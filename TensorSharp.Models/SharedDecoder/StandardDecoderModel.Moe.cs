@@ -88,8 +88,8 @@ namespace TensorSharp.Models
             // A40 and left the routed experts a 7.7 GB tier (legacy: 36.4 GB of experts resident).
             if (IsHostOnlyWeight(weightName) || !base.ShouldPreloadCudaQuantWeightToDevice(weightName)) return false;
             if (!IsExpertMember(weightName)) return true;
-            // Per-rank graphs run every member's shard on its rank; the per-op tensor-parallel path runs whole experts
-            // from the host.
+            // Per-rank graphs run every member's shard on its rank (GGML ranks read their own stacks instead); the per-op
+            // tensor-parallel path runs whole experts from the host, and one GGML device places its experts by the plan.
             return _mesh != null && (_mesh.TensorParallel == 1 || _rankGraphs) && !IsGgmlBackend;
         }
 

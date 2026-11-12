@@ -312,7 +312,9 @@ namespace TensorSharp.Models
         {
             string p = $"blk.{layer}.";
             int degree = ShardDegree;
-            if (DeviceRecurrence)
+            // GGML's per-op tensor parallelism runs the packed in-projection per rank; per-rank graphs read the
+            // projections by name (row shards, as on every other executor).
+            if (DeviceRecurrence && !RankGraphs)
             {
                 PackInProjection(layer, TpDegree, TpRankOffset, degree, r => _tpGroup.GetAllocator(r));
                 ShardInputColumnGroups(p + "ssm_out.weight", r => ValueHeadsOf(r, degree), _headVDim);

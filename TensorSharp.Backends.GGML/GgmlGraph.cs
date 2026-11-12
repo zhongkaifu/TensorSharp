@@ -32,7 +32,9 @@ namespace TensorSharp.GGML
         SetRows = 34, RopeExt = 35, FlashAttnExt = 36, SoftMaxExt = 37, Argsort = 38, TopK = 39,
         SumRows = 40, SsmConv = 41, GatedDeltaNet = 42, Concat = 43, Clamp = 44, Repeat = 45,
         Pad = 46, Mean = 47, AddId = 48, Argmax = 49, KvWindow = 50, Swiglu = 51, Geglu = 52, RopeMulti = 53,
-        MoeHostExperts = 54,
+        MoeHostExperts = 54, LightningIndexer = 55, TopKMask = 56,
+        /// <summary>A tensor-parallel partial, summed in place across the ranks of <see cref="GgmlGraph.RunRanked"/>.</summary>
+        AllReduce = 57,
     }
 
     /// <summary>ggml tensor types used by graph leaves (ggml.h's enum ggml_type).</summary>
@@ -180,6 +182,55 @@ namespace TensorSharp.GGML
             return ok != 0;
         }
 
+        /// <summary>
+        /// One tensor-parallel step: <paramref name="graphs"/>[r], built on rank r, runs with input set r, all ranks
+        /// segment by segment, and each <see cref="GgmlGraphOp"/> 57 (all-reduce) partial is summed in place across the
+        /// ranks between segments (the context's device collective; exactly in F32 when <paramref name="exactF32"/>).
+        /// False (with the native error) when any rank failed.
+        /// </summary>
+        public static unsafe bool RunRanked(GgmlGraph[] graphs, int[][] inputs, IntPtr[][] data, long[][] bytes, bool exactF32)
+        {
+            ArgumentNullException.ThrowIfNull(graphs);
+            int n = graphs.Length;
+            if (inputs.Length != n || data.Length != n || bytes.Length != n)
+                throw new ArgumentException("one input set per graph");
+            var handles = new IntPtr[n];
+            var pins = new System.Runtime.InteropServices.GCHandle[3 * n];
+            var pi = new IntPtr[n];
+            var pd = new IntPtr[n];
+            var pb = new IntPtr[n];
+            var counts = new int[n];
+            try
+            {
+                for (int r = 0; r < n; r++)
+                {
+                    if (inputs[r].Length != data[r].Length || inputs[r].Length != bytes[r].Length)
+                        throw new ArgumentException("one data pointer and byte count per input");
+                    handles[r] = graphs[r].Handle;
+                    counts[r] = inputs[r].Length;
+                    pins[3 * r] = System.Runtime.InteropServices.GCHandle.Alloc(inputs[r], System.Runtime.InteropServices.GCHandleType.Pinned);
+                    pins[3 * r + 1] = System.Runtime.InteropServices.GCHandle.Alloc(data[r], System.Runtime.InteropServices.GCHandleType.Pinned);
+                    pins[3 * r + 2] = System.Runtime.InteropServices.GCHandle.Alloc(bytes[r], System.Runtime.InteropServices.GCHandleType.Pinned);
+                    pi[r] = pins[3 * r].AddrOfPinnedObject();
+                    pd[r] = pins[3 * r + 1].AddrOfPinnedObject();
+                    pb[r] = pins[3 * r + 2].AddrOfPinnedObject();
+                }
+                int ok;
+                fixed (IntPtr* ph = handles)
+                fixed (IntPtr* ppi = pi)
+                fixed (IntPtr* ppd = pd)
+                fixed (IntPtr* ppb = pb)
+                fixed (int* pc = counts)
+                    ok = GgmlNative.TSGgml_GraphRunRanked(ph, n, ppi, ppd, ppb, pc, exactF32 ? 1 : 0);
+                foreach (GgmlGraph g in graphs) g.IsBuilt = true;
+                return ok != 0;
+            }
+            finally
+            {
+                foreach (var pin in pins) if (pin.IsAllocated) pin.Free();
+            }
+        }
+
         /// <summary>Whether a STATE leaf lives in device memory that outlives the run.</summary>
         public bool IsResident(int leaf) => GgmlNative.TSGgml_GraphLeafIsResident(Handle, leaf) != 0;
 
@@ -242,6 +293,11 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static unsafe partial int TSGgml_GraphRun(IntPtr graph, int* inputs, void** data, long* bytes, int ninputs);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static unsafe partial int TSGgml_GraphRunRanked(IntPtr* graphs, int nranks, IntPtr* inputs, IntPtr* data, IntPtr* bytes,
+            int* ninputs, int exactF32);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

@@ -85,9 +85,14 @@ namespace TensorSharp.Models
                 _rankGraphs = RankGraphsServe(tp);
                 if (_rankGraphs)
                 {
-                    var collective = new MeshCollective(_mesh, 0);
-                    for (int r = 0; r < tp; r++)
-                        ((TensorGraphExecutor)ExecutorFor(_mesh.Allocator(0, r))).JoinCollective(collective, r);
+                    // A streaming executor sums each partial as the last rank hands it in; a compiling one (GGML) runs
+                    // the ranks' plans together, pausing at every all-reduce (IRankedGraphExecutor).
+                    if (ExecutorFor(_mesh.Allocator(0, 0)) is TensorGraphExecutor)
+                    {
+                        var collective = new MeshCollective(_mesh, 0);
+                        for (int r = 0; r < tp; r++)
+                            ((TensorGraphExecutor)ExecutorFor(_mesh.Allocator(0, r))).JoinCollective(collective, r);
+                    }
                     Console.WriteLine($"  Tensor parallelism: each of {tp} devices runs its shard of every step as a graph, in lockstep.");
                 }
             }
@@ -119,7 +124,12 @@ namespace TensorSharp.Models
         private bool RankGraphsServe(int tp)
             => GraphLoweringEnabled && GraphRotary != null && RanksLower && !MoeCpuOffloadConfig.IsEnabled
                && StepAdapter == null && GlobalTpDegree == tp && TpRankOffset == 0
-               && ExecutorFor(_mesh.Allocator(0, 0)) is TensorGraphExecutor;
+               && ExecutorFor(_mesh.Allocator(0, 0)) switch
+               {
+                   TensorGraphExecutor => true,
+                   IRankedGraphExecutor ranked => ranked.RunsRanks(tp),
+                   _ => false,
+               };
 
         /// <summary>A stage group's sum for per-rank graphs: the last rank's partial runs the group's all-reduce.</summary>
         private sealed class MeshCollective : IGraphCollective
@@ -293,14 +303,93 @@ namespace TensorSharp.Models
                     rows.Add(p + "ffn_down.weight");
                     if (_rankGraphs && _moeLayer[l])
                     {
-                        // Each routed expert (its members) and the shared expert split by their width, like a dense
-                        // feed-forward: every rank runs every selected expert's slice.
-                        columns.AddRange(new[] { p + "ffn_gate_exps.", p + "ffn_up_exps.", p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight" });
-                        rows.AddRange(new[] { p + "ffn_down_exps.", p + "ffn_down_shexp.weight" });
+                        // Each routed expert and the shared expert split by their width, like a dense feed-forward:
+                        // every rank runs every selected expert's slice. GGML's mul_mat_id reads one stacked tensor, so
+                        // there each rank gets its own stack; other executors take the members one at a time.
+                        if (IsGgmlBackend)
+                        {
+                            ShardStackedExperts(p + "ffn_gate_exps.weight", columns: true, stage);
+                            ShardStackedExperts(p + "ffn_up_exps.weight", columns: true, stage);
+                            ShardStackedExperts(p + "ffn_down_exps.weight", columns: false, stage);
+                        }
+                        else
+                        {
+                            columns.AddRange(new[] { p + "ffn_gate_exps.", p + "ffn_up_exps." });
+                            rows.Add(p + "ffn_down_exps.");
+                        }
+                        columns.AddRange(new[] { p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight" });
+                        rows.Add(p + "ffn_down_shexp.weight");
                     }
                 }
                 ShardWeightsForTensorParallelism(columns, rows);
             }
+        }
+
+        /// <summary>Each rank's slice of a stacked expert weight, as its own contiguous stack (GGML per-rank graphs).</summary>
+        private readonly Dictionary<(string Name, int Rank), RankExpertStack> _rankStacks = new();
+
+        /// <summary>
+        /// Cut <paramref name="name"/>'s stacked experts [ne0, ne1, E] into one stack per rank of
+        /// <paramref name="stage"/>: each expert's output rows [r·ne1/T, (r+1)·ne1/T) (<paramref name="columns"/>, gate and
+        /// up), or each row's input blocks [r·ne0/T, ...) (down, split on quantization-block boundaries).
+        /// </summary>
+        private unsafe void ShardStackedExperts(string name, bool columns, int stage)
+        {
+            if (!_stackedExpertWeights.TryGetValue(name, out StackedExpertWeights w))
+                throw new NotSupportedException($"{Config.Architecture}: per-rank graphs on GGML need '{name}' as one stacked tensor.");
+            int degree = _mesh.TensorParallel, experts = w.NumExperts;
+            long ne0 = w.PerExpertNe0, ne1 = w.PerExpertNe1;
+            long rowBytes = NativeDequant.RowSize(w.GgmlType, ne0), perExpert = rowBytes * ne1;
+            var type = (GgmlTensorType)w.GgmlType;
+            long blockSize = GgufFile.GetBlockSize(type), typeSize = GgufFile.GetTypeSize(type);
+            if (columns ? ne1 % degree != 0 : (ne0 / blockSize) % degree != 0)
+                throw new NotSupportedException($"{Config.Architecture}: '{name}' ({ne0} x {ne1}) does not split over {degree} ranks.");
+            long shardNe0 = columns ? ne0 : ne0 / degree, shardNe1 = columns ? ne1 / degree : ne1;
+            long shardRowBytes = columns ? rowBytes : (ne0 / blockSize / degree) * typeSize;
+            long shardBytes = checked(shardRowBytes * shardNe1 * experts);
+            byte* src = (byte*)w.Data;
+            for (int r = 0; r < degree; r++)
+            {
+                IntPtr buffer = QuantizedWeight.AllocateBuffer(shardBytes);
+                byte* dst = (byte*)buffer;
+                int rank = r;
+                System.Threading.Tasks.Parallel.For(0, experts, e =>
+                {
+                    byte* from = src + e * perExpert;
+                    byte* to = dst + e * shardRowBytes * shardNe1;
+                    if (columns)
+                        Buffer.MemoryCopy(from + rank * shardNe1 * rowBytes, to, shardRowBytes * shardNe1, shardRowBytes * shardNe1);
+                    else
+                        for (long j = 0; j < ne1; j++)
+                            Buffer.MemoryCopy(from + j * rowBytes + rank * shardRowBytes, to + j * shardRowBytes, shardRowBytes, shardRowBytes);
+                });
+                var stack = new QuantizedWeight(buffer, shardBytes, w.GgmlType, shardNe0, shardNe1 * experts);
+                _rankStacks[(name, _mesh.GlobalDevice(stage, r))] = new RankExpertStack(stack, shardNe0, shardNe1, experts);
+            }
+        }
+
+        /// <summary>One rank's stacked expert slices [ne0, ne1, E] (contiguous), read whole by mul_mat_id.</summary>
+        private sealed class RankExpertStack : IGraphExpertWeights
+        {
+            public RankExpertStack(QuantizedWeight stack, long ne0, long ne1, int experts)
+            {
+                Stack = stack;
+                Ne0 = ne0;
+                Ne1 = ne1;
+                Ne2 = experts;
+                CacheKey = stack.EnsureDeviceCacheKey();
+            }
+
+            public QuantizedWeight Stack { get; }
+            public int Format => Stack.GgmlType;
+            public long Ne0 { get; }
+            public long Ne1 { get; }
+            public long Ne2 { get; }
+            public IntPtr Data => Stack.Data;
+            public IntPtr CacheKey { get; }
+            public long Bytes => Stack.RawBytes;
+            public IGraphWeight Expert(int index)
+                => throw new NotSupportedException("a rank's stacked expert slices are read whole (mul_mat_id)");
         }
 
         // ---------------------------------------------------------------- residency
@@ -379,31 +468,54 @@ namespace TensorSharp.Models
         /// </summary>
         private void PrepareRankGraphResidency()
         {
-            if (_backend != BackendType.Cuda) return;   // host-memory devices (simulated groups): nothing to upload
-            long[] bytes = new long[_mesh.TensorParallel];
-            var resident = new HashSet<QuantizedWeight>[_mesh.TensorParallel];
-            _mesh.RunPerRank(0, r =>
+            bool ggml = _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
+            if (_backend != BackendType.Cuda && !ggml) return;   // host-memory devices (simulated groups): nothing to upload
+            if (ggml) EnsureQuantBackendAvailable();
+            int ranks = _mesh.TensorParallel;
+            long[] bytes = new long[ranks];
+            var resident = new HashSet<QuantizedWeight>[ranks];
+            for (int r = 0; r < ranks; r++) resident[r] = new HashSet<QuantizedWeight>(ReferenceEqualityComparer.Instance);
+            void PreloadShards(int r)
             {
-                resident[r] = new HashSet<QuantizedWeight>(ReferenceEqualityComparer.Instance);
                 foreach (var kv in _tpQuantWeights)
                 {
                     QuantizedWeight shard = kv.Value[r];
                     if (!shard.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key)) continue;
-                    if (Preload(shard, _mesh.Allocator(0, r), ggml: false))
+                    if (Preload(shard, _mesh.Allocator(0, r), ggml))
                     {
                         bytes[r] += shard.RawBytes;
                         resident[r].Add(shard);
                     }
                 }
-            });
+            }
+            // A ggml preload lands on the calling thread's active rank: one thread, rank by rank.
+            if (ggml)
+                for (int r = 0; r < ranks; r++)
+                {
+                    GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, r));
+                    PreloadShards(r);
+                    // The rank's expert stacks (each its own copy, read whole by its graph's mul_mat_id).
+                    foreach (var ((_, device), stack) in _rankStacks)
+                        if (device == _mesh.GlobalDevice(0, r) && stack.Stack.HasHostData && Preload(stack.Stack, null, ggml: true))
+                        {
+                            bytes[r] += stack.Bytes;
+                            stack.Stack.ReleaseHostData();
+                        }
+                }
+            else
+                _mesh.RunPerRank(0, PreloadShards);
             foreach (var kv in _quantWeights)
             {
                 QuantizedWeight weight = kv.Value;
                 if (!weight.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key) || kv.Key == "token_embd.weight") continue;
-                int ranks = IsHeadWeight(kv.Key) ? 1 : _mesh.TensorParallel;
-                for (int r = 0; r < ranks; r++)
-                    if (Preload(weight, _mesh.Allocator(0, r), ggml: false)) bytes[r] += weight.RawBytes;
+                int holders = IsHeadWeight(kv.Key) ? 1 : ranks;
+                for (int r = 0; r < holders; r++)
+                {
+                    if (ggml) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, r));
+                    if (Preload(weight, _mesh.Allocator(0, r), ggml)) bytes[r] += weight.RawBytes;
+                }
             }
+            if (ggml) GgmlBasicOps.SetActiveRank(0);
             // Only a shard its rank holds gives up its host copy (another is read from the host).
             foreach (var kv in _tpQuantWeights)
                 for (int r = 0; r < kv.Value.Length; r++)

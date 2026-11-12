@@ -285,6 +285,31 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>Per-rank graphs on ggml_cuda over two GPUs: each rank's program compiles to its device's ggml graph, and
+    /// the ranks' graphs run together, pausing at every all-reduce while the devices sum the partial (exact F32).</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [InlineData("dense", KvCacheDtype.F32)]
+    [InlineData("dense", KvCacheDtype.F16)]
+    [InlineData("dense-tied", KvCacheDtype.F16)]
+    [InlineData("moe-tp", KvCacheDtype.F32)]
+    public void GgmlCudaRankGraphsMatchOneDevice(string variant, KvCacheDtype kv)
+    {
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
+        string path = Fixture(variant);
+        List<float[]> reference;
+        using (var single = Create(path, backend: BackendType.GgmlCuda))
+            reference = Script(single);
+        using var placed = new Qwen35RuntimeModel(path, BackendType.GgmlCuda, 2, null, 1);
+        Assert.Equal(2, placed.Mesh.TensorParallel);
+        List<float[]> actual = Script(placed);
+        Assert.True(placed.GraphRuns > 0 && placed.GraphReplays > 0, $"{variant}: the per-rank graphs did not run and replay");
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(actual[i], reference[i]);
+            Assert.True(rel <= (variant == "moe-tp" ? 2.5e-2 : 5e-3), $"{variant} {kv} row {i}: relL2 {rel:E2}");
+        }
+    }
+
     /// <summary>Two tensor-parallel ranks on CUDA device 0, each with its own allocator and stream; the all-reduce sums
     /// through the host.</summary>
     private sealed class OneGpuCudaGroup : ITensorParallelGroup

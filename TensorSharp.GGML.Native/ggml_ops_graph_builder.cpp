@@ -114,6 +114,7 @@ namespace
         OP_MOE_HOST = 54,       // srcs: x [n, T], ids [k, T], weights [k, T], gate/up/down expert stacks (host); ip: layer
         OP_LIGHTNING_INDEXER = 55, // srcs: q [d, heads, T], k [d, 1, n_kv], weights [heads, T], mask [n_kv, T] (F16)
         OP_TOP_K_MASK = 56,     // srcs: mask [n_kv, T], top_k [n_top, T], then (ip[0..2] flags) score, blocks, extra
+        OP_ALLREDUCE = 57,      // srcs: a tensor-parallel partial; summed in place across the ranks (TSGgml_GraphRunRanked)
     };
 
     struct Leaf
@@ -356,6 +357,9 @@ namespace
         // chain's input and ids allocated (see build_host_experts). Null where not needed.
         std::vector<std::pair<ggml_tensor*, ggml_tensor*>> host_moe_holds;
         std::vector<int> seg_end;
+        // Tensor-parallel partials (OP_ALLREDUCE) in program order: each ends a segment of TSGgml_GraphRunRanked, after
+        // which the ranks sum it in place. A graph run alone (one rank) reads them as they are.
+        std::vector<ggml_tensor*> tp_partials;
         // Effects and pauses in program order (kind 0: effects[i], 1: host_moe[i]): the graph is expanded in this
         // order, so a pause's boundary tensors precede everything that reads its result.
         std::vector<std::pair<int, int>> order;
@@ -606,6 +610,16 @@ namespace
                                  static_cast<int>(ipar(0, 0)), static_cast<int>(ipar(1, 0)), static_cast<int>(ipar(2, 0)),
                                  fpar(0, 10000.0f), fpar(1, 1.0f), fpar(2, 0.0f), fpar(3, 1.0f), fpar(4, 32.0f), fpar(5, 1.0f));
         case OP_MOE_HOST: return build_host_experts(g, s, ns, ip, nip);
+        case OP_ALLREDUCE:
+        {
+            // The node is its (contiguous F32) partial: the reduction happens between graph segments, in place.
+            need(1);
+            ggml_tensor* t = src(0);
+            if (t->type != GGML_TYPE_F32) t = ggml_cast(ctx, t, GGML_TYPE_F32);
+            else if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
+            g->tp_partials.push_back(t);
+            return t;
+        }
         case OP_ROPE_MULTI:
         {
             need(2);
@@ -933,6 +947,10 @@ namespace
             if (hm.pred_next != nullptr) ggml_build_forward_expand(g->graph, hm.pred_next);   // read at this pause
         }
         for (const Output& o : g->outputs) ggml_build_forward_expand(g->graph, o.tensor);
+        // Every tensor-parallel partial is computed and reduced on every rank, read or not: a rank that does not run the
+        // head never reads its last block's sum, yet the other ranks' reduce needs its partial (and the ranks must cut
+        // their graphs at the same boundaries).
+        for (ggml_tensor* t : g->tp_partials) ggml_build_forward_expand(g->graph, t);
         // Before allocation: reordering after lifetime planning would invalidate the alias plan (and a
         // reorder would move nodes across a pause).
         if (g->reorder && g->host_moe.empty()) optimize_graph_for_metal(g->ctx, g->graph);
@@ -1257,6 +1275,26 @@ TSG_EXPORT int TSGgml_GraphEffect(void* handle, int node)
 // leaves living in compute memory), compute, download the outputs and write back any STATE
 // leaf that lives in compute memory. `inputs`/`input_data`/`input_bytes` name per-run values
 // for INPUT leaves (or replace a leaf's host pointer for this run when it lives in compute memory).
+namespace
+{
+    // Leaves living in compute memory are uploaded every run, weights included: the allocator may reuse an input's
+    // memory after its last use within the graph. A leaf nothing in the graph reads (the trace may emit more than the
+    // outputs and effects need) has no memory. Then the step's inputs.
+    void upload_run_inputs(TsgGraph* g, const int* inputs, void* const* input_data, const std::int64_t* input_bytes, int ninputs)
+    {
+        for (const Leaf& leaf : g->leaves)
+            if (leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
+                ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
+        for (int i = 0; i < ninputs; i++)
+        {
+            ggml_tensor* t = node_at(g, inputs[i]);
+            const std::size_t n = std::min(static_cast<std::size_t>(input_bytes[i]), ggml_nbytes(t));
+            if (input_data[i] != nullptr && n > 0 && t->buffer != nullptr)
+                ggml_backend_tensor_set(t, input_data[i], 0, n);
+        }
+    }
+}
+
 TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* input_data,
                                const std::int64_t* input_bytes, int ninputs)
 {
@@ -1276,19 +1314,7 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
 
         // Device work queued by earlier calls may still read or write these host buffers.
         host_read_barrier();
-        // Leaves living in compute memory are uploaded every run, weights included: the allocator
-        // may reuse an input's memory after its last use within the graph. A leaf nothing in the
-        // graph reads (the trace may emit more than the outputs and effects need) has no memory.
-        for (const Leaf& leaf : g->leaves)
-            if (leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
-                ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
-        for (int i = 0; i < ninputs; i++)
-        {
-            ggml_tensor* t = node_at(g, inputs[i]);
-            const std::size_t n = std::min(static_cast<std::size_t>(input_bytes[i]), ggml_nbytes(t));
-            if (input_data[i] != nullptr && n > 0 && t->buffer != nullptr)
-                ggml_backend_tensor_set(t, input_data[i], 0, n);
-        }
+        upload_run_inputs(g, inputs, input_data, input_bytes, ninputs);
 
         // Enqueue the graph and the downloads back to back, then synchronize once (as llama.cpp's
         // scheduler does): a synchronous compute followed by a download is a second command-buffer
@@ -1327,6 +1353,68 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
                 ggml_backend_tensor_get_async(graph_backend(g), leaf.tensor, leaf.data, 0, leaf.bytes);
         sync_backend(graph_backend(g));
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+}
+
+// One tensor-parallel step: graph r (built on rank r, of `nranks` ranks of the active tensor-parallel context) runs
+// with its own inputs, all ranks segment by segment, each OP_ALLREDUCE partial summed in place across the ranks
+// between segments (tsg::tp_execute_plans, on-device where the context has a collective). Every rank's outputs and
+// state leaves are downloaded as TSGgml_GraphRun's are. `exact_f32`: reduce in F32 whatever the transport would
+// round (upstream NCCL rounds large F32 sums to BF16).
+TSG_EXPORT int TSGgml_GraphRunRanked(void* const* handles, int nranks, const int* const* inputs,
+                                     void* const* const* input_data, const std::int64_t* const* input_bytes,
+                                     const int* ninputs, int exact_f32)
+{
+    if (handles == nullptr || nranks < 1 || nranks > TSG_MAX_DEVICES)
+    {
+        set_last_error("graph builder: a ranked run needs 1 to TSG_MAX_DEVICES graphs.");
+        return 0;
+    }
+    try
+    {
+        std::vector<tsg::TpRankPlan> plans(static_cast<std::size_t>(nranks));
+        std::vector<tsg::TpRankPlan*> plan_ptrs(static_cast<std::size_t>(nranks));
+        host_read_barrier();
+        for (int r = 0; r < nranks; r++)
+        {
+            auto* g = static_cast<TsgGraph*>(handles[r]);
+            if (g == nullptr || g->rank != r || g->tp != nullptr || !g->host_moe.empty())
+            {
+                set_last_error("graph builder: a ranked run takes rank r's own graph, without host experts, for every rank r.");
+                return 0;
+            }
+            ScopedRank scope(g->rank);
+            if (!ensure_backend()) return 0;
+            if (!g->built && !build(g)) return 0;
+            if (g->runs > 0 && !g->replayable)
+            {
+                set_last_error("graph builder: a one-shot graph cannot run twice.");
+                return 0;
+            }
+            g->runs++;
+            upload_run_inputs(g, inputs[r], input_data[r], input_bytes[r], ninputs[r]);
+            tsg::TpRankPlan& plan = plans[static_cast<std::size_t>(r)];
+            plan.backend = graph_backend(g);
+            plan.allreduce_f32 = exact_f32 != 0;
+            plan.graph = g->graph;
+            plan.ar_tensor = g->tp_partials;
+            if (!tsg::tp_plan_segments(plan, g->tp_partials)) return 0;
+            for (const Output& o : g->outputs)
+                if (o.data != nullptr)
+                    plan.extra_out.push_back({ o.tensor, o.data, static_cast<std::size_t>(o.bytes) });
+            for (const Leaf& leaf : g->leaves)
+                if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
+                    plan.extra_out.push_back({ leaf.tensor, leaf.data, leaf.bytes });
+            plan_ptrs[static_cast<std::size_t>(r)] = &plan;
+        }
+        if (!tsg::tp_execute_plans(plan_ptrs.data(), nranks)) return 0;
         clear_last_error();
         return 1;
     }

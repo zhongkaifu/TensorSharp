@@ -110,6 +110,7 @@ namespace TensorSharp.Models
             lock (_rankExpertSets)
             {
                 if (_rankExpertSets.TryGetValue((name, rank), out IGraphExpertWeights set)) return set;
+                if (_rankStacks.TryGetValue((name, _mesh.GlobalDevice(0, rank)), out RankExpertStack own)) return _rankExpertSets[(name, rank)] = own;
                 if (!_stackedExpertWeights.TryGetValue(name, out StackedExpertWeights stacked)) return null;
                 string baseName = name.EndsWith(".weight", StringComparison.Ordinal) ? name[..^7] : name;
                 var members = new QuantizedWeight[stacked.NumExperts];
@@ -336,6 +337,7 @@ namespace TensorSharp.Models
             foreach (CachedGraph entry in _graphCache.Values) entry.Dispose();
             _graphCache.Clear();
             _graphLru.Clear();
+            ClearRankGraphCache();
             _streamedKinds.Clear();
             _streamTemplates.Clear();
         }
@@ -835,6 +837,8 @@ namespace TensorSharp.Models
         private bool TryRunRankedGraphStep(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
             GraphRequest request, out GraphResult result)
         {
+            if (ExecutorFor(_mesh.Allocator(0, 0)) is IRankedGraphExecutor compiled)
+                return TryRunRankedCompiledStep(compiled, hidden, slots, first, counts, starts, request, out result);
             result = null;
             int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
             string kind = $"{rows}|{slots.Length}|{request.RecurrentSnapshots}|{string.Join(",", counts)}|{request.Shape}|" +
@@ -895,6 +899,126 @@ namespace TensorSharp.Models
             {
                 foreach (GraphStep step in steps) step?.Dispose();
                 foreach (IGraphStream stream in streams) stream?.Dispose();
+                for (int r = 0; r < inputs.Length; r++)
+                    if (!ReferenceEquals(inputs[r], hidden)) inputs[r].Dispose();
+            }
+        }
+
+        /// <summary>Compiled per-rank plans by the ranks' combined signature (decode kinds replay), most recent first.</summary>
+        private readonly Dictionary<(ulong, ulong), CachedGraph[]> _rankGraphCache = new();
+        private readonly LinkedList<(ulong, ulong)> _rankGraphLru = new();
+
+        private void ClearRankGraphCache()
+        {
+            foreach (CachedGraph[] plans in _rankGraphCache.Values)
+                foreach (CachedGraph plan in plans) plan.Dispose();
+            _rankGraphCache.Clear();
+            _rankGraphLru.Clear();
+        }
+
+        private static (ulong, ulong) RankedSignature(GraphStep[] steps)
+        {
+            ulong a = 0xcbf29ce484222325UL, b = (ulong)steps.Length;
+            foreach (GraphStep step in steps)
+            {
+                (ulong x, ulong y) = step.Signature;
+                a = (a ^ x) * 0x100000001b3UL;
+                b = (b ^ y) * 0x9e3779b97f4a7c15UL + 1;
+            }
+            return (a, b);
+        }
+
+        /// <summary>
+        /// A step over a tensor-parallel group on an executor that compiles whole programs (GGML): every rank's program is
+        /// traced block by block across the ranks, compiled for the rank's device, and the ranks' plans run together,
+        /// pausing at each <see cref="GraphOp.AllReduce"/> while the devices sum the partial (IRankedGraphExecutor). Decode
+        /// kinds replay: a later step only re-traces to bind its inputs and finds the plans by the ranks' signatures.
+        /// </summary>
+        private bool TryRunRankedCompiledStep(IRankedGraphExecutor executor, Tensor hidden, Slot[] slots, int[] first, int[] counts,
+            int[] starts, GraphRequest request, out GraphResult result)
+        {
+            result = null;
+            int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
+            bool replayable = executor.Capabilities.Replays;
+            foreach (int c in counts) replayable &= c <= SmallChunkRows;
+            Tensor[] inputs = RankInputs(hidden);
+            var steps = new GraphStep[ranks];
+            CachedGraph[] plans = null;
+            bool owned = false;
+            StepOutputs outputs = default;
+            try
+            {
+                if (replayable && _rankGraphCache.Count > 0)
+                {
+                    for (int r = 0; r < ranks; r++)
+                        steps[r] = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: false) { Rank = r };
+                    outputs = EmitRankedStep(steps, inputs, request);
+                    var key = RankedSignature(steps);
+                    if (_rankGraphCache.TryGetValue(key, out plans))
+                    {
+                        _rankGraphLru.Remove(key);
+                        _rankGraphLru.AddFirst(key);
+                        GraphReplays++;
+                    }
+                    else
+                    {
+                        foreach (GraphStep step in steps) step.Dispose();
+                        Array.Clear(steps);
+                    }
+                }
+                if (plans == null)
+                {
+                    for (int r = 0; r < ranks; r++)
+                        steps[r] = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: true) { Rank = r };
+                    outputs = EmitRankedStep(steps, inputs, request);
+                    plans = new CachedGraph[ranks];
+                    try
+                    {
+                        for (int r = 0; r < ranks; r++)
+                            plans[r] = steps[r].BuildForRank(executor, _mesh.GlobalDevice(0, r), replayable);
+                    }
+                    catch
+                    {
+                        foreach (CachedGraph plan in plans) plan?.Dispose();
+                        throw;
+                    }
+                    if (replayable)
+                    {
+                        var key = RankedSignature(steps);
+                        _rankGraphCache[key] = plans;
+                        _rankGraphLru.AddFirst(key);
+                        while (_rankGraphLru.Count > GraphCacheEntries)
+                        {
+                            var evict = _rankGraphLru.Last.Value;
+                            _rankGraphLru.RemoveLast();
+                            if (_rankGraphCache.Remove(evict, out CachedGraph[] old))
+                                foreach (CachedGraph plan in old) plan.Dispose();
+                        }
+                    }
+                    else
+                    {
+                        owned = true;
+                    }
+                }
+                if (!executor.RunRanked(Array.ConvertAll(plans, p => p.Plan), Array.ConvertAll(steps, step => step.RunInputs()), out string error))
+                    throw new InvalidOperationException($"{Config.Architecture} tensor-parallel graph step failed: {error}");
+                GraphRuns++;
+                foreach (Slot slot in slots) slot.DeviceDirty = true;
+                CachedGraph lead = plans[0];
+                result = new GraphResult
+                {
+                    // A one-shot plan is disposed below: its outputs are the caller's arrays, which disposal does not free.
+                    Logits = outputs.Logits >= 0 ? lead.Outputs[outputs.Logits] : null,
+                    Final = outputs.Final >= 0 ? lead.Outputs[outputs.Final] : null,
+                    Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => i >= 0 ? lead.Outputs[i] : null),
+                };
+                return true;
+            }
+            finally
+            {
+                foreach (GraphStep step in steps) step?.Dispose();
+                if (owned)
+                    foreach (CachedGraph plan in plans) plan?.Dispose();
                 for (int r = 0; r < inputs.Length; r++)
                     if (!ReferenceEquals(inputs[r], hidden)) inputs[r].Dispose();
             }
@@ -1403,7 +1527,9 @@ namespace TensorSharp.Models
             /// <summary>An F32 tensor the family prepared (device constants, norms) as a read-only leaf.</summary>
             public int TensorWeight(Tensor t, params long[] ne)
             {
-                if (Rank >= 0 && !ReferenceEquals(t.Storage.Allocator, _m._mesh.Allocator(0, Rank)))
+                // An executor that binds tensors by object reads them on the rank's device; GGML binds host bytes and keeps
+                // each rank's device copy itself, so any rank may read any tensor.
+                if (Rank >= 0 && !_m.IsGgmlBackend && !ReferenceEquals(t.Storage.Allocator, _m._mesh.Allocator(0, Rank)))
                     throw new InvalidOperationException($"A leaf of tensor-parallel rank {Rank} lives on another allocator: pass the rank's " +
                         "own tensor, or Replicated() for one every rank reads.");
                 return TensorLeaf(GraphLeafRole.Weight, t, GraphFormat.F32, ne.Length == 0 ? Extents(t) : ne);
@@ -1805,6 +1931,18 @@ namespace TensorSharp.Models
                 Program = program;
                 return new CachedGraph { Plan = _m.GraphExecutor.Compile(program) };
             }
+
+            /// <summary>Compile this rank's recorded program for device <paramref name="device"/> of a compiling executor.</summary>
+            internal CachedGraph BuildForRank(IRankedGraphExecutor executor, int device, bool replayable)
+            {
+                if (!_record) throw new InvalidOperationException("a hash-only trace cannot be built");
+                GraphProgram program = _b.ToProgram(replayable, false, _m._graphTpRanks);
+                Program = program;
+                return new CachedGraph { Plan = executor.CompileForRank(program, device) };
+            }
+
+            /// <summary>This step's per-run inputs, for a run of several ranks' plans together.</summary>
+            internal GraphRunInputs RunInputs() => new(_inputs.ToArray(), _inputData.ToArray(), _inputBytes.ToArray());
 
             internal bool Run(IGraphPlan plan) => plan.Run(CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData),
                 CollectionsMarshal.AsSpan(_inputBytes), CollectionsMarshal.AsSpan(_inputHandles));

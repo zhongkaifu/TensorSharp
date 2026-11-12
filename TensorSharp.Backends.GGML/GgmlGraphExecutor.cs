@@ -18,7 +18,7 @@ namespace TensorSharp.GGML
     /// builder), weights bind to their cached device copies, states update in place, and a replayable
     /// program keeps its graph and memory. Tensor-parallel programs run on ggml's meta device.
     /// </summary>
-    public sealed class GgmlGraphExecutor : IGraphExecutor
+    public sealed class GgmlGraphExecutor : IRankedGraphExecutor
     {
         private static readonly Dictionary<GgmlBackendType, GgmlGraphExecutor> s_executors = new();
 
@@ -110,6 +110,34 @@ namespace TensorSharp.GGML
             }
         }
 
+        /// <summary>Per-rank graphs need ranks with a device collective: without one every segment boundary is a host
+        /// round trip (tsg::tp_fused_available).</summary>
+        public bool RunsRanks(int ranks) => Backend == GgmlBackendType.Cuda && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
+
+        /// <summary>A graph is built for the active rank's device: compile with rank <paramref name="rank"/> active.</summary>
+        public IGraphPlan CompileForRank(GraphProgram program, int rank)
+        {
+            int previous = GgmlBasicOps.GetActiveRank();
+            GgmlBasicOps.SetActiveRank(rank);
+            try { return Compile(program); }
+            finally { GgmlBasicOps.SetActiveRank(previous); }
+        }
+
+        /// <summary>The ranks' graphs segment by segment, each all-reduce partial summed exactly in F32 between segments
+        /// (ggml_ops_graph_builder.cpp's TSGgml_GraphRunRanked over tsg::tp_execute_plans).</summary>
+        public bool RunRanked(IGraphPlan[] plans, GraphRunInputs[] inputs, out string error)
+        {
+            ArgumentNullException.ThrowIfNull(plans);
+            ArgumentNullException.ThrowIfNull(inputs);
+            var graphs = new GgmlGraph[plans.Length];
+            for (int r = 0; r < plans.Length; r++)
+                graphs[r] = plans[r] is Plan p ? p.Graph : throw new ArgumentException("every plan must be this executor's", nameof(plans));
+            bool ok = GgmlGraph.RunRanked(graphs, Array.ConvertAll(inputs, i => i.Nodes), Array.ConvertAll(inputs, i => i.Data),
+                Array.ConvertAll(inputs, i => i.Bytes), exactF32: true);
+            error = ok ? null : GgmlBasicOps.LastNativeError();
+            return ok;
+        }
+
         public void SyncToHost(IntPtr data, long bytes) => GgmlBasicOps.SyncHostBuffer(data, bytes);
 
         public void Invalidate(IntPtr data) => GgmlBasicOps.InvalidateHostBuffer(data);
@@ -127,6 +155,8 @@ namespace TensorSharp.GGML
             }
 
             public float[][] Outputs { get; }
+
+            internal GgmlGraph Graph => _graph;
 
             public string LastError { get; private set; }
 

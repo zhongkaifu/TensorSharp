@@ -129,6 +129,28 @@ namespace TensorSharp.Graph
         IGraphStream OpenStream(GraphProgram? template = null);
     }
 
+    /// <summary>One rank's inputs for <see cref="IRankedGraphExecutor.RunRanked"/>: the input nodes with their per-run
+    /// host bytes and byte counts.</summary>
+    public readonly record struct GraphRunInputs(int[] Nodes, IntPtr[] Data, long[] Bytes);
+
+    /// <summary>
+    /// An executor whose compiled plans of one tensor-parallel step run together: plan r, compiled on rank r, runs
+    /// with its inputs while every rank pauses at each <see cref="GraphOp.AllReduce"/> to sum the partial in place
+    /// (on the devices where the backend has a collective), then continues. For executors that compile whole
+    /// programs; a streaming executor reduces as the ranks' nodes arrive instead.
+    /// </summary>
+    public interface IRankedGraphExecutor : IGraphExecutor
+    {
+        /// <summary>Whether steps over <paramref name="ranks"/> devices can run here (the devices' collective is up).</summary>
+        bool RunsRanks(int ranks);
+
+        /// <summary>Compile <paramref name="program"/> for rank <paramref name="rank"/>'s device.</summary>
+        IGraphPlan CompileForRank(GraphProgram program, int rank);
+
+        /// <summary>Run every rank's plan together; false with <paramref name="error"/> on failure.</summary>
+        bool RunRanked(IGraphPlan[] plans, GraphRunInputs[] inputs, out string error);
+    }
+
     /// <summary>A plan whose outputs can stay on the device: set <see cref="KeepTensors"/> before a run and
     /// take each output as a tensor after it (no host copy, no wait for the device).</summary>
     public interface IGraphTensorOutputs

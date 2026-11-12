@@ -111,6 +111,27 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => CreateGgmlTensorParallel(family, path), $"{family} tp2", tieTolerance: 1e-2);
     }
 
+    /// <summary>Tensor parallelism over two ggml_cuda GPUs as per-rank graphs run together (the default; the meta-device
+    /// graphs above are opt-in): the same logits as one device, decode replays, and speculation.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [MemberData(nameof(Families))]
+    public void RankGraphsOnGgmlMatchOneDevice(string family)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family, keyLength: 64);
+        List<float[]> single;
+        using (var one = Create(family, path, 1, 1, BackendType.GgmlCuda))
+            single = Script(one);
+        using ModelBase tp = CreateGgmlTensorParallel(family, path);
+        var sdm = Assert.IsAssignableFrom<StandardDecoderModel>(tp);
+        Assert.Equal(2, sdm.Mesh.TensorParallel);
+        List<float[]> actual = Script(tp);
+        Assert.True(sdm.GraphRuns > 0 && sdm.GraphReplays > 0, $"{family}: the per-rank graphs did not run and replay");
+        for (int i = 0; i < single.Count; i++)
+            // ggml's kernels split each row-parallel product differently per rank (1.5e-4 / 2.2e-4 measured on 2x A40).
+            Assert.True(RelL2(actual[i], single[i]) <= 1e-3, $"{family} tp2 rank graphs row {i}: relL2 {RelL2(actual[i], single[i]):E2}");
+    }
+
     /// <summary>A GGML tensor-parallel group of two (the model builds it: no group is passed).</summary>
     private static ModelBase CreateGgmlTensorParallel(string family, string path) => family switch
     {

@@ -220,6 +220,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GraphOp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOutput" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphRun" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphRunRanked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphShape" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />

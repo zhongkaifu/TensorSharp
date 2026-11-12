@@ -1211,6 +1211,8 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            foreach (RankExpertStack stack in _rankStacks.Values) stack.Stack.Dispose();
+            _rankStacks.Clear();
             foreach (Tensor t in AllCacheTensors(_cacheK)) t.Dispose();
             foreach (Tensor t in AllCacheTensors(_cacheV)) t.Dispose();
             _cacheK = _cacheV = null;

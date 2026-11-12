@@ -837,7 +837,20 @@ ranks' programs (nothing runs) so their streams release tensors by the readers. 
 Replicated weights are resident on every rank's allocator, rank 0's included: the CUDA quantized cache
 is keyed by allocator, and the model's own allocator of a GPU is another one with its own stream
 (Qwen3.6-35B-A3B decode went from 19.9 to 29.9 tok/s with rank 0 on its own copies). Speculation is
-refused here for now (the draft layer is not sharded). GGML keeps its per-op path or ggml's meta device.
+refused here for now (the draft layer is not sharded).
+
+On GGML (ggml_cuda with a device collective) the same ranked emission feeds an executor that compiles
+whole programs (`IRankedGraphExecutor`): each rank's program is compiled into a ggml graph on its own
+device (`CompileForRank`), its `GraphOp.AllReduce` nodes are the graph's segment boundaries (the native
+builder's `OP_ALLREDUCE` returns its contiguous F32 partial and records it), and the ranks' graphs run
+together through the existing segmented driver (`TSGgml_GraphRunRanked` over `tsg::tp_execute_plans`):
+every rank's segment is submitted, the partial is summed in place in exact F32 on the devices, the next
+segment follows. Decode kinds replay: a later step re-traces only to bind its inputs and finds the ranks'
+plans by their combined signature. Shards and replicated weights are preloaded on every rank's device,
+one thread rank by rank (a ggml preload lands on the calling thread's active rank); routed-expert shards
+are preloaded too, since each rank's graph reads its slices device-resident. ggml's meta device stays
+opt-in (`TS_GRAPH_TENSOR_PARALLEL=1`).
+
 
 The local group's peer-to-peer self-test now also runs a kernel that reads the other GPU's memory through
 the peer mapping. On the 2x A40 VM (PXB, a virtualized PCIe switch) the driver grants peer access, the
@@ -1085,3 +1098,10 @@ MoE checkpoints, a node with several tensor-parallel stages (covered only by the
 * Tensor-parallel decode on `ggml_cuda` is 6-10% below the old Mistral 3 TP path, and Ministral
   on `cuda --layer-split 2` decodes 32% below one GPU while Hunyuan Dense does not; both are
   open.
+* Direct-CUDA decode of small models is launch-bound (Qwen3.5-0.8B 172 tok/s against the hand-written
+  engine's 304 on an A40, whose decode step is a captured CUDA graph). Capturing the runtime's decode
+  plans needs more than the capture itself: the tensor executor reads indices on the host (`SetRows`'
+  cache rows, `GetRows`, rotary positions, `MulMatId`'s selected experts), which a captured graph would
+  freeze, so those ops need device-index forms first; then exact decode windows give way to padded ones
+  (a replayable shape), inputs refresh into stable device buffers before each launch, and blocks
+  returned during the capture stay with the plan.
