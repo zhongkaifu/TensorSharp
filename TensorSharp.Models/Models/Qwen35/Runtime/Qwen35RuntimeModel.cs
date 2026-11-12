@@ -146,7 +146,7 @@ namespace TensorSharp.Models
         /// The requests the shared runtime serves for this family (see Qwen35Architecture):
         /// whole-layer stages, local or multi-node, alone or with --tp; routed experts on the host
         /// for cuda and mlx, where Qwen35Model keeps them in device buffers; and one device on
-        /// ggml_cuda, ggml_metal or MLX for checkpoints without routed experts (<see cref="ServesOneDevice"/>).
+        /// ggml_cuda, ggml_metal, ggml_cpu or MLX for checkpoints without routed experts (<see cref="ServesOneDevice"/>).
         /// </summary>
         internal static bool Serves(Architecture.ModelCreateContext context)
             => context.LayerSplitDegree > 1
@@ -155,17 +155,19 @@ namespace TensorSharp.Models
                || ServesOneDevice(context);
 
         /// <summary>
-        /// One device on ggml_cuda, ggml_metal or MLX, for a checkpoint without routed experts: the runtime
-        /// matches Qwen35Model there (Qwen3.8-27B UD-IQ3_XXS, prefill / decode tok/s: ggml_metal 388.7 / 21.0
-        /// vs 393.3 / 21.0 on an M5 Pro; ggml_cuda measured on an RTX PRO 6000 in the commit adding this route;
-        /// MLX decode 19.8 vs 19.6-20.0, MTP 29.8 vs 29.3-29.6, DFlash2 29.3-29.8 vs 27.5-27.7, Qwen3.5-0.8B
-        /// Q8_0 prompt 12,130 vs 12,290). Bonsai2's PRISM rotations included: the GGML graphs rotate the
-        /// rotated products' inputs (MLX refuses them at load, as Qwen35Model does). Qwen35Model keeps routed
-        /// experts (its fused MoE graphs and host seam), --tp (its per-rank fused graphs) and the other
-        /// backends (direct CUDA is not at parity yet).
+        /// One device on ggml_cuda, ggml_metal, ggml_cpu or MLX, for a checkpoint without routed experts: the
+        /// runtime matches Qwen35Model there (Qwen3.8-27B UD-IQ3_XXS, prefill / decode tok/s: ggml_metal 388.7 /
+        /// 21.0 vs 393.3 / 21.0 on an M5 Pro; ggml_cuda measured on an RTX PRO 6000 in the commit adding this
+        /// route; MLX decode 19.8 vs 19.6-20.0, MTP 29.8 vs 29.3-29.6, DFlash2 29.3-29.8 vs 27.5-27.7,
+        /// Qwen3.5-0.8B Q8_0 prompt 12,130 vs 12,290) or beats it (ggml_cpu on the M5 Pro, prefill / decode:
+        /// Qwen3.5-0.8B Q8_0 3.6K tokens 3.2 vs 9.6 s / 99-111 vs 20 tok/s; Qwen3.8-27B UD-IQ3_XXS 55 tokens 6.0
+        /// vs 7.2-8.2 s / 6.2-6.8 vs 3.2-3.8 tok/s). Bonsai2's PRISM rotations included: the GGML graphs rotate
+        /// the rotated products' inputs (MLX refuses them at load, as Qwen35Model does). Qwen35Model keeps
+        /// routed experts (its fused MoE graphs and host seam), --tp (its per-rank fused graphs) and the other
+        /// backends (direct CUDA and ggml_vulkan are not at parity yet).
         /// </summary>
         internal static bool ServesOneDevice(Architecture.ModelCreateContext context)
-            => context.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.Mlx
+            => context.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu or BackendType.Mlx
                && context.TpDegree <= 1 && context.TpGroup == null && context.LayerSplitDegree <= 1
                && context.Probe != null && !HasRoutedExperts(context.Probe);
 
