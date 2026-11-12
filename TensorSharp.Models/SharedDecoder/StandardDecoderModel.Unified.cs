@@ -47,7 +47,7 @@ namespace TensorSharp.Models
                 _slots[requestId] = slot = NewSlot(reserve);
             }
             if (reserve > slot.Capacity)
-                EnsureSlotCapacity(slot, reserve);
+                EnsureSlotCapacity(slot, reserve, reservation: true);
             return slot.Length;
         }
 

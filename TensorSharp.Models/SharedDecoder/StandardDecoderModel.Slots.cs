@@ -56,6 +56,13 @@ namespace TensorSharp.Models
         private const int SlotPoolMax = 4;
         private const int FreshSlotTokens = 512;
 
+        /// <summary>Cells a grown slot keeps past what it needs (see <see cref="EnsureSlotCapacity"/>).</summary>
+        private const int SlotGrowthHeadroomTokens = 4096;
+
+        /// <summary>The step a request's reservation is rounded up to when a slot grows to it, so a pooled slot serves
+        /// the next request of about the same size without growing again.</summary>
+        private const int ReservationStepTokens = 1024;
+
         private Dictionary<string, Slot> _slots;            // requests with their own slot
         private Dictionary<string, Slot> _retainedSlots;    // finished requests kept for a continuation
         private List<Slot> _slotPool;
@@ -234,14 +241,54 @@ namespace TensorSharp.Models
             => GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) && total > 0 ? (free, total) : null;
 
         /// <summary>What the device lacks for <paramref name="needBytes"/> beside its headroom, after the kept graph arenas
-        /// are released (0 when it fits or is not measured).</summary>
+        /// are released and then the idle slots' device copies dropped (0 when it fits or is not measured).</summary>
         private long DeviceDeficit(long needBytes)
         {
             if (needBytes <= 0 || DeviceMemoryProbe() is not { } memory) return 0;
             long deficit = Math.Max(0, needBytes + DeviceHeadroom(memory.Total) - memory.Free);
             if (deficit > 0 && GgmlBasicOps.ReleaseKeptArenas() > 0 && DeviceMemoryProbe() is { } after)
                 deficit = Math.Max(0, needBytes + DeviceHeadroom(after.Total) - after.Free);
+            if (deficit > 0 && DropIdleSlotDeviceCopies() > 0 && DeviceMemoryProbe() is { } dropped)
+                deficit = Math.Max(0, needBytes + DeviceHeadroom(dropped.Total) - dropped.Free);
             return deficit;
+        }
+
+        /// <summary>
+        /// Drops the device copies of the slots no request runs on (finished requests kept for a continuation, pooled ones)
+        /// where the executor keeps separate device copies: their host tensors hold every row and state (synced first), and
+        /// a slot's next graph uploads what it binds. Kept, they filled the device: fifteen finished Qwen3.8-27B DFlash2
+        /// requests held 6.6 GB of a 24 GB GPU, and four new ones found no memory for their first step. Returns the slots
+        /// dropped.
+        /// </summary>
+        private int DropIdleSlotDeviceCopies()
+        {
+            // One device: a split's or a rank's copies live in another device's cache.
+            if (!KeepsDeviceCopies || _mesh.Stages != 1 || _mesh.TensorParallel != 1
+                || GraphExecutor is not { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } })
+                return 0;
+            int dropped = 0;
+            foreach (Slot slot in IdleSlots())
+            {
+                if (slot?.K == null) continue;
+                SyncToHost(slot);
+                foreach (Tensor t in AllCacheTensors(slot.K)) InvalidateTensorDeviceCache(t);
+                foreach (Tensor t in AllCacheTensors(slot.V)) InvalidateTensorDeviceCache(t);
+                if (slot.Recurrent != null)
+                    foreach (RecurrentState[] layer in slot.Recurrent)
+                        if (layer != null)
+                            foreach (RecurrentState state in layer)
+                                if (state != null)
+                                    foreach (Tensor t in state.HostTensors) InvalidateTensorDeviceCache(t);
+                dropped++;
+            }
+            if (dropped > 0) ClearGraphCache();
+            return dropped;
+
+            IEnumerable<Slot> IdleSlots()
+            {
+                if (_retainedSlots != null) foreach (Slot s in _retainedSlots.Values) yield return s;
+                if (_slotPool != null) foreach (Slot s in _slotPool) yield return s;
+            }
         }
 
         /// <summary>The prefix cache evicts finished requests' slots before a new request needs their room: what the device
@@ -397,15 +444,34 @@ namespace TensorSharp.Models
                 DisposeSlot(slot);
         }
 
-        /// <summary>Grow a slot's caches to hold <paramref name="required"/> tokens, keeping its rows.</summary>
-        private void EnsureSlotCapacity(Slot slot, int required)
+        /// <summary>
+        /// Grow a slot's caches to hold <paramref name="required"/> tokens, keeping its rows. A request's
+        /// <paramref name="reservation"/> (its prompt and whole generation) is held as asked, rounded up to
+        /// <see cref="ReservationStepTokens"/>; growth past what was reserved doubles, by no more than
+        /// <see cref="SlotGrowthHeadroomTokens"/>.
+        /// </summary>
+        private void EnsureSlotCapacity(Slot slot, int required, bool reservation = false)
         {
             if (required <= slot.Capacity) return;
             if (required > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {required} exceeds configured max context {_maxContextLength}.");
-            int capacity = Math.Max(slot.Capacity, 1);
-            while (capacity < required)
-                capacity = Math.Min(_maxContextLength, capacity * 2);
+            int capacity;
+            if (reservation)
+            {
+                // Four Qwen3.8-27B DFlash2 requests of 8K tokens each grew pooled 512-cell slots to 12K cells (16K before
+                // the headroom bound): a gigabyte of K/V no request could use, and a 24 GB GPU then had no memory for the
+                // step's state copies.
+                capacity = (int)Math.Min(_maxContextLength, (required + (long)ReservationStepTokens - 1) / ReservationStepTokens * ReservationStepTokens);
+            }
+            else
+            {
+                capacity = Math.Max(slot.Capacity, 1);
+                while (capacity < required)
+                    capacity = Math.Min(_maxContextLength, capacity * 2);
+                // Doubled, but no more than SlotGrowthHeadroomTokens past what is needed: a 16K-token clone that its request's
+                // reservation grew by a few dozen tokens became 32K cells, twice the memory and the upload.
+                capacity = Math.Min(capacity, Math.Min(_maxContextLength, required + SlotGrowthHeadroomTokens));
+            }
             if (TryGrowSlotOnDevice(slot, capacity)) return;
             SyncToHost(slot);
             (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
@@ -427,6 +493,7 @@ namespace TensorSharp.Models
                 if (from[l] == null) continue;
                 for (int r = 0; r < from[l].Length; r++)
                 {
+                    if (from[l][r] == null) continue;   // a rank that does not run this entry (a draft layer off rank 0)
                     using Tensor src = from[l][r].Narrow(1, 0, rows);
                     using Tensor dst = to[l][r].Narrow(1, 0, rows);
                     Ops.Copy(dst, src);
@@ -597,8 +664,68 @@ namespace TensorSharp.Models
         /// slot or does not continue its slot at the given position.</summary>
         /// <param name="features">Per request, a buffer for its rows' drafter features, or null (see
         /// <see cref="IUnifiedBatchModel.TryForwardUnified"/>); entries are set to null when no graph captured them.</param>
+        /// <remarks>
+        /// A step whose graph finds no device memory for its compute buffer (nothing ran) is retried once after the cached
+        /// graphs and kept arenas are freed, then run as two halves of its requests, each the same way. Failed, it failed
+        /// every request it carried: four Qwen3.8-27B DFlash2 prompts on a 24 GB GPU, where Qwen35Model serves them.
+        /// </remarks>
         private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
             float[][] features = null)
+        {
+            try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
+            catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
+            {
+                FreeGraphMemory();
+                try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
+                catch (InvalidOperationException again) when (IsGraphAllocationFailure(again) && requestIds.Count > 1)
+                {
+                    FreeGraphMemory();
+                    int half = requestIds.Count / 2;
+                    // The halves pass the same checks the whole did, so each runs or throws: none declines.
+                    return ForwardPart(0, half) && ForwardPart(half, requestIds.Count - half);
+                }
+            }
+
+            bool ForwardPart(int from, int count)
+            {
+                var ids = new string[count];
+                var parts = new int[count][];
+                var partStarts = new int[count];
+                var logits = new float[count][];
+                float[][] partFeatures = features == null ? null : new float[count][];
+                for (int i = 0; i < count; i++)
+                {
+                    ids[i] = requestIds[from + i];
+                    parts[i] = chunks[from + i];
+                    partStarts[i] = starts[from + i];
+                    logits[i] = outLogits[from + i];
+                    if (partFeatures != null) partFeatures[i] = features[from + i];
+                }
+                bool ran = TryForwardSlots(ids, parts, partStarts, logits, partFeatures);
+                Array.Copy(logits, 0, outLogits, from, count);
+                if (partFeatures != null) Array.Copy(partFeatures, 0, features, from, count);
+                return ran;
+            }
+        }
+
+        /// <summary>Frees the device memory a step can do without: the cached graphs, the kept arenas and the idle slots'
+        /// device copies.</summary>
+        private void FreeGraphMemory()
+        {
+            ClearGraphCache();
+            if (IsGgmlBackend) GgmlBasicOps.ReleaseKeptArenas();
+            DropIdleSlotDeviceCopies();
+        }
+
+        /// <summary>A graph's build found no device memory for its compute buffer (ggml_ops_graph_builder.cpp).</summary>
+        private static bool IsGraphAllocationFailure(Exception ex)
+            => ex.Message.Contains("failed to allocate the graph's compute memory", StringComparison.Ordinal);
+
+        /// <summary>Forwards over several requests that fail as a graph's compute allocation would, before running (tests).</summary>
+        internal int InjectedForwardAllocationFailures { get; set; }
+
+        private bool TryForwardSlotsOnce(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
+            float[][] features)
         {
             if (!SupportsPerSequenceFusedForward || _slots == null || HasPendingMedia || _pendingPositionTable != null) return false;
             int n = requestIds.Count;
@@ -621,6 +748,11 @@ namespace TensorSharp.Models
             }
             for (int s = 0; s < n; s++)
                 EnsureSlotCapacity(slots[s], checked(starts[s] + counts[s]));
+            if (n > 1 && InjectedForwardAllocationFailures > 0)
+            {
+                InjectedForwardAllocationFailures--;
+                throw new InvalidOperationException($"{Config.Architecture} graph step failed: graph builder: failed to allocate the graph's compute memory. (injected)");
+            }
 
             var flatTokens = new int[rows];
             var positions = new int[rows];

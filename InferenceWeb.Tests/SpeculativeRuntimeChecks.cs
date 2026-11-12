@@ -91,12 +91,7 @@ internal static class SpeculativeRuntimeChecks
     public static async Task AssertEngineSpeculationMatchesPlain(Func<ModelBase> create, SpeculationOptions speculation,
         string label, int maxNew = 20)
     {
-        int[][] prompts =
-        {
-            Enumerable.Range(0, 24).Select(i => 40 + i % 6).ToArray(),
-            Enumerable.Range(0, 19).Select(i => 50 + (i * 5) % 9).ToArray(),
-            Enumerable.Range(0, 27).Select(i => 44 + i % 4).ToArray(),
-        };
+        int[][] prompts = EnginePrompts;
         foreach (int concurrent in new[] { 1, prompts.Length })
         {
             int[][] chosen = prompts.Take(concurrent).ToArray();
@@ -108,6 +103,25 @@ internal static class SpeculativeRuntimeChecks
                     $"{label} x{concurrent}: request {r} gave [{string.Join(",", drafted[r])}], plain [{string.Join(",", plain[r])}]");
             Assert.True(verified > 0, $"{label} x{concurrent}: no batched verify ran");
         }
+    }
+
+    private static readonly int[][] EnginePrompts =
+    {
+        Enumerable.Range(0, 24).Select(i => 40 + i % 6).ToArray(),
+        Enumerable.Range(0, 19).Select(i => 50 + (i * 5) % 9).ToArray(),
+        Enumerable.Range(0, 27).Select(i => 44 + i % 4).ToArray(),
+    };
+
+    /// <summary>Several requests served at once through the engine's unified step (plain decoding) give the same streams
+    /// from <paramref name="variant"/> as from <paramref name="baseline"/>.</summary>
+    public static async Task AssertEngineStreamsMatch(Func<ModelBase> baseline, Func<ModelBase> variant, string label,
+        int maxNew = 20)
+    {
+        int[][] expected = await ServeAsync(baseline, EnginePrompts, null, maxNew, verifySteps: null);
+        int[][] actual = await ServeAsync(variant, EnginePrompts, null, maxNew, verifySteps: null);
+        for (int r = 0; r < EnginePrompts.Length; r++)
+            Assert.True(expected[r].SequenceEqual(actual[r]),
+                $"{label}: request {r} gave [{string.Join(",", actual[r])}], expected [{string.Join(",", expected[r])}]");
     }
 
     private static async Task<int[][]> ServeAsync(Func<ModelBase> create, int[][] prompts, SpeculationOptions speculation,

@@ -445,6 +445,7 @@ namespace TensorSharp.Models
                 if (_cacheK[l] == null) continue;
                 for (int r = 0; r < _mesh.TensorParallel; r++)
                 {
+                    if (_cacheK[l][r] == null) continue;   // a rank that does not run this entry (a draft layer off rank 0)
                     _cacheK[l][r] = Grow(_cacheK[l][r], NewCacheTensor(l, r, capacity, value: false));
                     if (_cacheV[l]?[r] != null) _cacheV[l][r] = Grow(_cacheV[l][r], NewCacheTensor(l, r, capacity, value: true));
                 }

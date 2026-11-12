@@ -96,22 +96,42 @@ namespace TensorSharp.Models
         private bool RankedSlotCopies => _rankGraphs && _graphTpRanks == null && _mesh.TensorParallel > 1 && _mesh.Stages == 1 && IsGgmlBackend;
 
         /// <summary>Every tensor of <paramref name="slot"/> a graph binds has a device copy of the size the graphs bind
-        /// (one device), so a copy can read the device instead of the host.</summary>
+        /// (one device, or each rank's share on its own device under per-rank graphs), so a copy can read the device
+        /// instead of the host.</summary>
         private bool DeviceCopiesResident(Slot slot)
         {
-            if (!KeepsDeviceCopies || _mesh.TensorParallel != 1 || _mesh.Stages != 1) return false;
-            foreach (Tensor t in AllCacheTensors(slot.K).Concat(AllCacheTensors(slot.V)))
-                if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.Storage.ByteLength)
-                    return false;
-            if (slot.Recurrent != null)
-                foreach (RecurrentState[] layer in slot.Recurrent)
-                    if (layer != null)
-                        foreach (RecurrentState state in layer)
-                            if (state?.GraphTensors is { } tensors)
-                                foreach (Tensor t in tensors)
-                                    if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.ElementCount() * sizeof(float))
-                                        return false;
-            return true;
+            bool ranked = RankedSlotCopies;
+            if (!KeepsDeviceCopies || _mesh.Stages != 1 || (_mesh.TensorParallel != 1 && !ranked)) return false;
+            int previous = ranked ? GgmlBasicOps.GetActiveRank() : 0;
+            try
+            {
+                for (int rank = 0; rank < _mesh.TensorParallel; rank++)
+                {
+                    if (ranked) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, rank));
+                    foreach (Tensor t in RankCacheTensors(slot.K, rank).Concat(RankCacheTensors(slot.V, rank)))
+                        if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.Storage.ByteLength)
+                            return false;
+                    if (slot.Recurrent == null) continue;
+                    foreach (RecurrentState[] layer in slot.Recurrent)
+                        if (layer != null && rank < layer.Length && layer[rank]?.GraphTensors is { } tensors)
+                            foreach (Tensor t in tensors)
+                                if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.ElementCount() * sizeof(float))
+                                    return false;
+                }
+                return true;
+            }
+            finally
+            {
+                if (ranked) GgmlBasicOps.SetActiveRank(previous);
+            }
+        }
+
+        /// <summary>A slot's cache tensors on one rank (an entry the rank does not run has none).</summary>
+        private static IEnumerable<Tensor> RankCacheTensors(Tensor[][] caches, int rank)
+        {
+            if (caches == null) yield break;
+            foreach (Tensor[] entry in caches)
+                if (entry != null && rank < entry.Length && entry[rank] != null) yield return entry[rank];
         }
 
         /// <summary>The GGML backend keeps device copies of what graphs bind (Metal, CUDA, Vulkan; not the CPU, whose
@@ -141,6 +161,16 @@ namespace TensorSharp.Models
             if (TryCopySlotOnDevice(source, slot, targetBound: inPlace))
                 return slot;
             SyncToHost(source);
+            // A fresh target where the executor keeps separate device copies: they are zero-filled on the device and the
+            // copy writes the rows into them, as into a pooled slot. Dropped, the target's next graph uploaded every
+            // cell of its capacity (Qwen3.8-27B, a 16K-token prefix grown to 32K cells: 2 GB at its first token), and a
+            // later growth of it went through the host too.
+            if (!inPlace && _mesh.Stages == 1 && _mesh.TensorParallel == 1
+                && GraphExecutor is { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } })
+            {
+                PrimeDeviceCopies(slot, overwritten: true);
+                inPlace = true;
+            }
             CopyRowsOnHost(source.K, slot.K, source.Length, inPlace);
             CopyRowsOnHost(source.V, slot.V, source.Length, inPlace);
             bool kept = true;
@@ -214,12 +244,13 @@ namespace TensorSharp.Models
             {
                 var g = new GraphProgramBuilder(record: true);
                 int copies = 0;
-                // Every cache entry (the layers' K and V, the extra key caches) by its own heads and width.
+                // Every cache entry (the layers' K and V, the extra key caches) by its own heads and width. A rank holds
+                // no tensor of an entry it does not run (a draft layer runs whole on rank 0 under tensor parallelism).
                 for (int e = 0; e < source.K.Length; e++)
                 {
                     if (CacheStage(e) != stage) continue;
-                    if (source.K[e] != null) CopyRows(source.K[e][rank], target.K[e][rank]);
-                    if (source.V[e] != null) CopyRows(source.V[e][rank], target.V[e][rank]);
+                    if (source.K[e]?[rank] != null) CopyRows(source.K[e][rank], target.K[e][rank]);
+                    if (source.V[e]?[rank] != null) CopyRows(source.V[e][rank], target.V[e][rank]);
                 }
                 for (int l = 0; l < TotalLayers; l++)
                 {
@@ -314,6 +345,7 @@ namespace TensorSharp.Models
                 if (from[l] == null) continue;
                 for (int r = 0; r < from[l].Length; r++)
                 {
+                    if (from[l][r] == null) continue;   // a rank that does not run this entry (a draft layer off rank 0)
                     CopyCacheRows(from[l][r], to[l][r], rows);
                     if (inPlace) UploadCacheRows(to[l][r], rows);
                     else InvalidateTensorDeviceCache(to[l][r]);

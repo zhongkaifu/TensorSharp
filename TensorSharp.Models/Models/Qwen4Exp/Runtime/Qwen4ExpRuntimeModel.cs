@@ -42,6 +42,7 @@ namespace TensorSharp.Models
 
         private PleSpec _ple;
         private readonly Dictionary<int, Tensor> _pleTaps = new();
+        private readonly Dictionary<int, float[]> _pleTapRows = new();   // read at load, before residency (PrepareLoadedWeights)
 
         public Qwen4ExpRuntimeModel(string ggufPath, BackendType backend, string draftModelPath = null, int layerSplitDegree = 1,
             int tpDegree = 1, ITensorParallelGroup tpGroup = null)
@@ -420,9 +421,31 @@ namespace TensorSharp.Models
         }
 
         /// <summary>ple_conv1d [kernel, hc·n] (one weight per channel and tap) as tap rows on the device.</summary>
-        private unsafe Tensor PleTaps(int layer)
+        private Tensor PleTaps(int layer)
         {
             if (_pleTaps.TryGetValue(layer, out Tensor taps)) return taps;
+            float[] rowsByTap = _pleTapRows.Remove(layer, out float[] read) ? read : ReadPleTapRows(layer);
+            taps = CreateFloatTensor(rowsByTap, Ple.ConvKernel, Ple.StreamFloats);
+            _pleTaps[layer] = taps;
+            return taps;
+        }
+
+        /// <summary>Every owned PLE layer's tap rows, read while the conv weights' host copies exist: residency may
+        /// release them (ggml_cuda with host-served experts did, and the first graph read a null pointer).</summary>
+        protected override void PrepareLoadedWeights()
+        {
+            base.PrepareLoadedWeights();
+            PleSpec p = Ple;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                string name = LayerName(l, "ple_conv1d.weight");
+                if (p.IsPle[l] && (_weights.ContainsKey(name) || _quantWeights.ContainsKey(name)))
+                    _pleTapRows[l] = ReadPleTapRows(l);
+            }
+        }
+
+        private float[] ReadPleTapRows(int layer)
+        {
             PleSpec p = Ple;
             string name = LayerName(layer, "ple_conv1d.weight");
             long width = p.StreamFloats;
@@ -430,17 +453,15 @@ namespace TensorSharp.Models
             var raw = new float[width * kernel];
             if (_weights.TryGetValue(name, out Tensor w))
                 Array.Copy(w.GetElementsAsFloat((int)w.ElementCount()), raw, raw.Length);
-            else if (_quantWeights.TryGetValue(name, out QuantizedWeight q))
+            else if (_quantWeights.TryGetValue(name, out QuantizedWeight q) && q.Data != IntPtr.Zero)
                 NativeDequant.DequantizeToFloat32(q.GgmlType, q.Data, raw, 0, raw.Length);
             else
-                throw new NotSupportedException($"{Config.Architecture}: {name} is missing.");
+                throw new NotSupportedException($"{Config.Architecture}: {name} is missing or has no host copy.");
             var rowsByTap = new float[raw.Length];
             for (long c = 0; c < width; c++)
                 for (int k = 0; k < kernel; k++)
                     rowsByTap[k * width + c] = raw[c * kernel + k];
-            taps = CreateFloatTensor(rowsByTap, kernel, width);
-            _pleTaps[layer] = taps;
-            return taps;
+            return rowsByTap;
         }
 
         /// <summary>This step's PLE rows, [rows, n]: each sequence's n-gram hashes over its history and its rows (the

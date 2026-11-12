@@ -365,9 +365,12 @@ public sealed class Qwen35RuntimeTests : IDisposable
     }
 
     /// <summary>On per-rank graphs a shared-prefix checkpoint and its clone are copied rank by rank on each rank's device
-    /// (each rank's share of the caches and states), and the clone continues exactly as the request did.</summary>
+    /// (each rank's share of the caches and states), and the clone continues exactly as the request did. A NextN draft
+    /// layer runs whole on rank 0, so the other ranks hold no tensor of its cache (Qwen3.8-27B with its MTP layer failed
+    /// every request under --tp 2 at its first checkpoint).</summary>
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
     [InlineData("dense")]
+    [InlineData("dense-nextn")]
     [InlineData("moe-tp")]
     public void RankGraphCheckpointsCopyOnEachRanksDevice(string variant)
     {
@@ -700,6 +703,45 @@ public sealed class Qwen35RuntimeTests : IDisposable
         var options = new SpeculationOptions { Enabled = true, SpeculatorName = speculator, MaxDraftTokens = 3, MinDraftProb = 0 };
         await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() => Create(path, backend: backend), options,
             $"qwen35 {variant} {speculator} {backend}");
+    }
+
+    /// <summary>A batched verify whose graph finds no device memory for its compute buffer is retried once after the
+    /// cached graphs are freed, and declined (the step decodes plainly) when it fails again: the requests get the plain
+    /// greedy streams either way, where the failure used to fail them.</summary>
+    [Theory]
+    [InlineData(1)]   // the retry runs the verify
+    [InlineData(3)]   // a verify declined (both attempts fail), the next one retried
+    public async Task VerifyOutOfDeviceMemoryDeclinesInsteadOfFailing(int failures)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.NGram, MaxDraftTokens = 3, MinDraftProb = 0 };
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() =>
+        {
+            var model = Create(path);
+            model.InjectedVerifyAllocationFailures = failures;
+            return model;
+        }, options, $"qwen35 dense, {failures} verify allocation failures");
+    }
+
+    /// <summary>A unified step over several requests whose graph finds no device memory for its compute buffer is
+    /// retried once after the cached graphs are freed, then run as two halves of its requests: the requests get the
+    /// streams of an unhindered run, where the failure used to fail them all.</summary>
+    [Theory]
+    [InlineData(1)]   // the retry runs the step
+    [InlineData(2)]   // both attempts fail: the step runs in halves
+    public async Task ForwardOutOfDeviceMemoryRetriesThenSplits(int failures)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        Qwen35RuntimeModel hindered = null;
+        await SpeculativeRuntimeChecks.AssertEngineStreamsMatch(() => Create(path), () =>
+        {
+            hindered = Create(path);
+            hindered.InjectedForwardAllocationFailures = failures;
+            return hindered;
+        }, $"qwen35 dense, {failures} forward allocation failures");
+        Assert.Equal(0, hindered.InjectedForwardAllocationFailures);
     }
 
     /// <summary>The NextN/MTP block drafts through the runtime's generic draft layer: speculation
@@ -1098,6 +1140,62 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { new[] { tail[i] } }, new[] { prompt.Length + i }, rows));
             double rel = RelL2(rows[0], expected[i]);
             Assert.True(rel <= 1e-5, $"row {i} after the growth: relL2 {rel:E2}");
+        }
+    }
+
+    /// <summary>A device without room for a new request's slot first takes back what the idle slots hold: a finished
+    /// request kept for a continuation drops its device copies (its host tensors keep every row and state), and a
+    /// continuation cloned from it later decodes as the request did. Kept on the device, finished requests filled a GPU
+    /// until new requests' steps found no memory. (Metal admits by its working set and keeps no separate copies; Vulkan
+    /// admits no slot by device memory, so only a failed step's retry drops them there.)</summary>
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(BackendType.GgmlCuda)]
+    public void IdleSlotsGiveBackTheirDeviceCopiesOnCuda(BackendType backend) => AssertIdleSlotsGiveBackDeviceCopies(backend);
+
+    private void AssertIdleSlotsGiveBackDeviceCopies(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        int[] prompt = Enumerable.Range(0, 37).Select(i => 41 + (i * 7) % 90).ToArray();
+        int[] tail = { 71, 72, 73 };
+        var expected = new List<float[]>();
+        using (var reference = Create(path, backend: backend))
+        {
+            var r = (IUnifiedBatchModel)reference;
+            r.EnsureSequenceSlot("a", 64);
+            var logits = new float[1][];
+            Assert.True(r.TryForwardUnified(new[] { "a" }, new[] { prompt }, new[] { 0 }, logits));
+            for (int i = 0; i < tail.Length; i++)
+            {
+                Assert.True(r.TryForwardUnified(new[] { "a" }, new[] { new[] { tail[i] } }, new[] { prompt.Length + i }, logits));
+                expected.Add((float[])logits[0].Clone());
+            }
+        }
+
+        using var model = Create(path, backend: backend);
+        const long gb = 1L << 30;
+        (long Free, long Total)? memory = (64 * gb, 64 * gb);
+        model.DeviceMemoryProbe = () => memory;
+        var unified = (IUnifiedBatchModel)model;
+        var prefixCache = (TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel)model;
+        var rows = new float[1][];
+        unified.EnsureSequenceSlot("a", 64);
+        Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { prompt }, new[] { 0 }, rows));
+        Assert.True(prefixCache.TryCaptureCopy("a", "kept", out _));   // "a" keeps running beside its copy
+
+        long resident = TensorSharp.GGML.GgmlBasicOps.DeviceCopyCacheResidentBytes();
+        memory = (1, 64 * gb);
+        Assert.Throws<TensorSharp.Runtime.Scheduling.SequenceSlotUnavailableException>(() => unified.EnsureSequenceSlot("b", 64));
+        Assert.True(TensorSharp.GGML.GgmlBasicOps.DeviceCopyCacheResidentBytes() < resident, "the kept slot's device copies were dropped");
+
+        memory = (64 * gb, 64 * gb);
+        Assert.True(prefixCache.TryMaterialize(new TensorSharp.Runtime.Scheduling.PrefixCache.MaterializeRequest(
+            TensorSharp.Runtime.Scheduling.PrefixCache.MaterializeOp.Clone, "kept", "c", prompt.Length, prompt.Length)));
+        for (int i = 0; i < tail.Length; i++)
+        {
+            Assert.True(unified.TryForwardUnified(new[] { "c" }, new[] { new[] { tail[i] } }, new[] { prompt.Length + i }, rows));
+            double rel = RelL2(rows[0], expected[i]);
+            Assert.True(rel <= 1e-5, $"row {i} of the continuation: relL2 {rel:E2}");
         }
     }
 

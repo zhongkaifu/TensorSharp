@@ -96,9 +96,30 @@ namespace TensorSharp.Models
             int[] tokens, float[] logits, float[] features)
             => TryVerifySlots(requestIds, positions, window, tokens, logits, features);
 
+        /// <summary>
+        /// <see cref="TryVerifySlotsOnce"/>, retried once after the cached graphs and kept arenas are freed when the
+        /// verify's graph finds no device memory for its compute buffer (nothing ran), and declined (false) when it still
+        /// finds none: the step then decodes its sequences plainly. Failed, it failed every request it carried (four
+        /// Qwen3.8-27B DFlash2 streams on a 24 GB GPU, where Qwen35Model serves them).
+        /// </summary>
+        private bool TryVerifySlots(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
+            float[] logitsOut, float[] featuresOut)
+        {
+            try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut); }
+            catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
+            {
+                FreeGraphMemory();
+                try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut); }
+                catch (InvalidOperationException again) when (IsGraphAllocationFailure(again)) { return false; }
+            }
+        }
+
+        /// <summary>Verifies that fail as a graph's compute allocation would, before running (tests).</summary>
+        internal int InjectedVerifyAllocationFailures { get; set; }
+
         /// <summary>One forward of every sequence's window on its own slot: all rows' logits, the drafter's feature
         /// rows, and on a hybrid stack the recurrent state after each row (settled by the commit).</summary>
-        private bool TryVerifySlots(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
+        private bool TryVerifySlotsOnce(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
             float[] logitsOut, float[] featuresOut)
         {
             int n = requestIds.Count;
@@ -121,6 +142,11 @@ namespace TensorSharp.Models
             }
             for (int s = 0; s < n; s++)
                 EnsureSlotCapacity(slots[s], checked(positions[s] + window));
+            if (InjectedVerifyAllocationFailures > 0)
+            {
+                InjectedVerifyAllocationFailures--;
+                throw new InvalidOperationException($"{Config.Architecture} graph step failed: graph builder: failed to allocate the graph's compute memory. (injected)");
+            }
 
             bool dflash = HasDFlash;
             var request = new GraphRequest
