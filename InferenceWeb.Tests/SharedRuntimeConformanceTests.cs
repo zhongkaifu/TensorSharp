@@ -212,10 +212,11 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         string path = Fixture(family);
         // Managed rows are computed row by row: batching must not change them at all. Device
         // kernels may pick a different matmul for one row than for several.
-        // ggml_cuda picks different matmul kernels for one row than for several and rounds their
-        // activations differently: measured 1.4e-3 / 2.2e-3 on an RTX PRO 6000 (2026-11-10).
+        // ggml_cuda and ggml_vulkan pick different matmul kernels for one row than for several and
+        // round their activations differently: measured 1.4e-3 / 2.2e-3 on an RTX PRO 6000 (ggml_cuda,
+        // 2026-11-10), 1.25e-3 on an A40 (ggml_vulkan, hunyuan-dense, 2026-11-12).
         double tolerance = backend == BackendType.Cpu ? 1e-6
-            : backend is BackendType.Mlx or BackendType.GgmlCuda ? 5e-3 : 1e-3;
+            : backend is BackendType.Mlx or BackendType.GgmlCuda or BackendType.GgmlVulkan ? 5e-3 : 1e-3;
         SlotParity.AssertBatchedSlotsMatchAlone(() => Create(family, path, tp, stages, backend), tolerance,
             $"{family} tp={tp} stages={stages} {backend}");
     }

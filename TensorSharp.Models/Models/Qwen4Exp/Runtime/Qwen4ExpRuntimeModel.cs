@@ -43,8 +43,8 @@ namespace TensorSharp.Models
         private PleSpec _ple;
         private readonly Dictionary<int, Tensor> _pleTaps = new();
 
-        public Qwen4ExpRuntimeModel(string ggufPath, BackendType backend, string draftModelPath = null)
-            : base(ggufPath, backend, 1, null, 1, draftModelPath)
+        public Qwen4ExpRuntimeModel(string ggufPath, BackendType backend, string draftModelPath = null, int layerSplitDegree = 1)
+            : base(ggufPath, backend, 1, null, layerSplitDegree, draftModelPath)
         {
             PleSpec ple = Ple;
             if (ple.Hc < 2)

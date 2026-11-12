@@ -372,11 +372,12 @@ namespace TensorSharp.Models
             _requestedTpDegree = tpDegree;
             _backend = backend;
             UseFloatKvCacheOnMlx();
-            // The pure-C# CPU backend must never touch native (ggml P/Invoke) dequant — route
-            // every dequant/row-size through the managed implementation (bit-exact vs native,
-            // verified). Other backends keep native dequant (faster load; their runtime quant
-            // ops go through GgmlBasicOps, not NativeDequant). One model/backend at a time.
-            NativeDequant.PreferManaged = backend == BackendType.Cpu;
+            // The pure-C# CPU backend and the direct-CUDA backend never touch GGML: every load-time
+            // dequant/row-size goes through the managed implementation (bit-exact vs native, verified).
+            // On cuda it costs nothing measurable (A40, without libGgmlOps: Qwen3.5-9B Q8_0 loads in 3.60 s
+            // against 3.55 s, Qwen3.6-35B-A3B 5.5 s against 6.5 s). The GGML backends keep native dequant
+            // (their runtime quant ops go through GgmlBasicOps anyway). One model/backend at a time.
+            NativeDequant.PreferManaged = backend is BackendType.Cpu or BackendType.Cuda;
             ExecutionPlan = new BackendExecutionPlan(backend);
             MultimodalInjector = new ModelMultimodalInjector(this);
 

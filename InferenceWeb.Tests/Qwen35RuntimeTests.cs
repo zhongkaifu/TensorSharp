@@ -98,11 +98,12 @@ public sealed class Qwen35RuntimeTests : IDisposable
     private static double PerOpTolerance(string variant)
         => RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
 
-    /// <summary>Backends whose matmuls round activations (ggml_cpu to BF16; ggml_cuda to BF16 / Q8_1,
-    /// with different kernels for one row than for several): measured on ggml_cuda (RTX PRO 6000,
-    /// 2026-11-10) up to 7.4e-3 against the managed reference and 5.2e-3 graph vs per-op on these
-    /// fixtures, ggml_cpu up to 1.5e-2.</summary>
-    private static bool RoundsActivations(BackendType backend) => backend is BackendType.GgmlCpu or BackendType.GgmlCuda;
+    /// <summary>Backends whose matmuls round activations (ggml_cpu to BF16; ggml_cuda and ggml_vulkan to
+    /// BF16 / Q8_1, with different kernels for one row than for several): measured on ggml_cuda (RTX PRO
+    /// 6000, 2026-11-10) up to 7.4e-3 against the managed reference and 5.2e-3 graph vs per-op on these
+    /// fixtures, ggml_vulkan (A40, 2026-11-12) 6.3e-3 graph vs per-op, ggml_cpu up to 1.5e-2.</summary>
+    private static bool RoundsActivations(BackendType backend)
+        => backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlVulkan;
 
     private static double RelL2(float[] a, float[] b)
     {
