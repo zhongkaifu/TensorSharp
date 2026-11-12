@@ -166,21 +166,16 @@ namespace TensorSharp.Models
         /// GGML devices (Qwen3.6-35B-A3B UD-Q4_K_M, runtime vs Qwen35Model: one A40 ggml_cuda, a 3.6K-token prompt
         /// then 512 tokens 762-804 vs 813-871 ms / 106.7-108.1 vs 104.0 tok/s, perplexity over 4,088 tokens 13.10 vs
         /// 13.13; ggml_metal on an M5 Pro 2.17 vs 2.21-2.23 s / 66.7-66.8 vs 66.8-67.0 tok/s, 13.13 vs 13.09; ggml_cpu
-        /// 55-token prompt 0.57-0.59 vs 1.24-2.04 s, decode 37-46 vs 6.4-7.4 tok/s, 12.86 vs 12.96). MLX keeps them on
-        /// Qwen35Model: it wires 3 GB more for a 3.6K-token prompt there. Qwen35Model also keeps --tp (its per-rank
-        /// fused graphs) and the other backends (direct CUDA and ggml_vulkan are not at parity yet).
+        /// 55-token prompt 0.57-0.59 vs 1.24-2.04 s, decode 37-46 vs 6.4-7.4 tok/s, 12.86 vs 12.96) and on MLX, whose
+        /// lone prompts step 512 tokens at a time (Qwen3.6-35B-A3B UD-IQ2_XXS, M5 Pro, a 3.6K-token prompt then 512
+        /// tokens: 4.48-4.65 vs 5.27-5.29 s / 38.1 vs 34.0 tok/s, peak wired 16 vs 16-17 GB; perplexity over 1,022
+        /// tokens 14.73 vs 14.72). Qwen35Model keeps --tp (its per-rank fused graphs) and the other backends (direct
+        /// CUDA and ggml_vulkan are not at parity yet).
         /// </summary>
         internal static bool ServesOneDevice(Architecture.ModelCreateContext context)
             => context.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu or BackendType.Mlx
                && context.TpDegree <= 1 && context.TpGroup == null && context.LayerSplitDegree <= 1
-               && context.Probe != null && (context.Backend != BackendType.Mlx || !HasRoutedExperts(context.Probe));
-
-        private static bool HasRoutedExperts(GgufFile probe)
-        {
-            foreach (string name in probe.Tensors.Keys)
-                if (name.Contains("_exps.", StringComparison.Ordinal)) return true;
-            return false;
-        }
+               && context.Probe != null;
 
         protected override bool IsRecurrentLayer(int layer) => _isRecurrent[layer];
 

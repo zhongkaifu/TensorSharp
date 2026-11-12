@@ -80,7 +80,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("dense", BackendType.GgmlVulkan, 1, false)]
     [InlineData("dense", BackendType.Cuda, 1, false)]
     [InlineData("dense", BackendType.Mlx, 1, true)]
-    [InlineData("moe", BackendType.Mlx, 1, false)]
+    [InlineData("moe", BackendType.Mlx, 1, true)]
     [InlineData("moe", BackendType.GgmlCuda, 1, true)]
     [InlineData("moe", BackendType.GgmlMetal, 1, true)]
     [InlineData("moe", BackendType.GgmlCpu, 1, true)]
