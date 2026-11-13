@@ -598,7 +598,7 @@ TestMatrix 配置中 sweep。
 | `TS_CUDA_Q80_MMQ_MAX_ROWS` | 直连 `cuda` 后端 | 激活行数在 32 到该值之间的 Q8_0 矩阵乘直接在原始 Q8_0 块上执行 int8 张量核心 GEMM（mma.m16n8k32，ggml MMQ 风格）；超过该值后 F16 GEMM 路线更优（MMQ 的权重扫描次数随 ceil(rows/128) 增长） | `512` | 未注册 | 否 |
 | `TS_CUDA_PREFILL_GRAPH_MAX` | 直连 `cuda` 后端 | 缓存的 prefill + decode CUDA graph 数量（LRU 淘汰；每个 graph 固定持有其捕获时使用的内存池块）。Qwen 3.5 / 3.6 纯文本 prefill 与 decode 会把逐算子层循环捕获为 graph 并重放（结果逐位一致；捕获失败时回退普通路径） | `4` | 未注册 | 否 |
 | `TS_CUDA_PREFILL_GRAPH_LOG` | 直连 `cuda` 后端 | 打印 graph 捕获/重放/中止事件（`1`） | 关闭 | 未注册 | 否 |
-| `TENSORSHARP_CUDA_POOL_LARGE_MB` | 直连 `cuda` 后端 | 全局大块（≥ 2 MB）显存缓存预算；让 prefill 级激活保持池化，避免每层重复 cuMemAlloc/cuMemFree | `1024` | 未注册 | 否 |
+| `TENSORSHARP_CUDA_POOL_LARGE_MB` | 直连 `cuda` 后端 | 全局大块（≥ 2 MB）显存缓存预算；让 prefill 级激活保持池化，避免每层重复 cuMemAlloc/cuMemFree（每次释放都会同步设备） | 显存的四分之一，至少 `1024` | 未注册 | 否 |
 | `TS_CUDA_PROFILE` | 直连 `cuda` 后端 | 退出时打印 CPU 回退算子与主机↔设备同步计数（`1`），含调用点归因（`2`） | 关闭 | 未注册 | 否 |
 
 ## 矩阵外的知识库配置

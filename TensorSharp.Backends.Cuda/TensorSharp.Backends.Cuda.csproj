@@ -80,6 +80,10 @@
     <CudaKernel Update="$(CudaKernelDir)/tensorsharp_q35_kernels.cu">
       <CommittedBaseline>false</CommittedBaseline>
     </CudaKernel>
+    <!-- The FP4 tensor-core products need sm_120a / sm_121a: the portable baseline would carry only traps. -->
+    <CudaKernel Update="$(CudaKernelDir)/tensorsharp_fp4_kernels.cu">
+      <CommittedBaseline>false</CommittedBaseline>
+    </CudaKernel>
     <CudaKernel Update="$(CudaKernelDir)/tensorsharp_q35_ninfer_attention.cu">
       <CommittedBaseline>false</CommittedBaseline>
     </CudaKernel>

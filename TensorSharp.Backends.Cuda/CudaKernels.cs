@@ -125,6 +125,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr quantMatmulQ80SingleF32;
         // ts_q80_vec_rows, one instantiation per row bound (1, 4, 8, 16).
         private readonly IntPtr[] quantMatmulQ80Vec;
+        private readonly IntPtr[] quantMatmulNvfp4Vec;
         private readonly IntPtr[] quantMatmulQ80Warp;
         private readonly IntPtr[] q80PairMma;
         private readonly IntPtr[][] q80PairTwin;
@@ -326,6 +327,7 @@ namespace TensorSharp.Cuda
             quantMatmulQ40Dp4aF32 = module.GetFunction("ts_quant_matmul_q4_0_dp4a_f32");
             quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
             quantMatmulQ80Vec = RowBoundFunctions(module, "ts_quant_matmul_q8_0_vec_f32");
+            quantMatmulNvfp4Vec = RowBoundFunctions(module, "ts_quant_matmul_nvfp4_vec_f32");
             quantMatmulQ80Warp = RowBoundFunctions(module, "ts_quant_matmul_q8_0_warp_f32");
             // Optional: a module before them has no pair (HasQ80Pair is then false).
             try
@@ -2908,6 +2910,21 @@ namespace TensorSharp.Cuda
                 Launch(quantMatmulQ80Warp[RowBoundIndex(rows)], (uint)((outDim + 7) / 8), 1, 1, 256, 1, 1, 0, stream, args);
             else
                 Launch(quantMatmulQ80Vec[RowBoundIndex(rows)], (uint)outDim, 1, 1, 128, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>NVFP4 matvec over 1..16 q8_1 activation rows, a CTA per output column, on the resident ggml blocks;
+        /// each row's result is the same whatever the row count.</summary>
+        public void LaunchQuantMatmulNvfp4VecRows(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim,
+            int rows, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqScratch;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
+            Launch(quantMatmulNvfp4Vec[RowBoundIndex(rows)], (uint)outDim, 1, 1, 128, 1, 1, 0, stream, args);
         }
 
         /// <summary>Whether <see cref="LaunchQuantMatmulQ80Pair"/> runs here: the module carries the pair and its

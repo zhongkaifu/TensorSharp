@@ -69,6 +69,30 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         AssertClose(expected, actual, 2e-2, "mlx");
     }
 
+    /// <summary>TS_Q4E_HC_Q8=1 on the shared runtime: the BF16 hyper-connection matrices become Q8_0 at load for every
+    /// backend (the managed CPU here), and the answers stay within Q8_0's rounding of the BF16 read.</summary>
+    [Fact]
+    public void HyperConnectionsReadAsQ8_0StayCloseToBf16()
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-hc-bf16.gguf"), indexerTopK: 64, qsa: false,
+            projectionType: SyntheticGguf.GgmlType.BF16);
+        float[][] bf16 = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt: false);
+        float[][] q8;
+        using (Qwen4ExpFormat.HcQ8ForCurrentFlowInTests(true))
+        {
+            q8 = Run(() =>
+            {
+                var model = new Qwen4ExpRuntimeModel(path, BackendType.Cpu);
+                Assert.Equal(WeightRequant.GgmlTypeQ8_0, model.QuantizedWeightTypeForTests("output_hc_down.weight"));
+                Assert.Equal(WeightRequant.GgmlTypeQ8_0, model.QuantizedWeightTypeForTests("blk.0.hc_ffn_up.weight"));
+                return model;
+            }, chunkedPrompt: false);
+        }
+        double[] errors = RowErrors(bf16, q8);
+        Assert.True(errors.Max() > 0, "the Q8_0 read changed nothing: the matrices stayed BF16");
+        AssertClose(bf16, q8, 2e-2, "hc q8_0 vs bf16");
+    }
+
     [GgmlTheory(BackendType.GgmlCpu)]
     [InlineData(false)]
     [InlineData(true)]

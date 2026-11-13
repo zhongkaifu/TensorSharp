@@ -6,11 +6,22 @@ namespace TensorSharp.Cuda
 {
     public static class CudaQuantizedOps
     {
+        /// <summary>
+        /// The resident layout of an NVFP4 matrix on a GPU with the FP4 tensor-core kernels (<see cref="CudaFp4Kernels"/>):
+        /// codes [rows][k/2] then UE4M3 scales [rows][k/16], the bytes of its ggml blocks repacked once as it becomes
+        /// resident (the 16-byte-aligned runs the TMA and vector loads need). Not a ggml type: only this class's matmul and
+        /// row lookups read it, and <see cref="TryGetResidentDevicePtr"/> does not hand such a weight out.
+        /// </summary>
+        internal const int Nvfp4PlanarType = 1040;
+
         private sealed class DeviceWeight : IDisposable
         {
             public IntPtr DevicePtr;
             public long RawBytes;
+            /// <summary>The layout the device bytes are in: the ggml type uploaded, or <see cref="Nvfp4PlanarType"/>.</summary>
             public int GgmlType;
+            /// <summary>The ggml type the weight was uploaded as.</summary>
+            public int SourceType;
             public long Ne0;
             public long Ne1;
             public int DeviceId;
@@ -180,6 +191,14 @@ namespace TensorSharp.Cuda
         private static readonly ScratchPool Q81SplitQsScratch = new ScratchPool();
         private static readonly ScratchPool Q81SplitDScratch = new ScratchPool();
 
+        // NVFP4 activation planes, row scales, split-K partials and the split-K tile counters (zeroed) of the FP4
+        // tensor-core products (see RunNvfp4Planar).
+        private static readonly ScratchPool Fp4CodesScratch = new ScratchPool();
+        private static readonly ScratchPool Fp4ScalesScratch = new ScratchPool();
+        private static readonly ScratchPool Fp4RowScaleScratch = new ScratchPool();
+        private static readonly ScratchPool Fp4PartialScratch = new ScratchPool();
+        private static readonly ScratchPool Fp4CounterScratch = new ScratchPool();
+
         private static IntPtr EnsureScratch(ScratchPool pool, CudaAllocator allocator, long bytes)
         {
             lock (Sync)
@@ -213,6 +232,24 @@ namespace TensorSharp.Cuda
             }
         }
 
+        /// <summary><see cref="EnsureScratch"/> whose bytes are zero when first handed out (the FP4 GEMM's split-K
+        /// counters, which the kernels return to zero after each product).</summary>
+        private static IntPtr EnsureZeroedScratch(ScratchPool pool, CudaAllocator allocator, long bytes)
+        {
+            lock (Sync)
+            {
+                pool.Allocations.TryGetValue(allocator, out ScratchAllocation before);
+                IntPtr previous = before?.Ptr ?? IntPtr.Zero;
+                IntPtr ptr = EnsureScratch(pool, allocator, bytes);
+                if (ptr != previous)
+                {
+                    long size = pool.Allocations[allocator].Bytes;
+                    CudaDriverApi.cuMemsetD8Async(ptr, 0, new UIntPtr((ulong)size), allocator.Stream.Handle).ThrowOnError();
+                }
+                return ptr;
+            }
+        }
+
         internal static void ReleaseScratch(CudaAllocator allocator)
         {
             lock (Sync)
@@ -223,6 +260,11 @@ namespace TensorSharp.Cuda
                 ReleaseScratch(AF16Scratch, allocator);
                 ReleaseScratch(Q81SplitQsScratch, allocator);
                 ReleaseScratch(Q81SplitDScratch, allocator);
+                ReleaseScratch(Fp4CodesScratch, allocator);
+                ReleaseScratch(Fp4ScalesScratch, allocator);
+                ReleaseScratch(Fp4RowScaleScratch, allocator);
+                ReleaseScratch(Fp4PartialScratch, allocator);
+                ReleaseScratch(Fp4CounterScratch, allocator);
             }
         }
 
@@ -643,7 +685,8 @@ namespace TensorSharp.Cuda
             var key = new CacheKey(allocator, cacheKey);
             lock (Sync)
             {
-                if (Cache.TryGetValue(key, out DeviceWeight w) && w.DevicePtr != IntPtr.Zero)
+                // A planar NVFP4 matrix is not ggml blocks: its callers read the bytes by their ggml type.
+                if (Cache.TryGetValue(key, out DeviceWeight w) && w.DevicePtr != IntPtr.Zero && w.GgmlType != Nvfp4PlanarType)
                 {
                     devicePtr = w.DevicePtr;
                     ggmlType = w.GgmlType;
@@ -735,7 +778,7 @@ namespace TensorSharp.Cuda
             DeviceWeight weight = EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
             inputStorage.EnsureDeviceCurrent();
             RunResidentMatmul(
-                allocator, kernels, weight.DevicePtr, ggmlType,
+                allocator, kernels, weight.DevicePtr, weight.GgmlType,
                 inputPtr, resultPtr, checked((int)ne0), checked((int)ne1),
                 checked((int)input.Sizes[0]), q8Kernel);
             resultStorage.MarkDeviceModified();
@@ -860,6 +903,43 @@ namespace TensorSharp.Cuda
         /// wants a sequence's result not to depend on its batchmates). Q2_K/Q3_K
         /// always do; Q8_0 then takes its matvec rather than the int8 MMA GEMM.
         /// </summary>
+        /// <summary>
+        /// result[rows, outDim] = input[rows, inDim] W^T for an NVFP4 matrix in the planar layout: up to 8 rows on the q8
+        /// matvec; more quantized to NVFP4 and multiplied on the FP4 tensor cores, TMA-fed from 65 rows, otherwise through
+        /// the cp.async GEMM split over K (up to 64 rows) as far as one wave of CTAs.
+        /// </summary>
+        private static void RunNvfp4Planar(CudaAllocator allocator, IntPtr planes, IntPtr inputPtr, IntPtr resultPtr, int inDim,
+            int outDim, int rows)
+        {
+            CudaFp4Kernels fp4 = allocator.Fp4Kernels
+                ?? throw new InvalidOperationException("an NVFP4 weight is resident in the planar layout, but the FP4 kernels are not loaded");
+            IntPtr stream = allocator.Stream.Handle;
+            if (rows <= CudaFp4Kernels.GemvMaxRows)
+            {
+                IntPtr scratch = EnsureQ81Scratch(allocator, CudaFp4Kernels.GemvScratchBytes(rows, inDim));
+                fp4.Gemv(planes, outDim, inDim, inputPtr, rows, scratch, resultPtr, stream);
+                return;
+            }
+            var (codeBytes, scaleBytes, rowScaleBytes) = CudaFp4Kernels.ActivationBytes(rows, inDim);
+            IntPtr codes = EnsureScratch(Fp4CodesScratch, allocator, codeBytes);
+            IntPtr scales = EnsureScratch(Fp4ScalesScratch, allocator, scaleBytes);
+            IntPtr rowScale = EnsureScratch(Fp4RowScaleScratch, allocator, rowScaleBytes);
+            fp4.Quantize(inputPtr, codes, scales, rowScale, inDim, rows, stream);
+            if (CudaFp4Kernels.TakesTma(rows, outDim, inDim, planes, codes, scales))
+            {
+                fp4.GemmTma(planes, outDim, inDim, codes, scales, rowScale, rows, 1.0f, resultPtr, stream);
+                return;
+            }
+            int splits = fp4.Splits(outDim, inDim, rows, rows <= 64 ? 8 : 1);
+            IntPtr partial = IntPtr.Zero, counters = IntPtr.Zero;
+            if (splits > 1)
+            {
+                partial = EnsureScratch(Fp4PartialScratch, allocator, (long)splits * rows * outDim * sizeof(float));
+                counters = EnsureZeroedScratch(Fp4CounterScratch, allocator, (long)CudaFp4Kernels.Tiles(outDim, rows) * sizeof(int));
+            }
+            fp4.Gemm(planes, outDim, inDim, codes, scales, rowScale, rows, 1.0f, resultPtr, partial, counters, splits, stream);
+        }
+
         internal static void RunResidentMatmul(
             CudaAllocator allocator,
             CudaKernels kernels,
@@ -874,6 +954,12 @@ namespace TensorSharp.Cuda
             bool rowInvariant = false)
         {
             allocator.Context.MakeCurrent();
+
+            if (ggmlType == Nvfp4PlanarType)
+            {
+                RunNvfp4Planar(allocator, weightPtr, inputPtr, resultPtr, inDim, outDim, rows);
+                return;
+            }
 
             // F16 weights: the resident bytes are already the GEMM operand, so
             // every row count (a rows==1 decode is just a GEMV) goes straight
@@ -953,6 +1039,20 @@ namespace TensorSharp.Cuda
                 kernels.LaunchQuantizeQ81Rows(
                     inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                 kernels.LaunchQuantMatmulQ80VecRows(
+                    weightPtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
+                return;
+            }
+
+            // NVFP4 decode, batched decode and verify windows (1..16 rows): q8_1 activations and dp4a against the
+            // resident blocks, the E2M1 codes decoded by byte permutes (the generic kernel below decoded each
+            // value through a per-element decoder: Qwen3.8-27B NVFP4 decoded at 10.4 tok/s on an RTX PRO 4500).
+            if (ggmlType == 40 && rows <= CudaKernels.Q80VecMaxRows && (inDim & 63) == 0)
+            {
+                long scratchBytes = (long)rows * (inDim / 32) * CudaKernels.Q81BlockBytes;
+                IntPtr xqScratch = EnsureQ81Scratch(allocator, scratchBytes);
+                kernels.LaunchQuantizeQ81Rows(
+                    inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
+                kernels.LaunchQuantMatmulNvfp4VecRows(
                     weightPtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
                 return;
             }
@@ -1247,6 +1347,13 @@ namespace TensorSharp.Cuda
             DeviceWeight weight = EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
             indicesStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
+            if (weight.GgmlType == Nvfp4PlanarType)
+            {
+                allocator.Fp4Kernels.GetRows(weight.DevicePtr, checked((int)ne1), checked((int)ne0), indicesPtr,
+                    indices.ElementType != DType.Int32, rows, resultPtr, allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
             kernels.LaunchQuantGetRowsF32(
                 weight.DevicePtr,
                 indicesPtr,
@@ -1258,6 +1365,23 @@ namespace TensorSharp.Cuda
                 allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
             return true;
+        }
+
+        /// <summary>The ggml blocks just uploaded to <paramref name="devicePtr"/> rewritten in place as the planar layout
+        /// (through a temporary copy of the blocks).</summary>
+        private static void RepackNvfp4(CudaAllocator allocator, CudaFp4Kernels fp4, IntPtr devicePtr, long rawBytes, int rows, int k)
+        {
+            CudaDriverApi.cuMemAlloc(out IntPtr blocks, new UIntPtr((ulong)rawBytes)).ThrowOnError();
+            try
+            {
+                CudaDriverApi.cuMemcpyDtoDAsync(blocks, devicePtr, new UIntPtr((ulong)rawBytes), allocator.Stream.Handle).ThrowOnError();
+                fp4.Repack(blocks, devicePtr, rows, k, allocator.Stream.Handle);
+                allocator.Stream.Synchronize();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree(blocks);
+            }
         }
 
         private static DeviceWeight EnsureWeight(
@@ -1280,7 +1404,7 @@ namespace TensorSharp.Cuda
             {
                 if (Cache.TryGetValue(key, out DeviceWeight existing))
                 {
-                    if (upload != null && (existing.RawBytes != rawBytes || existing.GgmlType != ggmlType ||
+                    if (upload != null && (existing.RawBytes != rawBytes || existing.SourceType != ggmlType ||
                         existing.Ne0 != ne0 || existing.Ne1 != ne1))
                         throw new InvalidOperationException("Source upload dimensions differ from the resident CUDA weight.");
                     return existing;
@@ -1315,11 +1439,19 @@ namespace TensorSharp.Cuda
                     arena.Release(devicePtr);
                     throw;
                 }
+                // NVFP4 on a GPU with the FP4 tensor-core kernels: the planar layout they read (the same bytes).
+                int layout = ggmlType;
+                if (ggmlType == 40 && CudaFp4Kernels.TakesWidth(ne0) && allocator.Fp4Kernels is { } fp4)
+                {
+                    RepackNvfp4(allocator, fp4, devicePtr, rawBytes, checked((int)ne1), checked((int)ne0));
+                    layout = Nvfp4PlanarType;
+                }
                 var entry = new DeviceWeight
                 {
                     DevicePtr = devicePtr,
                     RawBytes = rawBytes,
-                    GgmlType = ggmlType,
+                    GgmlType = layout,
+                    SourceType = ggmlType,
                     Ne0 = ne0,
                     Ne1 = ne1,
                     DeviceId = allocator.DeviceId,

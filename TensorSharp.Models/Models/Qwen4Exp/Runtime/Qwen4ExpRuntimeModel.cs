@@ -32,8 +32,8 @@ namespace TensorSharp.Models
     /// <item><b>QSA</b> layers keep every cell's indexer key and attend the cells of their top blocks past
     /// <c>top_k / ratio * ratio + ratio - 1</c> cached tokens, densely within (Qwen4ExpRuntimeModel.Qsa.cs).</item>
     /// </list>
-    /// Speculation (the MTP head, DFlash2) and expert tiers are not ported yet: <see cref="Qwen4ExpModel"/> serves
-    /// them.
+    /// Speculation (the MTP head, DFlash / DFlash2 drafters), expert offload and tiers are the shared runtime's, on
+    /// whichever backend's executor runs the graphs.
     /// </summary>
     public sealed partial class Qwen4ExpRuntimeModel : Qwen35RuntimeModel
     {
@@ -463,6 +463,7 @@ namespace TensorSharp.Models
         /// release them (ggml_cuda with host-served experts did, and the first graph read a null pointer).</summary>
         protected override void PrepareLoadedWeights()
         {
+            ReadHyperConnectionsAsQ8_0();
             base.PrepareLoadedWeights();
             PleSpec p = Ple;
             for (int l = 0; l < Config.NumLayers; l++)
@@ -471,6 +472,47 @@ namespace TensorSharp.Models
                 if (p.IsPle[l] && (_weights.ContainsKey(name) || _quantWeights.ContainsKey(name)))
                     _pleTapRows[l] = ReadPleTapRows(l);
             }
+        }
+
+        /// <summary>A hyper-connection mixer's down or up matrix (a layer's attn / ffn mixers, the output's, the MTP head's).</summary>
+        internal static bool IsHyperConnectionMatrix(string name)
+            => name.Contains("hc_", StringComparison.Ordinal)
+               && (name.EndsWith("_down.weight", StringComparison.Ordinal) || name.EndsWith("_up.weight", StringComparison.Ordinal));
+
+        /// <summary>
+        /// TS_Q4E_HC_Q8=1 (Strata's default read, STRATA_HC_Q8): the BF16 down and up matrices of the hyper-connection
+        /// mixers, which every token reads whole (1.26 GB on Flash Next), become Q8_0 copies made once at load (0.67 GB),
+        /// whatever the backend. It changes the arithmetic (Strata: mean KL 0.0007 against the BF16 read), so it is
+        /// opt-in; files that store these matrices as Q8_0 already (Unsloth's UD packs) are unchanged.
+        /// </summary>
+        private unsafe void ReadHyperConnectionsAsQ8_0()
+        {
+            if (!Qwen4ExpFormat.HcQ8) return;
+            var names = new List<string>();
+            foreach (var (name, w) in _quantWeights)
+                if (IsHyperConnectionMatrix(name) && w.GgmlType == WeightRequant.GgmlTypeBf16 && w.HasHostData && w.Ne0 % 32 == 0)
+                    names.Add(name);
+            if (names.Count == 0) return;
+            var copies = new QuantizedWeight[names.Count];
+            System.Threading.Tasks.Parallel.For(0, names.Count, i =>
+            {
+                QuantizedWeight w = _quantWeights[names[i]];
+                long bytes = WeightRequant.Q8_0Bytes(w.Ne1, w.Ne0);
+                IntPtr dst = QuantizedWeight.AllocateBuffer(bytes);
+                WeightRequant.Bf16ToQ8_0((ushort*)w.Data, (byte*)dst, w.Ne1, w.Ne0);
+                copies[i] = new QuantizedWeight(dst, bytes, WeightRequant.GgmlTypeQ8_0, w.Ne0, w.Ne1);
+            });
+            long before = 0, after = 0;
+            for (int i = 0; i < names.Count; i++)
+            {
+                QuantizedWeight w = _quantWeights[names[i]];
+                before += w.RawBytes;
+                after += copies[i].RawBytes;
+                _quantWeights[names[i]] = copies[i];
+                w.Dispose();
+            }
+            Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"  Hyper-connection matrices read as Q8_0 (TS_Q4E_HC_Q8=1): {names.Count} BF16 matrices, {before / 1e9:F2} -> {after / 1e9:F2} GB a token."));
         }
 
         private float[] ReadPleTapRows(int layer)

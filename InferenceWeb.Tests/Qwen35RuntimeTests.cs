@@ -481,6 +481,43 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>The same on the tensor executors whose device is not the host: an offloaded layer's routes the tier does
+    /// not hold run on the host (ggml's CPU kernels), the tier's on the device, and a prompt chunk wider than the host
+    /// kernel streams every selected expert to the device for the step. One implementation for every backend.</summary>
+    [MlxTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void HostExpertsOnMlxMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Mlx, tier);
+
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void HostExpertsOnDirectCudaMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Cuda, tier);
+
+    private void AssertHostExpertsMatchDevice(BackendType backend, bool tier)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("moe");
+        List<float[]> reference;
+        using (var device = Create(path, backend: backend))
+            reference = Script(device);
+        MoeCpuOffloadConfig.SetAllLayers();
+        using var offloaded = Create(path, backend: backend);
+        if (tier)
+            for (int l = 0; l < offloaded.Config.NumLayers; l++)
+                offloaded.SetExpertTierForTests(l, Enumerable.Range(0, offloaded.ExpertCountForTests / 2).ToArray());
+        List<float[]> actual = Script(offloaded);
+        (long hostRoutes, long streamed) = offloaded.ExpertHostCountsForTests;
+        Assert.True(offloaded.GraphRuns > 0, "the offloaded model did not run as graphs");
+        Assert.True(hostRoutes > 0 && streamed > 0, $"host routes {hostRoutes}, streamed steps {streamed}");
+        // The host's kernels round as ggml's CPU backend does (activations to Q8_K / BF16 against the device's).
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(actual[i], reference[i]);
+            Assert.True(rel <= 2.5e-2, $"{backend} --cpu-moe tier={tier}, row {i}: relL2 {rel:E2}");
+        }
+    }
+
     [Fact]
     public void ARecurrentStackRewindsOnlyToItsLengthOrToZero()
     {

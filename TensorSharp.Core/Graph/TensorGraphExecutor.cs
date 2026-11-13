@@ -49,7 +49,7 @@ namespace TensorSharp.Graph
         /// decode windows are exact (no padded rows to attend over).</summary>
         /// <summary>Exact decode windows; prompt chunks are written into the cache by row index and attend
         /// over its window, as the per-op paths do (the backends' cache kernels write and read it).</summary>
-        public virtual GraphCapabilities Capabilities { get; } = new() { StridedViews = true, DecodeWindowRows = 1, Replays = false, IndexedCacheWrites = true };
+        public virtual GraphCapabilities Capabilities { get; } = new() { StridedViews = true, DecodeWindowRows = 1, Replays = false, IndexedCacheWrites = true, HostExperts = true };
 
         /// <summary>The backend's binary kernels take a broadcast (stride-0) operand; otherwise it is
         /// gathered into a contiguous tensor first.</summary>
@@ -76,7 +76,7 @@ namespace TensorSharp.Graph
             GraphOp.View, GraphOp.Permute, GraphOp.Transpose, GraphOp.Cont, GraphOp.Cast, GraphOp.Cpy, GraphOp.SetRows,
             GraphOp.RopeExt, GraphOp.RopeMulti, GraphOp.FlashAttnExt, GraphOp.SoftMaxExt, GraphOp.TopK, GraphOp.SumRows,
             GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow, GraphOp.Sqr, GraphOp.Sqrt, GraphOp.Clamp,
-            GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce,
+            GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce, GraphOp.MoeHostExperts,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -123,6 +123,10 @@ namespace TensorSharp.Graph
         /// <summary>x [n, Ne0] times expert <paramref name="expert"/> of stacked weights: [n, Ne1].</summary>
         protected virtual Tensor ExpertMatMul(IGraphExpertWeights weights, int expert, Tensor x)
             => QuantizedMatMul(weights.Expert(expert), x);
+
+        /// <summary>Drop the device copy an expert streamed in for one step left behind (its experts are not the
+        /// layer's tier). Executors that keep device copies of weights release it; the default keeps nothing.</summary>
+        protected virtual void ReleaseStreamedExpert(IGraphWeight expert) { }
 
         /// <summary>Attention of q [heads, nq, d] over k [kvHeads, nkv, d] / v [kvHeads, nkv, dv] with an
         /// additive mask [nq, nkv] (or null); query head h reads KV head h / (heads / kvHeads). The
@@ -1292,6 +1296,8 @@ namespace TensorSharp.Graph
                     return new Value { Tensor = y, Relaid = !y.IsContiguous() };
                 }
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));
+                case GraphOp.MoeHostExperts: return V(HostExperts(T(0), values[n.Srcs[1]], values[n.Srcs[2]], values[n.Srcs[3]],
+                    values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run));
                 case GraphOp.Reshape: return V(Contig(T(0), run).View(Sizes(n.Ip)));
                 case GraphOp.View:
                 {
@@ -1612,6 +1618,108 @@ namespace TensorSharp.Graph
         }
 
         private static long[] Ids(Value v) => Ne(v.Tensor);
+
+        /// <summary>
+        /// <see cref="GraphOp.MoeHostExperts"/> on any tensor executor: x [rows, hidden], the router's top-K ids and
+        /// weights ([rows, K]). The routes whose expert the layer's tier keeps on this device run here, each selected
+        /// expert once over its rows; the model's <see cref="IGraphExpertHost"/> computes the rest on the host. A step
+        /// the host streams (a prompt chunk) runs every route here, the experts outside the tier read in for it and
+        /// dropped after. Returns the weighted sum [rows, hidden].
+        /// </summary>
+        private Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
+            int layer, RunState run)
+        {
+            if (gateValue.Weight is not IGraphHostedExperts gate || upValue.Weight is not IGraphExpertWeights up
+                || downValue.Weight is not IGraphExpertWeights down)
+                throw new NotSupportedException("host experts need the model's expert host on their stacks");
+            IGraphExpertHost host = gate.Host;
+            // ggml's order: x [hidden, rows] (a decode step's single row arrives as [hidden]), ids [K, rows].
+            int hidden = (int)Ne(x)[0];
+            int[] ids = Ints(selected);
+            long[] nid = Ids(selected);
+            int k = (int)nid[0], rows = (int)nid[1], routes = k * rows;
+            Tensor xc = run.Keep(Contig(x, run).View(rows, hidden));
+            float[] weights = weightValue.Floats ?? Contig(weightValue.Tensor, run).GetElementsAsFloat(routes);
+            host.Record(layer, ids);
+
+            bool stream = host.StreamsStep(layer, rows);
+            var skip = new byte[routes];   // 1: the route runs on this device
+            bool anyHost = false, anyDevice = false;
+            for (int i = 0; i < routes; i++)
+            {
+                bool here = stream || host.IsResident(layer, ids[i]);
+                skip[i] = here ? (byte)1 : (byte)0;
+                anyHost |= !here;
+                anyDevice |= here;
+            }
+
+            // The returned tensor is the caller's to keep (V keeps it); the pieces summed into it are this run's.
+            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, skip, k, gate, up, down, host, layer, stream, run) : null;
+            if (!anyHost)
+                return device;
+            float[] xs = xc.GetElementsAsFloat(rows * hidden);
+            var output = new float[(long)rows * hidden];
+            if (!host.Compute(layer, xs, ids, weights, skip, rows, output))
+                throw new NotSupportedException($"layer {layer}: the host's expert kernels do not cover these experts");
+            var fromHost = new Tensor(Allocator, DType.Float32, rows, hidden);
+            fromHost.SetElementsAsFloat(output);
+            if (device == null)
+                return fromHost;
+            return Ops.Add(null, run.Keep(device), run.Keep(fromHost));
+        }
+
+        /// <summary>The device's routes of <see cref="HostExperts"/>: each expert once over the rows routed to it,
+        /// weighted, then every row's routes summed (a host route reads a zero row).</summary>
+        private Tensor DeviceExperts(Tensor x, int[] ids, float[] weights, byte[] onDevice, int k, IGraphExpertWeights gate,
+            IGraphExpertWeights up, IGraphExpertWeights down, IGraphExpertHost host, int layer, bool stream, RunState run)
+        {
+            int rows = (int)x.Sizes[0], hidden = (int)x.Sizes[1], routes = ids.Length;
+            var byExpert = new List<int>[gate.Ne2];
+            for (int i = 0; i < routes; i++)
+                if (onDevice[i] != 0) (byExpert[ids[i]] ??= new List<int>()).Add(i);
+            var pieces = new List<Tensor>();
+            var position = new int[routes];
+            int at = 0;
+            for (int e = 0; e < byExpert.Length; e++)
+            {
+                List<int> list = byExpert[e];
+                if (list == null) continue;
+                var sourceRows = new int[list.Count];
+                var routeWeights = new float[list.Count];
+                for (int j = 0; j < list.Count; j++)
+                {
+                    sourceRows[j] = list[j] / k;
+                    routeWeights[j] = weights[list[j]];
+                    position[list[j]] = at + j;
+                }
+                at += list.Count;
+                Tensor xs = run.Keep(Ops.IndexSelect(null, x, IntTensor(sourceRows, new long[] { sourceRows.Length }, run)));
+                Tensor g = run.Keep(ExpertMatMul(gate, e, xs));
+                Tensor u = run.Keep(ExpertMatMul(up, e, xs));
+                Tensor act = run.Keep(Ops.SiLUMul(null, g, u));
+                Tensor d = run.Keep(ExpertMatMul(down, e, act));
+                var w = run.Keep(new Tensor(Allocator, DType.Float32, list.Count, 1));
+                w.SetElementsAsFloat(routeWeights);
+                pieces.Add(run.Keep(Binary(d, w, run, (r, a, b) => Ops.Mul(r, a, b))));
+                if (stream && !host.IsResident(layer, e))
+                {
+                    ReleaseStreamedExpert(gate.Expert(e));
+                    ReleaseStreamedExpert(up.Expert(e));
+                    ReleaseStreamedExpert(down.Expert(e));
+                }
+            }
+            // A host route reads the zero row past the device's pieces.
+            Tensor zero = run.Keep(new Tensor(Allocator, DType.Float32, 1, hidden));
+            Ops.Fill(zero, 0f);
+            pieces.Add(zero);
+            for (int i = 0; i < routes; i++)
+                if (onDevice[i] == 0) position[i] = at;
+            Tensor all = pieces.Count == 1 ? pieces[0] : run.Keep(Ops.Concat(null, 0, pieces.ToArray()));
+            Tensor byRoute = run.Keep(Ops.IndexSelect(null, all, IntTensor(position, new long[] { routes }, run)));   // [rows * K, hidden]
+            using Tensor perRow = byRoute.View(rows, k, hidden);
+            Tensor summed = run.Keep(Ops.Sum(null, perRow, 1));                                                   // [rows, 1, hidden]
+            return summed.View(rows, hidden);
+        }
 
         /// <summary>ggml_view_Nd: ip = nd, ne0..ne3, nb1..nb3, offset (bytes).</summary>
         private static Tensor View(Tensor src, long[] ip)

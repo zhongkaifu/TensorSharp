@@ -651,7 +651,7 @@ These variables are real runtime knobs, but they are not registered in
 | `TS_CUDA_Q80_MMQ_MAX_ROWS` | direct `cuda` backend | Q8_0 matmuls with 32 to this many activation rows run the direct int8 tensor-core GEMM over raw Q8_0 blocks (mma.m16n8k32, ggml MMQ-style); above it the F16 GEMM route wins (MMQ weight sweeps grow as ceil(rows/128)) | `512` | not registered | no |
 | `TS_CUDA_PREFILL_GRAPH_MAX` | direct `cuda` backend | Cached prefill + decode CUDA graphs kept (LRU-evicted; each pins its captured working-set pool blocks). Qwen 3.5 / 3.6 text-only prefill and decode capture their per-op layer loop as a graph and replay it (bit-identical results; any capture failure falls back to the plain run) | `4` | not registered | no |
 | `TS_CUDA_PREFILL_GRAPH_LOG` | direct `cuda` backend | Log graph capture/replay/abort events (`1`) | OFF | not registered | no |
-| `TENSORSHARP_CUDA_POOL_LARGE_MB` | direct `cuda` backend | Budget for the global large-block (≥ 2 MB) device-memory cache; keeps prefill-sized activations pooled instead of re-issuing cuMemAlloc/cuMemFree per layer | `1024` | not registered | no |
+| `TENSORSHARP_CUDA_POOL_LARGE_MB` | direct `cuda` backend | Budget for the global large-block (≥ 2 MB) device-memory cache; keeps prefill-sized activations pooled instead of re-issuing cuMemAlloc/cuMemFree per layer (each free synchronizes the device) | a quarter of the device memory, at least `1024` | not registered | no |
 | `TS_CUDA_PROFILE` | direct `cuda` backend | Print CPU-fallback op and host↔device sync counters at exit (`1`), with call-site attribution (`2`) | OFF | not registered | no |
 
 ## Out-of-Matrix Knowledge Configuration

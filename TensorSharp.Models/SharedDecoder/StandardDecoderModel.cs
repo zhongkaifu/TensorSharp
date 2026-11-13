@@ -234,6 +234,9 @@ namespace TensorSharp.Models
         /// <summary>The K caches as [layer][rank], for tests that check placement.</summary>
         internal Tensor[][] KeyCachesForTests => _cacheK;
 
+        /// <summary>The ggml type a loaded quantized weight is held in (-1: not a quantized weight).</summary>
+        internal int QuantizedWeightTypeForTests(string name) => _quantWeights.TryGetValue(name, out QuantizedWeight w) ? w.GgmlType : -1;
+
         /// <summary>Placement summary, e.g. "2 whole-layer stages x tensor parallel 2 = 4 devices".</summary>
         public string PlacementDescription => _mesh?.Describe() ?? "not initialized";
 

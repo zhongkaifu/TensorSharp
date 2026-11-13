@@ -21,10 +21,7 @@ namespace TensorSharp.Cuda
             long maxCachedBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_MAX_MB", 512L) * 1024L * 1024L;
             long maxCachedBlockBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_MAX_BLOCK_MB", 256L) * 1024L * 1024L;
             // Budget for the global large-block cache (prefill-sized activations;
-            // see CudaDeviceMemoryPool). Big enough that a 2048-token prefill
-            // chunk's transients all pool, which also keeps CUDA-graph captures
-            // of the prefill loop allocation-free.
-            long largeCachedBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_LARGE_MB", 1024L) * 1024L * 1024L;
+            // see CudaDeviceMemoryPool), resolved once the context exists.
             // Keep at least this much dedicated VRAM free: once the pool would push
             // free VRAM below it, returned blocks go back to the driver instead of
             // into the cache. Prevents the pool from being the thing that tips a
@@ -55,6 +52,15 @@ namespace TensorSharp.Cuda
                 throw;
             }
 
+            // Default: a quarter of the device's memory, at least 1 GB. A graph executor's prompt step allocates each
+            // op's activations as it runs (a 3.6K-token step of Qwen3.8-27B holds 0.5 GB gate|up products); past the
+            // budget every one went back to the driver through a synchronizing cuMemFree (2,863 a prompt, 0.55 s of a
+            // 2.3 s prefill on an RTX PRO 4500). An allocation that finds the device full drains the cache first.
+            context.MakeCurrent();
+            long deviceBytes = CudaDriverApi.cuMemGetInfo(out UIntPtr _, out UIntPtr totalBytes) == 0 ? (long)totalBytes.ToUInt64() : 0;
+            long largeCachedBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_LARGE_MB", Math.Max(1024L, deviceBytes / 4 / (1024L * 1024L)))
+                * 1024L * 1024L;
+
             Context = context;
             Stream = stream;
             Blas = blas;
@@ -83,6 +89,38 @@ namespace TensorSharp.Cuda
         internal CudaCublasHandle Blas { get; }
 
         internal CudaKernels Kernels { get; }
+
+        private CudaFp4Kernels fp4Kernels;
+        private CudaSsmPrefillKernels ssmPrefillKernels;
+        private CudaFlashPrefillKernels flashPrefillKernels;
+        private int fp4State, ssmPrefillState, flashPrefillState;   // 0: not loaded yet, 1: loaded, 2: unavailable
+
+        /// <summary>The FP4 tensor-core products for this device (tensorsharp_fp4_kernels), loaded on first use; null
+        /// where the image has no tensor-core code for this GPU or is missing.</summary>
+        internal CudaFp4Kernels Fp4Kernels => LoadOnce(ref fp4Kernels, ref fp4State, CudaFp4Kernels.TryCreate);
+
+        /// <summary>The recurrent-layer prefill kernels for this device (tensorsharp_ssm_prefill), loaded on first use;
+        /// null where the module is missing or stale.</summary>
+        internal CudaSsmPrefillKernels SsmPrefillKernels => LoadOnce(ref ssmPrefillKernels, ref ssmPrefillState, CudaSsmPrefillKernels.TryCreate);
+
+        /// <summary>The flash prefill attention kernels for this device (tensorsharp_flash_prefill), loaded on first use;
+        /// null where the module is missing or stale.</summary>
+        internal CudaFlashPrefillKernels FlashPrefillKernels => LoadOnce(ref flashPrefillKernels, ref flashPrefillState, CudaFlashPrefillKernels.TryCreate);
+
+        private delegate bool ModuleFactory<T>(out T module, out string reason);
+
+        private T LoadOnce<T>(ref T module, ref int state, ModuleFactory<T> create) where T : class
+        {
+            if (Volatile.Read(ref state) != 0) return module;
+            lock (this)
+            {
+                if (state != 0) return module;
+                Context.MakeCurrent();
+                bool loaded = create(out module, out _);
+                Volatile.Write(ref state, loaded ? 1 : 2);
+                return module;
+            }
+        }
 
         public Storage Allocate(DType elementType, long elementCount)
         {
@@ -232,6 +270,9 @@ namespace TensorSharp.Cuda
             pool.DrainAndFree();
             CudaLtx25PromptOps.ReleaseForAllocator(this);
             Kernels?.Dispose();
+            fp4Kernels?.Dispose();
+            ssmPrefillKernels?.Dispose();
+            flashPrefillKernels?.Dispose();
             Blas.Dispose();
             Stream.Dispose();
             Context.Dispose();

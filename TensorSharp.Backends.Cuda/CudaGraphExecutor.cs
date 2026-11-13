@@ -31,6 +31,7 @@ namespace TensorSharp.Cuda
         public override GraphCapabilities Capabilities { get; } = new()
         {
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
+            HostExperts = true,
         };
 
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
@@ -127,6 +128,21 @@ namespace TensorSharp.Cuda
             }
             if (kWindow.Start != 0 || vWindow.Start != 0 || heads % kvHeads != 0)
                 return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+            // Causal rows over an F16 cache: the tensor-core flash attention (K and V tiles streamed once per block of
+            // 128 query rows, split over the keys when the rows are few), not the scores of every query and key.
+            if (kc.ElementType == DType.Float16 && vc.ElementType == DType.Float16 && kc.Sizes[^1] == d && vc.Sizes[^1] == d
+                && (trimmed ? mask.Trimmed : mask.Pattern) == MaskPattern.Causal
+                && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && flash.RunsAttention(d))
+            {
+                var attended = new Tensor(Allocator, DType.Float32, nq, heads, d);
+                int splits = flash.Splits(nq * (heads / kvHeads), kvHeads, len);
+                using Tensor partial = splits > 1
+                    ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
+                Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
+                Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor,
+                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream));
+                return attended;
+            }
             int group = heads / kvHeads;
             // K and V once as F32 [kvHeads, len, d] (the cache may hold F16); the query heads of a group share
             // their KV head, so q [heads, rows, d] is [kvHeads, group * rows, d] and each product is one batch
@@ -323,8 +339,14 @@ namespace TensorSharp.Cuda
             output.EnsureDeviceCurrent();
             IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
             cuda.Context.MakeCurrent();
+            // A prompt chunk of 128-wide heads with one state slot runs in chunks of 16 rows on the tensor cores (the WY
+            // form; 2.9 ms a layer for 3.6K rows on the rows4 kernel, Qwen3.8-27B on an RTX PRO 4500).
+            if (tokens > 1 && slots == 1 && !kda && s == CudaSsmPrefillKernels.GdnHeadDim
+                && cuda.SsmPrefillKernels is { RunsGatedDeltaNetChunks: true } ssm)
+                ssm.LaunchGatedDeltaNetChunks(P(q), P(k), P(v), P(g), P(beta), P(state), output.DevicePtrAtElement(rowFloats),
+                    output.DevicePtrAtElement(0), keyHeads, heads, tokens, sequences, cuda.Stream.Handle);
             // A chunk of rows reads each token's q and k once per four state rows; a decode row keeps the one-row kernel.
-            if (tokens > 1)
+            else if (tokens > 1)
                 kernels.LaunchGatedDeltaNetRows4(P(q), P(k), P(v), P(g), P(beta), P(state), output.DevicePtrAtElement(0),
                     s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle);
             else
@@ -495,6 +517,13 @@ namespace TensorSharp.Cuda
                 ((CudaStorage)table.Storage).EnsureDeviceCurrent();
                 return _expertTables[set] = table;
             }
+        }
+
+        /// <summary>A streamed expert's device copy goes once the step used it: only the layer's tier stays resident.</summary>
+        protected override void ReleaseStreamedExpert(IGraphWeight expert)
+        {
+            if (Allocator is CudaAllocator cuda && expert.CacheKey != IntPtr.Zero)
+                CudaQuantizedOps.ReleaseQuantizedWeight(cuda, expert.CacheKey);
         }
 
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)

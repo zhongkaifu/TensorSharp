@@ -76,7 +76,7 @@ namespace TensorSharp.Models
             return null;
         }
 
-        private readonly Dictionary<string, GraphExpertSet> _graphExpertSets = new();
+        private readonly Dictionary<string, IGraphExpertWeights> _graphExpertSets = new();
 
         /// <summary>Step kinds (shape, emitter) that ran as recorded programs: a streaming executor runs
         /// later steps of the kind as they are emitted.</summary>
@@ -88,17 +88,29 @@ namespace TensorSharp.Models
 
         /// <summary>A stacked expert weight with its members (each a quantized weight with its own
         /// resident copy), for executors that run routed experts one at a time.</summary>
-        private GraphExpertSet ExpertSet(string name, StackedExpertWeights stacked)
+        private IGraphExpertWeights ExpertSet(string name, StackedExpertWeights stacked)
         {
             lock (_graphExpertSets)
             {
-                if (_graphExpertSets.TryGetValue(name, out GraphExpertSet set)) return set;
+                if (_graphExpertSets.TryGetValue(name, out IGraphExpertWeights set)) return set;
                 string baseName = name.EndsWith(".weight", StringComparison.Ordinal) ? name[..^7] : name;
                 var members = new QuantizedWeight[stacked.NumExperts];
                 for (int e = 0; e < members.Length; e++)
                     _quantWeights.TryGetValue($"{baseName}.{e}.weight", out members[e]);
-                return _graphExpertSets[name] = new GraphExpertSet(stacked, members);
+                // An offloaded layer on a tensor executor: its stacks carry the model's expert host (host compute, tier).
+                ModelExpertHost host = ExpertLayerOf(name) is int layer and >= 0 ? HostFor(layer) : null;
+                return _graphExpertSets[name] = host != null
+                    ? new HostedExpertSet(stacked, members, host)
+                    : new GraphExpertSet(stacked, members);
             }
+        }
+
+        /// <summary>The layer of a stacked expert weight's name (blk.N.ffn_*_exps.weight), or -1.</summary>
+        private static int ExpertLayerOf(string name)
+        {
+            if (!name.StartsWith("blk.", StringComparison.Ordinal)) return -1;
+            int dot = name.IndexOf('.', 4);
+            return dot > 4 && int.TryParse(name.AsSpan(4, dot - 4), out int layer) ? layer : -1;
         }
 
         private readonly Dictionary<(string Name, int Rank), IGraphExpertWeights> _rankExpertSets = new();
@@ -327,8 +339,8 @@ namespace TensorSharp.Models
         private bool TryRunRecorded(DecodeReplay r, CachedGraph cached, Slot[] slots, int[] starts)
         {
             if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length != 1 || GraphExecutor is not IDecodeCaptureExecutor recorder
-                || cached.Plan is not IGraphTensorOutputs keep)
-                return false;
+                || cached.Plan is not IGraphTensorOutputs keep || _expertHost != null)
+                return false;   // (a step with host experts reads the routes back mid-step: it cannot be recorded)
             if (r.Capture == null && ++r.Advances < 2) return false;
             r.Capture ??= recorder.OpenDecodeCapture();
             if (r.Capture == null) { r.CaptureFailed = true; return false; }

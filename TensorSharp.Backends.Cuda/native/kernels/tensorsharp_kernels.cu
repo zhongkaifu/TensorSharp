@@ -6388,6 +6388,104 @@ extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32_16(
 {
     TS_PDL_ENTRY(); ts_q80_vec_rows<16>(weights, xq, output, in_dim, out_dim, rows); }
 
+// Eight E2M1 codes (one 32-bit word of an NVFP4 sub-block) as int8 values of ggml's doubled codebook
+// (ts_kvalues_mxfp4): .x holds the low nibbles of the word's four bytes, .y the high ones. Table lookups
+// by byte permutes (ggml's get_int_from_table_16).
+__device__ __forceinline__ int2 ts_e2m1x8(int q)
+{
+    const uint32_t t0 = 0x03020100u, t1 = 0x0C080604u, t2 = 0xFDFEFF00u, t3 = 0xF4F8FAFCu;
+    const uint32_t q4 = (uint32_t)q;
+    const uint32_t select = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+    uint32_t tmp[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint32_t shift = 16 * i;
+        const uint32_t lo = __byte_perm(t0, t1, q4 >> shift);
+        const uint32_t hi = __byte_perm(t2, t3, q4 >> shift);
+        tmp[i] = __byte_perm(lo, hi, select >> shift);
+    }
+    return make_int2((int)__byte_perm(tmp[0], tmp[1], 0x6420), (int)__byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+// NVFP4 matvec for 1..16 activation rows against the resident ggml blocks (block_nvfp4: four UE4M3 scales,
+// then 32 code bytes, 36 bytes a 64-value block), the activation pre-quantized once to q8_1. A CTA per
+// output column as the Q8_0 kernel above; a thread takes one 16-value sub-block at a time (its scale, two
+// code words, four activation ints), so a warp reads eight whole blocks, 288 contiguous bytes. Every row
+// runs the same accumulation whatever the row count, so a row's result does not depend on the launch.
+template <int MAXR>
+__device__ __forceinline__ void ts_nvfp4_vec_rows(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    int col = blockIdx.x;
+    if (col >= out_dim)
+        return;
+
+    const int subs = in_dim / 16;
+    const int q8_blocks = in_dim / 32;
+    const uint8_t* w_row = weights + (size_t)col * (size_t)(in_dim / 64) * 36;
+
+    float acc[MAXR];
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+        acc[r] = 0.0f;
+    for (int sb = threadIdx.x; sb < subs; sb += blockDim.x)
+    {
+        const uint8_t* wblk = w_row + (size_t)(sb >> 2) * 36;
+        const int s = sb & 3;
+        const float dw = ts_ue4m3_to_fp32(wblk[s]);
+        const int2 v0 = ts_e2m1x8(get_int_b4(wblk + 4 + s * 8, 0));   // values 0-3 | 8-11
+        const int2 v1 = ts_e2m1x8(get_int_b4(wblk + 4 + s * 8, 1));   // values 4-7 | 12-15
+        const int a0 = (sb & 1) * 4;
+#pragma unroll
+        for (int r = 0; r < MAXR; r++)
+        {
+            if (r >= rows)
+                break;
+            const ts_block_q8_1* ablk = &xq[(size_t)r * q8_blocks + (sb >> 1)];
+            int sumi = dp4a_i8(v0.x, get_int_b4(ablk->qs, a0), 0);
+            sumi = dp4a_i8(v1.x, get_int_b4(ablk->qs, a0 + 1), sumi);
+            sumi = dp4a_i8(v0.y, get_int_b4(ablk->qs, a0 + 2), sumi);
+            sumi = dp4a_i8(v1.y, get_int_b4(ablk->qs, a0 + 3), sumi);
+            acc[r] += dw * __half2float(ablk->d) * (float)sumi;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+    {
+        if (r >= rows)
+            break;
+        float sum = block_reduce_sum(acc[r]);
+        if (threadIdx.x == 0)
+            output[(size_t)r * out_dim + col] = sum;
+        if (MAXR > 1)
+            __syncthreads();   // block_reduce_sum's scratch is reused by the next row
+    }
+}
+
+extern "C" __global__ void ts_quant_matmul_nvfp4_vec_f32_1(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{
+    TS_PDL_ENTRY(); ts_nvfp4_vec_rows<1>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void ts_quant_matmul_nvfp4_vec_f32_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{
+    TS_PDL_ENTRY(); ts_nvfp4_vec_rows<4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void ts_quant_matmul_nvfp4_vec_f32_8(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{
+    TS_PDL_ENTRY(); ts_nvfp4_vec_rows<8>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void ts_quant_matmul_nvfp4_vec_f32_16(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{
+    TS_PDL_ENTRY(); ts_nvfp4_vec_rows<16>(weights, xq, output, in_dim, out_dim, rows); }
+
 // Q8_0 matvec for short input rows (fewer than 1024 values: a hyper-connection bottleneck's up
 // projection, a shared expert's down projection). There the kernel above keeps most of its 32 lane
 // groups idle on the few blocks a row has, and launches a CTA per column: 10240 CTAs for a 320-wide
