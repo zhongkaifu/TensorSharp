@@ -3078,11 +3078,14 @@ public class CudaBackendTests
                 outDim,
                 weights.Length));
 
+            // Against unrounded activations: decode-size rows run the NVFP4 matvec on activations rounded to 8 bits a
+            // 32-value block (as ggml's mmvq does), which moves a 256-term product by up to ~1% of its magnitude
+            // (CudaNvfp4MatmulTests holds the matvec to 1e-4 of the dequantized weights times those rounded values).
             float[] expected = DequantizedMatmulNative(weights, GgmlTensorType.NVFP4, outDim, inDim, input);
             float maxAbs = 0f;
             foreach (float e in expected)
                 maxAbs = MathF.Max(maxAbs, MathF.Abs(e));
-            AssertClose(expected, output.GetElementsAsFloat(rows * outDim), MathF.Max(5e-2f, maxAbs * 3e-4f));
+            AssertClose(expected, output.GetElementsAsFloat(rows * outDim), MathF.Max(5e-2f, maxAbs * 1e-2f));
         }
         finally
         {

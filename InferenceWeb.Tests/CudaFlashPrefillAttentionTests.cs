@@ -29,6 +29,7 @@ public sealed class CudaFlashPrefillAttentionTests
     [InlineData(256, 24, 4, 17, 300, 0)]    // a chunk after a history
     [InlineData(256, 8, 1, 3, 2100, 0)]     // a verify window over a long history: split over the keys
     [InlineData(128, 16, 2, 40, 90, 33)]    // 128-wide heads, keys below a floor masked
+    [InlineData(256, 24, 4, 1, 3700, 0)]    // a decode row over a long window
     public void RowsMatchTheReference(int d, int heads, int kvHeads, int nq, int len, int floor)
     {
         using var allocator = new CudaAllocator();

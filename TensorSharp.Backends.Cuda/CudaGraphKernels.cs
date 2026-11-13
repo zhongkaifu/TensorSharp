@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 4;
+        public const int CurrentVersion = 6;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _ssmConv, _deltaNetPrep, _gatedRmsNorm;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
@@ -33,6 +33,7 @@ namespace TensorSharp.Cuda
             _ssmConv = module.GetFunction("ts_graph_ssm_conv_f32");
             _deltaNetPrep = module.GetFunction("ts_graph_deltanet_prep_f32");
             _gatedRmsNorm = module.GetFunction("ts_graph_gated_rms_norm_f32");
+            _addRmsNorm = module.GetFunction("ts_graph_add_rms_norm_f32");
         }
 
         /// <summary>The current module, or false with the reason it cannot be used (requires a current context).</summary>
@@ -81,21 +82,32 @@ namespace TensorSharp.Cuda
         /// <summary>GraphFusion.DeltaNetPrep over contiguous F32 buffers (see the kernel's contract).</summary>
         public void LaunchDeltaNetPrep(IntPtr window, IntPtr qkv, IntPtr convW, IntPtr alpha, IntPtr beta, IntPtr dt, IntPtr a,
             IntPtr convIn, IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr betaOut,
-            int channels, int convRows, int width, int d, int kHeads, int vHeads, int rows, float eps, IntPtr stream)
+            int channels, int convRows, int width, int d, int kHeads, int vHeads, int rows, float eps, long qkvPitch, long alphaBetaPitch,
+            IntPtr stream)
         {
             void** args = stackalloc void*[]
             {
                 &window, &qkv, &convW, &alpha, &beta, &dt, &a, &convIn, &q, &k, &v, &g, &betaOut,
-                &channels, &convRows, &width, &d, &kHeads, &vHeads, &rows, &eps,
+                &channels, &convRows, &width, &d, &kHeads, &vHeads, &rows, &eps, &qkvPitch, &alphaBetaPitch,
             };
             CudaDriverApi.cuLaunchKernel(_deltaNetPrep, (uint)(2 * kHeads + vHeads), (uint)rows, 1, (uint)d, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
-        /// <summary>GraphFusion.GatedRmsNorm over <paramref name="rows"/> contiguous rows of <paramref name="d"/>.</summary>
-        public void LaunchGatedRmsNorm(IntPtr y, IntPtr z, IntPtr w, IntPtr output, int rows, int d, float eps, IntPtr stream)
+        /// <summary>sum = a + b and normed = rms_norm(sum) * w over <paramref name="rows"/> contiguous rows of
+        /// <paramref name="cols"/>, one pass.</summary>
+        public void LaunchAddRmsNorm(IntPtr a, IntPtr b, IntPtr w, IntPtr sum, IntPtr normed, int rows, int cols, float eps, IntPtr stream)
         {
-            void** args = stackalloc void*[] { &y, &z, &w, &output, &d, &eps };
+            void** args = stackalloc void*[] { &a, &b, &w, &sum, &normed, &cols, &eps };
+            CudaDriverApi.cuLaunchKernel(_addRmsNorm, (uint)rows, 1, 1, 512, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>GraphFusion.GatedRmsNorm over <paramref name="rows"/> rows of <paramref name="d"/> (head r % heads of token
+        /// r / heads); z's tokens are <paramref name="zPitch"/> floats apart.</summary>
+        public void LaunchGatedRmsNorm(IntPtr y, IntPtr z, IntPtr w, IntPtr output, int rows, int d, float eps, int heads, long zPitch,
+            IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &y, &z, &w, &output, &d, &eps, &heads, &zPitch };
             CudaDriverApi.cuLaunchKernel(_gatedRmsNorm, (uint)rows, 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
     }

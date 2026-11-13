@@ -114,6 +114,26 @@ namespace TensorSharp.Cuda
             using Tensor kc = HeadFirst(kWindow.Cache), vc = HeadFirst(vWindow.Cache);
             int cap = (int)kc.Sizes[1];
             using Tensor qc = q.IsContiguous() ? q.CopyRef() : Ops.NewContiguous(q);
+            // A decode row over an F16 cache: the flash kernel split over the keys (the length read on the device when the
+            // step is recorded), where the GQA decode kernels took one block a head over the whole window (200 us a layer
+            // at 4K keys on Qwen3.8-27B).
+            if (nq == 1 && kWindow.Start == 0 && vWindow.Start == 0 && heads % kvHeads == 0
+                && kc.ElementType == DType.Float16 && vc.ElementType == DType.Float16 && kc.Sizes[^1] == d && vc.Sizes[^1] == d
+                && (trimmed ? mask.Trimmed : mask.Pattern) is MaskPattern.Causal or MaskPattern.None
+                && ((CudaAllocator)Allocator).FlashPrefillKernels is { } decodeFlash && decodeFlash.RunsAttention(d))
+            {
+                var cudaAllocator = (CudaAllocator)Allocator;
+                IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(cudaAllocator);
+                // Splits from the window (a recorded step replays at every length it covers).
+                int splits = decodeFlash.Splits(heads / kvHeads, kvHeads, dyn != IntPtr.Zero ? (int)k.Sizes[^2] : len);
+                var attended = new Tensor(Allocator, DType.Float32, 1, heads, d);
+                using Tensor partial = splits > 1
+                    ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(1, heads, d, splits)) : null;
+                Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
+                Launch(new[] { qc, kc, vc }, written, (_, stream) => decodeFlash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, 1, len, floor,
+                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn));
+                return attended;
+            }
             if (nq == 1)
             {
                 using Tensor query = qc.View(1, heads * d);
@@ -229,7 +249,7 @@ namespace TensorSharp.Cuda
         protected override bool Fuses(GraphFusion kind) => kind switch
         {
             GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm => Kernels != null,
-            GraphFusion.RoutedExperts => ((CudaAllocator)Allocator).Kernels != null,
+            GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             _ => false,
         };
 
@@ -238,8 +258,9 @@ namespace TensorSharp.Cuda
         protected override bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
         {
             if (kind == GraphFusion.RoutedExperts) return TryRoutedExperts(inputs, weights, ip, results);
+            if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs, weights, ip, results);
             CudaGraphKernels kernels = Kernels;
-            if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || !t.IsContiguous() || t.ElementType != DType.Float32))
+            if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
             float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
             switch (kind)
@@ -250,10 +271,17 @@ namespace TensorSharp.Cuda
                     Tensor window = inputs[0], qkv = inputs[1], convW = inputs[2];
                     int channels = (int)window.Sizes[0], convRows = (int)window.Sizes[^1], width = (int)convW.Sizes[^1];
                     int rows = (int)(qkv.ElementCount() / channels);
+                    // qkv, alpha and beta are read where they are (views of the packed in-projection): rows a pitch apart.
                     if (dk != dv || dk % 32 != 0 || dk > 1024 || channels != (2 * kHeads + vHeads) * dk
                         || window.ElementCount() != (long)channels * convRows || convW.ElementCount() != (long)channels * width
-                        || inputs[3].ElementCount() != (long)rows * vHeads || inputs[4].ElementCount() != (long)rows * vHeads)
+                        || inputs[3].ElementCount() != (long)rows * vHeads || inputs[4].ElementCount() != (long)rows * vHeads
+                        || !TryRows(qkv, channels, out long qkvPitch) || !TryRows(inputs[3], vHeads, out long alphaPitch)
+                        || !TryRows(inputs[4], vHeads, out long betaPitch) || alphaPitch != betaPitch)
                         return false;
+                    // The conv window, its weights, dt and a are read contiguous (copied when they are not).
+                    var copies = new System.Collections.Generic.List<Tensor>();
+                    foreach (int i in new[] { 0, 2, 5, 6 })
+                        if (!inputs[i].IsContiguous()) copies.Add(inputs[i] = Ops.NewContiguous(inputs[i]));
                     results[0] = new Tensor(Allocator, DType.Float32, channels, convRows + rows);
                     results[1] = new Tensor(Allocator, DType.Float32, rows, kHeads, dk);
                     results[2] = new Tensor(Allocator, DType.Float32, rows, kHeads, dk);
@@ -262,25 +290,84 @@ namespace TensorSharp.Cuda
                     results[5] = new Tensor(Allocator, DType.Float32, rows, vHeads, 1);
                     Launch(inputs, results, (k, stream) => k.LaunchDeltaNetPrep(Ptr(inputs[0]), Ptr(inputs[1]), Ptr(inputs[2]), Ptr(inputs[3]),
                         Ptr(inputs[4]), Ptr(inputs[5]), Ptr(inputs[6]), Ptr(results[0]), Ptr(results[1]), Ptr(results[2]), Ptr(results[3]),
-                        Ptr(results[4]), Ptr(results[5]), channels, convRows, width, dk, kHeads, vHeads, rows, eps, stream));
+                        Ptr(results[4]), Ptr(results[5]), channels, convRows, width, dk, kHeads, vHeads, rows, eps, qkvPitch, alphaPitch, stream));
+                    foreach (Tensor c in copies) c.Dispose();
                     return true;
                 }
                 case GraphFusion.GatedRmsNorm:
                 {
                     if (ip != null && ip.Length > 0 && ip[0] != 0) return false;   // the kernel gates with silu only
-                    Tensor y = inputs[0];
+                    Tensor y = inputs[0], z = inputs[1];
                     int d = (int)inputs[2].ElementCount();
-                    if (d % 32 != 0 || d > 1024 || y.ElementCount() % d != 0 || inputs[1].ElementCount() != y.ElementCount())
+                    // z is read where it is (a view of the packed in-projection): a token's heads * d values a pitch apart.
+                    int heads = y.DimensionCount >= 2 ? (int)y.Sizes[^2] : 1;
+                    if (d % 32 != 0 || d > 1024 || y.ElementCount() % d != 0 || z.ElementCount() != y.ElementCount()
+                        || !y.IsContiguous() || !inputs[2].IsContiguous() || y.Sizes[^1] != d)
+                        return false;
+                    if (!TryRows(z, (long)heads * d, out long zPitch))
                         return false;
                     results[0] = new Tensor(Allocator, DType.Float32, y.Sizes);
                     int rows = (int)(y.ElementCount() / d);
                     Launch(inputs, results, (k, stream) => k.LaunchGatedRmsNorm(Ptr(inputs[0]), Ptr(inputs[1]), Ptr(inputs[2]), Ptr(results[0]),
-                        rows, d, eps, stream));
+                        rows, d, eps, heads, zPitch, stream));
                     return true;
                 }
                 default:
                     return false;
             }
+        }
+
+        /// <summary>A block's residual add and the next block's input norm in one kernel (the stream and the normed row
+        /// written in one pass; three otherwise).</summary>
+        protected override bool TryAddWeightedNorm(Tensor a, Tensor b, Tensor weight, float eps, out Tensor sum, out Tensor normed)
+        {
+            sum = normed = null;
+            CudaGraphKernels kernels = Kernels;
+            Tensor[] inputs = { a, b, weight };
+            if (kernels == null || Array.Exists(inputs, t => t.Storage is not CudaStorage || !t.IsContiguous() || t.ElementType != DType.Float32))
+                return false;
+            long cols = a.Sizes[^1];
+            if (weight.ElementCount() != cols || a.ElementCount() != b.ElementCount() || a.ElementCount() % cols != 0 || cols > int.MaxValue)
+                return false;
+            int rows = checked((int)(a.ElementCount() / cols));
+            Tensor total = new Tensor(Allocator, DType.Float32, a.Sizes), norm = new Tensor(Allocator, DType.Float32, a.Sizes);
+            Launch(inputs, new[] { total, norm }, (k, stream) => k.LaunchAddRmsNorm(Ptr(a), Ptr(b), Ptr(weight), Ptr(total), Ptr(norm), rows,
+                (int)cols, eps, stream));
+            (sum, normed) = (total, norm);
+            return true;
+        }
+
+        /// <summary>The gated delta rule's regions read views of a packed in-projection where they are (<see cref="TryRows"/>);
+        /// the others take contiguous inputs.</summary>
+        protected override bool RegionReadsStridedInputs(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm;
+
+        /// <summary>
+        /// Whether <paramref name="t"/> is rows of <paramref name="rowFloats"/> contiguous floats, each <paramref name="pitch"/>
+        /// floats after the previous (pitch &gt;= rowFloats; a contiguous tensor has pitch rowFloats): the layout of a column
+        /// block of a packed product's rows.
+        /// </summary>
+        private static bool TryRows(Tensor t, long rowFloats, out long pitch)
+        {
+            pitch = rowFloats;
+            if (rowFloats <= 0 || t.ElementCount() % rowFloats != 0) return false;
+            if (t.IsContiguous()) return true;
+            int dim = t.DimensionCount - 1;
+            long inner = 1;
+            for (; dim >= 0 && inner < rowFloats; dim--)
+            {
+                if (t.Sizes[dim] != 1 && t.Strides[dim] != inner) return false;
+                inner *= t.Sizes[dim];
+            }
+            if (inner != rowFloats) return false;
+            long expected = -1;
+            for (; dim >= 0; dim--)
+            {
+                if (t.Sizes[dim] == 1) continue;
+                if (expected < 0) pitch = t.Strides[dim];
+                else if (t.Strides[dim] != expected) return false;
+                expected = t.Strides[dim] * t.Sizes[dim];
+            }
+            return pitch >= rowFloats;
         }
 
         private static IntPtr Ptr(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
@@ -354,6 +441,38 @@ namespace TensorSharp.Cuda
                     s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle);
             output.MarkDeviceModified();
             return result;
+        }
+
+        /// <summary>
+        /// A SwiGLU feed-forward with a fused gate|up weight (<see cref="GraphFusion.SwigluFfn"/>): the gate|up product, then
+        /// silu(gate) * up read from its rows in place (the region's ops copied both halves whole first: 0.5 GB a layer
+        /// for a 3.6K-token prompt of Qwen3.8-27B), and the down product. An NVFP4 down projection on the FP4 tensor cores
+        /// takes the activation straight into its quantized planes. False (the ops run) for separate gate and up weights.
+        /// </summary>
+        private bool TrySwigluFfn(Tensor[] inputs, IGraphWeight[] weights, long[] ip, Tensor[] results)
+        {
+            if (ip != null && ip.Length > 0 && ip[0] == 1) return false;
+            if (weights.Length < 3 || weights[1] is not { } gateUp || weights[2] is not { } down) return false;
+            Tensor x = inputs[0];
+            long ff = gateUp.Ne1 / 2;
+            if (x?.Storage is not CudaStorage || x.ElementType != DType.Float32 || !x.IsContiguous() || gateUp.Ne2 > 1 || down.Ne2 > 1
+                || gateUp.Ne1 % 2 != 0 || down.Ne0 != ff || x.ElementCount() % gateUp.Ne0 != 0 || ff > int.MaxValue)
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            long rows = x.ElementCount() / gateUp.Ne0;
+            using Tensor x2 = x.View(rows, gateUp.Ne0);
+            using Tensor gu = QuantizedMatMul(gateUp, x2);   // [rows, 2 ff], gate first
+            var y = new Tensor(Allocator, DType.Float32, rows, down.Ne1);
+            if (CudaQuantizedOps.TryAddmmSwiGluNvfp4(y, gu, down.CacheKey, down.Data, down.Format, down.Ne0, down.Ne1, down.Bytes))
+            {
+                results[0] = y;
+                return true;
+            }
+            y.Dispose();
+            using var act = new Tensor(Allocator, DType.Float32, rows, ff);
+            Launch(new[] { gu }, act, (_, stream) => cuda.Kernels.LaunchSiLUMulSplitF32(Ptr(gu), Ptr(act), checked((int)rows), (int)ff, stream));
+            results[0] = QuantizedMatMul(down, act);
+            return true;
         }
 
         // ---------------------------------------------------------------- routed experts

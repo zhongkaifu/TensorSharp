@@ -15,7 +15,8 @@
 //
 //   * ts_fp4_repack_nvfp4: ggml block_nvfp4 rows -> the planes (once, as the weight becomes resident).
 //   * ts_fp4_quantize_q81_f32 + ts_fp4_gemv_nvfp4_<n>: up to 8 rows (decode, verify windows) against q8 activations.
-//   * ts_fp4_quantize_nvfp4_f32: F32 rows -> NVFP4 activation planes and row scales (ggml-cuda's quantize_mmq_nvfp4).
+//   * ts_fp4_quantize_nvfp4_f32: F32 rows -> NVFP4 activation planes and row scales (ggml-cuda's quantize_mmq_nvfp4);
+//     ts_fp4_quantize_swiglu_nvfp4_f32 the planes of silu(gate) * up of fused gate|up rows.
 //   * ts_fp4_gemm_w4a4_<bn>: 9+ rows on the FP4 tensor cores through a cp.async ring, split over K for few rows.
 //   * ts_fp4_gemm_w4a4_tma<bm>: prompt rows, TMA-fed and warp-specialized (the same products in the same order).
 //   * ts_fp4_get_rows_f32: rows of a planar matrix as F32 (an NVFP4 table's lookup).
@@ -35,7 +36,7 @@
 #define TS_FP4_NVFP4_BLOCK 64
 #define TS_FP4_NVFP4_BLOCK_BYTES 36
 
-#define TS_FP4_VERSION 2
+#define TS_FP4_VERSION 3
 
 __device__ __forceinline__ float ts_fp4_warp_sum(float v)
 {
@@ -452,6 +453,15 @@ extern "C" __global__ void __launch_bounds__(512) ts_fp4_quantize_nvfp4_f32(
     float* __restrict__ rowScale, int k)
 {
     ts_fp4_quantize_row<0>(const_cast<float*>(x), nullptr, nullptr, 0.0f, codes, scales, rowScale, k);
+}
+
+// The NVFP4 planes of silu(gate) * up for fused gate|up rows [rows][2k] (gate first): a SwiGLU feed-forward's down
+// projection input, never stored as F32.
+extern "C" __global__ void __launch_bounds__(512) ts_fp4_quantize_swiglu_nvfp4_f32(
+    const float* __restrict__ gu, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
+    float* __restrict__ rowScale, int k)
+{
+    ts_fp4_quantize_row<1>(const_cast<float*>(gu), nullptr, nullptr, 0.0f, codes, scales, rowScale, k);
 }
 
 #if defined(__CUDA_ARCH__) && (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL))

@@ -27,7 +27,7 @@
 // so the committed compute_75 PTX carries working kernels.
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 2
+#define TS_FLASH_PREFILL_VERSION 3
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -54,7 +54,8 @@ extern "C" __global__ void ts_flash_prefill_caps(int* out)
 // rows of one KV head (row r: query t = r / G of head kvh * G + r % G) and streams 32-key K and V tiles through a
 // two-stage cp.async pipeline. The mma accumulate in F16 over short runs only: each 16-value step of QK^T (Q
 // pre-scaled to log2 units) is rounded once and summed in F32, and PV over one 32-key tile (probabilities at most 1)
-// is rounded twice before it joins the F32 accumulators. splits > 1 (a grid too small to fill the device: a few
+// is rounded twice before it joins the F32 accumulators. With dyn set (a recorded decode step) the window's length is
+// dyn[0], read on the device. splits > 1 (a grid too small to fill the device: a few
 // query rows over a long window): block x = (row tile, key split), each split takes a 32-key-aligned share of its
 // rows' keys and writes unnormalized partials (acc, ln-domain max, sum) that ts_flash_prefill_combine_f32 merges.
 // sm_80+ (cp.async, ldmatrix, mma.f16): the compute_75 image traps here; the host launches it only where
@@ -138,6 +139,8 @@ __device__ __forceinline__ uint32_t ts_fp_pack_h2(float lo, float hi)
     return *reinterpret_cast<const uint32_t*>(&v);
 }
 
+// Dynamic shared memory of ts_flash_prefill_f16_d<HD>: 2 stages x (K, V) x TS_FP_KT rows of HD + 8 halves
+// (CudaFlashPrefillKernels.SharedBytes computes the same).
 template <int HD>
 struct TsFpAttnSmem
 {
@@ -149,8 +152,12 @@ struct TsFpAttnSmem
 template <int HD>
 __device__ __forceinline__ void ts_fp_attn(
     const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len,
-    int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out)
+    int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out,
+    const int* __restrict__ dyn)
 {
+    // A recorded decode step reads the window's length from the step's parameter block (CudaDecodeDynParams).
+    if (dyn != nullptr)
+        len = dyn[0];
     constexpr int ROW = TsFpAttnSmem<HD>::ROW, KS = HD / 16, NS = HD / 8;
     extern __shared__ __align__(16) uint8_t ts_fp_attn_smem[];
     TsFpAttnSmem<HD>& sm = *reinterpret_cast<TsFpAttnSmem<HD>*>(ts_fp_attn_smem);
@@ -372,18 +379,12 @@ __device__ __forceinline__ void ts_fp_attn(
 #define TS_FP_ATTN(HD) \
     extern "C" __global__ void __launch_bounds__(256) ts_flash_prefill_f16_d##HD( \
         const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len, \
-        int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out) \
-    { ts_fp_attn<HD>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out); }
+        int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
+        const int* __restrict__ dyn) \
+    { ts_fp_attn<HD>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn); }
 
 TS_FP_ATTN(128)
 TS_FP_ATTN(256)
-
-/// Dynamic shared memory of ts_flash_prefill_f16_d<hd>: out[0] for 128, out[1] for 256.
-extern "C" __global__ void ts_flash_prefill_smem_bytes(int* out)
-{
-    out[0] = (int)sizeof(TsFpAttnSmem<128>);
-    out[1] = (int)sizeof(TsFpAttnSmem<256>);
-}
 
 // The split partials of one (query, head): out = sum_s e^(m_s - m) acc_s / sum_s e^(m_s - m) l_s.
 // Launch: grid nq * heads, block HD.

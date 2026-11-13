@@ -66,6 +66,10 @@ namespace TensorSharp.Graph
         /// <summary>The backend's element-wise kernels read strided views (no contiguous copy first).</summary>
         protected virtual bool KernelsReadStridedViews => false;
 
+        /// <summary>Whether a fused region of <paramref name="kind"/> takes its tensor inputs as they are (views of a packed
+        /// projection, say) rather than contiguous copies: <see cref="TryFused"/> then handles (or declines) any layout.</summary>
+        protected virtual bool RegionReadsStridedInputs(GraphFusion kind) => KernelsReadStridedViews;
+
         private Tensor In(Tensor t, RunState run) => KernelsReadStridedViews ? t : Contig(t, run);
 
         private static readonly HashSet<GraphOp> s_ops = new()
@@ -560,7 +564,7 @@ namespace TensorSharp.Graph
                         continue;
                     }
                     inputs[i] = Get(region.Srcs[i]);
-                    if (!_x.KernelsReadStridedViews && !inputs[i].IsContiguous()) inputs[i] = _x.Contig(inputs[i], Run);
+                    if (!_x.RegionReadsStridedInputs((GraphFusion)region.Node) && !inputs[i].IsContiguous()) inputs[i] = _x.Contig(inputs[i], Run);
                 }
                 var outs = new Tensor[results.Length];
                 if (_x.TryFused((GraphFusion)region.Node, inputs, weights, region.Ip, region.Fp, outs))

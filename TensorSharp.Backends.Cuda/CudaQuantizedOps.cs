@@ -920,11 +920,23 @@ namespace TensorSharp.Cuda
                 fp4.Gemv(planes, outDim, inDim, inputPtr, rows, scratch, resultPtr, stream);
                 return;
             }
-            var (codeBytes, scaleBytes, rowScaleBytes) = CudaFp4Kernels.ActivationBytes(rows, inDim);
-            IntPtr codes = EnsureScratch(Fp4CodesScratch, allocator, codeBytes);
-            IntPtr scales = EnsureScratch(Fp4ScalesScratch, allocator, scaleBytes);
-            IntPtr rowScale = EnsureScratch(Fp4RowScaleScratch, allocator, rowScaleBytes);
+            var (codes, scales, rowScale) = Fp4Activations(allocator, rows, inDim);
             fp4.Quantize(inputPtr, codes, scales, rowScale, inDim, rows, stream);
+            RunNvfp4PlanarGemm(allocator, fp4, planes, codes, scales, rowScale, resultPtr, inDim, outDim, rows);
+        }
+
+        private static (IntPtr Codes, IntPtr Scales, IntPtr RowScale) Fp4Activations(CudaAllocator allocator, int rows, int k)
+        {
+            var (codeBytes, scaleBytes, rowScaleBytes) = CudaFp4Kernels.ActivationBytes(rows, k);
+            return (EnsureScratch(Fp4CodesScratch, allocator, codeBytes), EnsureScratch(Fp4ScalesScratch, allocator, scaleBytes),
+                EnsureScratch(Fp4RowScaleScratch, allocator, rowScaleBytes));
+        }
+
+        /// <summary>The FP4 tensor-core product of NVFP4 activation planes already quantized and a planar matrix.</summary>
+        private static void RunNvfp4PlanarGemm(CudaAllocator allocator, CudaFp4Kernels fp4, IntPtr planes, IntPtr codes, IntPtr scales,
+            IntPtr rowScale, IntPtr resultPtr, int inDim, int outDim, int rows)
+        {
+            IntPtr stream = allocator.Stream.Handle;
             if (CudaFp4Kernels.TakesTma(rows, outDim, inDim, planes, codes, scales))
             {
                 fp4.GemmTma(planes, outDim, inDim, codes, scales, rowScale, rows, 1.0f, resultPtr, stream);
@@ -938,6 +950,36 @@ namespace TensorSharp.Cuda
                 counters = EnsureZeroedScratch(Fp4CounterScratch, allocator, (long)CudaFp4Kernels.Tiles(outDim, rows) * sizeof(int));
             }
             fp4.Gemm(planes, outDim, inDim, codes, scales, rowScale, rows, 1.0f, resultPtr, partial, counters, splits, stream);
+        }
+
+        /// <summary>
+        /// result[rows, ne1] = (silu(gate) * up) W^T for fused gate|up rows <paramref name="gateUp"/> [rows, 2 * ne0] (gate
+        /// first) and an NVFP4 matrix W [ne1, ne0] kept as planes for the FP4 tensor cores, when the rows run on its GEMMs:
+        /// the activation goes straight into the GEMM's NVFP4 planes (never stored as F32). False where it does not apply
+        /// (the caller computes the activation and multiplies it).
+        /// </summary>
+        public static bool TryAddmmSwiGluNvfp4(Tensor result, Tensor gateUp, IntPtr cacheKey, IntPtr hostData, int ggmlType,
+            long ne0, long ne1, long rawBytes)
+        {
+            if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
+                || !CudaKernelOps.TryGetContiguousRows(gateUp, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
+                || rows != inputRows || cols != ne1 || inputCols != 2 * ne0 || rows <= CudaFp4Kernels.GemvMaxRows
+                || result.ElementType != DType.Float32 || gateUp.ElementType != DType.Float32)
+                return false;
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (allocator.Fp4Kernels is not { } fp4)
+                return false;
+            DeviceWeight weight = EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            if (weight.GgmlType != Nvfp4PlanarType)
+                return false;
+            inputStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            int k = checked((int)ne0);
+            var (codes, scales, rowScale) = Fp4Activations(allocator, rows, k);
+            fp4.QuantizeSwiGlu(inputPtr, codes, scales, rowScale, k, rows, allocator.Stream.Handle);
+            RunNvfp4PlanarGemm(allocator, fp4, weight.DevicePtr, codes, scales, rowScale, resultPtr, k, cols, rows);
+            resultStorage.MarkDeviceModified();
+            return true;
         }
 
         internal static void RunResidentMatmul(

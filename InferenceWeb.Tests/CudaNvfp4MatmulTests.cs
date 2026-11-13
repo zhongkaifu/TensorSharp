@@ -184,6 +184,56 @@ public sealed class CudaNvfp4MatmulTests
         }
     }
 
+    /// <summary>
+    /// A SwiGLU feed-forward's down projection on the FP4 tensor cores with the activation quantized straight from the fused
+    /// gate|up rows (silu(gate) * up never stored) equals the activation computed first and multiplied, to the bit.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(17408, 5120, 40)]
+    [InlineData(512, 256, 300)]
+    public void FusedSwiGluDownProjectionMatchesTheTwoStepProduct(int ff, int outDim, int rows)
+    {
+        using var allocator = new CudaAllocator();
+        if (allocator.Fp4Kernels == null)
+        {
+            _output.WriteLine("no FP4 tensor-core products here: the fused route does not apply");
+            return;
+        }
+        byte[] weights = Nvfp4Rows(outDim, ff, seed: 13);
+        var gu = new float[rows, 2 * ff];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < 2 * ff; c++)
+                gu[r, c] = 2.5f * MathF.Sin(0.0091f * (c + 1) * (r + 3)) + 0.2f * MathF.Cos(0.033f * c - r);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var gateUp = Tensor.FromArray(allocator, gu);
+            using var fused = new Tensor(allocator, DType.Float32, rows, outDim);
+            Assert.True(CudaQuantizedOps.TryAddmmSwiGluNvfp4(fused, gateUp, host, host, Nvfp4, ff, outDim, weights.Length));
+            float[] a = fused.GetElementsAsFloat(rows * outDim);
+
+            using var act = new Tensor(allocator, DType.Float32, rows, ff);
+            ((CudaStorage)gateUp.Storage).EnsureDeviceCurrent();
+            ((CudaStorage)act.Storage).EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            allocator.Kernels.LaunchSiLUMulSplitF32(((CudaStorage)gateUp.Storage).DevicePtrAtElement(0),
+                ((CudaStorage)act.Storage).DevicePtrAtElement(0), rows, ff, allocator.Stream.Handle);
+            ((CudaStorage)act.Storage).MarkDeviceModified();
+            using var twoStep = new Tensor(allocator, DType.Float32, rows, outDim);
+            Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(twoStep, act, host, host, Nvfp4, ff, outDim, weights.Length));
+            float[] b = twoStep.GetElementsAsFloat(rows * outDim);
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+            for (int i = 0; i < a.Length; i++)
+                if (BitConverter.SingleToInt32Bits(a[i]) != BitConverter.SingleToInt32Bits(b[i]))
+                    Assert.Fail($"row {i / outDim} column {i % outDim}: fused {a[i]:R}, two-step {b[i]:R}");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
     /// <summary>Rows of an NVFP4 table gathered on the device (the planar layout's lookup where weights are planar) equal
     /// the host's dequantization.</summary>
     [CudaFact]

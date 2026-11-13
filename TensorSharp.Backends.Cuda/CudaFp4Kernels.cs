@@ -22,7 +22,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FP4_VERSION in tensorsharp_fp4_kernels.cu: bump both together whenever a kernel is added or
         /// changes its signature.</summary>
-        public const int CurrentVersion = 2;
+        public const int CurrentVersion = 3;
 
         /// <summary>K values one GEMM stage takes: a planar matrix's row width must be a multiple of it.</summary>
         public const int StageK = 256;
@@ -42,7 +42,7 @@ namespace TensorSharp.Cuda
         private const int Block = 256;
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
 
-        private readonly IntPtr _repack, _quantQ81, _quantNvfp4, _gemm32, _gemm64, _gemm128, _tma256, _tma128, _getRows;
+        private readonly IntPtr _repack, _quantQ81, _quantNvfp4, _quantSwiGlu, _gemm32, _gemm64, _gemm128, _tma256, _tma128, _getRows;
         private readonly IntPtr[] _gemv = new IntPtr[GemvMaxRows + 1];
         private readonly int[] _gemvRows = new int[GemvMaxRows + 1];
         private readonly int _smem32, _smem64, _smem128, _smemTma256, _smemTma128;
@@ -60,6 +60,7 @@ namespace TensorSharp.Cuda
             _repack = module.GetFunction("ts_fp4_repack_nvfp4");
             _quantQ81 = module.GetFunction("ts_fp4_quantize_q81_f32");
             _quantNvfp4 = module.GetFunction("ts_fp4_quantize_nvfp4_f32");
+            _quantSwiGlu = module.GetFunction("ts_fp4_quantize_swiglu_nvfp4_f32");
             _gemm32 = module.GetFunction("ts_fp4_gemm_w4a4_32");
             _gemm64 = module.GetFunction("ts_fp4_gemm_w4a4_64");
             _gemm128 = module.GetFunction("ts_fp4_gemm_w4a4_128");
@@ -76,6 +77,7 @@ namespace TensorSharp.Cuda
             RunProbe(module.GetFunction("ts_fp4_gemm_tma_smem_bytes"), host, 2);
             (_smemTma256, _smemTma128) = (host[0], host[1]);
             CudaDriverApi.cuFuncSetAttribute(_quantNvfp4, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_quantSwiGlu, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             foreach (var (fn, smem) in new[] { (_gemm32, _smem32), (_gemm64, _smem64), (_gemm128, _smem128), (_tma256, _smemTma256), (_tma128, _smemTma128) })
                 CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem).ThrowOnError();
         }
@@ -167,6 +169,15 @@ namespace TensorSharp.Cuda
             IntPtr a0 = x, a1 = codes, a2 = scales, a3 = rowScale; int a4 = k;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
             Launch(_quantNvfp4, (uint)rows, 1, 1, 512, k * 4, stream, args);
+        }
+
+        /// <summary>NVFP4 planes of silu(gate) * up for fused gate|up rows [rows][2k] (gate first): the planes
+        /// <see cref="Quantize"/> makes of that activation, which is never stored as F32.</summary>
+        public void QuantizeSwiGlu(IntPtr gateUp, IntPtr codes, IntPtr scales, IntPtr rowScale, int k, int rows, IntPtr stream)
+        {
+            IntPtr a0 = gateUp, a1 = codes, a2 = scales, a3 = rowScale; int a4 = k;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
+            Launch(_quantSwiGlu, (uint)rows, 1, 1, 512, k * 4, stream, args);
         }
 
         /// <summary>Whether <paramref name="m"/> rows of a product run on the TMA-fed GEMM (16-byte aligned planes).</summary>

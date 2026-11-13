@@ -1798,7 +1798,8 @@ namespace TensorSharp.Cli
                     EmitToken, cancellationToken, requestId,
                     _model.MultimodalInjector.GetPreparedMediaSpans(requestId),
                     enablePrefixCache: PrefixCacheEnabled,
-                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(_sharedPrefix, inputTokens));
+                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(_sharedPrefix, inputTokens),
+                    promptTailCheckpointOptional: !budgetThinking);
             }
             finally
             {

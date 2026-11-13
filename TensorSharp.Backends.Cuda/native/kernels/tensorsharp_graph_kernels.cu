@@ -9,7 +9,7 @@
 // have no generic tensor-op equivalent, with ggml's semantics so a program computes the same thing
 // on every backend.
 
-#define TS_GRAPH_KERNELS_VERSION 4
+#define TS_GRAPH_KERNELS_VERSION 6
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -234,7 +234,8 @@ extern "C" __global__ void ts_graph_ssm_conv_f32(const float* __restrict__ x, co
 // GraphFusion.DeltaNetPrep for one sequence (the gated delta rule's inputs). Launch: grid (2 * k_heads + v_heads,
 // rows), block d (d % 32 == 0, <= 1024): one block per (head, row), q heads then k heads then v heads, thread i
 // owning channel head * d + i. window [channels, conv_rows] and conv_in [channels, conv_rows + rows] are time
-// innermost; qkv [rows, channels]; conv_w [channels, width]; alpha, beta [rows, v_heads]; dt, a [v_heads].
+// innermost; qkv [rows, channels] with rows qkv_pitch floats apart; conv_w [channels, width]; alpha, beta
+// [rows, v_heads] with rows ab_pitch floats apart (views of a packed projection are read in place); dt, a [v_heads].
 // Outputs: conv_in (window then rows); q, k [rows, heads, d] = silu(ssm_conv) L2-normed per head
 // (x * rsqrt(sum x^2 + eps)); v [rows, v_heads, d] = silu(ssm_conv); g = softplus(alpha + dt) * a and
 // beta = sigmoid(beta), [rows, v_heads].
@@ -243,7 +244,8 @@ extern "C" __global__ void ts_graph_deltanet_prep_f32(
     const float* __restrict__ alpha, const float* __restrict__ beta, const float* __restrict__ dt, const float* __restrict__ a,
     float* __restrict__ conv_in, float* __restrict__ q_out, float* __restrict__ k_out, float* __restrict__ v_out,
     float* __restrict__ g_out, float* __restrict__ beta_out,
-    int channels, int conv_rows, int width, int d, int k_heads, int v_heads, int rows, float eps)
+    int channels, int conv_rows, int width, int d, int k_heads, int v_heads, int rows, float eps,
+    long long qkv_pitch, long long ab_pitch)
 {
     __shared__ float partial[32];
     const int i = threadIdx.x;
@@ -255,10 +257,10 @@ extern "C" __global__ void ts_graph_deltanet_prep_f32(
     for (int j = 0; j < width; j++)
     {
         const int p = t + j;
-        const float in = p < conv_rows ? window[c * conv_rows + p] : qkv[(size_t)(p - conv_rows) * channels + c];
+        const float in = p < conv_rows ? window[c * conv_rows + p] : qkv[(size_t)(p - conv_rows) * qkv_pitch + c];
         x += in * conv_w[c * width + j];
     }
-    conv_in[c * span + conv_rows + t] = qkv[(size_t)t * channels + c];
+    conv_in[c * span + conv_rows + t] = qkv[(size_t)t * qkv_pitch + c];
     if (t == 0)
         for (int p = 0; p < conv_rows; p++) conv_in[c * span + p] = window[c * conv_rows + p];
     const float y = x / (1.0f + expf(-x));
@@ -279,18 +281,52 @@ extern "C" __global__ void ts_graph_deltanet_prep_f32(
         v_out[((size_t)t * v_heads + vh) * d + i] = y;
         if (i == 0)
         {
-            const size_t gi = (size_t)t * v_heads + vh;
-            const float s = alpha[gi] + dt[vh];
+            const size_t gi = (size_t)t * v_heads + vh, ai = (size_t)t * ab_pitch + vh;
+            const float s = alpha[ai] + dt[vh];
             g_out[gi] = (s > 20.0f ? s : logf(1.0f + expf(s))) * a[vh];
-            beta_out[gi] = 1.0f / (1.0f + expf(-beta[gi]));
+            beta_out[gi] = 1.0f / (1.0f + expf(-beta[ai]));
         }
     }
 }
 
-// GraphFusion.GatedRmsNorm: out = y * rsqrt(mean(y^2) + eps) * w * silu(z) over rows of d.
-// Launch: grid rows, block d (d % 32 == 0, <= 1024).
+// The residual add and the next block's input norm in one pass: sum = a + b, normed = sum * rsqrt(mean(sum^2) + eps) * w
+// over rows of cols (ggml_rms_norm(ggml_add(a, b)) * w). Launch: grid rows, block 512.
+extern "C" __global__ void ts_graph_add_rms_norm_f32(const float* __restrict__ a, const float* __restrict__ b,
+    const float* __restrict__ w, float* __restrict__ sum, float* __restrict__ normed, int cols, float eps)
+{
+    __shared__ float partial[32];
+    const size_t r = blockIdx.x;
+    const float* ar = a + r * cols;
+    const float* br = b + r * cols;
+    float* sr = sum + r * cols;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+    {
+        const float v = ar[i] + br[i];
+        sr[i] = v;
+        ss += v * v;
+    }
+    ss = ts_graph_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        float t = threadIdx.x < (blockDim.x >> 5) ? partial[threadIdx.x] : 0.0f;
+        t = ts_graph_warp_sum(t);
+        if (threadIdx.x == 0) partial[0] = t;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(partial[0] / (float)cols + eps);
+    float* nr = normed + r * cols;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        nr[i] = sr[i] * scale * w[i];
+}
+
+// GraphFusion.GatedRmsNorm: out = y * rsqrt(mean(y^2) + eps) * w * silu(z) over rows of d. Row r of y and out is head
+// r % heads of token r / heads; z holds a token's heads * d values z_pitch floats after the previous token's (a view
+// of a packed projection is read in place). Launch: grid rows, block d (d % 32 == 0, <= 1024).
 extern "C" __global__ void ts_graph_gated_rms_norm_f32(const float* __restrict__ y, const float* __restrict__ z,
-    const float* __restrict__ w, float* __restrict__ out, int d, float eps)
+    const float* __restrict__ w, float* __restrict__ out, int d, float eps, int heads, long long z_pitch)
 {
     __shared__ float partial[32];
     const int i = threadIdx.x;
@@ -301,6 +337,6 @@ extern "C" __global__ void ts_graph_gated_rms_norm_f32(const float* __restrict__
     __syncthreads();
     float total = 0.0f;
     for (int s = 0; s < d / 32; s++) total += partial[s];
-    const float zz = z[r * d + i];
+    const float zz = z[(r / heads) * z_pitch + (r % heads) * d + i];
     out[r * d + i] = v * rsqrtf(total / d + eps) * w[i] * (zz / (1.0f + expf(-zz)));
 }
