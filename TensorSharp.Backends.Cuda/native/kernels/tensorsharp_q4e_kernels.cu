@@ -31,6 +31,19 @@
 
 #include <cuda_fp16.h>
 #include <stdint.h>
+// Programmatic dependent launch (sm_90+): a kernel the engine launches with the programmatic-serialization
+// attribute may start while the kernel before it in the stream drains, so its launch overlaps the other's tail.
+// Every exported kernel opens with TS_PDL_ENTRY(): griddepcontrol.wait holds the whole kernel until the grids it
+// depends on have completed and their writes are visible (so nothing it reads or overwrites is touched early), and
+// launch_dependents then lets the next kernel's blocks be scheduled. Below sm_90 (and launched without the attribute)
+// both are no-ops, and the kernel runs exactly as before.
+#ifndef TS_PDL_ENTRY
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define TS_PDL_ENTRY() asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory")
+#else
+#define TS_PDL_ENTRY() do { } while (0)
+#endif
+#endif
 
 __device__ __forceinline__ float q4e_warp_sum(float v)
 {
@@ -134,6 +147,7 @@ extern "C" __global__ void ts_q4e_hc_norm_f32(
     const int HC,
     const float eps)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[32];
     __shared__ float inv[Q4E_HC_MAX];
     const int t = blockIdx.x;
@@ -244,6 +258,7 @@ extern "C" __global__ void ts_q4e_hc_partials_f32(
     const int E,
     const int HC)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[Q4E_HC_PARTIAL][32];
     const int slice = blockIdx.x;
     const int t = blockIdx.y;
@@ -266,6 +281,7 @@ extern "C" __global__ void ts_q4e_hc_post_partials_f32(
     const int E,
     const int HC)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[Q4E_HC_PARTIAL][32];
     const int slice = blockIdx.x;
     const int t = blockIdx.y;
@@ -284,6 +300,7 @@ extern "C" __global__ void ts_q4e_hc_post_partials_f32(
 // BF16 values widened to F32 (exact): a prompt's router GEMM over weights kept as the file's BF16.
 extern "C" __global__ void ts_q4e_bf16_to_f32(const unsigned short* __restrict__ src, float* __restrict__ dst, const long long n)
 {
+    TS_PDL_ENTRY();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
         dst[i] = __uint_as_float((unsigned int)src[i] << 16);
@@ -304,6 +321,7 @@ extern "C" __global__ void ts_q4e_hc_apply_f32(
     const int HC,
     const float eps)
 {
+    TS_PDL_ENTRY();
     __shared__ float inv[Q4E_HC_MAX];
     const int slice = blockIdx.x;
     const int t = blockIdx.y;
@@ -344,6 +362,7 @@ extern "C" __global__ void ts_q4e_silu_q81_f32(
     const long long blocks,
     const float scale)
 {
+    TS_PDL_ENTRY();
     const int lane = threadIdx.x & 31;
     const long long b = (((long long)blockIdx.x * blockDim.x) + threadIdx.x) >> 5;
     if (b >= blocks)
@@ -356,6 +375,7 @@ extern "C" __global__ void ts_q4e_silu_q81_f32(
 // x = silu(x * scale) over n values: the bottleneck activation.
 extern "C" __global__ void ts_q4e_silu_scale_f32(float* __restrict__ x, const long long n, const float scale)
 {
+    TS_PDL_ENTRY();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
         x[i] = q4e_silu(x[i] * scale);
@@ -370,6 +390,7 @@ extern "C" __global__ void ts_q4e_hc_collapse_f32(
     const int E,
     const int HC)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (i >= E)
@@ -393,6 +414,7 @@ extern "C" __global__ void ts_q4e_hc_collapse_q81_f32(
     const int E,
     const int HC)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (i >= E)
@@ -415,6 +437,7 @@ extern "C" __global__ void ts_q4e_hc_post_f32(
     const int E,
     const int HC)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (i >= E)
@@ -473,6 +496,7 @@ extern "C" __global__ void ts_q4e_gdn_prep_f32(
     const int dc,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     if (warp >= rowsPerSeq * nSeq * HV)
@@ -526,6 +550,7 @@ extern "C" __global__ void ts_q4e_conv_update_f32(
     const int C,
     const int hist)
 {
+    TS_PDL_ENTRY();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)nSeq * C)
         return;
@@ -573,6 +598,7 @@ extern "C" __global__ void __launch_bounds__(256) ts_q4e_gdn_chunk_prep_f32(
     const int HK,
     const int HV)
 {
+    TS_PDL_ENTRY();
     constexpr int S = Q4E_GDN_HD, GCH = Q4E_GCH, GTP = Q4E_GTP;
     extern __shared__ __align__(16) float q4e_gsm[];
     float* sk = q4e_gsm;                   // [GCH][S + 1]
@@ -676,6 +702,7 @@ extern "C" __global__ void __launch_bounds__(128 * Q4E_GVPK) ts_q4e_gdn_chunk_sc
     const int HK,
     const int HV)
 {
+    TS_PDL_ENTRY();
     constexpr int S = Q4E_GDN_HD, GCH = Q4E_GCH, GDV = Q4E_GDV, GKP = Q4E_GKP;
     constexpr int NT = 128 * Q4E_GVPK, HEAD = S * GDV + 3 * GCH * GDV;
     extern __shared__ __align__(16) float q4e_gsm[];
@@ -1006,6 +1033,7 @@ extern "C" __global__ void ts_q4e_attn_prep_f32(
     half* __restrict__ kCache, half* __restrict__ vCache, const int32_t* __restrict__ positions,
     const int p0, const int NH, const int NKV, const int nRot, const float base, const float freqScale, const float eps)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[32];
     __shared__ float row[Q4E_ATTN_HD];
     const int head = blockIdx.x;
@@ -1056,6 +1084,7 @@ extern "C" __global__ void ts_q4e_attn_prep_q8_f32(
     const int32_t* __restrict__ positions,
     const int p0, const int NH, const int NKV, const int nRot, const float base, const float freqScale, const float eps)
 {
+    TS_PDL_ENTRY();
     q4e_attn_prep<true>(qg, k, v, qNorm, kNorm, q, gate, kCache, vCache, kScale, vScale, positions,
         p0, NH, NKV, nRot, base, freqScale, eps);
 }
@@ -1070,6 +1099,7 @@ extern "C" __global__ void ts_q4e_attn_prep_q8_paged_f32(
     const int32_t* __restrict__ table, signed char* __restrict__ hostK, signed char* __restrict__ hostV,
     half* __restrict__ hostKScale, half* __restrict__ hostVScale)
 {
+    TS_PDL_ENTRY();
     q4e_attn_prep<true, true>(qg, k, v, qNorm, kNorm, q, gate, kCache, vCache, kScale, vScale, positions,
         p0, NH, NKV, nRot, base, freqScale, eps, table, hostK, hostV, hostKScale, hostVScale);
 }
@@ -1222,6 +1252,7 @@ extern "C" __global__ void ts_q4e_attention_f32(
     const float scale,
     const int cellStride)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const int kvh = h / (NH / NKV);
@@ -1321,6 +1352,7 @@ extern "C" __global__ void ts_q4e_attention_q8_f32(
     float* __restrict__ out, const int32_t* __restrict__ positions,
     const int p0, const int NH, const int NKV, const float scale, const int cellStride)
 {
+    TS_PDL_ENTRY();
     q4e_attention<true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
         p0, NH, NKV, scale, cellStride);
 }
@@ -1333,6 +1365,7 @@ extern "C" __global__ void ts_q4e_attention_q8_paged_f32(
     float* __restrict__ out, const int32_t* __restrict__ positions,
     const int p0, const int NH, const int NKV, const float scale, const int cellStride, const int32_t* __restrict__ table)
 {
+    TS_PDL_ENTRY();
     q4e_attention<true, true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
         p0, NH, NKV, scale, cellStride, table);
 }
@@ -1512,6 +1545,7 @@ extern "C" __global__ void ts_q4e_attention_split_f32(
     const int p0, const int NH, const int NKV, const float scale, const int cellStride,
     float* __restrict__ part, int* __restrict__ arrive)
 {
+    TS_PDL_ENTRY();
     q4e_attention_split<false>(q, kCache, vCache, nullptr, nullptr, gate, cells, cellCnt, out, positions,
         p0, NH, NKV, scale, cellStride, part, arrive);
 }
@@ -1524,6 +1558,7 @@ extern "C" __global__ void ts_q4e_attention_split_q8_f32(
     const int p0, const int NH, const int NKV, const float scale, const int cellStride,
     float* __restrict__ part, int* __restrict__ arrive)
 {
+    TS_PDL_ENTRY();
     q4e_attention_split<true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
         p0, NH, NKV, scale, cellStride, part, arrive);
 }
@@ -1537,8 +1572,360 @@ extern "C" __global__ void ts_q4e_attention_split_q8_paged_f32(
     const int p0, const int NH, const int NKV, const float scale, const int cellStride,
     float* __restrict__ part, int* __restrict__ arrive, const int32_t* __restrict__ table)
 {
+    TS_PDL_ENTRY();
     q4e_attention_split<true, true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
         p0, NH, NKV, scale, cellStride, part, arrive, table);
+}
+
+// ---- Decode attention a KV head's query heads at a time (grouped-query) ----
+// q4e_attention_split runs a block per (query head, row, split): the 12 query heads of a KV head each read that head's
+// cells, so a row's K/V crosses the memory system 12 times (114 us a layer for 8 rows of ~400 cells on an H100 NVL).
+// Here a block takes HG query heads of one KV head: its warps load each cell's K and V once and score every head
+// against them. Every head keeps the one-head kernel's arithmetic exactly: the same cells to the same warp in the same
+// order, the same dot (an 8-term chain then the warp sum), the same online softmax, the same merge of the warps and of
+// the splits (the last block to arrive for a head merges that head; which block it is does not change the sums), so
+// the outputs are bit for bit q4e_attention_split's. grid (NKV * (NH / NKV) / HG, nt, splits), 256 threads.
+template <bool Q8, int HG>
+__device__ __forceinline__ void q4e_attention_split_gqa(
+    const float* __restrict__ q, const void* __restrict__ kCache, const void* __restrict__ vCache,
+    const half* __restrict__ kScale, const half* __restrict__ vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    const int G = NH / NKV;
+    const int groupsPerKv = G / HG;
+    const int kvh = blockIdx.x / groupsPerKv;
+    const int h0 = kvh * G + (blockIdx.x % groupsPerKv) * HG;
+    const int t = blockIdx.y;
+    const int z = blockIdx.z;
+    const int nSplit = gridDim.z;
+    const int p = positions != nullptr ? positions[t] : p0 + t;
+    const int32_t* list = nullptr;
+    int n = p + 1;
+    if (cells != nullptr && cellCnt[t] >= 0)
+    {
+        n = cellCnt[t];
+        list = cells + (size_t)t * cellStride;
+    }
+    const bool split = n > Q4E_ATTN_SPLIT_MIN && nSplit > 1;
+    if (!split && z > 0)
+        return;
+    int begin = 0, end = n;
+    if (split)
+    {
+        const int chunk = (n + nSplit - 1) / nSplit;
+        begin = min(n, z * chunk);
+        end = min(n, begin + chunk);
+    }
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    float qReg[HG][8];
+#pragma unroll
+    for (int hh = 0; hh < HG; ++hh)
+    {
+        const float* qRow = q + ((size_t)t * NH + h0 + hh) * Q4E_ATTN_HD + lane * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            qReg[hh][i] = qRow[i];
+    }
+
+    float m[HG], sum[HG], acc[HG][8];
+#pragma unroll
+    for (int hh = 0; hh < HG; ++hh)
+    {
+        m[hh] = -INFINITY;
+        sum[hh] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            acc[hh][i] = 0.0f;
+    }
+    for (int i = begin + warp; i < end; i += 8)
+    {
+        const int c = list != nullptr ? list[i] : i;
+        const size_t at = ((size_t)c * NKV + kvh) * Q4E_ATTN_HD + lane * 8;
+        float kf[8], vf[8];
+        q4e_load_kv8<Q8>(kCache, kScale, at, kf);
+        q4e_load_kv8<Q8>(vCache, vScale, at, vf);
+#pragma unroll
+        for (int hh = 0; hh < HG; ++hh)
+        {
+            float partDot = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                partDot += qReg[hh][j] * kf[j];
+            const float s = q4e_warp_sum(partDot) * scale;
+            if (s > m[hh])
+            {
+                const float r = expf(m[hh] - s);
+                sum[hh] *= r;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    acc[hh][j] *= r;
+                m[hh] = s;
+            }
+            const float w = expf(s - m[hh]);
+            sum[hh] += w;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                acc[hh][j] += w * vf[j];
+        }
+    }
+
+    __shared__ float shAcc[8][Q4E_ATTN_HD];
+    __shared__ float shM[8], shSum[8];
+    __shared__ int isLast;
+    const size_t stride = 2 + Q4E_ATTN_HD;
+#pragma unroll
+    for (int hh = 0; hh < HG; ++hh)
+    {
+        const int h = h0 + hh;
+        __syncthreads();   // the previous head's merge has read the shared arrays
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            shAcc[warp][lane * 8 + j] = acc[hh][j];
+        if (lane == 0)
+        {
+            shM[warp] = m[hh];
+            shSum[warp] = sum[hh];
+        }
+        __syncthreads();
+        float M = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < 8; ++w)
+            M = fmaxf(M, shM[w]);
+        float S = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w)
+            S += shSum[w] * (shM[w] == -INFINITY ? 0.0f : expf(shM[w] - M));
+        const size_t off = ((size_t)t * NH + h) * Q4E_ATTN_HD;
+        if (!split)
+        {
+            const float invS = 1.0f / S;
+            for (int d = threadIdx.x; d < Q4E_ATTN_HD; d += blockDim.x)
+            {
+                float v = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 8; ++w)
+                    v += shM[w] == -INFINITY ? 0.0f : shAcc[w][d] * expf(shM[w] - M);
+                out[off + d] = v * invS * q4e_sigmoid(gate[off + d]);
+            }
+            continue;
+        }
+        float* rowPart = part + ((size_t)t * NH + h) * nSplit * stride;
+        float* mine = rowPart + (size_t)z * stride;
+        for (int d = threadIdx.x; d < Q4E_ATTN_HD; d += blockDim.x)
+        {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w)
+                v += shM[w] == -INFINITY ? 0.0f : shAcc[w][d] * expf(shM[w] - M);
+            mine[2 + d] = v;
+        }
+        if (threadIdx.x == 0)
+        {
+            mine[0] = M;
+            mine[1] = S;
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0)
+            isLast = atomicAdd(&arrive[(size_t)t * NH + h], 1) == nSplit - 1;
+        __syncthreads();
+        if (!isLast)
+            continue;
+        __threadfence();
+        float MM = -INFINITY;
+        for (int s = 0; s < nSplit; ++s)
+            MM = fmaxf(MM, __ldcg(rowPart + (size_t)s * stride));
+        float SS = 0.0f;
+        for (int s = 0; s < nSplit; ++s)
+        {
+            const float ms = __ldcg(rowPart + (size_t)s * stride);
+            SS += ms == -INFINITY ? 0.0f : __ldcg(rowPart + (size_t)s * stride + 1) * expf(ms - MM);
+        }
+        const float invS = 1.0f / SS;
+        for (int d = threadIdx.x; d < Q4E_ATTN_HD; d += blockDim.x)
+        {
+            float v = 0.0f;
+            for (int s = 0; s < nSplit; ++s)
+            {
+                const float ms = __ldcg(rowPart + (size_t)s * stride);
+                v += ms == -INFINITY ? 0.0f : __ldcg(rowPart + (size_t)s * stride + 2 + d) * expf(ms - MM);
+            }
+            out[off + d] = v * invS * q4e_sigmoid(gate[off + d]);
+        }
+        if (threadIdx.x == 0)
+            arrive[(size_t)t * NH + h] = 0;
+    }
+}
+
+// Heads a block of the grouped kernels takes (Q4eKernels.AttnGqaHeads).
+#define Q4E_ATTN_GQA_HG 4
+
+extern "C" __global__ void ts_q4e_attention_split_gqa_f32(
+    const float* __restrict__ q, const half* __restrict__ kCache, const half* __restrict__ vCache,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    TS_PDL_ENTRY();
+    q4e_attention_split_gqa<false, Q4E_ATTN_GQA_HG>(q, kCache, vCache, nullptr, nullptr, gate, cells, cellCnt, out, positions,
+        p0, NH, NKV, scale, cellStride, part, arrive);
+}
+
+extern "C" __global__ void ts_q4e_attention_split_gqa_q8_f32(
+    const float* __restrict__ q, const signed char* __restrict__ kCache, const signed char* __restrict__ vCache,
+    const half* __restrict__ kScale, const half* __restrict__ vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    TS_PDL_ENTRY();
+    q4e_attention_split_gqa<true, Q4E_ATTN_GQA_HG>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
+        p0, NH, NKV, scale, cellStride, part, arrive);
+}
+
+// ---- A batched decode step's attention in one launch per kernel ----
+// A batched step's rows belong to different sequences, each with its own caches, so the engine issued a layer's
+// attention a sequence at a time: about four launches a row and attention layer (prep, QSA store, QSA pool, attention),
+// ~50 a row a step for this model. The _rows kernels below take every row of the step at once and read each row's cache
+// pointers from a table passed by value (Q4eRowPtrs, entry t for the step's row t; a verify window's rows repeat their
+// sequence's pointers). Each block runs the same device code the one-sequence kernels run, on the same row, with the
+// same position, cells and split count, so every row computes what it computed alone, bit for bit.
+#define Q4E_ROWS_MAX 16
+struct Q4eRowPtrs
+{
+    unsigned long long p[Q4E_ROWS_MAX];
+};
+
+extern "C" __global__ void ts_q4e_attn_prep_rows_f32(
+    const float* __restrict__ qg, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ qNorm, const float* __restrict__ kNorm, float* __restrict__ q, float* __restrict__ gate,
+    const Q4eRowPtrs kCache, const Q4eRowPtrs vCache, const int32_t* __restrict__ positions,
+    const int NH, const int NKV, const int nRot, const float base, const float freqScale, const float eps)
+{
+    TS_PDL_ENTRY();
+    // The body of ts_q4e_attn_prep_f32 with the row's caches.
+    __shared__ float sh[32];
+    __shared__ float row[Q4E_ATTN_HD];
+    const int head = blockIdx.x;
+    const int t = blockIdx.y;
+    const int d = threadIdx.x;
+    const int pos = positions[t];
+    const bool isQ = head < NH;
+    const int kvh = head - NH;
+    float x;
+    if (isQ)
+    {
+        const float* src = qg + ((size_t)t * NH + head) * 2 * Q4E_ATTN_HD;
+        x = src[d];
+        gate[((size_t)t * NH + head) * Q4E_ATTN_HD + d] = src[Q4E_ATTN_HD + d];
+    }
+    else
+    {
+        x = k[((size_t)t * NKV + kvh) * Q4E_ATTN_HD + d];
+    }
+    const float ss = q4e_block_sum(x * x, sh);
+    x = x * rsqrtf(ss / (float)Q4E_ATTN_HD + eps) * (isQ ? qNorm[d] : kNorm[d]);
+    row[d] = x;
+    __syncthreads();
+    if (d < nRot)
+    {
+        const int half = nRot / 2;
+        const int i = d < half ? d : d - half;
+        float c, s;
+        q4e_rope_angle(pos, i, nRot, base, freqScale, &c, &s);
+        x = d < half ? row[d] * c - row[d + half] * s : row[d - half] * s + row[d] * c;
+    }
+    if (isQ)
+    {
+        q[((size_t)t * NH + head) * Q4E_ATTN_HD + d] = x;
+    }
+    else
+    {
+        const size_t at = ((size_t)pos * NKV + kvh) * Q4E_ATTN_HD + d;
+        reinterpret_cast<half*>(kCache.p[t])[at] = __float2half(x);
+        reinterpret_cast<half*>(vCache.p[t])[at] = __float2half(v[((size_t)t * NKV + kvh) * Q4E_ATTN_HD + d]);
+    }
+}
+
+extern "C" __global__ void ts_q4e_attn_prep_rows_q8_f32(
+    const float* __restrict__ qg, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ qNorm, const float* __restrict__ kNorm, float* __restrict__ q, float* __restrict__ gate,
+    const Q4eRowPtrs kCache, const Q4eRowPtrs vCache, const Q4eRowPtrs kScale, const Q4eRowPtrs vScale,
+    const int32_t* __restrict__ positions,
+    const int NH, const int NKV, const int nRot, const float base, const float freqScale, const float eps)
+{
+    TS_PDL_ENTRY();
+    const int t = blockIdx.y;
+    q4e_attn_prep<true>(qg, k, v, qNorm, kNorm, q, gate,
+        reinterpret_cast<void*>(kCache.p[t]), reinterpret_cast<void*>(vCache.p[t]),
+        reinterpret_cast<half*>(kScale.p[t]), reinterpret_cast<half*>(vScale.p[t]), positions,
+        0, NH, NKV, nRot, base, freqScale, eps);
+}
+
+// grid (NH, nt, splits), as ts_q4e_attention_split_f32; part / arrive indexed by the step's row.
+extern "C" __global__ void ts_q4e_attention_split_rows_f32(
+    const float* __restrict__ q, const Q4eRowPtrs kCache, const Q4eRowPtrs vCache,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    TS_PDL_ENTRY();
+    const int t = blockIdx.y;
+    q4e_attention_split<false>(q, reinterpret_cast<const void*>(kCache.p[t]), reinterpret_cast<const void*>(vCache.p[t]),
+        nullptr, nullptr, gate, cells, cellCnt, out, positions, 0, NH, NKV, scale, cellStride, part, arrive);
+}
+
+extern "C" __global__ void ts_q4e_attention_split_rows_q8_f32(
+    const float* __restrict__ q, const Q4eRowPtrs kCache, const Q4eRowPtrs vCache,
+    const Q4eRowPtrs kScale, const Q4eRowPtrs vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    TS_PDL_ENTRY();
+    const int t = blockIdx.y;
+    q4e_attention_split<true>(q, reinterpret_cast<const void*>(kCache.p[t]), reinterpret_cast<const void*>(vCache.p[t]),
+        reinterpret_cast<const half*>(kScale.p[t]), reinterpret_cast<const half*>(vScale.p[t]),
+        gate, cells, cellCnt, out, positions, 0, NH, NKV, scale, cellStride, part, arrive);
+}
+
+// The grouped-query kernels (q4e_attention_split_gqa) for a batched step's rows: grid (NKV * G / HG, nt, splits).
+extern "C" __global__ void ts_q4e_attention_split_gqa_rows_f32(
+    const float* __restrict__ q, const Q4eRowPtrs kCache, const Q4eRowPtrs vCache,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    TS_PDL_ENTRY();
+    const int t = blockIdx.y;
+    q4e_attention_split_gqa<false, Q4E_ATTN_GQA_HG>(q, reinterpret_cast<const void*>(kCache.p[t]),
+        reinterpret_cast<const void*>(vCache.p[t]), nullptr, nullptr, gate, cells, cellCnt, out, positions, 0, NH, NKV, scale,
+        cellStride, part, arrive);
+}
+
+extern "C" __global__ void ts_q4e_attention_split_gqa_rows_q8_f32(
+    const float* __restrict__ q, const Q4eRowPtrs kCache, const Q4eRowPtrs vCache,
+    const Q4eRowPtrs kScale, const Q4eRowPtrs vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    TS_PDL_ENTRY();
+    const int t = blockIdx.y;
+    q4e_attention_split_gqa<true, Q4E_ATTN_GQA_HG>(q, reinterpret_cast<const void*>(kCache.p[t]),
+        reinterpret_cast<const void*>(vCache.p[t]), reinterpret_cast<const half*>(kScale.p[t]),
+        reinterpret_cast<const half*>(vScale.p[t]), gate, cells, cellCnt, out, positions, 0, NH, NKV, scale, cellStride, part,
+        arrive);
 }
 
 // ---- KV streaming: residency of a streamed layer's pages ----
@@ -1569,6 +1956,7 @@ extern "C" __global__ void __launch_bounds__(1024) ts_q4e_kv_resolve(
     const int nSlots,
     const int maxMiss)
 {
+    TS_PDL_ENTRY();
     __shared__ int shEpoch, shMiss, shHand, shTaken, shLast;
     __shared__ int warpCnt[32];
     if (threadIdx.x == 0)
@@ -1680,6 +2068,7 @@ extern "C" __global__ void ts_q4e_kv_page_copy(
     half* __restrict__ vScale,
     const int NKV)
 {
+    TS_PDL_ENTRY();
     const int n = ctl[2];
     const int codes16 = Q4E_KV_PAGE * NKV * Q4E_ATTN_HD / 16;
     const int scales16 = Q4E_KV_PAGE * NKV * (Q4E_ATTN_HD / Q4E_KV_Q8_BLOCK) * 2 / 16;
@@ -1725,6 +2114,7 @@ extern "C" __global__ void ts_q4e_kv_page_copy(
 extern "C" __global__ void ts_q4e_kv_invalidate(int32_t* __restrict__ table, int32_t* __restrict__ slotPage,
     const int first, const int count)
 {
+    TS_PDL_ENTRY();
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x)
     {
         const int pg = first + i;
@@ -2030,6 +2420,7 @@ extern "C" __global__ void __launch_bounds__(Q4E_MMA_ATTN_WARPS * 32) ts_q4e_att
     float* __restrict__ out, const int32_t* __restrict__ positions,
     const int p0, const int NH, const int NKV, const float scale, const int cellStride)
 {
+    TS_PDL_ENTRY();
     q4e_attention_mma<false>(q, kCache, vCache, nullptr, nullptr, gate, cells, cellCnt, out, positions,
         p0, NH, NKV, scale, cellStride);
 }
@@ -2041,6 +2432,7 @@ extern "C" __global__ void __launch_bounds__(Q4E_MMA_ATTN_WARPS * 32) ts_q4e_att
     float* __restrict__ out, const int32_t* __restrict__ positions,
     const int p0, const int NH, const int NKV, const float scale, const int cellStride)
 {
+    TS_PDL_ENTRY();
     q4e_attention_mma<true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
         p0, NH, NKV, scale, cellStride);
 }
@@ -2057,6 +2449,7 @@ extern "C" __global__ void ts_q4e_qsa_store_f32(
     const int p0,
     const int D)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     const int pos = positions != nullptr ? positions[t] : p0 + t;
     for (int d = threadIdx.x; d < D; d += blockDim.x)
@@ -2073,6 +2466,7 @@ extern "C" __global__ void ts_q4e_qsa_store_ring_f32(
     const int D,
     const int ring)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     const int pos = positions != nullptr ? positions[t] : p0 + t;
     for (int d = threadIdx.x; d < D; d += blockDim.x)
@@ -2096,6 +2490,7 @@ extern "C" __global__ void ts_q4e_qsa_pool_f32(
     const float freqScale,
     const float eps)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[32];
     __shared__ float row[512];
     int b = first + blockIdx.x;
@@ -2134,6 +2529,74 @@ extern "C" __global__ void ts_q4e_qsa_pool_f32(
         pooled[(size_t)b * D + d] = x;
 }
 
+// ts_q4e_qsa_store_f32 for a batched step's rows (Q4eRowPtrs): grid nt, row t into its own sequence's raw keys.
+extern "C" __global__ void ts_q4e_qsa_store_rows_f32(
+    const float* __restrict__ raw,       // [nt, D]
+    const Q4eRowPtrs cache,              // each row's [nCtx, D]
+    const int32_t* __restrict__ positions,
+    const int D)
+{
+    TS_PDL_ENTRY();
+    const int t = blockIdx.x;
+    const int pos = positions[t];
+    half* c = reinterpret_cast<half*>(cache.p[t]);
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+        c[(size_t)pos * D + d] = __float2half(raw[(size_t)t * D + d]);
+}
+
+// ts_q4e_qsa_pool_f32 with positions for a batched step's rows: grid nt, block t pools the block row t completes, if it
+// completes one, from and into its own sequence's caches. Every launch of the store precedes it in stream order, so a
+// verify window's rows find their earlier rows' raw keys cached, as the one-sequence pool does.
+extern "C" __global__ void ts_q4e_qsa_pool_rows_f32(
+    const Q4eRowPtrs cache,              // each row's [nCtx, D]
+    const float* __restrict__ kNorm,     // [D]
+    const Q4eRowPtrs pooledRows,         // each row's [nCtx / R, D]
+    const int32_t* __restrict__ positions,
+    const int R,
+    const int D,
+    const int nRot,
+    const float base,
+    const float freqScale,
+    const float eps)
+{
+    TS_PDL_ENTRY();
+    __shared__ float sh[32];
+    __shared__ float row[512];
+    const int t = blockIdx.x;
+    const int p = positions[t];
+    if ((p + 1) % R != 0)
+        return;
+    const int b = p / R;
+    const half* c = reinterpret_cast<const half*>(cache.p[t]);
+    float* pooled = reinterpret_cast<float*>(pooledRows.p[t]);
+    const int d = threadIdx.x;
+    float x = 0.0f;
+    if (d < D)
+    {
+        x = __half2float(c[(size_t)b * R * D + d]);
+        for (int r = 1; r < R; ++r)
+            x += __half2float(c[((size_t)b * R + r) * D + d]);
+        x *= 1.0f / (float)R;
+    }
+    const float ss = q4e_block_sum(x * x, sh);
+    if (d < D)
+    {
+        x = x * rsqrtf(ss / (float)D + eps) * kNorm[d];
+        row[d] = x;
+    }
+    __syncthreads();
+    if (d < nRot)
+    {
+        const int half = nRot / 2;
+        const int i = d < half ? d : d - half;
+        float cs, sn;
+        q4e_rope_angle(b * R, i, nRot, base, freqScale, &cs, &sn);
+        x = d < half ? row[d] * cs - row[d + half] * sn : row[d - half] * sn + row[d] * cs;
+    }
+    if (d < D)
+        pooled[(size_t)b * D + d] = x;
+}
+
 // ts_q4e_qsa_pool_f32 over the raw keys' ring (ts_q4e_qsa_store_ring_f32).
 extern "C" __global__ void ts_q4e_qsa_pool_ring_f32(
     const half* __restrict__ cache,      // [ring, D]
@@ -2149,6 +2612,7 @@ extern "C" __global__ void ts_q4e_qsa_pool_ring_f32(
     const float eps,
     const int ring)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[32];
     __shared__ float row[512];
     int b = first + blockIdx.x;
@@ -2201,6 +2665,7 @@ extern "C" __global__ void ts_q4e_qsa_query_f32(
     const float freqScale,
     const float eps)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[32];
     __shared__ float row[512];
     const int h = blockIdx.x;
@@ -2243,6 +2708,7 @@ extern "C" __global__ void ts_q4e_qsa_scores_f32(
     const int R,
     const int stride)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.y;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -2299,6 +2765,7 @@ extern "C" __global__ void __launch_bounds__(128) ts_q4e_qsa_scores_mma_f32(
     const int R,
     const int stride)
 {
+    TS_PDL_ENTRY();
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const int t0 = blockIdx.y * 16, j0 = blockIdx.x * 64;
     const int nbMax = (p0 + min(nt, t0 + 16)) / R;       // the blocks the CTA's last row sees
@@ -2397,6 +2864,7 @@ extern "C" __global__ void ts_q4e_qsa_select_i32(
     const int stride,
     const int cellStride)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     const int p = positions != nullptr ? positions[t] : p0 + t;
     const int W = topK + R - 1;
@@ -2548,6 +3016,7 @@ extern "C" __global__ void ts_q4e_ple_gate_f32(
     const int HC,
     const float eps)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[32];
     const int t = blockIdx.x;
     const float* kr = key + (size_t)t * HC * E;
@@ -2588,6 +3057,7 @@ extern "C" __global__ void ts_q4e_group_norm_f32(
     const int HC,
     const float eps)
 {
+    TS_PDL_ENTRY();
     // grid (nt, HC): a block per row and group (a block per row walked the four groups in turn, 21 us a call on the
     // RTX 5090 for one row); each group's sum is the same block reduction as before, so the outputs are unchanged.
     __shared__ float sh[32];
@@ -2624,6 +3094,7 @@ extern "C" __global__ void ts_q4e_ple_conv_f32(
     const int kern,
     const int dil)
 {
+    TS_PDL_ENTRY();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)rowsPerSeq * nSeq * C)
         return;
@@ -2657,6 +3128,7 @@ extern "C" __global__ void ts_q4e_shared_gate_f32(
     float* __restrict__ sh,              // [nt, E]
     const int E)
 {
+    TS_PDL_ENTRY();
     __shared__ float red[32];
     const int t = blockIdx.x;
     float dot = 0.0f;
@@ -2676,6 +3148,7 @@ extern "C" __global__ void ts_q4e_set_stream_rows_f32(
     const int E,
     const int HC)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int r = blockIdx.y;
     if (i >= E)
@@ -2693,6 +3166,7 @@ extern "C" __global__ void ts_q4e_argmax_rows_f32(
     int32_t* __restrict__ ids,           // [rows]
     const int V)
 {
+    TS_PDL_ENTRY();
     __shared__ float shV[32];
     __shared__ int shI[32];
     const float* row = logits + (size_t)blockIdx.x * V;
@@ -2752,6 +3226,7 @@ extern "C" __global__ void ts_q4e_count_selected(
     const int n,
     unsigned int* __restrict__ counts)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n)
         return;
@@ -2772,6 +3247,7 @@ extern "C" __global__ void ts_q4e_draft_pick_f32(
     const int step,
     int32_t* __restrict__ nextToken)     // [1]
 {
+    TS_PDL_ENTRY();
     __shared__ float shV[32];
     __shared__ int shK[32], shT[32];
     __shared__ float top[Q4E_PICK_K];
@@ -2959,6 +3435,7 @@ extern "C" __global__ void ts_q4e_draft_pick_part_f32(
     float* __restrict__ candVal,         // [blocks * 10]
     int32_t* __restrict__ candKey)       // [blocks * 10]
 {
+    TS_PDL_ENTRY();
     __shared__ float top[Q4E_PICK_K];
     __shared__ int head;
     const int base = blockIdx.x * chunk;
@@ -2981,6 +3458,7 @@ extern "C" __global__ void ts_q4e_draft_pick_merge_f32(
     const int step,
     int32_t* __restrict__ nextToken)
 {
+    TS_PDL_ENTRY();
     __shared__ float top[Q4E_PICK_K];
     __shared__ int head;
     q4e_pick_topk_block(candVal, candKey, 0, n, top, &head);

@@ -27,6 +27,19 @@
 
 #include <cuda_fp16.h>
 #include <stdint.h>
+// Programmatic dependent launch (sm_90+): a kernel the engine launches with the programmatic-serialization
+// attribute may start while the kernel before it in the stream drains, so its launch overlaps the other's tail.
+// Every exported kernel opens with TS_PDL_ENTRY(): griddepcontrol.wait holds the whole kernel until the grids it
+// depends on have completed and their writes are visible (so nothing it reads or overwrites is touched early), and
+// launch_dependents then lets the next kernel's blocks be scheduled. Below sm_90 (and launched without the attribute)
+// both are no-ops, and the kernel runs exactly as before.
+#ifndef TS_PDL_ENTRY
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define TS_PDL_ENTRY() asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory")
+#else
+#define TS_PDL_ENTRY() do { } while (0)
+#endif
+#endif
 
 __device__ __forceinline__ float ts_glm_warp_sum(float v)
 {
@@ -88,6 +101,7 @@ extern "C" __global__ void ts_glm_kda_prep_f32(
     const int dc,
     const float gateLowerBound)
 {
+    TS_PDL_ENTRY();
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     const int rows = rowsPerSeq * nSeq;
@@ -145,6 +159,7 @@ extern "C" __global__ void ts_glm_kda_scan_f32(
     const int rowsPerSeq,
     const int H)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int seq = blockIdx.z;
     const int lane = threadIdx.x & 31;
@@ -220,6 +235,7 @@ extern "C" __global__ void ts_glm_kda_scan_r1_f32(
     const int rowsPerSeq,
     const int H)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int seq = blockIdx.z;
     const int lane = threadIdx.x & 31;
@@ -311,6 +327,7 @@ extern "C" __global__ void ts_glm_kda_out_f32(
     const int H,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     if (warp >= rows * H)
@@ -347,6 +364,7 @@ extern "C" __global__ void ts_glm_kda_conv_update_f32(
     const int dInner,
     const int dc)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int C = 3 * dInner;
     if (i >= nSeq * C)
@@ -402,6 +420,7 @@ extern "C" __global__ void ts_glm_mla_kv_store_f32(
     const float eps,
     const int32_t* __restrict__ positions)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[32];
     const int t = blockIdx.x;
     const float* x = kv + (size_t)t * width;
@@ -428,6 +447,7 @@ extern "C" __global__ void ts_glm_indexer_store_f32(
     const float eps,
     const int32_t* __restrict__ positions)
 {
+    TS_PDL_ENTRY();
     __shared__ float sh[32];
     const int t = blockIdx.x;
     const float* x = key + (size_t)t * D;
@@ -477,6 +497,7 @@ extern "C" __global__ void ts_glm_pool_keys_f32(
     const int D,
     const int32_t* __restrict__ positions)
 {
+    TS_PDL_ENTRY();
     int b = firstPool + blockIdx.x;
     if (positions != nullptr)
     {
@@ -527,6 +548,7 @@ extern "C" __global__ void ts_glm_pool_scores_f32(
     const int maxVis,
     const int32_t* __restrict__ positions)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.y;
     const long long pos = positions != nullptr ? (long long)positions[t] : (long long)p0 + t;
     int nVis = (int)((pos + 1) / TS_GLM_KPOOL);
@@ -564,6 +586,7 @@ extern "C" __global__ void ts_glm_expand_cells_i32(
     const int cellStride,
     const int32_t* __restrict__ positions)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     const int n = selCnt[t];
     const int32_t* s = sel + (size_t)t * K;
@@ -632,13 +655,17 @@ __device__ __forceinline__ void ts_glm_head_gemv_rows(
 }
 
 extern "C" __global__ void ts_glm_head_gemv_1_f32(const half* w, const float* x, float* y, int heads, int outDim, int inDim, int rows)
-{ ts_glm_head_gemv_rows<1>(w, x, y, heads, outDim, inDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_glm_head_gemv_rows<1>(w, x, y, heads, outDim, inDim, rows); }
 extern "C" __global__ void ts_glm_head_gemv_4_f32(const half* w, const float* x, float* y, int heads, int outDim, int inDim, int rows)
-{ ts_glm_head_gemv_rows<4>(w, x, y, heads, outDim, inDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_glm_head_gemv_rows<4>(w, x, y, heads, outDim, inDim, rows); }
 extern "C" __global__ void ts_glm_head_gemv_8_f32(const half* w, const float* x, float* y, int heads, int outDim, int inDim, int rows)
-{ ts_glm_head_gemv_rows<8>(w, x, y, heads, outDim, inDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_glm_head_gemv_rows<8>(w, x, y, heads, outDim, inDim, rows); }
 extern "C" __global__ void ts_glm_head_gemv_16_f32(const half* w, const float* x, float* y, int heads, int outDim, int inDim, int rows)
-{ ts_glm_head_gemv_rows<16>(w, x, y, heads, outDim, inDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_glm_head_gemv_rows<16>(w, x, y, heads, outDim, inDim, rows); }
 
 // Projected vision rows replace the token embeddings of their positions in every stream:
 // xs[firstRow + r, c, :] = rows[r, :] for each of the 4 hyper-connection streams.
@@ -648,6 +675,7 @@ extern "C" __global__ void ts_glm_set_stream_rows_f32(
     const int firstRow,
     const int E)
 {
+    TS_PDL_ENTRY();
     const int r = blockIdx.y;
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= E)

@@ -169,6 +169,7 @@ namespace TensorSharp.Cuda
         {
             long matBytes = Q80PairMatrixBytes(inDim, outDim);
             var scratch = new List<IntPtr>();
+            var packedRotation = new List<IntPtr>();
             IntPtr xq = IntPtr.Zero, y = IntPtr.Zero;
             try
             {
@@ -183,6 +184,19 @@ namespace TensorSharp.Cuda
                     CudaDriverApi.cuMemcpyDtoDAsync(p, mats[0], (UIntPtr)matBytes, stream).ThrowOnError();
                 }
                 var rotation = mats.Concat(scratch).ToList();
+                // The swapped kernel reads packed copies: enough of them to stream past the L2 as the rest do.
+                if (HasQ80PairSwap)
+                {
+                    long packedBytes = Q80PairPackedBytes(inDim, outDim);
+                    long n = Math.Max(1, Math.Min(Q80PairMaxColdCopies, (coldBytes + packedBytes - 1) / packedBytes + 1));
+                    for (long c = 0; c < n; c++)
+                    {
+                        if (CudaDriverApi.cuMemAlloc(out IntPtr p, (UIntPtr)packedBytes) != 0)
+                            break;
+                        packedRotation.Add(p);
+                        LaunchQ80PairPack(rotation[(int)(c % rotation.Count)], p, inDim, outDim, stream);
+                    }
+                }
                 long xqBytes = (long)Q80PairMaxRows * (inDim / 32) * Q81BlockBytes;
                 CudaDriverApi.cuMemAlloc(out xq, (UIntPtr)xqBytes).ThrowOnError();
                 CudaDriverApi.cuMemsetD8Async(xq, 0, (UIntPtr)xqBytes, stream).ThrowOnError();
@@ -198,6 +212,9 @@ namespace TensorSharp.Cuda
                     foreach (Q80PairKernel kernel in Q80PairCandidates)
                         if (rows <= Q80PairKernelMaxRows(kernel))
                             micros[kernel] = TimeQ80PairKernel(kernel, rotation, xq, y, inDim, outDim, rows, calls, stream);
+                    if (packedRotation.Count > 0)
+                        micros[Q80PairKernel.Swap] = TimeQ80PairKernel(Q80PairKernel.Swap, packedRotation, xq, y, inDim, outDim, rows,
+                            Math.Max(packedRotation.Count, Q80PairMinTimedCalls), stream);
                     picks[rows - 1] = ChooseQ80PairKernel(Q80PairKernelFor(inDim, outDim, rows), micros);
                 }
                 return (picks, scratch.Count);
@@ -206,6 +223,8 @@ namespace TensorSharp.Cuda
             {
                 CudaDriverApi.cuStreamSynchronize(stream);
                 foreach (IntPtr p in scratch)
+                    CudaDriverApi.cuMemFree(p);
+                foreach (IntPtr p in packedRotation)
                     CudaDriverApi.cuMemFree(p);
                 if (xq != IntPtr.Zero)
                     CudaDriverApi.cuMemFree(xq);
@@ -227,7 +246,10 @@ namespace TensorSharp.Cuda
                 try
                 {
                     for (int i = 0; i < calls; i++)
-                        LaunchQuantMatmulQ80PairKernel(kernel, rotation[i % rotation.Count], xq, y, inDim, outDim, rows, stream);
+                        if (kernel == Q80PairKernel.Swap)
+                            LaunchQuantMatmulQ80PairSwap(rotation[i % rotation.Count], xq, y, inDim, outDim, rows, stream);
+                        else
+                            LaunchQuantMatmulQ80PairKernel(kernel, rotation[i % rotation.Count], xq, y, inDim, outDim, rows, stream);
                     captured = true;
                 }
                 finally

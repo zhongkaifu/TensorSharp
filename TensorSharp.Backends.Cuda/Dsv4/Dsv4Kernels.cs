@@ -153,6 +153,7 @@ namespace TensorSharp.Cuda
         private Dsv4Kernels(CudaModule module)
         {
             this.module = module;
+            s_pdl = CudaPdl.UsableFor(module.CompiledArchOf("ts_dsv4_embed_f32"));
             CudaDriverApi.cuCtxGetDevice(out int device);
             CudaDriverApi.cuDeviceGetAttribute(out int ccMajor, 75 /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */, device);
             HasMoeMma = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_dsv4_moe_mma_f32"), ccMajor);
@@ -398,16 +399,21 @@ namespace TensorSharp.Cuda
         /// null for a module loaded without identifying it.</summary>
         public string ModuleImageSha256 => module.ImageSha256;
 
+        // Programmatic dependent launch for this module's kernels (CudaPdl): set once its code is known to be sm_90+.
+        private static bool s_pdl;
+
         private static void Launch(IntPtr fn, uint gx, uint gy, uint gz, int block, uint sharedBytes, IntPtr stream, void** args)
         {
-            CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, sharedBytes, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            (s_pdl ? CudaPdl.Launch(fn, gx, gy, gz, (uint)block, 1, 1, sharedBytes, stream, args)
+                : CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, sharedBytes, stream, (IntPtr)args, IntPtr.Zero)).ThrowOnError();
         }
 
         /// <summary>Launch with a two-dimensional block, for the kernels that put
         /// one warp on the contracted dimension and independent rows on y.</summary>
         private static void Launch2D(IntPtr fn, uint gx, uint gy, int bx, int by, uint sharedBytes, IntPtr stream, void** args)
         {
-            CudaDriverApi.cuLaunchKernel(fn, gx, gy, 1, (uint)bx, (uint)by, 1, sharedBytes, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            (s_pdl ? CudaPdl.Launch(fn, gx, gy, 1, (uint)bx, (uint)by, 1, sharedBytes, stream, args)
+                : CudaDriverApi.cuLaunchKernel(fn, gx, gy, 1, (uint)bx, (uint)by, 1, sharedBytes, stream, (IntPtr)args, IntPtr.Zero)).ThrowOnError();
         }
 
         private static uint CeilDiv(long n, int d) => (uint)Math.Max(1, (n + d - 1) / d);

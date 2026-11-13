@@ -140,6 +140,7 @@ extern "C" __global__ __launch_bounds__(256)
 void ts_embedding_attention_group2_d256_f32(const float* q, const float* k, const float* v, const int* bounds,
     float* output, int batch, int q_heads, int kv_heads, int seq, int radius, float scale)
 {
+    TS_PDL_ENTRY();
     ts_embedding_attention_body<256, 2, 8, 128>(q, k, v, bounds, output, batch, q_heads, kv_heads, seq, radius, scale);
 }
 
@@ -147,5 +148,6 @@ extern "C" __global__ __launch_bounds__(256)
 void ts_embedding_attention_group4_d512_f32(const float* q, const float* k, const float* v, const int* bounds,
     float* output, int batch, int q_heads, int kv_heads, int seq, int radius, float scale)
 {
+    TS_PDL_ENTRY();
     ts_embedding_attention_body<512, 4, 4, 128>(q, k, v, bounds, output, batch, q_heads, kv_heads, seq, radius, scale);
 }

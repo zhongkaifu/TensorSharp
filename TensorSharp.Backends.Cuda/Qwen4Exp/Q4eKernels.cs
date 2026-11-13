@@ -118,9 +118,65 @@ namespace TensorSharp.Cuda
         // The pick in two stages (optional): a block per slice of the row, then one merging block.
         private readonly IntPtr draftPickPart, draftPickMerge;
 
+        // A batched step's attention in one launch per kernel, each row's caches from a by-value table (optional: a module
+        // before it issues a sequence at a time).
+        private readonly IntPtr attnPrepRows, attnPrepRowsQ8, attentionSplitRows, attentionSplitRowsQ8, qsaStoreRows, qsaPoolRows;
+        // The split attention a KV head's query heads at a time (optional; TS_Q4E_ATTN_GQA=0 keeps a block per head).
+        private readonly IntPtr attentionSplitGqa, attentionSplitGqaQ8, attentionSplitGqaRows, attentionSplitGqaRowsQ8;
+
+        /// <summary>Query heads a block of the grouped attention takes (Q4E_ATTN_GQA_HG).</summary>
+        public const int AttnGqaHeads = 4;
+
+        private static readonly bool AttnGqaEnabled = Environment.GetEnvironmentVariable("TS_Q4E_ATTN_GQA") != "0";
+
+        /// <summary>Tests: force the grouped attention on or off (null: TS_Q4E_ATTN_GQA).</summary>
+        internal static bool? AttnGqaOverride;
+
+        /// <summary>Whether the module carries the grouped attention.</summary>
+        public bool HasAttentionGqa => attentionSplitGqa != IntPtr.Zero && attentionSplitGqaQ8 != IntPtr.Zero
+            && attentionSplitGqaRows != IntPtr.Zero && attentionSplitGqaRowsQ8 != IntPtr.Zero;
+
+        /// <summary>Whether the split attention runs a KV head's query heads a block (the same bits as a block a head): the
+        /// kernels loaded, the query heads a KV head a multiple of <see cref="AttnGqaHeads"/>, and enough rows that the
+        /// fewer blocks still fill the GPU when a short context leaves the splits idle (a batched step of four rows or
+        /// more, a sequence's own call of eight: on two H100 NVL the grouped kernel lost 3-5% at one and two streams and
+        /// gained 4% at 16, 9% at 32). A forced test runs it at any row count.</summary>
+        private bool GqaFor(int nHead, int nKvHead, IntPtr fn, int rows, int minRows)
+            => (AttnGqaOverride ?? (AttnGqaEnabled && rows >= minRows)) && fn != IntPtr.Zero && nKvHead > 0 && nHead % nKvHead == 0
+               && (nHead / nKvHead) % AttnGqaHeads == 0;
+
+        private const int GqaMinBatchedRows = 4, GqaMinSequenceRows = 8;
+
+        /// <summary>Rows a <see cref="RowPtrs"/> table holds (Q4E_ROWS_MAX).</summary>
+        public const int MaxTableRows = 16;
+
+        /// <summary>Each row's pointer into its own sequence's cache, passed by value (Q4eRowPtrs).</summary>
+        public struct RowPtrs
+        {
+            public fixed ulong P[MaxTableRows];
+
+            /// <summary>A table of <paramref name="ptrs"/> (at most <see cref="MaxTableRows"/>; the rest zero).</summary>
+            public static RowPtrs Of(params IntPtr[] ptrs)
+            {
+                if (ptrs.Length > MaxTableRows)
+                    throw new ArgumentOutOfRangeException(nameof(ptrs), $"a row table holds at most {MaxTableRows} rows");
+                RowPtrs r = default;
+                for (int i = 0; i < ptrs.Length; i++)
+                    r.P[i] = (ulong)ptrs[i];
+                return r;
+            }
+        }
+
+        /// <summary>Whether the module carries the batched step's attention kernels (<see cref="AttnPrepRows"/>,
+        /// <see cref="AttentionSplitRows"/>, <see cref="QsaStoreRows"/>, <see cref="QsaPoolRows"/>).</summary>
+        public bool HasBatchedAttention => attnPrepRows != IntPtr.Zero && attnPrepRowsQ8 != IntPtr.Zero
+            && attentionSplitRows != IntPtr.Zero && attentionSplitRowsQ8 != IntPtr.Zero && qsaStoreRows != IntPtr.Zero
+            && qsaPoolRows != IntPtr.Zero;
+
         private Q4eKernels(CudaModule module)
         {
             this.module = module;
+            s_pdl = CudaPdl.UsableFor(module.CompiledArchOf("ts_q4e_hc_norm_f32"));
             hcNorm = module.GetFunction("ts_q4e_hc_norm_f32");
             siluScale = module.GetFunction("ts_q4e_silu_scale_f32");
             hcCollapse = module.GetFunction("ts_q4e_hc_collapse_f32");
@@ -205,6 +261,30 @@ namespace TensorSharp.Cuda
                 HasQsaScoresMma = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_q4e_qsa_scores_mma_f32"), ccMajor);
             }
             catch (CudaException ex) when (ex.ErrorCode == 500) { qsaScoresMma = IntPtr.Zero; }
+            try
+            {
+                attnPrepRows = module.GetFunction("ts_q4e_attn_prep_rows_f32");
+                attnPrepRowsQ8 = module.GetFunction("ts_q4e_attn_prep_rows_q8_f32");
+                attentionSplitRows = module.GetFunction("ts_q4e_attention_split_rows_f32");
+                attentionSplitRowsQ8 = module.GetFunction("ts_q4e_attention_split_rows_q8_f32");
+                qsaStoreRows = module.GetFunction("ts_q4e_qsa_store_rows_f32");
+                qsaPoolRows = module.GetFunction("ts_q4e_qsa_pool_rows_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                attnPrepRows = attnPrepRowsQ8 = attentionSplitRows = attentionSplitRowsQ8 = qsaStoreRows = qsaPoolRows = IntPtr.Zero;
+            }
+            try
+            {
+                attentionSplitGqa = module.GetFunction("ts_q4e_attention_split_gqa_f32");
+                attentionSplitGqaQ8 = module.GetFunction("ts_q4e_attention_split_gqa_q8_f32");
+                attentionSplitGqaRows = module.GetFunction("ts_q4e_attention_split_gqa_rows_f32");
+                attentionSplitGqaRowsQ8 = module.GetFunction("ts_q4e_attention_split_gqa_rows_q8_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                attentionSplitGqa = attentionSplitGqaQ8 = attentionSplitGqaRows = attentionSplitGqaRowsQ8 = IntPtr.Zero;
+            }
             try { draftPick = module.GetFunction("ts_q4e_draft_pick_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { draftPick = IntPtr.Zero; }
             try
@@ -227,8 +307,12 @@ namespace TensorSharp.Cuda
             return new Q4eKernels(CudaModule.LoadFromFile(path));
         }
 
+        // Programmatic dependent launch for this module's kernels (CudaPdl): set once its code is known to be sm_90+.
+        private static bool s_pdl;
+
         private static void Launch(IntPtr fn, uint gx, uint gy, uint gz, int block, IntPtr stream, void** args)
-            => CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            => (s_pdl ? CudaPdl.Launch(fn, gx, gy, gz, (uint)block, 1, 1, 0, stream, args)
+                : CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero)).ThrowOnError();
 
         private static uint CeilDiv(long n, int d) => (uint)Math.Max(1, (n + d - 1) / d);
 
@@ -384,7 +468,8 @@ namespace TensorSharp.Cuda
         public static long GdnChunkTPFloats(int vHeads) => (long)(GdnChunkSuperBlock / GdnChunkTokens) * vHeads * GdnChunkTokens * GdnChunkTokens;
 
         private static void LaunchShared(IntPtr fn, uint gx, uint gy, uint gz, int block, int shared, IntPtr stream, void** args)
-            => CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, (uint)shared, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            => (s_pdl ? CudaPdl.Launch(fn, gx, gy, gz, (uint)block, 1, 1, (uint)shared, stream, args)
+                : CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, (uint)shared, stream, (IntPtr)args, IntPtr.Zero)).ThrowOnError();
 
         /// <summary>Keep each sequence's last <paramref name="hist"/> rows of [state; x] as its state.</summary>
         public void ConvUpdate(IntPtr x, IntPtr states, int rowsPerSeq, int nSeq, int channels, int hist, IntPtr stream)
@@ -487,11 +572,83 @@ namespace TensorSharp.Cuda
             {
                 IntPtr s0 = kScale, s1 = vScale;
                 void** q8 = stackalloc void*[] { &a0, &a1, &a2, &s0, &s1, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
-                Launch(attentionSplitQ8, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, q8);
+                if (GqaFor(nHead, nKvHead, attentionSplitGqaQ8, rows, GqaMinSequenceRows))
+                    Launch(attentionSplitGqaQ8, (uint)(nHead / AttnGqaHeads), (uint)rows, (uint)splits, BlockSize, stream, q8);
+                else
+                    Launch(attentionSplitQ8, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, q8);
                 return;
             }
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
-            Launch(attentionSplit, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, args);
+            if (GqaFor(nHead, nKvHead, attentionSplitGqa, rows, GqaMinSequenceRows))
+                Launch(attentionSplitGqa, (uint)(nHead / AttnGqaHeads), (uint)rows, (uint)splits, BlockSize, stream, args);
+            else
+                Launch(attentionSplit, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, args);
+        }
+
+        // ---- a batched step's attention, every row in one launch ----
+
+        /// <summary><see cref="AttnPrep"/> of a batched step's rows, row t at positions[t] into its own caches
+        /// (<paramref name="kCache"/>.P[t]; a Q8_0 cache passes its scales' tables too).</summary>
+        public void AttnPrepRows(IntPtr qg, IntPtr k, IntPtr v, IntPtr qNorm, IntPtr kNorm, IntPtr q, IntPtr gate,
+            RowPtrs kCache, RowPtrs vCache, IntPtr positions, int nHead, int nKvHead, int nRot, float ropeBase, float freqScale,
+            float eps, int rows, IntPtr stream, bool q8 = false, RowPtrs kScale = default, RowPtrs vScale = default)
+        {
+            IntPtr a0 = qg, a1 = k, a2 = v, a3 = qNorm, a4 = kNorm, a5 = q, a6 = gate, a9 = positions;
+            int a11 = nHead, a12 = nKvHead, a13 = nRot;
+            float a14 = ropeBase, a15 = freqScale, a16 = eps;
+            uint grid = (uint)(nHead + nKvHead);
+            if (q8)
+            {
+                void** argsQ8 = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &kCache, &vCache, &kScale, &vScale, &a9, &a11, &a12, &a13, &a14, &a15, &a16 };
+                Launch(attnPrepRowsQ8, grid, (uint)rows, 1, AttnHeadDim, stream, argsQ8);
+                return;
+            }
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &kCache, &vCache, &a9, &a11, &a12, &a13, &a14, &a15, &a16 };
+            Launch(attnPrepRows, grid, (uint)rows, 1, AttnHeadDim, stream, args);
+        }
+
+        /// <summary><see cref="AttentionSplit"/> of a batched step's rows, each over its own caches.</summary>
+        public void AttentionSplitRows(IntPtr q, RowPtrs kCache, RowPtrs vCache, IntPtr gate, IntPtr cells, IntPtr cellCnt,
+            IntPtr output, IntPtr positions, int nHead, int nKvHead, float scale, int cellStride, int rows, int splits, IntPtr part,
+            IntPtr arrive, IntPtr stream, bool q8 = false, RowPtrs kScale = default, RowPtrs vScale = default)
+        {
+            IntPtr a0 = q, a3 = gate, a4 = cells, a5 = cellCnt, a6 = output, a7 = positions;
+            int a9 = nHead, a10 = nKvHead; float a11 = scale; int a12 = cellStride;
+            IntPtr a13 = part, a14 = arrive;
+            if (q8)
+            {
+                void** argsQ8 = stackalloc void*[] { &a0, &kCache, &vCache, &kScale, &vScale, &a3, &a4, &a5, &a6, &a7, &a9, &a10, &a11, &a12, &a13, &a14 };
+                if (GqaFor(nHead, nKvHead, attentionSplitGqaRowsQ8, rows, GqaMinBatchedRows))
+                    Launch(attentionSplitGqaRowsQ8, (uint)(nHead / AttnGqaHeads), (uint)rows, (uint)splits, BlockSize, stream, argsQ8);
+                else
+                    Launch(attentionSplitRowsQ8, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, argsQ8);
+                return;
+            }
+            void** args = stackalloc void*[] { &a0, &kCache, &vCache, &a3, &a4, &a5, &a6, &a7, &a9, &a10, &a11, &a12, &a13, &a14 };
+            if (GqaFor(nHead, nKvHead, attentionSplitGqaRows, rows, GqaMinBatchedRows))
+                Launch(attentionSplitGqaRows, (uint)(nHead / AttnGqaHeads), (uint)rows, (uint)splits, BlockSize, stream, args);
+            else
+                Launch(attentionSplitRows, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, args);
+        }
+
+        /// <summary><see cref="QsaStore"/> of a batched step's rows, each into its own raw keys.</summary>
+        public void QsaStoreRows(IntPtr raw, RowPtrs cache, IntPtr positions, int d, int rows, IntPtr stream)
+        {
+            IntPtr a0 = raw, a2 = positions;
+            int a4 = d;
+            void** args = stackalloc void*[] { &a0, &cache, &a2, &a4 };
+            Launch(qsaStoreRows, (uint)rows, 1, 1, Math.Min(d, BlockSize), stream, args);
+        }
+
+        /// <summary><see cref="QsaPool"/> with positions for a batched step's rows: each pools the block it completes.</summary>
+        public void QsaPoolRows(RowPtrs cache, IntPtr kNorm, RowPtrs pooled, IntPtr positions, int ratio, int d, int nRot,
+            float ropeBase, float freqScale, float eps, int rows, IntPtr stream)
+        {
+            IntPtr a1 = kNorm, a3 = positions;
+            int a5 = ratio, a6 = d, a7 = nRot;
+            float a8 = ropeBase, a9 = freqScale, a10 = eps;
+            void** args = stackalloc void*[] { &cache, &a1, &pooled, &a3, &a5, &a6, &a7, &a8, &a9, &a10 };
+            Launch(qsaPoolRows, (uint)rows, 1, 1, d, stream, args);
         }
 
         // ---- KV streaming (TS_Q4E_KV_RESIDENT) ----
