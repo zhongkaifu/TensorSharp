@@ -27,9 +27,12 @@ namespace TensorSharp.Models
 
         public PrefixCacheCapabilities GetPrefixCacheCapabilities()
         {
+            // A slot, a checkpoint and a checkpoint file keep the sequence's M-RoPE delta (Slot.RopeDelta), so a cache
+            // that went through an image continues past it at the positions a re-prefill of the history uses; the
+            // other families rotate at absolute positions. Either way the reuse is exact (Qwen35ImageFollowUpExactnessTests).
             PrefixCacheCapabilities pages = _anyRecurrent
-                ? PageFamilyCapabilities(FamilyClass.R, TruncationKind.None, pagesNeedStateAtEnd: true)
-                : PageFamilyCapabilities(FamilyClass.P, TruncationKind.Any);
+                ? PageFamilyCapabilities(FamilyClass.R, TruncationKind.None, pagesNeedStateAtEnd: true, reuseAcrossMediaSpan: true)
+                : PageFamilyCapabilities(FamilyClass.P, TruncationKind.Any, reuseAcrossMediaSpan: true);
             if (!SupportsRetainedFusedCache) return pages;
             bool copies = SupportsPrefixCheckpoints;
             return pages with

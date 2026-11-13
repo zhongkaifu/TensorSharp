@@ -54,7 +54,7 @@ namespace
 // ============================================================================
 // qwen4exp (Qwen3.8-Flash-Next) SLOT-STABLE ARENA token-batched decode: N
 // concurrent sequences, one token each, in ONE ggml graph — the port of the
-// Qwen3.5 arena design (ggml_ops_qwen35_batched_arena.cpp) to the hybrid
+// GPT-OSS / Qwen3.5 arena design (ggml_ops_gptoss_*.cpp) to the hybrid
 // GDN + full-attention + hyper-connections + PLE family.
 //
 // Without this, N>=2 requests round-robin N solo token-span graphs per step:

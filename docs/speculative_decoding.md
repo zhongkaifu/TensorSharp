@@ -764,14 +764,14 @@ only read, with the gate and beta of the rejected rows zeroed. Below 64 rows ggm
 steps the recurrence row by row, and a row with g = 0 and beta = 0 leaves the state
 exactly where the kept prefix put it, so the committed state is the one a snapshot
 held: the same logits bit for bit over 120 verifies of one to eight rows with every
-kind of acceptance (`GdnDecodeBench` `TS_BENCH_MODE=verify TS_VERIFY_ACCEPT=cycle`,
+kind of acceptance (`GdnDecodeBench`, since removed, `TS_BENCH_MODE=verify TS_VERIFY_ACCEPT=cycle`,
 and `CudaReplayCommit_LeavesTheStateASnapshotCommitLeaves` on a toy trunk). It is the
 batched verify's commit (`ggml_ops_qwen35_batched_verify.cpp`): one captured graph
 serves every acceptance. A fully accepted window commits the verify's own post-window
 state, as before. `TS_Q35_VERIFY_REPLAY=0` restores the snapshots.
 
 Qwen3.8-27B-UD-IQ3_XXS + DFlash2 Q4_K_M, RTX Spark N1X, 4.3K-token context,
-median ms of the verify forward (`GdnDecodeBench` `TS_BENCH_MODE=verify`, 12 steps
+median ms of the verify forward (`GdnDecodeBench`, since removed, `TS_BENCH_MODE=verify`, 12 steps
 per row count; the commit after it costs 2-3 ms either way):
 
 | rows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |

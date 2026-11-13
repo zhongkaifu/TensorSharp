@@ -9,11 +9,6 @@ namespace TensorSharp.Cuda
     {
         private const int BlockSize = 256;
 
-        // The GatedDeltaNet kernel assigns one warp per delta-net row, so a wider
-        // block processes more rows concurrently (head_v_dim / num_warps passes).
-        // 512 threads = 16 warps keeps occupancy high without exhausting shared mem.
-        private const int GdnBlockSize = 512;
-
         private readonly CudaModule module;
         private readonly IntPtr copy2DBytes;
         private readonly IntPtr fillF32;
@@ -27,17 +22,10 @@ namespace TensorSharp.Cuda
         private readonly IntPtr mulMulAddF32;
         private readonly IntPtr binaryActivationF32;
         private readonly IntPtr binaryActivationStridedF32;
-        private readonly IntPtr deinterleaveQGateF32;
         private readonly IntPtr addBiasRowsF32;
         private readonly IntPtr siluMulSplitF32;
         private readonly IntPtr geluMulSplitF32;
         private readonly IntPtr swigluOaiSplitF32;
-        private readonly IntPtr qwen35GdnPackedF32;
-        private readonly IntPtr qwen35GdnPrefillConvF32;
-        private readonly IntPtr qwen35GdnPrefillScanF32;
-        private readonly IntPtr qwen35GdnPrefillOutF32;
-        private readonly IntPtr qwen35GdnUpdateConvStateF32;
-        private readonly IntPtr qwen35GdnPackInputsF32;
         private readonly IntPtr layerNormF32;
         private readonly IntPtr rmsNormF32;
         private readonly IntPtr rmsNormResidualAddF32;
@@ -95,7 +83,6 @@ namespace TensorSharp.Cuda
         private readonly IntPtr flatToHeadFirstF32;
         private readonly IntPtr splitQkvHeadFirstF32;
         private readonly IntPtr copyHeadFirstToCacheF32;
-        private readonly IntPtr fillRopePositionsI32;
         private readonly IntPtr copyHeadFirstToCacheF16;
         private readonly IntPtr gatherCircularHeadFirstF32;
         private readonly IntPtr gatherCircularHeadFirstF16;
@@ -163,8 +150,6 @@ namespace TensorSharp.Cuda
         private readonly IntPtr convertF32F16;
         private readonly IntPtr convertF32Bf16;
         private readonly IntPtr matvecBf16F32;
-        private readonly IntPtr qkNormRopeNeoxF32;
-        private readonly IntPtr qwen35GdnFusedF32;
 
         // q8_1 block = half d + half s + 32 int8 = 36 bytes (matches ts_block_q8_1).
         public const int Q81BlockBytes = 36;
@@ -187,17 +172,10 @@ namespace TensorSharp.Cuda
             mulMulAddF32 = module.GetFunction("ts_mulmuladd_f32");
             binaryActivationF32 = module.GetFunction("ts_binary_activation_f32");
             binaryActivationStridedF32 = module.GetFunction("ts_binary_activation_strided_f32");
-            deinterleaveQGateF32 = module.GetFunction("ts_deinterleave_qgate_f32");
             addBiasRowsF32 = module.GetFunction("ts_add_bias_rows_f32");
             siluMulSplitF32 = module.GetFunction("ts_silu_mul_split_f32");
             geluMulSplitF32 = module.GetFunction("ts_gelu_mul_split_f32");
             swigluOaiSplitF32 = module.GetFunction("ts_swiglu_oai_split_f32");
-            qwen35GdnPackedF32 = module.GetFunction("ts_qwen35_gdn_packed_f32");
-            qwen35GdnPrefillConvF32 = module.GetFunction("ts_qwen35_gdn_prefill_conv_f32");
-            qwen35GdnPrefillScanF32 = module.GetFunction("ts_qwen35_gdn_prefill_scan_f32");
-            qwen35GdnPrefillOutF32 = module.GetFunction("ts_qwen35_gdn_prefill_out_f32");
-            qwen35GdnUpdateConvStateF32 = module.GetFunction("ts_qwen35_gdn_update_conv_state_f32");
-            qwen35GdnPackInputsF32 = module.GetFunction("ts_qwen35_gdn_pack_inputs_f32");
             layerNormF32 = module.GetFunction("ts_layernorm_f32");
             rmsNormF32 = module.GetFunction("ts_rmsnorm_f32");
             rmsNormResidualAddF32 = module.GetFunction("ts_rmsnorm_residual_add_f32");
@@ -303,7 +281,6 @@ namespace TensorSharp.Cuda
             splitQkvHeadFirstF32 = module.GetFunction("ts_split_qkv_head_first_f32");
             copyHeadFirstToCacheF32 = module.GetFunction("ts_copy_head_first_to_cache_f32");
             copyHeadFirstToCacheF16 = module.GetFunction("ts_copy_head_first_to_cache_f16");
-            fillRopePositionsI32 = module.GetFunction("ts_fill_rope_positions_i32");
             gatherCircularHeadFirstF32 = module.GetFunction("ts_gather_circular_head_first_f32");
             gatherCircularHeadFirstF16 = module.GetFunction("ts_gather_circular_head_first_f16");
             expandKvHeadsF32 = module.GetFunction("ts_expand_kv_heads_f32");
@@ -399,8 +376,6 @@ namespace TensorSharp.Cuda
             convertF32Bf16 = module.GetFunction("ts_convert_f32_bf16");
             matvecBf16F32 = module.GetFunction("ts_matvec_bf16_f32");
             quantGetRowsF32 = module.GetFunction("ts_quant_get_rows_f32");
-            qkNormRopeNeoxF32 = module.GetFunction("ts_qk_norm_rope_neox_f32");
-            qwen35GdnFusedF32 = module.GetFunction("ts_qwen35_gdn_fused_f32");
         }
 
         /// <summary>Kernels over an already loaded module (tests that load a specific PTX
@@ -602,22 +577,6 @@ namespace TensorSharp.Cuda
             Launch(binaryActivationStridedF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
-        public void LaunchDeinterleaveQGateF32(
-            IntPtr src, IntPtr q, IntPtr gate,
-            int rows, int numHeads, int headDim, long srcRowStride, IntPtr stream)
-        {
-            IntPtr srcArg = src;
-            IntPtr qArg = q;
-            IntPtr gateArg = gate;
-            int rowsArg = rows;
-            int numHeadsArg = numHeads;
-            int headDimArg = headDim;
-            long srcStrideArg = srcRowStride;
-            int count = checked(rows * numHeads * headDim);
-            void** args = stackalloc void*[] { &srcArg, &qArg, &gateArg, &rowsArg, &numHeadsArg, &headDimArg, &srcStrideArg };
-            Launch(deinterleaveQGateF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
-        }
-
         public void LaunchAddBiasRowsF32(IntPtr tensor, IntPtr bias, int rows, int cols, int biasCols, IntPtr stream)
         {
             IntPtr tensorArg = tensor;
@@ -663,261 +622,6 @@ namespace TensorSharp.Cuda
             int count = checked(rows * halfDim);
             void** args = stackalloc void*[] { &gateUpArg, &outputArg, &rowsArg, &halfDimArg, &alphaArg, &limitArg };
             Launch(swigluOaiSplitF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
-        }
-
-        public void LaunchQwen35GatedDeltaNetPackedF32(
-            IntPtr packed,
-            IntPtr convState,
-            IntPtr ssmState,
-            IntPtr convWeight,
-            IntPtr dtBias,
-            IntPtr aLog,
-            IntPtr ssmNorm,
-            IntPtr output,
-            int seqLen,
-            int packedDim,
-            int qkvDim,
-            int qkDim,
-            int vDim,
-            int numKHeads,
-            int numVHeads,
-            int headKDim,
-            int headVDim,
-            int convKernel,
-            int convWriteIdx,
-            float eps,
-            IntPtr stream,
-            IntPtr dynParams = default)
-        {
-            IntPtr packedArg = packed;
-            IntPtr convStateArg = convState;
-            IntPtr ssmStateArg = ssmState;
-            IntPtr convWeightArg = convWeight;
-            IntPtr dtBiasArg = dtBias;
-            IntPtr aLogArg = aLog;
-            IntPtr ssmNormArg = ssmNorm;
-            IntPtr outputArg = output;
-            int seqLenArg = seqLen;
-            int packedDimArg = packedDim;
-            int qkvDimArg = qkvDim;
-            int qkDimArg = qkDim;
-            int vDimArg = vDim;
-            int numKHeadsArg = numKHeads;
-            int numVHeadsArg = numVHeads;
-            int headKDimArg = headKDim;
-            int headVDimArg = headVDim;
-            int convKernelArg = convKernel;
-            int convWriteIdxArg = convWriteIdx;
-            float epsArg = eps;
-            IntPtr dynArg = dynParams;
-            void** args = stackalloc void*[]
-            {
-                &packedArg, &convStateArg, &ssmStateArg, &convWeightArg, &dtBiasArg,
-                &aLogArg, &ssmNormArg, &outputArg, &seqLenArg, &packedDimArg,
-                &qkvDimArg, &qkDimArg, &vDimArg, &numKHeadsArg, &numVHeadsArg,
-                &headKDimArg, &headVDimArg, &convKernelArg, &convWriteIdxArg, &epsArg,
-                &dynArg
-            };
-            // Multi-token prefill on supported geometry: the 3-phase split path
-            // (parallel conv/norm -> sync-free register-resident row scan ->
-            // parallel RMS+gate). The single-kernel path below walks the sequence
-            // with block-wide barriers per token and only numVHeads blocks in
-            // flight, which is latency-bound for long windows.
-            // Split (3-phase) prefill where its shape holds; the single-kernel
-            // sequential walk serves the rest.
-            if (seqLen >= 8 && headKDim == 128 && (headVDim & 31) == 0)
-            {
-                LaunchQwen35GdnPrefillSplit(
-                    packed, convState, ssmState, convWeight, dtBias, aLog, ssmNorm, output,
-                    seqLen, packedDim, qkvDim, qkDim, vDim,
-                    numKHeads, numVHeads, headKDim, headVDim,
-                    convKernel, convWriteIdx, eps, stream);
-            }
-            else
-            {
-                // One block per head; the head's recurrent state ([headVDim, headKDim])
-                // is staged in dynamic shared memory for the whole sequence. Above the
-                // default 48 KB dynamic-shared limit the function attribute must be
-                // raised once (sm_86 allows ~99 KB/block).
-                uint sharedBytes = checked((uint)((2L * headKDim + headVDim + (long)headVDim * headKDim) * sizeof(float)));
-                EnsureGdnPackedSharedCapacity(sharedBytes);
-                Launch(qwen35GdnPackedF32, (uint)numVHeads, 1, 1, GdnBlockSize, 1, 1, sharedBytes, stream, args);
-            }
-
-            int convDim = convKernel - 1;
-            if (convDim <= 0)
-                return;
-
-            int tail = Math.Min(seqLen, convDim);
-            int updateCount = checked(tail * qkvDim);
-            int convDimArg = convDim;
-            void** updateArgs = stackalloc void*[]
-            {
-                &packedArg, &convStateArg, &seqLenArg, &packedDimArg, &qkvDimArg,
-                &convDimArg, &convWriteIdxArg, &dynArg
-            };
-            Launch(qwen35GdnUpdateConvStateF32, Grid(updateCount), 1, 1, BlockSize, 1, 1, 0, stream, updateArgs);
-        }
-
-        // Token window per split-GDN pass; bounds the conv/core scratch size.
-        private const int GdnSplitMaxWindow = 512;
-
-        private IntPtr gdnSplitScratch;
-        private long gdnSplitScratchBytes;
-
-        private IntPtr EnsureGdnSplitScratch(long bytes)
-        {
-            if (gdnSplitScratch != IntPtr.Zero && gdnSplitScratchBytes >= bytes)
-                return gdnSplitScratch;
-            if (gdnSplitScratch != IntPtr.Zero)
-                CudaDriverApi.cuMemFree(gdnSplitScratch);
-            CudaDriverApi.cuMemAlloc(out gdnSplitScratch, new UIntPtr((ulong)bytes)).ThrowOnError();
-            gdnSplitScratchBytes = bytes;
-            return gdnSplitScratch;
-        }
-
-        private void LaunchQwen35GdnPrefillSplit(
-            IntPtr packed, IntPtr convState, IntPtr ssmState,
-            IntPtr convWeight, IntPtr dtBias, IntPtr aLog, IntPtr ssmNorm, IntPtr output,
-            int seqLen, int packedDim, int qkvDim, int qkDim, int vDim,
-            int numKHeads, int numVHeads, int headKDim, int headVDim,
-            int convKernel, int convWriteIdx, float eps, IntPtr stream)
-        {
-            int stride = 2 * headKDim + headVDim + 2;
-            int win = Math.Min(seqLen, GdnSplitMaxWindow);
-            long convBytes = (long)numVHeads * win * stride * sizeof(float);
-            long coreBytes = (long)numVHeads * win * headVDim * sizeof(float);
-            IntPtr scr = EnsureGdnSplitScratch(convBytes + coreBytes);
-            IntPtr core = new IntPtr(scr.ToInt64() + convBytes);
-
-            IntPtr packedArg = packed; IntPtr convStateArg = convState; IntPtr convWArg = convWeight;
-            IntPtr dtBiasArg = dtBias; IntPtr aLogArg = aLog; IntPtr scrArg = scr;
-            int winStartArg = 0; int winLenArg = 0; int seqLenArg = seqLen;
-            int packedDimArg = packedDim; int qkvDimArg = qkvDim; int qkDimArg = qkDim; int vDimArg = vDim;
-            int numKHeadsArg = numKHeads; int numVHeadsArg = numVHeads;
-            int headKDimArg = headKDim; int headVDimArg = headVDim;
-            int convKernelArg = convKernel; int convWriteIdxArg = convWriteIdx;
-            float epsArg = eps;
-
-            void** convArgs = stackalloc void*[]
-            {
-                &packedArg, &convStateArg, &convWArg, &dtBiasArg, &aLogArg, &scrArg,
-                &winStartArg, &winLenArg, &seqLenArg,
-                &packedDimArg, &qkvDimArg, &qkDimArg, &vDimArg,
-                &numKHeadsArg, &numVHeadsArg, &headKDimArg, &headVDimArg,
-                &convKernelArg, &convWriteIdxArg, &epsArg
-            };
-            IntPtr ssmStateArg = ssmState; IntPtr coreArg = core;
-            void** scanArgs = stackalloc void*[]
-            {
-                &scrArg, &ssmStateArg, &coreArg,
-                &winLenArg, &numVHeadsArg, &headKDimArg, &headVDimArg
-            };
-            IntPtr ssmNormArg = ssmNorm; IntPtr outputArg = output;
-            void** outArgs = stackalloc void*[]
-            {
-                &coreArg, &packedArg, &ssmNormArg, &outputArg,
-                &winStartArg, &winLenArg, &packedDimArg, &qkvDimArg, &vDimArg,
-                &numVHeadsArg, &headVDimArg, &epsArg
-            };
-
-            for (int winStart = 0; winStart < seqLen; winStart += win)
-            {
-                int winLen = Math.Min(win, seqLen - winStart);
-                winStartArg = winStart;
-                winLenArg = winLen;
-
-                uint convWarps = (uint)((long)winLen * numVHeads);
-                uint convGrid = (uint)((convWarps + 7) / 8);   // 8 warps per 256-thread block
-                Launch(qwen35GdnPrefillConvF32, convGrid, 1, 1, BlockSize, 1, 1, 0, stream, convArgs);
-
-                uint scanGridY = (uint)((headVDim + 31) / 32);  // 8 warps x 4 rows per block
-                Launch(qwen35GdnPrefillScanF32, (uint)numVHeads, scanGridY, 1, BlockSize, 1, 1, 0, stream, scanArgs);
-
-                Launch(qwen35GdnPrefillOutF32, convGrid, 1, 1, BlockSize, 1, 1, 0, stream, outArgs);
-            }
-        }
-
-        // Maximum dynamic shared memory the GDN packed kernel can request; checked by
-        // the caller so unsupported geometries fall back before a launch failure.
-        public const uint GdnPackedMaxSharedBytes = 96 * 1024;
-
-        private uint gdnPackedSharedCapacity = 48 * 1024;
-
-        private void EnsureGdnPackedSharedCapacity(uint sharedBytes)
-        {
-            if (sharedBytes <= gdnPackedSharedCapacity)
-                return;
-            CudaDriverApi.cuFuncSetAttribute(
-                qwen35GdnPackedF32,
-                CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                checked((int)sharedBytes)).ThrowOnError();
-            gdnPackedSharedCapacity = sharedBytes;
-        }
-
-        public void LaunchQwen35GatedDeltaNetPackInputsF32(
-            IntPtr qkv,
-            IntPtr z,
-            IntPtr beta,
-            IntPtr alpha,
-            IntPtr packed,
-            int seqLen,
-            int qkvDim,
-            int zDim,
-            int numVHeads,
-            int packedDim,
-            IntPtr stream)
-        {
-            IntPtr qkvArg = qkv;
-            IntPtr zArg = z;
-            IntPtr betaArg = beta;
-            IntPtr alphaArg = alpha;
-            IntPtr packedArg = packed;
-            int seqLenArg = seqLen;
-            int qkvDimArg = qkvDim;
-            int zDimArg = zDim;
-            int numVHeadsArg = numVHeads;
-            int packedDimArg = packedDim;
-            int count = checked(seqLen * packedDim);
-            void** args = stackalloc void*[]
-            {
-                &qkvArg, &zArg, &betaArg, &alphaArg, &packedArg,
-                &seqLenArg, &qkvDimArg, &zDimArg, &numVHeadsArg, &packedDimArg
-            };
-            Launch(qwen35GdnPackInputsF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
-        }
-
-        public void LaunchQwen35GdnFusedF32(
-            IntPtr qkv, IntPtr z, IntPtr beta, IntPtr alpha,
-            IntPtr convState, IntPtr ssmState, IntPtr convWeight,
-            IntPtr dtBias, IntPtr aLog, IntPtr ssmNorm, IntPtr output,
-            int seqLen, int qkvDim, int zDim, int qkDim, int vDim,
-            int numKHeads, int numVHeads, int headKDim, int headVDim,
-            int convKernel, int convWriteIdx, float eps, IntPtr stream)
-        {
-            IntPtr qkvArg = qkv; IntPtr zArg = z; IntPtr betaArg = beta; IntPtr alphaArg = alpha;
-            IntPtr convStateArg = convState; IntPtr ssmStateArg = ssmState; IntPtr convWeightArg = convWeight;
-            IntPtr dtBiasArg = dtBias; IntPtr aLogArg = aLog; IntPtr ssmNormArg = ssmNorm; IntPtr outputArg = output;
-            int seqLenArg = seqLen; int qkvDimArg = qkvDim; int zDimArg = zDim;
-            int qkDimArg = qkDim; int vDimArg = vDim;
-            int numKHeadsArg = numKHeads; int numVHeadsArg = numVHeads;
-            int headKDimArg = headKDim; int headVDimArg = headVDim;
-            int convKernelArg = convKernel; int convWriteIdxArg = convWriteIdx;
-            float epsArg = eps;
-
-            void** args = stackalloc void*[]
-            {
-                &qkvArg, &zArg, &betaArg, &alphaArg,
-                &convStateArg, &ssmStateArg, &convWeightArg,
-                &dtBiasArg, &aLogArg, &ssmNormArg, &outputArg,
-                &seqLenArg, &qkvDimArg, &zDimArg, &qkDimArg, &vDimArg,
-                &numKHeadsArg, &numVHeadsArg, &headKDimArg, &headVDimArg,
-                &convKernelArg, &convWriteIdxArg, &epsArg
-            };
-            // One block per head; warps stride the head's rows (multi-block-per-head
-            // raced the shared-state decay and core[] reduction).
-            uint sharedBytes = checked((uint)((2 * headKDim + headVDim) * sizeof(float)));
-            Launch(qwen35GdnFusedF32, (uint)numVHeads, 1, 1, GdnBlockSize, 1, 1, sharedBytes, stream, args);
         }
 
         public void LaunchLayerNormF32(IntPtr input, IntPtr alpha, IntPtr beta, IntPtr output, int rows, int cols, float eps, IntPtr stream)
@@ -2265,29 +1969,6 @@ namespace TensorSharp.Cuda
             Launch(copyHeadFirstToCacheF16, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
-        /// <summary>
-        /// Refreshes the two cached RoPE position tensors (Q rows / K rows, one row
-        /// per head for single-token decode) from the decode-graph dynamic parameter
-        /// block. Captured at the top of a decode graph.
-        /// </summary>
-        public void LaunchFillRopePositionsI32(
-            IntPtr posQ,
-            int qRows,
-            IntPtr posK,
-            int kRows,
-            IntPtr dynParams,
-            IntPtr stream)
-        {
-            IntPtr posQArg = posQ;
-            int qRowsArg = qRows;
-            IntPtr posKArg = posK;
-            int kRowsArg = kRows;
-            IntPtr dynArg = dynParams;
-            int count = Math.Max(qRows, kRows);
-            void** args = stackalloc void*[] { &posQArg, &qRowsArg, &posKArg, &kRowsArg, &dynArg };
-            Launch(fillRopePositionsI32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
-        }
-
         public void LaunchGatherCircularHeadFirstF32(
             IntPtr cache,
             IntPtr output,
@@ -2493,57 +2174,6 @@ namespace TensorSharp.Cuda
                 &dynParamsArg
             };
             Launch(fillNeoXRopeTablesDynamicF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
-        }
-
-        /// <summary>
-        /// Fused QK-RMSNorm + NeoX RoPE kernel.  Normalizes each row via RMSNorm,
-        /// then applies NeoX rotary position embeddings in-place — all in a single
-        /// kernel launch with one shared-memory pass.
-        /// </summary>
-        /// <param name="data">Q or K tensor [rows, cols], modified in-place.</param>
-        /// <param name="alpha">RMSNorm weight [cols].</param>
-        /// <param name="positions">Token positions [rows] as int32.</param>
-        /// <param name="rows">seqLen * numHeads (or seqLen * kvHeads).</param>
-        /// <param name="cols">headDim.</param>
-        /// <param name="ropeHalf">rope_dims / 2 (number of rotary pairs).</param>
-        /// <param name="eps">RMSNorm epsilon.</param>
-        /// <param name="ropeBase">RoPE base frequency (e.g. 1000000.0).</param>
-        /// <param name="ropeFreqScale">1.0 / rope_scale.</param>
-        public void LaunchQKNormRopeNeoxF32(
-            IntPtr data,
-            IntPtr alpha,
-            IntPtr positions,
-            int rows,
-            int cols,
-            int ropeHalf,
-            float eps,
-            float ropeBase,
-            float ropeFreqScale,
-            IntPtr stream)
-        {
-            IntPtr dataArg = data;
-            IntPtr alphaArg = alpha;
-            IntPtr positionsArg = positions;
-            int rowsArg = rows;
-            int colsArg = cols;
-            int ropeHalfArg = ropeHalf;
-            float epsArg = eps;
-            float ropeBaseArg = ropeBase;
-            float ropeFreqScaleArg = ropeFreqScale;
-
-            void** args = stackalloc void*[]
-            {
-                &dataArg, &alphaArg, &positionsArg, &rowsArg, &colsArg,
-                &ropeHalfArg, &epsArg, &ropeBaseArg, &ropeFreqScaleArg
-            };
-
-            // ONE BLOCK PER ROW: the kernel block-reduces each row's RMS and processes
-            // that row's rotation (row = blockIdx.x). Grid(rows) — ceil(rows/BlockSize)
-            // — collapsed every decode-sized launch to a single block, so only the
-            // first attention head was ever normalized/rotated; the rest passed
-            // through raw and corrupted generations progressively with position.
-            uint sharedBytes = checked((uint)(2 * cols * sizeof(float)));
-            Launch(qkNormRopeNeoxF32, (uint)rows, 1, 1, BlockSize, 1, 1, sharedBytes, stream, args);
         }
 
         public void LaunchIndexSelectF32(IntPtr source, IntPtr indices, IntPtr output, int rows, int cols, int sourceRows, int indicesAreInt32, int isAdd, IntPtr stream)
@@ -3504,12 +3134,6 @@ namespace TensorSharp.Cuda
 
         public void Dispose()
         {
-            if (gdnSplitScratch != IntPtr.Zero)
-            {
-                CudaDriverApi.cuMemFree(gdnSplitScratch);
-                gdnSplitScratch = IntPtr.Zero;
-                gdnSplitScratchBytes = 0;
-            }
             module.Dispose();
         }
 

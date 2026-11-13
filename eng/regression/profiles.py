@@ -8,7 +8,7 @@ CPU_MOE_FAMILIES = ("qwen35", "qwen4exp")
 CPU_MOE_SOURCES = [
     "TensorSharp.Models/MoeCpuOffloadConfig.cs",
     "TensorSharp.Models/ModelBase.WeightLoading.cs",
-    "TensorSharp.Models/Models/Qwen35/Qwen35Model.cs",
+    "TensorSharp.Models/SharedDecoder/StandardDecoderModel.ExpertPlacement.cs",
     "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpModel.ExpertPlacement.cs",
 ]
 

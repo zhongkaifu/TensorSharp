@@ -349,7 +349,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     {
         "gptoss" => row == 0 ? 0.0075 : 0.0068,
         "qwen35moe" => row == 0 ? 0.0075 : 0.015,
-        "qwen35" => row == 0 ? 0.0011 : 0.00031,
+        "qwen35" => row == 0 ? 0.0012 : 0.00031,   // row 0 of [64] at 96 tokens: 1.105e-3 on an RTX A5000 (sm_86)
         "gemma4moe" => row == 0 ? 0.0089 : 0.017,  // A 5.9e-3 / 1.08e-2 (with the D3 fixes)
         "gemma4moe_global" => row == 0 ? 0.0074 : 0.017,
         "nemotron_h" => chunks[0] is 1 or 64 ? 0 : row == 0 ? 0.015 : row == 1 && length == 96 ? 0.013 : 0,
@@ -470,7 +470,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         int[] prompt = Prompt(length);
         int[] forced = Forced(6);
         using var cuda = Load(path, BackendType.Cuda);
-        var runs = Enumerable.Range(0, 3).Select(r => TrajectoryKeepingRingPhase(cuda, prompt, forced, null, $"{family} {length} run {r + 1}")).ToList();
+        var runs = Enumerable.Range(0, 3).Select(r => Trajectory(cuda, prompt, forced, null)).ToList();
         AssertReproduces($"{family} {length}", runs, family);
     }
 
@@ -500,25 +500,8 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         int[] prompt = Prompt(97), forced = Forced(6);
         int[] chunks = { 31, 2, 64 };
         using var cuda = Load(path, BackendType.Cuda);
-        var runs = Enumerable.Range(0, 3).Select(r => TrajectoryKeepingRingPhase(cuda, prompt, forced, chunks, $"{family} chunks [31,2,64] run {r + 1}")).ToList();
+        var runs = Enumerable.Range(0, 3).Select(r => Trajectory(cuda, prompt, forced, chunks)).ToList();
         AssertReproduces($"{family} chunks [31,2,64]", runs, family);
-    }
-
-    /// <summary>A <see cref="Trajectory"/> that, on direct-CUDA Qwen3.5, also checks the GDN conv
-    /// ring bookkeeping: every recurrent layer's host ring phase (the write index its device kernel
-    /// is launched with, and the phase the decode graph applies to every layer) must equal the
-    /// tokens fed since the reset modulo conv_kernel - 1. A path that forgets the bookkeeping fails
-    /// here at the run that forgot it, even where the logits happen to survive.</summary>
-    private static List<float[]> TrajectoryKeepingRingPhase(ModelBase model, int[] prompt, int[] forced, int[] chunks, string what)
-    {
-        List<float[]> rows = Trajectory(model, prompt, forced, chunks);
-        if (GdnRingPhases(model) is { } ring)
-        {
-            int expected = (prompt.Length + forced.Length) % ring.Ring;
-            Assert.True(ring.Phases.All(p => p == expected),
-                $"{what}: GDN conv ring phases [{string.Join(",", ring.Phases)}] after {prompt.Length + forced.Length} tokens, expected {expected} on every recurrent layer");
-        }
-        return rows;
     }
 
     [CudaTheory]
@@ -600,16 +583,14 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
 
     // ---- 5. snapshot restore ---------------------------------------------------------------
 
+    // Qwen 3.5 runs on the shared decoder runtime, which keeps a recurrent model's state in per-request slots and
+    // prefix checkpoints (Qwen35RuntimeTests.CheckpointsContinueExactly) rather than in extracted blocks.
     [CudaTheory]
     [InlineData("gptoss", "cuda")]
-    [InlineData("qwen35moe", "cuda")]
-    [InlineData("qwen35", "cuda")]
     [InlineData("gemma4moe", "cuda")]
     [InlineData("nemotron_h", "cuda")]
     [InlineData("nemotron_h_moe", "cuda")]
     [InlineData("gptoss", "cpu")]
-    [InlineData("qwen35moe", "cpu")]
-    [InlineData("qwen35", "cpu")]
     [InlineData("gemma4moe", "cpu")]
     [InlineData("nemotron_h", "cpu")]
     [InlineData("nemotron_h_moe", "cpu")]
@@ -641,12 +622,9 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
 
     [CudaTheory]
     [InlineData("gptoss", "cuda")]
-    [InlineData("qwen35moe", "cuda")]
-    [InlineData("qwen35", "cuda")]
     [InlineData("gemma4moe", "cuda")]
     [InlineData("nemotron_h", "cuda")]
     [InlineData("nemotron_h_moe", "cuda")]
-    [InlineData("qwen35moe", "cpu")]
     public void SnapshotBlock_RoundTripsThroughInject(string family, string backend)
     {
         // Narrows D1: a block injected into an empty cache and extracted again comes back byte
@@ -670,123 +648,6 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         int differing = block.Zip(again, (a, b) => a != b).Count(d => d);
         _output.WriteLine($"{family} on {backend}: {size} B block, {differing} bytes differ after inject + extract");
         Assert.Equal(0, differing);
-    }
-
-    [CudaTheory]
-    [InlineData("replay-after-inject")]
-    [InlineData("capture-after-inject")]
-    [InlineData("capture-after-extract")]
-    [InlineData("no-inject")]
-    public void Qwen35PrefillGraph_AroundSnapshots_MatchesAFreshModel(string scenario)
-    {
-        // Direct-CUDA Qwen3.5 captures its per-op prefill on a key's second sighting and replays it
-        // from the third, reading the K/V and GDN state buffers in place. So a replay right after a
-        // snapshot inject must see the injected rows, and a capture must not record the upload of
-        // a host-dirty buffer (left by an inject, or by an extract, which checks the state out to
-        // the host): a recorded upload copies that stale host image over the state on every later
-        // replay, and an unrelated request then continues from the snapshot's prefix. Every row
-        // here is the 16-token suffix after a 48-token prefix (key 16|48), compared with a freshly
-        // loaded model's plain run of the same prefix. The base (D1) was 0.11 off on the replay
-        // after an inject and 7.7e-3 / 1.8e-2 off on the replays after a capture that followed an
-        // extract / an inject; no-inject is the control.
-        string path = WriteModel("qwen35");
-        int[] p = Prompt(48), q = Prompt(48, salt: 3), s = Prompt(16, salt: 5);
-        float[] Suffix(ModelBase m) => (float[])m.ForwardPrompt(s).Clone();
-        float[] Row(ModelBase m, int[] prefix)
-        {
-            m.ResetKVCache();
-            m.ForwardPrompt(prefix);
-            return Suffix(m);
-        }
-        float[] refP, refQ;
-        using (var fresh = Load(path, BackendType.Cuda)) refP = Row(fresh, p);
-        using (var fresh = Load(path, BackendType.Cuda)) refQ = Row(fresh, q);
-        Assert.False(BitIdentical(refP, refQ), "the two prefixes give the same suffix row: this file cannot tell them apart");
-
-        using var model = Load(path, BackendType.Cuda);
-        model.ResetKVCache();
-        model.ForwardPrompt(p);
-        var block = new byte[model.ComputeKVBlockByteSize(48)];
-        Assert.True(model.TryExtractKVBlock(0, 48, block));
-        var checks = new List<(string What, float[] Row, float[] Reference)> { ("run 1 (plain, after an extract): P", Suffix(model), refP) };
-        switch (scenario)
-        {
-            case "replay-after-inject":
-                checks.Add(("run 2 (capture): Q", Row(model, q), refQ));
-                model.ResetKVCache();
-                Assert.True(model.TryInjectKVBlock(0, 48, block));
-                checks.Add(("run 3 (replay right after injecting P): P", Suffix(model), refP));
-                break;
-            case "capture-after-inject":
-                model.ResetKVCache();
-                Assert.True(model.TryInjectKVBlock(0, 48, block));
-                checks.Add(("run 2 (capture right after injecting P): P", Suffix(model), refP));
-                checks.Add(("run 3 (replay, Q prefilled normally): Q", Row(model, q), refQ));
-                break;
-            case "capture-after-extract":
-                model.ResetKVCache();
-                model.ForwardPrompt(p);
-                Assert.True(model.TryExtractKVBlock(0, 48, block));
-                checks.Add(("run 2 (capture right after extracting P): P", Suffix(model), refP));
-                checks.Add(("run 3 (replay, Q prefilled normally): Q", Row(model, q), refQ));
-                break;
-            case "no-inject":
-                checks.Add(("run 2 (capture): Q", Row(model, q), refQ));
-                checks.Add(("run 3 (replay): P", Row(model, p), refP));
-                checks.Add(("run 4 (replay): Q", Row(model, q), refQ));
-                break;
-            default:
-                throw new ArgumentOutOfRangeException(nameof(scenario));
-        }
-        foreach (var (what, row, reference) in checks)
-            _output.WriteLine($"{scenario} {what} vs a fresh model: {RelL2(row, reference):E3} (bit-identical {BitIdentical(row, reference)})");
-        foreach (var (what, row, reference) in checks)
-            Assert.True(BitIdentical(row, reference), $"{scenario} {what} is {RelL2(row, reference):E3} from a fresh model's row");
-    }
-
-    [CudaTheory]
-    [InlineData("qwen35")]
-    [InlineData("qwen35moe")]
-    public void Qwen35DecodeGraph_CapturedRightAfterInject_MatchesAFreshModel(string family)
-    {
-        // The decode-side twin of the prefill-graph scenarios above. Direct-CUDA Qwen3.5 captures
-        // its decode layer loop on a key's second sighting and replays it after that, reading the
-        // K/V and GDN state buffers in place. Here the capture is the first forward after a
-        // snapshot inject (what a prefix-cache hit that matched all but the last prompt token does:
-        // it feeds that token as a one-token forward), so the injected host rows must be uploaded
-        // BEFORE the capture (EnsureDecodeGraphInputsResident in RunCudaDecodeLayerLoop): an upload
-        // recorded inside the graph copies that host image over the state on every replay. The
-        // review of the D1 fix removed only that call and nothing failed; this scenario then put
-        // the rows 0.07-0.24 (dense) and 0.78-1.21 (MoE) from the fresh model's.
-        string path = WriteModel(family);
-        int[] prefix = Prompt(48);
-        int[] forced = Forced(4);
-        float[][] straight;
-        using (var fresh = Load(path, BackendType.Cuda))
-        {
-            fresh.ResetKVCache();
-            fresh.ForwardPrompt(prefix);
-            straight = forced.Select(token => (float[])fresh.Forward(new[] { token }).Clone()).ToArray();
-        }
-
-        using var model = Load(path, BackendType.Cuda);
-        model.ResetKVCache();
-        model.ForwardPrompt(prefix);
-        var block = new byte[model.ComputeKVBlockByteSize(prefix.Length)];
-        Assert.True(model.TryExtractKVBlock(0, prefix.Length, block));
-        // The decode key's first sighting (a plain per-op step), as in the fresh model.
-        float[] first = (float[])model.Forward(new[] { forced[0] }).Clone();
-        Assert.True(BitIdentical(first, straight[0]), $"{family}: the step before the inject is {RelL2(first, straight[0]):E3} from the fresh model's");
-        model.ResetKVCache();
-        Assert.True(model.TryInjectKVBlock(0, prefix.Length, block));
-        // Second sighting, right after the inject: row 0 is the CAPTURE, rows 1.. replay it.
-        float[][] restored = forced.Select(token => (float[])model.Forward(new[] { token }).Clone()).ToArray();
-        var rel = restored.Select((row, i) => RelL2(row, straight[i])).ToList();
-        Report($"{family} decode after inject (row 0 captured, then replays) vs a fresh model", rel);
-        // Row 0 is the captured graph against the fresh model's per-op step: the same kernels,
-        // measured 1.3e-7 apart on the dense file (the per-op vs graph rounding the snapshot test's
-        // warm-up avoids) and bit-identical on MoE. Every replayed row is bit-identical.
-        AssertRows($"{family} decode captured right after an inject", restored, straight, row => row == 0 ? 1e-6 : 0);
     }
 
     // ---- 5b. host reads of the K/V cache ----------------------------------------------------

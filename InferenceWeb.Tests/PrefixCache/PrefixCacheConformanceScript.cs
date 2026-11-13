@@ -155,7 +155,9 @@ internal static class PrefixCacheConformanceScript
             _caps = _pcm.GetPrefixCacheCapabilities();
             Assert.NotNull(_caps);
             Assert.False(string.IsNullOrEmpty(_caps.NamespaceFingerprint), "NamespaceFingerprint must be non-empty (K1a)");
-            Assert.Equal(_arch.KVStateFingerprint, _caps.NamespaceFingerprint);
+            // The namespace is the KV fingerprint, or narrows it: the shared decoder runtime appends its backend, so
+            // a checkpoint file written on one backend never loads on another.
+            Assert.StartsWith(_arch.KVStateFingerprint, _caps.NamespaceFingerprint, StringComparison.Ordinal);
             _rules = new ResumabilityRules(_caps, blockSize: 256, batchedPagedEnabled: false);
             Assert.Equal(Math.Max(1, _arch.KVCacheTruncationGranularity), _caps.TruncationGranularity);
             if (_caps.EndState == EndStateSupport.None)

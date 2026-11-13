@@ -501,11 +501,8 @@ TensorSharp/
 │   ├── ggml_ops_flash_attn_guard.cpp      # Flash attention, or explicit attention with a one-time warning when the backend has no kernel for the shape
 │   ├── ggml_ops_transformer.cpp           # Stand-alone flash-attention decode (`TSGgml_FlashAttnDecodeF32`)
 │   ├── ggml_ops_transformer_common.h      # Shared transformer helpers + C# layer-descriptor structs
-│   ├── ggml_ops_transformer_prefill.cpp   # Fused layer prefill (Gemma 4, GPT-OSS, Qwen 3.5)
-│   ├── ggml_ops_qwen35_decode.cpp         # Qwen 3.5/3.6 fused decode (layer, whole-model, batched)
-│   ├── ggml_ops_qwen35_verify.cpp         # Qwen 3.5/3.6 fused multi-token verify
+│   ├── ggml_ops_transformer_prefill.cpp   # Fused layer prefill (Gemma 4, GPT-OSS)
 │   ├── ggml_ops_qwen35_gdn_tp.cpp         # Qwen 3.5/3.6 per-rank packed GatedDeltaNet kernel (tensor parallel)
-│   ├── ggml_ops_qwen35_recurrent_prefill.cpp # Qwen 3.5/3.6 recurrent-layer prefill
 │   ├── ggml_ops_qwen4exp*.cpp             # Qwen 3.8 Flash Next (`qwen4exp`): fused block and token-span graphs with per-sequence state snapshots, the slot-stable arena for token-batched decode, and the shared MTP head
 │   ├── ggml_ops_gptoss_decode.cpp         # GPT OSS whole-model decode graph (one dispatch per token, shared KV window)
 │   ├── ggml_ops_gptoss_prefill.cpp        # GPT OSS whole-model prefill: N tokens through every attention + MoE layer plus the folded final norm and LM head as one graph

@@ -270,7 +270,7 @@ namespace InferenceWeb.Tests
         /// An explicit model file, or the first GGUF in <paramref name="dir"/> whose name contains
         /// <paramref name="contains"/> (case-insensitive; '|' separates
         /// accepted alternatives, e.g. "gpt-oss|gpt_oss"), skipping companion
-        /// files (mmproj / assistant drafts). Shared by the attributes and the
+        /// files (mmproj / assistant and DFlash drafters). Shared by the attributes and the
         /// per-class loaders so the skip decision and the load pick the same file.
         /// </summary>
         public static string FindGguf(string dir, string contains)
@@ -299,7 +299,7 @@ namespace InferenceWeb.Tests
             {
                 string n = Path.GetFileName(p).ToLowerInvariant();
                 return alternatives.Any(n.Contains)
-                    && !n.Contains("mmproj") && !n.Contains("assistant");
+                    && !n.Contains("mmproj") && !n.Contains("assistant") && !n.Contains("dflash");
             });
         }
     }

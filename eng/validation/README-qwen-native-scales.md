@@ -6,29 +6,16 @@ native operators. They are correctness checks, not model-quality or performance
 benchmarks.
 
 Enable `TENSORSHARP_GGML_NATIVE_BUILD_TESTS` in the native CMake build, along with
-the intended CUDA or Metal backend, then build `GgmlOpsQwen35ArenaScaleTest` and
-`GgmlOpsDFlashScaleTest`. Run:
+the intended CUDA or Metal backend, then build `GgmlOpsDFlashScaleTest`. Run:
 
 ```sh
-ctest --test-dir TensorSharp.GGML.Native/build --output-on-failure \
-  -R 'qwen35-arena-sidecar-scales|dflash-sidecar-scales'
+ctest --test-dir TensorSharp.GGML.Native/build --output-on-failure -R 'dflash-sidecar-scales'
 ```
 
-The arena fixture covers all 13 projection scale slots, fused and separate
-attention/GDN/FFN projections, 2 and 4 sequences, F16 and Q8 KV caches, five
-successive decode steps, sampled IDs, and flushed recurrent state. Powers of two
-make the scaled and folded-weight references exact. An unscaled negative control
-must differ. The initial three-build order across the entire matrix is deliberate:
-inserting additional graphs between cases can mask a launch failure that depends
-on the preceding sequence of graphs. Separate repeated-build controls follow
-that matrix.
-
-The width-transition checks run 2→4→2→4 batches while keeping all four holders
-alive. The returning holders resume their previous KV and recurrent state. A
-reference explicitly flushes and rebuilds after every step. This covers the
-memory policy that retires the same model's old width bucket before allocating
-a new one. Run the executable with `cuda transitions` or `metal transitions` to
-isolate that check; the default run includes both scale and transition cases.
+The Qwen 3.5 slot-stable arena and its fixture (`GgmlOpsQwen35ArenaScaleTest`) were
+removed with `Qwen35Model`. The shared decoder runtime's sidecar scales and batch-width
+transitions are covered by the managed `Qwen35RuntimeTests` and
+`SharedRuntimeConformanceTests` lanes on each GPU backend.
 
 The DFlash fixture covers both DFlash versions, injection and eight-row draft
 blocks, borrowed embedding/head scales, layer projections, dynamic convolution,
@@ -47,7 +34,8 @@ On visible SM12 CUDA devices, TensorSharp defaults `GGML_CUDA_PDL` to `0` before
 CUDA backend enumeration. This keeps CUDA graph capture and fusion enabled while
 disabling programmatic dependent launch. On the tested RTX 5090, the default
 upstream PDL path produced incorrect logits and recurrent state starting at the
-first capture of the 4-lane F32 case after the 2-lane cases. `GGML_CUDA_PDL=0`
+first capture of the 4-lane F32 case after the 2-lane cases of the (since removed)
+Qwen 3.5 arena fixture. `GGML_CUDA_PDL=0`
 restored exact results; clearing the backend's cached graph entry and replacing
 the GDN output copies with explicit dependencies did not fix it. Those failed
 workarounds are not part of the implementation.
@@ -56,10 +44,12 @@ Explicit `GGML_CUDA_PDL=0` and `GGML_CUDA_PDL=1` settings are preserved. Setting
 `1` opts back into the unsafe, unqualified path on the affected device; do not
 use it for production correctness qualification. The compatibility guard logs
 its default once. `cuda-launch-policy-*` tests check unset, explicit 0/1 and
-unaffected-device policies without hardware. Device qualification must also run
-the arena fixture with this environment variable initially unset. Other CUDA
-architectures retain their existing defaults; they are not covered by the RTX
-5090 validation.
+unaffected-device policies without hardware, and `cuda-launch-policy-device-*`
+check that the real CUDA backend keeps an explicit setting. Device qualification
+must also run the runtime's batched ggml_cuda lanes (`SlotBatchesMatchEachSequenceAlone`,
+`ConcurrentRequestsAreBatched`) with this environment variable initially unset.
+Other CUDA architectures retain their existing defaults; they are not covered by
+the RTX 5090 validation.
 
 Keep logs in ignored `artifacts/` or `docs/validation/`. A skipped backend (exit
 77) is unavailable coverage, not a passing device test. Record the actual ggml

@@ -12,7 +12,8 @@
 //     be deleted here, so the list is always the true support matrix;
 //   * a family that is not one of the legacy bespoke implementations must be built on the
 //     shared decoder runtime (which provides every mechanism), and must register a fixture
-//     in SharedRuntimeConformanceTests.Families so its claims are proven, not declared.
+//     in SharedRuntimeConformanceTests.Families (or a dedicated suite in
+//     SharedRuntimeConformanceTests.DedicatedSuites) so its claims are proven, not declared.
 using TensorSharp.Models.Architecture;
 
 namespace InferenceWeb.Tests;
@@ -26,7 +27,7 @@ public sealed class ServingContractConformanceTests
     /// </summary>
     internal static readonly HashSet<string> LegacyBespokeFamilies = new(StringComparer.Ordinal)
     {
-        "qwen35", "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-glimmer", "muse-spark",
+        "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-glimmer", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
         "diffusion-gemma", "qwen_image", "wan", "ltx-2.5", "minimax-h3", "minimax-h3-image",
     };
@@ -142,9 +143,6 @@ public sealed class ServingContractConformanceTests
         "nemotron_h: TensorParallel+batching@cuda",
         "nemotron_h: TensorParallel+batching@ggml_cuda",
         "nemotron_h: TensorParallel+batching@ggml_vulkan",
-        "qwen35: TensorParallel+batching@cuda",
-        "qwen35: TensorParallel+batching@ggml_cuda",
-        "qwen35: TensorParallel+batching@ggml_vulkan",
         "qwen4exp: ContinuousBatching@cpu",
         "qwen4exp: ExpertOffload@cuda",
         "qwen4exp: HybridParallel@cuda",
@@ -219,9 +217,18 @@ public sealed class ServingContractConformanceTests
     {
         var withFixtures = SharedRuntimeConformanceTests.FamilyIds.ToHashSet(StringComparer.Ordinal);
         foreach (var arch in BuiltInArchitectures.Descriptors.Where(a => a.Serving.Implementation == ServingImplementation.SharedRuntime))
+        {
+            if (SharedRuntimeConformanceTests.DedicatedSuites.TryGetValue(arch.Id, out Type suite))
+            {
+                foreach (string test in SharedRuntimeConformanceTests.MechanismTests)
+                    Assert.True(suite.GetMethod(test)?.GetCustomAttributes(typeof(FactAttribute), inherit: true).Length > 0,
+                        $"'{arch.Id}' is proven by {suite.Name}, which must declare the test {test}.");
+                continue;
+            }
             Assert.True(withFixtures.Contains(arch.Id),
                 $"'{arch.Id}' claims every mechanism through the shared runtime; add its synthetic fixture to " +
                 "SharedRuntimeConformanceTests.Families so the claims are proven.");
+        }
     }
 
     [Fact]

@@ -435,279 +435,6 @@ public class CudaBackendTests
     }
 
     [CudaFact]
-    public void CudaQwen35GatedDeltaNetPacked_MatchesCpuReference()
-    {
-        const int seqLen = 4;
-        const int numKHeads = 2;
-        const int numVHeads = 4;
-        const int headKDim = 4;
-        const int headVDim = 3;
-        const int convKernel = 3;
-        const int convWriteIdx = 1;
-        const float eps = 1e-5f;
-
-        int qkDim = numKHeads * headKDim;
-        int vDim = numVHeads * headVDim;
-        int qkvDim = 2 * qkDim + vDim;
-        int packedDim = qkvDim + vDim + 2 * numVHeads;
-        int convDim = convKernel - 1;
-
-        float[] packed = MakePattern(seqLen * packedDim, 0.07f, -0.015f);
-        float[] qkv = new float[seqLen * qkvDim];
-        float[] z = new float[seqLen * vDim];
-        float[] beta = new float[seqLen * numVHeads];
-        float[] alpha = new float[seqLen * numVHeads];
-        for (int s = 0; s < seqLen; s++)
-        {
-            Array.Copy(packed, s * packedDim, qkv, s * qkvDim, qkvDim);
-            Array.Copy(packed, s * packedDim + qkvDim, z, s * vDim, vDim);
-            Array.Copy(packed, s * packedDim + qkvDim + vDim, beta, s * numVHeads, numVHeads);
-            Array.Copy(packed, s * packedDim + qkvDim + vDim + numVHeads, alpha, s * numVHeads, numVHeads);
-        }
-        float[] convState = MakePattern(convDim * qkvDim, 0.05f, 0.01f);
-        float[] ssmState = MakePattern(numVHeads * headVDim * headKDim, 0.04f, -0.02f);
-        float[] convWeight = MakePattern(qkvDim * convKernel, 0.08f, 0.03f);
-        float[] dtBias = MakePattern(numVHeads, 0.03f, -0.01f);
-        float[] aLog = new float[numVHeads];
-        float[] ssmNorm = new float[headVDim];
-        for (int i = 0; i < numVHeads; i++)
-            aLog[i] = -0.05f - i * 0.01f;
-        for (int i = 0; i < headVDim; i++)
-            ssmNorm[i] = 0.8f + i * 0.07f;
-
-        float[] expectedConv = (float[])convState.Clone();
-        float[] expectedState = (float[])ssmState.Clone();
-        float[] expected = Qwen35GdnPackedReference(
-            packed,
-            expectedConv,
-            expectedState,
-            convWeight,
-            dtBias,
-            aLog,
-            ssmNorm,
-            seqLen,
-            packedDim,
-            qkvDim,
-            qkDim,
-            vDim,
-            numKHeads,
-            numVHeads,
-            headKDim,
-            headVDim,
-            convKernel,
-            convWriteIdx,
-            eps);
-
-        using var allocator = new CudaAllocator();
-        using var packedFromParts = new Tensor(allocator, DType.Float32, seqLen, packedDim);
-        using var qkvTensor = new Tensor(allocator, DType.Float32, seqLen, qkvDim);
-        using var zTensor = new Tensor(allocator, DType.Float32, seqLen, vDim);
-        using var betaTensor = new Tensor(allocator, DType.Float32, seqLen, numVHeads);
-        using var alphaTensor = new Tensor(allocator, DType.Float32, seqLen, numVHeads);
-        using var convTensor = new Tensor(allocator, DType.Float32, convDim, qkvDim);
-        using var stateTensor = new Tensor(allocator, DType.Float32, numVHeads, headVDim, headKDim);
-        using var convWeightTensor = new Tensor(allocator, DType.Float32, qkvDim, convKernel);
-        using var dtBiasTensor = new Tensor(allocator, DType.Float32, numVHeads);
-        using var aLogTensor = new Tensor(allocator, DType.Float32, numVHeads);
-        using var ssmNormTensor = new Tensor(allocator, DType.Float32, headVDim);
-        using var output = new Tensor(allocator, DType.Float32, seqLen, vDim);
-
-        qkvTensor.SetElementsAsFloat(qkv);
-        zTensor.SetElementsAsFloat(z);
-        betaTensor.SetElementsAsFloat(beta);
-        alphaTensor.SetElementsAsFloat(alpha);
-        convTensor.SetElementsAsFloat(convState);
-        stateTensor.SetElementsAsFloat(ssmState);
-        convWeightTensor.SetElementsAsFloat(convWeight);
-        dtBiasTensor.SetElementsAsFloat(dtBias);
-        aLogTensor.SetElementsAsFloat(aLog);
-        ssmNormTensor.SetElementsAsFloat(ssmNorm);
-
-        Assert.True(CudaFusedOps.TryQwen35GatedDeltaNetPackInputs(
-            packedFromParts,
-            qkvTensor,
-            zTensor,
-            betaTensor,
-            alphaTensor,
-            seqLen,
-            qkvDim,
-            vDim,
-            numVHeads,
-            packedDim));
-        AssertClose(packed, packedFromParts.GetElementsAsFloat(seqLen * packedDim), 1e-6f);
-
-        Assert.True(CudaFusedOps.TryQwen35GatedDeltaNetPacked(
-            output,
-            packedFromParts,
-            convTensor,
-            stateTensor,
-            convWeightTensor,
-            dtBiasTensor,
-            aLogTensor,
-            ssmNormTensor,
-            seqLen,
-            packedDim,
-            qkvDim,
-            qkDim,
-            vDim,
-            numKHeads,
-            numVHeads,
-            headKDim,
-            headVDim,
-            convKernel,
-            convWriteIdx,
-            eps));
-
-        AssertClose(expected, output.GetElementsAsFloat(seqLen * vDim), 5e-4f);
-        AssertClose(expectedState, stateTensor.GetElementsAsFloat(expectedState.Length), 5e-4f);
-        AssertClose(expectedConv, convTensor.GetElementsAsFloat(expectedConv.Length), 1e-6f);
-    }
-
-    [CudaFact]
-    public void CudaQwen35GatedDeltaNetPacked_ProductionHeadDims_MatchesCpuReference()
-    {
-        // Production-shaped geometry (Qwen3.5-9B: headKDim = headVDim = 128).
-        // headVDim > the kernel's warp count used to route through a multi-block-
-        // per-head layout whose whole-state decay raced between blocks; this test
-        // pins the single-block kernel (with >48 KB dynamic shared) to the CPU
-        // reference at real head sizes.
-        const int seqLen = 8;
-        const int numKHeads = 2;
-        const int numVHeads = 4;
-        const int headKDim = 128;
-        const int headVDim = 128;
-        const int convKernel = 4;
-        const int convWriteIdx = 2;
-        const float eps = 1e-5f;
-
-        int qkDim = numKHeads * headKDim;
-        int vDim = numVHeads * headVDim;
-        int qkvDim = 2 * qkDim + vDim;
-        int packedDim = qkvDim + vDim + 2 * numVHeads;
-        int convDim = convKernel - 1;
-
-        float[] packed = MakePattern(seqLen * packedDim, 0.011f, -0.006f);
-        float[] convState = MakePattern(convDim * qkvDim, 0.017f, 0.004f);
-        float[] ssmState = MakePattern(numVHeads * headVDim * headKDim, 0.009f, -0.005f);
-        float[] convWeight = MakePattern(qkvDim * convKernel, 0.021f, 0.008f);
-        float[] dtBias = MakePattern(numVHeads, 0.03f, -0.01f);
-        float[] aLog = new float[numVHeads];
-        float[] ssmNorm = new float[headVDim];
-        for (int i = 0; i < numVHeads; i++)
-            aLog[i] = -0.05f - i * 0.01f;
-        for (int i = 0; i < headVDim; i++)
-            ssmNorm[i] = 0.8f + (i % 16) * 0.02f;
-
-        float[] expectedConv = (float[])convState.Clone();
-        float[] expectedState = (float[])ssmState.Clone();
-        float[] expected = Qwen35GdnPackedReference(
-            packed, expectedConv, expectedState, convWeight, dtBias, aLog, ssmNorm,
-            seqLen, packedDim, qkvDim, qkDim, vDim,
-            numKHeads, numVHeads, headKDim, headVDim,
-            convKernel, convWriteIdx, eps);
-
-        using var allocator = new CudaAllocator();
-        using var packedTensor = new Tensor(allocator, DType.Float32, seqLen, packedDim);
-        using var convTensor = new Tensor(allocator, DType.Float32, convDim, qkvDim);
-        using var stateTensor = new Tensor(allocator, DType.Float32, numVHeads, headVDim, headKDim);
-        using var convWeightTensor = new Tensor(allocator, DType.Float32, qkvDim, convKernel);
-        using var dtBiasTensor = new Tensor(allocator, DType.Float32, numVHeads);
-        using var aLogTensor = new Tensor(allocator, DType.Float32, numVHeads);
-        using var ssmNormTensor = new Tensor(allocator, DType.Float32, headVDim);
-        using var output = new Tensor(allocator, DType.Float32, seqLen, vDim);
-
-        packedTensor.SetElementsAsFloat(packed);
-        convTensor.SetElementsAsFloat(convState);
-        stateTensor.SetElementsAsFloat(ssmState);
-        convWeightTensor.SetElementsAsFloat(convWeight);
-        dtBiasTensor.SetElementsAsFloat(dtBias);
-        aLogTensor.SetElementsAsFloat(aLog);
-        ssmNormTensor.SetElementsAsFloat(ssmNorm);
-
-        Assert.True(CudaFusedOps.TryQwen35GatedDeltaNetPacked(
-            output, packedTensor, convTensor, stateTensor,
-            convWeightTensor, dtBiasTensor, aLogTensor, ssmNormTensor,
-            seqLen, packedDim, qkvDim, qkDim, vDim,
-            numKHeads, numVHeads, headKDim, headVDim,
-            convKernel, convWriteIdx, eps));
-
-        AssertClose(expected, output.GetElementsAsFloat(seqLen * vDim), 5e-4f);
-        AssertClose(expectedState, stateTensor.GetElementsAsFloat(expectedState.Length), 5e-4f);
-        AssertClose(expectedConv, convTensor.GetElementsAsFloat(expectedConv.Length), 1e-6f);
-    }
-
-    [CudaFact]
-    public void CudaFusedQKNormRopeNeox_PartialRopeDims_MatchesNormThenRopeReference()
-    {
-        // Qwen3.5 attention geometry: headDim 256, partial RoPE (ropeDim 64 < headDim),
-        // large base. The fused kernel used to derive frequencies from headDim instead
-        // of ropeDim, mis-rotating every position on partial-RoPE models.
-        const int seqLen = 3;
-        const int numHeads = 2;
-        const int headDim = 256;
-        const int ropeDim = 64;
-        const int startPos = 5;
-        const float eps = 1e-6f;
-        const float ropeBase = 10000000f;
-        const float freqScale = 1.0f;
-        int rows = seqLen * numHeads;
-
-        float[,] data = new float[rows, headDim];
-        float[] alpha = new float[headDim];
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < headDim; c++)
-                data[r, c] = MathF.Sin((r + 1) * (c + 3) * 0.013f);
-        for (int c = 0; c < headDim; c++)
-            alpha[c] = 0.9f + (c % 8) * 0.03f;
-
-        int[] positions = new int[rows];
-        for (int s = 0; s < seqLen; s++)
-            for (int h = 0; h < numHeads; h++)
-                positions[s * numHeads + h] = startPos + s;
-
-        // Reference: RMSNorm per row, then NeoX rotation of the first ropeDim dims
-        // with theta_i = pos * base^(-2i/ropeDim) * freqScale.
-        float[] expected = new float[rows * headDim];
-        for (int r = 0; r < rows; r++)
-        {
-            double sumSq = 0;
-            for (int c = 0; c < headDim; c++)
-                sumSq += (double)data[r, c] * data[r, c];
-            float invRms = 1.0f / MathF.Sqrt((float)(sumSq / headDim) + eps);
-            float[] normed = new float[headDim];
-            for (int c = 0; c < headDim; c++)
-                normed[c] = data[r, c] * invRms * alpha[c];
-
-            int half = ropeDim / 2;
-            for (int i = 0; i < half; i++)
-            {
-                float theta = positions[r] * MathF.Pow(ropeBase, -2.0f * i / ropeDim) * freqScale;
-                float c0 = MathF.Cos(theta);
-                float s0 = MathF.Sin(theta);
-                float x0 = normed[i];
-                float x1 = normed[i + half];
-                normed[i] = x0 * c0 - x1 * s0;
-                normed[i + half] = x0 * s0 + x1 * c0;
-            }
-            for (int c = 0; c < headDim; c++)
-                expected[r * headDim + c] = normed[c];
-        }
-
-        using var allocator = new CudaAllocator();
-        using var dataTensor = Tensor.FromArray(allocator, data);
-        using var alphaTensor = new Tensor(allocator, DType.Float32, headDim);
-        using var posTensor = new Tensor(allocator, DType.Int32, rows);
-        alphaTensor.SetElementsAsFloat(alpha);
-        posTensor.SetElementsAsInt(positions);
-
-        Assert.True(CudaFusedOps.TryQKNormRopeNeox(
-            dataTensor, alphaTensor, posTensor,
-            rows, headDim, ropeDim / 2, eps, ropeBase, freqScale));
-
-        AssertClose(expected, dataTensor.GetElementsAsFloat(rows * headDim), 2e-4f);
-    }
-
-    [CudaFact]
     public void CudaPrefillGraphCache_CaptureReplayAndAbort_BehaveCorrectly()
     {
         using var allocator = new CudaAllocator();
@@ -810,8 +537,7 @@ public class CudaBackendTests
     /// The decode-graph contract: a captured graph's leading node copies the
     /// PINNED host parameter block to a device block, and the position-dependent
     /// kernels re-read it there. Rewriting the pinned ints and relaunching must
-    /// therefore steer the SAME graph to a new RoPE position and a new KV write
-    /// slot. Also checks the MaxAttendLen entry expiry used by the single-block
+    /// therefore steer the SAME graph to a new KV write slot. Also checks the MaxAttendLen entry expiry used by the single-block
     /// attention route.
     /// </summary>
     [CudaFact]
@@ -825,10 +551,6 @@ public class CudaBackendTests
         Assert.True(dyn.IsValid);
 
         const int numHeads = 2, headDim = 4, cacheSize = 16;
-        using var posQ = new Tensor(allocator, DType.Int32, 8);
-        using var posK = new Tensor(allocator, DType.Int32, 4);
-        posQ.SetElementsAsInt(new int[8]);
-        posK.SetElementsAsInt(new int[4]);
 
         using var kvCache = new Tensor(allocator, DType.Float32, numHeads, cacheSize, headDim);
         Ops.Fill(kvCache, 0.0f);
@@ -837,7 +559,7 @@ public class CudaBackendTests
         src.SetElementsAsFloat(srcVals1);
         using var pinnedIn = new Tensor(allocator, DType.Float32, 1, headDim);
         pinnedIn.SetElementsAsFloat(new float[headDim]);
-        foreach (var t in new[] { posQ, posK, kvCache, src, pinnedIn })
+        foreach (var t in new[] { kvCache, src, pinnedIn })
             CudaFusedOps.TryEnsureDeviceResident(t);
 
         const string key = "dec|test";
@@ -851,7 +573,6 @@ public class CudaBackendTests
         {
             dyn.EnqueueUpload();
             dyn.Activate();
-            Assert.True(CudaFusedOps.TryFillRopePositions(posQ, posK, dyn));
             // seqLen==1 non-circular append picks up the ambient dyn pointer.
             Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(kvCache, src, 3, 1, cacheSize, false));
             CudaDecodeDynParams.Deactivate();
@@ -869,15 +590,13 @@ public class CudaBackendTests
             return vals[start..(start + headDim)];
         }
 
-        // First launch used the captured values: positions=7, write slot 3.
-        Assert.All(posQ.GetElementsAsInt(8), p => Assert.Equal(7, p));
-        Assert.All(posK.GetElementsAsInt(4), p => Assert.Equal(7, p));
+        // First launch used the captured values: write slot 3.
         float[] cacheVals = kvCache.GetElementsAsFloat(numHeads * cacheSize * headDim);
         AssertClose(new float[] { 1, 2, 3, 4 }, CacheRow(cacheVals, 0, 3), 1e-6f);
         AssertClose(new float[] { 5, 6, 7, 8 }, CacheRow(cacheVals, 1, 3), 1e-6f);
 
         // Replay with fresh pinned values and fresh source content: the same
-        // graph must write the NEW rows at the NEW slot with the NEW position.
+        // graph must write the NEW rows at the NEW slot.
         float[] srcVals2 = { 10, 20, 30, 40, 50, 60, 70, 80 };
         src.SetElementsAsFloat(srcVals2);
         CudaFusedOps.TryEnsureDeviceResident(src);
@@ -885,14 +604,9 @@ public class CudaBackendTests
         Assert.True(cache.TryGetReplayInput(key, 2, out Tensor replayInput));
         replayInput.Dispose();
         cache.Replay(key);
-        // The graph rewrote these on device; flag it like the model wrapper
-        // does (posQ/posK were not passed as keepAlive here).
-        CudaFusedOps.TryMarkDeviceModified(posQ);
-        CudaFusedOps.TryMarkDeviceModified(posK);
+        // The graph rewrote the cache on device; flag it like the model wrapper does.
         CudaFusedOps.TryMarkDeviceModified(kvCache);
 
-        Assert.All(posQ.GetElementsAsInt(8), p => Assert.Equal(9, p));
-        Assert.All(posK.GetElementsAsInt(4), p => Assert.Equal(9, p));
         cacheVals = kvCache.GetElementsAsFloat(numHeads * cacheSize * headDim);
         AssertClose(new float[] { 10, 20, 30, 40 }, CacheRow(cacheVals, 0, 5), 1e-6f);
         AssertClose(new float[] { 50, 60, 70, 80 }, CacheRow(cacheVals, 1, 5), 1e-6f);
@@ -1492,16 +1206,6 @@ public class CudaBackendTests
         using var scatterExpert = new Tensor(allocator, DType.Float32, tokens, hiddenDim);
         Assert.False(CudaFusedOps.TryMoEScatterAddWeightedRows(
             scatterOutput, scatterExpert, scatterRows, scatterWeightsOther));
-
-        using var sharedDown = new Tensor(allocator, DType.Float32, tokens, hiddenDim);
-        using var sharedInputOther = new Tensor(otherAllocator, DType.Float32, tokens, hiddenDim);
-        using var shortGate = new Tensor(allocator, DType.Float32, hiddenDim - 1);
-        Assert.False(CudaFusedOps.TryMoEAddSharedExpertBatched(
-            scatterOutput, sharedDown, sharedInputOther));
-        Assert.False(CudaFusedOps.TryMoEAddSharedExpertBatched(
-            scatterOutput, sharedDown, scatterExpert, shortGate));
-        Assert.False(CudaFusedOps.TryMoEAddSharedExpertBatched(
-            scatterOutput, sharedDown, nonContiguousExpert));
     }
 
     [CudaTheory]
@@ -5081,145 +4785,6 @@ public class CudaBackendTests
         }
 
         return input;
-    }
-
-    private static float[] Qwen35GdnPackedReference(
-        float[] packed,
-        float[] convState,
-        float[] ssmState,
-        float[] convWeight,
-        float[] dtBias,
-        float[] aLog,
-        float[] ssmNorm,
-        int seqLen,
-        int packedDim,
-        int qkvDim,
-        int qkDim,
-        int vDim,
-        int numKHeads,
-        int numVHeads,
-        int headKDim,
-        int headVDim,
-        int convKernel,
-        int convWriteIdx,
-        float eps)
-    {
-        int convDim = convKernel - 1;
-        int zDim = vDim;
-        float[] output = new float[seqLen * vDim];
-        float[] convOut = new float[qkvDim];
-        float[] q = new float[numVHeads * headKDim];
-        float[] k = new float[numVHeads * headKDim];
-        float[] core = new float[headVDim];
-        int writeIdx = convWriteIdx;
-
-        for (int s = 0; s < seqLen; s++)
-        {
-            int packedBase = s * packedDim;
-            for (int ch = 0; ch < qkvDim; ch++)
-            {
-                float acc = 0;
-                for (int ki = 0; ki < convKernel; ki++)
-                {
-                    float x;
-                    if (ki < convDim)
-                    {
-                        int slot = (writeIdx + ki) % convDim;
-                        x = convState[slot * qkvDim + ch];
-                    }
-                    else
-                    {
-                        x = packed[packedBase + ch];
-                    }
-                    acc += x * convWeight[ch * convKernel + ki];
-                }
-                convOut[ch] = Silu(acc);
-            }
-
-            if (convDim > 0)
-            {
-                Array.Copy(packed, packedBase, convState, writeIdx * qkvDim, qkvDim);
-                writeIdx = (writeIdx + 1) % convDim;
-            }
-
-            for (int h = 0; h < numVHeads; h++)
-            {
-                int srcHead = h % numKHeads;
-                Array.Copy(convOut, srcHead * headKDim, q, h * headKDim, headKDim);
-                Array.Copy(convOut, qkDim + srcHead * headKDim, k, h * headKDim, headKDim);
-            }
-
-            for (int h = 0; h < numVHeads; h++)
-            {
-                float qSum = 0;
-                float kSum = 0;
-                int headBase = h * headKDim;
-                for (int d = 0; d < headKDim; d++)
-                {
-                    qSum += q[headBase + d] * q[headBase + d];
-                    kSum += k[headBase + d] * k[headBase + d];
-                }
-
-                float qScale = 1.0f / MathF.Sqrt(qSum + eps) / MathF.Sqrt(headVDim);
-                float kScale = 1.0f / MathF.Sqrt(kSum + eps);
-                for (int d = 0; d < headKDim; d++)
-                {
-                    q[headBase + d] *= qScale;
-                    k[headBase + d] *= kScale;
-                }
-            }
-
-            for (int h = 0; h < numVHeads; h++)
-            {
-                int qkBase = h * headKDim;
-                int vBase = 2 * qkDim + h * headVDim;
-                int zBase = qkvDim + h * headVDim;
-                int stateHeadBase = h * headVDim * headKDim;
-                float gate = Softplus(packed[packedBase + qkvDim + zDim + numVHeads + h] + dtBias[h]) * aLog[h];
-                float stateScale = MathF.Exp(gate);
-                float beta = Sigmoid(packed[packedBase + qkvDim + zDim + h]);
-
-                for (int i = 0; i < headVDim * headKDim; i++)
-                    ssmState[stateHeadBase + i] *= stateScale;
-
-                for (int row = 0; row < headVDim; row++)
-                {
-                    int stateRow = stateHeadBase + row * headKDim;
-                    float kvMem = 0;
-                    for (int d = 0; d < headKDim; d++)
-                        kvMem += ssmState[stateRow + d] * k[qkBase + d];
-                    float delta = (convOut[vBase + row] - kvMem) * beta;
-                    for (int d = 0; d < headKDim; d++)
-                        ssmState[stateRow + d] += k[qkBase + d] * delta;
-
-                    float coreValue = 0;
-                    for (int d = 0; d < headKDim; d++)
-                        coreValue += ssmState[stateRow + d] * q[qkBase + d];
-                    core[row] = coreValue;
-                }
-
-                float sumSq = 0;
-                for (int row = 0; row < headVDim; row++)
-                    sumSq += core[row] * core[row];
-                float rmsInv = 1.0f / MathF.Sqrt(sumSq / headVDim + eps);
-
-                for (int row = 0; row < headVDim; row++)
-                {
-                    output[s * vDim + h * headVDim + row] =
-                        core[row] * rmsInv * ssmNorm[row] * Silu(packed[packedBase + zBase + row]);
-                }
-            }
-        }
-
-        return output;
-    }
-
-    private static float[] MakePattern(int length, float scale, float offset)
-    {
-        float[] values = new float[length];
-        for (int i = 0; i < length; i++)
-            values[i] = offset + MathF.Sin(i * 0.37f) * scale + MathF.Cos(i * 0.13f) * (scale * 0.5f);
-        return values;
     }
 
     private static float Silu(float x) => x / (1.0f + MathF.Exp(-x));

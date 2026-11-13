@@ -896,7 +896,6 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H：物化 prefill 回退路径在改为按 query 子块计算前允许构建的最大注意力得分张量（MiB，默认 1024）。GGML 融合 prefill kernel（F32 / F16 cache）不受此预算约束，得分张量较大时会切换到 flash attention。 |
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H：缓存的原生 Mamba2 prefill 计算图可占用的设备内存（MiB，按最近最少使用淘汰，默认 1024）。大于预算的计算图只服务当次调用，随后释放。 |
 | `TS_MLX_MLOCK_GGUF` | 默认 `1`，通过 `mlock(2)` 把 GGUF mmap 区域钉在物理内存，避免前向之间被换出。设为 `0` 关闭（适用于进程 `memlock` rlimit 太低、或希望让 OS 自行管理分页的情况）。仅 MLX 后端。 |
-| `TS_MLX_BATCHED_MOE_DECODE` | 默认 `1`，将 Qwen 3.5/3.6 MoE 解码时每专家的 K 次 dispatch 合并为每种（gate / up / down）一次批处理 dispatch。在显存紧张的机器上可设为 `0` 关闭（可节省堆叠权重 slab 带来的近一倍权重显存占用）。 |
 | `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | 覆盖 MLX 分配器硬上限 / 空闲缓冲池上限 / wired 缓冲上限（兆字节）。分配器上限和 wired 上限默认为内存的 70%，并至少给 macOS 留出 min(8 GiB, 内存的四分之一)：wired 内存不会被换出，上限接近内存总量时 Mac 会卡死而不是让分配失败。空闲缓冲池上限默认 2048。 |
 | `TS_MLX_EVAL_EVERY_N_LAYERS` | 解码时定期触发 `mlx_async_eval` 的层间隔，用于让 GPU 计算和宿主端排队重叠。每个 MLX 模型有自己的默认值（Gemma 4 与 Muse-Glimmer 每 4 层，Qwen 3.5 与 Nemotron-H 每 16 层）；该变量为所有模型统一设置。支持处可设为 `0` 关闭。 |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | 覆盖 `--backend mlx` 时 `libmlxc` 的搜索路径。 |
@@ -1782,7 +1781,6 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 | `TS_GGML_F32_RESIDENT=0` | 每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | 仅 Gemma 4：从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径。融合路径在 26B 上加载时会物化约 10.5 GB 的专家分片（约 36 秒），换来约 10× 的 decode。被 `--n-cpu-moe` 卸载的层不参与这次物化——它们从不在加速器上运行——因此 `--cpu-moe` 也会去掉这笔加载开销 |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | ggml-cuda 集合通信在多大载荷以上把 F32 转成 BF16 再归约。TensorSharp 把 ggml 的默认值（1 字节，即总是转换）提高到 1 MB，使 decode 规模的集合通信精确归约；设为 `0` 则完全禁用转换 |
-| `TS_QWEN35_LAYER_TRACE=1` | 打印首次前向的逐层残差流摘要，单卡与 TP 两条路径都会输出（诊断用） |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`，直接透传给 ggml |
 
 ### 约束
@@ -1907,7 +1905,6 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | DFlash 投机 prefill 分块 | `1024`（受草稿器环形缓冲与主干窗口限制） | `TS_DFLASH_PREFILL_CHUNK` | — |
 | DFlash2 候选选择器 | 检查点带有时开启 | `TS_DFLASH_SELECTOR=0` 改为按逐位置 argmax 起草（仅用于归因分析） | — |
 | DFlash2 分组卷积 | 检查点带有时开启 | `TS_DFLASH_CONV=0` 去掉它（同上，仅用于归因分析） | — |
-| Qwen 3.5/3.8 递归状态快照 | 开启 | `TS_Q35_VERIFY_SNAPSHOTS=0` 回退为先恢复验证前的状态副本、再对已接受前缀重新前向（更慢；见 [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md)） | — |
 | Gemma 4 融合验证 / 草稿内核（ggml） | 开启 | — | — |
 | Gemma 4 部分接受时的稠密快速回滚 | 开启 | — | — |
 
@@ -2023,7 +2020,6 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | MLX 流水化贪心 decode（仅 CLI `--benchmark`） | 满足条件时启用 | — | — |
 | 使用 `mlock(2)` 钉住 GGUF mmap，使权重常驻 | 启用 | `TS_MLX_MLOCK_GGUF=0` 关闭 | — |
 | MLX 融合多维 KV 写入（每个 cache block 单次 `slice_update`） | 启用 | — | — |
-| MLX 批处理 MoE 解码（Qwen 3.5/3.6 MoE） | 启用 | `TS_MLX_BATCHED_MOE_DECODE=0` 走按专家路径（不保留堆叠副本） | — |
 | MLX MoE gate+up+SiLUMul 融合 Metal kernel | 启用 | — | — |
 | MLX 设备端 MoE router top-K + softmax | 满足条件时启用 | — | — |
 | MLX 解码层边界 `async_eval` 间隔 | Gemma 4 / Muse-Glimmer：每 4 层；Qwen / Nemotron：每 16 层 | `TS_MLX_EVAL_EVERY_N_LAYERS=N`（支持处 `0` = 关闭） | — |

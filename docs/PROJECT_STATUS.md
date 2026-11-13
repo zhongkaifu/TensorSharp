@@ -364,8 +364,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
     Qwen 3.5 and Gemma 4 switches that turned a default path off
     (`TS_QWEN35_FULL_DECODE`, `TS_QWEN35_FUSED_VERIFY`, `TS_QWEN35_TP_FUSED*`,
     `TS_G4_*`, `TS_GMTP_NO_*` and the rest). `TS_QWEN35_HOST_MOE_VERIFY` is now
-    `TS_HOST_MOE_VERIFY`. `TS_Q35_VERIFY_SNAPSHOTS=0` stays: it is the workaround
-    for the open wide-verify divergence on `ggml_cuda`;
+    `TS_HOST_MOE_VERIFY`. `TS_Q35_VERIFY_SNAPSHOTS=0` stayed, as the workaround
+    for the wide-verify divergence on `ggml_cuda`, until `Qwen35Model` itself was removed (2026-11);
   - two never-default experiments: Qwen 3.5's device-resident verify state
     (`TS_QWEN35_VERIFY_RESIDENT`, known wrong) and Gemma 4's batched paged
     speculative trunk (`TS_GMTP_BATCHED_TRUNK`, about half the speed of the fused

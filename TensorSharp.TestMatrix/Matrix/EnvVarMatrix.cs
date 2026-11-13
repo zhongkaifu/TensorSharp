@@ -123,16 +123,7 @@ public static class EnvVarMatrix
             DefaultValue: "(arch default)",
             Notes: "Max image tiles for Nemotron-H Omni.",
             AppliesTo: (m, b, f) => m.Family.StartsWith("nemotron", StringComparison.OrdinalIgnoreCase)
-                                    && f.Kind == FeatureKind.Image),
-
-        // MLX
-        new(
-            Name: "TS_MLX_BATCHED_MOE_DECODE",
-            Category: "MLX",
-            Values: BoolValues,
-            DefaultValue: "1",
-            Notes: "Batched MoE decode on MLX (Qwen 3.5 / 3.6): one dispatch per projection over the stacked experts. 0 runs the per-expert sequence, which avoids the stacked copy on memory-constrained machines.",
-            AppliesTo: (m, b, f) => b.Id == "mlx" && m.Family.StartsWith("qwen35", StringComparison.OrdinalIgnoreCase)),
+                                    && f.Kind == FeatureKind.Image)
     };
 
     public static EnvVarSpec? FindByName(string name)

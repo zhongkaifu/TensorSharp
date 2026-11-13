@@ -376,11 +376,8 @@ TensorSharp/
 │   ├── ggml_ops_flash_attn_guard.cpp      # Flash attention；后端对该形状没有 kernel 时改为显式注意力并警告一次
 │   ├── ggml_ops_transformer.cpp           # 独立的 flash-attention decode 内核（`TSGgml_FlashAttnDecodeF32`）
 │   ├── ggml_ops_transformer_common.h      # 共享的 Transformer 辅助函数与 C# 层描述符结构体
-│   ├── ggml_ops_transformer_prefill.cpp   # 融合层 prefill（Gemma 4、GPT-OSS、Qwen 3.5）
-│   ├── ggml_ops_qwen35_decode.cpp         # Qwen 3.5/3.6 融合 decode（单层、整模型、批量）
-│   ├── ggml_ops_qwen35_verify.cpp         # Qwen 3.5/3.6 融合多 token verify
+│   ├── ggml_ops_transformer_prefill.cpp   # 融合层 prefill（Gemma 4、GPT-OSS）
 │   ├── ggml_ops_qwen35_gdn_tp.cpp         # Qwen 3.5/3.6 按 rank 的打包 GatedDeltaNet 内核（张量并行）
-│   ├── ggml_ops_qwen35_recurrent_prefill.cpp # Qwen 3.5/3.6 递归层 prefill
 │   ├── ggml_ops_qwen4exp*.cpp             # Qwen 3.8 Flash Next（`qwen4exp`）：融合的块级与 token 区间计算图及按序列的状态快照、按 token 批量 decode 的槽位稳定 arena，以及共享 MTP 头
 │   ├── ggml_ops_gptoss_decode.cpp         # GPT OSS 整模型 decode 计算图（每 token 一次调度，共享 KV 窗口）
 │   ├── ggml_ops_gptoss_prefill.cpp        # GPT OSS 整模型 prefill：N 个 token 走完全部注意力 + MoE 层，连同折叠的最终 norm 与 LM head 合为一张图

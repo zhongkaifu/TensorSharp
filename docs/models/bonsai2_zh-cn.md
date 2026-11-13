@@ -179,7 +179,6 @@ CUDA、Vulkan、iOS 与张量并行的模型执行均未验证。
 | 3,609 token | Prefill（毫秒） | 11,512-11,533 | 11,592-11,636 |
 | 3,609 token | Decode，109 token（token/秒） | 26.1 | 26.2 |
 
-合成的 PRISM 检查点（旋转后的 PQ2_0 投影、输出头与嵌入，以及分组的 value 头）在
-`Qwen35RuntimeTests.PrismRotationsMatchQwen35Model` 中比较两条路径的 logits：`ggml_metal` 上最多相差
-1.1e-5，`ggml_cpu` 上 2.0e-2（其激活经 BF16 舍入）；若省略旋转，第一行相差 1.2。该测试在 `ggml_cuda`
-（RTX 2000 Ada）上同样通过；真实检查点尚未在 CUDA 上运行。
+合成的 PRISM 检查点（旋转后的 PQ2_0 投影、输出头与嵌入，以及分组的 value 头）比较过两条路径的 logits：`ggml_metal` 上最多相差
+1.1e-5，`ggml_cpu` 上 2.0e-2（其激活经 BF16 舍入）；若省略旋转，第一行相差 1.2。`Qwen35RuntimeTests.PrismRotationsMatchTheFamilyGolden`
+让运行时保持在被删实现 `ggml_cpu` 输出的这一舍入范围内（`ggml_cuda` 上 2.52e-2，RTX A5000，其激活同样经过舍入）；真实检查点尚未在 CUDA 上运行。

@@ -319,7 +319,6 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --host 127.0.0.1 
       <tr><td><code>MAX_CONTEXT</code></td><td>硬性的上下文上限。不设时，自报的上下文只是<em>上界</em>：权重加载完之后引擎会去问各设备实际还剩多少显存，按「缓存加一整个 <code>n_ubatch</code> 计算图」能装下的大小定上下文，并打印它的选择（GLM-5.2 在 3× RTX PRO 6000 上：按层切分 342,272 token，<code>--tp 3</code> 91,136，<code>--n-cpu-moe 30</code> 646,400）。设了它，放得下就照办，放不下会带着数字直接报错，而不会被悄悄缩小。</td></tr>
       <tr><td><code>TS_PDF_MAX_PAGES</code></td><td>上传 PDF 时读取的页数上限，文本提取与页面图像渲染均遵循（默认：<code>0</code> = 全部页面；CLI <code>--pdf</code> 同样遵循）。</td></tr>
       <tr><td><code>VIDEO_SAMPLE_FPS</code> / <code>VIDEO_MAX_FRAMES</code></td><td>每秒视频采样的帧数 / 可选的抽帧上限。</td></tr>
-      <tr><td><code>TS_FUSED_QKNORM_ROPE</code></td><td>Direct <code>cuda</code> 后端上 Qwen 3.5/3.6 文本 prefill 的融合 QK-Norm + RoPE CUDA 内核（默认开启；<code>0</code> 关闭）。</td></tr>
       <tr><td><code>TENSORSHARP_TEMPERATURE</code>、<code>…_TOP_K</code>、<code>…_TOP_P</code>、<code>…_MIN_P</code></td><td>当参数与请求体都未设置时的默认采样值。</td></tr>
       <tr><td><code>TENSORSHARP_REPEAT_PENALTY</code>、<code>…_REPEAT_LAST_N</code>、<code>…_PRESENCE_PENALTY</code>、<code>…_FREQUENCY_PENALTY</code>、<code>…_SEED</code></td><td>默认惩罚、惩罚窗口与随机种子。</td></tr>
       <tr><td><code>TENSORSHARP_LOG_LEVEL</code> / <code>…_LOG_DIR</code> / <code>…_LOG_FILE</code></td><td>日志级别、目录与文件开关 —— 这是配置服务端日志的唯一方式，服务端没有 <code>--log-*</code> 参数（CLI 也会遵循它们，作为自身参数的默认值）。</td></tr>

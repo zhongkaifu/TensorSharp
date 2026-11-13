@@ -45,6 +45,26 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     /// <summary>The family ids in <see cref="Families"/>.</summary>
     public static readonly string[] FamilyIds = { "mistral3", "hunyuan-dense" };
 
+    /// <summary>Shared-runtime families the script here cannot drive, with the suite that proves the
+    /// same mechanisms on the family's own synthetic fixtures. A recurrent stack rewinds only to its
+    /// length or to zero, so the script's truncate-and-refill step does not apply to Qwen 3.5.</summary>
+    public static readonly IReadOnlyDictionary<string, Type> DedicatedSuites = new Dictionary<string, Type>(StringComparer.Ordinal)
+    {
+        ["qwen35"] = typeof(Qwen35RuntimeTests),
+    };
+
+    /// <summary>The tests a dedicated suite declares: one per mechanism the runtime claims.</summary>
+    public static readonly string[] MechanismTests =
+    {
+        nameof(PlacementMatchesOneDevice),                 // tensor parallelism, whole-layer stages, their hybrid
+        nameof(SlotBatchesMatchEachSequenceAlone),         // batched slots in every placement
+        "ConcurrentRequestsAreBatched",                    // continuous batching in every placement
+        "HostExpertsMatchDeviceExperts",                   // routed experts on the host
+        nameof(CheckpointsContinueExactly),
+        nameof(SpeculativeDecodingMatchesPlainGreedy),
+        nameof(WholeForwardGraphMatchesThePerOpPath),
+    };
+
     /// <summary>(tensor parallel, stages) placements: TP, local layer split (even and uneven
     /// stage sizes), and the hybrid.</summary>
     public static TheoryData<string, int, int> Placements()

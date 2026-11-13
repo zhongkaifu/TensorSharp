@@ -332,15 +332,11 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_transformer_prefill.cpp
     ggml_ops_gptoss_decode.cpp
     ggml_ops_gptoss_batched.cpp
-    ggml_ops_qwen35_batched_arena.cpp
-    ggml_ops_qwen35_batched_verify.cpp
     ggml_ops_qwen4exp.cpp
     ggml_ops_qwen4exp_reduce.cpp
     ggml_ops_qwen4exp_mtp.cpp
     ggml_ops_qwen4exp_arena.cpp
     ggml_ops_gptoss_prefill.cpp
-    ggml_ops_qwen35_decode.cpp
-    ggml_ops_qwen35_verify.cpp
     ggml_ops_gemma4_decode.cpp
     ggml_ops_gemma4_batched.cpp
     ggml_ops_gemma4_verify.cpp
@@ -357,7 +353,6 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_wan.cpp
     ggml_ops_minimax_h3.cpp
     ggml_ops_gated_delta_net.cpp
-    ggml_ops_qwen35_recurrent_prefill.cpp
     ggml_ops_qwen35_gdn_tp.cpp
     ggml_ops_mamba2.cpp
     ggml_ops_moe.cpp
@@ -1413,10 +1408,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     foreach(TSG_PDL_CASE IN ITEMS unset 0 1 unaffected)
         add_test(NAME cuda-launch-policy-${TSG_PDL_CASE} COMMAND GgmlOpsCudaLaunchPolicyTest ${TSG_PDL_CASE})
     endforeach()
-    add_executable(GgmlOpsQwen35ArenaScaleTest tests/qwen35_arena_scale_test.cpp)
-    target_include_directories(GgmlOpsQwen35ArenaScaleTest PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
-    target_link_libraries(GgmlOpsQwen35ArenaScaleTest PRIVATE GgmlOps ggml-base)
+    add_executable(GgmlOpsCudaLaunchPolicyDeviceTest tests/cuda_launch_policy_device_test.cpp)
+    target_link_libraries(GgmlOpsCudaLaunchPolicyDeviceTest PRIVATE GgmlOps)
     add_executable(GgmlOpsDeviceCopyRangesTest tests/device_copy_ranges_test.cpp)
     target_link_libraries(GgmlOpsDeviceCopyRangesTest PRIVATE GgmlOps)
     foreach(TSG_DEVCOPY_BACKEND IN ITEMS cpu cuda metal)
@@ -1452,18 +1445,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(dspine-draft-${TSG_DSPINE_BACKEND} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 RUN_SERIAL TRUE)
     endforeach()
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
-        add_test(NAME qwen35-arena-sidecar-scales-cuda COMMAND GgmlOpsQwen35ArenaScaleTest cuda default)
-        set_tests_properties(qwen35-arena-sidecar-scales-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
         foreach(TSG_PDL_VALUE IN ITEMS 0 1)
-            add_test(NAME cuda-launch-policy-device-${TSG_PDL_VALUE} COMMAND GgmlOpsQwen35ArenaScaleTest cuda pdl${TSG_PDL_VALUE})
+            add_test(NAME cuda-launch-policy-device-${TSG_PDL_VALUE} COMMAND GgmlOpsCudaLaunchPolicyDeviceTest pdl${TSG_PDL_VALUE})
             set_tests_properties(cuda-launch-policy-device-${TSG_PDL_VALUE} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 RUN_SERIAL TRUE)
         endforeach()
         add_test(NAME dflash-sidecar-scales-cuda COMMAND GgmlOpsDFlashScaleTest cuda)
         set_tests_properties(dflash-sidecar-scales-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
     endif()
     if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
-        add_test(NAME qwen35-arena-sidecar-scales-metal COMMAND GgmlOpsQwen35ArenaScaleTest metal)
-        set_tests_properties(qwen35-arena-sidecar-scales-metal PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
         add_test(NAME dflash-sidecar-scales-metal COMMAND GgmlOpsDFlashScaleTest metal)
         set_tests_properties(dflash-sidecar-scales-metal PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
     endif()

@@ -70,7 +70,7 @@ public sealed class Bonsai2ConstructionFailureTests
 
     private sealed record Snapshot(CapturingModel Model, QuantizedWeight[] Weights, IntPtr[] Keys);
 
-    private sealed class CapturingModel : Qwen35Model
+    private sealed class CapturingModel : Qwen35RuntimeModel
     {
         internal static Snapshot? Last;
         internal int VirtualDisposeCalls;

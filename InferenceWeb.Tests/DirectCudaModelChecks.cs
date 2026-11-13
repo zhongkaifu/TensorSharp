@@ -67,29 +67,6 @@ internal static class DirectCudaModelChecks
         return logits;
     }
 
-    public sealed record GdnRingState(int Ring, int[] Phases);
-
-    /// <summary>
-    /// A Qwen3.5 model's Gated DeltaNet conv ring bookkeeping (the private host write index of each
-    /// recurrent layer, and the ring size conv_kernel - 1), read by reflection; null for other
-    /// models. On direct CUDA every path that writes the device ring advances the index by the
-    /// tokens it wrote (TryRunCudaNativeGdnPacked, the decode/prefill graph replays), so after a
-    /// reset and N tokens every layer's phase is N mod ring.
-    /// </summary>
-    public static GdnRingState GdnRingPhases(ModelBase model)
-    {
-        if (model is not Qwen35Model)
-            return null;
-        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
-        Type type = typeof(Qwen35Model);
-        var phases = (int[])type.GetField("_convStateWriteIdx", flags)?.GetValue(model);
-        var recurrent = (bool[])type.GetField("_isRecurrent", flags)?.GetValue(model);
-        object kernel = type.GetField("_convKernel", flags)?.GetValue(model);
-        if (phases == null || recurrent == null || kernel is not int convKernel || convKernel <= 1)
-            throw new InvalidOperationException("Qwen35Model's GDN ring fields (_convStateWriteIdx, _isRecurrent, _convKernel) were renamed: update GdnRingPhases");
-        return new GdnRingState(convKernel - 1, phases.Where((_, layer) => recurrent[layer]).ToArray());
-    }
-
     public sealed record SnapshotResult(int BlockBytes, float[][] Straight, float[][] Restored);
 
     /// <summary>
@@ -211,8 +188,10 @@ internal static class DirectCudaModelChecks
     /// </summary>
     public static List<float[]>[] BatchedTrajectories(ModelBase model, int[][] prompts, int[][] forced)
     {
-        const int blockSize = 16;
         var batched = (IBatchedPagedModel)model;
+        if (!batched.BatchedForwardAvailable && batched.SupportsPerSequenceFusedForward)
+            return SlotTrajectories(batched, prompts, forced);
+        const int blockSize = 16;
         var pool = new BlockPool(numBlocks: 256, blockSize: blockSize, blockByteSize: 1);
         var sequences = new SequenceState[prompts.Length];
         var rows = new List<float[]>[prompts.Length];
@@ -286,6 +265,39 @@ internal static class DirectCudaModelChecks
             }
         }
         return rows;
+    }
+
+    /// <summary><see cref="BatchedTrajectories"/> on a model that serves concurrent requests from per-request slots
+    /// (the shared decoder runtime): each prompt binds a fresh request's slot, the prompts prefill in one batched step and
+    /// decode teacher-forced in batched steps, and the requests are released at the end, so the next call's requests
+    /// take freed slots (a new request must start from zero state).</summary>
+    private static List<float[]>[] SlotTrajectories(IBatchedPagedModel slots, int[][] prompts, int[][] forced)
+    {
+        string[] ids = prompts.Select((_, s) => $"fb-{s}-{Guid.NewGuid():N}").ToArray();
+        var rows = prompts.Select(_ => new List<float[]>()).ToArray();
+        try
+        {
+            foreach (string id in ids)
+                if (!slots.BindSequenceCache(id)) throw new InvalidOperationException($"{id} did not get a fresh slot");
+            var logits = new float[ids.Length][];
+            if (!slots.TryForwardBatchedFusedPrefill(ids, prompts, new int[ids.Length], logits))
+                throw new InvalidOperationException("the batched prefill was declined");
+            for (int s = 0; s < ids.Length; s++) rows[s].Add((float[])logits[s].Clone());
+            int steps = forced.Min(f => f.Length);
+            for (int step = 0; step < steps; step++)
+            {
+                int[] tokens = forced.Select(f => f[step]).ToArray();
+                int[] positions = prompts.Select(p => p.Length + step).ToArray();
+                if (!slots.TryForwardBatchedFusedDecode(ids, tokens, positions, logits))
+                    throw new InvalidOperationException($"the batched decode was declined at step {step}");
+                for (int s = 0; s < ids.Length; s++) rows[s].Add((float[])logits[s].Clone());
+            }
+            return rows;
+        }
+        finally
+        {
+            foreach (string id in ids) slots.OnSequenceReleased(id);
+        }
     }
 
     /// <summary>Teacher-forced logits for <paramref name="prompt"/> followed by the first

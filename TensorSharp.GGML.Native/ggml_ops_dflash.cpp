@@ -1687,7 +1687,7 @@ static int df_draft_block(
 // ---------------------------------------------------------------------------
 // PASS C for SEVERAL sequences at once: one graph drafts a block for each of
 // n_lanes sequences, each attending to its own ring. The batched speculative
-// verify (ggml_ops_qwen35_batched_verify.cpp) serves every decoding request in
+// verify (the shared decoder runtime's verify windows) serves every decoding request in
 // one trunk forward; drafting those requests one graph at a time then cost
 // 2.7 ms per request per step - 10.8 of a 37 ms four-request step - mostly the
 // drafter's and LM head's weight sweep repeated per request. Here projections,

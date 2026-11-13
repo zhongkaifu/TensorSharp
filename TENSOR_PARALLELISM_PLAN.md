@@ -285,7 +285,6 @@ TensorSharp.Cli --model m.gguf --backend ggml_cuda --tp 2 \
 | `TS_GGML_TP_PARALLEL=0` | Sequential rank dispatch (diagnostic) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of device-resident (diagnostic) |
-| `TS_QWEN35_LAYER_TRACE=1` | Per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none` — passed through to ggml |
 
 ### Measured results

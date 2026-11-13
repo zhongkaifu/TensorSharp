@@ -15,7 +15,6 @@
     <Compile Remove="Fixtures/PdfProcessFixture/**/*.cs" />
     <ProjectReference Include="Fixtures/PdfProcessFixture/PdfProcessFixture.csproj" ReferenceOutputAssembly="false" />
     <Compile Include="../eng/validation/Gemma4BatchedCacheProbe/Gemma4CacheProbe.cs" Link="Validation/Gemma4CacheProbe.cs" />
-    <Compile Include="../eng/validation/Qwen35BatchedDecodeProbe/Qwen35DecodeProbe.cs" Link="Validation/Qwen35DecodeProbe.cs" />
     <Compile Include="../eng/validation/NinferA16ScheduleReference.cs" Link="Validation/NinferA16ScheduleReference.cs" />
     <Compile Include="../eng/validation/ValidationSha256.cs" Link="Validation/ValidationSha256.cs" />
   </ItemGroup>
@@ -35,6 +34,7 @@
     <EmbeddedResource Include="Fixtures/MuseGlimmer/chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/MuseSpark/chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/Qwen35/chat_template.jinja" />
+    <EmbeddedResource Include="Fixtures/Qwen35Legacy/*.json" />
     <EmbeddedResource Include="Fixtures/Qwen35/pi_tool_loop.transformers.txt" />
     <EmbeddedResource Include="Fixtures/MuseSpark/unsloth_chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/MuseSpark/jinja_reference.json" />

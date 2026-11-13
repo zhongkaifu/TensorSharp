@@ -35,7 +35,6 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(Mistral3Model))]
     [InlineData(typeof(MuseGlimmerModel))]
     [InlineData(typeof(NemotronModel))]
-    [InlineData(typeof(Qwen35Model))]
     [InlineData(typeof(Qwen4ExpModel))]
     public void EveryEngineServedFamily_EnablesTreeWithoutAdvertisingUnavailableEndStates(Type family)
     {
@@ -89,13 +88,12 @@ public sealed class PrefixCacheFamilyCoverageTests
         Assert.Equal(
             new[] { "DeepSeek41Model", "DeepSeek4Model", "Gemma4Model", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
                     "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerModel", "MuseSparkModel", "NemotronModel", "Qwen35CudaModel",
-                    "Qwen35Model", "Qwen35RuntimeModel", "Qwen4ExpCudaModel", "Qwen4ExpModel", "Qwen4ExpRuntimeModel" },
+                    "Qwen35RuntimeModel", "Qwen4ExpCudaModel", "Qwen4ExpModel", "Qwen4ExpRuntimeModel" },
             engineServed.Select(t => t.Name).ToArray());
     }
 
     [Theory]
     [InlineData(typeof(Gemma4Model))]
-    [InlineData(typeof(Qwen35Model))]
     [InlineData(typeof(Qwen4ExpModel))]
     [InlineData(typeof(DeepSeek4Model))]
     [InlineData(typeof(GptOssModel))]

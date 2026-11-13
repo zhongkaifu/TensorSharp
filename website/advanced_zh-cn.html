@@ -133,7 +133,6 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model DeepSeek-
     <li><strong>调度器自动 N=1 快路径</strong> —— 只有一个序列被调度时，服务器会自动使用 Gemma 4 的融合逐序列 forward，避免完全批处理路径的固定开销。</li>
     <li><strong>分块 prefill</strong>（Gemma 4）—— 长提示被切成有界块，避免滑动窗口层产生 O(n²) 的注意力分数张量。独占请求使用 <code>TS_SCHED_SOLO_PREFILL_CHUNK</code>（默认 8192）；混合 prefill+decode 步使用 <code>TS_SCHED_PREFILL_CHUNK</code>（默认 256），仅 prefill 时则公平用满设备 token 预算。</li>
     <li><strong>融合 Qwen 3.5/3.6 注意力与 FFN</strong> —— 单图融合注意力层 decode、融合 prefill 注意力、融合 out-proj + FFN，以及融合视觉编码器块（约 15 op → 2）。CUDA 与 Metal 的并发 decode 会共享一张槽位稳定的 token 批处理图，不再为每个请求分别扫描一次权重。</li>
-    <li><strong>融合 QK-Norm + RoPE</strong>（Qwen 3.5/3.6，direct CUDA）—— <code>cuda</code> 后端在纯文本 prefill 路径用单个 CUDA kernel 完成 QK-Norm 与 NeoX RoPE。默认开启；用 <code>TS_FUSED_QKNORM_ROPE=0</code> 禁用。</li>
     <li><strong>原生量化计算</strong> —— Q4_K_M、Q6_K、Q8_0、IQ2_XXS、MXFP4 直接用于 matmul 而不展开为 FP32；批量 <code>AddmmQuantBatch</code> 在一次分派中处理多个子权重 matmul。</li>
     <li><strong>批量 GPU MoE</strong> —— 所有被选专家（加上可选的共享专家与残差相加）在每个 MoE 层折叠为一次 GGML 图分派。</li>
     <li><strong>KV 缓存前缀复用</strong> —— 多轮对话复用最长匹配 token 前缀；滑动窗口模型按窗口大小回退截断。</li>

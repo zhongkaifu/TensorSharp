@@ -78,22 +78,13 @@ namespace ggml_pool
 // ---------------------------------------------------------------------------
 // Internal shared types, globals, and helpers
 // ---------------------------------------------------------------------------
-// Qwen3.5 arena batched-decode coherence hooks (ggml_ops_qwen35_batched_arena.cpp).
+// qwen4exp arena batched-decode coherence hooks (ggml_ops_qwen4exp_arena.cpp).
 // on_external_touch: a non-arena path is about to use this host cache/state
 // pointer — flush the arena slot's rows/state to the host bytes, invalidate the
 // resident copies, and retire the slot (no-op for unregistered pointers).
 // on_drop: the host bytes were rewritten/freed — discard without flushing.
-namespace tsg_q35arena
-{
-    void on_external_touch(const void* host_ptr);
-    void on_drop(const void* host_ptr);
-    void on_drop_all();
-}
-
-// qwen4exp arena batched-decode coherence hooks (ggml_ops_qwen4exp_arena.cpp).
-// Same contract as tsg_q35arena, plus a per-device sweep: the qwen4exp pools
-// are per-rank, and the touch/drop caller does not always know which rank a
-// holder's slot lives on.
+// The pools are per-rank, and the touch/drop caller does not always know which
+// rank a holder's slot lives on, so both sweep every device.
 namespace tsg_q4earena
 {
     void on_external_touch(const void* host_ptr);

@@ -642,7 +642,7 @@ image.
 
 ### Qwen 3.5 / 3.6 family
 
-All Qwen 3.5/3.6-family variants (`qwen35`, `qwen35moe`, and `qwen3next`) load through the same `Qwen35Model` implementation. Image inputs are supported via the dynamic-resolution `Qwen35VisionEncoder`; pass the selected repository's projector explicitly (for the 9B and Qwen 3.6 examples, `mmproj-F16.gguf`; Bonsai2 27B has its own `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `-Q8_0.gguf`). The MoE variants (e.g. Qwen3.5-35B-A3B and Qwen3.6-35B-A3B GGUFs that report the same architecture keys) additionally enable a fused `MoEExpertsSwiGLUResidual` GGML kernel during decode that runs all selected experts, the optional shared expert, and the residual add in a single GPU graph dispatch.
+All Qwen 3.5/3.6-family variants (`qwen35`, `qwen35moe`, and `qwen3next`) load through the same `Qwen35RuntimeModel` on the shared decoder runtime (dense NVFP4 checkpoints on `--backend cuda` run the direct-CUDA engine). Image inputs are supported via the dynamic-resolution `Qwen35VisionEncoder`; pass the selected repository's projector explicitly (for the 9B and Qwen 3.6 examples, `mmproj-F16.gguf`; Bonsai2 27B has its own `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `-Q8_0.gguf`). The MoE variants (e.g. Qwen3.5-35B-A3B and Qwen3.6-35B-A3B GGUFs that report the same architecture keys) additionally enable a fused `MoEExpertsSwiGLUResidual` GGML kernel during decode that runs all selected experts, the optional shared expert, and the residual add in a single GPU graph dispatch.
 
 ### Qwen 3.8 Flash Next
 

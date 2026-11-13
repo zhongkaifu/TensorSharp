@@ -215,7 +215,7 @@ public sealed class SharedPrefixRenderTests : IDisposable
 
     private static ModelBase Model(ITokenizer tokenizer)
     {
-        var model = (Qwen35Model)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35Model));
+        var model = (Qwen35RuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35RuntimeModel));
         typeof(ModelBase).GetProperty(nameof(ModelBase.Tokenizer))!.SetValue(model, tokenizer);
         typeof(ModelBase).GetField("<Config>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(model, new ModelConfig { Architecture = "qwen35", ChatTemplate = "first-template" });

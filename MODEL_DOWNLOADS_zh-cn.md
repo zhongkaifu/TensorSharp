@@ -84,7 +84,7 @@ draft，社区亦有 GGUF 转换，但它们是另一种 draft 结构：5 层 Tr
 > 这套 5 层 `fc` 融合结构**已经**在 Muse-Glimmer 上实现——见
 > [DFlash 投机解码](docs/models/muse-glimmer_zh-cn.md#3-dflash-投机解码)。
 > 下表这些 draft 没有接入，是因为它们的编码器需要目标模型暴露逐层输入残差，而 `Gemma4Model`
-> 没有暴露。目前做到这一点的是 `MuseGlimmerModel` 与 `Qwen35Model`（Qwen 3.5 / 3.8 的
+> 没有暴露。目前做到这一点的是 `MuseGlimmerModel` 与 `Qwen35RuntimeModel`（Qwen 3.5 / 3.8 的
 > DFlash/DFlash2 draft）；`NemotronModel` 也会取出这些残差，但该主干拒绝投机解码。
 
 | 主干 | 官方 checkpoint（safetensors） | 社区 GGUF |

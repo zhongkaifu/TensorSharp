@@ -218,8 +218,8 @@ interleaved runs of each, F16 KV:
 | 3,609 tokens | Decode, 109 tokens (tok/s) | 26.1 | 26.2 |
 
 A synthetic PRISM checkpoint (rotated PQ2_0 projections, head and embedding,
-grouped value heads) compares the two paths' logits in
-`Qwen35RuntimeTests.PrismRotationsMatchQwen35Model`: 1.1e-5 apart at most on
+grouped value heads) compared the two paths' logits: 1.1e-5 apart at most on
 `ggml_metal`, 2.0e-2 on `ggml_cpu` (its BF16-rounded activations); with the
-rotations left out the first row is 1.2 away. That test also passed on
-`ggml_cuda` (RTX 2000 Ada); the real checkpoint was not run on CUDA.
+rotations left out the first row is 1.2 away. `Qwen35RuntimeTests.PrismRotationsMatchTheFamilyGolden`
+keeps the runtime within that rounding of the removed implementation's `ggml_cpu` rows (2.52e-2 on
+`ggml_cuda`, RTX A5000, which rounds its activations too); the real checkpoint was not run on CUDA.

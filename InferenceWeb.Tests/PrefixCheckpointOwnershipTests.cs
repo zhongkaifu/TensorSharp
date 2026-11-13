@@ -34,16 +34,15 @@ public class PrefixCheckpointOwnershipTests
 
     public static IEnumerable<object[]> AllocationCases()
     {
-        foreach (bool qwen in new[] { false, true })
-            for (int allocation = 1; allocation <= 6; allocation++)
-                yield return new object[] { qwen, allocation };
+        for (int allocation = 1; allocation <= 6; allocation++)
+            yield return new object[] { allocation };
     }
 
     [Theory]
     [MemberData(nameof(AllocationCases))]
-    public void CheckpointAllocationFailure_ReclaimsPartialCacheAndPreservesSource(bool qwen, int allocation)
+    public void CheckpointAllocationFailure_ReclaimsPartialCacheAndPreservesSource(int allocation)
     {
-        using var f = new Fixture(qwen);
+        using var f = new Fixture();
         byte[] before = f.State(f.Source);
         var live = f.Allocator.LiveSet();
         f.Allocator.FailAllocation = f.Allocator.Allocations + allocation;
@@ -58,75 +57,12 @@ public class PrefixCheckpointOwnershipTests
     }
 
     [Theory]
-    [InlineData(1)]
-    [InlineData(2)]
+    [InlineData(0)]
     [InlineData(3)]
-    [InlineData(4)]
     [InlineData(5)]
-    [InlineData(6)]
-    public void QwenPrimaryAdoptionFailure_PreservesLiveStateAndPublishesNoHolder(int allocation)
+    public void CloneReadFailure_ReclaimsCompletedAllocationAndPreservesRetainedOwner(int storage)
     {
-        using var f = new Fixture(qwen: true);
-        var model = (Qwen35Model)f.Model;
-        byte[] before = f.State(f.Source);
-        var live = f.Allocator.LiveSet();
-        f.Allocator.FailAllocation = f.Allocator.Allocations + allocation;
-
-        Assert.Throws<OutOfMemoryException>(() => model.AdoptPrimaryCacheToFused("failed-adoption"));
-        Assert.False(model.HasFusedSequenceCache("failed-adoption"));
-        Assert.Null(Get(model, "_activeFusedKey"));
-        Assert.Null(Get(model, "_primaryHolder"));
-        Assert.Equal(9, model.PrimaryCacheLength);
-        Assert.Equal(before, f.State(Invoke(model, "SnapshotActiveCache")!));
-        f.Allocator.AssertLiveSet(live);
-
-        Assert.True(f.Checkpoint("after-failed-adoption"));
-        f.AssertIndependent(f.Source, f.Retained["after-failed-adoption"]!);
-    }
-
-    [Fact]
-    public void QwenPrimaryMeasurement_MatchesAdoptedFootprintWithoutAllocatingOrChangingState()
-    {
-        using var f = new Fixture(qwen: true);
-        var model = (Qwen35Model)f.Model;
-        byte[] before = f.State(f.Source);
-        var live = f.Allocator.LiveSet();
-        int allocations = f.Allocator.Allocations;
-
-        foreach (int length in new[] { -1, 0, 8, 10, 17 })
-        {
-            Assert.False(model.TryMeasurePrimaryEndState(length, out var refused));
-            Assert.Equal(default, refused);
-        }
-        Assert.True(model.TryMeasurePrimaryEndState(9, out var measured));
-        Assert.Equal(9, measured.Tokens);
-        Assert.True(measured.Bytes.HostKv > 0);
-        Assert.True(measured.Bytes.StateSnapshot > 0);
-        Assert.Equal(allocations, f.Allocator.Allocations);
-        f.Allocator.AssertLiveSet(live);
-        Assert.Equal(before, f.State(Invoke(model, "SnapshotActiveCache")!));
-
-        model.AdoptPrimaryCacheToFused("adopted");
-        // The donated snapshot now owns Source's storage and unmanaged scratch.
-        f.ForgetOwner(f.Source);
-        f.TrackOwner(Get(model, "_primaryHolder")!);
-        Assert.False(model.TryMeasurePrimaryEndState(9, out var checkedOut));
-        Assert.Equal(default, checkedOut);
-        Assert.True(model.RetainSequenceCacheAs("adopted", "retained"));
-        Assert.Equal(measured, model.MeasureEndState("retained"));
-        Assert.Equal(before, f.State(f.Retained["retained"]!));
-    }
-
-    [Theory]
-    [InlineData(false, 0)]
-    [InlineData(false, 3)]
-    [InlineData(false, 5)]
-    [InlineData(true, 0)]
-    [InlineData(true, 3)]
-    [InlineData(true, 5)]
-    public void CloneReadFailure_ReclaimsCompletedAllocationAndPreservesRetainedOwner(bool qwen, int storage)
-    {
-        using var f = new Fixture(qwen);
+        using var f = new Fixture();
         Assert.True(f.Checkpoint("source"));
         object retained = f.Retained["source"]!;
         byte[] before = f.State(retained);
@@ -143,151 +79,11 @@ public class PrefixCheckpointOwnershipTests
         f.AssertIndependent(retained, f.Active["retry"]!);
     }
 
-    [Fact]
-    public void QwenReservedClone_CopiesOnce_AndFirstPrefillKeepsItsAllocation()
-    {
-        using var f = new Fixture(qwen: true);
-        var model = (Qwen35Model)f.Model;
-        Set(typeof(ModelBase), model, "_maxContextLength", 4096);
-        Assert.True(f.Checkpoint("source"));
-        object retained = f.Retained["source"]!;
-        IPrefixCacheModel pcm = model;
-        int reservation = pcm.ResolveCloneReservationTokens("source", 617);
-        Assert.Equal(768, reservation);
-        ResourceVector estimate = pcm.EstimateCloneBytes("source", 9, reservation);
-        int allocations = f.Allocator.Allocations;
-
-        Assert.True(pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "active", 9, 9, reservation)));
-        object clone = f.Active["active"]!;
-        Assert.Equal(768, Get(clone, "KvCapacity"));
-        Assert.Equal(16, Get(retained, "KvCapacity")); // Retained snapshots stay compact.
-        Assert.Equal(6, f.Allocator.Allocations - allocations); // Four KV slabs, two recurrent states.
-        Assert.Equal(f.State(retained, true), f.State(clone, true));
-        long actualKv = ((Tensor[])Get(clone, "K")!).Concat((Tensor[])Get(clone, "V")!)
-            .Where(t => t != null).Sum(t => t.Storage.ByteLength);
-        Assert.Equal(actualKv, estimate.HostKv);
-        Assert.Equal(0, estimate.DeviceKv); // Cloning allocates host storage; GPU mirrors stay lazy.
-        Tensor[] before = f.Tensors(clone);
-        f.Load(clone);
-        model.PrepareForPrefill(617);
-        Assert.Equal(6, f.Allocator.Allocations - allocations);
-        Assert.Equal(before, f.Tensors(clone));
-        Assert.Equal(f.State(retained, true), f.State(clone, true));
-        f.AssertIndependent(retained, clone);
-    }
-
-    [Theory]
-    [InlineData(1)]
-    [InlineData(2)]
-    [InlineData(4)]
-    public void QwenCudaActiveClones_ReuseDistinctExactCapacityHolders_WithoutNewStorage(int count)
-    {
-        using var f = new Fixture(qwen: true);
-        var model = (Qwen35Model)f.Model;
-        Set(typeof(ModelBase), model, "_backend", BackendType.GgmlCuda);
-        Set(typeof(ModelBase), model, "_maxContextLength", 4096);
-        Assert.True(f.Checkpoint("source"));
-        object source = f.Retained["source"]!;
-        var oldOwners = new List<object>();
-        for (int i = 0; i < count; i++)
-        {
-            object holder = Invoke(model, "AllocateHolder", 768)!;
-            f.TrackOwner(holder);
-            f.Pool(holder);
-            foreach (var tensor in f.Tensors(holder))
-                tensor.SetElementsAsFloat(Enumerable.Repeat(-12345f, (int)tensor.ElementCount()).ToArray());
-            foreach (string flag in new[] { "KvHostDirty", "GdnHostDirty", "FdStateResident", "ArenaStateResident", "DeviceMirrored" })
-                Set(holder.GetType(), holder, flag, true);
-            oldOwners.Add(holder);
-        }
-        int allocations = f.Allocator.Allocations;
-        IPrefixCacheModel pcm = model;
-        for (int i = 0; i < count; i++)
-        {
-            Assert.True(pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "clone-" + i, 9, 9, 768)));
-            object copy = f.Active["clone-" + i]!;
-            Assert.Contains(copy, oldOwners);
-            Assert.Equal(f.State(source, true), f.State(copy, true));
-            Assert.Equal(768, Get(copy, "KvCapacity"));
-            foreach (string flag in new[] { "KvHostDirty", "GdnHostDirty", "FdStateResident", "ArenaStateResident", "DeviceMirrored" })
-                Assert.False((bool)Get(copy, flag)!);
-            foreach (var tensor in ((Tensor[])Get(copy, "K")!).Concat((Tensor[])Get(copy, "V")!).Where(t => t != null))
-            {
-                int heads = (int)tensor.Sizes[0], dim = (int)tensor.Sizes[2];
-                float[] values = tensor.GetElementsAsFloat((int)tensor.ElementCount());
-                for (int h = 0; h < heads; h++)
-                    Assert.All(values.AsSpan((h * 768 + 9) * dim, (768 - 9) * dim).ToArray(), x => Assert.Equal(0, x));
-            }
-        }
-        Assert.Equal(count, f.Active.Values.Cast<object>().Distinct().Count());
-        Assert.Equal(allocations, f.Allocator.Allocations);
-        Assert.Empty((IList)Get(model, "_holderPool")!);
-    }
-
-    [Theory]
-    [InlineData(false, 768)] // Other backends keep their established allocation policy.
-    [InlineData(true, 1024)] // A bigger idle holder must not inflate the clone's frozen budget.
-    public void QwenClone_DoesNotConsumeAnIneligibleIdleHolder(bool cuda, int idleCapacity)
-    {
-        using var f = new Fixture(qwen: true);
-        var model = (Qwen35Model)f.Model;
-        if (cuda) Set(typeof(ModelBase), model, "_backend", BackendType.GgmlCuda);
-        Set(typeof(ModelBase), model, "_maxContextLength", 4096);
-        Assert.True(f.Checkpoint("source"));
-        object parked = Invoke(model, "AllocateHolder", idleCapacity)!;
-        f.TrackOwner(parked); f.Pool(parked);
-        int allocations = f.Allocator.Allocations;
-        IPrefixCacheModel pcm = model;
-        Assert.True(pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "clone", 9, 9, 768)));
-        Assert.NotSame(parked, f.Active["clone"]);
-        Assert.Same(parked, Assert.Single(((IList)Get(model, "_holderPool")!).Cast<object>()));
-        Assert.Equal(6, f.Allocator.Allocations - allocations);
-    }
-
-    [Fact]
-    public void QwenPooledClone_CopyFailureDisposesThePartialOwner_AndPreservesSource()
-    {
-        using var f = new Fixture(qwen: true);
-        var model = (Qwen35Model)f.Model;
-        Set(typeof(ModelBase), model, "_backend", BackendType.GgmlCuda);
-        Set(typeof(ModelBase), model, "_maxContextLength", 4096);
-        Assert.True(f.Checkpoint("source"));
-        object source = f.Retained["source"]!;
-        byte[] before = f.State(source);
-        object parked = Invoke(model, "AllocateHolder", 768)!;
-        f.TrackOwner(parked); f.Pool(parked);
-        var parkedStorage = f.Tensors(parked).Select(t => (TrackedStorage)t.Storage).ToArray();
-        ((TrackedStorage)f.Tensors(source)[0].Storage).FailNextRead = true;
-        IPrefixCacheModel pcm = model;
-        Assert.Throws<IOException>(() => pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "clone", 9, 9, 768)));
-        Assert.Empty((IList)Get(model, "_holderPool")!);
-        Assert.False(f.Active.Contains("clone"));
-        Assert.All(parkedStorage, storage => Assert.True(storage.Freed));
-        Assert.Equal(before, f.State(source));
-        Assert.True(pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "retry", 9, 9, 768)));
-        f.AssertIndependent(source, f.Active["retry"]!);
-    }
-
-    [Fact]
-    public void QwenCheckpoint_DoesNotConsumeAnExactCapacityIdleHolder()
-    {
-        using var f = new Fixture(qwen: true);
-        var model = (Qwen35Model)f.Model;
-        Set(typeof(ModelBase), model, "_backend", BackendType.GgmlCuda);
-        object parked = Invoke(model, "AllocateHolder", 16)!;
-        f.TrackOwner(parked); f.Pool(parked);
-        int allocations = f.Allocator.Allocations;
-        Assert.True(f.Checkpoint("snapshot"));
-        Assert.Equal(6, f.Allocator.Allocations - allocations);
-        Assert.NotSame(parked, f.Retained["snapshot"]);
-        Assert.Same(parked, Assert.Single(((IList)Get(model, "_holderPool")!).Cast<object>()));
-    }
-
     [Theory]
     [MemberData(nameof(AllocationCases))]
-    public void ImportAllocationFailure_PublishesNothingAndValidRetryKeepsSource(bool qwen, int allocation)
+    public void ImportAllocationFailure_PublishesNothingAndValidRetryKeepsSource(int allocation)
     {
-        using var f = new Fixture(qwen);
+        using var f = new Fixture();
         Assert.True(f.Checkpoint("source"));
         byte[] encoded = f.Export("source");
         byte[] before = f.State(f.Source);
@@ -305,13 +101,11 @@ public class PrefixCheckpointOwnershipTests
     }
 
     [Theory]
-    [InlineData(false, 1)]
-    [InlineData(false, 73)]
-    [InlineData(true, 1)]
-    [InlineData(true, 73)]
-    public void TruncatedImport_ReclaimsBuffersAfterPartialPayloadAndAllowsRetry(bool qwen, int missingBytes)
+    [InlineData(1)]
+    [InlineData(73)]
+    public void TruncatedImport_ReclaimsBuffersAfterPartialPayloadAndAllowsRetry(int missingBytes)
     {
-        using var f = new Fixture(qwen);
+        using var f = new Fixture();
         Assert.True(f.Checkpoint("source"));
         byte[] encoded = f.Export("source");
         byte[] before = f.State(f.Source);
@@ -328,54 +122,12 @@ public class PrefixCheckpointOwnershipTests
         Assert.Equal(encoded, f.Export("retry"));
     }
 
-    [Fact]
-    public void QwenCheckpointFailure_PreservesSpeculativeSnapshotAndIndependentCloneRollback()
-    {
-        using var f = new Fixture(qwen: true);
-        var model = (Qwen35Model)f.Model;
-        byte[] original = f.State(f.Source);
-        model.SpecSnapshotRecurrentState();
-        f.MutateRecurrent(f.Source);
-        byte[] afterVerify = f.State(f.Source);
-        Assert.NotEqual(original, afterVerify);
-        var live = f.Allocator.LiveSet();
-        f.Allocator.FailAllocation = f.Allocator.Allocations + 5;
-
-        Assert.Throws<OutOfMemoryException>(() => f.Checkpoint("retry"));
-        Assert.Equal(afterVerify, f.State(f.Source));
-        f.Allocator.AssertLiveSet(live);
-        model.SpecRestoreRecurrentState();
-        Assert.Equal(original, f.State(f.Source));
-
-        Assert.True(f.Checkpoint("retry"));
-        Assert.True(f.Clone("retry", "branch"));
-        object branch = f.Active["branch"]!;
-        f.AssertIndependent(f.Source, branch);
-        f.Load(branch);
-        byte[] branchBefore = f.State(branch);
-        model.SpecSnapshotRecurrentState();
-        f.MutateRecurrent(branch);
-        Assert.Equal(original, f.State(f.Source));
-        byte[] branchAfterVerify = f.State(branch);
-        byte[] encoded = f.Export("retry");
-        live = f.Allocator.LiveSet();
-
-        Assert.False(f.Import("failed-import", encoded[..^1]));
-        Assert.Equal(branchAfterVerify, f.State(branch));
-        f.Allocator.AssertLiveSet(live);
-        model.SpecRestoreRecurrentState();
-        Assert.Equal(branchBefore, f.State(branch));
-        Assert.Equal(original, f.State(f.Source));
-        Assert.True(f.Import("failed-import", encoded));
-        Assert.Equal(encoded, f.Export("failed-import"));
-    }
-
     [GemmaTraceTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void GemmaThrowingPostCommitTrace_DoesNotReportFailureOrLosePublishedOwner(bool clone)
     {
-        using var f = new Fixture(qwen: false);
+        using var f = new Fixture();
         Assert.True((bool)typeof(Gemma4Model).GetField("_cbDebug", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!,
             "TS_CB_DEBUG=1 must be set before the testhost loads Gemma4Model.");
         if (clone) Assert.True(f.Checkpoint("source"));
@@ -427,18 +179,15 @@ public class PrefixCheckpointOwnershipTests
         internal readonly object Source;
         internal readonly IDictionary Retained;
         internal readonly IDictionary Active;
-        private readonly Type modelType;
-        private readonly bool qwen;
+        private readonly Type modelType = typeof(Gemma4Model);
         private readonly List<object> owners = new();
 
-        internal Fixture(bool qwen)
+        internal Fixture()
         {
-            this.qwen = qwen;
-            modelType = qwen ? typeof(Qwen35Model) : typeof(Gemma4Model);
             Model = (ModelBase)RuntimeHelpers.GetUninitializedObject(modelType);
             Set(typeof(ModelBase), Model, "<Config>k__BackingField", new ModelConfig
             {
-                Architecture = qwen ? "qwen35" : "gemma4", NumLayers = 4,
+                Architecture = "gemma4", NumLayers = 4,
                 HiddenSize = 8, NumHeads = 2, NumKVHeads = 2,
             });
             // Public checkpoint APIs are enabled for the GGML CPU execution plan;
@@ -449,30 +198,18 @@ public class PrefixCheckpointOwnershipTests
             Set(typeof(ModelBase), Model, "_maxContextLength", 16);
             Set(typeof(ModelBase), Model, "_kvCacheDtype", KvCacheDtype.F32);
             Set(typeof(ModelBase), Model, "_cacheSeqLen", 9); // local Gemma ring has wrapped
-            Type holderType = modelType.GetNestedType(qwen ? "Qwen35KvCacheHolder" : "Gemma4KvCacheHolder", BindingFlags.NonPublic)!;
+            Type holderType = modelType.GetNestedType("Gemma4KvCacheHolder", BindingFlags.NonPublic)!;
             Retained = (IDictionary)Activator.CreateInstance(typeof(Dictionary<,>).MakeGenericType(typeof(string), holderType))!;
             Active = (IDictionary)Activator.CreateInstance(typeof(Dictionary<,>).MakeGenericType(typeof(string), holderType))!;
             Field("_retainedFusedHolders", Retained);
             Field("_fusedHolders", Active);
-            if (qwen)
-            {
-                Field("_kvCacheK", new Tensor[4]);
-                Field("_isRecurrent", new[] { false, true, false, true });
-                Field("_headKDim", 2); Field("_headVDim", 2);
-                Field("_numKHeads", 1); Field("_numVHeads", 2); Field("_convKernel", 4);
-                Source = Invoke(Model, "AllocateHolder", 16)!;
-                Set(Source.GetType(), Source, "CacheSeqLen", 9);
-            }
-            else
-            {
-                Field("_kvDonorMap", new Dictionary<int, int> { [3] = 1 });
-                Field("_slidingWindowPattern", new[] { true, false, true, false });
-                Field("_slidingWindow", 4); Field("_localHeadDim", 4);
-                Field("_globalHeadDim", 4); Field("_numGlobalKVHeads", 2);
-                Field("_initialGlobalCacheLength", 16);
-                Source = Invoke(Model, "CreateFreshHolder")!;
-                Set(Source.GetType(), Source, "SeqLen", 9);
-            }
+            Field("_kvDonorMap", new Dictionary<int, int> { [3] = 1 });
+            Field("_slidingWindowPattern", new[] { true, false, true, false });
+            Field("_slidingWindow", 4); Field("_localHeadDim", 4);
+            Field("_globalHeadDim", 4); Field("_numGlobalKVHeads", 2);
+            Field("_initialGlobalCacheLength", 16);
+            Source = Invoke(Model, "CreateFreshHolder")!;
+            Set(Source.GetType(), Source, "SeqLen", 9);
             owners.Add(Source);
             int storageIndex = 0;
             foreach (Tensor tensor in Tensors(Source))
@@ -480,17 +217,6 @@ public class PrefixCheckpointOwnershipTests
                 float[] values = Enumerable.Range(0, checked((int)tensor.ElementCount()))
                     .Select(i => (float)(++storageIndex * 0.125 + i * 0.0625)).ToArray();
                 tensor.SetElementsAsFloat(values);
-            }
-            if (qwen)
-            {
-                var conv = (float[][])Get(Source, "ConvState")!;
-                var indexes = (int[])Get(Source, "ConvWriteIdx")!;
-                for (int l = 0; l < conv.Length; l++)
-                    if (conv[l] != null)
-                    {
-                        for (int i = 0; i < conv[l].Length; i++) conv[l][i] = l * 100 + i * .25f;
-                        indexes[l] = l % 3;
-                    }
             }
             Load(Source);
             Assert.Equal(6, Allocator.LiveSet().Length);
@@ -526,7 +252,7 @@ public class PrefixCheckpointOwnershipTests
         internal Tensor[] Tensors(object holder)
         {
             var result = new List<Tensor>();
-            foreach (string field in qwen ? new[] { "K", "V", "DeltaState" } : new[] { "K", "V" })
+            foreach (string field in new[] { "K", "V" })
                 foreach (Tensor? tensor in (Tensor[])Get(holder, field)!)
                     if (tensor != null && !result.Contains(tensor)) result.Add(tensor);
             return result.ToArray();
@@ -535,7 +261,7 @@ public class PrefixCheckpointOwnershipTests
         {
             using var output = new MemoryStream();
             using var writer = new BinaryWriter(output);
-            writer.Write((int)Get(holder, qwen ? "CacheSeqLen" : "SeqLen")!);
+            writer.Write((int)Get(holder, "SeqLen")!);
             foreach (Tensor tensor in Tensors(holder))
             {
                 if (liveRowsOnly && tensor.Sizes.Length == 3)
@@ -559,12 +285,6 @@ public class PrefixCheckpointOwnershipTests
                     writer.Write(bytes);
                 }
             }
-            if (qwen)
-            {
-                foreach (float[]? row in (float[][])Get(holder, "ConvState")!)
-                    if (row != null) foreach (float value in row) writer.Write(value);
-                foreach (int index in (int[])Get(holder, "ConvWriteIdx")!) writer.Write(index);
-            }
             return output.ToArray();
         }
         internal void AssertIndependent(object source, object copy)
@@ -577,19 +297,9 @@ public class PrefixCheckpointOwnershipTests
                 Assert.NotSame(src[i], dst[i]);
                 Assert.NotEqual(src[i].Storage.PtrAtElement(0), dst[i].Storage.PtrAtElement(0));
             }
-            if (!qwen)
-            {
-                var k = (Tensor[])Get(copy, "K")!;
-                var v = (Tensor[])Get(copy, "V")!;
-                Assert.Same(k[1], k[3]); Assert.Same(v[1], v[3]);
-            }
-            else
-            {
-                var from = (float[][])Get(source, "ConvState")!;
-                var to = (float[][])Get(copy, "ConvState")!;
-                for (int l = 0; l < from.Length; l++) if (from[l] != null) Assert.NotSame(from[l], to[l]);
-                Assert.NotEqual((IntPtr)Get(source, "ConvScratch")!, (IntPtr)Get(copy, "ConvScratch")!);
-            }
+            var k = (Tensor[])Get(copy, "K")!;
+            var v = (Tensor[])Get(copy, "V")!;
+            Assert.Same(k[1], k[3]); Assert.Same(v[1], v[3]);
             byte[] before = State(source);
             dst[0].SetElementAsFloat(-9876.5f, 0, 0, 0);
             Assert.Equal(before, State(source));

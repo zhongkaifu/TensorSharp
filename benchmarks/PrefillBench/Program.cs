@@ -4,8 +4,7 @@
 // prefill latency that dominates TTFT. Runs single-sequence and concurrent
 // scenarios so the per-sequence-graph vs batched-graph behaviour is visible.
 //
-// Plain exe (no VSTest host) so nsys/ncu can attach to the CUDA work, mirroring
-// benchmarks/GdnDecodeBench.
+// Plain exe (no VSTest host) so nsys/ncu can attach to the CUDA work.
 //
 // Env knobs:
 //   TS_PREFILL_MODEL    path to a .gguf (default Ministral-3-8B Q8_0)

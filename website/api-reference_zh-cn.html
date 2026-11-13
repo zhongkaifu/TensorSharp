@@ -244,7 +244,6 @@
       <tr><td><code>GGML_CUDA_ALLREDUCE / GGML_CUDA_AR_BF16_THRESHOLD</code></td><td>ggml 集合通信选择（<code>nccl</code> / <code>internal</code> / <code>none</code>），以及 F32 集合通信转为 BF16 的负载阈值（TensorSharp 将其提高到 1 MB）。</td></tr>
       <tr><td><code>TS_RESPONSES_STORE_REDIS_URL</code></td><td>Redis 支撑的 OpenAI Responses API 存储（取代内存存储）；即 <code>--redis-url</code> 中生效的那一半。</td></tr>
       <tr><td><code>TS_GGML_VULKAN_DEVICE</code></td><td><code>ggml_vulkan</code> 使用的 Vulkan 设备索引（= <code>--gpu-device</code>）。</td></tr>
-      <tr><td><code>TS_FUSED_QKNORM_ROPE</code></td><td><code>0</code> 禁用 direct <code>cuda</code> 后端中 Qwen 3.5/3.6 文本 prefill 的融合 QK-Norm + RoPE kernel（默认开启）。</td></tr>
       <tr><td><code>TS_MLX_* </code></td><td>MLX 后端调参：mlock GGUF、批量 MoE decode、层间 eval 间隔、内存上限。</td></tr>
       <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>覆盖 <code>libmlxc</code> 的搜索路径。</td></tr>
       <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>在原生构建时跳过 / 固定 ggml 源码克隆。</td></tr>

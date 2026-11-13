@@ -1429,7 +1429,7 @@ namespace tsg
 
     // Probe-only lookup: an EXISTING DeviceCopy-mode cached buffer for `data`
     // covering exactly `bytes`. Never allocates, uploads, or evicts — callers
-    // that only want to READ the current resident bytes (the qwen35 arena join)
+    // that only want to READ the current resident bytes (the qwen4exp arena join)
     // use this so probing absent entries cannot create device copies.
     bool try_peek_cached_device_copy(const void* data, std::size_t bytes,
                                      ggml_backend_buffer_t& out_buffer, void*& out_addr)
@@ -3409,26 +3409,17 @@ extern "C" void TSGgml_WanResetForwardCache();
 // TSGgml_Shutdown releases them while the backends are still alive.
 extern "C" void TSGgml_GraphReleaseDeviceIo();
 extern "C" void TSGgml_Gemma4ReleaseVerifyTpGraphs();
-extern "C" void TSGgml_Qwen35ReleaseAttentionTpGraphs();
 extern "C" void TSGgml_Qwen35GdnDropTpGraphs();
 extern "C" void TSGgml_ReleaseFusedFfnTpGraphs();
 extern "C" void TSGgml_ReleaseFusedMatmulAddTpGraphs();
 extern "C" void TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
 extern "C" void TSGgml_Gemma4MoEResetDecodeCache();
 extern "C" void TSGgml_Gemma4ResetDecodeCache();
-extern "C" void TSGgml_Qwen35ReleaseVerifyTpGraphs();
-extern "C" void TSGgml_Qwen35ReleaseVerifyGraphsPreserveState();
-extern "C" void TSGgml_Qwen35ResetDecodeCache();
-extern "C" void TSGgml_Qwen35ResetVerifyCache();
-extern "C" void TSGgml_Qwen35ResetVerifyCacheForHostPointer(const void* host_ptr);
 extern "C" void TSGgml_Gemma4ResetBatchedDecodeCache();
 extern "C" void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
 extern "C" void TSGgml_GptOssResetDecodeCache();
 extern "C" void TSGgml_GptOssResetBatchedDecodeCache();
-extern "C" void TSGgml_Qwen35ArenaResetBatchedDecodeCache();
-extern "C" void TSGgml_Qwen35BatchedVerifyReset();
 extern "C" void TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
-namespace tsg_q35arena { void on_drop(const void* host_ptr); }
 extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
 extern "C" void TSGgml_MuseGlimmerResetDecodeCache();
 extern "C" void TSGgml_DFlashResetCaches();
@@ -3454,14 +3445,11 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // The slot-stable arena pools bind resident weight buffers this wipe is
     // about to free; their captured graphs must not survive it.
     TSGgml_GptOssResetBatchedDecodeCache();
-    TSGgml_Qwen35ArenaResetBatchedDecodeCache();
-    TSGgml_Qwen35BatchedVerifyReset();
     TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
     // Drop any persistent whole-model graphs first: they bind weights resident by
     // GGUF pointer (shared via these caches), so freeing the caches below would leave
     // their captured graphs pointing at freed device memory.
     TSGgml_WanResetForwardCache();
-    TSGgml_Qwen35ResetDecodeCache();
     // The same holds for the persistent graphs TSGgml_InvalidateHostBuffer drops when
     // it frees ONE device copy; this wipe frees all of them. They used to survive a
     // model unload until TSGgml_Shutdown. Their keys are raw host addresses (DFlash:
@@ -3483,12 +3471,6 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     TSGgml_NemotronMamba2PrefillClear();
     tsg::free_prefill_attn_sessions();
     tsg::free_paged_attn_sessions();
-    // A process-global host-weight eviction must retire every verify graph/TP
-    // plan, but another live Qwen35 model may still own the only current copy of
-    // its recurrent state. Preserve those owner-private state buffers so its next
-    // call can rebuild safely.
-    TSGgml_Qwen35ReleaseVerifyGraphsPreserveState();
-    TSGgml_Qwen35ReleaseAttentionTpGraphs();
     TSGgml_Qwen35GdnDropTpGraphs();
     // The vendor convolution library holds a handle, its engine tables and a
     // workspace on the device. The VAE ENCODER runs before the DiT, so leaving them
@@ -3570,8 +3552,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     // Tear the TP communicator down first: it holds NCCL communicators and
     // pinned staging buffers that reference every rank's backend.
     tp_comm_free();
-    TSGgml_Qwen35ResetDecodeCache();
-    TSGgml_Qwen35ReleaseVerifyTpGraphs();
     forget_cache_keys();
 
     const int ranks = tsg::g_device_count.load(std::memory_order_acquire);
@@ -3612,7 +3592,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     // static destructors free them after the CUDA driver has shut down aborts
     // the process ("CUDA error: driver shutting down").
     TSGgml_Gemma4ReleaseVerifyTpGraphs();
-    TSGgml_Qwen35ReleaseAttentionTpGraphs();
     TSGgml_Qwen35GdnDropTpGraphs();
     TSGgml_ReleaseFusedFfnTpGraphs();
     TSGgml_ReleaseFusedMatmulAddTpGraphs();
@@ -3621,7 +3600,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     TSGgml_Gemma4ResetDecodeCache();
     TSGgml_Gemma4ResetBatchedDecodeCache();
     TSGgml_Gemma4ResetMoEBatchedDecodeCache();
-    TSGgml_Qwen35ResetVerifyCache();
     // GPT-OSS keeps per-layer device-resident K/V windows (tsg_gptoss::kv_*)
     // alive for the whole session; nothing else drops them, so on Metal their
     // MTLBuffers were still registered in the device residency set when the
@@ -3631,8 +3609,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     // (null, null) drops every window.
     TSGgml_GptOssResetDecodeCache();
     TSGgml_GptOssResetBatchedDecodeCache();
-    TSGgml_Qwen35ArenaResetBatchedDecodeCache();
-    TSGgml_Qwen35BatchedVerifyReset();
     TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
     TSGgml_GptOssInvalidateKvCache(nullptr, nullptr);
     // Same contract for the other whole-model graph caches: each parks a ggml
@@ -4063,9 +4039,8 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     // without every call site having to know about both.
     TSGgml_GptOssInvalidateKvCache(ptr, nullptr);
 
-    // Same contract for the qwen35 arena: this host pointer's bytes changed (or
+    // Same contract for the qwen4exp arena: this host pointer's bytes changed (or
     // are being freed) behind the kernels — its arena slot, if any, is stale.
-    tsg_q35arena::on_drop(ptr);
     tsg_q4earena::on_drop(ptr);
     tsg_graphtp::on_drop(ptr);
     // A mapped expert's address can be recycled by a subsequent model load.
@@ -4101,10 +4076,7 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_GptOssResetDecodeCache();
     TSGgml_GptOssResetBatchedDecodeCache();
-    TSGgml_Qwen35ArenaResetBatchedDecodeCache();
     TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
-    TSGgml_Qwen35ResetDecodeCache();
-    TSGgml_Qwen35ResetVerifyCacheForHostPointer(ptr);
     // Muse-Glimmer's persistent decode graphs bind the KV device copies the same
     // way. Its C# side resets them around its own grow/truncate/inject, but the
     // per-op fallback invalidates the caches it writes without doing so.

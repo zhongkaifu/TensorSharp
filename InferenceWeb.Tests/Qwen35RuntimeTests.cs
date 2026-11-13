@@ -66,30 +66,31 @@ public sealed class Qwen35RuntimeTests : IDisposable
     private static Qwen35RuntimeModel Create(string path, int tp = 1, int stages = 1, BackendType backend = BackendType.Cpu)
         => new(path, backend, tp, tp > 1 ? new SimulatedDeviceGroup(tp * stages) : null, stages);
 
-    /// <summary>The factory's route: one ggml_cuda / ggml_metal / ggml_cpu / MLX device runs a dense checkpoint on
-    /// the shared runtime, the GGML devices a routed-expert one too; routed experts on MLX, --tp, and every other
-    /// backend stay with Qwen35Model.</summary>
+    /// <summary>The factory's route: the shared runtime serves every checkpoint on every backend and placement; only a
+    /// dense NVFP4 checkpoint on one direct-CUDA GPU leaves it for the direct engine.</summary>
     [Theory]
-    [InlineData("dense", BackendType.GgmlCuda, 1, true)]
-    [InlineData("dense", BackendType.GgmlMetal, 1, true)]
-    [InlineData("dense-nextn", BackendType.GgmlCuda, 1, true)]
-    [InlineData("dense-prism", BackendType.GgmlMetal, 1, true)]
-    [InlineData("dense-prism", BackendType.GgmlCuda, 1, true)]
-    [InlineData("dense", BackendType.GgmlCuda, 2, false)]
-    [InlineData("dense", BackendType.GgmlCpu, 1, true)]
-    [InlineData("dense", BackendType.GgmlVulkan, 1, false)]
-    [InlineData("dense", BackendType.Cuda, 1, false)]
-    [InlineData("dense", BackendType.Mlx, 1, true)]
-    [InlineData("moe", BackendType.Mlx, 1, true)]
-    [InlineData("moe", BackendType.GgmlCuda, 1, true)]
-    [InlineData("moe", BackendType.GgmlMetal, 1, true)]
-    [InlineData("moe", BackendType.GgmlCpu, 1, true)]
-    public void OneDeviceRouteServesDenseCheckpoints(string variant, BackendType backend, int tp, bool runtime)
+    [InlineData("dense", BackendType.GgmlCuda, 1)]
+    [InlineData("dense", BackendType.GgmlMetal, 1)]
+    [InlineData("dense", BackendType.GgmlVulkan, 1)]
+    [InlineData("dense", BackendType.GgmlCuda, 2)]
+    [InlineData("dense", BackendType.Cuda, 1)]
+    [InlineData("dense", BackendType.Cpu, 1)]
+    [InlineData("dense", BackendType.Mlx, 1)]
+    [InlineData("moe", BackendType.Cuda, 1)]
+    [InlineData("moe", BackendType.Mlx, 1)]
+    public void TheRuntimeServesEveryNonNvfp4Load(string variant, BackendType backend, int tp)
     {
         using var probe = new GgufFile(Fixture(variant));
         var context = new TensorSharp.Models.Architecture.ModelCreateContext(probe.FilePaths[0], backend, probe, tp);
-        Assert.Equal(runtime, Qwen35RuntimeModel.ServesOneDevice(context));
-        Assert.Equal(runtime, Qwen35RuntimeModel.Serves(context));
+        Assert.False(Qwen35CudaModel.ServesLoad(context));
+    }
+
+    /// <summary>A golden of the deleted Qwen35Model (Fixtures/Qwen35Legacy).</summary>
+    private static List<float[]> LegacyGolden(string name)
+    {
+        using Stream stream = typeof(Qwen35RuntimeTests).Assembly.GetManifestResourceStream(
+            $"InferenceWeb.Tests.Fixtures.Qwen35Legacy.{name}.json") ?? throw new FileNotFoundException(name);
+        return System.Text.Json.JsonSerializer.Deserialize<List<float[]>>(stream)!;
     }
 
     /// <summary>Prefill, decode, reset, prefill, decode: a recurrent stack cannot rewind.</summary>
@@ -142,37 +143,36 @@ public sealed class Qwen35RuntimeTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(variant);
-        List<float[]> legacy;
-        using (var family = new Qwen35Model(path, BackendType.Cpu))
-            legacy = Script(family);
+        List<float[]> legacy = LegacyGolden($"script_{variant.Replace('-', '_')}_cpu");
         using var runtime = Create(path);
         List<float[]> actual = Script(runtime);
+        Assert.Equal(legacy.Count, actual.Count);
         for (int i = 0; i < legacy.Count; i++)
         {
             double rel = RelL2(actual[i], legacy[i]);
-            Assert.True(rel <= tolerance, $"{variant} row {i}: relL2 {rel:E2} from Qwen35Model");
+            Assert.True(rel <= tolerance, $"{variant} row {i}: relL2 {rel:E2} from Qwen35Model's");
         }
     }
 
     /// <summary>Bonsai2's PRISM rotations on the pinned GGML backend: the runtime's step graphs read every rotated
     /// product's input rotated (the GGML graph builder's weight_product, Q/K/V and gate/up sharing one rotation; the
     /// grouped value heads permuted before ssm_out's) and embed through the inverse transform, as Qwen35Model's fused
-    /// graphs do.</summary>
+    /// graphs did (its rows on ggml_cpu are the golden).</summary>
     [Fact]
-    public void PrismRotationsMatchQwen35Model()
+    public void PrismRotationsMatchTheFamilyGolden()
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         BackendType backend = TestGates.PinnedGgmlBackend;
         string path = Fixture("dense-prism");
-        List<float[]> legacy;
-        using (var family = new Qwen35Model(path, backend))
-            legacy = Script(family);
+        List<float[]> legacy = LegacyGolden("script_dense_prism_ggmlcpu");
         using var runtime = Create(path, backend: backend);
         List<float[]> actual = Script(runtime);
         Assert.True(runtime.GraphRuns > 0, "the steps did not run as graphs");
-        // Measured 2026-11-12 (M5 Pro): ggml_metal 1.1e-5 at most, ggml_cpu 2.0e-2 (its BF16-rounded activations, as
-        // PerOpTolerance bounds); with the rotations left out the first row is 1.2 away.
-        double tolerance = RoundsActivations(backend) ? 2.5e-2 : 1e-4;
+        // Measured 2026-11-12 (M5 Pro) against Qwen35Model on the same backend: ggml_metal 1.1e-5 at most, ggml_cpu
+        // 2.0e-2 (its BF16-rounded activations, as PerOpTolerance bounds); the golden is ggml_cpu's, so every backend
+        // sits within that rounding of it, plus its own where it rounds activations too (ggml_cuda on an RTX A5000:
+        // 2.52e-2). With the rotations left out the first row is 1.2 away.
+        double tolerance = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan ? 3.5e-2 : 2.5e-2;
         for (int i = 0; i < legacy.Count; i++)
         {
             double rel = RelL2(actual[i], legacy[i]);
@@ -212,24 +212,22 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [Theory]
     [InlineData("moe")]
     [InlineData("moe-quantized")]
-    public void HostExpertsInTheGraphMatchTheAcceleratorAndQwen35Model(string variant)
+    public void HostExpertsInTheGraphMatchTheAccelerator(string variant)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         BackendType backend = TestGates.PinnedGgmlBackend;
         string path = Fixture(variant);
-        List<float[]> device, host, legacyDevice, legacyHost, tiered;
+        List<float[]> device, host, tiered;
         MoeCpuOffloadConfig.Reset();
         try
         {
             using (var model = Create(path, backend: backend)) device = Script(model);
-            using (var model = new Qwen35Model(path, backend)) legacyDevice = Script(model);
             MoeCpuOffloadConfig.SetAllLayers();
             using (var model = Create(path, backend: backend))
             {
                 host = Script(model);
                 Assert.True(model.GraphRuns > 0, "the offloaded steps did not run as graphs");
             }
-            using (var model = new Qwen35Model(path, backend)) legacyHost = Script(model);
             // A tier holding every expert (fixed slots): every route runs on the accelerator at the pause.
             using (var model = Create(path, backend: backend))
             {
@@ -258,13 +256,6 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(host.Select((r, i) => RelL2(r, device[i])).All(r => r <= tolerance),
                 $"{variant} on {backend}: relL2 from the accelerator's experts: {Rows(host, device)}");
         }
-        // The runtime and Qwen35Model route this fixture's near-ties differently: with quantized experts they sit up
-        // to 6.1e-2 apart even on the accelerator (ggml_cpu), with BF16 experts 1.2e-2 (ggml_cuda). Worst row, host
-        // experts against Qwen35Model's (2026-11-11): ggml_metal 1.9e-3 (moe) / 2.6e-2 (moe-quantized), ggml_cuda
-        // 1.1e-2 (moe).
-        double fromLegacy = variant == "moe" ? 2e-2 : 7e-2;
-        Assert.True(host.Select((r, i) => RelL2(r, legacyHost[i])).All(r => r <= fromLegacy),
-            $"{variant} on {backend}: host experts relL2 from Qwen35Model's {Rows(host, legacyHost)}; accelerator experts {Rows(device, legacyDevice)}");
     }
 
     private void CompareBackend(string variant, BackendType backend)
@@ -772,9 +763,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture("dense-nextn");
-        List<float[]> legacy;
-        using (var family = new Qwen35Model(path, BackendType.Cpu))
-            legacy = DraftTrace(family);
+        List<float[]> legacy = LegacyGolden("draft_dense_nextn_cpu");
         using var runtime = Create(path, backend: BackendType.Mlx);
         List<float[]> actual = DraftTrace(runtime);
         Assert.Equal(legacy.Count, actual.Count);
@@ -792,9 +781,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture("dense-nextn");
-        List<float[]> legacy;
-        using (var family = new Qwen35Model(path, BackendType.Cpu))
-            legacy = DraftTrace(family);
+        List<float[]> legacy = LegacyGolden("draft_dense_nextn_cpu");
         using var runtime = Create(path, backend: TestGates.PinnedGgmlBackend);
         List<float[]> actual = DraftTrace(runtime);
         double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
@@ -878,18 +865,17 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.True(RelL2(scalar, graph[0]) > 10 * tolerance, "the position table changed nothing");
     }
 
-    /// <summary>The same image span through Qwen35Model (its fused graphs run ggml's M-RoPE).</summary>
+    /// <summary>The same image span as Qwen35Model ran it on the managed CPU (its golden).</summary>
     [Fact]
     public void ImageSpanMatchesTheFamilyImplementation()
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture("dense");
-        List<float[]> legacy;
-        using (var family = new Qwen35Model(path, TestGates.PinnedGgmlBackend))
-            legacy = MediaScript(family, out _);
+        List<float[]> legacy = LegacyGolden("media_dense_cpu");
         using var runtime = Create(path, backend: TestGates.PinnedGgmlBackend);
         List<float[]> actual = MediaScript(runtime, out _);
         double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
+        Assert.Equal(legacy.Count, actual.Count);
         for (int i = 0; i < legacy.Count; i++)
             Assert.True(RelL2(actual[i], legacy[i]) <= tolerance, $"row {i}: relL2 {RelL2(actual[i], legacy[i]):E2} from Qwen35Model");
     }

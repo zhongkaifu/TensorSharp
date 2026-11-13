@@ -49,8 +49,8 @@ public class Qwen36SpeculativeTests
         int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
 
         _output.WriteLine($"[mtp] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
-        using var model = new Qwen35Model(modelPath, ResolveBackend());
-        Xunit.Assert.True(model.HasDraftHead, "model should expose a NextN/MTP draft head");
+        using var model = (Qwen35RuntimeModel)ModelBase.Create(modelPath, ResolveBackend());
+        Xunit.Assert.True(((IDraftHead)model).HasDraftHead, "model should expose a NextN/MTP draft head");
 
         string prompt = "Q: What is the capital of France?\nA: The capital of France is Paris.\n" +
                         "Q: What is the capital of Japan?\nA:";
@@ -115,8 +115,8 @@ public class Qwen36SpeculativeTests
         int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
 
         _output.WriteLine($"[mtp-bench] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
-        using var model = new Qwen35Model(modelPath, ResolveBackend());
-        Xunit.Assert.True(model.HasDraftHead);
+        using var model = (Qwen35RuntimeModel)ModelBase.Create(modelPath, ResolveBackend());
+        Xunit.Assert.True(((IDraftHead)model).HasDraftHead);
 
         string prompt = "Write a short story about a robot learning to paint. " +
                         "Once upon a time, in a small workshop at the edge of the city,";
@@ -166,49 +166,6 @@ public class Qwen36SpeculativeTests
             $"snapshot={st.SnapshotMs:F0} rollback={st.RollbackMs:F0} catchup={st.CatchUpMs:F0} plain={st.PlainMs:F0}");
         _output.WriteLine($"[mtp-bench] baseline: \"{Trim(model.Tokenizer.Decode(baseline))}\"");
         _output.WriteLine($"[mtp-bench] spec:     \"{Trim(model.Tokenizer.Decode(specTokens))}\"");
-    }
-
-    [Fact]
-    public void Mtp_Profile_LayerTypeSplit()
-    {
-        // Opt-in profiling (TS_TEST_QWEN36_SPEC_PROFILE=1): where does a speculative step's
-        // trunk time go — attention layers, recurrent (GDN) layers, or the LM
-        // head? Drives optimization of the speculative path's per-pass cost.
-        string modelPath = ResolveModel();
-        if (modelPath == null || Environment.GetEnvironmentVariable("TS_TEST_QWEN36_SPEC_PROFILE") != "1")
-        { _output.WriteLine("[mtp-profile] opt-in not set; skipping"); return; }
-
-        int maxNew = EnvInt("TS_TEST_QWEN36_SPEC_NEW_TOKENS", 48);
-        int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
-
-        _output.WriteLine($"[mtp-profile] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
-        using var model = new Qwen35Model(modelPath, ResolveBackend());
-        Xunit.Assert.True(model.HasDraftHead);
-
-        string prompt = "Write a long, detailed essay about the history of video games. Begin:";
-        int[] tokens = model.Tokenizer.Encode(prompt, addSpecial: false).ToArray();
-
-        // Warmup.
-        model.ResetKVCache();
-        model.ForwardRefill(tokens);
-        model.Forward(new[] { tokens[^1] });
-
-        var spec = new SpeculativeDecoder(model, maxDraft);
-        model.ResetSpecLayerTimings();
-        var specTokens = spec.GenerateGreedy(tokens, maxNew);
-
-        double msPerTick = 1000.0 / Stopwatch.Frequency;
-        double attnMs = model.SpecAttnLayerTicks * msPerTick;
-        double recMs = model.SpecRecurrentLayerTicks * msPerTick;
-        double headMs = model.SpecLmHeadTicks * msPerTick;
-        double decodeMs = spec.LastDecodeSeconds * 1000;
-        _output.WriteLine($"[mtp-profile] tokens={specTokens.Count} decode={decodeMs:F0}ms " +
-            $"({decodeMs / specTokens.Count:F0} ms/token) acceptance={spec.AcceptanceRate:P0} " +
-            $"verify={spec.VerifySteps} plain={spec.PlainSteps} rollbacks={spec.RollbackSteps}");
-        _output.WriteLine($"[mtp-profile] trunk attention layers: {attnMs:F0} ms ({100 * attnMs / decodeMs:F1}% of decode)");
-        _output.WriteLine($"[mtp-profile] trunk recurrent (GDN) layers: {recMs:F0} ms ({100 * recMs / decodeMs:F1}%)");
-        _output.WriteLine($"[mtp-profile] trunk LM head: {headMs:F0} ms ({100 * headMs / decodeMs:F1}%)");
-        _output.WriteLine($"[mtp-profile] unaccounted (draft head, catch-up, emb, copies): {decodeMs - attnMs - recMs - headMs:F0} ms");
     }
 
     private static int Argmax(float[] v)

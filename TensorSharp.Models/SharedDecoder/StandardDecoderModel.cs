@@ -374,7 +374,13 @@ namespace TensorSharp.Models
             }
             catch
             {
-                Dispose();
+                // A Bonsai2 load releases what it owns without virtual dispatch into a subclass whose constructor has
+                // not finished, and each object independently: a missing native reset export must neither hide the
+                // load error nor leak the transcoded weights and their registered transforms.
+                if (HasBonsaiCheckpointMetadata)
+                    CleanUpFailedBonsaiConstruction(ReleaseDecoderResources, () => base.Dispose());
+                else
+                    Dispose();
                 throw;
             }
         }
@@ -1275,6 +1281,12 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            ReleaseDecoderResources();
+            base.Dispose();
+        }
+
+        private void ReleaseDecoderResources()
+        {
             StopHostWarm();
             foreach (RankExpertStack stack in _rankStacks.Values) stack.Stack.Dispose();
             _rankStacks.Clear();
@@ -1287,7 +1299,6 @@ namespace TensorSharp.Models
             ClearGraphCache();
             DisposeRecurrentStates();
             DropPendingMedia();
-            base.Dispose();
         }
     }
 }

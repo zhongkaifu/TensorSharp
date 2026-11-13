@@ -991,7 +991,6 @@ latency, quality or delegation-rate measurements are published. Full design:
 | `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H: largest attention score tensor (MiB) the materialized prefill fallback builds before it attends in query sub-chunks (default 1024). Not used by the GGML fused prefill kernel (F32/F16 cache), which switches to flash attention once the scores would be large. |
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H: device memory (MiB) the cached native Mamba2 prefill graphs may hold, least recently used first out (default 1024). A graph larger than the budget serves its call and is released. |
 | `TS_MLX_MLOCK_GGUF` | `1` (default) pins the GGUF mmap region in physical RAM via `mlock(2)` so model weights stay resident between forward passes. Set to `0` to skip (use if the process `memlock` rlimit is too low or you want the OS to manage paging). MLX backend only. |
-| `TS_MLX_BATCHED_MOE_DECODE` | `1` (default) collapses K per-expert decode dispatches to one batched dispatch per (gate/up/down) kind for Qwen 3.5/3.6 MoE. Set to `0` on memory-constrained machines (saves ~weight-doubling overhead from the stacked weight slabs). |
 | `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | Override the MLX allocator hard cap / unused-buffer cache cap / wired-buffer residency cap (megabytes). The allocator and wired caps default to 70% of the RAM, leaving macOS at least min(8 GiB, a quarter of the RAM): wired memory is never paged, and a cap near the RAM hangs the Mac instead of failing an allocation. The cache cap defaults to 2048. |
 | `TS_MLX_EVAL_EVERY_N_LAYERS` | Periodic `mlx_async_eval` cadence during decode to overlap GPU work with host queueing. Each MLX model has its own default (Gemma 4 and Muse-Glimmer every 4 layers, Qwen 3.5 and Nemotron-H every 16); the variable sets it for all of them. Set to `0` to disable where supported. |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | Override the search path for `libmlxc` when using `--backend mlx`. |
@@ -2029,7 +2028,6 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode. Layers offloaded by `--n-cpu-moe` are skipped by that materialization — they never run on the accelerator — so `--cpu-moe` also removes the load-time cost |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | Payload size above which ggml-cuda's collective converts F32 to BF16 before reducing. TensorSharp raises ggml's default (1 byte — i.e. always) to 1 MB so decode-sized collectives reduce exactly; `0` disables the conversion entirely |
-| `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |
 
 ### Constraints
@@ -2172,7 +2170,6 @@ continues to measure its direct backend decode paths, including MLX pipelining.
 | DFlash speculative prefill chunk | `1024` (capped by the drafter ring and the trunk's window) | `TS_DFLASH_PREFILL_CHUNK` | — |
 | DFlash2 candidate selector | ON when the checkpoint has one | `TS_DFLASH_SELECTOR=0` drafts by per-position argmax instead (diagnostic only) | — |
 | DFlash2 grouped convolution | ON when the checkpoint has one | `TS_DFLASH_CONV=0` drops it (diagnostic only) | — |
-| Qwen 3.5/3.8 recurrent-state snapshots | ON | `TS_Q35_VERIFY_SNAPSHOTS=0` reverts to restoring a pre-verify state copy and re-forwarding the accepted prefix (slower; see [qwen35.md §12.5](docs/models/qwen35.md)) | — |
 | Gemma 4 fused verify / draft kernels (ggml) | ON | — | — |
 | Gemma 4 dense fast rollback on partial accept | ON | — | — |
 
@@ -2289,7 +2286,6 @@ Every `TS_MINIMAX_M3_*` variable, with its default, is in the
 | MLX pipelined greedy decode (CLI `--benchmark` only) | ON when eligible | — | — |
 | MLX `mlock(2)` of GGUF mmap so weights stay resident | ON | `TS_MLX_MLOCK_GGUF=0` to disable | — |
 | MLX fused multi-dim KV write (single `slice_update` per cache block) | ON | — | — |
-| MLX batched MoE decode (Qwen 3.5/3.6 MoE) | ON | `TS_MLX_BATCHED_MOE_DECODE=0` runs the per-expert path (no stacked copy) | — |
 | MLX fused MoE gate+up+SiLUMul Metal kernel | ON | — | — |
 | MLX on-device MoE router top-K + softmax | ON when prerequisites are met | — | — |
 | MLX layer-boundary `async_eval` cadence | Gemma 4 / Muse-Glimmer: every 4 layers; Qwen / Nemotron / shared-decoder-runtime families: every 16 layers | `TS_MLX_EVAL_EVERY_N_LAYERS=N` (`0` = disabled where supported) | — |

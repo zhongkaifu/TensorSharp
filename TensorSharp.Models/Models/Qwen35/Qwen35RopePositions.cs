@@ -68,43 +68,4 @@ namespace TensorSharp.Models
         public static int ScalarPosition(int index, int delta) => checked(index + delta);
     }
 
-    public partial class Qwen35Model
-    {
-        // M-RoPE delta of the ACTIVE sequence (the primary cache or the checked-out
-        // holder): rope position = KV index + _ropeDelta for every token the pending
-        // position table does not cover. Zero for text-only history.
-        private int _ropeDelta;
-
-        /// <summary>The M-RoPE delta of the active sequence (test and diagnostics hook).</summary>
-        internal int ActiveRopePositionDelta => _ropeDelta;
-
-        private int RopePosition(int kvIndex) => Qwen35RopePositions.ScalarPosition(kvIndex, _ropeDelta);
-
-        /// <summary>
-        /// Settle the rope delta for a forward of <paramref name="seqLen"/> tokens at KV
-        /// index <paramref name="startPos"/>, before any kernel reads a position.
-        /// <list type="bullet">
-        /// <item>With a staged position table, the delta becomes the one that holds after
-        /// these rows. The table itself still drives this forward's rows, except when every
-        /// row is plain text at KV index + delta: the table is then dropped, so the text
-        /// after an image runs the ordinary scalar-RoPE graphs (the same rotation).</item>
-        /// <item>Without one, a forward from index 0 starts a new history (delta 0);
-        /// any other forward continues the active sequence's delta.</item>
-        /// </list>
-        /// </summary>
-        private void BeginRopePositions(int startPos, int seqLen)
-        {
-            int[] table = _pendingMRoPEPositions;
-            if (table != null && seqLen > 0 && table.Length >= 3 * seqLen)
-            {
-                int delta = Qwen35RopePositions.DeltaAfterRows(table, seqLen, startPos + seqLen);
-                _ropeDelta = delta;
-                if (Qwen35RopePositions.IsScalarContinuation(table, seqLen, startPos, delta))
-                    _pendingMRoPEPositions = null;
-                return;
-            }
-            if (startPos == 0)
-                _ropeDelta = 0;
-        }
-    }
 }

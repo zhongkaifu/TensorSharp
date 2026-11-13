@@ -67,6 +67,12 @@ namespace TensorSharp.Models
         /// True when this checkpoint runs on the direct-CUDA engine: a dense qwen35 (no experts)
         /// whose projections are unscaled NVFP4. TS_Q35_NATIVE=0 keeps the managed path.
         /// </summary>
+        /// <summary>The direct-CUDA engine serves this load: --backend cuda on one GPU (no --tp, no whole-layer stages,
+        /// no host experts) with a checkpoint it serves (<see cref="CanServe"/>); the shared runtime serves the rest.</summary>
+        internal static bool ServesLoad(Architecture.ModelCreateContext c)
+            => c.Backend == BackendType.Cuda && c.TpDegree <= 1 && c.TpGroup == null && c.LayerSplitDegree <= 1
+               && !MoeCpuOffloadConfig.IsEnabled && CanServe(c.Probe);
+
         internal static bool CanServe(GgufFile probe)
         {
             if (Environment.GetEnvironmentVariable("TS_Q35_NATIVE") == "0" || probe == null)

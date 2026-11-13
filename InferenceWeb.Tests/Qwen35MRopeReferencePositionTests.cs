@@ -17,7 +17,7 @@
 //
 // The tests drive the real code: the injector's layout, and the model's own position
 // state machine (BeginRopePositions / RopePosition, reached by reflection on an
-// uninitialized Qwen35Model - no weights are involved in choosing a position).
+// uninitialized Qwen35RuntimeModel - no weights are involved in choosing a position).
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
@@ -123,30 +123,17 @@ public class Qwen35MRopeReferencePositionTests
             for (int start = 0; start < promptLen; start += chunk)
             {
                 int n = Math.Min(chunk, promptLen - start);
-                int[] slice = table.AsSpan(3 * start, 3 * n).ToArray();
-                model.SetMRoPEPositions(slice);
-                Begin(model, start, n);
-                int[] pending = Pending(model);
-                for (int i = 0; i < n; i++)
-                {
-                    if (pending != null)
-                        produced.AddRange(new[] { pending[3 * i], pending[3 * i + 1], pending[3 * i + 2] });
-                    else
-                    {
-                        int p = RopePosition(model, start + i);
-                        produced.AddRange(new[] { p, p, p });
-                    }
-                }
-                model.SetMRoPEPositions(null);   // ForwardCore clears it after the forward
+                Stage(model, table.AsSpan(3 * start, 3 * n).ToArray());
+                produced.AddRange(Begin(model, start, n, out _));
             }
             Assert.Equal(s.Positions, produced);
-            Assert.Equal(s.Delta, model.ActiveRopePositionDelta);
+            Assert.Equal(s.Delta, model.ActiveRopeDelta);
 
             for (int k = 0; k < s.DecodePositions.Length; k++)
             {
-                Begin(model, promptLen + k, 1);
-                Assert.Null(Pending(model));
-                Assert.Equal(s.DecodePositions[k], RopePosition(model, promptLen + k));
+                int[] decode = Begin(model, promptLen + k, 1, out bool tabled);
+                Assert.False(tabled);
+                Assert.Equal(new[] { s.DecodePositions[k], s.DecodePositions[k], s.DecodePositions[k] }, decode);
             }
         }
     }
@@ -180,21 +167,19 @@ public class Qwen35MRopeReferencePositionTests
         // KV index + delta - which must be the table's own positions.
         var (_, promptTable) = Layout(s.PromptTokens, s.Spans);
         var model = NewModel();
-        model.SetMRoPEPositions(promptTable);
-        Begin(model, 0, promptLen);
-        model.SetMRoPEPositions(null);
+        Stage(model, promptTable);
+        Begin(model, 0, promptLen, out _);
         int cached = promptLen + s.DecodePositions.Length - 1;
         for (int i = promptLen; i < cached; i++)
-            Begin(model, i, 1);
+            Begin(model, i, 1, out _);
 
         int suffix = s.FollowUpTokens.Length - cached;
         int[] slice = followTable.AsSpan(3 * cached, 3 * suffix).ToArray();
-        model.SetMRoPEPositions(slice);
-        Begin(model, cached, suffix);
-        Assert.Null(Pending(model));
-        for (int i = 0; i < suffix; i++)
-            Assert.Equal(slice[3 * i], RopePosition(model, cached + i));
-        Assert.Equal(s.FollowUpDelta, model.ActiveRopePositionDelta);
+        Stage(model, slice);
+        int[] continued = Begin(model, cached, suffix, out bool tabled);
+        Assert.False(tabled);   // text at KV index + delta: the scalar form
+        Assert.Equal(slice, continued);
+        Assert.Equal(s.FollowUpDelta, model.ActiveRopeDelta);
     }
 
     /// <summary>Qwen3.8 Flash Next uses the same Qwen-VL layout, with the signed
@@ -248,22 +233,19 @@ public class Qwen35MRopeReferencePositionTests
         Scenario s = Get("two_images");
         var (_, table) = Layout(s.PromptTokens, s.Spans);
         var model = NewModel();
-        model.SetMRoPEPositions(table);
-        Begin(model, 0, table.Length / 3);
-        model.SetMRoPEPositions(null);
-        Assert.Equal(s.Delta, model.ActiveRopePositionDelta);
+        Stage(model, table);
+        Begin(model, 0, table.Length / 3, out _);
+        Assert.Equal(s.Delta, model.ActiveRopeDelta);
 
-        // Swapping a sequence out captures its delta with its rows.
-        object holder = typeof(Qwen35Model)
-            .GetMethod("SnapshotActiveCache", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .Invoke(model, null)!;
-        Assert.Equal(s.Delta, (int)holder.GetType().GetField("RopeDelta")!.GetValue(holder)!);
+        // Swapping a sequence out captures its delta with its rows (the slot carries it).
+        object slot = typeof(StandardDecoderModel).GetMethod("SnapshotActive", Hidden)!.Invoke(model, null)!;
+        Assert.Equal(s.Delta, (int)slot.GetType().GetField("RopeDelta")!.GetValue(slot)!);
 
         // A decode continues the delta; a text forward from index 0 starts a new history.
-        Begin(model, table.Length / 3, 1);
-        Assert.Equal(s.Delta, model.ActiveRopePositionDelta);
-        Begin(model, 0, 4);
-        Assert.Equal(0, model.ActiveRopePositionDelta);
+        Begin(model, table.Length / 3, 1, out _);
+        Assert.Equal(s.Delta, model.ActiveRopeDelta);
+        Begin(model, 0, 4, out _);
+        Assert.Equal(0, model.ActiveRopeDelta);
     }
 
     [Fact]
@@ -276,19 +258,35 @@ public class Qwen35MRopeReferencePositionTests
 
     // ---- reflection plumbing ----
 
-    private static Qwen35Model NewModel() => (Qwen35Model)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35Model));
+    private const BindingFlags Hidden = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
 
-    private static void Begin(Qwen35Model model, int startPos, int seqLen)
-        => typeof(Qwen35Model).GetMethod("BeginRopePositions", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .Invoke(model, new object[] { startPos, seqLen });
+    /// <summary>The shared runtime's position state, without weights: Qwen-VL's interleaved M-RoPE sections let it
+    /// take a table.</summary>
+    private static Qwen35RuntimeModel NewModel()
+    {
+        var model = (Qwen35RuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35RuntimeModel));
+        typeof(Qwen35RuntimeModel).GetField("_ropeSections", Hidden)!.SetValue(model, new[] { 11, 11, 10, 0 });
+        return model;
+    }
 
-    private static int RopePosition(Qwen35Model model, int kvIndex)
-        => (int)typeof(Qwen35Model).GetMethod("RopePosition", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .Invoke(model, new object[] { kvIndex })!;
+    /// <summary>The table the prompt expander stages for the next forward (null: none).</summary>
+    private static void Stage(Qwen35RuntimeModel model, int[] table) => ((TensorSharp.Models.Architecture.IMRoPEPositionSink)model).SetMRoPEPositions(table);
 
-    private static int[] Pending(Qwen35Model model)
-        => (int[])typeof(Qwen35Model).GetField("_pendingMRoPEPositions", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .GetValue(model);
+    /// <summary>The (T, H, W) of each row of a forward of <paramref name="rows"/> rows at KV index
+    /// <paramref name="start"/>, as the runtime rotates them; <paramref name="tabled"/>: from a table, not the
+    /// scalar KV index + delta.</summary>
+    private static int[] Begin(Qwen35RuntimeModel model, int start, int rows, out bool tabled)
+    {
+        object p = typeof(StandardDecoderModel).GetMethod("BeginRotaryPositions", Hidden)!.Invoke(model, new object[] { start, rows })!;
+        var table = (int[])p.GetType().GetProperty("Table")!.GetValue(p);
+        int delta = (int)p.GetType().GetProperty("RopeDelta")!.GetValue(p)!;
+        tabled = table != null;
+        var result = new int[3 * rows];
+        for (int i = 0; i < rows; i++)
+            for (int a = 0; a < 3; a++)
+                result[3 * i + a] = table != null ? table[3 * i + a] : start + i + delta;
+        return result;
+    }
 
     private static void InjectorSetPositions(ModelMultimodalInjector injector, string requestId, int[] table)
         => injector.SetMRoPEPositions(requestId, table);

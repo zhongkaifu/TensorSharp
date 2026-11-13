@@ -350,44 +350,10 @@
     <ReferenceNativeSymbol Include="TSGgml_PrefaultHostSpans" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PreloadQuantizedWeight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen21VisionEncoderF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatched" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatchedHidden" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDiscardHostPointer" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaFlushHostPointer" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaResetBatchedDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaUsesHolderBuffers" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35AttentionLayerDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35AttentionLayerPrefill" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35BatchedVerify" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35BatchedVerifyCommit" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35BatchedVerifyReset" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35CommitStateSnapshotOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35DiscardLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35DrainDeviceStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ExportLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35FetchStateSnapshotOwned" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35GdnDropTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35GdnLayerTP" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ImportLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ModelDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ModelDecodeBatched" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ModelDecodeToken" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ModelVerifyOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReadLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35RecurrentLayerPrefill" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReleaseAttentionTpGraphs" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReleaseVerifyGraphsPreserveState" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReleaseVerifyOwner" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReleaseVerifyTpGraphs" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCacheForHostPointer" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCacheOwner" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35VerifyArgmaxDone" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35VerifyRequestArgmax" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderMergedF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ZeroLiveStateOwned" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatchedTp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointer" SymbolType="Function" />

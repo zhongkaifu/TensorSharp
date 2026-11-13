@@ -538,7 +538,7 @@ GGUF 都不带这个视觉塔，因此 `--mmproj` 既可以指向 mmproj GGUF，
 
 ### Qwen 3.5 / 3.6 family
 
-所有 Qwen 3.5/3.6-family 变体（`qwen35`、`qwen35moe` 与 `qwen3next`）共用同一个 `Qwen35Model` 实现。图像输入通过支持动态分辨率的 `Qwen35VisionEncoder` 处理；请显式传入所选仓库的投影器（上文 9B 与 Qwen 3.6 示例均为 `mmproj-F16.gguf`；Bonsai2 27B 使用自己的 `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `-Q8_0.gguf`）。MoE 变体（例如 Qwen3.5-35B-A3B，以及使用同一架构标识的 Qwen3.6-35B-A3B GGUF）在 decode 时还会启用融合的 `MoEExpertsSwiGLUResidual` GGML 内核，将所有被选中的专家、可选的 shared expert 与残差加法合并到一次 GPU 计算图调度中执行。
+所有 Qwen 3.5/3.6-family 变体（`qwen35`、`qwen35moe` 与 `qwen3next`）共用共享解码运行时上的同一个 `Qwen35RuntimeModel`（`--backend cuda` 上的稠密 NVFP4 检查点由直连 CUDA 引擎执行）。图像输入通过支持动态分辨率的 `Qwen35VisionEncoder` 处理；请显式传入所选仓库的投影器（上文 9B 与 Qwen 3.6 示例均为 `mmproj-F16.gguf`；Bonsai2 27B 使用自己的 `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `-Q8_0.gguf`）。MoE 变体（例如 Qwen3.5-35B-A3B，以及使用同一架构标识的 Qwen3.6-35B-A3B GGUF）在 decode 时还会启用融合的 `MoEExpertsSwiGLUResidual` GGML 内核，将所有被选中的专家、可选的 shared expert 与残差加法合并到一次 GPU 计算图调度中执行。
 
 ### Qwen 3.8 Flash Next
 

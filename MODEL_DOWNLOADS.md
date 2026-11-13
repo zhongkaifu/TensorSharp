@@ -92,7 +92,7 @@ with a clear message rather than mis-loading them. Listed here so you know what 
 > [DFlash speculative decoding](docs/models/muse-glimmer.md#3-dflash-speculative-decoding).
 > The drafters below are not wired up because each one needs its target model to expose the
 > per-layer input residuals its encoder consumes, and `Gemma4Model` does not. Today
-> `MuseGlimmerModel` and `Qwen35Model` (the DFlash/DFlash2 drafters for Qwen 3.5 / 3.8) do;
+> `MuseGlimmerModel` and `Qwen35RuntimeModel` (the DFlash/DFlash2 drafters for Qwen 3.5 / 3.8) do;
 > `NemotronModel` taps them too, but speculation is refused on that trunk.
 
 | Backbone | Official checkpoint (safetensors) | Community GGUF |

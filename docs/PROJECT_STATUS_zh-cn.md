@@ -255,7 +255,7 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
     `TS_GPTOSS_FUSED_DECODE`、`TS_GPTOSS_TP_*`、`TS_GPTOSS_MLX_MOE_GQMM`、`TS_GPTOSS_PAGED_ATTN_MANAGED`），以及关闭
     默认路径的 Qwen 3.5 与 Gemma 4 开关（`TS_QWEN35_FULL_DECODE`、`TS_QWEN35_FUSED_VERIFY`、`TS_QWEN35_TP_FUSED*`、
     `TS_G4_*`、`TS_GMTP_NO_*` 等）。`TS_QWEN35_HOST_MOE_VERIFY` 改为 `TS_HOST_MOE_VERIFY`。`TS_Q35_VERIFY_SNAPSHOTS=0`
-    保留：它是 `ggml_cuda` 上宽 verify 分歧这一未修复问题的规避手段；
+    作为 `ggml_cuda` 上宽 verify 分歧的规避手段一直保留，直到 `Qwen35Model` 本身于 2026-11 删除；
   - 两个从未默认启用的实验：Qwen 3.5 的设备端常驻 verify 状态（`TS_QWEN35_VERIFY_RESIDENT`，已知结果错误）与
     Gemma 4 的批处理分页投机主干（`TS_GMTP_BATCHED_TRUNK`，速度约为融合线性 verify 的一半）。投机解码总在模型的
     线性缓存上运行；
