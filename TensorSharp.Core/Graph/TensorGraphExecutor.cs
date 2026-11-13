@@ -277,6 +277,9 @@ namespace TensorSharp.Graph
                 _make = make;
             }
 
+            /// <summary>The most keys a query attends (a sparse attention's budget: the op's hint), 0 when unknown.</summary>
+            public int KvMax { get; set; }
+
             /// <summary>The mask [nq, nkv] as a device tensor (uploaded on first use: a kernel that runs the
             /// pattern never needs it).</summary>
             public Tensor Tensor => _tensor ??= _make?.Invoke();
@@ -339,7 +342,7 @@ namespace TensorSharp.Graph
             return new AttentionMask(pattern, trimmedFloor, mask, (int)valid, pattern, trimmedFloor);
         }
 
-        private sealed class RunState
+        protected sealed class RunState
         {
             public readonly List<Tensor> Owned = new();
             /// <summary>Full products of a weight with a node's rows, shared by the row blocks a
@@ -639,7 +642,9 @@ namespace TensorSharp.Graph
                     int owner = -1;
                     for (int j = setMark; j < _setDuring.Count && owner < 0; j++)
                         if (ReferenceEquals(_values[_setDuring[j]].Tensor, t) && _own[_setDuring[j]] == null) owner = _setDuring[j];
-                    if (owner >= 0) _own[owner] = t;
+                    // A node made and read for the last time within this work (a fused region forcing its sources, the
+                    // add-and-norm peephole) was released before it had an owner: its tensor goes now, not at the step's end.
+                    if (owner >= 0 && _uses[owner] != Released) _own[owner] = t;
                     else t.Dispose();
                 }
                 Run.Owned.RemoveRange(mark, Run.Owned.Count - mark);
@@ -659,6 +664,7 @@ namespace TensorSharp.Graph
             }
 
             /// <summary>Node <paramref name="node"/> has been read once more: release it after its last reader.</summary>
+
             private void Use(int node)
             {
                 if (!_freeing || node < 0) return;
@@ -1053,6 +1059,9 @@ namespace TensorSharp.Graph
                 return new Value { Tensor = Shaped(given, leaf.Ne, run) };
             if (handle is StableInput stable)
             {
+                // A varying input binds its device copy alone: an op reading it on the host synchronizes, which aborts
+                // the recording, instead of recording this launch's values.
+                if (stable.Varies) return new Value { Tensor = Shaped(stable.Device, leaf.Ne, run) };
                 // The device copy a captured step binds; the host values still classify a mask and feed host reads.
                 Value host = HostValues(leaf.Format, leaf.Ne, data, bytes);
                 return host with { Tensor = Shaped(stable.Device, leaf.Ne, run) };
@@ -1247,7 +1256,7 @@ namespace TensorSharp.Graph
             return t;
         }
 
-        private static int[] Ints(Value v) => v.Ints ?? v.Tensor.GetElementsAsInt((int)v.Tensor.ElementCount());
+        protected static int[] Ints(Value v) => v.Ints ?? v.Tensor.GetElementsAsInt((int)v.Tensor.ElementCount());
 
         // ================================================================ ops
 
@@ -1265,7 +1274,7 @@ namespace TensorSharp.Graph
                 case GraphOp.Mul: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Mul(r, a, b)));
                 case GraphOp.Div: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Div(r, a, b)));
                 case GraphOp.Sqr: { Tensor x = In(T(0), run); return V(Ops.Mul(null, x, x)); }
-                case GraphOp.Sqrt: return V(Ops.Pow(null, In(T(0), run), 0.5f));
+                case GraphOp.Sqrt: return V(Sqrt(In(T(0), run)));
                 case GraphOp.Clamp: return V(Ops.Clamp(null, In(T(0), run), Fp(0, float.MinValue), Fp(1, float.MaxValue)));
                 case GraphOp.Scale: return V(Ops.Mul(null, In(T(0), run), Fp(0, 1f)));
                 case GraphOp.Silu: return V(Ops.SiLU(null, In(T(0), run)));
@@ -1355,11 +1364,9 @@ namespace TensorSharp.Graph
                 {
                     int at = 2;
                     Tensor score = Ip(0, 0) != 0 ? T(at++) : null;
-                    int[] blocks = Ip(1, 0) != 0 ? Ints(values[n.Srcs[at++]]) : null;
-                    long[] blockNe = blocks != null ? Ne(values[n.Srcs[at - 1]].Tensor) : null;
-                    int[] extra = Ip(2, 0) != 0 ? Ints(values[n.Srcs[at++]]) : null;
-                    long[] extraNe = extra != null ? Ne(values[n.Srcs[at - 1]].Tensor) : null;
-                    return V(TopKMask(T(0), Ints(values[n.Srcs[1]]), Ne(values[n.Srcs[1]].Tensor), score, blocks, blockNe, extra, extraNe, run));
+                    Value blocks = Ip(1, 0) != 0 ? values[n.Srcs[at++]] : default;
+                    Value extra = Ip(2, 0) != 0 ? values[n.Srcs[at++]] : default;
+                    return V(TopKMask(T(0), values[n.Srcs[1]], score, blocks, extra, run));
                 }
                 case GraphOp.FlashAttnExt:
                 {
@@ -1378,6 +1385,7 @@ namespace TensorSharp.Graph
                         int maskNode = n.Srcs[3];
                         if (!run.Masks.TryGetValue((maskNode, nq), out mask))
                             run.Masks[(maskNode, nq)] = mask = Classify(() => Mask(Device(values, maskNode, run), nq, run), m.Floats, nq, keys);
+                        if (Ip(1, 0) > 0) mask.KvMax = (int)Ip(1, 0);
                     }
                     return V(FlashAttention(q, k, v, mask, Fp(0, 1f), values[n.Srcs[1]].Window, values[n.Srcs[2]].Window));
                 }
@@ -1398,11 +1406,7 @@ namespace TensorSharp.Graph
                     return V(s);
                 }
                 case GraphOp.TopK: return TopK(Contig(T(0), run), (int)Ip(0, 1), run);
-                case GraphOp.SumRows:
-                {
-                    Tensor x = Contig(T(0), run);
-                    return V(Ops.Sum(null, x, x.DimensionCount - 1));
-                }
+                case GraphOp.SumRows: return V(SumRows(Contig(T(0), run)));
                 case GraphOp.SsmConv:
                 {
                     Tensor x = Contig(T(0), run), kernel = Contig(T(1), run);
@@ -1442,6 +1446,15 @@ namespace TensorSharp.Graph
             return result;
         }
 
+        /// <summary>ggml_sum_rows over a contiguous tensor: the sums of its innermost rows (executors with a kernel
+        /// override it).</summary>
+        protected virtual Tensor SumRows(Tensor x) => Ops.Sum(null, x, x.DimensionCount - 1);
+
+
+        /// <summary>The gather indices of <see cref="Gathered"/> by shape, on the device once (the first run, never inside a
+        /// recording: a recorded step reads the copy its recording bound).</summary>
+        private readonly Dictionary<string, Tensor> _gatherIndices = new();
+
         /// <summary><paramref name="b4"/> repeated to <paramref name="sizes"/> as a contiguous tensor: the rows
         /// of its longest unrepeated suffix gathered by index (one kernel on any backend).</summary>
         private Tensor Gathered(Tensor b4, long[] sizes, RunState run)
@@ -1451,6 +1464,18 @@ namespace TensorSharp.Graph
             while (k > 0 && b4.Sizes[k - 1] == sizes[k - 1]) { width *= sizes[k - 1]; k--; }
             long outer = 1, bOuter = 1;
             for (int i = 0; i < k; i++) { outer *= sizes[i]; bOuter *= b4.Sizes[i]; }
+            Tensor rows = run.Keep(Contig(b4, run).View(bOuter, width));
+            string key = $"{string.Join(",", b4.Sizes.ToArray())}>{string.Join(",", sizes)}";
+            Tensor cached;
+            lock (_gatherIndices)
+                if (!_gatherIndices.TryGetValue(key, out cached))
+                    _gatherIndices[key] = cached = GatherIndex(b4, sizes, k, outer);
+            Tensor gathered = run.Keep(Ops.IndexSelect(null, rows, cached));
+            return run.Keep(gathered.View(sizes));
+        }
+
+        private Tensor GatherIndex(Tensor b4, long[] sizes, int k, long outer)
+        {
             var index = new int[outer];
             var at = new long[Math.Max(1, k)];
             for (long o = 0; o < outer; o++)
@@ -1464,12 +1489,13 @@ namespace TensorSharp.Graph
                     at[i] = 0;
                 }
             }
-            Tensor rows = run.Keep(Contig(b4, run).View(bOuter, width));
-            Tensor gathered = run.Keep(Ops.IndexSelect(null, rows, IntTensor(index, new long[] { outer }, run)));
-            return run.Keep(gathered.View(sizes));
+            return NewIntTensor(index, new long[] { outer });
         }
 
         /// <summary>log(1 + exp(x)) as max(x, 0) + log(1 + exp(-|x|)) (no overflow).</summary>
+        /// <summary>ggml_sqrt, elementwise (executors with a kernel of their own override it).</summary>
+        protected virtual Tensor Sqrt(Tensor x) => Ops.Pow(null, x, 0.5f);
+
         protected virtual Tensor Softplus(Tensor x)
         {
             using Tensor abs = Ops.Abs(null, x);
@@ -1630,7 +1656,7 @@ namespace TensorSharp.Graph
         /// the host streams (a prompt chunk) runs every route here, the experts outside the tier read in for it and
         /// dropped after. Returns the weighted sum [rows, hidden].
         /// </summary>
-        private Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
+        protected virtual Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
             int layer, RunState run)
         {
             if (gateValue.Weight is not IGraphHostedExperts gate || upValue.Weight is not IGraphExpertWeights up
@@ -1647,20 +1673,36 @@ namespace TensorSharp.Graph
             host.Record(layer, ids);
 
             bool stream = host.StreamsStep(layer, rows);
-            var skip = new byte[routes];   // 1: the route runs on this device
-            bool anyHost = false, anyDevice = false;
+            var here = new byte[routes];   // 1: the route runs on this device
+            bool anyDevice = false;
             for (int i = 0; i < routes; i++)
             {
-                bool here = stream || host.IsResident(layer, ids[i]);
-                skip[i] = here ? (byte)1 : (byte)0;
-                anyHost |= !here;
-                anyDevice |= here;
+                here[i] = stream || host.IsResident(layer, ids[i]) ? (byte)1 : (byte)0;
+                anyDevice |= here[i] != 0;
             }
+            // The host's routes, less those the route-tail skip leaves out (an expert every row routes at the rank or lower).
+            var skip = (byte[])here.Clone();
+            int tail = stream ? 0 : host.TailSkipRank(layer);
+            if (tail > 0)
+                for (int i = 0; i < routes; i++)
+                {
+                    if (skip[i] != 0 || ids[i] < 0) continue;
+                    bool high = false;
+                    for (int j = 0; j < routes && !high; j++) high = ids[j] == ids[i] && j % k < tail;
+                    if (!high) skip[i] = 1;
+                }
+            bool anyHost = false;
+            for (int i = 0; i < routes; i++) anyHost |= skip[i] == 0 && ids[i] >= 0;
 
             // The returned tensor is the caller's to keep (V keeps it); the pieces summed into it are this run's.
-            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, skip, k, gate, up, down, host, layer, stream, run) : null;
+            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run) : null;
             if (!anyHost)
-                return device;
+            {
+                if (device != null) return device;
+                var zeros = new Tensor(Allocator, DType.Float32, rows, hidden);   // every route left out
+                Ops.Fill(zeros, 0f);
+                return zeros;
+            }
             float[] xs = xc.GetElementsAsFloat(rows * hidden);
             var output = new float[(long)rows * hidden];
             if (!host.Compute(layer, xs, ids, weights, skip, rows, output))
@@ -1793,6 +1835,8 @@ namespace TensorSharp.Graph
         /// higher index.</summary>
         private Tensor SetRows(Tensor dst, Tensor src, Value ids, RunState run)
         {
+            // Rows only on the device (a recorded step's varying input): written there.
+            if (ids.Ints == null && ids.Tensor != null && TrySetRowsOnDevice(dst, src, ids.Tensor)) return dst;
             int[] rows = Ints(ids);
             Tensor d4 = As4(dst, run);
             Tensor s4 = As4(F32(src, run.Owned), run);
@@ -1819,8 +1863,13 @@ namespace TensorSharp.Graph
             return dst;
         }
 
-        /// <summary>ggml_get_rows(a, ids): a [ne0, ne1, ne2, ne3], ids [n, ne2, ne3]: [ne0, n, ne2, ne3].</summary>
-        private Tensor GetRows(Tensor src, Value ids, RunState run)
+        /// <summary>ggml_set_rows with the row ids on the device ([n] I32 or I64, every higher index of dst one block): false
+        /// where this executor has no kernel for it (the ids are then read on the host).</summary>
+        protected virtual bool TrySetRowsOnDevice(Tensor dst, Tensor src, Tensor ids) => false;
+
+        /// <summary>ggml_get_rows(a, ids): a [ne0, ne1, ne2, ne3], ids [n, ne2, ne3]: [ne0, n, ne2, ne3]; the ids are read
+        /// on the host (executors with a gather kernel override it).</summary>
+        protected virtual Tensor GetRows(Tensor src, Value ids, RunState run)
         {
             long[] na = Ne(src), ni = Ne(ids.Tensor);
             int[] index = Ints(ids);
@@ -1879,7 +1928,7 @@ namespace TensorSharp.Graph
 
         /// <summary>ggml_lightning_indexer on the host: q [d, heads, rows], keys [d, 1, n], weights [heads, rows],
         /// mask [n, rows]; [n, rows] = sum over heads of weight * relu(q . key) + mask.</summary>
-        private Tensor LightningIndexer(Tensor q, Tensor keys, Tensor weights, Tensor mask, RunState run)
+        protected virtual Tensor LightningIndexer(Tensor q, Tensor keys, Tensor weights, Tensor mask, RunState run)
         {
             long[] nq = Ne(q), nk = Ne(keys);
             int d = (int)nq[0], heads = (int)nq[1], rows = (int)nq[2], n = (int)nk[2];
@@ -1903,7 +1952,13 @@ namespace TensorSharp.Graph
             return t;
         }
 
-        /// <summary>ggml_top_k_mask on the host (see <see cref="GraphOp.TopKMask"/>): an F32 [n_kv, rows] mask.</summary>
+        /// <summary>ggml_top_k_mask (see <see cref="GraphOp.TopKMask"/>): an F32 [n_kv, rows] mask; the picks, blocks and
+        /// cells read on the host (executors with a kernel override it).</summary>
+        protected virtual Tensor TopKMask(Tensor mask, Value picks, Tensor score, Value blocks, Value extra, RunState run)
+            => TopKMask(mask, Ints(picks), Ne(picks.Tensor), score, blocks.Tensor == null && blocks.Ints == null ? null : Ints(blocks),
+                blocks.Tensor == null && blocks.Ints == null ? null : Ne(blocks.Tensor),
+                extra.Tensor == null && extra.Ints == null ? null : Ints(extra), extra.Tensor == null && extra.Ints == null ? null : Ne(extra.Tensor), run);
+
         private Tensor TopKMask(Tensor mask, int[] picks, long[] pickNe, Tensor score, int[] blocks, long[] blockNe,
             int[] extra, long[] extraNe, RunState run)
         {
@@ -1945,7 +2000,8 @@ namespace TensorSharp.Graph
             return x.GetElementsAsFloat((int)x.ElementCount());
         }
 
-        private Value TopK(Tensor x, int k, RunState run)
+        /// <summary>ggml_top_k on the host (executors with a kernel override it; their result need not carry host ints).</summary>
+        protected virtual Value TopK(Tensor x, int k, RunState run)
         {
             long cols = x.Sizes[^1], rows = x.ElementCount() / cols;
             float[] v = x.GetElementsAsFloat((int)x.ElementCount());
@@ -1970,7 +2026,9 @@ namespace TensorSharp.Graph
             int d = (int)ne[0], heads = (int)ne[1], tokens = (int)ne[2];
             int dims = (int)n.Ip[0], mode = (int)n.Ip[1], ctx = (int)n.Ip[2];
             float freqBase = n.Fp[0], freqScale = n.Fp[1], extFactor = n.Fp[2], attnFactor = n.Fp[3];
-            int[] pos = Ints(positions);
+            // Read on the host only where the host needs them (multi-axis rows, or no device positions): a recorded step's
+            // varying positions are never read back.
+            int[] pos = multi || !BroadcastsPositionsOnDevice || positions.Tensor == null ? Ints(positions) : null;
             // Multi-axis rotary whose axes all carry the same position (every text token) is NeoX rotary at
             // that position: the device kernel, not the host loop below (which reads and writes the rows).
             if (multi && extFactor == 0f && pos.Length >= 3 * tokens && SameAxes(pos, tokens, n.Ip.Length > 6 && n.Ip[6] > 0 ? 4 : 3))
@@ -1997,6 +2055,7 @@ namespace TensorSharp.Graph
                     }
                     else
                     {
+                        pos ??= Ints(positions);
                         var perRow = new int[tokens * heads];
                         for (int t = 0; t < tokens; t++)
                             for (int h = 0; h < heads; h++) perRow[t * heads + h] = pos[t];

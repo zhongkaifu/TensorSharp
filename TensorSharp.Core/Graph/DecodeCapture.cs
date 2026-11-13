@@ -18,6 +18,11 @@ namespace TensorSharp.Graph
         public StableInput(Tensor device) => Device = device ?? throw new ArgumentNullException(nameof(device));
 
         public Tensor Device { get; }
+
+        /// <summary>The values change from launch to launch in a way the recording cannot follow (a family's refilled
+        /// input): a plan binds no host values for it, so an op that would read them on the host aborts the recording
+        /// rather than replaying the recorded launch's values.</summary>
+        public bool Varies { get; init; }
     }
 
     /// <summary>An executor that can record a decode step's device work once and replay it as one launch.</summary>
@@ -37,8 +42,10 @@ namespace TensorSharp.Graph
         /// <summary>The step is recorded: <see cref="Launch"/> replays it.</summary>
         bool Captured { get; }
 
-        /// <summary>The tensor input <paramref name="slot"/> is bound to at every launch (allocated once).</summary>
-        Tensor Stable(int slot, DType type, long[] sizes);
+        /// <summary>The tensor input <paramref name="slot"/> is bound to at every launch (allocated once). A
+        /// <paramref name="varies"/> input's host copy is stale once uploaded, so a host read of it inside the recording
+        /// aborts it (see <see cref="StableInput.Varies"/>).</summary>
+        Tensor Stable(int slot, DType type, long[] sizes, bool varies = false);
 
         /// <summary>
         /// Record <paramref name="run"/> (device work only: a host read of device data aborts the recording) and launch it.

@@ -23,9 +23,11 @@ public sealed class Qwen35RuntimeTests : IDisposable
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-qwen35-runtime-" + Guid.NewGuid().ToString("N"));
     private readonly KvCacheDtype _dtype = KvCacheDtypeConfig.Current;
     private readonly bool _dtypeExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+    private readonly Xunit.Abstractions.ITestOutputHelper _output;
 
-    public Qwen35RuntimeTests()
+    public Qwen35RuntimeTests(Xunit.Abstractions.ITestOutputHelper output)
     {
+        _output = output;
         Directory.CreateDirectory(_dir);
         MoeCpuOffloadConfig.Reset();
     }
@@ -57,6 +59,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
         // The quantized mix (IQ3_S / IQ4_XS experts, Q8_0 projections) quantizes activations, so
         // a rounding flip upstream moves outputs by ~1e-2 in either implementation.
         "moe-quantized" => new Qwen35MoeSyntheticModelBuilder { Layers = 8 }.Write(Path.Combine(_dir, "q35-moe-q.gguf")),
+        // Eight routes a token: the route-tail skip's rank 7 is one of them.
+        "moe-k8" => new Qwen35MoeSyntheticModelBuilder { Layers = 4, TopK = 8, UniformWeightType = SyntheticGguf.GgmlType.BF16 }
+            .Write(Path.Combine(_dir, "q35-moe-k8.gguf")),
         // Two KV heads, so tensor parallelism can split the attention layers.
         "moe-tp" => new Qwen35MoeSyntheticModelBuilder { Layers = 8, UniformWeightType = SyntheticGguf.GgmlType.BF16, KvHeads = 2 }
             .Write(Path.Combine(_dir, "q35-moe-tp.gguf")),
@@ -494,6 +499,37 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData(true)]
     public void HostExpertsOnDirectCudaMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Cuda, tier);
 
+    /// <summary>The route-tail skip on the tensor executors' expert host (Strata's, on by default): in a step the host
+    /// computes, a host expert every row routes at rank 7 or lower is left out; a streamed prompt chunk computes every route.
+    /// The same answers as the exact sums for the prompt, slightly different ones after.</summary>
+    [MlxFact]
+    public void RouteTailSkipOnMlxLeavesOutLowRankHostRoutes() => AssertRouteTailSkip(BackendType.Mlx);
+
+    [CudaFact]
+    public void RouteTailSkipOnDirectCudaLeavesOutLowRankHostRoutes() => AssertRouteTailSkip(BackendType.Cuda);
+
+    private void AssertRouteTailSkip(BackendType backend)
+    {
+        using var kv = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-k8");
+        (List<float[]> Rows, long HostRoutes) Run(int rank)
+        {
+            using var model = Create(path, backend: backend);
+            model.RouteTailSkipForTests = (rank, 100);
+            List<float[]> rows = Script(model);
+            return (rows, model.ExpertHostCountsForTests.HostRoutes);
+        }
+        (List<float[]> exact, long exactRoutes) = Run(0);
+        (List<float[]> skipped, long skippedRoutes) = Run(7);
+        _output.WriteLine($"{backend}: host routes {exactRoutes} exact, {skippedRoutes} with the tail skip");
+        Assert.True(skippedRoutes < exactRoutes && skippedRoutes * 8 >= exactRoutes * 7 - 8,
+            $"host routes {skippedRoutes} with the skip, {exactRoutes} without");
+        Assert.Equal(exact[0], skipped[0]);   // the streamed prompt chunk: every route
+        double worst = Enumerable.Range(1, exact.Count - 1).Max(i => RelL2(skipped[i], exact[i]));
+        Assert.True(worst > 0 && worst < 5e-2, $"rows after the prompt moved {worst:E2}");
+    }
+
     private void AssertHostExpertsMatchDevice(BackendType backend, bool tier)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
@@ -501,7 +537,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
         List<float[]> reference;
         using (var device = Create(path, backend: backend))
             reference = Script(device);
-        MoeCpuOffloadConfig.SetAllLayers();
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
         using var offloaded = Create(path, backend: backend);
         if (tier)
             for (int l = 0; l < offloaded.Config.NumLayers; l++)

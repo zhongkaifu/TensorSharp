@@ -34,11 +34,28 @@ namespace TensorSharp.Models
             private readonly bool _deviceIsHost;
             private readonly bool[][] _tier;
 
+            private readonly int _tailRank, _tailMaxCachedPercent;
+
             public ModelExpertHost(StandardDecoderModel model, bool deviceIsHost)
             {
                 _m = model;
                 _deviceIsHost = deviceIsHost;
                 _tier = new bool[model.Config.NumLayers][];
+                (_tailRank, _tailMaxCachedPercent) = model.RouteTailSkip;
+            }
+
+            /// <summary>Off where every expert is the device's or the layer's tier holds the switch's share of them (the
+            /// misses are rare there, and the skip would only cost quality).</summary>
+            public int TailSkipRank(int layer)
+            {
+                if (_deviceIsHost || _tailRank <= 0) return 0;
+                if (_tier[layer] is { } held)
+                {
+                    int count = 0;
+                    foreach (bool h in held) if (h) count++;
+                    if (count * 100L >= (long)_tailMaxCachedPercent * held.Length) return 0;
+                }
+                return _tailRank;
             }
 
             /// <summary>Keep <paramref name="experts"/> of <paramref name="layer"/> on the executor's device.</summary>
@@ -97,12 +114,36 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>The route-tail skip's rank (0 off) and the tier share past which a layer computes every route
+        /// (TS_MOE_ROUTE_TAIL_SKIP, default 7; TS_MOE_TAIL_SKIP_MAX_CACHED, default 90 percent): the switches ggml's tiers
+        /// read. Tests that compare exact sums pass their own.</summary>
+        private (int Rank, int MaxCachedPercent) RouteTailSkip
+        {
+            get
+            {
+                if (RouteTailSkipForTests is { } fixedSkip) return fixedSkip;
+                static int Env(string name, int fallback)
+                    => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) ? v : fallback;
+                return (Math.Max(0, Env("TS_MOE_ROUTE_TAIL_SKIP", 7)), Math.Clamp(Env("TS_MOE_TAIL_SKIP_MAX_CACHED", 90), 0, 100));
+            }
+        }
+
+        /// <summary>Test seam: the route-tail skip this model's expert host applies (set before the first offloaded step).</summary>
+        internal (int Rank, int MaxCachedPercent)? RouteTailSkipForTests { get; set; }
+
         /// <summary>The expert host of an offloaded <paramref name="layer"/> on a tensor executor, or null (a resident layer,
         /// or the GGML backends).</summary>
         private ModelExpertHost HostFor(int layer)
         {
             if (IsGgmlBackend || !_anyMoe || !_moeLayer[layer] || !IsExpertLayerOffloaded(layer)) return null;
-            return _expertHost ??= new ModelExpertHost(this, deviceIsHost: _backend == BackendType.Cpu);
+            if (_expertHost == null)
+            {
+                _expertHost = new ModelExpertHost(this, deviceIsHost: _backend == BackendType.Cpu);
+                // The planned tiers (TryPlanTensorExecutorTiers), resident since the preload.
+                for (int l = 0; _tierExperts != null && l < _tierExperts.Length; l++)
+                    _expertHost.SetTier(l, _tierExperts[l]);
+            }
+            return _expertHost;
         }
 
         /// <summary>Routes the expert host computed on the host, and steps it streamed to the device (tests).</summary>

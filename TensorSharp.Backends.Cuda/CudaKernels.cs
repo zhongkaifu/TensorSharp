@@ -391,6 +391,8 @@ namespace TensorSharp.Cuda
             dequantWeightF16 = module.GetFunction("ts_dequant_weight_f16");
             try { module.GetFunction("ts_caps_q2_0_dequant"); DequantsQ2_0 = true; }
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
+            try { module.GetFunction("ts_caps_moe_dp4a_iq_q2_0"); MoeDp4aIqQ2_0 = true; }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
             dequantWeightQ80F16 = module.GetFunction("ts_dequant_weight_q8_0_f16");
             convertF32F16 = module.GetFunction("ts_convert_f32_f16");
             convertF32Bf16 = module.GetFunction("ts_convert_f32_bf16");
@@ -708,6 +710,10 @@ namespace TensorSharp.Cuda
 
         /// <summary>Whether ts_dequant_weight_f16 decodes Q2_0 (the module carries its marker).</summary>
         public bool DequantsQ2_0 { get; }
+
+        /// <summary>Whether the MoE dp4a kernels take IQ2_XS, IQ3_XXS, IQ4_NL and Q2_0 experts (the module carries its
+        /// marker).</summary>
+        public bool MoeDp4aIqQ2_0 { get; }
 
         /// <summary>The SM architecture the code the driver loaded for this module was compiled
         /// for (0 = unknown; see <see cref="CudaModule.CompiledArchOf"/>).</summary>

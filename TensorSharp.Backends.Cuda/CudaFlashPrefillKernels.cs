@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 3;
+        public const int CurrentVersion = 4;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
@@ -69,16 +69,20 @@ namespace TensorSharp.Cuda
         /// Causal attention of q [heads][nq][d] F32 over keys 0..len-1 of the head-first F16 caches k, v [kvHeads][cap][d]:
         /// query t sees keys [floor, len - nq + t]. out [nq][heads][d] F32. With <paramref name="splits"/> &gt; 1 the splits
         /// write <paramref name="partial"/> (<see cref="PartialFloats"/>) and a combine pass writes out. With
-        /// <paramref name="dyn"/> (a recorded decode step's parameter block) the length is read on the device.
+        /// <paramref name="dyn"/> (a recorded decode step's parameter block) the length is read on the device. With
+        /// <paramref name="cells"/> (one decode row: a sparse attention's selection) the keys are the cache rows listed there,
+        /// <paramref name="cellCount"/>[0] of them on the device, each with its value in the mask row
+        /// <paramref name="cellMask"/> added (len and floor unused).
         /// </summary>
         public unsafe void LaunchAttention(IntPtr q, IntPtr k, IntPtr v, int cap, int nq, int len, int floor, int heads,
-            int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default)
+            int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
+            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default)
         {
             int rows = nq * (heads / kvHeads);
-            IntPtr a0 = q, a1 = k, a2 = v, a11 = partial, a12 = output, a13 = dyn;
+            IntPtr a0 = q, a1 = k, a2 = v, a11 = partial, a12 = output, a13 = dyn, a14 = cells, a15 = cellCount, a16 = cellMask;
             int a3 = cap, a4 = nq, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = splits;
             float a9 = scale;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16 };
             var (fn, smem) = headDim == 128 ? (_attn128, _smem128) : (_attn256, _smem256);
             uint tiles = (uint)((rows + BlockRows - 1) / BlockRows);
             CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)smem, stream, (IntPtr)args,

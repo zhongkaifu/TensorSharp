@@ -79,7 +79,7 @@ namespace TensorSharp.Models
         /// is part of the profile's identity: keep it stable, or earlier profiles stop matching.</summary>
         private protected void AttachRoutingProfile(string architectureId, int numExperts)
         {
-            if (_routingProfile != null || !IsGgmlBackend || IsTensorParallel || numExperts <= 0)
+            if (_routingProfile != null || IsTensorParallel || numExperts <= 0)
                 return;
             int n = Config.NumLayers;
             string identity = MoeRoutingProfile.IdentityFor(ModelFilePaths, architectureId, n, numExperts);

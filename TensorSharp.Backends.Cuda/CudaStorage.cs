@@ -186,8 +186,8 @@ namespace TensorSharp.Cuda
             lock (sync)
             {
                 AllocatorImpl.Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyHtoDAsync(DevicePtrAtElement(storageIndex), src, new UIntPtr((ulong)byteCount),
-                    AllocatorImpl.Stream.Handle).ThrowOnError();
+                // The source may be a model file's mapping with page-locked ranges a copy must not span (CudaHostPins).
+                CudaHostPins.CopyToDevice(DevicePtrAtElement(storageIndex), src, byteCount, AllocatorImpl.Stream.Handle).ThrowOnError();
                 CudaDriverApi.cuStreamSynchronize(AllocatorImpl.Stream.Handle).ThrowOnError();
                 deviceDirty = true;
                 hostDirty = false;

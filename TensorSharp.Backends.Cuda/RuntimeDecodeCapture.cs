@@ -26,6 +26,7 @@ namespace TensorSharp.Cuda
         private readonly CudaPrefillGraphCache _graphs;
         private readonly CudaDecodeDynParams _dyn;
         private readonly Dictionary<int, Tensor> _stable = new();
+        private readonly HashSet<int> _varying = new();
         private bool _disposed;
 
         public RuntimeDecodeCapture(CudaAllocator allocator)
@@ -37,8 +38,9 @@ namespace TensorSharp.Cuda
 
         public bool Captured { get; private set; }
 
-        public Tensor Stable(int slot, DType type, long[] sizes)
+        public Tensor Stable(int slot, DType type, long[] sizes, bool varies = false)
         {
+            if (varies) _varying.Add(slot);
             if (_stable.TryGetValue(slot, out Tensor t))
             {
                 if (t.ElementType == type && t.Sizes.SequenceEqual(sizes)) return t;
@@ -53,6 +55,7 @@ namespace TensorSharp.Cuda
         public bool CaptureAndLaunch(Func<bool> run, int attendLength, int writeRow, IReadOnlyList<Tensor> written)
         {
             if (Captured || _disposed || !_graphs.IsUsable || !_dyn.IsValid || _stable.Count == 0) return false;
+            _allocator.OnRecordedStepLaunching();
             Upload();
             _dyn.Write(attendLength, writeRow, 0, 0);
             if (!_graphs.BeginCapture(Key)) return false;
@@ -88,6 +91,7 @@ namespace TensorSharp.Cuda
         public void Launch(int attendLength, int writeRow)
         {
             if (!Captured) throw new InvalidOperationException("no decode step is recorded");
+            _allocator.OnRecordedStepLaunching();
             Upload();
             _dyn.Write(attendLength, writeRow, 0, 0);
             _graphs.Replay(Key);
@@ -103,8 +107,14 @@ namespace TensorSharp.Cuda
         /// upload inside the recording would be refused.</summary>
         private void Upload()
         {
-            foreach (Tensor t in _stable.Values)
-                if (t.Storage is CudaStorage storage) storage.EnsureDeviceCurrent();
+            foreach ((int slot, Tensor t) in _stable)
+                if (t.Storage is CudaStorage storage)
+                {
+                    storage.EnsureDeviceCurrent();
+                    // A varying input's host copy is not what later launches read: a host read inside the recording
+                    // must synchronize (and so abort it), never bake this launch's values in.
+                    if (_varying.Contains(slot)) storage.MarkDeviceModified();
+                }
         }
 
         public void Dispose()

@@ -9,7 +9,9 @@
 // have no generic tensor-op equivalent, with ggml's semantics so a program computes the same thing
 // on every backend.
 
-#define TS_GRAPH_KERNELS_VERSION 6
+#include <cuda_fp16.h>
+
+#define TS_GRAPH_KERNELS_VERSION 11
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -199,6 +201,426 @@ extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
             }
         }
     }
+}
+
+// ggml_top_k: the indices of each row's k largest values, largest first, a tie going to the lower index (the order the
+// host sort gives). x [rows, cols] (cols <= 4096), ids [rows, k] int32. Launch: grid rows, block 256, cols floats of
+// dynamic shared memory.
+extern "C" __global__ void ts_graph_topk_f32(const float* __restrict__ x, int* __restrict__ ids, int cols, int k)
+{
+    extern __shared__ float row[];
+    __shared__ float bestV[8];
+    __shared__ int bestI[8];
+    const size_t r = blockIdx.x;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        row[c] = x[r * cols + c];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    for (int j = 0; j < k; j++)
+    {
+        float v = -INFINITY;
+        int idx = 0x7fffffff;
+        for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        {
+            const float t = row[c];
+            if (t > v || (t == v && c < idx)) { v = t; idx = c; }
+        }
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            const float ov = __shfl_xor_sync(0xffffffff, v, off);
+            const int oi = __shfl_xor_sync(0xffffffff, idx, off);
+            if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+        }
+        if (lane == 0) { bestV[warp] = v; bestI[warp] = idx; }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            float bv = bestV[0];
+            int bi = bestI[0];
+            for (int w = 1; w < warps; w++)
+                if (bestV[w] > bv || (bestV[w] == bv && bestI[w] < bi)) { bv = bestV[w]; bi = bestI[w]; }
+            if (bi < 0 || bi >= cols) bi = 0;
+            ids[r * k + j] = bi;
+            row[bi] = -INFINITY;
+        }
+        __syncthreads();
+    }
+}
+
+// Floats as unsigned keys in the same order (larger float, larger key); -0 is +0 (equal values tie, as the host sort has
+// them).
+__device__ __forceinline__ unsigned int ts_order_key(float v)
+{
+    const unsigned int u = v == 0.0f ? 0u : __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// ggml_top_k for many picks or wide rows (a sparse attention's blocks): the k-th largest value radix-selected (four 8-bit
+// passes over the row), every larger value and the lowest-indexed equal ones taken, and the k picks sorted largest
+// first, a tie to the lower index: ts_graph_topk_f32's order and ties. x [rows, cols], ids [rows, k], k <= n2 (a power of
+// two). Launch: grid rows, block 1024, n2 * 8 bytes of dynamic shared memory.
+extern "C" __global__ void ts_graph_topk_wide_f32(const float* __restrict__ x, int* __restrict__ ids, int cols, int k, int n2)
+{
+    extern __shared__ unsigned long long picks[];   // (key << 32) | ~index: larger value, then lower index, sorts first
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int warpCounts[32];
+    __shared__ unsigned int s_prefix, s_remaining, s_taken, s_equalBase;
+    const float* row = x + (size_t)blockIdx.x * cols;
+    if (threadIdx.x == 0) { s_prefix = 0; s_remaining = (unsigned int)k; s_taken = 0; s_equalBase = 0; }
+    unsigned int mask = 0;
+    for (int shift = 24; shift >= 0; shift -= 8)
+    {
+        for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+        __syncthreads();
+        const unsigned int prefix = s_prefix;
+        for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        {
+            const unsigned int key = ts_order_key(row[c]);
+            if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            unsigned int remaining = s_remaining, b = 255;
+            while (b > 0 && hist[b] < remaining) { remaining -= hist[b]; b--; }
+            s_prefix = prefix | (b << shift);
+            s_remaining = remaining;
+        }
+        mask |= 255u << shift;
+        __syncthreads();
+    }
+    const unsigned int thr = s_prefix, need = s_remaining;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+    {
+        const unsigned int key = ts_order_key(row[c]);
+        if (key > thr) picks[atomicAdd(&s_taken, 1u)] = ((unsigned long long)key << 32) | (unsigned int)(~c);
+    }
+    __syncthreads();
+    // The values equal to the k-th: the lowest-indexed ones, a block-wide scan over each stride of the row.
+    const unsigned int greater = s_taken;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    for (int base = 0; base < cols; base += blockDim.x)
+    {
+        const unsigned int done = s_equalBase;
+        if (done >= need) break;   // uniform: read after the barrier below (or the one above)
+        const int c = base + threadIdx.x;
+        const bool eq = c < cols && ts_order_key(row[c]) == thr;
+        const unsigned int ballot = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) warpCounts[warp] = __popc(ballot);
+        __syncthreads();
+        unsigned int before = done + __popc(ballot & ((1u << lane) - 1u));
+        for (int w = 0; w < warp; w++) before += warpCounts[w];
+        if (eq && before < need) picks[greater + before] = ((unsigned long long)thr << 32) | (unsigned int)(~c);
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            unsigned int total = 0;
+            for (int w = 0; w < warps; w++) total += warpCounts[w];
+            s_equalBase = done + total;
+        }
+        __syncthreads();
+    }
+    for (int i = k + threadIdx.x; i < n2; i += blockDim.x) picks[i] = 0ull;
+    __syncthreads();
+    // Bitonic sort, largest first.
+    for (int size = 2; size <= n2; size <<= 1)
+        for (int stride = size >> 1; stride > 0; stride >>= 1)
+        {
+            for (int i = threadIdx.x; i < n2; i += blockDim.x)
+            {
+                const int j = i ^ stride;
+                if (j > i)
+                {
+                    const unsigned long long a = picks[i], b = picks[j];
+                    if ((i & size) == 0 ? a < b : a > b) { picks[i] = b; picks[j] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        ids[(size_t)blockIdx.x * k + i] = (int)~(unsigned int)(picks[i] & 0xffffffffull);
+}
+
+// ggml_get_rows by device int32 indices into F32 rows: src [batches, rowsPerBatch, rowLen] (F32 or F16) with rows
+// rowPitch elements apart (a strided view's; batches > 1 only for packed rows), ids [batches, n];
+// out [batches, n, rowLen] = src[b, ids[b, i], :]. Launch: grid batches * n, block 256.
+extern "C" __global__ void ts_graph_get_rows_f32(const float* __restrict__ src, const int* __restrict__ ids,
+    float* __restrict__ out, int rowLen, int n, int rowsPerBatch, long long rowPitch)
+{
+    const size_t o = blockIdx.x;
+    const size_t b = o / n;
+    const size_t from = (b * rowsPerBatch + ids[o]) * (size_t)rowPitch;
+    for (int c = threadIdx.x; c < rowLen; c += blockDim.x)
+        out[o * rowLen + c] = src[from + c];
+}
+
+extern "C" __global__ void ts_graph_get_rows_f16(const __half* __restrict__ src, const int* __restrict__ ids,
+    float* __restrict__ out, int rowLen, int n, int rowsPerBatch, long long rowPitch)
+{
+    const size_t o = blockIdx.x;
+    const size_t b = o / n;
+    const size_t from = (b * rowsPerBatch + ids[o]) * (size_t)rowPitch;
+    for (int c = threadIdx.x; c < rowLen; c += blockDim.x)
+        out[o * rowLen + c] = __half2float(src[from + c]);
+}
+
+// ggml_set_rows by device int32 indices: dst row ids[i] (F32 or F16 rows of rowLen, dstPitch elements apart, dstRows of
+// them) takes src row i (contiguous F32; F16 rounds to nearest even); an index out of range writes nothing.
+// Launch: grid count, block 256.
+extern "C" __global__ void ts_graph_set_rows_f32(const float* __restrict__ src, const int* __restrict__ ids, void* __restrict__ dst,
+    int rowLen, long long dstPitch, int dstRows, int half)
+{
+    const size_t i = blockIdx.x;
+    const int row = ids[i];
+    if (row < 0 || row >= dstRows) return;
+    const size_t to = (size_t)row * (size_t)dstPitch;
+    for (int c = threadIdx.x; c < rowLen; c += blockDim.x)
+    {
+        const float v = src[i * rowLen + c];
+        if (half) ((__half*)dst)[to + c] = __float2half_rn(v);
+        else ((float*)dst)[to + c] = v;
+    }
+}
+
+// ggml_lightning_indexer: out[r, j] = sum over heads h of w[r, h] * relu(q[r, h, :] . keys[j, :]) + mask[r % maskRows, j].
+// q [rows, heads, d], keys [n, d], w [rows, heads], mask [maskRows, n], all F32; d <= 256. Launch: grid (ceil(n / 8), rows),
+// block 256 (a warp a key), heads * d floats of dynamic shared memory.
+extern "C" __global__ void ts_graph_lightning_indexer_f32(const float* __restrict__ q, const float* __restrict__ keys,
+    const float* __restrict__ w, const float* __restrict__ mask, float* __restrict__ out, int d, int heads, int n, int maskRows)
+{
+    extern __shared__ float sq[];
+    const size_t r = blockIdx.y;
+    for (int i = threadIdx.x; i < heads * d; i += blockDim.x)
+        sq[i] = q[r * heads * d + i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int j = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (j >= n) return;
+    float kr[8];
+#pragma unroll
+    for (int t = 0; t < 8; t++)
+    {
+        const int i = lane + 32 * t;
+        kr[t] = i < d ? keys[(size_t)j * d + i] : 0.f;
+    }
+    float sum = 0.f;
+    for (int h = 0; h < heads; h++)
+    {
+        float dot = 0.f;
+#pragma unroll
+        for (int t = 0; t < 8; t++)
+        {
+            const int i = lane + 32 * t;
+            if (i < d) dot += sq[h * d + i] * kr[t];
+        }
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        if (dot > 0.f) sum += w[r * heads + h] * dot;
+    }
+    if (lane == 0)
+        out[r * n + j] = sum + mask[(r % maskRows) * n + j];
+}
+
+// The cells each row of a mask keeps (above -inf), in order: cells [rows, n], count [rows] (a sparse attention's keys).
+// Launch: grid rows, block 1024.
+extern "C" __global__ void ts_graph_mask_cells(const float* __restrict__ mask, int* __restrict__ cells, int* __restrict__ count, int n)
+{
+    __shared__ unsigned int warpCounts[32];
+    __shared__ unsigned int s_base;
+    const float* m = mask + (size_t)blockIdx.x * n;
+    int* out = cells + (size_t)blockIdx.x * n;
+    if (threadIdx.x == 0) s_base = 0;
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    for (int base = 0; base < n; base += blockDim.x)
+    {
+        const int c = base + threadIdx.x;
+        const bool keep = c < n && m[c] != -INFINITY;
+        const unsigned int ballot = __ballot_sync(0xffffffffu, keep);
+        if (lane == 0) warpCounts[warp] = __popc(ballot);
+        __syncthreads();
+        unsigned int at = s_base + __popc(ballot & ((1u << lane) - 1u));
+        for (int w = 0; w < warp; w++) at += warpCounts[w];
+        if (keep) out[at] = c;
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            unsigned int total = 0;
+            for (int w = 0; w < warps; w++) total += warpCounts[w];
+            s_base += total;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) count[blockIdx.x] = (int)s_base;
+}
+
+// ggml_top_k_mask: out[r, c] = mask[r % maskRows, c] at the cells row r keeps, -inf elsewhere. Kept: each pick's cells
+// (picks [rows, top]; a pick out of range, or whose score [rows, nPick] is -inf, keeps none; a pick's cells are its row of
+// blocks [nBlocks, cells] when given, else the pick itself) and extra [rows, nExtra]; cells outside [0, nkv) are skipped.
+// score, blocks and extra may be null. Launch: grid rows, block 256.
+extern "C" __global__ void ts_graph_topk_mask_f32(const float* __restrict__ mask, const int* __restrict__ picks,
+    const float* __restrict__ score, const int* __restrict__ blocks, const int* __restrict__ extra, float* __restrict__ out,
+    int nkv, int maskRows, int top, int nPick, int cells, int nBlocks, int nExtra)
+{
+    const size_t r = blockIdx.x;
+    float* o = out + r * nkv;
+    const float* m = mask + (r % maskRows) * nkv;
+    for (int c = threadIdx.x; c < nkv; c += blockDim.x)
+        o[c] = -INFINITY;
+    __syncthreads();
+    const int perPick = blocks ? cells : 1;
+    for (int i = threadIdx.x; i < top * perPick; i += blockDim.x)
+    {
+        const int pick = picks[r * top + i / perPick];
+        if (score && (pick < 0 || pick >= nPick || score[r * nPick + pick] == -INFINITY)) continue;
+        int c = pick;
+        if (blocks)
+        {
+            if (pick < 0 || pick >= nBlocks) continue;
+            c = blocks[(size_t)pick * cells + i % perPick];
+        }
+        if (c >= 0 && c < nkv) o[c] = m[c];
+    }
+    if (extra)
+        for (int e = threadIdx.x; e < nExtra; e += blockDim.x)
+        {
+            const int c = extra[r * nExtra + e];
+            if (c >= 0 && c < nkv) o[c] = m[c];
+        }
+}
+
+// ggml_cpy between F16 and F32 over n contiguous elements (round to nearest even into F16).
+extern "C" __global__ void ts_graph_f16_to_f32(const __half* __restrict__ x, float* __restrict__ y, long long n)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        y[i] = __half2float(x[i]);
+}
+
+extern "C" __global__ void ts_graph_f32_to_f16(const float* __restrict__ x, __half* __restrict__ y, long long n)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        y[i] = __float2half_rn(x[i]);
+}
+
+// ---- host experts on a recorded step (GraphOp.MoeHostExperts, the doorbell of the Qwen3.8 engines): a layer's routes
+// to experts its device tier holds run on the device, the others on the host while the device works, without the step
+// returning to the host. ts_graph_moe_route_split writes the device's routes (a host expert's id becomes -1, which the
+// MoE kernels skip) and, when some route is the host's, publishes the layer's input and routes into host-mapped memory
+// and advances the counter; ts_graph_moe_wait_add then waits for the host's flag and adds its sum. Both read the counter
+// from memory, so a replayed graph carries no stale value; an all-device layer rings nothing (missDev = 0).
+// hdr: [0] layer, [1] slots, [2] 1 (routes published). Launch route_split <<<1, 1024>>>.
+// The route-tail skip: host route i (rank i % perRow) at tailRank or lower is left out when no row routes its expert
+// higher (0: off).
+__device__ __forceinline__ bool ts_graph_tail_dropped(const int* __restrict__ sel, int slots, int perRow, int i, int tailRank)
+{
+    if (tailRank <= 0 || i % perRow < tailRank) return false;
+    const int e = sel[i];
+    for (int j = 0; j < slots; j++)
+        if (sel[j] == e && j % perRow < tailRank) return false;
+    return true;
+}
+
+extern "C" __global__ void ts_graph_moe_route_split(
+    const float* __restrict__ x, const int* __restrict__ sel, const float* __restrict__ selW,
+    const unsigned char* __restrict__ onDevice, int n, int rows, int perRow, int layer, int tailRank, int* __restrict__ devSel,
+    unsigned int* __restrict__ counts, float* xOut, int* idsOut, float* wOut, int* hdr, unsigned int* seq, int* missDev)
+{
+    // rows of perRow routes each, a route's rank its slot in its row; every route counted for the routing profile.
+    const int slots = rows * perRow;
+    int miss = 0;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        if (e >= 0 && counts != nullptr) atomicAdd(&counts[e], 1u);
+        const bool device = e >= 0 && onDevice[e];
+        devSel[i] = device ? e : -1;
+        if (e >= 0 && !device && !ts_graph_tail_dropped(sel, slots, perRow, i, tailRank))
+            miss = 1;
+    }
+    miss = __syncthreads_or(miss);
+    if (threadIdx.x == 0)
+        *missDev = miss;
+    if (!miss)
+        return;
+    // A route the device runs, or the tail skip leaves out, is published as -(e + 2) (the host records it and skips it), so
+    // the two sides split the routes by this table alone.
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        idsOut[i] = e >= 0 && (onDevice[e] || ts_graph_tail_dropped(sel, slots, perRow, i, tailRank)) ? -(e + 2) : e;
+        wOut[i] = selW[i];
+    }
+    for (int i = threadIdx.x; i < rows * n; i += blockDim.x)
+        xOut[i] = x[i];
+    if (threadIdx.x == 0)
+    {
+        ((volatile int*)hdr)[0] = layer;
+        ((volatile int*)hdr)[1] = slots;
+        ((volatile int*)hdr)[2] = 1;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        *(volatile unsigned int*)seq = *(volatile unsigned int*)seq + 1u;
+        __threadfence_system();
+    }
+}
+
+// Every block waits for the host's flag to reach the counter, then adds its part of the host's sum (missDev 0: nothing
+// was rung; count 0: the host had nothing to add).
+extern "C" __global__ void ts_graph_moe_wait_add(const unsigned int* flag, const unsigned int* seq, const int* count,
+    const float* hostOut, float* __restrict__ dst, int n, const int* missDev)
+{
+    __shared__ int add;
+    if (threadIdx.x == 0)
+    {
+        add = *missDev;
+        if (add)
+        {
+            const unsigned int want = *(const volatile unsigned int*)seq;
+            while (*(const volatile unsigned int*)flag != want)
+            {
+            }
+            __threadfence_system();
+            add = *(const volatile int*)count;
+        }
+    }
+    __syncthreads();
+    if (!add)
+        return;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        dst[i] += ((const volatile float*)hostOut)[i];
+}
+
+// ggml_sum_rows over contiguous rows of cols floats: y[r] = sum of x[r, :]. Launch: grid rows, block 256.
+extern "C" __global__ void ts_graph_sum_rows_f32(const float* __restrict__ x, float* __restrict__ y, int cols)
+{
+    __shared__ float part[8];
+    const float* row = x + (size_t)blockIdx.x * cols;
+    float s = 0.f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        s += row[c];
+    for (int off = 16; off > 0; off >>= 1)
+        s += __shfl_xor_sync(0xffffffffu, s, off);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float t = 0.f;
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += part[w];
+        y[blockIdx.x] = t;
+    }
+}
+
+// ggml_sqrt, elementwise over n contiguous floats.
+extern "C" __global__ void ts_graph_sqrt_f32(const float* __restrict__ x, float* __restrict__ y, long long n)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        y[i] = sqrtf(x[i]);
 }
 
 // ggml_softplus: x > 20 ? x : log(1 + exp(x)), elementwise over n contiguous floats.

@@ -109,6 +109,26 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     public void RuntimeMatchesQwen4ExpModelOnGgmlCuda(bool chunkedPrompt) => MatchesOnGgml(BackendType.GgmlCuda, chunkedPrompt);
 
     /// <summary>Qwen4ExpModel's token-span graphs on ggml_cpu (QSA layers dense below the budget) against the runtime.</summary>
+    /// <summary>The direct-CUDA tensor executor (the device top-k, gathers and conversions; QSA dense within the budget)
+    /// against Qwen4ExpModel's goldens.</summary>
+    [CudaTheory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void RuntimeOnDirectCudaMatchesQwen4ExpModel(bool chunkedPrompt, bool qsa)
+    {
+        if (qsa)
+        {
+            MatchesOnGgml(BackendType.Cuda, chunkedPrompt);
+            return;
+        }
+        string path = Fixture(qsa: false);
+        float[][] expected = LegacyGolden(chunkedPrompt ? "script_chunked_cpu" : "script_cpu");
+        float[][] actual = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cuda), chunkedPrompt);
+        AssertClose(expected, actual, 2e-2, "cuda");
+    }
+
     private void MatchesOnGgml(BackendType backend, bool chunkedPrompt)
     {
         string path = Fixture();

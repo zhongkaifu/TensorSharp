@@ -5,7 +5,7 @@ using TensorSharp.Cuda.Interop;
 namespace TensorSharp.Cuda
 {
     [Serializable]
-    public sealed class CudaAllocator : IAllocator, IDisposable
+    public sealed class CudaAllocator : IAllocator, IDeviceMemoryInfo, IDisposable
     {
         private int disposed;
 
@@ -106,6 +106,19 @@ namespace TensorSharp.Cuda
         /// <summary>The flash prefill attention kernels for this device (tensorsharp_flash_prefill), loaded on first use;
         /// null where the module is missing or stale.</summary>
         internal CudaFlashPrefillKernels FlashPrefillKernels => LoadOnce(ref flashPrefillKernels, ref flashPrefillState, CudaFlashPrefillKernels.TryCreate);
+
+        /// <summary>Raised before a recorded step is launched (or recorded): host threads its kernels wait on spin up.</summary>
+        internal event Action RecordedStepLaunching;
+
+        internal void OnRecordedStepLaunching() => RecordedStepLaunching?.Invoke();
+
+        private readonly System.Collections.Generic.List<IDisposable> ownedResources = new();
+
+        /// <summary>A resource that lives as long as this allocator's context (disposed with it, before the context).</summary>
+        internal void Own(IDisposable resource)
+        {
+            lock (ownedResources) ownedResources.Add(resource);
+        }
 
         private delegate bool ModuleFactory<T>(out T module, out string reason);
 
@@ -218,6 +231,24 @@ namespace TensorSharp.Cuda
             return ((long)free.ToUInt64(), (long)total.ToUInt64());
         }
 
+        /// <summary>Free device memory, with the blocks the pool caches for reuse counted as free, and the total.</summary>
+        public bool TryGetDeviceMemory(out long freeBytes, out long totalBytes)
+        {
+            try
+            {
+                (freeBytes, totalBytes) = GetMemoryInfo();
+                freeBytes += pool.GetStats().CachedBytes;
+                return totalBytes > 0;
+            }
+            catch (CudaException)
+            {
+                freeBytes = totalBytes = 0;
+                return false;
+            }
+        }
+
+        public bool SharesHostMemory => false;
+
         internal static readonly bool VramLogEnabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_LOG_VRAM"), "1", StringComparison.Ordinal);
 
@@ -265,6 +296,11 @@ namespace TensorSharp.Cuda
 
             Context.MakeCurrent();
             Stream.Synchronize();
+            lock (ownedResources)
+            {
+                foreach (IDisposable resource in ownedResources) resource.Dispose();
+                ownedResources.Clear();
+            }
             CudaQuantizedOps.ReleaseScratch(this);
             CudaQuantizedOps.ReleaseArena(this);
             pool.DrainAndFree();

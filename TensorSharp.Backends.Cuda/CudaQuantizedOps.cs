@@ -498,6 +498,7 @@ namespace TensorSharp.Cuda
                 12 => Q4KDp4aEnabled,
                 16 => Iq2xxsDp4aEnabled,
                 22 => Iq2sDp4aEnabled,
+                17 or 18 or 20 or 42 => true,   // IQ2_XS, IQ3_XXS, IQ4_NL, Q2_0 (where the module has them)
                 _ => false,
             };
         }
@@ -554,7 +555,8 @@ namespace TensorSharp.Cuda
                 ggmlType == 23 ||    // IQ4_XS
                 ggmlType == 29 ||    // IQ1_M
                 ggmlType == 39 ||    // MXFP4 (gpt-oss experts)
-                ggmlType == 40;      // NVFP4
+                ggmlType == 40 ||    // NVFP4
+                ggmlType == 42;      // Q2_0 (ISTA-DASLab's GSQ-RCO packs)
         }
 
         /// <summary>
@@ -1471,8 +1473,9 @@ namespace TensorSharp.Cuda
                 IntPtr devicePtr = arena.Allocate(rawBytes);
                 try
                 {
+                    // (A model file's mapping may hold page-locked ranges a copy must not span: CudaHostPins cuts it there.)
                     if (upload == null)
-                        CudaDriverApi.cuMemcpyHtoD(devicePtr, hostData, new UIntPtr((ulong)rawBytes)).ThrowOnError();
+                        CudaHostPins.CopyToDevice(devicePtr, hostData, rawBytes, IntPtr.Zero).ThrowOnError();
                     else
                         upload(devicePtr);
                 }

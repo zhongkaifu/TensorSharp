@@ -327,6 +327,7 @@ namespace TensorSharp.Models
             r.Step.Dispose();
         }
 
+
         /// <summary>Decode steps record on executors that can (<see cref="IDecodeCaptureExecutor"/>).</summary>
         internal bool DecodeCaptureDisabled { get; set; }
 
@@ -339,8 +340,8 @@ namespace TensorSharp.Models
         private bool TryRunRecorded(DecodeReplay r, CachedGraph cached, Slot[] slots, int[] starts)
         {
             if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length != 1 || GraphExecutor is not IDecodeCaptureExecutor recorder
-                || cached.Plan is not IGraphTensorOutputs keep || _expertHost != null)
-                return false;   // (a step with host experts reads the routes back mid-step: it cannot be recorded)
+                || cached.Plan is not IGraphTensorOutputs keep || (_expertHost != null && !GraphExecutor.Capabilities.RecordsHostExperts))
+                return false;   // (a step whose host experts read the routes back mid-step cannot be recorded)
             if (r.Capture == null && ++r.Advances < 2) return false;
             r.Capture ??= recorder.OpenDecodeCapture();
             if (r.Capture == null) { r.CaptureFailed = true; return false; }
@@ -1927,10 +1928,15 @@ namespace TensorSharp.Models
                 return node;
             }
 
-            public int InputF32(float[] values, params long[] ne)
+            public int InputF32(float[] values, params long[] ne) => InputF32(values, InputKind.Opaque, ne);
+
+            /// <summary>F32 values that stay what they are while the rows' positions move.</summary>
+            internal int ConstantInputF32(float[] values, params long[] ne) => InputF32(values, InputKind.Constant, ne);
+
+            private int InputF32(float[] values, InputKind kind, long[] ne)
             {
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F32, ne, IntPtr.Zero, 0);
-                AddInput(node, Pin(values), (long)values.Length * sizeof(float));
+                AddInput(node, Pin(values), (long)values.Length * sizeof(float), kind: kind, values: values);
                 return node;
             }
 
@@ -2217,7 +2223,7 @@ namespace TensorSharp.Models
             internal int InputF16(ushort[] values, params long[] ne)
             {
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, ne, IntPtr.Zero, 0);
-                AddInput(node, Pin(values), values.LongLength * sizeof(ushort));
+                AddInput(node, Pin(values), values.LongLength * sizeof(ushort), values: values);
                 return node;
             }
 
@@ -2364,29 +2370,36 @@ namespace TensorSharp.Models
                             _inputHandles[i] = stable;
                             break;
                         }
-                        case InputKind.Positions or InputKind.Constant when m.Values is int[] ints:
+                        case InputKind.Positions or InputKind.Constant or InputKind.Refill when m.Values is int[] ints:
                         {
-                            Tensor stable = capture.Stable(i, DType.Int32, new long[] { ints.Length });
+                            Tensor stable = capture.Stable(i, DType.Int32, new long[] { ints.Length }, m.Kind == InputKind.Refill);
                             stable.SetElementsAsInt(ints);
-                            _inputHandles[i] = new StableInput(stable);
+                            _inputHandles[i] = new StableInput(stable) { Varies = m.Kind == InputKind.Refill };
                             break;
                         }
-                        case InputKind.WriteRows when m.Values is long[] longs:
+                        case InputKind.WriteRows or InputKind.Refill when m.Values is long[] longs:
                         {
-                            Tensor stable = capture.Stable(i, DType.Int32, new long[] { longs.Length });
+                            Tensor stable = capture.Stable(i, DType.Int32, new long[] { longs.Length }, m.Kind == InputKind.Refill);
                             var ints = new int[longs.Length];
                             for (int j = 0; j < ints.Length; j++) ints[j] = checked((int)longs[j]);
                             stable.SetElementsAsInt(ints);
-                            _inputHandles[i] = new StableInput(stable);
+                            _inputHandles[i] = new StableInput(stable) { Varies = m.Kind == InputKind.Refill };
                             break;
                         }
-                        case InputKind.DecodeMask when m.Values is ushort[] half:
+                        case InputKind.Constant or InputKind.Refill when m.Values is float[] values:
                         {
-                            Tensor stable = capture.Stable(i, DType.Float32, new long[] { half.Length });
+                            Tensor stable = capture.Stable(i, DType.Float32, new long[] { values.Length }, m.Kind == InputKind.Refill);
+                            stable.SetElementsAsFloat(values);
+                            _inputHandles[i] = new StableInput(stable) { Varies = m.Kind == InputKind.Refill };
+                            break;
+                        }
+                        case InputKind.DecodeMask or InputKind.Refill when m.Values is ushort[] half:
+                        {
+                            Tensor stable = capture.Stable(i, DType.Float32, new long[] { half.Length }, m.Kind == InputKind.Refill);
                             var floats = new float[half.Length];
                             for (int j = 0; j < floats.Length; j++) floats[j] = (float)BitConverter.UInt16BitsToHalf(half[j]);
                             stable.SetElementsAsFloat(floats);
-                            _inputHandles[i] = new StableInput(stable);
+                            _inputHandles[i] = new StableInput(stable) { Varies = m.Kind == InputKind.Refill };
                             break;
                         }
                         default:

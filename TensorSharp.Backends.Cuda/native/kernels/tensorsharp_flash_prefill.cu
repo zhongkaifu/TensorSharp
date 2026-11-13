@@ -27,7 +27,7 @@
 // so the committed compute_75 PTX carries working kernels.
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 3
+#define TS_FLASH_PREFILL_VERSION 4
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -58,6 +58,8 @@ extern "C" __global__ void ts_flash_prefill_caps(int* out)
 // dyn[0], read on the device. splits > 1 (a grid too small to fill the device: a few
 // query rows over a long window): block x = (row tile, key split), each split takes a 32-key-aligned share of its
 // rows' keys and writes unnormalized partials (acc, ln-domain max, sum) that ts_flash_prefill_combine_f32 merges.
+// With cells set (one decode row, nq = 1: a sparse attention's selection) the keys are the listed cache rows
+// cells[0 .. cellCount[0]) instead of 0..len-1, each with its mask value cellMask[cell] added (len and floor unused).
 // sm_80+ (cp.async, ldmatrix, mma.f16): the compute_75 image traps here; the host launches it only where
 // CudaPrefillModule.ArchGuardedKernelsUsable holds.
 // ---------------------------------------------------------------------------
@@ -153,11 +155,16 @@ template <int HD>
 __device__ __forceinline__ void ts_fp_attn(
     const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len,
     int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out,
-    const int* __restrict__ dyn)
+    const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask)
 {
     // A recorded decode step reads the window's length from the step's parameter block (CudaDecodeDynParams).
     if (dyn != nullptr)
         len = dyn[0];
+    if (cells != nullptr)
+    {
+        len = cellCount[0];
+        floor = 0;
+    }
     constexpr int ROW = TsFpAttnSmem<HD>::ROW, KS = HD / 16, NS = HD / 8;
     extern __shared__ __align__(16) uint8_t ts_fp_attn_smem[];
     TsFpAttnSmem<HD>& sm = *reinterpret_cast<TsFpAttnSmem<HD>*>(ts_fp_attn_smem);
@@ -186,7 +193,8 @@ __device__ __forceinline__ void ts_fp_attn(
             const int isV = i >= TS_FP_KT * CHUNKS, c = isV ? i - TS_FP_KT * CHUNKS : i;
             const int key = c / CHUNKS, part = c % CHUNKS;
             const bool ok = first + key < kHi;
-            const half* src = (isV ? vHead : kHead) + (long long)(ok ? first + key : 0) * HD + part * 8;
+            const int row = !ok ? 0 : cells != nullptr ? cells[first + key] : first + key;
+            const half* src = (isV ? vHead : kHead) + (long long)row * HD + part * 8;
             ts_fp_cp16((isV ? sm.v[st] : sm.k[st]) + key * ROW + part * 8, src, ok);
         }
     };
@@ -260,10 +268,16 @@ __device__ __forceinline__ void ts_fp_attn(
         for (int j = 0; j < 4; ++j)
         {
             const int key = first + j * 8 + qd * 2;
-            s[j][0] = key < end0 && key >= floor ? s[j][0] : -INFINITY;
-            s[j][1] = key + 1 < end0 && key + 1 >= floor ? s[j][1] : -INFINITY;
-            s[j][2] = key < end1 && key >= floor ? s[j][2] : -INFINITY;
-            s[j][3] = key + 1 < end1 && key + 1 >= floor ? s[j][3] : -INFINITY;
+            float mk0 = 0.0f, mk1 = 0.0f;   // a listed cell's mask value (log2 units)
+            if (cells != nullptr)
+            {
+                mk0 = key < kHi ? cellMask[cells[key]] * 1.4426950408889634f : 0.0f;
+                mk1 = key + 1 < kHi ? cellMask[cells[key + 1]] * 1.4426950408889634f : 0.0f;
+            }
+            s[j][0] = key < end0 && key >= floor ? s[j][0] + mk0 : -INFINITY;
+            s[j][1] = key + 1 < end0 && key + 1 >= floor ? s[j][1] + mk1 : -INFINITY;
+            s[j][2] = key < end1 && key >= floor ? s[j][2] + mk0 : -INFINITY;
+            s[j][3] = key + 1 < end1 && key + 1 >= floor ? s[j][3] + mk1 : -INFINITY;
             t0 = fmaxf(t0, fmaxf(s[j][0], s[j][1]));
             t1 = fmaxf(t1, fmaxf(s[j][2], s[j][3]));
         }
@@ -380,8 +394,8 @@ __device__ __forceinline__ void ts_fp_attn(
     extern "C" __global__ void __launch_bounds__(256) ts_flash_prefill_f16_d##HD( \
         const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len, \
         int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
-        const int* __restrict__ dyn) \
-    { ts_fp_attn<HD>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn); }
+        const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask) \
+    { ts_fp_attn<HD>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn, cells, cellCount, cellMask); }
 
 TS_FP_ATTN(128)
 TS_FP_ATTN(256)

@@ -42,6 +42,14 @@ namespace TensorSharp.Graph
         void Record(int layer, ReadOnlySpan<int> ids);
 
         /// <summary>
+        /// The route-tail skip of <paramref name="layer"/> (approximate, on by default: TS_MOE_ROUTE_TAIL_SKIP, Strata's
+        /// STRATA_ROUTE_TAIL_SKIP): in a step the host computes, an expert the device does not hold that every row routes at
+        /// this 0-based rank or lower (in the row's descending top-K) is left out, its weight dropped, not renormalized.
+        /// 0 computes every route (a layer whose tier holds most of its experts, or the switch at 0).
+        /// </summary>
+        int TailSkipRank(int layer);
+
+        /// <summary>
         /// The routed experts of <paramref name="rows"/> rows on the host: <paramref name="x"/> [rows, hidden],
         /// <paramref name="ids"/> and <paramref name="weights"/> [rows, K]; a route whose <paramref name="skip"/> entry
         /// is nonzero is the device's and adds nothing here. Writes the weighted sum [rows, hidden] to

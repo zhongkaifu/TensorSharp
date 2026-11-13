@@ -56,22 +56,25 @@ namespace TensorSharp.Models
         private static int _cpuMoeLayers;
         private static bool _allLayers;
         private static bool _explicitlySet;
+        // A test's own policy for the models it constructs, invisible to tests running alongside
+        // (AllLayersForCurrentFlowInTests).
+        private static readonly System.Threading.AsyncLocal<bool> s_flowAllLayers = new();
 
         /// <summary>
         /// Number of leading layers whose routed experts live on the CPU. Only
         /// meaningful when <see cref="AllLayers"/> is false. Zero means the
         /// feature is off.
         /// </summary>
-        public static int CpuMoeLayers => _cpuMoeLayers;
+        public static int CpuMoeLayers => s_flowAllLayers.Value ? 0 : _cpuMoeLayers;
 
         /// <summary>True when every MoE layer is offloaded (<c>--cpu-moe</c>).</summary>
-        public static bool AllLayers => _allLayers;
+        public static bool AllLayers => s_flowAllLayers.Value || _allLayers;
 
         /// <summary>True when any MoE layer is offloaded to the host.</summary>
-        public static bool IsEnabled => _allLayers || _cpuMoeLayers > 0;
+        public static bool IsEnabled => AllLayers || _cpuMoeLayers > 0;
 
         /// <summary>True when a CLI flag or environment variable set the policy.</summary>
-        public static bool IsExplicitlySet => _explicitlySet;
+        public static bool IsExplicitlySet => s_flowAllLayers.Value || _explicitlySet;
 
         /// <summary>
         /// Worker threads for the host-side MoE matmul. Zero (the default) lets
@@ -90,6 +93,24 @@ namespace TensorSharp.Models
             _cpuMoeLayers = layers;
             _allLayers = false;
             _explicitlySet = true;
+        }
+
+        /// <summary>
+        /// <c>--cpu-moe</c> for the models this test flow constructs only: the process-wide policy other tests see is
+        /// untouched. Dispose to end it.
+        /// </summary>
+        internal static IDisposable AllLayersForCurrentFlowInTests()
+        {
+            bool previous = s_flowAllLayers.Value;
+            s_flowAllLayers.Value = true;
+            return new FlowScope(previous);
+        }
+
+        private sealed class FlowScope : IDisposable
+        {
+            private readonly bool _previous;
+            public FlowScope(bool previous) => _previous = previous;
+            public void Dispose() => s_flowAllLayers.Value = _previous;
         }
 
         /// <summary>Offload the routed experts of every MoE layer.</summary>
@@ -152,7 +173,7 @@ namespace TensorSharp.Models
         /// </summary>
         public static bool IsLayerOnCpu(int layer)
         {
-            if (_allLayers)
+            if (AllLayers)
                 return true;
             return layer >= 0 && layer < _cpuMoeLayers;
         }
@@ -178,7 +199,7 @@ namespace TensorSharp.Models
         {
             if (!IsEnabled || !IsRoutedExpertWeightName(name))
                 return false;
-            if (_allLayers)
+            if (AllLayers)
                 return true;
             return TryParseLayerIndex(name, out int layer) && layer < _cpuMoeLayers;
         }
@@ -297,7 +318,7 @@ namespace TensorSharp.Models
         /// </summary>
         public static string Describe()
         {
-            if (_allLayers) return "all layers";
+            if (AllLayers) return "all layers";
             if (_cpuMoeLayers > 0) return $"first {_cpuMoeLayers} layer(s)";
             return null;
         }

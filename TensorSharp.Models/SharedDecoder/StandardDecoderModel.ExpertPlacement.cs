@@ -147,11 +147,17 @@ namespace TensorSharp.Models
         /// (Flash Next's PLE table) the page cache could not keep.</summary>
         protected override bool ShouldPrefaultWeight(GgufTensorInfo info) => !IsHostOnlyWeight(info.Name);
 
-        /// <summary>Decide <see cref="_expertOnHost"/> once the weights and caches exist, before the first forward.</summary>
+        /// <summary>Decide <see cref="_expertOnHost"/> before the first forward: on the GGML backends once the weights and
+        /// caches exist; on the tensor executors before residency (<see cref="PlanTensorExecutorPlacement"/>).</summary>
         private void PlanExpertPlacement()
         {
-            if (!_anyMoe || !IsGgmlBackend || _mesh.TensorParallel > 1 || LayerSplitGroup != null)
+            if (!_anyMoe || _mesh.TensorParallel > 1 || LayerSplitGroup != null)
                 return;
+            if (!IsGgmlBackend)
+            {
+                PlanTensorExecutorPlacement();
+                return;
+            }
             int n = Config.NumLayers;
             if (_mesh.Stages > 1)
             {
@@ -209,6 +215,120 @@ namespace TensorSharp.Models
             for (int l = 0; l < n - resident; l++) _expertOnHost[l] = _moeLayer[l];
             ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved scratch {Gb(DeviceScratchBytes)}; --n-cpu-moe N overrides");
         }
+
+        /// <summary>
+        /// A tensor executor on one discrete device (direct CUDA), planned before residency, whose preload uploads every
+        /// expert member it is not told to leave on the host: the trailing MoE layers whose experts fit beside every other
+        /// weight (none resident yet), the slot reserve and the headroom stay on the device; the first layers run their
+        /// experts through the model's expert host (<see cref="GraphOp.MoeHostExperts"/>), with each layer's most-routed
+        /// experts in a device tier where a routing profile ranks them. Unified memory (MLX) keeps every expert where the
+        /// mapping is. Explicit <c>--n-cpu-moe N</c> / <c>--cpu-moe</c> win.
+        /// </summary>
+        private void PlanTensorExecutorPlacement()
+        {
+            if (_mesh.Stages > 1 || _allocator is not IDeviceMemoryInfo memory || memory.SharesHostMemory)
+                return;
+            int n = Config.NumLayers;
+            if (MoeCpuOffloadConfig.IsExplicitlySet)
+            {
+                if (MoeCpuOffloadConfig.IsEnabled)
+                    AttachRoutingProfile(Config.Architecture, _numExperts);
+                return;
+            }
+            if (!memory.TryGetDeviceMemory(out long free, out long total))
+                return;
+            var layerBytes = new long[n];
+            long allExperts = 0;
+            for (int l = 0; l < n; l++)
+                allExperts += layerBytes[l] = _moeLayer[l] ? LayerExpertBytes(l) : 0;
+            // Nothing is resident yet: every other weight, the draft, the first slot (its states and initial caches) are to come.
+            long pending = checked(AcceleratorBoundNonExpertBytes() + _pendingDraftBytes + TensorExecutorSlotReserveBytes);
+            long headroom = GpuMemoryBudget.ResolveHeadroomBytes(total);
+            if (allExperts + pending + headroom + DeviceScratchBytes <= free)
+                return;
+            // Offloading: a prompt chunk stages the experts the device does not hold (the CUDA executor's staging arena).
+            long largest = 0;
+            for (int l = 0; l < n; l++) largest = Math.Max(largest, layerBytes[l]);
+            pending += Math.Min(largest, StagingReserveCapBytes);
+            int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free, headroom, 0);
+            if (resident >= n)
+                return;
+            long deviceExpertBytes = 0;
+            for (int l = n - resident; l < n; l++) deviceExpertBytes += layerBytes[l];
+            if (TryPlanTensorExecutorTiers(deviceExpertBytes))
+                return;
+            _expertOnHost = new bool[n];
+            for (int l = 0; l < n - resident; l++) _expertOnHost[l] = _moeLayer[l];
+            ReportExpertPlacement("planned", $"device free {Gb(free)}; --n-cpu-moe N overrides");
+        }
+
+        /// <summary>A slot's states and its first caches, reserved when a tensor executor plans before any slot exists.</summary>
+        private const long TensorExecutorSlotReserveBytes = 1L << 30;
+
+        /// <summary>Most device memory an offloaded plan leaves for staging a prompt chunk's experts (one layer's worth).</summary>
+        private const long StagingReserveCapBytes = 2L << 30;
+
+        /// <summary>
+        /// Every MoE layer's experts through the expert host, each layer keeping its most-routed experts in a device tier of
+        /// <paramref name="budget"/> bytes in all: ranked by the routing profile where it has a layer's routes, an equal
+        /// share of the layer's experts where it has not (as the Qwen3.8 engines planned without one; this load records the
+        /// routing for the next). False when tiers are switched off.
+        /// </summary>
+        private bool TryPlanTensorExecutorTiers(long budget)
+        {
+            if (!ExpertTiersEnabled())
+                return false;
+            AttachRoutingProfile(Config.Architecture, _numExperts);
+            int n = Config.NumLayers;
+            var moeLayers = new List<int>(n);
+            var expertBytes = new long[n];
+            for (int l = 0; l < n; l++)
+            {
+                if (!_moeLayer[l] || !TryGetLayerExperts(l, out var gate, out var up, out var down))
+                    continue;
+                moeLayers.Add(l);
+                expertBytes[l] = gate.PerExpertRawBytes + up.PerExpertRawBytes + down.PerExpertRawBytes;
+            }
+            if (moeLayers.Count == 0)
+                return false;
+            // The plan's counts: the profile's for the layers it covers, one route per expert for the others (an equal
+            // share, the lower ids first).
+            var plan = new MoeRoutingProfile(_routingProfile?.Identity ?? "plan", n, _numExperts);
+            var uniform = new ulong[_numExperts];
+            Array.Fill(uniform, 1UL);
+            int ranked = 0;
+            foreach (int l in moeLayers)
+            {
+                if (_routingProfile != null && _routingProfile.CoversLayers(new[] { l }))
+                {
+                    plan.Add(l, _routingProfile.Counts(l));
+                    ranked++;
+                }
+                else plan.Add(l, uniform);
+            }
+            long? requested = ExpertTierBudgetOverride(Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER_GB"));
+            int[][] tiers = plan.SelectTiers(expertBytes, requested ?? budget);
+            _expertOnHost = new bool[n];
+            foreach (int l in moeLayers) _expertOnHost[l] = true;
+            _tierExperts = new int[n][];
+            long held = 0;
+            for (int l = 0; l < n; l++)
+            {
+                _tierExperts[l] = tiers[l] ?? Array.Empty<int>();
+                held += _tierExperts[l].Length * expertBytes[l];
+            }
+            Console.WriteLine($"[moe-offload] {Config.Architecture} (tiered): every MoE layer's routed experts run through the " +
+                $"expert host; the device keeps each layer's most-routed experts ({Gb(held)} of {Gb(budget)}), " +
+                (ranked == moeLayers.Count ? $"ranked by {_routingProfilePath}."
+                    : ranked > 0 ? $"{ranked} of {moeLayers.Count} layers ranked by {_routingProfilePath}, the others an equal share."
+                    : "an equal share of each layer (no routing profile yet: this load records one)."));
+            return true;
+        }
+
+        /// <summary>Whether a tensor executor uploads expert <paramref name="expert"/> of <paramref name="layer"/> at
+        /// residency: a resident layer's experts, and an offloaded layer's tier.</summary>
+        private bool PreloadsExpert(int layer, int expert)
+            => !IsExpertLayerOffloaded(layer) || (_tierExperts?[layer] is { } tier && Array.IndexOf(tier, expert) >= 0);
 
         /// <summary>
         /// A layer split on discrete GPUs: each stage keeps the experts of its trailing layers that fit its own device's

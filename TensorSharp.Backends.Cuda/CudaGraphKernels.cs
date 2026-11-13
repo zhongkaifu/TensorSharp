@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 6;
+        public const int CurrentVersion = 11;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
@@ -30,6 +30,21 @@ namespace TensorSharp.Cuda
             _gatedDeltaNet = module.GetFunction("ts_graph_gated_delta_net_f32");
             _gatedDeltaNetRows4 = module.GetFunction("ts_graph_gated_delta_net_rows4_f32");
             _softplus = module.GetFunction("ts_graph_softplus_f32");
+            _sqrt = module.GetFunction("ts_graph_sqrt_f32");
+            _topk = module.GetFunction("ts_graph_topk_f32");
+            _topkWide = module.GetFunction("ts_graph_topk_wide_f32");
+            _getRows = module.GetFunction("ts_graph_get_rows_f32");
+            _getRowsF16 = module.GetFunction("ts_graph_get_rows_f16");
+            _setRows = module.GetFunction("ts_graph_set_rows_f32");
+            _lightningIndexer = module.GetFunction("ts_graph_lightning_indexer_f32");
+            _topkMask = module.GetFunction("ts_graph_topk_mask_f32");
+            _maskCells = module.GetFunction("ts_graph_mask_cells");
+            _sumRows = module.GetFunction("ts_graph_sum_rows_f32");
+            _f16ToF32 = module.GetFunction("ts_graph_f16_to_f32");
+            _f32ToF16 = module.GetFunction("ts_graph_f32_to_f16");
+            _routeSplit = module.GetFunction("ts_graph_moe_route_split");
+            _waitAdd = module.GetFunction("ts_graph_moe_wait_add");
+            CudaDriverApi.cuFuncSetAttribute(_topk, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, TopKMaxColumns * 4).ThrowOnError();
             _ssmConv = module.GetFunction("ts_graph_ssm_conv_f32");
             _deltaNetPrep = module.GetFunction("ts_graph_deltanet_prep_f32");
             _gatedRmsNorm = module.GetFunction("ts_graph_gated_rms_norm_f32");
@@ -67,6 +82,124 @@ namespace TensorSharp.Cuda
         {
             void** args = stackalloc void*[] { &x, &y, &n };
             CudaDriverApi.cuLaunchKernel(_softplus, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Widest row <see cref="LaunchTopK"/> takes.</summary>
+        public const int TopKMaxColumns = 4096;
+
+        /// <summary>ggml_top_k over <paramref name="rows"/> contiguous rows of <paramref name="cols"/> floats: ids [rows, k],
+        /// largest first, a tie going to the lower index.</summary>
+        public void LaunchTopK(IntPtr x, IntPtr ids, int rows, int cols, int k, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &ids, &cols, &k };
+            CudaDriverApi.cuLaunchKernel(_topk, (uint)rows, 1, 1, 256, 1, 1, (uint)(cols * 4), stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Most picks <see cref="LaunchTopKWide"/> takes.</summary>
+        public const int TopKWideMaxPicks = 2048;
+
+        /// <summary>ggml_top_k for many picks or wide rows (radix-selected, then sorted): the order and ties of
+        /// <see cref="LaunchTopK"/>; <paramref name="k"/> &lt;= <see cref="TopKWideMaxPicks"/>.</summary>
+        public void LaunchTopKWide(IntPtr x, IntPtr ids, int rows, int cols, int k, IntPtr stream)
+        {
+            int n2 = 1;
+            while (n2 < k) n2 <<= 1;
+            void** args = stackalloc void*[] { &x, &ids, &cols, &k, &n2 };
+            CudaDriverApi.cuLaunchKernel(_topkWide, (uint)rows, 1, 1, 1024, 1, 1, (uint)(n2 * 8), stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_get_rows into F32 rows by device int32 ids: src [batches, rowsPerBatch, rowLen] (F32, or F16 when
+        /// <paramref name="half"/>) with rows <paramref name="rowPitch"/> elements apart, ids [batches, n].</summary>
+        public void LaunchGetRows(IntPtr src, IntPtr ids, IntPtr output, int rowLen, int n, int rowsPerBatch, int batches, long rowPitch,
+            bool half, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &src, &ids, &output, &rowLen, &n, &rowsPerBatch, &rowPitch };
+            CudaDriverApi.cuLaunchKernel(half ? _getRowsF16 : _getRows, (uint)(n * batches), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args,
+                IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_set_rows by device int32 ids: dst row ids[i] (F32, or F16 when <paramref name="half"/>; rows
+        /// <paramref name="dstPitch"/> elements apart) takes contiguous F32 src row i.</summary>
+        public void LaunchSetRows(IntPtr src, IntPtr ids, IntPtr dst, int count, int rowLen, long dstPitch, int dstRows, bool half, IntPtr stream)
+        {
+            int h = half ? 1 : 0;
+            void** args = stackalloc void*[] { &src, &ids, &dst, &rowLen, &dstPitch, &dstRows, &h };
+            CudaDriverApi.cuLaunchKernel(_setRows, (uint)count, 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Most q floats (heads * d) a row of <see cref="LaunchLightningIndexer"/> holds; d &lt;= 256.</summary>
+        public const int LightningIndexerMaxQ = 12 * 1024;
+
+        /// <summary>ggml_lightning_indexer over F32: q [rows, heads, d], keys [n, d], w [rows, heads], mask [maskRows, n];
+        /// out [rows, n].</summary>
+        public void LaunchLightningIndexer(IntPtr q, IntPtr keys, IntPtr w, IntPtr mask, IntPtr output, int d, int heads, int n, int rows,
+            int maskRows, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &q, &keys, &w, &mask, &output, &d, &heads, &n, &maskRows };
+            CudaDriverApi.cuLaunchKernel(_lightningIndexer, (uint)((n + 7) / 8), (uint)rows, 1, 256, 1, 1, (uint)(heads * d * 4), stream,
+                (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The cells each of <paramref name="rows"/> F32 mask rows of <paramref name="n"/> keeps (above -inf), in
+        /// order: cells [rows, n], count [rows].</summary>
+        public void LaunchMaskCells(IntPtr mask, IntPtr cells, IntPtr count, int rows, int n, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &mask, &cells, &count, &n };
+            CudaDriverApi.cuLaunchKernel(_maskCells, (uint)rows, 1, 1, 1024, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_top_k_mask over F32 (see the kernel's contract); <paramref name="score"/>, <paramref name="blocks"/>
+        /// and <paramref name="extra"/> may be zero.</summary>
+        public void LaunchTopKMask(IntPtr mask, IntPtr picks, IntPtr score, IntPtr blocks, IntPtr extra, IntPtr output, int rows, int nkv,
+            int maskRows, int top, int nPick, int cells, int nBlocks, int nExtra, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &mask, &picks, &score, &blocks, &extra, &output, &nkv, &maskRows, &top, &nPick, &cells, &nBlocks, &nExtra };
+            CudaDriverApi.cuLaunchKernel(_topkMask, (uint)rows, 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Convert <paramref name="n"/> contiguous elements between F16 and F32 (<paramref name="toHalf"/>: F32 to F16).</summary>
+        public void LaunchConvert(IntPtr x, IntPtr y, long n, bool toHalf, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &y, &n };
+            CudaDriverApi.cuLaunchKernel(toHalf ? _f32ToF16 : _f16ToF32, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args,
+                IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>A layer's routes split between the device (its tier: <paramref name="onDevice"/>[e] != 0) and the host
+        /// (less those at <paramref name="tailRank"/> or lower that no row routes higher: the route-tail skip, 0 off), for
+        /// <paramref name="rows"/> rows of <paramref name="perRow"/> routes, each counted in <paramref name="counts"/> (per expert):
+        /// the device's into <paramref name="devSel"/> (-1 for a host route); when any route is the host's, the input and
+        /// routes published to <paramref name="box"/> and its counter advanced (<paramref name="missDev"/> says which).</summary>
+        public void LaunchMoeRouteSplit(IntPtr x, IntPtr sel, IntPtr selW, IntPtr onDevice, int n, int rows, int perRow, int layer,
+            int tailRank, IntPtr devSel, IntPtr counts, CudaHostExpertMailbox box, IntPtr missDev, IntPtr stream)
+        {
+            IntPtr xOut = box.XDev, idsOut = box.IdsDev, wOut = box.WDev, hdr = box.HeaderDev, seq = box.SeqDev;
+            void** args = stackalloc void*[] { &x, &sel, &selW, &onDevice, &n, &rows, &perRow, &layer, &tailRank, &devSel, &counts, &xOut, &idsOut, &wOut, &hdr, &seq, &missDev };
+            CudaDriverApi.cuLaunchKernel(_routeSplit, 1, 1, 1, 1024, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Wait for the host's answer to the layer's doorbell (when one rang) and add its sum into
+        /// <paramref name="dst"/> (<paramref name="n"/> floats).</summary>
+        public void LaunchMoeWaitAdd(CudaHostExpertMailbox box, IntPtr dst, int n, IntPtr missDev, IntPtr stream)
+        {
+            IntPtr flag = box.FlagDev, seq = box.SeqDev, count = box.CountDev, outDev = box.OutDev;
+            void** args = stackalloc void*[] { &flag, &seq, &count, &outDev, &dst, &n, &missDev };
+            CudaDriverApi.cuLaunchKernel(_waitAdd, (uint)Math.Min(16, Math.Max(1, (n + 255) / 256)), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args,
+                IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_sum_rows over <paramref name="rows"/> contiguous rows of <paramref name="cols"/> floats.</summary>
+        public void LaunchSumRows(IntPtr x, IntPtr y, int rows, int cols, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &y, &cols };
+            CudaDriverApi.cuLaunchKernel(_sumRows, (uint)rows, 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_sqrt over <paramref name="n"/> contiguous floats.</summary>
+        public void LaunchSqrt(IntPtr x, IntPtr y, long n, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &y, &n };
+            CudaDriverApi.cuLaunchKernel(_sqrt, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>ggml_ssm_conv: x [n_s, channels, length] (time innermost), w [channels, width] (contiguous):

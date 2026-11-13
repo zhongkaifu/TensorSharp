@@ -362,6 +362,9 @@ namespace TensorSharp.Models
                     ApplyModelAlignedKvCacheDefault(_quantWeights);
                 if (_mesh.TensorParallel > 1)
                     ShardForMesh();
+                // A tensor executor's residency uploads every expert member the plan does not leave on the host.
+                if (!IsGgmlBackend)
+                    PlanExpertPlacement();
                 PrepareResidency();
 
                 int maxContext = ResolveConfiguredContextLength();
@@ -370,7 +373,8 @@ namespace TensorSharp.Models
                     Console.WriteLine($"Initial {_backend} KV cache allocation: {initial} tokens (grows on demand up to {maxContext}).");
                 InitCaches(initial, maxContext);
                 InitRecurrentStates();
-                PlanExpertPlacement();
+                if (IsGgmlBackend)
+                    PlanExpertPlacement();
                 StartHostWarm();
                 PreReplicateNormWeights();
                 Console.WriteLine($"  Placement: {_mesh.Describe()} (shared decoder runtime).");
@@ -1302,6 +1306,11 @@ namespace TensorSharp.Models
             ClearGraphCache();
             DisposeRecurrentStates();
             DropPendingMedia();
+            // The executors' own resources (a CUDA executor's doorbell, staging arena, page-locked ranges of the mappings and
+            // its last route counts) go before the routing profile is saved and the tiers and mappings are released.
+            foreach (TensorSharp.Graph.IGraphExecutor executor in _graphExecutors.Values)
+                (executor as IDisposable)?.Dispose();
+            _graphExecutors.Clear();
             // The routing profile is saved and the accelerator tiers freed with the graphs gone and before the stacked experts
             // are: a tier outliving its model served the next model mapped at the same addresses (and leaked its buffers).
             DetachRoutingProfile();

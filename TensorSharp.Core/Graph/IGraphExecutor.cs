@@ -34,6 +34,10 @@ namespace TensorSharp.Graph
         /// <summary>It runs <see cref="GraphOp.MoeHostExperts"/>: routed experts computed from host memory at a
         /// pause in the program.</summary>
         public bool HostExperts { get; init; }
+
+        /// <summary>A decode step's <see cref="GraphOp.MoeHostExperts"/> stays on the device's stream (the host answers a
+        /// doorbell while the device waits), so a step with host experts can be recorded and replayed.</summary>
+        public bool RecordsHostExperts { get; init; }
         /// <summary>A compiled plan is worth keeping to run again (a replayable program is cached and
         /// looked up by its signature); otherwise every step is recorded and compiled once.</summary>
         public bool Replays { get; init; } = true;
