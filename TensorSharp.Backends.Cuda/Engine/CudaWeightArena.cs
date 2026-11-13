@@ -94,6 +94,9 @@ namespace TensorSharp.Cuda
         /// table of one address per expert (a VRAM slot or pinned host memory the GPU reads over the
         /// bus). Zero means <see cref="Ptr"/> is the whole stack.</summary>
         public IntPtr Table;
+        /// <summary>A Q8_0 dense matrix's packed copy for the pair's swapped tensor-core kernel
+        /// (CudaKernels.LaunchQ80PairPack), or zero.</summary>
+        public IntPtr PairPacked;
     }
 
     /// <summary>

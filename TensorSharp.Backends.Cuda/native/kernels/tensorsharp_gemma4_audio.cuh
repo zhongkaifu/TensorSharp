@@ -3,6 +3,7 @@ extern "C" __global__ void ts_gemma4_audio_attention_f32(
     const float *q, const float *k, const float *v, const float *relative, float *out,
     int sequence, int heads, int head, int past, int future, float cap)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int window = past + future + 1;
     __shared__ float scores[257], ccWarps[4], cpWarps[4];
@@ -49,6 +50,7 @@ extern "C" __global__ void ts_gemma4_audio_attention_f32(
 extern "C" __global__ void ts_gemma4_audio_depthwise_f32(
     const float *x, const float *weight, float *out, int sequence, int channels, int kernel)
 {
+    TS_PDL_ENTRY();
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= sequence * channels) return;
     const int t = index / channels, channel = index % channels;

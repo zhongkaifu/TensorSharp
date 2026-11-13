@@ -2523,6 +2523,10 @@ per step. These settings shape it as a server:
 | `TS_Q4E_PIPELINE_OVER_SPEC` | on | With the MTP head under `--layer-split 2` and up, a lone request speculates and two or more decode plainly as two groups in flight; `0` puts the batched verify first again (a draft head then turns the groups off). |
 | `TS_Q4E_MTP_FOLLOW`, `TS_Q4E_MTP_CHAIN_SPLIT` | on | With the MTP head, the block takes a lone request's prompt on its own device as each ubatch finishes, instead of through the host; on a layer split the last GPU holds a second copy of the token embedding for it (0.67 GiB for Q8_0), which also keeps a window's draft chain on that GPU. `0` for the first keeps the host's catch-up; `0` for the second turns both off on a layer split. |
 | `TS_KDA_SCAN_R4` | off | `1` runs the gated-delta scan four state rows a warp in prefill too; unset, a prefill ubatch's scan runs one row a warp and prefetches the next row's inputs (bit-identical). |
+| `TS_Q80_PAIR_SWAP` | on | Each dense Q8_0 projection the pair takes gets a packed copy at load (its tensor-core fragments as aligned 16-byte words, 2.4 GB on the last of two H100 NVL, counted into the layer placement), and the pair's tuning may pick a fourth kernel over it, the weight as the mma's 16-column operand, with the same bits; `0` packs nothing. |
+| `TS_CUDA_PDL` | on | On sm_90 and newer, with sm_90 code loaded, the direct kernels launch with programmatic dependent launch: each exported kernel waits for the grid before it at its first instruction, and its launch overlaps that grid's tail. `0` launches them plainly; the outputs are the same. |
+| `TS_Q4E_ATTN_GQA` | on | Decode attention runs a KV head's query heads four at a block, each cell's K and V loaded once for them (batched steps of four rows or more, a sequence's own calls of eight); `0` keeps a block per query head. The same bits. |
+| `TS_Q4E_BATCHED_ATTN` | on | A batched step's attention layers launch each kernel once for every row (each row's caches from a table), not once a sequence; `0` issues them a sequence at a time. The same bits. |
 
 The scheduler sizes its reservation pool for one context per running sequence for this
 engine (`IBatchedPagedModel.UsesNativeSequenceSlots`), as for DeepSeek V4.1, instead of
@@ -2622,6 +2626,37 @@ four-rows-a-warp scan computes (`Qwen4ExpPrefillKernelTests`); on the same two H
 (2026-11-09) the 2,048-token forward's scan fell from 137 to 113 ms.
 Sampling a batched step's rows in parallel took 16 streams at temperature 1 (top-k 20) from
 291 to 316 tok/s in all and 8 from 235 to 250; the draws are unchanged.
+
+Faster decode kernels (2026-11-12, the same two H100 NVL, Q8_0, upstream `032fdf24`, the MTP
+head on), greedy tok/s with the folder's bench (384 tokens a stream):
+
+| Streams | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `032fdf24` | 179 | 241 | 386 | 562 | 772 | 1,028 |
+| These kernels | 206 | 277 | 436 | 664 | 956 | 1,210 |
+
+Every answer equals `032fdf24`'s at every stream count. An nsys timeline of a 16-stream step
+showed the dense Q8_0 projections (the pair) taking about as long as the routed experts: at 8
+rows the pair's kernels read HBM at 0.4-1.1 TB/s, its tensor-core kernel loading each 34-byte
+Q8_0 block with 16-bit loads.
+
+- **The pair over a packed copy** (`TS_Q80_PAIR_SWAP`): the weight is the mma's 16-column A
+  operand and the activations its B, each lane's A fragment one aligned 16-byte load, sixteen
+  blocks in flight a warp. Each output still sums every block's exact int32 dot into the same
+  eight fma chains and trees, so it gives the other three kernels' bits
+  (`SwappedPairKernel_GivesTheTensorCoresBits`, 1-16 rows). On an H100 NVL at 8 rows: 2560 ->
+  12288 in 17.7 against 31.5 us, 6144 -> 2560 in 14.1 against 28.8, 2560 -> 6144 in 11.4
+  against 17.9; the tuning keeps the twin for one row. +16% at 16 streams, +11% at 32.
+- **Programmatic dependent launch** (`TS_CUDA_PDL`): +21% for one stream (the MTP verify and
+  draft chain are short kernels back to back), +9% at 4, +5% at 16, +2% at 32.
+- **Grouped-query decode attention** (`TS_Q4E_ATTN_GQA`): a block per KV head and four query
+  heads loads each cell once for the four, where a block per query head read every row's K/V
+  twelve times; +4% at 16 streams, +9% at 32. With fewer rows and short contexts its smaller
+  grid left the GPU idle (3-5% slower at one and two streams), hence the row thresholds.
+  `TheGroupedKernel_GivesThePerHeadBits` covers dense and listed cells, split and unsplit
+  rows, both caches and a batched step's own caches.
+- **One launch for a batched step's attention** (`TS_Q4E_BATCHED_ATTN`): +1-3% at 16-32 streams;
+  captured graphs had already hidden most of the per-sequence launches.
 
 ## Benchmark matrix
 

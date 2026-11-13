@@ -139,7 +139,7 @@ public sealed class Q4eAttentionMmaTests
         }
     }
 
-    private static byte[] F16(float[] v)
+    internal static byte[] F16(float[] v)
     {
         var b = new byte[v.Length * 2];
         for (int i = 0; i < v.Length; i++)
@@ -148,7 +148,7 @@ public sealed class Q4eAttentionMmaTests
     }
 
     /// <summary>ggml's Q8_0 of each 32 values: int8 codes round(x / d), d = max|x| / 127 as F16.</summary>
-    private static (byte[] Codes, byte[] Scales) Q8(float[] v)
+    internal static (byte[] Codes, byte[] Scales) Q8(float[] v)
     {
         var codes = new byte[v.Length];
         var scales = new byte[v.Length / 32 * 2];

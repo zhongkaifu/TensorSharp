@@ -6,6 +6,19 @@
 // IQ2_XXS dequant lookup tables, vendored from ggml-org/ggml so the CUDA backend
 // builds without the upstream ggml checkout (see tensorsharp_iq2xxs_tables.cuh).
 #include "tensorsharp_iq2xxs_tables.cuh"
+// Programmatic dependent launch (sm_90+): a kernel the engine launches with the programmatic-serialization
+// attribute may start while the kernel before it in the stream drains, so its launch overlaps the other's tail.
+// Every exported kernel opens with TS_PDL_ENTRY(): griddepcontrol.wait holds the whole kernel until the grids it
+// depends on have completed and their writes are visible (so nothing it reads or overwrites is touched early), and
+// launch_dependents then lets the next kernel's blocks be scheduled. Below sm_90 (and launched without the attribute)
+// both are no-ops, and the kernel runs exactly as before.
+#ifndef TS_PDL_ENTRY
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define TS_PDL_ENTRY() asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory")
+#else
+#define TS_PDL_ENTRY() do { } while (0)
+#endif
+#endif
 
 #define GGML_Q4_0 2
 #define GGML_Q4_1 3
@@ -537,7 +550,8 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
 }
 
 // Marker: ts_dequant_weight_f16 decodes Q2_0 (a module without it reads Q2_0 rows as zeros).
-extern "C" __global__ void ts_caps_q2_0_dequant() {}
+extern "C" __global__ void ts_caps_q2_0_dequant() {
+    TS_PDL_ENTRY();}
 
 __device__ __forceinline__ void quantize_q8_1_block(const float* x, ts_block_q8_1* dst)
 {
@@ -732,6 +746,7 @@ __device__ __forceinline__ float gelu(float x)
 
 extern "C" __global__ void ts_fill_f32(float* output, int count, float value)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count)
         output[i] = value;
@@ -739,6 +754,7 @@ extern "C" __global__ void ts_fill_f32(float* output, int count, float value)
 
 extern "C" __global__ void ts_fill_f16(half* output, int count, float value)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count)
         output[i] = __float2half_rn(value);
@@ -756,6 +772,7 @@ extern "C" __global__ void ts_copy2d_bytes(
     long long srcPitch,
     long long dstPitch)
 {
+    TS_PDL_ENTRY();
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long stride = (long long)gridDim.x * blockDim.x;
     for (long long r = blockIdx.y; r < rows; r += gridDim.y)
@@ -790,6 +807,7 @@ extern "C" __global__ void ts_copy2d_bytes(
 
 extern "C" __global__ void ts_unary_f32(const float* input, float* output, int count, int op)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
@@ -811,6 +829,7 @@ extern "C" __global__ void ts_unary_f32(const float* input, float* output, int c
 
 extern "C" __global__ void ts_binary_f32(const float* lhs, const float* rhs, float* output, int count, int op)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
@@ -835,6 +854,7 @@ extern "C" __global__ void ts_binary_f32(const float* lhs, const float* rhs, flo
 extern "C" __global__ void ts_binary_row_bcast_f32(
     const float* lhs, const float* rhs, float* output, int rows, int cols, int rhs_cols, int op)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int count = rows * cols;
     if (i >= count)
@@ -855,6 +875,7 @@ extern "C" __global__ void ts_binary_row_bcast_f32(
 
 extern "C" __global__ void ts_scalar_f32(const float* input, float* output, int count, float value, int op)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
@@ -876,6 +897,7 @@ extern "C" __global__ void ts_scalar_f32(const float* input, float* output, int 
 
 extern "C" __global__ void ts_ternary_f32(const float* x, const float* y, const float* z, float* output, int count, int op)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
@@ -891,6 +913,7 @@ extern "C" __global__ void ts_ternary_f32(const float* x, const float* y, const 
 
 extern "C" __global__ void ts_addmul_scalar_f32(const float* x, const float* y, float* output, int count, float value)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count)
         output[i] = x[i] + y[i] * value;
@@ -898,6 +921,7 @@ extern "C" __global__ void ts_addmul_scalar_f32(const float* x, const float* y, 
 
 extern "C" __global__ void ts_mulmuladd_f32(const float* x, const float* y, const float* z, const float* w, float* output, int count)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count)
         output[i] = x[i] * y[i] + z[i] * w[i];
@@ -905,6 +929,7 @@ extern "C" __global__ void ts_mulmuladd_f32(const float* x, const float* y, cons
 
 extern "C" __global__ void ts_binary_activation_f32(const float* a, const float* b, float* output, int count, int op)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
@@ -925,6 +950,7 @@ extern "C" __global__ void ts_binary_activation_f32(const float* a, const float*
 extern "C" __global__ void ts_dequant_weight_f16(
     const uint8_t* weights, half* output, int type, int in_dim, long long total)
 {
+    TS_PDL_ENTRY();
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total)
         return;
@@ -947,6 +973,7 @@ extern "C" __global__ void ts_dequant_weight_f16(
 extern "C" __global__ void ts_dequant_weight_q8_0_f16(
     const uint8_t* weights, half* output, long long total)
 {
+    TS_PDL_ENTRY();
     constexpr int q8_blocks_per_chunk = TS_Q80_F16_CHUNK / 32;
     constexpr int raw_bytes_per_chunk = q8_blocks_per_chunk * TS_Q80_BLOCK_BYTES;
     constexpr int raw_ints_per_chunk = raw_bytes_per_chunk / (int)sizeof(int);
@@ -984,6 +1011,7 @@ extern "C" __global__ void ts_dequant_weight_q8_0_f16(
 
 extern "C" __global__ void ts_convert_f32_f16(const float* src, half* dst, long long count)
 {
+    TS_PDL_ENTRY();
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count)
         dst[i] = __float2half(src[i]);
@@ -1007,6 +1035,7 @@ extern "C" __global__ void ts_matvec_bf16_f32(
     const int inDim,
     const int outDim)
 {
+    TS_PDL_ENTRY();
     const int j = blockIdx.x;
     if (j >= outDim)
         return;
@@ -1061,6 +1090,7 @@ extern "C" __global__ void ts_matvec_bf16_f32(
 // predate the __nv_bfloat16 intrinsics.
 extern "C" __global__ void ts_convert_f32_bf16(const float* src, unsigned short* dst, long long count)
 {
+    TS_PDL_ENTRY();
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
@@ -1082,6 +1112,7 @@ extern "C" __global__ void ts_deinterleave_qgate_f32(
     const float* src, float* q, float* gate,
     int rows, int num_heads, int head_dim, long long src_row_stride)
 {
+    TS_PDL_ENTRY();
     int per_row = num_heads * head_dim;
     int count = rows * per_row;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1107,6 +1138,7 @@ extern "C" __global__ void ts_binary_activation_strided_f32(
     long long a_row_stride, long long b_row_stride, long long out_row_stride,
     int op)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int count = rows * cols;
     if (i >= count)
@@ -1128,6 +1160,7 @@ extern "C" __global__ void ts_binary_activation_strided_f32(
 
 extern "C" __global__ void ts_add_bias_rows_f32(float* tensor, const float* bias, int rows, int cols, int bias_cols)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int count = rows * cols;
     if (i >= count)
@@ -1140,6 +1173,7 @@ extern "C" __global__ void ts_add_bias_rows_f32(float* tensor, const float* bias
 
 extern "C" __global__ void ts_silu_mul_split_f32(const float* gate_up, float* output, int rows, int half_dim)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = rows * half_dim;
     if (idx >= total)
@@ -1155,6 +1189,7 @@ extern "C" __global__ void ts_silu_mul_split_f32(const float* gate_up, float* ou
 
 extern "C" __global__ void ts_gelu_mul_split_f32(const float* gate_up, float* output, int rows, int half_dim)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = rows * half_dim;
     if (idx >= total)
@@ -1170,6 +1205,7 @@ extern "C" __global__ void ts_gelu_mul_split_f32(const float* gate_up, float* ou
 
 extern "C" __global__ void ts_swiglu_oai_split_f32(const float* gate_up, float* output, int rows, int half_dim, float alpha, float limit)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = rows * half_dim;
     if (idx >= total)
@@ -1243,6 +1279,7 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
     float eps,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     int h = blockIdx.x;
     if (h >= num_v_heads)
         return;
@@ -1426,6 +1463,7 @@ extern "C" __global__ void ts_qwen35_gdn_prefill_conv_f32(
     int conv_write_idx,
     float eps)
 {
+    TS_PDL_ENTRY();
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     if (wid >= win_len * num_v_heads)
@@ -1502,6 +1540,7 @@ extern "C" __global__ void ts_qwen35_gdn_prefill_scan_f32(
     int head_k_dim,       // must be 128
     int head_v_dim)
 {
+    TS_PDL_ENTRY();
     int h = blockIdx.x;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
@@ -1577,6 +1616,7 @@ extern "C" __global__ void ts_qwen35_gdn_prefill_out_f32(
     int head_v_dim,
     float eps)
 {
+    TS_PDL_ENTRY();
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     if (wid >= win_len * num_v_heads)
@@ -1611,6 +1651,7 @@ extern "C" __global__ void ts_qwen35_gdn_update_conv_state_f32(
     int conv_write_idx,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     int tail = seq_len < conv_dim ? seq_len : conv_dim;
     int total = tail * qkv_dim;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1638,6 +1679,7 @@ extern "C" __global__ void ts_qwen35_gdn_pack_inputs_f32(
     int num_v_heads,
     int packed_dim)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int total = seq_len * packed_dim;
     if (i >= total)
@@ -1683,6 +1725,7 @@ extern "C" __global__ void ts_layernorm_f32(
     int cols,
     float eps)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= rows)
         return;
@@ -1734,6 +1777,7 @@ extern "C" __global__ void ts_rmsnorm_f32(
     int cols,
     float eps)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= rows)
         return;
@@ -1778,6 +1822,7 @@ extern "C" __global__ void ts_rmsnorm_residual_add_f32(
     int cols,
     float eps)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= rows)
         return;
@@ -1804,6 +1849,7 @@ extern "C" __global__ void ts_rmsnorm_residual_add_f32(
 
 extern "C" __global__ void ts_softmax_f32(const float* input, float* output, int rows, int cols)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= rows)
         return;
@@ -1850,6 +1896,7 @@ extern "C" __global__ void ts_attention_softmax_sinks_f32(
     float scale,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     int total_rows = num_heads * seq_len;
     if (row >= total_rows)
@@ -2017,7 +2064,7 @@ __device__ __forceinline__ void ts_vision_attention_body(
         int seq,                                                                 \
         float scale)                                                             \
     {                                                                            \
-        ts_vision_attention_body<D>(query, key, value, output, num_heads, seq, scale); \
+        TS_PDL_ENTRY(); ts_vision_attention_body<D>(query, key, value, output, num_heads, seq, scale); \
     }
 
 TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d64_f32, 64)
@@ -2038,6 +2085,7 @@ TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d128_f32, 128)
 extern "C" __global__ void ts_vision_pad_f16(
     const float* __restrict__ src, int seq, int heads, int d, int dp, half* __restrict__ dst)
 {
+    TS_PDL_ENTRY();
     const long long n = (long long)heads * seq * dp;
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
     {
@@ -2239,7 +2287,7 @@ __device__ __forceinline__ void ts_vision_attention_mma_body(
         const half* __restrict__ v16, float* __restrict__ output,                \
         int num_heads, int seq, float scale)                                     \
     {                                                                            \
-        ts_vision_attention_mma_body<D>(q16, k16, v16, output, num_heads, seq, scale); \
+        TS_PDL_ENTRY(); ts_vision_attention_mma_body<D>(q16, k16, v16, output, num_heads, seq, scale); \
     }
 
 TS_VISION_ATTENTION_MMA_KERNEL(ts_vision_attention_mma_d64, 64)
@@ -2264,6 +2312,7 @@ extern "C" __global__ void ts_scaled_dot_product_attention_f32(
     float scale,
     int has_mask)
 {
+    TS_PDL_ENTRY();
     int batch_head = blockIdx.x;
     int q_pos = blockIdx.y;
     if (batch_head >= batch * heads || q_pos >= seq_q)
@@ -3115,6 +3164,7 @@ ts_gqa_prefill_flash_g16d128_f16(
     float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
     int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash_g16d128_impl<2, 64, half>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
@@ -3126,6 +3176,7 @@ ts_gqa_prefill_flash_g16d128_f32(
     float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
     int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash_g16d128_impl<2, 64, float>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
@@ -3137,6 +3188,7 @@ ts_gqa_prefill_flash2_group4_d256_f16(
     float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
     int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash2_group4_impl<256, 8, 64, half>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
@@ -3148,6 +3200,7 @@ ts_gqa_prefill_flash2_group4_d256_f32(
     float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
     int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash2_group4_impl<256, 8, 64, float>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
@@ -3159,6 +3212,7 @@ ts_gqa_prefill_flash2_group4_d512_f16(
     float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
     int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash2_group4_impl<512, 4, 64, half>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
@@ -3170,6 +3224,7 @@ ts_gqa_prefill_flash2_group4_d512_f32(
     float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
     int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash2_group4_impl<512, 4, 64, float>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
@@ -3193,6 +3248,7 @@ ts_gqa_prefill_flash_group4_d256_f16(
     int kv_stride,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash_group4_impl<256, 8, half>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
@@ -3217,6 +3273,7 @@ ts_gqa_prefill_flash_group4_d512_f16(
     int kv_stride,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash_group4_impl<512, 4, half>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
@@ -3241,6 +3298,7 @@ ts_gqa_prefill_flash_group4_d256_f32(
     int kv_stride,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash_group4_impl<256, 8, float>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
@@ -3265,6 +3323,7 @@ ts_gqa_prefill_flash_group4_d512_f32(
     int kv_stride,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     ts_gqa_prefill_flash_group4_impl<512, 4, float>(
         query, key, value, sinks, output, num_q_heads, num_kv_heads,
         seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
@@ -3286,6 +3345,7 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     float scale,
     int kv_stride)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
     if (q_head >= num_q_heads || q_pos >= seq_len)
@@ -3368,6 +3428,7 @@ extern "C" __global__ void ts_gqa_decode_attention_sinks_f32(
     float scale,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     if (q_head >= num_q_heads)
         return;
@@ -3449,6 +3510,7 @@ extern "C" __global__ void ts_gqa_decode_attention_sinks_f16(
     float scale,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     if (q_head >= num_q_heads)
         return;
@@ -3529,6 +3591,7 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
     float scale,
     int kv_stride)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
     if (q_head >= num_q_heads || q_pos >= seq_len)
@@ -3612,6 +3675,7 @@ extern "C" __global__ void ts_gqa_prefill_attention_sinks_f32(
     float scale,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
     if (q_head >= num_q_heads || q_pos >= seq_len)
@@ -3695,6 +3759,7 @@ extern "C" __global__ void ts_gqa_prefill_attention_sinks_f16(
     float scale,
     int has_sinks)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
     if (q_head >= num_q_heads || q_pos >= seq_len)
@@ -3776,6 +3841,7 @@ extern "C" __global__ void ts_gqa_decode_attention_f32(
     float scale,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     if (q_head >= num_q_heads)
         return;
@@ -3864,6 +3930,7 @@ extern "C" __global__ void ts_gqa_decode_attention_f16(
     float scale,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     if (q_head >= num_q_heads)
         return;
@@ -4055,6 +4122,7 @@ extern "C" __global__ void ts_gqa_decode_attention_group4_d512_f16(
     int score_capacity,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     const int kv_head = blockIdx.x;
     if (kv_head >= num_kv_heads)
         return;
@@ -4118,6 +4186,7 @@ extern "C" __global__ void ts_gqa_decode_attention_group4_d256_f16(
     int score_capacity,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     const int kv_head = blockIdx.x;
     if (kv_head >= num_kv_heads)
         return;
@@ -4179,6 +4248,7 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d512_f16(
     int partition_size,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     const int kv_head = blockIdx.x;
     const int partition = blockIdx.y;
     if (kv_head >= num_kv_heads || partition >= num_partitions)
@@ -4278,6 +4348,7 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d256_f16(
     int partition_size,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     const int kv_head = blockIdx.x;
     const int partition = blockIdx.y;
     if (kv_head >= num_kv_heads || partition >= num_partitions)
@@ -4511,6 +4582,7 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_f32(
     int partition_size,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     extern __shared__ float scores[];
     ts_gqa_decode_attention_partition_impl<float>(
         query, key_cache, value_cache, sinks, partial,
@@ -4538,6 +4610,7 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_f16(
     int partition_size,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     extern __shared__ float scores[];
     ts_gqa_decode_attention_partition_impl<half>(
         query, key_cache, value_cache, sinks, partial,
@@ -4553,6 +4626,7 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_reduce_f32(
     int head_dim,
     int num_partitions)
 {
+    TS_PDL_ENTRY();
     int q_head = blockIdx.x;
     if (q_head >= num_q_heads)
         return;
@@ -4610,6 +4684,7 @@ extern "C" __global__ void ts_slice_columns_f32(
     int col_offset,
     int width)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = rows * width;
     if (idx >= total)
@@ -4627,6 +4702,7 @@ extern "C" __global__ void ts_flat_to_head_first_f32(
     int num_heads,
     int head_dim)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = seq_len * num_heads * head_dim;
     if (idx >= total)
@@ -4648,6 +4724,7 @@ extern "C" __global__ void ts_split_qkv_head_first_f32(
     int num_heads,
     int head_dim)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = seq_len * num_heads * head_dim;
     if (idx >= total)
@@ -4671,6 +4748,7 @@ extern "C" __global__ void ts_copy_head_first_to_cache_f32(
     int circular,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_heads * seq_len * head_dim;
     if (idx >= total)
@@ -4697,6 +4775,7 @@ extern "C" __global__ void ts_copy_head_first_to_cache_f16(
     int circular,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_heads * seq_len * head_dim;
     if (idx >= total)
@@ -4722,6 +4801,7 @@ extern "C" __global__ void ts_fill_rope_positions_i32(
     int k_rows,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int pos = dyn[TS_DYN_ROPE_POS];
     if (idx < q_rows)
@@ -4739,6 +4819,7 @@ extern "C" __global__ void ts_gather_circular_head_first_f32(
     int start_pos,
     int cache_size)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_heads * seq_len * head_dim;
     if (idx >= total)
@@ -4763,6 +4844,7 @@ extern "C" __global__ void ts_gather_circular_head_first_f16(
     int start_pos,
     int cache_size)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_heads * seq_len * head_dim;
     if (idx >= total)
@@ -4815,6 +4897,7 @@ extern "C" __global__ void ts_expand_kv_heads_f32(
     int head_dim,
     int group_size)
 {
+    TS_PDL_ENTRY();
     ts_expand_kv_heads_impl(
         cache, output, num_kv_heads, seq_len, cache_size, head_dim, group_size);
 }
@@ -4828,6 +4911,7 @@ extern "C" __global__ void ts_expand_kv_heads_f16(
     int head_dim,
     int group_size)
 {
+    TS_PDL_ENTRY();
     ts_expand_kv_heads_impl(
         cache, output, num_kv_heads, seq_len, cache_size, head_dim, group_size);
 }
@@ -4864,6 +4948,7 @@ extern "C" __global__ void ts_repeat_interleave_f32(
     int repeats,
     int inner_size)
 {
+    TS_PDL_ENTRY();
     ts_repeat_interleave_impl(
         source, output, outer_size, dim_size, repeats, inner_size);
 }
@@ -4876,6 +4961,7 @@ extern "C" __global__ void ts_repeat_interleave_f16(
     int repeats,
     int inner_size)
 {
+    TS_PDL_ENTRY();
     ts_repeat_interleave_impl(
         source, output, outer_size, dim_size, repeats, inner_size);
 }
@@ -4889,6 +4975,7 @@ extern "C" __global__ void ts_concat_head_first_f32(
     int len_b,
     int head_dim)
 {
+    TS_PDL_ENTRY();
     int total_len = len_a + len_b;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_heads * total_len * head_dim;
@@ -4914,6 +5001,7 @@ extern "C" __global__ void ts_neox_rope_head_first_f32(
     int head_dim,
     int rope_half)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_heads * seq_len * rope_half;
     if (idx >= total)
@@ -4950,6 +5038,7 @@ extern "C" __global__ void ts_neox_rope_flat_f32(
     int head_dim,
     int rope_half)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_heads * seq_len * rope_half;
     if (idx >= total)
@@ -4985,6 +5074,7 @@ extern "C" __global__ void ts_fill_neox_rope_tables_dyn_f32(
     int global_half,
     const int* dyn)
 {
+    TS_PDL_ENTRY();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = max(local_half, global_half);
     if (idx >= total || !dyn)
@@ -5007,6 +5097,7 @@ extern "C" __global__ void ts_index_select_f32(
     int indices_are_int32,
     int is_add)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= rows)
         return;
@@ -5028,6 +5119,7 @@ extern "C" __global__ void ts_index_select_f32(
 
 extern "C" __global__ void ts_add_causal_mask_f32(float* tensor, int rows, int cols, int seq_len, int start_pos, float masked_value)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= rows)
         return;
@@ -5044,6 +5136,7 @@ extern "C" __global__ void ts_add_causal_mask_f32(float* tensor, int rows, int c
 
 extern "C" __global__ void ts_rope_f32(const float* input, float* output, int rows, int cols, int seq_len, int row_offset)
 {
+    TS_PDL_ENTRY();
     int pair_count = cols / 2;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = rows * pair_count;
@@ -5113,6 +5206,7 @@ extern "C" __global__ void ts_rope_ex_f32(
     float beta_slow,
     int add_to_result)
 {
+    TS_PDL_ENTRY();
     int active_dim = rope_dim < cols ? rope_dim : cols;
     int pair_count = active_dim / 2;
     int global = blockIdx.x * blockDim.x + threadIdx.x;
@@ -5203,6 +5297,7 @@ extern "C" __global__ void ts_quant_matmul_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     const int cols_per_block = 4;
     int out_col0 = blockIdx.x * cols_per_block;
     int row = blockIdx.y;
@@ -5270,6 +5365,7 @@ extern "C" __global__ void ts_quant_matmul_vec_f32(
     int in_dim,
     int out_dim)
 {
+    TS_PDL_ENTRY();
     int out_col = blockIdx.x;
     if (out_col >= out_dim)
         return;
@@ -5317,6 +5413,7 @@ extern "C" __global__ void ts_quant_matmul_batched_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     int warps_per_block = blockDim.x >> 5;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
@@ -5373,6 +5470,7 @@ extern "C" __global__ void ts_quant_matmul_iq2_xxs_q8_1_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.y;
     if (row >= rows || (in_dim & 255) != 0)
         return;
@@ -5431,6 +5529,7 @@ extern "C" __global__ void ts_quant_matmul_iq2_vec_q8_1_f32(
     int in_dim,
     int out_dim)
 {
+    TS_PDL_ENTRY();
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps_per_block = blockDim.x >> 5;
@@ -5480,6 +5579,7 @@ extern "C" __global__ void ts_quant_matmul_q4_0_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     const int cols_per_block = 4;
     int out_col0 = blockIdx.x * cols_per_block;
     int row = blockIdx.y;
@@ -5579,6 +5679,7 @@ extern "C" __global__ void ts_quant_matmul_q4_0_batched_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     int out_col0 = blockIdx.x * TS_Q40_COLS;
     int row0 = blockIdx.y * TS_Q40_ROW_TILE;
     if (out_col0 >= out_dim || row0 >= rows)
@@ -5660,6 +5761,7 @@ extern "C" __global__ void ts_quant_matmul_q8_0_single_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     const int cols_per_block = 4;
     int out_col0 = blockIdx.x * cols_per_block;
     int row = blockIdx.y;
@@ -5737,6 +5839,7 @@ extern "C" __global__ void ts_quant_matmul_q8_0_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     const int cols_per_block = 4;
     int out_col0 = blockIdx.x * cols_per_block;
 
@@ -5896,6 +5999,7 @@ extern "C" __global__ void ts_quantize_q8_1_rows_f32(
     int in_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     int q8_blocks = in_dim / TS_QK8_1;
     long long total = (long long)rows * q8_blocks;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -5921,6 +6025,7 @@ extern "C" __global__ void ts_quantize_q8_1_rows_warp_f32(
     int in_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     int lane = threadIdx.x & 31;
     long long warp_idx =
         (((long long)blockIdx.x * blockDim.x) + threadIdx.x) >> 5;
@@ -5971,6 +6076,7 @@ extern "C" __global__ void ts_quantize_q8_1_split_rows_f32(
     int in_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     int q8_blocks = in_dim / TS_QK8_1;
     long long total = (long long)rows * q8_blocks;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -6040,6 +6146,7 @@ extern "C" __global__ void ts_quant_matmul_q8_0_dp4a_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     int out_col0 = blockIdx.x * TS_Q8_DP4A_COLS;
     int row0 = blockIdx.y * TS_Q8_DP4A_ROWS;
     if (out_col0 >= out_dim || row0 >= rows || (in_dim & 31) != 0)
@@ -6164,6 +6271,7 @@ extern "C" __global__ void __launch_bounds__(TS_MMQ_THREADS, 2) ts_quant_matmul_
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     int n0 = blockIdx.x * TS_MMQ_N;
     int m0 = blockIdx.y * TS_MMQ_M;
@@ -6428,6 +6536,7 @@ extern "C" __global__ void __launch_bounds__(TS_MMQ_THREADS, 2) ts_quant_matmul_
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     int n0 = blockIdx.x * TS_MMQ_N;
     int m0 = blockIdx.y * TS_MMQ_M;
@@ -6686,16 +6795,20 @@ __device__ __forceinline__ void ts_q80_vec_rows(
 
 extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32_1(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_vec_rows<1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_vec_rows<1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_vec_rows<4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_vec_rows<4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32_8(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_vec_rows<8>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_vec_rows<8>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32_16(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_vec_rows<16>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_vec_rows<16>(weights, xq, output, in_dim, out_dim, rows); }
 
 // Q8_0 matvec for short input rows (fewer than 1024 values: a hyper-connection bottleneck's up
 // projection, a shared expert's down projection). There the kernel above keeps most of its 32 lane
@@ -6758,16 +6871,20 @@ __device__ __forceinline__ void ts_q80_warp_rows(
 
 extern "C" __global__ void ts_quant_matmul_q8_0_warp_f32_1(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_warp_rows<1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_warp_rows<1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void ts_quant_matmul_q8_0_warp_f32_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_warp_rows<4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_warp_rows<4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void ts_quant_matmul_q8_0_warp_f32_8(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_warp_rows<8>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_warp_rows<8>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void ts_quant_matmul_q8_0_warp_f32_16(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_warp_rows<16>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_warp_rows<16>(weights, xq, output, in_dim, out_dim, rows); }
 
 // Q8_0 matvec for 1..16 q8_1 rows as a pair of kernels with one arithmetic, so a row's result never depends on
 // the batch it decodes in nor on which kernel ran it. For an output (row, column), with the input's blocks cut
@@ -7049,109 +7166,360 @@ __device__ __forceinline__ void ts_q80_pair_lane_rows(
 
 extern "C" __global__ void __launch_bounds__(128) ts_q80_pair_mma_1(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_mma_rows<1, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_mma_rows<1, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(128) ts_q80_pair_mma_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_mma_rows<2, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_mma_rows<2, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(128) ts_q80_pair_mma_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_mma_rows<4, 1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_mma_rows<4, 1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_mma_8(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_mma_rows<8, 1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_mma_rows<8, 1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(512) ts_q80_pair_mma_16(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_mma_rows<16, 1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_mma_rows<16, 1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_1_1(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<1, 1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<1, 1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_1_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<1, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<1, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_2_1(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<2, 1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<2, 1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_2_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<2, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<2, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_4_1(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<4, 1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<4, 1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_4_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<4, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<4, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_8_1(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<8, 1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<8, 1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_8_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<8, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<8, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(512) ts_q80_pair_twin_16_1(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<16, 1>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<16, 1>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(512) ts_q80_pair_twin_16_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<16, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<16, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_1_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<1, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<1, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_2_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<2, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<2, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_4_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<4, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<4, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_8_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<8, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<8, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(512) ts_q80_pair_twin_16_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_twin_rows<16, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_twin_rows<16, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_1_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<1, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<1, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_1_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<1, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<1, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_1_8(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<1, 8>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<1, 8>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_2_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<2, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<2, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_2_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<2, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<2, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_2_8(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<2, 8>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<2, 8>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_4_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<4, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<4, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_4_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<4, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<4, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_4_8(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<4, 8>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<4, 8>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_8_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<8, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<8, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_8_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<8, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<8, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_8_8(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<8, 8>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<8, 8>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_16_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<16, 2>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<16, 2>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_16_4(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<16, 4>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<16, 4>(weights, xq, output, in_dim, out_dim, rows); }
 extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_16_8(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
-{ ts_q80_pair_lane_rows<16, 8>(weights, xq, output, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q80_pair_lane_rows<16, 8>(weights, xq, output, in_dim, out_dim, rows); }
+
+// ---- The pair's sums over a packed copy of the weight, the tensor cores' operands swapped ----
+// ts_q80_pair_mma_rows makes the activations the mma's 16-row A and the weight its 8-column B, and reads each Q8_0
+// block (34 bytes, 2-byte aligned) with 16-bit loads: a warp keeps ~1 KB in flight and an 8-row call reads the H100's
+// HBM at 0.4-1.1 TB/s. Here the weight is A (16 output columns x one 32-value block) and the activations B (8 rows; a
+// second B for rows 8-15), from a copy packed once at load (ts_q80_pair_pack): per 16-column tile and block, each
+// lane's A fragment as one aligned 16-byte word, and the tile's 16 scales as 8 half2 beside them. A warp then issues
+// U blocks' 16-byte loads before its first mma. Every output still sums each block's exact int32 dot (one block is one
+// m16n8k32 step), scaled by fma(dw * dact, isum, acc) in block order into the eight partials (ib - k0) % 8 of its
+// slice, with the slices of Q80PairSlices and the same trees: bit for bit the pair's other three kernels.
+// Packed layout (Q80PairPackedBytes): quants int4 [tiles16][kb][32 lanes] {col gid ints tig, tig + 4; col gid + 8
+// ints tig, tig + 4} (A's a0 a1 a2 a3), then scales half2 [tiles16][kb][8] {dw(col gid), dw(col gid + 8)};
+// columns past out_dim are zeros.
+extern "C" __global__ void ts_q80_pair_pack(const uint8_t* __restrict__ w, uint8_t* __restrict__ packed, int in_dim, int out_dim)
+{
+    TS_PDL_ENTRY();
+    const int kb = in_dim / 32, tiles = (out_dim + 15) / 16;
+    const long long n = (long long)tiles * kb * 32;
+    int4* q = reinterpret_cast<int4*>(packed);
+    half2* sc = reinterpret_cast<half2*>(packed + (size_t)n * 16);
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+    {
+        const int lane = (int)(i & 31);
+        const long long tj = i >> 5;
+        const int j = (int)(tj % kb), tile = (int)(tj / kb);
+        const int gid = lane >> 2, tig = lane & 3;
+        const int c0 = tile * 16 + gid, c1 = c0 + 8;
+        int4 v = make_int4(0, 0, 0, 0);
+        half d0 = __float2half(0.0f), d1 = d0;
+        if (c0 < out_dim)
+        {
+            const uint8_t* b = w + ((size_t)c0 * kb + j) * 34;
+            d0 = *reinterpret_cast<const half*>(b);
+            v.x = get_int_b2(b + 2, tig);
+            v.z = get_int_b2(b + 2, tig + 4);
+        }
+        if (c1 < out_dim)
+        {
+            const uint8_t* b = w + ((size_t)c1 * kb + j) * 34;
+            d1 = *reinterpret_cast<const half*>(b);
+            v.y = get_int_b2(b + 2, tig);
+            v.w = get_int_b2(b + 2, tig + 4);
+        }
+        q[i] = v;
+        if (tig == 0)
+            sc[tj * 8 + gid] = __halves2half2(d0, d1);
+    }
+}
+
+__device__ __forceinline__ void ts_q80_pair_swap_step(int (&d)[4], const int4 a, int b0, int b1)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+                 : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "r"(0), "r"(0), "r"(0), "r"(0));
+#else
+    d[0] = d[1] = d[2] = d[3] = 0;
+#endif
+}
+
+// S slices (Q80PairSlices), TPC 16-column tiles a CTA (a warp per tile and slice), NB B halves (1: rows <= 8, 2: <= 16),
+// U blocks in flight a warp (a multiple of 8, so a block's partial is u % 8).
+template <int S, int TPC, int NB, int U>
+__device__ __forceinline__ void ts_q80_pair_swap_rows(
+    const uint8_t* __restrict__ packed, const ts_block_q8_1* __restrict__ xq, float* __restrict__ output,
+    int in_dim, int out_dim, int rows)
+{
+    __shared__ float part[TPC][S][32][4 * NB];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tileInCta = warp / S, slice = warp % S;
+    const int tile = blockIdx.x * TPC + tileInCta;
+    const int gid = lane >> 2, tig = lane & 3;
+    const int kb = in_dim / 32;
+    const int tiles = (out_dim + 15) / 16;
+    const int tl = min(tile, tiles - 1);
+    const int k0 = slice * kb / S, k1 = (slice + 1) * kb / S;
+    const int4* qb = reinterpret_cast<const int4*>(packed) + (size_t)tl * kb * 32 + lane;
+    const half2* sb = reinterpret_cast<const half2*>(packed + (size_t)tiles * kb * 32 * 16) + (size_t)tl * kb * 8 + gid;
+    // B: activation row nb * 8 + gid (ints tig, tig + 4); D's columns: rows nb * 8 + tig * 2 and + 1. Rows past the
+    // call's last read the last row again and are never stored.
+    const ts_block_q8_1* xb[NB];
+    const ts_block_q8_1* xd0[NB];
+    const ts_block_q8_1* xd1[NB];
+    bool rb[NB], rd0[NB], rd1[NB];
+#pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+    {
+        const int r = nb * 8 + gid, q0 = nb * 8 + tig * 2;
+        rb[nb] = r < rows;
+        rd0[nb] = q0 < rows;
+        rd1[nb] = q0 + 1 < rows;
+        xb[nb] = xq + (size_t)min(r, rows - 1) * kb;
+        xd0[nb] = xq + (size_t)min(q0, rows - 1) * kb;
+        xd1[nb] = xq + (size_t)min(q0 + 1, rows - 1) * kb;
+    }
+    float p[NB][4][8];
+#pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int u = 0; u < 8; u++)
+                p[nb][i][u] = 0.0f;
+    for (int ib0 = k0; ib0 < k1; ib0 += U)
+    {
+        // Every load of the U blocks first (volatile: issued before the first mma), then the arithmetic.
+        int4 w[U];
+        half2 s2[U];
+#pragma unroll
+        for (int u = 0; u < U; u++)
+        {
+            const int j = min(ib0 + u, k1 - 1);
+            const int4* pq = qb + (size_t)j * 32;
+            asm volatile("ld.global.cs.v4.s32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(w[u].x), "=r"(w[u].y), "=r"(w[u].z), "=r"(w[u].w) : "l"(pq));
+            unsigned sv;
+            asm volatile("ld.global.nc.b32 %0, [%1];" : "=r"(sv) : "l"(sb + (size_t)j * 8));
+            s2[u] = *reinterpret_cast<half2*>(&sv);
+        }
+        int bb0[NB][U], bb1[NB][U];
+        float dd0[NB][U], dd1[NB][U];
+#pragma unroll
+        for (int u = 0; u < U; u++)
+        {
+            const int j = min(ib0 + u, k1 - 1);
+#pragma unroll
+            for (int nb = 0; nb < NB; nb++)
+            {
+                bb0[nb][u] = rb[nb] ? get_int_b4(xb[nb][j].qs, tig) : 0;
+                bb1[nb][u] = rb[nb] ? get_int_b4(xb[nb][j].qs, tig + 4) : 0;
+                dd0[nb][u] = rd0[nb] ? __half2float(xd0[nb][j].d) : 0.0f;
+                dd1[nb][u] = rd1[nb] ? __half2float(xd1[nb][j].d) : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; u++)
+        {
+            const float dw0 = __low2float(s2[u]), dw1 = __high2float(s2[u]);
+#pragma unroll
+            for (int nb = 0; nb < NB; nb++)
+                if (ib0 + u < k1)
+                {
+                    int d[4];
+                    ts_q80_pair_swap_step(d, w[u], bb0[nb][u], bb1[nb][u]);
+                    const int pu = u & 7;
+                    p[nb][0][pu] = __fmaf_rn(__fmul_rn(dw0, dd0[nb][u]), (float)d[0], p[nb][0][pu]);
+                    p[nb][1][pu] = __fmaf_rn(__fmul_rn(dw0, dd1[nb][u]), (float)d[1], p[nb][1][pu]);
+                    p[nb][2][pu] = __fmaf_rn(__fmul_rn(dw1, dd0[nb][u]), (float)d[2], p[nb][2][pu]);
+                    p[nb][3][pu] = __fmaf_rn(__fmul_rn(dw1, dd1[nb][u]), (float)d[3], p[nb][3][pu]);
+                }
+        }
+    }
+    float acc[NB][4];
+#pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+            acc[nb][i] = ts_q80_pair_tree8(p[nb][i]);
+    if (S > 1)
+    {
+#pragma unroll
+        for (int nb = 0; nb < NB; nb++)
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+                part[tileInCta][slice][lane][nb * 4 + i] = acc[nb][i];
+        __syncthreads();
+        if (slice != 0)
+            return;
+#pragma unroll
+        for (int nb = 0; nb < NB; nb++)
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                float v[S];
+#pragma unroll
+                for (int s = 0; s < S; s++)
+                    v[s] = part[tileInCta][s][lane][nb * 4 + i];
+                acc[nb][i] = ts_q80_pair_slice_tree<S>(v);
+            }
+    }
+    if (tile * 16 >= out_dim)
+        return;
+    const int c0 = tile * 16 + gid, c1 = c0 + 8;
+#pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+    {
+        const int q0 = nb * 8 + tig * 2;
+        if (c0 < out_dim)
+        {
+            if (rd0[nb]) output[(size_t)q0 * out_dim + c0] = acc[nb][0];
+            if (rd1[nb]) output[(size_t)(q0 + 1) * out_dim + c0] = acc[nb][1];
+        }
+        if (c1 < out_dim)
+        {
+            if (rd0[nb]) output[(size_t)q0 * out_dim + c1] = acc[nb][2];
+            if (rd1[nb]) output[(size_t)(q0 + 1) * out_dim + c1] = acc[nb][3];
+        }
+    }
+}
+
+// ts_q80_pair_swap_<S>_<NB>: CudaKernels.Q80PairSwapTiles(S) tiles a CTA, 16 blocks in flight up to 8 rows (8 for two
+// slices), 8 for 9-16 rows; measured on an H100 NVL at Flash Next's decode shapes, 2026-11-12.
+#define TS_Q80_PAIR_SWAP(S, TPC, NB, U)                                                                              \
+    extern "C" __global__ void __launch_bounds__(32 * S * TPC) ts_q80_pair_swap_##S##_##NB(                         \
+        const uint8_t* packed, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)            \
+    { TS_PDL_ENTRY(); ts_q80_pair_swap_rows<S, TPC, NB, U>(packed, xq, output, in_dim, out_dim, rows); }
+TS_Q80_PAIR_SWAP(1, 2, 1, 16)
+TS_Q80_PAIR_SWAP(1, 2, 2, 8)
+TS_Q80_PAIR_SWAP(2, 2, 1, 8)
+TS_Q80_PAIR_SWAP(2, 2, 2, 8)
+TS_Q80_PAIR_SWAP(4, 1, 1, 16)
+TS_Q80_PAIR_SWAP(4, 1, 2, 8)
+TS_Q80_PAIR_SWAP(8, 1, 1, 16)
+TS_Q80_PAIR_SWAP(8, 1, 2, 8)
+TS_Q80_PAIR_SWAP(16, 1, 1, 16)
+TS_Q80_PAIR_SWAP(16, 1, 2, 8)
 
 // dp4a (int8) Q4_K single-token decode matvec. The generic scalar path
 // (ts_quant_matmul_vec_f32 -> qvalue_at) re-parses the Q4_K super-block header
@@ -7175,6 +7543,7 @@ extern "C" __global__ void ts_quant_matmul_q4k_dp4a_f32(
     int in_dim,
     int out_dim)
 {
+    TS_PDL_ENTRY();
     int col = blockIdx.x;
     if (col >= out_dim)
         return;
@@ -7245,7 +7614,7 @@ __device__ __forceinline__ int ts_q3k_scale(const uint8_t* scales, int is)
 // accumulators or other type's decode, and every instantiation computes a row the same way.
 #define TS_LOWK_KERNEL(NAME, IMPL, XT, R, Q3, SUFFIX)                                                     \
     extern "C" __global__ void NAME##SUFFIX(const uint8_t* w, const XT* x, float* o, int in_dim, int out_dim, int rows) \
-    { IMPL<R, Q3>(w, x, o, in_dim, out_dim, rows); }
+    { TS_PDL_ENTRY(); IMPL<R, Q3>(w, x, o, in_dim, out_dim, rows); }
 #define TS_LOWK_KERNELS(NAME, IMPL, XT)                   \
     TS_LOWK_KERNEL(NAME, IMPL, XT, 1, false, _q2_1)       \
     TS_LOWK_KERNEL(NAME, IMPL, XT, 4, false, _q2_4)       \
@@ -7365,6 +7734,7 @@ extern "C" __global__ void ts_quant_matmul_q5k_dp4a_f32(
     int in_dim,
     int out_dim)
 {
+    TS_PDL_ENTRY();
     int col = blockIdx.x;
     if (col >= out_dim)
         return;
@@ -7511,15 +7881,19 @@ extern "C" __global__ void ts_quant_matmul_q6k_dp4a_f32(
     int in_dim,
     int out_dim)
 {
+    TS_PDL_ENTRY();
     ts_q6k_dp4a_rows<1>(weights, xq, output, in_dim, out_dim, 1);
 }
 
 extern "C" __global__ void ts_quant_matmul_q6k_dp4a_rows_f32_4(const uint8_t* w, const ts_block_q8_1* x, float* o, int in_dim, int out_dim, int rows)
-{ ts_q6k_dp4a_rows<4>(w, x, o, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q6k_dp4a_rows<4>(w, x, o, in_dim, out_dim, rows); }
 extern "C" __global__ void ts_quant_matmul_q6k_dp4a_rows_f32_8(const uint8_t* w, const ts_block_q8_1* x, float* o, int in_dim, int out_dim, int rows)
-{ ts_q6k_dp4a_rows<8>(w, x, o, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q6k_dp4a_rows<8>(w, x, o, in_dim, out_dim, rows); }
 extern "C" __global__ void ts_quant_matmul_q6k_dp4a_rows_f32_16(const uint8_t* w, const ts_block_q8_1* x, float* o, int in_dim, int out_dim, int rows)
-{ ts_q6k_dp4a_rows<16>(w, x, o, in_dim, out_dim, rows); }
+{
+    TS_PDL_ENTRY(); ts_q6k_dp4a_rows<16>(w, x, o, in_dim, out_dim, rows); }
 
 // dp4a (int8) Q4_0 GEMM — the fast path for BOTH single-token decode (rows == 1)
 // and the MTP verify window (rows 2-9) on the dominant dense quant. Mirrors the
@@ -7545,6 +7919,7 @@ extern "C" __global__ void ts_quant_matmul_q4_0_dp4a_f32(
     int out_dim,
     int rows)
 {
+    TS_PDL_ENTRY();
     int out_col0 = blockIdx.x * TS_Q40_DP4A_COLS;
     int row0 = blockIdx.y * TS_Q40_DP4A_ROWS;
     if (out_col0 >= out_dim || row0 >= rows || (in_dim & 31) != 0)
@@ -7678,6 +8053,7 @@ extern "C" __global__ void ts_qk_norm_rope_neox_f32(
     float rope_base,
     float rope_freq_scale)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= rows)
         return;
@@ -7827,6 +8203,7 @@ extern "C" __global__ void ts_qwen35_gdn_fused_f32(
     int conv_write_idx,
     float eps)
 {
+    TS_PDL_ENTRY();
     int h = blockIdx.x;
     if (h >= num_v_heads)
         return;
@@ -7966,6 +8343,7 @@ extern "C" __global__ void ts_quant_get_rows_f32(
     int rows,
     int indices_are_int32)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= rows)
         return;
@@ -8010,6 +8388,7 @@ extern "C" __global__ void ts_moe_router_f32(
     int num_experts,
     int n_used)
 {
+    TS_PDL_ENTRY();
     if (threadIdx.x != 0)
         return;
 
@@ -8063,6 +8442,7 @@ extern "C" __global__ void ts_moe_expert_gate_up_vec_f32(
     int in_dim,
     int out_dim)
 {
+    TS_PDL_ENTRY();
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps_per_block = blockDim.x >> 5;
@@ -8108,6 +8488,7 @@ extern "C" __global__ void ts_moe_expert_down_accum_f32(
     int out_dim,
     int n_used)
 {
+    TS_PDL_ENTRY();
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps_per_block = blockDim.x >> 5;
@@ -8226,6 +8607,7 @@ extern "C" __global__ void ts_moe_expert_gate_up_dp4a_f32(
     int in_dim,
     int out_dim)
 {
+    TS_PDL_ENTRY();
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps_per_block = blockDim.x >> 5;
@@ -8270,6 +8652,7 @@ extern "C" __global__ void ts_moe_expert_down_dp4a_f32(
     int out_dim,
     int n_used)
 {
+    TS_PDL_ENTRY();
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps_per_block = blockDim.x >> 5;
@@ -8310,6 +8693,7 @@ extern "C" __global__ void ts_moe_expert_down_dp4a_f32(
 // parameter (and the index) host-dependent. The managed launcher passes a 64-bit long.
 extern "C" __global__ void ts_silu_mul_f32(float* dst, const float* a, const float* b, long long n)
 {
+    TS_PDL_ENTRY();
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n)
         return;
@@ -8330,6 +8714,7 @@ extern "C" __global__ void ts_silu_mul_clamp_f32(
     const float limit,
     const int do_clamp)
 {
+    TS_PDL_ENTRY();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n)
         return;
@@ -8357,6 +8742,7 @@ extern "C" __global__ void ts_moe_shared_gated_add(
     int hidden,
     int gate_dim)
 {
+    TS_PDL_ENTRY();
     __shared__ float g_shared;
     if (gate_vec != nullptr && input != nullptr)
     {
@@ -8399,6 +8785,7 @@ extern "C" __global__ void ts_moe_router_batched_f32(
     int n_used,
     int num_tokens)
 {
+    TS_PDL_ENTRY();
     int t = blockIdx.x;
     if (t >= num_tokens || threadIdx.x != 0)
         return;
@@ -8447,6 +8834,7 @@ extern "C" __global__ void ts_moe_expert_gate_up_batched_dp4a_f32(
     float* gate_up_out,            // [num_tokens * n_used * out_dim]
     int type, int in_dim, int out_dim, int n_used)
 {
+    TS_PDL_ENTRY();
     int out_col = blockIdx.x;
     int slot = blockIdx.y;
     int t = blockIdx.z;
@@ -8483,6 +8871,7 @@ extern "C" __global__ void ts_moe_expert_gate_up_batched_vec_f32(
     float* gate_up_out,            // [num_tokens * n_used * out_dim]
     int type, int in_dim, int out_dim, int n_used)
 {
+    TS_PDL_ENTRY();
     int out_col = blockIdx.x;
     int slot = blockIdx.y;
     int t = blockIdx.z;
@@ -8519,6 +8908,7 @@ extern "C" __global__ void ts_moe_expert_down_batched_dp4a_f32(
     float* output,                 // [num_tokens * out_dim]
     int type, int in_dim, int out_dim, int n_used)
 {
+    TS_PDL_ENTRY();
     int out_col = blockIdx.x;
     int t = blockIdx.y;
     if (out_col >= out_dim)
@@ -8556,6 +8946,7 @@ extern "C" __global__ void ts_moe_expert_down_batched_accum_f32(
     float* output,                 // [num_tokens * out_dim]
     int type, int in_dim, int out_dim, int n_used)
 {
+    TS_PDL_ENTRY();
     int out_col = blockIdx.x;
     int t = blockIdx.y;
     if (out_col >= out_dim)
@@ -8594,6 +8985,7 @@ extern "C" __global__ void ts_moe_shared_gated_add_batched(
     int gate_dim,
     int num_tokens)
 {
+    TS_PDL_ENTRY();
     int t = blockIdx.x;
     if (t >= num_tokens)
         return;
@@ -8637,6 +9029,7 @@ extern "C" __global__ void ts_moe_scatter_add_weighted_rows_f32(
     int num_tokens,
     int hidden)
 {
+    TS_PDL_ENTRY();
     int row = blockIdx.x;
     if (row >= batch_size)
         return;
@@ -8821,7 +9214,7 @@ __device__ __forceinline__ void ts_wan_attention_body(
     }
 }
 
-#define TS_WAN_ATTENTION_KERNEL(NAME, D)                                             extern "C" __global__ __launch_bounds__(TS_WAN_ATTN_WARPS * 32) void NAME(           const float* __restrict__ query,                                                 const float* __restrict__ key,                                                   const float* __restrict__ value,                                                 const float* __restrict__ bias,                                                  float* __restrict__ output,                                                      int num_heads,                                                                   int seq_q,                                                                       int seq_k,                                                                       float scale)                                                                 {                                                                                    ts_wan_attention_body<D>(query, key, value, bias, output, num_heads, seq_q, seq_k, scale);     }
+#define TS_WAN_ATTENTION_KERNEL(NAME, D)                                             extern "C" __global__ __launch_bounds__(TS_WAN_ATTN_WARPS * 32) void NAME(           const float* __restrict__ query,                                                 const float* __restrict__ key,                                                   const float* __restrict__ value,                                                 const float* __restrict__ bias,                                                  float* __restrict__ output,                                                      int num_heads,                                                                   int seq_q,                                                                       int seq_k,                                                                       float scale)                                                                 { TS_PDL_ENTRY();                                                                                    ts_wan_attention_body<D>(query, key, value, bias, output, num_heads, seq_q, seq_k, scale);     }
 
 TS_WAN_ATTENTION_KERNEL(ts_wan_attention_d64_f32, 64)
 TS_WAN_ATTENTION_KERNEL(ts_wan_attention_d128_f32, 128)
@@ -8836,6 +9229,7 @@ extern "C" __global__ void ts_wan_rope_f32(
     int seq,
     int head_dim)
 {
+    TS_PDL_ENTRY();
     const int half = head_dim / 2;
     const long long total = (long long)seq * heads * half;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -8864,6 +9258,7 @@ extern "C" __global__ void ts_wan_modulate_f32(
     long long row_count,
     int cols)
 {
+    TS_PDL_ENTRY();
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long total = row_count * cols;
     if (idx >= total)
@@ -8882,6 +9277,7 @@ extern "C" __global__ void ts_wan_gate_add_f32(
     long long row_count,
     int cols)
 {
+    TS_PDL_ENTRY();
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long total = row_count * cols;
     if (idx >= total)
@@ -8898,6 +9294,7 @@ extern "C" __global__ void ts_wan_scale_cols_f32(
     long long rows,
     int cols)
 {
+    TS_PDL_ENTRY();
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long total = rows * cols;
     if (idx >= total)
@@ -8920,6 +9317,7 @@ extern "C" __global__ void ts_wan_im2col_f32(
     int stride_h, int stride_w,
     int oy0, int band_oh)
 {
+    TS_PDL_ENTRY();
     const long long K = (long long)C * KH * KW;
     const long long total = (long long)band_oh * OW * K;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -8949,6 +9347,7 @@ extern "C" __global__ void ts_wan_chan_rms_f32(
     long long HW,
     float eps)
 {
+    TS_PDL_ENTRY();
     long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= HW)
         return;
@@ -8969,6 +9368,7 @@ extern "C" __global__ void ts_wan_upsample2x_f32(
     float* __restrict__ dst,
     int C, int H, int W)
 {
+    TS_PDL_ENTRY();
     const long long total = (long long)C * 2 * H * 2 * W;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total)
@@ -8989,6 +9389,7 @@ extern "C" __global__ void ts_silu_mul_clamp_quantize_q8_1_f32(
     float* gate, const float* up, void* output, float* scales,
     int in_dim, int rows, float limit)
 {
+    TS_PDL_ENTRY();
     int lane = threadIdx.x & 31;
     long long block = (((long long)blockIdx.x * blockDim.x) + threadIdx.x) >> 5;
     if (block >= (long long)rows * (in_dim / TS_QK8_1))

@@ -51,6 +51,7 @@ namespace TensorSharp.Cuda
         private GlmKernels(CudaModule module)
         {
             this.module = module;
+            s_pdl = CudaPdl.UsableFor(module.CompiledArchOf("ts_glm_kda_prep_f32"));
             kdaPrep = module.GetFunction("ts_glm_kda_prep_f32");
             kdaScan = module.GetFunction("ts_glm_kda_scan_f32");
             kdaScanR1 = module.GetFunction("ts_glm_kda_scan_r1_f32");
@@ -81,9 +82,13 @@ namespace TensorSharp.Cuda
             return new GlmKernels(CudaModule.LoadFromFile(path));
         }
 
+        // Programmatic dependent launch for this module's kernels (CudaPdl): set once its code is known to be sm_90+.
+        private static bool s_pdl;
+
         private static void Launch(IntPtr fn, uint gx, uint gy, uint gz, int block, IntPtr stream, void** args)
         {
-            CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            (s_pdl ? CudaPdl.Launch(fn, gx, gy, gz, (uint)block, 1, 1, 0, stream, args)
+                : CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero)).ThrowOnError();
         }
 
         private static uint CeilDiv(long n, int d) => (uint)Math.Max(1, (n + d - 1) / d);

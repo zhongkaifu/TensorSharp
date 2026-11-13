@@ -2,6 +2,7 @@
 #include <cuda_fp16.h>
 
 extern "C" __global__ void ts_h3_weight_f16_f32(const half * x,float * y,int count) {
+    TS_PDL_ENTRY();
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<count)y[i]=__half2float(x[i]);
 }
@@ -10,6 +11,7 @@ extern "C" __global__ void ts_h3_copy_strided_f32(const float * x, float * y, in
         long long n0, long long n1, long long n2, long long n3,
         long long xs0, long long xs1, long long xs2, long long xs3,
         long long ys0, long long ys1, long long ys2, long long ys3) {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     long long r=i, c3=r%n3; r/=n3; long long c2=r%n2; r/=n2;
@@ -18,6 +20,7 @@ extern "C" __global__ void ts_h3_copy_strided_f32(const float * x, float * y, in
 }
 
 extern "C" __global__ void ts_h3_clamp_f32(const float * x, float * y, int count, float lower, float upper) {
+    TS_PDL_ENTRY();
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if (i<count) { const float v=x[i]; y[i]=v<lower ? lower : (v>upper ? upper : v); }
 }
@@ -25,6 +28,7 @@ extern "C" __global__ void ts_h3_clamp_f32(const float * x, float * y, int count
 extern "C" __global__ void ts_h3_transform_f32(const float * x, const float * a,
         const float * b, float * y, int count, int op, int p0, int p1, int p2,
         int p3, int p4, int p5, int p6, int p7, int p8, int p9) {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     if (op == 0) { // reflect im2col: x[H,W,C], y[bandRows*OW,C*K*K]
@@ -78,6 +82,7 @@ extern "C" __global__ void ts_h3_transform_f32(const float * x, const float * a,
 
 extern "C" __global__ void ts_h3_groupnorm_silu_f32(const float * x, const float * gain,
         const float * bias, float * y, int rows, int channels, int groups, float eps) {
+    TS_PDL_ENTRY();
     int frame = blockIdx.x/groups, group = blockIdx.x%groups, width = channels/groups;
     int n = rows*width;
     __shared__ double sums[256];

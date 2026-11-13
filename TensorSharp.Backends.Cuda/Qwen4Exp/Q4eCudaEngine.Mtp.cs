@@ -305,7 +305,10 @@ namespace TensorSharp.Cuda
                 HcPre(dev, _mtpHeadNorm, _mtpHeadDown, _mtpHeadUp, null, 1, xs);
             DeviceWeight head = _output;
             if (vocab > 0 && vocab < head.Ne1)
+            {
                 head.Ne1 = vocab;
+                head.PairPacked = IntPtr.Zero;   // the packed copy's layout is the whole vocabulary's
+            }
             MatMulQ(dev, head, dev.Cur, dev.Logits, 1);
         }
 
