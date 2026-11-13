@@ -120,7 +120,7 @@ the local arithmetic, so network costs can dominate decode.
 | Qwen3.8 Flash Next (`qwen4exp`) | `ggml_cuda` | Native spans transfer the complete hyper-connection residual. GDN recurrence, convolution, PLE and QSA state stay with their owning layers. Text forwards only. |
 | GLM-5.3-Flash (`glm5next` / `glm5-next`) | `ggml_cuda` | Native stages transfer the complete hyper-connection residual. KDA recurrence and pooled DSA/MLA caches stay with their owning layers. Text forwards only; older `glm-dsa` variants remain local. |
 | Mistral 3 dense text tower | `ggml_cuda`, `ggml_vulkan` | Shared dense pipeline transfers F32 hidden activations. Each node loads only its layer weights/KV state; the first stage embeds and the last stage computes logits. Nodes may differ in GPU count and `--tp`. |
-| Qwen 3.5 / 3.6 (`qwen35`, `qwen35moe`) | `cuda`, `ggml_cuda`, `ggml_vulkan` | The shared decoder runtime: F32 hidden activations cross nodes; GDN recurrent and convolution state and the KV cache stay with their owning layers. Nodes may differ in GPU count and `--tp`. Requests run one at a time (no batched forward across nodes). |
+| Qwen 3.5 / 3.6 (`qwen35`, `qwen35moe`) | `cuda`, `ggml_cuda`, `ggml_vulkan` | The shared decoder runtime: F32 hidden activations cross nodes; GDN recurrent and convolution state and the KV cache stay with their owning layers. Nodes may differ in GPU count and `--tp`. Requests run one at a time (no batched forward across nodes). Speculative decoding (the checkpoint's MTP head, a `--draft-model` DFlash/DFlash2 drafter, n-gram) drafts on node 0; see [speculative decoding across nodes](#speculative-decoding-across-nodes). |
 
 The transport, ownership plan and dense-stage execution are independent of model
 names. Architecture descriptors explicitly opt in after implementing their full
@@ -149,10 +149,32 @@ require headroom. New architecture adapters must account for their own replicate
 weights and boundary state.
 
 Distributed requests currently use serialized forward/refill/reset/truncate
-controls. Paged multi-sequence batching, KV snapshots and speculative paths that
-bypass those controls are disabled for these stage executors. Layer splitting
-increases aggregate model capacity. Each token still traverses the stages in
-order, so more devices need not make single-request decode faster.
+controls. Paged multi-sequence batching and KV snapshots that bypass those
+controls are disabled for these stage executors. Layer splitting increases
+aggregate model capacity. Each token still traverses the stages in order, so
+more devices need not make single-request decode faster.
+
+### Speculative decoding across nodes
+
+On the shared decoder runtime (Qwen 3.5 / 3.6, Qwen3.8 dense) a pipeline speculates
+as one device does: `--spec` uses the checkpoint's MTP head, `--draft-model` attaches a
+DFlash / DFlash2 drafter, and `--spec-type ngram` drafts from the context. The drafter,
+the head and the sampler run on node 0, which runs the last stage (the default order;
+`TENSORSHARP_LAYER_SPLIT_DRIVER_STAGE=first` refuses speculation with that reason):
+the MTP layer is placed with the last decoder layer, and only node 0 needs the
+`--draft-model` file. Each verify window is mirrored to every node, which runs its
+layers over the window's rows while its recurrent states keep the state before the
+window; the accepted count and the cache rewind are mirrored after it, and a node
+whose window was cut runs its recurrence again over the accepted rows. A DFlash
+drafter's target-layer rows come to node 0 from the nodes that run those layers
+(for the prompt too, so a long prompt moves several hundred MB of features).
+Streams match plain greedy decoding on one device, up to the near-ties a stage's
+`--tp` rounding can flip.
+
+Measured with Qwen3.8-27B UD-IQ3_XXS over two nodes (an RTX A5000 driver and an RTX
+2000 Ada worker, peers relayed through SSH, so each token pays a network round trip),
+32 greedy tokens: plain decode 12.8 s after a short prompt and 15.7 s after a 3.6K-token
+one; MTP 9.3 s and 14.4 s (55% / 33% accepted); DFlash2 9.2 s and 8.3 s (52% / 84%).
 
 ## Adding a model family
 

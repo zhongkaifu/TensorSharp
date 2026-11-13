@@ -530,6 +530,9 @@ namespace TensorSharp.Models
         /// snapshots and prefix checkpoints carry it; a host mirror serves the hashing).</summary>
         private sealed class PleGdnState : DeviceGdnState
         {
+            /// <summary>The per-op verify window restores the recurrence only, not the PLE conv and n-gram histories.</summary>
+            protected internal override bool SupportsVerify => false;
+
             private readonly PleSpec _p;
             private readonly int[] _tokens, _undoTokens;
             private int _count, _next;

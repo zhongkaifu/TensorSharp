@@ -338,16 +338,18 @@ internal static class Qwen4ExpSyntheticModelBuilder
     }
 
     /// <summary>A one-layer DFlash drafter for the checkpoint <see cref="Write"/> writes: it reads the stream entering
-    /// layers [2, 5, 7], as Flash Next's DFlash2 reads [6, 16, 26, 36, 46], and borrows the trunk's embedding and head.</summary>
-    public static string WriteDFlash(string path, int blockSize = 4)
+    /// layers [2, 5, 7], as Flash Next's DFlash2 reads [6, 16, 26, 36, 46], and borrows the trunk's embedding and head.
+    /// <paramref name="hidden"/>: another trunk's width (a Qwen 3.5 synthetic checkpoint's).</summary>
+    public static string WriteDFlash(string path, int blockSize = 4, int hidden = Hidden)
     {
         const int heads = 4, kvHeads = 2, headDim = 64, ffn = 512;
+        int Hidden = hidden;
         int[] taps = { 2, 5, 7 };
         var kv = new List<Kv>
         {
             new Str { Key = "general.architecture", V = "dflash" },
             new U32 { Key = "dflash.block_count", V = 1 },
-            new U32 { Key = "dflash.embedding_length", V = Hidden },
+            new U32 { Key = "dflash.embedding_length", V = (uint)Hidden },
             new U32 { Key = "dflash.feed_forward_length", V = ffn },
             new U32 { Key = "dflash.attention.head_count", V = heads },
             new U32 { Key = "dflash.attention.head_count_kv", V = kvHeads },

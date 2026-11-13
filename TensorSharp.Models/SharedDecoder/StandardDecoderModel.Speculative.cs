@@ -83,6 +83,7 @@ namespace TensorSharp.Models
         protected void AttachDraftModel(string draftModelPath)
         {
             if (string.IsNullOrEmpty(draftModelPath)) return;
+            if (!DraftsOnThisNode) return;   // a multi-node pipeline drafts on the driver (the last stage)
             if (SpeculationRefusal is { } reason)
             {
                 Console.WriteLine($"  Draft model '{System.IO.Path.GetFileName(draftModelPath)}' not attached: {reason}.");
@@ -107,6 +108,7 @@ namespace TensorSharp.Models
                 // Per-rank graphs verify (each rank's recurrent states keep their window and commit on their device);
                 // the draft layer is not sharded, so a family loads none under tensor parallelism.
                 if (GraphUnsupportedReason() is not { } reason) return null;
+                if (IsMultiNodePipeline) return DistributedSpeculationRefusal(reason);
                 if (!_mesh.IsSingleDevice || LayerSplitGroup != null)
                     return $"speculative decoding off whole-forward graphs ({reason}) runs on one device";
                 foreach (RecurrentState state in ActiveRecurrentStates())
@@ -175,6 +177,11 @@ namespace TensorSharp.Models
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             ArgumentNullException.ThrowIfNull(tokens);
+            if (IsMultiNodePipeline)
+            {
+                SpecForwardDistributed(tokens, hAllOut, logitsOut, allLogitsRows);
+                return;
+            }
             SettlePendingVerify();
             int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
             EnsureCacheCapacity(checked(start + rows));
@@ -314,6 +321,7 @@ namespace TensorSharp.Models
             if (kept < 1 || kept > rows)
                 throw new InvalidOperationException($"Accepted {acceptedRows} rows of a {rows}-row verify.");
             _verifyRows = 0;
+            MirrorVerifyCommit(kept);
             CommitRecurrentPrefix(kept, rows);
         }
 
@@ -325,6 +333,7 @@ namespace TensorSharp.Models
             {
                 int rows = _verifyRows;
                 _verifyRows = 0;
+                MirrorVerifyCommit(0);
                 CommitRecurrentPrefix(0, rows);
                 return;
             }
@@ -337,6 +346,7 @@ namespace TensorSharp.Models
         {
             if (length < 0 || length > _cacheSeqLen)
                 throw new ArgumentOutOfRangeException(nameof(length), $"rewind to {length} of {_cacheSeqLen}");
+            MirrorRewind(length);
             _cacheSeqLen = length;
         }
 

@@ -401,6 +401,71 @@ namespace TensorSharp.Models
                 foreach (Tensor t in new[] { Conv, Backing, Ssm }) Invalidate(t);
             }
 
+            // A per-op verify window (BeginVerify .. CommitVerify, a multi-node pipeline's): the state before it, and the
+            // mixer's recorded run over the window, replayed over the kept rows when the window is cut.
+            private float[] _verifyConv, _verifyBacking;
+            private Tensor _verifyInput;
+            private Func<Tensor, Tensor> _verifyReplay;
+            private int _verifyWindow;
+
+            /// <summary>A per-op verify window is open on this state.</summary>
+            public bool Verifying { get; private set; }
+
+            /// <summary>The per-op path verifies on this state: it keeps the state before the window, and a cut window
+            /// runs the recurrence again over its kept rows (the attention layers' rows past them are dead).</summary>
+            protected internal override bool SupportsVerify => true;
+
+            protected internal override void BeginVerify()
+            {
+                DropVerify();
+                if (_host)
+                    foreach (Tensor t in new[] { Conv, Backing })
+                        _executor?.SyncToHost(_hostPointer(t), t.ElementCount() * sizeof(float));
+                _verifyConv = Conv.GetElementsAsFloat(checked((int)Conv.ElementCount()));
+                _verifyBacking = Backing.GetElementsAsFloat(checked((int)Backing.ElementCount()));
+                Verifying = true;
+            }
+
+            /// <summary>The mixer ran the window's <paramref name="input"/> rows (kept, taken over by the state) through
+            /// <paramref name="replay"/>, which runs the recurrence over rows like them again.</summary>
+            public void RecordVerifyWindow(Tensor input, Func<Tensor, Tensor> replay)
+            {
+                _verifyInput?.Dispose();
+                _verifyInput = input;
+                _verifyReplay = replay;
+                _verifyWindow = (int)input.Sizes[0];
+            }
+
+            protected internal override void CommitVerify(int kept)
+            {
+                if (!Verifying) return;
+                Verifying = false;
+                try
+                {
+                    if (_verifyInput == null || kept >= _verifyWindow) return;   // the live state is the window's end
+                    Conv.SetElementsAsFloat(_verifyConv);
+                    Backing.SetElementsAsFloat(_verifyBacking);
+                    OnHostWritten();
+                    if (kept <= 0) return;
+                    using Tensor head = _verifyInput.Narrow(0, 0, kept);
+                    using Tensor rows = Ops.NewContiguous(head);
+                    using Tensor discarded = _verifyReplay(rows);
+                }
+                finally
+                {
+                    DropVerify();
+                }
+            }
+
+            private void DropVerify()
+            {
+                _verifyInput?.Dispose();
+                _verifyInput = null;
+                _verifyReplay = null;
+                _verifyConv = _verifyBacking = null;
+                _verifyWindow = 0;
+            }
+
             protected void Invalidate(Tensor t)
             {
                 _executor?.Invalidate(_hostPointer(t));
@@ -464,6 +529,14 @@ namespace TensorSharp.Models
             int v = vHeads * _headVDim;
             int qkv = 2 * qk + v;
             int packed = qkv + v + 2 * vHeads;
+            if (state.Verifying)
+            {
+                // A per-op verify window: the state keeps its input, so a cut window runs the recurrence again over its
+                // kept rows (CommitVerify; the state is no longer verifying then, so the replay records nothing).
+                var input = new Tensor(scope.Allocator, DType.Float32, tokens, Config.HiddenSize);
+                Ops.Copy(input, raw);
+                state.RecordVerifyWindow(input, rows => DeviceGatedDeltaNet(scope, rows, layer, state));
+            }
 
             // One device keeps in-projections of mixed types unpacked (packing them would mean a
             // dense or requantized copy): the family's graph lowering runs them as quantized.

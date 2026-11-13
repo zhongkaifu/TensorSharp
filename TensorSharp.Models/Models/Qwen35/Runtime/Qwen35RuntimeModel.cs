@@ -73,9 +73,9 @@ namespace TensorSharp.Models
             // NextN / MTP draft blocks are counted in block_count but are not decoder layers.
             int nextn = (int)_gguf.GetUint32($"{arch}.nextn_predict_layers", 0);
             Config.NumLayers -= nextn;
-            // The NextN/MTP block drafts on one device, the last of this process's whole-layer stages, or (unsharded) on
-            // rank 0 of a tensor-parallel group; a multi-node pipeline drafts once its graphs lower.
-            bool drafts = tpGroup == null || (tpGroup is not ILayerSplitGroup && tpGroup.NodeCount == 1);
+            // The NextN/MTP block drafts on one device, the last of this process's whole-layer stages, (unsharded) on
+            // rank 0 of a tensor-parallel group, or on the last stage of a multi-node pipeline, which the driver runs.
+            bool drafts = tpGroup == null || tpGroup is ILayerSplitGroup || tpGroup.NodeCount == 1;
             _draftLayers = drafts ? Math.Min(nextn, 1) : 0;
             // A family whose MTP head ships as its own file (--draft-model): its layer loads as the draft layer.
             if (_draftLayers == 0 && drafts && OpenSeparateDraftHead(draftModelPath) is { } head)
@@ -84,6 +84,9 @@ namespace TensorSharp.Models
                 _separateDraftHead = head;
                 LoadAdditionalWeights(head);
             }
+            // A multi-node pipeline drafts on its last stage: a drafter that reads the trunk's embedding needs it there.
+            DrafterReadsTrunkEmbedding = (_draftLayers > 0 && !_gguf.Tensors.ContainsKey(LayerName(Config.NumLayers, "nextn.embed_tokens.weight")))
+                || !string.IsNullOrWhiteSpace(draftModelPath);
 
             int interval = (int)_gguf.GetUint32($"{arch}.full_attention_interval", 4);
             _isRecurrent = new bool[Config.NumLayers];
@@ -398,6 +401,54 @@ namespace TensorSharp.Models
                 Array.Clear(Ssm);
                 WriteIndex = 0;
             }
+
+            // A per-op verify window (a multi-node pipeline's): the state before it, and the window's recorded
+            // recurrence, run again over the kept rows when the window is cut.
+            private float[] _verifyConv, _verifySsm;
+            private int _verifyWriteIndex, _verifyWindow;
+            private Action<int> _verifyReplay;
+
+            public bool Verifying { get; private set; }
+
+            protected internal override bool SupportsVerify => true;
+
+            protected internal override void BeginVerify()
+            {
+                _verifyConv = (float[])Conv.Clone();
+                _verifySsm = (float[])Ssm.Clone();
+                _verifyWriteIndex = WriteIndex;
+                _verifyReplay = null;
+                _verifyWindow = 0;
+                Verifying = true;
+            }
+
+            /// <summary>The window's <paramref name="rows"/> ran; <paramref name="replay"/> runs the recurrence over its
+            /// first rows again.</summary>
+            public void RecordVerifyWindow(int rows, Action<int> replay)
+            {
+                _verifyWindow = rows;
+                _verifyReplay = replay;
+            }
+
+            protected internal override void CommitVerify(int kept)
+            {
+                if (!Verifying) return;
+                Verifying = false;
+                try
+                {
+                    if (_verifyReplay == null || kept >= _verifyWindow) return;
+                    Array.Copy(_verifyConv, Conv, Conv.Length);
+                    Array.Copy(_verifySsm, Ssm, Ssm.Length);
+                    WriteIndex = _verifyWriteIndex;
+                    if (kept > 0) _verifyReplay(kept);
+                }
+                finally
+                {
+                    _verifyConv = _verifySsm = null;
+                    _verifyReplay = null;
+                    _verifyWindow = 0;
+                }
+            }
         }
 
         protected override RecurrentState CreateRecurrentState(RankScope scope, int layer)
@@ -436,6 +487,13 @@ namespace TensorSharp.Models
             using (Tensor t = Linear(scope, normed, p + "ssm_alpha.weight")) alpha = t.GetElementsAsFloat(tokens * vHeads);
 
             var gated = new float[tokens * vWidth];
+            if (gdn.Verifying)
+            {
+                // A cut verify window runs the recurrence again over its kept rows from the state before it (CommitVerify).
+                int rank = scope.Rank;
+                gdn.RecordVerifyWindow(tokens, kept => GatedDeltaNet(gdn, qkv, z, beta, alpha, new float[kept * vWidth], kept, kHeads, vHeads,
+                    _convWT[layer][rank], _dtBias[layer][rank], _ssmA[layer][rank], _ssmNorm[layer]));
+            }
             GatedDeltaNet(gdn, qkv, z, beta, alpha, gated, tokens, kHeads, vHeads,
                 _convWT[layer][scope.Rank], _dtBias[layer][scope.Rank], _ssmA[layer][scope.Rank], _ssmNorm[layer]);
 

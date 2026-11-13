@@ -108,21 +108,25 @@ public abstract partial class ModelBase
     /// remains with its owner. Families with extra cross-layer state use the same
     /// ILayerSplitGroup transport with their complete boundary-state representation.</summary>
     protected float[] ForwardLayerPipeline(int[] tokens, Func<Tensor> embed,
-        Func<Tensor, int, Tensor> runLayer, Func<Tensor, float[]> project)
+        Func<Tensor, int, Tensor> runLayer, Func<Tensor, float[]> project, int outputFloats = 0)
     {
         ArgumentNullException.ThrowIfNull(tokens);
-        return ForwardLayerPipeline(tokens, embed, (Func<Tensor, Tensor>)(hidden => RunOwnedLayers(hidden, tokens.Length, runLayer)), project);
+        return ForwardLayerPipeline(tokens, embed, (Func<Tensor, Tensor>)(hidden => RunOwnedLayers(hidden, tokens.Length, runLayer)), project,
+            outputFloats);
     }
 
     /// <summary>
     /// The stage protocol with this node's layers run by <paramref name="runLocalLayers"/>: it receives the activation
     /// on local stage 0's device (taking ownership) and returns it after layer <see cref="LayerSplitPlan.EndLayer"/> - 1,
     /// where <paramref name="project"/> reads it when this node runs the last stage. For a model whose local stages are
-    /// not single devices (tensor-parallel stages), which the per-layer form cannot express.
+    /// not single devices (tensor-parallel stages), which the per-layer form cannot express. The last stage's
+    /// <paramref name="project"/> returns <paramref name="outputFloats"/> floats (0: one row of logits; a verify window's
+    /// rows of logits are several).
     /// </summary>
     protected float[] ForwardLayerPipeline(int[] tokens, Func<Tensor> embed,
-        Func<Tensor, Tensor> runLocalLayers, Func<Tensor, float[]> project)
+        Func<Tensor, Tensor> runLocalLayers, Func<Tensor, float[]> project, int outputFloats = 0)
     {
+        if (outputFloats <= 0) outputFloats = Config.VocabSize;
         if (LayerPlacement == null) throw new InvalidOperationException("Layer placement has not been configured.");
         ArgumentNullException.ThrowIfNull(tokens);
         if (tokens.Length == 0) throw new ArgumentException("A forward requires at least one token.", nameof(tokens));
@@ -146,7 +150,7 @@ public abstract partial class ModelBase
             if (LayerPlacement.IsLast)
             {
                 float[] result = project(hidden);
-                if (result.Length != Config.VocabSize)
+                if (result.Length != outputFloats)
                     throw new InvalidOperationException("The output stage returned an unexpected vocabulary size.");
                 if (LayerPlacement.NodeId != 0) LayerSplitGroup.Send(result, result.Length, 0);
                 return result;
@@ -156,7 +160,7 @@ public abstract partial class ModelBase
             if (outgoing.Length != elements) throw new InvalidOperationException("Invalid layer-stage activation shape.");
             LayerSplitGroup.Send(outgoing, elements, LayerPlacement.NextNode);
             if (LayerPlacement.NodeId != 0) return Array.Empty<float>();
-            var logits = new float[Config.VocabSize];
+            var logits = new float[outputFloats];
             LayerSplitGroup.Receive(logits, logits.Length, LayerPlacement.NodeOfStage(LayerPlacement.NodeCount - 1));
             return logits;
         }

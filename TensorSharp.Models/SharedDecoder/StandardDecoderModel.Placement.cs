@@ -234,7 +234,7 @@ namespace TensorSharp.Models
             if (LayerPlacement == null) return true;
             if (LayerSplitPlan.TryGetLayer(info.Name, out int layer)) return LayerPlacement.Owns(PlacementLayer(layer));
             if (info.Name == "token_embd.weight")
-                return LayerPlacement.IsFirst || (LayerPlacement.IsLast && !_gguf.Tensors.ContainsKey("output.weight"));
+                return LayerPlacement.IsFirst || (LayerPlacement.IsLast && (!_gguf.Tensors.ContainsKey("output.weight") || DrafterReadsTrunkEmbedding));
             if (info.Name.StartsWith("output", StringComparison.Ordinal)) return LayerPlacement.IsLast;
             return true;
         }

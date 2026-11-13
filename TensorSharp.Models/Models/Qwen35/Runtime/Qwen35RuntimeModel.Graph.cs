@@ -60,7 +60,8 @@ namespace TensorSharp.Models
         /// still the one before the window).</summary>
         protected override void CommitRecurrentPrefix(int kept, int rows)
         {
-            if (!TensorRecurrence)
+            // The per-op path's states keep their own window (a multi-node pipeline verifies per op).
+            if (!TensorRecurrence || PerOpVerifyOpen())
             {
                 base.CommitRecurrentPrefix(kept, rows);
                 return;
@@ -94,6 +95,14 @@ namespace TensorSharp.Models
                     EnterGraphStage(0);
                 }
             }
+        }
+
+        /// <summary>A per-op verify window is open on the active request's states (they settle it themselves).</summary>
+        private bool PerOpVerifyOpen()
+        {
+            foreach (RecurrentState state in ActiveRecurrentStates())
+                if (state is DeviceGdnState { Verifying: true }) return true;
+            return false;
         }
 
         private GraphProgram BuildCommitProgram(int kept, int rows, int stage, int rank)

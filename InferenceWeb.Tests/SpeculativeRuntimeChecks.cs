@@ -21,10 +21,12 @@ internal static class SpeculativeRuntimeChecks
     /// verify window than for one row (ggml_cuda, ggml_cpu), the streams may part only where plain
     /// greedy's top two logits are within this relative margin, and only to the runner-up; 0
     /// (exact backends) requires the streams to be equal.</param>
-    public static void AssertMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0)
+    /// <param name="reference">The model plain greedy runs on (default: <paramref name="create"/>'s).</param>
+    public static void AssertMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0,
+        Func<ModelBase> reference = null)
     {
         int[] prompt = Enumerable.Range(0, 12).Select(i => 40 + i % 6).Concat(Enumerable.Range(0, 9).Select(i => 40 + i % 6)).ToArray();
-        List<Greedy> plain = PlainGreedy(create, prompt, maxNew);
+        List<Greedy> plain = PlainGreedy(reference ?? create, prompt, maxNew);
 
         using ModelBase target = create();
         var spec = Assert.IsAssignableFrom<ISpeculativeTarget>(target);
@@ -43,10 +45,11 @@ internal static class SpeculativeRuntimeChecks
 
     /// <summary>Greedy speculation through the model's own per-token draft head (NextN/MTP) emits
     /// exactly the plain greedy tokens: drafting, catch-up and the fused catch-up step ran.</summary>
-    public static void AssertDraftHeadMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0)
+    public static void AssertDraftHeadMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0,
+        Func<ModelBase> reference = null)
     {
         int[] prompt = Enumerable.Range(0, 21).Select(i => 40 + (i * 7) % 23).ToArray();
-        List<Greedy> plain = PlainGreedy(create, prompt, maxNew);
+        List<Greedy> plain = PlainGreedy(reference ?? create, prompt, maxNew);
 
         using ModelBase target = create();
         var spec = Assert.IsAssignableFrom<ISpeculativeModel>(target);
@@ -64,10 +67,11 @@ internal static class SpeculativeRuntimeChecks
 
     /// <summary>Greedy speculation through the model's block drafter (DFlash) emits exactly the plain greedy
     /// tokens: the prompt and every verify feed the drafter's feature rows, and its blocks are verified.</summary>
-    public static void AssertBlockDraftMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0)
+    public static void AssertBlockDraftMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0,
+        Func<ModelBase> reference = null)
     {
         int[] prompt = Enumerable.Range(0, 21).Select(i => 40 + (i * 7) % 23).ToArray();
-        List<Greedy> plain = PlainGreedy(create, prompt, maxNew);
+        List<Greedy> plain = PlainGreedy(reference ?? create, prompt, maxNew);
 
         using ModelBase target = create();
         var spec = Assert.IsAssignableFrom<ISpeculativeModel>(target);

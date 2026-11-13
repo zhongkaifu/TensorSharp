@@ -123,6 +123,11 @@ namespace TensorSharp.Models
         /// layer each, run by the draft head, never by the trunk. 0 when the family has none here.</summary>
         protected virtual int DraftLayerCount => 0;
 
+        /// <summary>A drafter on this load reads the trunk's token embedding (a draft layer without its own, or a DFlash
+        /// drafter): a multi-node pipeline's last stage, where the driver drafts, then loads the embedding too. Set by a
+        /// family before its weights load.</summary>
+        private protected bool DrafterReadsTrunkEmbedding { get; set; }
+
         /// <summary>Decoder layers plus draft layers: what weights, fusion, routing and caches cover.</summary>
         private int TotalLayers => Config.NumLayers + DraftLayerCount;
 
@@ -632,6 +637,7 @@ namespace TensorSharp.Models
         /// <summary>A multi-node layer split: the serialized stage protocol (ModelBase).</summary>
         private float[] ForwardDistributedPipeline(int[] tokens)
         {
+            SettlePendingVerify();   // every node: a verify the driver did not commit keeps its whole window
             int seqLen = tokens.Length;
             int start = _cacheSeqLen;
             EnsureCacheCapacity(checked(start + seqLen));
@@ -692,6 +698,7 @@ namespace TensorSharp.Models
                 }
                 else
                 {
+                    beforeLayer?.Invoke(layer, ranks[0]);   // every rank holds the whole residual stream
                     LayerAcrossRanks(ranks, layer, s, positions, batch);
                 }
             }
@@ -911,11 +918,14 @@ namespace TensorSharp.Models
             RotateQueryKey(scope, layer, ref q, ref k, positions);
 
             long t0 = Stopwatch.GetTimestamp();
+            Tensor cacheK = _cacheK[layer][scope.Rank], cacheV = _cacheV[layer][scope.Rank];
             Tensor attn = batch != null
                 ? SlotAttention(scope, layer, q, k, v, batch)
                 : decode
-                    ? DecodeAttention(scope, _cacheK[layer][scope.Rank], _cacheV[layer][scope.Rank], _cacheCapacity, q, k, v, positions.Start)
-                    : PrefillAttention(scope, _cacheK[layer][scope.Rank], _cacheV[layer][scope.Rank], q, k, v, positions.Start, tokens);
+                    ? DecodeAttention(scope, cacheK, cacheV, _cacheCapacity, q, k, v, positions.Start)
+                    : AttendsWindowOnHost(cacheK, tokens)
+                        ? WindowAttention(scope, cacheK, cacheV, q, k, v, positions.Start, tokens)
+                        : PrefillAttention(scope, cacheK, cacheV, q, k, v, positions.Start, tokens);
             _attnTicks += Stopwatch.GetTimestamp() - t0;
             if (gate != null)
             {
@@ -979,6 +989,51 @@ namespace TensorSharp.Models
             if (!done)
                 AttentionDecodePureCS(q, cacheK, cacheV, result, heads, kvHeads, _keyDim, start + 1, scale);
             q.Dispose();
+            return result;
+        }
+
+        /// <summary>Rows a verify window (or a draft layer's floored step) attends with in place on the host.</summary>
+        private const int HostWindowAttentionRows = 16;
+
+        /// <summary>
+        /// A few rows on a backend whose decode attention runs on the host (GGML, the managed CPU): each row attends over
+        /// the cache in place, as a decode row does (<see cref="WindowAttention"/>), instead of the prompt path's copy of
+        /// the whole cache expanded per query head. Qwen3.8-27B's 4-row verify windows at 3.6K keys took 1.1 s that way on
+        /// a 30-layer stage of a multi-node pipeline that decoded a row in 85 ms, and its draft layer copied 3.6K rows to
+        /// attend to ten.
+        /// </summary>
+        private bool AttendsWindowOnHost(Tensor cacheK, int tokens)
+            => tokens <= HostWindowAttentionRows && _backend != BackendType.Mlx && _backend != BackendType.Cuda
+               && _keyDim == _valueDim && (cacheK.ElementType == DType.Float32 || cacheK.ElementType == DType.Float16);
+
+        /// <summary>The rows' K/V into the cache, then each row's attention over keys [floor, start + row + 1) in place,
+        /// by the decode kernels (the floor offsets the cache's base; rows keep the cache's stride).</summary>
+        private unsafe Tensor WindowAttention(RankScope scope, Tensor cacheK, Tensor cacheV, Tensor q, Tensor k, Tensor v, int start, int tokens)
+        {
+            int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
+            float scale = 1.0f / MathF.Sqrt(_keyDim);
+            using (Tensor kHeads = ReshapeToHeads(k, kvHeads, tokens, _keyDim)) CopyToCache(cacheK, kHeads, start, tokens);
+            using (Tensor vHeads = ReshapeToHeads(v, kvHeads, tokens, _valueDim)) CopyToCache(cacheV, vHeads, start, tokens);
+            k.Dispose();
+            v.Dispose();
+            Tensor query = q.IsContiguous() ? q : Ops.NewContiguous(q);
+            if (!ReferenceEquals(query, q)) q.Dispose();
+            var result = new Tensor(scope.Allocator, DType.Float32, tokens, heads * _valueDim);
+            int floor = Math.Min(_attentionFloor, start);
+            int capacity = (int)cacheK.Sizes[1];
+            long qRow = (long)heads * _keyDim, rRow = (long)heads * _valueDim, skip = (long)floor * _keyDim;
+            float* qp = GetFloatPtr(query), rp = GetFloatPtr(result);
+            for (int r = 0; r < tokens; r++)
+            {
+                int keys = start + r + 1 - floor;
+                if (cacheK.ElementType == DType.Float16)
+                    AttentionDecodeGroupedF16(qp + r * qRow, GetHalfPtrForRead(cacheK) + skip, GetHalfPtrForRead(cacheV) + skip, rp + r * rRow,
+                        heads, kvHeads, _keyDim, capacity, keys, scale);
+                else
+                    AttentionDecodeGrouped(qp + r * qRow, GetFloatPtrForRead(cacheK) + skip, GetFloatPtrForRead(cacheV) + skip, rp + r * rRow,
+                        heads, kvHeads, _keyDim, capacity, keys, scale, Environment.ProcessorCount);
+            }
+            query.Dispose();
             return result;
         }
 
