@@ -290,8 +290,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   - 与 `--tp` / `--layer-split` 并存的放置拼写：`TS_DSV41_TP`（只用 `--tp N` 即可启用 DeepSeek V4.1 的 routed-MoE
     张量并行），以及 `TS_DSV4_NGPU` / `TS_GLM_NGPU`（GPU 数由 `--layer-split N` 设置；没有“全部可见 GPU”的简写，
     不给放置参数时这些执行器只用一张卡）；
-  - `TS_Q4E_RETAINED_CACHE`：Qwen 3.8 Flash Next 始终保留已结束的会话与共享前缀检查点，其内存由
-    `TS_Q4E_RETAINED_CACHE_MB` 决定（`0` 表示不保留）；
+  - `TS_Q4E_RETAINED_CACHE` 与 `TS_Q4E_RETAINED_CACHE_MB`：Qwen 3.8 Flash Next 已结束的会话与共享前缀检查点
+    由共享运行时的前缀缓存保留；
   - 更多关闭默认路径或进入已结束实验的开关：Qwen 3.8 Flash Next 的 `TS_Q4E_TOKEN_GRAPH`、`TS_Q4E_SPAN_ATTN`、
     `TS_Q4E_FLASH_ATTN`、`TS_Q4E_GRAPH_UID`、`TS_Q4E_SPAN_STATE`、`TS_Q4E_SPAN_REBUILD`、`TS_Q4E_SPAN_FA_MAX`、
     `TS_Q4E_GDN_MAX_LAYERS` 与 `TS_Q4E_RES_RESIDENT`（已知结果错误）；GLM 5.x 的 `TS_GLM_FA`、`TS_GLM_FUSED_LID`、

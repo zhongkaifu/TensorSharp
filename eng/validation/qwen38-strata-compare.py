@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import ast
 import ctypes
-import importlib.util
+import hashlib
 import json
 import math
 import os
@@ -27,9 +27,52 @@ import time
 
 
 HERE = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("expert_cache_validation", HERE / "qwen4exp-expert-cache.py")
-cache = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(cache)
+
+
+def digest_stream(source):
+    digest = hashlib.sha256()
+    for block in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def sha(path):
+    with Path(path).open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest() if hasattr(hashlib, "file_digest") else digest_stream(source)
+
+
+def git(root, *args):
+    return subprocess.check_output(["git", "-C", str(root), *args], text=True, encoding="utf-8").strip()
+
+
+def gpu_sample():
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw",
+                                 "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
+        return {"unix": time.time(), "exit_code": result.returncode, "csv": result.stdout.strip(),
+                "error": result.stderr.strip() or None}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"unix": time.time(), "error": str(error)}
+
+
+def difference(actual, expected):
+    if not actual or len(actual) != len(expected):
+        raise ValueError("Missing or different row counts")
+    metrics = []
+    for row, (a, b) in enumerate(zip(actual, expected)):
+        if not a or len(a) != len(b) or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in a + b):
+            raise ValueError("Incomplete/nonfinite vocabulary logits")
+        relative = math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)) / max(sum(y * y for y in b), 1e-30))
+        metrics.append({"row": row, "relative_l2": relative,
+                        "max_absolute": max(abs(x - y) for x, y in zip(a, b)),
+                        "argmax_equal": max(range(len(a)), key=a.__getitem__) == max(range(len(b)), key=b.__getitem__)})
+    return {"rows": len(metrics), "worst_relative_l2": max(row["relative_l2"] for row in metrics),
+            "max_absolute": max(row["max_absolute"] for row in metrics),
+            "argmax_mismatches": sum(not row["argmax_equal"] for row in metrics),
+            "first_argmax_divergence": next((row["row"] for row in metrics if not row["argmax_equal"]), None)}
+
+
 
 CASES = {
     "math": "Compute 17 + 25. Reply with only the integer.",
@@ -153,7 +196,7 @@ def verified_download(report_path, checkpoint_paths):
         if expected[key].stat().st_size != shard.get("bytes"):
             raise ValueError("Verified checkpoint shard size changed")
         seen.add(key)
-    return {"report_path": str(Path(report_path).resolve()), "report_sha256": cache.sha(report_path),
+    return {"report_path": str(Path(report_path).resolve()), "report_sha256": sha(report_path),
             "status": downloaded["status"], "shards": shards,
             "scope": "publisher hashes verified by the downloader; this comparison checks paths/sizes and does not rehash weights"}
 
@@ -179,7 +222,7 @@ def parse_strata_final_logits(path, vocab, prompt_count, generated_count, max_ne
     if not all(math.isfinite(value) for value in final):
         raise ValueError("Strata final logits contain nonfinite values")
     return {"final_logits": final, "prediction_position": rows - 1, "actual_rows": rows,
-            "header_planned_rows": planned_rows, "sha256": cache.sha(path)}
+            "header_planned_rows": planned_rows, "sha256": sha(path)}
 
 
 def load_strata_tokenizer(root, pack):
@@ -203,7 +246,7 @@ def load_strata_tokenizer(root, pack):
            if key.rsplit(".", 1)[-1] in ("eos_token_id", "eot_token_id", "eom_token_id")}
     if not eos:
         raise ValueError("Extracted checkpoint tokenizer does not declare EOS IDs")
-    return tokenizer, eos, {path.name: cache.sha(path) for path in directory.iterdir() if path.is_file()}
+    return tokenizer, eos, {path.name: sha(path) for path in directory.iterdir() if path.is_file()}
 
 
 def windows_peak_working_set(pid):
@@ -241,7 +284,7 @@ def run_process(command, cwd, environment, directory, timeout):
         process = subprocess.Popen(command, cwd=cwd, env=environment, stdout=log, stderr=subprocess.STDOUT)
         def sample():
             while not stopped.is_set():
-                samples.append(cache.gpu_sample())
+                samples.append(gpu_sample())
                 peak = windows_peak_working_set(process.pid)
                 if peak is not None:
                     peaks.append(peak)
@@ -271,9 +314,9 @@ def ts_environment(budget):
         if key.startswith(("TS_SPEC", "TS_MTP", "TS_Q4E_EXPERT_CACHE_")) or key in (
                 "TS_CPU_MOE", "TS_N_CPU_MOE", "TS_DSV4_DSPARK", "TS_QWEN35_DFLASH", "TS_MUSE_GLIMMER_DFLASH", "TS_NEMOTRON_DFLASH"):
             environment.pop(key)
-    environment.update(TS_HOST_MOE_EXPERT_CACHE_MB=str(budget), TS_HOST_MOE_EXPERT_CACHE_LAYERS="48",
-                       TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS="1", TS_HOST_MOE_EXPERT_CACHE_BRIDGE="1",
-                       TS_HOST_MOE_DECODE="1", TS_HOST_MOE_PIN_MAX_MB="0", TS_HOST_MOE_PIN="0")
+    # The expert-cache budget the runs once set (TS_HOST_MOE_EXPERT_CACHE_*) went with Qwen4ExpModel; the runtime's
+    # host experts keep their accelerator tier (TS_MOE_HOT_TIER_GB) instead.
+    environment.update(TS_HOST_MOE_DECODE="1", TS_HOST_MOE_PIN_MAX_MB="0", TS_HOST_MOE_PIN="0")
     return environment
 
 
@@ -322,7 +365,7 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     report = {"schema_version": 1, "passed": False, "language_quality_validated": False, "strata_parity_validated": False,
-              "cases": {}, "comparisons": {}, "runner_sha256": cache.sha(__file__), "settings": vars(args).copy(),
+              "cases": {}, "comparisons": {}, "runner_sha256": sha(__file__), "settings": vars(args).copy(),
               "limitations": ["Deterministic semantic smoke cases do not establish general language quality.",
                   "Strata's pack converts dense projections to BF16; cross-engine bit-exact logits are not expected.",
                   "Stock Strata native IQ experts use a verifier with capacity >=2, explicitly capped to one target row without MTP or suffix drafts; observed window counts must confirm scalar execution.",
@@ -343,13 +386,13 @@ def main():
             raise ValueError("Strata resident CPU experts require an available static --strata-expert-profile")
         if expert_profile.is_file():
             report["strata_expert_profile"] = {"path": str(expert_profile.resolve()), "bytes": expert_profile.stat().st_size,
-                "sha256": cache.sha(expert_profile), "source": "explicit CLI selection" if args.strata_expert_profile else "Strata stock data/expert-profile.bin"}
-        report.update(strata_binary_sha256=cache.sha(args.strata), probe_assembly_sha256=cache.sha(args.probe),
-                      source_revision=cache.git(root, "rev-parse", "HEAD"), source_status=cache.git(root, "status", "--short"),
-                      strata_revision=cache.git(args.strata_root, "rev-parse", "HEAD"),
-                      strata_status=cache.git(args.strata_root, "status", "--porcelain"),
-                      ggml_revision=cache.git(root / "ExternalProjects/ggml", "rev-parse", "HEAD"),
-                      ggml_status=cache.git(root / "ExternalProjects/ggml", "status", "--porcelain"))
+                "sha256": sha(expert_profile), "source": "explicit CLI selection" if args.strata_expert_profile else "Strata stock data/expert-profile.bin"}
+        report.update(strata_binary_sha256=sha(args.strata), probe_assembly_sha256=sha(args.probe),
+                      source_revision=git(root, "rev-parse", "HEAD"), source_status=git(root, "status", "--short"),
+                      strata_revision=git(args.strata_root, "rev-parse", "HEAD"),
+                      strata_status=git(args.strata_root, "status", "--porcelain"),
+                      ggml_revision=git(root / "ExternalProjects/ggml", "rev-parse", "HEAD"),
+                      ggml_status=git(root / "ExternalProjects/ggml", "status", "--porcelain"))
         report["execution_modes"] = {
             "tensorsharp": {"generation": "scalar greedy", "mtp": False, "prompt_lookup_drafts": False},
             "strata": {"verifier_capacity": args.strata_spec_window, "target_window_cap": 1,
@@ -359,13 +402,13 @@ def main():
         if report["ggml_status"] or report["strata_status"]:
             raise ValueError("Comparison requires unchanged upstream ggml and Strata source checkouts")
         if args.strata_dependency:
-            report.update(strata_dependency_revision=cache.git(args.strata_dependency, "rev-parse", "HEAD"),
-                          strata_dependency_status=cache.git(args.strata_dependency, "status", "--porcelain"))
+            report.update(strata_dependency_revision=git(args.strata_dependency, "rev-parse", "HEAD"),
+                          strata_dependency_status=git(args.strata_dependency, "status", "--porcelain"))
             if report["strata_dependency_status"]:
                 raise ValueError("Strata dependency checkout is modified")
         conversions = json.loads((args.pack / "conversions.json").read_text(encoding="utf-8"))
         report["pack"] = {"path": str(args.pack.resolve()), "conversions": conversions,
-                          "small_files_sha256": {p.name: cache.sha(p) for p in args.pack.iterdir() if p.is_file() and p.stat().st_size < 16 * 1024 * 1024},
+                          "small_files_sha256": {p.name: sha(p) for p in args.pack.iterdir() if p.is_file() and p.stat().st_size < 16 * 1024 * 1024},
                           "large_files": [{"name": p.name, "bytes": p.stat().st_size} for p in args.pack.iterdir() if p.is_file() and p.stat().st_size >= 16 * 1024 * 1024]}
         checkpoint_paths = sorted(args.model.parent.glob(args.model.name.split("-00001-of-")[0] + "*.gguf")) if "-00001-of-" in args.model.name else [args.model]
         report["checkpoint_shards"] = [{"path": str(p.resolve()), "bytes": p.stat().st_size} for p in checkpoint_paths]
@@ -381,7 +424,7 @@ def main():
                 raise ValueError("Provided prompt IDs are empty, out of vocabulary or exceed the context")
             if CASES[args.cases[0]] not in tokenizer.decode(seed_prompt):
                 raise ValueError("Provided prompt IDs do not contain the selected case's prompt")
-            report["prompt_tokens_file_sha256"] = cache.sha(args.prompt_tokens_file)
+            report["prompt_tokens_file_sha256"] = sha(args.prompt_tokens_file)
         binary_identity = None
         for case in args.cases:
             report["cases"][case] = {"prompt": CASES[case], "runs": []}
@@ -428,10 +471,10 @@ def main():
                         if binary_identity is not None and identity != binary_identity:
                             raise ValueError("Mapped TensorSharp native/managed binaries differ between arms")
                         binary_identity = identity
-                        if cache.sha(data["native_path"]) != data["native_sha256"]:
+                        if sha(data["native_path"]) != data["native_sha256"]:
                             raise ValueError("Mapped native binary changed during comparison")
                         for path, digest in data["managed_assemblies_sha256"].items():
-                            if cache.sha(path) != digest:
+                            if sha(path) != digest:
                                 raise ValueError("Loaded managed binary changed during comparison")
                         row = data["runs"][0]
                         ids = data["generated_tokens"]
@@ -505,11 +548,11 @@ def main():
                                   "cache_vs_strata": compare_ids(cached, arms["strata"]), "cross_engine_bit_exact_claim": False}
                     report["comparisons"][key][str(budget)] = comparison
                     if cached["generated_tokens"] == arms["tensor-cache0"]["generated_tokens"]:
-                        comparison["cache_final_logits_same_context"] = cache.difference(
+                        comparison["cache_final_logits_same_context"] = difference(
                             [cached["final_logits"]], [arms["tensor-cache0"]["final_logits"]])
                     dumped = arms["strata"].get("logits_dump", {})
                     if "final_logits" in dumped and cached["generated_tokens"] == arms["strata"]["generated_tokens"]:
-                        comparison["strata_final_logits_same_context"] = cache.difference(
+                        comparison["strata_final_logits_same_context"] = difference(
                             [cached["final_logits"]], [dumped["final_logits"]])
                 save()
         report["passed"] = completed_suite(report["cases"], args.cases,
@@ -528,7 +571,7 @@ def main():
                     "whole_process_seconds", "prefill_ms", "decode_ms", "decode_tps", "time_to_first_token_ms")},
                 "decode_denominator": rows[0]["decode_denominator"],
                 "scope": "aggregate of the selected semantic cases; output lengths can differ"}
-        if cache.sha(args.strata) != report["strata_binary_sha256"] or cache.git(root / "ExternalProjects/ggml", "status", "--porcelain"):
+        if sha(args.strata) != report["strata_binary_sha256"] or git(root / "ExternalProjects/ggml", "status", "--porcelain"):
             raise ValueError("Engine binary or upstream checkout changed during comparison")
     except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError) as error:
         report.update(passed=False, language_quality_validated=False, semantic_smoke_parity_validated=False, error=str(error))

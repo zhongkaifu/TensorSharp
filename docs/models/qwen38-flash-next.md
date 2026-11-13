@@ -114,8 +114,8 @@ Further notes:
 > removed on 2026-11-13. That covers its token span, arenas, retained holders, one-token verify-row kernels and expert
 > cache. Its GGML-only switches went with it: `TS_Q4E_VERIFY_ROW_KERNELS`, `TS_Q4E_VERIFY_ROW_COMMIT`,
 > `TS_Q4E_DISABLE_ARENA_DECODE`, `TS_Q4E_QSA_POOL_CACHE`, `TS_Q4E_QSA_SPARSE_FA`, `TS_Q4E_LAYER_SPLIT`,
-> `TS_Q4E_PLE_PREFETCH`, `TS_Q4E_METAL_FUSE`, `TS_Q4E_VISION_MERGER_ERF` and the debug dumps. Setting one now prints a
-> removal notice. The direct-CUDA engine's `TS_Q4E_*` switches are unchanged.
+> `TS_Q4E_PLE_PREFETCH`, `TS_Q4E_METAL_FUSE`, `TS_Q4E_VISION_MERGER_ERF`, `TS_Q4E_RETAINED_CACHE_MB`, the expert
+> cache's `TS_HOST_MOE_EXPERT_CACHE_*` and the debug dumps. Setting one now prints a removal notice. The direct-CUDA engine's `TS_Q4E_*` switches are unchanged.
 
 ## Vision encoder memory and validation
 

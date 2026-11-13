@@ -73,6 +73,6 @@ public sealed record PrefixCacheCapabilities
     public bool OffThreadImportRead { get; init; }                   // M7c, after §12.6 proofs
 
     // Budgets
-    public ResourceVector SubCapBytes { get; init; }                 // TS_Q4E_RETAINED_CACHE_MB, TS_DSV41_RETAINED_CACHE_MB, GLM slots
+    public ResourceVector SubCapBytes { get; init; }                 // TS_DSV41_RETAINED_CACHE_MB, GLM slots
     public int MaxRetainedNativeSlots { get; init; }                 // 0 = byte cap only (every family today)
 }

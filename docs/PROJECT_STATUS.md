@@ -415,9 +415,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
     alone enables DeepSeek V4.1's routed-MoE tensor parallelism), and `TS_DSV4_NGPU` /
     `TS_GLM_NGPU` (`--layer-split N` sets the GPU count; there is no all-visible-GPUs
     shorthand, and with no placement flag these executors use one device);
-  - `TS_Q4E_RETAINED_CACHE`: Qwen 3.8 Flash Next always retains finished conversations
-    and shared-prefix checkpoints, and `TS_Q4E_RETAINED_CACHE_MB` sizes that memory
-    (`0` retains nothing);
+  - `TS_Q4E_RETAINED_CACHE` and `TS_Q4E_RETAINED_CACHE_MB`: Qwen 3.8 Flash Next's finished
+    conversations and shared-prefix checkpoints are retained by the shared runtime's prefix cache;
   - more switches that turned a default path off or reached a concluded experiment:
     Qwen 3.8 Flash Next's `TS_Q4E_TOKEN_GRAPH`, `TS_Q4E_SPAN_ATTN`, `TS_Q4E_FLASH_ATTN`,
     `TS_Q4E_GRAPH_UID`, `TS_Q4E_SPAN_STATE`, `TS_Q4E_SPAN_REBUILD`, `TS_Q4E_SPAN_FA_MAX`,

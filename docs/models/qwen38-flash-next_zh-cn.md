@@ -95,7 +95,7 @@ erf 选项（`TS_Q4E_VISION_MERGER_ERF`）已随旧实现移除。见[图像验�
   约早 60 ms 完成，但 decode 速率为 54.4 对 57.1 tok/s（尚未解决）。
 - `Qwen4ExpModel` 在合成 fixture 上的 golden（`InferenceWeb.Tests/Fixtures/Qwen4ExpLegacy`）约束运行时的数值结果。
 
-> **历史章节。** 下文描述 GGML 后端的带日期章节记录的是 `Qwen4ExpModel`，它已于 2026-11-13 移除，包括其 token span、arena、保留 holder、单 token verify 行 kernel 与专家缓存。其 GGML 专属开关随之移除：`TS_Q4E_VERIFY_ROW_KERNELS`、`TS_Q4E_VERIFY_ROW_COMMIT`、`TS_Q4E_DISABLE_ARENA_DECODE`、`TS_Q4E_QSA_POOL_CACHE`、`TS_Q4E_QSA_SPARSE_FA`、`TS_Q4E_LAYER_SPLIT`、`TS_Q4E_PLE_PREFETCH`、`TS_Q4E_METAL_FUSE`、`TS_Q4E_VISION_MERGER_ERF` 以及调试 dump。现在设置这些开关会打印移除提示。直连 CUDA 引擎的 `TS_Q4E_*` 开关不变。
+> **历史章节。** 下文描述 GGML 后端的带日期章节记录的是 `Qwen4ExpModel`，它已于 2026-11-13 移除，包括其 token span、arena、保留 holder、单 token verify 行 kernel 与专家缓存。其 GGML 专属开关随之移除：`TS_Q4E_VERIFY_ROW_KERNELS`、`TS_Q4E_VERIFY_ROW_COMMIT`、`TS_Q4E_DISABLE_ARENA_DECODE`、`TS_Q4E_QSA_POOL_CACHE`、`TS_Q4E_QSA_SPARSE_FA`、`TS_Q4E_LAYER_SPLIT`、`TS_Q4E_PLE_PREFETCH`、`TS_Q4E_METAL_FUSE`、`TS_Q4E_VISION_MERGER_ERF`、`TS_Q4E_RETAINED_CACHE_MB`、专家缓存的 `TS_HOST_MOE_EXPERT_CACHE_*` 以及调试 dump。现在设置这些开关会打印移除提示。直连 CUDA 引擎的 `TS_Q4E_*` 开关不变。
 
 ## 工具调用与 Agent 工作流
 

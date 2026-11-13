@@ -3434,9 +3434,6 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // (see TSGgml_ReleaseReuseComputeBuffers). Two atomic loads and no write when
     // nothing is pending.
     host_read_barrier();
-    // ModelBase.Dispose uses this global cache sweep before unmapping weights.
-    // Retire compact expert buffers here as well, while CUDA is still alive.
-    tsg::host_moe_expert_cache_release();
     TSGgml_QwenImage21ResetForwardCache();
     // Stored Qwen-Image-2.1 prefix K/V are device memory too; a request that
     // still wants them stores them again on its next step.
@@ -4037,10 +4034,6 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     TSGgml_GptOssInvalidateKvCache(ptr, nullptr);
 
     tsg_graphtp::on_drop(ptr);
-    // A mapped expert's address can be recycled by a subsequent model load.
-    // Compact expert slots have their own allocations, so they must be dropped
-    // even when the ordinary host-buffer cache had no copy of this pointer.
-    tsg::host_moe_expert_cache_on_drop(ptr);
     tsg::moe_hot_tier_on_drop(ptr);
     tsg::host_expert_io_on_drop(ptr);
 

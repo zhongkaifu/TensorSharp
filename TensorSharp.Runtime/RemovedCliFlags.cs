@@ -362,6 +362,12 @@ namespace TensorSharp.Runtime
             ("TS_Q4E_TEST_MMVQ_CHANNELS", Qwen4ExpModelRemoved),
             ("TS_Q4E_VERIFY_ROW_COMMIT", Qwen4ExpModelRemoved),
             ("TS_Q4E_VERIFY_ROW_KERNELS", Qwen4ExpModelRemoved),
+            ("TS_HOST_MOE_EXPERT_CACHE_MB", HostMoeExpertCacheRemoved),
+            ("TS_HOST_MOE_EXPERT_CACHE_LAYERS", HostMoeExpertCacheRemoved),
+            ("TS_HOST_MOE_EXPERT_CACHE_BRIDGE", HostMoeExpertCacheRemoved),
+            ("TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE", HostMoeExpertCacheRemoved),
+            ("TS_HOST_MOE_EXPERT_CACHE_PREFETCH", HostMoeExpertCacheRemoved),
+            ("TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS", HostMoeExpertCacheRemoved),
             ("TS_Q4E_VISION_MERGER_ERF",
                 "Qwen 3.8 Flash Next's vision merger keeps its tanh GELU (the shipped projector's validated default); the "
                 + "erf opt-in of the removed Qwen4ExpModel was removed."),
@@ -395,9 +401,8 @@ namespace TensorSharp.Runtime
             ("TS_Q4E_SPAN_FA_MAX", ExperimentRemoved),
             ("TS_Q4E_GDN_MAX_LAYERS", ExperimentRemoved),
             ("TS_Q4E_RES_RESIDENT", ExperimentRemoved),
-            ("TS_Q4E_RETAINED_CACHE",
-                "Qwen 3.8 always retains finished conversations and shared-prefix checkpoints; "
-                + "TS_Q4E_RETAINED_CACHE_MB sizes that memory (0 retains nothing)."),
+            ("TS_Q4E_RETAINED_CACHE", Qwen4ExpRetentionRemoved),
+            ("TS_Q4E_RETAINED_CACHE_MB", Qwen4ExpRetentionRemoved),
             ("TS_NEMOTRON_FLASH_DECODE", DefaultPathSwitchRemoved),
             ("TS_NEMOTRON_LINEAR_RESIDUAL_FUSED", DefaultPathSwitchRemoved),
             ("TS_NEMOTRON_MAMBA2_NATIVE_DECODE", DefaultPathSwitchRemoved),
@@ -465,6 +470,14 @@ namespace TensorSharp.Runtime
         private const string Qwen4ExpModelRemoved =
             "Qwen 3.8 Flash Next runs on the shared decoder runtime on the GGML backends and cpu; the switch of the "
             + "removed Qwen4ExpModel (its token span, arenas and holders) was removed with it.";
+
+        private const string Qwen4ExpRetentionRemoved =
+            "Qwen 3.8 Flash Next's finished conversations and shared-prefix checkpoints are retained by the shared "
+            + "runtime's prefix cache, within the memory its slots leave; the removed Qwen4ExpModel's retention switches went with it.";
+
+        private const string HostMoeExpertCacheRemoved =
+            "the opt-in CUDA expert cache served only the removed Qwen4ExpModel's token span; host-served experts keep "
+            + "their hot tier on the accelerator (TS_MOE_HOT_TIER_GB) and the routing profile.";
 
         private const string ExperimentRemoved =
             "the experimental path it selected (never the default) was removed.";

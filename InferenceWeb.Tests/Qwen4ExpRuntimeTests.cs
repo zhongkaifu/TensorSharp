@@ -352,7 +352,7 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     [InlineData(true, true)]
     public void AdvancedDecodeStepsMatchTracedOnes(bool stages, bool managedCpu)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using IDisposable f32 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
         string path = Fixture(qsa: true);
         BackendType backend = managedCpu ? BackendType.Cpu : TestGates.PinnedGgmlBackend;
         List<float[]> Run(bool advance, out int advances)
