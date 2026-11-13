@@ -869,6 +869,10 @@ namespace TensorSharp.Cuda
                 kernels.LaunchQuantMatmulLowKDp4a(ggmlType, weightPtr, xq, resultPtr, inDim, outDim, rows, stream);
             else if (ggmlType == 14)
                 kernels.LaunchQuantMatmulQ6KDp4aRows(weightPtr, xq, resultPtr, inDim, outDim, rows, stream);
+            else if (ggmlType == 13)
+                kernels.LaunchQuantMatmulQ5KDp4a(weightPtr, xq, resultPtr, inDim, outDim, stream);
+            else if (ggmlType == 12)
+                kernels.LaunchQuantMatmulQ4KDp4a(weightPtr, xq, resultPtr, inDim, outDim, stream);
             else
                 kernels.LaunchQuantMatmulQ80VecRows(weightPtr, xq, resultPtr, inDim, outDim, rows, stream);
             return true;
@@ -884,6 +888,11 @@ namespace TensorSharp.Cuda
                 return rows <= CudaKernels.LowKMaxRows && (inDim & 255) == 0;
             if (ggmlType == 14)
                 return Q6KDp4aEnabled && (inDim & 255) == 0;
+            // Q5_K and Q4_K one-row decode: the single-row dp4a kernels.
+            if (ggmlType == 13)
+                return rows == 1 && Q5KDp4aEnabled && (inDim & 255) == 0;
+            if (ggmlType == 12)
+                return rows == 1 && Q4KDp4aEnabled && (inDim & 255) == 0;
             return ggmlType == 8 && Q80VecDp4aEnabled && (inDim & 31) == 0
                 && (rows >= 2 || outDim >= Q80VecMinOutDim);
         }

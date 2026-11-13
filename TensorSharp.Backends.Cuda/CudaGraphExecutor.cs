@@ -1608,8 +1608,46 @@ namespace TensorSharp.Cuda
                 CudaQuantizedOps.ReleaseQuantizedWeight(cuda, expert.CacheKey);
         }
 
+        /// <summary>A step's activations quantized to q8_1 for the decode-size products (rows up to 16), by the storage and
+        /// offset they were read from: the products of one activation (q, k and v; a block's gate and up) quantize it once.
+        /// Cleared at every run (a storage object is never written again while it is a node's value).</summary>
+        private readonly Dictionary<(CudaStorage Storage, long Offset, long InDim, long Rows), Tensor> _quantized = new();
+
+        protected override void BeginRun()
+        {
+            foreach (Tensor t in _quantized.Values) t.Dispose();
+            _quantized.Clear();
+        }
+
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
+            var cuda = (CudaAllocator)Allocator;
+            long rows = x.Sizes[0], inDim = weight.Ne0, outDim = weight.Ne1;
+            // A decode-size product over q8_1 activations the step already quantized (or quantizes now, once).
+            if (rows >= 1 && rows <= 16 && x.Storage is CudaStorage xs && x.ElementType == DType.Float32 && x.IsContiguous()
+                && x.ElementCount() == rows * inDim && inDim % 32 == 0 && inDim <= int.MaxValue && outDim <= int.MaxValue
+                && cuda.Kernels != null && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type)
+                && CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows))
+            {
+                var key = (xs, x.StorageOffset, inDim, rows);
+                if (!_quantized.TryGetValue(key, out Tensor xq))
+                {
+                    xq = new Tensor(Allocator, DType.UInt8, rows * (inDim / 32) * CudaKernels.Q81BlockBytes);
+                    xs.EnsureDeviceCurrent();
+                    cuda.Context.MakeCurrent();
+                    CudaQuantizedOps.QuantizeRowsQ81(cuda, Ptr(x), Ptr(xq), (int)inDim, (int)rows);
+                    ((CudaStorage)xq.Storage).MarkDeviceModified();
+                    _quantized[key] = xq;
+                }
+                var product = new Tensor(Allocator, DType.Float32, rows, outDim);
+                cuda.Context.MakeCurrent();
+                if (CudaQuantizedOps.TryResidentMatmulQ81(cuda, wPtr, type, Ptr(xq), Ptr(product), (int)inDim, (int)outDim, (int)rows))
+                {
+                    ((CudaStorage)product.Storage).MarkDeviceModified();
+                    return product;
+                }
+                product.Dispose();
+            }
             var result = new Tensor(Allocator, DType.Float32, x.Sizes[0], weight.Ne1);
             if (CudaQuantizedOps.TryAddmmQuantizedToFloat32(result, x, weight.CacheKey, weight.Data, weight.Format,
                     weight.Ne0, weight.Ne1, weight.Bytes))

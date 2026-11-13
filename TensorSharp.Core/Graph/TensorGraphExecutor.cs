@@ -455,6 +455,7 @@ namespace TensorSharp.Graph
 
             public Session(TensorGraphExecutor executor, bool[] dead = null, Liveness live = null)
             {
+                executor.BeginRun();
                 _x = executor;
                 _dead = dead;
                 _live = live;
@@ -1449,6 +1450,9 @@ namespace TensorSharp.Graph
         /// <summary>ggml_sum_rows over a contiguous tensor: the sums of its innermost rows (executors with a kernel
         /// override it).</summary>
         protected virtual Tensor SumRows(Tensor x) => Ops.Sum(null, x, x.DimensionCount - 1);
+
+        /// <summary>A run (one step's program) begins: an executor drops what it cached for the previous one.</summary>
+        protected virtual void BeginRun() { }
 
 
 

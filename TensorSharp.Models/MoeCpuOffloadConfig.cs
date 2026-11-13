@@ -155,6 +155,32 @@ namespace TensorSharp.Models
         private static int _threadsUndeliveredWarned;
 
         /// <summary>
+        /// The host experts' worker team beside an accelerator that waits for them inside a recorded step (a doorbell): the
+        /// process's other busy threads are the stream wait and the doorbell server, so the team takes all CPUs but three,
+        /// at least half, at most 32 (the Qwen3.8 engines' sizing; on the 5090 VM's 13.6-CPU quota 10 workers decoded at
+        /// 69.0/48.0/63.5 tok/s against 6 at 65.5/45.9/58.8 and 16 oversubscribed at 63.4/45.1/58.0).
+        /// </summary>
+        public static int DoorbellTeamThreads(int cpus) => Math.Min(32, Math.Max(cpus - 3, Math.Max(1, cpus / 2)));
+
+        /// <summary>Size the host experts' team for a doorbell unless a count was given (--cpu-moe-threads,
+        /// TS_CPU_MOE_THREADS).</summary>
+        public static void SizeTeamForDoorbell()
+        {
+            if (CpuThreads > 0 || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(EnvVarThreads)))
+                return;
+            int threads = DoorbellTeamThreads(Environment.ProcessorCount);
+            try
+            {
+                TensorSharp.GGML.GgmlBasicOps.SetHostMoeThreads(threads);
+                Console.Error.WriteLine($"[moe-offload] host experts: {threads} CPU threads (of {Environment.ProcessorCount}); --cpu-moe-threads overrides.");
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+            {
+                // No GGML native library: the host kernels are not there either.
+            }
+        }
+
+        /// <summary>
         /// Reset to the "no offload" default. Used by tests and by model reload
         /// so a previous run's policy cannot leak into a fresh load.
         /// </summary>

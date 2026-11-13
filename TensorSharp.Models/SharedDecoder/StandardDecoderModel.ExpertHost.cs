@@ -203,6 +203,9 @@ namespace TensorSharp.Models
             if (_expertHost == null)
             {
                 _expertHost = new ModelExpertHost(this, deviceIsHost: _backend == BackendType.Cpu);
+                // An executor that records host experts waits for them inside its steps: the team is sized for that.
+                if (_backend != BackendType.Cpu && GraphExecutor?.Capabilities.RecordsHostExperts == true)
+                    MoeCpuOffloadConfig.SizeTeamForDoorbell();
                 // The planned tiers (TryPlanTensorExecutorTiers), resident since the preload.
                 for (int l = 0; _tierExperts != null && l < _tierExperts.Length; l++)
                     _expertHost.SetTier(l, _tierExperts[l]);
