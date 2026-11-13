@@ -102,7 +102,7 @@ public sealed class QwenVLVideoEncoderTests : IDisposable
 
             Assert.True(injector.HasPendingEmbeddings(null));
             Assert.True(injector.QueuePromptEmbeddingsForSlice(0, expanded.Count));
-            var queued = Field<List<(Tensor Embeddings, int StartPosition)>>(model, "_visionEmbeddingsList");
+            var queued = TestReflection.Get<List<(Tensor Embeddings, int StartPosition)>>(model, "_pendingMedia");
             Assert.Equal(new[] { first, second }, queued.Select(q => q.StartPosition));
             Assert.All(queued, q => Assert.Equal(new long[] { 4, QwenVLSyntheticMmprojBuilder.ProjectionDim }, q.Embeddings.Sizes.ToArray()));
             float[] pairA = Values(queued[0].Embeddings), pairB = Values(queued[1].Embeddings);
@@ -203,7 +203,7 @@ public sealed class QwenVLVideoEncoderTests : IDisposable
             {
                 var tokens = injector.ProcessPromptTokens(new() { message }, new() { 7, 101, 9 });
                 Assert.True(injector.QueuePromptEmbeddingsForSlice(0, tokens.Count));
-                var queued = Field<List<(Tensor Embeddings, int StartPosition)>>(model, "_visionEmbeddingsList");
+                var queued = TestReflection.Get<List<(Tensor Embeddings, int StartPosition)>>(model, "_pendingMedia");
                 float[] values = Values(Assert.Single(queued).Embeddings);
                 foreach (var q in queued) q.Embeddings.Dispose();
                 queued.Clear();
@@ -242,12 +242,17 @@ public sealed class QwenVLVideoEncoderTests : IDisposable
 
     // ---- helpers -------------------------------------------------------------
 
-    private (Qwen4ExpModel Model, ModelMultimodalInjector Injector) Host(Qwen35VisionEncoder encoder, int videoPad = 101)
+    /// <summary>A Qwen 3.5 runtime host with just what the injector reaches: the tokenizer's pads, the encoder, the media queue.</summary>
+    private (Qwen35RuntimeModel Model, ModelMultimodalInjector Injector) Host(Qwen35VisionEncoder encoder, int videoPad = 101)
     {
-        var model = (Qwen4ExpModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen4ExpModel));
-        Qwen4ExpMtpMathTests.Set(typeof(ModelBase), model, "<Tokenizer>k__BackingField", new PadTokenizer(imagePad: 100, videoPad: videoPad));
-        Qwen4ExpMtpMathTests.Set(typeof(Qwen4ExpModel), model, "<VisionEncoder>k__BackingField", encoder);
-        Qwen4ExpMtpMathTests.Set(typeof(Qwen4ExpModel), model, "_visionEmbeddingsList", new List<(Tensor Embeddings, int StartPosition)>());
+        var model = (Qwen35RuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35RuntimeModel));
+        GC.SuppressFinalize(model);
+        TestReflection.Set(typeof(ModelBase), model, "<Tokenizer>k__BackingField", new PadTokenizer(imagePad: 100, videoPad: videoPad));
+        TestReflection.Set(typeof(ModelBase), model, "<Config>k__BackingField",
+            new ModelConfig { Architecture = "qwen35", HiddenSize = QwenVLSyntheticMmprojBuilder.ProjectionDim });
+        TestReflection.Set(typeof(Qwen35RuntimeModel), model, "<VisionEncoder>k__BackingField", encoder);
+        TestReflection.Set(typeof(StandardDecoderModel), model, "_pendingMedia", new List<(Tensor Rows, int Offset)>());
+        TestReflection.Set(typeof(Qwen35RuntimeModel), model, "_ropeSections", new[] { 11, 11, 10, 0 });   // Qwen3-VL's M-RoPE
         return (model, new ModelMultimodalInjector(model));
     }
 

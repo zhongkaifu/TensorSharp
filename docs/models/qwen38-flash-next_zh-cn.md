@@ -30,24 +30,72 @@ PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF �
 
 ## TensorSharp 如何运行它
 
-在 GGML 后端上，整个 token（几乎）只跑一张图——嵌入、PLE（在图内）、全部 48 层、
-最后的 mixer 以及 LM head——并配一个按形状索引的可复用 ggml 图缓存
-（span 放弃时改走逐层融合 kernel，后者再逐算子回退）。视觉沿用
-Qwen3.5-VL 塔，位置用 (T,H,W) IMRoPE；支持多图与多轮图像会话，并在轮次之间复用
-KV（GDN 递归无法回退，因此只有当新 prompt **恰好扩展**已缓存前缀时才复用；见[保留前缀复用](#保留前缀复用)）。radix 复用可以越过相同的图像或视频 span：完整状态保存 M-RoPE 缓存间隙与 QSA 位置历史，键同时校验媒体身份、span 边界与 token。结束的主缓存留在原处供下一轮精确续接；只有其他请求需要替换它时，才转换为保留 holder。
+该模型族由两种实现服务：
 
-思考模式可以开启或关闭。关闭时，助手轮次以已发布模板输出的闭合空块 `<think>\n\n</think>` 开头，重放历史时也保留这一确切后缀，因此缓存前缀仍能匹配。
+- `--backend cuda` 加载直连 CUDA 引擎（`Qwen4ExpCudaModel`，即 Q4e kernel；见[直连 CUDA 引擎上的服务](#直连-cuda-引擎上的服务)）。
+- 其余后端（`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`ggml_cpu`、`cpu`）运行在共享解码运行时（`Qwen4ExpRuntimeModel`）上，与 Qwen 3.5 是同一个运行时。模型族只添加自身特有的部分：
+  - hyper-connection 流；
+  - sigmoid 门控递归；
+  - PLE 层，其 n-gram 行从磁盘上的表中读取；
+  - QSA：在 indexer 预算内（发布 checkpoint 为 2,051 个 cell）为稠密注意力，超出后按整块选择。
+- `--backend mlx` 会被拒绝。
 
-已发布的 Qwen4Exp 视觉塔最终 patch merger 使用 GELU(erf)，与 transformer block 的
-`gelu_pytorch_tanh` 分开，符合
-[Transformers v5.16.1 参考实现](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705)。
-所提供 GGUF 路径保留既有的 tanh merger 默认行为。在加载 projector 前设置
-`TS_Q4E_VISION_MERGER_ERF=1`，可单独为 merger 选择参考实现的 erf，而 block 激活不变。
-交付构建的 base 模型默认路径通过 12/12 项图像检查，16 个回答均复现先前 tanh 运行。
-完整 erf 试验通过 10/12；随后同一构建的 C=1 OCR 对照中，tanh 通过 2/2，erf 通过
-1/2，把蓝色 `9364` 识别为 `9334`。这些限定范围的检查支持保留兼容默认值，尚未解释
-识别差异的原因，也不能确立更广泛的激活函数质量结论。详见
-[图像验证指南](../../eng/validation/qwen38-parallel-vision.md)。
+每一步运行为一张图。Metal 的 prompt kernel 作为图分段之间的设备操作运行：
+
+- GDN 递归；
+- 融合的 hyper-connection read；
+- hyper-connection scatter；
+- 宽窗口上的 QSA 选择注意力。
+
+每个请求各有 slot，因此连续批处理、前缀缓存与张量并行都由共享运行时提供，不是模型族代码。下列能力同样如此：
+
+- `--tp N`：`ggml_cuda` 与 `ggml_vulkan` 上的 per-rank 图。
+- `--layer-split N`：按整层划分的 stage，以及多节点流水线。
+- 带加速器 tier 的主机专家：独立显存上同样会收集路由 profile，下次加载时把每层最常路由的专家留在显存中。
+- 投机解码：经 `--draft-model mtp-*.gguf` 使用共享 MTP 头，或使用 DFlash2 drafter。
+
+该模型族的 `--tp` 与 `--layer-split` 是互斥的放置方式，二者的混合会被拒绝。
+
+视觉沿用 Qwen3.5-VL 塔，位置用 (T,H,W) IMRoPE，支持多图与多轮图像会话。
+
+radix 复用可以越过相同的图像或视频 span。slot 的副本携带：
+
+- M-RoPE delta；
+- PLE 卷积与 n-gram 历史；
+- QSA indexer 缓存；
+- 最近若干 cell 的旋转位置。QSA 在块首 cell 的位置上旋转该块的 pooled key，而媒体之后这个位置不等于其 KV 下标。
+
+因此带图像的长会话在超出预算后同样可以做块选择。GDN 递归无法回退，所以只有当新 prompt 恰好扩展已缓存前缀时才复用。
+
+思考模式可以开启或关闭。关闭时，助手轮次以已发布模板输出的闭合空块 `<think>\n\n</think>` 开头。重放历史时也保留这一确切后缀，因此缓存前缀仍能匹配。
+
+已发布的 Qwen4Exp 视觉 patch merger 使用 GELU(erf)，与 block 的 `gelu_pytorch_tanh` 分开（[Transformers v5.16.1 参考实现](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705)）。TensorSharp 保留 tanh merger，这是所发布 projector 经验证的默认值：
+
+- 交付默认值通过 12/12 项图像检查。
+- erf 试验通过 10/12。
+- 同一构建的 OCR 对照中，erf 把蓝色 `9364` 识别为 `9334`。
+
+erf 选项（`TS_Q4E_VISION_MERGER_ERF`）已随旧实现移除。见[图像验证指南](../../eng/validation/qwen38-parallel-vision.md)。
+
+**与 `Qwen4ExpModel` 对比**（对照 `main` `032fdf24`，当时仍由它服务），3.6K token prompt：
+
+| 路线 | Prefill | Decode |
+|---|---|---|
+| `ggml_metal`，M5 Pro，Q2_0 文件 | 3.95-4.15 s 对 3.95-4.23 s | 30.4 对 30.3 tok/s |
+| `ggml_cuda`，一张 A40，30 GB tier | 6.09 s 对 6.54 s | 41.3 对 41.4 tok/s |
+| `ggml_cuda`，2x A40，`--layer-split 2` | 2.64-2.69 s 对 2.80 s | 51.6 对 51.1 tok/s |
+
+补充说明：
+
+- `ggml_metal` 上输出一致，运行时 wired 内存峰值为 35-36 GB，对 39 GB。
+- slot 容量取 256 个 cell 的整数倍。ggml-cuda 只在 key 长度为 256 的倍数时把一个 KV head 的各个 query 合并计算；
+  按提示加 `max_tokens` 精确分配的 slot 曾让 layer-split 的 decode 停在 48.4 tok/s：一个 QSA 层的 attention 耗时
+  133 us，对 26 us。
+- 在两张 A40 上用 55 token 的提示生成 128 个 token 时，运行时的首个 token 在 345-398 ms 到达，对 517 ms，整个回答
+  约早 60 ms 完成，但 decode 速率为 54.4 对 57.1 tok/s（尚未解决）。
+- `Qwen4ExpModel` 在合成 fixture 上的 golden（`InferenceWeb.Tests/Fixtures/Qwen4ExpLegacy`）约束运行时的数值结果。
+
+> **历史章节。** 下文描述 GGML 后端的带日期章节记录的是 `Qwen4ExpModel`，它已于 2026-11-13 移除，包括其 token span、arena、保留 holder、单 token verify 行 kernel 与专家缓存。其 GGML 专属开关随之移除：`TS_Q4E_VERIFY_ROW_KERNELS`、`TS_Q4E_VERIFY_ROW_COMMIT`、`TS_Q4E_DISABLE_ARENA_DECODE`、`TS_Q4E_QSA_POOL_CACHE`、`TS_Q4E_QSA_SPARSE_FA`、`TS_Q4E_LAYER_SPLIT`、`TS_Q4E_PLE_PREFETCH`、`TS_Q4E_METAL_FUSE`、`TS_Q4E_VISION_MERGER_ERF` 以及调试 dump。现在设置这些开关会打印移除提示。直连 CUDA 引擎的 `TS_Q4E_*` 开关不变。
 
 ## 工具调用与 Agent 工作流
 

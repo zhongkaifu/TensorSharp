@@ -134,7 +134,7 @@ public sealed partial class PrefixCacheContractConformanceTests
     [ModelFact(EnvQwen38Dir, Qwen38FlashNext)]
     public void Qwen38_FlashNext_PassesTheConformanceScript()
     {
-        using var model = (Qwen4ExpModel)LoadFrom(EnvQwen38Dir, Qwen38FlashNext);
+        using var model = (Qwen4ExpRuntimeModel)LoadFrom(EnvQwen38Dir, Qwen38FlashNext);
         model.AttachPrefixCache(new RecordingPayloadSink());
         ConformanceReport report = PrefixCacheConformanceScript.Run(TextSubject(model, "qwen38-flash-next"));
 

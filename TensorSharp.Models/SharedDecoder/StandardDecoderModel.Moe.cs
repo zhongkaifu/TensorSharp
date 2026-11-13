@@ -36,6 +36,13 @@ namespace TensorSharp.Models
         private bool _normalizeExpertWeights;
         private bool _anyMoe;
 
+        /// <summary>Routed experts a MoE layer holds (tests size tiers from it).</summary>
+        internal int ExpertCountForTests => _numExperts;
+
+        /// <summary>Test hook: serve the GGUF mapping through the explicit-read I/O layer (as a tiered Mac load does),
+        /// with a host expert cache of <paramref name="budgetBytes"/>.</summary>
+        internal bool EnableHostExpertIoForTests(long budgetBytes) => EnableHostExpertIo(budgetBytes);
+
         /// <summary>Whether the selected experts' softmax weights are renormalized to sum to 1
         /// (Mixtral / Qwen-MoE <c>norm_topk_prob</c>). Families may override; the default reads
         /// <c>{arch}.expert_weights_norm</c> and falls back to true.</summary>

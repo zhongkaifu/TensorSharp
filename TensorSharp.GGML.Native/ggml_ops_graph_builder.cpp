@@ -27,6 +27,7 @@
 #include "ggml_ops_bonsai.h"
 #include "ggml_ops_graph_optimize.h"
 #include "ggml_ops_transformer_common.h"
+#include "ggml_ops_precision_policy.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -266,6 +267,8 @@ namespace
     {
         FUSED_DELTA_NET_PROMPT = 5,   // GraphFusion.DeltaNetPrompt
         FUSED_HC_READ = 6,            // GraphFusion.HcRead
+        FUSED_HC_SCATTER = 7,         // GraphFusion.HcScatter
+        FUSED_HC_MIX = 8,             // GraphFusion.HcMix
         SELECTED_ATTENTION = 100,     // a prompt chunk's flash attention under a selection's mask (no region: the op)
     };
 
@@ -305,6 +308,10 @@ namespace
         std::vector<std::int64_t> ip;
         std::vector<float> fp;
         std::vector<ggml_tensor*> results;
+        // A hyper-connection scatter's residual regions (IoRole): the one its input is read from (bound here when a
+        // graph op produced it, -1 when an earlier scatter's output already lives there) and the one it writes.
+        int res_role = -1, out_role = -1;
+        bool bind_inject = false;   // a scatter's inject a graph op produced (no served read wrote it)
     };
 
     // The IO buffer's roles: each operand a kind's operation keeps there, one region per role (every region of the
@@ -312,7 +319,13 @@ namespace
     enum IoRole
     {
         IO_GDN_QKV, IO_GDN_Z, IO_GDN_ALPHA, IO_GDN_BETA, IO_GDN_Y, IO_HC_MIXED, IO_HC_INJECT,
-        IO_SEL_Q, IO_SEL_MASK, IO_SEL_IDX, IO_SEL_CNT, IO_SEL_OUT, IO_ROLES
+        IO_SEL_Q, IO_SEL_MASK, IO_SEL_IDX, IO_SEL_CNT, IO_SEL_OUT,
+        // The residual streams a prompt's hyper-connection scatters read and write, alternating between two regions
+        // (a scatter reads one and writes the other: the version it reads is still the hyper-connection read's input),
+        // and the block output each scatter adds.
+        IO_HC_RES0, IO_HC_RES1, IO_HC_B,
+        // A read's mix pass without the fused read (devices without the tensor API): the normed streams and the gates.
+        IO_HC_XN, IO_HC_G, IO_ROLES
     };
 
     // A served region's operands in the IO buffer, by role.
@@ -325,6 +338,15 @@ namespace
                      { IO_GDN_Y, r.results[0] } };
         case FUSED_HC_READ:
             return { { IO_HC_MIXED, r.results[0] }, { IO_HC_INJECT, r.results[1] } };
+        case FUSED_HC_SCATTER:
+        {
+            std::vector<std::pair<IoRole, ggml_tensor*>> ops{ { IO_HC_B, r.in[1] }, { static_cast<IoRole>(r.out_role), r.results[0] } };
+            if (r.res_role >= 0) ops.emplace_back(static_cast<IoRole>(r.res_role), r.in[0]);
+            if (r.bind_inject) ops.emplace_back(IO_HC_INJECT, r.in[2]);
+            return ops;
+        }
+        case FUSED_HC_MIX:
+            return { { IO_HC_XN, r.in[0] }, { IO_HC_G, r.in[1] }, { IO_HC_MIXED, r.results[0] } };
         case SELECTED_ATTENTION:
             return { { IO_SEL_Q, r.in[0] }, { IO_SEL_MASK, r.in[3] }, { IO_SEL_IDX, r.results[0] }, { IO_SEL_CNT, r.results[1] },
                      { IO_SEL_OUT, r.results[2] } };
@@ -377,6 +399,10 @@ namespace
         int serving = -1;
         std::vector<char> skipped;
         std::shared_ptr<DeviceIo> io;
+        // The residual versions bound to a hyper-connection scatter region (IO_HC_RES0 / IO_HC_RES1), and the region the
+        // newest one lives in (-1: none yet).
+        std::map<const ggml_tensor*, int> hc_res_role;
+        int hc_last_role = -1;
         // Bonsai2 PRISM: the rotated activation each (input, transform) products share (see weight_product).
         tsg::BonsaiMemo bonsai;
 
@@ -526,10 +552,16 @@ namespace
         hm.seq_len = static_cast<int>(T);
         hm.hidden = static_cast<int>(n);
         ggml_tensor* hot = nullptr;
+        // A verify-width step (2 to 8 rows) overlaps up to two window misses a row with the routes the slots hold: they
+        // are read in the background and computed after a second cut that only waits for them (Qwen4ExpModel's
+        // overlap; the wait segment follows this pause, ending at the first group so it precedes the cut).
+        tsg::HostMoeSegment overlap_wait;
+        constexpr int overlap_routes = 2;
         if (tsg::MoeHotTier* tier = tsg::moe_hot_tier_find(hm.gate_data))
             if (T <= tsg::host_moe_tier_max_rows(*tier) && tier->num_experts == hm.num_experts && tier->count >= hm.n_used
                 && tier->type[0] == hm.gate_type && tier->type[1] == hm.up_type && tier->type[2] == hm.down_type)
-                hot = tsg::host_moe_build_hot_part(ctx, hm, hm.moe_in, *tier, ggml_mul_mat_id, 0, nullptr, nullptr);
+                hot = tsg::host_moe_build_hot_part(ctx, hm, hm.moe_in, *tier, ggml_mul_mat_id,
+                    T >= 2 && T <= TSG_PRECISION_DECODE_COLUMNS ? overlap_routes : 0, nullptr, &overlap_wait);
         // Strata's read-ahead (srcs 6 and 7: the next offloaded layer's router and gate stack): that router applied
         // to this layer's FFN input before the pause, so the seam reads the next tier's predicted misses into its
         // window while the accelerator works (moe_hot_tier_prefetch). Only where the seam computes the tier's routes
@@ -549,11 +581,34 @@ namespace
         g->host_moe.push_back(hm);
         g->host_moe_holds.emplace_back(keep_logits, hold_ids);
         g->order.emplace_back(1, static_cast<int>(g->host_moe.size()) - 1);
+        if (overlap_wait.io_wait)
+        {
+            g->host_moe.push_back(overlap_wait);
+            g->host_moe_holds.emplace_back(nullptr, nullptr);
+            g->order.emplace_back(1, static_cast<int>(g->host_moe.size()) - 1);
+        }
         return hot != nullptr ? ggml_add(ctx, hm.moe_out, hot) : hm.moe_out;
     }
 
     ggml_tensor* try_selected_attention(TsgGraph* g, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
                                         float scale, std::int64_t width);
+
+    // ggml_lightning_indexer as plain ggml ops, for a backend with no kernel for the shape (ggml-cuda runs 128-wide keys
+    // with 4, 32 or 64 heads only, and aborts on others): every head's q.k, ReLU, the heads summed by their prescaled
+    // weights, plus the mask. q [E, H, T, S], k [E, 1, KV, S], w [H, T, 1, S], mask [KV, T, 1, S'] F16 -> [KV, T, 1, S].
+    ggml_tensor* lightning_indexer_explicit(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, ggml_tensor* w, ggml_tensor* mask)
+    {
+        const std::int64_t E = q->ne[0], H = q->ne[1], T = q->ne[2], S = q->ne[3], KV = k->ne[2];
+        ggml_tensor* keys = ggml_view_3d(ctx, k, E, KV, S, k->nb[2], k->nb[3], 0);                        // [E, KV, S]
+        if (!ggml_is_contiguous(keys))
+            keys = k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 ? ggml_cont(ctx, keys) : ggml_cast(ctx, keys, GGML_TYPE_F32);
+        ggml_tensor* queries = ggml_reshape_3d(ctx, ggml_is_contiguous(q) ? q : ggml_cont(ctx, q), E, H * T, S);
+        ggml_tensor* scores = ggml_relu(ctx, ggml_mul_mat(ctx, keys, queries));                             // [KV, H*T, S]
+        scores = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, scores, KV, H, T, S), 1, 0, 2, 3));  // [H, KV, T, S]
+        ggml_tensor* weights = ggml_reshape_4d(ctx, ggml_is_contiguous(w) ? w : ggml_cont(ctx, w), H, 1, T, S);
+        ggml_tensor* summed = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, scores, weights), KV, T, 1, S);        // [KV, T, 1, S]
+        return ggml_add(ctx, summed, ggml_cast(ctx, mask, GGML_TYPE_F32));
+    }
 
     ggml_tensor* build_op(TsgGraph* g, int op, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
     {
@@ -693,7 +748,14 @@ namespace
         // to the host seams' route-tail skip, and argsort + view is the chain ggml-metal's top-k MoE fusion matches.
         case OP_TOP_K: need(1); return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
         case OP_SUM_ROWS: need(1); return ggml_sum_rows(ctx, src(0));
-        case OP_LIGHTNING_INDEXER: need(4); return ggml_lightning_indexer(ctx, src(0), src(1), src(2), src(3));
+        case OP_LIGHTNING_INDEXER:
+        {
+            need(4);
+            ggml_tensor* li = ggml_lightning_indexer(ctx, src(0), src(1), src(2), src(3));
+            ggml_backend_t backend = graph_backend(g);
+            return backend == nullptr || ggml_backend_supports_op(backend, li)
+                ? li : lightning_indexer_explicit(ctx, src(0), src(1), src(2), src(3));
+        }
         case OP_TOP_K_MASK:
         {
             // The optional operands follow in order, each present when its flag is set.
@@ -828,6 +890,53 @@ namespace
                 || ggml_nelements(in[9]) != dk * dv * vh || in[7]->ne[0] != dv)
                 return false;
         }
+        else if (kind == FUSED_HC_SCATTER)
+        {
+            // the residual streams [hc * n, T], the block output [n, T] and the read's inject [hc, T]; ip n, hc.
+            if (ns != 3 || nip < 2) return false;
+            const std::int64_t n = ip[0], hc = ip[1];
+            const std::int64_t T = in[0]->ne[1];
+            if (T < device_ops_min_rows() || !tsm::hc_prompt_supported(graph_backend(g))) return false;
+            if (in[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(in[0]) || in[0]->ne[0] != n * hc
+                || !io_bindable(in[1]) || ggml_nelements(in[1]) != n * T || in[2]->ne[0] != hc || in[2]->ne[1] != T)
+                return false;
+            // The inject is the served read's result (it lives in the IO buffer); a residual either an earlier scatter
+            // wrote there or one a graph op produces, which is bound into the region the newest version is not in.
+            bool inject_served = false;
+            for (const DeviceRegion& prior : g->regions)
+                inject_served |= prior.kind == FUSED_HC_READ && prior.results.size() == 2 && prior.results[1] == in[2];
+            if (!inject_served && !io_bindable(in[2])) return false;
+            DeviceRegion r;
+            r.bind_inject = !inject_served;
+            auto bound = g->hc_res_role.find(in[0]);
+            if (bound != g->hc_res_role.end())
+            {
+                r.out_role = bound->second == IO_HC_RES0 ? IO_HC_RES1 : IO_HC_RES0;
+            }
+            else
+            {
+                if (!io_bindable(in[0])) return false;
+                r.res_role = g->hc_last_role == IO_HC_RES0 ? IO_HC_RES1 : IO_HC_RES0;
+                r.out_role = r.res_role == IO_HC_RES0 ? IO_HC_RES1 : IO_HC_RES0;
+                g->hc_res_role[in[0]] = r.res_role;
+            }
+            r.kind = kind;
+            r.in = std::move(in);
+            r.ip.assign(ip, ip + nip);
+            r.fp.assign(fp, fp + nfp);
+            g->regions.push_back(std::move(r));
+            return true;
+        }
+        else if (kind == FUSED_HC_MIX)
+        {
+            // the normed streams and the gates before their sigmoid, both [hc * n, T]; ip n, hc.
+            if (ns != 2 || nip < 2) return false;
+            const std::int64_t n = ip[0], hc = ip[1];
+            const std::int64_t T = in[0]->ne[1];
+            if (T < device_ops_min_rows() || !tsm::hc_prompt_supported(graph_backend(g))) return false;
+            for (int i = 0; i < 2; i++)
+                if (!io_bindable(in[i]) || in[i]->ne[0] != n * hc || in[i]->ne[1] != T) return false;
+        }
         else if (kind == FUSED_HC_READ)
         {
             // the residual streams [hc * n, T], the norm's gammas [hc * n], the down, inject and up weights; ip n, hc,
@@ -887,6 +996,36 @@ namespace
             // the leaves join the graph so the allocator places them (leaves place no cut).
             seg.device_inputs = { r.in[0], r.in[1], r.in[2], r.in[3], r.in[9], r.in[8], r.in[4], r.in[5], r.in[6], r.in[7] };
             seg.device_op = [io](ggml_backend_t backend) { return tsm::gdn_prompt_encode(backend, io); };
+        }
+        else if (r.kind == FUSED_HC_MIX)
+        {
+            if (nresults != 1) throw std::runtime_error("graph builder: a hyper-connection mix has one result, the mix");
+            const std::int64_t n = r.ip[0], hc = r.ip[1];
+            r.results = { ggml_new_tensor_2d(g->ctx, GGML_TYPE_F32, n, T) };
+            ggml_tensor *xn = r.in[0], *gates = r.in[1], *mixed = r.results[0];
+            const int t = static_cast<int>(T), ni = static_cast<int>(n), hci = static_cast<int>(hc);
+            seg.device_name = "hc mix";
+            seg.device_inputs = { xn, gates };
+            seg.device_op = [xn, gates, mixed, ni, hci, t](ggml_backend_t backend) {
+                return tsm::hc_mix_encode(backend, xn, gates, mixed, ni, hci, t);
+            };
+        }
+        else if (r.kind == FUSED_HC_SCATTER)
+        {
+            if (nresults != 1) throw std::runtime_error("graph builder: a hyper-connection scatter has one result, the residual streams");
+            const std::int64_t n = r.ip[0], hc = r.ip[1];
+            r.results = { ggml_new_tensor_2d(g->ctx, GGML_TYPE_F32, n * hc, T) };   // bound into its region at build
+            g->hc_res_role[r.results[0]] = r.out_role;
+            g->hc_last_role = r.out_role;
+            ggml_tensor *res = r.in[0], *b = r.in[1], *inject = r.in[2], *out = r.results[0];
+            const int t = static_cast<int>(T), ni = static_cast<int>(n), hci = static_cast<int>(hc);
+            seg.device_name = "hc scatter";
+            // The block output ends the segment before it; the residual and the inject are already in the IO buffer
+            // (or bound there at build), so nothing the allocator places is read after the cut.
+            seg.device_inputs = { res, b, inject };
+            seg.device_op = [res, b, inject, out, ni, hci, t](ggml_backend_t backend) {
+                return tsm::hc_scatter_encode(backend, res, b, inject, out, ni, hci, t);
+            };
         }
         else
         {

@@ -257,6 +257,19 @@ namespace TensorSharp.Models
             public int Floor;
             public string Shape;
             public long Epoch;
+            /// <summary>The step recorded on the device (an executor that records decode steps; one sequence).</summary>
+            public IDecodeCapture Capture;
+            public Tensor[] CaptureOutputs;
+            public int Advances;
+            public bool CaptureFailed;
+
+            public void DisposeCapture()
+            {
+                if (CaptureOutputs != null) foreach (Tensor t in CaptureOutputs) t?.Dispose();
+                CaptureOutputs = null;
+                Capture?.Dispose();
+                Capture = null;
+            }
         }
 
         private DecodeReplay _decodeReplay;
@@ -285,8 +298,87 @@ namespace TensorSharp.Models
 
         private void DropDecodeReplay()
         {
+            _decodeReplay?.DisposeCapture();
             _decodeReplay?.Step.Dispose();
             _decodeReplay = null;
+        }
+
+        /// <summary>Decode steps record on executors that can (<see cref="IDecodeCaptureExecutor"/>).</summary>
+        internal bool DecodeCaptureDisabled { get; set; }
+
+        /// <summary>
+        /// Run an advanced decode step as the device's recording of it: the first advance of a kept step runs as usual
+        /// (its pools and lazy buffers settle), the second records it and every later one replays the recording with
+        /// this position's inputs, attention length and cache write row. One sequence only (the attention length and the
+        /// write row are one value each). False runs the step as usual; a failed recording is not tried again.
+        /// </summary>
+        private bool TryRunRecorded(DecodeReplay r, CachedGraph cached, Slot[] slots, int[] starts)
+        {
+            if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length != 1 || GraphExecutor is not IDecodeCaptureExecutor recorder
+                || cached.Plan is not IGraphTensorOutputs keep)
+                return false;
+            if (r.Capture == null && ++r.Advances < 2) return false;
+            r.Capture ??= recorder.OpenDecodeCapture();
+            if (r.Capture == null) { r.CaptureFailed = true; return false; }
+            int writeRow = starts[0], attend = starts[0] + 1;
+            bool bound = false;
+            try
+            {
+                bound = r.Step.BindStable(r.Capture);
+                if (!bound) { r.CaptureFailed = true; return false; }
+                if (!r.Capture.Captured)
+                {
+                    keep.KeepTensors = true;
+                    bool recorded = r.Capture.CaptureAndLaunch(() => r.Step.Run(cached.Plan), attend, writeRow, WrittenTensors(slots[0]));
+                    if (!recorded)
+                    {
+                        keep.KeepTensors = false;
+                        r.DisposeCapture();
+                        r.CaptureFailed = true;
+                        return false;
+                    }
+                    r.CaptureOutputs = new Tensor[cached.Outputs.Length];
+                    for (int o = 0; o < r.CaptureOutputs.Length; o++) r.CaptureOutputs[o] = keep.TakeOutput(o);
+                    keep.KeepTensors = false;
+                }
+                else
+                {
+                    r.Capture.Launch(attend, writeRow);
+                    r.Capture.MarkWritten(r.CaptureOutputs);
+                }
+                for (int o = 0; o < r.CaptureOutputs.Length; o++)
+                {
+                    Tensor t = r.CaptureOutputs[o];
+                    float[] into = cached.Outputs[o];
+                    if (t.ElementCount() == into.LongLength) t.CopyToArray(into);
+                    else Array.Copy(t.GetElementsAsFloat((int)Math.Min(into.LongLength, t.ElementCount())), into, (int)Math.Min(into.LongLength, t.ElementCount()));
+                }
+                return true;
+            }
+            finally
+            {
+                if (bound) r.Step.UnbindStable();
+            }
+        }
+
+        /// <summary>The tensors a decode step of <paramref name="slot"/> writes in place: its K/V caches and recurrent states.</summary>
+        private static List<Tensor> WrittenTensors(Slot slot)
+        {
+            var written = new List<Tensor>();
+            foreach (Tensor[][] caches in new[] { slot.K, slot.V })
+                if (caches != null)
+                    foreach (Tensor[] layer in caches)
+                        if (layer != null)
+                            foreach (Tensor t in layer)
+                                if (t != null) written.Add(t);
+            if (slot.Recurrent != null)
+                foreach (RecurrentState[] layer in slot.Recurrent)
+                    if (layer != null)
+                        foreach (RecurrentState state in layer)
+                            if (state?.GraphTensors is { } tensors)
+                                foreach (Tensor t in tensors)
+                                    if (t != null) written.Add(t);
+            return written;
         }
 
         /// <summary>
@@ -320,9 +412,12 @@ namespace TensorSharp.Models
             Array.Copy(starts, r.Starts, starts.Length);
             _graphLru.Remove(r.Signature);
             _graphLru.AddFirst(r.Signature);
-            if (cached.Plan is IGraphTensorOutputs keep) keep.KeepTensors = false;
-            if (!r.Step.Run(cached.Plan))
-                throw new InvalidOperationException($"{Config.Architecture} graph step failed: {cached.Plan.LastError}");
+            if (!TryRunRecorded(r, cached, slots, starts))
+            {
+                if (cached.Plan is IGraphTensorOutputs keep) keep.KeepTensors = false;
+                if (!r.Step.Run(cached.Plan))
+                    throw new InvalidOperationException($"{Config.Architecture} graph step failed: {cached.Plan.LastError}");
+            }
             GraphRuns++;
             GraphReplays++;
             DecodeAdvances++;
@@ -417,6 +512,7 @@ namespace TensorSharp.Models
                 step => EmitStep(step, hidden, request), out StepOutputs outputs, out bool owned, shape: request.Shape,
                 advanceHidden: request.PositionTable == null ? hidden : null);
             if (graph == null) return false;
+            CountDeviceRoutes(graph, outputs);
             // A replayed graph's buffers are rewritten by its next run (the model-owned buffer
             // contract); a one-shot graph's arrays are the caller's.
             result = new GraphResult
@@ -460,6 +556,7 @@ namespace TensorSharp.Models
                     }
                     try
                     {
+                        CountDeviceRoutes(graph, outputs);
                         if (outputs.Captures != null)
                             for (int c = 0; c < outputs.Captures.Length; c++)
                                 if (outputs.Captures[c] >= 0) captures[c] = (float[])graph.Outputs[outputs.Captures[c]].Clone();
@@ -540,7 +637,9 @@ namespace TensorSharp.Models
                     // Everything that changes what the step emits: a stream frees each node after the template's
                     // last reader, so a step that emits differently (other outputs, another stage) must not share it.
                     kind = $"{rows}|{slots.Length}|{snapshots}|{attentionFloor > 0}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}|{EmissionVariant(counts, starts)}";
-                    if (_streamedKinds.Contains(kind))
+                    // A decode step that could advance runs as the recorded program instead, so it is kept for the next
+                    // step to advance (a streamed step keeps nothing: decode would re-emit every node of every step).
+                    if (_streamedKinds.Contains(kind) && !advance)
                     {
                         IGraphStream stream = streaming.OpenStream(_streamTemplates.GetValueOrDefault(kind));
                         if (deviceOutputs && stream is IGraphTensorOutputs keepStream) keepStream.KeepTensors = true;
@@ -680,6 +779,7 @@ namespace TensorSharp.Models
         {
             public int Logits, Final, Hidden;
             public int[] Captures;   // -1: the captured layer is another stage's
+            public (int Output, int Layer)[] Routes;   // resident MoE layers' top-K ids while device routes are recorded
         }
 
         /// <summary>Trace one step: every layer, then what the request asks for.</summary>
@@ -723,6 +823,7 @@ namespace TensorSharp.Models
                 h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
                 step.Boundary(h);
             }
+            outputs.Routes = step.Routes;
             if (!head)
             {
                 outputs.Hidden = step.Output(h, (long)width * rows);
@@ -730,6 +831,15 @@ namespace TensorSharp.Models
             }
             EmitHead(step, h, request, ref outputs);
             return outputs;
+        }
+
+        /// <summary>A profiling load's resident MoE layers: their recorded top-K ids go to the routing counters.</summary>
+        private void CountDeviceRoutes(CachedGraph graph, in StepOutputs outputs)
+        {
+            if (outputs.Routes == null) return;
+            foreach ((int output, int layer) in outputs.Routes)
+                if (TryGetLayerExperts(layer, out var gate, out _, out _))
+                    GgmlBasicOps.MoeRoutingCount(gate.Data, _numExperts, System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(graph.Outputs[output]));
         }
 
         /// <summary>The head over the stream <paramref name="h"/> leaving the last layer: the captures past it, the final
@@ -1414,6 +1524,10 @@ namespace TensorSharp.Models
             }
             else
             {
+                // A profiling load counts a resident layer's routes too (host seams count the offloaded ones): the ids are
+                // read back after the run (an output costs ggml-metal its softmax / top-k fusion, on this load only).
+                if (_recordingDeviceRoutes && GraphExecutor.Capabilities.HostExperts && !_rankGraphs)
+                    step.RecordRoutes(step.Output(step.Op(GraphOp.Cont, selected), (long)k * rows), layer);   // the top-K is a view of the sort
                 int input = step.Reshape(x, hidden, 1, rows);
                 int gate = step.Op(GraphOp.MulMatId, step.Experts(p + "ffn_gate_exps.weight"), input, selected);
                 int up = step.Op(GraphOp.MulMatId, step.Experts(p + "ffn_up_exps.weight"), input, selected);
@@ -1585,6 +1699,14 @@ namespace TensorSharp.Models
             /// returns its index among the step's results.</summary>
             internal int Output(int node, long floats) => _b.Output(node, floats);
 
+            /// <summary>Output <paramref name="output"/> holds layer <paramref name="layer"/>'s top-K expert ids (I32).</summary>
+            internal void RecordRoutes(int output, int layer) => (_routes ??= new()).Add((output, layer));
+
+            private List<(int Output, int Layer)> _routes;
+
+            /// <summary>The route outputs this emission recorded (null: none).</summary>
+            internal (int Output, int Layer)[] Routes => _routes?.ToArray();
+
             // ---- leaves
 
             /// <summary>A model weight by name: quantized (its device-cache key) or F32.</summary>
@@ -1738,7 +1860,38 @@ namespace TensorSharp.Models
             }
 
             /// <summary>Axis-major [4 * rows] rotary positions (ggml_rope_multi); rotary ops then take them.</summary>
-            internal void SetPositionTable(int[] axisMajor) => PositionTable = InputI32(axisMajor, axisMajor.Length);
+            internal void SetPositionTable(int[] axisMajor)
+            {
+                PositionTable = InputI32(axisMajor, axisMajor.Length);
+                PositionTableValues = axisMajor;
+            }
+
+            /// <summary>The host values of <see cref="PositionTable"/> (axis-major T, H, W, extra), or null.</summary>
+            internal int[] PositionTableValues { get; private set; }
+
+            /// <summary>The rotary position (T, H, W) of row <paramref name="i"/> of sequence <paramref name="s"/>: the
+            /// position table's where one drives the step, else its KV index plus the slot's rotary delta on every axis.</summary>
+            internal (int T, int H, int W) RowPosition(int s, int i)
+            {
+                if (PositionTableValues is { } table)
+                {
+                    int rows = table.Length / 4, r = First[s] + i;
+                    return (table[r], table[rows + r], table[2 * rows + r]);
+                }
+                int p = Starts[s] + i + Slots[s].RopeDelta;
+                return (p, p, p);
+            }
+
+            /// <summary>Multi-axis rotary over x [d, heads, n] at the axis-major <paramref name="table"/> (I32 [4 n]) rather
+            /// than the step's (keys pooled at their blocks' first cells, some inside media).</summary>
+            internal int RopeMultiAt(int x, RotarySpec spec, int table)
+            {
+                int[] sections = _m.RotarySections ?? throw new NotSupportedException($"{_m.Config.Architecture} has no multi-axis rotary.");
+                return Op(GraphOp.RopeMulti, stackalloc[] { x, table },
+                    stackalloc long[] { spec.Dims, 40 /* GGML_ROPE_TYPE_IMROPE */, spec.OriginalContext,
+                        sections[0], sections[1], sections[2], sections.Length > 3 ? sections[3] : 0 },
+                    stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
+            }
 
             /// <summary>Multi-axis rotary positions [4 * rows] (I32), or -1.</summary>
             public int PositionTable { get; private set; } = -1;
@@ -2078,6 +2231,69 @@ namespace TensorSharp.Models
 
             internal bool Run(IGraphPlan plan) => plan.Run(CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData),
                 CollectionsMarshal.AsSpan(_inputBytes), CollectionsMarshal.AsSpan(_inputHandles));
+
+            private object[] _unstable;
+
+            /// <summary>Bind every input to its <see cref="IDecodeCapture.Stable"/> tensor, uploaded with this step's
+            /// values (the embedded rows copied on the device): a recorded step reads its inputs there. False when an
+            /// input is not one a recording can rebind (it then runs as usual).</summary>
+            internal bool BindStable(IDecodeCapture capture)
+            {
+                if (_unstable != null) throw new InvalidOperationException("inputs already bound to a recording");
+                var saved = _inputHandles.ToArray();
+                for (int i = 0; i < _inputMeta.Count; i++)
+                {
+                    InputMeta m = _inputMeta[i];
+                    switch (m.Kind)
+                    {
+                        case InputKind.Hidden when _inputHandles[i] is Tensor hidden:
+                        {
+                            Tensor stable = capture.Stable(i, DType.Float32, hidden.Sizes.ToArray());
+                            Ops.Copy(stable, hidden);
+                            _inputHandles[i] = stable;
+                            break;
+                        }
+                        case InputKind.Positions or InputKind.Constant when m.Values is int[] ints:
+                        {
+                            Tensor stable = capture.Stable(i, DType.Int32, new long[] { ints.Length });
+                            stable.SetElementsAsInt(ints);
+                            _inputHandles[i] = new StableInput(stable);
+                            break;
+                        }
+                        case InputKind.WriteRows when m.Values is long[] longs:
+                        {
+                            Tensor stable = capture.Stable(i, DType.Int32, new long[] { longs.Length });
+                            var ints = new int[longs.Length];
+                            for (int j = 0; j < ints.Length; j++) ints[j] = checked((int)longs[j]);
+                            stable.SetElementsAsInt(ints);
+                            _inputHandles[i] = new StableInput(stable);
+                            break;
+                        }
+                        case InputKind.DecodeMask when m.Values is ushort[] half:
+                        {
+                            Tensor stable = capture.Stable(i, DType.Float32, new long[] { half.Length });
+                            var floats = new float[half.Length];
+                            for (int j = 0; j < floats.Length; j++) floats[j] = (float)BitConverter.UInt16BitsToHalf(half[j]);
+                            stable.SetElementsAsFloat(floats);
+                            _inputHandles[i] = new StableInput(stable);
+                            break;
+                        }
+                        default:
+                            for (int j = 0; j < saved.Length; j++) _inputHandles[j] = saved[j];
+                            return false;
+                    }
+                }
+                _unstable = saved;
+                return true;
+            }
+
+            /// <summary>Restore the inputs <see cref="BindStable"/> rebound.</summary>
+            internal void UnbindStable()
+            {
+                if (_unstable == null) return;
+                for (int j = 0; j < _unstable.Length; j++) _inputHandles[j] = _unstable[j];
+                _unstable = null;
+            }
 
             public void Dispose()
             {

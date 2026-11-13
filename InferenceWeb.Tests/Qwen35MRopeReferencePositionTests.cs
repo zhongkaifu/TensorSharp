@@ -182,51 +182,6 @@ public class Qwen35MRopeReferencePositionTests
         Assert.Equal(s.FollowUpDelta, model.ActiveRopeDelta);
     }
 
-    /// <summary>Qwen3.8 Flash Next uses the same Qwen-VL layout, with the signed
-    /// offset stored as a gap in its retained holder. Check its actual gap update
-    /// and MTP scalar-position selection against the independent reference before
-    /// allowing the radix cache to resume through images or video.</summary>
-    [Theory]
-    [MemberData(nameof(ScenarioNames))]
-    public void Qwen4ExpPositions_DecodeAndRetainedContinuation_MatchSGLang(string name)
-    {
-        Scenario s = Get(name);
-        int promptLen = s.PromptTokens.Length;
-        foreach (int chunk in new[] { promptLen, 7, 3, 1 })
-        {
-            var model = (Qwen4ExpModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen4ExpModel));
-            try
-            {
-                for (int start = 0; start < promptLen; start += chunk)
-                {
-                    int n = Math.Min(chunk, promptLen - start);
-                    model.SetMRoPEPositions(s.Positions.AsSpan(3 * start, 3 * n).ToArray());
-                    Qwen4ExpMtpMathTests.Invoke(model, "UpdateMropeGap", [start, n]);
-                }
-                model.SetMRoPEPositions(null);
-                int gap = (int)typeof(Qwen4ExpModel).GetField("_mropeCacheGap", BindingFlags.Instance | BindingFlags.NonPublic)!
-                    .GetValue(model)!;
-                Assert.Equal(-s.Delta, gap);
-                for (int k = 0; k < s.DecodePositions.Length; k++)
-                    Assert.Equal(s.DecodePositions[k], Qwen4ExpModel.ResolveMtpPositions([], promptLen + k, 1, gap).RopePosition);
-
-                object holder = Qwen4ExpMtpMathTests.Invoke(model, "SnapshotActiveCache", [])!;
-                Assert.Equal(gap, (int)holder.GetType().GetField("MropeCacheGap")!.GetValue(holder)!);
-                int cached = promptLen + s.DecodePositions.Length - 1;
-                int suffix = s.FollowUpTokens.Length - cached;
-                var continuation = Qwen4ExpModel.ResolveMtpPositions([], cached, suffix, gap);
-                Assert.Null(continuation.MultiAxis);
-                for (int i = 0; i < suffix; i++)
-                    Assert.Equal(s.FollowUpPositions[3 * (cached + i)], continuation.RopePosition + i);
-                model.SetMRoPEPositions(s.FollowUpPositions.AsSpan(3 * cached, 3 * suffix).ToArray());
-                Qwen4ExpMtpMathTests.Invoke(model, "UpdateMropeGap", [cached, suffix]);
-                Assert.Equal(-s.FollowUpDelta, (int)typeof(Qwen4ExpModel)
-                    .GetField("_mropeCacheGap", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(model)!);
-            }
-            finally { GC.SuppressFinalize(model); }
-        }
-    }
-
     [Fact]
     public void NewHistory_ResetsTheDelta_AndAHolderSnapshotCarriesIt()
     {

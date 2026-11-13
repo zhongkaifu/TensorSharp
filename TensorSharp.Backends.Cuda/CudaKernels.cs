@@ -11,6 +11,7 @@ namespace TensorSharp.Cuda
 
         private readonly CudaModule module;
         private readonly IntPtr copy2DBytes;
+        private readonly IntPtr copy4DBytes;
         private readonly IntPtr fillF32;
         private readonly IntPtr fillF16;
         private readonly IntPtr unaryF32;
@@ -161,6 +162,7 @@ namespace TensorSharp.Cuda
         {
             this.module = module;
             copy2DBytes = module.GetFunction("ts_copy2d_bytes");
+            copy4DBytes = module.GetFunction("ts_copy4d_bytes");
             fillF32 = module.GetFunction("ts_fill_f32");
             fillF16 = module.GetFunction("ts_fill_f16");
             unaryF32 = module.GetFunction("ts_unary_f32");
@@ -444,6 +446,22 @@ namespace TensorSharp.Cuda
             uint gx = (uint)Math.Min(Math.Max(1, (innerBytes / 16 + BlockSize - 1) / BlockSize), 8);
             uint gy = (uint)Math.Min(rows, 65535);
             Launch(copy2DBytes, gx, gy, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary><see cref="LaunchCopy2DBytes"/> over n0 x n1 groups of rows, each level with its own pitches, in one
+        /// launch.</summary>
+        public void LaunchCopy4DBytes(
+            IntPtr src, IntPtr dst, long n0, long n1, long rows, long innerBytes,
+            long srcPitch0, long dstPitch0, long srcPitch1, long dstPitch1, long srcPitch, long dstPitch, IntPtr stream)
+        {
+            IntPtr srcArg = src, dstArg = dst;
+            long n0Arg = n0, n1Arg = n1, rowsArg = rows, innerArg = innerBytes;
+            long sp0 = srcPitch0, dp0 = dstPitch0, sp1 = srcPitch1, dp1 = dstPitch1, spArg = srcPitch, dpArg = dstPitch;
+            void** args = stackalloc void*[] { &srcArg, &dstArg, &n0Arg, &n1Arg, &rowsArg, &innerArg, &sp0, &dp0, &sp1, &dp1, &spArg, &dpArg };
+            uint gx = (uint)Math.Min(Math.Max(1, (innerBytes / 16 + BlockSize - 1) / BlockSize), 8);
+            uint gy = (uint)Math.Min(rows, 65535);
+            uint gz = (uint)Math.Min(n0 * n1, 65535);
+            Launch(copy4DBytes, gx, gy, gz, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchFillF32(IntPtr output, int count, float value, IntPtr stream)

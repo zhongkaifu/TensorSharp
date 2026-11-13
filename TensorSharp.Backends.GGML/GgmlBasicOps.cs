@@ -2873,116 +2873,6 @@ namespace TensorSharp.GGML
                 kvCacheType, eps);
         }
 
-        /// <summary>
-        /// Qwen3.8-Flash-Next fused FFN half-layer: the hyper-connection mixer, the
-        /// 512-expert MoE and the scatter back into the 4-wide residual as ONE graph.
-        /// Returns false when the backend declines the shape, so the caller can fall
-        /// back to the op-by-op path.
-        /// </summary>
-        public static bool Qwen4ExpFfnBlock(ref Qwen4ExpFfnArgs args, IntPtr resData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int nExpert, int nExpertUsed, int nFf, int nFfShared, float eps, int cacheSlot)
-        {
-            return GgmlNative.Qwen4ExpFfnBlock(ref args, resData, nEmbd, hc, hcLowRank,
-                nTokens, nExpert, nExpertUsed, nFf, nFfShared, eps, cacheSlot);
-        }
-
-        /// <summary>
-        /// Qwen3.8-Flash-Next fused attention half-layer: mixer, joint query|gate
-        /// projection, Q/K norm, partial rotary, KV append, gated attention and the
-        /// scatter, as ONE graph.
-        /// </summary>
-        public static bool Qwen4ExpAttnBlock(ref Qwen4ExpAttnArgs args, IntPtr resData, IntPtr maskData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
-            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
-            float eps, int cacheSlot)
-        {
-            return GgmlNative.Qwen4ExpAttnBlock(ref args, resData, maskData, nEmbd, hc, hcLowRank,
-                nTokens, headDim, nHead, nHeadKv, kvCapacity, nKv, position,
-                nRot, ropeBase, ropeFreqScale, attnScale, eps, cacheSlot);
-        }
-
-        /// <summary>
-        /// Qwen3.8-Flash-Next fused recurrent half-layer: mixer, projections, causal
-        /// depthwise conv, the Gated DeltaNet recurrence and the scatter, as ONE graph.
-        /// The conv and recurrent state are updated in place inside it.
-        /// </summary>
-        public static bool Qwen4ExpGdnBlock(ref Qwen4ExpGdnArgs args, IntPtr resData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
-            float eps, int cacheSlot)
-        {
-            return GgmlNative.Qwen4ExpGdnBlock(ref args, resData, nEmbd, hc, hcLowRank, nTokens,
-                headKDim, headVDim, nKHeads, nVHeads, dConv, eps, cacheSlot);
-        }
-
-        /// <summary>
-        /// Qwen3.8-Flash-Next token span: layers [layerBegin, layerEnd) - the
-        /// recurrent-or-attention half AND the FFN half of each - as ONE persisted
-        /// GGML graph. With the PLE layer the only host interruption, a token is two
-        /// of these calls instead of 96 per-layer ones.
-        /// </summary>
-        public static bool Qwen4ExpTokenSpan(
-            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
-            int layerBegin, int layerEnd,
-            IntPtr resData, IntPtr maskData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
-            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
-            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
-            int nExpert, int nExpertUsed, int nFf, int nFfSh,
-            float eps, int cacheSlot,
-            IntPtr head = default, IntPtr logitsOut = default,
-            IntPtr ple = default, int pleLayer = -1, IntPtr pleEmb = default,
-            IntPtr mropePos = default, IntPtr mropeSections = default,
-            int ropePosition = -1,
-            // GPU this span's layers live on (layer split). -1 / 0 = the current
-            // rank, which is the only rank on a single-GPU run.
-            int device = 0, IntPtr hiddenOut = default, int logitsRows = 1,
-            IntPtr qsa = default, IntPtr qsaPositions = default, int qsaPositionCount = 0)
-        {
-            return GgmlNative.Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
-                resData, maskData, nEmbd, hc, hcLowRank, nTokens,
-                headKDim, headVDim, nKHeads, nVHeads, dConv,
-                headDim, nHead, nHeadKv, kvCapacity, nKv, position,
-                nRot, ropeBase, ropeFreqScale, attnScale,
-                nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
-                head, logitsOut, ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition,
-                device, hiddenOut, logitsRows, qsa, qsaPositions, qsaPositionCount);
-        }
-
-        public static bool Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device)
-            => GgmlNative.Qwen4ExpCopyQsaCache(key, destination, bytes, device);
-
-        /// <summary>Drop every cached qwen4exp FFN graph (they pin weight bindings).</summary>
-        public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();
-
-        public static void Qwen4ExpInvalidateSeqState(IntPtr key) => GgmlNative.Qwen4ExpInvalidateSeqState(key);
-
-        public static void Qwen4ExpReleaseAllSeqState() => GgmlNative.Qwen4ExpReleaseAllSeqState();
-
-        public static void Qwen4ExpReleaseSeqState(IntPtr[] keys) => GgmlNative.Qwen4ExpReleaseSeqState(keys);
-
-        public static IntPtr Qwen4ExpStateSnapshotCreate(IntPtr[] keys, int[] devices,
-            IntPtr attn, IntPtr gdn, IntPtr ple)
-            => GgmlNative.Qwen4ExpStateSnapshotCreate(keys, devices, attn, gdn, ple);
-        public static bool Qwen4ExpStateSnapshotCapture(IntPtr handle)
-            => GgmlNative.TSGgml_Qwen4ExpStateSnapshotCapture(handle) != 0;
-        public static IntPtr Qwen4ExpMtpCreate(ref Qwen4ExpMtpConfig config,
-            ref Qwen4ExpAttnArgs attn, ref Qwen4ExpFfnArgs ffn, ref Qwen4ExpHeadArgs head)
-            => GgmlNative.TSGgml_Qwen4ExpMtpCreate(ref config, ref attn, ref ffn, ref head);
-        public static bool Qwen4ExpMtpForward(IntPtr handle, IntPtr embedding, IntPtr previous,
-            int count, int position, int ropePosition, IntPtr mrope3, IntPtr hiddenOut, IntPtr logitsOut)
-            => GgmlNative.TSGgml_Qwen4ExpMtpForward(handle, embedding, previous,
-                count, position, ropePosition, mrope3, hiddenOut, logitsOut) != 0;
-        public static void Qwen4ExpMtpFree(IntPtr handle) => GgmlNative.TSGgml_Qwen4ExpMtpFree(handle);
-        public static bool Qwen4ExpMtpCopyKv(IntPtr handle, IntPtr k, IntPtr v, long bytes)
-            => GgmlNative.TSGgml_Qwen4ExpMtpCopyKv(handle, k, v, bytes) != 0;
-
-        /// <summary>While set, a 2-8 row qwen4exp span keeps every row's recurrent state.</summary>
-        public static void Qwen4ExpCaptureVerifyRows(bool enable) => GgmlNative.TSGgml_Qwen4ExpCaptureVerifyRows(enable ? 1 : 0);
-
         /// <summary>Test probe of the TensorSharp Metal grouped expert kernels (tsm/tsm_moe.mm): one layer's held routes
         /// (slot -1: a route the host computes) over stacked expert bytes, into <paramref name="output"/> [rows, hidden].</summary>
         public static unsafe bool TsmMoeProbe(int gateType, int downType, int hidden, int nFf, int nExpert,
@@ -3173,43 +3063,12 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 0; }
         }
 
-        /// <summary>Test hook: qwen4exp span steps whose QSA layers pooled only the blocks they completed (the pooled
-        /// keys kept between steps). -1 when the native library was built without the test hooks
-        /// (TENSORSHARP_GGML_NATIVE_BUILD_TESTS off, as in the release and CI builds).</summary>
-        public static long Qwen4ExpQsaIncrementalSteps()
-        {
-            try { return GgmlNative.TSGgml_Qwen4ExpQsaIncrementalSteps(); }
-            catch (EntryPointNotFoundException) { return -1; }
-        }
-
         /// <summary>Test hook: decode / verify routes the route tail skip dropped in this process (missed experts routed
         /// only at rank TS_MOE_ROUTE_TAIL_SKIP or lower; ggml_ops_moe_hot_tier.cpp). -1 when the hooks are not built.</summary>
         public static long MoeTailSkippedRoutes()
         {
             try { return GgmlNative.TSGgml_MoeTailSkippedRoutes(); }
             catch (EntryPointNotFoundException) { return -1; }
-        }
-
-        /// <summary>DFlash feature taps for the following qwen4exp spans on this thread: after each
-        /// <paramref name="layers"/>[i] (a completed-output layer id), the mean of its hyper-connection
-        /// streams lands in row r of <paramref name="output"/> at column i * n_embd, rows
-        /// <paramref name="rowStride"/> floats apart. A null output turns the taps off.</summary>
-        public static unsafe bool Qwen4ExpSetFeatureTaps(int[] layers, IntPtr output, int rowStride)
-        {
-            fixed (int* l = layers)
-                return GgmlNative.TSGgml_Qwen4ExpSetFeatureTaps((IntPtr)l, layers?.Length ?? 0, output, rowStride) != 0;
-        }
-
-        /// <summary>Commit the state after <paramref name="row"/> of the last captured
-        /// <paramref name="rows"/>-row verify into the live state buffers.</summary>
-        public static bool Qwen4ExpCommitVerifyRow(int row, int rows) => GgmlNative.TSGgml_Qwen4ExpCommitVerifyRow(row, rows) != 0;
-
-        /// <summary>Bytes held by qwen4exp's verify row buffers (one set shared by every holder); 0 when the native
-        /// library predates the counter.</summary>
-        public static long Qwen4ExpRowBufferBytes()
-        {
-            try { return GgmlNative.TSGgml_Qwen4ExpRowBufferBytes(); }
-            catch (EntryPointNotFoundException) { return 0; }
         }
 
         /// <summary>Copy <paramref name="experts"/> of one host-offloaded MoE layer (its
@@ -3269,7 +3128,23 @@ namespace TensorSharp.GGML
 
         /// <summary>Count the router ids of accelerator-resident MoE layers too (they have no
         /// host seam). Process-wide; the counters stay keyed by each layer's mapped gate stack.</summary>
-        public static void MoeRoutingRecordDevice(bool on) => GgmlNative.TSGgml_MoeRoutingRecordDevice(on ? 1 : 0);
+        public static void MoeRoutingRecordDevice(bool on)
+        {
+            GgmlNative.TSGgml_MoeRoutingRecordDevice(on ? 1 : 0);
+            MoeRoutingRecordsDevice = on;
+        }
+
+        /// <summary>Whether <see cref="MoeRoutingRecordDevice"/> is on: a graph should hand its resident layers' ids over.</summary>
+        public static bool MoeRoutingRecordsDevice { get; private set; }
+
+        /// <summary>Count <paramref name="ids"/> (a resident layer's top-K expert ids) for the layer whose gate stack is
+        /// mapped at <paramref name="gate"/>, as its host seam would.</summary>
+        public static unsafe void MoeRoutingCount(IntPtr gate, int numExperts, ReadOnlySpan<int> ids)
+        {
+            if (gate == IntPtr.Zero || ids.IsEmpty) return;
+            fixed (int* p = ids)
+                GgmlNative.TSGgml_MoeRoutingCount(gate, numExperts, p, ids.Length);
+        }
 
         /// <summary>Serve host-offloaded experts mapped inside [<paramref name="baseAddress"/>,
         /// +<paramref name="length"/>) - a read-only mapping of <paramref name="path"/> from
@@ -3332,10 +3207,6 @@ namespace TensorSharp.GGML
             GgmlNative.TSGgml_HostExpertIoStats(s);
             return (s[0], s[1], s[2], s[3]);
         }
-        public static bool Qwen4ExpStateSnapshotRestore(IntPtr handle)
-            => GgmlNative.TSGgml_Qwen4ExpStateSnapshotRestore(handle) != 0;
-        public static void Qwen4ExpStateSnapshotFree(IntPtr handle)
-            => GgmlNative.TSGgml_Qwen4ExpStateSnapshotFree(handle);
 
         /// <summary>
         /// Fused chunked GatedDeltaNet for Qwen3.5/Qwen3-Next. Runs the prefill recurrent

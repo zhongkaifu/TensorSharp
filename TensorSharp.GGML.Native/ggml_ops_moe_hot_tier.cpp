@@ -193,14 +193,15 @@ namespace tsg
         // seam runs; up to overlap_routes window misses a row are read in the
         // background meanwhile and computed below, after a second cut that only
         // waits for those reads.
-        const bool overlap = overlap_routes > 0 && graph != nullptr && wait_out != nullptr
+        // A null graph: the caller orders the first group before the cut itself (the wait segment ends at it).
+        const bool overlap = overlap_routes > 0 && wait_out != nullptr
             && tier.count > tier.fixed && tier.cpu_visible && tier.count >= n_used + overlap_routes;
         if (!overlap)
         {
             hm.hot_out = sum;
             return sum;
         }
-        ggml_build_forward_expand(graph, sum);       // the first group precedes the cut
+        if (graph != nullptr) ggml_build_forward_expand(graph, sum);       // the first group precedes the cut
         *wait_out = HostMoeSegment{};
         wait_out->io_wait = true;
         wait_out->layer = hm.layer;
@@ -1042,6 +1043,13 @@ TSG_EXPORT int TSGgml_MoeRoutingCounts(const void* gate, unsigned long long* cou
 TSG_EXPORT void TSGgml_MoeRoutingRecordDevice(int on)
 {
     tsg::moe_set_record_device_routes(on != 0);
+}
+
+// Count router ids a graph computed for an accelerator-resident layer (no host seam counts them): the shared
+// runtime hands each resident layer's top-K ids to the counters while a profiling load records device routes.
+TSG_EXPORT void TSGgml_MoeRoutingCount(const void* gate, int num_experts, const std::int32_t* ids, long long count)
+{
+    if (count > 0) tsg::moe_routing_count(gate, num_experts, ids, static_cast<std::size_t>(count));
 }
 
 TSG_EXPORT void TSGgml_MoeRoutingReset(const void* gate)

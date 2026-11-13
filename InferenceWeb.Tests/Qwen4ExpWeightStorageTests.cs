@@ -32,9 +32,9 @@ public sealed class Qwen4ExpWeightStorageTests : IDisposable
     public void CoefficientRoles_AreIndependentOfStorageTypeAndMatrixShape(BackendType backend)
     {
         // The policy can be exercised without constructing a native backend or loading weights.
-        var model = (Qwen4ExpModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen4ExpModel));
+        var model = (Qwen4ExpRuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen4ExpRuntimeModel));
         GC.SuppressFinalize(model);
-        Qwen4ExpMtpMathTests.Set(typeof(ModelBase), model, "<ExecutionPlan>k__BackingField", new BackendExecutionPlan(backend));
+        TestReflection.Set(typeof(ModelBase), model, "<ExecutionPlan>k__BackingField", new BackendExecutionPlan(backend));
         string[] coefficients =
         [
             "blk.1.ple_conv1d.weight", "blk.0.ssm_conv1d.weight",
@@ -52,7 +52,7 @@ public sealed class Qwen4ExpWeightStorageTests : IDisposable
         ];
         foreach (GgmlTensorType type in new[] { GgmlTensorType.F16, GgmlTensorType.BF16, GgmlTensorType.Q8_0 })
         {
-            bool Store(string name) => (bool)Qwen4ExpMtpMathTests.Invoke(model, "IsQuantizedLinearWeight",
+            bool Store(string name) => (bool)TestReflection.Invoke(model, "IsQuantizedLinearWeight",
                 [new GgufTensorInfo { Name = name, Shape = [256, 4], Type = type }])!;
             foreach (string name in coefficients)
                 Assert.False(Store(name), $"{backend} retained {name} as {type} matrix bytes.");
@@ -81,7 +81,7 @@ public sealed class Qwen4ExpWeightStorageTests : IDisposable
     {
         string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_directory, "fixture.gguf"),
             pleConvType: ple, ssmConvType: ssm, matrixNormType: norms);
-        using var model = Assert.IsType<Qwen4ExpModel>(ModelBase.Create(path, backend));
+        using var model = Assert.IsType<Qwen4ExpRuntimeModel>(ModelBase.Create(path, backend));
         var weights = Field<Dictionary<string, Tensor>>(typeof(ModelBase), model, "_weights");
         var compressed = Field<IDictionary>(typeof(ModelBase), model, "_quantWeights");
         using var gguf = new GgufFile(path);
@@ -103,15 +103,13 @@ public sealed class Qwen4ExpWeightStorageTests : IDisposable
         int[] steps = [17, 203, 99, 4, 150, 61];
         float[][] Run()
         {
+            long graphRuns = model.GraphRuns;
             var rows = new List<float[]> { (float[])model.ForwardRefill(prompt).Clone() };
-            AssertSpan(model);
             foreach (int token in steps)
-            {
                 rows.Add((float[])model.Forward([token]).Clone());
-                AssertSpan(model);
-            }
+            // Every step ran as a graph (the family runs only as graphs; a refused step throws).
+            Assert.True(model.GraphRuns - graphRuns >= 1 + steps.Length, $"{model.GraphRuns - graphRuns} graph runs");
             Assert.Equal(prompt.Length + steps.Length, model.CacheSeqLen);
-            Assert.Equal(prompt.Length + steps.Length, Field<int>(typeof(Qwen4ExpModel), model, "_qsaPositionCount"));
             foreach (float[] row in rows)
             {
                 Assert.Equal(Qwen4ExpSyntheticModelBuilder.Vocab, row.Length);
@@ -125,14 +123,6 @@ public sealed class Qwen4ExpWeightStorageTests : IDisposable
         model.ResetKVCache();
         float[][] second = Run();
         for (int i = 0; i < first.Length; i++) Assert.Equal(first[i], second[i]);
-    }
-
-    private static void AssertSpan(Qwen4ExpModel model)
-    {
-        Assert.False(Field<bool>(typeof(Qwen4ExpModel), model, "_tokenGraphUnsupported"));
-        Assert.True(Field<bool>(typeof(Qwen4ExpModel), model, "_spanLogitsValid"));
-        Assert.NotNull(Field<object>(typeof(Qwen4ExpModel), model, "_pleArgs"));
-        Assert.NotNull(Field<object>(typeof(Qwen4ExpModel), model, "_qsaArgs"));
     }
 
     private static T Field<T>(Type owner, object model, string name)

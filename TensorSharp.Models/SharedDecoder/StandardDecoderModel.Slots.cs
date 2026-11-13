@@ -63,6 +63,16 @@ namespace TensorSharp.Models
         /// the next request of about the same size without growing again.</summary>
         private const int ReservationStepTokens = 1024;
 
+        /// <summary>Slot capacities are whole multiples of this many cells, up to the context limit. A decode or verify
+        /// row attends the padded cache window, which the capacity caps, and ggml-cuda groups a KV head's queries only
+        /// over K whose length is a multiple of 256: a one-shot request's exact 3,736-cell reservation (a 3.6K prompt
+        /// and 128 new tokens) kept Qwen3.8 Flash Next's decode in the ungrouped flash-attention kernel, 133 us a
+        /// layer against 26 (A40, nsys). Metal's 64-cell windows divide it.</summary>
+        private const int SlotCapacityAlignment = 256;
+
+        private int AlignedSlotCapacity(long cells)
+            => (int)Math.Min(_maxContextLength, (Math.Max(1, cells) + SlotCapacityAlignment - 1) / SlotCapacityAlignment * SlotCapacityAlignment);
+
         private Dictionary<string, Slot> _slots;            // requests with their own slot
         private Dictionary<string, Slot> _retainedSlots;    // finished requests kept for a continuation
         private List<Slot> _slotPool;
@@ -185,7 +195,7 @@ namespace TensorSharp.Models
                     ClearGraphCache();
                 return pooled;
             }
-            int capacity = Math.Min(_maxContextLength, Math.Max(Math.Max(1, reserveTokens), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength))));
+            int capacity = AlignedSlotCapacity(Math.Max(Math.Max(1, reserveTokens), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength))));
             var slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
             (slot.K, slot.V) = AllocateCaches(capacity);
             PrimeDeviceCopies(slot, overwritten: false);
@@ -470,7 +480,7 @@ namespace TensorSharp.Models
                     capacity = Math.Min(_maxContextLength, capacity * 2);
                 // Doubled, but no more than SlotGrowthHeadroomTokens past what is needed: a 16K-token clone that its request's
                 // reservation grew by a few dozen tokens became 32K cells, twice the memory and the upload.
-                capacity = Math.Min(capacity, Math.Min(_maxContextLength, required + SlotGrowthHeadroomTokens));
+                capacity = AlignedSlotCapacity(Math.Min(capacity, (long)required + SlotGrowthHeadroomTokens));
             }
             if (TryGrowSlotOnDevice(slot, capacity)) return;
             SyncToHost(slot);

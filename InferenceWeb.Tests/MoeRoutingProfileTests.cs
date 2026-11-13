@@ -148,7 +148,7 @@ public sealed class MoeRoutingProfileTests : IDisposable
     [InlineData(null, null)]
     public void BudgetOverrides_ParseGigabytes(string value, long? expected)
     {
-        Assert.Equal(expected, Qwen4ExpModel.ExpertTierBudgetOverride(value));
+        Assert.Equal(expected, ModelBase.ExpertTierBudgetOverride(value));
         Assert.Equal(expected, ModelBase.HostExpertIoBudgetOverride(value));
     }
 
@@ -158,10 +158,10 @@ public sealed class MoeRoutingProfileTests : IDisposable
     [InlineData("0.25", 0.25)]
     [InlineData("0", 0.0)]
     [InlineData("0.9", 0.9)]
-    [InlineData("0.95", Qwen4ExpModel.DefaultWindowShare)]
-    [InlineData("-0.1", Qwen4ExpModel.DefaultWindowShare)]
-    [InlineData("abc", Qwen4ExpModel.DefaultWindowShare)]
-    [InlineData(null, Qwen4ExpModel.DefaultWindowShare)]
+    [InlineData("0.95", ModelBase.DefaultWindowShare)]
+    [InlineData("-0.1", ModelBase.DefaultWindowShare)]
+    [InlineData("abc", ModelBase.DefaultWindowShare)]
+    [InlineData(null, ModelBase.DefaultWindowShare)]
     public void WindowShare_ParsesAFraction(string value, double expected)
-        => Assert.Equal(expected, Qwen4ExpModel.WindowShare(value));
+        => Assert.Equal(expected, ModelBase.WindowShare(value));
 }

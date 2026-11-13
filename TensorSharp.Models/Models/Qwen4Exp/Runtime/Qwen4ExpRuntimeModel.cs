@@ -149,6 +149,14 @@ namespace TensorSharp.Models
 
         protected override bool RequiresGraphs => true;
 
+        /// <summary>The PLE layer's conv taps load as F32 too, and its norms are coefficient vectors (see the base's rule).</summary>
+        protected override bool IsQuantizedLinearWeight(GgufTensorInfo info)
+            => !info.Name.EndsWith(".ple_conv1d.weight", StringComparison.Ordinal) && base.IsQuantizedLinearWeight(info);
+
+        protected override bool IsCoefficientVector(string name)
+            => base.IsCoefficientVector(name) || name.EndsWith(".ple_norm_key.weight", StringComparison.Ordinal)
+               || name.EndsWith(".ple_norm_query.weight", StringComparison.Ordinal) || name.EndsWith(".ple_norm_conv.weight", StringComparison.Ordinal);
+
         protected override int StreamWidth => checked((int)Ple.StreamFloats);
 
         /// <summary>Each rank traces its shard: the recurrent and attention heads and the experts' width split as Qwen 3.5's,
@@ -280,10 +288,17 @@ namespace TensorSharp.Models
         {
             PleSpec p = Ple;
             int rows = step.Rows, hc = p.Hc;
+            int block = step.Cont(output);
+            // A prompt chunk's scatter is one region a backend may run as one pass (GraphFusion.HcScatter: Metal's
+            // prompt-width hyper-connection scatter, Qwen4ExpModel's tsm_hc_scatter: 4.85 -> 3.89 s on a 3.6K prompt).
+            bool region = rows > 1;
+            if (region) step.BeginFused(GraphFusion.HcScatter, stackalloc[] { stream, block, context }, stackalloc long[] { p.Hidden, hc });
             int w = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Sigmoid, step.Op(GraphOp.Scale, stackalloc[] { context }, default, stackalloc[] { 1f / hc })) },
                 default, stackalloc[] { 2f });
-            int scaled = Outer(step, step.Cont(output), p.Hidden, step.Reshape(w, 1, hc, rows), hc, rows);
-            return step.Op(GraphOp.Add, stream, step.Reshape(scaled, p.StreamFloats, rows));
+            int scaled = Outer(step, block, p.Hidden, step.Reshape(w, 1, hc, rows), hc, rows);
+            int result = step.Op(GraphOp.Add, stream, step.Reshape(scaled, p.StreamFloats, rows));
+            if (region) step.EndFused(stackalloc[] { result });
+            return result;
         }
 
         /// <summary>The final mixer is the output norm (qwen4exp has no output_norm).</summary>
@@ -324,13 +339,18 @@ namespace TensorSharp.Models
             long n = p.Hidden, width = p.StreamFloats;
             int xn = GroupedNorm(step, stream, rows, norm);
             int lo = step.Op(GraphOp.Silu, step.Op(GraphOp.Scale, stackalloc[] { step.MatMul(down, xn) }, default, stackalloc[] { 1f / hc }));
-            int gate = step.Op(GraphOp.Sigmoid, step.MatMul(up, lo));
-            int gated = step.Op(GraphOp.Mul, xn, gate);
+            int gates = step.MatMul(up, lo);
+            // A prompt chunk's block read mixes in one region a backend may run as one kernel (GraphFusion.HcMix: Metal's,
+            // where the whole read cannot run fused); the output mixer's stays ops, as Qwen4ExpModel ran it.
+            bool region = rows > 1 && inject != null;
+            if (region) step.BeginFused(GraphFusion.HcMix, stackalloc[] { xn, gates }, stackalloc long[] { n, hc });
+            int gated = step.Op(GraphOp.Mul, xn, step.Op(GraphOp.Sigmoid, gates));
             const long f = sizeof(float);
             int mixed = step.View2(gated, n, rows, width * f, 0);
             for (int c = 1; c < hc; c++)
                 mixed = step.Op(GraphOp.Add, mixed, step.View2(gated, n, rows, width * f, c * n * f));
             mixed = step.Op(GraphOp.Scale, stackalloc[] { mixed }, default, stackalloc[] { 1f / hc });
+            if (region) step.EndFused(stackalloc[] { mixed });
             injected = inject != null ? step.MatMul(inject, xn) : -1;
             return mixed;
         }
@@ -467,16 +487,42 @@ namespace TensorSharp.Models
         /// <summary>This step's PLE rows, [rows, n]: each sequence's n-gram hashes over its history and its rows (the
         /// history then advances), gathered from the host table.</summary>
         private const int PleExplicitReadMinRows = 1024;
-        private byte[] _plePackedRows;
+        private byte[] _plePackedRows, _plePrefetchPackedRows;
+
+        /// <summary>A prompt chunk's rows gathered while the chunk before it computed (<see cref="PrepareNextPrefillChunk"/>):
+        /// the hashes it was gathered for and the rows, read on a worker.</summary>
+        private sealed record PlePrefetch(int Start, int[] Ids, Task<float[]> Rows);
+
+        private (int[] Tokens, int Start)? _pleHint;
+        private (int[] Ids, float[] Rows)? _pleLast;
+        private PlePrefetch _plePrefetch;
+
+        /// <summary>Prompt chunks that took the rows gathered while the chunk before them computed.</summary>
+        internal long PlePrefetchHitsForTests { get; private set; }
+
+        /// <summary>Test seam: gather every chunk's rows in place.</summary>
+        internal bool PlePrefetchDisabled { get; set; }
+
+        /// <summary>Test seam: fault a prompt's rows through the mapping instead of reading them explicitly.</summary>
+        internal bool PleExplicitReadDisabled { get; set; }
+
+        /// <summary>The scheduler names the next chunk of a prompt (its tokens from <paramref name="startPos"/>): when the
+        /// chunk being gathered ends there, its PLE rows are read on a worker while this one computes (a 4096-token
+        /// chunk's 65K table rows took 0.26 s of an M5 Pro's prompt step, beside 3.9 s of compute).</summary>
+        public override void PrepareNextPrefillChunk(int[] tokens, int startPos)
+        {
+            if (PlePrefetchDisabled || tokens == null || tokens.Length < 2 || !_quantWeights.ContainsKey(PleTable)) return;
+            _pleHint = ((int[])tokens.Clone(), startPos);
+        }
 
         /// <summary>The rows read explicitly into a packed buffer (row i at i * row bytes); 0 to read the mapping.</summary>
-        private unsafe long ReadPleRowsPacked(QuantizedWeight table, int[] ids, long rowBytes)
+        private static unsafe long ReadPleRowsPacked(QuantizedWeight table, int[] ids, long rowBytes, ref byte[] buffer)
         {
             long need = ids.Length * rowBytes;
             if (need > int.MaxValue) return 0;
-            if (_plePackedRows == null || _plePackedRows.Length < need)
-                _plePackedRows = GC.AllocateUninitializedArray<byte>((int)need, pinned: true);
-            var packed = (IntPtr)System.Runtime.CompilerServices.Unsafe.AsPointer(ref _plePackedRows[0]);
+            if (buffer == null || buffer.Length < need)
+                buffer = GC.AllocateUninitializedArray<byte>((int)need, pinned: true);
+            var packed = (IntPtr)System.Runtime.CompilerServices.Unsafe.AsPointer(ref buffer[0]);
             return GgmlBasicOps.HostReadRows(table.Data, rowBytes, ids, packed) ? (long)packed : 0;
         }
 
@@ -492,7 +538,52 @@ namespace TensorSharp.Models
                 var state = (PleGdnState)step.SequenceState(s, layer);
                 state.HashRows(tokens, step.First[s], step.Counts[s], step.Starts[s], ids);
             }
-            var embedded = new float[(long)step.Rows * p.Hidden];
+            // The rows' rotary positions, for the QSA layers after this one (a block's pooled key turns at its first cell's).
+            for (int s = 0; s < step.Sequences; s++)
+            {
+                int seq = s;
+                ((PleGdnState)step.SequenceState(s, layer)).RecordPositions(step.Starts[s], step.Counts[s], i => step.RowPosition(seq, i));
+            }
+            // A replayable step that misses the graph cache is emitted twice (its signature, then its recording).
+            if (_pleLast is { } last && last.Ids.AsSpan().SequenceEqual(ids)) return last.Rows;
+            float[] embedded = TakePrefetchedPleRows(step, ids) ?? ReadPleRows(ids, ref _plePackedRows);
+            _pleLast = (ids, embedded);
+            if (step.Sequences == 1 && _pleHint is { } hint && hint.Start == step.Starts[0] + step.Counts[0])
+            {
+                // The history now ends with this chunk: hash the next one as it will be, and read its rows meanwhile.
+                _pleHint = null;
+                var next = new int[(long)hint.Tokens.Length * p.Heads];
+                ((PleGdnState)step.SequenceState(0, layer)).PeekRows(hint.Tokens, hint.Start, next);
+                _plePrefetch?.Rows.Wait();
+                _plePrefetch = new PlePrefetch(hint.Start, next, Task.Run(() => ReadPleRows(next, ref _plePrefetchPackedRows)));
+            }
+            return embedded;
+        }
+
+        /// <summary>The prefetched rows when this step is the hinted chunk or its start (the scheduler may hold a
+        /// prompt's last token back), on the same history; null otherwise (a stale prefetch is dropped).</summary>
+        private float[] TakePrefetchedPleRows(GraphStep step, int[] ids)
+        {
+            PlePrefetch prefetch = _plePrefetch;
+            if (prefetch == null) return null;
+            _plePrefetch = null;
+            float[] rows = prefetch.Rows.Result;
+            if (step.Sequences != 1 || step.Starts[0] != prefetch.Start || ids.Length > prefetch.Ids.Length
+                || !ids.AsSpan().SequenceEqual(prefetch.Ids.AsSpan(0, ids.Length)))
+                return null;
+            PlePrefetchHitsForTests++;
+            long n = (long)step.Rows * Ple.Hidden;
+            if (n == rows.LongLength) return rows;
+            var leading = new float[n];
+            Array.Copy(rows, leading, n);
+            return leading;
+        }
+
+        /// <summary>The table rows of <paramref name="ids"/>, dequantized, [ids, head dim].</summary>
+        private unsafe float[] ReadPleRows(int[] ids, ref byte[] packedBuffer)
+        {
+            PleSpec p = Ple;
+            var embedded = new float[(long)ids.Length * p.HeadDim];
             if (_quantWeights.TryGetValue(PleTable, out QuantizedWeight table))
             {
                 int type = table.GgmlType, dim = p.HeadDim;
@@ -500,7 +591,8 @@ namespace TensorSharp.Models
                 // A row the page cache lacks is a read from disk: a prompt's rows are read explicitly and packed (one
                 // pread each on the native I/O team; as faults a 4096-token chunk's 65K rows took 1.1-3.1 s on an M5
                 // Pro), and the rows are dequantized concurrently, so a decode's 16 faults overlap (Qwen4ExpModel.Ple).
-                long packed = table.IsFileBacked && ids.Length >= PleExplicitReadMinRows ? ReadPleRowsPacked(table, ids, rowBytes) : 0;
+                long packed = table.IsFileBacked && ids.Length >= PleExplicitReadMinRows && !PleExplicitReadDisabled
+                    ? ReadPleRowsPacked(table, ids, rowBytes, ref packedBuffer) : 0;
                 long source = packed != 0 ? packed : (long)table.Data;
                 fixed (float* dst = embedded)
                 {
@@ -540,6 +632,11 @@ namespace TensorSharp.Models
             // The history before the last hashed step: a step's emission may run twice (a replayable step's
             // signature pass, then its recording), and both must hash with the history as of its start.
             private int _undoCount, _undoNext, _lastStart = -1, _lastCount = -1;
+            // The rotary position (T, H, W) of the last PositionRing cells, by cell modulo the ring: QSA rotates a block's
+            // pooled key at its first cell's position, which an earlier step may have written (media cells and the text
+            // after them do not sit at their cell index). Entry: [cell, t, h, w], cell -1 where none.
+            internal const int PositionRing = 64;
+            private readonly int[] _ring = new int[4 * PositionRing];
 
             public PleGdnState(IAllocator allocator, IGraphExecutor executor, Func<Tensor, IntPtr> hostPointer,
                 int convRows, int channels, int vHeads, int dv, int dk, PleSpec p)
@@ -549,7 +646,7 @@ namespace TensorSharp.Models
                 _tokens = new int[p.Ngram - 1];
                 _undoTokens = new int[p.Ngram - 1];
                 PleConv = new Tensor(allocator, DType.Float32, Math.Max(1, p.ConvHistory), p.StreamFloats);
-                PleTokens = new Tensor(allocator, DType.Float32, 2 + p.Ngram - 1);
+                PleTokens = new Tensor(allocator, DType.Float32, 2 + p.Ngram - 1 + 4 * PositionRing);
                 ResetPle();
             }
 
@@ -607,6 +704,7 @@ namespace TensorSharp.Models
                 if (!base.ResetInPlace()) return false;
                 ClearInPlace(PleConv);
                 _count = _next = 0;
+                ClearRing();
                 _stale = false;
                 _lastStart = -1;
                 WriteTokens();
@@ -618,6 +716,7 @@ namespace TensorSharp.Models
                 if (PleConv == null) return;   // the base constructor resets before this one ran
                 Clear(PleConv);
                 _count = _next = 0;
+                ClearRing();
                 _stale = false;
                 _lastStart = -1;
                 WriteTokens();
@@ -712,6 +811,16 @@ namespace TensorSharp.Models
                 }
                 _lastStart = start;
                 _lastCount = count;
+                Hash(tokens, first, count, start, ids);
+                _verifyTokens = tokens.AsSpan(first, count).ToArray();
+                Advance(tokens, first, count, start);
+                WriteTokens();
+            }
+
+            /// <summary>The ids rows [first, first + count) at <paramref name="start"/> hash to after the current history,
+            /// which stays as it is.</summary>
+            private void Hash(int[] tokens, int first, int count, int start, int[] ids)
+            {
                 int ngram = _p.Ngram, eos = _p.Eos;
                 var hist = new List<int>(ngram);
                 if (_next == start)
@@ -754,9 +863,41 @@ namespace TensorSharp.Models
                         }
                     }
                 }
-                _verifyTokens = tokens.AsSpan(first, count).ToArray();
-                Advance(tokens, first, count, start);
+            }
+
+            private void ClearRing()
+            {
+                for (int i = 0; i < PositionRing; i++) _ring[4 * i] = -1;
+            }
+
+            /// <summary>Record the rotary positions of cells [start, start + count) (the last PositionRing of them).</summary>
+            public void RecordPositions(int start, int count, Func<int, (int T, int H, int W)> position)
+            {
+                ReadTokens();
+                for (int i = Math.Max(0, count - PositionRing); i < count; i++)
+                {
+                    int cell = start + i, e = 4 * (cell % PositionRing);
+                    (int t, int h, int w) = position(i);
+                    _ring[e] = cell; _ring[e + 1] = t; _ring[e + 2] = h; _ring[e + 3] = w;
+                }
                 WriteTokens();
+            }
+
+            /// <summary>The rotary position an earlier step recorded for <paramref name="cell"/>, if it is still in the ring.</summary>
+            public bool TryPositionOf(int cell, out (int T, int H, int W) position)
+            {
+                ReadTokens();
+                int e = 4 * (cell % PositionRing);
+                position = (_ring[e + 1], _ring[e + 2], _ring[e + 3]);
+                return _ring[e] == cell;
+            }
+
+            /// <summary>The ids of <paramref name="tokens"/> at <paramref name="start"/> after the history as it is now (a
+            /// prompt chunk that will follow; nothing advances).</summary>
+            public void PeekRows(int[] tokens, int start, int[] ids)
+            {
+                ReadTokens();
+                Hash(tokens, 0, tokens.Length, start, ids);
             }
 
             /// <summary>The last n-1 tokens after rows [first, first + count) at <paramref name="start"/> (after the
@@ -777,6 +918,8 @@ namespace TensorSharp.Models
                 v[0] = _count;
                 v[1] = _next;
                 for (int i = 0; i < _count; i++) v[2 + i] = _tokens[i];
+                int ring = 2 + _p.Ngram - 1;
+                for (int i = 0; i < _ring.Length; i++) v[ring + i] = _ring[i];
                 PleTokens.SetElementsAsFloat(v);
                 if (_host) Invalidate(PleTokens);
             }
@@ -788,6 +931,8 @@ namespace TensorSharp.Models
                 _count = (int)v[0];
                 _next = (int)v[1];
                 for (int i = 0; i < _count; i++) _tokens[i] = (int)v[2 + i];
+                int ring = 2 + _p.Ngram - 1;
+                for (int i = 0; i < _ring.Length; i++) _ring[i] = (int)v[ring + i];
                 _stale = false;
             }
 
@@ -802,6 +947,9 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            // A prefetch reads the mapped table: it ends before the mapping goes.
+            try { _plePrefetch?.Rows.Wait(); } catch (AggregateException) { }
+            _plePrefetch = null;
             foreach (Tensor t in _pleTaps.Values) t.Dispose();
             _pleTaps.Clear();
             base.Dispose();

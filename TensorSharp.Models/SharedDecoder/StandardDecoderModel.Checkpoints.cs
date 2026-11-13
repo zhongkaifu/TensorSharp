@@ -28,8 +28,9 @@ namespace TensorSharp.Models
         private const int CheckpointVersion = 2;   // 2: the rotary delta
 
         /// <summary>The format a checkpoint file is written in: where the model keeps extra key caches (their rows
-        /// follow the recurrent states) 4, so a file without them, or with 3's one-key QSA rows, is not read as one.</summary>
-        private int CheckpointFormat => _extraCacheLayer.Length > 0 ? 4 : CheckpointVersion;
+        /// follow the recurrent states) 5, so a file without them, with 3's one-key QSA rows or with 4's PLE state before
+        /// it kept its cells' rotary positions, is not read as one.</summary>
+        private int CheckpointFormat => _extraCacheLayer.Length > 0 ? 5 : CheckpointVersion;
 
         public bool SupportsPrefixCheckpoints => SupportsPerSequenceFusedForward && RecurrentStatesCopy;
 
@@ -145,7 +146,7 @@ namespace TensorSharp.Models
         /// <summary>A deep copy of <paramref name="source"/> sized for <paramref name="capacityTokens"/>.</summary>
         private Slot CopySlot(Slot source, int capacityTokens)
         {
-            int capacity = Math.Min(_maxContextLength, Math.Max(FreshSlotTokens, capacityTokens));
+            int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, capacityTokens));
             // A pooled slot's caches and states are overwritten whole and keep their device copies (cached graphs
             // bind them), so the host route writes them in place.
             Slot slot = TakePooledSlot(capacity, mustFit: true);
@@ -451,7 +452,7 @@ namespace TensorSharp.Models
                 int length = reader.ReadInt32();
                 int ropeDelta = reader.ReadInt32();
                 if (length <= 0 || length > _maxContextLength) return false;
-                int capacity = Math.Min(_maxContextLength, Math.Max(FreshSlotTokens, length));
+                int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, length));
                 slot = new Slot { Capacity = capacity, Length = 0, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
                 (slot.K, slot.V) = AllocateCaches(capacity);
                 int blockBytes = reader.ReadInt32();

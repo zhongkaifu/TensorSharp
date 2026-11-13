@@ -154,6 +154,15 @@ namespace TensorSharp.Models
         /// the rotated weights, fused QKV and gate/up included (the GGML graph builder rotates their inputs).</summary>
         protected override void PrepareLoadedWeights()
         {
+            // Coefficient vectors a converter stored as matrices ([n, 1]; an hc norm as [n, hc]) bind as the flat vectors
+            // the graph multiplies by.
+            foreach (string name in new List<string>(_weights.Keys))
+            {
+                Tensor w = _weights[name];
+                if (w.DimensionCount <= 1 || !IsCoefficientVector(name)) continue;
+                _weights[name] = w.View(w.ElementCount());
+                w.Dispose();
+            }
             if (TensorRecurrence && Mesh.TensorParallel == 1)
             {
                 for (int l = 0; l < Config.NumLayers; l++)
@@ -296,6 +305,25 @@ namespace TensorSharp.Models
             ShardOutputRows(p + "ssm_alpha.weight", r => ValueHeadsOf(r, degree));
             ShardInputColumnGroups(p + "ssm_out.weight", r => ValueHeadsOf(r, degree), _headVDim);
         }
+
+        /// <summary>
+        /// Coefficients the recurrence and the norms read as F32 load as F32 whatever a converter stored them as (F16,
+        /// BF16 or quantized blocks; scale vectors as [n, 1]): the depthwise conv taps, the norms' gammas, the decay
+        /// constants and the shared expert's gate. Projections stay compressed.
+        /// </summary>
+        protected override bool IsQuantizedLinearWeight(GgufTensorInfo info)
+        {
+            string name = info.Name;
+            if (name.EndsWith(".ssm_conv1d.weight", StringComparison.Ordinal) || name.EndsWith(".ffn_gate_inp_shexp.weight", StringComparison.Ordinal)
+                || IsCoefficientVector(name))
+                return false;
+            return base.IsQuantizedLinearWeight(info);
+        }
+
+        /// <summary>A per-channel coefficient vector (a norm's gammas, the decay constants), whatever shape it was stored in.</summary>
+        protected virtual bool IsCoefficientVector(string name)
+            => name.EndsWith("_norm.weight", StringComparison.Ordinal) || name.EndsWith(".ssm_dt.bias", StringComparison.Ordinal)
+               || name.EndsWith(".ssm_a", StringComparison.Ordinal);
 
         /// <summary>The recurrence's small per-head constants, gathered per rank in its local order.</summary>
         private void BuildRecurrentConstants()

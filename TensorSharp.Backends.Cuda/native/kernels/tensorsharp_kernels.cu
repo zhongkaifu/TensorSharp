@@ -6,6 +6,7 @@
 // IQ2_XXS dequant lookup tables, vendored from ggml-org/ggml so the CUDA backend
 // builds without the upstream ggml checkout (see tensorsharp_iq2xxs_tables.cuh).
 #include "tensorsharp_iq2xxs_tables.cuh"
+#include "tensorsharp_iq1s_tables.cuh"
 
 #define GGML_Q4_0 2
 #define GGML_Q4_1 3
@@ -19,11 +20,14 @@
 #define GGML_Q5_K 13
 #define GGML_Q6_K 14
 #define GGML_IQ2_XXS 16
+#define GGML_IQ2_XS 17
 #define GGML_IQ3_XXS 18
+#define GGML_IQ1_S 19
 #define GGML_IQ4_NL 20
 #define GGML_IQ3_S 21
 #define GGML_IQ2_S 22
 #define GGML_IQ4_XS 23
+#define GGML_IQ1_M 29
 #define GGML_MXFP4 39
 #define GGML_NVFP4 40
 #define GGML_Q2_0 42
@@ -135,6 +139,9 @@ __device__ __forceinline__ int qrow_bytes(int type, int cols)
         case GGML_Q5_K: return (cols / 256) * 176;
         case GGML_Q6_K: return (cols / 256) * 210;
         case GGML_IQ2_XXS: return (cols / 256) * 66;
+        case GGML_IQ2_XS: return (cols / 256) * 74;
+        case GGML_IQ1_S: return (cols / 256) * 50;
+        case GGML_IQ1_M: return (cols / 256) * 56;
         case GGML_IQ3_XXS: return (cols / 256) * 98;
         case GGML_IQ2_S: return (cols / 256) * 82;
         case GGML_IQ3_S: return (cols / 256) * 110;
@@ -244,6 +251,68 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
         uint64_t grid = iq2xxs_grid[grid_index];
         int v = (int)((grid >> (8 * j)) & 0xFF);
         return (sign8 & (1u << j)) ? -db * (float)v : db * (float)v;
+    }
+
+    if (type == GGML_IQ2_XS)
+    {
+        // block_iq2_xs: d (half), qs[32] (uint16: 9-bit grid index + 7-bit sign index), scales[8] = 74 bytes
+        // (ggml dequantize_row_iq2_xs).
+        const uint8_t* block = row + (col / 256) * 74;
+        int t = col & 255;
+        int ib32 = t >> 5;
+        int l = (t & 31) >> 3;
+        int j = t & 7;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        uint16_t q = (uint16_t)(block[2 + 2 * (4 * ib32 + l)] | (block[3 + 2 * (4 * ib32 + l)] << 8));
+        uint8_t sc = block[66 + ib32];
+        float db = d * (0.5f + (float)((l < 2) ? (sc & 0xf) : (sc >> 4))) * 0.25f;
+        uint64_t grid = iq2xs_grid[q & 511];
+        int v = (int)((grid >> (8 * j)) & 0xFF);
+        uint8_t signs = ksigns_iq2xs[q >> 9];
+        return (signs & (1u << j)) ? -db * (float)v : db * (float)v;
+    }
+
+    if (type == GGML_IQ1_S || type == GGML_IQ1_M)
+    {
+        // block_iq1_s: d (half), qs[32], qh[8] (uint16) = 50 bytes; block_iq1_m: qs[32], qh[16], scales[8]
+        // (four uint16 whose top nibbles make the half super-block scale) = 56 bytes. A value is
+        // dl * (grid + delta) with grid in {-1, 0, 1} (ggml dequantize_row_iq1_s / _iq1_m).
+        int t = col & 255;
+        int ib32 = t >> 5;
+        int l = (t & 31) >> 3;
+        int j = t & 7;
+        float dl;
+        float delta;
+        int index;
+        if (type == GGML_IQ1_S)
+        {
+            const uint8_t* block = row + (col / 256) * 50;
+            float d = __half2float(*reinterpret_cast<const half*>(block));
+            uint16_t qh = (uint16_t)(block[34 + 2 * ib32] | (block[35 + 2 * ib32] << 8));
+            dl = d * (float)(2 * ((qh >> 12) & 7) + 1);
+            delta = (qh & 0x8000) ? -0.125f : 0.125f;
+            index = block[2 + 4 * ib32 + l] | (((qh >> (3 * l)) & 7) << 8);
+        }
+        else
+        {
+            const uint8_t* block = row + (col / 256) * 56;
+            const uint8_t* sc8 = block + 48;
+            uint16_t sc0 = (uint16_t)(sc8[0] | (sc8[1] << 8));
+            uint16_t sc1 = (uint16_t)(sc8[2] | (sc8[3] << 8));
+            uint16_t sc2 = (uint16_t)(sc8[4] | (sc8[5] << 8));
+            uint16_t sc3 = (uint16_t)(sc8[6] | (sc8[7] << 8));
+            uint16_t bits = (uint16_t)((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+            float d = __half2float(__ushort_as_half(bits));
+            uint16_t sc = (uint16_t)(sc8[2 * (ib32 >> 1)] | (sc8[2 * (ib32 >> 1) + 1] << 8));
+            int shift = 6 * (ib32 & 1) + (l < 2 ? 0 : 3);
+            dl = d * (float)(2 * ((sc >> shift) & 0x7) + 1);
+            uint8_t qh = block[32 + 2 * ib32 + (l >> 1)];
+            index = block[4 * ib32 + l] | (((l & 1) ? (qh << 4) : (qh << 8)) & 0x700);
+            delta = (qh & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;
+        }
+        uint32_t grid = iq1s_grid_gpu[index];
+        int nib = (int)((grid >> (8 * (j & 3) + ((j & 4) ? 4 : 0))) & 0xF);
+        return dl * ((float)(nib - 1) + delta);
     }
 
     if (type == GGML_Q4_K)
@@ -774,6 +843,58 @@ extern "C" __global__ void ts_copy2d_bytes(
         {
             for (long long j = i; j < innerBytes; j += stride)
                 d[j] = s[j];
+        }
+    }
+}
+
+// A strided copy of up to four dimensions in ONE launch: n0 x n1 groups (grid.z) of `rows` rows (grid.y) of
+// `innerBytes` contiguous bytes, every level with its own src/dst pitch. The 2D copy above runs one launch per
+// group; a 3D view of a prompt chunk ([rows, heads, head_dim] permuted or narrowed) made that a launch per row.
+extern "C" __global__ void ts_copy4d_bytes(
+    const unsigned char* __restrict__ src,
+    unsigned char* __restrict__ dst,
+    long long n0, long long n1,
+    long long rows,
+    long long innerBytes,
+    long long srcPitch0, long long dstPitch0,
+    long long srcPitch1, long long dstPitch1,
+    long long srcPitch, long long dstPitch)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    long long groups = n0 * n1;
+    for (long long g = blockIdx.z; g < groups; g += gridDim.z)
+    {
+        long long g0 = g / n1, g1 = g - g0 * n1;
+        const unsigned char* sg = src + g0 * srcPitch0 + g1 * srcPitch1;
+        unsigned char* dg = dst + g0 * dstPitch0 + g1 * dstPitch1;
+        for (long long r = blockIdx.y; r < rows; r += gridDim.y)
+        {
+            const unsigned char* s = sg + r * srcPitch;
+            unsigned char* d = dg + r * dstPitch;
+            unsigned long long align =
+                (unsigned long long)(size_t)s | (unsigned long long)(size_t)d | (unsigned long long)innerBytes;
+            if ((align & 15ULL) == 0ULL)
+            {
+                const int4* s4 = (const int4*)s;
+                int4* d4 = (int4*)d;
+                long long n = innerBytes >> 4;
+                for (long long j = i; j < n; j += stride)
+                    d4[j] = s4[j];
+            }
+            else if ((align & 3ULL) == 0ULL)
+            {
+                const int* s1 = (const int*)s;
+                int* d1 = (int*)d;
+                long long n = innerBytes >> 2;
+                for (long long j = i; j < n; j += stride)
+                    d1[j] = s1[j];
+            }
+            else
+            {
+                for (long long j = i; j < innerBytes; j += stride)
+                    d[j] = s[j];
+            }
         }
     }
 }

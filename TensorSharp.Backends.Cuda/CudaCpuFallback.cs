@@ -14,6 +14,10 @@ namespace TensorSharp.Cuda
 
         internal static void WarnFallback(string opName)
         {
+            // A host computation inside a CUDA graph capture runs once, at recording: every replay would reuse what it
+            // computed then (a recorded decode step replayed the recording's rotary positions).
+            if (CudaGraphCapture.AnyCapturing)
+                throw new CudaGraphCaptureAbortedException($"CUDA op '{opName}' has no device kernel for these arguments; a recorded step cannot run it on the host.");
             if (!WarnedOps.TryAdd(opName, true))
                 return;
 

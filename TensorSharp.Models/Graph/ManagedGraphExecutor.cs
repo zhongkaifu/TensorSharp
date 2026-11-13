@@ -35,6 +35,20 @@ namespace TensorSharp.Models.Graph
 
         public ManagedGraphExecutor(IAllocator allocator) : base(allocator) { }
 
+        /// <summary>The base executor's capabilities, and a decode row's recurrence updates the slot's state in place (see
+        /// <see cref="GatedDeltaNet"/>); decode steps replay their program a position on over windows padded to
+        /// <see cref="DecodeWindowRows"/> rows, whose unwritten keys the attention stops before (see <see cref="FlashAttention"/>).</summary>
+        public override GraphCapabilities Capabilities { get; } =
+            new() { StridedViews = true, DecodeWindowRows = DecodeWindowRows, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true };
+
+        /// <summary>Decode window bucket: one program serves this many decode steps of a sequence.</summary>
+        private const int DecodeWindowRows = 256;
+
+        /// <summary>The recurrence wrote its result into the leaf already (<see cref="GatedDeltaNet"/>): nothing to copy.</summary>
+        protected override bool TryAlias(Tensor result, Tensor leaf, long offsetBytes)
+            => ReferenceEquals(result.Storage, leaf.Storage)
+               && result.StorageOffset * result.ElementType.Size() == leaf.StorageOffset * leaf.ElementType.Size() + offsetBytes;
+
         /// <summary>Work (state elements touched in a step) below which the (sequence, head) pairs run serially.</summary>
         private const long ParallelRecurrenceWork = 1L << 16;
 
@@ -50,8 +64,15 @@ namespace TensorSharp.Models.Graph
             int sv = (int)v.Sizes[3], h = (int)v.Sizes[2], nt = (int)v.Sizes[1], ns = (int)v.Sizes[0], hq = (int)q.Sizes[2];
             bool kda = g.Sizes[3] == sv && sv > 1;
             int slots = Math.Max(1, snapshots);
-            long perHead = (long)sv * sv, attn = (long)sv * h * nt * ns, perSnap = perHead * h * ns;
-            var result = new Tensor(Allocator, DType.Float32, attn + perSnap * slots);
+            long perHead = (long)sv * sv, attn = (long)sv * h * nt * ns, perSnap = perHead * h * ns, total = attn + perSnap * slots;
+            // A decode row whose state is the tail of a [row outputs | state] buffer (a slot's backing): the result goes
+            // there, the new state over the old (each (sequence, head) pair reads only its own state), and the alias that
+            // follows finds it in place - a state copy per layer and token otherwise (1 MB a layer on Qwen3.5-0.8B).
+            bool inPlace = slots == 1 && nt == 1 && ns == 1 && state.IsContiguous() && state.StorageOffset == attn
+                && state.Storage.ElementCount == total && state.ElementType == DType.Float32;
+            var result = inPlace
+                ? new Tensor(new[] { total }, new[] { 1L }, state.Storage, 0)
+                : new Tensor(Allocator, DType.Float32, total);
             float* outp = TensorComputePrimitives.GetFloatPointer(result);
             // A slot older than the step's tokens stays zero, as ggml leaves it.
             if (slots > nt)
@@ -66,7 +87,9 @@ namespace TensorSharp.Models.Graph
             {
                 int seq = pair / h, head = pair % h, qh = head % hq;
                 float* s = (float*)oa + attn + ((long)seq * h + head) * perHead;
-                Buffer.MemoryCopy((float*)sa + ((long)seq * h + head) * perHead, s, perHead * sizeof(float), perHead * sizeof(float));
+                float* from = (float*)sa + ((long)seq * h + head) * perHead;
+                if (from != s)
+                    Buffer.MemoryCopy(from, s, perHead * sizeof(float), perHead * sizeof(float));
                 float* columns = stackalloc float[sv];
                 float* decay = kda ? columns : null;
                 var all = new Span<float>(s, (int)perHead);
@@ -250,13 +273,18 @@ namespace TensorSharp.Models.Graph
             CacheWindow kWindow, CacheWindow vWindow)
         {
             long heads = q.Sizes[0], d = q.Sizes[2], kvHeads = k.Sizes[0], keys = k.Sizes[1];
-            bool open = mask.Floor == 0 && (mask.Pattern == MaskPattern.None || (mask.Pattern == MaskPattern.Causal && q.Sizes[1] == 1));
+            // A padded decode window (its unwritten tail masked) runs its pattern over the written keys only.
+            bool trimmed = mask.Pattern == MaskPattern.Explicit && mask.Trimmed != MaskPattern.Explicit && mask.Keys > 0;
+            MaskPattern pattern = trimmed ? mask.Trimmed : mask.Pattern;
+            int floor = trimmed ? mask.TrimmedFloor : mask.Floor;
+            bool open = floor == 0 && (pattern == MaskPattern.None || (pattern == MaskPattern.Causal && q.Sizes[1] == 1));
             bool half = k.ElementType == DType.Float16 && v.ElementType == DType.Float16;
             if (q.Sizes[1] != 1 || !open || v.Sizes[2] != d || k.Sizes[2] != d || kvHeads == 0 || heads % kvHeads != 0
                 || q.ElementType != DType.Float32 || !(half || (k.ElementType == DType.Float32 && v.ElementType == DType.Float32))
                 || k.Strides[2] != 1 || k.Strides[1] != d || v.Strides[2] != 1 || v.Strides[1] != d
                 || k.Strides[0] != v.Strides[0] || k.Strides[0] % d != 0 || v.Sizes[1] != keys)
                 return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+            if (trimmed) keys = mask.Keys;
             Tensor packed = q.IsContiguous() ? null : Ops.NewContiguous(q);
             try
             {

@@ -130,6 +130,77 @@ public class CudaBackendTests
         AssertClose(expected, dense.GetElementsAsFloat(d0 * d1 * narrow));
     }
 
+    /// <summary>Strided copies with one or two group dimensions run as ONE launch of ts_copy4d_bytes: a head-major
+    /// permute of a prompt chunk's [rows, heads, d] and a narrowed 4D view, in F32 and F16, against the host copy.</summary>
+    [CudaTheory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void CudaStridedCopy_GroupDimsInOneLaunch_MatchHostReference(bool half, bool fourD)
+    {
+        // The copy moves raw elements, so the values are distinct bit patterns of the element width.
+        using var allocator = new CudaAllocator();
+        int width = half ? 2 : 4;
+        long[] shape = fourD ? new long[] { 3, 5, 37, 70 } : new long[] { 301, 8, 48 };
+        int count = (int)shape.Aggregate(1L, (a, b) => a * b);
+        byte[] source = new byte[count * width];
+        for (int i = 0; i < count; i++)
+            for (int b = 0; b < width; b++)
+                source[i * width + b] = (byte)((i >> (8 * b)) * 31 + b + i);
+        using var device = new Tensor(allocator, half ? DType.Float16 : DType.Float32, shape);
+        GCHandle pin = GCHandle.Alloc(source, GCHandleType.Pinned);
+        try { device.Storage.CopyToStorage(0, pin.AddrOfPinnedObject(), source.Length); }
+        finally { pin.Free(); }
+
+        // 3D: [rows, heads, d] -> [heads, rows, d] (one group dim); 4D: the last axis narrowed to [3, 44) (two).
+        using Tensor view = fourD ? device.Narrow(3, 3, 41) : device.Permute(1, 0, 2);
+        using Tensor dense = Ops.NewContiguous(view);
+        int n = (int)dense.ElementCount();
+        var expected = new byte[n * width];
+        int at = 0;
+        if (fourD)
+        {
+            for (int a = 0; a < 3; a++)
+                for (int b = 0; b < 5; b++)
+                    for (int c = 0; c < 37; c++)
+                        for (int j = 0; j < 41; j++, at++)
+                            Array.Copy(source, (((a * 5 + b) * 37 + c) * 70 + 3 + j) * width, expected, at * width, width);
+        }
+        else
+        {
+            for (int h = 0; h < 8; h++)
+                for (int r = 0; r < 301; r++)
+                    for (int c = 0; c < 48; c++, at++)
+                        Array.Copy(source, ((r * 8 + h) * 48 + c) * width, expected, at * width, width);
+        }
+        var actual = new byte[n * width];
+        pin = GCHandle.Alloc(actual, GCHandleType.Pinned);
+        try { dense.Storage.CopyFromStorage(pin.AddrOfPinnedObject(), dense.StorageOffset, actual.Length); }
+        finally { pin.Free(); }
+        Assert.Equal(expected, actual);
+    }
+
+    /// <summary>An Int32 broadcast (rotary positions repeated per head: a zero source stride) copies on the device. It had
+    /// fallen to the element-by-element host copy on every attention layer of every direct-CUDA decode step, and inside a
+    /// recorded decode step that host copy replayed the recording's positions.</summary>
+    [CudaFact]
+    public void CudaCopy_Int32Broadcast_RunsOnTheDevice()
+    {
+        using var allocator = new CudaAllocator();
+        int[] values = { 7, -3, 1 << 30, 0, 42 };
+        using var src = new Tensor(allocator, DType.Int32, values.Length);
+        src.SetElementsAsInt(values);
+        using Tensor column = src.View(values.Length, 1);
+        using Tensor rows = column.Expand(values.Length, 24);
+        using var dst = new Tensor(allocator, DType.Int32, values.Length, 24);
+        Assert.True(CudaMiniMaxH3Ops.TryCopyStrided(dst, rows));
+        int[] got = dst.GetElementsAsInt(values.Length * 24);
+        for (int t = 0; t < values.Length; t++)
+            for (int h = 0; h < 24; h++)
+                Assert.Equal(values[t], got[t * 24 + h]);
+    }
+
     [CudaFact]
     public void CudaAddmm_MatchesCpuForTransposedWeightView()
     {
@@ -2827,6 +2898,92 @@ public class CudaBackendTests
             foreach (float e in expected)
                 maxAbs = MathF.Max(maxAbs, MathF.Abs(e));
             AssertClose(expected, output.GetElementsAsFloat(rows * outDim), MathF.Max(5e-2f, maxAbs * 3e-4f));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    /// <summary>
+    /// IQ2_XS, IQ1_S and IQ1_M on the device (Qwen3.8-27B UD-IQ3_XXS keeps ffn tensors in all three): without them those
+    /// weights stayed host-backed and every product ran on the CPU (27B decode 0.7 tok/s on direct CUDA). One row runs
+    /// the vector kernel, 3 the batched one, 40 the dequantize-once F16 GEMM; the row gather reads the same decoder.
+    /// </summary>
+    [CudaTheory]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 1)]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 3)]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 40)]
+    [InlineData((int)GgmlTensorType.IQ1_S, 1)]
+    [InlineData((int)GgmlTensorType.IQ1_S, 3)]
+    [InlineData((int)GgmlTensorType.IQ1_S, 40)]
+    [InlineData((int)GgmlTensorType.IQ1_M, 1)]
+    [InlineData((int)GgmlTensorType.IQ1_M, 3)]
+    [InlineData((int)GgmlTensorType.IQ1_M, 40)]
+    public void CudaQuantizedMatmul_LowBitIQuantsMatchNativeReference(int ggmlType, int rows)
+    {
+        const int inDim = 512;
+        const int outDim = 6;
+        var type = (GgmlTensorType)ggmlType;
+        int blockBytes = type switch { GgmlTensorType.IQ2_XS => 74, GgmlTensorType.IQ1_S => 50, _ => 56 };
+        int blocks = outDim * inDim / 256;
+        byte[] weights = new byte[blocks * blockBytes];
+        for (int b = 0; b < blocks; b++)
+        {
+            int offset = b * blockBytes;
+            for (int i = 0; i < blockBytes; i++)
+                weights[offset + i] = (byte)((b * 29 + i * 13 + 7) & 0xFF);
+            float d = 0.0078125f + (b % 5) * 0.001953125f;
+            if (type == GgmlTensorType.IQ1_M)
+            {
+                // The super-block scale is an F16 split over the top nibbles of the four scale words.
+                ushort bits = BitConverter.HalfToUInt16Bits((System.Half)d);
+                for (int w = 0; w < 4; w++)
+                    weights[offset + 49 + 2 * w] = (byte)((weights[offset + 49 + 2 * w] & 0x0F) | (((bits >> (4 * w)) & 0xF) << 4));
+            }
+            else
+            {
+                WriteHalf(weights, offset, d);
+            }
+        }
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 1) * 0.011f) + MathF.Cos((r + 2) * (c + 3) * 0.005f) * 0.3f;
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x768000 + ggmlType * 64 + rows);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            Assert.True(CudaQuantizedOps.SupportsQuantizedType(ggmlType));
+            CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, host, ggmlType, inDim, outDim, weights.Length);
+            try
+            {
+                using var inputTensor = Tensor.FromArray(allocator, input);
+                using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                    output, inputTensor, cacheKey, IntPtr.Zero, ggmlType, inDim, outDim, weights.Length));
+                float[] expected = DequantizedMatmulNative(weights, type, outDim, inDim, input);
+                float maxAbs = expected.Max(MathF.Abs);
+                // The 40-row product dequantizes to F16 for the tensor-core GEMM.
+                AssertClose(expected, output.GetElementsAsFloat(rows * outDim), maxAbs * (rows >= 32 ? 2e-3f : 1e-4f) + 1e-5f);
+
+                using var indices = new Tensor(allocator, DType.Int32, 3);
+                indices.SetElementsAsInt(new[] { 5, 0, 2 });
+                using var gathered = new Tensor(allocator, DType.Float32, 3, inDim);
+                Assert.True(CudaQuantizedOps.TryGetRowsQuantizedToFloat32(
+                    gathered, cacheKey, IntPtr.Zero, ggmlType, inDim, outDim, weights.Length, indices));
+                float[] dequantized = new float[outDim * inDim];
+                NativeDequant.DequantizeToFloat32(ggmlType, weights, 0, dequantized, 0, outDim * inDim);
+                float[] rowsExpected = new[] { 5, 0, 2 }.SelectMany(r => dequantized.Skip(r * inDim).Take(inDim)).ToArray();
+                Assert.Equal(rowsExpected, gathered.GetElementsAsFloat(3 * inDim));
+            }
+            finally
+            {
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+            }
         }
         finally
         {

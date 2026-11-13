@@ -53,7 +53,7 @@ if (node >= 0)
         ? new DistributedTensorParallelGroup(new GgmlTensorParallelGroup(context), node, endpoints)
         : new DistributedLayerSplitGroup(new GgmlLayerSplitDevices(context), node, endpoints);
 }
-using var modelInstance = new Qwen4ExpModel(Path.Combine(fixture, "qwen4exp-fixture.gguf"), cuda ? BackendType.GgmlCuda : BackendType.GgmlCpu, tpGroup: group);
+using var modelInstance = ModelBase.Create(Path.Combine(fixture, "qwen4exp-fixture.gguf"), cuda ? BackendType.GgmlCuda : BackendType.GgmlCpu, tpGroup: group);
 group?.Barrier();
 if (modelInstance.IsDistributedWorker)
 {

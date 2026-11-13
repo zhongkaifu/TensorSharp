@@ -148,6 +148,14 @@ namespace TensorSharp.Graph
         /// inject [hc * n, hc] and up [lr, hc * n] weights (no per-tensor scale). Ip: n, hc, lr. Fp: eps. Results: the
         /// mix [n, rows] and the injection weights [hc, rows].</summary>
         HcRead = 6,
+        /// <summary>A prompt chunk's hyper-connection scatter: the residual streams plus the block output in every stream,
+        /// weighted by 2 * sigmoid(inject / hc). Inputs: the residual streams [hc * n, rows], the block output [n, rows]
+        /// and the read's injection weights [hc, rows]. Ip: n, hc. Result: the residual streams [hc * n, rows].</summary>
+        HcScatter = 7,
+        /// <summary>A prompt chunk's hyper-connection mix: the streams' mean of the normed rows gated by sigmoid of their
+        /// gates. Inputs: the normed streams and the gates before their sigmoid, both [hc * n, rows]. Ip: n, hc. Result:
+        /// the mix [n, rows].</summary>
+        HcMix = 8,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

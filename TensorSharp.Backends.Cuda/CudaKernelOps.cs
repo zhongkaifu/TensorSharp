@@ -217,6 +217,22 @@ namespace TensorSharp.Cuda
                 long srcRowPitch = ElementOffsetToBytes(srcStrides[rowDim], dtype);
                 long dstRowPitch = ElementOffsetToBytes(resultStrides[rowDim], dtype);
                 int groupDims = rowDim; // host-looped dims are [0, rowDim)
+
+                // Up to two group dimensions go into the same launch (a 3D/4D view of a prompt chunk had been a
+                // launch per row: ~90K launches in one Qwen3.5-9B 3.6K-token prefill on direct CUDA).
+                bool oneLaunch = groupDims is 1 or 2 && dtype != DType.Q8_0;
+                if (oneLaunch)
+                {
+                    int g1 = groupDims - 1, g0 = groupDims - 2;
+                    long n0 = g0 >= 0 ? resultSizes[g0] : 1, n1 = resultSizes[g1];
+                    long dp0 = g0 >= 0 ? ElementOffsetToBytes(resultStrides[g0], dtype) : 0, sp0 = g0 >= 0 ? ElementOffsetToBytes(srcStrides[g0], dtype) : 0;
+                    long dp1 = ElementOffsetToBytes(resultStrides[g1], dtype), sp1 = ElementOffsetToBytes(srcStrides[g1], dtype);
+                    if (resultStorage.TryCopyDeviceFrom4D(srcStorage,
+                            ElementOffsetToBytes(result.StorageOffset, dtype), ElementOffsetToBytes(src.StorageOffset, dtype),
+                            n0, n1, rowCount, innerBytes, dp0, sp0, dp1, sp1, dstRowPitch, srcRowPitch))
+                        return true;
+                }
+
                 long[] gcounter = groupDims > 0 ? new long[groupDims] : Array.Empty<long>();
 
                 while (true)

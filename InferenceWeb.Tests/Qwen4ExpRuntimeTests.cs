@@ -5,7 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Qwen3.8-Flash-Next (qwen4exp) on the shared decoder runtime against Qwen4ExpModel on the synthetic checkpoint:
+// Qwen3.8-Flash-Next (qwen4exp) on the shared decoder runtime against goldens of the deleted Qwen4ExpModel
+// (Fixtures/Qwen4ExpLegacy) on the synthetic checkpoint:
 // hyper-connections, the sigmoid-gated recurrence, gated attention, the PLE layer (its n-gram and conv
 // histories across steps) and the shared-expert MoE.
 
@@ -32,13 +33,21 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     // (the managed CPU) has no QSA layers at all.
     private string Fixture(bool qsa = true) => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-{qsa}.gguf"), indexerTopK: 64, qsa: qsa);
 
+    /// <summary>Rows the deleted Qwen4ExpModel produced on these fixtures (Fixtures/Qwen4ExpLegacy).</summary>
+    private static float[][] LegacyGolden(string name)
+    {
+        using Stream stream = typeof(Qwen4ExpRuntimeTests).Assembly.GetManifestResourceStream(
+            $"InferenceWeb.Tests.Fixtures.Qwen4ExpLegacy.{name}.json") ?? throw new FileNotFoundException(name);
+        return System.Text.Json.JsonSerializer.Deserialize<float[][]>(stream)!;
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public void RuntimeMatchesQwen4ExpModelOnTheManagedCpu(bool chunkedPrompt)
     {
         string path = Fixture(qsa: false);
-        float[][] expected = Run(() => new Qwen4ExpModel(path, BackendType.Cpu), chunkedPrompt);
+        float[][] expected = LegacyGolden(chunkedPrompt ? "script_chunked_cpu" : "script_cpu");
         float[][] actual = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt);
         // The managed executor runs the recurrent mixer's regions as fused host kernels (ManagedGraphExecutor), whose
         // results stay within 2.4e-7 of the region's own ops but round differently; through this fixture's routing
@@ -55,7 +64,7 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     public void RuntimeOnMlxMatchesQwen4ExpModel(bool chunkedPrompt)
     {
         string path = Fixture(qsa: false);
-        float[][] expected = Run(() => new Qwen4ExpModel(path, BackendType.Cpu), chunkedPrompt);
+        float[][] expected = LegacyGolden(chunkedPrompt ? "script_chunked_cpu" : "script_cpu");
         float[][] actual = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Mlx), chunkedPrompt);
         AssertClose(expected, actual, 2e-2, "mlx");
     }
@@ -75,13 +84,67 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     [InlineData(true)]
     public void RuntimeMatchesQwen4ExpModelOnGgmlCuda(bool chunkedPrompt) => MatchesOnGgml(BackendType.GgmlCuda, chunkedPrompt);
 
-    /// <summary>Qwen4ExpModel's token-span graphs (QSA layers dense below the budget) against the runtime.</summary>
+    /// <summary>Qwen4ExpModel's token-span graphs on ggml_cpu (QSA layers dense below the budget) against the runtime.</summary>
     private void MatchesOnGgml(BackendType backend, bool chunkedPrompt)
     {
         string path = Fixture();
-        float[][] expected = Run(() => new Qwen4ExpModel(path, backend), chunkedPrompt);
+        float[][] expected = LegacyGolden(chunkedPrompt ? "script_qsa_chunked_ggmlcpu" : "script_qsa_ggmlcpu");
         float[][] actual = Run(() => new Qwen4ExpRuntimeModel(path, backend), chunkedPrompt);
         AssertClose(expected, actual, 2e-2, backend.ToString());
+    }
+
+    // ---- the prefix cache: every reuse continues as a cold run of the same tokens
+
+    /// <summary>The prefix-cache contract script (every capture, clone, donation, truncation and primary conversion
+    /// compared token for token with a cold run of the same tokens) on the runtime's qwen4exp: the slot's copies carry
+    /// the PLE layer's conv and n-gram histories and the QSA indexer cache, with QSA dense and selecting past a top-k of
+    /// 8 (Qwen4ExpModel's holders were held to this by Qwen4ExpRetainedCacheTests). The accelerators run the selecting
+    /// fixture only through SparseQsaMatches: a prompt chunked where the script splits it (34 + 9 cells) picks a near-tied
+    /// block differently from one forward on Metal (1.6e-2 at the next row, with or without any reuse; exact on the CPU
+    /// backends), and this fixture's top two logits tie to 1e-4, so a greedy comparison would flip.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PrefixCacheReuseContinuesAsColdRunsOnTheManagedCpu(bool selecting) => PrefixCacheConformance(BackendType.Cpu, selecting);
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PrefixCacheReuseContinuesAsColdRunsOnGgmlCpu(bool selecting) => PrefixCacheConformance(BackendType.GgmlCpu, selecting);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(false)]
+    public void PrefixCacheReuseContinuesAsColdRunsOnGgmlMetal(bool selecting) => PrefixCacheConformance(BackendType.GgmlMetal, selecting);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(false)]
+    public void PrefixCacheReuseContinuesAsColdRunsOnGgmlCuda(bool selecting) => PrefixCacheConformance(BackendType.GgmlCuda, selecting);
+
+    private void PrefixCacheConformance(BackendType backend, bool selecting)
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-prefix-{selecting}.gguf"), indexerTopK: selecting ? 8 : 64, qsa: true);
+        using var model = new Qwen4ExpRuntimeModel(path, backend);
+        model.AttachPrefixCache(new InferenceWeb.Tests.PrefixCache.Fakes.RecordingPayloadSink());
+        // An EOS inside the shared prefix cuts the n-gram context after it; 34 + 9 cells cross a top-k of 8.
+        int[] shared = Enumerable.Range(0, 34).Select(i => i == 20 ? 255 : 3 + (i * 37) % 240).ToArray();
+        int[] suffix = Enumerable.Range(0, 9).Select(i => 7 + (i * 53) % 230).ToArray();
+        var report = InferenceWeb.Tests.PrefixCache.PrefixCacheConformanceScript.Run(new InferenceWeb.Tests.PrefixCache.ConformanceSubject
+        {
+            Name = $"qwen4exp {backend}{(selecting ? " selecting" : "")}",
+            Model = model,
+            SharedPrefix = shared,
+            Suffix = suffix,
+            DecodeTokens = 8,
+            DonateAfter = 3,
+            RewindTokens = 4,
+            // A graph leaves a slot's rows and recurrent state on the device until a sync.
+            ExpectDirtyDonations = backend != BackendType.Cpu,
+        });
+        Assert.Contains("capture", report.Ran);
+        Assert.Contains("clone x2", report.Ran);
+        Assert.Contains("donate/return/donate", report.Ran);
+        Assert.Contains("settle then clone", report.Ran);
+        Assert.Contains("primary conversion", report.Ran);
     }
 
     // ---- QSA past its dense budget: the block selection
@@ -174,6 +237,82 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         }
     }
 
+    // ---- QSA past its budget over media positions
+
+    /// <summary>
+    /// The block selection with rotary positions that are not the KV index (media spans and the text after them): a
+    /// block's pooled key turns at its first cell's recorded position and a row's indexer query at its own. Rotary scores
+    /// depend only on relative positions, so a text prompt fed at every position plus 7 (a position table, then the slot's
+    /// delta) answers as the plain prompt, through the selection (a top-k of 8 over a 40-token prompt and decode steps).
+    /// Qwen4ExpModel kept a position history for this; the runtime refused the selection once any position moved. The
+    /// rotations at other absolute angles round differently and this fixture's routing (16 random experts, top 4)
+    /// amplifies that: without QSA layers the same shift moves the rows by 4-6e-3 on the managed CPU (a table at the
+    /// plain positions answers bit for bit), and a selection misread by the shift would move them by 2e-2 or more.
+    /// </summary>
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    public void ShiftedPositionsSelectAsThePlainPrompt(BackendType backend) => ShiftedPositions(backend, 1e-2);
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(BackendType.GgmlCpu)]
+    public void ShiftedPositionsSelectAsThePlainPromptOnGgmlCpu(BackendType backend) => ShiftedPositions(backend, 1.5e-2);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(BackendType.GgmlMetal)]
+    public void ShiftedPositionsSelectAsThePlainPromptOnGgmlMetal(BackendType backend) => ShiftedPositions(backend, 1.5e-2);
+
+    private void ShiftedPositions(BackendType backend, double tolerance)
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-shift.gguf"), indexerTopK: 8, qsa: true);
+        int[] prompt = Enumerable.Range(0, 40).Select(i => 3 + (i * 37) % 240).ToArray();
+        int[] decode = Enumerable.Range(0, 10).Select(i => 5 + (i * 11) % 200).ToArray();
+        float[][] plain = PositionedRun(() => new Qwen4ExpRuntimeModel(path, backend), prompt, decode, null);
+        float[][] shifted = PositionedRun(() => new Qwen4ExpRuntimeModel(path, backend), prompt, decode, i => (i + 7, i + 7, i + 7));
+        AssertClose(plain, shifted, tolerance, $"{backend} shifted positions");
+    }
+
+    /// <summary>An image-like span (a 2 x 4 grid at one temporal position, then text continuing past it) through the
+    /// selection: the GGML backends' multi-axis rotary of the pooled keys and queries answers as the managed CPU's.</summary>
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(BackendType.GgmlCpu)]
+    public void MediaPositionsSelectAsTheManagedCpuOnGgmlCpu(BackendType backend) => MediaPositions(backend);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(BackendType.GgmlMetal)]
+    public void MediaPositionsSelectAsTheManagedCpuOnGgmlMetal(BackendType backend) => MediaPositions(backend);
+
+    private void MediaPositions(BackendType backend)
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-media.gguf"), indexerTopK: 8, qsa: true);
+        int[] prompt = Enumerable.Range(0, 40).Select(i => 3 + (i * 37) % 240).ToArray();
+        int[] decode = Enumerable.Range(0, 10).Select(i => 5 + (i * 11) % 200).ToArray();
+        // Rows 6..13 are the grid (T 6, H 6..7, W 6..9); the text after it continues at T 10 (the grid's extent).
+        (int, int, int) Position(int i) => i < 6 ? (i, i, i) : i < 14 ? (6, 6 + (i - 6) / 4, 6 + (i - 6) % 4) : (i - 4, i - 4, i - 4);
+        float[][] expected = PositionedRun(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), prompt, decode, Position);
+        float[][] actual = PositionedRun(() => new Qwen4ExpRuntimeModel(path, backend), prompt, decode, Position);
+        double[] errors = RowErrors(expected, actual);
+        // As SparseQsaMatches: one near-tied block pick a run is allowed, within a block's worth.
+        Assert.True(errors.Count(e => e >= 1.5e-2) <= 1 && errors.All(e => e < 5e-2),
+            $"{backend} media positions relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
+    }
+
+    private static float[][] PositionedRun(Func<ModelBase> create, int[] prompt, int[] decode, Func<int, (int T, int H, int W)>? position)
+    {
+        using ModelBase model = create();
+        model.ResetKVCache();
+        if (position != null)
+        {
+            var flat = new int[3 * prompt.Length];
+            for (int i = 0; i < prompt.Length; i++)
+                (flat[3 * i], flat[3 * i + 1], flat[3 * i + 2]) = position(i);
+            ((TensorSharp.Models.Architecture.IMRoPEPositionSink)model).SetMRoPEPositions(flat);
+        }
+        var rows = new List<float[]> { (float[])model.ForwardRefill(prompt).Clone() };
+        foreach (int token in decode)
+            rows.Add((float[])model.Forward(new[] { token }).Clone());
+        return rows.ToArray();
+    }
+
     // ---- speculation: the PLE histories follow a verify's accept count; the MTP head chains the stream
 
     private (string Target, string Mtp) SpecFixtures(bool qsa)
@@ -184,6 +323,26 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     /// <summary>Tensor parallelism as per-rank graphs on two simulated devices: the heads and experts split, the
     /// hyper-connections, PLE and QSA indexer whole on each rank; the same logits as one device, with QSA dense and
     /// selecting (a top-k of 8 over a 40-token prompt: every rank must pick the same blocks).</summary>
+    /// <summary>Whole-layer stages (--layer-split 2) on the managed CPU: the PLE layer, the QSA layers and the hyper-connection
+    /// streams pass stage to stage as the residual rows, and every row answers as one device's (Qwen4ExpModel's layer
+    /// placement was held to this by Qwen4ExpLayerSplitTests).</summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void StagesMatchOneDeviceOnTheManagedCpu(bool qsa, bool chunkedPrompt)
+    {
+        string path = Fixture(qsa);
+        ModelBase Staged()
+        {
+            var model = new Qwen4ExpRuntimeModel(path, BackendType.Cpu, layerSplitDegree: 2);
+            Assert.Equal(2, model.Mesh.Stages);
+            return model;
+        }
+        AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt), Run(Staged, chunkedPrompt), 1e-5,
+            $"stages2 qsa={qsa} chunked={chunkedPrompt}");
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(true, false)]
@@ -280,15 +439,11 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     private void MtpDraftsMatch(BackendType backend)
     {
         var (target, mtp) = SpecFixtures(qsa: true);
-        List<float[]> legacy, actual;
-        using (var family = new Qwen4ExpModel(target, backend))
-        {
-            family.LoadMtpDraftWeights(mtp);
-            legacy = DraftTrace(family);
-        }
+        float[][] legacy = LegacyGolden("mtp_drafts_ggmlcpu");
+        List<float[]> actual;
         using (var runtime = new Qwen4ExpRuntimeModel(target, backend, mtp))
             actual = DraftTrace(runtime);
-        double[] rel = Errors(legacy.ToArray(), actual.ToArray());
+        double[] rel = Errors(legacy, actual.ToArray());
         Assert.True(rel.All(r => r <= 3e-2), $"{backend}: draft rows relL2 from Qwen4ExpModel: {string.Join(", ", rel.Select(r => r.ToString("E2")))}");
     }
 
@@ -310,9 +465,7 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     private void DFlashFeaturesMatch(BackendType backend)
     {
         var (target, draft) = DFlashFixtures(qsa: true);
-        float[][] legacy, actual;
-        using (var family = new Qwen4ExpModel(target, backend, draftGgufPath: draft))
-            legacy = FeatureTrace(family);
+        float[][] legacy = LegacyGolden("dflash_features_ggmlcpu"), actual;
         using (var runtime = new Qwen4ExpRuntimeModel(target, backend, draft))
             actual = FeatureTrace(runtime);
         double[] rel = Errors(legacy, actual);

@@ -85,7 +85,7 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     {
         string path = Fixture();
         using ModelBase model = ModelBase.Create(path, backend);
-        Assert.IsType<Qwen4ExpModel>(model);
+        Assert.IsType<Qwen4ExpRuntimeModel>(model);
         float[][] rows = Run(model);
         for (int i = 0; i < rows.Length; i++)
         {
@@ -96,66 +96,6 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             Assert.True(norm > 1e-3, "degenerate logits");
             if (i > 0)
                 Assert.True(RelativeError(rows[i], rows[i - 1]) > 1e-3, "the step did not change the logits");
-        }
-    }
-
-    [GgmlFact(BackendType.GgmlCpu)]
-    public void TheFeatureTaps_AverageTheStreamsOfACompletedLayer_Cpu() => NativeFeatureTaps(BackendType.GgmlCpu);
-
-    [GgmlFact(BackendType.GgmlMetal)]
-    public void TheFeatureTaps_AverageTheStreamsOfACompletedLayer_Metal() => NativeFeatureTaps(BackendType.GgmlMetal);
-
-    [GgmlFact(BackendType.GgmlCuda)]
-    public void TheFeatureTaps_AverageTheStreamsOfACompletedLayer_Cuda() => NativeFeatureTaps(BackendType.GgmlCuda);
-
-    /// <summary>The DFlash feature taps of the native token span (TSGgml_Qwen4ExpSetFeatureTaps): after a tapped layer,
-    /// the mean of its hyper-connection streams lands in the tap's column block of each row. The last layer's completed
-    /// output is the residual a speculative forward already exports, so its tap must be that residual's stream mean; a
-    /// middle layer's tap fills its own block, and a block no tap names stays untouched. A prompt, a decode step and a
-    /// verify-width window alike.</summary>
-    private void NativeFeatureTaps(BackendType backend)
-    {
-        string path = Fixture(indexerTopK: 2048);
-        using ModelBase model = ModelBase.Create(path, backend);
-        var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
-        int hcDim = spec.SpecFeatureSize, nEmbd = model.Config.HiddenSize, hc = hcDim / nEmbd;
-        int last = model.Config.NumLayers - 1, vocab = model.Config.VocabSize, stride = 3 * nEmbd;
-        Assert.Equal(hcDim, hc * nEmbd);
-        foreach (int[] tokens in new[] { Prompt, new[] { Steps[0] }, new[] { Steps[1], 77, 123 } })
-        {
-            var hidden = new float[tokens.Length * hcDim];
-            float[] taps = GC.AllocateArray<float>(tokens.Length * stride, pinned: true);
-            Array.Fill(taps, float.NaN);
-            IntPtr at = System.Runtime.InteropServices.Marshal.UnsafeAddrOfPinnedArrayElement(taps, 0);
-            Assert.True(TensorSharp.GGML.GgmlBasicOps.Qwen4ExpSetFeatureTaps(new[] { 1, last }, at, stride));
-            try
-            {
-                spec.SpecForward(tokens, hidden, new float[tokens.Length * vocab], true);
-            }
-            finally
-            {
-                TensorSharp.GGML.GgmlBasicOps.Qwen4ExpSetFeatureTaps(null, IntPtr.Zero, 0);
-            }
-            double worst = 0;
-            for (int r = 0; r < tokens.Length; r++)
-            {
-                bool middleDiffers = false;
-                for (int d = 0; d < nEmbd; d++)
-                {
-                    float mean = hidden[(long)r * hcDim + d];
-                    for (int c = 1; c < hc; c++)
-                        mean += hidden[(long)r * hcDim + (long)c * nEmbd + d];
-                    mean *= 1.0f / hc;
-                    float lastTap = taps[(long)r * stride + nEmbd + d], middle = taps[(long)r * stride + d];
-                    worst = Math.Max(worst, Math.Abs(lastTap - mean) / Math.Max(1.0, Math.Abs(mean)));
-                    Assert.True(float.IsFinite(middle), $"T={tokens.Length} row {r}: the middle tap left its block unwritten");
-                    Assert.True(float.IsNaN(taps[(long)r * stride + 2 * nEmbd + d]), $"T={tokens.Length} row {r}: a tap wrote past its slot");
-                    middleDiffers |= middle != lastTap;
-                }
-                Assert.True(middleDiffers, $"T={tokens.Length} row {r}: the middle tap repeats the last layer's");
-            }
-            _output.WriteLine($"T={tokens.Length}: last-layer tap vs the exported streams' mean, worst relative error {worst:E2}");
-            Assert.True(worst <= 1e-6, $"T={tokens.Length}: the last layer's tap is not its streams' mean ({worst:E2})");
         }
     }
 
@@ -177,16 +117,17 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             "the one-row capture is not the full capture's last row");
     }
 
+    /// <summary>The shared runtime verifies a window as one batched forward on every GGML backend, which rounds its
+    /// activations unlike its decode steps (ggml_cpu: 1.4e-4 measured; Qwen4ExpModel's one-token row kernels were exact).
+    /// </summary>
     [GgmlFact(BackendType.GgmlCpu)]
-    public void VerifyWindowsOfChangingWidth_CommitAsPlainDecode_Cpu() => NativeChangingWidths(BackendType.GgmlCpu, 1e-5);
+    public void VerifyWindowsOfChangingWidth_CommitAsPlainDecode_Cpu() => NativeChangingWidths(BackendType.GgmlCpu, 2e-3);
 
-    /// <summary>Metal verifies a window as one batched forward, which does not round like its decode steps.</summary>
     [GgmlFact(BackendType.GgmlMetal)]
     public void VerifyWindowsOfChangingWidth_CommitAsPlainDecode_Metal() => NativeChangingWidths(BackendType.GgmlMetal, 2e-2);
 
-    /// <summary>ggml_cuda verifies with the one-token kernels per row (exact).</summary>
     [GgmlFact(BackendType.GgmlCuda)]
-    public void VerifyWindowsOfChangingWidth_CommitAsPlainDecode_Cuda() => NativeChangingWidths(BackendType.GgmlCuda, 1e-5);
+    public void VerifyWindowsOfChangingWidth_CommitAsPlainDecode_Cuda() => NativeChangingWidths(BackendType.GgmlCuda, 2e-2);
 
     /// <summary>Verify windows of changing width on the native token span, some partly accepted (committed from the
     /// window's own per-row states), against a plain decode of the same tokens. Each width keeps its own persisted graph,
@@ -1266,48 +1207,6 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     [GgmlFact(BackendType.GgmlCpu)]
     public void TheMtpFixture_DraftsOnTheNativeHead_Cpu() => NativeMtpSmoke(BackendType.GgmlCpu);
 
-    /// <summary>
-    /// A draft-head catch-up whose graph does not fit the device goes in halves (on ggml_cuda after four concurrent
-    /// requests, a 1,045-row prompt chunk's catch-up asked 1.29 GB and the request failed). The seam takes that branch
-    /// for every forward past 4 rows: the 40-token catch-up runs as sixteen forwards of 2 or 3 rows, the head's position
-    /// covers the prompt (the next step is no gap), and the chained draft answers as after one 40-row forward.
-    /// </summary>
-    [GgmlFact(BackendType.GgmlCuda)]
-    public void TheDraftHeadCatchUp_InHalves_AnswersAsOneForward_GgmlCuda()
-    {
-        string path = Fixture(indexerTopK: 2048);
-        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
-        (float[] Logits, float[] Streams) Draft(int maxRows)
-        {
-            Qwen4ExpModel.MtpForwardRowsForTest = maxRows;
-            try
-            {
-                using ModelBase model = ModelBase.Create(path, BackendType.GgmlCuda, draftModelPath: mtp);
-                var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
-                var head = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.IDraftHead>(model);
-                int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
-                var hidden = new float[Prompt.Length * feat];
-                spec.SpecForward(Prompt, hidden, new float[Prompt.Length * vocab], true);
-                var rows = new float[Prompt.Length * feat];
-                Array.Copy(hidden, 0, rows, feat, (Prompt.Length - 1) * feat);
-                head.DraftCatchUp(Prompt, rows, 0);
-                var logits = new float[vocab];
-                var streams = new float[feat];
-                head.DraftStep(Steps[0], hidden.AsSpan((Prompt.Length - 1) * feat, feat).ToArray(), Prompt.Length, logits, streams);
-                return (logits, streams);
-            }
-            finally { Qwen4ExpModel.MtpForwardRowsForTest = 0; }
-        }
-        var whole = Draft(0);
-        var halves = Draft(4);
-        double num = 0, den = 0;
-        for (int i = 0; i < whole.Logits.Length; i++) { double d = halves.Logits[i] - whole.Logits[i]; num += d * d; den += (double)whole.Logits[i] * whole.Logits[i]; }
-        double rel = Math.Sqrt(num / Math.Max(den, 1e-30));
-        _output.WriteLine($"draft logits after a halved catch-up vs one forward: relative L2 {rel:E3}, argmax {ArgMax(halves.Logits)} vs {ArgMax(whole.Logits)}");
-        Assert.All(halves.Logits, v => Assert.True(float.IsFinite(v)));
-        Assert.Equal(ArgMax(whole.Logits), ArgMax(halves.Logits));
-        Assert.True(rel < 1e-2, $"a catch-up in halves drafts {rel:E3} away from one forward");
-    }
 
     [GgmlFact(BackendType.GgmlMetal)]
     public void TheMtpFixture_DraftsOnTheNativeHead_Metal() => NativeMtpSmoke(BackendType.GgmlMetal);

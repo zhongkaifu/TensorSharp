@@ -32,7 +32,52 @@ namespace TensorSharp.Models
         /// 8.99 s at 31 GB). Elsewhere the scheduler's own steps (0).
         /// </summary>
         public int PreferredSoloPrefillTokens(int start, int remaining)
-            => _backend == BackendType.Mlx ? Math.Min(remaining, MlxPromptStepTokens) : 0;
+            => _backend switch
+            {
+                BackendType.Mlx => Math.Min(remaining, MlxPromptStepTokens),
+                BackendType.Cuda => CudaPromptStepTokens(remaining),
+                _ => 0,
+            };
+
+        /// <summary>Device memory a direct-CUDA prompt step keeps beside its rows' activations (cuBLAS workspace, the
+        /// dequantized-weight and activation scratch).</summary>
+        private const long CudaPromptReserveBytes = 768L << 20;
+
+        /// <summary>
+        /// On direct CUDA a lone prompt prefills in steps whose activations fit the device memory the weights and caches
+        /// leave: the tensor executor allocates a layer's activations as it runs, and a step that runs out part way has
+        /// already written some layers' cache rows and states, so it is not retried (Qwen3.8-27B UD-IQ3_XXS, 10.5 GB
+        /// resident on a 16 GB RTX 2000 Ada, ran out on a 3.6K-token prompt in one step). The scheduler's own step (0)
+        /// where the whole remainder fits.
+        /// </summary>
+        private int CudaPromptStepTokens(int remaining)
+        {
+            if (_allocator is not TensorSharp.Cuda.CudaAllocator cuda || remaining <= 256) return 0;
+            // Sized once, from the memory the first lone prompt finds beside the weights: a budget read at every prompt
+            // followed what earlier requests' caches happened to hold, so the same prompt split differently from one
+            // request to the next (and a near-tied first token flipped with the split's rounding).
+            if (_cudaPromptRows == 0)
+            {
+                long free;
+                try { free = cuda.GetMemoryInfo().freeBytes + cuda.GetStats().CachedBytes; }
+                catch (Exception) { return 0; }
+                _cudaPromptRows = (int)Math.Clamp((free - CudaPromptReserveBytes) / CudaPromptRowBytes() / 256 * 256, 256, int.MaxValue);
+            }
+            return remaining <= _cudaPromptRows ? 0 : _cudaPromptRows;
+        }
+
+        private int _cudaPromptRows;
+
+        /// <summary>A prompt row's activations at their peak, in bytes: the feed-forward's (gate and up, their product,
+        /// the dequantized products' F16 copies) and some dozen hidden-wide rows (the stream, norms, projections), F32.</summary>
+        private long CudaPromptRowBytes()
+        {
+            long ff = Config.IntermediateSize;
+            foreach (var stacked in _stackedExpertWeights.Values)
+                ff = Math.Max(ff, stacked.PerExpertNe1 * Math.Max(1, _expertsUsed));
+            long width = Math.Max(Config.HiddenSize, StreamWidth);
+            return 4L * (6 * ff + 48 * width);
+        }
 
         public int EnsureSequenceSlot(string requestId, int reserveTokens)
         {

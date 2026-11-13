@@ -606,13 +606,28 @@ public sealed class Qwen35RuntimeTests : IDisposable
     }
 
     /// <summary>A decode step that repeats the last one a position on runs again without a trace: every logit is the
-    /// traced step's, for one request and for two in one step, across a decode window's bucket edge. (An executor
-    /// whose plans are not replayed, the managed CPU, traces every step anyway.)</summary>
+    /// traced step's, for one request and for two in one step, across a decode window's bucket edge.</summary>
     [Theory]
     [InlineData("dense")]
     [InlineData("moe")]
     public void AdvancedDecodeStepsMatchTracedOnes(string variant)
         => AssertAdvancedDecodeMatchesTraced(variant, path => Create(path, backend: TestGates.PinnedGgmlBackend));
+
+    /// <summary>The same on the managed tensor executor, whose steps stream: a decode step that could advance runs as
+    /// the recorded program, so the next one advances instead of emitting every node again.</summary>
+    [Theory]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void AdvancedDecodeStepsMatchTracedOnesOnTheManagedExecutor(string variant)
+        => AssertAdvancedDecodeMatchesTraced(variant, path => Create(path, backend: BackendType.Cpu));
+
+    /// <summary>The same on direct CUDA, where a lone request's advanced steps are recorded as one CUDA graph and
+    /// replayed (attention length and cache write row read on the device): every logit is still the traced step's.</summary>
+    [CudaTheory]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void AdvancedDecodeStepsMatchTracedOnesOnDirectCuda(string variant)
+        => AssertAdvancedDecodeMatchesTraced(variant, path => Create(path, backend: BackendType.Cuda));
 
     /// <summary>The same over per-rank graphs on two ggml_cuda GPUs: every rank's step advances in place and the ranks run
     /// together without a trace.</summary>

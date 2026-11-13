@@ -143,7 +143,6 @@ public sealed class ServingContractConformanceTests
         "nemotron_h: TensorParallel+batching@cuda",
         "nemotron_h: TensorParallel+batching@ggml_cuda",
         "nemotron_h: TensorParallel+batching@ggml_vulkan",
-        "qwen4exp: ContinuousBatching@cpu",
         "qwen4exp: ExpertOffload@cuda",
         "qwen4exp: HybridParallel@cuda",
         "qwen4exp: HybridParallel@ggml_cuda",

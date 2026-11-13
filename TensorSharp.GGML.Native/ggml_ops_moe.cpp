@@ -2268,6 +2268,17 @@ namespace tsg
     bool moe_stage_prefetch_enabled() { return stage_prefetch_enabled_impl(); }
     void moe_stage_prefetch_start(const HostMoeSegment& hm) { stage_prefetch_start_impl(hm); }
     void moe_stage_prefetch_join() { stage_prefetch_join_impl(); }
+    // A pass's end: the staging threads joined and every stack its seams did not take retired. A later pass (another
+    // model's, whose experts may be mapped at the same addresses) stages its own; it never takes one staged for this.
+    void moe_stage_prefetch_retire()
+    {
+        stage_prefetch_join_impl();
+        for (StagePrefetch& s : g_stage_prefetch)
+        {
+            s.active = false;
+            s.src[0] = s.src[1] = s.src[2] = nullptr;
+        }
+    }
     bool moe_stage_prefetch_take(const void* gate, const void* up, const void* down, ggml_backend_buffer_t& buf,
                                  std::size_t offset[3], std::size_t bytes[3])
     { return stage_prefetch_take_impl(gate, up, down, buf, offset, bytes); }
@@ -3032,7 +3043,7 @@ namespace tsg
 
         // Prompt-sized passes: stage the next offloaded layer's experts while the accelerator runs (see
         // moe_stage_prefetch_start); every staging thread is joined before this returns.
-        struct PrefetchJoin { ~PrefetchJoin() { moe_stage_prefetch_join(); } } prefetch_join;
+        struct PrefetchJoin { ~PrefetchJoin() { moe_stage_prefetch_retire(); } } prefetch_join;
         const int stream_threshold = moe_offload_stream_batch_threshold();
         // The next host-expert segment at or after i (device operations have no experts to stage).
         auto next_host = [&](std::size_t i) {

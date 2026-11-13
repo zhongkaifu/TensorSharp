@@ -1,7 +1,18 @@
 # Qwen3.8-Flash-Next (`qwen4exp`) on the shared decoder runtime
 
-Status: steps 1 to 3 of §3 and QSA (dense and sparse) are in (`Qwen4ExpRuntimeModel`, not routed yet). `Qwen4ExpModel` and its engines
-stay until the runtime matches them.
+Status (2026-11-13): done. `Qwen4ExpRuntimeModel` serves every backend but `--backend cuda` (the direct engine,
+`Qwen4ExpCudaModel`), and `Qwen4ExpModel` with its native token span, arenas and switches is removed. Its goldens on the
+synthetic fixtures (`InferenceWeb.Tests/Fixtures/Qwen4ExpLegacy`) replace the comparisons below. What the removal
+needed beyond the steps below:
+
+- the Metal hyper-connection scatter and mix as fused regions (`GraphFusion.HcScatter`, `HcMix`: 4K prompt 4.1 -> 3.95 s,
+  at `Qwen4ExpModel`'s);
+- the PLE rows of a prompt's next chunk read while the current one computes;
+- the verify-width tier overlap;
+- resident layers' routes recorded on a profiling load (discrete GPUs);
+- converted coefficients loaded as F32;
+- QSA over media positions: each slot records the rotary positions of its recent cells;
+- tiers released on dispose (they had outlived the model).
 
 **Done (2026-11-11).** `Qwen4ExpRuntimeModel` derives from `Qwen35RuntimeModel` and adds only the family's own
 parts: the hyper-connection hooks (§2.1), the sigmoid output gate of the recurrence (§2.2), the PLE layer (§2.4)

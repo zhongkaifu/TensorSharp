@@ -16,7 +16,7 @@ namespace TensorSharp.Cuda
     /// The direct CUDA backend's executor plugin: programs run node by node on CUDA tensors, with the
     /// backend's quantized products (weights resident under their device cache keys).
     /// </summary>
-    public sealed class CudaGraphExecutor : TensorGraphExecutor
+    public sealed class CudaGraphExecutor : TensorGraphExecutor, IDecodeCaptureExecutor
     {
         [ModuleInitializer]
         internal static void Register()
@@ -25,11 +25,19 @@ namespace TensorSharp.Cuda
         public CudaGraphExecutor(IAllocator allocator) : base(allocator) { }
 
         /// <summary>The base executor's capabilities, and a decode row's recurrence updates its state in place (see
-        /// <see cref="GatedDeltaNet"/>).</summary>
+        /// <see cref="GatedDeltaNet"/>); decode steps replay their program a position on over windows padded to 256 rows,
+        /// whose unwritten keys the attention stops before (<see cref="FlashAttention"/>), and record as one CUDA graph
+        /// (<see cref="OpenDecodeCapture"/>).</summary>
         public override GraphCapabilities Capabilities { get; } = new()
         {
-            StridedViews = true, DecodeWindowRows = 1, Replays = false, IndexedCacheWrites = true, InPlaceStateAlias = true,
+            StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
         };
+
+        /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
+        protected override bool BroadcastsPositionsOnDevice => true;
+
+        public IDecodeCapture OpenDecodeCapture()
+            => Allocator is CudaAllocator cuda ? new RuntimeDecodeCapture(cuda) : null;
 
         /// <summary>CUDA's binary kernels take same-shaped contiguous operands: a broadcast operand is gathered.</summary>
         protected override bool BroadcastsInKernels => false;
@@ -91,14 +99,17 @@ namespace TensorSharp.Cuda
         protected override Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
             CacheWindow kWindow, CacheWindow vWindow)
         {
-            if (kWindow == null || vWindow == null || mask.Pattern == MaskPattern.Explicit || q.ElementType != DType.Float32
+            // A padded decode window (its unwritten tail masked) runs its pattern over the written keys only.
+            bool trimmed = mask.Pattern == MaskPattern.Explicit && mask.Trimmed != MaskPattern.Explicit && mask.Keys > 0;
+            if (kWindow == null || vWindow == null || (mask.Pattern == MaskPattern.Explicit && !trimmed) || q.ElementType != DType.Float32
                 || q.DimensionCount != 3 || k.DimensionCount is < 2 or > 3 || v.DimensionCount is < 2 or > 3
                 || kWindow.Cache.DimensionCount is < 2 or > 3 || vWindow.Cache.DimensionCount is < 2 or > 3
                 || k.Sizes[^1] != v.Sizes[^1])
                 return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
             int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2];
             // A single KV head's window and cache bind without their head extent.
-            int kvHeads = k.DimensionCount == 3 ? (int)k.Sizes[0] : 1, len = (int)k.Sizes[^2], floor = mask.Floor;
+            int kvHeads = k.DimensionCount == 3 ? (int)k.Sizes[0] : 1;
+            int len = trimmed ? mask.Keys : (int)k.Sizes[^2], floor = trimmed ? mask.TrimmedFloor : mask.Floor;
             using Tensor kc = HeadFirst(kWindow.Cache), vc = HeadFirst(vWindow.Cache);
             int cap = (int)kc.Sizes[1];
             using Tensor qc = q.IsContiguous() ? q.CopyRef() : Ops.NewContiguous(q);
@@ -142,7 +153,7 @@ namespace TensorSharp.Cuda
                     using Tensor below = perHead.Narrow(2, 0, Math.Min(floor, len));
                     Ops.Fill(below, float.NegativeInfinity);
                 }
-                if (mask.Pattern == MaskPattern.Causal) Ops.AddCausalMask(perHead, rows, len - nq + first, float.NegativeInfinity);
+                if ((trimmed ? mask.Trimmed : mask.Pattern) == MaskPattern.Causal) Ops.AddCausalMask(perHead, rows, len - nq + first, float.NegativeInfinity);
                 Ops.Softmax(perHead, perHead);
                 using var attn = new Tensor(Allocator, DType.Float32, kvHeads, (long)group * rows, d);
                 if (!CudaHalfOperandGemm.TryAddmmBatch(attn, 0, attn, 1.0f, scores, vx)) Ops.AddmmBatch(attn, 0, attn, 1.0f, scores, vx);

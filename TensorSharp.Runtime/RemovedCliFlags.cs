@@ -332,6 +332,39 @@ namespace TensorSharp.Runtime
             ("TS_Q4E_SPAN_ATTN",
                 "Qwen 3.8 attention layers always run inside the token-span graph; the per-layer attention "
                 + "split was removed."),
+            // Qwen 3.8 Flash Next's own GGML implementation (Qwen4ExpModel) was removed: the shared decoder runtime serves
+            // every backend but --backend cuda (the direct engine, whose TS_Q4E_* switches stay).
+            ("TS_Q4E_ARENA_BATCHED_ATTN", Qwen4ExpModelRemoved),
+            ("TS_Q4E_ARENA_BATCHED_GDN", Qwen4ExpModelRemoved),
+            ("TS_Q4E_DEBUG_SPAN_INPUT", Qwen4ExpModelRemoved),
+            ("TS_Q4E_DEBUG_SPAN_INPUT_LAYER", Qwen4ExpModelRemoved),
+            ("TS_Q4E_DEBUG_SPAN_LAYERS", Qwen4ExpModelRemoved),
+            ("TS_Q4E_DISABLE_ARENA_DECODE", Qwen4ExpModelRemoved),
+            ("TS_Q4E_DRIVER_DUMP", Qwen4ExpModelRemoved),
+            ("TS_Q4E_DRIVER_TRACE", Qwen4ExpModelRemoved),
+            ("TS_Q4E_EXPERT_CACHE_CAPTURE_DIR", Qwen4ExpModelRemoved),
+            ("TS_Q4E_EXPERT_CACHE_REFERENCE_DIR", Qwen4ExpModelRemoved),
+            ("TS_Q4E_GDN_VERIFY", Qwen4ExpModelRemoved),
+            ("TS_Q4E_LAYER_SPLIT", Qwen4ExpModelRemoved),
+            ("TS_Q4E_LOG", Qwen4ExpModelRemoved),
+            ("TS_Q4E_METAL_FUSE", Qwen4ExpModelRemoved),
+            ("TS_Q4E_NODE_DUMP", Qwen4ExpModelRemoved),
+            ("TS_Q4E_NODE_DUMP_LAYER", Qwen4ExpModelRemoved),
+            ("TS_Q4E_PLE_PREFETCH", Qwen4ExpModelRemoved),
+            ("TS_Q4E_PREFILL_COMBINE", Qwen4ExpModelRemoved),
+            ("TS_Q4E_PROFILE", Qwen4ExpModelRemoved),
+            ("TS_Q4E_PROMPT_SPAN_CAP", Qwen4ExpModelRemoved),
+            ("TS_Q4E_QSA_POOL_CACHE", Qwen4ExpModelRemoved),
+            ("TS_Q4E_QSA_SPARSE_FA", Qwen4ExpModelRemoved),
+            ("TS_Q4E_SNAPSHOT_GPU", Qwen4ExpModelRemoved),
+            ("TS_Q4E_SPAN_TRACE", Qwen4ExpModelRemoved),
+            ("TS_Q4E_TEST_BATCHED_VERIFY", Qwen4ExpModelRemoved),
+            ("TS_Q4E_TEST_MMVQ_CHANNELS", Qwen4ExpModelRemoved),
+            ("TS_Q4E_VERIFY_ROW_COMMIT", Qwen4ExpModelRemoved),
+            ("TS_Q4E_VERIFY_ROW_KERNELS", Qwen4ExpModelRemoved),
+            ("TS_Q4E_VISION_MERGER_ERF",
+                "Qwen 3.8 Flash Next's vision merger keeps its tanh GELU (the shipped projector's validated default); the "
+                + "erf opt-in of the removed Qwen4ExpModel was removed."),
             ("TS_GGML_TP_FUSED_MATMUL",
                 "the single-thread multi-rank linear it engaged (never the default) allocated a device buffer per rank "
                 + "per call and measured 2.3x slower on Qwen 3.5 35B (ggml_cuda --tp 2); local TP always runs the per-rank path."),
@@ -428,6 +461,10 @@ namespace TensorSharp.Runtime
         private const string DefaultPathSwitchRemoved =
             "the path it switched off always runs where the backend supports it (its fallback still serves the "
             + "shapes it declines); the switch was removed.";
+
+        private const string Qwen4ExpModelRemoved =
+            "Qwen 3.8 Flash Next runs on the shared decoder runtime on the GGML backends and cpu; the switch of the "
+            + "removed Qwen4ExpModel (its token span, arenas and holders) was removed with it.";
 
         private const string ExperimentRemoved =
             "the experimental path it selected (never the default) was removed.";

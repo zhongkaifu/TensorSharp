@@ -3419,7 +3419,6 @@ extern "C" void TSGgml_Gemma4ResetBatchedDecodeCache();
 extern "C" void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
 extern "C" void TSGgml_GptOssResetDecodeCache();
 extern "C" void TSGgml_GptOssResetBatchedDecodeCache();
-extern "C" void TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
 extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
 extern "C" void TSGgml_MuseGlimmerResetDecodeCache();
 extern "C" void TSGgml_DFlashResetCaches();
@@ -3445,7 +3444,6 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // The slot-stable arena pools bind resident weight buffers this wipe is
     // about to free; their captured graphs must not survive it.
     TSGgml_GptOssResetBatchedDecodeCache();
-    TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
     // Drop any persistent whole-model graphs first: they bind weights resident by
     // GGUF pointer (shared via these caches), so freeing the caches below would leave
     // their captured graphs pointing at freed device memory.
@@ -3609,7 +3607,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     // (null, null) drops every window.
     TSGgml_GptOssResetDecodeCache();
     TSGgml_GptOssResetBatchedDecodeCache();
-    TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
     TSGgml_GptOssInvalidateKvCache(nullptr, nullptr);
     // Same contract for the other whole-model graph caches: each parks a ggml
     // context + backend buffer that must be released before the backend is.
@@ -4039,9 +4036,6 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     // without every call site having to know about both.
     TSGgml_GptOssInvalidateKvCache(ptr, nullptr);
 
-    // Same contract for the qwen4exp arena: this host pointer's bytes changed (or
-    // are being freed) behind the kernels — its arena slot, if any, is stale.
-    tsg_q4earena::on_drop(ptr);
     tsg_graphtp::on_drop(ptr);
     // A mapped expert's address can be recycled by a subsequent model load.
     // Compact expert slots have their own allocations, so they must be dropped
@@ -4076,7 +4070,6 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_GptOssResetDecodeCache();
     TSGgml_GptOssResetBatchedDecodeCache();
-    TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
     // Muse-Glimmer's persistent decode graphs bind the KV device copies the same
     // way. Its C# side resets them around its own grow/truncate/inject, but the
     // per-op fallback invalidates the caches it writes without doing so.

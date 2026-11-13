@@ -258,10 +258,14 @@ namespace TensorSharp.Graph
             private readonly Func<Tensor> _make;
             private Tensor _tensor;
 
-            public AttentionMask(MaskPattern pattern, int floor, Func<Tensor> make)
+            public AttentionMask(MaskPattern pattern, int floor, Func<Tensor> make, int keys = -1,
+                MaskPattern trimmed = MaskPattern.Explicit, int trimmedFloor = 0)
             {
                 Pattern = pattern;
                 Floor = floor;
+                Keys = keys;
+                Trimmed = trimmed;
+                TrimmedFloor = trimmedFloor;
                 _make = make;
             }
 
@@ -271,6 +275,16 @@ namespace TensorSharp.Graph
             public bool HasTensor => _make != null;
             public MaskPattern Pattern { get; }
             public int Floor { get; }
+
+            /// <summary>Keys before the trailing ones every query masks (a padded decode window's unwritten cells), -1 when
+            /// unknown.</summary>
+            public int Keys { get; }
+
+            /// <summary>The pattern over keys [<see cref="TrimmedFloor"/>, <see cref="Keys"/>) alone (nothing past Keys is
+            /// attended), for a kernel that stops at Keys: a padded window's causal mask is Explicit over the whole window
+            /// but causal over its written cells.</summary>
+            public MaskPattern Trimmed { get; }
+            public int TrimmedFloor { get; }
 
             public static readonly AttentionMask None = new(MaskPattern.None, 0, null);
         }
@@ -288,11 +302,20 @@ namespace TensorSharp.Graph
                 if (!all) break;
                 floor++;
             }
+            // The trailing keys every query masks (a padded window's unwritten cells): the pattern is judged before them.
+            long valid = keys;
+            while (valid > floor)
+            {
+                bool all = true;
+                for (long r = 0; r < rows && all; r++) all = float.IsNegativeInfinity(host[r * keys + valid - 1]);
+                if (!all) break;
+                valid--;
+            }
             bool none = true, causal = true;
             for (long r = 0; r < rows && (none || causal); r++)
             {
-                long last = keys - rows + r;   // the last key row r sees when causal
-                for (long c = floor; c < keys; c++)
+                long last = valid - rows + r;   // the last key row r sees when causal
+                for (long c = floor; c < valid; c++)
                 {
                     float m = host[r * keys + c];
                     none &= m == 0f;
@@ -300,7 +323,12 @@ namespace TensorSharp.Graph
                 }
             }
             MaskPattern pattern = none ? MaskPattern.None : causal ? MaskPattern.Causal : MaskPattern.Explicit;
-            return new AttentionMask(pattern, pattern == MaskPattern.Explicit ? 0 : floor, mask);
+            int trimmedFloor = pattern == MaskPattern.Explicit ? 0 : floor;
+            // Over fewer keys than the window the pattern holds only for kernels that stop at Keys (Trimmed); for every
+            // other reader the mask stays Explicit, as it was.
+            if (pattern != MaskPattern.Explicit && valid < keys)
+                return new AttentionMask(MaskPattern.Explicit, 0, mask, (int)valid, pattern, trimmedFloor);
+            return new AttentionMask(pattern, trimmedFloor, mask, (int)valid, pattern, trimmedFloor);
         }
 
         private sealed class RunState
@@ -979,6 +1007,10 @@ namespace TensorSharp.Graph
         /// without the alias's copy (the executor shares the result's memory); false runs the copy.</summary>
         protected virtual bool TryAlias(Tensor result, Tensor leaf, long offsetBytes) => false;
 
+        /// <summary>Rotary positions per row are a broadcast of the positions tensor on the device, not an upload of
+        /// host values per step (a backend whose recorded steps must read their positions from the device).</summary>
+        protected virtual bool BroadcastsPositionsOnDevice => false;
+
         /// <summary>Whether this executor has a kernel for regions of <paramref name="kind"/> (its sessions then
         /// defer the region's ops).</summary>
         protected virtual bool Fuses(GraphFusion kind) => false;
@@ -1011,7 +1043,49 @@ namespace TensorSharp.Graph
             (IntPtr data, long bytes, object handle) = input;
             if (handle is Tensor given)
                 return new Value { Tensor = Shaped(given, leaf.Ne, run) };
+            if (handle is StableInput stable)
+            {
+                // The device copy a captured step binds; the host values still classify a mask and feed host reads.
+                Value host = HostValues(leaf.Format, leaf.Ne, data, bytes);
+                return host with { Tensor = Shaped(stable.Device, leaf.Ne, run) };
+            }
             return FromHost(leaf.Format, leaf.Ne, data, bytes, run);
+        }
+
+        /// <summary>A host input's values alone (no tensor): F32/F16 as floats, I32/I64 as ints.</summary>
+        private static unsafe Value HostValues(int format, long[] ne, IntPtr data, long bytes)
+        {
+            long[] sizes = Sizes(ne);
+            long count = 1;
+            foreach (long s in sizes) count *= s;
+            switch (format)
+            {
+                case GraphFormat.F32:
+                {
+                    var values = new float[count];
+                    fixed (float* dst = values) Buffer.MemoryCopy((void*)data, dst, count * 4L, Math.Min(bytes, count * 4L));
+                    return new Value { Floats = values, HostSizes = sizes };
+                }
+                case GraphFormat.F16:
+                {
+                    var values = new float[count];
+                    var src = (System.Half*)data;
+                    for (long i = 0; i < count; i++) values[i] = (float)src[i];
+                    return new Value { Floats = values, HostSizes = sizes };
+                }
+                case GraphFormat.I32:
+                case GraphFormat.I64:
+                {
+                    var values = new int[count];
+                    if (format == GraphFormat.I32)
+                        fixed (int* dst = values) Buffer.MemoryCopy((void*)data, dst, count * 4L, Math.Min(bytes, count * 4L));
+                    else
+                        for (long i = 0; i < count; i++) values[i] = checked((int)((long*)data)[i]);
+                    return new Value { Ints = values };
+                }
+                default:
+                    throw new NotSupportedException($"input format {format}");
+            }
         }
 
         // ================================================================ shapes
@@ -1796,10 +1870,26 @@ namespace TensorSharp.Graph
             {
                 if (!run.RowPositions.TryGetValue((positionsNode, heads), out Tensor p) || positionsNode < 0)
                 {
-                    var perRow = new int[tokens * heads];
-                    for (int t = 0; t < tokens; t++)
-                        for (int h = 0; h < heads; h++) perRow[t * heads + h] = pos[t];
-                    p = run.KeepLasting(NewIntTensor(perRow, new long[] { perRow.Length }));
+                    Tensor device = positions.Tensor;
+                    if (BroadcastsPositionsOnDevice && device != null && device.ElementType == DType.Int32 && device.IsContiguous()
+                        && ReferenceEquals(device.Allocator, Allocator) && device.ElementCount() >= tokens)
+                    {
+                        // Every row of a token takes its position: a broadcast copy of the positions already on the
+                        // device (no upload per step, so a recorded decode step reads the positions it is given).
+                        p = run.KeepLasting(new Tensor(Allocator, DType.Int32, (long)tokens * heads));
+                        using Tensor first = device.View(device.ElementCount()).Narrow(0, 0, tokens);
+                        using Tensor column = first.View(tokens, 1);
+                        using Tensor rows = column.Expand(tokens, heads);
+                        using Tensor target = p.View(tokens, heads);
+                        Ops.Copy(target, rows);
+                    }
+                    else
+                    {
+                        var perRow = new int[tokens * heads];
+                        for (int t = 0; t < tokens; t++)
+                            for (int h = 0; h < heads; h++) perRow[t * heads + h] = pos[t];
+                        p = run.KeepLasting(NewIntTensor(perRow, new long[] { perRow.Length }));
+                    }
                     if (positionsNode >= 0) run.RowPositions[(positionsNode, heads)] = p;
                 }
                 if (KernelsReadStridedViews)

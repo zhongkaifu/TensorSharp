@@ -61,7 +61,7 @@ public sealed class TextLoraPlanTests : IDisposable
         // Each opted-in family names the weights it applies a delta to; none relies on a default.
         Assert.All(models.Where(t => Overrides(t, "SupportsTextLora")), t => Assert.True(OverridesMethod(t, "TextLoraWeightRefusal"), t.Name));
         // The families the review tested, by name: they never call the hook on every path.
-        foreach (string name in new[] { "DeepSeek41Model", "DeepSeek4Model", "Qwen35RuntimeModel", "Qwen35CudaModel", "Gemma4Model", "Qwen4ExpModel", "GptOssModel" })
+        foreach (string name in new[] { "DeepSeek41Model", "DeepSeek4Model", "Qwen35RuntimeModel", "Qwen35CudaModel", "Gemma4Model", "Qwen4ExpRuntimeModel", "GptOssModel" })
             Assert.DoesNotContain(name, optedIn);
         Assert.Contains(models, t => t.Name == "DeepSeek41Model");
     }
@@ -194,7 +194,7 @@ public sealed class TextLoraPlanTests : IDisposable
     public void AFamilyThatHasNotOptedIn_RefusesLive()
     {
         string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"), contextLength: 128);
-        using var model = new Qwen4ExpModel(path, BackendType.Cpu);
+        using var model = new Qwen4ExpRuntimeModel(path, BackendType.Cpu);
         var adapter = Adapter("q", ("blk.3.attn_q.weight", 2, 8, 8), ("output.weight", 2, 8, 8));
 
         var plan = model.PlanTextLora(adapter);

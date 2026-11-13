@@ -1299,6 +1299,10 @@ namespace TensorSharp.Models
             ClearGraphCache();
             DisposeRecurrentStates();
             DropPendingMedia();
+            // The routing profile is saved and the accelerator tiers freed with the graphs gone and before the stacked experts
+            // are: a tier outliving its model served the next model mapped at the same addresses (and leaked its buffers).
+            DetachRoutingProfile();
+            ReleaseExpertTiers();
         }
     }
 }

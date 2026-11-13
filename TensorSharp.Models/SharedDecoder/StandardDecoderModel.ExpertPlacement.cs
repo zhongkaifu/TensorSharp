@@ -330,11 +330,16 @@ namespace TensorSharp.Models
             if (moeLayers.Count == 0)
                 return false;
             bool profiled = _routingProfile.CoversLayers(moeLayers);
-            // Discrete VRAM has no host-writable window: without a profile its tiers would be empty.
+            // Discrete VRAM has no host-writable window: without a profile its tiers would be empty. The layer plan stays,
+            // and its resident layers hand their router ids to the same counters (they have no host seam), so the profile
+            // saved at dispose covers every layer and the next load keeps each layer's most-routed experts in VRAM.
             if (!profiled && !unified)
             {
+                GgmlBasicOps.MoeRoutingRecordDevice(true);
+                _recordingDeviceRoutes = true;
                 Console.WriteLine($"[moe-offload] {Config.Architecture} (profiling): no routing profile covers this model yet " +
-                    $"({_routingProfilePath}); this load keeps the layer plan, and its offloaded layers record their routing.");
+                    $"({_routingProfilePath}); this load keeps the layer plan and records every layer's routing, so a later load " +
+                    $"keeps each layer's most-routed experts in VRAM once {MoeRoutingProfile.MinimumRoutesPerLayer:N0} routes a layer are recorded.");
                 return false;
             }
             if (!profiled)

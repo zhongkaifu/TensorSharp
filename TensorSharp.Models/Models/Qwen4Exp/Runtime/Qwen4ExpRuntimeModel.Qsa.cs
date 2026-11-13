@@ -45,6 +45,20 @@ namespace TensorSharp.Models
 
         private int QsaRatio(int layer) => layer < Ple.CompressRatios.Length ? Ple.CompressRatios[layer] : 0;
 
+        /// <summary>The rotary position (T, H, W) of <paramref name="cell"/> of sequence <paramref name="s"/>: this step's
+        /// rows from the step, earlier cells from what the PLE layer's state recorded (it runs before every QSA layer).
+        /// Without a record (a pipeline stage on another node than the PLE layer's, which never sees media) the text rule:
+        /// the KV index plus the slot's rotary delta on every axis.</summary>
+        private (int T, int H, int W) CellPosition(GraphStep step, int s, int cell)
+        {
+            if (cell >= step.Starts[s]) return step.RowPosition(s, cell - step.Starts[s]);
+            int ple = Array.IndexOf(Ple.IsPle, true);
+            if (ple >= 0 && step.SequenceState(s, ple) is PleGdnState state && state.TryPositionOf(cell, out var recorded))
+                return recorded;
+            int p = cell + step.Slots[s].RopeDelta;
+            return (p, p, p);
+        }
+
         private bool? _anyQsa;
 
         /// <summary>Each sequence's attention, dense (within the budget) or selecting: the two emit different graphs.</summary>
@@ -105,11 +119,16 @@ namespace TensorSharp.Models
                 int n = end - first;
                 var members = new int[ratio * n];
                 var lastRows = new int[n];
-                var positions = new int[n];
+                // A block's pooled key turns at its first cell's rotary position (media cells and the text after them do
+                // not sit at their KV index), an axis-major [T | H | W | 0] table where any of them is not text.
+                var table = new int[4 * n];
+                bool multi = false;
                 for (int b = 0; b < n; b++)
                 {
                     int block = first + b;
-                    positions[b] = block * ratio;
+                    (int t, int h, int w) = CellPosition(step, s, block * ratio);
+                    table[b] = t; table[n + b] = h; table[2 * n + b] = w;
+                    multi |= h != t || w != t;
                     lastRows[b] = block * ratio + ratio - 1;
                     for (int i = 0; i < ratio; i++) members[b * ratio + i] = block * ratio + i;
                 }
@@ -124,7 +143,9 @@ namespace TensorSharp.Models
                 }
                 int pooled = step.Op(GraphOp.Scale, stackalloc[] { sum }, default, stackalloc[] { 1f / ratio });
                 pooled = step.RmsNorm(pooled, LayerName(layer, "indexer.k_norm.weight"));
-                pooled = step.RopeAt(step.Reshape(pooled, d, 1, n), GraphRotary, step.InputI32(positions, n));
+                pooled = multi
+                    ? step.RopeMultiAt(step.Reshape(pooled, d, 1, n), GraphRotary, step.InputI32(table, table.Length))
+                    : step.RopeAt(step.Reshape(pooled, d, 1, n), GraphRotary, step.InputI32(table.AsSpan(0, n).ToArray(), n));
                 // [the last member's raw key | the pooled key] into the last member's row.
                 int lastRaw = step.Cont(step.View2(gathered, d, n, ratio * d * f, (ratio - 1) * d * f));
                 int row = step.Op(GraphOp.Concat, stackalloc[] { lastRaw, step.Reshape(pooled, d, n) }, stackalloc long[] { 0 });
@@ -142,9 +163,6 @@ namespace TensorSharp.Models
                 step.LimitAdvance(start, (int)Math.Min(int.MaxValue, Ple.QsaBudget - count));   // past it, a step selects
                 return mask;
             }
-            if (step.PositionTable >= 0 || step.Slots[s].RopeDelta != 0)
-                throw new NotSupportedException(string.Create(CultureInfo.InvariantCulture,
-                    $"{Config.Architecture}: QSA's block selection over media positions is not ported ({start + count} cells, dense up to {Ple.QsaBudget})."));
             QsaSpec q = Qsa;
             int d = q.Dim, heads = q.Heads, kvType = KvCacheGraphType;
             Slot slot = step.Slots[s];
@@ -178,7 +196,8 @@ namespace TensorSharp.Models
             int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);
             int query = step.MatMul(LayerName(layer, "indexer.q_proj.weight"), step.Cont(xs));                // [d * heads, count]
             query = step.RmsNorm(step.Reshape(query, d, heads, count), LayerName(layer, "indexer.q_norm.weight"));
-            query = step.RopeAt(query, GraphRotary, step.SequencePositions(s));
+            // The rows' own rotary positions: a media step's table (one sequence), else the KV index plus the slot's delta.
+            query = step.PositionTable >= 0 ? step.Rope(query, GraphRotary) : step.RopeAt(query, GraphRotary, step.SequencePositions(s));
             var weights = new float[heads * count];
             Array.Fill(weights, 1f / MathF.Sqrt(d));   // the reference's unweighted head sum, scaled
             int score = step.Op(GraphOp.LightningIndexer, stackalloc[]

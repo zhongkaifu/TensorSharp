@@ -104,7 +104,7 @@ public class SpeculatorRegistryTests
         var model = new StubTarget
         {
             Kind = kind, PreferredWindow = 3,
-            HardDraftLimit = Qwen4ExpModel.ResolveSpecMaxDraftTokens(BackendType.GgmlCuda),
+            HardDraftLimit = 7,   // a GGML verify window's widest exact row kernels
         };
         var options = new SpeculationOptions
         {

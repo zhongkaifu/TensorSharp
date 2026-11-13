@@ -153,10 +153,11 @@ public sealed class Dsv4DenseRowInvarianceTests
     [Fact]
     public void AQ81RowsProjectionWithoutItsScratch_IsRefused()
     {
-        foreach (int type in new[] { Q4_K, Q5_K, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4 })
+        // IQ2_XS too, since the shared routing runs it on the device (with no row-invariant kernel of its own).
+        foreach (int type in new[] { Q4_K, Q5_K, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4, IQ2_XS })
             Assert.True(Dsv4CudaEngine.TakesDenseQ81Rows(type, 2304), Name(type));
-        // The shared routing's own row-invariant kernels; and IQ2_XS, which it cannot run at all.
-        foreach (int type in new[] { Q2_K, Q3_K, Q6_K, Q8_0, IQ2_XXS, IQ2_XS, BF16, (int)GgmlTensorType.F16, (int)GgmlTensorType.F32 })
+        // The shared routing's own row-invariant kernels.
+        foreach (int type in new[] { Q2_K, Q3_K, Q6_K, Q8_0, IQ2_XXS, BF16, (int)GgmlTensorType.F16, (int)GgmlTensorType.F32 })
             Assert.False(Dsv4CudaEngine.TakesDenseQ81Rows(type, 2304), Name(type));
         Assert.False(Dsv4CudaEngine.TakesDenseQ81Rows(Q4_K, 2368));
         var w = new DeviceWeight { Type = Q5_K, Ne0 = 2304, Ne1 = 512 };
