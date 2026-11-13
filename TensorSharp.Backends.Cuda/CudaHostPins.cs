@@ -36,6 +36,9 @@ namespace TensorSharp.Cuda
         /// <summary>Bytes registered in the process.</summary>
         public static long PinnedBytes { get { lock (Sync) return _pinned; } }
 
+        /// <summary>Bytes this instance registered.</summary>
+        public long OwnBytes { get; private set; }
+
         /// <summary>Page-lock [<paramref name="ptr"/>, + <paramref name="bytes"/>) as far as the budget allows; true when all of
         /// it is locked (then copies from it run at DMA speed).</summary>
         public bool Pin(IntPtr ptr, long bytes)
@@ -73,6 +76,7 @@ namespace TensorSharp.Cuda
                     }
                     Ranges[s] = (e, this);
                     _pinned += e - s;
+                    OwnBytes += e - s;
                 }
                 return all;
             }

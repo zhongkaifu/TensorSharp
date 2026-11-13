@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 
 using System;
+using System.Collections.Generic;
 using TensorSharp.GGML;
 using TensorSharp.Graph;
 
@@ -41,6 +42,7 @@ namespace TensorSharp.Models
                 _m = model;
                 _deviceIsHost = deviceIsHost;
                 _tier = new bool[model.Config.NumLayers][];
+                _recent = new float[model.Config.NumLayers][];
                 (_tailRank, _tailMaxCachedPercent) = model.RouteTailSkip;
             }
 
@@ -82,11 +84,73 @@ namespace TensorSharp.Models
             /// <summary>Routes the host computed and steps whose experts were streamed (tests).</summary>
             internal long HostRoutes, StreamedSteps;
 
-            public void Record(int layer, ReadOnlySpan<int> ids)
+            public void Record(int layer, ReadOnlySpan<int> ids, float adaptWeight = 1f)
             {
                 if (_m.TryGetLayerExperts(layer, out StackedExpertWeights gate, out _, out _))
                     GgmlBasicOps.MoeRoutingCount(gate.Data, _m._numExperts, ids);
+                if (!_adapt || _tier[layer] == null) return;
+                lock (_recentSync)
+                {
+                    float[] recent = _recent[layer] ??= new float[_m._numExperts];
+                    foreach (int e in ids)
+                        if (e >= 0 && e < recent.Length) recent[e] += adaptWeight;
+                }
             }
+
+            // ---- adaptive tiers: each tiered layer's decayed recent route counts (decode steps count one a route, a prompt
+            // chunk's routes PromptAdaptRows rows' worth in all, as the Qwen3.8 engines weighed them).
+
+            private readonly bool _adapt = Environment.GetEnvironmentVariable("TS_MOE_TIER_ADAPT") != "0";
+            private readonly float[][] _recent;
+            private readonly object _recentSync = new();
+
+            /// <summary>A prompt chunk's selections weigh as this many rows' worth of decode selections.</summary>
+            internal const float PromptAdaptRows = 128f;
+
+            public IReadOnlyList<(int Layer, int Out, int In)> ProposeSwaps(int budget)
+            {
+                var trades = new List<(float Gain, int Layer, int Out, int In)>();
+                if (!_adapt || budget <= 0) return Array.Empty<(int, int, int)>();
+                lock (_recentSync)
+                {
+                    for (int l = 0; l < _tier.Length; l++)
+                    {
+                        bool[] held = _tier[l];
+                        float[] recent = _recent[l];
+                        if (held == null || recent == null) continue;
+                        // The layer's hottest experts outside the tier against its coldest members, pairwise.
+                        var outside = new List<int>();
+                        var inside = new List<int>();
+                        for (int e = 0; e < held.Length; e++) (held[e] ? inside : outside).Add(e);
+                        outside.Sort((a, b) => recent[b].CompareTo(recent[a]));
+                        inside.Sort((a, b) => recent[a].CompareTo(recent[b]));
+                        for (int i = 0; i < Math.Min(outside.Count, inside.Count); i++)
+                        {
+                            float hot = recent[outside[i]], cold = recent[inside[i]];
+                            if (hot <= 2f * cold + 1f) break;
+                            trades.Add((hot - cold, l, inside[i], outside[i]));
+                        }
+                        // Decayed each round: recent routing outweighs old.
+                        for (int e = 0; e < recent.Length; e++) recent[e] *= 0.5f;
+                    }
+                }
+                trades.Sort((a, b) => b.Gain.CompareTo(a.Gain));
+                var result = new List<(int, int, int)>(Math.Min(budget, trades.Count));
+                for (int i = 0; i < trades.Count && result.Count < budget; i++)
+                    result.Add((trades[i].Layer, trades[i].Out, trades[i].In));
+                return result;
+            }
+
+            public void CommitSwap(int layer, int outOf, int into)
+            {
+                if (_tier[layer] is not { } held) return;
+                held[outOf] = false;
+                held[into] = true;
+                System.Threading.Interlocked.Increment(ref Swaps);
+            }
+
+            /// <summary>Trades adaptive tiers made (tests, telemetry).</summary>
+            internal long Swaps;
 
             public unsafe bool Compute(int layer, ReadOnlySpan<float> x, ReadOnlySpan<int> ids, ReadOnlySpan<float> weights,
                 ReadOnlySpan<byte> skip, int rows, Span<float> output)

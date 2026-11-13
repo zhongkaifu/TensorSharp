@@ -229,6 +229,11 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName, EntryPoint = "cuEventDestroy_v2")]
         public static partial int cuEventDestroy(IntPtr hEvent);
 
+        /// <summary>An event record a captured graph keeps as an external node (flag 1): the event can be waited on and timed
+        /// from outside the graph after a launch.</summary>
+        [LibraryImport(LibName, EntryPoint = "cuEventRecordWithFlags")]
+        public static partial int cuEventRecordWithFlags(IntPtr hEvent, IntPtr hStream, uint flags);
+
         [LibraryImport(LibName, EntryPoint = "cuEventRecord")]
         public static partial int cuEventRecord(IntPtr hEvent, IntPtr hStream);
 

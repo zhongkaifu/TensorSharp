@@ -1,11 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
 {
     [Serializable]
-    public sealed class CudaAllocator : IAllocator, IDeviceMemoryInfo, IDisposable
+    public sealed class CudaAllocator : IAllocator, IDeviceMemoryInfo, IHostRangePinner, IDisposable
     {
         private int disposed;
 
@@ -248,6 +249,18 @@ namespace TensorSharp.Cuda
         }
 
         public bool SharesHostMemory => false;
+
+        public IDisposable PinHostRanges(IReadOnlyList<(IntPtr Pointer, long Bytes)> ranges, System.Threading.CancellationToken cancel)
+        {
+            Context.MakeCurrent();
+            var pins = new CudaHostPins();
+            foreach ((IntPtr pointer, long bytes) in ranges)
+            {
+                if (cancel.IsCancellationRequested) break;
+                pins.Pin(pointer, bytes);
+            }
+            return pins;
+        }
 
         internal static readonly bool VramLogEnabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_LOG_VRAM"), "1", StringComparison.Ordinal);

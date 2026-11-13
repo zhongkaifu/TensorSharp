@@ -272,7 +272,7 @@ namespace TensorSharp.Models
                 up = LayerName(layer, $"hc_{part}_up.weight"), inject = LayerName(layer, $"hc_{part}_inject.weight");
             // A prompt chunk's read is one region a backend may run as one kernel (GraphFusion.HcRead: Metal's
             // prompt-width hyper-connection read), where the weights carry no per-tensor scale.
-            bool region = step.Rows > 1 && Unscaled(down) && Unscaled(up) && Unscaled(inject);
+            bool region = (step.Rows > 1 || step.RegionsAtAnyWidth) && Unscaled(down) && Unscaled(up) && Unscaled(inject);
             if (region)
                 step.BeginFused(GraphFusion.HcRead, stackalloc[] { stream, step.Weight(norm), step.Weight(down), step.Weight(inject), step.Weight(up) },
                     stackalloc long[] { Ple.Hidden, Ple.Hc, Ple.HcLowRank }, stackalloc[] { Config.Eps });
@@ -291,7 +291,7 @@ namespace TensorSharp.Models
             int block = step.Cont(output);
             // A prompt chunk's scatter is one region a backend may run as one pass (GraphFusion.HcScatter: Metal's
             // prompt-width hyper-connection scatter, Qwen4ExpModel's tsm_hc_scatter: 4.85 -> 3.89 s on a 3.6K prompt).
-            bool region = rows > 1;
+            bool region = rows > 1 || step.RegionsAtAnyWidth;
             if (region) step.BeginFused(GraphFusion.HcScatter, stackalloc[] { stream, block, context }, stackalloc long[] { p.Hidden, hc });
             int w = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Sigmoid, step.Op(GraphOp.Scale, stackalloc[] { context }, default, stackalloc[] { 1f / hc })) },
                 default, stackalloc[] { 2f });

@@ -595,6 +595,78 @@ extern "C" __global__ void ts_graph_moe_wait_add(const unsigned int* flag, const
         dst[i] += ((const volatile float*)hostOut)[i];
 }
 
+// ---- hyper-connections (GraphFusion.HcRead / HcScatter): the residual streams [rows][hc][n].
+// The read's grouped norm: each stream of each row RMS-normed (eps inside the root), times the [hc * n] gammas.
+// Launch: grid rows * hc, block 256.
+extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, const float* __restrict__ gamma, float* __restrict__ y,
+    int n, int hc, float eps)
+{
+    __shared__ float part[8];
+    const size_t s = blockIdx.x;               // row * hc + stream
+    const float* xs = x + s * n;
+    const float* g = gamma + (s % hc) * n;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        ss += xs[i] * xs[i];
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor_sync(0xffffffffu, ss, off);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        float t = threadIdx.x < (int)(blockDim.x >> 5) ? part[threadIdx.x] : 0.f;
+        for (int off = 16; off > 0; off >>= 1)
+            t += __shfl_xor_sync(0xffffffffu, t, off);
+        if (threadIdx.x == 0) part[0] = t;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(part[0] / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        y[s * n + i] = xs[i] * scale * g[i];
+}
+
+// y = silu(x * scale) over n contiguous floats (the read's low-rank activation). Launch: ceil(n / 256), 256.
+extern "C" __global__ void ts_graph_scale_silu_f32(const float* __restrict__ x, float* __restrict__ y, long long n, float scale)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        const float v = x[i] * scale;
+        y[i] = v / (1.f + expf(-v));
+    }
+}
+
+// The read's mix: out[r][i] = (sum over c, in order, of xn[r][c][i] * sigmoid(gates[r][c][i])) / hc.
+// Launch: ceil(rows * n / 256), 256.
+extern "C" __global__ void ts_graph_hc_gate_mix_f32(const float* __restrict__ xn, const float* __restrict__ gates,
+    float* __restrict__ out, int rows, int n, int hc)
+{
+    const long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= (long long)rows * n) return;
+    const long long r = j / n, i = j % n;
+    const float* xr = xn + r * hc * n;
+    const float* gr = gates + r * hc * n;
+    float sum = 0.f;
+    for (int c = 0; c < hc; c++)
+    {
+        const float g = gr[(long long)c * n + i];
+        sum += xr[(long long)c * n + i] * (1.f / (1.f + expf(-g)));
+    }
+    out[j] = sum * (1.f / hc);
+}
+
+// The scatter: out[r][c][i] = stream[r][c][i] + block[r][i] * 2 * sigmoid(inject[r][c] / hc). Launch: ceil(rows * hc * n / 256), 256.
+extern "C" __global__ void ts_graph_hc_scatter_f32(const float* __restrict__ stream, const float* __restrict__ block,
+    const float* __restrict__ inject, float* __restrict__ out, int rows, int n, int hc)
+{
+    const long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long width = (long long)hc * n;
+    if (j >= (long long)rows * width) return;
+    const long long r = j / width, c = (j % width) / n, i = j % n;
+    const float w = 2.f * (1.f / (1.f + expf(-inject[r * hc + c] * (1.f / hc))));
+    out[j] = stream[j] + block[r * n + i] * w;
+}
+
 // ggml_sum_rows over contiguous rows of cols floats: y[r] = sum of x[r, :]. Launch: grid rows, block 256.
 extern "C" __global__ void ts_graph_sum_rows_f32(const float* __restrict__ x, float* __restrict__ y, int cols)
 {

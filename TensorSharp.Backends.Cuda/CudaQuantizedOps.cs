@@ -1508,6 +1508,35 @@ namespace TensorSharp.Cuda
             }
         }
 
+        /// <summary>
+        /// Hand the resident copies of <paramref name="fromKeys"/> to <paramref name="toKeys"/> (an adaptive expert tier
+        /// trading one expert's device slot for another's): each pair the same type, in the ggml layout, and size; the
+        /// caller then copies the new weights' bytes into <paramref name="devicePtrs"/> on the allocator's stream, before
+        /// anything reads them. All or nothing: false, with nothing changed, when a pair does not qualify.
+        /// </summary>
+        internal static bool TryMoveResident(CudaAllocator allocator, IntPtr[] fromKeys, IntPtr[] toKeys, int[] types, long[] rawBytes,
+            IntPtr[] devicePtrs)
+        {
+            lock (Sync)
+            {
+                for (int i = 0; i < fromKeys.Length; i++)
+                {
+                    if (!Cache.TryGetValue(new CacheKey(allocator, fromKeys[i]), out DeviceWeight w) || Cache.ContainsKey(new CacheKey(allocator, toKeys[i]))
+                        || w.GgmlType != types[i] || w.SourceType != types[i] || w.RawBytes != rawBytes[i])
+                        return false;
+                }
+                for (int i = 0; i < fromKeys.Length; i++)
+                {
+                    var from = new CacheKey(allocator, fromKeys[i]);
+                    DeviceWeight w = Cache[from];
+                    Cache.Remove(from);
+                    Cache[new CacheKey(allocator, toKeys[i])] = w;
+                    devicePtrs[i] = w.DevicePtr;
+                }
+                return true;
+            }
+        }
+
         private readonly struct CacheKey : IEquatable<CacheKey>
         {
             public CacheKey(CudaAllocator allocator, IntPtr key)

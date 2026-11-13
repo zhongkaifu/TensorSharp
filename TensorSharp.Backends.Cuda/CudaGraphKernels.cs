@@ -22,7 +22,7 @@ namespace TensorSharp.Cuda
         /// kernel is added or changes its signature.</summary>
         public const int CurrentVersion = 11;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
@@ -40,6 +40,10 @@ namespace TensorSharp.Cuda
             _topkMask = module.GetFunction("ts_graph_topk_mask_f32");
             _maskCells = module.GetFunction("ts_graph_mask_cells");
             _sumRows = module.GetFunction("ts_graph_sum_rows_f32");
+            _hcNorm = module.GetFunction("ts_graph_hc_norm_f32");
+            _scaleSilu = module.GetFunction("ts_graph_scale_silu_f32");
+            _hcGateMix = module.GetFunction("ts_graph_hc_gate_mix_f32");
+            _hcScatter = module.GetFunction("ts_graph_hc_scatter_f32");
             _f16ToF32 = module.GetFunction("ts_graph_f16_to_f32");
             _f32ToF16 = module.GetFunction("ts_graph_f32_to_f16");
             _routeSplit = module.GetFunction("ts_graph_moe_route_split");
@@ -186,6 +190,37 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &flag, &seq, &count, &outDev, &dst, &n, &missDev };
             CudaDriverApi.cuLaunchKernel(_waitAdd, (uint)Math.Min(16, Math.Max(1, (n + 255) / 256)), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The hyper-connection read's grouped norm: each of <paramref name="rows"/> x <paramref name="hc"/> streams
+        /// of <paramref name="n"/> RMS-normed, times the [hc * n] gammas.</summary>
+        public void LaunchHcNorm(IntPtr x, IntPtr gamma, IntPtr y, int rows, int n, int hc, float eps, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &gamma, &y, &n, &hc, &eps };
+            CudaDriverApi.cuLaunchKernel(_hcNorm, (uint)(rows * hc), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>y = silu(x * scale) over <paramref name="n"/> contiguous floats.</summary>
+        public void LaunchScaleSilu(IntPtr x, IntPtr y, long n, float scale, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &y, &n, &scale };
+            CudaDriverApi.cuLaunchKernel(_scaleSilu, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The read's mix: each row's streams' mean of xn * sigmoid(gates).</summary>
+        public void LaunchHcGateMix(IntPtr xn, IntPtr gates, IntPtr output, int rows, int n, int hc, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &xn, &gates, &output, &rows, &n, &hc };
+            long total = (long)rows * n;
+            CudaDriverApi.cuLaunchKernel(_hcGateMix, (uint)((total + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The scatter: each stream plus the block output weighted by 2 * sigmoid(inject / hc).</summary>
+        public void LaunchHcScatter(IntPtr streamIn, IntPtr block, IntPtr inject, IntPtr output, int rows, int n, int hc, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &streamIn, &block, &inject, &output, &rows, &n, &hc };
+            long total = (long)rows * hc * n;
+            CudaDriverApi.cuLaunchKernel(_hcScatter, (uint)((total + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>ggml_sum_rows over <paramref name="rows"/> contiguous rows of <paramref name="cols"/> floats.</summary>

@@ -530,10 +530,25 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.True(worst > 0 && worst < 5e-2, $"rows after the prompt moved {worst:E2}");
     }
 
-    private void AssertHostExpertsMatchDevice(BackendType backend, bool tier)
+    /// <summary>Quantized experts (IQ3_S / IQ4_XS): the prompt chunk's staged experts (on CUDA the grouped MoE kernels, F16
+    /// operands and F32 accumulation) against the device's own kernels. Only the prompt row is judged: the decode rows' host
+    /// routes round the activations to Q8_K as ggml's CPU backend does, against the device's unrounded ones, and on this
+    /// random model a flipped top-k then moves a later row by 0.1-0.4 (MLX and CUDA alike), past any tolerance that would
+    /// still catch a fault.</summary>
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QuantizedHostExpertsOnDirectCudaMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Cuda, tier, "moe-quantized");
+
+    [MlxTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QuantizedHostExpertsOnMlxMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Mlx, tier, "moe-quantized");
+
+    private void AssertHostExpertsMatchDevice(BackendType backend, bool tier, string variant = "moe")
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
-        string path = Fixture("moe");
+        string path = Fixture(variant);
         List<float[]> reference;
         using (var device = Create(path, backend: backend))
             reference = Script(device);
@@ -547,10 +562,12 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.True(offloaded.GraphRuns > 0, "the offloaded model did not run as graphs");
         Assert.True(hostRoutes > 0 && streamed > 0, $"host routes {hostRoutes}, streamed steps {streamed}");
         // The host's kernels round as ggml's CPU backend does (activations to Q8_K / BF16 against the device's).
-        for (int i = 0; i < reference.Count; i++)
+        _output.WriteLine($"{backend} {variant} tier={tier}: " + string.Join(" ", reference.Select((r, i) => RelL2(actual[i], r).ToString("E2"))));
+        for (int i = 0; i < (variant == "moe" ? reference.Count : 1); i++)
         {
             double rel = RelL2(actual[i], reference[i]);
-            Assert.True(rel <= 2.5e-2, $"{backend} --cpu-moe tier={tier}, row {i}: relL2 {rel:E2}");
+            // Quantized activations upstream move a quantized checkpoint's rows by ~1e-2 in either implementation.
+            Assert.True(rel <= (variant == "moe" ? 2.5e-2 : 5e-2), $"{backend} --cpu-moe {variant} tier={tier}, row {i}: relL2 {rel:E2}");
         }
     }
 

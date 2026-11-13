@@ -32,7 +32,7 @@ namespace TensorSharp.Cuda
         public override GraphCapabilities Capabilities { get; } = new()
         {
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
-            HostExperts = true, RecordsHostExperts = true,
+            HostExperts = true, RecordsHostExperts = true, RegionsAtAnyWidth = true,
         };
 
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
@@ -419,6 +419,69 @@ namespace TensorSharp.Cuda
             return result;
         }
 
+        /// <summary>
+        /// A hyper-connection read (<see cref="GraphFusion.HcRead"/>) as five launches: the grouped norm, the low-rank down
+        /// product, its scaled silu, the up product and the gated mix in one pass, then the injection weights; the region's
+        /// ops were about sixteen, a decode step's dominant node count on Qwen3.8 Flash Next (two reads a layer).
+        /// </summary>
+        private bool TryHcRead(Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || inputs.Length < 5 || ip == null || ip.Length < 3 || results.Length < 2) return false;
+            Tensor x = inputs[0], gamma = inputs[1];
+            int n = (int)ip[0], hc = (int)ip[1], lr = (int)ip[2];
+            long width = (long)hc * n;
+            // The matrices are quantized weights, or F32 tensors [out, in] (a checkpoint keeping them unquantized).
+            bool Fits(int i, long inDim, long outDim) => weights[i] != null
+                ? weights[i].Ne0 == inDim && weights[i].Ne1 == outDim
+                : inputs[i] is { } w && w.Storage is CudaStorage && w.ElementType == DType.Float32 && w.DimensionCount == 2
+                  && w.Sizes[0] == outDim && w.Sizes[1] == inDim;
+            if (!AllF32OnDevice(x, gamma) || !x.IsContiguous() || !gamma.IsContiguous() || gamma.ElementCount() != width
+                || x.ElementCount() % width != 0 || !Fits(2, width, lr) || !Fits(3, width, hc) || !Fits(4, lr, width))
+                return false;
+            int rows = (int)(x.ElementCount() / width);
+            float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
+            Tensor Product(int i, Tensor input)
+            {
+                if (weights[i] != null) return QuantizedMatMul(weights[i], input);
+                Tensor w = inputs[i];
+                var y = new Tensor(Allocator, DType.Float32, input.Sizes[0], w.Sizes[0]);
+                using Tensor wt = w.Transpose();
+                Ops.Addmm(y, 0, y, 1, input, wt);
+                return y;
+            }
+            using var xn = new Tensor(Allocator, DType.Float32, rows, width);
+            Launch(new[] { x, gamma }, xn, (k, stream) => k.LaunchHcNorm(Ptr(x), Ptr(gamma), Ptr(xn), rows, n, hc, eps, stream));
+            using Tensor lo = Product(2, xn);
+            Launch(new[] { lo }, lo, (k, stream) => k.LaunchScaleSilu(Ptr(lo), Ptr(lo), lo.ElementCount(), 1f / hc, stream));
+            using Tensor gates = Product(4, lo);
+            var mix = new Tensor(Allocator, DType.Float32, rows, n);
+            Launch(new[] { xn, gates }, mix, (k, stream) => k.LaunchHcGateMix(Ptr(xn), Ptr(gates), Ptr(mix), rows, n, hc, stream));
+            results[0] = mix;
+            results[1] = Product(3, xn);
+            return true;
+        }
+
+        /// <summary>A hyper-connection scatter (<see cref="GraphFusion.HcScatter"/>) as one pass over the streams.</summary>
+        private bool TryHcScatter(Tensor[] inputs, long[] ip, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || inputs.Length < 3 || ip == null || ip.Length < 2 || results.Length < 1) return false;
+            Tensor streams = inputs[0], block = inputs[1], inject = inputs[2];
+            int n = (int)ip[0], hc = (int)ip[1];
+            long width = (long)hc * n;
+            if (!AllF32OnDevice(streams, block, inject) || !streams.IsContiguous() || !block.IsContiguous() || !inject.IsContiguous()
+                || streams.ElementCount() % width != 0)
+                return false;
+            int rows = (int)(streams.ElementCount() / width);
+            if (block.ElementCount() != (long)rows * n || inject.ElementCount() != (long)rows * hc) return false;
+            var output = new Tensor(Allocator, DType.Float32, rows, width);
+            Launch(new[] { streams, block, inject }, output, (k, stream) => k.LaunchHcScatter(Ptr(streams), Ptr(block), Ptr(inject), Ptr(output),
+                rows, n, hc, stream));
+            results[0] = output;
+            return true;
+        }
+
         private static bool DeviceInts(Tensor t) => t != null && t.Storage is CudaStorage && t.ElementType == DType.Int32 && t.IsContiguous();
 
         private static bool AllF32OnDevice(params Tensor[] tensors)
@@ -427,6 +490,7 @@ namespace TensorSharp.Cuda
                 if (t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32) return false;
             return true;
         }
+
 
         /// <summary>ggml_sum_rows as one kernel (the CUDA reductions run on the host).</summary>
         protected override Tensor SumRows(Tensor x)
@@ -480,7 +544,7 @@ namespace TensorSharp.Cuda
 
         protected override bool Fuses(GraphFusion kind) => kind switch
         {
-            GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm => Kernels != null,
+            GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.HcRead or GraphFusion.HcScatter => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             _ => false,
         };
@@ -491,6 +555,8 @@ namespace TensorSharp.Cuda
         {
             if (kind == GraphFusion.RoutedExperts) return TryRoutedExperts(inputs, weights, ip, results);
             if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs, weights, ip, results);
+            if (kind == GraphFusion.HcRead) return TryHcRead(inputs, weights, ip, fp, results);
+            if (kind == GraphFusion.HcScatter) return TryHcScatter(inputs, ip, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
@@ -720,9 +786,88 @@ namespace TensorSharp.Cuda
             public Tensor Counts;
             public IGraphExpertHost Host;
             public int Layer, Experts;
+            /// <summary>The layer's stacks, and the tables' host copies (pointer words per matrix, the on-device flags):
+            /// an adaptive trade rewrites them and uploads them again.</summary>
+            public IGraphExpertWeights[] Sets;
+            public int[][] Words;
+            public byte[] Mask;
         }
 
         private long _countsHarvestedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        /// <summary>Seconds between harvests of the device's route counts (and adaptive trades after each).</summary>
+        private const double HarvestSeconds = 0.25;
+
+        /// <summary>Trades an adaptive round makes at most (each a few MB copied before the next step).</summary>
+        private const int AdaptSwapsPerRound = 64;
+
+        /// <summary>
+        /// An adaptive round (<see cref="IGraphExpertHost.ProposeSwaps"/>): each trade's incoming expert copied into the
+        /// outgoing one's device slot from the stack's (page-locked) mapping, the resident copies re-keyed and the layer's
+        /// tables and flags rewritten, all on the stream before the next step: a recorded step reads the tables when it runs.
+        /// </summary>
+        private void AdaptTiers(HostedTables[] layers)
+        {
+            if (layers.Length == 0) return;
+            var cuda = (CudaAllocator)Allocator;
+            IGraphExpertHost host = layers[0].Host;
+            IReadOnlyList<(int Layer, int Out, int In)> swaps = host.ProposeSwaps(AdaptSwapsPerRound);
+            if (swaps.Count == 0) return;
+            var byLayer = new Dictionary<int, HostedTables>();
+            foreach (HostedTables t in layers) byLayer[t.Layer] = t;
+            var dirty = new HashSet<HostedTables>();
+            var fromKeys = new IntPtr[3];
+            var toKeys = new IntPtr[3];
+            var types = new int[3];
+            var bytes = new long[3];
+            var ptrs = new IntPtr[3];
+            cuda.Context.MakeCurrent();
+            foreach ((int layer, int outOf, int into) in swaps)
+            {
+                if (!byLayer.TryGetValue(layer, out HostedTables t) || t.Sets == null || t.Mask[outOf] == 0 || t.Mask[into] != 0) continue;
+                bool ok = true;
+                for (int m = 0; m < 3 && ok; m++)
+                {
+                    IGraphExpertWeights set = t.Sets[m];
+                    IGraphWeight a = set.Expert(outOf), b = set.Expert(into);
+                    fromKeys[m] = a.CacheKey;
+                    toKeys[m] = b.CacheKey;
+                    types[m] = set.Format;
+                    bytes[m] = b.Bytes;
+                    ok = a.Bytes == b.Bytes && set.Data != IntPtr.Zero;
+                }
+                if (!ok || !CudaQuantizedOps.TryMoveResident(cuda, fromKeys, toKeys, types, bytes, ptrs)) continue;
+                for (int m = 0; m < 3; m++)
+                {
+                    IGraphExpertWeights set = t.Sets[m];
+                    IntPtr source = set.Data + (nint)(set.Bytes / set.Ne2 * into);
+                    CudaHostPins.CopyToDevice(ptrs[m], source, bytes[m], cuda.Stream.Handle).ThrowOnError();
+                    long p = ptrs[m].ToInt64();
+                    t.Words[m][2 * into] = unchecked((int)p);
+                    t.Words[m][2 * into + 1] = unchecked((int)(p >> 32));
+                    t.Words[m][2 * outOf] = t.Words[m][2 * outOf + 1] = 0;
+                }
+                t.Mask[into] = 1;
+                t.Mask[outOf] = 0;
+                host.CommitSwap(layer, outOf, into);
+                dirty.Add(t);
+            }
+            foreach (HostedTables t in dirty)
+            {
+                Tensor[] tables = { t.Gate, t.Up, t.Down };
+                for (int m = 0; m < 3; m++)
+                {
+                    tables[m].SetElementsAsInt(t.Words[m]);
+                    ((CudaStorage)tables[m].Storage).EnsureDeviceCurrent();
+                }
+                unsafe
+                {
+                    fixed (byte* mask = t.Mask)
+                        CudaDriverApi.cuMemcpyHtoDAsync(Ptr(t.OnDevice), (IntPtr)mask, new UIntPtr((ulong)t.Mask.Length), cuda.Stream.Handle).ThrowOnError();
+                }
+                ((CudaStorage)t.OnDevice.Storage).MarkDeviceModified();
+            }
+        }
 
         /// <summary>
         /// The routes the doorbell layers counted on the device, handed to their expert hosts (the routing profile) and
@@ -733,7 +878,7 @@ namespace TensorSharp.Cuda
         {
             var cuda = (CudaAllocator)Allocator;
             long now = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (!force && now - _countsHarvestedAt < 2 * System.Diagnostics.Stopwatch.Frequency) return;
+            if (!force && now - _countsHarvestedAt < HarvestSeconds * System.Diagnostics.Stopwatch.Frequency) return;
             if (CudaGraphCapture.IsCapturing(cuda)) return;
             _countsHarvestedAt = now;
             HostedTables[] layers;
@@ -753,6 +898,7 @@ namespace TensorSharp.Cuda
                 ((CudaStorage)t.Counts.Storage).MarkDeviceModified();
                 t.Host.Record(t.Layer, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(ids));
             }
+            if (!force) AdaptTiers(layers);
         }
 
         private readonly Dictionary<IGraphHostedExperts, HostedTables> _hostedTables = new(ReferenceEqualityComparer.Instance);
@@ -776,14 +922,13 @@ namespace TensorSharp.Cuda
             return base.HostExperts(x, selected, weightValue, gateValue, upValue, downValue, layer, run);
         }
 
-        private CudaHostPins _pins;
         private IntPtr _stagingArena;
         private long _stagingBytes;
 
         /// <summary>
         /// A prompt chunk's routed experts (rows past what the host computes): routed on the host, each selected expert run
         /// once over its rows, from its tier copy where the device holds one and otherwise from a staging arena the expert's
-        /// bytes are copied into from the model file's mapping (page-locked: DMA speed). The arena holds as many experts as
+        /// bytes are copied into from the model file's mapping (page-locked at load where the host allows: DMA speed). The arena holds as many experts as
         /// device memory allows; a layer whose staged experts do not fit runs in batches. Every route is computed (the
         /// route-tail skip is for decode rows).
         /// </summary>
@@ -803,7 +948,7 @@ namespace TensorSharp.Cuda
                 return false;
             int[] ids = Ints(selected);
             float[] weights = weightValue.Floats ?? weightValue.Tensor.GetElementsAsFloat(rows * k);
-            gate.Host.Record(layer, ids);
+            gate.Host.Record(layer, ids, GraphExpertAdapt.Weight(rows));
 
             // The routes grouped by expert: rowOf / weightOf from start[e], count[e] of them.
             var count = new int[experts];
@@ -852,12 +997,6 @@ namespace TensorSharp.Cuda
                     if (Source(m, e) == IntPtr.Zero) return false;
             if (staged.Count > 0 && !EnsureStagingArena(perExpert, staged.Count))
                 return false;
-            if (staged.Count > 0)
-            {
-                _pins ??= new CudaHostPins();
-                foreach (IGraphExpertWeights set in sets)
-                    if (set.Data != IntPtr.Zero) _pins.Pin(set.Data, set.Bytes);
-            }
 
             using Tensor x2 = x.View(rows, hidden);
             using var rowIdx = new Tensor(Allocator, DType.Int32, Math.Max(1, rowOf.Length));
@@ -884,14 +1023,18 @@ namespace TensorSharp.Cuda
                 if (!CudaFusedOps.TryMoEScatterAddWeightedRows(output, downOut, at, w))
                     throw new InvalidOperationException($"layer {layer}: the weighted scatter of expert {e}'s rows failed");
             }
-            // A short chunk whose staged experts fit the arena at once: every route through the batched per-row MoE kernels
-            // (one launch a projection over tables of the step's expert copies) rather than a handful of launches an expert.
-            if (rows <= StagedPerRowMaxRows && (long)staged.Count * perExpert <= _stagingBytes
-                && TryStagedPerRow(x2, output, selected, weightValue, sets, resident, staged, memberBytes, perExpert, Source, rows, k,
-                    hidden, ff, experts, layer))
+            // Staged experts that fit the arena at once: every route through the grouped MoE kernels (the engines' routes:
+            // tensor-core grouped GEMMs for a long chunk, per-slot kernels for a short one) over tables of the step's expert
+            // copies, else the batched per-row kernels; a handful of launches an expert only where neither takes them.
+            if ((long)staged.Count * perExpert <= _stagingBytes
+                && TryStagedTables(selected, weightValue, sets, resident, staged, memberBytes, perExpert, Source, experts, layer))
             {
-                result = output;
-                return true;
+                if (TryGroupedMoe(x2, output, selected.Tensor, weightValue.Tensor, sets, rows, k, hidden, ff, experts)
+                    || (rows <= StagedPerRowMaxRows && TryStagedPerRow(x2, output, selected, weightValue, sets, rows, k, hidden, ff, experts)))
+                {
+                    result = output;
+                    return true;
+                }
             }
             try
             {
@@ -943,20 +1086,16 @@ namespace TensorSharp.Cuda
         private Tensor[] _stepTables;
 
         /// <summary>
-        /// The staged experts copied in at once, then the chunk's routes through the batched per-row kernels over this step's
-        /// pointer tables (tier copies and staged copies; the router's ids and weights as they are on the device). False,
-        /// with nothing launched, where the routes are not on the device or the kernels do not take the experts.
+        /// The staged experts copied in at once and this step's pointer tables built over them and the tier's copies
+        /// (<see cref="_stepTables"/>). False, with nothing launched, where the routes are not on the device.
         /// </summary>
-        private bool TryStagedPerRow(Tensor x2, Tensor output, Value selected, Value weightValue, IGraphExpertWeights[] sets,
-            IntPtr[] resident, List<int> staged, long[] memberBytes, long perExpert, Func<int, int, IntPtr> source, int rows, int k,
-            int hidden, int ff, int experts, int layer)
+        private bool TryStagedTables(Value selected, Value weightValue, IGraphExpertWeights[] sets, IntPtr[] resident, List<int> staged,
+            long[] memberBytes, long perExpert, Func<int, int, IntPtr> source, int experts, int layer)
         {
             var cuda = (CudaAllocator)Allocator;
             Tensor sel = selected.Tensor, w = weightValue.Tensor;
-            int gateType = sets[0].Format, downType = sets[2].Format;
             if (sel?.Storage is not CudaStorage || w?.Storage is not CudaStorage || sel.ElementType != DType.Int32 || w.ElementType != DType.Float32
-                || !sel.IsContiguous() || !w.IsContiguous() || sets[1].Format != gateType
-                || !CudaQuantizedOps.SupportsQuantizedType(gateType) || !CudaQuantizedOps.SupportsQuantizedType(downType))
+                || !sel.IsContiguous() || !w.IsContiguous())
                 return false;
             cuda.Context.MakeCurrent();
             for (int j = 0; j < staged.Count; j++)
@@ -991,10 +1130,21 @@ namespace TensorSharp.Cuda
                 _stepTables[m].SetElementsAsInt(words);
                 ((CudaStorage)_stepTables[m].Storage).EnsureDeviceCurrent();
             }
+            return true;
+        }
+
+        /// <summary>The chunk's routes through the batched per-row MoE kernels over this step's tables (one launch a
+        /// projection).</summary>
+        private bool TryStagedPerRow(Tensor x2, Tensor output, Value selected, Value weightValue, IGraphExpertWeights[] sets, int rows,
+            int k, int hidden, int ff, int experts)
+        {
+            int gateType = sets[0].Format, downType = sets[2].Format;
+            if (sets[1].Format != gateType || !CudaQuantizedOps.SupportsQuantizedType(gateType) || !CudaQuantizedOps.SupportsQuantizedType(downType))
+                return false;
             long routes = (long)rows * k;
             bool gateUpDp4a = CudaQuantizedOps.IsMoeDp4aEnabledForType(gateType) && CudaFusedOps.IsMoeDp4aDimensionSupported(gateType, hidden);
             bool downDp4a = CudaQuantizedOps.IsMoeDp4aEnabledForType(downType) && CudaFusedOps.IsMoeDp4aDimensionSupported(downType, ff);
-            using Tensor ids = sel.View(routes), routeWeights = w.View(routes);
+            using Tensor ids = selected.Tensor.View(routes), routeWeights = weightValue.Tensor.View(routes);
             using var devSel = Ops.NewContiguous(ids);   // the kernels' scratch for the routes they run (the router's ids kept)
             using var gateOut = new Tensor(Allocator, DType.Float32, routes, ff);
             using var upOut = new Tensor(Allocator, DType.Float32, routes, ff);
@@ -1004,6 +1154,85 @@ namespace TensorSharp.Cuda
                 Ptr(_stepTables[0]), Ptr(_stepTables[1]), Ptr(_stepTables[2]), gateType, downType, experts, k, hidden, ff, rows, null,
                 IntPtr.Zero, inputQ8, gateQ8, gateUpDp4a, downDp4a);
         }
+
+        private Dsv4Kernels _moeKernels;
+        private bool _moeKernelsMissing;
+
+        /// <summary>The grouped MoE kernels' module (the direct engines' expert kernels) in this allocator's context, or
+        /// null (reported once) where it cannot load.</summary>
+        private Dsv4Kernels MoeKernels
+        {
+            get
+            {
+                if (_moeKernels != null || _moeKernelsMissing) return _moeKernels;
+                try
+                {
+                    ((CudaAllocator)Allocator).Context.MakeCurrent();
+                    _moeKernels = Dsv4Kernels.Create();
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or CudaException or System.IO.IOException)
+                {
+                    _moeKernelsMissing = true;
+                    Console.Error.WriteLine($"[cuda] the grouped MoE kernels are unavailable ({ex.Message}); prompt experts run per expert.");
+                }
+                return _moeKernels;
+            }
+        }
+
+        /// <summary>
+        /// A chunk's routed experts on the grouped MoE kernels (CudaMoe: the routes grouped by expert on the device, then
+        /// tensor-core grouped GEMMs, F16 operands and F32 accumulation, for a long chunk, the per-slot kernels for a short
+        /// one, and the weighted scatter) over this step's pointer tables, the router's ids and weights as they are.
+        /// False, with nothing launched, for a layout or width the kernels do not take.
+        /// </summary>
+        private bool TryGroupedMoe(Tensor x2, Tensor output, Tensor sel, Tensor w, IGraphExpertWeights[] sets, int rows, int k,
+            int hidden, int ff, int experts)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            Dsv4Kernels dk = MoeKernels;
+            int gateType = sets[0].Format, upType = sets[1].Format, downType = sets[2].Format;
+            if (dk == null || cuda.Kernels == null || gateType != upType
+                || !CudaMoe.GroupedSupportsType(gateType, dk.DecodesLowBitIqExperts, dk.DecodesLegacyQuants)
+                || !CudaMoe.GroupedSupportsType(downType, dk.DecodesLowBitIqExperts, dk.DecodesLegacyQuants)
+                || CudaMoe.SelectRoute(rows, GroupedPerSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, gateType, downType, hidden, ff,
+                    dk.DecodesLegacyQuants) == CudaMoe.ExpertRoute.Warp)
+                return false;
+            var owned = new List<Tensor>();
+            try
+            {
+                var scratch = new CudaMoeScratch((type, sizes) =>
+                {
+                    var t = new Tensor(Allocator, type, sizes);
+                    owned.Add(t);
+                    return t;
+                }, rows, experts, k, hidden, ff);
+                long routes = (long)rows * k;
+                using (Tensor ids = sel.View(routes), weights = w.View(routes))
+                using (Tensor selDst = scratch.Sel.View(routes), wDst = scratch.SelW.View(routes))
+                {
+                    Ops.Copy(selDst, ids);
+                    Ops.Copy(wDst, weights);
+                }
+                long RowBytes(IGraphExpertWeights set) => set.Expert(0).Bytes / set.Ne1;
+                var gate = new DeviceWeight { Type = gateType, Ne0 = hidden, Ne1 = ff, RowBytes = RowBytes(sets[0]), Table = Ptr(_stepTables[0]) };
+                var up = new DeviceWeight { Type = upType, Ne0 = hidden, Ne1 = ff, RowBytes = RowBytes(sets[1]), Table = Ptr(_stepTables[1]) };
+                var down = new DeviceWeight { Type = downType, Ne0 = ff, Ne1 = hidden, RowBytes = RowBytes(sets[2]), Table = Ptr(_stepTables[2]) };
+                foreach (Tensor t in new[] { x2, output }) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+                cuda.Context.MakeCurrent();
+                CudaMoe.Experts(dk, cuda.Kernels, scratch, gate, up, down, x2, null, output, rows, k, experts, hidden, ff, 0f,
+                    GroupedPerSlotMaxRows, cuda.Stream.Handle);
+                ((CudaStorage)output.Storage).MarkDeviceModified();
+                return true;
+            }
+            finally
+            {
+                // The kernels are queued on the allocator's stream: the scratch returns to its pool for later work there.
+                foreach (Tensor t in owned) t.Dispose();
+            }
+        }
+
+        /// <summary>Rows the grouped MoE path runs on its per-slot kernels (the engines' decode-window bound).</summary>
+        private const int GroupedPerSlotMaxRows = 16;
 
         /// <summary>Most bytes the staging arena takes (the placement's reserve for it: one layer's experts at most).</summary>
         private const long StagingArenaCapBytes = 2L << 30;
@@ -1044,9 +1273,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>
         /// The model's resources this executor holds on the device and the host, released with the model (before its
-        /// mappings and tiers go: a registration or table outliving them would serve the next model mapped at the same
-        /// addresses): the doorbell stopped and unsubscribed, the last route counts handed to the routing profile, the
-        /// page-locked ranges unregistered, the staging arena and the expert tables freed.
+        /// mappings and tiers go: a table outliving them would serve the next model mapped at the same addresses): the
+        /// doorbell stopped and unsubscribed, the last route counts handed to the routing profile, the staging arena and the
+        /// expert tables freed.
         /// </summary>
         public void Dispose()
         {
@@ -1057,8 +1286,6 @@ namespace TensorSharp.Cuda
             catch (CudaException) { }
             _doorbell?.Dispose();
             _doorbell = null;
-            _pins?.Dispose();
-            _pins = null;
             cuda.Context.MakeCurrent();
             if (_stagingArena != IntPtr.Zero)
             {
@@ -1070,6 +1297,8 @@ namespace TensorSharp.Cuda
             if (_stepTables != null)
                 foreach (Tensor t in _stepTables) t.Dispose();
             _stepTables = null;
+            _moeKernels?.Dispose();
+            _moeKernels = null;
             lock (_hostedTables)
             {
                 foreach (HostedTables t in _hostedTables.Values)
@@ -1196,7 +1425,7 @@ namespace TensorSharp.Cuda
                 t = new HostedTables
                 {
                     Gate = Upload(words[0]), Up = Upload(words[1]), Down = Upload(words[2]), OnDevice = mask, Counts = Upload(new int[experts]),
-                    Host = gate.Host, Layer = layer, Experts = experts,
+                    Host = gate.Host, Layer = layer, Experts = experts, Sets = sets, Words = words, Mask = onDevice,
                 };
                 using (Tensor bytes = Upload(maskInts))
                 {

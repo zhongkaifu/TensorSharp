@@ -2119,6 +2119,10 @@ namespace TensorSharp.Models
             /// <summary>Every input follows positions in a known way, so the step can be run again one position on.</summary>
             internal bool Advanceable => !_inputMeta.Exists(m => m.Kind == InputKind.Opaque);
 
+            /// <summary>The executor fuses regions at any row count (<see cref="GraphCapabilities.RegionsAtAnyWidth"/>): a family
+            /// marks its prompt-width regions for decode rows too.</summary>
+            internal bool RegionsAtAnyWidth => _m.GraphExecutor?.Capabilities.RegionsAtAnyWidth == true;
+
             private List<(int Start, int Max)> _advanceLimits;
 
             /// <summary>The graph a trace builds for a sequence continuing at <paramref name="start"/> stays the same only

@@ -38,6 +38,10 @@ namespace TensorSharp.Graph
         /// <summary>A decode step's <see cref="GraphOp.MoeHostExperts"/> stays on the device's stream (the host answers a
         /// doorbell while the device waits), so a step with host experts can be recorded and replayed.</summary>
         public bool RecordsHostExperts { get; init; }
+
+        /// <summary>The executor's kernels take a family's fusion regions at any row count, decode rows too (a family marks
+        /// some regions for prompt chunks only, where the backends that fuse them had prompt-width kernels).</summary>
+        public bool RegionsAtAnyWidth { get; init; }
         /// <summary>A compiled plan is worth keeping to run again (a replayable program is cached and
         /// looked up by its signature); otherwise every step is recorded and compiled once.</summary>
         public bool Replays { get; init; } = true;

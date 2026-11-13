@@ -1451,6 +1451,7 @@ namespace TensorSharp.Graph
         protected virtual Tensor SumRows(Tensor x) => Ops.Sum(null, x, x.DimensionCount - 1);
 
 
+
         /// <summary>The gather indices of <see cref="Gathered"/> by shape, on the device once (the first run, never inside a
         /// recording: a recorded step reads the copy its recording bound).</summary>
         private readonly Dictionary<string, Tensor> _gatherIndices = new();
@@ -1670,7 +1671,7 @@ namespace TensorSharp.Graph
             int k = (int)nid[0], rows = (int)nid[1], routes = k * rows;
             Tensor xc = run.Keep(Contig(x, run).View(rows, hidden));
             float[] weights = weightValue.Floats ?? Contig(weightValue.Tensor, run).GetElementsAsFloat(routes);
-            host.Record(layer, ids);
+            host.Record(layer, ids, GraphExpertAdapt.Weight(rows));
 
             bool stream = host.StreamsStep(layer, rows);
             var here = new byte[routes];   // 1: the route runs on this device

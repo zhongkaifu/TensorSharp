@@ -92,6 +92,8 @@ namespace TensorSharp.Models
             var cancel = _hostWarmCancel.Token;
             GgufFile gguf = _gguf;
             string arch = Config.Architecture;
+            List<(IntPtr Pointer, long Bytes)> stacks = StagedExpertStacks();
+            IHostRangePinner pinner = stacks.Count > 0 ? _allocator as IHostRangePinner : null;
             _hostWarm = System.Threading.Tasks.Task.Run(() =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -100,6 +102,14 @@ namespace TensorSharp.Models
                     long read = gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
                     if (!cancel.IsCancellationRequested)
                         Console.Error.WriteLine($"[{arch}] warmed {read / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
+                    // Then the stacks a prompt chunk stages experts from are page-locked (DMA-speed copies), off the
+                    // request path: locking them as the first prompt arrived cost it 7 s on an A40 (80 GB of Flash Next).
+                    if (pinner != null && !cancel.IsCancellationRequested)
+                    {
+                        sw.Restart();
+                        _hostPins = pinner.PinHostRanges(stacks, cancel);
+                        Console.Error.WriteLine($"[{arch}] page-locked the offloaded experts' file ranges in {sw.Elapsed.TotalSeconds:F1}s");
+                    }
                 }
                 catch (OperationCanceledException) { }
             });
@@ -141,6 +151,27 @@ namespace TensorSharp.Models
             _hostWarmCancel.Dispose();
             _hostWarmCancel = null;
             _hostWarm = null;
+            // Unlocked before the mappings go (a registration outliving them would pin the next model's pages).
+            _hostPins?.Dispose();
+            _hostPins = null;
+        }
+
+        /// <summary>The page-locked file ranges of the offloaded experts (<see cref="IHostRangePinner"/>), or null.</summary>
+        private IDisposable _hostPins;
+
+        /// <summary>The whole gate, up and down stacks of every offloaded layer on a tensor executor: a prompt chunk stages
+        /// the experts its device tier does not hold from them.</summary>
+        private List<(IntPtr Pointer, long Bytes)> StagedExpertStacks()
+        {
+            var stacks = new List<(IntPtr, long)>();
+            if (IsGgmlBackend || _expertOnHost == null) return stacks;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_expertOnHost[l] || !TryGetLayerExperts(l, out var gate, out var up, out var down)) continue;
+                foreach (StackedExpertWeights w in new[] { gate, up, down })
+                    if (w != null && w.Data != IntPtr.Zero) stacks.Add((w.Data, w.TotalRawBytes));
+            }
+            return stacks;
         }
 
         /// <summary>A host-only table is read a few rows a token, on demand: warming every row at load read 28.8 GB
