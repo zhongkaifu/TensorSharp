@@ -34,6 +34,19 @@
 #include "tensorsharp_dsv4_tables.cuh"
 #include "tensorsharp_iq1s_tables.cuh"
 #include "tensorsharp_iq2xxs_tables.cuh"
+// Programmatic dependent launch (sm_90+): a kernel the engine launches with the programmatic-serialization
+// attribute may start while the kernel before it in the stream drains, so its launch overlaps the other's tail.
+// Every exported kernel opens with TS_PDL_ENTRY(): griddepcontrol.wait holds the whole kernel until the grids it
+// depends on have completed and their writes are visible (so nothing it reads or overwrites is touched early), and
+// launch_dependents then lets the next kernel's blocks be scheduled. Below sm_90 (and launched without the attribute)
+// both are no-ops, and the kernel runs exactly as before.
+#ifndef TS_PDL_ENTRY
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define TS_PDL_ENTRY() asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory")
+#else
+#define TS_PDL_ENTRY() do { } while (0)
+#endif
+#endif
 
 #define TS_DSV4_QK8_1 32
 
@@ -422,14 +435,16 @@ __device__ __forceinline__ float ts_dsv4_dot_q5_1_block(
 // committed PTX baseline not yet regenerated, which machines without nvcc load) sends Q5_1 rows down
 // the Q8_0 branch: wrong output and no error. Dsv4Kernels looks this name up, and the engines refuse
 // Q5_1 experts on a module that lacks it. Never launched.
-extern "C" __global__ void ts_dsv4_caps_q5_1_experts() {}
+extern "C" __global__ void ts_dsv4_caps_q5_1_experts() {
+    TS_PDL_ENTRY();}
 
 // Present only in a module whose expert decoders read IQ1_S and IQ2_S on every route, and IQ2_XXS on
 // the grouped (register-staged and tensor-core) routes as well as the warp-per-row ones. A module
 // built from older source decodes the first two as Q8_0, and IQ2_XXS too once it reaches a grouped
 // kernel: Dsv4Kernels looks this name up, and CudaMoe keeps those layouts off a module that lacks it.
 // Never launched.
-extern "C" __global__ void ts_dsv4_caps_lowbit_iq_experts() {}
+extern "C" __global__ void ts_dsv4_caps_lowbit_iq_experts() {
+    TS_PDL_ENTRY();}
 
 // ggml's legacy block formats that ISTA-DASLab's Qwen3.8-Flash-Next Q2_0 pack stores: Q2_0 (its routed
 // experts and some dense projections), Q4_0 and Q5_0 (shared-expert down projections). Each against
@@ -533,7 +548,8 @@ __device__ __forceinline__ float ts_dsv4_dot_q5_0_block(
 
 // Present only in a module whose warp-per-row decoders (decode steps, dense rows, the warp expert route)
 // read Q2_0, Q4_0 and Q5_0; an older module answers NaN for them. Never launched.
-extern "C" __global__ void ts_dsv4_caps_legacy_quants() {}
+extern "C" __global__ void ts_dsv4_caps_legacy_quants() {
+    TS_PDL_ENTRY();}
 
 #define TS_DSV4_WTYPE_Q5_1 7
 #define TS_DSV4_WTYPE_Q8_0 8
@@ -1163,6 +1179,7 @@ extern "C" __global__ void ts_dsv41_engram_gather_f32(
     float* __restrict__ out,            // [nt, columns * headDim]
     const int headDim)
 {
+    TS_PDL_ENTRY();
     const int b = blockIdx.x;
     const uint8_t* row = table + (size_t)rows[b] * rowBytes;
     float* dst = out + (size_t)b * headDim;
@@ -1179,6 +1196,7 @@ extern "C" __global__ void ts_dsv4_embed_f32(
     const int nt,
     const int E)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.y;
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nt || e >= E)
@@ -1203,6 +1221,7 @@ extern "C" __global__ void ts_dsv4_hc_rms_f32(
     const int flatDim,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     const float* x = xs + (size_t)t * flatDim;
 
@@ -1298,13 +1317,17 @@ __device__ __forceinline__ void ts_dsv4_gemv_rows(
 }
 
 extern "C" __global__ void ts_dsv4_gemv_1_f32(const float* x, const float* w, float* y, float* p, int inDim, int outDim, int rows, int splits)
-{ ts_dsv4_gemv_rows<1>(x, w, y, p, inDim, outDim, rows, splits); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_rows<1>(x, w, y, p, inDim, outDim, rows, splits); }
 extern "C" __global__ void ts_dsv4_gemv_4_f32(const float* x, const float* w, float* y, float* p, int inDim, int outDim, int rows, int splits)
-{ ts_dsv4_gemv_rows<4>(x, w, y, p, inDim, outDim, rows, splits); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_rows<4>(x, w, y, p, inDim, outDim, rows, splits); }
 extern "C" __global__ void ts_dsv4_gemv_8_f32(const float* x, const float* w, float* y, float* p, int inDim, int outDim, int rows, int splits)
-{ ts_dsv4_gemv_rows<8>(x, w, y, p, inDim, outDim, rows, splits); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_rows<8>(x, w, y, p, inDim, outDim, rows, splits); }
 extern "C" __global__ void ts_dsv4_gemv_16_f32(const float* x, const float* w, float* y, float* p, int inDim, int outDim, int rows, int splits)
-{ ts_dsv4_gemv_rows<16>(x, w, y, p, inDim, outDim, rows, splits); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_rows<16>(x, w, y, p, inDim, outDim, rows, splits); }
 
 // The same product for a wide output (the MoE router's 256+ experts): a warp per output, four per
 // CTA, lanes striding the whole input row in float4s. The CTA-per-output form gave each of its 128
@@ -1491,10 +1514,10 @@ __device__ __forceinline__ void ts_dsv4_gemv_block_rows(
 #define TS_DSV4_GEMV_BLOCK(R)                                                                                          \
     extern "C" __global__ void __launch_bounds__(TS_DSV4_GEMV_BLOCK_T) ts_dsv4_gemv_block_##R##_f32(                   \
         const float* x, const float* w, float* y, int inDim, int outDim, int rows)                                     \
-    { ts_dsv4_gemv_block_rows<R, false>(x, w, y, inDim, outDim, rows); }                                               \
+    { TS_PDL_ENTRY(); ts_dsv4_gemv_block_rows<R, false>(x, w, y, inDim, outDim, rows); }                                               \
     extern "C" __global__ void __launch_bounds__(TS_DSV4_GEMV_BLOCK_T) ts_dsv4_gemv_block_bf16_##R##_f32(              \
         const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)                            \
-    { ts_dsv4_gemv_block_rows<R, true>(x, w, y, inDim, outDim, rows); }
+    { TS_PDL_ENTRY(); ts_dsv4_gemv_block_rows<R, true>(x, w, y, inDim, outDim, rows); }
 TS_DSV4_GEMV_BLOCK(1)
 TS_DSV4_GEMV_BLOCK(4)
 TS_DSV4_GEMV_BLOCK(8)
@@ -1502,27 +1525,36 @@ TS_DSV4_GEMV_BLOCK(16)
 #undef TS_DSV4_GEMV_BLOCK
 
 extern "C" __global__ void ts_dsv4_gemv_warp_bf16_1_f32(const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)
-{ ts_dsv4_gemv_warp_bf16_rows<1>(x, w, y, inDim, outDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_warp_bf16_rows<1>(x, w, y, inDim, outDim, rows); }
 extern "C" __global__ void ts_dsv4_gemv_warp_bf16_4_f32(const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)
-{ ts_dsv4_gemv_warp_bf16_rows<4>(x, w, y, inDim, outDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_warp_bf16_rows<4>(x, w, y, inDim, outDim, rows); }
 extern "C" __global__ void ts_dsv4_gemv_warp_bf16_8_f32(const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)
-{ ts_dsv4_gemv_warp_bf16_rows<8>(x, w, y, inDim, outDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_warp_bf16_rows<8>(x, w, y, inDim, outDim, rows); }
 extern "C" __global__ void ts_dsv4_gemv_warp_bf16_16_f32(const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)
-{ ts_dsv4_gemv_warp_bf16_rows<16>(x, w, y, inDim, outDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_warp_bf16_rows<16>(x, w, y, inDim, outDim, rows); }
 
 extern "C" __global__ void ts_dsv4_gemv_warp_1_f32(const float* x, const float* w, float* y, int inDim, int outDim, int rows)
-{ ts_dsv4_gemv_warp_rows<1>(x, w, y, inDim, outDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_warp_rows<1>(x, w, y, inDim, outDim, rows); }
 extern "C" __global__ void ts_dsv4_gemv_warp_4_f32(const float* x, const float* w, float* y, int inDim, int outDim, int rows)
-{ ts_dsv4_gemv_warp_rows<4>(x, w, y, inDim, outDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_warp_rows<4>(x, w, y, inDim, outDim, rows); }
 extern "C" __global__ void ts_dsv4_gemv_warp_8_f32(const float* x, const float* w, float* y, int inDim, int outDim, int rows)
-{ ts_dsv4_gemv_warp_rows<8>(x, w, y, inDim, outDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_warp_rows<8>(x, w, y, inDim, outDim, rows); }
 extern "C" __global__ void ts_dsv4_gemv_warp_16_f32(const float* x, const float* w, float* y, int inDim, int outDim, int rows)
-{ ts_dsv4_gemv_warp_rows<16>(x, w, y, inDim, outDim, rows); }
+{
+    TS_PDL_ENTRY(); ts_dsv4_gemv_warp_rows<16>(x, w, y, inDim, outDim, rows); }
 
 // y[i] = sum over s of partials[i, s], in split order.
 extern "C" __global__ void ts_dsv4_gemv_combine_f32(
     const float* __restrict__ partials, float* __restrict__ y, const int count, const int splits)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
@@ -1791,6 +1823,7 @@ extern "C" __global__ void ts_dsv4_hc_gates_comb_f32(
     const int iters,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nt)
         return;
@@ -1818,6 +1851,7 @@ extern "C" __global__ void __launch_bounds__(256) ts_dsv4_hc_mix_partials_f32(
     const float* __restrict__ xs, const uint8_t* __restrict__ fn, const int wtype,
     float* __restrict__ partials, const int flat)
 {
+    TS_PDL_ENTRY();
     ts_hc_mix_partials(xs, fn, wtype, partials, flat);
 }
 
@@ -1828,6 +1862,7 @@ extern "C" __global__ void __launch_bounds__(256) ts_dsv4_hc_pre_finish_f32(
     const float* __restrict__ collapseWith, const int meanCollapse, float* __restrict__ publish,
     float* __restrict__ cur, const int e, const int iters, const float hcEps, const float rmsEps)
 {
+    TS_PDL_ENTRY();
     ts_hc_pre_finish(partials, nSlices, xs, scale, baseW, normW, pre, post, comb,
         collapseWith, meanCollapse, publish, cur, e, iters, hcEps, rmsEps);
 }
@@ -1840,6 +1875,7 @@ extern "C" __global__ void ts_dsv4_hc_collapse_f32(
     const int nt,
     const int E)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.y;
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nt || e >= E)
@@ -1864,6 +1900,7 @@ extern "C" __global__ void ts_dsv4_hc_post_f32(
     const int nt,
     const int E)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nt || i >= 4 * E)
@@ -1896,6 +1933,7 @@ extern "C" __global__ void ts_dsv4_hc_head_f32(
     const int baseCount,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int flatDim = 4 * E;
     const float* __restrict__ x = xAll + (size_t)blockIdx.x * flatDim;
     float* __restrict__ cur = curAll + (size_t)blockIdx.x * E;
@@ -1974,6 +2012,7 @@ extern "C" __global__ void ts_dsv4_attn_prep_f32(
     const int nRot,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const bool isKv = h == NH;
@@ -2055,6 +2094,7 @@ extern "C" __global__ void ts_dsv4_ape_add_f32(
     const int nt,
     const int cw)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nt || i >= cw)
@@ -2088,6 +2128,7 @@ extern "C" __global__ void ts_dsv4_compress_f32(
     const int nRot,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int b = blockIdx.x;
     if (b >= nBlocks)
         return;
@@ -2187,6 +2228,7 @@ extern "C" __global__ void ts_dsv4_persist_f32(
     const int stateSize,
     const int cw)
 {
+    TS_PDL_ENTRY();
     const int np = nt < stateSize ? nt : stateSize;
     const long long total = (long long)np * cw;
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2215,6 +2257,7 @@ extern "C" __global__ void ts_dsv4_idx_prep_f32(
     const int nRot,
     const float iwScale)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int t = blockIdx.y;
 
@@ -2263,6 +2306,7 @@ extern "C" __global__ void ts_dsv4_idx_scores_f32(
     const int nt,
     const int scoreStride)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.y;
     const int nVis = (int)(((long long)p0 + t + 1) / ratio);
     const int r0 = blockIdx.x * TS_DSV4_IDX_ROWS_PER_BLOCK;
@@ -2318,6 +2362,7 @@ extern "C" __global__ void ts_dsv4_topk_f32(
     const int scoreStride,
     const int32_t* __restrict__ positions)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     const long long pos = positions != nullptr ? (long long)positions[t] : (long long)p0 + t;
     const int nVis = (int)((pos + 1) / ratio);
@@ -2464,6 +2509,7 @@ extern "C" __global__ void ts_dsv4_attention_f32(
     const float kqScale,
     const int32_t* __restrict__ positions)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const long long p = positions != nullptr ? (long long)positions[t] : (long long)p0 + t;
@@ -2625,6 +2671,7 @@ extern "C" __global__ void ts_dsv4_attn_finish_f32(
     const int nt,
     const int* __restrict__ pos)       // [nt] or nullptr
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int t = blockIdx.y;
 
@@ -2668,6 +2715,7 @@ extern "C" __global__ void ts_dsv4_regroup_f32(
     const int nt,
     const int R)
 {
+    TS_PDL_ENTRY();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const long long total = (long long)G * nt * R;
     if (i >= total)
@@ -2763,6 +2811,7 @@ extern "C" __global__ void ts_dsv4_moe_select_f32(
     const float wScale,
     const int gating)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     const float* lg = logits + (size_t)t * nExpert;
     int32_t* selT = sel + (size_t)t * nUsed;
@@ -2981,6 +3030,7 @@ extern "C" __global__ void __launch_bounds__(32) ts_dsv4_moe_select_keys_f32(
     const float wScale,
     const int gating)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x, lane = threadIdx.x;
     const float* lg = logits + (size_t)t * nExpert;
     __shared__ float shRaw[32 * TS_DSV4_SELECT_PER_LANE];
@@ -3033,6 +3083,7 @@ extern "C" __global__ void __launch_bounds__(32) ts_dsv4_moe_select_keys_f32(
 extern "C" __global__ void ts_dsv4_moe_count_i32(
     const int32_t* __restrict__ sel, int32_t* __restrict__ counts, const int S)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= S)
         return;
@@ -3045,6 +3096,7 @@ extern "C" __global__ void ts_dsv4_moe_scan_i32(
     int32_t* __restrict__ cursors,
     const int nExpert)
 {
+    TS_PDL_ENTRY();
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
     int off = 0;
@@ -3064,6 +3116,7 @@ extern "C" __global__ void ts_dsv4_moe_scatter_i32(
     const int S,
     const int nUsed)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= S)
         return;
@@ -3589,6 +3642,7 @@ extern "C" __global__ void ts_dsv4_moe_gateup_staged_f32(
     const unsigned long long* __restrict__ gateTab,
     const unsigned long long* __restrict__ upTab)
 {
+    TS_PDL_ENTRY();
     const int e = blockIdx.y;
     const int m = counts[e];
     if (m == 0)
@@ -3646,6 +3700,7 @@ extern "C" __global__ void ts_dsv4_moe_down_staged_f32(
     const long long rowBytes,
     const unsigned long long* __restrict__ downTab)
 {
+    TS_PDL_ENTRY();
     const int e = blockIdx.y;
     const int m = counts[e];
     if (m == 0)
@@ -3734,6 +3789,7 @@ extern "C" __global__ void __launch_bounds__(TS_MOE_MMA_THREADS, 2) ts_dsv4_moe_
     const unsigned long long* __restrict__ tab0,
     const unsigned long long* __restrict__ tab1)
 {
+    TS_PDL_ENTRY();
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const int e = blockIdx.y;
     const int m = counts[e];
@@ -3968,6 +4024,7 @@ __host__ __device__ __forceinline__ int ts_q2i8_perm32(int k) { return 8 * (k & 
 extern "C" __global__ void ts_dsv4_q2i8_quant_act_f32(const float* __restrict__ x, const long long nblk,
                                                       uint8_t* __restrict__ xa)
 {
+    TS_PDL_ENTRY();
     const long long w = (long long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
     if (w >= nblk)
@@ -4271,6 +4328,7 @@ extern "C" __global__ void __launch_bounds__(TS_Q2I8_THREADS, 2) ts_dsv4_moe_q2i
     const unsigned long long* __restrict__ gateTab,
     const unsigned long long* __restrict__ upTab)
 {
+    TS_PDL_ENTRY();
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const int e = blockIdx.y;
     const int m = counts[e];
@@ -4303,6 +4361,7 @@ extern "C" __global__ void __launch_bounds__(TS_Q2I8_THREADS, 2) ts_dsv4_moe_q2i
     const unsigned long long* __restrict__ downTab,
     const int32_t* __restrict__ actRow)
 {
+    TS_PDL_ENTRY();
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const int e = blockIdx.y;
     const int m = counts[e];
@@ -4327,6 +4386,7 @@ extern "C" __global__ void ts_dsv4_moe_row_map_i32(
     int32_t* __restrict__ actRow,
     const int slots)
 {
+    TS_PDL_ENTRY();
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= slots)
         return;
@@ -4357,6 +4417,7 @@ extern "C" __global__ void ts_dsv4_moe_gateup_f32(
     const unsigned long long* __restrict__ gateTab,
     const unsigned long long* __restrict__ upTab)
 {
+    TS_PDL_ENTRY();
     const int e = blockIdx.x;
     const int m = counts[e];
     if (m == 0)
@@ -4400,6 +4461,7 @@ extern "C" __global__ void ts_dsv4_moe_down_f32(
     const long long rowBytes,
     const unsigned long long* __restrict__ downTab)
 {
+    TS_PDL_ENTRY();
     const int e = blockIdx.x;
     const int m = counts[e];
     if (m == 0)
@@ -4445,6 +4507,7 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_f32(
     const unsigned long long* __restrict__ gateTab,
     const unsigned long long* __restrict__ upTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
     act += (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
@@ -4510,6 +4573,7 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v_f32(
     const unsigned long long* __restrict__ gateTab,
     const unsigned long long* __restrict__ upTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
     act += (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
@@ -4544,6 +4608,7 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v_pair_f32(
     const unsigned long long* __restrict__ gateTab,
     const unsigned long long* __restrict__ upTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
     act += (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
@@ -4601,6 +4666,7 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_q80v_f32(
     const long long rowBytes,
     const unsigned long long* __restrict__ downTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
     const int rr = blockIdx.y * 8 + threadIdx.x / 32;
@@ -4676,6 +4742,7 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v8_pair_f32(
     const unsigned long long* __restrict__ gateTab,
     const unsigned long long* __restrict__ upTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
     act += (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
@@ -4713,6 +4780,7 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_q80v8_f32(
     const long long rowBytes,
     const unsigned long long* __restrict__ downTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
     const int lane = threadIdx.x % 32;
@@ -4742,6 +4810,7 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_f32(
     const long long rowBytes,
     const unsigned long long* __restrict__ downTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
 
@@ -4776,6 +4845,7 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_short_f32(
     const long long rowBytes,
     const unsigned long long* __restrict__ downTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
     const int lane = threadIdx.x % 32;
@@ -4809,6 +4879,7 @@ extern "C" __global__ void ts_dense_bf16_rows_f32(
     const int inDim,
     const int rows)
 {
+    TS_PDL_ENTRY();
     const int o = (int)((blockIdx.x * (size_t)blockDim.x + threadIdx.x) >> 5);
     const int lane = threadIdx.x & 31;
     if (o >= outDim)
@@ -4852,6 +4923,7 @@ extern "C" __global__ void ts_dsv4_dense_q81_rows_splitk_f32(
     const int inDim,
     const long long rowBytes)
 {
+    TS_PDL_ENTRY();
     const int o = blockIdx.x, row = blockIdx.y;
     const int warpId = threadIdx.x >> 5, lane = threadIdx.x & 31;
     __shared__ float part[8];
@@ -4878,6 +4950,7 @@ extern "C" __global__ void ts_dense_bf16_rows_splitk_f32(
     const int inDim,
     const int rows)
 {
+    TS_PDL_ENTRY();
     const int o = blockIdx.x;
     const int warpId = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const unsigned int* wr = (const unsigned int*)(w + (size_t)o * inDim);
@@ -4930,6 +5003,7 @@ extern "C" __global__ void ts_dsv4_dense_q81_rows_multi_f32(
     const long long rowBytes,
     const int rows)
 {
+    TS_PDL_ENTRY();
     const int lane = threadIdx.x % 32;
     const int rr = blockIdx.x * 8 + threadIdx.x / 32;
     if (rr >= outDim)
@@ -4952,6 +5026,7 @@ extern "C" __global__ void ts_dsv4_dense_q81_rows_f32(
     const int inDim,
     const long long rowBytes)
 {
+    TS_PDL_ENTRY();
     const int row = blockIdx.y;
     const int warpId = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -5323,7 +5398,7 @@ __device__ __forceinline__ void ts_dsv4_dense_fast(
     extern "C" __global__ void __launch_bounds__(256) ts_dsv4_dense_fast_r##R##_w##W##_f32(                              \
         const uint8_t* w, const ts_dsv4_block_q8_1* act, float* out, const int wtype, const int outDim, const int inDim, \
         const long long rowBytes, const int rows)                                                                         \
-    { ts_dsv4_dense_fast<R, W>(w, act, out, wtype, outDim, inDim, rowBytes, rows); }
+    { TS_PDL_ENTRY(); ts_dsv4_dense_fast<R, W>(w, act, out, wtype, outDim, inDim, rowBytes, rows); }
 TS_DSV4_DENSE_FAST(1, 1)
 TS_DSV4_DENSE_FAST(2, 1)
 TS_DSV4_DENSE_FAST(4, 1)
@@ -5372,6 +5447,7 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_half_f32(
     const unsigned long long* __restrict__ gateTab,
     const unsigned long long* __restrict__ upTab)
 {
+    TS_PDL_ENTRY();
     const int slot = blockIdx.x;
     const int e = sel[slot];
     const ts_dsv4_block_q8_1* a = act + (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
@@ -5433,6 +5509,7 @@ extern "C" __global__ void ts_dsv4_moe_stage_plan(
     const long long offDown,
     const int capacity)
 {
+    TS_PDL_ENTRY();
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < slots; i += gridDim.x * blockDim.x)
     {
         const int e = sel[i];
@@ -5471,6 +5548,7 @@ extern "C" __global__ void ts_dsv4_moe_stage_copy(
     const int capacity,
     const int chunks)
 {
+    TS_PDL_ENTRY();
     const int k = blockIdx.x / chunks;
     if (k >= min(*stageCount, capacity))
         return;
@@ -5509,6 +5587,7 @@ extern "C" __global__ void ts_dsv4_moe_stage_copy_from(
     const int capacity,
     const int chunks)
 {
+    TS_PDL_ENTRY();
     const int k = *stageFrom + (int)(blockIdx.x / chunks);
     if (k >= min(*stageCount, capacity))
         return;
@@ -5541,6 +5620,7 @@ extern "C" __global__ void ts_dsv4_moe_unstage(
     const unsigned long long* __restrict__ hostTabDown,
     const int capacity)
 {
+    TS_PDL_ENTRY();
     const int n = min(*stageCount, capacity);
     for (int i = threadIdx.x; i < n; i += blockDim.x)
     {
@@ -5576,6 +5656,7 @@ extern "C" __global__ void ts_moe_doorbell_publish(
     int32_t* hdr,
     unsigned int* seq)
 {
+    TS_PDL_ENTRY();
     int miss = 0;
     for (int i = threadIdx.x; i < slots; i += blockDim.x)
     {
@@ -5614,6 +5695,7 @@ extern "C" __global__ void ts_moe_doorbell_wait_add(
     float* __restrict__ dst,
     const int n)
 {
+    TS_PDL_ENTRY();
     __shared__ int add;
     if (threadIdx.x == 0)
     {
@@ -5651,6 +5733,7 @@ extern "C" __global__ void ts_moe_doorbell_publish_skip(
     unsigned int* counts,                // [layers, nExpert] selections (adaptive residency), or null
     const int nExpert)
 {
+    TS_PDL_ENTRY();
     int miss = 0;
     for (int i = threadIdx.x; i < slots; i += blockDim.x)
     {
@@ -5710,6 +5793,7 @@ extern "C" __global__ void ts_moe_doorbell_publish_tail(
     const int nUsed,
     const int tailRank)
 {
+    TS_PDL_ENTRY();
     int miss = 0;
     for (int i = threadIdx.x; i < slots; i += blockDim.x)
     {
@@ -5787,6 +5871,7 @@ extern "C" __global__ void ts_moe_doorbell_publish_hybrid(
     const int capacity,
     const int odd)
 {
+    TS_PDL_ENTRY();
     if (threadIdx.x < 32)
     {
         const int lane = threadIdx.x;
@@ -5882,6 +5967,7 @@ extern "C" __global__ void ts_moe_doorbell_wait_add_skip(
     const int n,
     const int32_t* __restrict__ missDev)
 {
+    TS_PDL_ENTRY();
     if (*missDev == 0)
         return;
     __shared__ int add;
@@ -5911,6 +5997,7 @@ extern "C" __global__ void ts_dsv4_moe_scatter_add_f32(
     const int nUsed,
     const int E)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.y;
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nt || e >= E)
@@ -5959,6 +6046,7 @@ extern "C" __global__ void ts_dsv4_hc_mean_f32(
     const int dstStride,
     const int dstOff)
 {
+    TS_PDL_ENTRY();
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const long long total = (long long)nt * E;
     if (i >= total)
@@ -5995,6 +6083,7 @@ extern "C" __global__ void ts_dsv4_dspark_prep_f32(
     const float eps,
     const int kvOnly)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const bool isKv = kvOnly != 0 || h == NH;
@@ -6076,6 +6165,7 @@ extern "C" __global__ void ts_dsv4_dspark_gather_f32(
     float* __restrict__ dst,        // [R]
     const int R)
 {
+    TS_PDL_ENTRY();
     const int tok = tokSlot < 0 ? anchorTok : toks[tokSlot];
     for (int i = threadIdx.x; i < R; i += blockDim.x)
         dst[i] = w1[(size_t)tok * R + i];
@@ -6090,6 +6180,7 @@ extern "C" __global__ void ts_dsv4_dspark_argmax_f32(
     const int slot,
     const int V)
 {
+    TS_PDL_ENTRY();
     __shared__ float shV[256];
     __shared__ int shI[256];
 
@@ -6136,6 +6227,7 @@ extern "C" __global__ void ts_dsv4_dspark_conf_f32(
     const int E,
     const int R)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     __shared__ float red[256];
 
@@ -6294,6 +6386,7 @@ extern "C" __global__ void ts_dsv41_attn_prep_f32(
     const int nRot,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const bool isKv = h == NH;
@@ -6377,6 +6470,7 @@ extern "C" __global__ void ts_dsv41_compress_f32(
     const float eps,
     const int stateSize)                 // ratio + the drafter's block: see ts_dsv41_persist_f32
 {
+    TS_PDL_ENTRY();
     const int bi = blockIdx.x;
     const long long p = firstBoundary + (long long)bi * ratio;
     const long long start = p + 1 - ratio;
@@ -6449,6 +6543,7 @@ extern "C" __global__ void ts_dsv41_commit_f32(
     const int nRot,
     const int mode)
 {
+    TS_PDL_ENTRY();
     const int bi = blockIdx.x;
     const long long p = firstBoundary + (long long)bi * ratio;
     const long long start = p + 1 - ratio;
@@ -6486,6 +6581,7 @@ extern "C" __global__ void ts_dsv41_persist_f32(
     const int stateSize,
     const int HD)
 {
+    TS_PDL_ENTRY();
     const int i = blockIdx.y;                 // 0..min(nt, stateSize)-1, newest last
     const int t = nt - min(nt, stateSize) + i;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6507,6 +6603,7 @@ extern "C" __global__ void ts_dsv41_idx_prep_f32(
     const int nRot,
     const float iwScale)
 {
+    TS_PDL_ENTRY();
     const int h = blockIdx.x;
     const int t = blockIdx.y;
 
@@ -6546,6 +6643,7 @@ extern "C" __global__ void ts_dsv41_idx_scores_f32(
     const int rows,
     const int maxVis)
 {
+    TS_PDL_ENTRY();
     const int r = blockIdx.x * blockDim.y + threadIdx.y;
     const int t = blockIdx.y;
     if (r >= maxVis)
@@ -6591,6 +6689,7 @@ extern "C" __global__ void ts_dsv41_candidate_f32(
     const int blockLen,
     const int topk)
 {
+    TS_PDL_ENTRY();
     const int t = blockIdx.x;
     const long long p = (long long)p0 + t;
     const int nVis = (int)((p + 1) / ratio);
@@ -6656,6 +6755,7 @@ extern "C" __global__ void ts_dsv41_engram_gate_f32(
     const int E,
     const float eps)
 {
+    TS_PDL_ENTRY();
     const int st = blockIdx.x;
     const int t = blockIdx.y;
     const int HC41 = gridDim.x;

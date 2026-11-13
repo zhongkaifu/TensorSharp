@@ -129,6 +129,9 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] q80PairMma;
         private readonly IntPtr[][] q80PairTwin;
         private readonly IntPtr[][] q80PairLane;
+        // The pair over a packed copy (optional: a module before it has none; HasQ80PairSwap is then false).
+        private readonly IntPtr[][] q80PairSwap;
+        private readonly IntPtr q80PairPack;
         private readonly IntPtr[] quantMatmulLowKDp4aF32;
         private readonly IntPtr quantMatmulQ4KDp4aF32;
         private readonly IntPtr quantMatmulQ5KDp4aF32;
@@ -202,6 +205,7 @@ namespace TensorSharp.Cuda
             // Enable them only when the code the driver loaded was compiled for sm_80+ (a
             // release fatbin's sm_86 SASS is, though the PTX beside it targets compute_75).
             compiledArch = module.CompiledArchOf("ts_copy2d_bytes");
+            s_pdl = CudaPdl.UsableFor(compiledArch);
             sm80KernelsUsable = ArchGuardedKernelsUsable(compiledArch, ccMajor);
             var archDisabled = new System.Collections.Generic.List<string>();
             if (ccMajor >= 8 && !sm80KernelsUsable)
@@ -349,6 +353,18 @@ namespace TensorSharp.Cuda
                 q80PairLane = pairLane;
             }
             catch (CudaException ex) when (ex.ErrorCode == 500) { q80PairMma = null; q80PairTwin = null; q80PairLane = null; }
+            try
+            {
+                var swap = new IntPtr[Q80PairSliceCounts.Length][];
+                for (int i = 0; i < Q80PairSliceCounts.Length; i++)
+                {
+                    int s = Q80PairSliceCounts[i];
+                    swap[i] = new[] { module.GetFunction("ts_q80_pair_swap_" + s + "_1"), module.GetFunction("ts_q80_pair_swap_" + s + "_2") };
+                }
+                q80PairPack = module.GetFunction("ts_q80_pair_pack");
+                q80PairSwap = swap;
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { q80PairSwap = null; q80PairPack = IntPtr.Zero; }
             quantMatmulLowKDp4aF32 = LowKFunctions(module, "ts_quant_matmul_lowk_dp4a_f32");
             quantMatmulQ4KDp4aF32 = module.GetFunction("ts_quant_matmul_q4k_dp4a_f32");
             quantMatmulQ5KDp4aF32 = module.GetFunction("ts_quant_matmul_q5k_dp4a_f32");
@@ -2898,6 +2914,30 @@ namespace TensorSharp.Cuda
         /// tensor-core half has a body (sm_80+ code on an sm_80+ device; see <see cref="ArchGuardedKernelsUsable"/>).</summary>
         public bool HasQ80Pair => q80PairMma != null && sm80KernelsUsable;
 
+        /// <summary>Whether the pair's swapped tensor-core kernel (<see cref="Q80PairKernel.Swap"/>, over a copy packed by
+        /// <see cref="LaunchQ80PairPack"/>) runs here. TS_Q80_PAIR_SWAP=0 keeps the three kernels over the GGUF layout.</summary>
+        public bool HasQ80PairSwap => HasQ80Pair && q80PairSwap != null && q80PairPack != IntPtr.Zero && Q80PairSwapEnabled;
+
+        private static readonly bool Q80PairSwapEnabled = Environment.GetEnvironmentVariable("TS_Q80_PAIR_SWAP") != "0";
+
+        /// <summary>Bytes of a packed copy of a Q8_0 [outDim, inDim] weight: per 16-column tile and 32-value block, 512 bytes
+        /// of quants and 32 of scales (columns padded to a whole tile).</summary>
+        public static long Q80PairPackedBytes(int inDim, int outDim) => (long)((outDim + 15) / 16) * (inDim / 32) * 544;
+
+        /// <summary>Pack a Q8_0 [outDim, inDim] weight (GGUF blocks) into <paramref name="packed"/>
+        /// (<see cref="Q80PairPackedBytes"/>) for <see cref="Q80PairKernel.Swap"/>.</summary>
+        public void LaunchQ80PairPack(IntPtr weights, IntPtr packed, int inDim, int outDim, IntPtr stream)
+        {
+            IntPtr a0 = weights, a1 = packed;
+            int a2 = inDim, a3 = outDim;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3 };
+            long n = (long)((outDim + 15) / 16) * (inDim / 32) * 32;
+            Launch(q80PairPack, (uint)Math.Min(4096, (n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>16-column tiles a CTA of the swapped kernel takes for a slice count (TS_Q80_PAIR_SWAP's table).</summary>
+        internal static int Q80PairSwapTiles(int slices) => slices <= 2 ? 2 : 1;
+
         /// <summary>Rows <see cref="LaunchQuantMatmulQ80Pair"/> takes in one launch.</summary>
         public const int Q80PairMaxRows = 16;
 
@@ -2926,6 +2966,9 @@ namespace TensorSharp.Cuda
             Lane,
             /// <summary>int8 tensor cores, a warp per 16 x 8 tile and slice, 1-16 rows.</summary>
             Mma,
+            /// <summary>int8 tensor cores with the weight as the 16-column operand, over a packed copy (16-byte loads,
+            /// 8 or 16 blocks in flight a warp), 1-16 rows; only where the weight has one.</summary>
+            Swap,
         }
 
         /// <summary>
@@ -2966,8 +3009,44 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void LaunchQuantMatmulQ80Pair(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim,
             int rows, IntPtr stream)
-            => LaunchQuantMatmulQ80PairKernel(Q80PairKernelOnDevice(inDim, outDim, rows), weights, xqScratch, output, inDim,
-                outDim, rows, stream);
+            => LaunchQuantMatmulQ80Pair(weights, IntPtr.Zero, xqScratch, output, inDim, outDim, rows, stream);
+
+        /// <summary><see cref="LaunchQuantMatmulQ80Pair(IntPtr, IntPtr, IntPtr, int, int, int, IntPtr)"/> for a weight that may
+        /// have a packed copy (<paramref name="packed"/>, zero for none): the swapped kernel runs where it was timed fastest
+        /// and the copy exists, otherwise the GGUF layout's kernel as before.</summary>
+        public void LaunchQuantMatmulQ80Pair(IntPtr weights, IntPtr packed, IntPtr xqScratch, IntPtr output, int inDim, int outDim,
+            int rows, IntPtr stream)
+        {
+            Q80PairKernel kernel = Q80PairKernelOnDevice(inDim, outDim, rows);
+            if (kernel == Q80PairKernel.Swap)
+            {
+                if (packed != IntPtr.Zero)
+                {
+                    LaunchQuantMatmulQ80PairSwap(packed, xqScratch, output, inDim, outDim, rows, stream);
+                    return;
+                }
+                kernel = Q80PairKernelFor(inDim, outDim, rows);
+            }
+            LaunchQuantMatmulQ80PairKernel(kernel, weights, xqScratch, output, inDim, outDim, rows, stream);
+        }
+
+        /// <summary>The pair's sums from a packed copy (<see cref="LaunchQ80PairPack"/>): bit for bit the other kernels'.</summary>
+        internal void LaunchQuantMatmulQ80PairSwap(IntPtr packed, IntPtr xqScratch, IntPtr output, int inDim, int outDim, int rows,
+            IntPtr stream)
+        {
+            if (!HasQ80PairSwap)
+                throw new InvalidOperationException("Q8_0 pair matvec: the loaded module has no swapped kernel for this GPU");
+            if (rows < 1 || rows > Q80PairMaxRows || (inDim & 31) != 0)
+                throw new ArgumentOutOfRangeException(nameof(rows), $"Q8_0 pair matvec (swap): {rows} rows of width {inDim}");
+            IntPtr a0 = packed, a1 = xqScratch, a2 = output;
+            int a3 = inDim, a4 = outDim, a5 = rows;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            int s = Q80PairSlices(inDim, outDim);
+            int si = System.Numerics.BitOperations.Log2((uint)s);
+            int tpc = Q80PairSwapTiles(s);
+            int tiles = (outDim + 15) / 16;
+            Launch(q80PairSwap[si][rows <= 8 ? 0 : 1], (uint)((tiles + tpc - 1) / tpc), 1, 1, 32 * s * tpc, 1, 1, 0, stream, args);
+        }
 
         /// <summary><see cref="LaunchQuantMatmulQ80Pair"/> on a given kernel (tests: each must give the others' bits).</summary>
         internal void LaunchQuantMatmulQ80PairKernel(Q80PairKernel kernel, IntPtr weights, IntPtr xqScratch, IntPtr output,
@@ -3155,8 +3234,16 @@ namespace TensorSharp.Cuda
             module.Dispose();
         }
 
+        // Programmatic dependent launch for this module's kernels (CudaPdl): set once its code is known to be sm_90+.
+        private static bool s_pdl;
+
         private static void Launch(IntPtr function, uint gx, uint gy, uint gz, int bx, int by, int bz, uint sharedBytes, IntPtr stream, void** args)
         {
+            if (s_pdl)
+            {
+                CudaPdl.Launch(function, gx, gy, gz, (uint)bx, (uint)by, (uint)bz, sharedBytes, stream, args).ThrowOnError();
+                return;
+            }
             CudaDriverApi.cuLaunchKernel(
                 function,
                 gx,

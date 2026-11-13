@@ -6,6 +6,7 @@
 extern "C" __global__ void ts_gemma4_vision_rope2d_f32(
     float* data, const float* cosine, const float* sine, int pairs, int heads, int head_dim)
 {
+    TS_PDL_ENTRY();
     int pair = blockIdx.x * blockDim.x + threadIdx.x;
     if (pair >= pairs) return;
     int half = head_dim / 2, quarter = head_dim / 4;
@@ -23,6 +24,7 @@ extern "C" __global__ void ts_gemma4_vision_rope2d_f32(
 extern "C" __global__ void ts_gemma4_vision_pad_f32(
     const float* input, float* output, int count, int input_columns, int output_columns)
 {
+    TS_PDL_ENTRY();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     int row = i / output_columns, column = i % output_columns;

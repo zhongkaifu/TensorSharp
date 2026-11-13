@@ -979,6 +979,8 @@ namespace TensorSharp.Cuda
             StageEnd(dev, StHc);
             if (L.Recurrent)
                 Gdn(dev, L, il, slot, nt, rows, curQ);
+            else if (rows != null && BatchedAttentionFor(dev, L, il, rows, nt, pos))
+                AttentionRows(dev, L, il, rows, nt, positions, pos, curQ);
             else if (rows != null)
                 // A batched step's rows, a sequence's at a time: one row each in a batched decode step, a sequence's whole
                 // window (consecutive positions) in a batched verify, issued as that sequence's own verify issues it. A

@@ -172,6 +172,72 @@ public sealed class Q80PairMatvecTests
             $"in {checkedCalls} calls");
     }
 
+    /// <summary>
+    /// The swapped tensor-core kernel over a packed copy (<see cref="CudaKernels.LaunchQ80PairPack"/>) gives the tensor
+    /// cores' bits at every row count 1-16, so the tuning may pick it per shape for speed alone. The odd shapes cover a
+    /// last 16-column tile that is partly padding and a slice count that does not divide the blocks evenly.
+    /// </summary>
+    [CudaTheory(TensorCoreModule = "tensorsharp_kernels")]
+    [InlineData(2560, 10240)]
+    [InlineData(2560, 6144)]
+    [InlineData(6144, 2560)]
+    [InlineData(2560, 12288)]
+    [InlineData(2560, 512)]
+    [InlineData(10240, 320)]
+    [InlineData(320, 10240)]
+    [InlineData(640, 2560)]
+    [InlineData(2560, 248320)]
+    [InlineData(96, 40)]
+    [InlineData(1056, 1000)]
+    public void SwappedPairKernel_GivesTheTensorCoresBits(int inDim, int outDim)
+    {
+        const int Rows = CudaKernels.Q80PairMaxRows;
+        long rowBytes = inDim / 32 * 34;
+        byte[] weights = QuantRows(Q8_0, outDim, rowBytes, seed: 31);
+        var act = new float[Rows, inDim];
+        for (int t = 0; t < Rows; t++)
+            for (int k = 0; k < inDim; k++)
+                act[t, k] = MathF.Sin(0.0173f * (k + 5) * (t + 1)) + 0.25f * MathF.Cos(0.041f * k + 3 * t);
+
+        using var allocator = new CudaAllocator(0);
+        allocator.Context.MakeCurrent();
+        if (!allocator.Kernels.HasQ80PairSwap)
+        {
+            _output.WriteLine("the module has no swapped pair kernel (TS_Q80_PAIR_SWAP=0 or an old module)");
+            return;
+        }
+        IntPtr stream = allocator.Stream.Handle;
+        using var w = Up(allocator, weights);
+        using var packed = new Tensor(allocator, DType.UInt8, CudaKernels.Q80PairPackedBytes(inDim, outDim));
+        allocator.Kernels.LaunchQ80PairPack(Dsv4CudaEngine.Ptr(w), Dsv4CudaEngine.Ptr(packed), inDim, outDim, stream);
+        using var input = Up(allocator, act);
+        long q81Row = (long)(inDim / 32) * CudaKernels.Q81BlockBytes;
+        using var xq = new Tensor(allocator, DType.UInt8, Rows * q81Row);
+        CudaQuantizedOps.QuantizeRowsQ81(allocator, Dsv4CudaEngine.Ptr(input), Dsv4CudaEngine.Ptr(xq), inDim, Rows);
+        using var want = new Tensor(allocator, DType.Float32, Rows, outDim);
+        using var got = new Tensor(allocator, DType.Float32, Rows, outDim);
+
+        for (int rows = 1; rows <= Rows; rows++)
+        {
+            allocator.Kernels.LaunchQuantMatmulQ80PairKernel(CudaKernels.Q80PairKernel.Mma, Dsv4CudaEngine.Ptr(w),
+                Dsv4CudaEngine.Ptr(xq), Dsv4CudaEngine.Ptr(want), inDim, outDim, rows, stream);
+            allocator.Kernels.LaunchFillF32(Dsv4CudaEngine.Ptr(got), Rows * outDim, float.NaN, stream);
+            allocator.Kernels.LaunchQuantMatmulQ80PairSwap(Dsv4CudaEngine.Ptr(packed), Dsv4CudaEngine.Ptr(xq),
+                Dsv4CudaEngine.Ptr(got), inDim, outDim, rows, stream);
+            allocator.Stream.Synchronize();
+            float[] mma = Down(want, rows * outDim);
+            float[] k = Down(got, Rows * outDim);
+            for (int i = 0; i < rows * outDim; i++)
+                if (BitConverter.SingleToInt32Bits(k[i]) != BitConverter.SingleToInt32Bits(mma[i]))
+                    Assert.Fail($"{inDim} -> {outDim}, {rows} rows: the swapped kernel gives {k[i]:R} at row " +
+                        $"{i / outDim}, column {i % outDim}, the tensor cores {mma[i]:R}");
+            for (int i = rows * outDim; i < Rows * outDim; i++)
+                if (!float.IsNaN(k[i]))
+                    Assert.Fail($"{inDim} -> {outDim}, {rows} rows: the swapped kernel wrote row {i / outDim}");
+        }
+        _output.WriteLine($"{inDim} -> {outDim}: the swapped kernel bit-equal to the tensor cores at 1-{Rows} rows");
+    }
+
     /// <summary>The kernel each of the model's decode shapes gets, by rows (speed only; the bits are the same).</summary>
     [Theory]
     [InlineData(2560, 10240, 1, "Twin")]

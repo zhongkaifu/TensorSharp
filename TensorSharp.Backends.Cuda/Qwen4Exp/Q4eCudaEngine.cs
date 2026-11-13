@@ -478,7 +478,7 @@ namespace TensorSharp.Cuda
                 foreach (var w in LayerWeights(m.Layers[il], experts: _residency == null))
                     layerBytes[il] += CudaWeightArena.Align(w.TotalBytes);
                 cacheBytes[il] = LayerCacheBytes(il);
-                layerBytes[il] += LayerFloatBytes(m.Layers[il]) + cacheBytes[il];
+                layerBytes[il] += LayerFloatBytes(m.Layers[il]) + cacheBytes[il] + PairPackedBytesOf(LayerWeights(m.Layers[il], experts: false));
             }
             int[] assignment = PlaceLayers(layerBytes, cacheBytes);
             _lastDev = assignment[m.NLayer - 1];
@@ -538,7 +538,8 @@ namespace TensorSharp.Cuda
 
             foreach (var dev in _devs)
                 AllocateScratch(dev);
-            // Before the first slot: the timing's weight copies need the VRAM the slot's caches will take.
+            // Before the first slot: the packed copies and the timing's weight copies need the VRAM the slot's caches will take.
+            PackPairWeights();
             TuneQ80PairKernels();
             ReportResidency();
             StartHostExperts();
@@ -995,7 +996,7 @@ namespace TensorSharp.Cuda
             // sequence's own step does.
             if (xq != IntPtr.Zero && TakesQ80Pair(w, rows, dev.Alloc.Kernels.HasQ80Pair))
             {
-                dev.Alloc.Kernels.LaunchQuantMatmulQ80Pair(w.Ptr, xq, Ptr(output), w.Ne0, w.Ne1, rows, stream);
+                dev.Alloc.Kernels.LaunchQuantMatmulQ80Pair(w.Ptr, w.PairPacked, xq, Ptr(output), w.Ne0, w.Ne1, rows, stream);
                 return;
             }
             // BF16 matrices (ISTA's hyper-connection and PLE value weights) at decode size: F32 activations, as
