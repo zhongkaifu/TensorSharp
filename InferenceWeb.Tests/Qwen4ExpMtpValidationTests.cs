@@ -162,7 +162,7 @@ public partial class Qwen4ExpMtpValidationTests
     {
         try
         {
-            return (int)typeof(Qwen4ExpModel).GetMethod("ValidateMtpHead", BindingFlags.Static | BindingFlags.NonPublic)!
+            return (int)typeof(TensorSharp.Models.Qwen4ExpRuntimeModel).Assembly.GetType("TensorSharp.Models.Qwen4ExpFormat")!.GetMethod("ValidateMtpHead", BindingFlags.Static | BindingFlags.NonPublic)!
                 .Invoke(null, new object[] { target, draft, targetTensor })!;
         }
         catch (TargetInvocationException e) when (e.InnerException != null)

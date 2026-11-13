@@ -19,9 +19,20 @@ namespace TensorSharp.Models
             Aliases = new[] { "deepseek4" },
             Factory = c => new DeepSeek4Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup,
                 c.DraftModelPath, c.LayerSplitDegree),
-            MultiGpu = MultiGpuMode.LayerSplit,
-            MultiGpuLimitation = "deepseek4 (DeepSeek V4) places whole layers across local GPUs; it does not implement tensor parallelism.",
-            LayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda },
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlCuda, BackendType.GgmlVulkan },
+                HasRoutedExperts = true,
+                ContinuousBatching = MechanismSupport.On(BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlCuda, BackendType.GgmlVulkan)
+                    .ElsewhereGap("the pure-C# DeepSeek executor (--backend cpu) serves concurrent requests one at a time."),
+                TensorParallel = MechanismSupport.None(
+                    "deepseek4 (DeepSeek V4) places whole layers across local GPUs; it does not implement tensor parallelism. Use --layer-split N."),
+                LayerSplit = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda).KeepsBatching(),
+                HybridParallel = MechanismSupport.None("deepseek4 (DeepSeek V4) does not implement tensor parallelism, so it cannot combine it with --layer-split."),
+                ExpertOffload = MechanismSupport.On(BackendType.Cpu, BackendType.GgmlCpu, BackendType.GgmlCuda, BackendType.GgmlVulkan)
+                    .ElsewhereGap("the direct-CUDA DeepSeek engine keeps every routed expert in VRAM; use --backend ggml_cuda for --n-cpu-moe."),
+            },
         };
 
         /// <summary>

@@ -61,6 +61,9 @@ namespace TensorSharp.Cuda
             }
         }
 
+        /// <summary>A capture is being recorded on some allocator.</summary>
+        internal static bool AnyCapturing => active != null;
+
         internal static bool IsCapturing(CudaAllocator allocator)
         {
             CaptureContext ctx = active;

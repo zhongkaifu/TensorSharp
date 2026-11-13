@@ -91,12 +91,11 @@ public sealed partial class PrefixCacheContractConformanceTests
     [ModelFact(EnvModelDir, Qwen35_9B)]
     public void Qwen35_9B_PassesTheConformanceScript()
     {
-        using var model = (Qwen35Model)Load(Qwen35_9B);
+        using var model = (Qwen35RuntimeModel)Load(Qwen35_9B);
         model.AttachPrefixCache(new RecordingPayloadSink());
         ConformanceSubject subject = TextSubject(model, "qwen35-9b") with
         {
-            PayloadDeviceDirty = model.IsRetainedDeviceAuthoritative,
-            // A decoded holder's GDN state is device-resident (and its K/V dirty) on Metal.
+            // A graph leaves a slot's rows and recurrent state on the device until a sync.
             ExpectDirtyDonations = true,
         };
         ConformanceReport report = PrefixCacheConformanceScript.Run(subject);
@@ -135,7 +134,7 @@ public sealed partial class PrefixCacheContractConformanceTests
     [ModelFact(EnvQwen38Dir, Qwen38FlashNext)]
     public void Qwen38_FlashNext_PassesTheConformanceScript()
     {
-        using var model = (Qwen4ExpModel)LoadFrom(EnvQwen38Dir, Qwen38FlashNext);
+        using var model = (Qwen4ExpRuntimeModel)LoadFrom(EnvQwen38Dir, Qwen38FlashNext);
         model.AttachPrefixCache(new RecordingPayloadSink());
         ConformanceReport report = PrefixCacheConformanceScript.Run(TextSubject(model, "qwen38-flash-next"));
 

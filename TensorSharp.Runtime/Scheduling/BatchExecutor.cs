@@ -611,6 +611,9 @@ namespace TensorSharp.Runtime.Scheduling
                 case ExecutionPathKind.PerSequence:
                     return ExecuteStepPerSequenceStateSafe(output);
 
+                case ExecutionPathKind.Unified:
+                    return ExecuteStepUnified((IUnifiedBatchModel)_model, output);
+
                 case ExecutionPathKind.PerSequenceFused:
                     return ExecuteStepPerSequenceFused((IBatchedPagedModel)_model, output, options);
 
@@ -2438,6 +2441,226 @@ namespace TensorSharp.Runtime.Scheduling
             return results;
         }
 
+        /// <summary>
+        /// The unified step (<see cref="ExecutionPathKind.Unified"/>): every scheduled request runs on its own slot, in
+        /// batched forwards. Speculating requests' decode tokens are drafted per request (each over its own drafter
+        /// state) and verified together in one forward (<see cref="TryBatchedSpeculativeDecode"/>); every other
+        /// prompt chunk and decode token goes into one forward. A request with pending media embeddings runs its chunk
+        /// through the model's media path on its slot. A failed forward fails the requests it carried.
+        /// </summary>
+        private List<SequenceStepResult> ExecuteStepUnified(IUnifiedBatchModel model, SchedulerOutput output)
+        {
+            var results = new List<SequenceStepResult>(output.ScheduledWork.Count);
+            var prepared = new List<ScheduledSequenceWork>(output.ScheduledWork.Count);
+            int kvReserveMax = ExecutionOptions.FromEnvironment().KvGenerationReserveMax;
+            // A verify writes its whole padded window past the committed rows: room for it, so no slot grows mid-stream.
+            int verifySlack = SpeculationEnabledThisStep && _model is IBatchedSpeculativeTarget verifier ? verifier.BatchedSpecWindow(1) : 0;
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                try
+                {
+                    // A slot adopted past this prompt rewinds, a revoked live-cache claim is dropped and a reused
+                    // prefix is injected the way a per-request holder binds (BindFusedHolder).
+                    if (_model is IBatchedPagedModel holders
+                        && (_pendingRetainedFusedTruncations.ContainsKey(seq.RequestId)
+                            || (!holders.HasFusedSequenceCache(seq.RequestId) && (seq.NumComputedTokens > 0 || seq.UsesLiveCacheContinuation))))
+                    {
+                        bool bound;
+                        try { bound = BindFusedHolder(holders, seq, results); }
+                        finally { holders.RestorePrimaryCache(); }
+                        if (!bound) continue;
+                    }
+                    int reserve = ResolvePrefillReservation(seq.PromptTokens.Count, seq.MaxNewTokens, _model.MaxContextLength, kvReserveMax);
+                    reserve = (int)Math.Min(_model.MaxContextLength, (long)reserve + verifySlack);
+                    int held = model.EnsureSequenceSlot(seq.RequestId, reserve);
+                    if (held != seq.NumComputedTokens)
+                        throw new InvalidOperationException(
+                            $"{seq.RequestId}: its slot holds {held} tokens, the sequence {seq.NumComputedTokens}.");
+                    prepared.Add(work);
+                }
+                catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == 0)
+                {
+                    // The device holds no slot for a NEW request beside the running ones: nothing of it ran or is held, so
+                    // it waits for one of them to finish instead of failing.
+                    _logger.LogDebug("No unified slot for {EngineRequestId} yet: {Reason}", seq.RequestId, ex.Message);
+                    results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
+                }
+                catch (Exception ex)
+                {
+                    FailUnified(seq, ex, results);
+                }
+            }
+
+            HashSet<string>? handled = null;
+            if (UnifiedSpeculativeDecodes(prepared) is { } speculating)
+                TryRunBatchedSpeculativeSubset(speculating, results, ref handled);
+
+            var batch = new List<(ScheduledSequenceWork Work, int[] Tokens, int Start, int Sampled, SpecSeqContext? Drafter)>(prepared.Count);
+            var injector = _model.MultimodalInjector;
+            // The step's host phases (tensorsharp.engine.step.phase.duration), as the batched decode records them: the
+            // decoders' draws ("sample") and the forward ("issue", bucketed by the rows it ran).
+            long sampleTicks = 0;
+            int decoders = 0;
+            foreach (var work in prepared)
+            {
+                var seq = work.Sequence;
+                if (handled != null && handled.Contains(seq.RequestId)) continue;
+                try
+                {
+                    int start = seq.NumComputedTokens;
+                    if (work.IsPrefill)
+                    {
+                        int[] chunk = PrefillTokens(seq, work);
+                        if (injector != null && injector.HasPendingEmbeddings(seq.RequestId))
+                        {
+                            injector.QueuePromptEmbeddingsForSlice(start, chunk.Length, seq.RequestId);
+                            long started = Stopwatch.GetTimestamp();
+                            float[] logits = model.ForwardUnifiedMedia(seq.RequestId, chunk, start);
+                            CompleteUnified(seq, chunk.Length, -1, logits, Stopwatch.GetTimestamp() - started, results);
+                            continue;
+                        }
+                        batch.Add((work, chunk, start, -1, PromptConditionedDrafter(seq, start)));
+                    }
+                    else
+                    {
+                        long drawn = Stopwatch.GetTimestamp();
+                        int token = TakePendingOrSample(seq);
+                        sampleTicks += Stopwatch.GetTimestamp() - drawn;
+                        decoders++;
+                        seq.AppendOutputToken(token);
+                        batch.Add((work, new[] { token }, start, token, null));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    FailUnified(seq, ex, results);
+                }
+            }
+            if (decoders > 0)
+                RecordStepPhase(s_phaseSample, Stopwatch.GetTimestamp() - sampleTicks, decoders);
+            if (batch.Count == 0)
+                return results;
+
+            var ids = new string[batch.Count];
+            var tokens = new int[batch.Count][];
+            var starts = new int[batch.Count];
+            int stepRows = 0;
+            for (int i = 0; i < batch.Count; i++)
+            {
+                ids[i] = batch[i].Work.Sequence.RequestId;
+                tokens[i] = batch[i].Tokens;
+                starts[i] = batch[i].Start;
+                stepRows += tokens[i].Length;
+            }
+            var lastLogits = new float[batch.Count][];
+            // A prompt-conditioned drafter's chunks come back with the features of the rows its context needs.
+            float[][]? features = null;
+            for (int i = 0; i < batch.Count; i++)
+                if (batch[i].Drafter is { } drafter)
+                {
+                    int rows = drafter.Exec.PrefillFeatureRows(starts[i], tokens[i].Length, batch[i].Work.Sequence.PromptTokens.Count);
+                    (features ??= new float[batch.Count][])[i] = new float[(long)rows * ((ISpeculativeTarget)_model).SpecFeatureSize];
+                }
+            try
+            {
+                long started = Stopwatch.GetTimestamp();
+                if (!model.TryForwardUnified(ids, tokens, starts, lastLogits, features))
+                    throw new InvalidOperationException("the model declined a unified step whose slots it had prepared");
+                RecordStepPhase(s_phaseIssue, started, stepRows);
+                long ticksPerSequence = (Stopwatch.GetTimestamp() - started) / batch.Count;
+                if (batch.Count >= 2) ReportBatchedFusedDecodeSuccess(batch.Count);
+                if (features != null)
+                    CommitPromptFeatures(batch.ConvertAll(item => (item.Work.Sequence, item.Tokens, item.Start, item.Drafter)), features);
+                for (int i = 0; i < batch.Count; i++)
+                    CompleteUnified(batch[i].Work.Sequence, tokens[i].Length, batch[i].Sampled, lastLogits[i], ticksPerSequence, results);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unified step failed for {Count} sequences; failing them.", batch.Count);
+                foreach (var item in batch)
+                    FailUnified(item.Work.Sequence, ex, results);
+            }
+            return results;
+        }
+
+        /// <summary>The speculative context of a request whose prompt chunk at <paramref name="start"/> should feed its
+        /// drafter (a block drafter conditions on the prompt's feature rows), armed over the tokens before the chunk;
+        /// null for any other request (an n-gram or per-token drafter arms at its first decode step).</summary>
+        private SpecSeqContext? PromptConditionedDrafter(SequenceState seq, int start)
+        {
+            if (!SpeculationEnabledThisStep || !CanSpeculate(seq) || _model is not IBatchedSpeculativeTarget
+                || _model is not ISpeculativeTarget { SpeculationProfitable: true } spec
+                || _fusedSpecDeclined.Contains(seq.RequestId)
+                || !TryGetFusedSpecContext(spec, seq, start, out SpecSeqContext? ctx))
+                return null;
+            return ctx.Exec.PrefillsThroughContext ? ctx : null;
+        }
+
+        /// <summary>Hand each prompt chunk's feature rows to its request's drafter, over that request's own drafter
+        /// state. A chunk the forward could not capture leaves its context behind; the first decode step catches it
+        /// up over the chunk's tokens.</summary>
+        private void CommitPromptFeatures(List<(SequenceState Seq, int[] Tokens, int Start, SpecSeqContext? Drafter)> chunks,
+            float[][] features)
+        {
+            var batched = (IBatchedSpeculativeTarget)_model;
+            using var scope = batched.BeginBatchedSpeculation();
+            for (int i = 0; i < chunks.Count; i++)
+            {
+                var (seq, chunk, start, ctx) = chunks[i];
+                if (ctx == null || features[i] == null) continue;
+                batched.BindDraftState(seq.RequestId);
+                ctx.Exec.CommitPrefill(chunk, start, features[i], seq.PromptTokens.Count);
+                ctx.NextPosition = start + chunk.Length;
+            }
+        }
+
+        /// <summary>The prepared decode tokens of requests that can speculate on this step, or null: the model
+        /// verifies several requests' windows in one forward and speculation is on and pays on it.</summary>
+        private List<ScheduledSequenceWork>? UnifiedSpeculativeDecodes(List<ScheduledSequenceWork> prepared)
+        {
+            if (!SpeculationEnabledThisStep || _model is not IBatchedSpeculativeTarget
+                || _model is not ISpeculativeTarget { SpeculationProfitable: true })
+                return null;
+            List<ScheduledSequenceWork>? speculating = null;
+            foreach (var work in prepared)
+            {
+                var seq = work.Sequence;
+                if (!work.IsPrefill && seq.NumComputedTokens > 0 && CanSpeculate(seq)
+                    && !_fusedSpecDeclined.Contains(seq.RequestId))
+                    (speculating ??= new List<ScheduledSequenceWork>()).Add(work);
+            }
+            return speculating;
+        }
+
+        private void CompleteUnified(SequenceState seq, int forwarded, int sampled, float[] logits, long ticks,
+            List<SequenceStepResult> results)
+        {
+            bool prefill = sampled < 0;
+            seq.LastLogits = logits;
+            seq.AdvanceComputedTokens(forwarded);
+            if (prefill)
+                MaybeCheckpointSharedPrefix(seq);
+            if (!seq.FirstTokenAt.HasValue && sampled >= 0)
+                seq.FirstTokenAt = DateTime.UtcNow;
+            results.Add(new SequenceStepResult
+            {
+                Sequence = seq,
+                TokensForwarded = forwarded,
+                SampledToken = sampled,
+                IsPrefill = prefill,
+                FullBlocksCaptured = 0,
+                ForwardElapsedTicks = ticks,
+            });
+        }
+
+        private void FailUnified(SequenceState seq, Exception ex, List<SequenceStepResult> results)
+        {
+            _logger.LogError(ex, "Unified step failed for sequence {EngineRequestId}", seq.RequestId);
+            seq.Error = ex;
+            results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+        }
+
         /// <summary>Serve one scheduled work item via NextN/MTP speculative
         /// decoding on the LINEAR-cache trunk when the speculative context is
         /// (or can be) armed for it. Returns null when the step must run on
@@ -3244,7 +3467,9 @@ namespace TensorSharp.Runtime.Scheduling
             int longest = 0;
             for (int i = 0; i < n; i++)
                 longest = Math.Max(longest, drafts[i].Count);
-            if (window > NarrowBatchedWindow && 1 + longest <= NarrowBatchedWindow)
+            if (batched.BatchedSpecExactWindow)
+                window = 1 + longest;
+            else if (window > NarrowBatchedWindow && 1 + longest <= NarrowBatchedWindow)
                 window = NarrowBatchedWindow;
             var tokens = new int[n * window];
             for (int i = 0; i < n; i++)

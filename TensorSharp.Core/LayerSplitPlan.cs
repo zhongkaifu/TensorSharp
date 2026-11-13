@@ -9,7 +9,8 @@ public sealed class LayerSplitPlan
     public int LocalDegree { get; }
     public int NodeId { get; }
     public int NodeCount { get; }
-    public int GlobalDegree => checked(LocalDegree * NodeCount);
+    /// <summary>Whole-layer stages over every node (LocalDegree x NodeCount unless the nodes' shapes differ).</summary>
+    public int GlobalDegree { get; }
     public int FirstLayer { get; }
     public int EndLayer { get; }
     private readonly int[] _localBoundaries;
@@ -49,6 +50,7 @@ public sealed class LayerSplitPlan
         LocalDegree = localDegree;
         NodeId = nodeId;
         NodeCount = nodeCount;
+        GlobalDegree = checked(localDegree * nodeCount);
         DriverRunsLastStage = driverRunsLastStage && nodeCount > 1;
         StageIndex = StageOf(nodeId, nodeCount, DriverRunsLastStage);
         FirstLayer = (int)((long)LayerCount * StageIndex / NodeCount);
@@ -64,6 +66,150 @@ public sealed class LayerSplitPlan
         FirstLayer = stageBoundaries[StageIndex];
         EndLayer = stageBoundaries[StageIndex + 1];
         _localBoundaries = localBoundaries;
+    }
+
+    /// <summary>A node of a pipeline whose nodes differ (<see cref="LayerSplitTopology"/>): every field given.</summary>
+    private LayerSplitPlan(int layerCount, int localDegree, int nodeId, int nodeCount, int globalDegree,
+        bool driverRunsLastStage, int stageIndex, int firstLayer, int endLayer, int[] localBoundaries)
+    {
+        LayerCount = layerCount;
+        LocalDegree = localDegree;
+        NodeId = nodeId;
+        NodeCount = nodeCount;
+        GlobalDegree = globalDegree;
+        DriverRunsLastStage = driverRunsLastStage;
+        StageIndex = stageIndex;
+        FirstLayer = firstLayer;
+        EndLayer = endLayer;
+        _localBoundaries = localBoundaries;
+    }
+
+    /// <summary>
+    /// Node <paramref name="nodeId"/>'s share of a pipeline over <paramref name="topology"/>'s nodes. A uniform
+    /// topology gives exactly the plan of <see cref="CreateWeighted(long[], int, int, int, long, long, bool)"/>.
+    /// Otherwise each node's layers are proportional to its capacity (its stages x their capacity): the maximum of a
+    /// node's resident bytes over its capacity is minimized, every stage owning at least one layer; within the node,
+    /// the layers split over its equal stages as in the uniform plan. Every node computes the same boundaries from the
+    /// same agreed topology.
+    /// </summary>
+    /// <param name="layerBytes">Resident bytes per layer; null weighs every layer alike.</param>
+    public static LayerSplitPlan Create(int layerCount, long[] layerBytes, LayerSplitTopology topology, int nodeId,
+        long embeddingBytes, long headBytes, bool driverRunsLastStage)
+    {
+        ArgumentNullException.ThrowIfNull(topology);
+        if (layerBytes != null && layerBytes.Length != layerCount)
+            throw new ArgumentException("One byte count per layer is required.", nameof(layerBytes));
+        int nodeCount = topology.NodeCount;
+        if ((uint)nodeId >= (uint)nodeCount) throw new ArgumentOutOfRangeException(nameof(nodeId));
+        int localStages = topology.Stages(nodeId);
+        if (topology.IsUniform)
+            return layerBytes == null
+                ? new LayerSplitPlan(layerCount, localStages, nodeId, nodeCount, driverRunsLastStage)
+                : CreateWeighted(layerBytes, localStages, nodeId, nodeCount, embeddingBytes, headBytes, driverRunsLastStage);
+        if (layerCount < topology.TotalStages)
+            throw new NotSupportedException(
+                $"Cannot distribute {layerCount} layers over {topology.TotalStages} stages: each stage must own at least one layer.");
+        bool driverLast = driverRunsLastStage && nodeCount > 1;
+        long[] bytes = layerBytes ?? Ones(layerCount);
+        if (layerBytes == null) embeddingBytes = headBytes = 0;
+        // Pipeline position p is run by node NodeOfStage(p).
+        var capacity = new long[nodeCount];
+        var minimum = new int[nodeCount];
+        for (int p = 0; p < nodeCount; p++)
+        {
+            int node = NodeOfStage(p, nodeCount, driverLast);
+            capacity[p] = checked(topology.Stages(node) * topology.StageCapacity(node));
+            minimum[p] = topology.Stages(node);
+        }
+        int[] boundaries = PartitionByCapacity(bytes, capacity, minimum, embeddingBytes, headBytes);
+        int stage = StageOf(nodeId, nodeCount, driverLast);
+        int first = boundaries[stage], end = boundaries[stage + 1];
+        long[] owned = bytes.AsSpan(first, end - first).ToArray();
+        int[] local = Partition(owned, localStages, 1,
+            stage == 0 ? embeddingBytes : 0, stage == nodeCount - 1 ? headBytes : 0);
+        for (int rank = 0; rank < local.Length; rank++) local[rank] += first;
+        return new LayerSplitPlan(layerCount, localStages, nodeId, nodeCount, topology.TotalStages, driverLast,
+            stage, first, end, local);
+    }
+
+    private static long[] Ones(int count)
+    {
+        var ones = new long[count];
+        Array.Fill(ones, 1L);
+        return ones;
+    }
+
+    /// <summary>
+    /// Exact partition of an ordered layer sequence into parts of different capacities, minimizing the largest
+    /// bytes-to-capacity ratio (compared exactly, by cross-multiplication). Part p owns at least
+    /// <paramref name="minimumLayers"/>[p] layers. Equal-cost solutions choose the smallest preceding boundary.
+    /// </summary>
+    public static int[] PartitionByCapacity(long[] layerBytes, long[] capacity, int[] minimumLayers,
+        long firstBytes = 0, long lastBytes = 0)
+    {
+        ArgumentNullException.ThrowIfNull(layerBytes);
+        ArgumentNullException.ThrowIfNull(capacity);
+        ArgumentNullException.ThrowIfNull(minimumLayers);
+        int partitions = capacity.Length;
+        if (partitions < 1 || minimumLayers.Length != partitions)
+            throw new ArgumentException("Every partition needs a capacity and a minimum layer count.");
+        if (firstBytes < 0 || lastBytes < 0) throw new ArgumentOutOfRangeException(nameof(firstBytes));
+        int count = layerBytes.Length;
+        var before = new int[partitions + 1];   // layers the parts before p need at least
+        for (int p = 0; p < partitions; p++)
+        {
+            if (capacity[p] < 1) throw new ArgumentOutOfRangeException(nameof(capacity));
+            if (minimumLayers[p] < 1) throw new ArgumentOutOfRangeException(nameof(minimumLayers));
+            before[p + 1] = checked(before[p] + minimumLayers[p]);
+        }
+        if (before[partitions] > count)
+            throw new ArgumentException("Every partition must own its minimum number of layers.");
+        long[] prefix = new long[count + 1];
+        for (int layer = 0; layer < count; layer++)
+        {
+            if (layerBytes[layer] < 0) throw new ArgumentOutOfRangeException(nameof(layerBytes));
+            prefix[layer + 1] = checked(prefix[layer] + layerBytes[layer]);
+        }
+        _ = checked(prefix[count] + firstBytes + lastBytes);
+        // best[p, end]: the smallest achievable maximum ratio, as (bytes, capacity), of parts 1..p ending at end.
+        var bestBytes = new long[partitions + 1, count + 1];
+        var bestCapacity = new long[partitions + 1, count + 1];
+        var cuts = new int[partitions + 1, count + 1];
+        var reachable = new bool[partitions + 1, count + 1];
+        reachable[0, 0] = true;
+        bestCapacity[0, 0] = 1;
+        for (int p = 1; p <= partitions; p++)
+        {
+            int after = before[partitions] - before[p];   // layers the parts after p need at least
+            for (int end = before[p]; end <= count - after; end++)
+            for (int begin = before[p - 1]; begin <= end - minimumLayers[p - 1]; begin++)
+            {
+                if (!reachable[p - 1, begin]) continue;
+                long bytes = prefix[end] - prefix[begin] + (p == 1 ? firstBytes : 0) + (p == partitions ? lastBytes : 0);
+                // max(previous, bytes / capacity[p-1]) as a fraction.
+                long maxBytes = bestBytes[p - 1, begin], maxCapacity = bestCapacity[p - 1, begin];
+                if (Less(maxBytes, maxCapacity, bytes, capacity[p - 1]))
+                {
+                    maxBytes = bytes;
+                    maxCapacity = capacity[p - 1];
+                }
+                if (!reachable[p, end] || Less(maxBytes, maxCapacity, bestBytes[p, end], bestCapacity[p, end]))
+                {
+                    reachable[p, end] = true;
+                    bestBytes[p, end] = maxBytes;
+                    bestCapacity[p, end] = maxCapacity;
+                    cuts[p, end] = begin;
+                }
+            }
+        }
+        int[] boundaries = new int[partitions + 1];
+        boundaries[partitions] = count;
+        for (int p = partitions; p > 0; p--)
+            boundaries[p - 1] = cuts[p, boundaries[p]];
+        return boundaries;
+
+        static bool Less(long aBytes, long aCapacity, long bBytes, long bCapacity)
+            => (Int128)aBytes * bCapacity < (Int128)bBytes * aCapacity;
     }
 
     /// <summary>Pipeline position of a node.</summary>

@@ -54,17 +54,40 @@ namespace TensorSharp.Models
             _gguf.PrefaultFileCache(info => ShouldLoadWeight(info) && ShouldPrefaultWeight(info),
                 ShouldPrefaultWeightWhenConstrained, logProgress: true);
             Console.Write("Loading model weights...");
+            var (countF32, countQuant, totalQuantBytes, totalF32Bytes, mappedQuantBytes) = LoadTensorsFrom(_gguf);
+            Console.WriteLine($" done ({countF32} F32 tensors, {countQuant} quantized tensors)");
+            AttachSidecarWeightScales();
+            if (countQuant > 0)
+            {
+                if (mappedQuantBytes > 0)
+                    Console.WriteLine($"  Quantized: {totalQuantBytes / 1024 / 1024} MB ({mappedQuantBytes / 1024 / 1024} MB file-backed), F32: {totalF32Bytes / 1024 / 1024} MB");
+                else
+                    Console.WriteLine($"  Quantized: {totalQuantBytes / 1024 / 1024} MB, F32: {totalF32Bytes / 1024 / 1024} MB");
+            }
+        }
+
+        /// <summary>Load another GGUF's tensors under their own names (a separate MTP head file): mapped views stay
+        /// owned by <paramref name="file"/>, which the caller keeps open for the model's life.</summary>
+        protected void LoadAdditionalWeights(GgufFile file)
+        {
+            ArgumentNullException.ThrowIfNull(file);
+            var (f32, quant, quantBytes, _, _) = LoadTensorsFrom(file);
+            Console.WriteLine($"  {System.IO.Path.GetFileName(file.FilePaths[0])}: {f32} F32 and {quant} quantized tensors ({quantBytes / 1024 / 1024} MB).");
+        }
+
+        private (int F32, int Quant, long QuantBytes, long F32Bytes, long MappedBytes) LoadTensorsFrom(GgufFile file)
+        {
             int countF32 = 0;
             int countQuant = 0;
             long totalQuantBytes = 0;
             long totalF32Bytes = 0;
             long mappedQuantBytes = 0;
             bool tryMmap = CanUseFileMappedQuantizedWeights;
-            foreach (var kv in _gguf.Tensors)
+            foreach (var kv in file.Tensors)
             {
                 var info = kv.Value;
                 if (!ShouldLoadWeight(info)) continue;
-                long byteCount = _gguf.GetTensorByteCount(info);
+                long byteCount = file.GetTensorByteCount(info);
 
                 if (info.Type is GgmlTensorType.PQ2_0 or GgmlTensorType.PTQ1_0)
                 {
@@ -94,21 +117,21 @@ namespace TensorSharp.Models
                         if (baseName.EndsWith(".weight"))
                             baseName = baseName.Substring(0, baseName.Length - 7);
 
-                        if (tryMmap && _gguf.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
+                        if (tryMmap && file.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
                         {
                             for (int e = 0; e < numExperts; e++)
                             {
                                 IntPtr expertPtr = new IntPtr(mappedTensorPtr.ToInt64() + e * perExpertBytes);
                                 string expertName = $"{baseName}.{e}.weight";
                                 _quantWeights[expertName] = QuantizedWeight.CreateExternalView(
-                                    expertPtr, perExpertBytes, (int)info.Type, ne0, ne1, _gguf);
+                                    expertPtr, perExpertBytes, (int)info.Type, ne0, ne1, file);
                                 _stackedExpertMemberNames.Add(expertName);
                             }
                             // Free zero-cost stacked view: same bytes the per-expert
                             // views point into, owner is the GgufFile mmap.
                             _stackedExpertWeights[info.Name] = new StackedExpertWeights(
                                 mappedTensorPtr, (int)info.Type, ne0, ne1, numExperts,
-                                byteCount, isExternalView: true, ownerToken: _gguf,
+                                byteCount, isExternalView: true, ownerToken: file,
                                 ownedBuffer: IntPtr.Zero);
                             mappedQuantBytes += byteCount;
                         }
@@ -121,7 +144,7 @@ namespace TensorSharp.Models
                             // the cost of an extra strong reference held by the
                             // stacked weight (no memory duplication).
                             IntPtr bulkPtr = QuantizedWeight.AllocateBuffer(byteCount);
-                            _gguf.ReadTensorDataToNative(info, bulkPtr, byteCount);
+                            file.ReadTensorDataToNative(info, bulkPtr, byteCount);
 
                             var stacked = new StackedExpertWeights(
                                 bulkPtr, (int)info.Type, ne0, ne1, numExperts,
@@ -143,16 +166,16 @@ namespace TensorSharp.Models
                     }
                     else
                     {
-                        if (tryMmap && _gguf.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
+                        if (tryMmap && file.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
                         {
                             _quantWeights[info.Name] = QuantizedWeight.CreateExternalView(
-                                mappedTensorPtr, byteCount, (int)info.Type, ne0, ne1, _gguf);
+                                mappedTensorPtr, byteCount, (int)info.Type, ne0, ne1, file);
                             mappedQuantBytes += byteCount;
                         }
                         else
                         {
                             IntPtr ptr = QuantizedWeight.AllocateBuffer(byteCount);
-                            _gguf.ReadTensorDataToNative(info, ptr, byteCount);
+                            file.ReadTensorDataToNative(info, ptr, byteCount);
                             _quantWeights[info.Name] = new QuantizedWeight(ptr, byteCount, (int)info.Type, ne0, ne1);
                         }
                         countQuant++;
@@ -176,14 +199,14 @@ namespace TensorSharp.Models
 
                     if (info.Type == GgmlTensorType.F32)
                     {
-                        _gguf.ReadTensorDataToFloat32Native(info, destPtr, numElements);
+                        file.ReadTensorDataToFloat32Native(info, destPtr, numElements);
                     }
                     else
                     {
                         IntPtr tempPtr = QuantizedWeight.AllocateBuffer(byteCount);
                         try
                         {
-                            _gguf.ReadTensorDataToNative(info, tempPtr, byteCount);
+                            file.ReadTensorDataToNative(info, tempPtr, byteCount);
                             NativeDequant.DequantizeToFloat32Native((int)info.Type, tempPtr, destPtr, numElements);
                         }
                         finally { QuantizedWeight.FreeBuffer(tempPtr); }
@@ -195,15 +218,7 @@ namespace TensorSharp.Models
                     totalF32Bytes += numElements * 4;
                 }
             }
-            Console.WriteLine($" done ({countF32} F32 tensors, {countQuant} quantized tensors)");
-            AttachSidecarWeightScales();
-            if (countQuant > 0)
-            {
-                if (mappedQuantBytes > 0)
-                    Console.WriteLine($"  Quantized: {totalQuantBytes / 1024 / 1024} MB ({mappedQuantBytes / 1024 / 1024} MB file-backed), F32: {totalF32Bytes / 1024 / 1024} MB");
-                else
-                    Console.WriteLine($"  Quantized: {totalQuantBytes / 1024 / 1024} MB, F32: {totalF32Bytes / 1024 / 1024} MB");
-            }
+            return (countF32, countQuant, totalQuantBytes, totalF32Bytes, mappedQuantBytes);
         }
 
         protected void PrepareCudaQuantizedWeightsForInference()
@@ -725,8 +740,10 @@ namespace TensorSharp.Models
                     continue;
 
                 IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                // Under layer split the weight belongs to its layer's GPU.
+                var owner = AllocatorForWeight(kv.Key) as CudaAllocator ?? cudaAllocator;
                 CudaQuantizedOps.PreloadQuantizedWeight(
-                    cudaAllocator,
+                    owner,
                     cacheKey,
                     qw.Data,
                     qw.GgmlType,
@@ -951,6 +968,9 @@ namespace TensorSharp.Models
             string kName = $"blk.{layer}.attn_k.weight";
             string vName = $"blk.{layer}.attn_v.weight";
             string qkvName = $"blk.{layer}.attn_qkv.weight";
+            // Bonsai2 PRISM: rows concatenate only where the three read the same rotated (or unrotated) input.
+            if (BonsaiHadamard != null && !BonsaiHadamard.CanFuseProjections(qName, kName, vName))
+                return false;
 
             if (_quantWeights.TryGetValue(qName, out var qw) &&
                 _quantWeights.TryGetValue(kName, out var kw) &&
@@ -1339,7 +1359,7 @@ namespace TensorSharp.Models
             {
                 Console.WriteLine(
                     $"  Split projections: {keptMixedLayers.Count} of {numLayers} mixed-quant ffn_gate/ffn_up pairs run " +
-                    "as two matmuls in their own types on MLX (no requantization; TS_MLX_MIXED_GATE_UP_SPLIT=0 fuses them).");
+                    "as two matmuls in their own types on MLX (no requantization).");
             }
             ReportDeclinedFusionCopies();
         }

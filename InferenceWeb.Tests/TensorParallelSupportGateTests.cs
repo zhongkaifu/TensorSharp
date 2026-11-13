@@ -85,7 +85,7 @@ public class TensorParallelSupportGateTests
     public void TpCapableArchitectures_AreUntouched(string arch)
     {
         ITensorParallelGroup group = null;
-        Assert.Equal(4, Resolve(arch, BackendType.GgmlCuda, 4, ref group, out int layerSplit));
+        Assert.Equal(2, Resolve(arch, BackendType.GgmlCuda, 2, ref group, out int layerSplit));
         Assert.Equal(1, layerSplit);
     }
 
@@ -139,47 +139,62 @@ public class TensorParallelSupportGateTests
     }
 
     [Fact]
-    public void ArchitectureThatDeclaresNothing_IsNotBlocked()
+    public void ArchitectureWithoutAServingContract_IsRejectedAtRegistration()
     {
-        // The gate is opt-in per architecture, not an allow-list: a family that says
-        // nothing about multi-GPU gets plain tensor parallelism, unchanged.
-        var brandNew = new ModelArchitectureDescriptor
+        // The old gate was opt-in: a family that said nothing silently got tensor
+        // parallelism. The contract is mandatory - the compiler requires the property, and
+        // registration refuses a null one - so a new family must say what it supports.
+        var silent = new ModelArchitectureDescriptor
         {
             Id = "brand-new-arch",
             Aliases = new[] { "brand-new-arch" },
             Factory = _ => throw new NotSupportedException("not constructed by this test"),
+            Serving = null!,
         };
-        ITensorParallelGroup group = null;
-        Assert.Equal(2, Resolve(brandNew, BackendType.GgmlCuda, 2, ref group, out int layerSplit));
-        Assert.Equal(1, layerSplit);
+        var ex = Assert.Throws<InvalidOperationException>(() => ModelArchitectureRegistry.Register(silent));
+        Assert.Contains("serving contract", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void EveryDegradedArchitectureExplainsItself()
+    public void EveryGapExplainsItself()
     {
-        // The message is the whole value of the gate - it is what tells the operator
-        // why the second GPU is idle, or why it holds whole layers instead of shards.
-        foreach (var arch in ModelArchitectureRegistry.All.Where(a => a.MultiGpu != MultiGpuMode.TensorParallel))
+        // The reason is the whole value of a gap - it is what tells the operator why the
+        // second GPU is idle, or why --n-cpu-moe is refused on this backend.
+        foreach (var arch in ModelArchitectureRegistry.All)
         {
-            Assert.False(string.IsNullOrWhiteSpace(arch.MultiGpuLimitation), $"'{arch.Id}' has no explanation.");
-            Assert.Contains(arch.Id, arch.MultiGpuLimitation, StringComparison.OrdinalIgnoreCase);
+            foreach (ServingMechanism mechanism in Enum.GetValues<ServingMechanism>())
+            {
+                MechanismSupport support = arch.Serving[mechanism];
+                if (support.Kind == SupportKind.NotApplicable)
+                    Assert.False(string.IsNullOrWhiteSpace(support.Reason), $"'{arch.Id}' {mechanism}: no reason.");
+                else if (support.GapsWithin(arch.Serving.GapUniverse(mechanism)).Any())
+                    Assert.False(string.IsNullOrWhiteSpace(support.GapReason), $"'{arch.Id}' {mechanism}: gap without a reason.");
+            }
         }
     }
 
     [Fact]
-    public void DeclaringADegradedModeWithoutAReasonIsRejectedAtRegistration()
+    public void DeclaringAGapWithoutAReasonIsRejectedAtRegistration()
     {
-        // Validate() is what makes "every entry explains itself" true by construction,
-        // so a family cannot land a silent degrade the way the old name tables allowed.
+        // Validate() is what makes "every gap explains itself" true by construction.
         var silent = new ModelArchitectureDescriptor
         {
             Id = "silent-arch",
             Aliases = new[] { "silent-arch" },
             Factory = _ => throw new NotSupportedException(),
-            MultiGpu = MultiGpuMode.LayerSplit,
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                HasRoutedExperts = false,
+                ContinuousBatching = MechanismSupport.On(ServingContract.AllBackends.ToArray()),
+                TensorParallel = MechanismSupport.On(BackendType.GgmlCuda),   // cuda and ggml_vulkan left unexplained
+                LayerSplit = MechanismSupport.None("no layer split"),
+                HybridParallel = MechanismSupport.None("no hybrid"),
+                ExpertOffload = MechanismSupport.NotApplicable("dense"),
+            },
         };
         var ex = Assert.Throws<InvalidOperationException>(() => ModelArchitectureRegistry.Register(silent));
-        Assert.Contains("MultiGpuLimitation", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("does not say why", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

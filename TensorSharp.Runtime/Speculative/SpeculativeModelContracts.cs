@@ -525,6 +525,12 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Width of the proposal block <see cref="TryDraftBatch"/> fills per sequence.</summary>
         int BatchDraftBlockWidth => 0;
 
+        /// <summary>The verify takes exactly the longest draft plus its anchor (one row when nothing was drafted),
+        /// rather than a few fixed widths: a trunk whose graphs replay per width, where a padded row costs a row
+        /// (Qwen3.8-Flash-Next MTP on ggml_metal: a 4-row window for a step that drafted nothing cost 100 ms, the
+        /// one-row decode 40).</summary>
+        bool BatchedSpecExactWindow => false;
+
         /// <summary>
         /// Forward <paramref name="tokens"/> ([sequences * window], sequence-major:
         /// each sequence's anchor then its drafts, padded) at

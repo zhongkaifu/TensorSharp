@@ -190,8 +190,7 @@ python eng/ResetLogitProbe/create-sharded-fixture.py --inventory artifacts/moe-c
 ```
 
 For a bounded first run on the MSI's 32 GiB RAM / 16 GiB VRAM, use all host MoE
-layers (`TS_CPU_MOE=1`), `TS_HOST_MOE_EXPERT_CACHE_MB=0`, `TS_GGUF_PREFAULT=0`,
-`TS_Q4E_RETAINED_CACHE_MB=0`, f16 KV, and disabled speculation. Keep the generic
+layers (`TS_CPU_MOE=1`), `TS_GGUF_PREFAULT=0`, f16 KV, and disabled speculation. Keep the generic
 CPU and host expert thread settings fixed as above. The 28.8 GB PLE table stays
 host-mapped and gathers 16 rows per token; it is excluded from CUDA preload.
 Expert weights also remain mapped, while about 3.89 GB of non-expert payload

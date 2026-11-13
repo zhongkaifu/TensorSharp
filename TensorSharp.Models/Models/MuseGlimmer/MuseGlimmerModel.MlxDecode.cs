@@ -21,7 +21,7 @@ namespace TensorSharp.Models
     /// DEVICE tensor, so the caller can submit step N+1 before it reads step
     /// N's token.
     ///
-    /// Port of <see cref="Qwen35Model.SubmitGreedyDecodeStep"/>; see
+    /// Ported from Qwen35Model's SubmitGreedyDecodeStep (since removed); see
     /// <c>ModelBase.SupportsPipelinedGreedy</c> for the contract and
     /// <c>TensorSharp.Cli/Program.cs</c> for the driving loop.
     ///
@@ -690,8 +690,7 @@ namespace TensorSharp.Models
         /// Reporting those numbers as "Norm: 70.9%" invites a whole afternoon
         /// of optimizing RMSNorm for a token that is 98% GPU wait.
         ///
-        /// The labels below say what the numbers actually are, matching
-        /// <see cref="Qwen35Model.PrintTimingStats"/>. Use
+        /// The labels below say what the numbers actually are. Use
         /// TS_MUSE_GLIMMER_MLX_STAGE_PROFILE=1 for a real per-stage GPU
         /// attribution.
         /// </summary>

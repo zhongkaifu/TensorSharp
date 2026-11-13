@@ -705,7 +705,9 @@ namespace tsg
                 host_only = true;
             }
             if (!host_only && tp_device_allreduce(nodes))
+            {
                 return true;
+            }
 
             // Host reduction: drain every rank, sum the partials in RAM, push
             // the total back. On backends with no device collective (Vulkan)

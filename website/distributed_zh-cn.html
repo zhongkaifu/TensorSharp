@@ -16,9 +16,9 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 多 GPU 与多节点</div>
   <h1>多 GPU 与多节点</h1>
-  <p class="lede"><code>--tp N</code> 仅选择张量并行，在层内切分权重；<code>--layer-split N</code> 在支持的架构上选择整层放置。两种参数互斥，不支持的请求会在启动时失败。按层切分仅限单节点；只有支持分布式张量并行的架构才能通过 <code>--tp-node-id</code> / <code>--tp-peers</code> 跨节点运行。旧的按层切分命令需将 <code>--tp N</code> 改为 <code>--layer-split N</code>（环境变量：<code>TENSORSHARP_LAYER_SPLIT_DEGREE=N</code>）。</p>
+  <p class="lede"><code>--tp N</code> 仅选择张量并行，在层内切分权重；<code>--layer-split N</code> 在支持的架构上选择整层放置。在共享解码运行时上的架构可同时使用两者：<code>--layer-split P</code> 个 stage，每个 stage 由 <code>--tp T</code> 张 GPU 组成；不支持的请求会在启动时失败。配合 <code>--tp-node-id</code> / <code>--tp-peers</code> 时，单独的 <code>--tp</code> 表示一个跨节点的张量并行组；显式给出 <code>--layer-split</code> 则把各节点组成整层流水线。在共享解码运行时（Qwen 3.5、Mistral 3）上，每个节点各自设置 <code>--layer-split</code> 和 <code>--tp</code>，GPU 数量不同的节点可以组成同一条流水线，层按各节点的显存大小分配（见 <code>docs/multi-node-inference.md</code>）。旧的按层切分命令需将 <code>--tp N</code> 改为 <code>--layer-split N</code>（环境变量：<code>TENSORSHARP_LAYER_SPLIT_DEGREE=N</code>）。</p>
 
-  <div class="callout note"><div class="ic">🧭</div><p><code>--tp N</code> 仅选择张量并行，在层内切分权重；<code>--layer-split N</code> 在支持的架构上选择整层放置。两种参数互斥，不支持的请求会在启动时失败。按层切分仅限单节点；只有支持分布式张量并行的架构才能通过 <code>--tp-node-id</code> / <code>--tp-peers</code> 跨节点运行。旧的按层切分命令需将 <code>--tp N</code> 改为 <code>--layer-split N</code>（环境变量：<code>TENSORSHARP_LAYER_SPLIT_DEGREE=N</code>）。</p></div>
+  <div class="callout note"><div class="ic">🧭</div><p><code>--tp N</code> 仅选择张量并行，在层内切分权重；<code>--layer-split N</code> 在支持的架构上选择整层放置。在共享解码运行时上的架构可同时使用两者：<code>--layer-split P</code> 个 stage，每个 stage 由 <code>--tp T</code> 张 GPU 组成；不支持的请求会在启动时失败。配合 <code>--tp-node-id</code> / <code>--tp-peers</code> 时，单独的 <code>--tp</code> 表示一个跨节点的张量并行组；显式给出 <code>--layer-split</code> 则把各节点组成整层流水线。在共享解码运行时（Qwen 3.5、Mistral 3）上，每个节点各自设置 <code>--layer-split</code> 和 <code>--tp</code>，GPU 数量不同的节点可以组成同一条流水线，层按各节点的显存大小分配（见 <code>docs/multi-node-inference.md</code>）。旧的按层切分命令需将 <code>--tp N</code> 改为 <code>--layer-split N</code>（环境变量：<code>TENSORSHARP_LAYER_SPLIT_DEGREE=N</code>）。</p></div>
 
   <h2 id="why">什么时候需要它？</h2>
   <ul>
@@ -99,7 +99,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   <table>
     <thead><tr><th>架构</th><th>TP</th><th>策略 / 说明</th></tr></thead>
     <tbody>
-      <tr><td>Mistral 3</td><td class="yes">✅</td><td>融合与分离两种 QKV 布局，YaRN RoPE。</td></tr>
+      <tr><td>Mistral 3</td><td class="yes">✅</td><td>共享解码运行时：<code>--tp T</code>、<code>--layer-split P</code>（本地或跨节点）及两者组合（混合），各种本地放置下都保持批处理。</td></tr>
       <tr><td>Gemma 4</td><td class="yes">✅</td><td>稠密与 MoE、逐层 head 维度；多模态嵌入会注入 TP 路径，因此视觉 / 音频提示不会丢失。GGML 上融合的整模 MoE 主干在<em>每个专家内部</em>切分（gate/up 列并行、down 行并行），从而保留全局专家 id —— <code>TS_GEMMA4_TP_FUSED_MOE=0</code> 可回退到逐算子的整专家路径。Direct CUDA 使用逐专家切分。</td></tr>
       <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>GatedDeltaNet 循环层采用块循环 V-head 归属 —— 每个 rank 维护自己的、常驻设备的 delta/conv 状态，循环路径无需跨 rank 通信。GGML 上整个 GDN block 作为一个打包的按 rank 内核运行，MoE 采用专家并行（每个 rank 持有整个专家，shared expert 按 Megatron 切分），LM head 为列并行且完全不需要集合通信。Direct CUDA 使用专家切分。例外是 Bonsai2 经 PRISM 旋转的 <code>qwen35</code> 文件：它们需要单设备 GGML 后端，会拒绝 <code>--tp</code>。</td></tr>
       <tr><td>Qwen 3.8 Flash Next</td><td>本地 GGML CUDA</td><td><code>--tp N</code> 切分路由/共享 FFN 的中间通道与输出行，使用 FP32 gather；注意力、GDN、QSA 与 PLE 保持复制。加载时检查量化布局；UD-Q2_K_XL 的 IQ2_XS/IQ3_XXS FFN 会被 TP 拒绝。真机覆盖为 A40 上 UD-IQ4_XS 的 TP2/TP4；TP 下仍禁用前缀检查点。GGML CUDA/Vulkan 上也保留 <code>--layer-split N</code>。<a href="models-text_zh-cn.html#qwen4exp">范围与模型卡证据 →</a></td></tr>
@@ -111,7 +111,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td>DeepSeek V4.1 Flash</td><td>部分支持，仅本地</td><td><code>--layer-split N</code> 选择整层放置。<code>--tp N</code> 在 GGML CUDA 上启用 routed-MoE TP（并行度 2–8）；注意力与缓存仍按层放置。不支持完整注意力 TP 与分布式组。两种模式不能组合。历史完整检查点 TP 实测比按层切分更慢。</td></tr>
       <tr><td>DeepSeek V4 Flash</td><td class="yes">—（仅按层切分）</td><td>机制不同：DSV4 的整模型执行器是把模型<em>按层</em>切分到各 GPU，而不是切分每个权重，因此没有逐层 AllReduce。<code>--layer-split N</code> 指定使用 N 张本地 GPU；未配置时默认单设备。切分以单卡最大负载为优化目标，并按各设备固定常驻项的实际落点计入——embedding 表在第一张卡，输出头与整个 DSpark 草稿器在最后一张卡。</td></tr>
       <tr><td>GLM 5.x</td><td class="yes">✅（仅本地）</td><td>仅限 GGML GPU 后端；整个家族 —— GLM-5.2、GLM-5.3 与 GLM-5.3-Flash —— 的原生 TP 都只支持本地单进程。GLM-5.2 切 MLA head 与每个路由专家内的隐藏行。GLM-5.3（非 Flash）与 5.2 是同一套 79 block 的 <code>glm-dsa</code> 结构 —— 256 个路由专家取 top-8 外加一个共享专家、带 lightning indexer 的 MLA、rope base 8e6 —— 因此它在 GLM-5.2 的路径上原样接受 <code>--tp N</code>，不需要新代码也不需要新参数；它的 MLA 与 indexer cache 是<strong>每个 rank 各复制一份</strong>，所以 KV 占用随 <code>N</code> 倍增，能装下的上下文也相应变短。它在大于 1 的并行度下从未跑过 —— 唯一有记录的算术是一台 8× A40 46 GB 机器上 <code>--tp 8</code> 每 rank 需要 41.7 GiB、装不下 —— 因此请把它当作一个被接受的模式，而不是一个已验证的配置。GLM-5.3-Flash 还会切 KDA head 并让每个 rank 持有对应的递归状态；其 MLA head 与路由专家隐藏行同样切分。注意力局部输出会在每次非线性 Sinkhorn 超连接之前归约。在 GLM-5.3-Flash 满足条件的分段快路径上，路由 MoE 局部输出先归约，随后每个 rank 在本地计算并加入其复制的共享专家；超连接、池化 indexer、router、norm、稠密层与 embedding 保持不切分并按 rank 执行，output norm / LM head 留在 rank 0。分段快路径由 Flash 这个布尔开关控制，因此 GLM-5.3（非 Flash）始终走组合调度器。对 Flash 而言，CPU MoE、tracing、部分 <code>TS_GLM_TP_SHARD</code> 切分、超额 rank 或缺少原生超连接内核时选择组合调度器回退，其中共享专家只在 rank 0 运行一次。用 <code>--layer-split N</code> 选择整层放置。</td></tr>
-      <tr><td>Hunyuan Dense</td><td>—</td><td>仅单设备；启动时拒绝张量并行、按层切分与分布式组。</td></tr>
+      <tr><td>Hunyuan Dense</td><td class="yes">✅</td><td>共享解码运行时：<code>--tp T</code>、<code>--layer-split P</code> 及两者组合（混合），各种放置下都保持批处理。</td></tr>
       <tr><td>DiffusionGemma</td><td>—</td><td>仅单设备；启动时拒绝张量并行、按层切分与分布式组。</td></tr>
       <tr><td>Qwen-Image-2.1</td><td class="yes">✅（仅本地，扩散 Transformer）</td><td>在 <code>ggml_cuda</code> / <code>ggml_vulkan</code> 上，<code>--tp N</code> 按 Megatron 方式切分扩散 Transformer：每张 GPU 持有 32/N 个完整注意力头与 12,288/N 个 MLP 列，每个 block 中两次行并行乘积在各 GPU 间求和。LoRA 因子随其权重一起切分，每张 GPU 只缓存自己那部分头的前缀。N 必须整除 32 个头——单机上为 2、4、8 或 16——且切分每个权重时都不能拆开它的量化块，加载时会按权重类型逐一检查；仅实测过 2 张 GPU。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，多节点并行组会被拒绝。见<a href="#perf-qwen-image">下文实测</a>。</td></tr>
       <tr><td>Wan / MiniMax-H3（视频）</td><td>—</td><td>仅单设备；启动时拒绝张量并行、按层切分与分布式组。</td></tr>
@@ -124,7 +124,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   <ul>
     <li><strong>仅限 GPU 后端。</strong>TP 可运行在 <code>cuda</code>、<code>ggml_cuda</code> 与 <code>ggml_vulkan</code> 上；MLX 与 CPU 后端为单设备。</li>
     <li><strong>整除性。</strong><code>numHeads</code>、<code>numKVHeads</code> 与 <code>intermediateSize</code> 都必须能被 TP 度整除；量化权重的行并行切分还要求 <code>ne0</code> 能被 <code>tp × blockSize</code> 整除。Muse Spark 是例外：它的两条 TP 路径都接受不均匀划分——原生执行器不均匀地分配 KV 组与 256 元素的专家切片，逐算子路径则分配完整的头组与专家——但逐算子路径上量化注意力输出的切分仍须保持完整的量化块。</li>
-    <li><strong>TP 下的批处理前向</strong>目前实现于 Mistral 3。MoE 模型（Gemma 4、Qwen 3.5/3.6、GPT OSS、Nemotron-H）在 TP 激活时回退到按序列前向，因此连续批处理在这些模型上的增益较小。</li>
+    <li><strong>TP 下的批处理前向</strong>由共享解码运行时提供（Mistral 3、Hunyuan Dense），各种放置下均可用。Gemma 4、Qwen 3.5/3.6、GPT OSS 与 Nemotron-H 在 TP 激活时仍回退到按序列前向；<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/design/unified-execution.md">统一执行设计</a>（英文）跟踪所有此类缺口。</li>
     <li><strong>本地并行度 ≤ 可见 GPU 数。</strong>请求的 rank 数超过主机设备数时，启动阶段就会直接失败。</li>
     <li><strong>多节点仍走逐算子前向。</strong>融合的整模 TP 计算图是按 rank、单进程的；分布式运行会回退到逐算子执行。</li>
   </ul>
@@ -237,7 +237,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model model.ggu
       <tr><td>某个维度无法被 TP 度整除</td><td>选择能整除 <code>numHeads</code>、<code>numKVHeads</code> 与 <code>intermediateSize</code> 的并行度，通常取 2 的幂。</td></tr>
       <tr><td>节点一直等待 peer</td><td>各节点的 peer 列表、顺序或端口不一致，或者防火墙拦截了该端口。若只是节点启动间隔较久，调大 <code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS</code>。</td></tr>
       <tr><td>只有多 GPU 时输出乱码</td><td>怀疑 P2P DMA 路径。先用 <code>TENSORSHARP_TP_HOST_ALLREDUCE=1</code> 重跑，再试 <code>TENSORSHARP_TP_DISABLE_P2P=1</code>；如果输出恢复正常，问题出在该拓扑的 peer DMA 上。</td></tr>
-      <tr><td>多 GPU 比单 GPU 更慢</td><td>Prefill 受计算约束且要承担集合通信开销，在本来就装得下单卡的模型上可能落后于单卡。GGML 后端上的 decode 应当更快 —— 如果不是，请确认融合路径处于开启状态（未设置 <code>TS_GEMMA4_TP_FUSED_MOE</code> 与 <code>TS_GGML_TP_FUSED_MATMUL</code>），并确认是单进程运行，因为多节点会回退到逐算子前向。另外，在没有 NVLink 的 PCIe 主机上，层本身就不好拆的模型无论怎么调都可能更慢——GLM 5.x 每层需要两次 all-reduce，GLM-5.2 在 <code>--tp 3</code> 下实测就是比按层切分慢；GLM-5.3（非 Flash）从未在大于 1 的并行度下跑过，同样的推理对它成立，但背后没有实测数据。那里请把 TP 当作容量手段而不是提速手段。</td></tr>
+      <tr><td>多 GPU 比单 GPU 更慢</td><td>Prefill 受计算约束且要承担集合通信开销，在本来就装得下单卡的模型上可能落后于单卡。GGML 后端上的 decode 应当更快 —— 如果不是，请确认融合路径处于开启状态（未设置 <code>TS_GEMMA4_TP_FUSED_MOE</code>），并确认是单进程运行，因为多节点会回退到逐算子前向。另外，在没有 NVLink 的 PCIe 主机上，层本身就不好拆的模型无论怎么调都可能更慢——GLM 5.x 每层需要两次 all-reduce，GLM-5.2 在 <code>--tp 3</code> 下实测就是比按层切分慢；GLM-5.3（非 Flash）从未在大于 1 的并行度下跑过，同样的推理对它成立，但背后没有实测数据。那里请把 TP 当作容量手段而不是提速手段。</td></tr>
     </tbody>
   </table>
   </div>

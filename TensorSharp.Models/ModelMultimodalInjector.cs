@@ -655,9 +655,6 @@ namespace TensorSharp.Models
             });
         }
 
-        internal List<int> ProcessQwen35History(Qwen35Model model, List<ChatMessage> history, List<int> inputTokens)
-            => ProcessQwenVLHistory(model.VisionEncoder, history, inputTokens);
-
         /// <summary>
         /// Shared Qwen-VL-family prompt processing: Qwen3.5-VL and Qwen3.8-Flash-Next
         /// use the same qwen3vl_merger tower, image-pad expansion and (T,H,W) IMRoPE

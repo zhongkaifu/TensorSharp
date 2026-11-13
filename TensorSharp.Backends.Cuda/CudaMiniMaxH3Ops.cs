@@ -220,10 +220,11 @@ public static class CudaMiniMaxH3Ops
     }
 
     /// <summary>Copy F32 permutations of up to four dimensions on the device.</summary>
+    /// <summary>Any-stride copy of 4-byte elements (F32, or Int32 moved bit for bit: rotary positions broadcast to heads).</summary>
     public static bool TryCopyStrided(Tensor output,Tensor input)
     {
         if(output?.Storage is not CudaStorage os || input?.Storage is not CudaStorage xs ||
-            output.ElementType != DType.Float32 || input.ElementType != DType.Float32 ||
+            output.ElementType is not (DType.Float32 or DType.Int32) || input.ElementType != output.ElementType ||
             output.DimensionCount != input.DimensionCount || output.DimensionCount is < 1 or > 4 ||
             output.ElementCount() != input.ElementCount() || output.ElementCount() > int.MaxValue ||
             !ReferenceEquals(os.AllocatorImpl,xs.AllocatorImpl) || ReferenceEquals(os,xs)) return false;

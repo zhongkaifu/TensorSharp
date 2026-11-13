@@ -38,15 +38,50 @@ model; changing a running distributed cluster's model/backend is refused.
 
 Use `--layer-split 1` for one GPU on each of several nodes. With neither placement
 mode configured, the default is one local GPU. `--tp-node-id` and `--tp-peers`
-without an explicit layer selection retain their tensor-parallel meaning.
-`--tp N` and `--layer-split M` cannot both exceed one. Environment equivalents are
-`TENSORSHARP_LAYER_SPLIT_DEGREE`, `TENSORSHARP_TP_DEGREE`,
+without an explicit layer selection retain their tensor-parallel meaning (one
+tensor-parallel group spanning the nodes). With an explicit `--layer-split`, `--tp T`
+makes each of the node's stages a T-GPU tensor-parallel group; see
+[nodes with different GPU counts](#nodes-with-different-gpu-counts). Environment
+equivalents are `TENSORSHARP_LAYER_SPLIT_DEGREE`, `TENSORSHARP_TP_DEGREE`,
 `TENSORSHARP_TP_NODE_ID` and `TENSORSHARP_TP_PEERS`.
 
 For native DeepSeek, Qwen and GLM, select physical CUDA devices with `CUDA_VISIBLE_DEVICES`
 before launching each process. The managed dense layer executor also supports
 `TENSORSHARP_LAYER_SPLIT_DEVICES` for multi-GPU device ordinals. Model files and
 all shards must be available on every node; each stage loads its owned weights.
+
+## Nodes with different GPU counts
+
+On the shared decoder runtime (Qwen 3.5 / 3.6 on cuda, ggml_cuda and ggml_vulkan;
+Mistral 3 on ggml_cuda and ggml_vulkan), each node of a layer pipeline chooses its
+own shape: `--layer-split P` local stages, each a tensor-parallel group of `--tp T`
+GPUs (one GPU without `--tp`). A node with two GPUs can run one two-GPU stage next to
+a node with one GPU:
+
+```bash
+# Node 1: one GPU, worker
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+  --model /models/model.gguf --backend cuda --layer-split 1 \
+  --tp-node-id 1 --tp-peers 10.0.0.10:9500,10.0.0.11:9500
+
+# Node 0: two GPUs as one tensor-parallel stage, driver
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+  --model /models/model.gguf --backend cuda --tp 2 --layer-split 1 \
+  --tp-node-id 0 --tp-peers 10.0.0.10:9500,10.0.0.11:9500 \
+  --input prompt.txt --chat --max-tokens 128
+```
+
+At startup the nodes exchange their shapes and the total memory of their CUDA GPUs
+(in whole GiB; on ggml_vulkan every GPU counts alike), and every node derives the
+same plan: each node owns layers in proportion to its capacity, every stage at least
+one layer, and a node splits its share evenly over its own stages. Each node prints
+the layers it owns. Nodes of the same shape but different memory are also weighted.
+Tensor-parallel stages reduce within their node; only the activation crosses the
+network, as in any layer pipeline. Every stage's `--tp` must divide the model's
+attention, KV and recurrent head counts and FFN width.
+
+Other stage executors (DeepSeek V4.1, GLM, Qwen 3.8 Flash Next) need the same
+`--layer-split` and no `--tp` on every node, and refuse other shapes at load.
 
 ## Launch tensor parallelism
 
@@ -84,7 +119,8 @@ the local arithmetic, so network costs can dominate decode.
 | DeepSeek V4.1 Flash, including 1017 | `ggml_cuda`, `cuda` (layer split only) | Native whole-layer graphs transfer residual streams, delayed gates, sparse selections, candidate masks and newly written shared cache rows. Exact prefill; approximate YOCO, vision and DSpark are unavailable in this mode. The direct-CUDA engine's stages move the same state in a layout-hashed payload, place layers from header bytes, need the driver on the last stage and keep every routed expert in VRAM ([card](models/deepseek41.md#backends)). |
 | Qwen3.8 Flash Next (`qwen4exp`) | `ggml_cuda` | Native spans transfer the complete hyper-connection residual. GDN recurrence, convolution, PLE and QSA state stay with their owning layers. Text forwards only. |
 | GLM-5.3-Flash (`glm5next` / `glm5-next`) | `ggml_cuda` | Native stages transfer the complete hyper-connection residual. KDA recurrence and pooled DSA/MLA caches stay with their owning layers. Text forwards only; older `glm-dsa` variants remain local. |
-| Mistral 3 dense text tower | `ggml_cuda`, `ggml_vulkan` | Shared dense pipeline transfers F32 hidden activations. Each node loads only its layer weights/KV state; the first stage embeds and the last stage computes logits. |
+| Mistral 3 dense text tower | `ggml_cuda`, `ggml_vulkan` | Shared dense pipeline transfers F32 hidden activations. Each node loads only its layer weights/KV state; the first stage embeds and the last stage computes logits. Nodes may differ in GPU count and `--tp`. |
+| Qwen 3.5 / 3.6 (`qwen35`, `qwen35moe`) | `cuda`, `ggml_cuda`, `ggml_vulkan` | The shared decoder runtime: F32 hidden activations cross nodes; GDN recurrent and convolution state and the KV cache stay with their owning layers. Nodes may differ in GPU count and `--tp`. Requests run one at a time (no batched forward across nodes). Speculative decoding (the checkpoint's MTP head, a `--draft-model` DFlash/DFlash2 drafter, n-gram) drafts on node 0; see [speculative decoding across nodes](#speculative-decoding-across-nodes). |
 
 The transport, ownership plan and dense-stage execution are independent of model
 names. Architecture descriptors explicitly opt in after implementing their full
@@ -113,10 +149,32 @@ require headroom. New architecture adapters must account for their own replicate
 weights and boundary state.
 
 Distributed requests currently use serialized forward/refill/reset/truncate
-controls. Paged multi-sequence batching, KV snapshots and speculative paths that
-bypass those controls are disabled for these stage executors. Layer splitting
-increases aggregate model capacity. Each token still traverses the stages in
-order, so more devices need not make single-request decode faster.
+controls. Paged multi-sequence batching and KV snapshots that bypass those
+controls are disabled for these stage executors. Layer splitting increases
+aggregate model capacity. Each token still traverses the stages in order, so
+more devices need not make single-request decode faster.
+
+### Speculative decoding across nodes
+
+On the shared decoder runtime (Qwen 3.5 / 3.6, Qwen3.8 dense) a pipeline speculates
+as one device does: `--spec` uses the checkpoint's MTP head, `--draft-model` attaches a
+DFlash / DFlash2 drafter, and `--spec-type ngram` drafts from the context. The drafter,
+the head and the sampler run on node 0, which runs the last stage (the default order;
+`TENSORSHARP_LAYER_SPLIT_DRIVER_STAGE=first` refuses speculation with that reason):
+the MTP layer is placed with the last decoder layer, and only node 0 needs the
+`--draft-model` file. Each verify window is mirrored to every node, which runs its
+layers over the window's rows while its recurrent states keep the state before the
+window; the accepted count and the cache rewind are mirrored after it, and a node
+whose window was cut runs its recurrence again over the accepted rows. A DFlash
+drafter's target-layer rows come to node 0 from the nodes that run those layers
+(for the prompt too, so a long prompt moves several hundred MB of features).
+Streams match plain greedy decoding on one device, up to the near-ties a stage's
+`--tp` rounding can flip.
+
+Measured with Qwen3.8-27B UD-IQ3_XXS over two nodes (an RTX A5000 driver and an RTX
+2000 Ada worker, peers relayed through SSH, so each token pays a network round trip),
+32 greedy tokens: plain decode 12.8 s after a short prompt and 15.7 s after a 3.6K-token
+one; MTP 9.3 s and 14.4 s (55% / 33% accepted); DFlash2 9.2 s and 8.3 s (52% / 84%).
 
 ## Adding a model family
 

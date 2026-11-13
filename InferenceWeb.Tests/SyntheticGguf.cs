@@ -16,7 +16,34 @@ namespace InferenceWeb.Tests;
 /// </summary>
 internal static class SyntheticGguf
 {
-    public enum GgmlType { F32 = 0, F16 = 1, Q4_0 = 2, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, BF16 = 30, MXFP4 = 39, Q2_0 = 42 }
+    public enum GgmlType { F32 = 0, F16 = 1, Q4_0 = 2, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, BF16 = 30, MXFP4 = 39, Q2_0 = 42, PQ2_0 = 142 }
+
+    /// <summary>
+    /// <paramref name="x"/> as Bonsai2's PQ2_0 (bonsai_quant.cpp): every 128 values along ne0 one F16 scale d and 32
+    /// bytes of 2-bit codes, value = d * (code - 1), codes 0..2 (ternary). d is 0.7 of the block's largest magnitude,
+    /// so each block mixes -d, 0 and +d.
+    /// </summary>
+    public static Tensor Pq2(Tensor x)
+    {
+        const int block = 128, bytes = 2 + block / 4;
+        if (x.Dims[0] % block != 0) throw new ArgumentException($"PQ2_0 rows need a multiple of {block} values: '{x.Name}'.");
+        int blocks = x.Data.Length / block;
+        var raw = new byte[blocks * bytes];
+        for (int b = 0; b < blocks; b++)
+        {
+            float max = 0;
+            for (int j = 0; j < block; j++) max = Math.Max(max, Math.Abs(x.Data[b * block + j]));
+            var d = (System.Half)(0.7f * max);
+            float scale = (float)d;
+            BitConverter.TryWriteBytes(raw.AsSpan(b * bytes), BitConverter.HalfToUInt16Bits(d));
+            for (int j = 0; j < block; j++)
+            {
+                int q = scale == 0 ? 0 : (int)Math.Clamp(MathF.Round(x.Data[b * block + j] / scale), -1, 1);
+                raw[b * bytes + 2 + j / 4] |= (byte)((q + 1) << (2 * (j % 4)));
+            }
+        }
+        return new Tensor { Name = x.Name, Dims = x.Dims, Type = GgmlType.PQ2_0, RawBlocks = raw };
+    }
 
     private const int Q8Block = 32;
     private const int Q8BlockBytes = 2 + Q8Block;   // f16 scale + 32 int8

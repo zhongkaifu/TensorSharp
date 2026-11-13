@@ -126,8 +126,10 @@ namespace TensorSharp.Models
             {
                 int numKVHeads = (int)cache.Sizes[0];
                 int headDim = (int)cache.Sizes[2];
+                // Beside the cache: under tensor parallelism the cache lives on its
+                // rank's device, and the expansion must not cross devices.
                 var expanded = new Tensor(
-                    _allocator, DType.Float32,
+                    cache.Storage.Allocator, DType.Float32,
                     numKVHeads * groupSize, totalSeqLen, headDim);
                 if (CudaFusedOps.TryExpandKvHeads(expanded, cache, groupSize, totalSeqLen))
                     return expanded;

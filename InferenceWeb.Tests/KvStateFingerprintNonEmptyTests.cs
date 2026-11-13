@@ -32,7 +32,7 @@ public sealed class KvStateFingerprintNonEmptyTests
     /// silently find nothing.</summary>
     private static readonly Type[] KnownEngineServedFamilies =
     {
-        typeof(Qwen35Model), typeof(Qwen4ExpModel), typeof(Gemma4Model),
+        typeof(Qwen35RuntimeModel), typeof(Qwen4ExpRuntimeModel), typeof(Gemma4Model),
         typeof(GptOssModel), typeof(Mistral3Model), typeof(NemotronModel), typeof(MuseGlimmerModel),
         typeof(GlmDsaModel), typeof(DeepSeek4Model), typeof(DeepSeek41Model),
     };
@@ -74,11 +74,11 @@ public sealed class KvStateFingerprintNonEmptyTests
     {
         // The four M0a families first; the rest pin that the pre-existing overrides keep
         // the same two properties.
-        new object[] { typeof(Qwen4ExpModel) },
+        new object[] { typeof(Qwen4ExpRuntimeModel) },
         new object[] { typeof(DeepSeek4Model) },
         new object[] { typeof(DeepSeek41Model) },
         new object[] { typeof(HunyuanDenseModel) },
-        new object[] { typeof(Qwen35Model) },
+        new object[] { typeof(Qwen35RuntimeModel) },
         new object[] { typeof(Gemma4Model) },
         new object[] { typeof(GptOssModel) },
         new object[] { typeof(Mistral3Model) },

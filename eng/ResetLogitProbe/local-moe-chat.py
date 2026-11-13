@@ -139,7 +139,7 @@ def main():
         if name.startswith(("TS_", "TENSORSHARP_", "GGML_", "OPENAI_")) or name in ("MAX_CONTEXT", "KV_CACHE_DTYPE", "MAX_TOKENS", "ASPNETCORE_URLS", "HOST", "PORT"):
             del env[name]
     fixed = dict(TS_CPU_MOE="1", TS_N_CPU_MOE="0", TS_CPU_MOE_THREADS="0", TS_GGML_CPU_THREADS="8",
-                 TS_GGUF_PREFAULT="0", TS_HOST_MOE_EXPERT_CACHE_MB="0", TS_Q4E_RETAINED_CACHE_MB="0",
+                 TS_GGUF_PREFAULT="0",
                  TS_SPEC="0", KV_CACHE_DTYPE="f16", TS_HOST_MOE_METAL_OVERLAP="0",
                  TENSORSHARP_TP_DEGREE="1", TENSORSHARP_LAYER_SPLIT_DEGREE="1", TS_SCHED_MAX_RUNNING_SEQS="1")
     env.update(fixed)

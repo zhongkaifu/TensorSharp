@@ -95,8 +95,10 @@ dotnet run --project TensorSharp.Server.Host -c Release -- \
   --backend ggml_metal --host 127.0.0.1 --port 5000
 ```
 
-现有的 Qwen 3.5 实现提供整模型 prefill/decode、按序列的 KV 与循环状态，以及连续批处理。
-PRISM 变换被插入这些路径，因此模型可以沿用它们现有的融合与状态管理。旋转会增加计算量，
+在单个 `ggml_metal` 或 `ggml_cuda` 设备上，模型运行在共享解码器运行时（`Qwen35RuntimeModel`）上，
+这也是那里所有稠密 Qwen 3.5 检查点所走的路径：GGML 构建每一步的计算图时，凡是权重带有正向旋转的乘积，
+其输入都会先被旋转（Q/K/V 与 gate/up 共用同一个旋转后的输入），嵌入行则经过逆变换。`ggml_cpu` 与
+`ggml_vulkan` 仍使用 Qwen 3.5 系列实现，它把同样的变换插入自己的融合计算图。旋转会增加计算量，
 重新打包后的权重也比发布方的自定义格式占用更多内存；性能必须在实际负载上测量。
 
 ## 可复现的验证
@@ -164,3 +166,19 @@ CUDA、Vulkan、iOS 与张量并行的模型执行均未验证。
 保持未修改，在同一 GGUF 上测量纯模型与 HTTP（并发 1 与 4）吞吐，运行一次投影器冒烟测试，
 并把输出写入已忽略的 `artifacts/`。它没有任何已提交的结果，因此如上所述，CUDA 模型执行
 仍未经验证。
+
+### 共享解码器运行时（2026-11-12）
+
+在 M5 Pro 上使用未修改的上游 ggml `cd6d2b75f5d3e4b2f3fe8e8fbc6c8b84ac80e74a`，PTQ1_0 文件（SHA-256 见上）
+在 `ggml_metal` 上由共享运行时与系列实现给出相同的贪心文本，两者各交替运行两次，F16 KV：
+
+| 提示 | 指标 | 运行时 | 系列实现 |
+|---|---|---:|---:|
+| 55 token | Prefill（毫秒） | 357-370 | 376-402 |
+| 55 token | Decode，128 token（token/秒） | 27.4 | 27.2-27.4 |
+| 3,609 token | Prefill（毫秒） | 11,512-11,533 | 11,592-11,636 |
+| 3,609 token | Decode，109 token（token/秒） | 26.1 | 26.2 |
+
+合成的 PRISM 检查点（旋转后的 PQ2_0 投影、输出头与嵌入，以及分组的 value 头）比较过两条路径的 logits：`ggml_metal` 上最多相差
+1.1e-5，`ggml_cpu` 上 2.0e-2（其激活经 BF16 舍入）；若省略旋转，第一行相差 1.2。`Qwen35RuntimeTests.PrismRotationsMatchTheFamilyGolden`
+让运行时保持在被删实现 `ggml_cpu` 输出的这一舍入范围内（`ggml_cuda` 上 2.52e-2，RTX A5000，其激活同样经过舍入）；真实检查点尚未在 CUDA 上运行。

@@ -6,7 +6,7 @@
 |---|---|
 | 提供方 | Mistral AI |
 | GGUF 架构标识 | `mistral3`；以及 llama.cpp 尚无 `mistral3` 时转换的 Mistral Small 3.x 文件所用的 `llama`（见[标记为 llama 的文件](#标记为-llama-的文件)） |
-| 模型类 | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs)（旧单序列路径）+ [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)（`IBatchedPagedModel`） |
+| 模型类 | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs)（YaRN 旋转、视觉）建立在共享解码运行时 [`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) 之上（前向、`IBatchedPagedModel`、TP / 按层切分 / 混合） |
 | 视觉编码器 | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs)（Pixtral） |
 | 图像处理器 | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
 | 示例模型 | Mistral-Small-3.1-24B-Instruct、Ministral-3-14B-Instruct |
@@ -142,7 +142,7 @@ Mistral 3 是 Mistral 第三代 LLaMA 风格密集 transformer，带两个显著
         ┌──── × NumLayers ──────────────────────────────┐
         │  RMSNorm(attn_norm)                            │
         │  Q, K, V 投影（或融合 QKV）                    │
-        │  RoPE_GPT-J(Q, K) with YaRN-corrected freqs    │
+        │  RoPE_GPT-J(Q, K), ggml YaRN (rope_yarn)       │
         │  Q ← Q * (1 + β · log(1 + ⌊pos / origCtx⌋))    │
         │  attention(Q, KCache, VCache) (全因果)         │
         │  attn_output ─► residual                        │
@@ -206,21 +206,11 @@ hidden ─► narrow(seq_len-1) if prefill
 ### 4.2 RoPE —— GPT-J 风格 + YaRN
 
 - **配对**：相邻元素 `(x[2i], x[2i+1])` 一起旋转（GPT-J 约定），与 NeoX 的 `(x[i], x[i + halfDim])` 配对相反。
-- **YaRN 频率校正**：当 `mistral3.rope.scaling.type == "yarn"` 且 `mistral3.rope.scaling.original_context_length > 0` 时，`ApplyYarnFreqCorrection()` 根据每个频段属于「慢」还是「快」rotation 范围，在外推与插值频率之间做插值：
+- **YaRN**：`mistral3.rope.scaling.type == "yarn"` 时，旋转就是 ggml 的 `rope_yarn`（`ggml_rope_ext`，使用检查点的外推因子、`yarn_beta_fast` / `yarn_beta_slow` 与原始上下文）：每个旋转对 `theta = interp * (1 - ramp) + extrap * ramp`，ramp 在两个校正维之间按对序号线性变化。
+- **注意力因子**（llama.cpp 的 `yarn_attn_factor`）：只要开启 YaRN，ggml 就会把 cos/sin 乘以 `1 + 0.1 ln(factor)`，因此运行时传入 `mscale(factor, m) / mscale(factor, m_all) / (1 + 0.1 ln(factor))`，其中 `m_all` 取 `rope.scaling.yarn_log_multiplier`（或 `mscale_all_dim`），`m` 取 `rope.scaling.mscale`（缺省 1）。Ministral 3 的 `yarn_log_multiplier = 1`，所以旋转保持单位幅度。
+- **所有路径同一个旋转**：prompt、解码 token 与批处理计算同一个函数（`StandardDecoderModel.RotarySpec`）；单序列的解码 token 在 GGML 后端与托管 CPU 上于主机端旋转（那里一次设备调度比这点运算更贵），其余后端走 `Ops.RoPEEx`。
 
-  ```
-  lowFreqWavelen  = origCtx / betaSlow
-  highFreqWavelen = origCtx / betaFast
-  对每个 freq f:
-      wavelen = 2π / f
-      if wavelen < highFreqWavelen:        # 高频段: 外推
-          f 不变
-      elif wavelen > lowFreqWavelen:       # 低频段: 插值
-          f *= 1 / scale
-      else:                                # 中频段: 平滑插值
-          ramp = ...                       # 两者之间线性 ramp
-          f = mix(f, f / scale, ramp)
-  ```
+  2026-11-10 之前，prompt 路径保留了 `1 + 0.1 ln(16)` 因子（q、k 被放大 1.28 倍），而解码用不带该因子的 Llama-3.1 式波长平滑，prompt 的 key 与解码的 query 不一致。Ministral-3-3B Q4_K_M 在本仓库文档的四个 512 token 块上的 teacher-forced 困惑度：修复前 49.20，修复后 42.91；llama.cpp `llama-perplexity` 在相同块上为 42.37。
 
 - **位置相关 Q 缩放**：`_ropeOrigCtx > 0` 时，
   ```
@@ -267,8 +257,10 @@ hidden ─► narrow(seq_len-1) if prefill
 | `mistral3.rope.scaling.extrapolation_factor` | float32 | YaRN 外推因子（默认 1.0） |
 | `mistral3.rope.scaling.yarn_beta_fast` | float32 | YaRN 快速 rotation 阈值（默认 32.0） |
 | `mistral3.rope.scaling.yarn_beta_slow` | float32 | YaRN 慢速 rotation 阈值（默认 1.0） |
-| `mistral3.rope.scaling.mscale` | float32 | YaRN mscale（默认 0） |
-| `mistral3.rope.scaling.mscale_all_dim` | float32 | YaRN mscale_all_dim（默认 0） |
+| `mistral3.rope.scaling.yarn_log_multiplier` | float32 | llama.cpp 读取的 YaRN `mscale_all_dim`（默认 0 = 缺省） |
+| `mistral3.rope.scaling.mscale` | float32 | YaRN mscale（缺省时为 1） |
+| `mistral3.rope.scaling.mscale_all_dim` | float32 | YaRN mscale_all_dim，在没有 `yarn_log_multiplier` 时使用 |
+| `mistral3.rope.scaling.attn_factor` | float32 | 额外的旋转幅度因子（默认 1.0） |
 
 Pixtral 视觉 projector（`mmproj` GGUF）使用标准 `clip.vision.*` keys 与 `mm.*` keys 描述编码器维度与 projector 层。
 
@@ -330,14 +322,13 @@ mm.linear_2.weight                         # projector linear 2
 7. `InitKVCache(maxSeqLen)` 为每层分配 K、V tensor，形状 `[NumKVHeads, maxSeqLen, headDim]`（独立 `_attnKeyLen` / `_attnValLen` 会被尊重）。
 8. `PrecomputeConstants()` 构建：
    - per-layer 权重名数组 —— 形状取决于该层的 QKV / gate-up 是否融合。
-   - RoPE 频率表 `_ropeFreqs[halfDim]`。
-   - `_ropeType == "yarn"` 且 `_ropeOrigCtx > 0` 时通过 `ApplyYarnFreqCorrection()` 校正 YaRN 频率。
+   - 旋转参数（`RotarySpec`：GPT-J 配对、YaRN 参数与上述注意力因子）。
 
 `Forward(int[] tokens)` 跑 per-op 托管循环：
 
 - Embedding lookup。
 - 在展开后的 `[IMG]` 行所在位置可选视觉注入。
-- 每层：RMSNorm，QKV（融合或拆开），带 YaRN 校正频率的 RoPE，可选位置相关 Q 缩放，attention，输出投影 + residual，FFN，residual。
+- 每层：RMSNorm，QKV（融合或拆开），YaRN RoPE，可选位置相关 Q 缩放，attention，输出投影 + residual，FFN，residual。
 - prefill 时 residual 在 `output_norm` 之前 narrow 到最后一个 token，让 LM head matmul 只产出一行。
 - 最终 RMSNorm、LM head、拷贝到 `_logitsBuffer`。
 
@@ -345,7 +336,7 @@ mm.linear_2.weight                         # projector linear 2
 
 - **融合 QKV 与 gate / up** 减少 per-layer GEMM 数。
 - **末行 narrow** 在 `output_norm` 之前，让 LM head matmul 只输出 `[1, vocab]`。
-- **YaRN 频率表加载时一次性构建**。Decode 路径复用同一份 `_ropeFreqs[]`。
+- **加载时构建一次旋转描述**（`RotarySpec`）；prompt、解码与批处理都据此计算 ggml 的 YaRN 旋转。
 - **后端算子** 通过 `Ops.RoPEEx` 与 `Ops.SiLUMul` 派发，GGML / CUDA 后端上以原生 kernel 运行。
 
 Mistral 3 没有分块 prefill（只有全因果 attention，没有 SWA），没有融合 per-layer prefill kernel，也没有 whole-model 原生 decode。任何一项都能进一步压低 decode latency 与 TTFT。
@@ -354,7 +345,7 @@ Mistral 3 没有分块 prefill（只有全因果 attention，没有 SWA），没
 
 - 在 `PrecomputeConstants()` 中预分配的 per-layer 权重名数组（`_layerWeightNames[L][]`）让热循环零分配。
 - `_layerQkvFused[]` 标志 per-layer 选择融合 / 拆开 QKV 路径，无分配。
-- 预分配的 decode 位置数组与 YaRN 校正后的 `_ropeFreqs[]` 避免每 token 重新计算。
+- 单序列的解码 token 在 GGML 后端与托管 CPU 上于主机端旋转（一次设备调度比 2 x 64 次旋转更贵）；MLX 与直连 CUDA 在设备上旋转。
 - 量化权重保留在 `_quantWeights`；matmul 通过后端的原生量化 matmul 调用。
 
 ## 10. 内存与 KV cache 策略
@@ -367,7 +358,7 @@ Mistral 3 没有分块 prefill（只有全因果 attention，没有 SWA），没
 ## 11. 批处理 / 分页前向（连续批处理）
 
 Mistral 3 是 TensorSharp 中 `IBatchedPagedModel.ForwardBatch` 的**参考实现**
-（[`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)），
+（现由共享解码运行时提供：[`StandardDecoderModel.Batched.cs`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.Batched.cs)），
 通过 [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
 中描述的共享连续批处理栈（`InferenceEngine` + `ContinuousBatchScheduler` +
 `BatchExecutor`）执行。
@@ -383,8 +374,8 @@ Mistral 3 是 TensorSharp 中 `IBatchedPagedModel.ForwardBatch` 的**参考实�
 - **逐层选择融合 vs 非融合 QKV**：`ForwardBatch` 根据 `_layerQkvFused[layer]`
   决定走融合的 `attn_qkv.weight` matmul 还是三次独立的 `attn_q/k/v.weight`
   matmul。两条路径都按 token 轴批量计算，每层只发起一次 GEMM。
-- **逐 token YaRN RoPE**。加载时建立的 `_ropeFreqs[]` 数组通过 `Ops.RoPEEx`
-  应用，并传入显式 `positions[]` 数组；逐 token 的 YaRN 位置相关 Q 缩放
+- **逐 token YaRN RoPE**。`Ops.RoPEEx` 使用模型的 `RotarySpec`，
+  并传入显式 `positions[]` 数组；逐 token 的 YaRN 位置相关 Q 缩放
   （`q *= 1 + beta * log(1 + floor(pos / orig_ctx))`）在批处理循环中执行，
   每个 token 取各自的缩放因子。
 - **基于 `slotMapping` 的 K/V 写入** 把新的 K 与 V 写入层的分页缓冲区在

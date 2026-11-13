@@ -138,6 +138,7 @@ public class LlamaLabelledMistral3RoutingTests : IDisposable
             Id = id,
             Aliases = new[] { id },
             Factory = _ => null,
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
             RecognizeRelabelledFile = (_, _) => false,
         };
         Assert.Throws<InvalidOperationException>(() => ModelArchitectureRegistry.Register(bad));

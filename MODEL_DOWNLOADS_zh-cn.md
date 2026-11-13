@@ -26,7 +26,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Nemotron 3.5 | Nemotron-3.5-Lightning-30B-A3B（23 Mamba-2 + 23 MoE + 6 注意力的混合架构） | [unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF)，例如 `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE.gguf`（MoE 专家为 MXFP4，约 17 GB）；`general.architecture` = `nemotron_h_moe`。更小 / 其他量化见 [ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF)（BF16/Q4_0/Q8_0 与独立的 MTP GGUF）。下一行的 DSpark drafter 仅作参考列出：这个主干拒绝投机解码 |
 | Nemotron 3.5 | DSpark 投机 drafter——**不会使用** | [magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark-GGUF](https://huggingface.co/magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark-GGUF)（官方 DSpark 模块的 llama.cpp DFlash 导出版）。TensorSharp 在 Nemotron-H 上拒绝投机解码，`--draft-model` 不会挂载它：主干的 verify 与 decode 内核结果不一致，投机输出会与普通解码不同（见 [speculative_decoding.md](docs/speculative_decoding.md#nemotron-h-refuses-speculation)） |
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF)，Pixtral 投影器 `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` |
-| Hunyuan Dense | 腾讯稠密 Hunyuan 检查点（`hunyuan-dense`） | 任何 `general.architecture` 为 `hunyuan-dense` 的 GGUF 均可加载，例如 Hy-MT2 系列（参考对话模板取自 `tencent/Hy-MT2-1.8B`）。仅文本、单设备，没有投影器也没有草稿模型。见 [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
+| Hunyuan Dense | 腾讯稠密 Hunyuan 检查点（`hunyuan-dense`） | 任何 `general.architecture` 为 `hunyuan-dense` 的 GGUF 均可加载，例如 Hy-MT2 系列（参考对话模板取自 `tencent/Hy-MT2-1.8B`）。仅文本（多 GPU 由共享解码运行时提供），没有投影器也没有草稿模型。见 [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | Muse-Glimmer | Muse-Glimmer-30B（稠密，支持图像） | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)，如 `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` 或 `Muse-Glimmer-30B-Q8_0.gguf`；`general.architecture` 为 `muse-glimmer` / `muse_glimmer`。图像输入需同仓库的 `mmproj-Muse-Glimmer-30B-Q8_0.gguf`：传 `--image` 时 CLI 会在模型旁边找到它，服务端则需用 `--mmproj` 指定。可选提速产物：同仓库的 DFlash 分块 draft `dflash-kquant.gguf`，或更新的 DFlash2 draft [z-lab/Muse-Glimmer-30B-DFlash2-GGUF](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2-GGUF)（16 GB 显卡上优先选 `-Q4_K_M`，见 [speculative_decoding.md](docs/speculative_decoding.md#what-to-expect) 中关于 draft 大小的说明），用 `--draft-model` 加载即可无损推测解码——不要传任何采样参数，它只在纯贪心下生效 |
 | Muse Spark | Muse-Spark-Open-816B-A42B（816B-A42B MoE，支持图像） | [unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF)：每个量化档一个子目录，各为一组分片：`UD-IQ3_XXS/` 为 8 个分片、317 GiB（即实测所用的量化），`UD-Q3_K_XL/` 为 10 个分片、374 GiB，`UD-Q4_K_XL/` 为 12 个分片。同一量化档的所有分片需放在同一目录，`--model` 指向其中任意一片即可；后续分片只含切分元数据，不能单独作为模型加载。`general.architecture` 为 `muse-spark` / `muse_spark`。图像输入需用 `--mmproj` 指定仓库根目录下的 `mmproj-Q8_0.gguf`（2.2 GB）；Muse-Glimmer-30B 的投影器输出宽度不同，会被拒绝。实测配置为十张 46 GB A40，全部专家都放在显存中（见下方运行示例）。没有草稿器：投机解码只能用无权重的 n-gram |
 | MiniMax-M3.1 | MiniMax-M3.1-Flash（428B-A23B MoE，支持图像，`minimax-m3`） | [unsloth/MiniMax-M3.1-Flash-GGUF](https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF)：`UD-Q4_K_XL/` 为 7 个分片，共 249,402,105,310 字节（232.3 GiB）；`--model` 指向 `-00001-of-00007` 分片。该仓库标注为仍在制作中，尚未发布 mmproj 与 DSpark 草稿器：两者都需用 [unslothai/llama.cpp PR #320](https://github.com/unslothai/llama.cpp/pull/320)（`minimax-m31` @ `ef8f94cc`）的转换器从 [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) 转换，只需配置 / 分词器文件、第 13 与 48 个 safetensors 分片（视觉塔）以及 `dspark/`，得到 `mmproj-MiniMax-M3.1-Flash-BF16.gguf`（1.74 GB，`--mmproj`）与 `MiniMax-M3.1-Flash-DSpark-BF16.gguf`（3.93 GB，`--draft-model`）；步骤见[模型卡片](docs/models/minimax-m3_zh-cn.md#生成视觉投影器与-dspark-草稿器)。仅在 `ggml_cuda` 上运行，并且需要显式的 `--layer-split N` 或 `--tp N`（实测配置为八张 46 GB A40） |
@@ -84,7 +84,7 @@ draft，社区亦有 GGUF 转换，但它们是另一种 draft 结构：5 层 Tr
 > 这套 5 层 `fc` 融合结构**已经**在 Muse-Glimmer 上实现——见
 > [DFlash 投机解码](docs/models/muse-glimmer_zh-cn.md#3-dflash-投机解码)。
 > 下表这些 draft 没有接入，是因为它们的编码器需要目标模型暴露逐层输入残差，而 `Gemma4Model`
-> 没有暴露。目前做到这一点的是 `MuseGlimmerModel` 与 `Qwen35Model`（Qwen 3.5 / 3.8 的
+> 没有暴露。目前做到这一点的是 `MuseGlimmerModel` 与 `Qwen35RuntimeModel`（Qwen 3.5 / 3.8 的
 > DFlash/DFlash2 draft）；`NemotronModel` 也会取出这些残差，但该主干拒绝投机解码。
 
 | 主干 | 官方 checkpoint（safetensors） | 社区 GGUF |
@@ -286,7 +286,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/nv
 
 图像输入请改用 Omni 发行版：从 [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) 下载 `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf` 与 `mmproj-BF16.gguf`；除非加载了由 NVIDIA 检查点转换得到的音频配套 GGUF，音频输入会被拒绝：这些 GGUF 不带 Parakeet/FastConformer 音频塔（见 [nemotron_zh-cn.md §4.6-4.7](docs/models/nemotron_zh-cn.md)）。
 
-**Hunyuan Dense**（腾讯稠密 Hunyuan / Hy-MT2，仅文本，单设备）：
+**Hunyuan Dense**（腾讯稠密 Hunyuan / Hy-MT2，仅文本；多 GPU 由共享解码运行时提供）：
 
 这里不固定任何仓库：只要 GGUF 的 `general.architecture` 是 `hunyuan-dense` 就能加载，
 架构由该键决定，与文件名无关。

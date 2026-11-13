@@ -77,30 +77,6 @@ namespace ggml_pool
 
 // ---------------------------------------------------------------------------
 // Internal shared types, globals, and helpers
-// ---------------------------------------------------------------------------
-// Qwen3.5 arena batched-decode coherence hooks (ggml_ops_qwen35_batched_arena.cpp).
-// on_external_touch: a non-arena path is about to use this host cache/state
-// pointer — flush the arena slot's rows/state to the host bytes, invalidate the
-// resident copies, and retire the slot (no-op for unregistered pointers).
-// on_drop: the host bytes were rewritten/freed — discard without flushing.
-namespace tsg_q35arena
-{
-    void on_external_touch(const void* host_ptr);
-    void on_drop(const void* host_ptr);
-    void on_drop_all();
-}
-
-// qwen4exp arena batched-decode coherence hooks (ggml_ops_qwen4exp_arena.cpp).
-// Same contract as tsg_q35arena, plus a per-device sweep: the qwen4exp pools
-// are per-rank, and the touch/drop caller does not always know which rank a
-// holder's slot lives on.
-namespace tsg_q4earena
-{
-    void on_external_touch(const void* host_ptr);
-    void on_drop(const void* host_ptr);
-    void on_drop_all();
-}
-
 namespace tsg
 {
     // --- Tensor descriptor structs ---
@@ -263,6 +239,13 @@ namespace tsg
         // or the host pointer for a zero-copy wrap). Recording it lets a repeat
         // bind attach with two assignments and no backend calls at all.
         void* bound_addr = nullptr;
+        // Where this entry's device copy starts in `buffer`. Non-zero only for a
+        // slice of a buffer shared by several keys (TSGgml_ZeroDeviceCopies: one
+        // allocation for a request slot's caches instead of one per layer), whose
+        // owners are counted in DeviceState::shared_buffer_refs. Use
+        // cached_buffer_addr / release_cached_buffer_locked, never the buffer's
+        // base or ggml_backend_buffer_free, on host-cache entries.
+        std::size_t offset = 0;
     };
 
     // --- Multi-device (tensor-parallel) state -------------------------------
@@ -306,6 +289,11 @@ namespace tsg
 
         std::int64_t device_copy_resident_bytes = 0;
         std::int64_t device_copy_budget_bytes = 0;
+
+        // Host-cache entries sharing one device buffer (slices at their offsets),
+        // by buffer: the last entry released frees it. Guarded by
+        // host_buffer_cache_mutex.
+        std::unordered_map<ggml_backend_buffer_t, int> shared_buffer_refs;
     };
 
     extern DeviceState g_device_states[TSG_MAX_DEVICES];
@@ -400,6 +388,34 @@ namespace tsg
 #define g_offloadable_budget            (::tsg::dev().offloadable_budget)
 #define g_device_copy_resident_bytes    (::tsg::dev().device_copy_resident_bytes)
 #define g_device_copy_budget_bytes      (::tsg::dev().device_copy_budget_bytes)
+#define g_shared_buffer_refs            (::tsg::dev().shared_buffer_refs)
+
+    // A host-cache entry's device address (its buffer's base plus its slice offset).
+    inline void* cached_buffer_addr(const CachedHostBuffer& entry)
+    {
+        void* base = entry.buffer != nullptr ? ggml_backend_buffer_get_base(entry.buffer) : nullptr;
+        return base != nullptr ? static_cast<char*>(base) + entry.offset : nullptr;
+    }
+
+    // Free a host-cache entry's buffer, or drop its share of a shared one (the
+    // last share frees it). Caller holds host_buffer_cache_mutex.
+    inline void release_cached_buffer_locked(CachedHostBuffer& entry)
+    {
+        if (entry.buffer == nullptr)
+            return;
+        auto shared = g_shared_buffer_refs.find(entry.buffer);
+        if (shared != g_shared_buffer_refs.end())
+        {
+            if (--shared->second <= 0)
+            {
+                g_shared_buffer_refs.erase(shared);
+                ggml_backend_buffer_free(entry.buffer);
+            }
+        }
+        else
+            ggml_backend_buffer_free(entry.buffer);
+        entry.buffer = nullptr;
+    }
 
     constexpr int BACKEND_TYPE_METAL = 1;
     constexpr int BACKEND_TYPE_CPU = 2;
@@ -1024,6 +1040,7 @@ namespace tsg
     bool moe_stage_prefetch_enabled();
     void moe_stage_prefetch_start(const HostMoeSegment& hm);
     void moe_stage_prefetch_join();
+    void moe_stage_prefetch_retire();
     bool moe_stage_prefetch_take(const void* gate, const void* up, const void* down, ggml_backend_buffer_t& buf,
                                  std::size_t offset[3], std::size_t bytes[3]);
     long long moe_stage_prefetch_hits();
@@ -1509,7 +1526,6 @@ namespace tsg
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
                                   HostMoeStagedInputs* staged = nullptr,
                                   bool allow_device_stream = true,
-                                  bool* output_on_device = nullptr,
                                   void (*after_split)(void*) = nullptr, void* after_split_ctx = nullptr);
 
     // One-token routed experts on the host (ggml_ops_host_moe_decode.cpp): ggml's
@@ -1536,15 +1552,6 @@ namespace tsg
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                      const float* weights, float* out, const std::uint8_t* skip = nullptr,
                                      const HostMoePrefetch* ahead = nullptr);
-    // Opt-in Qwen4Exp CUDA expert tier: 1 computed, 0 unsupported/disabled,
-    // -1 execution failed. Owns bounded compact quantized slots and graphs.
-    // x/weights both null reads hm.moe_in/hm.weights through CUDA row copies;
-    // IDs stay on the host. out null writes hm.moe_out directly on CUDA;
-    // otherwise the complete result is downloaded into out.
-    int host_moe_cached_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                               const float* weights, float* out, const char* kernel_name);
-    void host_moe_expert_cache_on_drop(const void* ptr);
-    void host_moe_expert_cache_release();
     void prefetch_mapped_ranges(const std::uint8_t* base,
                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges);
     void host_moe_decode_release();
@@ -2050,407 +2057,3 @@ namespace tsg
         std::int64_t rows, std::int64_t cols, float label_smooth);
 
 } // namespace tsg
-
-// ---------------------------------------------------------------------------
-// qwen4exp (Qwen3.8-Flash-Next) shared executor pieces.
-//
-// The per-layer descriptor structs, the weight binder and the node builders
-// are defined/implemented in ggml_ops_qwen4exp.cpp and shared with the arena
-// batched-decode kernel in ggml_ops_qwen4exp_arena.cpp, so the solo span and
-// the arena compose their layer math from ONE source of truth.
-// ---------------------------------------------------------------------------
-
-// Per-layer weights. Pointers first, then int64, then int32 - the layout the
-// C# side mirrors; append within a run rather than reordering.
-struct TSGgmlQwen4ExpFfnArgs
-{
-    // hyper-connection mixer
-    void* hc_norm;          // f32 [hc_dim], gamma folded to (1 + w)
-    void* hc_down;          // [hc_dim, hc_low_rank]
-    void* hc_up;            // [hc_low_rank, hc_dim]
-    void* hc_inject;        // [hc_dim, hc]
-    // MoE
-    void* router;           // [n_embd, n_expert]
-    void* gate_exps;        // [n_embd, n_ff, n_expert]
-    void* up_exps;          // [n_embd, n_ff, n_expert]
-    void* down_exps;        // [n_ff, n_embd, n_expert]
-    // shared expert
-    void* sh_gate_inp;      // f32 [n_embd] - one sigmoid scalar per token
-    void* sh_gate;          // [n_embd, n_ff_sh]
-    void* sh_up;            // [n_embd, n_ff_sh]
-    void* sh_down;          // [n_ff_sh, n_embd]
-
-    long long hc_down_bytes, hc_up_bytes, hc_inject_bytes;
-    long long router_bytes, gate_exps_bytes, up_exps_bytes, down_exps_bytes;
-    long long sh_gate_bytes, sh_up_bytes, sh_down_bytes;
-
-    int hc_down_type, hc_up_type, hc_inject_type;
-    int router_type, gate_exps_type, up_exps_type, down_exps_type;
-    int sh_gate_type, sh_up_type, sh_down_type;
-
-    // Nonzero: this layer's routed experts run on the host, straight from the
-    // GGUF mapping (MoE CPU offload, --n-cpu-moe). The graph never binds the
-    // expert tensors, so they are never wrapped as accelerator buffers - on
-    // ggml-metal a wrapped weight is wired whole while a command buffer uses it.
-    // Only the token span supports it; every other builder refuses the layer.
-    int cpu_moe;
-};
-
-// Per-layer weights for the recurrent (Gated DeltaNet) half of a layer.
-struct TSGgmlQwen4ExpGdnArgs
-{
-    // hyper-connection mixer
-    void* hc_norm;
-    void* hc_down;
-    void* hc_up;
-    void* hc_inject;
-    // delta net
-    void* qkv;              // [n_embd, conv_dim]
-    void* gate;             // [n_embd, value_dim]
-    void* beta;             // [n_embd, n_v_heads]
-    void* alpha;            // [n_embd, n_v_heads]
-    void* conv1d;           // f32 [d_conv, conv_dim]
-    void* ssm_dt;           // f32 [n_v_heads]
-    void* ssm_a;            // f32 [n_v_heads], pre-negated
-    void* ssm_norm;         // f32 [head_v_dim]
-    void* out_proj;         // [value_dim, n_embd]
-    // state, updated in place
-    void* conv_state;       // f32 [d_conv-1, conv_dim]
-    void* ssm_state;        // f32 [head_v_dim, head_v_dim, n_v_heads]
-
-    long long hc_down_bytes, hc_up_bytes, hc_inject_bytes;
-    long long qkv_bytes, gate_bytes, beta_bytes, alpha_bytes, out_proj_bytes;
-
-    int hc_down_type, hc_up_type, hc_inject_type;
-    int qkv_type, gate_type, beta_type, alpha_type, out_proj_type;
-};
-
-// Per-layer weights for the full-attention half of a layer.
-struct TSGgmlQwen4ExpAttnArgs
-{
-    void* hc_norm;
-    void* hc_down;
-    void* hc_up;
-    void* hc_inject;
-    void* wq;               // [n_embd, head_dim * n_head * 2]  (query|gate interleaved)
-    void* wk;               // [n_embd, head_dim * n_head_kv]
-    void* wv;
-    void* wo;               // [head_dim * n_head, n_embd]
-    void* q_norm;           // f32 [head_dim]
-    void* k_norm;           // f32 [head_dim]
-    void* k_cache;          // f16/f32 [head_dim, capacity, n_head_kv]
-    void* v_cache;
-
-    long long hc_down_bytes, hc_up_bytes, hc_inject_bytes;
-    long long wq_bytes, wk_bytes, wv_bytes, wo_bytes;
-    long long kv_bytes;     // per cache
-
-    int hc_down_type, hc_up_type, hc_inject_type;
-    int wq_type, wk_type, wv_type, wo_type;
-    int kv_type;
-};
-
-// The PLE block riding inside the span. Only the n-gram hash and the gather
-// from the ~320M-row host table stay on the CPU; the gathered rows arrive as a
-// graph input and the projections, norms, gating, dilated depthwise conv and
-// the residual add all run on the device. The conv history is persistent
-// device state, written in place like the GDN state.
-struct TSGgmlQwen4ExpPleArgs
-{
-    void* key_w;            // [n_embd, hc_dim]
-    void* value_w;          // [n_embd, n_embd]
-    void* norm_key;         // f32 [hc_dim]
-    void* norm_query;       // f32 [hc_dim]
-    void* norm_conv;        // f32 [hc_dim]
-    void* conv1d_t;         // f32 [hc_dim, kern] - tap-major transpose of ple_conv1d
-    void* conv_state;       // f32 [hc_dim, hist] seed (host layout matches)
-
-    long long key_bytes, value_bytes;
-
-    int key_type, value_type;
-    int kern;               // conv kernel taps
-    int dil;                // dilation (the n-gram size)
-};
-
-// The output stage: the final hyper-connection mixer (which IS the output norm -
-// qwen4exp ships no separate one) and the LM head, riding the tail of the last
-// span. The mixer runs on the LAST token only - at prefill the managed path used
-// to mix every position and throw all but one away.
-struct TSGgmlQwen4ExpHeadArgs
-{
-    void* hc_norm;          // f32 [hc_dim]
-    void* hc_down;          // [hc_dim, hc_low_rank]
-    void* hc_up;            // [hc_low_rank, hc_dim]
-    void* head;             // [n_embd, vocab]
-
-    long long hc_down_bytes, hc_up_bytes, head_bytes;
-
-    int hc_down_type, hc_up_type, head_type;
-    int vocab;
-};
-
-struct TSGgmlQwen4ExpMtpConfig
-{
-    void* enorm;
-    void* hnorm;
-    void* eh_proj;
-    long long eh_bytes;
-    int eh_type;
-    int n_embd, hc, hc_low_rank;
-    int head_dim, n_head, n_head_kv, n_rot;
-    int n_expert, n_expert_used, n_ff, n_ff_sh;
-    int capacity, device;
-    float eps, rope_base, rope_scale, attn_scale;
-    int rope_sections[4];
-};
-
-// Additive QSA descriptor. Existing attention/span descriptor ABIs stay intact.
-struct TSGgmlQwen4ExpQsaArgs
-{
-    void* k_proj;
-    void* q_proj;
-    void* k_norm;
-    void* q_norm;
-    void* cache;
-    long long k_bytes, q_bytes, cache_bytes;
-    int k_type, q_type, cache_type;
-    int head_dim, heads, ratio, top_k;
-    int rope_sections[4];
-};
-
-struct Q4eQsaInputs
-{
-    int ratio = 0;
-    ggml_tensor* cell_blocks = nullptr;
-    ggml_tensor* block_cells = nullptr;
-    ggml_tensor* block_positions = nullptr;
-    ggml_tensor* query_positions = nullptr;
-    ggml_tensor* bias = nullptr;
-    // Incremental pooling (Q4eQsaGraph::pooled): the complete blocks this step's cells belong to - their slots, member
-    // cells and positions - padded with a scratch slot.
-    ggml_tensor* new_blocks = nullptr;
-    ggml_tensor* new_block_cells = nullptr;
-    ggml_tensor* new_block_positions = nullptr;
-};
-
-struct Q4eQsaGraph
-{
-    const TSGgmlQwen4ExpQsaArgs* args = nullptr;
-    const Q4eQsaInputs* inputs = nullptr;
-    ggml_tensor* cache = nullptr;
-    // Optional test-only outputs, never retained by production graphs.
-    std::vector<ggml_tensor*>* probes = nullptr;
-    // The layer's persistent pooled keys [head_dim, blocks + 1] (Q4eSeqStateEntry::aux), or null: pool every block.
-    // With `incremental`, only the inputs' new blocks are pooled and written; else every block is, and written too.
-    ggml_tensor* pooled = nullptr;
-    bool incremental = false;
-};
-
-// A weight binding resolved through the resident cache, remembered so a
-// REPLAY can re-resolve it. The cache can move or re-create a device copy
-// (large allocations elsewhere churn it), and a persisted graph would keep
-// reading the old address forever - the graph-uid stamp even tells ggml-cuda
-// to skip the staleness walk that might have noticed.
-struct Q4eCachedBind
-{
-    ggml_tensor* tensor;
-    void* data;
-    std::size_t bytes;
-    ggml_backend_buffer_usage usage;
-};
-
-// One place for the weight-binding policy the block builders share. Collecting
-// the uploads rather than binding immediately is what lets several layers
-// build into one graph: everything is bound before a single allocation pass
-// runs over the lot. Methods are defined in ggml_ops_qwen4exp.cpp.
-struct Q4eHostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
-
-struct Q4eBinder
-{
-    ggml_backend_dev_t dev = nullptr;
-    std::vector<Q4eHostBinding> upload_list;
-    std::vector<Q4eCachedBind> cached;
-
-    void add(ggml_tensor* tgt, void* data, std::size_t bytes,
-             ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    void flush();
-};
-
-// GDN write-back sources: the caller decides how they reach the persistent
-// state (copied out after the compute, or cpy-expanded in graph after the
-// reads).
-struct Q4eGdnWriteback
-{
-    ggml_tensor* tail;
-    ggml_tensor* new_state;
-    // Verify row capture (q4e_capture_rows): the conv input [hist + T, conv_dim]
-    // and the T state snapshots (most recent first), else null.
-    ggml_tensor* conv_in = nullptr;
-    ggml_tensor* snaps = nullptr;
-    // Set when the builder ran the recurrence on TensorSharp's Metal kernels (a token span building with device
-    // operations, tsm::gdn_prompt_encode): the [value_dim, T] tensor they write. tail and new_state stay null then, as
-    // the kernels update the state in place.
-    ggml_tensor* device_y = nullptr;
-};
-// ReplaySSM-style verify commit: while set, a 2-8 row span keeps every row's
-// recurrent state (GDN conv + SSM, PLE conv history) so the accepted prefix can
-// be committed without restoring and re-forwarding it.
-bool q4e_capture_rows(int T);
-
-// Arena override for q4e_nodes_attn: the KV lives in a slot-stable 2D arena
-// [head_dim, (n_slots+1) * n_head_kv * cap] instead of the holder's resident
-// cache copy, written by ONE absolute-row ggml_set_rows per K/V and read back
-// as a 4D view of the set_rows RESULT (a real src edge, so node order is not
-// load-bearing for the write->read hazard). The mask passed alongside must be
-// the 4D per-slot mask [cap, 1, 1, n_slots] and `pos` the per-slot ROPE
-// positions.
-struct Q4eAttnArenaIO
-{
-    ggml_tensor* k_arena = nullptr;     // [head_dim, (n_slots+1)*kvH*cap], kv_type
-    ggml_tensor* v_arena = nullptr;
-    ggml_tensor* kv_idx_abs = nullptr;  // I64 [kvH * n_slots], absolute arena rows
-    std::int64_t cap = 0;               // rows per head plane
-    std::int64_t rows_per_slot = 0;     // kvH * cap
-    // out: the set_rows nodes, for the caller's OUTPUT-flag + expand pass.
-    ggml_tensor* k_set = nullptr;
-    ggml_tensor* v_set = nullptr;
-    ggml_tensor* fa = nullptr;          // out: the flash node, for support probing
-};
-
-// Per-sequence recurrent-state entry: GDN conv+ssm state (packed conv @0,
-// ssm @ (conv_bytes + 255) & ~255) or the PLE conv history, in a device buffer
-// keyed by the HOST SEED POINTER the descriptors carry. `ready` gates the
-// one-time seed upload; after the first forward the device copy is
-// authoritative and the host seed permanently stale.
-struct Q4eSeqStateEntry
-{
-    ggml_backend_buffer_t buf = nullptr;
-    std::size_t bytes = 0;
-    bool ready = false;
-    // A QSA layer's pooled indexer keys (one F32 row per complete block), derived from `buf`'s raw keys and kept so a
-    // step pools only the blocks it completes. Valid while aux_ready and the span itself last wrote the raw keys up to
-    // aux_upto: any other writer (an upload, the concurrent-decode arena) leaves aux_upto behind the next step's start,
-    // and that step pools every block again.
-    ggml_backend_buffer_t aux = nullptr;
-    std::size_t aux_bytes = 0;
-    bool aux_ready = false;
-    std::int64_t aux_upto = -1;
-};
-
-// Create-or-grow the active rank's entry for `key` (the span/per-layer path).
-Q4eSeqStateEntry* q4e_seq_state(const void* key, std::size_t bytes);
-// Lookup WITHOUT creating (the arena join declines on a missing entry rather
-// than fabricating state for a sequence that never ran through the span).
-Q4eSeqStateEntry* q4e_seq_state_find(const void* key);
-// Clamp a caller-supplied device index to an initialized rank (-1 = active).
-int q4e_resolve_device(int device);
-// ggml-cuda flash-attention eligibility for this family's KV type/head size.
-bool q4e_flash_attn_ok(int kv_type, int head_dim);
-// Independent decode rows keep the solo projection/expert reductions while
-// sharing a graph. Prefill and single-sequence decode leave this disabled; so
-// does the arena where verify runs batched (Metal by default; see
-// TS_Q4E_VERIFY_ROW_KERNELS).
-void q4e_independent_decode_rows(int rows);
-// While alive, q4e_nodes_ffn builds ONE RANK's tensor-sliced FFN - gate/up over the rank's channels, down over
-// its output rows - and appends each layer's two reduction partials to `partials` in graph order: the cut points
-// of that rank's TpRankPlan. The token span sets the same state up itself; this is for a builder outside it (the
-// arena's tensor-parallel batched step). A null `partials` leaves the builder as it is.
-struct Q4eTpFfnScope
-{
-    Q4eTpFfnScope(std::vector<ggml_tensor*>* partials, int degree, int rank);
-    ~Q4eTpFfnScope();
-    Q4eTpFfnScope(const Q4eTpFfnScope&) = delete;
-    Q4eTpFfnScope& operator=(const Q4eTpFfnScope&) = delete;
-
-private:
-    bool active_;
-};
-// Drop (graph only - state kept) every cached per-layer/span graph built from
-// the given holder descriptor arrays, on every device. The arena flush calls
-// this after invalidating a holder's resident KV copies: captured solo graphs
-// bake those buffers, and q4e_refresh_bindings only SAMPLES every 32nd replay,
-// which is no protection against a freed pointer.
-void q4e_drop_holder_graphs(const void* attn_base, const void* gdn_base, const void* ple_base);
-
-// ---------------------------------------------------------------------------
-// Node builders (defined in ggml_ops_qwen4exp.cpp). Each appends one
-// half-layer to ctx and returns the new residual; the per-layer entry points,
-// the token span and the arena share them, so the graph a half builds has a
-// single source of truth.
-// ---------------------------------------------------------------------------
-// A layer with cpu_moe set appends its host-MoE seam to `host_moe` and expands
-// the seam's boundary tensors into `graph` before anything reads the host's
-// result; a builder that passes no plan gets an exception for such a layer.
-ggml_tensor* q4e_nodes_ffn(
-    ggml_context* ctx, Q4eBinder& bnd,
-    const TSGgmlQwen4ExpFfnArgs* a, ggml_tensor* res_in,
-    int n_embd, int hc, int hc_low_rank, int T,
-    int n_expert, int n_expert_used, int n_ff, int n_ff_sh, float eps,
-    ggml_cgraph* graph = nullptr, std::vector<tsg::HostMoeSegment>* host_moe = nullptr, int layer = -1,
-    const TSGgmlQwen4ExpFfnArgs* next_a = nullptr);
-
-ggml_tensor* q4e_nodes_gdn(
-    ggml_context* ctx, Q4eBinder& bnd,
-    const TSGgmlQwen4ExpGdnArgs* a, ggml_tensor* res_in,
-    ggml_tensor* conv_state, ggml_tensor* ssm_state,
-    int n_embd, int hc, int hc_low_rank, int T,
-    int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int d_conv,
-    float eps, Q4eGdnWriteback* wb,
-    std::vector<ggml_tensor*>* probe = nullptr, int n_seqs = 1);
-
-// One arena slot's own attention inputs for q4e_nodes_attn_slots: its mask row, its cache-position index, its cache
-// views and padded window, and its QSA state (null without QSA).
-struct Q4eAttnSlot
-{
-    ggml_tensor* mask = nullptr;
-    ggml_tensor* kv_idx = nullptr;
-    ggml_tensor* k_cache = nullptr;
-    ggml_tensor* v_cache = nullptr;
-    int n_kv_pad = 0;
-    const Q4eQsaGraph* qsa = nullptr;
-};
-
-ggml_tensor* q4e_nodes_attn_slots(
-    ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
-    const TSGgmlQwen4ExpAttnArgs* a, ggml_tensor* res_in, ggml_tensor* pos, int n_slots,
-    const Q4eAttnSlot* slots,
-    int n_embd, int hc, int hc_low_rank,
-    int head_dim, int n_head, int n_head_kv,
-    int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
-    float eps, bool use_flash);
-
-ggml_tensor* q4e_nodes_attn(
-    ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
-    const TSGgmlQwen4ExpAttnArgs* a, ggml_tensor* res_in,
-    ggml_tensor* mask, ggml_tensor* pos, ggml_tensor* kv_idx,
-    int n_embd, int hc, int hc_low_rank, int T,
-    int head_dim, int n_head, int n_head_kv, int kv_capacity, int n_kv_pad,
-    int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
-    float eps, bool use_flash,
-    std::vector<ggml_tensor*>* kv_out = nullptr,
-    std::vector<ggml_tensor*>* probe = nullptr,
-    const std::int32_t* mrope_sections = nullptr,
-    Q4eAttnArenaIO* arena = nullptr,
-    ggml_tensor* owned_k = nullptr, ggml_tensor* owned_v = nullptr,
-    const Q4eQsaGraph* qsa = nullptr);
-
-// PLE half. `conv_hist` is the persistent history - [hc_dim, hist] for the
-// span (n_streams == 1), a [hc_dim, hist, n_streams] arena view for the arena
-// (T == 1 per stream). When `writes` is null the write-back cpy is expanded
-// into `graph` right after the residual (span semantics); otherwise it is
-// appended to *writes for the caller's OUTPUT-flag + expand pass.
-ggml_tensor* q4e_nodes_ple(
-    ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
-    const TSGgmlQwen4ExpPleArgs* a, ggml_tensor* res_in, ggml_tensor* ple_emb_in,
-    ggml_tensor* conv_hist,
-    int n_embd, int hc, int T, int n_streams, float eps,
-    std::vector<ggml_tensor*>* writes = nullptr);
-
-// Head: final hyper-connection mixer + LM head over `res_last` [hc_dim, T]
-// (must be contiguous - the span passes a cont of the last column, the arena
-// its whole [hc_dim, n_slots] residual since every slot's token is "last").
-// Returns logits [vocab, T]; the caller flags/expands it.
-ggml_tensor* q4e_nodes_head(
-    ggml_context* ctx, Q4eBinder& bnd,
-    const TSGgmlQwen4ExpHeadArgs* a, ggml_tensor* res_last,
-    int n_embd, int hc, int hc_low_rank, int T, float eps);

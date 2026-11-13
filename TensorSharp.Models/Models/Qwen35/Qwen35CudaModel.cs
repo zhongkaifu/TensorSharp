@@ -67,6 +67,12 @@ namespace TensorSharp.Models
         /// True when this checkpoint runs on the direct-CUDA engine: a dense qwen35 (no experts)
         /// whose projections are unscaled NVFP4. TS_Q35_NATIVE=0 keeps the managed path.
         /// </summary>
+        /// <summary>The direct-CUDA engine serves this load: --backend cuda on one GPU (no --tp, no whole-layer stages,
+        /// no host experts) with a checkpoint it serves (<see cref="CanServe"/>); the shared runtime serves the rest.</summary>
+        internal static bool ServesLoad(Architecture.ModelCreateContext c)
+            => c.Backend == BackendType.Cuda && c.TpDegree <= 1 && c.TpGroup == null && c.LayerSplitDegree <= 1
+               && !MoeCpuOffloadConfig.IsEnabled && CanServe(c.Probe);
+
         internal static bool CanServe(GgufFile probe)
         {
             if (Environment.GetEnvironmentVariable("TS_Q35_NATIVE") == "0" || probe == null)
@@ -98,7 +104,7 @@ namespace TensorSharp.Models
                 if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
                     maxContext = Math.Min(maxContext, 65536);
                 int nUbatch = ParseEnvInt("TS_Q35_UBATCH", 2048);
-                _exec = new Qwen35CudaExecutor(ggufPath, maxContext, nUbatch, Qwen35Model.ResolveQwen35DFlashPath(draftGgufPath));
+                _exec = new Qwen35CudaExecutor(ggufPath, maxContext, nUbatch, DFlashDraftFiles.Resolve(draftGgufPath));
                 InitializeEngineRuntime();
                 Console.WriteLine($"Model: qwen35 on the direct-CUDA engine, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
                     $"Vocab={Config.VocabSize}, n_ctx={_maxContextLength}, drafter={(_exec.Draft != null ? "DFlash2" : "none")}");

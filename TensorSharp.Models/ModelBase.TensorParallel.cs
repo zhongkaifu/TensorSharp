@@ -25,7 +25,8 @@ using TensorSharp.GGML;
 using TensorSharp.MLX;
 
 namespace TensorSharp.Models
-{
+{
+
     // Tensor-parallel weight sharding and the collectives the sharded layers issue.
     // Split out of ModelBase.cs: it is one self-contained concern, it only runs when a
     // TP group is live, and it was a third of the file.
@@ -250,13 +251,10 @@ namespace TensorSharp.Models
         protected void ShardConcatenatedColumnParallel(string weightName, params int[] segmentDims)
         {
             if (!IsTensorParallel) return;
-
-            int tp = TpDegree;
             int globalTp = GlobalTpDegree;
-            int rankOffset = TpRankOffset;
 
             // Output-row indices for a global rank: its 1/tp slice of each segment.
-            int[] BuildRows(int globalRank)
+            ShardOutputRows(weightName, globalRank =>
             {
                 var idx = new List<int>();
                 int baseOff = 0;
@@ -269,7 +267,21 @@ namespace TensorSharp.Models
                     baseOff += segDim;
                 }
                 return idx.ToArray();
-            }
+            });
+        }
+
+        /// <summary>
+        /// Column-parallel shard by an arbitrary set of output rows per rank, gathered in the
+        /// order <paramref name="rowsOfGlobalRank"/> gives them (any head layout: segmented,
+        /// block-cyclic, ...). Quantized rows are independent blocks, so they move unchanged;
+        /// F32 rows are copied. No-op when the weight is absent or nothing is sharded.
+        /// </summary>
+        protected void ShardOutputRows(string weightName, Func<int, int[]> rowsOfGlobalRank)
+        {
+            if (!IsTensorParallel) return;
+
+            int tp = TpDegree;
+            int rankOffset = TpRankOffset;
 
             if (_quantWeights.TryGetValue(weightName, out var qw))
             {
@@ -277,7 +289,7 @@ namespace TensorSharp.Models
                 var shards = new QuantizedWeight[tp];
                 for (int r = 0; r < tp; r++)
                 {
-                    int[] rows = BuildRows(rankOffset + r);
+                    int[] rows = rowsOfGlobalRank(rankOffset + r);
                     long totalBytes = rows.Length * rowBytes;
                     IntPtr shardPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                     unsafe
@@ -309,7 +321,7 @@ namespace TensorSharp.Models
                 var shards = new Tensor[tp];
                 for (int r = 0; r < tp; r++)
                 {
-                    int[] rows = BuildRows(rankOffset + r);
+                    int[] rows = rowsOfGlobalRank(rankOffset + r);
                     var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, rows.Length, inDim);
                     unsafe
                     {
@@ -325,7 +337,148 @@ namespace TensorSharp.Models
                 }
 
                 _tpWeights[weightName] = shards;
+                RecordTpWeightScale(weightName, null);
+                _weights.Remove(weightName);
+                w.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Row-parallel shard whose input columns are gathered in groups: rank r keeps the
+        /// <paramref name="groupWidth"/>-wide column groups <paramref name="groupsOfGlobalRank"/>
+        /// lists, in that order (e.g. a recurrent block's output projection, whose input is the
+        /// rank's block-cyclic value heads). A quantized weight moves whole source blocks when
+        /// the group width is a multiple of the block; otherwise each row is dequantized,
+        /// gathered and re-encoded as Q8_0 (or kept F32 when 32 does not divide the group).
+        /// </summary>
+        protected void ShardInputColumnGroups(string weightName, Func<int, int[]> groupsOfGlobalRank, int groupWidth)
+        {
+            if (!IsTensorParallel) return;
+
+            int tp = TpDegree;
+            int rankOffset = TpRankOffset;
+
+            if (_quantWeights.TryGetValue(weightName, out var qw))
+            {
+                var type = (GgmlTensorType)qw.GgmlType;
+                long blockSize = GgufFile.GetBlockSize(type);
+                long srcRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                var shards = new QuantizedWeight[tp];
+                if (blockSize > 0 && groupWidth % blockSize == 0)
+                {
+                    long groupBytes = groupWidth / blockSize * GgufFile.GetTypeSize(type);
+                    for (int r = 0; r < tp; r++)
+                    {
+                        int[] groups = groupsOfGlobalRank(rankOffset + r);
+                        long ne0 = (long)groups.Length * groupWidth;
+                        long dstRowBytes = groups.Length * groupBytes;
+                        long total = qw.Ne1 * dstRowBytes;
+                        IntPtr shardPtr = QuantizedWeight.AllocateBuffer(total);
+                        unsafe
+                        {
+                            byte* src = (byte*)qw.Data.ToPointer();
+                            byte* dst = (byte*)shardPtr.ToPointer();
+                            for (long row = 0; row < qw.Ne1; row++)
+                                for (int g = 0; g < groups.Length; g++)
+                                    Buffer.MemoryCopy(
+                                        src + row * srcRowBytes + groups[g] * groupBytes,
+                                        dst + row * dstRowBytes + g * groupBytes,
+                                        groupBytes, groupBytes);
+                        }
+                        shards[r] = new QuantizedWeight(shardPtr, total, qw.GgmlType, ne0, qw.Ne1) { Scale = qw.Scale };
+                    }
+                    _tpQuantWeights[weightName] = shards;
+                }
+                else if (groupWidth % 32 == 0)
+                {
+                    const int q8Type = (int)GgmlTensorType.Q8_0;
+                    Console.WriteLine($"  {weightName}: {type} block ({blockSize} elements) does not divide the " +
+                        $"{groupWidth}-column groups; re-encoding its tensor-parallel shards as Q8_0.");
+                    for (int r = 0; r < tp; r++)
+                    {
+                        int[] groups = groupsOfGlobalRank(rankOffset + r);
+                        long ne0 = (long)groups.Length * groupWidth;
+                        long dstRowBytes = NativeDequant.RowSize(q8Type, ne0);
+                        long total = qw.Ne1 * dstRowBytes;
+                        IntPtr shardPtr = QuantizedWeight.AllocateBuffer(total);
+                        unsafe
+                        {
+                            byte* src = (byte*)qw.Data.ToPointer();
+                            byte* dst = (byte*)shardPtr.ToPointer();
+                            var srcRow = new float[qw.Ne0];
+                            var dstRow = new float[ne0];
+                            fixed (float* sf = srcRow, df = dstRow)
+                            {
+                                for (long row = 0; row < qw.Ne1; row++)
+                                {
+                                    NativeDequant.DequantizeToFloat32Native(qw.GgmlType, (IntPtr)(src + row * srcRowBytes), (IntPtr)sf, qw.Ne0);
+                                    for (int g = 0; g < groups.Length; g++)
+                                        Buffer.MemoryCopy(sf + (long)groups[g] * groupWidth, df + (long)g * groupWidth,
+                                            groupWidth * sizeof(float), groupWidth * sizeof(float));
+                                    ManagedQuantizedOps.QuantizeRowFromFloat32(q8Type, df, (IntPtr)(dst + row * dstRowBytes), ne0);
+                                }
+                            }
+                        }
+                        shards[r] = new QuantizedWeight(shardPtr, total, q8Type, ne0, qw.Ne1) { Scale = qw.Scale };
+                    }
+                    _tpQuantWeights[weightName] = shards;
+                }
+                else
+                {
+                    var dense = new Tensor[tp];
+                    for (int r = 0; r < tp; r++)
+                    {
+                        int[] groups = groupsOfGlobalRank(rankOffset + r);
+                        long ne0 = (long)groups.Length * groupWidth;
+                        var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, qw.Ne1, ne0);
+                        unsafe
+                        {
+                            byte* src = (byte*)qw.Data.ToPointer();
+                            float* dstBase = GetFloatPtr(shard);
+                            var srcRow = new float[qw.Ne0];
+                            fixed (float* sf = srcRow)
+                            {
+                                for (long row = 0; row < qw.Ne1; row++)
+                                {
+                                    NativeDequant.DequantizeToFloat32Native(qw.GgmlType, (IntPtr)(src + row * srcRowBytes), (IntPtr)sf, qw.Ne0);
+                                    for (int g = 0; g < groups.Length; g++)
+                                        Buffer.MemoryCopy(sf + (long)groups[g] * groupWidth, dstBase + row * ne0 + (long)g * groupWidth,
+                                            groupWidth * sizeof(float), groupWidth * sizeof(float));
+                                }
+                            }
+                        }
+                        dense[r] = shard;
+                    }
+                    _tpWeights[weightName] = dense;
+                }
                 RecordTpWeightScale(weightName, qw);
+                _quantWeights.Remove(weightName);
+                qw.Dispose();
+            }
+            else if (_weights.TryGetValue(weightName, out var w))
+            {
+                int outDim = (int)w.Sizes[0];
+                int inDim = (int)w.Sizes[1];
+                var shards = new Tensor[tp];
+                for (int r = 0; r < tp; r++)
+                {
+                    int[] groups = groupsOfGlobalRank(rankOffset + r);
+                    int ne0 = groups.Length * groupWidth;
+                    var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, outDim, ne0);
+                    unsafe
+                    {
+                        float* srcPtr = GetFloatPtr(w);
+                        float* dstPtr = GetFloatPtr(shard);
+                        for (int row = 0; row < outDim; row++)
+                            for (int g = 0; g < groups.Length; g++)
+                                Buffer.MemoryCopy(srcPtr + (long)row * inDim + (long)groups[g] * groupWidth,
+                                    dstPtr + (long)row * ne0 + (long)g * groupWidth,
+                                    groupWidth * sizeof(float), groupWidth * sizeof(float));
+                    }
+                    shards[r] = shard;
+                }
+                _tpWeights[weightName] = shards;
+                RecordTpWeightScale(weightName, null);
                 _weights.Remove(weightName);
                 w.Dispose();
             }
@@ -704,20 +857,6 @@ namespace TensorSharp.Models
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
                 int seqLen = (int)input.Sizes[0];
-                // Column-parallel: every rank reads the same replicated
-                // activation straight out of host memory, so one shared input
-                // tensor covers all of them.
-                var sharedInputs = new Tensor[tp];
-                for (int r = 0; r < tp; r++) sharedInputs[r] = input;
-                if (TryTpFusedQuantLinear(sharedInputs, qShards, results, seqLen, allReduce: false))
-                {
-                    // The fused multi-rank linear returns here without touching the
-                    // method's normal exit, so it needs the scale applied too.
-                    TpApplyNamedWeightScale(results, weightName);
-                    _linearTicks += Stopwatch.GetTimestamp() - t0;
-                    return results;
-                }
-
                 _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
@@ -760,88 +899,6 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// GGML fast path for a tensor-parallel quantized linear: hand all ranks
-        /// to the native bridge in one call so the per-rank matmuls are submitted
-        /// as concurrent device graphs (and, for a row-parallel layer, reduced
-        /// on-device before they come back). Returns false on other backends, or
-        /// when the shapes don't fit the fused entry point, so the caller can use
-        /// the generic per-rank loop.
-        /// </summary>
-        /// <summary>
-        /// The fused multi-rank linear is OFF by default; set
-        /// TS_GGML_TP_FUSED_MATMUL=1 to use it.
-        ///
-        /// It submits both ranks' graphs from one thread without a hand-off,
-        /// which sounds like the faster shape, but it has to allocate a fresh
-        /// backend buffer per rank per call: its graphs run asynchronously, so it
-        /// cannot use the shared per-rank compute buffer the way the ordinary
-        /// per-op path does. On CUDA that is a cudaMalloc/cudaFree pair per rank
-        /// per linear, and on a nearly-full card the cost dwarfs the hand-off it
-        /// saves. Measured on Qwen3.5-35B-A3B, --tp 2, ggml_cuda: decode 8.7 →
-        /// 20.1 tok/s and the LM head 44 → 1.6 ms/token with it disabled.
-        ///
-        /// The generic path is not serial either — <c>RunPerRank</c> fans the
-        /// ranks out across worker threads — so what is given up is the in-call
-        /// device AllReduce, which <c>ITensorParallelGroup.AllReduce</c> does
-        /// anyway.
-        /// </summary>
-        private static readonly bool TpFusedMatmulEnabled =
-            string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_FUSED_MATMUL"), "1", StringComparison.Ordinal);
-
-        private bool TryTpFusedQuantLinear(Tensor[] inputs, QuantizedWeight[] shards, Tensor[] results, int seqLen, bool allReduce)
-        {
-            // The fused entry point exists to overlap several local GPUs. With a
-            // single local rank — the multi-node layout, one GPU per node — there
-            // is nothing to overlap, and it is not the validated configuration:
-            // it was measured to produce wrong results there, while the generic
-            // per-rank path is correct. Require a genuine multi-GPU group.
-            if (!TpFusedMatmulEnabled || !IsGgmlBackend || _ggmlContext == null ||
-                TpDegree < 2 || _ggmlContext.Degree != TpDegree)
-                return false;
-
-            int tp = TpDegree;
-            for (int r = 0; r < tp; r++)
-            {
-                if (!shards[r].HasHostData)
-                    return false;
-            }
-
-            var data = new IntPtr[tp];
-            var types = new int[tp];
-            var ne0 = new long[tp];
-            var ne1 = new long[tp];
-            var raw = new long[tp];
-
-            for (int r = 0; r < tp; r++)
-            {
-                var qw = shards[r];
-                results[r] = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, seqLen, (int)qw.Ne1);
-                // CacheKey identifies the rank-resident device copy created by
-                // PrepareGgmlQuantizedWeightsForInferenceTP; Data would miss it.
-                data[r] = qw.CacheKey;
-                types[r] = qw.GgmlType;
-                ne0[r] = qw.Ne0;
-                ne1[r] = qw.Ne1;
-                raw[r] = qw.RawBytes;
-            }
-
-            try
-            {
-                GgmlBasicOps.TensorParallelMatmul(results, inputs, data, types, ne0, ne1, raw, allReduce);
-                return true;
-            }
-            catch (NotSupportedException)
-            {
-                for (int r = 0; r < tp; r++)
-                {
-                    results[r]?.Dispose();
-                    results[r] = null;
-                }
-                return false;
-            }
-        }
-
-        /// <summary>
         /// Row-parallel linear forward: each GPU computes a partial result using
         /// its weight shard, then AllReduce sums the partials. Returns the
         /// reduced result (replicated on all GPUs); the caller typically uses
@@ -856,17 +913,6 @@ namespace TensorSharp.Models
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
                 int seqLen = (int)inputs[0].Sizes[0];
-                if (TryTpFusedQuantLinear(inputs, qShards, partials, seqLen, allReduce: true))
-                {
-                    // The fused multi-rank linear returns here without touching the
-                    // method's normal exit, so it needs the scale applied too.
-                    TpApplyNamedWeightScale(partials, weightName);
-                    _linearTicks += Stopwatch.GetTimestamp() - t0;
-                    for (int r = 1; r < tp; r++)
-                        partials[r].Dispose();
-                    return partials[0];
-                }
-
                 _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
@@ -932,15 +978,6 @@ namespace TensorSharp.Models
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
                 int seqLen = (int)inputs[0].Sizes[0];
-                if (TryTpFusedQuantLinear(inputs, qShards, partials, seqLen, allReduce: true))
-                {
-                    // The fused multi-rank linear returns here without touching the
-                    // method's normal exit, so it needs the scale applied too.
-                    TpApplyNamedWeightScale(partials, weightName);
-                    _linearTicks += Stopwatch.GetTimestamp() - t0;
-                    return partials;
-                }
-
                 _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
@@ -1528,6 +1565,7 @@ namespace TensorSharp.Models
             }
         }
 
-        #endregion
+        #endregion
+
     }
 }

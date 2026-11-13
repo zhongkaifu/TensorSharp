@@ -45,6 +45,14 @@ namespace TensorSharp.Runtime.Scheduling
             bool mtpUnprofitable = false;
             string? speculationRefusal = null;
 
+            // ---- Unified batching: the only path of a model built on per-request slots (speculating requests
+            // verify their windows together inside it).
+            if (caps.SupportsUnifiedBatching)
+            {
+                candidates.Add(ExecutionPathKind.Unified); // terminal
+                return Build(candidates, rejections, mtpUnprofitable, speculationRefusal);
+            }
+
             bool batchedEnabled = !options.BatchedPathDisabled;
             bool batchedImpl = caps.SupportsBatchedPagedAttention;
             bool solo = features.SequenceCount == 1;

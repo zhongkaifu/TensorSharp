@@ -1052,7 +1052,7 @@ namespace TensorSharp.Cli
             {
                 if (parallelism.Distributed is { } distributed)
                 {
-                    if (parallelism.IsLayerSplit)
+                    if (parallelism.IsDistributedPipeline)
                         ModelBase.ValidateDistributedLayerSplit(modelPath, backend);
                     else
                         ModelBase.ValidateDistributedTensorParallelism(modelPath, backend);
@@ -1063,14 +1063,18 @@ namespace TensorSharp.Cli
                     int localDegree = distributed.LocalDegree;
                     // The on-node group has to match the backend: direct CUDA drives
                     // CudaAllocators, the ggml backends drive per-rank ggml backends.
-                    tpGroup = parallelism.IsLayerSplit
-                        ? new TensorSharp.Distributed.DistributedLayerSplitGroup(
-                            ModelBase.CreateLocalLayerSplitGroup(backend, localDegree), tpNodeId, peerEndpoints)
-                        : backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
+                    if (parallelism.IsDistributedPipeline)
+                    {
+                        // This node's --layer-split stages of --tp GPUs each; the nodes exchange shapes and capacities.
+                        ITensorParallelGroup local = ModelBase.CreateLocalStageGroup(backend, parallelism.LayerSplitDegree, parallelism.TpDegree);
+                        tpGroup = new TensorSharp.Distributed.DistributedLayerSplitGroup(local, tpNodeId, peerEndpoints,
+                            parallelism.TpDegree, ModelBase.MeasureStageCapacity(local, backend, parallelism.TpDegree));
+                    }
+                    else tpGroup = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
                         ? new TensorSharp.Distributed.DistributedTensorParallelGroup(
                             ModelBase.CreateGgmlLocalTpGroup(backend, localDegree), tpNodeId, peerEndpoints)
                         : new TensorSharp.Distributed.DistributedTensorParallelGroup(localDegree, tpNodeId, peerEndpoints);
-                    tpDegree = parallelism.IsLayerSplit ? 1 : localDegree;
+                    tpDegree = parallelism.IsDistributedPipeline ? 1 : localDegree;
                 }
 
                 createdModel = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath,

@@ -34,7 +34,7 @@ public sealed class DFlashSidecarRowsTests
                 raw[row * 34 + 2 + column] = unchecked((byte)(sbyte)(column - 16 + row * 3));
         }
         using var weight = new QuantizedWeight(raw, ggmlType: 8, width, vocabulary) { Scale = scale };
-        var model = (Qwen35Model)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35Model));
+        var model = (Qwen35RuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35RuntimeModel));
         var allocator = new CpuAllocator(BlasEnum.DotNet);
         Set(model, "_allocator", allocator);
         Set(model, "_backend", BackendType.Cpu);

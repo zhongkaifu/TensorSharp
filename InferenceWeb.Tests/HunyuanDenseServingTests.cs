@@ -150,10 +150,10 @@ public class HunyuanDenseServingTests : IDisposable
         }
 
         using var model = ModelBase.Create(path, Backend);
-        // Batched: one paged ForwardBatch per step over every running sequence.
+        // Batched: each running request on its own slot, batched steps over the slots.
         // Not batched (--no-continuous-batching): the K/V snapshot path swaps
         // sequences through the linear cache.
-        Assert.True(((IBatchedPagedModel)model).BatchedForwardAvailable);
+        Assert.True(((IBatchedPagedModel)model).SupportsPerSequenceFusedForward);
         Assert.Equal(!batched, ExecutionOptions.FromEnvironment().BatchedPathDisabled);
         var cfg = new SchedulerConfig
         {

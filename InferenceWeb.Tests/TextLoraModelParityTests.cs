@@ -103,6 +103,10 @@ public sealed class TextLoraModelParityTests : IDisposable
         int[] prompt = Enumerable.Range(0, promptLength).Select(i => 65 + (i * 7) % 50).ToArray();
 
         using var twin = ModelBase.Create(twinPath, backend);
+        // A selected adapter runs the shared runtime's per-op layers (it does not lower to graphs), so the twin does
+        // too: the comparison is the adapter's arithmetic, not two execution paths (direct cuda's graph executor and
+        // its per-op layers differ by ~5e-4 on these logits).
+        if (twin is StandardDecoderModel shared) shared.GraphLoweringEnabled = false;
         twin.ResetKVCache();
         var expected = new List<float[]> { (float[])twin.ForwardRefill(prompt).Clone() };
         var tokens = new List<int>();
@@ -194,7 +198,8 @@ public sealed class TextLoraModelParityTests : IDisposable
         int[][] outputs;
         using (var model = ModelBase.Create(basePath, backend))
         {
-            Assert.True(((IBatchedPagedModel)model).BatchedForwardAvailable);
+            var batchedModel = (IBatchedPagedModel)model;
+            Assert.True(batchedModel.BatchedForwardAvailable || batchedModel.SupportsPerSequenceFusedForward);
             var cfg = new SchedulerConfig
             {
                 MaxNumBatchedTokens = 256, MaxNumRunningSequences = 4, MaxPrefillChunkSize = 8,

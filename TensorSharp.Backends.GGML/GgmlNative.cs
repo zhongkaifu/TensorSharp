@@ -364,207 +364,6 @@ public struct Gemma4MoELayerDecodeArgs
     public float LayerOutputScale;
 }
 
-    /// <summary>
-    /// Mirrors TSGgmlQwen4ExpPleArgs in ggml_ops_qwen4exp.cpp - the PLE block run
-    /// inside the span; only the n-gram hash and the table gather stay host-side.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Qwen4ExpPleArgs
-    {
-        public IntPtr KeyW, ValueW, NormKey, NormQuery, NormConv, Conv1dT, ConvState;
-        public long KeyBytes, ValueBytes;
-        public int KeyType, ValueType, Kern, Dil;
-    }
-
-    /// <summary>
-    /// Mirrors TSGgmlQwen4ExpHeadArgs in ggml_ops_qwen4exp.cpp - the final
-    /// hyper-connection mixer (which IS the output norm) plus the LM head.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Qwen4ExpHeadArgs
-    {
-        public IntPtr HcNorm, HcDown, HcUp, Head;
-        public long HcDownBytes, HcUpBytes, HeadBytes;
-        public int HcDownType, HcUpType, HeadType;
-        public int Vocab;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Qwen4ExpMtpConfig
-    {
-        public IntPtr Enorm, Hnorm, EhProj;
-        public long EhBytes;
-        public int EhType;
-        public int Hidden, Hc, HcLowRank;
-        public int HeadDim, Heads, KvHeads, RotaryDim;
-        public int Experts, UsedExperts, ExpertFf, SharedFf;
-        public int Capacity, Device;
-        public float Eps, RopeBase, RopeScale, AttnScale;
-        public int RopeSection0, RopeSection1, RopeSection2, RopeSection3;
-    }
-
-    /// <summary>
-    /// Mirrors TSGgmlQwen4ExpAttnArgs in ggml_ops_qwen4exp.cpp - the full-attention
-    /// half of a qwen4exp layer. Pointers first, then int64, then int32.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Qwen4ExpQsaArgs
-    {
-        public IntPtr KProj, QProj, KNorm, QNorm, Cache;
-        public long KBytes, QBytes, CacheBytes;
-        public int KType, QType, CacheType, HeadDim, Heads, Ratio, TopK;
-        public int Section0, Section1, Section2, Section3;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Qwen4ExpAttnArgs
-    {
-        public IntPtr HcNorm, HcDown, HcUp, HcInject;
-        public IntPtr Wq, Wk, Wv, Wo;
-        public IntPtr QNorm, KNorm;
-        public IntPtr KCache, VCache;
-
-        public long HcDownBytes, HcUpBytes, HcInjectBytes;
-        public long WqBytes, WkBytes, WvBytes, WoBytes;
-        public long KvBytes;
-
-        public int HcDownType, HcUpType, HcInjectType;
-        public int WqType, WkType, WvType, WoType;
-        public int KvType;
-    }
-
-    /// <summary>
-    /// Mirrors TSGgmlQwen4ExpGdnArgs in ggml_ops_qwen4exp.cpp - the recurrent half
-    /// of a qwen4exp layer. Pointers first, then int64, then int32.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Qwen4ExpGdnArgs
-    {
-        public IntPtr HcNorm, HcDown, HcUp, HcInject;
-        public IntPtr Qkv, Gate, Beta, Alpha;
-        public IntPtr Conv1d, SsmDt, SsmA, SsmNorm, OutProj;
-        public IntPtr ConvState, SsmState;
-
-        public long HcDownBytes, HcUpBytes, HcInjectBytes;
-        public long QkvBytes, GateBytes, BetaBytes, AlphaBytes, OutProjBytes;
-
-        public int HcDownType, HcUpType, HcInjectType;
-        public int QkvType, GateType, BetaType, AlphaType, OutProjType;
-    }
-
-    /// <summary>
-    /// Mirrors TSGgmlQwen4ExpFfnArgs in ggml_ops_qwen4exp.cpp. Pointers first,
-    /// then int64, then int32 - append within a run rather than reordering.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Qwen4ExpFfnArgs
-    {
-        public IntPtr HcNorm, HcDown, HcUp, HcInject;
-        public IntPtr Router, GateExps, UpExps, DownExps;
-        public IntPtr ShGateInp, ShGate, ShUp, ShDown;
-
-        public long HcDownBytes, HcUpBytes, HcInjectBytes;
-        public long RouterBytes, GateExpsBytes, UpExpsBytes, DownExpsBytes;
-        public long ShGateBytes, ShUpBytes, ShDownBytes;
-
-        public int HcDownType, HcUpType, HcInjectType;
-        public int RouterType, GateExpsType, UpExpsType, DownExpsType;
-        public int ShGateType, ShUpType, ShDownType;
-
-        /// <summary>Nonzero: this layer's routed experts run on the host, read from
-        /// the GGUF mapping (MoE CPU offload). Only the token span accepts it.</summary>
-        public int CpuMoe;
-    }
-
-// Descriptor for the Qwen3.5/3.6 full-model decode kernel
-// (TSGgml_Qwen35ModelDecode). Field order/types MUST match the native
-// TSGgmlQwen35LayerDesc struct EXACTLY: 23 pointers, then 27 int64, then 13 int32.
-[StructLayout(LayoutKind.Sequential)]
-public struct Qwen35LayerDecodeArgs
-{
-    // pointers (23)
-    public IntPtr AttnNormW;
-    public IntPtr PostAttnNormW;
-    public IntPtr QkvW;
-    public IntPtr QNormW;
-    public IntPtr KNormW;
-    public IntPtr OW;
-    public IntPtr KCache;
-    public IntPtr VCache;
-    public IntPtr GdnQkvW;
-    public IntPtr GdnGateW;
-    public IntPtr SsmBetaW;
-    public IntPtr SsmAlphaW;
-    public IntPtr Conv1dW;
-    public IntPtr SsmDtW;
-    public IntPtr SsmAW;
-    public IntPtr SsmNormW;
-    public IntPtr SsmOutW;
-    public IntPtr ConvStateIn;
-    public IntPtr DeltaStateIn;
-    public IntPtr ConvStateOut;
-    public IntPtr DeltaStateOut;
-    public IntPtr GuW;
-    public IntPtr DownW;
-    public IntPtr KW;
-    public IntPtr VW;
-    public IntPtr GateInpW;
-    public IntPtr GateExps;
-    public IntPtr UpExps;
-    public IntPtr DownExps;
-    public IntPtr ShexpGateW;
-    public IntPtr ShexpUpW;
-    public IntPtr ShexpDownW;
-    public IntPtr ShexpGateInpW;
-    /// <summary>Dense FFN with gate and up UNFUSED, for the mixed-quant "UD"
-    /// layers where the two tensors have different GGML types and no
-    /// imatrix-free requantization can bring them together. Non-zero exactly
-    /// when <see cref="GuW"/> is zero; the graph then runs two matmuls.</summary>
-    public IntPtr FfnGateW;
-    public IntPtr FfnUpW;
-    /// <summary>Optional host pointer to 16 F32 per-projection matmul-output
-    /// scales (NVFP4 per-tensor scale2 sidecars; native TSQ35_SC_* slot order).
-    /// Zero when no projection of this layer carries a scale.</summary>
-    public IntPtr ProjScales;
-
-    // int64 weight shapes
-    public long QkvNe0, QkvNe1, QkvBytes;
-    public long ONe0, ONe1, OBytes;
-    public long KNe0, KNe1, KBytes;
-    public long VNe0, VNe1, VBytes;
-    public long GdnQkvNe0, GdnQkvNe1, GdnQkvBytes;
-    public long GdnGateNe0, GdnGateNe1, GdnGateBytes;
-    public long SsmBetaNe0, SsmBetaNe1, SsmBetaBytes;
-    public long SsmAlphaNe0, SsmAlphaNe1, SsmAlphaBytes;
-    public long SsmOutNe0, SsmOutNe1, SsmOutBytes;
-    public long GuNe0, GuNe1, GuBytes;
-    public long DownNe0, DownNe1, DownBytes;
-    public long GateInpNe0, GateInpNe1, GateInpBytes;
-    public long GateExpsBytes, UpExpsBytes, DownExpsBytes;
-    public long ShexpGateNe0, ShexpGateNe1, ShexpGateBytes;
-    public long ShexpUpNe0, ShexpUpNe1, ShexpUpBytes;
-    public long ShexpDownNe0, ShexpDownNe1, ShexpDownBytes;
-    public long FfnGateNe0, FfnGateNe1, FfnGateBytes;
-    public long FfnUpNe0, FfnUpNe1, FfnUpBytes;
-
-    // int32 scalars
-    public int StructBytes;
-    public int IsRecurrent;
-    public int IsMoe;
-    public int QkvType, OType;
-    public int GdnQkvType, GdnGateType, SsmBetaType, SsmAlphaType, SsmOutType;
-    public int GuType, DownType;
-    public int FfDense;
-    public int SeparateQkv, KType, VType;
-    public int GateInpType, GateExpsType, UpExpsType, DownExpsType;
-    public int ShexpGateType, ShexpUpType, ShexpDownType;
-    /// <summary>Non-zero keeps this layer's routed experts in system RAM and runs its
-    /// MoE FFN on the host (MoeCpuOffloadConfig / --n-cpu-moe).</summary>
-    public int CpuMoe;
-    public int FfnGateType;
-    public int FfnUpType;
-}
-
 // Descriptor for the fused DiffusionGemma decode-layer kernel
 // (TSGgml_DiffusionDecodeLayer). Field order/types MUST match the native
 // TSGgmlDiffusionDecodeLayerDesc struct EXACTLY.
@@ -2541,20 +2340,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35AttentionLayerDecode(
-            IntPtr residualData, int hiddenSize,
-            IntPtr attnNormData,
-            IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            IntPtr qNormData, IntPtr kNormData, int headDim,
-            IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
-            IntPtr kCacheData, IntPtr vCacheData,
-            int numHeads, int numKvHeads,
-            int maxSeqLen, int position,
-            float eps, float ropeBase, float ropeFreqScale,
-            int ropeNDims, int ropeMode, int kvCacheType);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_GptOssAttentionLayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,
             IntPtr attnNormW,
@@ -2576,59 +2361,6 @@ internal enum GgmlIndexReductionOp
             int originalContextLength,
             int kvCacheType,
             float eps);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35AttentionLayerPrefill(
-            IntPtr hiddenData, int hiddenSize, int seqLen,
-            IntPtr attnNormW,
-            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            IntPtr qNormW, IntPtr kNormW,
-            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
-            IntPtr kCacheData, IntPtr vCacheData,
-            int numHeads, int kvHeads, int headDim,
-            int cacheSize, int startPos,
-            float ropeBase, float ropeFreqScale, int ropeDims,
-            int ropeMode,
-            int kvCacheType,
-            float eps,
-            int tpDegree, [In, Out] IntPtr[] tpPlanOut);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ReleaseAttentionTpGraphs();
-
-        public static void Qwen35ReleaseAttentionTpGraphs() => TSGgml_Qwen35ReleaseAttentionTpGraphs();
-
-        public static void Qwen35AttentionLayerPrefill(
-            IntPtr hiddenData, int hiddenSize, int seqLen,
-            IntPtr attnNormW,
-            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            IntPtr qNormW, IntPtr kNormW,
-            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
-            IntPtr kCacheData, IntPtr vCacheData,
-            int numHeads, int kvHeads, int headDim,
-            int cacheSize, int startPos,
-            float ropeBase, float ropeFreqScale, int ropeDims,
-            int ropeMode,
-            int kvCacheType,
-            float eps,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
-        {
-            if (tpPlanOut != null) tpPlanOut[0] = IntPtr.Zero;
-            CheckResult(TSGgml_Qwen35AttentionLayerPrefill(
-                hiddenData, hiddenSize, seqLen,
-                attnNormW,
-                qkvW, qkvType, qkvNe0, qkvNe1, qkvBytes,
-                qNormW, kNormW,
-                oW, oType, oNe0, oNe1, oBytes,
-                kCacheData, vCacheData,
-                numHeads, kvHeads, headDim,
-                cacheSize, startPos,
-                ropeBase, ropeFreqScale, ropeDims,
-                ropeMode, kvCacheType, eps,
-                tpDegree, tpPlanOut), "qwen35_attention_layer_prefill");
-        }
 
         public static void GptOssAttentionLayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,
@@ -3942,204 +3674,6 @@ internal enum GgmlIndexReductionOp
             return rc != 0;
         }
 
-        // Qwen3.5/3.6 full-model decode: the whole hybrid transformer (full-attention
-        // + GatedDeltaNet recurrent layers + per-layer FFN) as one graph/token.
-        // Returns 0 when it cannot handle the shape so the caller falls back to per-op.
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ModelDecode(
-            [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
-            [MarshalAs(UnmanagedType.Bool)] bool reseedState,
-            IntPtr hidden, int hiddenSize, int position, int ropePositionDelta,
-            int numHeads, int numKvHeads, int headDim, int cacheSize,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale,
-            IntPtr logits, int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm,
-            int tpDegree, [In, Out] IntPtr[] tpPlanOut);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ModelDecodeToken(
-            [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
-            [MarshalAs(UnmanagedType.Bool)] bool reseedState,
-            int tokenId,
-            IntPtr tokenEmbedding, int tokenEmbeddingType,
-            long tokenEmbeddingNe0, long tokenEmbeddingNe1, long tokenEmbeddingBytes,
-            int hiddenSize, int position, int ropePositionDelta,
-            int numHeads, int numKvHeads, int headDim, int cacheSize,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale,
-            IntPtr logits, int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ResetDecodeCache();
-
-        // Qwen3.5/3.8 SLOT-STABLE ARENA token-batched decode (the GPT-OSS arena
-        // design ported to the hybrid GDN + attention family; see
-        // ggml_ops_qwen35_batched_arena.cpp). kCaches/vCaches are
-        // [attn_layer * n + s]; convStates/deltaStates are [gdn_layer * n + s].
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ArenaDecodeBatched(
-            [In] Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs,
-            [In] int[] tokenIds, [In] int[] positions, [In] int[] ropePositions,
-            [In] IntPtr[] kCaches, [In] IntPtr[] vCaches,
-            [In] IntPtr[] convStates, [In] IntPtr[] deltaStates,
-            [In] int[] gdnHostAuth, [In] int[] cacheSizes,
-            int numHeads, int numKvHeads, int headDim,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale,
-            IntPtr logits, int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm,
-            IntPtr tokenEmbd, int tokenEmbdType,
-            long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
-            IntPtr sampled, int wantLogits);
-
-        /// <summary>Returns 1 on success, 0 on a safe pre-compute decline, and
-        /// -1 when graph execution may have partially mutated recurrent state.
-        /// A -1 must never be converted into serial fallback.</summary>
-        public static int Qwen35ArenaDecodeBatchedStatus(
-            Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs,
-            int[] tokenIds, int[] positions, int[] ropePositions,
-            IntPtr[] kCaches, IntPtr[] vCaches,
-            IntPtr[] convStates, IntPtr[] deltaStates,
-            int[] gdnHostAuth, int[] cacheSizes,
-            int numHeads, int numKvHeads, int headDim,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale,
-            IntPtr logits, int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm,
-            IntPtr tokenEmbd, int tokenEmbdType,
-            long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
-            IntPtr sampled, bool wantLogits)
-            => TSGgml_Qwen35ArenaDecodeBatched(layers, numLayers, nSeqs, tokenIds, positions, ropePositions,
-                kCaches, vCaches, convStates, deltaStates, gdnHostAuth, cacheSizes,
-                numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
-                convKernel, headKDim, headVDim, numKHeads, numVHeads,
-                eps, ropeBase, ropeFreqScale,
-                numExperts, numExpertsUsed, expertFf, sharedFf, normTopk, expertWeightsScale,
-                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, tokenEmbd, tokenEmbdType, tokenEmbdNe0, tokenEmbdNe1, tokenEmbdBytes,
-                sampled, wantLogits ? 1 : 0);
-
-        // Qwen3.5/3.8 batched speculative verify: N sequences x T tokens in one graph
-        // over the holders' resident copies (see ggml_ops_qwen35_batched_verify.cpp).
-        // tokenIds/ropePositions are [n * T] sequence-major; kCaches/vCaches are
-        // [attn_layer * n + s] and convStates/deltaStates [gdn_layer * n + s].
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35BatchedVerify(
-            [In] Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs, int nTok,
-            [In] int[] tokenIds, [In] int[] positions, [In] int[] ropePositions,
-            [In] IntPtr[] kCaches, [In] IntPtr[] vCaches,
-            [In] IntPtr[] convStates, [In] IntPtr[] deltaStates,
-            [In] int[] cacheSizes,
-            int numHeads, int numKvHeads, int headDim, int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm,
-            IntPtr tokenEmbd, int tokenEmbdType, long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
-            [In] int[] captureLayers, int captureCount, [Out] float[] captureData,
-            [Out] int[] sampled);
-
-        /// <summary>Returns 1 on success, 0 on a safe decline (no holder touched), and
-        /// -1 when execution failed after K/V writes began.</summary>
-        public static int Qwen35BatchedVerify(
-            Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs, int nTok,
-            int[] tokenIds, int[] positions, int[] ropePositions,
-            IntPtr[] kCaches, IntPtr[] vCaches, IntPtr[] convStates, IntPtr[] deltaStates,
-            int[] cacheSizes,
-            int numHeads, int numKvHeads, int headDim, int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm,
-            IntPtr tokenEmbd, int tokenEmbdType, long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
-            int[] captureLayers, float[] captureData, int[] sampled)
-            => TSGgml_Qwen35BatchedVerify(layers, numLayers, nSeqs, nTok, tokenIds, positions, ropePositions,
-                kCaches, vCaches, convStates, deltaStates, cacheSizes,
-                numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
-                convKernel, headKDim, headVDim, numKHeads, numVHeads, eps, ropeBase, ropeFreqScale,
-                vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm,
-                tokenEmbd, tokenEmbdType, tokenEmbdNe0, tokenEmbdNe1, tokenEmbdBytes,
-                captureLayers, captureLayers?.Length ?? 0, captureData, sampled);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35BatchedVerifyCommit(int nSeqs, [In] int[] accepted);
-
-        /// <summary>Advance each sequence of the last batched verify by its accepted
-        /// prefix (accepted[s] drafts kept). 1 ok, 0 nothing pending, -1 failed midway.</summary>
-        public static int Qwen35BatchedVerifyCommit(int[] accepted)
-            => TSGgml_Qwen35BatchedVerifyCommit(accepted.Length, accepted);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35BatchedVerifyReset();
-
-        public static void Qwen35BatchedVerifyReset() => TSGgml_Qwen35BatchedVerifyReset();
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ArenaUsesHolderBuffers();
-
-        /// <summary>True when the qwen35 batched decode binds each holder's own resident
-        /// cache copies: a successful step leaves holders as a solo fused decode does,
-        /// with no arena slot to flush.</summary>
-        public static bool Qwen35ArenaUsesHolderBuffers() => TSGgml_Qwen35ArenaUsesHolderBuffers() != 0;
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ArenaResetBatchedDecodeCache();
-
-        /// <summary>Drops the qwen35 slot-stable arena batched-decode state
-        /// (flushing dirty slots to their host bytes first). Survives prefills
-        /// and holder churn by design; call on model teardown.</summary>
-        public static void Qwen35ArenaResetBatchedDecodeCache() => TSGgml_Qwen35ArenaResetBatchedDecodeCache();
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ArenaFlushHostPointer(IntPtr hostPtr);
-
-        /// <summary>Flush-and-retire the qwen35 arena slot registered for this
-        /// host cache/state pointer (no-op when none) — call before any managed
-        /// path reads or replaces a holder's caches outside the hooked
-        /// kernels (growth, host sync, snapshot extraction).</summary>
-        public static void Qwen35ArenaFlushHostPointer(IntPtr hostPtr) => TSGgml_Qwen35ArenaFlushHostPointer(hostPtr);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ArenaDiscardHostPointer(IntPtr hostPtr);
-
-        /// <summary>Retires the qwen35 arena slot registered for this host
-        /// pointer without flushing it (no-op when none). Use only when the
-        /// owning sequence is complete and its holder will be reset.</summary>
-        public static void Qwen35ArenaDiscardHostPointer(IntPtr hostPtr) => TSGgml_Qwen35ArenaDiscardHostPointer(hostPtr);
-
-        public static void Qwen35ResetDecodeCache() => TSGgml_Qwen35ResetDecodeCache();
-
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial void TSGgml_Gemma4ResetDecodeCache();
@@ -4164,123 +3698,12 @@ internal enum GgmlIndexReductionOp
 
         public static void Gemma4MoEResetDecodeCache() => TSGgml_Gemma4MoEResetDecodeCache();
 
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ResetVerifyCache();
-
-        public static void Qwen35ResetVerifyCache() => TSGgml_Qwen35ResetVerifyCache();
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ResetVerifyCacheOwner(long ownerId);
-
-        public static void Qwen35ResetVerifyCache(long ownerId)
-            => TSGgml_Qwen35ResetVerifyCacheOwner(ownerId);
-
         // Qwen3.5/3.6 TRUE token-batched fused decode: N sequences' decode tokens
         // (one per sequence) through the whole hybrid transformer in ONE graph,
         // with PAGED KV (slot_mapping write + per-seq get_rows gather). Returns 0
         // when it cannot handle the shape so the caller falls back to op-by-op.
         // padKv = fixed per-seq gather length (round_up(maxSeqLen, stride)); gatherIdx is
         // [nSeqs*padKv] (real slots then pad), seqLens [nSeqs] drives the per-seq attn mask.
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ModelDecodeBatched(
-            [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int nTokens, int nSeqs,
-            IntPtr positions, IntPtr slotMapping,
-            IntPtr gatherIdx, IntPtr seqLens, int padKv, int totalSlots,
-            int numHeads, int numKvHeads, int headDim,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale);
-
-        public static bool Qwen35ModelDecodeBatched(
-            Qwen35LayerDecodeArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int nTokens, int nSeqs,
-            IntPtr positions, IntPtr slotMapping,
-            IntPtr gatherIdx, IntPtr seqLens, int padKv, int totalSlots,
-            int numHeads, int numKvHeads, int headDim,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale)
-        {
-            return TSGgml_Qwen35ModelDecodeBatched(
-                layers, numLayers, hidden, hiddenSize, nTokens, nSeqs,
-                positions, slotMapping, gatherIdx, seqLens, padKv, totalSlots,
-                numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
-                convKernel, headKDim, headVDim, numKHeads, numVHeads,
-                eps, ropeBase, ropeFreqScale,
-                numExperts, numExpertsUsed, expertFf, sharedFf,
-                normTopk, expertWeightsScale) != 0;
-        }
-
-        public static bool Qwen35ModelDecode(
-            Qwen35LayerDecodeArgs[] layers, int numLayers,
-            bool reseedState,
-            IntPtr hidden, int hiddenSize, int position, int ropePositionDelta,
-            int numHeads, int numKvHeads, int headDim, int cacheSize,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale,
-            IntPtr logits, int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
-        {
-            return TSGgml_Qwen35ModelDecode(
-                layers, numLayers, reseedState,
-                hidden, hiddenSize, position, ropePositionDelta,
-                numHeads, numKvHeads, headDim, cacheSize,
-                ropeNDims, ropeMode, kvCacheType,
-                convKernel, headKDim, headVDim, numKHeads, numVHeads,
-                eps, ropeBase, ropeFreqScale,
-                numExperts, numExpertsUsed, expertFf, sharedFf,
-                normTopk, expertWeightsScale,
-                logits, vocabSize,
-                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, tpDegree, tpPlanOut) != 0;
-        }
-
-        public static bool Qwen35ModelDecodeToken(
-            Qwen35LayerDecodeArgs[] layers, int numLayers,
-            bool reseedState,
-            int tokenId,
-            IntPtr tokenEmbedding, int tokenEmbeddingType,
-            long tokenEmbeddingNe0, long tokenEmbeddingNe1, long tokenEmbeddingBytes,
-            int hiddenSize, int position, int ropePositionDelta,
-            int numHeads, int numKvHeads, int headDim, int cacheSize,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale,
-            IntPtr logits, int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm)
-        {
-            return TSGgml_Qwen35ModelDecodeToken(
-                layers, numLayers, reseedState,
-                tokenId,
-                tokenEmbedding, tokenEmbeddingType,
-                tokenEmbeddingNe0, tokenEmbeddingNe1, tokenEmbeddingBytes,
-                hiddenSize, position, ropePositionDelta,
-                numHeads, numKvHeads, headDim, cacheSize,
-                ropeNDims, ropeMode, kvCacheType,
-                convKernel, headKDim, headVDim, numKHeads, numVHeads,
-                eps, ropeBase, ropeFreqScale,
-                numExperts, numExpertsUsed, expertFf, sharedFf,
-                normTopk, expertWeightsScale,
-                logits, vocabSize,
-                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm) != 0;
-        }
 
         // Qwen3.5/3.6 fused multi-token VERIFY: the whole hybrid transformer over
         // N tokens of ONE sequence as a single graph (prefill-style causal attention,
@@ -4288,241 +3711,8 @@ internal enum GgmlIndexReductionOp
         // final-norm). Outputs per-row logits [vocab, N] AND post-norm hidden
         // [hidden, N] (normedOut, for the MTP draft head). GDN state advances from
         // each layer's ConvStateIn/DeltaStateIn to ConvStateOut/DeltaStateOut.
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35VerifyRequestArgmax(IntPtr output);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35VerifyArgmaxDone();
-
-        /// <summary>Greedy verify: the next full-row Qwen3.5 verify on this thread writes its row
-        /// argmaxes to <paramref name="output"/> (int32 per row) instead of downloading the logits.</summary>
-        internal static void Qwen35VerifyRequestArgmax(IntPtr output) => TSGgml_Qwen35VerifyRequestArgmax(output);
-
-        /// <summary>True when a verify since the request wrote the argmaxes; clears the request.</summary>
-        internal static bool Qwen35VerifyArgmaxDone() => TSGgml_Qwen35VerifyArgmaxDone() != 0;
 
         // Returns 0 when it cannot handle the shape so the caller falls back to per-op.
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ModelVerifyOwned(
-            [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int startPos, int numTokens, int ropePositionDelta,
-            int numHeads, int numKvHeads, int headDim, int cacheSize,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale,
-            IntPtr logits, int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, IntPtr normedOut, int nLogitRows,
-            int[] mropePos, int[] mropeSections,
-            int tpDegree, IntPtr[] tpPlanOut,
-            IntPtr captureData, int[] captureLayers, int captureCount,
-            int stateSnapshots, IntPtr stateSnapshotsUsed, int deviceStateCurrent,
-            int deferStateDownload, long ownerId);
-
-        public static bool Qwen35ModelVerify(
-            Qwen35LayerDecodeArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int startPos, int numTokens,
-            int numHeads, int numKvHeads, int headDim, int cacheSize,
-            int ropeNDims, int ropeMode, int kvCacheType,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps, float ropeBase, float ropeFreqScale,
-            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
-            int normTopk, float expertWeightsScale,
-            IntPtr logits, int vocabSize,
-            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, IntPtr normedOut, int nLogitRows,
-            int[] mropePos = null, int[] mropeSections = null,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null,
-            IntPtr captureData = default, int[] captureLayers = null, int captureCount = 0,
-            int stateSnapshots = 1, IntPtr stateSnapshotsUsed = default,
-            bool deviceStateCurrent = false, bool deferStateDownload = false,
-            long ownerId = 0, int ropePositionDelta = 0)
-        {
-            return TSGgml_Qwen35ModelVerifyOwned(
-                layers, numLayers, hidden, hiddenSize, startPos, numTokens, ropePositionDelta,
-                numHeads, numKvHeads, headDim, cacheSize,
-                ropeNDims, ropeMode, kvCacheType,
-                convKernel, headKDim, headVDim, numKHeads, numVHeads,
-                eps, ropeBase, ropeFreqScale,
-                numExperts, numExpertsUsed, expertFf, sharedFf,
-                normTopk, expertWeightsScale,
-                logits, vocabSize,
-                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
-                tpDegree, tpPlanOut, captureData, captureLayers, captureCount,
-                stateSnapshots, stateSnapshotsUsed, deviceStateCurrent ? 1 : 0,
-                deferStateDownload ? 1 : 0, ownerId) != 0;
-        }
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35CommitStateSnapshotOwned(
-            int slot, int numRecurrentLayers, long ownerId);
-
-        /// <summary>
-        /// Commit one recurrent-state snapshot into the live device state, without a
-        /// host round trip. The next verify can then skip its state upload, which is
-        /// the point: that upload plus the matching download was the largest per-step
-        /// cost of speculative decoding on a Qwen 3.5/3.8 hybrid trunk.
-        ///
-        /// <paramref name="slot"/> counts back from the end of the verified batch;
-        /// -1 means the post-window state, which is what a single-row step commits.
-        /// </summary>
-        public static bool Qwen35CommitStateSnapshot(
-            int slot, int numRecurrentLayers, long ownerId = 0)
-            => TSGgml_Qwen35CommitStateSnapshotOwned(slot, numRecurrentLayers, ownerId) != 0;
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35DrainDeviceStateOwned(
-            IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers, long ownerId);
-
-        /// <summary>Read the live device recurrent state back into the host mirrors,
-        /// for anything that has to run the op-by-op recurrent path.</summary>
-        public static bool Qwen35DrainDeviceState(IntPtr[] convOut, IntPtr[] deltaOut,
-            int numRecurrentLayers, long ownerId = 0)
-            => TSGgml_Qwen35DrainDeviceStateOwned(
-                convOut, deltaOut, numRecurrentLayers, ownerId) != 0;
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ReadLiveStateOwned(
-            IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers, long ownerId);
-
-        /// <summary>Copy the live device recurrent state to host buffers and keep it
-        /// live. False = no live state, or an older native library.</summary>
-        public static bool Qwen35ReadLiveState(IntPtr[] convOut, IntPtr[] deltaOut,
-            int numRecurrentLayers, long ownerId = 0)
-        {
-            try
-            {
-                return TSGgml_Qwen35ReadLiveStateOwned(convOut, deltaOut, numRecurrentLayers, ownerId) != 0;
-            }
-            catch (EntryPointNotFoundException)
-            {
-                return false;
-            }
-        }
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ZeroLiveStateOwned(
-            IntPtr sig, int numRecurrentLayers, long convBytes, long deltaBytes, long ownerId);
-
-        /// <summary>Make the live device recurrent state the all-zero state a sequence
-        /// starts from, without uploading host zeros.</summary>
-        public static bool Qwen35ZeroLiveState(IntPtr sig, int numRecurrentLayers,
-            long convBytes, long deltaBytes, long ownerId)
-            => TSGgml_Qwen35ZeroLiveStateOwned(sig, numRecurrentLayers, convBytes, deltaBytes, ownerId) != 0;
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35DiscardLiveStateOwned(long ownerId);
-
-        /// <summary>Forget the live device recurrent state of a finished sequence.</summary>
-        public static void Qwen35DiscardLiveState(long ownerId)
-            => TSGgml_Qwen35DiscardLiveStateOwned(ownerId);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ExportLiveStateOwned(
-            IntPtr[] convKeys, IntPtr[] deltaKeys, int numRecurrentLayers, long ownerId);
-
-        /// <summary>Move the live device recurrent state into the device copies keyed by
-        /// a sequence's own conv-scratch and delta-state host pointers.</summary>
-        public static bool Qwen35ExportLiveState(IntPtr[] convKeys, IntPtr[] deltaKeys,
-            int numRecurrentLayers, long ownerId)
-            => TSGgml_Qwen35ExportLiveStateOwned(convKeys, deltaKeys, numRecurrentLayers, ownerId) != 0;
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35ImportLiveStateOwned(
-            IntPtr sig, IntPtr[] convKeys, IntPtr[] deltaKeys, int numRecurrentLayers,
-            long convBytes, long deltaBytes, long ownerId);
-
-        /// <summary>Seed the live device recurrent state from a sequence's existing
-        /// device copies.</summary>
-        public static bool Qwen35ImportLiveState(IntPtr sig, IntPtr[] convKeys, IntPtr[] deltaKeys,
-            int numRecurrentLayers, long convBytes, long deltaBytes, long ownerId)
-            => TSGgml_Qwen35ImportLiveStateOwned(
-                sig, convKeys, deltaKeys, numRecurrentLayers, convBytes, deltaBytes, ownerId) != 0;
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35FetchStateSnapshotOwned(
-            int slot, IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers,
-            long ownerId);
-
-        /// <summary>
-        /// Pull ONE per-token recurrent-state snapshot out of the verify that just
-        /// ran, counting <paramref name="slot"/> tokens back from the end of that
-        /// batch. False when there is nothing to pull (no snapshotting verify has
-        /// run, or the slot is out of range), and the caller keeps its old
-        /// restore-and-re-forward path.
-        /// </summary>
-        public static bool Qwen35FetchStateSnapshot(int slot, IntPtr[] convOut, IntPtr[] deltaOut,
-            int numRecurrentLayers, long ownerId = 0)
-            => TSGgml_Qwen35FetchStateSnapshotOwned(
-                slot, convOut, deltaOut, numRecurrentLayers, ownerId) != 0;
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ReleaseVerifyTpGraphs();
-
-        public static void Qwen35ReleaseVerifyTpGraphs() => TSGgml_Qwen35ReleaseVerifyTpGraphs();
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35ReleaseVerifyOwner(long ownerId);
-
-        public static void Qwen35ReleaseVerifyOwner(long ownerId) => TSGgml_Qwen35ReleaseVerifyOwner(ownerId);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_Qwen35RecurrentLayerPrefill(
-            IntPtr hiddenData, int hiddenSize, int n,
-            IntPtr attnNormW,
-            IntPtr gdnQkvW, int gdnQkvType, long gdnQkvNe0, long gdnQkvNe1, long gdnQkvBytes,
-            IntPtr gdnGateW, int gdnGateType, long gdnGateNe0, long gdnGateNe1, long gdnGateBytes,
-            IntPtr ssmBetaW, int ssmBetaType, long ssmBetaNe0, long ssmBetaNe1, long ssmBetaBytes,
-            IntPtr ssmAlphaW, int ssmAlphaType, long ssmAlphaNe0, long ssmAlphaNe1, long ssmAlphaBytes,
-            IntPtr ssmOutW, int ssmOutType, long ssmOutNe0, long ssmOutNe1, long ssmOutBytes,
-            IntPtr conv1dW, IntPtr ssmDtW, IntPtr ssmAW, IntPtr ssmNormW,
-            IntPtr convStateIn, IntPtr deltaStateIn,
-            IntPtr convStateOut, IntPtr deltaStateOut,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps);
-
-        public static bool Qwen35RecurrentLayerPrefill(
-            IntPtr hiddenData, int hiddenSize, int n,
-            IntPtr attnNormW,
-            IntPtr gdnQkvW, int gdnQkvType, long gdnQkvNe0, long gdnQkvNe1, long gdnQkvBytes,
-            IntPtr gdnGateW, int gdnGateType, long gdnGateNe0, long gdnGateNe1, long gdnGateBytes,
-            IntPtr ssmBetaW, int ssmBetaType, long ssmBetaNe0, long ssmBetaNe1, long ssmBetaBytes,
-            IntPtr ssmAlphaW, int ssmAlphaType, long ssmAlphaNe0, long ssmAlphaNe1, long ssmAlphaBytes,
-            IntPtr ssmOutW, int ssmOutType, long ssmOutNe0, long ssmOutNe1, long ssmOutBytes,
-            IntPtr conv1dW, IntPtr ssmDtW, IntPtr ssmAW, IntPtr ssmNormW,
-            IntPtr convStateIn, IntPtr deltaStateIn,
-            IntPtr convStateOut, IntPtr deltaStateOut,
-            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
-            float eps)
-        {
-            return TSGgml_Qwen35RecurrentLayerPrefill(
-                hiddenData, hiddenSize, n, attnNormW,
-                gdnQkvW, gdnQkvType, gdnQkvNe0, gdnQkvNe1, gdnQkvBytes,
-                gdnGateW, gdnGateType, gdnGateNe0, gdnGateNe1, gdnGateBytes,
-                ssmBetaW, ssmBetaType, ssmBetaNe0, ssmBetaNe1, ssmBetaBytes,
-                ssmAlphaW, ssmAlphaType, ssmAlphaNe0, ssmAlphaNe1, ssmAlphaBytes,
-                ssmOutW, ssmOutType, ssmOutNe0, ssmOutNe1, ssmOutBytes,
-                conv1dW, ssmDtW, ssmAW, ssmNormW,
-                convStateIn, deltaStateIn, convStateOut, deltaStateOut,
-                convKernel, headKDim, headVDim, numKHeads, numVHeads, eps) != 0;
-        }
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -4566,13 +3756,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void TSGgml_Qwen35GdnDropTpGraphs();
-
-        /// <summary>Free every cached per-rank TP GatedDeltaNet graph.</summary>
-        public static void Qwen35GdnDropTpGraphs() => TSGgml_Qwen35GdnDropTpGraphs();
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_GatedDeltaNetChunkedF32(
             GgmlTensorView3D q,
             GgmlTensorView3D k,
@@ -4589,49 +3772,6 @@ internal enum GgmlIndexReductionOp
             float eps,
             int gateMode);
 
-        [LibraryImport(DllName)]
-        private static partial int TSGgml_Qwen4ExpFfnBlock(
-            ref Qwen4ExpFfnArgs args,
-            IntPtr resData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int nExpert, int nExpertUsed, int nFf, int nFfShared,
-            float eps, int cacheSlot);
-
-        [LibraryImport(DllName)]
-        private static partial int TSGgml_Qwen4ExpGdnBlock(
-            ref Qwen4ExpGdnArgs args,
-            IntPtr resData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
-            float eps, int cacheSlot);
-
-        [LibraryImport(DllName)]
-        internal static partial void TSGgml_Qwen4ExpResetFfnCache();
-
-        [LibraryImport(DllName)]
-        internal static partial void TSGgml_Qwen4ExpInvalidateSeqState(IntPtr key);
-
-        [LibraryImport(DllName)]
-        internal static partial void TSGgml_Qwen4ExpReleaseAllSeqState();
-
-        [LibraryImport(DllName)]
-        internal static unsafe partial void TSGgml_Qwen4ExpReleaseSeqState(IntPtr* keys, int n);
-
-        [LibraryImport(DllName)]
-        internal static partial IntPtr TSGgml_Qwen4ExpMtpCreate(ref Qwen4ExpMtpConfig config,
-            ref Qwen4ExpAttnArgs attn, ref Qwen4ExpFfnArgs ffn, ref Qwen4ExpHeadArgs head);
-        [LibraryImport(DllName)]
-        internal static partial int TSGgml_Qwen4ExpMtpForward(IntPtr handle,
-            IntPtr embedding, IntPtr previous, int count, int position, int ropePosition,
-            IntPtr mrope3, IntPtr hiddenOut, IntPtr logitsOut);
-        [LibraryImport(DllName)]
-        internal static partial void TSGgml_Qwen4ExpMtpFree(IntPtr handle);
-        [LibraryImport(DllName)]
-        internal static partial int TSGgml_Qwen4ExpMtpCopyKv(IntPtr handle, IntPtr k, IntPtr v, long bytes);
-        [LibraryImport(DllName)]
-        internal static partial void TSGgml_Qwen4ExpCaptureVerifyRows(int enable);
-        [LibraryImport(DllName)]
-        internal static partial int TSGgml_Qwen4ExpSetFeatureTaps(IntPtr layers, int count, IntPtr output, int rowStride);
         [LibraryImport(DllName)]
         internal static partial int TSGgml_TsmMoeProbe(int gateType, int downType, int hidden, int nFf, int nExpert,
             IntPtr gate, IntPtr up, IntPtr down, int rows, int nUsed, IntPtr slots, IntPtr weights, IntPtr x, IntPtr output);
@@ -4662,6 +3802,8 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmQsaAttnCount();
         [LibraryImport(DllName)]
+        internal static partial void TSGgml_TsmQsaAttnSetMinCells(int cells);
+        [LibraryImport(DllName)]
         internal static partial int TSGgml_TsmQsaSelectProbe(int T, int nCells, int nBlocks, int heads, int width,
             IntPtr scores, IntPtr bias, IntPtr cellBlocks, IntPtr maskIn, IntPtr maskOut);
         [LibraryImport(DllName)]
@@ -4676,13 +3818,7 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial int TSGgml_HostReadRows(IntPtr table, long rowBytes, IntPtr rows, int count, IntPtr dst);
         [LibraryImport(DllName)]
-        internal static partial long TSGgml_Qwen4ExpQsaIncrementalSteps();
-        [LibraryImport(DllName)]
         internal static partial long TSGgml_MoeTailSkippedRoutes();
-        [LibraryImport(DllName)]
-        internal static partial int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows);
-        [LibraryImport(DllName)]
-        internal static partial long TSGgml_Qwen4ExpRowBufferBytes();
 
         // Priority-ranked accelerator tier for host-offloaded routed experts and
         // the routing counters the host seams keep (ggml_ops_moe_hot_tier.cpp).
@@ -4704,6 +3840,8 @@ internal enum GgmlIndexReductionOp
         internal static partial void TSGgml_MoeRoutingReset(IntPtr gate);
         [LibraryImport(DllName)]
         internal static partial void TSGgml_MoeRoutingRecordDevice(int on);
+        [LibraryImport(DllName)]
+        internal static unsafe partial void TSGgml_MoeRoutingCount(IntPtr gate, int numExperts, int* ids, long count);
         [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
         internal static partial int TSGgml_HostExpertIoRegister(IntPtr baseAddress, long length, string path);
         [LibraryImport(DllName)]
@@ -4728,139 +3866,6 @@ internal enum GgmlIndexReductionOp
         internal static partial int TSGgml_DirectReadRegister(IntPtr baseAddress, long length, string path);
         [LibraryImport(DllName)]
         internal static partial void TSGgml_DirectReadUnregister(IntPtr baseAddress);
-
-        [LibraryImport(DllName)]
-        private static unsafe partial IntPtr TSGgml_Qwen4ExpStateSnapshotCreate(
-            IntPtr* keys, int* devices, int count, IntPtr attn, IntPtr gdn, IntPtr ple);
-        [LibraryImport(DllName)]
-        internal static partial int TSGgml_Qwen4ExpStateSnapshotCapture(IntPtr handle);
-        [LibraryImport(DllName)]
-        internal static partial int TSGgml_Qwen4ExpStateSnapshotRestore(IntPtr handle);
-        [LibraryImport(DllName)]
-        internal static partial void TSGgml_Qwen4ExpStateSnapshotFree(IntPtr handle);
-
-        internal static unsafe IntPtr Qwen4ExpStateSnapshotCreate(
-            IntPtr[] keys, int[] devices, IntPtr attn, IntPtr gdn, IntPtr ple)
-        {
-            if (keys == null || devices == null || keys.Length != devices.Length)
-                throw new ArgumentException("Snapshot keys and devices must have equal lengths.");
-            fixed (IntPtr* kp = keys)
-            fixed (int* dp = devices)
-                return TSGgml_Qwen4ExpStateSnapshotCreate(kp, dp, keys.Length, attn, gdn, ple);
-        }
-
-        /// <summary>Re-arm the one-time seed upload for one recurrent-state entry
-        /// (keyed by its host seed pointer); the next graph build re-uploads from
-        /// the host copy. Used after the managed reset zeroes that copy.</summary>
-        public static void Qwen4ExpInvalidateSeqState(IntPtr key) => TSGgml_Qwen4ExpInvalidateSeqState(key);
-
-        /// <summary>Free every native sequence-state entry and cached graph
-        /// (model dispose).</summary>
-        public static void Qwen4ExpReleaseAllSeqState() => TSGgml_Qwen4ExpReleaseAllSeqState();
-
-        /// <summary>Free the device recurrent-state entries of a released sequence
-        /// holder and drop every cached graph (surviving holders rebuild and
-        /// re-bind their own still-alive entries).</summary>
-        public static unsafe void Qwen4ExpReleaseSeqState(IntPtr[] keys)
-        {
-            if (keys == null || keys.Length == 0) return;
-            fixed (IntPtr* k = keys)
-            {
-                TSGgml_Qwen4ExpReleaseSeqState(k, keys.Length);
-            }
-        }
-
-        /// <summary>
-        /// One graph for the hyper-connection mixer, the 512-expert MoE and the
-        /// scatter back into the wide residual. Returns false when the backend
-        /// declines the shape, so the caller falls back to the op-by-op path.
-        /// </summary>
-        public static bool Qwen4ExpFfnBlock(ref Qwen4ExpFfnArgs args, IntPtr resData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int nExpert, int nExpertUsed, int nFf, int nFfShared, float eps, int cacheSlot)
-        {
-            return TSGgml_Qwen4ExpFfnBlock(ref args, resData,
-                nEmbd, hc, hcLowRank, nTokens,
-                nExpert, nExpertUsed, nFf, nFfShared, eps, cacheSlot) != 0;
-        }
-
-        public static bool Qwen4ExpGdnBlock(ref Qwen4ExpGdnArgs args, IntPtr resData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
-            float eps, int cacheSlot)
-        {
-            return TSGgml_Qwen4ExpGdnBlock(ref args, resData, nEmbd, hc, hcLowRank, nTokens,
-                headKDim, headVDim, nKHeads, nVHeads, dConv, eps, cacheSlot) != 0;
-        }
-
-        [LibraryImport(DllName)]
-        private static partial int TSGgml_Qwen4ExpAttnBlock(
-            ref Qwen4ExpAttnArgs args,
-            IntPtr resData,
-            IntPtr maskData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
-            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
-            float eps, int cacheSlot);
-
-        public static bool Qwen4ExpAttnBlock(ref Qwen4ExpAttnArgs args, IntPtr resData, IntPtr maskData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
-            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
-            float eps, int cacheSlot)
-        {
-            return TSGgml_Qwen4ExpAttnBlock(ref args, resData, maskData, nEmbd, hc, hcLowRank,
-                nTokens, headDim, nHead, nHeadKv, kvCapacity, nKv, position,
-                nRot, ropeBase, ropeFreqScale, attnScale, eps, cacheSlot) != 0;
-        }
-
-        [LibraryImport(DllName)]
-        private static partial int TSGgml_Qwen4ExpTokenSpan(
-            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
-            int layerBegin, int layerEnd, IntPtr resData, IntPtr maskData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
-            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
-            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
-            int nExpert, int nExpertUsed, int nFf, int nFfSh,
-            float eps, int cacheSlot, IntPtr head, IntPtr logitsOut,
-            IntPtr ple, int pleLayer, IntPtr pleEmb,
-            IntPtr mropePos, IntPtr mropeSections, int ropePosition, int device,
-            IntPtr hiddenOut, int logitsRows, IntPtr qsa, IntPtr qsaPositions, int qsaPositionCount);
-
-        public static bool Qwen4ExpTokenSpan(
-            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
-            int layerBegin, int layerEnd,
-            IntPtr resData, IntPtr maskData,
-            int nEmbd, int hc, int hcLowRank, int nTokens,
-            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
-            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
-            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
-            int nExpert, int nExpertUsed, int nFf, int nFfSh,
-            float eps, int cacheSlot,
-            IntPtr head, IntPtr logitsOut,
-            IntPtr ple, int pleLayer, IntPtr pleEmb,
-            IntPtr mropePos, IntPtr mropeSections, int ropePosition, int device,
-            IntPtr hiddenOut, int logitsRows,
-            IntPtr qsa, IntPtr qsaPositions, int qsaPositionCount)
-        {
-            return TSGgml_Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
-                resData, maskData, nEmbd, hc, hcLowRank, nTokens,
-                headKDim, headVDim, nKHeads, nVHeads, dConv,
-                headDim, nHead, nHeadKv, kvCapacity, nKv, position,
-                nRot, ropeBase, ropeFreqScale, attnScale,
-                nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
-                head, logitsOut, ple, pleLayer, pleEmb,
-                mropePos, mropeSections, ropePosition, device,
-                hiddenOut, logitsRows, qsa, qsaPositions, qsaPositionCount) != 0;
-        }
-
-        [LibraryImport(DllName)]
-        private static partial int TSGgml_Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device);
-        public static bool Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device)
-            => TSGgml_Qwen4ExpCopyQsaCache(key, destination, bytes, device) != 0;
-
-        public static void Qwen4ExpResetFfnCache() => TSGgml_Qwen4ExpResetFfnCache();
 
         // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; same 32-byte
         // POD layout on 64-bit (two ints, two padding ints, two pointers).
@@ -5039,6 +4044,10 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_EnsureDeviceCopyFromHost(IntPtr key, long bytes);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_ZeroDeviceCopies(IntPtr* keys, long* bytes, int count, byte* skipped);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -6516,30 +5525,6 @@ internal enum GgmlIndexReductionOp
             }
         }
 
-        public static void Qwen35AttentionLayerDecode(
-            IntPtr residualData, int hiddenSize,
-            IntPtr attnNormData,
-            IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            IntPtr qNormData, IntPtr kNormData, int headDim,
-            IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
-            IntPtr kCacheData, IntPtr vCacheData,
-            int numHeads, int numKvHeads,
-            int maxSeqLen, int position,
-            float eps, float ropeBase, float ropeFreqScale,
-            int ropeNDims, int ropeMode, int kvCacheType = 0)
-        {
-            CheckResult(TSGgml_Qwen35AttentionLayerDecode(
-                residualData, hiddenSize,
-                attnNormData,
-                qkvData, qkvType, qkvNe0, qkvNe1, qkvBytes,
-                qNormData, kNormData, headDim,
-                oData, oType, oNe0, oNe1, oBytes,
-                kCacheData, vCacheData,
-                numHeads, numKvHeads,
-                maxSeqLen, position,
-                eps, ropeBase, ropeFreqScale, ropeNDims, ropeMode, kvCacheType), "qwen35_attention_layer_decode");
-        }
-
         public static void Gemma4ModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
@@ -7071,6 +6056,27 @@ internal enum GgmlIndexReductionOp
             fixed (long* d = dstOffsets)
             fixed (long* l = lengths)
                 return TSGgml_UploadToDeviceCopyRanges(srcHost, srcBytes, dstKey, dstBytes, so, d, l, lengths.Length, zeroDestination ? 1 : 0) == 1;
+        }
+
+        /// <summary>
+        /// Zero-filled device copies for several host keys in shared device buffers (one allocation and one clear for
+        /// all of them). <paramref name="skipped"/>[i] is set for a key left alone (it already has a cached buffer, or
+        /// alone exceeds a buffer). Returns the keys placed, or -1 when nothing was (no separate device copies, several
+        /// devices, the budget, an allocation).
+        /// </summary>
+        public static unsafe int ZeroDeviceCopies(ReadOnlySpan<IntPtr> keys, ReadOnlySpan<long> bytes, Span<bool> skipped)
+        {
+            if (keys.Length != bytes.Length || skipped.Length != keys.Length)
+                throw new ArgumentException("key, size and skipped spans must have the same length.");
+            if (keys.Length == 0) return 0;
+            var flags = new byte[keys.Length];
+            int placed;
+            fixed (IntPtr* k = keys)
+            fixed (long* b = bytes)
+            fixed (byte* f = flags)
+                placed = TSGgml_ZeroDeviceCopies(k, b, keys.Length, f);
+            for (int i = 0; i < flags.Length; i++) skipped[i] = flags[i] != 0;
+            return placed;
         }
 
         /// <summary>Upload all host bytes of <paramref name="key"/> into its device copy,

@@ -127,7 +127,9 @@ public class Qwen35HolderSpeculationTests
 
             Assert.Equal(plain.t1, spec.t1);
             Assert.Equal(plain.t2, spec.t2);
-            Assert.Equal(turn1.Length + 24, spec.c2.PrefixCacheReusedTokens);   // the whole retained holder, no rewind
+            // The whole retained holder, no rewind: turn one's last sampled token was never forwarded, so the
+            // holder's state ends one token before the 24 it produced.
+            Assert.Equal(turn1.Length + 23, spec.c2.PrefixCacheReusedTokens);
             Assert.NotNull(spec.seq2.SpecStats);
             Assert.True(spec.seq2.SpecStats.VerifySteps > 0, "speculation never verified a window on the holder");
             Assert.True(spec.seq2.SpecStats.TokensAccepted > 0, "no drafted token was accepted while quoting the passage");

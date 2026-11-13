@@ -560,8 +560,8 @@ script gets that error instead of watching a setting be ignored.
 | `--ref-audio <file>` | Reference audio clip. Repeatable; referred to as `<Audio 1>`, `<Audio 2>`, … Resampled to the audio VAE's 32 kHz stereo and truncated to the generated clip's duration. |
 | `--no-audio` | Skip audio decoding on models that generate an audio track jointly with the video (LTX 2.5, MiniMax-H3), saving the audio VAE's time and memory. Ignored by video-only models. |
 | `--wan-vae` / `--wan-te` / `--wan-dit2` / `--video-te` | **Removed and rejected at startup on both hosts, including as config-file keys.** Use `--video-vae`, `--video-text-encoder` and `--video-dit2`. The `TS_WAN_VAE`, `TS_WAN_TE` and `TS_WAN_DIT2` variables are refused too: every video model reads `TS_VIDEO_VAE`, `TS_VIDEO_TEXT_ENCODER` and `TS_VIDEO_DIT2`. |
-| `--tp <N>` | Tensor-parallel degree: shard weights within layers over N local GPUs (default `1`). Requires a supported architecture and GPU backend. Mutually exclusive with `--layer-split`; unsupported requests fail at startup. Env: `TENSORSHARP_TP_DEGREE`. |
-| `--layer-split <N>` | Local GPU count for whole-layer placement. Add `--tp-node-id` and `--tp-peers` for supported distributed stage executors; see [multi-node inference](docs/multi-node-inference.md). Cannot combine with `--tp` above 1. Env: `TENSORSHARP_LAYER_SPLIT_DEGREE`. |
+| `--tp <N>` | Tensor-parallel degree: shard weights within layers over N local GPUs (default `1`). Requires a supported architecture and GPU backend. With `--layer-split P` it selects hybrid placement (P whole-layer stages of N GPUs each, one process) on families that declare it; unsupported requests fail at startup. Env: `TENSORSHARP_TP_DEGREE`. |
+| `--layer-split <N>` | Local GPU count for whole-layer placement. Add `--tp-node-id` and `--tp-peers` for supported distributed stage executors; see [multi-node inference](docs/multi-node-inference.md). With `--tp T` above 1 it selects hybrid placement (one process only). Env: `TENSORSHARP_LAYER_SPLIT_DEGREE`. |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node tensor parallelism or layer splitting. Requires `--tp-peers`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. |
 | `--test` | Run built-in tokenizer, ChatML-template, and Ollama-comparison tests |
@@ -754,8 +754,8 @@ Running `TensorSharp.Server.Host` (`dotnet TensorSharp.Server.Host/bin/TensorSha
 | `--port <N>` / `--host <address>` | Listen port and bind interface (defaults: `5000`, `0.0.0.0` — every interface). On macOS port 5000 is taken by the AirPlay Receiver, so pick another port or turn that off. Env: `PORT` / `HOST`. |
 | `--urls <urls>` | Full listen URL(s), semicolon-separated, for what `--port`/`--host` cannot express (HTTPS, several endpoints). `--port`/`--host` win when both are given. Without any of the three, `PORT`/`HOST` apply, then `ASPNETCORE_URLS`. |
 | `--backend <type>` | Default compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` (default `ggml_metal` on macOS, `ggml_cpu` elsewhere). Omitted on a machine that has the platform default, it logs nothing; if the platform default is missing, startup warns `The platform default backend 'X' is unavailable on this machine (available: …). Using 'Y' instead`. An explicit backend the machine lacks refuses the startup model's load (exit code 2); a model-less server warns and falls back to an available one. |
-| `--tp <N>` | Tensor-parallel degree: shard weights within layers over N local GPUs (default `1`). Requires a supported architecture and GPU backend. Mutually exclusive with `--layer-split`; unsupported requests fail at startup. Env: `TENSORSHARP_TP_DEGREE`. |
-| `--layer-split <N>` | Local GPU count for whole-layer placement. Add `--tp-node-id` and `--tp-peers` for supported distributed stage executors; see [multi-node inference](docs/multi-node-inference.md). Cannot combine with `--tp` above 1. Env: `TENSORSHARP_LAYER_SPLIT_DEGREE`. |
+| `--tp <N>` | Tensor-parallel degree: shard weights within layers over N local GPUs (default `1`). Requires a supported architecture and GPU backend. With `--layer-split P` it selects hybrid placement (P whole-layer stages of N GPUs each, one process) on families that declare it; unsupported requests fail at startup. Env: `TENSORSHARP_TP_DEGREE`. |
+| `--layer-split <N>` | Local GPU count for whole-layer placement. Add `--tp-node-id` and `--tp-peers` for supported distributed stage executors; see [multi-node inference](docs/multi-node-inference.md). With `--tp T` above 1 it selects hybrid placement (one process only). Env: `TENSORSHARP_LAYER_SPLIT_DEGREE`. |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node tensor parallelism or layer splitting. The server can only be node `0` (the driver that serves HTTP); start worker nodes with `TensorSharp.Cli`. Requires `--tp-peers`. Env: `TENSORSHARP_TP_NODE_ID`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed cluster, ordered by node ID (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. Env: `TENSORSHARP_TP_PEERS`. |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
@@ -991,8 +991,7 @@ latency, quality or delegation-rate measurements are published. Full design:
 | `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H: largest attention score tensor (MiB) the materialized prefill fallback builds before it attends in query sub-chunks (default 1024). Not used by the GGML fused prefill kernel (F32/F16 cache), which switches to flash attention once the scores would be large. |
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H: device memory (MiB) the cached native Mamba2 prefill graphs may hold, least recently used first out (default 1024). A graph larger than the budget serves its call and is released. |
 | `TS_MLX_MLOCK_GGUF` | `1` (default) pins the GGUF mmap region in physical RAM via `mlock(2)` so model weights stay resident between forward passes. Set to `0` to skip (use if the process `memlock` rlimit is too low or you want the OS to manage paging). MLX backend only. |
-| `TS_MLX_BATCHED_MOE_DECODE` | `1` (default) collapses K per-expert decode dispatches to one batched dispatch per (gate/up/down) kind for Qwen 3.5/3.6 MoE. Set to `0` on memory-constrained machines (saves ~weight-doubling overhead from the stacked weight slabs). |
-| `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | Override the MLX allocator hard cap / unused-buffer cache cap / wired-buffer residency cap (megabytes). Defaults are derived from the host's unified-memory capacity. |
+| `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | Override the MLX allocator hard cap / unused-buffer cache cap / wired-buffer residency cap (megabytes). The allocator and wired caps default to 70% of the RAM, leaving macOS at least min(8 GiB, a quarter of the RAM): wired memory is never paged, and a cap near the RAM hangs the Mac instead of failing an allocation. The cache cap defaults to 2048. |
 | `TS_MLX_EVAL_EVERY_N_LAYERS` | Periodic `mlx_async_eval` cadence during decode to overlap GPU work with host queueing. Each MLX model has its own default (Gemma 4 and Muse-Glimmer every 4 layers, Qwen 3.5 and Nemotron-H every 16); the variable sets it for all of them. Set to `0` to disable where supported. |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | Override the search path for `libmlxc` when using `--backend mlx`. |
 
@@ -1931,7 +1930,7 @@ must be reachable between all nodes.
 
 | Architecture | TP status | Notes |
 |---|---|---|
-| Mistral 3 | ✅ | Fused/separate QKV, YaRN RoPE |
+| Mistral 3 | ✅ + layer split + hybrid | Shared decoder runtime: `--tp T`, `--layer-split P` (local, or multi-node on GGML CUDA/Vulkan) and both together (`--tp T --layer-split P`, P stages of T GPUs each) on `cuda`, `ggml_cuda` and `ggml_vulkan`; concurrent requests stay batched in every placement. See [unified execution](docs/design/unified-execution.md) |
 | Gemma 4 | ✅ | Dense TP + MoE. On GGML the fused whole-model MoE trunk splits *inside* each expert (gate/up column-parallel, down row-parallel) so global expert ids keep working; `TS_GEMMA4_TP_FUSED_MOE=0` falls back to the whole-expert per-op path. Per-expert slicing on direct CUDA |
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership; expert-parallel MoE on GGML (whole experts per rank, Megatron-split shared expert) with a column-parallel (vocabulary-sharded) LM head unless the head is tied to the embedding or its vocabulary rows do not divide by the local TP degree (it then stays replicated on rank 0), expert slicing and a replicated LM head on direct CUDA. Runs on both `cuda` and `ggml_cuda` / `ggml_vulkan` — the GGML path uses the packed per-rank GDN kernel (`TSGgml_Qwen35GdnLayerTP`) with device-resident recurrent state. [Bonsai2](docs/models/bonsai2.md) (`qwen35` files with PRISM PQ2_0 / PTQ1_0 tensors) is the exception: single-device GGML backends only, so `--tp` is refused |
 | Qwen 3.8 Flash Next | ✅ (local FFN TP) + layer split | `ggml_cuda --tp N` partitions routed/shared FFNs while attention/QSA/GDN/PLE remain replicated. Requires qualified CUDA MMQ devices and supported FFN types; UD-IQ4_XS was checked on A40 TP2/TP4, but UD-Q2_K_XL is refused for TP. CPU expert offload, prefix checkpoints and distributed TP are unsupported in this mode. `--layer-split N` remains available on GGML CUDA/Vulkan and direct `cuda`. Measured A40 TP2 was slower than layer split; see [qualification, numerical gates and benchmarks](docs/models/qwen38-flash-next.md#multi-gpu). |
@@ -1943,7 +1942,7 @@ must be reachable between all nodes.
 | GLM 5.x | ✅ (local only) | GGML GPU backends only; the native TP path is local/single-process for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (`--tp-node-id` / `--tp-peers` are hard-refused for the whole family). GLM-5.2 shards MLA heads and hidden rows inside every routed expert. GLM-5.3-Flash also head-shards KDA with per-rank recurrent state; its MLA heads and routed-expert hidden rows are sharded likewise. Attention partials reduce before each nonlinear Sinkhorn hyper-connection. On GLM-5.3-Flash's eligible segmented fast path, routed-MoE partials reduce first, then each rank computes/adds the replicated shared expert locally; hyper-connections, pooled indexer, router, norms, dense layers and embedding also remain unsharded and execute per rank, while output norm / LM head stay on rank 0. CPU MoE, tracing, partial `TS_GLM_TP_SHARD`, oversubscription, or missing native hyper-connection kernels use the combined scheduler fallback, where the shared expert runs once on rank 0. Plain GLM-5.3 accepts `--tp N` on the same local terms and replicates the MLA and indexer caches on every rank, so `--tp` multiplies the KV footprint; nothing has ever been run on it at `--tp N>1` — the only recorded arithmetic is a non-fit, `--tp 8` wanting 41.7 GiB per rank against 46 GB cards — so treat it as an accepted mode rather than a validated configuration, and note that `--spec` is refused there whenever `--tp N>1`. Use `--layer-split N` for whole-layer placement |
 | DeepSeek V4 Flash | layer split | Not tensor parallelism: the whole-model executors bin-pack contiguous runs of whole layers against each device's free VRAM, and `--layer-split N` only caps how many GPUs that split uses |
 | DeepSeek V4.1 Flash | partial TP + layer split | On GGML CUDA, `--layer-split N` selects whole-layer placement and `--tp N` selects routed-MoE sharding. Both can span nodes through the shared peer options. Attention remains unsharded in TP. See [multi-node setup and limits](docs/multi-node-inference.md). |
-| Hunyuan Dense | — | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
+| Hunyuan Dense | ✅ + layer split + hybrid | Shared decoder runtime: the same placements as Mistral 3 (`--tp T`, `--layer-split P`, both together), with batched serving in each. |
 | DiffusionGemma | — | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
 | Wan 2.1 / 2.2, MiniMax-H3 | — | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
 | Qwen-Image-2.1 | ✅ (local only, diffusion transformer) | `--tp N` (any GPU count that divides the 32 attention heads — 2, 4, 8 or 16 on one machine — subject to block alignment when the weights are sharded) on `ggml_cuda` / `ggml_vulkan` shards the DiT's attention heads and MLP columns; LoRA plug-ins are sharded with it. Measured 1.34-1.57× on 2× A40 with `ggml_cuda`, but slower than one GPU on `ggml_vulkan` (0.86×, host reduction). The text encoder, vision encoder and VAE stay on the first GPU, and multi-node groups are refused. See the [Qwen-Image-2.1 card](docs/models/qwenimage21.md#cuda-graphs-and-tensor-parallelism) |
@@ -2024,13 +2023,11 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`). Muse Spark's and MiniMax-M3.1's native `--tp` refuse it; use `CUDA_VISIBLE_DEVICES` there |
 | `TS_GGML_TP_PARALLEL=0` | Drive ranks sequentially instead of concurrently (diagnostic) |
-| `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
 | `TS_Q4E_LAYER_SPLIT=20,28` | Qwen 3.8 Flash Next only: explicit layer counts per GPU for its layer split, instead of the automatic VRAM balance. Throws rather than silently ignoring a value it cannot honour — useful because the automatic balance prices weights and cannot see the vision tower, which loads later and lands on GPU 0 |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode. Layers offloaded by `--n-cpu-moe` are skipped by that materialization — they never run on the accelerator — so `--cpu-moe` also removes the load-time cost |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | Payload size above which ggml-cuda's collective converts F32 to BF16 before reducing. TensorSharp raises ggml's default (1 byte — i.e. always) to 1 MB so decode-sized collectives reduce exactly; `0` disables the conversion entirely |
-| `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |
 
 ### Constraints
@@ -2147,8 +2144,8 @@ continues to measure its direct backend decode paths, including MLX pipelining.
 
 | Model | Default state | Env vars | Native-kernel sub-toggle |
 |---|---|---|---|
-| Mistral 3 | ON | — | — |
-| Hunyuan Dense | ON (a block-quantized KV cache keeps the K/V snapshot path). Single device: `--tp N > 1`, `--layer-split N > 1` and distributed groups are refused at startup | — | — |
+| Mistral 3 | ON in every local placement (TP, layer split, hybrid); a multi-node layer split uses the serialized stage protocol | — | — |
+| Hunyuan Dense | ON in every placement (TP, layer split, hybrid); a block-quantized KV cache keeps the K/V snapshot path | — | — |
 | Gemma 4 | ON | — | — |
 | Qwen 3.5 / 3.6 family | ON | — | — |
 | GPT OSS | ON | — | — |
@@ -2173,7 +2170,6 @@ continues to measure its direct backend decode paths, including MLX pipelining.
 | DFlash speculative prefill chunk | `1024` (capped by the drafter ring and the trunk's window) | `TS_DFLASH_PREFILL_CHUNK` | — |
 | DFlash2 candidate selector | ON when the checkpoint has one | `TS_DFLASH_SELECTOR=0` drafts by per-position argmax instead (diagnostic only) | — |
 | DFlash2 grouped convolution | ON when the checkpoint has one | `TS_DFLASH_CONV=0` drops it (diagnostic only) | — |
-| Qwen 3.5/3.8 recurrent-state snapshots | ON | `TS_Q35_VERIFY_SNAPSHOTS=0` reverts to restoring a pre-verify state copy and re-forwarding the accepted prefix (slower; see [qwen35.md §12.5](docs/models/qwen35.md)) | — |
 | Gemma 4 fused verify / draft kernels (ggml) | ON | — | — |
 | Gemma 4 dense fast rollback on partial accept | ON | — | — |
 
@@ -2290,10 +2286,9 @@ Every `TS_MINIMAX_M3_*` variable, with its default, is in the
 | MLX pipelined greedy decode (CLI `--benchmark` only) | ON when eligible | — | — |
 | MLX `mlock(2)` of GGUF mmap so weights stay resident | ON | `TS_MLX_MLOCK_GGUF=0` to disable | — |
 | MLX fused multi-dim KV write (single `slice_update` per cache block) | ON | — | — |
-| MLX batched MoE decode (Qwen 3.5/3.6 MoE) | ON | `TS_MLX_BATCHED_MOE_DECODE=0` runs the per-expert path (no stacked copy) | — |
 | MLX fused MoE gate+up+SiLUMul Metal kernel | ON | — | — |
 | MLX on-device MoE router top-K + softmax | ON when prerequisites are met | — | — |
-| MLX layer-boundary `async_eval` cadence | Gemma 4 / Muse-Glimmer: every 4 layers; Qwen / Nemotron: every 16 layers | `TS_MLX_EVAL_EVERY_N_LAYERS=N` (`0` = disabled where supported) | — |
+| MLX layer-boundary `async_eval` cadence | Gemma 4 / Muse-Glimmer: every 4 layers; Qwen / Nemotron / shared-decoder-runtime families: every 16 layers | `TS_MLX_EVAL_EVERY_N_LAYERS=N` (`0` = disabled where supported) | — |
 | MLX allocator caps (memory / cache / wired buffer) | host-derived | `TS_MLX_MEMORY_LIMIT_MB`, `TS_MLX_CACHE_LIMIT_MB`, `TS_MLX_WIRED_LIMIT_MB` | — |
 
 #### Pure C# CPU backend (`--backend cpu`)

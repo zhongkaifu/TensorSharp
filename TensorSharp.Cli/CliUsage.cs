@@ -329,7 +329,8 @@ namespace TensorSharp.Cli
                     "Use tensor parallelism across N local GPUs: shard supported weight tensors and combine " +
                     "their results on every token. Applies to supported architectures on cuda, ggml_cuda, and " +
                     "ggml_vulkan. Unsupported architectures/backends are refused; this option never selects a layer split. " +
-                    "Use --layer-split for whole-layer placement. Cannot combine degrees above 1. " +
+                    "Use --layer-split for whole-layer placement, or both together for hybrid placement " +
+                    "(--layer-split P stages of --tp T GPUs each, T x P GPUs; architectures on the shared decoder runtime). " +
                     "Default: TENSORSHARP_TP_DEGREE or 1; the CLI overrides the environment.",
                     "--backend ggml_cuda --tp 2"),
                 new OptionHelp("--layer-split <N>",
@@ -337,8 +338,11 @@ namespace TensorSharp.Cli
                     "it does not shard weight tensors or promise faster decoding. Requires an architecture with " +
                     "layer placement on the chosen backend (ggml_cuda/ggml_vulkan, or cuda for supported families). Unsupported combinations " +
                     "are refused. Add --tp-node-id/--tp-peers for multiple nodes with a supported stage executor " +
-                    "(DeepSeek V4.1 on ggml_cuda, Mistral 3 on ggml_cuda/ggml_vulkan). Use the same local degree " +
-                    "on every node; --layer-split 1 supports one GPU per node. Cannot combine with --tp above 1. " +
+                    "(DeepSeek V4.1 on ggml_cuda, Mistral 3 on ggml_cuda/ggml_vulkan, Qwen 3.5 on cuda/ggml_cuda/ggml_vulkan); " +
+                    "--layer-split 1 runs one stage per node. With --tp T above 1 each stage is a T-GPU tensor-parallel group, " +
+                    "in one process or on each node. Across nodes on the shared decoder runtime (Qwen 3.5, Mistral 3) every " +
+                    "node sets its own --layer-split and --tp, so nodes with different GPU counts form one pipeline, layers " +
+                    "split by each node's GPU memory; other executors need the same --layer-split and no --tp on every node. " +
                     "Default: TENSORSHARP_LAYER_SPLIT_DEGREE or 1; the CLI overrides the environment.",
                     "--backend ggml_cuda --layer-split 2"),
                 new OptionHelp("--tp-node-id <N>",

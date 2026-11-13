@@ -44,6 +44,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Per-sequence forward with KV-state ownership swap — the
         /// universal fallback; never declines.</summary>
         PerSequence,
+
+        /// <summary>Every scheduled request's prompt chunk or decode token in one
+        /// batched forward over per-request slots (<see cref="IUnifiedBatchModel"/>,
+        /// the shared decoder runtime), whatever the count. Never declines.</summary>
+        Unified,
     }
 
     /// <summary>

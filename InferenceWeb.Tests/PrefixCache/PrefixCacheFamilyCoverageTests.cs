@@ -35,8 +35,6 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(Mistral3Model))]
     [InlineData(typeof(MuseGlimmerModel))]
     [InlineData(typeof(NemotronModel))]
-    [InlineData(typeof(Qwen35Model))]
-    [InlineData(typeof(Qwen4ExpModel))]
     public void EveryEngineServedFamily_EnablesTreeWithoutAdvertisingUnavailableEndStates(Type family)
     {
         // Capabilities describe construction-time geometry and backend availability.
@@ -89,22 +87,22 @@ public sealed class PrefixCacheFamilyCoverageTests
         Assert.Equal(
             new[] { "DeepSeek41Model", "DeepSeek4Model", "Gemma4Model", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
                     "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerModel", "MuseSparkModel", "NemotronModel", "Qwen35CudaModel",
-                    "Qwen35Model", "Qwen4ExpCudaModel", "Qwen4ExpModel" },
+                    "Qwen35RuntimeModel", "Qwen4ExpCudaModel", "Qwen4ExpRuntimeModel" },
             engineServed.Select(t => t.Name).ToArray());
     }
 
     [Theory]
     [InlineData(typeof(Gemma4Model))]
-    [InlineData(typeof(Qwen35Model))]
-    [InlineData(typeof(Qwen4ExpModel))]
     [InlineData(typeof(DeepSeek4Model))]
     [InlineData(typeof(GptOssModel))]
+    [InlineData(typeof(Mistral3Model))]
+    [InlineData(typeof(HunyuanDenseModel))]
+    [InlineData(typeof(Qwen35RuntimeModel))]
+    [InlineData(typeof(Qwen4ExpRuntimeModel))]
     public void HolderFamilies_UseTheHolderAdapter(Type family)
         => Assert.True(typeof(IHolderPrefixCacheModel).IsAssignableFrom(family), $"{family.Name} is not an IHolderPrefixCacheModel");
 
     [Theory]
-    [InlineData(typeof(Mistral3Model))]
-    [InlineData(typeof(HunyuanDenseModel))]
     [InlineData(typeof(MuseGlimmerModel))]
     public void PageFamilies_RefuseEveryEndStateMember(Type family)
         => Assert.True(typeof(IPageOnlyPrefixCacheModel).IsAssignableFrom(family), $"{family.Name} is not an IPageOnlyPrefixCacheModel");

@@ -155,6 +155,18 @@ ggml_tensor * bonsai_transform(ggml_context * ctx, ggml_tensor * x, const void *
 ggml_tensor * bonsai_mul_mat(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, const void * key) {
     return ggml_mul_mat(ctx, w, bonsai_transform(ctx, x, key, false));
 }
+bool bonsai_any_transform() {
+    return has_transforms.load(std::memory_order_acquire);
+}
+ggml_tensor * bonsai_mul_mat_memo(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, const void * key, BonsaiMemo & memo) {
+    auto t = lookup(key);
+    if (!t) return ggml_mul_mat(ctx, w, x);
+    const auto memo_key = std::make_pair(static_cast<const ggml_tensor *>(x), static_cast<const void *>(t.get()));
+    auto found = memo.entries.find(memo_key);
+    ggml_tensor * rotated = found != memo.entries.end() ? found->second : bonsai_transform(ctx, x, key, false);
+    if (found == memo.entries.end()) memo.entries.emplace(memo_key, rotated);
+    return ggml_mul_mat(ctx, w, rotated);
+}
 ggml_tensor * bonsai_get_rows(ggml_context * ctx, ggml_tensor * w, ggml_tensor * ids, const void * key) {
     return bonsai_transform(ctx, ggml_get_rows(ctx, w, ids), key, true);
 }

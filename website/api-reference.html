@@ -244,7 +244,6 @@
       <tr><td><code>GGML_CUDA_ALLREDUCE / GGML_CUDA_AR_BF16_THRESHOLD</code></td><td>ggml collective selection (<code>nccl</code> / <code>internal</code> / <code>none</code>) and the payload size above which F32 collectives convert to BF16 (raised to 1 MB by TensorSharp).</td></tr>
       <tr><td><code>TS_RESPONSES_STORE_REDIS_URL</code></td><td>Redis-backed OpenAI Responses API store (replaces the in-memory store); the live half of <code>--redis-url</code>.</td></tr>
       <tr><td><code>TS_GGML_VULKAN_DEVICE</code></td><td>Vulkan device index for <code>ggml_vulkan</code> (= <code>--gpu-device</code>).</td></tr>
-      <tr><td><code>TS_FUSED_QKNORM_ROPE</code></td><td><code>0</code> disables the fused QK-Norm + RoPE CUDA kernel in Qwen 3.5/3.6 text prefill on the direct <code>cuda</code> backend (default on).</td></tr>
       <tr><td><code>TS_MLX_* </code></td><td>MLX backend tuning: mlock GGUF, batched MoE decode, layer-eval cadence, memory caps.</td></tr>
       <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>Override the search path for <code>libmlxc</code>.</td></tr>
       <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>Skip / pin the ggml source clone on native builds.</td></tr>

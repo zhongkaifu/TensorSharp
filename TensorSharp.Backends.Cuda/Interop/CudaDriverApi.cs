@@ -242,6 +242,9 @@ namespace TensorSharp.Cuda.Interop
         public static partial int cuCtxEnablePeerAccess(IntPtr peerContext, uint flags);
 
         [LibraryImport(LibName)]
+        public static partial int cuCtxDisablePeerAccess(IntPtr peerContext);
+
+        [LibraryImport(LibName)]
         public static partial int cuMemcpyPeerAsync(
             IntPtr dstDevice, IntPtr dstContext,
             IntPtr srcDevice, IntPtr srcContext,

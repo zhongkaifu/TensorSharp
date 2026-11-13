@@ -409,6 +409,41 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary><see cref="TryCopyDeviceFrom2D"/> over <paramref name="n0"/> x <paramref name="n1"/> groups of rows,
+        /// each level with its own byte pitches, in one kernel launch. Same allocator only; non-negative pitches.</summary>
+        internal bool TryCopyDeviceFrom4D(
+            CudaStorage src,
+            long destByteOffset, long srcByteOffset,
+            long n0, long n1, long rows, long innerBytes,
+            long destPitch0, long srcPitch0, long destPitch1, long srcPitch1,
+            long destPitchBytes, long srcPitchBytes)
+        {
+            if (src == null || !ReferenceEquals(AllocatorImpl, src.AllocatorImpl))
+                return false;
+            var kernels = AllocatorImpl.Kernels;
+            if (kernels == null)
+                return false;
+            if (n0 <= 0 || n1 <= 0 || rows <= 0 || innerBytes <= 0)
+                return true;
+            if (destPitch0 < 0 || srcPitch0 < 0 || destPitch1 < 0 || srcPitch1 < 0 || destPitchBytes < 0 || srcPitchBytes < 0)
+                return false;
+
+            // Bounds: the last group's last row's inner span must stay inside both buffers.
+            long srcLast = checked(srcByteOffset + (n0 - 1) * srcPitch0 + (n1 - 1) * srcPitch1 + (rows - 1) * srcPitchBytes + innerBytes);
+            long dstLast = checked(destByteOffset + (n0 - 1) * destPitch0 + (n1 - 1) * destPitch1 + (rows - 1) * destPitchBytes + innerBytes);
+            if (srcByteOffset < 0 || destByteOffset < 0 || srcLast > src.ByteLength || dstLast > ByteLength)
+                return false;
+
+            src.EnsureDeviceCurrent();
+            AllocatorImpl.Context.MakeCurrent();
+            kernels.LaunchCopy4DBytes(
+                AddBytes(src.deviceBuffer, srcByteOffset), AddBytes(deviceBuffer, destByteOffset),
+                n0, n1, rows, innerBytes, srcPitch0, destPitch0, srcPitch1, destPitch1, srcPitchBytes, destPitchBytes,
+                AllocatorImpl.Stream.Handle);
+            MarkDeviceModified();
+            return true;
+        }
+
         internal void SynchronizeDeviceWork()
         {
             ThrowIfDisposed();

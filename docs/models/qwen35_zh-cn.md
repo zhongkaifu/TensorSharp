@@ -6,7 +6,7 @@
 |---|---|
 | 提供方 | 阿里巴巴 |
 | GGUF 架构标识 | `qwen35`、`qwen35moe`、`qwen3next` |
-| 模型类 | [`Qwen35Model`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.cs)（旧单序列路径）+ partial [`Qwen35Model.GatedDeltaNet.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.GatedDeltaNet.cs) + [`Qwen35Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs)（`IBatchedPagedModel`） |
+| 模型类 | 共享解码运行时上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs)；`--backend cuda` 上的稠密 NVFP4 由 [`Qwen35CudaModel`](../../TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs) 执行 |
 | 视觉编码器 | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | 图像处理器 | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
 | 示例模型 | Qwen3.5-9B（dense hybrid）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE 系列）、Qwen3.6-27B / Qwen3.8-27B（dense）；另有 [Bonsai2 27B](bonsai2_zh-cn.md)（PRISM PQ2_0 / PTQ1_0） |
@@ -87,7 +87,7 @@ Qwen 3.5 / 3.6 系是阿里第一个「混合」Qwen 系列，也是 TensorSharp
 - **Sigmoid-gated FullAttention。** Q 投影输出行数翻倍（`2 × numHeads × headDim`）；后半 deinterleave 后作为 sigmoid gate，在输出投影之前与 attention 输出相乘。
 - **动态分辨率视觉。** 图像走 `Qwen35VisionEncoder`，一个支持任意分辨率的 2D-RoPE ViT，通过 patch embedding + spatial merger 完成 tokenization。
 
-三种 GGUF 架构标识（`qwen35`、`qwen35moe`、`qwen3next`）共用同一个 `Qwen35Model`。MoE 变体额外启用 § 8 / § 9 描述的融合 MoE kernel。
+三种 GGUF 架构标识（`qwen35`、`qwen35moe`、`qwen3next`）共用同一个 `Qwen35RuntimeModel`（§ 7）；MoE 变体在其 FFN 中加入路由专家。
 
 ## 2. 模型架构
 
@@ -263,7 +263,7 @@ rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分�
 ```
 
 即 SGLang 的 `mrope_position_delta`（decode 位置为 `delta - 1 + seq_len`）。delta 按序列保存
-（`Qwen35Model.RopePositions.cs`）：
+（[`Qwen35RopePositions`](../../TensorSharp.Models/Models/Qwen35/Qwen35RopePositions.cs)）：
 
 - **在任何内核运行之前确定。** `BeginRopePositions` 从 prefill 分块暂存的位置表取得它；从 KV 下标
   0 开始且没有位置表的前向会开启新历史（delta 为 0）；其他前向沿用当前序列的 delta。若一个分块的
@@ -443,174 +443,34 @@ output.weight
 
 `FuseAttentionProjectionWeights()` 在三个 GGUF 张量量化类型相同时，把每层的 Q+K+V 融合为 `attn_qkv.weight`；混合类型的 importance-matrix / UD 量化投影保持分开，避免展开成数 GB 的 FP32。`FuseRecurrentInputWeights()` 把 GatedDeltaNet 的五路递归投影（`attn_qkv`、`attn_gate`、`ssm_beta`、`ssm_alpha`、加一个空槽）融合为 `ssm_in_proj.weight`。`FuseGateUpWeights()` 融合 dense FFN 的 gate 与 up。
 
-## 7. TensorSharp 实现走读
+## 7. TensorSharp 实现
 
-构造函数：
+所有加载都经过 [`Qwen35Architecture`](../../TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs)：
 
-1. `ParseBaseConfig()`。
-2. `ParseGdnConfig(arch)` 读取 SSM 维度（`_ssmDInner`、`_ssmDState`、`_ssmNGroup`、`_ssmDtRank`、`_convKernel`）。
-3. `_fullAttentionInterval` 与每层 `_isRecurrent[]`。
-4. `_mropeSections`、`_ropeDimCount`。
-5. MoE 配置（`_numExperts`、`_numExpertsUsed`、`_expertFfnLength`、`_sharedExpertFfnLength`）。
-6. `ParseTokenizer()`、`LoadWeights()`。
-7. `FuseAttentionProjectionWeights()`、`FuseRecurrentInputWeights()`、`FuseGateUpWeights()`。
-8. `DetectMoeLayers()` 遍历每个 block，设置 `_isMoeLayer[l]`、`_hasSharedExperts[l]`、`_hasSharedExpertGate[l]`。
-9. `BuildLayerKeys()` 预计算热路径用到的全部权重名（`attn_norm`、`attn_qkv`、`attn_q_norm`、`attn_k_norm`、`attn_output`、`ffn_gate_up`、`ffn_down`、`ffn_gate_inp`、`ffn_gate_up_exps[e]`、`ffn_down_exps[e]`...）。
-10. `InitMoeBuffers()` 预分配 router / expert 指针数组、MoE 工作 tensor、批量 MoE kernel 用的 `IntPtr[]`。
-11. `PrepareCudaQuantizedWeightsForInference()`。
-12. `InitCaches(initialCacheLength, maxContextLength)` 为 FullAttention 层分配 KV cache，对 recurrent 状态清零。
-13. `PrecomputeRoPE()`、`InitGDNBuffers()`、`CacheRecurrentWeights()`。
+| 加载 | 由谁执行 |
+|---|---|
+| `--backend cuda`、单 GPU、稠密 NVFP4 检查点、没有 `--tp` / `--layer-split` / 主机专家 | [`Qwen35CudaModel`](../../TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs)，直连 CUDA 引擎（`TS_Q35_NATIVE=0` 让它让位） |
+| 其余全部：每个后端（`cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`mlx`、`cuda`）、单设备、`--tp`、`--layer-split`、二者混合、多节点流水线、主机专家 | 运行在[共享解码运行时](../design/unified-execution.md)上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) |
 
-`Forward(int[] tokens)` 区分 prefill（`seqLen > 1`）与 decode（`seqLen == 1`），把每层路由到下列任一路径：
+本家族自己的模型类（`Qwen35Model`，及其融合整模型 GGML 图、槽位稳定 arena、常驻验证图与原生内核）已于 2026-11 删除；它服务过的每种放置都由运行时接管。
 
-- 融合整模型 GGML 图，用于受支持的稠密单设备 GPU prefill 与 decode。在 Metal 上，这是 27B 稠密 Qwen 3.6 模型的默认路径。
-- 融合 per-layer attention decode（`TryFusedAttnLayerDecode`），在任意已缓存序列长度下启用。
-- 融合 prefill attention（`FusedPrefillAttention`），用于 GGML 后端上的多 token prefill。
-- 融合输出投影 + FFN（`FusedOutProjFFN`），用于 attention 与 recurrent 层带 dense FFN 的情况。
-- 融合输出投影 + post-norm + router（`FusedOutProjNormRouter`），用于 recurrent 层接入 MoE。
-- 批量 MoE（`MoEExpertsSwiGLUResidual`），用于 MoE FFN 的 decode。
-- 否则走标准托管 C# 路径。
+`Qwen35RuntimeModel` 是本家族在运行时上的配方：
 
-## 8. Prefill 优化
+- **带门控的注意力。** `attn_q` 按头输出 `[q_h | gate_h]`；逐头 Q/K RMSNorm 后接部分 NeoX 旋转（图像之后用 M-RoPE 分段），注意力输出先乘 `sigmoid(gate)` 再进 `attn_output`。
+- **Gated DeltaNet 作为递归混合层。** 输入投影（`attn_qkv`、`attn_gate`、`ssm_beta`、`ssm_alpha`）在量化类型一致时打包为一次乘积；随后是 `ssm_conv1d`、q/k L2 归一化、delta 规则（GGML 后端用 ggml 的 `ggml_gated_delta_net`，直连 CUDA、MLX 与托管 CPU 用运行时自己的内核）、带 `silu(z)` 的门控 RMSNorm 与 `ssm_out`。卷积窗口与 delta 状态按序列槽位保存（`--tp` 下按 rank 保存）。
+- **FFN。** 稠密 SwiGLU（类型一致时 gate/up 融合），或带共享专家及其 sigmoid 门的路由专家。
+- **图像。** [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) 编码图块，在图像区间注入行，之后文本位置遵循压缩后的 M-RoPE delta（[`Qwen35RopePositions`](../../TensorSharp.Models/Models/Qwen35/Qwen35RopePositions.cs)）。
+- **检查点变体。** Bonsai2 的 PRISM 旋转在 GGML 后端运行（图构建器旋转每个被旋转乘积的输入；其他后端与 `--tp` 拒绝加载）。NVFP4 旁路缩放乘到各自投影上，路由专家上的除外（运行时拒绝）。
 
-### 整模型融合 prefill
+每一步都降为一张图：GGML 后端上是整次前向的 GGML 图（decode 步以新输入重放上一步的图），直连 CUDA、MLX 与托管 CPU 上是张量执行器的程序。[`Fixtures/Qwen35Legacy`](../../InferenceWeb.Tests/Fixtures/Qwen35Legacy/README.md) 中的黄金 logits 保存了被删实现的输出，`Qwen35RuntimeTests` 让运行时在各后端的舍入范围内与之一致。
 
-在受支持的稠密 GGML GPU 模型上，prefill 通过 `TSGgml_Qwen35ModelVerifyOwned` 派发：一张图计算全部 FullAttention 与 GatedDeltaNet 层、最终 RMSNorm 以及 LM head。中间激活常驻设备，混合量化的 Q/K/V 投影保持原生量化表示，logits 直接拷贝到托管输出缓冲。不受支持的布局继续走下面的逐层路径。
+## 8. Prefill
 
-### 融合 prefill attention（`FusedPrefillAttention`）
+一个提示分块就是一张覆盖所有层的图。全注意力层按下标写入 K/V 行并做因果注意力（后端对该头宽有内核时用 flash attention）；递归层在分块上运行分块 delta 规则。提示分块默认 2,048 行（`TS_PREFILL_CHUNK`）。带图像的提示先运行视觉编码器并注入其行。
 
-单张 GGML 图完成：
+## 9. Decode 与后端说明
 
-1. `Q × K^T`（带 scale），处理 GQA head 广播。
-2. 因果掩码（下三角，连续 prefill 时带 `maskStartPos` 偏移）。
-3. Softmax。
-4. Scores × V → attention 输出。
-
-替代每 attention 层 ~5 次 C# 到 GGML 往返。同时支持初始 prefill（KV cache 为空）与连续 prefill（已存有上一轮 KV）。`inputFormat` 参数支持 `[seqLen, numHeads, headDim]` 与 `[numHeads, seqLen, headDim]` 两种布局。
-
-### 融合输出投影 + FFN（`FusedOutProjFFN`）
-
-对于 FullAttention 与 GatedDeltaNet 中带 dense FFN 的层，单张 GGML 图完成：output 投影 + residual add + post-attention RMSNorm + ffn_gate_up matmul + SiLU + ffn_down matmul + residual。两次 GPU 往返合并为一次。
-
-### 并行化 Q / gate deinterleave
-
-FullAttention prefill 中 Q + sigmoid-gate 的 deinterleave 走 `Parallel.For` 跨 token 并行。每个 token 的 deinterleave 互不依赖，因此长 prompt 下随 CPU 核数线性扩展。
-
-### 原地 QK RMSNorm
-
-`ApplyPerHeadRMSNorm()` 通过 `View(seqLen * numHeads, headDim)` 复用同一片内存做 RMSNorm。RMSNorm 对行序无关，所以这种 reshape 对 Q、K 都安全。每层每个 Q/K 省一次 tensor 分配 + `Ops.CopyTo`。
-
-### 融合 QK-Norm + RoPE（direct CUDA）
-
-在 direct `cuda` 后端上，纯文本 prefill 路径把 per-head QK RMSNorm 与 NeoX RoPE
-融合为一个 CUDA kernel（`ts_qk_norm_rope_neox_f32`）。默认开启；设
-`TS_FUSED_QKNORM_ROPE=0` 可回退到独立的 Norm + RoPE 算子（多模态 MRoPE 与非
-CUDA 后端始终走独立路径）。
-
-### RoPE 位置张量缓存
-
-`_cachedRoPEPosQ` / `_cachedRoPEPosK` 仅在 `(seqLen, startPos)` 变化时重建，跨所有 attention 层复用。
-
-### 基于 GEMM 的视觉 patch embedding
-
-`Qwen35VisionEncoder` 把 patch embedding 重写为并行 im2col + matmul，把单线程标量五重嵌套循环替换为 GPU 加速 matmul。配合融合视觉 block 显著加速多 tile 图像路径。
-
-### 融合视觉编码器 block
-
-- **`FusedVisionAttention`**：LayerNorm + QKV 投影 + bias + 2D RoPE + scaled dot-product attention + 输出投影 + bias + residual 合并为一次 GGML 图调度（~8 op → 1）。
-- **`FusedVisionMLP`**：LayerNorm + up 投影 + bias + GELU + down 投影 + bias + residual 合并为一次 GGML 图调度（7 op → 1）。
-
-合计每个视觉 block 从 ~15 次 GPU 往返降到 2 次。
-
-### 跨层缓存与并行
-
-- spatial merge 中 `ReorderToBlockOrder` 对 block 行做 `Parallel.For`。
-- GPU 友好 QKV split：GPU 后端用 `Narrow` + `NewContiguous` 让数据保持在设备上；CPU 用并行 `Buffer.MemoryCopy` 一次扫完成 Q/K/V 拆分。
-
-### 分块并行 GatedDeltaNet recurrent prefill
-
-prefill 长度不小于 `GDN_CHUNK_PREFILL_MIN_SEQ_LEN`（默认 ggml_cuda 为 2，其他后端为 6）时，GGML 后端上的 per-token 递归循环会被一次融合的分块 SSM 扫描替代（C# 端 `GatedDeltaNetChunkedPrefill` → `GgmlBasicOps.GatedDeltaNetChunked`，原生端 `ggml_ops_gated_delta_net.cpp` 中的 `TSGgml_GatedDeltaNetChunkedF32`）。整体思路与 Mamba 的 parallel-scan kernel 相同：
-
-1. **CPU 准备阶段（按 token 并行）**：每通道 1D 卷积 + SiLU + Q/K/V/Z/α/β 打包融合在同一次 `Parallel.ForEach` 里，每个工作线程持有自己的 SiLU scratch（`ApplySiLUInPlaceScratch`）。同一次扫描里更新 conv 环状状态的最后 `convKernel - 1` 行，保证下一层看到正确的 conv state。
-2. **CPU 端预先计算 gate / β-sigmoid**：极小的 `[seqLen, H]` 张量上的 `softplus(α + dt_bias)·a_log` 与 `sigmoid(β)` 直接走 `TensorPrimitives.Sigmoid` 在 CPU 完成。本来在 GPU 上跑的 4 个 op 因此被吃掉，省去两个 per-layer 常量上传。
-3. **一次融合 GGML 图调度（`GatedDeltaNetChunked`）**：整个 delta-net 块（Q/K L2-norm、scale、β 乘、分块三角解 `(I − decay·k·kᵀ)⁻¹·decay·k·kᵀ` attention、跨 chunk 递归状态传播、RMSNorm、`silu(z)` 门控）跑在一张 Metal/CUDA 图上。该图按 `(T, H, D, chunkSize, eps)` 维度只构建一次，缓存在 `g_gdn_chunked_cache`；后续调用只用 `ggml_backend_tensor_set` 重新绑定输入。`ggml_solve_tri` 在 head + chunk 维度并行求解每个 chunk 的 `(I − attn_lower)·X = attn_init`。
-4. **跨 chunk 仍然顺序**：第 `c+1` 个 chunk 的递归状态依赖第 `c` 个 chunk 的输出，但循环长度只有 `nC = ceil(T/64)`，串行深度从 `O(T)` 降到 `O(T/64)`，与 Mamba parallel-scan kernel 的渐进 span 一致。
-
-可调环境变量：
-
-- `GDN_CHUNK_PREFILL_MIN_SEQ_LEN=N` 覆盖阈值（默认：ggml_cuda 上为 2，其他后端为 6）。在 CUDA 上逐 token 路径每层的主机/设备同步开销远大于 64 padding 浪费，chunked 内核对所有多 token 批次都更快；在 Qwen3.6-27B IQ2_XXS 上实测 MTP 投机验证解码从 217 ms/token 降到 174 ms/token。单 token 解码仍走逐 token 路径。
-- `GDN_VERIFY_CHUNKED=1` 在递归状态快照上跑 chunked 路径，恢复快照后再跑 per-token 路径，统计两条路径在 gated 输出与递归状态上的最大绝对 / 相对差。下游使用 per-token 结果，所以即使 chunked kernel 有 bug 也不会污染后续层。`PrintGdnTimingStats` 会打印验证调用次数与最大差值。
-
-在 Apple Metal（M 系列）上、KV cache f16、每个配置 3 次 run，对 Qwen3.6-35B-A3B（UD-IQ2_XXS，30 个 GDN 层 + MoE FFN）实测：
-
-| prefill tokens | chunked ms / call | per-token ms / call | GDN 块加速 | 总 prefill 加速 | 采样 token 一致 |
-|---:|---:|---:|---:|---:|:---:|
-|  128 |   3.77 |   7.32 | **1.94×** | 1.03× | ✓ |
-|  512 |  12.91 |  29.98 | **2.32×** | 1.09× | ✓ |
-| 2048 |  49.66 | 118.88 | **2.39×** | 1.11× | ✓ |
-
-`GDN_VERIFY_CHUNKED=1` 在三个 prefill 长度上分别报告 max output `|Δ|` ≈ 3 × 10⁻³、max state `|Δ|` ≈ 1 × 10⁻²，warnings 全部为 0（warn 阈值是绝对 5 × 10⁻³ / 相对 5 × 10⁻²）。这是跨 30 层、对 256–2048 个 token 步乘加结果在不同求和顺序下（Metal MM 累加 vs 标量 CPU）的 FP32 噪声底，属正常范围。所有长度下两条路径的最高概率 token 完全一致。
-
-## 9. Decode 优化
-
-### 常驻整模型 Metal decode
-
-`TSGgml_Qwen35ModelDecode` 跨 token 保留一张完整的逐序列 decode 图，包含全部 64 个 transformer 层、最终 RMSNorm 与 LM head；Metal 路径还能直接从量化 token embedding 表做 `GET_ROWS`。按 64 token 补齐的注意力桶让图拓扑保持稳定，可移动的 `CPY` 目标无需 scatter kernel 即可追加 K/V，异步提交把图执行与 logits 回读合并到一次同步之后。
-
-GatedDeltaNet K=1 的输出布局为 `[attention output | recurrent state]`。在单设备 Metal 上，托管状态视图与原生结果共用同一块底层缓冲，因此 48 个递归层原地更新状态，而不是每层各拷贝 3 MiB。原生侧在省略任何拷贝之前，会校验后端、指针偏移、对齐与精确的张量几何。
-
-### 融合 per-layer attention decode（`Qwen35AttentionLayerDecode`）
-
-单张 GGML 图完成整个 FullAttention 块：
-
-1. RMSNorm(input) * `attn_norm.weight`。
-2. 融合 QKV matmul → `[Q+gate (2*qDim), K (kvDim), V (kvDim)]`。
-3. strided view + 连续拷贝完成 Q、gate、K、V 拆分。
-4. per-head RMSNorm(Q) * `attn_q_norm.weight`，per-head RMSNorm(K) * `attn_k_norm.weight`。
-5. 当前 `position` 上 NeoX 风格 RoPE 旋转 Q、K。
-6. 通过 `ggml_cpy` view 把新 K、V 写回持久化 KV cache。
-7. `ggml_flash_attn_ext` 在已填充 KV cache 窗口上跑（处理 GQA 广播）。
-8. `attn_out *= sigmoid(gate)`。
-9. 输出投影 + residual add → 通过 host 指针写回更新后的 hidden state。
-
-替代了 1 次独立 `FusedRmsNormMatMulQuant` + ~6 次 CPU 端小算子 + 1 次独立 `FusedMatMulQuantAdd`，合并为一次融合调度，且在任意上下文长度下启用：模型其余部分都在设备上运行后，GPU flash-attn 的启动开销即使在短上下文也能摊平（omlx 与 vLLM 同样无条件调用 `mx.fast.scaled_dot_product_attention`）。fused kernel 拒绝的情况（例如图像之后的序列，其 M-RoPE delta 不由该 kernel 处理）仍走 `FusedRmsNormMatMulQuant` + CPU-SIMD attention + `FusedMatMulQuantAdd` 路径。
-
-### 融合输出投影 + norm + router（MoE recurrent decode）
-
-GatedDeltaNet 层后接 MoE FFN 的 decode 中，`FusedOutProjNormRouter` 把 GDN 输出投影、residual add、post-attention RMSNorm 与 MoE router 投影合并为一次 GGML 图调度（3 op → 1）。预先算好的 router logits 直接喂给 `TryMoEResidualDecodeWithRouter()`，每层 MoE 不再单独发 router。
-
-### 批量 GPU MoE（`MoEExpertsSwiGLUResidual`）
-
-GGML 后端上 `qwen35moe` / `qwen3next` 的 decode 中，每层 MoE expert 计算合并为一次 `MoEExpertsSwiGLUResidual()`：
-
-1. 全部被选 routed expert：`SwiGLU(hidden × gate_up_exps[e]) × down_exps[e]`，按 router 概率加权。
-2. 可选 shared expert：`SwiGLU(hidden × gate_up_shexp) × down_shexp`。
-3. 把 residual 加回流动 hidden state。
-
-预缓存的 `QuantizedWeight` 引用与 `IntPtr[]` 数组（`_routedExpertGateUpQW`、`_routedExpertDownQW`、`_sharedExpertGateUpQW`、`_sharedExpertDownQW`，以及对应的 `*Ptrs` 数组）让热 decode 循环没有字典查询、没有分配。
-
-### 预分配的 GDN decode 缓冲
-
-在 `InitGDNBuffers()` 一次性分配：
-
-| Buffer | 形状 | 用途 |
-|---|---|---|
-| `_gdnConvOutT` | `[1, qkvDim]` | Conv1d 输出 + SiLU |
-| `_gdnKBuf` / `_gdnQBuf` | `[numVHeads, headKDim]` | 扩展 + L2 norm 后的 Q/K |
-| `_gdnVBuf` | `[numVHeads, headVDim]` | V split |
-| `_gdnKvMemBuf` | `[numVHeads, headVDim, 1]` | `state @ k` 中间结果 |
-| `_gdnCoreOutBuf` | `[numVHeads, headVDim, 1]` | `state @ q` 输出 |
-| `_gdnGatedOutT` | `[1, ssmDInner]` | 最终 gated 输出 |
-
-### 预分配的 FullAttention decode 缓冲
-
-| Buffer | 形状 | 用途 |
-|---|---|---|
-| `_attnDecodeQBuf` | `[1, numHeads * headDim]` | deinterleave 出来的 Q |
-| `_attnDecodeGBuf` | `[1, numHeads * headDim]` | deinterleave 出来的 gate |
-| `_attnDecodeOutBuf` | `[1, numHeads * headDim]` | attention 输出 |
-| `_attnDecodeQkvBuf` | `[1, qFullDim + 2*kvDim]` | 复用的融合 QKV 输出 |
-| `_ffnDecodeGateUpBuf` | `[1, 2 * intermediateSize]` | 复用的融合 gate+up 输出 |
+decode 每步对所有运行中的序列只跑一张图：每个序列的行读取自己槽位的 K/V 窗口与递归状态。GGML 后端上下一步就地改写位置、写入行与掩码后重放该图。ggml_metal 上 decode 行的递归原地更新其状态。
 
 ### Direct CUDA NVFP4 路线：输出层、验证 GEMM 与预填充 GEMM
 
@@ -664,182 +524,23 @@ M5 Pro（48 GB）实测：Qwen3.8-27B GGUF，DFlash2 Q4_K_M 草稿模型（`--sp
 
 ## 10. 内存与 KV cache 策略
 
-- **FullAttention 层**：标准 KV cache `[numKVHeads, maxSeqLen, headDim]` per layer。KV dtype 通过 `--kv-cache-dtype` 选 `f32` / `f16` / `q8_0` / `q4_0`。
-- **GatedDeltaNet 层**：`_convState[layer]` 是 `(convKernel - 1) * qkvDim` 的 float 数组（conv1d 滑动窗口），`_deltaStateTensor[layer]` 形如 `[numVHeads, headVDim, headKDim]`（SSM 隐状态）。
-- `ResetKVCache()` 同时清零两类缓存。
-- 初始 CUDA 缓存可以小于 `maxContextLength`，按需扩张（启动时打印）。
-- **整模型 decode 的 conv scratch**（`_fdConvScratch`）属于每个缓存（主缓存和每个按请求的 holder），随缓存
-  一起换入换出。只要当前激活的缓存还没有 scratch 就会分配（其 GDN 真值在 host 环形缓冲里，从那里重新
-  填充），而不只是在首次构建 decode 描述符时分配。以前，一个在那一刻之前从未 decode 过的缓存（模型最初的
-  主缓存，在先绑定某个 holder 时被保存到一旁）会保留空 scratch，恢复后第一次 decode 就在
-  `TryFullModelDecodeCore` 中抛出 `NullReferenceException`；在引擎上，这对应新加载模型的第一个调度步是并发
-  步、之后主缓存上又有一次单独 decode 的情形。arena 批处理 decode 对 scratch 为空的 holder 同样处理。
-  `Qwen35ConvScratchTests`（需要模型）覆盖这一点。
+- **全注意力层**：每个槽位一份 K/V cache，`[kv_heads, capacity, head_dim]`，类型由 `--kv-cache-dtype` 决定（`f32`、`f16`、`q8_0`、`q4_0`）。槽位从小容量开始，按需增长到上下文长度；在一步即将耗尽显存前，空闲的保留槽位会先交还其设备副本。
+- **递归层**：每个槽位保存卷积窗口 `(conv_kernel - 1) x qkv_dim` 与 delta 状态 `[v_heads, head_v_dim, head_k_dim]`。递归状态无法回退，因此槽位只能截断到自身长度或清零。
+- **文件映射权重**：后端能直接读取时（GGML CUDA、Metal、CPU、集成 GPU），量化张量绑定 GGUF 映射而不复制。
 
-### mmap 量化权重
+## 11. 连续批处理与前缀复用
 
-后端支持时（direct CUDA、GGML CUDA、Apple Silicon Metal、GGML CPU、集成显卡），加载器避免把量化 tensor 拷贝到新分配的 native 堆缓冲，而是通过 `MemoryMappedFile` + `QuantizedWeight.CreateExternalView` 直接绑定 GGUF 文件。结合 GGML 的 host-pointer buffer mapping，让 Metal command buffer 直接读 OS page cache 中的权重。`Qwen3.5-35B-A3B-IQ2_XXS`（~10 GB GGUF）在 M 系 Mac 上的常驻内存从 ~17 GB 降到 ~7 GB，且没有任何 per-token 拷贝。
+并发请求各用自己的槽位；一步把所有运行中请求的行合批（不同长度的提示分块与 decode 行一起）。radix 前缀缓存把一轮结束后保留的槽位用于同一会话的下一轮；共享前缀检查点（某一边界处 K/V 行与递归状态的副本）让新请求从公共前缀开始。由于状态无法回退，提示的自动检查点位于其末尾前一个 token，以便同一提示可以再次被服务。`Qwen35RuntimeTests` 检查合批槽位与单独运行一致、引擎在每种放置下的并发请求，以及检查点克隆与文件的精确续接。
 
-## 11. 批处理 / 分页前向（连续批处理）
+## 12. 投机解码
 
-Qwen 3.5 / 3.6 实现了 `IBatchedPagedModel.ForwardBatch`
-（[`Qwen35Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs)）
-并默认启用 —— 该路径支持 Qwen3.5 全部三种层类型（attention、GDN 递归、MoE），
-也是连续批处理多请求并发所必需的。`--no-continuous-batching` 会强制改走按序列 KV-swap 路径。
+运行时一次前向验证一整个草稿窗口，并保留窗口内每一行之后的递归状态，因此拒绝时直接提交被接受行的状态而无需重新前向（GGML 图保留逐行快照；逐算子路径保留窗口输入并重放被接受的前缀）。草稿器：
 
-Qwen 3.5/3.6 是混合架构（FullAttention + GatedDeltaNet 递归层），批处理移
-植需要同时管理**两种正交的缓存** —— 注意力层的分页 K/V，以及 GatedDeltaNet
-层独立的**每槽位递归状态池**：
+- **n-gram**（`--spec --spec-type ngram`），适用于 Qwen 3.5 家族的每个检查点。
+- **NextN / MTP**（Qwen 3.6、Qwen 3.8 27B，`--spec`）：内嵌的 NextN 块作为最后一个 stage 上的草稿层加载；单独成文件的 MTP 头用 `--draft-model` 加载。
+- **DFlash / DFlash2** 块草稿器（Qwen 3.8）：`--draft-model <drafter.gguf>`；草稿器读取主干捕获的隐藏行。
 
-### FullAttention 层 —— 分页 K/V
-
-- 每层分页缓冲，布局 `[numBlocks * blockSize * numKvHeads * headDim]`，
-  按需扩容。
-- 逐 token NeoX RoPE 通过 `Ops.RoPEEx` 派发，使用显式 positions 数组。
-- 每头 QK RMSNorm 通过 `View` 原地执行（与旧路径一致）。
-- Q 与 sigmoid gate 从融合的 `[2 × qDim ‖ kDim ‖ vDim]` Q 投影中按 token
-  反交错（与旧 forward 同样的布局，在批处理循环中逐 token 解开）。
-- 基于 `slotMapping` 的 K/V 写入到每层的分页缓冲。
-- 通过 `GgmlBasicOps.PagedAttentionForward`（驱动 `ggml_flash_attn_ext` 的
-  原生分页内核）按序列计算注意力。
-
-### GatedDeltaNet 层 —— 每槽位递归状态池
-
-递归状态是逐序列的，并在整个输入上演进。Phase 5c 引入了一个以每个序列的
-**主块 id**（与 vLLM 的 `state_indices_tensor` 对齐）为 key 的每槽位状态池：
-
-- `_q35GdnSlotConvBuf[layer][slot]` —— 每槽位 conv1d 环形缓冲
-  （`float[(convKernel - 1) * qkvDim]`）。
-- `_q35GdnSlotConvWriteIdx[layer][slot]` —— 每槽位环形写指针。
-- `_q35GdnSlotSsmTensor[layer][slot]` —— 每槽位 SSM 状态 Tensor，形如
-  `[numVHeads, headVDim, headKDim]`。
-- `_q35GdnSlotInit[layer][slot]` —— 初始化标志。
-
-槽位在首次访问时按需分配，引擎回收序列时释放。交换引用而不是把每个槽位的状态
-复制进 / 出 per-model scratch buffer，在每次 decode 步骤上**每个 GDN 层每个序列**
-节省了大约 **2 MB SSM tensor memcpy 加几十 KB conv memcpy**。随后每个序列的切片
-针对自己的槽位走模型的 GatedDeltaNet 步
-（[`Qwen35Model.GatedDeltaNet.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.GatedDeltaNet.cs)）。
-
-### 批处理路径下的多模态
-
-`SupportsBatchedMultimodal` 为 true：`ForwardBatch` 会按 batch 构建一张全局 MRoPE 位置表：每个序列的 MRoPE
-positions 从多模态注入器中取出，按批中全局偏移注入到批处理 hidden tensor
-中，并传给每层的 RoPE 调用。视觉嵌入按 per-layer 循环之前按行注入，与旧
-forward 一致。
-
-### 已验证的正确性与吞吐
-
-- 短 prompt 上与旧路径 100% 贪心一致
-  （[`Qwen35BatchedCorrectnessTests`](../../InferenceWeb.Tests/Qwen35BatchedCorrectnessTests.cs)）。
-- 在 Qwen 3.6-27B（Apple M4 Pro、GgmlMetal、进程内 legacy-vs-batched 切换）
-  上 **n=3 时达到 ~1.83× tps**。
-
-### CUDA 上带 K/IQ 量化 embedding 的并发 decode
-
-arena 融合 decode 路径支持 token embedding 表无法使用 CUDA `GET_ROWS` 的 GGUF，包括 `Qwen3.8-27B-UD-IQ3_XXS.gguf` 中的 Q2_K 表。TensorSharp 在 CPU 上只为每个请求收集当前 token 的 embedding 行，再把这些 F32 行上传到常驻的批量图中；QKV、递归输入 / 输出、FFN 与词表投影仍在 GPU 上批量执行。三个请求、hidden size 5120 时，embedding 数据量在 arena 补齐前为 60 KiB。
-
-这需要同时更新托管程序集并重新构建 `GgmlOps` 库（`TSGgml_Qwen35ArenaDecodeBatchedHidden`）。旧的库会得到明确的拒绝原因；CUDA 支持的 embedding 类型保留原来的原生入口。上游 ggml 源码未作修改。
-
-CUDA 图还会保留 RoPE 之前归一化后的 Q/K 张量。单独 decode 已经用一次 reshape 把这两步分开；如果没有同样的边界，arena 可能选中 CUDA 合并的 RMSNorm/乘法/RoPE kernel，从而与单独 decode 产生偏差。保留这两个中间张量会阻止该融合，同时保留普通的 RMSNorm/乘法融合、批量权重投影与 CUDA 图捕获。其他模型与 Metal 不受这个仅限 CUDA 的边界影响。数值一致性仍需针对每种模型 / 后端 / 缓存配置验证，并不是普遍的逐位保证。
-
-CUDA 注意力在同一张图中为每个 arena 槽位使用一个单请求注意力节点，每个 holder 的有效注意力窗口长度与单独 decode 一致。对更大的共享窗口做 mask 可能改变 CUDA 的归约划分并累积数值漂移，量化缓存尤其如此。窗口变化时图会重建，并刷新、恢复 KV 与递归状态；普通步骤保留已捕获的图。权重投影仍对整个批次一起计算。Metal 保留现有的批量注意力布局。
-
-调度器的拒绝警告只描述一个步骤。冷模型可能需要一次串行 decode 步来初始化权重描述符，正在扩容的缓存也可能暂时被单独服务。持续性的失败会在服务端日志中给出实际的托管 / 原生原因；成功的批量执行也会记录一次。关闭批量 decode 或使用不受支持的配置时，仍会选择原有的回退路径。
-
-用 [Qwen35 decode probe](../../eng/validation/Qwen35BatchedDecodeProbe/README.md) 做 teacher-forced 分布对比、显式原生启用、请求重新排序、不同缓存容量、串行续接以及成对吞吐测量。它报告原始 logit 误差、softmax KL 与 argmax 变化及其参照 margin，并按实际请求而不是补齐后的 GPU 通道计数。另用[双 reviewer HTTP probe](../../eng/validation/probe_qwen35_reviewers.py) 单独验证[子智能体](../multi_agent.md)回合（服务端对话路径上默认开启委派）：报告中提示词的委派顺序与最终答案；仅测 decode 的吞吐并不代表完整的 agent 回合。
-
-## 12. MTP / NextN 投机解码（Qwen 3.6）
-
-Qwen 3.6 的 GGUF 可以自带一个 **NextN / 多 token 预测（MTP）草稿块**，两个宿主都会
-用它为单序列（无并发）请求做无损投机解码。在公开的转换中，只有
-[unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
-保留了该块（见[下载](#下载)）；不含该块的 GGUF 会在打印一次警告后走标准 decode。源码：
-[`Qwen35Model.Speculative.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.Speculative.cs)，
-由共享的
-[`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
-起草 / 验证 / 回滚核心驱动——它是可插拔的 `--spec-type` 层里的 `draft-head` 算法，
-而不是 Qwen 专属的循环。与 Gemma 4 不同，这里无需独立草稿 GGUF——草稿块就内嵌在主干
-文件中，因此 NextN 头无需 `--draft-model`（该参数只用于挂载 Qwen 3.8 的 DFlash2 草稿器，见 §12.4；
-若显式传入一个无法在启动模型上激活的草稿模型，会在启动时快速失败报错）。
-
-### 12.1 内嵌 NextN 块
-
-Qwen 3.6 GGUF 在主干栈之后带有一个额外解码块（`blk.N`，`N` == 主干层数），由
-`{arch}.nextn_predict_layers` 标记。它是一个标准的 Qwen 3.5 全注意力解码块（27B 上是
-dense FFN，35B-A3B 上是 MoE FFN），外加四个 NextN 专属张量：
-
-```
-nextn.eh_proj          [2*hidden, hidden]  对 concat(embedding, hidden) 的输入投影
-nextn.enorm            [hidden]            对 token embedding 的 RMS norm
-nextn.hnorm            [hidden]            对主干 hidden state 的 RMS norm
-nextn.shared_head_norm [hidden]            LM 头前的最终 norm
-```
-
-（`nextn.embed_tokens` / `nextn.shared_head_head` 可选，在标准 GGUF 中缺失，代码会回退到
-主干的 token embedding / LM 头。）MTP 步在位置 `p` 消费（token `x_p`、主干 hidden
-`h_{p-1}`），产出预测 `x_{p+1}` 的 logits 以及自己的 hidden state 用于串接后续草稿步——对应
-llama.cpp 的 `graph_mtp` 与 vLLM 的 `Qwen3_5MultiTokenPredictor`。
-
-### 12.2 递归状态回滚
-
-由于 Qwen 3.6 主干混合了 GatedDeltaNet 递归层与全注意力层，部分被拒的验证批次不能简单地
-截断 KV 缓存：GDN 递归状态无法就地回退。MTP 路径在每个验证批次前对 GDN 状态做快照
-（`_mtpGdnSnapshot`），部分接受时恢复。在 CUDA 后端上快照在设备侧完成，避免宿主端往返。
-
-### 12.3 收益与调优
-
-投机默认关闭，在 `TensorSharp.Cli` 或 `TensorSharp.Server` 上用 `--spec`（环境变量
-`TS_SPEC=1`）启用 ——
-[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)
-由两个宿主共用。只要加载的 GGUF 保留 NextN 块，它就会对
-单序列（无并发）请求启用；对不含该块的 GGUF，引擎会记录一次投机不可用的警告，然后走标准 decode。
-`--spec-draft`（取值 1-64）限制草稿窗口，它同时还在加载期决定原生计算图缓存的大小，因此要和 `--spec`
-写在同一条命令行上。共享默认值为 `8`，但这种混合主干会把未显式设置的窗口收窄到 3（§12.5）；显式的
-`--spec-draft` 总是优先。`--spec-pmin`（逐 token 草稿头默认 `0.15`，即其 top-10 logits 上的
-top-1 概率；完全平坦的草稿得分为 0.10）是保留 token 所需的最低草稿置信度（`0` 表示从不设阈）。`--spec-type draft-head` 可以显式钉住这条
-路径；默认的 `auto` 已经能从 checkpoint 中把它选出来。在 `ggml_cuda` 上，GDN 分块
-prefill 内核也会加速投机验证：在 Qwen3.6-27B IQ2_XXS 上实测把 MTP 投机验证 decode 从
-217 ms/token 降到 174 ms/token（见 §8，`GDN_CHUNK_PREFILL_MIN_SEQ_LEN`）。完整参数列表
-以及另外三种算法见 [投机解码](../../FEATURES_zh-cn.md#投机解码) —— 其中 `--spec-type ngram`
-完全不需要训练好的权重，因此在不带草稿块的 Qwen 3.5 checkpoint 上照样能跑。
-
-**复用前缀之后。** `--spec` 不会关闭提示复用：默认的 radix 前缀缓存保持开启（只有 `--no-prefix-cache` 或 `TS_SCHED_PREFIX_CACHE=0` 会关闭它）。从复用前缀开始的序列（保留的对话轮次、启动时预热或从磁盘恢复的共享前缀）在这些位置上没有草稿 hidden 行，因此 NextN 头只在该空缺的末尾重启它自己的私有注意力缓存（`DraftHeadResumesAfterGap`），并保留绝对旋转位置；主干的 KV 与递归状态不受影响。第一次 decode 步会先捕获一行新的主干 hidden，然后才恢复起草，因此初期接受率可能低于完整重放草稿头前缀的情况。这适用于单独请求的默认 fused-verify 路径；通过关闭 fused verify 选中的分页投机路径仍需从位置 0 prefill。挂上 DFlash 草稿器（§12.4）时，它会取代 NextN 头，并通过自己的 KV 环跨越空缺。详见 [Arming after a reused KV prefix](../speculative_decoding.md#arming-after-a-reused-kv-prefix)。
-
-### 12.4 DFlash2 块草稿（Qwen 3.8）
-
-Qwen 3.8 还有另一个互不相关的草稿器：**DFlash2**，一个 5 层的块扩散模型，以独立 GGUF 发布（[z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF)，`general.architecture = dflash`）。NextN 块每次前向起草一个 token，DFlash2 一次提出一整块 7 个 token，读取的是主干自己的残差，而不只是最后的 hidden state。用 `--draft-model` 挂上它；指定该文件本身就是请求，无需 `--spec`。该草稿器与 NextN 块是二选一而不是叠加——挂上 DFlash 文件时它优先，加载器会明确打印这一点。
-
-算法、草稿器的 KV 环、融合图以及候选选择 lattice 都是共享代码（[`ModelBase.DFlash.cs`](../../TensorSharp.Models/Speculative/ModelBase.DFlash.cs)，[`speculative_decoding.md`](../speculative_decoding.md#dflash-and-dflash2)）。本模型只负责残差抽头：`SpecForward` 额外写出进入 `dflash.target_layers` 所列每一层（随附草稿器为 `[6, 20, 34, 48, 62]`）时的残差，每个 token 打包成一行 25600 宽。这在融合整模型 verify kernel 内完成——每个抽头层一次 `ggml_cpy` 写入 `[hidden, N]` 输出块——因此投机不会迫使模型走逐算子层循环（[`Qwen35Model.DFlash.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.DFlash.cs)）。
-
-**收益几乎完全取决于负载。** 在一台 RTX 3080 Laptop 上用 Qwen3.8-27B-UD-IQ3_XXS、贪心、两次取最佳实测：自由散文上普通 18.3 tok/s，DFlash2 为 20.9（1.14 倍），主干自带的 NextN 块为 19.1；在高度可预测的提示（"list the first 20 primes"）上普通 19.5，DFlash2 为 31.7（1.63 倍），`--spec-draft 7` 时为 34.8。默认窗口为 3（§12.5），只有接受率高时才值得用更宽的窗口——在散文上它会慢 40%。
-
-质量不受影响：在事实类提示上，DFlash2 的续写与普通续写逐字节一致，也与快照之前的回滚路径一致。
-
-### 12.5 递归状态快照（投机为何不再亏损）
-
-两种草稿器过去在这个主干上都是**净亏损**——DFlash2 为 15.5 tok/s、MTP 为 15.7，普通为 18.3——原因不在草稿器，而在**拒绝**的代价。§12.2 的 GDN 递归状态不能像 KV 缓存那样截断，于是部分被拒的 verify 要恢复 verify 之前的状态副本，再把已接受的前缀在全部 64 层上重新前向一遍：每次拒绝多一次整模型前向。无论是否有拒绝，状态每步还要穿过 PCIe 两次——上传 151 MB 进 verify 图，之后再下载 151 MB。
-
-融合 verify kernel 及其调用方的几处改动消除了这些开销：
-
-1. `ggml_gated_delta_net` 本就接受快照数 K 并输出最后 K 个逐 token 状态；第 *m* 行之后的 conv 状态是图中已有 `conv_input` 张量的一个窗口。verify 现在每行保留一个快照，回滚所需的状态永远不必重算——就是槽位 `N-1-accepted`。
-2. `TSGgml_Qwen35CommitStateSnapshotOwned` 完全在设备上把该槽位写入 live 状态。每张缓存的 verify 图都从同一块共享设备缓冲（`g_q35v_state_buf`）绑定 `*_state_in`，所以下一次 verify 无论形状如何都能看到这次写入，并因此跳过状态上传，正如这一步跳过了下载。
-3. verify 只**读取** live 切片（它写的是 `*_state_out` 与快照槽位），所以在 commit 覆盖之前，这些切片就是 verify 之前的状态——而 commit 只发生在回滚决策之后。因此 `SpecSnapshotRecurrentState` 不拷贝任何东西。
-4. 投机会话回退到的单行步（草稿器拒绝起草时）同样推迟下载。这种步的窗口后状态就是 `*_state_out` 切片，之后不再有决策依赖它，所以调用方立即 commit 槽位 -1。在此之前，每个这样的步都会打断设备状态链——下载 151 MB，下一次 verify 再上传一遍——在一次 MTP 运行中占 125 步中的 46 步。
-
-对 DFlash2 的 256 个散文 token：`rollbackMs` 从 3604 降到 0，`snapshotMs` 从 919 降到 69。推迟单行步的下载在此之上再带来 5-20%（成对运行：DFlash2 事实类 22.0 -> 27.1，MTP 散文 19.1 -> 21.4），而且这条路径更精确：设备上的 commit 是对图输出张量的原样拷贝，而 host 往返要经过一次解包与重新打包，因此在事实类提示上它与普通解码逐字节一致，host 路径则在最后几个 token 出现漂移。
-
-代价是显存——GDN 算子的输出在 48 个递归层上每个槽位多一个约 150 MB 的状态——这就是默认窗口是 3 而不是 8 的原因。`TS_Q35_VERIFY_SNAPSHOTS=0` 恢复“恢复并重新前向”路径（这是 `ggml_cuda` 上宽 verify 分歧这一未修复问题的规避手段，见 [speculative_decoding.md](../speculative_decoding.md)）；对于 kernel 不会持久化的任何形状，它也是自动回退。
-
-### 12.6 把 MTP 追赶合并进第一个草稿步
-
-llama.cpp 的 `draft-mtp` 在 `n_accepted + 1` 行上运行一次 MTP 块：一次既把已验证 token 重放过草稿头、又完成第一个草稿步。TensorSharp 过去把两者分成两次调用；由于一次草稿调用的开销大多是固定的——它自己的图、启动与回读，约 6 ms 里只有约 1 ms 是计算——这次额外调用是两个引擎在这个模型上最大的单项差异。
-
-`Qwen35Model.DraftCatchUpAndStep` 用一次覆盖所有行的 `TryFusedMtpBlock` 调用完成两件事。kernel 本就把 LM head 折叠在**最后** `n_logits` 行上，所以只要一行 logits 就恰好得到草稿需要的那一行；归一化后的 hidden 每行都会返回，最后一行串接下一步。这种合并是恒等变换而非近似：该块在自己的 KV 上是因果的，所以最后一行无论哪种方式都恰好看到这些重放行，输出逐字节一致，接受率不变。
-
-`DraftHeadSpeculator` 暂存 commit，并把它合并进下一次 `Propose`；当暂存的行不能一直延续到下一步的位置时，它会作为普通追赶单独执行。在 Qwen3.8-27B-UD-IQ3_XXS 上实测：`catchUpMs` 从 191 降到 0，256 token 时 +4.0%，散文上 +5.3%。
-
-剩余的逐步差异在 `MtpProjectInput`，即构建该块输入的 C# 前端（embedding、`enorm`、`hnorm`、concat、`eh_proj`）。在一次 256 token 运行中它耗时 462 ms，而融合 kernel 在 208 次调用中共 804 ms——每次 6.1 ms 的草稿调用中有 2.2 ms 花在这里——分摊在约六次独立的设备算子启动上，每次都会同步，因为 lazy-sync 路径只在 Metal 上存在。把它合并进融合 MTP 图是下一步工作。
+投机在单设备、`--tp`（按 rank 的图）以及多节点流水线（驱动节点运行最后一个 stage 并在那里起草）上都可用。`--spec-draft` 限制每步的草稿数，引擎的调速器在投机不划算时暂停它。
 
 ## 13. 输出解析器与聊天模板
 
@@ -854,39 +555,63 @@ llama.cpp 的 `draft-mtp` 在 `n_accepted + 1` 行上运行一次 MTP 块：一�
 
   在 Qwen3.8-27B UD-IQ3_XXS（Metal）上，预先写入思考的 issue 循环被模型继续下去，并在生成 32 行后被闭合，答案正确（`02:33`）；思考中途的替代停止 token 被闭合后，模型对 17 x 23 回答 `391`。
 
-## 13a. 张量并行
+## 13a. 多 GPU 放置
 
-Qwen 3.5/3.6 在 Direct `cuda` 后端以及 GGML CUDA / Vulkan 后端上都支持 `--tp N`。
-GGML 路径由四个部分构成：
+| 请求 | 实际运行 |
+|---|---|
+| `--tp N` | 执行器支持按 rank 运行时（`ggml_cuda`、直连 `cuda`）用按 rank 的图：每个 rank 持有自己的头、每个投影的分片与自己的递归状态；一个 rank 拥有一组 key 头及读取它们的 value 头，因此只需归约 `ssm_out` 与 FFN 的部分和。其他情况下每个 rank 的 Gated DeltaNet 块作为一张原生图运行（`TSGgml_Qwen35GdnLayerTP`），其余逐算子 |
+| `--layer-split P` | 整层 stage，每个 stage 在其设备上一张图 |
+| `--tp T --layer-split P` | 每个 stage 由 T 个 rank 组成 |
+| 多节点 `--layer-split` | 每个节点加载自己的 stage（可以是各自大小的 `--tp` 组）；投机在驱动节点上起草 |
+| `--n-cpu-moe N` / `--cpu-moe` | 这些层的路由专家在主机上 |
 
-- **按 rank 的打包 GatedDeltaNet 内核**（`TSGgml_Qwen35GdnLayerTP`）—— 每个 rank
-  一张 ggml 计算图，覆盖输入 RMSNorm、打包的列并行 in-projection、
-  `ggml_ssm_conv`、q/k L2 归一化与 head 平铺、`ggml_gated_delta_net`、门控
-  RMSNorm 以及 SiLU(z) 门。每个 rank 持有 V head 的块循环切片，因此循环路径无需
-  跨 rank 通信。
-- **常驻设备的循环状态** —— conv 窗口与 delta 状态只上传一次并原地更新；若要回
-  读，每层每 token 每 rank 就要付出约 1 MB 的代价。`ResetKVCache` 会丢弃设备副本。
-- **专家并行 MoE**（`Qwen35Model.TensorParallelGgmlMoE.cs`）—— 整个专家在各 rank
-  之间划分（每个 rank 256 选 128），因此每个 rank 每个投影仍只需一次批量
-  `ggml_mul_mat_id` 调度，而不是按 (token, 专家) 循环。shared expert 仍按
-  Megatron 方式切分，因为每个 token 都会用到它。
-- **列并行 LM head** —— 词表就是输出维度，因此每个 rank 拥有一段连续的行区间，
-  "gather" 只是两次写入 logits 缓冲的不相交半区，完全不需要集合通信。
+每种放置下并发请求都保持合批。`SharedRuntimeConformanceTests` 与 `Qwen35RuntimeTests` 在模拟设备上把张量并行、层切分及其混合与单设备对比；GPU 测试通道在两块真实设备上做同样的检查。
 
-在 2× RTX 2000 Ada 上实测（`--backend ggml_cuda --tp 2`）：单张 16 GB 卡装不下的
-Qwen3.5-35B-A3B UD-IQ4_XS 短提示 decode 为 20.4 tok/s（3 K 上下文时 12.1），
-23 / 512 / 2966 token 的 prefill 分别为 26.3 / 80.2 / 75.7 tok/s，显存占用
-9.4 + 8.0 GB。decode 时间分布：注意力 block 32%、MoE 专家 31%、GDN 15%、
-ssm_out + AllReduce 6%、router 6%、LM head 2.5%。在能装进单卡的 Qwen3.5-9B Q8_0
-上，使用设备 AllReduce 时 `--tp 2` 与单卡运行在 60 个贪心 token 内逐字节一致。
-完整细节见 [`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md)。
+## 14. 相对被删实现的现状
 
-## 14. 优化机会
+2026-11-12 测量，最新 `main`（`032fdf24`，`Qwen35Model`）对比运行时，两边使用相同 CLI 脚本（预热后每个提示跑两次："short" 55 token，"4K" 3.6K token，生成 128 token，greedy），两个构建交替运行。Prefill ms / decode tok/s：
 
-- **原生 GDN decode（回退路径）** —— 融合整模型路径已是原生实现，但逐算子
-  回退路径仍在托管 C# 中执行 GDN decode（带预分配缓冲与 `Ops.AddmmBatch`）。
-  把这条回退路径的递归更新移入原生 C / CUDA，可消除其剩余的托管开销。
-- **向量化 conv1d** —— `Conv1dStep` 是标量循环。SIMD 或原生向量化版本能给
-  decode 热路径带来几个百分点的提升。
-- **MoE prefill 批处理** —— MoE prefill 当前逐 token 迭代。批处理的 expert
-  prefill kernel（类比 decode 路径）能进一步加速 MoE 变体的长 prompt。
+| 放置 | 模型 | `main` | 运行时 |
+|---|---|---|---|
+| ggml_vulkan，RTX A5000 | Qwen3.5-0.8B Q8_0，short | 39-41 / 271-278 | 45-47 / 323-327 |
+| | 4K | 299-313 / 126-146 | 354-359 / 276-278 |
+| | Qwen3.5-9B Q8_0，short | 152-222 / 61 | 175-198 / 62 |
+| | 4K | 1,777-1,911 / 53-54 | 1,808-1,825 / 63 |
+| `--tp 2` ggml_cuda，2x A40（经主机传输） | Qwen3.5-9B Q8_0，short | 105-108 / 94-95 | 112-114 / 85-86 |
+| | 4K | 903-934 / 91 | 977-988 / 84 |
+| | Qwen3.6-35B-A3B UD-Q4_K_M，short | 127-130 / 107-112 | 164-176 / 106-108 |
+| | 4K | 950-979 / 105-106 | 900-917 / 104 |
+| `--tp 2` 直连 cuda，2x A40 | Qwen3.5-9B Q8_0，short | 351-376 / 23 | 239-310 / 43-45 |
+| | 4K | 14,923-15,171 / 17-18 | 6,354-7,413 / 43-45 |
+| 直连 cuda，RTX A5000（非 NVFP4） | Qwen3.5-0.8B Q8_0，short | 13 / 323-324 | 38-39 / 154-163 |
+| | 4K | 363 / 298 | 686-687 / 158-187 |
+| | Qwen3.5-9B Q8_0，short | 51 / 66 | 111-140 / 63 |
+| | 4K | 1,431-1,436 / 65 | 2,007-2,019 / 63 |
+| 托管 cpu，M5 Pro，64 token | Qwen3.5-0.8B Q8_0，short | 311-367 / 105-108 | 290-300 / 73-75 |
+
+运行时在 ggml_cuda、ggml_metal、ggml_cpu 与 MLX 单设备上的数据在这些路线迁移时已测量（[unified execution](../design/unified-execution.md)）。
+
+2026-11-13 对同一 `main` 重新测量，此时已完成以下改动：
+- 直连 CUDA 的 decode 步录制为一张 CUDA graph；
+- slot 按 256 个 cell 分配，ggml-cuda 的分组 query attention 得以生效；
+- 新 slot 的循环状态不再逐页清零；
+- 提示末尾的 checkpoint 在设备上复制各行。
+
+| 放置方式 | 模型 | `main` | 运行时 |
+|---|---|---|---|
+| 直连 cuda，RTX 2000 Ada（非 NVFP4） | Qwen3.5-0.8B Q8_0，short | 14 / 171 | 38-40 / 181 |
+| | 4K | 591 / 164 | 696 / 164 |
+| | Qwen3.5-9B Q8_0，short | 88 / 22.9 | 152-158 / 23.3 |
+| | 4K | 2,816 / 22.6 | 2,975 / 23.0 |
+| ggml_cuda，RTX A5000 | Qwen3.8-27B UD-IQ3_XXS，short | 391 / 36.0 | 152 / 36.3 |
+| | 3.6K 提示 + 512 token | 3,776-3,869 / 35.4-35.5 | 3,563-3,603 / 35.7-35.8 |
+| ggml_vulkan，RTX A5000 | Qwen3.8-27B UD-IQ3_XXS，short | 460 / 25.5 | 330 / 26.5 |
+| 托管 cpu，M5 Pro，128 token | Qwen3.5-0.8B Q8_0，short | 404-466 / 111-114 | 296-358 / 89-92 |
+
+尚未解决的差距：
+
+- **小检查点的直连 CUDA 提示**：`main` 回放已录制的提示 graph，运行时则从主机逐个启动内核（0.8B 的 61 行提示需 1,224 次启动）。此外每个提示都分两步运行，因为提示尾部的 checkpoint 取在末尾前一个 token（多一次权重读取：9B 上 47 ms）。decode 持平或领先。
+- **托管 CPU**：Qwen3.5-0.8B decode 落后约 20%；矩阵乘耗时相同，剩余开销在执行器的逐节点工作上。提示更快。
+- **Qwen3.5-9B 的 `--tp 2` decode**：落后 8-10%（35B MoE 持平）。LM head 整个在 rank 0 上运行，而 `main` 按词表切分。
+- **Qwen3.5-0.8B 的 ggml_vulkan 提示**：慢约 15%（decode 更快）。
+

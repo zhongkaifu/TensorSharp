@@ -140,7 +140,7 @@ def placement_evidence(log, model_id, profile):
             # Benchmark property is source-verified only for these three model
             # classes. Opaque native caches must provide their own diagnostics.
             match = re.fullmatch(r'\[agent-turn-bench\] effective managed KV storage dtype=(f32|f16|bf16|q8_0|q4_0) '
-                                 r'model_type=(?:Gemma4Model|Qwen35Model|GptOssModel)', line)
+                                 r'model_type=(?:Gemma4Model|Qwen35Model|Qwen35RuntimeModel|GptOssModel)', line)
         if match:
             kv_types.add(match[1].lower())
             evidence.append(line)

@@ -10,6 +10,9 @@ namespace TensorSharp.MLX
         private readonly object sync = new();
         private IntPtr buffer;
         private MlxNative.MlxArray deviceArray;
+        // The device contents as consecutive flat arrays (an op's packed result whose pieces are read
+        // separately): a view inside one part reads that part, anything else joins them first.
+        private (MlxNative.MlxArray Array, long Offset, long Length)[] parts;
         private int[] deviceShape;
         private bool hostDirty = true;
         private bool deviceDirty;
@@ -53,6 +56,140 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(deviceArray);
                 deviceArray = default;
             }
+            FreeParts();
+        }
+
+        private void FreeParts()
+        {
+            if (parts == null) return;
+            foreach (var part in parts) MlxNative.FreeArray(part.Array);
+            parts = null;
+        }
+
+        /// <summary>The parts as one array (the storage's device array from now on). Caller holds sync.</summary>
+        private void JoinParts()
+        {
+            if (parts == null) return;
+            MlxNative.MlxArray joined = MlxNative.Retain(parts[0].Array);
+            for (int i = 1; i < parts.Length; i++)
+            {
+                MlxNative.MlxArray next = MlxNative.ConcatenateAxis(joined, parts[i].Array, 0);
+                MlxNative.FreeArray(joined);
+                joined = next;
+            }
+            FreeParts();
+            if (deviceArray.IsValid) MlxNative.FreeArray(deviceArray);
+            deviceArray = joined;
+            deviceShape = new[] { (int)ElementCount };
+        }
+
+        /// <summary>The part holding elements [first, last] of a view, or -1.</summary>
+        private int PartOf(int[] shape, long[] strides, long offset)
+        {
+            long lo = offset, hi = offset;
+            for (int i = 0; i < shape.Length; i++)
+            {
+                if (shape[i] == 0) return -1;
+                long span = (shape[i] - 1L) * strides[i];
+                if (span < 0) lo += span; else hi += span;
+            }
+            for (int p = 0; p < parts.Length; p++)
+                if (lo >= parts[p].Offset && hi < parts[p].Offset + parts[p].Length) return p;
+            return -1;
+        }
+
+        /// <summary>A view of one part, or (the view crosses parts) of the joined array.</summary>
+        private bool TryPartView(int[] shape, long[] strides, long offset, out MlxNative.MlxArray view)
+        {
+            view = default;
+            lock (sync)
+            {
+                if (parts == null) return false;
+                int p = PartOf(shape, strides, offset);
+                if (p < 0)
+                {
+                    JoinParts();
+                    return false;
+                }
+                view = MlxNative.AsStrided(parts[p].Array, shape, strides, offset - parts[p].Offset);
+                return true;
+            }
+        }
+
+        /// <summary>Flat views (no copy) of elements [offset, offset + count): slices of the parts or of the
+        /// device array. The caller frees them.</summary>
+        internal MlxNative.MlxArray[] FlatRange(long offset, long count)
+        {
+            if (ElementCount > int.MaxValue) throw new NotSupportedException("MLX parts need storage under 2^31 elements.");
+            ValidateElementRange(offset, count);
+            lock (sync)
+            {
+                if (parts == null)
+                {
+                    EnsureDeviceCurrent(null);
+                    MlxNative.MlxArray flat = MlxNative.Reshape(deviceArray, new[] { (int)ElementCount });
+                    try { return new[] { MlxNative.Slice(flat, new[] { (int)offset }, new[] { (int)(offset + count) }, new[] { 1 }) }; }
+                    finally { MlxNative.FreeArray(flat); }
+                }
+                var list = new List<MlxNative.MlxArray>();
+                long end = offset + count;
+                foreach (var part in parts)
+                {
+                    long from = Math.Max(offset, part.Offset), to = Math.Min(end, part.Offset + part.Length);
+                    if (from >= to) continue;
+                    list.Add(MlxNative.Slice(part.Array, new[] { (int)(from - part.Offset) }, new[] { (int)(to - part.Offset) }, new[] { 1 }));
+                }
+                return list.ToArray();
+            }
+        }
+
+        /// <summary>
+        /// Elements [offset, offset + n) become <paramref name="flat"/> (1-D arrays of n elements in all, taken
+        /// over) with no copy; the rest keeps its contents as views of what held them.
+        /// </summary>
+        internal void AdoptRange(long offset, MlxNative.MlxArray[] flat)
+        {
+            long n = 0;
+            foreach (var a in flat) n += MlxNative.GetArraySize(a);
+            MlxNative.MlxArray[] head = offset > 0 ? FlatRange(0, offset) : Array.Empty<MlxNative.MlxArray>();
+            MlxNative.MlxArray[] tail = offset + n < ElementCount ? FlatRange(offset + n, ElementCount - offset - n) : Array.Empty<MlxNative.MlxArray>();
+            var all = new MlxNative.MlxArray[head.Length + flat.Length + tail.Length];
+            head.CopyTo(all, 0);
+            flat.CopyTo(all, head.Length);
+            tail.CopyTo(all, head.Length + flat.Length);
+            ReplaceDeviceParts(all);
+        }
+
+        /// <summary>
+        /// Hold <paramref name="flatParts"/> (1-D arrays whose sizes add up to the storage) as the device
+        /// contents without concatenating them; the storage takes ownership of the arrays.
+        /// </summary>
+        internal void ReplaceDeviceParts(params MlxNative.MlxArray[] flatParts)
+        {
+            if (ElementCount > int.MaxValue) throw new NotSupportedException("MLX parts need storage under 2^31 elements.");
+            var list = new (MlxNative.MlxArray, long, long)[flatParts.Length];
+            long at = 0;
+            for (int i = 0; i < flatParts.Length; i++)
+            {
+                long n = MlxNative.GetArraySize(flatParts[i]);
+                list[i] = (flatParts[i], at, n);
+                at += n;
+            }
+            if (at != ElementCount)
+            {
+                foreach (var a in flatParts) MlxNative.FreeArray(a);
+                throw new ArgumentException($"MLX parts hold {at} elements; the storage has {ElementCount}.", nameof(flatParts));
+            }
+            lock (sync)
+            {
+                if (deviceArray.IsValid) MlxNative.FreeArray(deviceArray);
+                deviceArray = default;
+                FreeParts();
+                parts = list;
+                deviceShape = new[] { (int)ElementCount };
+                hostDirty = false;
+                deviceDirty = true;
+            }
         }
 
         public override string LocationDescription()
@@ -75,6 +212,7 @@ namespace TensorSharp.MLX
             lock (sync)
             {
                 EnsureHostBufferAllocated();
+                JoinParts();
                 if (!deviceDirty || !deviceArray.IsValid || ByteLength == 0)
                     return;
 
@@ -92,6 +230,8 @@ namespace TensorSharp.MLX
                 throw new ArgumentException("Tensor is not backed by this MLX storage.", nameof(tensor));
 
             int[] shape = ToIntArray(tensor.Sizes);
+            if (TryPartView(shape, ToLongArray(tensor.Strides), tensor.StorageOffset, out MlxNative.MlxArray partView))
+                return partView;
             int[] storageShape = tensor.ElementCount() == ElementCount ? shape : null;
             if (storageShape == null && MlxBasicOps.TryGetStridedBox(tensor, out int[] parent, out _, out _))
                 storageShape = parent;
@@ -103,6 +243,8 @@ namespace TensorSharp.MLX
         /// extra leading batch axis, say), so it reaches MLX as a view rather than a copy.</summary>
         internal MlxNative.MlxArray CreateArrayView(int[] shape, long[] strides, long offset)
         {
+            if (TryPartView(shape, strides, offset, out MlxNative.MlxArray partView))
+                return partView;
             EnsureDeviceCurrent(shape);
             return MlxNative.AsStrided(deviceArray, shape, strides, offset, ElementCount > int.MaxValue);
         }
@@ -139,6 +281,7 @@ namespace TensorSharp.MLX
             {
                 if (deviceArray.IsValid)
                     MlxNative.FreeArray(deviceArray);
+                FreeParts();
 
                 deviceArray = contiguous;
                 deviceShape = shape;
@@ -253,6 +396,7 @@ namespace TensorSharp.MLX
 
             lock (sync)
             {
+                JoinParts();
                 if (deviceArray.IsValid && !hostDirty)
                     return;
 

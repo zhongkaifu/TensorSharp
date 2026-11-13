@@ -91,48 +91,4 @@ public class UdQuantShardConfigTests
         Assert.True(GptOssModel.CanFuseAllQkvLayers(2, _ => null, _ => true));
     }
 
-    [Theory]
-    // 32-element blocks divide the 128-column V-head slice: gather source blocks.
-    [InlineData(GgmlTensorType.Q8_0, 128, nameof(Qwen35Model.SsmOutShardEncoding.SourceBlocks))]
-    [InlineData(GgmlTensorType.Q4_0, 128, nameof(Qwen35Model.SsmOutShardEncoding.SourceBlocks))]
-    [InlineData(GgmlTensorType.Q5_0, 128, nameof(Qwen35Model.SsmOutShardEncoding.SourceBlocks))]
-    // 256-element super-blocks do NOT divide 128: the old math produced
-    // blocksPerVHead = 0 and zero-byte shards. Must re-encode as Q8_0.
-    [InlineData(GgmlTensorType.Q4_K, 128, nameof(Qwen35Model.SsmOutShardEncoding.RequantQ8))]
-    [InlineData(GgmlTensorType.Q6_K, 128, nameof(Qwen35Model.SsmOutShardEncoding.RequantQ8))]
-    [InlineData(GgmlTensorType.IQ2_XXS, 128, nameof(Qwen35Model.SsmOutShardEncoding.RequantQ8))]
-    [InlineData(GgmlTensorType.IQ4_XS, 128, nameof(Qwen35Model.SsmOutShardEncoding.RequantQ8))]
-    // A head dim not divisible by 32 either can only be sharded in F32.
-    [InlineData(GgmlTensorType.Q4_K, 100, nameof(Qwen35Model.SsmOutShardEncoding.Float32))]
-    public void SsmOutShardEncoding_SelectsByBlockDivisibility(
-        GgmlTensorType type, int headVDim, string expected)
-    {
-        Assert.Equal(expected, Qwen35Model.SelectSsmOutShardEncoding(type, headVDim).ToString());
-    }
-
-    [Fact]
-    public void SsmOutShardEncoding_NeverProducesZeroByteShards()
-    {
-        // The property the preload actually depends on: whatever encoding is
-        // selected, the per-shard row size must be positive for the shapes the
-        // 9B UD mix ships (v_dim 4096 split across 2 ranks, headVDim 128).
-        foreach (GgmlTensorType t in new[]
-                 {
-                     GgmlTensorType.Q8_0, GgmlTensorType.Q4_K, GgmlTensorType.Q5_K,
-                     GgmlTensorType.Q6_K, GgmlTensorType.IQ2_XXS, GgmlTensorType.IQ3_XXS,
-                 })
-        {
-            var enc = Qwen35Model.SelectSsmOutShardEncoding(t, 128);
-            long ne0PerShard = 16 * 128; // 16 local V heads
-            long rowBytes = enc switch
-            {
-                Qwen35Model.SsmOutShardEncoding.SourceBlocks =>
-                    (ne0PerShard / GgufFile.GetBlockSize(t)) * GgufFile.GetTypeSize(t),
-                Qwen35Model.SsmOutShardEncoding.RequantQ8 =>
-                    (ne0PerShard / GgufFile.GetBlockSize(GgmlTensorType.Q8_0)) * GgufFile.GetTypeSize(GgmlTensorType.Q8_0),
-                _ => ne0PerShard * sizeof(float),
-            };
-            Assert.True(rowBytes > 0, $"{t}: shard row bytes must be positive, got {rowBytes}");
-        }
-    }
 }

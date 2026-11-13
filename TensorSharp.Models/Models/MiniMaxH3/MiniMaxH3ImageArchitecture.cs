@@ -20,9 +20,18 @@ namespace TensorSharp.Models.MiniMaxH3
             Aliases = new[] { MiniMaxH3ImageModel.ArchitectureId, "minimax_h3_image" },
             Factory = c => new MiniMaxH3ImageModel(c.GgufPath, c.Backend),
             DetectFromTensors = MiniMaxH3ImageModel.LooksLikeMiniMaxH3Image,
-            MultiGpu = MultiGpuMode.SingleDevice,
-            MultiGpuLimitation =
-                "minimax-h3-image has no tensor-parallel or layer-split path; it runs on one GPU and extra GPUs stay idle.",
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                Backends = new[] { BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda },
+                Autoregressive = false,
+                HasRoutedExperts = false,
+                ContinuousBatching = MechanismSupport.NotApplicable("generates images, not decode steps; requests are serialized by its pipeline"),
+                TensorParallel = MechanismSupport.None("minimax-h3-image has no tensor-parallel path; it runs on one GPU and extra GPUs stay idle."),
+                LayerSplit = MechanismSupport.None("minimax-h3-image has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
+                HybridParallel = MechanismSupport.None("minimax-h3-image has no multi-GPU placement to combine."),
+                ExpertOffload = MechanismSupport.NotApplicable("no routed experts"),
+            },
         };
     }
 }

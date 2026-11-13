@@ -63,7 +63,7 @@ string nativeName = OperatingSystem.IsWindows() ? "GgmlOps.dll" : OperatingSyste
 string nativePath = Path.Combine(AppContext.BaseDirectory, nativeName), nativeHash = Hash(nativePath);
 if (!nativeHash.Equals(Required("--native-sha256"), StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Unexpected app-local native library");
 Environment.SetEnvironmentVariable("MAX_CONTEXT", fixture.Context.ToString());
-string[] envKeys = ["MAX_CONTEXT", "KV_CACHE_DTYPE", "TS_CPU_MOE", "TS_N_CPU_MOE", "TS_CPU_MOE_THREADS", "TS_GGML_CPU_THREADS", "TS_SPEC", "TS_HOST_MOE_DECODE", "TS_HOST_MOE_DEVICE_MIN_BATCH", "TS_HOST_MOE_METAL_OVERLAP", "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE", "GGML_CUDA_DISABLE_GRAPHS", "TS_QWEN35_DEVICE_STATE_HANDOFF", "TS_Q35_DEVICE_MASK", "TS_HOST_MOE_TRACE_DIR", "TS_HOST_MOE_TRACE_CALLS", "TS_HOST_MOE_TRACE_START", "TS_GGUF_PREFAULT", "TS_HOST_MOE_EXPERT_CACHE_MB", "TS_Q4E_RETAINED_CACHE_MB"];
+string[] envKeys = ["MAX_CONTEXT", "KV_CACHE_DTYPE", "TS_CPU_MOE", "TS_N_CPU_MOE", "TS_CPU_MOE_THREADS", "TS_GGML_CPU_THREADS", "TS_SPEC", "TS_HOST_MOE_DECODE", "TS_HOST_MOE_DEVICE_MIN_BATCH", "TS_HOST_MOE_METAL_OVERLAP", "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE", "GGML_CUDA_DISABLE_GRAPHS", "TS_HOST_MOE_TRACE_DIR", "TS_HOST_MOE_TRACE_CALLS", "TS_HOST_MOE_TRACE_START", "TS_GGUF_PREFAULT"];
 var environment = envKeys.ToDictionary(k => k, Environment.GetEnvironmentVariable);
 KvCacheDtypeConfig.ConfigureFromEnvironment();
 MoeCpuOffloadConfig.ConfigureFromEnvironment();

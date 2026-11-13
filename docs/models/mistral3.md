@@ -6,7 +6,7 @@
 |---|---|
 | Provider | Mistral AI |
 | GGUF architecture key | `mistral3`; also `llama` for Mistral Small 3.x files converted before llama.cpp had `mistral3` (see [llama-labelled files](#llama-labelled-files)) |
-| Source class | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) (single-sequence) + [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs) (`IBatchedPagedModel`) |
+| Source class | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) (YaRN rotary, vision) on the shared decoder runtime [`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) (forwards, `IBatchedPagedModel`, TP / layer split / hybrid) |
 | Vision encoder | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs) (Pixtral) |
 | Image processor | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
 | Example models | Mistral-Small-3.1-24B-Instruct, Ministral-3-14B-Instruct |
@@ -162,7 +162,7 @@ head.
         ┌──── × NumLayers ──────────────────────────────┐
         │  RMSNorm(attn_norm)                            │
         │  Q, K, V projections (or fused QKV)            │
-        │  RoPE_GPT-J(Q, K) with YaRN-corrected freqs    │
+        │  RoPE_GPT-J(Q, K), ggml YaRN (rope_yarn)       │
         │  Q ← Q * (1 + β · log(1 + ⌊pos / origCtx⌋))    │
         │  attention(Q, KCache, VCache) (full causal)    │
         │  attn_output ─► residual                        │
@@ -233,25 +233,29 @@ hidden ─► narrow(seq_len-1) if prefill
 - **Pairing**: adjacent elements `(x[2i], x[2i+1])` are rotated together
   (GPT-J convention), as opposed to the `(x[i], x[i + halfDim])` pairing of
   NeoX.
-- **YaRN frequency correction**: when `mistral3.rope.scaling.type == "yarn"`
-  and `mistral3.rope.scaling.original_context_length > 0`,
-  `ApplyYarnFreqCorrection()` interpolates between extrapolated and
-  interpolated frequencies based on whether each frequency band is in the
-  "slow" or "fast" rotation range:
+- **YaRN**: when `mistral3.rope.scaling.type == "yarn"`, the rotary is ggml's
+  `rope_yarn` (`ggml_rope_ext` with the checkpoint's extrapolation factor,
+  `yarn_beta_fast` / `yarn_beta_slow` and original context): per rotated pair,
+  `theta = interp * (1 - ramp) + extrap * ramp`, where the ramp runs linearly
+  over the pair index between the two correction dims.
+- **Attention factor** (llama.cpp's `yarn_attn_factor`): ggml multiplies cos/sin
+  by `1 + 0.1 ln(factor)` whenever YaRN is on, so the runtime passes
+  `mscale(factor, m) / mscale(factor, m_all) / (1 + 0.1 ln(factor))`, with
+  `m_all` = `rope.scaling.yarn_log_multiplier` (or `mscale_all_dim`) and `m` =
+  `rope.scaling.mscale` (default 1). Ministral 3 ships `yarn_log_multiplier = 1`,
+  so its rotary keeps unit magnitude.
+- **One rotary for every path**: prompts, decode tokens and batches compute the
+  same function (`StandardDecoderModel.RotarySpec`); a single sequence's decode
+  token rotates on the host on the GGML backends and the managed CPU, where a
+  device dispatch costs more than the arithmetic, and through `Ops.RoPEEx`
+  elsewhere.
 
-  ```
-  lowFreqWavelen  = origCtx / betaSlow
-  highFreqWavelen = origCtx / betaFast
-  for each freq f:
-      wavelen = 2π / f
-      if wavelen < highFreqWavelen:        # high-freq band: extrapolate
-          f stays
-      elif wavelen > lowFreqWavelen:       # low-freq band: interpolate
-          f *= 1 / scale
-      else:                                # medium band: smooth interp
-          ramp = ...                       # linear ramp between the two
-          f = mix(f, f / scale, ramp)
-  ```
+  Before 2026-11-10 the prompt path left the `1 + 0.1 ln(16)` factor in (q and k
+  scaled by 1.28) while decode used Llama-3.1-style wavelength smoothing without
+  it, so prompt keys and decoded queries disagreed. Teacher-forced perplexity of
+  Ministral-3-3B Q4_K_M on four 512-token chunks of this repository's docs:
+  49.20 before, 42.91 after; llama.cpp `llama-perplexity` on the same chunks:
+  42.37.
 
 - **Position-dependent Q scaling**: when `_ropeOrigCtx > 0`,
   ```
@@ -311,8 +315,10 @@ land at the right positions in the prompt before `Forward()`.
 | `mistral3.rope.scaling.extrapolation_factor` | float32 | YaRN extrapolation factor (default 1.0) |
 | `mistral3.rope.scaling.yarn_beta_fast` | float32 | YaRN fast rotation threshold (default 32.0) |
 | `mistral3.rope.scaling.yarn_beta_slow` | float32 | YaRN slow rotation threshold (default 1.0) |
-| `mistral3.rope.scaling.mscale` | float32 | YaRN mscale (default 0) |
-| `mistral3.rope.scaling.mscale_all_dim` | float32 | YaRN mscale_all_dim (default 0) |
+| `mistral3.rope.scaling.yarn_log_multiplier` | float32 | YaRN `mscale_all_dim` as llama.cpp reads it (default 0 = absent) |
+| `mistral3.rope.scaling.mscale` | float32 | YaRN mscale (default 1 when absent) |
+| `mistral3.rope.scaling.mscale_all_dim` | float32 | YaRN mscale_all_dim, used when `yarn_log_multiplier` is absent |
+| `mistral3.rope.scaling.attn_factor` | float32 | Extra rotary magnitude factor (default 1.0) |
 
 For the Pixtral vision projector (`mmproj` GGUF), the standard
 `clip.vision.*` keys cover the encoder dims, plus `mm.*` keys for the
@@ -380,16 +386,14 @@ Constructor (`Mistral3Model(string ggufPath, BackendType backend)`):
 8. `PrecomputeConstants()` builds:
    - The per-layer weight name arrays — different shapes depending on
      whether QKV / gate-up are fused for that layer.
-   - The RoPE frequency table `_ropeFreqs[halfDim]`.
-   - YaRN-corrected frequencies via `ApplyYarnFreqCorrection()` when
-     `_ropeType == "yarn"` and `_ropeOrigCtx > 0`.
+   - The rotary (`RotarySpec`: GPT-J pairing, YaRN parameters and the
+     attention factor above).
 
 `Forward(int[] tokens)` runs the per-op managed loop:
 
 - Embedding lookup.
 - Optional vision injection at the positions of the expanded `[IMG]` rows.
-- For each layer: RMSNorm, QKV (fused or split), RoPE with YaRN-corrected
-  frequencies, optional position-dependent Q scaling, attention, output
+- For each layer: RMSNorm, QKV (fused or split), YaRN RoPE, optional position-dependent Q scaling, attention, output
   projection + residual, FFN, residual.
 - For prefill, the residual is narrowed to the last token before
   `output_norm` so the LM head matmul produces a single row.
@@ -400,8 +404,8 @@ Constructor (`Mistral3Model(string ggufPath, BackendType backend)`):
 - **Fused QKV and gate / up** cut the per-layer GEMM count.
 - **Last-row narrow** before `output_norm` so the LM head matmul only
   produces `[1, vocab]`.
-- **YaRN frequency table built once** at load time. The decode path uses
-  the same `_ropeFreqs[]` array.
+- **One rotary description** (`RotarySpec`) built once at load time; prompts,
+  decode and batches all compute ggml's YaRN rotary from it.
 - **Backend ops** dispatch through `Ops.RoPEEx` and `Ops.SiLUMul`,
   which run as native kernels on GGML / CUDA backends.
 
@@ -415,8 +419,9 @@ Adding either would shrink decode latency and TTFT.
   allocated in `PrecomputeConstants()` keep the hot loop allocation-free.
 - The `_layerQkvFused[]` flag picks the fused vs. split QKV path per layer
   without allocations.
-- Pre-allocated decode position arrays and YaRN-corrected `_ropeFreqs[]`
-  avoid recomputation per token.
+- A single sequence's decode token rotates on the host on the GGML backends
+  and the managed CPU (one device dispatch costs more than 2 x 64 rotations);
+  MLX and direct CUDA rotate on the device.
 - Quantized weights stay quantized in `_quantWeights`; matmul calls run
   through the backend's native quantized matmul.
 
@@ -434,7 +439,7 @@ Adding either would shrink decode latency and TTFT.
 ## 11. Batched / paged forward (continuous batching)
 
 Mistral 3 is the **reference implementation** of `IBatchedPagedModel.ForwardBatch`
-in TensorSharp ([`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)).
+in TensorSharp, now provided by the shared decoder runtime ([`StandardDecoderModel.Batched.cs`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.Batched.cs)).
 It runs through the shared continuous-batching engine (`InferenceEngine` +
 `ContinuousBatchScheduler` + `BatchExecutor`) described in
 [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
@@ -452,8 +457,8 @@ Key properties:
   `_layerQkvFused[layer]` to pick between the fused `attn_qkv.weight`
   matmul and the three independent `attn_q/k/v.weight` matmuls. Both paths
   batch across the entire token axis in a single GEMM per layer.
-- **Per-token YaRN RoPE.** The `_ropeFreqs[]` array built at load time is
-  applied through `Ops.RoPEEx` with an explicit `positions[]` array, and
+- **Per-token YaRN RoPE.** `Ops.RoPEEx` with an explicit `positions[]` array
+  and the model's `RotarySpec`, and
   per-token YaRN position-dependent Q scaling
   (`q *= 1 + beta * log(1 + floor(pos / orig_ctx))`) is performed inside
   the batched loop so each token in the batch picks its own scale factor.

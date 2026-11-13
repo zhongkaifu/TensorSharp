@@ -3814,6 +3814,38 @@ if (simd_id == 0) {
             });
         }
 
+        /// <summary>mlx_conv1d: input [N, L, C_in], weight [C_out, K, C_in / groups]: [N, L_out, C_out].</summary>
+        internal static MlxArray Conv1d(MlxArray input, MlxArray weight, int stride, int padding, int dilation, int groups)
+        {
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray result;
+                Check(mlx_conv1d(out result, input, weight, stride, padding, dilation, groups, DefaultStream()), "running MLX conv1d");
+                return result;
+            });
+        }
+
+        /// <summary>log(exp(a) + exp(b)), elementwise (b broadcasts).</summary>
+        internal static MlxArray LogAddExp(MlxArray a, MlxArray b)
+        {
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray result;
+                Check(mlx_logaddexp(out result, a, b, DefaultStream()), "running MLX logaddexp");
+                return result;
+            });
+        }
+
+        internal static MlxArray SumAxis(MlxArray array, int axis, bool keepDims)
+        {
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray result;
+                Check(mlx_sum_axis(out result, array, axis, keepDims, DefaultStream()), "summing MLX array");
+                return result;
+            });
+        }
+
         internal static MlxArray Contiguous(MlxArray array)
         {
             return MlxWorker.Shared.Invoke(() =>
@@ -8334,6 +8366,12 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         }
 
         private static MlxFastMetalKernel CreateFastMetalKernel(string name, string[] inputs, string[] outputs, string source, string header)
+            => CreateFastMetalKernel(name, inputs, outputs, source, header, ensureRowContiguous: true);
+
+        /// <summary>With <paramref name="ensureRowContiguous"/> false the kernel reads its inputs as they are
+        /// (strided views; its source indexes them through <c>name_strides</c>).</summary>
+        private static MlxFastMetalKernel CreateFastMetalKernel(string name, string[] inputs, string[] outputs, string source, string header,
+            bool ensureRowContiguous)
         {
             IntPtr namePtr = IntPtr.Zero;
             IntPtr sourcePtr = IntPtr.Zero;
@@ -8353,7 +8391,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                     outputVector,
                     sourcePtr,
                     headerPtr,
-                    true,
+                    ensureRowContiguous,
                     false);
             }
             finally
@@ -8464,9 +8502,9 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             // back from the GGUF file — observed as ~0.3 tok/s on a 25 GB
             // Mac running a 14 GB IQ4 model.
             //
-            // Default: wire up to ~min(physRam-2GB, physRam*0.85). macOS
-            // rejects oversized requests; we fall back to 75% then 50% on
-            // rejection. Opt-in override via TS_MLX_WIRED_LIMIT_MB=<N>.
+            // Default: DefaultMlxMemoryCeilingMb. macOS rejects oversized
+            // requests; we fall back to 75% then 50% on rejection. Override
+            // via TS_MLX_WIRED_LIMIT_MB=<N>.
             string value = Environment.GetEnvironmentVariable("TS_MLX_WIRED_LIMIT_MB");
             long limitMb;
             if (string.Equals(value, "0", StringComparison.Ordinal) ||
@@ -8480,9 +8518,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 long phys = GetPhysicalMemoryBytes();
                 if (phys <= 0)
                     return;
-                long physMb = phys / 1024 / 1024;
-                long reserve = Math.Max(2048, physMb / 8);
-                limitMb = Math.Max(physMb - reserve, physMb * 85 / 100);
+                limitMb = DefaultMlxMemoryCeilingMb(phys / 1024 / 1024);
             }
             else if (!long.TryParse(value, out limitMb) || limitMb <= 0)
             {
@@ -8518,6 +8554,16 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             }
         }
 
+        /// <summary>
+        /// What MLX may wire and allocate by default: 70% of the RAM, and at least min(8 GiB, a quarter of the RAM)
+        /// left to macOS. Wired memory is never paged or compressed, so a ceiling near the RAM hangs the machine
+        /// instead of failing an allocation: on a 48 GiB M5 Pro the previous default (the RAM less an eighth,
+        /// 43 GB) let two Qwen3.6-35B-A3B runs on MLX wire 49.1 of 51.5 GB, and watchdogd went 90 s without
+        /// a check-in (two kernel panics, 2026-11-11). 33.6 GiB there.
+        /// </summary>
+        internal static long DefaultMlxMemoryCeilingMb(long physMb)
+            => Math.Max(0, Math.Min(physMb * 70 / 100, physMb - Math.Min(8192, physMb / 4)));
+
         private static long GetPhysicalMemoryBytes()
         {
             try
@@ -8535,13 +8581,20 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
 
         private static void ConfigureMemoryLimit()
         {
-            // mlx_set_memory_limit bounds total active GPU allocations.
-            // Default unset (MLX picks its own). Useful on machines where we
-            // need a hard cap so other processes get RAM.
+            // mlx_set_memory_limit bounds total active GPU allocations: MLX frees its cache and waits on
+            // scheduled work past it rather than growing (its own default is 1.5x the recommended working set,
+            // more than the RAM). Default: the wired ceiling (DefaultMlxMemoryCeilingMb); override via
+            // TS_MLX_MEMORY_LIMIT_MB=<N>.
             string value = Environment.GetEnvironmentVariable("TS_MLX_MEMORY_LIMIT_MB");
+            long limitMb;
             if (string.IsNullOrWhiteSpace(value))
-                return;
-            if (!long.TryParse(value, out long limitMb) || limitMb <= 0)
+            {
+                long phys = GetPhysicalMemoryBytes();
+                limitMb = phys > 0 ? DefaultMlxMemoryCeilingMb(phys / 1024 / 1024) : 0;
+                if (limitMb <= 0)
+                    return;
+            }
+            else if (!long.TryParse(value, out limitMb) || limitMb <= 0)
                 return;
 
             nuint previous = 0;
@@ -9058,6 +9111,18 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         [LibraryImport(LibraryName, EntryPoint = "mlx_as_strided")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_as_strided(out MlxArray result, MlxArray array, int[] shape, nuint shapeCount, long[] strides, nuint stridesCount, nuint offset, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_conv1d")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_conv1d(out MlxArray result, MlxArray input, MlxArray weight, int stride, int padding, int dilation, int groups, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_logaddexp")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_logaddexp(out MlxArray result, MlxArray a, MlxArray b, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_sum_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_sum_axis(out MlxArray result, MlxArray array, int axis, [MarshalAs(UnmanagedType.U1)] bool keepDims, MlxStream stream);
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_reshape")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

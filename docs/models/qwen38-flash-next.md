@@ -33,36 +33,89 @@ The `Q2_0` files are [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggi
 
 ## How TensorSharp runs it
 
-On the GGML backends the whole token runs as (almost) one graph — embedding,
-PLE (in-graph), all 48 layers, the final mixer and the LM head — with a
-shape-keyed cache of reusable ggml graphs (where the span declines, per-layer fused
-kernels run instead, and those in turn fall back op-by-op). Vision rides the
-Qwen3.5-VL tower with (T,H,W) IMRoPE positions; multi-image and multi-turn
-image sessions are supported, with KV reuse across turns (the GDN recurrence
-cannot rewind, so a cached prefix is reused only when the new prompt extends
-it exactly; see [Retained-prefix reuse](#retained-prefix-reuse)). Radix reuse
-can continue past an identical image or video span: the complete state includes
-the M-RoPE cache gap and QSA position history, and the key checks media identity
-and span boundaries as well as tokens. A finished primary cache stays in place
-for the next exact turn; it becomes a retained holder only when another request
-needs to displace it.
+Two implementations serve the family:
 
-Thinking can be switched on or off. With it off, the assistant turn opens with
-the closed, empty `<think>\n\n</think>` block the published template emits,
-and replayed history keeps that exact suffix so cached prefixes still match.
+- `--backend cuda` loads the direct-CUDA engine (`Qwen4ExpCudaModel`, the Q4e kernels; see
+  [Serving on the direct-CUDA engine](#serving-on-the-direct-cuda-engine)).
+- Every other backend (`ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `ggml_cpu`, `cpu`) runs it on the shared decoder
+  runtime (`Qwen4ExpRuntimeModel`). It is the same runtime that serves Qwen 3.5. The family adds only its own parts:
+  - the hyper-connection streams;
+  - the sigmoid-gated recurrence;
+  - the PLE layer, whose n-gram rows are gathered from the on-disk table;
+  - QSA: dense up to the indexer's budget (2,051 cells on the shipped checkpoint), selecting whole blocks past it.
+- `--backend mlx` is refused.
 
-The published Qwen4Exp vision patch merger uses GELU(erf), separately from the
-transformer blocks' `gelu_pytorch_tanh`, matching the
-[Transformers v5.16.1 reference](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705).
-The supplied GGUF path retains its existing tanh merger default. Set
-`TS_Q4E_VISION_MERGER_ERF=1` before loading the projector to select the published
-erf merger independently of the block activation. The delivered base-model default
-passes 12/12 image cases, reproducing all 16 earlier tanh answers. The full erf
-trial passed 10/12; a subsequent same-build C=1 OCR control passes 2/2 with tanh
-and 1/2 with erf, which reads blue `9364` as `9334`. These scoped checks support
-preserving the compatibility default; they do not explain the recognition
-difference or establish broader activation quality. See the
+A step runs as one graph, with the Metal prompt kernels as device operations between graph segments:
+
+- the GDN recurrence;
+- the fused hyper-connection read;
+- the hyper-connection scatter;
+- the selected QSA attention over wide windows.
+
+Every request has its own slot, so continuous batching, the prefix cache and tensor parallelism come from the shared
+runtime. They are not family code. The same applies to:
+
+- `--tp N`: per-rank graphs on `ggml_cuda` and `ggml_vulkan`.
+- `--layer-split N`: whole-layer stages, and multi-node pipelines.
+- Host experts with accelerator tiers: the routing profile is collected on discrete GPUs too, so the next load keeps
+  each layer's most-routed experts in VRAM.
+- Speculative decoding: the shared MTP head through `--draft-model mtp-*.gguf`, or a DFlash2 drafter.
+
+`--tp` and `--layer-split` are separate placement modes for this family. Their hybrid is refused.
+
+Vision rides the Qwen3.5-VL tower with (T,H,W) IMRoPE positions. Multi-image and multi-turn image sessions are
+supported.
+
+Radix reuse can continue past an identical image or video span. A slot's copies carry:
+
+- the M-RoPE delta;
+- the PLE conv and n-gram histories;
+- the QSA indexer cache;
+- the rotary positions of the recent cells. QSA turns a block's pooled key at its first cell's position, which is not
+  its KV index after media.
+
+A long conversation with images therefore selects past the budget too. The GDN recurrence cannot rewind, so a cached
+prefix is reused only when the new prompt extends it exactly.
+
+Thinking can be switched on or off. With it off, the assistant turn opens with the closed, empty `<think>\n\n</think>`
+block the published template emits. Replayed history keeps that exact suffix, so cached prefixes still match.
+
+The published Qwen4Exp vision patch merger uses GELU(erf), separately from the transformer blocks'
+`gelu_pytorch_tanh` ([Transformers v5.16.1 reference](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705)).
+TensorSharp keeps the tanh merger, which is the shipped projector's validated default:
+
+- The delivered default passes 12/12 image cases.
+- An erf trial passed 10/12.
+- A same-build OCR control read blue `9364` as `9334` with erf.
+
+The erf opt-in (`TS_Q4E_VISION_MERGER_ERF`) went with the removed implementation. See the
 [image validation guide](../../eng/validation/qwen38-parallel-vision.md).
+
+**Against `Qwen4ExpModel`**, measured against `main` (`032fdf24`, which still served it), 3.6K-token prompt:
+
+| Route | Prefill | Decode |
+|---|---|---|
+| `ggml_metal`, M5 Pro, Q2_0 file | 3.95-4.15 s vs 3.95-4.23 s | 30.4 vs 30.3 tok/s |
+| `ggml_cuda`, one A40, 30 GB tier | 6.09 s vs 6.54 s | 41.3 vs 41.4 tok/s |
+| `ggml_cuda`, 2x A40, `--layer-split 2` | 2.64-2.69 s vs 2.80 s | 51.6 vs 51.1 tok/s |
+
+Further notes:
+
+- On `ggml_metal` the outputs are identical, and the runtime peaks at 35-36 GB wired against 39 GB.
+- Slot capacities are whole multiples of 256 cells. ggml-cuda groups a KV head's queries only over keys whose length
+  is a multiple of 256, and an exact-size slot (prompt plus `max_tokens`) had kept the layer-split decode at 48.4
+  tok/s: a QSA layer's attention took 133 us against 26.
+- With a 55-token prompt and 128 tokens on the two A40s, the runtime's first token comes at 345-398 ms against
+  517 ms and the whole answer about 60 ms sooner, but its decode rate is 54.4 against 57.1 tok/s (open).
+- `Qwen4ExpModel`'s goldens on the synthetic fixtures (`InferenceWeb.Tests/Fixtures/Qwen4ExpLegacy`) hold the runtime
+  to its numerics.
+
+> **Historical sections.** The dated sections below that describe the GGML backends record `Qwen4ExpModel`, which was
+> removed on 2026-11-13. That covers its token span, arenas, retained holders, one-token verify-row kernels and expert
+> cache. Its GGML-only switches went with it: `TS_Q4E_VERIFY_ROW_KERNELS`, `TS_Q4E_VERIFY_ROW_COMMIT`,
+> `TS_Q4E_DISABLE_ARENA_DECODE`, `TS_Q4E_QSA_POOL_CACHE`, `TS_Q4E_QSA_SPARSE_FA`, `TS_Q4E_LAYER_SPLIT`,
+> `TS_Q4E_PLE_PREFETCH`, `TS_Q4E_METAL_FUSE`, `TS_Q4E_VISION_MERGER_ERF`, `TS_Q4E_RETAINED_CACHE_MB`, the expert
+> cache's `TS_HOST_MOE_EXPERT_CACHE_*` and the debug dumps. Setting one now prints a removal notice. The direct-CUDA engine's `TS_Q4E_*` switches are unchanged.
 
 ## Vision encoder memory and validation
 

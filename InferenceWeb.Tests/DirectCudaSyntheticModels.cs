@@ -140,6 +140,13 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
     public int TopK { get; init; } = 4;
     public int ExpertFf { get; init; } = 256;
     public int SharedFf { get; init; } = 256;
+    /// <summary>KV heads (default <see cref="NumKvHeads"/>); two let tensor parallelism split them.</summary>
+    public int KvHeads { get; init; } = NumKvHeads;
+    /// <summary>When set, every projection and expert is written in this type (BF16: no
+    /// activation quantization, so two implementations of the recipe can be compared tightly;
+    /// the default IQ3_S / IQ4_XS / Q8_0 mix quantizes activations and so amplifies tiny
+    /// upstream differences into ~1e-2 output differences).</summary>
+    public GgmlType? UniformWeightType { get; init; }
 
     public string Write(string path)
     {
@@ -151,7 +158,7 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
             new U32 { Key = $"{a}.context_length", V = 4096 },
             new U32 { Key = $"{a}.embedding_length", V = Hidden },
             new U32 { Key = $"{a}.attention.head_count", V = NumHeads },
-            new U32 { Key = $"{a}.attention.head_count_kv", V = NumKvHeads },
+            new U32 { Key = $"{a}.attention.head_count_kv", V = (uint)KvHeads },
             new I32Arr { Key = $"{a}.rope.dimension_sections", V = new[] { 11, 11, 10, 0 } },
             new F32 { Key = $"{a}.rope.freq_base", V = 10000000f },
             new F32 { Key = $"{a}.attention.layer_norm_rms_epsilon", V = 1e-6f },
@@ -173,9 +180,9 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
 
         var t = new List<Tensor>
         {
-            GptOssSyntheticModelBuilder.Q8(Gen("token_embd.weight", 0.5f, Hidden, Vocab)),
+            Q8(Gen("token_embd.weight", 0.5f, Hidden, Vocab)),
             GenAround("output_norm.weight", 1f, 0.1f, Hidden),
-            Blocks("output.weight", GgmlType.Q6_K, 0.08f, Hidden, Vocab),
+            Typed("output.weight", GgmlType.Q6_K, 0.08f, Hidden, Vocab),
         };
         int qkvDim = 2 * SsmKHeads * SsmHeadDim + SsmInner;
         for (int l = 0; l < Layers; l++)
@@ -198,16 +205,16 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
             else
             {
                 t.Add(Q8(p + "attn_q.weight", 0.06f, Hidden, 2 * NumHeads * HeadDim));   // Q and its gate
-                t.Add(Q8(p + "attn_k.weight", 0.06f, Hidden, NumKvHeads * HeadDim));
-                t.Add(Q8(p + "attn_v.weight", 0.06f, Hidden, NumKvHeads * HeadDim));
+                t.Add(Q8(p + "attn_k.weight", 0.06f, Hidden, KvHeads * HeadDim));
+                t.Add(Q8(p + "attn_v.weight", 0.06f, Hidden, KvHeads * HeadDim));
                 t.Add(GenAround(p + "attn_q_norm.weight", 1f, 0.1f, HeadDim));
                 t.Add(GenAround(p + "attn_k_norm.weight", 1f, 0.1f, HeadDim));
                 t.Add(Q8(p + "attn_output.weight", 0.04f, NumHeads * HeadDim, Hidden));
             }
             t.Add(Gen(p + "ffn_gate_inp.weight", 0.3f, Hidden, Experts));
-            t.Add(Blocks(p + "ffn_gate_exps.weight", GgmlType.IQ3_S, 0.06f, Hidden, ExpertFf, Experts));
-            t.Add(Blocks(p + "ffn_up_exps.weight", GgmlType.IQ3_S, 0.06f, Hidden, ExpertFf, Experts));
-            t.Add(Blocks(p + "ffn_down_exps.weight", GgmlType.IQ4_XS, 0.06f, ExpertFf, Hidden, Experts));
+            t.Add(Typed(p + "ffn_gate_exps.weight", GgmlType.IQ3_S, 0.06f, Hidden, ExpertFf, Experts));
+            t.Add(Typed(p + "ffn_up_exps.weight", GgmlType.IQ3_S, 0.06f, Hidden, ExpertFf, Experts));
+            t.Add(Typed(p + "ffn_down_exps.weight", GgmlType.IQ4_XS, 0.06f, ExpertFf, Hidden, Experts));
             t.Add(Gen(p + "ffn_gate_inp_shexp.weight", 0.3f, Hidden));
             t.Add(Q8(p + "ffn_gate_shexp.weight", 0.06f, Hidden, SharedFf));
             t.Add(Q8(p + "ffn_up_shexp.weight", 0.06f, Hidden, SharedFf));
@@ -217,7 +224,22 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
         return path;
     }
 
-    private static Tensor Q8(string name, float scale, params int[] dims) => GptOssSyntheticModelBuilder.Q8(Gen(name, scale, dims));
+    private Tensor Q8(string name, float scale, params int[] dims) => Q8(Gen(name, scale, dims));
+
+    private Tensor Q8(Tensor x)
+    {
+        if (UniformWeightType is not GgmlType uniform) return GptOssSyntheticModelBuilder.Q8(x);
+        x.Type = uniform;
+        return x;
+    }
+
+    private Tensor Typed(string name, GgmlType type, float scale, params int[] dims)
+    {
+        if (UniformWeightType is not GgmlType uniform) return Blocks(name, type, scale, dims);
+        Tensor x = Gen(name, scale, dims);
+        x.Type = uniform;
+        return x;
+    }
 }
 
 /// <summary>Dense Qwen3.5 (qwen35, the 0.8B layout that Stage 0 calls qwen08): three Gated DeltaNet
@@ -233,10 +255,56 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
     public const int HeadDim = 256;
     public const int Vocab = 256;
     public const int SsmKHeads = 2;          // ssm.group_count
-    public const int SsmVHeads = 2;          // ssm.time_step_rank (== group_count in the 0.8B)
     public const int SsmHeadDim = 128;
-    public const int SsmInner = SsmVHeads * SsmHeadDim;
     public const int SsmConv = 4;
+    /// <summary>ssm.time_step_rank: value heads (== group_count in the 0.8B; 3x it in the 27B, whose
+    /// value head h reads key head h mod group_count).</summary>
+    public int SsmVHeads { get; init; } = 2;
+    private int SsmInner => SsmVHeads * SsmHeadDim;
+
+    /// <summary>Bonsai2's PRISM layout (Ternary-Bonsai-2-27B): the projections and the output head PQ2_0 under
+    /// forward Hadamard rotations of block 128, the embedding PQ2_0 under the inverse one, beta/alpha kept in
+    /// <see cref="WeightType"/>, value heads grouped (gdn_v_grouped). Needs 128-aligned input widths (<see cref="Ff"/>
+    /// 512) and no NextN block (the rotations cover the decoder's layers only).</summary>
+    public bool Prism { get; init; }
+
+    private static readonly string[] PrismRotated =
+    {
+        "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    };
+
+    private void ApplyPrism(List<Kv> kv, List<Tensor> t)
+    {
+        if (NextN) throw new InvalidOperationException("PRISM rotations cover the decoder's layers only.");
+        var forward = new List<string>();
+        var widths = new SortedSet<int>();
+        for (int i = 0; i < t.Count; i++)
+        {
+            string name = t[i].Name;
+            bool inverse = name == "token_embd.weight";
+            bool rotated = name == "output.weight" || Array.Exists(PrismRotated, s => name.EndsWith("." + s, StringComparison.Ordinal));
+            if (!inverse && !rotated) continue;
+            t[i] = Pq2(t[i]);
+            widths.Add((int)t[i].Dims[0]);
+            if (rotated) forward.Add(name);
+        }
+        int total = 0;
+        foreach (int width in widths) total += width;
+        var signs = new List<float>(total);
+        foreach (float v in Gen("prism.hadamard.signs", 1f, total).Data) signs.Add(v < 0 ? -1f : 1f);
+        const string p = "prism.hadamard.";
+        kv.Add(new U32 { Key = p + "version", V = 1 });
+        kv.Add(new U32 { Key = p + "block_size", V = 128 });
+        kv.Add(new Str { Key = p + "transform", V = "normalized-sylvester-walsh-hadamard" });
+        kv.Add(new Str { Key = p + "axis", V = "input-last-dimension" });
+        kv.Add(new Str { Key = p + "sign_mode", V = "explicit" });
+        kv.Add(new I32Arr { Key = p + "sign_widths", V = new List<int>(widths) });
+        kv.Add(new F32Arr { Key = p + "sign_values", V = signs });
+        kv.Add(new StrArr { Key = p + "weight_names", V = forward });
+        kv.Add(new StrArr { Key = p + "inverse_weight_names", V = new[] { "token_embd.weight" } });
+        kv.Add(new Bool { Key = p + "gdn_v_grouped", V = true });
+    }
 
     public int Layers { get; init; } = 4;
     public int Ff { get; init; } = 448;      // 3584 / 8: not a multiple of 128 or 256
@@ -245,6 +313,9 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
     public float EmbeddingScale { get; init; } = 0.5f;
     /// <summary>Write an untied output.weight (the 0.8B ties the head to the embedding).</summary>
     public bool UntiedOutput { get; init; }
+    /// <summary>Append a NextN/MTP block (blk.{Layers}: gated full attention, dense FFN and the
+    /// nextn projection and norms), as Qwen 3.6 / 3.8 checkpoints ship.</summary>
+    public bool NextN { get; init; }
 
     /// <summary>A file whose greedy continuation depends on the history: with the tied head these
     /// small files repeat their last token (0/12 argmax changes when only the history changes);
@@ -257,7 +328,8 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
         var kv = new List<Kv>
         {
             new Str { Key = "general.architecture", V = a },
-            new U32 { Key = $"{a}.block_count", V = (uint)Layers },
+            new U32 { Key = $"{a}.block_count", V = (uint)(Layers + (NextN ? 1 : 0)) },
+            new U32 { Key = $"{a}.nextn_predict_layers", V = NextN ? 1u : 0u },
             new U32 { Key = $"{a}.context_length", V = 4096 },
             new U32 { Key = $"{a}.embedding_length", V = Hidden },
             new U32 { Key = $"{a}.feed_forward_length", V = (uint)Ff },
@@ -271,8 +343,8 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
             new U32 { Key = $"{a}.ssm.conv_kernel", V = SsmConv },
             new U32 { Key = $"{a}.ssm.state_size", V = SsmHeadDim },
             new U32 { Key = $"{a}.ssm.group_count", V = SsmKHeads },
-            new U32 { Key = $"{a}.ssm.time_step_rank", V = SsmVHeads },
-            new U32 { Key = $"{a}.ssm.inner_size", V = SsmInner },
+            new U32 { Key = $"{a}.ssm.time_step_rank", V = (uint)SsmVHeads },
+            new U32 { Key = $"{a}.ssm.inner_size", V = (uint)SsmInner },
             new U32 { Key = $"{a}.full_attention_interval", V = 4 },
             new U32 { Key = $"{a}.rope.dimension_count", V = 64 },
         };
@@ -286,12 +358,19 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
         if (UntiedOutput)
             t.Add(W(Gen("output.weight", 0.08f, Hidden, Vocab)));
         int qkvDim = 2 * SsmKHeads * SsmHeadDim + SsmInner;
-        for (int l = 0; l < Layers; l++)
+        for (int l = 0; l < Layers + (NextN ? 1 : 0); l++)
         {
             string p = $"blk.{l}.";
             t.Add(GenAround(p + "attn_norm.weight", 1f, 0.1f, Hidden));
             t.Add(GenAround(p + "post_attention_norm.weight", 1f, 0.1f, Hidden));
-            if ((l + 1) % 4 != 0)
+            if (l == Layers)
+            {
+                t.Add(W(Gen(p + "nextn.eh_proj.weight", 0.06f, 2 * Hidden, Hidden)));
+                t.Add(GenAround(p + "nextn.enorm.weight", 1f, 0.1f, Hidden));
+                t.Add(GenAround(p + "nextn.hnorm.weight", 1f, 0.1f, Hidden));
+                t.Add(GenAround(p + "nextn.shared_head_norm.weight", 1f, 0.1f, Hidden));
+            }
+            if (l < Layers && (l + 1) % 4 != 0)
             {
                 t.Add(W(Gen(p + "attn_qkv.weight", 0.06f, Hidden, qkvDim)));
                 t.Add(W(Gen(p + "attn_gate.weight", 0.06f, Hidden, SsmInner)));
@@ -316,13 +395,20 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
             t.Add(W(Gen(p + "ffn_up.weight", 0.06f, Hidden, Ff)));
             t.Add(W(Gen(p + "ffn_down.weight", 0.05f, Ff, Hidden)));
         }
+        if (Prism) ApplyPrism(kv, t);
         SyntheticGguf.Write(path, kv, t);
         return path;
     }
 
+    /// <summary>A type for the Gated DeltaNet's beta/alpha projections that differs from
+    /// <see cref="WeightType"/> (mixed-quant checkpoints mix the in-projection's types); null keeps
+    /// <see cref="WeightType"/>.</summary>
+    public GgmlType? GateProjectionType { get; init; }
+
     private Tensor W(Tensor x)
     {
-        x.Type = WeightType;
+        x.Type = GateProjectionType is { } gate && (x.Name.EndsWith("ssm_alpha.weight", StringComparison.Ordinal)
+            || x.Name.EndsWith("ssm_beta.weight", StringComparison.Ordinal)) ? gate : WeightType;
         return x;
     }
 }

@@ -829,6 +829,14 @@ namespace TensorSharp
                 return;
             }
 
+			// The strided paths below walk both buffers as 4-byte elements: right for F32 and Int32,
+			// a buffer overrun for F16 (and a reinterpretation across types). Those go element by element.
+			if (result.ElementType != src.ElementType || result.ElementType.Size() != 4)
+			{
+				CopyConverting(result, src);
+				return;
+			}
+
 			if (TryCopyStridedSimd(result, src))
 			{
 				return;
@@ -858,6 +866,63 @@ namespace TensorSharp
 			}
 		}
 
+
+		/// <summary>
+		/// A copy between same-shaped views of any strides that converts F32 and F16 (unit-stride rows
+		/// through the vectorized converters); other element types are refused rather than reinterpreted.
+		/// </summary>
+		unsafe static void CopyConverting(Tensor result, Tensor src)
+		{
+			DType dt = result.ElementType, st = src.ElementType;
+			if ((dt != DType.Float32 && dt != DType.Float16) || (st != DType.Float32 && st != DType.Float16))
+				throw new NotSupportedException($"CPU copy from {st} to {dt} between strided views");
+			int rank = result.DimensionCount;
+			if (rank != src.DimensionCount)
+				throw new NotSupportedException("CPU converting copy between views of different ranks");
+			for (int d = 0; d < rank; d++)
+				if (result.Sizes[d] != src.Sizes[d])
+					throw new NotSupportedException("CPU converting copy between views of different sizes");
+			if (rank == 0)
+				return;
+			long inner = result.Sizes[rank - 1];
+			long dInner = result.Strides[rank - 1], sInner = src.Strides[rank - 1];
+			byte* d0 = (byte*)CpuNativeHelpers.GetBufferStart(result), s0 = (byte*)CpuNativeHelpers.GetBufferStart(src);
+			int de = dt.Size(), se = st.Size();
+			long[] index = new long[Math.Max(1, rank - 1)];
+			long rows = inner == 0 ? 0 : result.ElementCount() / inner;
+			for (long r = 0; r < rows; r++)
+			{
+				long dOff = 0, sOff = 0;
+				for (int i = 0; i < rank - 1; i++)
+				{
+					dOff += index[i] * result.Strides[i];
+					sOff += index[i] * src.Strides[i];
+				}
+				byte* dRow = d0 + dOff * de, sRow = s0 + sOff * se;
+				if (dInner == 1 && sInner == 1 && dt == st)
+					Buffer.MemoryCopy(sRow, dRow, inner * de, inner * de);
+				else if (dInner == 1 && sInner == 1 && dt == DType.Float16)
+					TensorComputePrimitives.F32ToF16((ushort*)dRow, (float*)sRow, checked((int)inner));
+				else if (dInner == 1 && sInner == 1)
+					TensorComputePrimitives.F16ToF32((float*)dRow, (ushort*)sRow, checked((int)inner));
+				else
+				{
+					for (long j = 0; j < inner; j++)
+					{
+						byte* sp = sRow + j * sInner * se, dp = dRow + j * dInner * de;
+						float v = st == DType.Float32 ? *(float*)sp : (float)BitConverter.UInt16BitsToHalf(*(ushort*)sp);
+						if (dt == DType.Float32) *(float*)dp = v;
+						else *(ushort*)dp = BitConverter.HalfToUInt16Bits((System.Half)v);
+					}
+				}
+				for (int i = rank - 2; i >= 0; i--)
+				{
+					if (++index[i] < result.Sizes[i])
+						break;
+					index[i] = 0;
+				}
+			}
+		}
 
 		/// <summary>
 		/// Strided F32 copy between same-shaped views (head split/merge, narrowed rows, permutes).

@@ -367,7 +367,7 @@ public sealed class AttachmentPromptStabilityTests : IDisposable
 
     private static ModelBase Model()
     {
-        var model = (Qwen35Model)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35Model));
+        var model = (Qwen35RuntimeModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35RuntimeModel));
         typeof(ModelBase).GetProperty(nameof(ModelBase.Tokenizer))!.SetValue(model, new CharTokenizer());
         typeof(ModelBase).GetField("<Config>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(model, new ModelConfig { Architecture = "qwen35", ChatTemplate = "template" });

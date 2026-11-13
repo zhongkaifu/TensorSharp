@@ -351,7 +351,9 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 
 | 架构 | 多卡模式 |
 |---|---|
-| Mistral 3、Gemma 4、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Muse-Glimmer（上限 `--tp 2`） | 张量并行，用 `--tp N` 显式开启 |
+| Mistral 3、Hunyuan Dense（共享解码运行时） | 在 `cuda`、`ggml_cuda`、`ggml_vulkan` 上支持 `--tp T`、`--layer-split P` 以及两者组合（混合：P 个整层阶段，每个阶段 T 张 GPU）；每种放置下并发请求都保持批处理（[统一执行](docs/design/unified-execution.md)，英文） |
+| Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`） | `--tp N`：该家族自己的张量并行（按 rank 的融合计算图；并发请求逐个服务）。`--layer-split P` 与 `--tp T --layer-split P`（混合）在 `cuda`、`ggml_cuda`、`ggml_vulkan` 上（单进程）：由共享解码运行时提供，保持批处理；仅文本、不支持 `--draft-model`，每 token 比单设备融合计算图慢（见 [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md#13b-多-gpu-放置)）。Bonsai2 与带 NVFP4 sidecar 的 MoE checkpoint 在这些放置下被拒绝 |
+| Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer（上限 `--tp 2`） | 张量并行，用 `--tp N` 显式开启 |
 | Muse Spark（`muse-spark`） | 两种模式都由原生整模型执行器运行。在 GGML CUDA / Vulkan 上用 `--layer-split N`（最多 16 张 GPU）做本地整层放置，专家栈按每张 GPU 规划；专家栈全部在 CUDA GPU 上时，一个提示的 prefill 以流水线方式分布到各 GPU。GGML CUDA 上的 `--tp N` 通过上游 ggml 的 meta 后端（llama.cpp `-sm tensor` 所用的机制）把每层切分到 N 张 GPU（最多 16 张，即 KV 头数），仅限单节点。`TS_MUSE_SPARK_NATIVE=0` 以及 Vulkan 上的 `--tp N` 改选逐算子路径的注意力头与整专家张量并行。在十张 A40 上，按层切分的 4K token 提示 prefill 为 llama.cpp 对应模式的 2.07 倍，`--tp 10` 的 decode 为 1.40 倍（[报告](docs/perf/muse-spark-vs-llama-cpp.md)，英文）。两种模式不能组合 |
 | MiniMax-M3.1（`minimax-m3`） | 两种模式都由原生整模型执行器运行，仅限 `ggml_cuda`。`--layer-split N`（最多 16 张 GPU）放置连续的整层，把一个提示的 prefill 以流水线方式分布到各 GPU，并支持主机专家（`--n-cpu-moe N`、`TS_MINIMAX_M3_CPU_MOE=auto`）。`--tp N`（2 到 16 张相同型号的 CUDA GPU，仅单节点）在上游 ggml 的 meta 后端上运行执行器：由于只有四个 KV 头，注意力、稀疏注意力索引器以及 K/V/索引键缓存在每张 GPU 上镜像，稠密、路由与共享专家 FFN 沿隐藏维切分，输出头按词表行切分，每层一次 all-reduce。它拒绝主机专家与 DSpark 草稿器。在八张 A40 上，`--tp 8` 深度 0 的 decode 为 35.7 tok/s，按层切分的 32K token 提示 prefill 为 1,544 tok/s，llama.cpp 为 240（[性能数据](docs/benchmarks_zh-cn.md#八张-a40-上的-minimax-m31-flash)）。两种模式不能组合 |
 | Bonsai2 27B（带 PRISM Hadamard 变换的 `qwen35`） | 单设备——加载器拒绝 `--tp` |
@@ -361,7 +363,7 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 | GLM-5.3-Flash（`glm5next`） | 用 `--layer-split N` 显式选择本地整层放置；`--tp N` 在 GGML GPU 后端上选择原生本地张量并行 |
 | DeepSeek V4 Flash | 用 `--layer-split N` 显式选择本地整层放置；`--layer-split N` 只限制这次切分用几张卡 |
 | DeepSeek V4.1 Flash | `--layer-split N` 选择本地整层放置。GGML CUDA 上的实验性 routed-MoE TP 使用 `--tp N`；不支持注意力 TP 与分布式组。两种模式不能组合。 |
-| Hunyuan Dense（`hunyuan-dense`） | 单设备——两种模式都不支持；启动时会在 stderr 上明说 |
+| Hunyuan Dense（`hunyuan-dense`）、Mistral 3 | 共享解码运行时：在 `cuda`、`ggml_cuda`、`ggml_vulkan` 上支持 `--tp T`、`--layer-split P` 及两者组合（混合：P 个整层阶段、每段 T 张 GPU）；每种放置下并发请求都保持批处理 |
 | DiffusionGemma、LTX 2.5、Wan 2.1/2.2、MiniMax-H3 | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
 | Qwen 3.8 Flash Next（`qwen4exp`） | 在合格的 `ggml_cuda` 设备/量化上用 `--tp N` 开启本地 FFN TP；注意力/QSA/GDN/PLE 保持复制。用独立的 `--layer-split N` 在 GGML CUDA/Vulkan 与 direct `cuda` 上按整层放置。UD-Q2_K_XL 只能按层切分；见[验证范围与测量](docs/models/qwen38-flash-next_zh-cn.md#多-gpu) |
 
@@ -416,7 +418,7 @@ decode 是每个 token 一张持久化的单设备 GGML 图，而它的 GDN / PL
 只按权重定价，看不到稍后才加载、且会落在 GPU 0 上的视觉塔。详见
 [Qwen 3.8 Flash Next 卡片](docs/models/qwen38-flash-next_zh-cn.md)。
 
-Hunyuan Dense、DiffusionGemma、LTX 2.5、Wan 2.1/2.2 与 MiniMax-H3 仅支持单设备。
+DiffusionGemma、LTX 2.5、Wan 2.1/2.2 与 MiniMax-H3 仅支持单设备。
 不支持的多 GPU 请求会在启动时失败；`--tp` 与 `--layer-split` 都不会静默回到单卡。
 
 本地集合通信优先使用 CUDA 点对点（P2P）DMA，但启动时会对每一对支持 P2P 的设备
@@ -536,7 +538,7 @@ GGUF 都不带这个视觉塔，因此 `--mmproj` 既可以指向 mmproj GGUF，
 
 ### Qwen 3.5 / 3.6 family
 
-所有 Qwen 3.5/3.6-family 变体（`qwen35`、`qwen35moe` 与 `qwen3next`）共用同一个 `Qwen35Model` 实现。图像输入通过支持动态分辨率的 `Qwen35VisionEncoder` 处理；请显式传入所选仓库的投影器（上文 9B 与 Qwen 3.6 示例均为 `mmproj-F16.gguf`；Bonsai2 27B 使用自己的 `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `-Q8_0.gguf`）。MoE 变体（例如 Qwen3.5-35B-A3B，以及使用同一架构标识的 Qwen3.6-35B-A3B GGUF）在 decode 时还会启用融合的 `MoEExpertsSwiGLUResidual` GGML 内核，将所有被选中的专家、可选的 shared expert 与残差加法合并到一次 GPU 计算图调度中执行。
+所有 Qwen 3.5/3.6-family 变体（`qwen35`、`qwen35moe` 与 `qwen3next`）共用共享解码运行时上的同一个 `Qwen35RuntimeModel`（`--backend cuda` 上的稠密 NVFP4 检查点由直连 CUDA 引擎执行）。图像输入通过支持动态分辨率的 `Qwen35VisionEncoder` 处理；请显式传入所选仓库的投影器（上文 9B 与 Qwen 3.6 示例均为 `mmproj-F16.gguf`；Bonsai2 27B 使用自己的 `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `-Q8_0.gguf`）。MoE 变体（例如 Qwen3.5-35B-A3B，以及使用同一架构标识的 Qwen3.6-35B-A3B GGUF）在 decode 时还会启用融合的 `MoEExpertsSwiGLUResidual` GGML 内核，将所有被选中的专家、可选的 shared expert 与残差加法合并到一次 GPU 计算图调度中执行。
 
 ### Qwen 3.8 Flash Next
 

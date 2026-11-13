@@ -328,18 +328,11 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_training.cpp
     ggml_ops_fused.cpp
     ggml_ops_transformer.cpp
+    ggml_ops_graph_builder.cpp
     ggml_ops_transformer_prefill.cpp
     ggml_ops_gptoss_decode.cpp
     ggml_ops_gptoss_batched.cpp
-    ggml_ops_qwen35_batched_arena.cpp
-    ggml_ops_qwen35_batched_verify.cpp
-    ggml_ops_qwen4exp.cpp
-    ggml_ops_qwen4exp_reduce.cpp
-    ggml_ops_qwen4exp_mtp.cpp
-    ggml_ops_qwen4exp_arena.cpp
     ggml_ops_gptoss_prefill.cpp
-    ggml_ops_qwen35_decode.cpp
-    ggml_ops_qwen35_verify.cpp
     ggml_ops_gemma4_decode.cpp
     ggml_ops_gemma4_batched.cpp
     ggml_ops_gemma4_verify.cpp
@@ -356,12 +349,10 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_wan.cpp
     ggml_ops_minimax_h3.cpp
     ggml_ops_gated_delta_net.cpp
-    ggml_ops_qwen35_recurrent_prefill.cpp
     ggml_ops_qwen35_gdn_tp.cpp
     ggml_ops_mamba2.cpp
     ggml_ops_moe.cpp
     ggml_ops_host_moe_decode.cpp
-    ggml_ops_host_moe_cache.cpp
     ggml_ops_moe_hot_tier.cpp
     ggml_ops_moe_expert_io.cpp
     ggml_ops_direct_read.cpp
@@ -764,16 +755,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsEmbeddingCpuMatmulTest PRIVATE ${TSG_EMBEDDING_ACCELERATE_FRAMEWORK})
     endif()
     add_test(NAME embedding-cpu-matmul COMMAND GgmlOpsEmbeddingCpuMatmulTest)
-    set_property(SOURCE ggml_ops_qwen4exp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
-    set_property(SOURCE ggml_ops_qwen4exp_arena.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_moe_hot_tier.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
-    add_executable(GgmlOpsQwen4ExpQsaPlanTest tests/qwen4exp_qsa_plan_test.cpp)
-    target_include_directories(GgmlOpsQwen4ExpQsaPlanTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    if (MSVC)
-        target_compile_options(GgmlOpsQwen4ExpQsaPlanTest PRIVATE /O2 /EHsc)
-    endif()
-    add_test(NAME qwen4exp-qsa-position-plan COMMAND GgmlOpsQwen4ExpQsaPlanTest)
-    set_tests_properties(qwen4exp-qsa-position-plan PROPERTIES TIMEOUT 30)
     set_property(SOURCE ggml_ops_glm_dsa.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_deepseek4.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_deepseek41_tp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
@@ -948,11 +930,6 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(current-graph-plan-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
     endif()
 
-    add_executable(GgmlOpsHostMoeExpertCacheTest
-        tests/host_moe_expert_cache_test.cpp ggml_ops_host_moe_cache.cpp)
-    target_include_directories(GgmlOpsHostMoeExpertCacheTest PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
-    target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cpu ggml-base)
     add_executable(GgmlOpsHostMoeDecodeRowsTest
         tests/host_moe_decode_rows_test.cpp ggml_ops_host_moe_decode.cpp)
     target_include_directories(GgmlOpsHostMoeDecodeRowsTest PRIVATE
@@ -960,35 +937,6 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsHostMoeDecodeRowsTest PRIVATE ggml-cpu ggml-base)
     add_test(NAME host-moe-decode-independent-rows COMMAND GgmlOpsHostMoeDecodeRowsTest)
     set_tests_properties(host-moe-decode-independent-rows PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
-    add_test(NAME host-moe-expert-cache-cpu-fallback COMMAND GgmlOpsHostMoeExpertCacheTest --cpu)
-    add_test(NAME host-moe-expert-cache-invalid-budget-sign
-        COMMAND GgmlOpsHostMoeExpertCacheTest --invalid-budget "+8192")
-    add_test(NAME host-moe-expert-cache-invalid-budget-leading-space
-        COMMAND GgmlOpsHostMoeExpertCacheTest --invalid-budget " 8192")
-    add_test(NAME host-moe-expert-cache-invalid-budget-trailing-space
-        COMMAND GgmlOpsHostMoeExpertCacheTest --invalid-budget "8192 ")
-    add_test(NAME host-moe-expert-cache-invalid-budget-overflow
-        COMMAND GgmlOpsHostMoeExpertCacheTest --invalid-budget "18446744073709551616")
-    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
-        target_compile_definitions(GgmlOpsHostMoeExpertCacheTest PRIVATE TSG_GGML_USE_CUDA=1)
-        target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cuda)
-        add_test(NAME host-moe-expert-cache-cuda-parity COMMAND GgmlOpsHostMoeExpertCacheTest)
-        add_test(NAME host-moe-expert-cache-cuda-iq1-m-parity
-            COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m)
-        add_test(NAME host-moe-expert-cache-cuda-iq2-xxs-parity
-            COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq2_xxs)
-        add_test(NAME host-moe-expert-cache-cuda-prefetch-parity
-            COMMAND GgmlOpsHostMoeExpertCacheTest --prefetch)
-        add_test(NAME host-moe-expert-cache-cuda-iq1-m-prefetch-parity
-            COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --prefetch)
-        add_test(NAME host-moe-expert-cache-cuda-iq2-xxs-prefetch-parity
-            COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq2_xxs --prefetch)
-        set_tests_properties(host-moe-expert-cache-cuda-parity
-            host-moe-expert-cache-cuda-iq1-m-parity host-moe-expert-cache-cuda-iq2-xxs-parity
-            host-moe-expert-cache-cuda-prefetch-parity host-moe-expert-cache-cuda-iq1-m-prefetch-parity
-            host-moe-expert-cache-cuda-iq2-xxs-prefetch-parity
-            PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
-    endif()
 
     add_executable(GgmlOpsDsv41RawGatherTest
         tests/dsv41_raw_gather_test.cpp ggml_ops_dsv4_fused_cpu.cpp)
@@ -1109,11 +1057,6 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         add_test(NAME cuda-explicit-f32-matmul COMMAND GgmlOpsCudaMatmulPrecisionTest)
         add_test(NAME cuda-quantized-ffn-strip COMMAND GgmlOpsCudaMatmulPrecisionTest --quant-strip-only --inner 2560)
         add_test(NAME cuda-quantized-ffn-wide-scratch COMMAND GgmlOpsCudaMatmulPrecisionTest --quant-strip-wide-only)
-        # Measurement probe (not a test): which CUDA kernels a qwen4exp verify
-        # row shares with the one-token decode graph, and at what cost.
-        add_executable(GgmlOpsQwen4ExpRowKernelProbe tests/qwen4exp_row_kernel_probe.cpp)
-        target_compile_definitions(GgmlOpsQwen4ExpRowKernelProbe PRIVATE TSG_GGML_USE_CUDA=1)
-        target_link_libraries(GgmlOpsQwen4ExpRowKernelProbe PRIVATE ggml-cuda ggml-cpu ggml-base)
         set_tests_properties(cuda-explicit-f32-matmul PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(cuda-quantized-ffn-strip PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         set_tests_properties(cuda-quantized-ffn-wide-scratch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
@@ -1136,15 +1079,6 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsCudaQ8PrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-q8-f32-projection COMMAND GgmlOpsCudaQ8PrecisionTest)
         set_tests_properties(cuda-q8-f32-projection PROPERTIES SKIP_RETURN_CODE 77)
-        add_executable(GgmlOpsQwen4ExpReduceTest tests/qwen4exp_reduce_test.cpp
-            ggml_ops_qwen4exp_reduce.cpp ggml_ops_matmul_precision.cu
-            ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_dsv4_fused.cu)
-        target_compile_definitions(GgmlOpsQwen4ExpReduceTest PRIVATE TSG_GGML_USE_CUDA=1)
-        target_include_directories(GgmlOpsQwen4ExpReduceTest PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
-        target_link_libraries(GgmlOpsQwen4ExpReduceTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
-        add_test(NAME qwen4exp-prefill-combine-cuda COMMAND GgmlOpsQwen4ExpReduceTest cuda)
-        set_tests_properties(qwen4exp-prefill-combine-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         # Explicit performance control: includes transient conversion costs,
         # independent sampled numerical checks and a scratch-reuse guard.
         # Never register benchmarks in the automatic correctness CTest lane.
@@ -1173,11 +1107,6 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(minimax-msa-kernels-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 900)
 
     endif()
-
-    add_executable(GgmlOpsQwen4ExpReduceCpuTest tests/qwen4exp_reduce_test.cpp ggml_ops_qwen4exp_reduce.cpp)
-    target_include_directories(GgmlOpsQwen4ExpReduceCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(GgmlOpsQwen4ExpReduceCpuTest PRIVATE ggml-cpu ggml-base)
-    add_test(NAME qwen4exp-prefill-combine-cpu COMMAND GgmlOpsQwen4ExpReduceCpuTest cpu)
 
     add_executable(GgmlOpsAttentionAllocTest
         tests/attention_alloc_test.cpp ggml_ops_attention_alloc.cpp)
@@ -1412,10 +1341,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     foreach(TSG_PDL_CASE IN ITEMS unset 0 1 unaffected)
         add_test(NAME cuda-launch-policy-${TSG_PDL_CASE} COMMAND GgmlOpsCudaLaunchPolicyTest ${TSG_PDL_CASE})
     endforeach()
-    add_executable(GgmlOpsQwen35ArenaScaleTest tests/qwen35_arena_scale_test.cpp)
-    target_include_directories(GgmlOpsQwen35ArenaScaleTest PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
-    target_link_libraries(GgmlOpsQwen35ArenaScaleTest PRIVATE GgmlOps ggml-base)
+    add_executable(GgmlOpsCudaLaunchPolicyDeviceTest tests/cuda_launch_policy_device_test.cpp)
+    target_link_libraries(GgmlOpsCudaLaunchPolicyDeviceTest PRIVATE GgmlOps)
     add_executable(GgmlOpsDeviceCopyRangesTest tests/device_copy_ranges_test.cpp)
     target_link_libraries(GgmlOpsDeviceCopyRangesTest PRIVATE GgmlOps)
     foreach(TSG_DEVCOPY_BACKEND IN ITEMS cpu cuda metal)
@@ -1451,18 +1378,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(dspine-draft-${TSG_DSPINE_BACKEND} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 RUN_SERIAL TRUE)
     endforeach()
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
-        add_test(NAME qwen35-arena-sidecar-scales-cuda COMMAND GgmlOpsQwen35ArenaScaleTest cuda default)
-        set_tests_properties(qwen35-arena-sidecar-scales-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
         foreach(TSG_PDL_VALUE IN ITEMS 0 1)
-            add_test(NAME cuda-launch-policy-device-${TSG_PDL_VALUE} COMMAND GgmlOpsQwen35ArenaScaleTest cuda pdl${TSG_PDL_VALUE})
+            add_test(NAME cuda-launch-policy-device-${TSG_PDL_VALUE} COMMAND GgmlOpsCudaLaunchPolicyDeviceTest pdl${TSG_PDL_VALUE})
             set_tests_properties(cuda-launch-policy-device-${TSG_PDL_VALUE} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 RUN_SERIAL TRUE)
         endforeach()
         add_test(NAME dflash-sidecar-scales-cuda COMMAND GgmlOpsDFlashScaleTest cuda)
         set_tests_properties(dflash-sidecar-scales-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
     endif()
     if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
-        add_test(NAME qwen35-arena-sidecar-scales-metal COMMAND GgmlOpsQwen35ArenaScaleTest metal)
-        set_tests_properties(qwen35-arena-sidecar-scales-metal PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
         add_test(NAME dflash-sidecar-scales-metal COMMAND GgmlOpsDFlashScaleTest metal)
         set_tests_properties(dflash-sidecar-scales-metal PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
     endif()

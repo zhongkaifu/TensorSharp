@@ -94,6 +94,7 @@ public sealed class DistributedModelControlTests : IDisposable
             Id = "native-distributed-probe",
             Aliases = ["native-distributed-probe"],
             Factory = _ => throw new InvalidOperationException("must not construct a model during preflight"),
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
             DistributedTensorParallelBackends = [BackendType.GgmlCuda],
         };
         ModelBase.ValidateDistributedTensorParallelism(descriptor, BackendType.GgmlCuda);

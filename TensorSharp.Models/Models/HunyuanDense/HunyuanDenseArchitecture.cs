@@ -16,10 +16,8 @@ namespace TensorSharp.Models
             Id = "hunyuan-dense",
             DisplayName = "Hunyuan Dense",
             Aliases = ["hunyuan-dense"],
-            Factory = c => new HunyuanDenseModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
-            MultiGpu = MultiGpuMode.SingleDevice,
-            MultiGpuLimitation =
-                "hunyuan-dense has no tensor-parallel or layer-split path yet; extra GPUs stay idle.",
+            Factory = c => new HunyuanDenseModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
         };
     }
 }

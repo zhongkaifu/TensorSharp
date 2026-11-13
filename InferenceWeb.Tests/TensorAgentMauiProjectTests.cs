@@ -213,7 +213,6 @@ public class TensorAgentMauiProjectTests
 
         foreach (string export in new[]
                  {
-                     "TSGgml_Qwen35ArenaDiscardHostPointer",
                      // Bonsai2's PQ2_0/PTQ1_0 transcode and PRISM Hadamard registration,
                      // reached by the app's Bonsai 2 27B catalog entry.
                      "TSGgml_TranscodeBonsaiToQ2_0",

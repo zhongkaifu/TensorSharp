@@ -19,7 +19,7 @@ public class DFlashInjectDeclineTests
     private const string Warning = "[dflash] the drafter's context inject failed";
     private const BindingFlags Instance = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
 
-    private sealed class DeclineTestModel : Qwen35Model
+    private sealed class DeclineTestModel : Qwen35RuntimeModel
     {
         // Never called: the tests build only the drafter's request state, without a GGUF or a backend.
         public DeclineTestModel() : base("", BackendType.Cpu) { }

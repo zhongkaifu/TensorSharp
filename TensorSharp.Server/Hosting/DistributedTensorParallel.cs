@@ -40,10 +40,13 @@ public static class DistributedTensorParallel
         if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
             throw new ArgumentException("Distributed --tp requires cuda, ggml_cuda, or ggml_vulkan.");
 
-        if (options.IsLayerSplit)
-            return new DistributedLayerSplitGroup(
-                ModelBase.CreateLocalLayerSplitGroup(backend, distConfig.LocalDegree),
-                distConfig.NodeId, distConfig.PeerEndpoints);
+        if (options.IsDistributedPipeline)
+        {
+            // This node's --layer-split stages of --tp GPUs each; the nodes exchange their shapes and capacities.
+            ITensorParallelGroup local = ModelBase.CreateLocalStageGroup(backend, options.LayerSplitDegree, options.TpDegree);
+            return new DistributedLayerSplitGroup(local, distConfig.NodeId, distConfig.PeerEndpoints,
+                options.TpDegree, ModelBase.MeasureStageCapacity(local, backend, options.TpDegree));
+        }
 
         // The on-node group has to match the backend: direct CUDA
         // drives CudaAllocators, the ggml backends drive per-rank

@@ -27,11 +27,14 @@ namespace TensorSharp.Server
         private string _loadedMmProjPath;
         private BackendType _backend;
 
+        /// <remarks>A node of a multi-node layer split runs its group's local stages (its GPUs over its stages'
+        /// <c>--tp</c>), as the CLI passes its <c>--layer-split</c>: the GPU count refused a node of one two-GPU stage
+        /// ("the layer-split degree must match the local device group").</remarks>
         public ModelLifecycleService(ILogger logger)
             : this(logger, static (path, backend, tpGroup, draftPath) =>
                 ModelBase.Create(path, backend, tpDegree: tpGroup is ILayerSplitGroup ? 1 : tpGroup?.Degree ?? 1,
                     tpGroup: tpGroup, draftModelPath: draftPath,
-                    layerSplitDegree: tpGroup is ILayerSplitGroup ? tpGroup.Degree : 1))
+                    layerSplitDegree: tpGroup is ILayerSplitGroup layers ? layers.LocalStages : 1))
         {
         }
 
@@ -370,8 +373,8 @@ namespace TensorSharp.Server
                 string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
                 return;
 
-            bool layerSelected = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE")) &&
-                (!int.TryParse(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"), out int tpDegree) || tpDegree <= 1);
+            // Across nodes an explicit --layer-split selects the node pipeline (each node's stages may be --tp groups).
+            bool layerSelected = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"));
             BackendType backend = ResolveBackend(backendStr);
             if (layerSelected) ModelBase.ValidateDistributedLayerSplit(modelPath, backend);
             else ModelBase.ValidateDistributedTensorParallelism(modelPath, backend);

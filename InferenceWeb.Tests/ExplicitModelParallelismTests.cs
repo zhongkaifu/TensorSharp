@@ -50,10 +50,16 @@ public sealed class ExplicitModelParallelismTests : IDisposable
     [Fact]
     public void ConflictingModesAndUnsupportedLayerPlacementAreRefused()
     {
-        Assert.Throws<ArgumentException>(() => Resolve("glm-dsa", BackendType.GgmlCuda, 2, 2, out _));
+        // --tp with --layer-split is one topology now: refused only where the family declares
+        // the hybrid as a gap, and accepted (T per stage, P stages) where it is supported.
+        var gap = Assert.Throws<NotSupportedException>(() => Resolve("glm-dsa", BackendType.GgmlCuda, 2, 2, out _));
+        Assert.Contains("separate placement modes", gap.Message, StringComparison.Ordinal);
         Assert.Throws<NotSupportedException>(() => Resolve("mistral3", BackendType.Cpu, 1, 2, out _));
         Assert.Equal(1, Resolve("mistral3", BackendType.GgmlCuda, 1, 2, out int split));
         Assert.Equal(2, split);
+        Assert.Equal(2, Resolve("mistral3", BackendType.GgmlCuda, 2, 2, out int hybridSplit));
+        Assert.Equal(2, hybridSplit);
+        Assert.Throws<NotSupportedException>(() => Resolve("mistral3", BackendType.GgmlMetal, 2, 2, out _));
     }
 
     [Theory]

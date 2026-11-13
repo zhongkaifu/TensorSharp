@@ -1199,6 +1199,10 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
         catch (const std::exception&) { return false; }
     }
 
+    namespace { std::atomic<int> g_qsa_attn_min_cells{0}; }
+
+    void qsa_attn_set_min_cells(int cells) { g_qsa_attn_min_cells.store(cells > 0 ? cells : 0, std::memory_order_relaxed); }
+
     bool qsa_attn_supported(ggml_backend* backend, int head_dim, int n_head, int n_head_kv, int kv_type, int n_cells)
     {
         const char* e = std::getenv("TS_METAL_QSA_ATTN");
@@ -1210,6 +1214,7 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
         int min_cells = 12288;
         if (qsa_attn_tensor_api(backend)) min_cells = 8192;
         if (m && std::atoi(m) > 0) min_cells = std::atoi(m);
+        if (const int t = g_qsa_attn_min_cells.load(std::memory_order_relaxed); t > 0) min_cells = t;
         return metal_device(backend) != nullptr && head_dim == 256 && n_head_kv > 0 && n_head % n_head_kv == 0
             && n_head / n_head_kv <= 16 && kv_type == GGML_TYPE_F16 && n_cells >= min_cells;
     }
@@ -1278,6 +1283,52 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
     }
 
     long long qsa_attn_count() { return g_qsa_attn_count.load(std::memory_order_relaxed); }
+
+    namespace
+    {
+        struct TsmQsaCompactArgs { std::uint32_t n_tok, n_cells, width, pad; };
+    }
+
+    bool qsa_compact_encode(ggml_backend* backend, const ggml_tensor* mask, ggml_tensor* idx, ggml_tensor* cnt,
+                            int T, int n_cells, int width)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm qsa compact: not a Metal backend");
+            if (T <= 0 || n_cells <= 0 || width <= 0) throw std::runtime_error("tsm qsa compact: empty selection");
+            const std::int64_t t = T;
+            require_type(mask, GGML_TYPE_F16, static_cast<std::int64_t>(n_cells) * t, "mask");
+            require_type(idx, GGML_TYPE_I32, static_cast<std::int64_t>(width) * t, "idx");
+            require_type(cnt, GGML_TYPE_I32, t, "cnt");
+            const ggml_metal_buffer_id mi = tensor_id(mask), xi = tensor_id(idx), ci = tensor_id(cnt);
+            const TsmQsaCompactArgs args{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(n_cells),
+                static_cast<std::uint32_t>(width), 0};
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                id<MTLCommandBuffer> cmd = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                [enc setComputePipelineState:pipeline(s, "tsm_qsa_compact")];
+                bind(enc, mi, 0, 0); bind(enc, xi, 0, 1); bind(enc, ci, 0, 2);
+                [enc setBytes:&args length:sizeof(args) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cmd commit];
+                s.last = cmd;
+            }
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
 
     // ---- the prompt expert GEMM (Strata's moe_mm: tsm/kernels/tsm_moe_mm.metal) ---------------------------------
     namespace
@@ -2251,6 +2302,13 @@ TSG_EXPORT int TSGgml_TsmQsaSelectProbe(int T, int n_cells, int n_blocks, int he
 TSG_EXPORT long long TSGgml_TsmQsaAttnCount()
 {
     return tsm::qsa_attn_count();
+}
+
+// ---- test hook: the narrowest window the prompt QSA attention over the chosen cells takes (0: the default), so a
+// synthetic checkpoint's short windows reach it without the process environment.
+TSG_EXPORT void TSGgml_TsmQsaAttnSetMinCells(int cells)
+{
+    tsm::qsa_attn_set_min_cells(cells);
 }
 
 // ---- test probe: one QSA attention over the chosen cells (qsa_attn_encode) on inputs the caller gives - q F32

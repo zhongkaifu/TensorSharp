@@ -22,7 +22,7 @@ namespace TensorSharp.Models
     internal sealed unsafe class Qwen4ExpCudaExecutor : IQwen4ExpPleSource, IDisposable
     {
         private const string Tag = "q4e-cuda";
-        private const string A = Qwen4ExpModel.ArchitectureId;
+        private const string A = Qwen4ExpFormat.ArchitectureId;
         private GgufShardSet _gguf;
         private Q4eCudaEngine _engine;
 
@@ -39,7 +39,7 @@ namespace TensorSharp.Models
         private CudaWeightDesc HcWeight(string name)
         {
             CudaWeightDesc w = _gguf.Weight(name);
-            if (!Qwen4ExpModel.HcQ8 || w.GgmlType != WeightRequant.GgmlTypeBf16 || w.Ne0 % 32 != 0 || w.Ne2 > 1)
+            if (!Qwen4ExpFormat.HcQ8 || w.GgmlType != WeightRequant.GgmlTypeBf16 || w.Ne0 % 32 != 0 || w.Ne2 > 1)
                 return w;
             long rows = w.Ne1, cols = w.Ne0, srcBytes = rows * cols * 2, bytes = WeightRequant.Q8_0Bytes(rows, cols);
             IntPtr tmp = IntPtr.Zero, src = w.HostPtr;
@@ -433,7 +433,7 @@ namespace TensorSharp.Models
         private Q4eCudaEngine.MtpDesc BuildMtp(int hcDim)
         {
             // The target's tensors from every shard: the first of a split checkpoint may hold none of them.
-            int layer = Qwen4ExpModel.ValidateMtpHead(_gguf.First, _gguf.Extra, _gguf.InfoOf);
+            int layer = Qwen4ExpFormat.ValidateMtpHead(_gguf.First, _gguf.Extra, _gguf.InfoOf);
             string p = $"blk.{layer}.";
             var mtp = new Q4eCudaEngine.MtpDesc
             {

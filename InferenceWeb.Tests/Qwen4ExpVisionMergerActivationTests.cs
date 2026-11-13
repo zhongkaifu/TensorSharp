@@ -60,32 +60,6 @@ public sealed class Qwen4ExpVisionMergerActivationTests : IDisposable
         AssertClose(Tanh, EncodeControlledMerger(legacy));
     }
 
-    [Theory]
-    [InlineData(null, false)]
-    [InlineData("0", false)]
-    [InlineData("1", true)]
-    public void Qwen4ExpProjectorLoaderRequiresExplicitErfOptIn(string? optIn, bool erf)
-    {
-        // LoadVisionEncoder needs only the allocator. Keep language-weight loading
-        // out of this activation regression, then detach the incomplete host model.
-        var model = (Qwen4ExpModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen4ExpModel));
-        typeof(ModelBase).GetField("_allocator", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(model, _allocator);
-        string? previous = Environment.GetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF");
-        try
-        {
-            Environment.SetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF", optIn);
-            model.LoadVisionEncoder(_mmproj);
-            model.VisionEncoder.SetHostModel(null);
-            AssertClose(erf ? Erf : Tanh, EncodeControlledMerger(model.VisionEncoder));
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF", previous);
-            model.VisionEncoder?.Dispose();
-            GC.SuppressFinalize(model);
-        }
-    }
-
     [GgmlTheory(BackendType.GgmlMetal)]
     [InlineData(1, 8, false)]
     [InlineData(1, 8, true)]

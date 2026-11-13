@@ -17,6 +17,10 @@ public sealed class ModelParallelismOptions
     public int LayerSplitDegree { get; private set; }
     /// <summary>Whole-layer execution was selected, including one GPU per node.</summary>
     public bool IsLayerSplit { get; private set; }
+    /// <summary>A multi-node whole-layer pipeline: <c>--layer-split P</c> with <c>--tp-peers</c>. This node runs P
+    /// stages, each a tensor-parallel group of <c>--tp T</c> GPUs (one GPU without <c>--tp</c>); nodes may differ.
+    /// Without <c>--layer-split</c>, <c>--tp</c> across nodes is one tensor-parallel group spanning them.</summary>
+    public bool IsDistributedPipeline { get; private set; }
     public DistributedTpConfig Distributed { get; private set; }
     public bool HasCliOverrides => _overrides.Count != 0;
 
@@ -91,14 +95,18 @@ public sealed class ModelParallelismOptions
         result.TpDegree = ReadInteger(Resolve(TpDegreeVariable) ?? "1", "--tp / " + TpDegreeVariable, 1);
         result.LayerSplitDegree = ReadInteger(Resolve(LayerSplitDegreeVariable) ?? "1",
             "--layer-split / " + LayerSplitDegreeVariable, 1);
-        if (result.TpDegree > 1 && result.LayerSplitDegree > 1)
-            throw new ArgumentException("--tp and --layer-split cannot both exceed 1. Choose tensor parallelism or layer splitting.");
+        // Both above 1 is hybrid placement: --layer-split stages, each a --tp group, in one
+        // process (whether the architecture supports it is the loader's decision, from its
+        // serving contract). IsLayerSplit names the PURE whole-layer mode.
         result.IsLayerSplit = result.TpDegree == 1 && !string.IsNullOrWhiteSpace(Resolve(LayerSplitDegreeVariable));
 
         string node = Resolve(NodeIdVariable);
         string peers = Resolve(PeersVariable);
         bool hasNode = !string.IsNullOrWhiteSpace(node);
         bool hasPeers = !string.IsNullOrWhiteSpace(peers);
+        // Across nodes an explicit --layer-split selects the node pipeline, --tp then sizing each of this node's stages
+        // (--layer-split 1 --tp 2: one stage of two GPUs on this node).
+        result.IsDistributedPipeline = hasNode && hasPeers && !string.IsNullOrWhiteSpace(Resolve(LayerSplitDegreeVariable));
         if (hasNode != hasPeers)
             throw new ArgumentException(hasNode
                 ? "--tp-node-id requires --tp-peers (the endpoints of all nodes)."
@@ -114,7 +122,7 @@ public sealed class ModelParallelismOptions
                 if (nodeId >= endpoints.Length)
                     throw new ArgumentException($"--tp-node-id {nodeId} must be less than the number of peers ({endpoints.Length}).");
                 result.Distributed = new DistributedTpConfig(nodeId,
-                    result.IsLayerSplit ? result.LayerSplitDegree : result.TpDegree, endpoints);
+                    result.IsDistributedPipeline ? checked(result.LayerSplitDegree * result.TpDegree) : result.TpDegree, endpoints);
             }
             catch (Exception ex) when (ex is ArgumentException or FormatException or System.Net.Sockets.SocketException)
             {

@@ -38,6 +38,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// slot-mapped paged KV storage).</summary>
         public bool SupportsBatchedPagedAttention { get; init; }
 
+        /// <summary>Every step is one batched forward over per-request slots (<see cref="IUnifiedBatchModel"/>):
+        /// the planner serves the model on <see cref="ExecutionPathKind.Unified"/>.</summary>
+        public bool SupportsUnifiedBatching { get; init; }
+
         /// <summary>Model-declared master switch for its batched path
         /// (<see cref="IBatchedPagedModel.BatchedForwardAvailable"/>): false when
         /// a static limitation (e.g. Gemma 4 with MoE layers or block-quantized
@@ -120,6 +124,7 @@ namespace TensorSharp.Runtime.Scheduling
             return new ExecutionCapabilities
             {
                 SupportsBatchedPagedAttention = batched != null,
+                SupportsUnifiedBatching = model is IUnifiedBatchModel unified && unified.SupportsUnifiedBatching,
                 BatchedForwardAvailable = batched != null && batched.BatchedForwardAvailable,
                 SupportsBatchedMultimodal = batched != null && batched.SupportsBatchedMultimodal,
                 SupportsPerSequenceFusedForward = batched != null && batched.SupportsPerSequenceFusedForward,

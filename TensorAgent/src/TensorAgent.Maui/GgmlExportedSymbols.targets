@@ -207,6 +207,21 @@
     <ReferenceNativeSymbol Include="TSGgml_GptOssResetBatchedDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GptOssResetDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphAlias" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphCreateTp" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphEffect" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphFree" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphFusedBegin" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphFusedEnd" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphLeaf" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphLeafIsResident" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphLeafSplit" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphOp" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphOutput" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphRun" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphRunRanked" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphShape" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostAvailableMemoryBytes" SymbolType="Function" />
@@ -216,7 +231,6 @@
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoUnregister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertRows" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_HostMoeExpertCacheStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexReductionF32" SymbolType="Function" />
@@ -276,6 +290,7 @@
     <ReferenceNativeSymbol Include="TSGgml_MoeTierPrefetchStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeMmSeamLayers" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeOffloadCounters" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeRoutingCount" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingCounts" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingRecordDevice" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingReset" SymbolType="Function" />
@@ -335,74 +350,10 @@
     <ReferenceNativeSymbol Include="TSGgml_PrefaultHostSpans" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PreloadQuantizedWeight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen21VisionEncoderF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatched" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatchedHidden" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDiscardHostPointer" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaFlushHostPointer" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaResetBatchedDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaUsesHolderBuffers" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35AttentionLayerDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35AttentionLayerPrefill" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35BatchedVerify" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35BatchedVerifyCommit" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35BatchedVerifyReset" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35CommitStateSnapshotOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35DiscardLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35DrainDeviceStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ExportLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35FetchStateSnapshotOwned" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35GdnDropTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35GdnLayerTP" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ImportLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ModelDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ModelDecodeBatched" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ModelDecodeToken" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ModelVerifyOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReadLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35RecurrentLayerPrefill" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReleaseAttentionTpGraphs" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReleaseVerifyGraphsPreserveState" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReleaseVerifyOwner" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ReleaseVerifyTpGraphs" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCacheForHostPointer" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCacheOwner" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35VerifyArgmaxDone" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35VerifyRequestArgmax" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderMergedF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen35ZeroLiveStateOwned" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatched" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatchedTp" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointer" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointerStatus" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaResetBatchedDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpAttnBlock" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCaptureVerifyRows" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpSetFeatureTaps" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCommitVerifyRow" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpRowBufferBytes" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCopyQsaCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpFfnBlock" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpGdnBlock" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpInvalidateSeqState" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpMtpCopyKv" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpMtpCreate" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpMtpForward" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpMtpFree" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpReleaseAllSeqState" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpReleaseSeqState" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpResetFfnCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotCapture" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotCreate" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotFree" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotRestore" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpan" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpanTp" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpanTpGlobal" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTpWeightSupported" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTpWeightSupportedGlobal" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImage21Forward" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImage21ForwardTp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImage21GetPrefixCacheInfo" SymbolType="Function" />
@@ -460,5 +411,6 @@
     <ReferenceNativeSymbol Include="TSGgml_WanT5Encode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WanVaeDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WanVaeEncode" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ZeroDeviceCopies" SymbolType="Function" />
   </ItemGroup>
 </Project>

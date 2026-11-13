@@ -68,6 +68,7 @@ public sealed class DistributedServerLoadTests : IDisposable
             Aliases = [architecture],
             ApplyNativeTunables = context => { observed = context; throw stop; },
             Factory = _ => throw new InvalidOperationException("must not construct a native model"),
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
         });
         SyntheticGguf.Write(_path, [new SyntheticGguf.Str { Key = "general.architecture", V = architecture }], []);
         var group = new DegreeProbeGroup();
@@ -96,7 +97,7 @@ public sealed class DistributedServerLoadTests : IDisposable
         {
             Id = architecture,
             Aliases = [architecture],
-            SupportsLayerSplit = true,
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
             SupportsDistributedLayerSplit = true,
             ApplyNativeTunables = context => { observed = context; throw stop; },
             Factory = _ => throw new InvalidOperationException("must not construct"),
@@ -110,6 +111,33 @@ public sealed class DistributedServerLoadTests : IDisposable
         Assert.Equal(2, observed.LayerSplitDegree);
         Assert.Same(group, observed.TpGroup);
         Assert.True(group.Disposed);
+    }
+
+    /// <summary>A node whose two GPUs are one tensor-parallel stage of a multi-node layer split (hybrid) loads as one
+    /// local stage, as the CLI's <c>--tp 2 --layer-split 1</c> does: the server passed its GPU count as the layer-split
+    /// degree and the load refused it.</summary>
+    [Fact]
+    public void DefaultServerFactoryLoadsAHybridNodeAsItsLocalStages()
+    {
+        string architecture = "distributed-server-hybrid-" + Guid.NewGuid().ToString("N");
+        ModelCreateContext observed = null;
+        var stop = new InvalidOperationException("Captured hybrid context before native construction");
+        ModelArchitectureRegistry.Register(new ModelArchitectureDescriptor
+        {
+            Id = architecture,
+            Aliases = [architecture],
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
+            SupportsDistributedLayerSplit = true,
+            ApplyNativeTunables = context => { observed = context; throw stop; },
+            Factory = _ => throw new InvalidOperationException("must not construct"),
+        });
+        SyntheticGguf.Write(_path, [new SyntheticGguf.Str { Key = "general.architecture", V = architecture }], []);
+        var group = new HybridProbeGroup();
+        using var lifecycle = new ModelLifecycleService(null);
+        lifecycle.TensorParallelGroupFactory = _ => group;
+        Assert.Same(stop, Assert.Throws<InvalidOperationException>(() => lifecycle.LoadModel(_path, null, "ggml_cuda")));
+        Assert.Equal(1, observed.LayerSplitDegree);
+        Assert.Same(group, observed.TpGroup);
     }
 
     private sealed class ProbeModel(string path) : ModelBase(path, BackendType.Cpu)
@@ -135,10 +163,16 @@ public sealed class DistributedServerLoadTests : IDisposable
         public void Dispose() => Disposed = true;
     }
 
-    private sealed class LayerProbeGroup : DegreeProbeGroup, ILayerSplitGroup
+    private class LayerProbeGroup : DegreeProbeGroup, ILayerSplitGroup
     {
         public int NodeId => 0;
         public void Send(float[] buffer, int count, int destination) => throw new NotSupportedException();
         public void Receive(float[] buffer, int count, int source) => throw new NotSupportedException();
+    }
+
+    /// <summary>Two GPUs as one tensor-parallel stage.</summary>
+    private sealed class HybridProbeGroup : LayerProbeGroup, ILayerSplitGroup
+    {
+        public int StageTensorParallel => 2;
     }
 }

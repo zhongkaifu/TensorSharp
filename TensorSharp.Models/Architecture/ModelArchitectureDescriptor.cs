@@ -12,26 +12,6 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.Architecture
 {
-    /// <summary>How an architecture uses more than one GPU.</summary>
-    public enum MultiGpuMode
-    {
-        /// <summary>Weights are sharded across ranks and the layers issue collectives
-        /// (<c>--tp N</c> in its literal sense).</summary>
-        TensorParallel,
-
-        /// <summary>The shared loader passes the device count to the architecture's
-        /// own executor without creating a tensor-parallel group. The default is
-        /// whole-layer placement. Executors with an additional native sharding mode
-        /// describe it through <see cref="ModelArchitectureDescriptor.DescribeMultiGpuPlacement"/>.</summary>
-        LayerSplit,
-
-        /// <summary>The architecture cannot use a second GPU through the shared
-        /// machinery at all. <see cref="ModelArchitectureDescriptor.MultiGpuLimitation"/>
-        /// says why, and is printed instead of silently idling the extra devices.
-        /// Requests for either multi-GPU mode are refused.</summary>
-        SingleDevice,
-    }
-
     /// <summary>
     /// One architecture plug-in: everything the shared loader needs to know about a
     /// model family, declared by the family itself.
@@ -89,12 +69,14 @@ namespace TensorSharp.Models.Architecture
         /// refusal message when it accepts nothing. Required when the recogniser is set.</summary>
         public string RelabelledFileDescription { get; init; }
 
-        /// <summary>How this architecture uses several GPUs. See <see cref="MultiGpuMode"/>.</summary>
-        public MultiGpuMode MultiGpu { get; init; } = MultiGpuMode.TensorParallel;
-
-        /// <summary>Whether a tensor-parallel architecture also implements explicit
-        /// whole-layer placement. LayerSplit architectures support it inherently.</summary>
-        public bool SupportsLayerSplit { get; init; }
+        /// <summary>
+        /// The mandatory declaration of how this family serves requests: continuous batching,
+        /// tensor parallelism, layer split, their hybrid and expert offload, per backend. The
+        /// loader accepts or refuses <c>--tp</c> / <c>--layer-split</c> from this alone, and the
+        /// conformance tests prove it and hold its gaps to a shrinking list. See
+        /// docs/design/unified-execution.md.
+        /// </summary>
+        public required ServingContract Serving { get; init; }
 
         /// <summary>The executor loads and runs only its node's whole layers and
         /// exchanges every required stage boundary tensor through ILayerSplitGroup.</summary>
@@ -102,11 +84,6 @@ namespace TensorSharp.Models.Architecture
 
         public IReadOnlyList<BackendType> DistributedLayerSplitBackends { get; init; } =
             new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan };
-
-        /// <summary>Optional native partial-TP mode, for an otherwise layer-split
-        /// executor. True only when its explicit native settings enable real sharding
-        /// for the requested degree and backend.</summary>
-        public Func<int, BackendType, bool> SupportsNativeTensorParallel { get; init; }
 
         /// <summary>Whether the tensor-parallel executor consumes cross-node
         /// collectives. Only applies to TensorParallel architectures. Native
@@ -118,18 +95,6 @@ namespace TensorSharp.Models.Architecture
         /// Checked before the host creates GPU ranks or connects to peers;
         /// null permits the shared distributed GPU backends.</summary>
         public IReadOnlyList<BackendType> DistributedTensorParallelBackends { get; init; }
-
-        /// <summary>Backends implementing this architecture's whole-layer placement.</summary>
-        public IReadOnlyList<BackendType> LayerSplitBackends { get; init; } =
-            new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan };
-
-        /// <summary>
-        /// Why the shared tensor-parallel path is unavailable. REQUIRED for
-        /// <see cref="MultiGpuMode.LayerSplit"/> and <see cref="MultiGpuMode.SingleDevice"/>,
-        /// because that message is the whole value of the gate: it is what tells an
-        /// operator why the extra GPU is idle, or why it holds layers rather than shards.
-        /// </summary>
-        public string MultiGpuLimitation { get; init; }
 
         /// <summary>Optional startup description for an executor that owns device
         /// placement and reductions itself. Receives the requested GPU count; may
@@ -167,11 +132,6 @@ namespace TensorSharp.Models.Architecture
         /// </summary>
         public string LoraPluginType { get; init; }
 
-        /// <summary>Backends on which <see cref="MultiGpuMode.LayerSplit"/> can actually
-        /// find several devices to split across.</summary>
-        internal static bool BackendHasSeveralDevices(BackendType backend)
-            => backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
-
         internal string Name => DisplayName ?? Id;
 
         internal void Validate()
@@ -190,12 +150,12 @@ namespace TensorSharp.Models.Architecture
                     $"Architecture '{Id}' recognises relabelled files but does not say which; the refusal " +
                     "message for a file it rejects would not tell the operator what is accepted.");
             }
-            if (MultiGpu != MultiGpuMode.TensorParallel && string.IsNullOrWhiteSpace(MultiGpuLimitation))
-            {
+            if (Serving == null)
+                throw new InvalidOperationException($"Architecture '{Id}' declares no serving contract.");
+            Serving.Validate(Id);
+            if (SupportsDistributedLayerSplit && !DistributedLayerSplitBackends.All(Serving.LayerSplit.IsSupportedOn))
                 throw new InvalidOperationException(
-                    $"Architecture '{Id}' declares MultiGpu={MultiGpu} but no MultiGpuLimitation. That message is " +
-                    "what tells an operator why the extra GPUs are idle or holding layers; an empty one is a bug.");
-            }
+                    $"Architecture '{Id}' runs distributed layer split on a backend where it does not declare local layer split.");
             if (LoraPluginType != null && !LoraCliFlags.PluginTypes.Contains(LoraPluginType, StringComparer.Ordinal))
             {
                 throw new InvalidOperationException(

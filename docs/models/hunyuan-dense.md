@@ -8,10 +8,13 @@ releases. Before this architecture was registered, those official Q4 files
 failed at load rather than falling back to a similar family: the loader fails
 closed on an unknown architecture instead of guessing a graph.
 
-It is a single-device, text-only path on the generic per-op executor: there is
-no fused whole-model graph, no tensor parallelism and no layer split. The
-server serves it through the continuous-batching engine with a batched paged
-forward (see [Serving](#serving-continuous-batching)).
+It is a text-only family built on the shared decoder runtime
+([`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs); see [unified execution](../design/unified-execution.md)),
+which gives it tensor parallelism (`--tp T`), whole-layer placement
+(`--layer-split P`, local or multi-node) and both together on `cuda`,
+`ggml_cuda` and `ggml_vulkan`, with concurrent requests batched through a paged
+forward in every placement (see [Serving](#serving-continuous-batching)). There
+is no fused whole-model graph yet.
 
 | Property | Value |
 |---|---|
@@ -24,7 +27,7 @@ forward (see [Serving](#serving-continuous-batching)).
 | Tool calling | No — the protocol renders neither tool declarations nor `role: "tool"` results |
 | Batched / paged forward | **Default** — [`HunyuanDenseModel.BatchedForward.cs`](../../TensorSharp.Models/Models/HunyuanDense/HunyuanDenseModel.BatchedForward.cs) (`IBatchedPagedModel`); `--no-continuous-batching` selects the K/V-snapshot swap path |
 | Speculative decoding | Not supported |
-| Multi-GPU | Single device. `MultiGpuLimitation` says so on stderr rather than leaving extra GPUs idle in silence |
+| Multi-GPU | `--tp T`, `--layer-split P` and `--tp T --layer-split P` (hybrid) on `cuda`, `ggml_cuda`, `ggml_vulkan`, from the shared decoder runtime. Proven against one device on simulated devices (`SharedRuntimeConformanceTests`); not yet measured on GPUs |
 | Backends | Every backend, through the generic per-op path: `cpu`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `cuda`, `mlx` |
 
 ## Run it
@@ -150,8 +153,9 @@ instructions here, as they do for every family without a tool parser.
   not apply.
 - No thinking channel and no tool-call parser, so the code tools and
   sub-agent delegation are not offered for this model.
-- Single device: no tensor parallelism, no layer split, no fused whole-model
-  graph, and no speculative decoding.
+- No fused whole-model graph and no speculative decoding. Multi-GPU placement
+  comes from the shared decoder runtime and has been proven on simulated
+  devices only; no GPU measurement exists yet.
 - Hy-MT2-1.8B is a translation model and follows its own output habits: it
   answers `What is 17 + 25? Reply with only the integer.` with `42.`, and on the
   release translation fixtures it copies the input back for the

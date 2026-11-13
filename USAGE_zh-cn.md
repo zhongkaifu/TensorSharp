@@ -345,8 +345,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | 参数 | 说明 |
 |---|---|
 | `--kv-cache-dtype <type>` | KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（默认：自动——由后端 / 模型决定；环境变量 `KV_CACHE_DTYPE`）。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径；DeepSeek V4 / V4.1 会在加载时拒绝它们（其执行器的 cache 固定为 F16，由自己的内核读取），显式的 `f32` 会按 `f16` 报告。 |
-| `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。不能与 `--layer-split` 组合；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
-| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。支持的架构可配合 `--tp-node-id`、`--tp-peers` 跨节点运行；不能同时使用大于 1 的 `--tp`。详见[多节点推理](docs/multi-node-inference.md)。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
+| `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。与 `--layer-split P` 一起使用时，在声明支持的架构上选择混合放置（P 个整层阶段，每个阶段 N 张 GPU，仅限单进程）；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
+| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。支持的架构可配合 `--tp-node-id`、`--tp-peers` 跨节点运行；与大于 1 的 `--tp T` 一起使用时选择混合放置（仅限单进程）。详见[多节点推理](docs/multi-node-inference.md)。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
 | `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |
 | `--tp-peers <list>` | 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。所有节点必须使用完全相同的列表。必须与 `--tp-node-id` 一起使用。 |
 | `--interactive` / `-i` / `--chat` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
@@ -677,8 +677,8 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
 | `--port <N>` / `--host <address>` | 监听端口与绑定网卡（默认：`5000`、`0.0.0.0`——即所有网卡）。macOS 上 5000 端口被隔空播放接收器占用，请换一个端口或关闭该功能。环境变量：`PORT` / `HOST`。 |
 | `--urls <urls>` | 完整监听 URL（分号分隔），用于 `--port`/`--host` 表达不了的情形（HTTPS、同时绑定多个端点）。两者都给时以 `--port`/`--host` 为准；三者都不给时依次回退到 `PORT`/`HOST` 与 `ASPNETCORE_URLS`。 |
 | `--backend <type>` | 默认计算后端（macOS 上默认 `ggml_metal`，其他平台默认 `ggml_cpu`；省略且本机具备平台默认后端时不打印任何警告；平台默认后端缺失时，启动会警告 `The platform default backend 'X' is unavailable on this machine (available: …). Using 'Y' instead`；显式指定本机没有的后端会拒绝启动模型的加载（退出码 2），不带模型的服务端则警告并回退到可用后端）：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan` |
-| `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。不能与 `--layer-split` 组合；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
-| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。支持的架构可配合 `--tp-node-id`、`--tp-peers` 跨节点运行；不能同时使用大于 1 的 `--tp`。详见[多节点推理](docs/multi-node-inference.md)。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
+| `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。与 `--layer-split P` 一起使用时，在声明支持的架构上选择混合放置（P 个整层阶段，每个阶段 N 张 GPU，仅限单进程）；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
+| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。支持的架构可配合 `--tp-node-id`、`--tp-peers` 跨节点运行；与大于 1 的 `--tp T` 一起使用时选择混合放置（仅限单进程）。详见[多节点推理](docs/multi-node-inference.md)。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
 | `--tp-node-id <N>` | 多节点（分布式）张量并行中本节点的 0 起始编号。服务端只能是节点 `0`（对外提供 HTTP 的 driver）；其余节点请用 `TensorSharp.Cli` 启动。必须与 `--tp-peers` 一起使用。环境变量：`TENSORSHARP_TP_NODE_ID`。 |
 | `--tp-peers <list>` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，按节点 ID 排序，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `--tp-node-id` 一起使用。环境变量：`TENSORSHARP_TP_PEERS`。 |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
@@ -896,8 +896,7 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H：物化 prefill 回退路径在改为按 query 子块计算前允许构建的最大注意力得分张量（MiB，默认 1024）。GGML 融合 prefill kernel（F32 / F16 cache）不受此预算约束，得分张量较大时会切换到 flash attention。 |
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H：缓存的原生 Mamba2 prefill 计算图可占用的设备内存（MiB，按最近最少使用淘汰，默认 1024）。大于预算的计算图只服务当次调用，随后释放。 |
 | `TS_MLX_MLOCK_GGUF` | 默认 `1`，通过 `mlock(2)` 把 GGUF mmap 区域钉在物理内存，避免前向之间被换出。设为 `0` 关闭（适用于进程 `memlock` rlimit 太低、或希望让 OS 自行管理分页的情况）。仅 MLX 后端。 |
-| `TS_MLX_BATCHED_MOE_DECODE` | 默认 `1`，将 Qwen 3.5/3.6 MoE 解码时每专家的 K 次 dispatch 合并为每种（gate / up / down）一次批处理 dispatch。在显存紧张的机器上可设为 `0` 关闭（可节省堆叠权重 slab 带来的近一倍权重显存占用）。 |
-| `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | 覆盖 MLX 分配器硬上限 / 空闲缓冲池上限 / wired 缓冲上限（兆字节）。默认值会根据宿主机统一内存大小派生。 |
+| `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | 覆盖 MLX 分配器硬上限 / 空闲缓冲池上限 / wired 缓冲上限（兆字节）。分配器上限和 wired 上限默认为内存的 70%，并至少给 macOS 留出 min(8 GiB, 内存的四分之一)：wired 内存不会被换出，上限接近内存总量时 Mac 会卡死而不是让分配失败。空闲缓冲池上限默认 2048。 |
 | `TS_MLX_EVAL_EVERY_N_LAYERS` | 解码时定期触发 `mlx_async_eval` 的层间隔，用于让 GPU 计算和宿主端排队重叠。每个 MLX 模型有自己的默认值（Gemma 4 与 Muse-Glimmer 每 4 层，Qwen 3.5 与 Nemotron-H 每 16 层）；该变量为所有模型统一设置。支持处可设为 `0` 关闭。 |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | 覆盖 `--backend mlx` 时 `libmlxc` 的搜索路径。 |
 
@@ -1696,7 +1695,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 
 | 架构 | TP 状态 | 说明 |
 |---|---|---|
-| Mistral 3 | ✅ | 融合 / 分离 QKV，YaRN RoPE |
+| Mistral 3 | ✅ + 按层切分 + 混合 | 共享解码运行时：在 `cuda`、`ggml_cuda` 与 `ggml_vulkan` 上支持 `--tp T`、`--layer-split P`（本地；GGML CUDA/Vulkan 上也可跨节点）以及两者组合（`--tp T --layer-split P`：P 个阶段、每段 T 张 GPU）；各种放置下并发请求都保持批处理。见[统一执行设计](docs/design/unified-execution.md)（英文） |
 | Gemma 4 | ✅ | 稠密 TP + MoE。GGML 上融合的整模 MoE 主干在**每个专家内部**切分（gate/up 列并行、down 行并行），从而保留全局专家 id；`TS_GEMMA4_TP_FUSED_MOE=0` 可回退到逐算子的整专家路径。Direct CUDA 上为逐专家切分 |
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属；GGML 上为专家并行 MoE（每个 rank 持有整个专家，shared expert 仍按 Megatron 切分）与列并行（按词表切分的）LM head（LM head 与 embedding 共享权重、或其词表行数不能被本机 TP 度整除时除外，此时它留在 rank 0 上复制），Direct CUDA 上为专家切分且 LM head 保持复制。`cuda` 与 `ggml_cuda` / `ggml_vulkan` 均可运行——GGML 路径使用打包的按 rank GDN 内核（`TSGgml_Qwen35GdnLayerTP`）并把循环状态常驻设备。[Bonsai2](docs/models/bonsai2_zh-cn.md)（带 PRISM PQ2_0 / PTQ1_0 张量的 `qwen35` 文件）例外：只支持单设备 GGML 后端，`--tp` 会被拒绝 |
 | Qwen 3.8 Flash Next | ✅（本地 FFN TP）+ 按层切分 | `ggml_cuda --tp N` 切分路由/共享 FFN，注意力/QSA/GDN/PLE 保持复制。要求合格的 CUDA MMQ 设备与受支持的 FFN 类型；UD-IQ4_XS 已在 A40 TP2/TP4 上检查，UD-Q2_K_XL 则拒绝 TP。此模式不支持 CPU 专家卸载、前缀 checkpoint 与跨节点 TP。独立的 `--layer-split N` 仍支持 GGML CUDA/Vulkan 与 direct `cuda`。实测 A40 TP2 比按层切分慢；见[验证范围、数值门限与基准](docs/models/qwen38-flash-next_zh-cn.md#多-gpu)。 |
@@ -1708,7 +1707,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | GLM 5.x | ✅（仅本地） | 仅限 GGML GPU 后端；GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 的原生 TP 路径都只支持本地单进程（`--tp-node-id` / `--tp-peers` 对整个 GLM 家族都是硬拒绝）。GLM-5.2 切 MLA head 与每个路由专家内的隐藏行。GLM-5.3-Flash 还会切 KDA head 并让每个 rank 持有对应的递归状态；其 MLA head 与路由专家隐藏行同样切分。注意力局部输出会在每次非线性 Sinkhorn 超连接之前归约。在 GLM-5.3-Flash 满足条件的分段快路径上，路由 MoE 局部输出先归约，随后每个 rank 在本地计算并加入其复制的共享专家；超连接、池化 indexer、router、norm、稠密层与 embedding 也保持不切分并按 rank 执行，output norm / LM head 留在 rank 0。CPU MoE、tracing、部分 `TS_GLM_TP_SHARD` 切分、超额 rank 或缺少原生超连接内核时使用组合调度器回退，其中共享专家只在 rank 0 运行一次。GLM-5.3（非 Flash）同样以本地单进程的方式接受 `--tp N`，并在每个 rank 上复制 MLA 与 indexer cache，因此 `--tp` 会成倍放大 KV 占用；它在 `--tp N>1` 下从未被实际跑过——唯一有记录的算术是一个装不下的例子：`--tp 8` 每个 rank 需要 41.7 GiB，而卡只有 46 GB——因此它只是一个被接受的模式，而不是已验证的配置；另外在那里只要 `--tp N>1`，`--spec` 就会被拒绝。用 `--layer-split N` 选择整层放置 |
 | DeepSeek V4 Flash | 按层切分 | 不是张量并行：整模型执行器按每张卡的空闲显存把连续的整层装箱分配，`--layer-split N` 只限制这次切分用几张卡 |
 | DeepSeek V4.1 Flash | partial TP + 按层切分 | GGML CUDA 上的 `--layer-split N` 选择整层放置，`--tp N` 选择路由 MoE 切分。两种模式均可配合节点与 peer 参数跨节点运行；TP 中的注意力保持不切分。详见[多节点配置与限制](docs/multi-node-inference.md)。 |
-| Hunyuan Dense | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
+| Hunyuan Dense | ✅ + 按层切分 + 混合 | 共享解码运行时：与 Mistral 3 相同的放置方式（`--tp T`、`--layer-split P` 及两者组合），每种放置下都保持批处理。 |
 | DiffusionGemma | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
 | Wan 2.1 / 2.2、MiniMax-H3 | — | 仅支持单设备：张量并行、按层切分和分布式组均在启动时被拒绝 |
 | Qwen-Image-2.1 | ✅（仅本地，扩散 Transformer） | 在 `ggml_cuda` / `ggml_vulkan` 上，`--tp N`（N 为任何能整除 32 个注意力头的 GPU 数——单机上为 2、4、8 或 16——并受切分时的块对齐约束）切分 DiT 的注意力头与 MLP 列；LoRA 插件随之切分。在 2× A40 上用 `ggml_cuda` 实测加速 1.34-1.57×，但在 `ggml_vulkan` 上比单卡更慢（0.86×，主机归约）。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，不支持多节点组。见 [Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#cuda-graph-与张量并行) |
@@ -1777,13 +1776,11 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号，例如 `0,2`（默认 `0..tp-1`）。Muse Spark 与 MiniMax-M3.1 的原生 `--tp` 会拒绝它，请改用 `CUDA_VISIBLE_DEVICES` |
 | `TS_GGML_TP_PARALLEL=0` | 顺序而非并发地驱动各 rank（诊断用） |
-| `TS_GGML_TP_FUSED_MATMUL=1` | 由单个线程提交两个 rank 的线性层（默认关闭；它每次调用都要为每个 rank 分配设备缓冲，在 Qwen 3.5 35B 上实测慢 2.3×） |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 超过该元素数量时 AllReduce 走设备集合通信（默认 262144） |
 | `TS_Q4E_LAYER_SPLIT=20,28` | 仅 Qwen 3.8 Flash Next：用显式的每卡层数取代按层切分的自动显存均衡。给出无法满足的值时直接抛错而不是静默忽略——这个开关有用，是因为自动均衡只按权重定价，看不到后加载、会落在 GPU 0 上的视觉塔 |
 | `TS_GGML_F32_RESIDENT=0` | 每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | 仅 Gemma 4：从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径。融合路径在 26B 上加载时会物化约 10.5 GB 的专家分片（约 36 秒），换来约 10× 的 decode。被 `--n-cpu-moe` 卸载的层不参与这次物化——它们从不在加速器上运行——因此 `--cpu-moe` 也会去掉这笔加载开销 |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | ggml-cuda 集合通信在多大载荷以上把 F32 转成 BF16 再归约。TensorSharp 把 ggml 的默认值（1 字节，即总是转换）提高到 1 MB，使 decode 规模的集合通信精确归约；设为 `0` 则完全禁用转换 |
-| `TS_QWEN35_LAYER_TRACE=1` | 打印首次前向的逐层残差流摘要，单卡与 TP 两条路径都会输出（诊断用） |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`，直接透传给 ggml |
 
 ### 约束
@@ -1882,8 +1879,8 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 
 | 模型 | 默认状态 | 环境变量 | 原生内核子开关 |
 |---|---|---|---|
-| Mistral 3 | 启用 | — | — |
-| Hunyuan Dense | 启用（块量化 KV cache 保留 KV 快照路径）。仅支持单设备：启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组 | — | — |
+| Mistral 3 | 在所有本地放置方式（TP、按层切分、混合）下启用；跨节点按层切分使用串行阶段协议 | — | — |
+| Hunyuan Dense | 在所有放置方式（TP、按层切分、混合）下启用；块量化 KV cache 保留 KV 快照路径 | — | — |
 | Gemma 4 | 启用 | — | — |
 | Qwen 3.5 / 3.6 系列 | 启用 | — | — |
 | GPT OSS | 启用 | — | — |
@@ -1908,7 +1905,6 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | DFlash 投机 prefill 分块 | `1024`（受草稿器环形缓冲与主干窗口限制） | `TS_DFLASH_PREFILL_CHUNK` | — |
 | DFlash2 候选选择器 | 检查点带有时开启 | `TS_DFLASH_SELECTOR=0` 改为按逐位置 argmax 起草（仅用于归因分析） | — |
 | DFlash2 分组卷积 | 检查点带有时开启 | `TS_DFLASH_CONV=0` 去掉它（同上，仅用于归因分析） | — |
-| Qwen 3.5/3.8 递归状态快照 | 开启 | `TS_Q35_VERIFY_SNAPSHOTS=0` 回退为先恢复验证前的状态副本、再对已接受前缀重新前向（更慢；见 [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md)） | — |
 | Gemma 4 融合验证 / 草稿内核（ggml） | 开启 | — | — |
 | Gemma 4 部分接受时的稠密快速回滚 | 开启 | — | — |
 
@@ -2024,7 +2020,6 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | MLX 流水化贪心 decode（仅 CLI `--benchmark`） | 满足条件时启用 | — | — |
 | 使用 `mlock(2)` 钉住 GGUF mmap，使权重常驻 | 启用 | `TS_MLX_MLOCK_GGUF=0` 关闭 | — |
 | MLX 融合多维 KV 写入（每个 cache block 单次 `slice_update`） | 启用 | — | — |
-| MLX 批处理 MoE 解码（Qwen 3.5/3.6 MoE） | 启用 | `TS_MLX_BATCHED_MOE_DECODE=0` 走按专家路径（不保留堆叠副本） | — |
 | MLX MoE gate+up+SiLUMul 融合 Metal kernel | 启用 | — | — |
 | MLX 设备端 MoE router top-K + softmax | 满足条件时启用 | — | — |
 | MLX 解码层边界 `async_eval` 间隔 | Gemma 4 / Muse-Glimmer：每 4 层；Qwen / Nemotron：每 16 层 | `TS_MLX_EVAL_EVERY_N_LAYERS=N`（支持处 `0` = 关闭） | — |

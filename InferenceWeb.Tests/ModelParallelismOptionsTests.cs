@@ -64,11 +64,36 @@ public sealed class ModelParallelismOptionsTests : IDisposable
     }
 
     [Fact]
-    public void BothActiveModesAreRejectedRegardlessOfArgumentOrder()
+    public void BothDegreesSelectHybridPlacementRegardlessOfArgumentOrder()
     {
-        foreach (var args in new[] { new[] { "--tp", "2", "--layer-split", "2" },
-                     new[] { "--layer-split=2", "--tp=2" } })
-            Assert.Contains("cannot both", Assert.Throws<ArgumentException>(() => ModelParallelismOptions.Parse(args)).Message);
+        // --layer-split P stages of --tp T devices each; whether the architecture supports it
+        // is the loader's decision (its serving contract), not the option parser's.
+        foreach (var args in new[] { new[] { "--tp", "2", "--layer-split", "3" },
+                     new[] { "--layer-split=3", "--tp=2" } })
+        {
+            var options = ModelParallelismOptions.Parse(args);
+            Assert.Equal(2, options.TpDegree);
+            Assert.Equal(3, options.LayerSplitDegree);
+            Assert.False(options.IsLayerSplit);
+            Assert.Null(options.Distributed);
+        }
+    }
+
+    /// <summary>Across nodes an explicit --layer-split selects the node pipeline and --tp sizes each of this node's
+    /// stages, even --layer-split 1 (one stage of --tp GPUs); --tp alone stays one group spanning the nodes.</summary>
+    [Theory]
+    [InlineData("--layer-split=2", "--tp=2", true, 4)]
+    [InlineData("--layer-split=1", "--tp=2", true, 2)]
+    [InlineData("--layer-split=2", "--tp=1", true, 2)]
+    [InlineData("--tp=2", "--tp=2", false, 2)]
+    public void LayerSplitAcrossNodesSelectsTheNodePipeline(string first, string second, bool pipeline, int localDevices)
+    {
+        var options = ModelParallelismOptions.Parse(new[]
+        {
+            first, second, "--tp-node-id=0", "--tp-peers=127.0.0.1:9500,127.0.0.1:9501",
+        });
+        Assert.Equal(pipeline, options.IsDistributedPipeline);
+        Assert.Equal(localDevices, options.Distributed.LocalDegree);
     }
 
     [Fact]
@@ -88,7 +113,7 @@ public sealed class ModelParallelismOptionsTests : IDisposable
     public void InvalidConfigurationDoesNotPartiallyMutateEnvironment()
     {
         Environment.SetEnvironmentVariable(ModelParallelismOptions.TpDegreeVariable, "1");
-        Assert.Throws<ArgumentException>(() => ModelParallelismOptions.Parse(new[] { "--tp=2", "--layer-split=2" }));
+        Assert.Throws<ArgumentException>(() => ModelParallelismOptions.Parse(new[] { "--tp=2", "--layer-split=0" }));
         Assert.Equal("1", Environment.GetEnvironmentVariable(ModelParallelismOptions.TpDegreeVariable));
         Assert.Null(Environment.GetEnvironmentVariable(ModelParallelismOptions.LayerSplitDegreeVariable));
     }
@@ -101,6 +126,9 @@ public sealed class ModelParallelismOptionsTests : IDisposable
         Assert.Equal(3, options.LayerSplitDegree);
         Assert.False(options.ApplyEnvironment());
         Environment.SetEnvironmentVariable(ModelParallelismOptions.TpDegreeVariable, "2");
+        var hybrid = ModelParallelismOptions.Parse(Array.Empty<string>());
+        Assert.Equal((2, 3), (hybrid.TpDegree, hybrid.LayerSplitDegree));
+        Environment.SetEnvironmentVariable(ModelParallelismOptions.TpDegreeVariable, "zero");
         Assert.Throws<ArgumentException>(() => ModelParallelismOptions.Parse(Array.Empty<string>()));
     }
 

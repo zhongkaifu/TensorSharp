@@ -117,11 +117,6 @@ a matching radix path must also have an actual recurrent-state snapshot at its
 branch boundary. TensorSharp implements its own checkpoint planning and
 retention; it does not depend on SGLang or modify ggml.
 
-The [parent-prefix validation probe](../eng/validation/Qwen35ParentPrefixProbe/README.md)
-compares parent-plus-two-child workflows with and without the earlier checkpoint,
-including its capture cost and exact generated-token comparisons. Both arms keep
-ordinary radix caching and the default public checkpoint count of two enabled.
-
 Agents belong to a request-scoped tree with parent identity and depth. Limits
 apply across that tree, including children created by other children. Agent IDs
 are paths below `/root`, the parent: a child named `review_api` is

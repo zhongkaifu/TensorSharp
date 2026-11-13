@@ -2268,6 +2268,17 @@ namespace tsg
     bool moe_stage_prefetch_enabled() { return stage_prefetch_enabled_impl(); }
     void moe_stage_prefetch_start(const HostMoeSegment& hm) { stage_prefetch_start_impl(hm); }
     void moe_stage_prefetch_join() { stage_prefetch_join_impl(); }
+    // A pass's end: the staging threads joined and every stack its seams did not take retired. A later pass (another
+    // model's, whose experts may be mapped at the same addresses) stages its own; it never takes one staged for this.
+    void moe_stage_prefetch_retire()
+    {
+        stage_prefetch_join_impl();
+        for (StagePrefetch& s : g_stage_prefetch)
+        {
+            s.active = false;
+            s.src[0] = s.src[1] = s.src[2] = nullptr;
+        }
+    }
     bool moe_stage_prefetch_take(const void* gate, const void* up, const void* down, ggml_backend_buffer_t& buf,
                                  std::size_t offset[3], std::size_t bytes[3])
     { return stage_prefetch_take_impl(gate, up, down, buf, offset, bytes); }
@@ -2377,8 +2388,6 @@ namespace tsg
 
     void moe_ffn_host_release()
     {
-        // Cached CUDA graphs must retire before the backend and mapped weights.
-        host_moe_expert_cache_release();
         // Give the locked expert pages back first: a model reload maps a new
         // GGUF, and leaving the previous one pinned would charge its bytes to
         // the pin budget forever.
@@ -2534,10 +2543,9 @@ namespace tsg
     }
 
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
-                                  HostMoeStagedInputs* staged, bool allow_device_stream, bool* output_on_device,
+                                  HostMoeStagedInputs* staged, bool allow_device_stream,
                                   void (*after_split)(void*), void* after_split_ctx)
     {
-        if (output_on_device != nullptr) *output_on_device = false;
         if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
             hm.weights == nullptr || hm.moe_out == nullptr)
         {
@@ -2658,33 +2666,6 @@ namespace tsg
             return ok;
         }
 
-        // CUDA compact slots can keep activations and routing probabilities on
-        // the device. The host only needs IDs for slot selection; retain staged
-        // reads when diagnostics request them and when the cache declines.
-        static const bool s_cache_device_inputs = [] {
-            const char* e = std::getenv("TS_HOST_MOE_EXPERT_CACHE_BRIDGE");
-            return e == nullptr || e[0] != '0';
-        }();
-        if (allow_device_stream && staged == nullptr && s_cache_device_inputs)
-        {
-            static const bool s_cache_device_outputs = [] {
-                const char* e = std::getenv("TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE");
-                return e == nullptr || e[0] != '0';
-            }();
-            if (output_on_device != nullptr && s_cache_device_outputs)
-            {
-                const int cached = host_moe_cached_experts(hm, nullptr, s_ids.data(),
-                    nullptr, nullptr, kernel_name);
-                if (cached != 0)
-                {
-                    *output_on_device = cached > 0;
-                    return cached > 0;
-                }
-            }
-            const int cached = host_moe_cached_experts(hm, nullptr, s_ids.data(),
-                nullptr, out.data(), kernel_name);
-            if (cached != 0) return cached > 0;
-        }
         ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
         ggml_backend_tensor_get(hm.weights, s_weights.data(), 0, route_count * sizeof(float));
 
@@ -2695,10 +2676,6 @@ namespace tsg
             staged->weights = s_weights.data();
         }
 
-        const int cached = allow_device_stream ? host_moe_cached_experts(hm, s_moe_in.data(), s_ids.data(),
-            s_weights.data(), out.data(), kernel_name) : 0;
-        if (cached != 0)
-            return cached > 0;
         if (host_moe_decode_experts(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
             return true;
         if (hm.independent_decode_rows && hm.seq_len > 1)
@@ -2917,7 +2894,7 @@ namespace tsg
             const auto t_host = timing ? clock::now() : clock::time_point{};
             // The split writes the plan and releases the kernels (seams_active); the host's routes follow on the CPU
             // (no device stream: the queue is held by this pass's waits).
-            ok = host_moe_compute_segment(hm, s_out, kernel_name, nullptr, false, nullptr, nullptr, nullptr);
+            ok = host_moe_compute_segment(hm, s_out, kernel_name, nullptr, false, nullptr, nullptr);
             if (timing) *acc_host += ms_since(t_host);
             if (!ok) break;
             // The accelerator runs this layer's tier routes now (the split released them): read the next tier's
@@ -3001,6 +2978,8 @@ namespace tsg
         double& s_acc_gpu = acc.gpu; double& s_acc_host = acc.host; double& s_acc_up = acc.up;
         double& s_acc_total = acc.total; int& s_acc_passes = acc.passes; int& s_acc_seq = acc.seq;
         const auto t_pass = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
+        // The route counters as the report's first pass starts (taken after it, a prompt pass - reported alone - read 0).
+        if (s_pass_timing && (s_acc_passes == 0 || pass_seq != s_acc_seq)) TSGgml_MoeOffloadCounters(acc.c0, 9);
         auto ms_since = [](pass_clock::time_point t) {
             return std::chrono::duration<double, std::milli>(pass_clock::now() - t).count();
         };
@@ -3030,7 +3009,7 @@ namespace tsg
 
         // Prompt-sized passes: stage the next offloaded layer's experts while the accelerator runs (see
         // moe_stage_prefetch_start); every staging thread is joined before this returns.
-        struct PrefetchJoin { ~PrefetchJoin() { moe_stage_prefetch_join(); } } prefetch_join;
+        struct PrefetchJoin { ~PrefetchJoin() { moe_stage_prefetch_retire(); } } prefetch_join;
         const int stream_threshold = moe_offload_stream_batch_threshold();
         // The next host-expert segment at or after i (device operations have no experts to stage).
         auto next_host = [&](std::size_t i) {
@@ -3142,7 +3121,6 @@ namespace tsg
             // (The verify chain wants the host result to compare against, so it
             // keeps the staged path.)
             HostMoeStagedInputs staged;
-            bool output_on_device = false;
             // A tiered seam launches the accelerator's half of the layer (every node of
             // the next segment up to hot_out: the tier's routes, and whatever else the
             // graph placed before them, none of which reads moe_out) as soon as the
@@ -3173,7 +3151,6 @@ namespace tsg
 #endif
             if (!host_moe_compute_segment(hm, s_moe_out, kernel_name,
                                           debug_this_call ? &staged : nullptr, true,
-                                          !debug_this_call && hm.verify_gpu == nullptr ? &output_on_device : nullptr,
                                           hot.end > hot.begin ? +launch_hot : nullptr, &hot))
             {
                 if (hot.launched) sync_backend(backend);
@@ -3215,7 +3192,7 @@ namespace tsg
             }
 
             const auto t_up = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
-            if (!output_on_device) host_moe_upload_segment(hm, s_moe_out.data());
+            host_moe_upload_segment(hm, s_moe_out.data());
             if (s_pass_timing) s_acc_up += ms_since(t_up);
 
             if (debug_this_call)
@@ -3249,7 +3226,6 @@ namespace tsg
             }
             s_acc_seq = seq;
             s_acc_total += ms_since(t_pass);
-            if (s_acc_passes == 0) TSGgml_MoeOffloadCounters(acc.c0, 9);
             // Decode/verify widths report over 32 passes; a prompt pass (one a chunk, rare) reports on its own.
             const int report_every = seq > 8 ? 1 : 32;
             if (++s_acc_passes == report_every)

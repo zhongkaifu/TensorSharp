@@ -127,7 +127,7 @@ class ComparisonTests(unittest.TestCase):
 
     def test_changed_environment_controls_fail(self):
         candidate = self.candidate()
-        candidate["environment"]["TS_CUDA_PREFILL_GRAPH_MAX_SEQLEN"] = "1"
+        candidate["environment"]["TS_PREFILL_CHUNK"] = "1024"
         with self.assertRaisesRegex(ValueError, "environment controls"):
             module.compare([self.report], [candidate])
 

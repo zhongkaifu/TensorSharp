@@ -86,37 +86,15 @@ namespace TensorSharp.Models
             {
                 return true;
             }
-            // Likewise a per-token head the constructor attached itself: Qwen3.8-Flash-Next's MTP block on
-            // --backend cuda lives in the direct engine's own placement, so it is loaded with the model.
-            if (model is Qwen4ExpCudaModel { HasDraftHead: true })
+            // Likewise a per-token head the constructor attached itself: Qwen3.8-Flash-Next's shared MTP block loads with
+            // the model (the runtime's draft layer; on --backend cuda the direct engine's own placement).
+            if (model is Qwen4ExpCudaModel { HasDraftHead: true } or Qwen4ExpRuntimeModel { DraftHeadKind: DraftHeadKind.PerToken })
                 return true;
 
             if (!File.Exists(draftPath))
             {
                 error = $"Draft-head model file not found: {draftPath}";
                 return false;
-            }
-
-            if (model is Qwen4ExpModel qwen4Exp)
-            {
-                // A DFlash drafter attaches in the constructor, where its feature taps are
-                // set up; reaching here means the constructor declined it and said why.
-                if (Qwen4ExpModel.IsDFlashDraftFile(draftPath))
-                {
-                    error = $"DFlash drafter '{Path.GetFileName(draftPath)}' was not attached when the model loaded "
-                            + "(the load log gives the reason).";
-                    return false;
-                }
-                try
-                {
-                    qwen4Exp.LoadMtpDraftWeights(draftPath);
-                    return qwen4Exp.HasDraftHead;
-                }
-                catch (Exception ex)
-                {
-                    error = $"Failed to load Qwen4Exp shared MTP head '{Path.GetFileName(draftPath)}': {ex.Message}";
-                    return false;
-                }
             }
 
             // A DFlash / DFlash2 drafter is architecture-agnostic on this side: any

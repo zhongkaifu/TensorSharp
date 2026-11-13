@@ -21,8 +21,8 @@
 // up to 8 activation rows take the q8_1 GEMV, more the FP4 tensor-core GEMM. The embedding is
 // Q4_0 and the LM head Q6_K, read as stored.
 //
-// The reference is the native executor ggml_cuda runs (ggml_ops_qwen35_verify.cpp); the kernels
-// follow its numerics (q8_1 / NVFP4 activation rounding, q8_0 caches, F16 attention operands).
+// The reference is the shared decoder runtime's graphs on ggml_cuda (Qwen35RuntimeModel); the kernels
+// follow ggml_cuda's numerics (q8_1 / NVFP4 activation rounding, q8_0 caches, F16 attention operands).
 // ---------------------------------------------------------------------------
 using System;
 using System.Collections.Generic;

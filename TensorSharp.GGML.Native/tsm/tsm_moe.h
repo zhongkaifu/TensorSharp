@@ -140,6 +140,12 @@ namespace tsm
                          const ggml_tensor* idx, const ggml_tensor* cnt, const ggml_tensor* mask_in, ggml_tensor* out,
                          int T, int n_head, int n_head_kv, int n_cells, int width, float scale);
     long long qsa_attn_count();
+    // A selection given as its attention mask (F16 [cells, T]: the chosen cells finite, the rest -inf) as
+    // qsa_attn_encode's lists: idx I32 [width, T], each token's finite cells ascending, and cnt I32 [T].
+    bool qsa_compact_encode(ggml_backend* backend, const ggml_tensor* mask, ggml_tensor* idx, ggml_tensor* cnt,
+                            int T, int n_cells, int width);
+    // The narrowest window qsa_attn_supported takes, for tests (0: the default and TS_METAL_QSA_ATTN_MIN_CELLS).
+    void qsa_attn_set_min_cells(int cells);
 
     // A prompt chunk's routed experts on Strata's grouped GEMM (tsm/kernels/tsm_moe_mm.metal, the Metal 4 tensor API):
     // the (token, expert) entries sorted by expert into 16-row tiles, gate+up+SwiGLU in one pass, down, then each

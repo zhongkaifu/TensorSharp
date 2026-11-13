@@ -127,12 +127,14 @@ public sealed class CudaKernelAvailabilityTests
         // does: its engine's GEMMs need sm_120a SASS (CommittedBaseline=false in the csproj;
         // a refresh never copies it). The three *_prefill modules are the direct-CUDA prefill
         // plan's (flash attention, grouped MoE, recurrent layers); each carries its
-        // ts_<module>_caps version probe (CudaPrefillModuleTests).
+        // ts_<module>_caps version probe (CudaPrefillModuleTests). tensorsharp_graph_kernels holds the graph
+        // executor's ops (CudaGraphExecutor), with its ts_graph_caps probe.
         Assert.Equal(
             new[]
             {
-                "tensorsharp_dsv4_kernels", "tensorsharp_flash_prefill", "tensorsharp_glm_kernels", "tensorsharp_kernels",
-                "tensorsharp_ltx25", "tensorsharp_moe_prefill", "tensorsharp_q4e_kernels", "tensorsharp_ssm_prefill",
+                "tensorsharp_dsv4_kernels", "tensorsharp_flash_prefill", "tensorsharp_glm_kernels", "tensorsharp_graph_kernels",
+                "tensorsharp_kernels", "tensorsharp_ltx25", "tensorsharp_moe_prefill", "tensorsharp_q4e_kernels",
+                "tensorsharp_ssm_prefill",
             },
             CommittedModuleNames());
     }

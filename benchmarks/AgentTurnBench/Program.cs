@@ -91,7 +91,7 @@ internal static class Program
         model.WarmUpKernels();
         // These managed cache implementations allocate K/V using KvCacheDtype.
         // Opaque native executors need their own effective-storage diagnostics.
-        if (model is Gemma4Model or Qwen35Model or GptOssModel)
+        if (model is Gemma4Model or StandardDecoderModel or GptOssModel)
             Console.WriteLine($"[agent-turn-bench] effective managed KV storage dtype={model.KvCacheDtype.ToShortString()} model_type={model.GetType().Name}");
         Console.WriteLine($"[agent-turn-bench] loaded {model.Config.Architecture} in {swLoad.Elapsed.TotalSeconds:0.0}s; " +
                           $"context={model.MaxContextLength} drafter={DescribeDrafter(model)}");

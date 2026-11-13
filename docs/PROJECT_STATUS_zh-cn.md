@@ -255,7 +255,7 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
     `TS_GPTOSS_FUSED_DECODE`、`TS_GPTOSS_TP_*`、`TS_GPTOSS_MLX_MOE_GQMM`、`TS_GPTOSS_PAGED_ATTN_MANAGED`），以及关闭
     默认路径的 Qwen 3.5 与 Gemma 4 开关（`TS_QWEN35_FULL_DECODE`、`TS_QWEN35_FUSED_VERIFY`、`TS_QWEN35_TP_FUSED*`、
     `TS_G4_*`、`TS_GMTP_NO_*` 等）。`TS_QWEN35_HOST_MOE_VERIFY` 改为 `TS_HOST_MOE_VERIFY`。`TS_Q35_VERIFY_SNAPSHOTS=0`
-    保留：它是 `ggml_cuda` 上宽 verify 分歧这一未修复问题的规避手段；
+    作为 `ggml_cuda` 上宽 verify 分歧的规避手段一直保留，直到 `Qwen35Model` 本身于 2026-11 删除；
   - 两个从未默认启用的实验：Qwen 3.5 的设备端常驻 verify 状态（`TS_QWEN35_VERIFY_RESIDENT`，已知结果错误）与
     Gemma 4 的批处理分页投机主干（`TS_GMTP_BATCHED_TRUNK`，速度约为融合线性 verify 的一半）。投机解码总在模型的
     线性缓存上运行；
@@ -290,8 +290,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   - 与 `--tp` / `--layer-split` 并存的放置拼写：`TS_DSV41_TP`（只用 `--tp N` 即可启用 DeepSeek V4.1 的 routed-MoE
     张量并行），以及 `TS_DSV4_NGPU` / `TS_GLM_NGPU`（GPU 数由 `--layer-split N` 设置；没有“全部可见 GPU”的简写，
     不给放置参数时这些执行器只用一张卡）；
-  - `TS_Q4E_RETAINED_CACHE`：Qwen 3.8 Flash Next 始终保留已结束的会话与共享前缀检查点，其内存由
-    `TS_Q4E_RETAINED_CACHE_MB` 决定（`0` 表示不保留）；
+  - `TS_Q4E_RETAINED_CACHE` 与 `TS_Q4E_RETAINED_CACHE_MB`：Qwen 3.8 Flash Next 已结束的会话与共享前缀检查点
+    由共享运行时的前缀缓存保留；
   - 更多关闭默认路径或进入已结束实验的开关：Qwen 3.8 Flash Next 的 `TS_Q4E_TOKEN_GRAPH`、`TS_Q4E_SPAN_ATTN`、
     `TS_Q4E_FLASH_ATTN`、`TS_Q4E_GRAPH_UID`、`TS_Q4E_SPAN_STATE`、`TS_Q4E_SPAN_REBUILD`、`TS_Q4E_SPAN_FA_MAX`、
     `TS_Q4E_GDN_MAX_LAYERS` 与 `TS_Q4E_RES_RESIDENT`（已知结果错误）；GLM 5.x 的 `TS_GLM_FA`、`TS_GLM_FUSED_LID`、

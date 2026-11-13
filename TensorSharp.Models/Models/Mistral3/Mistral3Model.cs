@@ -9,57 +9,38 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using TensorSharp;
-using TensorSharp.GGML;
-using TensorSharp.MLX;
+using System.Globalization;
 
 namespace TensorSharp.Models
 {
     /// <summary>
-    /// Mistral 3 model architecture.
-    /// Key features:
-    /// - Standard LLaMA-like transformer with SiLU-gated MLP (SwiGLU)
+    /// Mistral 3, on the shared decoder runtime (which provides the single-sequence and batched
+    /// forwards, tensor parallelism, layer split - local or multi-node - and their hybrid).
+    /// What is Mistral's own:
     /// - GPT-J (norm) style RoPE with YaRN scaling for extended context
     /// - Position-dependent Q scaling: q *= (1 + beta * log(1 + floor(pos / orig_ctx)))
     /// - No per-head QK normalization
-    /// - Supports multimodal (vision) via separate Pixtral vision encoder
+    /// - Multimodal (vision) through the separate Pixtral vision encoder
     /// </summary>
-    public partial class Mistral3Model : ModelBase
+    public partial class Mistral3Model : StandardDecoderModel
     {
-        // Bound the MLX lazy-graph depth across the per-layer dispatch loop.
-        // Default matches Qwen35 (16). Override via TS_MLX_EVAL_EVERY_N_LAYERS.
-        private static readonly int MlxEvalEveryNLayers = ResolveMlxEvalEveryNLayers();
-        private static int ResolveMlxEvalEveryNLayers()
-        {
-            string env = Environment.GetEnvironmentVariable("TS_MLX_EVAL_EVERY_N_LAYERS");
-            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
-                return v;
-            return 16;
-        }
-
-        private Tensor[] _kvCacheK;
-        private Tensor[] _kvCacheV;
-
-        private string[][] _layerWeightNames;
-        private float[] _ropeFreqs;
-        private int _ropeDim;
-        private int _attnKeyLen;
-        private int _attnValLen;
+        private readonly int _ropeDim;
 
         // YaRN scaling parameters
-        private float _ropeScalingBeta;
-        private int _ropeOrigCtx;
-        private float _ropeExtFactor;
-        private float _ropeBetaFast;
-        private float _ropeBetaSlow;
-        private float _ropeMscale;
-        private float _ropeMscaleAllDim;
-        private string _ropeType;
+        private readonly float _ropeScalingBeta;
+        private readonly int _ropeOrigCtx;
+        private readonly float _ropeExtFactor;
+        private readonly float _ropeBetaFast;
+        private readonly float _ropeBetaSlow;
+        private readonly float _ropeMscale;
+        private readonly float _ropeMscaleAllDim;
+        private readonly float _ropeYarnLogMul;
+        private readonly float _ropeAttnFactor;
+        private readonly string _ropeType;
+        private readonly RotarySpec _rotary;
 
         // Vision support
         private Mistral3VisionEncoder _visionEncoder;
-        private List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
 
         // Preserve the CLR signature used by existing compiled callers.
         public Mistral3Model(string ggufPath, BackendType backend, int tpDegree, ITensorParallelGroup tpGroup)
@@ -85,9 +66,9 @@ namespace TensorSharp.Models
             }
             ParseBaseConfig();
 
-            _attnKeyLen = Config.KeyLength > 0 ? Config.KeyLength : Config.HeadDim;
-            _attnValLen = Config.ValueLength > 0 ? Config.ValueLength : _attnKeyLen;
-            _ropeDim = (int)_gguf.GetUint32($"{arch}.rope.dimension_count", (uint)_attnKeyLen);
+            int keyLen = Config.KeyLength > 0 ? Config.KeyLength : Config.HeadDim;
+            int valueLen = Config.ValueLength > 0 ? Config.ValueLength : keyLen;
+            _ropeDim = (int)_gguf.GetUint32($"{arch}.rope.dimension_count", (uint)keyLen);
 
             // YaRN parameters
             _ropeType = _gguf.GetString($"{arch}.rope.scaling.type", "");
@@ -102,65 +83,29 @@ namespace TensorSharp.Models
                             _gguf.GetFloat32($"{arch}.rope.scaling.beta_slow", 1.0f));
             _ropeMscale = _gguf.GetFloat32($"{arch}.rope.scaling.mscale", 0f);
             _ropeMscaleAllDim = _gguf.GetFloat32($"{arch}.rope.scaling.mscale_all_dim", 0f);
+            _ropeYarnLogMul = _gguf.GetFloat32($"{arch}.rope.scaling.yarn_log_multiplier", 0f);
+            _ropeAttnFactor = YarnAttnFactor(_gguf.GetFloat32($"{arch}.rope.scaling.attn_factor", 1f));
 
             Console.WriteLine($"Model: {arch}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
-                $"Heads={Config.NumHeads}, KVHeads={Config.NumKVHeads}, KeyLen={_attnKeyLen}, " +
-                $"ValLen={_attnValLen}, Vocab={Config.VocabSize}");
+                $"Heads={Config.NumHeads}, KVHeads={Config.NumKVHeads}, KeyLen={keyLen}, " +
+                $"ValLen={valueLen}, Vocab={Config.VocabSize}");
             Console.WriteLine($"RoPE base={Config.RopeBase}, scale={Config.RopeScale}, type={_ropeType}, " +
                 $"dim={_ropeDim}, origCtx={_ropeOrigCtx}");
             if (_ropeType == "yarn")
                 Console.WriteLine($"YaRN beta={_ropeScalingBeta}, betaFast={_ropeBetaFast}, " +
-                    $"betaSlow={_ropeBetaSlow}, extFactor={_ropeExtFactor}");
+                    $"betaSlow={_ropeBetaSlow}, extFactor={_ropeExtFactor}, attnFactor={_ropeAttnFactor}");
+
+            bool yarn = _ropeType == "yarn";
+            _rotary = new RotarySpec(_ropeDim, neoX: false, Config.RopeBase, 1.0f / Config.RopeScale, _ropeOrigCtx,
+                yarn ? _ropeExtFactor : 0f, _ropeAttnFactor, yarn ? _ropeBetaFast : 0f, yarn ? _ropeBetaSlow : 0f);
 
             ParseTokenizer();
-            try
-            {
-                if (LayerSplitGroup != null || LayerSplitDegree > 1)
-                    ApplyModelAlignedKvCacheDefaultFromMetadata();
-                ConfigureLayerPlacement(FormattableString.Invariant(
-                    $"mistral3|{Config.NumHeads}|{Config.NumKVHeads}|{_attnKeyLen}|{_attnValLen}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeType}|{_ropeDim}|{_ropeOrigCtx}|{_ropeScalingBeta:R}|{_ropeExtFactor:R}|{_ropeBetaFast:R}|{_ropeBetaSlow:R}|{_ropeMscale:R}|{_ropeMscaleAllDim:R}|{_kvCacheDtype}"), balanceWeightBytes: true);
-            }
-            catch { base.Dispose(); throw; }
-            LoadWeights();
-            FuseQKVWeights();
-            FuseGateUpWeights();
-
-            if (IsTensorParallel)
-            {
-                ShardMistral3WeightsForTP();
-                PrepareCudaQuantizedWeightsForInferenceTP();
-            }
-            else
-            {
-                PrepareCudaQuantizedWeightsForInference();
-            }
-
-            int maxContextLength = ResolveConfiguredContextLength();
-            int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
-            if (initialCacheLength < maxContextLength)
-                Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
-
-            if (IsTensorParallel)
-                InitTpKVCache(initialCacheLength, maxContextLength);
-            else
-                InitKVCache(initialCacheLength, maxContextLength);
-
-            PrecomputeConstants();
+            // "rope2": every position rotates through RoPEEx with the attention factor above.
+            // Prefix checkpoints saved by the earlier rotary (host decode frequencies, YaRN
+            // mscale not cancelled) hold different K rows and must not be reused.
+            InitializeDecoder(keyLen, valueLen, string.Create(CultureInfo.InvariantCulture,
+                $"mistral3|rope2|{Config.NumHeads}|{Config.NumKVHeads}|{keyLen}|{valueLen}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeType}|{_ropeDim}|{_ropeOrigCtx}|{_ropeScalingBeta:R}|{_ropeExtFactor:R}|{_ropeBetaFast:R}|{_ropeBetaSlow:R}|{_ropeAttnFactor:R}"));
         }
-
-        private void FuseQKVWeights()
-        {
-            int fused = 0;
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (TryFuseQkvWeights(l))
-                    fused++;
-            }
-            if (fused > 0)
-                Console.WriteLine($"  Fused projections: {fused} QKV");
-        }
-
-        private bool[] _layerQkvFused;
 
         // Text LoRA: on a single device every projection of a decoder layer and the LM head
         // run through LinearForward, attn_q/k/v and ffn_gate/up as their fused weights. The one
@@ -176,239 +121,10 @@ namespace TensorSharp.Models
                 ? null
                 : "is not one of the projections Mistral 3 applies a LoRA delta to";
 
-        private void PrecomputeConstants()
-        {
-            int numLayers = Config.NumLayers;
-            _layerQkvFused = new bool[numLayers];
+        // ---------------------------------------------------------------- vision
 
-            _layerWeightNames = new string[numLayers][];
-            for (int l = 0; l < numLayers; l++)
-            {
-                string p = $"blk.{l}.";
-                // Check the TP-sharded dictionaries too: under tensor parallelism
-                // ShardMistral3WeightsForTP (which runs before PrecomputeConstants)
-                // has already moved the fused attn_qkv out of _quantWeights into
-                // _tpQuantWeights, so a plain _quantWeights lookup would wrongly
-                // mark fused layers as "separate" and the forward would ask for the
-                // now-consumed attn_q.weight.
-                string qkvName = p + "attn_qkv.weight";
-                bool fused = _quantWeights.ContainsKey(qkvName) ||
-                             _weights.ContainsKey(qkvName) ||
-                             _tpQuantWeights.ContainsKey(qkvName) ||
-                             _tpWeights.ContainsKey(qkvName);
-                _layerQkvFused[l] = fused;
-
-                if (fused)
-                {
-                    _layerWeightNames[l] = new[]
-                    {
-                        p + "attn_norm.weight",      // 0
-                        p + "attn_qkv.weight",        // 1
-                        p + "attn_output.weight",     // 2
-                        p + "ffn_norm.weight",         // 3
-                        p + "ffn_gate_up.weight",      // 4
-                        p + "ffn_down.weight",         // 5
-                    };
-                }
-                else
-                {
-                    _layerWeightNames[l] = new[]
-                    {
-                        p + "attn_norm.weight",      // 0
-                        p + "attn_q.weight",          // 1
-                        p + "attn_k.weight",          // 2
-                        p + "attn_v.weight",          // 3
-                        p + "attn_output.weight",     // 4
-                        p + "ffn_norm.weight",         // 5
-                        p + "ffn_gate_up.weight",      // 6
-                        p + "ffn_down.weight",         // 7
-                    };
-                }
-            }
-
-            int halfDim = _ropeDim / 2;
-            float freqScale = 1.0f / Config.RopeScale;
-            _ropeFreqs = new float[halfDim];
-            for (int i = 0; i < halfDim; i++)
-                _ropeFreqs[i] = freqScale / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDim);
-
-            if (_ropeType == "yarn" && _ropeOrigCtx > 0)
-                ApplyYarnFreqCorrection(_ropeFreqs, halfDim);
-        }
-
-        /// <summary>
-        /// Apply YaRN frequency correction to precomputed RoPE frequencies for decode path.
-        /// Interpolates between extrapolated and interpolated frequencies based on
-        /// whether each frequency band is within the "slow" or "fast" rotation range.
-        /// </summary>
-        private void ApplyYarnFreqCorrection(float[] freqs, int halfDim)
-        {
-            float lowFreqWavelen = (float)(_ropeOrigCtx / _ropeBetaSlow);
-            float highFreqWavelen = (float)(_ropeOrigCtx / _ropeBetaFast);
-
-            for (int i = 0; i < halfDim; i++)
-            {
-                float origFreq = 1.0f / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDim);
-                float wavelen = 2.0f * MathF.PI / origFreq;
-
-                if (wavelen < highFreqWavelen)
-                {
-                    // High frequency: use original frequency (extrapolation)
-                    freqs[i] = origFreq;
-                }
-                else if (wavelen > lowFreqWavelen)
-                {
-                    // Low frequency: use interpolated frequency
-                    freqs[i] = origFreq / Config.RopeScale;
-                }
-                else
-                {
-                    // Intermediate: smooth blend between interpolated and extrapolated
-                    float smooth = (lowFreqWavelen / wavelen - 1.0f) /
-                                   (lowFreqWavelen / highFreqWavelen - 1.0f);
-                    float interpFreq = origFreq / Config.RopeScale;
-                    freqs[i] = (1.0f - smooth) * interpFreq + smooth * origFreq;
-                }
-            }
-        }
-
-        private int _kvCacheCapacity;
-
-        private void InitKVCache(int initialSeqLen, int maxSeqLen)
-        {
-            _maxContextLength = maxSeqLen;
-            _kvCacheCapacity = initialSeqLen;
-            int numKVHeads = Config.NumKVHeads;
-            if (LayerPlacement == null)
-                ApplyModelAlignedKvCacheDefault(_quantWeights);
-            DType kvDtype = _kvCacheDtype.ToDType();
-            _kvCacheK = new Tensor[Config.NumLayers];
-            _kvCacheV = new Tensor[Config.NumLayers];
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (LayerPlacement != null && !LayerPlacement.Owns(l)) continue;
-                _kvCacheK[l] = new Tensor(LayerAllocator(l), kvDtype, numKVHeads, initialSeqLen, _attnKeyLen);
-                _kvCacheV[l] = new Tensor(LayerAllocator(l), kvDtype, numKVHeads, initialSeqLen, _attnValLen);
-                InitializeCacheTensor(_kvCacheK[l]);
-                InitializeCacheTensor(_kvCacheV[l]);
-            }
-            _cacheSeqLen = 0;
-        }
-
-        private void EnsureCacheCapacity(int requiredSeqLen)
-        {
-            if (requiredSeqLen <= _kvCacheCapacity)
-                return;
-            if (requiredSeqLen > _maxContextLength)
-                throw new InvalidOperationException($"Requested sequence length {requiredSeqLen} exceeds configured max context {_maxContextLength}.");
-
-            int newCapacity = Math.Max(_kvCacheCapacity, 1);
-            while (newCapacity < requiredSeqLen)
-                newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
-
-            int numKVHeads = Config.NumKVHeads;
-            DType kvDtype = _kvCacheDtype.ToDType();
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (LayerPlacement != null && !LayerPlacement.Owns(l)) continue;
-                var newK = new Tensor(LayerAllocator(l), kvDtype, numKVHeads, newCapacity, _attnKeyLen);
-                var newV = new Tensor(LayerAllocator(l), kvDtype, numKVHeads, newCapacity, _attnValLen);
-                InitializeCacheTensor(newK);
-                InitializeCacheTensor(newV);
-
-                if (_cacheSeqLen > 0)
-                {
-                    using var srcK = _kvCacheK[l].Narrow(1, 0, _cacheSeqLen);
-                    using var dstK = newK.Narrow(1, 0, _cacheSeqLen);
-                    Ops.Copy(dstK, srcK);
-
-                    using var srcV = _kvCacheV[l].Narrow(1, 0, _cacheSeqLen);
-                    using var dstV = newV.Narrow(1, 0, _cacheSeqLen);
-                    Ops.Copy(dstV, srcV);
-                }
-
-                _kvCacheK[l].Dispose();
-                _kvCacheV[l].Dispose();
-                _kvCacheK[l] = newK;
-                _kvCacheV[l] = newV;
-            }
-
-            _kvCacheCapacity = newCapacity;
-            Console.WriteLine($"Expanded Mistral3 attention cache to {newCapacity} tokens.");
-        }
-
-        protected override void ResetKVCacheCore()
-        {
-            // Setting _cacheSeqLen = 0 is the functional reset: subsequent forwards
-            // overwrite the cache from position 0. Under TP the non-TP _kvCacheK/_kvCacheV
-            // arrays are null (TP uses _tpKvCacheK/_tpKvCacheV, whose tensors get overwritten
-            // on the next forward), so guard the tensor-clearing loop against null.
-            _cacheSeqLen = 0;
-            _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
-            _forwardCount = 0;
-            _forwardSw.Reset();
-            if (_kvCacheK == null) return;
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (_kvCacheK[l] == null) continue;
-                ResetCacheTensor(_kvCacheK[l]);
-                ResetCacheTensor(_kvCacheV[l]);
-            }
-        }
-
-        protected override void TruncateKVCacheCore(int tokenCount)
-        {
-            base.TruncateKVCacheCore(tokenCount);
-            if (_kvCacheK == null) return;
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (_kvCacheK[l] == null) continue;
-                InvalidateTensorDeviceCache(_kvCacheK[l]);
-                InvalidateTensorDeviceCache(_kvCacheV[l]);
-            }
-        }
-
-        public override bool SupportsKVStateSnapshot => LayerPlacement == null && _kvCacheK != null && _kvCacheV != null;
-
-        public override string KVStateFingerprint =>
-            $"mistral3|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|kL={_attnKeyLen}|vL={_attnValLen}|dtype={_kvCacheDtype.ToShortString()}";
-
-        public override long ComputeKVBlockByteSize(int tokenCount)
-            => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokenCount);
-
-        public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
-        {
-            if (!SupportsKVStateSnapshot)
-                return false;
-            return KvBlockTransfer.Extract(
-                _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
-                startToken, tokenCount, destination);
-        }
-
-        public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
-        {
-            if (!SupportsKVStateSnapshot)
-                return false;
-            EnsureCacheCapacity(destToken + tokenCount);
-            if (!KvBlockTransfer.Inject(
-                    _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
-                    destToken, tokenCount, source))
-            {
-                return false;
-            }
-            _cacheSeqLen = destToken + tokenCount;
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                InvalidateTensorDeviceCache(_kvCacheK[l]);
-                InvalidateTensorDeviceCache(_kvCacheV[l]);
-            }
-            return true;
-        }
-
-        // Vision support
         public void LoadVisionEncoder(string mmProjPath)
         {
-            RefuseVisionOffFirstStage();
             _visionEncoder = new Mistral3VisionEncoder(mmProjPath, _allocator);
             _visionEncoder.SetHostModel(this);
         }
@@ -417,522 +133,69 @@ namespace TensorSharp.Models
         /// layouts that interleave marker tokens with encoder output.</summary>
         internal Tensor EmbedTokensForMultimodal(int[] tokens) => Embedding(tokens);
 
-        public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
-        {
-            RefuseVisionOffFirstStage();
-            _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));
-        }
-
-        /// <summary>Image rows are embedded and injected where this node embeds
-        /// tokens. In a multi-node pipeline that runs the last stage on node 0 (the
-        /// default), the first stage is another node, so images are refused rather
-        /// than dropped.</summary>
-        private void RefuseVisionOffFirstStage()
-        {
-            if (LayerSplitGroup?.NodeCount > 1 && LayerPlacement != null && !LayerPlacement.IsFirst)
-                throw new NotSupportedException(
-                    "Multi-node layer split runs node 0 as the last stage, so it cannot inject image embeddings. " +
-                    $"Set {LayerSplitPlan.DriverStageVariable}=first on every node to serve images.");
-        }
+        public void SetVisionEmbeddings(Tensor embeddings, int insertPosition) => QueueMedia(embeddings, insertPosition);
 
         public Mistral3VisionEncoder VisionEncoder => _visionEncoder;
 
-        // Chunk size for ForwardRefill: long prompts are processed in this-many-token
-        // chunks so the per-layer attention-score allocation stays bounded
-        // (~numHeads × chunkLen × totalKvLen × kvDtype). Past ~2048 the score tensor
-        // can run into hundreds of MB on long contexts and thrash the MLX memory pool.
-        // Override with TS_PREFILL_CHUNK when tuning.
-        private static int ResolvePrefillChunkSize()
+        // ---------------------------------------------------------------- rotary
+
+        /// <summary>GPT-J (norm) RoPE with Mistral's YaRN parameters (the runtime's rotary:
+        /// the same function for prompts, batches and decode), then the YaRN position-dependent
+        /// Q scale.</summary>
+        protected override void RotateQueryKey(RankScope rank, int layer, ref Tensor q, ref Tensor k, TokenPositions positions)
         {
-            string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
-            if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
-                return v;
-            return 2048;
-        }
-
-        protected override float[] ForwardRefillCore(int[] tokens)
-        {
-            if (tokens == null || tokens.Length <= 1)
-                return ForwardCore(tokens);
-
-            // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
-            // layer loop and non-sharded weights, which are unavailable under
-            // tensor parallelism. Route through ForwardCore → ForwardTP instead.
-            if (IsTensorParallel || LayerPlacement != null)
-                return ForwardCore(tokens);
-
-            // Multimodal embeddings carry absolute insert positions within the
-            // current Forward call's hidden tensor, so chunked prefill would
-            // need to remap them per-chunk. Skip chunking when any are pending
-            // and let the single-call path handle injection.
-            bool hasMultimodal = _pendingVisionEmbeddingsList.Count > 0;
-            int chunkSize = ResolvePrefillChunkSize();
-            int lastIdx = tokens.Length - 1;
-
-            if (hasMultimodal || tokens.Length <= chunkSize)
-                return ForwardCore(tokens);
-
-            for (int pos = 0; pos < lastIdx; pos += chunkSize)
-            {
-                int chunkLen = Math.Min(chunkSize, lastIdx - pos);
-                var chunk = new int[chunkLen];
-                Array.Copy(tokens, pos, chunk, 0, chunkLen);
-                PrefillWithoutLogits(chunk);
-            }
-            return ForwardCore(new[] { tokens[lastIdx] });
-        }
-
-        private void PrefillWithoutLogits(int[] tokens)
-        {
-            if (tokens == null || tokens.Length == 0)
-                return;
-
-            _forwardSw.Start();
-            int seqLen = tokens.Length;
-            int startPos = _cacheSeqLen;
-
-            EnsureCacheCapacity(startPos + seqLen);
-
-            long t1 = Stopwatch.GetTimestamp();
-            Tensor hidden = Embedding(tokens);
-            _embTicks += Stopwatch.GetTimestamp() - t1;
-
-            for (int layer = 0; layer < Config.NumLayers; layer++)
-            {
-                hidden = TransformerBlock(hidden, layer, seqLen, startPos);
-                if (_backend == BackendType.Mlx && (layer + 1) % MlxEvalEveryNLayers == 0
-                    && layer + 1 != Config.NumLayers && hidden != null)
-                {
-                    MlxFusedOps.TryAsyncEvaluate(hidden);
-                }
-            }
-
-            hidden.Dispose();
-            _cacheSeqLen += seqLen;
-            _forwardSw.Stop();
-        }
-
-        protected override float[] ForwardCore(int[] tokens)
-        {
-            if (LayerPlacement != null)
-                return ForwardLayerSplit(tokens);
-            if (IsTensorParallel)
-                return ForwardTP(tokens);
-
-            _forwardSw.Start();
-            int seqLen = tokens.Length;
-            int startPos = _cacheSeqLen;
-
-            EnsureCacheCapacity(startPos + seqLen);
-
-            long t1 = Stopwatch.GetTimestamp();
-            Tensor hidden = Embedding(tokens);
-            _embTicks += Stopwatch.GetTimestamp() - t1;
-
-            if (_pendingVisionEmbeddingsList.Count > 0)
-            {
-                foreach (var (embeddings, position) in _pendingVisionEmbeddingsList)
-                {
-                    InjectVisionEmbeddings(hidden, embeddings, position, startPos);
-                    embeddings.Dispose();
-                }
-                _pendingVisionEmbeddingsList.Clear();
-            }
-
-            for (int layer = 0; layer < Config.NumLayers; layer++)
-            {
-                hidden = TransformerBlock(hidden, layer, seqLen, startPos);
-                if (_backend == BackendType.Mlx && (layer + 1) % MlxEvalEveryNLayers == 0
-                    && layer + 1 != Config.NumLayers && hidden != null)
-                {
-                    MlxFusedOps.TryAsyncEvaluate(hidden);
-                }
-            }
-
-            Tensor normed = RMSNormOp(hidden, "output_norm.weight");
-            hidden.Dispose();
-
-            Tensor lastHidden;
-            if (seqLen > 1)
-            {
-                using var narrowed = normed.Narrow(0, seqLen - 1, 1);
-                lastHidden = Ops.NewContiguous(narrowed);
-            }
-            else
-            {
-                lastHidden = normed.CopyRef();
-            }
-            normed.Dispose();
-
-            long t2 = Stopwatch.GetTimestamp();
-            Tensor logitsTensor = LinearForward(lastHidden, "output.weight");
-            if (logitsTensor == null)
-                logitsTensor = LinearForward(lastHidden, "token_embd.weight");
-            _lmHeadTicks += Stopwatch.GetTimestamp() - t2;
-            lastHidden.Dispose();
-
-            long t3 = Stopwatch.GetTimestamp();
-            _logitsBuffer = TensorToFloatArray(logitsTensor);
-            _logitsCopyTicks += Stopwatch.GetTimestamp() - t3;
-            logitsTensor.Dispose();
-
-            _cacheSeqLen += seqLen;
-            _forwardCount++;
-            _forwardSw.Stop();
-            return _logitsBuffer;
-        }
-
-        private unsafe void InjectVisionEmbeddings(Tensor hidden, Tensor visionEmbeddings, int insertPos, int startPos)
-        {
-            int numVisionTokens = (int)visionEmbeddings.Sizes[0];
-            int dim = Config.HiddenSize;
-            float* hPtr = GetFloatPtr(hidden);
-            float* vPtr = GetFloatPtr(visionEmbeddings);
-
-            for (int t = 0; t < numVisionTokens; t++)
-            {
-                float* dst = hPtr + (long)(insertPos + t) * dim;
-                float* src = vPtr + (long)t * dim;
-                Buffer.MemoryCopy(src, dst, dim * sizeof(float), dim * sizeof(float));
-            }
-
-            // insertPos is the offset within the current prefill chunk; startPos
-            // (the cached sequence length) makes the absolute position explicit so
-            // the log reads monotonically across chunked multimodal prefill.
-            Console.WriteLine($"Injected {numVisionTokens} vision tokens at chunk-offset {insertPos} (absolute position {startPos + insertPos})");
-        }
-
-        private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos)
-        {
-            string[] wn = _layerWeightNames[layer];
-
-            bool fused = _layerQkvFused[layer];
-            int normIdx = 0;
-            int ffnNormIdx = fused ? 3 : 5;
-            int gateUpIdx = fused ? 4 : 6;
-            int downIdx = fused ? 5 : 7;
-
-            Tensor normed = RMSNormOp(hidden, wn[normIdx]);
-            Tensor attnOut = Attention(normed, layer, wn, seqLen, startPos);
-            normed.Dispose();
-
-            // Fused (hidden += attnOut; normed2 = RmsNorm(hidden, ffnNormW))
-            // saves one MLX dispatch per residual stage. Falls through to
-            // separate Add + RMSNorm if the fused MLX op isn't available
-            // (e.g. non-MLX backend or unsupported shape).
-            Tensor normed2 = null;
-            if (_backend == BackendType.Mlx && _weights.TryGetValue(wn[ffnNormIdx], out var ffnNormW))
-            {
-                normed2 = new Tensor(_allocator, DType.Float32, hidden.Sizes[0], hidden.Sizes[1]);
-                if (!MlxFusedOps.TryAddRmsNorm(hidden, attnOut, ffnNormW, Config.Eps, normed2))
-                {
-                    normed2.Dispose();
-                    normed2 = null;
-                }
-            }
-            if (normed2 == null)
-            {
-                Ops.Add(hidden, hidden, attnOut);
-                attnOut.Dispose();
-
-                // GGML fused dense SwiGLU FFN (norm + gate/up + SiLU·mul + down +
-                // residual) in one graph, keeping the large intermediate on-device.
-                // This is the per-sequence path used by the CLI and the
-                // server's per-seq fallback; the batched path fuses separately.
-                if (TryFusedDenseSwiGLUFFNInto(hidden, wn[ffnNormIdx], wn[gateUpIdx], wn[downIdx]))
-                    return hidden;
-
-                normed2 = RMSNormOp(hidden, wn[ffnNormIdx]);
-            }
-            else
-            {
-                attnOut.Dispose();
-            }
-
-            Tensor ffnOut = FFN(normed2, wn[gateUpIdx], wn[downIdx], seqLen);
-            normed2.Dispose();
-
-            Ops.Add(hidden, hidden, ffnOut);
-            ffnOut.Dispose();
-
-            return hidden;
-        }
-
-        private Tensor Attention(Tensor input, int layer, string[] wn, int seqLen, int startPos)
-        {
-            int numHeads = Config.NumHeads;
-            int numKVHeads = Config.NumKVHeads;
-            int headDim = _attnKeyLen;
-            int qDim = numHeads * headDim;
-            int kDim = numKVHeads * headDim;
-            int totalSeqLen = startPos + seqLen;
-            float scale = 1.0f / MathF.Sqrt(headDim);
-
-            Tensor qTensor, kTensor, vTensor;
-
-            bool layerFused = _layerQkvFused[layer];
-            if (layerFused)
-            {
-                Tensor qkvFused = LinearForward(input, wn[1]);
-                if (seqLen == 1)
-                {
-                    qTensor = qkvFused.Narrow(1, 0, qDim);
-                    kTensor = qkvFused.Narrow(1, qDim, kDim);
-                    vTensor = qkvFused.Narrow(1, qDim + kDim, kDim);
-                    qkvFused.Dispose();
-                }
-                else
-                {
-                    using (var qView = qkvFused.Narrow(1, 0, qDim))
-                        qTensor = Ops.NewContiguous(qView);
-                    using (var kView = qkvFused.Narrow(1, qDim, kDim))
-                        kTensor = Ops.NewContiguous(kView);
-                    using (var vView = qkvFused.Narrow(1, qDim + kDim, kDim))
-                        vTensor = Ops.NewContiguous(vView);
-                    qkvFused.Dispose();
-                }
-            }
-            else
-            {
-                qTensor = LinearForward(input, wn[1]);  // attn_q
-                kTensor = LinearForward(input, wn[2]);  // attn_k
-                vTensor = LinearForward(input, wn[3]);  // attn_v
-            }
-
-            if (seqLen == 1)
-            {
-                ApplyRoPEDecode(qTensor, numHeads, headDim, startPos);
-                ApplyRoPEDecode(kTensor, numKVHeads, headDim, startPos);
-
-                // Position-dependent Q scaling for YaRN
-                if (_ropeOrigCtx > 0)
-                    ApplyPositionScale(qTensor, numHeads * headDim, startPos);
-            }
-            else
-            {
-                qTensor = ApplyRoPEPrefill(qTensor, numHeads, headDim, seqLen, startPos);
-                kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, headDim, seqLen, startPos);
-
-                // Position-dependent Q scaling for YaRN
-                if (_ropeOrigCtx > 0)
-                    ApplyPositionScalePrefill(qTensor, numHeads, headDim, seqLen, startPos);
-            }
-
-            long t0 = Stopwatch.GetTimestamp();
-
-            if (seqLen == 1)
-            {
-                CopyToCacheDecode(_kvCacheK[layer], kTensor, _kvCacheV[layer], vTensor,
-                    numKVHeads, headDim, startPos);
-                kTensor.Dispose();
-                vTensor.Dispose();
-
-                var attnResult = new Tensor(_allocator, DType.Float32, 1, numHeads * headDim);
-
-                // MLX path: keep K/V on device and run attention via
-                // mlx_fast_sdpa. Avoids the per-layer device→host copy of the
-                // KV cache that AttentionDecodePureCS triggers via
-                // GetHalfPointer (multi-GB transfer per token for long-
-                // context configs).
-                bool attnOk = false;
-                if (_backend == BackendType.Mlx)
-                {
-                    attnOk = MlxFusedOps.TryDecodeAttention(
-                        attnResult, qTensor, _kvCacheK[layer], _kvCacheV[layer],
-                        numHeads, numKVHeads, headDim,
-                        0, totalSeqLen, _kvCacheCapacity, false, scale);
-                }
-                if (!attnOk)
-                {
-                    AttentionDecodePureCS(qTensor, _kvCacheK[layer], _kvCacheV[layer],
-                        attnResult, numHeads, numKVHeads, headDim, totalSeqLen, scale);
-                }
-                qTensor.Dispose();
-
-                _attnTicks += Stopwatch.GetTimestamp() - t0;
-
-                int outputIdx = layerFused ? 2 : 4;
-                Tensor decodeOut = LinearForward(attnResult, wn[outputIdx]);
-                attnResult.Dispose();
-                return decodeOut;
-            }
-
-            Tensor qHeads = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
-            qTensor.Dispose();
-            Tensor kHeads = ReshapeToHeads(kTensor, numKVHeads, seqLen, headDim);
-            kTensor.Dispose();
-            Tensor vHeads = ReshapeToHeads(vTensor, numKVHeads, seqLen, _attnValLen);
-            vTensor.Dispose();
-
-            CopyToCache(_kvCacheK[layer], kHeads, startPos, seqLen);
-            CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
-            kHeads.Dispose();
-            vHeads.Dispose();
-
-            int groupSize = numHeads / numKVHeads;
-            Tensor kExpanded = ExpandKVHeads(_kvCacheK[layer], groupSize, totalSeqLen);
-            Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
-
-            using var kT = kExpanded.Transpose(1, 2);
-            var scores = new Tensor(_allocator, DType.Float32, numHeads, seqLen, totalSeqLen);
-            // Both attention GEMMs on half operands by name on direct CUDA (HalfOperandGemm): K/V come from
-            // the F16 cache of a quantized model, Q and P are rounded as ggml's flash attention rounds them,
-            // and exact F32 is 2.0-2.1x here (4096 tokens: +0.9 s per prefill on an RTX 3080 Laptop).
-            HalfOperandGemm.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
-            qHeads.Dispose();
-            kExpanded.Dispose();
-
-            // Fused causal-mask + softmax on GPU. Replaces AddCausalMask + Softmax
-            // (two separate ops) with one Metal kernel.
-            if (IsGgmlBackend)
-            {
-                GgmlBasicOps.AttentionSoftmaxWithSinks(
-                    scores, sinks: null,
-                    numHeads: numHeads, seqLen: seqLen, kvLen: totalSeqLen,
-                    maskStartPos: startPos, slidingWindow: 0, scale: 1.0f);
-            }
-            else
-            {
-                Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-                Ops.Softmax(scores, scores);
-            }
-
-            var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, _attnValLen);
-            HalfOperandGemm.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
-            scores.Dispose();
-            vExpanded.Dispose();
-
-            Tensor flatOutput = ReshapeFromHeads(attnOut, numHeads, seqLen, _attnValLen);
-            attnOut.Dispose();
-
-            _attnTicks += Stopwatch.GetTimestamp() - t0;
-
-            int outIdx = layerFused ? 2 : 4;
-            Tensor output = LinearForward(flatOutput, wn[outIdx]);
-            flatOutput.Dispose();
-
-            return output;
+            Rotate(q, rank.LocalHeads, KeyDim, positions, _rotary);
+            Rotate(k, rank.LocalKvHeads, KeyDim, positions, _rotary);
+            if (_ropeOrigCtx > 0)
+                ApplyPositionScale(q, rank.LocalHeads * KeyDim, positions);
         }
 
         /// <summary>
-        /// GPT-J (norm) style RoPE: pairs adjacent elements (x[2i], x[2i+1]).
-        /// Uses precomputed YaRN-corrected frequencies for decode.
+        /// The rotary attention factor, as llama.cpp computes it (llama_context, YaRN). With
+        /// a non-zero extrapolation factor the rotary multiplies cos/sin by
+        /// <c>1 + 0.1 ln(factor)</c> itself, so the factor cancels that and applies the
+        /// checkpoint's own magnitude scale instead: <c>mscale(factor, m) / mscale(factor,
+        /// m_all)</c>, where <c>yarn_log_multiplier</c> (or <c>mscale_all_dim</c>) is
+        /// <c>m_all</c> and <c>m</c> is <c>mscale</c> (default 1); without either it is the
+        /// standard YaRN <c>mscale(factor, 1)</c>. Ministral 3 ships
+        /// <c>yarn_log_multiplier = 1</c>, so its rotary keeps unit magnitude.
         /// </summary>
-        private unsafe void ApplyRoPEDecode(Tensor data, int numHeads, int headDim, int position)
+        private float YarnAttnFactor(float checkpointAttnFactor)
         {
-            int halfDim = _ropeDim / 2;
-            float* ptr = GetFloatPtr(data);
+            if (_ropeType != "yarn" || _ropeExtFactor == 0f)
+                return checkpointAttnFactor;
+            float factor = Config.RopeScale;
+            static float Mscale(float scale, float m) => scale <= 1f ? 1f : 0.1f * m * MathF.Log(scale) + 1f;
+            float mAll = _ropeYarnLogMul != 0f ? _ropeYarnLogMul : _ropeMscaleAllDim;
+            float m = _ropeMscale != 0f ? _ropeMscale : 1f;
+            float attn = mAll != 0f ? Mscale(factor, m) / Mscale(factor, mAll) : Mscale(factor, 1f);
+            if (factor > 1f)
+                attn *= 1f / (1f + 0.1f * MathF.Log(factor));
+            return attn * checkpointAttnFactor;
+        }
 
-            float* cosTable = stackalloc float[halfDim];
-            float* sinTable = stackalloc float[halfDim];
-            for (int i = 0; i < halfDim; i++)
+        /// <summary>Position-dependent Q scaling for YaRN, one factor per token (it scales the
+        /// whole row): q *= (1 + beta * log(1 + floor(pos / orig_ctx))).</summary>
+        /// <remarks>Below the original context every factor is 1, so the query is not touched at
+        /// all: reading it back would cost a device round trip per layer on GPU backends.</remarks>
+        private unsafe void ApplyPositionScale(Tensor q, int rowWidth, TokenPositions positions)
+        {
+            float* ptr = null;
+            for (int t = 0; t < positions.Count; t++)
             {
-                float theta = position * _ropeFreqs[i];
-                cosTable[i] = MathF.Cos(theta);
-                sinTable[i] = MathF.Sin(theta);
-            }
-
-            for (int h = 0; h < numHeads; h++)
-            {
-                float* head = ptr + h * headDim;
-                for (int i = 0; i < halfDim; i++)
-                {
-                    float x0 = head[2 * i];
-                    float x1 = head[2 * i + 1];
-                    head[2 * i] = x0 * cosTable[i] - x1 * sinTable[i];
-                    head[2 * i + 1] = x0 * sinTable[i] + x1 * cosTable[i];
-                }
-            }
-        }
-
-        private Tensor ApplyRoPEPrefill(Tensor data, int numHeads, int headDim, int seqLen, int startPos)
-        {
-            int totalRows = seqLen * numHeads;
-            int[] positions = new int[totalRows];
-            for (int s = 0; s < seqLen; s++)
-                for (int h = 0; h < numHeads; h++)
-                    positions[s * numHeads + h] = startPos + s;
-            using var posTensor = CreateIntTensorOn(data.Storage.Allocator, positions, totalRows);
-
-            using var reshaped = data.View(1, seqLen, numHeads, headDim);
-            Tensor result = Ops.RoPEEx(
-                null, reshaped, posTensor, _ropeDim, 0, _ropeOrigCtx,
-                Config.RopeBase, 1.0f / Config.RopeScale,
-                _ropeType == "yarn" ? _ropeExtFactor : 0f,
-                ComputeAttnFactor(),
-                _ropeType == "yarn" ? _ropeBetaFast : 0f,
-                _ropeType == "yarn" ? _ropeBetaSlow : 0f);
-
-            data.Dispose();
-
-            Tensor flat = result.View(seqLen, numHeads * headDim);
-            result.Dispose();
-            return flat;
-        }
-
-        private float ComputeAttnFactor()
-        {
-            if (_ropeMscale != 0 && _ropeMscaleAllDim != 0)
-                return 1.0f / (0.1f * MathF.Log(Config.RopeScale) + 1.0f);
-            return 1.0f;
-        }
-
-        /// <summary>
-        /// Position-dependent Q scaling for YaRN:
-        /// q *= (1 + beta * log(1 + floor(pos / orig_ctx)))
-        /// </summary>
-        private unsafe void ApplyPositionScale(Tensor qTensor, int totalQDim, int position)
-        {
-            float interval = MathF.Floor((float)position / _ropeOrigCtx);
-            float posScale = 1.0f + _ropeScalingBeta * MathF.Log(1.0f + interval);
-            if (MathF.Abs(posScale - 1.0f) < 1e-7f)
-                return;
-
-            float* ptr = GetFloatPtr(qTensor);
-            VecScale(ptr, posScale, totalQDim);
-        }
-
-        private unsafe void ApplyPositionScalePrefill(Tensor qTensor, int numHeads, int headDim,
-            int seqLen, int startPos)
-        {
-            float* ptr = GetFloatPtr(qTensor);
-            int stride = numHeads * headDim;
-
-            for (int s = 0; s < seqLen; s++)
-            {
-                int pos = startPos + s;
-                float interval = MathF.Floor((float)pos / _ropeOrigCtx);
+                float interval = MathF.Floor((float)positions[t] / _ropeOrigCtx);
                 float posScale = 1.0f + _ropeScalingBeta * MathF.Log(1.0f + interval);
-                if (MathF.Abs(posScale - 1.0f) < 1e-7f)
-                    continue;
-                VecScale(ptr + (long)s * stride, posScale, stride);
+                if (MathF.Abs(posScale - 1.0f) < 1e-7f) continue;
+                if (ptr == null) ptr = GetFloatPtr(q);
+                VecScale(ptr + (long)t * rowWidth, posScale, rowWidth);
             }
+            if (ptr != null)
+                HostWritten(q);
         }
-
-        // Native batch decode is not used for Mistral 3 because YaRN applies
-        // per-dimension frequency correction that its fused decode path cannot
-        // express. The C# decode path uses GGML-backed matmul/attention and only
-        // adds a lightweight C# RoPE kernel.
 
         public override void Dispose()
         {
             _visionEncoder?.Dispose();
-            foreach (var (embeddings, _) in _pendingVisionEmbeddingsList)
-                embeddings?.Dispose();
-            _pendingVisionEmbeddingsList.Clear();
-
-            if (_kvCacheK != null)
-                foreach (var t in _kvCacheK) t?.Dispose();
-            if (_kvCacheV != null)
-                foreach (var t in _kvCacheV) t?.Dispose();
-
-            if (_tpKvCacheK != null)
-                foreach (var layer in _tpKvCacheK)
-                    foreach (var t in layer) t?.Dispose();
-            if (_tpKvCacheV != null)
-                foreach (var layer in _tpKvCacheV)
-                    foreach (var t in layer) t?.Dispose();
-
             base.Dispose();
         }
     }

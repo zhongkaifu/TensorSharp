@@ -16,7 +16,7 @@ unset, the actual model is `Qwen35CudaModel`. Its startup log must contain
 and startup log together: the backend argument alone does not establish which
 Qwen model implementation was selected.
 
-`TS_Q35_NATIVE=0` selects the separate managed `Qwen35Model` implementation on
+`TS_Q35_NATIVE=0` selects the shared decoder runtime (`Qwen35RuntimeModel`) on
 the CUDA tensor backend. Label its state-residency diagnostics separately.
 `--backend ggml_cuda` selects another backend and is not part of this native
 performance matrix. The earlier configurations in
