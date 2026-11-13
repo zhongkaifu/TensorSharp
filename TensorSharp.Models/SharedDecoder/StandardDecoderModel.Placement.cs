@@ -322,7 +322,69 @@ namespace TensorSharp.Models
                     }
                 }
                 ShardWeightsForTensorParallelism(columns, rows);
+                if (_mesh.Stages == 1) ShardHeadByVocab();
             }
+        }
+
+        /// <summary>The per-rank vocabulary slices of the LM head on per-rank graphs (each rank's rows, in rank order).</summary>
+        private const string VocabHeadName = "output.weight@vocab";
+
+        /// <summary>The head rows each rank holds under <see cref="VocabHeadName"/>, or null: rank 0 runs the whole head.</summary>
+        private int[] _vocabHeadRows;
+
+        /// <summary>Each rank scores its slice of the vocabulary (tests).</summary>
+        internal bool HeadSplitByVocabulary => _vocabHeadRows != null;
+
+        /// <summary>
+        /// Per-rank graphs: each rank keeps a contiguous slice of the untied head's vocabulary rows, so every rank scores
+        /// its share of the vocabulary at once and the host joins the slices. Rank 0 ran the whole head: on Qwen3.5-9B
+        /// `--tp 2` that was ~1.9 ms of a ~11 ms decode step (2x A40), the main gap to Qwen35Model, which split it the
+        /// same way. The whole head stays for the draft heads and the per-op path; a tied head (the embedding) is not
+        /// split.
+        /// </summary>
+        private unsafe void ShardHeadByVocab()
+        {
+            const string head = "output.weight";
+            int ranks = _mesh.TensorParallel;
+            if (!_rankGraphs || ranks < 2) return;
+            long vocabRows;
+            if (_quantWeights.TryGetValue(head, out QuantizedWeight q)) vocabRows = q.Ne1;
+            else if (_weights.TryGetValue(head, out Tensor w)) vocabRows = w.Sizes[0];
+            else return;
+            if (vocabRows != Config.VocabSize || vocabRows < ranks) return;
+            var counts = new int[ranks];
+            for (int r = 0; r < ranks; r++) counts[r] = (int)(vocabRows / ranks + (r < vocabRows % ranks ? 1 : 0));
+            if (q != null)
+            {
+                long rowBytes = NativeDequant.RowSize(q.GgmlType, q.Ne0);
+                var shards = new QuantizedWeight[ranks];
+                long first = 0;
+                for (int r = 0; r < ranks; r++)
+                {
+                    long bytes = counts[r] * rowBytes;
+                    IntPtr data = QuantizedWeight.AllocateBuffer(bytes);
+                    Buffer.MemoryCopy((byte*)q.Data + first * rowBytes, (byte*)data, bytes, bytes);
+                    shards[r] = new QuantizedWeight(data, bytes, q.GgmlType, q.Ne0, counts[r]) { Scale = q.Scale };
+                    first += counts[r];
+                }
+                _tpQuantWeights[VocabHeadName] = shards;
+            }
+            else
+            {
+                Tensor full = _weights[head];
+                long cols = full.Sizes[1];
+                var shards = new Tensor[ranks];
+                long first = 0;
+                for (int r = 0; r < ranks; r++)
+                {
+                    shards[r] = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, counts[r], cols);
+                    Buffer.MemoryCopy(GetFloatPtr(full) + first * cols, GetFloatPtr(shards[r]), counts[r] * cols * 4L, counts[r] * cols * 4L);
+                    first += counts[r];
+                }
+                _tpWeights[VocabHeadName] = shards;
+            }
+            _vocabHeadRows = counts;
+            Console.WriteLine($"  {Config.Architecture}: the LM head is split by vocabulary over {ranks} ranks ({string.Join(" + ", counts)} rows).");
         }
 
         /// <summary>Each rank's slice of a stacked expert weight, as its own contiguous stack (GGML per-rank graphs).</summary>

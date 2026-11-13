@@ -816,13 +816,34 @@ generated tokens, greedy), alternating builds. Prefill ms / decode tok/s:
 | managed cpu, M5 Pro, 64 tokens | Qwen3.5-0.8B Q8_0, short | 311-367 / 105-108 | 290-300 / 73-75 |
 
 The runtime's ggml_cuda, ggml_metal, ggml_cpu and MLX single-device numbers were measured when those
-routes moved ([unified execution](../design/unified-execution.md)). Open gaps:
+routes moved ([unified execution](../design/unified-execution.md)).
 
-- **Direct CUDA on one GPU** (checkpoints the direct engine does not serve): the runtime's CUDA tensor
-  executor launches each kernel from the host; small models are bound by that (Qwen3.5-0.8B decode
-  at about half of `main`), and its prompt GEMMs trail the removed fused path (9B 4K prefill +40%).
-- **Managed CPU**: decode about 30% behind on Qwen3.5-0.8B: the matmuls take the same time; the
-  remaining cost is the executor's per-node work.
-- **`--tp 2` decode on Qwen3.5-9B**: 8-10% behind (the 35B MoE is level).
+Re-measured 2026-11-13 against the same `main`, after these changes:
+- direct-CUDA decode steps record as one CUDA graph;
+- slots are sized in 256-cell steps, so ggml-cuda's grouped-query attention applies;
+- a new slot's fresh recurrent states are not cleared page by page;
+- the prompt-end checkpoint copies its rows on the device.
+
+| Placement | Model | `main` | runtime |
+|---|---|---|---|
+| direct cuda, RTX 2000 Ada (not NVFP4) | Qwen3.5-0.8B Q8_0, short | 14 / 171 | 38-40 / 181 |
+| | 4K | 591 / 164 | 696 / 164 |
+| | Qwen3.5-9B Q8_0, short | 88 / 22.9 | 152-158 / 23.3 |
+| | 4K | 2,816 / 22.6 | 2,975 / 23.0 |
+| ggml_cuda, RTX A5000 | Qwen3.8-27B UD-IQ3_XXS, short | 391 / 36.0 | 152 / 36.3 |
+| | 3.6K prompt + 512 tokens | 3,776-3,869 / 35.4-35.5 | 3,563-3,603 / 35.7-35.8 |
+| ggml_vulkan, RTX A5000 | Qwen3.8-27B UD-IQ3_XXS, short | 460 / 25.5 | 330 / 26.5 |
+| managed cpu, M5 Pro, 128 tokens | Qwen3.5-0.8B Q8_0, short | 404-466 / 111-114 | 296-358 / 89-92 |
+
+Open gaps:
+
+- **Direct CUDA prompts on small checkpoints**: `main` replays a captured prompt graph, while the runtime launches each
+  kernel from the host (1,224 launches for the 0.8B's 61-row prompt). Every prompt also runs as two steps, because
+  the prompt-tail checkpoint is taken one token before the end (one extra weight pass: 47 ms on the 9B). Decode is
+  level or ahead.
+- **Managed CPU**: decode about 20% behind on Qwen3.5-0.8B; the matmuls take the same time, and the remaining cost is
+  the executor's per-node work. Prompts are faster.
+- **`--tp 2` decode on Qwen3.5-9B**: 8-10% behind (the 35B MoE is level). The LM head runs whole on rank 0, while
+  `main` splits it by vocabulary.
 - **ggml_vulkan prompts on Qwen3.5-0.8B**: about 15% slower (decode is faster).
 

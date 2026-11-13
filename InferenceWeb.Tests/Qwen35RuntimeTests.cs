@@ -289,6 +289,19 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [MemberData(nameof(Placements))]
     public void PlacementMatchesOneDevice(int tp, int stages) => AssertPlacementMatchesOneDevice("dense", tp, stages);
 
+    /// <summary>On per-rank graphs an untied head is split by vocabulary (each rank scores its rows, the host joins
+    /// them), and the logits are one device's; a head tied to the embedding stays whole on rank 0.</summary>
+    [Fact]
+    public void RankGraphsSplitAnUntiedHeadByVocabulary()
+    {
+        using (var untied = Create(Fixture("dense"), tp: 2))
+            Assert.True(untied.HeadSplitByVocabulary);
+        using (var tied = Create(Fixture("dense-tied"), tp: 2))
+            Assert.False(tied.HeadSplitByVocabulary);
+        AssertPlacementMatchesOneDevice("dense", 2, 1);
+        AssertPlacementMatchesOneDevice("dense-tied", 2, 1);
+    }
+
     /// <summary>Routed experts under tensor parallelism: each rank's graph runs its slice of every expert (sharded by
     /// width like a dense feed-forward) and the partials meet in the all-reduce.</summary>
     [Fact]

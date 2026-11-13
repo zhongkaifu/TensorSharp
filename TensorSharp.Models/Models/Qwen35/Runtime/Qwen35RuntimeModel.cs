@@ -293,7 +293,10 @@ namespace TensorSharp.Models
             int degree = ShardDegree;
             // GGML's per-op tensor parallelism runs the packed in-projection per rank; per-rank graphs read the
             // projections by name (row shards, as on every other executor).
-            if (DeviceRecurrence && !RankGraphs)
+            // Per-rank graphs decode the rank's packed in-projection in one product, as one device does, when the four
+            // sources share a type (their rows are copied exactly; a mixed checkpoint keeps them apart, unrequantized):
+            // four products a layer instead of one were most of Qwen3.5-9B's extra matvecs under `--tp 2`.
+            if ((DeviceRecurrence && !RankGraphs) || (RankGraphs && InProjectionSharesType(layer)))
             {
                 PackInProjection(layer, TpDegree, TpRankOffset, degree, r => _tpGroup.GetAllocator(r));
                 ShardInputColumnGroups(p + "ssm_out.weight", r => ValueHeadsOf(r, degree), _headVDim);

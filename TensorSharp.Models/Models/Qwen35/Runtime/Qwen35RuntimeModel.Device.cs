@@ -257,7 +257,14 @@ namespace TensorSharp.Models
                 Backing = new Tensor(allocator, DType.Float32, RowFloats + (long)vHeads * dv * dk);
                 using (Tensor tail = Backing.Narrow(0, RowFloats, (long)vHeads * dv * dk))
                     Ssm = tail.View(vHeads, dv, dk);
-                Reset();
+                // A fresh mapping is zero already: clearing it only faulted every page in (Qwen3.8-27B's 48 states took
+                // 64-102 ms of every new slot on ggml_cuda and ggml_vulkan). Subclasses reset their own tensors.
+                foreach (Tensor t in new[] { Conv, Backing })
+                {
+                    if (_host && t.Storage.TakeAllocationZeroGuarantee()) Invalidate(t);
+                    else Clear(t);
+                }
+                if (_host) Invalidate(Ssm);
             }
 
             private readonly IAllocator _allocator;

@@ -589,10 +589,29 @@ M5 Pro（48 GB）实测：Qwen3.8-27B GGUF，DFlash2 Q4_K_M 草稿模型（`--sp
 | | 4K | 1,431-1,436 / 65 | 2,007-2,019 / 63 |
 | 托管 cpu，M5 Pro，64 token | Qwen3.5-0.8B Q8_0，short | 311-367 / 105-108 | 290-300 / 73-75 |
 
-运行时在 ggml_cuda、ggml_metal、ggml_cpu 与 MLX 单设备上的数据在这些路线迁移时已测量（[unified execution](../design/unified-execution.md)）。尚未解决的差距：
+运行时在 ggml_cuda、ggml_metal、ggml_cpu 与 MLX 单设备上的数据在这些路线迁移时已测量（[unified execution](../design/unified-execution.md)）。
 
-- **单 GPU 直连 CUDA**（直连引擎不服务的检查点）：运行时的 CUDA 张量执行器从主机逐个启动内核，小模型受其限制（Qwen3.5-0.8B decode 约为 `main` 的一半），其提示 GEMM 也落后于被删的融合路径（9B 4K prefill +40%）。
-- **托管 CPU**：Qwen3.5-0.8B decode 落后约 30%：矩阵乘耗时相同，剩余开销在执行器的逐节点工作上。
-- **Qwen3.5-9B 的 `--tp 2` decode**：落后 8-10%（35B MoE 持平）。
+2026-11-13 对同一 `main` 重新测量，此时已完成以下改动：
+- 直连 CUDA 的 decode 步录制为一张 CUDA graph；
+- slot 按 256 个 cell 分配，ggml-cuda 的分组 query attention 得以生效；
+- 新 slot 的循环状态不再逐页清零；
+- 提示末尾的 checkpoint 在设备上复制各行。
+
+| 放置方式 | 模型 | `main` | 运行时 |
+|---|---|---|---|
+| 直连 cuda，RTX 2000 Ada（非 NVFP4） | Qwen3.5-0.8B Q8_0，short | 14 / 171 | 38-40 / 181 |
+| | 4K | 591 / 164 | 696 / 164 |
+| | Qwen3.5-9B Q8_0，short | 88 / 22.9 | 152-158 / 23.3 |
+| | 4K | 2,816 / 22.6 | 2,975 / 23.0 |
+| ggml_cuda，RTX A5000 | Qwen3.8-27B UD-IQ3_XXS，short | 391 / 36.0 | 152 / 36.3 |
+| | 3.6K 提示 + 512 token | 3,776-3,869 / 35.4-35.5 | 3,563-3,603 / 35.7-35.8 |
+| ggml_vulkan，RTX A5000 | Qwen3.8-27B UD-IQ3_XXS，short | 460 / 25.5 | 330 / 26.5 |
+| 托管 cpu，M5 Pro，128 token | Qwen3.5-0.8B Q8_0，short | 404-466 / 111-114 | 296-358 / 89-92 |
+
+尚未解决的差距：
+
+- **小检查点的直连 CUDA 提示**：`main` 回放已录制的提示 graph，运行时则从主机逐个启动内核（0.8B 的 61 行提示需 1,224 次启动）。此外每个提示都分两步运行，因为提示尾部的 checkpoint 取在末尾前一个 token（多一次权重读取：9B 上 47 ms）。decode 持平或领先。
+- **托管 CPU**：Qwen3.5-0.8B decode 落后约 20%；矩阵乘耗时相同，剩余开销在执行器的逐节点工作上。提示更快。
+- **Qwen3.5-9B 的 `--tp 2` decode**：落后 8-10%（35B MoE 持平）。LM head 整个在 rank 0 上运行，而 `main` 按词表切分。
 - **Qwen3.5-0.8B 的 ggml_vulkan 提示**：慢约 15%（decode 更快）。
 

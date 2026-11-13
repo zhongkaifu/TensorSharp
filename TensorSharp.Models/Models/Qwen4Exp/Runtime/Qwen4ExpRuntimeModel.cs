@@ -387,7 +387,16 @@ namespace TensorSharp.Models
             long n = p.Hidden, width = p.StreamFloats;
             const long f = sizeof(float);
 
-            int embedded = step.InputF32(GatherPleRows(step, layer), n, rows);
+            float[] gathered = GatherPleRows(step, layer);
+            int embedded = step.InputF32(gathered, n, rows);
+            // A decode step run again one position on gathers the new token's rows into the same input (its n-gram
+            // history moves as a trace's would).
+            step.RefillOnAdvance(embedded, () =>
+            {
+                float[] now = GatherPleRows(step, layer);
+                if (!ReferenceEquals(now, gathered)) Array.Copy(now, gathered, gathered.Length);
+                return true;
+            });
             int key = GroupedNorm(step, step.MatMul(LayerName(layer, "ple_key.weight"), embedded), rows, LayerName(layer, "ple_norm_key.weight"));
             int value = step.MatMul(LayerName(layer, "ple_value.weight"), embedded);                  // [n, rows]
             int query = GroupedNorm(step, stream, rows, LayerName(layer, "ple_norm_query.weight"));

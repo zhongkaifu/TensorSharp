@@ -112,29 +112,32 @@ namespace TensorSharp.Models
                 // The blocks to pool: those the step completes; a decode or verify step pools its last ceil(count /
                 // ratio) complete blocks (again where they were complete before: the same values), so its graph is the
                 // same at every position.
-                int end = (start + count) / ratio;
-                int first = count <= SmallChunkRows ? end - (count + ratio - 1) / ratio : (start + ratio) / ratio - 1;
-                first = Math.Max(first, 0);
-                if (end <= first) continue;
-                int n = end - first;
+                (int first, int n) = PoolSpan(step, s, ratio);
+                if (n <= 0) continue;
                 var members = new int[ratio * n];
                 var lastRows = new int[n];
-                // A block's pooled key turns at its first cell's rotary position (media cells and the text after them do
-                // not sit at their KV index), an axis-major [T | H | W | 0] table where any of them is not text.
                 var table = new int[4 * n];
-                bool multi = false;
-                for (int b = 0; b < n; b++)
-                {
-                    int block = first + b;
-                    (int t, int h, int w) = CellPosition(step, s, block * ratio);
-                    table[b] = t; table[n + b] = h; table[2 * n + b] = w;
-                    multi |= h != t || w != t;
-                    lastRows[b] = block * ratio + ratio - 1;
-                    for (int i = 0; i < ratio; i++) members[b * ratio + i] = block * ratio + i;
-                }
+                bool multi = FillPoolBlocks(step, s, ratio, first, n, members, lastRows, table);
                 // The members' raw keys (the cache's raw half, rows of 2d), read after this step's write.
                 int rawHalf = step.View2(cache, d, slot.Capacity, RowBytes(kvType, 2 * d), 0);
-                int gathered = step.Op(GraphOp.GetRows, rawHalf, step.InputI32(members, members.Length));   // [d, ratio * n]
+                int membersInput = step.InputI32(members, members.Length);
+                int tableInput = multi ? step.InputI32(table, table.Length) : step.InputI32(table.AsSpan(0, n).ToArray(), n);
+                int lastInput = step.InputRows(lastRows);
+                // Run again one position on, a decode step pools the blocks complete there; another count of blocks, or
+                // positions turning multi-axis, is another graph (the advance is refused and the step traced).
+                int seq = s;
+                step.RefillOnAdvance(membersInput, () =>
+                {
+                    (int from, int blocksNow) = PoolSpan(step, seq, ratio);
+                    if (blocksNow != n || FillPoolBlocks(step, seq, ratio, from, n, members, lastRows, table) != multi) return false;
+                    step.RewriteInput(membersInput, members);
+                    step.RewriteInput(tableInput, multi ? table : table.AsSpan(0, n));
+                    step.RewriteInput(lastInput, lastRows);
+                    return true;
+                });
+                step.RefillOnAdvance(tableInput, () => true);
+                step.RefillOnAdvance(lastInput, () => true);
+                int gathered = step.Op(GraphOp.GetRows, rawHalf, membersInput);   // [d, ratio * n]
                 int sum = -1;
                 for (int i = 0; i < ratio; i++)
                 {
@@ -144,13 +147,41 @@ namespace TensorSharp.Models
                 int pooled = step.Op(GraphOp.Scale, stackalloc[] { sum }, default, stackalloc[] { 1f / ratio });
                 pooled = step.RmsNorm(pooled, LayerName(layer, "indexer.k_norm.weight"));
                 pooled = multi
-                    ? step.RopeMultiAt(step.Reshape(pooled, d, 1, n), GraphRotary, step.InputI32(table, table.Length))
-                    : step.RopeAt(step.Reshape(pooled, d, 1, n), GraphRotary, step.InputI32(table.AsSpan(0, n).ToArray(), n));
+                    ? step.RopeMultiAt(step.Reshape(pooled, d, 1, n), GraphRotary, tableInput)
+                    : step.RopeAt(step.Reshape(pooled, d, 1, n), GraphRotary, tableInput);
                 // [the last member's raw key | the pooled key] into the last member's row.
                 int lastRaw = step.Cont(step.View2(gathered, d, n, ratio * d * f, (ratio - 1) * d * f));
                 int row = step.Op(GraphOp.Concat, stackalloc[] { lastRaw, step.Reshape(pooled, d, n) }, stackalloc long[] { 0 });
-                step.Effect(step.Op(GraphOp.SetRows, cache, step.Reshape(row, 2 * d, n, 1), step.InputRows(lastRows)));
+                step.Effect(step.Op(GraphOp.SetRows, cache, step.Reshape(row, 2 * d, n, 1), lastInput));
             }
+        }
+
+        /// <summary>The blocks sequence <paramref name="s"/>'s step pools at a QSA layer of <paramref name="ratio"/>:
+        /// those it completes; a decode or verify step pools its last ceil(count / ratio) complete blocks.</summary>
+        private static (int First, int Count) PoolSpan(GraphStep step, int s, int ratio)
+        {
+            int count = step.Counts[s], start = step.Starts[s];
+            int end = (start + count) / ratio;
+            int first = Math.Max(count <= SmallChunkRows ? end - (count + ratio - 1) / ratio : (start + ratio) / ratio - 1, 0);
+            return (first, Math.Max(end - first, 0));
+        }
+
+        /// <summary>The <paramref name="n"/> blocks from <paramref name="first"/>: their members, last rows and an
+        /// axis-major [T | H | W | 0] table of their first cells' rotary positions (a block's pooled key turns there:
+        /// media cells and the text after them do not sit at their KV index). True when a position is not text.</summary>
+        private bool FillPoolBlocks(GraphStep step, int s, int ratio, int first, int n, int[] members, int[] lastRows, int[] table)
+        {
+            bool multi = false;
+            for (int b = 0; b < n; b++)
+            {
+                int block = first + b;
+                (int t, int h, int w) = CellPosition(step, s, block * ratio);
+                table[b] = t; table[n + b] = h; table[2 * n + b] = w;
+                multi |= h != t || w != t;
+                lastRows[b] = block * ratio + ratio - 1;
+                for (int i = 0; i < ratio; i++) members[b * ratio + i] = block * ratio + i;
+            }
+            return multi;
         }
 
         protected override int EmitAttentionMask(GraphStep step, int layer, int x, int s, int mask, int keys)

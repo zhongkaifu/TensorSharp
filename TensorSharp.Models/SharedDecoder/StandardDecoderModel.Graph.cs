@@ -272,13 +272,15 @@ namespace TensorSharp.Models
             }
         }
 
-        private DecodeReplay _decodeReplay;
+        /// <summary>The kept decode step of each shape (a layer-split step keeps one a stage).</summary>
+        private readonly Dictionary<string, DecodeReplay> _decodeReplays = new(StringComparer.Ordinal);
         private long _graphEpoch;   // bumped whenever cached graphs are dropped
 
         private void KeepDecodeReplay(GraphStep step, CachedGraph graph, StepOutputs outputs, Slot[] slots, int[] starts,
             int floor, string shape)
         {
-            DropDecodeReplay();
+            DropDecodeReplay(shape);
+            step.OwnPositions();
             int n = slots.Length;
             var r = new DecodeReplay
             {
@@ -293,14 +295,24 @@ namespace TensorSharp.Models
                 r.Capacity[s] = slots[s].Capacity;
                 r.RopeDelta[s] = slots[s].RopeDelta;
             }
-            _decodeReplay = r;
+            _decodeReplays[shape ?? ""] = r;
         }
 
         private void DropDecodeReplay()
         {
-            _decodeReplay?.DisposeCapture();
-            _decodeReplay?.Step.Dispose();
-            _decodeReplay = null;
+            foreach (DecodeReplay r in _decodeReplays.Values)
+            {
+                r.DisposeCapture();
+                r.Step.Dispose();
+            }
+            _decodeReplays.Clear();
+        }
+
+        private void DropDecodeReplay(string shape)
+        {
+            if (!_decodeReplays.Remove(shape ?? "", out DecodeReplay r)) return;
+            r.DisposeCapture();
+            r.Step.Dispose();
         }
 
         /// <summary>Decode steps record on executors that can (<see cref="IDecodeCaptureExecutor"/>).</summary>
@@ -393,7 +405,7 @@ namespace TensorSharp.Models
         {
             graph = null;
             outputs = default;
-            DecodeReplay r = _decodeReplay;
+            DecodeReplay r = _decodeReplays.GetValueOrDefault(shape ?? "");
             if (r == null || r.Epoch != _graphEpoch || r.Floor != floor || r.Shape != shape || r.Slots.Length != slots.Length)
                 return false;
             for (int s = 0; s < slots.Length; s++)
@@ -406,7 +418,7 @@ namespace TensorSharp.Models
             if (!_graphCache.TryGetValue(r.Signature, out CachedGraph cached) || !ReferenceEquals(cached, r.Graph)
                 || !r.Step.TryAdvance(hidden))
             {
-                DropDecodeReplay();
+                DropDecodeReplay(shape);
                 return false;
             }
             Array.Copy(starts, r.Starts, starts.Length);
@@ -546,9 +558,10 @@ namespace TensorSharp.Models
                     (int from, int to) = StageLayers(s);
                     bool last = s == stages - 1;
                     Tensor stageInput = input;
+                    // Each stage keeps its decode step to advance (one replay a stage shape).
                     CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
                         step => EmitStep(step, stageInput, request, from, to, last), out StepOutputs outputs, out bool owned,
-                        shape: $"{request.Shape}|stage{s}");
+                        shape: $"{request.Shape}|stage{s}", advanceHidden: request.PositionTable == null ? stageInput : null);
                     if (graph == null)
                     {
                         if (s == 0) return false;
@@ -622,7 +635,7 @@ namespace TensorSharp.Models
             owned = false;
             outputs = default;
             bool advance = replayable && advanceHidden != null && !deviceOutputs && !snapshots && DecodeStepsAdvance
-                && !DecodeAdvanceDisabled && _mesh.Stages == 1 && GraphExecutor.Capabilities.Replays && Array.TrueForAll(counts, c => c == 1);
+                && !DecodeAdvanceDisabled && GraphExecutor.Capabilities.Replays && Array.TrueForAll(counts, c => c == 1);
             if (advance && TryAdvanceDecode(slots, starts, attentionFloor, shape, advanceHidden, out graph, out outputs))
                 return graph;
             try
@@ -778,6 +791,7 @@ namespace TensorSharp.Models
         private struct StepOutputs
         {
             public int Logits, Final, Hidden;
+            public int[] RankLogits;   // each rank's slice of the vocabulary (a vocabulary-split head), in rank order
             public int[] Captures;   // -1: the captured layer is another stage's
             public (int Output, int Layer)[] Routes;   // resident MoE layers' top-K ids while device routes are recorded
         }
@@ -933,9 +947,57 @@ namespace TensorSharp.Models
                     steps[r].Boundary(h[r]);
                 }
             }
-            EmitHead(lead, h[0], request, ref outputs);
+            if (_vocabHeadRows != null && request.LastRowLogits && !request.AllRowLogits)
+                EmitVocabSplitHead(steps, h, request, ref outputs);
+            else
+                EmitHead(lead, h[0], request, ref outputs);
             return outputs;
         }
+
+        /// <summary><see cref="EmitHead"/> over the ranks: each rank normalizes its copy of the stream and scores its
+        /// slice of the vocabulary for the sequences' last rows (<see cref="ShardHeadByVocab"/>).</summary>
+        private void EmitVocabSplitHead(GraphStep[] steps, int[] h, GraphRequest request, ref StepOutputs outputs)
+        {
+            GraphStep lead = steps[0];
+            int n = lead.Sequences, rows = lead.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
+            for (int c = 0; c < request.CaptureLayers.Length; c++)
+                if (request.CaptureLayers[c] >= Config.NumLayers)
+                    outputs.Captures[c] = EmitCaptureOutput(lead, h[0], request);
+            var last = new int[n];
+            for (int s = 0; s < n; s++) last[s] = lead.First[s] + lead.Counts[s] - 1;
+            outputs.RankLogits = new int[steps.Length];
+            for (int r = 0; r < steps.Length; r++)
+            {
+                GraphStep step = steps[r];
+                int final = EmitStreamOutput(step, h[r]);
+                if (r == 0 && request.CaptureFinal)
+                    outputs.Final = DraftChainsStream ? step.Output(h[0], (long)width * rows) : step.Output(final, (long)hiddenSize * rows);
+                int selected = n == 1 && rows == 1 ? final
+                    : n == 1 ? step.View2(final, hiddenSize, 1, hiddenSize * 4L, (rows - 1) * hiddenSize * 4L)
+                    : step.Op(GraphOp.GetRows, final, step.ConstantInputI32((int[])last.Clone(), n));
+                outputs.RankLogits[r] = step.Output(step.MatMul(VocabHeadName, selected), (long)_vocabHeadRows[r] * n);
+            }
+        }
+
+        /// <summary>The ranks' vocabulary slices joined into [vocab, n] logits (a buffer of the model's, as a plan's
+        /// outputs are: the caller copies what it keeps).</summary>
+        private float[] JoinVocabSlices(int[] rankLogits, int n, Func<int, int, float[]> output)
+        {
+            int vocab = Config.VocabSize;
+            long size = (long)vocab * n;
+            if (_vocabLogits == null || _vocabLogits.LongLength != size) _vocabLogits = new float[size];
+            int offset = 0;
+            for (int r = 0; r < rankLogits.Length; r++)
+            {
+                float[] part = output(r, rankLogits[r]);
+                int rows = _vocabHeadRows[r];
+                for (int s = 0; s < n; s++) Array.Copy(part, (long)s * rows, _vocabLogits, (long)s * vocab + offset, rows);
+                offset += rows;
+            }
+            return _vocabLogits;
+        }
+
+        private float[] _vocabLogits;
 
         /// <summary>Each kind's programs of the ranks (recorded once, before the kind's first step streams), whose readers
         /// let each rank's stream free its tensors.</summary>
@@ -1002,7 +1064,8 @@ namespace TensorSharp.Models
                 IGraphPlan lead = streams[0];
                 result = new GraphResult
                 {
-                    Logits = outputs.Logits >= 0 ? lead.Outputs[outputs.Logits] : null,
+                    Logits = outputs.Logits >= 0 ? lead.Outputs[outputs.Logits]
+                        : outputs.RankLogits != null ? JoinVocabSlices(outputs.RankLogits, slots.Length, (r, o) => ((IGraphPlan)streams[r]).Outputs[o]) : null,
                     Final = outputs.Final >= 0 ? lead.Outputs[outputs.Final] : null,
                     Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => i >= 0 ? lead.Outputs[i] : null),
                 };
@@ -1045,6 +1108,7 @@ namespace TensorSharp.Models
         private void KeepRankedReplay(GraphStep[] steps, CachedGraph[] plans, StepOutputs outputs, Slot[] slots, int[] starts, string shape)
         {
             DropRankedReplay();
+            foreach (GraphStep step in steps) step.OwnPositions();   // each rank's step moves its own positions on
             int n = slots.Length;
             var r = new RankedReplay
             {
@@ -1228,7 +1292,8 @@ namespace TensorSharp.Models
                 result = new GraphResult
                 {
                     // A one-shot plan is disposed below: its outputs are the caller's arrays, which disposal does not free.
-                    Logits = outputs.Logits >= 0 ? lead.Outputs[outputs.Logits] : null,
+                    Logits = outputs.Logits >= 0 ? lead.Outputs[outputs.Logits]
+                        : outputs.RankLogits != null ? JoinVocabSlices(outputs.RankLogits, slots.Length, (r, o) => plans[r].Outputs[o]) : null,
                     Final = outputs.Final >= 0 ? lead.Outputs[outputs.Final] : null,
                     Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => i >= 0 ? lead.Outputs[i] : null),
                 };
@@ -1649,7 +1714,11 @@ namespace TensorSharp.Models
             public int Sequences => Slots.Length;
             public int[] First { get; }
             public int[] Counts { get; }
-            public int[] Starts { get; }
+            public int[] Starts { get; private set; }
+
+            /// <summary>A kept decode step gets its own positions (the caller's array is the step's it ran for; stages
+            /// share it), which <see cref="TryAdvance"/> moves on.</summary>
+            internal void OwnPositions() => Starts = (int[])Starts.Clone();
             /// <summary>Every sequence forwards a short chunk (the graph may be replayed).</summary>
             public bool IsDecode { get; }
             /// <summary>Keep the recurrent state after every row (a verify window).</summary>
@@ -1998,9 +2067,34 @@ namespace TensorSharp.Models
             // ---- advancing a decode step
 
             /// <summary>How an input follows the rows' positions.</summary>
-            private enum InputKind : byte { Opaque, Hidden, Positions, WriteRows, DecodeMask, Constant }
+            private enum InputKind : byte { Opaque, Hidden, Positions, WriteRows, DecodeMask, Constant, Refill }
 
-            private readonly record struct InputMeta(InputKind Kind, Array Values, int Window, int Start, int Count);
+            private readonly record struct InputMeta(InputKind Kind, Array Values, int Window, int Start, int Count,
+                Func<bool> Refill = null);
+
+            /// <summary>An input the family rewrites when the step runs again one position on: <paramref name="refill"/>
+            /// runs after the positions moved (through <see cref="RewriteInput"/>, or into the input's own array) and
+            /// returns false where the step would emit another graph there, which refuses the advance.</summary>
+            internal void RefillOnAdvance(int node, Func<bool> refill)
+            {
+                int i = _inputs.LastIndexOf(node);
+                if (i < 0) throw new InvalidOperationException($"node {node} is not an input of this step.");
+                _inputMeta[i] = _inputMeta[i] with { Kind = InputKind.Refill, Refill = refill };
+            }
+
+            /// <summary>Overwrite an I32 or I64 input's values in place (its bound array).</summary>
+            internal void RewriteInput(int node, ReadOnlySpan<int> values)
+            {
+                int i = _inputs.LastIndexOf(node);
+                switch (i < 0 ? null : _inputMeta[i].Values)
+                {
+                    case int[] ints when ints.Length >= values.Length: values.CopyTo(ints); break;
+                    case long[] longs when longs.Length >= values.Length:
+                        for (int k = 0; k < values.Length; k++) longs[k] = values[k];
+                        break;
+                    default: throw new InvalidOperationException($"node {node} is not an I32/I64 input of this step that holds {values.Length} values.");
+                }
+            }
 
             private readonly List<InputMeta> _inputMeta = new();
 
@@ -2049,6 +2143,9 @@ namespace TensorSharp.Models
                             break;
                     }
                 }
+                for (int s = 0; s < Starts.Length; s++) Starts[s] += Counts[s];
+                foreach (InputMeta m in _inputMeta)
+                    if (m.Kind == InputKind.Refill && !m.Refill()) return false;
                 return true;
             }
 
@@ -2081,7 +2178,9 @@ namespace TensorSharp.Models
                 int w = Weight(weight);
                 long ne0, rowBytes;
                 float scale = 1.0f;
-                if (_m._quantWeights.TryGetValue(weight, out QuantizedWeight q))
+                QuantizedWeight q = Rank >= 0 && _m._tpQuantWeights.TryGetValue(weight, out QuantizedWeight[] shards) ? shards[Rank]
+                    : _m._quantWeights.GetValueOrDefault(weight);
+                if (q != null)
                 {
                     ne0 = q.Ne0;
                     rowBytes = q.RawBytes / q.Ne1;
@@ -2089,7 +2188,7 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    Tensor t = _m._weights[weight];
+                    Tensor t = Rank >= 0 && _m._tpWeights.TryGetValue(weight, out Tensor[] tensors) ? tensors[Rank] : _m._weights[weight];
                     ne0 = t.Sizes[t.DimensionCount - 1];
                     rowBytes = ne0 * sizeof(float);
                 }

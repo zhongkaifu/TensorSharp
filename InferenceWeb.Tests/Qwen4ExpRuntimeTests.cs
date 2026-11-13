@@ -343,6 +343,51 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
             $"stages2 qsa={qsa} chunked={chunkedPrompt}");
     }
 
+    /// <summary>A decode step one position on runs again without a trace, its PLE rows and QSA pooled blocks refilled:
+    /// every logit is the traced step's, while QSA attends densely and once it selects past its budget (~67 cells on
+    /// this fixture: those steps trace again), on one device and over two layer-split stages (each keeps its own step).</summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void AdvancedDecodeStepsMatchTracedOnes(bool stages, bool managedCpu)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(qsa: true);
+        BackendType backend = managedCpu ? BackendType.Cpu : TestGates.PinnedGgmlBackend;
+        List<float[]> Run(bool advance, out int advances)
+        {
+            using var model = stages ? new Qwen4ExpRuntimeModel(path, backend, layerSplitDegree: 2) : new Qwen4ExpRuntimeModel(path, backend);
+            Assert.Equal(stages ? 2 : 1, model.Mesh.Stages);
+            model.DecodeAdvanceDisabled = !advance;
+            var unified = (TensorSharp.Runtime.Scheduling.IUnifiedBatchModel)model;
+            unified.EnsureSequenceSlot("a", 320);
+            int[] prompt = Enumerable.Range(0, 20).Select(i => 3 + (i * 37) % 240).ToArray();
+            var logits = new float[1][];
+            Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { prompt }, new[] { 0 }, logits));
+            var trace = new List<float[]>();
+            int length = prompt.Length, next = ArgMax(logits[0]);
+            for (int t = 0; t < 90; t++)
+            {
+                Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { new[] { next } }, new[] { length }, logits));
+                trace.Add((float[])logits[0].Clone());
+                next = ArgMax(logits[0]);
+                length++;
+            }
+            advances = model.DecodeAdvances;
+            return trace;
+        }
+
+        List<float[]> traced = Run(advance: false, out int none);
+        List<float[]> advanced = Run(advance: true, out int advances);
+        Assert.Equal(0, none);
+        // The dense steps after the first two advance (each stage's), the selecting ones trace.
+        Assert.True(advances >= (stages ? 80 : 40), $"{advances} decode steps advanced");
+        Assert.True(advances < (stages ? 180 : 90), $"{advances} decode steps advanced: the selecting ones should trace");
+        for (int i = 0; i < traced.Count; i++)
+            Assert.True(traced[i].AsSpan().SequenceEqual(advanced[i]), $"step {i}: advanced logits differ");
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(true, false)]

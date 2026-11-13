@@ -162,7 +162,8 @@ namespace TensorSharp.Models
             // Decode rows take the packed in-projection in one product; a prompt chunk takes its four
             // row blocks as separate products, so each part is contiguous (no slice copies).
             string inProj = InProjName(layer);
-            bool isPacked = _quantWeights.ContainsKey(inProj) || _weights.ContainsKey(inProj);
+            bool isPacked = _quantWeights.ContainsKey(inProj) || _weights.ContainsKey(inProj)
+                || (step.Rank >= 0 && (_tpQuantWeights.ContainsKey(inProj) || _tpWeights.ContainsKey(inProj)));
             bool split = !isPacked || step.Rows > step.Sequences;
             int proj = -1, qkvAll = -1, zAll = -1, betaAll = -1, alphaAll = -1;
             if (!isPacked)
