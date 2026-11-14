@@ -27,7 +27,7 @@
 // so the committed compute_75 PTX carries working kernels.
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 4
+#define TS_FLASH_PREFILL_VERSION 5
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -399,6 +399,33 @@ __device__ __forceinline__ void ts_fp_attn(
 
 TS_FP_ATTN(128)
 TS_FP_ATTN(256)
+
+// A verify window's rows, each run as the decode row at its position (CudaGraphExecutor's window rows): grid z is the
+// window row, which attends the window's keys less the rows - 1 - z after it (the window's length read from dyn[0] on
+// the device when the step is recorded). One launch for what were `rows` one-row launches, each row through the same
+// code as ts_flash_prefill_f16_d<hd> with nq = 1, so a row's sums are the decode row's bit for bit.
+//   q, out  [rows][nHead][HD] F32;  partial  rows x nHead x splits x (HD + 2) floats (combined over rows * nHead).
+// With cells (a sparse attention's selection): row z's keys are cells[z * cellStride ..], cellCount[z] of them, each with
+// its value in the mask row cellMask[z * cellStride ..] added (len and floor unused).
+// Launch: grid (row tiles * splits, nKv, rows), block 256, the dynamic shared memory of ts_flash_prefill_f16_d<hd>.
+#define TS_FP_ATTN_ROWS(HD) \
+    extern "C" __global__ void __launch_bounds__(256) ts_flash_decode_rows_f16_d##HD( \
+        const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int rows, int len, \
+        int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
+        const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, \
+        const float* __restrict__ cellMask, int cellStride) \
+    { \
+        const int z = blockIdx.z; \
+        const long long at = (long long)z * nHead * HD; \
+        const bool listed = cells != nullptr; \
+        ts_fp_attn<HD>(q + at, kc, vc, cap, 1, (dyn != nullptr ? dyn[0] : len) - (rows - 1 - z), floor, nHead, nKv, scale, \
+            splits, partial != nullptr ? partial + (long long)z * nHead * splits * (HD + 2) : nullptr, out + at, nullptr, \
+            listed ? cells + (long long)z * cellStride : nullptr, listed ? cellCount + z : nullptr, \
+            listed ? cellMask + (long long)z * cellStride : nullptr); \
+    }
+
+TS_FP_ATTN_ROWS(128)
+TS_FP_ATTN_ROWS(256)
 
 // The split partials of one (query, head): out = sum_s e^(m_s - m) acc_s / sum_s e^(m_s - m) l_s.
 // Launch: grid nq * heads, block HD.

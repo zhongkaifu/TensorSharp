@@ -300,6 +300,8 @@ namespace TensorSharp.Cuda
                 return false;
             Tensor whole = mask.HasTensor ? mask.Tensor : null;
             if (selection && (whole == null || whole.DimensionCount != 2 || whole.Sizes[0] != nq)) return false;
+            if (TryWindowRowsInOneLaunch(q, k, v, mask, selection, whole, keys, floor, scale, kWindow, vWindow, out attended))
+                return true;
             var rowMasks = new List<Tensor>();
             using Tensor permuted = q.Permute(1, 0, 2);
             using Tensor byRow = Ops.NewContiguous(permuted);
@@ -342,6 +344,48 @@ namespace TensorSharp.Cuda
                 foreach (Tensor t in rowMasks) t.Dispose();
                 if (!done) output.Dispose();
             }
+            attended = output;
+            return true;
+        }
+
+        /// <summary>
+        /// A verify window's rows on the flash kernel's row grid, where each row would run the flash kernel as a decode row
+        /// (an F16 cache window; a selection's rows listed on the device): one launch, each row the one-row launch's
+        /// arithmetic (its length, its key splits, its cells). One launch a row and a copy each had cost a 4-row window of
+        /// Qwen3.8 Flash Next 0.9 ms against the engine's 0.2 (A40).
+        /// </summary>
+        private bool TryWindowRowsInOneLaunch(Tensor q, Tensor k, Tensor v, AttentionMask mask, bool selection, Tensor whole, int keys,
+            int floor, float scale, CacheWindow kWindow, CacheWindow vWindow, out Tensor attended)
+        {
+            attended = null;
+            var cuda = (CudaAllocator)Allocator;
+            int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2];
+            int kvHeads = k.DimensionCount == 3 ? (int)k.Sizes[0] : 1;
+            int nkv = (int)k.Sizes[^2];
+            if (cuda.FlashPrefillKernels is not { } flash || !flash.RunsAttention(d) || (selection && Kernels == null)) return false;
+            using Tensor kc = HeadFirst(kWindow.Cache), vc = HeadFirst(vWindow.Cache);
+            if (kc.ElementType != DType.Float16 || vc.ElementType != DType.Float16 || kc.Sizes[^1] != d || vc.Sizes[^1] != d) return false;
+            using Tensor rows = selection ? Contiguous2(whole, nq, nkv) : null;
+            if (selection && rows == null) return false;
+            int cap = (int)kc.Sizes[1];
+            // q [heads][nq][d] as its rows [nq][heads][d].
+            using Tensor permuted = q.Permute(1, 0, 2);
+            using Tensor qc = Ops.NewContiguous(permuted);
+            int splits = flash.Splits(heads / kvHeads, kvHeads, selection && mask.KvMax > 0 ? Math.Min(mask.KvMax, nkv) : nkv);
+            using Tensor cells = selection ? new Tensor(Allocator, DType.Int32, nq, nkv) : null;
+            using Tensor count = selection ? new Tensor(Allocator, DType.Int32, nq) : null;
+            if (selection)
+                Launch(new[] { rows }, new[] { cells, count }, (kn, stream) => kn.LaunchMaskCells(Ptr(rows), Ptr(cells), Ptr(count), nq, nkv, stream));
+            IntPtr dyn = selection ? IntPtr.Zero : CudaDecodeDynParams.GetActiveDevicePtr(cuda);
+            var output = new Tensor(Allocator, DType.Float32, nq, heads, d);
+            using Tensor partial = splits > 1
+                ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
+            Tensor[] written = partial == null ? new[] { output } : new[] { output, partial };
+            Tensor[] read = selection ? new[] { qc, kc, vc, cells, count, rows } : new[] { qc, kc, vc };
+            Launch(read, written, (_, stream) => flash.LaunchDecodeRows(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq,
+                selection ? nkv : keys, selection ? 0 : floor, heads, kvHeads, d, scale, splits,
+                partial == null ? IntPtr.Zero : Ptr(partial), Ptr(output), stream, dyn,
+                selection ? Ptr(cells) : IntPtr.Zero, selection ? Ptr(count) : IntPtr.Zero, selection ? Ptr(rows) : IntPtr.Zero, nkv));
             attended = output;
             return true;
         }

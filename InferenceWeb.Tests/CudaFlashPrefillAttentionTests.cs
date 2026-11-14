@@ -208,4 +208,103 @@ public sealed class CudaFlashPrefillAttentionTests
             Assert.True(rel <= 5e-3, $"relative L2 {rel:E2}");
         }
     }
+
+    /// <summary>
+    /// A verify window's rows on the row grid (ts_flash_decode_rows_f16_d*) against one one-row launch a row: row z attends
+    /// the window less the rows - 1 - z keys after it (the length read from a device block, as a recorded step reads it),
+    /// or its own row of a selection's cells, with the window's key splits. Bit for bit: speculative decoding answers as
+    /// plain greedy decoding only if a window's row rounds as the decode row at its position.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(256, 16, 2, 4, 2100, 0, 0)]   // split over the keys
+    [InlineData(256, 32, 4, 8, 700, 0, 0)]
+    [InlineData(128, 8, 1, 3, 300, 40, 0)]    // keys below a floor masked
+    [InlineData(256, 16, 2, 4, 3000, 0, 7)]   // a selection: each row's own cells
+    [InlineData(256, 4, 1, 2, 90, 0, 1)]
+    public void WindowRowsMatchOneRowLaunches(int d, int heads, int kvHeads, int rows, int len, int floor, int every)
+    {
+        using var allocator = new CudaAllocator();
+        CudaFlashPrefillKernels flash = allocator.FlashPrefillKernels;
+        if (flash == null || !flash.RunsAttention(d))
+        {
+            _output.WriteLine("no flash prefill attention for this GPU");
+            return;
+        }
+        allocator.Context.MakeCurrent();
+        Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels graph, out string reason), reason);
+        using (graph)
+        {
+            bool selection = every > 0;
+            int cap = len + 19, group = heads / kvHeads;
+            var rng = new Random(41);
+            float[] qv = new float[rows * heads * d];
+            for (int i = 0; i < qv.Length; i++) qv[i] = (float)(rng.NextDouble() * 2 - 1);
+            var kh = new float[kvHeads * cap * d];
+            var vh = new float[kvHeads * cap * d];
+            for (int i = 0; i < kh.Length; i++)
+            {
+                kh[i] = (float)(System.Half)(rng.NextDouble() * 2 - 1);
+                vh[i] = (float)(System.Half)(rng.NextDouble() * 2 - 1);
+            }
+            // Each row's own kept cells (rotated runs, small mask values), the rest -inf.
+            var mask = new float[rows * len];
+            for (int z = 0; z < rows; z++)
+                for (int j = 0; j < len; j++)
+                    mask[z * len + j] = selection && ((j / 4) + z) % every == 0 ? (float)(rng.NextDouble() * 0.5 - 0.25) : float.NegativeInfinity;
+            float scale = 1f / MathF.Sqrt(d);
+            int splits = flash.Splits(group, kvHeads, len);
+            using var q = Tensor.FromArray(allocator, qv);
+            using var k32 = Tensor.FromArray(allocator, kh);
+            using var v32 = Tensor.FromArray(allocator, vh);
+            using var mt = Tensor.FromArray(allocator, mask);
+            using var dyn = Tensor.FromArray(allocator, new[] { len, 0, 0, 0 });
+            using var k = new Tensor(allocator, DType.Float16, kvHeads * cap * d);
+            using var v = new Tensor(allocator, DType.Float16, kvHeads * cap * d);
+            using var cells = new Tensor(allocator, DType.Int32, rows * len);
+            using var count = new Tensor(allocator, DType.Int32, rows);
+            using var together = new Tensor(allocator, DType.Float32, rows * heads * d);
+            using var alone = new Tensor(allocator, DType.Float32, rows * heads * d);
+            using Tensor partial = splits > 1 ? new Tensor(allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(rows, heads, d, splits)) : null;
+            foreach (Tensor t in new[] { q, k32, v32, mt, dyn, k, v, cells, count, together, alone })
+                ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
+            IntPtr At(Tensor t, long element) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset + element);
+            IntPtr stream = allocator.Stream.Handle;
+            IntPtr none = IntPtr.Zero;
+            allocator.Context.MakeCurrent();
+            allocator.Kernels.LaunchConvertF32F16(P(k32), P(k), kh.Length, stream);
+            allocator.Kernels.LaunchConvertF32F16(P(v32), P(v), vh.Length, stream);
+            if (selection)
+            {
+                graph.LaunchMaskCells(P(mt), P(cells), P(count), rows, len, stream);
+                flash.LaunchDecodeRows(P(q), P(k), P(v), cap, rows, len, 0, heads, kvHeads, d, scale, splits,
+                    partial == null ? none : P(partial), P(together), stream, none, P(cells), P(count), P(mt), len);
+            }
+            else
+                // The length from the device block (a recorded step's), the scalar one wrong on purpose.
+                flash.LaunchDecodeRows(P(q), P(k), P(v), cap, rows, 1, floor, heads, kvHeads, d, scale, splits,
+                    partial == null ? none : P(partial), P(together), stream, P(dyn));
+            for (int z = 0; z < rows; z++)
+            {
+                long at = (long)z * heads * d;
+                if (selection)
+                    flash.LaunchAttention(At(q, at), P(k), P(v), cap, 1, len, 0, heads, kvHeads, d, scale, splits,
+                        partial == null ? none : P(partial), At(alone, at), stream, none, At(cells, (long)z * len), At(count, z), At(mt, (long)z * len));
+                else
+                    flash.LaunchAttention(At(q, at), P(k), P(v), cap, 1, len - (rows - 1 - z), floor, heads, kvHeads, d, scale, splits,
+                        partial == null ? none : P(partial), At(alone, at), stream);
+            }
+            allocator.Stream.Synchronize();
+            foreach (Tensor t in new[] { together, alone }) ((CudaStorage)t.Storage).MarkDeviceModified();
+            float[] a = together.GetElementsAsFloat(rows * heads * d), b = alone.GetElementsAsFloat(rows * heads * d);
+            int differ = 0;
+            for (int i = 0; i < a.Length; i++)
+                if (BitConverter.SingleToInt32Bits(a[i]) != BitConverter.SingleToInt32Bits(b[i])) differ++;
+            int zeros = 0;
+            foreach (float x in a) if (x == 0f) zeros++;
+            _output.WriteLine($"d {d}, {heads}/{kvHeads} heads, {rows} rows over {len} keys (floor {floor}, every {every}), {splits} splits: {differ} of {a.Length} differ");
+            Assert.Equal(0, differ);
+            Assert.True(zeros < a.Length / 4, $"{zeros} of {a.Length} outputs are zero");
+        }
+    }
 }
