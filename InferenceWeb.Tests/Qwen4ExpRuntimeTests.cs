@@ -415,6 +415,62 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
 
     /// <summary>The MTP head's routed experts requantized at load (the CUDA preset's TS_Q4E_MTP_EXPERTS=q2_0): the draft
     /// layer holds Q2_0 stacks, and speculation still emits the plain greedy streams (the verify decides every token).</summary>
+    /// <summary>The CUDA executor's draft chain (each step's top ten read back as ids and values) drafts what the per-step
+    /// head drafts - the tokens, and the speculator's confidences bit for bit - and stops after the first step below the
+    /// gate, as the speculator's per-step loop stops.</summary>
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DraftChainOnDirectCudaDraftsItsSteps(bool qsa)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        const int steps = 4;
+        (int[] Ids, float[] Probs, int Count) Draft(bool chain, float stopBelow)
+        {
+            using var model = new Qwen4ExpRuntimeModel(target, BackendType.Cuda, draftModelPath: mtp);
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var head = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.IDraftHead>(model);
+            Assert.True(head.SupportsDraftChain);
+            int width = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
+            int n = prompt.Length;
+            var hAll = new float[n * width];
+            var logits = new float[vocab];
+            model.ResetKVCache();
+            spec.SpecForward(prompt, hAll, logits, false);
+            head.DraftCatchUp(prompt, new float[width].Concat(hAll[..((n - 1) * width)]).ToArray(), 0);
+            var ids = new int[steps];
+            var probs = new float[steps];
+            float[] hIn = hAll[((n - 1) * width)..];
+            if (chain) return (ids, probs, head.DraftChain(new[] { ArgMax(logits) }, hIn, n, steps, ids, probs, stopBelow));
+            var draft = new float[vocab];
+            int token = ArgMax(logits), count = 0;
+            for (int i = 0; i < steps; i++)
+            {
+                var hOut = new float[width];
+                head.DraftStep(token, hIn, n + i, draft, hOut);
+                ids[i] = TensorSharp.Runtime.Speculative.DraftHeadSpeculator.ArgmaxWithTopKConfidence(draft, vocab, out probs[i]);
+                count++;
+                if (probs[i] < stopBelow) break;
+                token = ids[i];
+                hIn = hOut;
+            }
+            return (ids, probs, count);
+        }
+        var plain = Draft(chain: false, stopBelow: 0f);
+        var chained = Draft(chain: true, stopBelow: 0f);
+        Assert.Equal(steps, chained.Count);
+        Assert.Equal(plain.Ids, chained.Ids);
+        Assert.Equal(plain.Probs.Select(BitConverter.SingleToInt32Bits), chained.Probs.Select(BitConverter.SingleToInt32Bits));
+        // A gate just above the second step's confidence: the chain stops after the first step below it.
+        float gate = BitConverter.Int32BitsToSingle(BitConverter.SingleToInt32Bits(plain.Probs[1]) + 1);
+        int expect = Array.FindIndex(plain.Probs, p => p < gate) + 1;
+        var gated = Draft(chain: true, stopBelow: gate);
+        Assert.Equal(expect, gated.Count);
+        Assert.Equal(plain.Ids.Take(expect), gated.Ids.Take(expect));
+    }
+
     [Theory]
     [InlineData(BackendType.Cpu)]
     public Task Q2_0DraftExpertsSpeculateAsPlain(BackendType backend) => AssertQ2_0DraftExperts(backend);

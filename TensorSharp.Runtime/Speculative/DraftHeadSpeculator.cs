@@ -240,7 +240,7 @@ namespace TensorSharp.Runtime.Speculative
                 _chainIds = new int[ctx.MaxTokens];
                 _chainProbs = new float[ctx.MaxTokens];
             }
-            int steps = _head.DraftChain(tokens, hRows, start, ctx.MaxTokens, _chainIds, _chainProbs);
+            int steps = _head.DraftChain(tokens, hRows, start, ctx.MaxTokens, _chainIds, _chainProbs, MinDraftProb);
             for (int i = 0; i < steps; i++)
             {
                 if (_chainProbs[i] < MinDraftProb)
@@ -321,15 +321,24 @@ namespace TensorSharp.Runtime.Speculative
                     best = i;
             }
 
-            double denom = 0;
-            for (int j = 0; j < K; j++)
-            {
-                if (float.IsNegativeInfinity(topV[j]))
-                    break;
-                denom += Math.Exp(topV[j] - topV[0]);
-            }
-            prob = denom > 0 ? (float)(1.0 / denom) : 0f;
+            prob = TopConfidence(topV);
             return best;
+        }
+
+        /// <summary>
+        /// The confidence of <see cref="ArgmaxWithTopKConfidence"/> from a step's largest logits in descending order (up to
+        /// ten; a draft chain's device top-k reads back only these): the top-1 probability of a softmax over them.
+        /// </summary>
+        public static float TopConfidence(ReadOnlySpan<float> top)
+        {
+            double denom = 0;
+            for (int j = 0; j < top.Length; j++)
+            {
+                if (float.IsNegativeInfinity(top[j]))
+                    break;
+                denom += Math.Exp(top[j] - top[0]);
+            }
+            return denom > 0 ? (float)(1.0 / denom) : 0f;
         }
     }
 }

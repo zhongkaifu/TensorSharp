@@ -61,7 +61,7 @@ namespace TensorSharp.Models
         /// <summary>The replay shapes of the draft layer's steps start with this.</summary>
         private const string DraftShapePrefix = "draft-";
 
-        private void RunDraftLayer(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
+        private void RunDraftLayer(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut, float[] topOut = null)
         {
             int rows = tokens.Length, hiddenSize = DraftFeatureWidth;
             if (hRows == null || hRows.LongLength < (long)rows * hiddenSize)
@@ -80,7 +80,7 @@ namespace TensorSharp.Models
             Tensor embedded = DraftEmbedding(tokens);
             Tensor hidden = CreateFloatTensor(hRows.AsSpan(0, rows * hiddenSize).ToArray(), rows, hiddenSize);
             Slot active = SnapshotActive();
-            bool wantLogits = logitsOut != null;
+            bool top = topOut != null, wantLogits = logitsOut != null || top;
             CachedGraph graph = null;
             bool owned = false;
             StepOutputs outputs = default;
@@ -91,18 +91,23 @@ namespace TensorSharp.Models
                 // as decode steps and verify windows do: its rows are the token embeddings and the trunk's rows.
                 graph = RunTraced(rows, new[] { active }, new[] { 0 }, new[] { rows }, new[] { startPos },
                     replayable: rows <= SmallChunkRows, snapshots: false, attentionFloor: active.DraftStart,
-                    step => EmitDraftLayer(step, embedded, hidden, wantLogits), out outputs, out owned,
-                    shape: DraftShapePrefix + (wantLogits ? "logits" : "rows"), advanceInputs: new[] { embedded, hidden });
+                    step => EmitDraftLayer(step, embedded, hidden, wantLogits, top), out outputs, out owned,
+                    shape: DraftShapePrefix + (top ? "top" : wantLogits ? "logits" : "rows"), advanceInputs: new[] { embedded, hidden });
                 if (graph == null)
                     throw new NotSupportedException(SpeculationRefusal ?? $"{Config.Architecture}: the draft layer cannot run as a graph.");
                 _cacheDeviceDirty = true;
-                if (wantLogits)
+                if (top)
+                {
+                    Array.Copy(graph.Outputs[outputs.Logits], topOut, DraftTopK);
+                    Array.Copy(graph.Outputs[outputs.Hidden], 0, topOut, DraftTopK, DraftTopK);
+                }
+                else if (wantLogits)
                 {
                     int scored = Math.Min(logitsOut.Length, ScoredDraftVocabulary);
                     Array.Copy(graph.Outputs[outputs.Logits], logitsOut, scored);
                     if (scored < logitsOut.Length) Array.Fill(logitsOut, float.NegativeInfinity, scored, logitsOut.Length - scored);
-                    if (hOut != null) Array.Copy(graph.Outputs[outputs.Final], hOut, Math.Min(hOut.Length, hiddenSize));
                 }
+                if (wantLogits && hOut != null) Array.Copy(graph.Outputs[outputs.Final], hOut, Math.Min(hOut.Length, hiddenSize));
             }
             finally
             {
@@ -161,10 +166,10 @@ namespace TensorSharp.Models
 
         /// <summary>Trace the draft layer: projected input, one decoder layer (the family's block hooks), its head
         /// (last row). The chained row is the head's normed row, or the stream (<see cref="DraftChainsStream"/>).</summary>
-        private StepOutputs EmitDraftLayer(GraphStep step, Tensor embedded, Tensor hidden, bool wantLogits)
+        private StepOutputs EmitDraftLayer(GraphStep step, Tensor embedded, Tensor hidden, bool wantLogits, bool top = false)
         {
             int rows = step.Rows, hiddenSize = Config.HiddenSize, n = Config.NumLayers, width = DraftFeatureWidth;
-            var outputs = new StepOutputs { Logits = -1, Final = -1 };
+            var outputs = new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
             var positions = new int[rows];
             for (int i = 0; i < rows; i++) positions[i] = step.Starts[0] + i + step.Slots[0].RopeDelta;
             step.SetPositions(positions);
@@ -183,9 +188,21 @@ namespace TensorSharp.Models
                 : HasWeight("output.weight") ? "output.weight" : "token_embd.weight";
             outputs.Final = step.Output(DraftChainsStream ? last : head, width);
             int vocab = ScoredDraftVocabulary;
-            outputs.Logits = step.Output(vocab < Config.VocabSize ? step.MatMulRows(headWeight, 0, vocab, head, alone: true) : step.MatMul(headWeight, head), vocab);
+            int logits = vocab < Config.VocabSize ? step.MatMulRows(headWeight, 0, vocab, head, alone: true) : step.MatMul(headWeight, head);
+            if (!top)
+            {
+                outputs.Logits = step.Output(logits, vocab);
+                return outputs;
+            }
+            // A chain step's ten largest logits, as ids (a tie to the lower id) and values: what its confidence is made of.
+            int ids = step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { DraftTopK }));
+            outputs.Logits = step.Output(ids, DraftTopK);
+            outputs.Hidden = step.Output(step.Op(GraphOp.GetRows, step.Reshape(logits, 1, vocab), ids), DraftTopK);
             return outputs;
         }
+
+        /// <summary>The largest logits a draft chain's step reads back (the speculator's confidence is a softmax over ten).</summary>
+        private const int DraftTopK = 10;
 
         /// <summary>The draft layer's input: the next tokens' embedding and the trunk's rows, each RMS-normed
         /// (<c>nextn.enorm</c>, <c>nextn.hnorm</c>), concatenated and projected (<c>nextn.eh_proj</c>).</summary>
@@ -228,6 +245,41 @@ namespace TensorSharp.Models
             if (HasDFlash) throw new NotSupportedException("A DFlash drafter proposes whole blocks; use DraftBlock.");
             if (!HasDraftLayer) throw new InvalidOperationException($"{Config.Architecture} has no NextN/MTP draft layer.");
             RunDraftLayer(new[] { token }, hPrev, pos, logitsOut, hOut);
+        }
+
+        /// <summary>
+        /// The draft window in one call (<see cref="IDraftHead.DraftChain"/>) on executors that return integer outputs: each
+        /// step reads back its ten largest logits as ids and values (80 bytes) where a step had read back the scored
+        /// vocabulary's logits (593 KB of Qwen3.8's) for the speculator to scan on the host; the confidence is then the
+        /// speculator's own (<see cref="TensorSharp.Runtime.Speculative.DraftHeadSpeculator.TopConfidence"/> over the same
+        /// ten values), and the chain stops after the first step below <paramref name="stopBelow"/> as the per-step loop did.
+        /// </summary>
+        public bool SupportsDraftChain => HasDraftLayer && !HasDFlash && !_rankGraphs && GraphUnsupportedReason() == null
+            && GraphExecutor?.Capabilities.GreedyIdOutputs == true;
+
+        public int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut, float stopBelow = 0f)
+        {
+            if (!SupportsDraftChain) throw new InvalidOperationException($"{Config.Architecture} cannot run a draft chain.");
+            int width = DraftFeatureWidth, steps = 0, pos = startPos;
+            var top = new float[2 * DraftTopK];
+            float[] hIn = hRows, hOut = new float[width], spare = new float[width];
+            int[] stepTokens = tokens;
+            while (steps < maxTokens)
+            {
+                RunDraftLayer(stepTokens, hIn, pos, null, hOut, top);
+                int id = (int)top[0];
+                float prob = TensorSharp.Runtime.Speculative.DraftHeadSpeculator.TopConfidence(top.AsSpan(DraftTopK, DraftTopK));
+                draftOut[steps] = id;
+                probOut[steps] = prob;
+                steps++;
+                if (prob < stopBelow) break;
+                pos += stepTokens.Length;
+                stepTokens = new[] { id };
+                float[] next = ReferenceEquals(hIn, hRows) ? spare : hIn;
+                hIn = hOut;
+                hOut = next;
+            }
+            return steps;
         }
 
         /// <summary>A draft step folds into the catch-up over the accepted rows (one graph).</summary>
