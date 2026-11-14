@@ -702,6 +702,40 @@ public sealed class Qwen35RuntimeTests : IDisposable
     public void PrefetchedHostExpertsOnDirectCudaMatchDeviceExperts()
         => AssertHostExpertsMatchDevice(BackendType.Cuda, true, "moe-quantized", prefetch: true);
 
+    /// <summary>An adaptive round pairs a layer's hottest experts outside its tier with its coldest members, hottest with
+    /// coldest, while the outside one was routed more than twice as often (and at least twice): with every member cold the
+    /// two hot experts take the two lowest-numbered idle members' places; with the members warm only the expert routed past
+    /// twice theirs trades; the budget keeps the largest gains; nothing trades on a layer whose outside experts are cold.</summary>
+    [Fact]
+    public void AdaptiveRoundsPairTheHottestOutsideWithTheColdestMembers()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        using var model = Create(Fixture("moe"), backend: BackendType.Cpu);
+        int experts = model.ExpertCountForTests, half = experts / 2;
+        int[] moe = Enumerable.Range(0, model.Config.NumLayers).Where(l => model.ExpertHostForTests(l) != null).Take(3).ToArray();
+        Assert.True(moe.Length >= 2, "the fixture has too few offloaded MoE layers");
+        foreach (int l in moe) model.SetExpertTierForTests(l, Enumerable.Range(0, half).ToArray());
+        TensorSharp.Graph.IGraphExpertHost host = model.ExpertHostForTests(moe[0]);
+        int[] Routes(params (int Expert, int Count)[] counts) => counts.SelectMany(c => Enumerable.Repeat(c.Expert, c.Count)).ToArray();
+        // Layer A: two hot outside experts, every member cold.
+        host.Record(moe[0], Routes((half + 1, 9), (half + 3, 5)));
+        // Layer B: every member routed 3 times; one outside expert at 10 (> 2 * 3 + 1), one at 7 (not).
+        host.Record(moe[1], Routes(Enumerable.Range(0, half).Select(e => (e, 3)).Concat(new[] { (half + 2, 10), (half + 4, 7) }).ToArray()));
+        var swaps = host.ProposeSwaps(8);
+        var a = swaps.Where(s => s.Layer == moe[0]).ToArray();
+        var b = swaps.Where(s => s.Layer == moe[1]).ToArray();
+        Assert.Equal(new[] { (moe[0], 0, half + 1), (moe[0], 1, half + 3) }, a.Select(s => (s.Layer, s.Out, s.In)).ToArray());
+        Assert.Equal(new[] { (moe[1], 0, half + 2) }, b.Select(s => (s.Layer, s.Out, s.In)).ToArray());
+        if (moe.Length > 2) Assert.DoesNotContain(swaps, s => s.Layer == moe[2]);
+        // The budget keeps the largest gains: layer B's 10 - 3 before layer A's 5 - 0.
+        host.Record(moe[0], Routes((half + 1, 18), (half + 3, 10)));
+        host.Record(moe[1], Routes(Enumerable.Range(0, half).Select(e => (e, 6)).Concat(new[] { (half + 2, 40) }).ToArray()));
+        var top = host.ProposeSwaps(1);
+        Assert.Single(top);
+        Assert.Equal((moe[1], 0, half + 2), (top[0].Layer, top[0].Out, top[0].In));
+    }
+
     private void AssertHostExpertsMatchDevice(BackendType backend, bool tier, string variant = "moe", bool prefetch = false)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);

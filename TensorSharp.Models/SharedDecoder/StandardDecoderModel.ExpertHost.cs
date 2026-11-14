@@ -125,6 +125,8 @@ namespace TensorSharp.Models
             /// <summary>A prompt chunk's selections weigh as this many rows' worth of decode selections.</summary>
             internal const float PromptAdaptRows = 128f;
 
+            private readonly List<int> _hot = new(), _cold = new();
+
             public IReadOnlyList<(int Layer, int Out, int In)> ProposeSwaps(int budget)
             {
                 var trades = new List<(float Gain, int Layer, int Out, int In)>();
@@ -136,17 +138,49 @@ namespace TensorSharp.Models
                         bool[] held = _tier[l];
                         float[] recent = _recent[l];
                         if (held == null || recent == null) continue;
-                        // The layer's hottest experts outside the tier against its coldest members, pairwise.
-                        var outside = new List<int>();
-                        var inside = new List<int>();
-                        for (int e = 0; e < held.Length; e++) (held[e] ? inside : outside).Add(e);
-                        outside.Sort((a, b) => recent[b].CompareTo(recent[a]));
-                        inside.Sort((a, b) => recent[a].CompareTo(recent[b]));
-                        for (int i = 0; i < Math.Min(outside.Count, inside.Count); i++)
+                        // The layer's hottest experts outside the tier against its coldest members, pairwise, while the hot one
+                        // was routed more than twice as often. Only experts hotter than twice the coldest member can pair, so
+                        // one pass finds them and only they are sorted (sorting both whole lists cost 2-7 ms a round over 48
+                        // layers of 512 experts, on the decode thread).
+                        float coldest = float.PositiveInfinity;
+                        int members = 0;
+                        for (int e = 0; e < held.Length; e++)
+                            if (held[e])
+                            {
+                                members++;
+                                if (recent[e] < coldest) coldest = recent[e];
+                            }
+                        float bar = 2f * coldest + 1f;
+                        _hot.Clear();
+                        for (int e = 0; e < held.Length; e++)
+                            if (!held[e] && recent[e] > bar) _hot.Add(e);
+                        if (members > 0 && _hot.Count > 0)
                         {
-                            float hot = recent[outside[i]], cold = recent[inside[i]];
-                            if (hot <= 2f * cold + 1f) break;
-                            trades.Add((hot - cold, l, inside[i], outside[i]));
+                            _hot.Sort((a, b) => recent[b] != recent[a] ? recent[b].CompareTo(recent[a]) : a.CompareTo(b));
+                            // The hot ones' partners: the as many coldest members, coldest first.
+                            _cold.Clear();
+                            for (int e = 0; e < held.Length; e++) if (held[e]) _cold.Add(e);
+                            int need = Math.Min(_hot.Count, _cold.Count);
+                            if (need * 8 >= _cold.Count)
+                                _cold.Sort((a, b) => recent[a] != recent[b] ? recent[a].CompareTo(recent[b]) : a.CompareTo(b));
+                            else
+                                for (int i = 0; i < need; i++)
+                                {
+                                    // The few coldest by selection (a lower id first among equals, as the sort orders them).
+                                    int best = i;
+                                    for (int j = i + 1; j < _cold.Count; j++)
+                                    {
+                                        float rj = recent[_cold[j]], rb = recent[_cold[best]];
+                                        if (rj < rb || (rj == rb && _cold[j] < _cold[best])) best = j;
+                                    }
+                                    (_cold[i], _cold[best]) = (_cold[best], _cold[i]);
+                                }
+                            for (int i = 0; i < Math.Min(_hot.Count, _cold.Count); i++)
+                            {
+                                float hot = recent[_hot[i]], cold = recent[_cold[i]];
+                                if (hot <= 2f * cold + 1f) break;
+                                trades.Add((hot - cold, l, _cold[i], _hot[i]));
+                            }
                         }
                         // Decayed each round: recent routing outweighs old.
                         for (int e = 0; e < recent.Length; e++) recent[e] *= 0.5f;
@@ -237,6 +271,9 @@ namespace TensorSharp.Models
         /// <summary>Routes the expert host computed on the host, and steps it streamed to the device (tests).</summary>
         internal (long HostRoutes, long StreamedSteps) ExpertHostCountsForTests
             => _expertHost == null ? (0, 0) : (_expertHost.HostRoutes, _expertHost.StreamedSteps);
+
+        /// <summary>The expert host of <paramref name="layer"/> (tests).</summary>
+        internal IGraphExpertHost ExpertHostForTests(int layer) => HostFor(layer);
 
         /// <summary>Test seam: keep <paramref name="experts"/> of <paramref name="layer"/> in the executor's tier.</summary>
         internal void SetExpertTierForTests(int layer, int[] experts) => (HostFor(layer) ?? throw new InvalidOperationException(
