@@ -603,6 +603,27 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData(true)]
     public void QuantizedHostExpertsOnMlxMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Mlx, tier, "moe-quantized");
 
+    /// <summary>A shared expert run beside the router and the routed experts on a second stream (a concurrent region) gives
+    /// the logits it gives run in place, bit for bit: the same kernels on the same bytes, the streams joined where its output
+    /// is read - prompts, decode steps and their recordings.</summary>
+    [CudaFact]
+    public void SharedExpertBesideTheRoutedExpertsGivesTheSameLogitsOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture("moe-quantized");
+        List<float[]> Run(bool inPlace)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.ConcurrentRegionsDisabledForTests = inPlace;
+            List<float[]> rows = Script(model);
+            Assert.True(model.GraphReplays > 0, "the decode steps did not replay");
+            return rows;
+        }
+        List<float[]> beside = Run(false), inPlace = Run(true);
+        for (int i = 0; i < inPlace.Count; i++)
+            Assert.True(beside[i].AsSpan().SequenceEqual(inPlace[i]), $"row {i}: {RelL2(beside[i], inPlace[i]):E2} from the in-place run");
+    }
+
     /// <summary>The staged-ahead path of a long prompt chunk (CudaGraphExecutor.PromptPrefetch: every host expert of the
     /// next MoE layer copied into the other arena half while a layer runs, the routes kept on the device), driven with
     /// the fixture's short prompt by lowering this executor's row threshold: the same answers as the device's experts.</summary>

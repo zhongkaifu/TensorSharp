@@ -1561,6 +1561,13 @@ namespace TensorSharp.Cuda
             _stepTables = null;
             foreach (Tensor t in _decodeScratchTensors) t.Dispose();
             _decodeScratchTensors.Clear();
+            if (_sideStream != null)
+            {
+                CudaDriverApi.cuEventDestroy(_forkEvent);
+                CudaDriverApi.cuEventDestroy(_joinEvent);
+                _sideStream.Dispose();
+                _sideStream = null;
+            }
             foreach (Tensor t in _narrowF32.Values) t.Dispose();
             _narrowF32.Clear();
             _gemvScratch?.Dispose();
@@ -1683,6 +1690,7 @@ namespace TensorSharp.Cuda
                 PendingWrites = _joins.Count > 0;
                 finish();
             }
+            _pendingJoin?.Invoke();
             PendingWrites = false;
         }
 
@@ -2103,9 +2111,10 @@ namespace TensorSharp.Cuda
         private void KeepQuantized(Tensor x, long inDim, long rows, Tensor q)
         {
             var key = ((CudaStorage)x.Storage, x.StorageOffset, inDim, rows);
-            if (_quantized.TryGetValue(key, out Tensor old)) old.Dispose();
+            var cache = _branchQuantized ?? _quantized;
+            if (cache.TryGetValue(key, out Tensor old)) old.Dispose();
             ((CudaStorage)q.Storage).MarkDeviceModified();
-            _quantized[key] = q;
+            cache[key] = q;
         }
 
         /// <summary>The rows of x quantized to q8_1, once a run for every product that reads them.</summary>
@@ -2113,13 +2122,81 @@ namespace TensorSharp.Cuda
         {
             var key = (xs, x.StorageOffset, inDim, rows);
             if (_quantized.TryGetValue(key, out Tensor xq)) return xq;
+            // A concurrent region keeps its copies to itself: the other stream would read them before they are written.
+            if (_branchQuantized != null && _branchQuantized.TryGetValue(key, out xq)) return xq;
             xq = new Tensor(Allocator, DType.UInt8, rows * (inDim / 32) * CudaKernels.Q81BlockBytes);
             xs.EnsureDeviceCurrent();
             cuda.Context.MakeCurrent();
             CudaQuantizedOps.QuantizeRowsQ81(cuda, Ptr(x), Ptr(xq), (int)inDim, (int)rows);
             ((CudaStorage)xq.Storage).MarkDeviceModified();
-            _quantized[key] = xq;
+            (_branchQuantized ?? _quantized)[key] = xq;
             return xq;
+        }
+
+        // ---- concurrent regions (GraphFusion.ConcurrentBranch)
+
+        /// <summary>Rows up to which a concurrent region runs on the second stream (decode steps and verify windows, whose
+        /// kernels leave most of the device idle; a prompt chunk's fill it).</summary>
+        private const int ConcurrentMaxRows = 16;
+        private CudaStream _sideStream;
+        private IntPtr _forkEvent, _joinEvent;
+        private Dictionary<(CudaStorage Storage, long Offset, long InDim, long Rows), Tensor> _branchQuantized;
+        private Action _pendingJoin;
+
+        protected override bool RunsConcurrently(GraphFusion kind)
+            => kind == GraphFusion.ConcurrentBranch && Kernels != null;
+
+        /// <summary>
+        /// A decode-size concurrent region (a shared expert beside the router and the routed experts, the Qwen3.8 engines'
+        /// forked shared-expert stream) runs on a second stream: it starts after everything queued so far and the step's
+        /// next work does not wait for it until its results are read (<see cref="BeforeRead"/>). A recorded step holds both
+        /// branches. Every block returned in between is held back until the streams join, so neither stream is handed
+        /// memory the other may still read.
+        /// </summary>
+        protected override bool BeginConcurrent(Tensor[] inputs)
+        {
+            if (_branchQuantized != null || inputs.Length == 0 || inputs[0] == null || inputs[0].Storage is not CudaStorage) return false;
+            long width = inputs[0].Sizes[^1];
+            if (width <= 0 || inputs[0].ElementCount() / width > ConcurrentMaxRows) return false;
+            _pendingJoin?.Invoke();
+            var cuda = (CudaAllocator)Allocator;
+            cuda.Context.MakeCurrent();
+            if (_sideStream == null)
+            {
+                _sideStream = CudaStream.Create();
+                CudaDriverApi.cuEventCreate(out _forkEvent, 2 /* CU_EVENT_DISABLE_TIMING */).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out _joinEvent, 2).ThrowOnError();
+            }
+            CudaDriverApi.cuEventRecord(_forkEvent, cuda.MainStream.Handle).ThrowOnError();
+            CudaDriverApi.cuStreamWaitEvent(_sideStream.Handle, _forkEvent, 0).ThrowOnError();
+            cuda.EnterSideStream(_sideStream);
+            _branchQuantized = new();
+            return true;
+        }
+
+        protected override void EndConcurrent(Tensor[] results)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            CudaDriverApi.cuEventRecord(_joinEvent, _sideStream.Handle).ThrowOnError();
+            cuda.LeaveSideStream();
+            foreach (Tensor t in _branchQuantized.Values) t.Dispose();
+            _branchQuantized = null;
+            bool joined = false;
+            Action join = null;
+            join = () =>
+            {
+                if (joined) return;
+                joined = true;
+                if (ReferenceEquals(_pendingJoin, join)) _pendingJoin = null;
+                cuda.Context.MakeCurrent();
+                CudaDriverApi.cuStreamWaitEvent(cuda.MainStream.Handle, _joinEvent, 0).ThrowOnError();
+                cuda.EndDeferredReturns();
+            };
+            _pendingJoin = join;
+            foreach (Tensor r in results)
+                if (r?.Storage is CudaStorage storage) _joins.Add((storage, join));
+            PendingWrites = _joins.Count > 0;
+            if (!PendingWrites) join();
         }
 
         /// <summary>

@@ -1703,10 +1703,24 @@ namespace TensorSharp.Models
 
         private bool UnscaledQuantized(string name) => _quantWeights.TryGetValue(name, out QuantizedWeight q) && q.Scale == 1.0f;
 
+        /// <summary>Tests: a shared expert runs in place, not as a concurrent region.</summary>
+        internal bool ConcurrentRegionsDisabledForTests { get; set; }
+
         private int EmitMoe(GraphStep step, int layer, int x)
         {
             string p = LayerName(layer, "");
             int rows = step.Rows, hidden = Config.HiddenSize, k = _expertsUsed;
+            // The shared expert reads only x and is read only at the end: a region an executor may run beside the router and
+            // the routed experts (the Qwen3.8 engines' forked shared-expert stream), emitted first so it can start first.
+            int shared = -1;
+            if (HasWeight(p + "ffn_gate_shexp.weight"))
+            {
+                bool beside = !ConcurrentRegionsDisabledForTests;
+                if (beside) step.BeginFused(GraphFusion.ConcurrentBranch, stackalloc[] { x });
+                int sa = step.Op(GraphOp.SwigluSplit, step.MatMul(p + "ffn_gate_shexp.weight", x), step.MatMul(p + "ffn_up_shexp.weight", x));
+                shared = step.MatMul(p + "ffn_down_shexp.weight", sa);
+                if (beside) step.EndFused(stackalloc[] { shared });
+            }
             int logits = step.MatMul(p + "ffn_gate_inp.weight", x);                                    // [E, rows]
             // Experts on the device: routing and experts are one region an executor may run with its own MoE kernels
             // (MLX keeps the top-K on the device instead of reading the logits back every layer).
@@ -1774,10 +1788,8 @@ namespace TensorSharp.Models
                 step.EndFused(stackalloc[] { output });
             }
 
-            if (HasWeight(p + "ffn_gate_shexp.weight"))
+            if (shared >= 0)
             {
-                int sa = step.Op(GraphOp.SwigluSplit, step.MatMul(p + "ffn_gate_shexp.weight", x), step.MatMul(p + "ffn_up_shexp.weight", x));
-                int shared = step.MatMul(p + "ffn_down_shexp.weight", sa);
                 if (_weights.ContainsKey(p + "ffn_gate_inp_shexp.weight"))
                 {
                     int g = step.Op(GraphOp.MulMat, step.WeightAs(p + "ffn_gate_inp_shexp.weight", hidden, 1), x);   // [1, rows]

@@ -527,7 +527,7 @@ namespace TensorSharp.Graph
                         break;
                     case GraphNodeKind.Fused:
                         if (InRegion) _nested++;
-                        else if (_x.Fuses((GraphFusion)e.Node)) _region = e;
+                        else if (_x.Fuses((GraphFusion)e.Node) || _x.RunsConcurrently((GraphFusion)e.Node)) _region = e;
                         break;
                     case GraphNodeKind.FusedEnd:
                         if (InRegion && _nested > 0) _nested--;
@@ -576,6 +576,25 @@ namespace TensorSharp.Graph
                     }
                     inputs[i] = Get(region.Srcs[i]);
                     if (!_x.RegionReadsStridedInputs((GraphFusion)region.Node) && !inputs[i].IsContiguous()) inputs[i] = _x.Contig(inputs[i], Run);
+                }
+                if (_x.RunsConcurrently((GraphFusion)region.Node))
+                {
+                    // The region's ops, now, beside what the step runs next (the executor waits where their results are read).
+                    bool beside = _x.BeginConcurrent(inputs);
+                    try
+                    {
+                        foreach (int r in results) Force(r);
+                    }
+                    finally
+                    {
+                        if (beside)
+                        {
+                            var made = new Tensor[results.Length];
+                            for (int i = 0; i < results.Length; i++) made[i] = _values[results[i]].Tensor;
+                            _x.EndConcurrent(made);
+                        }
+                    }
+                    return;
                 }
                 var outs = new Tensor[results.Length];
                 if (_x.TryFused((GraphFusion)region.Node, inputs, weights, region.Ip, region.Fp, outs))
@@ -1078,6 +1097,17 @@ namespace TensorSharp.Graph
         /// <paramref name="weights"/> at the same index; false (nothing set) where the kernel does not apply,
         /// and the region's ops run instead.</summary>
         protected virtual bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results) => false;
+
+        /// <summary>Whether a region of <paramref name="kind"/> (<see cref="GraphFusion.ConcurrentBranch"/>) runs its ops at its
+        /// end, where <see cref="BeginConcurrent"/> may move them beside the step's later work.</summary>
+        protected virtual bool RunsConcurrently(GraphFusion kind) => false;
+
+        /// <summary>A concurrent region's ops are about to run (its inputs computed): true where the executor runs them beside
+        /// the step's later work until <see cref="EndConcurrent"/>, false to run them in place.</summary>
+        protected virtual bool BeginConcurrent(Tensor[] inputs) => false;
+
+        /// <summary>A concurrent region's ops are queued; <paramref name="results"/> are what later ops will wait for.</summary>
+        protected virtual void EndConcurrent(Tensor[] results) { }
 
         protected virtual bool TryAddWeightedNorm(Tensor a, Tensor b, Tensor weight, float eps, out Tensor sum, out Tensor normed)
         {

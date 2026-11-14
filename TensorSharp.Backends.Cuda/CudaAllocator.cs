@@ -63,7 +63,7 @@ namespace TensorSharp.Cuda
                 * 1024L * 1024L;
 
             Context = context;
-            Stream = stream;
+            _stream = stream;
             Blas = blas;
             Kernels = kernels;
             DeviceId = deviceId;
@@ -85,7 +85,50 @@ namespace TensorSharp.Cuda
 
         internal CudaContext Context { get; }
 
-        internal CudaStream Stream { get; }
+        /// <summary>The stream work is queued on: the allocator's own, or a second stream a graph executor moved this thread's
+        /// work to for a concurrent region (<see cref="EnterSideStream"/>).</summary>
+        internal CudaStream Stream => _side != null && _sideThread == Environment.CurrentManagedThreadId ? _side : _stream;
+
+        /// <summary>The allocator's own stream, whatever a concurrent region moved.</summary>
+        internal CudaStream MainStream => _stream;
+
+        private readonly CudaStream _stream;
+        private CudaStream _side;
+        private int _sideThread;
+
+        // Blocks returned while work on two streams may still read them (from a concurrent region's fork to its join): the
+        // pool hands a returned block out at once, which on one stream is safe (later work runs after), across two is not.
+        private readonly object _deferSync = new();
+        private readonly List<(IntPtr Ptr, long Bytes)> _deferred = new();
+        private int _deferDepth;
+
+        /// <summary>This thread's work goes to <paramref name="side"/> until <see cref="LeaveSideStream"/>, and every block
+        /// returned until the matching <see cref="EndDeferredReturns"/> is held back.</summary>
+        internal void EnterSideStream(CudaStream side)
+        {
+            lock (_deferSync) _deferDepth++;
+            _sideThread = Environment.CurrentManagedThreadId;
+            _side = side;
+        }
+
+        internal void LeaveSideStream() => _side = null;
+
+        /// <summary>The streams joined (later work on the allocator's stream waits for the side stream's): the blocks held
+        /// back since the matching <see cref="EnterSideStream"/> go back to the pool once no other window is open.</summary>
+        internal void EndDeferredReturns()
+        {
+            List<(IntPtr Ptr, long Bytes)> release = null;
+            lock (_deferSync)
+            {
+                if (_deferDepth > 0 && --_deferDepth == 0 && _deferred.Count > 0)
+                {
+                    release = new List<(IntPtr, long)>(_deferred);
+                    _deferred.Clear();
+                }
+            }
+            if (release != null)
+                foreach ((IntPtr ptr, long bytes) in release) ReturnNow(ptr, bytes);
+        }
 
         internal CudaCublasHandle Blas { get; }
 
@@ -150,6 +193,17 @@ namespace TensorSharp.Cuda
         }
 
         internal void ReturnDeviceMemory(IntPtr ptr, long allocationBytes)
+        {
+            lock (_deferSync)
+                if (_deferDepth > 0)
+                {
+                    _deferred.Add((ptr, allocationBytes));
+                    return;
+                }
+            ReturnNow(ptr, allocationBytes);
+        }
+
+        private void ReturnNow(IntPtr ptr, long allocationBytes)
         {
             if (CudaGraphCapture.IsCapturing(this))
             {
