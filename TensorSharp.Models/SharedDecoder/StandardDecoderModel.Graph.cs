@@ -611,10 +611,20 @@ namespace TensorSharp.Models
             float[] draftRows = null)
         {
             logits = null;
-            var request = new GraphRequest { LastRowLogits = wantLogits, PositionTable = positionTable, FollowDraft = follow, DraftRows = draftRows };
+            bool greedy = wantLogits && _greedyLastRows && GraphExecutor.Capabilities.GreedyIdOutputs;
+            var request = new GraphRequest
+            {
+                LastRowLogits = wantLogits, GreedyIds = greedy, PositionTable = positionTable, FollowDraft = follow, DraftRows = draftRows,
+            };
             if (!TryRunGraphStep(hidden, slots, first, counts, starts, request, out GraphResult result))
                 return false;
-            if (result.Logits != null)
+            if (result.Logits != null && greedy)
+            {
+                // Each sequence's id as its F32 value (TryForwardUnifiedGreedy reads it).
+                logits = new float[slots.Length][];
+                for (int s = 0; s < slots.Length; s++) logits[s] = new[] { result.Logits[s] };
+            }
+            else if (result.Logits != null)
             {
                 int n = slots.Length, vocab = Config.VocabSize;
                 logits = new float[n][];
@@ -1047,7 +1057,10 @@ namespace TensorSharp.Models
                     for (int s = 0; s < n; s++) last[s] = step.First[s] + step.Counts[s] - 1;
                     selected = step.Op(GraphOp.GetRows, final, step.ConstantInputI32(last, n));
                 }
-                outputs.Logits = step.Output(step.MatMul(headName, selected), (long)Config.VocabSize * n);
+                int logits = step.MatMul(headName, selected);
+                outputs.Logits = request.GreedyIds
+                    ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1 })), n)
+                    : step.Output(logits, (long)Config.VocabSize * n);
             }
         }
 

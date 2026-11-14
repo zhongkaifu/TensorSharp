@@ -33,6 +33,14 @@ namespace TensorSharp.Runtime.Scheduling
         bool TryForwardUnified(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, float[][] lastRowLogits,
             float[][]? features = null);
 
+        /// <summary>Whether <see cref="TryForwardUnifiedGreedy"/> picks the tokens on the device (else it is not offered).</summary>
+        bool SupportsUnifiedGreedyIds => false;
+
+        /// <summary><see cref="TryForwardUnified"/> for requests that all draw greedily: <paramref name="nextTokens"/>[s] is
+        /// request s's last row's largest logit's id (a tie to the lower id), picked where the logits are, so the vocabulary's
+        /// logits are not read back. Declines as <see cref="TryForwardUnified"/> does.</summary>
+        bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens) => false;
+
         /// <summary>A request with pending media embeddings runs its prompt chunk on its own slot through the model's
         /// media path; the last row's logits.</summary>
         float[] ForwardUnifiedMedia(string requestId, int[] tokens, int start);

@@ -2565,6 +2565,29 @@ namespace TensorSharp.Runtime.Scheduling
             try
             {
                 long started = Stopwatch.GetTimestamp();
+                // Every request decodes, draws greedily and nothing reads its logits: the model picks the next tokens where the
+                // logits are and the next step takes them from the stash (as the batched fused decode's device-sampled path
+                // does). A prompt's last chunk reads its logits: its draw is the first token, which a first-token constraint
+                // may narrow.
+                if (features == null && model.SupportsUnifiedGreedyIds && !FirstTokenLogitsDump.IsArmed
+                    && batch.TrueForAll(item => item.Sampled >= 0 && item.Work.Sequence.GetOrCreateSampler().IsPlainGreedyArgmax))
+                {
+                    var next = new int[batch.Count];
+                    if (model.TryForwardUnifiedGreedy(ids, tokens, starts, next))
+                    {
+                        RecordStepPhase(s_phaseIssue, started, stepRows);
+                        long ticks = (Stopwatch.GetTimestamp() - started) / batch.Count;
+                        if (batch.Count >= 2) ReportBatchedFusedDecodeSuccess(batch.Count);
+                        for (int i = 0; i < batch.Count; i++)
+                        {
+                            var seq = batch[i].Work.Sequence;
+                            CompleteUnified(seq, tokens[i].Length, batch[i].Sampled, null, ticks, results);
+                            seq.PendingDeviceToken = next[i];
+                            seq.PendingDevicePosition = seq.NumComputedTokens;
+                        }
+                        return results;
+                    }
+                }
                 if (!model.TryForwardUnified(ids, tokens, starts, lastLogits, features))
                     throw new InvalidOperationException("the model declined a unified step whose slots it had prepared");
                 RecordStepPhase(s_phaseIssue, started, stepRows);

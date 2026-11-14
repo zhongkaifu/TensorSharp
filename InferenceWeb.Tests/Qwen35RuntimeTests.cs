@@ -653,6 +653,48 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>A greedy unified step on the CUDA executor (each sequence's last row's top-1 picked on the device and read
+    /// back as an id) picks what the logits step's host argmax picks: two sequences over a prompt and four decode steps.</summary>
+    [CudaFact]
+    public void GreedyUnifiedStepsPickTheLogitsArgmaxOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture("moe-quantized");
+        int[] Run(bool greedy)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            var unified = Assert.IsAssignableFrom<TensorSharp.Runtime.Scheduling.IUnifiedBatchModel>(model);
+            Assert.True(unified.SupportsUnifiedGreedyIds);
+            string[] ids = { "a", "b" };
+            foreach (string id in ids) unified.EnsureSequenceSlot(id, 64);
+            int[][] tokens = { Enumerable.Range(0, 9).Select(i => 40 + i * 7).ToArray(), Enumerable.Range(0, 13).Select(i => 50 + i * 5).ToArray() };
+            int[] starts = { 0, 0 };
+            var picked = new List<int>();
+            for (int step = 0; step < 5; step++)
+            {
+                var next = new int[2];
+                if (greedy)
+                    Assert.True(unified.TryForwardUnifiedGreedy(ids, tokens, starts, next));
+                else
+                {
+                    var logits = new float[2][];
+                    Assert.True(unified.TryForwardUnified(ids, tokens, starts, logits));
+                    for (int s = 0; s < 2; s++)
+                    {
+                        int best = 0;
+                        for (int v = 1; v < logits[s].Length; v++) if (logits[s][v] > logits[s][best]) best = v;
+                        next[s] = best;
+                    }
+                }
+                picked.AddRange(next);
+                for (int s = 0; s < 2; s++) starts[s] += tokens[s].Length;
+                tokens = next.Select(t => new[] { t }).ToArray();
+            }
+            return picked.ToArray();
+        }
+        Assert.Equal(Run(greedy: false), Run(greedy: true));
+    }
+
     /// <summary>The staged-ahead path of a long prompt chunk (CudaGraphExecutor.PromptPrefetch: every host expert of the
     /// next MoE layer copied into the other arena half while a layer runs, the routes kept on the device), driven with
     /// the fixture's short prompt by lowering this executor's row threshold: the same answers as the device's experts.</summary>

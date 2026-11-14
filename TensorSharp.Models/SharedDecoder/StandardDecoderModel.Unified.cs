@@ -154,6 +154,43 @@ namespace TensorSharp.Models
             float[][] features = null)
             => TryForwardSlots(requestIds, tokens, starts, lastRowLogits, features);
 
+        /// <summary>On executors that return integer outputs (the CUDA executor), a greedy step's head ends in a top-1 over each
+        /// sequence's last row, read back as an id: a plain decode step had read back Qwen3.8's 248,320 logits (1 MB) and
+        /// scanned them on the host.</summary>
+        public bool SupportsUnifiedGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true && !_rankGraphs && _mesh.Stages == 1;
+
+        public bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens)
+        {
+            var logits = new float[requestIds.Count][];
+            _greedyLastRows = SupportsUnifiedGreedyIds;
+            try
+            {
+                if (!TryForwardSlots(requestIds, tokens, starts, logits, null)) return false;
+            }
+            finally
+            {
+                _greedyLastRows = false;
+            }
+            for (int s = 0; s < logits.Length; s++)
+            {
+                float[] row = logits[s];
+                if (row.Length == 1)
+                {
+                    nextTokens[s] = (int)row[0];   // the id as its F32 value (exact below 2^24)
+                    continue;
+                }
+                // A step that ran off the graphs read the logits back: the first largest, as the device picks.
+                int best = 0;
+                for (int v = 1; v < row.Length; v++)
+                    if (row[v] > row[best]) best = v;
+                nextTokens[s] = best;
+            }
+            return true;
+        }
+
+        /// <summary>Set while <see cref="TryForwardUnifiedGreedy"/> runs: the graph steps' last-row heads end in a top-1.</summary>
+        private bool _greedyLastRows;
+
         public float[] ForwardUnifiedMedia(string requestId, int[] tokens, int start)
         {
             if (!_slots.ContainsKey(requestId))
