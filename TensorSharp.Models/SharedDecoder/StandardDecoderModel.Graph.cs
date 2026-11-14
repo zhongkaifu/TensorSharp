@@ -399,10 +399,11 @@ namespace TensorSharp.Models
         internal bool DecodeCaptureDisabled { get; set; }
 
         /// <summary>
-        /// Run an advanced decode step as the device's recording of it: the first advance of a kept step runs as usual
-        /// (its pools and lazy buffers settle), the second records it and every later one replays the recording with
-        /// this position's inputs, attention length and cache write row. One sequence only (the attention length and the
-        /// write row are one value each). False runs the step as usual; a failed recording is not tried again.
+        /// Run an advanced decode step as the device's recording of it: the first advance of a kept step records it (the
+        /// trace already ran the plan once, which settled its pools and lazy buffers) and every later one replays the
+        /// recording with this position's inputs, attention length and cache write row. One sequence only (the attention
+        /// length and the write row are one value each). False runs the step as usual; a recording that fails on the first
+        /// advance is tried once more on the next, then not again.
         /// </summary>
         private bool TryRunRecorded(DecodeReplay r, CachedGraph cached, Slot[] slots, int[] starts)
         {
@@ -411,7 +412,9 @@ namespace TensorSharp.Models
             if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length != 1 || r.Floor > 0 || GraphExecutor is not IDecodeCaptureExecutor recorder
                 || cached.Plan is not IGraphTensorOutputs keep || (_expertHost != null && !GraphExecutor.Capabilities.RecordsHostExperts))
                 return false;   // (a step whose host experts read the routes back mid-step cannot be recorded)
-            if (r.Capture == null && ++r.Advances < 2) return false;
+            // Recording on the second advance ran one more unrecorded step of every shape a request starts and every 256
+            // positions: about 1.5% of a Qwen3.8 Flash Next MTP reply's time on an A40.
+            if (r.Capture == null) r.Advances++;
             // Too little device memory left for another recording: this step runs as usual and tries again later.
             if (r.Capture == null && !recorder.HasRoomToRecord())
             {
@@ -434,7 +437,7 @@ namespace TensorSharp.Models
                     {
                         keep.KeepTensors = false;
                         r.DisposeCapture();
-                        r.CaptureFailed = true;
+                        r.CaptureFailed = r.Advances > 1;
                         return false;
                     }
                     r.CaptureOutputs = new Tensor[cached.Outputs.Length];
