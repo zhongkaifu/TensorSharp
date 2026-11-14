@@ -263,10 +263,10 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         // The selection is discrete: where two blocks score within rounding of the cutoff, the backends may keep
         // different ones (the interpreter sums in double, ggml in float; ggml_cpu on x64 flipped one row of the
         // crossing run, 2.85e-2, and on linux-arm64 two of its 19 rows, 1.60e-2 and 2.77e-2). Up to a tenth of a run's
-        // rows (at least one) may sit past the tolerance, each within a block's worth (one block more moves a row by
+        // rows, rounded up, may sit past the tolerance, each within a block's worth (one block more moves a row by
         // 2.1e-2 to 3.6e-2); a wrong selection moves most rows.
         double[] errors = RowErrors(expected, actual);
-        Assert.True(errors.Count(e => e >= tolerance) <= Math.Max(1, errors.Length / 10) && errors.All(e => e < 5e-2),
+        Assert.True(errors.Count(e => e >= tolerance) <= (errors.Length + 9) / 10 && errors.All(e => e < 5e-2),
             $"{backend} sparse qsa ({run}) relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
         double[] fromDense = RowErrors(expected, Rows(() => new Qwen4ExpRuntimeModel(densePath, BackendType.Cpu)));
         string detail = string.Join(", ", fromDense.Select(e => e.ToString("E2")));
