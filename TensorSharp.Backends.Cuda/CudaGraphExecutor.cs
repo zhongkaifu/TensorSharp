@@ -472,6 +472,15 @@ namespace TensorSharp.Cuda
                 || k < 1 || k > cols || rows > int.MaxValue || cols > int.MaxValue || (wide && k > CudaGraphKernels.TopKWideMaxPicks))
                 return base.TopK(x, k, run);
             var ids = new Tensor(Allocator, DType.Int32, Sizes(stackalloc long[] { k, rows }));
+            // One pick over a wide row (a greedy verify's token over Qwen3.8's 248,320 ids) in two stages over every SM: the
+            // radix-selecting kernel's one block a row took 355 us of a 4-row window on an A40. The same pick.
+            bool argmax = wide && k == 1;
+            if (argmax)
+            {
+                using var part = new Tensor(Allocator, DType.Float32, Math.Max(1, CudaGraphKernels.ArgmaxPartBytes((int)rows, (int)cols) / 4));
+                Launch(new[] { x }, new[] { ids, part }, (kn, stream) => kn.LaunchArgmax(Ptr(x), Ptr(ids), Ptr(part), (int)rows, (int)cols, stream));
+                return new Value { Tensor = run.Keep(ids) };
+            }
             Launch(new[] { x }, ids, (kn, stream) =>
             {
                 if (wide) kn.LaunchTopKWide(Ptr(x), Ptr(ids), (int)rows, (int)cols, k, stream);

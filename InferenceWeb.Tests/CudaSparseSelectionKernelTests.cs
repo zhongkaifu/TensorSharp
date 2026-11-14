@@ -80,6 +80,47 @@ public sealed class CudaSparseSelectionKernelTests
             Assert.Equal(HostTopK(x, r, cols, k), got.AsSpan(r * k, k).ToArray());
     }
 
+    /// <summary>The two-stage pick (a greedy verify's token a row) against the wide top-k at k = 1, which it replaces for
+    /// wide rows: the same index for every row, ties (the lower index), -0 against +0, a maximum in the last slice.</summary>
+    [CudaTheory]
+    [InlineData(4, 248320, false)]   // Qwen3.8's vocabulary
+    [InlineData(3, 151643, true)]
+    [InlineData(2, 4097, true)]      // one column past a slice
+    [InlineData(5, 9000, true)]
+    public void ArgmaxMatchesTheWideTopK(int rows, int cols, bool ties)
+    {
+        using var allocator = new CudaAllocator();
+        using CudaGraphKernels kernels = Kernels(allocator);
+        var rng = new Random(13);
+        var x = new float[rows * cols];
+        for (int i = 0; i < x.Length; i++)
+        {
+            float v = (float)(rng.NextDouble() * 8 - 4);
+            if (ties) v = MathF.Round(v * 2) / 2;
+            x[i] = v;
+        }
+        // Row 0's maximum twice (the lower index wins), row 1's in the last column, row 2 all zeros of both signs.
+        x[17] = 100f; x[cols - 5] = 100f;
+        if (rows > 1) x[2L * cols - 1 > int.MaxValue ? 0 : 2 * cols - 1] = 1000f;
+        if (rows > 2) for (int c = 0; c < cols; c++) x[2 * cols + c] = c % 3 == 0 ? -0f : 0f;
+        using var xt = Tensor.FromArray(allocator, x);
+        using var wide = new Tensor(allocator, DType.Int32, rows);
+        using var two = new Tensor(allocator, DType.Int32, rows);
+        using var part = new Tensor(allocator, DType.Float32, CudaGraphKernels.ArgmaxPartBytes(rows, cols) / 4);
+        Upload(xt, wide, two, part);
+        allocator.Context.MakeCurrent();
+        kernels.LaunchTopKWide(P(xt), P(wide), rows, cols, 1, allocator.Stream.Handle);
+        kernels.LaunchArgmax(P(xt), P(two), P(part), rows, cols, allocator.Stream.Handle);
+        allocator.Stream.Synchronize();
+        Written(wide, two);
+        int[] a = wide.GetElementsAsInt(rows), b = two.GetElementsAsInt(rows);
+        Assert.Equal(a, b);
+        Assert.Equal(17, b[0]);
+        if (rows > 1) Assert.Equal(cols - 1, b[1]);
+        if (rows > 2) Assert.Equal(0, b[2]);
+        for (int r = 3; r < rows; r++) Assert.Equal(HostTopK(x, r, cols, 1)[0], b[r]);
+    }
+
     [CudaTheory]
     [InlineData(128, 4, 1, 700, 1)]
     [InlineData(64, 8, 3, 257, 3)]

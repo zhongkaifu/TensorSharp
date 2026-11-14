@@ -11,7 +11,7 @@
 
 #include <cuda_fp16.h>
 
-#define TS_GRAPH_KERNELS_VERSION 12
+#define TS_GRAPH_KERNELS_VERSION 13
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -253,6 +253,49 @@ __device__ __forceinline__ unsigned int ts_order_key(float v)
 {
     const unsigned int u = v == 0.0f ? 0u : __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// ts_graph_topk_wide_f32 at k = 1 (a greedy verify's token a row over a 248K vocabulary) in two stages, every SM busy where
+// one block a row walked the whole row: each block keeps the largest of its slice as (order key << 32) | ~index - the
+// encoding the wide kernel orders its picks by, so a larger value wins and an equal one goes to the lower index - and one
+// warp a row merges the slices. The same pick bit for bit. Part: grid (slices, rows), block 256, part [rows, slices].
+extern "C" __global__ void ts_graph_argmax_part_f32(const float* __restrict__ x, unsigned long long* __restrict__ part, int cols, int slice)
+{
+    __shared__ unsigned long long warpBest[8];
+    const float* row = x + (size_t)blockIdx.y * cols;
+    const int c0 = blockIdx.x * slice, c1 = min(cols, c0 + slice);
+    unsigned long long best = 0;
+    for (int c = c0 + threadIdx.x; c < c1; c += blockDim.x)
+    {
+        const unsigned long long v = ((unsigned long long)ts_order_key(row[c]) << 32) | (unsigned int)(~c);
+        best = v > best ? v : best;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+    {
+        const unsigned long long o = __shfl_xor_sync(0xffffffffu, best, off);
+        best = o > best ? o : best;
+    }
+    if ((threadIdx.x & 31) == 0) warpBest[threadIdx.x >> 5] = best;
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        for (int w = 1; w < (int)(blockDim.x >> 5); w++) best = warpBest[w] > best ? warpBest[w] : best;
+        part[(size_t)blockIdx.y * gridDim.x + blockIdx.x] = best;
+    }
+}
+
+// The merge: ids[r] = the index of row r's largest slice pick. Launch: grid rows, block 32.
+extern "C" __global__ void ts_graph_argmax_merge(const unsigned long long* __restrict__ part, int* __restrict__ ids, int slices)
+{
+    const unsigned long long* p = part + (size_t)blockIdx.x * slices;
+    unsigned long long best = 0;
+    for (int s = threadIdx.x; s < slices; s += 32) best = p[s] > best ? p[s] : best;
+    for (int off = 16; off > 0; off >>= 1)
+    {
+        const unsigned long long o = __shfl_xor_sync(0xffffffffu, best, off);
+        best = o > best ? o : best;
+    }
+    if (threadIdx.x == 0) ids[blockIdx.x] = (int)(~(unsigned int)(best & 0xffffffffull));
 }
 
 // ggml_top_k for many picks or wide rows (a sparse attention's blocks): the k-th largest value radix-selected (four 8-bit

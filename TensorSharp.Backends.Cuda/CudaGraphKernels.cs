@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 12;
+        public const int CurrentVersion = 13;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
@@ -33,6 +33,8 @@ namespace TensorSharp.Cuda
             _sqrt = module.GetFunction("ts_graph_sqrt_f32");
             _topk = module.GetFunction("ts_graph_topk_f32");
             _topkWide = module.GetFunction("ts_graph_topk_wide_f32");
+            _argmaxPart = module.GetFunction("ts_graph_argmax_part_f32");
+            _argmaxMerge = module.GetFunction("ts_graph_argmax_merge");
             _getRows = module.GetFunction("ts_graph_get_rows_f32");
             _getRowsF16 = module.GetFunction("ts_graph_get_rows_f16");
             _setRows = module.GetFunction("ts_graph_set_rows_f32");
@@ -113,6 +115,23 @@ namespace TensorSharp.Cuda
             while (n2 < k) n2 <<= 1;
             void** args = stackalloc void*[] { &x, &ids, &cols, &k, &n2 };
             CudaDriverApi.cuLaunchKernel(_topkWide, (uint)rows, 1, 1, 1024, 1, 1, (uint)(n2 * 8), stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Columns each block of <see cref="LaunchArgmax"/>'s first stage takes.</summary>
+        public const int ArgmaxSlice = 4096;
+
+        /// <summary>Bytes of the slices' picks <see cref="LaunchArgmax"/> needs for <paramref name="rows"/> rows.</summary>
+        public static long ArgmaxPartBytes(int rows, int cols) => (long)rows * ((cols + ArgmaxSlice - 1) / ArgmaxSlice) * 8;
+
+        /// <summary><see cref="LaunchTopKWide"/> at k = 1 (the same pick: the largest value, a tie to the lower index), over
+        /// every SM: the slices' picks into <paramref name="part"/> (<see cref="ArgmaxPartBytes"/>), then a merge a row.</summary>
+        public void LaunchArgmax(IntPtr x, IntPtr ids, IntPtr part, int rows, int cols, IntPtr stream)
+        {
+            int slice = ArgmaxSlice, slices = (cols + slice - 1) / slice;
+            void** args = stackalloc void*[] { &x, &part, &cols, &slice };
+            CudaDriverApi.cuLaunchKernel(_argmaxPart, (uint)slices, (uint)rows, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            void** margs = stackalloc void*[] { &part, &ids, &slices };
+            CudaDriverApi.cuLaunchKernel(_argmaxMerge, (uint)rows, 1, 1, 32, 1, 1, 0, stream, (IntPtr)margs, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>ggml_get_rows into F32 rows by device int32 ids: src [batches, rowsPerBatch, rowLen] (F32, or F16 when
