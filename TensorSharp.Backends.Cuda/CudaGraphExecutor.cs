@@ -32,7 +32,7 @@ namespace TensorSharp.Cuda
         public override GraphCapabilities Capabilities { get; } = new()
         {
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
-            HostExperts = true, RecordsHostExperts = true, RegionsAtAnyWidth = true,
+            HostExperts = true, RecordsHostExperts = true, RegionsAtAnyWidth = true, GreedyIdOutputs = true,
         };
 
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
@@ -2038,6 +2038,7 @@ namespace TensorSharp.Cuda
                 IntPtr input = Ptr(x), output = Ptr(product);
                 Dsv4Kernels wide = outDim >= 256 && !(_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing(cuda)))
                     ? MoeKernels : null;
+                // (The warp-per-output form for narrow outputs left an A40 idle: a 4-row window 27.3 ms against 23.7.)
                 if (wide != null && wide.HasGemvBf16)
                     for (long first = 0; first < rows; first += Dsv4Kernels.GemvMaxRows)
                         wide.GemvBf16(input + (nint)(first * inDim * sizeof(float)), bPtr, output + (nint)(first * outDim * sizeof(float)),

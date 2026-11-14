@@ -53,6 +53,9 @@ namespace TensorSharp.Graph
         /// the host by syncs; false where the device reads the host bytes themselves (Metal's shared buffers, the
         /// CPU), so a host copy of them moves nothing across.</summary>
         public bool SeparateDeviceCopies { get; init; }
+        /// <summary>A program may end in each row's greedy token (a top-1 over the logits, a tie to the lower id), read
+        /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits.</summary>
+        public bool GreedyIdOutputs { get; init; }
     }
 
     /// <summary>A stable identity for a storage object, for program signatures of executors that bind

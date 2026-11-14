@@ -207,6 +207,9 @@ namespace TensorSharp.Models
             /// <summary>Logits of each sequence's last row, or of every row.</summary>
             public bool LastRowLogits { get; init; } = true;
             public bool AllRowLogits { get; init; }
+            /// <summary>Every row's greedy token (the largest logit, a tie to the lower id) in place of its logits: a greedy
+            /// verify reads back an id a row, where it had read the whole vocabulary's logits and scanned them on the host.</summary>
+            public bool GreedyIds { get; init; }
             /// <summary>Layers whose INPUT residual [hidden, rows] is returned (a drafter's features).</summary>
             public int[] CaptureLayers { get; init; } = Array.Empty<int>();
             /// <summary>Capture only the step's last this-many rows (0: every row): a block drafter's context holds only
@@ -227,6 +230,7 @@ namespace TensorSharp.Models
             /// <summary>What the request changes in the emitted program (a streamed step's template key).</summary>
             public string Shape =>
                 $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}:{CaptureTail}"
+                + (GreedyIds ? ":g" : "")
                 + (FollowDraft == DraftFollow.None ? "" : $":f{(int)FollowDraft}{(DraftRows != null ? "e" : "")}");
         }
 
@@ -453,7 +457,13 @@ namespace TensorSharp.Models
                 {
                     Tensor t = r.CaptureOutputs[o];
                     float[] into = cached.Outputs[o];
-                    if (t.ElementCount() == into.LongLength) t.CopyToArray(into);
+                    if (t.ElementType == DType.Int32)
+                    {
+                        int count = (int)Math.Min(into.LongLength, t.ElementCount());
+                        int[] ints = t.GetElementsAsInt(count);
+                        for (int i = 0; i < count; i++) into[i] = ints[i];
+                    }
+                    else if (t.ElementCount() == into.LongLength) t.CopyToArray(into);
                     else Array.Copy(t.GetElementsAsFloat((int)Math.Min(into.LongLength, t.ElementCount())), into, (int)Math.Min(into.LongLength, t.ElementCount()));
                 }
                 return true;
@@ -1018,7 +1028,10 @@ namespace TensorSharp.Models
                 ? "output.weight" : "token_embd.weight";
             if (request.AllRowLogits)
             {
-                outputs.Logits = step.Output(step.MatMul(headName, final), (long)Config.VocabSize * rows);
+                int logits = step.MatMul(headName, final);
+                outputs.Logits = request.GreedyIds
+                    ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1 })), rows)
+                    : step.Output(logits, (long)Config.VocabSize * rows);
             }
             else if (request.LastRowLogits)
             {

@@ -606,7 +606,21 @@ namespace TensorSharp.Graph
                 _x.FinishWrites();
                 for (int o = 0; o < _outputs.Count; o++)
                 {
-                    Tensor c = _x.Contig(_x.F32(Get(_outputs[o]), Run.Owned), Run.Owned);
+                    Tensor src = _x.Contig(Get(_outputs[o]), Run.Owned);
+                    // An integer output (a top-k's ids) is read as its values: not every backend converts I32 to F32.
+                    if (src.ElementType == DType.Int32)
+                    {
+                        if (keep != null)
+                        {
+                            keep[o] = src.CopyRef();
+                            continue;
+                        }
+                        int n = (int)Math.Min(outputs[o].LongLength, src.ElementCount());
+                        int[] ints = src.GetElementsAsInt(n);
+                        for (int i = 0; i < n; i++) outputs[o][i] = ints[i];
+                        continue;
+                    }
+                    Tensor c = _x.F32(src, Run.Owned);
                     if (keep != null)
                     {
                         keep[o] = c.CopyRef();

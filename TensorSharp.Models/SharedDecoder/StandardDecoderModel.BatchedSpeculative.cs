@@ -75,22 +75,9 @@ namespace TensorSharp.Models
         public bool TryBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int window,
             int[] tokens, int[] drawn, float[] features)
         {
-            int vocab = Config.VocabSize;
-            long needed = (long)requestIds.Count * window * vocab;
-            if (_verifyLogits == null || _verifyLogits.LongLength < needed) _verifyLogits = new float[needed];
-            if (!TryVerifySlots(requestIds, positions, window, tokens, _verifyLogits, features)) return false;
-            for (int row = 0; row < requestIds.Count * window; row++)
-            {
-                var span = new ReadOnlySpan<float>(_verifyLogits, row * vocab, vocab);
-                int best = 0;
-                for (int v = 1; v < vocab; v++)
-                    if (span[v] > span[best]) best = v;
-                drawn[row] = best;
-            }
-            return true;
+            // Each row's greedy token, taken on the device (an id a row read back).
+            return TryVerifySlots(requestIds, positions, window, tokens, null, features, drawn);
         }
-
-        private float[] _verifyLogits;
 
         public bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
             int[] tokens, float[] logits, float[] features)
@@ -103,13 +90,13 @@ namespace TensorSharp.Models
         /// Qwen3.8-27B DFlash2 streams on a 24 GB GPU, where Qwen35Model serves them).
         /// </summary>
         private bool TryVerifySlots(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
-            float[] logitsOut, float[] featuresOut)
+            float[] logitsOut, float[] featuresOut, int[] idsOut = null)
         {
-            try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut); }
+            try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, idsOut); }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {
                 FreeGraphMemory();
-                try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut); }
+                try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, idsOut); }
                 catch (InvalidOperationException again) when (IsGraphAllocationFailure(again)) { return false; }
             }
         }
@@ -117,10 +104,11 @@ namespace TensorSharp.Models
         /// <summary>Verifies that fail as a graph's compute allocation would, before running (tests).</summary>
         internal int InjectedVerifyAllocationFailures { get; set; }
 
-        /// <summary>One forward of every sequence's window on its own slot: all rows' logits, the drafter's feature
-        /// rows, and on a hybrid stack the recurrent state after each row (settled by the commit).</summary>
+        /// <summary>One forward of every sequence's window on its own slot: all rows' logits (or with
+        /// <paramref name="idsOut"/> each row's greedy token), the drafter's feature rows, and on a hybrid stack the recurrent
+        /// state after each row (settled by the commit).</summary>
         private bool TryVerifySlotsOnce(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
-            float[] logitsOut, float[] featuresOut)
+            float[] logitsOut, float[] featuresOut, int[] idsOut = null)
         {
             int n = requestIds.Count;
             if (n == 0 || window < 1 || window > SmallChunkRows || tokens.Length < n * window || positions.Length != n
@@ -160,6 +148,7 @@ namespace TensorSharp.Models
             {
                 LastRowLogits = false,
                 AllRowLogits = true,
+                GreedyIds = idsOut != null && GraphExecutor.Capabilities.GreedyIdOutputs,
                 CaptureLayers = dflash && featuresOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
                 CaptureFinal = !dflash && featuresOut != null,
                 RecurrentSnapshots = _anyRecurrent && window > 1,
@@ -185,7 +174,22 @@ namespace TensorSharp.Models
                 slots[s].VerifyRows = request.RecurrentSnapshots ? window : 0;
             }
             if (follow != DraftFollow.None) NoteDraftFollowed(slots[0], positions[0], window);
-            Array.Copy(result.Logits, 0, logitsOut, 0, Math.Min((long)rows * Config.VocabSize, logitsOut.LongLength));
+            if (idsOut != null)
+            {
+                int vocab = Config.VocabSize;
+                bool ids = result.Logits.LongLength == rows;   // a path that returns logits (a tensor-parallel head) is scanned here
+                for (int row = 0; row < rows; row++)
+                {
+                    if (ids) { idsOut[row] = (int)result.Logits[row]; continue; }   // the ids as F32 values (exact below 2^24)
+                    var span = new ReadOnlySpan<float>(result.Logits, row * vocab, vocab);
+                    int best = 0;
+                    for (int v = 1; v < vocab; v++)
+                        if (span[v] > span[best]) best = v;
+                    idsOut[row] = best;
+                }
+            }
+            else
+                Array.Copy(result.Logits, 0, logitsOut, 0, Math.Min((long)rows * Config.VocabSize, logitsOut.LongLength));
             WriteSpecFeatures(featuresOut, rows, result.Captures, result.Final);
             BatchedSpecVerifySteps++;
             return true;
