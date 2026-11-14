@@ -105,10 +105,10 @@ namespace TensorSharp.Cuda
             return CudaFusedOps.TryGatherCircularHeadFirst(result, cache, (int)column, (int)width, (int)pitch);
         }
 
-        /// <summary>The recurrence wrote its result into the leaf already (<see cref="GatedDeltaNet"/>): nothing to copy.</summary>
         /// <summary>A verify window's recurrence writes its result into the request's verify buffer (<see cref="GatedDeltaNet"/>).</summary>
         protected override bool TakesAliasDestinations => true;
 
+        /// <summary>The recurrence wrote its result into the leaf already (<see cref="GatedDeltaNet"/>): nothing to copy.</summary>
         protected override bool TryAlias(Tensor result, Tensor leaf, long offsetBytes)
             => ReferenceEquals(result.Storage, leaf.Storage)
                && result.StorageOffset * result.ElementType.Size() == leaf.StorageOffset * leaf.ElementType.Size() + offsetBytes;
