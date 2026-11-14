@@ -16,6 +16,11 @@ namespace TensorSharp.Graph
         public bool StridedViews { get; init; }
         /// <summary>An op may write its result in place inside a state leaf (<see cref="GraphNodeKind.Alias"/>).</summary>
         public bool InPlaceStateAlias { get; init; }
+
+        /// <summary>A verify window's recurrence updates the live state in place, saving the state before it and its scan
+        /// inputs (a gated delta rule with destination leaves 6 and 7): a fully accepted window commits nothing, a cut one
+        /// re-steps its kept rows from the saved state. Elsewhere the window keeps a state after every row.</summary>
+        public bool WindowStateInPlace { get; init; }
         /// <summary>Reordering independent work pays off (and is safe) on this device.</summary>
         public bool ConcurrencyReorder { get; init; }
         /// <summary>The bucket a decode step's padded attention window grows by (a window's programs replay).</summary>

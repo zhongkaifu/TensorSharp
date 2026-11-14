@@ -996,6 +996,57 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(placed.Logits[w].AsSpan().SequenceEqual(copied.Logits[w]), $"window {w} differs with its result written in place");
     }
 
+    /// <summary>A verify window on direct CUDA updates the live recurrent state in place, saving the state before it and
+    /// its scan inputs (each window had kept a state after every row, 2 MB a row and layer on Qwen3.8 Flash Next): a fully
+    /// accepted window commits nothing, a cut one steps its kept rows again from the saved state on the window's kernels,
+    /// and a restored one takes the saved state back. Windows cut at every row, accepted whole and restored give the
+    /// logits of windows that kept a state per row, bit for bit, and so does the decode after them.</summary>
+    [CudaTheory]
+    [InlineData("dense")]
+    [InlineData("dense-gqa")]
+    public void InPlaceVerifyWindowsMatchSnapshotWindowsOnDirectCuda(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture(variant);
+        (List<float[]> Logits, int Rows) Run(bool inPlace)
+        {
+            Qwen35RuntimeModel.WindowStatesInPlaceOffForTests = !inPlace;
+            Qwen35RuntimeModel created;
+            try { created = Create(path, backend: BackendType.Cuda); }
+            finally { Qwen35RuntimeModel.WindowStatesInPlaceOffForTests = false; }
+            using var model = created;
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            int vocab = model.Config.VocabSize;
+            spec.SpecForward(Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray(), null, new float[vocab], false);
+            var trace = new List<float[]>();
+            // Accepted rows of each 4-row window (-1: restored to the state before it).
+            int[] accepted = { 3, 0, 2, -1, 1, 3, 0, 2 };
+            for (int w = 0; w < accepted.Length; w++)
+            {
+                int[] window = Enumerable.Range(0, 4).Select(i => 60 + (w * 4 + i) % 30).ToArray();
+                var logits = new float[4 * vocab];
+                spec.SpecForward(window, null, logits, true);
+                if (accepted[w] < 0) spec.SpecRestoreRecurrentState();
+                else spec.SpecOnVerifyAccepted(accepted[w], 4);
+                trace.Add(logits);
+            }
+            for (int d = 0; d < 3; d++)
+            {
+                var logits = new float[vocab];
+                spec.SpecForward(new[] { 50 + d }, null, logits, false);
+                trace.Add(logits);
+            }
+            return (trace, model.WindowStateRowsForTests);
+        }
+        var inPlace = Run(inPlace: true);
+        var snapshots = Run(inPlace: false);
+        Assert.True(inPlace.Rows > 1, $"the windows did not update the states in place ({inPlace.Rows} rows)");
+        Assert.Equal(1, snapshots.Rows);
+        for (int w = 0; w < inPlace.Logits.Count; w++)
+            Assert.True(inPlace.Logits[w].AsSpan().SequenceEqual(snapshots.Logits[w]),
+                $"step {w} differs with in-place windows ({RelL2(inPlace.Logits[w], snapshots.Logits[w]):E2} relative L2)");
+    }
+
     private void AssertWindowsRetraceAfterRelease(BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);

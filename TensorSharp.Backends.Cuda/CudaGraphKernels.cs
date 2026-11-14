@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 17;
+        public const int CurrentVersion = 18;
 
         private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
@@ -69,24 +69,36 @@ namespace TensorSharp.Cuda
         /// <summary>ggml_gated_delta_net over contiguous F32 device buffers (see the kernel's contract);
         /// <paramref name="s"/> % 32 == 0 and <= 256.</summary>
         public void LaunchGatedDeltaNet(IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr beta, IntPtr state, IntPtr output,
-            int s, int heads, int keyHeads, int tokens, int sequences, int slots, bool perKeyDecay, IntPtr stream)
+            int s, int heads, int keyHeads, int tokens, int sequences, int slots, bool perKeyDecay, IntPtr stream, IntPtr saved = default,
+            IntPtr inputs = default, int inputRows = 0)
         {
             int kda = perKeyDecay ? 1 : 0;
-            void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda };
+            void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda,
+                &saved, &inputs, &inputRows };
             CudaDriverApi.cuLaunchKernel(_gatedDeltaNet, (uint)(sequences * heads), (uint)((s + 3) / 4), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary><see cref="LaunchGatedDeltaNet"/> with four state rows a warp (a prompt chunk reads each token's q and k
-        /// once for four rows); the same results.</summary>
+        /// once for four rows); the same results. With <paramref name="saved"/> ([heads, s, s], one sequence) the state before
+        /// the rows is written there as it is read; with <paramref name="inputs"/> (<see cref="GatedDeltaNetInputFloats"/>) the
+        /// rows' q, k, v, gates and betas in planar regions of <paramref name="inputRows"/> tokens, for a later re-step. The
+        /// state may be the output's state part (one slot, one sequence).</summary>
         public void LaunchGatedDeltaNetRows4(IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr beta, IntPtr state, IntPtr output,
-            int s, int heads, int keyHeads, int tokens, int sequences, int slots, bool perKeyDecay, IntPtr stream)
+            int s, int heads, int keyHeads, int tokens, int sequences, int slots, bool perKeyDecay, IntPtr stream, IntPtr saved = default,
+            IntPtr inputs = default, int inputRows = 0)
         {
             int kda = perKeyDecay ? 1 : 0;
-            void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda };
+            void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda,
+                &saved, &inputs, &inputRows };
             CudaDriverApi.cuLaunchKernel(_gatedDeltaNetRows4, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
+
+        /// <summary>Floats of a recurrence's saved inputs for <paramref name="rows"/> tokens: q and k [rows, keyHeads, s], v
+        /// [rows, heads, s], the gates [rows, heads, s or 1] and betas [rows, heads], each a region of its own.</summary>
+        public static long GatedDeltaNetInputFloats(int rows, int s, int heads, int keyHeads, bool perKeyDecay)
+            => (long)rows * (2L * keyHeads * s + (long)heads * s + (long)heads * (perKeyDecay ? s : 1) + heads);
 
         /// <summary>ggml_softplus over <paramref name="n"/> contiguous floats.</summary>
         public void LaunchSoftplus(IntPtr x, IntPtr y, long n, IntPtr stream)

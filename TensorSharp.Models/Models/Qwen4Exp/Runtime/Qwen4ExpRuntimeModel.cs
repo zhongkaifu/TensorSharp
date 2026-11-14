@@ -259,7 +259,8 @@ namespace TensorSharp.Models
 
         protected override DeviceGdnState CreateDeviceGdnState(RankScope scope, int layer, int convRows, int channels, int vHeads, int dv, int dk)
             => Ple.IsPle[layer]
-                ? new PleGdnState(scope.Allocator, ExecutorFor(scope.Allocator), HostPointer, convRows, channels, vHeads, dv, dk, Ple)
+                ? new PleGdnState(scope.Allocator, ExecutorFor(scope.Allocator), HostPointer, convRows, channels, vHeads, dv, dk, Ple,
+                    WindowStateRows(ExecutorFor(scope.Allocator)))
                 : base.CreateDeviceGdnState(scope, layer, convRows, channels, vHeads, dv, dk);
 
         /// <summary>The embedding's hc copies, stream c at elements [c·n, (c+1)·n) of a row.</summary>
@@ -756,8 +757,8 @@ namespace TensorSharp.Models
             private readonly int[] _ring = new int[4 * PositionRing];
 
             public PleGdnState(IAllocator allocator, IGraphExecutor executor, Func<Tensor, IntPtr> hostPointer,
-                int convRows, int channels, int vHeads, int dv, int dk, PleSpec p)
-                : base(allocator, executor, hostPointer, convRows, channels, vHeads, dv, dk)
+                int convRows, int channels, int vHeads, int dv, int dk, PleSpec p, int backingRows)
+                : base(allocator, executor, hostPointer, convRows, channels, vHeads, dv, dk, backingRows)
             {
                 _p = p;
                 _tokens = new int[p.Ngram - 1];

@@ -207,6 +207,39 @@ namespace TensorSharp.Graph
         protected virtual Tensor GatedDeltaNet(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots)
             => GatedDeltaNetHost(q, k, v, g, beta, state, snapshots);
 
+        /// <summary><see cref="GatedDeltaNet(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int)"/>; with
+        /// <paramref name="rowKernels"/> a backend with a chunked prompt kernel runs the decode rows' kernels instead, so a
+        /// window's re-step rounds as its rows did.</summary>
+        protected virtual Tensor GatedDeltaNet(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots, bool rowKernels)
+            => GatedDeltaNet(q, k, v, g, beta, state, snapshots);
+
+        /// <summary>
+        /// A verify window's recurrence (one sequence, <see cref="GraphCapabilities.WindowStateInPlace"/>): the state before
+        /// the rows into <paramref name="saved"/> ([heads, S, S]), the result as <see cref="GatedDeltaNet"/>'s, and the rows'
+        /// q, k, v, gates and betas into <paramref name="inputs"/> in planar regions of <paramref name="inputRows"/> tokens
+        /// (q and k [rows, keyHeads, S], v [rows, heads, S], the gates [rows, heads, S or 1], the betas [rows, heads]).
+        /// </summary>
+        protected virtual Tensor GatedDeltaNetSaving(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots,
+            Tensor saved, Tensor inputs, int inputRows)
+        {
+            using (Tensor sv = saved.View(state.ElementCount()))
+            using (Tensor st = state.View(state.ElementCount()))
+                CopyInto(sv, st);
+            Tensor result = GatedDeltaNet(q, k, v, g, beta, state, snapshots, rowKernels: true);
+            long[] nq = Ne(q), nv = Ne(v), ng = Ne(g);
+            long s = nv[0], heads = nv[1], tokens = nv[2], keyHeads = nq[1], gate = ng[0];
+            long at = 0;
+            foreach ((Tensor part, long rowFloats) in new[] { (q, keyHeads * s), (k, keyHeads * s), (v, heads * s), (g, heads * gate), (beta, heads) })
+            {
+                using (Tensor flat = inputs.View(inputs.ElementCount()))
+                using (Tensor dst = flat.Narrow(0, at, tokens * rowFloats))
+                using (Tensor src = part.View(tokens * rowFloats))
+                    CopyInto(dst, src);
+                at += inputRows * rowFloats;
+            }
+            return result;
+        }
+
         /// <summary>ggml_ssm_conv: x [n_s, channels, width - 1 + n_t] (time innermost), kernel
         /// [channels, width]: [n_s, n_t, channels].</summary>
         protected virtual Tensor SsmConv(Tensor x, Tensor kernel)
@@ -1540,7 +1573,12 @@ namespace TensorSharp.Graph
                 {
                     Tensor q = Contig(T(0), run), k = Contig(T(1), run), v = Contig(T(2), run);
                     Tensor g = Contig(T(3), run), b = Contig(T(4), run), s = Contig(T(5), run);
-                    return V(GatedDeltaNet(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run), (int)Ip(0, 1)));
+                    // ip: [snapshots, rows the saved inputs hold (with destination leaves 6 and 7), the decode row kernels]
+                    if (n.Srcs.Length >= 8)
+                        return V(GatedDeltaNetSaving(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run),
+                            (int)Ip(0, 1), T(6), T(7), (int)Ip(1, 0)));
+                    return V(GatedDeltaNet(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run), (int)Ip(0, 1),
+                        Ip(2, 0) != 0));
                 }
                 default:
                     throw new NotSupportedException($"{GetType().Name} has no kernel for {n.Op}");

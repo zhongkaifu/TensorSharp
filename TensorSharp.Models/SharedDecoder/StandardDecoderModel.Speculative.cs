@@ -348,8 +348,8 @@ namespace TensorSharp.Models
             CommitRecurrentPrefix(kept, rows);
         }
 
-        /// <summary>Back to the state before the last verify (the graphs' live state still is; the per-op
-        /// path's states restore the one they kept).</summary>
+        /// <summary>Back to the state before the last verify (the graphs' live state still is, or a window that
+        /// updated it in place takes back the one it saved; the per-op path's states restore the one they kept).</summary>
         public void SpecRestoreRecurrentState()
         {
             if (_verifyRows > 1)

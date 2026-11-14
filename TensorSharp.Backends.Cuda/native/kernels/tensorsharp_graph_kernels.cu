@@ -11,7 +11,7 @@
 
 #include <cuda_fp16.h>
 
-#define TS_GRAPH_KERNELS_VERSION 17
+#define TS_GRAPH_KERNELS_VERSION 18
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -33,6 +33,38 @@ __device__ __forceinline__ float ts_graph_warp_sum(float v)
     return v;
 }
 
+// A verify window's scan inputs, kept for a later re-step of its kept rows (one sequence): planar regions of save_rows tokens
+// each, q [t][hk][S] | k [t][hk][S] | v [t][h][S] | g [t][h][S or 1] | beta [t][h]. The head's first warp writes q and k
+// (heads below hk: their key head) and its gates, every warp the v of its own rows.
+__device__ __forceinline__ void ts_graph_gdn_save_token(float* __restrict__ in_save, int save_rows, const float* __restrict__ q,
+    const float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ g, const float* __restrict__ beta, int S,
+    int h, int hk, int kda, int t, int head, int row, int rows, bool first, int lane)
+{
+    const size_t qk = (size_t)save_rows * hk * S, vs = (size_t)save_rows * h * S, gs = (size_t)save_rows * h * (kda ? S : 1);
+    float* qs = in_save;
+    float* ks = qs + qk;
+    float* vv = ks + qk;
+    float* gg = vv + vs;
+    float* bb = gg + gs;
+    const size_t gb = (size_t)t * h + head;
+    if (first)
+    {
+        if (head < hk)
+            for (int i = lane; i < S; i += 32)
+            {
+                qs[((size_t)t * hk + head) * S + i] = q[((size_t)t * hk + head) * S + i];
+                ks[((size_t)t * hk + head) * S + i] = k[((size_t)t * hk + head) * S + i];
+            }
+        if (kda)
+            for (int i = lane; i < S; i += 32) gg[gb * S + i] = g[gb * S + i];
+        else if (lane == 0)
+            gg[gb] = g[gb];
+        if (lane == 0) bb[gb] = beta[gb];
+    }
+    if (lane == 0)
+        for (int r = row; r < row + rows && r < S; r++) vv[gb * S + r] = v[gb * S + r];
+}
+
 // ggml_gated_delta_net (ggml-cpu's loop, one warp per value row of a head's state):
 //   q, k  [n_s, n_t, hk, S]   (value head h reads key head h % hk)
 //   v     [n_s, n_t, h, S]
@@ -43,10 +75,14 @@ __device__ __forceinline__ float ts_graph_warp_sum(float v)
 //         last row, slot s the state s rows before it (slots older than the rows are left as they are).
 // Per row: S *= exp(g); delta = (v - S^T k) * beta; S += k delta^T; y = S^T q / sqrt(S).
 // Launch: grid (n_s * h, ceil(S / 4)), block 128 (4 warps, one value row each); S % 32 == 0, S <= 256.
+// saved (null, or [h, S, S]): the state before the rows, written as it is read (one sequence); in_save (null, or the
+// planar regions above): the scan inputs of the rows. state may be out's state part (one slot, one sequence): each warp
+// reads its row before it writes it.
 extern "C" __global__ void ts_graph_gated_delta_net_f32(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-    const float* __restrict__ g, const float* __restrict__ beta, const float* __restrict__ state,
-    float* __restrict__ out, int S, int h, int hk, int n_t, int n_s, int slots, int kda)
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int S, int h, int hk, int n_t, int n_s, int slots, int kda, float* __restrict__ saved,
+    float* __restrict__ in_save, int save_rows)
 {
     const int seq = blockIdx.x / h;
     const int head = blockIdx.x % h;
@@ -62,6 +98,13 @@ extern "C" __global__ void ts_graph_gated_delta_net_f32(
 #pragma unroll
     for (int j = 0; j < 8; j++)
         st[j] = j < per ? s_in[lane + 32 * j] : 0.0f;
+    if (saved != nullptr)
+    {
+        float* s_sv = saved + ((size_t)(seq * h + head) * S + row) * S;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            if (j < per) s_sv[lane + 32 * j] = st[j];
+    }
 
     const float scale = rsqrtf((float)S);
     const size_t attn = (size_t)n_s * n_t * h * S;
@@ -94,6 +137,8 @@ extern "C" __global__ void ts_graph_gated_delta_net_f32(
         y = ts_graph_warp_sum(y);
         if (lane == 0)
             out[v_off + row] = y * scale;
+        if (in_save != nullptr)
+            ts_graph_gdn_save_token(in_save, save_rows, q, k, v, g, beta, S, h, hk, kda, t, head, row, 1, row == 0, lane);
 
         const int slot = n_t - 1 - t;
         if (slot < slots)
@@ -111,8 +156,9 @@ extern "C" __global__ void ts_graph_gated_delta_net_f32(
 // goes through the same operations in the same order as in the one-row kernel, so the results are the same bits.
 extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-    const float* __restrict__ g, const float* __restrict__ beta, const float* __restrict__ state,
-    float* __restrict__ out, int S, int h, int hk, int n_t, int n_s, int slots, int kda)
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int S, int h, int hk, int n_t, int n_s, int slots, int kda, float* __restrict__ saved,
+    float* __restrict__ in_save, int save_rows)
 {
     const int seq = blockIdx.x / h;
     const int head = blockIdx.x % h;
@@ -130,6 +176,18 @@ extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
 #pragma unroll
         for (int j = 0; j < 8; j++)
             st[r][j] = (j < per && r0 + r < S) ? s_in[(size_t)r * S + lane + 32 * j] : 0.0f;
+    if (saved != nullptr)
+    {
+        float* s_sv = saved + ((size_t)(seq * h + head) * S + r0) * S;
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            if (r0 + r >= S) break;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                if (j < per) s_sv[(size_t)r * S + lane + 32 * j] = st[r][j];
+        }
+    }
 
     const float scale = rsqrtf((float)S);
     const size_t attn = (size_t)n_s * n_t * h * S;
@@ -186,6 +244,8 @@ extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
             for (int r = 0; r < 4; r++)
                 if (r0 + r < S) out[v_off + r0 + r] = y[r] * scale;
         }
+        if (in_save != nullptr)
+            ts_graph_gdn_save_token(in_save, save_rows, q, k, v, g, beta, S, h, hk, kda, t, head, r0, 4, r0 == 0, lane);
 
         const int slot = n_t - 1 - t;
         if (slot < slots)

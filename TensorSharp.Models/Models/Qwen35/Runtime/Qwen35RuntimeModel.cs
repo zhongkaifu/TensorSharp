@@ -477,7 +477,19 @@ namespace TensorSharp.Models
 
         /// <summary>A layer's tensor state (a family adds what its layer keeps besides the recurrence).</summary>
         protected virtual DeviceGdnState CreateDeviceGdnState(RankScope scope, int layer, int convRows, int channels, int vHeads, int dv, int dk)
-            => new(scope.Allocator, ExecutorFor(scope.Allocator), HostPointer, convRows, channels, vHeads, dv, dk);
+            => new(scope.Allocator, ExecutorFor(scope.Allocator), HostPointer, convRows, channels, vHeads, dv, dk,
+                WindowStateRows(ExecutorFor(scope.Allocator)));
+
+        /// <summary>The widest verify window that updates its states in place
+        /// (<see cref="TensorSharp.Graph.GraphCapabilities.WindowStateInPlace"/>: MTP's windows and drafts of up to 8 rows), else 1 (a window
+        /// keeps a state after each row and its commit copies one).</summary>
+        protected int WindowStateRows(TensorSharp.Graph.IGraphExecutor executor)
+            => executor?.Capabilities.WindowStateInPlace == true && !_windowStatesInPlaceOff ? 8 : 1;
+
+        /// <summary>Tests: a model constructed on this thread while it is set keeps a state after each verify window row
+        /// (as on executors without in-place windows). Read at construction, which creates the first states.</summary>
+        [ThreadStatic] internal static bool WindowStatesInPlaceOffForTests;
+        private readonly bool _windowStatesInPlaceOff = WindowStatesInPlaceOffForTests;
 
         /// <summary>The recurrence's output gate: sigmoid(z) (Qwen3.8-Flash-Next) instead of silu(z).</summary>
         protected virtual bool MixerSigmoidGate => false;
