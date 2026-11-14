@@ -530,7 +530,9 @@ namespace TensorSharp.Graph
                         {
                             GraphNode region = _region, end = e;
                             _region = default;
-                            Attribute(() => RunFused(region, end.Srcs));
+                            // A region none of whose results the step reads does not run (its ops are dead too).
+                            if (_dead == null || !Array.TrueForAll(end.Srcs, r => r >= 0 && r < _dead.Length && _dead[r]))
+                                Attribute(() => RunFused(region, end.Srcs));
                             SkipUnrun();
                         }
                         break;
@@ -863,6 +865,10 @@ namespace TensorSharp.Graph
                 _program = program;
                 var nodes = new GraphNode[program.NodeCount];
                 var roots = new List<int>();
+                // Fused regions (inputs, results): a region runs as one kernel reading every input it names, also one only
+                // its unneeded ops read (a hyper-connection read's injection weights where the step drops the injection).
+                var regions = new List<(int[] Inputs, int[] Results)>();
+                var open = new Stack<int[]>();
                 int n = 0;
                 foreach (GraphNode e in program.Entries)
                 {
@@ -873,17 +879,30 @@ namespace TensorSharp.Graph
                         case GraphNodeKind.Output:
                         case GraphNodeKind.Effect: roots.Add(e.Node); break;
                         case GraphNodeKind.Alias: roots.Add(e.Srcs[1]); break;
+                        case GraphNodeKind.Fused: open.Push(e.Srcs ?? Array.Empty<int>()); break;
+                        case GraphNodeKind.FusedEnd: if (open.Count > 0) regions.Add((open.Pop(), e.Srcs ?? Array.Empty<int>())); break;
                     }
                 }
                 var live = new bool[n];
                 var stack = new Stack<int>(roots);
-                while (stack.Count > 0)
+                bool grew = true;
+                while (grew)
                 {
-                    int i = stack.Pop();
-                    if (live[i]) continue;
-                    live[i] = true;
-                    if (nodes[i].Kind == GraphNodeKind.Op)
-                        foreach (int s in nodes[i].Srcs) stack.Push(s);
+                    while (stack.Count > 0)
+                    {
+                        int i = stack.Pop();
+                        if (live[i]) continue;
+                        live[i] = true;
+                        if (nodes[i].Kind == GraphNodeKind.Op)
+                            foreach (int s in nodes[i].Srcs) stack.Push(s);
+                    }
+                    grew = false;
+                    foreach ((int[] inputs, int[] results) in regions)
+                    {
+                        if (!Array.Exists(results, r => r >= 0 && r < n && live[r])) continue;
+                        foreach (int input in inputs)
+                            if (input >= 0 && input < n && !live[input]) { stack.Push(input); grew = true; }
+                    }
                 }
                 _dead = new bool[n];
                 for (int i = 0; i < n; i++)

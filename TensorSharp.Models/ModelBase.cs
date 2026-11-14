@@ -1497,7 +1497,10 @@ namespace TensorSharp.Models
                 GgmlTensorType.TQ1_0 or
                 GgmlTensorType.TQ2_0 or
                 GgmlTensorType.MXFP4 or
-                GgmlTensorType.NVFP4 => true,
+                GgmlTensorType.NVFP4 or
+                // ISTA-DASLab's Qwen3.8 Flash Next experts (CudaQuantizedOps.SupportsQuantizedType, the MoE dp4a and grouped
+                // kernels): without it --backend cuda widened the checkpoint's ~60 GB of Q2_0 to F32 at load.
+                GgmlTensorType.Q2_0 => true,
                 _ => false,
             };
         }

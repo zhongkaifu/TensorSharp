@@ -362,6 +362,31 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     private (string Target, string Mtp) SpecFixtures(bool qsa)
         => (Fixture(qsa), Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, $"q4e-mtp-{qsa}.gguf"), indexerTopK: 64));
 
+    /// <summary>The MTP head drafting through the engine's unified step (the preset Qwen3.8 Flash Next serves with): one
+    /// request and several at once give the plain greedy streams, on the managed CPU and on the CUDA executor (whose
+    /// hyper-connection regions run at every width, the draft head's one-row steps included).</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task MtpSpeculationMatchesPlain(bool qsa) => AssertMtpSpeculation(qsa, BackendType.Cpu);
+
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task MtpSpeculationOnDirectCudaMatchesPlain(bool qsa) => AssertMtpSpeculation(qsa, BackendType.Cuda);
+
+    private async Task AssertMtpSpeculation(bool qsa, BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        var options = new TensorSharp.Runtime.Speculative.SpeculationOptions
+        {
+            Enabled = true, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0,
+        };
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() => new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp),
+            options, $"qwen4exp mtp qsa={qsa} {backend}");
+    }
+
     /// <summary>n-gram drafts (accepted and rejected): the verify keeps each row's recurrent and PLE state, and the
     /// accept count commits the kept prefix's n-gram and conv histories.</summary>
     /// <summary>Tensor parallelism as per-rank graphs on two simulated devices: the heads and experts split, the

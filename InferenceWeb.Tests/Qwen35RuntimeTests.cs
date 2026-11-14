@@ -864,6 +864,15 @@ public sealed class Qwen35RuntimeTests : IDisposable
             $"qwen35 {variant} {speculator} {backend}");
     }
 
+    /// <summary>As <see cref="EngineSpeculationMatchesPlain"/> on the CUDA executor (the verify windows' decode-size
+    /// products and the draft head's step run there).</summary>
+    [CudaTheory]
+    [InlineData("dense", SpeculatorRegistry.NGram)]
+    [InlineData("moe", SpeculatorRegistry.NGram)]
+    [InlineData("dense-nextn", SpeculatorRegistry.DraftHead)]
+    public Task EngineSpeculationOnDirectCudaMatchesPlain(string variant, string speculator)
+        => EngineSpeculationMatchesPlain(variant, speculator, BackendType.Cuda);
+
     /// <summary>A batched verify whose graph finds no device memory for its compute buffer is retried once after the
     /// cached graphs are freed, and declined (the step decodes plainly) when it fails again: the requests get the plain
     /// greedy streams either way, where the failure used to fail them.</summary>
