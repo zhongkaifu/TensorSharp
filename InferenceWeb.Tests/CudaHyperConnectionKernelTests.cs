@@ -91,4 +91,73 @@ public sealed class CudaHyperConnectionKernelTests
             Same(mixq, mixRef, "mix's q8_1");
         }
     }
+    /// <summary>The injection logits folded into the norm and the mix: a double reference's values, and each row of a
+    /// window the same bits as that row read alone (a verify window's rows are its decode steps').</summary>
+    [CudaTheory]
+    [InlineData(4, 4, 2560)]
+    [InlineData(3, 2, 512)]
+    [InlineData(20, 8, 256)]   // a prompt chunk's narrow blocks
+    public void FoldedInjectionMatchesTheReferenceAndEachRowAlone(int rows, int hc, int n)
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels kernels, out string reason), reason);
+        using (kernels)
+        {
+            var rng = new Random(31);
+            float[] R(int count, double scale) => Enumerable.Range(0, count).Select(_ => (float)((rng.NextDouble() * 2 - 1) * scale)).ToArray();
+            int width = hc * n;
+            float[] xs = R(rows * width, 3), gs = R(width, 1.5), ws = R(hc * width, 0.05);
+            using var x = Tensor.FromArray(allocator, xs);
+            using var gamma = Tensor.FromArray(allocator, gs);
+            using var injW = Tensor.FromArray(allocator, ws);
+            using var gates = Tensor.FromArray(allocator, R(rows * width, 5));
+            using var xn = new Tensor(allocator, DType.Float32, rows * width);
+            using var part = new Tensor(allocator, DType.Float32, rows * hc * hc);
+            using var mix = new Tensor(allocator, DType.Float32, rows * n);
+            using var inject = new Tensor(allocator, DType.Float32, rows * hc);
+            Upload(x, gamma, injW, gates, xn, part, mix, inject);
+            IntPtr stream = allocator.Stream.Handle;
+            kernels.LaunchHcNorm(P(x), P(gamma), P(xn), rows, n, hc, 1e-6f, stream, IntPtr.Zero, P(injW), P(part));
+            kernels.LaunchHcGateMix(P(xn), P(gates), P(mix), rows, n, hc, stream, IntPtr.Zero, P(part), P(inject));
+            allocator.Stream.Synchronize();
+            Written(xn, part, mix, inject);
+            float[] got = inject.GetElementsAsFloat(rows * hc);
+            for (int r = 0; r < rows; r++)
+            {
+                for (int o = 0; o < hc; o++)
+                {
+                    double want = 0, mag = 0;
+                    for (int c = 0; c < hc; c++)
+                    {
+                        double ss = 0;
+                        for (int i = 0; i < n; i++) ss += (double)xs[(r * hc + c) * n + i] * xs[(r * hc + c) * n + i];
+                        double scale = 1 / Math.Sqrt(ss / n + 1e-6);
+                        for (int i = 0; i < n; i++)
+                        {
+                            double v = xs[(r * hc + c) * n + i] * scale * gs[c * n + i] * ws[(long)o * width + c * n + i];
+                            want += v;
+                            mag += Math.Abs(v);
+                        }
+                    }
+                    Assert.True(Math.Abs(got[r * hc + o] - want) <= 1e-5 * mag + 1e-6, $"row {r} output {o}: {got[r * hc + o]} against {want}");
+                }
+                // The row alone.
+                using var x1 = Tensor.FromArray(allocator, xs.Skip(r * width).Take(width).ToArray());
+                using var g1 = Tensor.FromArray(allocator, gates.GetElementsAsFloat(rows * width).Skip(r * width).Take(width).ToArray());
+                using var xn1 = new Tensor(allocator, DType.Float32, width);
+                using var part1 = new Tensor(allocator, DType.Float32, hc * hc);
+                using var mix1 = new Tensor(allocator, DType.Float32, n);
+                using var inject1 = new Tensor(allocator, DType.Float32, hc);
+                Upload(x1, g1, xn1, part1, mix1, inject1);
+                kernels.LaunchHcNorm(P(x1), P(gamma), P(xn1), 1, n, hc, 1e-6f, stream, IntPtr.Zero, P(injW), P(part1));
+                kernels.LaunchHcGateMix(P(xn1), P(g1), P(mix1), 1, n, hc, stream, IntPtr.Zero, P(part1), P(inject1));
+                allocator.Stream.Synchronize();
+                Written(xn1, part1, mix1, inject1);
+                float[] alone = inject1.GetElementsAsFloat(hc);
+                if (rows * hc < 64)   // the norm's block width is the same for the row alone
+                    Assert.Equal(alone.Select(BitConverter.SingleToInt32Bits), got.Skip(r * hc).Take(hc).Select(BitConverter.SingleToInt32Bits));
+            }
+        }
+    }
 }

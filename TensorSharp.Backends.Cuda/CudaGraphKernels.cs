@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 14;
+        public const int CurrentVersion = 15;
 
         private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
@@ -215,10 +215,13 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>The hyper-connection read's grouped norm: each of <paramref name="rows"/> x <paramref name="hc"/> streams
-        /// of <paramref name="n"/> RMS-normed, times the [hc * n] gammas.</summary>
-        public void LaunchHcNorm(IntPtr x, IntPtr gamma, IntPtr y, int rows, int n, int hc, float eps, IntPtr stream, IntPtr yq = default)
+        /// of <paramref name="n"/> RMS-normed, times the [hc * n] gammas. With <paramref name="injW"/> (the injection weights
+        /// [hc, hc * n] as F32, hc at most 8) each stream's slice of the normed row is also dotted with every row's slice into
+        /// <paramref name="injPart"/> [rows * hc, hc], which <see cref="LaunchHcGateMix"/> sums into the injection logits.</summary>
+        public void LaunchHcNorm(IntPtr x, IntPtr gamma, IntPtr y, int rows, int n, int hc, float eps, IntPtr stream, IntPtr yq = default,
+            IntPtr injW = default, IntPtr injPart = default)
         {
-            void** args = stackalloc void*[] { &x, &gamma, &y, &n, &hc, &eps, &yq };
+            void** args = stackalloc void*[] { &x, &gamma, &y, &n, &hc, &eps, &yq, &injW, &injPart };
             // Few streams (a decode or verify step): wide blocks; a prompt chunk's many streams fill the device at 256.
             uint threads = rows * hc < 64 ? 1024u : 256u;
             CudaDriverApi.cuLaunchKernel(_hcNorm, (uint)(rows * hc), 1, 1, threads, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
@@ -233,10 +236,12 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>The read's mix: each row's streams' mean of xn * sigmoid(gates); with <paramref name="outq"/> (n a multiple
-        /// of 32) also as q8_1.</summary>
-        public void LaunchHcGateMix(IntPtr xn, IntPtr gates, IntPtr output, int rows, int n, int hc, IntPtr stream, IntPtr outq = default)
+        /// of 32) also as q8_1. With <paramref name="injPart"/> (<see cref="LaunchHcNorm"/>'s) also the injection logits
+        /// <paramref name="inject"/> [rows, hc], each the sum of its row's streams' partial dots in stream order.</summary>
+        public void LaunchHcGateMix(IntPtr xn, IntPtr gates, IntPtr output, int rows, int n, int hc, IntPtr stream, IntPtr outq = default,
+            IntPtr injPart = default, IntPtr inject = default)
         {
-            void** args = stackalloc void*[] { &xn, &gates, &output, &rows, &n, &hc, &outq };
+            void** args = stackalloc void*[] { &xn, &gates, &output, &rows, &n, &hc, &outq, &injPart, &inject };
             long total = (long)rows * n;
             CudaDriverApi.cuLaunchKernel(_hcGateMix, (uint)((total + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }

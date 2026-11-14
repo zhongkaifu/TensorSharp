@@ -11,7 +11,7 @@
 
 #include <cuda_fp16.h>
 
-#define TS_GRAPH_KERNELS_VERSION 14
+#define TS_GRAPH_KERNELS_VERSION 15
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -677,10 +677,14 @@ __device__ __forceinline__ void ts_graph_quantize_q8_1(float x, ts_graph_block_q
 }
 
 // yq (null, or n % 32 == 0 and a block a multiple of 32 threads): y's rows also as q8_1.
+// injW (null, or hc <= 8): the read's injection weights [hc, hc * n] as F32; injPart[s * hc + o] is then this stream's slice of
+// the normed row dotted with row o's slice, which ts_graph_hc_gate_mix_f32 sums over the row's streams in order (the injection
+// logits without a product of their own: the Qwen3.8 engines' HcPartials fold them into the norm's pass the same way).
 extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, const float* __restrict__ gamma, float* __restrict__ y,
-    int n, int hc, float eps, ts_graph_block_q8_1* __restrict__ yq)
+    int n, int hc, float eps, ts_graph_block_q8_1* __restrict__ yq, const float* __restrict__ injW, float* __restrict__ injPart)
 {
     __shared__ float part[32];
+    __shared__ float ipart[32][8];
     const size_t s = blockIdx.x;               // row * hc + stream
     const float* xs = x + s * n;
     const float* g = gamma + (s % hc) * n;
@@ -700,13 +704,39 @@ extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, con
     }
     __syncthreads();
     const float scale = rsqrtf(part[0] / n + eps);
+    const size_t slice = (s % hc) * (size_t)n, rowWidth = (size_t)hc * n;
+    float acc[8] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
     for (int i = threadIdx.x; i < n; i += blockDim.x)
     {
         const float v = xs[i] * scale * g[i];
         y[s * n + i] = v;
         if (yq != nullptr)
             ts_graph_quantize_q8_1(v, yq + (s * n + i) / 32, threadIdx.x & 31);
+        if (injW != nullptr)
+        {
+#pragma unroll
+            for (int o = 0; o < 8; o++)
+                if (o < hc) acc[o] += v * injW[o * rowWidth + slice + i];
+        }
     }
+    if (injW == nullptr) return;
+#pragma unroll
+    for (int o = 0; o < 8; o++)
+    {
+        float t = acc[o];
+        for (int off = 16; off > 0; off >>= 1)
+            t += __shfl_xor_sync(0xffffffffu, t, off);
+        if ((threadIdx.x & 31) == 0) ipart[threadIdx.x >> 5][o] = t;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32)
+        for (int o = 0; o < hc; o++)
+        {
+            float t = threadIdx.x < (int)(blockDim.x >> 5) ? ipart[threadIdx.x][o] : 0.f;
+            for (int off = 16; off > 0; off >>= 1)
+                t += __shfl_xor_sync(0xffffffffu, t, off);
+            if (threadIdx.x == 0) injPart[s * hc + o] = t;
+        }
 }
 
 // y = silu(x * scale) over n contiguous floats (the read's low-rank activation). Launch: ceil(n / 256), 256.
@@ -728,9 +758,21 @@ extern "C" __global__ void ts_graph_scale_silu_f32(const float* __restrict__ x, 
 // The read's mix: out[r][i] = (sum over c, in order, of xn[r][c][i] * sigmoid(gates[r][c][i])) / hc.
 // Launch: ceil(rows * n / 256), 256.
 // outq (null, or n % 32 == 0): out also as q8_1.
+// injPart (null, or ts_graph_hc_norm_f32's partial injection dots of these rows): the first block also writes
+// inject[r][o] = the sum over the row's streams c, in order, of injPart[(r * hc + c) * hc + o].
 extern "C" __global__ void ts_graph_hc_gate_mix_f32(const float* __restrict__ xn, const float* __restrict__ gates,
-    float* __restrict__ out, int rows, int n, int hc, ts_graph_block_q8_1* __restrict__ outq)
+    float* __restrict__ out, int rows, int n, int hc, ts_graph_block_q8_1* __restrict__ outq, const float* __restrict__ injPart,
+    float* __restrict__ inject)
 {
+    if (injPart != nullptr && blockIdx.x == 0)
+        for (int t = threadIdx.x; t < rows * hc; t += blockDim.x)
+        {
+            const int r = t / hc, o = t % hc;
+            float sum = 0.f;
+            for (int c = 0; c < hc; c++)
+                sum += injPart[((size_t)r * hc + c) * hc + o];
+            inject[t] = sum;
+        }
     const long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= (long long)rows * n) return;
     const long long r = j / n, i = j % n;

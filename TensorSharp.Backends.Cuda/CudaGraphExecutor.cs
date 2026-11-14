@@ -578,9 +578,10 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>
-        /// A hyper-connection read (<see cref="GraphFusion.HcRead"/>) as five launches: the grouped norm, the low-rank down
-        /// product, its scaled silu, the up product and the gated mix in one pass, then the injection weights; the region's
-        /// ops were about sixteen, a decode step's dominant node count on Qwen3.8 Flash Next (two reads a layer).
+        /// A hyper-connection read (<see cref="GraphFusion.HcRead"/>) as four launches: the grouped norm (with the injection
+        /// logits' partial dots), the low-rank down product, its scaled silu, the up product, and the gated mix in one pass
+        /// (summing the injection partials); the region's ops were about sixteen, a decode step's dominant node count on
+        /// Qwen3.8 Flash Next (two reads a layer).
         /// </summary>
         private bool TryHcRead(Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
         {
@@ -613,8 +614,17 @@ namespace TensorSharp.Cuda
             bool quantize = rows <= DenseDecodeRows && n % 32 == 0 && lr % 32 == 0 && CudaQuantizedOps.Q81WarpQuantizeEnabled;
             using var xn = new Tensor(Allocator, DType.Float32, rows, width);
             Tensor xnq = quantize ? Q81Rows(rows, width) : null;
-            Launch(new[] { x, gamma }, xnq == null ? new[] { xn } : new[] { xn, xnq },
-                (k, stream) => k.LaunchHcNorm(Ptr(x), Ptr(gamma), Ptr(xn), rows, n, hc, eps, stream, xnq == null ? IntPtr.Zero : Ptr(xnq)));
+            // The injection logits (hc outputs over the whole streams) fold into the norm's pass and the mix's launch, as the
+            // Qwen3.8 engines' HcPartials fold them: their own product was a split-K GEMV and its combine, 192 launches of a
+            // 4-row window of Qwen3.8 Flash Next. Each row's sums run in one order whatever the row count.
+            Tensor injW = hc <= 8 ? InjectionRowsF32(weights[3], inputs[3], width, hc) : null;
+            using Tensor injPart = injW != null ? new Tensor(Allocator, DType.Float32, (long)rows * hc * hc) : null;
+            var normOut = new List<Tensor> { xn };
+            if (xnq != null) normOut.Add(xnq);
+            if (injPart != null) normOut.Add(injPart);
+            Launch(injW == null ? new[] { x, gamma } : new[] { x, gamma, injW }, normOut.ToArray(),
+                (k, stream) => k.LaunchHcNorm(Ptr(x), Ptr(gamma), Ptr(xn), rows, n, hc, eps, stream, xnq == null ? IntPtr.Zero : Ptr(xnq),
+                    injW == null ? IntPtr.Zero : Ptr(injW), injPart == null ? IntPtr.Zero : Ptr(injPart)));
             if (xnq != null) KeepQuantized(xn, width, rows, xnq);
             using Tensor lo = Product(2, xn);
             Tensor loq = quantize ? Q81Rows(rows, lr) : null;
@@ -624,12 +634,34 @@ namespace TensorSharp.Cuda
             using Tensor gates = Product(4, lo);
             var mix = new Tensor(Allocator, DType.Float32, rows, n);
             Tensor mixq = quantize ? Q81Rows(rows, n) : null;
-            Launch(new[] { xn, gates }, mixq == null ? new[] { mix } : new[] { mix, mixq },
-                (k, stream) => k.LaunchHcGateMix(Ptr(xn), Ptr(gates), Ptr(mix), rows, n, hc, stream, mixq == null ? IntPtr.Zero : Ptr(mixq)));
+            Tensor inject = injPart != null ? new Tensor(Allocator, DType.Float32, rows, hc) : null;
+            var mixOut = new List<Tensor> { mix };
+            if (mixq != null) mixOut.Add(mixq);
+            if (inject != null) mixOut.Add(inject);
+            Launch(injPart == null ? new[] { xn, gates } : new[] { xn, gates, injPart }, mixOut.ToArray(),
+                (k, stream) => k.LaunchHcGateMix(Ptr(xn), Ptr(gates), Ptr(mix), rows, n, hc, stream, mixq == null ? IntPtr.Zero : Ptr(mixq),
+                    injPart == null ? IntPtr.Zero : Ptr(injPart), inject == null ? IntPtr.Zero : Ptr(inject)));
             if (mixq != null) KeepQuantized(mix, n, rows, mixq);
             results[0] = mix;
-            results[1] = Product(3, xn);
+            results[1] = inject ?? Product(3, xn);
             return true;
+        }
+
+        /// <summary>A read's injection weights [hc, hc * n] as F32 on the device: a BF16 matrix widened exactly (made once, on an
+        /// uncaptured step), or an F32 tensor as given; null for another format (its product then runs as a product).</summary>
+        private Tensor InjectionRowsF32(IGraphWeight weight, Tensor tensor, long width, int hc)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            if (weight == null)
+                return tensor is { } t && t.Storage is CudaStorage && t.ElementType == DType.Float32 && t.IsContiguous()
+                    && t.ElementCount() == width * hc ? t : null;
+            if (weight.CacheKey == IntPtr.Zero || weight.Bytes != width * hc * 2) return null;
+            if (_narrowF32.TryGetValue(weight.CacheKey, out Tensor copy)) return copy;
+            if (CudaGraphCapture.IsCapturing(cuda)
+                || !CudaQuantizedOps.TryEnsureResident(cuda, weight.CacheKey, weight.Data, weight.Format, width, hc, weight.Bytes, out _, out _)
+                || !CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr bf16, out int type) || type != 30)
+                return null;
+            return NarrowF32(cuda, weight.CacheKey, bf16, width, hc);
         }
 
         /// <summary>A hyper-connection scatter (<see cref="GraphFusion.HcScatter"/>) as one pass over the streams.</summary>
