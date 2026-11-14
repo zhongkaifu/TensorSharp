@@ -2348,8 +2348,10 @@ namespace TensorSharp.Models
             }
 
             /// <summary>weight[firstRow .. firstRow + rows) · x: a row block of a (packed) weight as its
-            /// own product, so the result is contiguous.</summary>
-            public int MatMulRows(string weight, long firstRow, long rows, int x)
+            /// own product, so the result is contiguous. <paramref name="alone"/>: no other block of the weight is read with
+            /// these rows (a draft head scoring part of the vocabulary), so an executor may compute the block alone instead
+            /// of the whole product its blocks share.</summary>
+            public int MatMulRows(string weight, long firstRow, long rows, int x, bool alone = false)
             {
                 int w = Weight(weight);
                 long ne0, rowBytes;
@@ -2369,7 +2371,7 @@ namespace TensorSharp.Models
                     rowBytes = ne0 * sizeof(float);
                 }
                 int block = Op(GraphOp.View, stackalloc[] { w }, stackalloc long[] { 2, ne0, rows, 1, 1, rowBytes, 0, 0, firstRow * rowBytes });
-                int y = Op(GraphOp.MulMat, block, x);
+                int y = alone ? Op(GraphOp.MulMat, stackalloc[] { block, x }, stackalloc long[] { 0, 1 }) : Op(GraphOp.MulMat, block, x);
                 if (scale != 1.0f)
                     y = Op(GraphOp.Scale, stackalloc[] { y }, default, stackalloc[] { scale });
                 return y;

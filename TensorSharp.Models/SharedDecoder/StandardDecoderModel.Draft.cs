@@ -183,7 +183,7 @@ namespace TensorSharp.Models
                 : HasWeight("output.weight") ? "output.weight" : "token_embd.weight";
             outputs.Final = step.Output(DraftChainsStream ? last : head, width);
             int vocab = ScoredDraftVocabulary;
-            outputs.Logits = step.Output(vocab < Config.VocabSize ? step.MatMulRows(headWeight, 0, vocab, head) : step.MatMul(headWeight, head), vocab);
+            outputs.Logits = step.Output(vocab < Config.VocabSize ? step.MatMulRows(headWeight, 0, vocab, head, alone: true) : step.MatMul(headWeight, head), vocab);
             return outputs;
         }
 

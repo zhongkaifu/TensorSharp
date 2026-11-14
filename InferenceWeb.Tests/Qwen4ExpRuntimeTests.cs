@@ -446,7 +446,7 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     }
 
     /// <summary>A draft head scoring a vocabulary prefix (the family's base vocabulary) proposes from the full head's
-    /// logits over those ids, the rest never drafted.</summary>
+    /// logits over those ids, bit for bit (CUDA computes the prefix's rows alone), the rest never drafted.</summary>
     [Theory]
     [InlineData(BackendType.Cpu)]
     public void DraftVocabularyPrefixScoresTheFullHeadsLogits(BackendType backend) => AssertDraftVocabularyPrefix(backend);
@@ -476,13 +476,10 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         float[] full = Draft(null);
         int half = full.Length / 2;
         float[] prefix = Draft(half);
-        double num = 0, den = 0;
+        int differ = 0;
         for (int i = 0; i < half; i++)
-        {
-            num += (prefix[i] - full[i]) * (double)(prefix[i] - full[i]);
-            den += full[i] * (double)full[i];
-        }
-        Assert.True(Math.Sqrt(num / den) < 1e-5, $"{backend}: the prefix head's logits are {Math.Sqrt(num / den):E2} from the full head's");
+            if (BitConverter.SingleToInt32Bits(prefix[i]) != BitConverter.SingleToInt32Bits(full[i])) differ++;
+        Assert.True(differ == 0, $"{backend}: {differ} of the prefix head's {half} logits differ from the full head's");
         for (int i = half; i < prefix.Length; i++)
             Assert.True(float.IsNegativeInfinity(prefix[i]), $"{backend}: id {i} past the draft vocabulary scored {prefix[i]}");
     }

@@ -1353,7 +1353,8 @@ namespace TensorSharp.Graph
                 }
                 case GraphOp.MulMat:
                 {
-                    Tensor y = MatMul(values[n.Srcs[0]], n.Srcs[1], T(1), run);
+                    // ip [1] set: a row block of the weight read alone (GraphStep.MatMulRows), which need not be a shared product.
+                    Tensor y = MatMul(values[n.Srcs[0]], n.Srcs[1], T(1), run, alone: n.Ip != null && n.Ip.Length > 1 && n.Ip[1] != 0);
                     return new Value { Tensor = y, Relaid = !y.IsContiguous() };
                 }
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));
@@ -1624,13 +1625,23 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>ggml_mul_mat(a, b) = b · aᵀ: [a.ne1, b.ne1, b.ne2, b.ne3], a repeating over b's batches.</summary>
-        private Tensor MatMul(Value a, int bNode, Tensor b, RunState run)
+        private Tensor MatMul(Value a, int bNode, Tensor b, RunState run, bool alone = false)
         {
             long[] nb = Ne(b);
             if (a.Weight != null)
             {
                 IGraphWeight w = a.Weight;
                 if (nb[0] != w.Ne0) throw new NotSupportedException($"product of a {w.Ne0}-wide weight with {nb[0]}-wide rows");
+                if (alone && (a.FirstRow != 0 || a.Rows != w.Ne1) && !run.Products.ContainsKey((w, bNode)))
+                {
+                    Tensor rows = Contig(b, run);
+                    using Tensor x2 = rows.View(rows.ElementCount() / w.Ne0, w.Ne0);
+                    if (QuantizedMatMulRows(w, x2, a.FirstRow, a.Rows) is { } own)
+                    {
+                        run.Keep(own);
+                        return run.Keep(own.View(Sizes(stackalloc long[] { a.Rows, nb[1], nb[2], nb[3] })));
+                    }
+                }
                 if (!run.Products.TryGetValue((w, bNode), out Tensor full))
                 {
                     Tensor rows = Contig(b, run);
@@ -1689,6 +1700,11 @@ namespace TensorSharp.Graph
                 throw new NotSupportedException("a view of a quantized weight that is not a block of whole rows");
             return new Value { Weight = weight, FirstRow = w.FirstRow + offset / rowBytes, Rows = rows };
         }
+
+        /// <summary>Rows [<paramref name="firstRow"/>, + <paramref name="rows"/>) of <paramref name="weight"/> · x, the block
+        /// alone ([x rows, rows] F32), with each value the whole product's bit for bit; null where this executor computes the
+        /// whole product instead (then the block is a slice of it).</summary>
+        protected virtual Tensor QuantizedMatMulRows(IGraphWeight weight, Tensor x, long firstRow, long rows) => null;
 
         /// <summary>ggml_mul_mat_id(as, b, ids): [as.ne1, K, rows], row (j, t) = expert ids[t, j] · b[t, j or 0].</summary>
         private Tensor MatMulId(Value experts, Tensor b, Value ids, RunState run)

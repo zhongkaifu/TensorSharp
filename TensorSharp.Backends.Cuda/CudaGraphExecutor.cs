@@ -2041,6 +2041,54 @@ namespace TensorSharp.Cuda
 
         /// <summary>The decode-once kernels' module where they take a decode-size product of this weight (up to 8 rows of a
         /// 2-D weight in one of their formats), else null.</summary>
+        /// <summary>The rows of x quantized to q8_1, once a run for every product that reads them.</summary>
+        private Tensor QuantizedOnce(CudaAllocator cuda, Tensor x, CudaStorage xs, long inDim, long rows)
+        {
+            var key = (xs, x.StorageOffset, inDim, rows);
+            if (_quantized.TryGetValue(key, out Tensor xq)) return xq;
+            xq = new Tensor(Allocator, DType.UInt8, rows * (inDim / 32) * CudaKernels.Q81BlockBytes);
+            xs.EnsureDeviceCurrent();
+            cuda.Context.MakeCurrent();
+            CudaQuantizedOps.QuantizeRowsQ81(cuda, Ptr(x), Ptr(xq), (int)inDim, (int)rows);
+            ((CudaStorage)xq.Storage).MarkDeviceModified();
+            _quantized[key] = xq;
+            return xq;
+        }
+
+        /// <summary>
+        /// A row block of a weight read alone (a draft head scoring the 151,643 ids of the Qwen2 base vocabulary out of
+        /// Qwen3.8's 248,320) at decode size, on the decode-once kernels over the block's rows only. The whole product had
+        /// read every row and the block was sliced from it: 975 us of each draft step against 600 for the block (Qwen3.8
+        /// Flash Next's MTP head, A40). The kernel walks an output row with as many warps as the whole product's
+        /// (Dsv4Kernels.DenseFastWarps), so each value is the whole product's bit for bit; otherwise the whole product runs.
+        /// </summary>
+        protected override Tensor QuantizedMatMulRows(IGraphWeight weight, Tensor x, long firstRow, long outRows)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            long rows = x.Sizes[0], inDim = weight.Ne0;
+            if (rows < 1 || rows > DenseDecodeRows || weight.Ne2 > 1 || weight.Ne1 <= 0 || weight.Ne1 > int.MaxValue
+                || weight.Bytes % weight.Ne1 != 0 || firstRow < 0 || outRows < 1 || firstRow + outRows > weight.Ne1
+                || x.Storage is not CudaStorage xs || x.ElementType != DType.Float32 || !x.IsContiguous() || x.ElementCount() != rows * inDim
+                || inDim % 32 != 0 || inDim > int.MaxValue || weight.CacheKey == IntPtr.Zero || cuda.Kernels == null
+                || Dsv4Kernels.DenseFastWarps((int)weight.Ne1) != Dsv4Kernels.DenseFastWarps((int)outRows))
+                return null;
+            if (!CudaGraphCapture.IsCapturing(cuda))
+                CudaQuantizedOps.TryEnsureResident(cuda, weight.CacheKey, weight.Data, weight.Format, inDim, weight.Ne1, weight.Bytes, out _, out _);
+            if (!CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type) || type == 30
+                || DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not { } dk)
+                return null;
+            long rowBytes = weight.Bytes / weight.Ne1, qRow = inDim / 32 * CudaKernels.Q81BlockBytes;
+            Tensor xq = QuantizedOnce(cuda, x, xs, inDim, rows);
+            var product = new Tensor(Allocator, DType.Float32, rows, outRows);
+            ((CudaStorage)product.Storage).EnsureDeviceCurrent();
+            cuda.Context.MakeCurrent();
+            for (long first = 0; first < rows; first += DecodeOnceRows)
+                dk.DenseQ81Rows(wPtr + (nint)(firstRow * rowBytes), Ptr(xq) + (nint)(first * qRow), Ptr(product) + (nint)(first * outRows * sizeof(float)),
+                    type, (int)outRows, (int)inDim, rowBytes, (int)Math.Min(DecodeOnceRows, rows - first), cuda.Stream.Handle);
+            ((CudaStorage)product.Storage).MarkDeviceModified();
+            return product;
+        }
+
         private Dsv4Kernels DecodeOnce(int type, long inDim, long rows, IGraphWeight weight)
         {
             if (rows > 8 || weight.Ne2 > 1 || weight.Bytes % weight.Ne1 != 0) return null;
@@ -2145,16 +2193,7 @@ namespace TensorSharp.Cuda
                 && (DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not null
                     || (rows <= 16 && CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows))))
             {
-                var key = (xs, x.StorageOffset, inDim, rows);
-                if (!_quantized.TryGetValue(key, out Tensor xq))
-                {
-                    xq = new Tensor(Allocator, DType.UInt8, rows * (inDim / 32) * CudaKernels.Q81BlockBytes);
-                    xs.EnsureDeviceCurrent();
-                    cuda.Context.MakeCurrent();
-                    CudaQuantizedOps.QuantizeRowsQ81(cuda, Ptr(x), Ptr(xq), (int)inDim, (int)rows);
-                    ((CudaStorage)xq.Storage).MarkDeviceModified();
-                    _quantized[key] = xq;
-                }
+                Tensor xq = QuantizedOnce(cuda, x, xs, inDim, rows);
                 var product = new Tensor(Allocator, DType.Float32, rows, outDim);
                 ((CudaStorage)product.Storage).EnsureDeviceCurrent();
                 cuda.Context.MakeCurrent();
