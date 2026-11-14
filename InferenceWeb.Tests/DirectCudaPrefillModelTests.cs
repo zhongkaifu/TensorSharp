@@ -356,8 +356,10 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         // [24,24,24] at 97 tokens on an A40 (sm_86) since prompt chunks run the chunked Gated DeltaNet (WY form,
         // BF16-split operands: the direct engine's arithmetic) and the flash prefill attention: row 0 1.49e-3 and the
         // decode rows up to 3.86e-4; with the per-row kernel 0.93e-3 and 2.0e-4, with neither 0.89e-3 (row 0 of [64] at 96
-        // tokens was 1.105e-3 on an RTX A5000).
-        "qwen35" => row == 0 ? 0.0016 : 0.0004,
+        // tokens was 1.105e-3 on an RTX A5000). [16,16,16,16,16] row 0 2.11e-3 / 1.75e-3 (96 / 97 tokens, RTX 2000 Ada), the
+        // decode rows up to 7.1e-4 (A40) since products of 9-32 rows run on the decode-once kernels in pieces of 8 (a decode
+        // row's sums however many rows share the step) where 9-16 had taken the q8_1 multi-row kernel.
+        "qwen35" => row == 0 ? 0.0025 : 0.001,
         "gemma4moe" => row == 0 ? 0.0089 : 0.017,  // A 5.9e-3 / 1.08e-2 (with the D3 fixes)
         "gemma4moe_global" => row == 0 ? 0.0074 : 0.017,
         "nemotron_h" => chunks[0] is 1 or 64 ? 0 : row == 0 ? 0.015 : row == 1 && length == 96 ? 0.013 : 0,

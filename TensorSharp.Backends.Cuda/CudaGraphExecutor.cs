@@ -41,6 +41,18 @@ namespace TensorSharp.Cuda
         public IDecodeCapture OpenDecodeCapture()
             => Allocator is CudaAllocator cuda ? new RuntimeDecodeCapture(cuda) : null;
 
+        /// <summary>Device memory a new recording leaves free (with the pool's cached blocks): a speculating request records
+        /// a step for each window and draft width, each keeping the blocks its kernels used, and Qwen3.8 Flash Next's ISTA
+        /// pack with its MTP head on an A40 ran out of memory recording or launching one after a 4K prompt.</summary>
+        private const long RecordingHeadroomBytes = 1L << 30;
+
+        public bool HasRoomToRecord()
+        {
+            if (Allocator is not CudaAllocator cuda) return false;
+            try { return cuda.GetMemoryInfo().freeBytes + cuda.GetStats().CachedBytes >= RecordingHeadroomBytes; }
+            catch (Exception) { return true; }
+        }
+
         /// <summary>CUDA's binary kernels take same-shaped contiguous operands: a broadcast operand is gathered.</summary>
         protected override bool BroadcastsInKernels => false;
 
@@ -125,6 +137,9 @@ namespace TensorSharp.Cuda
         {
             // A padded decode window (its unwritten tail masked) runs its pattern over the written keys only.
             bool trimmed = mask.Pattern == MaskPattern.Explicit && mask.Trimmed != MaskPattern.Explicit && mask.Keys > 0;
+            if (q.DimensionCount == 3 && q.Sizes[1] > 1 && q.Sizes[1] <= CudaDecodeDynParams.WindowRowBlocks
+                && TryWindowRowsAsDecode(q, k, v, mask, trimmed, scale, kWindow, vWindow, out Tensor byRow))
+                return byRow;
             if (mask.Pattern == MaskPattern.Explicit && !trimmed && TrySparseDecodeAttention(q, k, v, mask, scale, kWindow, vWindow, out Tensor sparse))
                 return sparse;
             // An explicit mask (a sparse attention's selection over prompt or verify rows) runs on the tiled path below, its rows
@@ -152,8 +167,10 @@ namespace TensorSharp.Cuda
             {
                 var cudaAllocator = (CudaAllocator)Allocator;
                 IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(cudaAllocator);
-                // Splits from the window (a recorded step replays at every length it covers).
-                int splits = decodeFlash.Splits(heads / kvHeads, kvHeads, dyn != IntPtr.Zero ? (int)k.Sizes[^2] : len);
+                // Splits from the window, recorded or not: a recorded step replays at every length its window covers, and a
+                // row's arithmetic must not depend on whether its step was recorded (a verify window's row and the decode
+                // row at its position, a speculating request and a plain one).
+                int splits = decodeFlash.Splits(heads / kvHeads, kvHeads, (int)k.Sizes[^2]);
                 var attended = new Tensor(Allocator, DType.Float32, 1, heads, d);
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(1, heads, d, splits)) : null;
@@ -251,6 +268,76 @@ namespace TensorSharp.Cuda
                 Ops.Copy(target, permuted);
             }
             return output;
+        }
+
+        /// <summary>
+        /// A verify window's rows (up to 8 a sequence, causal over the cache window or a sparse attention's selection) each
+        /// run as the decode row at their position: row r attends the window's keys less the nq - 1 - r after it, read on
+        /// the device from that row's block of the step's parameters when the step is recorded. The multi-row kernels split
+        /// the keys by the window's length (the flash kernel's split share), or ran another product altogether (an F32
+        /// cache, a selection), so a window row rounded apart from the decode row at its position, and speculative
+        /// decoding could answer other than plain greedy at a near-tie.
+        /// </summary>
+        private bool TryWindowRowsAsDecode(Tensor q, Tensor k, Tensor v, AttentionMask mask, bool trimmed, float scale,
+            CacheWindow kWindow, CacheWindow vWindow, out Tensor attended)
+        {
+            attended = null;
+            if (kWindow == null || vWindow == null || kWindow.Start != 0 || vWindow.Start != 0 || q.ElementType != DType.Float32
+                || k.DimensionCount is < 2 or > 3 || v.DimensionCount is < 2 or > 3 || k.Sizes[^1] != v.Sizes[^1])
+                return false;
+            int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2];
+            int kvHeads = k.DimensionCount == 3 ? (int)k.Sizes[0] : 1;
+            bool selection = mask.Pattern == MaskPattern.Explicit && !trimmed;
+            int keys = trimmed ? mask.Keys : (int)k.Sizes[^2], floor = trimmed ? mask.TrimmedFloor : mask.Floor;
+            if (heads % kvHeads != 0 || (selection ? !mask.HasTensor : (trimmed ? mask.Trimmed : mask.Pattern) != MaskPattern.Causal)
+                || keys - (nq - 1) <= floor)
+                return false;
+            Tensor whole = mask.HasTensor ? mask.Tensor : null;
+            if (selection && (whole == null || whole.DimensionCount != 2 || whole.Sizes[0] != nq)) return false;
+            var rowMasks = new List<Tensor>();
+            using Tensor permuted = q.Permute(1, 0, 2);
+            using Tensor byRow = Ops.NewContiguous(permuted);
+            var output = new Tensor(Allocator, DType.Float32, nq, heads, d);
+            bool done = false;
+            try
+            {
+                for (int r = 0; r < nq; r++)
+                {
+                    int fewer = nq - 1 - r, row = r;
+                    Func<Tensor> rowOf = whole == null ? null : () =>
+                    {
+                        Tensor t = whole.Narrow(0, row, 1);
+                        rowMasks.Add(t);
+                        return t;
+                    };
+                    // The decode row's own mask: a selection's row, or the written keys up to its position.
+                    AttentionMask rowMask = selection
+                        ? new AttentionMask(MaskPattern.Explicit, 0, rowOf) { KvMax = mask.KvMax }
+                        : new AttentionMask(MaskPattern.Explicit, 0, rowOf, keys - fewer, MaskPattern.None, floor);
+                    using Tensor qRow = byRow.Narrow(0, r, 1);
+                    using Tensor q1 = qRow.View(heads, 1, d);
+                    CudaDecodeDynParams.WindowRow(fewer);
+                    try
+                    {
+                        using Tensor one = FlashAttention(q1, k, v, rowMask, scale, kWindow, vWindow);
+                        using Tensor target = output.Narrow(0, r, 1);
+                        using Tensor source = one.View(1, heads, d);
+                        Ops.Copy(target, source);
+                    }
+                    finally
+                    {
+                        CudaDecodeDynParams.WindowRow(null);
+                    }
+                }
+                done = true;
+            }
+            finally
+            {
+                foreach (Tensor t in rowMasks) t.Dispose();
+                if (!done) output.Dispose();
+            }
+            attended = output;
+            return true;
         }
 
         /// <summary>A mask as contiguous F32 [rows, keys] on this device, or null.</summary>
@@ -1368,6 +1455,9 @@ namespace TensorSharp.Cuda
             if (_stepTables != null)
                 foreach (Tensor t in _stepTables) t.Dispose();
             _stepTables = null;
+            foreach (Tensor t in _decodeScratchTensors) t.Dispose();
+            _decodeScratchTensors.Clear();
+            _decodeScratch.Clear();
             _moeKernels?.Dispose();
             _moeKernels = null;
             lock (_hostedTables)
@@ -1583,9 +1673,11 @@ namespace TensorSharp.Cuda
             using Tensor x2 = x.View(rows, hidden);
             using Tensor logits2 = logits.View(rows, experts);
             var output = new Tensor(Allocator, DType.Float32, rows, hidden);
-            bool ok = rows <= PerRowExpertRows
-                ? PerRowExperts(x2, logits2, output, gate, up, down, experts, k, hidden, ff, rows)
-                : GroupedExperts(x2, logits2, output, gate, up, down, experts, k);
+            bool ok = TryDecodeExperts(x2, logits2, output, gate, up, down, experts, k, hidden, ff, rows)
+                || (rows <= PerRowExpertRows
+                    ? PerRowExperts(x2, logits2, output, gate, up, down, experts, k, hidden, ff, rows)
+                    : TryChunkExperts(x2, logits2, output, gate, up, down, experts, k, hidden, ff, rows)
+                      || GroupedExperts(x2, logits2, output, gate, up, down, experts, k));
             if (!ok)
             {
                 output.Dispose();
@@ -1595,9 +1687,171 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>Whether the loaded module's grouped expert kernels read experts of <paramref name="type"/> (an older module
+        /// reads some layouts as Q8_0: CudaMoe.RequireExpertDecoders).</summary>
+        private static bool ChunkKernelsRead(Dsv4Kernels dk, int type) => CudaMoe.SupportsExpertType(type) && type switch
+        {
+            7 => dk.DecodesQ5_1Experts,
+            19 or 22 => dk.DecodesLowBitIqExperts,
+            42 => dk.DecodesLegacyQuants,
+            _ => true,
+        };
+
+        /// <summary>
+        /// A prompt chunk's device-resident routed experts on the grouped kernels the tiered layers already take
+        /// (CudaMoe.Experts: the routes grouped by expert on the device, then the tensor-core or int8 grouped GEMMs). The
+        /// per-expert loop below them spent 3.0 of a 2048-row step's 3.6 s on 46K launches once every expert of Qwen3.8 Flash
+        /// Next's ISTA pack fitted an A40 (its prompt then took 7.4 s against 1.8). The routing is the engines' selection (the K
+        /// largest logits, softmax over them; every score NaN picks expert 0, where the executor's router wrote -1,
+        /// which the grouped kernels index with).
+        /// </summary>
+        private bool TryChunkExperts(Tensor x, Tensor logits, Tensor output, IGraphExpertWeights gate, IGraphExpertWeights up,
+            IGraphExpertWeights down, int experts, int k, int hidden, int ff, int rows)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            if (hidden % 32 != 0 || ff % 32 != 0 || gate.Format != up.Format || k > 32 || experts > 512 || cuda.Kernels == null
+                || CudaGraphCapture.IsCapturing(cuda))
+                return false;
+            Dsv4Kernels dk = MoeKernels;
+            if (dk == null || !ChunkKernelsRead(dk, gate.Format) || !ChunkKernelsRead(dk, down.Format)
+                || !GroupedTakes(new[] { gate, up, down }, rows, hidden, ff))
+                return false;
+            Tensor gateTable = ExpertTable(gate), upTable = ExpertTable(up), downTable = ExpertTable(down);
+            if (gateTable == null || upTable == null || downTable == null) return false;
+            if (!TryExpertRowBytes(gate, out long gateRow) || !TryExpertRowBytes(up, out long upRow) || !TryExpertRowBytes(down, out long downRow))
+                return false;
+            var owned = new List<Tensor>();
+            try
+            {
+                var s = new CudaMoeScratch((type, sizes) =>
+                {
+                    var t = new Tensor(Allocator, type, sizes);
+                    owned.Add(t);
+                    return t;
+                }, rows, experts, k, hidden, ff);
+                foreach (Tensor t in new[] { x, logits, output }) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+                cuda.Context.MakeCurrent();
+                IntPtr stream = cuda.Stream.Handle;
+                dk.MoeSelect(logits, IntPtr.Zero, IntPtr.Zero, null, s.Sel, s.SelW, experts, k, 1, 1f, rows, stream, Dsv4Kernels.RouterSoftmax, keys: true);
+                var gw = new DeviceWeight { Type = gate.Format, Ne0 = hidden, Ne1 = ff, RowBytes = gateRow, Table = Ptr(gateTable) };
+                var uw = new DeviceWeight { Type = up.Format, Ne0 = hidden, Ne1 = ff, RowBytes = upRow, Table = Ptr(upTable) };
+                var dw = new DeviceWeight { Type = down.Format, Ne0 = ff, Ne1 = hidden, RowBytes = downRow, Table = Ptr(downTable) };
+                CudaMoe.Experts(dk, cuda.Kernels, s, gw, uw, dw, x, null, output, rows, k, experts, hidden, ff, 0f, GroupedPerSlotMaxRows, stream);
+                ((CudaStorage)output.Storage).MarkDeviceModified();
+                return true;
+            }
+            finally
+            {
+                // The kernels are queued on the allocator's stream: the scratch returns to its pool for later work there.
+                foreach (Tensor t in owned) t.Dispose();
+            }
+        }
+
+        /// <summary>Bytes of one row of a stacked expert weight (every member alike).</summary>
+        private static bool TryExpertRowBytes(IGraphExpertWeights set, out long rowBytes)
+        {
+            rowBytes = 0;
+            IGraphWeight first;
+            try { first = set.Expert(0); }
+            catch (NotSupportedException) { return false; }
+            if (first == null || first.Ne1 <= 0 || first.Bytes % first.Ne1 != 0) return false;
+            rowBytes = first.Bytes / first.Ne1;
+            return true;
+        }
+
+        /// <summary>Rows up to which the routed experts run on the direct engines' per-(token, expert) decode kernels, in
+        /// pieces of <see cref="GroupedPerSlotMaxRows"/>.</summary>
+        private const int DecodeExpertRows = 32;
+
+        /// <summary>
+        /// Expert formats the per-slot decode kernels read at least as close to the exact product as the executor's per-row
+        /// kernels (the median relative L2 of a two-layer fixture's logits against the managed CPU, A40): Q8_0 8.0e-3 against
+        /// 2.5e-2, MXFP4 8.9e-3 against 2.1e-2, IQ3_S 4.0e-2 against 4.9e-2, Q4_0 / IQ2_XXS / IQ2_S / IQ4_NL the same bits,
+        /// Q5_1 / Q4_K / Q6_K / IQ2_XS / IQ3_XXS within a tenth. IQ4_XS (2.1e-2 against 8.8e-3) and IQ1_S (1.9e-2 against
+        /// 8.6e-3) keep the per-row kernels.
+        /// </summary>
+        private static bool DecodeKernelsAsExact(int type) => type is not (19 or 23);
+
+        /// <summary>The per-slot kernels' scratch for each expert geometry (never freed while recorded steps may bind it).</summary>
+        private readonly Dictionary<(int Experts, int K, int Hidden, int Ff), CudaMoeScratch> _decodeScratch = new();
+        private readonly List<Tensor> _decodeScratchTensors = new();
+
+        /// <summary>
+        /// The routed experts of decode steps and verify windows (up to <see cref="DecodeExpertRows"/> rows, several
+        /// sequences' alike) on the direct engines' per-(token, expert) decode kernels (CudaMoe.Experts' per-slot route, the
+        /// engines' own): each slot is computed as a lone token's decode step computes it, so a row's experts never depend
+        /// on how many rows the step holds (a verify window's rows are a decode step's bit for bit, and a speculating
+        /// request's are a plain one's however many share the step). The executor's batched kernels took 160 us a layer for
+        /// a 4-row window of Qwen3.8 Flash Next's Q2_0 experts against these kernels' 83 (A40, nsys). The routing is the
+        /// engines' selection (the K largest logits, softmax over them; never an expert -1, which these kernels would index
+        /// with); Q8_0 experts are read in the dense matvec's row layout, as the engine reads them. A fixed choice by format
+        /// and rows.
+        /// </summary>
+        private bool TryDecodeExperts(Tensor x, Tensor logits, Tensor output, IGraphExpertWeights gate, IGraphExpertWeights up,
+            IGraphExpertWeights down, int experts, int k, int hidden, int ff, int rows)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            if (rows > DecodeExpertRows || hidden % 32 != 0 || ff % 32 != 0 || gate.Format != up.Format || k > 32 || experts > 512
+                || cuda.Kernels == null)
+                return false;
+            // The module and the scratch are made on an uncaptured step (never inside a recording, which would then bind
+            // another route than the unrecorded steps take: the first steps of a shape always run unrecorded).
+            if (_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing(cuda))) return false;
+            Dsv4Kernels dk = MoeKernels;
+            if (dk == null || !ChunkKernelsRead(dk, gate.Format) || !ChunkKernelsRead(dk, down.Format)
+                || !DecodeKernelsAsExact(gate.Format) || !DecodeKernelsAsExact(down.Format)) return false;
+            Tensor gateTable = ExpertTable(gate), upTable = ExpertTable(up), downTable = ExpertTable(down);
+            if (gateTable == null || upTable == null || downTable == null) return false;
+            if (!TryExpertRowBytes(gate, out long gateRow) || !TryExpertRowBytes(up, out long upRow) || !TryExpertRowBytes(down, out long downRow))
+                return false;
+            var shape = (experts, k, hidden, ff);
+            if (!_decodeScratch.TryGetValue(shape, out CudaMoeScratch s))
+            {
+                if (CudaGraphCapture.IsCapturing(cuda)) return false;
+                s = new CudaMoeScratch((type, sizes) =>
+                {
+                    var t = new Tensor(Allocator, type, sizes);
+                    ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+                    _decodeScratchTensors.Add(t);
+                    return t;
+                }, GroupedPerSlotMaxRows, experts, k, hidden, ff);
+                _decodeScratch[shape] = s;
+            }
+            foreach (Tensor t in new[] { x, logits, output }) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            cuda.Context.MakeCurrent();
+            IntPtr stream = cuda.Stream.Handle;
+            var gw = new DeviceWeight { Type = gate.Format, Ne0 = hidden, Ne1 = ff, RowBytes = gateRow, Table = Ptr(gateTable) };
+            var uw = new DeviceWeight { Type = up.Format, Ne0 = hidden, Ne1 = ff, RowBytes = upRow, Table = Ptr(upTable) };
+            var dw = new DeviceWeight { Type = down.Format, Ne0 = ff, Ne1 = hidden, RowBytes = downRow, Table = Ptr(downTable) };
+            for (int first = 0; first < rows; first += GroupedPerSlotMaxRows)
+            {
+                int n = Math.Min(GroupedPerSlotMaxRows, rows - first);
+                using Tensor xs = x.Narrow(0, first, n), ls = logits.Narrow(0, first, n), outs = output.Narrow(0, first, n);
+                dk.MoeSelect(ls, IntPtr.Zero, IntPtr.Zero, null, s.Sel, s.SelW, experts, k, 1, 1f, n, stream, Dsv4Kernels.RouterSoftmax, keys: true);
+                CudaMoe.Experts(dk, cuda.Kernels, s, gw, uw, dw, xs, null, outs, n, k, experts, hidden, ff, 0f, GroupedPerSlotMaxRows, stream,
+                    q80VecDecode: true);
+            }
+            ((CudaStorage)output.Storage).MarkDeviceModified();
+            return true;
+        }
+
+        /// <summary>
+        /// The routed experts on the executor's fused kernels. Up to <see cref="DecodeExpertRows"/> rows each run as a lone
+        /// decode row (the one-row kernel a row): the multi-row kernel rounds apart from it, so a verify window's rows had
+        /// differed from the decode rows at their positions where the per-slot kernels do not take the format.
+        /// </summary>
         private bool PerRowExperts(Tensor x, Tensor logits, Tensor output, IGraphExpertWeights gate, IGraphExpertWeights up,
             IGraphExpertWeights down, int experts, int k, int hidden, int ff, int rows)
         {
+            if (rows > 1 && rows <= DecodeExpertRows)
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    using Tensor xr = x.Narrow(0, r, 1), lr = logits.Narrow(0, r, 1), outr = output.Narrow(0, r, 1);
+                    if (!PerRowExperts(xr, lr, outr, gate, up, down, experts, k, hidden, ff, 1)) return false;
+                }
+                return true;
+            }
             Tensor gateTable = ExpertTable(gate), upTable = ExpertTable(up), downTable = ExpertTable(down);
             if (gateTable == null || upTable == null || downTable == null) return false;
             bool gateUpDp4a = CudaQuantizedOps.IsMoeDp4aEnabledForType(gate.Format) && CudaFusedOps.IsMoeDp4aDimensionSupported(gate.Format, hidden);
@@ -1742,15 +1996,59 @@ namespace TensorSharp.Cuda
             return dk != null && dk.DenseFastReads(type, inDim) ? dk : null;
         }
 
+        /// <summary>BF16 products of up to this many rows take the row-invariant kernels (decode steps and verify windows,
+        /// several sequences' alike).</summary>
+        private const int Bf16DecodeRows = 32;
+        /// <summary>Rows the decode-once kernels take in one call, and quantized products of up to <see cref="DenseDecodeRows"/>
+        /// rows run on them in pieces of that many.</summary>
+        private const int DecodeOnceRows = 8, DenseDecodeRows = 32;
+
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
             var cuda = (CudaAllocator)Allocator;
             long rows = x.Sizes[0], inDim = weight.Ne0, outDim = weight.Ne1;
+            // A decode-size product chooses its kernel by the weight's resident copy: made resident first, so a weight's first
+            // product takes the kernel every later one takes (it had fallen to the uploading product once, which rounds
+            // otherwise: a prompt's first logits then differed from the same prompt's in a later batch).
+            if (rows <= 32 && !CudaGraphCapture.IsCapturing(cuda) && weight.CacheKey != IntPtr.Zero)
+                CudaQuantizedOps.TryEnsureResident(cuda, weight.CacheKey, weight.Data, weight.Format, inDim, outDim, weight.Bytes, out _, out _);
+            // BF16 weights (MoE routers, recurrent gates, sparse-attention indexer projections) at decode size, F32 activations,
+            // with sums whose order never depends on the row count: a verify window's rows are then a plain decode step's bit
+            // for bit, however many sequences share the step. A wide output (a router's 256+ experts) runs on the direct
+            // engines' block GEMV (one block an output, every row of the call through it: 4.4 us a 4-row window's router on
+            // an RTX 5090), a narrower one on the one-row matvec a row. The multi-row product had gone to cuBLAS with the
+            // activations rounded to BF16, so a window's router could pick other experts than the same row alone, and took
+            // 113 us a product (Qwen3.8 Flash Next, 4-row windows on an A40); a row each then cost 55K launches for 192
+            // tokens. A fixed choice by format, width and rows.
+            if (rows >= 1 && rows <= Bf16DecodeRows && inDim % 8 == 0 && inDim <= int.MaxValue && outDim <= int.MaxValue
+                && x.Storage is CudaStorage bs && x.ElementType == DType.Float32 && x.IsContiguous() && x.ElementCount() == rows * inDim
+                && cuda.Kernels != null && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr bPtr, out int bType)
+                && bType == 30 && weight.Bytes == inDim * outDim * 2)
+            {
+                var product = new Tensor(Allocator, DType.Float32, rows, outDim);
+                ((CudaStorage)product.Storage).EnsureDeviceCurrent();
+                bs.EnsureDeviceCurrent();
+                cuda.Context.MakeCurrent();
+                IntPtr input = Ptr(x), output = Ptr(product);
+                Dsv4Kernels wide = outDim >= 256 && !(_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing(cuda)))
+                    ? MoeKernels : null;
+                if (wide != null && wide.HasGemvBf16)
+                    for (long first = 0; first < rows; first += Dsv4Kernels.GemvMaxRows)
+                        wide.GemvBf16(input + (nint)(first * inDim * sizeof(float)), bPtr, output + (nint)(first * outDim * sizeof(float)),
+                            (int)inDim, (int)outDim, (int)Math.Min(Dsv4Kernels.GemvMaxRows, rows - first), cuda.Stream.Handle);
+                else
+                    for (long r = 0; r < rows; r++)
+                        cuda.Kernels.LaunchMatvecBf16(bPtr, input + (nint)(r * inDim * sizeof(float)), output + (nint)(r * outDim * sizeof(float)),
+                            (int)inDim, (int)outDim, cuda.Stream.Handle);
+                ((CudaStorage)product.Storage).MarkDeviceModified();
+                return product;
+            }
             // A decode-size product over q8_1 activations the step already quantized (or quantizes now, once).
-            if (rows >= 1 && rows <= 16 && x.Storage is CudaStorage xs && x.ElementType == DType.Float32 && x.IsContiguous()
+            if (rows >= 1 && rows <= DenseDecodeRows && x.Storage is CudaStorage xs && x.ElementType == DType.Float32 && x.IsContiguous()
                 && x.ElementCount() == rows * inDim && inDim % 32 == 0 && inDim <= int.MaxValue && outDim <= int.MaxValue
                 && cuda.Kernels != null && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type)
-                && (DecodeOnce(type, inDim, rows, weight) is not null || CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows)))
+                && (DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is not null
+                    || (rows <= 16 && CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows))))
             {
                 var key = (xs, x.StorageOffset, inDim, rows);
                 if (!_quantized.TryGetValue(key, out Tensor xq))
@@ -1770,13 +2068,18 @@ namespace TensorSharp.Cuda
                 // speculative step answers as the plain greedy stream), and a K-quant window no longer goes through a
                 // dequantizing product (3-5x slower on an A40, an RTX 2000 Ada and an RTX PRO 6000 slice). A fixed choice
                 // by format and rows, never by timing (the per-type q8_1 kernels round apart in the last bits).
-                if (DecodeOnce(type, inDim, rows, weight) is { } dk)
+                // Past 8 rows (several sequences' windows in one step) in pieces of 8: still a decode row's sums, and faster than
+                // the one multi-row product (4 sequences' 4-row windows of Qwen3.8 Flash Next: 50-58 tok/s served against 40).
+                if (DecodeOnce(type, inDim, Math.Min(rows, DecodeOnceRows), weight) is { } dk)
                 {
-                    dk.DenseQ81Rows(wPtr, Ptr(xq), Ptr(product), type, (int)outDim, (int)inDim, weight.Bytes / outDim, (int)rows, cuda.Stream.Handle);
+                    long qRow = inDim / 32 * CudaKernels.Q81BlockBytes;
+                    for (long first = 0; first < rows; first += DecodeOnceRows)
+                        dk.DenseQ81Rows(wPtr, Ptr(xq) + (nint)(first * qRow), Ptr(product) + (nint)(first * outDim * sizeof(float)), type,
+                            (int)outDim, (int)inDim, weight.Bytes / outDim, (int)Math.Min(DecodeOnceRows, rows - first), cuda.Stream.Handle);
                     ((CudaStorage)product.Storage).MarkDeviceModified();
                     return product;
                 }
-                if (CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows)
+                if (rows <= 16 && CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows)
                     && CudaQuantizedOps.TryResidentMatmulQ81(cuda, wPtr, type, Ptr(xq), Ptr(product), (int)inDim, (int)outDim, (int)rows))
                 {
                     ((CudaStorage)product.Storage).MarkDeviceModified();

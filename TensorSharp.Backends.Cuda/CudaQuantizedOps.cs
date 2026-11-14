@@ -677,6 +677,24 @@ namespace TensorSharp.Cuda
         /// <summary>Returns the device pointer of an already-preloaded quantized
         /// weight (by its host cache key), so callers can build a device-side
         /// table of per-expert weight pointers for the on-device MoE kernels.</summary>
+        /// <summary>The weight resident on the device (uploaded now from <paramref name="hostData"/> when it is not yet), then
+        /// <see cref="TryGetResidentDevicePtr"/>: a caller choosing its kernel by the resident copy chooses the same on the
+        /// weight's first use as on every later one. False, nothing uploaded, when the upload fails.</summary>
+        public static bool TryEnsureResident(CudaAllocator allocator, IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1,
+            long rawBytes, out IntPtr devicePtr, out int residentType)
+        {
+            devicePtr = IntPtr.Zero;
+            residentType = 0;
+            if (cacheKey == IntPtr.Zero && hostData == IntPtr.Zero) return false;
+            if (!TryGetResidentDevicePtr(allocator, cacheKey != IntPtr.Zero ? cacheKey : hostData, out devicePtr, out residentType))
+            {
+                if (hostData == IntPtr.Zero || !SupportsMatmulType(ggmlType)) return false;
+                try { EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes); }
+                catch (Exception ex) when (ex is CudaException or InvalidOperationException or OutOfMemoryException) { return false; }
+            }
+            return TryGetResidentDevicePtr(allocator, cacheKey != IntPtr.Zero ? cacheKey : hostData, out devicePtr, out residentType);
+        }
+
         public static bool TryGetResidentDevicePtr(CudaAllocator allocator, IntPtr cacheKey, out IntPtr devicePtr, out int ggmlType)
         {
             devicePtr = IntPtr.Zero;

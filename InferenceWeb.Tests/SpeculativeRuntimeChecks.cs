@@ -143,8 +143,15 @@ internal static class SpeculativeRuntimeChecks
             Speculation = speculation ?? new SpeculationOptions { Enabled = false },
         };
         using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+        // Every request is admitted before the first step: submitted one by one, the engine sometimes took the first prompt
+        // alone, so the two runs batched their prompts differently (a prompt step rounds by how many rows it holds) and a
+        // near-tie flipped between them for reasons that were not the speculation's.
+        var gate = new ComputeGate();
+        gate.Close();
+        engine.ComputeGate = gate;
         var handles = prompts.Select((p, i) => engine.SubmitRequest(
             new SequenceState($"req{i}", p, maxNew, cfg.BlockSize, SamplingConfig.Greedy))).ToList();
+        gate.Open();
         int[][] outputs = await Task.WhenAll(handles.Select(async h =>
         {
             var tokens = new List<int>();
