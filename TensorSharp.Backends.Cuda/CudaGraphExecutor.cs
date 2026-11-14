@@ -1463,6 +1463,10 @@ namespace TensorSharp.Cuda
             _stepTables = null;
             foreach (Tensor t in _decodeScratchTensors) t.Dispose();
             _decodeScratchTensors.Clear();
+            foreach (Tensor t in _narrowF32.Values) t.Dispose();
+            _narrowF32.Clear();
+            _gemvScratch?.Dispose();
+            _gemvScratch = null;
             _decodeScratch.Clear();
             _moeKernels?.Dispose();
             _moeKernels = null;
@@ -2002,6 +2006,36 @@ namespace TensorSharp.Cuda
             return dk != null && dk.DenseFastReads(type, inDim) ? dk : null;
         }
 
+        /// <summary>Narrow BF16 weights as F32 copies (by cache key), for the split-K GEMV; made on an uncaptured step.</summary>
+        private readonly Dictionary<IntPtr, Tensor> _narrowF32 = new();
+        private Tensor _gemvScratch;
+
+        private unsafe Tensor NarrowF32(CudaAllocator cuda, IntPtr key, IntPtr bf16, long inDim, long outDim)
+        {
+            if (_narrowF32.TryGetValue(key, out Tensor copy)) return copy;
+            if (CudaGraphCapture.IsCapturing(cuda) || key == IntPtr.Zero || inDim % 4 != 0) return null;
+            long n = inDim * outDim;
+            var bits = new ushort[n];
+            cuda.Context.MakeCurrent();
+            cuda.Stream.Synchronize();
+            fixed (ushort* p = bits)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)p, bf16, (UIntPtr)(ulong)(n * sizeof(ushort))).ThrowOnError();
+            var values = new float[n];
+            for (long i = 0; i < n; i++) values[i] = BitConverter.Int32BitsToSingle(bits[i] << 16);
+            copy = new Tensor(Allocator, DType.Float32, outDim, inDim);
+            copy.SetElementsAsFloat(values);
+            ((CudaStorage)copy.Storage).EnsureDeviceCurrent();
+            return _narrowF32[key] = copy;
+        }
+
+        private Tensor GemvScratch(CudaAllocator cuda)
+        {
+            if (_gemvScratch != null) return _gemvScratch;
+            _gemvScratch = new Tensor(Allocator, DType.Float32, Dsv4Kernels.GemvScratchFloats);
+            ((CudaStorage)_gemvScratch.Storage).EnsureDeviceCurrent();
+            return _gemvScratch;
+        }
+
         /// <summary>BF16 products of up to this many rows take the row-invariant kernels (decode steps and verify windows,
         /// several sequences' alike).</summary>
         private const int Bf16DecodeRows = 32;
@@ -2022,7 +2056,7 @@ namespace TensorSharp.Cuda
             // with sums whose order never depends on the row count: a verify window's rows are then a plain decode step's bit
             // for bit, however many sequences share the step. A wide output (a router's 256+ experts) runs on the direct
             // engines' block GEMV (one block an output, every row of the call through it: 4.4 us a 4-row window's router on
-            // an RTX 5090), a narrower one on the one-row matvec a row. The multi-row product had gone to cuBLAS with the
+            // an RTX 5090), a narrower one on the engines' split-K GEMV over an F32 copy. The multi-row product had gone to cuBLAS with the
             // activations rounded to BF16, so a window's router could pick other experts than the same row alone, and took
             // 113 us a product (Qwen3.8 Flash Next, 4-row windows on an A40); a row each then cost 55K launches for 192
             // tokens. A fixed choice by format, width and rows.
@@ -2036,12 +2070,22 @@ namespace TensorSharp.Cuda
                 bs.EnsureDeviceCurrent();
                 cuda.Context.MakeCurrent();
                 IntPtr input = Ptr(x), output = Ptr(product);
-                Dsv4Kernels wide = outDim >= 256 && !(_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing(cuda)))
-                    ? MoeKernels : null;
-                // (The warp-per-output form for narrow outputs left an A40 idle: a 4-row window 27.3 ms against 23.7.)
-                if (wide != null && wide.HasGemvBf16)
+                Dsv4Kernels dsv4 = !(_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing(cuda))) ? MoeKernels : null;
+                // A narrow output (a gated delta net's alpha and beta, a shared expert's gate): the engines' split-K GEMV over an
+                // F32 copy (the BF16 widened exactly), an output's partial sums combined in one order whatever the row count. A
+                // row each on the one-row matvec cost 2.6 ms of a 4-row window's 21.3 (691 launches; Qwen3.8 Flash Next, A40),
+                // and the warp-per-output form left the device idle (27.3 ms a window against 23.7).
+                Tensor narrow = dsv4 != null && outDim < 256 ? NarrowF32(cuda, weight.CacheKey, bPtr, inDim, outDim) : null;
+                if (narrow != null)
+                {
+                    Tensor scratch = GemvScratch(cuda);
                     for (long first = 0; first < rows; first += Dsv4Kernels.GemvMaxRows)
-                        wide.GemvBf16(input + (nint)(first * inDim * sizeof(float)), bPtr, output + (nint)(first * outDim * sizeof(float)),
+                        dsv4.Gemv(input + (nint)(first * inDim * sizeof(float)), Ptr(narrow), output + (nint)(first * outDim * sizeof(float)),
+                            (int)inDim, (int)outDim, (int)Math.Min(Dsv4Kernels.GemvMaxRows, rows - first), cuda.Stream.Handle, Ptr(scratch));
+                }
+                else if (dsv4 != null && outDim >= 256 && dsv4.HasGemvBf16)
+                    for (long first = 0; first < rows; first += Dsv4Kernels.GemvMaxRows)
+                        dsv4.GemvBf16(input + (nint)(first * inDim * sizeof(float)), bPtr, output + (nint)(first * outDim * sizeof(float)),
                             (int)inDim, (int)outDim, (int)Math.Min(Dsv4Kernels.GemvMaxRows, rows - first), cuda.Stream.Handle);
                 else
                     for (long r = 0; r < rows; r++)
