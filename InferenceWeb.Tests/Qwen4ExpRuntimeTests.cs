@@ -387,6 +387,69 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
             $"stages2 qsa={qsa} chunked={chunkedPrompt}");
     }
 
+    /// <summary>Whole-layer stages on two GPUs (--backend cuda --layer-split 2) on the CUDA executor: every row answers as
+    /// one GPU's (the runtime's placement in place of the direct engine's, Qwen4ExpCudaEngineTests.ALayerSplit_AnswersAsOneDevice).</summary>
+    [MultiCudaTheory(2)]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void StagesOnTwoGpusMatchOneGpu(bool qsa, bool chunkedPrompt)
+    {
+        using IDisposable f32 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        string path = Fixture(qsa);
+        ModelBase Staged()
+        {
+            var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda, layerSplitDegree: 2);
+            Assert.Equal(2, model.Mesh.Stages);
+            return model;
+        }
+        AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cuda), chunkedPrompt), Run(Staged, chunkedPrompt), 1e-4,
+            $"cuda stages2 qsa={qsa} chunked={chunkedPrompt}");
+    }
+
+    /// <summary>Per-rank graphs on two GPUs (--backend cuda --tp 2, the P2P all-reduce): every row answers as one GPU's.</summary>
+    [MultiCudaTheory(2)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RankGraphsOnTwoGpusMatchOneGpu(bool qsa)
+    {
+        using IDisposable f32 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-cuda-tp-{qsa}.gguf"), indexerTopK: 64, qsa: qsa,
+            projectionType: SyntheticGguf.GgmlType.BF16, expertGateUpType: SyntheticGguf.GgmlType.BF16, expertDownType: SyntheticGguf.GgmlType.BF16);
+        using var group = new TensorSharp.Cuda.TensorParallelGroup(2);
+        ModelBase Placed()
+        {
+            var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda, tpDegree: 2, tpGroup: group);
+            Assert.Equal(2, model.Mesh.TensorParallel);
+            return model;
+        }
+        // The ranks' BF16 products run on BF16-rounded activations (tensor cores), as Qwen35RuntimeTests'
+        // DirectCudaRankGraphsMatchOneDevice allows: 1.0-3.0e-3 measured on two RTX 2000 Ada.
+        AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cuda), false), Run(Placed, false), 5e-3, $"cuda tp2 qsa={qsa}");
+    }
+
+    /// <summary>Routed experts on the host (--cpu-moe) across two GPU stages: every row answers as one GPU's with its experts
+    /// resident, within the host kernels' rounding (activations to Q8_K, as ggml's CPU backend; this fixture's prompt is
+    /// short enough for the host to compute it).</summary>
+    [MultiCudaFact(2)]
+    public void HostExpertsOnTwoGpuStagesMatchOneGpu()
+    {
+        using IDisposable f32 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        string path = Fixture(qsa: true);
+        float[][] reference = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cuda), false);
+        float[][] offloaded;
+        using (MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests())
+            offloaded = Run(() =>
+            {
+                var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda, layerSplitDegree: 2);
+                Assert.Equal(2, model.Mesh.Stages);
+                return model;
+            }, false);
+        double[] errors = RowErrors(reference, offloaded);
+        // As Qwen35RuntimeTests' host-expert bound (2.5e-2); 4.7-6.6e-3 measured on two RTX 2000 Ada.
+        Assert.True(errors.All(e => e < 2.5e-2), $"cuda stages2 --cpu-moe relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
+    }
+
     /// <summary>A decode step one position on runs again without a trace, its PLE rows and QSA pooled blocks refilled:
     /// every logit is the traced step's, while QSA attends densely and once it selects past its budget (~67 cells on
     /// this fixture: those steps trace again), on one device and over two layer-split stages (each keeps its own step).</summary>

@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 11;
+        public const int CurrentVersion = 12;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
@@ -40,6 +40,9 @@ namespace TensorSharp.Cuda
             _topkMask = module.GetFunction("ts_graph_topk_mask_f32");
             _maskCells = module.GetFunction("ts_graph_mask_cells");
             _sumRows = module.GetFunction("ts_graph_sum_rows_f32");
+            _smallMatvec = module.GetFunction("ts_graph_small_matvec_f32");
+            _countRoutes = module.GetFunction("ts_graph_count_routes");
+            _binaryBcast = module.GetFunction("ts_graph_binary_bcast_f32");
             _hcNorm = module.GetFunction("ts_graph_hc_norm_f32");
             _scaleSilu = module.GetFunction("ts_graph_scale_silu_f32");
             _hcGateMix = module.GetFunction("ts_graph_hc_gate_mix_f32");
@@ -197,7 +200,9 @@ namespace TensorSharp.Cuda
         public void LaunchHcNorm(IntPtr x, IntPtr gamma, IntPtr y, int rows, int n, int hc, float eps, IntPtr stream)
         {
             void** args = stackalloc void*[] { &x, &gamma, &y, &n, &hc, &eps };
-            CudaDriverApi.cuLaunchKernel(_hcNorm, (uint)(rows * hc), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            // Few streams (a decode or verify step): wide blocks; a prompt chunk's many streams fill the device at 256.
+            uint threads = rows * hc < 64 ? 1024u : 256u;
+            CudaDriverApi.cuLaunchKernel(_hcNorm, (uint)(rows * hc), 1, 1, threads, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>y = silu(x * scale) over <paramref name="n"/> contiguous floats.</summary>
@@ -228,6 +233,34 @@ namespace TensorSharp.Cuda
         {
             void** args = stackalloc void*[] { &x, &y, &cols };
             CudaDriverApi.cuLaunchKernel(_sumRows, (uint)rows, 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>y [rows, outs] = x [rows, k] (rows <paramref name="xPitch"/> floats apart) times the F32 weight
+        /// [outs, k] transposed, one block an output and eight rows; for products with few outputs and rows.</summary>
+        public void LaunchSmallMatvec(IntPtr x, IntPtr w, IntPtr y, int rows, int k, int outs, long xPitch, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &w, &y, &rows, &k, &outs, &xPitch };
+            // Threads across k: a float4 each, up to 1024.
+            uint threads = (uint)Math.Clamp(((k + 3) / 4 + 31) / 32 * 32, 32, 1024);
+            CudaDriverApi.cuLaunchKernel(_smallMatvec, (uint)outs, (uint)((rows + 7) / 8), 1, threads, 1, 1, 0, stream, (IntPtr)args,
+                IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>counts[ids[i]] += 1 for the <paramref name="n"/> route ids in [0, <paramref name="experts"/>).</summary>
+        public void LaunchCountRoutes(IntPtr ids, int n, IntPtr counts, int experts, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &ids, &n, &counts, &experts };
+            CudaDriverApi.cuLaunchKernel(_countRoutes, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>out = a op b over a's <paramref name="na"/> extents (ne0 first), b repeating where its
+        /// <paramref name="nb"/> extent is 1; op 0 add, 1 sub, 2 mul, 3 div; contiguous F32.</summary>
+        public void LaunchBinaryBroadcast(IntPtr a, IntPtr b, IntPtr output, long[] na, long[] nb, int op, IntPtr stream)
+        {
+            long n = na[0] * na[1] * na[2] * na[3];
+            long a0 = na[0], a1 = na[1], a2 = na[2], b0 = nb[0], b1 = nb[1], b2 = nb[2], b3 = nb[3];
+            void** args = stackalloc void*[] { &a, &b, &output, &n, &a0, &a1, &a2, &b0, &b1, &b2, &b3, &op };
+            CudaDriverApi.cuLaunchKernel(_binaryBcast, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>ggml_sqrt over <paramref name="n"/> contiguous floats.</summary>

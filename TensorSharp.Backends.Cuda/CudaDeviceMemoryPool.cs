@@ -85,8 +85,9 @@ namespace TensorSharp.Cuda
         // hot return path from calling cuMemGetInfo on every block.
         private readonly Func<long> queryFreeBytes;
         private readonly long minFreeReserveBytes;
+        // ~100 ms: cuMemGetInfo took 86 us an A40 call, and at 10 ms a decode step (~19 ms) paid it every token.
         private static readonly long FreeSampleIntervalTicks =
-            System.Diagnostics.Stopwatch.Frequency / 100; // ~10 ms
+            System.Diagnostics.Stopwatch.Frequency / 10;
         private long lastFreeReading;
         private long lastFreeReadTicks;
 

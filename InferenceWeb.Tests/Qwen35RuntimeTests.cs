@@ -339,6 +339,35 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>Per-rank graphs on two GPUs (the P2P all-reduce of --tp 2) and whole-layer stages on two GPUs
+    /// (--layer-split 2), on the CUDA executor: every row answers as one GPU's (the placements the direct engine never
+    /// served; the 27B NVFP4 on two 16 GB cards needs one of them).</summary>
+    [MultiCudaTheory(2)]
+    [InlineData("dense", 2, 1)]
+    [InlineData("moe-tp", 2, 1)]
+    [InlineData("dense", 1, 2)]
+    [InlineData("moe", 1, 2)]
+    public void DirectCudaPlacementsOnTwoGpusMatchOneGpu(string variant, int tp, int stages)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        List<float[]> reference;
+        using (var single = Create(path, backend: BackendType.Cuda))
+            reference = Script(single);
+        using var group = tp > 1 ? new TensorSharp.Cuda.TensorParallelGroup(tp) : null;
+        using var placed = new Qwen35RuntimeModel(path, BackendType.Cuda, tp, group, stages);
+        Assert.Equal(tp, placed.Mesh.TensorParallel);
+        Assert.Equal(stages, placed.Mesh.Stages);
+        List<float[]> actual = Script(placed);
+        Assert.True(placed.GraphRuns > 0, $"{variant}: no graph ran");
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(actual[i], reference[i]);
+            // As DirectCudaRankGraphsMatchOneDevice: BF16 experts sharded by width round apart; stages are exact.
+            Assert.True(rel <= (variant == "moe-tp" ? 2.5e-2 : 5e-3), $"{variant} tp={tp} stages={stages} row {i}: relL2 {rel:E2}");
+        }
+    }
+
     /// <summary>Speculation on per-rank graphs: each rank's verify keeps its recurrent states' window, and the commit runs
     /// per rank on its own share of the heads; the NextN draft layer runs whole (unsharded) on rank 0.</summary>
     [Fact]
@@ -545,7 +574,14 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData(true)]
     public void QuantizedHostExpertsOnMlxMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Mlx, tier, "moe-quantized");
 
-    private void AssertHostExpertsMatchDevice(BackendType backend, bool tier, string variant = "moe")
+    /// <summary>The staged-ahead path of a long prompt chunk (CudaGraphExecutor.PromptPrefetch: every host expert of the
+    /// next MoE layer copied into the other arena half while a layer runs, the routes kept on the device), driven with
+    /// the fixture's short prompt by lowering this executor's row threshold: the same answers as the device's experts.</summary>
+    [CudaFact]
+    public void PrefetchedHostExpertsOnDirectCudaMatchDeviceExperts()
+        => AssertHostExpertsMatchDevice(BackendType.Cuda, true, "moe-quantized", prefetch: true);
+
+    private void AssertHostExpertsMatchDevice(BackendType backend, bool tier, string variant = "moe", bool prefetch = false)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(variant);
@@ -557,7 +593,21 @@ public sealed class Qwen35RuntimeTests : IDisposable
         if (tier)
             for (int l = 0; l < offloaded.Config.NumLayers; l++)
                 offloaded.SetExpertTierForTests(l, Enumerable.Range(0, offloaded.ExpertCountForTests / 2).ToArray());
+        var cudaExecutor = prefetch ? (TensorSharp.Cuda.CudaGraphExecutor)offloaded.GraphExecutorForTests : null;
+        if (cudaExecutor != null)
+        {
+            cudaExecutor.PrefetchMinRows = 1;
+            // The executor learns the MoE layers' order from a first request; the next prompt stages each layer ahead.
+            Script(offloaded);
+            offloaded.ResetKVCache();
+        }
         List<float[]> actual = Script(offloaded);
+        if (cudaExecutor != null)
+        {
+            _output.WriteLine($"staged-ahead layers {cudaExecutor.PrefetchedLayers}, copied while the previous layer ran {cudaExecutor.PrefetchedAhead}");
+            Assert.True(cudaExecutor.PrefetchedLayers > 0 && cudaExecutor.PrefetchedAhead > 0,
+                $"staged-ahead layers {cudaExecutor.PrefetchedLayers}, ahead {cudaExecutor.PrefetchedAhead}");
+        }
         (long hostRoutes, long streamed) = offloaded.ExpertHostCountsForTests;
         Assert.True(offloaded.GraphRuns > 0, "the offloaded model did not run as graphs");
         Assert.True(hostRoutes > 0 && streamed > 0, $"host routes {hostRoutes}, streamed steps {streamed}");

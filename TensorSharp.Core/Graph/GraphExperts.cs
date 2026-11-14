@@ -74,6 +74,11 @@ namespace TensorSharp.Graph
         /// </summary>
         int TailSkipRank(int layer);
 
+        /// <summary>The most experts the host serves in any one layer (outside the layer's tier): what an executor reserves
+        /// to stage one layer's host experts for a prompt chunk. Fixed for a load: an adaptive trade swaps one expert for
+        /// another.</summary>
+        int MostHostExperts { get; }
+
         /// <summary>
         /// The routed experts of <paramref name="rows"/> rows on the host: <paramref name="x"/> [rows, hidden],
         /// <paramref name="ids"/> and <paramref name="weights"/> [rows, K]; a route whose <paramref name="skip"/> entry

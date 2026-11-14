@@ -11,7 +11,7 @@
 
 #include <cuda_fp16.h>
 
-#define TS_GRAPH_KERNELS_VERSION 11
+#define TS_GRAPH_KERNELS_VERSION 12
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -597,11 +597,12 @@ extern "C" __global__ void ts_graph_moe_wait_add(const unsigned int* flag, const
 
 // ---- hyper-connections (GraphFusion.HcRead / HcScatter): the residual streams [rows][hc][n].
 // The read's grouped norm: each stream of each row RMS-normed (eps inside the root), times the [hc * n] gammas.
-// Launch: grid rows * hc, block 256.
+// Launch: grid rows * hc, block a multiple of 32 up to 1024 (a decode row's four streams take 1024: four blocks of 256
+// left the step's norm latency-bound).
 extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, const float* __restrict__ gamma, float* __restrict__ y,
     int n, int hc, float eps)
 {
-    __shared__ float part[8];
+    __shared__ float part[32];
     const size_t s = blockIdx.x;               // row * hc + stream
     const float* xs = x + s * n;
     const float* g = gamma + (s % hc) * n;
@@ -685,6 +686,102 @@ extern "C" __global__ void ts_graph_sum_rows_f32(const float* __restrict__ x, fl
         for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += part[w];
         y[blockIdx.x] = t;
     }
+}
+
+// y[r][o] = sum over i of x[r][i] * w[o][i] for an F32 weight [outs][k] with few outputs and a few rows, where a GEMV
+// library kernel spreads the outputs alone over the device (a hyper-connection's injection, 4 outputs of 10240, took
+// 49 us on an A40 through cuBLAS). One block an output and up to 8 rows (blockIdx.y the row group), its threads
+// across k; the sums run in a fixed order. x's rows are xPitch floats apart. Launch: grid (outs, ceil(rows / 8)),
+// block a multiple of 32 up to 1024.
+extern "C" __global__ void ts_graph_small_matvec_f32(const float* __restrict__ x, const float* __restrict__ w,
+    float* __restrict__ y, int rows, int k, int outs, long long xPitch)
+{
+    __shared__ float part[32][8];
+    const int o = blockIdx.x, r0 = blockIdx.y * 8;
+    const int nr = min(8, rows - r0);
+    const float* wr = w + (size_t)o * k;
+    const float* xr = x + (size_t)r0 * xPitch;
+    float acc[8];
+#pragma unroll
+    for (int r = 0; r < 8; r++)
+        acc[r] = 0.f;
+    const bool vec = (k & 3) == 0 && (xPitch & 3) == 0 && ((size_t)wr & 15) == 0 && ((size_t)xr & 15) == 0;
+    if (vec)
+    {
+        const float4* w4 = reinterpret_cast<const float4*>(wr);
+        for (int i = threadIdx.x; i < (k >> 2); i += blockDim.x)
+        {
+            const float4 a = w4[i];
+#pragma unroll
+            for (int r = 0; r < 8; r++)
+                if (r < nr)
+                {
+                    const float4 b = reinterpret_cast<const float4*>(xr + (size_t)r * xPitch)[i];
+                    acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+                }
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < k; i += blockDim.x)
+        {
+            const float a = wr[i];
+#pragma unroll
+            for (int r = 0; r < 8; r++)
+                if (r < nr)
+                    acc[r] += a * xr[(size_t)r * xPitch + i];
+        }
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+#pragma unroll
+    for (int r = 0; r < 8; r++)
+    {
+        const float v = ts_graph_warp_sum(acc[r]);
+        if (lane == 0)
+            part[warp][r] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nr)
+    {
+        float t = 0.f;
+        for (int i = 0; i < warps; i++)
+            t += part[i][threadIdx.x];
+        y[(size_t)(r0 + threadIdx.x) * outs + o] = t;
+    }
+}
+
+// A prompt chunk's routes counted per expert on the device (the routing profile and the adaptive tiers read them later):
+// counts[ids[i]] += 1 for every id in [0, experts). Launch: ceil(n / 256), 256.
+extern "C" __global__ void ts_graph_count_routes(const int* __restrict__ ids, int n, unsigned int* __restrict__ counts, int experts)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        const int e = ids[i];
+        if (e >= 0 && e < experts)
+            atomicAdd(counts + e, 1u);
+    }
+}
+
+// ggml's binary ops with b repeating over a (each of b's extents 1 or a's), both contiguous with ne0 innermost:
+// out[i] = a[i] op b[i's coordinates, 0 where b's extent is 1]. op: 0 add, 1 sub, 2 mul, 3 div. Replaces a gather that
+// materialized the repeated b first (a shared expert's [1, rows] gate, a hyper-connection's per-stream weights).
+// Launch: ceil(n / 256), 256.
+extern "C" __global__ void ts_graph_binary_bcast_f32(const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ out, long long n, long long a0, long long a1, long long a2, long long b0, long long b1,
+    long long b2, long long b3, int op)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    long long r = i;
+    const long long i0 = r % a0; r /= a0;
+    const long long i1 = r % a1; r /= a1;
+    const long long i2 = r % a2;
+    const long long i3 = r / a2;
+    const long long j = (((b3 == 1 ? 0 : i3) * b2 + (b2 == 1 ? 0 : i2)) * b1 + (b1 == 1 ? 0 : i1)) * b0 + (b0 == 1 ? 0 : i0);
+    const float x = a[i], y = b[j];
+    out[i] = op == 0 ? x + y : op == 1 ? x - y : op == 2 ? x * y : x / y;
 }
 
 // ggml_sqrt, elementwise over n contiguous floats.

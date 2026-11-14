@@ -596,6 +596,7 @@ namespace TensorSharp.Graph
             /// <summary>Read the outputs into <paramref name="outputs"/>.</summary>
             public void Finish(float[][] outputs, Tensor[] keep = null)
             {
+                _x.FinishWrites();
                 for (int o = 0; o < _outputs.Count; o++)
                 {
                     Tensor c = _x.Contig(_x.F32(Get(_outputs[o]), Run.Owned), Run.Owned);
@@ -616,6 +617,10 @@ namespace TensorSharp.Graph
 
             public void Dispose()
             {
+                // A run that ended early (an exception) still finishes the writes it left for later, while their tensors
+                // live; a failure there is the run's own error again, already on its way out.
+                try { _x.FinishWrites(); }
+                catch (Exception) { }
                 for (int i = 0; i < _count; i++) _own[i]?.Dispose();
                 foreach (Tensor t in Run.Owned) t.Dispose();
                 foreach (Tensor t in Run.Lasting) t.Dispose();
@@ -746,7 +751,7 @@ namespace TensorSharp.Graph
                 }
                 GraphNode n = _nodes[node];
                 Tensor result = n.Op == GraphOp.Add
-                    ? _x.Binary(Get(n.Srcs[0]), Get(n.Srcs[1]), Run, (r, a, b) => Ops.Add(r, a, b))
+                    ? _x.Binary(Get(n.Srcs[0]), Get(n.Srcs[1]), Run, (r, a, b) => Ops.Add(r, a, b), GraphOp.Add)
                     : _x.RowNorm(Get(n.Srcs[0]), Eps(n), Run);
                 Set(node, new Value { Tensor = Run.Keep(result) }, fresh: true);
             }
@@ -1236,6 +1241,7 @@ namespace TensorSharp.Graph
         private Tensor Device(Value[] values, int node, RunState run)
         {
             Value v = values[node];
+            if (PendingWrites && v.Tensor != null) BeforeRead(v.Tensor);
             if (v.Tensor != null || v.HostSizes == null) return v.Tensor;
             var t = run.KeepLasting(new Tensor(Allocator, DType.Float32, v.HostSizes));
             t.SetElementsAsFloat(v.Floats);
@@ -1263,6 +1269,9 @@ namespace TensorSharp.Graph
 
         private Value Eval(GraphNode n, Value[] values, RunState run)
         {
+            if (PendingWrites && n.Srcs != null)
+                foreach (int src in n.Srcs)
+                    if (src >= 0 && values[src].Tensor is { } read) BeforeRead(read);
             Tensor T(int s) => Device(values, n.Srcs[s], run) ?? throw new NotSupportedException($"{n.Op}: source {s} is a quantized weight");
             Value V(Tensor t) => new() { Tensor = run.Keep(t) };
             long Ip(int i, long fallback) => n.Ip != null && n.Ip.Length > i ? n.Ip[i] : fallback;
@@ -1270,10 +1279,10 @@ namespace TensorSharp.Graph
 
             switch (n.Op)
             {
-                case GraphOp.Add: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Add(r, a, b)));
-                case GraphOp.Sub: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Sub(r, a, b)));
-                case GraphOp.Mul: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Mul(r, a, b)));
-                case GraphOp.Div: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Div(r, a, b)));
+                case GraphOp.Add: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Add(r, a, b), GraphOp.Add));
+                case GraphOp.Sub: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Sub(r, a, b), GraphOp.Sub));
+                case GraphOp.Mul: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Mul(r, a, b), GraphOp.Mul));
+                case GraphOp.Div: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Div(r, a, b), GraphOp.Div));
                 case GraphOp.Sqr: { Tensor x = In(T(0), run); return V(Ops.Mul(null, x, x)); }
                 case GraphOp.Sqrt: return V(Sqrt(In(T(0), run)));
                 case GraphOp.Clamp: return V(Ops.Clamp(null, In(T(0), run), Fp(0, float.MinValue), Fp(1, float.MaxValue)));
@@ -1399,7 +1408,7 @@ namespace TensorSharp.Graph
                     if (n.Srcs.Length > 1)
                     {
                         Tensor m = Mask(T(1), Ne(x)[1], run);
-                        Tensor sum = Binary(s, m, run, (r, a, b) => Ops.Add(r, a, b));
+                        Tensor sum = Binary(s, m, run, (r, a, b) => Ops.Add(r, a, b), GraphOp.Add);
                         s.Dispose();
                         s = sum;
                     }
@@ -1426,7 +1435,7 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>ggml's binary ops: b repeats over a (b's extents are ones or a's).</summary>
-        private Tensor Binary(Tensor a, Tensor b, RunState run, Action<Tensor, Tensor, Tensor> op)
+        private Tensor Binary(Tensor a, Tensor b, RunState run, Action<Tensor, Tensor, Tensor> op, GraphOp kind)
         {
             long[] na = Ne(a), nb = Ne(b);
             Tensor ac = In(a, run);
@@ -1442,14 +1451,41 @@ namespace TensorSharp.Graph
             for (int i = 0; i < 4; i++)
                 if (nb[i] != 1 && nb[i] != na[i])
                     throw new NotSupportedException($"binary op repeating [{string.Join(",", nb)}] over [{string.Join(",", na)}]");
+            if (TryBinaryBroadcast(kind, r4, a4, b4, na, nb))
+                return result;
             Tensor be = BroadcastsInKernels ? run.Keep(b4.Expand(Sizes4(na))) : Gathered(b4, Sizes4(na), run);
             op(r4, a4, be);
             return result;
         }
 
+        /// <summary>A binary op (<paramref name="kind"/>: Add, Sub, Mul or Div) whose b repeats over a, in one kernel reading
+        /// b in place; false (the repeated b is materialized first) where the backend has none for these operands.</summary>
+        protected virtual bool TryBinaryBroadcast(GraphOp kind, Tensor result, Tensor a, Tensor b, long[] na, long[] nb) => false;
+
         /// <summary>ggml_sum_rows over a contiguous tensor: the sums of its innermost rows (executors with a kernel
         /// override it).</summary>
         protected virtual Tensor SumRows(Tensor x) => Ops.Sum(null, x, x.DimensionCount - 1);
+
+        /// <summary><paramref name="result"/> [n, m] = <paramref name="rows"/> [n, k] times the F32 <paramref name="weight"/>
+        /// [m, k] transposed (contiguous operands): an unquantized weight's product. A backend with a faster kernel for some
+        /// shapes overrides it.</summary>
+        protected virtual void DenseProduct(Tensor result, Tensor rows, Tensor weight)
+        {
+            using Tensor wt = weight.Transpose();
+            Ops.Addmm(result, 0, result, 1f, rows, wt);
+        }
+
+        /// <summary>Whether the executor queued a write to a node's tensor that it finishes later (<see cref="BeforeRead"/>):
+        /// then every op's sources pass through <see cref="BeforeRead"/> first.</summary>
+        protected bool PendingWrites { get; set; }
+
+        /// <summary>An op is about to read <paramref name="t"/> (called while <see cref="PendingWrites"/> is set): an executor
+        /// that left a write to it for later (a doorbell's host sum, joined after the work that does not need it) finishes
+        /// it now.</summary>
+        protected virtual void BeforeRead(Tensor t) { }
+
+        /// <summary>The run's outputs are about to be read: every write left for later is finished.</summary>
+        protected virtual void FinishWrites() { }
 
         /// <summary>A run (one step's program) begins: an executor drops what it cached for the previous one.</summary>
         protected virtual void BeginRun() { }
@@ -1532,7 +1568,7 @@ namespace TensorSharp.Graph
             if (weight.ElementCount() != cols)
             {
                 Tensor plain = run.Keep(RowNorm(x, eps, run));
-                return new Value { Tensor = run.Keep(Binary(plain, weight, run, (r, a, b) => Ops.Mul(r, a, b))) };
+                return new Value { Tensor = run.Keep(Binary(plain, weight, run, (r, a, b) => Ops.Mul(r, a, b), GraphOp.Mul)) };
             }
             using Tensor rows = x.View(x.ElementCount() / cols, cols);
             using Tensor gamma = Contig(weight, run).View(cols);
@@ -1584,9 +1620,8 @@ namespace TensorSharp.Graph
             {
                 using Tensor a2 = ac.View(m, kd);
                 using Tensor b2 = bc.View(n, kd);
-                using Tensor a2t = a2.Transpose();
                 var r2 = run.Keep(new Tensor(Allocator, DType.Float32, n, m));
-                Ops.Addmm(r2, 0, r2, 1f, b2, a2t);
+                DenseProduct(r2, b2, a2);
                 return run.Keep(r2.View(Sizes(stackalloc long[] { m, n, 1, 1 })));
             }
             Tensor a3 = run.Keep(ac.View(na[2] * na[3], m, kd));
@@ -1751,7 +1786,7 @@ namespace TensorSharp.Graph
                 Tensor d = run.Keep(ExpertMatMul(down, e, act));
                 var w = run.Keep(new Tensor(Allocator, DType.Float32, list.Count, 1));
                 w.SetElementsAsFloat(routeWeights);
-                pieces.Add(run.Keep(Binary(d, w, run, (r, a, b) => Ops.Mul(r, a, b))));
+                pieces.Add(run.Keep(Binary(d, w, run, (r, a, b) => Ops.Mul(r, a, b), GraphOp.Mul)));
                 if (stream && !host.IsResident(layer, e))
                 {
                     ReleaseStreamedExpert(gate.Expert(e));

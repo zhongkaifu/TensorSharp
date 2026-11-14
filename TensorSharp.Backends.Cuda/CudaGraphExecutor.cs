@@ -17,7 +17,7 @@ namespace TensorSharp.Cuda
     /// The direct CUDA backend's executor plugin: programs run node by node on CUDA tensors, with the
     /// backend's quantized products (weights resident under their device cache keys).
     /// </summary>
-    public sealed class CudaGraphExecutor : TensorGraphExecutor, IDisposable, IDecodeCaptureExecutor
+    public sealed partial class CudaGraphExecutor : TensorGraphExecutor, IDisposable, IDecodeCaptureExecutor
     {
         [ModuleInitializer]
         internal static void Register()
@@ -446,8 +446,7 @@ namespace TensorSharp.Cuda
                 if (weights[i] != null) return QuantizedMatMul(weights[i], input);
                 Tensor w = inputs[i];
                 var y = new Tensor(Allocator, DType.Float32, input.Sizes[0], w.Sizes[0]);
-                using Tensor wt = w.Transpose();
-                Ops.Addmm(y, 0, y, 1, input, wt);
+                DenseProduct(y, input, w);
                 return y;
             }
             using var xn = new Tensor(Allocator, DType.Float32, rows, width);
@@ -491,6 +490,32 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+
+        /// <summary>Unquantized products with at most this many rows and outputs take the small-matvec kernel (one block an
+        /// output, threads across the inner dimension): cuBLAS's GEMV spreads only the outputs over the device.</summary>
+        internal const int SmallProductMaxRows = 16, SmallProductMaxOutputs = 64;
+
+        protected override void DenseProduct(Tensor result, Tensor rows, Tensor weight)
+        {
+            long n = rows.Sizes[0], k = rows.Sizes[1], m = weight.Sizes[0];
+            if (Kernels != null && n <= SmallProductMaxRows && m <= SmallProductMaxOutputs && k <= int.MaxValue
+                && AllF32OnDevice(result, rows, weight) && result.IsContiguous() && rows.IsContiguous() && weight.IsContiguous())
+            {
+                Launch(new[] { rows, weight }, result, (kernels, stream) => kernels.LaunchSmallMatvec(Ptr(rows), Ptr(weight), Ptr(result),
+                    (int)n, (int)k, (int)m, k, stream));
+                return;
+            }
+            base.DenseProduct(result, rows, weight);
+        }
+
+        protected override bool TryBinaryBroadcast(GraphOp kind, Tensor result, Tensor a, Tensor b, long[] na, long[] nb)
+        {
+            int op = kind switch { GraphOp.Add => 0, GraphOp.Sub => 1, GraphOp.Mul => 2, GraphOp.Div => 3, _ => -1 };
+            if (op < 0 || Kernels == null || !AllF32OnDevice(result, a, b) || !result.IsContiguous() || !a.IsContiguous() || !b.IsContiguous())
+                return false;
+            Launch(new[] { a, b }, result, (kn, stream) => kn.LaunchBinaryBroadcast(Ptr(a), Ptr(b), Ptr(result), na, nb, op, stream));
+            return true;
+        }
 
         /// <summary>ggml_sum_rows as one kernel (the CUDA reductions run on the host).</summary>
         protected override Tensor SumRows(Tensor x)
@@ -791,6 +816,15 @@ namespace TensorSharp.Cuda
             public IGraphExpertWeights[] Sets;
             public int[][] Words;
             public byte[] Mask;
+            /// <summary>A long prompt chunk's staged-ahead path (CudaGraphExecutor.PromptPrefetch): the host experts in
+            /// slot order, their matrices' bytes, the tables per arena half and the generation they were built for, and
+            /// the routes counted on the device since the last harvest.</summary>
+            public int[] HostList;
+            public long PerExpert;
+            public long[] MemberBytes;
+            public Tensor[][] Half;
+            public long[] HalfGeneration;
+            public Tensor PromptCounts;
         }
 
         private long _countsHarvestedAt = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -849,6 +883,7 @@ namespace TensorSharp.Cuda
                 }
                 t.Mask[into] = 1;
                 t.Mask[outOf] = 0;
+                TierMoved(t);
                 host.CommitSwap(layer, outOf, into);
                 dirty.Add(t);
             }
@@ -881,6 +916,7 @@ namespace TensorSharp.Cuda
             if (!force && now - _countsHarvestedAt < HarvestSeconds * System.Diagnostics.Stopwatch.Frequency) return;
             if (CudaGraphCapture.IsCapturing(cuda)) return;
             _countsHarvestedAt = now;
+            HarvestPromptCounts();
             HostedTables[] layers;
             lock (_hostedTables) layers = new List<HostedTables>(_hostedTables.Values).ToArray();
             var ids = new List<int>();
@@ -915,6 +951,10 @@ namespace TensorSharp.Cuda
             if (gateValue.Weight is IGraphHostedExperts gate && upValue.Weight is IGraphExpertWeights up
                 && downValue.Weight is IGraphExpertWeights down)
             {
+                // Every MoE layer the executor meets is remembered, so a long prompt chunk stages each next layer ahead.
+                if (!_moeLayers.ContainsKey(layer) && gate.Format == up.Format)
+                    _moeLayers[layer] = Tables(gate, up, down, layer);
+                SizeStagingArenas(gate, up, down);
                 if (TryDoorbellExperts(x, selected, weightValue, gate, up, down, layer, out Tensor result)
                     || TryStagedExperts(x, selected, weightValue, gate, up, down, layer, out result))
                     return result;
@@ -946,6 +986,8 @@ namespace TensorSharp.Cuda
             int k = (int)nid[0], rows = (int)nid[1];
             if ((long)rows * hidden != x.ElementCount() || !gate.Host.StreamsStep(layer, rows))
                 return false;
+            if (TryPrefetchedExperts(x, selected, weightValue, gate, up, down, layer, rows, k, out result))
+                return true;
             int[] ids = Ints(selected);
             float[] weights = weightValue.Floats ?? weightValue.Tensor.GetElementsAsFloat(rows * k);
             gate.Host.Record(layer, ids, GraphExpertAdapt.Weight(rows));
@@ -1029,7 +1071,7 @@ namespace TensorSharp.Cuda
             if ((long)staged.Count * perExpert <= _stagingBytes
                 && TryStagedTables(selected, weightValue, sets, resident, staged, memberBytes, perExpert, Source, experts, layer))
             {
-                if (TryGroupedMoe(x2, output, selected.Tensor, weightValue.Tensor, sets, rows, k, hidden, ff, experts)
+                if (TryGroupedMoe(x2, output, selected.Tensor, weightValue.Tensor, sets, _stepTables, rows, k, hidden, ff, experts)
                     || (rows <= StagedPerRowMaxRows && TryStagedPerRow(x2, output, selected, weightValue, sets, rows, k, hidden, ff, experts)))
                 {
                     result = output;
@@ -1185,17 +1227,13 @@ namespace TensorSharp.Cuda
         /// one, and the weighted scatter) over this step's pointer tables, the router's ids and weights as they are.
         /// False, with nothing launched, for a layout or width the kernels do not take.
         /// </summary>
-        private bool TryGroupedMoe(Tensor x2, Tensor output, Tensor sel, Tensor w, IGraphExpertWeights[] sets, int rows, int k,
-            int hidden, int ff, int experts)
+        private bool TryGroupedMoe(Tensor x2, Tensor output, Tensor sel, Tensor w, IGraphExpertWeights[] sets, Tensor[] tables, int rows,
+            int k, int hidden, int ff, int experts)
         {
             var cuda = (CudaAllocator)Allocator;
             Dsv4Kernels dk = MoeKernels;
             int gateType = sets[0].Format, upType = sets[1].Format, downType = sets[2].Format;
-            if (dk == null || cuda.Kernels == null || gateType != upType
-                || !CudaMoe.GroupedSupportsType(gateType, dk.DecodesLowBitIqExperts, dk.DecodesLegacyQuants)
-                || !CudaMoe.GroupedSupportsType(downType, dk.DecodesLowBitIqExperts, dk.DecodesLegacyQuants)
-                || CudaMoe.SelectRoute(rows, GroupedPerSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, gateType, downType, hidden, ff,
-                    dk.DecodesLegacyQuants) == CudaMoe.ExpertRoute.Warp)
+            if (!GroupedTakes(sets, rows, hidden, ff))
                 return false;
             var owned = new List<Tensor>();
             try
@@ -1214,9 +1252,9 @@ namespace TensorSharp.Cuda
                     Ops.Copy(wDst, weights);
                 }
                 long RowBytes(IGraphExpertWeights set) => set.Expert(0).Bytes / set.Ne1;
-                var gate = new DeviceWeight { Type = gateType, Ne0 = hidden, Ne1 = ff, RowBytes = RowBytes(sets[0]), Table = Ptr(_stepTables[0]) };
-                var up = new DeviceWeight { Type = upType, Ne0 = hidden, Ne1 = ff, RowBytes = RowBytes(sets[1]), Table = Ptr(_stepTables[1]) };
-                var down = new DeviceWeight { Type = downType, Ne0 = ff, Ne1 = hidden, RowBytes = RowBytes(sets[2]), Table = Ptr(_stepTables[2]) };
+                var gate = new DeviceWeight { Type = gateType, Ne0 = hidden, Ne1 = ff, RowBytes = RowBytes(sets[0]), Table = Ptr(tables[0]) };
+                var up = new DeviceWeight { Type = upType, Ne0 = hidden, Ne1 = ff, RowBytes = RowBytes(sets[1]), Table = Ptr(tables[1]) };
+                var down = new DeviceWeight { Type = downType, Ne0 = ff, Ne1 = hidden, RowBytes = RowBytes(sets[2]), Table = Ptr(tables[2]) };
                 foreach (Tensor t in new[] { x2, output }) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
                 cuda.Context.MakeCurrent();
                 CudaMoe.Experts(dk, cuda.Kernels, scratch, gate, up, down, x2, null, output, rows, k, experts, hidden, ff, 0f,
@@ -1229,6 +1267,18 @@ namespace TensorSharp.Cuda
                 // The kernels are queued on the allocator's stream: the scratch returns to its pool for later work there.
                 foreach (Tensor t in owned) t.Dispose();
             }
+        }
+
+        /// <summary>Whether the grouped MoE kernels take a chunk of <paramref name="rows"/> rows of these experts.</summary>
+        private bool GroupedTakes(IGraphExpertWeights[] sets, int rows, int hidden, int ff)
+        {
+            Dsv4Kernels dk = MoeKernels;
+            int gateType = sets[0].Format, downType = sets[2].Format;
+            return dk != null && ((CudaAllocator)Allocator).Kernels != null && gateType == sets[1].Format
+                && CudaMoe.GroupedSupportsType(gateType, dk.DecodesLowBitIqExperts, dk.DecodesLegacyQuants)
+                && CudaMoe.GroupedSupportsType(downType, dk.DecodesLowBitIqExperts, dk.DecodesLegacyQuants)
+                && CudaMoe.SelectRoute(rows, GroupedPerSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, gateType, downType, hidden, ff,
+                    dk.DecodesLegacyQuants) != CudaMoe.ExpertRoute.Warp;
         }
 
         /// <summary>Rows the grouped MoE path runs on its per-slot kernels (the engines' decode-window bound).</summary>
@@ -1258,6 +1308,14 @@ namespace TensorSharp.Cuda
                 _stagingBytes = 0;
             }
             CudaDriverApi.cuMemGetInfo(out UIntPtr free, out _).ThrowOnError();
+            if ((long)free.ToUInt64() - StagingFreeFloorBytes < Math.Min(need, StagingArenaCapBytes))
+            {
+                // The memory pool keeps the blocks earlier steps returned: release them before settling for a smaller
+                // arena (a capped arena runs a long chunk's staged experts one at a time).
+                cuda.TrimPool();
+                cuda.Context.MakeCurrent();
+                CudaDriverApi.cuMemGetInfo(out free, out _).ThrowOnError();
+            }
             long room = Math.Min(StagingArenaCapBytes, (long)free.ToUInt64() - StagingFreeFloorBytes);
             long bytes = Math.Min(need, room) / perExpert * perExpert;
             if (bytes < perExpert) return false;
@@ -1286,6 +1344,7 @@ namespace TensorSharp.Cuda
             catch (CudaException) { }
             _doorbell?.Dispose();
             _doorbell = null;
+            DisposePrefetch();
             cuda.Context.MakeCurrent();
             if (_stagingArena != IntPtr.Zero)
             {
@@ -1328,6 +1387,8 @@ namespace TensorSharp.Cuda
             HostedTables tables = Tables(gate, up, down, layer);
             if (_doorbell != null && (_doorbell.Hidden != hidden || _doorbell.RoutesPerRow != k))
                 return false;   // another shape already has the executor's mailbox
+            // The mailbox holds one request: the previous layer's host sum is added before this layer rings.
+            FinishJoins();
             if (_doorbell == null)
             {
                 _doorbell = new CudaExpertDoorbell(cuda, hidden, k);
@@ -1371,11 +1432,48 @@ namespace TensorSharp.Cuda
                 throw new NotSupportedException($"layer {layer}: the CUDA MoE kernels do not take these experts ({experts} experts, top-{k}, "
                     + $"types {gate.Format}/{down.Format}, {hidden}x{ff}, {rows} row(s))");
             }
-            Launch(Array.Empty<Tensor>(), output, (kn, stream) => kn.LaunchMoeWaitAdd(bell.Box, Ptr(output), sum, bell.MissDev, stream));
-            if (bell.Error is { } error)
-                throw new InvalidOperationException($"layer {layer}: the host experts failed", error);
+            // The host's sum joins when something first reads the output: the work the program emits before that (a shared
+            // expert reading the same input) runs on the device while the host computes, ahead of the wait.
+            _joins.Add(((CudaStorage)output.Storage, () =>
+            {
+                Launch(Array.Empty<Tensor>(), output, (kn, stream) => kn.LaunchMoeWaitAdd(bell.Box, Ptr(output), sum, bell.MissDev, stream));
+                if (bell.Error is { } error)
+                    throw new InvalidOperationException($"layer {layer}: the host experts failed", error);
+            }));
+            PendingWrites = true;
             result = output;
             return true;
+        }
+
+        /// <summary>Doorbell sums not yet added (the output's storage, the wait-add that finishes it).</summary>
+        private readonly List<(CudaStorage Storage, Action Finish)> _joins = new();
+
+        protected override void BeforeRead(Tensor t)
+        {
+            if (t.Storage is not CudaStorage storage) return;
+            for (int i = 0; i < _joins.Count; i++)
+            {
+                if (!ReferenceEquals(_joins[i].Storage, storage)) continue;
+                Action finish = _joins[i].Finish;
+                _joins.RemoveAt(i);
+                PendingWrites = _joins.Count > 0;
+                finish();
+                return;
+            }
+        }
+
+        protected override void FinishWrites() => FinishJoins();
+
+        private void FinishJoins()
+        {
+            while (_joins.Count > 0)
+            {
+                Action finish = _joins[0].Finish;
+                _joins.RemoveAt(0);
+                PendingWrites = _joins.Count > 0;
+                finish();
+            }
+            PendingWrites = false;
         }
 
         /// <summary>The device tables of a stack of offloaded experts: tier members (resident on this device) by their
@@ -1617,6 +1715,8 @@ namespace TensorSharp.Cuda
         {
             foreach (Tensor t in _quantized.Values) t.Dispose();
             _quantized.Clear();
+            _runOrdinal++;
+            HarvestPromptCounts();
         }
 
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
@@ -1640,6 +1740,7 @@ namespace TensorSharp.Cuda
                     _quantized[key] = xq;
                 }
                 var product = new Tensor(Allocator, DType.Float32, rows, outDim);
+                ((CudaStorage)product.Storage).EnsureDeviceCurrent();
                 cuda.Context.MakeCurrent();
                 if (CudaQuantizedOps.TryResidentMatmulQ81(cuda, wPtr, type, Ptr(xq), Ptr(product), (int)inDim, (int)outDim, (int)rows))
                 {

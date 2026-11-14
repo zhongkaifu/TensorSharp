@@ -28,7 +28,8 @@ namespace TensorSharp.Cuda
     {
         private const long Page = 4096;
         private static readonly object Sync = new();
-        private static readonly SortedDictionary<long, (long End, CudaHostPins Owner)> Ranges = new();
+        // Disjoint, sorted by start (so by end too): found by binary search, as a host's experts pin as thousands of runs.
+        private static readonly SortedList<long, (long End, CudaHostPins Owner)> Ranges = new();
         private static readonly long Budget = Math.Max(0, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / 10 * 6);
         private static long _pinned;
         private static bool _refused;
@@ -50,12 +51,12 @@ namespace TensorSharp.Cuda
                 // The gaps of [start, end) between the registered ranges.
                 long at = start;
                 var gaps = new List<(long, long)>();
-                foreach (var (s, r) in Ranges)
+                for (int i = FirstEndingAfter(start); i < Ranges.Count; i++)
                 {
-                    if (r.End <= at) continue;
+                    long s = Ranges.Keys[i], rEnd = Ranges.Values[i].End;
                     if (s >= end) break;
                     if (s > at) gaps.Add((at, s));
-                    at = Math.Max(at, r.End);
+                    at = Math.Max(at, rEnd);
                 }
                 if (at < end) gaps.Add((at, end));
                 if (gaps.Count == 0) return true;
@@ -92,12 +93,12 @@ namespace TensorSharp.Cuda
             long at = src.ToInt64(), end = at + bytes;
             var cuts = new List<long>();
             lock (Sync)
-                foreach (var (s, r) in Ranges)
+                for (int i = FirstEndingAfter(at); i < Ranges.Count; i++)
                 {
-                    if (r.End <= at) continue;
+                    long s = Ranges.Keys[i], rEnd = Ranges.Values[i].End;
                     if (s >= end) break;
                     if (s > at) cuts.Add(s);
-                    if (r.End < end) cuts.Add(r.End);
+                    if (rEnd < end) cuts.Add(rEnd);
                 }
             cuts.Add(end);
             cuts.Sort();
@@ -113,6 +114,21 @@ namespace TensorSharp.Cuda
                 at = cut;
             }
             return 0;
+        }
+
+        /// <summary>The index of the first registered range ending past <paramref name="at"/> (Count if none); under the lock.</summary>
+        private static int FirstEndingAfter(long at)
+        {
+            IList<long> keys = Ranges.Keys;
+            int lo = 0, hi = keys.Count - 1, last = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (keys[mid] <= at) { last = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            // The range starting at or before at covers it when it ends past it; the next one starts after it.
+            return last >= 0 && Ranges.Values[last].End > at ? last : last + 1;
         }
 
         public void Dispose()

@@ -194,6 +194,21 @@ namespace TensorSharp.Cuda
             }
         }
 
+        /// <summary>The host writes not yet on the device copied to <paramref name="destination"/> (pinned memory a recorded
+        /// step's copy node reads; <see cref="ByteLength"/> bytes) instead of uploaded now. The device copy counts as the
+        /// current one from here (the recorded copy delivers these bytes before any kernel reads them).</summary>
+        internal unsafe void TakeHostWrites(IntPtr destination)
+        {
+            ThrowIfDisposed();
+            lock (sync)
+            {
+                if (hostDirty && hostBuffer != IntPtr.Zero)
+                    Buffer.MemoryCopy(hostBuffer.ToPointer(), destination.ToPointer(), ByteLength, ByteLength);
+                hostDirty = false;
+                deviceDirty = true;
+            }
+        }
+
         internal void MarkDeviceModified()
         {
             ThrowIfDisposed();

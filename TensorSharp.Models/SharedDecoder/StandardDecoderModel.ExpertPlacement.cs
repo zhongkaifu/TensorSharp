@@ -92,7 +92,7 @@ namespace TensorSharp.Models
             var cancel = _hostWarmCancel.Token;
             GgufFile gguf = _gguf;
             string arch = Config.Architecture;
-            List<(IntPtr Pointer, long Bytes)> stacks = StagedExpertStacks();
+            List<(IntPtr Pointer, long Bytes)> stacks = HostExpertRuns();
             IHostRangePinner pinner = stacks.Count > 0 ? _allocator as IHostRangePinner : null;
             _hostWarm = System.Threading.Tasks.Task.Run(() =>
             {
@@ -159,19 +159,35 @@ namespace TensorSharp.Models
         /// <summary>The page-locked file ranges of the offloaded experts (<see cref="IHostRangePinner"/>), or null.</summary>
         private IDisposable _hostPins;
 
-        /// <summary>The whole gate, up and down stacks of every offloaded layer on a tensor executor: a prompt chunk stages
-        /// the experts its device tier does not hold from them.</summary>
-        private List<(IntPtr Pointer, long Bytes)> StagedExpertStacks()
+        /// <summary>
+        /// The runs of host-served experts in every offloaded layer's gate, up and down stacks on a tensor executor: the
+        /// experts a prompt chunk stages (the tier's members are copied to the device at load). Locking only these keeps
+        /// the locked total at the host's share - Flash Next UD-Q2_K_XL on an A40: 9.5 GB, not the 46 GB of whole stacks,
+        /// which also outran the pin budget of a 50 GB container and left a third of the layers' copies pageable (each one
+        /// then blocked the thread that launches the step). Experts an adaptive trade moves to the host later are locked
+        /// by the executor when it first stages them.
+        /// </summary>
+        private List<(IntPtr Pointer, long Bytes)> HostExpertRuns()
         {
-            var stacks = new List<(IntPtr, long)>();
-            if (IsGgmlBackend || _expertOnHost == null) return stacks;
+            var runs = new List<(IntPtr, long)>();
+            if (IsGgmlBackend || _expertOnHost == null) return runs;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (!_expertOnHost[l] || !TryGetLayerExperts(l, out var gate, out var up, out var down)) continue;
+                var held = new HashSet<int>(_tierExperts?[l] ?? Array.Empty<int>());
                 foreach (StackedExpertWeights w in new[] { gate, up, down })
-                    if (w != null && w.Data != IntPtr.Zero) stacks.Add((w.Data, w.TotalRawBytes));
+                {
+                    if (w == null || w.Data == IntPtr.Zero) continue;
+                    for (int e = 0; e < _numExperts;)
+                    {
+                        if (held.Contains(e)) { e++; continue; }
+                        int first = e;
+                        while (e < _numExperts && !held.Contains(e)) e++;
+                        runs.Add((w.Data + (nint)(first * w.PerExpertRawBytes), (e - first) * w.PerExpertRawBytes));
+                    }
+                }
             }
-            return stacks;
+            return runs;
         }
 
         /// <summary>A host-only table is read a few rows a token, on demand: warming every row at load read 28.8 GB

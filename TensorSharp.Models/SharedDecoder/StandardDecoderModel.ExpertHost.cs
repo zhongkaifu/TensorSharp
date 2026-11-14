@@ -60,6 +60,24 @@ namespace TensorSharp.Models
                 return _tailRank;
             }
 
+            public int MostHostExperts
+            {
+                get
+                {
+                    if (_deviceIsHost) return 0;
+                    int most = 0;
+                    for (int l = 0; l < _tier.Length; l++)
+                    {
+                        if (!_m.IsExpertLayerOffloaded(l)) continue;
+                        int host = _m._numExperts;
+                        if (_tier[l] is { } held)
+                            foreach (bool h in held) if (h) host--;
+                        most = Math.Max(most, host);
+                    }
+                    return most;
+                }
+            }
+
             /// <summary>Keep <paramref name="experts"/> of <paramref name="layer"/> on the executor's device.</summary>
             public void SetTier(int layer, int[] experts)
             {
@@ -194,6 +212,9 @@ namespace TensorSharp.Models
 
         /// <summary>Test seam: the route-tail skip this model's expert host applies (set before the first offloaded step).</summary>
         internal (int Rank, int MaxCachedPercent)? RouteTailSkipForTests { get; set; }
+
+        /// <summary>The executor the model's graphs run on (a test sets a backend executor's own thresholds).</summary>
+        internal TensorSharp.Graph.IGraphExecutor GraphExecutorForTests => GraphExecutor;
 
         /// <summary>The expert host of an offloaded <paramref name="layer"/> on a tensor executor, or null (a resident layer,
         /// or the GGML backends).</summary>
