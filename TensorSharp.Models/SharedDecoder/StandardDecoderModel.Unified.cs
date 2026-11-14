@@ -61,22 +61,51 @@ namespace TensorSharp.Models
                 long free;
                 try { free = cuda.GetMemoryInfo().freeBytes + cuda.GetStats().CachedBytes; }
                 catch (Exception) { return 0; }
-                _cudaPromptRows = (int)Math.Clamp((free - CudaPromptReserveBytes) / CudaPromptRowBytes() / 256 * 256, 256, int.MaxValue);
+                _cudaPromptRows = (int)Math.Clamp((free - CudaPromptReserveBytes) / CudaPromptRowBytes() / 256 * 256, 256, MaxCudaPromptStepRows);
+            }
+            int rows = Math.Min(_cudaPromptRows, remaining);
+            // What the first prompt found may be held since: recorded steps keep the pool blocks their kernels used, a
+            // speculating request its verify buffers, retained slots their caches (an RTX PRO 6000 slice ran out of memory
+            // part way through the second 4K prompt of a speculating run). The recordings go first (they record again);
+            // a step that still does not fit is narrower, this prompt only.
+            long need = rows * CudaPromptRowBytes() + CudaPromptReserveBytes;
+            if (CudaFreeBytes(cuda) < need)
+            {
+                ClearGraphCache();
+                long now = CudaFreeBytes(cuda);
+                if (now < need)
+                    return (int)Math.Clamp((now - CudaPromptReserveBytes) / CudaPromptRowBytes() / 256 * 256, 256, _cudaPromptRows);
             }
             return remaining <= _cudaPromptRows ? 0 : _cudaPromptRows;
         }
 
+        /// <summary>The device's free bytes and its pool's cached ones (long.MaxValue when unknown).</summary>
+        private static long CudaFreeBytes(TensorSharp.Cuda.CudaAllocator cuda)
+        {
+            try { return cuda.GetMemoryInfo().freeBytes + cuda.GetStats().CachedBytes; }
+            catch (Exception) { return long.MaxValue; }
+        }
+
         private int _cudaPromptRows;
 
-        /// <summary>A prompt row's activations at their peak, in bytes: the feed-forward's (gate and up, their product,
-        /// the dequantized products' F16 copies) and some dozen hidden-wide rows (the stream, norms, projections), F32.</summary>
+        /// <summary>The widest lone-prompt step the model chooses: wider ones were slower where the memory allowed them
+        /// (Qwen3.8 Flash Next on an A40, a 3.6K-token prompt in one step 6.1 s against 2.1 s in 2,816 + 794 rows; UD-Q2_K_XL
+        /// on a 16 GB RTX 2000 Ada, 2,560-row steps 11.5 s against 7.2 s in 2,048-row ones).</summary>
+        private const int MaxCudaPromptStepRows = 2048;
+
+        /// <summary>A prompt row's activations at their peak, in bytes, about twice what the CUDA executor's steps peak at
+        /// (its pool's live bytes over a step, 11-14 on an RTX 2000 Ada and an RTX PRO 6000 slice): Qwen3.8 Flash Next
+        /// 329 KB a row (ff 25,600, a 10,240-float stream), Qwen3.8-27B 196 KB (ff 17,408, 5,120), i.e. about 1.8 ff and
+        /// 3.8 stream-wide F32 rows (the executor frees each layer's activations after their last reader). The estimate
+        /// had been 6 ff and 48 rows (2,520 and 1,368 KB): a 16 GB card then read a 4K prompt in 512-row steps, 19.7 s
+        /// against 7.2 s in 2,048-row ones, each step streaming the offloaded experts once.</summary>
         private long CudaPromptRowBytes()
         {
             long ff = Config.IntermediateSize;
             foreach (var stacked in _stackedExpertWeights.Values)
                 ff = Math.Max(ff, stacked.PerExpertNe1 * Math.Max(1, _expertsUsed));
             long width = Math.Max(Config.HiddenSize, StreamWidth);
-            return 4L * (6 * ff + 48 * width);
+            return 4L * (3 * ff + 8 * width);
         }
 
         public int EnsureSequenceSlot(string requestId, int reserveTokens)
