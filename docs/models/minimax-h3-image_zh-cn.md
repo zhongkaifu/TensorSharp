@@ -29,6 +29,9 @@ TensorSharp 通过 `MiniMaxH3ImageModel` 在 ggml 后端上运行文生图。已
 
 去噪器直接从 safetensors 文件按原始张量名读取，无需转换为 GGUF。包含相同张量的
 GGUF（用于更小的量化）同样可以加载，依据张量识别（没有 `audio_patch_proj` 的 H3 DiT）。
+这也包括 ComfyUI-GGUF 转换工具生成的 GGUF，例如
+[unsloth/MiniMax-H3-Image-GGUF](https://huggingface.co/unsloth/MiniMax-H3-Image-GGUF)：
+它们声明 `general.architecture = hyvid`，这个标签并不指向本模型，因此由张量决定。
 ComfyUI 自己的量化重打包（`*_int8_convrot`、`*_w4a8`）以 ggml 没有对应类型的格式存储
 投影，会被拒绝，并在提示中给出 bf16 文件名。
 

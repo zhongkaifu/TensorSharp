@@ -13,6 +13,8 @@ namespace TensorSharp.Models.MiniMaxH3
     /// before any GGUF probe; a GGUF with the same tensors is recognised by them.</summary>
     internal static class MiniMaxH3ImageArchitecture
     {
+        private const string HyVidLabel = "hyvid";
+
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
             Id = MiniMaxH3ImageModel.ArchitectureId,
@@ -20,6 +22,15 @@ namespace TensorSharp.Models.MiniMaxH3
             Aliases = new[] { MiniMaxH3ImageModel.ArchitectureId, "minimax_h3_image" },
             Factory = c => new MiniMaxH3ImageModel(c.GgufPath, c.Backend),
             DetectFromTensors = MiniMaxH3ImageModel.LooksLikeMiniMaxH3Image,
+            // ComfyUI-GGUF's converter labels the quantized denoisers it writes 'hyvid'
+            // (unsloth/MiniMax-H3-Image-GGUF); the label never names this model, so the
+            // tensors decide, as for an unlabelled file.
+            RecognizeRelabelledFile = (label, gguf) =>
+                string.Equals(label, HyVidLabel, System.StringComparison.OrdinalIgnoreCase)
+                && MiniMaxH3ImageModel.LooksLikeMiniMaxH3Image(gguf),
+            RelabelledFileDescription =
+                "a '" + HyVidLabel + "'-labelled GGUF from ComfyUI-GGUF's converter whose tensors are the " +
+                "MiniMax-H3-Image denoiser (the H3 DiT with no audio stream) - e.g. unsloth/MiniMax-H3-Image-GGUF",
             Serving = new ServingContract
             {
                 Implementation = ServingImplementation.Bespoke,

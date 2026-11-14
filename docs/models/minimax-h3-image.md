@@ -33,7 +33,10 @@ same native graphs but have not been run with it yet. Editing with reference ima
 The denoiser is read from the safetensors file directly, in its original tensor
 names: there is no GGUF to make. A GGUF holding the same tensors (for a smaller
 quantization) loads as well; it is recognised by its tensors (the H3 DiT with no
-`audio_patch_proj`). ComfyUI's own quantized repacks (`*_int8_convrot`, `*_w4a8`)
+`audio_patch_proj`). That includes the GGUFs ComfyUI-GGUF's converter writes, such
+as [unsloth/MiniMax-H3-Image-GGUF](https://huggingface.co/unsloth/MiniMax-H3-Image-GGUF):
+they declare `general.architecture = hyvid`, a label that never names this model, so
+the tensors decide. ComfyUI's own quantized repacks (`*_int8_convrot`, `*_w4a8`)
 store the projections in formats ggml has no type for and are refused with a
 message naming the bf16 file.
 
