@@ -278,7 +278,9 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         [("gptoss", 96)] = (0.037, 0.061, 0.11),
         [("gptoss", 97)] = (0.047, 0.056, 0.063),
         [("qwen35moe", 96)] = (0.072, 0.090, 0.19),
-        [("qwen35moe", 97)] = (0.049, 0.11, 0.23),
+        // Worst row 0.232 since decode-size products run on the decode-once kernels (q8_1 activations, a verify window's
+        // rows a decode step's bit for bit): this random router's near-ties flip (A40, 2026-11-14).
+        [("qwen35moe", 97)] = (0.049, 0.11, 0.25),
         [("qwen35", 96)] = (0.0025, 0.0032, 0.0042),
         [("qwen35", 97)] = (0.0029, 0.0029, 0.0042),
         [("gemma4moe_global", 96)] = (0.0056, 0.0082, 0.017),
@@ -348,7 +350,9 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     private static double ChunkTolerance(string family, int length, int[] chunks, int row) => family switch
     {
         "gptoss" => row == 0 ? 0.0075 : 0.0068,
-        "qwen35moe" => row == 0 ? 0.0075 : 0.015,
+        // Row 0 up to 1.58e-2 ([64]: RTX PRO 6000 slice and RTX 2000 Ada; [1,15,33] 8.1e-3 on an A40) since decode-size
+        // products run on the decode-once kernels (q8_1 activations where some went F32): this random router's near-ties.
+        "qwen35moe" => row == 0 ? 0.02 : 0.015,
         // [24,24,24] at 97 tokens on an A40 (sm_86) since prompt chunks run the chunked Gated DeltaNet (WY form,
         // BF16-split operands: the direct engine's arithmetic) and the flash prefill attention: row 0 1.49e-3 and the
         // decode rows up to 3.86e-4; with the per-row kernel 0.93e-3 and 2.0e-4, with neither 0.89e-3 (row 0 of [64] at 96
@@ -928,7 +932,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     private static readonly Dictionary<string, double> BatchedVsSolo = new()
     {
         ["qwen35"] = 0.0048,
-        ["qwen35moe"] = 0.011,
+        ["qwen35moe"] = 0.013,   // 1.126e-2 on an RTX PRO 6000 slice with the decode-once kernels (decode-size rows)
     };
 
     [CudaTheory]

@@ -1719,6 +1719,17 @@ namespace TensorSharp.Cuda
             HarvestPromptCounts();
         }
 
+        /// <summary>The decode-once kernels' module where they take a decode-size product of this weight (up to 8 rows of a
+        /// 2-D weight in one of their formats), else null.</summary>
+        private Dsv4Kernels DecodeOnce(int type, long inDim, long rows, IGraphWeight weight)
+        {
+            if (rows > 8 || weight.Ne2 > 1 || weight.Bytes % weight.Ne1 != 0) return null;
+            // The module loads on an uncaptured step (never inside a recording).
+            if (_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing((CudaAllocator)Allocator))) return null;
+            Dsv4Kernels dk = MoeKernels;
+            return dk != null && dk.DenseFastReads(type, inDim) ? dk : null;
+        }
+
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
             var cuda = (CudaAllocator)Allocator;
@@ -1727,7 +1738,7 @@ namespace TensorSharp.Cuda
             if (rows >= 1 && rows <= 16 && x.Storage is CudaStorage xs && x.ElementType == DType.Float32 && x.IsContiguous()
                 && x.ElementCount() == rows * inDim && inDim % 32 == 0 && inDim <= int.MaxValue && outDim <= int.MaxValue
                 && cuda.Kernels != null && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type)
-                && CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows))
+                && (DecodeOnce(type, inDim, rows, weight) is not null || CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows)))
             {
                 var key = (xs, x.StorageOffset, inDim, rows);
                 if (!_quantized.TryGetValue(key, out Tensor xq))
@@ -1742,7 +1753,19 @@ namespace TensorSharp.Cuda
                 var product = new Tensor(Allocator, DType.Float32, rows, outDim);
                 ((CudaStorage)product.Storage).EnsureDeviceCurrent();
                 cuda.Context.MakeCurrent();
-                if (CudaQuantizedOps.TryResidentMatmulQ81(cuda, wPtr, type, Ptr(xq), Ptr(product), (int)inDim, (int)outDim, (int)rows))
+                // Up to 8 rows of a format the direct engines' decode-once kernels read run on them: a row's sums never depend
+                // on how many rows the call holds, so a verify window's rows are a plain decode step's bit for bit (a
+                // speculative step answers as the plain greedy stream), and a K-quant window no longer goes through a
+                // dequantizing product (3-5x slower on an A40, an RTX 2000 Ada and an RTX PRO 6000 slice). A fixed choice
+                // by format and rows, never by timing (the per-type q8_1 kernels round apart in the last bits).
+                if (DecodeOnce(type, inDim, rows, weight) is { } dk)
+                {
+                    dk.DenseQ81Rows(wPtr, Ptr(xq), Ptr(product), type, (int)outDim, (int)inDim, weight.Bytes / outDim, (int)rows, cuda.Stream.Handle);
+                    ((CudaStorage)product.Storage).MarkDeviceModified();
+                    return product;
+                }
+                if (CudaQuantizedOps.ResidentMatmulTakesQ81(type, (int)inDim, (int)outDim, (int)rows)
+                    && CudaQuantizedOps.TryResidentMatmulQ81(cuda, wPtr, type, Ptr(xq), Ptr(product), (int)inDim, (int)outDim, (int)rows))
                 {
                     ((CudaStorage)product.Storage).MarkDeviceModified();
                     return product;
