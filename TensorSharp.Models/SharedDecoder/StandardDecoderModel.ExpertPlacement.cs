@@ -65,15 +65,20 @@ namespace TensorSharp.Models
             if (_backend == BackendType.GgmlMetal || _gguf == null) return;
             long available = MappedTableWarm.HostMemoryAvailable();
             if (available <= 0) return;
-            long room = available - MappedTableWarm.Headroom;
+            // The offloaded experts' file ranges are page-locked after the warm (below), out of the same memory: what the warm
+            // reads and copies must leave them room. A cgroup's available figure counts its reclaimable page cache, so the warm
+            // had filled it beside the locks: on a 62 GB cgroup 46.5 GiB warmed beside 27.8 GB of locks, and a 16 GB card's 4K
+            // prompt took 15 s against the direct engine's 7.9 (which locks first, and then skipped the tables).
+            List<(IntPtr Pointer, long Bytes)> stacks = HostExpertRuns();
+            IHostRangePinner pinner = stacks.Count > 0 ? _allocator as IHostRangePinner : null;
+            long locked = 0;
+            if (pinner != null)
+                foreach ((IntPtr _, long bytes) in stacks) locked += bytes;
+            long room = available - MappedTableWarm.Headroom - locked;
             var ranges = new List<(IntPtr Pointer, long Bytes)>();
             var copies = new List<QuantizedWeight>();
             long tableBytes = 0, expertBytes = 0, copyBytes = 0;
             int slices = 0;
-            // The offloaded experts' file ranges are page-locked after the warm (below): a table copy must leave them room.
-            List<(IntPtr Pointer, long Bytes)> stacks = HostExpertRuns();
-            long locked = 0;
-            foreach ((IntPtr _, long bytes) in stacks) locked += bytes;
             foreach (var (name, q) in _quantWeights)
             {
                 if (!IsHostOnlyWeight(name) || !q.IsFileBacked || q.RawBytes > room) continue;
@@ -95,7 +100,8 @@ namespace TensorSharp.Models
                 }
                 room -= q.RawBytes;
             }
-            foreach (var (pointer, bytes) in HostServedExpertSlices())
+            // Experts the locks fault in are not read twice.
+            foreach (var (pointer, bytes) in pinner != null ? Array.Empty<(IntPtr, long)>() : HostServedExpertSlices())
             {
                 if (bytes > room) break;
                 ranges.Add((pointer, bytes));
@@ -103,7 +109,7 @@ namespace TensorSharp.Models
                 expertBytes += bytes;
                 slices++;
             }
-            if (ranges.Count == 0 && copies.Count == 0) return;
+            if (ranges.Count == 0 && copies.Count == 0 && pinner == null) return;
             int experts = slices / 3;
             string what = (tableBytes > 0 ? "the host-only tables" : "") + (tableBytes > 0 && experts > 0 ? " and " : "")
                 + (experts > 0 ? $"{experts} host-served experts" : "");
@@ -111,7 +117,6 @@ namespace TensorSharp.Models
             var cancel = _hostWarmCancel.Token;
             GgufFile gguf = _gguf;
             string arch = Config.Architecture;
-            IHostRangePinner pinner = stacks.Count > 0 ? _allocator as IHostRangePinner : null;
             _hostWarm = System.Threading.Tasks.Task.Run(() =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -126,7 +131,7 @@ namespace TensorSharp.Models
                         Console.Error.WriteLine($"[{arch}] copied {copyBytes / (double)(1L << 30):F1} GiB of host-only tables into process memory in {sw.Elapsed.TotalSeconds:F1}s");
                     sw.Restart();
                     long read = ranges.Count == 0 ? 0 : gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
-                    if (!cancel.IsCancellationRequested)
+                    if (ranges.Count > 0 && !cancel.IsCancellationRequested)
                         Console.Error.WriteLine($"[{arch}] warmed {read / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
                     // Then the stacks a prompt chunk stages experts from are page-locked (DMA-speed copies), off the
                     // request path: locking them as the first prompt arrived cost it 7 s on an A40 (80 GB of Flash Next).
