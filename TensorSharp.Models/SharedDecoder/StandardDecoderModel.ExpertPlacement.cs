@@ -67,13 +67,32 @@ namespace TensorSharp.Models
             if (available <= 0) return;
             long room = available - MappedTableWarm.Headroom;
             var ranges = new List<(IntPtr Pointer, long Bytes)>();
-            long tableBytes = 0, expertBytes = 0;
+            var copies = new List<QuantizedWeight>();
+            long tableBytes = 0, expertBytes = 0, copyBytes = 0;
             int slices = 0;
+            // The offloaded experts' file ranges are page-locked after the warm (below): a table copy must leave them room.
+            List<(IntPtr Pointer, long Bytes)> stacks = HostExpertRuns();
+            long locked = 0;
+            foreach ((IntPtr _, long bytes) in stacks) locked += bytes;
             foreach (var (name, q) in _quantWeights)
             {
                 if (!IsHostOnlyWeight(name) || !q.IsFileBacked || q.RawBytes > room) continue;
-                ranges.Add((q.Data, q.RawBytes));
-                tableBytes += q.RawBytes;
+                // On Linux a table the process can hold beside 6 GB more is copied into process memory (the direct engines'
+                // and Strata's rule): every token reads scattered rows of it, and a memory cgroup's page cache dropped the
+                // warmed pages for the model's other files (Flash Next's 28.8 GB PLE table on an A40 with a 50 GB cgroup: a
+                // 4K prompt 7.1 s against 2.1 s, 0.5 s against 0.13 for a short one). Elsewhere the pages are warmed. The copy
+                // must leave room for the experts' page locks: beside 27.8 GB of them a 62 GB cgroup thrashed (a 16 GB card's 4K
+                // prompt 93 s against 7.2), where the page cache gives the table's cold rows up instead.
+                if (OperatingSystem.IsLinux() && available - locked - copyBytes >= q.RawBytes + HostTableCopyHeadroom)
+                {
+                    copies.Add(q);
+                    copyBytes += q.RawBytes;
+                }
+                else
+                {
+                    ranges.Add((q.Data, q.RawBytes));
+                    tableBytes += q.RawBytes;
+                }
                 room -= q.RawBytes;
             }
             foreach (var (pointer, bytes) in HostServedExpertSlices())
@@ -84,7 +103,7 @@ namespace TensorSharp.Models
                 expertBytes += bytes;
                 slices++;
             }
-            if (ranges.Count == 0) return;
+            if (ranges.Count == 0 && copies.Count == 0) return;
             int experts = slices / 3;
             string what = (tableBytes > 0 ? "the host-only tables" : "") + (tableBytes > 0 && experts > 0 ? " and " : "")
                 + (experts > 0 ? $"{experts} host-served experts" : "");
@@ -92,14 +111,21 @@ namespace TensorSharp.Models
             var cancel = _hostWarmCancel.Token;
             GgufFile gguf = _gguf;
             string arch = Config.Architecture;
-            List<(IntPtr Pointer, long Bytes)> stacks = HostExpertRuns();
             IHostRangePinner pinner = stacks.Count > 0 ? _allocator as IHostRangePinner : null;
             _hostWarm = System.Threading.Tasks.Task.Run(() =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
-                    long read = gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
+                    foreach (QuantizedWeight table in copies)
+                    {
+                        if (cancel.IsCancellationRequested) break;
+                        CopyTableToProcessMemory(table, cancel);
+                    }
+                    if (copies.Count > 0 && !cancel.IsCancellationRequested)
+                        Console.Error.WriteLine($"[{arch}] copied {copyBytes / (double)(1L << 30):F1} GiB of host-only tables into process memory in {sw.Elapsed.TotalSeconds:F1}s");
+                    sw.Restart();
+                    long read = ranges.Count == 0 ? 0 : gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
                     if (!cancel.IsCancellationRequested)
                         Console.Error.WriteLine($"[{arch}] warmed {read / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
                     // Then the stacks a prompt chunk stages experts from are page-locked (DMA-speed copies), off the
@@ -114,9 +140,42 @@ namespace TensorSharp.Models
                 catch (OperationCanceledException) { }
             });
             bool wait = Environment.GetEnvironmentVariable("TS_HOST_WARM_WAIT") == "1";
-            Console.WriteLine($"[{arch}] warming {(tableBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
-                (wait ? "before serving (TS_HOST_WARM_WAIT=1)" : "in the background (the first answers read the rest from the model files)"));
+            if (copies.Count > 0)
+                Console.WriteLine($"[{arch}] copying {copyBytes / (double)(1L << 30):F1} GiB of host-only tables into process memory " +
+                    (wait ? "before serving" : "in the background (the first answers read them from the model files)"));
+            if (ranges.Count > 0)
+                Console.WriteLine($"[{arch}] warming {(tableBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
+                    (wait ? "before serving (TS_HOST_WARM_WAIT=1)" : "in the background (the first answers read the rest from the model files)"));
             if (wait) _hostWarm.Wait();
+        }
+
+        /// <summary>Host memory a table copy leaves beside itself (the direct engines' rule).</summary>
+        private const long HostTableCopyHeadroom = 6L << 30;
+
+        /// <summary>A file-backed table into process memory, in parallel 64 MB pieces (each read from the mapping, so a
+        /// cold page is read from disk on several threads), then served from there.</summary>
+        internal static unsafe void CopyTableToProcessMemory(QuantizedWeight table, System.Threading.CancellationToken cancel)
+        {
+            long bytes = table.RawBytes;
+            IntPtr source = table.Data, copy = QuantizedWeight.AllocateBuffer(bytes);
+            const long Piece = 64L << 20;
+            long pieces = (bytes + Piece - 1) / Piece;
+            try
+            {
+                System.Threading.Tasks.Parallel.For(0, pieces,
+                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = GgufFile.DefaultWarmThreads(), CancellationToken = cancel },
+                    i =>
+                    {
+                        long at = i * Piece, n = Math.Min(Piece, bytes - at);
+                        Buffer.MemoryCopy((void*)(source + (nint)at), (void*)(copy + (nint)at), n, n);
+                    });
+            }
+            catch (OperationCanceledException)
+            {
+                QuantizedWeight.FreeBuffer(copy);
+                throw;
+            }
+            table.AdoptHostCopy(copy);
         }
 
         /// <summary>The (pointer, bytes) slices of every routed expert the host computes, one per gate/up/down part, the
@@ -289,7 +348,8 @@ namespace TensorSharp.Models
             for (int l = 0; l < n; l++)
                 allExperts += layerBytes[l] = _moeLayer[l] ? LayerExpertBytes(l) : 0;
             // Nothing is resident yet: every other weight, the draft, the first slot (its states and initial caches) are to come.
-            long pending = checked(AcceleratorBoundNonExpertBytes() + _pendingDraftBytes + TensorExecutorSlotReserveBytes);
+            long pending = checked(AcceleratorBoundNonExpertBytes() + _pendingDraftBytes + TensorExecutorSlotReserveBytes
+                + SpeculationReserveBytes);
             long headroom = GpuMemoryBudget.ResolveHeadroomBytes(total);
             if (allExperts + pending + headroom + DeviceScratchBytes <= free)
                 return;
@@ -311,6 +371,10 @@ namespace TensorSharp.Models
 
         /// <summary>A slot's states and its first caches, reserved when a tensor executor plans before any slot exists.</summary>
         private const long TensorExecutorSlotReserveBytes = 1L << 30;
+
+        /// <summary>Device memory a speculating request holds beside its slot (a family whose verify windows keep a state after
+        /// each row): an offloaded plan leaves it free.</summary>
+        protected virtual long SpeculationReserveBytes => 0;
 
         /// <summary>Most device memory an offloaded plan leaves for staging a prompt chunk's experts (one layer's worth).</summary>
         private const long StagingReserveCapBytes = 2L << 30;

@@ -391,6 +391,28 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
             $"qwen4exp mtp qsa={qsa} stages={stages}", 1e-4);
     }
 
+    /// <summary>A host-only table copied into process memory (on Linux, where the process can hold it beside 6 GB more:
+    /// Flash Next's PLE n-gram table) holds the mapping's bytes, owned and no longer file-backed, at the address readers
+    /// switch to.</summary>
+    [Fact]
+    public void HostOnlyTableCopiedIntoProcessMemoryKeepsItsBytes()
+    {
+        using var file = new GgufFile(Fixture(false));
+        var info = file.Tensors["per_layer_token_embd.weight"];
+        Assert.True(file.TryGetTensorDataPointer(info, out IntPtr pointer));
+        long bytes = file.GetTensorByteCount(info);
+        using var table = QuantizedWeight.CreateExternalView(pointer, bytes, (int)info.Type, (long)info.Shape[0], (long)info.Shape[1], file);
+        Assert.True(table.IsFileBacked);
+        var before = new byte[bytes];
+        System.Runtime.InteropServices.Marshal.Copy(pointer, before, 0, (int)bytes);
+        StandardDecoderModel.CopyTableToProcessMemory(table, System.Threading.CancellationToken.None);
+        Assert.False(table.IsFileBacked);
+        Assert.NotEqual(pointer, table.Data);
+        var after = new byte[bytes];
+        System.Runtime.InteropServices.Marshal.Copy(table.Data, after, 0, (int)bytes);
+        Assert.Equal(before, after);
+    }
+
     /// <summary>The MTP head's routed experts requantized at load (the CUDA preset's TS_Q4E_MTP_EXPERTS=q2_0): the draft
     /// layer holds Q2_0 stacks, and speculation still emits the plain greedy streams (the verify decides every token).</summary>
     [Theory]

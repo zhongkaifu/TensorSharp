@@ -447,6 +447,24 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>A draft head's verify windows (up to four rows: three drafts and the anchor) keep each recurrent layer's
+        /// output and state after every row (DeviceGdnState's verify buffers): 456 MB on Qwen3.8 Flash Next, which an
+        /// offloaded plan had handed to the expert tiers (an RTX PRO 6000 slice then ran out of memory in a verify).</summary>
+        protected override long SpeculationReserveBytes
+        {
+            get
+            {
+                if (_draftLayers == 0) return 0;
+                const int rows = 4;
+                int channels = 2 * _numKHeads * _headKDim + _numVHeads * _headVDim;
+                long perLayer = rows * ((long)_numVHeads * _headVDim + (long)_numVHeads * _headVDim * _headKDim) * sizeof(float)
+                    + (long)channels * (_convKernel - 1 + rows) * sizeof(float);
+                long layers = 0;
+                foreach (bool recurrent in _isRecurrent) if (recurrent) layers++;
+                return layers * perLayer;
+            }
+        }
+
         protected override RecurrentState CreateRecurrentState(RankScope scope, int layer)
         {
             int vHeads = _numVHeads / ShardDegree;
