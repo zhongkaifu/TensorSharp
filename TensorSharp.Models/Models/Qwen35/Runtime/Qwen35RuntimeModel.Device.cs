@@ -281,8 +281,8 @@ namespace TensorSharp.Models
             /// <summary>A verify window's recurrence result, written there in place: [outputs of its rows |
             /// state after the last row | state 1 row before it | ...], room for SnapshotCapacity rows.</summary>
             public Tensor Verify { get; private set; }
-            /// <summary>The conv inputs of a verify window, [channels, ConvRows + capacity]: columns
-            /// [k, k + ConvRows) are the window after k of its rows.</summary>
+            /// <summary>The conv inputs of a verify window of n rows, [channels, ConvRows + n] at the window's own pitch (room
+            /// for ConvRows + capacity a channel): columns [k, k + ConvRows) are the window after k of its rows.</summary>
             public Tensor ConvHistory { get; private set; }
             public int SnapshotCapacity { get; private set; }
 

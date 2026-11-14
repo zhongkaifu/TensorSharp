@@ -135,9 +135,11 @@ namespace TensorSharp.Models
                         : g.Op(GraphOp.Reshape, stackalloc[] { GraphLeaf(g, state.Ssm, _headKDim, _headVDim, state.Ssm.Sizes[0]) }, stackalloc long[] { stateFloats });
                     g.Effect(g.Op(GraphOp.Cpy, source, target));
                 }
+                // The window wrote its conv inputs at its own pitch (convRows + rows a channel).
                 int hist = GraphLeaf(g, state.ConvHistory, convRows + cap, channels);
+                long histPitch = convRows + rows;
                 int window = g.Op(GraphOp.View, stackalloc[] { hist },
-                    stackalloc long[] { 2, convRows, channels, 1, 1, (convRows + cap) * f, 0, 0, kept * f });
+                    stackalloc long[] { 2, convRows, channels, 1, 1, histPitch * f, 0, 0, kept * f });
                 g.Effect(g.Op(GraphOp.Cpy, window, GraphLeaf(g, state.Conv, convRows, channels)));
                 EmitCommitExtras(g, layer, state, kept, rows);
             }
@@ -379,9 +381,13 @@ namespace TensorSharp.Models
                         int fallback = step.Op(GraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(verify, total, 1, total * f, 0));
                         step.Alias(gdn, verify, 0, fallback);
                     }
+                    // At the window's own pitch, one contiguous copy whatever its rows (at the capacity's pitch a window
+                    // narrower than it wrote [channels] rows of a few floats each: 27 us a layer for 2- and 3-row windows
+                    // of Qwen3.8 Flash Next, 1 ms a window).
                     int hist = step.State(state.ConvHistory, GraphFormat.F32, convRows + cap, channels);
+                    long histPitch = convRows + count;
                     step.Effect(step.Op(GraphOp.Cpy, convIn,
-                        step.View2(hist, convRows + count, channels, (convRows + cap) * f, 0)));
+                        step.View2(hist, convRows + count, channels, histPitch * f, 0)));
                 }
                 else
                 {
