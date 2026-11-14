@@ -822,7 +822,7 @@ namespace TensorSharp.Cuda
                 }
                 case GraphFusion.GatedRmsNorm:
                 {
-                    if (ip != null && ip.Length > 0 && ip[0] != 0) return false;   // the kernel gates with silu only
+                    bool sigmoidGate = ip != null && ip.Length > 0 && ip[0] != 0;
                     Tensor y = inputs[0], z = inputs[1];
                     int d = (int)inputs[2].ElementCount();
                     // z is read where it is (a view of the packed in-projection): a token's heads * d values a pitch apart.
@@ -835,7 +835,7 @@ namespace TensorSharp.Cuda
                     results[0] = new Tensor(Allocator, DType.Float32, y.Sizes);
                     int rows = (int)(y.ElementCount() / d);
                     Launch(inputs, results, (k, stream) => k.LaunchGatedRmsNorm(Ptr(inputs[0]), Ptr(inputs[1]), Ptr(inputs[2]), Ptr(results[0]),
-                        rows, d, eps, heads, zPitch, stream));
+                        rows, d, eps, heads, zPitch, stream, sigmoidGate));
                     return true;
                 }
                 default:

@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 15;
+        public const int CurrentVersion = 16;
 
         private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
@@ -332,9 +332,10 @@ namespace TensorSharp.Cuda
         /// <summary>GraphFusion.GatedRmsNorm over <paramref name="rows"/> rows of <paramref name="d"/> (head r % heads of token
         /// r / heads); z's tokens are <paramref name="zPitch"/> floats apart.</summary>
         public void LaunchGatedRmsNorm(IntPtr y, IntPtr z, IntPtr w, IntPtr output, int rows, int d, float eps, int heads, long zPitch,
-            IntPtr stream)
+            IntPtr stream, bool sigmoidGate = false)
         {
-            void** args = stackalloc void*[] { &y, &z, &w, &output, &d, &eps, &heads, &zPitch };
+            int gate = sigmoidGate ? 1 : 0;
+            void** args = stackalloc void*[] { &y, &z, &w, &output, &d, &eps, &heads, &zPitch, &gate };
             CudaDriverApi.cuLaunchKernel(_gatedRmsNorm, (uint)rows, 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
     }

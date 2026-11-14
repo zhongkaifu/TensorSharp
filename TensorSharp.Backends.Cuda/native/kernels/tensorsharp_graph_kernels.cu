@@ -11,7 +11,7 @@
 
 #include <cuda_fp16.h>
 
-#define TS_GRAPH_KERNELS_VERSION 15
+#define TS_GRAPH_KERNELS_VERSION 16
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1047,11 +1047,11 @@ extern "C" __global__ void ts_graph_add_rms_norm_f32(const float* __restrict__ a
         nr[i] = sr[i] * scale * w[i];
 }
 
-// GraphFusion.GatedRmsNorm: out = y * rsqrt(mean(y^2) + eps) * w * silu(z) over rows of d. Row r of y and out is head
-// r % heads of token r / heads; z holds a token's heads * d values z_pitch floats after the previous token's (a view
-// of a packed projection is read in place). Launch: grid rows, block d (d % 32 == 0, <= 1024).
+// GraphFusion.GatedRmsNorm: out = y * rsqrt(mean(y^2) + eps) * w * silu(z) (sigmoid(z) with sigmoid_gate) over rows of
+// d. Row r of y and out is head r % heads of token r / heads; z holds a token's heads * d values z_pitch floats after the
+// previous token's (a view of a packed projection is read in place). Launch: grid rows, block d (d % 32 == 0, <= 1024).
 extern "C" __global__ void ts_graph_gated_rms_norm_f32(const float* __restrict__ y, const float* __restrict__ z,
-    const float* __restrict__ w, float* __restrict__ out, int d, float eps, int heads, long long z_pitch)
+    const float* __restrict__ w, float* __restrict__ out, int d, float eps, int heads, long long z_pitch, int sigmoid_gate)
 {
     __shared__ float partial[32];
     const int i = threadIdx.x;
@@ -1063,5 +1063,6 @@ extern "C" __global__ void ts_graph_gated_rms_norm_f32(const float* __restrict__
     float total = 0.0f;
     for (int s = 0; s < d / 32; s++) total += partial[s];
     const float zz = z[(r / heads) * z_pitch + (r % heads) * d + i];
-    out[r * d + i] = v * rsqrtf(total / d + eps) * w[i] * (zz / (1.0f + expf(-zz)));
+    const float gate = sigmoid_gate ? 1.0f / (1.0f + expf(-zz)) : zz / (1.0f + expf(-zz));
+    out[r * d + i] = v * rsqrtf(total / d + eps) * w[i] * gate;
 }

@@ -160,4 +160,40 @@ public sealed class CudaHyperConnectionKernelTests
             }
         }
     }
+    /// <summary>The gated norm with a sigmoid gate (Qwen3.8's delta-net output) against a double reference.</summary>
+    [CudaFact]
+    public void SigmoidGatedNormMatchesTheReference()
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels kernels, out string reason), reason);
+        using (kernels)
+        {
+            const int d = 128, heads = 3, tokens = 4, rows = heads * tokens;
+            var rng = new Random(43);
+            float[] R(int count, double scale) => Enumerable.Range(0, count).Select(_ => (float)((rng.NextDouble() * 2 - 1) * scale)).ToArray();
+            float[] ys = R(rows * d, 2), zs = R(rows * d, 3), wsN = R(d, 1);
+            using var y = Tensor.FromArray(allocator, ys);
+            using var z = Tensor.FromArray(allocator, zs);
+            using var w = Tensor.FromArray(allocator, wsN);
+            using var output = new Tensor(allocator, DType.Float32, rows * d);
+            Upload(y, z, w, output);
+            kernels.LaunchGatedRmsNorm(P(y), P(z), P(w), P(output), rows, d, 1e-6f, heads, (long)heads * d, allocator.Stream.Handle, sigmoidGate: true);
+            allocator.Stream.Synchronize();
+            Written(output);
+            float[] got = output.GetElementsAsFloat(rows * d);
+            for (int r = 0; r < rows; r++)
+            {
+                double ss = 0;
+                for (int i = 0; i < d; i++) ss += (double)ys[r * d + i] * ys[r * d + i];
+                double scale = 1 / Math.Sqrt(ss / d + 1e-6);
+                for (int i = 0; i < d; i++)
+                {
+                    double zz = zs[r * d + i];
+                    double want = ys[r * d + i] * scale * wsN[i] / (1 + Math.Exp(-zz));
+                    Assert.True(Math.Abs(got[r * d + i] - want) <= 1e-5 * Math.Abs(want) + 1e-6, $"row {r} value {i}: {got[r * d + i]} against {want}");
+                }
+            }
+        }
+    }
 }
