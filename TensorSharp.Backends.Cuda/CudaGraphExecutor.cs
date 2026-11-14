@@ -1127,10 +1127,12 @@ namespace TensorSharp.Cuda
             public Tensor PromptCounts;
         }
 
-        private long _countsHarvestedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-
-        /// <summary>Seconds between harvests of the device's route counts (and adaptive trades after each).</summary>
-        private const double HarvestSeconds = 0.25;
+        /// <summary>Steps (recorded launches and runs) between harvests of the device's route counts, and the adaptive round
+        /// after each: counted, never timed, so which experts the device holds at a given step - and so how that step's routes
+        /// round - follows the steps alone (a quarter-second timer gave each run of one prompt on Qwen3.8 Flash Next UD-Q2_K_XL
+        /// its own tokens). About a quarter second of its decode on an A40.</summary>
+        private const int HarvestSteps = 12;
+        private int _stepsSinceHarvest;
 
         /// <summary>Trades an adaptive round makes at most (each a few MB copied before the next step).</summary>
         private const int AdaptSwapsPerRound = 64;
@@ -1206,16 +1208,15 @@ namespace TensorSharp.Cuda
 
         /// <summary>
         /// The routes the doorbell layers counted on the device, handed to their expert hosts (the routing profile) and
-        /// zeroed, at most every two seconds and never inside a recording: every route counts, the device's as the host's,
+        /// zeroed, every HarvestSteps steps and never inside a recording: every route counts, the device's as the host's,
         /// though a step whose routes all stay on the device never rings.
         /// </summary>
         private void HarvestRouteCounts(bool force = false)
         {
             var cuda = (CudaAllocator)Allocator;
-            long now = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (!force && now - _countsHarvestedAt < HarvestSeconds * System.Diagnostics.Stopwatch.Frequency) return;
+            if (!force && _stepsSinceHarvest < HarvestSteps) return;
             if (CudaGraphCapture.IsCapturing(cuda)) return;
-            _countsHarvestedAt = now;
+            _stepsSinceHarvest = 0;
             HarvestPromptCounts();
             HostedTables[] layers;
             lock (_hostedTables) layers = new List<HostedTables>(_hostedTables.Values).ToArray();
@@ -1706,7 +1707,7 @@ namespace TensorSharp.Cuda
             if (_doorbell == null)
             {
                 _doorbell = new CudaExpertDoorbell(cuda, hidden, k);
-                _onLaunching = () => { _doorbell?.Arm(); HarvestRouteCounts(); };
+                _onLaunching = () => { _doorbell?.Arm(); _stepsSinceHarvest++; HarvestRouteCounts(); };
                 cuda.RecordedStepLaunching += _onLaunching;
             }
             HarvestRouteCounts();
@@ -2195,6 +2196,7 @@ namespace TensorSharp.Cuda
             foreach (Tensor t in _quantized.Values) t.Dispose();
             _quantized.Clear();
             _runOrdinal++;
+            _stepsSinceHarvest++;
             HarvestPromptCounts();
         }
 
