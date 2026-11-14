@@ -126,6 +126,12 @@ namespace TensorSharp.Cuda
         /// [cells, dim] (a leaf's trailing unit extents are dropped), so it is viewed with its head again.</summary>
         private static Tensor HeadFirst(Tensor t) => t.DimensionCount == 2 ? t.View(1, t.Sizes[0], t.Sizes[1]) : t.CopyRef();
 
+        /// <summary>A prompt chunk's row blocks of a packed product stay views: the gated delta net's fused input region reads
+        /// its q/k/v, alpha and beta blocks strided, where each block had been copied out first (6.5 GB a 2048-row step of
+        /// Qwen3.8-27B; its 4K prompt 4-11% faster on an RTX PRO 6000 slice, the same tokens). Decode-size steps keep the
+        /// copies (their own measured speed).</summary>
+        protected override bool ProductRowBlocksAsViews(long rows) => rows > DenseDecodeRows;
+
         /// <summary>
         /// Attention over cache windows with the per-op path's kernels: a decode row runs the GQA decode kernel
         /// on the head-first cache in place (F32 or F16); a prompt chunk expands the window's KV heads, runs the

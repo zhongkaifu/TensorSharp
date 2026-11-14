@@ -72,6 +72,11 @@ namespace TensorSharp.Graph
 
         private Tensor In(Tensor t, RunState run) => KernelsReadStridedViews ? t : Contig(t, run);
 
+        /// <summary>Whether a row block of a packed weight's product of <paramref name="rows"/> rows stays a strided view of the
+        /// product (its readers copy it where they need it contiguous): fused regions that read strided inputs then take it
+        /// as it is.</summary>
+        protected virtual bool ProductRowBlocksAsViews(long rows) => KernelsReadStridedViews;
+
         private static readonly HashSet<GraphOp> s_ops = new()
         {
             GraphOp.GetRows, GraphOp.Add, GraphOp.Sub, GraphOp.Mul, GraphOp.Div, GraphOp.Scale, GraphOp.RmsNorm,
@@ -1624,7 +1629,7 @@ namespace TensorSharp.Graph
                 {
                     Tensor block = run.Keep(full.Narrow(1, a.FirstRow, a.Rows));
                     // A row block of a packed weight's product: a strided view where kernels read them.
-                    if (KernelsReadStridedViews && nb[2] * nb[3] == 1) return block;
+                    if (ProductRowBlocksAsViews(nb[1]) && nb[2] * nb[3] == 1) return block;
                     y = run.Keep(Ops.NewContiguous(block));
                 }
                 return run.Keep(y.View(Sizes(stackalloc long[] { a.Rows, nb[1], nb[2], nb[3] })));
