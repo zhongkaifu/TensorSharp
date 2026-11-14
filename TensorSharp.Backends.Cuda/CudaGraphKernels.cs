@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 13;
+        public const int CurrentVersion = 14;
 
         private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
 
@@ -216,25 +216,27 @@ namespace TensorSharp.Cuda
 
         /// <summary>The hyper-connection read's grouped norm: each of <paramref name="rows"/> x <paramref name="hc"/> streams
         /// of <paramref name="n"/> RMS-normed, times the [hc * n] gammas.</summary>
-        public void LaunchHcNorm(IntPtr x, IntPtr gamma, IntPtr y, int rows, int n, int hc, float eps, IntPtr stream)
+        public void LaunchHcNorm(IntPtr x, IntPtr gamma, IntPtr y, int rows, int n, int hc, float eps, IntPtr stream, IntPtr yq = default)
         {
-            void** args = stackalloc void*[] { &x, &gamma, &y, &n, &hc, &eps };
+            void** args = stackalloc void*[] { &x, &gamma, &y, &n, &hc, &eps, &yq };
             // Few streams (a decode or verify step): wide blocks; a prompt chunk's many streams fill the device at 256.
             uint threads = rows * hc < 64 ? 1024u : 256u;
             CudaDriverApi.cuLaunchKernel(_hcNorm, (uint)(rows * hc), 1, 1, threads, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
-        /// <summary>y = silu(x * scale) over <paramref name="n"/> contiguous floats.</summary>
-        public void LaunchScaleSilu(IntPtr x, IntPtr y, long n, float scale, IntPtr stream)
+        /// <summary>y = silu(x * scale) over <paramref name="n"/> contiguous floats; with <paramref name="yq"/> (n a multiple of
+        /// 32) y also as q8_1, as <see cref="CudaKernels"/>' row quantizer writes it.</summary>
+        public void LaunchScaleSilu(IntPtr x, IntPtr y, long n, float scale, IntPtr stream, IntPtr yq = default)
         {
-            void** args = stackalloc void*[] { &x, &y, &n, &scale };
+            void** args = stackalloc void*[] { &x, &y, &n, &scale, &yq };
             CudaDriverApi.cuLaunchKernel(_scaleSilu, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
-        /// <summary>The read's mix: each row's streams' mean of xn * sigmoid(gates).</summary>
-        public void LaunchHcGateMix(IntPtr xn, IntPtr gates, IntPtr output, int rows, int n, int hc, IntPtr stream)
+        /// <summary>The read's mix: each row's streams' mean of xn * sigmoid(gates); with <paramref name="outq"/> (n a multiple
+        /// of 32) also as q8_1.</summary>
+        public void LaunchHcGateMix(IntPtr xn, IntPtr gates, IntPtr output, int rows, int n, int hc, IntPtr stream, IntPtr outq = default)
         {
-            void** args = stackalloc void*[] { &xn, &gates, &output, &rows, &n, &hc };
+            void** args = stackalloc void*[] { &xn, &gates, &output, &rows, &n, &hc, &outq };
             long total = (long)rows * n;
             CudaDriverApi.cuLaunchKernel(_hcGateMix, (uint)((total + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }

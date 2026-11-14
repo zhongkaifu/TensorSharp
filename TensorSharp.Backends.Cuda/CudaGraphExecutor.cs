@@ -607,13 +607,26 @@ namespace TensorSharp.Cuda
                 DenseProduct(y, input, w);
                 return y;
             }
+            // A decode-size read writes the q8_1 copies its products read beside the values (the normed streams for the down and
+            // injection products, the bottleneck for the up product, the mix for the next block's projections): each product
+            // had quantized its input in a pass of its own, 288 launches of a 4-row window of Qwen3.8 Flash Next. The same bytes.
+            bool quantize = rows <= DenseDecodeRows && n % 32 == 0 && lr % 32 == 0 && CudaQuantizedOps.Q81WarpQuantizeEnabled;
             using var xn = new Tensor(Allocator, DType.Float32, rows, width);
-            Launch(new[] { x, gamma }, xn, (k, stream) => k.LaunchHcNorm(Ptr(x), Ptr(gamma), Ptr(xn), rows, n, hc, eps, stream));
+            Tensor xnq = quantize ? Q81Rows(rows, width) : null;
+            Launch(new[] { x, gamma }, xnq == null ? new[] { xn } : new[] { xn, xnq },
+                (k, stream) => k.LaunchHcNorm(Ptr(x), Ptr(gamma), Ptr(xn), rows, n, hc, eps, stream, xnq == null ? IntPtr.Zero : Ptr(xnq)));
+            if (xnq != null) KeepQuantized(xn, width, rows, xnq);
             using Tensor lo = Product(2, xn);
-            Launch(new[] { lo }, lo, (k, stream) => k.LaunchScaleSilu(Ptr(lo), Ptr(lo), lo.ElementCount(), 1f / hc, stream));
+            Tensor loq = quantize ? Q81Rows(rows, lr) : null;
+            Launch(new[] { lo }, loq == null ? new[] { lo } : new[] { lo, loq },
+                (k, stream) => k.LaunchScaleSilu(Ptr(lo), Ptr(lo), lo.ElementCount(), 1f / hc, stream, loq == null ? IntPtr.Zero : Ptr(loq)));
+            if (loq != null) KeepQuantized(lo, lr, rows, loq);
             using Tensor gates = Product(4, lo);
             var mix = new Tensor(Allocator, DType.Float32, rows, n);
-            Launch(new[] { xn, gates }, mix, (k, stream) => k.LaunchHcGateMix(Ptr(xn), Ptr(gates), Ptr(mix), rows, n, hc, stream));
+            Tensor mixq = quantize ? Q81Rows(rows, n) : null;
+            Launch(new[] { xn, gates }, mixq == null ? new[] { mix } : new[] { mix, mixq },
+                (k, stream) => k.LaunchHcGateMix(Ptr(xn), Ptr(gates), Ptr(mix), rows, n, hc, stream, mixq == null ? IntPtr.Zero : Ptr(mixq)));
+            if (mixq != null) KeepQuantized(mix, n, rows, mixq);
             results[0] = mix;
             results[1] = Product(3, xn);
             return true;
@@ -2050,6 +2063,19 @@ namespace TensorSharp.Cuda
 
         /// <summary>The decode-once kernels' module where they take a decode-size product of this weight (up to 8 rows of a
         /// 2-D weight in one of their formats), else null.</summary>
+        /// <summary>A q8_1 buffer for <paramref name="rows"/> rows of <paramref name="inDim"/> values.</summary>
+        private Tensor Q81Rows(long rows, long inDim) => new Tensor(Allocator, DType.UInt8, rows * (inDim / 32) * CudaKernels.Q81BlockBytes);
+
+        /// <summary><paramref name="q"/> (taken over) is <paramref name="x"/>'s rows as q8_1, written by the kernel that made x:
+        /// the products that read x this run take it (<see cref="QuantizedOnce"/>).</summary>
+        private void KeepQuantized(Tensor x, long inDim, long rows, Tensor q)
+        {
+            var key = ((CudaStorage)x.Storage, x.StorageOffset, inDim, rows);
+            if (_quantized.TryGetValue(key, out Tensor old)) old.Dispose();
+            ((CudaStorage)q.Storage).MarkDeviceModified();
+            _quantized[key] = q;
+        }
+
         /// <summary>The rows of x quantized to q8_1, once a run for every product that reads them.</summary>
         private Tensor QuantizedOnce(CudaAllocator cuda, Tensor x, CudaStorage xs, long inDim, long rows)
         {

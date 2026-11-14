@@ -11,7 +11,7 @@
 
 #include <cuda_fp16.h>
 
-#define TS_GRAPH_KERNELS_VERSION 13
+#define TS_GRAPH_KERNELS_VERSION 14
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -642,8 +642,43 @@ extern "C" __global__ void ts_graph_moe_wait_add(const unsigned int* flag, const
 // The read's grouped norm: each stream of each row RMS-normed (eps inside the root), times the [hc * n] gammas.
 // Launch: grid rows * hc, block a multiple of 32 up to 1024 (a decode row's four streams take 1024: four blocks of 256
 // left the step's norm latency-bound).
+// ggml's block_q8_1 (tensorsharp_kernels' ts_block_q8_1): the scale, the scale times the sum of the values, 32 int8 values.
+struct ts_graph_block_q8_1
+{
+    half d;
+    half s;
+    int8_t qs[32];
+};
+
+// A warp's 32 values (lane i holding value i of a block) into q8_1 exactly as ts_quantize_q8_1_rows_warp_f32 rounds them, so
+// a kernel that produces a product's input can write the quantized copy the product reads, and the product skips its own
+// quantizing pass (the decode-size products read q8_1 activations).
+__device__ __forceinline__ void ts_graph_quantize_q8_1(float x, ts_graph_block_q8_1* dst, int lane)
+{
+    float amax = fmaxf(0.0f, fabsf(x));
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_down_sync(0xFFFFFFFF, amax, offset));
+    amax = __shfl_sync(0xFFFFFFFF, amax, 0);
+    const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int q = (int)rintf(x * id);
+    q = max(-127, min(127, q));
+    dst->qs[lane] = (int8_t)q;
+    int sum = q;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    if (lane == 0)
+    {
+        dst->d = __float2half_rn(d);
+        dst->s = __float2half_rn(d * (float)sum);
+    }
+}
+
+// yq (null, or n % 32 == 0 and a block a multiple of 32 threads): y's rows also as q8_1.
 extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, const float* __restrict__ gamma, float* __restrict__ y,
-    int n, int hc, float eps)
+    int n, int hc, float eps, ts_graph_block_q8_1* __restrict__ yq)
 {
     __shared__ float part[32];
     const size_t s = blockIdx.x;               // row * hc + stream
@@ -666,24 +701,35 @@ extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, con
     __syncthreads();
     const float scale = rsqrtf(part[0] / n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x)
-        y[s * n + i] = xs[i] * scale * g[i];
+    {
+        const float v = xs[i] * scale * g[i];
+        y[s * n + i] = v;
+        if (yq != nullptr)
+            ts_graph_quantize_q8_1(v, yq + (s * n + i) / 32, threadIdx.x & 31);
+    }
 }
 
 // y = silu(x * scale) over n contiguous floats (the read's low-rank activation). Launch: ceil(n / 256), 256.
-extern "C" __global__ void ts_graph_scale_silu_f32(const float* __restrict__ x, float* __restrict__ y, long long n, float scale)
+// yq (null, or n % 32 == 0): y also as q8_1.
+extern "C" __global__ void ts_graph_scale_silu_f32(const float* __restrict__ x, float* __restrict__ y, long long n, float scale,
+    ts_graph_block_q8_1* __restrict__ yq)
 {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
     {
         const float v = x[i] * scale;
-        y[i] = v / (1.f + expf(-v));
+        const float o = v / (1.f + expf(-v));
+        y[i] = o;
+        if (yq != nullptr)
+            ts_graph_quantize_q8_1(o, yq + i / 32, threadIdx.x & 31);
     }
 }
 
 // The read's mix: out[r][i] = (sum over c, in order, of xn[r][c][i] * sigmoid(gates[r][c][i])) / hc.
 // Launch: ceil(rows * n / 256), 256.
+// outq (null, or n % 32 == 0): out also as q8_1.
 extern "C" __global__ void ts_graph_hc_gate_mix_f32(const float* __restrict__ xn, const float* __restrict__ gates,
-    float* __restrict__ out, int rows, int n, int hc)
+    float* __restrict__ out, int rows, int n, int hc, ts_graph_block_q8_1* __restrict__ outq)
 {
     const long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= (long long)rows * n) return;
@@ -696,7 +742,10 @@ extern "C" __global__ void ts_graph_hc_gate_mix_f32(const float* __restrict__ xn
         const float g = gr[(long long)c * n + i];
         sum += xr[(long long)c * n + i] * (1.f / (1.f + expf(-g)));
     }
-    out[j] = sum * (1.f / hc);
+    const float m = sum * (1.f / hc);
+    out[j] = m;
+    if (outq != nullptr)
+        ts_graph_quantize_q8_1(m, outq + j / 32, threadIdx.x & 31);
 }
 
 // The scatter: out[r][c][i] = stream[r][c][i] + block[r][i] * 2 * sigmoid(inject[r][c] / hc). Launch: ceil(rows * hc * n / 256), 256.
