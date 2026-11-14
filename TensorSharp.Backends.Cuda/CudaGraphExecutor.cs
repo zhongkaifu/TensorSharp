@@ -484,6 +484,14 @@ namespace TensorSharp.Cuda
                 Launch(new[] { x }, new[] { ids, part }, (kn, stream) => kn.LaunchArgmax(Ptr(x), Ptr(ids), Ptr(part), (int)rows, (int)cols, stream));
                 return new Value { Tensor = run.Keep(ids) };
             }
+            // A few picks over a wide row (a draft step's ten over Qwen3.8's 151,643 draft ids) the same way: the radix-selecting
+            // kernel's one block a row took 224 us of each draft step on an A40. The same picks in the same order.
+            if (wide && k <= CudaGraphKernels.TopKFewMaxPicks && cols > CudaGraphKernels.ArgmaxSlice)
+            {
+                using var part = new Tensor(Allocator, DType.Float32, Math.Max(1, CudaGraphKernels.TopKFewPartBytes((int)rows, (int)cols, k) / 4));
+                Launch(new[] { x }, new[] { ids, part }, (kn, stream) => kn.LaunchTopKFew(Ptr(x), Ptr(ids), Ptr(part), (int)rows, (int)cols, k, stream));
+                return new Value { Tensor = run.Keep(ids) };
+            }
             Launch(new[] { x }, ids, (kn, stream) =>
             {
                 if (wide) kn.LaunchTopKWide(Ptr(x), Ptr(ids), (int)rows, (int)cols, k, stream);

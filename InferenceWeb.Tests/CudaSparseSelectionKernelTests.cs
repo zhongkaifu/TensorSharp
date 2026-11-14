@@ -121,6 +121,47 @@ public sealed class CudaSparseSelectionKernelTests
         for (int r = 3; r < rows; r++) Assert.Equal(HostTopK(x, r, cols, 1)[0], b[r]);
     }
 
+    /// <summary>The two-stage few picks (a draft step's ten over the draft vocabulary) against the wide top-k they replace for
+    /// wide rows: the same indices in the same order for every row - ties to the lower index, -0 against +0, picks crowding
+    /// one slice, a row whose picks straddle the last slice.</summary>
+    [CudaTheory]
+    [InlineData(1, 151643, 10, true)]   // Qwen3.8's draft vocabulary
+    [InlineData(4, 248320, 16, false)]
+    [InlineData(3, 4097, 2, true)]       // one column past a slice
+    [InlineData(5, 9000, 7, true)]
+    public void FewPicksMatchTheWideTopK(int rows, int cols, int k, bool ties)
+    {
+        using var allocator = new CudaAllocator();
+        using CudaGraphKernels kernels = Kernels(allocator);
+        var rng = new Random(29);
+        var x = new float[rows * cols];
+        for (int i = 0; i < x.Length; i++)
+        {
+            float v = (float)(rng.NextDouble() * 8 - 4);
+            if (ties) v = MathF.Round(v * 2) / 2;
+            x[i] = v;
+        }
+        // Row 0: its largest values all in one slice, one of them twice; the last row's in the last columns.
+        for (int j = 0; j < k; j++) x[100 + j] = 50f + j % 3;
+        x[cols - 5] = 52f;
+        int last = rows - 1;
+        if (rows > 1) for (int j = 0; j < k; j++) x[(long)last * cols + cols - 1 - j] = 70f - j;
+        if (rows > 2) for (int c = 0; c < cols; c++) x[cols + c] = c % 3 == 0 ? -0f : 0f;
+        using var xt = Tensor.FromArray(allocator, x);
+        using var wide = new Tensor(allocator, DType.Int32, rows * k);
+        using var few = new Tensor(allocator, DType.Int32, rows * k);
+        using var part = new Tensor(allocator, DType.Float32, CudaGraphKernels.TopKFewPartBytes(rows, cols, k) / 4);
+        Upload(xt, wide, few, part);
+        allocator.Context.MakeCurrent();
+        kernels.LaunchTopKWide(P(xt), P(wide), rows, cols, k, allocator.Stream.Handle);
+        kernels.LaunchTopKFew(P(xt), P(few), P(part), rows, cols, k, allocator.Stream.Handle);
+        allocator.Stream.Synchronize();
+        Written(wide, few);
+        int[] a = wide.GetElementsAsInt(rows * k), b = few.GetElementsAsInt(rows * k);
+        Assert.Equal(a, b);
+        for (int r = 0; r < rows; r++) Assert.Equal(HostTopK(x, r, cols, k), b.AsSpan(r * k, k).ToArray());
+    }
+
     [CudaTheory]
     [InlineData(128, 4, 1, 700, 1)]
     [InlineData(64, 8, 3, 257, 3)]
