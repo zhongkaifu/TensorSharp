@@ -1706,6 +1706,9 @@ namespace TensorSharp.Models
         /// <summary>Tests: a shared expert runs in place, not as a concurrent region.</summary>
         internal bool ConcurrentRegionsDisabledForTests { get; set; }
 
+        /// <summary>Tests: a host-served layer's selection runs as its ops, not as a <see cref="GraphFusion.MoeSelect"/> region.</summary>
+        internal bool MoeSelectRegionDisabledForTests { get; set; }
+
         private int EmitMoe(GraphStep step, int layer, int x)
         {
             string p = LayerName(layer, "");
@@ -1731,6 +1734,11 @@ namespace TensorSharp.Models
                     x, logits, step.Experts(p + "ffn_gate_exps.weight"), step.Experts(p + "ffn_up_exps.weight"),
                     step.Experts(p + "ffn_down_exps.weight"),
                 }, stackalloc long[] { k, NormalizeExpertWeights ? 1 : 0 });
+            // A host-served layer's selection is one region an executor may run as one kernel (its routes then stay on the
+            // device as they do in a routed-experts region).
+            bool selectRegion = !region && !MoeSelectRegionDisabledForTests;
+            if (selectRegion)
+                step.BeginFused(GraphFusion.MoeSelect, stackalloc[] { logits }, stackalloc long[] { k, NormalizeExpertWeights ? 1 : 0 });
             int probs = step.Op(GraphOp.SoftMaxExt, logits);                                            // [E, rows]
             int selected = step.Op(GraphOp.TopK, stackalloc[] { probs }, stackalloc long[] { k });      // [K, rows]
             int weights = step.Op(GraphOp.GetRows, step.Reshape(probs, 1, _numExperts, rows), selected); // [1, K, rows]
@@ -1745,6 +1753,7 @@ namespace TensorSharp.Models
                 weights = step.Op(GraphOp.Scale, stackalloc[] { step.Reshape(step.Op(GraphOp.Div, picked, sum), 1, k, rows) }, default,
                     stackalloc[] { 1f });
             }
+            if (selectRegion) step.EndFused(stackalloc[] { selected, weights });
 
             int output;
             if (IsExpertLayerOffloaded(layer) && GraphExecutor.Capabilities.HostExperts)

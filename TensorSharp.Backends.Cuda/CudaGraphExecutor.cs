@@ -664,6 +664,41 @@ namespace TensorSharp.Cuda
             return NarrowF32(cuda, weight.CacheKey, bf16, width, hc);
         }
 
+        /// <summary>
+        /// A host-served layer's selection (<see cref="GraphFusion.MoeSelect"/>) as the engines' keyed warp select, one launch
+        /// where the region's ops were six (softmax, top-k, the gather, the sum, its clamp and the division): the selection
+        /// resident layers' experts already take (<see cref="TryDecodeExperts"/>). 0.85 ms of a Qwen3.8 Flash Next
+        /// UD-Q2_K_XL decode step on an A40 went to the ops, against the engine's 0.39.
+        /// </summary>
+        private bool TryMoeSelect(Tensor[] inputs, long[] ip, Tensor[] results)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            if (inputs.Length < 1 || ip == null || ip.Length < 2 || results.Length < 2) return false;
+            Tensor logits = inputs[0];
+            if (!AllF32OnDevice(logits) || !logits.IsContiguous()) return false;
+            long experts = logits.Sizes[^1], rows = logits.ElementCount() / Math.Max(1, experts);
+            int k = (int)ip[0], norm = ip[1] != 0 ? 1 : 0;
+            if (experts < 1 || experts > 512 || k < 1 || k > 32 || k > experts || rows < 1 || rows > int.MaxValue) return false;
+            if (_moeKernels == null && (_moeKernelsMissing || CudaGraphCapture.IsCapturing(cuda))) return false;
+            Dsv4Kernels dk = MoeKernels;
+            if (dk == null) return false;
+            var sel = new Tensor(Allocator, DType.Int32, rows, k);
+            var weights = new Tensor(Allocator, DType.Float32, rows, k, 1);
+            foreach (Tensor t in new[] { logits, sel, weights }) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            cuda.Context.MakeCurrent();
+            dk.MoeSelect(logits, IntPtr.Zero, IntPtr.Zero, null, sel, weights, (int)experts, k, norm, 1f, (int)rows, cuda.Stream.Handle,
+                Dsv4Kernels.RouterSoftmax, keys: true);
+            ((CudaStorage)sel.Storage).MarkDeviceModified();
+            ((CudaStorage)weights.Storage).MarkDeviceModified();
+            results[0] = sel;
+            results[1] = weights;
+            MoeSelectRegions++;
+            return true;
+        }
+
+        /// <summary>Selections run as <see cref="TryMoeSelect"/> (tests check the region engaged).</summary>
+        internal long MoeSelectRegions { get; private set; }
+
         /// <summary>A hyper-connection scatter (<see cref="GraphFusion.HcScatter"/>) as one pass over the streams.</summary>
         private bool TryHcScatter(Tensor[] inputs, long[] ip, Tensor[] results)
         {
@@ -772,7 +807,8 @@ namespace TensorSharp.Cuda
 
         protected override bool Fuses(GraphFusion kind) => kind switch
         {
-            GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.HcRead or GraphFusion.HcScatter => Kernels != null,
+            GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.HcRead or GraphFusion.HcScatter
+                or GraphFusion.MoeSelect => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             _ => false,
         };
@@ -785,6 +821,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs, weights, ip, results);
             if (kind == GraphFusion.HcRead) return TryHcRead(inputs, weights, ip, fp, results);
             if (kind == GraphFusion.HcScatter) return TryHcScatter(inputs, ip, results);
+            if (kind == GraphFusion.MoeSelect) return TryMoeSelect(inputs, ip, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;

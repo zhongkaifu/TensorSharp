@@ -624,6 +624,35 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(beside[i].AsSpan().SequenceEqual(inPlace[i]), $"row {i}: {RelL2(beside[i], inPlace[i]):E2} from the in-place run");
     }
 
+    /// <summary>A host-served layer's selection on the CUDA executor's keyed warp select (the selection resident layers'
+    /// experts take) gives what its softmax / top-k / renormalize ops give, within the fixture's near-tie bound.</summary>
+    [CudaFact]
+    public void HostServedSelectionOnDirectCudaMatchesItsOps()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("moe-quantized");
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        (List<float[]> Rows, long Regions) Run(bool ops)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.MoeSelectRegionDisabledForTests = ops;
+            List<float[]> rows = Script(model);
+            return (rows, ((TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests).MoeSelectRegions);
+        }
+        var kernel = Run(ops: false);
+        var ops = Run(ops: true);
+        Assert.True(kernel.Regions > 0, "no selection ran as the region");
+        Assert.Equal(0, ops.Regions);
+        _output.WriteLine("selection region vs ops: " + string.Join(" ", kernel.Rows.Select((r, i) => RelL2(r, ops.Rows[i]).ToString("E2"))));
+        // The fixture's random router has near-ties, where the two sums may pick another expert: rows then move by the
+        // quantized checkpoint's ~1e-2 (AssertHostExpertsMatchDevice's bound for it).
+        for (int i = 0; i < ops.Rows.Count; i++)
+        {
+            double rel = RelL2(kernel.Rows[i], ops.Rows[i]);
+            Assert.True(rel <= 5e-2, $"row {i}: {rel:E2} from the ops' selection");
+        }
+    }
+
     /// <summary>The staged-ahead path of a long prompt chunk (CudaGraphExecutor.PromptPrefetch: every host expert of the
     /// next MoE layer copied into the other arena half while a layer runs, the routes kept on the device), driven with
     /// the fixture's short prompt by lowering this executor's row threshold: the same answers as the device's experts.</summary>

@@ -161,6 +161,10 @@ namespace TensorSharp.Graph
         /// waits for them where their results are first read. Inputs: what the region reads. Results: what it computes.
         /// Executors that do not run it so compute the ops in place.</summary>
         ConcurrentBranch = 9,
+        /// <summary>A softmax router's selection: each row's top-K experts by their softmax probabilities (a tie to the lower
+        /// expert) and their weights - the probabilities, renormalized over the K (Ip[1] = 1) or as they are. Inputs: the
+        /// router logits [E, rows]. Ip: K, renormalize. Results: the ids [K, rows] (I32) and the weights [1, K, rows].</summary>
+        MoeSelect = 10,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
