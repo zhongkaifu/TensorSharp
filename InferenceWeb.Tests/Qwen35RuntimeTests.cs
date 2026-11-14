@@ -171,8 +171,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("dense-gqa", 1e-4)]
     [InlineData("moe", 1e-4)]
     // Measured 2026-11-10 (M5 Pro): 7.9e-3; the legacy implementation's own prefill and decode
-    // disagree by 2.5e-3 on this fixture, and ggml vs the managed kernels by 5e-2.
-    [InlineData("moe-quantized", 3e-2)]
+    // disagree by 2.5e-3 on this fixture, and ggml vs the managed kernels by 5e-2. The managed kernels' sums follow the
+    // runner's vector width: 3.03e-2 on some linux-x64 CI runners (and an RTX 2000 Ada VM's host), under 3e-2 on others.
+    [InlineData("moe-quantized", 4e-2)]
     public void MatchesTheFamilyImplementation(string variant, double tolerance)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
@@ -285,8 +286,10 @@ public sealed class Qwen35RuntimeTests : IDisposable
         // q8_1), so only ggml_cpu, whose experts are the host's kernels, compares them.
         if (variant == "moe" || backend == BackendType.GgmlCpu)
         {
-            // BF16 experts: ggml-cuda rounds the activations to BF16 (1.4e-2 measured on an RTX PRO 6000).
-            double tolerance = variant == "moe" ? 2e-2 : 3e-2;
+            // BF16 experts: ggml-cuda rounds the activations to BF16 (1.4e-2 measured on an RTX PRO 6000). Quantized ones on
+            // ggml_cpu: the prompt rows are the same bits and the decode rows carry the activations' rounding through the
+            // recurrent state (3.4e-2 measured on linux-arm64, under 3e-2 on x64).
+            double tolerance = variant == "moe" ? 2e-2 : 4e-2;
             Assert.True(host.Select((r, i) => RelL2(r, device[i])).All(r => r <= tolerance),
                 $"{variant} on {backend}: relL2 from the accelerator's experts: {Rows(host, device)}");
         }
