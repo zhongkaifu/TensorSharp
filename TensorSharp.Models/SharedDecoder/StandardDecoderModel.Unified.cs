@@ -66,18 +66,43 @@ namespace TensorSharp.Models
             int rows = Math.Min(_cudaPromptRows, remaining);
             // What the first prompt found may be held since: recorded steps keep the pool blocks their kernels used, a
             // speculating request its verify buffers, retained slots their caches (an RTX PRO 6000 slice ran out of memory
-            // part way through the second 4K prompt of a speculating run). The recordings go first (they record again);
-            // a step that still does not fit is narrower, this prompt only.
+            // part way through the second 4K prompt of a speculating run). The recordings go first (they record again), then
+            // finished requests' retained slots, the oldest first; a step that still does not fit is narrower, this prompt only.
             long need = rows * CudaPromptRowBytes() + CudaPromptReserveBytes;
-            if (CudaFreeBytes(cuda) < need)
+            if (PromptFreeBytes(cuda) < need)
             {
                 ClearGraphCache();
-                long now = CudaFreeBytes(cuda);
+                if (PromptFreeBytes(cuda) < need) ReleaseRetainedSlotsFor(need, cuda);
+                long now = PromptFreeBytes(cuda);
                 if (now < need)
                     return (int)Math.Clamp((now - CudaPromptReserveBytes) / CudaPromptRowBytes() / 256 * 256, 256, _cudaPromptRows);
             }
             return remaining <= _cudaPromptRows ? 0 : _cudaPromptRows;
         }
+
+        /// <summary>
+        /// Finished requests' retained slots (prefix-cache payloads), the oldest first, until a lone prompt's step of
+        /// <paramref name="need"/> bytes fits, each reported to the prefix cache as reclaimed (DEC-23). Kept, they narrowed
+        /// every later prompt's steps on a small card, and a narrower step stages every host expert again: a 16 GB RTX 2000
+        /// Ada's third distinct 4K prompt of Qwen3.8 Flash Next UD-Q2_K_XL ran in 1,024- and 541-row steps, 17.4 s against
+        /// 7.05 s for the first. The request being served holds its own slot, so its reuse has already happened.
+        /// </summary>
+        private void ReleaseRetainedSlotsFor(long need, TensorSharp.Cuda.CudaAllocator cuda)
+        {
+            if (_retainedSlots == null || _retainedSlots.Count == 0) return;
+            foreach (var (key, slot) in System.Linq.Enumerable.ToList(System.Linq.Enumerable.OrderBy(_retainedSlots, kv => kv.Value.RetainedAt)))
+            {
+                if (PromptFreeBytes(cuda) >= need) break;
+                _retainedSlots.Remove(key);
+                DisposeSlot(slot);
+                _prefixCacheSink?.OnPayloadInvalidated(key, Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed);
+            }
+        }
+
+        /// <summary>Tests stand in for the device's free memory a lone prompt's step is fitted to (after its first sizing).</summary>
+        internal Func<long> PromptFreeBytesForTests { get; set; }
+
+        private long PromptFreeBytes(TensorSharp.Cuda.CudaAllocator cuda) => PromptFreeBytesForTests?.Invoke() ?? CudaFreeBytes(cuda);
 
         /// <summary>The device's free bytes and its pool's cached ones (long.MaxValue when unknown).</summary>
         private static long CudaFreeBytes(TensorSharp.Cuda.CudaAllocator cuda)

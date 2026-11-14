@@ -41,7 +41,10 @@ namespace TensorSharp.Models
             public int VerifyRows;                 // a batched verify's window, its recurrent states awaiting the commit
             public int DraftFollowed = -1;         // the draft layer holds the trunk's own rows through here (see DraftFollowReady)
             public Tensor DraftCarry;              // the trunk's last followed row's stream (the next followed row's input)
+            public long RetainedAt;                // when it entered the retained set (the oldest goes first under pressure)
         }
+
+        private static long s_retainSerial;
 
         /// <summary>Rows of a batched step: sequence s owns rows [QueryStart[s], QueryStart[s] + Counts[s])
         /// and continues its slot from position Starts[s].</summary>

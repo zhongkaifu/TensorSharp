@@ -71,6 +71,35 @@ public sealed class Qwen35RuntimeTests : IDisposable
     private static Qwen35RuntimeModel Create(string path, int tp = 1, int stages = 1, BackendType backend = BackendType.Cpu)
         => new(path, backend, tp, tp > 1 ? new SimulatedDeviceGroup(tp * stages) : null, stages);
 
+    /// <summary>A lone CUDA prompt whose full step does not fit the device releases finished requests' retained slots, the
+    /// oldest first and only until the step fits, each reported to the prefix cache as reclaimed (kept, they narrowed every
+    /// later prompt's steps on a 16 GB card).</summary>
+    [CudaFact]
+    public void ALonePromptReleasesTheOldestRetainedSlotsItNeeds()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), backend: BackendType.Cuda);
+        var sink = new InferenceWeb.Tests.PrefixCache.Fakes.RecordingPayloadSink();
+        model.AttachPrefixCache(sink);
+        var unified = (IUnifiedBatchModel)model;
+        string[] keys = { "pc:test:1", "pc:test:2", "pc:test:3" };
+        for (int i = 0; i < keys.Length; i++)
+        {
+            string id = $"done{i}";
+            unified.EnsureSequenceSlot(id, 64);
+            Assert.True(unified.TryForwardUnified(new[] { id }, new[] { Enumerable.Range(0, 12).Select(t => 30 + i + t).ToArray() }, new[] { 0 },
+                new float[1][]));
+            Assert.True(model.RetainSequenceCacheAs(id, keys[i]));
+        }
+        // The first lone prompt sizes its steps from the device; then the device has room only with one slot left retained.
+        model.PreferredSoloPrefillTokens(0, 1000);
+        model.PromptFreeBytesForTests = () => model.RetainedPayloadKeys.Count > 1 ? 0 : long.MaxValue;
+        model.PreferredSoloPrefillTokens(0, 100_000);
+        Assert.Equal(new[] { keys[2] }, model.RetainedPayloadKeys);
+        Assert.Equal(new[] { (keys[0], TensorSharp.Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed), (keys[1], TensorSharp.Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed) },
+            sink.Reports);
+    }
+
     /// <summary>The factory's route: the shared runtime serves every checkpoint on every backend and placement; only a
     /// dense NVFP4 checkpoint on one direct-CUDA GPU leaves it for the direct engine.</summary>
     [Theory]

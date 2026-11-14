@@ -486,6 +486,7 @@ namespace TensorSharp.Models
                 slot.RopeDelta = ropeDelta;
                 slot.DraftStart = length;   // the file holds no draft-layer rows
                 slot.DraftFollowed = -1;
+                slot.RetainedAt = System.Threading.Interlocked.Increment(ref s_retainSerial);
                 _retainedSlots.Add(key, slot);
                 return true;
             }
