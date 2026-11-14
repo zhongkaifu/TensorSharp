@@ -18,7 +18,9 @@ namespace TensorSharp
     public interface IHostRangePinner
     {
         /// <summary>Page-lock as many of <paramref name="ranges"/> as the host allows (the rest stay pageable), in order,
-        /// stopping at <paramref name="cancel"/>. The handle unlocks them: dispose it before the memory goes. Any thread.</summary>
-        IDisposable PinHostRanges(IReadOnlyList<(IntPtr Pointer, long Bytes)> ranges, CancellationToken cancel);
+        /// stopping at <paramref name="cancel"/>. <paramref name="allowance"/>: the bytes the caller measured free for the
+        /// locks (0: the pinner's own limit), which the process may lock from then on. The handle unlocks them: dispose it
+        /// before the memory goes. Any thread.</summary>
+        IDisposable PinHostRanges(IReadOnlyList<(IntPtr Pointer, long Bytes)> ranges, long allowance, CancellationToken cancel);
     }
 }

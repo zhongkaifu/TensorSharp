@@ -75,6 +75,12 @@ namespace TensorSharp.Models
             if (pinner != null)
                 foreach ((IntPtr _, long bytes) in stacks) locked += bytes;
             long room = available - MappedTableWarm.Headroom - locked;
+            // The locks may take what the host has free less a reserve for the OS, the rest of the process and the page cache
+            // the host-only tables are read through (the direct engines' rule, Q4eCudaEngine.HostPinReserve): a fixed 60% of
+            // the managed heap's limit had locked 26.6 of a 16 GB card's 37.6 GiB of host experts in a 62 GB cgroup, so a
+            // third of every prompt's staging went through pageable copies (Qwen3.8 Flash Next UD-Q2_K_XL; the engine pins
+            // all 35.8 GiB of its host experts there).
+            long pinAllowance = available > HostPinReserve ? available - HostPinReserve : 0;
             var ranges = new List<(IntPtr Pointer, long Bytes)>();
             var copies = new List<QuantizedWeight>();
             long tableBytes = 0, expertBytes = 0, copyBytes = 0;
@@ -138,7 +144,7 @@ namespace TensorSharp.Models
                     if (pinner != null && !cancel.IsCancellationRequested)
                     {
                         sw.Restart();
-                        _hostPins = pinner.PinHostRanges(stacks, cancel);
+                        _hostPins = pinner.PinHostRanges(stacks, pinAllowance, cancel);
                         Console.Error.WriteLine($"[{arch}] page-locked the offloaded experts' file ranges in {sw.Elapsed.TotalSeconds:F1}s");
                     }
                 }
@@ -153,6 +159,9 @@ namespace TensorSharp.Models
                     (wait ? "before serving (TS_HOST_WARM_WAIT=1)" : "in the background (the first answers read the rest from the model files)"));
             if (wait) _hostWarm.Wait();
         }
+
+        /// <summary>Host memory left beside the experts' page locks (the direct engines' HostPinReserve).</summary>
+        private const long HostPinReserve = 4L << 30;
 
         /// <summary>Host memory a table copy leaves beside itself (the direct engines' rule).</summary>
         private const long HostTableCopyHeadroom = 6L << 30;

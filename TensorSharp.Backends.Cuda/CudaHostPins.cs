@@ -31,8 +31,21 @@ namespace TensorSharp.Cuda
         // Disjoint, sorted by start (so by end too): found by binary search, as a host's experts pin as thousands of runs.
         private static readonly SortedList<long, (long End, CudaHostPins Owner)> Ranges = new();
         private static readonly long Budget = Math.Max(0, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / 10 * 6);
+        // What a planner allowed beyond the budget (Allow): the host memory it measured free for the locks.
+        private static long _allowed;
         private static long _pinned;
         private static bool _refused;
+
+        /// <summary>Most bytes the process registers: 60% of the managed heap's limit, or what a planner allowed (the host
+        /// memory it measured free, less a reserve), whichever is more.</summary>
+        private static long Limit => Math.Max(Budget, _allowed);
+
+        /// <summary>Let the process register up to <paramref name="bytes"/> (a planner's measure of the host memory free for
+        /// the locks); never lowers the limit.</summary>
+        public static void Allow(long bytes)
+        {
+            lock (Sync) _allowed = Math.Max(_allowed, bytes);
+        }
 
         /// <summary>Bytes registered in the process.</summary>
         public static long PinnedBytes { get { lock (Sync) return _pinned; } }
@@ -64,7 +77,7 @@ namespace TensorSharp.Cuda
                 bool all = true;
                 foreach ((long s, long e) in gaps)
                 {
-                    if (_pinned + (e - s) > Budget) { all = false; continue; }
+                    if (_pinned + (e - s) > Limit) { all = false; continue; }
                     int rc = CudaDriverApi.cuMemHostRegister(new IntPtr(s), new UIntPtr((ulong)(e - s)),
                         CudaDriverApi.CU_MEMHOSTREGISTER_PORTABLE | CudaDriverApi.CU_MEMHOSTREGISTER_READ_ONLY);
                     if (rc != 0)

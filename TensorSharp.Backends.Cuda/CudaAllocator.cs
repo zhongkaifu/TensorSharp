@@ -250,8 +250,9 @@ namespace TensorSharp.Cuda
 
         public bool SharesHostMemory => false;
 
-        public IDisposable PinHostRanges(IReadOnlyList<(IntPtr Pointer, long Bytes)> ranges, System.Threading.CancellationToken cancel)
+        public IDisposable PinHostRanges(IReadOnlyList<(IntPtr Pointer, long Bytes)> ranges, long allowance, System.Threading.CancellationToken cancel)
         {
+            if (allowance > 0) CudaHostPins.Allow(allowance);
             Context.MakeCurrent();
             var pins = new CudaHostPins();
             foreach ((IntPtr pointer, long bytes) in ranges)
