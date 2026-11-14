@@ -376,6 +376,10 @@ namespace TensorSharp.Graph
             public readonly int[] Uses;
             private readonly GraphNode[] _nodes;
 
+            /// <summary>Each aliased node's state leaf and byte offset (<see cref="GraphNodeKind.Alias"/>): the session hands
+            /// them to the node's op, which may write its result there (<see cref="AliasDestination"/>).</summary>
+            public readonly Dictionary<int, (int Leaf, long Offset)> Aliases = new();
+
             public Liveness(GraphProgram program)
             {
                 Count = program.NodeCount;
@@ -400,6 +404,7 @@ namespace TensorSharp.Graph
                         case GraphNodeKind.Alias:
                             Uses[e.Node] += Forever;
                             Uses[e.Srcs[1]] += Forever;
+                            Aliases[e.Node] = (e.Srcs[0], e.Bytes);
                             break;
                         case GraphNodeKind.Boundary:
                             Uses[e.Node]++;
@@ -516,7 +521,12 @@ namespace TensorSharp.Graph
                         Pinned(alias.Srcs[1]);
                         Attribute(() =>
                         {
-                            if (!_x.TryAlias(Get(alias.Node), Get(alias.Srcs[0]), alias.Bytes)) Force(alias.Srcs[1]);
+                            if (_x.TryAlias(Get(alias.Node), Get(alias.Srcs[0]), alias.Bytes)) _x.AliasesInPlace++;
+                            else
+                            {
+                                _x.AliasCopies++;
+                                Force(alias.Srcs[1]);
+                            }
                         });
                         break;
                     }
@@ -848,7 +858,15 @@ namespace TensorSharp.Graph
                     }
                 }
                 foreach (int src in n.Srcs) Force(src);
-                Value v = _x.Eval(n, _values, Run);
+                // An aliased op may write its result into the alias's leaf (bound before it, on the template's nodes).
+                (int Leaf, long Offset) target = default;
+                bool aliased = _freeing && _x.TakesAliasDestinations && !_x.AliasDestinationsDisabledForTests
+                    && _live.Aliases.TryGetValue(node, out target)
+                    && target.Leaf < node && _state[target.Leaf] == Done && _values[target.Leaf].Tensor != null;
+                if (aliased) _x._aliasTarget = (Get(target.Leaf), target.Offset);
+                Value v;
+                try { v = _x.Eval(n, _values, Run); }
+                finally { if (aliased) _x._aliasTarget = default; }
                 bool fresh = n.Op switch
                 {
                     GraphOp.View or GraphOp.Reshape or GraphOp.Permute or GraphOp.Transpose or GraphOp.KvWindow => _fresh[n.Srcs[0]],
@@ -1084,6 +1102,31 @@ namespace TensorSharp.Graph
         /// without the alias's copy (the executor shares the result's memory); false runs the copy.</summary>
         protected virtual bool TryAlias(Tensor result, Tensor leaf, long offsetBytes) => false;
 
+        private (Tensor Leaf, long Offset) _aliasTarget;
+
+        /// <summary>Aliases whose op wrote its result in place, and those whose copy ran (tests).</summary>
+        internal long AliasesInPlace { get; private set; }
+        internal long AliasCopies { get; private set; }
+
+        /// <summary>Whether this executor's ops may write their results where an alias names (<see cref="AliasDestination"/>): the
+        /// session then binds the alias's leaf before the op runs.</summary>
+        protected virtual bool TakesAliasDestinations => false;
+
+        /// <summary>Tests: no op is offered its alias's destination (each alias then finds what the op allocated).</summary>
+        internal bool AliasDestinationsDisabledForTests { get; set; }
+
+        /// <summary>While an aliased op runs (<see cref="GraphNodeKind.Alias"/>): a view of <paramref name="elements"/> F32 values of
+        /// the alias's leaf at its offset, where the op may write its result so that <see cref="TryAlias"/> finds it in place (the
+        /// alias's copy then never runs); null when no alias names the op or its leaf has no room for them.</summary>
+        protected Tensor AliasDestination(long elements)
+        {
+            (Tensor leaf, long offset) = _aliasTarget;
+            if (leaf == null || leaf.ElementType != DType.Float32 || !leaf.IsContiguous() || offset % sizeof(float) != 0) return null;
+            long first = offset / sizeof(float);
+            if (first + elements > leaf.ElementCount()) return null;
+            return new Tensor(new[] { elements }, new[] { 1L }, leaf.Storage, leaf.StorageOffset + first);
+        }
+
         /// <summary>Rotary positions per row are a broadcast of the positions tensor on the device, not an upload of
         /// host values per step (a backend whose recorded steps must read their positions from the device).</summary>
         protected virtual bool BroadcastsPositionsOnDevice => false;
@@ -1097,6 +1140,7 @@ namespace TensorSharp.Graph
         /// <paramref name="weights"/> at the same index; false (nothing set) where the kernel does not apply,
         /// and the region's ops run instead.</summary>
         protected virtual bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results) => false;
+
 
         /// <summary>Whether a region of <paramref name="kind"/> (<see cref="GraphFusion.ConcurrentBranch"/>) runs its ops at its
         /// end, where <see cref="BeginConcurrent"/> may move them beside the step's later work.</summary>

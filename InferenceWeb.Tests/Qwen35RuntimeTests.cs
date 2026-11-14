@@ -923,6 +923,42 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData(BackendType.Cuda)]
     public void AdvancedWindowsRetraceAfterTheirVerifyBuffersAreFreedOnDirectCuda(BackendType backend) => AssertWindowsRetraceAfterRelease(backend);
 
+    /// <summary>A verify window's recurrence on direct CUDA writes its rows and its state after every row straight into the
+    /// request's verify buffer (the alias's destination), where each window had copied them (12.7 MB a layer of a 4-row
+    /// window of Qwen3.8 Flash Next): the same kernel into other memory, so every window's logits are the same bits.</summary>
+    [CudaFact]
+    public void VerifyWindowRecurrenceWritesItsVerifyBufferInPlaceOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture("dense");
+        (List<float[]> Logits, long InPlace, long Copies) Run(bool inPlace)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            var executor = (TensorSharp.Graph.TensorGraphExecutor)model.GraphExecutorForTests;
+            executor.AliasDestinationsDisabledForTests = !inPlace;
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            int vocab = model.Config.VocabSize;
+            spec.SpecForward(Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray(), null, new float[vocab], false);
+            long inPlaceBefore = executor.AliasesInPlace, copiesBefore = executor.AliasCopies;
+            var trace = new List<float[]>();
+            for (int w = 0; w < 6; w++)
+            {
+                int[] window = Enumerable.Range(0, 4).Select(i => 60 + (w * 4 + i) % 30).ToArray();
+                var logits = new float[4 * vocab];
+                spec.SpecForward(window, null, logits, true);
+                spec.SpecOnVerifyAccepted(3, 4);
+                trace.Add(logits);
+            }
+            return (trace, executor.AliasesInPlace - inPlaceBefore, executor.AliasCopies - copiesBefore);
+        }
+        var placed = Run(inPlace: true);
+        var copied = Run(inPlace: false);
+        Assert.True(placed.InPlace > copied.InPlace, $"windows' results in place: {placed.InPlace} vs {copied.InPlace} without destinations");
+        Assert.True(placed.Copies < copied.Copies, $"alias copies: {placed.Copies} vs {copied.Copies} without destinations");
+        for (int w = 0; w < placed.Logits.Count; w++)
+            Assert.True(placed.Logits[w].AsSpan().SequenceEqual(copied.Logits[w]), $"window {w} differs with its result written in place");
+    }
+
     private void AssertWindowsRetraceAfterRelease(BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);

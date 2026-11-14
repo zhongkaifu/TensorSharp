@@ -106,6 +106,9 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>The recurrence wrote its result into the leaf already (<see cref="GatedDeltaNet"/>): nothing to copy.</summary>
+        /// <summary>A verify window's recurrence writes its result into the request's verify buffer (<see cref="GatedDeltaNet"/>).</summary>
+        protected override bool TakesAliasDestinations => true;
+
         protected override bool TryAlias(Tensor result, Tensor leaf, long offsetBytes)
             => ReferenceEquals(result.Storage, leaf.Storage)
                && result.StorageOffset * result.ElementType.Size() == leaf.StorageOffset * leaf.ElementType.Size() + offsetBytes;
@@ -981,9 +984,18 @@ namespace TensorSharp.Cuda
             // the decode GPU time).
             bool inPlace = slots == 1 && tokens == 1 && sequences == 1 && state.Storage is CudaStorage held
                 && state.StorageOffset == rowFloats && held.ElementCount == total && held.DeviceId == cuda.DeviceId;
+            // A verify window's result goes where its alias names (the request's verify buffer): the window had copied its
+            // rows and its state after every row there, 12.7 MB a layer of a 4-row window of Qwen3.8 Flash Next (1.05 ms).
+            Tensor into = inPlace ? null : AliasDestination(total);
+            if (into != null && (into.Storage is not CudaStorage target || target.DeviceId != cuda.DeviceId
+                || Array.Exists(inputs, t => ReferenceEquals(t.Storage, into.Storage))))
+            {
+                into.Dispose();
+                into = null;
+            }
             Tensor result = inPlace
                 ? new Tensor(new[] { total }, new[] { 1L }, state.Storage, 0)
-                : new Tensor(Allocator, DType.Float32, total);
+                : into ?? new Tensor(Allocator, DType.Float32, total);
             foreach (Tensor t in inputs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
             var output = (CudaStorage)result.Storage;
             output.EnsureDeviceCurrent();

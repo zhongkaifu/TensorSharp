@@ -277,6 +277,14 @@ namespace TensorSharp.Models
                 // result into the request's verify buffer in place, the live state stays the one before the
                 // window, and the commit copies the accepted prefix's state into place.
                 long stateBytes = stateFloats * f;
+                // The verify buffer binds before the recurrence, so an executor can write the window's result there in place.
+                int verify = -1, cap = 0;
+                if (keep)
+                {
+                    if (state.EnsureSpecBuffers(count)) NoteGraphBindingsChanged();
+                    cap = state.SnapshotCapacity;
+                    verify = step.State(state.Verify, GraphFormat.F32, cap * (state.RowFloats + stateFloats));
+                }
                 int gdn = step.Op(GraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 },
                     stackalloc long[] { keep ? count : 1 });
                 int scores = step.View2(gdn, v, count, v * f, 0);
@@ -284,9 +292,6 @@ namespace TensorSharp.Models
                     stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
                 if (keep)
                 {
-                    if (state.EnsureSpecBuffers(count)) NoteGraphBindingsChanged();
-                    int cap = state.SnapshotCapacity;
-                    int verify = step.State(state.Verify, GraphFormat.F32, cap * (state.RowFloats + stateFloats));
                     long total = v * count + stateFloats * count;
                     int fallback = step.Op(GraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(verify, total, 1, total * f, 0));
                     step.Alias(gdn, verify, 0, fallback);
