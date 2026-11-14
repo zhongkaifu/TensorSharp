@@ -149,6 +149,13 @@ namespace TensorSharp.Models
             }
 
             bool dflash = HasDFlash;
+            int rows = n * window;
+            var flat = new int[rows];
+            Array.Copy(tokens, flat, rows);
+            // A lone request's one-row step that captures its carry (no drafts yet) hands the draft layer its row when the
+            // layer followed the rows before it (its prompt).
+            DraftFollow follow = n == 1 && window == 1 && !dflash && featuresOut != null ? PlanDraftFollow(slots[0], positions[0], null) : DraftFollow.None;
+            if (follow == DraftFollow.FromStart) follow = DraftFollow.None;
             var request = new GraphRequest
             {
                 LastRowLogits = false,
@@ -156,10 +163,9 @@ namespace TensorSharp.Models
                 CaptureLayers = dflash && featuresOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
                 CaptureFinal = !dflash && featuresOut != null,
                 RecurrentSnapshots = _anyRecurrent && window > 1,
+                FollowDraft = follow,
+                DraftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], flat, media: false) : null,
             };
-            int rows = n * window;
-            var flat = new int[rows];
-            Array.Copy(tokens, flat, rows);
             Tensor hidden = EmbedStep(flat);
             GraphResult result;
             _forwardSw.Start();
@@ -178,6 +184,7 @@ namespace TensorSharp.Models
                 slots[s].Length = positions[s] + window;
                 slots[s].VerifyRows = request.RecurrentSnapshots ? window : 0;
             }
+            if (follow != DraftFollow.None) NoteDraftFollowed(slots[0], positions[0], window);
             Array.Copy(result.Logits, 0, logitsOut, 0, Math.Min((long)rows * Config.VocabSize, logitsOut.LongLength));
             WriteSpecFeatures(featuresOut, rows, result.Captures, result.Final);
             BatchedSpecVerifySteps++;

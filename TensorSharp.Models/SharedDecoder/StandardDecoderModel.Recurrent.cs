@@ -76,6 +76,14 @@ namespace TensorSharp.Models
             /// only a verify window needs; a later verify allocates it again.</summary>
             protected internal virtual void ReleaseSpecBuffers() { }
 
+            /// <summary>Counts every change of a state's graph-bound buffers (a verify buffer grown, or freed when its slot
+            /// was retained or pooled). A decode step kept to advance binds the buffers it was traced with, so it is never
+            /// advanced or replayed across a change: a recorded verify window had written a freed verify buffer of the
+            /// pooled slot the next request took (CUDA error 700).</summary>
+            internal static long BindingChanges;
+
+            protected static void NoteBindingsChanged() => System.Threading.Interlocked.Increment(ref BindingChanges);
+
             /// <summary>Bytes of the state's tensors (a retained slot's footprint counts them with its caches).</summary>
             protected internal virtual long StateBytes => 0;
 
@@ -98,6 +106,15 @@ namespace TensorSharp.Models
         private bool[] _recurrentLayer;
         private bool _anyRecurrent;
         private RecurrentState[][] _recurrentPrimary;   // [layer][rank]
+
+        /// <summary>The active cache's states give up their verify buffers, as a retained slot's do (tests).</summary>
+        internal void ReleaseActiveSpecBuffersForTests()
+        {
+            if (_recurrentPrimary == null) return;
+            foreach (RecurrentState[] layer in _recurrentPrimary)
+                if (layer != null)
+                    foreach (RecurrentState state in layer) state?.ReleaseSpecBuffers();
+        }
 
         // ---------------------------------------------------------------- family hooks
 

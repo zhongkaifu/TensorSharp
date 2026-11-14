@@ -288,6 +288,7 @@ namespace TensorSharp.Models
             /// memory on the fourth request).</summary>
             protected internal override void ReleaseSpecBuffers()
             {
+                if (Verify != null || ConvHistory != null) NoteBindingsChanged();
                 Free(Verify);
                 Free(ConvHistory);
                 Verify = null;
@@ -310,6 +311,7 @@ namespace TensorSharp.Models
                 Verify = new Tensor(_allocator, DType.Float32, capacity * (RowFloats + StateFloats));
                 ConvHistory = new Tensor(_allocator, DType.Float32, Channels, ConvRows + capacity);
                 SnapshotCapacity = capacity;
+                NoteBindingsChanged();
                 return true;
             }
             /// <summary>One token's recurrence outputs followed by the state (Ssm views its tail).</summary>

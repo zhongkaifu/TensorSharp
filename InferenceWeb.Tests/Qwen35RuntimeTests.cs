@@ -790,6 +790,67 @@ public sealed class Qwen35RuntimeTests : IDisposable
     public void AdvancedRankedDecodeStepsMatchTracedOnes(string variant)
         => AssertAdvancedDecodeMatchesTraced(variant, path => new Qwen35RuntimeModel(path, BackendType.GgmlCuda, 2, null, 1));
 
+    /// <summary>A verify window kept to advance (and, on CUDA, recorded) is never run again on verify buffers its states
+    /// gave up since (a retained or pooled slot frees them): the next window traces anew and answers as a model whose
+    /// buffers stayed. A recorded window had written the freed buffers of the pooled slot the next request took (CUDA
+    /// error 700 on an RTX PRO 6000).</summary>
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    public void AdvancedWindowsRetraceAfterTheirVerifyBuffersAreFreed(BackendType backend) => AssertWindowsRetraceAfterRelease(backend);
+
+    [CudaTheory]
+    [InlineData(BackendType.Cuda)]
+    public void AdvancedWindowsRetraceAfterTheirVerifyBuffersAreFreedOnDirectCuda(BackendType backend) => AssertWindowsRetraceAfterRelease(backend);
+
+    private void AssertWindowsRetraceAfterRelease(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        List<float[]> Run(bool release, out int advances)
+        {
+            using var model = Create(path, backend: backend);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            int vocab = model.Config.VocabSize;
+            spec.SpecForward(Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray(), null, new float[vocab], false);
+            var trace = new List<float[]>();
+            for (int w = 0; w < 7; w++)
+            {
+                if (w == 5)
+                {
+                    // The window before keeps all its rows (settled now, as a request's last verify is before its slot is retained).
+                    spec.SpecOnVerifyAccepted(3, 4);
+                    if (release) model.ReleaseActiveSpecBuffersForTests();
+                }
+                int[] window = Enumerable.Range(0, 4).Select(i => 60 + (w * 4 + i) % 30).ToArray();
+                var logits = new float[4 * vocab];
+                spec.SpecForward(window, null, logits, true);
+                trace.Add(logits);
+            }
+            advances = model.WindowAdvances;
+            return trace;
+        }
+        List<float[]> kept = Run(release: false, out int keptAdvances), released = Run(release: true, out _);
+        Assert.True(keptAdvances >= 3, $"{backend}: {keptAdvances} windows advanced");
+        // CUDA records a kept window, whose attention runs over the whole window with its mask (a retraced one over the
+        // written keys): the same sums in another order. A freed buffer read back gives garbage, or CUDA error 700.
+        for (int w = 0; w < kept.Count; w++)
+        {
+            if (backend == BackendType.Cpu)
+            {
+                Assert.True(kept[w].AsSpan().SequenceEqual(released[w]), $"{backend}: window {w} differs after the verify buffers were freed");
+                continue;
+            }
+            double num = 0, den = 0;
+            for (int i = 0; i < kept[w].Length; i++)
+            {
+                double d = kept[w][i] - released[w][i];
+                num += d * d;
+                den += kept[w][i] * (double)kept[w][i];
+            }
+            Assert.True(Math.Sqrt(num / den) < 1e-2, $"{backend}: window {w} is {Math.Sqrt(num / den):E2} away after the verify buffers were freed");
+        }
+    }
+
     private void AssertAdvancedDecodeMatchesTraced(string variant, Func<string, Qwen35RuntimeModel> create)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
@@ -910,6 +971,24 @@ public sealed class Qwen35RuntimeTests : IDisposable
             return hindered;
         }, $"qwen35 dense, {failures} forward allocation failures");
         Assert.Equal(0, hindered.InjectedForwardAllocationFailures);
+    }
+
+    /// <summary>The draft layer follows a speculating request's plain prompt (the trunk's own steps hand it their rows):
+    /// its first draft is the one the speculator's catch-up over the same rows gives.</summary>
+    [Fact]
+    public void FollowedPromptDraftsAsItsCatchUp()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(() => Create(path), "qwen35 nextn cpu", 1e-4);
+    }
+
+    [CudaFact]
+    public void FollowedPromptDraftsAsItsCatchUpOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(() => Create(path, backend: BackendType.Cuda), "qwen35 nextn cuda", 2e-3);
     }
 
     /// <summary>The NextN/MTP block drafts through the runtime's generic draft layer: speculation

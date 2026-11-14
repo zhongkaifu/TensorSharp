@@ -375,6 +375,107 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     [InlineData(true)]
     public Task MtpSpeculationOnDirectCudaMatchesPlain(bool qsa) => AssertMtpSpeculation(qsa, BackendType.Cuda);
 
+    /// <summary>The MTP head follows a speculating request's plain prompt (the trunk's own steps hand it their streams, the
+    /// carry crossing chunks), on one device and on the last of two whole-layer stages (the draft embedding then its own
+    /// input): its first draft is the one the speculator's catch-up over the same rows gives.</summary>
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(true, 1)]
+    [InlineData(false, 2)]
+    public void FollowedPromptDraftsAsItsCatchUp(bool qsa, int stages)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(
+            () => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, draftModelPath: mtp, layerSplitDegree: stages),
+            $"qwen4exp mtp qsa={qsa} stages={stages}", 1e-4);
+    }
+
+    /// <summary>The MTP head's routed experts requantized at load (the CUDA preset's TS_Q4E_MTP_EXPERTS=q2_0): the draft
+    /// layer holds Q2_0 stacks, and speculation still emits the plain greedy streams (the verify decides every token).</summary>
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    public Task Q2_0DraftExpertsSpeculateAsPlain(BackendType backend) => AssertQ2_0DraftExperts(backend);
+
+    [CudaTheory]
+    [InlineData(BackendType.Cuda)]
+    public Task Q2_0DraftExpertsSpeculateAsPlainOnDirectCuda(BackendType backend) => AssertQ2_0DraftExperts(backend);
+
+    private async Task AssertQ2_0DraftExperts(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa: false);
+        Qwen4ExpRuntimeModel.DraftExpertTypeForTests.Value = TensorSharp.Models.WeightRequant.GgmlTypeQ2_0;
+        try
+        {
+            using (var probe = new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp))
+                Assert.Equal(TensorSharp.Models.WeightRequant.GgmlTypeQ2_0, probe.DraftExpertType);
+            var options = new TensorSharp.Runtime.Speculative.SpeculationOptions
+            {
+                Enabled = true, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0,
+            };
+            await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(
+                () => new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp), options, $"qwen4exp q2_0 mtp experts {backend}");
+        }
+        finally
+        {
+            Qwen4ExpRuntimeModel.DraftExpertTypeForTests.Value = null;
+        }
+    }
+
+    /// <summary>A draft head scoring a vocabulary prefix (the family's base vocabulary) proposes from the full head's
+    /// logits over those ids, the rest never drafted.</summary>
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    public void DraftVocabularyPrefixScoresTheFullHeadsLogits(BackendType backend) => AssertDraftVocabularyPrefix(backend);
+
+    [CudaTheory]
+    [InlineData(BackendType.Cuda)]
+    public void DraftVocabularyPrefixScoresTheFullHeadsLogitsOnDirectCuda(BackendType backend) => AssertDraftVocabularyPrefix(backend);
+
+    private void AssertDraftVocabularyPrefix(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa: false);
+        float[] Draft(int? vocabulary)
+        {
+            using var model = new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp) { DraftVocabularyForTests = vocabulary };
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeModel)model;
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            int[] prompt = Enumerable.Range(0, 13).Select(i => 30 + (i * 7) % 90).ToArray();
+            var rows = new float[prompt.Length * feat];
+            var logits = new float[vocab];
+            spec.SpecForward(prompt, rows, logits, false);
+            spec.DraftCatchUp(prompt[1..], rows[..((prompt.Length - 1) * feat)], 1);
+            var draft = new float[vocab];
+            spec.DraftStep(ArgMax(logits), rows[((prompt.Length - 1) * feat)..], prompt.Length, draft, new float[feat]);
+            return draft;
+        }
+        float[] full = Draft(null);
+        int half = full.Length / 2;
+        float[] prefix = Draft(half);
+        double num = 0, den = 0;
+        for (int i = 0; i < half; i++)
+        {
+            num += (prefix[i] - full[i]) * (double)(prefix[i] - full[i]);
+            den += full[i] * (double)full[i];
+        }
+        Assert.True(Math.Sqrt(num / den) < 1e-5, $"{backend}: the prefix head's logits are {Math.Sqrt(num / den):E2} from the full head's");
+        for (int i = half; i < prefix.Length; i++)
+            Assert.True(float.IsNegativeInfinity(prefix[i]), $"{backend}: id {i} past the draft vocabulary scored {prefix[i]}");
+    }
+
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FollowedPromptDraftsAsItsCatchUpOnDirectCuda(bool qsa)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(
+            () => new Qwen4ExpRuntimeModel(target, BackendType.Cuda, draftModelPath: mtp), $"qwen4exp mtp qsa={qsa} cuda", 2e-3);
+    }
+
     private async Task AssertMtpSpeculation(bool qsa, BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
@@ -383,8 +484,16 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         {
             Enabled = true, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0,
         };
-        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() => new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp),
-            options, $"qwen4exp mtp qsa={qsa} {backend}");
+        var models = new List<Qwen4ExpRuntimeModel>();
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() =>
+        {
+            var model = new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp);
+            models.Add(model);
+            return model;
+        }, options, $"qwen4exp mtp qsa={qsa} {backend}");
+        // The verify windows ran as the kept window of their width advanced to their positions (recorded on CUDA).
+        int windows = models.Sum(m => m.WindowAdvances);
+        Assert.True(windows > 0, $"{backend} qsa={qsa}: no verify window advanced");
     }
 
     /// <summary>n-gram drafts (accepted and rejected): the verify keeps each row's recurrent and PLE state, and the

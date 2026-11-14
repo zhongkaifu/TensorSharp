@@ -212,6 +212,12 @@ namespace TensorSharp.Models
 
         /// <summary>Each stream sees [rms(embedding) * enorm, grouped rms(stream) * hnorm] through eh_proj (a single
         /// norm over the whole stream, or one projection of all streams, is a different trained model).</summary>
+        /// <summary>The draft head scores the Qwen2 base vocabulary (ids below the first token of the Qwen3.5/3.8
+        /// tokenizer's extensions): the later multilingual additions and the special tokens are almost never the next
+        /// token (0.2% of mixed English/Chinese text, 0.01% of Chinese), and the head over all 248,320 rows was 270 us
+        /// of each draft step on an RTX 5090 (the direct engine's default, TS_Q4E_DRAFT_VOCAB).</summary>
+        protected override int DraftVocabulary => Math.Min(Config.VocabSize, 151643);
+
         protected override int EmitDraftInput(GraphStep step, int layer, int embedded, int hidden)
         {
             PleSpec p = Ple;
@@ -464,6 +470,7 @@ namespace TensorSharp.Models
         protected override void PrepareLoadedWeights()
         {
             ReadHyperConnectionsAsQ8_0();
+            RequantizeDraftExperts();
             base.PrepareLoadedWeights();
             PleSpec p = Ple;
             for (int l = 0; l < Config.NumLayers; l++)
@@ -513,6 +520,65 @@ namespace TensorSharp.Models
             }
             Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
                 $"  Hyper-connection matrices read as Q8_0 (TS_Q4E_HC_Q8=1): {names.Count} BF16 matrices, {before / 1e9:F2} -> {after / 1e9:F2} GB a token."));
+        }
+
+        /// <summary>
+        /// TS_Q4E_MTP_EXPERTS (the CUDA preset's q2_0, Strata's read): the MTP draft layer's 512 routed experts in another
+        /// ggml type, requantized once at load through ggml's own quantizer (the shared Q8_0 head's 2,550 MiB of experts
+        /// as 675 MiB of Q2_0, which a draft step reads a tenth as much of, and which the trunk's expert tiers keep). Drafts
+        /// only: the verify decides every token.
+        /// </summary>
+        /// <summary>Tests load the draft layer's experts in another type than TS_Q4E_MTP_EXPERTS names (this flow only).</summary>
+        internal static readonly System.Threading.AsyncLocal<int?> DraftExpertTypeForTests = new();
+
+        /// <summary>The ggml type the draft layer's routed experts are held in (-1: no draft layer).</summary>
+        internal int DraftExpertType
+            => _stackedExpertWeights != null && _stackedExpertWeights.TryGetValue(LayerName(Config.NumLayers, "ffn_gate_exps.weight"), out var s) ? s.GgmlType : -1;
+
+        private unsafe void RequantizeDraftExperts()
+        {
+            int type = DraftExpertTypeForTests.Value ?? WeightRequant.MtpExpertType();
+            if (type < 0 || DraftLayerCount == 0 || _stackedExpertWeights == null) return;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            long before = 0, after = 0;
+            foreach (string part in new[] { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps" })
+            {
+                string name = LayerName(Config.NumLayers, part + ".weight");
+                if (!_stackedExpertWeights.TryGetValue(name, out StackedExpertWeights stack) || stack.GgmlType == type || stack.Data == IntPtr.Zero)
+                    continue;
+                long rows = stack.PerExpertNe1 * stack.NumExperts, srcRow = stack.TotalRawBytes / rows;
+                IntPtr src = stack.Data;
+                IntPtr aligned = WeightRequant.Requantize(
+                    (r0, n, buffer) => Buffer.MemoryCopy((void*)(src + (nint)(r0 * srcRow)), (void*)buffer, n * srcRow, n * srcRow),
+                    stack.GgmlType, stack.PerExpertNe0, rows, type, out long bytes);
+                if (aligned == IntPtr.Zero)
+                {
+                    Console.WriteLine($"  {name}: ggml cannot quantize to {(GgmlTensorType)type} here; kept as stored.");
+                    continue;
+                }
+                // The model frees owned stacks as host buffers.
+                IntPtr owned = QuantizedWeight.AllocateBuffer(bytes);
+                Buffer.MemoryCopy((void*)aligned, (void*)owned, bytes, bytes);
+                System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)aligned);
+                var requantized = new StackedExpertWeights(owned, type, stack.PerExpertNe0, stack.PerExpertNe1, stack.NumExperts, bytes,
+                    isExternalView: false, ownerToken: null, ownedBuffer: owned);
+                string baseName = name[..^".weight".Length];
+                long perExpert = bytes / stack.NumExperts;
+                for (int e = 0; e < stack.NumExperts; e++)
+                {
+                    string expert = $"{baseName}.{e}.weight";
+                    if (_quantWeights.Remove(expert, out QuantizedWeight old)) old.Dispose();
+                    _quantWeights[expert] = QuantizedWeight.CreateExternalView(owned + (nint)(e * perExpert), perExpert, type,
+                        stack.PerExpertNe0, stack.PerExpertNe1, requantized);
+                }
+                _stackedExpertWeights[name] = requantized;
+                if (stack.OwnedBuffer != IntPtr.Zero) QuantizedWeight.FreeBuffer(stack.OwnedBuffer);
+                before += stack.TotalRawBytes;
+                after += bytes;
+            }
+            if (after > 0)
+                Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"  MTP experts as {(GgmlTensorType)type}: {before / 1048576.0:F0} -> {after / 1048576.0:F0} MiB in {watch.Elapsed.TotalSeconds:F1} s (TS_Q4E_MTP_EXPERTS)."));
         }
 
         private float[] ReadPleTapRows(int layer)

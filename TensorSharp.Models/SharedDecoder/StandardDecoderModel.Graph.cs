@@ -218,10 +218,16 @@ namespace TensorSharp.Models
             public bool RecurrentSnapshots { get; init; }
             /// <summary>Flat (T, H, W) rotary positions of a single sequence's rows (multi-axis rotary).</summary>
             public int[] PositionTable { get; init; }
+            /// <summary>The draft layer takes the step's rows as the trunk finishes them (<see cref="EmitDraftFollow"/>).</summary>
+            public DraftFollow FollowDraft { get; init; }
+            /// <summary>The followed rows' draft embedding [rows, hidden] when the step's input rows are not it; null reads
+            /// them.</summary>
+            public float[] DraftRows { get; init; }
 
             /// <summary>What the request changes in the emitted program (a streamed step's template key).</summary>
             public string Shape =>
-                $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}:{CaptureTail}";
+                $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}:{CaptureTail}"
+                + (FollowDraft == DraftFollow.None ? "" : $":f{(int)FollowDraft}{(DraftRows != null ? "e" : "")}");
         }
 
         private sealed class GraphResult
@@ -247,6 +253,9 @@ namespace TensorSharp.Models
         /// <summary>Trace every step (tests compare against it).</summary>
         internal bool DecodeAdvanceDisabled { get; set; }
 
+        /// <summary>The widest verify window a sequence advances (and records) instead of tracing each time.</summary>
+        private const int MaxAdvancedWindowRows = 8;
+
         /// <summary>What else, beyond the rows, counts and outputs, decides what a step emits: a family whose graph
         /// depends on where its sequences are (QSA selects past its budget) names it, so a streamed step never frees
         /// nodes by the last readers of a template emitted the other way.</summary>
@@ -254,6 +263,9 @@ namespace TensorSharp.Models
 
         /// <summary>Decode steps run as the previous one advanced, without a trace.</summary>
         internal int DecodeAdvances { get; private set; }
+
+        /// <summary>Of <see cref="DecodeAdvances"/>, the verify windows (more than one row a sequence).</summary>
+        internal int WindowAdvances { get; private set; }
 
         /// <summary>The last decode step, kept to run again one position on.</summary>
         private sealed class DecodeReplay
@@ -263,12 +275,14 @@ namespace TensorSharp.Models
             public (ulong, ulong) Signature;
             public StepOutputs Outputs;
             public Slot[] Slots;
-            public Tensor[][][] K;
+            public Tensor[][][] K, V;
             public RecurrentState[][][] Recurrent;
             public int[] Capacity, RopeDelta, Starts;
             public int Floor;
             public string Shape;
             public long Epoch;
+            /// <summary><see cref="RecurrentState.BindingChanges"/> when the step was kept.</summary>
+            public long Bindings;
             /// <summary>The step recorded on the device (an executor that records decode steps; one sequence).</summary>
             public IDecodeCapture Capture;
             public Tensor[] CaptureOutputs;
@@ -297,12 +311,14 @@ namespace TensorSharp.Models
             var r = new DecodeReplay
             {
                 Step = step, Graph = graph, Signature = step.Signature, Outputs = outputs, Slots = (Slot[])slots.Clone(),
-                K = new Tensor[n][][], Recurrent = new RecurrentState[n][][], Capacity = new int[n], RopeDelta = new int[n],
+                K = new Tensor[n][][], V = new Tensor[n][][], Recurrent = new RecurrentState[n][][], Capacity = new int[n], RopeDelta = new int[n],
                 Starts = (int[])starts.Clone(), Floor = floor, Shape = shape, Epoch = _graphEpoch,
+                Bindings = System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges),
             };
             for (int s = 0; s < n; s++)
             {
                 r.K[s] = slots[s].K;
+                r.V[s] = slots[s].V;
                 r.Recurrent[s] = slots[s].Recurrent;
                 r.Capacity[s] = slots[s].Capacity;
                 r.RopeDelta[s] = slots[s].RopeDelta;
@@ -345,7 +361,7 @@ namespace TensorSharp.Models
             if (r.Capture == null && ++r.Advances < 2) return false;
             r.Capture ??= recorder.OpenDecodeCapture();
             if (r.Capture == null) { r.CaptureFailed = true; return false; }
-            int writeRow = starts[0], attend = starts[0] + 1;
+            int writeRow = starts[0], attend = starts[0] + r.Step.Counts[0];
             bool bound = false;
             try
             {
@@ -421,15 +437,25 @@ namespace TensorSharp.Models
             DecodeReplay r = _decodeReplays.GetValueOrDefault(shape ?? "");
             if (r == null || r.Epoch != _graphEpoch || r.Floor != floor || r.Shape != shape || r.Slots.Length != slots.Length)
                 return false;
+            if (r.Bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges))
+            {
+                DropDecodeReplay(shape);
+                return false;
+            }
+            // Every sequence moves on by the same positions: one for decode steps, a verify window's accepted rows and one.
+            int delta = starts.Length > 0 ? starts[0] - r.Starts[0] : 0;
+            if (delta < 1) return false;
             for (int s = 0; s < slots.Length; s++)
             {
                 Slot slot = slots[s];
-                if (!ReferenceEquals(slot, r.Slots[s]) || !ReferenceEquals(slot.K, r.K[s]) || !ReferenceEquals(slot.Recurrent, r.Recurrent[s])
-                    || slot.Capacity != r.Capacity[s] || slot.RopeDelta != r.RopeDelta[s] || starts[s] != r.Starts[s] + 1)
+                // What the kept graph binds: the same caches and states (a batched step may hand them in another slot
+                // object), the same capacity and rotary offset.
+                if (!ReferenceEquals(slot.K, r.K[s]) || !ReferenceEquals(slot.V, r.V[s]) || !ReferenceEquals(slot.Recurrent, r.Recurrent[s])
+                    || slot.Capacity != r.Capacity[s] || slot.RopeDelta != r.RopeDelta[s] || starts[s] != r.Starts[s] + delta)
                     return false;
             }
             if (!_graphCache.TryGetValue(r.Signature, out CachedGraph cached) || !ReferenceEquals(cached, r.Graph)
-                || !r.Step.TryAdvance(hidden))
+                || !r.Step.TryAdvance(hidden, delta))
             {
                 DropDecodeReplay(shape);
                 return false;
@@ -446,6 +472,7 @@ namespace TensorSharp.Models
             GraphRuns++;
             GraphReplays++;
             DecodeAdvances++;
+            if (r.Step.Counts.Length > 0 && r.Step.Counts[0] > 1) WindowAdvances++;
             foreach (Slot slot in slots) slot.DeviceDirty = true;
             graph = cached;
             outputs = r.Outputs;
@@ -476,10 +503,11 @@ namespace TensorSharp.Models
         /// when the step cannot be lowered (nothing was written).
         /// </summary>
         private bool TryRunGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
-            bool wantLogits, out float[][] logits, int[] positionTable = null)
+            bool wantLogits, out float[][] logits, int[] positionTable = null, DraftFollow follow = DraftFollow.None,
+            float[] draftRows = null)
         {
             logits = null;
-            var request = new GraphRequest { LastRowLogits = wantLogits, PositionTable = positionTable };
+            var request = new GraphRequest { LastRowLogits = wantLogits, PositionTable = positionTable, FollowDraft = follow, DraftRows = draftRows };
             if (!TryRunGraphStep(hidden, slots, first, counts, starts, request, out GraphResult result))
                 return false;
             if (result.Logits != null)
@@ -647,9 +675,13 @@ namespace TensorSharp.Models
             CachedGraph graph = null;
             owned = false;
             outputs = default;
-            bool advance = replayable && advanceHidden != null && !deviceOutputs && !snapshots && DecodeStepsAdvance
-                && !DecodeAdvanceDisabled && GraphExecutor.Capabilities.Replays && Array.TrueForAll(counts, c => c == 1);
-            if (advance && TryAdvanceDecode(slots, starts, attentionFloor, shape, advanceHidden, out graph, out outputs))
+            // A decode step, or a verify window of up to 8 rows a sequence (its recurrent snapshots indexed by row, not by
+            // position), runs as the kept step of its width advanced to its positions; each width keeps its own.
+            bool advance = replayable && advanceHidden != null && !deviceOutputs && DecodeStepsAdvance
+                && !DecodeAdvanceDisabled && GraphExecutor.Capabilities.Replays && counts.Length > 0 && counts[0] >= 1
+                && counts[0] <= MaxAdvancedWindowRows && Array.TrueForAll(counts, c => c == counts[0]) && (counts[0] > 1 || !snapshots);
+            string replayShape = advance && (counts[0] > 1 || snapshots) ? $"{shape}|w{counts[0]}|{(snapshots ? "s" : "")}" : shape;
+            if (advance && TryAdvanceDecode(slots, starts, attentionFloor, replayShape, advanceHidden, out graph, out outputs))
                 return graph;
             try
             {
@@ -736,7 +768,7 @@ namespace TensorSharp.Models
                 foreach (Slot slot in slots) slot.DeviceDirty = true;
                 if (advance && !owned && step.Advanceable)
                 {
-                    KeepDecodeReplay(step, graph, outputs, slots, starts, attentionFloor, shape);
+                    KeepDecodeReplay(step, graph, outputs, slots, starts, attentionFloor, replayShape);
                     step = null;   // the replay owns it now
                 }
                 return graph;
@@ -820,7 +852,8 @@ namespace TensorSharp.Models
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             var outputs = new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
             // The first stage widens the embedded rows into the residual stream; later stages receive it.
-            int h = from == 0 ? EmitStreamInput(step, step.HiddenInput(hidden, hiddenSize, rows)) : step.HiddenInput(hidden, width, rows);
+            int embedded = from == 0 ? step.HiddenInput(hidden, hiddenSize, rows) : -1;
+            int h = from == 0 ? EmitStreamInput(step, embedded) : step.HiddenInput(hidden, width, rows);
             var positions = new int[rows];
             for (int s = 0; s < n; s++)
                 for (int i = 0; i < step.Counts[s]; i++) positions[step.First[s] + i] = step.Starts[s] + i + step.Slots[s].RopeDelta;
@@ -856,7 +889,7 @@ namespace TensorSharp.Models
                 outputs.Hidden = step.Output(h, (long)width * rows);
                 return outputs;
             }
-            EmitHead(step, h, request, ref outputs);
+            EmitHead(step, h, request, ref outputs, embedded);
             return outputs;
         }
 
@@ -871,15 +904,22 @@ namespace TensorSharp.Models
 
         /// <summary>The head over the stream <paramref name="h"/> leaving the last layer: the captures past it, the final
         /// rows and the logits the request asks for.</summary>
-        private void EmitHead(GraphStep step, int h, GraphRequest request, ref StepOutputs outputs)
+        private void EmitHead(GraphStep step, int h, GraphRequest request, ref StepOutputs outputs, int embedded = -1)
         {
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             for (int c = 0; c < request.CaptureLayers.Length; c++)
                 if (request.CaptureLayers[c] >= Config.NumLayers)
                     outputs.Captures[c] = EmitCaptureOutput(step, h, request);
+            int final = -1;
+            if (request.FollowDraft != DraftFollow.None)
+            {
+                // The draft layer reads the rows the speculator's features are: the stream, or the final-normed rows.
+                if (!DraftChainsStream) final = EmitStreamOutput(step, h);
+                EmitDraftFollow(step, DraftChainsStream ? h : final, embedded, request);
+            }
             if (!request.LastRowLogits && !request.AllRowLogits && !request.CaptureFinal) return;
 
-            int final = EmitStreamOutput(step, h);
+            if (final < 0) final = EmitStreamOutput(step, h);
             if (request.CaptureFinal)
                 outputs.Final = DraftChainsStream ? step.Output(h, (long)width * rows) : step.Output(final, (long)hiddenSize * rows);
             string headName = _quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")
@@ -1114,6 +1154,7 @@ namespace TensorSharp.Models
             public int[] Capacity, RopeDelta, Starts;
             public string Shape;
             public long Epoch;
+            public long Bindings;
         }
 
         private RankedReplay _rankedReplay;
@@ -1128,6 +1169,7 @@ namespace TensorSharp.Models
                 Steps = (GraphStep[])steps.Clone(), Plans = plans, Signature = RankedSignature(steps), Outputs = outputs,
                 Slots = (Slot[])slots.Clone(), K = new Tensor[n][][], Recurrent = new RecurrentState[n][][], Capacity = new int[n],
                 RopeDelta = new int[n], Starts = (int[])starts.Clone(), Shape = shape, Epoch = _graphEpoch,
+                Bindings = System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges),
             };
             for (int s = 0; s < n; s++)
             {
@@ -1154,7 +1196,8 @@ namespace TensorSharp.Models
             plans = null;
             outputs = default;
             RankedReplay r = _rankedReplay;
-            if (r == null || r.Epoch != _graphEpoch || r.Shape != shape || r.Slots.Length != slots.Length) return false;
+            if (r == null || r.Epoch != _graphEpoch || r.Shape != shape || r.Slots.Length != slots.Length
+                || r.Bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges)) return false;
             for (int s = 0; s < slots.Length; s++)
             {
                 Slot slot = slots[s];
@@ -2133,16 +2176,17 @@ namespace TensorSharp.Models
             /// <summary>Rewrite this step's inputs for every row one position on, with <paramref name="hidden"/> as its
             /// rows: positions and write rows plus one, decode masks one column wider (each must stay inside its
             /// window and every limit honored: false, nothing changed, when one would not).</summary>
-            internal bool TryAdvance(Tensor hidden)
+            internal bool TryAdvance(Tensor hidden, int delta = 1)
             {
+                if (delta < 1) return false;
                 foreach (InputMeta m in _inputMeta)
-                    if (m.Kind == InputKind.DecodeMask && m.Start + m.Count + 1 > m.Window) return false;
+                    if (m.Kind == InputKind.DecodeMask && m.Start + m.Count + delta > m.Window) return false;
                 if (_advanceLimits != null)
                 {
                     foreach ((int start, int max) in _advanceLimits)
-                        if (start + 1 > max) return false;
+                        if (start + delta > max) return false;
                     for (int i = 0; i < _advanceLimits.Count; i++)
-                        _advanceLimits[i] = (_advanceLimits[i].Start + 1, _advanceLimits[i].Max);
+                        _advanceLimits[i] = (_advanceLimits[i].Start + delta, _advanceLimits[i].Max);
                 }
                 for (int i = 0; i < _inputMeta.Count; i++)
                 {
@@ -2154,18 +2198,18 @@ namespace TensorSharp.Models
                             _inputHandles[i] = hidden;
                             break;
                         case InputKind.Positions:
-                            foreach (ref int p in ((int[])m.Values).AsSpan()) p++;
+                            foreach (ref int p in ((int[])m.Values).AsSpan()) p += delta;
                             break;
                         case InputKind.WriteRows:
-                            foreach (ref long r in ((long[])m.Values).AsSpan()) r++;
+                            foreach (ref long r in ((long[])m.Values).AsSpan()) r += delta;
                             break;
                         case InputKind.DecodeMask:
-                            FillChunkMask((ushort[])m.Values, m.Window, m.Start + 1, m.Count);
-                            _inputMeta[i] = m with { Start = m.Start + 1 };
+                            FillChunkMask((ushort[])m.Values, m.Window, m.Start + delta, m.Count);
+                            _inputMeta[i] = m with { Start = m.Start + delta };
                             break;
                     }
                 }
-                for (int s = 0; s < Starts.Length; s++) Starts[s] += Counts[s];
+                for (int s = 0; s < Starts.Length; s++) Starts[s] += delta;
                 foreach (InputMeta m in _inputMeta)
                     if (m.Kind == InputKind.Refill && !m.Refill()) return false;
                 return true;

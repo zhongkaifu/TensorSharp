@@ -388,6 +388,15 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool DraftHeadConditionsOnPrompt => false;
 
+        /// <summary>
+        /// A speculating request's prompt runs on the plain path (it does not read through the speculative context
+        /// because the head keeps itself in step with the trunk, <see cref="DraftSelfCatchUp"/>): the head takes the
+        /// request's next prompt chunk's rows as the trunk forwards them, so its drafts condition on the prompt. Called
+        /// before each such chunk, with the request's id on a model that keeps a cache per request, or null for the
+        /// model's primary cache; a head that follows every forward anyway ignores it.
+        /// </summary>
+        void FollowPlainPrompt(string? requestId) { }
+
         /// <summary>One per-token draft step at <paramref name="pos"/>: consume
         /// (token, previous hidden), fill next-token logits and the chained
         /// hidden state. Only called for <see cref="DraftHeadKind.PerToken"/>.</summary>

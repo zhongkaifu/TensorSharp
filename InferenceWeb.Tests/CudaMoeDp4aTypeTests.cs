@@ -46,6 +46,15 @@ public sealed class CudaMoeDp4aTypeTests
         return data;
     }
 
+    /// <summary>A decode row through the one-row kernels and the same row as the first of a 3-row window through the batched
+    /// ones: the same bits (a verify window's rows must be plain decode steps', or speculation drifts from greedy).</summary>
+    [CudaTheory]
+    [InlineData(17)]
+    [InlineData(18)]
+    [InlineData(20)]
+    [InlineData(42)]
+    public void ADecodeRowIsAWindowRowBitForBit(int type) => AssertRowInvariant(type);
+
     [CudaTheory]
     [InlineData(17, 1)]
     [InlineData(17, 5)]
@@ -132,6 +141,83 @@ public sealed class CudaMoeDp4aTypeTests
                 if (tables[m] != IntPtr.Zero) CudaQuantizedOps.FreeDeviceBuffer(allocator, tables[m]);
             for (int i = 0; i < hosts.Length; i++)
                 if (hosts[i] != IntPtr.Zero) Marshal.FreeHGlobal(hosts[i]);
+        }
+    }
+
+    private void AssertRowInvariant(int type)
+    {
+        const int hidden = 512, ff = 256, experts = 4, k = 2, rows = 3;
+        using var allocator = new CudaAllocator();
+        if (allocator.Kernels?.MoeDp4aIqQ2_0 != true)
+        {
+            _output.WriteLine("the loaded kernels have no dp4a path for these types");
+            return;
+        }
+        var rng = new Random(77 + type);
+        var hosts = new IntPtr[3 * experts];
+        var tables = new IntPtr[3];
+        try
+        {
+            var resident = new IntPtr[3 * experts];
+            for (int m = 0; m < 3; m++)
+                for (int e = 0; e < experts; e++)
+                {
+                    int i = m * experts + e, inDim = m < 2 ? hidden : ff, outDim = m < 2 ? ff : hidden;
+                    byte[] w = RandomRows(type, outDim, inDim, rng);
+                    hosts[i] = Marshal.AllocHGlobal(w.Length);
+                    Marshal.Copy(w, 0, hosts[i], w.Length);
+                    var key = new IntPtr(0x7d0000 + 64 * type + i);
+                    CudaQuantizedOps.PreloadQuantizedWeight(allocator, key, hosts[i], type, inDim, outDim, w.Length);
+                    Assert.True(CudaQuantizedOps.TryGetResidentDevicePtr(allocator, key, out resident[i], out _));
+                }
+            for (int m = 0; m < 3; m++)
+                tables[m] = CudaQuantizedOps.CreateDevicePointerTable(allocator, resident.AsSpan(m * experts, experts).ToArray());
+            var input = new float[rows, hidden];
+            var logits = new float[rows, experts];
+            for (int r = 0; r < rows; r++)
+            {
+                for (int i = 0; i < hidden; i++) input[r, i] = (float)(rng.NextDouble() * 2 - 1);
+                for (int e = 0; e < experts; e++) logits[r, e] = (float)(rng.NextDouble() * 2 - 1);
+            }
+            float[] Run(int n)
+            {
+                var x = new float[n, hidden];
+                var l = new float[n, experts];
+                for (int r = 0; r < n; r++)
+                {
+                    for (int i = 0; i < hidden; i++) x[r, i] = input[r, i];
+                    for (int e = 0; e < experts; e++) l[r, e] = logits[r, e];
+                }
+                using var lt = Tensor.FromArray(allocator, l);
+                using var xt = Tensor.FromArray(allocator, x);
+                using var output = new Tensor(allocator, DType.Float32, n, hidden);
+                using var selected = new Tensor(allocator, DType.Int32, n * k);
+                using var weights = new Tensor(allocator, DType.Float32, n * k);
+                using var gate = new Tensor(allocator, DType.Float32, n * k, ff);
+                using var up = new Tensor(allocator, DType.Float32, n * k, ff);
+                using var xq = new Tensor(allocator, DType.UInt8, (long)n * (hidden / 32) * CudaFusedOps.Q81BlockBytes);
+                using var hq = new Tensor(allocator, DType.UInt8, (long)n * k * (ff / 32) * CudaFusedOps.Q81BlockBytes);
+                Assert.True(n == 1
+                    ? CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(lt, xt, output, selected, weights, gate, up, IntPtr.Zero,
+                        tables[0], tables[1], tables[2], type, type, experts, k, hidden, ff, null, IntPtr.Zero, xq, hq, true, true)
+                    : CudaFusedOps.TryMoEExpertFFNPrefillSwiGLU(lt, xt, output, selected, weights, gate, up, IntPtr.Zero,
+                        tables[0], tables[1], tables[2], type, type, experts, k, hidden, ff, n, null, IntPtr.Zero, xq, hq, true, true));
+                return output.GetElementsAsFloat(n * hidden);
+            }
+            float[] one = Run(1), window = Run(rows);
+            int differ = 0;
+            for (int i = 0; i < hidden; i++)
+                if (BitConverter.SingleToInt32Bits(one[i]) != BitConverter.SingleToInt32Bits(window[i])) differ++;
+            _output.WriteLine($"type {type}: {differ} of {hidden} values of row 0 differ between the decode and the window kernels");
+            Assert.Equal(0, differ);
+        }
+        finally
+        {
+            allocator.Synchronize();
+            for (int m = 0; m < 3; m++)
+                if (tables[m] != IntPtr.Zero) CudaQuantizedOps.FreeDeviceBuffer(allocator, tables[m]);
+            foreach (IntPtr h in hosts)
+                if (h != IntPtr.Zero) Marshal.FreeHGlobal(h);
         }
     }
 }

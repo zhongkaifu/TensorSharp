@@ -183,13 +183,25 @@ namespace TensorSharp.Cuda
                 && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && flash.RunsAttention(d))
             {
                 var attended = new Tensor(Allocator, DType.Float32, nq, heads, d);
-                int splits = flash.Splits(nq * (heads / kvHeads), kvHeads, len);
+                // A recorded verify window reads its length on the device (the window's rows the last nq of it), as a
+                // recorded decode row does: the splits then follow the window bucket, which every replay fits.
+                IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr((CudaAllocator)Allocator);
+                int splits = flash.Splits(nq * (heads / kvHeads), kvHeads, dyn != IntPtr.Zero ? (int)k.Sizes[^2] : len);
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
                 Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor,
-                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream));
+                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn));
                 return attended;
+            }
+            // A recorded verify window replays at later positions, where the written length this classification read (the
+            // capture's) is short: such a window runs over the whole cache window with the mask itself, which every launch
+            // rewrites (the flash kernel above reads the length on the device instead). Only when recording: the window's
+            // length is the step's, so a sequence batched with others would round with its neighbours' lengths.
+            if (trimmed && nq > 1 && mask.HasTensor && CudaDecodeDynParams.GetActiveDevicePtr((CudaAllocator)Allocator) != IntPtr.Zero)
+            {
+                Tensor whole = mask.Tensor;
+                return FlashAttention(q, k, v, new AttentionMask(MaskPattern.Explicit, 0, () => whole), scale, kWindow, vWindow);
             }
             int group = heads / kvHeads;
             // K and V once as F32 [kvHeads, len, d] (the cache may hold F16); the query heads of a group share

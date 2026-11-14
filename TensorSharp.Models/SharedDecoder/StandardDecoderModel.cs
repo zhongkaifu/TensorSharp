@@ -500,6 +500,7 @@ namespace TensorSharp.Models
         {
             _verifyRows = 0;   // the state is reset; nothing to settle
             _draftStart = 0;
+            _draftFollowed = -1;
             _ropeDelta = 0;
             _pendingPositionTable = null;
             _cacheSeqLen = 0;
@@ -518,6 +519,7 @@ namespace TensorSharp.Models
         {
             SyncActiveToHost();
             ClearGraphCache();
+            if (tokenCount < _draftFollowed) _draftFollowed = -1;   // the rows the draft layer followed are rewritten
             if (_anyRecurrent && tokenCount != _cacheSeqLen)
             {
                 if (tokenCount != 0)
@@ -566,6 +568,7 @@ namespace TensorSharp.Models
                 return false;
             SyncActiveToHost();
             ClearGraphCache();
+            _draftFollowed = -1;
             EnsureCacheCapacity(destToken + tokenCount);
             if (!KvBlockTransfer.Inject(_allocator, FlatCaches(_cacheK), FlatCaches(_cacheV), _cacheSeqLen,
                     destToken, tokenCount, source))
@@ -617,16 +620,28 @@ namespace TensorSharp.Models
                 var positions = BeginRotaryPositions(start, seqLen);
                 EnterStage(0);
                 long t0 = Stopwatch.GetTimestamp();
+                bool media = _pendingMedia.Count > 0;
                 Tensor hidden = EmbedStep(tokens);
                 _embTicks += Stopwatch.GetTimestamp() - t0;
                 InjectMedia(hidden, start);
+                // A speculating request's prompt chunk hands the draft layer its rows (FollowPlainPrompt).
+                Slot active = SnapshotActive();
+                DraftFollow follow = ForwardIsPrompt && _followPlainPrompt ? PlanDraftFollow(active, start, positions.Table) : DraftFollow.None;
+                _followPlainPrompt = false;
+                float[] draftRows = follow != DraftFollow.None ? PrepareDraftFollow(active, tokens, media) : null;
+                _draftCarry = active.DraftCarry;
 
-                if (TryRunGraph(hidden, new[] { SnapshotActive() }, new[] { 0 }, new[] { seqLen }, new[] { start },
-                        wantLogits, out float[][] graphLogits, positions.Table))
+                if (TryRunGraph(hidden, new[] { active }, new[] { 0 }, new[] { seqLen }, new[] { start },
+                        wantLogits, out float[][] graphLogits, positions.Table, follow, draftRows))
                 {
                     hidden.Dispose();
                     _cacheDeviceDirty = true;
                     _cacheSeqLen += seqLen;
+                    if (follow != DraftFollow.None)
+                    {
+                        NoteDraftFollowed(active, start, seqLen);
+                        LoadDraftFollow(active);
+                    }
                     return graphLogits?[0];
                 }
                 SyncActiveToHost();
@@ -1300,6 +1315,8 @@ namespace TensorSharp.Models
             foreach (Tensor t in AllCacheTensors(_cacheK)) t.Dispose();
             foreach (Tensor t in AllCacheTensors(_cacheV)) t.Dispose();
             _cacheK = _cacheV = null;
+            _draftCarry?.Dispose();
+            _draftCarry = null;
             foreach (Tensor copy in _replicas.Values) copy.Dispose();
             _replicas.Clear();
             DisposeSlots();

@@ -230,4 +230,128 @@ internal static class SpeculativeRuntimeChecks
         for (int v = 1; v < logits.Length; v++) if (logits[v] > logits[best]) best = v;
         return best;
     }
+
+    /// <summary>
+    /// A draft head the trunk keeps in step (<see cref="IDraftHead.DraftSelfCatchUp"/>) over a prompt read on the plain path
+    /// in two chunks (<see cref="IDraftHead.FollowPlainPrompt"/> before each, the carry crossing between them) and the step
+    /// that captures the carry after it: the first draft is the one the speculator's own catch-up over the same rows gives
+    /// (every row's features to the host and back, token k paired with row k - 1, zeros before the first), and not the one
+    /// a head restarted after the prompt gives (the drafts read the prompt).
+    /// </summary>
+    public static void AssertFollowedPromptDraftsAsItsCatchUp(Func<ModelBase> create, string label, double tolerance)
+    {
+        // Chunks wider than a verify window (StandardDecoderModel.SmallChunkRows): every model's trunk then reads them alike
+        // (a narrower chunk through the speculative forward keeps the recurrent state after each row, another recurrence).
+        int[] prompt = Enumerable.Range(0, 45).Select(i => 40 + (i * 13) % 150).ToArray();
+        int n = prompt.Length, split = 20;
+
+        // Followed: two plain prompt chunks, then the capture step; the null-row commits the speculator makes report no gap.
+        using ModelBase followedModel = create();
+        var followed = Assert.IsAssignableFrom<ISpeculativeModel>(followedModel);
+        Assert.True(followed.DraftSelfCatchUp, $"{label}: the head does not follow the trunk");
+        int feat = followed.SpecFeatureSize, vocab = followedModel.Config.VocabSize;
+        followed.FollowPlainPrompt(null);
+        followedModel.ForwardPrompt(prompt[..split], morePromptFollows: true);
+        followed.FollowPlainPrompt(null);
+        int next = ArgMax(followedModel.ForwardPrompt(prompt[split..], morePromptFollows: false));
+        followed.DraftCatchUp(prompt, null, 0);
+        var carry = new float[feat];
+        var logits = new float[vocab];
+        followed.SpecForward(new[] { next }, carry, logits, false);
+        followed.DraftCatchUp(new[] { next }, null, n);
+        int after = ArgMax(logits);
+        var draftFollowed = new float[vocab];
+        followed.DraftStep(after, carry, n + 1, draftFollowed, new float[feat]);
+
+        // Caught up: every prompt row's features through the host (the same chunks: a chunk's split moves the trunk's
+        // rounding).
+        using ModelBase caughtModel = create();
+        var caught = (ISpeculativeModel)caughtModel;
+        var rows = new float[n * feat];
+        var first = new float[split * feat];
+        caught.SpecForward(prompt[..split], first, new float[vocab], false);
+        var second = new float[(n - split) * feat];
+        caught.SpecForward(prompt[split..], second, new float[vocab], false);
+        Array.Copy(first, rows, first.Length);
+        Array.Copy(second, 0, rows, first.Length, second.Length);
+        var shifted = new float[n * feat];
+        Array.Copy(rows, 0, shifted, feat, (n - 1) * feat);
+        caught.DraftCatchUp(prompt, shifted, 0);
+        var carry2 = new float[feat];
+        caught.SpecForward(new[] { next }, carry2, new float[vocab], false);
+        caught.DraftCatchUp(new[] { next }, rows[((n - 1) * feat)..], n);
+        var draftCaught = new float[vocab];
+        caught.DraftStep(after, carry2, n + 1, draftCaught, new float[feat]);
+
+        // Restarted after the prompt (the head before it followed): the drafts do not read the prompt.
+        using ModelBase restartedModel = create();
+        var restarted = (ISpeculativeModel)restartedModel;
+        restartedModel.ForwardPrompt(prompt[..split], morePromptFollows: true);
+        restartedModel.ForwardPrompt(prompt[split..], morePromptFollows: false);
+        restarted.DraftCatchUp(prompt, null, 0);
+        var carry3 = new float[feat];
+        restarted.SpecForward(new[] { next }, carry3, new float[vocab], false);
+        restarted.DraftCatchUp(new[] { next }, null, n);
+        var draftRestarted = new float[vocab];
+        restarted.DraftStep(after, carry3, n + 1, draftRestarted, new float[feat]);
+
+        // Followed on a per-request slot (the unified step a lone request takes on a model with slots): the prompt chunks,
+        // then the one-row verify that captures the carry, the drafter's commits reporting no gap.
+        float[] draftUnified = null;
+        using (ModelBase unifiedModel = create())
+        {
+            if (unifiedModel is IUnifiedBatchModel unified && unifiedModel is IBatchedSpeculativeTarget batched)
+            {
+                var head = (ISpeculativeModel)unifiedModel;
+                const string id = "followed";
+                unified.EnsureSequenceSlot(id, n + 16);
+                head.FollowPlainPrompt(id);
+                Assert.True(unified.TryForwardUnified(new[] { id }, new[] { prompt[..split] }, new[] { 0 }, new float[1][]));
+                head.FollowPlainPrompt(id);
+                var last = new float[1][];
+                Assert.True(unified.TryForwardUnified(new[] { id }, new[] { prompt[split..] }, new[] { split }, last));
+                Assert.Equal(next, ArgMax(last[0]));
+                using (batched.BeginBatchedSpeculation())
+                {
+                    batched.BindDraftState(id);
+                    head.DraftCatchUp(prompt, null, 0);
+                }
+                var carry4 = new float[feat];
+                var rowLogits = new float[vocab];
+                Assert.True(batched.TryBatchedSpecVerifyLogits(new[] { id }, new[] { n }, 1, new[] { next }, rowLogits, carry4));
+                batched.CommitBatchedSpecVerify(new[] { id }, new[] { n }, new[] { 1 });
+                Assert.Equal(after, ArgMax(rowLogits));
+                draftUnified = new float[vocab];
+                using (batched.BeginBatchedSpeculation())
+                {
+                    batched.BindDraftState(id);
+                    head.DraftCatchUp(new[] { next }, null, n);
+                    head.DraftStep(after, carry4, n + 1, draftUnified, new float[feat]);
+                }
+            }
+        }
+
+        double followedVsCaught = RelL2(draftFollowed, draftCaught), restartedVsCaught = RelL2(draftRestarted, draftCaught);
+        if (draftUnified != null)
+        {
+            double unifiedVsCaught = RelL2(draftUnified, draftCaught);
+            Assert.True(unifiedVsCaught <= tolerance,
+                $"{label}: the per-request slot's followed prompt drafts {unifiedVsCaught:E2} (relative L2) from the catch-up");
+        }
+        Assert.True(followedVsCaught <= tolerance,
+            $"{label}: the followed prompt's first draft is {followedVsCaught:E2} (relative L2) from the catch-up's");
+        Assert.True(restartedVsCaught > 10 * tolerance,
+            $"{label}: a restarted head drafts within {restartedVsCaught:E2} of the caught-up one: the check cannot see the prompt");
+    }
+
+    private static double RelL2(float[] a, float[] b)
+    {
+        double num = 0, den = 0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            num += (a[i] - b[i]) * (double)(a[i] - b[i]);
+            den += b[i] * (double)b[i];
+        }
+        return Math.Sqrt(num / Math.Max(den, 1e-30));
+    }
 }

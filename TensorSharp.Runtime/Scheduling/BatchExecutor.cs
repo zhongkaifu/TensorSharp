@@ -2594,6 +2594,9 @@ namespace TensorSharp.Runtime.Scheduling
                 || _fusedSpecDeclined.Contains(seq.RequestId)
                 || !TryGetFusedSpecContext(spec, seq, start, out SpecSeqContext? ctx))
                 return null;
+            // A head the trunk keeps in step (DraftSelfCatchUp) takes this chunk's rows as the forward runs them.
+            if (ctx.Exec.PrefillSelfCatchUp && _model is IDraftHead follower)
+                follower.FollowPlainPrompt(seq.RequestId);
             return ctx.Exec.PrefillsThroughContext ? ctx : null;
         }
 
@@ -2733,7 +2736,11 @@ namespace TensorSharp.Runtime.Scheduling
                     // head: 856 vs 627 ms) of its time to first token - and every
                     // request arriving behind it waited on that. Prefill plainly on
                     // the fused path; the late-arming branch below seeds the drafter
-                    // at the first decode step.
+                    // at the first decode step. A head the trunk keeps in step
+                    // (DraftSelfCatchUp) takes this chunk's rows as the trunk forwards
+                    // them, so its drafts still read the prompt.
+                    if (exec.PrefillSelfCatchUp && _model is IDraftHead follower)
+                        follower.FollowPlainPrompt(null);
                     exec.Dispose();
                     return null;
                 }
