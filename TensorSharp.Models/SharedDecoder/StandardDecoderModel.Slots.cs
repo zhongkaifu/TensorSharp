@@ -39,7 +39,12 @@ namespace TensorSharp.Models
             public int DraftStart;                 // the draft layers attend to rows from here on
             public int RopeDelta;                  // rotary position = KV index + this past a position table
             public int VerifyRows;                 // a batched verify's window, its recurrent states awaiting the commit
+            public int DraftFollowed = -1;         // the draft layer holds the trunk's own rows through here (see DraftFollowReady)
+            public Tensor DraftCarry;              // the trunk's last followed row's stream (the next followed row's input)
+            public long RetainedAt;                // when it entered the retained set (the oldest goes first under pressure)
         }
+
+        private static long s_retainSerial;
 
         /// <summary>Rows of a batched step: sequence s owns rows [QueryStart[s], QueryStart[s] + Counts[s])
         /// and continues its slot from position Starts[s].</summary>
@@ -117,6 +122,8 @@ namespace TensorSharp.Models
             DeviceDirty = _cacheDeviceDirty,
             DraftStart = _draftStart,
             RopeDelta = _ropeDelta,
+            DraftFollowed = _draftFollowed,
+            DraftCarry = _draftCarry,
         };
 
         private void LoadActive(Slot slot)
@@ -129,6 +136,8 @@ namespace TensorSharp.Models
             _cacheDeviceDirty = slot.DeviceDirty;
             _draftStart = slot.DraftStart;
             _ropeDelta = slot.RopeDelta;
+            _draftFollowed = slot.DraftFollowed;
+            _draftCarry = slot.DraftCarry;
         }
 
         // The active cache's draft-layer floor (see Slot.DraftStart).
@@ -408,6 +417,7 @@ namespace TensorSharp.Models
             _slotPool.RemoveAt(pick);
             pooled.Length = 0;
             pooled.DraftStart = 0;
+            pooled.DraftFollowed = -1;
             pooled.RopeDelta = 0;
             pooled.VerifyRows = 0;
             return pooled;
@@ -442,6 +452,8 @@ namespace TensorSharp.Models
             slot.K = slot.V = null;
             DisposeStates(slot.Recurrent);
             slot.Recurrent = null;
+            slot.DraftCarry?.Dispose();
+            slot.DraftCarry = null;
         }
 
         private void RecycleSlot(Slot slot)
@@ -549,6 +561,8 @@ namespace TensorSharp.Models
         {
             if (_slots == null || string.IsNullOrEmpty(requestId)) return;
             if (!_slots.TryGetValue(requestId, out Slot slot)) return;
+            DropReplaysOf(slot.K, slot.Recurrent);
+            if (string.Equals(_activeKey, requestId, StringComparison.Ordinal)) DropReplaysOf(_cacheK, _recurrentPrimary);
             if (string.Equals(_activeKey, requestId, StringComparison.Ordinal))
             {
                 slot = SnapshotActive();
@@ -571,6 +585,8 @@ namespace TensorSharp.Models
         {
             if (_slots == null || string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key)) return false;
             if (!_slots.TryGetValue(requestId, out Slot slot)) return false;
+            DropReplaysOf(slot.K, slot.Recurrent);
+            if (string.Equals(_activeKey, requestId, StringComparison.Ordinal)) DropReplaysOf(_cacheK, _recurrentPrimary);
             _retainedSlots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_retainedSlots.ContainsKey(key)) return false;
             if (string.Equals(_activeKey, requestId, StringComparison.Ordinal))
@@ -787,13 +803,19 @@ namespace TensorSharp.Models
             {
                 embedded = EmbedStep(flatTokens);
                 bool capture = features != null && Array.Exists(features, f => f != null);
+                // A lone speculating request's prompt chunk hands the draft layer its rows (FollowPlainPrompt).
+                DraftFollow follow = n == 1 && !capture && _followPromptRequests != null && _followPromptRequests.Remove(requestIds[0])
+                    ? PlanDraftFollow(slots[0], starts[0], null) : DraftFollow.None;
+                float[] draftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], chunks[0], media: false) : null;
                 if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
-                    : TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(), wantLogits: true, out float[][] graphLogits)
+                    : TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(), wantLogits: true, out float[][] graphLogits,
+                          follow: follow, draftRows: draftRows)
                       && CopyLogits(graphLogits, outLogits))
                 {
                     BatchedForwardCount++;
                     for (int s = 0; s < n; s++)
                         slots[s].Length = starts[s] + counts[s];
+                    if (follow != DraftFollow.None) NoteDraftFollowed(slots[0], starts[0], counts[0]);
                     return true;
                 }
                 static bool CopyLogits(float[][] from, float[][] to)

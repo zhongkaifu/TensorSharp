@@ -67,6 +67,17 @@ namespace TensorSharp.Cuda.Interop
         /// <summary>cuMemHostAlloc flags: PORTABLE (all contexts) and DEVICEMAP (kernels address it).</summary>
         public const uint CU_MEMHOSTALLOC_PORTABLE = 0x01, CU_MEMHOSTALLOC_DEVICEMAP = 0x02;
 
+        /// <summary>Page-lock an existing host range (a model file's mapping) so device copies from it run at the link's DMA
+        /// speed; READ_ONLY lets a read-only mapping register.</summary>
+        [LibraryImport(LibName, EntryPoint = "cuMemHostRegister_v2")]
+        public static partial int cuMemHostRegister(IntPtr hostPtr, UIntPtr byteSize, uint flags);
+
+        [LibraryImport(LibName, EntryPoint = "cuMemHostUnregister")]
+        public static partial int cuMemHostUnregister(IntPtr hostPtr);
+
+        /// <summary>cuMemHostRegister flags.</summary>
+        public const uint CU_MEMHOSTREGISTER_PORTABLE = 0x01, CU_MEMHOSTREGISTER_READ_ONLY = 0x08;
+
         [LibraryImport(LibName, EntryPoint = "cuMemHostGetDevicePointer_v2")]
         public static partial int cuMemHostGetDevicePointer(out IntPtr devicePtr, IntPtr hostPtr, uint flags);
 
@@ -217,6 +228,11 @@ namespace TensorSharp.Cuda.Interop
 
         [LibraryImport(LibName, EntryPoint = "cuEventDestroy_v2")]
         public static partial int cuEventDestroy(IntPtr hEvent);
+
+        /// <summary>An event record a captured graph keeps as an external node (flag 1): the event can be waited on and timed
+        /// from outside the graph after a launch.</summary>
+        [LibraryImport(LibName, EntryPoint = "cuEventRecordWithFlags")]
+        public static partial int cuEventRecordWithFlags(IntPtr hEvent, IntPtr hStream, uint flags);
 
         [LibraryImport(LibName, EntryPoint = "cuEventRecord")]
         public static partial int cuEventRecord(IntPtr hEvent, IntPtr hStream);

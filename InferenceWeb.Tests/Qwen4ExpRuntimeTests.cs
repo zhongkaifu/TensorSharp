@@ -69,6 +69,30 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         AssertClose(expected, actual, 2e-2, "mlx");
     }
 
+    /// <summary>TS_Q4E_HC_Q8=1 on the shared runtime: the BF16 hyper-connection matrices become Q8_0 at load for every
+    /// backend (the managed CPU here), and the answers stay within Q8_0's rounding of the BF16 read.</summary>
+    [Fact]
+    public void HyperConnectionsReadAsQ8_0StayCloseToBf16()
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-hc-bf16.gguf"), indexerTopK: 64, qsa: false,
+            projectionType: SyntheticGguf.GgmlType.BF16);
+        float[][] bf16 = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt: false);
+        float[][] q8;
+        using (Qwen4ExpFormat.HcQ8ForCurrentFlowInTests(true))
+        {
+            q8 = Run(() =>
+            {
+                var model = new Qwen4ExpRuntimeModel(path, BackendType.Cpu);
+                Assert.Equal(WeightRequant.GgmlTypeQ8_0, model.QuantizedWeightTypeForTests("output_hc_down.weight"));
+                Assert.Equal(WeightRequant.GgmlTypeQ8_0, model.QuantizedWeightTypeForTests("blk.0.hc_ffn_up.weight"));
+                return model;
+            }, chunkedPrompt: false);
+        }
+        double[] errors = RowErrors(bf16, q8);
+        Assert.True(errors.Max() > 0, "the Q8_0 read changed nothing: the matrices stayed BF16");
+        AssertClose(bf16, q8, 2e-2, "hc q8_0 vs bf16");
+    }
+
     [GgmlTheory(BackendType.GgmlCpu)]
     [InlineData(false)]
     [InlineData(true)]
@@ -85,6 +109,26 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     public void RuntimeMatchesQwen4ExpModelOnGgmlCuda(bool chunkedPrompt) => MatchesOnGgml(BackendType.GgmlCuda, chunkedPrompt);
 
     /// <summary>Qwen4ExpModel's token-span graphs on ggml_cpu (QSA layers dense below the budget) against the runtime.</summary>
+    /// <summary>The direct-CUDA tensor executor (the device top-k, gathers and conversions; QSA dense within the budget)
+    /// against Qwen4ExpModel's goldens.</summary>
+    [CudaTheory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void RuntimeOnDirectCudaMatchesQwen4ExpModel(bool chunkedPrompt, bool qsa)
+    {
+        if (qsa)
+        {
+            MatchesOnGgml(BackendType.Cuda, chunkedPrompt);
+            return;
+        }
+        string path = Fixture(qsa: false);
+        float[][] expected = LegacyGolden(chunkedPrompt ? "script_chunked_cpu" : "script_cpu");
+        float[][] actual = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cuda), chunkedPrompt);
+        AssertClose(expected, actual, 2e-2, "cuda");
+    }
+
     private void MatchesOnGgml(BackendType backend, bool chunkedPrompt)
     {
         string path = Fixture();
@@ -318,6 +362,218 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     private (string Target, string Mtp) SpecFixtures(bool qsa)
         => (Fixture(qsa), Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, $"q4e-mtp-{qsa}.gguf"), indexerTopK: 64));
 
+    /// <summary>The MTP head drafting through the engine's unified step (the preset Qwen3.8 Flash Next serves with): one
+    /// request and several at once give the plain greedy streams, on the managed CPU and on the CUDA executor (whose
+    /// hyper-connection regions run at every width, the draft head's one-row steps included).</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task MtpSpeculationMatchesPlain(bool qsa) => AssertMtpSpeculation(qsa, BackendType.Cpu);
+
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task MtpSpeculationOnDirectCudaMatchesPlain(bool qsa) => AssertMtpSpeculation(qsa, BackendType.Cuda);
+
+    /// <summary>The MTP head follows a speculating request's plain prompt (the trunk's own steps hand it their streams, the
+    /// carry crossing chunks), on one device and on the last of two whole-layer stages (the draft embedding then its own
+    /// input): its first draft is the one the speculator's catch-up over the same rows gives.</summary>
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(true, 1)]
+    [InlineData(false, 2)]
+    public void FollowedPromptDraftsAsItsCatchUp(bool qsa, int stages)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(
+            () => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, draftModelPath: mtp, layerSplitDegree: stages),
+            $"qwen4exp mtp qsa={qsa} stages={stages}", 1e-4);
+    }
+
+    /// <summary>A host-only table copied into process memory (on Linux, where the process can hold it beside 6 GB more:
+    /// Flash Next's PLE n-gram table) holds the mapping's bytes, owned and no longer file-backed, at the address readers
+    /// switch to.</summary>
+    [Fact]
+    public void HostOnlyTableCopiedIntoProcessMemoryKeepsItsBytes()
+    {
+        using var file = new GgufFile(Fixture(false));
+        var info = file.Tensors["per_layer_token_embd.weight"];
+        Assert.True(file.TryGetTensorDataPointer(info, out IntPtr pointer));
+        long bytes = file.GetTensorByteCount(info);
+        using var table = QuantizedWeight.CreateExternalView(pointer, bytes, (int)info.Type, (long)info.Shape[0], (long)info.Shape[1], file);
+        Assert.True(table.IsFileBacked);
+        var before = new byte[bytes];
+        System.Runtime.InteropServices.Marshal.Copy(pointer, before, 0, (int)bytes);
+        StandardDecoderModel.CopyTableToProcessMemory(table, System.Threading.CancellationToken.None);
+        Assert.False(table.IsFileBacked);
+        Assert.NotEqual(pointer, table.Data);
+        var after = new byte[bytes];
+        System.Runtime.InteropServices.Marshal.Copy(table.Data, after, 0, (int)bytes);
+        Assert.Equal(before, after);
+    }
+
+    /// <summary>The MTP head's routed experts requantized at load (the CUDA preset's TS_Q4E_MTP_EXPERTS=q2_0): the draft
+    /// layer holds Q2_0 stacks, and speculation still emits the plain greedy streams (the verify decides every token).</summary>
+    /// <summary>The CUDA executor's draft chain (each step's top ten read back as ids and values) drafts what the per-step
+    /// head drafts - the tokens, and the speculator's confidences bit for bit - and stops after the first step below the
+    /// gate, as the speculator's per-step loop stops.</summary>
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DraftChainOnDirectCudaDraftsItsSteps(bool qsa)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        const int steps = 4;
+        (int[] Ids, float[] Probs, int Count) Draft(bool chain, float stopBelow)
+        {
+            using var model = new Qwen4ExpRuntimeModel(target, BackendType.Cuda, draftModelPath: mtp);
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var head = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.IDraftHead>(model);
+            Assert.True(head.SupportsDraftChain);
+            int width = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
+            int n = prompt.Length;
+            var hAll = new float[n * width];
+            var logits = new float[vocab];
+            model.ResetKVCache();
+            spec.SpecForward(prompt, hAll, logits, false);
+            head.DraftCatchUp(prompt, new float[width].Concat(hAll[..((n - 1) * width)]).ToArray(), 0);
+            var ids = new int[steps];
+            var probs = new float[steps];
+            float[] hIn = hAll[((n - 1) * width)..];
+            if (chain) return (ids, probs, head.DraftChain(new[] { ArgMax(logits) }, hIn, n, steps, ids, probs, stopBelow));
+            var draft = new float[vocab];
+            int token = ArgMax(logits), count = 0;
+            for (int i = 0; i < steps; i++)
+            {
+                var hOut = new float[width];
+                head.DraftStep(token, hIn, n + i, draft, hOut);
+                ids[i] = TensorSharp.Runtime.Speculative.DraftHeadSpeculator.ArgmaxWithTopKConfidence(draft, vocab, out probs[i]);
+                count++;
+                if (probs[i] < stopBelow) break;
+                token = ids[i];
+                hIn = hOut;
+            }
+            return (ids, probs, count);
+        }
+        var plain = Draft(chain: false, stopBelow: 0f);
+        var chained = Draft(chain: true, stopBelow: 0f);
+        Assert.Equal(steps, chained.Count);
+        Assert.Equal(plain.Ids, chained.Ids);
+        Assert.Equal(plain.Probs.Select(BitConverter.SingleToInt32Bits), chained.Probs.Select(BitConverter.SingleToInt32Bits));
+        // A gate just above the second step's confidence: the chain stops after the first step below it.
+        float gate = BitConverter.Int32BitsToSingle(BitConverter.SingleToInt32Bits(plain.Probs[1]) + 1);
+        int expect = Array.FindIndex(plain.Probs, p => p < gate) + 1;
+        var gated = Draft(chain: true, stopBelow: gate);
+        Assert.Equal(expect, gated.Count);
+        Assert.Equal(plain.Ids.Take(expect), gated.Ids.Take(expect));
+    }
+
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    public Task Q2_0DraftExpertsSpeculateAsPlain(BackendType backend) => AssertQ2_0DraftExperts(backend);
+
+    [CudaTheory]
+    [InlineData(BackendType.Cuda)]
+    public Task Q2_0DraftExpertsSpeculateAsPlainOnDirectCuda(BackendType backend) => AssertQ2_0DraftExperts(backend);
+
+    private async Task AssertQ2_0DraftExperts(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa: false);
+        Qwen4ExpRuntimeModel.DraftExpertTypeForTests.Value = TensorSharp.Models.WeightRequant.GgmlTypeQ2_0;
+        try
+        {
+            using (var probe = new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp))
+                Assert.Equal(TensorSharp.Models.WeightRequant.GgmlTypeQ2_0, probe.DraftExpertType);
+            var options = new TensorSharp.Runtime.Speculative.SpeculationOptions
+            {
+                Enabled = true, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0,
+            };
+            await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(
+                () => new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp), options, $"qwen4exp q2_0 mtp experts {backend}");
+        }
+        finally
+        {
+            Qwen4ExpRuntimeModel.DraftExpertTypeForTests.Value = null;
+        }
+    }
+
+    /// <summary>A draft head scoring a vocabulary prefix (the family's base vocabulary) proposes from the full head's
+    /// logits over those ids, bit for bit (CUDA computes the prefix's rows alone), the rest never drafted.</summary>
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    public void DraftVocabularyPrefixScoresTheFullHeadsLogits(BackendType backend) => AssertDraftVocabularyPrefix(backend);
+
+    [CudaTheory]
+    [InlineData(BackendType.Cuda)]
+    public void DraftVocabularyPrefixScoresTheFullHeadsLogitsOnDirectCuda(BackendType backend) => AssertDraftVocabularyPrefix(backend);
+
+    private void AssertDraftVocabularyPrefix(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa: false);
+        float[] Draft(int? vocabulary)
+        {
+            using var model = new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp) { DraftVocabularyForTests = vocabulary };
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeModel)model;
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            int[] prompt = Enumerable.Range(0, 13).Select(i => 30 + (i * 7) % 90).ToArray();
+            var rows = new float[prompt.Length * feat];
+            var logits = new float[vocab];
+            spec.SpecForward(prompt, rows, logits, false);
+            spec.DraftCatchUp(prompt[1..], rows[..((prompt.Length - 1) * feat)], 1);
+            var draft = new float[vocab];
+            spec.DraftStep(ArgMax(logits), rows[((prompt.Length - 1) * feat)..], prompt.Length, draft, new float[feat]);
+            return draft;
+        }
+        float[] full = Draft(null);
+        int half = full.Length / 2;
+        float[] prefix = Draft(half);
+        int differ = 0;
+        for (int i = 0; i < half; i++)
+            if (BitConverter.SingleToInt32Bits(prefix[i]) != BitConverter.SingleToInt32Bits(full[i])) differ++;
+        Assert.True(differ == 0, $"{backend}: {differ} of the prefix head's {half} logits differ from the full head's");
+        for (int i = half; i < prefix.Length; i++)
+            Assert.True(float.IsNegativeInfinity(prefix[i]), $"{backend}: id {i} past the draft vocabulary scored {prefix[i]}");
+    }
+
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FollowedPromptDraftsAsItsCatchUpOnDirectCuda(bool qsa)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(
+            () => new Qwen4ExpRuntimeModel(target, BackendType.Cuda, draftModelPath: mtp), $"qwen4exp mtp qsa={qsa} cuda", 2e-3);
+    }
+
+    private async Task AssertMtpSpeculation(bool qsa, BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        var options = new TensorSharp.Runtime.Speculative.SpeculationOptions
+        {
+            Enabled = true, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0,
+        };
+        var models = new List<Qwen4ExpRuntimeModel>();
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() =>
+        {
+            var model = new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp);
+            models.Add(model);
+            return model;
+        }, options, $"qwen4exp mtp qsa={qsa} {backend}");
+        // The verify windows ran as the kept window of their width advanced to their positions (recorded on CUDA).
+        int windows = models.Sum(m => m.WindowAdvances);
+        Assert.True(windows > 0, $"{backend} qsa={qsa}: no verify window advanced");
+        // So did the draft layer's steps (each draft one position on from the last).
+        int drafts = models.Sum(m => m.DraftAdvances);
+        Assert.True(drafts > 0, $"{backend} qsa={qsa}: no draft step advanced");
+    }
+
     /// <summary>n-gram drafts (accepted and rejected): the verify keeps each row's recurrent and PLE state, and the
     /// accept count commits the kept prefix's n-gram and conv histories.</summary>
     /// <summary>Tensor parallelism as per-rank graphs on two simulated devices: the heads and experts split, the
@@ -341,6 +597,69 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         }
         AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt), Run(Staged, chunkedPrompt), 1e-5,
             $"stages2 qsa={qsa} chunked={chunkedPrompt}");
+    }
+
+    /// <summary>Whole-layer stages on two GPUs (--backend cuda --layer-split 2) on the CUDA executor: every row answers as
+    /// one GPU's (the runtime's placement in place of the direct engine's, Qwen4ExpCudaEngineTests.ALayerSplit_AnswersAsOneDevice).</summary>
+    [MultiCudaTheory(2)]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void StagesOnTwoGpusMatchOneGpu(bool qsa, bool chunkedPrompt)
+    {
+        using IDisposable f32 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        string path = Fixture(qsa);
+        ModelBase Staged()
+        {
+            var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda, layerSplitDegree: 2);
+            Assert.Equal(2, model.Mesh.Stages);
+            return model;
+        }
+        AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cuda), chunkedPrompt), Run(Staged, chunkedPrompt), 1e-4,
+            $"cuda stages2 qsa={qsa} chunked={chunkedPrompt}");
+    }
+
+    /// <summary>Per-rank graphs on two GPUs (--backend cuda --tp 2, the P2P all-reduce): every row answers as one GPU's.</summary>
+    [MultiCudaTheory(2)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RankGraphsOnTwoGpusMatchOneGpu(bool qsa)
+    {
+        using IDisposable f32 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-cuda-tp-{qsa}.gguf"), indexerTopK: 64, qsa: qsa,
+            projectionType: SyntheticGguf.GgmlType.BF16, expertGateUpType: SyntheticGguf.GgmlType.BF16, expertDownType: SyntheticGguf.GgmlType.BF16);
+        using var group = new TensorSharp.Cuda.TensorParallelGroup(2);
+        ModelBase Placed()
+        {
+            var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda, tpDegree: 2, tpGroup: group);
+            Assert.Equal(2, model.Mesh.TensorParallel);
+            return model;
+        }
+        // The ranks' BF16 products run on BF16-rounded activations (tensor cores), as Qwen35RuntimeTests'
+        // DirectCudaRankGraphsMatchOneDevice allows: 1.0-3.0e-3 measured on two RTX 2000 Ada.
+        AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cuda), false), Run(Placed, false), 5e-3, $"cuda tp2 qsa={qsa}");
+    }
+
+    /// <summary>Routed experts on the host (--cpu-moe) across two GPU stages: every row answers as one GPU's with its experts
+    /// resident, within the host kernels' rounding (activations to Q8_K, as ggml's CPU backend; this fixture's prompt is
+    /// short enough for the host to compute it).</summary>
+    [MultiCudaFact(2)]
+    public void HostExpertsOnTwoGpuStagesMatchOneGpu()
+    {
+        using IDisposable f32 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        string path = Fixture(qsa: true);
+        float[][] reference = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cuda), false);
+        float[][] offloaded;
+        using (MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests())
+            offloaded = Run(() =>
+            {
+                var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda, layerSplitDegree: 2);
+                Assert.Equal(2, model.Mesh.Stages);
+                return model;
+            }, false);
+        double[] errors = RowErrors(reference, offloaded);
+        // As Qwen35RuntimeTests' host-expert bound (2.5e-2); 4.7-6.6e-3 measured on two RTX 2000 Ada.
+        Assert.True(errors.All(e => e < 2.5e-2), $"cuda stages2 --cpu-moe relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
     }
 
     /// <summary>A decode step one position on runs again without a trace, its PLE rows and QSA pooled blocks refilled:

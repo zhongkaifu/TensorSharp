@@ -186,11 +186,26 @@ namespace TensorSharp.Cuda
             lock (sync)
             {
                 AllocatorImpl.Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyHtoDAsync(DevicePtrAtElement(storageIndex), src, new UIntPtr((ulong)byteCount),
-                    AllocatorImpl.Stream.Handle).ThrowOnError();
+                // The source may be a model file's mapping with page-locked ranges a copy must not span (CudaHostPins).
+                CudaHostPins.CopyToDevice(DevicePtrAtElement(storageIndex), src, byteCount, AllocatorImpl.Stream.Handle).ThrowOnError();
                 CudaDriverApi.cuStreamSynchronize(AllocatorImpl.Stream.Handle).ThrowOnError();
                 deviceDirty = true;
                 hostDirty = false;
+            }
+        }
+
+        /// <summary>The host writes not yet on the device copied to <paramref name="destination"/> (pinned memory a recorded
+        /// step's copy node reads; <see cref="ByteLength"/> bytes) instead of uploaded now. The device copy counts as the
+        /// current one from here (the recorded copy delivers these bytes before any kernel reads them).</summary>
+        internal unsafe void TakeHostWrites(IntPtr destination)
+        {
+            ThrowIfDisposed();
+            lock (sync)
+            {
+                if (hostDirty && hostBuffer != IntPtr.Zero)
+                    Buffer.MemoryCopy(hostBuffer.ToPointer(), destination.ToPointer(), ByteLength, ByteLength);
+                hostDirty = false;
+                deviceDirty = true;
             }
         }
 

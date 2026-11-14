@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using TensorSharp.Cuda.Interop;
 using TensorSharp.Graph;
 
 namespace TensorSharp.Cuda
@@ -26,7 +27,14 @@ namespace TensorSharp.Cuda
         private readonly CudaPrefillGraphCache _graphs;
         private readonly CudaDecodeDynParams _dyn;
         private readonly Dictionary<int, Tensor> _stable = new();
+        private readonly HashSet<int> _varying = new();
         private bool _disposed;
+
+        /// <summary>The varying inputs' bytes in one pinned buffer (offset per slot): the recording copies each from there
+        /// (a copy node a replay runs on the device), so a replay makes no upload calls - 54 a token on Qwen3.8 Flash Next
+        /// had cost ~0.5 ms of host time between its steps.</summary>
+        private IntPtr _pinned;
+        private readonly Dictionary<int, long> _pinnedAt = new();
 
         public RuntimeDecodeCapture(CudaAllocator allocator)
         {
@@ -37,8 +45,9 @@ namespace TensorSharp.Cuda
 
         public bool Captured { get; private set; }
 
-        public Tensor Stable(int slot, DType type, long[] sizes)
+        public Tensor Stable(int slot, DType type, long[] sizes, bool varies = false)
         {
+            if (varies) _varying.Add(slot);
             if (_stable.TryGetValue(slot, out Tensor t))
             {
                 if (t.ElementType == type && t.Sizes.SequenceEqual(sizes)) return t;
@@ -53,6 +62,8 @@ namespace TensorSharp.Cuda
         public bool CaptureAndLaunch(Func<bool> run, int attendLength, int writeRow, IReadOnlyList<Tensor> written)
         {
             if (Captured || _disposed || !_graphs.IsUsable || !_dyn.IsValid || _stable.Count == 0) return false;
+            _allocator.OnRecordedStepLaunching();
+            PinVaryingInputs();
             Upload();
             _dyn.Write(attendLength, writeRow, 0, 0);
             if (!_graphs.BeginCapture(Key)) return false;
@@ -60,6 +71,7 @@ namespace TensorSharp.Cuda
             try
             {
                 _dyn.EnqueueUpload();
+                EnqueueVaryingCopies();
                 _dyn.Activate();
                 ok = run();
             }
@@ -67,6 +79,12 @@ namespace TensorSharp.Cuda
             {
                 CudaDecodeDynParams.Deactivate();
                 _graphs.AbortCapture(Key, aborted.Message);
+                return false;
+            }
+            catch (CudaException e) when (e.ErrorCode == OutOfMemory)
+            {
+                CudaDecodeDynParams.Deactivate();
+                _graphs.AbortCapture(Key, "out of device memory");
                 return false;
             }
             catch
@@ -81,16 +99,35 @@ namespace TensorSharp.Cuda
                 _graphs.AbortCapture(Key, "the step declined");
                 return false;
             }
-            Captured = _graphs.EndCaptureAndLaunch(Key, _stable.Values.First(), written);
+            try
+            {
+                Captured = _graphs.EndCaptureAndLaunch(Key, _stable.Values.First(), written);
+            }
+            catch (CudaException e) when (e.ErrorCode == OutOfMemory)
+            {
+                return false;
+            }
             return Captured;
         }
 
-        public void Launch(int attendLength, int writeRow)
+        /// <summary>CUDA_ERROR_OUT_OF_MEMORY: a graph the device has no memory left to instantiate or launch.</summary>
+        private const int OutOfMemory = 2;
+
+        public bool TryLaunch(int attendLength, int writeRow)
         {
             if (!Captured) throw new InvalidOperationException("no decode step is recorded");
+            _allocator.OnRecordedStepLaunching();
             Upload();
             _dyn.Write(attendLength, writeRow, 0, 0);
-            _graphs.Replay(Key);
+            try
+            {
+                _graphs.Replay(Key);
+            }
+            catch (CudaException e) when (e.ErrorCode == OutOfMemory)
+            {
+                return false;
+            }
+            return true;
         }
 
         public void MarkWritten(IReadOnlyList<Tensor> tensors)
@@ -99,12 +136,66 @@ namespace TensorSharp.Cuda
                 if (t?.Storage is CudaStorage storage) storage.MarkDeviceModified();
         }
 
+        /// <summary>The pinned buffer of the varying inputs, laid out once before the recording (their shapes are fixed from
+        /// then on); left unset (each uploaded per launch) where the host cannot pin it.</summary>
+        private void PinVaryingInputs()
+        {
+            if (_pinned != IntPtr.Zero) return;
+            long total = 0;
+            foreach (int slot in _varying)
+                if (_stable.TryGetValue(slot, out Tensor t) && t.Storage is CudaStorage storage)
+                {
+                    _pinnedAt[slot] = total;
+                    total += (storage.ByteLength + 255) / 256 * 256;
+                }
+            if (total == 0) return;
+            _allocator.Context.MakeCurrent();
+            if (CudaDriverApi.cuMemHostAlloc(out IntPtr pinned, (UIntPtr)total, 0) != 0)
+            {
+                _pinnedAt.Clear();
+                return;
+            }
+            _pinned = pinned;
+            // An input the host did not write since its last upload: the copy node must deliver what the device holds.
+            _allocator.Stream.Synchronize();
+            foreach ((int slot, long at) in _pinnedAt)
+            {
+                var storage = (CudaStorage)_stable[slot].Storage;
+                if (!storage.IsHostDirty)
+                    CudaDriverApi.cuMemcpyDtoH(_pinned + (nint)at, storage.DeviceBuffer, (UIntPtr)storage.ByteLength).ThrowOnError();
+            }
+        }
+
+        /// <summary>Inside the recording: a copy node per varying input, from its place in the pinned buffer.</summary>
+        private void EnqueueVaryingCopies()
+        {
+            if (_pinned == IntPtr.Zero) return;
+            foreach ((int slot, long at) in _pinnedAt)
+            {
+                var storage = (CudaStorage)_stable[slot].Storage;
+                CudaDriverApi.cuMemcpyHtoDAsync(storage.DeviceBuffer, _pinned + (nint)at, (UIntPtr)storage.ByteLength,
+                    _allocator.Stream.Handle).ThrowOnError();
+            }
+        }
+
         /// <summary>The stable inputs' host writes go to the device now: the recorded kernels read them there, and an
-        /// upload inside the recording would be refused.</summary>
+        /// upload inside the recording would be refused. A varying input's writes go to the pinned buffer instead, which
+        /// the recording's copy node reads when the step runs.</summary>
         private void Upload()
         {
-            foreach (Tensor t in _stable.Values)
-                if (t.Storage is CudaStorage storage) storage.EnsureDeviceCurrent();
+            foreach ((int slot, Tensor t) in _stable)
+                if (t.Storage is CudaStorage storage)
+                {
+                    if (_pinned != IntPtr.Zero && _pinnedAt.TryGetValue(slot, out long at))
+                    {
+                        storage.TakeHostWrites(_pinned + (nint)at);
+                        continue;
+                    }
+                    storage.EnsureDeviceCurrent();
+                    // A varying input's host copy is not what later launches read: a host read inside the recording
+                    // must synchronize (and so abort it), never bake this launch's values in.
+                    if (_varying.Contains(slot)) storage.MarkDeviceModified();
+                }
         }
 
         public void Dispose()
@@ -113,6 +204,12 @@ namespace TensorSharp.Cuda
             _disposed = true;
             _graphs.Dispose();
             _dyn.Dispose();
+            if (_pinned != IntPtr.Zero)
+            {
+                _allocator.Context.MakeCurrent();
+                CudaDriverApi.cuMemFreeHost(_pinned);
+                _pinned = IntPtr.Zero;
+            }
             foreach (Tensor t in _stable.Values) t.Dispose();
             _stable.Clear();
         }

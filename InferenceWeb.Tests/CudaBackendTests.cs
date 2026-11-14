@@ -2142,6 +2142,70 @@ public class CudaBackendTests
         }
     }
 
+    /// <summary>Q2_0 rows (ISTA-DASLab's GSQ-RCO packs: an F16 scale and 64 two-bit codes meaning -1..2) on the generic
+    /// quantized kernels, for a decode row, a few rows and a prompt chunk.</summary>
+    [CudaTheory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(40)]
+    public void CudaQuantizedMatmul_Q2_0MatchesDequantizedReference(int rows)
+    {
+        const int ggmlType = 42, inDim = 256, outDim = 7, blockBytes = 18;
+        var rng = new Random(29);
+        int blocks = inDim / 64;
+        var weights = new byte[outDim * blocks * blockBytes];
+        var dequant = new float[outDim, inDim];
+        for (int o = 0; o < outDim; o++)
+            for (int b = 0; b < blocks; b++)
+            {
+                int at = (o * blocks + b) * blockBytes;
+                var d = (System.Half)(0.01 + rng.NextDouble() * 0.05);
+                BitConverter.TryWriteBytes(weights.AsSpan(at, 2), d);
+                for (int j = 0; j < 64; j++)
+                {
+                    int code = rng.Next(4);
+                    weights[at + 2 + (j / 32) * 8 + (j % 32) / 4] |= (byte)(code << (2 * (j % 4)));
+                    dequant[o, b * 64 + j] = (float)d * (code - 1);
+                }
+            }
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 1) * 0.013f) + MathF.Cos((r + 2) * (c + 3) * 0.007f) * 0.25f;
+        var expected = new float[rows * outDim];
+        for (int r = 0; r < rows; r++)
+            for (int o = 0; o < outDim; o++)
+            {
+                double sum = 0;
+                for (int c = 0; c < inDim; c++) sum += dequant[o, c] * (double)input[r, c];
+                expected[r * outDim + o] = (float)sum;
+            }
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x765000 + rows);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            Assert.True(CudaQuantizedOps.SupportsQuantizedType(ggmlType));
+            CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, host, ggmlType, inDim, outDim, weights.Length);
+            try
+            {
+                using var inputTensor = Tensor.FromArray(allocator, input);
+                using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(output, inputTensor, cacheKey, IntPtr.Zero, ggmlType, inDim, outDim, weights.Length));
+                AssertClose(expected, output.GetElementsAsFloat(rows * outDim), 5e-2f);
+            }
+            finally
+            {
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
     [CudaTheory]
     [InlineData((int)GgmlTensorType.Q5_K)]
     [InlineData((int)GgmlTensorType.Q6_K)]
@@ -3078,11 +3142,14 @@ public class CudaBackendTests
                 outDim,
                 weights.Length));
 
+            // Against unrounded activations: decode-size rows run the NVFP4 matvec on activations rounded to 8 bits a
+            // 32-value block (as ggml's mmvq does), which moves a 256-term product by up to ~1% of its magnitude
+            // (CudaNvfp4MatmulTests holds the matvec to 1e-4 of the dequantized weights times those rounded values).
             float[] expected = DequantizedMatmulNative(weights, GgmlTensorType.NVFP4, outDim, inDim, input);
             float maxAbs = 0f;
             foreach (float e in expected)
                 maxAbs = MathF.Max(maxAbs, MathF.Abs(e));
-            AssertClose(expected, output.GetElementsAsFloat(rows * outDim), MathF.Max(5e-2f, maxAbs * 3e-4f));
+            AssertClose(expected, output.GetElementsAsFloat(rows * outDim), MathF.Max(5e-2f, maxAbs * 1e-2f));
         }
         finally
         {

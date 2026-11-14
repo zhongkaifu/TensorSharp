@@ -49,7 +49,7 @@ internal sealed class CliInferenceSession : IDisposable
     public Result Generate(IReadOnlyList<int> prompt, int maxTokens, SamplingConfig sampling,
         Func<int, bool> onToken = null, CancellationToken cancellationToken = default,
         string requestId = null, IReadOnlyList<PromptMediaSpan> mediaSpans = null,
-        bool enablePrefixCache = true, int sharedPrefixTokens = 0)
+        bool enablePrefixCache = true, int sharedPrefixTokens = 0, bool promptTailCheckpointOptional = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(maxTokens);
         cancellationToken.ThrowIfCancellationRequested();
@@ -75,7 +75,13 @@ internal sealed class CliInferenceSession : IDisposable
         var sequence = new SequenceState(requestId, prompt, replyLimit,
             _engine.PoolStats.blockSize, maxTokens == 0 ? SamplingConfig.Greedy : sampling, mediaSpans: mediaSpans,
             cacheBreakpoints: enablePrefixCache ? null : Array.Empty<int>(),
-            sharedPrefixTokens: enablePrefixCache ? sharedPrefixTokens : 0, cacheScope: _scope);
+            sharedPrefixTokens: enablePrefixCache ? sharedPrefixTokens : 0, cacheScope: _scope)
+        {
+            // The server's rule (ChatGenerationPipeline): a reply rendered back verbatim resumes from the retained end
+            // state, so a short unprotected prompt tail takes no checkpoint (an extra checkpoint copy and one-row
+            // forward on every request otherwise: 65 ms of a 60-token prompt's 116 ms TTFT, Qwen3.8-27B on CUDA).
+            PromptTailCheckpointOptional = promptTailCheckpointOptional,
+        };
 
         // One chat span and the request metrics per call, recorded the way the server's
         // pipeline records them: the CLI submits to an engine of its own, so nothing else

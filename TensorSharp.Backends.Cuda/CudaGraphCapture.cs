@@ -162,8 +162,14 @@ namespace TensorSharp.Cuda
     {
         // Slot layout must match the TS_DYN_* defines in tensorsharp_kernels.cu:
         // [0]=attend_len, [1]=kv write pos, [2]=conv ring write idx, [3]=rope pos.
+        // Then one such block for each row of a verify window run as the decode row at its position (WindowRow): the
+        // window's last row attends attend_len keys, the one before it one fewer, and so on, each written where its
+        // last key is.
         private const int SlotCount = 4;
-        private const int ByteCount = SlotCount * sizeof(int);
+        private const int ByteCount = SlotCount * (1 + WindowRowBlocks) * sizeof(int);
+
+        /// <summary>The rows of a verify window that can read their own lengths (<see cref="WindowRow"/>).</summary>
+        public const int WindowRowBlocks = 8;
 
         private readonly CudaAllocator allocator;
         private IntPtr devicePtr;
@@ -179,6 +185,19 @@ namespace TensorSharp.Cuda
         [ThreadStatic]
         private static int captureMaxAttendLen;
 
+        [ThreadStatic]
+        private static int windowRow;   // 0: the step's block; b + 1: the row b keys short of the step's last
+
+        /// <summary>While set, a launcher's dynamic block is the one of a verify window's row that attends
+        /// <paramref name="fewerKeys"/> keys fewer than the step's length (0 to <see cref="WindowRowBlocks"/> - 1); null
+        /// restores the step's own. Kernels that read only the length and the write position take it.</summary>
+        internal static void WindowRow(int? fewerKeys)
+        {
+            if (fewerKeys is int b && (b < 0 || b >= WindowRowBlocks))
+                throw new ArgumentOutOfRangeException(nameof(fewerKeys), b, $"a verify window row is 0 to {WindowRowBlocks - 1} keys short");
+            windowRow = fewerKeys is int f ? f + 1 : 0;
+        }
+
         /// <summary>Largest attention length the graph being captured stays
         /// valid for (0 = unlimited). Set by launchers that bake a
         /// length-dependent launch configuration (shared memory, grid).</summary>
@@ -193,7 +212,7 @@ namespace TensorSharp.Cuda
             return active != null &&
                 ReferenceEquals(active.allocator, launchAllocator) &&
                 active.devicePtr != IntPtr.Zero
-                    ? active.devicePtr
+                    ? active.devicePtr + windowRow * SlotCount * sizeof(int)
                     : IntPtr.Zero;
         }
 
@@ -229,6 +248,14 @@ namespace TensorSharp.Cuda
             p[1] = kvWritePos;
             p[2] = convWriteIdx;
             p[3] = ropePos;
+            for (int b = 0; b < WindowRowBlocks; b++)
+            {
+                int* row = p + (b + 1) * SlotCount;
+                row[0] = attendLen - b;
+                row[1] = attendLen - b - 1;
+                row[2] = convWriteIdx;
+                row[3] = ropePos;
+            }
         }
 
         /// <summary>Enqueues the pinned-host -> device upload on the allocator
@@ -253,6 +280,7 @@ namespace TensorSharp.Cuda
         public static void Deactivate()
         {
             activeInstance = null;
+            windowRow = 0;
         }
 
         internal static void LimitCaptureAttendLen(int limit)

@@ -1881,7 +1881,8 @@ namespace TensorSharp.Cli
                 {
                     inputTokens = model.MultimodalInjector.ProcessPromptTokens(history, inputTokens, requestId);
                     result = inference.Generate(inputTokens, turnMaxTokens, sampling ?? SamplingConfig.Greedy,
-                        requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId));
+                        requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId),
+                        promptTailCheckpointOptional: !TensorSharp.Server.ChatGenerationPipeline.ReasonsWhetherAsked(arch, enableThinking));
                 }
                 finally
                 {
@@ -2039,7 +2040,8 @@ namespace TensorSharp.Cli
                             return cfg.StopSequences == null || cfg.StopSequences.Count == 0
                                 || !stopSampler.CheckStopSequences(model.Tokenizer.Decode(streamed)).shouldStop;
                         }, requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId),
-                            sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens));
+                            sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens),
+                            promptTailCheckpointOptional: !TensorSharp.Server.ChatGenerationPipeline.ReasonsWhetherAsked(model.Config.Architecture, reqThinking));
                     }
                     finally
                     {
@@ -2980,7 +2982,8 @@ namespace TensorSharp.Cli
                 }
                 var result = inference.Generate(inputTokens, maxTokens, cfg, Emit,
                     requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId),
-                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens));
+                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens),
+                    promptTailCheckpointOptional: !TensorSharp.Server.ChatGenerationPipeline.ReasonsWhetherAsked(model.Config.Architecture, enableThinking));
                 onGenerated?.Invoke(result.Tokens, trailingWhitespace);
                 if (!silent)
                 {

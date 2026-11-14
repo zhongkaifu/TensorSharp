@@ -34,6 +34,14 @@ namespace TensorSharp.Graph
         /// <summary>It runs <see cref="GraphOp.MoeHostExperts"/>: routed experts computed from host memory at a
         /// pause in the program.</summary>
         public bool HostExperts { get; init; }
+
+        /// <summary>A decode step's <see cref="GraphOp.MoeHostExperts"/> stays on the device's stream (the host answers a
+        /// doorbell while the device waits), so a step with host experts can be recorded and replayed.</summary>
+        public bool RecordsHostExperts { get; init; }
+
+        /// <summary>The executor's kernels take a family's fusion regions at any row count, decode rows too (a family marks
+        /// some regions for prompt chunks only, where the backends that fuse them had prompt-width kernels).</summary>
+        public bool RegionsAtAnyWidth { get; init; }
         /// <summary>A compiled plan is worth keeping to run again (a replayable program is cached and
         /// looked up by its signature); otherwise every step is recorded and compiled once.</summary>
         public bool Replays { get; init; } = true;
@@ -45,6 +53,9 @@ namespace TensorSharp.Graph
         /// the host by syncs; false where the device reads the host bytes themselves (Metal's shared buffers, the
         /// CPU), so a host copy of them moves nothing across.</summary>
         public bool SeparateDeviceCopies { get; init; }
+        /// <summary>A program may end in each row's greedy token (a top-1 over the logits, a tie to the lower id), read
+        /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits.</summary>
+        public bool GreedyIdOutputs { get; init; }
     }
 
     /// <summary>A stable identity for a storage object, for program signatures of executors that bind

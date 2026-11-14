@@ -158,6 +158,7 @@ namespace TensorSharp.Models
             }
             slot.Length = source.Length;
             slot.DraftStart = source.DraftStart;
+            slot.DraftFollowed = -1;   // the copy has no carry
             slot.RopeDelta = source.RopeDelta;
             if (TryCopySlotOnDevice(source, slot, targetBound: inPlace))
                 return slot;
@@ -484,6 +485,8 @@ namespace TensorSharp.Models
                 slot.Length = length;
                 slot.RopeDelta = ropeDelta;
                 slot.DraftStart = length;   // the file holds no draft-layer rows
+                slot.DraftFollowed = -1;
+                slot.RetainedAt = System.Threading.Interlocked.Increment(ref s_retainSerial);
                 _retainedSlots.Add(key, slot);
                 return true;
             }

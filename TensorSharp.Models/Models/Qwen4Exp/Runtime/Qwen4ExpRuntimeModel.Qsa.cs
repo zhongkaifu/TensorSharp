@@ -198,30 +198,38 @@ namespace TensorSharp.Models
             int d = q.Dim, heads = q.Heads, kvType = KvCacheGraphType;
             Slot slot = step.Slots[s];
 
-            // The plan: blocks over the window, complete ones holding cells, the rest padded and invisible.
-            int pools = (keys + ratio - 1) / ratio, complete = (start + count) / ratio;
+            // The plan: blocks over the window, complete ones holding cells, the rest padded and invisible. It follows the
+            // rows' positions: run again one position on, a decode step refills it in place (the same graph: the window,
+            // and so the blocks, unchanged).
+            int pools = (keys + ratio - 1) / ratio;
             var pooledRows = new int[pools];              // the row holding a block's pooled key (padded blocks read row 0)
             var cells = new int[ratio * pools];           // the members a picked block keeps (padded: out of range)
-            for (int b = 0; b < pools; b++)
-            {
-                pooledRows[b] = b < complete ? b * ratio + ratio - 1 : 0;
-                for (int i = 0; i < ratio; i++)
-                    cells[b * ratio + i] = b < complete ? b * ratio + i : keys;
-            }
             var visible = new ushort[pools * count];      // 0 where row q sees all of block b, -inf elsewhere (F16)
             var tail = new int[(ratio - 1) * count];      // row q's incomplete block's cells (out of range past them)
-            for (int r = 0; r < count; r++)
+            void Plan(int first)
             {
-                int p = start + r, tailStart = (p + 1) / ratio * ratio;
+                int complete = (first + count) / ratio;
                 for (int b = 0; b < pools; b++)
-                    visible[r * pools + b] = b < complete && (b + 1) * ratio - 1 <= p ? (ushort)0 : (ushort)0xFC00;
-                for (int t = 0; t < ratio - 1; t++)
-                    tail[r * (ratio - 1) + t] = tailStart + t <= p ? tailStart + t : keys;
+                {
+                    pooledRows[b] = b < complete ? b * ratio + ratio - 1 : 0;
+                    for (int i = 0; i < ratio; i++)
+                        cells[b * ratio + i] = b < complete ? b * ratio + i : keys;
+                }
+                for (int r = 0; r < count; r++)
+                {
+                    int p = first + r, tailStart = (p + 1) / ratio * ratio;
+                    for (int b = 0; b < pools; b++)
+                        visible[r * pools + b] = b < complete && (b + 1) * ratio - 1 <= p ? (ushort)0 : (ushort)0xFC00;
+                    for (int t = 0; t < ratio - 1; t++)
+                        tail[r * (ratio - 1) + t] = tailStart + t <= p ? tailStart + t : keys;
+                }
             }
+            Plan(start);
 
             // Each block's pooled key, from its last member's row (the cache's pooled half).
             int pooledHalf = step.View2(QsaCache(step, layer, s), d, slot.Capacity, RowBytes(kvType, 2 * d), RowBytes(kvType, d));
-            int pooled = step.Reshape(step.Op(GraphOp.GetRows, pooledHalf, step.InputI32(pooledRows, pools)), d, 1, pools);
+            int pooledInput = step.InputI32(pooledRows, pools);
+            int pooled = step.Reshape(step.Op(GraphOp.GetRows, pooledHalf, pooledInput), d, 1, pools);
 
             // The rows' indexer queries, scored against every block.
             int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);
@@ -231,13 +239,17 @@ namespace TensorSharp.Models
             query = step.PositionTable >= 0 ? step.Rope(query, GraphRotary) : step.RopeAt(query, GraphRotary, step.SequencePositions(s));
             var weights = new float[heads * count];
             Array.Fill(weights, 1f / MathF.Sqrt(d));   // the reference's unweighted head sum, scaled
+            int visibleInput = step.InputF16(visible, pools, count);
             int score = step.Op(GraphOp.LightningIndexer, stackalloc[]
-                { query, pooled, step.InputF32(weights, heads, count), step.InputF16(visible, pools, count) });   // [pools, count]
+                { query, pooled, step.ConstantInputF32(weights, heads, count), visibleInput });   // [pools, count]
             int picks = step.Op(GraphOp.TopK, stackalloc[] { score }, stackalloc long[] { Math.Min(pools, q.TopK / ratio) });
+            int cellsInput = step.InputI32(cells, cells.Length), tailInput = step.InputI32(tail, tail.Length);
+            int seq = s;
+            step.RefillOnAdvance(pooledInput, () => { Plan(step.Starts[seq]); return true; });
+            foreach (int input in new[] { visibleInput, cellsInput, tailInput }) step.RefillOnAdvance(input, () => true);
             return step.Op(GraphOp.TopKMask, stackalloc[]
             {
-                mask, picks, score, step.Reshape(step.InputI32(cells, cells.Length), ratio, pools),
-                step.Reshape(step.InputI32(tail, tail.Length), ratio - 1, count),
+                mask, picks, score, step.Reshape(cellsInput, ratio, pools), step.Reshape(tailInput, ratio - 1, count),
             }, stackalloc long[] { 1, 1, 1 });
         }
     }

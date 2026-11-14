@@ -297,6 +297,20 @@ namespace TensorSharp.Models
             CacheKey = _data;
         }
 
+        /// <summary>
+        /// A file-backed view reads its bytes from <paramref name="owned"/> from here on: a copy in process memory (from
+        /// <see cref="AllocateBuffer"/>) that the weight now owns and frees. A reader that took the mapping's pointer keeps a
+        /// valid one (the file stays mapped), so the switch is safe while rows are being read; the device cache key stays.
+        /// </summary>
+        internal void AdoptHostCopy(IntPtr owned)
+        {
+            if (owned == IntPtr.Zero || !IsFileBacked)
+                throw new InvalidOperationException("Only a file-backed view adopts a host copy.");
+            _ownsBuffer = true;
+            _ownerToken = null;
+            System.Threading.Volatile.Write(ref _data, owned);
+        }
+
         public void ReleaseHostData()
         {
             if (_data == IntPtr.Zero)

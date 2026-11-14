@@ -202,14 +202,37 @@ namespace TensorSharp.Models
                 SpecForwardPerOp(tokens, hAllOut, logitsOut, allLogitsRows, request, positions);
                 return;
             }
+            bool media = _pendingMedia.Count > 0;
             Tensor hidden = EmbedStep(tokens);
             InjectMedia(hidden, start);
+            // A forward that is not a verify hands the draft layer its rows (DraftSelfCatchUp) when it continues the ones the
+            // layer followed (the step that captures the carry after a followed prompt), or from position 0 when the caller
+            // takes only the last row's features (a prompt chunk through a context that leaves the catch-up to the trunk:
+            // a caller taking every row catches the layer up itself).
+            Slot active = SnapshotActive();
+            DraftFollow follow = !allLogitsRows && !dflash && hAllOut != null ? PlanDraftFollow(active, start, positions.Table) : DraftFollow.None;
+            if (follow == DraftFollow.FromStart && hAllOut.LongLength >= (long)rows * DraftFeatureWidth) follow = DraftFollow.None;
+            if (follow != DraftFollow.None)
+            {
+                request = new GraphRequest
+                {
+                    PositionTable = request.PositionTable, AllRowLogits = request.AllRowLogits, LastRowLogits = request.LastRowLogits,
+                    CaptureLayers = request.CaptureLayers, CaptureFinal = request.CaptureFinal, RecurrentSnapshots = request.RecurrentSnapshots,
+                    FollowDraft = follow, DraftRows = PrepareDraftFollow(active, tokens, media),
+                };
+                _draftCarry = active.DraftCarry;
+            }
             GraphResult result;
             _forwardSw.Start();
             try
             {
-                if (!TryRunGraphStep(hidden, new[] { SnapshotActive() }, new[] { 0 }, new[] { rows }, new[] { start }, request, out result))
+                if (!TryRunGraphStep(hidden, new[] { active }, new[] { 0 }, new[] { rows }, new[] { start }, request, out result))
                     throw new NotSupportedException(SpeculationRefusal ?? $"{Config.Architecture}: this verify cannot run as a graph.");
+                if (follow != DraftFollow.None)
+                {
+                    NoteDraftFollowed(active, start, rows);
+                    LoadDraftFollow(active);
+                }
             }
             finally
             {
@@ -348,6 +371,7 @@ namespace TensorSharp.Models
                 throw new ArgumentOutOfRangeException(nameof(length), $"rewind to {length} of {_cacheSeqLen}");
             MirrorRewind(length);
             _cacheSeqLen = length;
+            if (length < _draftFollowed) _draftFollowed = -1;
         }
 
         /// <summary>With a drafter attached, also warm each verify width (and its commit), so the first

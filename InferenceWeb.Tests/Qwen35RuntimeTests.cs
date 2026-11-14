@@ -23,9 +23,11 @@ public sealed class Qwen35RuntimeTests : IDisposable
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-qwen35-runtime-" + Guid.NewGuid().ToString("N"));
     private readonly KvCacheDtype _dtype = KvCacheDtypeConfig.Current;
     private readonly bool _dtypeExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+    private readonly Xunit.Abstractions.ITestOutputHelper _output;
 
-    public Qwen35RuntimeTests()
+    public Qwen35RuntimeTests(Xunit.Abstractions.ITestOutputHelper output)
     {
+        _output = output;
         Directory.CreateDirectory(_dir);
         MoeCpuOffloadConfig.Reset();
     }
@@ -57,6 +59,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
         // The quantized mix (IQ3_S / IQ4_XS experts, Q8_0 projections) quantizes activations, so
         // a rounding flip upstream moves outputs by ~1e-2 in either implementation.
         "moe-quantized" => new Qwen35MoeSyntheticModelBuilder { Layers = 8 }.Write(Path.Combine(_dir, "q35-moe-q.gguf")),
+        // Eight routes a token: the route-tail skip's rank 7 is one of them.
+        "moe-k8" => new Qwen35MoeSyntheticModelBuilder { Layers = 4, TopK = 8, UniformWeightType = SyntheticGguf.GgmlType.BF16 }
+            .Write(Path.Combine(_dir, "q35-moe-k8.gguf")),
         // Two KV heads, so tensor parallelism can split the attention layers.
         "moe-tp" => new Qwen35MoeSyntheticModelBuilder { Layers = 8, UniformWeightType = SyntheticGguf.GgmlType.BF16, KvHeads = 2 }
             .Write(Path.Combine(_dir, "q35-moe-tp.gguf")),
@@ -65,6 +70,35 @@ public sealed class Qwen35RuntimeTests : IDisposable
 
     private static Qwen35RuntimeModel Create(string path, int tp = 1, int stages = 1, BackendType backend = BackendType.Cpu)
         => new(path, backend, tp, tp > 1 ? new SimulatedDeviceGroup(tp * stages) : null, stages);
+
+    /// <summary>A lone CUDA prompt whose full step does not fit the device releases finished requests' retained slots, the
+    /// oldest first and only until the step fits, each reported to the prefix cache as reclaimed (kept, they narrowed every
+    /// later prompt's steps on a 16 GB card).</summary>
+    [CudaFact]
+    public void ALonePromptReleasesTheOldestRetainedSlotsItNeeds()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), backend: BackendType.Cuda);
+        var sink = new InferenceWeb.Tests.PrefixCache.Fakes.RecordingPayloadSink();
+        model.AttachPrefixCache(sink);
+        var unified = (IUnifiedBatchModel)model;
+        string[] keys = { "pc:test:1", "pc:test:2", "pc:test:3" };
+        for (int i = 0; i < keys.Length; i++)
+        {
+            string id = $"done{i}";
+            unified.EnsureSequenceSlot(id, 64);
+            Assert.True(unified.TryForwardUnified(new[] { id }, new[] { Enumerable.Range(0, 12).Select(t => 30 + i + t).ToArray() }, new[] { 0 },
+                new float[1][]));
+            Assert.True(model.RetainSequenceCacheAs(id, keys[i]));
+        }
+        // The first lone prompt sizes its steps from the device; then the device has room only with one slot left retained.
+        model.PreferredSoloPrefillTokens(0, 1000);
+        model.PromptFreeBytesForTests = () => model.RetainedPayloadKeys.Count > 1 ? 0 : long.MaxValue;
+        model.PreferredSoloPrefillTokens(0, 100_000);
+        Assert.Equal(new[] { keys[2] }, model.RetainedPayloadKeys);
+        Assert.Equal(new[] { (keys[0], TensorSharp.Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed), (keys[1], TensorSharp.Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed) },
+            sink.Reports);
+    }
 
     /// <summary>The factory's route: the shared runtime serves every checkpoint on every backend and placement; only a
     /// dense NVFP4 checkpoint on one direct-CUDA GPU leaves it for the direct engine.</summary>
@@ -334,6 +368,35 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>Per-rank graphs on two GPUs (the P2P all-reduce of --tp 2) and whole-layer stages on two GPUs
+    /// (--layer-split 2), on the CUDA executor: every row answers as one GPU's (the placements the direct engine never
+    /// served; the 27B NVFP4 on two 16 GB cards needs one of them).</summary>
+    [MultiCudaTheory(2)]
+    [InlineData("dense", 2, 1)]
+    [InlineData("moe-tp", 2, 1)]
+    [InlineData("dense", 1, 2)]
+    [InlineData("moe", 1, 2)]
+    public void DirectCudaPlacementsOnTwoGpusMatchOneGpu(string variant, int tp, int stages)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        List<float[]> reference;
+        using (var single = Create(path, backend: BackendType.Cuda))
+            reference = Script(single);
+        using var group = tp > 1 ? new TensorSharp.Cuda.TensorParallelGroup(tp) : null;
+        using var placed = new Qwen35RuntimeModel(path, BackendType.Cuda, tp, group, stages);
+        Assert.Equal(tp, placed.Mesh.TensorParallel);
+        Assert.Equal(stages, placed.Mesh.Stages);
+        List<float[]> actual = Script(placed);
+        Assert.True(placed.GraphRuns > 0, $"{variant}: no graph ran");
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(actual[i], reference[i]);
+            // As DirectCudaRankGraphsMatchOneDevice: BF16 experts sharded by width round apart; stages are exact.
+            Assert.True(rel <= (variant == "moe-tp" ? 2.5e-2 : 5e-3), $"{variant} tp={tp} stages={stages} row {i}: relL2 {rel:E2}");
+        }
+    }
+
     /// <summary>Speculation on per-rank graphs: each rank's verify keeps its recurrent states' window, and the commit runs
     /// per rank on its own share of the heads; the NextN draft layer runs whole (unsharded) on rank 0.</summary>
     [Fact]
@@ -478,6 +541,204 @@ public sealed class Qwen35RuntimeTests : IDisposable
         {
             double rel = RelL2(actual[i], reference[i]);
             Assert.True(rel <= 1e-4, $"--cpu-moe, {stages} stage(s), row {i}: relL2 {rel:E2}");
+        }
+    }
+
+    /// <summary>The same on the tensor executors whose device is not the host: an offloaded layer's routes the tier does
+    /// not hold run on the host (ggml's CPU kernels), the tier's on the device, and a prompt chunk wider than the host
+    /// kernel streams every selected expert to the device for the step. One implementation for every backend.</summary>
+    [MlxTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void HostExpertsOnMlxMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Mlx, tier);
+
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void HostExpertsOnDirectCudaMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Cuda, tier);
+
+    /// <summary>The route-tail skip on the tensor executors' expert host (Strata's, on by default): in a step the host
+    /// computes, a host expert every row routes at rank 7 or lower is left out; a streamed prompt chunk computes every route.
+    /// The same answers as the exact sums for the prompt, slightly different ones after.</summary>
+    [MlxFact]
+    public void RouteTailSkipOnMlxLeavesOutLowRankHostRoutes() => AssertRouteTailSkip(BackendType.Mlx);
+
+    [CudaFact]
+    public void RouteTailSkipOnDirectCudaLeavesOutLowRankHostRoutes() => AssertRouteTailSkip(BackendType.Cuda);
+
+    private void AssertRouteTailSkip(BackendType backend)
+    {
+        using var kv = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-k8");
+        (List<float[]> Rows, long HostRoutes) Run(int rank)
+        {
+            using var model = Create(path, backend: backend);
+            model.RouteTailSkipForTests = (rank, 100);
+            List<float[]> rows = Script(model);
+            return (rows, model.ExpertHostCountsForTests.HostRoutes);
+        }
+        (List<float[]> exact, long exactRoutes) = Run(0);
+        (List<float[]> skipped, long skippedRoutes) = Run(7);
+        _output.WriteLine($"{backend}: host routes {exactRoutes} exact, {skippedRoutes} with the tail skip");
+        Assert.True(skippedRoutes < exactRoutes && skippedRoutes * 8 >= exactRoutes * 7 - 8,
+            $"host routes {skippedRoutes} with the skip, {exactRoutes} without");
+        Assert.Equal(exact[0], skipped[0]);   // the streamed prompt chunk: every route
+        double worst = Enumerable.Range(1, exact.Count - 1).Max(i => RelL2(skipped[i], exact[i]));
+        Assert.True(worst > 0 && worst < 5e-2, $"rows after the prompt moved {worst:E2}");
+    }
+
+    /// <summary>Quantized experts (IQ3_S / IQ4_XS): the prompt chunk's staged experts (on CUDA the grouped MoE kernels, F16
+    /// operands and F32 accumulation) against the device's own kernels. Only the prompt row is judged: the decode rows' host
+    /// routes round the activations to Q8_K as ggml's CPU backend does, against the device's unrounded ones, and on this
+    /// random model a flipped top-k then moves a later row by 0.1-0.4 (MLX and CUDA alike), past any tolerance that would
+    /// still catch a fault.</summary>
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QuantizedHostExpertsOnDirectCudaMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Cuda, tier, "moe-quantized");
+
+    [MlxTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QuantizedHostExpertsOnMlxMatchDeviceExperts(bool tier) => AssertHostExpertsMatchDevice(BackendType.Mlx, tier, "moe-quantized");
+
+    /// <summary>A shared expert run beside the router and the routed experts on a second stream (a concurrent region) gives
+    /// the logits it gives run in place, bit for bit: the same kernels on the same bytes, the streams joined where its output
+    /// is read - prompts, decode steps and their recordings.</summary>
+    [CudaFact]
+    public void SharedExpertBesideTheRoutedExpertsGivesTheSameLogitsOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture("moe-quantized");
+        List<float[]> Run(bool inPlace)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.ConcurrentRegionsDisabledForTests = inPlace;
+            List<float[]> rows = Script(model);
+            Assert.True(model.GraphReplays > 0, "the decode steps did not replay");
+            return rows;
+        }
+        List<float[]> beside = Run(false), inPlace = Run(true);
+        for (int i = 0; i < inPlace.Count; i++)
+            Assert.True(beside[i].AsSpan().SequenceEqual(inPlace[i]), $"row {i}: {RelL2(beside[i], inPlace[i]):E2} from the in-place run");
+    }
+
+    /// <summary>A host-served layer's selection on the CUDA executor's keyed warp select (the selection resident layers'
+    /// experts take) gives what its softmax / top-k / renormalize ops give, within the fixture's near-tie bound.</summary>
+    [CudaFact]
+    public void HostServedSelectionOnDirectCudaMatchesItsOps()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("moe-quantized");
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        (List<float[]> Rows, long Regions) Run(bool ops)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.MoeSelectRegionDisabledForTests = ops;
+            List<float[]> rows = Script(model);
+            return (rows, ((TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests).MoeSelectRegions);
+        }
+        var kernel = Run(ops: false);
+        var ops = Run(ops: true);
+        Assert.True(kernel.Regions > 0, "no selection ran as the region");
+        Assert.Equal(0, ops.Regions);
+        _output.WriteLine("selection region vs ops: " + string.Join(" ", kernel.Rows.Select((r, i) => RelL2(r, ops.Rows[i]).ToString("E2"))));
+        // The fixture's random router has near-ties, where the two sums may pick another expert: rows then move by the
+        // quantized checkpoint's ~1e-2 (AssertHostExpertsMatchDevice's bound for it).
+        for (int i = 0; i < ops.Rows.Count; i++)
+        {
+            double rel = RelL2(kernel.Rows[i], ops.Rows[i]);
+            Assert.True(rel <= 5e-2, $"row {i}: {rel:E2} from the ops' selection");
+        }
+    }
+
+    /// <summary>A greedy unified step on the CUDA executor (each sequence's last row's top-1 picked on the device and read
+    /// back as an id) picks what the logits step's host argmax picks: two sequences over a prompt and four decode steps.</summary>
+    [CudaFact]
+    public void GreedyUnifiedStepsPickTheLogitsArgmaxOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture("moe-quantized");
+        int[] Run(bool greedy)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            var unified = Assert.IsAssignableFrom<TensorSharp.Runtime.Scheduling.IUnifiedBatchModel>(model);
+            Assert.True(unified.SupportsUnifiedGreedyIds);
+            string[] ids = { "a", "b" };
+            foreach (string id in ids) unified.EnsureSequenceSlot(id, 64);
+            int[][] tokens = { Enumerable.Range(0, 9).Select(i => 40 + i * 7).ToArray(), Enumerable.Range(0, 13).Select(i => 50 + i * 5).ToArray() };
+            int[] starts = { 0, 0 };
+            var picked = new List<int>();
+            for (int step = 0; step < 5; step++)
+            {
+                var next = new int[2];
+                if (greedy)
+                    Assert.True(unified.TryForwardUnifiedGreedy(ids, tokens, starts, next));
+                else
+                {
+                    var logits = new float[2][];
+                    Assert.True(unified.TryForwardUnified(ids, tokens, starts, logits));
+                    for (int s = 0; s < 2; s++)
+                    {
+                        int best = 0;
+                        for (int v = 1; v < logits[s].Length; v++) if (logits[s][v] > logits[s][best]) best = v;
+                        next[s] = best;
+                    }
+                }
+                picked.AddRange(next);
+                for (int s = 0; s < 2; s++) starts[s] += tokens[s].Length;
+                tokens = next.Select(t => new[] { t }).ToArray();
+            }
+            return picked.ToArray();
+        }
+        Assert.Equal(Run(greedy: false), Run(greedy: true));
+    }
+
+    /// <summary>The staged-ahead path of a long prompt chunk (CudaGraphExecutor.PromptPrefetch: every host expert of the
+    /// next MoE layer copied into the other arena half while a layer runs, the routes kept on the device), driven with
+    /// the fixture's short prompt by lowering this executor's row threshold: the same answers as the device's experts.</summary>
+    [CudaFact]
+    public void PrefetchedHostExpertsOnDirectCudaMatchDeviceExperts()
+        => AssertHostExpertsMatchDevice(BackendType.Cuda, true, "moe-quantized", prefetch: true);
+
+    private void AssertHostExpertsMatchDevice(BackendType backend, bool tier, string variant = "moe", bool prefetch = false)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        List<float[]> reference;
+        using (var device = Create(path, backend: backend))
+            reference = Script(device);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        using var offloaded = Create(path, backend: backend);
+        if (tier)
+            for (int l = 0; l < offloaded.Config.NumLayers; l++)
+                offloaded.SetExpertTierForTests(l, Enumerable.Range(0, offloaded.ExpertCountForTests / 2).ToArray());
+        var cudaExecutor = prefetch ? (TensorSharp.Cuda.CudaGraphExecutor)offloaded.GraphExecutorForTests : null;
+        if (cudaExecutor != null)
+        {
+            cudaExecutor.PrefetchMinRows = 1;
+            // The executor learns the MoE layers' order from a first request; the next prompt stages each layer ahead.
+            Script(offloaded);
+            offloaded.ResetKVCache();
+        }
+        List<float[]> actual = Script(offloaded);
+        if (cudaExecutor != null)
+        {
+            _output.WriteLine($"staged-ahead layers {cudaExecutor.PrefetchedLayers}, copied while the previous layer ran {cudaExecutor.PrefetchedAhead}");
+            Assert.True(cudaExecutor.PrefetchedLayers > 0 && cudaExecutor.PrefetchedAhead > 0,
+                $"staged-ahead layers {cudaExecutor.PrefetchedLayers}, ahead {cudaExecutor.PrefetchedAhead}");
+        }
+        (long hostRoutes, long streamed) = offloaded.ExpertHostCountsForTests;
+        Assert.True(offloaded.GraphRuns > 0, "the offloaded model did not run as graphs");
+        Assert.True(hostRoutes > 0 && streamed > 0, $"host routes {hostRoutes}, streamed steps {streamed}");
+        // The host's kernels round as ggml's CPU backend does (activations to Q8_K / BF16 against the device's).
+        _output.WriteLine($"{backend} {variant} tier={tier}: " + string.Join(" ", reference.Select((r, i) => RelL2(actual[i], r).ToString("E2"))));
+        for (int i = 0; i < (variant == "moe" ? reference.Count : 1); i++)
+        {
+            double rel = RelL2(actual[i], reference[i]);
+            // Quantized activations upstream move a quantized checkpoint's rows by ~1e-2 in either implementation.
+            Assert.True(rel <= (variant == "moe" ? 2.5e-2 : 5e-2), $"{backend} --cpu-moe {variant} tier={tier}, row {i}: relL2 {rel:E2}");
         }
     }
 
@@ -650,6 +911,103 @@ public sealed class Qwen35RuntimeTests : IDisposable
     public void AdvancedRankedDecodeStepsMatchTracedOnes(string variant)
         => AssertAdvancedDecodeMatchesTraced(variant, path => new Qwen35RuntimeModel(path, BackendType.GgmlCuda, 2, null, 1));
 
+    /// <summary>A verify window kept to advance (and, on CUDA, recorded) is never run again on verify buffers its states
+    /// gave up since (a retained or pooled slot frees them): the next window traces anew and answers as a model whose
+    /// buffers stayed. A recorded window had written the freed buffers of the pooled slot the next request took (CUDA
+    /// error 700 on an RTX PRO 6000).</summary>
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    public void AdvancedWindowsRetraceAfterTheirVerifyBuffersAreFreed(BackendType backend) => AssertWindowsRetraceAfterRelease(backend);
+
+    [CudaTheory]
+    [InlineData(BackendType.Cuda)]
+    public void AdvancedWindowsRetraceAfterTheirVerifyBuffersAreFreedOnDirectCuda(BackendType backend) => AssertWindowsRetraceAfterRelease(backend);
+
+    /// <summary>A verify window's recurrence on direct CUDA writes its rows and its state after every row straight into the
+    /// request's verify buffer (the alias's destination), where each window had copied them (12.7 MB a layer of a 4-row
+    /// window of Qwen3.8 Flash Next): the same kernel into other memory, so every window's logits are the same bits.</summary>
+    [CudaFact]
+    public void VerifyWindowRecurrenceWritesItsVerifyBufferInPlaceOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture("dense");
+        (List<float[]> Logits, long InPlace, long Copies) Run(bool inPlace)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            var executor = (TensorSharp.Graph.TensorGraphExecutor)model.GraphExecutorForTests;
+            executor.AliasDestinationsDisabledForTests = !inPlace;
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            int vocab = model.Config.VocabSize;
+            spec.SpecForward(Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray(), null, new float[vocab], false);
+            long inPlaceBefore = executor.AliasesInPlace, copiesBefore = executor.AliasCopies;
+            var trace = new List<float[]>();
+            for (int w = 0; w < 6; w++)
+            {
+                int[] window = Enumerable.Range(0, 4).Select(i => 60 + (w * 4 + i) % 30).ToArray();
+                var logits = new float[4 * vocab];
+                spec.SpecForward(window, null, logits, true);
+                spec.SpecOnVerifyAccepted(3, 4);
+                trace.Add(logits);
+            }
+            return (trace, executor.AliasesInPlace - inPlaceBefore, executor.AliasCopies - copiesBefore);
+        }
+        var placed = Run(inPlace: true);
+        var copied = Run(inPlace: false);
+        Assert.True(placed.InPlace > copied.InPlace, $"windows' results in place: {placed.InPlace} vs {copied.InPlace} without destinations");
+        Assert.True(placed.Copies < copied.Copies, $"alias copies: {placed.Copies} vs {copied.Copies} without destinations");
+        for (int w = 0; w < placed.Logits.Count; w++)
+            Assert.True(placed.Logits[w].AsSpan().SequenceEqual(copied.Logits[w]), $"window {w} differs with its result written in place");
+    }
+
+    private void AssertWindowsRetraceAfterRelease(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        List<float[]> Run(bool release, out int advances)
+        {
+            using var model = Create(path, backend: backend);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            int vocab = model.Config.VocabSize;
+            spec.SpecForward(Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray(), null, new float[vocab], false);
+            var trace = new List<float[]>();
+            for (int w = 0; w < 7; w++)
+            {
+                if (w == 5)
+                {
+                    // The window before keeps all its rows (settled now, as a request's last verify is before its slot is retained).
+                    spec.SpecOnVerifyAccepted(3, 4);
+                    if (release) model.ReleaseActiveSpecBuffersForTests();
+                }
+                int[] window = Enumerable.Range(0, 4).Select(i => 60 + (w * 4 + i) % 30).ToArray();
+                var logits = new float[4 * vocab];
+                spec.SpecForward(window, null, logits, true);
+                trace.Add(logits);
+            }
+            advances = model.WindowAdvances;
+            return trace;
+        }
+        List<float[]> kept = Run(release: false, out int keptAdvances), released = Run(release: true, out _);
+        Assert.True(keptAdvances >= 3, $"{backend}: {keptAdvances} windows advanced");
+        // CUDA records a kept window, whose attention runs over the whole window with its mask (a retraced one over the
+        // written keys): the same sums in another order. A freed buffer read back gives garbage, or CUDA error 700.
+        for (int w = 0; w < kept.Count; w++)
+        {
+            if (backend == BackendType.Cpu)
+            {
+                Assert.True(kept[w].AsSpan().SequenceEqual(released[w]), $"{backend}: window {w} differs after the verify buffers were freed");
+                continue;
+            }
+            double num = 0, den = 0;
+            for (int i = 0; i < kept[w].Length; i++)
+            {
+                double d = kept[w][i] - released[w][i];
+                num += d * d;
+                den += kept[w][i] * (double)kept[w][i];
+            }
+            Assert.True(Math.Sqrt(num / den) < 1e-2, $"{backend}: window {w} is {Math.Sqrt(num / den):E2} away after the verify buffers were freed");
+        }
+    }
+
     private void AssertAdvancedDecodeMatchesTraced(string variant, Func<string, Qwen35RuntimeModel> create)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
@@ -724,6 +1082,15 @@ public sealed class Qwen35RuntimeTests : IDisposable
             $"qwen35 {variant} {speculator} {backend}");
     }
 
+    /// <summary>As <see cref="EngineSpeculationMatchesPlain"/> on the CUDA executor (the verify windows' decode-size
+    /// products and the draft head's step run there).</summary>
+    [CudaTheory]
+    [InlineData("dense", SpeculatorRegistry.NGram)]
+    [InlineData("moe", SpeculatorRegistry.NGram)]
+    [InlineData("dense-nextn", SpeculatorRegistry.DraftHead)]
+    public Task EngineSpeculationOnDirectCudaMatchesPlain(string variant, string speculator)
+        => EngineSpeculationMatchesPlain(variant, speculator, BackendType.Cuda);
+
     /// <summary>A batched verify whose graph finds no device memory for its compute buffer is retried once after the
     /// cached graphs are freed, and declined (the step decodes plainly) when it fails again: the requests get the plain
     /// greedy streams either way, where the failure used to fail them.</summary>
@@ -761,6 +1128,24 @@ public sealed class Qwen35RuntimeTests : IDisposable
             return hindered;
         }, $"qwen35 dense, {failures} forward allocation failures");
         Assert.Equal(0, hindered.InjectedForwardAllocationFailures);
+    }
+
+    /// <summary>The draft layer follows a speculating request's plain prompt (the trunk's own steps hand it their rows):
+    /// its first draft is the one the speculator's catch-up over the same rows gives.</summary>
+    [Fact]
+    public void FollowedPromptDraftsAsItsCatchUp()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(() => Create(path), "qwen35 nextn cpu", 1e-4);
+    }
+
+    [CudaFact]
+    public void FollowedPromptDraftsAsItsCatchUpOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(() => Create(path, backend: BackendType.Cuda), "qwen35 nextn cuda", 2e-3);
     }
 
     /// <summary>The NextN/MTP block drafts through the runtime's generic draft layer: speculation

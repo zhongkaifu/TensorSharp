@@ -195,7 +195,7 @@ namespace TensorSharp.Models
         // one per draft, and no draft logits on the host.
         public bool SupportsDraftChain => _exec?.HasMtpDraftChain == true;
 
-        public int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut)
+        public int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut, float stopBelow = 0f)
         {
             ArgumentNullException.ThrowIfNull(tokens);
             if (hRows == null)

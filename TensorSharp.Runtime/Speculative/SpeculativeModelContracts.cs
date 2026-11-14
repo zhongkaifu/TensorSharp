@@ -388,6 +388,15 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool DraftHeadConditionsOnPrompt => false;
 
+        /// <summary>
+        /// A speculating request's prompt runs on the plain path (it does not read through the speculative context
+        /// because the head keeps itself in step with the trunk, <see cref="DraftSelfCatchUp"/>): the head takes the
+        /// request's next prompt chunk's rows as the trunk forwards them, so its drafts condition on the prompt. Called
+        /// before each such chunk, with the request's id on a model that keeps a cache per request, or null for the
+        /// model's primary cache; a head that follows every forward anyway ignores it.
+        /// </summary>
+        void FollowPlainPrompt(string? requestId) { }
+
         /// <summary>One per-token draft step at <paramref name="pos"/>: consume
         /// (token, previous hidden), fill next-token logits and the chained
         /// hidden state. Only called for <see cref="DraftHeadKind.PerToken"/>.</summary>
@@ -454,10 +463,11 @@ namespace TensorSharp.Runtime.Speculative
         /// <paramref name="maxTokens"/> - 1 further steps, each fed the previous step's first-max token and the head's own
         /// hidden output on the device. Writes each step's token to <paramref name="draftOut"/> and its confidence (the
         /// top-1 probability over the step's 10 largest logits, the per-token gate's measure) to
-        /// <paramref name="probOut"/>, and returns the steps run (at most <paramref name="maxTokens"/>). The head's own
-        /// state then covers every step's row; later calls start at or before positions it holds.
+        /// <paramref name="probOut"/>, and returns the steps run (at most <paramref name="maxTokens"/>). A head may stop after
+        /// the first step whose confidence is below <paramref name="stopBelow"/> (the speculator keeps no draft past it). The
+        /// head's own state then covers every step's row; later calls start at or before positions it holds.
         /// </summary>
-        int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut) => 0;
+        int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut, float stopBelow = 0f) => 0;
     }
 
     /// <summary>Convenience alias for the common case: a model that is its own

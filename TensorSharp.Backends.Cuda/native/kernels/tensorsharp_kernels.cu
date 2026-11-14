@@ -6388,6 +6388,104 @@ extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32_16(
 {
     TS_PDL_ENTRY(); ts_q80_vec_rows<16>(weights, xq, output, in_dim, out_dim, rows); }
 
+// Eight E2M1 codes (one 32-bit word of an NVFP4 sub-block) as int8 values of ggml's doubled codebook
+// (ts_kvalues_mxfp4): .x holds the low nibbles of the word's four bytes, .y the high ones. Table lookups
+// by byte permutes (ggml's get_int_from_table_16).
+__device__ __forceinline__ int2 ts_e2m1x8(int q)
+{
+    const uint32_t t0 = 0x03020100u, t1 = 0x0C080604u, t2 = 0xFDFEFF00u, t3 = 0xF4F8FAFCu;
+    const uint32_t q4 = (uint32_t)q;
+    const uint32_t select = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+    uint32_t tmp[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint32_t shift = 16 * i;
+        const uint32_t lo = __byte_perm(t0, t1, q4 >> shift);
+        const uint32_t hi = __byte_perm(t2, t3, q4 >> shift);
+        tmp[i] = __byte_perm(lo, hi, select >> shift);
+    }
+    return make_int2((int)__byte_perm(tmp[0], tmp[1], 0x6420), (int)__byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+// NVFP4 matvec for 1..16 activation rows against the resident ggml blocks (block_nvfp4: four UE4M3 scales,
+// then 32 code bytes, 36 bytes a 64-value block), the activation pre-quantized once to q8_1. A CTA per
+// output column as the Q8_0 kernel above; a thread takes one 16-value sub-block at a time (its scale, two
+// code words, four activation ints), so a warp reads eight whole blocks, 288 contiguous bytes. Every row
+// runs the same accumulation whatever the row count, so a row's result does not depend on the launch.
+template <int MAXR>
+__device__ __forceinline__ void ts_nvfp4_vec_rows(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    int col = blockIdx.x;
+    if (col >= out_dim)
+        return;
+
+    const int subs = in_dim / 16;
+    const int q8_blocks = in_dim / 32;
+    const uint8_t* w_row = weights + (size_t)col * (size_t)(in_dim / 64) * 36;
+
+    float acc[MAXR];
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+        acc[r] = 0.0f;
+    for (int sb = threadIdx.x; sb < subs; sb += blockDim.x)
+    {
+        const uint8_t* wblk = w_row + (size_t)(sb >> 2) * 36;
+        const int s = sb & 3;
+        const float dw = ts_ue4m3_to_fp32(wblk[s]);
+        const int2 v0 = ts_e2m1x8(get_int_b4(wblk + 4 + s * 8, 0));   // values 0-3 | 8-11
+        const int2 v1 = ts_e2m1x8(get_int_b4(wblk + 4 + s * 8, 1));   // values 4-7 | 12-15
+        const int a0 = (sb & 1) * 4;
+#pragma unroll
+        for (int r = 0; r < MAXR; r++)
+        {
+            if (r >= rows)
+                break;
+            const ts_block_q8_1* ablk = &xq[(size_t)r * q8_blocks + (sb >> 1)];
+            int sumi = dp4a_i8(v0.x, get_int_b4(ablk->qs, a0), 0);
+            sumi = dp4a_i8(v1.x, get_int_b4(ablk->qs, a0 + 1), sumi);
+            sumi = dp4a_i8(v0.y, get_int_b4(ablk->qs, a0 + 2), sumi);
+            sumi = dp4a_i8(v1.y, get_int_b4(ablk->qs, a0 + 3), sumi);
+            acc[r] += dw * __half2float(ablk->d) * (float)sumi;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+    {
+        if (r >= rows)
+            break;
+        float sum = block_reduce_sum(acc[r]);
+        if (threadIdx.x == 0)
+            output[(size_t)r * out_dim + col] = sum;
+        if (MAXR > 1)
+            __syncthreads();   // block_reduce_sum's scratch is reused by the next row
+    }
+}
+
+extern "C" __global__ void ts_quant_matmul_nvfp4_vec_f32_1(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{
+    TS_PDL_ENTRY(); ts_nvfp4_vec_rows<1>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void ts_quant_matmul_nvfp4_vec_f32_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{
+    TS_PDL_ENTRY(); ts_nvfp4_vec_rows<4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void ts_quant_matmul_nvfp4_vec_f32_8(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{
+    TS_PDL_ENTRY(); ts_nvfp4_vec_rows<8>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void ts_quant_matmul_nvfp4_vec_f32_16(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{
+    TS_PDL_ENTRY(); ts_nvfp4_vec_rows<16>(weights, xq, output, in_dim, out_dim, rows); }
+
 // Q8_0 matvec for short input rows (fewer than 1024 values: a hyper-connection bottleneck's up
 // projection, a shared expert's down projection). There the kernel above keeps most of its 32 lane
 // groups idle on the few blocks a row has, and launches a CTA per column: 10240 CTAs for a 320-wide
@@ -7856,8 +7954,106 @@ __device__ __forceinline__ float q40_block_dot_q8(const uint8_t* block, const ts
     return dw * (dact * (float)s - 8.0f * sact);
 }
 
+// Byte signs of eight values (ksigns_iq2xs bits) as two masks of four bytes for __vsub4 (ggml's trick: bit j -> byte j's
+// top bit through __vcmpne4).
+__device__ __forceinline__ int ts_iq_signs_lo(int signs) { return __vcmpne4(((signs & 0x03) << 7) | ((signs & 0x0C) << 21), 0x00000000); }
+__device__ __forceinline__ int ts_iq_signs_hi(int signs) { return __vcmpne4(((signs & 0x30) << 3) | ((signs & 0xC0) << 17), 0x00000000); }
+
+// One IQ2_XS 32-value group (block_iq2_xs: d, qs[32] uint16 = 9-bit grid index + 7-bit sign index, scales[8]) against
+// its q8_1 block: value = d * (0.5 + scale) / 4 * grid * sign, the first 16 values on the low scale nibble.
+__device__ __forceinline__ float dot_iq2_xs_q8_1(const uint8_t* iq_block, const ts_block_q8_1* q8_blocks, int group)
+{
+    const float d = __half2float(*reinterpret_cast<const half*>(iq_block));
+    const uint16_t* qs = reinterpret_cast<const uint16_t*>(iq_block + 2);
+    const int sc = iq_block[66 + group];
+    int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+    for (int l = 0; l < 4; l++)
+    {
+        const uint16_t q = qs[4 * group + l];
+        const int* grid = reinterpret_cast<const int*>(iq2xs_grid + (q & 511));
+        const int signs = ksigns_iq2xs[q >> 9];
+        const int lo = ts_iq_signs_lo(signs), hi = ts_iq_signs_hi(signs);
+        int sumi = dp4a_i8(__vsub4(grid[0] ^ lo, lo), get_int_b4(q8_blocks[group].qs, 2 * l), 0);
+        sumi = dp4a_i8(__vsub4(grid[1] ^ hi, hi), get_int_b4(q8_blocks[group].qs, 2 * l + 1), sumi);
+        if (l < 2) sumi0 += sumi; else sumi1 += sumi;
+    }
+    const float dq = d * __half2float(q8_blocks[group].d) * 0.25f;
+    return dq * ((0.5f + (float)(sc & 0xF)) * (float)sumi0 + (0.5f + (float)(sc >> 4)) * (float)sumi1);
+}
+
+// One IQ3_XXS 32-value group (block_iq3_xxs: d, qs[64] grid indices, then a uint32 of four 7-bit sign indices and a
+// 4-bit scale per group) against its q8_1 block: value = d * (0.5 + scale) / 2 * grid * sign.
+__device__ __forceinline__ float dot_iq3_xxs_q8_1(const uint8_t* iq_block, const ts_block_q8_1* q8_blocks, int group)
+{
+    const float d = __half2float(*reinterpret_cast<const half*>(iq_block));
+    const uint8_t* qs = iq_block + 2 + 8 * group;
+    const uint32_t aux32 = read_u32_unaligned(iq_block + 2 + 64 + 4 * group);
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 4; l++)
+    {
+        const int signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+        const int lo = ts_iq_signs_lo(signs), hi = ts_iq_signs_hi(signs);
+        const int g0 = (int)iq3xxs_grid[qs[2 * l]], g1 = (int)iq3xxs_grid[qs[2 * l + 1]];
+        sumi = dp4a_i8(__vsub4(g0 ^ lo, lo), get_int_b4(q8_blocks[group].qs, 2 * l), sumi);
+        sumi = dp4a_i8(__vsub4(g1 ^ hi, hi), get_int_b4(q8_blocks[group].qs, 2 * l + 1), sumi);
+    }
+    return d * (0.5f + (float)(aux32 >> 28)) * 0.5f * __half2float(q8_blocks[group].d) * (float)sumi;
+}
+
+// One IQ4_NL block (d, 16 bytes of nibbles: value j the low nibble of byte j, value j + 16 the high one, through the
+// non-linear codebook) against its q8_1 block.
+__device__ __forceinline__ float iq4nl_block_dot_q8(const uint8_t* block, const ts_block_q8_1* ablk)
+{
+    const float d = __half2float(*reinterpret_cast<const half*>(block));
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        const int w = get_int_b2(block + 2, j);
+        int lo = 0, hi = 0;
+#pragma unroll
+        for (int b = 0; b < 4; b++)
+        {
+            const int byte = (w >> (8 * b)) & 0xFF;
+            lo |= ((int)(uint8_t)ts_kvalues_iq4nl[byte & 15]) << (8 * b);
+            hi |= ((int)(uint8_t)ts_kvalues_iq4nl[byte >> 4]) << (8 * b);
+        }
+        sumi = dp4a_i8(lo, get_int_b4(ablk->qs, j), sumi);
+        sumi = dp4a_i8(hi, get_int_b4(ablk->qs, j + 4), sumi);
+    }
+    return d * __half2float(ablk->d) * (float)sumi;
+}
+
+// Half hb of a Q2_0 block (d, 16 bytes of 2-bit codes meaning -1..2: values 32hb .. 32hb + 31 in bytes 8hb .. 8hb + 7,
+// four to a byte from the low bits) against its q8_1 block: d * d8 * sum((code - 1) * q), the offset taken per byte in
+// the integer sum (not through the block's F16 sum, whose rounding the cancellation would magnify).
+__device__ __forceinline__ float q2_0_half_dot_q8(const uint8_t* block, int hb, const ts_block_q8_1* ablk)
+{
+    const float d = __half2float(*reinterpret_cast<const half*>(block));
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 2; j++)
+    {
+        const int w = get_int_b2(block + 2 + 8 * hb, j);
+#pragma unroll
+        for (int b = 0; b < 4; b++)
+        {
+            const int byte = (w >> (8 * b)) & 0xFF;
+            const int v = (byte & 3) | (((byte >> 2) & 3) << 8) | (((byte >> 4) & 3) << 16) | (((byte >> 6) & 3) << 24);
+            sumi = dp4a_i8(__vsub4(v, 0x01010101), get_int_b4(ablk->qs, 4 * j + b), sumi);
+        }
+    }
+    return d * __half2float(ablk->d) * (float)sumi;
+}
+
+// Marker: moe_block_dot_q8 takes IQ2_XS, IQ3_XXS, IQ4_NL and Q2_0 (a module without it computes them as Q4_K).
+extern "C" __global__ void ts_caps_moe_dp4a_iq_q2_0() {
+    TS_PDL_ENTRY();}
+
 // One 32-value weight block dot against a q8_1 activation block, dispatching on
-// the quant type (2 = Q4_0, 12 = Q4_K, 16 = IQ2_XXS, 22 = IQ2_S). `w_base` is the weight ROW
+// the quant type (2 = Q4_0, 12 = Q4_K, 16 = IQ2_XXS, 17 = IQ2_XS, 18 = IQ3_XXS, 20 = IQ4_NL, 22 = IQ2_S, 42 = Q2_0). `w_base` is the weight ROW
 // base and `ib` the global 32-value sub-block index; `xq_row` is the ROW base of
 // the q8_1 activation blocks (indexed by ib internally, so each type can also
 // reach the enclosing super-block it belongs to). For Q4_0 each 32-value block is
@@ -7874,6 +8070,14 @@ __device__ __forceinline__ float moe_block_dot_q8(
         return dot_iq2_xxs_q8_1(w_base + (size_t)(ib >> 3) * 66, xq_row + (size_t)(ib >> 3) * 8, ib & 7);
     if (type == GGML_IQ2_S)
         return dot_iq2_s_q8_1(w_base + (size_t)(ib >> 3) * 82, xq_row + (size_t)(ib >> 3) * 8, ib & 7);
+    if (type == GGML_IQ2_XS)
+        return dot_iq2_xs_q8_1(w_base + (size_t)(ib >> 3) * 74, xq_row + (size_t)(ib >> 3) * 8, ib & 7);
+    if (type == GGML_IQ3_XXS)
+        return dot_iq3_xxs_q8_1(w_base + (size_t)(ib >> 3) * 98, xq_row + (size_t)(ib >> 3) * 8, ib & 7);
+    if (type == GGML_IQ4_NL)
+        return iq4nl_block_dot_q8(w_base + (size_t)ib * 18, &xq_row[ib]);
+    if (type == GGML_Q2_0)
+        return q2_0_half_dot_q8(w_base + (size_t)(ib >> 1) * 18, ib & 1, &xq_row[ib]);
     // GGML_Q4_K
     return q4k_subblock_dot_q8(w_base + (size_t)(ib >> 3) * 144, ib & 7, &xq_row[ib]);
 }

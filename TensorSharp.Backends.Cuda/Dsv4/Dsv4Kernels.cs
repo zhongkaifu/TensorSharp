@@ -103,7 +103,7 @@ namespace TensorSharp.Cuda
         /// <summary>Warps sharing an output row in the decode-once kernels: by shape alone, so a row's sums never depend on
         /// how many rows a call holds. Few outputs need the K split to fill the GPU (measured on the RTX 5090 at Qwen3.8
         /// Flash Next's shapes: 10240 -> 320 and 2560 -> 640 fastest at 4, 2560 -> 6144 at 2, the rest at 1).</summary>
-        private static int DenseFastWarps(int outDim) => outDim <= 2048 ? 4 : outDim > 4096 && outDim <= 8192 ? 2 : 1;
+        internal static int DenseFastWarps(int outDim) => outDim <= 2048 ? 4 : outDim > 4096 && outDim <= 8192 ? 2 : 1;
         private readonly IntPtr hcMean, hcMixPartials, hcPreFinish;
         private readonly IntPtr dsparkPrep;
         private readonly IntPtr dsparkGather;

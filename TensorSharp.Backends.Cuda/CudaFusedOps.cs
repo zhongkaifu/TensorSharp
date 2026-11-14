@@ -547,8 +547,9 @@ namespace TensorSharp.Cuda
                 return false;
             return type switch
             {
-                2 => (inDim & 31) == 0,                       // Q4_0 block
-                12 or 16 or 22 => (inDim & 255) == 0,        // Q4_K / IQ2_XXS / IQ2_S
+                2 or 20 => (inDim & 31) == 0,                 // Q4_0 / IQ4_NL block
+                42 => (inDim & 63) == 0,                      // Q2_0 block
+                12 or 16 or 17 or 18 or 22 => (inDim & 255) == 0,   // Q4_K / IQ2_XXS / IQ2_XS / IQ3_XXS / IQ2_S
                 _ => false,
             };
         }
@@ -556,7 +557,8 @@ namespace TensorSharp.Cuda
         private static bool MoeStageDp4aOk(bool requested, int type, int inDim, Tensor scratch)
             => requested
                && IsMoeDp4aDimensionSupported(type, inDim)
-               && scratch?.Storage is CudaStorage;
+               && scratch?.Storage is CudaStorage
+               && (type is not (17 or 18 or 20 or 42) || ((CudaStorage)scratch.Storage).AllocatorImpl.Kernels?.MoeDp4aIqQ2_0 == true);
 
         /// <summary>Device pointer of a CUDA-resident tensor, flushing any pending
         /// host upload first. Returns <see cref="IntPtr.Zero"/> for a non-CUDA
@@ -747,7 +749,10 @@ namespace TensorSharp.Cuda
                 return false;
             }
             CudaAllocator allocator = outStorage.AllocatorImpl;
-            if (!IsCudaMatrix(logits, DType.Float32, 1, numExperts, allocator, out CudaStorage logitsStorage)
+            // No logits: the routes are given (selectedExperts and routingWeights already hold them; an id below zero is
+            // a route the device leaves out).
+            CudaStorage logitsStorage = null;
+            if ((logits != null && !IsCudaMatrix(logits, DType.Float32, 1, numExperts, allocator, out logitsStorage))
                 || !IsCudaMatrix(moeInput, DType.Float32, 1, hiddenDim, allocator, out CudaStorage moeInStorage)
                 || !IsCudaVector(selectedExperts, DType.Int32, nUsed, allocator, out _)
                 || !IsCudaVector(routingWeights, DType.Float32, nUsed, allocator, out _)
@@ -774,7 +779,7 @@ namespace TensorSharp.Cuda
             if (kernels == null)
                 return false;
 
-            IntPtr logitsPtr = DeviceBufferOf(logits);
+            IntPtr logitsPtr = logits != null ? DeviceBufferOf(logits) : IntPtr.Zero;
             IntPtr moeInPtr = DeviceBufferOf(moeInput);
             IntPtr outPtr = DeviceBufferOf(output);
             IntPtr selPtr = DeviceBufferOf(selectedExperts);
@@ -782,12 +787,13 @@ namespace TensorSharp.Cuda
             IntPtr gPtr = DeviceBufferOf(gateOut);
             IntPtr uPtr = DeviceBufferOf(upOut);
 
-            logitsStorage.EnsureDeviceCurrent();
+            logitsStorage?.EnsureDeviceCurrent();
             moeInStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
             IntPtr stream = allocator.Stream.Handle;
 
-            kernels.LaunchMoERouterF32(logitsPtr, perExpertScalePtr, selPtr, rwPtr, numExperts, nUsed, stream);
+            if (logits != null)
+                kernels.LaunchMoERouterF32(logitsPtr, perExpertScalePtr, selPtr, rwPtr, numExperts, nUsed, stream);
 
             // Each projection dp4a's over q8_1-quantized activations when its quant
             // type has a MoE dp4a dot
@@ -886,7 +892,9 @@ namespace TensorSharp.Cuda
             }
             CudaAllocator allocator = outStorage.AllocatorImpl;
             long routedRows = (long)numTokens * nUsed;
-            if (!IsCudaMatrix(logits, DType.Float32, numTokens, numExperts, allocator, out CudaStorage logitsStorage)
+            // No logits: the rows arrive routed (selectedExperts and routingWeights hold the routes; -1 skips one).
+            CudaStorage logitsStorage = null;
+            if ((logits != null && !IsCudaMatrix(logits, DType.Float32, numTokens, numExperts, allocator, out logitsStorage))
                 || !IsCudaMatrix(moeInput, DType.Float32, numTokens, hiddenDim, allocator, out CudaStorage moeInStorage)
                 || !IsCudaVector(selectedExperts, DType.Int32, routedRows, allocator, out _)
                 || !IsCudaVector(routingWeights, DType.Float32, routedRows, allocator, out _)
@@ -913,7 +921,7 @@ namespace TensorSharp.Cuda
             if (kernels == null)
                 return false;
 
-            IntPtr logitsPtr = DeviceBufferOf(logits);
+            IntPtr logitsPtr = logits == null ? IntPtr.Zero : DeviceBufferOf(logits);
             IntPtr moeInPtr = DeviceBufferOf(moeInput);
             IntPtr outPtr = DeviceBufferOf(output);
             IntPtr selPtr = DeviceBufferOf(selectedExperts);
@@ -921,12 +929,18 @@ namespace TensorSharp.Cuda
             IntPtr gPtr = DeviceBufferOf(gateOut);
             IntPtr uPtr = DeviceBufferOf(upOut);
 
-            logitsStorage.EnsureDeviceCurrent();
+            logitsStorage?.EnsureDeviceCurrent();
             moeInStorage.EnsureDeviceCurrent();
+            if (logits == null)
+            {
+                ((CudaStorage)selectedExperts.Storage).EnsureDeviceCurrent();
+                ((CudaStorage)routingWeights.Storage).EnsureDeviceCurrent();
+            }
             allocator.Context.MakeCurrent();
             IntPtr stream = allocator.Stream.Handle;
 
-            kernels.LaunchMoERouterBatched(logitsPtr, perExpertScalePtr, selPtr, rwPtr, numExperts, nUsed, numTokens, stream);
+            if (logits != null)
+                kernels.LaunchMoERouterBatched(logitsPtr, perExpertScalePtr, selPtr, rwPtr, numExperts, nUsed, numTokens, stream);
 
             bool gateUpDp4a = MoeStageDp4aOk(useGateUpDp4a, gateUpType, hiddenDim, moeInputQ8);
             bool downDp4a = MoeStageDp4aOk(useDownDp4a, downType, nFf, gateOutQ8);

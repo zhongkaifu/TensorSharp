@@ -65,18 +65,49 @@ namespace TensorSharp.Models
             if (_backend == BackendType.GgmlMetal || _gguf == null) return;
             long available = MappedTableWarm.HostMemoryAvailable();
             if (available <= 0) return;
-            long room = available - MappedTableWarm.Headroom;
+            // The offloaded experts' file ranges are page-locked after the warm (below), out of the same memory: what the warm
+            // reads and copies must leave them room. A cgroup's available figure counts its reclaimable page cache, so the warm
+            // had filled it beside the locks: on a 62 GB cgroup 46.5 GiB warmed beside 27.8 GB of locks, and a 16 GB card's 4K
+            // prompt took 15 s against the direct engine's 7.9 (which locks first, and then skipped the tables).
+            List<(IntPtr Pointer, long Bytes)> stacks = HostExpertRuns();
+            IHostRangePinner pinner = stacks.Count > 0 ? _allocator as IHostRangePinner : null;
+            long locked = 0;
+            if (pinner != null)
+                foreach ((IntPtr _, long bytes) in stacks) locked += bytes;
+            long room = available - MappedTableWarm.Headroom - locked;
+            // The locks may take what the host has free less a reserve for the OS, the rest of the process and the page cache
+            // the host-only tables are read through (the direct engines' rule, Q4eCudaEngine.HostPinReserve): a fixed 60% of
+            // the managed heap's limit had locked 26.6 of a 16 GB card's 37.6 GiB of host experts in a 62 GB cgroup, so a
+            // third of every prompt's staging went through pageable copies (Qwen3.8 Flash Next UD-Q2_K_XL; the engine pins
+            // all 35.8 GiB of its host experts there).
+            long pinAllowance = available > HostPinReserve ? available - HostPinReserve : 0;
             var ranges = new List<(IntPtr Pointer, long Bytes)>();
-            long tableBytes = 0, expertBytes = 0;
+            var copies = new List<QuantizedWeight>();
+            long tableBytes = 0, expertBytes = 0, copyBytes = 0;
             int slices = 0;
             foreach (var (name, q) in _quantWeights)
             {
                 if (!IsHostOnlyWeight(name) || !q.IsFileBacked || q.RawBytes > room) continue;
-                ranges.Add((q.Data, q.RawBytes));
-                tableBytes += q.RawBytes;
+                // On Linux a table the process can hold beside 6 GB more is copied into process memory (the direct engines'
+                // and Strata's rule): every token reads scattered rows of it, and a memory cgroup's page cache dropped the
+                // warmed pages for the model's other files (Flash Next's 28.8 GB PLE table on an A40 with a 50 GB cgroup: a
+                // 4K prompt 7.1 s against 2.1 s, 0.5 s against 0.13 for a short one). Elsewhere the pages are warmed. The copy
+                // must leave room for the experts' page locks: beside 27.8 GB of them a 62 GB cgroup thrashed (a 16 GB card's 4K
+                // prompt 93 s against 7.2), where the page cache gives the table's cold rows up instead.
+                if (OperatingSystem.IsLinux() && available - locked - copyBytes >= q.RawBytes + HostTableCopyHeadroom)
+                {
+                    copies.Add(q);
+                    copyBytes += q.RawBytes;
+                }
+                else
+                {
+                    ranges.Add((q.Data, q.RawBytes));
+                    tableBytes += q.RawBytes;
+                }
                 room -= q.RawBytes;
             }
-            foreach (var (pointer, bytes) in HostServedExpertSlices())
+            // Experts the locks fault in are not read twice.
+            foreach (var (pointer, bytes) in pinner != null ? Array.Empty<(IntPtr, long)>() : HostServedExpertSlices())
             {
                 if (bytes > room) break;
                 ranges.Add((pointer, bytes));
@@ -84,7 +115,7 @@ namespace TensorSharp.Models
                 expertBytes += bytes;
                 slices++;
             }
-            if (ranges.Count == 0) return;
+            if (ranges.Count == 0 && copies.Count == 0 && pinner == null) return;
             int experts = slices / 3;
             string what = (tableBytes > 0 ? "the host-only tables" : "") + (tableBytes > 0 && experts > 0 ? " and " : "")
                 + (experts > 0 ? $"{experts} host-served experts" : "");
@@ -97,16 +128,68 @@ namespace TensorSharp.Models
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
-                    long read = gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
-                    if (!cancel.IsCancellationRequested)
+                    foreach (QuantizedWeight table in copies)
+                    {
+                        if (cancel.IsCancellationRequested) break;
+                        CopyTableToProcessMemory(table, cancel);
+                    }
+                    if (copies.Count > 0 && !cancel.IsCancellationRequested)
+                        Console.Error.WriteLine($"[{arch}] copied {copyBytes / (double)(1L << 30):F1} GiB of host-only tables into process memory in {sw.Elapsed.TotalSeconds:F1}s");
+                    sw.Restart();
+                    long read = ranges.Count == 0 ? 0 : gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
+                    if (ranges.Count > 0 && !cancel.IsCancellationRequested)
                         Console.Error.WriteLine($"[{arch}] warmed {read / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
+                    // Then the stacks a prompt chunk stages experts from are page-locked (DMA-speed copies), off the
+                    // request path: locking them as the first prompt arrived cost it 7 s on an A40 (80 GB of Flash Next).
+                    if (pinner != null && !cancel.IsCancellationRequested)
+                    {
+                        sw.Restart();
+                        _hostPins = pinner.PinHostRanges(stacks, pinAllowance, cancel);
+                        Console.Error.WriteLine($"[{arch}] page-locked the offloaded experts' file ranges in {sw.Elapsed.TotalSeconds:F1}s");
+                    }
                 }
                 catch (OperationCanceledException) { }
             });
             bool wait = Environment.GetEnvironmentVariable("TS_HOST_WARM_WAIT") == "1";
-            Console.WriteLine($"[{arch}] warming {(tableBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
-                (wait ? "before serving (TS_HOST_WARM_WAIT=1)" : "in the background (the first answers read the rest from the model files)"));
+            if (copies.Count > 0)
+                Console.WriteLine($"[{arch}] copying {copyBytes / (double)(1L << 30):F1} GiB of host-only tables into process memory " +
+                    (wait ? "before serving" : "in the background (the first answers read them from the model files)"));
+            if (ranges.Count > 0)
+                Console.WriteLine($"[{arch}] warming {(tableBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
+                    (wait ? "before serving (TS_HOST_WARM_WAIT=1)" : "in the background (the first answers read the rest from the model files)"));
             if (wait) _hostWarm.Wait();
+        }
+
+        /// <summary>Host memory left beside the experts' page locks (the direct engines' HostPinReserve).</summary>
+        private const long HostPinReserve = 4L << 30;
+
+        /// <summary>Host memory a table copy leaves beside itself (the direct engines' rule).</summary>
+        private const long HostTableCopyHeadroom = 6L << 30;
+
+        /// <summary>A file-backed table into process memory, in parallel 64 MB pieces (each read from the mapping, so a
+        /// cold page is read from disk on several threads), then served from there.</summary>
+        internal static unsafe void CopyTableToProcessMemory(QuantizedWeight table, System.Threading.CancellationToken cancel)
+        {
+            long bytes = table.RawBytes;
+            IntPtr source = table.Data, copy = QuantizedWeight.AllocateBuffer(bytes);
+            const long Piece = 64L << 20;
+            long pieces = (bytes + Piece - 1) / Piece;
+            try
+            {
+                System.Threading.Tasks.Parallel.For(0, pieces,
+                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = GgufFile.DefaultWarmThreads(), CancellationToken = cancel },
+                    i =>
+                    {
+                        long at = i * Piece, n = Math.Min(Piece, bytes - at);
+                        Buffer.MemoryCopy((void*)(source + (nint)at), (void*)(copy + (nint)at), n, n);
+                    });
+            }
+            catch (OperationCanceledException)
+            {
+                QuantizedWeight.FreeBuffer(copy);
+                throw;
+            }
+            table.AdoptHostCopy(copy);
         }
 
         /// <summary>The (pointer, bytes) slices of every routed expert the host computes, one per gate/up/down part, the
@@ -141,17 +224,60 @@ namespace TensorSharp.Models
             _hostWarmCancel.Dispose();
             _hostWarmCancel = null;
             _hostWarm = null;
+            // Unlocked before the mappings go (a registration outliving them would pin the next model's pages).
+            _hostPins?.Dispose();
+            _hostPins = null;
+        }
+
+        /// <summary>The page-locked file ranges of the offloaded experts (<see cref="IHostRangePinner"/>), or null.</summary>
+        private IDisposable _hostPins;
+
+        /// <summary>
+        /// The runs of host-served experts in every offloaded layer's gate, up and down stacks on a tensor executor: the
+        /// experts a prompt chunk stages (the tier's members are copied to the device at load). Locking only these keeps
+        /// the locked total at the host's share - Flash Next UD-Q2_K_XL on an A40: 9.5 GB, not the 46 GB of whole stacks,
+        /// which also outran the pin budget of a 50 GB container and left a third of the layers' copies pageable (each one
+        /// then blocked the thread that launches the step). Experts an adaptive trade moves to the host later are locked
+        /// by the executor when it first stages them.
+        /// </summary>
+        private List<(IntPtr Pointer, long Bytes)> HostExpertRuns()
+        {
+            var runs = new List<(IntPtr, long)>();
+            if (IsGgmlBackend || _expertOnHost == null) return runs;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_expertOnHost[l] || !TryGetLayerExperts(l, out var gate, out var up, out var down)) continue;
+                var held = new HashSet<int>(_tierExperts?[l] ?? Array.Empty<int>());
+                foreach (StackedExpertWeights w in new[] { gate, up, down })
+                {
+                    if (w == null || w.Data == IntPtr.Zero) continue;
+                    for (int e = 0; e < _numExperts;)
+                    {
+                        if (held.Contains(e)) { e++; continue; }
+                        int first = e;
+                        while (e < _numExperts && !held.Contains(e)) e++;
+                        runs.Add((w.Data + (nint)(first * w.PerExpertRawBytes), (e - first) * w.PerExpertRawBytes));
+                    }
+                }
+            }
+            return runs;
         }
 
         /// <summary>A host-only table is read a few rows a token, on demand: warming every row at load read 28.8 GB
         /// (Flash Next's PLE table) the page cache could not keep.</summary>
         protected override bool ShouldPrefaultWeight(GgufTensorInfo info) => !IsHostOnlyWeight(info.Name);
 
-        /// <summary>Decide <see cref="_expertOnHost"/> once the weights and caches exist, before the first forward.</summary>
+        /// <summary>Decide <see cref="_expertOnHost"/> before the first forward: on the GGML backends once the weights and
+        /// caches exist; on the tensor executors before residency (<see cref="PlanTensorExecutorPlacement"/>).</summary>
         private void PlanExpertPlacement()
         {
-            if (!_anyMoe || !IsGgmlBackend || _mesh.TensorParallel > 1 || LayerSplitGroup != null)
+            if (!_anyMoe || _mesh.TensorParallel > 1 || LayerSplitGroup != null)
                 return;
+            if (!IsGgmlBackend)
+            {
+                PlanTensorExecutorPlacement();
+                return;
+            }
             int n = Config.NumLayers;
             if (_mesh.Stages > 1)
             {
@@ -209,6 +335,125 @@ namespace TensorSharp.Models
             for (int l = 0; l < n - resident; l++) _expertOnHost[l] = _moeLayer[l];
             ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved scratch {Gb(DeviceScratchBytes)}; --n-cpu-moe N overrides");
         }
+
+        /// <summary>
+        /// A tensor executor on one discrete device (direct CUDA), planned before residency, whose preload uploads every
+        /// expert member it is not told to leave on the host: the trailing MoE layers whose experts fit beside every other
+        /// weight (none resident yet), the slot reserve and the headroom stay on the device; the first layers run their
+        /// experts through the model's expert host (<see cref="GraphOp.MoeHostExperts"/>), with each layer's most-routed
+        /// experts in a device tier where a routing profile ranks them. Unified memory (MLX) keeps every expert where the
+        /// mapping is. Explicit <c>--n-cpu-moe N</c> / <c>--cpu-moe</c> win.
+        /// </summary>
+        private void PlanTensorExecutorPlacement()
+        {
+            if (_mesh.Stages > 1 || _allocator is not IDeviceMemoryInfo memory || memory.SharesHostMemory)
+                return;
+            int n = Config.NumLayers;
+            if (MoeCpuOffloadConfig.IsExplicitlySet)
+            {
+                if (MoeCpuOffloadConfig.IsEnabled)
+                    AttachRoutingProfile(Config.Architecture, _numExperts);
+                return;
+            }
+            if (!memory.TryGetDeviceMemory(out long free, out long total))
+                return;
+            var layerBytes = new long[n];
+            long allExperts = 0;
+            for (int l = 0; l < n; l++)
+                allExperts += layerBytes[l] = _moeLayer[l] ? LayerExpertBytes(l) : 0;
+            // Nothing is resident yet: every other weight, the draft, the first slot (its states and initial caches) are to come.
+            long pending = checked(AcceleratorBoundNonExpertBytes() + _pendingDraftBytes + TensorExecutorSlotReserveBytes
+                + SpeculationReserveBytes);
+            long headroom = GpuMemoryBudget.ResolveHeadroomBytes(total);
+            if (allExperts + pending + headroom + DeviceScratchBytes <= free)
+                return;
+            // Offloading: a prompt chunk stages the experts the device does not hold (the CUDA executor's staging arena).
+            long largest = 0;
+            for (int l = 0; l < n; l++) largest = Math.Max(largest, layerBytes[l]);
+            pending += Math.Min(largest, StagingReserveCapBytes);
+            int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free, headroom, 0);
+            if (resident >= n)
+                return;
+            long deviceExpertBytes = 0;
+            for (int l = n - resident; l < n; l++) deviceExpertBytes += layerBytes[l];
+            if (TryPlanTensorExecutorTiers(deviceExpertBytes))
+                return;
+            _expertOnHost = new bool[n];
+            for (int l = 0; l < n - resident; l++) _expertOnHost[l] = _moeLayer[l];
+            ReportExpertPlacement("planned", $"device free {Gb(free)}; --n-cpu-moe N overrides");
+        }
+
+        /// <summary>A slot's states and its first caches, reserved when a tensor executor plans before any slot exists.</summary>
+        private const long TensorExecutorSlotReserveBytes = 1L << 30;
+
+        /// <summary>Device memory a speculating request holds beside its slot (a family whose verify windows keep a state after
+        /// each row): an offloaded plan leaves it free.</summary>
+        protected virtual long SpeculationReserveBytes => 0;
+
+        /// <summary>Most device memory an offloaded plan leaves for staging a prompt chunk's experts (one layer's worth).</summary>
+        private const long StagingReserveCapBytes = 2L << 30;
+
+        /// <summary>
+        /// Every MoE layer's experts through the expert host, each layer keeping its most-routed experts in a device tier of
+        /// <paramref name="budget"/> bytes in all: ranked by the routing profile where it has a layer's routes, an equal
+        /// share of the layer's experts where it has not (as the Qwen3.8 engines planned without one; this load records the
+        /// routing for the next). False when tiers are switched off.
+        /// </summary>
+        private bool TryPlanTensorExecutorTiers(long budget)
+        {
+            if (!ExpertTiersEnabled())
+                return false;
+            AttachRoutingProfile(Config.Architecture, _numExperts);
+            int n = Config.NumLayers;
+            var moeLayers = new List<int>(n);
+            var expertBytes = new long[n];
+            for (int l = 0; l < n; l++)
+            {
+                if (!_moeLayer[l] || !TryGetLayerExperts(l, out var gate, out var up, out var down))
+                    continue;
+                moeLayers.Add(l);
+                expertBytes[l] = gate.PerExpertRawBytes + up.PerExpertRawBytes + down.PerExpertRawBytes;
+            }
+            if (moeLayers.Count == 0)
+                return false;
+            // The plan's counts: the profile's for the layers it covers, one route per expert for the others (an equal
+            // share, the lower ids first).
+            var plan = new MoeRoutingProfile(_routingProfile?.Identity ?? "plan", n, _numExperts);
+            var uniform = new ulong[_numExperts];
+            Array.Fill(uniform, 1UL);
+            int ranked = 0;
+            foreach (int l in moeLayers)
+            {
+                if (_routingProfile != null && _routingProfile.CoversLayers(new[] { l }))
+                {
+                    plan.Add(l, _routingProfile.Counts(l));
+                    ranked++;
+                }
+                else plan.Add(l, uniform);
+            }
+            long? requested = ExpertTierBudgetOverride(Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER_GB"));
+            int[][] tiers = plan.SelectTiers(expertBytes, requested ?? budget);
+            _expertOnHost = new bool[n];
+            foreach (int l in moeLayers) _expertOnHost[l] = true;
+            _tierExperts = new int[n][];
+            long held = 0;
+            for (int l = 0; l < n; l++)
+            {
+                _tierExperts[l] = tiers[l] ?? Array.Empty<int>();
+                held += _tierExperts[l].Length * expertBytes[l];
+            }
+            Console.WriteLine($"[moe-offload] {Config.Architecture} (tiered): every MoE layer's routed experts run through the " +
+                $"expert host; the device keeps each layer's most-routed experts ({Gb(held)} of {Gb(budget)}), " +
+                (ranked == moeLayers.Count ? $"ranked by {_routingProfilePath}."
+                    : ranked > 0 ? $"{ranked} of {moeLayers.Count} layers ranked by {_routingProfilePath}, the others an equal share."
+                    : "an equal share of each layer (no routing profile yet: this load records one)."));
+            return true;
+        }
+
+        /// <summary>Whether a tensor executor uploads expert <paramref name="expert"/> of <paramref name="layer"/> at
+        /// residency: a resident layer's experts, and an offloaded layer's tier.</summary>
+        private bool PreloadsExpert(int layer, int expert)
+            => !IsExpertLayerOffloaded(layer) || (_tierExperts?[layer] is { } tier && Array.IndexOf(tier, expert) >= 0);
 
         /// <summary>
         /// A layer split on discrete GPUs: each stage keeps the experts of its trailing layers that fit its own device's
