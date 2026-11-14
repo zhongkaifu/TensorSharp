@@ -144,7 +144,7 @@ ggml_tensor* tsg_flash_attn_ext_guarded(
     ggml_tensor* sinks, ggml_prec prec)
 {
     ggml_tensor* fa = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, max_bias, logit_softcap);
-    if (prec != GGML_PREC_DEFAULT)
+    if (prec != GGML_PREC_UNDEFINED)
         ggml_prec_set_acc(fa, prec);
     if (sinks != nullptr)
         ggml_flash_attn_ext_add_sinks(fa, sinks);
