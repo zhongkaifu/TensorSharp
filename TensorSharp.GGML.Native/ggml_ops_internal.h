@@ -813,7 +813,7 @@ namespace tsg
         ggml_context* ctx, const char* site,
         ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
         float scale, float max_bias, float logit_softcap,
-        ggml_tensor* sinks = nullptr, ggml_prec prec = GGML_PREC_DEFAULT)
+        ggml_tensor* sinks = nullptr, ggml_prec prec = GGML_PREC_UNDEFINED)
     {
         return tsg_flash_attn_ext_guarded(ctx, g_backend, site, q, k, v, mask,
             scale, max_bias, logit_softcap, sinks, prec);

@@ -61,13 +61,13 @@ ggml_tensor* tsg_attention_explicit(
 
 // `site` is a short static label naming the call site in the warning.
 // `backend` null means "no backend to ask" and always returns the flash node.
-// `prec` is applied to the flash node when it is not GGML_PREC_DEFAULT (the
+// `prec` is applied to the flash node when it is not GGML_PREC_UNDEFINED (the
 // explicit path always multiplies in F32).
 ggml_tensor* tsg_flash_attn_ext_guarded(
     ggml_context* ctx, ggml_backend_t backend, const char* site,
     ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
     float scale, float max_bias, float logit_softcap,
-    ggml_tensor* sinks = nullptr, ggml_prec prec = GGML_PREC_DEFAULT);
+    ggml_tensor* sinks = nullptr, ggml_prec prec = GGML_PREC_UNDEFINED);
 
 // Number of graph builds that took the explicit path since process start.
 std::uint64_t tsg_flash_attn_fallback_count();

@@ -118,7 +118,7 @@ void matmul_test(ggml_backend_t backend, int type, int inner, int rows, int colu
     auto * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_Q2_0, inner, rows);
     auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, inner, columns);
     auto * output = ggml_mul_mat(ctx, weights, input);
-    ggml_mul_mat_set_prec(output, GGML_PREC_F32);
+    ggml_prec_set_acc(output, GGML_PREC_F32);
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
     require(ggml_backend_supports_op(backend, output), "backend does not support upstream Q2_0 matmul");
