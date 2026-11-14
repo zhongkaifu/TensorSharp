@@ -460,7 +460,10 @@ const ggml_tensor* h3_view_base(const ggml_tensor* t) { return t->view_src != nu
 // x, a residual's mm; see h3_fused_run). Views read nothing themselves. Any other
 // reader, a second reader or an output flag keeps the product F32. A projection with
 // a BF16 weight (tsg_cuda_bf16_gemm) neither leaves int32 sums nor reads them.
-std::unordered_set<const ggml_tensor*> h3_deferrable(ggml_cgraph* graph)
+// C++ linkage: this file's extern "C" block encloses it, and a C-linkage function
+// cannot return a class. GCC and Clang only warn (-Wreturn-type-c-linkage); other
+// compilers refuse to build it.
+extern "C++" std::unordered_set<const ggml_tensor*> h3_deferrable(ggml_cgraph* graph)
 {
     const int n = ggml_graph_n_nodes(graph);
     auto int8Projection = [](const ggml_tensor* node, std::int32_t kind) {

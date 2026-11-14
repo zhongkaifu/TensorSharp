@@ -721,7 +721,7 @@ namespace
                 // Tensor parallelism: the explicit-ops fallback would pair query heads with KV heads
                 // split differently, which the meta device cannot run (build() refuses unsupported nodes).
                 ggml_tensor* fa = ggml_flash_attn_ext(ctx, src(0), src(1), src(2), src(3), fpar(0, 1.0f), fpar(1, 0.0f), fpar(2, 0.0f));
-                ggml_flash_attn_ext_set_prec(fa, static_cast<ggml_prec>(ipar(0, 0)));
+                ggml_prec_set_acc(fa, static_cast<ggml_prec>(ipar(0, 0)));
                 if (src(4) != nullptr) ggml_flash_attn_ext_add_sinks(fa, src(4));
                 return fa;
             }

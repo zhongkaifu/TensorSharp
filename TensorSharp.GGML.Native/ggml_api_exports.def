@@ -10,8 +10,6 @@ EXPORTS
     ggml_acc
     ggml_acc_inplace
     ggml_add
-    ggml_add1
-    ggml_add1_inplace
     ggml_add_cast
     ggml_add_id
     ggml_add_inplace
@@ -245,10 +243,6 @@ EXPORTS
     ggml_cycles
     ggml_cycles_per_ms
     ggml_diag
-    ggml_diag_mask_inf
-    ggml_diag_mask_inf_inplace
-    ggml_diag_mask_zero
-    ggml_diag_mask_zero_inplace
     ggml_div
     ggml_div_inplace
     ggml_dup
@@ -267,7 +261,6 @@ EXPORTS
     ggml_flash_attn_ext
     ggml_flash_attn_ext_add_sinks
     ggml_flash_attn_ext_get_prec
-    ggml_flash_attn_ext_set_prec
     ggml_floor
     ggml_floor_inplace
     ggml_fopen
@@ -395,7 +388,6 @@ EXPORTS
     ggml_mul_mat
     ggml_mul_mat_id
     ggml_mul_mat_set_hint
-    ggml_mul_mat_set_prec
     ggml_n_dims
     ggml_nbytes
     ggml_nbytes_pad
@@ -456,8 +448,6 @@ EXPORTS
     ggml_rms_norm_inplace
     ggml_roll
     ggml_rope
-    ggml_rope_custom
-    ggml_rope_custom_inplace
     ggml_rope_ext
     ggml_rope_ext_back
     ggml_rope_ext_inplace
@@ -555,13 +545,11 @@ EXPORTS
     ggml_trunc_inplace
     ggml_type_name
     ggml_type_size
-    ggml_type_sizef
     ggml_unary
     ggml_unary_inplace
     ggml_unary_op_name
     ggml_unravel_index
     ggml_upscale
-    ggml_upscale_ext
     ggml_used_mem
     ggml_validate_row_data
     ggml_version
