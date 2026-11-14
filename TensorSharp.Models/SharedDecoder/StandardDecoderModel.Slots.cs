@@ -558,6 +558,8 @@ namespace TensorSharp.Models
         {
             if (_slots == null || string.IsNullOrEmpty(requestId)) return;
             if (!_slots.TryGetValue(requestId, out Slot slot)) return;
+            DropReplaysOf(slot.K, slot.Recurrent);
+            if (string.Equals(_activeKey, requestId, StringComparison.Ordinal)) DropReplaysOf(_cacheK, _recurrentPrimary);
             if (string.Equals(_activeKey, requestId, StringComparison.Ordinal))
             {
                 slot = SnapshotActive();
@@ -580,6 +582,8 @@ namespace TensorSharp.Models
         {
             if (_slots == null || string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key)) return false;
             if (!_slots.TryGetValue(requestId, out Slot slot)) return false;
+            DropReplaysOf(slot.K, slot.Recurrent);
+            if (string.Equals(_activeKey, requestId, StringComparison.Ordinal)) DropReplaysOf(_cacheK, _recurrentPrimary);
             _retainedSlots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_retainedSlots.ContainsKey(key)) return false;
             if (string.Equals(_activeKey, requestId, StringComparison.Ordinal))

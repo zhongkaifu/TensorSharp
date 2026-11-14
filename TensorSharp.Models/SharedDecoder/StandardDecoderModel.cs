@@ -499,6 +499,7 @@ namespace TensorSharp.Models
         protected override void ResetKVCacheCore()
         {
             _verifyRows = 0;   // the state is reset; nothing to settle
+            DropReplaysOf(_cacheK, _recurrentPrimary);
             _draftStart = 0;
             _draftFollowed = -1;
             _ropeDelta = 0;

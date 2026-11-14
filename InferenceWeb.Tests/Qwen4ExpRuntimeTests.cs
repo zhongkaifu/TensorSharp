@@ -516,6 +516,9 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         // The verify windows ran as the kept window of their width advanced to their positions (recorded on CUDA).
         int windows = models.Sum(m => m.WindowAdvances);
         Assert.True(windows > 0, $"{backend} qsa={qsa}: no verify window advanced");
+        // So did the draft layer's steps (each draft one position on from the last).
+        int drafts = models.Sum(m => m.DraftAdvances);
+        Assert.True(drafts > 0, $"{backend} qsa={qsa}: no draft step advanced");
     }
 
     /// <summary>n-gram drafts (accepted and rejected): the verify keeps each row's recurrent and PLE state, and the

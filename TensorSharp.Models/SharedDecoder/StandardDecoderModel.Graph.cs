@@ -267,6 +267,9 @@ namespace TensorSharp.Models
         /// <summary>Of <see cref="DecodeAdvances"/>, the verify windows (more than one row a sequence).</summary>
         internal int WindowAdvances { get; private set; }
 
+        /// <summary>Of <see cref="DecodeAdvances"/>, the draft layer's steps.</summary>
+        internal int DraftAdvances { get; private set; }
+
         /// <summary>The last decode step, kept to run again one position on.</summary>
         private sealed class DecodeReplay
         {
@@ -288,6 +291,8 @@ namespace TensorSharp.Models
             public Tensor[] CaptureOutputs;
             public int Advances;
             public bool CaptureFailed;
+            /// <summary>The storages the step reads and writes in place (each slot's caches and recurrent states), as kept.</summary>
+            public object[] Bound;
 
             public void DisposeCapture()
             {
@@ -323,6 +328,7 @@ namespace TensorSharp.Models
                 r.Capacity[s] = slots[s].Capacity;
                 r.RopeDelta[s] = slots[s].RopeDelta;
             }
+            r.Bound = BoundStorages(slots);
             _decodeReplays[shape ?? ""] = r;
         }
 
@@ -334,6 +340,47 @@ namespace TensorSharp.Models
                 r.Step.Dispose();
             }
             _decodeReplays.Clear();
+        }
+
+        /// <summary>
+        /// A slot ends a request (released, retained, or the primary cache reset): the steps kept to advance on its caches and
+        /// states go, so the next request on the slot traces anew. A pooled slot keeps its caches and states, which every
+        /// check of an advance compares, and a window recorded for one request replayed some 3,000 positions on for the
+        /// next (CUDA error 700 on an A40).
+        /// </summary>
+        private void DropReplaysOf(Tensor[][] k, RecurrentState[][] recurrent)
+        {
+            bool Binds(Tensor[][][] ks, RecurrentState[][][] rs)
+            {
+                for (int s = 0; s < ks.Length; s++)
+                    if ((k != null && ReferenceEquals(ks[s], k)) || (recurrent != null && ReferenceEquals(rs[s], recurrent))) return true;
+                return false;
+            }
+            List<string> drop = null;
+            foreach (var (shape, r) in _decodeReplays)
+                if (Binds(r.K, r.Recurrent)) (drop ??= new List<string>()).Add(shape);
+            if (drop != null)
+                foreach (string shape in drop) DropDecodeReplay(shape);
+            if (_rankedReplay != null && Binds(_rankedReplay.K, _rankedReplay.Recurrent)) DropRankedReplay();
+        }
+
+        private bool _capturesDroppedReported;
+
+        /// <summary>Every kept step's recording goes (their pools back to the allocator); the steps stay kept, and record
+        /// again on later advances.</summary>
+        private void DropDecodeCaptures()
+        {
+            if (!_capturesDroppedReported)
+            {
+                _capturesDroppedReported = true;
+                Console.Error.WriteLine($"[{Config.Architecture}] the device could not hold another recorded step: the recordings were dropped (their steps run unrecorded until they record again).");
+            }
+            foreach (DecodeReplay r in _decodeReplays.Values)
+                if (r.Capture != null)
+                {
+                    r.DisposeCapture();
+                    r.Advances = 0;
+                }
         }
 
         private void DropDecodeReplay(string shape)
@@ -355,10 +402,18 @@ namespace TensorSharp.Models
         /// </summary>
         private bool TryRunRecorded(DecodeReplay r, CachedGraph cached, Slot[] slots, int[] starts)
         {
-            if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length != 1 || GraphExecutor is not IDecodeCaptureExecutor recorder
+            // A floored step (the draft layer after a restored checkpoint) runs as usual: some decode kernels read the
+            // recorded length as the count of keys past the floor.
+            if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length != 1 || r.Floor > 0 || GraphExecutor is not IDecodeCaptureExecutor recorder
                 || cached.Plan is not IGraphTensorOutputs keep || (_expertHost != null && !GraphExecutor.Capabilities.RecordsHostExperts))
                 return false;   // (a step whose host experts read the routes back mid-step cannot be recorded)
             if (r.Capture == null && ++r.Advances < 2) return false;
+            // Too little device memory left for another recording: this step runs as usual and tries again later.
+            if (r.Capture == null && !recorder.HasRoomToRecord())
+            {
+                r.Advances = 0;
+                return false;
+            }
             r.Capture ??= recorder.OpenDecodeCapture();
             if (r.Capture == null) { r.CaptureFailed = true; return false; }
             int writeRow = starts[0], attend = starts[0] + r.Step.Counts[0];
@@ -384,7 +439,14 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    r.Capture.Launch(attend, writeRow);
+                    if (!r.Capture.TryLaunch(attend, writeRow))
+                    {
+                        // Out of device memory (a 4K request beside Qwen3.8 Flash Next's ISTA pack and MTP head on an A40): every
+                        // recording gives its memory back and this step runs as usual; this one is not recorded again.
+                        DropDecodeCaptures();
+                        r.CaptureFailed = true;
+                        return false;
+                    }
                     r.Capture.MarkWritten(r.CaptureOutputs);
                 }
                 for (int o = 0; o < r.CaptureOutputs.Length; o++)
@@ -400,6 +462,29 @@ namespace TensorSharp.Models
             {
                 if (bound) r.Step.UnbindStable();
             }
+        }
+
+        /// <summary>The storages behind <see cref="WrittenTensors"/> of every slot, in order: a kept step binds them, so one
+        /// replaced inside the same arrays (a cache or state tensor swapped for another) must retrace it.</summary>
+        private static object[] BoundStorages(Slot[] slots)
+        {
+            var bound = new List<object>();
+            foreach (Slot slot in slots)
+                foreach (Tensor t in WrittenTensors(slot))
+                {
+                    bound.Add(t.Storage);
+                    bound.Add(t.StorageOffset);
+                }
+            return bound.ToArray();
+        }
+
+        private static bool SameBound(object[] kept, Slot[] slots)
+        {
+            object[] now = BoundStorages(slots);
+            if (kept == null || now.Length != kept.Length) return false;
+            for (int i = 0; i < now.Length; i += 2)
+                if (!ReferenceEquals(now[i], kept[i]) || !Equals(now[i + 1], kept[i + 1])) return false;
+            return true;
         }
 
         /// <summary>The tensors a decode step of <paramref name="slot"/> writes in place: its K/V caches and recurrent states.</summary>
@@ -429,7 +514,7 @@ namespace TensorSharp.Models
         /// rewritten in place (positions, write rows, masks, the embedded rows); the cached graph's signature is the
         /// one the trace would compute. A trace was ~2% of a decode step (Qwen3.6-35B-A3B on an M5 Pro: 0.28 of 15 ms).
         /// </summary>
-        private bool TryAdvanceDecode(Slot[] slots, int[] starts, int floor, string shape, Tensor hidden,
+        private bool TryAdvanceDecode(Slot[] slots, int[] starts, int floor, string shape, Tensor[] hidden,
             out CachedGraph graph, out StepOutputs outputs)
         {
             graph = null;
@@ -454,6 +539,11 @@ namespace TensorSharp.Models
                     || slot.Capacity != r.Capacity[s] || slot.RopeDelta != r.RopeDelta[s] || starts[s] != r.Starts[s] + delta)
                     return false;
             }
+            if (!SameBound(r.Bound, slots))
+            {
+                DropDecodeReplay(shape);
+                return false;
+            }
             if (!_graphCache.TryGetValue(r.Signature, out CachedGraph cached) || !ReferenceEquals(cached, r.Graph)
                 || !r.Step.TryAdvance(hidden, delta))
             {
@@ -473,6 +563,7 @@ namespace TensorSharp.Models
             GraphReplays++;
             DecodeAdvances++;
             if (r.Step.Counts.Length > 0 && r.Step.Counts[0] > 1) WindowAdvances++;
+            if (shape != null && shape.StartsWith(DraftShapePrefix, StringComparison.Ordinal)) DraftAdvances++;
             foreach (Slot slot in slots) slot.DeviceDirty = true;
             graph = cached;
             outputs = r.Outputs;
@@ -669,7 +760,7 @@ namespace TensorSharp.Models
         /// advanced (<see cref="TryAdvanceDecode"/>) instead of being traced.</param>
         private CachedGraph RunTraced(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
             bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned,
-            bool deviceOutputs = false, string shape = null, Tensor advanceHidden = null)
+            bool deviceOutputs = false, string shape = null, Tensor advanceHidden = null, Tensor[] advanceInputs = null)
         {
             GraphStep step = null;
             CachedGraph graph = null;
@@ -677,11 +768,12 @@ namespace TensorSharp.Models
             outputs = default;
             // A decode step, or a verify window of up to 8 rows a sequence (its recurrent snapshots indexed by row, not by
             // position), runs as the kept step of its width advanced to its positions; each width keeps its own.
-            bool advance = replayable && advanceHidden != null && !deviceOutputs && DecodeStepsAdvance
+            Tensor[] advancing = advanceInputs ?? (advanceHidden != null ? new[] { advanceHidden } : null);
+            bool advance = replayable && advancing != null && !deviceOutputs && DecodeStepsAdvance
                 && !DecodeAdvanceDisabled && GraphExecutor.Capabilities.Replays && counts.Length > 0 && counts[0] >= 1
                 && counts[0] <= MaxAdvancedWindowRows && Array.TrueForAll(counts, c => c == counts[0]) && (counts[0] > 1 || !snapshots);
             string replayShape = advance && (counts[0] > 1 || snapshots) ? $"{shape}|w{counts[0]}|{(snapshots ? "s" : "")}" : shape;
-            if (advance && TryAdvanceDecode(slots, starts, attentionFloor, replayShape, advanceHidden, out graph, out outputs))
+            if (advance && TryAdvanceDecode(slots, starts, attentionFloor, replayShape, advancing, out graph, out outputs))
                 return graph;
             try
             {
@@ -1206,13 +1298,13 @@ namespace TensorSharp.Models
                     return false;
             }
             if (!_rankGraphCache.TryGetValue(r.Signature, out CachedGraph[] cached) || !ReferenceEquals(cached, r.Plans)
-                || !r.Steps[0].TryAdvance(inputs[0]))
+                || !r.Steps[0].TryAdvance(new[] { inputs[0] }))
             {
                 DropRankedReplay();
                 return false;
             }
             for (int rank = 1; rank < r.Steps.Length; rank++)
-                if (!r.Steps[rank].TryAdvance(inputs[rank]))
+                if (!r.Steps[rank].TryAdvance(new[] { inputs[rank] }))
                     throw new InvalidOperationException($"{Config.Architecture}: tensor-parallel rank {rank} could not advance where rank 0 did.");
             Array.Copy(starts, r.Starts, starts.Length);
             _rankGraphLru.Remove(r.Signature);
@@ -2174,10 +2266,12 @@ namespace TensorSharp.Models
             internal void LimitAdvance(int start, int maxStart) => (_advanceLimits ??= new()).Add((start, maxStart));
 
             /// <summary>Rewrite this step's inputs for every row one position on, with <paramref name="hidden"/> as its
-            /// rows: positions and write rows plus one, decode masks one column wider (each must stay inside its
-            /// window and every limit honored: false, nothing changed, when one would not).</summary>
-            internal bool TryAdvance(Tensor hidden, int delta = 1)
+            /// rows (its row inputs in order; one tensor binds them all): positions and write rows plus one, decode masks
+            /// one column wider (each must stay inside its window and every limit honored: false, nothing changed, when
+            /// one would not).</summary>
+            internal bool TryAdvance(Tensor[] hidden, int delta = 1)
             {
+                int hiddenAt = 0;
                 if (delta < 1) return false;
                 foreach (InputMeta m in _inputMeta)
                     if (m.Kind == InputKind.DecodeMask && m.Start + m.Count + delta > m.Window) return false;
@@ -2194,9 +2288,12 @@ namespace TensorSharp.Models
                     switch (m.Kind)
                     {
                         case InputKind.Hidden:
-                            _inputData[i] = _m.GraphExecutor.Capabilities.BindsHostPointers ? TensorComputePrimitives.GetStoragePointer(hidden) : IntPtr.Zero;
-                            _inputHandles[i] = hidden;
+                        {
+                            Tensor rows = hidden[Math.Min(hiddenAt++, hidden.Length - 1)];
+                            _inputData[i] = _m.GraphExecutor.Capabilities.BindsHostPointers ? TensorComputePrimitives.GetStoragePointer(rows) : IntPtr.Zero;
+                            _inputHandles[i] = rows;
                             break;
+                        }
                         case InputKind.Positions:
                             foreach (ref int p in ((int[])m.Values).AsSpan()) p += delta;
                             break;

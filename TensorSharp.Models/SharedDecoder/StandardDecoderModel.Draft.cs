@@ -58,6 +58,9 @@ namespace TensorSharp.Models
         /// <summary>Run the draft layer over <paramref name="tokens"/> paired with the trunk rows
         /// <paramref name="hRows"/> at <paramref name="startPos"/>; with <paramref name="logitsOut"/> it
         /// returns the last row's logits and its normed hidden row (the next step's input).</summary>
+        /// <summary>The replay shapes of the draft layer's steps start with this.</summary>
+        private const string DraftShapePrefix = "draft-";
+
         private void RunDraftLayer(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
         {
             int rows = tokens.Length, hiddenSize = DraftFeatureWidth;
@@ -84,10 +87,12 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             try
             {
+                // A draft step runs as the kept one of its width advanced to its position (and replays its recording),
+                // as decode steps and verify windows do: its rows are the token embeddings and the trunk's rows.
                 graph = RunTraced(rows, new[] { active }, new[] { 0 }, new[] { rows }, new[] { startPos },
                     replayable: rows <= SmallChunkRows, snapshots: false, attentionFloor: active.DraftStart,
                     step => EmitDraftLayer(step, embedded, hidden, wantLogits), out outputs, out owned,
-                    shape: wantLogits ? "logits" : "rows");
+                    shape: DraftShapePrefix + (wantLogits ? "logits" : "rows"), advanceInputs: new[] { embedded, hidden });
                 if (graph == null)
                     throw new NotSupportedException(SpeculationRefusal ?? $"{Config.Architecture}: the draft layer cannot run as a graph.");
                 _cacheDeviceDirty = true;
@@ -163,7 +168,7 @@ namespace TensorSharp.Models
             var positions = new int[rows];
             for (int i = 0; i < rows; i++) positions[i] = step.Starts[0] + i + step.Slots[0].RopeDelta;
             step.SetPositions(positions);
-            int x = EmitDraftInput(step, n, step.Input(embedded, hiddenSize, rows), step.Input(hidden, width, rows));
+            int x = EmitDraftInput(step, n, step.HiddenInput(embedded, hiddenSize, rows), step.HiddenInput(hidden, width, rows));
             int normed = EmitBlockInput(step, n, x, BlockSite.Mixer, out int mixContext);
             x = EmitBlockOutput(step, n, x, BlockSite.Mixer, mixContext, EmitAttention(step, n, normed));
             // A catch-up only needs the layer's K/V rows (written as effects): the graph holds what

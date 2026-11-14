@@ -81,6 +81,12 @@ namespace TensorSharp.Cuda
                 _graphs.AbortCapture(Key, aborted.Message);
                 return false;
             }
+            catch (CudaException e) when (e.ErrorCode == OutOfMemory)
+            {
+                CudaDecodeDynParams.Deactivate();
+                _graphs.AbortCapture(Key, "out of device memory");
+                return false;
+            }
             catch
             {
                 CudaDecodeDynParams.Deactivate();
@@ -93,17 +99,35 @@ namespace TensorSharp.Cuda
                 _graphs.AbortCapture(Key, "the step declined");
                 return false;
             }
-            Captured = _graphs.EndCaptureAndLaunch(Key, _stable.Values.First(), written);
+            try
+            {
+                Captured = _graphs.EndCaptureAndLaunch(Key, _stable.Values.First(), written);
+            }
+            catch (CudaException e) when (e.ErrorCode == OutOfMemory)
+            {
+                return false;
+            }
             return Captured;
         }
 
-        public void Launch(int attendLength, int writeRow)
+        /// <summary>CUDA_ERROR_OUT_OF_MEMORY: a graph the device has no memory left to instantiate or launch.</summary>
+        private const int OutOfMemory = 2;
+
+        public bool TryLaunch(int attendLength, int writeRow)
         {
             if (!Captured) throw new InvalidOperationException("no decode step is recorded");
             _allocator.OnRecordedStepLaunching();
             Upload();
             _dyn.Write(attendLength, writeRow, 0, 0);
-            _graphs.Replay(Key);
+            try
+            {
+                _graphs.Replay(Key);
+            }
+            catch (CudaException e) when (e.ErrorCode == OutOfMemory)
+            {
+                return false;
+            }
+            return true;
         }
 
         public void MarkWritten(IReadOnlyList<Tensor> tensors)

@@ -30,6 +30,10 @@ namespace TensorSharp.Graph
     {
         /// <summary>A capture for one kept decode step (null where this executor cannot record).</summary>
         IDecodeCapture OpenDecodeCapture();
+
+        /// <summary>Whether the device keeps room for another recording beside what it holds (a recording keeps the memory its
+        /// step used); false defers it.</summary>
+        bool HasRoomToRecord() => true;
     }
 
     /// <summary>
@@ -54,8 +58,9 @@ namespace TensorSharp.Graph
         /// </summary>
         bool CaptureAndLaunch(Func<bool> run, int attendLength, int writeRow, IReadOnlyList<Tensor> written);
 
-        /// <summary>Replay the recorded step with this position's attention length and cache write row.</summary>
-        void Launch(int attendLength, int writeRow);
+        /// <summary>Replay the recorded step with this position's attention length and cache write row. False when the device
+        /// could not launch it (out of memory): nothing ran, so the caller drops recordings and runs the step itself.</summary>
+        bool TryLaunch(int attendLength, int writeRow);
 
         /// <summary>A launch rewrote these tensors on the device (the recorded step's outputs): reads go to the device.</summary>
         void MarkWritten(IReadOnlyList<Tensor> tensors);
