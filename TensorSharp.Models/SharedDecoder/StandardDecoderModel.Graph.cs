@@ -1775,8 +1775,11 @@ namespace TensorSharp.Models
 
             if (gate >= 0)
             {
+                // One region a backend may run as one kernel reading the gate where the projection put it.
+                step.BeginFused(GraphFusion.SigmoidGate, stackalloc[] { attn, gate });
                 int g = step.Reshape(step.Cont(gate), (int)qDim, rows);
                 attn = step.Op(GraphOp.Mul, attn, step.Op(GraphOp.Sigmoid, g));
+                step.EndFused(stackalloc[] { attn });
             }
             return step.MatMul(LayerName(layer, "attn_output.weight"), attn);
         }

@@ -12,7 +12,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#define TS_GRAPH_KERNELS_VERSION 22
+#define TS_GRAPH_KERNELS_VERSION 23
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1671,6 +1671,22 @@ extern "C" __global__ void ts_graph_deltanet_prep_tiled_f32(
             beta_out[gi] = 1.0f / (1.0f + expf(-beta[ai]));
         }
     }
+}
+
+// GraphFusion.SigmoidGate: out = attn * sigmoid(gate) over [rows, heads * d] (attn and out contiguous), gate read at its row
+// and head strides where the query projection put it (its heads interleaved with the queries, rows a packed projection's
+// pitch apart): the per-op path's sigmoid (ts_unary_f32) and product (ts_binary_f32) expressions, in one pass. Launch:
+// grid ceil(n / 256), block 256.
+extern "C" __global__ void ts_graph_sigmoid_gate_f32(const float* __restrict__ attn, const float* __restrict__ gate,
+    float* __restrict__ out, int heads, int d, long long gate_row, long long gate_head, long long n)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    const long long width = (long long)heads * d, r = i / width, rem = i - r * width;
+    const long long h = rem / d, e = rem - h * d;
+    const float g = gate[r * gate_row + h * gate_head + e];
+    out[i] = attn[i] * (1.0f / (1.0f + expf(-g)));
 }
 
 // The residual add and the next block's input norm in one pass: sum = a + b, normed = sum * rsqrt(mean(sum^2) + eps) * w

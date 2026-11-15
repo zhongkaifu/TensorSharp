@@ -923,7 +923,7 @@ namespace TensorSharp.Cuda
         protected override bool Fuses(GraphFusion kind) => kind switch
         {
             GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.HcRead or GraphFusion.HcScatter
-                or GraphFusion.MoeSelect => Kernels != null,
+                or GraphFusion.MoeSelect or GraphFusion.SigmoidGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             _ => false,
         };
@@ -932,6 +932,7 @@ namespace TensorSharp.Cuda
         /// path's MoE kernels.</summary>
         protected override bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
         {
+            if (kind == GraphFusion.SigmoidGate) return TrySigmoidGate(inputs, results);
             if (kind == GraphFusion.RoutedExperts) return TryRoutedExperts(inputs, weights, ip, results);
             if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs, weights, ip, results);
             if (kind == GraphFusion.HcRead) return TryHcRead(inputs, weights, ip, fp, results);
@@ -1187,7 +1188,43 @@ namespace TensorSharp.Cuda
 
         /// <summary>The gated delta rule's regions read views of a packed in-projection where they are (<see cref="TryRows"/>);
         /// the others take contiguous inputs.</summary>
-        protected override bool RegionReadsStridedInputs(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm;
+        protected override bool RegionReadsStridedInputs(GraphFusion kind)
+            => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate;
+
+        /// <summary>
+        /// A gated attention output (<see cref="GraphFusion.SigmoidGate"/>), attn * sigmoid(gate), in one pass with the gate
+        /// read where the query projection put it (ts_graph_sigmoid_gate_f32: the region's sigmoid and product expressions).
+        /// The ops copied the gate out of the projection, then ran the sigmoid and the product as two passes (Qwen3.8-27B, a
+        /// 2K-row chunk: 50 MB each of the three, 16 layers).
+        /// </summary>
+        private bool TrySigmoidGate(Tensor[] inputs, Tensor[] results)
+        {
+            Tensor attn = inputs[0], gate = inputs[1];
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || attn?.Storage is not CudaStorage || gate?.Storage is not CudaStorage || !attn.IsContiguous()
+                || attn.ElementType != DType.Float32 || gate.ElementType != DType.Float32 || attn.ElementCount() != gate.ElementCount()
+                || gate.Strides[^1] != 1 || gate.Sizes[^1] > int.MaxValue || gate.DimensionCount >= 2 && gate.Sizes[^2] > int.MaxValue)
+                return false;
+            int d = (int)gate.Sizes[^1], heads = gate.DimensionCount >= 2 ? (int)gate.Sizes[^2] : 1;
+            long gateHead = gate.DimensionCount >= 2 ? gate.Strides[^2] : 0;
+            // The dims outside [heads, d] (a view's leading ones of size one included) must be rows a uniform pitch apart.
+            long rows = 1, gateRow = 0;
+            for (int dim = gate.DimensionCount - 3; dim >= 0; dim--)
+            {
+                if (gate.Sizes[dim] == 1) continue;
+                if (rows == 1) gateRow = gate.Strides[dim];
+                else if (gate.Strides[dim] != gateRow * rows) return false;
+                rows *= gate.Sizes[dim];
+            }
+            results[0] = new Tensor(Allocator, DType.Float32, attn.Sizes);
+            Launch(inputs, results, (k, stream) => k.LaunchSigmoidGate(Ptr(attn), Ptr(gate), Ptr(results[0]), rows, heads, d, gateRow,
+                gateHead, stream));
+            SigmoidGateRegions++;
+            return true;
+        }
+
+        /// <summary>Gated attention outputs run as <see cref="TrySigmoidGate"/> (tests check the region engaged).</summary>
+        internal long SigmoidGateRegions { get; private set; }
 
         /// <summary>
         /// Whether <paramref name="t"/> is rows of <paramref name="rowFloats"/> contiguous floats, each <paramref name="pitch"/>

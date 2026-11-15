@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 22;
+        public const int CurrentVersion = 23;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _repackQ6kTiled;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
 
@@ -64,6 +64,7 @@ namespace TensorSharp.Cuda
             _ssmConv = module.GetFunction("ts_graph_ssm_conv_f32");
             _deltaNetPrep = module.GetFunction("ts_graph_deltanet_prep_f32");
             _deltaNetPrepTiled = module.GetFunction("ts_graph_deltanet_prep_tiled_f32");
+            _sigmoidGate = module.GetFunction("ts_graph_sigmoid_gate_f32");
             _gatedRmsNorm = module.GetFunction("ts_graph_gated_rms_norm_f32");
             _addRmsNorm = module.GetFunction("ts_graph_add_rms_norm_f32");
             _repackQ6kTiled = module.GetFunction("ts_graph_repack_q6k_tiled");
@@ -512,6 +513,17 @@ namespace TensorSharp.Cuda
             }
             CudaDriverApi.cuLaunchKernel(_deltaNetPrep, (uint)(2 * kHeads + vHeads), (uint)rows, 1, (uint)d, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>GraphFusion.SigmoidGate: output = attn * sigmoid(gate) over <paramref name="rows"/> x <paramref name="heads"/>
+        /// x <paramref name="d"/> (attn and output contiguous), gate's heads <paramref name="gateHead"/> floats and its rows
+        /// <paramref name="gateRow"/> floats apart.</summary>
+        public void LaunchSigmoidGate(IntPtr attn, IntPtr gate, IntPtr output, long rows, int heads, int d, long gateRow, long gateHead,
+            IntPtr stream)
+        {
+            long n = rows * heads * d;
+            void** args = stackalloc void*[] { &attn, &gate, &output, &heads, &d, &gateRow, &gateHead, &n };
+            CudaDriverApi.cuLaunchKernel(_sigmoidGate, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>sum = a + b and normed = rms_norm(sum) * w over <paramref name="rows"/> contiguous rows of
