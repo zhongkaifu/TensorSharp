@@ -234,6 +234,85 @@ public sealed class CudaNvfp4MatmulTests
         }
     }
 
+    /// <summary>
+    /// Prompt rows of a fused gate|up NVFP4 projection with SwiGLU in the TMA GEMM's epilogue equal the [rows, 2 ff] product
+    /// and a SwiGLU over it, to the bit: 128-row token tiles (a partial one at 65 rows), 256-row ones from 768 rows, and a
+    /// feed-forward width a 128-row weight tile would split across gate and up (ff = 1536 + 64).
+    /// </summary>
+    [CudaTheory]
+    [InlineData(512, 1024, 65)]
+    [InlineData(1600, 2048, 300)]
+    [InlineData(17408, 5120, 800)]
+    public void GateUpProductWithSwiGluEpilogueMatchesTheProductAndItsSwiGlu(int ff, int inDim, int rows)
+    {
+        using var allocator = new CudaAllocator();
+        if (allocator.Fp4Kernels == null)
+        {
+            _output.WriteLine("no FP4 tensor-core products here: the epilogue route does not apply");
+            return;
+        }
+        byte[] weights = Nvfp4Rows(2 * ff, inDim, seed: 17);
+        var x = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                x[r, c] = 1.5f * MathF.Sin(0.0137f * (c + 1) * (r + 2)) + 0.25f * MathF.Cos(0.047f * c - 2 * r);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var input = Tensor.FromArray(allocator, x);
+            using var fused = new Tensor(allocator, DType.Float32, rows, ff);
+            Assert.True(CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(fused, input, host, host, Nvfp4, inDim, 2 * ff, weights.Length));
+            float[] got = fused.GetElementsAsFloat(rows * ff);
+
+            using var gateUp = new Tensor(allocator, DType.Float32, rows, 2 * ff);
+            Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(gateUp, input, host, host, Nvfp4, inDim, 2 * ff, weights.Length));
+            using var act = new Tensor(allocator, DType.Float32, rows, ff);
+            ((CudaStorage)gateUp.Storage).EnsureDeviceCurrent();
+            ((CudaStorage)act.Storage).EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            allocator.Kernels.LaunchSiLUMulSplitF32(Ptr(gateUp), Ptr(act), rows, ff, allocator.Stream.Handle);
+            ((CudaStorage)act.Storage).MarkDeviceModified();
+            float[] want = act.GetElementsAsFloat(rows * ff);
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+            for (int i = 0; i < want.Length; i++)
+                if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(want[i]))
+                    Assert.Fail($"ff {ff}, {rows} rows: row {i / ff} column {i % ff}: epilogue {got[i]:R}, product + SwiGLU {want[i]:R}");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    /// <summary>A gate|up width the epilogue's 64-column tiles do not divide, or too few rows for the TMA GEMM: the route
+    /// declines (the caller runs the product and the SwiGLU).</summary>
+    [CudaFact]
+    public void GateUpSwiGluEpilogueDeclinesWhatItDoesNotTile()
+    {
+        using var allocator = new CudaAllocator();
+        if (allocator.Fp4Kernels == null)
+            return;
+        const int inDim = 512;
+        foreach ((int ff, int rows) in new[] { (96, 100), (512, 64) })
+        {
+            byte[] weights = Nvfp4Rows(2 * ff, inDim, seed: 3);
+            IntPtr host = Marshal.AllocHGlobal(weights.Length);
+            try
+            {
+                Marshal.Copy(weights, 0, host, weights.Length);
+                using var input = new Tensor(allocator, DType.Float32, rows, inDim);
+                using var act = new Tensor(allocator, DType.Float32, rows, ff);
+                Assert.False(CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(act, input, host, host, Nvfp4, inDim, 2 * ff, weights.Length));
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(host);
+            }
+        }
+    }
+
     /// <summary>Rows of an NVFP4 table gathered on the device (the planar layout's lookup where weights are planar) equal
     /// the host's dequantization.</summary>
     [CudaFact]

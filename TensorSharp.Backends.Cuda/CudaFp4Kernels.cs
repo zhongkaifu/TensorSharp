@@ -22,7 +22,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FP4_VERSION in tensorsharp_fp4_kernels.cu: bump both together whenever a kernel is added or
         /// changes its signature.</summary>
-        public const int CurrentVersion = 3;
+        public const int CurrentVersion = 4;
 
         /// <summary>K values one GEMM stage takes: a planar matrix's row width must be a multiple of it.</summary>
         public const int StageK = 256;
@@ -42,7 +42,8 @@ namespace TensorSharp.Cuda
         private const int Block = 256;
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
 
-        private readonly IntPtr _repack, _quantQ81, _quantNvfp4, _quantSwiGlu, _gemm32, _gemm64, _gemm128, _tma256, _tma128, _getRows;
+        private readonly IntPtr _repack, _quantQ81, _quantNvfp4, _quantSwiGlu, _gemm32, _gemm64, _gemm128, _tma256, _tma128, _tma256SwiGlu,
+            _tma128SwiGlu, _getRows;
         private readonly IntPtr[] _gemv = new IntPtr[GemvMaxRows + 1];
         private readonly int[] _gemvRows = new int[GemvMaxRows + 1];
         private readonly int _smem32, _smem64, _smem128, _smemTma256, _smemTma128;
@@ -66,6 +67,8 @@ namespace TensorSharp.Cuda
             _gemm128 = module.GetFunction("ts_fp4_gemm_w4a4_128");
             _tma256 = module.GetFunction("ts_fp4_gemm_w4a4_tma256");
             _tma128 = module.GetFunction("ts_fp4_gemm_w4a4_tma128");
+            _tma256SwiGlu = module.GetFunction("ts_fp4_gemm_w4a4_tma256_swiglu");
+            _tma128SwiGlu = module.GetFunction("ts_fp4_gemm_w4a4_tma128_swiglu");
             _getRows = module.GetFunction("ts_fp4_get_rows_f32");
             for (int n = 1; n <= GemvMaxRows; n++)
                 _gemv[n] = module.GetFunction($"ts_fp4_gemv_nvfp4_{n}");
@@ -78,7 +81,8 @@ namespace TensorSharp.Cuda
             (_smemTma256, _smemTma128) = (host[0], host[1]);
             CudaDriverApi.cuFuncSetAttribute(_quantNvfp4, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_quantSwiGlu, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
-            foreach (var (fn, smem) in new[] { (_gemm32, _smem32), (_gemm64, _smem64), (_gemm128, _smem128), (_tma256, _smemTma256), (_tma128, _smemTma128) })
+            foreach (var (fn, smem) in new[] { (_gemm32, _smem32), (_gemm64, _smem64), (_gemm128, _smem128), (_tma256, _smemTma256), (_tma128, _smemTma128),
+                         (_tma256SwiGlu, _smemTma256), (_tma128SwiGlu, _smemTma128) })
                 CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem).ThrowOnError();
         }
 
@@ -234,21 +238,43 @@ namespace TensorSharp.Cuda
         /// summation order of <see cref="Gemm"/> unsplit. Token tiles of 256 rows from 768 rows, else 128.</summary>
         public void GemmTma(IntPtr planes, int outDim, int k, IntPtr xCodes, IntPtr xScales, IntPtr rowScale, int m, float alpha,
             IntPtr y, IntPtr stream)
+            => LaunchTma(planes, outDim, k, xCodes, xScales, rowScale, m, alpha, y, swiGlu: false, stream);
+
+        /// <summary>Whether <see cref="GemmTmaSwiGlu"/> takes <paramref name="m"/> rows of a fused gate|up matrix of
+        /// <paramref name="outDim"/> rows (ff gate rows, then ff up rows): <see cref="TakesTma"/>, and ff a multiple of 64.</summary>
+        public static bool TakesTmaSwiGlu(int m, int outDim, int k, IntPtr planes, IntPtr xCodes, IntPtr xScales)
+            => outDim % 128 == 0 && TakesTma(m, outDim, k, planes, xCodes, xScales);
+
+        /// <summary>
+        /// y[m, ff] = silu(gate) * up for a fused gate|up matrix of <paramref name="outDim"/> = 2 ff rows (the gate rows first)
+        /// on the TMA-fed GEMM (<see cref="TakesTmaSwiGlu"/>): gate and up are the values <see cref="GemmTma"/> stores for
+        /// those rows, so the activation is the one a SwiGLU over its [m, 2 ff] result computes, without that result's
+        /// bytes written and read again.
+        /// </summary>
+        public void GemmTmaSwiGlu(IntPtr planes, int outDim, int k, IntPtr xCodes, IntPtr xScales, IntPtr rowScale, int m, float alpha,
+            IntPtr y, IntPtr stream)
+            => LaunchTma(planes, outDim, k, xCodes, xScales, rowScale, m, alpha, y, swiGlu: true, stream);
+
+        private void LaunchTma(IntPtr planes, int outDim, int k, IntPtr xCodes, IntPtr xScales, IntPtr rowScale, int m, float alpha,
+            IntPtr y, bool swiGlu, IntPtr stream)
         {
             int bm = m >= 768 ? 256 : 128;
+            // A CTA's weight rows: 128, or 64 gate rows and their 64 up rows (two boxes each).
+            uint weightBox = swiGlu ? 64u : 128u;
             // CUtensorMap is 128 bytes and 64-byte aligned: xCodes, xScales, wCodes, wScales (codes in 64-byte boxes with
             // the 64-byte swizzle, scales in 16-byte boxes).
             byte* raw = stackalloc byte[4 * 128 + 64];
             byte* maps = (byte*)(((nint)raw + 63) & ~(nint)63);
             EncodeTma(maps, xCodes, k / 2, m, 64, (uint)bm, 2);
             EncodeTma(maps + 128, xScales, k / 16, m, 16, (uint)bm, 0);
-            EncodeTma(maps + 256, planes, k / 2, outDim, 64, 128, 2);
-            EncodeTma(maps + 384, ScalePlane(planes, outDim, k), k / 16, outDim, 16, 128, 0);
+            EncodeTma(maps + 256, planes, k / 2, outDim, 64, weightBox, 2);
+            EncodeTma(maps + 384, ScalePlane(planes, outDim, k), k / 16, outDim, 16, weightBox, 0);
             IntPtr a3 = rowScale, a6 = y;
             int a1 = outDim, a2 = k, a4 = m; float a5 = alpha;
             void** args = stackalloc void*[] { maps, &a1, &a2, &a3, &a4, &a5, &a6 };
-            Launch(bm == 256 ? _tma256 : _tma128, (uint)((m + bm - 1) / bm), (uint)((outDim + 127) / 128), 1, bm == 256 ? 384 : 288,
-                bm == 256 ? _smemTma256 : _smemTma128, stream, args);
+            IntPtr fn = bm == 256 ? (swiGlu ? _tma256SwiGlu : _tma256) : (swiGlu ? _tma128SwiGlu : _tma128);
+            uint weightTiles = swiGlu ? (uint)(outDim / 128) : (uint)((outDim + 127) / 128);
+            Launch(fn, (uint)((m + bm - 1) / bm), weightTiles, 1, bm == 256 ? 384 : 288, bm == 256 ? _smemTma256 : _smemTma128, stream, args);
         }
 
         private static void EncodeTma(byte* map, IntPtr address, long columns, long rows, uint boxColumns, uint boxRows, int swizzle)

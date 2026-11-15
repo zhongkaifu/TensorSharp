@@ -1173,7 +1173,9 @@ namespace TensorSharp.Cuda
         /// A SwiGLU feed-forward with a fused gate|up weight (<see cref="GraphFusion.SwigluFfn"/>): the gate|up product, then
         /// silu(gate) * up read from its rows in place (the region's ops copied both halves whole first: 0.5 GB a layer
         /// for a 3.6K-token prompt of Qwen3.8-27B), and the down product. An NVFP4 down projection on the FP4 tensor cores
-        /// takes the activation straight into its quantized planes. False (the ops run) for separate gate and up weights.
+        /// takes the activation straight into its quantized planes; prompt rows of an NVFP4 gate|up on the TMA-fed GEMM
+        /// get the activation from its epilogue instead of the [rows, 2 ff] product. False (the ops run) for separate gate
+        /// and up weights.
         /// </summary>
         private bool TrySwigluFfn(Tensor[] inputs, IGraphWeight[] weights, long[] ip, Tensor[] results)
         {
@@ -1187,6 +1189,19 @@ namespace TensorSharp.Cuda
             var cuda = (CudaAllocator)Allocator;
             long rows = x.ElementCount() / gateUp.Ne0;
             using Tensor x2 = x.View(rows, gateUp.Ne0);
+            // Prompt rows of an NVFP4 gate|up on the FP4 tensor cores: the activation straight from the GEMM's epilogue.
+            if (rows >= CudaFp4Kernels.TmaMinRows && cuda.Fp4Kernels != null)
+            {
+                var swiglu = new Tensor(Allocator, DType.Float32, rows, ff);
+                if (CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(swiglu, x2, gateUp.CacheKey, gateUp.Data, gateUp.Format, gateUp.Ne0, gateUp.Ne1,
+                        gateUp.Bytes))
+                {
+                    results[0] = QuantizedMatMul(down, swiglu);
+                    swiglu.Dispose();
+                    return true;
+                }
+                swiglu.Dispose();
+            }
             using Tensor gu = QuantizedMatMul(gateUp, x2);   // [rows, 2 ff], gate first
             var y = new Tensor(Allocator, DType.Float32, rows, down.Ne1);
             if (CudaQuantizedOps.TryAddmmSwiGluNvfp4(y, gu, down.CacheKey, down.Data, down.Format, down.Ne0, down.Ne1, down.Bytes))

@@ -1025,6 +1025,39 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>
+        /// result[rows, ff] = silu(x Wg^T) * (x Wu^T) for a fused gate|up NVFP4 matrix [2 ff, ne0] (the gate rows first) kept
+        /// as planes, when the rows run on the TMA-fed GEMM: the activation straight from the GEMM's epilogue, the values the
+        /// [rows, 2 ff] product and a SwiGLU over it give (that product's F32 rows had been written and read again: 0.5 GB a
+        /// layer for 3.6K rows of Qwen3.8-27B). False, with nothing launched, where it does not apply.
+        /// </summary>
+        public static bool TryAddmmGateUpSwiGluNvfp4(Tensor result, Tensor input, IntPtr cacheKey, IntPtr hostData, int ggmlType,
+            long ne0, long ne1, long rawBytes)
+        {
+            if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
+                || !CudaKernelOps.TryGetContiguousRows(input, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
+                || rows != inputRows || 2L * cols != ne1 || inputCols != ne0 || rows < CudaFp4Kernels.TmaMinRows
+                || result.ElementType != DType.Float32 || input.ElementType != DType.Float32)
+                return false;
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (allocator.Fp4Kernels is not { } fp4)
+                return false;
+            DeviceWeight weight = EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            int k = checked((int)ne0), outDim = checked((int)ne1);
+            if (weight.GgmlType != Nvfp4PlanarType)
+                return false;
+            var (codes, scales, rowScale) = Fp4Activations(allocator, rows, k);
+            if (!CudaFp4Kernels.TakesTmaSwiGlu(rows, outDim, k, weight.DevicePtr, codes, scales))
+                return false;
+            inputStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            IntPtr stream = allocator.Stream.Handle;
+            fp4.Quantize(inputPtr, codes, scales, rowScale, k, rows, stream);
+            fp4.GemmTmaSwiGlu(weight.DevicePtr, outDim, k, codes, scales, rowScale, rows, 1.0f, resultPtr, stream);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         internal static void RunResidentMatmul(
             CudaAllocator allocator,
             CudaKernels kernels,

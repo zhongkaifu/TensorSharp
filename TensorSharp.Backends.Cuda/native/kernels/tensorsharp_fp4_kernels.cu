@@ -18,7 +18,8 @@
 //   * ts_fp4_quantize_nvfp4_f32: F32 rows -> NVFP4 activation planes and row scales (ggml-cuda's quantize_mmq_nvfp4);
 //     ts_fp4_quantize_swiglu_nvfp4_f32 the planes of silu(gate) * up of fused gate|up rows.
 //   * ts_fp4_gemm_w4a4_<bn>: 9+ rows on the FP4 tensor cores through a cp.async ring, split over K for few rows.
-//   * ts_fp4_gemm_w4a4_tma<bm>: prompt rows, TMA-fed and warp-specialized (the same products in the same order).
+//   * ts_fp4_gemm_w4a4_tma<bm>: prompt rows, TMA-fed and warp-specialized (the same products in the same order);
+//     ts_fp4_gemm_w4a4_tma<bm>_swiglu a fused gate|up projection's rows with silu(gate) * up in the epilogue.
 //   * ts_fp4_get_rows_f32: rows of a planar matrix as F32 (an NVFP4 table's lookup).
 //
 // The kernels are the direct-CUDA Qwen3.5 engine's (bit-identical arithmetic). The tensor-core bodies exist only in an
@@ -36,7 +37,7 @@
 #define TS_FP4_NVFP4_BLOCK 64
 #define TS_FP4_NVFP4_BLOCK_BYTES 36
 
-#define TS_FP4_VERSION 3
+#define TS_FP4_VERSION 4
 
 __device__ __forceinline__ float ts_fp4_warp_sum(float v)
 {
@@ -865,7 +866,13 @@ __device__ __forceinline__ uint32_t ts_fp4_sw64(uint32_t addr) { return addr ^ (
 
 #endif
 
-template <int BM, int STAGES>
+// SWIGLU: the fused gate|up projection of a SwiGLU feed-forward (outDim = 2 ff weight rows, the ff gate rows first) with
+// the activation in the epilogue: y [m][ff] = silu(gate) * up, gate and up each the value the plain kernel stores, so the
+// down projection's quantizer reads the activation it would otherwise compute from the [m][2 ff] product (half the
+// bytes written, half read). A CTA takes 64 gate rows and the same columns' 64 up rows (two 64-row TMA boxes per
+// operand, smem rows 0-63 and 64-127); a consumer warp's n8 tiles 0-3 are gate rows wn * 32 + 8j, tiles 4-7 the same
+// columns' up rows, so a column's gate and up meet in one thread. grid (activation tiles, ff / 64); ff % 64 == 0.
+template <int BM, int STAGES, bool SWIGLU = false>
 __device__ __forceinline__ void ts_fp4_gemm_w4a4_tma(const TsFp4TmaMaps& maps, int outDim, int k,
     const float* __restrict__ rowScale, int m, float alpha, float* __restrict__ y)
 {
@@ -875,7 +882,7 @@ __device__ __forceinline__ void ts_fp4_gemm_w4a4_tma(const TsFp4TmaMaps& maps, i
     constexpr int PRODUCERS = BM == 256 ? 128 : 32, WARP_M = BM / 4, MT = WARP_M / 16, NT = 8;
     extern __shared__ __align__(1024) uint8_t tmaSmem[];
     auto& sm = *reinterpret_cast<TsFp4TmaSmem<BM, STAGES>*>(tmaSmem);
-    const int token0 = blockIdx.x * BM, row0 = blockIdx.y * 128, kTiles = k / 128;
+    const int token0 = blockIdx.x * BM, row0 = blockIdx.y * (SWIGLU ? 64 : 128), kTiles = k / 128;
 
     if (threadIdx.x == 0)
     {
@@ -905,10 +912,14 @@ __device__ __forceinline__ void ts_fp4_gemm_w4a4_tma(const TsFp4TmaMaps& maps, i
                 ts_fp4_mbar_expect(&sm.full[s], scales ? CODES + SCALES : CODES);
                 ts_fp4_tma_2d(sm.xc[s], &maps.xCodes, kt * 64, token0, &sm.full[s]);
                 ts_fp4_tma_2d(sm.wc[s], &maps.wCodes, kt * 64, row0, &sm.full[s]);
+                if constexpr (SWIGLU)
+                    ts_fp4_tma_2d(sm.wc[s] + 64 * 64, &maps.wCodes, kt * 64, outDim / 2 + row0, &sm.full[s]);
                 if (scales)
                 {
                     ts_fp4_tma_2d(sm.xs[(kt >> 1) & 1], &maps.xScales, (kt >> 1) * 16, token0, &sm.full[s]);
                     ts_fp4_tma_2d(sm.ws[(kt >> 1) & 1], &maps.wScales, (kt >> 1) * 16, row0, &sm.full[s]);
+                    if constexpr (SWIGLU)
+                        ts_fp4_tma_2d(sm.ws[(kt >> 1) & 1] + 64 * 16, &maps.wScales, (kt >> 1) * 16, outDim / 2 + row0, &sm.full[s]);
                 }
             }
         }
@@ -920,10 +931,13 @@ __device__ __forceinline__ void ts_fp4_gemm_w4a4_tma(const TsFp4TmaMaps& maps, i
     const int ct = threadIdx.x - PRODUCERS, lane = ct & 31, warp = ct >> 5;
     const int wm = warp >> 1, wn = warp & 1;
     const int g = lane >> 2, q = lane & 3;
+    // The smem weight row of n8 tile j's first row, past the warp's own (wn * 64, or wn * 32 for the gate|up split).
+    auto tileRow = [](int j) { return SWIGLU ? (j >> 2) * 64 + (j & 3) * 8 : j * 8; };
+    const int warpRow = SWIGLU ? wn * 32 : wn * 64;
     // ldmatrix row addresses: A x4 = rows 0-15 at byte 0 then 16; B x2 = rows 0-7 at bytes 0, 16.
     const int aRow = wm * WARP_M + (lane & 15), aByte = (lane >> 4) * 16;
-    const int bRow = wn * 64 + (lane & 7), bByte = ((lane >> 3) & 1) * 16;
-    const int saRow = wm * WARP_M + g + (lane & 1) * 8, sbRow = wn * 64 + g;
+    const int bRow = warpRow + (lane & 7), bByte = ((lane >> 3) & 1) * 16;
+    const int saRow = wm * WARP_M + g + (lane & 1) * 8, sbRow = warpRow + g;
 
     float acc[MT][NT][4];
 #pragma unroll
@@ -954,8 +968,8 @@ __device__ __forceinline__ void ts_fp4_gemm_w4a4_tma(const TsFp4TmaMaps& maps, i
             for (int j = 0; j < NT; ++j)
             {
                 uint32_t b0, b1;
-                ts_fp4_ldsm_x2(b0, b1, ts_fp4_sw64(wc + (bRow + j * 8) * 64 + k64 * 32 + bByte));
-                const uint32_t sb = *(const uint32_t*)(ws + (sbRow + j * 8) * 16 + k64 * 4);
+                ts_fp4_ldsm_x2(b0, b1, ts_fp4_sw64(wc + (bRow + tileRow(j)) * 64 + k64 * 32 + bByte));
+                const uint32_t sb = *(const uint32_t*)(ws + (sbRow + tileRow(j)) * 16 + k64 * 4);
 #pragma unroll
                 for (int i = 0; i < MT; ++i)
                     ts_fp4_mma_fp4(acc[i][j], a[i], b0, b1, sa[i], sb);
@@ -966,7 +980,34 @@ __device__ __forceinline__ void ts_fp4_gemm_w4a4_tma(const TsFp4TmaMaps& maps, i
     }
 
     // D rows are tokens (g, g + 8), columns weight rows (2q, 2q + 1).
-    const int tokBase = token0 + wm * WARP_M + g, rowBase = row0 + wn * 64 + 2 * q;
+    const int tokBase = token0 + wm * WARP_M + g, rowBase = row0 + warpRow + 2 * q;
+    if constexpr (SWIGLU)
+    {
+        const int ff = outDim / 2;
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int c = tokBase + i * 16 + h * 8;
+                if (c >= m)
+                    continue;
+                const float rs = rowScale[c];
+#pragma unroll
+                for (int j = 0; j < NT / 2; ++j)
+                {
+                    float out[2];
+#pragma unroll
+                    for (int e = 0; e < 2; ++e)
+                    {
+                        const float gate = acc[i][j][h * 2 + e] * rs * alpha, up = acc[i][j + NT / 2][h * 2 + e] * rs * alpha;
+                        out[e] = ts_fp4_silu(gate) * up;
+                    }
+                    *(float2*)(y + (long long)c * ff + rowBase + j * 8) = make_float2(out[0], out[1]);
+                }
+            }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < MT; ++i)
 #pragma unroll
@@ -993,13 +1034,16 @@ __device__ __forceinline__ void ts_fp4_gemm_w4a4_tma(const TsFp4TmaMaps& maps, i
 
 // grid (activation tiles, 128-row weight tiles), block 256 consumers + 32 (BM 128) or 128
 // (BM 256) producers; outDim % 16 == 0 and k % 128 == 0 (CudaFp4Kernels.TakesTma checks).
-#define TS_FP4_GEMM_TMA(NAME, BM, STAGES) \
+// _swiglu: the gate|up projection with the SwiGLU epilogue (weight maps in 64-row boxes).
+#define TS_FP4_GEMM_TMA(NAME, BM, STAGES, SWIGLU) \
     extern "C" __global__ __launch_bounds__(256 + (BM == 256 ? 128 : 32), 1) void NAME( \
         const __grid_constant__ TsFp4TmaMaps maps, int outDim, int k, const float* __restrict__ rowScale, int m, \
         float alpha, float* __restrict__ y) \
-    { ts_fp4_gemm_w4a4_tma<BM, STAGES>(maps, outDim, k, rowScale, m, alpha, y); }
-TS_FP4_GEMM_TMA(ts_fp4_gemm_w4a4_tma256, 256, 3)
-TS_FP4_GEMM_TMA(ts_fp4_gemm_w4a4_tma128, 128, 3)
+    { ts_fp4_gemm_w4a4_tma<BM, STAGES, SWIGLU>(maps, outDim, k, rowScale, m, alpha, y); }
+TS_FP4_GEMM_TMA(ts_fp4_gemm_w4a4_tma256, 256, 3, false)
+TS_FP4_GEMM_TMA(ts_fp4_gemm_w4a4_tma128, 128, 3, false)
+TS_FP4_GEMM_TMA(ts_fp4_gemm_w4a4_tma256_swiglu, 256, 3, true)
+TS_FP4_GEMM_TMA(ts_fp4_gemm_w4a4_tma128_swiglu, 128, 3, true)
 
 /// Dynamic shared memory of the TMA GEMMs: [BM 256, BM 128] (three stages each).
 extern "C" __global__ void ts_fp4_gemm_tma_smem_bytes(int* out)
