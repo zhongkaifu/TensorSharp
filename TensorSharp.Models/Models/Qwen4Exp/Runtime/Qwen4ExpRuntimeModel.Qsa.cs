@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 
@@ -197,7 +198,44 @@ namespace TensorSharp.Models
             QsaSpec q = Qsa;
             int d = q.Dim, heads = q.Heads, kvType = KvCacheGraphType;
             Slot slot = step.Slots[s];
+            int pools = (keys + ratio - 1) / ratio;
+            QsaPlanInputs plan = QsaPlanFor(step, s, ratio, keys, count, heads, d);
 
+            // Each block's pooled key, from its last member's row (the cache's pooled half).
+            int pooledHalf = step.View2(QsaCache(step, layer, s), d, slot.Capacity, RowBytes(kvType, 2 * d), RowBytes(kvType, d));
+            int pooled = step.Reshape(step.Op(GraphOp.GetRows, pooledHalf, plan.PooledRows), d, 1, pools);
+
+            // The rows' indexer queries, scored against every block.
+            int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);
+            int query = step.MatMul(LayerName(layer, "indexer.q_proj.weight"), step.Cont(xs));                // [d * heads, count]
+            query = step.RmsNorm(step.Reshape(query, d, heads, count), LayerName(layer, "indexer.q_norm.weight"));
+            // The rows' own rotary positions: a media step's table (one sequence), else the KV index plus the slot's delta.
+            query = step.PositionTable >= 0 ? step.Rope(query, GraphRotary) : step.RopeAt(query, GraphRotary, step.SequencePositions(s));
+            int score = step.Op(GraphOp.LightningIndexer, stackalloc[] { query, pooled, plan.Weights, plan.Visible });   // [pools, count]
+            int picks = step.Op(GraphOp.TopK, stackalloc[] { score }, stackalloc long[] { Math.Min(pools, q.TopK / ratio) });
+            return step.Op(GraphOp.TopKMask, stackalloc[]
+            {
+                mask, picks, score, step.Reshape(plan.Cells, ratio, pools), step.Reshape(plan.Tail, ratio - 1, count),
+            }, stackalloc long[] { 1, 1, 1 });
+        }
+
+        /// <summary>A step's selection plan for one sequence, as graph inputs: every QSA layer of the step with the same ratio
+        /// and window reads the same ones (as llama.cpp shares them across layers). Each layer had built and refilled its own
+        /// on the host at every step: four inputs and their uploads per layer and token, ~80 copies a token at 16K.</summary>
+        private sealed record QsaPlanInputs(int PooledRows, int Cells, int Visible, int Tail, int Weights);
+
+        private object _qsaPlanStep;
+        private readonly Dictionary<(int Sequence, int Ratio, int Keys), QsaPlanInputs> _qsaPlans = new();
+
+        private QsaPlanInputs QsaPlanFor(GraphStep step, int s, int ratio, int keys, int count, int heads, int d)
+        {
+            if (!ReferenceEquals(_qsaPlanStep, step))
+            {
+                _qsaPlanStep = step;
+                _qsaPlans.Clear();
+            }
+            if (_qsaPlans.TryGetValue((s, ratio, keys), out QsaPlanInputs shared)) return shared;
+            int start = step.Starts[s];
             // The plan: blocks over the window, complete ones holding cells, the rest padded and invisible. It follows the
             // rows' positions: run again one position on, a decode step refills it in place (the same graph: the window,
             // and so the blocks, unchanged).
@@ -225,32 +263,17 @@ namespace TensorSharp.Models
                 }
             }
             Plan(start);
-
-            // Each block's pooled key, from its last member's row (the cache's pooled half).
-            int pooledHalf = step.View2(QsaCache(step, layer, s), d, slot.Capacity, RowBytes(kvType, 2 * d), RowBytes(kvType, d));
             int pooledInput = step.InputI32(pooledRows, pools);
-            int pooled = step.Reshape(step.Op(GraphOp.GetRows, pooledHalf, pooledInput), d, 1, pools);
-
-            // The rows' indexer queries, scored against every block.
-            int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);
-            int query = step.MatMul(LayerName(layer, "indexer.q_proj.weight"), step.Cont(xs));                // [d * heads, count]
-            query = step.RmsNorm(step.Reshape(query, d, heads, count), LayerName(layer, "indexer.q_norm.weight"));
-            // The rows' own rotary positions: a media step's table (one sequence), else the KV index plus the slot's delta.
-            query = step.PositionTable >= 0 ? step.Rope(query, GraphRotary) : step.RopeAt(query, GraphRotary, step.SequencePositions(s));
             var weights = new float[heads * count];
             Array.Fill(weights, 1f / MathF.Sqrt(d));   // the reference's unweighted head sum, scaled
             int visibleInput = step.InputF16(visible, pools, count);
-            int score = step.Op(GraphOp.LightningIndexer, stackalloc[]
-                { query, pooled, step.ConstantInputF32(weights, heads, count), visibleInput });   // [pools, count]
-            int picks = step.Op(GraphOp.TopK, stackalloc[] { score }, stackalloc long[] { Math.Min(pools, q.TopK / ratio) });
             int cellsInput = step.InputI32(cells, cells.Length), tailInput = step.InputI32(tail, tail.Length);
             int seq = s;
             step.RefillOnAdvance(pooledInput, () => { Plan(step.Starts[seq]); return true; });
             foreach (int input in new[] { visibleInput, cellsInput, tailInput }) step.RefillOnAdvance(input, () => true);
-            return step.Op(GraphOp.TopKMask, stackalloc[]
-            {
-                mask, picks, score, step.Reshape(cellsInput, ratio, pools), step.Reshape(tailInput, ratio - 1, count),
-            }, stackalloc long[] { 1, 1, 1 });
+            var plan = new QsaPlanInputs(pooledInput, cellsInput, visibleInput, tailInput, step.ConstantInputF32(weights, heads, count));
+            _qsaPlans[(s, ratio, keys)] = plan;
+            return plan;
         }
     }
 }
