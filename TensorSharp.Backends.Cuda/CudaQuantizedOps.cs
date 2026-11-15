@@ -199,6 +199,9 @@ namespace TensorSharp.Cuda
         private static readonly ScratchPool Fp4PartialScratch = new ScratchPool();
         private static readonly ScratchPool Fp4CounterScratch = new ScratchPool();
 
+        /// <summary>CUDA_ERROR_OUT_OF_MEMORY.</summary>
+        private const int OutOfMemoryStatus = 2;
+
         private static IntPtr EnsureScratch(ScratchPool pool, CudaAllocator allocator, long bytes)
         {
             lock (Sync)
@@ -214,7 +217,16 @@ namespace TensorSharp.Cuda
                     ? 0
                     : scratch.Bytes * 2;
                 long alloc = Math.Max(bytes, Math.Max(64 * 1024L, doubled));
-                CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)alloc)).ThrowOnError();
+                int status = CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)alloc));
+                // The allocator's pool keeps returned blocks for reuse, which this direct allocation cannot use: out of memory,
+                // they go back to the driver first (outside a recording, which must not synchronize). A 4K prompt of
+                // Qwen3.8-27B NVFP4 with the DFlash2 drafter on a 24 GB RTX PRO 4000 failed here with the pool holding them.
+                if (status == OutOfMemoryStatus && !CudaGraphCapture.IsCapturing(allocator))
+                {
+                    allocator.TrimPool();
+                    status = CudaDriverApi.cuMemAlloc(out ptr, new UIntPtr((ulong)alloc));
+                }
+                status.ThrowOnError();
 
                 if (scratch == null)
                 {
