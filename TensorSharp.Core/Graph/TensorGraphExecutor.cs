@@ -1382,6 +1382,11 @@ namespace TensorSharp.Graph
         /// a backend whose generic copy does not convert overrides it. Default: <see cref="Ops.Copy"/>.</summary>
         protected virtual void CopyInto(Tensor dst, Tensor src) => Ops.Copy(dst, src);
 
+        /// <summary>Single-axis rotary of <paramref name="x"/> ([tokens, heads, d], d contiguous, any token and head strides)
+        /// into new contiguous rows, the values the contiguous path writes; null where the backend cannot (it is copied, then
+        /// rotated). fp: freq base, freq scale, ext factor, attn factor, beta fast, beta slow.</summary>
+        protected virtual Tensor RopeStrided(Tensor x, Tensor positions, int tokens, int heads, int d, int dims, int mode, int ctx, float[] fp) => null;
+
         private Tensor Contig(Tensor t, RunState run) => Contig(t, run.Owned);
 
         private Tensor F32(Tensor t, List<Tensor> owned)
@@ -2204,11 +2209,11 @@ namespace TensorSharp.Graph
             return r.View(Sizes(stackalloc long[] { na[0], n, ni[1], ni[2] }));
         }
 
+        /// <summary>Each source copied into its slice of the result as it is: a strided view (a fused projection's column block)
+        /// takes no contiguous copy of its own first (28 concats of a Qwen3.8 Flash Next verify window took 94 kernels).</summary>
         private Tensor Concat(Tensor a, Tensor b, int ggmlDim, RunState run)
         {
-            Tensor a4 = run.Keep(Contig(a, run).View(Sizes4(Ne(a))));
-            Tensor b4 = run.Keep(Contig(b, run).View(Sizes4(Ne(b))));
-            using Tensor r = Ops.Concat(null, 3 - ggmlDim, a4, b4);
+            using Tensor r = Ops.Concat(null, 3 - ggmlDim, As4(a, run), As4(b, run));
             return r.View(Sizes(Ne(r)));
         }
 
@@ -2382,6 +2387,12 @@ namespace TensorSharp.Graph
                 {
                     using Tensor rotated = Ops.RoPEEx(null, As4(x, run), p, dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, n.Fp[4], n.Fp[5]);
                     return rotated.View(Sizes(ne));
+                }
+                // Rotated where it lies into new rows (a fused projection's q or k block, or contiguous rows), where the backend
+                // can: one launch where the copy and the rotary in place took two.
+                if (RopeStrided(x, p, tokens, heads, d, dims, mode, ctx, n.Fp) is { } strided)
+                {
+                    using (strided) return strided.View(Sizes(ne));
                 }
                 Tensor copy = Ops.NewContiguous(x);
                 using Tensor r4 = copy.View(1, tokens, heads, d);

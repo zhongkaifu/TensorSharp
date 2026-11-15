@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 23;
+        public const int CurrentVersion = 24;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
 
@@ -51,6 +51,9 @@ namespace TensorSharp.Cuda
             _binaryBcast = module.GetFunction("ts_graph_binary_bcast_f32");
             _hcNorm = module.GetFunction("ts_graph_hc_norm_f32");
             _hcPartials = module.GetFunction("ts_graph_hc_partials_f32");
+            _hcPostPartials = module.GetFunction("ts_graph_hc_post_partials_f32");
+            _ropeStrided = module.GetFunction("ts_graph_rope_ex_strided_f32");
+            _sharedGate = module.GetFunction("ts_graph_shared_gate_add_f32");
             _hcApply = module.GetFunction("ts_graph_hc_apply_f32");
             _scaleSilu = module.GetFunction("ts_graph_scale_silu_f32");
             _hcGateMix = module.GetFunction("ts_graph_hc_gate_mix_f32");
@@ -422,6 +425,29 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>The scatter: each stream plus the block output weighted by 2 * sigmoid(inject / hc).</summary>
+        /// <summary>A block's scatter into <paramref name="output"/> (<see cref="LaunchHcScatter"/>'s arithmetic) and the next
+        /// read's first pass over the scattered streams (<see cref="LaunchHcPartials"/>' arithmetic) in one launch.</summary>
+        public void LaunchHcPostPartials(IntPtr streamIn, IntPtr block, IntPtr inject, IntPtr output, IntPtr gamma, IntPtr injW,
+            IntPtr partials, int rows, int n, int hc, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &streamIn, &block, &inject, &output, &gamma, &injW, &partials, &n, &hc };
+            CudaDriverApi.cuLaunchKernel(_hcPostPartials, (uint)(hc * n / HcSlice), (uint)rows, 1, HcSlice, 1, 1, 0, stream, (IntPtr)args,
+                IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ts_rope_ex_f32's rotary over a strided source (row r head r % heads of token r / heads, at token and head
+        /// strides in floats) into contiguous rows: the rotated values that kernel writes.</summary>
+        public void LaunchRopeExStrided(IntPtr input, long tokenStride, long headStride, int heads, IntPtr positions, IntPtr output, int rows,
+            int cols, int ropeDim, int mode, bool positionsAreInt32, int ctx, float freqBase, float freqScale, float extFactor, float attnFactor,
+            float betaFast, float betaSlow, IntPtr stream)
+        {
+            int ints = positionsAreInt32 ? 1 : 0, add = 0;
+            void** args = stackalloc void*[] { &input, &tokenStride, &headStride, &heads, &positions, &output, &rows, &cols, &ropeDim, &mode, &ints,
+                &ctx, &freqBase, &freqScale, &extFactor, &attnFactor, &betaFast, &betaSlow, &add };
+            long work = Math.Max((long)rows * (Math.Min(ropeDim, cols) / 2), (long)rows * cols);
+            CudaDriverApi.cuLaunchKernel(_ropeStrided, (uint)((work + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
         public void LaunchHcScatter(IntPtr streamIn, IntPtr block, IntPtr inject, IntPtr output, int rows, int n, int hc, IntPtr stream)
         {
             void** args = stackalloc void*[] { &streamIn, &block, &inject, &output, &rows, &n, &hc };
@@ -438,6 +464,15 @@ namespace TensorSharp.Cuda
 
         /// <summary>y [rows, outs] = x [rows, k] (rows <paramref name="xPitch"/> floats apart) times the F32 weight
         /// [outs, k] transposed, one block an output and eight rows; for products with few outputs and rows.</summary>
+        /// <summary>moe + shared * sigmoid(x . w) per row (GraphFusion.SharedExpertGate), the dot summed as
+        /// <see cref="LaunchSmallMatvec"/> sums it.</summary>
+        public void LaunchSharedGateAdd(IntPtr moe, IntPtr shared, IntPtr x, IntPtr w, IntPtr output, int rows, int k, long xPitch, int n, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &moe, &shared, &x, &w, &output, &rows, &k, &xPitch, &n };
+            uint threads = (uint)Math.Clamp(((k + 3) / 4 + 31) / 32 * 32, 32, 1024);
+            CudaDriverApi.cuLaunchKernel(_sharedGate, 1, (uint)((rows + 7) / 8), 1, threads, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
         public void LaunchSmallMatvec(IntPtr x, IntPtr w, IntPtr y, int rows, int k, int outs, long xPitch, IntPtr stream)
         {
             void** args = stackalloc void*[] { &x, &w, &y, &rows, &k, &outs, &xPitch };
@@ -527,10 +562,11 @@ namespace TensorSharp.Cuda
         /// x <paramref name="d"/> (attn and output contiguous), gate's heads <paramref name="gateHead"/> floats and its rows
         /// <paramref name="gateRow"/> floats apart.</summary>
         public void LaunchSigmoidGate(IntPtr attn, IntPtr gate, IntPtr output, long rows, int heads, int d, long gateRow, long gateHead,
-            IntPtr stream)
+            IntPtr stream, IntPtr outputQ81 = default)
         {
             long n = rows * heads * d;
-            void** args = stackalloc void*[] { &attn, &gate, &output, &heads, &d, &gateRow, &gateHead, &n };
+            if (outputQ81 != IntPtr.Zero && n % 32 != 0) throw new ArgumentException("a q8_1 copy needs whole 32-value blocks");
+            void** args = stackalloc void*[] { &attn, &gate, &output, &heads, &d, &gateRow, &gateHead, &n, &outputQ81 };
             CudaDriverApi.cuLaunchKernel(_sigmoidGate, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
@@ -545,10 +581,10 @@ namespace TensorSharp.Cuda
         /// <summary>GraphFusion.GatedRmsNorm over <paramref name="rows"/> rows of <paramref name="d"/> (head r % heads of token
         /// r / heads); z's tokens are <paramref name="zPitch"/> floats apart.</summary>
         public void LaunchGatedRmsNorm(IntPtr y, IntPtr z, IntPtr w, IntPtr output, int rows, int d, float eps, int heads, long zPitch,
-            IntPtr stream, bool sigmoidGate = false)
+            IntPtr stream, bool sigmoidGate = false, IntPtr outputQ81 = default)
         {
             int gate = sigmoidGate ? 1 : 0;
-            void** args = stackalloc void*[] { &y, &z, &w, &output, &d, &eps, &heads, &zPitch, &gate };
+            void** args = stackalloc void*[] { &y, &z, &w, &output, &d, &eps, &heads, &zPitch, &gate, &outputQ81 };
             CudaDriverApi.cuLaunchKernel(_gatedRmsNorm, (uint)rows, 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
     }

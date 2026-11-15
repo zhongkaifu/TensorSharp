@@ -168,6 +168,9 @@ namespace TensorSharp.Graph
         /// <summary>A gated attention output: attn * sigmoid(gate). Inputs: attn [d * heads, rows] and gate [d, heads, rows] (a
         /// view of the query projection, its heads interleaved with the queries). Result: [d * heads, rows].</summary>
         SigmoidGate = 11,
+        /// <summary>A MoE layer's output plus its shared expert gated per row: moe + shared * sigmoid(x . w). Inputs: moe and
+        /// shared [n, rows], x [n, rows] (the layer's input) and w [n] (ffn_gate_inp_shexp). Result: [n, rows].</summary>
+        SharedExpertGate = 12,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

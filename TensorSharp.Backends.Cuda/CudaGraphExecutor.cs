@@ -73,6 +73,26 @@ namespace TensorSharp.Cuda
             if (!TryGatherShortRows(dst, src)) base.CopyInto(dst, src);
         }
 
+        /// <summary>The strided rotary (ts_graph_rope_ex_strided_f32): one launch where the copy out and the rotary in place took
+        /// two, 36 ropes a Qwen3.8 Flash Next step.</summary>
+        protected override Tensor RopeStrided(Tensor x, Tensor positions, int tokens, int heads, int d, int dims, int mode, int ctx, float[] fp)
+        {
+            if (Kernels == null || x.Storage is not CudaStorage || x.ElementType != DType.Float32 || positions?.Storage is not CudaStorage
+                || positions.ElementType != DType.Int32 || !positions.IsContiguous() || positions.ElementCount() != (long)tokens * heads
+                || fp == null || fp.Length < 6)
+                return null;
+            // [.., tokens, heads, d] with d contiguous; any outer dims of size one.
+            int nd = x.DimensionCount;
+            if (nd < 1 || x.Strides[nd - 1] != 1 || x.Sizes[nd - 1] != d) return null;
+            long headStride = nd >= 2 ? x.Strides[nd - 2] : d, tokenStride = nd >= 3 ? x.Strides[nd - 3] : (long)heads * d;
+            if ((nd >= 2 ? x.Sizes[nd - 2] : 1) != heads || (nd >= 3 ? x.Sizes[nd - 3] : 1) != tokens) return null;
+            for (int i = 0; i < nd - 3; i++) if (x.Sizes[i] != 1) return null;
+            var output = new Tensor(Allocator, DType.Float32, tokens, heads, d);
+            Launch(new[] { x, positions }, output, (k, stream) => k.LaunchRopeExStrided(Ptr(x), tokenStride, headStride, heads, Ptr(positions),
+                Ptr(output), tokens * heads, d, dims, mode, true, ctx, fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], stream));
+            return output;
+        }
+
         /// <summary>An F16 / F32 copy that converts (the CUDA copy op copies one type only): the source made contiguous in
         /// its own type first where it is a strided view.</summary>
         private bool TryConvert(Tensor dst, Tensor src)
@@ -721,11 +741,27 @@ namespace TensorSharp.Cuda
             bool split = xnq != null && n % CudaGraphKernels.HcSlice == 0 && hc <= 8;
             Tensor inject = null;
             using Tensor injPart = !split && injW != null ? new Tensor(Allocator, DType.Float32, (long)rows * hc * hc) : null;
+            // The streams may be a scatter left for this read (the region takes its inputs unread): fused with the first pass.
+            DeferredScatter scatter = split && _deferredScatters.TryGetValue(x.Storage, out DeferredScatter ds) && ds.Rows == rows && ds.N == n
+                && ds.Hc == hc && x.StorageOffset == ds.Output.StorageOffset && x.ElementCount() == ds.Output.ElementCount() ? ds : null;
+            if (scatter == null) ReadNow(x);
             if (split)
             {
                 using var partials = new Tensor(Allocator, DType.Float32, (long)rows * (width / CudaGraphKernels.HcSlice) * CudaGraphKernels.HcPartialFloats);
-                Launch(injW == null ? new[] { x, gamma } : new[] { x, gamma, injW }, new[] { partials },
-                    (k, stream) => k.LaunchHcPartials(Ptr(x), Ptr(gamma), injW == null ? IntPtr.Zero : Ptr(injW), Ptr(partials), rows, n, hc, stream));
+                if (scatter != null)
+                {
+                    _deferredScatters.Remove(x.Storage);
+                    PendingWrites = _joins.Count > 0 || AnyDeferred;
+                    Tensor[] reads = injW == null ? new[] { scatter.Streams, scatter.Block, scatter.Inject, gamma }
+                        : new[] { scatter.Streams, scatter.Block, scatter.Inject, gamma, injW };
+                    Launch(reads, new[] { x, partials }, (k, stream) => k.LaunchHcPostPartials(Ptr(scatter.Streams), Ptr(scatter.Block),
+                        Ptr(scatter.Inject), Ptr(x), Ptr(gamma), injW == null ? IntPtr.Zero : Ptr(injW), Ptr(partials), rows, n, hc, stream));
+                    scatter.Dispose();
+                    HcPostPartials++;
+                }
+                else
+                    Launch(injW == null ? new[] { x, gamma } : new[] { x, gamma, injW }, new[] { partials },
+                        (k, stream) => k.LaunchHcPartials(Ptr(x), Ptr(gamma), injW == null ? IntPtr.Zero : Ptr(injW), Ptr(partials), rows, n, hc, stream));
                 inject = injW != null ? new Tensor(Allocator, DType.Float32, rows, hc) : null;
                 Launch(new[] { x, gamma, partials }, inject == null ? new[] { xn, xnq } : new[] { xn, xnq, inject },
                     (k, stream) => k.LaunchHcApply(Ptr(x), Ptr(gamma), Ptr(partials), Ptr(xn), Ptr(xnq), inject == null ? IntPtr.Zero : Ptr(inject),
@@ -828,10 +864,52 @@ namespace TensorSharp.Cuda
             int rows = (int)(streams.ElementCount() / width);
             if (block.ElementCount() != (long)rows * n || inject.ElementCount() != (long)rows * hc) return false;
             var output = new Tensor(Allocator, DType.Float32, rows, width);
-            Launch(new[] { streams, block, inject }, output, (k, stream) => k.LaunchHcScatter(Ptr(streams), Ptr(block), Ptr(inject), Ptr(output),
-                rows, n, hc, stream));
+            if (rows <= DenseDecodeRows && n % CudaGraphKernels.HcSlice == 0 && hc <= 8)
+            {
+                // Left for its reader: the next read runs it with its first pass (TryHcRead), any other read as it is.
+                _deferredScatters[output.Storage] = new DeferredScatter
+                {
+                    Streams = streams.CopyRef(), Block = block.CopyRef(), Inject = inject.CopyRef(), Output = output.CopyRef(), Rows = rows, N = n, Hc = hc,
+                };
+                PendingWrites = true;
+            }
+            else
+                Launch(new[] { streams, block, inject }, output, (k, stream) => k.LaunchHcScatter(Ptr(streams), Ptr(block), Ptr(inject), Ptr(output),
+                    rows, n, hc, stream));
             results[0] = output;
             return true;
+        }
+
+        /// <summary>
+        /// A decode-size hyper-connection scatter not yet run: its output exists, its values do not. The next read of the
+        /// streams computes them in its first pass (the Qwen3.8 engines' hc_post_partials: one launch where there were two, 96
+        /// a step of Qwen3.8 Flash Next); any other read runs the scatter as it ran before. The values are the same either way.
+        /// </summary>
+        private sealed class DeferredScatter : IDisposable
+        {
+            public Tensor Streams, Block, Inject, Output;
+            public int Rows, N, Hc;
+
+            public void Dispose()
+            {
+                Streams.Dispose();
+                Block.Dispose();
+                Inject.Dispose();
+                Output.Dispose();
+            }
+        }
+
+        private readonly Dictionary<Storage, DeferredScatter> _deferredScatters = new(ReferenceEqualityComparer.Instance);
+
+        private bool AnyDeferred => _deferredNorms.Count > 0 || _deferredScatters.Count > 0;
+
+        private void FinishScatter(DeferredScatter d)
+        {
+            _deferredScatters.Remove(d.Output.Storage);
+            PendingWrites = _joins.Count > 0 || AnyDeferred;
+            Launch(new[] { d.Streams, d.Block, d.Inject }, d.Output, (k, stream) => k.LaunchHcScatter(Ptr(d.Streams), Ptr(d.Block), Ptr(d.Inject),
+                Ptr(d.Output), d.Rows, d.N, d.Hc, stream));
+            d.Dispose();
         }
 
         private static bool DeviceInts(Tensor t) => t != null && t.Storage is CudaStorage && t.ElementType == DType.Int32 && t.IsContiguous();
@@ -923,7 +1001,7 @@ namespace TensorSharp.Cuda
         protected override bool Fuses(GraphFusion kind) => kind switch
         {
             GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.HcRead or GraphFusion.HcScatter
-                or GraphFusion.MoeSelect or GraphFusion.SigmoidGate => Kernels != null,
+                or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             _ => false,
         };
@@ -933,6 +1011,7 @@ namespace TensorSharp.Cuda
         protected override bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
         {
             if (kind == GraphFusion.SigmoidGate) return TrySigmoidGate(inputs, results);
+            if (kind == GraphFusion.SharedExpertGate) return TrySharedExpertGate(inputs, weights, results);
             if (kind == GraphFusion.RoutedExperts) return TryRoutedExperts(inputs, weights, ip, results);
             if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs, weights, ip, results);
             if (kind == GraphFusion.HcRead) return TryHcRead(inputs, weights, ip, fp, results);
@@ -987,8 +1066,15 @@ namespace TensorSharp.Cuda
                         return false;
                     results[0] = new Tensor(Allocator, DType.Float32, y.Sizes);
                     int rows = (int)(y.ElementCount() / d);
-                    Launch(inputs, results, (k, stream) => k.LaunchGatedRmsNorm(Ptr(inputs[0]), Ptr(inputs[1]), Ptr(inputs[2]), Ptr(results[0]),
-                        rows, d, eps, heads, zPitch, stream, sigmoidGate));
+                    // A decode-size norm also writes the q8_1 copy its out-projection reads (a token's heads * d values), as the
+                    // hyper-connection read does: the product had quantized it in a pass of its own, 36 a Qwen3.8 Flash Next step.
+                    long tokens = rows / heads, inDim = (long)heads * d;
+                    Tensor q = tokens <= DenseDecodeRows && rows % heads == 0 && inDim % 32 == 0 && CudaQuantizedOps.Q81WarpQuantizeEnabled
+                        ? Q81Rows(tokens, inDim) : null;
+                    Tensor[] writes = q == null ? results : new[] { results[0], q };
+                    Launch(inputs, writes, (k, stream) => k.LaunchGatedRmsNorm(Ptr(inputs[0]), Ptr(inputs[1]), Ptr(inputs[2]), Ptr(results[0]),
+                        rows, d, eps, heads, zPitch, stream, sigmoidGate, q == null ? IntPtr.Zero : Ptr(q)));
+                    if (q != null) KeepQuantized(results[0], inDim, tokens, q);
                     return true;
                 }
                 default:
@@ -1076,7 +1162,10 @@ namespace TensorSharp.Cuda
 
         protected override bool ProductsFinishDeferredRows => true;
 
-        protected override bool RegionFinishesDeferredInputs(GraphFusion kind) => kind == GraphFusion.SwigluFfn;
+        protected override bool RegionFinishesDeferredInputs(GraphFusion kind) => kind is GraphFusion.SwigluFfn or GraphFusion.HcRead;
+
+        /// <summary>Scatters run with the next read's first pass (tests check the fusion engaged).</summary>
+        internal long HcPostPartials { get; private set; }
 
         /// <summary>The deferred norm whose sum or normed rows <paramref name="t"/> lives in, else null.</summary>
         private DeferredNorm DeferredOf(Tensor t) => _deferredBy.TryGetValue(t.Storage, out DeferredNorm d) ? d : null;
@@ -1108,7 +1197,7 @@ namespace TensorSharp.Cuda
                     Ptr(d.Normed), d.Rows, d.Cols, d.Eps, stream));
             }
             Forget(d);
-            PendingWrites = _joins.Count > 0 || _deferredNorms.Count > 0;
+            PendingWrites = _joins.Count > 0 || AnyDeferred;
         }
 
         /// <summary>Finishes what was left for later in <paramref name="t"/> (a deferred norm, a doorbell or branch join) before
@@ -1217,11 +1306,43 @@ namespace TensorSharp.Cuda
                 rows *= gate.Sizes[dim];
             }
             results[0] = new Tensor(Allocator, DType.Float32, attn.Sizes);
-            Launch(inputs, results, (k, stream) => k.LaunchSigmoidGate(Ptr(attn), Ptr(gate), Ptr(results[0]), rows, heads, d, gateRow,
-                gateHead, stream));
+            // A decode-size output also writes its out-projection's q8_1 copy (12 quantize passes a Qwen3.8 Flash Next step).
+            long inDim = (long)heads * d;
+            Tensor q = rows <= DenseDecodeRows && inDim % 32 == 0 && CudaQuantizedOps.Q81WarpQuantizeEnabled ? Q81Rows(rows, inDim) : null;
+            Tensor[] writes = q == null ? results : new[] { results[0], q };
+            Launch(inputs, writes, (k, stream) => k.LaunchSigmoidGate(Ptr(attn), Ptr(gate), Ptr(results[0]), rows, heads, d, gateRow,
+                gateHead, stream, q == null ? IntPtr.Zero : Ptr(q)));
+            if (q != null) KeepQuantized(results[0], inDim, rows, q);
             SigmoidGateRegions++;
             return true;
         }
+
+        /// <summary>
+        /// A MoE layer's output plus its gated shared expert (<see cref="GraphFusion.SharedExpertGate"/>) in one launch where its
+        /// ops took four (the gate's product, its sigmoid, the scale and the add; the direct engines' shared_gate), at the widths
+        /// whose gate product runs on the small matvec (<see cref="DenseProduct"/>), whose sums the kernel repeats: the same
+        /// values, bit for bit. 144 launches a Qwen3.8 Flash Next step.
+        /// </summary>
+        private bool TrySharedExpertGate(Tensor[] inputs, IGraphWeight[] weights, Tensor[] results)
+        {
+            if (Kernels == null || inputs.Length < 4 || results.Length < 1 || weights[3] != null) return false;
+            Tensor moe = inputs[0], shared = inputs[1], x = inputs[2], w = inputs[3];
+            if (!AllF32OnDevice(moe, shared, x, w) || !moe.IsContiguous() || !shared.IsContiguous() || !x.IsContiguous() || !w.IsContiguous())
+                return false;
+            long n = w.ElementCount(), rows = n == 0 ? 0 : x.ElementCount() / n;
+            if (n == 0 || n > int.MaxValue || x.ElementCount() != rows * n || moe.ElementCount() != rows * n || shared.ElementCount() != rows * n
+                || rows < 1 || rows > SmallProductMaxRows)
+                return false;
+            var output = new Tensor(Allocator, DType.Float32, moe.Sizes);
+            Launch(new[] { moe, shared, x, w }, output, (k, stream) => k.LaunchSharedGateAdd(Ptr(moe), Ptr(shared), Ptr(x), Ptr(w), Ptr(output),
+                (int)rows, (int)n, n, (int)n, stream));
+            results[0] = output;
+            SharedGateRegions++;
+            return true;
+        }
+
+        /// <summary>Gated shared experts run as <see cref="TrySharedExpertGate"/> (tests check the region engaged).</summary>
+        internal long SharedGateRegions { get; private set; }
 
         /// <summary>Gated attention outputs run as <see cref="TrySigmoidGate"/> (tests check the region engaged).</summary>
         internal long SigmoidGateRegions { get; private set; }
@@ -2168,19 +2289,21 @@ namespace TensorSharp.Cuda
                 if (!ReferenceEquals(_joins[i].Storage, storage)) continue;
                 Action finish = _joins[i].Finish;
                 _joins.RemoveAt(i);
-                PendingWrites = _joins.Count > 0 || _deferredNorms.Count > 0;
+                PendingWrites = _joins.Count > 0 || AnyDeferred;
                 finish();
                 return;
             }
             if (_deferredNorms.Count > 0 && DeferredOf(t) is { } d)
                 FinishDeferred(d, t);
+            else if (_deferredScatters.Count > 0 && _deferredScatters.TryGetValue(t.Storage, out DeferredScatter ds))
+                FinishScatter(ds);
         }
 
         /// <summary>The doorbell sums join; deferred norms stay deferred (an output that reads one finishes it).</summary>
         protected override void FinishWrites()
         {
             FinishJoins();
-            PendingWrites = _deferredNorms.Count > 0;
+            PendingWrites = AnyDeferred;
         }
 
         protected override void EndRun()
@@ -2188,6 +2311,9 @@ namespace TensorSharp.Cuda
             foreach (DeferredNorm d in _deferredNorms) d.Dispose();
             _deferredNorms.Clear();
             _deferredBy.Clear();
+            // A scatter nothing read (the step's last streams, unread): nothing needs it.
+            foreach (DeferredScatter d in _deferredScatters.Values) d.Dispose();
+            _deferredScatters.Clear();
             PendingWrites = _joins.Count > 0;
         }
 
@@ -2197,11 +2323,11 @@ namespace TensorSharp.Cuda
             {
                 Action finish = _joins[0].Finish;
                 _joins.RemoveAt(0);
-                PendingWrites = _joins.Count > 0 || _deferredNorms.Count > 0;
+                PendingWrites = _joins.Count > 0 || AnyDeferred;
                 finish();
             }
             _pendingJoin?.Invoke();
-            PendingWrites = _deferredNorms.Count > 0;
+            PendingWrites = AnyDeferred;
         }
 
         /// <summary>The device tables of a stack of offloaded experts: tier members (resident on this device) by their
@@ -2844,7 +2970,7 @@ namespace TensorSharp.Cuda
             _pendingJoin = join;
             foreach (Tensor r in results)
                 if (r?.Storage is CudaStorage storage) _joins.Add((storage, join));
-            PendingWrites = _joins.Count > 0 || _deferredNorms.Count > 0;
+            PendingWrites = _joins.Count > 0 || AnyDeferred;
             if (_joins.Count == 0) join();
         }
 

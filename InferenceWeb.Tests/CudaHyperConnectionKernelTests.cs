@@ -280,4 +280,163 @@ public sealed class CudaHyperConnectionKernelTests
             }
         }
     }
+
+    /// <summary>A scatter fused with the next read's first pass (ts_graph_hc_post_partials) writes the streams and the
+    /// partials the scatter and the first pass write apart, bit for bit.</summary>
+    [CudaTheory]
+    [InlineData(4, 4, 2560, true)]
+    [InlineData(1, 4, 256, false)]
+    [InlineData(8, 8, 512, true)]
+    public void ScatterWithTheNextFirstPassMatchesThemApart(int rows, int hc, int n, bool withInjection)
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels kernels, out string reason), reason);
+        using (kernels)
+        {
+            var rng = new Random(91 + rows);
+            float[] R(int count, double scale) => Enumerable.Range(0, count).Select(_ => (float)((rng.NextDouble() * 2 - 1) * scale)).ToArray();
+            int width = hc * n, slices = width / CudaGraphKernels.HcSlice;
+            using var streams = Tensor.FromArray(allocator, R(rows * width, 3));
+            using var block = Tensor.FromArray(allocator, R(rows * n, 2));
+            using var inject = Tensor.FromArray(allocator, R(rows * hc, 4));
+            using var gamma = Tensor.FromArray(allocator, R(width, 1.5));
+            using var injW = Tensor.FromArray(allocator, R(hc * width, 0.05));
+            using var apart = new Tensor(allocator, DType.Float32, rows * width);
+            using var fused = new Tensor(allocator, DType.Float32, rows * width);
+            using var partialsApart = new Tensor(allocator, DType.Float32, rows * slices * CudaGraphKernels.HcPartialFloats);
+            using var partialsFused = new Tensor(allocator, DType.Float32, rows * slices * CudaGraphKernels.HcPartialFloats);
+            Upload(streams, block, inject, gamma, injW, apart, fused, partialsApart, partialsFused);
+            IntPtr stream = allocator.Stream.Handle, w = withInjection ? P(injW) : IntPtr.Zero;
+            kernels.LaunchHcScatter(P(streams), P(block), P(inject), P(apart), rows, n, hc, stream);
+            kernels.LaunchHcPartials(P(apart), P(gamma), w, P(partialsApart), rows, n, hc, stream);
+            kernels.LaunchHcPostPartials(P(streams), P(block), P(inject), P(fused), P(gamma), w, P(partialsFused), rows, n, hc, stream);
+            allocator.Stream.Synchronize();
+            Written(apart, fused, partialsApart, partialsFused);
+            Assert.Equal(apart.GetElementsAsFloat(rows * width), fused.GetElementsAsFloat(rows * width));
+            int count = rows * slices * CudaGraphKernels.HcPartialFloats;
+            Assert.Equal(partialsApart.GetElementsAsFloat(count), partialsFused.GetElementsAsFloat(count));
+        }
+    }
+
+    /// <summary>The gated norm's and the sigmoid gate's q8_1 copies (written beside their values for the out-projection) are
+    /// the row quantizer's bytes, and the values are those the kernels write without them.</summary>
+    [CudaTheory]
+    [InlineData(1, 32, 128)]
+    [InlineData(4, 32, 128)]
+    [InlineData(8, 16, 256)]
+    public void NormAndGateQuantizedCopiesAreTheQuantizers(int tokens, int heads, int d)
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels kernels, out string reason), reason);
+        using (kernels)
+        {
+            var rng = new Random(17 + tokens);
+            float[] R(int count, double scale) => Enumerable.Range(0, count).Select(_ => (float)((rng.NextDouble() * 2 - 1) * scale)).ToArray();
+            int n = tokens * heads * d, blocks = n / 32 * CudaKernels.Q81BlockBytes;
+            using var y = Tensor.FromArray(allocator, R(n, 2));
+            using var z = Tensor.FromArray(allocator, R(n, 3));
+            using var w = Tensor.FromArray(allocator, R(d, 1));
+            using var plain = new Tensor(allocator, DType.Float32, n);
+            using var withQ = new Tensor(allocator, DType.Float32, n);
+            using var q = new Tensor(allocator, DType.UInt8, blocks);
+            using var reference = new Tensor(allocator, DType.UInt8, blocks);
+            Upload(y, z, w, plain, withQ, q, reference);
+            IntPtr stream = allocator.Stream.Handle;
+            void Check(string what)
+            {
+                CudaQuantizedOps.QuantizeRowsQ81(allocator, P(withQ), P(reference), heads * d, tokens);
+                allocator.Stream.Synchronize();
+                Written(plain, withQ, q, reference);
+                Assert.Equal(plain.GetElementsAsFloat(n), withQ.GetElementsAsFloat(n));
+                byte[] a = new byte[blocks], b = new byte[blocks];
+                q.CopyToArray(a);
+                reference.CopyToArray(b);
+                Assert.True(a.AsSpan().SequenceEqual(b), $"{what}: the q8_1 copy differs from the row quantizer's");
+            }
+            kernels.LaunchGatedRmsNorm(P(y), P(z), P(w), P(plain), tokens * heads, d, 1e-6f, heads, (long)heads * d, stream);
+            kernels.LaunchGatedRmsNorm(P(y), P(z), P(w), P(withQ), tokens * heads, d, 1e-6f, heads, (long)heads * d, stream, outputQ81: P(q));
+            Check("gated norm");
+            kernels.LaunchSigmoidGate(P(y), P(z), P(plain), tokens, heads, d, (long)heads * d, d, stream);
+            kernels.LaunchSigmoidGate(P(y), P(z), P(withQ), tokens, heads, d, (long)heads * d, d, stream, P(q));
+            Check("sigmoid gate");
+        }
+    }
+
+    /// <summary>The strided rotary (a fused projection's q block read where it lies) writes the rows ts_rope_ex_f32 writes over
+    /// a contiguous copy, bit for bit: NeoX and normal pairs, a partial rotary dimension.</summary>
+    [CudaTheory]
+    [InlineData(1, 16, 256, 256, 2)]
+    [InlineData(4, 16, 256, 64, 2)]
+    [InlineData(4, 2, 128, 128, 0)]
+    public void StridedRopeMatchesTheContiguousOne(int tokens, int heads, int d, int ropeDim, int mode)
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels kernels, out string reason), reason);
+        using (kernels)
+        {
+            var rng = new Random(5 + tokens * heads);
+            int pitch = 2 * heads * d, rows = tokens * heads;   // q | gate per token
+            float[] packed = Enumerable.Range(0, tokens * pitch).Select(_ => (float)(rng.NextDouble() * 4 - 2)).ToArray();
+            var contiguous = new float[rows * d];
+            for (int t = 0; t < tokens; t++)
+                for (int h = 0; h < heads; h++)
+                    Array.Copy(packed, t * pitch + h * d, contiguous, (t * heads + h) * d, d);
+            int[] pos = Enumerable.Range(0, rows).Select(r => 100 + r / heads * 7).ToArray();
+            using var src = Tensor.FromArray(allocator, packed);
+            using var flat = Tensor.FromArray(allocator, contiguous);
+            using var positions = Tensor.FromArray(allocator, pos);
+            using var expected = new Tensor(allocator, DType.Float32, rows * d);
+            using var got = new Tensor(allocator, DType.Float32, rows * d);
+            Upload(src, flat, positions, expected, got);
+            IntPtr stream = allocator.Stream.Handle;
+            allocator.Kernels.LaunchRoPEExF32(P(flat), P(positions), P(expected), rows, d, ropeDim, mode, 1, 32768, 1e7f, 1f, 0f, 1f, 32f, 1f, 0, stream);
+            kernels.LaunchRopeExStrided(P(src), pitch, d, heads, P(positions), P(got), rows, d, ropeDim, mode, true, 32768, 1e7f, 1f, 0f, 1f, 32f, 1f, stream);
+            allocator.Stream.Synchronize();
+            Written(expected, got);
+            Assert.Equal(expected.GetElementsAsFloat(rows * d), got.GetElementsAsFloat(rows * d));
+        }
+    }
+
+    /// <summary>The fused shared-expert gate writes moe + shared * sigmoid(x . w) as the four separate launches it replaces
+    /// write it (the small matvec, the sigmoid, the broadcast product, the add), bit for bit.</summary>
+    [CudaTheory]
+    [InlineData(1, 2048)]
+    [InlineData(4, 4096)]
+    [InlineData(13, 1024)]
+    public void SharedExpertGateMatchesItsOps(int rows, int n)
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels kernels, out string reason), reason);
+        using (kernels)
+        {
+            var rng = new Random(29 + rows);
+            float[] R(int count, double scale) => Enumerable.Range(0, count).Select(_ => (float)((rng.NextDouble() * 2 - 1) * scale)).ToArray();
+            using var moe = Tensor.FromArray(allocator, R(rows * n, 2));
+            using var shared = Tensor.FromArray(allocator, R(rows * n, 2));
+            using var x = Tensor.FromArray(allocator, R(rows * n, 1));
+            using var w = Tensor.FromArray(allocator, R(n, 0.05));
+            using var g = new Tensor(allocator, DType.Float32, rows, 1);
+            using var fused = new Tensor(allocator, DType.Float32, rows * n);
+            Upload(moe, shared, x, w, g, fused);
+            IntPtr stream = allocator.Stream.Handle;
+            kernels.LaunchSmallMatvec(P(x), P(w), P(g), rows, n, 1, n, stream);
+            kernels.LaunchSharedGateAdd(P(moe), P(shared), P(x), P(w), P(fused), rows, n, n, n, stream);
+            allocator.Stream.Synchronize();
+            Written(g, fused);
+            using Tensor s = Ops.Sigmoid(null, g);
+            using var scaled = new Tensor(allocator, DType.Float32, rows, n);
+            Upload(scaled);
+            using (Tensor sh = shared.View(rows, n))
+                kernels.LaunchBinaryBroadcast(P(sh), P(s), P(scaled), new long[] { n, rows, 1, 1 }, new long[] { 1, rows, 1, 1 }, 2, stream);
+            allocator.Stream.Synchronize();
+            Written(scaled);
+            using Tensor m2 = moe.View(rows, n);
+            using Tensor sum = Ops.Add(null, m2, scaled);
+            Assert.Equal(sum.GetElementsAsFloat(rows * n), fused.GetElementsAsFloat(rows * n));
+        }
+    }
 }

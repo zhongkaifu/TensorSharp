@@ -11,8 +11,9 @@
 
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 23
+#define TS_GRAPH_KERNELS_VERSION 24
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -946,13 +947,11 @@ extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, con
 
 // Pass 1, per (row, slice): the slice's sum of squares and, with injW, sum_j x_j * gamma_j * injW[o][j] for each output o,
 // into partials [rows][slices][9].
-extern "C" __global__ void ts_graph_hc_partials_f32(const float* __restrict__ x, const float* __restrict__ gamma,
-    const float* __restrict__ injW, float* __restrict__ partials, int n, int hc)
+// A slice's partials of the value v each thread holds (pass 1's arithmetic, shared by the kernels that compute v).
+__device__ __forceinline__ void ts_graph_hc_partials_of(const float v, const float* __restrict__ gamma,
+    const float* __restrict__ injW, float* __restrict__ partials, const int j, const int width, const int hc, const int slice,
+    const int r, float (*sh)[8])
 {
-    __shared__ float sh[TS_GRAPH_HC_PARTIAL][8];
-    const int slice = blockIdx.x, r = blockIdx.y, width = hc * n;
-    const int j = slice * TS_GRAPH_HC_SLICE + threadIdx.x;
-    const float v = x[(size_t)r * width + j];
     float part[TS_GRAPH_HC_PARTIAL];
     part[0] = v * v;
     const float vg = injW != nullptr ? v * gamma[j] : 0.f;
@@ -974,6 +973,32 @@ extern "C" __global__ void ts_graph_hc_partials_f32(const float* __restrict__ x,
             t += sh[threadIdx.x][w];
         partials[((size_t)r * gridDim.x + slice) * TS_GRAPH_HC_PARTIAL + threadIdx.x] = t;
     }
+}
+
+extern "C" __global__ void ts_graph_hc_partials_f32(const float* __restrict__ x, const float* __restrict__ gamma,
+    const float* __restrict__ injW, float* __restrict__ partials, int n, int hc)
+{
+    __shared__ float sh[TS_GRAPH_HC_PARTIAL][8];
+    const int slice = blockIdx.x, r = blockIdx.y, width = hc * n;
+    const int j = slice * TS_GRAPH_HC_SLICE + threadIdx.x;
+    ts_graph_hc_partials_of(x[(size_t)r * width + j], gamma, injW, partials, j, width, hc, slice, r, sh);
+}
+
+// A block's scatter (ts_graph_hc_scatter_f32's arithmetic, into out) fused with the next read's pass 1 over the scattered
+// streams (the Qwen3.8 engines' hc_post_partials): a decode step's two halves of a layer meet in one launch instead of two.
+// grid (hc * n / 256, rows), 256 threads.
+extern "C" __global__ void ts_graph_hc_post_partials_f32(const float* __restrict__ stream, const float* __restrict__ block,
+    const float* __restrict__ inject, float* __restrict__ out, const float* __restrict__ gamma, const float* __restrict__ injW,
+    float* __restrict__ partials, int n, int hc)
+{
+    __shared__ float sh[TS_GRAPH_HC_PARTIAL][8];
+    const int slice = blockIdx.x, r = blockIdx.y, width = hc * n;
+    const int j = slice * TS_GRAPH_HC_SLICE + threadIdx.x;
+    const int c = j / n, i = j - c * n;
+    const float w = 2.f * (1.f / (1.f + expf(-inject[r * hc + c] * (1.f / hc))));
+    const float v = stream[(size_t)r * width + j] + block[(size_t)r * n + i] * w;
+    out[(size_t)r * width + j] = v;
+    ts_graph_hc_partials_of(v, gamma, injW, partials, j, width, hc, slice, r, sh);
 }
 
 // Pass 2: y = x * rsqrt(mean of its stream's squares + eps) * gamma (and yq, its q8_1 copy, when not null); with inject (not
@@ -1675,10 +1700,11 @@ extern "C" __global__ void ts_graph_deltanet_prep_tiled_f32(
 
 // GraphFusion.SigmoidGate: out = attn * sigmoid(gate) over [rows, heads * d] (attn and out contiguous), gate read at its row
 // and head strides where the query projection put it (its heads interleaved with the queries, rows a packed projection's
-// pitch apart): the per-op path's sigmoid (ts_unary_f32) and product (ts_binary_f32) expressions, in one pass. Launch:
-// grid ceil(n / 256), block 256.
+// pitch apart): the per-op path's sigmoid (ts_unary_f32) and product (ts_binary_f32) expressions, in one pass. With outq
+// (not null; n % 32 == 0, so a warp's 32 values are one block) also out's q8_1 copy. Launch: grid ceil(n / 256), block 256.
 extern "C" __global__ void ts_graph_sigmoid_gate_f32(const float* __restrict__ attn, const float* __restrict__ gate,
-    float* __restrict__ out, int heads, int d, long long gate_row, long long gate_head, long long n)
+    float* __restrict__ out, int heads, int d, long long gate_row, long long gate_head, long long n,
+    ts_graph_block_q8_1* __restrict__ outq)
 {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n)
@@ -1686,7 +1712,10 @@ extern "C" __global__ void ts_graph_sigmoid_gate_f32(const float* __restrict__ a
     const long long width = (long long)heads * d, r = i / width, rem = i - r * width;
     const long long h = rem / d, e = rem - h * d;
     const float g = gate[r * gate_row + h * gate_head + e];
-    out[i] = attn[i] * (1.0f / (1.0f + expf(-g)));
+    const float o = attn[i] * (1.0f / (1.0f + expf(-g)));
+    out[i] = o;
+    if (outq != nullptr)
+        ts_graph_quantize_q8_1(o, outq + i / 32, (int)(i & 31));
 }
 
 // The residual add and the next block's input norm in one pass: sum = a + b, normed = sum * rsqrt(mean(sum^2) + eps) * w
@@ -1724,9 +1753,11 @@ extern "C" __global__ void ts_graph_add_rms_norm_f32(const float* __restrict__ a
 
 // GraphFusion.GatedRmsNorm: out = y * rsqrt(mean(y^2) + eps) * w * silu(z) (sigmoid(z) with sigmoid_gate) over rows of
 // d. Row r of y and out is head r % heads of token r / heads; z holds a token's heads * d values z_pitch floats after the
-// previous token's (a view of a packed projection is read in place). Launch: grid rows, block d (d % 32 == 0, <= 1024).
+// previous token's (a view of a packed projection is read in place). With outq (not null) also out's q8_1 copy for the
+// product that reads it (the quantizer's bytes). Launch: grid rows, block d (d % 32 == 0, <= 1024).
 extern "C" __global__ void ts_graph_gated_rms_norm_f32(const float* __restrict__ y, const float* __restrict__ z,
-    const float* __restrict__ w, float* __restrict__ out, int d, float eps, int heads, long long z_pitch, int sigmoid_gate)
+    const float* __restrict__ w, float* __restrict__ out, int d, float eps, int heads, long long z_pitch, int sigmoid_gate,
+    ts_graph_block_q8_1* __restrict__ outq)
 {
     __shared__ float partial[32];
     const int i = threadIdx.x;
@@ -1739,5 +1770,213 @@ extern "C" __global__ void ts_graph_gated_rms_norm_f32(const float* __restrict__
     for (int s = 0; s < d / 32; s++) total += partial[s];
     const float zz = z[(r / heads) * z_pitch + (r % heads) * d + i];
     const float gate = sigmoid_gate ? 1.0f / (1.0f + expf(-zz)) : zz / (1.0f + expf(-zz));
-    out[r * d + i] = v * rsqrtf(total / d + eps) * w[i] * gate;
+    const float o = v * rsqrtf(total / d + eps) * w[i] * gate;
+    out[r * d + i] = o;
+    if (outq != nullptr)
+        ts_graph_quantize_q8_1(o, outq + (r * d + i) / 32, i & 31);
+}
+
+// ts_rope_ex_f32 (tensorsharp_kernels.cu) over a strided source: row r is head r % heads of token r / heads, its values
+// contiguous at input + token * token_stride + head * head_stride (a fused projection's q or k block read where it lies);
+// the output is contiguous rows. The same expressions as ts_rope_ex_f32 and its YaRN helpers (copied), so a rotated value
+// is that kernel's to the bit. Launch: as ts_rope_ex_f32.
+__device__ __forceinline__ float ts_graph_yarn_corr_dim(int n_dims, int n_ctx_orig, float n_rot, float freq_base)
+{
+    return (float)n_dims * logf((float)n_ctx_orig / (n_rot * 2.0f * 3.14159265358979323846f)) / (2.0f * logf(freq_base));
+}
+
+__device__ __forceinline__ void ts_graph_yarn_corr_dims(int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, float* low, float* high)
+{
+    if (beta_fast == 0.0f && beta_slow == 0.0f)
+    {
+        *low = FLT_MAX;
+        *high = (float)(n_dims / 2 - 1);
+    }
+    else
+    {
+        *low = fmaxf(0.0f, floorf(ts_graph_yarn_corr_dim(n_dims, n_ctx_orig, beta_fast, freq_base)));
+        *high = fminf((float)(n_dims / 2 - 1), ceilf(ts_graph_yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, freq_base)));
+    }
+}
+
+__device__ __forceinline__ void ts_graph_yarn_rope(float theta_extrap, float freq_scale, float corr_low, float corr_high, int i0, float ext_factor, float mscale, float* c, float* s)
+{
+    float theta_interp = freq_scale * theta_extrap;
+    float ramp_y = ((float)i0 - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+    float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, ramp_y))) * ext_factor;
+    float theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+    *c = cosf(theta) * mscale;
+    *s = sinf(theta) * mscale;
+}
+
+extern "C" __global__ void ts_graph_rope_ex_strided_f32(
+    const float* input,
+    long long token_stride,
+    long long head_stride,
+    int heads,
+    const void* positions,
+    float* output,
+    int rows,
+    int cols,
+    int rope_dim,
+    int mode,
+    int positions_are_int32,
+    int n_ctx_orig,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow,
+    int add_to_result)
+{
+    int active_dim = rope_dim < cols ? rope_dim : cols;
+    int pair_count = active_dim / 2;
+    int global = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair_count <= 0)
+    {
+        int total = rows * cols;
+        if (global < total && !add_to_result)
+            output[global] = input[(long long)((global / cols) / heads) * token_stride + (long long)((global / cols) % heads) * head_stride + global % cols];
+        return;
+    }
+
+    if (!add_to_result && global < rows * cols)
+    {
+        int col = global % cols;
+        if (col >= pair_count * 2)
+            output[global] = input[(long long)((global / cols) / heads) * token_stride + (long long)((global / cols) % heads) * head_stride + global % cols];
+    }
+
+    int idx = global;
+    int total = rows * pair_count;
+    if (idx >= total)
+        return;
+
+    const int GGML_ROPE_TYPE_NEOX = 2;
+    bool neox = (mode & GGML_ROPE_TYPE_NEOX) != 0;
+    int row = idx / pair_count;
+    int i = idx - row * pair_count;
+    int pos = positions_are_int32
+        ? reinterpret_cast<const int*>(positions)[row]
+        : (int)reinterpret_cast<const float*>(positions)[row];
+
+    float theta_extrap = (float)pos * powf(freq_base, -2.0f * (float)i / (float)active_dim);
+    float c;
+    float s;
+    if (ext_factor != 0.0f)
+    {
+        float corr_low;
+        float corr_high;
+        ts_graph_yarn_corr_dims(active_dim, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr_low, &corr_high);
+        float mscale = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+        ts_graph_yarn_rope(theta_extrap, freq_scale, corr_low, corr_high, i, ext_factor, mscale, &c, &s);
+    }
+    else
+    {
+        float angle = theta_extrap * freq_scale;
+        c = cosf(angle);
+        s = sinf(angle);
+    }
+
+    const float* src = input + (long long)(row / heads) * token_stride + (long long)(row % heads) * head_stride;
+    float* dst = output + (size_t)row * cols;
+
+    int left_index;
+    int right_index;
+    if (neox)
+    {
+        left_index = i;
+        right_index = i + pair_count;
+    }
+    else
+    {
+        left_index = i * 2;
+        right_index = i * 2 + 1;
+    }
+
+    float left = src[left_index];
+    float right = src[right_index];
+    float out_left = left * c - right * s;
+    float out_right = right * c + left * s;
+    if (add_to_result)
+    {
+        dst[left_index] += out_left;
+        dst[right_index] += out_right;
+    }
+    else
+    {
+        dst[left_index] = out_left;
+        dst[right_index] = out_right;
+    }
+}
+
+// GraphFusion.SharedExpertGate: out[r] = moe[r] + shared[r] * sigmoid(x[r] . w), the four launches it replaces in the same
+// arithmetic: the gate's dot as ts_graph_small_matvec_f32 sums it (one output, up to 8 rows a block, the same threads and
+// order), the per-op path's sigmoid expression, then the scale and the add each rounded on its own (as the separate
+// broadcast product and add round them). Launch: grid (1, ceil(rows / 8)), block ts_graph_small_matvec_f32's for k.
+extern "C" __global__ void ts_graph_shared_gate_add_f32(const float* __restrict__ moe, const float* __restrict__ shared,
+    const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out, int rows, int k, long long xPitch, int n)
+{
+    __shared__ float part[32][8];
+    __shared__ float gate[8];
+    const int r0 = blockIdx.y * 8;
+    const int nr = min(8, rows - r0);
+    const float* wr = w;
+    const float* xr = x + (size_t)r0 * xPitch;
+    float acc[8];
+#pragma unroll
+    for (int r = 0; r < 8; r++)
+        acc[r] = 0.f;
+    const bool vec = (k & 3) == 0 && (xPitch & 3) == 0 && ((size_t)wr & 15) == 0 && ((size_t)xr & 15) == 0;
+    if (vec)
+    {
+        const float4* w4 = reinterpret_cast<const float4*>(wr);
+        for (int i = threadIdx.x; i < (k >> 2); i += blockDim.x)
+        {
+            const float4 a = w4[i];
+#pragma unroll
+            for (int r = 0; r < 8; r++)
+                if (r < nr)
+                {
+                    const float4 b = reinterpret_cast<const float4*>(xr + (size_t)r * xPitch)[i];
+                    acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+                }
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < k; i += blockDim.x)
+        {
+            const float a = wr[i];
+#pragma unroll
+            for (int r = 0; r < 8; r++)
+                if (r < nr)
+                    acc[r] += a * xr[(size_t)r * xPitch + i];
+        }
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+#pragma unroll
+    for (int r = 0; r < 8; r++)
+    {
+        const float v = ts_graph_warp_sum(acc[r]);
+        if (lane == 0)
+            part[warp][r] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nr)
+    {
+        float t = 0.f;
+        for (int i = 0; i < warps; i++)
+            t += part[i][threadIdx.x];
+        gate[threadIdx.x] = 1.0f / (1.0f + expf(-t));
+    }
+    __syncthreads();
+    for (int r = 0; r < nr; r++)
+    {
+        const float s = gate[r];
+        const size_t base = (size_t)(r0 + r) * n;
+        for (int j = threadIdx.x; j < n; j += blockDim.x)
+            out[base + j] = __fadd_rn(moe[base + j], __fmul_rn(shared[base + j], s));
+    }
 }

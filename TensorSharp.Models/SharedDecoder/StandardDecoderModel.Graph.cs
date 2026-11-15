@@ -2126,10 +2126,17 @@ namespace TensorSharp.Models
             {
                 if (_weights.ContainsKey(p + "ffn_gate_inp_shexp.weight"))
                 {
-                    int g = step.Op(GraphOp.MulMat, step.WeightAs(p + "ffn_gate_inp_shexp.weight", hidden, 1), x);   // [1, rows]
+                    // One region a backend may run as one kernel (the direct engines' shared_gate): four launches a layer
+                    // otherwise (the gate's product, its sigmoid, the scale and the add).
+                    int w = step.WeightAs(p + "ffn_gate_inp_shexp.weight", hidden, 1);
+                    step.BeginFused(GraphFusion.SharedExpertGate, stackalloc[] { output, shared, x, w });
+                    int g = step.Op(GraphOp.MulMat, w, x);   // [1, rows]
                     shared = step.Op(GraphOp.Mul, shared, step.Op(GraphOp.Sigmoid, g));
+                    output = step.Op(GraphOp.Add, output, shared);
+                    step.EndFused(stackalloc[] { output });
                 }
-                output = step.Op(GraphOp.Add, output, shared);
+                else
+                    output = step.Op(GraphOp.Add, output, shared);
             }
             return output;
         }
