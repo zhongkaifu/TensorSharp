@@ -95,6 +95,11 @@ namespace TensorSharp.Graph
 
         /// <summary>The host bytes at <paramref name="data"/> changed (or are being freed): drop device copies.</summary>
         void Invalidate(IntPtr data);
+
+        /// <summary>A weight the model reads only through its products (an untied LM head, never gathered by rows), by its
+        /// cache key: the executor may keep it in a layout only its own products read. False where it keeps the weight as it
+        /// is.</summary>
+        bool KeepForProductsOnly(IntPtr weightKey) => false;
     }
 
     /// <summary>A compiled program. Outputs are the plan's arrays, rewritten by each run.</summary>

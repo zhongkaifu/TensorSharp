@@ -20,9 +20,11 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 18;
+        public const int CurrentVersion = 19;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm, _repackQ6kTiled;
+        private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
+        private readonly int[] _smemQ6kTiled = new int[4];
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
@@ -60,6 +62,68 @@ namespace TensorSharp.Cuda
             _deltaNetPrep = module.GetFunction("ts_graph_deltanet_prep_f32");
             _gatedRmsNorm = module.GetFunction("ts_graph_gated_rms_norm_f32");
             _addRmsNorm = module.GetFunction("ts_graph_add_rms_norm_f32");
+            _repackQ6kTiled = module.GetFunction("ts_graph_repack_q6k_tiled");
+            // The tiled head's products stream with cp.async into the int8 tensor cores: only an image with their sm_80 bodies.
+            if (ArchGuardedKernelsUsable)
+            {
+                for (int i = 0; i < 4; i++)
+                    _gemmQ6kTiled[i] = module.GetFunction($"ts_graph_gemm_q6kt_{1 << i}");
+                CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr(16)).ThrowOnError();
+                try
+                {
+                    IntPtr p = probe;
+                    void** args = stackalloc void*[] { &p };
+                    CudaDriverApi.cuLaunchKernel(module.GetFunction("ts_graph_gemm_q6kt_smem_bytes"), 1, 1, 1, 1, 1, 1, 0, IntPtr.Zero, (IntPtr)args,
+                        IntPtr.Zero).ThrowOnError();
+                    int* host = stackalloc int[4];
+                    CudaDriverApi.cuMemcpyDtoH((IntPtr)host, probe, new UIntPtr(16)).ThrowOnError();
+                    for (int i = 0; i < 4; i++)
+                    {
+                        _smemQ6kTiled[i] = host[i];
+                        CudaDriverApi.cuFuncSetAttribute(_gemmQ6kTiled[i], 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, host[i]).ThrowOnError();
+                    }
+                }
+                finally
+                {
+                    CudaDriverApi.cuMemFree(probe);
+                }
+                TakesTiledQ6kHeads = true;
+            }
+        }
+
+        /// <summary>Weight rows of a tile of the tiled Q6_K head layout, and rows of activations one product takes at most.</summary>
+        public const int Q6kTileRows = 64, Q6kTiledMaxRows = 64;
+
+        /// <summary>Whether this image runs <see cref="LaunchGemmQ6kTiled"/> (its sm_80 bodies are in it).</summary>
+        public bool TakesTiledQ6kHeads { get; }
+
+        /// <summary>A Q6_K matrix's stored rows [rows][srcRowBytes] (rows rowBase .. of the head) into the tiled layout at
+        /// <paramref name="dst"/> (the head's base); rows of whole 64-row tiles land on the same bytes they came from.</summary>
+        public void LaunchRepackQ6kTiled(IntPtr src, long srcRowBytes, int rows, int k, int rowBase, IntPtr dst, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &src, &srcRowBytes, &rows, &k, &rowBase, &dst };
+            long threads = (long)rows * (k / 256);
+            CudaDriverApi.cuLaunchKernel(_repackQ6kTiled, (uint)((threads + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>y [n][outDim] = xq [n] W^T for a tiled Q6_K head: <paramref name="xq"/> int8 [n][k] and <paramref name="xd"/>
+        /// [n][k / 32] (the split q8_1 rows). Up to 64 rows a launch on the int8 tensor cores, the narrowest of 8 / 16 / 32 / 64
+        /// that holds them; a row's logits are the same in any of them.</summary>
+        public void LaunchGemmQ6kTiled(IntPtr w, int outDim, int k, IntPtr xq, IntPtr xd, int n, IntPtr y, IntPtr stream)
+        {
+            IntPtr a3 = IntPtr.Zero, a4 = IntPtr.Zero, a6 = IntPtr.Zero;
+            int rows = 0;
+            void** args = stackalloc void*[] { &w, &outDim, &k, &a3, &a4, &rows, &a6 };
+            for (int r0 = 0; r0 < n; r0 += Q6kTiledMaxRows)
+            {
+                rows = Math.Min(Q6kTiledMaxRows, n - r0);
+                int i = rows <= 8 ? 0 : rows <= 16 ? 1 : rows <= 32 ? 2 : 3;
+                a3 = xq + (nint)((long)r0 * k);
+                a4 = xd + (nint)((long)r0 * (k / 32) * 4);
+                a6 = y + (nint)((long)r0 * outDim * 4);
+                CudaDriverApi.cuLaunchKernel(_gemmQ6kTiled[i], (uint)((outDim + Q6kTileRows - 1) / Q6kTileRows), 1, 1, 128, 1, 1, (uint)_smemQ6kTiled[i],
+                    stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            }
         }
 
         /// <summary>The current module, or false with the reason it cannot be used (requires a current context).</summary>

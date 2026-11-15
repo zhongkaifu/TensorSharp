@@ -10,8 +10,9 @@
 // on every backend.
 
 #include <cuda_fp16.h>
+#include <stdint.h>
 
-#define TS_GRAPH_KERNELS_VERSION 18
+#define TS_GRAPH_KERNELS_VERSION 19
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -860,6 +861,280 @@ extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, con
                 t += __shfl_xor_sync(0xffffffffu, t, off);
             if (threadIdx.x == 0) injPart[s * hc + o] = t;
         }
+}
+
+
+// ---------------------------------------------------------------------------
+// A Q6_K vocabulary head (an LM head) on the tiled layout of the Qwen3.5 CUDA engine's head kernels
+// (ts_q35_repack_q6k_tiled, ts_q35_gemm_q6kt). A 210-byte superblock gives a row's pieces no 16-byte boundary, so the
+// stored rows load 2 bytes at a time; the tiled layout keeps, for each tile of 64 rows and each superblock, one
+// 13,440-byte chunk (the 64 superblocks' own bytes):
+//   half 0: ql [64][64] | qh [64][32] | sc [64][8] | d [64] (half)    (6,784 bytes)
+//   half 1: ql [64][64] | qh [64][32] | sc [64][8]                    (6,656 bytes)
+// so a block streams each half superblock of its 64 rows as one contiguous, 16-byte-aligned run. 64 rows of 210 * (k / 256)
+// bytes are exactly a tile's chunks, so a head of whole tiles is regrouped in place, tile by tile, through a copy.
+// ---------------------------------------------------------------------------
+#define TS_GRAPH_Q6KT_ROWS 64
+#define TS_GRAPH_Q6KT_CHUNK 13440
+#define TS_GRAPH_Q6KT_H1 6784
+#define TS_GRAPH_Q6KT_QH 4096
+#define TS_GRAPH_Q6KT_SC 6144
+#define TS_GRAPH_Q6KT_D 6656
+
+__device__ __forceinline__ int ts_graph_q6kt_ql(int h, int rr) { return h * TS_GRAPH_Q6KT_H1 + rr * 64; }
+__device__ __forceinline__ int ts_graph_q6kt_qh(int h, int rr) { return h * TS_GRAPH_Q6KT_H1 + TS_GRAPH_Q6KT_QH + rr * 32; }
+__device__ __forceinline__ int ts_graph_q6kt_sc(int h, int rr) { return h * TS_GRAPH_Q6KT_H1 + TS_GRAPH_Q6KT_SC + rr * 8; }
+
+// `rows` stored Q6_K rows [rows][srcRowBytes] (from row rowBase of the head) into the tiled layout at dst (the head's base).
+// One thread per (row, superblock). Launch: ceil(rows * k / 256 / 256), 256.
+extern "C" __global__ void ts_graph_repack_q6k_tiled(
+    const uint8_t* __restrict__ src, long long srcRowBytes, int rows, int k, int rowBase, uint8_t* __restrict__ dst)
+{
+    const int nsb = k / 256;
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * nsb)
+        return;
+    const long long rs = i / nsb;
+    const int b = (int)(i % nsb);
+    const long long r = rowBase + rs;
+    const int rr = (int)(r % TS_GRAPH_Q6KT_ROWS);
+    const uint8_t* blk = src + rs * srcRowBytes + (long long)b * 210;
+    uint8_t* chunk = dst + (r / TS_GRAPH_Q6KT_ROWS * nsb + b) * TS_GRAPH_Q6KT_CHUNK;
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+    {
+        for (int j = 0; j < 64; ++j)
+            chunk[ts_graph_q6kt_ql(h, rr) + j] = blk[64 * h + j];
+        for (int j = 0; j < 32; ++j)
+            chunk[ts_graph_q6kt_qh(h, rr) + j] = blk[128 + 32 * h + j];
+        for (int j = 0; j < 8; ++j)
+            chunk[ts_graph_q6kt_sc(h, rr) + j] = blk[192 + 8 * h + j];
+    }
+    chunk[TS_GRAPH_Q6KT_D + 2 * rr] = blk[208];
+    chunk[TS_GRAPH_Q6KT_D + 2 * rr + 1] = blk[209];
+}
+
+// cp.async and the int8 tensor-core product need sm_80; below it (the compute_75 baseline) they trap, and the caps' image
+// architecture keeps the head on its stored rows there.
+__device__ __forceinline__ void ts_graph_cp16(void* dst, const void* src, bool valid)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned saddr = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(saddr), "l"(src), "r"(valid ? 16 : 0));
+#else
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ void ts_graph_cp_commit()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void ts_graph_cp_wait()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+
+__device__ __forceinline__ void ts_graph_mma_s8(int (&c)[4], int a0, int a1, int b0)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
+#else
+    __trap();
+#endif
+}
+
+// (float)c for |c| < 2^22 without the quarter-rate I2F: the same value, exactly.
+__device__ __forceinline__ float ts_graph_i2f_small(int c)
+{
+    return __int_as_float(c + 0x4B400000) - 12582912.0f;
+}
+
+// 64 weight rows (four warps of 16 each) against NT * 8 activation rows a block, one mma.m16n8k16.s8 per 16-value sub-block.
+// A stage is half a superblock of the tile and of the activations, three deep; shared rows are padded (ql 80, qh 48,
+// activations 144 bytes) so the fragment loads hit 32 banks. Each output's sums run over the head's superblocks in order
+// whatever NT and the row count: a row's logits are the same alone or in a window of up to 64 (padding rows read zeros).
+// The activations are q8_1 in the split layout (ts_quantize_q8_1_split_rows_f32): int8 [n][k], scales [n][k / 32].
+template <int NT>
+struct TsGraphQ6ktStage
+{
+    static constexpr int BR = TS_GRAPH_Q6KT_ROWS, NA = NT * 8, QL = 80, QH = 48, SC = 8, XA = 144;
+    uint8_t ql[BR * QL];
+    uint8_t qh[BR * QH];
+    int8_t sc[BR * SC];
+    half d[BR];
+    int8_t x[NA * XA];
+    float xd[NA * 4];
+};
+
+template <int NT>
+__device__ __forceinline__ void ts_graph_gemm_q6kt(
+    const uint8_t* __restrict__ w, int outDim, int k, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n,
+    float* __restrict__ y)
+{
+    constexpr int STAGES = 3;
+    using Stage = TsGraphQ6ktStage<NT>;
+    constexpr int BR = Stage::BR, NA = Stage::NA, QL = Stage::QL, QH = Stage::QH, SC = Stage::SC, XA = Stage::XA;
+    constexpr int THREADS = 128;
+    static_assert(sizeof(Stage) % 16 == 0, "16-byte stage slots");
+    extern __shared__ __align__(16) uint8_t q6ktSmem[];
+    Stage* st = reinterpret_cast<Stage*>(q6ktSmem);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int tile0 = blockIdx.x, row0 = tile0 * TS_GRAPH_Q6KT_ROWS;
+    const int nsb = k / 256, nH = 2 * nsb;
+    const int tiles = (outDim + TS_GRAPH_Q6KT_ROWS - 1) / TS_GRAPH_Q6KT_ROWS;
+
+    auto load = [&](int slot, int u) {
+        Stage& s = st[slot];
+        const int sbIdx = u >> 1, h = u & 1;
+        const bool ok = tile0 < tiles;
+        const uint8_t* chunk = w + ((long long)(ok ? tile0 : 0) * nsb + sbIdx) * TS_GRAPH_Q6KT_CHUNK;
+        for (int i = tid; i < BR * 4; i += THREADS)          // ql: 4 x 16 bytes per row
+        {
+            const int r = i >> 2, c = i & 3;
+            ts_graph_cp16(s.ql + r * QL + 16 * c, chunk + ts_graph_q6kt_ql(h, r) + 16 * c, ok);
+        }
+        for (int i = tid; i < BR * 2; i += THREADS)          // qh: 2 x 16 bytes per row
+        {
+            const int r = i >> 1, c = i & 1;
+            ts_graph_cp16(s.qh + r * QH + 16 * c, chunk + ts_graph_q6kt_qh(h, r) + 16 * c, ok);
+        }
+        for (int i = tid; i < BR / 2; i += THREADS)          // sc: 8 bytes per row, 16 per pair
+        {
+            const int r = 2 * i;
+            ts_graph_cp16(s.sc + r * SC, chunk + ts_graph_q6kt_sc(h, r), ok);
+        }
+        if (h == 0)
+            for (int i = tid; i < BR / 8; i += THREADS)      // d: 2 bytes per row, half 0 only
+            {
+                const int r = 8 * i;
+                ts_graph_cp16(s.d + r, chunk + TS_GRAPH_Q6KT_D + 2 * r, ok);
+            }
+        for (int i = tid; i < NA * 8; i += THREADS)
+        {
+            const int r = i >> 3, c = i & 7;
+            const bool okr = r < n;
+            ts_graph_cp16(s.x + r * XA + 16 * c, xq + (long long)(okr ? r : 0) * k + 128LL * u + 16 * c, okr);
+        }
+        for (int r = tid; r < NA; r += THREADS)
+        {
+            const bool okr = r < n;
+            ts_graph_cp16(s.xd + 4 * r, xd + (long long)(okr ? r : 0) * (k >> 5) + 4LL * u, okr);
+        }
+    };
+
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            acc[j][e] = 0.0f;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s)
+    {
+        if (s < nH)
+            load(s, s);
+        ts_graph_cp_commit();
+    }
+    const int wr = warp * 16 + g;   // this thread's first weight row in the tile (the second is wr + 8)
+    float d0 = 0.0f, d1 = 0.0f;
+    for (int it = 0; it < nH; ++it)
+    {
+        ts_graph_cp_wait<STAGES - 2>();
+        __syncthreads();
+        const int next = it + STAGES - 1;
+        if (next < nH)
+            load(next % STAGES, next);
+        ts_graph_cp_commit();
+        const Stage& s = st[it % STAGES];
+        if ((it & 1) == 0)   // half 0 of a superblock carries its d
+        {
+            d0 = __half2float(s.d[wr]);
+            d1 = __half2float(s.d[wr + 8]);
+        }
+        uint32_t qlw[2][2][2], qhw[2][2];
+#pragma unroll
+        for (int rr = 0; rr < 2; ++rr)
+#pragma unroll
+            for (int lh = 0; lh < 2; ++lh)
+            {
+                const int row = wr + 8 * rr;
+                qlw[rr][lh][0] = *(const uint32_t*)(s.ql + row * QL + 16 * lh + 4 * t);
+                qlw[rr][lh][1] = *(const uint32_t*)(s.ql + row * QL + 32 + 16 * lh + 4 * t);
+                qhw[rr][lh] = *(const uint32_t*)(s.qh + row * QH + 16 * lh + 4 * t);
+            }
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+        {
+            float x0[NT], x1[NT];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+            {
+                x0[nt] = s.xd[(8 * nt + 2 * t) * 4 + m];
+                x1[nt] = s.xd[(8 * nt + 2 * t + 1) * 4 + m];
+            }
+#pragma unroll
+            for (int lh = 0; lh < 2; ++lh)
+            {
+                int a[2];
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr)
+                    a[rr] = (int)__vsubss4(((qlw[rr][lh][m & 1] >> (4 * (m >> 1))) & 0x0F0F0F0Fu)
+                                               | (((qhw[rr][lh] >> (2 * m)) & 0x03030303u) << 4), 0x20202020);
+                const int jj = 2 * m + lh;
+                const float s0 = d0 * (float)s.sc[wr * SC + jj], s1 = d1 * (float)s.sc[(wr + 8) * SC + jj];
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt)
+                {
+                    int c[4];
+                    ts_graph_mma_s8(c, a[0], a[1], *(const int*)(s.x + (8 * nt + g) * XA + 32 * m + 16 * lh + 4 * t));
+                    acc[nt][0] += ts_graph_i2f_small(c[0]) * s0 * x0[nt];
+                    acc[nt][1] += ts_graph_i2f_small(c[1]) * s0 * x1[nt];
+                    acc[nt][2] += ts_graph_i2f_small(c[2]) * s1 * x0[nt];
+                    acc[nt][3] += ts_graph_i2f_small(c[3]) * s1 * x1[nt];
+                }
+            }
+        }
+    }
+    ts_graph_cp_wait<0>();
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const int r = row0 + wr + 8 * (e >> 1), col = 8 * nt + 2 * t + (e & 1);
+            if (r < outDim && col < n)
+                y[(long long)col * outDim + r] = acc[nt][e];
+        }
+}
+
+// y [n][outDim] = xq [n] W^T for n <= NT * 8 rows. Launch: grid ceil(outDim / 64), block 128, dynamic shared memory
+// ts_graph_gemm_q6kt_smem_bytes reports.
+#define TS_GRAPH_GEMM_Q6KT(NT) \
+    extern "C" __global__ void __launch_bounds__(128) ts_graph_gemm_q6kt_##NT( \
+        const uint8_t* __restrict__ w, int outDim, int k, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, \
+        float* __restrict__ y) \
+    { ts_graph_gemm_q6kt<NT>(w, outDim, k, xq, xd, n, y); }
+TS_GRAPH_GEMM_Q6KT(1)
+TS_GRAPH_GEMM_Q6KT(2)
+TS_GRAPH_GEMM_Q6KT(4)
+TS_GRAPH_GEMM_Q6KT(8)
+
+extern "C" __global__ void ts_graph_gemm_q6kt_smem_bytes(int* out)
+{
+    out[0] = 3 * (int)sizeof(TsGraphQ6ktStage<1>);
+    out[1] = 3 * (int)sizeof(TsGraphQ6ktStage<2>);
+    out[2] = 3 * (int)sizeof(TsGraphQ6ktStage<4>);
+    out[3] = 3 * (int)sizeof(TsGraphQ6ktStage<8>);
 }
 
 // y = silu(x * scale) over n contiguous floats (the read's low-rank activation). Launch: ceil(n / 256), 256.

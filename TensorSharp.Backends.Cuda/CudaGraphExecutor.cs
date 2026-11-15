@@ -47,6 +47,11 @@ namespace TensorSharp.Cuda
         /// pack with its MTP head on an A40 ran out of memory recording or launching one after a 4K prompt.</summary>
         private const long RecordingHeadroomBytes = 1L << 30;
 
+        /// <summary>A Q6_K vocabulary head the model only multiplies: regrouped in place for the tiled int8 tensor-core
+        /// product (<see cref="CudaQuantizedOps.TryTileQ6kHead"/>).</summary>
+        public override bool KeepForProductsOnly(IntPtr weightKey)
+            => Allocator is CudaAllocator cuda && Kernels is { } kernels && CudaQuantizedOps.TryTileQ6kHead(cuda, weightKey, kernels);
+
         public bool HasRoomToRecord()
         {
             if (Allocator is not CudaAllocator cuda) return false;

@@ -14,6 +14,13 @@ namespace TensorSharp.Cuda
         /// </summary>
         internal const int Nvfp4PlanarType = 1040;
 
+        /// <summary>The layout of a Q6_K vocabulary head regrouped for <see cref="CudaGraphKernels.LaunchGemmQ6kTiled"/>
+        /// (<see cref="TryTileQ6kHead"/>): the same bytes, which only that product reads.</summary>
+        internal const int Q6kTiledType = 1014;
+
+        /// <summary>The graph kernels that run each allocator's tiled heads.</summary>
+        private static readonly Dictionary<CudaAllocator, CudaGraphKernels> TiledHeadKernels = new(ReferenceEqualityComparer.Instance);
+
         private sealed class DeviceWeight : IDisposable
         {
             public IntPtr DevicePtr;
@@ -718,7 +725,7 @@ namespace TensorSharp.Cuda
             lock (Sync)
             {
                 // A planar NVFP4 matrix is not ggml blocks: its callers read the bytes by their ggml type.
-                if (Cache.TryGetValue(key, out DeviceWeight w) && w.DevicePtr != IntPtr.Zero && w.GgmlType != Nvfp4PlanarType)
+                if (Cache.TryGetValue(key, out DeviceWeight w) && w.DevicePtr != IntPtr.Zero && w.GgmlType != Nvfp4PlanarType && w.GgmlType != Q6kTiledType)
                 {
                     devicePtr = w.DevicePtr;
                     ggmlType = w.GgmlType;
@@ -1041,6 +1048,12 @@ namespace TensorSharp.Cuda
             if (ggmlType == Nvfp4PlanarType)
             {
                 RunNvfp4Planar(allocator, weightPtr, inputPtr, resultPtr, inDim, outDim, rows);
+                return;
+            }
+
+            if (ggmlType == Q6kTiledType)
+            {
+                RunQ6kTiled(allocator, kernels, weightPtr, inputPtr, resultPtr, inDim, outDim, rows);
                 return;
             }
 
@@ -1428,6 +1441,8 @@ namespace TensorSharp.Cuda
                 return false;
 
             DeviceWeight weight = EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            if (weight.GgmlType == Q6kTiledType)
+                return false;   // a tiled head's rows are regrouped: only its product reads them
             indicesStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
             if (weight.GgmlType == Nvfp4PlanarType)
@@ -1448,6 +1463,69 @@ namespace TensorSharp.Cuda
                 allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
             return true;
+        }
+
+        /// <summary>
+        /// A resident Q6_K vocabulary head (an LM head the model reads only through its product: not a tied embedding table,
+        /// which is gathered by rows) regrouped in place into the tiled layout <see cref="CudaGraphKernels.LaunchGemmQ6kTiled"/>
+        /// streams, tile by tile through a small copy, so its products take the int8 tensor-core kernels (the Qwen3.5 CUDA
+        /// engine's head kernels): a 248,320 x 5,120 head's 8-row product took 3.7 ms on the stored rows' decode-once kernel
+        /// on an RTX PRO 4000. Whole 64-row tiles of 256-value superblocks only; outside a recording. False, with the weight
+        /// as it was, when it does not qualify.
+        /// </summary>
+        internal static bool TryTileQ6kHead(CudaAllocator allocator, IntPtr cacheKey, CudaGraphKernels kernels)
+        {
+            if (allocator == null || cacheKey == IntPtr.Zero || kernels == null || !kernels.TakesTiledQ6kHeads || CudaGraphCapture.IsCapturing(allocator))
+                return false;
+            lock (Sync)
+            {
+                if (!Cache.TryGetValue(new CacheKey(allocator, cacheKey), out DeviceWeight w) || w.DevicePtr == IntPtr.Zero)
+                    return false;
+                if (w.GgmlType == Q6kTiledType)
+                    return true;
+                long rowBytes = w.Ne0 / 256 * 210;
+                if (w.GgmlType != 14 || w.Ne0 % 256 != 0 || w.Ne1 % CudaGraphKernels.Q6kTileRows != 0 || w.Ne1 > int.MaxValue
+                    || w.Ne0 > int.MaxValue || w.RawBytes != w.Ne1 * rowBytes)
+                    return false;
+                allocator.Context.MakeCurrent();
+                const int chunkRows = 4096;   // a multiple of the tile: each chunk's tiles land on its own bytes
+                long chunkBytes = Math.Min(w.Ne1, chunkRows) * rowBytes;
+                CudaDriverApi.cuMemAlloc(out IntPtr copy, new UIntPtr((ulong)chunkBytes)).ThrowOnError();
+                try
+                {
+                    IntPtr stream = allocator.Stream.Handle;
+                    for (long r0 = 0; r0 < w.Ne1; r0 += chunkRows)
+                    {
+                        int rows = (int)Math.Min(chunkRows, w.Ne1 - r0);
+                        CudaDriverApi.cuMemcpyDtoDAsync(copy, w.DevicePtr + (nint)(r0 * rowBytes), new UIntPtr((ulong)(rows * rowBytes)), stream).ThrowOnError();
+                        kernels.LaunchRepackQ6kTiled(copy, rowBytes, rows, (int)w.Ne0, (int)r0, w.DevicePtr, stream);
+                    }
+                    allocator.Stream.Synchronize();
+                }
+                finally
+                {
+                    CudaDriverApi.cuMemFree(copy);
+                }
+                w.GgmlType = Q6kTiledType;
+                TiledHeadKernels[allocator] = kernels;
+                return true;
+            }
+        }
+
+        /// <summary>result [rows, outDim] = input [rows, inDim] W^T for a tiled Q6_K head: the rows quantized to split q8_1, then
+        /// the tiled product.</summary>
+        private static void RunQ6kTiled(CudaAllocator allocator, CudaKernels kernels, IntPtr weightPtr, IntPtr inputPtr, IntPtr resultPtr,
+            int inDim, int outDim, int rows)
+        {
+            CudaGraphKernels head;
+            lock (Sync)
+                head = TiledHeadKernels.TryGetValue(allocator, out CudaGraphKernels k) ? k : null;
+            if (head == null)
+                throw new InvalidOperationException("a Q6_K head is resident in the tiled layout, but its kernels are not loaded");
+            IntPtr qs = EnsureScratch(Q81SplitQsScratch, allocator, (long)rows * inDim);
+            IntPtr d = EnsureScratch(Q81SplitDScratch, allocator, (long)rows * (inDim / 32) * sizeof(float));
+            kernels.LaunchQuantizeQ81SplitRows(inputPtr, qs, d, inDim, rows, allocator.Stream.Handle);
+            head.LaunchGemmQ6kTiled(weightPtr, outDim, inDim, qs, d, rows, resultPtr, allocator.Stream.Handle);
         }
 
         /// <summary>The ggml blocks just uploaded to <paramref name="devicePtr"/> rewritten in place as the planar layout

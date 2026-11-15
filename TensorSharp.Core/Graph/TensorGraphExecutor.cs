@@ -105,6 +105,9 @@ namespace TensorSharp.Graph
 
         public virtual void Invalidate(IntPtr data) { }
 
+        /// <inheritdoc cref="IGraphExecutor.KeepForProductsOnly"/>
+        public virtual bool KeepForProductsOnly(IntPtr weightKey) => false;
+
         // ================================================================ kernels a backend provides
 
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>

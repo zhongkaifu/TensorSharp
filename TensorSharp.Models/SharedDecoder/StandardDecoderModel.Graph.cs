@@ -606,6 +606,22 @@ namespace TensorSharp.Models
         /// sequence's last-row logits (or null with <paramref name="wantLogits"/> false); false
         /// when the step cannot be lowered (nothing was written).
         /// </summary>
+        private bool _headLayoutPrepared;
+
+        /// <summary>
+        /// The untied LM head is read only by its products (never gathered by rows): the executor may keep it in a layout only
+        /// they read - direct CUDA regroups a Q6_K head for its int8 tensor-core kernels (a 248,320 x 5,120 head's 8-row product
+        /// 3.7 ms on the stored rows on an RTX PRO 4000). Once, on the first step (the weights are resident by then; one device).
+        /// </summary>
+        private void PrepareHeadLayout()
+        {
+            if (_headLayoutPrepared) return;
+            _headLayoutPrepared = true;
+            if (_mesh.IsSingleDevice && !_rankGraphs && _quantWeights.TryGetValue("output.weight", out QuantizedWeight head)
+                && head != null && head.CacheKey != IntPtr.Zero)
+                GraphExecutor?.KeepForProductsOnly(head.CacheKey);
+        }
+
         private bool TryRunGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
             bool wantLogits, out float[][] logits, int[] positionTable = null, DraftFollow follow = DraftFollow.None,
             float[] draftRows = null)
@@ -648,6 +664,7 @@ namespace TensorSharp.Models
             GraphRequest request, out GraphResult result)
         {
             result = null;
+            PrepareHeadLayout();
             string reason = GraphUnsupportedReason();
             if (reason != null && RequiresGraphs)
                 throw new NotSupportedException($"{Config.Architecture} runs only as graphs on the shared runtime, which this step cannot use ({reason}).");
