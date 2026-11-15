@@ -69,37 +69,39 @@ namespace TensorSharp.Cuda
             {
                 public IntPtr Pointer;
                 public long Size;
+                /// <summary>Bytes handed out from the slab's start (its tail past them was never used).</summary>
+                public long Offset;
                 public int LiveAllocations;
             }
             private readonly List<Slab> slabs = new List<Slab>();
             private readonly Dictionary<IntPtr, Slab> allocations = new Dictionary<IntPtr, Slab>();
-            private Slab currentSlab;
-            private long currentOffset;
 
             public WeightArena(CudaAllocator allocator) => this.allocator = allocator;
 
-            /// <summary>Bump-suballocate <paramref name="rawBytes"/> from a slab.
-            /// Each block is 256-byte aligned and carries 16 trailing slack bytes
-            /// (the cp.async MMQ kernel over-reads up to 8 bytes past the last
-            /// block), matching the old per-tensor <c>cuMemAlloc(rawBytes + 16)</c>.</summary>
+            /// <summary>Bump-suballocate <paramref name="rawBytes"/> from the first slab whose unused tail holds it (a new slab
+            /// otherwise). Each block is 256-byte aligned and carries 16 trailing slack bytes (the cp.async MMQ kernel
+            /// over-reads up to 8 bytes past the last block), matching the old per-tensor <c>cuMemAlloc(rawBytes + 16)</c>.
+            /// Only the last slab took blocks before: a weight that did not fit its tail left that tail unused for good -
+            /// 3.2 GB of Qwen3.8-27B NVFP4's 18.2 GB of slabs, whose 50-100 MB weights fill a 256 MB slab two or three at a
+            /// time (a 24 GB RTX PRO 4000 then had too little left to record a step after a 4K prompt).</summary>
             public IntPtr Allocate(long rawBytes)
             {
                 const long align = 256;
                 long need = checked((checked(rawBytes + 16 + align - 1) / align) * align);
-                if (currentSlab == null || need > currentSlab.Size - currentOffset)
+                Slab slab = slabs.Find(x => x.Size - x.Offset >= need);
+                if (slab == null)
                 {
                     long slabSize = Math.Max(SlabBytes, need);
                     allocator.Context.MakeCurrent();
-                    CudaDriverApi.cuMemAlloc(out IntPtr slab, new UIntPtr((ulong)slabSize)).ThrowOnError();
-                    currentSlab = new Slab { Pointer = slab, Size = slabSize };
-                    slabs.Add(currentSlab);
-                    currentOffset = 0;
+                    CudaDriverApi.cuMemAlloc(out IntPtr pointer, new UIntPtr((ulong)slabSize)).ThrowOnError();
+                    slab = new Slab { Pointer = pointer, Size = slabSize };
+                    slabs.Add(slab);
                 }
 
-                IntPtr ptr = new IntPtr(currentSlab.Pointer.ToInt64() + currentOffset);
-                currentOffset += need;
-                allocations.Add(ptr, currentSlab);
-                currentSlab.LiveAllocations++;
+                IntPtr ptr = new IntPtr(slab.Pointer.ToInt64() + slab.Offset);
+                slab.Offset += need;
+                allocations.Add(ptr, slab);
+                slab.LiveAllocations++;
                 return ptr;
             }
 
@@ -116,11 +118,6 @@ namespace TensorSharp.Cuda
                 // Driver free waits for work using the allocation before returning.
                 CudaDriverApi.cuMemFree(slab.Pointer).ThrowOnError();
                 slabs.Remove(slab);
-                if (ReferenceEquals(currentSlab, slab))
-                {
-                    currentSlab = null;
-                    currentOffset = 0;
-                }
             }
 
             public void FreeAll()
@@ -133,8 +130,6 @@ namespace TensorSharp.Cuda
                 }
                 slabs.Clear();
                 allocations.Clear();
-                currentSlab = null;
-                currentOffset = 0;
             }
         }
 
