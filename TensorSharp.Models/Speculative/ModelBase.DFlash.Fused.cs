@@ -92,16 +92,17 @@ namespace TensorSharp.Models
         /// <summary>Highest ring position written + 1. The ring slot for position p is
         /// p % ringRows, so this is all that is needed to reconstruct which slot holds
         /// which position (and which slots were never written).</summary>
-        private int _dflashRingFilled;
+        private protected int _dflashRingFilled;
 
         /// <summary>First position of the contiguous run of rows the ring holds for
         /// its current sequence; rows below it (never written, or written for another
         /// sequence) are not context. See <see cref="NoteDFlashRingWrite"/>.</summary>
-        private int _dflashRingValidFrom;
+        private protected int _dflashRingValidFrom;
 
-        /// <summary>Set when the fused kernels have written the ring on the device, so
+        /// <summary>Set when the fused kernels or the runtime's graph programs
+        /// (StandardDecoderModel.BlockDraft.cs) have written the ring on the device, so
         /// the host mirror is behind.</summary>
-        private bool _dflashRingHostStale;
+        private protected bool _dflashRingHostStale;
 
         /// <summary>
         /// Pull device-side ring writes back to the host copy. Only the per-op drafter
@@ -338,6 +339,11 @@ namespace TensorSharp.Models
 
         private void MapDraftVocab(int[] ids, int count) => DraftVocabSubset.MapToTokens(_dflashVocabMap, ids, count);
 
+        /// <summary>TS_DFLASH_DRAFT_VOCAB is set: only the fused graph scores a vocabulary subset, so a drafter asked for
+        /// one keeps that graph where it runs.</summary>
+        private protected static bool DFlashDraftVocabSubsetRequested
+            => !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_DFLASH_DRAFT_VOCAB"));
+
         private void ApplyDraftVocabSubset(DFlashArrays a, DFlashConfig cfg)
         {
             string path = Environment.GetEnvironmentVariable("TS_DFLASH_DRAFT_VOCAB");
@@ -457,7 +463,7 @@ namespace TensorSharp.Models
         /// frontier hold zeros or another sequence's rows at colliding positions, which
         /// the slot map used to label as live context.
         /// </summary>
-        private void NoteDFlashRingWrite(int startPos, int n)
+        private protected void NoteDFlashRingWrite(int startPos, int n)
         {
             if (startPos > _dflashRingFilled || startPos < _dflashRingValidFrom)
                 _dflashRingValidFrom = startPos;
@@ -470,7 +476,7 @@ namespace TensorSharp.Models
         /// graph shape stays constant; this map is what lets its mask express liveness,
         /// causality and the sliding window without changing the shape.
         /// </summary>
-        private int[] BuildRingSlotPositions()
+        private protected int[] BuildRingSlotPositions()
         {
             int rows = _dflashRingRows;
             if (_dflashRingSlotPos == null || _dflashRingSlotPos.Length != rows)

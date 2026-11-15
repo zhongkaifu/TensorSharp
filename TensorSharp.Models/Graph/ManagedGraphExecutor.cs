@@ -31,6 +31,14 @@ namespace TensorSharp.Models.Graph
                     ManagedQuantizedOps.AddmmQuantizedToFloat32(weight.Format, weight.Data, weight.Ne0, weight.Ne1,
                         xp, (int)weight.Ne0, rows, yp, (int)weight.Ne1);
             };
+            HostQuantizedRows = (weight, rows, y) =>
+            {
+                long rowBytes = weight.Bytes / (weight.Ne1 * Math.Max(1, weight.Ne2));
+                fixed (float* yp = y)
+                    for (int i = 0; i < rows.Length; i++)
+                        ManagedQuantizedOps.DequantizeToFloat32Native(weight.Format, weight.Data + (nint)(rows[i] * rowBytes),
+                            (IntPtr)(yp + (long)i * weight.Ne0), weight.Ne0);
+            };
         }
 
         public ManagedGraphExecutor(IAllocator allocator) : base(allocator) { }

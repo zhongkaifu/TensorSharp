@@ -155,6 +155,8 @@ namespace TensorSharp.Cuda
             // An explicit mask (a sparse attention's selection over prompt or verify rows) runs on the tiled path below, its rows
             // added to each tile's scores: the generic attention would hold every head's scores of the whole chunk at once.
             bool explicitRows = mask.Pattern == MaskPattern.Explicit && !trimmed && mask.HasTensor && q.DimensionCount == 3 && q.Sizes[1] > 1;
+            if (explicitRows && kWindow == null && vWindow == null && TryExplicitRowsOverTensors(q, k, v, mask.Tensor, scale, out Tensor plain))
+                return plain;
             if (kWindow == null || vWindow == null || (mask.Pattern == MaskPattern.Explicit && !trimmed && !explicitRows) || q.ElementType != DType.Float32
                 || q.DimensionCount != 3 || k.DimensionCount is < 2 or > 3 || v.DimensionCount is < 2 or > 3
                 || kWindow.Cache.DimensionCount is < 2 or > 3 || vWindow.Cache.DimensionCount is < 2 or > 3
@@ -278,6 +280,53 @@ namespace TensorSharp.Cuda
                 Ops.Copy(target, permuted);
             }
             return output;
+        }
+
+        /// <summary>
+        /// A few rows with an explicit mask over K and V that are tensors, not cache windows (a block drafter's ring: F32
+        /// [kv_heads, n, d], every slot read and the mask closing the ones outside the drafter's window): each KV head's group
+        /// of query rows in one batched F32 product, the mask added over the heads in one kernel, the softmax, the product
+        /// with V. The generic path repeated K and V for every query head first and ran its products from there: 50 ms a
+        /// layer of Qwen3.8-27B's DFlash2 block on an A40 (a 2,080-row ring, 32 heads over 8).
+        /// </summary>
+        private bool TryExplicitRowsOverTensors(Tensor q, Tensor k, Tensor v, Tensor mask, float scale, out Tensor output)
+        {
+            output = null;
+            if (Kernels == null || q.DimensionCount != 3 || k.DimensionCount != 3 || v.DimensionCount != 3 || mask == null
+                || !AllF32OnDevice(q, k, v) || mask.Storage is not CudaStorage || mask.ElementType is not (DType.Float32 or DType.Float16))
+                return false;
+            int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2];
+            int kvHeads = (int)k.Sizes[0], len = (int)k.Sizes[1], dv = (int)v.Sizes[2];
+            if (kvHeads == 0 || heads % kvHeads != 0 || k.Sizes[2] != d || v.Sizes[0] != kvHeads || v.Sizes[1] != len
+                || mask.ElementCount() != (long)nq * len || (long)heads * nq * len * sizeof(float) > ScoreBudgetBytes)
+                return false;
+            int group = heads / kvHeads;
+            using Tensor maskRows = mask.ElementType == DType.Float32 ? Contiguous2(mask, nq, len) : new Tensor(Allocator, DType.Float32, nq, len);
+            if (maskRows == null) return false;
+            if (mask.ElementType == DType.Float16)
+                using (Tensor half = mask.IsContiguous() ? mask.CopyRef() : Ops.NewContiguous(mask))
+                using (Tensor flat = half.View(nq, len))
+                    CopyInto(maskRows, flat);
+            using Tensor qc = q.IsContiguous() ? q.CopyRef() : Ops.NewContiguous(q);
+            using Tensor kc = k.IsContiguous() ? k.CopyRef() : Ops.NewContiguous(k);
+            using Tensor vc = v.IsContiguous() ? v.CopyRef() : Ops.NewContiguous(v);
+            using Tensor q3 = qc.View(kvHeads, (long)group * nq, d);
+            using Tensor kt = kc.Transpose(1, 2);
+            using var scores = new Tensor(Allocator, DType.Float32, kvHeads, (long)group * nq, len);
+            Ops.AddmmBatch(scores, 0, scores, scale, q3, kt);
+            using var masked = new Tensor(Allocator, DType.Float32, heads, nq, len);
+            using (Tensor perHead = scores.View(heads, nq, len))
+                if (!TryBinaryBroadcast(GraphOp.Add, masked, perHead, maskRows, new long[] { len, nq, heads, 1 }, new long[] { len, nq, 1, 1 }))
+                    return false;
+            Ops.Softmax(masked, masked);
+            using var attn = new Tensor(Allocator, DType.Float32, kvHeads, (long)group * nq, dv);
+            using (Tensor probs = masked.View(kvHeads, (long)group * nq, len))
+                Ops.AddmmBatch(attn, 0, attn, 1.0f, probs, vc);
+            output = new Tensor(Allocator, DType.Float32, nq, heads, dv);
+            using Tensor attnHeads = attn.View(heads, nq, dv);
+            using Tensor permuted = attnHeads.Permute(1, 0, 2);
+            Ops.Copy(output, permuted);
+            return true;
         }
 
         /// <summary>
@@ -536,13 +585,41 @@ namespace TensorSharp.Cuda
                 || src.Storage is not CudaStorage || src.ElementType != DType.Float32 || !src.IsContiguous())
                 return false;
             long[] nd = Ne(dst), ns = Ne(src);
-            if (nd[2] * nd[3] != 1 || ns[2] * ns[3] != 1 || nd[0] != ns[0] || ids.ElementCount() < ns[1] || nd[1] > int.MaxValue)
+            // Rows of several heads ([heads, rows, d], a block drafter's KV ring): the same rows into each head's block.
+            long heads = nd[2];
+            if (nd[3] != 1 || ns[3] != 1 || ns[2] != heads || nd[0] != ns[0] || ids.ElementCount() < ns[1] || nd[1] > int.MaxValue
+                || (heads > 1 && dst.DimensionCount < 3))
                 return false;
             long pitch = dst.DimensionCount >= 2 ? dst.Strides[^2] : nd[0];
+            long dstHead = heads > 1 ? dst.Strides[^3] : 0, srcHead = ns[0] * ns[1];
             int count = (int)ns[1];
-            Launch(new[] { src, ids }, dst, (k, stream) => k.LaunchSetRows(Ptr(src), Ptr(ids), Ptr(dst), count, (int)ns[0], pitch, (int)nd[1],
-                dst.ElementType == DType.Float16, stream));
+            bool half = dst.ElementType == DType.Float16;
+            int elementBytes = half ? 2 : 4;
+            Launch(new[] { src, ids }, dst, (k, stream) =>
+            {
+                for (long h = 0; h < heads; h++)
+                    k.LaunchSetRows(Ptr(src) + (nint)(h * srcHead * sizeof(float)), Ptr(ids), Ptr(dst) + (nint)(h * dstHead * elementBytes), count,
+                        (int)ns[0], pitch, (int)nd[1], half, stream);
+            });
             return true;
+        }
+
+        /// <summary>Rows of a quantized weight by device ids (a block drafter's selector codebooks): the quantized gather kernel,
+        /// so the ids are never read back and a step that gathers them can be recorded.</summary>
+        protected override Tensor QuantizedRows(IGraphWeight weight, long firstRow, Value ids, RunState run)
+        {
+            Tensor index = ids.Tensor;
+            if (firstRow == 0 && weight.Ne2 <= 1 && index is { Storage: CudaStorage } && index.ElementType == DType.Int32
+                && index.IsContiguous() && index.ElementCount() <= int.MaxValue)
+            {
+                var result = new Tensor(Allocator, DType.Float32, index.ElementCount(), weight.Ne0);
+                using Tensor flat = index.View(index.ElementCount());
+                if (CudaQuantizedOps.TryGetRowsQuantizedToFloat32(result, weight.CacheKey, weight.Data, weight.Format, weight.Ne0, weight.Ne1,
+                        weight.Bytes, flat))
+                    return result;
+                result.Dispose();
+            }
+            return base.QuantizedRows(weight, firstRow, ids, run);
         }
 
         /// <summary>ggml_lightning_indexer on the device (a warp a key): a sparse attention's block scores, not read back.</summary>

@@ -115,6 +115,35 @@ namespace TensorSharp.Graph
         /// format runs it through here, as its per-op path does.</summary>
         public static Action<IGraphWeight, float[], int, float[]> HostQuantizedProduct { get; set; }
 
+        /// <summary>The managed dequantization of a weight's host rows (rows[i] of the weight into F32 row i of the output,
+        /// <see cref="IGraphWeight.Ne0"/> values each), registered beside <see cref="HostQuantizedProduct"/>.</summary>
+        public static Action<IGraphWeight, long[], float[]> HostQuantizedRows { get; set; }
+
+        /// <summary>
+        /// ggml_get_rows over a quantized weight (a block drafter's selector codebooks): rows <paramref name="firstRow"/> +
+        /// ids of <paramref name="weight"/>, as F32 [ids, Ne0] (ggml's [Ne0, ids]). Default: dequantized from the weight's
+        /// host blocks through <see cref="HostQuantizedRows"/>, the ids read on the host; an executor with a device gather
+        /// for the weight's format overrides it.
+        /// </summary>
+        protected virtual Tensor QuantizedRows(IGraphWeight weight, long firstRow, Value ids, RunState run)
+        {
+            if (HostQuantizedRows == null || weight.Data == IntPtr.Zero)
+                throw new NotSupportedException($"{GetType().Name} has no row gather for weight type {weight.Format}, and no host copy to run it on");
+            int[] index = Ints(ids);
+            var rows = new long[index.Length];
+            for (int i = 0; i < index.Length; i++)
+            {
+                rows[i] = firstRow + index[i];
+                if (index[i] < 0 || rows[i] >= weight.Ne1 * Math.Max(1, weight.Ne2))
+                    throw new InvalidOperationException($"get_rows index {index[i]} outside the weight's {weight.Ne1} rows");
+            }
+            var values = new float[rows.LongLength * weight.Ne0];
+            HostQuantizedRows(weight, rows, values);
+            var result = new Tensor(Allocator, DType.Float32, rows.Length, weight.Ne0);
+            result.SetElementsAsFloat(values);
+            return result;
+        }
+
         /// <summary><see cref="HostQuantizedProduct"/> on <paramref name="x"/>'s rows (copied to the host and back).</summary>
         protected Tensor HostProduct(IGraphWeight weight, Tensor x)
         {
@@ -1493,7 +1522,10 @@ namespace TensorSharp.Graph
                     return new Value { Tensor = dst };
                 }
                 case GraphOp.SetRows: return new Value { Tensor = SetRows(T(0), T(1), values[n.Srcs[2]], run) };
-                case GraphOp.GetRows: return V(GetRows(T(0), values[n.Srcs[1]], run));
+                case GraphOp.GetRows:
+                    return values[n.Srcs[0]].Weight is { } table
+                        ? V(QuantizedRows(table, values[n.Srcs[0]].FirstRow, values[n.Srcs[1]], run))
+                        : V(GetRows(T(0), values[n.Srcs[1]], run));
                 case GraphOp.Concat: return V(Concat(T(0), T(1), (int)Ip(0, 0), run));
                 case GraphOp.KvWindow:
                     return new Value { Tensor = run.Keep(KvWindow(T(0), n.Ip)), Window = new CacheWindow(T(0), n.Ip[3] % n.Ip[1]) };

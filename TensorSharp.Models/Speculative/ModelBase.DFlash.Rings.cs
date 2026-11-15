@@ -178,6 +178,33 @@ namespace TensorSharp.Models
             return ring;
         }
 
+        /// <summary>Tests: the rows of the drafter's KV ring.</summary>
+        internal int DFlashRingRowsForTests => DFlashRingRows;
+
+        /// <summary>
+        /// Tests: the bound ring's rows of draft layer <paramref name="layer"/> for the positions it holds as context
+        /// (<paramref name="first"/> up to the write frontier), host-current, in position order; each position's K (and
+        /// V) is [kvHeads][headDim].
+        /// </summary>
+        internal (float[] K, float[] V) DFlashRingContextForTests(int layer, out int first)
+        {
+            EnsureDFlashRingHostSynchronized();
+            int rows = _dflashRingRows, kvHeads = _dflash.NumKVHeads, hd = _dflash.HeadDim;
+            first = Math.Max(Math.Max(0, _dflashRingFilled - rows), _dflashRingValidFrom);
+            int lo = first, count = Math.Max(0, _dflashRingFilled - lo);
+            return (Gather(_dflashRingK[layer]), Gather(_dflashRingV[layer]));
+
+            float[] Gather(Tensor ring)
+            {
+                float[] all = ring.GetElementsAsFloat(kvHeads * rows * hd);
+                var context = new float[(long)count * kvHeads * hd];
+                for (int i = 0; i < count; i++)
+                    for (int h = 0; h < kvHeads; h++)
+                        Array.Copy(all, ((long)h * rows + (lo + i) % rows) * hd, context, ((long)i * kvHeads + h) * hd, hd);
+                return context;
+            }
+        }
+
         private void DisposeDFlashRingPool()
         {
             if (_dflashModelRing != null)

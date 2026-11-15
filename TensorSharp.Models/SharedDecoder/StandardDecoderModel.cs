@@ -1322,6 +1322,7 @@ namespace TensorSharp.Models
             _replicas.Clear();
             DisposeSlots();
             ClearGraphCache();
+            ReleaseGraphBlockDraft();
             DisposeRecurrentStates();
             DropPendingMedia();
             // The executors' own resources (a CUDA executor's doorbell, staging arena, page-locked ranges of the mappings and

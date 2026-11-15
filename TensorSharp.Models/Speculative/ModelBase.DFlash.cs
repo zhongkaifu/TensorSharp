@@ -195,12 +195,12 @@ namespace TensorSharp.Models
         private protected int[] _dflashCaptureSlot;
 
         /// <summary>Per draft layer, the weight names of that block.</summary>
-        private string[][] _dflashLayerNames;
+        private protected string[][] _dflashLayerNames;
 
         /// <summary>The drafter's own KV ring, [numKVHeads, ringRows, headDim] per
         /// draft layer, indexed by (absolute position % ringRows).</summary>
-        private Tensor[] _dflashRingK;
-        private Tensor[] _dflashRingV;
+        private protected Tensor[] _dflashRingK;
+        private protected Tensor[] _dflashRingV;
         private int _dflashRingRows;
 
         /// <summary>Committed positions the DFlash KV ring keeps; 0 without a drafter.</summary>
@@ -677,6 +677,8 @@ namespace TensorSharp.Models
             RecordDSpineDumpRows(hRows, rowOffset, n, startPos);
             if (DFlashDraftingDeclined)
                 return;   // this request's ring is incomplete; it decodes without drafts
+            if (TryGraphDFlashInject(hRows, rowOffset, n, startPos))
+                return;
             _dflashFusedInjectFailed = false;
             if (TryFusedDFlashInject(hRows, rowOffset, n, startPos))
                 return;
@@ -688,6 +690,20 @@ namespace TensorSharp.Models
             using Tensor g = DFlashEncode(hRows, rowOffset, n);
             DFlashInjectKv(g, n, startPos);
         }
+
+        /// <summary>
+        /// PASS A+B as the runtime's graph program (StandardDecoderModel.BlockDraft.cs): true when it wrote the
+        /// ring and its bookkeeping, false when the model does not run the drafter as graphs, in which case the
+        /// fused or per-op inject runs. Same arguments as <see cref="DFlashEncodeAndInject"/>.
+        /// </summary>
+        private protected virtual bool TryGraphDFlashInject(float[] hRows, int rowOffset, int n, int startPos) => false;
+
+        /// <summary>
+        /// PASS C as the runtime's graph program (StandardDecoderModel.BlockDraft.cs): the number of drafts written,
+        /// or -1 when the model does not run the drafter as graphs, in which case the fused or per-op block runs.
+        /// Same arguments as <see cref="DFlashDraftBlockCore"/>.
+        /// </summary>
+        private protected virtual int TryGraphDFlashDraftBlock(int anchorToken, int position, int b, int[] draftOut, float[] confOut) => -1;
 
         /// <summary>
         /// After a fused inject that ran and failed (device memory, typically): on a discrete GPU the bound request
@@ -896,6 +912,9 @@ namespace TensorSharp.Models
         private unsafe int DFlashDraftBlockCore(int anchorToken, int position, int b, int[] draftOut, float[] confOut)
         {
             FlushDeferredDFlashInjects();
+            int graph = TryGraphDFlashDraftBlock(anchorToken, position, b, draftOut, confOut);
+            if (graph >= 0)
+                return graph;
             int fused = TryFusedDFlashDraftBlock(anchorToken, position, b, draftOut, confOut);
             if (fused >= 0)
                 return fused;
@@ -1762,7 +1781,7 @@ namespace TensorSharp.Models
             return sum > 0 ? (float)(Math.Exp(row[index] - max) / sum) : 0f;
         }
 
-        private Tensor DFlashEmbedding(int[] ids)
+        private protected Tensor DFlashEmbedding(int[] ids)
         {
             Tensor rows = Embedding(ids);
             if (_quantWeights.TryGetValue("token_embd.weight", out var weight) && weight.Scale != 1f)
