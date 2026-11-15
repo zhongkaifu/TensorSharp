@@ -508,6 +508,13 @@ namespace TensorSharp.Graph
                         case GraphNodeKind.Boundary:
                             Uses[e.Node]++;
                             break;
+                        case GraphNodeKind.Fused:
+                            // A region's inputs live until it closes (the session spends these reads there): its kernel reads
+                            // them, and an input whose last op reader ran before the region opened (a QSA layer's cache write
+                            // rows) had been released by then.
+                            foreach (int src in e.Srcs ?? Array.Empty<int>())
+                                if (src >= 0 && src < Count) Uses[src]++;
+                            break;
                     }
                 }
             }
@@ -575,6 +582,7 @@ namespace TensorSharp.Graph
             }
 
             private GraphNode _region;   // the open fused region this executor has a kernel for (Kind Fused), else default
+            private readonly Stack<int[]> _regionInputs = new();   // every open region's inputs, innermost on top
             private readonly List<int> _regionOps = new();   // the ops the open region deferred, in order
             private int _nested;         // regions opened inside it (part of it: their ends do not close it)
             private bool InRegion => _region.Kind == GraphNodeKind.Fused;
@@ -635,6 +643,7 @@ namespace TensorSharp.Graph
                         else _boundaryPending[e.Node] = 0;
                         break;
                     case GraphNodeKind.Fused:
+                        _regionInputs.Push(e.Srcs ?? Array.Empty<int>());
                         if (InRegion) _nested++;
                         else if (_x.Fuses((GraphFusion)e.Node) || _x.RunsConcurrently((GraphFusion)e.Node)) _region = e;
                         break;
@@ -649,6 +658,10 @@ namespace TensorSharp.Graph
                                 Attribute(() => RunFused(region, end.Srcs));
                             SkipUnrun();
                         }
+                        // The region's reads of its inputs (Liveness counts one each) are spent, run or not.
+                        if (_regionInputs.Count > 0)
+                            foreach (int src in _regionInputs.Pop())
+                                if (src >= 0 && src < _count) Use(src);
                         break;
                 }
             }
