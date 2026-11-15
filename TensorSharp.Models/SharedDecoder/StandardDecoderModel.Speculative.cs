@@ -76,8 +76,17 @@ namespace TensorSharp.Models
                 : executor.Compile(program);
         }
 
-        /// <summary>A family moved buffers a cached graph binds: drop the cached graphs.</summary>
-        protected void NoteGraphBindingsChanged() => ClearGraphCache();
+        /// <summary>
+        /// A family moved buffers a cached graph binds. Plans keyed by identity never bind the moved ones again and stay for
+        /// the steps that bind what did not move: a Qwen3.8 Flash Next request's first verify window grew 35 layers' verify
+        /// buffers, and each had dropped every plan and recording of every slot. Steps kept to advance see the move through
+        /// RecurrentState.BindingChanges. An executor that binds host addresses drops every graph.
+        /// </summary>
+        protected void NoteGraphBindingsChanged()
+        {
+            if (GraphsKeyedByIdentity) ForgetProgramsKeyedOtherwise();
+            else ClearGraphCache();
+        }
 
         /// <summary>Attach a DFlash / DFlash2 / DSpine drafter after the trunk loaded.</summary>
         protected void AttachDraftModel(string draftModelPath)

@@ -788,6 +788,7 @@ namespace TensorSharp.Models
                 if (!grown && PleConvHistory != null) return false;
                 Free(PleConvHistory);
                 PleConvHistory = new Tensor(PleConv.Allocator, DType.Float32, Math.Max(1, _p.ConvHistory) + SnapshotCapacity, _p.StreamFloats);
+                if (!grown) NoteBindingsChanged();   // a kept step that binds the history advances no more
                 return true;
             }
 

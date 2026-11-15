@@ -969,6 +969,57 @@ public sealed class Qwen35RuntimeTests : IDisposable
     public void AdvancedDecodeStepsMatchTracedOnesOnDirectCuda(string variant)
         => AssertAdvancedDecodeMatchesTraced(variant, path => Create(path, backend: BackendType.Cuda));
 
+    /// <summary>A request's recorded decode steps park when it ends, and the pooled slot's next request replays them where
+    /// its steps trace to the same plan (each window it reaches): the same prompt answers with the same logits, bit for
+    /// bit, without running and recording those steps again.</summary>
+    [CudaTheory]
+    [InlineData("dense")]
+    public void ParkedDecodeRecordingsServeThePooledSlotsNextRequestOnDirectCuda(string variant)
+        => AssertParkedRecordingsServeTheNextRequest(variant, retain: false);
+
+    /// <summary>The same when the first request's slot is kept (the prefix cache keeps finished slots): the next request runs
+    /// on a new slot, and its steps replay the parked recordings moved to its caches and states.</summary>
+    [CudaTheory]
+    [InlineData("dense")]
+    public void ParkedDecodeRecordingsMoveToANewSlotOnDirectCuda(string variant)
+        => AssertParkedRecordingsServeTheNextRequest(variant, retain: true);
+
+    private void AssertParkedRecordingsServeTheNextRequest(string variant, bool retain)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture(variant), backend: BackendType.Cuda);
+        var unified = (IUnifiedBatchModel)model;
+        int[] prompt = Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray();
+        List<float[]> Request(string id)
+        {
+            unified.EnsureSequenceSlot(id, 320);
+            var logits = new float[1][];
+            Assert.True(unified.TryForwardUnified(new[] { id }, new[] { prompt }, new[] { 0 }, logits));
+            var trace = new List<float[]> { (float[])logits[0].Clone() };
+            int next = ArgMax(logits[0]), length = prompt.Length;
+            // Past the 256-key window edge: two windows, each recorded.
+            for (int t = 0; t < 250; t++)
+            {
+                Assert.True(unified.TryForwardUnified(new[] { id }, new[] { new[] { next } }, new[] { length }, logits));
+                trace.Add((float[])logits[0].Clone());
+                next = ArgMax(logits[0]);
+                length++;
+            }
+            if (retain) Assert.True(model.RetainSequenceCache(id));
+            else model.OnSequenceReleased(id);
+            return trace;
+        }
+        List<float[]> first = Request("a");
+        Assert.True(model.ParkedRecordingCount >= 2, $"{model.ParkedRecordingCount} recordings parked after the first request");
+        int adopted = model.RecordingsAdopted, relocated = model.RecordingsRelocated;
+        List<float[]> second = Request("b");
+        Assert.True(model.RecordingsAdopted - adopted >= 2, $"the second request replayed {model.RecordingsAdopted - adopted} parked recordings");
+        Assert.Equal(retain, model.RecordingsRelocated - relocated >= 2);
+        Assert.Equal(first.Count, second.Count);
+        for (int i = 0; i < first.Count; i++)
+            Assert.True(first[i].AsSpan().SequenceEqual(second[i]), $"row {i}: the second request's logits differ (relL2 {RelL2(second[i], first[i]):E2})");
+    }
+
     /// <summary>The same over per-rank graphs on two ggml_cuda GPUs: every rank's step advances in place and the ranks run
     /// together without a trace.</summary>
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]

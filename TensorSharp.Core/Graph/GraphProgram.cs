@@ -231,6 +231,8 @@ namespace TensorSharp.Graph
         private readonly List<GraphNode>? _entries;
         private readonly List<long> _outputs = new();
         private ulong _h1 = 14695981039346656037UL, _h2 = 0x9E3779B97F4A7C15UL;
+        private ulong _s1 = 14695981039346656037UL, _s2 = 0x9E3779B97F4A7C15UL;
+        private bool _signatureOnly;
 
         public GraphProgramBuilder(bool record) => _entries = record ? new List<GraphNode>() : null;
 
@@ -250,11 +252,18 @@ namespace TensorSharp.Graph
         public int OutputCount => _outputs.Count;
         public (ulong, ulong) Signature => (_h1, _h2);
 
+        /// <summary>The signature without the state leaves' identities: two steps that run the same kernels over different
+        /// caches and states (another slot's) share it.</summary>
+        public (ulong, ulong) StructuralSignature => (_s1, _s2);
+
         public void Mix(long value)
         {
             ulong v = unchecked((ulong)value);
             _h1 = (_h1 ^ v) * 1099511628211UL;
             _h2 = (_h2 ^ (v + 0x9E3779B97F4A7C15UL + (_h2 << 6) + (_h2 >> 2))) * 0xC2B2AE3D27D4EB4FUL;
+            if (_signatureOnly) return;
+            _s1 = (_s1 ^ v) * 1099511628211UL;
+            _s2 = (_s2 ^ (v + 0x9E3779B97F4A7C15UL + (_s2 << 6) + (_s2 >> 2))) * 0xC2B2AE3D27D4EB4FUL;
         }
 
         public void Mix(ReadOnlySpan<long> values) { Mix(values.Length); foreach (long v in values) Mix(v); }
@@ -266,7 +275,13 @@ namespace TensorSharp.Graph
         public int Leaf(GraphLeafRole role, int format, ReadOnlySpan<long> ne, IntPtr data, long bytes, GraphSplit? split = null, object? handle = null)
         {
             Mix(1); Mix((int)role); Mix(format); Mix(ne);
-            if (role != GraphLeafRole.Input) { Mix(data.ToInt64()); Mix(bytes); }
+            if (role != GraphLeafRole.Input)
+            {
+                _signatureOnly = role == GraphLeafRole.State;
+                Mix(data.ToInt64());
+                _signatureOnly = false;
+                Mix(bytes);
+            }
             if (split != null) { Mix(100 + split.Axis); Mix(split.Ne); }
             if (Keeping) Emit(NodeCount, new GraphNode { Kind = GraphNodeKind.Leaf, Role = role, Format = format, Ne = ne.ToArray(), Data = data, Bytes = bytes, Split = split, Handle = handle });
             return NodeCount++;

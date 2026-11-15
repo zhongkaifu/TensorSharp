@@ -39,9 +39,75 @@ namespace TensorSharp.Cuda
         public RuntimeDecodeCapture(CudaAllocator allocator)
         {
             _allocator = allocator;
-            _graphs = new CudaPrefillGraphCache(allocator);
+            _graphs = new CudaPrefillGraphCache(allocator) { KeepTemplates = true };
             _dyn = new CudaDecodeDynParams(allocator);
         }
+
+        /// <summary>The state leaves the recording was made over: (device base, bytes, byte offset of the leaf) each.</summary>
+        private (long Base, long Bytes, long Offset)[] _states;
+        private CudaGraphRelocation _relocation;
+
+        public void NoteStates(IReadOnlyList<Tensor> states)
+        {
+            if (Captured) return;
+            _states = Describe(states);
+        }
+
+        /// <summary>Each leaf's storage range and offset; null when one is not a device tensor of this allocator.</summary>
+        private (long, long, long)[] Describe(IReadOnlyList<Tensor> states)
+        {
+            var described = new (long, long, long)[states.Count];
+            for (int i = 0; i < states.Count; i++)
+            {
+                if (states[i]?.Storage is not CudaStorage storage || !ReferenceEquals(storage.Allocator, _allocator)) return null;
+                described[i] = (storage.DeviceBuffer.ToInt64(), storage.ByteLength, states[i].StorageOffset * states[i].ElementType.Size());
+            }
+            return described;
+        }
+
+        public bool TryRelocate(IReadOnlyList<Tensor> states, IReadOnlyList<Tensor> written)
+        {
+            if (!Captured || _disposed || _states == null || !_graphs.TryGetGraphs(Key, out IntPtr exec, out IntPtr template)
+                || template == IntPtr.Zero)
+                return false;
+            (long Base, long Bytes, long Offset)[] target = Describe(states);
+            if (target == null || target.Length != _states.Length) return false;
+            var bases = new long[target.Length];
+            var moved = new Dictionary<long, long>();
+            for (int i = 0; i < target.Length; i++)
+            {
+                if (target[i].Bytes != _states[i].Bytes || target[i].Offset != _states[i].Offset) return false;
+                // Leaves that shared a storage share one where they move to.
+                if (moved.TryGetValue(_states[i].Base, out long to) ? to != target[i].Base : !moved.TryAdd(_states[i].Base, target[i].Base))
+                    return false;
+                bases[i] = target[i].Base;
+            }
+            _allocator.Context.MakeCurrent();
+            _relocation ??= new CudaGraphRelocation(template, Array.ConvertAll(_states, s => (s.Base, s.Bytes)));
+            if (_relocation.Refusal != null)
+            {
+                if (!_refusalReported)
+                {
+                    _refusalReported = true;
+                    if (RelocationLog) Console.Error.WriteLine($"[cuda-graph] a recorded step cannot move to another slot: {_relocation.Refusal}");
+                }
+                return false;
+            }
+            // What the step reads must be on the device (the eager run it replaces would have uploaded it).
+            foreach (Tensor t in states) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            if (!_relocation.Apply(exec, _allocator.Context.Handle, bases))
+            {
+                // Part of the graph points at the new slot: it must never run again.
+                Captured = false;
+                return false;
+            }
+            _graphs.ReplaceKeepAlive(Key, written);
+            return true;
+        }
+
+        private bool _refusalReported;
+
+        private static readonly bool RelocationLog = Environment.GetEnvironmentVariable("TS_CUDA_PREFILL_GRAPH_LOG") == "1";
 
         public bool Captured { get; private set; }
 

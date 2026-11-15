@@ -339,6 +339,8 @@ namespace TensorSharp.Cuda
         private sealed class Entry
         {
             public IntPtr Exec;
+            /// <summary>The captured graph the instantiation was made from (kept with <see cref="KeepTemplates"/>).</summary>
+            public IntPtr Template;
             public Tensor InputHidden;
             public List<Tensor> KeepAlive;
             public List<(IntPtr ptr, long bytes)> OwnedBlocks;
@@ -368,6 +370,32 @@ namespace TensorSharp.Cuda
         }
 
         public bool IsUsable => allocator != null && !disposed;
+
+        /// <summary>Keep each captured graph beside its instantiation: its nodes hold the recorded launch arguments, which a
+        /// relocation (CudaGraphRelocation) reads.</summary>
+        public bool KeepTemplates { get; set; }
+
+        /// <summary>The instantiated graph of <paramref name="key"/> and its template (zero without <see cref="KeepTemplates"/>).</summary>
+        internal bool TryGetGraphs(string key, out IntPtr exec, out IntPtr template)
+        {
+            exec = template = IntPtr.Zero;
+            if (!entries.TryGetValue(key, out Entry entry)) return false;
+            exec = entry.Exec;
+            template = entry.Template;
+            return true;
+        }
+
+        /// <summary>The tensors <paramref name="key"/>'s recording writes in place moved (its graph was relocated to others): it
+        /// keeps those alive and marks them written instead.</summary>
+        internal void ReplaceKeepAlive(string key, IEnumerable<Tensor> keepAlive)
+        {
+            Entry entry = entries[key];
+            // The first is the recording's own input tensor.
+            for (int i = 1; i < entry.KeepAlive.Count; i++) entry.KeepAlive[i].Dispose();
+            entry.KeepAlive.RemoveRange(1, entry.KeepAlive.Count - 1);
+            foreach (Tensor t in keepAlive)
+                if (t != null) entry.KeepAlive.Add(t.CopyRef());
+        }
 
         /// <summary>
         /// When a cached graph exists for <paramref name="key"/>, returns (a
@@ -491,7 +519,11 @@ namespace TensorSharp.Cuda
             }
 
             rc = CudaDriverApi.cuGraphInstantiateWithFlags(out IntPtr exec, graph, 0);
-            CudaDriverApi.cuGraphDestroy(graph);
+            if (!KeepTemplates || rc != 0 || exec == IntPtr.Zero)
+            {
+                CudaDriverApi.cuGraphDestroy(graph);
+                graph = IntPtr.Zero;
+            }
             if (rc != 0 || exec == IntPtr.Zero)
             {
                 ReleaseContextBlocks(ctx);
@@ -527,6 +559,7 @@ namespace TensorSharp.Cuda
             entries[key] = new Entry
             {
                 Exec = exec,
+                Template = graph,
                 InputHidden = pinnedHidden.CopyRef(),
                 KeepAlive = keep,
                 OwnedBlocks = owned,
@@ -604,6 +637,7 @@ namespace TensorSharp.Cuda
             // between forwards (each forward ends in a logits sync), so the
             // stream is idle with respect to this graph here.
             CudaDriverApi.cuGraphExecDestroy(entry.Exec);
+            if (entry.Template != IntPtr.Zero) CudaDriverApi.cuGraphDestroy(entry.Template);
             foreach (Tensor t in entry.KeepAlive)
                 t.Dispose();
             entry.InputHidden.Dispose();

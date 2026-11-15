@@ -292,6 +292,8 @@ namespace TensorSharp.Models
             public GraphStep Step;
             public CachedGraph Graph;
             public (ulong, ulong) Signature;
+            /// <summary>The signature without the state leaves' identities (GraphStep.StructuralSignature).</summary>
+            public (ulong, ulong) Structure;
             public StepOutputs Outputs;
             public Slot[] Slots;
             public Tensor[][][] K, V;
@@ -331,7 +333,7 @@ namespace TensorSharp.Models
             int n = slots.Length;
             var r = new DecodeReplay
             {
-                Step = step, Graph = graph, Signature = step.Signature, Outputs = outputs, Slots = (Slot[])slots.Clone(),
+                Step = step, Graph = graph, Signature = step.Signature, Structure = step.StructuralSignature, Outputs = outputs, Slots = (Slot[])slots.Clone(),
                 K = new Tensor[n][][], V = new Tensor[n][][], Recurrent = new RecurrentState[n][][], Capacity = new int[n], RopeDelta = new int[n],
                 Starts = (int[])starts.Clone(), Floor = floor, Shape = shape, Epoch = _graphEpoch,
                 Bindings = System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges),
@@ -356,15 +358,17 @@ namespace TensorSharp.Models
                 r.Step.Dispose();
             }
             _decodeReplays.Clear();
+            DisposeParkedRecordings();
         }
 
         /// <summary>
         /// A slot ends a request (released, retained, or the primary cache reset): the steps kept to advance on its caches and
         /// states go, so the next request on the slot traces anew. A pooled slot keeps its caches and states, which every
         /// check of an advance compares, and a window recorded for one request replayed some 3,000 positions on for the
-        /// next (CUDA error 700 on an A40).
+        /// next (CUDA error 700 on an A40). Their recordings park: a later trace of the same plan replays one only at its
+        /// own window (<see cref="TryRunParked"/>).
         /// </summary>
-        private void DropReplaysOf(Tensor[][] k, RecurrentState[][] recurrent)
+        private void DropReplaysOf(Tensor[][] k, RecurrentState[][] recurrent, bool park = true)
         {
             bool Binds(Tensor[][][] ks, RecurrentState[][][] rs)
             {
@@ -376,7 +380,7 @@ namespace TensorSharp.Models
             foreach (var (shape, r) in _decodeReplays)
                 if (Binds(r.K, r.Recurrent)) (drop ??= new List<string>()).Add(shape);
             if (drop != null)
-                foreach (string shape in drop) DropDecodeReplay(shape);
+                foreach (string shape in drop) DropDecodeReplay(shape, park);
             if (_rankedReplay != null && Binds(_rankedReplay.K, _rankedReplay.Recurrent)) DropRankedReplay();
         }
 
@@ -397,13 +401,209 @@ namespace TensorSharp.Models
                     r.DisposeCapture();
                     r.Advances = 0;
                 }
+            DisposeParkedRecordings();
         }
 
-        private void DropDecodeReplay(string shape)
+        /// <summary>Drop the kept step of <paramref name="shape"/>; its recording parks (<see cref="_parkedRecordings"/>) unless
+        /// what it binds changed (<paramref name="park"/> false).</summary>
+        private void DropDecodeReplay(string shape, bool park = true)
         {
             if (!_decodeReplays.Remove(shape ?? "", out DecodeReplay r)) return;
-            r.DisposeCapture();
+            if (park) ParkOrDisposeCapture(r);
+            else r.DisposeCapture();
             r.Step.Dispose();
+        }
+
+        /// <summary>A recorded step's recording, kept after its step was dropped (its request ended, its window filled).</summary>
+        private sealed class ParkedRecording
+        {
+            public IDecodeCapture Capture;
+            public Tensor[] Outputs;
+            public object[] Bound;
+            public (ulong, ulong) Structure;
+
+            public void Dispose()
+            {
+                if (Outputs != null) foreach (Tensor t in Outputs) t?.Dispose();
+                Outputs = null;
+                Capture?.Dispose();
+                Capture = null;
+            }
+        }
+
+        /// <summary>
+        /// Recordings of dropped steps, by their plan's signature. A plan's signature hashes every state and weight leaf by
+        /// identity (GraphIdentity), so a later step that traces to the same signature runs the same kernels over the same
+        /// slot's caches and states: it replays the parked recording instead of running once and recording again. A pooled
+        /// slot's next request, and a window a request had filled before, then cost a trace instead of a run and a recording
+        /// (the direct engines' graphs outlive their requests; recording again cost a Qwen3.8 Flash Next MTP request on an
+        /// A40 about 0.1 s of 2.3: four target widths recorded at its start and again past 256 positions).
+        /// </summary>
+        private readonly Dictionary<(ulong, ulong), ParkedRecording> _parkedRecordings = new();
+        private readonly LinkedList<(ulong, ulong)> _parkedLru = new();
+
+        /// <summary>Parked recordings at most (each keeps the pool blocks its step used). Memory pressure drops them all: a
+        /// prompt step that does not fit clears the graph cache first, and a step that cannot record clears them.</summary>
+        private const int ParkedRecordingsMax = 24;
+
+        /// <summary>Steps that took over a parked recording (tests check that a request reuses them).</summary>
+        internal int RecordingsAdopted { get; private set; }
+
+        internal int ParkedRecordingCount => _parkedRecordings.Count;
+
+        /// <summary>Park <paramref name="r"/>'s recording (one that recorded, since the last time every graph went); dispose it
+        /// otherwise. A plan owns no device memory, so the recording does not need its plan cached: the graph cache's 32 plans
+        /// turned over with every new slot's, and had taken their recordings with them.</summary>
+        private void ParkOrDisposeCapture(DecodeReplay r)
+        {
+            if (r.Capture is { Captured: true } && !r.CaptureFailed && r.Epoch == _graphEpoch)
+            {
+                DisposeParked(r.Signature);
+                _parkedRecordings[r.Signature] = new ParkedRecording
+                {
+                    Capture = r.Capture, Outputs = r.CaptureOutputs, Bound = r.Bound, Structure = r.Structure,
+                };
+                _parkedLru.AddFirst(r.Signature);
+                r.Capture = null;
+                r.CaptureOutputs = null;
+                while (_parkedLru.Count > ParkedRecordingsMax) DisposeParked(_parkedLru.Last.Value);
+            }
+            r.DisposeCapture();
+        }
+
+        private void DisposeParked((ulong, ulong) signature)
+        {
+            if (!_parkedRecordings.Remove(signature, out ParkedRecording p)) return;
+            _parkedLru.Remove(signature);
+            p.Dispose();
+        }
+
+        /// <summary>Parked recordings that bind any of <paramref name="storages"/> (<see cref="BoundStorages"/> pairs) go.</summary>
+        private void DisposeParkedBinding(object[] storages)
+        {
+            if (_parkedRecordings.Count == 0 || storages.Length == 0) return;
+            var gone = new HashSet<object>(ReferenceEqualityComparer.Instance);
+            for (int i = 0; i < storages.Length; i += 2) gone.Add(storages[i]);
+            List<(ulong, ulong)> drop = null;
+            foreach (var (signature, p) in _parkedRecordings)
+                for (int i = 0; i < p.Bound.Length; i += 2)
+                    if (gone.Contains(p.Bound[i]))
+                    {
+                        (drop ??= new()).Add(signature);
+                        break;
+                    }
+            if (drop != null) foreach (var signature in drop) DisposeParked(signature);
+        }
+
+        /// <summary>Whether cached plans bind their state leaves by object identity (GraphIdentity), which a freed tensor never
+        /// has again; an executor that binds host addresses can see a freed buffer's address come back.</summary>
+        private bool GraphsKeyedByIdentity => GraphExecutor != null && !GraphExecutor.Capabilities.BindsHostPointers;
+
+        /// <summary>
+        /// <paramref name="slot"/>'s caches and states are about to be freed. Plans keyed by identity never bind them again, so
+        /// only the steps kept over them and the recordings that hold them go (a finished conversation's slot reclaimed from the
+        /// prefix cache had dropped every plan and recording of the conversations still running); elsewhere every graph goes.
+        /// </summary>
+        private void ForgetGraphsOf(Slot slot)
+        {
+            if (!GraphsKeyedByIdentity)
+            {
+                ClearGraphCache();
+                return;
+            }
+            DropReplaysOf(slot.K, slot.Recurrent, park: false);
+            DisposeParkedBinding(BoundStorages(new[] { slot }));
+            ForgetProgramsKeyedOtherwise();
+        }
+
+        /// <summary>Programs cached by something other than their leaves' identities: the streamed kinds' templates and a
+        /// family's (Qwen3.5's commit copies, keyed by one state's identity).</summary>
+        private void ForgetProgramsKeyedOtherwise()
+        {
+            OnGraphCacheCleared();
+            _streamedKinds.Clear();
+            _streamTemplates.Clear();
+        }
+
+        private void DisposeParkedRecordings()
+        {
+            foreach (ParkedRecording p in _parkedRecordings.Values) p.Dispose();
+            _parkedRecordings.Clear();
+            _parkedLru.Clear();
+        }
+
+        /// <summary>
+        /// A traced decode step whose plan has a parked recording over the same slot: kept as its shape's step with that
+        /// recording, and run as it (no eager run, no recording). False leaves the step to the caller, nothing run.
+        /// </summary>
+        private bool TryRunParked(GraphStep step, CachedGraph graph, StepOutputs outputs, Slot[] slots, int[] starts, int floor, string shape)
+        {
+            // The shape's kept step of this plan (a draft step back a position after a rejection) parks its recording first.
+            if (_decodeReplays.TryGetValue(shape ?? "", out DecodeReplay current) && current.Signature == step.Signature)
+                DropDecodeReplay(shape);
+            ParkedRecording p;
+            if (_parkedRecordings.Remove(step.Signature, out p))
+            {
+                _parkedLru.Remove(step.Signature);
+                if (!SameBound(p.Bound, slots))
+                {
+                    p.Dispose();
+                    return false;
+                }
+            }
+            else if ((p = TakeRelocated(step, slots)) == null)
+                return false;
+            KeepDecodeReplay(step, graph, outputs, slots, starts, floor, shape);
+            DecodeReplay r = _decodeReplays[shape ?? ""];
+            r.Capture = p.Capture;
+            r.CaptureOutputs = p.Outputs;
+            r.Advances = 1;
+            RecordingsAdopted++;
+            if (!TryRunRecorded(r, graph, slots, starts)) RunUnrecorded(r, graph);
+            return true;
+        }
+
+        /// <summary>
+        /// A parked recording of the same plan structure over another slot, moved to this step's state leaves
+        /// (IDecodeCapture.TryRelocate): a request on a new slot - each one with the prefix cache keeping finished slots -
+        /// had recorded every width again (~30 ms each for Qwen3.8 Flash Next on an A40), where the direct engines' graphs
+        /// serve every slot. Null when none can move.
+        /// </summary>
+        private ParkedRecording TakeRelocated(GraphStep step, Slot[] slots)
+        {
+            if (slots.Length != 1) return null;
+            (ulong, ulong) found = default;
+            bool any = false;
+            // The least recently parked first: the most recent is likelier to serve its own slot again.
+            for (LinkedListNode<(ulong, ulong)> n = _parkedLru.Last; n != null; n = n.Previous)
+                if (_parkedRecordings[n.Value].Structure == step.StructuralSignature)
+                {
+                    found = n.Value;
+                    any = true;
+                    break;
+                }
+            if (!any) return null;
+            ParkedRecording p = _parkedRecordings[found];
+            if (p.Capture.TryRelocate(step.StateLeaves, WrittenTensors(slots[0])))
+            {
+                _parkedRecordings.Remove(found);
+                _parkedLru.Remove(found);
+                RecordingsRelocated++;
+                return p;
+            }
+            if (!p.Capture.Captured) DisposeParked(found);   // broken part way: it must never run
+            return null;
+        }
+
+        /// <summary>Steps that took over a parked recording moved from another slot (tests check that a new slot reuses them).</summary>
+        internal int RecordingsRelocated { get; private set; }
+
+        /// <summary>Run a kept step's plan as usual (its recording declined or failed; nothing ran).</summary>
+        private void RunUnrecorded(DecodeReplay r, CachedGraph graph)
+        {
+            if (graph.Plan is IGraphTensorOutputs keep) keep.KeepTensors = false;
+            if (!r.Step.Run(graph.Plan))
+                throw new InvalidOperationException($"{Config.Architecture} graph step failed: {graph.Plan.LastError}");
         }
 
 
@@ -411,11 +611,10 @@ namespace TensorSharp.Models
         internal bool DecodeCaptureDisabled { get; set; }
 
         /// <summary>
-        /// Run an advanced decode step as the device's recording of it: the first advance of a kept step records it (the
-        /// trace already ran the plan once, which settled its pools and lazy buffers) and every later one replays the
-        /// recording with this position's inputs, attention length and cache write row. One sequence only (the attention
-        /// length and the write row are one value each). False runs the step as usual; a recording that fails on the first
-        /// advance is tried once more on the next, then not again.
+        /// Run a kept decode step as the device's recording of it: its first run records it and every later one (each
+        /// advance) replays the recording with this position's inputs, attention length and cache write row. One sequence
+        /// only (the attention length and the write row are one value each). False runs the step as usual; a recording that
+        /// fails is tried once more on the next advance, then not again.
         /// </summary>
         private bool TryRunRecorded(DecodeReplay r, CachedGraph cached, Slot[] slots, int[] starts)
         {
@@ -424,11 +623,11 @@ namespace TensorSharp.Models
             if (r.CaptureFailed || DecodeCaptureDisabled || slots.Length != 1 || r.Floor > 0 || GraphExecutor is not IDecodeCaptureExecutor recorder
                 || cached.Plan is not IGraphTensorOutputs keep || (_expertHost != null && !GraphExecutor.Capabilities.RecordsHostExperts))
                 return false;   // (a step whose host experts read the routes back mid-step cannot be recorded)
-            // Recording on the second advance ran one more unrecorded step of every shape a request starts and every 256
-            // positions: about 1.5% of a Qwen3.8 Flash Next MTP reply's time on an A40.
             if (r.Capture == null) r.Advances++;
             // Too little device memory left for another recording: this step runs as usual and tries again later, and the next
             // step first gives finished conversations' retained slots back (RoomForRecordings).
+            // Parked recordings give their memory back first.
+            if (r.Capture == null && _parkedRecordings.Count > 0 && !recorder.HasRoomToRecord()) DisposeParkedRecordings();
             if (r.Capture == null && !recorder.HasRoomToRecord())
             {
                 r.Advances = 0;
@@ -446,6 +645,7 @@ namespace TensorSharp.Models
                 if (!r.Capture.Captured)
                 {
                     keep.KeepTensors = true;
+                    r.Capture.NoteStates(r.Step.StateLeaves);
                     bool recorded = r.Capture.CaptureAndLaunch(() => r.Step.Run(cached.Plan), attend, writeRow, WrittenTensors(slots[0]));
                     if (!recorded)
                     {
@@ -551,7 +751,7 @@ namespace TensorSharp.Models
                 return false;
             if (r.Bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges))
             {
-                DropDecodeReplay(shape);
+                DropDecodeReplay(shape, park: false);
                 return false;
             }
             // Every sequence moves on by the same positions: one for decode steps, a verify window's accepted rows and one.
@@ -568,7 +768,7 @@ namespace TensorSharp.Models
             }
             if (!SameBound(r.Bound, slots))
             {
-                DropDecodeReplay(shape);
+                DropDecodeReplay(shape, park: false);
                 return false;
             }
             if (!_graphCache.TryGetValue(r.Signature, out CachedGraph cached) || !ReferenceEquals(cached, r.Graph)
@@ -929,7 +1129,29 @@ namespace TensorSharp.Models
                     }
                 }
 
+                // A decode step whose plan an earlier request recorded over this slot replays that recording.
+                if (advance && !owned && step.Advanceable && (_parkedRecordings.Count > 0 || _decodeReplays.ContainsKey(replayShape ?? ""))
+                    && TryRunParked(step, graph, outputs, slots, starts, attentionFloor, replayShape))
+                {
+                    step = null;   // the kept step owns it now
+                    GraphRuns++;
+                    foreach (Slot slot in slots) slot.DeviceDirty = true;
+                    return graph;
+                }
+
                 if (graph.Plan is IGraphTensorOutputs keep) keep.KeepTensors = deviceOutputs;
+                // A decode step that will advance records on its first run: running it unrecorded first cost every width a
+                // request starts and every 256 positions one more step (~1.5% of a Qwen3.8 Flash Next MTP reply on an A40).
+                if (advance && !owned && step.Advanceable && kind == null && GraphExecutor is IDecodeCaptureExecutor)
+                {
+                    KeepDecodeReplay(step, graph, outputs, slots, starts, attentionFloor, replayShape);
+                    DecodeReplay kept = _decodeReplays[replayShape ?? ""];
+                    step = null;   // the kept step owns it now
+                    if (!TryRunRecorded(kept, graph, slots, starts)) RunUnrecorded(kept, graph);
+                    GraphRuns++;
+                    foreach (Slot slot in slots) slot.DeviceDirty = true;
+                    return graph;
+                }
                 if (!step.Run(graph.Plan))
                     throw new InvalidOperationException($"{Config.Architecture} graph step failed: {graph.Plan.LastError}");
                 GraphRuns++;
@@ -2020,6 +2242,13 @@ namespace TensorSharp.Models
             internal bool Rejected { get; private set; }
             internal (ulong, ulong) Signature => _b.Signature;
 
+            /// <summary>The signature without the state leaves' identities (<see cref="StateLeaves"/>).</summary>
+            internal (ulong, ulong) StructuralSignature => _b.StructuralSignature;
+
+            /// <summary>The state leaves the step binds, in the order its plan binds them.</summary>
+            internal IReadOnlyList<Tensor> StateLeaves => _stateOrder;
+            private readonly List<Tensor> _stateOrder = new();
+
             // ---- tracing
 
             private void Mix(long value) => _b.Mix(value);
@@ -2152,6 +2381,7 @@ namespace TensorSharp.Models
                 if (_states.TryGetValue(t, out int node)) return node;
                 node = TensorLeaf(GraphLeafRole.State, t, type, ne, _m._graphTpRanks != null ? split : null);
                 _states[t] = node;
+                _stateOrder.Add(t);
                 return node;
             }
 

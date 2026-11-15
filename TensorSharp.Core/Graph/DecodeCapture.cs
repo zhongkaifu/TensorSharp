@@ -64,5 +64,18 @@ namespace TensorSharp.Graph
 
         /// <summary>A launch rewrote these tensors on the device (the recorded step's outputs): reads go to the device.</summary>
         void MarkWritten(IReadOnlyList<Tensor> tensors);
+
+        /// <summary>The step's state leaves (caches, recurrent states and their buffers) in the order its plan binds them,
+        /// given before <see cref="CaptureAndLaunch"/>: a recording that knows them can move to another slot's
+        /// (<see cref="TryRelocate"/>).</summary>
+        void NoteStates(IReadOnlyList<Tensor> states) { }
+
+        /// <summary>
+        /// Move the recording to <paramref name="states"/> - the state leaves of a step with the same plan structure over
+        /// another slot, in the same order, each the size and at the offset of its counterpart - and to
+        /// <paramref name="written"/>, the tensors that step writes in place. False when it cannot move: nothing changed
+        /// unless <see cref="Captured"/> turned false (the recording broke part way and must be dropped).
+        /// </summary>
+        bool TryRelocate(IReadOnlyList<Tensor> states, IReadOnlyList<Tensor> written) => false;
     }
 }
