@@ -150,6 +150,12 @@ namespace TensorSharp.Cuda
         protected override Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
             CacheWindow kWindow, CacheWindow vWindow)
         {
+            // Rows over K and V that are tensors, not cache windows (a block drafter's ring), with a mask tensor: its values, whatever
+            // pattern an eager run reads in them (a recorded run cannot read them; the eager run had then taken the generic path,
+            // 54 ms a layer of Qwen3.8-27B's drafter on an A40, the first two blocks of every request).
+            if (kWindow == null && vWindow == null && mask.HasTensor && q.DimensionCount == 3 && q.Sizes[1] > 1
+                && TryExplicitRowsOverTensors(q, k, v, mask.Tensor, scale, out Tensor plain))
+                return plain;
             // A padded decode window (its unwritten tail masked) runs its pattern over the written keys only.
             bool trimmed = mask.Pattern == MaskPattern.Explicit && mask.Trimmed != MaskPattern.Explicit && mask.Keys > 0;
             if (q.DimensionCount == 3 && q.Sizes[1] > 1 && q.Sizes[1] <= CudaDecodeDynParams.WindowRowBlocks
@@ -160,8 +166,6 @@ namespace TensorSharp.Cuda
             // An explicit mask (a sparse attention's selection over prompt or verify rows) runs on the tiled path below, its rows
             // added to each tile's scores: the generic attention would hold every head's scores of the whole chunk at once.
             bool explicitRows = mask.Pattern == MaskPattern.Explicit && !trimmed && mask.HasTensor && q.DimensionCount == 3 && q.Sizes[1] > 1;
-            if (explicitRows && kWindow == null && vWindow == null && TryExplicitRowsOverTensors(q, k, v, mask.Tensor, scale, out Tensor plain))
-                return plain;
             if (kWindow == null || vWindow == null || (mask.Pattern == MaskPattern.Explicit && !trimmed && !explicitRows) || q.ElementType != DType.Float32
                 || q.DimensionCount != 3 || k.DimensionCount is < 2 or > 3 || v.DimensionCount is < 2 or > 3
                 || kWindow.Cache.DimensionCount is < 2 or > 3 || vWindow.Cache.DimensionCount is < 2 or > 3
