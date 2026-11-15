@@ -641,6 +641,8 @@ namespace TensorSharp.Graph
             {
                 var inputs = new Tensor[region.Srcs.Length];
                 var weights = new IGraphWeight[region.Srcs.Length];
+                // A region whose kernel finishes writes left for later to its inputs itself takes them unread.
+                bool unread = _x.RegionFinishesDeferredInputs((GraphFusion)region.Node);
                 for (int i = 0; i < inputs.Length; i++)
                 {
                     Force(region.Srcs[i]);
@@ -649,8 +651,12 @@ namespace TensorSharp.Graph
                         weights[i] = weight;
                         continue;
                     }
-                    inputs[i] = Get(region.Srcs[i]);
-                    if (!_x.RegionReadsStridedInputs((GraphFusion)region.Node) && !inputs[i].IsContiguous()) inputs[i] = _x.Contig(inputs[i], Run);
+                    inputs[i] = _x.Device(_values, region.Srcs[i], Run, read: !unread);
+                    if (!_x.RegionReadsStridedInputs((GraphFusion)region.Node) && !inputs[i].IsContiguous())
+                    {
+                        if (unread && _x.PendingWrites) _x.BeforeRead(inputs[i]);
+                        inputs[i] = _x.Contig(inputs[i], Run);
+                    }
                 }
                 if (_x.RunsConcurrently((GraphFusion)region.Node))
                 {
@@ -749,6 +755,7 @@ namespace TensorSharp.Graph
                 _regionOps.Clear();
                 _x._buffers = new Buffers { Nodes = _nodes, Values = _values, State = _state, Fresh = _fresh, Own = _own, Uses = _uses };
                 _count = 0;
+                _x.EndRun();
             }
 
             /// <summary>Run <paramref name="work"/>: the tensors it made that became a node's value stay owned by
@@ -1415,10 +1422,10 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>The value's tensor, uploading a host-only input on first use (stored back).</summary>
-        private Tensor Device(Value[] values, int node, RunState run)
+        private Tensor Device(Value[] values, int node, RunState run, bool read = true)
         {
             Value v = values[node];
-            if (PendingWrites && v.Tensor != null) BeforeRead(v.Tensor);
+            if (read && PendingWrites && v.Tensor != null) BeforeRead(v.Tensor);
             if (v.Tensor != null || v.HostSizes == null) return v.Tensor;
             var t = run.KeepLasting(new Tensor(Allocator, DType.Float32, v.HostSizes));
             t.SetElementsAsFloat(v.Floats);
@@ -1446,10 +1453,13 @@ namespace TensorSharp.Graph
 
         private Value Eval(GraphNode n, Value[] values, RunState run)
         {
+            // A weight product's rows go to the executor unread when it finishes writes left for later to them itself.
+            int productRows = n.Op == GraphOp.MulMat && ProductsFinishDeferredRows && values[n.Srcs[0]].Weight != null ? n.Srcs[1] : -1;
             if (PendingWrites && n.Srcs != null)
                 foreach (int src in n.Srcs)
-                    if (src >= 0 && values[src].Tensor is { } read) BeforeRead(read);
-            Tensor T(int s) => Device(values, n.Srcs[s], run) ?? throw new NotSupportedException($"{n.Op}: source {s} is a quantized weight");
+                    if (src >= 0 && src != productRows && values[src].Tensor is { } read) BeforeRead(read);
+            Tensor T(int s) => Device(values, n.Srcs[s], run, read: n.Srcs[s] != productRows)
+                ?? throw new NotSupportedException($"{n.Op}: source {s} is a quantized weight");
             Value V(Tensor t) => new() { Tensor = run.Keep(t) };
             long Ip(int i, long fallback) => n.Ip != null && n.Ip.Length > i ? n.Ip[i] : fallback;
             float Fp(int i, float fallback) => n.Fp != null && n.Fp.Length > i ? n.Fp[i] : fallback;
@@ -1670,11 +1680,26 @@ namespace TensorSharp.Graph
         /// it now.</summary>
         protected virtual void BeforeRead(Tensor t) { }
 
-        /// <summary>The run's outputs are about to be read: every write left for later is finished.</summary>
+        /// <summary>The run's outputs are about to be read: every write left for later is finished (or, while
+        /// <see cref="PendingWrites"/> stays set, finished as <see cref="BeforeRead"/> meets it).</summary>
         protected virtual void FinishWrites() { }
 
         /// <summary>A run (one step's program) begins: an executor drops what it cached for the previous one.</summary>
         protected virtual void BeginRun() { }
+
+        /// <summary>A run ended (its outputs read, or its failure on its way out): an executor drops the writes it left for
+        /// later that nothing read.</summary>
+        protected virtual void EndRun() { }
+
+        /// <summary>The executor's weight products (<see cref="QuantizedMatMul"/>, <see cref="QuantizedMatMulRows"/>) finish
+        /// writes left for later to their rows themselves: a product's contiguous rows reach them without
+        /// <see cref="BeforeRead"/> (a product that quantizes its rows may compute them in the same pass).</summary>
+        protected virtual bool ProductsFinishDeferredRows => false;
+
+        /// <summary>A region of <paramref name="kind"/> whose kernel (<see cref="TryFused"/>) finishes writes left for later to
+        /// its inputs itself: its contiguous inputs reach it without <see cref="BeforeRead"/> (its ops, if it declines, read
+        /// them as any op does).</summary>
+        protected virtual bool RegionFinishesDeferredInputs(GraphFusion kind) => false;
 
 
 
@@ -1779,6 +1804,8 @@ namespace TensorSharp.Graph
             {
                 IGraphWeight w = a.Weight;
                 if (nb[0] != w.Ne0) throw new NotSupportedException($"product of a {w.Ne0}-wide weight with {nb[0]}-wide rows");
+                // Strided rows are copied first: a read the executor's product does not finish itself (ProductsFinishDeferredRows).
+                if (PendingWrites && !b.IsContiguous()) BeforeRead(b);
                 if (alone && (a.FirstRow != 0 || a.Rows != w.Ne1) && !run.Products.ContainsKey((w, bNode)))
                 {
                     Tensor rows = Contig(b, run);

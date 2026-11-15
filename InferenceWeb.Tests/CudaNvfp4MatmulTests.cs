@@ -366,7 +366,7 @@ public sealed class CudaNvfp4MatmulTests
     }
 
     /// <summary>NVFP4 rows of random codes under scales a checkpoint holds (UE4M3 exponents 4..10, never the NaN pattern).</summary>
-    private static byte[] Nvfp4Rows(int rows, int cols, int seed)
+    internal static byte[] Nvfp4Rows(int rows, int cols, int seed)
     {
         var bytes = new byte[(long)rows * (cols / 64) * BlockBytes];
         uint x = (uint)(0x9E3779B9 * seed);

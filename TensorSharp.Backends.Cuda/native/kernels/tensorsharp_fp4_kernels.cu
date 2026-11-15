@@ -16,7 +16,8 @@
 //   * ts_fp4_repack_nvfp4: ggml block_nvfp4 rows -> the planes (once, as the weight becomes resident).
 //   * ts_fp4_quantize_q81_f32 + ts_fp4_gemv_nvfp4_<n>: up to 8 rows (decode, verify windows) against q8 activations.
 //   * ts_fp4_quantize_nvfp4_f32: F32 rows -> NVFP4 activation planes and row scales (ggml-cuda's quantize_mmq_nvfp4);
-//     ts_fp4_quantize_swiglu_nvfp4_f32 the planes of silu(gate) * up of fused gate|up rows.
+//     ts_fp4_quantize_swiglu_nvfp4_f32 the planes of silu(gate) * up of fused gate|up rows, ts_fp4_add_rmsnorm_nvfp4_f32
+//     those of a residual add's RMSNorm.
 //   * ts_fp4_gemm_w4a4_<bn>: 9+ rows on the FP4 tensor cores through a cp.async ring, split over K for few rows.
 //   * ts_fp4_gemm_w4a4_tma<bm>: prompt rows, TMA-fed and warp-specialized (the same products in the same order);
 //     ts_fp4_gemm_w4a4_tma<bm>_swiglu a fused gate|up projection's rows with silu(gate) * up in the epilogue.
@@ -37,7 +38,7 @@
 #define TS_FP4_NVFP4_BLOCK 64
 #define TS_FP4_NVFP4_BLOCK_BYTES 36
 
-#define TS_FP4_VERSION 4
+#define TS_FP4_VERSION 5
 
 __device__ __forceinline__ float ts_fp4_warp_sum(float v)
 {
@@ -355,82 +356,11 @@ __device__ __forceinline__ float ts_fp4_block_reduce(float v, float* partial, bo
     return r;
 }
 
-// The row reaches shared memory once, through one of three prologues, and is quantized from there:
-//   MODE 0: x itself [rows][k];
-//   MODE 1: silu(gate) * up of a fused gate|up row [rows][2k] (the down projection's input);
-//   MODE 2: x += delta (written back; delta may be null), then rmsnorm(x) * w with eps - the
-//           pre-norm and the next projection's quantization in one pass, the normed row never
-//           stored (the same per-thread sums and reductions as ts_fp4_add_rmsnorm_f32 at 512
-//           threads, so the values match it exactly).
-// One block per row, k floats of dynamic shared memory.
-template <int MODE>
-__device__ __forceinline__ void ts_fp4_quantize_row(
-    float* __restrict__ x, const float* __restrict__ aux, const float* __restrict__ w, float eps,
-    uint8_t* __restrict__ codes, uint8_t* __restrict__ scales, float* __restrict__ rowScale, int k)
+// The planes and row scale of a row already in shared memory (act, k floats) whose largest magnitude is amax (this
+// thread's part of it).
+__device__ __forceinline__ void ts_fp4_quantize_staged(const float* act, float amax, float* partial, uint8_t* __restrict__ codes,
+    uint8_t* __restrict__ scales, float* __restrict__ rowScale, long long row, int k)
 {
-    extern __shared__ float act[];
-    __shared__ float partial[32];
-    const long long row = blockIdx.x;
-    float amax = 0.0f;
-    if (MODE == 2)
-    {
-        float* xr = x + row * k;
-        float ss = 0.0f;
-        for (int i = threadIdx.x; i < k; i += blockDim.x)
-        {
-            float v = xr[i];
-            if (aux != nullptr)
-            {
-                v += aux[row * k + i];
-                xr[i] = v;
-            }
-            act[i] = v;
-            ss += v * v;
-        }
-        ss = ts_fp4_block_reduce(ss, partial, false);
-        const float scale = rsqrtf(ss / (float)k + eps);
-        for (int i = threadIdx.x; i < k; i += blockDim.x)
-        {
-            const float v = act[i] * scale * w[i];
-            act[i] = v;
-            amax = fmaxf(amax, fabsf(v));
-        }
-    }
-    else
-    {
-        // Four float4 groups per thread in flight before any is used (one dependent round trip
-        // per group otherwise); the maximum is exact in any order.
-        const float* xr = x + row * (MODE == 1 ? 2LL * k : k);
-        const int step = blockDim.x * 4;
-        for (int base = threadIdx.x * 4; base < k; base += 4 * step)
-        {
-            float4 v[4], u[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-            {
-                const int i = base + j * step;
-                if (i < k)
-                {
-                    v[j] = *(const float4*)(xr + i);
-                    if (MODE == 1)
-                        u[j] = *(const float4*)(xr + k + i);
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-            {
-                const int i = base + j * step;
-                if (i >= k)
-                    break;
-                float4 t = v[j];
-                if (MODE == 1)
-                    t = make_float4(ts_fp4_silu(t.x) * u[j].x, ts_fp4_silu(t.y) * u[j].y, ts_fp4_silu(t.z) * u[j].z,
-                                    ts_fp4_silu(t.w) * u[j].w);
-                *(float4*)(act + i) = t;
-                amax = fmaxf(fmaxf(amax, fabsf(t.x)), fmaxf(fmaxf(fabsf(t.y), fabsf(t.z)), fabsf(t.w)));
-            }
-        }
-    }
     amax = ts_fp4_block_reduce(amax, partial, true);
     const float rs = amax / (6.0f * 448.0f);
     const float invRow = rs > 0.0f ? 1.0f / rs : 0.0f;
@@ -449,11 +379,58 @@ __device__ __forceinline__ void ts_fp4_quantize_row(
     }
 }
 
+// The row reaches shared memory once, through one of two prologues, and is quantized from there:
+//   MODE 0: x itself [rows][k];
+//   MODE 1: silu(gate) * up of a fused gate|up row [rows][2k] (the down projection's input).
+// One block per row, k floats of dynamic shared memory.
+template <int MODE>
+__device__ __forceinline__ void ts_fp4_quantize_row(
+    const float* __restrict__ x, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales, float* __restrict__ rowScale, int k)
+{
+    extern __shared__ float act[];
+    __shared__ float partial[32];
+    const long long row = blockIdx.x;
+    float amax = 0.0f;
+    // Four float4 groups per thread in flight before any is used (one dependent round trip
+    // per group otherwise); the maximum is exact in any order.
+    const float* xr = x + row * (MODE == 1 ? 2LL * k : k);
+    const int step = blockDim.x * 4;
+    for (int base = threadIdx.x * 4; base < k; base += 4 * step)
+    {
+        float4 v[4], u[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            const int i = base + j * step;
+            if (i < k)
+            {
+                v[j] = *(const float4*)(xr + i);
+                if (MODE == 1)
+                    u[j] = *(const float4*)(xr + k + i);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            const int i = base + j * step;
+            if (i >= k)
+                break;
+            float4 t = v[j];
+            if (MODE == 1)
+                t = make_float4(ts_fp4_silu(t.x) * u[j].x, ts_fp4_silu(t.y) * u[j].y, ts_fp4_silu(t.z) * u[j].z,
+                                ts_fp4_silu(t.w) * u[j].w);
+            *(float4*)(act + i) = t;
+            amax = fmaxf(fmaxf(amax, fabsf(t.x)), fmaxf(fmaxf(fabsf(t.y), fabsf(t.z)), fabsf(t.w)));
+        }
+    }
+    ts_fp4_quantize_staged(act, amax, partial, codes, scales, rowScale, row, k);
+}
+
 extern "C" __global__ void __launch_bounds__(512) ts_fp4_quantize_nvfp4_f32(
     const float* __restrict__ x, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
     float* __restrict__ rowScale, int k)
 {
-    ts_fp4_quantize_row<0>(const_cast<float*>(x), nullptr, nullptr, 0.0f, codes, scales, rowScale, k);
+    ts_fp4_quantize_row<0>(x, codes, scales, rowScale, k);
 }
 
 // The NVFP4 planes of silu(gate) * up for fused gate|up rows [rows][2k] (gate first): a SwiGLU feed-forward's down
@@ -462,7 +439,98 @@ extern "C" __global__ void __launch_bounds__(512) ts_fp4_quantize_swiglu_nvfp4_f
     const float* __restrict__ gu, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
     float* __restrict__ rowScale, int k)
 {
-    ts_fp4_quantize_row<1>(const_cast<float*>(gu), nullptr, nullptr, 0.0f, codes, scales, rowScale, k);
+    ts_fp4_quantize_row<1>(gu, codes, scales, rowScale, k);
+}
+
+// ---------------------------------------------------------------------------
+// A residual add, the RMSNorm after it and the next product's NVFP4 quantization of the normed row in one pass (the
+// direct-CUDA Qwen3.5 engine's add_rmsnorm_nvfp4): v = a + b (b null: v = a), n = v * rsqrt(mean(v^2) + eps) * w; the sum
+// v, the normed row n and n's planes and row scale are each written where their pointer is not null. The per-thread
+// sums, reductions and expressions of ts_graph_add_rms_norm_f32 at 512 threads, so v and n are that kernel's to the bit
+// (n again when a is its sum and b null), and the planes are ts_fp4_quantize_nvfp4_f32's of n. PER > 0 (k = 512 PER)
+// keeps a thread's values in registers with every load issued up front; 0 walks any k. One block of 512 threads per
+// row, k floats of dynamic shared memory.
+// ---------------------------------------------------------------------------
+template <int PER>
+__device__ __forceinline__ void ts_fp4_add_rmsnorm_nvfp4(const float* __restrict__ a, const float* __restrict__ b,
+    const float* __restrict__ w, float eps, float* __restrict__ sum, float* __restrict__ normed, uint8_t* __restrict__ codes,
+    uint8_t* __restrict__ scales, float* __restrict__ rowScale, int k)
+{
+    extern __shared__ float act[];
+    __shared__ float partial[32];
+    constexpr int T = 512;
+    const long long row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* ar = a + row * k;
+    float ss = 0.0f, amax = 0.0f;
+    if constexpr (PER > 0)
+    {
+        float v[PER], wv[PER];
+#pragma unroll
+        for (int p = 0; p < PER; ++p)
+            v[p] = b != nullptr ? ar[tid + p * T] + b[row * k + tid + p * T] : ar[tid + p * T];
+#pragma unroll
+        for (int p = 0; p < PER; ++p)
+            wv[p] = w[tid + p * T];
+#pragma unroll
+        for (int p = 0; p < PER; ++p)
+        {
+            if (sum != nullptr)
+                sum[row * k + tid + p * T] = v[p];
+            ss += v[p] * v[p];
+        }
+        ss = ts_fp4_block_reduce(ss, partial, false);
+        const float scale = rsqrtf(ss / (float)k + eps);
+#pragma unroll
+        for (int p = 0; p < PER; ++p)
+        {
+            const float n = v[p] * scale * wv[p];
+            if (normed != nullptr)
+                normed[row * k + tid + p * T] = n;
+            act[tid + p * T] = n;
+            amax = fmaxf(amax, fabsf(n));
+        }
+    }
+    else
+    {
+        for (int i = tid; i < k; i += T)
+        {
+            const float v = b != nullptr ? ar[i] + b[row * k + i] : ar[i];
+            if (sum != nullptr)
+                sum[row * k + i] = v;
+            act[i] = v;
+            ss += v * v;
+        }
+        ss = ts_fp4_block_reduce(ss, partial, false);
+        const float scale = rsqrtf(ss / (float)k + eps);
+        for (int i = tid; i < k; i += T)
+        {
+            const float n = act[i] * scale * w[i];
+            if (normed != nullptr)
+                normed[row * k + i] = n;
+            act[i] = n;
+            amax = fmaxf(amax, fabsf(n));
+        }
+    }
+    if (codes != nullptr)
+        ts_fp4_quantize_staged(act, amax, partial, codes, scales, rowScale, row, k);
+}
+
+extern "C" __global__ void __launch_bounds__(512) ts_fp4_add_rmsnorm_nvfp4_f32(const float* __restrict__ a,
+    const float* __restrict__ b, const float* __restrict__ w, float eps, float* __restrict__ sum, float* __restrict__ normed,
+    uint8_t* __restrict__ codes, uint8_t* __restrict__ scales, float* __restrict__ rowScale, int k)
+{
+    switch (k % 512 == 0 ? k / 512 : 0)
+    {
+        case 4: ts_fp4_add_rmsnorm_nvfp4<4>(a, b, w, eps, sum, normed, codes, scales, rowScale, k); break;
+        case 5: ts_fp4_add_rmsnorm_nvfp4<5>(a, b, w, eps, sum, normed, codes, scales, rowScale, k); break;
+        case 6: ts_fp4_add_rmsnorm_nvfp4<6>(a, b, w, eps, sum, normed, codes, scales, rowScale, k); break;
+        case 8: ts_fp4_add_rmsnorm_nvfp4<8>(a, b, w, eps, sum, normed, codes, scales, rowScale, k); break;
+        case 10: ts_fp4_add_rmsnorm_nvfp4<10>(a, b, w, eps, sum, normed, codes, scales, rowScale, k); break;
+        case 12: ts_fp4_add_rmsnorm_nvfp4<12>(a, b, w, eps, sum, normed, codes, scales, rowScale, k); break;
+        case 16: ts_fp4_add_rmsnorm_nvfp4<16>(a, b, w, eps, sum, normed, codes, scales, rowScale, k); break;
+        default: ts_fp4_add_rmsnorm_nvfp4<0>(a, b, w, eps, sum, normed, codes, scales, rowScale, k); break;
+    }
 }
 
 #if defined(__CUDA_ARCH__) && (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL))

@@ -709,6 +709,31 @@ namespace TensorSharp.Cuda
             return TryGetResidentDevicePtr(allocator, cacheKey != IntPtr.Zero ? cacheKey : hostData, out devicePtr, out residentType);
         }
 
+        /// <summary>The planes of an NVFP4 matrix kept planar on this device (<see cref="Nvfp4PlanarType"/>), made resident first
+        /// unless <paramref name="mayUpload"/> is false (a recording step). False where the weight is not kept as planes.</summary>
+        internal static bool TryGetNvfp4Planes(CudaAllocator allocator, IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1,
+            long rawBytes, bool mayUpload, out IntPtr planes)
+        {
+            planes = IntPtr.Zero;
+            IntPtr key = cacheKey != IntPtr.Zero ? cacheKey : hostData;
+            if (ggmlType != 40 || key == IntPtr.Zero || allocator.Fp4Kernels == null)
+                return false;
+            DeviceWeight weight;
+            lock (Sync)
+                Cache.TryGetValue(new CacheKey(allocator, key), out weight);
+            if (weight == null)
+            {
+                if (!mayUpload || hostData == IntPtr.Zero)
+                    return false;
+                try { weight = EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes); }
+                catch (Exception ex) when (ex is CudaException or InvalidOperationException or OutOfMemoryException) { return false; }
+            }
+            if (weight.GgmlType != Nvfp4PlanarType || weight.DevicePtr == IntPtr.Zero)
+                return false;
+            planes = weight.DevicePtr;
+            return true;
+        }
+
         public static bool TryGetResidentDevicePtr(CudaAllocator allocator, IntPtr cacheKey, out IntPtr devicePtr, out int ggmlType)
         {
             devicePtr = IntPtr.Zero;
@@ -1025,14 +1050,46 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>Writes the NVFP4 planes of a product's activation rows (<see cref="CudaFp4Kernels.Quantize"/>'s layout) on
+        /// <paramref name="stream"/>: a kernel that makes the rows and quantizes them in one pass.</summary>
+        internal delegate void Nvfp4ActivationWriter(IntPtr codes, IntPtr scales, IntPtr rowScale, IntPtr stream);
+
+        /// <summary>
+        /// result[rows, outDim] = x W^T for the resident planar NVFP4 matrix at <paramref name="planes"/> and more rows than the
+        /// matvec takes, the activation planes written by <paramref name="quantize"/> instead of quantized from F32 rows x:
+        /// the GEMM <see cref="RunResidentMatmul"/> runs on those planes. False, with nothing launched, where it does not apply.
+        /// </summary>
+        internal static bool TryAddmmNvfp4Planes(Tensor result, IntPtr planes, int outDim, int k, Nvfp4ActivationWriter quantize)
+        {
+            if (!CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
+                || cols != outDim || rows <= CudaFp4Kernels.GemvMaxRows || result.ElementType != DType.Float32
+                || !CudaFp4Kernels.TakesWidth(k))
+                return false;
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (allocator.Fp4Kernels is not { } fp4)
+                return false;
+            allocator.Context.MakeCurrent();
+            var (codes, scales, rowScale) = Fp4Activations(allocator, rows, k);
+            quantize(codes, scales, rowScale, allocator.Stream.Handle);
+            RunNvfp4PlanarGemm(allocator, fp4, planes, codes, scales, rowScale, resultPtr, k, outDim, rows);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         /// <summary>
         /// result[rows, ff] = silu(x Wg^T) * (x Wu^T) for a fused gate|up NVFP4 matrix [2 ff, ne0] (the gate rows first) kept
         /// as planes, when the rows run on the TMA-fed GEMM: the activation straight from the GEMM's epilogue, the values the
         /// [rows, 2 ff] product and a SwiGLU over it give (that product's F32 rows had been written and read again: 0.5 GB a
-        /// layer for 3.6K rows of Qwen3.8-27B). False, with nothing launched, where it does not apply.
+        /// layer for 3.6K rows of Qwen3.8-27B). <paramref name="quantize"/>, when given, writes the input's planes (input is
+        /// then read for its shape alone). False, with nothing launched, where it does not apply.
         /// </summary>
         public static bool TryAddmmGateUpSwiGluNvfp4(Tensor result, Tensor input, IntPtr cacheKey, IntPtr hostData, int ggmlType,
             long ne0, long ne1, long rawBytes)
+            => TryAddmmGateUpSwiGluNvfp4(result, input, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes, null);
+
+        /// <inheritdoc cref="TryAddmmGateUpSwiGluNvfp4(Tensor, Tensor, IntPtr, IntPtr, int, long, long, long)"/>
+        internal static bool TryAddmmGateUpSwiGluNvfp4(Tensor result, Tensor input, IntPtr cacheKey, IntPtr hostData, int ggmlType,
+            long ne0, long ne1, long rawBytes, Nvfp4ActivationWriter quantize)
         {
             if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
                 || !CudaKernelOps.TryGetContiguousRows(input, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
@@ -1049,10 +1106,15 @@ namespace TensorSharp.Cuda
             var (codes, scales, rowScale) = Fp4Activations(allocator, rows, k);
             if (!CudaFp4Kernels.TakesTmaSwiGlu(rows, outDim, k, weight.DevicePtr, codes, scales))
                 return false;
-            inputStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
             IntPtr stream = allocator.Stream.Handle;
-            fp4.Quantize(inputPtr, codes, scales, rowScale, k, rows, stream);
+            if (quantize != null)
+                quantize(codes, scales, rowScale, stream);
+            else
+            {
+                inputStorage.EnsureDeviceCurrent();
+                fp4.Quantize(inputPtr, codes, scales, rowScale, k, rows, stream);
+            }
             fp4.GemmTmaSwiGlu(weight.DevicePtr, outDim, k, codes, scales, rowScale, rows, 1.0f, resultPtr, stream);
             resultStorage.MarkDeviceModified();
             return true;

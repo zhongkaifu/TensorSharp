@@ -22,7 +22,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FP4_VERSION in tensorsharp_fp4_kernels.cu: bump both together whenever a kernel is added or
         /// changes its signature.</summary>
-        public const int CurrentVersion = 4;
+        public const int CurrentVersion = 5;
 
         /// <summary>K values one GEMM stage takes: a planar matrix's row width must be a multiple of it.</summary>
         public const int StageK = 256;
@@ -42,7 +42,7 @@ namespace TensorSharp.Cuda
         private const int Block = 256;
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
 
-        private readonly IntPtr _repack, _quantQ81, _quantNvfp4, _quantSwiGlu, _gemm32, _gemm64, _gemm128, _tma256, _tma128, _tma256SwiGlu,
+        private readonly IntPtr _repack, _quantQ81, _quantNvfp4, _quantSwiGlu, _addRmsNorm, _gemm32, _gemm64, _gemm128, _tma256, _tma128, _tma256SwiGlu,
             _tma128SwiGlu, _getRows;
         private readonly IntPtr[] _gemv = new IntPtr[GemvMaxRows + 1];
         private readonly int[] _gemvRows = new int[GemvMaxRows + 1];
@@ -62,6 +62,7 @@ namespace TensorSharp.Cuda
             _quantQ81 = module.GetFunction("ts_fp4_quantize_q81_f32");
             _quantNvfp4 = module.GetFunction("ts_fp4_quantize_nvfp4_f32");
             _quantSwiGlu = module.GetFunction("ts_fp4_quantize_swiglu_nvfp4_f32");
+            _addRmsNorm = module.GetFunction("ts_fp4_add_rmsnorm_nvfp4_f32");
             _gemm32 = module.GetFunction("ts_fp4_gemm_w4a4_32");
             _gemm64 = module.GetFunction("ts_fp4_gemm_w4a4_64");
             _gemm128 = module.GetFunction("ts_fp4_gemm_w4a4_128");
@@ -81,6 +82,7 @@ namespace TensorSharp.Cuda
             (_smemTma256, _smemTma128) = (host[0], host[1]);
             CudaDriverApi.cuFuncSetAttribute(_quantNvfp4, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_quantSwiGlu, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_addRmsNorm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, MaxQuantRowFloats * 4).ThrowOnError();
             foreach (var (fn, smem) in new[] { (_gemm32, _smem32), (_gemm64, _smem64), (_gemm128, _smem128), (_tma256, _smemTma256), (_tma128, _smemTma128),
                          (_tma256SwiGlu, _smemTma256), (_tma128SwiGlu, _smemTma128) })
                 CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem).ThrowOnError();
@@ -182,6 +184,22 @@ namespace TensorSharp.Cuda
             IntPtr a0 = gateUp, a1 = codes, a2 = scales, a3 = rowScale; int a4 = k;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
             Launch(_quantSwiGlu, (uint)rows, 1, 1, 512, k * 4, stream, args);
+        }
+
+        /// <summary>
+        /// The residual add and weighted RMSNorm of <paramref name="rows"/> rows of <paramref name="k"/> (<see cref="TakesWidth"/>)
+        /// with the next product's NVFP4 quantization: v = a + b (<paramref name="b"/> zero: v = a), n = v * rsqrt(mean(v^2)
+        /// + eps) * w; v to <paramref name="sum"/>, n to <paramref name="normed"/>, and n's planes (<see cref="Quantize"/>'s
+        /// of n) to <paramref name="codes"/>, <paramref name="scales"/> and <paramref name="rowScale"/>, each where it is not
+        /// zero. v and n are the graph kernels' add-and-norm values to the bit.
+        /// </summary>
+        public void AddRmsNormQuantize(IntPtr a, IntPtr b, IntPtr w, float eps, IntPtr sum, IntPtr normed, IntPtr codes, IntPtr scales,
+            IntPtr rowScale, int k, int rows, IntPtr stream)
+        {
+            IntPtr a0 = a, a1 = b, a2 = w, a4 = sum, a5 = normed, a6 = codes, a7 = scales, a8 = rowScale;
+            float a3 = eps; int a9 = k;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
+            Launch(_addRmsNorm, (uint)rows, 1, 1, 512, k * 4, stream, args);
         }
 
         /// <summary>Whether <paramref name="m"/> rows of a product run on the TMA-fed GEMM (16-byte aligned planes).</summary>

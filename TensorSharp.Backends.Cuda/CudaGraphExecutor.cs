@@ -996,7 +996,8 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>A block's residual add and the next block's input norm in one kernel (the stream and the normed row
-        /// written in one pass; three otherwise).</summary>
+        /// written in one pass; three otherwise). Rows an NVFP4 GEMM may quantize are left for their reader
+        /// (<see cref="DeferredNorm"/>).</summary>
         protected override bool TryAddWeightedNorm(Tensor a, Tensor b, Tensor weight, float eps, out Tensor sum, out Tensor normed)
         {
             sum = normed = null;
@@ -1009,11 +1010,180 @@ namespace TensorSharp.Cuda
                 return false;
             int rows = checked((int)(a.ElementCount() / cols));
             Tensor total = new Tensor(Allocator, DType.Float32, a.Sizes), norm = new Tensor(Allocator, DType.Float32, a.Sizes);
-            Launch(inputs, new[] { total, norm }, (k, stream) => k.LaunchAddRmsNorm(Ptr(a), Ptr(b), Ptr(weight), Ptr(total), Ptr(norm), rows,
-                (int)cols, eps, stream));
+            var cuda = (CudaAllocator)Allocator;
+            if (rows > CudaFp4Kernels.GemvMaxRows && CudaFp4Kernels.TakesWidth(cols) && _branchQuantized == null && cuda.Fp4Kernels != null
+                && Array.TrueForAll(inputs, t => ((CudaStorage)t.Storage).DeviceId == cuda.DeviceId))
+            {
+                DropUnreadNorms();
+                var deferred = new DeferredNorm
+                {
+                    A = a.CopyRef(), B = b.CopyRef(), Weight = weight.CopyRef(), Sum = total.CopyRef(), Normed = norm.CopyRef(),
+                    Eps = eps, Rows = rows, Cols = (int)cols,
+                };
+                _deferredNorms.Add(deferred);
+                _deferredBy[total.Storage] = deferred;
+                _deferredBy[norm.Storage] = deferred;
+                PendingWrites = true;
+            }
+            else
+                Launch(inputs, new[] { total, norm }, (k, stream) => k.LaunchAddRmsNorm(Ptr(a), Ptr(b), Ptr(weight), Ptr(total), Ptr(norm), rows,
+                    (int)cols, eps, stream));
             (sum, normed) = (total, norm);
             return true;
         }
+
+        // ---- a residual add and norm left for the product that quantizes its rows
+
+        /// <summary>
+        /// A residual add and the weighted RMSNorm after it (<see cref="TryAddWeightedNorm"/>) over more rows than the matvec
+        /// takes, not yet run: the sum and normed tensors exist, their values do not. An NVFP4 product of the normed rows on
+        /// the FP4 tensor cores writes the sum and the rows' NVFP4 planes in one pass (the direct-CUDA engine's
+        /// add_rmsnorm_nvfp4: the normed rows never stored, never read back to be quantized; 3.6K rows of Qwen3.8-27B wrote
+        /// and read 42 MB a norm, two norms a layer); any other read runs the add and norm as they ran before
+        /// (<see cref="BeforeRead"/>). The values are the same either way, to the bit.
+        /// </summary>
+        private sealed class DeferredNorm : IDisposable
+        {
+            /// <summary>The add's operands (released once the sum is written), the norm's weight, and the results.</summary>
+            public Tensor A, B, Weight, Sum, Normed;
+            public float Eps;
+            public int Rows, Cols;
+
+            public bool SumWritten => A == null;
+
+            public void ReleaseOperands()
+            {
+                A?.Dispose();
+                B?.Dispose();
+                A = B = null;
+            }
+
+            public void Dispose()
+            {
+                ReleaseOperands();
+                Weight.Dispose();
+                Sum.Dispose();
+                Normed.Dispose();
+            }
+        }
+
+        private readonly List<DeferredNorm> _deferredNorms = new();
+
+        /// <summary>The deferred norms by their sum's and their normed rows' storage (every op's sources are looked up here
+        /// while any is deferred).</summary>
+        private readonly Dictionary<Storage, DeferredNorm> _deferredBy = new(ReferenceEqualityComparer.Instance);
+
+        protected override bool ProductsFinishDeferredRows => true;
+
+        protected override bool RegionFinishesDeferredInputs(GraphFusion kind) => kind == GraphFusion.SwigluFfn;
+
+        /// <summary>The deferred norm whose sum or normed rows <paramref name="t"/> lives in, else null.</summary>
+        private DeferredNorm DeferredOf(Tensor t) => _deferredBy.TryGetValue(t.Storage, out DeferredNorm d) ? d : null;
+
+        private void Forget(DeferredNorm d)
+        {
+            _deferredNorms.Remove(d);
+            _deferredBy.Remove(d.Sum.Storage);
+            _deferredBy.Remove(d.Normed.Storage);
+            d.Dispose();
+        }
+
+        /// <summary>Runs what a read of <paramref name="t"/> needs of its deferred norm: the add and norm as they ran before
+        /// (the normed rows from the sum, once a product wrote that).</summary>
+        private void FinishDeferred(DeferredNorm d, Tensor t)
+        {
+            if (d.SumWritten && ReferenceEquals(t.Storage, d.Sum.Storage) && !ReferenceEquals(t.Storage, d.Normed.Storage)) return;
+            var cuda = (CudaAllocator)Allocator;
+            if (d.SumWritten)
+            {
+                Tensor[] inputs = { d.Sum, d.Weight };
+                Launch(inputs, d.Normed, (_, stream) => cuda.Fp4Kernels.AddRmsNormQuantize(Ptr(d.Sum), IntPtr.Zero, Ptr(d.Weight), d.Eps,
+                    IntPtr.Zero, Ptr(d.Normed), IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, d.Cols, d.Rows, stream));
+            }
+            else
+            {
+                Tensor[] inputs = { d.A, d.B, d.Weight };
+                Launch(inputs, new[] { d.Sum, d.Normed }, (k, stream) => k.LaunchAddRmsNorm(Ptr(d.A), Ptr(d.B), Ptr(d.Weight), Ptr(d.Sum),
+                    Ptr(d.Normed), d.Rows, d.Cols, d.Eps, stream));
+            }
+            Forget(d);
+            PendingWrites = _joins.Count > 0 || _deferredNorms.Count > 0;
+        }
+
+        /// <summary>Finishes what was left for later in <paramref name="t"/> (a deferred norm, a doorbell or branch join) before
+        /// this executor reads it where the program handed it over unread (<see cref="ProductsFinishDeferredRows"/>,
+        /// <see cref="RegionFinishesDeferredInputs"/>).</summary>
+        private void ReadNow(Tensor t)
+        {
+            if (PendingWrites) BeforeRead(t);
+        }
+
+        /// <summary>Deferred norms nothing can read any more (the step released its sum and normed tensors) go.</summary>
+        private void DropUnreadNorms()
+        {
+            for (int i = _deferredNorms.Count - 1; i >= 0; i--)
+            {
+                DeferredNorm d = _deferredNorms[i];
+                if (d.Normed.IsOwnerExclusive() && (d.SumWritten || d.Sum.IsOwnerExclusive()))
+                    Forget(d);
+            }
+        }
+
+        /// <summary>
+        /// x W^T for <paramref name="x"/> the normed rows of a deferred norm and an NVFP4 weight kept as planes: the rows'
+        /// planes from the add, the norm and the quantizer in one kernel (the sum written there too, if no product wrote it
+        /// yet). <paramref name="swiGluFfn"/> set: the gate|up product with SwiGLU in its epilogue
+        /// (<see cref="CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(Tensor, Tensor, IntPtr, IntPtr, int, long, long, long)"/>),
+        /// [rows, Ne1 / 2]. Null, with nothing launched, where it does not apply.
+        /// </summary>
+        private Tensor DeferredNormProduct(IGraphWeight weight, Tensor x, bool swiGluFfn = false)
+        {
+            if (_deferredNorms.Count == 0 || DeferredOf(x) is not { } d || !ReferenceEquals(x.Storage, d.Normed.Storage)
+                || x.StorageOffset != d.Normed.StorageOffset || !x.IsContiguous() || x.ElementCount() != (long)d.Rows * d.Cols
+                || weight.Ne0 != d.Cols || weight.Ne2 > 1 || weight.Ne1 > int.MaxValue)
+                return null;
+            var cuda = (CudaAllocator)Allocator;
+            if (!CudaQuantizedOps.TryGetNvfp4Planes(cuda, weight.CacheKey, weight.Data, weight.Format, weight.Ne0, weight.Ne1, weight.Bytes,
+                    !CudaGraphCapture.IsCapturing(cuda), out IntPtr planes))
+                return null;
+            foreach (Tensor t in new[] { d.A, d.B, d.Weight, d.Sum })
+                ((CudaStorage)t?.Storage)?.EnsureDeviceCurrent();
+            CudaFp4Kernels fp4 = cuda.Fp4Kernels;
+            bool writesSum = !d.SumWritten;
+            IntPtr a = writesSum ? Ptr(d.A) : Ptr(d.Sum), b = writesSum ? Ptr(d.B) : IntPtr.Zero, sum = writesSum ? Ptr(d.Sum) : IntPtr.Zero;
+            void Quantize(IntPtr codes, IntPtr scales, IntPtr rowScale, IntPtr stream)
+                => fp4.AddRmsNormQuantize(a, b, Ptr(d.Weight), d.Eps, sum, IntPtr.Zero, codes, scales, rowScale, d.Cols, d.Rows, stream);
+            Tensor product;
+            if (swiGluFfn)
+            {
+                product = new Tensor(Allocator, DType.Float32, d.Rows, weight.Ne1 / 2);
+                if (!CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(product, x, weight.CacheKey, weight.Data, weight.Format, weight.Ne0, weight.Ne1,
+                        weight.Bytes, Quantize))
+                {
+                    product.Dispose();
+                    return null;
+                }
+            }
+            else
+            {
+                product = new Tensor(Allocator, DType.Float32, d.Rows, weight.Ne1);
+                if (!CudaQuantizedOps.TryAddmmNvfp4Planes(product, planes, (int)weight.Ne1, d.Cols, Quantize))
+                {
+                    product.Dispose();
+                    return null;
+                }
+            }
+            if (writesSum)
+            {
+                ((CudaStorage)d.Sum.Storage).MarkDeviceModified();
+                d.ReleaseOperands();
+            }
+            NormedProducts++;
+            return product;
+        }
+
+        /// <summary>Products that quantized a deferred norm's rows in its own pass (tests check the route engaged).</summary>
+        internal long NormedProducts { get; private set; }
 
         /// <summary>The gated delta rule's regions read views of a packed in-projection where they are (<see cref="TryRows"/>);
         /// the others take contiguous inputs.</summary>
@@ -1189,20 +1359,30 @@ namespace TensorSharp.Cuda
             var cuda = (CudaAllocator)Allocator;
             long rows = x.ElementCount() / gateUp.Ne0;
             using Tensor x2 = x.View(rows, gateUp.Ne0);
-            // Prompt rows of an NVFP4 gate|up on the FP4 tensor cores: the activation straight from the GEMM's epilogue.
+            // Prompt rows of an NVFP4 gate|up on the FP4 tensor cores: the activation straight from the GEMM's epilogue (and
+            // x's planes straight from the add and norm that make x, where they were deferred).
             if (rows >= CudaFp4Kernels.TmaMinRows && cuda.Fp4Kernels != null)
             {
-                var swiglu = new Tensor(Allocator, DType.Float32, rows, ff);
-                if (CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(swiglu, x2, gateUp.CacheKey, gateUp.Data, gateUp.Format, gateUp.Ne0, gateUp.Ne1,
-                        gateUp.Bytes))
+                Tensor swiglu = DeferredNormProduct(gateUp, x2, swiGluFfn: true);
+                if (swiglu == null)
+                {
+                    ReadNow(x2);
+                    swiglu = new Tensor(Allocator, DType.Float32, rows, ff);
+                    if (!CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(swiglu, x2, gateUp.CacheKey, gateUp.Data, gateUp.Format, gateUp.Ne0,
+                            gateUp.Ne1, gateUp.Bytes))
+                    {
+                        swiglu.Dispose();
+                        swiglu = null;
+                    }
+                }
+                if (swiglu != null)
                 {
                     results[0] = QuantizedMatMul(down, swiglu);
                     swiglu.Dispose();
                     return true;
                 }
-                swiglu.Dispose();
             }
-            using Tensor gu = QuantizedMatMul(gateUp, x2);   // [rows, 2 ff], gate first
+            using Tensor gu = QuantizedMatMul(gateUp, x2);   // [rows, 2 ff], gate first (x2 read there)
             var y = new Tensor(Allocator, DType.Float32, rows, down.Ne1);
             if (CudaQuantizedOps.TryAddmmSwiGluNvfp4(y, gu, down.CacheKey, down.Data, down.Format, down.Ne0, down.Ne1, down.Bytes))
             {
@@ -1936,13 +2116,28 @@ namespace TensorSharp.Cuda
                 if (!ReferenceEquals(_joins[i].Storage, storage)) continue;
                 Action finish = _joins[i].Finish;
                 _joins.RemoveAt(i);
-                PendingWrites = _joins.Count > 0;
+                PendingWrites = _joins.Count > 0 || _deferredNorms.Count > 0;
                 finish();
                 return;
             }
+            if (_deferredNorms.Count > 0 && DeferredOf(t) is { } d)
+                FinishDeferred(d, t);
         }
 
-        protected override void FinishWrites() => FinishJoins();
+        /// <summary>The doorbell sums join; deferred norms stay deferred (an output that reads one finishes it).</summary>
+        protected override void FinishWrites()
+        {
+            FinishJoins();
+            PendingWrites = _deferredNorms.Count > 0;
+        }
+
+        protected override void EndRun()
+        {
+            foreach (DeferredNorm d in _deferredNorms) d.Dispose();
+            _deferredNorms.Clear();
+            _deferredBy.Clear();
+            PendingWrites = _joins.Count > 0;
+        }
 
         private void FinishJoins()
         {
@@ -1950,11 +2145,11 @@ namespace TensorSharp.Cuda
             {
                 Action finish = _joins[0].Finish;
                 _joins.RemoveAt(0);
-                PendingWrites = _joins.Count > 0;
+                PendingWrites = _joins.Count > 0 || _deferredNorms.Count > 0;
                 finish();
             }
             _pendingJoin?.Invoke();
-            PendingWrites = false;
+            PendingWrites = _deferredNorms.Count > 0;
         }
 
         /// <summary>The device tables of a stack of offloaded experts: tier members (resident on this device) by their
@@ -2516,6 +2711,9 @@ namespace TensorSharp.Cuda
             long width = inputs[0].Sizes[^1];
             if (width <= 0 || inputs[0].ElementCount() / width > ConcurrentMaxRows) return false;
             _pendingJoin?.Invoke();
+            // Deferred norms run on this stream first: the other one would write them where this one never waits.
+            while (_deferredNorms.Count > 0)
+                FinishDeferred(_deferredNorms[0], _deferredNorms[0].Normed);
             var cuda = (CudaAllocator)Allocator;
             cuda.Context.MakeCurrent();
             if (_sideStream == null)
@@ -2552,8 +2750,8 @@ namespace TensorSharp.Cuda
             _pendingJoin = join;
             foreach (Tensor r in results)
                 if (r?.Storage is CudaStorage storage) _joins.Add((storage, join));
-            PendingWrites = _joins.Count > 0;
-            if (!PendingWrites) join();
+            PendingWrites = _joins.Count > 0 || _deferredNorms.Count > 0;
+            if (_joins.Count == 0) join();
         }
 
         /// <summary>
@@ -2565,6 +2763,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         protected override Tensor QuantizedMatMulRows(IGraphWeight weight, Tensor x, long firstRow, long outRows)
         {
+            ReadNow(x);
             var cuda = (CudaAllocator)Allocator;
             long rows = x.Sizes[0], inDim = weight.Ne0;
             if (rows < 1 || rows > DenseDecodeRows || weight.Ne2 > 1 || weight.Ne1 <= 0 || weight.Ne1 > int.MaxValue
@@ -2638,6 +2837,8 @@ namespace TensorSharp.Cuda
 
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
+            if (_deferredNorms.Count > 0 && DeferredNormProduct(weight, x) is { } normedProduct) return normedProduct;
+            ReadNow(x);
             var cuda = (CudaAllocator)Allocator;
             long rows = x.Sizes[0], inDim = weight.Ne0, outDim = weight.Ne1;
             // A decode-size product chooses its kernel by the weight's resident copy: made resident first, so a weight's first
