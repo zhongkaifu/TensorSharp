@@ -12,7 +12,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#define TS_GRAPH_KERNELS_VERSION 21
+#define TS_GRAPH_KERNELS_VERSION 22
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1554,6 +1554,118 @@ extern "C" __global__ void ts_graph_deltanet_prep_f32(
         if (i == 0)
         {
             const size_t gi = (size_t)t * v_heads + vh, ai = (size_t)t * ab_pitch + vh;
+            const float s = alpha[ai] + dt[vh];
+            g_out[gi] = (s > 20.0f ? s : logf(1.0f + expf(s))) * a[vh];
+            beta_out[gi] = 1.0f / (1.0f + expf(-beta[ai]));
+        }
+    }
+}
+
+// ts_graph_deltanet_prep_f32 over a prompt chunk, the same outputs bit for bit, a block per (head, tile of
+// TS_GRAPH_PREP_TILE tokens): the tile's conv inputs (positions t0 .. t0 + tokens + width - 2) staged in shared memory once
+// (the per-row kernel read each input row width times), conv_in written along time through the stage (a warp writes 32
+// consecutive tokens of one channel; the per-row kernel wrote one float per channel row, a 32-byte sector each), each
+// thread's channel convolved and SiLU'd for every token of the tile, and each token's q/k norm reduced in the per-row
+// kernel's order (a warp sum per 32 channels, then the warps' sums in order). conv_rows == width - 1, width <=
+// TS_GRAPH_PREP_WIDTH (the conv weights in registers), d % 32 == 0, d <= 256. Launch: grid (2 * k_heads + v_heads,
+// ceil(rows / TS_GRAPH_PREP_TILE)), block d, dynamic shared memory ((TS_GRAPH_PREP_TILE + width - 1) * (d + 1) +
+// TS_GRAPH_PREP_TILE * d / 32) floats.
+#define TS_GRAPH_PREP_TILE 32
+#define TS_GRAPH_PREP_WIDTH 4
+extern "C" __global__ void ts_graph_deltanet_prep_tiled_f32(
+    const float* __restrict__ window, const float* __restrict__ qkv, const float* __restrict__ conv_w,
+    const float* __restrict__ alpha, const float* __restrict__ beta, const float* __restrict__ dt, const float* __restrict__ a,
+    float* __restrict__ conv_in, float* __restrict__ q_out, float* __restrict__ k_out, float* __restrict__ v_out,
+    float* __restrict__ g_out, float* __restrict__ beta_out,
+    int channels, int conv_rows, int width, int d, int k_heads, int v_heads, int rows, float eps,
+    long long qkv_pitch, long long ab_pitch)
+{
+    extern __shared__ float prep_smem[];
+    const int i = threadIdx.x;
+    const int head = blockIdx.x;
+    const int t0 = blockIdx.y * TS_GRAPH_PREP_TILE;
+    const int tokens = min(TS_GRAPH_PREP_TILE, rows - t0);
+    const int span = conv_rows + rows, pitch = d + 1, warps = d / 32;
+    float* stage = prep_smem;                                                  // [tokens + width - 1][d + 1]
+    float* partial = prep_smem + (TS_GRAPH_PREP_TILE + width - 1) * pitch;     // [tile][d / 32]
+    const size_t c = (size_t)head * d + i;
+    const int staged = tokens + width - 1;
+    // Eight rows' loads in flight before any is stored (each store waits for its load).
+    for (int s0 = 0; s0 < staged; s0 += 8)
+    {
+        float in[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++)
+        {
+            const int p = t0 + s0 + u;
+            if (s0 + u < staged)
+                in[u] = p < conv_rows ? window[c * conv_rows + p] : qkv[(size_t)(p - conv_rows) * qkv_pitch + c];
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u++)
+            if (s0 + u < staged) stage[(s0 + u) * pitch + i] = in[u];
+    }
+    float w[TS_GRAPH_PREP_WIDTH];
+#pragma unroll
+    for (int j = 0; j < TS_GRAPH_PREP_WIDTH; j++)
+        if (j < width) w[j] = conv_w[c * width + j];
+    if (t0 == 0)
+        for (int p = 0; p < conv_rows; p++) conv_in[c * span + p] = window[c * conv_rows + p];
+    __syncthreads();
+    for (int e = i; e < d * tokens; e += d)
+    {
+        const int ch = e / tokens, tt = e % tokens;
+        conv_in[((size_t)head * d + ch) * span + conv_rows + t0 + tt] = stage[(conv_rows + tt) * pitch + ch];
+    }
+    float y[TS_GRAPH_PREP_TILE];
+#pragma unroll
+    for (int tt = 0; tt < TS_GRAPH_PREP_TILE; tt++)
+    {
+        if (tt >= tokens) break;
+        float x = 0.0f;
+#pragma unroll
+        for (int j = 0; j < TS_GRAPH_PREP_WIDTH; j++)
+        {
+            if (j >= width) break;
+            x += stage[(tt + j) * pitch + i] * w[j];
+        }
+        y[tt] = x / (1.0f + expf(-x));
+    }
+    if (head < 2 * k_heads)
+    {
+#pragma unroll
+        for (int tt = 0; tt < TS_GRAPH_PREP_TILE; tt++)
+        {
+            if (tt >= tokens) break;
+            const float sq = ts_graph_warp_sum(y[tt] * y[tt]);
+            if ((i & 31) == 0) partial[tt * warps + (i >> 5)] = sq;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int tt = 0; tt < TS_GRAPH_PREP_TILE; tt++)
+        {
+            if (tt >= tokens) break;
+            float total = 0.0f;
+            for (int s = 0; s < warps; s++) total += partial[tt * warps + s];
+            const float yn = y[tt] * rsqrtf(total + eps);
+            const size_t t = (size_t)t0 + tt;
+            if (head < k_heads) q_out[(t * k_heads + head) * d + i] = yn;
+            else k_out[(t * k_heads + head - k_heads) * d + i] = yn;
+        }
+    }
+    else
+    {
+        const int vh = head - 2 * k_heads;
+#pragma unroll
+        for (int tt = 0; tt < TS_GRAPH_PREP_TILE; tt++)
+        {
+            if (tt >= tokens) break;
+            v_out[(((size_t)t0 + tt) * v_heads + vh) * d + i] = y[tt];
+        }
+        if (i < tokens)
+        {
+            const size_t t = (size_t)t0 + i;
+            const size_t gi = t * v_heads + vh, ai = t * ab_pitch + vh;
             const float s = alpha[ai] + dt[vh];
             g_out[gi] = (s > 20.0f ? s : logf(1.0f + expf(s))) * a[vh];
             beta_out[gi] = 1.0f / (1.0f + expf(-beta[ai]));

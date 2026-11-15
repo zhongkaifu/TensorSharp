@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 21;
+        public const int CurrentVersion = 22;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm, _repackQ6kTiled;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _repackQ6kTiled;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
 
@@ -63,6 +63,7 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuFuncSetAttribute(_topk, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, TopKMaxColumns * 4).ThrowOnError();
             _ssmConv = module.GetFunction("ts_graph_ssm_conv_f32");
             _deltaNetPrep = module.GetFunction("ts_graph_deltanet_prep_f32");
+            _deltaNetPrepTiled = module.GetFunction("ts_graph_deltanet_prep_tiled_f32");
             _gatedRmsNorm = module.GetFunction("ts_graph_gated_rms_norm_f32");
             _addRmsNorm = module.GetFunction("ts_graph_add_rms_norm_f32");
             _repackQ6kTiled = module.GetFunction("ts_graph_repack_q6k_tiled");
@@ -471,17 +472,44 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuLaunchKernel(_ssmConv, (uint)((total + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
-        /// <summary>GraphFusion.DeltaNetPrep over contiguous F32 buffers (see the kernel's contract).</summary>
+        /// <summary>Tokens a block of the tiled DeltaNet prep takes (TS_GRAPH_PREP_TILE).</summary>
+        internal const int DeltaNetPrepTile = 32;
+
+        /// <summary>
+        /// GraphFusion.DeltaNetPrep over contiguous F32 buffers (see the kernel's contract). A prompt chunk (a tile of rows or
+        /// more, heads of up to 256, a conv of up to 4 taps) runs on the tiled kernel, the same values bit for bit: its conv
+        /// inputs read once and conv_in written along time (the per-row kernel wrote it a float per channel row).
+        /// </summary>
         public void LaunchDeltaNetPrep(IntPtr window, IntPtr qkv, IntPtr convW, IntPtr alpha, IntPtr beta, IntPtr dt, IntPtr a,
             IntPtr convIn, IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr betaOut,
             int channels, int convRows, int width, int d, int kHeads, int vHeads, int rows, float eps, long qkvPitch, long alphaBetaPitch,
             IntPtr stream)
+            => LaunchDeltaNetPrep(window, qkv, convW, alpha, beta, dt, a, convIn, q, k, v, g, betaOut, channels, convRows, width, d, kHeads,
+                vHeads, rows, eps, qkvPitch, alphaBetaPitch, stream, TakesTiledDeltaNetPrep(convRows, width, d, rows));
+
+        /// <summary>Whether <see cref="LaunchDeltaNetPrep(IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr,
+        /// IntPtr, IntPtr, IntPtr, int, int, int, int, int, int, int, float, long, long, IntPtr)"/> takes the tiled kernel.</summary>
+        internal static bool TakesTiledDeltaNetPrep(int convRows, int width, int d, int rows)
+            => rows >= DeltaNetPrepTile && convRows == width - 1 && width <= 4 && d % 32 == 0 && d <= 256;
+
+        /// <summary>The per-row kernel, or the tiled one (<paramref name="tiled"/>; tests compare the two).</summary>
+        internal void LaunchDeltaNetPrep(IntPtr window, IntPtr qkv, IntPtr convW, IntPtr alpha, IntPtr beta, IntPtr dt, IntPtr a,
+            IntPtr convIn, IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr betaOut,
+            int channels, int convRows, int width, int d, int kHeads, int vHeads, int rows, float eps, long qkvPitch, long alphaBetaPitch,
+            IntPtr stream, bool tiled)
         {
             void** args = stackalloc void*[]
             {
                 &window, &qkv, &convW, &alpha, &beta, &dt, &a, &convIn, &q, &k, &v, &g, &betaOut,
                 &channels, &convRows, &width, &d, &kHeads, &vHeads, &rows, &eps, &qkvPitch, &alphaBetaPitch,
             };
+            if (tiled)
+            {
+                uint smem = (uint)(((DeltaNetPrepTile + width - 1) * (d + 1) + DeltaNetPrepTile * d / 32) * sizeof(float));
+                CudaDriverApi.cuLaunchKernel(_deltaNetPrepTiled, (uint)(2 * kHeads + vHeads), (uint)((rows + DeltaNetPrepTile - 1) / DeltaNetPrepTile),
+                    1, (uint)d, 1, 1, smem, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+                return;
+            }
             CudaDriverApi.cuLaunchKernel(_deltaNetPrep, (uint)(2 * kHeads + vHeads), (uint)rows, 1, (uint)d, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
