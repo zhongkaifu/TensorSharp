@@ -123,7 +123,7 @@ public sealed class GraphBlockDraftTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         var (target, draft) = Fixtures(variant);
-        using var graph = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft);
+        using var graph = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { GraphBlockDraftOnMetalForTests = true };
         using var perOp = new Qwen35RuntimeModel(target, reference ?? backend, 1, null, 1, draft) { GraphBlockDraftDisabledForTests = true };
         string label = $"{backend} {variant}";
         Assert.True(graph.HasDFlash && perOp.HasDFlash, $"{label}: the drafter did not attach");

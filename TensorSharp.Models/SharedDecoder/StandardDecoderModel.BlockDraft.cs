@@ -39,6 +39,10 @@ namespace TensorSharp.Models
         /// <summary>Test seam: true keeps the drafter on its fused or per-op path.</summary>
         internal bool GraphBlockDraftDisabledForTests { get; set; }
 
+        /// <summary>Tests: the graph programs draft where the fused GGML drafter would be kept for speed (ggml_metal's
+        /// DFlash2 selector tail).</summary>
+        internal bool GraphBlockDraftOnMetalForTests { get; set; }
+
         /// <summary>Blocks and ring injects the graph programs served (tests check the lowering ran).</summary>
         internal int GraphBlockDrafts { get; private set; }
 
@@ -81,6 +85,11 @@ namespace TensorSharp.Models
             if (cfg.HasAttentionSinks) return "attention sinks";
             if (DFlashRingRows < cfg.SlidingWindow + cfg.BlockSize) return "a ring narrower than the window and a block";
             if (DFlashDraftVocabSubsetRequested) return "a draft vocabulary subset (fused graph only)";
+            // ggml_metal's fused drafter runs DFlash2's head, top-k and selector walk on TensorSharp's own Metal kernels after
+            // its graph (tsm::df_tail_run): 12.3 ms a block of Qwen3.8-27B UD-IQ3_XXS's drafter on an M5 Pro against 15.5 ms
+            // for these programs, whose selector walk is ~70 dependent kernels. It keeps that path until the walk is a region
+            // the GGML builder serves with those kernels.
+            if (_backend == BackendType.GgmlMetal && cfg.HasSelector && !GraphBlockDraftOnMetalForTests) return "ggml_metal's fused selector tail";
             return null;
         }
 
