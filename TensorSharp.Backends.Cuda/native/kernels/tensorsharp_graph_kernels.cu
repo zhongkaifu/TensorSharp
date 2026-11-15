@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 24
+#define TS_GRAPH_KERNELS_VERSION 25
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1310,6 +1310,174 @@ extern "C" __global__ void ts_graph_gemm_q6kt_smem_bytes(int* out)
     out[2] = 3 * (int)sizeof(TsGraphQ6ktStage<4>);
     out[3] = 3 * (int)sizeof(TsGraphQ6ktStage<8>);
 }
+
+// ---------------------------------------------------------------------------
+// Q4_K x q8_1 on the int8 tensor cores: the direct engines' drafter product (ts_q35_gemm_q4k). Q4_K superblock (256
+// values, 144 bytes): half d, half dmin, scales[12] (eight 6-bit scale / min pairs), qs[128]; value 64c + l (c < 4,
+// l < 64) is nibble (l >= 32) of qs[32c + l % 32], in sub-block 2c + (l >= 32), and decodes to d * sc * q - dmin * m.
+// One mma.m16n8k32.s8 per 32-value sub-block (exactly one q8_1 block):
+//   sum_i (d sc q_i - dmin m) xd xq_i = d sc xd (sum q xq) - dmin m xd (sum xq).
+// Block: 4 warps x 16 weight rows against NT * 8 activation rows; grid (row tiles, K splits). With more than one split
+// every block adds its share atomically (the caller zeroes y first). A row's value never depends on how many rows the
+// call holds, but the splits' additions land in any order: for products whose last bits may vary (a drafter's).
+// ---------------------------------------------------------------------------
+#define TS_GRAPH_Q4K_ROW (256 + 16)
+
+__device__ __forceinline__ void ts_graph_q4k_scale_min(int j, const uint8_t* s, int& sc, int& m)
+{
+    if (j < 4)
+    {
+        sc = s[j] & 63;
+        m = s[j + 4] & 63;
+    }
+    else
+    {
+        sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4);
+        m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4);
+    }
+}
+
+__device__ __forceinline__ void ts_graph_mma_s8_k32(int (&c)[4], const int (&a)[4], int b0, int b1)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0), "r"(0), "r"(0), "r"(0));
+#else
+    __trap();
+#endif
+}
+
+template <int NT>
+__device__ __forceinline__ void ts_graph_gemm_q4k(
+    const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k,
+    const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, float* __restrict__ y)
+{
+    constexpr int NA = NT * 8;
+    __shared__ __align__(16) int8_t xs[NA][TS_GRAPH_Q4K_ROW];
+    __shared__ float xds[NA][8], xms[NA][8];
+    __shared__ __align__(16) int8_t ws[4][16][TS_GRAPH_Q4K_ROW];
+    __shared__ float wsd[4][16][8], wsm[4][16][8];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int row0 = blockIdx.x * 64 + warp * 16;
+    const int nsb = k / 256, per = (nsb + gridDim.y - 1) / gridDim.y;
+    const int sb0 = blockIdx.y * per, sb1 = min(nsb, sb0 + per);
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            acc[j][e] = 0.0f;
+    for (int sb = sb0; sb < sb1; ++sb)
+    {
+        __syncthreads();
+        for (int i = tid; i < NA * 16; i += blockDim.x)
+        {
+            const int r = i >> 4, c = (i & 15) * 16;
+            *(int4*)&xs[r][c] = r < n ? *(const int4*)(xq + (long long)r * k + sb * 256 + c) : make_int4(0, 0, 0, 0);
+        }
+        for (int i = tid; i < NA * 8; i += blockDim.x)
+        {
+            const int r = i >> 3;
+            xds[r][i & 7] = r < n ? xd[(long long)r * (k >> 5) + sb * 8 + (i & 7)] : 0.0f;
+        }
+        // This warp's 16 weight rows: lane takes (row, chunk, half) items of 16 code bytes.
+        for (int item = lane; item < 16 * 4 * 2; item += 32)
+        {
+            const int r = item >> 3, c = (item >> 1) & 3, hl = item & 1;
+            const int gr = row0 + r;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (gr < outDim)
+            {
+                const uint8_t* blk = w + (long long)gr * rowBytes + (long long)sb * 144;
+                v = *(const uint4*)(blk + 16 + 32 * c + 16 * hl);
+                if (c == 0 && hl == 0)
+                {
+                    const float d = __half2float(*(const half*)blk), dmin = __half2float(*(const half*)(blk + 2));
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                    {
+                        int sc, m;
+                        ts_graph_q4k_scale_min(j, blk + 4, sc, m);
+                        wsd[warp][r][j] = d * (float)sc;
+                        wsm[warp][r][j] = dmin * (float)m;
+                    }
+                }
+            }
+            else if (c == 0 && hl == 0)
+            {
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    wsd[warp][r][j] = wsm[warp][r][j] = 0.0f;
+            }
+            int8_t* lo = &ws[warp][r][64 * c + 16 * hl];
+            *(uint4*)lo = make_uint4(v.x & 0x0F0F0F0Fu, v.y & 0x0F0F0F0Fu, v.z & 0x0F0F0F0Fu, v.w & 0x0F0F0F0Fu);
+            *(uint4*)(lo + 32) = make_uint4((v.x >> 4) & 0x0F0F0F0Fu, (v.y >> 4) & 0x0F0F0F0Fu,
+                                            (v.z >> 4) & 0x0F0F0F0Fu, (v.w >> 4) & 0x0F0F0F0Fu);
+        }
+        __syncthreads();
+        // Activation block sums, scaled: xd * sum(xq) per 32-value block.
+        for (int i = tid; i < NA * 8; i += blockDim.x)
+        {
+            const int r = i >> 3, b = i & 7;
+            const int* p = (const int*)&xs[r][32 * b];
+            int sum = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                sum = __dp4a(p[j], 0x01010101, sum);
+            xms[r][b] = xds[r][b] * (float)sum;
+        }
+        __syncthreads();
+#pragma unroll 2
+        for (int j = 0; j < 8; ++j)   // 32-value sub-blocks
+        {
+            const int a[4] = { *(const int*)&ws[warp][g][32 * j + 4 * t], *(const int*)&ws[warp][g + 8][32 * j + 4 * t],
+                               *(const int*)&ws[warp][g][32 * j + 16 + 4 * t], *(const int*)&ws[warp][g + 8][32 * j + 16 + 4 * t] };
+            const float d0 = wsd[warp][g][j], d1 = wsd[warp][g + 8][j];
+            const float m0 = wsm[warp][g][j], m1 = wsm[warp][g + 8][j];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+            {
+                int c[4];
+                const int* xr = (const int*)&xs[8 * nt + g][32 * j];
+                ts_graph_mma_s8_k32(c, a, xr[t], xr[4 + t]);
+                const int c0 = 8 * nt + 2 * t;
+                const float x0 = xds[c0][j], x1 = xds[c0 + 1][j], s0 = xms[c0][j], s1 = xms[c0 + 1][j];
+                acc[nt][0] += (float)c[0] * d0 * x0 - m0 * s0;
+                acc[nt][1] += (float)c[1] * d0 * x1 - m0 * s1;
+                acc[nt][2] += (float)c[2] * d1 * x0 - m1 * s0;
+                acc[nt][3] += (float)c[3] * d1 * x1 - m1 * s1;
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const int r = row0 + g + 8 * (e >> 1), col = 8 * nt + 2 * t + (e & 1);
+            if (r < outDim && col < n)
+            {
+                float* dst = y + (long long)col * outDim + r;
+                if (gridDim.y > 1)
+                    atomicAdd(dst, acc[nt][e]);
+                else
+                    *dst = acc[nt][e];
+            }
+        }
+}
+
+// y [n][outDim] = xq [n] W^T for n <= NT * 8 rows of a Q4_K weight (rows rowBytes apart; k a multiple of 256). Launch:
+// grid (ceil(outDim / 64), K splits), block 128; with more than one split y starts zeroed.
+#define TS_GRAPH_GEMM_Q4K(NT) \
+    extern "C" __global__ void __launch_bounds__(128) ts_graph_gemm_q4k_##NT( \
+        const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k, \
+        const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, float* __restrict__ y) \
+    { ts_graph_gemm_q4k<NT>(w, rowBytes, outDim, k, xq, xd, n, y); }
+TS_GRAPH_GEMM_Q4K(1)
+TS_GRAPH_GEMM_Q4K(2)
+TS_GRAPH_GEMM_Q4K(4)
+TS_GRAPH_GEMM_Q4K(8)
 
 // y = silu(x * scale) over n contiguous floats (the read's low-rank activation). Launch: ceil(n / 256), 256.
 // yq (null, or n % 32 == 0): y also as q8_1.

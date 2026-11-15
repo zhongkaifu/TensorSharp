@@ -25,6 +25,9 @@ namespace TensorSharp.Graph
     /// </summary>
     public abstract class TensorGraphExecutor : IStreamingGraphExecutor
     {
+        /// <inheritdoc cref="IGraphExecutor.Drafting"/>
+        public bool Drafting { get; set; }
+
         protected TensorGraphExecutor(IAllocator allocator)
             => Allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
 

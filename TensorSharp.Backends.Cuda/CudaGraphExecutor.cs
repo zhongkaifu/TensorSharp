@@ -2310,6 +2310,12 @@ namespace TensorSharp.Cuda
         {
             foreach (Tensor t in _quantized.Values) t.Dispose();
             _quantized.Clear();
+            foreach ((Tensor q, Tensor d) in _splitQuantized.Values)
+            {
+                q.Dispose();
+                d.Dispose();
+            }
+            _splitQuantized.Clear();
             foreach (DeferredNorm d in _deferredNorms) d.Dispose();
             _deferredNorms.Clear();
             _deferredBy.Clear();
@@ -2892,6 +2898,24 @@ namespace TensorSharp.Cuda
             cache[key] = q;
         }
 
+        /// <summary>A drafter's activations as split q8_1 rows (int8 values, then a float scale a 32-value block) for the int8
+        /// tensor-core products, by the storage and offset they were read from; released when the run ends.</summary>
+        private readonly Dictionary<(CudaStorage Storage, long Offset, long InDim, long Rows), (Tensor Q, Tensor D)> _splitQuantized = new();
+
+        /// <summary>The rows of x as split q8_1, once a run for every product that reads them.</summary>
+        private (Tensor Q, Tensor D) SplitQuantizedOnce(CudaAllocator cuda, Tensor x, CudaStorage xs, long inDim, long rows)
+        {
+            var key = (xs, x.StorageOffset, inDim, rows);
+            if (_splitQuantized.TryGetValue(key, out (Tensor Q, Tensor D) split)) return split;
+            split = (new Tensor(Allocator, DType.UInt8, rows * inDim), new Tensor(Allocator, DType.Float32, rows * (inDim / 32)));
+            xs.EnsureDeviceCurrent();
+            cuda.Context.MakeCurrent();
+            cuda.Kernels.LaunchQuantizeQ81SplitRows(Ptr(x), Ptr(split.Q), Ptr(split.D), (int)inDim, (int)rows, cuda.Stream.Handle);
+            ((CudaStorage)split.Q.Storage).MarkDeviceModified();
+            ((CudaStorage)split.D.Storage).MarkDeviceModified();
+            return _splitQuantized[key] = split;
+        }
+
         /// <summary>The rows of x quantized to q8_1, once a run for every product that reads them.</summary>
         private Tensor QuantizedOnce(CudaAllocator cuda, Tensor x, CudaStorage xs, long inDim, long rows)
         {
@@ -3108,6 +3132,24 @@ namespace TensorSharp.Cuda
                     for (long r = 0; r < rows; r++)
                         cuda.Kernels.LaunchMatvecBf16(bPtr, input + (nint)(r * inDim * sizeof(float)), output + (nint)(r * outDim * sizeof(float)),
                             (int)inDim, (int)outDim, cuda.Stream.Handle);
+                ((CudaStorage)product.Storage).MarkDeviceModified();
+                return product;
+            }
+            // A drafter's Q4_K products (IGraphExecutor.Drafting) on the int8 tensor cores, as the direct engines ran theirs: a
+            // Qwen3.8 27B DFlash2 draft block's 45 Q4_K products took 5.0 ms a step on the row-invariant decode kernels, the
+            // engine's 2.6 (RTX PRO 4000). A drafter's last bits need not match anything: its proposals are verified.
+            if (Drafting && _branchQuantized == null && rows >= 2 && rows <= CudaGraphKernels.Q4kMmaMaxRows && inDim % 256 == 0 && inDim <= int.MaxValue
+                && outDim <= int.MaxValue && weight.Ne2 <= 1 && weight.Bytes % outDim == 0 && x.Storage is CudaStorage ds
+                && x.ElementType == DType.Float32 && x.IsContiguous() && x.ElementCount() == rows * inDim && cuda.Kernels != null
+                && Kernels is { TakesQ4kMma: true } q4k && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr qPtr,
+                    out int qType) && qType == 12)
+            {
+                (Tensor xq, Tensor xd) = SplitQuantizedOnce(cuda, x, ds, inDim, rows);
+                var product = new Tensor(Allocator, DType.Float32, rows, outDim);
+                ((CudaStorage)product.Storage).EnsureDeviceCurrent();
+                cuda.Context.MakeCurrent();
+                q4k.LaunchGemmQ4k(qPtr, weight.Bytes / outDim, (int)outDim, (int)inDim, Ptr(xq), Ptr(xd), (int)rows, Ptr(product),
+                    cuda.Stream.Handle);
                 ((CudaStorage)product.Storage).MarkDeviceModified();
                 return product;
             }

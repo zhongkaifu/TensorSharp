@@ -1039,6 +1039,26 @@ namespace TensorSharp.Models
             bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned,
             bool deviceOutputs = false, string shape = null, Tensor advanceHidden = null, Tensor[] advanceInputs = null)
         {
+            // A drafter's steps (IGraphExecutor.Drafting): its proposals are verified, so its products may take kernels whose
+            // last bits vary (the direct engines ran their drafters' Q4_K products on the int8 tensor cores).
+            IGraphExecutor executor = GraphExecutor;
+            bool drafting = executor.Drafting;
+            executor.Drafting = shape != null && shape.StartsWith(DraftShapePrefix, StringComparison.Ordinal);
+            try
+            {
+                return RunTracedAs(rows, slots, first, counts, starts, replayable, snapshots, attentionFloor, emit, out outputs, out owned,
+                    deviceOutputs, shape, advanceHidden, advanceInputs);
+            }
+            finally
+            {
+                executor.Drafting = drafting;
+            }
+        }
+
+        private CachedGraph RunTracedAs(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
+            bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned,
+            bool deviceOutputs, string shape, Tensor advanceHidden, Tensor[] advanceInputs)
+        {
             GraphStep step = null;
             CachedGraph graph = null;
             owned = false;

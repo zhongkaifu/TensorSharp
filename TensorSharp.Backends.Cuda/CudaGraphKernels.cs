@@ -20,11 +20,13 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 24;
+        public const int CurrentVersion = 25;
 
         private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
+        private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
+        private readonly int _multiprocessors;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
@@ -96,6 +98,11 @@ namespace TensorSharp.Cuda
                     CudaDriverApi.cuMemFree(probe);
                 }
                 TakesTiledQ6kHeads = true;
+                for (int i = 0; i < 4; i++)
+                    _gemmQ4k[i] = module.GetFunction($"ts_graph_gemm_q4k_{1 << i}");
+                CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
+                CudaDriverApi.cuDeviceGetAttribute(out _multiprocessors, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
+                TakesQ4kMma = true;
             }
         }
 
@@ -104,6 +111,38 @@ namespace TensorSharp.Cuda
 
         /// <summary>Whether this image runs <see cref="LaunchGemmQ6kTiled"/> (its sm_80 bodies are in it).</summary>
         public bool TakesTiledQ6kHeads { get; }
+
+        /// <summary>Whether this image runs <see cref="LaunchGemmQ4k"/> (its sm_80 bodies are in it).</summary>
+        public bool TakesQ4kMma { get; }
+
+        /// <summary>Activation rows <see cref="LaunchGemmQ4k"/> takes in one launch.</summary>
+        public const int Q4kMmaMaxRows = 64;
+
+        /// <summary>y [n][outDim] = xq [n] W^T for a Q4_K weight (rows <paramref name="rowBytes"/> apart, k a multiple of 256)
+        /// on the int8 tensor cores, the direct engines' drafter product: <paramref name="xq"/> int8 [n][k] and
+        /// <paramref name="xd"/> [n][k / 32] (the split q8_1 rows). K splits until the row tiles fill the device twice over (at
+        /// least four superblocks a split), their shares added atomically: the last bits vary from run to run.</summary>
+        public void LaunchGemmQ4k(IntPtr w, long rowBytes, int outDim, int k, IntPtr xq, IntPtr xd, int n, IntPtr y, IntPtr stream)
+        {
+            uint tiles = (uint)((outDim + 63) / 64);
+            int superblocks = k / 256, splits = 1;
+            while (tiles * splits < 2 * _multiprocessors && splits * 4 <= superblocks)
+                splits *= 2;
+            if (splits > 1)
+                CudaDriverApi.cuMemsetD32Async(y, 0, new UIntPtr((ulong)n * (ulong)outDim), stream).ThrowOnError();
+            IntPtr a4 = IntPtr.Zero, a5 = IntPtr.Zero, a7 = IntPtr.Zero;
+            int rows = 0;
+            void** args = stackalloc void*[] { &w, &rowBytes, &outDim, &k, &a4, &a5, &rows, &a7 };
+            for (int r0 = 0; r0 < n; r0 += Q4kMmaMaxRows)
+            {
+                rows = Math.Min(Q4kMmaMaxRows, n - r0);
+                int i = rows <= 8 ? 0 : rows <= 16 ? 1 : rows <= 32 ? 2 : 3;
+                a4 = xq + (nint)((long)r0 * k);
+                a5 = xd + (nint)((long)r0 * (k / 32) * 4);
+                a7 = y + (nint)((long)r0 * outDim * 4);
+                CudaDriverApi.cuLaunchKernel(_gemmQ4k[i], tiles, (uint)splits, 1, 128, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            }
+        }
 
         /// <summary>A Q6_K matrix's stored rows [rows][srcRowBytes] (rows rowBase .. of the head) into the tiled layout at
         /// <paramref name="dst"/> (the head's base); rows of whole 64-row tiles land on the same bytes they came from.</summary>

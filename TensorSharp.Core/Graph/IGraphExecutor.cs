@@ -100,6 +100,11 @@ namespace TensorSharp.Graph
         /// cache key: the executor may keep it in a layout only its own products read. False where it keeps the weight as it
         /// is.</summary>
         bool KeepForProductsOnly(IntPtr weightKey) => false;
+
+        /// <summary>The steps run now are a drafter's: its proposals are verified, not trusted, so its products need not be
+        /// row-invariant (a verify window's rows a plain decode step's bit for bit) and may take faster kernels whose last
+        /// bits vary. Set around a draft step's runs, its recordings' included.</summary>
+        bool Drafting { get => false; set { } }
     }
 
     /// <summary>A compiled program. Outputs are the plan's arrays, rewritten by each run.</summary>
