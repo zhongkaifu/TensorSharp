@@ -2089,17 +2089,16 @@ namespace TensorSharp.Graph
             bool run1 = true;
             for (int i = 1; i < count; i++) run1 &= rows[i] == rows[0] + i;
             if (run1 && TryWriteRows(dst, s4, rows[0], count)) return dst;
-            if (run1)
+            // Each run of consecutive rows in one copy: a ring's write that wraps (a block drafter's prompt inject, 1,569 rows
+            // into a 2,080-row ring) is two, where a copy a row took 6 ms a layer on CUDA.
+            for (int i = 0; i < count;)
             {
-                using Tensor target = d4.Narrow(2, rows[0], count);
-                CopyInto(target, s4);
-                return dst;
-            }
-            for (int i = 0; i < count; i++)
-            {
-                using Tensor target = d4.Narrow(2, rows[i], 1);
-                using Tensor row = s4.Narrow(2, i, 1);
-                CopyInto(target, row);
+                int n = 1;
+                while (i + n < count && rows[i + n] == rows[i] + n) n++;
+                using Tensor target = d4.Narrow(2, rows[i], n);
+                using Tensor part = s4.Narrow(2, i, n);
+                CopyInto(target, part);
+                i += n;
             }
             return dst;
         }
