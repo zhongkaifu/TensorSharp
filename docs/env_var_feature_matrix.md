@@ -74,8 +74,8 @@ catalog entry or the user's setting. The iOS app (`TensorAgent.Maui`) also defau
 
 The direct-CUDA engines of the Qwen 3.5 / 3.6 / 3.8 family and of Qwen 3.8 Flash Next, and NInfer support, were
 removed in 2026-11; `--backend cuda` now runs those families on the shared decoder runtime. Their variables went with
-them and now stop the server or CLI at startup: the engines' `TS_Q35_*` and `TS_Q4E_*` variables (the runtime still
-reads `TS_Q4E_HC_Q8` and `TS_Q4E_MTP_EXPERTS`), `TS_MOE_TIER_ADAPT_SWAPS`, `TS_MOE_TIER_ADAPT_EVERY`,
+them and now stop the server or CLI at startup: the engines' own variables (except `TS_Q4E_HC_Q8` and
+`TS_Q4E_MTP_EXPERTS`, which the runtime still reads), `TS_MOE_TIER_ADAPT_SWAPS`, `TS_MOE_TIER_ADAPT_EVERY`,
 `TS_MOE_TIER_ADAPT_ASYNC`, `TS_MOE_TIER_ADAPT_PROMPT_SWAPS` and `TS_NINFER_GGUF_DIR`. The complete list is
 `RemovedEnvironmentVariables` in `TensorSharp.Runtime/RemovedCliFlags.cs`.
 
@@ -351,7 +351,7 @@ A/B switch, plus long-context sizing knobs. None are registered in
 | `TS_PREFIX_ASYNC_SAVE` | Prefix checkpoint persistence | `0` writes shared-prefix checkpoint files on the engine worker (inline export, write and fsync) instead of in the background; background saves need 32 GB of host memory | ON | not registered | no |
 | `TS_SCHED_PREFILL_FCFS` | Continuous batching scheduler | `1` gives a step with no decode in flight to prompts oldest first instead of an even share per prompt | OFF | not registered | no |
 | `TS_SCHED_MIXED_PREFILL_TOKENS` / `TS_SCHED_MIXED_PREFILL_FCFS` | Continuous batching scheduler | Prompt tokens a step that also decodes may carry across all its prefilling sequences (`0`: only the per-sequence chunk bound); FCFS keeps that budget on the oldest prompt. A model may set the bound itself when the variable is unset (`IMixedStepPrefillTarget`; the removed Qwen 3.5 / 3.8 direct-CUDA engine set `1024`, and no model in the tree sets one now) | the model's bound, else none / OFF | not registered | no |
-| `TS_SCHED_MIXED_STEP` | Continuous batching executor, a model that takes a step's prompt chunk into its batched speculative verify (`IMixedStepPrefillTarget`; none in the tree since the Qwen 3.5 / 3.8 direct-CUDA engine was removed, and its alias `TS_Q35_MIXED_STEP` went with it) | `0` runs a step's prompt chunk and its batched speculative verify as two forwards instead of one mixed forward | ON | not registered | no |
+| `TS_SCHED_MIXED_STEP` | Continuous batching executor, a model that takes a step's prompt chunk into its batched speculative verify (`IMixedStepPrefillTarget`; none in the tree since the Qwen 3.5 / 3.8 direct-CUDA engine was removed) | `0` runs a step's prompt chunk and its batched speculative verify as two forwards instead of one mixed forward | ON | not registered | no |
 | `TS_QWEN_VISION_MERGED` | Qwen 3.5 / 3.8 vision encoder | `0` runs the post-LN spatial merger as separate ops after the fused encoder graph instead of inside it (bit-identical either way) | ON | not registered | no |
 | `TS_QWEN_VISION_F16` | Qwen 3.5 / 3.8 vision encoder (CUDA) | `1` gives the merged encoder F16 linear weights (F32 accumulation): half the resident weight memory, relative L2 ~0.002-0.003 vs F32, no measured speedup | OFF | not registered | no |
 | `TS_QWEN_VISION_DUMP` | Qwen 3.5 / 3.8 vision encoder | Directory to write each image's projected embeddings (int32 count + float32 values) for `eng/validation/compare-vision-embeddings.py` | unset | not registered | no |

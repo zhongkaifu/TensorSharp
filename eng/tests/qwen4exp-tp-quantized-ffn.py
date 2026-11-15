@@ -187,10 +187,6 @@ def main():
                 values[0]=C.addressof(shards[rank]);values[len(signature)-1]=rank;plan=P()
                 assert tp(*values,C.byref(plan)),err();plans[rank]=plan
             assert execute(plans,degree),err()
-            if os.environ.get("TS_Q4E_NODE_DUMP"):
-                dump = lib.TSGgml_Qwen4ExpTestDumpTpPlans
-                dump.argtypes = [P,I,I,I,I,I,I,I]; dump.restype = None
-                dump(plans,degree,0,1,T,0,1,T)
         else: assert normal(*values),err()
         return out
     def git_output(*command):

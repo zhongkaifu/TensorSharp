@@ -215,7 +215,7 @@ namespace TensorSharp.Models
         /// <summary>The draft head scores the Qwen2 base vocabulary (ids below the first token of the Qwen3.5/3.8
         /// tokenizer's extensions): the later multilingual additions and the special tokens are almost never the next
         /// token (0.2% of mixed English/Chinese text, 0.01% of Chinese), and the head over all 248,320 rows was 270 us
-        /// of each draft step on an RTX 5090 (the direct engine's default, TS_Q4E_DRAFT_VOCAB).</summary>
+        /// of each draft step on an RTX 5090 (the default of the removed direct engine).</summary>
         protected override int DraftVocabulary => Math.Min(Config.VocabSize, 151643);
 
         protected override int EmitDraftInput(GraphStep step, int layer, int embedded, int hidden)

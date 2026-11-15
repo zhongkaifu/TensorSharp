@@ -144,7 +144,7 @@ def probe_environment_overrides(steps):
     while capacity < steps + 64:
         capacity *= 2
     return {"MAX_CONTEXT": str(max(256, capacity)), "TS_KV_INITIAL_TOKENS": str(capacity),
-            "TS_Q4E_DISABLE_ARENA_DECODE": None, "speculation": "Cleared by the test's EnvScope"}
+            "speculation": "Cleared by the test's EnvScope"}
 
 
 def capture(args, environment):

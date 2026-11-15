@@ -65,8 +65,8 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 ## KV Cache / 上下文
 
 Qwen 3.5 / 3.6 / 3.8 家族与 Qwen 3.8 Flash Next 的直连 CUDA 引擎以及 NInfer 支持已于 2026-11 移除；`--backend cuda`
-现在在共享解码运行时上运行这些模型族。它们的变量随之移除，现在设置会让服务端或 CLI 在启动时报错退出：引擎的
-`TS_Q35_*` 与 `TS_Q4E_*` 变量（运行时仍读取 `TS_Q4E_HC_Q8` 与 `TS_Q4E_MTP_EXPERTS`）、`TS_MOE_TIER_ADAPT_SWAPS`、
+现在在共享解码运行时上运行这些模型族。它们的变量随之移除，现在设置会让服务端或 CLI 在启动时报错退出：引擎自己的
+变量（运行时仍读取的 `TS_Q4E_HC_Q8` 与 `TS_Q4E_MTP_EXPERTS` 除外）、`TS_MOE_TIER_ADAPT_SWAPS`、
 `TS_MOE_TIER_ADAPT_EVERY`、`TS_MOE_TIER_ADAPT_ASYNC`、`TS_MOE_TIER_ADAPT_PROMPT_SWAPS` 与 `TS_NINFER_GGUF_DIR`。完整列表见
 `TensorSharp.Runtime/RemovedCliFlags.cs` 中的 `RemovedEnvironmentVariables`。
 
@@ -314,7 +314,7 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_PREFIX_ASYNC_SAVE` | 前缀检查点持久化 | `0` 在引擎工作线程上写共享前缀检查点文件（导出、写入并 fsync），而不是在后台写；后台保存需要 32 GB 主机内存 | 开 | 未注册 | 否 |
 | `TS_SCHED_PREFILL_FCFS` | 连续批处理调度器 | `1` 在没有解码进行时按先到先得把步骤预算分给提示，而不是平均分配 | 关 | 未注册 | 否 |
 | `TS_SCHED_MIXED_PREFILL_TOKENS` / `TS_SCHED_MIXED_PREFILL_FCFS` | 连续批处理调度器 | 同时有解码的步骤里所有预填充序列合计可携带的提示 token 数（`0`：只受每序列分块上限约束）；FCFS 把这份预算留给最早的提示。变量未设置时模型可自行给出上限（`IMixedStepPrefillTarget`；已移除的 Qwen 3.5 / 3.8 直连 CUDA 引擎给出 `1024`，现在代码中没有模型给出上限） | 模型给出的上限，否则无 / 关 | 未注册 | 否 |
-| `TS_SCHED_MIXED_STEP` | 连续批处理执行器，能把一步的提示分块并入批量投机验证的模型（`IMixedStepPrefillTarget`；自 Qwen 3.5 / 3.8 直连 CUDA 引擎移除后代码中没有，其别名 `TS_Q35_MIXED_STEP` 也随之移除） | `0` 把同一步的提示分块与批量投机验证分成两次前向，而不是一次混合前向 | 开 | 未注册 | 否 |
+| `TS_SCHED_MIXED_STEP` | 连续批处理执行器，能把一步的提示分块并入批量投机验证的模型（`IMixedStepPrefillTarget`；自 Qwen 3.5 / 3.8 直连 CUDA 引擎移除后代码中没有） | `0` 把同一步的提示分块与批量投机验证分成两次前向，而不是一次混合前向 | 开 | 未注册 | 否 |
 | `TS_QWEN_VISION_MERGED` | Qwen 3.5 / 3.8 视觉编码器 | `0` 在融合编码器图之后以独立算子运行 post-LN 空间合并器，而不是放在图内（两者结果逐位一致） | 开 | 未注册 | 否 |
 | `TS_QWEN_VISION_F16` | Qwen 3.5 / 3.8 视觉编码器（CUDA） | `1` 让合并编码器使用 F16 线性权重（F32 累加）：常驻权重内存减半，相对 F32 的相对 L2 约 0.002-0.003，未测得加速 | 关 | 未注册 | 否 |
 | `TS_QWEN_VISION_DUMP` | Qwen 3.5 / 3.8 视觉编码器 | 将每张图像的投影嵌入（int32 个数 + float32 值）写入该目录，供 `eng/validation/compare-vision-embeddings.py` 比较 | 未设置 | 未注册 | 否 |

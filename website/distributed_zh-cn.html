@@ -161,7 +161,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
     </tbody>
   </table>
   </div>
-  <p>llama.cpp 在同一台机器上表现相同：<code>-sm layer</code> 把 pp1536 / tg128 从单卡的 1094 / 61.2 提到双卡的 1200 / 61.5 —— prefill 约 10%，decode 几乎为零 —— 而 <code>-sm row</code> 干脆拒绝加载这个架构。所以这里传 <code>--layer-split N</code> 的理由是权重、缓存与上下文装不进一张卡，而不是吞吐。启动时会打印实际使用的模式与每张 GPU 的层数 / 字节划分。<code>TS_Q4E_LAYER_SPLIT=20,28</code> 可为每张 GPU 指定明确的层数（精神上等同 llama.cpp 的 <code>--tensor-split</code>），遇到无法满足的取值会抛错而不是默默忽略 —— 这很有用，因为自动均衡只按权重计价，看不到稍后才加载、并落在 GPU 0 上的视觉塔。</p>
+  <p>llama.cpp 在同一台机器上表现相同：<code>-sm layer</code> 把 pp1536 / tg128 从单卡的 1094 / 61.2 提到双卡的 1200 / 61.5 —— prefill 约 10%，decode 几乎为零 —— 而 <code>-sm row</code> 干脆拒绝加载这个架构。所以这里传 <code>--layer-split N</code> 的理由是权重、缓存与上下文装不进一张卡，而不是吞吐。启动时会打印实际使用的模式与每张 GPU 的层数 / 字节划分。</p>
 
   <h3 id="perf-qwen-image">TP 下的 Qwen-Image-2.1 扩散 Transformer</h3>
   <p>两张分属不同 CPU 插槽的 NVIDIA A40（各 46 GB），它们之间的 peer access 不可用，NCCL 走的是共享内存传输。前缀缓存开启，步时不含第 1 步：</p>

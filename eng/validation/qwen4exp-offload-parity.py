@@ -66,13 +66,14 @@ def run_case(root, output, configuration, name, decode, pin_mb, reference):
     captures = directory / "logits"
     env = os.environ.copy()
     env.update(TS_TEST_GGML_BACKEND="cuda", TS_HOST_MOE_DECODE=str(decode), TS_HOST_MOE_PIN="1",
-               TS_HOST_MOE_PIN_MAX_MB=str(pin_mb), TS_Q4E_OFFLOAD_CAPTURE_DIR=str(captures))
-    env.pop("TS_Q4E_OFFLOAD_REFERENCE_DIR", None)
+               TS_HOST_MOE_PIN_MAX_MB=str(pin_mb), TS_TEST_OFFLOAD_CAPTURE_DIR=str(captures))
+    env.pop("TS_TEST_OFFLOAD_REFERENCE_DIR", None)
     if reference is not None:
-        env["TS_Q4E_OFFLOAD_REFERENCE_DIR"] = str(reference)
+        env["TS_TEST_OFFLOAD_REFERENCE_DIR"] = str(reference)
     command = ["dotnet", "test", "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
                "-c", configuration, "--no-build", "--no-restore", "--filter",
-               "FullyQualifiedName~Qwen4ExpExpertOffloadTests&FullyQualifiedName~Cuda",
+               "FullyQualifiedName~Qwen4ExpExpertOffloadTests.OffloadedExperts_AnswerAsTheAccelerator_Cuda"
+               "|FullyQualifiedName~Qwen4ExpExpertOffloadTests.StreamedPrefill_AnswersAsTheAccelerator_Cuda",
                "--logger", "trx;LogFileName=tests.trx", "--results-directory", str(directory)]
     started = time.monotonic()
     with (directory / "tests.log").open("w", encoding="utf-8") as log:

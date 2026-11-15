@@ -48,7 +48,7 @@ public sealed class ConfigFileArgsEnvironmentTests : IDisposable
 
     /// <summary>Many of these switches are read by the native library with getenv, and on Unix
     /// .NET keeps its own copy of the environment: a default published only there never reached
-    /// the C runtime (config/qwen3.8-flash-next.json's TS_Q4E_VERIFY_ROW_KERNELS was ignored).</summary>
+    /// the C runtime (a Flash Next preset's native switch was once ignored that way).</summary>
     [Fact]
     public void Defaults_ReachTheNativeEnvironment()
     {

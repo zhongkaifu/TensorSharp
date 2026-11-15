@@ -87,7 +87,7 @@ TensorSharp keeps the tanh merger, which is the shipped projector's validated de
 - An erf trial passed 10/12.
 - A same-build OCR control read blue `9364` as `9334` with erf.
 
-The erf opt-in (`TS_Q4E_VISION_MERGER_ERF`) went with the removed implementation. See the
+The erf opt-in went with the removed implementation. See the
 [image validation guide](../../eng/validation/qwen38-parallel-vision.md).
 
 **Against `Qwen4ExpModel`**, measured against `main` (`032fdf24`, which still served it), 3.6K-token prompt:
@@ -111,10 +111,10 @@ Further notes:
 
 > **Historical sections.** The dated sections below that describe the GGML backends record `Qwen4ExpModel`, which was
 > removed on 2026-11-13. That covers its token span, arenas, retained holders, one-token verify-row kernels and expert
-> cache. Its GGML-only switches went with it: `TS_Q4E_VERIFY_ROW_KERNELS`, `TS_Q4E_VERIFY_ROW_COMMIT`,
-> `TS_Q4E_DISABLE_ARENA_DECODE`, `TS_Q4E_QSA_POOL_CACHE`, `TS_Q4E_QSA_SPARSE_FA`, `TS_Q4E_LAYER_SPLIT`,
-> `TS_Q4E_PLE_PREFETCH`, `TS_Q4E_METAL_FUSE`, `TS_Q4E_VISION_MERGER_ERF`, `TS_Q4E_RETAINED_CACHE_MB`, the expert
-> cache's `TS_HOST_MOE_EXPERT_CACHE_*` and the debug dumps. Setting one now prints a removal notice. The direct-CUDA
+> cache. Its GGML-only switches went with it (the verify-row kernels and commit, the arena decode, the QSA pool cache
+> and sparse attention, the explicit layer split, PLE prefetch, Metal fusion, the erf vision merger and the
+> retained-cache budget), as did the expert cache's `TS_HOST_MOE_EXPERT_CACHE_*` and the debug dumps; the sections
+> below describe them by what they did. Setting one now prints a removal notice. The direct-CUDA
 > engine (`Qwen4ExpCudaModel`, the Q4e kernels) that `--backend cuda` used to load was removed after it; its sections below
 > are historical too, and its switches stop the server or CLI at startup (see
 > [The direct CUDA engine on one GPU that cannot hold the experts](#the-direct-cuda-engine-on-one-gpu-that-cannot-hold-the-experts-2026-11-07)).
@@ -465,11 +465,10 @@ Qwen 3.5 and DeepSeek V4 paths have:
   following scalar token rotates at `KV index - gap`. The gap is the negative of
   Qwen 3.5's rotary delta, including signed video offsets. Changed media content,
   span boundaries or conversation scope cannot claim that conversation's state.
-- Extra retained holders and checkpoints count against
-  `TS_Q4E_RETAINED_CACHE_MB`, clamped by measured memory headroom; `0` or an
-  unparsable value declines those payloads. This does not disable exact reuse of
-  an already live primary. Unset, model admission uses half the current measured
-  headroom, with 4096 MB only where no headroom can be measured. The radix tree
+- Extra retained holders and checkpoints counted against a retention budget of
+  their own, half the measured memory headroom by default (the runtime that
+  replaced `Qwen4ExpModel` keeps them in its prefix cache, within the memory its
+  slots leave). The radix tree
   also resolves its default device/state caps from half the spare memory at
   engine creation and checks current spare memory minus running-request reserves.
   Its live-primary marker is not charged again as an extra holder. The tree owns
@@ -619,16 +618,13 @@ pays off on code and lists: a 4-row verify costs ~115 ms against ~50 ms for a pl
 experts), acceptance 81% (3.4 tokens per verify). On `ggml_metal` the rows are verified as
 one batched forward by default, as NInfer, llama.cpp and vLLM do: 95 ms a verify and 1.3x the
 speed of verifying each row with the one-token kernels on code. Greedy text then differs from
-plain decode and depends on the verify widths the governor chose; `TS_Q4E_VERIFY_ROW_KERNELS=1`
-restores the exact rows (speculative text bit-identical to plain greedy, as on CPU and, by
-default, CUDA, which keep them; there `TS_Q4E_VERIFY_ROW_KERNELS=0` selects the batched
-verify). A partial acceptance no longer restores the
+plain decode and depends on the verify widths the governor chose; CPU and CUDA keep the exact
+rows (speculative text bit-identical to plain greedy). A partial acceptance no longer restores the
 recurrent state and re-forwards the kept rows (~60 ms each): the verify span keeps every
 row's GDN conv/SSM state (upstream `ggml_gated_delta_net`'s per-row snapshots) and PLE conv
 history, and the accepted row is copied into the live state (NInfer's ReplaySSM idea; by
 `memcpy` where the state is host-visible, by one device copy graph on `ggml_cuda` and
-`ggml_vulkan`, and by the old rollback on a layer split whose state spans devices;
-`TS_Q4E_VERIFY_ROW_COMMIT=0` restores the old rollback everywhere). With the exact verify rows the
+`ggml_vulkan`, and by the old rollback on a layer split whose state spans devices). With the exact verify rows the
 speculative text is still identical to plain greedy.
 
 A batched verify also overlaps its window reads with the GPU, as NInfer's streaming window
@@ -682,8 +678,7 @@ needs this construction on macOS ARM: without it, widths 2 and 4 differed from
 scalar logits despite identical stored GDN, PLE and KV state. The strict fixture
 suite passes with the CPU path enabled; its runtime is not a performance benchmark.
 The timing measurements below describe the original A40 run, not a qualification
-of other GPU architectures or the broadcast fallback. A test-hook build can set
-`TS_Q4E_TEST_MMVQ_CHANNELS=1` at startup to exercise that fallback on A40.
+of other GPU architectures or the broadcast fallback.
 
 Measured on the same setup, three interleaved repetitions: every verify row at
 widths 2, 3 and 4 is now bit-identical to its decode step (0 of 48 rows differ, no
@@ -847,7 +842,7 @@ repetitions in one session; the profile came from a separate 12-prompt calibrati
 | Before (whole layers wired) | 13.80 / 13.87 / 15.59 | 3.14 / 13.58 / 2.78 |
 | Expert tiers + explicit reads | 19.16 / 19.88 / 20.70 | 0.78 / 6.39 / 0.53 |
 | Before, MTP head | 14.67 / 11.98 / 16.66 | 5.31 / 13.61 / 3.27 |
-| Expert tiers, MTP head, exact verify rows (`TS_Q4E_VERIFY_ROW_KERNELS=1`) | 23.47 / 19.01 / 24.60 | 0.77 / 7.39 / 0.57 |
+| Expert tiers, MTP head, exact verify rows | 23.47 / 19.01 / 24.60 | 0.77 / 7.39 / 0.57 |
 | Expert tiers, MTP head (batched verify, the default) | 30.87 / 21.31 / 28.31 | 0.75 / 7.03 / 0.56 |
 | `config/qwen3.8-flash-next-ud-q2_k_xl.json` (the line above, with its sampling settings) | 27.00 / 20.62 / 32.72 | 0.80 / 7.96 / 0.53 |
 
@@ -889,9 +884,9 @@ Repeated arms agreed within 1.5 tok/s.
 | --- | --- | --- | --- | --- | --- |
 | Plain | 52.2 | 52.4 | 47.6 | 43.1 | - |
 | Plain, `TS_HOST_MOE_OVERLAP=0` | 49.6 | 49.6 | 45.5 | 41.3 | identical |
-| MTP, old rollback (`TS_Q4E_VERIFY_ROW_COMMIT=0`) | 49.6 | 39.5 | 47.8 | 52.5 | differs on all four |
+| MTP, old rollback | 49.6 | 39.5 | 47.8 | 52.5 | differs on all four |
 | MTP, exact rows + row commit (default) | 60.9 | 49.6 | 58.1 | 53.1 | identical on code and edit |
-| MTP, batched verify (`TS_Q4E_VERIFY_ROW_KERNELS=0`) | 64.3 | 55.0 | 57.9 | 54.8 | not exact by design |
+| MTP, batched verify | 64.3 | 55.0 | 57.9 | 54.8 | not exact by design |
 | Plain, adaptive slots (`TS_MOE_TIER_ADAPT=1`) | 57.1 | 61.4 | 58.8 | 53.3 | depends on earlier output |
 | MTP + adaptive slots | 62.6 | 56.9 | 60.7 | 57.5 | depends on earlier output |
 
@@ -1107,9 +1102,9 @@ decides hits on the device and computes misses on a CPU pool in place, concurren
 > [DFlash2 drafter on ggml_metal](#dflash2-drafter-on-ggml_metal-2026-11-08), record the direct-CUDA engine
 > (`Qwen4ExpCudaModel`, the Q4e kernels) that `--backend cuda` loaded until it was removed in 2026-11. `--backend cuda`
 > now runs the shared runtime on the CUDA graph executor; none of these measurements has been repeated there. The
-> engine's own switches named below went with it: its `TS_Q4E_*` variables (the runtime still reads `TS_Q4E_HC_Q8`
-> and `TS_Q4E_MTP_EXPERTS`) and `TS_MOE_TIER_ADAPT_SWAPS`, `_EVERY`, `_ASYNC` and `_PROMPT_SWAPS`. Setting one now
-> stops the server or CLI at startup. The `config/qwen3.8-flash-next-cuda-4lanes.json` overlay these sections mention is
+> engine's own switches went with it, `TS_MOE_TIER_ADAPT_SWAPS`, `_EVERY`, `_ASYNC` and `_PROMPT_SWAPS` among them, and
+> setting one now stops the server or CLI at startup; the sections below describe them by what they did. The runtime
+> still reads `TS_Q4E_HC_Q8` and `TS_Q4E_MTP_EXPERTS`. The `config/qwen3.8-flash-next-cuda-4lanes.json` overlay these sections mention is
 > deleted.
 
 `--backend cuda` runs a decode step as one captured CUDA graph. It used to need every routed expert in
@@ -1126,7 +1121,7 @@ It now plans **expert residency**, as Strata runs this model:
   step never leaves its graph and no expert crosses the bus. A missed expert's table entry points
   at a zeroed expert in VRAM, so the GPU's share contributes nothing for it. Steps with misses
   differ from an all-resident run in the last bits (the host quantizes activations as ggml's CPU
-  kernels do). `TS_Q4E_HOST_EXPERTS=0` stages every miss over the bus instead.
+  kernels do).
 - Prompts stage the missed experts into VRAM by a copy kernel inside the step.
 - The host's worker team takes the CPUs left after the two spinning threads (the stream wait and
   the doorbell server): on the VM's 13.6-CPU quota, 6 workers gave 65.5/45.9/58.8 tok/s, 10 gave
@@ -1159,7 +1154,7 @@ frozen routing profile, one run each:
 | `Q2_0`, cuda, host experts | 94.6 | 65.6 | 97.3 |
 | `Q2_0`, cuda, host experts + `TS_Q4E_HC_Q8=1` (Strata's Q8_0 hyper-connection read) | 106.0 | 70.4 | 109.1 |
 
-A `Q2_0` step's GPU time (`TS_Q4E_PERF=3`, uncaptured, stage timers on) is about 11 ms (9.9 ms with
+A `Q2_0` step's GPU time (uncaptured, the engine's stage timers on) is about 11 ms (9.9 ms with
 `TS_Q4E_HC_Q8=1`, whose hyper-connection stage takes 2.3 ms): hyper-connections 3.3 ms, routed experts 2.0, shared expert 1.2, GDN projections 1.1, attention
 output 0.9, router 0.7, GDN core 0.7. The weights it reads take about 2.3 ms at the card's
 bandwidth; the hyper-connection and shared-expert stages are mostly kernel boundaries, which is
@@ -1188,7 +1183,7 @@ the formats decoded a block at a time (Q4_0, Q5_0, Q8_0, IQ4_NL, MXFP4). Capture
   CUDA graphs per sequence, QSA regime and row count. The accepted prefix is committed by replaying the recurrences
   over it, bit-exact against a plain decode of the same tokens.
 - **One fused launch** for a half's hyper-connection scatter and the next mixer's first pass, about 95 fewer
-  launches a step; bit-exact (`TS_Q4E_FUSE_HC=0` restores the two launches).
+  launches a step; bit-exact.
 
 RTX 5090, `Q2_0` with `TS_Q4E_HC_Q8=1`, the same client as the comparison above:
 
@@ -1205,15 +1200,15 @@ MTP gains little so far because a 4-row verify window takes 27-32 ms, about thre
 window's rows miss four times as many as one decode row, and the GPU waits for the CPU at every layer. Prompts stage
 more experts for the same reason, which is why they read slower with the head loaded.
 
-Where a 4-row verify window's GPU time goes (`TS_Q4E_PERF=3`, uncaptured, against a 1-row step): 18.5-23.6 ms
+Where a 4-row verify window's GPU time goes (stage timers, uncaptured, against a 1-row step): 18.5-23.6 ms
 against 10.9 ms. The routed experts take 5.8-10.7 ms against 3.1. The dense projections and the LM head grow with
 the rows: attention projections 1.8 against 0.33 ms, GDN projections 1.9 against 1.1, LM head 1.1 against 0.3. The
 decode-size dense kernels read every weight row once per activation row. Staging a window's missed experts over
-the bus instead of computing them on the CPU (`TS_Q4E_HOST_EXPERT_ROWS=1`) left the window at 27-30 ms. So the
+the bus instead of computing them on the CPU left the window at 27-30 ms. So the
 next steps are a multi-row dense kernel that reads each weight row once, and fused expert kernels, not the CPU
 side.
 
-A larger prompt ubatch (`TS_Q4E_UBATCH=2048`, default 512) stages each missed expert once per 2048 rows instead of
+A larger prompt ubatch (2048 rows instead of the default 512) stages each missed expert once per 2048 rows instead of
 per 512. 4K prompts take 1.75 s instead of 2.70, and 16K prompts 7.5 s instead of 11.4 (2,290 tok/s). Its scratch
 takes 1.2 GiB from the expert slots (96.6% of routes resident instead of 97.6%), so plain decode drops from 103 to
 98 tok/s. Strata reads the same prompts in 0.92 s and 2.75 s.
@@ -1227,7 +1222,7 @@ computes about 16 experts a window. Ported, each measured against the change bef
 
 - **Doorbell skip.** A layer whose selected experts all have slots no longer rings the host. The publish kernel
   records it in a device word and the wait returns at once, where every layer used to wait for the host's echo:
-  20% of the GPU's time in an Nsight trace. Bit for bit the same (`TS_Q4E_DOORBELL_SKIP=0` rings every layer).
+  20% of the GPU's time in an Nsight trace. Bit for bit the same.
 - **Dense weights read once a window.** Verify rows of the warp-per-row formats (Q2_0, Q4_K, Q5_K, IQ4_XS, ...)
   take one block for every row, a warp per output row: a 4-row window's LM head went from 1.11 to 0.48 ms. Bit for
   bit the one-row kernel's sums.
@@ -1292,7 +1287,7 @@ Same session, RTX 5090, `Q2_0`, `TS_Q4E_HC_Q8=1`, MTP with Q2_0 draft experts, `
 
 #### Prompt groups, split attention and a lighter MTP catch-up, 2026-11-08
 
-A `TS_Q4E_PERF=3` profile of the 4K prompt on the RTX 5090 showed where the direct engine's time went. Of each 512-row
+A stage-timer profile of the 4K prompt on the RTX 5090 showed where the direct engine's time went. Of each 512-row
 prompt ubatch's 311 ms of GPU time, 197 ms were the routed experts, almost all of it staging the experts without a
 VRAM slot over the bus, and the next ubatch staged most of them again. After the prompt, the first draft replayed it
 through the whole MTP layer (attention over the prompt and every row's experts: 59 ms after a 4K prompt, 320 ms in
@@ -1300,28 +1295,28 @@ all for a 16K one, the last part of it in the answer's decode time). And the 12 
 window took 2.4 ms at 4K context and 4.9 ms at 16K: one block per head and row, walking up to 2,051 cells one load
 after another. Changed:
 
-- **Prompts read layer by layer** (`TS_Q4E_PROMPT_GROUP`, default 4096 rows; one GPU under expert residency). Each
+- **Prompts read layer by layer** (groups of 4096 rows by default; one GPU under expert residency). Each
   layer runs over all the group's ubatches before the next one and keeps its staged experts between them
   (`ts_dsv4_moe_stage_copy_from` copies only the experts a ubatch adds), so a missed expert crosses the bus once per
   layer and group. Bit for bit the ubatch order's logits (`APromptReadLayerByLayer_AnswersBitForBitAsUbatchOrder`).
   The group's streams, 160 MiB, come out of the expert slots (16,954 instead of 17,085 resident, 97.9% of profiled
   routes instead of 98.0%).
-- **Split attention** (`TS_Q4E_ATTN_SPLITS`, default 16). A decode-size row of more than 256 cells spreads them over
+- **Split attention** (16 splits by default). A decode-size row of more than 256 cells spreads them over
   16 blocks, and the last block to finish merges their partials (flash decoding), inside the captured graph. Shorter
   rows run whole, bit for bit as before; longer ones move within float reassociation (the test's bound is 1e-4
   relative), and a verify row still computes its own decode step.
-- **K/V-only MTP catch-up** (`TS_Q4E_MTP_KV_ONLY`, on). A catch-up's rows only write the MTP layer's K/V; the rest of
+- **K/V-only MTP catch-up** (on by default). A catch-up's rows only write the MTP layer's K/V; the rest of
   the layer runs for the last row alone when it drafts (Strata's `record_front` / `record_rest`): 59 to 23 ms after a
   4K prompt, 320 to 45 ms for a 16K one.
-- **Greedy verify on the device** (`TS_Q4E_GREEDY_VERIFY`, on). A plain greedy sampler takes each verify row's first
+- **Greedy verify on the device** (on by default). A plain greedy sampler takes each verify row's first
   maximum from an argmax kernel in the captured window, instead of a megabyte of logits a row crossing the bus to the
   host's scan. Same tokens.
-- **The draft chain on the device** (`TS_Q4E_MTP_CHAIN`, on; one GPU, or a layer split with `TS_Q4E_MTP_CHAIN_SPLIT`; no sampling penalties). A window's drafts run as
+- **The draft chain on the device** (on by default; one GPU, or a layer split with the token embedding beside the block; no sampling penalties). A window's drafts run as
   one chain: a pick kernel takes each step's first-max token and its top-10 confidence and feeds the next step, so the
   host makes one call a window and reads no draft logits. Drafting went from 2.1-2.2 to 1.9-2.1 ms a window; the end
   to end numbers stayed within run-to-run noise (short chat 74-102, long generation 141-175, 4K 108-131, 16K 154-170
   tok/s). Most of a draft step is GPU work (the LM head over 248K tokens).
-- **Q2_0 prompt rows through the tensor cores** (`TS_Q4E_Q2_0_PROMPT_GEMM`, on). ISTA keeps some attention
+- **Q2_0 prompt rows through the tensor cores** (on by default). ISTA keeps some attention
   projections, most shared experts and the PLE key in `Q2_0`, which the shared prompt route did not decode, so their
   prompt rows ran the warp-per-row kernel, reading the weight once per row (0.23 s of GPU time in a 4K prompt). They
   now take an F16 copy of the weight dequantized for the call and the cuBLAS GEMM: 4K TTFT 1.85 to 1.69 s, 16K 7.4-7.5
@@ -1398,7 +1393,7 @@ RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/
 A round that overlaps the decode can carry as many swaps as its staging slots hold (254 for Flash Next), and the
 default budget is now 256 instead of 64 (`TS_MOE_TIER_ADAPT_SWAPS`, when set, is still every round's). The answer to a
 long prompt routes elsewhere than the residency learned before it, and at 64 a round it kept missing those experts for
-many windows. Counted with the host computing every miss (`TS_Q4E_HYBRID_MISSES=0`), the first 16K-token answer of a
+many windows. Counted with the host computing every miss, the first 16K-token answer of a
 sequence had 49 misses a window in its windows 1-8 and 21 in windows 17-64; at 256, 13-17 and 5-6. Moving the prompt's
 experts in at the end of the prompt with the GPU waiting (a prototype, not merged) did less (32 / 5) and cost 50-280 ms
 of TTFT per 4,096-token prefill chunk.
@@ -1421,7 +1416,7 @@ at 64), as fewer missed experts were staged.
 
 Read layer by layer, a 4K prompt still spent 0.26 s of GPU time staging each layer's missed experts on its own
 stream, the layer waiting for the copy kernel. The staging now holds two halves with their own plans
-(`TS_Q4E_PROMPT_PREFETCH`, on): while a layer runs on the half that holds its experts, the copy engines bring every
+(on by default): while a layer runs on the half that holds its experts, the copy engines bring every
 host expert of the next layer into the other half. The host keeps a layer's experts packed in host-index order, which
 becomes the staging slot order, so each matrix is one 2D copy and the plan (slots, list, the layer's tables pointing at
 the copies) is written from the host; the next layer waits for those copies instead of staging per ubatch. A half is
@@ -1443,7 +1438,7 @@ RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/
 An nsys capture of a long generation (RTX 5090, ISTA `Q2_0`, MTP) showed two kernels waiting on their own loads. A
 draft step's pick read the 248,320 logits in one block of 1,024 threads: 115 us a step, two or three steps a window. It
 now runs a block per 1,024 logits, each keeping its slice's ten largest and the first index of its largest, then one
-block merging those candidates by the same rules (`TS_Q4E_DRAFT_PICK_SPLIT`): 12.8 + 12.0 us, the same token and
+block merging those candidates by the same rules: 12.8 + 12.0 us, the same token and
 confidence bit for bit. The BF16 router (512 x 2560, a warp per expert) issued each lane's loads one at a time; it now
 keeps four in flight with the sums in their order: 14.2 -> 12.6 us a 4-row layer. About 0.3 ms of a ~13 ms window,
 inside the run-to-run noise of the client below; the window is bound by the CPU's missed experts (a third of the
@@ -1468,7 +1463,7 @@ Same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
 A prompt's attention ran one block per query head and row, whose warps took the row's cells one warp-wide dot at a
 time; the 12 query heads sharing a KV head each loaded and widened every cached key and value again. That was 0.18 s
 of a 4K prompt, and a 16K prompt's rows each attend 2,051 cells. Prompt-size calls now run a block of four warps per
-row and KV head (`TS_Q4E_ATTN_MMA`, on): the group's query heads are the rows of a 16-row tensor-core tile, each warp
+row and KV head (on by default): the group's query heads are the rows of a 16-row tensor-core tile, each warp
 widens a chunk of 16 cells' keys and then values to F16 in shared memory once, and S = QK^T and O += PV run on
 `mma.sync` (F16 operands, F32 accumulation) under an online softmax; the warps merge at the end. Decode steps and
 verify windows keep their kernels, so a verify row still answers as its own decode step. The operands round to F16:
@@ -1488,8 +1483,7 @@ RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/
 
 With the next layer staged ahead and the attention on tensor cores, what a prompt ubatch pays per call (each expert's
 weights decoded per 32-row pass of the grouped kernel, a layer's fixed launches and syncs) became the larger share, and
-`TS_Q4E_UBATCH=1024` read a 4K prompt 17% faster. The engine now defaults to 1024 prompt rows a forward
-(`TS_Q4E_UBATCH=512` restores the old value). The larger scratch takes 345 expert slots (16,609 instead of 16,954 in
+a 1024-row ubatch read a 4K prompt 17% faster. The engine now defaults to 1024 prompt rows a forward. The larger scratch takes 345 expert slots (16,609 instead of 16,954 in
 VRAM, 97.6% instead of 97.9% of the profiled routes); long generation stayed within the run-to-run noise.
 
 RTX 5090, ISTA `Q2_0`, MTP, the same build, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
@@ -1533,8 +1527,8 @@ MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
 #### A draft vocabulary for the MTP head, 2026-11-08
 
 Each draft step ran the trunk's LM head over all 248,320 tokens: about 270 us of a ~1 ms draft chain on the RTX 5090.
-The draft chain now scores token ids [0, 151643) only, the Qwen2 base vocabulary (`TS_Q4E_DRAFT_VOCAB`, `0` for the
-whole vocabulary); the ids past it are the later multilingual additions and the special tokens, 0.1-0.2% of English
+The draft chain now scores token ids [0, 151643) only, the Qwen2 base vocabulary;
+the ids past it are the later multilingual additions and the special tokens, 0.1-0.2% of English
 and mixed English/Chinese text and 0.01% of Chinese. The drafts only propose: the verify window scores every token, so
 the answers do not change. With the answers made history-independent (`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0`)
 the English, Chinese and code answers were identical with the setting on and off, none of their tokens past the subset,
@@ -1563,14 +1557,14 @@ GPU's experts finish earlier only to wait longer, and the rest is inside the run
 
 A third of a verify window's layers wait for the CPU's missed experts: the host computes each (expert, row) route at
 DRAM speed, ~30-35 us on the pod's 7950X, while the GPU, its own experts done, waits (about 2 ms of an 11-13 ms window
-in an nsys capture). The GPU can now take some of those misses itself (`TS_Q4E_HYBRID_MISSES`, distinct experts a
+in an nsys capture). The GPU can now take some of those misses itself (a set number of distinct experts a
 step): the doorbell kernel first plans the GPU's share - those experts' table entries point at slots of the expert
 staging, their ids reach the host as -1 - and rings the host for the rest at once; the staging copy then reads the
 planned experts over the bus, one copy per expert whatever rows use it, and the GPU's expert kernels compute them with
 the resident ones. A layer whose misses the GPU takes whole rings no doorbell. All of it is device state, so a
 captured step replays it.
 
-`TS_Q4E_HYBRID_SPLIT` picks the share. `odd` takes odd-numbered experts only, so an expert goes to the same side
+Two rules pick the share. `odd` takes odd-numbered experts only, so an expert goes to the same side
 whatever else a call selects and a verify row computes what its own decode step does while the share holds them
 (`ExpertResidency_GpuShareOfMisses_VerifiesAsItsOwnDecode`); `first` takes the first misses in slot order - more of
 them, but which side a row's expert lands on depends on the window. The GPU's experts compute as all-resident ones do,
@@ -1578,7 +1572,7 @@ so the answers move within the host-compute tolerance, towards all-resident: a s
 for bit as all-resident (`ExpertResidency_GpuShareOfMisses_AnswersAsAllResident`).
 
 RTX 5090, ISTA `Q2_0`, MTP, long generation, same build and client (decode tok/s; a 4-row window's verify time and the
-experts left to the CPU, from `TS_Q4E_PERF`):
+experts left to the CPU, from the stage timers):
 
 | share | long generation | 4-row verify | CPU experts a window |
 | --- | --- | --- | --- |
@@ -1587,7 +1581,7 @@ experts left to the CPU, from `TS_Q4E_PERF`):
 | 4, `odd` | 214-232 | 11.3-12.8 ms | 20-33 |
 | 2, `first` | 210-232 | 10.9-12.2 ms | 6-13 |
 
-On by default since 2026-11-08 (`TS_Q4E_HYBRID_MISSES=4`, `TS_Q4E_HYBRID_SPLIT=first`): with four misses a step the
+On by default since 2026-11-08 (a share of 4, `first`): with four misses a step the
 GPU takes nearly all of them (one to three left to the CPU a window). Same client, the earlier build before and after
 the others (ABBA), 3 repetitions each:
 
@@ -1613,7 +1607,7 @@ CUDA-graph replays):
 - The hyper-connection partials (and the fused scatter-and-partials) summed their five values - the sum of squares and
   four scatter logits - one block reduction after another, three barriers each; they now share one barrier, each value
   summed in the same order: 2.56 -> 1.61 us a 4-row call, about 90 a window.
-- The mixer's collapse now also writes the q8_1 blocks of its output (`TS_Q4E_COLLAPSE_Q81`), which the attention, GDN,
+- The mixer's collapse now also writes the q8_1 blocks of its output, which the attention, GDN,
   shared-expert and routed-expert projections read instead of quantizing it again: 2.30 -> 1.58 us, and one launch
   fewer on the routed experts' path.
 - The QSA selection walked its 256-bin histograms on one thread, four passes a row; a block-wide scan finds the same
@@ -1630,8 +1624,8 @@ to a verify row, and the split kernel's 33 us for 4 QSA rows is about 0.4 ms of 
 
 At a 131K context one sequence's attention caches and QSA indexer keys take 2.3 GB of the RTX 5090's 32 GB (Q8_0
 K/V 1.7 GB, raw keys 0.4, pooled keys 0.2) - about 1,700 expert slots. Strata keeps 32K cells of each attention
-layer resident and the rest in host memory (`--kv-resident 32768`); `TS_Q4E_KV_RESIDENT` does the same for the direct
-engine's QSA layers (Q8_0 KV only):
+layer resident and the rest in host memory (`--kv-resident 32768`); the direct engine now does the same
+for its QSA layers (Q8_0 KV only):
 
 - The authoritative K/V of the whole context lives in pinned, device-mapped host memory in the usual layout; VRAM
   holds a window of 4-cell pages and a page table (page -> slot).
@@ -1650,9 +1644,8 @@ engine's QSA layers (Q8_0 KV only):
 The readers go through the page table with the resident kernels' arithmetic, cell for cell, so a streamed layer
 answers bit for bit as a resident one (`AResidentKvWindow_AnswersBitForBitAsResidentCaches`: a 600-token prompt in
 128-row ubatches, 150 decode steps whose selections move over the whole context and a verify window, through a
-448-cell window, against resident caches). Unset, the engine streams with Strata's 32,768 cells (raised to the
-32,960-cell floor) whenever the routed experts do not fit in VRAM whole, and keeps every layer resident when they do;
-`0` keeps every layer resident.
+448-cell window, against resident caches). By default the engine streams with Strata's 32,768 cells (raised to the
+32,960-cell floor) whenever the routed experts do not fit in VRAM whole, and keeps every layer resident when they do.
 
 On by default since 2026-11-08 when the experts do not fit whole. On the RTX 5090 (ISTA `Q2_0`, MTP, 131K context)
 the window freed 1.43 GiB a sequence less the 136 MiB staging pool: 17,718 experts in VRAM instead of 16,608, 98.4% of
@@ -1680,7 +1673,7 @@ no budget on both.
 
 Concurrency was the gap. Under expert residency the plan left VRAM for one sequence's 131K-context caches (2.3 GB), so
 a second request found no slot and waited ("The model has no device slot for another concurrent request"): four
-requests at once ran one after another at the single-stream rate, TTFT 0.1 / 3 / 6 / 9 s. `TS_Q4E_LANES` (1-16,
+requests at once ran one after another at the single-stream rate, TTFT 0.1 / 3 / 6 / 9 s. A lane count (1-16,
 default 1) has the plan leave VRAM for that many sequences; concurrent requests then get slots of their own and decode
 together. A lane costs about 1.5 GB with the resident KV window (four lanes: 92.9% of the profiled routes resident
 instead of 98.4%).
@@ -1695,13 +1688,13 @@ kept while the draw equals it, as a solo step does. Two things had to change fir
 - The MTP block keeps its own KV and refused to draft after positions it never replayed, so a request prefilled beside
   others (plainly) could never arm speculation, and concurrent requests decoded one token a step. The block now restarts
   its cache at the end of such a gap (`Q4eCudaEngine.MtpRestart`; positions count from the restart, RoPE scores depend
-  on distance alone). This also lets a turn that reuses a prefix speculate. `TS_Q4E_MTP_RESUME=0` restores the old rule.
+  on distance alone). This also lets a turn that reuses a prefix speculate.
 - Rows of different sequences share few experts, so a verify costs nearly in proportion to its rows: 4 / 8 / 12 rows in
   9.5 / 14.5 / 24.4 ms, each draft kept at about 0.62. Three sequences with 4-row windows decoded 211 tok/s in all
-  against about 296 for plain batched steps. A step keeps to `TS_Q4E_BATCHED_VERIFY_ROWS` rows (default 8): two
+  against about 296 for plain batched steps. A step keeps to 8 rows by default: two
   sequences verify 4 rows each, three or four 2 (365 tok/s at four sequences), more decode plainly.
 
-Batched steps (batched decode and batched verify) run through captured CUDA graphs (`TS_Q4E_BATCH_GRAPHS`), and give
+Batched steps (batched decode and batched verify) run through captured CUDA graphs, and give
 their memory back when a slot cannot be allocated or grown.
 
 RTX 5090, ISTA Q2_0 with the MTP head, `--sampling-precedence request`, three repeats each, aggregate tok/s:
@@ -1721,7 +1714,7 @@ whose free was refused while it was the engine's selection was never freed, and 
 retained slot it could not free. With those fixed every request's TTFT is 0.62-0.67 s. Sanity stays 12/12 and no
 request fails. Greedy answers
 of four requests at once are byte-identical to the same requests one at a time with the history-dependent shortcuts off
-(`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0 TS_Q4E_HYBRID_MISSES=0`, prefix reuse off): 4 of 4, and so are two solo
+(`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0`, the GPU's share of misses off, prefix reuse off): 4 of 4, and so are two solo
 runs. With the defaults even two solo runs differ (1 of 4), as the route-tail skip and adaptive residency intend.
 
 ggml_cuda cannot serve this model on the 32 GB card: decode at 0.5-4.7 tok/s (the experts read from the network volume),
@@ -1732,7 +1725,7 @@ like ggml_metal's.
 
 A prompt's gated DeltaNet layers walked their rows one at a time (KdaScan: a block per value head, each token a rank-1
 update of the 128 x 128 state). That was 0.49 s of a 16K prompt; Strata spends 0.07 s. A single sequence's prompt of
-128 rows or more now takes Strata's chunked form (`TS_Q4E_GDN_CHUNKED`, on), ported into `tensorsharp_q4e_kernels.cu`.
+128 rows or more now takes Strata's chunked form (on by default), ported into `tensorsharp_q4e_kernels.cu`.
 A prep kernel builds each 32-token chunk's WY factors (the in-chunk triangular solve and gate products) in FP32. A scan
 kernel then applies a chunk as two small matrix products instead of 32 rank-1 updates; it runs 16 key heads x 8 column
 tiles, 384 threads each, one wave on the GPU, and carries the state across chunks in shared memory. Super-blocks of
@@ -1743,7 +1736,7 @@ order: against the token-by-token scan the outputs move 3e-7 relative and the st
 with at least 128 SMs, so that every block runs in one wave; with fewer it would run in waves and lose. Otherwise the
 engine keeps KdaScan.
 
-RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GDN_CHUNKED=0` for the old scan). TTFT of
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (the old scan as the other arm). TTFT of
 three runs, the first cold; the engine bench's long-prompt and long-generation needles pass 6/6 in both arms:
 
 | prompt recurrence | 4K prompt (3,541 tokens) | 16K prompt (14,094 tokens) | engine bench 4K / 16K TTFT | long generation |
@@ -1800,7 +1793,7 @@ A QSA layer scores every complete block a row can see (the sum over the four ind
 head)) before it keeps the best. A prompt's rows did this one warp per block on the CUDA cores, each row reading every
 key again: 0.10 s of a 16K prompt, where Strata spends 0.02 s.
 
-Strata scores a prompt's rows on tensor cores, and that is now ported (`TS_Q4E_QSA_SCORES_MMA`, on) as
+Strata scores a prompt's rows on tensor cores, and that is now ported (on by default) as
 `ts_q4e_qsa_scores_mma_f32`:
 
 - A block of four warps takes 16 rows (their four heads, 64 query rows) against 64 blocks' keys, so a key is read
@@ -1815,7 +1808,7 @@ On rows starting at the context's beginning and 3,000 and 9,000 positions in (`Q
 within 4.6e-7 of the sum of |q . k| from the scores computed in double (the warp kernel: 6.1e-8). The blocks the
 selection keeps are the same in all 1,045 rows, 712 of them past the selection width.
 
-RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_QSA_SCORES_MMA=0` for the warp kernel). TTFT of
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (the warp kernel as the other arm). TTFT of
 three runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation checks pass 8/8 in
 both arms:
 
@@ -1828,11 +1821,11 @@ both arms:
 
 A prompt's dense projections (Q4_K, IQ4_XS, Q5_K, Q3_K, Q4_0 and Q2_0 in the ISTA pack, and the Q8_0 hyper-connection
 copies under `TS_Q4E_HC_Q8=1`) run as F16 tensor-core GEMMs on a copy of the weight dequantized for the call. A prompt
-group (`TS_Q4E_PROMPT_GROUP`, 4,096 rows) already runs each layer over its four 1,024-row ubatches back to back, but
+group (4,096 rows) already runs each layer over its four 1,024-row ubatches back to back, but
 each ubatch dequantized the layer's weights again. On a 16K prompt that was 183 ms of the 242 ms that dequantizing and
 converting took (nsys). Strata dequantizes per 8K-token chunk.
 
-Now (`TS_Q4E_GROUP_F16`, on) the first ubatch of a layer dequantizes each weight into the group's F16 arena and the
+Now (on by default) the first ubatch of a layer dequantizes each weight into the group's F16 arena and the
 others reuse that copy. The copy is the same kernel's output, so every product is the same bit for bit.
 `APromptGroupsDenseWeights_DequantizedOncePerLayer_AnswerBitForBit` runs two 520-row ubatches a layer and checks that the
 prompt's and the decode steps' logits are unchanged.
@@ -1841,7 +1834,7 @@ The arena holds the largest layer's quantized projections as F16: 194 MiB for th
 key. Residency plans around it, as around the group's streams, so 147 experts fewer stay in VRAM (17,632 -> 17,485,
 98.4% -> 98.3% of the profiled routes). That can move decode steps, which compute host experts on the CPU.
 
-RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GROUP_F16=0` dequantizes per ubatch). TTFT of three
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (the other arm dequantizes per ubatch). TTFT of three
 runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation checks pass 8/8 in both
 arms:
 
@@ -1858,7 +1851,7 @@ gate/up takes 0.52 ms over 1,024 rows and 1.27 ms over 4,096 (`CudaMoeQ2_0Int8Te
 8K-token chunks.
 
 Within a prompt group the next layer starts only after all the group's ubatches have run this one. So a group's ubatches
-now leave their routed experts to the end of the layer (`TS_Q4E_GROUP_EXPERTS`, on):
+now leave their routed experts to the end of the layer (on by default):
 
 - Each ubatch stages its missed experts (kept for the layer) and runs its router and shared expert.
 - It leaves its selections, int8 activations, shared-expert outputs and scatter logits in the group's buffers.
@@ -1876,7 +1869,7 @@ The buffers take 85 MiB at 4,096 rows, mostly the shared-expert outputs and H, s
 16 rows or fewer keeps ubatch order, because that ubatch runs the per-slot kernels. So does any layer the int8 route does
 not take.
 
-RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GROUP_EXPERTS=0` runs gate/up per ubatch). TTFT
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (the other arm runs gate/up per ubatch). TTFT
 of three runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation
 checks pass 8/8 in both arms:
 
@@ -1962,7 +1955,7 @@ device.
 
 The last prompt group's output streams stay in the group's buffer until the next group runs. The engine now records
 which positions of which sequence that buffer holds. The catch-up takes those rows' streams device to device, and only
-the rest from the host (`TS_Q4E_MTP_D2D`, on).
+the rest from the host (on by default).
 
 The values are the ones the host's copy holds, so the drafts are the same bits. In
 `TheMtpCatchUpAfterAGroupedPrompt_ReadsTheLastGroupsStreams_BitForBit` (a 300-token prompt in 192-row groups, catch-up
@@ -1974,7 +1967,7 @@ identical across arms, and every check passes:
 
 | catch-up rows | 4,000-row catch-up | long_prompt_4k | long_prompt_16k |
 | --- | --- | --- | --- |
-| from the host (`TS_Q4E_MTP_D2D=0`) | 21.6-22.7 ms | 177 / 186 / 206, 170 / 185 / 241 | 206 / 230 / 257, 209 / 234 / 256 |
+| from the host | 21.6-22.7 ms | 177 / 186 / 206, 170 / 185 / 241 | 206 / 230 / 257, 209 / 234 / 256 |
 | from the device (default) | 5.8-6.1 ms | 179 / 198 / 219, 176 / 201 / 255 | 208 / 257 / 277, 211 / 253 / 278 |
 
 The prompt forward still copies the streams to the host (164 MB D2H) for the runtime, so TTFT is unchanged.
@@ -2028,7 +2021,7 @@ ggml-metal's multi-row kernel; the speculation governor off. What remains is the
 about 70 ms of which 63 ms on the GPU, against 39 ms for one row; Strata spends about 55 ms a 3.6-row step.
 
 Windows of more than 4 rows are verified as one batched forward on Metal (see "Verify rows run the one-token
-kernels"), so DFlash text can differ from plain greedy decoding; `TS_Q4E_VERIFY_ROW_KERNELS=1` keeps it exact.
+kernels"), so DFlash text can differ from plain greedy decoding.
 
 #### TensorSharp-owned Metal expert kernels, 2026-11-08
 
@@ -2111,10 +2104,10 @@ all with upstream ggml ops:
   cells complete. Block membership is fixed by position for text. A rollback leaves a block incomplete until it is
   re-pooled, and any other writer of the raw keys (an upload, the concurrent-decode arena) makes the next step pool
   everything. Same per-block arithmetic, so the logits are the same bits
-  (`QsaPooledKeys_KeptBetweenSteps_AnswerAsPoolingEveryBlock_Cpu/_Metal`). `TS_Q4E_QSA_POOL_CACHE=0` pools every block.
+  (`QsaPooledKeys_KeptBetweenSteps_AnswerAsPoolingEveryBlock_Cpu/_Metal`).
 - The selection mask comes from `ggml_top_k_mask` (one op for what was a fill, a scatter and an add over the whole
   window), and decode steps and verify windows attend only the selected cells (`ggml_flash_attn_ext_set_n_kv_max`).
-  `TS_Q4E_QSA_SPARSE_FA=2` also does it for prompts; that was slower on an M5 Pro.
+  Doing it for prompts too was slower on an M5 Pro.
 - On unified memory 12% of the tier budget goes to window slots instead of profile-ranked fixed slots
   (`TS_MOE_WINDOW_SHARE`). The window follows the text; the fixed slots follow other prompts.
 
@@ -2152,7 +2145,7 @@ spends ~26 of its ~31 ms in the accelerator's segments, so fewer reads move it o
 
 #### Prompt reading: staged experts ahead, PLE rows read explicitly, 2026-11-08
 
-`TS_Q4E_PHASE=1` splits a prompt chunk's wall clock. Two host costs stood in front of the GPU:
+Splitting a prompt chunk's wall clock by phase showed two host costs in front of the GPU:
 
 - Every offloaded layer staged the experts it routes (tier copies and file reads) before its MoE graph could run, ~20 ms
   a layer. A prompt routes nearly every expert, so the next offloaded layer's stacks are now staged whole, on a thread,
@@ -2206,7 +2199,7 @@ Parity (`PromptKernels_OnTsm_AnswerAsGgml_Metal`: a 160-token prompt and six dec
 GDN 6.4e-5, HC 5.3e-5, both 6.9e-5 relative error, every argmax equal; 3.0e-4 with every expert on the host, where
 the Q8_K activations amplify the difference.
 
-| 16K prompt, `TS_Q4E_PHASE=1` (M5 Pro) | compute per 4096-token chunk | prompt + 50-70 tokens |
+| 16K prompt, phase timing (M5 Pro) | compute per 4096-token chunk | prompt + 50-70 tokens |
 | --- | --- | --- |
 | ggml's ops | 7.6 / 8.3 / 9.0 / 9.5 s | 44.3 s |
 | + GDN kernels | 6.3 / 6.8 / 7.4 / 8.0 s | 36.9 s |
@@ -2228,7 +2221,7 @@ the attention mask. Cells are compared exactly as ggml computes them, so the kep
 block's cells tie at the cutoff (the window keeps 2048 + 3 cells, so most rows split a block): ggml's top-k fills ties
 in atomic order, the kernels lowest index first, which also makes the choice reproducible
 (`QsaSelection_KeepsTheBestCells_TiesLowestFirst` checks the contract cell by cell). The span's arena no longer grows
-with the window (3.4 GB at every chunk of a 16K prompt). 16K, `TS_Q4E_PHASE=1`: chunk compute 5.2 / 5.7 / 6.3 / 6.9 s
+with the window (3.4 GB at every chunk of a 16K prompt). 16K, phase timing: chunk compute 5.2 / 5.7 / 6.3 / 6.9 s
 -> 5.1 / 5.3 / 5.8 / 6.3 s, prompt + ~50 tokens 32.3 -> 30.4 s. What grows with the window now is the attention
 itself, which reads every cell of it.
 
@@ -2271,7 +2264,7 @@ Now:
 - A request whose state does not fit beside a 1 GB headroom waits for a running request (the scheduler defers it).
   Its state is counted at 8192 rows plus its recurrent state, about 0.5 GB at F16. The prefix cache evicts retained
   conversations first.
-- `TS_Q4E_LANES` has the expert tier keep that room for that many sequences. With 4 lanes the reserve is 1.5 GB: the
+- A lane count has the expert tier keep that room for that many sequences. With 4 lanes the reserve is 1.5 GB: the
   tier goes from 19.1 to 17.7 GB, and from 94.2% to about 92% of the profiled routes.
 - A per-request backend that cannot get its cuBLAS handle fails that request, not the process.
 
@@ -2302,8 +2295,8 @@ No request failed in either arm.
 Greedy identity holds only in an exact arm that runs each sequence through its own one-row span:
 
 - The exact arm turns off the prefix cache, the route tail skip, tier adaptation and hybrid misses
-  (`TS_SCHED_PREFIX_CACHE=0 TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0 TS_Q4E_HYBRID_MISSES=0`).
-- With `TS_Q4E_DISABLE_ARENA_DECODE=1` added, four requests at once give the same text as alone, 4 of 4, and so do
+  (`TS_SCHED_PREFIX_CACHE=0 TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0`, and the GPU's share of misses off).
+- With the arena decode turned off as well, four requests at once give the same text as alone, 4 of 4, and so do
   repeats of each alone, 4 of 4. That arm does a parallel_4 wave in 18.5 s, against 14 s with the batched arena.
 - With the batched arena, parallel matches solo 0 to 1 of 4, with or without speculation. ggml picks its matrix kernels
   by row count, so a batched step rounds differently from a lone request's, and greedy text can part at a near tie.
@@ -2329,7 +2322,7 @@ arena, see "Concurrent decode uses the fused arena by default"), so their
 layers' gathers are paid once a step and not once a request. Two H100 NVL, Q8_0,
 `--tp 2`, `TS_KV_INITIAL_TOKENS=2048`, greedy, 384 tokens a request: 64 / 92 /
 123 / 146 / 165 tok/s at 1 / 2 / 4 / 8 / 16 requests, against 64 / 62 / 32 / 28
-/ 31 decoding them one at a time (`TS_Q4E_DISABLE_ARENA_DECODE=1`). As on one
+/ 31 decoding them one at a time (arena decode off). As on one
 device, the batched answers were the one-at-a-time text at 1 to 8 requests and
 parted from it at near ties at 16, where a graph is wider than the 8 rows that
 keep the one-token fusions (after 53 to 1382 characters under `--tp 2`, 6 to
@@ -2547,11 +2540,6 @@ Measured on 2× A100-80GB, Qwen3.8-Flash-Next-UD-Q2_K_XL (73.4 GiB):
   ~0 decode from the second card.
 
 Startup prints which mode ran and the per-GPU layer/byte split.
-`TS_Q4E_LAYER_SPLIT=20,28` overrides the automatic balance with explicit layer
-counts per GPU (llama.cpp's `--tensor-split` in spirit) and throws rather than
-silently ignoring a value it cannot honour — useful because the automatic
-balance prices weights and cannot see the vision tower, which loads later and
-lands on GPU 0.
 
 ## Serving on `--backend cuda`
 
@@ -2567,8 +2555,8 @@ describes it.
 
 > **Historical: removed engine.** Until 2026-11, `--backend cuda` loaded a direct engine of its own
 > (`Qwen4ExpCudaModel`, the Q4e kernels), with sequence slots, batched decode graphs and two decode lanes on a layer
-> split, tuned by its own `TS_Q4E_*` variables. That engine and those variables are removed (setting one now stops the
-> server or CLI at startup). The measurements and the switch and test names below are kept as a record and do not
+> split, tuned by its own environment variables. That engine and those variables are removed (setting one now stops the
+> server or CLI at startup). The measurements and the test names below are kept as a record and do not
 > describe the runtime that serves `--backend cuda` now.
 
 Measured on 2026-11-07/08 on two H100 NVL 94 GB (`--layer-split 2`, Q8_0, 262,144
@@ -2577,7 +2565,7 @@ context, ubatch 2048), the server behind a LiteLLM gateway:
 - Ten concurrent agent loops of four turns (22K-token system prompts, a tool call and
   a 1,500-token tool result per turn): 91.0% of later turns' prompt tokens came from
   cached slots, with first tokens at 3.5 s p50 and 6.3 s at most. With slots that
-  held the whole context from the start (`TS_Q4E_SLOT_TOKENS=262144`) only 7 fit;
+  held the whole context from the start (262,144 tokens) only 7 fit;
   the agents took each other's retained slots, 24.6% was reused, and later turns'
   first tokens took 73 s p50 and up to 417 s.
 - One request decodes at 94 tok/s; 16 concurrent 512-token answers at 250 tok/s in
@@ -2587,7 +2575,7 @@ context, ubatch 2048), the server behind a LiteLLM gateway:
   decodes each 128-row weight tile once for up to four 32-token passes; before, a
   4,096-token chunk's experts (about 80 member tokens each) decoded every tile three
   times.
-- Per decode step (`TS_Q4E_PERF=3`), one row: hyper-connection mixers 3.8 ms,
+- Per decode step (stage timers), one row: hyper-connection mixers 3.8 ms,
   routed experts 2.4 ms, GDN projections 1.5 ms, shared expert 1.5 ms, router
   1.2 ms of 13.5 ms uncaptured; four rows 22.6 ms. A step is ~2,000 small kernels
   and latency-bound.
@@ -2624,13 +2612,13 @@ back:
 | MTP head, before | 178 | 209 | 273 | 363 | 470 | 449 |
 | MTP head, now | 179 | 241 | 389 | 560 | 771 | 1,019 |
 
-- **Two or more requests decode as groups** (`TS_Q4E_PIPELINE_OVER_SPEC`): the scheduler asks
+- **Two or more requests decode as groups**: the scheduler asks
   the model whether its pipelined groups outrun its batched verify
   (`IPipelinedBatchedDecode.PipelinedDecodeOutrunsSpeculation`) and, if so, speculates only for
   a lone decoder. A request that was speculating joins a group and takes up its drafts again
-  when it is alone (the block restarts after the plain steps, `TS_Q4E_MTP_RESUME`).
-- **The block follows a prompt on its device** (`TS_Q4E_MTP_FOLLOW`,
-  `IDraftHead.DraftSelfCatchUp`): after each ubatch's last layer the block joins every row's
+  when it is alone (the block restarts after the plain steps).
+- **The block follows a prompt on its device**
+  (`IDraftHead.DraftSelfCatchUp`): after each ubatch's last layer the block joins every row's
   token with the streams of the row before it (the previous ubatch's last row is kept on the
   device) and writes its K/V. The prompt therefore runs on the plain path, its chunks in
   flight, and the first draft continues from the block's rows: a 19K-token prompt of scripts
@@ -2638,7 +2626,7 @@ back:
   6,066 against 3,819, with 80-85% of the drafts kept either way and the same answers.
   `TheMtpBlock_FollowsAPromptOnItsDevice_AsTheHostCatchUp` holds the drafts after a followed
   prompt to those of the host's catch-up, on one GPU and on a layer split.
-- **The token embedding beside the block** (`TS_Q4E_MTP_CHAIN_SPLIT`): on a layer split the
+- **The token embedding beside the block**: on a layer split the
   embedding is on the first GPU and the block on the last, so following needs a second copy
   (0.67 GiB); with it a window's draft chain runs on the last GPU as it does on one GPU
   (`TheMtpDraftChain_RunsOnALayerSplit_AsOnOneGpu`). The chain by itself is worth about 1% there.
@@ -2680,13 +2668,13 @@ Q8_0 block with 16-bit loads.
   against 17.9; the tuning keeps the twin for one row. +16% at 16 streams, +11% at 32.
 - **Programmatic dependent launch** (`TS_CUDA_PDL`): +21% for one stream (the MTP verify and
   draft chain are short kernels back to back), +9% at 4, +5% at 16, +2% at 32.
-- **Grouped-query decode attention** (`TS_Q4E_ATTN_GQA`): a block per KV head and four query
+- **Grouped-query decode attention**: a block per KV head and four query
   heads loads each cell once for the four, where a block per query head read every row's K/V
   twelve times; +4% at 16 streams, +9% at 32. With fewer rows and short contexts its smaller
   grid left the GPU idle (3-5% slower at one and two streams), hence the row thresholds.
   `TheGroupedKernel_GivesThePerHeadBits` covers dense and listed cells, split and unsplit
   rows, both caches and a batched step's own caches.
-- **One launch for a batched step's attention** (`TS_Q4E_BATCHED_ATTN`): +1-3% at 16-32 streams;
+- **One launch for a batched step's attention**: +1-3% at 16-32 streams;
   captured graphs had already hidden most of the per-sequence launches.
 
 ## Benchmark matrix

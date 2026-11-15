@@ -594,7 +594,7 @@ recurrence updates its state in place.
 
 Until 2026-11, `--backend cuda` ran a dense NVFP4 checkpoint on one GPU (no `--tp`, `--layer-split` or host experts)
 on a direct engine of its own (`Qwen35CudaModel`, `Q35CudaEngine` and its `ts_q35_*` kernels), which also loaded
-NInfer's NVFP4 artifact. The engine, its kernels, NInfer support and the engine's `TS_Q35_*` variables are removed;
+NInfer's NVFP4 artifact. The engine, its kernels, NInfer support and the engine's own environment variables are removed;
 setting one of those variables now stops the server or CLI at startup. `--backend cuda` serves these checkpoints on
 the shared runtime like every other load: its NVFP4 products run on the backend's FP4 kernels (`CudaFp4Kernels`,
 block-scaled FP4 tensor cores in an sm_120a / sm_121a build). The kernel and end-to-end figures this section used to

@@ -21,7 +21,7 @@ From the repository root on macOS, with an existing GGML Metal build/toolchain:
 
 ```bash
 MAX_CONTEXT=4096 TS_SCHED_NUM_BLOCKS=16 TS_SCHED_MAX_RUNNING_SEQS=1 \
-TS_Q4E_RETAINED_CACHE_MB=0 TS_HOST_MOE_TIMING=3 \
+TS_HOST_MOE_TIMING=3 \
 dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNative=true -- \
   --model /path/to/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf \
   --backend ggml_metal --host 127.0.0.1 --port 8080 --max-tokens 512 --temperature 0 \

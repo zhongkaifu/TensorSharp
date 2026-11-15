@@ -540,8 +540,8 @@ because each looks like an obvious suspect:
 
 - **CUDA-graph capture of the verify.** `TS_GGML_LOG_DEBUG=1` surfaces ggml's
   "CUDA graph warmup complete"/"reset" lines. Capture does churn (the persist
-  cache evicts across draft shapes), but raising
-  `TS_Q35_VERIFY_CACHE_BUDGET_MB` from 1536 to 3072 halves the resets and
+  cache evicts across draft shapes), but doubling its budget from 1536 to
+  3072 MB (measured with a switch since removed) halves the resets and
   changes throughput not at all.
 - **The MTP draft graph not persisting.** Persisting it (measured with a switch
   since removed) moved `draftMs` by less than the run-to-run noise.
@@ -742,8 +742,8 @@ the host round trip went through the state's unpack-and-repack; on the factual
 prompt the device path reproduces plain decoding byte for byte while the host
 path drifted in the last few tokens.
 
-`TS_Q35_VERIFY_SNAPSHOTS=0` restores the old path entirely; it is also what a
-shape the kernel will not persist falls back to, automatically. The cost of the snapshots is
+The old path is what a shape the kernel will not persist falls back to,
+automatically. The cost of the snapshots is
 VRAM: the GDN op's output grows by one state per slot, ~150 MB per slot for this
 model across all 48 recurrent layers, which is the other reason the default
 window is 3 rather than 8.
@@ -767,7 +767,7 @@ kind of acceptance (`GdnDecodeBench`, since removed, `TS_BENCH_MODE=verify TS_VE
 and `CudaReplayCommit_LeavesTheStateASnapshotCommitLeaves` on a toy trunk). It is the
 batched verify's commit (`ggml_ops_qwen35_batched_verify.cpp`): one captured graph
 serves every acceptance. A fully accepted window commits the verify's own post-window
-state, as before. `TS_Q35_VERIFY_REPLAY=0` restores the snapshots.
+state, as before.
 
 Qwen3.8-27B-UD-IQ3_XXS + DFlash2 Q4_K_M, RTX Spark N1X, 4.3K-token context,
 median ms of the verify forward (`GdnDecodeBench`, since removed, `TS_BENCH_MODE=verify`, 12 steps
@@ -1321,8 +1321,9 @@ and `TS_SPEC_ADAPTIVE=0` to force drafting:
 | 9 | 10 | **diverges at token 74** |
 | 10 | 11 | **diverges at token 74** |
 
-The culprit is the per-row recurrent-state snapshot path. `TS_Q35_VERIFY_SNAPSHOTS=0`
-at draft window 8 produces an identical stream; leaving it on diverges. Nine rows
+The culprit is the per-row recurrent-state snapshot path. Turning the snapshots off
+(with a switch since removed) at draft window 8 produces an identical stream; leaving
+them on diverges. Nine rows
 is also where ggml's 2..8-row matvec kernels give way to the large-batch path,
 which is the same boundary Gemma 4 already avoids for speed
 (`Gemma4Model.SpecPreferredDraftWindow`: 7, or 2 for a dense, mostly IQ4_XS
@@ -1332,13 +1333,13 @@ checkpoint on `ggml_metal`).
 on a recurrent trunk (a DFlash drafter on `ggml_cuda`; 3 otherwise), and a preferred window
 replaces the DEFAULT only - it never overrides a number the operator typed. So on
 `ggml_cuda` this is reachable by passing `--spec-draft 8` or wider, and not otherwise. That
-measurement predates the replayed commit (`TS_Q35_VERIFY_REPLAY`), which no longer keeps
+measurement predates the replayed commit, which no longer keeps
 snapshot slots on `ggml_cuda`; it has not been repeated on that path. On `ggml_metal`, n-gram's default
 for a dense, mostly IQ4_XS Qwen 3.5-family trunk is 12 drafts, a 13-row verify;
 a `ggml_metal` verify wider than eight rows now replays the accepted prefix at
 commit, as `ggml_cuda` does, instead of keeping the last three recurrent states
 (until 2026-11-09, an earlier rejection there restored and re-forwarded the
-accepted prefix; `TS_Q35_VERIFY_REPLAY=0` restores that). On an M5 Pro,
+accepted prefix). On an M5 Pro,
 Qwen3.8-27B-UD-IQ3_XXS, n-gram 12 on three copy prompts (1,110 tokens, identical
 text): 42.2 -> 46.6 tok/s, rollback 27.7 -> 0 ms per verify step, the 13-row
 verify graph 496 -> 97 MB; a DSpine block of 16 (six prompts, identical text):
@@ -1346,15 +1347,14 @@ verify graph 496 -> 97 MB; a DSpine block of 16 (six prompts, identical text):
 The earlier three-state comparison produced identical tokens too (see
 [Building against unchanged ggml](perf/ggml-without-patches.md)).
 
-**Workaround until it is fixed:** `--spec-draft 7` or lower, or
-`TS_Q35_VERIFY_SNAPSHOTS=0`.
+**Workaround until it is fixed:** `--spec-draft 7` or lower.
 
 Two C#-side guards were tried and do NOT work, which is worth recording so nobody
 repeats them: requesting one snapshot instead of N moved the divergence from
 token 74 to token 33, and additionally turning off the deferred state download
-moved it to token 18. The native reads `TS_Q35_VERIFY_SNAPSHOTS` itself for
-`fv_snapshots_cfg`, so the environment variable disables a combination the
-managed side cannot reproduce by toggling its own arguments. The fix belongs in
+moved it to token 18. The native read its snapshot switch itself for
+`fv_snapshots_cfg`, so that environment variable disabled a combination the
+managed side could not reproduce by toggling its own arguments. The fix belongs in
 `ggml_ops_qwen35_verify.cpp`, in how the snapshot slots are captured and
 committed for a batch wider than eight rows.
 

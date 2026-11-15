@@ -276,8 +276,8 @@ var report = new { schema_version = 1, passed = passedAll, synthetic, backend = 
     quality_checked = runQuality, quality_passed = runQuality ? (bool?)qualityPassed : null, quality, memory, moe_scratch = scratch, fusion,
     managed_assemblies_sha256 = assemblies, ptx_sha256 = ptx, native_sha256 = native,
     environment = Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>()
-        .Where(e => e.Key.ToString()!.StartsWith("TS_CUDA_", StringComparison.Ordinal) || e.Key.ToString()!.StartsWith("TS_Q4E_", StringComparison.Ordinal)
-            || e.Key.ToString() == "TENSORSHARP_CUDA_MOE_FUSION")
+        .Where(e => e.Key.ToString()!.StartsWith("TS_CUDA_", StringComparison.Ordinal)
+            || e.Key.ToString() is "TENSORSHARP_CUDA_MOE_FUSION" or "TS_Q4E_HC_Q8" or "TS_Q4E_MTP_EXPERTS")
         .OrderBy(e => e.Key.ToString()).ToDictionary(e => e.Key.ToString()!, e => e.Value?.ToString()),
     limitations = new[] { "Teacher-forced timing exercises the full loaded model, excluding HTTP, tokenization, sampling and semantic validation.",
         "Synthetic checkpoints are seeded engine fixtures; their execution does not establish trained-model quality or throughput.",

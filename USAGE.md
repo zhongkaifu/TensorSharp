@@ -951,7 +951,6 @@ latency, quality or delegation-rate measurements are published. Full design:
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | Local GPU count for whole-layer placement, equivalent to `--layer-split N`. Combine with the shared node/peer settings for distributed layer execution; cannot combine with TP above 1. |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Device ordinals for the Qwen 3.8 Flash Next shared GGML layer executor, comma-separated (e.g. `0,2`); independent of `TENSORSHARP_TP_DEVICES`. Native GLM/DeepSeek/MiniMax-M3.1 placement uses `CUDA_VISIBLE_DEVICES` instead. |
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals the TP ranks map to, comma-separated (e.g. `0,2`; default `0..tp-1`). Used by TP on the GGML backends. Muse Spark's and MiniMax-M3.1's native `--tp` on `ggml_cuda` use the first N CUDA GPUs and refuse to load with this set; choose their GPUs with `CUDA_VISIBLE_DEVICES`. |
-| `TS_Q4E_LAYER_SPLIT` | Explicit per-GPU layer counts for the Qwen 3.8 Flash Next (`qwen4exp`) multi-GPU layer split, comma-separated (e.g. `20,28`), replacing the automatic VRAM balance. Throws rather than silently ignoring a value it cannot honour. |
 | `TENSORSHARP_TP_NODE_ID` | This node's 0-based ID for multi-node tensor parallelism or layer splitting. Must be set together with `TENSORSHARP_TP_PEERS`. |
 | `TENSORSHARP_TP_PEERS` | Comma-separated `host:port` list of all nodes in the distributed cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Must be set together with `TENSORSHARP_TP_NODE_ID`. |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | How long each node keeps retrying outbound connections to its peers before giving up (default: `120`). Raise it when nodes are started far apart by hand or by a slow orchestrator. |
@@ -1865,8 +1864,6 @@ Historical Qwen3.8-Flash-Next-UD-Q2_K_XL measurements on 2× A100-80GB found
 byte-identical greedy output on one and two GPUs, prefill about 1520–1550 t/s,
 and decode about 56 t/s in both placements. They establish capacity and
 correctness for that checkpoint, not a general speedup.
-`TS_Q4E_LAYER_SPLIT=20,28` overrides automatic placement with explicit per-GPU
-layer counts; it does not select the execution mode or replace `--layer-split`.
 
 ### Local tensor parallelism (single process, multiple GPUs)
 
@@ -2025,7 +2022,6 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`). Muse Spark's and MiniMax-M3.1's native `--tp` refuse it; use `CUDA_VISIBLE_DEVICES` there |
 | `TS_GGML_TP_PARALLEL=0` | Drive ranks sequentially instead of concurrently (diagnostic) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
-| `TS_Q4E_LAYER_SPLIT=20,28` | Qwen 3.8 Flash Next only: explicit layer counts per GPU for its layer split, instead of the automatic VRAM balance. Throws rather than silently ignoring a value it cannot honour — useful because the automatic balance prices weights and cannot see the vision tower, which loads later and lands on GPU 0 |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode. Layers offloaded by `--n-cpu-moe` are skipped by that materialization — they never run on the accelerator — so `--cpu-moe` also removes the load-time cost |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | Payload size above which ggml-cuda's collective converts F32 to BF16 before reducing. TensorSharp raises ggml's default (1 byte — i.e. always) to 1 MB so decode-sized collectives reduce exactly; `0` disables the conversion entirely |
@@ -2263,7 +2259,6 @@ Every `TS_MINIMAX_M3_*` variable, with its default, is in the
 |---|---|---|---|
 | Local tensor parallelism (multi-GPU, single process) | OFF (`1` GPU) | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N` (CLI and server) |
 | GPU ordinals used by the TP ranks (GGML backends; Muse Spark's native `--tp` takes the first N visible CUDA GPUs, so use `CUDA_VISIBLE_DEVICES`) | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
-| Explicit per-GPU layer counts for the `qwen4exp` layer split (`--layer-split N`) | automatic VRAM balance | `TS_Q4E_LAYER_SPLIT=20,28` | — |
 | Distributed TP node ID (multi-node) | unset (disabled) | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N` (CLI and server; the server must be node `0`) |
 | Distributed TP peer endpoints | unset (disabled) | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2` (CLI and server) |
 | Peer connect retry window (multi-node) | `120` s | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |

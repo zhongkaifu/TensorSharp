@@ -3107,7 +3107,7 @@ namespace TensorSharp.Cuda
         private int _missCapacity;
 
         /// <summary>Host experts a layer's call stages into device slots at most (<see cref="Staging"/>), the rest going to the
-        /// host: the Qwen3.8 engines' default (TS_Q4E_HYBRID_MISSES). On an A40, Qwen3.8 Flash Next UD-Q2_K_XL rang the host
+        /// host: the removed Qwen3.8 direct engine's default. On an A40, Qwen3.8 Flash Next UD-Q2_K_XL rang the host
         /// for 287 routes of a 4-request run against 1,870, and decoded 54.4 / 50.5 tok/s (short, after a 4K prompt) against
         /// 52.5-52.6 / 49.5-49.6 with the host computing every miss.</summary>
         internal const int DefaultGpuMisses = 4;

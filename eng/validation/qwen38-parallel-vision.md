@@ -44,17 +44,15 @@ separate server runs. The model, projector, and fixture identities must match.
 Both requests per wave are retained at C=1 so that each distinct image has a
 sequential control. `--repeats` adds separate deterministic prompt markers.
 
-The Qwen4Exp loader preserves the supplied GGUF path's existing tanh patch-merger
-activation. The [published Transformers v5.16.1 merger](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705)
-uses GELU(erf); `TS_Q4E_VISION_MERGER_ERF=1` before server startup selects that
-activation without changing the transformer blocks' tanh GELU. Record this setting
-with each report. The delivered base-model default passed 12/12 image cases and
-reproduced all 16 answers from the earlier tanh run. The full erf trial passed
-10/12. In the subsequent same-build C=1 OCR control, tanh passed 2/2 and erf
-passed 1/2, reading blue `9364` as `9334`. These scoped observations support
-retaining tanh as the compatibility default; they do not explain the recognition
-difference or establish broader activation quality. Future activation comparisons
-must match model, projector, fixtures, sampling, cache settings and build identity.
+The Qwen4Exp loader keeps the tanh patch-merger activation. The [published
+Transformers v5.16.1 merger](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705)
+uses GELU(erf); the removed Qwen4ExpModel's opt-in to that activation went with it.
+The delivered base-model default passed 12/12 image cases and reproduced all 16
+answers from the earlier tanh run. The full erf trial passed 10/12. In the
+subsequent same-build C=1 OCR control, tanh passed 2/2 and erf passed 1/2, reading
+blue `9364` as `9334`. These scoped observations support retaining tanh as the
+default; they do not explain the recognition difference or establish broader
+activation quality.
 
 ## Projector sources
 

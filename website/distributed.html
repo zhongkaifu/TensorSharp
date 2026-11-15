@@ -161,7 +161,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
     </tbody>
   </table>
   </div>
-  <p>llama.cpp on the same box behaves the same way: <code>-sm layer</code> takes pp1536 / tg128 from 1094 / 61.2 on one GPU to 1200 / 61.5 on two — about 10% prefill, nothing on decode — and <code>-sm row</code> refuses to load this architecture at all. So the reason to pass <code>--layer-split N</code> here is that the weights, the caches and the context do not fit on one card, not throughput. Startup prints which mode ran and the per-GPU layer/byte split. <code>TS_Q4E_LAYER_SPLIT=20,28</code> gives explicit layer counts per GPU (llama.cpp's <code>--tensor-split</code> in spirit) and throws rather than silently ignoring a value it cannot honour — useful, because the automatic balance prices weights and cannot see the vision tower, which loads later and lands on GPU 0.</p>
+  <p>llama.cpp on the same box behaves the same way: <code>-sm layer</code> takes pp1536 / tg128 from 1094 / 61.2 on one GPU to 1200 / 61.5 on two — about 10% prefill, nothing on decode — and <code>-sm row</code> refuses to load this architecture at all. So the reason to pass <code>--layer-split N</code> here is that the weights, the caches and the context do not fit on one card, not throughput. Startup prints which mode ran and the per-GPU layer/byte split.</p>
   <h3 id="perf-qwen-image">Qwen-Image-2.1's diffusion transformer under TP</h3>
   <p>Two NVIDIA A40s (46 GB each) in different CPU sockets, where peer access is not functional and NCCL used its shared-memory transport. Prefix cache on, step times exclude step 1:</p>
   <div class="table-scroll">

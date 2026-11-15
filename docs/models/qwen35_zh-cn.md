@@ -473,7 +473,7 @@ decode 每步对所有运行中的序列只跑一张图：每个序列的行读�
 
 ### 直连 CUDA NVFP4 引擎（已移除）
 
-2026-11 之前，`--backend cuda` 在单 GPU 上（没有 `--tp`、`--layer-split` 或主机专家）用自己的直连引擎（`Qwen35CudaModel`、`Q35CudaEngine` 及其 `ts_q35_*` 核函数）运行稠密 NVFP4 检查点，该引擎也能加载 NInfer 的 NVFP4 文件。引擎、其核函数、NInfer 支持以及引擎的 `TS_Q35_*` 变量均已移除；现在设置这些变量会让服务端或 CLI 在启动时报错退出。`--backend cuda` 像其他加载一样在共享运行时上服务这些检查点：NVFP4 乘积运行在后端的 FP4 核函数上（`CudaFp4Kernels`，sm_120a / sm_121a 构建中的块缩放 FP4 张量核）。本节以前列出的核函数与端到端数据（RTX 5090，2026-11）都测于已移除的引擎，尚未在运行时上重测。
+2026-11 之前，`--backend cuda` 在单 GPU 上（没有 `--tp`、`--layer-split` 或主机专家）用自己的直连引擎（`Qwen35CudaModel`、`Q35CudaEngine` 及其 `ts_q35_*` 核函数）运行稠密 NVFP4 检查点，该引擎也能加载 NInfer 的 NVFP4 文件。引擎、其核函数、NInfer 支持以及引擎自己的环境变量均已移除；现在设置这些变量会让服务端或 CLI 在启动时报错退出。`--backend cuda` 像其他加载一样在共享运行时上服务这些检查点：NVFP4 乘积运行在后端的 FP4 核函数上（`CudaFp4Kernels`，sm_120a / sm_121a 构建中的块缩放 FP4 张量核）。本节以前列出的核函数与端到端数据（RTX 5090，2026-11）都测于已移除的引擎，尚未在运行时上重测。
 
 该路线上发现的一处修复是共享的，仍然保留：同一步进入、共享缓存前缀的多个对话，会先绑定 holder 并注入前缀（批处理执行器中的 `PrebindCachedPrefixPrefills`），使各后缀共用一次前向，而不是逐个运行。
 

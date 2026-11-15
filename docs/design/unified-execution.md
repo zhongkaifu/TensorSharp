@@ -38,7 +38,7 @@ Today each family implements each mechanism by hand, so support is a patchwork:
 * **Expert offload is a process-wide static (`MoeCpuOffloadConfig`) that each family's FFN must
   remember to consult.** Some families do on some paths only; others warn
   (`WarnUnsupportedBackend`); native executors each re-implement placement with their own knobs
-  (`TS_MUSE_SPARK_CPU_MOE`, `TS_MINIMAX_M3_CPU_MOE`, `TS_Q4E_HOST_EXPERTS`, ...).
+  (`TS_MUSE_SPARK_CPU_MOE`, `TS_MINIMAX_M3_CPU_MOE`, ...).
 * **Nothing forces a new family to support any of this.** `HunyuanDense` (the newest dense family)
   shipped as `MultiGpu = SingleDevice`: no TP, no layer split. The descriptor's multi-GPU fields
   are optional and default to "tensor parallel", so an undeclared family silently claims TP.

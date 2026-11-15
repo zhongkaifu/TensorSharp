@@ -723,13 +723,13 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     private void CheckGraphReference(BackendType backend, string scenario, float[][] logits)
     {
         string fileName = $"{backend}-{scenario}.json";
-        string captureDir = Environment.GetEnvironmentVariable("TS_Q4E_OFFLOAD_CAPTURE_DIR");
+        string captureDir = Environment.GetEnvironmentVariable("TS_TEST_OFFLOAD_CAPTURE_DIR");
         if (!string.IsNullOrEmpty(captureDir))
         {
             Directory.CreateDirectory(captureDir);
             File.WriteAllText(Path.Combine(captureDir, fileName), JsonSerializer.Serialize(logits));
         }
-        string referenceDir = Environment.GetEnvironmentVariable("TS_Q4E_OFFLOAD_REFERENCE_DIR");
+        string referenceDir = Environment.GetEnvironmentVariable("TS_TEST_OFFLOAD_REFERENCE_DIR");
         if (!string.IsNullOrEmpty(referenceDir))
         {
             float[][] reference = JsonSerializer.Deserialize<float[][]>(

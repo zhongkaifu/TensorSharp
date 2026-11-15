@@ -856,7 +856,6 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | 本地按层切分的 GPU 数，等价于 `--layer-split N`。可配合节点与 peer 参数跨节点运行；不能与大于 1 的 TP 度数组合。 |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器的设备序号，逗号分隔，例如 `0,2`；与 `TENSORSHARP_TP_DEVICES` 独立。原生 GLM/DeepSeek/MiniMax-M3.1 执行器请使用 `CUDA_VISIBLE_DEVICES`。 |
 | `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`；默认 `0..tp-1`）。用于 GGML 后端上的 TP。`ggml_cuda` 上 Muse Spark 与 MiniMax-M3.1 的原生 `--tp` 使用前 N 张 CUDA GPU，设置了该变量时会拒绝加载；请用 `CUDA_VISIBLE_DEVICES` 选择 GPU。 |
-| `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next（`qwen4exp`）多卡按层切分时每张 GPU 分到的层数（逗号分隔，例如 `20,28`），用于取代自动的显存均衡。给出无法满足的值时会直接抛错，而不是静默忽略。 |
 | `TENSORSHARP_TP_NODE_ID` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `TENSORSHARP_TP_PEERS` 一起设置。 |
 | `TENSORSHARP_TP_PEERS` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `TENSORSHARP_TP_NODE_ID` 一起设置。 |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 各节点向 peer 发起连接的重试窗口（默认：`120` 秒）。若节点由人工或较慢的编排系统间隔较久启动，可调大该值。 |
@@ -1633,8 +1632,6 @@ TensorSharp.Server.Host/bin/TensorSharp.Server.Host --model qwen38-flash-next.gg
 
 历史上的 2× A100-80GB、Qwen3.8-Flash-Next-UD-Q2_K_XL 实测显示：单卡和双卡贪心输出逐字节相同，
 prefill 约 1520–1550 t/s，decode 约 56 t/s。这验证了该检查点的容量与正确性，不代表普遍提速。
-`TS_Q4E_LAYER_SPLIT=20,28` 可覆盖自动放置、指定每卡层数；它不负责选择运行模式，也不替代
-`--layer-split`。
 
 ### 本地张量并行（单进程，多 GPU）
 
@@ -1778,7 +1775,6 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 | `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号，例如 `0,2`（默认 `0..tp-1`）。Muse Spark 与 MiniMax-M3.1 的原生 `--tp` 会拒绝它，请改用 `CUDA_VISIBLE_DEVICES` |
 | `TS_GGML_TP_PARALLEL=0` | 顺序而非并发地驱动各 rank（诊断用） |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 超过该元素数量时 AllReduce 走设备集合通信（默认 262144） |
-| `TS_Q4E_LAYER_SPLIT=20,28` | 仅 Qwen 3.8 Flash Next：用显式的每卡层数取代按层切分的自动显存均衡。给出无法满足的值时直接抛错而不是静默忽略——这个开关有用，是因为自动均衡只按权重定价，看不到后加载、会落在 GPU 0 上的视觉塔 |
 | `TS_GGML_F32_RESIDENT=0` | 每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | 仅 Gemma 4：从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径。融合路径在 26B 上加载时会物化约 10.5 GB 的专家分片（约 36 秒），换来约 10× 的 decode。被 `--n-cpu-moe` 卸载的层不参与这次物化——它们从不在加速器上运行——因此 `--cpu-moe` 也会去掉这笔加载开销 |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | ggml-cuda 集合通信在多大载荷以上把 F32 转成 BF16 再归约。TensorSharp 把 ggml 的默认值（1 字节，即总是转换）提高到 1 MB，使 decode 规模的集合通信精确归约；设为 `0` 则完全禁用转换 |
@@ -1997,7 +1993,6 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 |---|---|---|---|
 | 本地张量并行（单进程，多 GPU） | 关闭（`1` 张 GPU） | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N`（CLI 与服务端） |
 | TP 各 rank 使用的 GPU 序号（GGML 后端；Muse Spark 的原生 `--tp` 取前 N 张可见 CUDA GPU，请用 `CUDA_VISIBLE_DEVICES`） | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
-| `qwen4exp` 按层切分（`--layer-split N`）每张卡的显式层数 | 自动显存均衡 | `TS_Q4E_LAYER_SPLIT=20,28` | — |
 | 分布式 TP 节点编号（多节点） | 未设置（关闭） | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N`（CLI 与服务端；服务端必须是节点 `0`） |
 | 分布式 TP peer 端点 | 未设置（关闭） | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2`（CLI 与服务端） |
 | peer 连接重试窗口（多节点） | `120` 秒 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |

@@ -311,7 +311,7 @@ def run_process(command, cwd, environment, directory, timeout):
 def ts_environment(budget):
     environment = os.environ.copy()
     for key in list(environment):
-        if key.startswith(("TS_SPEC", "TS_MTP", "TS_Q4E_EXPERT_CACHE_")) or key in (
+        if key.startswith(("TS_SPEC", "TS_MTP")) or key in (
                 "TS_CPU_MOE", "TS_N_CPU_MOE", "TS_DSV4_DSPARK", "TS_QWEN35_DFLASH", "TS_MUSE_GLIMMER_DFLASH", "TS_NEMOTRON_DFLASH"):
             environment.pop(key)
     # The expert-cache budget the runs once set (TS_HOST_MOE_EXPERT_CACHE_*) went with Qwen4ExpModel; the runtime's

@@ -263,10 +263,9 @@ TS_TEST_GGML_BACKEND=metal TS_TEST_MODEL_DIR=/models/gemma-4-E2B \
   --filter FullyQualifiedName~Gemma4SwaRollbackExactnessTests
 
 TS_TEST_GGML_BACKEND=metal TS_KVQ_BACKEND=ggml_metal \
-TS_KVQ_MODEL=/models/Qwen3.5-9B-IQ4_XS.gguf \
-TS_Q35_STATE_MODEL=/models/Qwen3.5-9B-IQ4_XS.gguf TS_TEST_MODEL_DIR=/models \
+TS_KVQ_MODEL=/models/Qwen3.5-9B-IQ4_XS.gguf TS_TEST_MODEL_DIR=/models \
   dotnet test InferenceWeb.Tests -c Release --no-build \
-  --filter 'FullyQualifiedName~QuantizedKvFusedGraphTests|FullyQualifiedName~Qwen35HolderSpeculationTests|FullyQualifiedName~Qwen35VerifyDeviceChainTests'
+  --filter 'FullyQualifiedName~QuantizedKvFusedGraphTests|FullyQualifiedName~Qwen35HolderSpeculationTests'
 
 dotnet build benchmarks/AgentTurnBench -c Release
 dotnet benchmarks/AgentTurnBench/bin/Release/net10.0/AgentTurnBench.dll \
