@@ -427,10 +427,12 @@ namespace TensorSharp.Models
             // Recording on the second advance ran one more unrecorded step of every shape a request starts and every 256
             // positions: about 1.5% of a Qwen3.8 Flash Next MTP reply's time on an A40.
             if (r.Capture == null) r.Advances++;
-            // Too little device memory left for another recording: this step runs as usual and tries again later.
+            // Too little device memory left for another recording: this step runs as usual and tries again later, and the next
+            // step first gives finished conversations' retained slots back (RoomForRecordings).
             if (r.Capture == null && !recorder.HasRoomToRecord())
             {
                 r.Advances = 0;
+                _recordingWantsRoom = true;
                 return false;
             }
             r.Capture ??= recorder.OpenDecodeCapture();
@@ -620,6 +622,27 @@ namespace TensorSharp.Models
         /// </summary>
         private bool _headLayoutPrepared;
 
+        /// <summary>A step could not record for lack of device memory (<see cref="TryRunRecorded"/>).</summary>
+        private bool _recordingWantsRoom;
+
+        /// <summary>Device memory a lone CUDA step's recordings want free (with the pool's cached blocks): the executor records
+        /// only above 1 GiB, and a speculating request records a step for each window and draft width.</summary>
+        private const long RecordingRoomBytes = 3L << 29;
+
+        /// <summary>
+        /// After a step could not record: finished conversations' retained slots (prefix-cache payloads), the oldest first,
+        /// go back until the recordings fit, as a prompt step's do (ReleaseRetainedSlotsFor), before this step traces or
+        /// replays anything (releasing a slot drops the cached graphs). An unrecorded verify window of Qwen3.8-27B took 101 ms
+        /// against 41 recorded on a 24 GB RTX PRO 4000, for the whole request after two 4K prompts' slots were kept.
+        /// </summary>
+        private void RoomForRecordings()
+        {
+            if (!_recordingWantsRoom) return;
+            _recordingWantsRoom = false;
+            if (_allocator is TensorSharp.Cuda.CudaAllocator cuda && _retainedSlots is { Count: > 0 } && PromptFreeBytes(cuda) < RecordingRoomBytes)
+                ReleaseRetainedSlotsFor(RecordingRoomBytes, cuda);
+        }
+
         /// <summary>
         /// The untied LM head is read only by its products (never gathered by rows): the executor may keep it in a layout only
         /// they read - direct CUDA regroups a Q6_K head for its int8 tensor-core kernels (a 248,320 x 5,120 head's 8-row product
@@ -678,6 +701,7 @@ namespace TensorSharp.Models
         {
             result = null;
             PrepareHeadLayout();
+            RoomForRecordings();
             string reason = GraphUnsupportedReason();
             if (reason != null && RequiresGraphs)
                 throw new NotSupportedException($"{Config.Architecture} runs only as graphs on the shared runtime, which this step cannot use ({reason}).");
