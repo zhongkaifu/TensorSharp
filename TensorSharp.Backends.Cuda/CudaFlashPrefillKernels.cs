@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 5;
+        public const int CurrentVersion = 6;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
@@ -76,7 +76,8 @@ namespace TensorSharp.Cuda
         /// <paramref name="dyn"/> (a recorded decode step's parameter block) the length is read on the device. With
         /// <paramref name="cells"/> (one decode row: a sparse attention's selection) the keys are the cache rows listed there,
         /// <paramref name="cellCount"/>[0] of them on the device, each with its value in the mask row
-        /// <paramref name="cellMask"/> added (len and floor unused).
+        /// <paramref name="cellMask"/> added (len and floor unused; none added without it: a selection whose kept cells all
+        /// hold 0).
         /// </summary>
         public unsafe void LaunchAttention(IntPtr q, IntPtr k, IntPtr v, int cap, int nq, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
@@ -105,7 +106,7 @@ namespace TensorSharp.Cuda
         /// <paramref name="dyn"/>[0] on the device when given), into out [rows][heads][d] F32. Each row's arithmetic is a
         /// one-row <see cref="LaunchAttention"/>'s with the same <paramref name="splits"/>; the partials hold
         /// <see cref="PartialFloats"/>(rows, ...). With <paramref name="cells"/> (a sparse attention's selection) row z's
-        /// keys are cells[z * cellStride ..], cellCount[z] of them, its mask row cellMask[z * cellStride ..].
+        /// keys are cells[z * cellStride ..], cellCount[z] of them, its mask row cellMask[z * cellStride ..] (or none).
         /// </summary>
         public unsafe void LaunchDecodeRows(IntPtr q, IntPtr k, IntPtr v, int cap, int rows, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,

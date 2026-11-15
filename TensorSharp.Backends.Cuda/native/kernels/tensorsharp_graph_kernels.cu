@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 25
+#define TS_GRAPH_KERNELS_VERSION 26
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -2147,4 +2147,437 @@ extern "C" __global__ void ts_graph_shared_gate_add_f32(const float* __restrict_
         for (int j = threadIdx.x; j < n; j += blockDim.x)
             out[base + j] = __fadd_rn(moe[base + j], __fmul_rn(shared[base + j], s));
     }
+}
+
+// ---------------------------------------------------------------------------
+// GraphFusion.QsaAttention: a QSA layer's block selection and its attention over the selected cells, for one sequence's
+// rows over its cache window. The direct engine's kernels (tensorsharp_q4e_kernels.cu: ts_q4e_qsa_scores_f32,
+// ts_q4e_qsa_select_i32, ts_q4e_attention_mma_f32) on the runtime's operands and the runtime's selection: a row keeps its
+// `picks` best visible blocks WHOLE and its own incomplete tail block (llama.cpp since #29751), where the engine kept
+// top_k + ratio - 1 single cells (part of a further block where the tail is short). A row's position p is its KV index -
+// the row the step wrote it at, read on the device, so a recorded step replays at every position its window covers; block b
+// (cells b R .. b R + R - 1) is visible to it iff b < (p + 1) / R, and its pooled key is the pooled half of its last
+// member's row of the indexer cache [cap][2 d] (F16).
+// ---------------------------------------------------------------------------
+
+// The region's block scores, ts_graph_lightning_indexer_f32's arithmetic in its order (a warp a block, lanes over the dims, the
+// heads' rectified dots summed in head order, each times the weight w: the step's 1/sqrt(d) for every head), with each
+// block's pooled key read where the cache holds it (F16, widened as ts_graph_get_rows_f16 widens the region's gather of it)
+// and the visibility mask computed from the row's position: a visible block's score is the indexer's sum plus the mask's 0,
+// an invisible one's -inf (its sum plus the mask's -inf; not computed). So the scores
+// the region's GetRows and LightningIndexer ops give, bit for bit, for finite queries and keys. q [rows][heads][d] F32 (d <=
+// 256), cache rows cachePitch halves apart, pos [rows], out [rows][pools]. Launch: grid (ceil(pools / 8), rows), block 256,
+// heads * d floats of dynamic shared memory.
+extern "C" __global__ void ts_graph_qsa_scores_f32(const float* __restrict__ q, const __half* __restrict__ cache, long long cachePitch,
+    const int* __restrict__ pos, float* __restrict__ out, float w, int d, int heads, int pools, int ratio)
+{
+    extern __shared__ float sq[];
+    const size_t r = blockIdx.y;
+    for (int i = threadIdx.x; i < heads * d; i += blockDim.x)
+        sq[i] = q[r * heads * d + i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int j = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (j >= pools) return;
+    if (j >= (pos[r] + 1) / ratio)
+    {
+        if (lane == 0)
+            out[r * pools + j] = -INFINITY;
+        return;
+    }
+    const __half* key = cache + (size_t)(j * ratio + ratio - 1) * (size_t)cachePitch + d;
+    float kr[8];
+#pragma unroll
+    for (int t = 0; t < 8; t++)
+    {
+        const int i = lane + 32 * t;
+        kr[t] = i < d ? __half2float(key[i]) : 0.f;
+    }
+    float sum = 0.f;
+    for (int h = 0; h < heads; h++)
+    {
+        float dot = 0.f;
+#pragma unroll
+        for (int t = 0; t < 8; t++)
+        {
+            const int i = lane + 32 * t;
+            if (i < d) dot += sq[h * d + i] * kr[t];
+        }
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        if (dot > 0.f) sum += w * dot;
+    }
+    if (lane == 0)
+        out[r * pools + j] = sum + 0.f;
+}
+
+// The region's selection: the cells each row attends, ascending - its `picks` best visible blocks whole (by score, a tie to
+// the lower block; every visible block when there are no more than picks), then its own incomplete tail block's cells up to
+// p. The cell list ts_graph_topk_wide_f32 (or ts_graph_topk_f32) over the scores, ts_graph_topk_mask_f32 over the step's plan
+// and ts_graph_mask_cells give, in their order. The picks' threshold is ts_q4e_qsa_select_i32's radix select (four 8-bit
+// passes over the visible blocks' order keys, each pass's bin found by a block-wide scan) over ts_order_key, the wide top-k's
+// order; one ascending ballot pass then takes every block above it and the lowest-indexed ones equal to it.
+// scores [rows][pools], pos [rows], cells [rows][cellStride] (cellStride >= picks * ratio + ratio - 1), count [rows].
+// Launch: grid rows, block 256.
+extern "C" __global__ void __launch_bounds__(256) ts_graph_qsa_select_i32(const float* __restrict__ scores, const int* __restrict__ pos,
+    int* __restrict__ cells, int* __restrict__ count, int pools, int ratio, int picks, int cellStride)
+{
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int s_prefix;
+    __shared__ int s_need, s_equal, s_taken;
+    __shared__ int scanWarp[8], warpEqual[8], warpTaken[8];
+    const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int p = pos[r];
+    const int tail = (p + 1) / ratio * ratio, nb = tail / ratio;
+    int* out = cells + (size_t)r * cellStride;
+    if (nb <= picks)
+    {
+        // Every visible block and the tail: cells 0 .. p.
+        for (int c = tid; c <= p; c += blockDim.x)
+            out[c] = c;
+        if (tid == 0)
+            count[r] = p + 1;
+        return;
+    }
+    const float* sc = scores + (size_t)r * pools;
+
+    // The picks-th largest key, byte by byte from the most significant.
+    if (tid == 0)
+    {
+        s_prefix = 0;
+        s_need = picks;
+    }
+    __syncthreads();
+    for (int pass = 0; pass < 4; ++pass)
+    {
+        const int shift = 24 - 8 * pass;
+        hist[tid] = 0;
+        __syncthreads();
+        const unsigned int prefix = s_prefix;
+        for (int b = tid; b < nb; b += blockDim.x)
+        {
+            const unsigned int key = ts_order_key(sc[b]);
+            if (pass > 0 && (key >> (shift + 8)) != prefix)
+                continue;
+            atomicAdd(&hist[(key >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        // The bin a walk from bin 255 down stops at (the first whose count reaches the need left, the need then dropping by
+        // the bins above it), as a scan: thread i holds bin 255 - i. The bin always exists: the pass's keys number at least
+        // the need (nb > picks, then the previous bin's count).
+        {
+            const int c = (int)hist[255 - tid];
+            int incl = c;
+#pragma unroll
+            for (int off = 1; off < 32; off <<= 1)
+            {
+                const int o = __shfl_up_sync(0xffffffffu, incl, off);
+                if (lane >= off)
+                    incl += o;
+            }
+            if (lane == 31)
+                scanWarp[warp] = incl;
+            const int n = s_need;
+            __syncthreads();
+            for (int w = 0; w < warp; ++w)
+                incl += scanWarp[w];
+            const int excl = incl - c;
+            if (incl >= n && excl < n)
+            {
+                s_need = n - excl;
+                s_prefix = (prefix << 8) | (unsigned int)(255 - tid);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Ascending: every block above the threshold, and of those equal to it the lowest-indexed s_need.
+    const unsigned int thr = s_prefix;
+    const int needEqual = s_need;
+    if (tid == 0)
+    {
+        s_equal = 0;
+        s_taken = 0;
+    }
+    __syncthreads();
+    for (int b0 = 0; b0 < nb; b0 += blockDim.x)
+    {
+        const int b = b0 + tid;
+        const unsigned int key = b < nb ? ts_order_key(sc[b]) : 0u;
+        const bool equal = b < nb && key == thr;
+        const unsigned int equalBallot = __ballot_sync(0xffffffffu, equal);
+        if (lane == 0)
+            warpEqual[warp] = __popc(equalBallot);
+        __syncthreads();
+        int rank = s_equal + __popc(equalBallot & ((1u << lane) - 1u));
+        for (int w = 0; w < warp; ++w)
+            rank += warpEqual[w];
+        const bool take = (b < nb && key > thr) || (equal && rank < needEqual);
+        const unsigned int takeBallot = __ballot_sync(0xffffffffu, take);
+        if (lane == 0)
+            warpTaken[warp] = __popc(takeBallot);
+        __syncthreads();
+        int slot = s_taken + __popc(takeBallot & ((1u << lane) - 1u));
+        for (int w = 0; w < warp; ++w)
+            slot += warpTaken[w];
+        if (take)
+            for (int i = 0; i < ratio; ++i)
+                out[slot * ratio + i] = b * ratio + i;
+        __syncthreads();
+        if (tid == 0)
+        {
+            int equalSeen = 0, taken = 0;
+            for (int w = 0; w < (int)(blockDim.x >> 5); ++w)
+            {
+                equalSeen += warpEqual[w];
+                taken += warpTaken[w];
+            }
+            s_equal += equalSeen;
+            s_taken += taken;
+        }
+        __syncthreads();
+    }
+    const int kept = picks * ratio, t0 = p + 1 - tail;
+    for (int i = tid; i < t0; i += blockDim.x)
+        out[kept + i] = tail + i;
+    if (tid == 0)
+        count[r] = kept + t0;
+}
+
+// A prompt's rows over their selected cells on tensor cores: ts_q4e_attention_mma_f32 (the direct engine's prompt attention)
+// on the head-first cache and without the output gate (the model's SigmoidGate region follows). A block of four warps takes
+// one (KV head, row): the group's query heads are the rows of a 16-row mma tile (G <= 16, the rest zero), the row's cells come
+// in chunks of 16 (warp w takes chunks w, w + 4, ...), each chunk's keys and then values are staged in the warp's shared tile,
+// and S = Q K^T and O += P V run on mma.sync.m16n8k16 (F16 operands, F32 accumulation) under a per-warp online softmax; the
+// warps merge at the end. Queries and probabilities are F16 operands, so a row rounds apart from the flash kernel's (which
+// accumulates short runs in F16) within F16 P.V tolerance; decode rows and verify windows keep the flash kernel.
+//   q, out  [rows][heads][256] F32;  k, v  [kvHeads][cap][256] F16;  cells [rows][cellStride], count [rows]
+// sm_80 and newer (ldmatrix, mma.f16): the compute_75 image's body is empty; the host launches it only where
+// CudaPrefillModule.ArchGuardedKernelsUsable holds. Launch: grid (kvHeads, rows), block 128.
+#define TS_QSA_HD 256
+#define TS_QSA_WARPS 4
+#define TS_QSA_LDS (TS_QSA_HD + 8)   // halves a shared row holds: 528 B, so ldmatrix's eight rows hit distinct banks
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void ts_graph_qsa_ldsm_x4(uint32_t (&r)[4], const __half* p)
+{
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ void ts_graph_qsa_ldsm_x4_trans(uint32_t (&r)[4], const __half* p)
+{
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ void ts_graph_qsa_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t ts_graph_qsa_pack(float lo, float hi)
+{
+    const half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+// Listed cells base .. base + 15 of one KV head (head: its first row) into sm[16][LDS], zero past n: lane & 15 takes a cell,
+// lane >> 4 half of its dims.
+__device__ __forceinline__ void ts_graph_qsa_stage(__half (*sm)[TS_QSA_LDS], const __half* __restrict__ cache, size_t head,
+    const int* __restrict__ list, int base, int n, int lane)
+{
+    const int j = lane & 15, part = lane >> 4;
+    uint4* dst = reinterpret_cast<uint4*>(&sm[j][part * 128]);
+    const int i = base + j;
+    if (i >= n)
+    {
+#pragma unroll
+        for (int s = 0; s < 16; ++s)
+            dst[s] = make_uint4(0u, 0u, 0u, 0u);
+        return;
+    }
+    const int4* src = reinterpret_cast<const int4*>(cache + (head + (size_t)list[i]) * TS_QSA_HD + part * 128);
+    int4 w[16];
+#pragma unroll
+    for (int s = 0; s < 16; ++s)
+        w[s] = src[s];
+#pragma unroll
+    for (int s = 0; s < 16; ++s)
+        dst[s] = make_uint4((uint32_t)w[s].x, (uint32_t)w[s].y, (uint32_t)w[s].z, (uint32_t)w[s].w);
+}
+#endif
+
+extern "C" __global__ void __launch_bounds__(TS_QSA_WARPS * 32) ts_graph_qsa_attn_mma_f16_d256(
+    const float* __restrict__ q, const __half* __restrict__ kc, const __half* __restrict__ vc, const int* __restrict__ cells,
+    const int* __restrict__ count, float* __restrict__ out, int cap, int heads, int kvHeads, float scale, int cellStride)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ __align__(16) __half smQ[16][TS_QSA_LDS];
+    __shared__ __align__(16) __half smKV[TS_QSA_WARPS][16][TS_QSA_LDS];
+    __shared__ float smM[TS_QSA_WARPS][16], smL[TS_QSA_WARPS][16], smInv[16];
+
+    const int kvh = blockIdx.x, t = blockIdx.y;
+    const int G = heads / kvHeads;
+    const int n = count[t];
+    const int* list = cells + (size_t)t * cellStride;
+    const size_t head = (size_t)kvh * cap;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tig = lane & 3;
+
+    // The group's query heads as F16 rows, rows G..15 zero.
+    for (int u = tid; u < 16 * (TS_QSA_HD / 4); u += blockDim.x)
+    {
+        const int r = u / (TS_QSA_HD / 4), c4 = (u % (TS_QSA_HD / 4)) * 4;
+        float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (r < G)
+            f = *reinterpret_cast<const float4*>(q + ((size_t)t * heads + kvh * G + r) * TS_QSA_HD + c4);
+        *reinterpret_cast<uint2*>(&smQ[r][c4]) = make_uint2(ts_graph_qsa_pack(f.x, f.y), ts_graph_qsa_pack(f.z, f.w));
+    }
+    __syncthreads();
+
+    float o[TS_QSA_HD / 8][4];
+#pragma unroll
+    for (int dt = 0; dt < TS_QSA_HD / 8; ++dt)
+        o[dt][0] = o[dt][1] = o[dt][2] = o[dt][3] = 0.0f;
+    float mRow[2] = { -INFINITY, -INFINITY }, lRow[2] = { 0.0f, 0.0f };
+    const float sl2 = scale * 1.4426950408889634f;
+    __half (*sm)[TS_QSA_LDS] = smKV[warp];
+    const int nChunks = (n + 15) >> 4;
+    for (int ch = warp; ch < nChunks; ch += TS_QSA_WARPS)
+    {
+        const int base = ch << 4;
+        ts_graph_qsa_stage(sm, kc, head, list, base, n, lane);
+        __syncwarp();
+        float s[2][4] = { { 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+#pragma unroll
+        for (int kk = 0; kk < TS_QSA_HD; kk += 16)
+        {
+            uint32_t a[4], b[4];
+            ts_graph_qsa_ldsm_x4(a, &smQ[(lane & 7) + ((lane >> 3) & 1) * 8][kk + (lane >> 4) * 8]);
+            ts_graph_qsa_ldsm_x4(b, &sm[(lane & 7) + (lane >> 4) * 8][kk + ((lane >> 3) & 1) * 8]);
+            ts_graph_qsa_mma(s[0], a, b[0], b[1]);
+            ts_graph_qsa_mma(s[1], a, b[2], b[3]);
+        }
+        // Column 2 tig + (e & 1) of tile h is cell base + 8 h + 2 tig + (e & 1); e < 2 is head g, else g + 8.
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                s[h][e] = base + 8 * h + 2 * tig + (e & 1) < n ? s[h][e] * sl2 : -INFINITY;
+        float mx0 = fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1]));
+        float mx1 = fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3]));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float mN0 = fmaxf(mRow[0], mx0), mN1 = fmaxf(mRow[1], mx1);
+        const float c0 = exp2f(mRow[0] - mN0), c1 = exp2f(mRow[1] - mN1);
+        mRow[0] = mN0;
+        mRow[1] = mN1;
+        float pr[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                pr[h][e] = exp2f(s[h][e] - (e < 2 ? mN0 : mN1));
+        float sum0 = pr[0][0] + pr[0][1] + pr[1][0] + pr[1][1];
+        float sum1 = pr[0][2] + pr[0][3] + pr[1][2] + pr[1][3];
+        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
+        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
+        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
+        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
+        lRow[0] = lRow[0] * c0 + sum0;
+        lRow[1] = lRow[1] * c1 + sum1;
+#pragma unroll
+        for (int dt = 0; dt < TS_QSA_HD / 8; ++dt)
+        {
+            o[dt][0] *= c0; o[dt][1] *= c0;
+            o[dt][2] *= c1; o[dt][3] *= c1;
+        }
+        const uint32_t pa[4] = { ts_graph_qsa_pack(pr[0][0], pr[0][1]), ts_graph_qsa_pack(pr[0][2], pr[0][3]),
+                                 ts_graph_qsa_pack(pr[1][0], pr[1][1]), ts_graph_qsa_pack(pr[1][2], pr[1][3]) };
+        __syncwarp();
+        ts_graph_qsa_stage(sm, vc, head, list, base, n, lane);
+        __syncwarp();
+#pragma unroll
+        for (int dt = 0; dt < TS_QSA_HD / 8; dt += 2)
+        {
+            uint32_t b[4];
+            ts_graph_qsa_ldsm_x4_trans(b, &sm[(lane & 7) + ((lane >> 3) & 1) * 8][dt * 8 + (lane >> 4) * 8]);
+            ts_graph_qsa_mma(o[dt], pa, b[0], b[1]);
+            ts_graph_qsa_mma(o[dt + 1], pa, b[2], b[3]);
+        }
+        __syncwarp();
+    }
+
+    // Merge the warps: each scales its output to the block's maximum and adds it in turn.
+    __syncthreads();
+    if (tig == 0)
+    {
+        smM[warp][g] = mRow[0];
+        smM[warp][g + 8] = mRow[1];
+        smL[warp][g] = lRow[0];
+        smL[warp][g + 8] = lRow[1];
+    }
+    __syncthreads();
+    float M0 = -INFINITY, M1 = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < TS_QSA_WARPS; ++w)
+    {
+        M0 = fmaxf(M0, smM[w][g]);
+        M1 = fmaxf(M1, smM[w][g + 8]);
+    }
+    const float f0 = mRow[0] == -INFINITY ? 0.0f : exp2f(mRow[0] - M0);
+    const float f1 = mRow[1] == -INFINITY ? 0.0f : exp2f(mRow[1] - M1);
+    float* smO = reinterpret_cast<float*>(&smKV[0][0][0]);   // [16][TS_QSA_LDS] floats over the staging tiles
+#pragma unroll
+    for (int w = 0; w < TS_QSA_WARPS; ++w)
+    {
+        if (warp == w)
+        {
+#pragma unroll
+            for (int dt = 0; dt < TS_QSA_HD / 8; ++dt)
+            {
+                const int d = dt * 8 + 2 * tig;
+                float2* r0 = reinterpret_cast<float2*>(&smO[g * TS_QSA_LDS + d]);
+                float2* r1 = reinterpret_cast<float2*>(&smO[(g + 8) * TS_QSA_LDS + d]);
+                float2 v0 = make_float2(o[dt][0] * f0, o[dt][1] * f0), v1 = make_float2(o[dt][2] * f1, o[dt][3] * f1);
+                if (w > 0)
+                {
+                    const float2 p0 = *r0, p1 = *r1;
+                    v0.x += p0.x; v0.y += p0.y;
+                    v1.x += p1.x; v1.y += p1.y;
+                }
+                *r0 = v0;
+                *r1 = v1;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 16)
+    {
+        float M = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < TS_QSA_WARPS; ++w)
+            M = fmaxf(M, smM[w][tid]);
+        float L = 0.0f;
+#pragma unroll
+        for (int w = 0; w < TS_QSA_WARPS; ++w)
+            L += smM[w][tid] == -INFINITY ? 0.0f : smL[w][tid] * exp2f(smM[w][tid] - M);
+        smInv[tid] = L > 0.0f ? 1.0f / L : 0.0f;
+    }
+    __syncthreads();
+    for (int u = tid; u < G * TS_QSA_HD; u += blockDim.x)
+    {
+        const int r = u / TS_QSA_HD, d = u % TS_QSA_HD;
+        out[((size_t)t * heads + kvh * G + r) * TS_QSA_HD + d] = smO[r * TS_QSA_LDS + d] * smInv[r];
+    }
+#else
+    (void)q; (void)kc; (void)vc; (void)cells; (void)count; (void)out; (void)cap; (void)heads; (void)kvHeads; (void)scale;
+    (void)cellStride;
+#endif
 }

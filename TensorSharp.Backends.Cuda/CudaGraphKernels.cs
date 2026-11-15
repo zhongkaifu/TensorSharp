@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 25;
+        public const int CurrentVersion = 26;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -103,7 +103,54 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
                 CudaDriverApi.cuDeviceGetAttribute(out _multiprocessors, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
                 TakesQ4kMma = true;
+                // A QSA region's kernels: its prompt attention runs on the tensor cores, and its decode rows on the flash
+                // kernels (sm_80 as well).
+                _qsaScores = module.GetFunction("ts_graph_qsa_scores_f32");
+                _qsaSelect = module.GetFunction("ts_graph_qsa_select_i32");
+                _qsaAttention = module.GetFunction("ts_graph_qsa_attn_mma_f16_d256");
+                TakesQsaAttention = true;
             }
+        }
+
+        /// <summary>Whether this image runs a QSA region's kernels (<see cref="LaunchQsaScores"/>, <see cref="LaunchQsaSelect"/>
+        /// and <see cref="LaunchQsaAttention"/>, whose sm_80 body is in it).</summary>
+        public bool TakesQsaAttention { get; }
+
+        /// <summary>The head width <see cref="LaunchQsaAttention"/> takes, and the query heads of a KV head (the rows of its
+        /// 16-row mma tile).</summary>
+        public const int QsaAttentionHeadDim = 256, QsaAttentionMaxGroup = 16;
+
+        /// <summary>Most cells a row of <see cref="LaunchQsaSelect"/> lists: its picks' whole blocks and its tail block's cells.</summary>
+        public static int QsaCellStride(int picks, int ratio) => picks * ratio + ratio - 1;
+
+        /// <summary>A QSA region's block scores (see the kernel's contract): q [rows][heads][d] F32 (d &lt;= 256), the indexer
+        /// cache's rows <paramref name="cachePitch"/> halves apart with each block's pooled key at offset d of its last member's
+        /// row (F16), the rows' KV indices; out [rows][pools], -inf where a row cannot see the block.</summary>
+        public void LaunchQsaScores(IntPtr q, IntPtr cache, long cachePitch, IntPtr positions, IntPtr output, float weight, int d, int heads,
+            int rows, int pools, int ratio, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &q, &cache, &cachePitch, &positions, &output, &weight, &d, &heads, &pools, &ratio };
+            CudaDriverApi.cuLaunchKernel(_qsaScores, (uint)((pools + 7) / 8), (uint)rows, 1, 256, 1, 1, (uint)(heads * d * 4), stream,
+                (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>A QSA region's selection from its scores [rows][pools]: each row's attended cells, ascending, into
+        /// cells [rows][<paramref name="cellStride"/>] (at least <see cref="QsaCellStride"/>) and their number into count [rows].</summary>
+        public void LaunchQsaSelect(IntPtr scores, IntPtr positions, IntPtr cells, IntPtr count, int rows, int pools, int ratio, int picks,
+            int cellStride, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &scores, &positions, &cells, &count, &pools, &ratio, &picks, &cellStride };
+            CudaDriverApi.cuLaunchKernel(_qsaSelect, (uint)rows, 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>A QSA region's prompt rows over their selected cells on the tensor cores: q [rows][heads][256] F32 (16-byte
+        /// aligned), the head-first F16 caches k, v [kvHeads][cap][256], the cells and counts <see cref="LaunchQsaSelect"/>
+        /// wrote; out [rows][heads][256] F32. heads / kvHeads &lt;= <see cref="QsaAttentionMaxGroup"/>.</summary>
+        public void LaunchQsaAttention(IntPtr q, IntPtr k, IntPtr v, IntPtr cells, IntPtr count, IntPtr output, int cap, int rows, int heads,
+            int kvHeads, float scale, int cellStride, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &q, &k, &v, &cells, &count, &output, &cap, &heads, &kvHeads, &scale, &cellStride };
+            CudaDriverApi.cuLaunchKernel(_qsaAttention, (uint)kvHeads, (uint)rows, 1, 128, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Weight rows of a tile of the tiled Q6_K head layout, and rows of activations one product takes at most.</summary>

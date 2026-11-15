@@ -171,6 +171,17 @@ namespace TensorSharp.Graph
         /// <summary>A MoE layer's output plus its shared expert gated per row: moe + shared * sigmoid(x . w). Inputs: moe and
         /// shared [n, rows], x [n, rows] (the layer's input) and w [n] (ffn_gate_inp_shexp). Result: [n, rows].</summary>
         SharedExpertGate = 12,
+        /// <summary>A sparse attention layer's block selection and its attention, for one sequence over its cache window (Qwen
+        /// 3.8's QSA past its dense budget): the selection's ops (the pooled keys' gather, the lightning indexer, the top-k and
+        /// the top-k mask) and the flash attention under that mask. Block b is cells b R .. b R + R - 1, visible to the row at
+        /// KV index p iff b &lt; (p + 1) / R; its pooled key is the second half of its last member's row of the indexer cache.
+        /// A row attends its <c>picks</c> best visible blocks whole (by score, a tie to the lower block; every visible block
+        /// where there are no more) and its own incomplete tail block's cells up to p. Inputs: the rows' indexer queries
+        /// [idxDim, idxHeads, rows] (rotated), the indexer cache [2 idxDim, capacity], the attention's queries [d, heads, rows],
+        /// the K and V caches [d, capacity, kvHeads] and the rows' KV indices [rows] (the rows the step wrote). Ip: R, picks,
+        /// the window (the keys the mask spans), idxDim, idxHeads, heads, kvHeads, d, the attention's key bound (its kvMax).
+        /// Fp: the attention's scale, the indexer's weight of every head. Result: the attention [d, heads, rows].</summary>
+        QsaAttention = 13,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

@@ -185,6 +185,55 @@ namespace TensorSharp.Models
             return multi;
         }
 
+        /// <summary>Tests: a selecting step's selection and attention run as their ops, not as a
+        /// <see cref="GraphFusion.QsaAttention"/> region.</summary>
+        internal bool QsaRegionDisabledForTests { get; set; }
+
+        /// <summary>The indexer queries the open QsaAttention region read, for the selection's ops inside it.</summary>
+        private (GraphStep Step, int Layer, int Sequence, int Query)? _regionQuery;
+
+        /// <summary>
+        /// A selecting step's selection and attention as one region (<see cref="GraphFusion.QsaAttention"/>), which an executor
+        /// may run as the direct engine's kernels (direct CUDA): the blocks scored against their pooled keys where the cache
+        /// holds them, selected, and the selected cells alone attended. A prompt chunk's ops attend the whole window through a
+        /// widened mask: at 16K about 8x the work of the cells it keeps, and a second 16K prompt ran out of device memory.
+        /// The region reads the indexer queries, emitted before it opens. A step with an attention floor keeps the ops (the
+        /// region's cells are not masked below one), as does a media step (a position table), which the region has not been
+        /// checked on.
+        /// </summary>
+        protected override bool BeginWindowAttention(GraphStep step, int layer, int x, int s, in WindowAttentionOperands attention)
+        {
+            int ratio = QsaRatio(layer);
+            if (ratio <= 0 || step.Starts[s] + step.Counts[s] <= Ple.QsaBudget || step.PositionTable >= 0 || step.AttentionFloor > 0
+                || QsaRegionDisabledForTests)
+                return false;
+            QsaSpec q = Qsa;
+            int pools = (attention.Window + ratio - 1) / ratio;
+            int query = EmitIndexerQuery(step, layer, x, s);
+            _regionQuery = (step, layer, s, query);
+            step.BeginFused(GraphFusion.QsaAttention,
+                stackalloc[] { query, QsaCache(step, layer, s), attention.Queries, attention.KCache, attention.VCache, attention.Rows },
+                stackalloc long[]
+                {
+                    ratio, Math.Min(pools, q.TopK / ratio), attention.Window, q.Dim, q.Heads, attention.Heads, attention.KvHeads,
+                    attention.HeadDim, AttentionKvMax(step, layer, s),
+                },
+                stackalloc[] { attention.Scale, 1f / MathF.Sqrt(q.Dim) });   // the plan's weights: the reference's head sum, scaled
+            return true;
+        }
+
+        /// <summary>Sequence <paramref name="s"/>'s indexer queries [d, heads, count], rotated at the rows' own positions: a
+        /// media step's table (one sequence), else the KV index plus the slot's delta.</summary>
+        private int EmitIndexerQuery(GraphStep step, int layer, int x, int s)
+        {
+            QsaSpec q = Qsa;
+            int count = step.Counts[s];
+            int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);
+            int query = step.MatMul(LayerName(layer, "indexer.q_proj.weight"), step.Cont(xs));                // [d * heads, count]
+            query = step.RmsNorm(step.Reshape(query, q.Dim, q.Heads, count), LayerName(layer, "indexer.q_norm.weight"));
+            return step.PositionTable >= 0 ? step.Rope(query, GraphRotary) : step.RopeAt(query, GraphRotary, step.SequencePositions(s));
+        }
+
         protected override int EmitAttentionMask(GraphStep step, int layer, int x, int s, int mask, int keys)
         {
             int ratio = QsaRatio(layer);
@@ -205,12 +254,11 @@ namespace TensorSharp.Models
             int pooledHalf = step.View2(QsaCache(step, layer, s), d, slot.Capacity, RowBytes(kvType, 2 * d), RowBytes(kvType, d));
             int pooled = step.Reshape(step.Op(GraphOp.GetRows, pooledHalf, plan.PooledRows), d, 1, pools);
 
-            // The rows' indexer queries, scored against every block.
-            int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);
-            int query = step.MatMul(LayerName(layer, "indexer.q_proj.weight"), step.Cont(xs));                // [d * heads, count]
-            query = step.RmsNorm(step.Reshape(query, d, heads, count), LayerName(layer, "indexer.q_norm.weight"));
-            // The rows' own rotary positions: a media step's table (one sequence), else the KV index plus the slot's delta.
-            query = step.PositionTable >= 0 ? step.Rope(query, GraphRotary) : step.RopeAt(query, GraphRotary, step.SequencePositions(s));
+            // The rows' indexer queries (a QsaAttention region's, emitted before it opened), scored against every block.
+            int query = _regionQuery is { } open && ReferenceEquals(open.Step, step) && open.Layer == layer && open.Sequence == s
+                ? open.Query
+                : EmitIndexerQuery(step, layer, x, s);
+            _regionQuery = null;
             int score = step.Op(GraphOp.LightningIndexer, stackalloc[] { query, pooled, plan.Weights, plan.Visible });   // [pools, count]
             int picks = step.Op(GraphOp.TopK, stackalloc[] { score }, stackalloc long[] { Math.Min(pools, q.TopK / ratio) });
             return step.Op(GraphOp.TopKMask, stackalloc[]

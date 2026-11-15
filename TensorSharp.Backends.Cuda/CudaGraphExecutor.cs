@@ -850,6 +850,96 @@ namespace TensorSharp.Cuda
         /// <summary>Selections run as <see cref="TryMoeSelect"/> (tests check the region engaged).</summary>
         internal long MoeSelectRegions { get; private set; }
 
+        /// <summary>
+        /// A QSA layer's selection and attention (<see cref="GraphFusion.QsaAttention"/>) as the direct engine's kernels on the
+        /// runtime's selection: the blocks scored against their pooled keys where the indexer cache holds them (the lightning
+        /// indexer's arithmetic, so the same scores), each row's cells listed on the device (the cells the region's top-k, top-k
+        /// mask and mask listing give, in their order), and the listed cells alone attended. Decode rows and verify windows
+        /// (up to <see cref="CudaDecodeDynParams.WindowRowBlocks"/> rows) run the flash kernel over the cells as the region's
+        /// ops run it (<see cref="TrySparseDecodeAttention"/>, <see cref="TryWindowRowsInOneLaunch"/>: the same splits and
+        /// cells, no mask values added where the kept ones were all 0), so they answer bit for bit as before. A prompt chunk's
+        /// rows run ts_graph_qsa_attn_mma_f16_d256 over at most the budget's cells each, where the ops widened K and V of the
+        /// whole window to F32 and scored every row against all of it under the mask (about 8x the work at 16K, and out of
+        /// memory on a second 16K prompt); F16 products, so its rows round apart from the ops' within F16 tolerance. Every
+        /// launch reads the rows' positions on the device and sizes its grid by the window, so a recorded step replays.
+        /// Declined (the ops run) unless the caches are F16 and 256 wide, the sm_80 kernels are loaded, and a prompt's query
+        /// heads per KV head fit the mma tile.
+        /// </summary>
+        private bool TryQsaAttention(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            CudaGraphKernels kernels = Kernels;
+            if (kernels is not { TakesQsaAttention: true } || inputs.Length < 6 || ip == null || ip.Length < 9 || fp == null || fp.Length < 2
+                || results.Length < 1 || cuda.FlashPrefillKernels is not { } flash)
+                return false;
+            Tensor query = inputs[0], indexCache = inputs[1], q = inputs[2], rows = inputs[5];
+            int ratio = (int)ip[0], picks = (int)ip[1], window = (int)ip[2], idxDim = (int)ip[3], idxHeads = (int)ip[4];
+            int heads = (int)ip[5], kvHeads = (int)ip[6], d = (int)ip[7], kvMax = (int)ip[8];
+            float scale = fp[0], weight = fp[1];
+            if (!DeviceInts(rows) || !AllF32OnDevice(query, q) || !query.IsContiguous() || !q.IsContiguous()) return false;
+            long n = rows.ElementCount();
+            // The kernels' grids take the rows on y (at most 65,535).
+            if (n < 1 || n > ushort.MaxValue || ratio < 1 || picks < 1 || window < 1 || kvHeads < 1 || heads % kvHeads != 0
+                || d != CudaGraphKernels.QsaAttentionHeadDim || !flash.RunsAttention(d) || idxDim < 1 || idxDim > 256
+                || (long)idxHeads * idxDim > CudaGraphKernels.LightningIndexerMaxQ
+                || query.ElementCount() != n * idxHeads * idxDim || q.ElementCount() != n * heads * d)
+                return false;
+            if (indexCache.Storage is not CudaStorage || indexCache.ElementType != DType.Float16 || !indexCache.IsContiguous()
+                || indexCache.ElementCount() % (2L * idxDim) != 0 || indexCache.ElementCount() / (2L * idxDim) < window)
+                return false;
+            using Tensor kc = HeadFirst(inputs[3]), vc = HeadFirst(inputs[4]);
+            if (kc.Storage is not CudaStorage || vc.Storage is not CudaStorage || kc.ElementType != DType.Float16 || vc.ElementType != DType.Float16
+                || !kc.IsContiguous() || !vc.IsContiguous() || kc.DimensionCount != 3 || vc.DimensionCount != 3 || kc.Sizes[0] != kvHeads
+                || vc.Sizes[0] != kvHeads || kc.Sizes[2] != d || vc.Sizes[2] != d || kc.Sizes[1] != vc.Sizes[1] || kc.Sizes[1] < window
+                || kc.Sizes[1] > int.MaxValue)
+                return false;
+            int count = (int)n, group = heads / kvHeads, cap = (int)kc.Sizes[1];
+            bool prompt = count > CudaDecodeDynParams.WindowRowBlocks;
+            // The mma kernel's vector loads: 16-byte aligned queries and cache rows.
+            if (prompt && (group > CudaGraphKernels.QsaAttentionMaxGroup || ((long)Ptr(q) & 15) != 0 || ((long)Ptr(kc) & 15) != 0
+                || ((long)Ptr(vc) & 15) != 0))
+                return false;
+            int pools = (window + ratio - 1) / ratio, stride = CudaGraphKernels.QsaCellStride(picks, ratio);
+            using var scores = new Tensor(Allocator, DType.Float32, count, pools);
+            using var cells = new Tensor(Allocator, DType.Int32, count, stride);
+            using var cellCount = new Tensor(Allocator, DType.Int32, count);
+            // The indexer cache's [raw | pooled] rows, 2 idxDim halves apart: the kernel reads each block's pooled half.
+            Launch(new[] { query, indexCache, rows }, scores, (k, stream) => k.LaunchQsaScores(Ptr(query), Ptr(indexCache), 2L * idxDim, Ptr(rows),
+                Ptr(scores), weight, idxDim, idxHeads, count, pools, ratio, stream));
+            Launch(new[] { scores, rows }, new[] { cells, cellCount }, (k, stream) => k.LaunchQsaSelect(Ptr(scores), Ptr(rows), Ptr(cells),
+                Ptr(cellCount), count, pools, ratio, picks, stride, stream));
+            var output = new Tensor(Allocator, DType.Float32, count, heads, d);
+            if (prompt)
+            {
+                Launch(new[] { q, kc, vc, cells, cellCount }, output, (k, stream) => k.LaunchQsaAttention(Ptr(q), Ptr(kc), Ptr(vc), Ptr(cells),
+                    Ptr(cellCount), Ptr(output), cap, count, heads, kvHeads, scale, stride, stream));
+            }
+            else
+            {
+                // The splits the ops' flash path takes over the mask's window, bounded by the selection's width.
+                int splits = flash.Splits(group, kvHeads, kvMax > 0 ? Math.Min(kvMax, window) : window);
+                using Tensor partial = splits > 1
+                    ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(count, heads, d, splits)) : null;
+                Tensor[] written = partial == null ? new[] { output } : new[] { output, partial };
+                IntPtr partialPtr = partial == null ? IntPtr.Zero : Ptr(partial);
+                Launch(new[] { q, kc, vc, cells, cellCount }, written, (_, stream) =>
+                {
+                    if (count == 1)
+                        flash.LaunchAttention(Ptr(q), Ptr(kc), Ptr(vc), cap, 1, window, 0, heads, kvHeads, d, scale, splits, partialPtr,
+                            Ptr(output), stream, IntPtr.Zero, Ptr(cells), Ptr(cellCount));
+                    else
+                        flash.LaunchDecodeRows(Ptr(q), Ptr(kc), Ptr(vc), cap, count, window, 0, heads, kvHeads, d, scale, splits, partialPtr,
+                            Ptr(output), stream, IntPtr.Zero, Ptr(cells), Ptr(cellCount), IntPtr.Zero, stride);
+                });
+            }
+            results[0] = output;
+            QsaAttentionRegions++;
+            return true;
+        }
+
+        /// <summary>QSA selections and attentions run as <see cref="TryQsaAttention"/> (tests check the region engaged).</summary>
+        internal long QsaAttentionRegions { get; private set; }
+
         /// <summary>A hyper-connection scatter (<see cref="GraphFusion.HcScatter"/>) as one pass over the streams.</summary>
         private bool TryHcScatter(Tensor[] inputs, long[] ip, Tensor[] results)
         {
@@ -1003,6 +1093,7 @@ namespace TensorSharp.Cuda
             GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.HcRead or GraphFusion.HcScatter
                 or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
+            GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
             _ => false,
         };
 
@@ -1017,6 +1108,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.HcRead) return TryHcRead(inputs, weights, ip, fp, results);
             if (kind == GraphFusion.HcScatter) return TryHcScatter(inputs, ip, results);
             if (kind == GraphFusion.MoeSelect) return TryMoeSelect(inputs, ip, results);
+            if (kind == GraphFusion.QsaAttention) return TryQsaAttention(inputs, ip, fp, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;

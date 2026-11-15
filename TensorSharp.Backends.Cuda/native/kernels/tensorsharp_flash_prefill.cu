@@ -27,7 +27,7 @@
 // so the committed compute_75 PTX carries working kernels.
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 5
+#define TS_FLASH_PREFILL_VERSION 6
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -59,7 +59,8 @@ extern "C" __global__ void ts_flash_prefill_caps(int* out)
 // query rows over a long window): block x = (row tile, key split), each split takes a 32-key-aligned share of its
 // rows' keys and writes unnormalized partials (acc, ln-domain max, sum) that ts_flash_prefill_combine_f32 merges.
 // With cells set (one decode row, nq = 1: a sparse attention's selection) the keys are the listed cache rows
-// cells[0 .. cellCount[0]) instead of 0..len-1, each with its mask value cellMask[cell] added (len and floor unused).
+// cells[0 .. cellCount[0]) instead of 0..len-1, each with its mask value cellMask[cell] added (len and floor unused);
+// without cellMask (a selection whose kept cells all hold 0: QSA's) nothing is added, the same sums.
 // sm_80+ (cp.async, ldmatrix, mma.f16): the compute_75 image traps here; the host launches it only where
 // CudaPrefillModule.ArchGuardedKernelsUsable holds.
 // ---------------------------------------------------------------------------
@@ -269,7 +270,7 @@ __device__ __forceinline__ void ts_fp_attn(
         {
             const int key = first + j * 8 + qd * 2;
             float mk0 = 0.0f, mk1 = 0.0f;   // a listed cell's mask value (log2 units)
-            if (cells != nullptr)
+            if (cells != nullptr && cellMask != nullptr)
             {
                 mk0 = key < kHi ? cellMask[cells[key]] * 1.4426950408889634f : 0.0f;
                 mk1 = key + 1 < kHi ? cellMask[cells[key + 1]] * 1.4426950408889634f : 0.0f;
@@ -406,7 +407,7 @@ TS_FP_ATTN(256)
 // code as ts_flash_prefill_f16_d<hd> with nq = 1, so a row's sums are the decode row's bit for bit.
 //   q, out  [rows][nHead][HD] F32;  partial  rows x nHead x splits x (HD + 2) floats (combined over rows * nHead).
 // With cells (a sparse attention's selection): row z's keys are cells[z * cellStride ..], cellCount[z] of them, each with
-// its value in the mask row cellMask[z * cellStride ..] added (len and floor unused).
+// its value in the mask row cellMask[z * cellStride ..] added (len and floor unused; none without cellMask).
 // Launch: grid (row tiles * splits, nKv, rows), block 256, the dynamic shared memory of ts_flash_prefill_f16_d<hd>.
 #define TS_FP_ATTN_ROWS(HD) \
     extern "C" __global__ void __launch_bounds__(256) ts_flash_decode_rows_f16_d##HD( \
@@ -421,7 +422,7 @@ TS_FP_ATTN(256)
         ts_fp_attn<HD>(q + at, kc, vc, cap, 1, (dyn != nullptr ? dyn[0] : len) - (rows - 1 - z), floor, nHead, nKv, scale, \
             splits, partial != nullptr ? partial + (long long)z * nHead * splits * (HD + 2) : nullptr, out + at, nullptr, \
             listed ? cells + (long long)z * cellStride : nullptr, listed ? cellCount + z : nullptr, \
-            listed ? cellMask + (long long)z * cellStride : nullptr); \
+            listed && cellMask != nullptr ? cellMask + (long long)z * cellStride : nullptr); \
     }
 
 TS_FP_ATTN_ROWS(128)

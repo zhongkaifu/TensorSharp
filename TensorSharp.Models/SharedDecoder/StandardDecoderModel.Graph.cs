@@ -1915,6 +1915,18 @@ namespace TensorSharp.Models
         /// its mask (a selection's width), so the backend may attend only those; 0 for none.</summary>
         protected virtual int AttentionKvMax(GraphStep step, int layer, int s) => 0;
 
+        /// <summary>One sequence's attention operands over its cache window: its rows' queries [d, heads, rows] (rotated, before
+        /// the permute the attention takes), the K and V caches [d, capacity, kvHeads], the rows the step wrote them at (I64
+        /// [rows]: their KV indices), the window's keys, the local heads and KV heads, the head width and the scale.</summary>
+        protected readonly record struct WindowAttentionOperands(int Queries, int KCache, int VCache, int Rows, int Window, int Heads, int KvHeads,
+            int HeadDim, float Scale);
+
+        /// <summary>Open a fused region around sequence <paramref name="s"/>'s mask and attention over its cache window in
+        /// <paramref name="layer"/>: <see cref="EmitAttentionMask"/>'s ops and the attention follow, and the attention's
+        /// result closes it. A family whose mask an executor may run with the attention as its own kernels opens one (Qwen
+        /// 3.8's QSA selection), what the region reads from outside it emitted before it opens; default none.</summary>
+        protected virtual bool BeginWindowAttention(GraphStep step, int layer, int x, int s, in WindowAttentionOperands attention) => false;
+
         private int EmitAttention(GraphStep step, int layer, int x)
         {
             EmitAttentionInput(step, layer, x);
@@ -1987,8 +1999,10 @@ namespace TensorSharp.Models
                     int gqa = heads / kvHeads;
                     int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, window, kvType, count, gqa });
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, window, kvType, count, gqa });
+                    bool region = BeginWindowAttention(step, layer, x, s, new WindowAttentionOperands(qs, ck, cv, rowsAt, window, heads, kvHeads, d, scale));
                     fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, step.ChunkMask(window, start, count), window), scale,
                         AttentionKvMax(step, layer, s));
+                    if (region) step.EndFused(stackalloc[] { fa });
                 }
                 else
                 {
