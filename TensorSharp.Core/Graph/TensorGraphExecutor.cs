@@ -370,6 +370,36 @@ namespace TensorSharp.Graph
             public static readonly AttentionMask None = new(MaskPattern.None, 0, null);
         }
 
+        /// <summary>F16 host values widened to F32 (exactly) with the vectorized conversion: a prompt chunk's causal mask is
+        /// millions of values (1,565 x 3,613 for the second chunk of a 3.6K-token prompt), widened one at a time in 10-20 ms
+        /// of the step's emission while the device ran out of queued work.</summary>
+        private static unsafe float[] WidenF16(System.Half* src, long count)
+        {
+            var values = new float[count];
+            for (long done = 0; done < count;)
+            {
+                int n = (int)Math.Min(count - done, int.MaxValue);
+                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(new ReadOnlySpan<System.Half>(src + done, n), values.AsSpan((int)done, n));
+                done += n;
+            }
+            return values;
+        }
+
+        /// <summary>Every value of <paramref name="s"/> equals zero (either sign): the bits compared vectorized, a value not
+        /// +0 rechecked as a float.</summary>
+        private static bool AllZero(ReadOnlySpan<float> s)
+        {
+            int i = System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(s).IndexOfAnyExcept(0);
+            if (i < 0) return true;
+            for (; i < s.Length; i++)
+                if (s[i] != 0f) return false;
+            return true;
+        }
+
+        /// <summary>Every value of <paramref name="s"/> is -inf (one bit pattern), compared vectorized.</summary>
+        private static bool AllNegativeInfinity(ReadOnlySpan<float> s)
+            => System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(s).IndexOfAnyExcept(BitConverter.SingleToInt32Bits(float.NegativeInfinity)) < 0;
+
         private static AttentionMask Classify(Func<Tensor> mask, float[] host, long rows, long keys)
         {
             if (mask == null) return AttentionMask.None;
@@ -392,16 +422,17 @@ namespace TensorSharp.Graph
                 if (!all) break;
                 valid--;
             }
+            // Row by row, vectorized (a prompt chunk's mask is millions of values): keys [floor, valid) all zero for None;
+            // for Causal those up to the last key the row sees (valid - rows + r) zero, the rest -inf.
             bool none = true, causal = true;
             for (long r = 0; r < rows && (none || causal); r++)
             {
-                long last = valid - rows + r;   // the last key row r sees when causal
-                for (long c = floor; c < valid; c++)
-                {
-                    float m = host[r * keys + c];
-                    none &= m == 0f;
-                    causal &= c <= last ? m == 0f : float.IsNegativeInfinity(m);
-                }
+                long open = Math.Min(Math.Max(valid - rows + r + 1, floor), valid);
+                ReadOnlySpan<float> seen = host.AsSpan((int)(r * keys + floor), (int)(open - floor));
+                ReadOnlySpan<float> past = host.AsSpan((int)(r * keys + open), (int)(valid - open));
+                bool seenZero = AllZero(seen);
+                none = none && seenZero && AllZero(past);
+                causal = causal && seenZero && AllNegativeInfinity(past);
             }
             MaskPattern pattern = none ? MaskPattern.None : causal ? MaskPattern.Causal : MaskPattern.Explicit;
             int trimmedFloor = pattern == MaskPattern.Explicit ? 0 : floor;
@@ -1273,13 +1304,7 @@ namespace TensorSharp.Graph
                     fixed (float* dst = values) Buffer.MemoryCopy((void*)data, dst, count * 4L, Math.Min(bytes, count * 4L));
                     return new Value { Floats = values, HostSizes = sizes };
                 }
-                case GraphFormat.F16:
-                {
-                    var values = new float[count];
-                    var src = (System.Half*)data;
-                    for (long i = 0; i < count; i++) values[i] = (float)src[i];
-                    return new Value { Floats = values, HostSizes = sizes };
-                }
+                case GraphFormat.F16: return new Value { Floats = WidenF16((System.Half*)data, count), HostSizes = sizes };
                 case GraphFormat.I32:
                 case GraphFormat.I64:
                 {
@@ -1389,13 +1414,7 @@ namespace TensorSharp.Graph
                     fixed (float* dst = values) Buffer.MemoryCopy((void*)data, dst, count * 4L, Math.Min(bytes, count * 4L));
                     return HostFloats(values, sizes, run);
                 }
-                case GraphFormat.F16:
-                {
-                    var values = new float[count];
-                    var src = (System.Half*)data;
-                    for (long i = 0; i < count; i++) values[i] = (float)src[i];
-                    return HostFloats(values, sizes, run);
-                }
+                case GraphFormat.F16: return HostFloats(WidenF16((System.Half*)data, count), sizes, run);
                 case GraphFormat.I32:
                 case GraphFormat.I64:
                 {
