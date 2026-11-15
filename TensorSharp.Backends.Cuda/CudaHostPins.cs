@@ -29,7 +29,7 @@ namespace TensorSharp.Cuda
         private const long Page = 4096;
         private static readonly object Sync = new();
         // Disjoint, sorted by start (so by end too): found by binary search, as a host's experts pin as thousands of runs.
-        private static readonly SortedList<long, (long End, CudaHostPins Owner)> Ranges = new();
+        private static readonly SortedList<long, (long End, CudaHostPins Owner, bool Mapped)> Ranges = new();
         private static readonly long Budget = Math.Max(0, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / 10 * 6);
         // What a planner allowed beyond the budget (Allow): the host memory it measured free for the locks.
         private static long _allowed;
@@ -78,8 +78,17 @@ namespace TensorSharp.Cuda
                 foreach ((long s, long e) in gaps)
                 {
                     if (_pinned + (e - s) > Limit) { all = false; continue; }
+                    // Mapped into the device's address space as well, so a kernel can read an expert where it lies (DevicePointer);
+                    // a driver that refuses the mapping still locks the pages for copies.
+                    bool mapped = true;
                     int rc = CudaDriverApi.cuMemHostRegister(new IntPtr(s), new UIntPtr((ulong)(e - s)),
-                        CudaDriverApi.CU_MEMHOSTREGISTER_PORTABLE | CudaDriverApi.CU_MEMHOSTREGISTER_READ_ONLY);
+                        CudaDriverApi.CU_MEMHOSTREGISTER_PORTABLE | CudaDriverApi.CU_MEMHOSTREGISTER_READ_ONLY | CudaDriverApi.CU_MEMHOSTREGISTER_DEVICEMAP);
+                    if (rc != 0)
+                    {
+                        mapped = false;
+                        rc = CudaDriverApi.cuMemHostRegister(new IntPtr(s), new UIntPtr((ulong)(e - s)),
+                            CudaDriverApi.CU_MEMHOSTREGISTER_PORTABLE | CudaDriverApi.CU_MEMHOSTREGISTER_READ_ONLY);
+                    }
                     if (rc != 0)
                     {
                         // A platform or driver that will not register mapped file pages: stay pageable from now on.
@@ -88,7 +97,7 @@ namespace TensorSharp.Cuda
                         _refused = true;
                         return false;
                     }
-                    Ranges[s] = (e, this);
+                    Ranges[s] = (e, this, mapped);
                     _pinned += e - s;
                     OwnBytes += e - s;
                 }
@@ -127,6 +136,31 @@ namespace TensorSharp.Cuda
                 at = cut;
             }
             return 0;
+        }
+
+        /// <summary>
+        /// The device's address of [<paramref name="host"/>, + <paramref name="bytes"/>) for a kernel to read in place, or zero:
+        /// every byte must lie in registrations mapped into the device's address space, which unified addressing places at the
+        /// host's own addresses (a range across registrations is then contiguous on the device as well). Only an expert wholly
+        /// covered may be read so: one that began in the last page of a neighbour's lock and ran on into unlocked pages had
+        /// faulted (CUDA error 700) when its first byte alone was checked.
+        /// </summary>
+        public static IntPtr DevicePointer(IntPtr host, long bytes)
+        {
+            if (host == IntPtr.Zero || bytes <= 0) return IntPtr.Zero;
+            long at = host.ToInt64(), end = at + bytes;
+            lock (Sync)
+            {
+                for (int i = FirstEndingAfter(at); i < Ranges.Count && at < end; i++)
+                {
+                    long s = Ranges.Keys[i];
+                    var (rEnd, _, mapped) = Ranges.Values[i];
+                    if (s > at || !mapped) return IntPtr.Zero;
+                    at = rEnd;
+                }
+                if (at < end) return IntPtr.Zero;
+            }
+            return CudaDriverApi.cuMemHostGetDevicePointer(out IntPtr device, host, 0) == 0 && device == host ? device : IntPtr.Zero;
         }
 
         /// <summary>The index of the first registered range ending past <paramref name="at"/> (Count if none); under the lock.</summary>

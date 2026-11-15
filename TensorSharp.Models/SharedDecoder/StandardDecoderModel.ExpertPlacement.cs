@@ -215,6 +215,9 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>Tests: the background warm and page locks done (TS_HOST_WARM_WAIT's wait, without the process setting).</summary>
+        internal void WaitHostWarmForTests() => _hostWarm?.Wait();
+
         private void StopHostWarm()
         {
             if (_hostWarmCancel == null) return;
@@ -243,10 +246,13 @@ namespace TensorSharp.Models
         private List<(IntPtr Pointer, long Bytes)> HostExpertRuns()
         {
             var runs = new List<(IntPtr, long)>();
-            if (IsGgmlBackend || _expertOnHost == null) return runs;
+            if (IsGgmlBackend) return runs;
+            // The plan's layers, or an explicit --cpu-moe's (the plan is then left empty): the locks had covered only the
+            // planned ones, so an explicit offload staged every prompt's experts through pageable copies and the device
+            // could stage none of a step's misses.
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (!_expertOnHost[l] || !TryGetLayerExperts(l, out var gate, out var up, out var down)) continue;
+                if (!IsExpertLayerOffloaded(l) || !TryGetLayerExperts(l, out var gate, out var up, out var down)) continue;
                 var held = new HashSet<int>(_tierExperts?[l] ?? Array.Empty<int>());
                 foreach (StackedExpertWeights w in new[] { gate, up, down })
                 {

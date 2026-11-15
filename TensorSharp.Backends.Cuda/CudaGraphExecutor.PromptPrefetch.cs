@@ -134,7 +134,7 @@ namespace TensorSharp.Cuda
             var list = new List<int>();
             for (int e = 0; e < t.Experts; e++)
             {
-                if (t.Mask[e] != 0) continue;
+                if (t.Mask[e] == 1) continue;   // (2: a host expert the device may also read in place)
                 for (int m = 0; m < 3; m++)
                     if (HostBytes(t.Sets[m], e) == IntPtr.Zero) return false;
                 list.Add(e);

@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 20;
+        public const int CurrentVersion = 21;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm, _repackQ6kTiled;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm, _repackQ6kTiled;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
 
@@ -59,6 +59,7 @@ namespace TensorSharp.Cuda
             _f32ToF16 = module.GetFunction("ts_graph_f32_to_f16");
             _routeSplit = module.GetFunction("ts_graph_moe_route_split");
             _waitAdd = module.GetFunction("ts_graph_moe_wait_add");
+            _stageCopy = module.GetFunction("ts_graph_moe_stage_copy");
             CudaDriverApi.cuFuncSetAttribute(_topk, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, TopKMaxColumns * 4).ThrowOnError();
             _ssmConv = module.GetFunction("ts_graph_ssm_conv_f32");
             _deltaNetPrep = module.GetFunction("ts_graph_deltanet_prep_f32");
@@ -289,25 +290,67 @@ namespace TensorSharp.Cuda
                 IntPtr.Zero).ThrowOnError();
         }
 
-        /// <summary>A layer's routes split between the device (its tier: <paramref name="onDevice"/>[e] != 0) and the host
+        /// <summary>A layer's routes split between the device (its tier: <paramref name="onDevice"/>[e] == 1, and up to
+        /// <paramref name="gpuMisses"/> distinct experts the host holds where the device can read them: onDevice[e] == 2) and the host
         /// (less those at <paramref name="tailRank"/> or lower that no row routes higher: the route-tail skip, 0 off), for
         /// <paramref name="rows"/> rows of <paramref name="perRow"/> routes, each counted in <paramref name="counts"/> (per expert):
         /// the device's into <paramref name="devSel"/> (-1 for a host route); when any route is the host's, the input and
         /// routes published to <paramref name="box"/> and its counter advanced (<paramref name="missDev"/> says which).</summary>
         public void LaunchMoeRouteSplit(IntPtr x, IntPtr sel, IntPtr selW, IntPtr onDevice, int n, int rows, int perRow, int layer,
-            int tailRank, IntPtr devSel, IntPtr counts, CudaHostExpertMailbox box, IntPtr missDev, IntPtr stream)
+            int tailRank, IntPtr devSel, IntPtr counts, CudaHostExpertMailbox box, IntPtr missDev, IntPtr stream, in MoeStaging staging = default)
         {
             IntPtr xOut = box.XDev, idsOut = box.IdsDev, wOut = box.WDev, hdr = box.HeaderDev, seq = box.SeqDev;
-            void** args = stackalloc void*[] { &x, &sel, &selW, &onDevice, &n, &rows, &perRow, &layer, &tailRank, &devSel, &counts, &xOut, &idsOut, &wOut, &hdr, &seq, &missDev };
+            int gpuMisses = staging.Capacity;
+            IntPtr tg = staging.Gate, tu = staging.Up, td = staging.Down, list = staging.List, count = staging.Count;
+            ulong slots = (ulong)staging.Slots.ToInt64();
+            long stride = staging.Stride, offUp = staging.OffUp, offDown = staging.OffDown;
+            void** args = stackalloc void*[] { &x, &sel, &selW, &onDevice, &n, &rows, &perRow, &layer, &tailRank, &devSel, &counts, &xOut, &idsOut, &wOut,
+                &hdr, &seq, &missDev, &gpuMisses, &tg, &tu, &td, &slots, &stride, &offUp, &offDown, &list, &count };
             CudaDriverApi.cuLaunchKernel(_routeSplit, 1, 1, 1, 1024, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
+        /// <summary>A layer's staging of host experts for its device kernels (<see cref="LaunchMoeRouteSplit"/>): the tables
+        /// the split points at the slots and their resting entries (Src*), the slots, and the plan (List, Count). Capacity 0:
+        /// the host computes every miss.</summary>
+        public readonly struct MoeStaging
+        {
+            public int Capacity { get; init; }
+            public IntPtr Gate { get; init; }
+            public IntPtr Up { get; init; }
+            public IntPtr Down { get; init; }
+            public IntPtr SrcGate { get; init; }
+            public IntPtr SrcUp { get; init; }
+            public IntPtr SrcDown { get; init; }
+            public IntPtr Slots { get; init; }
+            public long Stride { get; init; }
+            public long OffUp { get; init; }
+            public long OffDown { get; init; }
+            public long BytesGate { get; init; }
+            public long BytesUp { get; init; }
+            public long BytesDown { get; init; }
+            public IntPtr List { get; init; }
+            public IntPtr Count { get; init; }
+        }
+
+        /// <summary>The staged experts' bytes into their slots over the link (<see cref="MoeStaging"/>).</summary>
+        public void LaunchMoeStageCopy(in MoeStaging staging, IntPtr stream)
+        {
+            const int chunks = 16;
+            IntPtr list = staging.List, count = staging.Count, sg = staging.SrcGate, su = staging.SrcUp, sd = staging.SrcDown, slots = staging.Slots;
+            long bg = staging.BytesGate, bu = staging.BytesUp, bd = staging.BytesDown, stride = staging.Stride, offUp = staging.OffUp, offDown = staging.OffDown;
+            int c = chunks;
+            void** args = stackalloc void*[] { &list, &count, &sg, &su, &sd, &bg, &bu, &bd, &slots, &stride, &offUp, &offDown, &c };
+            CudaDriverApi.cuLaunchKernel(_stageCopy, (uint)(staging.Capacity * chunks), 3, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
         /// <summary>Wait for the host's answer to the layer's doorbell (when one rang) and add its sum into
-        /// <paramref name="dst"/> (<paramref name="n"/> floats).</summary>
-        public void LaunchMoeWaitAdd(CudaHostExpertMailbox box, IntPtr dst, int n, IntPtr missDev, IntPtr stream)
+        /// <paramref name="dst"/> (<paramref name="n"/> floats); with a staging, its experts' table entries restored first.</summary>
+        public void LaunchMoeWaitAdd(CudaHostExpertMailbox box, IntPtr dst, int n, IntPtr missDev, IntPtr stream, in MoeStaging staging = default)
         {
             IntPtr flag = box.FlagDev, seq = box.SeqDev, count = box.CountDev, outDev = box.OutDev;
-            void** args = stackalloc void*[] { &flag, &seq, &count, &outDev, &dst, &n, &missDev };
+            IntPtr list = staging.Capacity > 0 ? staging.List : IntPtr.Zero, staged = staging.Count;
+            IntPtr tg = staging.Gate, tu = staging.Up, td = staging.Down, sg = staging.SrcGate, su = staging.SrcUp, sd = staging.SrcDown;
+            void** args = stackalloc void*[] { &flag, &seq, &count, &outDev, &dst, &n, &missDev, &list, &staged, &tg, &tu, &td, &sg, &su, &sd };
             CudaDriverApi.cuLaunchKernel(_waitAdd, (uint)Math.Min(16, Math.Max(1, (n + 255) / 256)), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();
         }

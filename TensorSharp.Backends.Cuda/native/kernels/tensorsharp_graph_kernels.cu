@@ -12,7 +12,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#define TS_GRAPH_KERNELS_VERSION 20
+#define TS_GRAPH_KERNELS_VERSION 21
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -689,19 +689,58 @@ __device__ __forceinline__ bool ts_graph_tail_dropped(const int* __restrict__ se
     return true;
 }
 
+// onDevice[e]: 1 the device tier holds expert e, 2 the host does but its bytes are mapped into the device's address space,
+// 0 the host alone can read it. Up to gpuMisses distinct experts of the 2s among the call's host routes (the first in slot
+// order; the tail skip's leave none) are the device's too (the Qwen3.8 engines' hybrid misses): each gets staging slot k
+// (stageList[k], *stageCount), its table entries point there, ts_graph_moe_stage_copy brings its bytes over the link with
+// coalesced loads (the expert kernels' own row reads over the link are small scattered transactions), and
+// ts_graph_moe_wait_add restores the entries; a layer whose misses they all are rings nothing.
+#define TS_GRAPH_MAX_GPU_MISSES 16
 extern "C" __global__ void ts_graph_moe_route_split(
     const float* __restrict__ x, const int* __restrict__ sel, const float* __restrict__ selW,
     const unsigned char* __restrict__ onDevice, int n, int rows, int perRow, int layer, int tailRank, int* __restrict__ devSel,
-    unsigned int* __restrict__ counts, float* xOut, int* idsOut, float* wOut, int* hdr, unsigned int* seq, int* missDev)
+    unsigned int* __restrict__ counts, float* xOut, int* idsOut, float* wOut, int* hdr, unsigned int* seq, int* missDev,
+    int gpuMisses, unsigned long long* __restrict__ tabGate, unsigned long long* __restrict__ tabUp,
+    unsigned long long* __restrict__ tabDown, unsigned long long staging, long long stride, long long offUp, long long offDown,
+    int* __restrict__ stageList, int* __restrict__ stageCount)
 {
     // rows of perRow routes each, a route's rank its slot in its row; every route counted for the routing profile.
     const int slots = rows * perRow;
+    __shared__ int taken[TS_GRAPH_MAX_GPU_MISSES];
+    __shared__ int takenCount;
+    if (threadIdx.x == 0)
+    {
+        int c = 0;
+        const int cap = min(gpuMisses, TS_GRAPH_MAX_GPU_MISSES);
+        for (int i = 0; i < slots && c < cap; i++)
+        {
+            const int e = sel[i];
+            if (e < 0 || onDevice[e] != 2 || ts_graph_tail_dropped(sel, slots, perRow, i, tailRank)) continue;
+            bool seen = false;
+            for (int j = 0; j < c; j++) seen |= taken[j] == e;
+            if (!seen) taken[c++] = e;
+        }
+        for (int j = 0; j < c; j++)
+        {
+            const int e = taken[j];
+            const unsigned long long base = staging + (unsigned long long)j * (unsigned long long)stride;
+            tabGate[e] = base;
+            tabUp[e] = base + (unsigned long long)offUp;
+            tabDown[e] = base + (unsigned long long)offDown;
+            stageList[j] = e;
+        }
+        if (stageCount != nullptr) *stageCount = c;
+        takenCount = c;
+    }
+    __syncthreads();
     int miss = 0;
     for (int i = threadIdx.x; i < slots; i += blockDim.x)
     {
         const int e = sel[i];
         if (e >= 0 && counts != nullptr) atomicAdd(&counts[e], 1u);
-        const bool device = e >= 0 && onDevice[e];
+        bool device = e >= 0 && onDevice[e] == 1;
+        if (e >= 0 && !device && onDevice[e] == 2)
+            for (int j = 0; j < takenCount; j++) device |= taken[j] == e;
         devSel[i] = device ? e : -1;
         if (e >= 0 && !device && !ts_graph_tail_dropped(sel, slots, perRow, i, tailRank))
             miss = 1;
@@ -716,7 +755,7 @@ extern "C" __global__ void ts_graph_moe_route_split(
     for (int i = threadIdx.x; i < slots; i += blockDim.x)
     {
         const int e = sel[i];
-        idsOut[i] = e >= 0 && (onDevice[e] || ts_graph_tail_dropped(sel, slots, perRow, i, tailRank)) ? -(e + 2) : e;
+        idsOut[i] = e >= 0 && (devSel[i] >= 0 || ts_graph_tail_dropped(sel, slots, perRow, i, tailRank)) ? -(e + 2) : e;
         wOut[i] = selW[i];
     }
     for (int i = threadIdx.x; i < rows * n; i += blockDim.x)
@@ -736,12 +775,48 @@ extern "C" __global__ void ts_graph_moe_route_split(
     }
 }
 
+// The experts ts_graph_moe_route_split staged: their bytes from the host's (device-mapped) memory into their slots with
+// coalesced 16-byte loads. grid (capacity * chunks, 3 matrices); every byte count and address is 16-byte aligned.
+extern "C" __global__ void ts_graph_moe_stage_copy(const int* __restrict__ stageList, const int* __restrict__ stageCount,
+    const unsigned long long* __restrict__ srcGate, const unsigned long long* __restrict__ srcUp,
+    const unsigned long long* __restrict__ srcDown, long long bytesGate, long long bytesUp, long long bytesDown,
+    unsigned char* __restrict__ staging, long long stride, long long offUp, long long offDown, int chunks)
+{
+    const int k = blockIdx.x / chunks;
+    if (k >= *stageCount) return;
+    const int e = stageList[k], part = blockIdx.y;
+    const long long bytes = part == 0 ? bytesGate : part == 1 ? bytesUp : bytesDown;
+    const uint4* src = reinterpret_cast<const uint4*>(part == 0 ? srcGate[e] : part == 1 ? srcUp[e] : srcDown[e]);
+    uint4* dst = reinterpret_cast<uint4*>(staging + (size_t)k * (size_t)stride + (part == 0 ? 0 : part == 1 ? offUp : offDown));
+    const long long units = bytes / 16, per = (units + chunks - 1) / chunks;
+    const long long begin = (long long)(blockIdx.x % chunks) * per, end = min(units, begin + per);
+    for (long long u = begin + threadIdx.x; u < end; u += blockDim.x)
+        dst[u] = src[u];
+}
+
 // Every block waits for the host's flag to reach the counter, then adds its part of the host's sum (missDev 0: nothing
-// was rung; count 0: the host had nothing to add).
+// was rung; count 0: the host had nothing to add). With stageList, block 0 first points the staged experts' table entries
+// back at their resting places (src*) and clears the count (the expert kernels that read the staging ran before).
 extern "C" __global__ void ts_graph_moe_wait_add(const unsigned int* flag, const unsigned int* seq, const int* count,
-    const float* hostOut, float* __restrict__ dst, int n, const int* missDev)
+    const float* hostOut, float* __restrict__ dst, int n, const int* missDev, const int* __restrict__ stageList,
+    int* __restrict__ stageCount, unsigned long long* __restrict__ tabGate, unsigned long long* __restrict__ tabUp,
+    unsigned long long* __restrict__ tabDown, const unsigned long long* __restrict__ srcGate,
+    const unsigned long long* __restrict__ srcUp, const unsigned long long* __restrict__ srcDown)
 {
     __shared__ int add;
+    if (stageList != nullptr && blockIdx.x == 0)
+    {
+        const int staged = *stageCount;
+        for (int i = threadIdx.x; i < staged; i += blockDim.x)
+        {
+            const int e = stageList[i];
+            tabGate[e] = srcGate[e];
+            tabUp[e] = srcUp[e];
+            tabDown[e] = srcDown[e];
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) *stageCount = 0;
+    }
     if (threadIdx.x == 0)
     {
         add = *missDev;

@@ -591,6 +591,35 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.True(worst > 0 && worst < 5e-2, $"rows after the prompt moved {worst:E2}");
     }
 
+    /// <summary>A decode step's misses partly on the device (the Qwen3.8 engines' hybrid misses): up to four of a layer's
+    /// host experts a call routes are staged over the link from their page-locked, device-mapped pages into device slots and
+    /// computed there, only the rest rung to the host: far fewer host routes, the prompt (a streamed chunk) the same. The decode
+    /// rows are not compared: the host's routes round the activations to Q8_K, the device's to q8_1, and on this random model
+    /// that flips a top-k (as in <see cref="QuantizedHostExpertsOnDirectCudaMatchDeviceExperts"/>); CudaMoeStagingKernelTests
+    /// checks the staging byte for byte.</summary>
+    [CudaFact]
+    public void HostMissesStagedOnDirectCudaAnswerAsTheHost()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-quantized");
+        (List<float[]> Rows, long HostRoutes) Run(int gpuMisses)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.RouteTailSkipForTests = (0, 100);
+            model.WaitHostWarmForTests();
+            ((TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests).GpuMissesForTests = gpuMisses;
+            List<float[]> rows = Script(model);
+            return (rows, model.ExpertHostCountsForTests.HostRoutes);
+        }
+        (List<float[]> host, long hostRoutes) = Run(0);
+        (List<float[]> staged, long stagedRoutes) = Run(TensorSharp.Cuda.CudaGraphExecutor.DefaultGpuMisses);
+        _output.WriteLine($"host routes {hostRoutes} with the host computing every miss, {stagedRoutes} with misses staged");
+        Assert.True(stagedRoutes * 2 < hostRoutes, $"host routes {stagedRoutes} with staging, {hostRoutes} without: nothing was staged");
+        Assert.Equal(host[0], staged[0]);   // the streamed prompt chunk
+        Assert.All(staged, row => Assert.All(row, v => Assert.True(float.IsFinite(v))));
+    }
+
     /// <summary>Quantized experts (IQ3_S / IQ4_XS): the prompt chunk's staged experts (on CUDA the grouped MoE kernels, F16
     /// operands and F32 accumulation) against the device's own kernels. Only the prompt row is judged: the decode rows' host
     /// routes round the activations to Q8_K as ggml's CPU backend does, against the device's unrounded ones, and on this

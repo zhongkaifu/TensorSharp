@@ -76,7 +76,7 @@ namespace TensorSharp.Cuda.Interop
         public static partial int cuMemHostUnregister(IntPtr hostPtr);
 
         /// <summary>cuMemHostRegister flags.</summary>
-        public const uint CU_MEMHOSTREGISTER_PORTABLE = 0x01, CU_MEMHOSTREGISTER_READ_ONLY = 0x08;
+        public const uint CU_MEMHOSTREGISTER_PORTABLE = 0x01, CU_MEMHOSTREGISTER_DEVICEMAP = 0x02, CU_MEMHOSTREGISTER_READ_ONLY = 0x08;
 
         [LibraryImport(LibName, EntryPoint = "cuMemHostGetDevicePointer_v2")]
         public static partial int cuMemHostGetDevicePointer(out IntPtr devicePtr, IntPtr hostPtr, uint flags);
