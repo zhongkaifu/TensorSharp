@@ -397,6 +397,13 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         void FollowPlainPrompt(string? requestId) { }
 
+        /// <summary>
+        /// <see cref="FollowPlainPrompt(string?)"/> knowing the prompt's end (<paramref name="promptEnd"/>, the position after
+        /// its last token): a head whose context keeps only the trailing positions (<see cref="DraftContextRows"/>, a block
+        /// drafter's ring) takes only the chunk's rows it still holds when the prompt ends.
+        /// </summary>
+        void FollowPlainPrompt(string? requestId, int promptEnd) => FollowPlainPrompt(requestId);
+
         /// <summary>One per-token draft step at <paramref name="pos"/>: consume
         /// (token, previous hidden), fill next-token logits and the chained
         /// hidden state. Only called for <see cref="DraftHeadKind.PerToken"/>.</summary>

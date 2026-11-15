@@ -2619,7 +2619,7 @@ namespace TensorSharp.Runtime.Scheduling
                 return null;
             // A head the trunk keeps in step (DraftSelfCatchUp) takes this chunk's rows as the forward runs them.
             if (ctx.Exec.PrefillSelfCatchUp && _model is IDraftHead follower)
-                follower.FollowPlainPrompt(seq.RequestId);
+                follower.FollowPlainPrompt(seq.RequestId, seq.PromptTokens.Count);
             return ctx.Exec.PrefillsThroughContext ? ctx : null;
         }
 
@@ -2763,7 +2763,11 @@ namespace TensorSharp.Runtime.Scheduling
                     // (DraftSelfCatchUp) takes this chunk's rows as the trunk forwards
                     // them, so its drafts still read the prompt.
                     if (exec.PrefillSelfCatchUp && _model is IDraftHead follower)
-                        follower.FollowPlainPrompt(null);
+                    {
+                        // Over the request's own drafter state (a block drafter's ring), which its decode steps bind.
+                        (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
+                        follower.FollowPlainPrompt(null, seq.PromptTokens.Count);
+                    }
                     exec.Dispose();
                     return null;
                 }

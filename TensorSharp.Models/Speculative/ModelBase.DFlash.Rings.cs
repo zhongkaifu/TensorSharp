@@ -64,11 +64,23 @@ namespace TensorSharp.Models
         {
             if (!_hasDFlash || _dflashRingK == null)
                 return;
-            _dflashModelRing ??= new DFlashRing { K = _dflashRingK, V = _dflashRingV };
-            _dflashActiveRing ??= _dflashModelRing;
-
+            EnsureDFlashRingObjects();
             DFlashRing target = requestId == null ? _dflashModelRing : FindOrAssignDFlashRing(requestId);
             target.LastUsed = ++_dflashRingClock;
+            SelectDFlashRing(target);
+        }
+
+        /// <summary>The model's own ring as an object, bound when none is (the fields hold it until a request binds one).</summary>
+        private void EnsureDFlashRingObjects()
+        {
+            _dflashModelRing ??= new DFlashRing { K = _dflashRingK, V = _dflashRingV };
+            _dflashActiveRing ??= _dflashModelRing;
+        }
+
+        /// <summary>Make <paramref name="target"/> the bound ring: the bound one's bookkeeping goes back to its object and
+        /// the target's into the model's fields (and the fused drafter's ring pointers).</summary>
+        private void SelectDFlashRing(DFlashRing target)
+        {
             if (ReferenceEquals(target, _dflashActiveRing))
                 return;
 
@@ -89,6 +101,42 @@ namespace TensorSharp.Models
                 }
             }
             _dflashActiveRing = target;
+        }
+
+        /// <summary>
+        /// The ring <paramref name="requestId"/> drafts over (assigned on its first use as <see cref="BindDFlashRing"/>
+        /// assigns it; null: the bound ring): each draft layer's K and V and its write frontier, with the bound ring left as
+        /// it was. The trunk's own steps write a request's prompt rows into it (StandardDecoderModel.BlockDraft.cs, the
+        /// followed prompt).
+        /// </summary>
+        private protected (Tensor[] K, Tensor[] V, int Filled) DFlashRingOf(string requestId)
+        {
+            if (requestId == null || !_hasDFlash || _dflashRingK == null)
+                return (_dflashRingK, _dflashRingV, _dflashRingFilled);
+            EnsureDFlashRingObjects();
+            DFlashRing previous = _dflashActiveRing;
+            BindDFlashRing(requestId);
+            (Tensor[] K, Tensor[] V, int Filled) ring = (_dflashRingK, _dflashRingV, _dflashRingFilled);
+            SelectDFlashRing(previous);
+            return ring;
+        }
+
+        /// <summary>A graph on the device wrote rows <paramref name="startPos"/> .. + <paramref name="n"/> of
+        /// <paramref name="requestId"/>'s ring (null: the bound ring): its frontier and valid run, as the injects record
+        /// theirs (<see cref="NoteDFlashRingWrite"/>), and its host copy behind; the bound ring is left as it was.</summary>
+        private protected void NoteDFlashRingWriteOf(string requestId, int startPos, int n)
+        {
+            DFlashRing previous = null;
+            if (requestId != null && _hasDFlash && _dflashRingK != null)
+            {
+                EnsureDFlashRingObjects();
+                previous = _dflashActiveRing;
+                BindDFlashRing(requestId);
+            }
+            NoteDFlashRingWrite(startPos, n);
+            _dflashRingHostStale = true;
+            if (previous != null)
+                SelectDFlashRing(previous);
         }
 
         /// <summary>Return <paramref name="requestId"/>'s ring to the pool.</summary>

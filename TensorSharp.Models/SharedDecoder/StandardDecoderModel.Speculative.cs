@@ -186,6 +186,8 @@ namespace TensorSharp.Models
             int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
             EnsureCacheCapacity(checked(start + rows));
             bool dflash = HasDFlash;
+            // A buffer smaller than every row's DFlash features takes the last row's: the step returns only that row.
+            bool lastFeatureRow = dflash && hAllOut != null && hAllOut.LongLength < (long)rows * DFlashSettings.FeatureSize;
             TokenPositions positions = BeginRotaryPositions(start, rows);
             var request = new GraphRequest
             {
@@ -193,6 +195,7 @@ namespace TensorSharp.Models
                 AllRowLogits = allLogitsRows,
                 LastRowLogits = !allLogitsRows,
                 CaptureLayers = dflash && hAllOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
+                CaptureTail = lastFeatureRow ? 1 : 0,
                 CaptureFinal = !dflash && hAllOut != null,
                 RecurrentSnapshots = _anyRecurrent && rows > 1 && rows <= SmallChunkRows,
             };
@@ -217,22 +220,29 @@ namespace TensorSharp.Models
                 request = new GraphRequest
                 {
                     PositionTable = request.PositionTable, AllRowLogits = request.AllRowLogits, LastRowLogits = request.LastRowLogits,
-                    CaptureLayers = request.CaptureLayers, CaptureFinal = request.CaptureFinal, RecurrentSnapshots = request.RecurrentSnapshots,
+                    CaptureLayers = request.CaptureLayers, CaptureTail = request.CaptureTail, CaptureFinal = request.CaptureFinal,
+                    RecurrentSnapshots = request.RecurrentSnapshots,
                     FollowDraft = follow, DraftRows = PrepareDraftFollow(active, tokens, media),
                 };
                 _draftCarry = active.DraftCarry;
             }
-            GraphResult result;
+            // A DFlash drafter's ring takes the rows of a forward whose caller reads only the last row's features (a prompt
+            // through a context the trunk keeps in step, PrefillStep): rows a caller takes every feature row of, it commits.
+            DFlashFollowPlan ringFollow = !allLogitsRows && lastFeatureRow && rows > 1
+                ? PlanDFlashFollow(new string[1], new[] { start }, new[] { rows }, new[] { start + rows }) : null;
+            GraphResult result = null;
             _forwardSw.Start();
             try
             {
-                if (!TryRunGraphStep(hidden, new[] { active }, new[] { 0 }, new[] { rows }, new[] { start }, request, out result))
+                if (!RunFollowingDFlash(ref ringFollow, plan => TryRunGraphStep(hidden, new[] { active }, new[] { 0 }, new[] { rows }, new[] { start },
+                        plan == null ? request : request.WithDFlashFollow(plan), out result)))
                     throw new NotSupportedException(SpeculationRefusal ?? $"{Config.Architecture}: this verify cannot run as a graph.");
                 if (follow != DraftFollow.None)
                 {
                     NoteDraftFollowed(active, start, rows);
                     LoadDraftFollow(active);
                 }
+                NoteDFlashFollowed(ringFollow, new[] { start }, new[] { rows });
             }
             finally
             {
@@ -318,8 +328,8 @@ namespace TensorSharp.Models
                     if (all)
                         for (int r = 0; r < rows; r++)
                             Array.Copy(layer, (long)r * hiddenSize, hAllOut, (long)r * feat + (long)c * hiddenSize, hiddenSize);
-                    else
-                        Array.Copy(layer, (long)(rows - 1) * hiddenSize, hAllOut, (long)c * hiddenSize, hiddenSize);
+                    else   // the last row of the rows captured (every row, or only the last: GraphRequest.CaptureTail)
+                        Array.Copy(layer, layer.LongLength - hiddenSize, hAllOut, (long)c * hiddenSize, hiddenSize);
                 }
             }
             else

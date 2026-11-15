@@ -68,7 +68,11 @@ namespace TensorSharp.Models
                 BindSequenceCache(requestId);
         }
 
-        public void ReleaseDraftState(string requestId) => ReleaseDFlashRing(requestId);
+        public void ReleaseDraftState(string requestId)
+        {
+            ReleaseDFlashRing(requestId);
+            if (requestId != null) _followPromptRequests?.Remove(requestId);
+        }
 
         public bool SupportsBatchedSpecLogits => true;
 

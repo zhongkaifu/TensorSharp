@@ -625,15 +625,20 @@ namespace TensorSharp.Models
                 Tensor hidden = EmbedStep(tokens);
                 _embTicks += Stopwatch.GetTimestamp() - t0;
                 InjectMedia(hidden, start);
-                // A speculating request's prompt chunk hands the draft layer its rows (FollowPlainPrompt).
+                // A speculating request's prompt chunk hands the draft layer, or the DFlash drafter's ring, its rows
+                // (FollowPlainPrompt).
                 Slot active = SnapshotActive();
-                DraftFollow follow = ForwardIsPrompt && _followPlainPrompt ? PlanDraftFollow(active, start, positions.Table) : DraftFollow.None;
+                bool followed = ForwardIsPrompt && _followPlainPrompt;
+                DraftFollow follow = followed ? PlanDraftFollow(active, start, positions.Table) : DraftFollow.None;
+                DFlashFollowPlan dflash = followed
+                    ? PlanDFlashFollow(new string[1], new[] { start }, new[] { seqLen }, new[] { _followPlainPromptEnd }) : null;
                 _followPlainPrompt = false;
                 float[] draftRows = follow != DraftFollow.None ? PrepareDraftFollow(active, tokens, media) : null;
                 _draftCarry = active.DraftCarry;
 
-                if (TryRunGraph(hidden, new[] { active }, new[] { 0 }, new[] { seqLen }, new[] { start },
-                        wantLogits, out float[][] graphLogits, positions.Table, follow, draftRows))
+                float[][] graphLogits = null;
+                if (RunFollowingDFlash(ref dflash, plan => TryRunGraph(hidden, new[] { active }, new[] { 0 }, new[] { seqLen }, new[] { start },
+                        wantLogits, out graphLogits, positions.Table, follow, draftRows, plan)))
                 {
                     hidden.Dispose();
                     _cacheDeviceDirty = true;
@@ -643,6 +648,7 @@ namespace TensorSharp.Models
                         NoteDraftFollowed(active, start, seqLen);
                         LoadDraftFollow(active);
                     }
+                    NoteDFlashFollowed(dflash, new[] { start }, new[] { seqLen });
                     return graphLogits?[0];
                 }
                 SyncActiveToHost();

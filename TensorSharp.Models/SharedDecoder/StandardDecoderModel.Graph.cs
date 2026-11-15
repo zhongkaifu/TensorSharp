@@ -226,12 +226,24 @@ namespace TensorSharp.Models
             /// <summary>The followed rows' draft embedding [rows, hidden] when the step's input rows are not it; null reads
             /// them.</summary>
             public float[] DraftRows { get; init; }
+            /// <summary>The DFlash drafter's rings take the following sequences' rows as the trunk finishes them
+            /// (<see cref="EmitDFlashFollow"/>).</summary>
+            public DFlashFollowPlan FollowDFlash { get; init; }
 
             /// <summary>What the request changes in the emitted program (a streamed step's template key).</summary>
             public string Shape =>
                 $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}:{CaptureTail}"
                 + (GreedyIds ? ":g" : "")
-                + (FollowDraft == DraftFollow.None ? "" : $":f{(int)FollowDraft}{(DraftRows != null ? "e" : "")}");
+                + (FollowDraft == DraftFollow.None ? "" : $":f{(int)FollowDraft}{(DraftRows != null ? "e" : "")}")
+                + (FollowDFlash == null ? "" : $":df{FollowDFlash.Key}");
+
+            /// <summary>This request with the DFlash rings' follow <paramref name="plan"/> (null: none).</summary>
+            public GraphRequest WithDFlashFollow(DFlashFollowPlan plan) => new()
+            {
+                LastRowLogits = LastRowLogits, AllRowLogits = AllRowLogits, GreedyIds = GreedyIds, CaptureLayers = CaptureLayers,
+                CaptureTail = CaptureTail, CaptureFinal = CaptureFinal, RecurrentSnapshots = RecurrentSnapshots,
+                PositionTable = PositionTable, FollowDraft = FollowDraft, DraftRows = DraftRows, FollowDFlash = plan,
+            };
         }
 
         private sealed class GraphResult
@@ -624,13 +636,14 @@ namespace TensorSharp.Models
 
         private bool TryRunGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
             bool wantLogits, out float[][] logits, int[] positionTable = null, DraftFollow follow = DraftFollow.None,
-            float[] draftRows = null)
+            float[] draftRows = null, DFlashFollowPlan dflash = null)
         {
             logits = null;
             bool greedy = wantLogits && _greedyLastRows && GraphExecutor.Capabilities.GreedyIdOutputs;
             var request = new GraphRequest
             {
                 LastRowLogits = wantLogits, GreedyIds = greedy, PositionTable = positionTable, FollowDraft = follow, DraftRows = draftRows,
+                FollowDFlash = dflash,
             };
             if (!TryRunGraphStep(hidden, slots, first, counts, starts, request, out GraphResult result))
                 return false;
@@ -1002,11 +1015,24 @@ namespace TensorSharp.Models
                 outputs.Captures = new int[request.CaptureLayers.Length];
                 Array.Fill(outputs.Captures, -1);
             }
+            // The DFlash rings' follow taps the drafter's target layers' rows and writes the rings once it has them all.
+            DFlashFollowPlan dflash = request.FollowDFlash;
+            int[] targets = null, taps = null;
+            if (dflash != null)
+            {
+                if (from != 0 || to != Config.NumLayers || !head)
+                    throw new InvalidOperationException("The drafter's rings follow a step over the whole stack.");
+                targets = DFlashSettings.TargetLayerIds;
+                taps = new int[targets.Length];
+                Array.Fill(taps, -1);
+            }
             for (int layer = from; layer < to; layer++)
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
                         outputs.Captures[c] = EmitCaptureOutput(step, h, request);
+                if (TapDFlashFollow(step, h, layer, targets, taps))
+                    EmitDFlashFollow(step, taps, dflash);
                 h = EmitLayerPrologue(step, layer, h);
                 int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
                 int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
@@ -1022,8 +1048,27 @@ namespace TensorSharp.Models
                 outputs.Hidden = step.Output(h, (long)width * rows);
                 return outputs;
             }
+            // A target past the stack taps the stream leaving it.
+            if (TapDFlashFollow(step, h, Config.NumLayers, targets, taps))
+                EmitDFlashFollow(step, taps, dflash);
             EmitHead(step, h, request, ref outputs, embedded);
             return outputs;
+        }
+
+        /// <summary>Tap the stream <paramref name="h"/> entering <paramref name="layer"/> (the stack's end at NumLayers) for
+        /// the DFlash rings' follow where the drafter reads it; true when this tap completes the drafter's rows.</summary>
+        private bool TapDFlashFollow(GraphStep step, int h, int layer, int[] targets, int[] taps)
+        {
+            if (taps == null) return false;
+            bool tapped = false;
+            int row = -1;
+            for (int t = 0; t < targets.Length; t++)
+            {
+                if (taps[t] >= 0 || (layer < Config.NumLayers ? targets[t] != layer : targets[t] < Config.NumLayers)) continue;
+                taps[t] = row = row >= 0 ? row : EmitCaptureRow(step, h);
+                tapped = true;
+            }
+            return tapped && Array.TrueForAll(taps, x => x >= 0);
         }
 
         /// <summary>A profiling load's resident MoE layers: their recorded top-K ids go to the routing counters.</summary>

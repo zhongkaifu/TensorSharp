@@ -799,23 +799,28 @@ namespace TensorSharp.Models
             };
 
             Tensor embedded = null;
+            int[] promptEnds = null;
             try
             {
                 embedded = EmbedStep(flatTokens);
                 bool capture = features != null && Array.Exists(features, f => f != null);
-                // A lone speculating request's prompt chunk hands the draft layer its rows (FollowPlainPrompt).
-                DraftFollow follow = n == 1 && !capture && _followPromptRequests != null && _followPromptRequests.Remove(requestIds[0])
+                // A lone speculating request's prompt chunk hands the draft layer its rows, and every speculating request's
+                // chunk its DFlash ring's (FollowPlainPrompt).
+                promptEnds = capture ? null : TakeFollowedPrompts(requestIds);
+                DraftFollow follow = n == 1 && promptEnds != null && promptEnds[0] != DFlashNoFollow
                     ? PlanDraftFollow(slots[0], starts[0], null) : DraftFollow.None;
                 float[] draftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], chunks[0], media: false) : null;
+                DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds);
                 if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
-                    : TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(), wantLogits: true, out float[][] graphLogits,
-                          follow: follow, draftRows: draftRows)
-                      && CopyLogits(graphLogits, outLogits))
+                    : RunFollowingDFlash(ref dflash, plan => TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(),
+                          wantLogits: true, out float[][] graphLogits, follow: follow, draftRows: draftRows, dflash: plan)
+                          && CopyLogits(graphLogits, outLogits)))
                 {
                     BatchedForwardCount++;
                     for (int s = 0; s < n; s++)
                         slots[s].Length = starts[s] + counts[s];
                     if (follow != DraftFollow.None) NoteDraftFollowed(slots[0], starts[0], counts[0]);
+                    NoteDFlashFollowed(dflash, starts, counts);
                     return true;
                 }
                 static bool CopyLogits(float[][] from, float[][] to)
@@ -823,6 +828,12 @@ namespace TensorSharp.Models
                     Array.Copy(from, to, to.Length);
                     return true;
                 }
+            }
+            catch
+            {
+                // A step that found no device memory is retried (TryForwardSlots): the chunks still follow there.
+                RestoreFollowedPrompts(requestIds, promptEnds);
+                throw;
             }
             finally
             {

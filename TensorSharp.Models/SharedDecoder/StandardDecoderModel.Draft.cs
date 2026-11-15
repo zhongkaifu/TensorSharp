@@ -303,22 +303,61 @@ namespace TensorSharp.Models
         /// with no context at all (the direct engines' MTP block followed the forward on its device the same way). Whole
         /// graphs on this process only: a per-rank (tensor-parallel) or multi-node step leaves the gap restart.
         /// </summary>
-        public bool DraftSelfCatchUp => HasDraftLayer && !HasDFlash && !_rankGraphs && !IsMultiNodePipeline && GraphUnsupportedReason() == null;
+        private bool DraftLayerSelfCatchUp => HasDraftLayer && !HasDFlash && !_rankGraphs && !IsMultiNodePipeline && GraphUnsupportedReason() == null;
+
+        /// <summary>The trunk keeps its drafter in step with the rows it forwards: the MTP draft layer
+        /// (<see cref="DraftLayerSelfCatchUp"/>) or a DFlash drafter's ring (<see cref="DFlashSelfCatchUp"/>).</summary>
+        public bool DraftSelfCatchUp => DraftLayerSelfCatchUp || DFlashSelfCatchUp;
 
         /// <summary>The drafts condition on the prompt's rows (<see cref="DraftSelfCatchUp"/> brings them).</summary>
         public bool DraftHeadConditionsOnPrompt => DraftSelfCatchUp;
 
-        public void FollowPlainPrompt(string requestId)
+        public void FollowPlainPrompt(string requestId) => FollowPlainPrompt(requestId, -1);
+
+        /// <summary>The prompt's end lets a DFlash ring take only the rows it holds when the prompt ends.</summary>
+        public void FollowPlainPrompt(string requestId, int promptEnd)
         {
-            if (requestId == null) _followPlainPrompt = true;
-            else (_followPromptRequests ??= new HashSet<string>(StringComparer.Ordinal)).Add(requestId);
+            if (requestId == null)
+            {
+                _followPlainPrompt = true;
+                _followPlainPromptEnd = promptEnd;
+            }
+            else (_followPromptRequests ??= new Dictionary<string, int>(StringComparer.Ordinal))[requestId] = promptEnd;
+        }
+
+        /// <summary>Each request's registered prompt end (<see cref="FollowPlainPrompt(string, int)"/>; -1 unknown), the
+        /// registrations taken, or <see cref="DFlashNoFollow"/> for a request that registered none; null when none did.</summary>
+        private int[] TakeFollowedPrompts(IReadOnlyList<string> requestIds)
+        {
+            if (_followPromptRequests == null || _followPromptRequests.Count == 0) return null;
+            int[] ends = null;
+            for (int s = 0; s < requestIds.Count; s++)
+            {
+                if (!_followPromptRequests.Remove(requestIds[s], out int end)) continue;
+                if (ends == null)
+                {
+                    ends = new int[requestIds.Count];
+                    Array.Fill(ends, DFlashNoFollow);
+                }
+                ends[s] = end;
+            }
+            return ends;
+        }
+
+        /// <summary>Put back registrations <see cref="TakeFollowedPrompts"/> took for a step that did not run.</summary>
+        private void RestoreFollowedPrompts(IReadOnlyList<string> requestIds, int[] promptEnds)
+        {
+            if (promptEnds == null) return;
+            for (int s = 0; s < requestIds.Count; s++)
+                if (promptEnds[s] != DFlashNoFollow) FollowPlainPrompt(requestIds[s], promptEnds[s]);
         }
 
         /// <summary>How a step of the active cache takes the draft layer along (<see cref="EmitDraftFollow"/>).</summary>
         private enum DraftFollow { None, FromStart, FromCarry }
 
         private bool _followPlainPrompt;   // the primary cache's next plain prompt chunk is a speculating request's
-        private HashSet<string> _followPromptRequests;   // per-request slots whose next prompt chunk is (FollowPlainPrompt)
+        private int _followPlainPromptEnd = -1;   // that prompt's end (-1: unknown)
+        private Dictionary<string, int> _followPromptRequests;   // per-request slots whose next prompt chunk is, and its end
         private int _draftFollowed = -1;   // the active cache's Slot.DraftFollowed
         private Tensor _draftCarry;        // the active cache's Slot.DraftCarry
 
@@ -330,7 +369,7 @@ namespace TensorSharp.Models
         /// </summary>
         private DraftFollow PlanDraftFollow(Slot slot, int start, int[] positionTable)
         {
-            if (positionTable != null || !DraftSelfCatchUp) return DraftFollow.None;
+            if (positionTable != null || !DraftLayerSelfCatchUp) return DraftFollow.None;
             if (start == 0) return DraftFollow.FromStart;
             return slot.DraftFollowed == start && start > slot.DraftStart && slot.DraftCarry != null ? DraftFollow.FromCarry : DraftFollow.None;
         }

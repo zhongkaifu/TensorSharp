@@ -236,22 +236,25 @@ namespace TensorSharp.Models
         }
 
         /// <summary>weight · x as heads [head_dim, heads, rows], each RMS-normed with <paramref name="norm"/> (the drafter's
-        /// epsilon) and rotated at the step's positions.</summary>
-        private int EmitDFlashHeads(GraphStep step, string weight, int x, int heads, int rows, string norm)
+        /// epsilon) and rotated at the step's positions, or at <paramref name="positions"/> (I32 [rows]) when given.</summary>
+        private int EmitDFlashHeads(GraphStep step, string weight, int x, int heads, int rows, string norm, int positions = -1)
         {
             DFlashConfig cfg = DFlashSettings;
             int y = step.Reshape(step.MatMul(weight, x), cfg.HeadDim, heads, rows);
-            return step.Rope(step.RmsNorm(y, step.Weight(norm), cfg.Eps), DFlashRotary);
+            int normed = step.RmsNorm(y, step.Weight(norm), cfg.Eps);
+            return positions >= 0 ? step.RopeAt(normed, DFlashRotary, positions) : step.Rope(normed, DFlashRotary);
         }
 
         /// <summary>K and V [head_dim, kv_heads, n] into draft layer <paramref name="layer"/>'s ring at the rows
-        /// <paramref name="ringRows"/>; returns the written rings (reading them orders the read after the write).</summary>
-        private void EmitDFlashRingWrite(GraphStep step, int layer, int k, int v, int n, int ringRows, out int ringK, out int ringV)
+        /// <paramref name="ringRows"/>; returns the written rings (reading them orders the read after the write). The bound
+        /// ring, or <paramref name="ringKTensor"/> / <paramref name="ringVTensor"/> (another request's).</summary>
+        private void EmitDFlashRingWrite(GraphStep step, int layer, int k, int v, int n, int ringRows, out int ringK, out int ringV,
+            Tensor ringKTensor = null, Tensor ringVTensor = null)
         {
             DFlashConfig cfg = DFlashSettings;
             int hd = cfg.HeadDim, kvHeads = cfg.NumKVHeads, rows = DFlashRingRows;
-            int ck = step.State(_dflashRingK[layer], GraphFormat.F32, hd, rows, kvHeads);
-            int cv = step.State(_dflashRingV[layer], GraphFormat.F32, hd, rows, kvHeads);
+            int ck = step.State(ringKTensor ?? _dflashRingK[layer], GraphFormat.F32, hd, rows, kvHeads);
+            int cv = step.State(ringVTensor ?? _dflashRingV[layer], GraphFormat.F32, hd, rows, kvHeads);
             // [head_dim, kv_heads, n] -> [head_dim, n, kv_heads], the ring's layout; one row is the same bytes either way.
             int kRows = n == 1 ? step.Reshape(k, hd, 1, kvHeads) : step.Cont(step.Permute(k, 0, 2, 1, 3));
             int vRows = n == 1 ? step.Reshape(v, hd, 1, kvHeads) : step.Cont(step.Permute(v, 0, 2, 1, 3));
@@ -259,6 +262,201 @@ namespace TensorSharp.Models
             ringV = step.Op(GraphOp.SetRows, cv, vRows, ringRows);
             step.Effect(ringK);
             step.Effect(ringV);
+        }
+
+        // ---------------------------------------------------------------- the trunk's own steps keep the ring
+
+        /// <summary>Tests: the prompt reaches the ring through the speculative context (its feature rows to the host and back
+        /// through the inject program), as it does wherever the graph drafter is refused.</summary>
+        internal bool DFlashSelfCatchUpDisabledForTests { get; set; }
+
+        /// <summary>Sequences' prompt chunks whose rows a trunk step wrote into their rings (tests check the follow ran).</summary>
+        internal int GraphDFlashFollows { get; private set; }
+
+        /// <summary>
+        /// The trunk's own steps write the drafter's ring (<see cref="DraftSelfCatchUp"/>): a speculating request's prompt,
+        /// read on the plain path, takes the drafter's target layers inside the trunk's graph and writes their K/V rows into
+        /// the request's ring there (<see cref="EmitDFlashFollow"/>), as the direct engine's forward did. Through the
+        /// speculative context instead, the prompt's step returned five layers' rows to the host (25,600 floats a row of
+        /// Qwen3.8-27B's DFlash2), the executor shifted them a row, and the inject program copied and uploaded them again
+        /// (a 4K prompt's first token 2.06 s against 1.07 s without the drafter on an RTX PRO 4000). Where the drafter keeps
+        /// its fused or per-op path (<see cref="GraphBlockDraftRefusal"/>), the prompt still goes through the context.
+        /// </summary>
+        private bool DFlashSelfCatchUp => HasDFlash && !DFlashSelfCatchUpDisabledForTests && GraphBlockDraftRefusal() == null;
+
+        /// <summary>Which sequences of a trunk step write their rows into a ring, and which rows.</summary>
+        private sealed class DFlashFollowPlan
+        {
+            /// <summary>Whose ring each sequence's rows go to (null: the bound ring).</summary>
+            public required string[] Requests { get; init; }
+            /// <summary>Each sequence's last rows the ring takes (0: the sequence does not follow).</summary>
+            public required int[] Keep { get; init; }
+            /// <summary>The sequence's ring also takes a zero row for the position before its rows (see
+            /// <see cref="PlanDFlashFollow"/>).</summary>
+            public required bool[] ZeroBefore { get; init; }
+            /// <summary>Each following sequence's ring, per draft layer.</summary>
+            public required Tensor[][] RingK { get; init; }
+            public required Tensor[][] RingV { get; init; }
+
+            /// <summary>What the plan changes in the emitted program.</summary>
+            public string Key
+            {
+                get
+                {
+                    var key = new System.Text.StringBuilder();
+                    for (int s = 0; s < Keep.Length; s++) key.Append(s > 0 ? "." : "").Append(Keep[s]).Append(ZeroBefore[s] ? "z" : "");
+                    return key.ToString();
+                }
+            }
+        }
+
+        /// <summary>A sequence that does not follow (<see cref="PlanDFlashFollow"/>'s prompt ends).</summary>
+        private const int DFlashNoFollow = int.MinValue;
+
+        /// <summary>Rows of the drafter's encoder product per block: the tapped layers' rows are joined a block at a time, so
+        /// the joined rows (a feature row is five hidden rows) never hold a whole prompt chunk.</summary>
+        private const int DFlashFollowBlockRows = 256;
+
+        /// <summary>
+        /// Which sequences of a step over rows starts[s] .. + counts[s] write them into a ring: those whose prompt end
+        /// (<paramref name="promptEnds"/>[s]; -1 unknown) is not <see cref="DFlashNoFollow"/>, each the rows its ring holds
+        /// when the prompt ends (the chunk's last ring-length rows, none older than the prompt's last ring-length
+        /// positions: a 16K prompt's earlier chunks would be overwritten). Null when none does.
+        ///
+        /// A ring row is its own position's features, so a chunk needs nothing of the rows before it, with one exception: the
+        /// last row a turn forwarded is the first row of the next turn's prompt to have none (its features were the carry
+        /// the next draft would have injected). A chunk starting right past that one-row hole writes a zero row there, as
+        /// the speculative context's catch-up did (its carry is zeros when a request arms after a reused prefix), so the
+        /// ring keeps the turn before as context instead of restarting at the hole.
+        /// </summary>
+        private DFlashFollowPlan PlanDFlashFollow(string[] requests, int[] starts, int[] counts, int[] promptEnds)
+        {
+            if (!DFlashSelfCatchUp) return null;
+            int n = counts.Length, ringRows = DFlashRingRows;
+            var keep = new int[n];
+            var zero = new bool[n];
+            var ringK = new Tensor[n][];
+            var ringV = new Tensor[n][];
+            bool any = false;
+            for (int s = 0; s < n; s++)
+            {
+                if (promptEnds[s] == DFlashNoFollow || counts[s] <= 0) continue;
+                int end = starts[s] + counts[s], first = Math.Max(starts[s], end - ringRows);
+                if (promptEnds[s] > 0) first = Math.Max(first, promptEnds[s] - ringRows);
+                if (first >= end) continue;
+                (Tensor[] k, Tensor[] v, int filled) = DFlashRingOf(requests[s]);
+                // Two sequences on one ring (more speculating requests than rings): the later one's prompt is not kept.
+                bool shared = false;
+                for (int o = 0; o < s; o++) shared |= ReferenceEquals(ringK[o], k);
+                if (k == null || shared) continue;
+                keep[s] = end - first;
+                zero[s] = first == starts[s] && first > 0 && filled == first - 1;
+                ringK[s] = k;
+                ringV[s] = v;
+                any = true;
+            }
+            return any ? new DFlashFollowPlan { Requests = requests, Keep = keep, ZeroBefore = zero, RingK = ringK, RingV = ringV } : null;
+        }
+
+        /// <summary>A step with <paramref name="plan"/> ran: each following sequence's ring holds its kept rows.</summary>
+        private void NoteDFlashFollowed(DFlashFollowPlan plan, int[] starts, int[] counts)
+        {
+            if (plan == null) return;
+            for (int s = 0; s < plan.Keep.Length; s++)
+            {
+                if (plan.Keep[s] <= 0) continue;
+                int zero = plan.ZeroBefore[s] ? 1 : 0;
+                NoteDFlashRingWriteOf(plan.Requests[s], starts[s] + counts[s] - plan.Keep[s] - zero, plan.Keep[s] + zero);
+                GraphDFlashFollows++;
+            }
+        }
+
+        /// <summary>
+        /// Run a trunk step with <paramref name="plan"/> (<paramref name="run"/> returns false when the step does not lower:
+        /// nothing ran). When the ring's writes are what the lowering or the executor refused, the drafter keeps its other
+        /// path from here on (the prompt then goes through the context) and the step runs without them. Returns whether the
+        /// step ran; <paramref name="plan"/> is null after when the ring did not take its rows.
+        /// </summary>
+        private bool RunFollowingDFlash(ref DFlashFollowPlan plan, Func<DFlashFollowPlan, bool> run)
+        {
+            if (plan == null) return run(null);
+            try
+            {
+                if (run(plan)) return true;
+            }
+            catch (NotSupportedException e)
+            {
+                // An executor refuses an op when it compiles the step, before anything runs.
+                plan = null;
+                DeclineGraphBlockDraft(e);
+                return run(null);
+            }
+            plan = null;
+            if (!run(null)) return false;
+            DeclineGraphBlockDraft(new NotSupportedException("the trunk's step does not lower with the drafter's ring writes"));
+            return true;
+        }
+
+        /// <summary>
+        /// The drafter's ring over a step's rows as the trunk finishes them: per following sequence, its kept rows'
+        /// target-layer rows (<paramref name="taps"/>, [hidden, rows] each, in the drafter's feature order) joined into
+        /// feature rows a block at a time, g = rmsnorm(fc · feat, enc.output_norm), and per draft layer the K (head-normed,
+        /// rotated at the rows' positions) and V rows written into the sequence's ring at position % ringRows: PASS A+B of
+        /// the inject program over the same rows, which the speculative context fed it from the host. A ring row is its own
+        /// position's features, so the step needs nothing from the steps before it.
+        /// </summary>
+        private void EmitDFlashFollow(GraphStep step, int[] taps, DFlashFollowPlan plan)
+        {
+            DFlashConfig cfg = DFlashSettings;
+            string prefix = DFlashConfig.WeightPrefix;
+            int hidden = Config.HiddenSize, hd = cfg.HeadDim, kvHeads = cfg.NumKVHeads, ringRows = DFlashRingRows;
+            const long f = sizeof(float);
+            for (int s = 0; s < step.Sequences; s++)
+            {
+                int keep = plan.Keep[s];
+                if (keep <= 0) continue;
+                int count = step.Counts[s], firstRow = step.First[s] + count - keep, firstPos = step.Starts[s] + count - keep;
+                int g = -1;
+                for (int b0 = 0; b0 < keep; b0 += DFlashFollowBlockRows)
+                {
+                    int nb = Math.Min(DFlashFollowBlockRows, keep - b0);
+                    int x = -1;
+                    foreach (int tap in taps)
+                    {
+                        int rows = step.View2(tap, hidden, nb, hidden * f, (long)(firstRow + b0) * hidden * f);
+                        x = x < 0 ? rows : step.Op(GraphOp.Concat, stackalloc[] { x, rows }, stackalloc long[] { 0 });
+                    }
+                    int part = step.MatMul(prefix + "fc.weight", x);
+                    g = g < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { g, part }, stackalloc long[] { 1 });
+                }
+                g = step.RmsNorm(g, step.Weight(prefix + "enc.output_norm.weight"), cfg.Eps);
+                int written = keep;
+                if (plan.ZeroBefore[s])
+                {
+                    // The encoder's row of zero features is zeros, and so are its K and V.
+                    g = step.Op(GraphOp.Concat, stackalloc[] { step.ConstantInputF32(new float[cfg.HiddenSize], cfg.HiddenSize, 1), g },
+                        stackalloc long[] { 1 });
+                    firstPos--;
+                    written++;
+                }
+                // The rows' positions and ring rows are the step's own (opaque inputs: a followed step is never kept to advance).
+                var positions = new int[written];
+                var slots = new int[written];
+                for (int i = 0; i < written; i++)
+                {
+                    positions[i] = firstPos + i;
+                    slots[i] = (firstPos + i) % ringRows;
+                }
+                int positionsNode = step.InputI32(positions, written);
+                int slotsNode = step.InputRows(slots);
+                for (int il = 0; il < cfg.NumLayers; il++)
+                {
+                    string[] names = _dflashLayerNames[il];
+                    int k = EmitDFlashHeads(step, names[DfAttnK], g, kvHeads, written, names[DfAttnKNorm], positionsNode);
+                    int v = step.Reshape(step.MatMul(names[DfAttnV], g), hd, kvHeads, written);
+                    EmitDFlashRingWrite(step, il, k, v, written, slotsNode, out _, out _, plan.RingK[s][il], plan.RingV[s][il]);
+                }
+            }
         }
 
         // ---------------------------------------------------------------- PASS C: the block
