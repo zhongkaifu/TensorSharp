@@ -535,16 +535,14 @@ namespace TensorSharp.Models
             DecodeReplay r = _decodeReplays.GetValueOrDefault(shape ?? "");
             if (r == null || r.Epoch != _graphEpoch || r.Floor != floor || r.Shape != shape || r.Slots.Length != slots.Length)
                 return false;
-            // (A step that binds no recurrent state - a block drafter's ring programs - is not moved by their buffers.)
-            if (r.Bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges) && Array.Exists(r.Recurrent, x => x != null))
+            if (r.Bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges))
             {
                 DropDecodeReplay(shape);
                 return false;
             }
-            // Every sequence moves on by the same positions: one for decode steps, a verify window's accepted rows and one; a
-            // program that runs at any position (a block drafter's) also back to the next request's.
+            // Every sequence moves on by the same positions: one for decode steps, a verify window's accepted rows and one.
             int delta = starts.Length > 0 ? starts[0] - r.Starts[0] : 0;
-            if (delta < 1 && !r.Step.AdvancesAnywhere) return false;
+            if (delta < 1) return false;
             for (int s = 0; s < slots.Length; s++)
             {
                 Slot slot = slots[s];
@@ -2324,17 +2322,6 @@ namespace TensorSharp.Models
             /// <summary>Every input follows positions in a known way, so the step can be run again one position on.</summary>
             internal bool Advanceable => !_inputMeta.Exists(m => m.Kind == InputKind.Opaque);
 
-            /// <summary>The program reads its positions only through its inputs (a block drafter's programs: positions, ring rows,
-            /// mask and anchor refilled; no cache window, no cache write rows): it may run again at any position, an earlier one
-            /// too (the next request's), not only further on.</summary>
-            internal void RunsAtAnyPosition() => _anyPosition = true;
-
-            private bool _anyPosition;
-
-            /// <summary>See <see cref="RunsAtAnyPosition"/>, and every input follows positions by value alone.</summary>
-            internal bool AdvancesAnywhere => _anyPosition && _advanceLimits == null
-                && _inputMeta.TrueForAll(m => m.Kind is InputKind.Positions or InputKind.Refill or InputKind.Constant or InputKind.Hidden);
-
             /// <summary>The executor fuses regions at any row count (<see cref="GraphCapabilities.RegionsAtAnyWidth"/>): a family
             /// marks its prompt-width regions for decode rows too.</summary>
             internal bool RegionsAtAnyWidth => _m.GraphExecutor?.Capabilities.RegionsAtAnyWidth == true;
@@ -2353,7 +2340,7 @@ namespace TensorSharp.Models
             internal bool TryAdvance(Tensor[] hidden, int delta = 1)
             {
                 int hiddenAt = 0;
-                if (delta < 1 && !(AdvancesAnywhere && System.Linq.Enumerable.Min(Starts) + delta >= 0)) return false;
+                if (delta < 1) return false;
                 foreach (InputMeta m in _inputMeta)
                     if (m.Kind == InputKind.DecodeMask && m.Start + m.Count + delta > m.Window) return false;
                 if (_advanceLimits != null)

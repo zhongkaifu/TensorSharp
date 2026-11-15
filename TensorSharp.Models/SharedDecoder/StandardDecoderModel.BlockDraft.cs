@@ -202,7 +202,6 @@ namespace TensorSharp.Models
             var positions = new int[n];
             for (int i = 0; i < n; i++) positions[i] = step.Starts[0] + i;
             step.SetPositions(positions);
-            step.RunsAtAnyPosition();
             int ringRows = DFlashRingRowsInput(step, n);
             int x = step.HiddenInput(features, cfg.FeatureSize, n);
             int g = step.RmsNorm(step.MatMul(prefix + "fc.weight", x), step.Weight(prefix + "enc.output_norm.weight"), cfg.Eps);
@@ -324,7 +323,6 @@ namespace TensorSharp.Models
             var positions = new int[b];
             for (int i = 0; i < b; i++) positions[i] = step.Starts[0] + i;
             step.SetPositions(positions);
-            step.RunsAtAnyPosition();
             int ringRows = DFlashRingRowsInput(step, b);
             int mask = DFlashBlockMaskInput(step, b);
             // The convolution's taps reach back up to taps - 1 rows; the rows before the block are zeros.
