@@ -108,11 +108,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// prefix from a clone of it. See <c>IBatchedPagedModel.SupportsPrefixCheckpoints</c>.
         /// </summary>
         /// <summary>The reply will be rendered back verbatim in the next turn (no reasoning is
-        /// stripped), so the end state this request retains, not a checkpoint before the prompt's
-        /// last token, is what the next turn resumes from. The prefix cache then skips that
-        /// prompt-tail checkpoint when it would protect fewer than
-        /// <see cref="SchedulerConfig.PromptTailCheckpointMinTokens"/> tokens: it costs an extra
-        /// single-row forward on every request. False (the default) always takes it.</summary>
+        /// stripped), so the end state this request retains, not a checkpoint of its prompt, is what
+        /// the next turn resumes from. The prefix cache then skips that prompt-tail checkpoint when it
+        /// would protect fewer than <see cref="SchedulerConfig.PromptTailCheckpointMinTokens"/> tokens:
+        /// it costs a copy of the request's state (and, where it has to stop short of the prompt's last
+        /// token, an extra single-row forward) on every request. False (the default) always takes it.</summary>
         public bool PromptTailCheckpointOptional { get; init; }
 
         public int SharedPrefixTokens { get; }
@@ -341,6 +341,14 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>How many tokens were restored from prefix cache (block hash
         /// hits) at admission time. Diagnostic only.</summary>
         public int PrefixCacheReusedTokens { get; internal set; }
+
+        /// <summary>Admission resumed this sequence at its prompt's very end, from a checkpoint
+        /// that kept the logits of the prompt's last row (the prefix cache's prompt-end
+        /// checkpoint): nothing is left to prefill, and <see cref="LastLogits"/> holds that row
+        /// until the first token is drawn from it. Its first step is the decode that forwards
+        /// that token.</summary>
+        internal bool ResumedAtPromptEnd => OutputTokens.Count == 0 && NumComputedTokens == PromptTokens.Count
+            && PrefixCacheReusedTokens == PromptTokens.Count && LastLogits != null;
 
         /// <summary>Whether the executor has reserved this request's K/V — prompt plus
         /// generation budget — on the cache it runs in. Set by the FIRST prefill chunk,

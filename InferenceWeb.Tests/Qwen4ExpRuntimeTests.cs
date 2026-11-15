@@ -667,6 +667,57 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         Assert.True(drafts > 0, $"{backend} qsa={qsa}: no draft step advanced");
     }
 
+    /// <summary>The same prompt sent again resumes at its very end from the checkpoint taken after its (unsplit) last
+    /// step, which kept that step's last logits: nothing is prefilled, the state (recurrences, PLE histories, QSA keys)
+    /// is the clone at the prompt's end, and the stream is the one the run that computed the row gave - decoding plainly
+    /// and with the MTP head drafting from the resumed state.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnIdenticalPromptResumesAtItsEndOnTheManagedCpu(bool speculate)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa: true);
+        using var model = new Qwen4ExpRuntimeModel(target, BackendType.Cpu, draftModelPath: speculate ? mtp : null);
+        var cfg = new TensorSharp.Runtime.Scheduling.SchedulerConfig
+        {
+            MaxNumBatchedTokens = 256,
+            MaxNumRunningSequences = 4,
+            NumBlocks = 64,
+            BlockSize = 16,
+            EnablePrefixCaching = true,
+            StopRepetition = false,
+            Speculation = new TensorSharp.Runtime.Speculative.SpeculationOptions
+            {
+                Enabled = speculate, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead,
+                MaxDraftTokens = 3, MinDraftProb = 0,
+            },
+        };
+        using var engine = new TensorSharp.Runtime.Scheduling.InferenceEngine(model, cfg,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+        int[] prompt = Enumerable.Range(0, 40).Select(i => 40 + (i * 7) % 150).ToArray();
+        async Task<(int[] Tokens, int Reused)> Serve(string id)
+        {
+            var handle = engine.SubmitRequest(new TensorSharp.Runtime.Scheduling.SequenceState(id, prompt, 12, cfg.BlockSize,
+                SamplingConfig.Greedy, cacheScope: "conversation"));
+            var tokens = new List<int>();
+            await foreach (int t in handle.Tokens.ReadAllAsync())
+                tokens.Add(t);
+            var completion = await handle.Completion;
+            await engine.WhenStepSettledAsync();
+            return (tokens.ToArray(), completion.PrefixCacheReusedTokens);
+        }
+        var first = await Serve("first").WaitAsync(TimeSpan.FromMinutes(3));
+        int verified = model.BatchedSpecVerifySteps;
+        var again = await Serve("again").WaitAsync(TimeSpan.FromMinutes(3));
+        Assert.Equal(0, first.Reused);
+        Assert.Equal(prompt.Length, again.Reused);
+        Assert.True(first.Tokens.Length > 0, "the first run produced nothing");
+        Assert.Equal(first.Tokens, again.Tokens);
+        if (speculate)
+            Assert.True(model.BatchedSpecVerifySteps > verified, "the resumed request never verified a draft");
+    }
+
     /// <summary>n-gram drafts (accepted and rejected): the verify keeps each row's recurrent and PLE state, and the
     /// accept count commits the kept prefix's n-gram and conv histories.</summary>
     /// <summary>Tensor parallelism as per-rank graphs on two simulated devices: the heads and experts split, the

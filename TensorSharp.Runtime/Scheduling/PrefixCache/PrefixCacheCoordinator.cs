@@ -142,19 +142,22 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     internal int GetScope(SequenceState sequence) { EnsureRequest(sequence); return _requests[sequence].Scope; }
     internal MediaSpanRecord[] GetSpans(SequenceState sequence) { EnsureRequest(sequence); return _requests[sequence].Spans; }
 
-    internal MatchRequest BuildRequest(SequenceState sequence, ExpectedRoute route)
+    /// <param name="promptEnd">Match up to the prompt's very end, which only a checkpoint that kept the
+    /// prompt's last logits serves (<see cref="TryPlanPromptEnd"/>).</param>
+    internal MatchRequest BuildRequest(SequenceState sequence, ExpectedRoute route, bool promptEnd = false)
     {
         KeyRope key = GetKey(sequence);
-        // At least one prompt token is always forwarded, for the logits (K6). A family may need more: DeepSeek
-        // V4.1 records the rewind checkpoint its next thinking turn depends on only at the end of a
-        // MULTI-token forward, so a regenerate that forwarded a single token left none behind.
-        int limit = sequence.PromptTokens.Count - Math.Max(1, _tree.Caps.MinTailPrefillTokens);
+        // At least one prompt token is always forwarded, for the logits (K6), unless a checkpoint kept them.
+        // A family may need more: DeepSeek V4.1 records the rewind checkpoint its next thinking turn depends
+        // on only at the end of a MULTI-token forward, so a regenerate that forwarded a single token left none behind.
+        int limit = promptEnd ? sequence.PromptTokens.Count
+            : sequence.PromptTokens.Count - Math.Max(1, _tree.Caps.MinTailPrefillTokens);
         if (sequence.CacheBreakpoints is not null) limit = Math.Min(limit, sequence.CacheBreakpointLimit);
         // Some vision encoders require the original prefill boundary to preserve positions.
         if (!_model.CanPrefillMediaAfterReusedPrefix(sequence.PromptTokens.Count) && sequence.MediaSpans.Count > 0)
             limit = Math.Min(limit, CheckpointsSupported ? sequence.SharedPrefixTokens : 0);
         return new MatchRequest(key, sequence.PromptTokens.Count, GetScope(sequence), sequence.SharedPrefixTokens,
-            Math.Max(0, limit), GetSpans(sequence), route, PrimaryAvailable);
+            Math.Max(0, limit), GetSpans(sequence), route, PrimaryAvailable, promptEnd);
     }
 
     /// <summary>Every step of the model runs on per-request slots (<see cref="ExecutionPathKind.Unified"/>), whatever
@@ -179,6 +182,12 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         RequiresSoleAdmission = false;
         LastSource = null;
         TryRestoreCheckpoint(sequence);
+        if (TryPlanPromptEnd(sequence))
+        {
+            LastBlockedByScope = _plan.BlockedByScope;
+            LastDeclineReason = null;
+            return _plan.Length;
+        }
         var request = BuildRequest(sequence, PredictRoute());
         _tree.Plan(request, _plan);
         if (request.Route == ExpectedRoute.Primary
@@ -216,6 +225,42 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             LastDeclineReason = "the live cache is not continued for a request with explicit cache breakpoints";
         }
         return _plan.Length;
+    }
+
+    /// <summary>
+    /// Whether a checkpoint at the very end of <paramref name="sequence"/>'s prompt keeps the prompt's
+    /// last logits (<see cref="EndStatePayload.PromptLogits"/>). A recurrent cache cannot rewind, so a
+    /// state saved at the complete prompt serves the same prompt again only with the row the first
+    /// token is drawn from; with it, the prompt takes its automatic checkpoint after its last step
+    /// instead of one token short of it (which split every prompt's last step in two: a whole extra
+    /// weight pass). Not for a family that must forward more than the last token on a reuse
+    /// (<see cref="PrefixCacheCapabilities.MinTailPrefillTokens"/>), a prompt with media (its boundaries
+    /// stay before its spans and its tail), an explicit cache policy, or a route that cannot resume a
+    /// holder: those keep the checkpoint before the tail.
+    /// </summary>
+    private bool PromptEndKeepsLogits(SequenceState sequence)
+        => _tree.Caps.Truncation == TruncationKind.None && _tree.Caps.MinTailPrefillTokens <= 1
+           && sequence.MediaSpans.Count == 0 && sequence.CacheBreakpoints is null
+           && PredictRoute() == ExpectedRoute.PerSequenceFused;
+
+    /// <summary>
+    /// Plans <paramref name="sequence"/> from a checkpoint at its prompt's very end that kept the
+    /// prompt's last logits: the same prompt sent again resumes there with nothing to prefill, its
+    /// first token drawn from those logits (<see cref="TryAdopt"/> hands them to the sequence). False,
+    /// with the plan reset, when there is none to use; the prompt is then planned as any other.
+    /// </summary>
+    private bool TryPlanPromptEnd(SequenceState sequence)
+    {
+        if (!CheckpointsSupported || sequence.CacheScope is null || sequence.OutputTokens.Count != 0
+            || !PromptEndKeepsLogits(sequence))
+            return false;
+        _tree.Plan(BuildRequest(sequence, ExpectedRoute.PerSequenceFused, promptEnd: true), _plan);
+        if (_plan.Kind == CandidateKind.EndState && _plan.Length == sequence.PromptTokens.Count
+            && _plan.Mode is MaterializeMode.CloneEndState or MaterializeMode.DonateEndState
+            && _plan.PayloadNode?.EndState?.PromptLogits is not null && !IsPagedEndState(_plan))
+            return true;
+        _plan.Reset();
+        return false;
     }
 
     /// <summary>The first specific reason a plan reused nothing: a rewind of the cached conversation, then
@@ -397,6 +442,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                 if (sharesKv) RecordCloneSharer(payload.Key, sequence, length / _pool.BlockSize);
                 sequence.SetComputedTokensForPrefixAdoption(length);
                 sequence.PrefixCacheReusedTokens = length;
+                // Resumed at the prompt's end (TryPlanPromptEnd): the first token is drawn from the logits the
+                // checkpoint kept, as from the row a prefill would compute. A copy: sampling rewrites them in place.
+                if (length == sequence.PromptTokens.Count && payload.PromptLogits is { } promptLogits)
+                    sequence.LastLogits = (float[])promptLogits.Clone();
                 sequence.PrefixCheckpointTaken = length >= sequence.SharedPrefixTokens && sequence.SharedPrefixTokens > 0;
                 transferred = true;
                 LastSource = primary ? "radix primary cache" : "radix end state";
@@ -430,11 +479,13 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     }
 
     /// <summary>The private checkpoint a later retry or branch can actually resume.
-    /// A non-rewindable recurrent state saved at the complete prompt cannot serve
-    /// the same prompt again: admission must leave a tail to produce logits. Save
-    /// before that tail, or before the newest image/audio span when it can change
-    /// between agent steps. The latter also avoids copying the media's K/V only to
-    /// discard it on the next screenshot. Public and explicit boundaries retain
+    /// A non-rewindable recurrent state saved at the complete prompt serves the same
+    /// prompt again only with the logits of its last row, so the checkpoint at the
+    /// prompt's end keeps them (<see cref="PromptEndKeepsLogits"/>) and the prompt runs
+    /// its last step whole. Where it cannot keep them, admission must leave a tail to
+    /// produce logits: save before that tail, or before the newest image/audio span when
+    /// it can change between agent steps. The latter also avoids copying the media's K/V
+    /// only to discard it on the next screenshot. Public and explicit boundaries retain
     /// their existing meaning.</summary>
     internal int AutomaticCheckpointBoundary(SequenceState sequence)
     {
@@ -442,7 +493,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             || sequence.CacheBreakpoints is not null)
             return 0;
         int length = sequence.PromptTokens.Count;
-        if (_tree.Caps.Truncation == TruncationKind.None)
+        if (_tree.Caps.Truncation == TruncationKind.None && !PromptEndKeepsLogits(sequence))
         {
             length -= Math.Max(1, _tree.Caps.MinTailPrefillTokens);
             // Only the latest span needs a branch checkpoint when prior media
@@ -459,9 +510,9 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         }
         if (length <= sequence.SharedPrefixTokens || length < _tree.Caps.MinRetainTokens)
             return 0;
-        // The checkpoint splits the prompt's last forward in two, so every request pays a
-        // whole extra weight pass for it (a 1-row forward: ~19 ms on the 27B NInfer engine,
-        // more than an 8-row verify). It only pays back when a later request repeats this
+        // The checkpoint copies the request's whole state (and, before a tail, splits the
+        // prompt's last forward in two: a whole extra weight pass, ~19 ms on a 27B target).
+        // It only pays back when a later request repeats this
         // exact prompt AND the tokens it protects - those no other checkpoint already covers
         // (the public shared prefix, or what this request itself resumed from) - would be
         // expensive to recompute. A continuing conversation whose reply is rendered back
@@ -534,7 +585,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             if (!captured && ReleaseOldestScopedPayload())
                 captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
             if (!captured) return;
-            published = Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy);
+            float[]? promptLogits = automaticBoundary && !publicBoundary ? PromptEndLogits(sequence, length) : null;
+            published = Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy, promptLogits);
         }
         finally
         {
@@ -543,6 +595,19 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         if (published && publicBoundary)
             SaveCheckpoint(sequence, key, length, footprint);
         Trim();
+    }
+
+    /// <summary>A copy of the logits of <paramref name="sequence"/>'s last prompt row, for its automatic
+    /// checkpoint at the prompt's end (<see cref="PromptEndKeepsLogits"/>), taken right after the step
+    /// that computed them and before anything samples (and so rewrites) them. Null when the checkpoint
+    /// is anywhere else or the step left no logits on the host; such a checkpoint still serves every
+    /// longer prompt, only not this one again.</summary>
+    private float[]? PromptEndLogits(SequenceState sequence, int length)
+    {
+        if (length != sequence.PromptTokens.Count || sequence.OutputTokens.Count != 0
+            || sequence.LastLogits is not { Length: > 0 } logits || !PromptEndKeepsLogits(sequence))
+            return null;
+        return (float[])logits.Clone();
     }
 
     private static readonly bool ReleaseDebug = Environment.GetEnvironmentVariable("TS_PREFIX_RELEASE_DEBUG") == "1";
@@ -632,7 +697,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         else _tree.CollectIfEmpty(node);
     }
 
-    private bool Publish(RadixNode node, string key, PayloadFootprint footprint, int length, PayloadOrigin origin)
+    /// <param name="promptLogits">The prompt's last logits a checkpoint at its end keeps
+    /// (<see cref="EndStatePayload.PromptLogits"/>), charged with the model's bytes; null for none.</param>
+    private bool Publish(RadixNode node, string key, PayloadFootprint footprint, int length, PayloadOrigin origin,
+        float[]? promptLogits = null)
     {
         if (footprint.Tokens != length)
         {
@@ -643,7 +711,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         var result = _tree.AttachEndState(node, new EndStatePayload
         {
             Key = key, Kind = _tree.Caps.Class == FamilyClass.N ? EndStateKind.NativeSlot : EndStateKind.Holder,
-            Origin = origin, Footprint = footprint, DeviceDirty = origin != PayloadOrigin.CaptureCopy,
+            Origin = origin, DeviceDirty = origin != PayloadOrigin.CaptureCopy,
+            Footprint = promptLogits is null ? footprint
+                : footprint with { Bytes = footprint.Bytes + EndStatePayload.PromptLogitsBytes(promptLogits) },
+            PromptLogits = promptLogits,
         });
         if (result == AttachResult.Refused)
         {

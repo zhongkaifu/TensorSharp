@@ -118,10 +118,12 @@ internal sealed class ResumabilityRules
         return ClampLength(x, r, ref ignored);
     }
 
-    /// <summary>λ bounded by the key: at least one token stays un-matched (K6).</summary>
+    /// <summary>λ bounded by the key: at least one token stays un-matched (K6), unless the request asks for
+    /// the prompt's end (<see cref="MatchRequest.PromptEnd"/>), which only an end state that kept the
+    /// prompt's last logits serves (PrefixTree.EvaluateEndStates).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int EffectiveMatchLimit(in MatchRequest r) =>
-        Math.Max(0, Math.Min(r.MatchLimit, Math.Min(r.KeyLength - 1, r.Key.Length)));
+        Math.Max(0, Math.Min(r.MatchLimit, Math.Min(r.KeyLength - (r.PromptEnd ? 0 : 1), r.Key.Length)));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int AlignDown(int x, int granularity) => granularity <= 1 ? x : x - (x % granularity);

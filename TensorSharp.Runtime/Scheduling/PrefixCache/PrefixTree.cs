@@ -549,7 +549,11 @@ internal sealed class PrefixTree
                 continue;
             }
             ClampReasons local = ClampReasons.None;
-            if (Rules.ClampLength(length, r, ref local) != length)
+            // The prompt's end serves only a state that kept the prompt's last logits: anything else
+            // leaves the last token to forward for them (K6).
+            if (r.PromptEnd && length >= r.KeyLength && c.EndState.PromptLogits is null)
+                local |= ClampReasons.LeaveOne;
+            if (local != ClampReasons.None || Rules.ClampLength(length, r, ref local) != length)
             {
                 CandidateKind declined = primary ? CandidateKind.PrimaryResident : CandidateKind.EndState;
                 clamps |= local;

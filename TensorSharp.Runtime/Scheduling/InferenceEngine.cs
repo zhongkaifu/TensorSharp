@@ -502,6 +502,7 @@ namespace TensorSharp.Runtime.Scheduling
                         continue;
                     }
 
+                    PublishResumedFirstTokens(output);
                     try
                     {
                         results = _executor.ExecuteStep(output);
@@ -1203,6 +1204,31 @@ namespace TensorSharp.Runtime.Scheduling
                 return;
             handle.PublishToken(token);
             seq.EarlyFirstTokenPublished = true;
+        }
+
+        /// <summary>A request resumed at its prompt's end from a checkpoint that kept the prompt's
+        /// last logits (<see cref="SequenceState.ResumedAtPromptEnd"/>) has no prompt step after
+        /// which <see cref="PublishEarlyFirstToken"/> would stream its first token: it is drawn from
+        /// those logits and streamed now, before the step that forwards it, as for a prefilled prompt.
+        /// A draw that fails is left to that step, which draws again and fails only that request.</summary>
+        private void PublishResumedFirstTokens(SchedulerOutput output)
+        {
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                if (work.IsPrefill || seq.EarlyFirstToken >= 0 || !seq.ResumedAtPromptEnd
+                    || !_handles.TryGetValue(seq.RequestId, out var handle))
+                    continue;
+                try
+                {
+                    PublishEarlyFirstToken(seq, handle);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Drawing the first token of {EngineRequestId} from its checkpoint's logits failed; its step draws it.",
+                        seq.RequestId);
+                }
+            }
         }
 
         /// <summary>Drop speculatively accepted tokens past a mid-batch stop

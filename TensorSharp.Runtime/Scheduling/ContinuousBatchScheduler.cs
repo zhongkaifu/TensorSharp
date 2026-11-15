@@ -586,7 +586,11 @@ namespace TensorSharp.Runtime.Scheduling
                 }
 
                 int promptUncomputed = Math.Max(0, seq.PromptTokens.Count - seq.NumComputedTokens);
-                if (promptUncomputed <= 0)
+                // Resumed at the prompt's end from a checkpoint that kept the prompt's last logits:
+                // nothing is left to prefill, so its first step is the decode that draws the first
+                // token from those logits and forwards it.
+                bool decodesFirst = promptUncomputed == 0 && seq.ResumedAtPromptEnd;
+                if (promptUncomputed <= 0 && !decodesFirst)
                 {
                     // The whole prompt was a prefix-cache hit. Force a 1-token
                     // forward to produce fresh logits.
@@ -596,19 +600,27 @@ namespace TensorSharp.Runtime.Scheduling
                 // The first prompt of an idle engine, when the requests behind it share its
                 // prefix and only its lone step can publish it: they wait (above), so it takes
                 // a lone prompt's step, cut where the prefix they share ends.
-                int pageBoundary = pageProducer == null && _running.Count == 0 && output.ScheduledWork.Count == 0
+                int pageBoundary = !decodesFirst && pageProducer == null && _running.Count == 0 && output.ScheduledWork.Count == 0
                     ? LonePagePublishBoundary(seq) : 0;
-                bool lone = noContention || pageBoundary > 0;
-                int cap = GetPrefillCap(
-                    lone, hasActiveDecode, tokenBudget,
-                    Math.Max(1, prefillCandidatesRemaining), soloPrefillCap);
-                if (lone) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
-                int desired = Math.Min(promptUncomputed, cap);
-                int want = Math.Min(desired, Math.Min(tokenBudget, mixedPrefillLeft));
-                want = RunTinyRemainder(seq, want, desired, tokenBudget);
-                want = AlignRecurrentPrefillBoundary(seq, want, promptUncomputed);
-                want = AlignSharedPrefixBoundary(seq, want);
-                want = CutAtBoundary(seq, want, pageBoundary);
+                int desired, want;
+                if (decodesFirst)
+                {
+                    desired = want = 1;
+                }
+                else
+                {
+                    bool lone = noContention || pageBoundary > 0;
+                    int cap = GetPrefillCap(
+                        lone, hasActiveDecode, tokenBudget,
+                        Math.Max(1, prefillCandidatesRemaining), soloPrefillCap);
+                    if (lone) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
+                    desired = Math.Min(promptUncomputed, cap);
+                    want = Math.Min(desired, Math.Min(tokenBudget, mixedPrefillLeft));
+                    want = RunTinyRemainder(seq, want, desired, tokenBudget);
+                    want = AlignRecurrentPrefillBoundary(seq, want, promptUncomputed);
+                    want = AlignSharedPrefixBoundary(seq, want);
+                    want = CutAtBoundary(seq, want, pageBoundary);
+                }
                 if (want <= 0) break;
 
                 if (!TryEnsureBlocksForStep(seq, want))
@@ -629,12 +641,13 @@ namespace TensorSharp.Runtime.Scheduling
                 // reader only asks whether the sequence was ever scheduled.
                 seq.FirstScheduledAt ??= DateTime.UtcNow;
 
-                bool isPrefill = want > 1 || promptUncomputed > 0;
+                bool isPrefill = !decodesFirst && (want > 1 || promptUncomputed > 0);
                 output.ScheduledWork.Add(new ScheduledSequenceWork(seq, want, true, isPrefill));
                 if (pageBoundary > 0)
                     NotePageProducer(seq, want, ref pageProducer, ref pageProducerEnd);
                 tokenBudget -= want;
-                mixedPrefillLeft -= want;
+                if (isPrefill)
+                    mixedPrefillLeft -= want;
                 prefillCandidatesRemaining = Math.Max(0, prefillCandidatesRemaining - 1);
                 if (want < desired)
                     _nextPrefillRequestId = seq.RequestId;

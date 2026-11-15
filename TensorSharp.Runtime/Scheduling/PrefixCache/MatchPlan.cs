@@ -67,7 +67,8 @@ internal readonly record struct MatchRequest(
     int MatchLimit,                          // λ = min(len−1, explicit ? CacheBreakpointLimit : len−1)   (K6, K7)
     MediaSpanRecord[] Spans,
     ExpectedRoute Route,                     // from ExecutionPlanner.PredictAdmissionRoute (§7.3)
-    bool PrimaryAvailable);                  // running == 0 && no scheduled work this step
+    bool PrimaryAvailable,                   // running == 0 && no scheduled work this step
+    bool PromptEnd = false);                 // an end state that kept the prompt's last logits may end AT len (K6 waived)
 
 /// <summary>One matched node on a trail: <c>Matched</c> elements of its edge, starting at <c>StartDepth</c>.</summary>
 internal readonly record struct TrailEntry(RadixNode Node, int StartDepth, int Matched, int Prev)

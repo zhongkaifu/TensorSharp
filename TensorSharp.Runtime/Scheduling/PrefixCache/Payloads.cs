@@ -129,7 +129,16 @@ internal sealed class EndStatePayload
     internal bool DeviceDirty;            // donated holder with device-authoritative state; settle before clone (§6)
     internal bool Persisted;
 
+    /// <summary>The logits of the last row of the prompt this checkpoint ends (the whole vocabulary, as
+    /// the step that computed them returned them), kept so the same prompt resumes here with nothing
+    /// left to prefill: its first token is drawn from these exactly as from a computed row. Null for
+    /// every other payload. Charged to <see cref="Footprint"/> as host bytes.</summary>
+    internal float[]? PromptLogits;
+
     internal ResourceVector Bytes => Kind == EndStateKind.PrimaryResident ? default : Footprint.Bytes;
+
+    /// <summary>The host bytes <paramref name="logits"/> add to a payload that keeps them.</summary>
+    internal static ResourceVector PromptLogitsBytes(float[] logits) => new() { HostKv = (long)logits.Length * sizeof(float) };
 }
 
 /// <summary>The store of record of a page's bytes (P15, G-03).</summary>

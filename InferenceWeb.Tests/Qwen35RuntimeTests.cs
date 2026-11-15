@@ -1631,6 +1631,63 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>A prompt's automatic checkpoint is taken after its last step and keeps that step's last logits
+    /// (the recurrent state cannot rewind to a tail), so the same prompt sent again resumes at its very end with
+    /// nothing to prefill, and draws the greedy tokens of the run that computed the row and of a cold engine.</summary>
+    [Fact]
+    public Task AnIdenticalPromptResumesAtItsEndOnTheManagedBackend()
+        => AssertIdenticalPromptResumesAtItsEnd(BackendType.Cpu, KvCacheDtype.F32);
+
+    [CudaFact]
+    public Task AnIdenticalPromptResumesAtItsEndOnDirectCuda()
+        => AssertIdenticalPromptResumesAtItsEnd(BackendType.Cuda, KvCacheDtype.F16);
+
+    private async Task AssertIdenticalPromptResumesAtItsEnd(BackendType backend, KvCacheDtype kv)
+    {
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
+        string path = Fixture("dense");
+        const int maxNewTokens = 8;
+        int[] prompt = Enumerable.Range(0, 45).Select(i => 65 + (i * 7) % 50).ToArray();
+        SchedulerConfig Config(bool prefixCache) => new()
+        {
+            MaxNumBatchedTokens = 256,
+            MaxNumRunningSequences = 4,
+            NumBlocks = 32,
+            BlockSize = 16,
+            EnablePrefixCaching = prefixCache,
+            StopRepetition = false,
+        };
+        static async Task<(int[] Tokens, InferenceCompletion Completion)> Serve(InferenceEngine engine, string id, int[] prompt)
+        {
+            var handle = engine.SubmitRequest(new SequenceState(id, prompt, maxNewTokens, 16, SamplingConfig.Greedy,
+                cacheScope: "conversation"));
+            var tokens = new List<int>();
+            await foreach (int t in handle.Tokens.ReadAllAsync())
+                tokens.Add(t);
+            var completion = await handle.Completion;
+            await engine.WhenStepSettledAsync();
+            return (tokens.ToArray(), completion);
+        }
+
+        int[] cold;
+        using (var reference = Create(path, backend: backend))
+        using (var coldEngine = new InferenceEngine(reference, Config(false), NullLogger.Instance))
+            cold = (await Serve(coldEngine, "cold", prompt).WaitAsync(TimeSpan.FromMinutes(3))).Tokens;
+
+        using var model = Create(path, backend: backend);
+        Assert.True(model.SupportsPrefixCheckpoints);
+        using var engine = new InferenceEngine(model, Config(true), NullLogger.Instance);
+        var first = await Serve(engine, "first", prompt).WaitAsync(TimeSpan.FromMinutes(3));
+        var again = await Serve(engine, "again", prompt).WaitAsync(TimeSpan.FromMinutes(3));
+        _output.WriteLine($"{backend}: cold [{string.Join(",", cold)}] first [{string.Join(",", first.Tokens)}] " +
+            $"again [{string.Join(",", again.Tokens)}] reused {again.Completion.PrefixCacheReusedTokens}");
+        Assert.True(cold.Length > 0, "the cold run produced nothing");
+        Assert.Equal(0, first.Completion.PrefixCacheReusedTokens);
+        Assert.Equal(prompt.Length, again.Completion.PrefixCacheReusedTokens);
+        Assert.Equal(cold, first.Tokens);
+        Assert.Equal(first.Tokens, again.Tokens);
+    }
+
     /// <summary>On one Metal or CUDA device a new request's slot must fit beside the running requests' (else it waits:
     /// <see cref="TensorSharp.Runtime.Scheduling.SequenceSlotUnavailableException"/>), a lone request always gets one, and
     /// the prefix cache is asked to free what one more fresh slot lacks (as Qwen4ExpModel admits its holders).</summary>
