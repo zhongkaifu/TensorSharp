@@ -1509,7 +1509,16 @@ namespace TensorSharp.Graph
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));
                 case GraphOp.MoeHostExperts: return V(HostExperts(T(0), values[n.Srcs[1]], values[n.Srcs[2]], values[n.Srcs[3]],
                     values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run));
-                case GraphOp.Reshape: return V(Contig(T(0), run).View(Sizes(n.Ip)));
+                case GraphOp.Reshape:
+                {
+                    // A relaid row block (a packed product's column block, rows a pitch apart) reshaped within its rows stays
+                    // a view of them, relaid too (Qwen3.8-27B's gated delta net copied its gate rows out of the in-projection's
+                    // product here, 50 MB a layer for a 2K-row chunk, for a region that reads them where they are).
+                    long[] sizes = Sizes(n.Ip);
+                    if (values[n.Srcs[0]].Relaid && RowsReshaped(T(0), sizes) is { } rows)
+                        return new Value { Tensor = run.Keep(rows), Relaid = true };
+                    return V(Contig(T(0), run).View(sizes));
+                }
                 case GraphOp.View:
                 {
                     Value src = values[n.Srcs[0]];
@@ -2055,6 +2064,26 @@ namespace TensorSharp.Graph
                 strides[i] = nb[3 - i] / elem;
             }
             return Checked(new Tensor(sizes, strides, src.Storage, src.StorageOffset + ip[8] / elem), "view");
+        }
+
+        /// <summary>
+        /// <paramref name="t"/> [rows, width] (rows a pitch apart, each contiguous) as <paramref name="sizes"/> [rows, ...]
+        /// whose inner extents split a row: a view of the same bytes. Null for any other shape.
+        /// </summary>
+        private static Tensor RowsReshaped(Tensor t, long[] sizes)
+        {
+            if (t.DimensionCount != 2 || t.Strides[1] != 1 || sizes.Length < 2 || sizes[0] != t.Sizes[0] || t.Sizes[0] < 2)
+                return null;
+            var strides = new long[sizes.Length];
+            long inner = 1;
+            for (int i = sizes.Length - 1; i >= 1; i--)
+            {
+                strides[i] = inner;
+                inner *= sizes[i];
+            }
+            if (inner != t.Sizes[1]) return null;
+            strides[0] = t.Strides[0];
+            return Checked(new Tensor(sizes, strides, t.Storage, t.StorageOffset), "reshape");
         }
 
         /// <summary>A view must stay inside its storage: kernels write through views (cache rows, state
