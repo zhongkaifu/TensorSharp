@@ -12,65 +12,6 @@ public sealed class CudaPtxBuildSettingsTests
     private const string Nvcc128 = "Cuda compilation tools, release 12.8, V12.8.93";
 
     [Theory]
-    [InlineData("compute_75", "", false, false, false)]
-    [InlineData("compute_80", "", false, false, false)]
-    [InlineData("compute_120", "", false, false, true)]
-    [InlineData("sm_120a", "", false, false, true)]
-    [InlineData("compute_121", "", false, false, false)]
-    [InlineData("compute_75", "75,86,120", false, false, true)]
-    [InlineData("compute_120", "", true, false, false)]
-    [InlineData("compute_120", "", false, true, false)]
-    public async Task OptionalVerify8BuildNeverAddsTheCoreToPortableOrSkippedBuilds(string architecture,
-        string fatbins, bool skip, bool refresh, bool expected)
-    {
-        var result = await RunTarget("ResolveNinferVerify8BuildPolicy", new()
-        {
-            ["_ResolvedCudaArch"] = architecture, ["_NvccExitCode"] = "0",
-            ["TensorSharpSkipCudaPtx"] = skip ? "true" : "false", ["TensorSharpUpdateCommittedPtx"] = refresh ? "true" : "false"
-        }, new() { ["CudaFatbinArchitectures"] = fatbins }, "_NinferVerify8BuildEnabled,_NinferVerify8Flags");
-        Assert.Equal(0, result.ExitCode);
-        using var json = JsonDocument.Parse(result.Output);
-        Assert.Equal(expected ? "true" : "false", json.RootElement.GetProperty("Properties").GetProperty("_NinferVerify8BuildEnabled").GetString());
-    }
-
-    [Theory]
-    [InlineData("compute_75", false)]
-    [InlineData("compute_120", true)]
-    public async Task OptionalVerify8UsesItsOwnFixedCompilerFlagsAndPairedPublishAssets(string architecture, bool expected)
-    {
-        string directory = NewDirectory(), tools = Path.Combine(directory, "tools"), output = Path.Combine(directory, "verify8");
-        Directory.CreateDirectory(tools);
-        try
-        {
-            string compiler = FakeCompilingNvcc(tools);
-            var result = await RunTarget("SelectNinferVerify8AttentionContent", new()
-            {
-                ["CudaArch"] = architecture, ["CudaNvcc"] = compiler, ["NinferVerify8OutputDir"] = output,
-                // These global settings must not relax the dedicated core.
-                ["CudaEnableFastMath"] = "true", ["CudaNvccOptimizationFlags"] = "-O0"
-            }, getProperties: "_NinferVerify8BuildEnabled,_NinferVerify8Flags", getItems: "Content");
-            Assert.True(result.ExitCode == 0, result.Output + result.Error);
-            using var json = JsonDocument.Parse(result.Output);
-            string flags = json.RootElement.GetProperty("Properties").GetProperty("_NinferVerify8Flags").GetString()!;
-            Assert.Contains("-std=c++20 -O3 --ftz=false --fmad=true -arch=sm_120a", flags);
-            Assert.DoesNotContain("--use_fast_math", flags); Assert.DoesNotContain("-O0", flags);
-            var assets = json.RootElement.GetProperty("Items").GetProperty("Content").EnumerateArray()
-                .Where(x => x.TryGetProperty("Link", out var link) && link.GetString()!.Contains("tensorsharp_ninfer_prefill_attention.")).ToArray();
-            Assert.True(assets.Length == (expected ? 3 : 0), result.Output + result.Error);
-            Assert.Equal(expected, File.Exists(Path.Combine(output, "tensorsharp_ninfer_prefill_attention.fatbin")));
-            if (expected)
-            {
-                Assert.All(assets, x => { Assert.Equal("PreserveNewest", x.GetProperty("CopyToOutputDirectory").GetString()); Assert.Equal("PreserveNewest", x.GetProperty("CopyToPublishDirectory").GetString());
-                    Assert.Equal("cuda_kernels/" + Path.GetFileName(x.GetProperty("Identity").GetString()), x.GetProperty("Link").GetString()!.Replace('\\', '/')); });
-                string ptx = Path.Combine(output, "tensorsharp_ninfer_prefill_attention.ptx");
-                Assert.Equal(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(ptx))),
-                    File.ReadAllText(Path.Combine(output, "tensorsharp_ninfer_prefill_attention.fatbin.sha256")).Trim(), ignoreCase: true);
-            }
-        }
-        finally { Directory.Delete(directory, true); }
-    }
-
-    [Theory]
     [InlineData(true, null, "compute_120", "compute_86", "compute_75")]
     [InlineData(true, "auto", "compute_120", "compute_86", "compute_75")]
     [InlineData(true, "native", "compute_120", "compute_86", "compute_75")]
@@ -183,7 +124,7 @@ public sealed class CudaPtxBuildSettingsTests
     }
 
     [Fact]
-    public async Task RefreshCompilesButNeverCommitsTheSm80OnlyQwen35Kernels()
+    public async Task RefreshCompilesButNeverCommitsTheArchSpecificFp4Kernels()
     {
         string directory = NewDirectory();
         string tools = Path.Combine(directory, "tools"), kernels = Path.Combine(directory, "kernels");
@@ -191,7 +132,7 @@ public sealed class CudaPtxBuildSettingsTests
         string baseline = Path.Combine(directory, "baseline");
         foreach (string path in new[] { tools, kernels, intermediate, stamps, baseline }) Directory.CreateDirectory(path);
         string stub = FakeCompilingNvcc(tools);
-        foreach (string kernel in new[] { "probe.cu", "tensorsharp_q35_kernels.cu" })
+        foreach (string kernel in new[] { "probe.cu", "tensorsharp_fp4_kernels.cu" })
             File.WriteAllText(Path.Combine(kernels, kernel), "// fake\n");
         try
         {
@@ -199,9 +140,9 @@ public sealed class CudaPtxBuildSettingsTests
             properties["CudaNvcc"] = stub;   // the side-by-side toolkit a refresh points at
             var result = await RunTarget("CompileCudaPtx", properties);
             Assert.True(result.ExitCode == 0, result.Output + result.Error);
-            Assert.True(File.Exists(Path.Combine(intermediate, "tensorsharp_q35_kernels.ptx")));
+            Assert.True(File.Exists(Path.Combine(intermediate, "tensorsharp_fp4_kernels.ptx")));
             Assert.True(File.Exists(Path.Combine(baseline, "probe.ptx")));
-            Assert.False(File.Exists(Path.Combine(baseline, "tensorsharp_q35_kernels.ptx")));
+            Assert.False(File.Exists(Path.Combine(baseline, "tensorsharp_fp4_kernels.ptx")));
         }
         finally { Directory.Delete(directory, recursive: true); }
     }

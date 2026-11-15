@@ -161,15 +161,6 @@ namespace TensorSharp.Cuda
         /// <summary>Reserve <paramref name="bytes"/> of uninitialized arena memory; returns the device address.</summary>
         public IntPtr Reserve(long bytes) => Take(bytes);
 
-        /// <summary>Copy <paramref name="bytes"/> from host memory into the arena now; returns the device
-        /// address. The device's context must be current.</summary>
-        public IntPtr PlaceBytes(IntPtr host, long bytes)
-        {
-            IntPtr p = Take(bytes);
-            CudaDriverApi.cuMemcpyHtoD(p, host, new UIntPtr((ulong)bytes)).ThrowOnError();
-            return p;
-        }
-
         /// <summary>Place a weight; an invalid descriptor yields a default (absent) weight. The
         /// device's context must be current.</summary>
         public DeviceWeight Place(in CudaWeightDesc qw)

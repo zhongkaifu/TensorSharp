@@ -24,7 +24,7 @@ public partial class SpeculativeExecutionTests
         using var block = FixedGovernorBlock(target);
         var profile = SpeculationGovernorFactory.Describe(target, block, true, null);
         Assert.False(profile.Enabled);
-        Assert.Equal("qualified-native-ninfer-dflash-k7", profile.Source);
+        Assert.Equal("qualified-fixed-cost-block-k7", profile.Source);
         Assert.Equal(7, profile.MaxDraft);
         Assert.Equal(0f, profile.MinProbability);
         Assert.Same(target, profile.Head);

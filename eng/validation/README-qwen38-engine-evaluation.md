@@ -10,14 +10,12 @@ an unavailable private workload. Generated evidence belongs in ignored
 ## TensorSharp backend and model route
 
 The native evaluation uses `TS_BACKEND=cuda` (the launcher's default), producing
-`--backend cuda`. With this dense NVFP4 GGUF, one device and `TS_Q35_NATIVE`
-unset, the actual model is `Qwen35CudaModel`. Its startup log must contain
-`Model: qwen35 on the direct-CUDA engine`. Check the recorded argv, environment
-and startup log together: the backend argument alone does not establish which
-Qwen model implementation was selected.
+`--backend cuda`. Qwen 3.5 / 3.6 / 3.8 always load the shared decoder runtime
+(`Qwen35RuntimeModel`); on `--backend cuda` its graphs run on the CUDA graph
+executor (`CudaGraphExecutor`). Check the recorded argv, environment and startup
+log together. Results recorded before the direct-CUDA engine (`Qwen35CudaModel`)
+was removed measured that engine, not the current runtime: keep them apart.
 
-`TS_Q35_NATIVE=0` selects the shared decoder runtime (`Qwen35RuntimeModel`) on
-the CUDA tensor backend. Label its state-residency diagnostics separately.
 `--backend ggml_cuda` selects another backend and is not part of this native
 performance matrix. The earlier configurations in
 `README-qwen38-perf-configurations.md` document a separate ggml CUDA campaign.

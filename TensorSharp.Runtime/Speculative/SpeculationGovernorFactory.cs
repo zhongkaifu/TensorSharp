@@ -30,7 +30,7 @@ internal static class SpeculationGovernorFactory
         // other nonnull value enables. A null value permits this narrow default.
         bool enabled = explicitAdaptive != null ? explicitAdaptive != "0" : !fixedProfile;
         string source = explicitAdaptive != null ? "explicit-TS_SPEC_ADAPTIVE"
-            : fixedProfile ? "qualified-native-ninfer-dflash-k7" : "legacy-default";
+            : fixedProfile ? "qualified-fixed-cost-block-k7" : "legacy-default";
         return new(target, (object?)block?.HeadIdentity ?? target, speculator.GetType(), k,
             speculator.MinDraftProb, enabled, source);
     }

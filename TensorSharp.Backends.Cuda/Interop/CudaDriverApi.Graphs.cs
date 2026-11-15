@@ -65,6 +65,11 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName, EntryPoint = "cuGraphExecKernelNodeSetParams_v2")]
         public static partial int cuGraphExecKernelNodeSetParams(IntPtr graphExec, IntPtr node, in CudaKernelNodeParams parameters);
 
+        /// <summary>A kernel's parameter <paramref name="index"/>: its offset and size in the parameter buffer; an error past
+        /// the last.</summary>
+        [LibraryImport(LibName)]
+        public static partial int cuFuncGetParamInfo(IntPtr function, UIntPtr index, out UIntPtr offset, out UIntPtr size);
+
         /// <summary>A library kernel's parameter <paramref name="index"/> (a node recorded from a runtime launch names its
         /// kernel this way, with no function).</summary>
         [LibraryImport(LibName)]

@@ -154,8 +154,8 @@ newer) can JIT; a driver rejects PTX newer than itself. The refresh resolves
 `CudaArch=auto` and `native` to that target and rejects any other explicit
 target; it fails before compiling unless the `nvcc` it runs (`-p:CudaNvcc`,
 else `CUDACXX`, else the one on `PATH`) reports release 13.0, and before copying unless every
-produced PTX reads `release 13.0`, `.version 9.0` and `.target sm_75`. The Qwen3.5
-kernels (`tensorsharp_q35_kernels.cu`, sm_80+ only) are never copied. Refresh on
+produced PTX reads `release 13.0`, `.version 9.0` and `.target sm_75`. The FP4
+tensor-core kernels (`tensorsharp_fp4_kernels.cu`, sm_120a / sm_121a only) are never copied. Refresh on
 Linux: Windows `nvcc` makes `long` 32-bit. Ordinary builds keep automatic GPU
 detection (with no GPU detected they fall back to `compute_75`) and stop with an
 error on a CUDA 12 `nvcc`; GPU-specific local builds should omit

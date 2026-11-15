@@ -15,9 +15,7 @@
   // same speed within the VM's noise; its VRAM peak was 27.4 GB on the 32 GB card with the projector loaded. 24 GB
   // cards were not tested: if it does not fit, drop the projector (--mmproj none) or lower MAX_CONTEXT.
   //
-  // RTX 50-series (sm_120): config/qwen3.8-27b-ninfer.json is faster there (the NVFP4 artifact on the direct CUDA
-  // engine: ~203 tok/s single stream, up to 372 for four requests); its kernels need sm_120. This preset runs on
-  // any GPU ggml_cuda supports, but it was measured on the RTX 5090 only.
+  // This preset runs on any GPU ggml_cuda supports, but it was measured on the RTX 5090 only.
   //
   // For mostly long-prompt work, Tencent's DSpine drafter is faster here: 15 drafts with a 0.35 confidence gate
   // (--spec-draft 15 --spec-pmin 0.35) decode 416-431 tok/s after a 4K prompt and 233-252 after 16K, but 146-160

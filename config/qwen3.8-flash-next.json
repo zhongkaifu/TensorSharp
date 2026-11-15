@@ -15,7 +15,7 @@
   // window slots, and the GPU computes every route; per-request caches start small and grow with the request. See
   // docs/models/qwen38-flash-next.md.
   //
-  // NVIDIA: config/qwen3.8-flash-next-cuda.json (the direct CUDA engine).
+  // NVIDIA: config/qwen3.8-flash-next-cuda.json (--backend cuda).
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "root": "${modelRoot}/qwen3.8-flash-next-ista-q2_0",

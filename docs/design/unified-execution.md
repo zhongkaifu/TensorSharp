@@ -1000,7 +1000,9 @@ from earlier loads ranks them; on unified memory, window slots fill on demand wh
 budgets (`ExpertPlacementPlanner`) are the ones measured for Flash Next.
 
 Direct CUDA (RTX PRO 6000) is not at parity yet: Qwen3.5-0.8B Q8_0 prompt 8,800 / 15,400 tok/s, decode
-209 / 272; 9B prompt 1,800 / 2,300, decode 38.4 / 38.7 (runtime / `Qwen35CudaModel`).
+209 / 272; 9B prompt 1,800 / 2,300, decode 38.4 / 38.7 (runtime / `Qwen35CudaModel`). `Qwen35CudaModel` and the Flash
+Next engine `Qwen4ExpCudaModel` were removed later in 2026-11, so the runtime now serves `--backend cuda` for both families;
+that removal was not re-measured on a GPU.
 
 ---
 

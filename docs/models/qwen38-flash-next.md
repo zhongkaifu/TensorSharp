@@ -23,8 +23,7 @@ image input needs its matching vision projector, such as `mmproj-BF16.gguf` or
 | Hardware | Preset | Files | Measured (2026-11-08) |
 | --- | --- | --- | --- |
 | Apple Silicon, 48 GB | `config/qwen3.8-flash-next.json` | ISTA-DASLab GSQ-RCO `Q2_0` (two shards, 66.4 GB) + DFlash2 Q4_K_M drafter, `ggml_metal` | M5 Pro: decode 43-48 tok/s, 4K / 16K prompt TTFT 5.8-6.0 / 22.7-24.3 s, four requests at once 43.4 tok/s, Strata's sanity checks 12/12 |
-| NVIDIA, 32 GB VRAM + ~45 GB RAM | `config/qwen3.8-flash-next-cuda.json` | the same `Q2_0` + the shared MTP head, direct `cuda` engine | RTX 5090: decode 131-250 tok/s, 4K / 16K / 100K prompt TTFT 1.0 / 4.2 / 30.4 s |
-| NVIDIA, several users | add `config/qwen3.8-flash-next-cuda-4lanes.json` | four sequence lanes | RTX 5090: four requests at once 243-258 tok/s, parallel_4 281-286 tok/s |
+| NVIDIA, 32 GB VRAM + ~45 GB RAM | `config/qwen3.8-flash-next-cuda.json` | the same `Q2_0` + the shared MTP head, `--backend cuda` (the shared runtime on the CUDA graph executor) | not re-measured on the runtime; the removed direct-CUDA engine measured, on an RTX 5090: decode 131-250 tok/s, 4K / 16K / 100K prompt TTFT 1.0 / 4.2 / 30.4 s |
 | Apple Silicon, UD-Q2_K_XL files | `config/qwen3.8-flash-next-ud-q2_k_xl.json` | UD-Q2_K_XL (three shards) + shared MTP head | M5 Pro: ~31 tok/s decode (the previous preset) |
 
 The `Q2_0` files are [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
@@ -33,12 +32,12 @@ The `Q2_0` files are [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggi
 
 ## How TensorSharp runs it
 
-Two implementations serve the family:
+One implementation serves the family:
 
-- `--backend cuda` loads the direct-CUDA engine (`Qwen4ExpCudaModel`, the Q4e kernels; see
-  [Serving on the direct-CUDA engine](#serving-on-the-direct-cuda-engine)).
-- Every other backend (`ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `ggml_cpu`, `cpu`) runs it on the shared decoder
-  runtime (`Qwen4ExpRuntimeModel`). It is the same runtime that serves Qwen 3.5. The family adds only its own parts:
+- Every backend (`ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `ggml_cpu`, `cpu` and `cuda`) runs it on the shared decoder
+  runtime (`Qwen4ExpRuntimeModel`). On `--backend cuda` its graphs run on the CUDA graph executor; see
+  [Serving on `--backend cuda`](#serving-on---backend-cuda). It is the same runtime that serves Qwen 3.5. The family
+  adds only its own parts:
   - the hyper-connection streams;
   - the sigmoid-gated recurrence;
   - the PLE layer, whose n-gram rows are gathered from the on-disk table;
@@ -55,7 +54,7 @@ A step runs as one graph, with the Metal prompt kernels as device operations bet
 Every request has its own slot, so continuous batching, the prefix cache and tensor parallelism come from the shared
 runtime. They are not family code. The same applies to:
 
-- `--tp N`: per-rank graphs on `ggml_cuda` and `ggml_vulkan`.
+- `--tp N`: per-rank graphs on `ggml_cuda`, `ggml_vulkan` and `cuda`.
 - `--layer-split N`: whole-layer stages, and multi-node pipelines.
 - Host experts with accelerator tiers: the routing profile is collected on discrete GPUs too, so the next load keeps
   each layer's most-routed experts in VRAM.
@@ -115,7 +114,10 @@ Further notes:
 > cache. Its GGML-only switches went with it: `TS_Q4E_VERIFY_ROW_KERNELS`, `TS_Q4E_VERIFY_ROW_COMMIT`,
 > `TS_Q4E_DISABLE_ARENA_DECODE`, `TS_Q4E_QSA_POOL_CACHE`, `TS_Q4E_QSA_SPARSE_FA`, `TS_Q4E_LAYER_SPLIT`,
 > `TS_Q4E_PLE_PREFETCH`, `TS_Q4E_METAL_FUSE`, `TS_Q4E_VISION_MERGER_ERF`, `TS_Q4E_RETAINED_CACHE_MB`, the expert
-> cache's `TS_HOST_MOE_EXPERT_CACHE_*` and the debug dumps. Setting one now prints a removal notice. The direct-CUDA engine's `TS_Q4E_*` switches are unchanged.
+> cache's `TS_HOST_MOE_EXPERT_CACHE_*` and the debug dumps. Setting one now prints a removal notice. The direct-CUDA
+> engine (`Qwen4ExpCudaModel`, the Q4e kernels) that `--backend cuda` used to load was removed after it; its sections below
+> are historical too, and its switches stop the server or CLI at startup (see
+> [The direct CUDA engine on one GPU that cannot hold the experts](#the-direct-cuda-engine-on-one-gpu-that-cannot-hold-the-experts-2026-11-07)).
 
 ## Vision encoder memory and validation
 
@@ -707,9 +709,8 @@ it and reads those parts from the SSD as tokens need them.
   llama.cpp's `--lazy-mode`, on by default there for tensors over 4 GiB. Every such load
   logs it:
   `PLE n-gram table: 28.8 GB read on demand from the GGUF mapping, 16 rows a token (random-access advice).`
-  The direct `cuda` engine reads the rows from the mapping too. Both it and the GGML
-  backends warm the table into the page cache in the background after loading, but only
-  where the host can keep it cached: Linux, where the room is `MemAvailable` capped by the
+  Every backend but `ggml_metal` warms the table into the page cache in the background
+  after loading, but only where the host can keep it cached: Linux, where the room is `MemAvailable` capped by the
   process's memory cgroup (a container's limit, not the host's). The larger-than-memory
   Mac skips it, since reading the table there would only evict experts. On a network
   filesystem the warm matters most: an uncached row on a geesefs mount took 92-120 ms.
@@ -1021,26 +1022,17 @@ On CUDA, `--n-cpu-moe` serves the same purpose on a GPU too small for the file. 
 A40 (46 GB) with 12 layers' experts on the host, `ggml_cuda` measured 600 / 30.2 tok/s
 (random tokens, pp512 / tg128) against llama-bench's 466.14 / 18.84 with `-ncmoe 12`.
 
-The direct `cuda` engine runs UD-Q2_K_XL's IQ2_XS and IQ3_XXS experts: per-token kernels
-ported from ggml's dot products for decode, which still runs as a captured CUDA graph, and
-the same two layouts decoded into its tensor-core and register-staged grouped kernels for
-prefill. Before the grouped kernels took them, its prefill of this file ran on the slowest
-fallback at about 500 tok/s. It also runs UD-Q4_K_XL, which stores 43 of its 48 routed down
-projections as Q5_1 (the other five Q8_0) under Q4_K/Q5_K gate/up: decode dots Q5_1 against
-q8_1 activations with dp4a as ggml's `vec_dot_q5_1_q8_1` does (the offset term from the int8
-activation sum), and prefill decodes it into the same grouped kernels, all held to ggml's
-`dequantize_row_q5_1`. Before that the engine refused the file at load, and under
-`--layer-split 2` the two devices' refusals aborted the CLI with an unhandled
-`AggregateException`; an expert layout it does not decode is now refused before any upload,
-with one `error: model load refused:` line naming the tensor. No UD-Q4_K_XL throughput has
-been measured on the direct engine yet. A build without nvcc uses the committed PTX, which
-includes the Q5_1 decoder; a kernel module built from source older than that decoder makes the
-engine refuse Q5_1 experts rather than decode them as Q8_0. The engine has no host-expert seam,
-so `--n-cpu-moe` there
-prints a warning and keeps the experts on the GPU. The direct `cuda` engine uses
-`--layer-split N` for multiple GPUs and refuses `--tp N`. On `ggml_cuda`,
-UD-Q2_K_XL supports `--tp 2` with its original quantized weights; see
-[Multi-GPU](#multi-gpu) for the supported formats and device/layout requirements.
+`--backend cuda` runs the shared runtime on the CUDA graph executor, which accepts `--n-cpu-moe` /
+`--cpu-moe` (host experts), `--tp N` and `--layer-split N` as `ggml_cuda` does (`--tp` with `--layer-split` is
+refused); none of that has been measured on a GPU yet. On `ggml_cuda`, UD-Q2_K_XL supports `--tp 2` with its
+original quantized weights; see [Multi-GPU](#multi-gpu) for the supported formats and device/layout requirements.
+
+**Historical: the removed direct-CUDA engine.** Until its removal in 2026-11, `--backend cuda` loaded a direct
+engine of its own (`Qwen4ExpCudaModel`). It ran UD-Q2_K_XL's IQ2_XS and IQ3_XXS experts with per-token kernels
+ported from ggml's dot products for decode (a captured CUDA graph a step) and tensor-core and register-staged grouped
+kernels for prefill, and UD-Q4_K_XL's Q5_1 down projections; it had no host-expert seam (`--n-cpu-moe` printed a
+warning there) and refused `--tp N`. The measurements below were taken on that engine and have not been repeated on
+the runtime.
 
 Both A40s, warm, the same 1,818-token prompt and 256 greedy tokens. TensorSharp ran as
 `TensorSharp.Server.Host` with `--no-multi-agent --no-skills`, three requests per process,
@@ -1049,7 +1041,7 @@ requests with `cache_prompt` off.
 
 | 2x A40, `--layer-split 2` (llama.cpp `-ngl 99`) | prefill tok/s | decode tok/s |
 | --- | --- | --- |
-| TensorSharp `cuda` | 1,612-1,613 | 56.85-56.93 |
+| TensorSharp `cuda` (the removed direct engine) | 1,612-1,613 | 56.85-56.93 |
 | TensorSharp `ggml_cuda` | 1,174-1,217 | 52.9-53.1 |
 | llama.cpp | 752-963 | 59.04-59.86 |
 
@@ -1057,8 +1049,8 @@ The direct engine's first request after a fresh kernel build ran its prefill at 
 while the driver compiled the PTX; the driver caches the result. On random tokens
 (pp512 / tg128) the direct engine measured 1,222.0 / 61.0 and `ggml_cuda` 410.9 / 43.2, where
 llama-bench's two-GPU run gave 210.74 / 41.99, far below its own server's numbers on the same
-machine, so the real-text table is the comparison to go by. There, TensorSharp prefills
-1.2-2.1x faster and decodes at 88-90% (`ggml_cuda`) and 95-96% (`cuda`) of llama.cpp's speed.
+machine, so the real-text table is the comparison to go by. There, TensorSharp prefilled
+1.2-2.1x faster and decoded at 88-90% (`ggml_cuda`) and 95-96% (the direct `cuda` engine) of llama.cpp's speed.
 
 ### Memory limits, 2026-11-07
 
@@ -1100,7 +1092,7 @@ Side by side on the same file (`eng/qwen38-engine-bench.py`, greedy, 3 repeats),
 | --- | --- | --- | --- |
 | RTX 5090, Strata (MTP) | 306 tok/s | 0.92 s | 2.75 s |
 | RTX 5090, TensorSharp (MTP) | 74 tok/s | 4.17 s | 27.4 s |
-| RTX 5090, TensorSharp `--backend cuda`, plain (later the same day, see below) | 98 tok/s | 4.24 s | 17.8 s |
+| RTX 5090, TensorSharp `--backend cuda` (the removed direct engine), plain (later the same day, see below) | 98 tok/s | 4.24 s | 17.8 s |
 | M5 Pro 48 GB, Strata (DFlash2) | 48 tok/s | 6.32 s | 24.4 s |
 | M5 Pro 48 GB, TensorSharp (MTP) | 32 tok/s | 16.8 s | 65.3 s |
 
@@ -1110,6 +1102,15 @@ under 1 ms), 2.3-3.5 ms of host experts. Strata runs a token as one captured CUD
 decides hits on the device and computes misses on a CPU pool in place, concurrently.
 
 ### The direct CUDA engine on one GPU that cannot hold the experts, 2026-11-07
+
+> **Historical: removed engine.** This section and its subsections, down to
+> [DFlash2 drafter on ggml_metal](#dflash2-drafter-on-ggml_metal-2026-11-08), record the direct-CUDA engine
+> (`Qwen4ExpCudaModel`, the Q4e kernels) that `--backend cuda` loaded until it was removed in 2026-11. `--backend cuda`
+> now runs the shared runtime on the CUDA graph executor; none of these measurements has been repeated there. The
+> engine's own switches named below went with it: its `TS_Q4E_*` variables (the runtime still reads `TS_Q4E_HC_Q8`
+> and `TS_Q4E_MTP_EXPERTS`) and `TS_MOE_TIER_ADAPT_SWAPS`, `_EVERY`, `_ASYNC` and `_PROMPT_SWAPS`. Setting one now
+> stops the server or CLI at startup. The `config/qwen3.8-flash-next-cuda-4lanes.json` overlay these sections mention is
+> deleted.
 
 `--backend cuda` runs a decode step as one captured CUDA graph. It used to need every routed expert in
 VRAM; UD-Q2_K_XL (42.9 GiB of experts) and ISTA-DASLab's `Q2_0` (31.6 GiB) do not fit a 32 GB card.
@@ -2366,8 +2367,8 @@ these buffers remain alive while the model runs. Loading skips a full prefault
 of the sparse PLE table, whose rows are gathered on demand.
 
 `--layer-split N` remains a separate option: each GPU holds a contiguous run of
-whole layers. It is available on `ggml_cuda`, `ggml_vulkan` and the direct `cuda`
-engine. Do not combine `--tp` and `--layer-split`. On `ggml_cuda`, either mode
+whole layers. It is available on `ggml_cuda`, `ggml_vulkan` and `cuda`. Do not
+combine `--tp` and `--layer-split`. On `ggml_cuda`, either mode
 can span nodes using `--tp-node-id` and `--tp-peers`.
 The layer pipeline transfers the complete F32 hyper-connection residual;
 GDN, convolution, PLE and QSA state remain with the layers that own them.
@@ -2552,46 +2553,23 @@ silently ignoring a value it cannot honour — useful because the automatic
 balance prices weights and cannot see the vision tower, which loads later and
 lands on GPU 0.
 
-## Serving on the direct-CUDA engine
+## Serving on `--backend cuda`
 
-`--backend cuda` keeps each request in a sequence slot of its own (attention and
-indexer caches, GDN and PLE state) and decodes the running slots together, up to 16
-per step. These settings shape it as a server:
+`--backend cuda` serves the family through the shared decoder runtime (`Qwen4ExpRuntimeModel`), whose graphs run on the
+CUDA graph executor. Its serving contract is the runtime's, as on `ggml_cuda`: every request has a slot of its own, the
+running requests' decode steps run together, `--tp N` runs per-rank graphs, `--layer-split N` places whole layers, and
+`--n-cpu-moe` / `--cpu-moe` leave routed experts to the host; `--tp` together with `--layer-split` is refused. The
+preset is `config/qwen3.8-flash-next-cuda.json`; its `TS_Q4E_HC_Q8` and `TS_Q4E_MTP_EXPERTS` settings are read by the
+runtime. This path has not been measured on a GPU since the direct engine below was removed, so no figure in this card
+describes it.
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `TS_Q4E_SLOT_TOKENS` | `32768` | A slot's initial capacity. It doubles as its sequence grows, up to the context; a slot that cannot grow frees the oldest retained conversation's slot first. `MAX_CONTEXT` keeps bounding each request. |
-| `TS_Q4E_REWIND_CHECKPOINT` | on | Each slot keeps its recurrent states as they were at the end of its last multi-token forward. A next turn that matches the slot only partway into the previous reply (re-rendered reasoning or tool calls) rewinds there and replays the slot's own tokens up to the match; `0` turns it off. |
-| `TS_SCHED_PIPELINE_DECODE`, `TS_Q4E_DECODE_LANES` | on | Under `--layer-split 2` and up, batched decode runs as two groups in flight, so the first GPU runs one group's layers while the last runs the other's (two H100 NVL, Q8_0: 582 against 377 tok/s at 16 streams, the same tokens); `0` for either decodes one batched step at a time. |
-| `TS_Q4E_PROMPT_PIPELINE` | on | Under `--layer-split 2` and up, a prompt chunk that more of the prompt follows runs without the LM head and stays in flight on the last GPU while the first starts the next chunk (two H100 NVL, Q8_0: a 40K-token prompt at 6,229-6,262 tok/s against 4,535-4,597, the same answers); `0` waits for every chunk. `TS_Q4E_PLE_GATHER_THREADS` (min(16, half the CPUs)) is the threads that gather a prompt ubatch's PLE rows. |
-| `TS_Q4E_BATCH_GRAPHS` | on | Batched steps (batched decode steps and batched speculative verifies) run as CUDA graphs, one per set of slots, their QSA regimes, rows and head form, captured on a set's third step and at most `TS_Q4E_BATCH_GRAPHS_MAX` (64) of them; `0` issues them kernel by kernel. |
-| `TS_Q4E_Q80_PAIR` | on | Q8_0 decode projections (1 to 16 rows) as one arithmetic on three kernels (sm_80+): int8 tensor cores, a dp4a twin with four lanes on a block and a dp4a kernel with a lane on a block, the fastest for the shape and row count; `0` runs the decode-once dense kernels (`TS_DENSE_FAST`). The two sum in different orders, so answers differ in the last bits. Two kinds of weight keep the dense kernels at every row count: the `TS_Q4E_HC_Q8` copies of the hyper-connection down mixers and the MTP block's Q8_0 weights (on the RTX 5090 the pair ran them ~2x slower from three rows, measured before the lane kernel). |
-| `TS_Q4E_EXPERT_VEC` | on | Q8_0 decode experts read each weight row four lanes per 32-value block; `0` runs the shared decode kernels (sixteen lanes a gate/up row, eight a short down row; a different order). Paged-in experts follow their residency table, as resident ones compute. |
-| `TS_MOE_Q80_LANES` | on | Q8_0 decode experts read a weight row with eight lanes (four rows a warp, a lane on whole blocks as aligned 64-bit words): the down projection always, gate/up from 40 slots with a slot's gate and up rows in the same lanes; the same sums. `0` keeps a warp on every row. |
-| `TS_MOE_GATEUP_Q80_PAIR` | on | A Q8_0 decode slot's gate and up rows computed together (the activation loaded once; the same sums): in eight lanes a row from 40 slots, or in one warp from 32 without `TS_MOE_Q80_LANES`; `0` keeps them in separate warps. |
-| `TS_Q4E_PLACEMENT_SLOTS` | `16` | The layer split balances weights plus this many slots' caches, as many as fit; `1` balances for one. |
-| `TS_Q4E_UBATCH` | `512` | Rows per prefill forward. |
-| `TS_Q4E_PERF` | `0` | `1` logs each forward's time; `3` logs each stage's GPU time per step (uncaptured). |
-| `TS_Q4E_PERF_SAMPLE` | `0` | Every Nth forward runs uncaptured with stage timers and records `tensorsharp.engine.stage.duration` per stage, step kind and rows, instead of a log line. A decode lane's step is sampled too (the other lane finishes first), and at most one forward every `TS_Q4E_PERF_SAMPLE_MIN_MS` (10,000) is sampled. With `TS_Q4E_PERF` at `2` or more it is off. |
-| `TS_Q4E_PIPELINE_OVER_SPEC` | on | With the MTP head under `--layer-split 2` and up, a lone request speculates and two or more decode plainly as two groups in flight; `0` puts the batched verify first again (a draft head then turns the groups off). |
-| `TS_Q4E_MTP_FOLLOW`, `TS_Q4E_MTP_CHAIN_SPLIT` | on | With the MTP head, the block takes a lone request's prompt on its own device as each ubatch finishes, instead of through the host; on a layer split the last GPU holds a second copy of the token embedding for it (0.67 GiB for Q8_0), which also keeps a window's draft chain on that GPU. `0` for the first keeps the host's catch-up; `0` for the second turns both off on a layer split. |
-| `TS_KDA_SCAN_R4` | off | `1` runs the gated-delta scan four state rows a warp in prefill too; unset, a prefill ubatch's scan runs one row a warp and prefetches the next row's inputs (bit-identical). |
-| `TS_Q80_PAIR_SWAP` | on | Each dense Q8_0 projection the pair takes gets a packed copy at load (its tensor-core fragments as aligned 16-byte words, 2.4 GB on the last of two H100 NVL, counted into the layer placement), and the pair's tuning may pick a fourth kernel over it, the weight as the mma's 16-column operand, with the same bits; `0` packs nothing. |
-| `TS_CUDA_PDL` | on | On sm_90 and newer, with sm_90 code loaded, the direct kernels launch with programmatic dependent launch: each exported kernel waits for the grid before it at its first instruction, and its launch overlaps that grid's tail. `0` launches them plainly; the outputs are the same. |
-| `TS_Q4E_ATTN_GQA` | on | Decode attention runs a KV head's query heads four at a block, each cell's K and V loaded once for them (batched steps of four rows or more, a sequence's own calls of eight); `0` keeps a block per query head. The same bits. |
-| `TS_Q4E_BATCHED_ATTN` | on | A batched step's attention layers launch each kernel once for every row (each row's caches from a table), not once a sequence; `0` issues them a sequence at a time. The same bits. |
+### Measured on the removed direct-CUDA engine, 2026-11-07 to 2026-11-12
 
-The scheduler sizes its reservation pool for one context per running sequence for this
-engine (`IBatchedPagedModel.UsesNativeSequenceSlots`), as for DeepSeek V4.1, instead of
-one context in all.
-
-The engine reports its slots and graphs as metrics (`IServingTelemetrySource`, see
-USAGE.md's telemetry section): slots running and retained, their memory and capacity,
-grows and grow failures, retained slots reclaimed for a new slot or for growth, rewinds
-by route (checkpoint, replay, reset, refused) and the tokens replayed, CUDA graph
-captures and launches by kind, and the host time spent issuing forwards versus waiting
-for them. A rising `tensorsharp.slots.reclaims` rate means conversations are evicting
-each other; captures that keep pace with launches mean graphs are not reused.
+> **Historical: removed engine.** Until 2026-11, `--backend cuda` loaded a direct engine of its own
+> (`Qwen4ExpCudaModel`, the Q4e kernels), with sequence slots, batched decode graphs and two decode lanes on a layer
+> split, tuned by its own `TS_Q4E_*` variables. That engine and those variables are removed (setting one now stops the
+> server or CLI at startup). The measurements and the switch and test names below are kept as a record and do not
+> describe the runtime that serves `--backend cuda` now.
 
 Measured on 2026-11-07/08 on two H100 NVL 94 GB (`--layer-split 2`, Q8_0, 262,144
 context, ubatch 2048), the server behind a LiteLLM gateway:

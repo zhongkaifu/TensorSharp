@@ -100,23 +100,15 @@ public sealed class Qwen35RuntimeTests : IDisposable
             sink.Reports);
     }
 
-    /// <summary>The factory's route: the shared runtime serves every checkpoint on every backend and placement; only a
-    /// dense NVFP4 checkpoint on one direct-CUDA GPU leaves it for the direct engine.</summary>
+    /// <summary>The factory's route: the shared runtime serves every checkpoint on every backend and placement (the
+    /// direct-CUDA engine that once took dense NVFP4 checkpoints on one GPU was removed).</summary>
     [Theory]
-    [InlineData("dense", BackendType.GgmlCuda, 1)]
-    [InlineData("dense", BackendType.GgmlMetal, 1)]
-    [InlineData("dense", BackendType.GgmlVulkan, 1)]
-    [InlineData("dense", BackendType.GgmlCuda, 2)]
-    [InlineData("dense", BackendType.Cuda, 1)]
-    [InlineData("dense", BackendType.Cpu, 1)]
-    [InlineData("dense", BackendType.Mlx, 1)]
-    [InlineData("moe", BackendType.Cuda, 1)]
-    [InlineData("moe", BackendType.Mlx, 1)]
-    public void TheRuntimeServesEveryNonNvfp4Load(string variant, BackendType backend, int tp)
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void TheFactoryCreatesTheRuntime(string variant)
     {
-        using var probe = new GgufFile(Fixture(variant));
-        var context = new TensorSharp.Models.Architecture.ModelCreateContext(probe.FilePaths[0], backend, probe, tp);
-        Assert.False(Qwen35CudaModel.ServesLoad(context));
+        using ModelBase model = ModelBase.Create(Fixture(variant), BackendType.Cpu);
+        Assert.IsType<Qwen35RuntimeModel>(model);
     }
 
     /// <summary>A golden of the deleted Qwen35Model (Fixtures/Qwen35Legacy).</summary>

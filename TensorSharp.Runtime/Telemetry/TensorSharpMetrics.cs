@@ -105,11 +105,6 @@ namespace TensorSharp.Runtime.Telemetry
             "tensorsharp.prefix_cache.lookups", "{lookup}",
             "Prefix-cache lookups at admission, by outcome (full, partial, miss) and source (where a reused prefix came from, or why a miss reused nothing).");
 
-        public static readonly Histogram<double> EngineStageDuration = M.CreateHistogram(
-            "tensorsharp.engine.stage.duration", "s",
-            "GPU time of one stage of a sampled forward (TS_Q4E_PERF_SAMPLE on the Qwen3.8-Flash-Next direct-CUDA engine), by stage, step kind and rows.",
-            advice: new InstrumentAdvice<double> { HistogramBucketBoundaries = s_stageBuckets });
-
         public static readonly Histogram<double> EngineStepPhaseDuration = M.CreateHistogram(
             "tensorsharp.engine.step.phase.duration", "s",
             "Host time of one part of a batched decode step, by phase (finish: waiting for the previous step's logits and copying them; sample; issue: queueing the step's GPU work, or the whole forward where the step waits for itself; draft and verify on speculative steps) and rows.",

@@ -14,7 +14,7 @@ namespace TensorSharp.Cuda
     /// dependent kernels, and each kernel boundary costs the GPU a launch gap even inside a CUDA graph. Launched with the
     /// programmatic-serialization attribute, a kernel is scheduled while the one before it in the stream finishes: its
     /// first instruction, griddepcontrol.wait (TS_PDL_ENTRY in every exported kernel of tensorsharp_kernels.cu,
-    /// tensorsharp_dsv4_kernels.cu, tensorsharp_glm_kernels.cu and tensorsharp_q4e_kernels.cu), holds it until the earlier
+    /// tensorsharp_dsv4_kernels.cu and tensorsharp_glm_kernels.cu), holds it until the earlier
     /// grid has completed and its writes are visible, so the kernels compute exactly what they computed before. Graph
     /// capture keeps the dependency as a programmatic edge.
     ///

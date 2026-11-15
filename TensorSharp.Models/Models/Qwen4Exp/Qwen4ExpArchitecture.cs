@@ -33,36 +33,30 @@ namespace TensorSharp.Models
             Id = Qwen4ExpFormat.ArchitectureId,
             DisplayName = "Qwen3.8-Flash-Next",
             Aliases = new[] { Qwen4ExpFormat.ArchitectureId },
-            // --backend cuda loads the direct-CUDA whole-model engine (Qwen4ExpCudaModel, the Q4e kernels); every other
-            // backend the shared decoder runtime (Qwen4ExpRuntimeModel). MLX has no kernels for this architecture and is
-            // refused up front.
-            Factory = c => c.Backend switch
-            {
-                BackendType.Cuda => new Qwen4ExpCudaModel(c.GgufPath, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
-                BackendType.Mlx => throw new NotSupportedException(MlxRefusal),
-                _ => new Qwen4ExpRuntimeModel(c.GgufPath, c.Backend, c.DraftModelPath, c.LayerSplitDegree, c.TpDegree, c.TpGroup),
-            },
+            // The shared decoder runtime (Qwen4ExpRuntimeModel) serves every backend, --backend cuda included (its graphs
+            // run on the CUDA graph executor there). MLX has no kernels for this architecture and is refused up front.
+            Factory = c => c.Backend == BackendType.Mlx
+                ? throw new NotSupportedException(MlxRefusal)
+                : new Qwen4ExpRuntimeModel(c.GgufPath, c.Backend, c.DraftModelPath, c.LayerSplitDegree, c.TpDegree, c.TpGroup),
             ProjectorFileHints = new[] { "*mmproj*.gguf" },
 
             Serving = new ServingContract
             {
-                // The shared runtime serves every backend but cuda, where the direct engine's placement rules apply; the
-                // contract states both (a shared-runtime contract would claim the runtime's --tp on cuda).
+                // The shared runtime on every backend but MLX; not ServingContract.SharedRuntime because the runtime runs
+                // --tp and --layer-split only as separate placement modes for this family (no hybrid).
                 Implementation = ServingImplementation.Bespoke,
                 Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlMetal,
                     BackendType.GgmlCuda, BackendType.GgmlVulkan },
                 HasRoutedExperts = true,
-                // The runtime's slots on every backend; the direct-CUDA engine's slots.
                 ContinuousBatching = MechanismSupport.On(BackendType.Cpu, BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlMetal,
                     BackendType.GgmlCuda, BackendType.GgmlVulkan),
-                TensorParallel = MechanismSupport.On(ServingBackends.GgmlMultiDevice).KeepsBatching()
-                    .ElsewhereGap("the direct-CUDA qwen4exp engine places whole layers; use --layer-split N instead of --tp."),
+                // Per-rank graphs: ggml's multi-device backends, and the CUDA graph executor's ranks on --backend cuda.
+                TensorParallel = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda).KeepsBatching(),
                 LayerSplit = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda).KeepsBatching(),
                 // The runtime's staged graphs do not run per-rank graphs yet, and qwen4exp runs only as graphs.
                 HybridParallel = MechanismSupport.None("qwen4exp runs --tp and --layer-split as separate placement modes."),
-                ExpertOffload = MechanismSupport.On(BackendType.Cpu, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda,
-                        BackendType.GgmlVulkan)
-                    .ElsewhereGap("the direct-CUDA qwen4exp engine keeps every expert resident; use a GGML backend for host experts."),
+                ExpertOffload = MechanismSupport.On(BackendType.Cpu, BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlMetal,
+                    BackendType.GgmlCuda, BackendType.GgmlVulkan),
             },
             SupportsDistributedTensorParallel = true,
             DistributedTensorParallelBackends = new[] { BackendType.GgmlCuda },

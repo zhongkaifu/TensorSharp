@@ -147,6 +147,18 @@ CUDA results are committed. See the [Bonsai2 card](models/bonsai2.md).
 
 The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse Spark, loading split GGUFs from any shard, native skill discovery and the latest MiniMax-H3 work are newer than `v2026.10.11`, as described above. Knowledge collections and active-turn steering are included in that tag; the entries below retain compatibility and measured-performance history from earlier work.
 
+- **The Qwen direct-CUDA engines and NInfer support are removed.** Qwen 3.5 / 3.6 / 3.8 (`qwen35`,
+  `qwen35moe`) and Qwen 3.8 Flash Next (`qwen4exp`) now run on the shared decoder runtime on every
+  backend; on `--backend cuda` its graphs run on the CUDA graph executor. Dense NVFP4 checkpoints on
+  `--backend cuda` no longer get a direct engine of their own, Flash Next on `--backend cuda` now
+  accepts `--tp N` and `--n-cpu-moe` / `--cpu-moe` as on `ggml_cuda` (`--tp` with `--layer-split`
+  stays refused), and NInfer artifacts (`.ninfer`, `neroued/Qwen3.8-27B-nvfp4-NInfer`) no longer
+  load. The engines' environment variables (`TS_Q35_*`, their `TS_Q4E_*` switches,
+  `TS_MOE_TIER_ADAPT_SWAPS` / `_EVERY` / `_ASYNC` / `_PROMPT_SWAPS`, `TS_NINFER_GGUF_DIR`) stop the
+  server or CLI at startup, and the presets `config/qwen3.8-27b-ninfer.json`,
+  `config/qwen3.8-27b-ninfer-64k.json` and `config/qwen3.8-flash-next-cuda-4lanes.json` are deleted.
+  The `--backend cuda` path of these families has not been measured on a GPU since; see the
+  [environment variable matrix](env_var_feature_matrix.md#kv-cache--context).
 - **Muse Spark runs through a native whole-model executor, in both multi-GPU modes.** It is the default on `ggml_cuda` / `ggml_vulkan`, and `--tp N` on `ggml_cuda` now runs it too, splitting every layer over the first N CUDA GPUs through upstream ggml's meta backend; `TS_MUSE_SPARK_NATIVE=0` restores the per-op path, which `--tp N` on `ggml_vulkan` still uses. Layer split spans up to 16 GPUs, refuses a GPU count it cannot honour instead of running on fewer, and pipelines one prompt's prefill across CUDA GPUs (`TS_MUSE_SPARK_PIPELINE`, `TS_MUSE_SPARK_PIPELINE_UBATCH`). Without `MAX_CONTEXT`, an advertised context that does not fit is capped to the largest that does. With pipelined prefill on, a request that is alone prefills in steps Muse Spark chooses (8,192 tokens) unless `TS_SCHED_SOLO_PREFILL_CHUNK` is set. On Linux hosts with ten or more peer-capable GPUs, a TensorSharp-owned `cuMemSetAccess` guard stops the ggml-cuda scratch-pool abort that ended every `ggml_cuda` run of an NCCL build (CUDA allows a GPU at most eight peer connections). With neither `TS_MUSE_SPARK_CPU_MOE=auto` nor `--n-cpu-moe N`, a layer-split checkpoint that does not fit the GPUs is refused at load with a message naming the option. For concurrent requests, raise `TS_MUSE_SPARK_PLAN_SLOTS` to the concurrency plus one for the shared-prefix checkpoint. See the [measured launch profile](models/muse-spark.md#launching) and the [ten-GPU comparison](perf/muse-spark-vs-llama-cpp.md).
 - **Split GGUFs load from any shard.** `--model` may name any file of a `-0000N-of-0000M` set: TensorSharp reads the metadata from shard 1, combines the tensor tables of every shard, and refuses a missing shard or an inconsistent split count before loading weights. Pointing at shard 1 keeps working as before.
 - **Knowledge collections are now part of TensorAgent and opt-in server requests.** Select collections explicitly for each chat/request, and reindex metadata-only media after loading a compatible model. Imports retain originals; replacement and reindexing invalidate old versioned citations. See [personal knowledge](knowledge-system.md).
@@ -171,7 +183,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
   ("Qwen3.8 Flash Next is not completely downloaded yet.") instead of letting the engine
   fail on a file the user never saw.
   See [the Mac's own models](../TensorAgent/README.md#the-macs-own-models).
-- **The direct `cuda` engine runs Qwen 3.8 Flash Next's UD-Q2_K_XL.** It used to refuse the
+- **The direct `cuda` engine runs Qwen 3.8 Flash Next's UD-Q2_K_XL** (since removed with the
+  engine; see the first entry). It used to refuse the
   file's IQ2_XS/IQ3_XXS experts at load ("unsupported expert quant type 17"); it now
   decodes them with kernels ported from ggml's dot products, in a decode step still
   captured as a CUDA graph, and its tensor-core and register-staged grouped expert kernels

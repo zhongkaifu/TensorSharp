@@ -148,7 +148,7 @@ dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -c Relea
   -p:TensorSharpUpdateCommittedPtx=true -p:CudaNvcc=/opt/cuda-13.0.3/bin/nvcc
 ```
 
-提交的基线以 `compute_75`（CUDA 13 能编译的最低架构）为目标，并在 Linux 上由 `nvcc` 13.0 构建：其 PTX（ISA 9.0）可被所有 CUDA 13 驱动（R580 或更新）JIT，而驱动不接受比自身更新的 PTX。刷新时 `CudaArch=auto` 与 `native` 都解析为该目标，其他显式目标会被拒绝；所用的 `nvcc`（`-p:CudaNvcc`，否则取 `CUDACXX`，再否则取 `PATH` 上的那个）报告的版本不是 13.0 时会在编译前失败，生成的 PTX 不全是 `release 13.0`、`.version 9.0`、`.target sm_75` 时会在复制前失败。Qwen3.5 内核（`tensorsharp_q35_kernels.cu`，只支持 sm_80+）不会被复制。请在 Linux 上刷新：Windows 的 `nvcc` 中 `long` 为 32 位。普通构建仍自动检测 GPU（未检测到 GPU 时回退到 `compute_75`），遇到 CUDA 12 的 `nvcc` 会报错停止；针对特定 GPU 的本地构建不要设置 `TensorSharpUpdateCommittedPtx`。
+提交的基线以 `compute_75`（CUDA 13 能编译的最低架构）为目标，并在 Linux 上由 `nvcc` 13.0 构建：其 PTX（ISA 9.0）可被所有 CUDA 13 驱动（R580 或更新）JIT，而驱动不接受比自身更新的 PTX。刷新时 `CudaArch=auto` 与 `native` 都解析为该目标，其他显式目标会被拒绝；所用的 `nvcc`（`-p:CudaNvcc`，否则取 `CUDACXX`，再否则取 `PATH` 上的那个）报告的版本不是 13.0 时会在编译前失败，生成的 PTX 不全是 `release 13.0`、`.version 9.0`、`.target sm_75` 时会在复制前失败。FP4 张量核内核（`tensorsharp_fp4_kernels.cu`，只支持 sm_120a / sm_121a）不会被复制。请在 Linux 上刷新：Windows 的 `nvcc` 中 `long` 为 32 位。普通构建仍自动检测 GPU（未检测到 GPU 时回退到 `compute_75`），遇到 CUDA 12 的 `nvcc` 会报错停止；针对特定 GPU 的本地构建不要设置 `TensorSharpUpdateCommittedPtx`。
 
 #### Apple Silicon 上的 Metal 4 tensor API
 

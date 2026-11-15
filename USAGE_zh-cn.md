@@ -1610,8 +1610,9 @@ CLI 与服务端使用不同参数明确选择运行模式：
 两种模式互斥。不支持的模型、后端或模式组合会在启动时失败，不会改为另一种模式或静默回到单卡。
 旧命令如果用 `--tp N` 表示按层切分，需改成 `--layer-split N`。CPU 后端不能运行多 GPU 模式。
 
-Qwen 3.8 Flash Next（`qwen4exp`）在 `ggml_cuda`、`ggml_vulkan` 与 direct `cuda` 上
-支持整层放置，并在合格的 `ggml_cuda` 设备和量化上支持本地 FFN 张量并行。
+Qwen 3.8 Flash Next（`qwen4exp`）在 `ggml_cuda`、`ggml_vulkan` 与 `cuda` 上
+支持整层放置，并在合格的 `ggml_cuda` 设备和量化上支持本地 FFN 张量并行。`--backend cuda`
+运行同一个共享运行时，也接受 `--tp N`（按 rank 的图；尚未在 GPU 上测量）。
 UD-Q2_K_XL 只能按层切分；TP 的验证范围见[支持的架构](#支持的架构)。
 DeepSeek V4 / V4.1 与 GLM 5.x 同样通过 `--layer-split N` 指定本地卡数。未配置两种模式时
 默认单设备。GLM 5.x 还支持 GGML GPU 后端上的
@@ -1698,7 +1699,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | Mistral 3 | ✅ + 按层切分 + 混合 | 共享解码运行时：在 `cuda`、`ggml_cuda` 与 `ggml_vulkan` 上支持 `--tp T`、`--layer-split P`（本地；GGML CUDA/Vulkan 上也可跨节点）以及两者组合（`--tp T --layer-split P`：P 个阶段、每段 T 张 GPU）；各种放置下并发请求都保持批处理。见[统一执行设计](docs/design/unified-execution.md)（英文） |
 | Gemma 4 | ✅ | 稠密 TP + MoE。GGML 上融合的整模 MoE 主干在**每个专家内部**切分（gate/up 列并行、down 行并行），从而保留全局专家 id；`TS_GEMMA4_TP_FUSED_MOE=0` 可回退到逐算子的整专家路径。Direct CUDA 上为逐专家切分 |
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属；GGML 上为专家并行 MoE（每个 rank 持有整个专家，shared expert 仍按 Megatron 切分）与列并行（按词表切分的）LM head（LM head 与 embedding 共享权重、或其词表行数不能被本机 TP 度整除时除外，此时它留在 rank 0 上复制），Direct CUDA 上为专家切分且 LM head 保持复制。`cuda` 与 `ggml_cuda` / `ggml_vulkan` 均可运行——GGML 路径使用打包的按 rank GDN 内核（`TSGgml_Qwen35GdnLayerTP`）并把循环状态常驻设备。[Bonsai2](docs/models/bonsai2_zh-cn.md)（带 PRISM PQ2_0 / PTQ1_0 张量的 `qwen35` 文件）例外：只支持单设备 GGML 后端，`--tp` 会被拒绝 |
-| Qwen 3.8 Flash Next | ✅（本地 FFN TP）+ 按层切分 | `ggml_cuda --tp N` 切分路由/共享 FFN，注意力/QSA/GDN/PLE 保持复制。要求合格的 CUDA MMQ 设备与受支持的 FFN 类型；UD-IQ4_XS 已在 A40 TP2/TP4 上检查，UD-Q2_K_XL 则拒绝 TP。此模式不支持 CPU 专家卸载、前缀 checkpoint 与跨节点 TP。独立的 `--layer-split N` 仍支持 GGML CUDA/Vulkan 与 direct `cuda`。实测 A40 TP2 比按层切分慢；见[验证范围、数值门限与基准](docs/models/qwen38-flash-next_zh-cn.md#多-gpu)。 |
+| Qwen 3.8 Flash Next | ✅（本地 FFN TP）+ 按层切分 | `ggml_cuda --tp N` 切分路由/共享 FFN，注意力/QSA/GDN/PLE 保持复制。要求合格的 CUDA MMQ 设备与受支持的 FFN 类型；UD-IQ4_XS 已在 A40 TP2/TP4 上检查，UD-Q2_K_XL 则拒绝 TP。此模式不支持 CPU 专家卸载、前缀 checkpoint 与跨节点 TP。独立的 `--layer-split N` 仍支持 GGML CUDA/Vulkan 与 `cuda`，`cuda` 上也接受 `--tp N`（共享运行时按 rank 的图；尚未在 GPU 上测量）。实测 A40 TP2 比按层切分慢；见[验证范围、数值门限与基准](docs/models/qwen38-flash-next_zh-cn.md#多-gpu)。 |
 | GPT OSS | ✅ | attention sink，YaRN。`cuda` 与 GGML 后端均可运行；GGML 路径是专家并行（每个 rank 持有整个专家，每层每个投影一次批量 `ggml_mul_mat_id` 派发），只有专家数不能被 TP 度整除时才回退到逐专家切分 |
 | Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算。GGML 上，若每个 MoE 层的专家都能均分到各 rank，且每个 rank 至少持有该层 top-k 个专家，MoE 走专家并行（每个 rank 持有整个专家，每层每个投影一次批量调度），否则回退到专家切分；Direct CUDA 上使用专家切分。加载时的提示行会说明实际走了哪条路径 |
 | Muse-Glimmer | ✅（最多 `--tp 2`） | 只有 2 个 KV head，因此 TP 度最多为 2；仅限 GGML CUDA / Vulkan；TP 下 DFlash 草稿器会被拒绝挂载——CLI 打印警告并按普通解码运行，服务端拒绝启动（见[约束](#约束)） |
@@ -2512,13 +2513,12 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 | `tensorsharp.engine.step.prefill_tokens` | histogram，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind`。一步前向的提示词 token 数 |
 | `tensorsharp.engine.inter_token.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind`（产生该 token 的步骤）。同一序列相邻两个输出 token 的间隔；`mixed` 与 `decode` 的差即与提示词共用步骤的代价 |
 | `tensorsharp.prefix_cache.lookups` | counter，`{lookup}` | `tensorsharp.model.architecture`、`tensorsharp.prefix_cache.outcome`（`full`、`partial`、`miss`）、`tensorsharp.prefix_cache.source` |
-| `tensorsharp.engine.stage.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.stage`、`tensorsharp.engine.step_kind`、`tensorsharp.engine.rows`；仅在设置 `TS_Q4E_PERF_SAMPLE=N` 时记录 |
 | `tensorsharp.engine.step.phase.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step.phase`（`finish`、`sample`、`issue`）、`tensorsharp.engine.rows`；批量解码步骤中主机各部分的耗时：等待并复制上一步的 logits、采样、下发下一步的 GPU 工作 |
-| `tensorsharp.engine.lane.steps` | counter，`{step}` | `tensorsharp.model.architecture`、`tensorsharp.engine.lane.finish`（`ready`：主机回来取 logits 时 GPU 已完成，瓶颈在主机；`waited`：瓶颈在 GPU） |
+| `tensorsharp.engine.lane.steps` | counter，`{step}` | `tensorsharp.model.architecture`、`tensorsharp.engine.lane.finish`（`ready`：主机回来取 logits 时 GPU 已完成，瓶颈在主机；`waited`：瓶颈在 GPU）；只有同时保持两个解码组在途的模型（`IPipelinedBatchedDecode`）才记录，自直连引擎移除后没有这样的模型 |
 | `tensorsharp.engine.lane.rows` | counter，`{row}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.lane.time` | counter，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.lane.state`（`issue`、`wait`、`idle`）；各解码通道上主机下发、等待以及通道空闲的时间之和 |
 | `tensorsharp.speculative.accepted_length` | histogram，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.speculative.drafted`；一个验证窗口保留的草稿 token 数 |
-| `tensorsharp.slots` | gauge，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.state`（`running`、`retained`） |
+| `tensorsharp.slots` | gauge，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.state`（`running`、`retained`）；`tensorsharp.slots*`、`tensorsharp.cuda_graph.*` 与 `forward.issue_time` / `.wait_time` 来自自带序列 slot 并上报它们的模型（`IServingTelemetrySource`），唯一的这类模型是已移除的 Qwen3.8-Flash-Next 直连 CUDA 引擎，目前没有模型上报 |
 | `tensorsharp.slots.memory` / `.capacity` | gauge，`By` / `{token}` | `tensorsharp.model.architecture` |
 | `tensorsharp.slots.grows`、`.grow_failures` | counter | `tensorsharp.model.architecture` |
 | `tensorsharp.slots.reclaims` | counter，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.reclaim_reason`（`new_slot`、`growth`） |

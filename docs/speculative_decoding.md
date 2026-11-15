@@ -610,8 +610,7 @@ native library) and pass the file to `--draft-model`. It is a `dflash` GGUF with
 `dflash.attention.causal = true` and `dflash.dspine.*` keys. The draft is one graph
 (`ggml_ops_dspine.cpp`; the context inject is DFlash's) on `ggml_metal`,
 `ggml_cuda` and `ggml_cpu`; there is no per-op path, so another backend refuses
-the file at load, and a failing draft stops drafting with a warning. The
-direct-CUDA Qwen 3.5 engine (`--backend cuda`) drafts with DFlash2 only.
+the file at load, and a failing draft stops drafting with a warning.
 
 `eng/dspine-reference.py` is a NumPy reference of the math. `GgmlOpsDSpineDraftTest`
 and `DSpineDraftTests` check every stage, the candidates, the lattice and the

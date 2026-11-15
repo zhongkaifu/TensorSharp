@@ -1838,8 +1838,9 @@ GPU. Commands that previously used `--tp N` to place whole layers must migrate
 to `--layer-split N`. CPU backends cannot run a multi-GPU mode.
 
 Qwen 3.8 Flash Next (`qwen4exp`) supports whole-layer placement on `ggml_cuda`,
-`ggml_vulkan` and direct `cuda`, plus local FFN tensor parallelism on qualified
-`ggml_cuda` devices and quantizations. Its UD-Q2_K_XL checkpoint is layer-split-only;
+`ggml_vulkan` and `cuda`, plus local FFN tensor parallelism on qualified
+`ggml_cuda` devices and quantizations. `--backend cuda` runs the same shared runtime
+and accepts `--tp N` there too (per-rank graphs; not yet measured on a GPU). Its UD-Q2_K_XL checkpoint is layer-split-only;
 see [Supported architectures](#supported-architectures) for the TP qualification.
 DeepSeek V4 / V4.1 and GLM 5.x also require `--layer-split N` to select the
 local layer-split device count. With neither mode configured, the default is
@@ -1933,7 +1934,7 @@ must be reachable between all nodes.
 | Mistral 3 | ✅ + layer split + hybrid | Shared decoder runtime: `--tp T`, `--layer-split P` (local, or multi-node on GGML CUDA/Vulkan) and both together (`--tp T --layer-split P`, P stages of T GPUs each) on `cuda`, `ggml_cuda` and `ggml_vulkan`; concurrent requests stay batched in every placement. See [unified execution](docs/design/unified-execution.md) |
 | Gemma 4 | ✅ | Dense TP + MoE. On GGML the fused whole-model MoE trunk splits *inside* each expert (gate/up column-parallel, down row-parallel) so global expert ids keep working; `TS_GEMMA4_TP_FUSED_MOE=0` falls back to the whole-expert per-op path. Per-expert slicing on direct CUDA |
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership; expert-parallel MoE on GGML (whole experts per rank, Megatron-split shared expert) with a column-parallel (vocabulary-sharded) LM head unless the head is tied to the embedding or its vocabulary rows do not divide by the local TP degree (it then stays replicated on rank 0), expert slicing and a replicated LM head on direct CUDA. Runs on both `cuda` and `ggml_cuda` / `ggml_vulkan` — the GGML path uses the packed per-rank GDN kernel (`TSGgml_Qwen35GdnLayerTP`) with device-resident recurrent state. [Bonsai2](docs/models/bonsai2.md) (`qwen35` files with PRISM PQ2_0 / PTQ1_0 tensors) is the exception: single-device GGML backends only, so `--tp` is refused |
-| Qwen 3.8 Flash Next | ✅ (local FFN TP) + layer split | `ggml_cuda --tp N` partitions routed/shared FFNs while attention/QSA/GDN/PLE remain replicated. Requires qualified CUDA MMQ devices and supported FFN types; UD-IQ4_XS was checked on A40 TP2/TP4, but UD-Q2_K_XL is refused for TP. CPU expert offload, prefix checkpoints and distributed TP are unsupported in this mode. `--layer-split N` remains available on GGML CUDA/Vulkan and direct `cuda`. Measured A40 TP2 was slower than layer split; see [qualification, numerical gates and benchmarks](docs/models/qwen38-flash-next.md#multi-gpu). |
+| Qwen 3.8 Flash Next | ✅ (local FFN TP) + layer split | `ggml_cuda --tp N` partitions routed/shared FFNs while attention/QSA/GDN/PLE remain replicated. Requires qualified CUDA MMQ devices and supported FFN types; UD-IQ4_XS was checked on A40 TP2/TP4, but UD-Q2_K_XL is refused for TP. CPU expert offload, prefix checkpoints and distributed TP are unsupported in this mode. `--layer-split N` remains available on GGML CUDA/Vulkan and `cuda`, where `--tp N` is also accepted (the shared runtime's per-rank graphs; not yet measured on a GPU). Measured A40 TP2 was slower than layer split; see [qualification, numerical gates and benchmarks](docs/models/qwen38-flash-next.md#multi-gpu). |
 | GPT OSS | ✅ | Attention sinks, YaRN. Runs on `cuda` and the GGML backends; the GGML path is expert-parallel (whole experts per rank, one batched `ggml_mul_mat_id` dispatch per projection per layer) and falls back to per-expert slicing only when the expert count does not divide the TP degree |
 | Nemotron-H | ✅ | Mamba2 replicated on rank 0. On GGML the MoE is expert-parallel (whole experts per rank, one batched dispatch per projection per layer) when every MoE layer's experts divide evenly over the ranks with at least that layer's top-k on each rank, and falls back to per-expert slicing otherwise; per-expert slicing on direct CUDA. The load banner names the path taken |
 | Muse-Glimmer | ✅ (`--tp 2` at most) | Its 2 KV heads cap the degree at 2; GGML CUDA / Vulkan only, and a DFlash drafter is declined under TP — the CLI warns and decodes plainly, the server refuses to start (see [Constraints](#constraints)) |
@@ -2841,7 +2842,6 @@ semantic conventions, which are still in development and may change.
 | `tensorsharp.engine.step.prefill_tokens` | histogram, `{token}` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind`. Prompt tokens one step forwarded |
 | `tensorsharp.engine.inter_token.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` (of the step that emitted the token). Time between a sequence's consecutive output tokens |
 | `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | `tensorsharp.model.architecture`, `tensorsharp.prefix_cache.outcome` (`full`, `partial`, `miss`), `tensorsharp.prefix_cache.source` |
-| `tensorsharp.engine.stage.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.stage`, `tensorsharp.engine.step_kind`, `tensorsharp.engine.rows` |
 | `tensorsharp.engine.step.phase.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step.phase` (`finish`, `sample`, `issue`), `tensorsharp.engine.rows`. Host time of each part of a batched decode step |
 | `tensorsharp.engine.lane.steps` | counter, `{step}` | `tensorsharp.model.architecture`, `tensorsharp.engine.lane.finish` (`ready`, `waited`) |
 | `tensorsharp.engine.lane.rows` | counter, `{row}` | `tensorsharp.model.architecture` |
@@ -2890,19 +2890,16 @@ semantic conventions, which are still in development and may change.
   first reason the cache gave (`shared_prefix`, `rewind`, `breakpoints`, `live_cache`,
   `retained_state`, `pages`, `none` when nothing was cached).
 - The `tensorsharp.slots.*`, `tensorsharp.cuda_graph.*` and `forward.issue_time` / `.wait_time`
-  instruments come from models that keep sequence slots of their own (the Qwen3.8-Flash-Next
-  direct-CUDA engine), read at each collection from counters the engine keeps; they start again
+  instruments come from models that keep sequence slots of their own and report them
+  (`IServingTelemetrySource`), read at each collection from counters the model keeps; they start again
   when the model is reloaded. Issue time close to `tensorsharp.engine.forward.time` means the
-  host, not the GPU, sets the pace.
-- `tensorsharp.engine.stage.duration` is recorded only when `TS_Q4E_PERF_SAMPLE=N` is set: every
-  Nth forward of that engine runs uncaptured, with GPU timers around each stage, and records one value per
-  stage. `tensorsharp.engine.rows` is the batch's rows in buckets (`1`, `2-4`, `5-8`, `9-16`, `17+`).
-  A decode lane's step is sampled too (the other lane's step finishes first, so the stages time that step
-  alone), and at most one forward every `TS_Q4E_PERF_SAMPLE_MIN_MS` (10 s) is sampled: a sampled forward costs
-  several captured steps.
+  host, not the GPU, sets the pace. The only such model was the Qwen3.8-Flash-Next direct-CUDA
+  engine, which has been removed, so no model in the tree reports them now.
+- `tensorsharp.engine.rows` is the batch's rows in buckets (`1`, `2-4`, `5-8`, `9-16`, `17+`).
 - `tensorsharp.engine.step.phase.duration` splits a batched decode step's host time: `finish` is the wait for the
   previous step's logits and their copy, `sample` the draws, `issue` queueing the next step's GPU work (the whole
-  forward where the step waits for itself). With decode lanes (a layer split), `tensorsharp.engine.lane.steps`
+  forward where the step waits for itself). With decode lanes (a model that keeps two decode groups in flight,
+  `IPipelinedBatchedDecode`; none since the removed engine), `tensorsharp.engine.lane.steps`
   counts each lane step by how it ended for the host: `ready` means the GPUs had finished before the host came
   back for the logits, so sampling and scheduling set the pace; `waited` means the GPUs do.
   `tensorsharp.engine.lane.time` sums, over the lanes, the host's time issuing a lane's step, waiting for one,

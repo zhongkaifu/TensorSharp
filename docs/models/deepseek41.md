@@ -1039,7 +1039,7 @@ deepseek41.engram.pad_id`.
 
 The direct-CUDA engine also checks every routed-expert tensor before it uploads
 anything, against the code that will run it. Its GPU expert kernels are the ones
-the GLM-5.3-Flash and Qwen3.8 direct engines run, and implement Q8_0, Q6_K, Q5_K,
+the GLM-5.3-Flash direct engine runs, and implement Q8_0, Q6_K, Q5_K,
 Q5_1, Q4_K, Q3_K, Q2_K, Q2_0, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS,
 IQ1_S and MXFP4 on every route: the per-token decode kernels, and for prefill the
 tensor-core, register-staged and warp-per-row ones. That covers every routed-expert

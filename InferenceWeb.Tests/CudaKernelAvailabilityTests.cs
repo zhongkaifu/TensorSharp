@@ -42,7 +42,7 @@ public sealed class CudaKernelAvailabilityTests
     /// <summary>
     /// The committed baselines as native/ptx holds them, so a module added there is covered by
     /// every theory over them without editing a list
-    /// (<see cref="CommittedPtx_IsExactlyThePortableModules_NeverQ35"/> pins the set).
+    /// (<see cref="CommittedPtx_IsExactlyThePortableModules_NeverFp4"/> pins the set).
     /// </summary>
     public static TheoryData<string> CommittedModules()
     {
@@ -61,7 +61,7 @@ public sealed class CudaKernelAvailabilityTests
     /// <summary>
     /// Every committed baseline keeps up with its source. Refresh on Linux with nvcc 13.0:
     /// <c>dotnet build TensorSharp.Backends.Cuda -c Release -p:TensorSharpUpdateCommittedPtx=true -p:CudaNvcc=&lt;13.0&gt;/bin/nvcc</c>.
-    /// tensorsharp_q35_kernels has no committed baseline by design (its engine needs nvcc).
+    /// tensorsharp_fp4_kernels has no committed baseline by design (its FP4 tensor-core code needs sm_120a / sm_121a).
     /// </summary>
     [Theory]
     [MemberData(nameof(CommittedModules))]
@@ -121,10 +121,10 @@ public sealed class CudaKernelAvailabilityTests
     }
 
     [Fact]
-    public void CommittedPtx_IsExactlyThePortableModules_NeverQ35()
+    public void CommittedPtx_IsExactlyThePortableModules_NeverFp4()
     {
-        // Every module a build without nvcc loads ships a baseline. The qwen35 one never
-        // does: its engine's GEMMs need sm_120a SASS (CommittedBaseline=false in the csproj;
+        // Every module a build without nvcc loads ships a baseline. The FP4 one never
+        // does: its GEMMs need sm_120a SASS (CommittedBaseline=false in the csproj;
         // a refresh never copies it). The three *_prefill modules are the direct-CUDA prefill
         // plan's (flash attention, grouped MoE, recurrent layers); each carries its
         // ts_<module>_caps version probe (CudaPrefillModuleTests). tensorsharp_graph_kernels holds the graph
@@ -133,8 +133,7 @@ public sealed class CudaKernelAvailabilityTests
             new[]
             {
                 "tensorsharp_dsv4_kernels", "tensorsharp_flash_prefill", "tensorsharp_glm_kernels", "tensorsharp_graph_kernels",
-                "tensorsharp_kernels", "tensorsharp_ltx25", "tensorsharp_moe_prefill", "tensorsharp_q4e_kernels",
-                "tensorsharp_ssm_prefill",
+                "tensorsharp_kernels", "tensorsharp_ltx25", "tensorsharp_moe_prefill", "tensorsharp_ssm_prefill",
             },
             CommittedModuleNames());
     }
@@ -142,7 +141,7 @@ public sealed class CudaKernelAvailabilityTests
     /// <summary>
     /// Every committed baseline JIT-compiles on this machine's driver, and each of its entries
     /// resolves and reports compute_75. The header theory above only implies that a CUDA 13
-    /// driver accepts them; the glm, q4e and ltx25 modules load only for their own models, so
+    /// driver accepts them; the glm and ltx25 modules load only for their own models, so
     /// nothing else proves it for them. Run with CUDA_CACHE_DISABLE=1 so the driver compiles
     /// instead of reusing a cached image.
     /// </summary>
@@ -257,48 +256,29 @@ public sealed class CudaKernelAvailabilityTests
     }
 
     /// <summary>
-    /// Every GEMM of the direct-CUDA qwen35 engine needs the block-scaled FP4 MMA, which only
-    /// sm_120a / sm_121a SASS carries; any other image of tensorsharp_q35_kernels compiles it
-    /// (and the mma / ldmatrix helpers below sm_80) to __trap(). Such a module must be refused
-    /// up front - the support check falls back to the managed path - instead of loading and
-    /// killing the context on the first prompt.
+    /// Every NVFP4 GEMM of the CUDA graph executor needs the block-scaled FP4 MMA, which only sm_120a / sm_121a SASS
+    /// carries; any other image of tensorsharp_fp4_kernels compiles it (and the mma / ldmatrix helpers below sm_80) to
+    /// __trap(). Such a module must be declined up front - the backend then keeps NVFP4 weights as ggml blocks on its
+    /// other kernels - instead of loading and killing the context on the first prompt.
     /// </summary>
-    [CudaFact(NvccOutput = "tensorsharp_q35_kernels.ptx")]   // an nvcc-only module
-    public void Q35Module_WithoutFp4TensorCoreCode_IsRefusedBeforeAnyGemm()
+    [CudaFact(NvccOutput = "tensorsharp_fp4_kernels.ptx")]   // an nvcc-only module
+    public void Fp4Module_WithoutFp4TensorCoreCode_IsDeclinedBeforeAnyGemm()
     {
-        string path = CudaKernels.LocatePtxPath("tensorsharp_q35_kernels.ptx");
-        Assert.NotNull(path);
         using var allocator = new CudaAllocator();
         allocator.Context.MakeCurrent();
         var device = CudaDevice.GetDevice(allocator.DeviceId);
-
-        // The PTX alone (what -p:CudaEmitFatbin=false ships) targets compute_NN, never the
-        // architecture-specific sm_120a, so it never carries the FP4 code.
-        bool archSpecificPtx = Regex.IsMatch(File.ReadAllText(path), @"^\.target sm_12[01]a\b", RegexOptions.Multiline);
-        using (var module = CudaModule.LoadFromBytes(File.ReadAllBytes(path)))
-            Assert.Equal(archSpecificPtx, Q35Kernels.RunsTensorCoreKernels(module));
-
-        // As the engine loads it (the fatbin when there is one): off a CC 12 GPU it never runs.
-        var loaded = CudaModule.LoadFromFile(path);
-        bool runs = Q35Kernels.RunsTensorCoreKernels(loaded);
-        if (device.ComputeCapabilityMajor != 12)
-            Assert.False(runs);
-        if (runs)
+        bool runs = CudaFp4Kernels.TryCreate(out CudaFp4Kernels kernels, out string reason);
+        using (kernels)
         {
-            using var kernels = Q35Kernels.FromModule(loaded);
+            // Off a CC 12 GPU the image never carries the FP4 bodies.
+            if (device.ComputeCapabilityMajor != 12)
+                Assert.False(runs);
+            Assert.Equal(runs, reason == null);
+            if (runs)
+                Assert.True(kernels.HasTensorCores);
+            else
+                Assert.Null(kernels);
         }
-        else
-        {
-            var refused = Assert.Throws<NotSupportedException>(() => Q35Kernels.FromModule(loaded));
-            Assert.Contains("sm_120a", refused.Message);
-        }
-
-        // The support check runs the same probe without disturbing this thread's context.
-        TensorSharp.Cuda.Interop.CudaDriverApi.cuCtxGetCurrent(out IntPtr before);
-        Assert.Equal(runs, Q35Kernels.ProbeTensorCoreKernels(path, out string reason));
-        Assert.Equal(runs, reason == null);
-        TensorSharp.Cuda.Interop.CudaDriverApi.cuCtxGetCurrent(out IntPtr after);
-        Assert.Equal(before, after);
     }
 
     /// <summary>

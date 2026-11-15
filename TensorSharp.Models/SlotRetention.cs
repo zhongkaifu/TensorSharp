@@ -5,8 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Donate-only prefix reuse over an executor's sequence slots (GLM-5.x, and Qwen3.8-Flash-Next on the
-// direct-CUDA engine): a finished request's slot is retained under a payload key, moved to the
+// Donate-only prefix reuse over an executor's sequence slots (GLM-5.x on its direct-CUDA engine): a
+// finished request's slot is retained under a payload key, moved to the
 // request that continues it, and taken back when memory needs it. The ownership moves are pure
 // bookkeeping over ISlotStore, so they are tested without weights.
 using System;

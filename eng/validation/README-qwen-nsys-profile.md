@@ -28,7 +28,7 @@ Every profiling subprocess, including version/help queries, launch, collection,
 cleanup and summary, receives an explicit small process environment. Only PATH,
 HOME, temporary-directory/locale names, LD_LIBRARY_PATH, CUDA device/cache names
 and DOTNET_ROOT variants are inherited automatically; server-spec `env` overrides
-are then applied. Other model settings such as TS_Q35_* must be declared in that
+are then applied. Other model settings such as TS_SCHED_* must be declared in that
 spec. Ambient authentication, proxy and Python-startup variables are not copied
 into a captured target environment. `_exec` applies the same filter and retains
 only named Nsight/CUDA interposition variables needed across exec, such as

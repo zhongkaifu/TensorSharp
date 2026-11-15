@@ -41,7 +41,7 @@ class ServerLifecycleTests(unittest.TestCase):
             import http.server, json, os, subprocess, sys
             if os.environ.get('FIXTURE_SERVER_ENV_FILE'):
                 with open(os.environ['FIXTURE_SERVER_ENV_FILE'], 'w') as output:
-                    json.dump({key:os.environ.get(key) for key in ('MAX_CONTEXT','TS_Q35_UBATCH','TS_SCHED_MAX_RUNNING_SEQS')}, output)
+                    json.dump({key:os.environ.get(key) for key in ('MAX_CONTEXT','TS_SCHED_MAX_RUNNING_SEQS')}, output)
             port = (int(sys.argv[sys.argv.index('--port') + 1]) if '--port' in sys.argv
                     else int(sys.argv[sys.argv.index('--server-bind') + 1].rsplit(':', 1)[1]))
             if '--fixture-child' in sys.argv:
@@ -419,9 +419,9 @@ class SourceProvenanceTests(unittest.TestCase):
             git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
             baseline = helper.revision(directory)
             (repository / "Program.cs").write_text("// candidate\n")
-            (repository / "Q35CudaEngine.Graphs.cs").write_text("// new managed CUDA path\n")
+            (repository / "CandidateEngine.Graphs.cs").write_text("// new managed CUDA path\n")
             (repository / "kernels").mkdir()
-            cuda = repository / "kernels/tensorsharp_q35_topk.cuh"
+            cuda = repository / "kernels/tensorsharp_candidate.cuh"
             cuda.write_text("// new native kernel\n")
             (repository / ".vscode").mkdir()
             (repository / ".vscode/settings.json").write_text('{"fixture":true}\n')
@@ -430,8 +430,8 @@ class SourceProvenanceTests(unittest.TestCase):
             self.assertNotEqual(candidate["tracked_diff_sha256"], baseline["tracked_diff_sha256"])
             self.assertTrue(candidate["tracked_dirty"])
             sources = {entry["path"]: entry for entry in candidate["untracked_sources"]}
-            self.assertEqual(set(sources), {"Q35CudaEngine.Graphs.cs", "kernels/tensorsharp_q35_topk.cuh"})
-            self.assertEqual(sources["kernels/tensorsharp_q35_topk.cuh"]["sha256"], hashlib.sha256(cuda.read_bytes()).hexdigest())
+            self.assertEqual(set(sources), {"CandidateEngine.Graphs.cs", "kernels/tensorsharp_candidate.cuh"})
+            self.assertEqual(sources["kernels/tensorsharp_candidate.cuh"]["sha256"], hashlib.sha256(cuda.read_bytes()).hexdigest())
             self.assertEqual(candidate["tracked_changes"][0]["path"], "Program.cs")
 
 

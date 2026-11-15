@@ -6,7 +6,7 @@
 |---|---|
 | 提供方 | 阿里巴巴 |
 | GGUF 架构标识 | `qwen35`、`qwen35moe`、`qwen3next` |
-| 模型类 | 共享解码运行时上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs)；`--backend cuda` 上的稠密 NVFP4 由 [`Qwen35CudaModel`](../../TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs) 执行 |
+| 模型类 | 共享解码运行时上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs)，所有后端通用 |
 | 视觉编码器 | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | 图像处理器 | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
 | 示例模型 | Qwen3.5-9B（dense hybrid）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE 系列）、Qwen3.6-27B / Qwen3.8-27B（dense）；另有 [Bonsai2 27B](bonsai2_zh-cn.md)（PRISM PQ2_0 / PTQ1_0） |
@@ -449,10 +449,9 @@ output.weight
 
 | 加载 | 由谁执行 |
 |---|---|
-| `--backend cuda`、单 GPU、稠密 NVFP4 检查点、没有 `--tp` / `--layer-split` / 主机专家 | [`Qwen35CudaModel`](../../TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs)，直连 CUDA 引擎（`TS_Q35_NATIVE=0` 让它让位） |
-| 其余全部：每个后端（`cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`mlx`、`cuda`）、单设备、`--tp`、`--layer-split`、二者混合、多节点流水线、主机专家 | 运行在[共享解码运行时](../design/unified-execution.md)上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) |
+| 每个后端（`cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`mlx`、`cuda`）、单设备、`--tp`、`--layer-split`、二者混合、多节点流水线、主机专家，包括稠密 NVFP4 检查点 | 运行在[共享解码运行时](../design/unified-execution.md)上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) |
 
-本家族自己的模型类（`Qwen35Model`，及其融合整模型 GGML 图、槽位稳定 arena、常驻验证图与原生内核）已于 2026-11 删除；它服务过的每种放置都由运行时接管。
+本家族自己的模型类（`Qwen35Model`，及其融合整模型 GGML 图、槽位稳定 arena、常驻验证图与原生内核）已于 2026-11 删除；它服务过的每种放置都由运行时接管。`--backend cuda` 过去为单 GPU 稠密 NVFP4 检查点使用的直连 CUDA 引擎（`Qwen35CudaModel`、`Q35CudaEngine`）及其 NInfer 文件路线随后也已删除，这些检查点现在同样运行在运行时上；见[直连 CUDA NVFP4 引擎（已移除）](#直连-cuda-nvfp4-引擎已移除)。
 
 `Qwen35RuntimeModel` 是本家族在运行时上的配方：
 
@@ -472,27 +471,11 @@ output.weight
 
 decode 每步对所有运行中的序列只跑一张图：每个序列的行读取自己槽位的 K/V 窗口与递归状态。GGML 后端上下一步就地改写位置、写入行与掩码后重放该图。ggml_metal 上 decode 行的递归原地更新其状态。
 
-### Direct CUDA NVFP4 路线：输出层、验证 GEMM 与预填充 GEMM
+### 直连 CUDA NVFP4 引擎（已移除）
 
-NVFP4 GGUF 走 `--backend cuda`（`Q35CudaEngine`）时，每一步都要把全部权重读一遍，所以每步耗时取决于核函数能用到多少 RTX 5090 显存带宽。2026-11 替换了三个明显偏慢的核函数；每个形状都与旧核函数逐位比对过，结果完全一致，回答不变。
+2026-11 之前，`--backend cuda` 在单 GPU 上（没有 `--tp`、`--layer-split` 或主机专家）用自己的直连引擎（`Qwen35CudaModel`、`Q35CudaEngine` 及其 `ts_q35_*` 核函数）运行稠密 NVFP4 检查点，该引擎也能加载 NInfer 的 NVFP4 文件。引擎、其核函数、NInfer 支持以及引擎的 `TS_Q35_*` 变量均已移除；现在设置这些变量会让服务端或 CLI 在启动时报错退出。`--backend cuda` 像其他加载一样在共享运行时上服务这些检查点：NVFP4 乘积运行在后端的 FP4 核函数上（`CudaFp4Kernels`，sm_120a / sm_121a 构建中的块缩放 FP4 张量核）。本节以前列出的核函数与端到端数据（RTX 5090，2026-11）都测于已移除的引擎，尚未在运行时上重测。
 
-| 核函数 | 改前 | 改后（RTX 5090） |
-|---|---|---|
-| 输出层，Q6_K 248,320 x 5,120（每步目标头与 DFlash2 草稿头各一次） | 210 字节超块每次读 2 字节，每个超块一次 `__syncthreads`：0.83 TB/s，32 行 1.27 ms | 加载时重排为 64 行一块（`ts_q35_repack_q6k_tiled`，同样的字节换顺序），用 cp.async 流水线读取：32 行 0.74 ms（1.41 TB/s），8 行 0.89 -> 0.69 ms，1 行 1.06 -> 0.87 ms |
-| W4A4 验证 GEMM（9-64 行）的 split-K | 切分到 CTA 覆盖所有 SM：129 块的 GDN 输入投影切 2 份、跑两波 | 取仍能一波放下的最大切分：32 行时 GDN 输入投影 38.1 -> 30.6 us，5,120 行输出投影 18.1 -> 14.3 us |
-| 预填充 W4A4 GEMM（65 行以上） | cp.async 128 行块，约 830 TFLOPS | 改用 NInfer 路线的 TMA warp 专用核函数，并为 gate/up 增加 F32 SwiGLU epilogue：2,048-4,096 行时 1,230-1,390 TFLOPS |
-
-端到端（GGUF + DFlash2 K7，短提示、400 token 回答）：4 路并发 464 -> 521 tok/s，2 路并发 284 -> 308 tok/s。预填充首 token：11K token 提示 1.51 -> 1.20 s，36K token 6.57 -> 5.38 s，4 个 3.6K token 提示同时到达 1.9-2.1 -> 1.6-1.7 s。
-
-仍未解决：1-8 行的 W4A8 GEMV 在 8 行时只有 1.17-1.37 TB/s。保持 GEMV 求和顺序的 int8 张量核版本（每个 GEMV lane 一个累加器）需要 242 个寄存器，只有 0.3-0.9 TB/s，没有采用。
-
-**长文档上的 2 路并发与多轮会话。** 2 路并发时 DFlash2 验证有 16 行，投影从 8 行 GEMV 切到 W4A4 GEMM，32 行块只用了一半。实测这一半并不花时间：16 行时这些 GEMM 受显存带宽限制，与 8 行 GEMV 一样快甚至更快（gate/up 65 vs 73 us，GDN 输入投影 31.5 vs 40.5 us），逐位一致的 16 行块最多只快 3%。真正的开销有三处，均已修复：
-
-| 开销 | 改前 | 改后（RTX 5090） |
-|---|---|---|
-| 9 行以上的 pre-norm + NVFP4 量化（每层两次） | 每组元素都要等一次全局内存往返：5.5 us | `ts_q35_add_rmsnorm_nvfp4_5120_f32` 把整行放在寄存器里，先发出全部读取：3.5 us，逐位一致 |
-| 长缓存上的短提示块（会话的新一轮、新对话的后缀） | 8 位提示注意力不切分键：127K 缓存上 47 token 的块只有 8 个 CTA，每层 5.3 ms，另加 0.65 ms 转换 band | 改用把键切分到整卡的 16 位核函数，直到 8 位 CTA 能覆盖约 40% 的 SM（约 350 行；两条路线都适用）：该轮首 token 140 -> 50 ms |
-| 同一步进入、共享缓存前缀的多个对话 | 从 radix 缓存恢复的请求还没有 holder，批量预填充跳过它，后缀逐个预填充 | 执行器先绑定 holder、注入前缀（`PrebindCachedPrefixPrefills`），后缀共用一次前向：120K token 文档上 3 个这样的对话首 token 相差不到 3 ms |
+该路线上发现的一处修复是共享的，仍然保留：同一步进入、共享缓存前缀的多个对话，会先绑定 holder 并注入前缀（批处理执行器中的 `PrebindCachedPrefixPrefills`），使各后缀共用一次前向，而不是逐个运行。
 
 ### MLX：UD 量化与推测解码
 

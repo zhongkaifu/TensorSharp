@@ -105,7 +105,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_environment_defaults_are_validated_raw_metadata_not_downloads_or_process_mutations(self):
         key = "TS_CONFIG_OFFLINE_TEST"
-        values = {key: "value", "TS_Q35_NINFER_DRAFT_PTX": "${appBaseDirectory}/cuda_kernels/draft.ptx"}
+        values = {key: "value", "TS_CONFIG_OFFLINE_HOST_PATH": "${appBaseDirectory}/cuda_kernels/draft.ptx"}
         self.write({"environment": values})
         with mock.patch.dict(os.environ, {key: "inherited"}):
             parsed = read_config(self.config, environ={})
@@ -124,18 +124,6 @@ class ConfigTests(unittest.TestCase):
         self.write({"variables": {"appBaseDirectory": "/invented"}})
         with self.assertRaises(ConfigError):
             read_config(self.config, environ={})
-
-    def test_shared_ninfer_profiles_preserve_host_only_environment_metadata(self):
-        repo = Path(__file__).resolve().parents[3]
-        for suffix, context in (("", "40960"), ("-64k", "65536")):
-            parsed = read_config(repo / f"config/qwen3.8-27b-ninfer{suffix}.json", self.root / "models", environ={})
-            self.assertEqual(parsed.environment_defaults["MAX_CONTEXT"], context)
-            self.assertEqual(parsed.environment_defaults["TS_SPEC_ADAPTIVE"], "0")
-            self.assertIn("${appBaseDirectory}", parsed.environment_defaults["TS_Q35_NINFER_DRAFT_PTX"])
-            self.assertEqual(parsed.options["backend"], "cuda")
-            self.assertNotIn("environment", parsed.options)
-            self.assertEqual(len(parsed.files), 1)
-            self.assertEqual(parsed.files[0].sha256, "74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82")
 
 
 class DownloadTests(unittest.TestCase):

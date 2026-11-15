@@ -600,10 +600,9 @@ latency in one bucket.
 | `tensorsharp.engine.step.prefill_tokens` | histogram, `{token}` (16 … 65536) | per step with prompt work: the `IsPrefill` work items' `NumScheduledTokens`, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.inter_token.duration` | histogram, s (0.005 … 30) | per output token after a sequence's first: the time since `SequenceState.LastTokenTimestamp`, a multi-token step's time split evenly, `tensorsharp.engine.step_kind` of the step that emitted it |
 | `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | the scheduler's "Radix prompt reuse" admission log site, `tensorsharp.prefix_cache.outcome` and `.source` |
-| `tensorsharp.engine.stage.duration` | histogram, s (0.0001 … 1.024) | the direct-CUDA Qwen 3.8 engine's sampled forwards (`TS_Q4E_PERF_SAMPLE`), `tensorsharp.engine.stage`, `.step_kind`, `.rows` |
 | `tensorsharp.engine.step.phase.duration` | histogram, s (0.0001 … 1.024) | `BatchExecutor`'s batched decode paths (pipelined groups and one batched step): the host's `finish`, `sample` and `issue` parts; the unified step (the shared decoder runtime): its decoders' draws (`sample`, `.rows` = decoders) and its forward (`issue`, `.rows` = every row it ran, prompt chunks included); `tensorsharp.engine.step.phase`, `.rows` |
 | `tensorsharp.speculative.accepted_length` | histogram, `{token}` (0 … 8) | the same sites as the drafted and accepted counters, one value a verify window, `tensorsharp.speculative.drafted` |
-| `tensorsharp.slots*`, `tensorsharp.cuda_graph.*`, `tensorsharp.engine.forward.issue_time`, `.wait_time`, `tensorsharp.engine.lane.steps`, `.rows`, `.time` | observable gauges and counters | `IServingTelemetrySource.ReadServingTelemetry()` of a registered engine's model |
+| `tensorsharp.slots*`, `tensorsharp.cuda_graph.*`, `tensorsharp.engine.forward.issue_time`, `.wait_time`, `tensorsharp.engine.lane.steps`, `.rows`, `.time` | observable gauges and counters | `IServingTelemetrySource.ReadServingTelemetry()` of a registered engine's model (no model implements it since the Qwen 3.8 Flash Next direct-CUDA engine was removed) |
 
 All carry `tensorsharp.model.architecture`.
 
@@ -702,7 +701,7 @@ accelerator's expert budget or the adaptive tier is where the decode time goes.
 | Instrument | Type | Source |
 |---|---|---|
 | `tensorsharp.moe.expert.routes` | observable counter, `{route}` | routed-expert selections by `tensorsharp.moe.placement`: `device` (an accelerator slot already held the expert: tier fixed and window hits, VRAM residency slots), `streamed` (a window slot read it from storage first), `host` (the host's expert kernel computed it) |
-| `tensorsharp.moe.host.compute.time` | observable counter, s | time in the host expert kernel (`host_moe_decode_experts_rows`, which the direct CUDA engine's host experts run as well) |
+| `tensorsharp.moe.host.compute.time` | observable counter, s | time in the host expert kernel (`host_moe_decode_experts_rows`, which the direct-CUDA host experts, `CudaHostExperts`, run as well) |
 | `tensorsharp.moe.expert.swaps` | observable counter, `{swap}` | adaptive residency swaps (`TS_MOE_TIER_ADAPT`) |
 | `tensorsharp.moe.expert.io` | observable counter, By | bytes explicit expert I/O read from storage (tier loads included) |
 

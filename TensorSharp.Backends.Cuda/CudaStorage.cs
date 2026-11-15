@@ -137,15 +137,6 @@ namespace TensorSharp.Cuda
             return AddBytes(deviceBuffer, checked(index * ElementType.Size()));
         }
 
-        /// <summary>The device address of element <paramref name="index"/> once the device copy is
-        /// current, for a reader in the same context (on another stream: synchronize this
-        /// allocator's stream first).</summary>
-        public IntPtr DevicePtrForRead(long index)
-        {
-            EnsureDeviceCurrent();
-            return DevicePtrAtElement(index);
-        }
-
         public override void EnsureDeviceCurrent()
         {
             ThrowIfDisposed();

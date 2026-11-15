@@ -115,6 +115,14 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 
 以下变化跨越多个发布标签。上文的 LTX 2.5、EmbeddingGemma 2、Muse Spark、从任意分片加载分片 GGUF、原生技能发现和最新 MiniMax-H3 改动晚于 `v2026.10.11`；知识集合与生成中引导已包含于该标签。下面保留早期工作的兼容性说明和性能实测记录。
 
+- **Qwen 直连 CUDA 引擎与 NInfer 支持已移除。** Qwen 3.5 / 3.6 / 3.8（`qwen35`、`qwen35moe`）与 Qwen 3.8 Flash Next（`qwen4exp`）
+  现在在所有后端上都运行在共享解码运行时上；`--backend cuda` 上它的图运行在 CUDA 图执行器上。`--backend cuda` 上的稠密 NVFP4
+  检查点不再有专属的直连引擎；Flash Next 在 `--backend cuda` 上现在与 `ggml_cuda` 一样接受 `--tp N` 与 `--n-cpu-moe` / `--cpu-moe`
+  （`--tp` 与 `--layer-split` 同时使用仍被拒绝）；NInfer 文件（`.ninfer`、`neroued/Qwen3.8-27B-nvfp4-NInfer`）不再能加载。引擎的环境变量
+  （`TS_Q35_*`、其 `TS_Q4E_*` 开关、`TS_MOE_TIER_ADAPT_SWAPS` / `_EVERY` / `_ASYNC` / `_PROMPT_SWAPS`、`TS_NINFER_GGUF_DIR`）会让服务端
+  或 CLI 在启动时报错退出；预设 `config/qwen3.8-27b-ninfer.json`、`config/qwen3.8-27b-ninfer-64k.json` 与
+  `config/qwen3.8-flash-next-cuda-4lanes.json` 已删除。这些模型族的 `--backend cuda` 路径此后尚未在 GPU 上测量；见
+  [环境变量矩阵](env_var_feature_matrix_zh-cn.md#kv-cache--上下文)。
 - **Muse Spark 的两种多 GPU 模式都通过原生整模型执行器运行。** 它是 `ggml_cuda` / `ggml_vulkan` 上的默认路径，`ggml_cuda` 上的 `--tp N` 现在也用它，通过上游 ggml 的 meta 后端把每层切分到前 N 张 CUDA GPU；`TS_MUSE_SPARK_NATIVE=0` 恢复逐算子路径，`ggml_vulkan` 上的 `--tp N` 仍走这条路径。按层切分最多覆盖 16 张 GPU，无法满足的 GPU 数会被拒绝，而不是改用更少的 GPU；在 CUDA GPU 上，一个提示的 prefill 会以流水线方式分布到各 GPU（`TS_MUSE_SPARK_PIPELINE`、`TS_MUSE_SPARK_PIPELINE_UBATCH`）。未设 `MAX_CONTEXT` 时，放不下的声明上下文会被限制到能放下的最大值。启用流水线 prefill 时，若只有一个请求，它的 prefill 步长由 Muse Spark 自己选择（8,192 token），除非设置了 `TS_SCHED_SOLO_PREFILL_CHUNK`。在支持 P2P 的 GPU 达到十张及以上的 Linux 主机上，TensorSharp 自有的 `cuMemSetAccess` 保护层消除了曾让带 NCCL 构建的每次 `ggml_cuda` 运行都中止的 ggml-cuda 临时内存池错误（CUDA 允许每张 GPU 最多八个 peer 连接）。既没有 `TS_MUSE_SPARK_CPU_MOE=auto` 也没有 `--n-cpu-moe N` 时，GPU 放不下的按层切分 checkpoint 会在加载时被拒绝，错误信息会指明该选项。处理并发请求时，把 `TS_MUSE_SPARK_PLAN_SLOTS` 设为并发数再加一（留给共享前缀检查点）。见[实测启动配置](models/muse-spark_zh-cn.md#启动)与[十 GPU 对比](perf/muse-spark-vs-llama-cpp.md)（英文）。
 - **分片 GGUF 可从任意分片加载。** `--model` 可以指向 `-0000N-of-0000M` 分片组中的任意文件：TensorSharp 从第 1 片读取元数据、合并所有分片的张量表，并在加载权重前拒绝缺失的分片或不一致的分片数。指向第 1 片的用法照旧可用。
 - **TensorAgent 与显式启用的服务端请求支持知识集合。** 每个聊天或请求都需显式选择集合；加载兼容模型后可重新索引仅元数据的媒体。导入保留原文件；替换或重新索引会使旧版本引用失效。见[个人知识库](knowledge-system_zh-cn.md)。
@@ -132,7 +140,7 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   按需从 SSD 读取。只有每个分片都完整时它才算已安装；分片不完整时应用拒绝加载
   （“Qwen3.8 Flash Next is not completely downloaded yet.”），而不是让引擎在用户从未见过的文件上失败。见
   [Mac 专属模型](../TensorAgent/README.md#the-macs-own-models)。
-- **Direct CUDA 引擎（`cuda`）可以运行 Qwen 3.8 Flash Next 的 UD-Q2_K_XL。** 它过去会在加载时拒绝该文件的
+- **Direct CUDA 引擎（`cuda`）可以运行 Qwen 3.8 Flash Next 的 UD-Q2_K_XL**（该引擎此后已移除，见第一条）。它过去会在加载时拒绝该文件的
   IQ2_XS/IQ3_XXS 专家（"unsupported expert quant type 17"）；现在用移植自 ggml 点积的内核解码它们，整个解码步仍被捕获为
   CUDA graph，其 tensor core 与寄存器暂存的分组专家内核也能在预填充时处理这两种类型。在 2x A40（`--layer-split 2`）上，
   预填充从约 500 tok/s 提升到 1,612 tok/s（预热后），真实文本的解码速度达到 llama.cpp 的 95-96%。这个量化的多 GPU 用 `--layer-split N`：`--tp N` 仍会拒绝它（退出码 2）。见

@@ -23,9 +23,9 @@
 //     ts_fp4_gemm_w4a4_tma<bm>_swiglu a fused gate|up projection's rows with silu(gate) * up in the epilogue.
 //   * ts_fp4_get_rows_f32: rows of a planar matrix as F32 (an NVFP4 table's lookup).
 //
-// The kernels are the direct-CUDA Qwen3.5 engine's (bit-identical arithmetic). The tensor-core bodies exist only in an
-// sm_120a / sm_121a image (CommittedBaseline false: no compute_75 baseline); ts_fp4_mma_caps reports whether the
-// loaded image has them, and the backend keeps NVFP4 weights as ggml blocks on its other kernels where it does not.
+// The kernels came from the removed direct-CUDA Qwen3.5 engine (bit-identical arithmetic). The tensor-core bodies exist
+// only in an sm_120a / sm_121a image (CommittedBaseline false: no compute_75 baseline); ts_fp4_mma_caps reports whether
+// the loaded image has them, and the backend keeps NVFP4 weights as ggml blocks on its other kernels where it does not.
 //
 // Bump TS_FP4_VERSION, and CudaFp4Kernels.CurrentVersion with it, whenever a kernel is added or changes signature.
 // ---------------------------------------------------------------------------
@@ -572,7 +572,7 @@ __device__ __forceinline__ uint32_t ts_fp4_smem_u32(const void* p)
 
 // cp.async and ldmatrix need sm_80. Below it (the compute_75 fallback, or sm_75 SASS in a
 // release fatbin) these helpers trap like the MMA ones, so the module still builds; ts_fp4_caps
-// reports 0 there and Q35Kernels never launches a GEMM.
+// reports 0 there and CudaFp4Kernels never launches a GEMM.
 __device__ __forceinline__ void ts_fp4_cp16(void* dst, const void* src, bool valid)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800

@@ -1,8 +1,8 @@
 # Reproducing the Qwen3.8-27B comparison configurations
 
 This page records an earlier **ggml CUDA** campaign with the revisions and
-configuration templates below. The current **native CUDA** engine evaluation
-uses `--backend cuda` and the `Qwen35CudaModel` direct engine; see
+configuration templates below. The current **native CUDA** evaluation uses
+`--backend cuda` (the shared `Qwen35RuntimeModel` on the CUDA graph executor); see
 [its reproduction guide](README-qwen38-engine-evaluation.md). These are separate
 campaigns. Keep their results, source revisions and dependency evidence separate.
 

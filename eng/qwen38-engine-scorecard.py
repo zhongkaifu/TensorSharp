@@ -11,9 +11,8 @@ KV-cache reuse, concurrent waves) and longdecode.jsonl (one JSON line per long-c
 probe), ready.txt (load_s=...), vram.txt and spec.txt ("on ..." or "off": whether speculative
 decoding ran; absent = on, except <engine>-nospec). Every metric records which (summary
 "spec": on / off / mixed) so the poster can label each result.
-TensorSharp is scored as two deployments: tensorsharp (the NInfer .ninfer artifact on the
-native CUDA engine, text only) and tensorsharp-gguf (the GGUF + mmproj model on the same
-engine). <engine>-nospec holds the same engine with speculative
+TensorSharp is scored as one deployment: tensorsharp (the GGUF + mmproj model on
+--backend cuda). <engine>-nospec holds the same engine with speculative
 decoding off (long_generation only): it feeds the speculative-decoding section and is
 never scored. Outputs: summary.json, report_en.html, report_zh.html, poster_en.html,
 poster_zh.html. Nothing is started; only recorded evidence is read.
@@ -39,10 +38,10 @@ import re
 import statistics
 from pathlib import Path
 
-ENGINE_NAMES = {"tensorsharp": "TensorSharp-NInfer", "tensorsharp-gguf": "TensorSharp-GGUF", "ignis": "Ignis",
+ENGINE_NAMES = {"tensorsharp": "TensorSharp", "ignis": "Ignis",
                 "ninfer": "NInfer", "llamacpp": "llama.cpp", "vllm": "vLLM", "sglang": "SGLang"}
 TIERS = ("64k", "128k", "256k")
-TS_ENGINES = ("tensorsharp", "tensorsharp-gguf")
+TS_ENGINES = ("tensorsharp",)
 
 # (id, en, zh, weight, quality items, perf metrics [(metric id, higher_is_better)]). A quality item is a
 # scenario name, or "scenario-glob:check-name-regex" for some checks of the matching scenarios.
@@ -607,15 +606,14 @@ def matrix_block(result, order, stats, best, lang, mids=None):
         p, pmax = st.get("prompt"), st.get("prompt_max")
         ptxt = fmt_tokens(p) + (f"–{fmt_tokens(pmax)}" if pmax and p and pmax > 1.2 * p else "")
         ts = result.get("tensorsharp", {}).get("metrics", {}).get(mid)
-        tsg = result.get("tensorsharp-gguf", {}).get("metrics", {}).get(mid)
         b = best.get(mid)
         who = next((ENGINE_NAMES[k] for k in order if result[k]["metrics"].get(mid) == b), "") if b else ""
         rows.append(f"<tr><td>{html.escape(label)}</td><td>{html.escape(task)}</td><td class='num'>{ptxt}</td>"
                     f"<td class='num'>{fmt_tokens(st.get('output'))}</td><td class='num'>{st.get('requests') or 1:g}</td>"
-                    f"<td class='num'>{fmt(ts)}</td><td class='num'>{fmt(tsg)}</td><td class='num'>{fmt(b)} {html.escape(who)}</td></tr>")
+                    f"<td class='num'>{fmt(ts)}</td><td class='num'>{fmt(b)} {html.escape(who)}</td></tr>")
     return (f"<h2>{html.escape(sec['matrix'])}</h2><div style='overflow-x:auto'><table class='matrix'><tr>"
             f"<th>{sec['metric']}</th><th>{sec['task']}</th><th>{sec['prompt']}</th><th>{sec['gen']}</th>"
-            f"<th>{sec['reqs']}</th><th>TensorSharp-NInfer</th><th>TensorSharp-GGUF</th><th>{sec['best']}</th></tr>{''.join(rows)}</table></div>")
+            f"<th>{sec['reqs']}</th><th>TensorSharp</th><th>{sec['best']}</th></tr>{''.join(rows)}</table></div>")
 
 
 def spec_block(result, order, context, lang, charts=True):

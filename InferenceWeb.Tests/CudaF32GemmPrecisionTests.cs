@@ -536,22 +536,6 @@ public sealed class CudaF32GemmPrecisionTests : IDisposable
 
     // ---------------------------------------------------------------- the direct engines' MatMulF32
 
-    /// <summary>Qwen3.8 Flash Next (q4e): the router, GDN alpha/beta and the indexer's key and query
-    /// projections of the synthetic checkpoint, through the engine's own MatMulF32 at 16 (GEMV), 17
-    /// and 64 rows (cuBLAS), then the trained model's 512 x 2560 router width on the same route.</summary>
-    [CudaFact]
-    public void Qwen4ExpEngine_F32ProjectionsComputeExactly()
-    {
-        _env.Set("MAX_CONTEXT", "1024");
-        _env.ClearSpeculationVars();
-        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"));
-        using var ex = new Qwen4ExpCudaExecutor(path, 1024, 64, 1);
-        AssertFiniteLogits(ex.VocabSize, ex.Forward);
-        int embd = NEmbd(ex.Engine);
-        CheckEngineMatMulF32("q4e", ex.Engine, new[] { "Router", "SsmAlpha", "SsmBeta", "IdxK", "IdxQ" }, _ => embd,
-            new[] { (512, 2560, new[] { 17, 512 }) });
-    }
-
     /// <summary>GLM-5.3-Flash: the router and the indexer's head weights, then a 288-expert router
     /// over a 6144-wide hidden state.</summary>
     [CudaFact]

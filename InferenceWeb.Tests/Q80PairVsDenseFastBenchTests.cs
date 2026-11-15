@@ -13,12 +13,10 @@ using static InferenceWeb.Tests.Dsv4ExpertKernelTests;
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// The direct engine's routing of Q8_0 decode projections between the pair matvec (CudaKernels.LaunchQuantMatmulQ80Pair)
-/// and the decode-once dense kernels (Dsv4Kernels.DenseQ81Rows): a weight that keeps the decode-once kernels
-/// (DeviceWeight.DecodeOnce) never takes the pair, at any row count. And, timing only, Flash Next's Q8_0 decode
-/// projections (the TS_Q4E_HC_Q8 hyper-connection mixers, the MTP block's dense weights, and the trunk shapes a Q8_0 pack
-/// would have) on both kernels at 1-16 rows, graph-captured, with cold weights (enough copies of each matrix to stream
-/// past the L2).
+/// Timing only: Flash Next's Q8_0 decode projections (the TS_Q4E_HC_Q8 hyper-connection mixers, the MTP block's dense
+/// weights, and the trunk shapes a Q8_0 pack would have) on the pair matvec (CudaKernels.LaunchQuantMatmulQ80Pair) and
+/// the decode-once dense kernels (Dsv4Kernels.DenseQ81Rows) at 1-16 rows, graph-captured, with cold weights (enough
+/// copies of each matrix to stream past the L2).
 /// </summary>
 public sealed class Q80PairVsDenseFastBenchTests
 {
@@ -28,28 +26,6 @@ public sealed class Q80PairVsDenseFastBenchTests
     public Q80PairVsDenseFastBenchTests(ITestOutputHelper output) => _output = output;
 
     private static IntPtr Ptr(Tensor t) => Dsv4CudaEngine.Ptr(t);
-
-    [Fact]
-    public void ADecodeOnceWeight_NeverTakesThePair()
-    {
-        var trunk = new DeviceWeight { Type = Q8_0, Ne0 = 2560, Ne1 = 10240, RowBytes = 2560 / 32 * 34 };
-        var once = trunk;
-        once.DecodeOnce = true;
-        bool pairOn = Environment.GetEnvironmentVariable("TS_Q4E_Q80_PAIR") != "0";
-        for (int rows = 1; rows <= CudaKernels.Q80PairMaxRows; rows++)
-        {
-            Assert.False(Q4eCudaEngine.TakesQ80Pair(once, rows, hasPair: true), $"a decode-once weight took the pair at {rows} rows");
-            Assert.Equal(pairOn, Q4eCudaEngine.TakesQ80Pair(trunk, rows, hasPair: true));
-            Assert.False(Q4eCudaEngine.TakesQ80Pair(trunk, rows, hasPair: false));
-        }
-        Assert.False(Q4eCudaEngine.TakesQ80Pair(trunk, CudaKernels.Q80PairMaxRows + 1, hasPair: true));
-        var odd = trunk;
-        odd.Ne0 = 2560 + 16;
-        Assert.False(Q4eCudaEngine.TakesQ80Pair(odd, 4, hasPair: true));
-        var q6 = trunk;
-        q6.Type = (int)GgmlTensorType.Q6_K;
-        Assert.False(Q4eCudaEngine.TakesQ80Pair(q6, 4, hasPair: true));
-    }
 
     private static double GraphMicros(IntPtr stream, Action<int> launch, int n, int reps)
     {

@@ -37,7 +37,7 @@ exercise 9–63-token shapes, without enabling them in model execution.
 
 Direct CUDA fusion covers the quantized expert SwiGLU paths in the shared
 whole-model MoE code, Dsv4, and generic Qwen decode/batched execution. Scratch
-reuse applies only to `CudaMoeScratch`, used by the GLM and Qwen4Exp engines:
+reuse applies only to `CudaMoeScratch`, used by the GLM engine and `CudaGraphExecutor`'s MoE ops:
 gate/up and down activation buffers share capacity because their lifetimes do
 not overlap, and the interleaved/split layouts are mutually exclusive. Dsv4's
 separate scratch and generic Qwen3.5/3.6 scratch are unchanged. The direct CUDA
@@ -87,12 +87,12 @@ expert reduction kernel. Confirm actual placement and kernel engagement in the
 retained process log and any implementation diagnostics.
 
 Use `--synthetic-q4e artifacts/strata-perf/fixture.gguf` instead of `--model` to
-generate a deterministic eight-layer Qwen4Exp engine fixture. This automatically
+generate a deterministic eight-layer Qwen4Exp model fixture. This automatically
 disables quality generation. It supports `--synthetic-q2kxl true`,
 `--synthetic-experts N`, `--synthetic-experts-used K` and
 `--synthetic-indexer-top-k N` (defaults: false, 16, 4 and 16). Both arms must use
 the same settings and the recorded fixture checksum must match. This mode
-exercises full engine loading and execution but makes no trained-model claim.
+exercises full model loading and execution but makes no trained-model claim.
 
 `--quality false` skips semantic generation and explicitly reports it as
 unchecked. `--max-context` defaults to 1024. The probe clears speculative decoding

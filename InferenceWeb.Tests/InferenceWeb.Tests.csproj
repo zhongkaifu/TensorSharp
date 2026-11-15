@@ -15,7 +15,6 @@
     <Compile Remove="Fixtures/PdfProcessFixture/**/*.cs" />
     <ProjectReference Include="Fixtures/PdfProcessFixture/PdfProcessFixture.csproj" ReferenceOutputAssembly="false" />
     <Compile Include="../eng/validation/Gemma4BatchedCacheProbe/Gemma4CacheProbe.cs" Link="Validation/Gemma4CacheProbe.cs" />
-    <Compile Include="../eng/validation/NinferA16ScheduleReference.cs" Link="Validation/NinferA16ScheduleReference.cs" />
     <Compile Include="../eng/validation/ValidationSha256.cs" Link="Validation/ValidationSha256.cs" />
   </ItemGroup>
   <ItemGroup>
@@ -28,7 +27,6 @@
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />
-    <EmbeddedResource Include="TestData/Ninfer/qwen38-nvfp4-v3-directory.json" />
     <EmbeddedResource Include="Fixtures/Knowledge/*.pdf" />
     <EmbeddedResource Include="Fixtures/Knowledge/manifest.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/chat_template.jinja" />

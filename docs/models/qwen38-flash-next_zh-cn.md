@@ -22,18 +22,16 @@ PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF �
 | 硬件 | 预设 | 文件 | 实测（2026-11-08） |
 | --- | --- | --- | --- |
 | Apple Silicon，48 GB | `config/qwen3.8-flash-next.json` | ISTA-DASLab GSQ-RCO `Q2_0`（两个分片，66.4 GB）+ DFlash2 Q4_K_M 草稿模型，`ggml_metal` | M5 Pro：解码 43-48 tok/s，4K / 16K 提示首 token 5.8-6.0 / 22.7-24.3 秒，四个请求并发合计 43.4 tok/s，Strata 的 12 项正确性检查全部通过 |
-| NVIDIA，32 GB 显存 + 约 45 GB 内存 | `config/qwen3.8-flash-next-cuda.json` | 同一 `Q2_0` + 共享 MTP 头，直接 `cuda` 引擎 | RTX 5090：解码 131-250 tok/s，4K / 16K / 100K 提示首 token 1.0 / 4.2 / 30.4 秒 |
-| NVIDIA，多用户 | 再叠加 `config/qwen3.8-flash-next-cuda-4lanes.json` | 四个序列通道 | RTX 5090：四个请求并发合计 243-258 tok/s，parallel_4 281-286 tok/s |
+| NVIDIA，32 GB 显存 + 约 45 GB 内存 | `config/qwen3.8-flash-next-cuda.json` | 同一 `Q2_0` + 共享 MTP 头，`--backend cuda`（共享运行时运行在 CUDA 图执行器上） | 尚未在运行时上重新测量；已移除的直连 CUDA 引擎在 RTX 5090 上实测：解码 131-250 tok/s，4K / 16K / 100K 提示首 token 1.0 / 4.2 / 30.4 秒 |
 | Apple Silicon，UD-Q2_K_XL 文件 | `config/qwen3.8-flash-next-ud-q2_k_xl.json` | UD-Q2_K_XL（三个分片）+ 共享 MTP 头 | M5 Pro：解码约 31 tok/s（之前的预设） |
 
 `Q2_0` 文件来自 [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)（固定在 `ed59f920`），草稿模型来自 [incoai/Qwen3.8-Flash-Next-DFlash2-GGUF](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2-GGUF)（固定在 `4f5a39be`）；预设会自动下载并校验（sha256）。
 
 ## TensorSharp 如何运行它
 
-该模型族由两种实现服务：
+该模型族由一种实现服务：
 
-- `--backend cuda` 加载直连 CUDA 引擎（`Qwen4ExpCudaModel`，即 Q4e kernel；见[直连 CUDA 引擎上的服务](#直连-cuda-引擎上的服务)）。
-- 其余后端（`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`ggml_cpu`、`cpu`）运行在共享解码运行时（`Qwen4ExpRuntimeModel`）上，与 Qwen 3.5 是同一个运行时。模型族只添加自身特有的部分：
+- 所有后端（`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`ggml_cpu`、`cpu` 与 `cuda`）都运行在共享解码运行时（`Qwen4ExpRuntimeModel`）上；`--backend cuda` 上它的图运行在 CUDA 图执行器上（见[在 `--backend cuda` 上服务](#在---backend-cuda-上服务)）。这与 Qwen 3.5 是同一个运行时。模型族只添加自身特有的部分：
   - hyper-connection 流；
   - sigmoid 门控递归；
   - PLE 层，其 n-gram 行从磁盘上的表中读取；
@@ -49,7 +47,7 @@ PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF �
 
 每个请求各有 slot，因此连续批处理、前缀缓存与张量并行都由共享运行时提供，不是模型族代码。下列能力同样如此：
 
-- `--tp N`：`ggml_cuda` 与 `ggml_vulkan` 上的 per-rank 图。
+- `--tp N`：`ggml_cuda`、`ggml_vulkan` 与 `cuda` 上的 per-rank 图。
 - `--layer-split N`：按整层划分的 stage，以及多节点流水线。
 - 带加速器 tier 的主机专家：独立显存上同样会收集路由 profile，下次加载时把每层最常路由的专家留在显存中。
 - 投机解码：经 `--draft-model mtp-*.gguf` 使用共享 MTP 头，或使用 DFlash2 drafter。
@@ -95,7 +93,7 @@ erf 选项（`TS_Q4E_VISION_MERGER_ERF`）已随旧实现移除。见[图像验�
   约早 60 ms 完成，但 decode 速率为 54.4 对 57.1 tok/s（尚未解决）。
 - `Qwen4ExpModel` 在合成 fixture 上的 golden（`InferenceWeb.Tests/Fixtures/Qwen4ExpLegacy`）约束运行时的数值结果。
 
-> **历史章节。** 下文描述 GGML 后端的带日期章节记录的是 `Qwen4ExpModel`，它已于 2026-11-13 移除，包括其 token span、arena、保留 holder、单 token verify 行 kernel 与专家缓存。其 GGML 专属开关随之移除：`TS_Q4E_VERIFY_ROW_KERNELS`、`TS_Q4E_VERIFY_ROW_COMMIT`、`TS_Q4E_DISABLE_ARENA_DECODE`、`TS_Q4E_QSA_POOL_CACHE`、`TS_Q4E_QSA_SPARSE_FA`、`TS_Q4E_LAYER_SPLIT`、`TS_Q4E_PLE_PREFETCH`、`TS_Q4E_METAL_FUSE`、`TS_Q4E_VISION_MERGER_ERF`、`TS_Q4E_RETAINED_CACHE_MB`、专家缓存的 `TS_HOST_MOE_EXPERT_CACHE_*` 以及调试 dump。现在设置这些开关会打印移除提示。直连 CUDA 引擎的 `TS_Q4E_*` 开关不变。
+> **历史章节。** 下文描述 GGML 后端的带日期章节记录的是 `Qwen4ExpModel`，它已于 2026-11-13 移除，包括其 token span、arena、保留 holder、单 token verify 行 kernel 与专家缓存。其 GGML 专属开关随之移除：`TS_Q4E_VERIFY_ROW_KERNELS`、`TS_Q4E_VERIFY_ROW_COMMIT`、`TS_Q4E_DISABLE_ARENA_DECODE`、`TS_Q4E_QSA_POOL_CACHE`、`TS_Q4E_QSA_SPARSE_FA`、`TS_Q4E_LAYER_SPLIT`、`TS_Q4E_PLE_PREFETCH`、`TS_Q4E_METAL_FUSE`、`TS_Q4E_VISION_MERGER_ERF`、`TS_Q4E_RETAINED_CACHE_MB`、专家缓存的 `TS_HOST_MOE_EXPERT_CACHE_*` 以及调试 dump。现在设置这些开关会打印移除提示。`--backend cuda` 过去加载的直连 CUDA 引擎（`Qwen4ExpCudaModel`，即 Q4e kernel）随后也已移除；下文关于它的章节同样是历史记录，其开关现在会让服务端或 CLI 在启动时报错退出（见[单卡放不下专家时的直接 CUDA 引擎](#单卡放不下专家时的直接-cuda-引擎2026-11-07)）。
 
 ## 工具调用与 Agent 工作流
 
@@ -430,7 +428,7 @@ UD-Q2_K_XL 文件共 78.9 GB，分三个分片：28.8 GB 的 n-gram（PLE）表�
   （`madvise(MADV_RANDOM)`），每个 token 的 16 行（每行 90 字节）按需并行收集。这正是 llama.cpp
   `--lazy-mode` 背后的思路，llama.cpp 对超过 4 GiB 的张量默认开启它。这类加载每次都会打印：
   `PLE n-gram table: 28.8 GB read on demand from the GGUF mapping, 16 rows a token (random-access advice).`
-  直连 `cuda` 引擎同样从映射中读取这些行。它和 GGML 后端都会在加载后于后台把整张表预热进页缓存，
+  除 `ggml_metal` 外的所有后端都会在加载后于后台把整张表预热进页缓存，
   但仅限主机能留住它的情况：Linux 上，可用空间取 `MemAvailable` 与进程内存 cgroup 余量中的较小者
   （容器的限额，而不是宿主机的）。大于内存的 Mac 会跳过预热，因为在那里读这张表只会挤掉专家。
   网络文件系统上预热最有用：geesefs 挂载上一行未缓存的读取需要 92–120 ms。
@@ -667,21 +665,15 @@ Qwen/MoE 回归通过 CUDA 327 项（跳过 17）和 CPU 319 项（跳过 22）�
 放在主机上，`ggml_cuda` 实测 600 / 30.2 tok/s（随机 token，pp512 / tg128），llama-bench 用
 `-ncmoe 12` 为 466.14 / 18.84。
 
-直接 `cuda` 引擎能运行 UD-Q2_K_XL 的 IQ2_XS 与 IQ3_XXS 专家：decode 用从 ggml 点积移植来的逐 token
-kernel，仍以捕获的 CUDA 图运行；prefill 则把这两种布局解码进它的 tensor-core 与寄存器暂存
-（register-staged）分组 kernel。在分组 kernel 接手之前，它对这个文件的 prefill 走最慢的回退路径，
-约 500 tok/s。它也能运行 UD-Q4_K_XL：该文件 48 层路由 down 投影中有 43 层存为 Q5_1（另外 5 层为
-Q8_0），gate/up 为 Q4_K/Q5_K。decode 像 ggml 的 `vec_dot_q5_1_q8_1` 一样用 dp4a 把 Q5_1 与 q8_1 激活
-做点积（偏移项取自 int8 激活之和），prefill 则把它解码进同样的分组 kernel，全部以 ggml 的
-`dequantize_row_q5_1` 为准。此前引擎在加载时拒绝
-这个文件，而在 `--layer-split 2` 下两个设备各自的拒绝以未处理的 `AggregateException` 中止了 CLI；
-现在它不能解码的专家布局会在任何上传之前被拒绝，只输出一行点名该张量的 `error: model load refused:`。
-尚未在直接引擎上测量 UD-Q4_K_XL 的吞吐。没有 nvcc 的构建使用已提交的 PTX，其中已包含 Q5_1
-解码器；若加载的 kernel 模块构建自早于该解码器的源码，引擎会拒绝 Q5_1 专家，而不是把它们当作 Q8_0 解码。
-该引擎没有主机专家接缝，所以 `--n-cpu-moe` 在它上面只打印警告，专家仍留在 GPU 上。
-直接 `cuda` 引擎使用 `--layer-split N` 分配多个 GPU，并拒绝 `--tp N`。
+`--backend cuda` 在 CUDA 图执行器上运行共享运行时，与 `ggml_cuda` 一样接受 `--n-cpu-moe` / `--cpu-moe`（主机专家）、
+`--tp N` 与 `--layer-split N`（`--tp` 与 `--layer-split` 同时使用会被拒绝）；这些尚未在 GPU 上测量。
 `ggml_cuda` 已支持对 UD-Q2_K_XL 使用 `--tp 2`，保留原始量化权重；支持的格式及设备/布局要求见
 [多 GPU](#多-gpu)。
+
+**历史：已移除的直连 CUDA 引擎。** 在 2026-11 移除之前，`--backend cuda` 加载自己的直连引擎（`Qwen4ExpCudaModel`）。
+它用从 ggml 点积移植来的逐 token kernel 运行 UD-Q2_K_XL 的 IQ2_XS 与 IQ3_XXS 专家（decode 每步一张捕获的 CUDA 图），
+prefill 用 tensor-core 与寄存器暂存分组 kernel，也能运行 UD-Q4_K_XL 的 Q5_1 down 投影；它没有主机专家接缝
+（`--n-cpu-moe` 只打印警告），并拒绝 `--tp N`。下面的测量都是在该引擎上得到的，尚未在运行时上重做。
 
 两张 A40、热态，同样的 1,818 token prompt 与 256 个贪心 token。TensorSharp 以
 `TensorSharp.Server.Host` 加 `--no-multi-agent --no-skills` 运行，每个进程三个请求，每个请求的首行各不相同，
@@ -689,7 +681,7 @@ Q8_0），gate/up 为 Q4_K/Q5_K。decode 像 ggml 的 `vec_dot_q5_1_q8_1` 一样
 
 | 2x A40，`--layer-split 2`（llama.cpp `-ngl 99`） | prefill tok/s | decode tok/s |
 | --- | --- | --- |
-| TensorSharp `cuda` | 1,612-1,613 | 56.85-56.93 |
+| TensorSharp `cuda`（已移除的直连引擎） | 1,612-1,613 | 56.85-56.93 |
 | TensorSharp `ggml_cuda` | 1,174-1,217 | 52.9-53.1 |
 | llama.cpp | 752-963 | 59.04-59.86 |
 
@@ -697,7 +689,7 @@ kernel 刚重新构建后，直接引擎的第一个请求在驱动编译 PTX �
 编译结果。随机 token（pp512 / tg128）下，直接引擎实测 1,222.0 / 61.0，`ggml_cuda` 为 410.9 / 43.2；
 llama-bench 的双 GPU 运行只有 210.74 / 41.99，远低于同一台机器上 llama-server 的数字，因此应以真实
 文本那张表为准。按那张表，TensorSharp 的 prefill 快 1.2-2.1 倍，decode 为 llama.cpp 的 88-90%
-（`ggml_cuda`）与 95-96%（`cuda`）。
+（`ggml_cuda`）与 95-96%（直连 `cuda` 引擎）。
 
 ### 内存上限，2026-11-07
 
@@ -733,7 +725,7 @@ llama-bench 的双 GPU 运行只有 210.74 / 41.99，远低于同一台机器上
 | --- | --- | --- | --- |
 | RTX 5090，Strata（MTP） | 306 tok/s | 0.92 s | 2.75 s |
 | RTX 5090，TensorSharp（MTP） | 74 tok/s | 4.17 s | 27.4 s |
-| RTX 5090，TensorSharp `--backend cuda`，普通解码（当天稍后，见下文） | 98 tok/s | 4.24 s | 17.8 s |
+| RTX 5090，TensorSharp `--backend cuda`（已移除的直连引擎），普通解码（当天稍后，见下文） | 98 tok/s | 4.24 s | 17.8 s |
 | M5 Pro 48 GB，Strata（DFlash2） | 48 tok/s | 6.32 s | 24.4 s |
 | M5 Pro 48 GB，TensorSharp（MTP） | 32 tok/s | 16.8 s | 65.3 s |
 
@@ -742,6 +734,13 @@ TensorSharp 在 5090 上的一个 decode token 耗时 11-13 ms：分层 span 中
 token 作为一张捕获好的 CUDA graph 运行，在设备上判定命中，未命中的专家由 CPU 线程池就地并行计算。
 
 ### 单卡放不下专家时的直接 CUDA 引擎，2026-11-07
+
+> **历史：已移除的引擎。** 本节及其子节（直到[ggml_metal 上的 DFlash2 草稿模型](#ggml_metal-上的-dflash2-草稿模型2026-11-08)之前）
+> 记录的是 `--backend cuda` 在 2026-11 移除之前加载的直连 CUDA 引擎（`Qwen4ExpCudaModel`，即 Q4e kernel）。
+> `--backend cuda` 现在在 CUDA 图执行器上运行共享运行时，这些测量都没有在那里重做。下文提到的引擎自有开关随之移除：
+> 它的 `TS_Q4E_*` 变量（运行时仍读取 `TS_Q4E_HC_Q8` 与 `TS_Q4E_MTP_EXPERTS`）以及 `TS_MOE_TIER_ADAPT_SWAPS`、`_EVERY`、
+> `_ASYNC` 与 `_PROMPT_SWAPS`；现在设置其中任何一个都会让服务端或 CLI 在启动时报错退出。这些章节提到的
+> `config/qwen3.8-flash-next-cuda-4lanes.json` 叠加配置已删除。
 
 `--backend cuda` 把一个 decode 步骤作为一张捕获的 CUDA 计算图运行。它以前要求所有路由专家都在 VRAM 中；
 UD-Q2_K_XL（42.9 GiB 专家）和 ISTA-DASLab 的 `Q2_0`（31.6 GiB）都放不进 32 GB 的显卡。现在它按 Strata 运行
@@ -1782,7 +1781,7 @@ UD-Q4_K_XL 的 Q5_1 down 权重使用 TensorSharp 自有的精确输出行切分
 主机缓冲区，并保留至模型释放。加载时不再预读整个稀疏 PLE 表，所需行按需读取。
 
 `--layer-split N` 仍表示按完整层连续分配至多个 GPU，适用于 `ggml_cuda`、
-`ggml_vulkan` 和直接 `cuda` 引擎。不得同时使用 `--tp` 与 `--layer-split`。
+`ggml_vulkan` 和 `cuda`。不得同时使用 `--tp` 与 `--layer-split`。
 `eng/tests/qwen4exp-tensor-parallel.py` 验证两层 prefill、重放、QSA、多轴 RoPE、
 全部 logits 和多 rank 状态回滚。量化模式
 （`--quantized-ffn --tokens 1,2,3,4,5,6,7,8 --rollback-width 8`）在 CUDA TP2 与 TP4 上均通过全部 102 项检查，
@@ -1915,6 +1914,16 @@ MTP 在两个场景中均实际达到验证宽度 8，并覆盖拒绝回滚。�
 llama.cpp 的 `--tensor-split`），并且在无法满足给定值时直接抛异常，而不是悄悄忽略
 ——这很有用，因为自动均衡只按权重计价，看不见视觉塔，而视觉塔加载得更晚、会落在
 GPU 0 上。
+
+## 在 `--backend cuda` 上服务
+
+`--backend cuda` 通过共享解码运行时（`Qwen4ExpRuntimeModel`）服务该模型族，其图运行在 CUDA 图执行器上。服务契约与
+`ggml_cuda` 上的运行时相同：每个请求有自己的 slot，运行中请求的 decode 步一起执行，`--tp N` 运行 per-rank 图，
+`--layer-split N` 按整层放置，`--n-cpu-moe` / `--cpu-moe` 把路由专家交给主机；`--tp` 与 `--layer-split` 同时使用会被拒绝。
+预设为 `config/qwen3.8-flash-next-cuda.json`，其中的 `TS_Q4E_HC_Q8` 与 `TS_Q4E_MTP_EXPERTS` 由运行时读取。自直连引擎移除后，
+这条路径尚未在 GPU 上测量，本卡中的数字都不描述它。已移除的直连引擎（`Qwen4ExpCudaModel`）在 2026-11-07 至 11-12
+的服务测量（两张 H100 NVL 上的 sequence slot、批量 decode 图与双 decode 通道）作为历史记录保留在
+[英文版](qwen38-flash-next.md#measured-on-the-removed-direct-cuda-engine-2026-11-07-to-2026-11-12)中。
 
 ## 基准矩阵
 
