@@ -182,6 +182,17 @@ namespace TensorSharp.Graph
         /// the window (the keys the mask spans), idxDim, idxHeads, heads, kvHeads, d, the attention's key bound (its kvMax).
         /// Fp: the attention's scale, the indexer's weight of every head. Result: the attention [d, heads, rows].</summary>
         QsaAttention = 13,
+        /// <summary>A sparse attention layer's indexer keys for one sequence's rows (Qwen 3.8's QSA): each row's raw key into
+        /// its [raw | pooled] row of the indexer cache (the pooled half 0 times the raw key), and every block the rows complete
+        /// pooled into its last member's row - the mean of its members' raw keys as the cache holds them, RMS-normed with the
+        /// norm weight and rotated at its first cell's position. The writes are effects inside the region. The ops also pool
+        /// again blocks complete before the step (a short chunk's last ones), to the values they hold; a kernel need not.
+        /// Inputs: the rows' raw keys [d, rows], the indexer cache [2 d, capacity], the rows' KV indices [rows] (consecutive),
+        /// the norm weight [d] and the rotary positions [n] of the first cells of the blocks the ops pool: from the first
+        /// block the rows complete, or (Ip[2] = 1, a short chunk) the last n blocks complete once they are written. Ip: d, R, the
+        /// short chunk flag, the rotary dims, mode and original context. Fp: the norm's eps, 1 / R, the rotary's base,
+        /// frequency scale, extrapolation factor, attention factor, beta fast and beta slow. Result: the pooled write.</summary>
+        QsaKeys = 14,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

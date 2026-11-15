@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 26;
+        public const int CurrentVersion = 27;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -73,6 +73,7 @@ namespace TensorSharp.Cuda
             _gatedRmsNorm = module.GetFunction("ts_graph_gated_rms_norm_f32");
             _addRmsNorm = module.GetFunction("ts_graph_add_rms_norm_f32");
             _repackQ6kTiled = module.GetFunction("ts_graph_repack_q6k_tiled");
+            _qsaStorePool = module.GetFunction("ts_graph_qsa_store_pool_f32");
             // The tiled head's products stream with cp.async into the int8 tensor cores: only an image with their sm_80 bodies.
             if (ArchGuardedKernelsUsable)
             {
@@ -110,6 +111,24 @@ namespace TensorSharp.Cuda
                 _qsaAttention = module.GetFunction("ts_graph_qsa_attn_mma_f16_d256");
                 TakesQsaAttention = true;
             }
+        }
+
+        /// <summary>Threads of <see cref="LaunchQsaStorePool"/>'s blocks: the norm's (ts_rmsnorm_f32 runs 256), whose sums it repeats.</summary>
+        public const int QsaStorePoolThreads = 256;
+
+        /// <summary>A QSA layer's indexer keys for one sequence's <paramref name="rows"/> rows (GraphFusion.QsaKeys; see the kernel's
+        /// contract): raw [rows][d] F32 into the [raw | pooled] F16 rows of <paramref name="cache"/> at the rows' KV indices
+        /// <paramref name="positions"/>, and each block a row completes pooled with the norm weight <paramref name="w"/> [d] and
+        /// rotated at <paramref name="table"/>'s position (<paramref name="n"/> of them, the blocks the ops pool).</summary>
+        public void LaunchQsaStorePool(IntPtr raw, IntPtr cache, IntPtr positions, IntPtr w, IntPtr table, int d, int ratio, int rows,
+            bool shortChunk, int n, float eps, float invRatio, int ropeDim, int mode, int ctx, float freqBase, float freqScale, float extFactor,
+            float attnFactor, float betaFast, float betaSlow, IntPtr stream)
+        {
+            int shortRows = shortChunk ? 1 : 0;
+            void** args = stackalloc void*[] { &raw, &cache, &positions, &w, &table, &d, &ratio, &rows, &shortRows, &n, &eps, &invRatio, &ropeDim,
+                &mode, &ctx, &freqBase, &freqScale, &extFactor, &attnFactor, &betaFast, &betaSlow };
+            CudaDriverApi.cuLaunchKernel(_qsaStorePool, (uint)rows, 1, 1, QsaStorePoolThreads, 1, 1, (uint)(d * 4), stream, (IntPtr)args,
+                IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Whether this image runs a QSA region's kernels (<see cref="LaunchQsaScores"/>, <see cref="LaunchQsaSelect"/>

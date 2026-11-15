@@ -285,12 +285,13 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     /// <summary>
     /// A selecting step's selection and attention on direct CUDA as one region (GraphFusion.QsaAttention: the indexer's
     /// scores against the pooled keys where the cache holds them, each row's cells listed on the device, the attention over
-    /// them) against the region's ops on the same executor (a top-k of 8: dense up to 11 cells, two blocks and the tail past
-    /// them). Rows that run the flash kernel over the listed cells - decode steps (recorded and replayed) and chunks of up to
-    /// 8 rows crossing the budget - answer bit for bit. A 40-row prompt past the budget in one step runs the tensor-core
-    /// attention over its cells (F16 products, where the ops widened the window to F32 under the mask), so its rows and the
-    /// decode rows over its cache stay within the sparse runs' 1.5e-2, with SparseQsaMatches' allowance for a near-tied block
-    /// that flips at the second QSA layer (its input moved by the first one's rounding).
+    /// them) and every step's indexer keys as another (GraphFusion.QsaKeys) against the regions' ops on the same executor (a
+    /// top-k of 8: dense up to 11 cells, two blocks and the tail past them). Rows that run the flash kernel over the listed
+    /// cells - decode steps (recorded and replayed) and chunks of up to 8 rows crossing the budget - answer bit for bit. A
+    /// 40-row prompt past the budget in one step runs the tensor-core attention over its cells (F16 products, where the ops
+    /// widened the window to F32 under the mask), so its rows and the decode rows over its cache stay within the sparse runs'
+    /// 1.5e-2, with SparseQsaMatches' allowance for a near-tied block that flips at the second QSA layer (its input moved by
+    /// the first one's rounding).
     /// </summary>
     [CudaTheory]
     [InlineData(false)]
@@ -299,45 +300,78 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     {
         using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
         string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-region.gguf"), indexerTopK: 8, qsa: true);
-        int[] tokens = Enumerable.Range(0, 64).Select(i => 3 + (i * 37) % 240).ToArray();
-        (float[][] Rows, long Regions, int Replays) Run(bool ops)
-        {
-            using var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda);
-            model.QsaRegionDisabledForTests = ops;
-            model.ResetKVCache();
-            var rows = new List<float[]>();
-            int at = widePrompt ? 40 : 6;
-            rows.Add((float[])model.ForwardRefill(tokens[..at]).Clone());
-            if (!widePrompt)
-            {
-                // 6 + 3 cells stay dense; the next chunks select (their first rows dense, the rest sparse).
-                foreach (int n in new[] { 3, 3, 5, 8 })
-                {
-                    rows.Add((float[])model.Forward(tokens[at..(at + n)]).Clone());
-                    at += n;
-                }
-            }
-            for (int i = 0; i < 12; i++)
-                rows.Add((float[])model.Forward(new[] { tokens[at + i] }).Clone());
-            var executor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(model.GraphExecutorForTests);
-            return (rows.ToArray(), executor.QsaAttentionRegions, model.GraphReplays);
-        }
-        var region = Run(ops: false);
-        var ops = Run(ops: true);
-        Assert.True(region.Regions > 0, "no selecting step ran as the region");
-        Assert.Equal(0, ops.Regions);
+        var region = QsaRegionRun(path, widePrompt, attentionOps: false, keysOps: false);
+        var ops = QsaRegionRun(path, widePrompt, attentionOps: true, keysOps: true);
+        Assert.True(region.Attention > 0, "no selecting step ran as the region");
+        Assert.True(region.Keys > 0, "no step wrote its keys as the region");
+        Assert.Equal(0, ops.Attention);
+        Assert.Equal(0, ops.Keys);
         Assert.True(region.Replays > 0, "the decode steps did not replay");
         if (!widePrompt)
         {
-            for (int i = 0; i < ops.Rows.Length; i++)
-                Assert.True(ops.Rows[i].Select(BitConverter.SingleToInt32Bits).SequenceEqual(region.Rows[i].Select(BitConverter.SingleToInt32Bits)),
-                    $"row {i}: {RowErrors(new[] { ops.Rows[i] }, new[] { region.Rows[i] })[0]:E2} from the ops");
+            AssertSameBits(ops.Rows, region.Rows, "the ops");
             return;
         }
         const double tolerance = 1.5e-2;
         double[] errors = RowErrors(ops.Rows, region.Rows);
         Assert.True(errors.Count(e => e >= tolerance) <= (errors.Length + 9) / 10 && errors.All(e => e < 5e-2),
             $"qsa region vs ops relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
+    }
+
+    /// <summary>
+    /// Every step's indexer keys on direct CUDA as one kernel (GraphFusion.QsaKeys: each row's raw key written, a block its
+    /// rows complete pooled with the ops' sum, norm and rotary) against their ops, the attention region on in both runs: the
+    /// kernel leaves the cache the ops' bytes, so every row - the 40-row prompt's included, and the decode steps after it
+    /// (recorded and replayed: rows that complete a block and rows whose ops pool the last one again) - answers bit for bit.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QsaKeysRegionOnDirectCudaAnswersAsItsOps(bool widePrompt)
+    {
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-keys.gguf"), indexerTopK: 8, qsa: true);
+        var region = QsaRegionRun(path, widePrompt, attentionOps: false, keysOps: false);
+        var ops = QsaRegionRun(path, widePrompt, attentionOps: false, keysOps: true);
+        Assert.True(region.Keys > 0, "no step wrote its keys as the region");
+        Assert.Equal(0, ops.Keys);
+        Assert.True(region.Replays > 0 && ops.Replays > 0, "the decode steps did not replay");
+        AssertSameBits(ops.Rows, region.Rows, "the keys' ops");
+    }
+
+    /// <summary>A QSA run on direct CUDA (a prompt, then chunks of up to 8 rows or a 40-row prompt, then 12 decode steps)
+    /// with either region's ops: its rows, the regions run and the decode steps replayed.</summary>
+    private static (float[][] Rows, long Attention, long Keys, int Replays) QsaRegionRun(string path, bool widePrompt, bool attentionOps, bool keysOps)
+    {
+        int[] tokens = Enumerable.Range(0, 64).Select(i => 3 + (i * 37) % 240).ToArray();
+        using var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda);
+        model.QsaRegionDisabledForTests = attentionOps;
+        model.QsaKeysRegionDisabledForTests = keysOps;
+        model.ResetKVCache();
+        var rows = new List<float[]>();
+        int at = widePrompt ? 40 : 6;
+        rows.Add((float[])model.ForwardRefill(tokens[..at]).Clone());
+        if (!widePrompt)
+        {
+            // 6 + 3 cells stay dense; the next chunks select (their first rows dense, the rest sparse).
+            foreach (int n in new[] { 3, 3, 5, 8 })
+            {
+                rows.Add((float[])model.Forward(tokens[at..(at + n)]).Clone());
+                at += n;
+            }
+        }
+        for (int i = 0; i < 12; i++)
+            rows.Add((float[])model.Forward(new[] { tokens[at + i] }).Clone());
+        var executor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(model.GraphExecutorForTests);
+        return (rows.ToArray(), executor.QsaAttentionRegions, executor.QsaKeysRegions, model.GraphReplays);
+    }
+
+    private static void AssertSameBits(float[][] expected, float[][] actual, string label)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(expected[i].Select(BitConverter.SingleToInt32Bits).SequenceEqual(actual[i].Select(BitConverter.SingleToInt32Bits)),
+                $"row {i}: {RowErrors(new[] { expected[i] }, new[] { actual[i] })[0]:E2} from {label}");
     }
 
     // ---- QSA past its budget over media positions

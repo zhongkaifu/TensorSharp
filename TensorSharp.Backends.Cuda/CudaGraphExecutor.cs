@@ -940,6 +940,40 @@ namespace TensorSharp.Cuda
         /// <summary>QSA selections and attentions run as <see cref="TryQsaAttention"/> (tests check the region engaged).</summary>
         internal long QsaAttentionRegions { get; private set; }
 
+        /// <summary>
+        /// A QSA layer's indexer keys (<see cref="GraphFusion.QsaKeys"/>) in one launch (ts_graph_qsa_store_pool_f32): each row's
+        /// raw key into its cache row, and each block a row completes pooled into the block's last row with the ops' own
+        /// arithmetic (the sum, the scale, ts_rmsnorm_f32's weighted norm, the strided rotary, the same F16 roundings), so the
+        /// cache holds the ops' bytes. The ops took about a dozen launches a layer and step and pooled a decode step's last
+        /// complete block again whether or not the row completed one. Positions are read on the device, so a recorded step
+        /// replays. Declined (the ops run) unless the cache is F16 and the norm weight a plain F32 vector.
+        /// </summary>
+        private bool TryQsaKeys(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || inputs.Length < 5 || ip == null || ip.Length < 6 || fp == null || fp.Length < 8 || results.Length < 1)
+                return false;
+            Tensor raw = inputs[0], cache = inputs[1], rows = inputs[2], norm = inputs[3], table = inputs[4];
+            if (!DeviceInts(rows) || !DeviceInts(table) || !AllF32OnDevice(raw, norm) || !raw.IsContiguous() || !norm.IsContiguous()
+                || cache.Storage is not CudaStorage || cache.ElementType != DType.Float16 || !cache.IsContiguous())
+                return false;
+            int d = (int)ip[0], ratio = (int)ip[1];
+            long count = rows.ElementCount(), n = table.ElementCount();
+            if (d < 1 || ratio < 1 || count < 1 || count > int.MaxValue || n < 1 || n > int.MaxValue || raw.ElementCount() != count * d
+                || norm.ElementCount() != d || (long)d * sizeof(float) > 48 * 1024 || cache.ElementCount() % (2L * d) != 0)
+                return false;
+            Launch(new[] { raw, rows, norm, table }, cache, (k, stream) => k.LaunchQsaStorePool(Ptr(raw), Ptr(cache), Ptr(rows), Ptr(norm), Ptr(table),
+                d, ratio, (int)count, ip[2] != 0, (int)n, fp[0], fp[1], (int)ip[3], (int)ip[4], (int)ip[5], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7],
+                stream));
+            // The pooled write's value: the cache (a reference of its own, released with the step).
+            results[0] = cache.CopyRef();
+            QsaKeysRegions++;
+            return true;
+        }
+
+        /// <summary>QSA keys written and pooled as <see cref="TryQsaKeys"/> (tests check the region engaged).</summary>
+        internal long QsaKeysRegions { get; private set; }
+
         /// <summary>A hyper-connection scatter (<see cref="GraphFusion.HcScatter"/>) as one pass over the streams.</summary>
         private bool TryHcScatter(Tensor[] inputs, long[] ip, Tensor[] results)
         {
@@ -1094,6 +1128,7 @@ namespace TensorSharp.Cuda
                 or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
+            GraphFusion.QsaKeys => Kernels != null,
             _ => false,
         };
 
@@ -1109,6 +1144,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.HcScatter) return TryHcScatter(inputs, ip, results);
             if (kind == GraphFusion.MoeSelect) return TryMoeSelect(inputs, ip, results);
             if (kind == GraphFusion.QsaAttention) return TryQsaAttention(inputs, ip, fp, results);
+            if (kind == GraphFusion.QsaKeys) return TryQsaKeys(inputs, ip, fp, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;

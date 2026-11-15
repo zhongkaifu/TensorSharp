@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 26
+#define TS_GRAPH_KERNELS_VERSION 27
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -2580,4 +2580,137 @@ extern "C" __global__ void __launch_bounds__(TS_QSA_WARPS * 32) ts_graph_qsa_att
     (void)q; (void)kc; (void)vc; (void)cells; (void)count; (void)out; (void)cap; (void)heads; (void)kvHeads; (void)scale;
     (void)cellStride;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// GraphFusion.QsaKeys: a QSA layer's indexer keys for one sequence's rows in one launch, where the region's ops are about a
+// dozen a layer and step (the packed [raw | 0] rows and their write; the members' gather, their sum, its scale, the
+// weighted norm, the rotary, the [last raw | pooled] row and its write). The ops also pool again, to the values it holds,
+// the last block complete before a short chunk; this kernel pools only the blocks its rows complete, so the cache's bytes
+// are the ops' once the step has run.
+// ---------------------------------------------------------------------------
+
+// block_reduce_sum of tensorsharp_kernels.cu (ts_rmsnorm_f32's reduction, copied): each warp's sum by shuffles down, then the
+// first warp's over the warps' sums; the block's total on thread 0.
+__device__ __forceinline__ float ts_graph_block_sum_down(float v)
+{
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xFFFFFFFF, v, offset);
+
+    __shared__ float warp_sums[32];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    if (lane == 0)
+        warp_sums[warp] = v;
+    __syncthreads();
+
+    if (warp == 0)
+    {
+        int num_warps = (blockDim.x + 31) >> 5;
+        v = lane < num_warps ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xFFFFFFFF, v, offset);
+    }
+
+    return v;
+}
+
+// Row r (KV index pos[r]; the rows consecutive, pos[0] the step's first) writes its raw key raw[r] into its [raw | pooled] F16
+// cache row, rounded as the ops' row write rounds it, the pooled half 0 times the raw key unless the row completes its block
+// ((p + 1) % ratio == 0). A completing row also pools the block into that half, in the ops' arithmetic and order: each
+// member's raw key as the cache holds it (rows before the step read there, the step's own rounded to F16 here, as the ops'
+// gather reads them back after the write), summed member by member, times 1 / ratio (the Scale); ts_rmsnorm_f32's weighted
+// norm (its thread-strided squares over a 256-thread block, its reduction, rsqrtf(sum / d + eps), x * inv then * w); and
+// ts_graph_rope_ex_strided_f32's rotation at the block's first cell's position - table[b - first], the ops' positions of the
+// blocks they pool from `first` (PoolSpan: a short chunk's last n complete blocks, else the first block its rows complete,
+// computed here from pos[0], so a recorded step replays). The rotated values rounded to F16 as the ops' pooled write rounds
+// them. Launch: grid count, block 256 (the norm's), d floats of dynamic shared memory.
+extern "C" __global__ void __launch_bounds__(256) ts_graph_qsa_store_pool_f32(
+    const float* __restrict__ raw, __half* __restrict__ cache, const int* __restrict__ pos, const float* __restrict__ w,
+    const int* __restrict__ table, int d, int ratio, int count, int shortChunk, int n, float eps, float inv_ratio,
+    int rope_dim, int mode, int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor,
+    float beta_fast, float beta_slow)
+{
+    extern __shared__ float pooled[];
+    __shared__ float inv_rms;
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const int start = pos[0], p = pos[r];
+    const float* key = raw + (size_t)r * d;
+    __half* row = cache + (size_t)p * 2 * d;
+    // The block the row completes, and its index among the blocks whose positions the table holds.
+    const int b = (p + 1) / ratio - 1, end = (start + count) / ratio;
+    const int first = max(shortChunk ? end - (count + ratio - 1) / ratio : (start + ratio) / ratio - 1, 0);
+    const bool completes = (p + 1) % ratio == 0 && b - first >= 0 && b - first < n;
+    for (int i = tid; i < d; i += blockDim.x)
+    {
+        const float v = key[i];
+        row[i] = __float2half_rn(v);
+        if (!completes)
+            row[d + i] = __float2half_rn(v * 0.0f);
+    }
+    if (!completes)
+        return;
+
+    const int base = b * ratio;
+    float sum_sq = 0.0f;
+    for (int i = tid; i < d; i += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int k = 0; k < ratio; ++k)
+        {
+            const int c = base + k;
+            const float m = c < start ? __half2float(cache[(size_t)c * 2 * d + i])
+                                      : __half2float(__float2half_rn(raw[(size_t)(c - start) * d + i]));
+            acc = k == 0 ? m : acc + m;
+        }
+        const float v = acc * inv_ratio;
+        pooled[i] = v;
+        sum_sq += v * v;
+    }
+    sum_sq = ts_graph_block_sum_down(sum_sq);
+    if (tid == 0)
+        inv_rms = rsqrtf(sum_sq / (float)d + eps);
+    __syncthreads();
+    for (int i = tid; i < d; i += blockDim.x)
+    {
+        float v = pooled[i] * inv_rms;
+        v *= w[i];
+        pooled[i] = v;
+    }
+    __syncthreads();
+
+    const int position = table[b - first];
+    const int active_dim = rope_dim < d ? rope_dim : d;
+    const int pair_count = active_dim / 2;
+    const bool neox = (mode & 2) != 0;   // GGML_ROPE_TYPE_NEOX
+    for (int i = tid; i < pair_count; i += blockDim.x)
+    {
+        float theta_extrap = (float)position * powf(freq_base, -2.0f * (float)i / (float)active_dim);
+        float c;
+        float s;
+        if (ext_factor != 0.0f)
+        {
+            float corr_low;
+            float corr_high;
+            ts_graph_yarn_corr_dims(active_dim, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr_low, &corr_high);
+            float mscale = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+            ts_graph_yarn_rope(theta_extrap, freq_scale, corr_low, corr_high, i, ext_factor, mscale, &c, &s);
+        }
+        else
+        {
+            float angle = theta_extrap * freq_scale;
+            c = cosf(angle);
+            s = sinf(angle);
+        }
+        const int left_index = neox ? i : i * 2;
+        const int right_index = neox ? i + pair_count : i * 2 + 1;
+        float left = pooled[left_index];
+        float right = pooled[right_index];
+        float out_left = left * c - right * s;
+        float out_right = right * c + left * s;
+        row[d + left_index] = __float2half_rn(out_left);
+        row[d + right_index] = __float2half_rn(out_right);
+    }
+    for (int col = pair_count * 2 + tid; col < d; col += blockDim.x)
+        row[d + col] = __float2half_rn(pooled[col]);
 }
