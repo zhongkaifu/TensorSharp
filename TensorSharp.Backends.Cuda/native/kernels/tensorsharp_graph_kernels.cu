@@ -12,7 +12,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#define TS_GRAPH_KERNELS_VERSION 19
+#define TS_GRAPH_KERNELS_VERSION 20
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -861,6 +861,80 @@ extern "C" __global__ void ts_graph_hc_norm_f32(const float* __restrict__ x, con
                 t += __shfl_xor_sync(0xffffffffu, t, off);
             if (threadIdx.x == 0) injPart[s * hc + o] = t;
         }
+}
+
+// The read's grouped norm at decode size in two passes over slices of 256 values (the Qwen3.8 engines' HcPartials and
+// HcApply): one block a row's stream (ts_graph_hc_norm_f32) leaves all but rows * hc SMs idle. n % 256 == 0, hc <= 8,
+// 256 threads, grid (hc * n / 256, rows); a row's sums run in one order whatever the row count.
+#define TS_GRAPH_HC_SLICE 256
+#define TS_GRAPH_HC_PARTIAL 9
+
+// Pass 1, per (row, slice): the slice's sum of squares and, with injW, sum_j x_j * gamma_j * injW[o][j] for each output o,
+// into partials [rows][slices][9].
+extern "C" __global__ void ts_graph_hc_partials_f32(const float* __restrict__ x, const float* __restrict__ gamma,
+    const float* __restrict__ injW, float* __restrict__ partials, int n, int hc)
+{
+    __shared__ float sh[TS_GRAPH_HC_PARTIAL][8];
+    const int slice = blockIdx.x, r = blockIdx.y, width = hc * n;
+    const int j = slice * TS_GRAPH_HC_SLICE + threadIdx.x;
+    const float v = x[(size_t)r * width + j];
+    float part[TS_GRAPH_HC_PARTIAL];
+    part[0] = v * v;
+    const float vg = injW != nullptr ? v * gamma[j] : 0.f;
+#pragma unroll
+    for (int o = 0; o < 8; o++)
+        part[1 + o] = injW != nullptr && o < hc ? vg * injW[(size_t)o * width + j] : 0.f;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+#pragma unroll
+    for (int p = 0; p < TS_GRAPH_HC_PARTIAL; p++)
+    {
+        const float t = ts_graph_warp_sum(part[p]);
+        if (lane == 0) sh[p][warp] = t;
+    }
+    __syncthreads();
+    if (threadIdx.x < TS_GRAPH_HC_PARTIAL)
+    {
+        float t = 0.f;
+        for (int w = 0; w < TS_GRAPH_HC_SLICE / 32; w++)
+            t += sh[threadIdx.x][w];
+        partials[((size_t)r * gridDim.x + slice) * TS_GRAPH_HC_PARTIAL + threadIdx.x] = t;
+    }
+}
+
+// Pass 2: y = x * rsqrt(mean of its stream's squares + eps) * gamma (and yq, its q8_1 copy, when not null); with inject (not
+// null) the slice-0 block also writes inject[r][o] = sum over streams c, in order, of inv_c * (stream c's partials of o).
+extern "C" __global__ void ts_graph_hc_apply_f32(const float* __restrict__ x, const float* __restrict__ gamma,
+    const float* __restrict__ partials, float* __restrict__ y, ts_graph_block_q8_1* __restrict__ yq, float* __restrict__ inject,
+    int n, int hc, float eps)
+{
+    __shared__ float inv[8];
+    const int slice = blockIdx.x, r = blockIdx.y, width = hc * n, per = n / TS_GRAPH_HC_SLICE;
+    const float* p = partials + (size_t)r * gridDim.x * TS_GRAPH_HC_PARTIAL;
+    if (threadIdx.x < hc)
+    {
+        float ss = 0.f;
+        for (int s = 0; s < per; s++)
+            ss += p[((size_t)threadIdx.x * per + s) * TS_GRAPH_HC_PARTIAL];
+        inv[threadIdx.x] = rsqrtf(ss / n + eps);
+    }
+    __syncthreads();
+    const int j = slice * TS_GRAPH_HC_SLICE + threadIdx.x;
+    const float v = x[(size_t)r * width + j] * inv[j / n] * gamma[j];
+    y[(size_t)r * width + j] = v;
+    if (yq != nullptr)
+        ts_graph_quantize_q8_1(v, yq + ((size_t)r * width + j) / 32, threadIdx.x & 31);
+    if (inject != nullptr && slice == 0 && threadIdx.x < hc)
+    {
+        float acc = 0.f;
+        for (int c = 0; c < hc; c++)
+        {
+            float pc = 0.f;
+            for (int s = 0; s < per; s++)
+                pc += p[((size_t)c * per + s) * TS_GRAPH_HC_PARTIAL + 1 + threadIdx.x];
+            acc += inv[c] * pc;
+        }
+        inject[(size_t)r * hc + threadIdx.x] = acc;
+    }
 }
 
 

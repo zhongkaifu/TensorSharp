@@ -160,6 +160,90 @@ public sealed class CudaHyperConnectionKernelTests
             }
         }
     }
+    /// <summary>The decode-size norm in two passes over slices of 256 values (LaunchHcPartials, LaunchHcApply): the normed
+    /// streams and the injection logits against a double reference, the q8_1 copy byte for byte the row quantizer's, and each
+    /// row of a window the same bits as that row alone.</summary>
+    [CudaTheory]
+    [InlineData(4, 4, 2560, true)]
+    [InlineData(1, 4, 256, true)]
+    [InlineData(32, 8, 512, true)]
+    [InlineData(7, 2, 1024, false)]
+    public void SplitNormMatchesTheReferenceAndEachRowAlone(int rows, int hc, int n, bool withInjection)
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels kernels, out string reason), reason);
+        using (kernels)
+        {
+            var rng = new Random(37 + rows);
+            float[] R(int count, double scale) => Enumerable.Range(0, count).Select(_ => (float)((rng.NextDouble() * 2 - 1) * scale)).ToArray();
+            int width = hc * n, slices = width / CudaGraphKernels.HcSlice;
+            float[] xs = R(rows * width, 3), gs = R(width, 1.5), ws = R(hc * width, 0.05);
+            using var gamma = Tensor.FromArray(allocator, gs);
+            using var injW = Tensor.FromArray(allocator, ws);
+            IntPtr stream = allocator.Stream.Handle;
+            (float[] Xn, byte[] Xnq, float[] Inject, byte[] Reference) Run(float[] input, int count)
+            {
+                using var x = Tensor.FromArray(allocator, input);
+                using var partials = new Tensor(allocator, DType.Float32, count * slices * CudaGraphKernels.HcPartialFloats);
+                using var xn = new Tensor(allocator, DType.Float32, count * width);
+                using var xnq = new Tensor(allocator, DType.UInt8, count * width / 32 * CudaKernels.Q81BlockBytes);
+                using var xnRef = new Tensor(allocator, DType.UInt8, count * width / 32 * CudaKernels.Q81BlockBytes);
+                using var inject = new Tensor(allocator, DType.Float32, count * hc);
+                Upload(x, gamma, injW, partials, xn, xnq, xnRef, inject);
+                IntPtr w = withInjection ? P(injW) : IntPtr.Zero;
+                kernels.LaunchHcPartials(P(x), P(gamma), w, P(partials), count, n, hc, stream);
+                kernels.LaunchHcApply(P(x), P(gamma), P(partials), P(xn), P(xnq), withInjection ? P(inject) : IntPtr.Zero, count, n, hc, 1e-6f, stream);
+                CudaQuantizedOps.QuantizeRowsQ81(allocator, P(xn), P(xnRef), width, count);
+                allocator.Stream.Synchronize();
+                Written(partials, xn, xnq, xnRef, inject);
+                byte[] q = new byte[xnq.ElementCount()], qr = new byte[xnRef.ElementCount()];
+                xnq.CopyToArray(q);
+                xnRef.CopyToArray(qr);
+                return (xn.GetElementsAsFloat(count * width), q, withInjection ? inject.GetElementsAsFloat(count * hc) : null, qr);
+            }
+            var all = Run(xs, rows);
+            Assert.True(all.Xnq.AsSpan().SequenceEqual(all.Reference), $"the q8_1 copy differs from the row quantizer's ({rows} rows, {hc}x{n})");
+            for (int r = 0; r < rows; r++)
+            {
+                for (int c = 0; c < hc; c++)
+                {
+                    double ss = 0;
+                    for (int i = 0; i < n; i++) ss += (double)xs[(r * hc + c) * n + i] * xs[(r * hc + c) * n + i];
+                    double scale = 1 / Math.Sqrt(ss / n + 1e-6);
+                    for (int i = 0; i < n; i++)
+                    {
+                        double want = xs[(r * hc + c) * n + i] * scale * gs[c * n + i];
+                        float got = all.Xn[(r * hc + c) * n + i];
+                        Assert.True(Math.Abs(got - want) <= 1e-5 * Math.Abs(want) + 1e-6, $"row {r} stream {c} value {i}: {got} against {want}");
+                    }
+                }
+                if (withInjection)
+                    for (int o = 0; o < hc; o++)
+                    {
+                        double want = 0, mag = 0;
+                        for (int c = 0; c < hc; c++)
+                        {
+                            double ss = 0;
+                            for (int i = 0; i < n; i++) ss += (double)xs[(r * hc + c) * n + i] * xs[(r * hc + c) * n + i];
+                            double scale = 1 / Math.Sqrt(ss / n + 1e-6);
+                            for (int i = 0; i < n; i++)
+                            {
+                                double v = xs[(r * hc + c) * n + i] * scale * gs[c * n + i] * ws[(long)o * width + c * n + i];
+                                want += v;
+                                mag += Math.Abs(v);
+                            }
+                        }
+                        Assert.True(Math.Abs(all.Inject[r * hc + o] - want) <= 1e-5 * mag + 1e-6, $"row {r} output {o}: {all.Inject[r * hc + o]} against {want}");
+                    }
+                var alone = Run(xs.Skip(r * width).Take(width).ToArray(), 1);
+                Assert.Equal(alone.Xn.Select(BitConverter.SingleToInt32Bits), all.Xn.Skip(r * width).Take(width).Select(BitConverter.SingleToInt32Bits));
+                if (withInjection)
+                    Assert.Equal(alone.Inject.Select(BitConverter.SingleToInt32Bits), all.Inject.Skip(r * hc).Take(hc).Select(BitConverter.SingleToInt32Bits));
+            }
+        }
+    }
+
     /// <summary>The gated norm with a sigmoid gate (Qwen3.8's delta-net output) against a double reference.</summary>
     [CudaFact]
     public void SigmoidGatedNormMatchesTheReference()

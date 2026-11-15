@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 19;
+        public const int CurrentVersion = 20;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm, _repackQ6kTiled;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _ssmConv, _deltaNetPrep, _gatedRmsNorm, _addRmsNorm, _repackQ6kTiled;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
 
@@ -50,6 +50,8 @@ namespace TensorSharp.Cuda
             _countRoutes = module.GetFunction("ts_graph_count_routes");
             _binaryBcast = module.GetFunction("ts_graph_binary_bcast_f32");
             _hcNorm = module.GetFunction("ts_graph_hc_norm_f32");
+            _hcPartials = module.GetFunction("ts_graph_hc_partials_f32");
+            _hcApply = module.GetFunction("ts_graph_hc_apply_f32");
             _scaleSilu = module.GetFunction("ts_graph_scale_silu_f32");
             _hcGateMix = module.GetFunction("ts_graph_hc_gate_mix_f32");
             _hcScatter = module.GetFunction("ts_graph_hc_scatter_f32");
@@ -321,6 +323,30 @@ namespace TensorSharp.Cuda
             // Few streams (a decode or verify step): wide blocks; a prompt chunk's many streams fill the device at 256.
             uint threads = rows * hc < 64 ? 1024u : 256u;
             CudaDriverApi.cuLaunchKernel(_hcNorm, (uint)(rows * hc), 1, 1, threads, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Slices of 256 values <see cref="LaunchHcPartials"/> and <see cref="LaunchHcApply"/> split a stream into, and the
+        /// floats each slice's partials take.</summary>
+        public const int HcSlice = 256, HcPartialFloats = 9;
+
+        /// <summary>The decode-size grouped norm's first pass (<paramref name="n"/> % <see cref="HcSlice"/> == 0, hc at most 8):
+        /// per row and slice of 256 values, the sum of squares and, with <paramref name="injW"/>, the injection weights' partial
+        /// dots of x * gamma, into <paramref name="partials"/> [rows, hc * n / 256, <see cref="HcPartialFloats"/>].</summary>
+        public void LaunchHcPartials(IntPtr x, IntPtr gamma, IntPtr injW, IntPtr partials, int rows, int n, int hc, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &gamma, &injW, &partials, &n, &hc };
+            CudaDriverApi.cuLaunchKernel(_hcPartials, (uint)(hc * n / HcSlice), (uint)rows, 1, HcSlice, 1, 1, 0, stream, (IntPtr)args,
+                IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The second pass: <paramref name="y"/> the normed streams (and <paramref name="yq"/> their q8_1 copy unless
+        /// zero) from <see cref="LaunchHcPartials"/>' partials; with <paramref name="inject"/> also the injection logits [rows, hc].</summary>
+        public void LaunchHcApply(IntPtr x, IntPtr gamma, IntPtr partials, IntPtr y, IntPtr yq, IntPtr inject, int rows, int n, int hc,
+            float eps, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &gamma, &partials, &y, &yq, &inject, &n, &hc, &eps };
+            CudaDriverApi.cuLaunchKernel(_hcApply, (uint)(hc * n / HcSlice), (uint)rows, 1, HcSlice, 1, 1, 0, stream, (IntPtr)args,
+                IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>y = silu(x * scale) over <paramref name="n"/> contiguous floats; with <paramref name="yq"/> (n a multiple of

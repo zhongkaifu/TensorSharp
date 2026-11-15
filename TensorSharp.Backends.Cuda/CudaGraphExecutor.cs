@@ -716,13 +716,30 @@ namespace TensorSharp.Cuda
             // Qwen3.8 engines' HcPartials fold them: their own product was a split-K GEMV and its combine, 192 launches of a
             // 4-row window of Qwen3.8 Flash Next. Each row's sums run in one order whatever the row count.
             Tensor injW = hc <= 8 ? InjectionRowsF32(weights[3], inputs[3], width, hc) : null;
-            using Tensor injPart = injW != null ? new Tensor(Allocator, DType.Float32, (long)rows * hc * hc) : null;
-            var normOut = new List<Tensor> { xn };
-            if (xnq != null) normOut.Add(xnq);
-            if (injPart != null) normOut.Add(injPart);
-            Launch(injW == null ? new[] { x, gamma } : new[] { x, gamma, injW }, normOut.ToArray(),
-                (k, stream) => k.LaunchHcNorm(Ptr(x), Ptr(gamma), Ptr(xn), rows, n, hc, eps, stream, xnq == null ? IntPtr.Zero : Ptr(xnq),
-                    injW == null ? IntPtr.Zero : Ptr(injW), injPart == null ? IntPtr.Zero : Ptr(injPart)));
+            // A decode-size read's norm runs in two passes over slices of 256 values (the Qwen3.8 engines' HcPartials and HcApply),
+            // which also write the injection logits: one block a stream left all but rows * hc SMs idle.
+            bool split = xnq != null && n % CudaGraphKernels.HcSlice == 0 && hc <= 8;
+            Tensor inject = null;
+            using Tensor injPart = !split && injW != null ? new Tensor(Allocator, DType.Float32, (long)rows * hc * hc) : null;
+            if (split)
+            {
+                using var partials = new Tensor(Allocator, DType.Float32, (long)rows * (width / CudaGraphKernels.HcSlice) * CudaGraphKernels.HcPartialFloats);
+                Launch(injW == null ? new[] { x, gamma } : new[] { x, gamma, injW }, new[] { partials },
+                    (k, stream) => k.LaunchHcPartials(Ptr(x), Ptr(gamma), injW == null ? IntPtr.Zero : Ptr(injW), Ptr(partials), rows, n, hc, stream));
+                inject = injW != null ? new Tensor(Allocator, DType.Float32, rows, hc) : null;
+                Launch(new[] { x, gamma, partials }, inject == null ? new[] { xn, xnq } : new[] { xn, xnq, inject },
+                    (k, stream) => k.LaunchHcApply(Ptr(x), Ptr(gamma), Ptr(partials), Ptr(xn), Ptr(xnq), inject == null ? IntPtr.Zero : Ptr(inject),
+                        rows, n, hc, eps, stream));
+            }
+            else
+            {
+                var normOut = new List<Tensor> { xn };
+                if (xnq != null) normOut.Add(xnq);
+                if (injPart != null) normOut.Add(injPart);
+                Launch(injW == null ? new[] { x, gamma } : new[] { x, gamma, injW }, normOut.ToArray(),
+                    (k, stream) => k.LaunchHcNorm(Ptr(x), Ptr(gamma), Ptr(xn), rows, n, hc, eps, stream, xnq == null ? IntPtr.Zero : Ptr(xnq),
+                        injW == null ? IntPtr.Zero : Ptr(injW), injPart == null ? IntPtr.Zero : Ptr(injPart)));
+            }
             if (xnq != null) KeepQuantized(xn, width, rows, xnq);
             using Tensor lo = Product(2, xn);
             Tensor loq = quantize ? Q81Rows(rows, lr) : null;
@@ -732,13 +749,13 @@ namespace TensorSharp.Cuda
             using Tensor gates = Product(4, lo);
             var mix = new Tensor(Allocator, DType.Float32, rows, n);
             Tensor mixq = quantize ? Q81Rows(rows, n) : null;
-            Tensor inject = injPart != null ? new Tensor(Allocator, DType.Float32, rows, hc) : null;
+            if (injPart != null) inject = new Tensor(Allocator, DType.Float32, rows, hc);
             var mixOut = new List<Tensor> { mix };
             if (mixq != null) mixOut.Add(mixq);
-            if (inject != null) mixOut.Add(inject);
+            if (injPart != null) mixOut.Add(inject);
             Launch(injPart == null ? new[] { xn, gates } : new[] { xn, gates, injPart }, mixOut.ToArray(),
                 (k, stream) => k.LaunchHcGateMix(Ptr(xn), Ptr(gates), Ptr(mix), rows, n, hc, stream, mixq == null ? IntPtr.Zero : Ptr(mixq),
-                    injPart == null ? IntPtr.Zero : Ptr(injPart), inject == null ? IntPtr.Zero : Ptr(inject)));
+                    injPart == null ? IntPtr.Zero : Ptr(injPart), injPart == null ? IntPtr.Zero : Ptr(inject)));
             if (mixq != null) KeepQuantized(mix, n, rows, mixq);
             results[0] = mix;
             results[1] = inject ?? Product(3, xn);
