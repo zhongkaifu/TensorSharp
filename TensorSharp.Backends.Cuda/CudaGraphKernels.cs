@@ -323,6 +323,11 @@ namespace TensorSharp.Cuda
             public IntPtr SrcGate { get; init; }
             public IntPtr SrcUp { get; init; }
             public IntPtr SrcDown { get; init; }
+            /// <summary>The tables' resting entries the wait restores (where they differ from the copy's sources: the host
+            /// experts rest at a zeroed expert while their bytes stay mapped), else zero (the sources).</summary>
+            public IntPtr HomeGate { get; init; }
+            public IntPtr HomeUp { get; init; }
+            public IntPtr HomeDown { get; init; }
             public IntPtr Slots { get; init; }
             public long Stride { get; init; }
             public long OffUp { get; init; }
@@ -351,7 +356,10 @@ namespace TensorSharp.Cuda
         {
             IntPtr flag = box.FlagDev, seq = box.SeqDev, count = box.CountDev, outDev = box.OutDev;
             IntPtr list = staging.Capacity > 0 ? staging.List : IntPtr.Zero, staged = staging.Count;
-            IntPtr tg = staging.Gate, tu = staging.Up, td = staging.Down, sg = staging.SrcGate, su = staging.SrcUp, sd = staging.SrcDown;
+            IntPtr tg = staging.Gate, tu = staging.Up, td = staging.Down;
+            IntPtr sg = staging.HomeGate != IntPtr.Zero ? staging.HomeGate : staging.SrcGate;
+            IntPtr su = staging.HomeUp != IntPtr.Zero ? staging.HomeUp : staging.SrcUp;
+            IntPtr sd = staging.HomeDown != IntPtr.Zero ? staging.HomeDown : staging.SrcDown;
             void** args = stackalloc void*[] { &flag, &seq, &count, &outDev, &dst, &n, &missDev, &list, &staged, &tg, &tu, &td, &sg, &su, &sd };
             CudaDriverApi.cuLaunchKernel(_waitAdd, (uint)Math.Min(16, Math.Max(1, (n + 255) / 256)), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();

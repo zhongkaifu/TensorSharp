@@ -1442,9 +1442,16 @@ namespace TensorSharp.Cuda
         private sealed class HostedTables
         {
             public Tensor Gate, Up, Down, OnDevice;
-            /// <summary>The tables' resting entries (the same words): a call's staged host experts point at staging slots in
-            /// Gate/Up/Down until the layer's wait restores them from here (<see cref="CudaGraphKernels.MoeStaging"/>).</summary>
+            /// <summary>The experts' own entries (device copies, mapped host bytes, or null): what a staging copy reads.</summary>
             public Tensor RestGate, RestUp, RestDown;
+            /// <summary>
+            /// The resting entries of Gate/Up/Down: a device expert's own, every other one a zeroed expert (the direct engines'
+            /// rule), so the decode kernels take the router's ids as they are and a host route adds nothing on the device. A
+            /// call's staged host experts point at staging slots until the layer's wait restores them from here.
+            /// </summary>
+            public Tensor HomeGate, HomeUp, HomeDown;
+            /// <summary>The zeroed expert's device address (0: none; the host experts rest at their own entries).</summary>
+            public long Zero;
             /// <summary>An expert's bytes per matrix, or null where they differ between experts.</summary>
             public long[] ExpertBytes;
             /// <summary>The layer's routes counted on the device since the last harvest ([experts] uint).</summary>
@@ -1537,11 +1544,12 @@ namespace TensorSharp.Cuda
         {
             var cuda = (CudaAllocator)Allocator;
             cuda.Context.MakeCurrent();
-            Tensor[] tables = { t.Gate, t.Up, t.Down, t.RestGate, t.RestUp, t.RestDown };
-            for (int m = 0; m < 6; m++)
+            int[][] home = HomeWords(t.Words, t.Mask, t.Zero);
+            Tensor[] tables = { t.Gate, t.Up, t.Down, t.RestGate, t.RestUp, t.RestDown, t.HomeGate, t.HomeUp, t.HomeDown };
+            for (int m = 0; m < tables.Length; m++)
             {
                 if (tables[m] == null) continue;
-                tables[m].SetElementsAsInt(t.Words[m % 3]);
+                tables[m].SetElementsAsInt(m is >= 3 and < 6 ? t.Words[m % 3] : home[m % 3]);
                 ((CudaStorage)tables[m].Storage).EnsureDeviceCurrent();
             }
             unsafe
@@ -2055,9 +2063,12 @@ namespace TensorSharp.Cuda
             lock (_hostedTables)
             {
                 foreach (HostedTables t in _hostedTables.Values)
-                    foreach (Tensor tensor in new[] { t.Gate, t.Up, t.Down, t.OnDevice, t.Counts, t.RestGate, t.RestUp, t.RestDown }) tensor?.Dispose();
+                    foreach (Tensor tensor in new[] { t.Gate, t.Up, t.Down, t.OnDevice, t.Counts, t.RestGate, t.RestUp, t.RestDown, t.HomeGate, t.HomeUp, t.HomeDown })
+                        tensor?.Dispose();
                 _hostedTables.Clear();
             }
+            foreach (Tensor z in _zeroExperts) z.Dispose();
+            _zeroExperts.Clear();
         }
 
         private bool TryDoorbellExperts(Tensor x, Value selected, Value weightValue, IGraphHostedExperts gate, IGraphExpertWeights up,
@@ -2112,8 +2123,12 @@ namespace TensorSharp.Cuda
                     Ptr(devSel), Ptr(tables.Counts), bell.Box, bell.MissDev, stream, staging));
             if (staging.Capacity > 0)
                 Launch(new[] { tables.RestGate, tables.RestUp, tables.RestDown }, Array.Empty<Tensor>(), (kn, stream) => kn.LaunchMoeStageCopy(staging, stream));
-            // The device's routes (the host's read -1), the router's weights: a decode row, or a verify window's rows.
-            bool ran = rows == 1
+            // The device's routes: on the decode kernels the router's ids as they are (the host's rest at the zeroed expert, so
+            // they add nothing), as the direct engines run them (UD-Q2_K_XL on an A40: 3.16 -> 2.77 ms a step's experts);
+            // else on the fused kernels, the host's ids read -1. The router's weights; a decode row, or a verify window's rows.
+            bool grouped = tables.Zero != 0 && GroupedTakes(tables.Sets, rows, hidden, ff);
+            bool ran = grouped ? TryGroupedMoe(x2, output, sel, w, tables.Sets, new[] { tables.Gate, tables.Up, tables.Down }, rows, k, hidden, ff, experts)
+                : rows == 1
                 ? CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(null, x2, output, devSel, w1, gateOut, upOut, IntPtr.Zero, Ptr(tables.Gate),
                     Ptr(tables.Up), Ptr(tables.Down), gate.Format, down.Format, experts, k, hidden, ff, null, IntPtr.Zero, inputQ8, gateQ8,
                     gateUpDp4a, downDp4a)
@@ -2241,10 +2256,13 @@ namespace TensorSharp.Cuda
                     try { expertBytes[m] = sets[m].Expert(0).Bytes; }
                     catch (NotSupportedException) { expertBytes = null; }
                 }
+                long zero = expertBytes == null ? 0 : ZeroExpert(Math.Max(expertBytes[0], Math.Max(expertBytes[1], expertBytes[2])));
+                int[][] home = HomeWords(words, onDevice, zero);
                 t = new HostedTables
                 {
-                    Gate = Upload(words[0]), Up = Upload(words[1]), Down = Upload(words[2]), OnDevice = mask, Counts = Upload(new int[experts]),
+                    Gate = Upload(home[0]), Up = Upload(home[1]), Down = Upload(home[2]), OnDevice = mask, Counts = Upload(new int[experts]),
                     RestGate = Upload(words[0]), RestUp = Upload(words[1]), RestDown = Upload(words[2]), ExpertBytes = expertBytes,
+                    HomeGate = Upload(home[0]), HomeUp = Upload(home[1]), HomeDown = Upload(home[2]), Zero = zero,
                     Host = gate.Host, Layer = layer, Experts = experts, Sets = sets, Words = words, Mask = onDevice,
                 };
                 using (Tensor bytes = Upload(maskInts))
@@ -2257,6 +2275,43 @@ namespace TensorSharp.Cuda
                 return _hostedTables[gate] = t;
             }
         }
+
+        /// <summary>The resting words of the main tables: <paramref name="words"/> with every expert the device does not hold
+        /// (<paramref name="mask"/> not 1) at the zeroed expert <paramref name="zero"/> (none when zero).</summary>
+        private static int[][] HomeWords(int[][] words, byte[] mask, long zero)
+        {
+            if (zero == 0) return words;
+            var home = new int[3][];
+            for (int m = 0; m < 3; m++)
+            {
+                home[m] = (int[])words[m].Clone();
+                for (int e = 0; e < mask.Length; e++)
+                    if (mask[e] != 1)
+                    {
+                        home[m][2 * e] = unchecked((int)zero);
+                        home[m][2 * e + 1] = unchecked((int)(zero >> 32));
+                    }
+            }
+            return home;
+        }
+
+        /// <summary>Zeroed device bytes, at least <paramref name="bytes"/>, that a host expert's entries rest at: any block
+        /// layout of zero bytes decodes to zeros (every scale zero). One buffer serves every table it is large enough for.</summary>
+        private long ZeroExpert(long bytes)
+        {
+            foreach (Tensor z in _zeroExperts)
+                if (z.Storage.ByteLength >= bytes) return Ptr(z).ToInt64();
+            var cuda = (CudaAllocator)Allocator;
+            if (CudaGraphCapture.IsCapturing(cuda)) return 0;
+            var zero = new Tensor(Allocator, DType.UInt8, (bytes + 255) / 256 * 256);
+            ((CudaStorage)zero.Storage).EnsureDeviceCurrent();
+            cuda.Context.MakeCurrent();
+            CudaDriverApi.cuMemsetD8(Ptr(zero), 0, new UIntPtr((ulong)zero.Storage.ByteLength)).ThrowOnError();
+            _zeroExperts.Add(zero);
+            return Ptr(zero).ToInt64();
+        }
+
+        private readonly List<Tensor> _zeroExperts = new();
 
         /// <summary>
         /// A host expert's table entries at its bytes in the stack's mapping, where every byte of its three matrices is
@@ -2317,6 +2372,8 @@ namespace TensorSharp.Cuda
             }
             return new CudaGraphKernels.MoeStaging
             {
+                HomeGate = t.Zero != 0 ? Ptr(t.HomeGate) : IntPtr.Zero, HomeUp = t.Zero != 0 ? Ptr(t.HomeUp) : IntPtr.Zero,
+                HomeDown = t.Zero != 0 ? Ptr(t.HomeDown) : IntPtr.Zero,
                 Capacity = capacity, Gate = Ptr(t.Gate), Up = Ptr(t.Up), Down = Ptr(t.Down), SrcGate = Ptr(t.RestGate), SrcUp = Ptr(t.RestUp),
                 SrcDown = Ptr(t.RestDown), Slots = Ptr(_missSlots), Stride = _missStride, OffUp = offUp, OffDown = offDown,
                 BytesGate = t.ExpertBytes[0], BytesUp = t.ExpertBytes[1], BytesDown = t.ExpertBytes[2], List = Ptr(_missPlan),
