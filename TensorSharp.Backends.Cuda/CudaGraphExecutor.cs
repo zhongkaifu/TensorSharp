@@ -2308,6 +2308,8 @@ namespace TensorSharp.Cuda
 
         protected override void EndRun()
         {
+            foreach (Tensor t in _quantized.Values) t.Dispose();
+            _quantized.Clear();
             foreach (DeferredNorm d in _deferredNorms) d.Dispose();
             _deferredNorms.Clear();
             _deferredBy.Clear();
@@ -2861,7 +2863,8 @@ namespace TensorSharp.Cuda
 
         /// <summary>A step's activations quantized to q8_1 for the decode-size products (rows up to 16), by the storage and
         /// offset they were read from: the products of one activation (q, k and v; a block's gate and up) quantize it once.
-        /// Cleared at every run (a storage object is never written again while it is a node's value).</summary>
+        /// Released when the run ends (a storage object is never written again while it is a node's value), within a
+        /// recorded run's capture.</summary>
         private readonly Dictionary<(CudaStorage Storage, long Offset, long InDim, long Rows), Tensor> _quantized = new();
 
         protected override void BeginRun()

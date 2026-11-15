@@ -38,6 +38,9 @@ namespace TensorSharp.Cuda
             public readonly HashSet<IntPtr> TrackedBlocks = new HashSet<IntPtr>();
             public readonly Dictionary<IntPtr, long> TrackedSizes = new Dictionary<IntPtr, long>();
             public readonly List<(IntPtr ptr, long bytes)> QuarantinedBlocks = new List<(IntPtr, long)>();
+            /// <summary>Blocks returned while a concurrent region held returns back (CudaAllocator.EnterSideStream): the
+            /// region's join can come after the capture ends, when they would go back to the pool unseen.</summary>
+            public readonly List<(IntPtr ptr, long bytes)> DeferredBlocks = new List<(IntPtr, long)>();
             public readonly List<IntPtr> DonatedHostBuffers = new List<IntPtr>();
         }
 
@@ -109,6 +112,16 @@ namespace TensorSharp.Cuda
                 ctx.QuarantinedBlocks.Add((ptr, bytes));
                 return true;
             }
+        }
+
+        /// <summary>A block held back by an open concurrent region while this allocator is capturing: the graph takes it
+        /// at the capture's end unless the region's join released it (through <see cref="InterceptReturn"/>) first.</summary>
+        internal static void OnDeferredReturn(CudaAllocator allocator, IntPtr ptr, long bytes)
+        {
+            CaptureContext ctx = active;
+            if (ctx == null || !ReferenceEquals(ctx.Allocator, allocator) || ptr == IntPtr.Zero)
+                return;
+            lock (Sync) ctx.DeferredBlocks.Add((ptr, bytes));
         }
 
         internal static void OnHostBufferOrphaned(CudaAllocator allocator, IntPtr hostBuffer, out bool donated)
@@ -344,6 +357,7 @@ namespace TensorSharp.Cuda
             public Tensor InputHidden;
             public List<Tensor> KeepAlive;
             public List<(IntPtr ptr, long bytes)> OwnedBlocks;
+            public List<IntPtr> Claimed;
             public List<IntPtr> OwnedHostBuffers;
             public long LastUse;
             /// <summary>Largest attention length this graph replays correctly
@@ -537,11 +551,24 @@ namespace TensorSharp.Cuda
             // free ones are stolen out of the pool so nothing else can rent them
             // while this graph can replay.
             var owned = new List<(IntPtr, long)>(ctx.QuarantinedBlocks);
+            // And the ones a concurrent region still holds back: its join would return them to the pool after this point.
+            owned.AddRange(allocator.TakeDeferredReturns(ctx.DeferredBlocks));
+            var taken = new HashSet<IntPtr>();
+            foreach ((IntPtr ptr, long _) in owned) taken.Add(ptr);
+            // The rest are rented still (a block the capture's work returned and then rented again for something kept past
+            // it): each becomes the graph's when its holder returns it.
+            var claimed = new List<IntPtr>();
             foreach (IntPtr ptr in ctx.TrackedBlocks)
             {
+                if (taken.Contains(ptr)) continue;
                 long bytes = ctx.TrackedSizes[ptr];
                 if (allocator.TryStealPooledBlock(ptr, bytes))
                     owned.Add((ptr, bytes));
+                else
+                {
+                    allocator.Claim(ptr, owned);
+                    claimed.Add(ptr);
+                }
             }
 
             if (entries.Count >= Capacity)
@@ -563,6 +590,7 @@ namespace TensorSharp.Cuda
                 InputHidden = pinnedHidden.CopyRef(),
                 KeepAlive = keep,
                 OwnedBlocks = owned,
+                Claimed = claimed,
                 OwnedHostBuffers = new List<IntPtr>(ctx.DonatedHostBuffers),
                 LastUse = ++useCounter,
                 MaxAttendLen = maxAttendLen,
@@ -641,6 +669,8 @@ namespace TensorSharp.Cuda
             foreach (Tensor t in entry.KeepAlive)
                 t.Dispose();
             entry.InputHidden.Dispose();
+            foreach (IntPtr ptr in entry.Claimed)
+                allocator.Unclaim(ptr);
             foreach ((IntPtr ptr, long bytes) in entry.OwnedBlocks)
                 allocator.ReturnDeviceMemory(ptr, bytes);
             foreach (IntPtr host in entry.OwnedHostBuffers)

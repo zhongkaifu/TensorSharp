@@ -130,6 +130,23 @@ namespace TensorSharp.Cuda
                 foreach ((IntPtr ptr, long bytes) in release) ReturnNow(ptr, bytes);
         }
 
+        /// <summary>Of <paramref name="blocks"/>, the ones still held back (removed: a graph that captured work on them
+        /// owns them now, and the region's join no longer returns them).</summary>
+        internal List<(IntPtr, long)> TakeDeferredReturns(IReadOnlyList<(IntPtr Ptr, long Bytes)> blocks)
+        {
+            var taken = new List<(IntPtr, long)>();
+            if (blocks.Count == 0) return taken;
+            lock (_deferSync)
+                foreach ((IntPtr ptr, long bytes) in blocks)
+                {
+                    int i = _deferred.IndexOf((ptr, bytes));
+                    if (i < 0) continue;
+                    _deferred.RemoveAt(i);
+                    taken.Add((ptr, bytes));
+                }
+            return taken;
+        }
+
         internal CudaCublasHandle Blas { get; }
 
         internal CudaKernels Kernels { get; }
@@ -192,12 +209,37 @@ namespace TensorSharp.Cuda
             return ptr;
         }
 
+        /// <summary>Blocks a recorded graph worked in that were still rented when its capture ended, by the graph's owned
+        /// list: the graph keeps writing them at every replay, so when their holder returns one it joins that list instead
+        /// of the pool (see <see cref="Claim"/>).</summary>
+        private readonly Dictionary<IntPtr, List<(IntPtr, long)>> _claims = new();
+
+        /// <summary>The block at <paramref name="ptr"/> becomes <paramref name="owner"/>'s (a graph's owned blocks) when it
+        /// is returned. A capture's work recycles blocks: one returned part way and rented again for something kept past the
+        /// capture is not in the pool when it ends, and returned later it went to the pool while the graph still wrote it.</summary>
+        internal void Claim(IntPtr ptr, List<(IntPtr, long)> owner)
+        {
+            lock (_claims) _claims[ptr] = owner;
+        }
+
+        /// <summary>Drop a claim (its graph is gone; the block, still rented, returns to the pool as usual).</summary>
+        internal void Unclaim(IntPtr ptr)
+        {
+            lock (_claims) _claims.Remove(ptr);
+        }
+
         internal void ReturnDeviceMemory(IntPtr ptr, long allocationBytes)
         {
+            List<(IntPtr, long)> owner = null;
+            lock (_claims)
+                if (_claims.Count > 0 && _claims.Remove(ptr, out owner))
+                    owner.Add((ptr, allocationBytes));
+            if (owner != null) return;
             lock (_deferSync)
                 if (_deferDepth > 0)
                 {
                     _deferred.Add((ptr, allocationBytes));
+                    CudaGraphCapture.OnDeferredReturn(this, ptr, allocationBytes);
                     return;
                 }
             ReturnNow(ptr, allocationBytes);
