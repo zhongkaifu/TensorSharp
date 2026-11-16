@@ -97,24 +97,32 @@ namespace TensorSharp.Models
         private bool RankedSlotCopies => _rankGraphs && _graphTpRanks == null && _mesh.TensorParallel > 1 && _mesh.Stages == 1 && IsGgmlBackend;
 
         /// <summary>Every tensor of <paramref name="slot"/> a graph binds has a device copy of the size the graphs bind
-        /// (one device, or each rank's share on its own device under per-rank graphs), so a copy can read the device
-        /// instead of the host.</summary>
+        /// (one device; each rank's share on its own device under per-rank graphs; each whole-layer stage's layers on its
+        /// device), so a copy can read the device instead of the host. Stages had answered no: two stages on two ggml-cuda
+        /// devices cloned an exported checkpoint (synced to the host for its file) through the host, where one device
+        /// copied it on the device.</summary>
         private bool DeviceCopiesResident(Slot slot)
         {
-            bool ranked = RankedSlotCopies;
-            if (!KeepsDeviceCopies || _mesh.Stages != 1 || (_mesh.TensorParallel != 1 && !ranked)) return false;
-            int previous = ranked ? GgmlBasicOps.GetActiveRank() : 0;
+            bool ranked = RankedSlotCopies, staged = _mesh.Stages > 1;
+            if (!KeepsDeviceCopies || (_mesh.TensorParallel != 1 && !ranked)) return false;
+            int previous = ranked || staged ? GgmlBasicOps.GetActiveRank() : 0;
             try
             {
+                for (int stage = 0; stage < _mesh.Stages; stage++)
                 for (int rank = 0; rank < _mesh.TensorParallel; rank++)
                 {
-                    if (ranked) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, rank));
-                    foreach (Tensor t in RankCacheTensors(slot.K, rank).Concat(RankCacheTensors(slot.V, rank)))
-                        if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.Storage.ByteLength)
-                            return false;
+                    if (ranked || staged) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(stage, rank));
+                    foreach (Tensor[][] caches in new[] { slot.K, slot.V })
+                    {
+                        if (caches == null) continue;
+                        for (int e = 0; e < caches.Length; e++)
+                            if (CacheStage(e) == stage && caches[e] is { } entry && rank < entry.Length && entry[rank] is { } t
+                                && GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.Storage.ByteLength)
+                                return false;
+                    }
                     if (slot.Recurrent == null) continue;
-                    foreach (RecurrentState[] layer in slot.Recurrent)
-                        if (layer != null && rank < layer.Length && layer[rank]?.GraphTensors is { } tensors)
+                    for (int l = 0; l < slot.Recurrent.Length; l++)
+                        if (slot.Recurrent[l] is { } layer && StageOfLayer(l) == stage && rank < layer.Length && layer[rank]?.GraphTensors is { } tensors)
                             foreach (Tensor t in tensors)
                                 if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.ElementCount() * sizeof(float))
                                     return false;
@@ -123,7 +131,7 @@ namespace TensorSharp.Models
             }
             finally
             {
-                if (ranked) GgmlBasicOps.SetActiveRank(previous);
+                if (ranked || staged) GgmlBasicOps.SetActiveRank(previous);
             }
         }
 
