@@ -107,6 +107,27 @@ namespace TensorSharp.Cuda
 
         private bool _refusalReported;
 
+        /// <summary>Free device memory below which a recording first returns the pool's cached blocks to the driver.</summary>
+        private const long CaptureFreeFloorBytes = 768L << 20;
+
+        /// <summary>Cached bytes past which a recording checks the driver's free memory first.</summary>
+        private const long CaptureTrimCachedBytes = 256L << 20;
+
+        /// <summary>
+        /// A recording allocates its step's intermediates while it captures, when the pool can no longer free what it caches:
+        /// a prompt's chunk activations stay cached in sizes a decode step never asks for. After a 4K prompt on an A40 holding
+        /// 38 GB of Qwen3.8 Flash Next's experts the driver had 97 MiB free beside 1.5 GB cached, the decode steps' recordings
+        /// ran out of memory and every step ran unrecorded (34 tok/s against 59). The cached blocks go back first. Only a
+        /// prompt's worth of cached blocks is worth asking the driver about (cuMemGetInfo took ~3 ms on an RTX PRO 4000; a
+        /// recording is made at every new width).
+        /// </summary>
+        private void ReleaseCachedBlocksWhenShort()
+        {
+            if (_allocator.GetStats().CachedBytes < CaptureTrimCachedBytes) return;
+            if (_allocator.GetMemoryInfo().freeBytes >= CaptureFreeFloorBytes) return;
+            _allocator.TrimPool();
+        }
+
         private static readonly bool RelocationLog = Environment.GetEnvironmentVariable("TS_CUDA_PREFILL_GRAPH_LOG") == "1";
 
         public bool Captured { get; private set; }
@@ -129,6 +150,7 @@ namespace TensorSharp.Cuda
         {
             if (Captured || _disposed || !_graphs.IsUsable || !_dyn.IsValid || _stable.Count == 0) return false;
             _allocator.OnRecordedStepLaunching();
+            ReleaseCachedBlocksWhenShort();
             PinVaryingInputs();
             Upload();
             _dyn.Write(attendLength, writeRow, 0, 0);
