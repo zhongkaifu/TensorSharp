@@ -39,8 +39,30 @@ namespace TensorSharp.Cuda
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
         protected override bool BroadcastsPositionsOnDevice => true;
 
+        /// <summary>The bucket a decode window grows by (<see cref="GraphCapabilities.DecodeWindowRows"/>): the flash kernels split a
+        /// length as the bucket window around it does, whatever window it is launched over.</summary>
+        private int DecodeWindowBucket => Capabilities.DecodeWindowRows;
+
+        /// <summary>
+        /// An F16 cache's decode rows and verify windows on the flash kernels attend the written keys alone (the length read on
+        /// the device when recorded), and split them as the bucket window around their length does
+        /// (<see cref="CudaFlashPrefillKernels.BucketKeys"/>, on the device for a recorded step); a QSA region scores and selects
+        /// only the blocks a row sees: a window padded to the slot's capacity computes what the bucket window computes, bit for
+        /// bit. A decode step had recorded again at every 256 positions and every verify width: 25-100 ms steps, about 25 of
+        /// them over four Qwen3.8 Flash Next MTP requests on an A40 (short-prompt decode 120.7 against the direct engine's 128
+        /// tok/s, whose graphs read the length on the device and never record again).
+        /// </summary>
+        public override bool AttendsCapacityWindows(int headDim, int kvFormat)
+            => kvFormat == GraphFormat.F16 && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && flash.RunsAttention(headDim);
+
         public IDecodeCapture OpenDecodeCapture()
             => Allocator is CudaAllocator cuda ? new RuntimeDecodeCapture(cuda) : null;
+
+        /// <summary>A batched decode step records too: each sequence's attention and cache append read its own length and write
+        /// row (<see cref="CudaDecodeDynParams"/>, the sequence named by the cache a launch reads or writes). Four Qwen3.8-27B
+        /// conversations decoding together had run every step unrecorded: 93.4 tok/s each against the direct engine's 108.9,
+        /// whose batched decode graphs replayed (one request alone: 5% faster than the engine).</summary>
+        public int MaxRecordedSequences => CudaDecodeDynParams.MaxSequences;
 
         /// <summary>Device memory a new recording leaves free (with the pool's cached blocks): a speculating request records
         /// a step for each window and draft width, each keeping the blocks its kernels used, and Qwen3.8 Flash Next's ISTA
@@ -212,17 +234,23 @@ namespace TensorSharp.Cuda
                 && ((CudaAllocator)Allocator).FlashPrefillKernels is { } decodeFlash && decodeFlash.RunsAttention(d))
             {
                 var cudaAllocator = (CudaAllocator)Allocator;
-                IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(cudaAllocator);
-                // Splits from the window, recorded or not: a recorded step replays at every length its window covers, and a
-                // row's arithmetic must not depend on whether its step was recorded (a verify window's row and the decode
-                // row at its position, a speculating request and a plain one).
-                int splits = decodeFlash.Splits(heads / kvHeads, kvHeads, (int)k.Sizes[^2]);
+                IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(cudaAllocator, kc.Storage);
+                // Splits from the bucket window the step's length falls in, recorded or not: a row's arithmetic must not depend
+                // on whether its step was recorded (a verify window's row and the decode row at its position, a speculating
+                // request and a plain one). A recorded launch holds the splits of its whole window - the slot's capacity where
+                // windows span it (AttendsCapacityWindows), so one recording replays at every length - and runs the bucket's,
+                // from the length it reads on the device; an unrecorded one is launched with the bucket's. A verify window's row
+                // run alone (fewer keys than its last) takes its window's length, as the window's own launch does.
+                int fewer = CudaDecodeDynParams.WindowRowFewer, windowKeys = (int)k.Sizes[^2];
+                int splits = decodeFlash.Splits(heads / kvHeads, kvHeads,
+                    dyn != IntPtr.Zero ? windowKeys : CudaFlashPrefillKernels.BucketKeys(windowKeys, len + fewer, DecodeWindowBucket));
                 var attended = new Tensor(Allocator, DType.Float32, 1, heads, d);
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(1, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
                 Launch(new[] { qc, kc, vc }, written, (_, stream) => decodeFlash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, 1, len, floor,
-                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn));
+                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn,
+                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0, lenBias: fewer));
                 return attended;
             }
             if (nq == 1)
@@ -247,21 +275,24 @@ namespace TensorSharp.Cuda
             {
                 var attended = new Tensor(Allocator, DType.Float32, nq, heads, d);
                 // A recorded verify window reads its length on the device (the window's rows the last nq of it), as a
-                // recorded decode row does: the splits then follow the window bucket, which every replay fits.
-                IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr((CudaAllocator)Allocator);
-                int splits = flash.Splits(nq * (heads / kvHeads), kvHeads, dyn != IntPtr.Zero ? (int)k.Sizes[^2] : len);
+                // recorded decode row does: the splits then follow the bucket window its length falls in (the launch holds its
+                // whole window's).
+                IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr((CudaAllocator)Allocator, kc.Storage);
+                int windowKeys = (int)k.Sizes[^2];
+                int splits = flash.Splits(nq * (heads / kvHeads), kvHeads, dyn != IntPtr.Zero ? windowKeys : len);
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
                 Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor,
-                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn));
+                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn,
+                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0));
                 return attended;
             }
             // A recorded verify window replays at later positions, where the written length this classification read (the
             // capture's) is short: such a window runs over the whole cache window with the mask itself, which every launch
             // rewrites (the flash kernel above reads the length on the device instead). Only when recording: the window's
             // length is the step's, so a sequence batched with others would round with its neighbours' lengths.
-            if (trimmed && nq > 1 && mask.HasTensor && CudaDecodeDynParams.GetActiveDevicePtr((CudaAllocator)Allocator) != IntPtr.Zero)
+            if (trimmed && nq > 1 && mask.HasTensor && CudaDecodeDynParams.IsActive((CudaAllocator)Allocator))
             {
                 Tensor whole = mask.Tensor;
                 return FlashAttention(q, k, v, new AttentionMask(MaskPattern.Explicit, 0, () => whole), scale, kWindow, vWindow);
@@ -500,12 +531,16 @@ namespace TensorSharp.Cuda
             // q [heads][nq][d] as its rows [nq][heads][d].
             using Tensor permuted = q.Permute(1, 0, 2);
             using Tensor qc = Ops.NewContiguous(permuted);
-            int splits = flash.Splits(heads / kvHeads, kvHeads, selection && mask.KvMax > 0 ? Math.Min(mask.KvMax, nkv) : nkv);
+            IntPtr dyn = selection ? IntPtr.Zero : CudaDecodeDynParams.GetActiveDevicePtr(cuda, kc.Storage);
+            // A selection's rows split their selection's width; the others the bucket window the window's length falls in (a
+            // recorded launch holds the splits of its whole window and runs the bucket's, the length read on the device), as
+            // the decode row at the last row's position does.
+            int splits = flash.Splits(heads / kvHeads, kvHeads, selection ? (mask.KvMax > 0 ? Math.Min(mask.KvMax, nkv) : nkv)
+                : dyn != IntPtr.Zero ? nkv : CudaFlashPrefillKernels.BucketKeys(nkv, keys, DecodeWindowBucket));
             using Tensor cells = selection ? new Tensor(Allocator, DType.Int32, nq, nkv) : null;
             using Tensor count = selection ? new Tensor(Allocator, DType.Int32, nq) : null;
             if (selection)
                 Launch(new[] { rows }, new[] { cells, count }, (kn, stream) => kn.LaunchMaskCells(Ptr(rows), Ptr(cells), Ptr(count), nq, nkv, stream));
-            IntPtr dyn = selection ? IntPtr.Zero : CudaDecodeDynParams.GetActiveDevicePtr(cuda);
             var output = new Tensor(Allocator, DType.Float32, nq, heads, d);
             using Tensor partial = splits > 1
                 ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
@@ -514,7 +549,8 @@ namespace TensorSharp.Cuda
             Launch(read, written, (_, stream) => flash.LaunchDecodeRows(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq,
                 selection ? nkv : keys, selection ? 0 : floor, heads, kvHeads, d, scale, splits,
                 partial == null ? IntPtr.Zero : Ptr(partial), Ptr(output), stream, dyn,
-                selection ? Ptr(cells) : IntPtr.Zero, selection ? Ptr(count) : IntPtr.Zero, selection ? Ptr(rows) : IntPtr.Zero, nkv));
+                selection ? Ptr(cells) : IntPtr.Zero, selection ? Ptr(count) : IntPtr.Zero, selection ? Ptr(rows) : IntPtr.Zero, nkv,
+                windowKeys: nkv, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0));
             attended = output;
             return true;
         }

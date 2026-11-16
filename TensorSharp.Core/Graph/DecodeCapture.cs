@@ -34,12 +34,16 @@ namespace TensorSharp.Graph
         /// <summary>Whether the device keeps room for another recording beside what it holds (a recording keeps the memory its
         /// step used); false defers it.</summary>
         bool HasRoomToRecord() => true;
+
+        /// <summary>The sequences one recorded step may batch, each reading its own attention length and write row on the
+        /// device.</summary>
+        int MaxRecordedSequences => 1;
     }
 
     /// <summary>
     /// One decode step recorded on the device and replayed a position on at a time. The step's inputs are uploaded to
-    /// <see cref="Stable"/> tensors before each launch, the attention length and the cache write row are read on the device,
-    /// and every other launch argument stays what the recorded step had (the same slots, caches and window).
+    /// <see cref="Stable"/> tensors before each launch, each sequence's attention length and cache write row are read on the
+    /// device, and every other launch argument stays what the recorded step had (the same slots, caches and windows).
     /// </summary>
     public interface IDecodeCapture : IDisposable
     {
@@ -53,14 +57,18 @@ namespace TensorSharp.Graph
 
         /// <summary>
         /// Record <paramref name="run"/> (device work only: a host read of device data aborts the recording) and launch it.
-        /// <paramref name="written"/> are the tensors the step writes in place (caches, states): every launch leaves them
-        /// device-current. False when the recording failed: nothing ran, so the caller runs the step itself.
+        /// Sequence s attends <paramref name="attendLengths"/>[s] keys and writes its rows from <paramref name="writeRows"/>[s];
+        /// <paramref name="sequences"/>[s] are the tensors its launches name it by (its caches). <paramref name="written"/> are
+        /// the tensors the step writes in place (caches, states): every launch leaves them device-current. False when the
+        /// recording failed: nothing ran, so the caller runs the step itself.
         /// </summary>
-        bool CaptureAndLaunch(Func<bool> run, int attendLength, int writeRow, IReadOnlyList<Tensor> written);
+        bool CaptureAndLaunch(Func<bool> run, ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows,
+            IReadOnlyList<IReadOnlyList<Tensor>> sequences, IReadOnlyList<Tensor> written);
 
-        /// <summary>Replay the recorded step with this position's attention length and cache write row. False when the device
-        /// could not launch it (out of memory): nothing ran, so the caller drops recordings and runs the step itself.</summary>
-        bool TryLaunch(int attendLength, int writeRow);
+        /// <summary>Replay the recorded step with this position's attention lengths and cache write rows, one a sequence. False
+        /// when the device could not launch it (out of memory): nothing ran, so the caller drops recordings and runs the step
+        /// itself.</summary>
+        bool TryLaunch(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows);
 
         /// <summary>A launch rewrote these tensors on the device (the recorded step's outputs): reads go to the device.</summary>
         void MarkWritten(IReadOnlyList<Tensor> tensors);

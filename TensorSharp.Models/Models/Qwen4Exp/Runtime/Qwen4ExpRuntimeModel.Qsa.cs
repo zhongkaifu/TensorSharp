@@ -109,7 +109,7 @@ namespace TensorSharp.Models
                 Slot slot = step.Slots[s];
                 int cache = QsaCache(step, layer, s);
                 int rows = step.Sequences == 1 ? raw : step.View2(raw, d, count, d * f, step.First[s] * d * f);
-                int writeRows = step.WriteRows(start, count);
+                int writeRows = step.WriteRows(start, count, s);
 
                 // The blocks to pool: those the step completes; a decode or verify step pools its last ceil(count /
                 // ratio) complete blocks (again where they were complete before: the same values), so its graph is the
@@ -283,7 +283,7 @@ namespace TensorSharp.Models
             if (ratio <= 0) return mask;
             if (start + count <= Ple.QsaBudget)
             {
-                step.LimitAdvance(start, (int)Math.Min(int.MaxValue, Ple.QsaBudget - count));   // past it, a step selects
+                step.LimitAdvance(start, (int)Math.Min(int.MaxValue, Ple.QsaBudget - count), s);   // past it, a step selects
                 return mask;
             }
             QsaSpec q = Qsa;

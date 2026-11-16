@@ -15,9 +15,10 @@ namespace TensorSharp.Cuda
     /// <summary>
     /// A decode step of the shared runtime recorded as one CUDA graph (<see cref="IDecodeCapture"/>). The step's kernels are
     /// launched one by one on the host otherwise - about a thousand a token on Qwen3.5-0.8B, which bound its decode to the
-    /// host. The recording owns the pool blocks its kernels use (<see cref="CudaPrefillGraphCache"/>); the attention length
-    /// and the cache write row come from a dynamic-parameter block the graph uploads first (<see cref="CudaDecodeDynParams"/>),
-    /// which the decode attention and the one-row cache append read on the device.
+    /// host. The recording owns the pool blocks its kernels use (<see cref="CudaPrefillGraphCache"/>); each sequence's
+    /// attention length and cache write row come from its blocks of a dynamic-parameter block the graph uploads first
+    /// (<see cref="CudaDecodeDynParams"/>), which the decode attention and the cache append read on the device, naming the
+    /// sequence by the cache they read or write.
     /// </summary>
     internal sealed class RuntimeDecodeCapture : IDecodeCapture
     {
@@ -146,14 +147,19 @@ namespace TensorSharp.Cuda
             return t;
         }
 
-        public bool CaptureAndLaunch(Func<bool> run, int attendLength, int writeRow, IReadOnlyList<Tensor> written)
+        public bool CaptureAndLaunch(Func<bool> run, ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows,
+            IReadOnlyList<IReadOnlyList<Tensor>> sequences, IReadOnlyList<Tensor> written)
         {
-            if (Captured || _disposed || !_graphs.IsUsable || !_dyn.IsValid || _stable.Count == 0) return false;
+            if (Captured || _disposed || !_graphs.IsUsable || !_dyn.IsValid || _stable.Count == 0 || attendLengths.Length < 1
+                || attendLengths.Length > CudaDecodeDynParams.MaxSequences || writeRows.Length != attendLengths.Length
+                || sequences == null || sequences.Count != attendLengths.Length)
+                return false;
             _allocator.OnRecordedStepLaunching();
             ReleaseCachedBlocksWhenShort();
             PinVaryingInputs();
             Upload();
-            _dyn.Write(attendLength, writeRow, 0, 0);
+            _dyn.Write(attendLengths, writeRows);
+            _dyn.NameSequences(sequences);
             if (!_graphs.BeginCapture(Key)) return false;
             bool ok;
             try
@@ -201,12 +207,12 @@ namespace TensorSharp.Cuda
         /// <summary>CUDA_ERROR_OUT_OF_MEMORY: a graph the device has no memory left to instantiate or launch.</summary>
         private const int OutOfMemory = 2;
 
-        public bool TryLaunch(int attendLength, int writeRow)
+        public bool TryLaunch(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> writeRows)
         {
             if (!Captured) throw new InvalidOperationException("no decode step is recorded");
             _allocator.OnRecordedStepLaunching();
             Upload();
-            _dyn.Write(attendLength, writeRow, 0, 0);
+            _dyn.Write(attendLengths, writeRows);
             try
             {
                 _graphs.Replay(Key);

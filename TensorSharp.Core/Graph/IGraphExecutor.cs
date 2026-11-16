@@ -108,6 +108,13 @@ namespace TensorSharp.Graph
         /// is.</summary>
         bool KeepForProductsOnly(IntPtr weightKey) => false;
 
+        /// <summary>Whether decode rows and short chunks over a K/V cache of <paramref name="kvFormat"/> with
+        /// <paramref name="headDim"/>-wide heads may attend their slot's whole capacity as their padded window: the executor's
+        /// kernels then compute, from the rows' written length (read on the device when the step is recorded), what the window
+        /// of <see cref="GraphCapabilities.DecodeWindowRows"/>-row buckets around that length computes, bit for bit - so one
+        /// recorded step of a width serves every position of its slot. False where a window's width shapes the arithmetic.</summary>
+        bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
+
         /// <summary>Host work to run while the device runs the next recorded step: after its launch, before anything waits for
         /// its outputs (a recorded step leaves the host idle for its whole run). False where the executor runs no recorded
         /// steps to hide it behind: the caller then does the work itself, or not at all.</summary>

@@ -177,12 +177,22 @@ namespace TensorSharp.Cuda
         // [0]=attend_len, [1]=kv write pos, [2]=conv ring write idx, [3]=rope pos.
         // Then one such block for each row of a verify window run as the decode row at its position (WindowRow): the
         // window's last row attends attend_len keys, the one before it one fewer, and so on, each written where its
-        // last key is.
+        // last key is. A batched step's sequences each have their own run of these blocks, sequence s's from block
+        // s * (1 + WindowRowBlocks) (the first sequence's, at the start, is a lone step's).
         private const int SlotCount = 4;
-        private const int ByteCount = SlotCount * (1 + WindowRowBlocks) * sizeof(int);
+        private const int BlocksPerSequence = 1 + WindowRowBlocks;
+        private const int ByteCount = SlotCount * BlocksPerSequence * MaxSequences * sizeof(int);
 
         /// <summary>The rows of a verify window that can read their own lengths (<see cref="WindowRow"/>).</summary>
         public const int WindowRowBlocks = 8;
+
+        /// <summary>The sequences a recorded step may batch, each with its own length and write row.</summary>
+        public const int MaxSequences = 16;
+
+        // A batched step's: the storages its sequences' launchers name them by (each sequence's caches), while it is
+        // recorded. Null for a lone sequence's.
+        private Dictionary<Storage, int> sequenceOf;
+        private int sequences = 1;
 
         private readonly CudaAllocator allocator;
         private IntPtr devicePtr;
@@ -201,6 +211,10 @@ namespace TensorSharp.Cuda
         [ThreadStatic]
         private static int windowRow;   // 0: the step's block; b + 1: the row b keys short of the step's last
 
+        /// <summary>The keys the verify window row a launcher runs now has fewer than the window's last (<see cref="WindowRow"/>;
+        /// 0 outside one): what its length lacks of the window's.</summary>
+        internal static int WindowRowFewer => windowRow > 0 ? windowRow - 1 : 0;
+
         /// <summary>While set, a launcher's dynamic block is the one of a verify window's row that attends
         /// <paramref name="fewerKeys"/> keys fewer than the step's length (0 to <see cref="WindowRowBlocks"/> - 1); null
         /// restores the step's own. Kernels that read only the length and the write position take it.</summary>
@@ -218,15 +232,47 @@ namespace TensorSharp.Cuda
 
         /// <summary>Returns the ambient dynamic-parameter pointer only when it
         /// belongs to the allocator issuing this launch. Otherwise the caller
-        /// must use its ordinary scalar kernel arguments.</summary>
-        internal static IntPtr GetActiveDevicePtr(CudaAllocator launchAllocator)
+        /// must use its ordinary scalar kernel arguments. A batched step's launcher
+        /// names its sequence (<see cref="GetActiveDevicePtr(CudaAllocator, Storage)"/>):
+        /// one that does not aborts the recording, which then runs unrecorded.</summary>
+        internal static IntPtr GetActiveDevicePtr(CudaAllocator launchAllocator) => GetActiveDevicePtr(launchAllocator, null);
+
+        /// <summary>The ambient dynamic-parameter pointer of the sequence <paramref name="owner"/> (one of its caches' storages)
+        /// belongs to: a lone step's own, a batched step's that sequence's. A batched step's launcher whose storage names no
+        /// sequence aborts the recording (it would replay one sequence's length for another's).</summary>
+        internal static IntPtr GetActiveDevicePtr(CudaAllocator launchAllocator, Storage owner)
         {
             CudaDecodeDynParams active = activeInstance;
-            return active != null &&
-                ReferenceEquals(active.allocator, launchAllocator) &&
-                active.devicePtr != IntPtr.Zero
-                    ? active.devicePtr + windowRow * SlotCount * sizeof(int)
-                    : IntPtr.Zero;
+            if (active == null || !ReferenceEquals(active.allocator, launchAllocator) || active.devicePtr == IntPtr.Zero)
+                return IntPtr.Zero;
+            int sequence = 0;
+            if (active.sequences > 1 && (owner == null || !active.sequenceOf.TryGetValue(owner, out sequence)))
+                throw new CudaGraphCaptureAbortedException("A batched decode step's launch read a length without naming its sequence.");
+            return active.devicePtr + (sequence * BlocksPerSequence + windowRow) * SlotCount * sizeof(int);
+        }
+
+        /// <summary>Whether a recorded step is being captured on <paramref name="launchAllocator"/> (its lengths read on the device).</summary>
+        internal static bool IsActive(CudaAllocator launchAllocator)
+        {
+            CudaDecodeDynParams active = activeInstance;
+            return active != null && ReferenceEquals(active.allocator, launchAllocator) && active.devicePtr != IntPtr.Zero;
+        }
+
+        /// <summary>The recorded step's sequences, by the tensors their launchers name them by (each sequence's caches): one
+        /// for a lone step's. Set before <see cref="Activate"/>.</summary>
+        internal void NameSequences(IReadOnlyList<IReadOnlyList<Tensor>> perSequence)
+        {
+            int n = perSequence?.Count ?? 1;
+            if (n < 1 || n > MaxSequences)
+                throw new ArgumentOutOfRangeException(nameof(perSequence), n, $"a recorded step holds 1 to {MaxSequences} sequences");
+            sequences = n;
+            sequenceOf = null;
+            if (n == 1) return;
+            sequenceOf = new Dictionary<Storage, int>(ReferenceEqualityComparer.Instance);
+            for (int s = 0; s < n; s++)
+                foreach (Tensor t in perSequence[s])
+                    if (t?.Storage != null && !sequenceOf.TryAdd(t.Storage, s) && sequenceOf[t.Storage] != s)
+                        throw new ArgumentException("two sequences of a recorded step share a cache", nameof(perSequence));
         }
 
         public CudaDecodeDynParams(IAllocator allocator)
@@ -255,8 +301,20 @@ namespace TensorSharp.Cuda
         /// <summary>Writes this token's values into the pinned host block. Must
         /// run before Replay (and before EndCaptureAndLaunch when capturing).</summary>
         public unsafe void Write(int attendLen, int kvWritePos, int convWriteIdx, int ropePos)
+            => WriteSequence((int*)hostPtr, attendLen, kvWritePos, convWriteIdx, ropePos);
+
+        /// <summary>A batched step's values, sequence s's attention length and cache write row its own blocks'
+        /// (<see cref="Write(int, int, int, int)"/>'s for each).</summary>
+        public unsafe void Write(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> kvWritePositions)
         {
-            int* p = (int*)hostPtr;
+            if (attendLengths.Length < 1 || attendLengths.Length > MaxSequences || kvWritePositions.Length != attendLengths.Length)
+                throw new ArgumentOutOfRangeException(nameof(attendLengths), attendLengths.Length, $"1 to {MaxSequences} sequences, a write row each");
+            for (int s = 0; s < attendLengths.Length; s++)
+                WriteSequence((int*)hostPtr + s * BlocksPerSequence * SlotCount, attendLengths[s], kvWritePositions[s], 0, 0);
+        }
+
+        private static unsafe void WriteSequence(int* p, int attendLen, int kvWritePos, int convWriteIdx, int ropePos)
+        {
             p[0] = attendLen;
             p[1] = kvWritePos;
             p[2] = convWriteIdx;

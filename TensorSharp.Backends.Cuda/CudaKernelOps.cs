@@ -1661,7 +1661,7 @@ namespace TensorSharp.Cuda
             keyStorage.EnsureDeviceCurrent();
             valueStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(allocator);
+            IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(allocator, keyStorage);
             bool useGroup4D512 =
                 keyIsHalf &&
                 !circular &&
@@ -2130,8 +2130,8 @@ namespace TensorSharp.Cuda
             allocator.Context.MakeCurrent();
             // A recorded step's append re-reads its first write row from the dyn block on every replay: a decode row's,
             // and a recorded verify window's rows from there on (its write rows baked at the capture rewrote the
-            // capture's rows at every later position).
-            IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(allocator);
+            // capture's rows at every later position); a batched step's, the block of the sequence this cache is.
+            IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(allocator, cacheStorage);
             if (cacheIsHalf)
             {
                 kernels.LaunchCopyHeadFirstToCacheF16(

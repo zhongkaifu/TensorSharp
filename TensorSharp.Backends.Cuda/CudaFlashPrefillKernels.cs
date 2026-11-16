@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 7;
+        public const int CurrentVersion = 8;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
@@ -70,6 +70,12 @@ namespace TensorSharp.Cuda
             return splits;
         }
 
+        /// <summary>The keys <see cref="Splits"/> takes for a step of <paramref name="length"/> keys over a padded window of
+        /// <paramref name="windowKeys"/>: the window of <paramref name="bucket"/>-key steps the length falls in, at most the
+        /// window (a window padded to the slot's capacity splits each length as the bucket window around it does).</summary>
+        public static int BucketKeys(int windowKeys, int length, int bucket)
+            => bucket <= 0 ? windowKeys : (int)Math.Min(windowKeys, ((long)length + bucket - 1) / bucket * bucket);
+
         /// <summary>Floats of split partials <paramref name="splits"/> splits write for nq queries of nHead heads.</summary>
         public static long PartialFloats(int nq, int nHead, int headDim, int splits) => (long)nq * nHead * splits * (headDim + 2);
 
@@ -81,26 +87,39 @@ namespace TensorSharp.Cuda
         /// <paramref name="cells"/> (one decode row: a sparse attention's selection) the keys are the cache rows listed there,
         /// <paramref name="cellCount"/>[0] of them on the device, each with its value in the mask row
         /// <paramref name="cellMask"/> added (len and floor unused; none added without it: a selection whose kept cells all
-        /// hold 0).
+        /// hold 0). With <paramref name="bucket"/> &gt; 0 and <paramref name="dyn"/> the launch holds <paramref name="splits"/>
+        /// splits (<see cref="Splits"/> of the whole <paramref name="windowKeys"/>-key window) and runs the ones
+        /// <see cref="Splits"/> gives the window of <see cref="BucketKeys"/> around the length read on the device plus
+        /// <paramref name="lenBias"/> (the keys a verify window's last row has past this row): one recording of a window padded
+        /// to the slot's capacity then splits every length as the bucket window around it does.
         /// </summary>
         public unsafe void LaunchAttention(IntPtr q, IntPtr k, IntPtr v, int cap, int nq, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
-            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default)
+            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default, int windowKeys = 0, int bucket = 0, int lenBias = 0)
         {
             int rows = nq * (heads / kvHeads);
             IntPtr a0 = q, a1 = k, a2 = v, a11 = partial, a12 = output, a13 = dyn, a14 = cells, a15 = cellCount, a16 = cellMask;
-            int a3 = cap, a4 = nq, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = splits;
+            int a3 = cap, a4 = nq, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = splits, a17 = lenBias, a18 = windowKeys, a19 = bucket,
+                a20 = MultiprocessorCount;
             float a9 = scale;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16 };
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16,
+                &a17, &a18, &a19, &a20 };
             var (fn, smem) = headDim == 128 ? (_attn128, _smem128) : (_attn256, _smem256);
             uint tiles = (uint)((rows + BlockRows - 1) / BlockRows);
             CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();
-            if (splits <= 1) return;
-            IntPtr c0 = partial, c3 = output;
-            int c1 = splits, c2 = headDim;
-            void** cargs = stackalloc void*[] { &c0, &c1, &c2, &c3 };
-            CudaDriverApi.cuLaunchKernel(_combine, (uint)(nq * heads), 1, 1, (uint)headDim, 1, 1, 0, stream, (IntPtr)cargs,
+            if (splits > 1) LaunchCombine(partial, splits, headDim, output, nq * heads, dyn, lenBias, windowKeys, bucket, rows, kvHeads, stream);
+        }
+
+        /// <summary>The combine over the splits the attention launch ran (its arguments: <paramref name="ruleRows"/> the rows its
+        /// splits were counted for).</summary>
+        private unsafe void LaunchCombine(IntPtr partial, int splits, int headDim, IntPtr output, int outputs, IntPtr dyn, int lenBias,
+            int windowKeys, int bucket, int ruleRows, int kvHeads, IntPtr stream)
+        {
+            IntPtr c0 = partial, c3 = output, c4 = dyn;
+            int c1 = splits, c2 = headDim, c5 = lenBias, c6 = windowKeys, c7 = bucket, c8 = ruleRows, c9 = kvHeads, c10 = MultiprocessorCount;
+            void** cargs = stackalloc void*[] { &c0, &c1, &c2, &c3, &c4, &c5, &c6, &c7, &c8, &c9, &c10 };
+            CudaDriverApi.cuLaunchKernel(_combine, (uint)outputs, 1, 1, (uint)headDim, 1, 1, 0, stream, (IntPtr)cargs,
                 IntPtr.Zero).ThrowOnError();
         }
 
@@ -113,35 +132,35 @@ namespace TensorSharp.Cuda
         /// keys are cells[z * cellStride ..], cellCount[z] of them, its mask row cellMask[z * cellStride ..] (or none).
         /// Without a selection the rows share the launch's row tiles (ts_flash_decode_window_f16_d*: every key tile read once
         /// for the window's rows, each row still its one-row launch's bits); with one, a row of the grid each.
+        /// <paramref name="windowKeys"/> and <paramref name="bucket"/> as <see cref="LaunchAttention"/>'s, for every row the
+        /// splits of the window's length (a row's as the decode row at its position).
         /// </summary>
         public unsafe void LaunchDecodeRows(IntPtr q, IntPtr k, IntPtr v, int cap, int rows, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
-            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default, int cellStride = 0)
+            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default, int cellStride = 0, int windowKeys = 0, int bucket = 0)
         {
             IntPtr a0 = q, a1 = k, a2 = v, a11 = partial, a12 = output, a13 = dyn, a14 = cells, a15 = cellCount, a16 = cellMask;
-            int a3 = cap, a4 = rows, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = splits, a17 = cellStride;
+            int a3 = cap, a4 = rows, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = splits, a17 = cellStride, a18 = windowKeys, a19 = bucket,
+                a20 = MultiprocessorCount;
             float a9 = scale;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16, &a17 };
             if (cells == IntPtr.Zero && !RowGridForTests)
             {
+                void** wargs = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a18, &a19, &a20 };
                 var (wfn, wsmem) = headDim == 128 ? (_window128, _smem128) : (_window256, _smem256);
                 uint windowTiles = (uint)((rows * (heads / kvHeads) + BlockRows - 1) / BlockRows);
-                CudaDriverApi.cuLaunchKernel(wfn, windowTiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)wsmem, stream, (IntPtr)args,
+                CudaDriverApi.cuLaunchKernel(wfn, windowTiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)wsmem, stream, (IntPtr)wargs,
                     IntPtr.Zero).ThrowOnError();
             }
             else
             {
+                void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16, &a17,
+                    &a18, &a19, &a20 };
                 var (fn, smem) = headDim == 128 ? (_rows128, _smem128) : (_rows256, _smem256);
                 uint tiles = (uint)((heads / kvHeads + BlockRows - 1) / BlockRows);
                 CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, (uint)rows, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
                     IntPtr.Zero).ThrowOnError();
             }
-            if (splits <= 1) return;
-            IntPtr c0 = partial, c3 = output;
-            int c1 = splits, c2 = headDim;
-            void** cargs = stackalloc void*[] { &c0, &c1, &c2, &c3 };
-            CudaDriverApi.cuLaunchKernel(_combine, (uint)(rows * heads), 1, 1, (uint)headDim, 1, 1, 0, stream, (IntPtr)cargs,
-                IntPtr.Zero).ThrowOnError();
+            if (splits > 1) LaunchCombine(partial, splits, headDim, output, rows * heads, dyn, 0, windowKeys, bucket, heads / kvHeads, kvHeads, stream);
         }
 
         /// <summary>Tests and A/B: <see cref="LaunchDecodeRows"/> runs a window's rows on the row grid (a row a z-slice) without a

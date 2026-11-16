@@ -114,6 +114,9 @@ namespace TensorSharp.Graph
         /// <inheritdoc cref="IGraphExecutor.RunWhileNextRecordedStepRuns"/>
         public virtual bool RunWhileNextRecordedStepRuns(Action work) => false;
 
+        /// <inheritdoc cref="IGraphExecutor.AttendsCapacityWindows"/>
+        public virtual bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
+
         // ================================================================ kernels a backend provides
 
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>

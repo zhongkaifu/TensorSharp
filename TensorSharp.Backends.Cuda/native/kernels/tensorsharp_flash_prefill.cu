@@ -27,7 +27,7 @@
 // so the committed compute_75 PTX carries working kernels.
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 7
+#define TS_FLASH_PREFILL_VERSION 8
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -57,7 +57,9 @@ extern "C" __global__ void ts_flash_prefill_caps(int* out)
 // is rounded twice before it joins the F32 accumulators. With dyn set (a recorded decode step) the window's length is
 // dyn[0], read on the device. splits > 1 (a grid too small to fill the device: a few
 // query rows over a long window): block x = (row tile, key split), each split takes a 32-key-aligned share of its
-// rows' keys and writes unnormalized partials (acc, ln-domain max, sum) that ts_flash_prefill_combine_f32 merges.
+// rows' keys and writes unnormalized partials (acc, ln-domain max, sum) that ts_flash_prefill_combine_f32 merges. A recorded
+// decode step's launch may hold more splits than it runs: those its window of 256-key buckets gives its length
+// (ts_fp_live_splits), so a window padded to the slot's capacity splits each length as the bucket window around it does.
 // With cells set (one decode row, nq = 1: a sparse attention's selection) the keys are the listed cache rows
 // cells[0 .. cellCount[0]) instead of 0..len-1, each with its mask value cellMask[cell] added (len and floor unused);
 // without cellMask (a selection whose kept cells all hold 0: QSA's) nothing is added, the same sums.
@@ -152,6 +154,31 @@ struct TsFpAttnSmem
     half v[2][TS_FP_KT * ROW];
 };
 
+// CudaFlashPrefillKernels.Splits on the device: key splits for `rows` query rows of each of nKv KV heads over `keys` keys,
+// enough blocks for about two waves of the device's sms multiprocessors, each split at least four key tiles.
+__device__ __forceinline__ int ts_fp_splits(int rows, int nKv, int keys, int sms)
+{
+    const int blocks = (rows + TS_FP_ROWS - 1) / TS_FP_ROWS * nKv;
+    int splits = 1;
+    while (blocks * splits * 2 <= 2 * sms && keys / (splits * 2) >= 4 * TS_FP_KT && splits < 64)
+        splits *= 2;
+    return splits;
+}
+
+// The splits a recorded step's launch runs (bucket > 0, dyn set): the host's rule over the window of `bucket`-key steps the
+// step's length falls in - min(windowKeys, its length rounded up to the bucket), the length dyn[0] plus lenBias (the keys a
+// verify window's later rows have past a row launched alone) - so a window as wide as the slot's capacity splits each length
+// as the bucket window around it would; the launch's own count otherwise (and never more: it covers the widest window).
+__device__ __forceinline__ int ts_fp_live_splits(int launched, const int* __restrict__ dyn, int lenBias, int windowKeys, int bucket,
+    int rows, int nKv, int sms)
+{
+    if (dyn == nullptr || bucket <= 0)
+        return launched;
+    const int len = dyn[0] + lenBias;
+    const int keys = min(windowKeys, (len + bucket - 1) / bucket * bucket);
+    return min(launched, ts_fp_splits(rows, nKv, keys, sms));
+}
+
 // WIN: the nq rows are a verify window's (q [nq][nHead][HD]), each run as the one-row launch at its position would run it:
 // a row's keys are split by its own length (the one-row launch's share), the block walks the union of its rows' key tiles
 // (each KT-aligned), and keys outside a row's own range are masked for it - they add exact zeros and leave its maximum, so a
@@ -160,7 +187,8 @@ template <int HD, bool WIN = false>
 __device__ __forceinline__ void ts_fp_attn(
     const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len,
     int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out,
-    const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask)
+    const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask,
+    int live)
 {
     // A recorded decode step reads the window's length from the step's parameter block (CudaDecodeDynParams).
     if (dyn != nullptr)
@@ -176,13 +204,18 @@ __device__ __forceinline__ void ts_fp_attn(
     const int kvh = blockIdx.y;
     const int G = nHead / nKv;
     const int R = nq * G;
+    // The grid holds `splits` splits a row tile (the partials that many apart); `live` of them run (ts_fp_live_splits), each the
+    // share a launch of `live` splits gives it, so a recorded launch over the slot's whole window runs what the bucket window's
+    // launch runs. The others leave before the first barrier, the whole block.
     const int split = (int)(blockIdx.x % splits);
     const int rowBase = (blockIdx.x / splits) * TS_FP_ROWS;
+    if (split >= live)
+        return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, qd = lane & 3;
     const int past = len - nq;   // keys before the first query row
     // A split's key range over kAll keys (the one-row launch's, kAll its row's length).
     auto range = [&](int kAll, int& lo, int& hi) {
-        const int share = ((kAll + splits - 1) / splits + TS_FP_KT - 1) / TS_FP_KT * TS_FP_KT;
+        const int share = ((kAll + live - 1) / live + TS_FP_KT - 1) / TS_FP_KT * TS_FP_KT;
         lo = max(min(kAll, split * share), min(kAll, floor / TS_FP_KT * TS_FP_KT));
         hi = min(kAll, split * share + share);
     };
@@ -388,7 +421,7 @@ __device__ __forceinline__ void ts_fp_attn(
         const int t = r / G, h = kvh * G + r % G;
         const long long base = (long long)t * nHead + h;
         const float l = half_ ? l1 : l0;
-        if (splits > 1)
+        if (live > 1)
         {
             float* p = partial + (base * splits + split) * (HD + 2);
 #pragma unroll
@@ -422,8 +455,12 @@ __device__ __forceinline__ void ts_fp_attn(
     extern "C" __global__ void __launch_bounds__(256) ts_flash_prefill_f16_d##HD( \
         const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len, \
         int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
-        const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask) \
-    { ts_fp_attn<HD>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn, cells, cellCount, cellMask); }
+        const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask, \
+        int lenBias, int windowKeys, int bucket, int sms) \
+    { \
+        ts_fp_attn<HD>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn, cells, cellCount, cellMask, \
+            ts_fp_live_splits(splits, dyn, lenBias, windowKeys, bucket, nq * (nHead / nKv), nKv, sms)); \
+    }
 
 TS_FP_ATTN(128)
 TS_FP_ATTN(256)
@@ -431,7 +468,8 @@ TS_FP_ATTN(256)
 // A verify window's rows, each run as the decode row at its position (CudaGraphExecutor's window rows): grid z is the
 // window row, which attends the window's keys less the rows - 1 - z after it (the window's length read from dyn[0] on
 // the device when the step is recorded). One launch for what were `rows` one-row launches, each row through the same
-// code as ts_flash_prefill_f16_d<hd> with nq = 1, so a row's sums are the decode row's bit for bit.
+// code as ts_flash_prefill_f16_d<hd> with nq = 1, so a row's sums are the decode row's bit for bit. Every row splits its
+// keys as the window's length's bucket says (ts_fp_live_splits over the query heads of one KV head, as a decode row).
 //   q, out  [rows][nHead][HD] F32;  partial  rows x nHead x splits x (HD + 2) floats (combined over rows * nHead).
 // With cells (a sparse attention's selection): row z's keys are cells[z * cellStride ..], cellCount[z] of them, each with
 // its value in the mask row cellMask[z * cellStride ..] added (len and floor unused; none without cellMask).
@@ -441,7 +479,7 @@ TS_FP_ATTN(256)
         const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int rows, int len, \
         int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
         const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, \
-        const float* __restrict__ cellMask, int cellStride) \
+        const float* __restrict__ cellMask, int cellStride, int windowKeys, int bucket, int sms) \
     { \
         const int z = blockIdx.z; \
         const long long at = (long long)z * nHead * HD; \
@@ -449,7 +487,8 @@ TS_FP_ATTN(256)
         ts_fp_attn<HD>(q + at, kc, vc, cap, 1, (dyn != nullptr ? dyn[0] : len) - (rows - 1 - z), floor, nHead, nKv, scale, \
             splits, partial != nullptr ? partial + (long long)z * nHead * splits * (HD + 2) : nullptr, out + at, nullptr, \
             listed ? cells + (long long)z * cellStride : nullptr, listed ? cellCount + z : nullptr, \
-            listed && cellMask != nullptr ? cellMask + (long long)z * cellStride : nullptr); \
+            listed && cellMask != nullptr ? cellMask + (long long)z * cellStride : nullptr, \
+            ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms)); \
     }
 
 TS_FP_ATTN_ROWS(128)
@@ -463,24 +502,32 @@ TS_FP_ATTN_ROWS(256)
     extern "C" __global__ void __launch_bounds__(256) ts_flash_decode_window_f16_d##HD( \
         const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int rows, int len, \
         int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
-        const int* __restrict__ dyn) \
-    { ts_fp_attn<HD, true>(q, kc, vc, cap, rows, len, floor, nHead, nKv, scale, splits, partial, out, dyn, nullptr, nullptr, nullptr); }
+        const int* __restrict__ dyn, int windowKeys, int bucket, int sms) \
+    { \
+        ts_fp_attn<HD, true>(q, kc, vc, cap, rows, len, floor, nHead, nKv, scale, splits, partial, out, dyn, nullptr, nullptr, nullptr, \
+            ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms)); \
+    }
 
 TS_FP_ATTN_WINDOW(128)
 TS_FP_ATTN_WINDOW(256)
 
-// The split partials of one (query, head): out = sum_s e^(m_s - m) acc_s / sum_s e^(m_s - m) l_s.
+// The split partials of one (query, head): out = sum_s e^(m_s - m) acc_s / sum_s e^(m_s - m) l_s, over the splits the
+// attention launch ran (ts_fp_live_splits with its arguments: `rows` its rule's rows); with one, it wrote out itself.
 // Launch: grid nq * heads, block HD.
-extern "C" __global__ void ts_flash_prefill_combine_f32(const float* __restrict__ partial, int splits, int hd, float* __restrict__ out)
+extern "C" __global__ void ts_flash_prefill_combine_f32(const float* __restrict__ partial, int splits, int hd, float* __restrict__ out,
+    const int* __restrict__ dyn, int lenBias, int windowKeys, int bucket, int rows, int nKv, int sms)
 {
+    const int live = ts_fp_live_splits(splits, dyn, lenBias, windowKeys, bucket, rows, nKv, sms);
+    if (live <= 1)
+        return;
     const long long base = blockIdx.x;
     const float* p = partial + base * splits * (hd + 2);
     float mx = -INFINITY;
-    for (int s = 0; s < splits; ++s)
+    for (int s = 0; s < live; ++s)
         mx = fmaxf(mx, p[s * (hd + 2) + hd]);
     float num = 0.0f, den = 0.0f;
     const int x = threadIdx.x;
-    for (int s = 0; s < splits; ++s)
+    for (int s = 0; s < live; ++s)
     {
         const float* ps = p + s * (hd + 2);
         const float w = mx == -INFINITY ? 0.0f : expf(ps[hd] - mx);

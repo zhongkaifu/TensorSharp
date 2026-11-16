@@ -1163,7 +1163,8 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(unified.TryForwardUnified(new[] { id }, new[] { prompt }, new[] { 0 }, logits));
             var trace = new List<float[]> { (float[])logits[0].Clone() };
             int next = ArgMax(logits[0]), length = prompt.Length;
-            // Past the 256-key window edge: two windows, each recorded.
+            // Past the 256-key window edge: one recording over the slot's capacity (two, one a window, where the step attends
+            // its 256-key bucket).
             for (int t = 0; t < 250; t++)
             {
                 Assert.True(unified.TryForwardUnified(new[] { id }, new[] { new[] { next } }, new[] { length }, logits));
@@ -1176,11 +1177,13 @@ public sealed class Qwen35RuntimeTests : IDisposable
             return trace;
         }
         List<float[]> first = Request("a");
-        Assert.True(model.ParkedRecordingCount >= 2, $"{model.ParkedRecordingCount} recordings parked after the first request");
+        int recorded = model.ParkedRecordingCount;
+        Assert.True(recorded >= 1, "no recording parked after the first request");
         int adopted = model.RecordingsAdopted, relocated = model.RecordingsRelocated;
         List<float[]> second = Request("b");
-        Assert.True(model.RecordingsAdopted - adopted >= 2, $"the second request replayed {model.RecordingsAdopted - adopted} parked recordings");
-        Assert.Equal(retain, model.RecordingsRelocated - relocated >= 2);
+        Assert.True(model.RecordingsAdopted - adopted >= recorded,
+            $"the second request replayed {model.RecordingsAdopted - adopted} of {recorded} parked recordings");
+        Assert.Equal(retain, model.RecordingsRelocated - relocated >= recorded);
         Assert.Equal(first.Count, second.Count);
         for (int i = 0; i < first.Count; i++)
             Assert.True(first[i].AsSpan().SequenceEqual(second[i]), $"row {i}: the second request's logits differ (relL2 {RelL2(second[i], first[i]):E2})");
