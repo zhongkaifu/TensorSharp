@@ -982,7 +982,11 @@ public sealed class Qwen35RuntimeTests : IDisposable
             List<float[]> rows = Script(model);
             return (rows, model.ExpertHostCountsForTests.HostRoutes, model.HostExpertCopyBytesForTests);
         }
+        long pinnedBefore = TensorSharp.Cuda.CudaHostPins.PinnedBytes;
         var mapped = Run(packed: false);
+        // The file ranges that model locked went with it: a lock outliving its mapping pins the old pages, and the next
+        // mapping at those addresses uploaded them in place of its own (later tests' first models computed garbage).
+        Assert.Equal(pinnedBefore, TensorSharp.Cuda.CudaHostPins.PinnedBytes);
         var copies = Run(packed: true);
         _output.WriteLine($"host routes: {copies.HostRoutes} from the packed copies ({copies.Packed} bytes), {mapped.HostRoutes} from the mapping");
         Assert.Equal(0, mapped.Packed);

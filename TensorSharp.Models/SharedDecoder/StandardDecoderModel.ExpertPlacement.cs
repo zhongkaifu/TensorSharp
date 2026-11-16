@@ -225,14 +225,18 @@ namespace TensorSharp.Models
 
         private void StopHostWarm()
         {
-            if (_hostWarmCancel == null) return;
-            _hostWarmCancel.Cancel();
-            try { _hostWarm?.Wait(); }
-            catch (AggregateException) { }
-            _hostWarmCancel.Dispose();
-            _hostWarmCancel = null;
-            _hostWarm = null;
-            // Unlocked before the mappings go (a registration outliving them would pin the next model's pages).
+            if (_hostWarmCancel != null)
+            {
+                _hostWarmCancel.Cancel();
+                try { _hostWarm?.Wait(); }
+                catch (AggregateException) { }
+                _hostWarmCancel.Dispose();
+                _hostWarmCancel = null;
+                _hostWarm = null;
+            }
+            // Unlocked before the mappings go, whether or not a warm ran (the locks a load without one took, or a test's):
+            // a registration outliving its mapping stays the driver's pin of the old pages, and the next mapping at those
+            // addresses then uploads them in place of its own (a later model computed from another file's weights).
             _hostPins?.Dispose();
             _hostPins = null;
         }
