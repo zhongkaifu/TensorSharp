@@ -67,8 +67,8 @@ namespace TensorSharp.Models
                 return;
             }
             CommitHostVerify(kept, rows);
-            // A window that updated the states in place restores the state before it; elsewhere the live state is that one.
-            if (kept == 0 && !WindowsInPlace(rows)) return;
+            // A window left the live states (and conv windows) as they were before it: none kept, nothing to set.
+            if (kept == 0) return;
             // One commit graph per pipeline stage and tensor-parallel rank: each binds its own device's states (a rank's
             // hold its share of the heads).
             for (int stage = 0; stage < Mesh.Stages; stage++)
@@ -107,9 +107,9 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// The commit of a <paramref name="rows"/>-row window that kept <paramref name="kept"/> rows, over the stage's (the rank's)
-        /// recurrent states: per layer the state after the kept rows (stepped again, copied, or left where the window left it)
-        /// and the conv window after them. Where the layers' shapes agree the ops are one region
+        /// The commit of a <paramref name="rows"/>-row window that kept <paramref name="kept"/> (at least one) rows, over the stage's
+        /// (the rank's) recurrent states: per layer the state after the kept rows (stepped again on the live state, or copied
+        /// from the window's) and the conv window after them. Where the layers' shapes agree the ops are one region
         /// (<see cref="GraphFusion.DeltaNetCommit"/>), which an executor may run as a few launches for every layer (direct CUDA):
         /// the ops are about fifteen nodes a layer, 1.1 ms of host time a verify step of Qwen3.8-27B's 48 recurrent layers.
         /// </summary>
@@ -183,14 +183,12 @@ namespace TensorSharp.Models
             int conv = GraphLeaf(g, state.Conv, convRows, channels);
             if (state.WindowInPlace(rows))
             {
-                // The window left the state after its last row in place: a cut one steps its kept rows again from the state
-                // before it (none kept: that state itself), into the backing as the window's result went there.
-                if (kept >= rows) return new CommitLayer(history, history, history, history, conv, -1, 0, 0);
+                // The window left the live state as it was and saved its inputs: the kept rows step again on that state, in
+                // place in the backing ([kept rows' outputs | state] ends on the state).
                 int backing = GraphLeaf(g, state.Backing, state.StateOffset + stateFloats);
-                int saved = GraphLeaf(g, state.Saved, stateFloats);
-                if (kept == 0) return new CommitLayer(saved, backing, saved, history, conv, 0, 0, state.StateOffset);
                 int inputs = GraphLeaf(g, state.SavedInputs, state.SavedInputFloats);
-                return new CommitLayer(saved, backing, inputs, history, conv, kept, 0, (state.BackingRows - kept) * state.RowFloats);
+                return new CommitLayer(backing, backing, inputs, history, conv, kept, state.StateOffset,
+                    (state.BackingRows - kept) * state.RowFloats);
             }
             // Result layout [rows' outputs | state after the last row | state 1 row before | ...].
             int verify = GraphLeaf(g, state.Verify, cap * (state.RowFloats + stateFloats));
@@ -207,15 +205,7 @@ namespace TensorSharp.Models
             long stateFloats = state.StateFloats, stateBytes = stateFloats * f;
             int convRows = state.ConvRows, channels = state.Channels;
             if (state.WindowInPlace(rows))
-            {
-                if (c.Steps > 0) EmitWindowRestep(g, state, kept, c.Target, c.Source, c.Inputs);
-                else if (c.Steps == 0)
-                {
-                    int live = g.Op(GraphOp.View, stackalloc[] { c.Target },
-                        stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, state.StateOffset * f });
-                    g.Effect(g.Op(GraphOp.Cpy, c.Source, live));
-                }
-            }
+                EmitWindowRestep(g, state, kept, c.Target, c.Inputs);
             else
             {
                 int source = g.Op(GraphOp.View, stackalloc[] { c.Source }, stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, c.From * f });
@@ -234,18 +224,18 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// The state after <paramref name="kept"/> (at least one) rows of a window that updated it in place: the recurrence over
-        /// the kept rows' saved inputs from the saved state before the window, on the decode rows' kernels (the window's
-        /// rounding), its result in place in the backing as the window's was.
+        /// The state after <paramref name="kept"/> (at least one) rows of a window that left it as it was: the recurrence over
+        /// the kept rows' saved inputs on the live state, on the decode rows' kernels (the window's rounding), its result in
+        /// place in the backing - [kept rows' outputs | state] ends on the state it read.
         /// </summary>
-        private void EmitWindowRestep(GraphProgramBuilder g, DeviceGdnState state, int kept, int backing, int saved, int inputs)
+        private void EmitWindowRestep(GraphProgramBuilder g, DeviceGdnState state, int kept, int backing, int inputs)
         {
             const long f = sizeof(float);
             int dk = _headKDim, dv = _headVDim, vHeads = state.VHeads, rows = state.BackingRows;
             int kHeads = (int)((state.Channels - (long)vHeads * dv) / (2L * dk));
             long stateFloats = state.StateFloats;
-            int before = g.Op(GraphOp.View, stackalloc[] { saved },
-                stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, stateFloats * f, 0 });
+            int before = g.Op(GraphOp.View, stackalloc[] { backing },
+                stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, stateFloats * f, state.StateOffset * f });
             // Planar regions of `rows` tokens: q | k [rows, kHeads, dk], v [rows, vHeads, dv], gates | betas [rows, vHeads].
             long qkRegion = (long)rows * kHeads * dk * f, vRegion = (long)rows * vHeads * dv * f, gRegion = (long)rows * vHeads * f;
             int Region(long width, long heads, long at) => g.Op(GraphOp.View, stackalloc[] { inputs },
@@ -268,7 +258,7 @@ namespace TensorSharp.Models
         internal int DeltaNetCommitRegionLayers { get; private set; }
 
         /// <summary>Tests: the rows the active request's first recurrent state keeps in front of its state (above one, its
-        /// verify windows update the state in place); 0 without one.</summary>
+        /// verify windows leave the state as it was and the commit steps their kept rows on it); 0 without one.</summary>
         internal int WindowStateRowsForTests
         {
             get
@@ -277,14 +267,6 @@ namespace TensorSharp.Models
                     if (state is DeviceGdnState gdn) return gdn.BackingRows;
                 return 0;
             }
-        }
-
-        /// <summary>A <paramref name="rows"/>-row window updated the active request's states in place.</summary>
-        private bool WindowsInPlace(int rows)
-        {
-            foreach (RecurrentState state in ActiveRecurrentStates())
-                if (state is DeviceGdnState gdn && gdn.WindowInPlace(rows) && gdn.Saved != null) return true;
-            return false;
         }
 
         /// <summary>A family's host-side state settled by a verify that kept <paramref name="kept"/> of its
@@ -429,8 +411,8 @@ namespace TensorSharp.Models
                 // A verify window keeps the state after each of its rows: the recurrence writes its whole
                 // result into the request's verify buffer in place, the live state stays the one before the
                 // window, and the commit copies the accepted prefix's state into place. Where the executor can, a
-                // window updates the live state in place instead, saving the state before it and its inputs: an
-                // accepted window commits nothing, a cut one steps its kept rows again.
+                // window writes only its rows' outputs and saves its inputs, the live state read and left as it
+                // was (the direct engines' verify scan): the commit steps the kept rows on it again, in place.
                 long stateBytes = stateFloats * f;
                 // The verify buffer binds before the recurrence, so an executor can write the window's result there in place.
                 int verify = -1, cap = 0;
@@ -443,20 +425,10 @@ namespace TensorSharp.Models
                 }
                 int gdn = inPlaceWindow
                     ? step.Op(GraphOp.GatedDeltaNet,
-                        stackalloc[] { q4, k4, v4, g, beta, s4, step.State(state.Saved, GraphFormat.F32, stateFloats),
-                            step.State(state.SavedInputs, GraphFormat.F32, state.SavedInputFloats) },
-                        stackalloc long[] { 1, state.BackingRows, 1 })
+                        stackalloc[] { q4, k4, v4, g, beta, s4, step.State(state.SavedInputs, GraphFormat.F32, state.SavedInputFloats) },
+                        stackalloc long[] { 0, state.BackingRows, 1 })
                     : step.Op(GraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 }, stackalloc long[] { keep ? count : 1 });
                 int scores = step.View2(gdn, v, count, v * f, 0);
-                int newState = step.Op(GraphOp.View, stackalloc[] { gdn },
-                    stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
-                if (inPlaceWindow)
-                {
-                    // [rows' outputs | state] ends on the live state.
-                    long total = v * count + stateFloats, at = (state.BackingRows - count) * state.RowFloats * f;
-                    int fallback = step.Op(GraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(backing, total, 1, total * f, at));
-                    step.Alias(gdn, backing, at, fallback);
-                }
                 if (keep)
                 {
                     if (!inPlaceWindow)
@@ -475,6 +447,8 @@ namespace TensorSharp.Models
                 }
                 else
                 {
+                    int newState = step.Op(GraphOp.View, stackalloc[] { gdn },
+                        stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
                     int copy = step.Op(GraphOp.Cpy, newState, s4);
                     if (viaBacking && count == 1)
                         // [outputs | state] of one row ends the backing: the recurrence updates the

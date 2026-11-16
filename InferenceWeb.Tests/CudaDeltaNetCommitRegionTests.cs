@@ -16,10 +16,10 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// A verify window's commit over a program's gated delta-net layers (GraphFusion.DeltaNetCommit) on the CUDA graph executor:
 /// ts_graph_gdn_commit_f32 against the region's ops (Qwen35RuntimeModel.BuildCommitProgram's: per layer the re-step of the kept
-/// rows - a GatedDeltaNet op over the saved inputs from the saved state, aliased into the backing, on the one-row kernel for
-/// one row and the rows4 kernel for more - or the state copy, and the conv window copy), each run on its own copy of the same
-/// layers' states. A window that updated its states in place is cut at every row (none kept: the saved state back; all kept:
-/// only the conv windows); one wider than the in-place rows copies the state its verify buffer kept. The backings, states and
+/// rows - a GatedDeltaNet op over the saved inputs on the live state, aliased into the backing it reads, on the one-row kernel
+/// for one row and the rows4 kernel for more - or the state copy, and the conv window copy), each run on its own copy of the
+/// same layers' states. A window that left its states as they were keeps every count of its rows (all of them stepped again
+/// when all were kept); one wider than the in-place rows copies the state its verify buffer kept. The backings, states and
 /// conv windows must be the same bytes, and the region must have served the commit.
 /// </summary>
 public sealed class CudaDeltaNetCommitRegionTests
@@ -30,12 +30,12 @@ public sealed class CudaDeltaNetCommitRegionTests
     /// the saved state and scan inputs of an in-place window, the verify buffer of a wider one and the conv history.</summary>
     private sealed class Layer : IDisposable
     {
-        public Tensor Conv, Backing, Saved, SavedInputs, Verify, ConvHistory;
+        public Tensor Conv, Backing, SavedInputs, Verify, ConvHistory;
         public int Capacity;
 
         public void Dispose()
         {
-            foreach (Tensor t in new[] { Conv, Backing, Saved, SavedInputs, Verify, ConvHistory }) t?.Dispose();
+            foreach (Tensor t in new[] { Conv, Backing, SavedInputs, Verify, ConvHistory }) t?.Dispose();
         }
     }
 
@@ -51,12 +51,12 @@ public sealed class CudaDeltaNetCommitRegionTests
     }
 
     [CudaTheory]
-    [InlineData(4, 0)]
     [InlineData(4, 1)]   // the ops' re-step runs the one-row kernel
     [InlineData(4, 2)]
     [InlineData(4, 3)]
-    [InlineData(4, 4)]   // all kept: the conv windows alone
+    [InlineData(4, 4)]   // all kept: every row stepped again
     [InlineData(8, 5)]
+    [InlineData(8, 8)]
     [InlineData(2, 1)]
     [InlineData(16, 1)]  // wider than the in-place rows: the verify buffer's state after the kept rows
     [InlineData(16, 9)]
@@ -68,7 +68,8 @@ public sealed class CudaDeltaNetCommitRegionTests
     public void CommitRegionOverMoreLayersThanALaunchTakesWritesItsOpsBytes() => AssertRegionMatchesOps(rows: 4, kept: 2, layers: 34, s: 32, vHeads: 2, kHeads: 1);
 
     /// <summary>A region the executor declines (heads of 16, not a multiple of 32) runs its ops when it closes: the writes it
-    /// held - the re-steps' aliases and the conv windows' copies - in order, the bytes of the same ops without the region.</summary>
+    /// held - the re-steps' aliases onto the states they read and the conv windows' copies - in order, the bytes of the same
+    /// ops without the region.</summary>
     [CudaFact]
     public void DeclinedCommitRegionRunsTheWritesItHeld() => AssertRegionMatchesOps(rows: 4, kept: 2, layers: 2, s: 16, vHeads: 2, kHeads: 1, served: false);
 
@@ -108,7 +109,7 @@ public sealed class CudaDeltaNetCommitRegionTests
         }
     }
 
-    private sealed record LayerValues(float[] Conv, float[] Backing, float[] Saved, float[] SavedInputs, float[] Verify, float[] History);
+    private sealed record LayerValues(float[] Conv, float[] Backing, float[] SavedInputs, float[] Verify, float[] History);
 
     private static LayerValues Values(Random rng, int rows, int s, int vHeads, int kHeads, int channels)
     {
@@ -123,7 +124,7 @@ public sealed class CudaDeltaNetCommitRegionTests
             inputs[2 * qk + v + i] = (float)(-0.05 - rng.NextDouble());            // log decay
             inputs[2 * qk + v + gates + i] = (float)(0.05 + 0.9 * rng.NextDouble()); // beta
         }
-        return new LayerValues(F((long)channels * ConvRows, 1), F(BackingRows * rowFloats + stateFloats, 0.5), F(stateFloats, 0.5), inputs,
+        return new LayerValues(F((long)channels * ConvRows, 1), F(BackingRows * rowFloats + stateFloats, 0.5), inputs,
             F(capacity * (rowFloats + stateFloats), 0.5), F((long)channels * (ConvRows + capacity), 1));
     }
 
@@ -149,7 +150,6 @@ public sealed class CudaDeltaNetCommitRegionTests
             Capacity = capacity,
             Conv = T(v.Conv, channels, ConvRows),
             Backing = T(v.Backing, v.Backing.Length),
-            Saved = T(v.Saved, v.Saved.Length),
             SavedInputs = T(v.SavedInputs, v.SavedInputs.Length),
             Verify = T(v.Verify, v.Verify.Length),
             ConvHistory = T(v.History, channels, ConvRows + capacity),
@@ -161,8 +161,8 @@ public sealed class CudaDeltaNetCommitRegionTests
 
     private static int View(GraphProgramBuilder g, int x, params long[] ip) => g.Op(GraphOp.View, stackalloc[] { x }, ip);
 
-    /// <summary>The commit as Qwen35RuntimeModel builds it on an executor whose states update in place (the backing holds the
-    /// state), with or without the region around the layers' ops.</summary>
+    /// <summary>The commit as Qwen35RuntimeModel builds it on an executor whose windows leave the states as they were (the
+    /// backing holds the state), with or without the region around the layers' ops.</summary>
     private static void Run(CudaGraphExecutor executor, Layer[] layers, int rows, int kept, int s, int vHeads, int kHeads, int channels, bool region)
     {
         const long f = sizeof(float);
@@ -175,13 +175,11 @@ public sealed class CudaDeltaNetCommitRegionTests
         {
             Layer layer = layers[l];
             int history = Leaf(g, layer.ConvHistory, ConvRows + layer.Capacity, channels), conv = Leaf(g, layer.Conv, ConvRows, channels);
-            if (inPlace && kept >= rows) leaves[l] = (history, history, history, history, conv, -1, 0, 0);
-            else if (inPlace)
+            if (inPlace)
             {
-                int backing = Leaf(g, layer.Backing, stateOffset + stateFloats), saved = Leaf(g, layer.Saved, stateFloats);
-                leaves[l] = kept == 0
-                    ? (saved, backing, saved, history, conv, 0, 0, stateOffset)
-                    : (saved, backing, Leaf(g, layer.SavedInputs, layer.SavedInputs.ElementCount()), history, conv, kept, 0, (BackingRows - kept) * rowFloats);
+                int backing = Leaf(g, layer.Backing, stateOffset + stateFloats);
+                leaves[l] = (backing, backing, Leaf(g, layer.SavedInputs, layer.SavedInputs.ElementCount()), history, conv, kept, stateOffset,
+                    (BackingRows - kept) * rowFloats);
             }
             else
             {
@@ -209,7 +207,7 @@ public sealed class CudaDeltaNetCommitRegionTests
             var c = leaves[l];
             if (inPlace && c.Steps > 0)
             {
-                int before = View(g, c.Source, 4, s, s, vHeads, 1, s * f, s * s * f, stateFloats * f, 0);
+                int before = View(g, c.Source, 4, s, s, vHeads, 1, s * f, s * s * f, stateFloats * f, c.From * f);
                 long qkRegion = (long)BackingRows * kHeads * s * f, vRegion = (long)BackingRows * vHeads * s * f, gRegion = (long)BackingRows * vHeads * f;
                 int Region(long width, long heads, long at) => View(g, c.Inputs, 4, width, heads, kept, 1, width * f, width * heads * f, width * heads * kept * f, at);
                 int q = Region(s, kHeads, 0), k = Region(s, kHeads, qkRegion), v = Region(s, vHeads, 2 * qkRegion);
@@ -231,7 +229,7 @@ public sealed class CudaDeltaNetCommitRegionTests
         if (region) g.EndFused(stackalloc[] { last });
         using IGraphPlan plan = executor.Compile(g.ToProgram(replayable: true, reorder: false));
         Assert.True(plan.Run(ReadOnlySpan<int>.Empty, ReadOnlySpan<IntPtr>.Empty, ReadOnlySpan<long>.Empty), plan.LastError);
-        if (!region && inPlace && kept > 0 && kept < rows && s % 32 == 0)
+        if (!region && inPlace && kept > 0 && s % 32 == 0)
             Assert.True(executor.AliasesInPlace >= n, $"the ops' re-steps did not write the backings in place ({executor.AliasesInPlace})");
     }
 }

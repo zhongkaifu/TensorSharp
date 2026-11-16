@@ -286,18 +286,16 @@ namespace TensorSharp.Models
             public Tensor ConvHistory { get; private set; }
             public int SnapshotCapacity { get; private set; }
 
-            /// <summary>Where a window of up to <see cref="BackingRows"/> rows updates the state in place: the state before
-            /// it ([vHeads, dv, dk]) and its scan inputs (the planar regions of <see cref="SavedInputFloats"/>), from which
-            /// the commit re-steps a cut window's kept rows.</summary>
-            public Tensor Saved { get; private set; }
+            /// <summary>Where a window of up to <see cref="BackingRows"/> rows leaves the state as it was: its scan inputs (the
+            /// planar regions of <see cref="SavedInputFloats"/>), from which the commit steps the kept rows on the state.</summary>
             public Tensor SavedInputs { get; private set; }
 
-            /// <summary>A <paramref name="rows"/>-row verify window updates the state in place (else it keeps a state after
-            /// each row in <see cref="Verify"/>).</summary>
+            /// <summary>A <paramref name="rows"/>-row verify window leaves the live state as it was and saves its inputs, the
+            /// commit stepping the kept rows on it in place (else it keeps a state after each row in <see cref="Verify"/>).</summary>
             public bool WindowInPlace(int rows) => BackingRows > 1 && rows <= BackingRows;
 
             /// <summary>What a commit after a <paramref name="rows"/>-row window reads (null: no window ran on this state).</summary>
-            public Tensor CommitSource(int rows) => ConvHistory == null ? null : WindowInPlace(rows) ? Saved : Verify;
+            public Tensor CommitSource(int rows) => ConvHistory == null ? null : WindowInPlace(rows) ? SavedInputs : Verify;
 
             /// <summary>Floats of a window's saved scan inputs: q and k [rows, kHeads, dk], v [rows, vHeads, dv], the gates
             /// and the betas [rows, vHeads], each a region of <see cref="BackingRows"/> rows (the conv channels are q|k|v).</summary>
@@ -308,14 +306,12 @@ namespace TensorSharp.Models
             /// memory on the fourth request).</summary>
             protected internal override void ReleaseSpecBuffers()
             {
-                if (Verify != null || ConvHistory != null || Saved != null) NoteBindingsChanged();
+                if (Verify != null || ConvHistory != null || SavedInputs != null) NoteBindingsChanged();
                 Free(Verify);
                 Free(ConvHistory);
-                Free(Saved);
                 Free(SavedInputs);
                 Verify = null;
                 ConvHistory = null;
-                Saved = null;
                 SavedInputs = null;
                 SnapshotCapacity = 0;
             }
@@ -323,7 +319,7 @@ namespace TensorSharp.Models
             protected internal override long StateBytes
                 => Conv.Storage.ByteLength + Backing.Storage.ByteLength
                    + (Verify?.Storage.ByteLength ?? 0) + (ConvHistory?.Storage.ByteLength ?? 0)
-                   + (Saved?.Storage.ByteLength ?? 0) + (SavedInputs?.Storage.ByteLength ?? 0);
+                   + (SavedInputs?.Storage.ByteLength ?? 0);
 
             /// <summary>Room for a <paramref name="rows"/>-row verify; true when the buffers moved.</summary>
             public virtual bool EnsureSpecBuffers(int rows)
@@ -342,9 +338,8 @@ namespace TensorSharp.Models
                 }
                 if (WindowInPlace(rows))
                 {
-                    if (Saved == null)
+                    if (SavedInputs == null)
                     {
-                        Saved = new Tensor(_allocator, DType.Float32, StateFloats);
                         SavedInputs = new Tensor(_allocator, DType.Float32, SavedInputFloats);
                         moved = true;
                     }
@@ -576,7 +571,6 @@ namespace TensorSharp.Models
                 Free(Backing);
                 Free(Verify);
                 Free(ConvHistory);
-                Free(Saved);
                 Free(SavedInputs);
             }
         }

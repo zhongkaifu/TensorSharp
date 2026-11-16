@@ -17,9 +17,9 @@ namespace TensorSharp.Graph
         /// <summary>An op may write its result in place inside a state leaf (<see cref="GraphNodeKind.Alias"/>).</summary>
         public bool InPlaceStateAlias { get; init; }
 
-        /// <summary>A verify window's recurrence updates the live state in place, saving the state before it and its scan
-        /// inputs (a gated delta rule with destination leaves 6 and 7): a fully accepted window commits nothing, a cut one
-        /// re-steps its kept rows from the saved state. Elsewhere the window keeps a state after every row.</summary>
+        /// <summary>A verify window's recurrence writes only its rows' outputs and saves its scan inputs (a gated delta rule
+        /// with destination leaf 6), the live state read and left as it was: the commit steps the kept rows on it again, in
+        /// place (the direct engines' verify scan and replay). Elsewhere the window keeps a state after every row.</summary>
         public bool WindowStateInPlace { get; init; }
         /// <summary>Reordering independent work pays off (and is safe) on this device.</summary>
         public bool ConcurrencyReorder { get; init; }

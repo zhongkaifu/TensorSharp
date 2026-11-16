@@ -1023,8 +1023,8 @@ namespace TensorSharp.Cuda
 
         /// <summary>
         /// A verify window's commit over a program's gated delta-net layers (<see cref="GraphFusion.DeltaNetCommit"/>) in one launch
-        /// per 32 layers (ts_graph_gdn_commit_f32, every layer's pointers by value): a cut window's kept rows stepped again from
-        /// the saved state on the rows4 kernel's body - the arithmetic the ops' re-step runs on the one-row and rows4 kernels, so
+        /// per 32 layers (ts_graph_gdn_commit_f32, every layer's pointers by value): a window's kept rows stepped again from
+        /// the state before it (the live state, in place, where the window left it alone) on the rows4 kernel's body - the arithmetic the ops' re-step runs on the one-row and rows4 kernels, so
         /// the states are their bytes - a state copied where none is stepped, and every conv window from its history. The ops
         /// were about fifteen graph nodes a layer: 1.1-1.2 ms of host time a verify step of Qwen3.8-27B's 48 layers, where the
         /// kernels take a few microseconds. Declined (the ops run) unless every operand is an F32 device tensor of the sizes the
@@ -1060,12 +1060,16 @@ namespace TensorSharp.Cuda
                 read.Add(history);
                 written.Add(conv);
                 if (steps < 0) continue;
-                // The kernel reads the source state and the saved inputs while it writes the target.
+                // The kernel reads the source state and the saved inputs while it writes the target: separate memory, or a
+                // re-step on the live state in place - the target's state part the source's state (each warp reads its state
+                // rows before it writes them, as the ops' re-step on the decode rows' kernels does).
+                bool inPlace = ReferenceEquals(source.Storage, target.Storage) && steps > 0
+                    && source.StorageOffset + from == target.StorageOffset + to + steps * rowFloats;
                 if (steps > saveRows || from < 0 || to < 0 || source.ElementCount() < from + stateFloats
-                    || target.ElementCount() < to + steps * rowFloats + stateFloats || ReferenceEquals(source.Storage, target.Storage)
+                    || target.ElementCount() < to + steps * rowFloats + stateFloats || (ReferenceEquals(source.Storage, target.Storage) && !inPlace)
                     || (steps > 0 && (saved.ElementCount() < savedFloats || ReferenceEquals(saved.Storage, target.Storage))))
                     return false;
-                read.Add(source);
+                if (!inPlace) read.Add(source);
                 if (steps > 0) read.Add(saved);
                 written.Add(target);
             }
@@ -1671,32 +1675,33 @@ namespace TensorSharp.Cuda
         /// <summary>The gated delta rule; <paramref name="rowKernels"/> keeps a chunk of rows off the chunked prompt kernel
         /// (a window's re-step then rounds as its rows did).</summary>
         protected override Tensor GatedDeltaNet(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots, bool rowKernels)
-            => DeviceGatedDeltaNet(q, k, v, g, beta, state, snapshots, rowKernels, null, null, 0)
+            => DeviceGatedDeltaNet(q, k, v, g, beta, state, snapshots, rowKernels, null, 0)
                ?? base.GatedDeltaNet(q, k, v, g, beta, state, snapshots);
 
-        /// <summary>A verify window's recurrence saving the state before it and its scan inputs as the rows run (the kernels
-        /// write both as they read them), its result in place over the state where its alias names the state's buffer.</summary>
-        protected override Tensor GatedDeltaNetSaving(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots,
-            Tensor saved, Tensor inputs, int inputRows)
-            => DeviceGatedDeltaNet(q, k, v, g, beta, state, snapshots, true, saved, inputs, inputRows)
-               ?? base.GatedDeltaNetSaving(q, k, v, g, beta, state, snapshots, saved, inputs, inputRows);
+        /// <summary>A verify window's recurrence: its rows' outputs on the decode rows' kernels, saving its scan inputs as the
+        /// rows run (the kernels write them as they read them), and no state written - the live state stays the one before
+        /// the window, read once (it had been saved, then overwritten by the window's last state: three passes over every
+        /// layer's state, 37.6 against the direct engine's 17 us a layer of a Qwen3.8-27B 8-row window).</summary>
+        protected override Tensor GatedDeltaNetWindow(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, Tensor inputs,
+            int inputRows)
+            => DeviceGatedDeltaNet(q, k, v, g, beta, state, 0, true, inputs, inputRows)
+               ?? base.GatedDeltaNetWindow(q, k, v, g, beta, state, inputs, inputRows);
 
+        /// <param name="snapshots">0: the rows' outputs alone (a verify window saving its inputs), no state written.</param>
         private Tensor DeviceGatedDeltaNet(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots, bool rowKernels,
-            Tensor saved, Tensor saveInputs, int inputRows)
+            Tensor saveInputs, int inputRows)
         {
             long[] nq = Ne(q), nv = Ne(v), ng = Ne(g);
             int s = (int)nv[0], heads = (int)nv[1], tokens = (int)nv[2], sequences = (int)nv[3], keyHeads = (int)nq[1];
-            int slots = Math.Max(1, snapshots);
+            int slots = saveInputs != null ? 0 : Math.Max(1, snapshots);
             bool kda = ng[0] == s && s > 1;
             CudaGraphKernels kernels = s % 32 == 0 && s <= 256 && nq[0] == s && heads % keyHeads == 0 ? Kernels : null;
             Tensor[] inputs = { q, k, v, g, beta, state };
             if (kernels == null || Array.Exists(inputs, t => t.Storage is not CudaStorage || !t.IsContiguous() || t.ElementType != DType.Float32))
                 return null;
             var cuda = (CudaAllocator)Allocator;
-            bool saving = saved != null;
-            if (saving && (sequences != 1 || tokens > inputRows
-                || saved.Storage is not CudaStorage sv || sv.DeviceId != cuda.DeviceId || !saved.IsContiguous()
-                || saved.ElementType != DType.Float32 || saved.ElementCount() < (long)heads * s * s
+            bool saving = saveInputs != null;
+            if (saving && (sequences != 1 || tokens > inputRows || tokens < 2
                 || saveInputs.Storage is not CudaStorage si || si.DeviceId != cuda.DeviceId || !saveInputs.IsContiguous()
                 || saveInputs.ElementType != DType.Float32
                 || saveInputs.ElementCount() < CudaGraphKernels.GatedDeltaNetInputFloats(inputRows, s, heads, keyHeads, kda)))
@@ -1712,9 +1717,9 @@ namespace TensorSharp.Cuda
                 && state.StorageOffset == rowFloats && held.ElementCount == total && held.DeviceId == cuda.DeviceId;
             // A verify window's result goes where its alias names (the request's verify buffer): the window had copied its
             // rows and its state after every row there, 12.7 MB a layer of a 4-row window of Qwen3.8 Flash Next (1.05 ms).
-            // A window whose live state stays in place (one slot, one sequence) runs over the state where the alias puts the
-            // result's state part: each warp reads its state rows before it writes them.
-            Tensor into = inPlace ? null : AliasDestination(total);
+            // A commit's re-step of a window's kept rows on the live state (one slot, one sequence) runs over the state where
+            // the alias puts the result's state part: each warp reads its state rows before it writes them.
+            Tensor into = inPlace || slots == 0 ? null : AliasDestination(total);
             if (into != null && (into.Storage is not CudaStorage target || target.DeviceId != cuda.DeviceId
                 || Array.Exists(inputs, t => ReferenceEquals(t.Storage, into.Storage)
                     && !(ReferenceEquals(t, state) && slots == 1 && sequences == 1 && t.StorageOffset == into.StorageOffset + rowFloats))))
@@ -1732,12 +1737,8 @@ namespace TensorSharp.Cuda
             cuda.Context.MakeCurrent();
             // A prompt chunk of 128-wide heads with one state slot runs in chunks of 16 rows on the tensor cores (the WY
             // form; 2.9 ms a layer for 3.6K rows on the rows4 kernel, Qwen3.8-27B on an RTX PRO 4500).
-            IntPtr savedAt = saving ? P(saved) : IntPtr.Zero, inputsAt = saving ? P(saveInputs) : IntPtr.Zero;
-            if (saving)
-            {
-                ((CudaStorage)saved.Storage).EnsureDeviceCurrent();
-                ((CudaStorage)saveInputs.Storage).EnsureDeviceCurrent();
-            }
+            IntPtr inputsAt = saving ? P(saveInputs) : IntPtr.Zero;
+            if (saving) ((CudaStorage)saveInputs.Storage).EnsureDeviceCurrent();
             if (!rowKernels && tokens > 1 && slots == 1 && !kda && s == CudaSsmPrefillKernels.GdnHeadDim
                 && cuda.SsmPrefillKernels is { RunsGatedDeltaNetChunks: true } ssm)
                 ssm.LaunchGatedDeltaNetChunks(P(q), P(k), P(v), P(g), P(beta), P(state), output.DevicePtrAtElement(result.StorageOffset + rowFloats),
@@ -1745,16 +1746,12 @@ namespace TensorSharp.Cuda
             // A chunk of rows reads each token's q and k once per four state rows; a decode row keeps the one-row kernel.
             else if (tokens > 1)
                 kernels.LaunchGatedDeltaNetRows4(P(q), P(k), P(v), P(g), P(beta), P(state), P(result),
-                    s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle, savedAt, inputsAt, inputRows);
+                    s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle, IntPtr.Zero, inputsAt, inputRows);
             else
                 kernels.LaunchGatedDeltaNet(P(q), P(k), P(v), P(g), P(beta), P(state), P(result),
-                    s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle, savedAt, inputsAt, inputRows);
+                    s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle, IntPtr.Zero, inputsAt, inputRows);
             output.MarkDeviceModified();
-            if (saving)
-            {
-                ((CudaStorage)saved.Storage).MarkDeviceModified();
-                ((CudaStorage)saveInputs.Storage).MarkDeviceModified();
-            }
+            if (saving) ((CudaStorage)saveInputs.Storage).MarkDeviceModified();
             return result;
         }
 

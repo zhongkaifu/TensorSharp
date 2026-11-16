@@ -249,20 +249,20 @@ namespace TensorSharp.Graph
             => GatedDeltaNet(q, k, v, g, beta, state, snapshots);
 
         /// <summary>
-        /// A verify window's recurrence (one sequence, <see cref="GraphCapabilities.WindowStateInPlace"/>): the state before
-        /// the rows into <paramref name="saved"/> ([heads, S, S]), the result as <see cref="GatedDeltaNet"/>'s, and the rows'
-        /// q, k, v, gates and betas into <paramref name="inputs"/> in planar regions of <paramref name="inputRows"/> tokens
-        /// (q and k [rows, keyHeads, S], v [rows, heads, S], the gates [rows, heads, S or 1], the betas [rows, heads]).
+        /// A verify window's recurrence (one sequence, <see cref="GraphCapabilities.WindowStateInPlace"/>): the rows' outputs
+        /// ([rows, heads, S], the leading part of <see cref="GatedDeltaNet"/>'s result) on the decode rows' kernels, the state
+        /// left as it was, and the rows' q, k, v, gates and betas into <paramref name="inputs"/> in planar regions of
+        /// <paramref name="inputRows"/> tokens (q and k [rows, keyHeads, S], v [rows, heads, S], the gates [rows, heads, S or
+        /// 1], the betas [rows, heads]), from which the commit steps the kept rows on the state.
         /// </summary>
-        protected virtual Tensor GatedDeltaNetSaving(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots,
-            Tensor saved, Tensor inputs, int inputRows)
+        protected virtual Tensor GatedDeltaNetWindow(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, Tensor inputs,
+            int inputRows)
         {
-            using (Tensor sv = saved.View(state.ElementCount()))
-            using (Tensor st = state.View(state.ElementCount()))
-                CopyInto(sv, st);
-            Tensor result = GatedDeltaNet(q, k, v, g, beta, state, snapshots, rowKernels: true);
             long[] nq = Ne(q), nv = Ne(v), ng = Ne(g);
             long s = nv[0], heads = nv[1], tokens = nv[2], keyHeads = nq[1], gate = ng[0];
+            Tensor result;
+            using (Tensor full = GatedDeltaNet(q, k, v, g, beta, state, 1, rowKernels: true))
+                result = full.Narrow(0, 0, tokens * heads * s);
             long at = 0;
             foreach ((Tensor part, long rowFloats) in new[] { (q, keyHeads * s), (k, keyHeads * s), (v, heads * s), (g, heads * gate), (beta, heads) })
             {
@@ -1688,10 +1688,11 @@ namespace TensorSharp.Graph
                 {
                     Tensor q = Contig(T(0), run), k = Contig(T(1), run), v = Contig(T(2), run);
                     Tensor g = Contig(T(3), run), b = Contig(T(4), run), s = Contig(T(5), run);
-                    // ip: [snapshots, rows the saved inputs hold (with destination leaves 6 and 7), the decode row kernels]
-                    if (n.Srcs.Length >= 8)
-                        return V(GatedDeltaNetSaving(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run),
-                            (int)Ip(0, 1), T(6), T(7), (int)Ip(1, 0)));
+                    // ip: [snapshots, rows the saved inputs hold (with destination leaf 6: a verify window's outputs alone), the
+                    // decode row kernels]
+                    if (n.Srcs.Length >= 7)
+                        return V(GatedDeltaNetWindow(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run),
+                            T(6), (int)Ip(1, 0)));
                     return V(GatedDeltaNet(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run), (int)Ip(0, 1),
                         Ip(2, 0) != 0));
                 }

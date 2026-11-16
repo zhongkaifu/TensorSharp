@@ -282,7 +282,8 @@ extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
 //   steps == 0: the state at `state` copied to out;
 //   steps < 0:  the state stays;
 // and every layer's conv window conv_to [channels][conv_rows] takes conv_from[c * conv_pitch + j] (the history's columns
-// after the kept rows). Sources and destinations are separate memory. Launch: grid (h, ceil(S / 16), layers), block 128.
+// after the kept rows). Sources and destinations are separate memory, or a re-step on the state in place (out's state
+// part the state: each warp reads its state rows before it writes them). Launch: grid (h, ceil(S / 16), layers), block 128.
 #define TS_GRAPH_GDN_COMMIT_LAYERS 32
 
 struct ts_graph_gdn_commit

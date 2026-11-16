@@ -1040,9 +1040,10 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData(BackendType.Cuda)]
     public void AdvancedWindowsRetraceAfterTheirVerifyBuffersAreFreedOnDirectCuda(BackendType backend) => AssertWindowsRetraceAfterRelease(backend);
 
-    /// <summary>A verify window's recurrence on direct CUDA writes its rows and its state after every row straight into the
-    /// request's verify buffer (the alias's destination), where each window had copied them (12.7 MB a layer of a 4-row
-    /// window of Qwen3.8 Flash Next): the same kernel into other memory, so every window's logits are the same bits.</summary>
+    /// <summary>A verify window that keeps a state after every row (the windows of an executor without in-place windows, here
+    /// direct CUDA with them off) writes its rows and states straight into the request's verify buffer (the alias's
+    /// destination), where each window had copied them (12.7 MB a layer of a 4-row window of Qwen3.8 Flash Next): the same
+    /// kernel into other memory, so every window's logits are the same bits.</summary>
     [CudaFact]
     public void VerifyWindowRecurrenceWritesItsVerifyBufferInPlaceOnDirectCuda()
     {
@@ -1050,7 +1051,11 @@ public sealed class Qwen35RuntimeTests : IDisposable
         string path = Fixture("dense");
         (List<float[]> Logits, long InPlace, long Copies) Run(bool inPlace)
         {
-            using var model = Create(path, backend: BackendType.Cuda);
+            Qwen35RuntimeModel.WindowStatesInPlaceOffForTests = true;
+            Qwen35RuntimeModel created;
+            try { created = Create(path, backend: BackendType.Cuda); }
+            finally { Qwen35RuntimeModel.WindowStatesInPlaceOffForTests = false; }
+            using var model = created;
             var executor = (TensorSharp.Graph.TensorGraphExecutor)model.GraphExecutorForTests;
             executor.AliasDestinationsDisabledForTests = !inPlace;
             var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
@@ -1076,11 +1081,11 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(placed.Logits[w].AsSpan().SequenceEqual(copied.Logits[w]), $"window {w} differs with its result written in place");
     }
 
-    /// <summary>A verify window on direct CUDA updates the live recurrent state in place, saving the state before it and
-    /// its scan inputs (each window had kept a state after every row, 2 MB a row and layer on Qwen3.8 Flash Next): a fully
-    /// accepted window commits nothing, a cut one steps its kept rows again from the saved state on the window's kernels,
-    /// and a restored one takes the saved state back. Windows cut at every row, accepted whole and restored give the
-    /// logits of windows that kept a state per row, bit for bit, and so does the decode after them.</summary>
+    /// <summary>A verify window on direct CUDA writes its rows' outputs alone and saves its scan inputs, the live recurrent
+    /// state left as it was (each window had kept a state after every row, 2 MB a row and layer on Qwen3.8 Flash Next): the
+    /// commit steps the kept rows on the state again, in place, on the window's kernels, and a restored window leaves the
+    /// state alone. Windows cut at every row, accepted whole and restored give the logits of windows that kept a state per
+    /// row, bit for bit, and so does the decode after them.</summary>
     [CudaTheory]
     [InlineData("dense")]
     [InlineData("dense-gqa")]
