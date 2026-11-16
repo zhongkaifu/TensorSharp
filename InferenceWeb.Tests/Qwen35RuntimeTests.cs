@@ -1566,7 +1566,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
         List<float[]> first = Request("a");
         Assert.True(model.RetainSequenceCacheAs("a", "kept"));
-        model.SlotFreeBytesForTests = () => 0;
+        model.SlotDeviceMemoryForTests = _ => (0, 1L << 34);
         int adopted = model.RecordingsAdopted;
         List<float[]> second = Request("b");
         Assert.Equal(1, model.RetainedSlotsReclaimed);
@@ -1612,6 +1612,75 @@ public sealed class Qwen35RuntimeTests : IDisposable
     /// <summary>A request that decodes in verify windows (speculative decoding) makes spare slots on direct CUDA, as plain
     /// decode steps do, while its recorded windows run (two: a checkpoint's and a retained copy's); a retained copy takes one
     /// without allocating, and the next windows make it again.</summary>
+    /// <summary>A slot split over a mesh's devices (here two whole-layer stages) is fitted to each device by its own share:
+    /// either device short of its share beside its headroom refuses another slot; the first device's room alone does not
+    /// stand for the other's.</summary>
+    [Fact]
+    public void SlotRoomIsJudgedOnEveryDeviceOfALayerSplit()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), stages: 2);
+        var unified = (IUnifiedBatchModel)model;
+        unified.EnsureSequenceSlot("a", 64);
+        var shares = model.SlotSharesForTests;
+        Assert.Equal(new[] { (0, 0), (1, 0) }, shares.Select(s => (s.Stage, s.Rank)).ToArray());
+        Assert.All(shares, s => Assert.True(s.PerToken > 0, "a stage holds no cache"));
+        const int capacity = 1024;
+        const long total = 1L << 34, headroom = 1L << 30;   // DeviceHeadroom: the larger of 1 GB and 1/32 of the device
+        long Need(int device) => shares[device].PerToken * capacity + shares[device].States + (256L << 20) + headroom;
+        long Plenty = long.MaxValue / 4;
+        model.SlotDeviceMemoryForTests = d => (d == 1 ? Need(1) : Plenty, total);
+        Assert.True(model.RoomForSlotsForTests(capacity, 1));
+        model.SlotDeviceMemoryForTests = d => (d == 1 ? Need(1) - 1 : Plenty, total);
+        Assert.False(model.RoomForSlotsForTests(capacity, 1));
+        model.SlotDeviceMemoryForTests = d => (d == 0 ? Need(0) - 1 : Plenty, total);
+        Assert.False(model.RoomForSlotsForTests(capacity, 1));
+        // Each device is asked for its own share only: both hold exactly theirs.
+        model.SlotDeviceMemoryForTests = d => (Need(d), total);
+        Assert.True(model.RoomForSlotsForTests(capacity, 1));
+        Assert.False(model.RoomForSlotsForTests(capacity, 2));
+    }
+
+    /// <summary>A conversation's next turn adopts its retained slot (exactly its rows) and reserves past it: the rows move into
+    /// a pooled slot that holds the reservation instead of the slot growing, and the turn continues as it did grown.</summary>
+    [Fact]
+    public void AnAdoptedSlotTooSmallForItsReservationMovesIntoAPooledSlot() => AssertAdoptedSlotMoves(BackendType.Cpu);
+
+    [CudaFact]
+    public void AnAdoptedSlotTooSmallForItsReservationMovesIntoAPooledSlotOnDirectCuda() => AssertAdoptedSlotMoves(BackendType.Cuda);
+
+    private void AssertAdoptedSlotMoves(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        int[] prompt = Enumerable.Range(0, 200).Select(i => 40 + i % 9).ToArray();
+        float[] Continue(bool move, out int moves)
+        {
+            using var model = Create(Fixture("dense"), backend: backend);
+            model.PooledSlotMoveDisabledForTests = !move;
+            var unified = (IUnifiedBatchModel)model;
+            var logits = new float[1][];
+            // The conversation's first turn, retained as it ended.
+            unified.EnsureSequenceSlot("turn1", 300);
+            Assert.True(unified.TryForwardUnified(new[] { "turn1" }, new[] { prompt }, new[] { 0 }, logits));
+            Assert.True(model.RetainSequenceCacheAs("turn1", "conversation"));
+            // Another request, run on a large slot, leaves it in the pool.
+            unified.EnsureSequenceSlot("big", 3000);
+            Assert.True(unified.TryForwardUnified(new[] { "big" }, new[] { new[] { 7 } }, new[] { 0 }, logits));
+            model.OnSequenceReleased("big");
+            // The conversation's next turn adopts the retained slot.
+            Assert.True(model.TryRebindRetainedCache("conversation", "turn2"));
+            Assert.Equal(prompt.Length, unified.EnsureSequenceSlot("turn2", 1500));   // past a new slot (512 cells, 1,024 on CUDA)
+            Assert.True(unified.TryForwardUnified(new[] { "turn2" }, new[] { new[] { 11, 12 } }, new[] { prompt.Length }, logits));
+            moves = model.PooledSlotMoves;
+            return (float[])logits[0].Clone();
+        }
+        float[] moved = Continue(move: true, out int movedCount);
+        float[] grown = Continue(move: false, out int grownCount);
+        Assert.Equal(1, movedCount);
+        Assert.Equal(0, grownCount);
+        Assert.True(moved.AsSpan().SequenceEqual(grown), "the moved slot answers otherwise than the grown one");
+    }
+
     [CudaFact]
     public void VerifyWindowsMakeSpareSlotsBesideRecordedStepsOnDirectCuda()
     {

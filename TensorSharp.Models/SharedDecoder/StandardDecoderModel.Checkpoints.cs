@@ -144,12 +144,14 @@ namespace TensorSharp.Models
             || GraphExecutor is { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } };
 
         /// <summary>A deep copy of <paramref name="source"/> sized for <paramref name="capacityTokens"/>.</summary>
-        private Slot CopySlot(Slot source, int capacityTokens)
+        /// <param name="runSlotFirst">A request will run on the copy: a pooled slot a request ran on (its recordings adopted
+        /// where they are) before a spare.</param>
+        private Slot CopySlot(Slot source, int capacityTokens, bool runSlotFirst = false)
         {
             int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, capacityTokens));
             // A pooled slot's caches and states are overwritten whole and keep their device copies (cached graphs
             // bind them), so the host route writes them in place.
-            Slot slot = TakePooledSlot(capacity, mustFit: true, spare: true);
+            Slot slot = TakePooledSlot(capacity, mustFit: true, spare: !runSlotFirst);
             bool inPlace = slot != null;
             if (slot == null)
             {

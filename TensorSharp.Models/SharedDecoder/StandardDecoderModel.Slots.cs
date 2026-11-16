@@ -60,7 +60,15 @@ namespace TensorSharp.Models
 
         // Parked slots keep their whole allocation; a few cover a burst of short requests.
         private const int SlotPoolMax = 4;
-        private const int FreshSlotTokens = 512;
+
+        /// <summary>
+        /// The fewest cells a new slot (and a copy into one) holds: 512, and a whole <see cref="ReservationStepTokens"/> where
+        /// recorded steps bind their slots (the CUDA executor). There a slot that grows records its steps again, and a chat's
+        /// next turn - its history and its answer's reservation - outgrew a 512-cell slot: four Qwen3.8-27B conversations at
+        /// once on an RTX PRO 4000 grew every second turn's slot (545-728 cells reserved), 13-30 ms of its first token, where
+        /// the direct engine's slots never grew.
+        /// </summary>
+        private int FreshSlotTokens => GraphExecutor?.Capabilities.SlotBoundRecordings == true ? ReservationStepTokens : 512;
 
         /// <summary>Cells a grown slot keeps past what it needs (see <see cref="EnsureSlotCapacity"/>).</summary>
         private const int SlotGrowthHeadroomTokens = 4096;
@@ -223,24 +231,40 @@ namespace TensorSharp.Models
         // A slot's cache bytes per token and its states' bytes, measured on the first slot (-1 until then).
         private long _slotBytesPerToken = -1, _slotStateBytes = -1;
 
+        // Each device's share of a slot (its caches' bytes per token and its states' bytes), by its place in the mesh: a layer
+        // split's stage or a tensor-parallel rank holds its layers' or heads' part; one device holds all of it.
+        private (int Stage, int Rank, long PerToken, long States)[] _slotShares;
+
         /// <summary>Beside a slot's caches and states: its drafter buffers and its share of the graphs' memory (the margin
         /// Qwen4ExpModel keeps for a holder on Metal).</summary>
         private const long SlotExtraBytes = 256L << 20;
 
         private void MeasureSlotBytes(Slot slot)
         {
-            long cache = 0;
-            foreach (Tensor t in AllCacheTensors(slot.K).Concat(AllCacheTensors(slot.V))) cache += t.Storage.ByteLength;
-            long states = 0;
+            var shares = new SortedDictionary<(int Stage, int Rank), (long Cache, long States)>();
+            void Add(int stage, int rank, long cache, long states)
+            {
+                shares.TryGetValue((stage, rank), out var share);
+                shares[(stage, rank)] = (share.Cache + cache, share.States + states);
+            }
+            for (int e = 0; e < CacheEntries; e++)
+                for (int r = 0; r < _mesh.TensorParallel; r++)
+                {
+                    long bytes = (slot.K?[e] is { } k && r < k.Length && k[r] != null ? k[r].Storage.ByteLength : 0)
+                        + (slot.V?[e] is { } v && r < v.Length && v[r] != null ? v[r].Storage.ByteLength : 0);
+                    if (bytes > 0) Add(CacheStage(e), r, bytes, 0);
+                }
             if (slot.Recurrent != null)
-                foreach (RecurrentState[] layer in slot.Recurrent)
-                    if (layer != null)
-                        foreach (RecurrentState state in layer)
-                            if (state != null)
-                                states += state.StateBytes > 0 ? state.StateBytes
-                                    : state.CheckpointTensors.Sum(t => t.ElementCount() * t.ElementType.Size());
-            _slotBytesPerToken = cache / Math.Max(1, slot.Capacity);
-            _slotStateBytes = states;
+                for (int l = 0; l < slot.Recurrent.Length; l++)
+                    if (slot.Recurrent[l] is { } layer)
+                        for (int r = 0; r < layer.Length; r++)
+                            if (layer[r] is { } state)
+                                Add(_mesh.StageOf(l), r, 0, state.StateBytes > 0 ? state.StateBytes
+                                    : state.CheckpointTensors.Sum(t => t.ElementCount() * t.ElementType.Size()));
+            int capacity = Math.Max(1, slot.Capacity);
+            _slotShares = shares.Select(kv => (kv.Key.Stage, kv.Key.Rank, kv.Value.Cache / capacity, kv.Value.States)).ToArray();
+            _slotBytesPerToken = shares.Values.Sum(v => v.Cache) / capacity;
+            _slotStateBytes = shares.Values.Sum(v => v.States);
         }
 
         /// <summary>Device bytes a slot of <paramref name="capacity"/> tokens takes, with its margin; -1 before the first

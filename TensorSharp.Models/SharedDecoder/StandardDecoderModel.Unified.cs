@@ -145,10 +145,38 @@ namespace TensorSharp.Models
                 EnsureDeviceRoomForSlot(requestId, Math.Max(reserve, FreshSlotTokens));
                 _slots[requestId] = slot = ReclaimRetainedSlot(reserve) ?? NewSlot(reserve);
             }
-            if (reserve > slot.Capacity)
+            if (reserve > slot.Capacity && !TryMoveToPooledSlot(requestId, ref slot, reserve))
                 EnsureSlotCapacity(slot, reserve, reservation: true);
             return slot.Length;
         }
+
+        /// <summary>
+        /// A request whose slot holds rows (the prefix it adopted: a retained conversation's slot, exactly its length) but not
+        /// its reservation takes a pooled slot that holds the reservation, the rows copied there on the device and the pooled
+        /// slot's recordings adopted where they are; its own slot goes back to the pool. Grown in place instead, the slot got new
+        /// caches, a copy and lost its recordings: four Qwen3.8-27B conversations at once on an RTX PRO 4000 each grew their
+        /// second turn's slot from 512 to 1,024 cells, 15-30 ms of its first token (the direct engine's slots never grew).
+        /// False where no pooled slot holds the reservation (the slot then grows).
+        /// </summary>
+        private bool TryMoveToPooledSlot(string requestId, ref Slot slot, int reserve)
+        {
+            if (slot.Length <= 0 || _slotPool == null || PooledSlotMoveDisabledForTests) return false;
+            int capacity = (int)Math.Min(_maxContextLength, (reserve + (long)ReservationStepTokens - 1) / ReservationStepTokens * ReservationStepTokens);
+            if (!_slotPool.Exists(p => p.Capacity >= capacity)) return false;
+            Slot moved = CopySlot(slot, capacity, runSlotFirst: true);
+            DropReplaysOf(slot.K, slot.Recurrent);
+            _slots[requestId] = moved;
+            RecycleSlot(slot);
+            slot = moved;
+            PooledSlotMoves++;
+            return true;
+        }
+
+        /// <summary>Requests moved into a pooled slot instead of growing theirs (tests check the route engaged).</summary>
+        internal int PooledSlotMoves { get; private set; }
+
+        /// <summary>Tests: a request's slot grows in place as before.</summary>
+        internal bool PooledSlotMoveDisabledForTests { get; set; }
 
         public bool TryForwardUnified(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, float[][] lastRowLogits,
             float[][] features = null)
@@ -300,20 +328,39 @@ namespace TensorSharp.Models
             return oldest;
         }
 
-        /// <summary>Whether the device has room for <paramref name="count"/> more slots of <paramref name="capacity"/> cells
-        /// beside its headroom and a lone prompt's step; null where it is not known.</summary>
+        /// <summary>
+        /// Whether every device that holds part of a slot has room for <paramref name="count"/> more slots' share of it (their
+        /// parts of <paramref name="capacity"/> cells) beside its headroom and a lone prompt's step; null where one is not known.
+        /// A layer split's or a rank's devices each hold their layers' or heads' part, and each runs the prompt's rows: judged
+        /// by the first device's memory alone, a split whose other GPU was the fuller one kept spare slots that device could
+        /// not hold.
+        /// </summary>
         private bool? RoomForSlots(int capacity, int count)
         {
-            long slot = SlotDeviceBytes(capacity);
-            if (slot < 0 || _allocator is not IDeviceMemoryInfo memory || memory.SharesHostMemory
-                || !memory.TryGetDeviceMemory(out long free, out long total))
-                return null;
-            if (SlotFreeBytesForTests != null) free = SlotFreeBytesForTests();
-            return free >= count * slot + DeviceHeadroom(total) + PromptStepBytes;
+            if (_slotShares == null || _slotShares.Length == 0) return null;
+            foreach (var (stage, rank, perToken, states) in _slotShares)
+            {
+                long free, total;
+                if (SlotDeviceMemoryForTests?.Invoke(_mesh.GlobalDevice(stage, rank)) is { } stand)
+                    (free, total) = stand;
+                else if (_mesh.Allocator(stage, rank) is not IDeviceMemoryInfo memory || memory.SharesHostMemory
+                    || !memory.TryGetDeviceMemory(out free, out total))
+                    return null;
+                if (free < count * (perToken * capacity + states + SlotExtraBytes) + DeviceHeadroom(total) + PromptStepBytes)
+                    return false;
+            }
+            return true;
         }
 
-        /// <summary>Tests stand in for the device's free bytes the slots made for the prefix cache and new requests are fitted to.</summary>
-        internal Func<long> SlotFreeBytesForTests { get; set; }
+        /// <summary>Tests stand in for each device's free and total bytes (by its index in the mesh) the slots made for the
+        /// prefix cache and new requests are fitted to.</summary>
+        internal Func<int, (long Free, long Total)?> SlotDeviceMemoryForTests { get; set; }
+
+        /// <summary><see cref="RoomForSlots"/> (tests).</summary>
+        internal bool? RoomForSlotsForTests(int capacity, int count) => RoomForSlots(capacity, count);
+
+        /// <summary>Each device's share of a slot (tests): its place in the mesh, its caches' bytes per token, its states' bytes.</summary>
+        internal (int Stage, int Rank, long PerToken, long States)[] SlotSharesForTests => _slotShares;
 
         /// <summary>A lone prompt's step on direct CUDA: its widest rows' activations and its scratch (0 elsewhere).</summary>
         private long PromptStepBytes => _backend == BackendType.Cuda
