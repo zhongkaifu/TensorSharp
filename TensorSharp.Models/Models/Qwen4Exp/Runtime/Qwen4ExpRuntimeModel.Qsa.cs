@@ -219,6 +219,9 @@ namespace TensorSharp.Models
         /// <see cref="GraphFusion.QsaAttention"/> region.</summary>
         internal bool QsaRegionDisabledForTests { get; set; }
 
+        /// <summary>Rows up to which a step is a decode row or a verify window (the CUDA executor's window rows).</summary>
+        private const int CudaWindowRows = 8;
+
         /// <summary>The indexer queries the open QsaAttention region read, for the selection's ops inside it.</summary>
         private (GraphStep Step, int Layer, int Sequence, int Query)? _regionQuery;
 
@@ -236,6 +239,10 @@ namespace TensorSharp.Models
             int ratio = QsaRatio(layer);
             if (ratio <= 0 || step.Starts[s] + step.Counts[s] <= Ple.QsaBudget || step.PositionTable >= 0 || step.AttentionFloor > 0
                 || QsaRegionDisabledForTests)
+                return false;
+            // A decode row or verify window answers as its rows decoded alone (speculation stays lossless): one that straddles
+            // the budget holds rows a lone decode step runs on the ops (dense below the budget), so it runs on them too.
+            if (step.Counts[s] <= CudaWindowRows && step.Starts[s] < Ple.QsaBudget)
                 return false;
             QsaSpec q = Qsa;
             int pools = (attention.Window + ratio - 1) / ratio;

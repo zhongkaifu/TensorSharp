@@ -468,6 +468,43 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     [InlineData(true)]
     public Task MtpSpeculationOnDirectCudaMatchesPlain(bool qsa) => AssertMtpSpeculation(qsa, BackendType.Cuda);
 
+    /// <summary>
+    /// QSA decode rows and verify windows on direct CUDA run as the QsaAttention region past the budget, and a window that
+    /// straddles the budget runs on the ops, as its rows below the budget do when decoded alone: the MTP head drafting
+    /// through the engine's unified step gives the plain greedy streams, one request and several at once, with a top-k of 8
+    /// (at most 11 cells, one block a row) and of 288 over 300-token prompts (288 cells and the tail). The F16 cache, which
+    /// the region takes.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(8, 0)]
+    [InlineData(288, 300)]
+    public async Task QsaRegionWithMtpSpeculationOnDirectCudaMatchesPlain(int indexerTopK, int promptLength)
+    {
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        string target = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-region-{indexerTopK}.gguf"), indexerTopK: indexerTopK, qsa: true);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, $"q4e-region-mtp-{indexerTopK}.gguf"), indexerTopK: indexerTopK);
+        var options = new TensorSharp.Runtime.Speculative.SpeculationOptions
+        {
+            Enabled = true, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0,
+        };
+        int[][] prompts = promptLength == 0 ? null : new[]
+        {
+            Enumerable.Range(0, promptLength).Select(i => 3 + (i * 37) % 240).ToArray(),
+            Enumerable.Range(0, promptLength + 7).Select(i => 40 + i % 6 + (i / 50) % 3).ToArray(),
+        };
+        var executors = new List<TensorSharp.Cuda.CudaGraphExecutor>();
+        var models = new List<Qwen4ExpRuntimeModel>();
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() =>
+        {
+            var model = new Qwen4ExpRuntimeModel(target, BackendType.Cuda, draftModelPath: mtp);
+            executors.Add(Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(model.GraphExecutorForTests));
+            models.Add(model);
+            return model;
+        }, options, $"qwen4exp mtp qsa region topK={indexerTopK}", prompts: prompts);
+        Assert.True(executors.All(e => e.QsaAttentionRegions > 0), "a run's QSA steps did not run as the region");
+        Assert.True(models.Sum(m => m.WindowAdvances) > 0, "no verify window advanced");
+    }
+
     /// <summary>The MTP head follows a speculating request's plain prompt (the trunk's own steps hand it their streams, the
     /// carry crossing chunks), on one device and on the last of two whole-layer stages (the draft embedding then its own
     /// input): its first draft is the one the speculator's catch-up over the same rows gives.</summary>

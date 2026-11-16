@@ -91,11 +91,12 @@ internal static class SpeculativeRuntimeChecks
     /// Speculation through the engine's unified step emits what plain decoding does, for one request and for several
     /// at once: each drafts over its own drafter state and every window is verified in one forward over the requests'
     /// slots (the batched verify must have run). Prompts repeat, so an n-gram drafter's drafts are accepted.
+    /// <paramref name="prompts"/> replaces the default short ones.
     /// </summary>
     public static async Task AssertEngineSpeculationMatchesPlain(Func<ModelBase> create, SpeculationOptions speculation,
-        string label, int maxNew = 20)
+        string label, int maxNew = 20, int[][] prompts = null)
     {
-        int[][] prompts = EnginePrompts;
+        prompts ??= EnginePrompts;
         foreach (int concurrent in new[] { 1, prompts.Length })
         {
             int[][] chosen = prompts.Take(concurrent).ToArray();
