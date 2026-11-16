@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 28
+#define TS_GRAPH_KERNELS_VERSION 29
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -2783,4 +2783,248 @@ extern "C" __global__ void __launch_bounds__(256) ts_graph_qsa_store_pool_f32(
     }
     for (int col = pair_count * 2 + tid; col < d; col += blockDim.x)
         row[d + col] = __float2half_rn(pooled[col]);
+}
+
+// ---------------------------------------------------------------------------
+// A block drafter's attention over its KV ring (DFlash / DFlash2 draft steps): the direct engine's ts_q35_df_attn_f16 and
+// ts_q35_df_combine_f32 over the runtime's ring (F32, the block's own rows already written into it) and its additive mask.
+// Row r of a KV head's group is block row r / G, head kvh * G + r % G (G = heads / kvHeads); every row scores every slot,
+// plus the mask's value for its block row and slot (0, or -inf outside the drafter's window). F16 operands (queries, K, V and
+// the probabilities), F32 scores and accumulation, online softmax on mma.sync.m16n8k16. A block takes `chunk` keys of one KV
+// head for 64 rows (4 warps x 16) and writes unnormalized partials (acc[HD], ln-domain max, sum); the combine merges a row's
+// partials in key order, so a run's sums do not depend on timing.
+//   q        F32, block row p head h at q[p * qRow + h * qHead + c]
+//   k, v     F32 [kvHeads][len][HD] (16-byte aligned)
+//   mask     [nq][len], block row p at mask[p * maskRow + slot]: F16 (maskHalf) or F32
+//   partial  [nq][heads][splits][HD + 2];  out  [nq][heads][HD] F32
+// sm_80 and newer (ldmatrix, mma.f16): the compute_75 image's body is empty; the host launches it only where
+// CudaPrefillModule.ArchGuardedKernelsUsable holds. Launch: grid (splits, kvHeads, ceil(nq * G / 64)), block 128; the
+// combine: grid nq * heads, block HD.
+// ---------------------------------------------------------------------------
+#define TS_RING_KT 32   // keys a tile
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void ts_graph_ldsm_x2_trans(uint32_t& b0, uint32_t& b1, const __half* row)
+{
+    const unsigned a = (unsigned)__cvta_generic_to_shared(row);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(b0), "=r"(b1) : "r"(a));
+}
+#endif
+
+template <int HD>
+__device__ __forceinline__ void ts_graph_ring_attn(
+    const float* __restrict__ q, long long qRow, long long qHead, const float* __restrict__ k, const float* __restrict__ v, int len,
+    const void* __restrict__ mask, int maskHalf, long long maskRow, int nq, int heads, int kvHeads, float scale, int chunk, int splits,
+    float* __restrict__ partial)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int ROW = HD + 8;          // F16 row stride of the K / V tiles: ldmatrix's eight rows hit distinct banks
+    constexpr int KK = HD / 16, NT = HD / 8;
+    constexpr float LOG2E = 1.4426950408889634f;
+    __shared__ __align__(16) __half ks[TS_RING_KT * ROW];
+    __shared__ __align__(16) __half vs[TS_RING_KT * ROW];
+    __shared__ float ms[64][TS_RING_KT + 1];   // the mask for the tile's block rows and keys, in log2 units
+    const int split = blockIdx.x, kvh = blockIdx.y;
+    const int G = heads / kvHeads, R = nq * G;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
+    const int kLo = split * chunk, kHi = min(len, kLo + chunk);
+    const float* kh = k + (long long)kvh * len * HD;
+    const float* vh = v + (long long)kvh * len * HD;
+    const int tile0 = blockIdx.z * 64, p0 = tile0 / G;
+    const int pn = min(R - 1, tile0 + 63) / G - p0 + 1;   // block rows the tile's rows span (at most 64)
+
+    const int r0 = tile0 + warp * 16 + g, r1 = r0 + 8;
+    const bool live0 = r0 < R, live1 = r1 < R;
+    const int pi0 = (live0 ? r0 : tile0) / G - p0, pi1 = (live1 ? r1 : tile0) / G - p0;
+    const bool warpLive = tile0 + warp * 16 < R;
+    auto qptr = [&](int r) { return q + (long long)(r / G) * qRow + (long long)(kvh * G + r % G) * qHead; };
+
+    uint32_t qa[KK][4];
+    {
+        const float* q0 = live0 ? qptr(r0) : nullptr;
+        const float* q1 = live1 ? qptr(r1) : nullptr;
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk)
+        {
+            const int c = kk * 16 + qd * 2;
+            qa[kk][0] = q0 ? ts_graph_qsa_pack(q0[c], q0[c + 1]) : 0u;
+            qa[kk][1] = q1 ? ts_graph_qsa_pack(q1[c], q1[c + 1]) : 0u;
+            qa[kk][2] = q0 ? ts_graph_qsa_pack(q0[c + 8], q0[c + 9]) : 0u;
+            qa[kk][3] = q1 ? ts_graph_qsa_pack(q1[c + 8], q1[c + 9]) : 0u;
+        }
+    }
+    float acc[NT][4];
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    const float log2Scale = scale * LOG2E;
+
+    for (int first = kLo; first < kHi; first += TS_RING_KT)
+    {
+        __syncthreads();
+        // The tile's K and V rows as F16 (zero past the range: finite, so a closed key's probability times V stays 0).
+        for (int i = threadIdx.x; i < TS_RING_KT * (HD / 8); i += blockDim.x)
+        {
+            const int key = i / (HD / 8), c = (i % (HD / 8)) * 8, idx = first + key;
+            float4 k0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f), k1 = k0, v0 = k0, v1 = k0;
+            if (idx < kHi)
+            {
+                const float4* ksrc = reinterpret_cast<const float4*>(kh + (long long)idx * HD + c);
+                const float4* vsrc = reinterpret_cast<const float4*>(vh + (long long)idx * HD + c);
+                k0 = ksrc[0];
+                k1 = ksrc[1];
+                v0 = vsrc[0];
+                v1 = vsrc[1];
+            }
+            *reinterpret_cast<uint4*>(ks + key * ROW + c) = make_uint4(ts_graph_qsa_pack(k0.x, k0.y), ts_graph_qsa_pack(k0.z, k0.w),
+                ts_graph_qsa_pack(k1.x, k1.y), ts_graph_qsa_pack(k1.z, k1.w));
+            *reinterpret_cast<uint4*>(vs + key * ROW + c) = make_uint4(ts_graph_qsa_pack(v0.x, v0.y), ts_graph_qsa_pack(v0.z, v0.w),
+                ts_graph_qsa_pack(v1.x, v1.y), ts_graph_qsa_pack(v1.z, v1.w));
+        }
+        for (int i = threadIdx.x; i < pn * TS_RING_KT; i += blockDim.x)
+        {
+            const int pi = i / TS_RING_KT, key = i % TS_RING_KT, idx = first + key;
+            const long long at = (long long)(p0 + pi) * maskRow + idx;
+            const float m = idx >= kHi ? -INFINITY
+                : maskHalf ? __half2float(reinterpret_cast<const __half*>(mask)[at]) : reinterpret_cast<const float*>(mask)[at];
+            ms[pi][key] = m * LOG2E;
+        }
+        __syncthreads();
+        if (!warpLive)
+            continue;
+        float s[4][4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+            const __half* kb = ks + (j * 8 + g) * ROW + qd * 2;
+#pragma unroll
+            for (int kk = 0; kk < KK; ++kk)
+                ts_graph_qsa_mma(s[j], qa[kk], *reinterpret_cast<const uint32_t*>(kb + kk * 16), *reinterpret_cast<const uint32_t*>(kb + kk * 16 + 8));
+        }
+        float t0 = m0, t1 = m1;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            const int key = j * 8 + qd * 2;
+            s[j][0] = fmaf(s[j][0], log2Scale, ms[pi0][key]);
+            s[j][1] = fmaf(s[j][1], log2Scale, ms[pi0][key + 1]);
+            s[j][2] = fmaf(s[j][2], log2Scale, ms[pi1][key]);
+            s[j][3] = fmaf(s[j][3], log2Scale, ms[pi1][key + 1]);
+            t0 = fmaxf(t0, fmaxf(s[j][0], s[j][1]));
+            t1 = fmaxf(t1, fmaxf(s[j][2], s[j][3]));
+        }
+#pragma unroll
+        for (int off = 1; off < 4; off <<= 1)
+        {
+            t0 = fmaxf(t0, __shfl_xor_sync(0xffffffffu, t0, off));
+            t1 = fmaxf(t1, __shfl_xor_sync(0xffffffffu, t1, off));
+        }
+        const float c0 = t0 == -INFINITY ? 1.0f : exp2f(m0 - t0);
+        const float c1 = t1 == -INFINITY ? 1.0f : exp2f(m1 - t1);
+        m0 = t0;
+        m1 = t1;
+        l0 *= c0;
+        l1 *= c1;
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+        {
+            acc[n][0] *= c0;
+            acc[n][1] *= c0;
+            acc[n][2] *= c1;
+            acc[n][3] *= c1;
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            s[j][0] = t0 == -INFINITY ? 0.0f : exp2f(s[j][0] - t0);
+            s[j][1] = t0 == -INFINITY ? 0.0f : exp2f(s[j][1] - t0);
+            s[j][2] = t1 == -INFINITY ? 0.0f : exp2f(s[j][2] - t1);
+            s[j][3] = t1 == -INFINITY ? 0.0f : exp2f(s[j][3] - t1);
+            l0 += s[j][0] + s[j][1];
+            l1 += s[j][2] + s[j][3];
+        }
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk)
+        {
+            const uint32_t pa[4] = {
+                ts_graph_qsa_pack(s[2 * kk][0], s[2 * kk][1]), ts_graph_qsa_pack(s[2 * kk][2], s[2 * kk][3]),
+                ts_graph_qsa_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]), ts_graph_qsa_pack(s[2 * kk + 1][2], s[2 * kk + 1][3]) };
+            const __half* vrow = vs + (kk * 16 + (lane & 15)) * ROW;
+#pragma unroll
+            for (int n = 0; n < NT; ++n)
+            {
+                uint32_t b0, b1;
+                ts_graph_ldsm_x2_trans(b0, b1, vrow + n * 8);
+                ts_graph_qsa_mma(acc[n], pa, b0, b1);
+            }
+        }
+    }
+    if (!warpLive)
+        return;
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1)
+    {
+        l0 += __shfl_xor_sync(0xffffffffu, l0, off);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, off);
+    }
+#pragma unroll
+    for (int half_ = 0; half_ < 2; ++half_)
+    {
+        const int r = half_ ? r1 : r0;
+        if (r >= R)
+            continue;
+        const long long base = (long long)(r / G) * heads + kvh * G + r % G;
+        float* p = partial + (base * splits + split) * (HD + 2);
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+        {
+            const int x = n * 8 + qd * 2;
+            p[x] = acc[n][half_ * 2];
+            p[x + 1] = acc[n][half_ * 2 + 1];
+        }
+        if (qd == 0)
+        {
+            const float m = half_ ? m1 : m0;
+            p[HD] = m == -INFINITY ? -INFINITY : m * 0.6931471805599453f;
+            p[HD + 1] = half_ ? l1 : l0;
+        }
+    }
+#endif
+}
+
+#define TS_GRAPH_RING_ATTN(HD)                                                                                                    \
+    extern "C" __global__ void __launch_bounds__(128) ts_graph_ring_attn_f16_d##HD(                                                \
+        const float* __restrict__ q, long long qRow, long long qHead, const float* __restrict__ k, const float* __restrict__ v,     \
+        int len, const void* __restrict__ mask, int maskHalf, long long maskRow, int nq, int heads, int kvHeads, float scale,      \
+        int chunk, int splits, float* __restrict__ partial)                                                                        \
+    {                                                                                                                              \
+        ts_graph_ring_attn<HD>(q, qRow, qHead, k, v, len, mask, maskHalf, maskRow, nq, heads, kvHeads, scale, chunk, splits,       \
+            partial);                                                                                                              \
+    }
+
+TS_GRAPH_RING_ATTN(64)
+TS_GRAPH_RING_ATTN(128)
+
+// A row's partials merged in key order: out = sum_s w_s acc_s / sum_s w_s l_s, w_s = e^(m_s - max m). One block a (row, head).
+extern "C" __global__ void ts_graph_ring_attn_combine_f32(const float* __restrict__ partial, int splits, int d, float* __restrict__ out)
+{
+    const long long base = blockIdx.x;
+    const float* p = partial + base * splits * (d + 2);
+    float mx = -INFINITY;
+    for (int s = 0; s < splits; ++s)
+        mx = fmaxf(mx, p[s * (d + 2) + d]);
+    for (int x = threadIdx.x; x < d; x += blockDim.x)
+    {
+        float num = 0.0f, den = 0.0f;
+        for (int s = 0; s < splits; ++s)
+        {
+            const float* ps = p + s * (d + 2);
+            const float w = mx == -INFINITY ? 0.0f : expf(ps[d] - mx);
+            num = fmaf(ps[x], w, num);
+            den = fmaf(ps[d + 1], w, den);
+        }
+        out[base * d + x] = den > 0.0f ? num / den : 0.0f;
+    }
 }

@@ -67,12 +67,39 @@ public sealed class GraphBlockDraftTests : IDisposable
 
     /// <summary>The same on the direct CUDA backend (the CUDA graph executor: the ring written and the selector's codebooks
     /// gathered on the device), against the managed CPU's per-op drafter: CUDA's own per-op selector drifts from it (its
-    /// DFlash2 confidences past the first slot), where the graph drafter matches it to the last digit.</summary>
+    /// DFlash2 confidences past the first slot), where the graph drafter matches it to the last digit. The ring attention takes
+    /// its F32 products here: its default, the engine's F16 tensor-core kernel, is checked against a reference within F16
+    /// tolerance (CudaRingAttentionKernelTests) and for lossless speculation (below).</summary>
     [CudaTheory]
     [InlineData("dflash")]
     [InlineData("dflash2")]
     [InlineData("dflash2-q8")]
-    public void GraphDraftsMatchTheManagedPerOpDrafterOnDirectCuda(string variant) => DraftsMatch(BackendType.Cuda, variant, BackendType.Cpu);
+    public void GraphDraftsMatchTheManagedPerOpDrafterOnDirectCuda(string variant)
+        => DraftsMatch(BackendType.Cuda, variant, BackendType.Cpu, ringKernel: false);
+
+    /// <summary>Speculation with the graph drafter on direct CUDA, its ring attention on the engine's tensor-core kernel
+    /// (ts_graph_ring_attn_f16, the default for draft steps), emits plain greedy decoding's stream: the drafts are verified,
+    /// so the kernel's F16 rounding moves acceptance only. The kernel served the blocks' attention and the graphs every block.</summary>
+    [CudaTheory]
+    [InlineData("qwen35", "dflash")]
+    [InlineData("qwen35", "dflash2")]
+    [InlineData("qwen4exp", "dflash2")]
+    public void RingKernelDraftSpeculationMatchesPlainGreedyOnDirectCuda(string family, string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var files = Files(family, variant);
+        StandardDecoderModel created = null;
+        TensorSharp.Cuda.CudaGraphExecutor executor = null;
+        SpeculativeRuntimeChecks.AssertBlockDraftMatchesPlainGreedy(() =>
+            {
+                created = Create(files, BackendType.Cuda);
+                executor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(created.GraphExecutorForTests);
+                return created;
+            }, $"{family} cuda {variant} ring kernel");
+        Assert.Null(created.GraphBlockDraftDeclineReason);
+        Assert.True(created.GraphBlockDrafts > 0, $"{family} {variant}: no block ran as a graph");
+        Assert.True(executor.RingAttentions > 0, $"{family} {variant}: no draft attention ran on the ring kernel");
+    }
 
     /// <summary>The same on ggml_cuda, where the old path is the fused native drafter.</summary>
     [GgmlTheory(BackendType.GgmlCuda)]
@@ -587,11 +614,12 @@ public sealed class GraphBlockDraftTests : IDisposable
 
     /// <summary>The graph drafter on <paramref name="backend"/> against the per-op drafter on <paramref name="reference"/>
     /// (the same backend unless named).</summary>
-    private void DraftsMatch(BackendType backend, string variant, BackendType? reference = null)
+    private void DraftsMatch(BackendType backend, string variant, BackendType? reference = null, bool ringKernel = true)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         var (target, draft) = Fixtures(variant);
         using var graph = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { GraphBlockDraftOnMetalForTests = true };
+        if (!ringKernel && graph.GraphExecutorForTests is TensorSharp.Cuda.CudaGraphExecutor cuda) cuda.RingAttentionDisabledForTests = true;
         using var perOp = new Qwen35RuntimeModel(target, reference ?? backend, 1, null, 1, draft) { GraphBlockDraftDisabledForTests = true };
         string label = $"{backend} {variant}";
         Assert.True(graph.HasDFlash && perOp.HasDFlash, $"{label}: the drafter did not attach");

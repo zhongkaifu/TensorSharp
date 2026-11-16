@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 28;
+        public const int CurrentVersion = 29;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _ringAttn64, _ringAttn128, _ringAttnCombine;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -111,6 +111,11 @@ namespace TensorSharp.Cuda
                 _qsaSelect = module.GetFunction("ts_graph_qsa_select_i32");
                 _qsaAttention = module.GetFunction("ts_graph_qsa_attn_mma_f16_d256");
                 TakesQsaAttention = true;
+                // A block drafter's ring attention on the tensor cores (sm_80 as well).
+                _ringAttn64 = module.GetFunction("ts_graph_ring_attn_f16_d64");
+                _ringAttn128 = module.GetFunction("ts_graph_ring_attn_f16_d128");
+                _ringAttnCombine = module.GetFunction("ts_graph_ring_attn_combine_f32");
+                TakesRingAttention = true;
             }
         }
 
@@ -171,6 +176,42 @@ namespace TensorSharp.Cuda
         {
             void** args = stackalloc void*[] { &q, &k, &v, &cells, &count, &output, &cap, &heads, &kvHeads, &scale, &cellStride };
             CudaDriverApi.cuLaunchKernel(_qsaAttention, (uint)kvHeads, (uint)rows, 1, 128, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Whether this image runs <see cref="LaunchRingAttention"/> (its sm_80 bodies are in it).</summary>
+        public bool TakesRingAttention { get; }
+
+        /// <summary>Keys a block of <see cref="LaunchRingAttention"/> takes (the direct engine's draft attention chunk).</summary>
+        public const int RingAttentionChunk = 256;
+
+        /// <summary>The head widths <see cref="LaunchRingAttention"/> takes.</summary>
+        public static bool RingAttentionTakes(int d) => d is 64 or 128;
+
+        /// <summary>Floats of <see cref="LaunchRingAttention"/>'s partials: [rows][heads][key ranges][d + 2].</summary>
+        public static long RingAttentionPartialFloats(int rows, int heads, int keys, int d)
+            => (long)rows * heads * ((keys + RingAttentionChunk - 1) / RingAttentionChunk) * (d + 2);
+
+        /// <summary>
+        /// A block drafter's attention over its KV ring on the tensor cores (the direct engine's ts_q35_df_attn_f16, see the
+        /// kernel's contract): <paramref name="rows"/> block rows' queries (F32, row p head h at q + p * qRow + h * qHead floats)
+        /// over every slot of the F32 ring k, v [kvHeads][keys][d] (16-byte aligned) under the additive mask [rows][keys] (rows
+        /// <paramref name="maskRow"/> elements apart, F16 or F32); out [rows][heads][d] F32. F16 operands, F32 scores and sums;
+        /// the key ranges merged in order, the same sums every run. <paramref name="partial"/> holds
+        /// <see cref="RingAttentionPartialFloats"/> floats.
+        /// </summary>
+        public void LaunchRingAttention(IntPtr q, long qRow, long qHead, IntPtr k, IntPtr v, int keys, IntPtr mask, bool maskHalf, long maskRow,
+            int rows, int heads, int kvHeads, int d, float scale, IntPtr partial, IntPtr output, IntPtr stream)
+        {
+            if (!TakesRingAttention || !RingAttentionTakes(d) || kvHeads < 1 || heads % kvHeads != 0 || rows < 1 || keys < 1)
+                throw new ArgumentOutOfRangeException(nameof(d), $"ring attention over {keys} keys of {rows} rows, {heads} / {kvHeads} heads of {d}");
+            int chunk = RingAttentionChunk, splits = (keys + chunk - 1) / chunk, half = maskHalf ? 1 : 0;
+            int groupRows = rows * (heads / kvHeads);
+            void** args = stackalloc void*[] { &q, &qRow, &qHead, &k, &v, &keys, &mask, &half, &maskRow, &rows, &heads, &kvHeads, &scale, &chunk,
+                &splits, &partial };
+            CudaDriverApi.cuLaunchKernel(d == 64 ? _ringAttn64 : _ringAttn128, (uint)splits, (uint)kvHeads, (uint)((groupRows + 63) / 64), 128, 1, 1, 0,
+                stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            void** combine = stackalloc void*[] { &partial, &splits, &d, &output };
+            CudaDriverApi.cuLaunchKernel(_ringAttnCombine, (uint)(rows * heads), 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)combine, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Weight rows of a tile of the tiled Q6_K head layout, and rows of activations one product takes at most.</summary>

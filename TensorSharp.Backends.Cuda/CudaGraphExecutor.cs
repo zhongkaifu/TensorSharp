@@ -172,10 +172,15 @@ namespace TensorSharp.Cuda
         {
             // Rows over K and V that are tensors, not cache windows (a block drafter's ring), with a mask tensor: its values, whatever
             // pattern an eager run reads in them (a recorded run cannot read them; the eager run had then taken the generic path,
-            // 54 ms a layer of Qwen3.8-27B's drafter on an A40, the first two blocks of every request).
-            if (kWindow == null && vWindow == null && mask.HasTensor && q.DimensionCount == 3 && q.Sizes[1] > 1
-                && TryExplicitRowsOverTensors(q, k, v, mask.Tensor, scale, out Tensor plain))
-                return plain;
+            // 54 ms a layer of Qwen3.8-27B's drafter on an A40, the first two blocks of every request). A draft step's run on the
+            // direct engine's tensor-core kernel (its proposals are verified, so its last bits need not match anything).
+            if (kWindow == null && vWindow == null && mask.HasTensor && q.DimensionCount == 3 && q.Sizes[1] > 1)
+            {
+                if (Drafting && TryRingAttention(q, k, v, mask.Tensor, scale, out Tensor ring))
+                    return ring;
+                if (TryExplicitRowsOverTensors(q, k, v, mask.Tensor, scale, out Tensor plain))
+                    return plain;
+            }
             // A padded decode window (its unwritten tail masked) runs its pattern over the written keys only.
             bool trimmed = mask.Pattern == MaskPattern.Explicit && mask.Trimmed != MaskPattern.Explicit && mask.Keys > 0;
             if (q.DimensionCount == 3 && q.Sizes[1] > 1 && q.Sizes[1] <= CudaDecodeDynParams.WindowRowBlocks
@@ -357,6 +362,48 @@ namespace TensorSharp.Cuda
             Ops.Copy(output, permuted);
             return true;
         }
+
+        /// <summary>
+        /// A draft step's rows over its block drafter's KV ring (<see cref="IGraphExecutor.Drafting"/>: K and V F32 tensors
+        /// [kv_heads, n, d], every slot read and the mask closing those outside the drafter's window) on the direct engine's
+        /// kernel (ts_graph_ring_attn_f16, its ts_q35_df_attn_f16 over the ring and the mask): F16 operands and F32 sums on the
+        /// tensor cores, a block a KV head's 64 rows and 256 keys, then the key ranges merged in order - the same values every
+        /// run. The grouped F32 products through cuBLAS took ten launches and 0.53 ms a Qwen3.8-27B DFlash2 draft step on an RTX
+        /// PRO 4000. Declined (that path runs) unless the head width is 64 or 128, the ring contiguous and 16-byte aligned, the
+        /// queries' rows unit-strided and the mask [rows, n] (F16 or F32) with unit-strided slots.
+        /// </summary>
+        private bool TryRingAttention(Tensor q, Tensor k, Tensor v, Tensor mask, float scale, out Tensor output)
+        {
+            output = null;
+            if (RingAttentionDisabledForTests || Kernels is not { TakesRingAttention: true } || mask == null || q.DimensionCount != 3
+                || k.DimensionCount != 3 || v.DimensionCount != 3 || !AllF32OnDevice(q, k, v) || mask.Storage is not CudaStorage
+                || mask.ElementType is not (DType.Float32 or DType.Float16))
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2];
+            int kvHeads = (int)k.Sizes[0], len = (int)k.Sizes[1];
+            if (!CudaGraphKernels.RingAttentionTakes(d) || kvHeads < 1 || heads % kvHeads != 0 || len < 1 || k.Sizes[2] != d
+                || v.Sizes[0] != kvHeads || v.Sizes[1] != len || v.Sizes[2] != d || !k.IsContiguous() || !v.IsContiguous() || q.Strides[2] != 1
+                || mask.DimensionCount != 2 || mask.Sizes[0] != nq || mask.Sizes[1] != len || mask.Strides[1] != 1
+                || Array.Exists(new[] { q, k, v, mask }, t => ((CudaStorage)t.Storage).DeviceId != cuda.DeviceId)
+                || ((long)Ptr(k) & 15) != 0 || ((long)Ptr(v) & 15) != 0)
+                return false;
+            long qRow = q.Strides[1], qHead = q.Strides[0], maskRow = mask.Strides[0];
+            var result = new Tensor(Allocator, DType.Float32, nq, heads, d);
+            using var partial = new Tensor(Allocator, DType.Float32, CudaGraphKernels.RingAttentionPartialFloats(nq, heads, len, d));
+            bool half = mask.ElementType == DType.Float16;
+            Launch(new[] { q, k, v, mask }, new[] { result, partial }, (kernels, stream) => kernels.LaunchRingAttention(Ptr(q), qRow, qHead,
+                Ptr(k), Ptr(v), len, Ptr(mask), half, maskRow, nq, heads, kvHeads, d, scale, Ptr(partial), Ptr(result), stream));
+            RingAttentions++;
+            output = result;
+            return true;
+        }
+
+        /// <summary>Draft steps' ring attentions run as <see cref="TryRingAttention"/> (tests check it engaged).</summary>
+        internal long RingAttentions { get; private set; }
+
+        /// <summary>Tests: draft steps' ring attentions take the grouped F32 products (<see cref="TryExplicitRowsOverTensors"/>).</summary>
+        internal bool RingAttentionDisabledForTests { get; set; }
 
         /// <summary>
         /// A verify window's rows (up to 8 a sequence, causal over the cache window or a sparse attention's selection) each
