@@ -193,6 +193,19 @@ namespace TensorSharp.Graph
         /// short chunk flag, the rotary dims, mode and original context. Fp: the norm's eps, 1 / R, the rotary's base,
         /// frequency scale, extrapolation factor, attention factor, beta fast and beta slow. Result: the pooled write.</summary>
         QsaKeys = 14,
+        /// <summary>A verify window's commit over the gated delta-net layers of one program (a pipeline stage's, a rank's):
+        /// each layer's recurrent state after the window's first <c>kept</c> rows and its conv window after them. Inputs, five a
+        /// layer: the state source, the state target, the window's saved scan inputs (q and k [saved rows, kHeads, S], v
+        /// [saved rows, vHeads, S], the gates and the betas [saved rows, vHeads], each a region of its own), the conv history
+        /// [convRows + capacity, channels] and the conv window [convRows, channels]. Ip: S (the key and value head width), vHeads,
+        /// kHeads, the saved rows, convRows, channels, the history's pitch (floats a channel), kept, then three a layer: the rows
+        /// to step, the source's and the target's offsets (floats). A layer with rows to step takes the gated delta rule over the
+        /// first of them in its saved inputs from the source's state (on the decode rows' kernels: the window's rounding), the
+        /// rows' outputs and the state after them written at the target's offset ([outputs | state]); with none, the source's
+        /// state at the target's offset; with -1, its state stays. Every layer's conv window takes the history's columns
+        /// [kept, kept + convRows) of each channel. The writes are effects and aliases inside the region. Result: the last
+        /// layer's conv window write.</summary>
+        DeltaNetCommit = 15,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
@@ -352,9 +365,10 @@ namespace TensorSharp.Graph
 
         /// <summary>
         /// Open a region of <paramref name="kind"/> over <paramref name="inputs"/> (nodes that exist now). The ops
-        /// up to <see cref="EndFused"/> compute its results from the inputs alone (no effects, no state); an
-        /// executor with a kernel for the kind may run that instead, and nodes inside are then computed
-        /// only if something else reads them.
+        /// up to <see cref="EndFused"/> compute its results from the inputs alone; an executor with a kernel for the
+        /// kind may run that instead, and nodes inside are then computed only if something else reads them. Writes
+        /// inside it (effects, aliases) are the region's where its kind says so: the kernel makes them, else they run
+        /// in order when the region closes.
         /// </summary>
         public void BeginFused(GraphFusion kind, ReadOnlySpan<int> inputs, ReadOnlySpan<long> ip = default, ReadOnlySpan<float> fp = default)
         {

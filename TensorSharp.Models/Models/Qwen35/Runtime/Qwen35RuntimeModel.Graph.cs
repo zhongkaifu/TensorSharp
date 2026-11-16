@@ -106,69 +106,146 @@ namespace TensorSharp.Models
             return false;
         }
 
+        /// <summary>
+        /// The commit of a <paramref name="rows"/>-row window that kept <paramref name="kept"/> rows, over the stage's (the rank's)
+        /// recurrent states: per layer the state after the kept rows (stepped again, copied, or left where the window left it)
+        /// and the conv window after them. Where the layers' shapes agree the ops are one region
+        /// (<see cref="GraphFusion.DeltaNetCommit"/>), which an executor may run as a few launches for every layer (direct CUDA):
+        /// the ops are about fifteen nodes a layer, 1.1 ms of host time a verify step of Qwen3.8-27B's 48 recurrent layers.
+        /// </summary>
         private GraphProgram BuildCommitProgram(int kept, int rows, int stage, int rank)
         {
-            const long f = sizeof(float);
             var g = new GraphProgramBuilder(record: true);
+            var layers = new System.Collections.Generic.List<(int Layer, DeviceGdnState State)>();
             for (int layer = 0; layer < Config.NumLayers; layer++)
+                if (_isRecurrent[layer] && OwnsLayer(layer) && Mesh.StageOf(layer) == stage
+                    && ActiveRecurrentState(layer, rank) is DeviceGdnState state && state.CommitSource(rows) != null)
+                    layers.Add((layer, state));
+            int n = layers.Count;
+            if (n == 0) return g.ToProgram(replayable: true, reorder: false);
+
+            // Every layer's leaves come first (the region's inputs, five a layer), then its ops.
+            var plan = new CommitLayer[n];
+            var inputs = new int[5 * n];
+            var ip = new long[8 + 3 * n];
+            DeviceGdnState first = layers[0].State;
+            int dk = _headKDim, dv = _headVDim;
+            int KeyHeads(DeviceGdnState s) => (int)((s.Channels - (long)s.VHeads * dv) / (2L * dk));
+            bool region = dk == dv && !CommitRegionDisabledForTests;
+            for (int i = 0; i < n; i++)
             {
-                if (!_isRecurrent[layer] || !OwnsLayer(layer) || Mesh.StageOf(layer) != stage
-                    || ActiveRecurrentState(layer, rank) is not DeviceGdnState state || state.CommitSource(rows) == null)
-                    continue;
-                long stateFloats = state.StateFloats, stateBytes = stateFloats * f;
-                int cap = state.SnapshotCapacity, convRows = state.ConvRows, channels = state.Channels;
-                if (state.WindowInPlace(rows))
-                {
-                    // The window left the state after its last row in place: a cut one steps its kept rows again from the
-                    // state before it.
-                    if (kept < rows) EmitWindowRestep(g, state, kept);
-                }
-                else
-                {
-                    // Result layout [rows' outputs | state after the last row | state 1 row before | ...].
-                    long offset = state.RowFloats * rows * f + (rows - kept) * stateBytes;
-                    int verify = GraphLeaf(g, state.Verify, cap * (state.RowFloats + stateFloats));
-                    int source = g.Op(GraphOp.View, stackalloc[] { verify }, stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, offset });
-                    int target = InPlaceRecurrentState
-                        ? g.Op(GraphOp.View, stackalloc[] { GraphLeaf(g, state.Backing, state.StateOffset + stateFloats) },
-                            stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, state.StateOffset * f })
-                        : g.Op(GraphOp.Reshape, stackalloc[] { GraphLeaf(g, state.Ssm, _headKDim, _headVDim, state.Ssm.Sizes[0]) }, stackalloc long[] { stateFloats });
-                    g.Effect(g.Op(GraphOp.Cpy, source, target));
-                }
-                // The window wrote its conv inputs at its own pitch (convRows + rows a channel).
-                int hist = GraphLeaf(g, state.ConvHistory, convRows + cap, channels);
-                long histPitch = convRows + rows;
-                int window = g.Op(GraphOp.View, stackalloc[] { hist },
-                    stackalloc long[] { 2, convRows, channels, 1, 1, histPitch * f, 0, 0, kept * f });
-                g.Effect(g.Op(GraphOp.Cpy, window, GraphLeaf(g, state.Conv, convRows, channels)));
-                EmitCommitExtras(g, layer, state, kept, rows);
+                DeviceGdnState state = layers[i].State;
+                plan[i] = CommitLayerOf(g, state, kept, rows);
+                region &= state.VHeads == first.VHeads && KeyHeads(state) == KeyHeads(first) && state.BackingRows == first.BackingRows
+                    && state.ConvRows == first.ConvRows && state.Channels == first.Channels;
+                CommitLayer c = plan[i];
+                inputs[5 * i] = c.Source;
+                inputs[5 * i + 1] = c.Target;
+                inputs[5 * i + 2] = c.Inputs;
+                inputs[5 * i + 3] = c.History;
+                inputs[5 * i + 4] = c.Conv;
+                ip[8 + 3 * i] = c.Steps;
+                ip[9 + 3 * i] = c.From;
+                ip[10 + 3 * i] = c.To;
             }
+            ip[0] = dk;
+            ip[1] = first.VHeads;
+            ip[2] = KeyHeads(first);
+            ip[3] = first.BackingRows;
+            ip[4] = first.ConvRows;
+            ip[5] = first.Channels;
+            ip[6] = first.ConvRows + rows;   // the window wrote its conv inputs at its own pitch (convRows + rows a channel)
+            ip[7] = kept;
+
+            if (region) g.BeginFused(GraphFusion.DeltaNetCommit, inputs, ip);
+            int last = -1;
+            for (int i = 0; i < n; i++)
+            {
+                last = EmitCommitLayer(g, layers[i].State, plan[i], kept, rows);
+                if (region) DeltaNetCommitRegionLayers++;
+            }
+            if (region) g.EndFused(stackalloc[] { last });
+            foreach ((int layer, DeviceGdnState state) in layers) EmitCommitExtras(g, layer, state, kept, rows);
             return g.ToProgram(replayable: true, reorder: false);
         }
 
+        /// <summary>A layer's part of a commit: its leaves (<see cref="Source"/> .. <see cref="Conv"/>, the history's leaf standing
+        /// in for those the layer does not read) and the state's work - <see cref="Steps"/> rows stepped again from the source,
+        /// 0 the source's state taken, -1 none - from <see cref="From"/> floats into the source to <see cref="To"/> floats into
+        /// the target (see <see cref="GraphFusion.DeltaNetCommit"/>).</summary>
+        private readonly record struct CommitLayer(int Source, int Target, int Inputs, int History, int Conv, long Steps, long From, long To);
+
+        private CommitLayer CommitLayerOf(GraphProgramBuilder g, DeviceGdnState state, int kept, int rows)
+        {
+            long stateFloats = state.StateFloats;
+            int cap = state.SnapshotCapacity, convRows = state.ConvRows, channels = state.Channels;
+            int history = GraphLeaf(g, state.ConvHistory, convRows + cap, channels);
+            int conv = GraphLeaf(g, state.Conv, convRows, channels);
+            if (state.WindowInPlace(rows))
+            {
+                // The window left the state after its last row in place: a cut one steps its kept rows again from the state
+                // before it (none kept: that state itself), into the backing as the window's result went there.
+                if (kept >= rows) return new CommitLayer(history, history, history, history, conv, -1, 0, 0);
+                int backing = GraphLeaf(g, state.Backing, state.StateOffset + stateFloats);
+                int saved = GraphLeaf(g, state.Saved, stateFloats);
+                if (kept == 0) return new CommitLayer(saved, backing, saved, history, conv, 0, 0, state.StateOffset);
+                int inputs = GraphLeaf(g, state.SavedInputs, state.SavedInputFloats);
+                return new CommitLayer(saved, backing, inputs, history, conv, kept, 0, (state.BackingRows - kept) * state.RowFloats);
+            }
+            // Result layout [rows' outputs | state after the last row | state 1 row before | ...].
+            int verify = GraphLeaf(g, state.Verify, cap * (state.RowFloats + stateFloats));
+            long from = state.RowFloats * rows + (rows - kept) * stateFloats;
+            return InPlaceRecurrentState
+                ? new CommitLayer(verify, GraphLeaf(g, state.Backing, state.StateOffset + stateFloats), verify, history, conv, 0, from, state.StateOffset)
+                : new CommitLayer(verify, GraphLeaf(g, state.Ssm, _headKDim, _headVDim, state.Ssm.Sizes[0]), verify, history, conv, 0, from, 0);
+        }
+
+        /// <summary>A layer's commit ops over its leaves; returns the conv window's write.</summary>
+        private int EmitCommitLayer(GraphProgramBuilder g, DeviceGdnState state, in CommitLayer c, int kept, int rows)
+        {
+            const long f = sizeof(float);
+            long stateFloats = state.StateFloats, stateBytes = stateFloats * f;
+            int convRows = state.ConvRows, channels = state.Channels;
+            if (state.WindowInPlace(rows))
+            {
+                if (c.Steps > 0) EmitWindowRestep(g, state, kept, c.Target, c.Source, c.Inputs);
+                else if (c.Steps == 0)
+                {
+                    int live = g.Op(GraphOp.View, stackalloc[] { c.Target },
+                        stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, state.StateOffset * f });
+                    g.Effect(g.Op(GraphOp.Cpy, c.Source, live));
+                }
+            }
+            else
+            {
+                int source = g.Op(GraphOp.View, stackalloc[] { c.Source }, stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, c.From * f });
+                int target = InPlaceRecurrentState
+                    ? g.Op(GraphOp.View, stackalloc[] { c.Target }, stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, c.To * f })
+                    : g.Op(GraphOp.Reshape, stackalloc[] { c.Target }, stackalloc long[] { stateFloats });
+                g.Effect(g.Op(GraphOp.Cpy, source, target));
+            }
+            // The window wrote its conv inputs at its own pitch (convRows + rows a channel).
+            long histPitch = convRows + rows;
+            int window = g.Op(GraphOp.View, stackalloc[] { c.History },
+                stackalloc long[] { 2, convRows, channels, 1, 1, histPitch * f, 0, 0, kept * f });
+            int write = g.Op(GraphOp.Cpy, window, c.Conv);
+            g.Effect(write);
+            return write;
+        }
+
         /// <summary>
-        /// The state after <paramref name="kept"/> rows of a window that updated it in place: the recurrence over the kept
-        /// rows' saved inputs from the saved state before the window, on the decode rows' kernels (the window's rounding),
-        /// its result in place in the backing as the window's was; none kept, the saved state itself.
+        /// The state after <paramref name="kept"/> (at least one) rows of a window that updated it in place: the recurrence over
+        /// the kept rows' saved inputs from the saved state before the window, on the decode rows' kernels (the window's
+        /// rounding), its result in place in the backing as the window's was.
         /// </summary>
-        private void EmitWindowRestep(GraphProgramBuilder g, DeviceGdnState state, int kept)
+        private void EmitWindowRestep(GraphProgramBuilder g, DeviceGdnState state, int kept, int backing, int saved, int inputs)
         {
             const long f = sizeof(float);
             int dk = _headKDim, dv = _headVDim, vHeads = state.VHeads, rows = state.BackingRows;
             int kHeads = (int)((state.Channels - (long)vHeads * dv) / (2L * dk));
             long stateFloats = state.StateFloats;
-            int backing = GraphLeaf(g, state.Backing, state.StateOffset + stateFloats);
-            int saved = GraphLeaf(g, state.Saved, stateFloats);
-            if (kept == 0)
-            {
-                int live = g.Op(GraphOp.View, stackalloc[] { backing },
-                    stackalloc long[] { 1, stateFloats, 1, 1, 1, stateFloats * f, 0, 0, state.StateOffset * f });
-                g.Effect(g.Op(GraphOp.Cpy, saved, live));
-                return;
-            }
             int before = g.Op(GraphOp.View, stackalloc[] { saved },
                 stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, stateFloats * f, 0 });
-            int inputs = GraphLeaf(g, state.SavedInputs, state.SavedInputFloats);
             // Planar regions of `rows` tokens: q | k [rows, kHeads, dk], v [rows, vHeads, dv], gates | betas [rows, vHeads].
             long qkRegion = (long)rows * kHeads * dk * f, vRegion = (long)rows * vHeads * dv * f, gRegion = (long)rows * vHeads * f;
             int Region(long width, long heads, long at) => g.Op(GraphOp.View, stackalloc[] { inputs },
@@ -182,6 +259,13 @@ namespace TensorSharp.Models
                 g.Op(GraphOp.View, stackalloc[] { backing }, stackalloc long[] { 1, total, 1, 1, 1, total * f, 0, 0, at }));
             g.Alias(gdn, backing, at, fallback);
         }
+
+        /// <summary>Tests: commits run as their ops, not as a <see cref="GraphFusion.DeltaNetCommit"/> region.</summary>
+        internal bool CommitRegionDisabledForTests { get; set; }
+
+        /// <summary>Tests: layers whose commit ops a compiled commit program put in a <see cref="GraphFusion.DeltaNetCommit"/>
+        /// region.</summary>
+        internal int DeltaNetCommitRegionLayers { get; private set; }
 
         /// <summary>Tests: the rows the active request's first recurrent state keeps in front of its state (above one, its
         /// verify windows update the state in place); 0 without one.</summary>

@@ -1127,6 +1127,56 @@ public sealed class Qwen35RuntimeTests : IDisposable
                 $"step {w} differs with in-place windows ({RelL2(inPlace.Logits[w], snapshots.Logits[w]):E2} relative L2)");
     }
 
+    /// <summary>A verify window's commit on direct CUDA runs as one region (GraphFusion.DeltaNetCommit: ts_graph_gdn_commit_f32
+    /// for every recurrent layer, where the ops were about fifteen graph nodes a layer): windows cut at every row, accepted
+    /// whole and restored, and the decode after them, give the logits of commits run as their ops, bit for bit.</summary>
+    [CudaTheory]
+    [InlineData("dense")]
+    [InlineData("dense-gqa")]
+    public void CommitRegionOnDirectCudaAnswersAsItsOps(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture(variant);
+        (List<float[]> Logits, long Regions, int Layers) Run(bool region)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.CommitRegionDisabledForTests = !region;
+            var executor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(model.GraphExecutorForTests);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            int vocab = model.Config.VocabSize;
+            spec.SpecForward(Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray(), null, new float[vocab], false);
+            var trace = new List<float[]>();
+            // Accepted rows of each 4-row window (-1: restored to the state before it).
+            int[] accepted = { 3, 0, 2, -1, 1, 3, 0, 2 };
+            for (int w = 0; w < accepted.Length; w++)
+            {
+                int[] window = Enumerable.Range(0, 4).Select(i => 60 + (w * 4 + i) % 30).ToArray();
+                var logits = new float[4 * vocab];
+                spec.SpecForward(window, null, logits, true);
+                if (accepted[w] < 0) spec.SpecRestoreRecurrentState();
+                else spec.SpecOnVerifyAccepted(accepted[w], 4);
+                trace.Add(logits);
+            }
+            for (int d = 0; d < 3; d++)
+            {
+                var logits = new float[vocab];
+                spec.SpecForward(new[] { 50 + d }, null, logits, false);
+                trace.Add(logits);
+            }
+            Assert.True(model.WindowStateRowsForTests > 1, $"the windows did not update the states in place ({model.WindowStateRowsForTests} rows)");
+            return (trace, executor.DeltaNetCommitRegions, model.DeltaNetCommitRegionLayers);
+        }
+        var fused = Run(region: true);
+        var ops = Run(region: false);
+        Assert.True(fused.Regions > 0, "no commit ran as a region");
+        Assert.True(fused.Layers > 0, "no commit program held a region");
+        Assert.Equal(0, ops.Regions);
+        Assert.Equal(0, ops.Layers);
+        for (int w = 0; w < fused.Logits.Count; w++)
+            Assert.True(fused.Logits[w].AsSpan().SequenceEqual(ops.Logits[w]),
+                $"step {w} differs with the commit region ({RelL2(fused.Logits[w], ops.Logits[w]):E2} relative L2)");
+    }
+
     private void AssertWindowsRetraceAfterRelease(BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);

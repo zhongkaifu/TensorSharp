@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 27
+#define TS_GRAPH_KERNELS_VERSION 28
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -156,17 +156,15 @@ extern "C" __global__ void ts_graph_gated_delta_net_f32(
 // ts_graph_gated_delta_net_f32 with four state rows a warp: a token's q, k and gates are read once for the four rows
 // (a prompt chunk re-read them for every row, 3.4x the legacy prefill scan's time on Qwen3.5-9B). Each state element
 // goes through the same operations in the same order as in the one-row kernel, so the results are the same bits.
-extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
+// The body takes the warp's sequence, head and first state row (r0); ts_graph_gated_delta_net_rows4_f32 and
+// ts_graph_gdn_commit_f32 both run it.
+__device__ __forceinline__ void ts_graph_gdn_rows4(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ g, const float* __restrict__ beta, const float* state,
     float* out, int S, int h, int hk, int n_t, int n_s, int slots, int kda, float* __restrict__ saved,
-    float* __restrict__ in_save, int save_rows)
+    float* __restrict__ in_save, int save_rows, int seq, int head, int r0, int lane)
 {
-    const int seq = blockIdx.x / h;
-    const int head = blockIdx.x % h;
     const int kh = head % hk;
-    const int lane = threadIdx.x & 31;
-    const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;
     if (seq >= n_s || r0 >= S)
         return;
 
@@ -263,6 +261,78 @@ extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
             }
         }
     }
+}
+
+extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int S, int h, int hk, int n_t, int n_s, int slots, int kda, float* __restrict__ saved,
+    float* __restrict__ in_save, int save_rows)
+{
+    ts_graph_gdn_rows4(q, k, v, g, beta, state, out, S, h, hk, n_t, n_s, slots, kda, saved, in_save, save_rows,
+        blockIdx.x / h, blockIdx.x % h, (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4, threadIdx.x & 31);
+}
+
+// A verify window's commit over the gated delta-net layers of a program (GraphFusion.DeltaNetCommit), up to
+// TS_GRAPH_GDN_COMMIT_LAYERS layers a launch, the layers' pointers by value. Per layer:
+//   steps > 0:  the state after the first `steps` rows of the window's saved scan inputs (planar regions of save_rows
+//               tokens: q | k [t][hk][S], v [t][h][S], g | beta [t][h]) from the state before the window (`state`):
+//               ts_graph_gdn_rows4 as the decode rows' kernels ran the window (one sequence, one slot, scalar gates), its
+//               outputs and the state after the rows written to out ([steps][h][S] | [h][S][S]);
+//   steps == 0: the state at `state` copied to out;
+//   steps < 0:  the state stays;
+// and every layer's conv window conv_to [channels][conv_rows] takes conv_from[c * conv_pitch + j] (the history's columns
+// after the kept rows). Sources and destinations are separate memory. Launch: grid (h, ceil(S / 16), layers), block 128.
+#define TS_GRAPH_GDN_COMMIT_LAYERS 32
+
+struct ts_graph_gdn_commit
+{
+    const float* state[TS_GRAPH_GDN_COMMIT_LAYERS];
+    float* out[TS_GRAPH_GDN_COMMIT_LAYERS];
+    const float* inputs[TS_GRAPH_GDN_COMMIT_LAYERS];
+    const float* conv_from[TS_GRAPH_GDN_COMMIT_LAYERS];
+    float* conv_to[TS_GRAPH_GDN_COMMIT_LAYERS];
+    int steps[TS_GRAPH_GDN_COMMIT_LAYERS];
+    int layers, S, h, hk, save_rows, conv_rows, channels, conv_pitch;
+};
+
+// CudaGraphKernels.GdnCommitArgs lays the launch's argument out byte for byte.
+static_assert(sizeof(ts_graph_gdn_commit) == 1440, "ts_graph_gdn_commit: CudaGraphKernels.GdnCommitArgs mirrors this layout");
+
+extern "C" __global__ void __launch_bounds__(128) ts_graph_gdn_commit_f32(const ts_graph_gdn_commit c)
+{
+    const int layer = blockIdx.z;
+    if (layer >= c.layers)
+        return;
+    // The conv window: every block of the layer copies its share.
+    {
+        const long long n = (long long)c.channels * c.conv_rows;
+        const long long blocks = (long long)gridDim.x * gridDim.y, block = (long long)blockIdx.y * gridDim.x + blockIdx.x;
+        const float* __restrict__ from = c.conv_from[layer];
+        float* __restrict__ to = c.conv_to[layer];
+        for (long long i = block * blockDim.x + threadIdx.x; i < n; i += blocks * blockDim.x)
+        {
+            const long long ch = i / c.conv_rows;
+            to[i] = from[ch * c.conv_pitch + (i - ch * c.conv_rows)];
+        }
+    }
+    const int steps = c.steps[layer], S = c.S, h = c.h, head = blockIdx.x, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;
+    if (steps < 0 || r0 >= S)
+        return;
+    if (steps == 0)
+    {
+        const float* __restrict__ src = c.state[layer] + ((size_t)head * S + r0) * S;
+        float* __restrict__ dst = c.out[layer] + ((size_t)head * S + r0) * S;
+        for (int r = 0; r < 4 && r0 + r < S; r++)
+            for (int i = lane; i < S; i += 32)
+                dst[(size_t)r * S + i] = src[(size_t)r * S + i];
+        return;
+    }
+    const float* in = c.inputs[layer];
+    const size_t qk = (size_t)c.save_rows * c.hk * S, vs = (size_t)c.save_rows * h * S, gs = (size_t)c.save_rows * h;
+    ts_graph_gdn_rows4(in, in + qk, in + 2 * qk, in + 2 * qk + vs, in + 2 * qk + vs + gs, c.state[layer], c.out[layer],
+        S, h, c.hk, steps, 1, 1, 0, nullptr, nullptr, 0, 0, head, r0, lane);
 }
 
 // ggml_top_k: the indices of each row's k largest values, largest first, a tie going to the lower index (the order the

@@ -584,7 +584,7 @@ namespace TensorSharp.Graph
             private GraphNode _region;   // the open fused region this executor has a kernel for (Kind Fused), else default
             private readonly Stack<int[]> _regionInputs = new();   // every open region's inputs, innermost on top
             private readonly List<int> _regionOps = new();   // the ops the open region deferred, in order
-            private readonly List<int> _regionEffects = new();   // the writes the open region deferred, in order
+            private readonly List<GraphNode> _regionWrites = new();   // the writes (effects, aliases) the open region deferred, in order
             private int _nested;         // regions opened inside it (part of it: their ends do not close it)
             private bool InRegion => _region.Kind == GraphNodeKind.Fused;
 
@@ -621,30 +621,16 @@ namespace TensorSharp.Graph
                         break;
                     }
                     case GraphNodeKind.Effect:
-                    {
-                        int n = e.Node;
-                        Pinned(n);
-                        // A write inside a region this executor serves is the region's: its kernel makes it, else its ops run
-                        // it when the region closes, in order with the region's other writes.
-                        if (InRegion) _regionEffects.Add(n);
-                        else Attribute(() => Force(n));
-                        break;
-                    }
-                    // The executor places the result in the leaf if it can, else the alias's copy runs.
                     case GraphNodeKind.Alias:
                     {
-                        GraphNode alias = e;
+                        GraphNode write = e;
                         Pinned(e.Node);
-                        Pinned(alias.Srcs[1]);
-                        Attribute(() =>
-                        {
-                            if (_x.TryAlias(Get(alias.Node), Get(alias.Srcs[0]), alias.Bytes)) _x.AliasesInPlace++;
-                            else
-                            {
-                                _x.AliasCopies++;
-                                Force(alias.Srcs[1]);
-                            }
-                        });
+                        if (e.Kind == GraphNodeKind.Alias) Pinned(e.Srcs[1]);
+                        // A write inside a region this executor serves is the region's (an effect, or an alias's in-place
+                        // result): its kernel makes it, else its ops run it when the region closes, in order with the
+                        // region's other writes.
+                        if (InRegion) _regionWrites.Add(write);
+                        else Attribute(() => Write(write));
                         break;
                     }
                     case GraphNodeKind.Output: Pinned(e.Node); _outputs.Add(e.Node); _outputFloats.Add(e.Bytes); break;
@@ -663,13 +649,13 @@ namespace TensorSharp.Graph
                         {
                             GraphNode region = _region, end = e;
                             _region = default;
-                            int[] effects = _regionEffects.Count == 0 ? Array.Empty<int>() : _regionEffects.ToArray();
-                            _regionEffects.Clear();
+                            GraphNode[] writes = _regionWrites.Count == 0 ? Array.Empty<GraphNode>() : _regionWrites.ToArray();
+                            _regionWrites.Clear();
                             // A region none of whose results the step reads does not run (its ops are dead too); its writes do.
                             if (_dead == null || !Array.TrueForAll(end.Srcs, r => r >= 0 && r < _dead.Length && _dead[r]))
-                                Attribute(() => RunFused(region, end.Srcs, effects));
-                            else if (effects.Length > 0)
-                                Attribute(() => { foreach (int fx in effects) Force(fx); });
+                                Attribute(() => RunFused(region, end.Srcs, writes));
+                            else if (writes.Length > 0)
+                                Attribute(() => { foreach (GraphNode w in writes) Write(w); });
                             SkipUnrun();
                         }
                         // The region's reads of its inputs (Liveness counts one each) are spent, run or not.
@@ -697,10 +683,27 @@ namespace TensorSharp.Graph
                 _regionOps.Clear();
             }
 
-            /// <summary>The region's results (and the writes inside it, <paramref name="effects"/>) from its kernel, else from its
+            /// <summary>An effect: its node runs. An alias: the executor places the node's result in the leaf if it can, else
+            /// the alias's copy runs.</summary>
+            private void Write(in GraphNode w)
+            {
+                if (w.Kind == GraphNodeKind.Effect)
+                {
+                    Force(w.Node);
+                    return;
+                }
+                if (_x.TryAlias(Get(w.Node), Get(w.Srcs[0]), w.Bytes)) _x.AliasesInPlace++;
+                else
+                {
+                    _x.AliasCopies++;
+                    Force(w.Srcs[1]);
+                }
+            }
+
+            /// <summary>The region's results (and the writes inside it, <paramref name="writes"/>) from its kernel, else from its
             /// ops: the writes first, in order, as they ran before regions held writes (an op after a write may read what it
             /// wrote).</summary>
-            private void RunFused(in GraphNode region, int[] results, int[] effects)
+            private void RunFused(in GraphNode region, int[] results, GraphNode[] writes)
             {
                 var inputs = new Tensor[region.Srcs.Length];
                 var weights = new IGraphWeight[region.Srcs.Length];
@@ -727,7 +730,7 @@ namespace TensorSharp.Graph
                     bool beside = _x.BeginConcurrent(inputs);
                     try
                     {
-                        foreach (int fx in effects) Force(fx);
+                        foreach (GraphNode w in writes) Write(w);
                         foreach (int r in results) Force(r);
                     }
                     finally
@@ -752,7 +755,7 @@ namespace TensorSharp.Graph
                     return;
                 }
                 foreach (Tensor t in outs) t?.Dispose();
-                foreach (int fx in effects) Force(fx);
+                foreach (GraphNode w in writes) Write(w);
                 foreach (int r in results) Force(r);
             }
 

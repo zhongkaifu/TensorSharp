@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 27;
+        public const int CurrentVersion = 28;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -33,6 +33,7 @@ namespace TensorSharp.Cuda
             if (!IsCurrent) return;
             _gatedDeltaNet = module.GetFunction("ts_graph_gated_delta_net_f32");
             _gatedDeltaNetRows4 = module.GetFunction("ts_graph_gated_delta_net_rows4_f32");
+            _gdnCommit = module.GetFunction("ts_graph_gdn_commit_f32");
             _softplus = module.GetFunction("ts_graph_softplus_f32");
             _sqrt = module.GetFunction("ts_graph_sqrt_f32");
             _topk = module.GetFunction("ts_graph_topk_f32");
@@ -270,6 +271,43 @@ namespace TensorSharp.Cuda
                 &saved, &inputs, &inputRows };
             CudaDriverApi.cuLaunchKernel(_gatedDeltaNetRows4, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Layers <see cref="LaunchGdnCommit"/> takes in one launch (TS_GRAPH_GDN_COMMIT_LAYERS).</summary>
+        public const int GdnCommitLayers = 32;
+
+        /// <summary>
+        /// The argument of ts_graph_gdn_commit_f32, byte for byte (struct ts_graph_gdn_commit, 1,440 bytes): each layer's state
+        /// source, output, saved scan inputs, conv history (at its first column) and conv window, its rows to step (0: the
+        /// source's state copied; below 0: the state stays), then the shapes every layer shares.
+        /// </summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct GdnCommitArgs
+        {
+            public fixed long State[GdnCommitLayers];
+            public fixed long Out[GdnCommitLayers];
+            public fixed long Inputs[GdnCommitLayers];
+            public fixed long ConvFrom[GdnCommitLayers];
+            public fixed long ConvTo[GdnCommitLayers];
+            public fixed int Steps[GdnCommitLayers];
+            public int Layers, S, Heads, KeyHeads, SaveRows, ConvRows, Channels, ConvPitch;
+        }
+
+        /// <summary>
+        /// A verify window's commit over <see cref="GdnCommitArgs.Layers"/> (at most <see cref="GdnCommitLayers"/>) gated delta-net
+        /// layers in one launch (GraphFusion.DeltaNetCommit; see the kernel's contract): a layer with rows to step re-steps them
+        /// from its saved inputs and state on ts_graph_gated_delta_net_rows4_f32's body (the one-row kernel's bits too), its
+        /// outputs and state written to its output; every layer's conv window taken from its history.
+        /// </summary>
+        public void LaunchGdnCommit(GdnCommitArgs args, IntPtr stream)
+        {
+            if (args.Layers < 1 || args.Layers > GdnCommitLayers || args.S % 32 != 0 || args.S > 256)
+                throw new ArgumentOutOfRangeException(nameof(args), $"{args.Layers} layers of S {args.S}");
+            // The driver copies the argument's bytes when the launch is made (or recorded).
+            GdnCommitArgs* p = &args;
+            void** a = stackalloc void*[] { p };
+            CudaDriverApi.cuLaunchKernel(_gdnCommit, (uint)args.Heads, (uint)((args.S + 15) / 16), (uint)args.Layers, 128, 1, 1, 0, stream,
+                (IntPtr)a, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Floats of a recurrence's saved inputs for <paramref name="rows"/> tokens: q and k [rows, keyHeads, s], v

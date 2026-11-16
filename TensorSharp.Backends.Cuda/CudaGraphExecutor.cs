@@ -974,6 +974,91 @@ namespace TensorSharp.Cuda
         /// <summary>QSA keys written and pooled as <see cref="TryQsaKeys"/> (tests check the region engaged).</summary>
         internal long QsaKeysRegions { get; private set; }
 
+        /// <summary>
+        /// A verify window's commit over a program's gated delta-net layers (<see cref="GraphFusion.DeltaNetCommit"/>) in one launch
+        /// per 32 layers (ts_graph_gdn_commit_f32, every layer's pointers by value): a cut window's kept rows stepped again from
+        /// the saved state on the rows4 kernel's body - the arithmetic the ops' re-step runs on the one-row and rows4 kernels, so
+        /// the states are their bytes - a state copied where none is stepped, and every conv window from its history. The ops
+        /// were about fifteen graph nodes a layer: 1.1-1.2 ms of host time a verify step of Qwen3.8-27B's 48 layers, where the
+        /// kernels take a few microseconds. Declined (the ops run) unless every operand is an F32 device tensor of the sizes the
+        /// region names and S a multiple of 32 up to 256.
+        /// </summary>
+        private bool TryDeltaNetCommit(Tensor[] inputs, long[] ip, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || ip == null || ip.Length < 8 || results.Length < 1 || inputs.Length == 0 || inputs.Length % 5 != 0)
+                return false;
+            int layers = inputs.Length / 5;
+            if (ip.Length != 8 + 3L * layers || Array.Exists(ip, x => x < int.MinValue || x > int.MaxValue)) return false;
+            int s = (int)ip[0], heads = (int)ip[1], keyHeads = (int)ip[2], saveRows = (int)ip[3], convRows = (int)ip[4], channels = (int)ip[5];
+            int pitch = (int)ip[6], kept = (int)ip[7];
+            if (s < 32 || s % 32 != 0 || s > 256 || heads < 1 || keyHeads < 1 || heads % keyHeads != 0 || saveRows < 0 || convRows < 1
+                || channels < 1 || kept < 0 || pitch < kept + convRows)
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            foreach (Tensor t in inputs)
+                if (t?.Storage is not CudaStorage cs || cs.DeviceId != cuda.DeviceId || t.ElementType != DType.Float32 || !t.IsContiguous())
+                    return false;
+            long stateFloats = (long)heads * s * s, rowFloats = (long)heads * s;
+            long savedFloats = CudaGraphKernels.GatedDeltaNetInputFloats(saveRows, s, heads, keyHeads, false);
+            var read = new List<Tensor>();
+            var written = new List<Tensor>();
+            for (int l = 0; l < layers; l++)
+            {
+                Tensor source = inputs[5 * l], target = inputs[5 * l + 1], saved = inputs[5 * l + 2], history = inputs[5 * l + 3], conv = inputs[5 * l + 4];
+                long steps = ip[8 + 3 * l], from = ip[9 + 3 * l], to = ip[10 + 3 * l];
+                if (conv.ElementCount() != (long)channels * convRows || history.ElementCount() < (long)(channels - 1) * pitch + kept + convRows
+                    || ReferenceEquals(history.Storage, conv.Storage))
+                    return false;
+                read.Add(history);
+                written.Add(conv);
+                if (steps < 0) continue;
+                // The kernel reads the source state and the saved inputs while it writes the target.
+                if (steps > saveRows || from < 0 || to < 0 || source.ElementCount() < from + stateFloats
+                    || target.ElementCount() < to + steps * rowFloats + stateFloats || ReferenceEquals(source.Storage, target.Storage)
+                    || (steps > 0 && (saved.ElementCount() < savedFloats || ReferenceEquals(saved.Storage, target.Storage))))
+                    return false;
+                read.Add(source);
+                if (steps > 0) read.Add(saved);
+                written.Add(target);
+            }
+            Launch(read.ToArray(), written.ToArray(), (k, stream) =>
+            {
+                for (int first = 0; first < layers; first += CudaGraphKernels.GdnCommitLayers)
+                {
+                    var args = new CudaGraphKernels.GdnCommitArgs
+                    {
+                        Layers = Math.Min(CudaGraphKernels.GdnCommitLayers, layers - first), S = s, Heads = heads, KeyHeads = keyHeads,
+                        SaveRows = saveRows, ConvRows = convRows, Channels = channels, ConvPitch = pitch,
+                    };
+                    unsafe
+                    {
+                        for (int i = 0; i < args.Layers; i++)
+                        {
+                            int l = first + i;
+                            Tensor source = inputs[5 * l], target = inputs[5 * l + 1], saved = inputs[5 * l + 2];
+                            long steps = ip[8 + 3 * l];
+                            args.Steps[i] = (int)steps;
+                            args.ConvFrom[i] = (long)Ptr(inputs[5 * l + 3]) + kept * sizeof(float);
+                            args.ConvTo[i] = (long)Ptr(inputs[5 * l + 4]);
+                            if (steps < 0) continue;
+                            args.State[i] = (long)Ptr(source) + ip[9 + 3 * l] * sizeof(float);
+                            args.Out[i] = (long)Ptr(target) + ip[10 + 3 * l] * sizeof(float);
+                            args.Inputs[i] = steps > 0 ? (long)Ptr(saved) : 0;
+                        }
+                    }
+                    k.LaunchGdnCommit(args, stream);
+                }
+            });
+            // The last conv window write's value: that window (a reference of its own, released with the step).
+            results[0] = inputs[^1].CopyRef();
+            DeltaNetCommitRegions++;
+            return true;
+        }
+
+        /// <summary>Commits run as <see cref="TryDeltaNetCommit"/> (tests check the region engaged).</summary>
+        internal long DeltaNetCommitRegions { get; private set; }
+
         /// <summary>A hyper-connection scatter (<see cref="GraphFusion.HcScatter"/>) as one pass over the streams.</summary>
         private bool TryHcScatter(Tensor[] inputs, long[] ip, Tensor[] results)
         {
@@ -1128,7 +1213,7 @@ namespace TensorSharp.Cuda
                 or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
-            GraphFusion.QsaKeys => Kernels != null,
+            GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit => Kernels != null,
             _ => false,
         };
 
@@ -1145,6 +1230,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.MoeSelect) return TryMoeSelect(inputs, ip, results);
             if (kind == GraphFusion.QsaAttention) return TryQsaAttention(inputs, ip, fp, results);
             if (kind == GraphFusion.QsaKeys) return TryQsaKeys(inputs, ip, fp, results);
+            if (kind == GraphFusion.DeltaNetCommit) return TryDeltaNetCommit(inputs, ip, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
