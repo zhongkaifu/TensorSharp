@@ -223,19 +223,17 @@ public class HostLoadRefusalProcessTests : IDisposable
     }
 
     /// <summary>
-    /// An expert layout the direct-CUDA engine's kernels do not decode, under a layer split: each
-    /// device refused it inside the parallel upload, and the AggregateException of two refusals
-    /// aborted the CLI (Qwen3.8-Flash-Next UD-Q4_K_XL's Q5_1 down experts on two A40s, before the
-    /// engine took Q5_1). Now one refusal line naming the tensor, before any upload.
+    /// A direct-CUDA layer split over more devices than the process sees: one refusal line before any upload, where device
+    /// n's context had failed inside the load and aborted the CLI ("invalid device ordinal"; the direct engine had refused).
     /// </summary>
     [CudaFact]
-    public void Cli_DirectCudaExpertLayoutItCannotDecode_IsOneRefusalLine()
+    public void Cli_DirectCudaLayerSplitPastTheVisibleDevices_IsOneRefusalLine()
     {
-        string model = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-q4_0-down.gguf"),
-            q4kxlExperts: true, expertDownType: SyntheticGguf.GgmlType.Q4_0);
-        HostRun run = RunCliWith(model, new[] { "--backend", "cuda", "--layer-split", "2" });
+        int devices = TensorSharp.Cuda.CudaDevice.GetDeviceCount();
+        string model = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-split.gguf"));
+        HostRun run = RunCliWith(model, new[] { "--backend", "cuda", "--layer-split", (devices + 1).ToString() });
 
-        AssertRefused(run, "blk.0.ffn_down_exps.weight is Q4_0");
+        AssertRefused(run, $"needs {devices + 1} CUDA devices; this process sees {devices}");
         Assert.DoesNotContain("Unhandled exception", run.Stdout + run.Stderr, StringComparison.Ordinal);
     }
 
