@@ -1,0 +1,7 @@
+{
+  "description": "ACE-Step 1.5 turbo (GGUF from eng/audio-models/acestep_to_gguf.py) for TensorSharp Music: songs from a style caption and lyrics, 48 kHz stereo.",
+  "model": "${TENSORSHARP_MODELS}/ace-step-1.5-turbo.gguf",
+  "args": ["--backend", "cuda"],
+  "service_name": "tensorsharp-comfyui-ace-step",
+  "startup_timeout": 600
+}

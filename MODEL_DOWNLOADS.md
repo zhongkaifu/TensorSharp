@@ -586,3 +586,25 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf \
     --prompt "the ship sails into the storm, waves crashing" --image ship.jpg --output ship.mp4
 ```
+
+**Audio: Whisper, Kokoro, ACE-Step 1.5** — no published GGUFs: each is converted once with its script in
+`eng/audio-models/` (details and the checks behind them on the [Whisper](docs/models/whisper.md),
+[Kokoro](docs/models/kokoro.md) and [ACE-Step](docs/models/ace-step.md) cards).
+
+```bash
+hf download openai/whisper-large-v3-turbo --local-dir models/whisper-large-v3-turbo
+python eng/audio-models/whisper_to_gguf.py --input models/whisper-large-v3-turbo --out models/whisper-large-v3-turbo-f16.gguf
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/whisper-large-v3-turbo-f16.gguf --backend cuda \
+    --audio talk.mp3 --output talk.srt
+
+hf download hexgrad/Kokoro-82M config.json kokoro-v1_0.pth voices/zm_yunjian.pt --local-dir models/kokoro-82m
+python eng/audio-models/kokoro_to_gguf.py --input models/kokoro-82m --out models/kokoro-82m-v1.0.gguf
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/kokoro-82m-v1.0.gguf --backend cpu \
+    --prompt "今天天气很好。" --voice zm_yunjian --output speech.wav
+
+hf download Comfy-Org/ace_step_1.5_ComfyUI_files checkpoints/ace_step_1.5_turbo_aio.safetensors --local-dir models
+python eng/audio-models/acestep_to_gguf.py --input models/checkpoints/ace_step_1.5_turbo_aio.safetensors \
+    --comfyui path/to/ComfyUI --out models/ace-step-1.5-turbo.gguf
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/ace-step-1.5-turbo.gguf --backend cuda \
+    --prompt "lofi hip hop, piano" --lyrics "[Instrumental]" --duration 30 --output song.wav
+```

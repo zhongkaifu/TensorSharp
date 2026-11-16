@@ -437,6 +437,7 @@ builder.Services.AddVideoStudio(Environment.GetEnvironmentVariable("TS_STUDIO_DI
     ?? Path.Combine(baseDirectory, "studio-projects"));
 builder.Services.AddSingleton<OllamaAdapter>();
 builder.Services.AddSingleton<OpenAIChatAdapter>();
+builder.Services.AddSingleton<AudioAdapter>();
 // Responses API store: use Redis when TS_RESPONSES_STORE_REDIS_URL is set,
 // otherwise fall back to the bounded in-memory cache.
 string? responsesRedisUrl = Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL")?.Trim();
@@ -710,6 +711,7 @@ app.MapVideoStudio();
 _ = app.Services.GetRequiredService<TensorSharp.Studio.StudioService>();
 app.MapOllamaEndpoints();
 app.MapOpenAIEndpoints();
+app.MapAudioEndpoints();
 app.MapLoraEndpoints();
 
 try

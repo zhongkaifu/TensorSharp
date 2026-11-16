@@ -1,10 +1,11 @@
 # ComfyUI nodes
 
 These [ComfyUI](https://github.com/Comfy-Org/ComfyUI) custom nodes run TensorSharp
-generations from a ComfyUI workflow: LTX 2.5 video with its soundtrack, and Qwen-Image-2.1
-pictures and edits. Each generation node sends one request to a TensorSharp server's
-streaming route and returns ComfyUI types, so the result feeds ComfyUI's own nodes: Save
-Video, Get Video Components, upscalers, frame interpolation, or the next clip.
+generations from a ComfyUI workflow: LTX 2.5 video with its soundtrack, Qwen-Image-2.1
+pictures and edits, and audio: Whisper transcripts, Kokoro speech and ACE-Step songs. Each
+generation node sends one request to a TensorSharp server and returns ComfyUI types, so the
+result feeds ComfyUI's own nodes: Save Video, Get Video Components, upscalers, frame
+interpolation, Save Audio, or the next clip.
 
 ComfyUI needs no change. The pack is an ordinary custom node that uses ComfyUI's public
 node API (`comfy_api.latest`), built the same way as ComfyUI's own API nodes for hosted
@@ -21,7 +22,10 @@ models, but pointed at a TensorSharp server on your machine.
   [LTX 2.5](../../docs/models/ltx-2.5.md) and [Qwen-Image-2.1](../../docs/models/qwenimage21.md).
   A preset downloads missing files when its server starts, which for LTX 2.5's 43 GB
   takes longer than a profile waits (`startup_timeout`). Fetch them first, for example
-  with one CLI run of the preset.
+  with one CLI run of the preset. The audio profiles name GGUFs you convert once with the
+  scripts in `eng/audio-models/` ([Whisper](../../docs/models/whisper.md),
+  [Kokoro](../../docs/models/kokoro.md), [ACE-Step](../../docs/models/ace-step.md)) and put in
+  `TENSORSHARP_MODELS`.
 - For MP4 export, FFmpeg on `PATH` or in `TS_FFMPEG`. On Windows, the CUDA runtime as
   described in DEVELOPMENT.md.
 
@@ -53,13 +57,18 @@ cannot install this one. The nodes appear under **TensorSharp** in the node libr
 | **TensorSharp Server** | Names the server (`url`) and a launch `profile`. With a profile, it starts a server for that profile on the URL's port, or reuses one already hosting its model. A server it started for another profile is stopped first. Without a profile, it connects to a server that is already running |
 | **TensorSharp Video** | Makes one clip from text, a first frame (`first_frame`), a last frame (`last_frame`) or reference pictures (`reference_images`, one per picture of the batch). It outputs the `video` (an MP4 with sound, saved under `output/tensorsharp/`), its `last_frame` for chaining the next clip, the `audio` and the file `path` |
 | **TensorSharp Image** | Generates a picture, or edits the connected pictures (`images`, each picture of the batch one reference). It shows the server's denoising previews on the node, and the finished picture reduced to at most 1024 pixels on its long side (the `image` output stays full size) |
+| **TensorSharp Speech** | Speaks `text` with a Kokoro server (profile `kokoro-82m`, on the CPU): Mandarin text, a `voice` from the model's set and a `speed`. It outputs 24 kHz `audio` and plays it on the node |
+| **TensorSharp Transcribe** | Transcribes `audio` of any length with a Whisper server (profile `whisper-large-v3-turbo`): `language` (empty detects it), `task` (`translate` to English on checkpoints trained for it) and `word_timestamps`. It outputs the `text`, an `srt` and the `json` of OpenAI's `verbose_json` (segments, and words when timed), and shows the text on the node |
+| **TensorSharp Music** | Writes a song with an ACE-Step 1.5 server (profile `ace-step-1.5-turbo`) from `tags` (the style), `lyrics` with `[verse]` / `[chorus]` tags or `[Instrumental]`, a `duration`, and an optional `bpm`, `key` and `time_signature` the planner otherwise chooses. It outputs 48 kHz stereo `audio` and plays it on the node |
 | **TensorSharp Stop Server** | Stops the server this ComfyUI started once the value it receives (a clip, a picture, anything) exists, and passes that value on, so later nodes get the GPU memory back. The next TensorSharp node starts it again |
 
 A setting left at zero is decided by the hosted model, its preset or its LoRA plug-in.
 Each node shows its progress in ComfyUI's progress bar, one step per denoising step.
 Cancelling closes the connection, and TensorSharp stops the generation at its next step or
 phase boundary. Before each generation the node unloads ComfyUI's own models from the GPU
-(`free_comfyui_memory`).
+(`free_comfyui_memory`). The audio nodes call `/v1/audio/*`, which answer once with the
+whole result, so they show no steps; cancelling one frees ComfyUI at once, but the server
+still finishes that request before it takes the next.
 
 ## Profiles
 

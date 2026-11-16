@@ -1,0 +1,7 @@
+{
+  "description": "Kokoro-82M v1.0 (GGUF from eng/audio-models/kokoro_to_gguf.py) for TensorSharp Speech: Mandarin text to 24 kHz speech on the CPU, leaving the GPU to other nodes.",
+  "model": "${TENSORSHARP_MODELS}/kokoro-82m-v1.0.gguf",
+  "args": ["--backend", "cpu"],
+  "service_name": "tensorsharp-comfyui-kokoro",
+  "startup_timeout": 300
+}

@@ -249,6 +249,35 @@ namespace TensorSharp.Models.Direct
             return ctx.Track(lin);
         }
 
+        /// <summary>A contiguous block of rows [firstRow, firstRow + rowCount) of a 2-D GGUF weight as its own
+        /// linear layer (a slice of a tied embedding used as an output head, for instance).</summary>
+        public static DirectLinear FromGgufRows(DirectContext ctx, GgufFile gguf, string weightName, long firstRow, long rowCount)
+        {
+            var info = gguf.Tensors[weightName];
+            if (info.Shape.Length != 2) throw new ArgumentException($"'{weightName}' is not a matrix.");
+            long ne0 = (long)info.Shape[0], rows = (long)info.Shape[1];
+            if (firstRow < 0 || rowCount <= 0 || firstRow + rowCount > rows)
+                throw new ArgumentOutOfRangeException(nameof(rowCount), $"rows [{firstRow}, {firstRow + rowCount}) of {rows}.");
+            long rowBytes = gguf.GetTensorByteCount(info) / rows;
+            if (rowBytes * rows != gguf.GetTensorByteCount(info) || GgufFile.GetBlockSize(info.Type) > 1 && ne0 % GgufFile.GetBlockSize(info.Type) != 0)
+                throw new NotSupportedException($"'{weightName}' rows are not byte-addressable.");
+            if (!gguf.TryGetTensorDataPointer(info, out IntPtr p))
+                throw new System.IO.InvalidDataException($"GGUF tensor '{weightName}' has no data pointer.");
+            IntPtr start = p + (nint)(firstRow * rowBytes);
+            var lin = new DirectLinear(ctx, start, IntPtr.Zero, (int)info.Type, ne0, rowCount, rowCount * rowBytes, null, false);
+            if (ctx.IsMlx && MlxQuantizedOps.CanPreloadDirectFloatType((int)info.Type))
+                MlxQuantizedOps.PreloadDirectFloatWeight(ctx.MlxAllocator, start, start, (int)info.Type, ne0, rowCount, rowCount * rowBytes);
+            else if (!ctx.IsCuda && (ctx.IsMlx || !lin.UseManagedQuantOnCpu))
+            {
+                var ids = new int[rowCount];
+                for (int i = 0; i < rowCount; i++) ids[i] = checked((int)(firstRow + i));
+                var w = new float[ne0 * rowCount];
+                DirectOps.DequantRows(gguf, weightName, ids, w);
+                lin.SetCpuWeight(w, ne0, rowCount);
+            }
+            return ctx.Track(lin);
+        }
+
         /// <summary>Load the 5D patch-embedding conv as the flattened
         /// [ic*kh*kw, oc] matmul weight (same bytes; see WanDiT.PatchW5D).</summary>
         public static DirectLinear FromGgufPatch(DirectContext ctx, GgufFile gguf, string weightName, string biasName)
@@ -1003,6 +1032,52 @@ namespace TensorSharp.Models.Direct
             var r = ctx.NewF32(x.Sizes);
             Ops.GELU(r, x);
             return r;
+        }
+
+        /// <summary>
+        /// Exact-form GELU, x * (1 + erf(x / sqrt 2)) / 2 (torch.nn.GELU's default), with erf from
+        /// the Abramowitz-Stegun 7.1.26 polynomial (|error| below 1.5e-7) that H3's kernels use.
+        /// Models trained on it need it: on Whisper's encoder the tanh form moves single
+        /// positions to cosine 0.4 of the reference.
+        /// </summary>
+        public static unsafe Tensor GeluErf(DirectContext ctx, Tensor x)
+        {
+            var r = ctx.NewF32(x.Sizes);
+            try
+            {
+                if (ctx.IsCuda && CudaMiniMaxH3Ops.TryTransform(r, x, null, null, 5, 0)) return r;
+                if (ctx.IsMlx && MlxMiniMaxH3Ops.TryTransform(r, x, null, null, 5, 0)) return r;
+                if (r.Storage is CpuStorage && x.Storage is CpuStorage && x.IsContiguous())
+                {
+                    long n = r.ElementCount();
+                    float* xp = (float*)CpuNativeHelpers.GetBufferStart(x);
+                    float* rp = (float*)CpuNativeHelpers.GetBufferStart(r);
+                    const long chunk = 1 << 16;
+                    Parallel.For(0, (n + chunk - 1) / chunk, c =>
+                    {
+                        long end = Math.Min(n, (c + 1) * chunk);
+                        for (long i = c * chunk; i < end; i++) rp[i] = GeluErfScalar(xp[i]);
+                    });
+                    return r;
+                }
+                throw new NotSupportedException("this backend has no exact-GELU path for the direct primitives.");
+            }
+            catch
+            {
+                r.Dispose();
+                throw;
+            }
+        }
+
+        internal static float GeluErfScalar(float value)
+        {
+            float scaled = value * 0.7071067811865475f;
+            float absolute = MathF.Abs(scaled);
+            float t = 1f / (1f + 0.3275911f * absolute);
+            float polynomial = ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
+            float erf = 1f - polynomial * MathF.Exp(-absolute * absolute);
+            if (scaled < 0) erf = -erf;
+            return value * 0.5f * (1f + erf);
         }
 
         public static Tensor Silu(DirectContext ctx, Tensor x)

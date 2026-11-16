@@ -30,6 +30,9 @@ public sealed class ServingContractConformanceTests
         "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-glimmer", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
         "diffusion-gemma", "qwen_image", "wan", "ltx-2.5", "minimax-h3", "minimax-h3-image",
+        // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
+        // families they generate media rather than decode steps, so the decoder runtime does not apply.
+        "whisper", "kokoro", "ace-step-1.5",
     };
 
     /// <summary>
@@ -39,6 +42,9 @@ public sealed class ServingContractConformanceTests
     /// </summary>
     internal static readonly string[] KnownGaps =
     {
+        "ace-step-1.5: HybridParallel@cuda",
+        "ace-step-1.5: LayerSplit@cuda",
+        "ace-step-1.5: TensorParallel@cuda",
         "deepseek41: ContinuousBatching@cpu",
         "deepseek41: ExpertOffload@cuda",
         "deepseek41: HybridParallel@cuda",
@@ -156,6 +162,9 @@ public sealed class ServingContractConformanceTests
         "wan: LayerSplit@ggml_vulkan",
         "wan: TensorParallel@ggml_cuda",
         "wan: TensorParallel@ggml_vulkan",
+        "whisper: HybridParallel@cuda",
+        "whisper: LayerSplit@cuda",
+        "whisper: TensorParallel@cuda",
     };
 
     private static IEnumerable<string> ActualGaps() =>
