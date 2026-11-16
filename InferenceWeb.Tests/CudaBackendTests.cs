@@ -43,6 +43,58 @@ public class CudaBackendTests
         }, tensor.GetElementsAsFloat(16));
     }
 
+    /// <summary>
+    /// A device copy into part of a storage whose host copy holds the newest writes (set from the host after the device's
+    /// own -1s) keeps those writes outside the copied range: a contiguous row (the driver copy), a column of short rows (the
+    /// pitched 2D kernel) and a block of a 3D view (the 4D kernel). The copies had made the device copy current without
+    /// uploading the host's, so the bytes around them read back as the device's stale -1s.
+    /// </summary>
+    [CudaFact]
+    public void CudaPartialDeviceCopy_KeepsTheDestinationsHostWrites()
+    {
+        using var allocator = new CudaAllocator();
+        float[] host = Enumerable.Range(0, 64).Select(i => (float)i).ToArray();
+        using var source = new Tensor(allocator, DType.Float32, 4, 4, 4);
+        Ops.Fill(source, 500f);
+
+        float[] Copied(Func<Tensor, Tensor> dstView, Func<Tensor, Tensor> srcView)
+        {
+            using var dst = new Tensor(allocator, DType.Float32, 4, 4, 4);
+            Ops.Fill(dst, -1f);
+            dst.SetElementsAsFloat(host);
+            using (Tensor d = dstView(dst))
+            using (Tensor s = srcView(source))
+                Ops.Copy(d, s);
+            return dst.GetElementsAsFloat(64);
+        }
+
+        float[] Expected(Func<int, int, int, bool> copied)
+        {
+            var e = (float[])host.Clone();
+            for (int a = 0; a < 4; a++)
+                for (int b = 0; b < 4; b++)
+                    for (int c = 0; c < 4; c++)
+                        if (copied(a, b, c)) e[a * 16 + b * 4 + c] = 500f;
+            return e;
+        }
+
+        static Tensor Columns(Tensor t)
+        {
+            using Tensor rows = t.View(16, 4);
+            return rows.Narrow(1, 0, 2);
+        }
+        static Tensor Block(Tensor t)
+        {
+            using Tensor a = t.Narrow(0, 2, 2);
+            using Tensor b = a.Narrow(1, 1, 3);
+            return b.Narrow(2, 0, 3);
+        }
+
+        AssertClose(Expected((a, b, c) => a == 1), Copied(t => t.Narrow(0, 1, 1), s => s.Narrow(0, 1, 1)));
+        AssertClose(Expected((a, b, c) => c < 2), Copied(Columns, Columns));
+        AssertClose(Expected((a, b, c) => a >= 2 && b >= 1 && c < 3), Copied(Block, Block));
+    }
+
     [CudaFact]
     public unsafe void CudaStorage_ReadOnlyHostCheckout_DoesNotQueueAnUpload()
     {

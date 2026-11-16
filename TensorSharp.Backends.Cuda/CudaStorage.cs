@@ -324,6 +324,10 @@ namespace TensorSharp.Cuda
                 return;
 
             src.EnsureDeviceCurrent();
+            // Host writes not yet on the device reach it first unless the copy overwrites every byte: the device copy is the
+            // current one after it, and the bytes outside the copied range would otherwise be the device's stale ones.
+            if (destinationByteOffset != 0 || byteCount != ByteLength)
+                EnsureDeviceCurrent();
             AllocatorImpl.Context.MakeCurrent();
             IntPtr dst = AddBytes(deviceBuffer, destinationByteOffset);
             IntPtr source = AddBytes(src.deviceBuffer, sourceByteOffset);
@@ -414,6 +418,8 @@ namespace TensorSharp.Cuda
                 return false;
 
             src.EnsureDeviceCurrent();
+            // Pitched rows write part of this storage: its host writes reach the device first (CopyDeviceFrom's rule).
+            EnsureDeviceCurrent();
             AllocatorImpl.Context.MakeCurrent();
             IntPtr dst = AddBytes(deviceBuffer, destByteOffset);
             IntPtr source = AddBytes(src.deviceBuffer, srcByteOffset);
@@ -450,6 +456,7 @@ namespace TensorSharp.Cuda
                 return false;
 
             src.EnsureDeviceCurrent();
+            EnsureDeviceCurrent();   // a partial write as well (CopyDeviceFrom's rule)
             AllocatorImpl.Context.MakeCurrent();
             kernels.LaunchCopy4DBytes(
                 AddBytes(src.deviceBuffer, srcByteOffset), AddBytes(deviceBuffer, destByteOffset),
