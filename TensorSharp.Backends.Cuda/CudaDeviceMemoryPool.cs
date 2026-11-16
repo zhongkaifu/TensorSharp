@@ -22,8 +22,13 @@ namespace TensorSharp.Cuda
     /// Blocks are fungible, so a block rented on one shard may be returned to another
     /// after a thread migrates — that only rebalances the cache, it is never unsafe.
     ///
-    /// The total byte cap is preserved: the sum of the per-shard caps equals the
-    /// configured <c>maxCachedBytes</c>.
+    /// The byte cap is the pool's, not a shard's: a shard caches past its even share of
+    /// <c>maxCachedBytes</c> while every shard's small blocks together stay within it (the
+    /// shards' counters are summed only then, so the hot path keeps no shared counter). A
+    /// cap split evenly over the shards was 8 MB a shard on a 48-core host (64 shards of
+    /// 512 MB): one thread's step that used more than that freed the rest to the driver
+    /// and allocated it again on the next step - every DFlash2 draft pass of Qwen3.8-27B
+    /// on an RTX PRO 4000 issued ~70 cuMemAlloc and ~70 synchronizing cuMemFree calls.
     /// </summary>
     public sealed class CudaDeviceMemoryPool
     {
@@ -117,7 +122,7 @@ namespace TensorSharp.Cuda
             for (int i = 0; i < count; i++)
                 shards[i] = new Shard();
             shardMask = count - 1;
-            // Split the global cap evenly so the sum of per-shard caps == maxCachedBytes.
+            // A shard's even share of the cap; past it a shard caches only while the pool has room (CachedSnapshot).
             perShardCap = Math.Max(maxCachedBytes / count, 0);
         }
 
@@ -176,6 +181,15 @@ namespace TensorSharp.Cuda
             // Backing allocation runs outside the shard lock so a slow driver call
             // never blocks other threads sharing the shard.
             return backingAllocate(allocationBytes);
+        }
+
+        /// <summary>Every shard's cached small blocks, read without their locks (a shard past its share asks).</summary>
+        private long CachedSnapshot()
+        {
+            long total = 0;
+            foreach (Shard shard in shards)
+                total += Volatile.Read(ref shard.CachedBytes);
+            return total;
         }
 
         public void Return(IntPtr ptr, long allocationBytes)
@@ -256,7 +270,8 @@ namespace TensorSharp.Cuda
             Shard shard = CurrentShard();
             lock (shard.Sync)
             {
-                if (shard.CachedBytes + allocationBytes > perShardCap)
+                if (shard.CachedBytes + allocationBytes > perShardCap
+                    && CachedSnapshot() + allocationBytes > maxCachedBytes)
                     return false;
 
                 if (!shard.Pool.TryGetValue(allocationBytes, out Stack<IntPtr> stack))
