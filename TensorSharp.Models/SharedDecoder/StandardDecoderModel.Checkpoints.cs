@@ -336,7 +336,7 @@ namespace TensorSharp.Models
                 foreach (Tensor t in AllCacheTensors(k).Concat(AllCacheTensors(v))) { InvalidateTensorDeviceCache(t); t.Dispose(); }
                 throw;
             }
-            ForgetGraphsOf(slot);
+            ForgetGraphsOfGrowing(slot);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             slot.K = k;

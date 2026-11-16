@@ -543,7 +543,7 @@ namespace TensorSharp.Models
             // Only this slot's graphs bound the caches it gives up: every other request's steps and recordings stay. Clearing
             // the whole cache when a pooled 512-cell slot grew for a 4K prompt had every slot's decode trace and record again
             // (Qwen3.8 Flash Next on an A40: five graphs and two parked recordings, 2,200 allocations and a 109 ms recording).
-            ForgetGraphsOf(slot);
+            ForgetGraphsOfGrowing(slot);
             CopyRows(slot.K, k, slot.Length);
             CopyRows(slot.V, v, slot.Length);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }

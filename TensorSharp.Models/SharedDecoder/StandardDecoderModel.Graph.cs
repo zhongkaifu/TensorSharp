@@ -416,7 +416,7 @@ namespace TensorSharp.Models
         {
             if (!_decodeReplays.Remove(shape ?? "", out DecodeReplay r)) return;
             if (park) ParkOrDisposeCapture(r);
-            else r.DisposeCapture();
+            else DisposeRecording(r.DisposeCapture);
             r.Step.Dispose();
         }
 
@@ -481,7 +481,47 @@ namespace TensorSharp.Models
         {
             if (!_parkedRecordings.Remove(signature, out ParkedRecording p)) return;
             _parkedLru.Remove(signature);
-            p.Dispose();
+            DisposeRecording(p.Dispose);
+        }
+
+        /// <summary>Set while a slot's caches are replaced before its request's step (<see cref="ForgetGraphsOfGrowing"/>):
+        /// the recordings that go are disposed later.</summary>
+        private List<Action> _recordingDisposals;
+
+        /// <summary>Dispose a dropped recording now, or later while a slot grows (<see cref="ForgetGraphsOfGrowing"/>).</summary>
+        private void DisposeRecording(Action dispose)
+        {
+            if (_recordingDisposals != null) _recordingDisposals.Add(dispose);
+            else dispose();
+        }
+
+        /// <summary>
+        /// <see cref="ForgetGraphsOf"/> for a slot whose caches are replaced by larger ones before its request's step: the
+        /// steps kept over the slot and the recordings bound to it go as there, but the recordings are disposed while the
+        /// device runs the next recorded step (<see cref="IGraphExecutor.RunWhileNextRecordedStepRuns"/>; now where the
+        /// executor runs none), not before the prompt that waits for the new caches. Nothing runs a dropped recording again;
+        /// only its device memory comes back later. Disposing them first took 1.7-7.1 ms of a 4K prompt's first token
+        /// (Qwen3.8-27B on an RTX PRO 6000 slice, whose pooled 1,024-cell slot held a request's decode and verify recordings).
+        /// </summary>
+        private void ForgetGraphsOfGrowing(Slot slot)
+        {
+            _recordingDisposals = new List<Action>();
+            List<Action> due;
+            try
+            {
+                ForgetGraphsOf(slot);
+            }
+            finally
+            {
+                due = _recordingDisposals;
+                _recordingDisposals = null;
+            }
+            if (due.Count == 0) return;
+            void DisposeDue()
+            {
+                foreach (Action dispose in due) dispose();
+            }
+            if (GraphExecutor?.RunWhileNextRecordedStepRuns(DisposeDue) != true) DisposeDue();
         }
 
         /// <summary>Parked recordings that bind any of <paramref name="storages"/> (<see cref="BoundStorages"/> pairs) go.</summary>
