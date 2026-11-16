@@ -13,6 +13,7 @@ Start with the output you need, then check the model's inputs, weights and backe
 | Search text, code or media | [Embedding guide](../embeddings.md): Snowflake, MiniLM and EmbeddingGemma 2 output vectors; media support depends on the encoder. |
 | Generate or edit images | [Qwen-Image-2.1](qwenimage21.md), with its matching files and sampling recipe; [MiniMax-H3-Image](minimax-h3-image.md) for text to image up to ~16 MP. |
 | Generate video, with or without audio | [LTX 2.5](ltx-2.5.md), [MiniMax-H3](minimax-h3.md) or [Wan](wan.md); compare the outputs below. |
+| Transcribe speech, speak text, or make music | [Whisper](whisper.md), [Kokoro](kokoro.md) or [ACE-Step 1.5](ace-step.md); see the audio table below. |
 | Get files for a model you have chosen | [Model downloads](../../MODEL_DOWNLOADS.md) and its card; check the named quantization, memory and companion files. |
 
 ## Reading support status
@@ -58,6 +59,14 @@ DeepSeek 1017 defaults to approximate YOCO prefill; read its [quality and benchm
 | [LTX 2.5 Distilled](ltx-2.5.md) | Text, image keyframes; optional identity sheets | Video + 48 kHz stereo | Experimental: current two-stage recipe and companions; Vulkan and multi-GPU are unsupported. |
 | [MiniMax-H3](minimax-h3.md) | Text, keyframes or reference media by checkpoint | Video + 32 kHz stereo | Conditional: distinct FL2VA/Ref2VA checkpoints. Component gates and whole-generation coverage differ. |
 | [Wan 2.1 / 2.2](wan.md) | Text, image by variant | Video (no audio) | Conditional: variant-specific encoders/VAE, sampler and step schedule; multi-GPU is unsupported. |
+
+## Audio
+
+| Family / card | Inputs | Output / task | Conditions and evidence |
+|---|---|---|---|
+| [Whisper](whisper.md) | Speech, any length | Transcript with segment / word timestamps; translation on checkpoints trained for it | Verified: `cpu` and `cuda`; text identical to transformers on English and Mandarin long-form clips. |
+| [Kokoro-82M](kokoro.md) | Mandarin text, or phonemes | 24 kHz speech | Verified: `cpu`; phonemes identical to Kokoro's pipeline. No English text front end yet. |
+| [ACE-Step 1.5](ace-step.md) | Caption, lyrics, tempo / key / metre | 48 kHz stereo songs | Verified: `cuda` and `cpu` against ComfyUI stage by stage; reference audio not implemented. |
 
 ## Detailed reference and architecture development
 

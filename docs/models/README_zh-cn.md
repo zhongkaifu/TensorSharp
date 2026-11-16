@@ -13,6 +13,7 @@
 | 搜索文本、代码或媒体 | [嵌入指南](../embeddings_zh-cn.md)：Snowflake、MiniLM 与 EmbeddingGemma 2 输出向量；媒体支持取决于编码器。 |
 | 生成或编辑图像 | [Qwen-Image-2.1](qwenimage21_zh-cn.md) 的匹配文件与采样配方。 |
 | 生成视频，或同时生成音频 | [LTX 2.5](ltx-2.5_zh-cn.md)、[MiniMax-H3](minimax-h3_zh-cn.md) 或 [Wan](wan_zh-cn.md)；比较下表的输出区别。 |
+| 语音转写、朗读文本或生成音乐 | [Whisper](whisper_zh-cn.md)、[Kokoro](kokoro_zh-cn.md) 或 [ACE-Step 1.5](ace-step_zh-cn.md)；见下方音频表。 |
 | 已经选定模型，需要文件 | [模型下载](../../MODEL_DOWNLOADS_zh-cn.md)与该模型卡片；按卡片核对量化、内存及伴随文件。 |
 
 ## 如何阅读支持状态
@@ -58,6 +59,14 @@ DeepSeek 1017 的默认 YOCO prefill 是近似计算；选择精确设置前请�
 | [MiniMax-H3-Image](minimax-h3-image_zh-cn.md) | 文本 | 图像，约 4 至 20 MP | 条件支持：仅 ggml 后端（已在 `ggml_cuda` 上实测）；6 步蒸馏、guidance 1；尚未实现编辑。 |
 | [MiniMax-H3](minimax-h3_zh-cn.md) | 文本、关键帧或由检查点决定的参考媒体 | 视频 + 32 kHz 立体声 | 条件支持：FL2VA / Ref2VA 是不同检查点。组件门控与完整生成验证范围不同。 |
 | [Wan 2.1 / 2.2](wan_zh-cn.md) | 文本；图像取决于变体 | 视频（无音频） | 条件支持：按变体匹配编码器 / VAE、采样器与步数；不支持多 GPU。 |
+
+## 音频
+
+| 家族 / 卡片 | 输入 | 输出 / 任务 | 条件与依据 |
+|---|---|---|---|
+| [Whisper](whisper_zh-cn.md) | 任意长度的语音 | 带片段 / 词级时间戳的转写；支持翻译的检查点可翻译 | 已验证：`cpu` 与 `cuda`；英语和普通话长音频文本与 transformers 完全一致。 |
+| [Kokoro-82M](kokoro_zh-cn.md) | 普通话文本或音素 | 24 kHz 语音 | 已验证：`cpu`；音素与 Kokoro 管线完全一致。暂无英文文本前端。 |
+| [ACE-Step 1.5](ace-step_zh-cn.md) | 风格描述、歌词、速度 / 调式 / 拍号 | 48 kHz 立体声歌曲 | 已验证：`cuda` 与 `cpu` 逐阶段对照 ComfyUI；尚未实现参考音频。 |
 
 ## 详细参考与架构开发
 

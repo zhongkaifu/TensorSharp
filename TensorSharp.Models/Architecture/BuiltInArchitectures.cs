@@ -55,6 +55,11 @@ namespace TensorSharp.Models.Architecture
             DiffusionGemmaArchitecture.Descriptor,
             QwenImage.QwenImageArchitecture.Descriptor,
             WanVideo.WanVideoArchitecture.Descriptor,
+
+            // Audio.
+            Whisper.WhisperArchitecture.Descriptor,
+            Kokoro.KokoroArchitecture.Descriptor,
+            AceStep.AceStepArchitecture.Descriptor,
         };
 
         public static void RegisterAll()

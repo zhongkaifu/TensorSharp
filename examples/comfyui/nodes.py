@@ -7,7 +7,7 @@
 #
 # TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
-"""ComfyUI nodes that run whole video and image generations on a TensorSharp server.
+"""ComfyUI nodes that run video, image and audio generations on a TensorSharp server.
 
 Each generation node sends one request to TensorSharp's streaming route, turns its step
 events into ComfyUI's progress bar, closes the connection when the prompt is cancelled
@@ -20,6 +20,7 @@ from __future__ import annotations
 import atexit
 import base64
 import io as _bytes_io
+import json
 import logging
 import os
 import wave
@@ -155,6 +156,29 @@ def _preview(data_url) -> tuple | None:
 def _seed_input() -> io.Int.Input:
     return io.Int.Input("seed", default=42, min=0, max=0xFFFFFFFFFFFFFFFF, control_after_generate=True,
                         tooltip="Noise seed. TensorSharp takes it modulo 2^63.")
+
+
+def _audio_from_wav(data: bytes) -> dict:
+    """The WAV an audio route answers as ComfyUI AUDIO ({waveform [1, C, N], sample_rate})."""
+    samples, rate = ts.read_wav(data)
+    return {"waveform": torch.from_numpy(samples)[None, ...], "sample_rate": rate}
+
+
+def _wav_from_audio(audio: dict) -> bytes:
+    """The first clip of a ComfyUI AUDIO batch as a 16-bit WAV."""
+    waveform = audio["waveform"]
+    if waveform.dim() == 3:
+        waveform = waveform[0]
+    return ts.wav_bytes(waveform.float().cpu().numpy(), int(audio["sample_rate"]))
+
+
+def _require_audio(info: dict, kind: str, url: str, what: str) -> dict:
+    """The /api/models audio block of a server hosting a `kind` model, or a clear refusal."""
+    audio = info.get("audio") or {}
+    if audio.get("kind") != kind:
+        raise ValueError(f"{url} hosts {sm.hosted_model(info) or 'a model'}, which does not {what}; "
+                         f"pick a profile for a {kind} model")
+    return audio
 
 
 # ---- nodes ---------------------------------------------------------------------------
@@ -317,6 +341,142 @@ class TensorSharpImage(io.ComfyNode):
         return io.NodeOutput(image, ui=ui.PreviewImage(preview, cls=cls))
 
 
+class TensorSharpSpeech(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TensorSharpSpeech",
+            display_name="TensorSharp Speech",
+            category=CATEGORY,
+            description=(
+                "Speaks text on a TensorSharp server hosting a speech model (Kokoro-82M: Mandarin text, "
+                "24 kHz). Long text is split at newlines and sentence ends, as Kokoro's own pipeline does."),
+            inputs=[
+                ServerType.Input("server"),
+                io.String.Input("text", multiline=True, default=""),
+                io.String.Input("voice", default="",
+                                tooltip="A voice the model has (zm_yunjian, zf_xiaoxiao, ...); empty for its default. "
+                                        "The node lists them in the log when the name is unknown."),
+                io.Float.Input("speed", default=1.0, min=0.25, max=4.0, step=0.05),
+            ],
+            outputs=[io.Audio.Output(display_name="audio")],
+        )
+
+    @classmethod
+    async def execute(cls, server: dict, text: str, voice: str, speed: float) -> io.NodeOutput:
+        info = await sm.ensure_server(server["url"], server["profile"], LOG_DIR, before_start=_free_comfy_memory)
+        caps = _require_audio(info, "speech", server["url"], "speak text")
+        if voice.strip() and caps.get("voices") and voice.strip() not in caps["voices"]:
+            raise ValueError(f"the hosted model has no voice {voice!r}; it has {', '.join(caps['voices'])}")
+        body = ts.build_speech_body(text, voice=voice, speed=speed)
+        async with ts.TensorSharpClient(server["url"], headers=_trace_headers()) as client:
+            try:
+                data = await client.post_audio("/v1/audio/speech", body,
+                                               should_stop=comfy.model_management.processing_interrupted)
+            except ts.Interrupted:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                raise
+        audio = _audio_from_wav(data)
+        return io.NodeOutput(audio, ui=ui.PreviewAudio(audio, cls=cls))
+
+
+class TensorSharpTranscribe(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TensorSharpTranscribe",
+            display_name="TensorSharp Transcribe",
+            category=CATEGORY,
+            description=(
+                "Transcribes audio of any length on a TensorSharp server hosting a speech recognition "
+                "model (Whisper), with segment timestamps and, when asked, word timestamps."),
+            inputs=[
+                ServerType.Input("server"),
+                io.Audio.Input("audio"),
+                io.String.Input("language", default="", tooltip="An ISO 639-1 code such as en or zh; empty detects it."),
+                io.Combo.Input("task", options=["transcribe", "translate"], default="transcribe",
+                               tooltip="translate: to English, on checkpoints trained for it (large-v3-turbo is not)."),
+                io.Boolean.Input("word_timestamps", default=False,
+                                 tooltip="Also time each word (a second decoder pass per window)."),
+                io.String.Input("prompt", multiline=True, default="", optional=True, advanced=True,
+                                tooltip="Text before the audio: names and spellings the speech uses."),
+            ],
+            outputs=[
+                io.String.Output(display_name="text"),
+                io.String.Output(display_name="srt"),
+                io.String.Output(display_name="json", tooltip="OpenAI's verbose_json: segments, and words when timed."),
+            ],
+        )
+
+    @classmethod
+    async def execute(cls, server: dict, audio: dict, language: str, task: str, word_timestamps: bool,
+                      prompt: str = "") -> io.NodeOutput:
+        info = await sm.ensure_server(server["url"], server["profile"], LOG_DIR, before_start=_free_comfy_memory)
+        _require_audio(info, "transcription", server["url"], "transcribe speech")
+        wav = _wav_from_audio(audio)
+        async with ts.TensorSharpClient(server["url"], headers=_trace_headers()) as client:
+            try:
+                result = await client.transcribe(wav, language=language, translate=task == "translate", prompt=prompt,
+                                                 word_timestamps=word_timestamps,
+                                                 should_stop=comfy.model_management.processing_interrupted)
+            except ts.Interrupted:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                raise
+        text = str(result.get("text", "")).strip()
+        srt = ts.srt_from_segments(result.get("segments") or [])
+        log.info("TensorSharp: transcribed %.1f s (%s), %d segments", result.get("duration") or 0.0,
+                 result.get("language"), len(result.get("segments") or []))
+        return io.NodeOutput(text, srt, json.dumps(result, ensure_ascii=False), ui=ui.PreviewText(text))
+
+
+class TensorSharpMusic(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TensorSharpMusic",
+            display_name="TensorSharp Music",
+            category=CATEGORY,
+            description=(
+                "Writes a song (48 kHz stereo) from a style caption and lyrics on a TensorSharp server hosting "
+                "a music model (ACE-Step 1.5). Zero or empty settings are left to the model's planner."),
+            inputs=[
+                ServerType.Input("server"),
+                io.String.Input("tags", multiline=True, default="", tooltip="Style caption: genre, instruments, mood, voice."),
+                io.String.Input("lyrics", multiline=True, default="[Instrumental]",
+                                tooltip="Lyrics with [verse] / [chorus] section tags, or [Instrumental]."),
+                io.Float.Input("duration", default=30.0, min=1.0, max=600.0, step=0.1, tooltip="Seconds."),
+                io.Int.Input("bpm", default=0, min=0, max=300, tooltip="0: the planner chooses."),
+                io.String.Input("key", default="", tooltip="Such as 'C major' or 'A minor'; empty: the planner chooses."),
+                io.Combo.Input("time_signature", options=list(ts.TIME_SIGNATURES), default="auto"),
+                io.String.Input("language", default="en", tooltip="Language of the lyrics (en, zh, ja, ...)."),
+                io.Int.Input("steps", default=0, min=0, max=200, tooltip="0: the checkpoint's own (8 for turbo)."),
+                _seed_input(),
+                io.Boolean.Input("free_comfyui_memory", default=True),
+            ],
+            outputs=[io.Audio.Output(display_name="audio")],
+        )
+
+    @classmethod
+    async def execute(cls, server: dict, tags: str, lyrics: str, duration: float, bpm: int, key: str,
+                      time_signature: str, language: str, steps: int, seed: int,
+                      free_comfyui_memory: bool) -> io.NodeOutput:
+        info = await sm.ensure_server(server["url"], server["profile"], LOG_DIR, before_start=_free_comfy_memory)
+        _require_audio(info, "music", server["url"], "generate music")
+        if free_comfyui_memory:
+            _free_comfy_memory()
+        body = ts.build_music_body(tags, lyrics=lyrics, duration=duration, bpm=bpm, key=key,
+                                   time_signature=time_signature, language=language, steps=steps, seed=seed)
+        async with ts.TensorSharpClient(server["url"], headers=_trace_headers()) as client:
+            try:
+                data = await client.post_audio("/v1/audio/music", body,
+                                               should_stop=comfy.model_management.processing_interrupted)
+            except ts.Interrupted:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                raise
+        audio = _audio_from_wav(data)
+        return io.NodeOutput(audio, ui=ui.PreviewAudio(audio, cls=cls))
+
+
 class TensorSharpStopServer(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -344,7 +504,8 @@ class TensorSharpStopServer(io.ComfyNode):
 class TensorSharpExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [TensorSharpServer, TensorSharpVideo, TensorSharpImage, TensorSharpStopServer]
+        return [TensorSharpServer, TensorSharpVideo, TensorSharpImage, TensorSharpSpeech, TensorSharpTranscribe,
+                TensorSharpMusic, TensorSharpStopServer]
 
 
 async def comfy_entrypoint() -> TensorSharpExtension:

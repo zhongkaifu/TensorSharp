@@ -1,0 +1,7 @@
+{
+  "description": "Whisper large-v3-turbo (F16 GGUF from eng/audio-models/whisper_to_gguf.py) for TensorSharp Transcribe: speech to text with segment and word timestamps.",
+  "model": "${TENSORSHARP_MODELS}/whisper-large-v3-turbo-f16.gguf",
+  "args": ["--backend", "cuda"],
+  "service_name": "tensorsharp-comfyui-whisper",
+  "startup_timeout": 300
+}
