@@ -373,10 +373,17 @@ namespace TensorSharp.Models
             long headroom = GpuMemoryBudget.ResolveHeadroomBytes(total);
             if (allExperts + pending + headroom + DeviceScratchBytes <= free)
                 return;
-            // Offloading: a prompt chunk stages the experts the device does not hold (the CUDA executor's staging arena).
+            // Offloading into tiers (the tensor executors): the direct engines' budget, a GiB beside the
+            // caches, the non-expert weights and the prompt scratch, and no staging reserve (the CUDA executor's staging arena
+            // caps itself to what is free and returns the pool's cached blocks first). The general headroom (1/16 of the card)
+            // and a layer's staging held Qwen3.8 Flash Next UD-Q2_K_XL's tier at 34.4 GB on an A40, where the engine kept
+            // 38.5 GB: 37 GB held 99.92% of the profiled routes, decoded 60.3 / 56.5 tok/s (short / after 4K) against 56.3 /
+            // 54.6, and still prefilled a 16K prompt in 8.6 s.
             long largest = 0;
             for (int l = 0; l < n; l++) largest = Math.Max(largest, layerBytes[l]);
-            pending += Math.Min(largest, StagingReserveCapBytes);
+            bool tiers = ExpertTiersEnabled();
+            if (tiers) headroom = 1L << 30;
+            else pending += Math.Min(largest, StagingReserveCapBytes);
             int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free, headroom, 0);
             if (resident >= n)
                 return;
@@ -439,6 +446,12 @@ namespace TensorSharp.Models
             }
             long? requested = ExpertTierBudgetOverride(Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER_GB"));
             int[][] tiers = plan.SelectTiers(expertBytes, requested ?? budget);
+            // A tier that holds every expert the routing profile routes to trades nothing (as the direct engines, whose residency
+            // covered 100% of the profiled routes, rarely did): a prompt's routes weigh 128 rows' worth in the recent counts and
+            // traded out members the decode routed to again. Qwen3.8 Flash Next UD-Q2_K_XL on an A40 with 38.5 GB of experts:
+            // 199 host routes a run and 58.8 / 54.3 tok/s with trades, 1 and 60.5 / 56.5 without.
+            _tierRouteCoverage = ranked == moeLayers.Count ? TierRouteCoverage(moeLayers, tiers) : 0;
+            _tierHoldsProfile = _tierRouteCoverage >= TierHoldCoverage;
             _expertOnHost = new bool[n];
             foreach (int l in moeLayers) _expertOnHost[l] = true;
             _tierExperts = new int[n][];
@@ -450,10 +463,39 @@ namespace TensorSharp.Models
             }
             Console.WriteLine($"[moe-offload] {Config.Architecture} (tiered): every MoE layer's routed experts run through the " +
                 $"expert host; the device keeps each layer's most-routed experts ({Gb(held)} of {Gb(budget)}), " +
-                (ranked == moeLayers.Count ? $"ranked by {_routingProfilePath}."
+                (ranked == moeLayers.Count ? $"ranked by {_routingProfilePath}{(_tierRouteCoverage > 0 ? $"; {_tierRouteCoverage * 100:F2}% of the profiled routes{(_tierHoldsProfile ? ", so adaptive trades are held" : "")}" : "")}."
                     : ranked > 0 ? $"{ranked} of {moeLayers.Count} layers ranked by {_routingProfilePath}, the others an equal share."
                     : "an equal share of each layer (no routing profile yet: this load records one)."));
             return true;
+        }
+
+        /// <summary>The planned tier holds (nearly) every route the routing profile counted (<see cref="TryPlanTensorExecutorTiers"/>):
+        /// adaptive trades are held, as the direct engines, whose residency reported 100.0% of the profiled routes, rarely
+        /// traded.</summary>
+        internal bool _tierHoldsProfile;
+
+        /// <summary>The share of the profiled routes the planned tier holds (0 without a profile for every layer).</summary>
+        private double _tierRouteCoverage;
+
+        /// <summary>The share of profiled routes past which trades are held: a trade could win back less than half a percent of
+        /// the routes and costs misses (Qwen3.8 Flash Next UD-Q2_K_XL on an A40: held at 99.74% the same speed as trading, at
+        /// 99.92% and 99.97% 1.5-3.3 tok/s faster).</summary>
+        private const double TierHoldCoverage = 0.995;
+
+        private double TierRouteCoverage(List<int> layers, int[][] tiers)
+        {
+            double held = 0, all = 0;
+            foreach (int l in layers)
+            {
+                ReadOnlySpan<ulong> counts = _routingProfile.Counts(l);
+                var tier = new HashSet<int>(tiers[l] ?? Array.Empty<int>());
+                for (int e = 0; e < counts.Length; e++)
+                {
+                    all += counts[e];
+                    if (tier.Contains(e)) held += counts[e];
+                }
+            }
+            return all > 0 ? held / all : 0;
         }
 
         /// <summary>Whether a tensor executor uploads expert <paramref name="expert"/> of <paramref name="layer"/> at

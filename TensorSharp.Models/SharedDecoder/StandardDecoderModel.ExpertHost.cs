@@ -130,7 +130,7 @@ namespace TensorSharp.Models
             public IReadOnlyList<(int Layer, int Out, int In)> ProposeSwaps(int budget)
             {
                 var trades = new List<(float Gain, int Layer, int Out, int In)>();
-                if (!_adapt || budget <= 0) return Array.Empty<(int, int, int)>();
+                if (!_adapt || budget <= 0 || _m._tierHoldsProfile) return Array.Empty<(int, int, int)>();
                 lock (_recentSync)
                 {
                     for (int l = 0; l < _tier.Length; l++)
