@@ -78,6 +78,19 @@ namespace TensorSharp.Cuda
         public override bool KeepForProductsOnly(IntPtr weightKey)
             => Allocator is CudaAllocator cuda && Kernels is { } kernels && CudaQuantizedOps.TryTileQ6kHead(cuda, weightKey, kernels);
 
+        /// <summary>Weights only a drafter reads (<see cref="MarkDrafterWeight"/>): their products take the drafter's kernels in
+        /// every step (<see cref="QuantizedMatMul"/>).</summary>
+        private readonly HashSet<IntPtr> _drafterWeights = new();
+
+        public override bool MarkDrafterWeight(IGraphWeight weight)
+        {
+            // The key its products see (a QuantizedWeight's device cache key).
+            IntPtr key = weight?.CacheKey ?? IntPtr.Zero;
+            if (key == IntPtr.Zero) return false;
+            _drafterWeights.Add(key);
+            return true;
+        }
+
         public bool HasRoomToRecord()
         {
             if (Allocator is not CudaAllocator cuda) return false;
@@ -3723,8 +3736,11 @@ namespace TensorSharp.Cuda
             }
             // A drafter's Q4_K products (IGraphExecutor.Drafting) on the int8 tensor cores, as the direct engines ran theirs: a
             // Qwen3.8 27B DFlash2 draft block's 45 Q4_K products took 5.0 ms a step on the row-invariant decode kernels, the
-            // engine's 2.6 (RTX PRO 4000). A drafter's last bits need not match anything: its proposals are verified.
-            if (Drafting && _branchQuantized == null && rows >= 2 && rows <= CudaGraphKernels.Q4kMmaMaxRows && inDim % 256 == 0 && inDim <= int.MaxValue
+            // engine's 2.6 (RTX PRO 4000). A drafter's last bits need not match anything: its proposals are verified. A
+            // drafter's weight takes them in any step (IGraphExecutor.MarkDrafterWeight): the trunk's prompt step that writes a
+            // block drafter's ring had dequantized each of its weights to F16 for cuBLAS (Qwen3.8-27B DFlash2, a 62-token prompt
+            // on an RTX PRO 6000 slice: 3.7 of the ring's 4.2 ms of device time, 1.6 ms now; the direct engine's ring took 1.2).
+            if ((Drafting || (_drafterWeights.Count > 0 && _drafterWeights.Contains(weight.CacheKey))) && _branchQuantized == null && rows >= 2 && rows <= CudaGraphKernels.Q4kMmaMaxRows && inDim % 256 == 0 && inDim <= int.MaxValue
                 && outDim <= int.MaxValue && weight.Ne2 <= 1 && weight.Bytes % outDim == 0 && x.Storage is CudaStorage ds
                 && x.ElementType == DType.Float32 && x.IsContiguous() && x.ElementCount() == rows * inDim && cuda.Kernels != null
                 && Kernels is { TakesQ4kMma: true } q4k && CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr qPtr,

@@ -108,6 +108,12 @@ namespace TensorSharp.Graph
         /// is.</summary>
         bool KeepForProductsOnly(IntPtr weightKey) => false;
 
+        /// <summary>A weight only a drafter reads: its products make proposals a verify checks, in whichever step they run, so
+        /// they may take the kernels a <see cref="Drafting"/> step's products take there too (the trunk's prompt step that writes
+        /// a block drafter's ring). False where the executor runs them as any other weight's (it reads nothing of the weight:
+        /// a weight's device cache key is made on first use by the executors that key on it).</summary>
+        bool MarkDrafterWeight(IGraphWeight weight) => false;
+
         /// <summary>Whether decode rows and short chunks over a K/V cache of <paramref name="kvFormat"/> with
         /// <paramref name="headDim"/>-wide heads may attend their slot's whole capacity as their padded window: the executor's
         /// kernels then compute, from the rows' written length (read on the device when the step is recorded), what the window

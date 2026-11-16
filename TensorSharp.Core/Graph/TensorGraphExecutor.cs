@@ -111,6 +111,9 @@ namespace TensorSharp.Graph
         /// <inheritdoc cref="IGraphExecutor.KeepForProductsOnly"/>
         public virtual bool KeepForProductsOnly(IntPtr weightKey) => false;
 
+        /// <inheritdoc cref="IGraphExecutor.MarkDrafterWeight"/>
+        public virtual bool MarkDrafterWeight(IGraphWeight weight) => false;
+
         /// <inheritdoc cref="IGraphExecutor.RunWhileNextRecordedStepRuns"/>
         public virtual bool RunWhileNextRecordedStepRuns(Action work) => false;
 

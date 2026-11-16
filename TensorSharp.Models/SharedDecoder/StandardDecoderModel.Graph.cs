@@ -910,6 +910,24 @@ namespace TensorSharp.Models
                 GraphExecutor?.KeepForProductsOnly(head.CacheKey);
         }
 
+        private bool _drafterWeightsMarked;
+
+        /// <summary>
+        /// A block drafter's weights ("dflash.") are read only for proposals a verify checks, in the trunk's steps too: a
+        /// speculating request's prompt step writes the drafter's ring (<see cref="EmitDFlashFollow"/>). The executor may then
+        /// run their products as it runs a draft step's (<see cref="IGraphExecutor.MarkDrafterWeight"/>), as the inject program
+        /// that wrote the ring before ran them, where the trunk's step had taken its own exact kernels for them. Once the
+        /// drafter is there, on one device (where its programs run).
+        /// </summary>
+        private void MarkDrafterWeights()
+        {
+            if (_drafterWeightsMarked || !HasDFlash || !_mesh.IsSingleDevice || _rankGraphs || GraphExecutor is not { } executor) return;
+            _drafterWeightsMarked = true;
+            foreach (var (name, weight) in _quantWeights)
+                if (name.StartsWith(DFlashConfig.WeightPrefix, StringComparison.Ordinal) && weight != null)
+                    executor.MarkDrafterWeight(weight);
+        }
+
         private bool TryRunGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
             bool wantLogits, out float[][] logits, int[] positionTable = null, DraftFollow follow = DraftFollow.None,
             float[] draftRows = null, DFlashFollowPlan dflash = null)
@@ -954,6 +972,7 @@ namespace TensorSharp.Models
         {
             result = null;
             PrepareHeadLayout();
+            MarkDrafterWeights();
             RoomForRecordings();
             string reason = GraphUnsupportedReason();
             if (reason != null && RequiresGraphs)
