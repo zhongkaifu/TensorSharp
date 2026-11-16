@@ -21,6 +21,10 @@ namespace TensorSharp.Graph
         /// with destination leaf 6), the live state read and left as it was: the commit steps the kept rows on it again, in
         /// place (the direct engines' verify scan and replay). Elsewhere the window keeps a state after every row.</summary>
         public bool WindowStateInPlace { get; init; }
+        /// <summary>A verify window's delta-net regions (prep, gated norm) read their inputs where a packed in-projection put
+        /// them, a packed row apart: the window takes the projection as one product, as decode rows do, instead of a product
+        /// per row block.</summary>
+        public bool WindowRegionsReadPackedRows { get; init; }
         /// <summary>Reordering independent work pays off (and is safe) on this device.</summary>
         public bool ConcurrencyReorder { get; init; }
         /// <summary>The bucket a decode step's padded attention window grows by (a window's programs replay).</summary>

@@ -294,12 +294,15 @@ namespace TensorSharp.Models
             int convRows = _convKernel - 1;
             float eps = Config.Eps;
 
-            // Decode rows take the packed in-projection in one product; a prompt chunk takes its four
-            // row blocks as separate products, so each part is contiguous (no slice copies).
+            // Decode rows take the packed in-projection in one product; so do a verify window's rows where the executor's
+            // delta-net regions read the four blocks where the product put them (GraphCapabilities.WindowRegionsReadPackedRows:
+            // the blocks' copies were 192 a Qwen3.8-27B 8-row window). A prompt chunk takes its four row blocks as separate products, so
+            // each part is contiguous (no slice copies).
             string inProj = InProjName(layer);
             bool isPacked = _quantWeights.ContainsKey(inProj) || _weights.ContainsKey(inProj)
                 || (step.Rank >= 0 && (_tpQuantWeights.ContainsKey(inProj) || _tpWeights.ContainsKey(inProj)));
-            bool split = !isPacked || step.Rows > step.Sequences;
+            bool windowViews = step.RecurrentSnapshots && GraphExecutor?.Capabilities.WindowRegionsReadPackedRows == true;
+            bool split = !isPacked || (step.Rows > step.Sequences && !windowViews);
             int proj = -1, qkvAll = -1, zAll = -1, betaAll = -1, alphaAll = -1;
             if (!isPacked)
             {
@@ -333,7 +336,7 @@ namespace TensorSharp.Models
                 long row0 = step.First[s] * nb1;
                 var state = (DeviceGdnState)step.SequenceState(s, layer);
 
-                int qkv, z, betaRaw, alphaRaw;
+                int qkv, z, betaRaw, alphaRaw, z4 = -1;
                 if (split)
                 {
                     long col = step.First[s];
@@ -341,6 +344,15 @@ namespace TensorSharp.Models
                     z = step.Sequences == 1 ? zAll : step.View2(zAll, v, count, v * f, col * v * f);
                     betaRaw = step.Sequences == 1 ? betaAll : step.View2(betaAll, vHeads, count, vHeads * f, col * vHeads * f);
                     alphaRaw = step.Sequences == 1 ? alphaAll : step.View2(alphaAll, vHeads, count, vHeads * f, col * vHeads * f);
+                }
+                else if (windowViews && count > 1)
+                {
+                    // The window's rows a packed row apart, read where they are by the regions that take them.
+                    qkv = step.View2(proj, channels, count, nb1, row0);
+                    z = step.View2(proj, v, count, nb1, row0 + channels * f);
+                    z4 = step.View4(proj, dv, vHeads, count, 1, dv * f, nb1, nb1 * count, row0 + channels * f);
+                    betaRaw = step.View2(proj, vHeads, count, nb1, row0 + (channels + v) * f);
+                    alphaRaw = step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f);
                 }
                 else
                 {
@@ -458,7 +470,7 @@ namespace TensorSharp.Models
                         step.Effect(copy);
                 }
 
-                int y = step.Reshape(step.Cont(scores), dv, vHeads, count), zh = step.Reshape(z, dv, vHeads, count);
+                int y = step.Reshape(step.Cont(scores), dv, vHeads, count), zh = z4 >= 0 ? z4 : step.Reshape(z, dv, vHeads, count);
                 bool sigmoid = MixerSigmoidGate;
                 step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, stackalloc long[] { sigmoid ? 1 : 0 }, stackalloc[] { eps });
                 int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(sigmoid ? GraphOp.Sigmoid : GraphOp.Silu, zh));
