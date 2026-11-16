@@ -20,13 +20,14 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 8;
+        public const int CurrentVersion = 9;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
 
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
         private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _window128, _window256, _combine;
+        private readonly IntPtr _prompt128, _prompt256;
         private readonly int _smem128, _smem256;
 
         private CudaFlashPrefillKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
@@ -39,6 +40,8 @@ namespace TensorSharp.Cuda
             _window128 = module.GetFunction("ts_flash_decode_window_f16_d128");
             _window256 = module.GetFunction("ts_flash_decode_window_f16_d256");
             _combine = module.GetFunction("ts_flash_prefill_combine_f32");
+            _prompt128 = module.GetFunction("ts_flash_prompt_f16_d128");
+            _prompt256 = module.GetFunction("ts_flash_prompt_f16_d256");
             (_smem128, _smem256) = (SharedBytes(128), SharedBytes(256));
             CudaDriverApi.cuFuncSetAttribute(_attn128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_attn256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
@@ -46,6 +49,8 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuFuncSetAttribute(_rows256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_window128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_window256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_prompt128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_prompt256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
             CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
             CudaDriverApi.cuDeviceGetAttribute(out int sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
             MultiprocessorCount = sms;
@@ -91,11 +96,14 @@ namespace TensorSharp.Cuda
         /// splits (<see cref="Splits"/> of the whole <paramref name="windowKeys"/>-key window) and runs the ones
         /// <see cref="Splits"/> gives the window of <see cref="BucketKeys"/> around the length read on the device plus
         /// <paramref name="lenBias"/> (the keys a verify window's last row has past this row): one recording of a window padded
-        /// to the slot's capacity then splits every length as the bucket window around it does.
+        /// to the slot's capacity then splits every length as the bucket window around it does. <paramref name="prompt"/>: the
+        /// rows are a prompt chunk's (more than any verify window's): its row tiles run heaviest first and its warps skip the key
+        /// tiles past their rows (each row's arithmetic unchanged).
         /// </summary>
         public unsafe void LaunchAttention(IntPtr q, IntPtr k, IntPtr v, int cap, int nq, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
-            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default, int windowKeys = 0, int bucket = 0, int lenBias = 0)
+            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default, int windowKeys = 0, int bucket = 0, int lenBias = 0,
+            bool prompt = false)
         {
             int rows = nq * (heads / kvHeads);
             IntPtr a0 = q, a1 = k, a2 = v, a11 = partial, a12 = output, a13 = dyn, a14 = cells, a15 = cellCount, a16 = cellMask;
@@ -104,7 +112,8 @@ namespace TensorSharp.Cuda
             float a9 = scale;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16,
                 &a17, &a18, &a19, &a20 };
-            var (fn, smem) = headDim == 128 ? (_attn128, _smem128) : (_attn256, _smem256);
+            IntPtr fn = !prompt ? (headDim == 128 ? _attn128 : _attn256) : headDim == 128 ? _prompt128 : _prompt256;
+            int smem = headDim == 128 ? _smem128 : _smem256;
             uint tiles = (uint)((rows + BlockRows - 1) / BlockRows);
             CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();

@@ -27,7 +27,7 @@
 // so the committed compute_75 PTX carries working kernels.
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 8
+#define TS_FLASH_PREFILL_VERSION 9
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -183,7 +183,11 @@ __device__ __forceinline__ int ts_fp_live_splits(int launched, const int* __rest
 // a row's keys are split by its own length (the one-row launch's share), the block walks the union of its rows' key tiles
 // (each KT-aligned), and keys outside a row's own range are masked for it - they add exact zeros and leave its maximum, so a
 // row's sums are the one-row launch's bit for bit, while every key tile is read once for all the window's rows.
-template <int HD, bool WIN = false>
+// PROMPT: a prompt chunk's rows (more than a verify window's), scheduled for the causal triangle: the row tiles run heaviest
+// first (block x takes tile tiles - 1 - x / splits: the last rows see the most keys, and a light tile now ends the grid where
+// the heaviest had started last), and a warp skips the key tiles past every one of its rows' ends (a whole tile its rows
+// mask: the zeros it added left every sum as it was) - each row's arithmetic is the plain launch's.
+template <int HD, bool WIN = false, bool PROMPT = false>
 __device__ __forceinline__ void ts_fp_attn(
     const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len,
     int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out,
@@ -208,7 +212,8 @@ __device__ __forceinline__ void ts_fp_attn(
     // share a launch of `live` splits gives it, so a recorded launch over the slot's whole window runs what the bucket window's
     // launch runs. The others leave before the first barrier, the whole block.
     const int split = (int)(blockIdx.x % splits);
-    const int rowBase = (blockIdx.x / splits) * TS_FP_ROWS;
+    const int tileOfBlock = (int)(blockIdx.x / splits);
+    const int rowBase = (PROMPT ? (R + TS_FP_ROWS - 1) / TS_FP_ROWS - 1 - tileOfBlock : tileOfBlock) * TS_FP_ROWS;
     if (split >= live)
         return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, qd = lane & 3;
@@ -242,6 +247,13 @@ __device__ __forceinline__ void ts_fp_attn(
         if (live1) range(end1, lo1, hi1);
     }
     const bool warpLive = rowBase + warp * 16 < R;
+    // A prompt chunk's warp: the end of its last-seeing row (tiles from there are masked for every row of it).
+    int warpEnd = max(end0, end1);
+    if (PROMPT)
+    {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) warpEnd = max(warpEnd, __shfl_xor_sync(0xffffffffu, warpEnd, o));
+    }
     const half* kHead = kc + (long long)kvh * cap * HD;
     const half* vHead = vc + (long long)kvh * cap * HD;
 
@@ -293,7 +305,7 @@ __device__ __forceinline__ void ts_fp_attn(
         if (first + TS_FP_KT < kHi)
             load(st ^ 1, first + TS_FP_KT);
         ts_fp_cp_commit();
-        if (!warpLive)
+        if (!warpLive || (PROMPT && first >= warpEnd))
             continue;
 
         float s[4][4];
@@ -464,6 +476,23 @@ __device__ __forceinline__ void ts_fp_attn(
 
 TS_FP_ATTN(128)
 TS_FP_ATTN(256)
+
+// A prompt chunk's rows (CudaGraphExecutor's attention past a verify window's rows): ts_flash_prefill_f16_d<hd>'s operands and
+// launch, scheduled for the causal triangle (ts_fp_attn's PROMPT: each row's arithmetic theirs, bit for bit). Qwen3.8-27B on an
+// RTX PRO 4000: a 16K prompt 4.08 s against 4.23 s with the plain launch, the same perplexity to the last digit.
+#define TS_FP_PROMPT(NAME, HD) \
+    extern "C" __global__ void __launch_bounds__(256) NAME( \
+        const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len, \
+        int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
+        const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask, \
+        int lenBias, int windowKeys, int bucket, int sms) \
+    { \
+        ts_fp_attn<HD, false, true>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn, cells, \
+            cellCount, cellMask, ts_fp_live_splits(splits, dyn, lenBias, windowKeys, bucket, nq * (nHead / nKv), nKv, sms)); \
+    }
+
+TS_FP_PROMPT(ts_flash_prompt_f16_d128, 128)
+TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256)
 
 // A verify window's rows, each run as the decode row at its position (CudaGraphExecutor's window rows): grid z is the
 // window row, which attends the window's keys less the rows - 1 - z after it (the window's length read from dyn[0] on

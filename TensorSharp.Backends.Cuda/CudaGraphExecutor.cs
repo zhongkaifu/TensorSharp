@@ -39,6 +39,10 @@ namespace TensorSharp.Cuda
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
         protected override bool BroadcastsPositionsOnDevice => true;
 
+        /// <summary>The widest verify window the shared runtime runs (a block drafter's 16 rows, StandardDecoderModel.SmallChunkRows):
+        /// a step of more rows is a prompt chunk, whose attention takes the prompt kernels; the windows keep theirs.</summary>
+        private const int WidestVerifyWindow = 16;
+
         /// <summary>The bucket a decode window grows by (<see cref="GraphCapabilities.DecodeWindowRows"/>): the flash kernels split a
         /// length as the bucket window around it does, whatever window it is launched over.</summary>
         private int DecodeWindowBucket => Capabilities.DecodeWindowRows;
@@ -283,9 +287,10 @@ namespace TensorSharp.Cuda
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
+                // Rows past a verify window's are a prompt chunk's: the prompt kernels (CudaFlashPrefillKernels.LaunchAttention).
                 Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor,
                     heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn,
-                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0));
+                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0, prompt: nq > WidestVerifyWindow));
                 return attended;
             }
             // A recorded verify window replays at later positions, where the written length this classification read (the
