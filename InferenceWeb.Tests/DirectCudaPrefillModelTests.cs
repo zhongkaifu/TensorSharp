@@ -179,12 +179,10 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     /// Q8_0, see DirectCudaRealModelTests). So a repeated trajectory must be bit-identical from
     /// its second run on, and the first run may differ on its decode rows by this much (the
     /// Qwen3.5 prefill-graph ring-phase defect D5, fixed, moved them 0.13-0.75, D3 by 0.07 and more).
-    /// The sliding-window Gemma file's first run differs from later runs on a few decode rows
-    /// (with the D3 fixes: 1.7e-3 at 64 tokens, 4.75e-3 at 511, 0 at the other lengths; runs 2 and
-    /// 3 bit-identical): rounding between its per-op and graph-replayed decode steps, not traced
-    /// further.
+    /// Gemma-4 runs its uncaptured decode steps (a graph key's first sighting) as the recorded
+    /// kernel sequence, so its first run must be bit-identical too (FirstDecodeSteps_MatchTheirReplays).
     /// </summary>
-    private static double FirstRunDecodeBand(string family) => family == "gemma4moe" ? 0.0072 : 1e-4;
+    private static double FirstRunDecodeBand(string family) => family is "gemma4moe" or "gemma4moe_global" ? 0 : 1e-4;
 
     private void AssertReproduces(string what, IReadOnlyList<List<float[]>> runs, string family)
     {
@@ -530,6 +528,44 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         using var cuda = Load(path, BackendType.Cuda);
         var runs = Enumerable.Range(0, 3).Select(_ => Trajectory(cuda, prompt, forced)).ToList();
         AssertReproduces($"{family} default decode", runs, family);
+    }
+
+    /// <summary>Prompt lengths whose first trajectory's uncaptured decode steps rounded differently from their replays
+    /// before Gemma-4 ran those steps as the recorded kernel sequence (RTX PRO 6000 slice, sm_120: the all-global file
+    /// at 33, 510, 511 and 1023 tokens, the sliding-window file at 97 and 514; an A40 and an RTX PRO 4000 failed at
+    /// other lengths), with lengths on both sides of the 512-key attention tier, the 32-row window and 1024.</summary>
+    private static readonly int[] FirstDecodeLengths = { 17, 31, 33, 64, 97, 130, 257, 400, 510, 511, 512, 514, 600, 1023, 1025 };
+
+    [CudaTheory]
+    [InlineData("gemma4moe_global")]
+    [InlineData("gemma4moe")]
+    public void FirstDecodeSteps_MatchTheirReplays(string family)
+    {
+        // A fresh model runs a decode-graph key's first sighting uncaptured: its first decode step, and its first step
+        // past the 512-key attention tier when the trajectory crosses it. Those steps must compute what a replay of the
+        // same step computes, bit for bit. Before they ran the recorded kernel sequence they built their RoPE tables on
+        // the host (MathF.Cos/Sin against the graph's sincosf): a last-bit difference that the Q8_1 activations mostly
+        // round away, so a length showed it only where it flipped a rounding (one in a few dozen decode rows, at lengths
+        // that depend on the GPU: RepeatedPrefill_Reproduces caught it at 511 tokens on an A40 and an RTX PRO 6000,
+        // ForwardRefill_TracksSinglePass at 600 on an RTX PRO 4000). Hence many lengths, each on a fresh model.
+        string path = WriteModel(family);
+        int[] forced = Forced(8);
+        var differing = new List<string>();
+        foreach (int length in FirstDecodeLengths)
+        {
+            int[] prompt = Prompt(length);
+            using var cuda = Load(path, BackendType.Cuda);
+            List<float[]> first = Trajectory(cuda, prompt, forced);
+            List<float[]> replayed = Trajectory(cuda, prompt, forced);
+            AssertFinite(first, family);
+            int same = replayed.Select((row, i) => BitIdentical(row, first[i])).Count(x => x);
+            Report($"{family} {length}: second trajectory vs the first (bit-identical rows {same}/{first.Count})",
+                replayed.Select((row, i) => RelL2(row, first[i])));
+            if (same != first.Count)
+                differing.Add($"{length} ({first.Count - same} rows)");
+        }
+        Assert.True(differing.Count == 0,
+            $"{family}: the second trajectory differs from the first (whose uncaptured decode steps must match their replays) at {string.Join(", ", differing)} tokens");
     }
 
     [CudaTheory]

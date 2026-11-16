@@ -186,11 +186,13 @@ public sealed class DirectCudaRealModelTests : IDisposable
     /// by the KV capacity the process has grown to (Qwen3.5-0.8B: 1-3e-2 relative L2, measured;
     /// Stage 0 VM2's "first-decode effect" outside D5/D3). So: run 3 bit-identical to run 2, and
     /// run 2 within <see cref="FirstRunBand"/> of run 1 (the prefill-graph ring-phase defect D5,
-    /// fixed, moved rows 0.13-0.75).
+    /// fixed, moved rows 0.13-0.75). Gemma-4 runs its uncaptured decode steps as the recorded kernel
+    /// sequence, so its run 2 must be bit-identical to run 1 (gemma-4-E4B Q8_0 before that, RTX PRO
+    /// 6000 slice: 96 tokens 1.5e-2..4.1e-2 on rows 1-6, 97 tokens 1.3e-2..5.2e-2 on rows 2-6).
     /// </summary>
     private const double FirstRunBand = 0.06;
 
-    private void RepeatedPrefill(string pattern, int promptLength)
+    private void RepeatedPrefill(string pattern, int promptLength, double firstRunBand = FirstRunBand)
     {
         string path = Find(pattern);
         using var model = ModelBase.Create(path, BackendType.Cuda);
@@ -206,8 +208,14 @@ public sealed class DirectCudaRealModelTests : IDisposable
             Assert.True(BitIdentical(runs[2][i], runs[1][i]),
                 $"run 3 row {i} differs from run 2 (relative L2 {RelL2(runs[2][i], runs[1][i]):E3})");
         for (int i = 0; i < runs[1].Count; i++)
-            Assert.True(RelL2(runs[1][i], runs[0][i]) <= FirstRunBand,
-                $"run 2 row {i} is {RelL2(runs[1][i], runs[0][i]):E3} from run 1 (allowed {FirstRunBand}: the first-decode effect)");
+        {
+            if (firstRunBand == 0)
+                Assert.True(BitIdentical(runs[1][i], runs[0][i]),
+                    $"run 2 row {i} is {RelL2(runs[1][i], runs[0][i]):E3} from run 1, but the first run's decode steps must match their replays");
+            else
+                Assert.True(RelL2(runs[1][i], runs[0][i]) <= firstRunBand,
+                    $"run 2 row {i} is {RelL2(runs[1][i], runs[0][i]):E3} from run 1 (allowed {firstRunBand}: the first-decode effect)");
+        }
         Assert.True(BitIdentical(runs[1][0], runs[0][0]), "the prefill rows of runs 1 and 2 differ");
     }
 
@@ -272,7 +280,7 @@ public sealed class DirectCudaRealModelTests : IDisposable
     [CudaTheory(ModelDir, "gemma-4-e4b")]
     [InlineData(96)]
     [InlineData(97)]
-    public void Gemma4_E4B_RepeatedPrefill_Reproduces(int promptLength) => RepeatedPrefill("gemma-4-e4b", promptLength);
+    public void Gemma4_E4B_RepeatedPrefill_Reproduces(int promptLength) => RepeatedPrefill("gemma-4-e4b", promptLength, firstRunBand: 0);
 
     [CudaFact(ModelDir, "gemma-4-e4b")]
     public void Gemma4_E4B_SnapshotRestore_IsExact() => SnapshotRestoreIsExact("gemma-4-e4b");
