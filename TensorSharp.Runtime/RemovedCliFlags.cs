@@ -351,6 +351,7 @@ namespace TensorSharp.Runtime
             ("TS_Q4E_NODE_DUMP", Qwen4ExpModelRemoved),
             ("TS_Q4E_NODE_DUMP_LAYER", Qwen4ExpModelRemoved),
             ("TS_Q4E_PLE_PREFETCH", Qwen4ExpModelRemoved),
+            ("TS_PLE_EXPLICIT_READ", Qwen4ExpModelRemoved),
             ("TS_Q4E_PREFILL_COMBINE", Qwen4ExpModelRemoved),
             ("TS_Q4E_PROFILE", Qwen4ExpModelRemoved),
             ("TS_Q4E_PROMPT_SPAN_CAP", Qwen4ExpModelRemoved),

@@ -169,7 +169,7 @@
         "video"
       ],
       "layout": "moe",
-      "notes": "MLX refused. MTP shared head requires GGML; f16/f32 KV only; cpu is a correctness path. No automatic disk-offload capacity claim.",
+      "notes": "MLX refused. The MTP shared head runs on every served backend's runtime; f16/f32 KV only; cpu is a correctness path. No automatic disk-offload capacity claim.",
       "source_evidence": [
         "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
         "docs/models/qwen38-flash-next.md"
