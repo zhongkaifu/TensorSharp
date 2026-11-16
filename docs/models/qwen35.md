@@ -286,11 +286,10 @@ parallel.
 
 ### 4.4 RoPE
 
-NeoX-style rotary embeddings. Frequencies are cached in `_ropeFreqs[halfDim]`
-once. Position tensors are cached across attention layers per forward pass:
-`_cachedRoPEPosQ` / `_cachedRoPEPosK` are reused when `(seqLen, startPos)`
-match across all 12 attention layers, eliminating duplicate allocation +
-population.
+NeoX-style rotary embeddings over the first `rope.dimension_count` channels of
+each head (a partial rotary), applied after the per-head Q/K RMSNorm. The
+runtime computes a step's positions once (`StandardDecoderModel.Positions.cs`)
+and every attention layer of the step's graph reads them.
 
 `qwen3next` GGUFs additionally ship `qwen35.rope.dimension_sections` which
 defines MRoPE section boundaries. When present, the RoPE step uses
@@ -311,28 +310,20 @@ rope position = KV index + delta,   delta = max(last table row) + 1 - prompt len
 which is SGLang's `mrope_position_delta` (decode position `delta - 1 + seq_len`).
 The delta is per sequence ([`Qwen35RopePositions`](../../TensorSharp.Models/Models/Qwen35/Qwen35RopePositions.cs)):
 
-- **Settled before any kernel runs.** `BeginRopePositions` takes it from the staged
+- **Settled before any kernel runs.** `BeginRotaryPositions` (`StandardDecoderModel.Positions.cs`) takes it from the staged
   table of a prefill chunk; a forward from KV index 0 without a table starts a new
   history at delta 0; any other forward continues the active sequence's delta. A
   chunk whose rows are all text at `KV index + delta` drops the table and runs the
-  ordinary scalar-RoPE graphs, which rotate identically.
-- **Used by every path.** The whole-model decode (`rope_pos_delta`), the fused
-  prefill/verify graph (`rope_pos_delta` for scalar rows), the arena batched decode
-  (`rope_positions` per holder), the paged batched forward (the request's delta
-  from the injector), the per-op attention, the direct-CUDA prefill and decode
-  graphs, tensor parallelism and the MTP draft head. The per-layer native attention
-  kernels rotate at their KV index, so a sequence past an image does not take them.
-  (A DFlash drafter keeps its own
+  ordinary scalar rotary, which rotates identically.
+- **Used by every step.** Prompt chunks, decode rows, verify windows and batched steps
+  rotate each sequence's rows at `KV index + delta` from its own slot, on every backend
+  and placement, and the MTP draft layer does too. (A DFlash drafter keeps its own
   positions; they only affect how many drafts are accepted, never the output.)
-- **Stored with the state it describes.** Each per-request holder carries it through
-  swaps, retention, re-keying and pooling, a shared-prefix checkpoint and its clone
-  copy it, the per-block KV snapshot of the KV-swap concurrency path ends with it (like
-  the recurrent state, as of the block's end; an injected block whose size does not fit,
-  or whose delta would put the next token at a negative position, is refused before
-  anything is written, so a refusal leaves the model holding exactly the blocks before
-  it), and the checkpoint file format (`Q5KC`) is **version 2**, which writes it
-  after the row count. A version-1 file names no delta and is refused on import; the
-  engine logs that the saved checkpoint does not fit, prefills the prefix and saves it
+- **Stored with the state it describes.** Each slot carries it (`Slot.RopeDelta`) through
+  retention, donation to the next turn and pooling; a shared-prefix checkpoint and its
+  clone copy it, and the checkpoint file format is **version 2** or later
+  (`StandardDecoderModel.Checkpoints.cs`), which writes it. A file without it is not
+  read as a checkpoint of this format: the engine prefills the prefix and saves it
   again.
 
 Before this, decode, speculative verify and every scalar path rotated at the KV index
@@ -372,7 +363,7 @@ itself. Two things followed:
   conversation text -> image -> text -> text on Qwen3.5-9B-Q8_0. In the engine, turns
   3 and 4 must reuse the previous turn past the image, and every turn's greedy tokens
   are compared with a cold engine's, also with a text conversation decoding beside it
-  (per-request holders and the arena batched decode). On the model directly, a turn
+  (slots batched in one step). On the model directly, a turn
   built by decoding the previous reply and prefilling the new suffix is compared with a
   cold prefill of the whole prompt, logits step by step for 24 steps, and the same
   comparison runs on a text-only conversation as a control. A checkpoint taken after
@@ -413,7 +404,7 @@ On CUDA the decode and prefill kernels differ by up to about one logit even for 
 text-only conversation, so over 24 greedy tokens a low-margin token can flip between a
 reused and a cold turn with or without images.
 
-The concurrent test (holders and the arena) applies the same tie rule. At the first step
+The concurrent test (slots batched in one step) applies the same tie rule. At the first step
 where a request's tokens differ from its cold engine run it captures the cold logits (the
 same prompt prefilled cold straight on the model, which must have decoded the same tokens
 up to that step) and accepts the difference only when their top-2 margin is below the
@@ -526,13 +517,15 @@ output_norm.weight
 output.weight
 ```
 
-`FuseAttentionProjectionWeights()` fuses per-layer Q+K+V into
-`attn_qkv.weight` when all three GGUF tensors share a quantization type.
-Mixed-type importance-matrix/UD quant projections remain separate, avoiding
-multi-gigabyte FP32 expansion. `FuseRecurrentInputWeights()` packs five recurrent projections
-(`attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha`, plus an empty slot) into
-one fused `ssm_in_proj.weight` for GatedDeltaNet layers. `FuseGateUpWeights()`
-fuses dense FFN gate and up.
+At load the runtime fuses a full-attention layer's Q+K+V into one
+`attn_qkv.weight` when all three GGUF tensors share a quantization type
+(`TryFuseQkvWeights`), and dense FFN gate and up into `ffn_gate_up.weight`
+(`FuseGateUpWeights`). Mixed-type importance-matrix/UD quant projections remain
+separate, avoiding requantization and multi-gigabyte FP32 expansion. A
+GatedDeltaNet layer's `attn_qkv`, `attn_gate`, `ssm_beta` and `ssm_alpha` are
+packed into one `ssm_in_proj.weight` when the four share a type
+(`Qwen35RuntimeModel.PrepareLoadedWeights`): decode rows take it as one
+product, a prompt chunk takes the four.
 
 ## 7. TensorSharp implementation
 

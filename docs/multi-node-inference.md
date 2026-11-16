@@ -117,7 +117,7 @@ the local arithmetic, so network costs can dominate decode.
 | Family | Multi-node layer backend | State and limits |
 | --- | --- | --- |
 | DeepSeek V4.1 Flash, including 1017 | `ggml_cuda`, `cuda` (layer split only) | Native whole-layer graphs transfer residual streams, delayed gates, sparse selections, candidate masks and newly written shared cache rows. Exact prefill; approximate YOCO, vision and DSpark are unavailable in this mode. The direct-CUDA engine's stages move the same state in a layout-hashed payload, place layers from header bytes, need the driver on the last stage and keep every routed expert in VRAM ([card](models/deepseek41.md#backends)). |
-| Qwen3.8 Flash Next (`qwen4exp`) | `ggml_cuda` | Native spans transfer the complete hyper-connection residual. GDN recurrence, convolution, PLE and QSA state stay with their owning layers. Text forwards only. |
+| Qwen3.8 Flash Next (`qwen4exp`) | `ggml_cuda` | The shared decoder runtime (`Qwen4ExpRuntimeModel`): stages transfer the complete hyper-connection residual (every stream). GDN recurrence, convolution, PLE and QSA state stay with their owning layers. The same `--layer-split` on every node and no `--tp` within a stage (this family has no hybrid placement); a multi-node pipeline keeps no retained slots. |
 | GLM-5.3-Flash (`glm5next` / `glm5-next`) | `ggml_cuda` | Native stages transfer the complete hyper-connection residual. KDA recurrence and pooled DSA/MLA caches stay with their owning layers. Text forwards only; older `glm-dsa` variants remain local. |
 | Mistral 3 dense text tower | `ggml_cuda`, `ggml_vulkan` | Shared dense pipeline transfers F32 hidden activations. Each node loads only its layer weights/KV state; the first stage embeds and the last stage computes logits. Nodes may differ in GPU count and `--tp`. |
 | Qwen 3.5 / 3.6 (`qwen35`, `qwen35moe`) | `cuda`, `ggml_cuda`, `ggml_vulkan` | The shared decoder runtime: F32 hidden activations cross nodes; GDN recurrent and convolution state and the KV cache stay with their owning layers. Nodes may differ in GPU count and `--tp`. Requests run one at a time (no batched forward across nodes). Speculative decoding (the checkpoint's MTP head, a `--draft-model` DFlash/DFlash2 drafter, n-gram) drafts on node 0; see [speculative decoding across nodes](#speculative-decoding-across-nodes). |
@@ -239,6 +239,9 @@ precision on every node.
 | `TENSORSHARP_LAYER_SPLIT_DRIVER_STAGE` | `last` | Pipeline stage node 0 runs: `last` keeps logits local, `first` restores the previous order. |
 
 ### Measured on two SSH-connected nodes (2026-10-28)
+
+The Qwen3.8 Flash Next rows below were measured on the removed `Qwen4ExpModel` and its native spans;
+the shared runtime that replaced it has not been measured across nodes.
 
 Two RunPod pods with three A40s each, reachable only through SSH (about 0.5 ms
 TCP round trip), F16 KV, no CPU expert offload, 512-token random prefill and

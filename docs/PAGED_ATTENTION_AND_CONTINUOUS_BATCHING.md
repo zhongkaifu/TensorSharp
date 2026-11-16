@@ -23,7 +23,7 @@ Throughput therefore depends on the selected and accepted execution path. See
 | Batched execution | Models that implement `IBatchedPagedModel.ForwardBatch` pack all scheduled sequences into one model call with explicit `positions`, `slotMapping`, `queryStartLoc`, and per-sequence block tables. |
 | Fallback execution | Path selection is centralized in `ExecutionPlanner`: model+backend capabilities (`ExecutionCapabilities`), operator overrides (`ExecutionOptions`), and per-step request features produce an `ExecutionPlan` (selected path, fallback chain, rejection reasons). A model may still decline a specific batch with `NotSupportedException`; the step then falls to the plan's next candidate, ending in the per-sequence KV-swap path. |
 | Native attention | `TSGgml_PagedAttentionForward` gathers paged K/V in C++ and dispatches `ggml_flash_attn_ext`; GPT OSS uses `TSGgml_PagedAttentionForwardWithSinks`. |
-| Speculative decoding | Optional speculation for solo (non-concurrent) sequences: learned draft heads (embedded NextN / MTP, Gemma 4's separate `gemma4-assistant` GGUF, Qwen 3.8 Flash Next's shared MTP head), block drafters (DSpark, DFlash) and the weight-free n-gram speculator. `BatchExecutor` drives the shared `SpeculativeExecution` draft / verify / rollback core for models that implement `ISpeculativeTarget`. Off by default; `--spec` (CLI and server) or `--draft-model`. See [Speculative decoding (MTP / NextN)](#speculative-decoding-mtp--nextn). |
+| Speculative decoding | Optional speculation for solo (non-concurrent) sequences, and for concurrent ones on the shared decoder runtime (Qwen 3.5 family, Qwen 3.8 Flash Next and the other families it serves): learned draft heads (embedded NextN / MTP, Gemma 4's separate `gemma4-assistant` GGUF, Qwen 3.8 Flash Next's shared MTP head), block drafters (DSpark, DFlash) and the weight-free n-gram speculator. `BatchExecutor` drives the shared `SpeculativeExecution` draft / verify / rollback core for models that implement `ISpeculativeTarget`. Off by default; `--spec` (CLI and server) or `--draft-model`. See [Speculative decoding (MTP / NextN)](#speculative-decoding-mtp--nextn). |
 | Throughput under concurrency | The generic host-resident `BatchedPaged` route does not itself scale aggregate decode; one Gemma 4 measurement saturated near **69 tok/s**. On a model that implements `TryForwardBatchedFusedDecode`, the per-sequence-fused route first attempts one device graph for the active decode subset and falls back per request only when that batch is ineligible or declined. See [Measured Concurrency Behavior](#measured-concurrency-behavior). |
 | Queue API | `/api/queue/status` reports the engine's live load: requests processing, requests waiting for a batch slot, and requests completed. Nothing serializes requests outside the engine. |
 | Diffusion models | DiffusionGemma does not enter this autoregressive `ForwardBatch` contract. CLI generation uses `DiffusionGemmaSampler`; the Web UI uses `DiffusionBatchScheduler` to batch denoising work at block boundaries. |
@@ -49,9 +49,10 @@ that successfully takes token-batched fused decode.
   `SupportsPerSequenceFusedForward`, `ExecutionPlanner` selects `PerSequenceFused`
   at N >= 2. The executor first offers an eligible decode subset to
   `TryForwardBatchedFusedDecode`, which can amortize the weight read in one graph
-  (including Qwen 3.5/3.6/3.8's slot-stable arena on GGML CUDA/Metal, which on CUDA
-  also serves K/IQ-quantized token embeddings, and Gemma 4's kernel with
-  per-sequence cache capacities). If the model declines, the same step falls back
+  (including Gemma 4's kernel with per-sequence cache capacities). The shared
+  decoder runtime's families (the Qwen 3.5 / 3.6 / 3.8 family and Qwen 3.8 Flash
+  Next among them) take the unified step instead: every running request's rows in
+  one forward over its own slot. If the model declines, the same step falls back
   to N isolated fused forwards; the server logs the first successful batch and the
   reason for the first decline.
 - **What does work.** Iteration-level scheduling, prefix sharing (the Radix tree
@@ -337,11 +338,10 @@ Three algorithms share the `SpeculativeExecution` core; the design is in
 | `block` | A block drafter on `--draft-model`: DeepSeek V4 DSpark, and DFlash / DFlash2 for Muse-Glimmer and the Qwen 3.5 family. DeepSeek V4.1 DSpark is experimental: a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu`; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified. |
 | `ngram` | No weights: suffix matching over the sequence's own tokens. |
 
-On rejection a Qwen 3.5-family trunk restores its GatedDeltaNet recurrent state
-(the GGML fused verify keeps a snapshot per row on a `ggml_metal` verify of up to
-eight rows and commits the accepted one on the device; a wider `ggml_metal` verify,
-and every `ggml_cuda` verify, keeps the recurrence inputs instead and replays the
-accepted prefix at commit); Gemma 4
+On rejection a Qwen 3.5-family or Qwen 3.8 Flash Next trunk (the shared decoder
+runtime) commits the GatedDeltaNet state after the accepted rows without a second
+forward (the GGML graphs keep a state per verify row; the per-op path keeps the
+window's inputs and replays the accepted prefix); Gemma 4
 rewinds its attention-KV position and puts back the sliding-window rows the verify
 overwrote (its drafter is stateless given `(token, h)`); GLM-5.3-Flash restores a
 snapshot of its KDA state (a device copy on the native executor) and re-forwards
@@ -350,13 +350,14 @@ the accepted prefix.
 Speculation engages only where the model declares it profitable
 (`SpeculationProfitable`), and each model decides: Qwen 3.5/3.6/3.8 and GLM 5.2 /
 GLM-5.3 on every backend; Gemma 4 on the ggml backends (`ggml_cpu` included) and
-the pure-C# `cuda` backend; Qwen 3.8 Flash Next on its GGML token-graph path;
+the pure-C# `cuda` backend; Qwen 3.8 Flash Next on every backend it loads on;
 GLM-5.3-Flash where its KDA rollback is available; Muse Spark on the GGML
 backends (n-gram only), except under its native `--tp`; DeepSeek V4 / V4.1 and Muse-Glimmer only with their drafter loaded. Nemotron-H refuses it outright (`SpeculationRefusal`). GPT OSS,
 Mistral 3 and Hunyuan Dense implement no speculative trunk and
-serve standard decode for every algorithm, n-gram included. Concurrent batches
-never speculate — when more than one sequence is running, every sequence uses the
-normal batched/fallback step. A `--draft-model` that cannot be attached (a
+serve standard decode for every algorithm, n-gram included. Outside the shared
+decoder runtime, concurrent batches never speculate — when more than one sequence
+is running, every sequence uses the normal batched/fallback step; the runtime's
+unified step verifies every speculating request's window in one forward. A `--draft-model` that cannot be attached (a
 mismatched or incomplete drafter, or a model that refuses speculation) fails fast
 at server startup (`SpeculationStartupValidation`). `--spec` leaves the Radix
 prefix cache on; a Qwen 3.5-family NextN head restarts its private cache after a
@@ -398,10 +399,11 @@ request can resume from there:
   family (`qwen35`, `qwen35moe`, `qwen3next`) and Qwen 3.8 Flash Next can copy
   theirs, so a finished conversation is retained for its next turn and the state at
   the end of the shared public prefix is checkpointed and cloned into each new chat.
-  They do so only where they run per-request fused holders: Gemma 4 on the GGML
-  backends, the Qwen 3.5 family on `ggml_cuda` / `ggml_metal` and not under TP,
-  Flash Next on its GGML token-span path, and none of them with `TS_PER_SEQ_FUSED=0`;
-  elsewhere only the primary cache is continued.
+  They do so only where they run per-request state: Gemma 4 on the GGML backends
+  with its fused holders, and the Qwen 3.5 family and Flash Next on the shared
+  decoder runtime's slots wherever their recurrent state can be copied (not a
+  multi-node pipeline); none of them with `TS_PER_SEQ_FUSED=0`. Elsewhere only the
+  primary cache is continued.
   GLM 5.x (native executor) and DeepSeek V4.1 cannot copy a native slot: they can
   only hand one over whole to the turn that continues it (unless
   `TS_RETAINED_FUSED_CACHE_MAX=0`; V4.1 not while a DSpark drafter is loaded),
@@ -418,9 +420,9 @@ resumable boundaries and at explicit cache breakpoints, and always leaves at lea
 one prompt token to compute. The conversation-scope rules below apply unchanged, and
 so does media identity (spans keyed by content; a reuse length never cuts a span).
 Whether reuse continues past a media span comes from each family's prefix-cache
-capabilities: it does on Gemma 4, the Qwen 3.5 / 3.6 / 3.8 family and GPT OSS;
-on the other tree families (Mistral 3, Nemotron-H, Muse-Glimmer,
-Hunyuan Dense, Qwen 3.8 Flash Next, GLM 5.x, DeepSeek V4 / V4.1) reuse stops at the
+capabilities: it does on Gemma 4, the Qwen 3.5 / 3.6 / 3.8 family, Qwen 3.8 Flash
+Next and GPT OSS; on the other tree families (Mistral 3, Nemotron-H, Muse-Glimmer,
+Hunyuan Dense, GLM 5.x, DeepSeek V4 / V4.1) reuse stops at the
 first image, video frame or audio clip. DiffusionGemma and the image/video models
 do not use it.
 
@@ -526,7 +528,7 @@ a picture share everything before it.
 A model whose cache cannot be continued past media exactly declares
 `SupportsReuseAcrossMediaSpan = false`, and reuse then stops at the first media
 span. The Radix tree takes the rule from each family's prefix-cache capabilities,
-which continue past a media span only on Gemma 4, the Qwen 3.5/3.6/3.8 family and GPT OSS
+which continue past a media span only on Gemma 4, the Qwen 3.5/3.6/3.8 family, Qwen 3.8 Flash Next and GPT OSS
 (see [Radix prefix cache](#radix-prefix-cache)). Gemma 4 uses absolute positions. Qwen 3.5/3.6's
 M-RoPE prompt positions compress after an image, and every token past the position table
 - decode, speculative verify, a text continuation - rotates at its KV index plus the
@@ -592,7 +594,7 @@ request reused nothing, the first specific reason a source declined.
 | `TS_BATCHED_FUSED_DECODE` | `1` | `0` disables true token-batched fused decode inside the per-sequence fused path (one graph decodes all N sequences). |
 | `TS_BATCHED_FUSED_MOE` | `0` | `1` lets Gemma 4 MoE checkpoints take the token-batched fused decode; off by default because it was not faster than round-robin on the measured 16 GB card. |
 | `TS_RETAINED_FUSED_CACHE_MAX` | the running-request limit, at least `4` | How many finished conversations' end states stay retained for their next turn, on models that advertise retained holders: Gemma 4 K/V, Qwen 3.5/3.6/3.8 attention K/V plus GDN recurrent state, Qwen 3.8 Flash Next's per-sequence holder, DeepSeek V4.1's native slot, and GLM 5.x's donated native slot. Each pins the model's complete per-request continuation state. Unset, it follows `TS_SCHED_MAX_RUNNING_SEQS`, so every request that runs in parallel keeps its own; `0` turns retention off. |
-| `TS_PREFIX_CHECKPOINTS_MAX` | `4` | How many checkpoints of the model's complete state at the end of the shared prompt prefix (the boundaries the chat layer marks on the request) the Radix tree keeps; each new chat starts from a clone of one. Applies on models that can copy their state (Gemma 4 on the GGML backends; Qwen 3.5/3.6/3.8 on `ggml_cuda` / `ggml_metal`, not under TP; Qwen 3.8 Flash Next on its GGML token-span path, including under the `--layer-split N` layer split). A prompt publishes one per declared boundary (the end of the system instructions and the end of the shared prefix), so 4 covers a host that warms both thinking modes; `0` turns checkpoints off. |
+| `TS_PREFIX_CHECKPOINTS_MAX` | `4` | How many checkpoints of the model's complete state at the end of the shared prompt prefix (the boundaries the chat layer marks on the request) the Radix tree keeps; each new chat starts from a clone of one. Applies on models that can copy their state (Gemma 4 on the GGML backends; Qwen 3.5/3.6/3.8 and Qwen 3.8 Flash Next on the shared decoder runtime wherever their slots' recurrent state can be copied, not a multi-node pipeline). A prompt publishes one per declared boundary (the end of the system instructions and the end of the shared prefix), so 4 covers a host that warms both thinking modes; `0` turns checkpoints off. |
 | `TS_MM_EMBEDDING_CACHE_MB` | 1/64 of host memory, 512-4096 MB | Byte budget of the vision/audio embedding cache, which is keyed by media content (SHA-256); least-recently-used entries no prepared prompt references are evicted past it. |
 | `TS_KV_INITIAL_TOKENS` | `0` | Tokens of K/V a cache is given when created, before any request declares a budget; `0` keeps the engine policy (the whole window when `MAX_CONTEXT` is explicit). The cache still grows on demand. |
 | `TS_KV_GENERATION_RESERVE_MAX` | `0` | Cap on the generation share of a request's up-front K/V reservation (prompt + max_new_tokens); `0` = uncapped. Past the cap the cache grows on demand. |

@@ -96,7 +96,7 @@ where a verify window's batched Metal kernels round differently from one row's, 
 
 Flash Next has 125 B parameters in total and 6 B active. Its routed experts take 46 GB at UD-Q2_K_XL.
 
-Today the family runs on its own code:
+When this plan was written, the family ran on its own code (all of it since removed):
 
 - `Qwen4ExpModel`: about 10.5 k lines over 21 files. It includes GGML token spans (fused native graphs), per-sequence holders, arenas, MTP, DFlash2, expert tiers and tensor parallelism.
 - `Qwen4ExpCudaModel`: the direct-CUDA engine with the Q4e kernels.

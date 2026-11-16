@@ -247,7 +247,7 @@ deinterleave 步骤（`SplitQGateInterleaved`）把 Q 写入一个 buffer、gate
 
 ### 4.4 RoPE
 
-NeoX 风格旋转嵌入。频率在 `_ropeFreqs[halfDim]` 一次性预计算。位置张量在每个 forward pass 内跨 attention 层缓存：当 `(seqLen, startPos)` 在所有 12 个 attention 层之间一致时，复用 `_cachedRoPEPosQ` / `_cachedRoPEPosK`，省去重复分配 + 填充。
+NeoX 风格旋转嵌入，作用于每个头的前 `rope.dimension_count` 个通道（部分旋转），在逐头 Q/K RMSNorm 之后应用。运行时每一步只计算一次位置（`StandardDecoderModel.Positions.cs`），该步计算图中的每个 attention 层都读取它们。
 
 `qwen3next` GGUF 额外提供 `qwen35.rope.dimension_sections`，定义 MRoPE section 边界。存在时 RoPE 步骤使用多模态 RoPE；不存在时使用纯 NeoX RoPE。
 
@@ -265,21 +265,15 @@ rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分�
 即 SGLang 的 `mrope_position_delta`（decode 位置为 `delta - 1 + seq_len`）。delta 按序列保存
 （[`Qwen35RopePositions`](../../TensorSharp.Models/Models/Qwen35/Qwen35RopePositions.cs)）：
 
-- **在任何内核运行之前确定。** `BeginRopePositions` 从 prefill 分块暂存的位置表取得它；从 KV 下标
+- **在任何内核运行之前确定。** `BeginRotaryPositions`（`StandardDecoderModel.Positions.cs`）从 prefill 分块暂存的位置表取得它；从 KV 下标
   0 开始且没有位置表的前向会开启新历史（delta 为 0）；其他前向沿用当前序列的 delta。若一个分块的
-  所有行都是位于 `KV 下标 + delta` 的文本，则丢弃位置表，改走普通的标量 RoPE 图，旋转完全相同。
-- **所有路径都使用它。** 整模型 decode（`rope_pos_delta`）、融合 prefill/verify 图（标量行使用
-  `rope_pos_delta`）、arena 批处理 decode（每个 holder 的 `rope_positions`）、分页批处理前向
-  （来自注入器的请求 delta）、逐算子 attention、direct-CUDA 的 prefill 与 decode 图、张量并行以及
-  MTP 草稿头。逐层原生 attention 内核按 KV 下标旋转，因此越过图片的序列不会走它们。
-  （DFlash 草稿器保留自己的位置；它们只影响草稿被接受的数量，
-  从不影响输出。）
-- **与其描述的状态一起保存。** 每个请求的 holder 在换入换出、保留、重新绑定和池化过程中携带它；
-  共享前缀检查点及其克隆会复制它；KV-swap 并发路径的逐块 KV 快照在末尾保存它（与递归状态一样，
-  取块结束时的值；注入的块若大小不符，或其 delta 会让下一个 token 落在负位置，会在写入任何内容之前被
-  拒绝，因此被拒绝后模型恰好保留该块之前的内容）；检查点文件格式（`Q5KC`）升级为**版本 2**，在行数之后写入 delta。
-  版本 1 的文件没有 delta，导入时会被拒绝；引擎记录“保存的检查点与模型不符”，重新 prefill 该前缀
-  并再次保存。
+  所有行都是位于 `KV 下标 + delta` 的文本，则丢弃位置表，改走普通的标量旋转，旋转完全相同。
+- **每一步都使用它。** 提示分块、decode 行、verify 窗口与批处理步在每个后端和放置方式下，都让每个序列的行
+  从自己的 slot 按 `KV 下标 + delta` 旋转，MTP 草稿层也一样。（DFlash 草稿器保留自己的位置；它们只影响
+  草稿被接受的数量，从不影响输出。）
+- **与其描述的状态一起保存。** 每个 slot 携带它（`Slot.RopeDelta`），经过保留、交给下一轮和池化都不丢失；
+  共享前缀检查点及其克隆会复制它；检查点文件格式为**版本 2** 或更高（`StandardDecoderModel.Checkpoints.cs`），
+  会写入它。不含它的文件不会被当作这种格式的检查点读取：引擎重新 prefill 该前缀并再次保存。
 
 在此之前，decode、投机 verify 以及所有标量路径都直接按 KV 下标旋转，带来两个后果：
 
@@ -308,7 +302,7 @@ rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分�
   高与宽的网格、两对帧的视频和纯文本。若 decode 按 KV 下标（旧规则），26 个用例中有 10 个失败。
 - `Qwen35ImageFollowUpExactnessTests`（需要模型，`TS_TEST_MODEL_DIR`）在 Qwen3.5-9B-Q8_0 上运行
   “文本 -> 图片 -> 文本 -> 文本”的对话。在引擎中，第 3、4 轮必须越过图片复用上一轮，每一轮的贪心
-  token 都与冷启动引擎比较；旁边同时有一段文本对话在 decode（按请求的 holder 与 arena 批处理 decode）
+  token 都与冷启动引擎比较；旁边同时有一段文本对话在 decode（slot 合并在同一步中批处理）
   时同样比较。直接在模型上，把“decode 上一轮回复再 prefill 新后缀”构建出的回合与整段提示的冷启动
   prefill 逐步比较 24 步 logits，并对一段纯文本对话做同样的比较作为对照。在图片之后建立的检查点经过
   导出、导入和克隆后，decode logits 逐位相同；版本 1 文件会被拒绝。关闭 delta 时测试失败：在 Metal
@@ -340,7 +334,7 @@ M-RoPE）。因此测试检查三点：
 在 CUDA 上，即使是纯文本对话，decode 与 prefill 内核也会相差约一个 logit，因此在 24 个贪心 token 内，
 无论有没有图片，复用回合与冷启动回合都可能在低差距 token 上翻转。
 
-并发测试（holder 与 arena）采用同样的平局规则。在某个请求的 token 与其冷启动引擎运行首次不同的那一步，
+并发测试（slot 合并在同一步中批处理）采用同样的平局规则。在某个请求的 token 与其冷启动引擎运行首次不同的那一步，
 测试捕获冷启动 logits（直接在模型上对同一提示做冷启动 prefill，且到该步为止必须解码出相同的 token），
 只有当其 top-2 差距低于该后端的 logit 容差时才接受这一差异，并且不再比较该请求的剩余部分。它的纯文本
 对照以长于一个块的系统提示开头（第 1 轮 346 token）：使用一行系统提示时每个文本回合都短于一个块，因此在旧版路径下没有
@@ -441,7 +435,7 @@ output_norm.weight
 output.weight
 ```
 
-`FuseAttentionProjectionWeights()` 在三个 GGUF 张量量化类型相同时，把每层的 Q+K+V 融合为 `attn_qkv.weight`；混合类型的 importance-matrix / UD 量化投影保持分开，避免展开成数 GB 的 FP32。`FuseRecurrentInputWeights()` 把 GatedDeltaNet 的五路递归投影（`attn_qkv`、`attn_gate`、`ssm_beta`、`ssm_alpha`、加一个空槽）融合为 `ssm_in_proj.weight`。`FuseGateUpWeights()` 融合 dense FFN 的 gate 与 up。
+加载时，运行时在三个 GGUF 张量量化类型相同时把全注意力层的 Q+K+V 融合为一个 `attn_qkv.weight`（`TryFuseQkvWeights`），并把 dense FFN 的 gate 与 up 融合为 `ffn_gate_up.weight`（`FuseGateUpWeights`）；混合类型的 importance-matrix / UD 量化投影保持分开，避免重新量化或展开成数 GB 的 FP32。GatedDeltaNet 层的 `attn_qkv`、`attn_gate`、`ssm_beta` 与 `ssm_alpha` 在四者类型一致时打包为一个 `ssm_in_proj.weight`（`Qwen35RuntimeModel.PrepareLoadedWeights`）：decode 行把它作为一次乘积，提示分块则用四次乘积。
 
 ## 7. TensorSharp 实现
 

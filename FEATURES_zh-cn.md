@@ -132,16 +132,16 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/ge
 - **Qwen 3.6 / Qwen 3.8 27B（内嵌 NextN）** —— GGUF 在主干栈之后带有一个额外解码块（`{arch}.nextn_predict_layers`）以及 NextN 投影 / 归一化张量。无需独立文件，`--draft-model` 被忽略。主干的递归状态（GatedDeltaNet）会被快照，以便部分被拒的验证批次可以回滚。
 - **GLM 5.2 与 GLM-5.3（内嵌 NextN）** —— 形态相同，且官方 [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF) 已经带有该块（`blk.78.nextn.*` 加上一个完整的 MLA + 256 专家解码块），无需额外下载，`--spec` 就是全部配置——在 CLI（`--input`、`--multi-turn-jsonl`、`--interactive`）上与在服务端上都是如此。该块只在传入该参数时才会加载：它是一整个解码层（IQ2_XXS 下约 3 GiB），会与 KV 缓存争抢 loader 用来确定上下文长度的同一块显存。glm-dsa 没有递归状态，因此部分被拒的验证批次会保留已接受前缀的 KV，只回退位置计数，不需要重跑。[unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF) 带的是同一个 `blk.78` 块，条件也一样——无需额外下载，`--spec` 同样必须在加载前就写在命令行上，因为正是这个开关才会把它调进来。两者的块都不带 `nextn.shared_head_head.weight`（GLM-5.2 的块也不带 `nextn.embed_tokens`），因此都借用主干的 LM 头；而在 `--tp N > 1` 下这个头是列并行的，loader 会拒绝从某一个 rank 的词表切片上起草——这个判断在放置任何一个权重字节之前就做完了，只在 stderr 上留一行，本次运行余下部分走标准 decode（该拒绝路径没有测试覆盖）；同时传入 `--spec` 与 `--tp` 时 CLI 也会提前告警。也就是说，投机只在单设备或显式 `--layer-split N` 放置模式（不启用张量并行）下启用。详见 [GLM 卡片](docs/models/glm_zh-cn.md#nextn--mtp-投机解码) 与 [GLM-5.3 专节](docs/models/glm_zh-cn.md#glm-53glm-dsa)。GLM-5.3-Flash（`glm5next`）是这一家族的例外：它的 NextN 块未构建，因此在它上面起草的是 `--spec --spec-type ngram`；又因为其 KDA 层携带递归状态，主干会在每次验证前拍下该状态的快照、部分被拒时恢复，而不是回退位置——见 [GLM-5.3-Flash 上的投机解码](docs/models/glm_zh-cn.md#glm-53-flash-上的投机解码)。
 - **Gemma 4（独立 `gemma4-assistant` GGUF）** —— 通过 `--draft-model` 加载的 EAGLE 风格递归草稿器，给出该文件本身即可启用投机。它自身不保存任何 K/V：每个草稿层都查询**目标模型**已有的逐层 KV 缓存（最后一个 local 层 + 最后一个 global 层），因此在给定 `(token, hidden)` 时草稿器是无状态的。草稿的隐藏维度必须与目标一致——12B 目标配 12B 草稿，而非 26B-A4B 草稿。草稿 GGUF 不匹配、缺失或不完整会在启动时**立即失败**并给出修复提示，而非静默关闭投机。
-- **Qwen 3.8 Flash Next（独立的共享 MTP GGUF）** —— `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` 在 GGML 后端上挂载逐 token 的 MTP 块。它保存自己的 K/V，因此只对从位置 0 开始 prefill 的单序列请求起草；接续保留持有器或共享前缀克隆的回合按普通 decode 运行。在 192 token 的代码复制流上，采用 2026-09-17 加入的精确 verify 行 kernel 后实测约 1.7×（83.2 对普通 49.1 tok/s；此前为 1.75-1.96×），输出与普通贪心完全一致，而散文则比普通 decode 更慢——见 [Qwen 3.8 Flash Next 卡片](docs/models/qwen38-flash-next_zh-cn.md#共享-mtp-头的投机解码)。
+- **Qwen 3.8 Flash Next（独立的共享 MTP GGUF）** —— `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` 在模型可加载的所有后端上挂载逐 token 的 MTP 块（共享运行时的投机）。它读取主干完整的超连接流，自己的行存放在每个请求的 slot 中，并发请求同样起草，接续交出的 slot 或检查点的回合也包括在内。已移除的 `Qwen4ExpModel` 在 192 token 的代码复制流上借助其精确 verify 行 kernel 实测约 1.7×（83.2 对普通 49.1 tok/s；此前为 1.75-1.96×），输出与普通贪心完全一致，而散文比普通 decode 更慢；运行时尚未在此重测——见 [Qwen 3.8 Flash Next 卡片](docs/models/qwen38-flash-next_zh-cn.md#共享-mtp-头的投机解码)。
 
-**前缀复用。** `--spec` 不会关闭 Radix 前缀缓存（显式的 `--no-prefix-cache` 仍会关闭）。Qwen 3.5/3.6 与 Qwen 3.8 27B（`qwen35`）的 NextN 头在复用前缀（启动预热、从磁盘恢复或保留的前缀）之后只重启自己私有的注意力缓存，因此开启投机时 prefill 仍走常规快路径；这适用于单序列请求的默认融合验证路径。Gemma 4 的 assistant 头不保存状态，可从任意位置起草；块级与 n-gram 投机器同样能在复用前缀之后启用。GLM-5.2 / GLM-5.3 的 NextN 头不能在缺口之后继续起草，因此与接续保留持有器或克隆的 Qwen 3.8 Flash Next 回合一样，复用了缓存前缀的 GLM 回合按普通 decode 运行。
+**前缀复用。** `--spec` 不会关闭 Radix 前缀缓存（显式的 `--no-prefix-cache` 仍会关闭）。Qwen 3.5/3.6 与 Qwen 3.8 27B（`qwen35`）的 NextN 头在复用前缀（启动预热、从磁盘恢复或保留的前缀）之后只重启自己私有的注意力缓存，因此开启投机时 prefill 仍走常规快路径。Gemma 4 的 assistant 头不保存状态，可从任意位置起草；块级与 n-gram 投机器同样能在复用前缀之后启用。GLM-5.2 / GLM-5.3 的 NextN 头不能在缺口之后继续起草，因此复用了缓存前缀的 GLM 回合按普通 decode 运行。
 
 **何处有收益**（自动启用；否则引擎走标准 decode）。GLM 一列描述的是共用的 `glm-dsa` 路径，因此同时覆盖 GLM-5.3 与 GLM-5.2，但支撑这些结论的实测运行都来自 GLM-5.2 —— 目前还没有 GLM-5.3 的投机解码实测：
 
 | 后端 | Qwen 3.6 | GLM 5.2 / GLM-5.3（`glm-dsa`） | Gemma 4 |
 |---|---|---|---|
-| GGML CUDA / GGML Metal | ✅ 融合多 token 验证 + 草稿步内核 | ✅ 原生整模型执行器中每个验证窗口一张图 | ✅ 融合多 token 验证 + 草稿步内核 |
-| Direct CUDA（`cuda`，Driver API / cuBLAS） | ✅ 完全驻留 GPU 的逐算子验证 / 草稿 | —（GLM 的托管逐算子路径在 `cpu` 与 `cuda` 上都会走，在 GGML 后端上设 `TS_GLM_NATIVE=0` 也会走；它是参考实现，不是快路径） | ✅ 完全驻留 GPU 的逐算子验证 / 草稿 |
+| GGML CUDA / GGML Metal | ✅ 共享解码运行时上每个验证窗口一张图（NextN 草稿层同样是一张图） | ✅ 原生整模型执行器中每个验证窗口一张图 | ✅ 融合多 token 验证 + 草稿步内核 |
+| Direct CUDA（`cuda`，Driver API / cuBLAS） | ✅ 共享运行时的验证与草稿计算图运行在 CUDA 图执行器上 | —（GLM 的托管逐算子路径在 `cpu` 与 `cuda` 上都会走，在 GGML 后端上设 `TS_GLM_NATIVE=0` 也会走；它是参考实现，不是快路径） | ✅ 完全驻留 GPU 的逐算子验证 / 草稿 |
 | GGML CPU（`ggml_cpu`） | 会投机：不按后端设门槛，成本调控器在实测更慢时暂停起草（默认 8 token 窗口在 Qwen3.6-35B-A3B 上实测 1.21×） | 与上面 GGML GPU 行相同的原生整模型执行器 | 会投机（所有 GGML 后端都符合条件） |
 | 纯 C# CPU（`cpu`）/ MLX | 会投机，与 `ggml_cpu` 一样交给成本调控器 | 逐算子参考实现（正确，但不快） | 标准 decode |
 
@@ -365,7 +365,7 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 | DeepSeek V4.1 Flash | `--layer-split N` 选择本地整层放置。GGML CUDA 上的实验性 routed-MoE TP 使用 `--tp N`；不支持注意力 TP 与分布式组。两种模式不能组合。 |
 | Hunyuan Dense（`hunyuan-dense`）、Mistral 3 | 共享解码运行时：在 `cuda`、`ggml_cuda`、`ggml_vulkan` 上支持 `--tp T`、`--layer-split P` 及两者组合（混合：P 个整层阶段、每段 T 张 GPU）；每种放置下并发请求都保持批处理 |
 | DiffusionGemma、LTX 2.5、Wan 2.1/2.2、MiniMax-H3 | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
-| Qwen 3.8 Flash Next（`qwen4exp`） | 在合格的 `ggml_cuda` 设备/量化上用 `--tp N` 开启本地 FFN TP；注意力/QSA/GDN/PLE 保持复制。用独立的 `--layer-split N` 在 GGML CUDA/Vulkan 与 `cuda` 上按整层放置；`cuda`（共享运行时运行在 CUDA 图执行器上）也接受 `--tp N`，尚未在 GPU 上测量。UD-Q2_K_XL 只能按层切分；见[验证范围与测量](docs/models/qwen38-flash-next_zh-cn.md#多-gpu) |
+| Qwen 3.8 Flash Next（`qwen4exp`） | 共享运行时的两种放置，彼此独立（`--tp` 与 `--layer-split` 同时使用会被拒绝）：`--tp N` 在 `cuda` 与 `ggml_cuda` 上运行按 rank 的计算图（注意力与 GDN 头、专家宽度切分；超连接混合器、PLE 与 QSA 索引器复制；不能整除它们的并行度在加载时被拒绝；不支持主机专家），`--layer-split N` 在 `ggml_cuda`、`ggml_vulkan` 与 `cuda` 上按整层放置。ggml 的执行器只在 CUDA 上运行按 rank 的图，因此这个只以图运行的模型族在 `ggml_vulkan` 上没有 `--tp`。跨节点运行限 `ggml_cuda`。运行时接管以来两者都未在 GPU 上测量；见[模型卡片](docs/models/qwen38-flash-next_zh-cn.md#多-gpu) |
 
 启动时会打印实际跑的是哪一种模式，因此不必从 `nvidia-smi` 去猜。
 
@@ -397,9 +397,9 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 TP 可运行在 `cuda` 后端以及 GGML CUDA / Vulkan 后端（`ggml_cuda`、`ggml_vulkan`）上；MLX 为单设备。在 GGML 后端上，每个 rank 拥有自己 GPU 上的 ggml 后端、权重分片与 KV 缓存，跨 GPU AllReduce 走 ggml-cuda 的集合通信（可用时用 NCCL），小载荷则在主机内存中归约。**TP 下 CUDA 图捕获保持开启**——一个张量并行 token 是几十次按 rank 的小提交，重放它们值约 45% 的 decode 吞吐（4×A40：Qwen 3.5-9B `--tp 4` 从 88 → 128.5 tok/s，Qwen 3.5-35B-A3B `--tp 2` 从 71.3 → 104.1，后者正是 TP 输给还是赢过单卡的分界线）。用 `TS_GGML_TP_CUDA_GRAPHS=0` 关闭。集合通信的选择靠实测而非能力标志位：启动时该组会验证所宣称的设备对之间的 peer copy 是否真的把数据送到，以及一次真实的 NCCL AllReduce 能否完成，然后选出通过检验的最快传输。有些主机（常见于虚拟化云实例）宣称支持 peer access 却从不兑现，此时会保留 NCCL 集合通信但禁用 peer 传输，而不是干脆放弃它——这在超过两张卡时尤为重要，因为那里用不上 pinned-host 流水线，替代方案是每个层边界都经主机内存归约（4×A40 实测：Qwen 3.5-9B Q8_0 decode 53.5 → 75.1 tok/s）。GGML 上的 TP 同时带来**容量**与**延迟**收益：融合的按 rank block 计算图（注意力、稠密 FFN、MoE 主干、GatedDeltaNet）取代了逐算子前向，在 2× RTX 2000 Ada 上 `--tp 2` 的 decode 达到单卡的 **1.39×**（Gemma 4 E4B Q8_0，51.7 对 37.3 tok/s）与 **1.06×**（Qwen 3.5-9B Q8_0），且 Gemma 4 的输出与单卡逐字节一致；单卡装不下的模型则只能靠 TP 运行（Qwen 3.5-35B-A3B IQ4_XS 共 16.6 GB，拆到两张 16 GB 卡上，prefill 184 tok/s、decode 18 tok/s）。完整测量数据见 `TENSOR_PARALLELISM_PLAN.md`（Stage 1b 与 1c）。这能推广多远，取决于互连带宽以及一层里究竟有多少能拆：在没有 NVLink 的主机上，每层两次 AllReduce 会成为瓶颈——GLM-5.2 UD-IQ2_XXS 在 3× RTX PRO 6000（PCIe）上 `--tp 3` 为 pp2048 505.6 / tg64 17.6 tok/s，而单机按层切分是 915.9 / 43.9，并且每个 rank 都要各自持有一份全长缓存，能装下的上下文从 342,272 掉到 91,136 token。那里的 TP 是**容量**特性而非延迟特性；它还改变了归约顺序，因此在 2-bit MoE 上，对着录制的 llama.cpp 金标准，按层切分复现 5/6 条提示，而 `--tp 3` 只复现 3/6。（对照同一后端上运行的 llama.cpp，按层切分为 6/6。）TP 下的批处理 /
 连续批处理前向目前实现于 Mistral 3；其他家族（包括 MoE 模型）在 TP 下回退到按序列前向。
 
-**Qwen 3.8 Flash Next 的多 GPU 模式。** 当前 `ggml_cuda --tp N` 在本机切分路由及共享 FFN，注意力、QSA、GDN 与 PLE 保持复制。它要求合格的 CUDA MMQ 设备与受支持的 FFN 类型；UD-IQ4_XS 已在 A40 TP2/TP4 上检查，UD-Q2_K_XL 则拒绝 TP。CPU 专家卸载与跨节点 TP 不受支持。实测的 2× A40 UD-IQ4_XS 场景中，TP2 比按层切分慢（prefill 慢 17.5%，decode 慢 28.4%）；数值门限与基准限制见[模型卡片](docs/models/qwen38-flash-next_zh-cn.md#多-gpu)。
+**Qwen 3.8 Flash Next 的多 GPU 模式。** `--tp N` 在 `cuda` 与 `ggml_cuda` 上运行共享运行时的按 rank 计算图；`--layer-split N` 按整层放置（`ggml_vulkan` 上也可）；两者是独立模式。下文与[模型卡片](docs/models/qwen38-flash-next_zh-cn.md#多-gpu)中的测量来自已移除的 `Qwen4ExpModel`，它的 `--tp` 只切分 FFN（实测的 2× A40 UD-IQ4_XS 场景中，其 TP2 比按层切分慢：prefill 慢 17.5%，decode 慢 28.4%）。
 
-**历史按层切分测量。** `qwen4exp` 上的 `--layer-split N` 跑的是按层切分而不是
+**历史按层切分测量。** 在已移除的 `Qwen4ExpModel` 上，`--layer-split N` 跑的是按层切分而不是
 张量并行：它的权重一个都不切分，它的
 decode 是每个 token 一张持久化的单设备 GGML 图，而它的 GDN / PLE 递归状态存放在由单个
 后端持有的设备缓冲里。这也是 llama.cpp 对这个架构提供的同一种（也是唯一一种）多卡模式
