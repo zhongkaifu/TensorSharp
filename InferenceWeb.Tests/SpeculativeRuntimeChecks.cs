@@ -93,8 +93,14 @@ internal static class SpeculativeRuntimeChecks
     /// slots (the batched verify must have run). Prompts repeat, so an n-gram drafter's drafts are accepted.
     /// <paramref name="prompts"/> replaces the default short ones.
     /// </summary>
+    /// <param name="nearTie">0: every stream is plain decoding's, token for token (backends whose decode-size products give a
+    /// row its bits whatever the rows beside it: the managed CPU, ggml's CPU, the CUDA executor). Otherwise a stream may part
+    /// from plain decoding's only where the two tokens' logits are within this share of the largest logit's magnitude - its
+    /// context's logits recomputed by one prompt forward over the tokens both streams agree on: on ggml's GPU kernels a
+    /// verify window's rows, plain decoding's batched rows and a prompt's rows each take other products, which round apart
+    /// in the last bits, and a synthetic checkpoint's near-tied logits then pick either token.</param>
     public static async Task AssertEngineSpeculationMatchesPlain(Func<ModelBase> create, SpeculationOptions speculation,
-        string label, int maxNew = 20, int[][] prompts = null)
+        string label, int maxNew = 20, int[][] prompts = null, double nearTie = 0)
     {
         prompts ??= EnginePrompts;
         foreach (int concurrent in new[] { 1, prompts.Length })
@@ -104,8 +110,20 @@ internal static class SpeculativeRuntimeChecks
             int verified = 0;
             int[][] drafted = await ServeAsync(create, chosen, speculation, maxNew, steps => verified = steps);
             for (int r = 0; r < chosen.Length; r++)
-                Assert.True(plain[r].SequenceEqual(drafted[r]),
-                    $"{label} x{concurrent}: request {r} gave [{string.Join(",", drafted[r])}], plain [{string.Join(",", plain[r])}]");
+            {
+                if (plain[r].SequenceEqual(drafted[r])) continue;
+                string streams = $"{label} x{concurrent}: request {r} gave [{string.Join(",", drafted[r])}], plain [{string.Join(",", plain[r])}]";
+                Assert.True(nearTie > 0, streams);
+                int d = 0;
+                while (d < plain[r].Length && d < drafted[r].Length && plain[r][d] == drafted[r][d]) d++;
+                Assert.True(d < plain[r].Length && d < drafted[r].Length, streams);
+                using ModelBase reference = create();
+                float[] logits = reference.ForwardPrompt(chosen[r].Concat(plain[r].Take(d)).ToArray());
+                float largest = logits.Max(Math.Abs);
+                float apart = Math.Abs(logits[plain[r][d]] - logits[drafted[r][d]]);
+                Assert.True(apart <= nearTie * largest,
+                    $"{streams}: they part at token {d}, whose logits are {apart:E2} apart ({apart / largest:E2} of the largest)");
+            }
             Assert.True(verified > 0, $"{label} x{concurrent}: no batched verify ran");
         }
     }
