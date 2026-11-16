@@ -42,6 +42,11 @@ namespace TensorSharp.Models
             /// <summary>A fused inject failed for the request on this ring: its context is incomplete, and the request
             /// decodes without drafts (ModelBase.DFlash.cs, DFlashEncodeAndInject). Cleared when the ring changes hands.</summary>
             public bool DraftingDeclined;
+            /// <summary>The trunk's feature row of position <see cref="CarryEnd"/> - 1, which a followed prompt's last step
+            /// wrote on the device (StandardDecoderModel.BlockDraft.cs), or null before any; <see cref="CarryEnd"/> is -1 once
+            /// anything else wrote the ring.</summary>
+            public Tensor Carry;
+            public int CarryEnd = -1;
         }
 
         /// <summary>Rings beyond the model's own (81 MB each on Qwen3.8-27B's DFlash2).
@@ -87,11 +92,15 @@ namespace TensorSharp.Models
             _dflashActiveRing.Filled = _dflashRingFilled;
             _dflashActiveRing.ValidFrom = _dflashRingValidFrom;
             _dflashActiveRing.HostStale = _dflashRingHostStale;
+            _dflashActiveRing.Carry = _dflashRingCarry;
+            _dflashActiveRing.CarryEnd = _dflashRingCarryEnd;
             _dflashRingK = target.K;
             _dflashRingV = target.V;
             _dflashRingFilled = target.Filled;
             _dflashRingValidFrom = target.ValidFrom;
             _dflashRingHostStale = target.HostStale;
+            _dflashRingCarry = target.Carry;
+            _dflashRingCarryEnd = target.CarryEnd;
             if (_dflashArrays != null)
             {
                 for (int l = 0; l < _dflashArrays.RingK.Length; l++)
@@ -109,22 +118,47 @@ namespace TensorSharp.Models
         /// it was. The trunk's own steps write a request's prompt rows into it (StandardDecoderModel.BlockDraft.cs, the
         /// followed prompt).
         /// </summary>
-        private protected (Tensor[] K, Tensor[] V, int Filled) DFlashRingOf(string requestId)
+        private protected (Tensor[] K, Tensor[] V, int Filled, Tensor Carry) DFlashRingOf(string requestId)
         {
             if (requestId == null || !_hasDFlash || _dflashRingK == null)
-                return (_dflashRingK, _dflashRingV, _dflashRingFilled);
+                return (_dflashRingK, _dflashRingV, _dflashRingFilled, EnsureDFlashRingCarry());
             EnsureDFlashRingObjects();
             DFlashRing previous = _dflashActiveRing;
             BindDFlashRing(requestId);
-            (Tensor[] K, Tensor[] V, int Filled) ring = (_dflashRingK, _dflashRingV, _dflashRingFilled);
+            (Tensor[] K, Tensor[] V, int Filled, Tensor Carry) ring = (_dflashRingK, _dflashRingV, _dflashRingFilled, EnsureDFlashRingCarry());
             SelectDFlashRing(previous);
             return ring;
         }
 
+        /// <summary>The bound ring's feature row [<see cref="DFlashConfig.FeatureSize"/>] a followed prompt's last step writes
+        /// (its carry), allocated on first use; null without a drafter.</summary>
+        private Tensor EnsureDFlashRingCarry()
+        {
+            if (!_hasDFlash || _dflash == null)
+                return null;
+            if (_dflashRingCarry == null)
+            {
+                _dflashRingCarry = new Tensor(_allocator, DType.Float32, _dflash.FeatureSize);
+                Ops.Fill(_dflashRingCarry, 0f);
+            }
+            return _dflashRingCarry;
+        }
+
+        /// <summary>The bound ring's carry for a draft at <paramref name="position"/>: the feature row of position - 1 that
+        /// a followed prompt's last step wrote, when nothing wrote the ring since (its frontier is still the prompt's end);
+        /// else null. The tensor's device copy is ahead of its host one.</summary>
+        private protected Tensor DFlashHeldCarry(int position)
+            => _hasDFlash && !DFlashDraftingDeclined && _dflashRingCarry != null && position > 0
+               && _dflashRingCarryEnd == position && _dflashRingFilled == position ? _dflashRingCarry : null;
+
+        // The bound ring's carry and the position past the row it holds (-1: none); see DFlashRing.Carry.
+        private Tensor _dflashRingCarry;
+        private int _dflashRingCarryEnd = -1;
+
         /// <summary>A graph on the device wrote rows <paramref name="startPos"/> .. + <paramref name="n"/> of
         /// <paramref name="requestId"/>'s ring (null: the bound ring): its frontier and valid run, as the injects record
         /// theirs (<see cref="NoteDFlashRingWrite"/>), and its host copy behind; the bound ring is left as it was.</summary>
-        private protected void NoteDFlashRingWriteOf(string requestId, int startPos, int n)
+        private protected void NoteDFlashRingWriteOf(string requestId, int startPos, int n, bool carried = false)
         {
             DFlashRing previous = null;
             if (requestId != null && _hasDFlash && _dflashRingK != null)
@@ -134,6 +168,9 @@ namespace TensorSharp.Models
                 BindDFlashRing(requestId);
             }
             NoteDFlashRingWrite(startPos, n);
+            // The write also left its last row's features in the ring's carry (a followed prompt's step).
+            if (carried)
+                _dflashRingCarryEnd = startPos + n;
             _dflashRingHostStale = true;
             if (previous != null)
                 SelectDFlashRing(previous);
@@ -207,6 +244,7 @@ namespace TensorSharp.Models
             chosen.Owner = requestId;
             chosen.Filled = 0;
             chosen.ValidFrom = 0;
+            chosen.CarryEnd = -1;
             chosen.DraftingDeclined = false;
             return chosen;
         }
@@ -255,6 +293,17 @@ namespace TensorSharp.Models
 
         private void DisposeDFlashRingPool()
         {
+            // Every ring's carry: the bound ring's is in the fields, the others' in their objects.
+            if (_dflashActiveRing != null)
+                _dflashActiveRing.Carry = _dflashRingCarry;
+            else
+                _dflashRingCarry?.Dispose();
+            _dflashModelRing?.Carry?.Dispose();
+            if (_dflashRingPool != null)
+                foreach (var ring in _dflashRingPool)
+                    ring.Carry?.Dispose();
+            _dflashRingCarry = null;
+            _dflashRingCarryEnd = -1;
             if (_dflashModelRing != null)
             {
                 // The model's own ring is disposed through the fields by DisposeDFlash.

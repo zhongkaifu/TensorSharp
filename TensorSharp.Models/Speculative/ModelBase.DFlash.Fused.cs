@@ -453,6 +453,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.DSpineResetCaches();
             _dflashRingFilled = 0;
             _dflashRingValidFrom = 0;
+            _dflashRingCarryEnd = -1;
         }
 
         /// <summary>
@@ -468,6 +469,7 @@ namespace TensorSharp.Models
             if (startPos > _dflashRingFilled || startPos < _dflashRingValidFrom)
                 _dflashRingValidFrom = startPos;
             _dflashRingFilled = startPos + n;
+            _dflashRingCarryEnd = -1;   // the carry no longer sits at the frontier (a followed step sets it again)
         }
 
         /// <summary>

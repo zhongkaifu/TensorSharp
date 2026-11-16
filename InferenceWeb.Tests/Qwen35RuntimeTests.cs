@@ -1583,6 +1583,25 @@ public sealed class Qwen35RuntimeTests : IDisposable
         SpeculativeRuntimeChecks.AssertFollowedPromptDraftsAsItsCatchUp(() => Create(path), "qwen35 nextn cpu", 1e-4);
     }
 
+    /// <summary>The first decode step after a prompt drafts with the draft layer the trunk keeps in step, from the carry
+    /// the prompt's plain steps left with it (the slot's draft carry), and the speculating streams are plain decoding's:
+    /// through the engine's unified step and through a context armed after a plain prompt.</summary>
+    [Fact]
+    public Task FirstDecodeStepAfterThePromptDrafts() => FirstDecodeStepDrafts(BackendType.Cpu);
+
+    /// <summary>The same on the direct CUDA backend, where the prompt's steps must stay exactly the plain ones.</summary>
+    [CudaFact]
+    public Task FirstDecodeStepAfterThePromptDraftsOnDirectCuda() => FirstDecodeStepDrafts(BackendType.Cuda);
+
+    private async Task FirstDecodeStepDrafts(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0 };
+        await SpeculativeRuntimeChecks.AssertFirstDecodeStepDrafts(() => Create(path, backend: backend), options, $"qwen35 nextn {backend}");
+        SpeculativeRuntimeChecks.AssertPlainPromptCarriesIntoTheFirstDraft(() => Create(path, backend: backend), $"qwen35 nextn {backend} plain prompt");
+    }
+
     [CudaFact]
     public void FollowedPromptDraftsAsItsCatchUpOnDirectCuda()
     {

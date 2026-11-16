@@ -170,6 +170,15 @@ namespace TensorSharp.Runtime.Speculative
         bool CanArmAfterPrefixReuse => false;
 
         /// <summary>
+        /// The carry a proposal at <paramref name="position"/> chains from (the trunk's features of the row before it,
+        /// <see cref="DraftContext.CarryHidden"/>) when the drafter took it itself as the trunk forwarded that row (a prompt
+        /// read on the plain path that the target kept the drafter in step with, <see cref="HandlesOwnPrefill"/>): copied
+        /// into <paramref name="carry"/>, and true. False when it holds none, and then the step that would have drafted
+        /// first captures the carry plainly. Default false.
+        /// </summary>
+        bool TryTakeHeldCarry(int position, float[] carry) => false;
+
+        /// <summary>
         /// Propose up to <see cref="DraftContext.MaxTokens"/> continuation
         /// tokens, appended in order to <paramref name="draftOut"/> (which the
         /// caller has already cleared). Returning 0 is always legal and simply

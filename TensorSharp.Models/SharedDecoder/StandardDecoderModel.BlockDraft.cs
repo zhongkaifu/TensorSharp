@@ -297,6 +297,9 @@ namespace TensorSharp.Models
             /// <summary>Each following sequence's ring, per draft layer.</summary>
             public required Tensor[][] RingK { get; init; }
             public required Tensor[][] RingV { get; init; }
+            /// <summary>Each following sequence's ring's carry: its last row's feature row is written there, so the first
+            /// draft after the prompt has its carry without the step returning features (<see cref="TryTakeHeldCarry"/>).</summary>
+            public required Tensor[] Carry { get; init; }
 
             /// <summary>What the plan changes in the emitted program.</summary>
             public string Key
@@ -337,6 +340,7 @@ namespace TensorSharp.Models
             var zero = new bool[n];
             var ringK = new Tensor[n][];
             var ringV = new Tensor[n][];
+            var carry = new Tensor[n];
             bool any = false;
             for (int s = 0; s < n; s++)
             {
@@ -344,7 +348,7 @@ namespace TensorSharp.Models
                 int end = starts[s] + counts[s], first = Math.Max(starts[s], end - ringRows);
                 if (promptEnds[s] > 0) first = Math.Max(first, promptEnds[s] - ringRows);
                 if (first >= end) continue;
-                (Tensor[] k, Tensor[] v, int filled) = DFlashRingOf(requests[s]);
+                (Tensor[] k, Tensor[] v, int filled, Tensor ringCarry) = DFlashRingOf(requests[s]);
                 // Two sequences on one ring (more speculating requests than rings): the later one's prompt is not kept.
                 bool shared = false;
                 for (int o = 0; o < s; o++) shared |= ReferenceEquals(ringK[o], k);
@@ -353,9 +357,10 @@ namespace TensorSharp.Models
                 zero[s] = first == starts[s] && first > 0 && filled == first - 1;
                 ringK[s] = k;
                 ringV[s] = v;
+                carry[s] = ringCarry;
                 any = true;
             }
-            return any ? new DFlashFollowPlan { Requests = requests, Keep = keep, ZeroBefore = zero, RingK = ringK, RingV = ringV } : null;
+            return any ? new DFlashFollowPlan { Requests = requests, Keep = keep, ZeroBefore = zero, RingK = ringK, RingV = ringV, Carry = carry } : null;
         }
 
         /// <summary>A step with <paramref name="plan"/> ran: each following sequence's ring holds its kept rows.</summary>
@@ -366,7 +371,8 @@ namespace TensorSharp.Models
             {
                 if (plan.Keep[s] <= 0) continue;
                 int zero = plan.ZeroBefore[s] ? 1 : 0;
-                NoteDFlashRingWriteOf(plan.Requests[s], starts[s] + counts[s] - plan.Keep[s] - zero, plan.Keep[s] + zero);
+                NoteDFlashRingWriteOf(plan.Requests[s], starts[s] + counts[s] - plan.Keep[s] - zero, plan.Keep[s] + zero,
+                    carried: plan.Carry[s] != null);
                 GraphDFlashFollows++;
             }
         }
@@ -416,7 +422,7 @@ namespace TensorSharp.Models
                 int keep = plan.Keep[s];
                 if (keep <= 0) continue;
                 int count = step.Counts[s], firstRow = step.First[s] + count - keep, firstPos = step.Starts[s] + count - keep;
-                int g = -1;
+                int g = -1, lastBlock = -1, lastRows = 0;
                 for (int b0 = 0; b0 < keep; b0 += DFlashFollowBlockRows)
                 {
                     int nb = Math.Min(DFlashFollowBlockRows, keep - b0);
@@ -428,6 +434,17 @@ namespace TensorSharp.Models
                     }
                     int part = step.MatMul(prefix + "fc.weight", x);
                     g = g < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { g, part }, stackalloc long[] { 1 });
+                    (lastBlock, lastRows) = (x, nb);
+                }
+                if (plan.Carry[s] != null)
+                {
+                    // The chunk's last feature row into the ring's carry, the first draft's: read from the rows the encoder
+                    // joined (a one-tap drafter's are the tap's own rows); the step returns no features.
+                    int feat = cfg.FeatureSize;
+                    int last = taps.Length == 1
+                        ? step.View2(taps[0], hidden, 1, hidden * f, (long)(firstRow + keep - 1) * hidden * f)
+                        : step.View2(lastBlock, feat, 1, feat * f, (long)(lastRows - 1) * feat * f);
+                    step.Effect(step.Op(GraphOp.Cpy, last, step.State(plan.Carry[s], GraphFormat.F32, feat, 1)));
                 }
                 g = step.RmsNorm(g, step.Weight(prefix + "enc.output_norm.weight"), cfg.Eps);
                 int written = keep;

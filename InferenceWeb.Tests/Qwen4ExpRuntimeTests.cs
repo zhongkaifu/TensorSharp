@@ -494,6 +494,34 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     [InlineData(true)]
     public Task MtpSpeculationOnDirectCudaMatchesPlain(bool qsa) => AssertMtpSpeculation(qsa, BackendType.Cuda);
 
+    /// <summary>The first decode step after a prompt drafts with the MTP head the trunk keeps in step, from the carry (the
+    /// hyper-connection streams it chains) the prompt's plain steps left with it, and the speculating streams are plain
+    /// decoding's: through the engine's unified step and through a context armed after a plain prompt.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task MtpFirstDecodeStepAfterThePromptDrafts(bool qsa) => MtpFirstDecodeStepDrafts(qsa, BackendType.Cpu);
+
+    /// <summary>The same on the direct CUDA backend, where the prompt's steps must stay exactly the plain ones.</summary>
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task MtpFirstDecodeStepAfterThePromptDraftsOnDirectCuda(bool qsa) => MtpFirstDecodeStepDrafts(qsa, BackendType.Cuda);
+
+    private async Task MtpFirstDecodeStepDrafts(bool qsa, BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        var options = new TensorSharp.Runtime.Speculative.SpeculationOptions
+        {
+            Enabled = true, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0,
+        };
+        await SpeculativeRuntimeChecks.AssertFirstDecodeStepDrafts(
+            () => new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp), options, $"qwen4exp mtp qsa={qsa} {backend}");
+        SpeculativeRuntimeChecks.AssertPlainPromptCarriesIntoTheFirstDraft(
+            () => new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp), $"qwen4exp mtp qsa={qsa} {backend} plain prompt");
+    }
+
     /// <summary>
     /// QSA decode rows and verify windows on direct CUDA run as the QsaAttention region past the budget, and a window that
     /// straddles the budget runs on the ops, as its rows below the budget do when decoded alone: the MTP head drafting

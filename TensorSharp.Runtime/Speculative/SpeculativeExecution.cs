@@ -273,6 +273,22 @@ namespace TensorSharp.Runtime.Speculative
         // Always known when the model keeps it (ISpeculativeTarget.SpecCarryOnDevice).
         private bool CarryValid => _carryValid || _model.SpecCarryOnDevice;
 
+        /// <summary>
+        /// Whether a draft at <paramref name="position"/> has its carry: known already, or taken from the drafter that held
+        /// it (<see cref="ISpeculator.TryTakeHeldCarry"/>: the last row of a prompt the target kept the drafter in step with
+        /// on the plain path). Without the latter the first decode step after every such prompt ran plainly to capture the
+        /// carry, where the direct engines, whose carry stays on the device, drafted.
+        /// </summary>
+        private bool EnsureCarry(int position)
+        {
+            if (CarryValid)
+                return true;
+            if (!NeedsHidden || !_speculator.TryTakeHeldCarry(position, _pendingH))
+                return false;
+            _carryValid = true;
+            return true;
+        }
+
         /// <summary>Reset speculative state and statistics. Does NOT touch the model's KV cache.</summary>
         public void Reset()
         {
@@ -345,6 +361,10 @@ namespace TensorSharp.Runtime.Speculative
 
                 Array.Copy(_lastRowH, 0, _pendingH, 0, _hidden);
             }
+            // Every branch that needs a carry left the chunk's last row in it: the next chunk, or the first draft, chains
+            // from it (an execution armed over a reused prefix, SeedCommitted, had none before this prompt).
+            if (NeedsHidden)
+                _carryValid = true;
 
             float[] logits = new float[_vocab];
             Array.Copy(_stepLogits, logits, _vocab);
@@ -464,9 +484,9 @@ namespace TensorSharp.Runtime.Speculative
             // Verify needs position + K + 1 trunk slots; drafting writes drafter
             // rows up to position + K.
             kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
-            // No carried hidden state yet (armed over a plain prefill): this step
-            // runs plain and captures it.
-            if (!CarryValid)
+            // No carried hidden state yet (armed over a plain prefill) and none the
+            // drafter held: this step runs plain and captures it.
+            if (kMax > 0 && !EnsureCarry(position))
                 kMax = 0;
 
             _draftTokens.Clear();
@@ -706,7 +726,7 @@ namespace TensorSharp.Runtime.Speculative
             draftsOut.Clear();
             kMax = Math.Min(kMax, MaxDraftTokens);
             kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
-            if (!CarryValid || kMax <= 0)
+            if (kMax <= 0 || !EnsureCarry(position))
                 return 0;
             long t0 = Stopwatch.GetTimestamp();
             _speculator.Propose(

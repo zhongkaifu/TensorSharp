@@ -238,6 +238,44 @@ public sealed class GraphBlockDraftTests : IDisposable
     public Task SelfCatchUpEngineSpeculationMatchesPlainOnGgmlCpu(string family, string variant, BackendType backend)
         => EngineSelfCatchUpMatchesPlain(family, variant, backend);
 
+    /// <summary>
+    /// The first decode step after a prompt drafts a block: the prompt's plain steps write the ring and, in the ring's
+    /// carry, the last row's taps, which the first draft chains from (where the context, armed without a carry, had decoded
+    /// that step plainly); the speculating streams are plain decoding's. Through the engine's unified step and through a
+    /// context armed after a plain prompt.
+    /// </summary>
+    [Theory]
+    [InlineData("qwen35", "dflash")]
+    [InlineData("qwen35", "dflash2")]
+    [InlineData("qwen4exp", "dflash2")]
+    public Task FirstDecodeStepAfterThePromptDrafts(string family, string variant) => FirstDecodeStepDrafts(family, variant, BackendType.Cpu);
+
+    /// <summary>The same on the direct CUDA backend (the CUDA graph executor), where the prompt's steps must stay exactly
+    /// the plain ones for the speculating streams to be plain decoding's.</summary>
+    [CudaTheory]
+    [InlineData("qwen35", "dflash")]
+    [InlineData("qwen35", "dflash2")]
+    [InlineData("qwen4exp", "dflash2")]
+    public Task FirstDecodeStepAfterThePromptDraftsOnDirectCuda(string family, string variant)
+        => FirstDecodeStepDrafts(family, variant, BackendType.Cuda);
+
+    private async Task FirstDecodeStepDrafts(string family, string variant, BackendType backend)
+    {
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        var files = Files(family, variant);
+        var created = new List<StandardDecoderModel>();
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.Block, MaxDraftTokens = 3, MinDraftProb = 0 };
+        await SpeculativeRuntimeChecks.AssertFirstDecodeStepDrafts(() =>
+            {
+                StandardDecoderModel model = Create(files, backend);
+                created.Add(model);
+                return model;
+            }, options, $"{family} {backend} {variant}");
+        Assert.True(created.Exists(m => m.GraphDFlashFollows > 0), $"{family} {variant}: no trunk step wrote the ring");
+        Assert.All(created, m => Assert.Null(m.GraphBlockDraftDeclineReason));
+        SpeculativeRuntimeChecks.AssertPlainPromptCarriesIntoTheFirstDraft(() => Create(files, backend), $"{family} {backend} {variant} plain prompt");
+    }
+
     private async Task EngineSelfCatchUpMatchesPlain(string family, string variant, BackendType backend)
     {
         using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);

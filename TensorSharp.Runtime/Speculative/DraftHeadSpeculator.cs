@@ -114,6 +114,8 @@ namespace TensorSharp.Runtime.Speculative
 
         public bool ConditionsOnPrompt => _head.DraftHeadConditionsOnPrompt;
 
+        public bool TryTakeHeldCarry(int position, float[] carry) => _head.TryTakeHeldCarry(position, carry);
+
         /// <summary>
         /// A head that keeps per-position state of its own (a NextN/MTP block with
         /// its own KV cache) cannot start drafting after trunk positions it never

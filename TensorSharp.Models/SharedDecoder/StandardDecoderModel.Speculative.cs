@@ -479,5 +479,40 @@ namespace TensorSharp.Models
             if (!HasDraftLayer) throw new InvalidOperationException($"{Config.Architecture} has no draft head.");
             DraftLayerCatchUp(tokens, hRows, startPos);
         }
+
+        /// <summary>
+        /// The carry the trunk's own plain steps left with the drafter when they followed a prompt (<see cref="DraftSelfCatchUp"/>):
+        /// the DFlash ring's feature row of the prompt's last position (written by the follow, <see cref="EmitDFlashFollow"/>),
+        /// or the draft layer's carry (the trunk's last followed row, <see cref="EmitDraftFollow"/>), read back from the device.
+        /// The prompt's steps stay exactly the plain ones (no features returned, no other kernels), and the first decode step
+        /// drafts from the carry instead of running plainly to capture it.
+        /// </summary>
+        public bool TryTakeHeldCarry(int position, float[] carry)
+        {
+            if (carry == null || position <= 0) return false;
+            Tensor held;
+            int width;
+            if (HasDFlash)
+            {
+                held = DFlashHeldCarry(position);
+                width = DFlashSettings.FeatureSize;
+            }
+            else
+            {
+                held = DraftLayerSelfCatchUp && _draftFollowed == position && position > _draftStart ? _draftCarry : null;
+                width = DraftFeatureWidth;
+            }
+            if (held == null || carry.Length < width) return false;
+            // The graph wrote the carry on the device: bring the host copy up to it (a GGML device copy, an executor that
+            // binds host pointers; a device-resident storage reads its device copy).
+            SyncTensorHostCache(held);
+            SyncStateTensor(held);
+            Array.Copy(held.GetElementsAsFloat(width), carry, width);
+            HeldCarriesTaken++;
+            return true;
+        }
+
+        /// <summary>Carries <see cref="TryTakeHeldCarry"/> handed over (tests check the first draft took one).</summary>
+        internal int HeldCarriesTaken { get; private set; }
     }
 }

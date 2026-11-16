@@ -110,6 +110,85 @@ internal static class SpeculativeRuntimeChecks
         }
     }
 
+    /// <summary>
+    /// The first decode step after a prompt drafts, through the engine's unified step (one request, its prompt in 16-token
+    /// chunks read on the plain path, the trunk keeping the drafter in step): the drafter hands the step the carry it took
+    /// as the trunk forwarded the prompt's last row (<see cref="IDraftHead.TryTakeHeldCarry"/>), where the context, armed
+    /// without one, had decoded that step plainly. Two new tokens leave room for that step alone (a window of one draft; an
+    /// anchor drawn after a rejected draft ends the request without a forward). The speculating streams, of those two tokens
+    /// and of <paramref name="maxNew"/>, are plain decoding's: the prompt's steps are the plain ones.
+    /// </summary>
+    public static async Task AssertFirstDecodeStepDrafts(Func<ModelBase> create, SpeculationOptions speculation, string label,
+        int maxNew = 20)
+    {
+        int[][] prompt = { EnginePrompts[0] };
+        int[][] plain = await ServeAsync(create, prompt, null, maxNew, verifySteps: null);
+        ModelBase last = null;
+        var served = new List<SequenceState>();
+        int[][] first = await ServeAsync(() => last = create(), prompt, speculation, 2, verifySteps: null, served);
+        Assert.True(plain[0].Take(2).SequenceEqual(first[0]), $"{label}: gave [{string.Join(",", first[0])}], plain [{string.Join(",", plain[0])}]");
+        SpeculationStats stats = Assert.Single(served).SpecStats;
+        Assert.True(stats != null, $"{label}: speculation did not arm");
+        Assert.True(stats.TokensDrafted >= 1 && stats.VerifySteps == 1 && stats.PlainSteps == 0,
+            $"{label}: the first decode step drafted {stats.TokensDrafted} (verify steps {stats.VerifySteps}, plain steps {stats.PlainSteps})");
+        if (last is StandardDecoderModel runtime)
+            Assert.True(runtime.HeldCarriesTaken > 0, $"{label}: the first draft did not chain from the carry the drafter held");
+        int[][] drafted = await ServeAsync(create, prompt, speculation, maxNew, verifySteps: null);
+        Assert.True(plain[0].SequenceEqual(drafted[0]), $"{label}: gave [{string.Join(",", drafted[0])}], plain [{string.Join(",", plain[0])}]");
+    }
+
+    /// <summary>
+    /// The same on the per-sequence route (a model without per-request slots): a prompt read plainly in 16-token chunks, the
+    /// trunk keeping the drafter in step (<see cref="IDraftHead.FollowPlainPrompt(string, int)"/> before each chunk), then a
+    /// context armed over the tokens the trunk holds (<see cref="SpeculativeExecution.SeedCommitted"/>, as the executor
+    /// arms it at the first decode step): the carry the drafter held is the prompt's last feature row (within
+    /// <paramref name="tolerance"/>, relative L2, of the row a capturing step returns for the same chunks), and that step
+    /// drafts from it.
+    /// </summary>
+    public static void AssertPlainPromptCarriesIntoTheFirstDraft(Func<ModelBase> create, string label, double tolerance = 1e-2)
+    {
+        int[] prompt = EnginePrompts[0];
+        int n = prompt.Length;
+        using ModelBase model = create();
+        var spec = Assert.IsAssignableFrom<ISpeculativeModel>(model);
+        Assert.True(spec.DraftSelfCatchUp, $"{label}: the trunk does not keep the drafter in step");
+        int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+        // Gate 0: the head drafts whatever its (random) confidence.
+        ISpeculator speculator = spec.DraftHeadKind == DraftHeadKind.Block
+            ? new BlockDraftSpeculator(spec, spec.DraftBlockSize, spec.DraftBlockSize) { MinDraftProb = 0 }
+            : new DraftHeadSpeculator(spec, vocab, feat, 3) { MinDraftProb = 0 };
+        using var execution = new SpeculativeExecution(spec, speculator) { AdaptiveSpeculation = false };
+        float[] logits = null;
+        for (int start = 0; start < n; start += 16)
+        {
+            int end = Math.Min(n, start + 16);
+            spec.FollowPlainPrompt(null, n);
+            logits = model.ForwardPrompt(prompt[start..end], morePromptFollows: end < n);
+        }
+
+        // The held carry is the prompt's last feature row: a capturing step over the same chunks on a twin returns it.
+        var held = new float[feat];
+        Assert.True(spec.TryTakeHeldCarry(n, held), $"{label}: the drafter holds no carry after the prompt");
+        using (ModelBase twin = create())
+        {
+            var reference = (ISpeculativeModel)twin;
+            float[] rows = null;
+            for (int start = 0; start < n; start += 16)
+            {
+                int end = Math.Min(n, start + 16);
+                rows = new float[(long)(end - start) * feat];
+                reference.SpecForward(prompt[start..end], rows, new float[vocab], allLogitsRows: false);
+            }
+            double rel = RelL2(held, rows[^feat..]);
+            Assert.True(rel <= tolerance, $"{label}: the held carry is {rel:E2} (relative L2) from the prompt's last feature row");
+        }
+
+        execution.SeedCommitted(prompt);
+        SpeculativeStepOutcome outcome = execution.DecodeStep(ArgMax(logits), n, 3, ArgMax);
+        Assert.True(outcome.UsedSpeculation && execution.Stats.TokensDrafted > 0,
+            $"{label}: the first decode step after the prompt drafted {execution.Stats.TokensDrafted}");
+    }
+
     private static readonly int[][] EnginePrompts =
     {
         Enumerable.Range(0, 24).Select(i => 40 + i % 6).ToArray(),
@@ -130,7 +209,7 @@ internal static class SpeculativeRuntimeChecks
     }
 
     private static async Task<int[][]> ServeAsync(Func<ModelBase> create, int[][] prompts, SpeculationOptions speculation,
-        int maxNew, Action<int> verifySteps)
+        int maxNew, Action<int> verifySteps, List<SequenceState> served = null)
     {
         using ModelBase model = create();
         var cfg = new SchedulerConfig
@@ -150,8 +229,9 @@ internal static class SpeculativeRuntimeChecks
         var gate = new ComputeGate();
         gate.Close();
         engine.ComputeGate = gate;
-        var handles = prompts.Select((p, i) => engine.SubmitRequest(
-            new SequenceState($"req{i}", p, maxNew, cfg.BlockSize, SamplingConfig.Greedy))).ToList();
+        var sequences = prompts.Select((p, i) => new SequenceState($"req{i}", p, maxNew, cfg.BlockSize, SamplingConfig.Greedy)).ToList();
+        served?.AddRange(sequences);
+        var handles = sequences.Select(s => engine.SubmitRequest(s)).ToList();
         gate.Open();
         int[][] outputs = await Task.WhenAll(handles.Select(async h =>
         {

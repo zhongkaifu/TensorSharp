@@ -404,6 +404,16 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         void FollowPlainPrompt(string? requestId, int promptEnd) => FollowPlainPrompt(requestId);
 
+        /// <summary>
+        /// The trunk's features of the row before <paramref name="position"/> (the carry a draft there chains from, as the
+        /// speculator's catch-up pairs them) when the head took that row as the trunk forwarded it (<see cref="DraftSelfCatchUp"/>:
+        /// the last row of a prompt read on the plain path) and nothing it holds was written since: copied into
+        /// <paramref name="carry"/> (<see cref="ISpeculativeTarget.SpecFeatureSize"/> floats), and true. Over the bound drafter
+        /// state (<see cref="IPerRequestDraftState.BindDraftState"/>). The first decode step after such a prompt then drafts
+        /// instead of running plainly to capture its carry, while the prompt's steps stay the plain ones. Default false.
+        /// </summary>
+        bool TryTakeHeldCarry(int position, float[] carry) => false;
+
         /// <summary>One per-token draft step at <paramref name="pos"/>: consume
         /// (token, previous hidden), fill next-token logits and the chained
         /// hidden state. Only called for <see cref="DraftHeadKind.PerToken"/>.</summary>
