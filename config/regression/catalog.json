@@ -320,6 +320,31 @@
       ]
     },
     {
+      "id": "minimax-h3-image",
+      "aliases": [
+        "minimax-h3-image",
+        "minimax_h3_image"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "modalities": [
+        "image_generation"
+      ],
+      "layout": "dense",
+      "notes": "Single device, ggml backends only. The MiniMax-H3 DiT without its audio stream; six distilled steps, guidance fixed at 1. Shares the Qwen3-VL-32B text encoder file with minimax-h3-fl2va.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "minimax-h3-image"
+      ]
+    },
+    {
       "id": "wan",
       "aliases": [
         "wan",
@@ -780,6 +805,73 @@
       "presets": [
         "bonsai-2-27b-ptq1"
       ]
+    },
+    {
+      "id": "whisper",
+      "aliases": [
+        "whisper"
+      ],
+      "backends": [
+        "cpu",
+        "cuda"
+      ],
+      "modalities": [
+        "audio"
+      ],
+      "layout": "dense",
+      "notes": "Speech recognition from a self-contained GGUF; one clip at a time, single device.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Whisper/WhisperArchitecture.cs",
+        "docs/models/whisper.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its model doc, so no regression preset can plan it.",
+      "presets": []
+    },
+    {
+      "id": "kokoro",
+      "aliases": [
+        "kokoro"
+      ],
+      "backends": [
+        "cpu"
+      ],
+      "modalities": [
+        "audio_generation"
+      ],
+      "layout": "dense",
+      "notes": "Text to speech on the CPU; single device.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Kokoro/KokoroArchitecture.cs",
+        "docs/models/kokoro.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its model doc, so no regression preset can plan it.",
+      "presets": []
+    },
+    {
+      "id": "ace-step",
+      "aliases": [
+        "ace-step-1.5",
+        "ace_step_1.5",
+        "ace-step"
+      ],
+      "backends": [
+        "cpu",
+        "cuda"
+      ],
+      "modalities": [
+        "audio_generation"
+      ],
+      "layout": "dense",
+      "notes": "Music generation; single device.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/AceStep/AceStepArchitecture.cs",
+        "docs/models/ace-step.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its model doc, so no regression preset can plan it.",
+      "presets": []
     }
   ],
   "presets": [
@@ -2384,6 +2476,38 @@
         "tokenizer_config.json": 11003,
         "minimax_h3_video_vae_fp16.safetensors": 5207808496,
         "minimax_h3_audio_vae_fp32.safetensors": 605254808
+      },
+      "status": "configured"
+    },
+    {
+      "id": "minimax-h3-image",
+      "config": "config/minimax-h3-image.json",
+      "kind": "image_generation",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "image_generation"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "image_generation"
+      ],
+      "source_evidence": [
+        "config/minimax-h3-image.json",
+        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "minimax_h3_image_pruned_bf16.safetensors": 40234657162,
+        "qwen3vl_32b_minimax_h3-Q4_K_M.gguf": 18218065024,
+        "vocab.json": 2776833,
+        "merges.txt": 1671839,
+        "tokenizer_config.json": 11003,
+        "minimax_h3_image_vae_fp16.safetensors": 1168505312
       },
       "status": "configured"
     },
