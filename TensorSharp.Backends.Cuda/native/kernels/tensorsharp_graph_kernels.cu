@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 29
+#define TS_GRAPH_KERNELS_VERSION 30
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1987,6 +1987,68 @@ extern "C" __global__ void ts_graph_add_rms_norm_f32(const float* __restrict__ a
     float* nr = normed + r * cols;
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
         nr[i] = sr[i] * scale * w[i];
+}
+
+// ts_graph_add_rms_norm_f32 for rows of up to 16 * 512 = 8192 values at 512 threads, the row and its norm weights held in
+// registers with every global load issued up front (the direct engine's ts_q35_add_rmsnorm_nvfp4_5120_f32 rule): the loop
+// above waits one dependent round trip per element, and a verify window's rows are a block each. Thread t takes elements
+// t, t + 512, ... in that order, so its sum, the reductions and the expressions are the loop's: the same bits.
+// Launch: grid rows, block 512.
+#define TS_GRAPH_ADD_RMS_NORM_REG_PER 16
+extern "C" __global__ void __launch_bounds__(512) ts_graph_add_rms_norm_reg_f32(const float* __restrict__ a,
+    const float* __restrict__ b, const float* __restrict__ w, float* __restrict__ sum, float* __restrict__ normed, int cols,
+    float eps)
+{
+    constexpr int T = 512, PER = TS_GRAPH_ADD_RMS_NORM_REG_PER;
+    __shared__ float partial[32];
+    const size_t r = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* ar = a + r * cols;
+    const float* br = b + r * cols;
+    float v[PER], wv[PER];
+#pragma unroll
+    for (int p = 0; p < PER; p++)
+    {
+        const int i = tid + p * T;
+        v[p] = i < cols ? ar[i] + br[i] : 0.0f;
+    }
+#pragma unroll
+    for (int p = 0; p < PER; p++)
+    {
+        const int i = tid + p * T;
+        wv[p] = i < cols ? w[i] : 0.0f;
+    }
+    float* sr = sum + r * cols;
+    float ss = 0.0f;
+#pragma unroll
+    for (int p = 0; p < PER; p++)
+    {
+        const int i = tid + p * T;
+        if (i < cols)
+        {
+            sr[i] = v[p];
+            ss += v[p] * v[p];
+        }
+    }
+    ss = ts_graph_warp_sum(ss);
+    if ((tid & 31) == 0) partial[tid >> 5] = ss;
+    __syncthreads();
+    if (tid < 32)
+    {
+        float t = tid < (T >> 5) ? partial[tid] : 0.0f;
+        t = ts_graph_warp_sum(t);
+        if (tid == 0) partial[0] = t;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(partial[0] / (float)cols + eps);
+    float* nr = normed + r * cols;
+#pragma unroll
+    for (int p = 0; p < PER; p++)
+    {
+        const int i = tid + p * T;
+        if (i < cols)
+            nr[i] = v[p] * scale * wv[p];
+    }
 }
 
 // GraphFusion.GatedRmsNorm: out = y * rsqrt(mean(y^2) + eps) * w * silu(z) (sigmoid(z) with sigmoid_gate) over rows of

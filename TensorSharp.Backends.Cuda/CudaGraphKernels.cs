@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 29;
+        public const int CurrentVersion = 30;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _ringAttn64, _ringAttn128, _ringAttnCombine;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _ringAttn64, _ringAttn128, _ringAttnCombine;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -73,6 +73,7 @@ namespace TensorSharp.Cuda
             _sigmoidGate = module.GetFunction("ts_graph_sigmoid_gate_f32");
             _gatedRmsNorm = module.GetFunction("ts_graph_gated_rms_norm_f32");
             _addRmsNorm = module.GetFunction("ts_graph_add_rms_norm_f32");
+            _addRmsNormReg = module.GetFunction("ts_graph_add_rms_norm_reg_f32");
             _repackQ6kTiled = module.GetFunction("ts_graph_repack_q6k_tiled");
             _qsaStorePool = module.GetFunction("ts_graph_qsa_store_pool_f32");
             // The tiled head's products stream with cp.async into the int8 tensor cores: only an image with their sm_80 bodies.
@@ -759,8 +760,17 @@ namespace TensorSharp.Cuda
         public void LaunchAddRmsNorm(IntPtr a, IntPtr b, IntPtr w, IntPtr sum, IntPtr normed, int rows, int cols, float eps, IntPtr stream)
         {
             void** args = stackalloc void*[] { &a, &b, &w, &sum, &normed, &cols, &eps };
-            CudaDriverApi.cuLaunchKernel(_addRmsNorm, (uint)rows, 1, 1, 512, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            // Rows of up to 8,192 values hold the row in registers, every load issued up front (the same bits).
+            IntPtr kernel = cols <= AddRmsNormRegisterCols && !AddRmsNormLoopForTests ? _addRmsNormReg : _addRmsNorm;
+            CudaDriverApi.cuLaunchKernel(kernel, (uint)rows, 1, 1, 512, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
+
+        /// <summary>The widest rows ts_graph_add_rms_norm_reg_f32 holds in registers (16 values a thread of 512).</summary>
+        public const int AddRmsNormRegisterCols = 16 * 512;
+
+        /// <summary>Tests: <see cref="LaunchAddRmsNorm"/> runs the loop kernel for every width (the register kernel's
+        /// reference).</summary>
+        internal bool AddRmsNormLoopForTests { get; set; }
 
         /// <summary>GraphFusion.GatedRmsNorm over <paramref name="rows"/> rows of <paramref name="d"/> (head r % heads of token
         /// r / heads); z's tokens are <paramref name="zPitch"/> floats apart.</summary>
