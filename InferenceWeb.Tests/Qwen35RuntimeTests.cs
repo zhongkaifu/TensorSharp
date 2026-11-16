@@ -984,6 +984,172 @@ public sealed class Qwen35RuntimeTests : IDisposable
     public void ParkedDecodeRecordingsMoveToANewSlotOnDirectCuda(string variant)
         => AssertParkedRecordingsServeTheNextRequest(variant, retain: true);
 
+    /// <summary>
+    /// On direct CUDA, whose recorded steps bind a slot's buffers, the prefix cache's retention of a finished request
+    /// (<see cref="TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel.TryCaptureDonate"/>) copies its slot: the slot
+    /// returns to the pool and the next request replays the parked recordings on it, none moved to a new slot, and the kept
+    /// copy continues as the request did, bit for bit.
+    /// </summary>
+    [CudaFact]
+    public void FinishedRequestsAreRetainedAsCopiesOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), backend: BackendType.Cuda);
+        var unified = (IUnifiedBatchModel)model;
+        var cache = (TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel)model;
+        cache.AttachPrefixCache(new PayloadSink());
+        int[] prompt = Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray();
+        var logits = new float[1][];
+        (int Next, int Length) Decode(string id, int steps)
+        {
+            unified.EnsureSequenceSlot(id, 320);
+            Assert.True(unified.TryForwardUnified(new[] { id }, new[] { prompt }, new[] { 0 }, logits));
+            int next = ArgMax(logits[0]), length = prompt.Length;
+            for (int t = 0; t < steps; t++)
+            {
+                Assert.True(unified.TryForwardUnified(new[] { id }, new[] { new[] { next } }, new[] { length }, logits));
+                next = ArgMax(logits[0]);
+                length++;
+            }
+            return (next, length);
+        }
+
+        var (token, kept) = Decode("a", 40);
+        Assert.True(cache.TryCaptureDonate("a", "kept", kept, out _));
+        Assert.Equal(1, model.RetainedByCopy);
+        Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { new[] { token } }, new[] { kept }, logits));
+        float[] expected = (float[])logits[0].Clone();
+        model.OnSequenceReleased("a");
+
+        int adopted = model.RecordingsAdopted, relocated = model.RecordingsRelocated;
+        Decode("b", 40);
+        Assert.True(model.RecordingsAdopted > adopted, "the next request replayed none of the parked recordings");
+        Assert.Equal(relocated, model.RecordingsRelocated);
+        model.OnSequenceReleased("b");
+
+        Assert.True(model.TryRebindRetainedCache("kept", "c"));
+        Assert.True(unified.TryForwardUnified(new[] { "c" }, new[] { new[] { token } }, new[] { kept }, logits));
+        Assert.True(expected.AsSpan().SequenceEqual(logits[0]),
+            $"the kept copy continues {RelL2(logits[0], expected):E2} (relative L2) from the request it copied");
+    }
+
+    /// <summary>On direct CUDA, where the device has no room for a fresh slot, a new request takes the oldest retained slot (its
+    /// payload reclaimed) rather than allocating: it replays the recordings the finished request parked there, and answers as
+    /// that request did.</summary>
+    [CudaFact]
+    public void ANewRequestReclaimsARetainedSlotWhenTheDeviceIsFullOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), backend: BackendType.Cuda);
+        var unified = (IUnifiedBatchModel)model;
+        int[] prompt = Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray();
+        List<float[]> Request(string id)
+        {
+            unified.EnsureSequenceSlot(id, 64);
+            var logits = new float[1][];
+            Assert.True(unified.TryForwardUnified(new[] { id }, new[] { prompt }, new[] { 0 }, logits));
+            var trace = new List<float[]> { (float[])logits[0].Clone() };
+            int next = ArgMax(logits[0]), length = prompt.Length;
+            for (int t = 0; t < 12; t++)
+            {
+                Assert.True(unified.TryForwardUnified(new[] { id }, new[] { new[] { next } }, new[] { length }, logits));
+                trace.Add((float[])logits[0].Clone());
+                next = ArgMax(logits[0]);
+                length++;
+            }
+            return trace;
+        }
+        List<float[]> first = Request("a");
+        Assert.True(model.RetainSequenceCacheAs("a", "kept"));
+        model.SlotFreeBytesForTests = () => 0;
+        int adopted = model.RecordingsAdopted;
+        List<float[]> second = Request("b");
+        Assert.Equal(1, model.RetainedSlotsReclaimed);
+        Assert.False(model.TryRebindRetainedCache("kept", "c"));
+        Assert.True(model.RecordingsAdopted > adopted, "the new request recorded its steps again on a new slot");
+        for (int i = 0; i < first.Count; i++)
+            Assert.True(first[i].AsSpan().SequenceEqual(second[i]), $"row {i} differs on the reclaimed slot");
+    }
+
+    /// <summary>On direct CUDA a slot that grows forgets only its own graphs: another request's recorded decode step keeps
+    /// replaying, and the grown slot's request continues as it would have.</summary>
+    [CudaFact]
+    public void AGrowingSlotKeepsOtherRequestsRecordingsOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), backend: BackendType.Cuda);
+        var unified = (IUnifiedBatchModel)model;
+        int[] prompt = Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray();
+        var logits = new float[1][];
+        int next = 0, length = 0;
+        void Step(string id, int[] tokens, int at)
+        {
+            Assert.True(unified.TryForwardUnified(new[] { id }, new[] { tokens }, new[] { at }, logits));
+            next = ArgMax(logits[0]);
+        }
+        unified.EnsureSequenceSlot("a", 64);
+        Step("a", prompt, 0);
+        length = prompt.Length;
+        for (int t = 0; t < 8; t++) Step("a", new[] { next }, length++);
+        int replays = model.GraphReplays;
+        Step("a", new[] { next }, length++);
+        Assert.True(model.GraphReplays > replays, "the decode step did not replay before the grow");
+
+        unified.EnsureSequenceSlot("b", 64);
+        Step("b", prompt, 0);
+        unified.EnsureSequenceSlot("b", 2048);   // b's slot grows
+
+        replays = model.GraphReplays;
+        Step("a", new[] { next }, length++);
+        Assert.True(model.GraphReplays > replays, "a's recorded decode step traced again after another slot grew");
+    }
+
+    /// <summary>A request that decodes in verify windows (speculative decoding) makes spare slots on direct CUDA, as plain
+    /// decode steps do, while its recorded windows run (two: a checkpoint's and a retained copy's); a retained copy takes one
+    /// without allocating, and the next windows make it again.</summary>
+    [CudaFact]
+    public void VerifyWindowsMakeSpareSlotsBesideRecordedStepsOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), backend: BackendType.Cuda);
+        var unified = (IUnifiedBatchModel)model;
+        var batched = (TensorSharp.Runtime.Speculative.IBatchedSpeculativeTarget)model;
+        var cache = (TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel)model;
+        cache.AttachPrefixCache(new PayloadSink());
+        int vocab = model.Config.VocabSize;
+        int[] prompt = Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray();
+        unified.EnsureSequenceSlot("a", 320);
+        var last = new float[1][];
+        Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { prompt }, new[] { 0 }, last));
+        Assert.Equal(0, model.SpareSlotsMade);
+        int length = prompt.Length, next = ArgMax(last[0]);
+        void Window()
+        {
+            var logits = new float[2 * vocab];
+            Assert.True(batched.TryBatchedSpecVerifyLogits(new[] { "a" }, new[] { length }, 2, new[] { next, next }, logits, null));
+            batched.CommitBatchedSpecVerify(new[] { "a" }, new[] { length }, new[] { 1 });
+            next = ArgMax(logits.AsSpan(0, vocab).ToArray());
+            length++;
+        }
+        int Until(int spares)
+        {
+            for (int w = 0; w < 16 && model.SpareSlotsMade < spares; w++) Window();
+            return model.SpareSlotsMade;
+        }
+        Assert.Equal(2, Until(2));
+        for (int w = 0; w < 4; w++) Window();
+        Assert.Equal(2, model.SpareSlotsMade);   // the pool holds both
+        Assert.True(cache.TryCaptureDonate("a", "kept", length, out _));
+        Assert.Equal(1, model.RetainedByCopy);
+        Assert.Equal(3, Until(3));
+    }
+
+    /// <summary>A prefix cache attached to the model (spare slots are made for its copies alone); it hears of no payload.</summary>
+    private sealed class PayloadSink : TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixPayloadSink
+    {
+        public void OnPayloadInvalidated(string payloadKey, TensorSharp.Runtime.Scheduling.PrefixCache.InvalidationReason reason) { }
+    }
+
     private void AssertParkedRecordingsServeTheNextRequest(string variant, bool retain)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);

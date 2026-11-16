@@ -167,15 +167,19 @@ namespace TensorSharp.Models
         private RecurrentState[][] NewRecurrentStates()
         {
             var states = new RecurrentState[Config.NumLayers][];
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (!_recurrentLayer[l] || !OwnsLayer(l)) continue;
-                int stage = _mesh.StageOf(l);
-                states[l] = new RecurrentState[_mesh.TensorParallel];
-                for (int r = 0; r < _mesh.TensorParallel; r++)
-                    states[l][r] = CreateRecurrentState(Scope(stage, r), l);
-            }
+            for (int l = 0; l < Config.NumLayers; l++) NewRecurrentLayer(states, l);
             return states;
+        }
+
+        /// <summary>Layer <paramref name="l"/>'s reset states, every rank's, into <paramref name="states"/>; nothing for a layer
+        /// that keeps none here.</summary>
+        private void NewRecurrentLayer(RecurrentState[][] states, int l)
+        {
+            if (!_recurrentLayer[l] || !OwnsLayer(l)) return;
+            int stage = _mesh.StageOf(l);
+            states[l] = new RecurrentState[_mesh.TensorParallel];
+            for (int r = 0; r < _mesh.TensorParallel; r++)
+                states[l][r] = CreateRecurrentState(Scope(stage, r), l);
         }
 
         private static void ResetStates(RecurrentState[][] states)

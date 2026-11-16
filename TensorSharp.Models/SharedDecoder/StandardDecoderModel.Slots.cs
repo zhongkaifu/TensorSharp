@@ -40,6 +40,7 @@ namespace TensorSharp.Models
             public int RopeDelta;                  // rotary position = KV index + this past a position table
             public int VerifyRows;                 // a batched verify's window, its recurrent states awaiting the commit
             public int DraftFollowed = -1;         // the draft layer holds the trunk's own rows through here (see DraftFollowReady)
+            public bool Spare;                     // made ahead of a request (no recordings bind it yet), see ReplenishSpareSlot
             public Tensor DraftCarry;              // the trunk's last followed row's stream (the next followed row's input)
             public long RetainedAt;                // when it entered the retained set (the oldest goes first under pressure)
         }
@@ -204,7 +205,12 @@ namespace TensorSharp.Models
                     ClearGraphCache();
                 return pooled;
             }
-            int capacity = AlignedSlotCapacity(Math.Max(Math.Max(1, reserveTokens), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength))));
+            return FreshSlot(AlignedSlotCapacity(Math.Max(Math.Max(1, reserveTokens), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength)))));
+        }
+
+        /// <summary>A new empty slot of <paramref name="capacity"/> cells (zeroed caches, reset states).</summary>
+        private Slot FreshSlot(int capacity)
+        {
             var slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
             (slot.K, slot.V) = AllocateCaches(capacity);
             PrimeDeviceCopies(slot, overwritten: false);
@@ -401,20 +407,29 @@ namespace TensorSharp.Models
 
         /// <summary>The pooled slot that best holds <paramref name="tokens"/> (the smallest that does, else the largest;
         /// <paramref name="mustFit"/>: null unless one does), emptied but its states as they were; null when the
-        /// pool has none.</summary>
-        private Slot TakePooledSlot(int tokens, bool mustFit)
+        /// pool has none. Among the slots that hold the tokens, a request's own (<paramref name="spare"/> false) takes a slot
+        /// a request ran on - its recordings are parked and adopted where they are - before a spare one; a copy that
+        /// overwrites every byte (true) takes a spare first.</summary>
+        private Slot TakePooledSlot(int tokens, bool mustFit, bool spare = false)
         {
             if (_slotPool == null || _slotPool.Count == 0) return null;
             int pick = 0;
             for (int i = 1; i < _slotPool.Count; i++)
             {
-                int best = _slotPool[pick].Capacity, cap = _slotPool[i].Capacity;
+                Slot b = _slotPool[pick], c = _slotPool[i];
+                int best = b.Capacity, cap = c.Capacity;
                 bool fits = cap >= tokens, bestFits = best >= tokens;
+                if (fits && bestFits && b.Spare != c.Spare)
+                {
+                    if (c.Spare == spare) pick = i;
+                    continue;
+                }
                 if (fits ? !bestFits || cap < best : !bestFits && cap > best) pick = i;
             }
             Slot pooled = _slotPool[pick];
             if (mustFit && pooled.Capacity < tokens) return null;
             _slotPool.RemoveAt(pick);
+            pooled.Spare = false;
             pooled.Length = 0;
             pooled.DraftStart = 0;
             pooled.DraftFollowed = -1;
@@ -429,18 +444,22 @@ namespace TensorSharp.Models
         {
             var k = new Tensor[CacheEntries][];
             var v = new Tensor[CacheEntries][];
-            for (int e = 0; e < CacheEntries; e++)
-            {
-                Tensor first = NewCacheTensor(e, 0, capacity, value: false);
-                if (first == null) continue;
-                k[e] = new Tensor[_mesh.TensorParallel];
-                k[e][0] = first;
-                for (int r = 1; r < _mesh.TensorParallel; r++) k[e][r] = NewCacheTensor(e, r, capacity, value: false);
-                if (e >= TotalLayers) continue;
-                v[e] = new Tensor[_mesh.TensorParallel];
-                for (int r = 0; r < _mesh.TensorParallel; r++) v[e][r] = NewCacheTensor(e, r, capacity, value: true);
-            }
+            for (int e = 0; e < CacheEntries; e++) AllocateCacheEntry(k, v, e, capacity);
             return (k, v);
+        }
+
+        /// <summary>Cache entry <paramref name="e"/>'s K (and V, for a layer's) at <paramref name="capacity"/> cells, every
+        /// rank's, into <paramref name="k"/> and <paramref name="v"/>; nothing for an entry this node does not hold.</summary>
+        private void AllocateCacheEntry(Tensor[][] k, Tensor[][] v, int e, int capacity)
+        {
+            Tensor first = NewCacheTensor(e, 0, capacity, value: false);
+            if (first == null) return;
+            k[e] = new Tensor[_mesh.TensorParallel];
+            k[e][0] = first;
+            for (int r = 1; r < _mesh.TensorParallel; r++) k[e][r] = NewCacheTensor(e, r, capacity, value: false);
+            if (e >= TotalLayers) return;
+            v[e] = new Tensor[_mesh.TensorParallel];
+            for (int r = 0; r < _mesh.TensorParallel; r++) v[e][r] = NewCacheTensor(e, r, capacity, value: true);
         }
 
         private void DisposeSlot(Slot slot)
@@ -497,7 +516,10 @@ namespace TensorSharp.Models
             if (TryGrowSlotOnDevice(slot, capacity)) return;
             SyncToHost(slot);
             (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
-            ClearGraphCache();
+            // Only this slot's graphs bound the caches it gives up: every other request's steps and recordings stay. Clearing
+            // the whole cache when a pooled 512-cell slot grew for a 4K prompt had every slot's decode trace and record again
+            // (Qwen3.8 Flash Next on an A40: five graphs and two parked recordings, 2,200 allocations and a 109 ms recording).
+            ForgetGraphsOf(slot);
             CopyRows(slot.K, k, slot.Length);
             CopyRows(slot.V, v, slot.Length);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
@@ -648,6 +670,8 @@ namespace TensorSharp.Models
                 foreach (Slot slot in _retainedSlots.Values) DisposeSlot(slot);
             if (_slotPool != null)
                 foreach (Slot slot in _slotPool) DisposeSlot(slot);
+            DisposeSlot(_spareBuild);
+            _spareBuild = null;
             _slots = _retainedSlots = null;
             ClearGraphCache();
             _slotPool = null;

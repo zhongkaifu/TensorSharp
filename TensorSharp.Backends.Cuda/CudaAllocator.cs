@@ -173,6 +173,12 @@ namespace TensorSharp.Cuda
 
         internal void OnRecordedStepLaunching() => RecordedStepLaunching?.Invoke();
 
+        /// <summary>Raised once a recorded step is launched: the device runs it while the host has nothing to do until it reads
+        /// the step's outputs.</summary>
+        internal event Action RecordedStepLaunched;
+
+        internal void OnRecordedStepLaunched() => RecordedStepLaunched?.Invoke();
+
         private readonly System.Collections.Generic.List<IDisposable> ownedResources = new();
 
         /// <summary>A resource that lives as long as this allocator's context (disposed with it, before the context).</summary>

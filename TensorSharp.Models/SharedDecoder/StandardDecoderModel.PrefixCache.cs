@@ -53,6 +53,7 @@ namespace TensorSharp.Models
         public void DetachPrefixCache() => _prefixCacheSink = null;
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
+        public void QuerySpareBytes(long[] perClass) => QueryPrefixCacheSpareBytes(perClass);
 
         // ---------------------------------------------------------------- end states
 

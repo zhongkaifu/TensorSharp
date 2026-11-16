@@ -72,6 +72,11 @@ public interface IPrefixCacheModel
     /// host-authoritative. The request's cache must be the active one.</summary>
     bool TryCaptureCopy(string requestId, string payloadKey, out PayloadFootprint footprint);
 
+    /// <summary><see cref="TryCaptureCopy"/> copies any request's own cache, whether or not it is the active one (a
+    /// model that keeps every request in a slot of its own): a prompt's end checkpoint may then wait for the step
+    /// after the prompt's, its first token going out first.</summary>
+    bool CapturesUnboundRequests => false;
+
     /// <summary>Move a finished or preempted request's private holder (or native slot) under
     /// <paramref name="payloadKey"/>. A <paramref name="length"/> below the holder's length
     /// truncates first, only where the family's truncation allows it. Zero copy.</summary>
@@ -177,6 +182,14 @@ public interface IPrefixCacheModel
 
     /// <summary>Spare bytes of <paramref name="cls"/>; −1 when unknown.</summary>
     long QuerySpareBytes(ResourceClass cls);
+
+    /// <summary>Spare bytes of every class at once (<paramref name="perClass"/>[i] for class i), as
+    /// <see cref="QuerySpareBytes(ResourceClass)"/> gives them: a model whose classes share one query (the device's free
+    /// memory) asks it once.</summary>
+    void QuerySpareBytes(long[] perClass)
+    {
+        for (int i = 0; i < perClass.Length; i++) perClass[i] = QuerySpareBytes((ResourceClass)i);
+    }
 
     /// <summary>Bytes the machine is short of now, which the cached payloads give back first; 0 when it is
     /// not. A spare figure measured after a payload was allocated never falls below it, so a host whose

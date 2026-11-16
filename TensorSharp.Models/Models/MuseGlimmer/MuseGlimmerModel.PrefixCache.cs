@@ -21,6 +21,7 @@ namespace TensorSharp.Models
                 : PageFamilyCapabilities(FamilyClass.S, TruncationKind.None);
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
+        public void QuerySpareBytes(long[] perClass) => QueryPrefixCacheSpareBytes(perClass);
 
         /// <summary>How far the primary may rewind on a wrapped ring and stay exact (M0c).</summary>
         private int RingSlack => _kvSwaRows - _slidingWindow - 1;

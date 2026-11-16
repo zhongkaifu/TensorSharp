@@ -149,7 +149,7 @@ namespace TensorSharp.Models
             int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, capacityTokens));
             // A pooled slot's caches and states are overwritten whole and keep their device copies (cached graphs
             // bind them), so the host route writes them in place.
-            Slot slot = TakePooledSlot(capacity, mustFit: true);
+            Slot slot = TakePooledSlot(capacity, mustFit: true, spare: true);
             bool inPlace = slot != null;
             if (slot == null)
             {
@@ -326,7 +326,7 @@ namespace TensorSharp.Models
                 foreach (Tensor t in AllCacheTensors(k).Concat(AllCacheTensors(v))) { InvalidateTensorDeviceCache(t); t.Dispose(); }
                 throw;
             }
-            ClearGraphCache();
+            ForgetGraphsOf(slot);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             slot.K = k;

@@ -25,6 +25,9 @@ namespace TensorSharp.Graph
         /// them, a packed row apart: the window takes the projection as one product, as decode rows do, instead of a product
         /// per row block.</summary>
         public bool WindowRegionsReadPackedRows { get; init; }
+        /// <summary>Its recorded steps bind a slot's buffers: a request that runs in a new slot relocates or records them again
+        /// (tens of milliseconds a step shape), so a finished request is retained as a copy and its slot serves the next.</summary>
+        public bool SlotBoundRecordings { get; init; }
         /// <summary>Reordering independent work pays off (and is safe) on this device.</summary>
         public bool ConcurrencyReorder { get; init; }
         /// <summary>The bucket a decode step's padded attention window grows by (a window's programs replay).</summary>
@@ -104,6 +107,11 @@ namespace TensorSharp.Graph
         /// cache key: the executor may keep it in a layout only its own products read. False where it keeps the weight as it
         /// is.</summary>
         bool KeepForProductsOnly(IntPtr weightKey) => false;
+
+        /// <summary>Host work to run while the device runs the next recorded step: after its launch, before anything waits for
+        /// its outputs (a recorded step leaves the host idle for its whole run). False where the executor runs no recorded
+        /// steps to hide it behind: the caller then does the work itself, or not at all.</summary>
+        bool RunWhileNextRecordedStepRuns(Action work) => false;
 
         /// <summary>The steps run now are a drafter's: its proposals are verified, not trusted, so its products need not be
         /// row-invariant (a verify window's rows a plain decode step's bit for bit) and may take faster kernels whose last

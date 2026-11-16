@@ -96,7 +96,12 @@ namespace TensorSharp.Models
         private bool TryVerifySlots(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
             float[] logitsOut, float[] featuresOut, int[] idsOut = null)
         {
-            try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, idsOut); }
+            try
+            {
+                if (!TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, idsOut)) return false;
+                ReplenishSpareSlot();
+                return true;
+            }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {
                 FreeGraphMemory();

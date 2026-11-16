@@ -62,6 +62,26 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>Every class's <see cref="QueryPrefixCacheSpareBytes(ResourceClass)"/> (<paramref name="perClass"/>[i] for
+        /// class i), the device classes from one query of the device's free memory, which they share.</summary>
+        protected void QueryPrefixCacheSpareBytes(long[] perClass)
+        {
+            long device = 0;
+            bool asked = false;
+            for (int i = 0; i < perClass.Length; i++)
+            {
+                var cls = (ResourceClass)i;
+                if (cls is not (ResourceClass.DeviceKv or ResourceClass.StateSnapshot or ResourceClass.NativeSlot))
+                    perClass[i] = QueryPrefixCacheSpareBytes(cls);
+                else
+                {
+                    if (!asked) device = QueryPrefixCacheSpareBytes(cls);
+                    asked = true;
+                    perClass[i] = device;
+                }
+            }
+        }
+
         /// <summary>
         /// <see cref="IPrefixCacheModel.QueryHostMemoryDeficitBytes"/>: on a Mac, how far what macOS can
         /// give without compressing has fallen below what it should keep (<see cref="UnifiedMemorySpareBytes"/>),

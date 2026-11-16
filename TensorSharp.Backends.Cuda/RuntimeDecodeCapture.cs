@@ -215,6 +215,7 @@ namespace TensorSharp.Cuda
             {
                 return false;
             }
+            _allocator.OnRecordedStepLaunched();
             return true;
         }
 

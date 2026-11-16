@@ -273,6 +273,8 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     if (RadixCache != null)
                     {
+                        // Prompt-end checkpoints the last step finished, before anything forwards their slots.
+                        RadixCache.CapturePending();
                         RadixCache.Drain();
                         if (RadixCache.DisplacePrimary())
                         {
@@ -3878,7 +3880,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// every per-sequence path with the sequence's cache active (the primary cache on
         /// the linear path, its own holder on the fused one).
         /// </summary>
-        private void MaybeCheckpointSharedPrefix(SequenceState seq) => RadixCache?.CaptureCheckpoint(seq);
+        /// <summary>A shared-prefix or prompt-end checkpoint of <paramref name="seq"/>; a prompt-end copy of a sequence in its own
+        /// slot waits for the next step (after its first token), a live primary cache's is taken now.</summary>
+        private void MaybeCheckpointSharedPrefix(SequenceState seq)
+            => RadixCache?.CaptureCheckpoint(seq, deferPromptEnd: !(_liveCacheValid && ReferenceEquals(_liveCacheSeq, seq)));
 
         /// <summary>How many leading prompt tokens of <paramref name="seq"/> the prefix
         /// cache can resume, or 0 (with <see cref="LastFusedContinuationDeclineReason"/>

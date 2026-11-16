@@ -69,6 +69,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             BatchedPagedEnabled = !options.BatchedPathDisabled,
             PayloadValidator = this,
             QuerySpareBytes = _cacheModel.QuerySpareBytes,
+            QueryAllSpareBytes = _cacheModel.QuerySpareBytes,
             HostRamBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
         });
         _cacheModel.AttachPrefixCache(this);
@@ -548,7 +549,41 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         return length > first ? length : 0;
     }
 
-    internal void CaptureCheckpoint(SequenceState sequence)
+    /// <summary>Prompt-end checkpoints waiting for the step after their prompt's (<see cref="CapturePending"/>): the
+    /// sequence, its length then and its prompt's last logits as they were.</summary>
+    private readonly List<(SequenceState Sequence, int Length, float[]? Logits)> _pendingPromptEnds = new();
+
+    /// <summary>Tests: a prompt's automatic end checkpoint is captured in the step that finished the prompt.</summary>
+    internal bool PromptEndCapturesDeferred { get; set; } = true;
+
+    /// <summary>
+    /// The automatic checkpoints at prompts' ends that <see cref="CaptureCheckpoint"/> left for after their first token:
+    /// a checkpoint copies the request's slot (its caches' rows and its recurrent states), which on Qwen3.8-27B took 12-13 ms
+    /// of a short prompt's time to first token and 25-35 ms of a 4K one's, where the copy needs only the state the prompt
+    /// left - still the slot's until the request's next step. Called before every step's work, under the step's GPU lock;
+    /// a request that has moved on since gets none. A request that leaves before its next step drops its own
+    /// (<see cref="DropPending"/>): retained whole, its slot holds the same state; released, it has none to keep.
+    /// </summary>
+    internal void CapturePending()
+    {
+        if (_pendingPromptEnds.Count == 0) return;
+        var pending = _pendingPromptEnds.ToArray();
+        _pendingPromptEnds.Clear();
+        foreach (var (sequence, length, logits) in pending)
+            if (sequence.NumComputedTokens == length && _requests.ContainsKey(sequence))
+                CaptureAt(sequence, length, publicBoundary: false, explicitBoundary: false, automaticBoundary: true, logits);
+    }
+
+    /// <summary>Forget <paramref name="sequence"/>'s waiting prompt-end checkpoint (it leaves the scheduler: the release runs
+    /// outside the steps' GPU lock, where a slot copy must not).</summary>
+    private void DropPending(SequenceState sequence)
+    {
+        if (_pendingPromptEnds.Count > 0) _pendingPromptEnds.RemoveAll(p => ReferenceEquals(p.Sequence, sequence));
+    }
+
+    /// <param name="deferPromptEnd">The sequence's state is its own slot's (not the executor's live primary cache, whose
+    /// owner may change before the next step), so its prompt-end copy may wait for <see cref="CapturePending"/>.</param>
+    internal void CaptureCheckpoint(SequenceState sequence, bool deferPromptEnd = false)
     {
         if (!CheckpointsSupported) return;
         int length = sequence.NumComputedTokens;
@@ -563,6 +598,21 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         }
         if (length <= 0 || (!publicBoundary && !explicitBoundary && !automaticBoundary)) return;
         if (length <= sequence.SharedPrefixTokens ? !PublicCheckpointsEnabled : !RetentionEnabled) return;
+        float[]? promptLogits = automaticBoundary && !publicBoundary ? PromptEndLogits(sequence, length) : null;
+        // The prompt's end (its first token is next): the copy waits for the next step.
+        if (deferPromptEnd && PromptEndCapturesDeferred && _cacheModel.CapturesUnboundRequests && automaticBoundary && !publicBoundary
+            && !explicitBoundary
+            && length == sequence.PromptTokens.Count)
+        {
+            _pendingPromptEnds.Add((sequence, length, promptLogits));
+            return;
+        }
+        CaptureAt(sequence, length, publicBoundary, explicitBoundary, automaticBoundary, promptLogits);
+    }
+
+    private void CaptureAt(SequenceState sequence, int length, bool publicBoundary, bool explicitBoundary, bool automaticBoundary,
+        float[]? promptLogits)
+    {
         if (publicBoundary && length == sequence.SharedPrefixTokens) sequence.PrefixCheckpointTaken = true;
         Drain();
         RadixNode node = _tree.Insert(GetKey(sequence), length, GetScope(sequence),
@@ -585,7 +635,6 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             if (!captured && ReleaseOldestScopedPayload())
                 captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
             if (!captured) return;
-            float[]? promptLogits = automaticBoundary && !publicBoundary ? PromptEndLogits(sequence, length) : null;
             published = Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy, promptLogits);
         }
         finally
@@ -614,6 +663,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
 
     internal bool RetainFinished(SequenceState sequence, bool primary)
     {
+        DropPending(sequence);
         Drain();
         int length = Math.Min(sequence.NumComputedTokens, sequence.NumTotalTokens);
         if (length < _tree.Caps.MinRetainTokens || sequence.CacheBreakpoints is not null) return false;
@@ -806,6 +856,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
 
     internal void ReleaseRequest(SequenceState sequence)
     {
+        DropPending(sequence);
         if (!_requests.Remove(sequence, out var request)) return;
         _tree.NoteRequests(request.Scope, -1, 0);
         _tree.ReleaseRopeOwner(request.Key);

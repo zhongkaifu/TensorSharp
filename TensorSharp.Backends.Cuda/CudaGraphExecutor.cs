@@ -32,7 +32,7 @@ namespace TensorSharp.Cuda
         public override GraphCapabilities Capabilities { get; } = new()
         {
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
-            WindowStateInPlace = true, WindowRegionsReadPackedRows = true,
+            WindowStateInPlace = true, WindowRegionsReadPackedRows = true, SlotBoundRecordings = true,
             HostExperts = true, RecordsHostExperts = true, RegionsAtAnyWidth = true, GreedyIdOutputs = true,
         };
 
@@ -2391,6 +2391,39 @@ namespace TensorSharp.Cuda
         private bool _stagingCapped;
         private Action _onLaunching;
 
+        // Host work waiting for the next recorded step's launch (RunWhileNextRecordedStepRuns), and the handler that runs it.
+        private readonly List<Action> _whileStepRuns = new();
+        private Action _onLaunched;
+
+        /// <summary>Queues <paramref name="work"/> for the next recorded step's launch (<see cref="RuntimeDecodeCapture.TryLaunch"/>),
+        /// where it runs on this thread while the device runs the step, before anything reads the step's outputs. Work that
+        /// throws is dropped: the step it rides on must not fail with it.</summary>
+        public override bool RunWhileNextRecordedStepRuns(Action work)
+        {
+            ArgumentNullException.ThrowIfNull(work);
+            var cuda = (CudaAllocator)Allocator;
+            if (_onLaunched == null)
+            {
+                _onLaunched = () =>
+                {
+                    if (_whileStepRuns.Count == 0) return;
+                    Action[] due = _whileStepRuns.ToArray();
+                    _whileStepRuns.Clear();
+                    foreach (Action a in due)
+                    {
+                        try { a(); }
+                        catch (Exception e) when (e is CudaException or OutOfMemoryException or InvalidOperationException)
+                        {
+                            Console.Error.WriteLine($"[cuda-graph] work beside a recorded step failed: {e.Message}");
+                        }
+                    }
+                };
+                cuda.RecordedStepLaunched += _onLaunched;
+            }
+            _whileStepRuns.Add(work);
+            return true;
+        }
+
         /// <summary>
         /// The model's resources this executor holds on the device and the host, released with the model (before its
         /// mappings and tiers go: a table outliving them would serve the next model mapped at the same addresses): the
@@ -2402,6 +2435,9 @@ namespace TensorSharp.Cuda
             var cuda = (CudaAllocator)Allocator;
             if (_onLaunching != null) cuda.RecordedStepLaunching -= _onLaunching;
             _onLaunching = null;
+            if (_onLaunched != null) cuda.RecordedStepLaunched -= _onLaunched;
+            _onLaunched = null;
+            _whileStepRuns.Clear();
             try { HarvestRouteCounts(force: true); }
             catch (CudaException) { }
             _doorbell?.Dispose();
