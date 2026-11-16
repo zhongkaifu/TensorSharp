@@ -122,15 +122,32 @@ namespace TensorSharp.Models
             private readonly float[][] _recent;
             private readonly object _recentSync = new();
 
+            /// <summary>A copy of <paramref name="layer"/>'s recent route counts, or null before its first recorded route
+            /// (tests).</summary>
+            internal float[] RecentForTests(int layer)
+            {
+                lock (_recentSync) return (float[])_recent[layer]?.Clone();
+            }
+
             /// <summary>A prompt chunk's selections weigh as this many rows' worth of decode selections.</summary>
             internal const float PromptAdaptRows = 128f;
+
+            /// <summary>
+            /// What a round leaves of the recent counts: the Qwen3.8 engines' 0.75 (DecayAdaptCounts), with their round every
+            /// four steps (the CUDA executor's AdaptEvery). A route then weighs half after about ten steps (after twelve at the
+            /// 0.5 a round this had while the executor's rounds came every twelve steps).
+            /// </summary>
+            internal const float RoundDecay = 0.75f;
+
+            /// <summary>Routes an expert outside the tier needs lately to trade in at all (the engines' BestTrade).</summary>
+            internal const float MinTradeRoutes = 2f;
 
             private readonly List<int> _hot = new(), _cold = new();
 
             public IReadOnlyList<(int Layer, int Out, int In)> ProposeSwaps(int budget)
             {
                 var trades = new List<(float Gain, int Layer, int Out, int In)>();
-                if (!_adapt || budget <= 0 || _m._tierHoldsProfile) return Array.Empty<(int, int, int)>();
+                if (!_adapt || budget <= 0) return Array.Empty<(int, int, int)>();
                 lock (_recentSync)
                 {
                     for (int l = 0; l < _tier.Length; l++)
@@ -139,9 +156,10 @@ namespace TensorSharp.Models
                         float[] recent = _recent[l];
                         if (held == null || recent == null) continue;
                         // The layer's hottest experts outside the tier against its coldest members, pairwise, while the hot one
-                        // was routed more than twice as often. Only experts hotter than twice the coldest member can pair, so
-                        // one pass finds them and only they are sorted (sorting both whole lists cost 2-7 ms a round over 48
-                        // layers of 512 experts, on the decode thread).
+                        // was routed more than twice as often and at least twice (the Qwen3.8 engines' trade: a prompt's
+                        // fractional counts alone do not move an expert). Only experts hotter than twice the coldest member can
+                        // pair, so one pass finds them and only they are sorted (sorting both whole lists cost 2-7 ms a round
+                        // over 48 layers of 512 experts, on the decode thread).
                         float coldest = float.PositiveInfinity;
                         int members = 0;
                         for (int e = 0; e < held.Length; e++)
@@ -153,7 +171,7 @@ namespace TensorSharp.Models
                         float bar = 2f * coldest + 1f;
                         _hot.Clear();
                         for (int e = 0; e < held.Length; e++)
-                            if (!held[e] && recent[e] > bar) _hot.Add(e);
+                            if (!held[e] && recent[e] > bar && recent[e] >= MinTradeRoutes) _hot.Add(e);
                         if (members > 0 && _hot.Count > 0)
                         {
                             _hot.Sort((a, b) => recent[b] != recent[a] ? recent[b].CompareTo(recent[a]) : a.CompareTo(b));
@@ -183,7 +201,7 @@ namespace TensorSharp.Models
                             }
                         }
                         // Decayed each round: recent routing outweighs old.
-                        for (int e = 0; e < recent.Length; e++) recent[e] *= 0.5f;
+                        for (int e = 0; e < recent.Length; e++) recent[e] *= RoundDecay;
                     }
                 }
                 trades.Sort((a, b) => b.Gain.CompareTo(a.Gain));
@@ -213,21 +231,37 @@ namespace TensorSharp.Models
                 long hostRoutes = 0;
                 foreach (byte s in skip) if (s == 0) hostRoutes++;
                 System.Threading.Interlocked.Add(ref HostRoutes, hostRoutes);
+                // The packed copies where every route computed here has a place (the ids then index the places; a route the
+                // device runs reads place 0, never computed): the same bytes, so the same sums. A route without one (an expert
+                // traded into the tier while the step that rang for it was queued) reads every expert from the mapping.
+                HostExpertCopies copies = Copies(layer);
+                Span<int> places = copies != null ? stackalloc int[ids.Length] : default;
+                for (int i = 0; copies != null && i < ids.Length; i++)
+                {
+                    places[i] = skip[i] != 0 ? 0 : copies.PlaceOf(ids[i]);
+                    if (places[i] < 0) copies = null;
+                }
+                IntPtr gateBytes = copies?.Stack(0) ?? gate.Data, upBytes = copies?.Stack(1) ?? up.Data, downBytes = copies?.Stack(2) ?? down.Data;
+                int stackExperts = copies?.Places ?? _m._numExperts;
+                ReadOnlySpan<int> experts = copies != null ? places : ids;
                 fixed (float* xp = x, wp = weights, op = output)
-                fixed (int* ip = ids)
+                fixed (int* ip = experts)
                 fixed (byte* sp = skip)
                 {
                     for (int r0 = 0; r0 < rows; r0 += HostRowsPerCall)
                     {
                         int n = Math.Min(HostRowsPerCall, rows - r0);
-                        if (!GgmlBasicOps.HostExpertRows(gate.Data, up.Data, down.Data, gate.GgmlType, up.GgmlType, down.GgmlType,
-                                _m._numExperts, hidden, ff, k, n, xp + (long)r0 * hidden, ip + (long)r0 * k, wp + (long)r0 * k,
+                        if (!GgmlBasicOps.HostExpertRows(gateBytes, upBytes, downBytes, gate.GgmlType, up.GgmlType, down.GgmlType,
+                                stackExperts, hidden, ff, k, n, xp + (long)r0 * hidden, ip + (long)r0 * k, wp + (long)r0 * k,
                                 sp + (long)r0 * k, op + (long)r0 * hidden))
                             return false;
                     }
                 }
                 return true;
             }
+
+            /// <summary>The layer's packed host experts (<see cref="StandardDecoderModel.TryPackHostExperts"/>), or null.</summary>
+            public HostExpertCopies Copies(int layer) => _m._hostCopies is { } all && (uint)layer < (uint)all.Length ? all[layer] : null;
         }
 
         /// <summary>The route-tail skip's rank (0 off) and the tier share past which a layer computes every route
@@ -274,6 +308,10 @@ namespace TensorSharp.Models
 
         /// <summary>The expert host of <paramref name="layer"/> (tests).</summary>
         internal IGraphExpertHost ExpertHostForTests(int layer) => HostFor(layer);
+
+        /// <summary>The adaptive tier's recent route counts of a tiered <paramref name="layer"/> as its expert host holds them
+        /// (a copy), or null before any (tests).</summary>
+        internal float[] ExpertRecentRoutesForTests(int layer) => _expertHost?.RecentForTests(layer);
 
         /// <summary>Test seam: keep <paramref name="experts"/> of <paramref name="layer"/> in the executor's tier.</summary>
         internal void SetExpertTierForTests(int layer, int[] experts) => (HostFor(layer) ?? throw new InvalidOperationException(

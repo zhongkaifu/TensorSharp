@@ -620,6 +620,511 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.All(staged, row => Assert.All(row, v => Assert.True(float.IsFinite(v))));
     }
 
+    /// <summary>
+    /// Adaptive tier trades overlapped with the decode on direct CUDA (CudaGraphExecutor.TierTrades: a round's copies on a
+    /// stream of their own, the tables moved a step boundary apart) give the logits blocking trades give, and no trades, bit
+    /// for bit - in steps run as they come and in recorded steps, whose kernels read the tables when they run. Every miss of
+    /// a decode row is computed on the device here (from the tier's slot, a staging copy or a miss slot: the same kernel over
+    /// the same bytes), so only a step that read bytes still in flight could differ. Each step first routes one host expert
+    /// of every layer often, so every round trades; the overlapped rounds' trades are committed after steps ran beside them.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void OverlappedTierTradesGiveTheBlockingTradesLogitsOnDirectCuda(bool recorded)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-quantized");
+        (List<float[]> Rows, long Overlapped, long Blocking, long Beside, long RecordedBeside, int Recordings, long HostRoutes) Run(
+            TensorSharp.Cuda.CudaGraphExecutor.TierTrades trades)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.RouteTailSkipForTests = (0, 100);
+            model.DecodeCaptureDisabled = !recorded;
+            model.WaitHostWarmForTests();
+            var executor = (TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests;
+            // Every miss of a decode row staged into a device slot: no route is left to the host's kernels.
+            executor.GpuMissesForTests = 16;
+            executor.UploadsTierForTests = true;
+            executor.TierTradesForTests = trades;
+            int experts = model.ExpertCountForTests;
+            int[] layers = Enumerable.Range(0, model.Config.NumLayers).Where(l => model.ExpertHostForTests(l) != null).ToArray();
+            Assert.True(layers.Length > 0, "the fixture has no offloaded MoE layer");
+            foreach (int l in layers) model.SetExpertTierForTests(l, Enumerable.Range(0, experts / 2).ToArray());
+            TensorSharp.Graph.IGraphExpertHost host = model.ExpertHostForTests(layers[0]);
+            void RouteAHostExpertOften()
+            {
+                foreach (int l in layers)
+                {
+                    int e = Enumerable.Range(0, experts).First(x => !host.IsResident(l, x));
+                    host.Record(l, Enumerable.Repeat(e, 40).ToArray());
+                }
+            }
+            var rows = new List<float[]>();
+            RouteAHostExpertOften();
+            rows.Add((float[])model.ForwardRefill(Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray()).Clone());
+            for (int i = 0; i < 24; i++)
+            {
+                RouteAHostExpertOften();
+                rows.Add((float[])model.Forward(new[] { 60 + (i * 7) % 90 }).Clone());
+            }
+            return (rows, executor.OverlappedTrades, executor.BlockingTrades, executor.StepsBesideTrades, executor.RecordedStepsBesideTrades,
+                model.DecodeRecordings, model.ExpertHostCountsForTests.HostRoutes);
+        }
+        var off = Run(TensorSharp.Cuda.CudaGraphExecutor.TierTrades.Off);
+        var blocking = Run(TensorSharp.Cuda.CudaGraphExecutor.TierTrades.Blocking);
+        var overlapped = Run(TensorSharp.Cuda.CudaGraphExecutor.TierTrades.Overlapped);
+        _output.WriteLine($"recorded={recorded}: blocking trades {blocking.Blocking}; overlapped trades {overlapped.Overlapped} "
+            + $"(+{overlapped.Blocking} blocking), steps beside them {overlapped.Beside} ({overlapped.RecordedBeside} recorded launches), "
+            + $"recordings {overlapped.Recordings}");
+        Assert.Equal(0, off.Overlapped + off.Blocking);
+        // The decode's cost: no route ever reached the host's kernels - no expert left the device's reach at any step (a
+        // lock replaced while serving takes its pages' experts off the device; the rounds only add locks).
+        Assert.Equal(0, off.HostRoutes);
+        Assert.Equal(0, blocking.HostRoutes);
+        Assert.Equal(0, overlapped.HostRoutes);
+        Assert.True(blocking.Blocking > 0 && blocking.Overlapped == 0, $"blocking rounds: {blocking.Blocking} blocking, {blocking.Overlapped} overlapped trades");
+        Assert.True(overlapped.Overlapped > 0 && overlapped.Blocking == 0,
+            $"overlapped rounds: {overlapped.Overlapped} overlapped, {overlapped.Blocking} blocking trades (no staging to borrow?)");
+        Assert.True(overlapped.Beside > 0, "no step ran while a round's copies were in flight");
+        if (recorded)
+            Assert.True(overlapped.Recordings > 0 && overlapped.RecordedBeside > 0,
+                $"recordings {overlapped.Recordings}, recorded launches beside a round {overlapped.RecordedBeside}");
+        for (int i = 0; i < off.Rows.Count; i++)
+        {
+            Assert.True(blocking.Rows[i].AsSpan().SequenceEqual(off.Rows[i]), $"row {i}: blocking trades moved it {RelL2(blocking.Rows[i], off.Rows[i]):E2}");
+            Assert.True(overlapped.Rows[i].AsSpan().SequenceEqual(off.Rows[i]), $"row {i}: overlapped trades moved it {RelL2(overlapped.Rows[i], off.Rows[i]):E2}");
+        }
+    }
+
+    /// <summary>
+    /// Adaptive trades beside every way a step's misses go on direct CUDA - rung to the host (no miss slots), or staged into
+    /// miss slots with a short chunk's surplus rung - over three conversations of a long prompt chunk (staged through the arenas
+    /// a round borrows), a 7-row continuation the doorbell takes and recorded decode steps: every step finishes. Run on a worker
+    /// thread with a deadline, so a step left waiting on the device (a ring nobody answers, a stream waiting on a copy that
+    /// never comes) fails here instead of hanging the run.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(0)]
+    [InlineData(TensorSharp.Cuda.CudaGraphExecutor.DefaultGpuMisses)]
+    public void TierTradesBesideRungAndStagedMissesFinishOnDirectCuda(int gpuMisses)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-quantized");
+        (long Trades, long Beside, long HostRoutes, long Doorbells, int Rows) Run()
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.WaitHostWarmForTests();
+            var executor = (TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests;
+            executor.GpuMissesForTests = gpuMisses;
+            executor.UploadsTierForTests = true;
+            int experts = model.ExpertCountForTests;
+            int[] layers = Enumerable.Range(0, model.Config.NumLayers).Where(l => model.ExpertHostForTests(l) != null).ToArray();
+            foreach (int l in layers) model.SetExpertTierForTests(l, Enumerable.Range(0, experts / 2).ToArray());
+            TensorSharp.Graph.IGraphExpertHost host = model.ExpertHostForTests(layers[0]);
+            void RouteAHostExpertOften()
+            {
+                foreach (int l in layers)
+                    host.Record(l, Enumerable.Repeat(Enumerable.Range(0, experts).First(x => !host.IsResident(l, x)), 40).ToArray());
+            }
+            var rows = new List<float[]>();
+            for (int turn = 0; turn < 3; turn++)
+            {
+                if (turn > 0) model.ResetKVCache();
+                RouteAHostExpertOften();
+                rows.Add((float[])model.ForwardRefill(Enumerable.Range(0, 17 + turn).Select(i => 40 + (i * 13 + turn) % 150).ToArray()).Clone());
+                RouteAHostExpertOften();
+                rows.Add((float[])model.Forward(Enumerable.Range(0, 7).Select(i => 50 + (i * 5 + turn) % 90).ToArray()).Clone());
+                for (int i = 0; i < 9; i++)
+                {
+                    RouteAHostExpertOften();
+                    rows.Add((float[])model.Forward(new[] { 60 + (i * 7 + turn) % 90 }).Clone());
+                }
+            }
+            Assert.All(rows, row => Assert.All(row, v => Assert.True(float.IsFinite(v))));
+            return (executor.OverlappedTrades + executor.BlockingTrades, executor.StepsBesideTrades, model.ExpertHostCountsForTests.HostRoutes,
+                executor.DoorbellCalls, rows.Count);
+        }
+        var run = Task.Run(Run);
+        Assert.True(run.Wait(TimeSpan.FromMinutes(5)),
+            $"gpuMisses={gpuMisses}: the conversations did not finish in 5 minutes (a step waits on the device for something nobody provides)");
+        var r = run.Result;
+        _output.WriteLine($"gpuMisses={gpuMisses}: {r.Rows} steps, {r.Trades} trades, {r.Beside} steps beside a round, "
+            + $"{r.HostRoutes} host routes, {r.Doorbells} doorbell calls");
+        Assert.True(r.Trades > 0, "no trade was made");
+        Assert.True(r.Doorbells > 0, "no step rang the doorbell");
+        if (gpuMisses == 0) Assert.True(r.HostRoutes > 0, "no route was rung to the host");
+    }
+
+    /// <summary>
+    /// Where the host could not pin the host experts' packed copies (dropped here before the first step), their file ranges are
+    /// page-locked instead, and a trade's outgoing expert is page-locked and mapped before it leaves the tier on direct CUDA
+    /// (the load locks the host experts it planned, not the tier's: here the tier's locks are released before the first step):
+    /// a worker locks the outgoing experts and the round's copies begin a counted step later. Nothing is unlocked while the
+    /// model serves, so no expert is ever taken off the device: with every decode miss staged in a miss slot no route reaches
+    /// the host's kernels, the locked total within the stacks grows only by what the worker locked, and a prompt chunk after
+    /// the rounds stages every layer's host experts on the device (none reads its routes back).
+    /// </summary>
+    [CudaFact]
+    public void TradedOutExpertsAreLockedBeforeTheyLeaveTheTierWithoutPackedCopiesOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        using var model = Create(Fixture("moe-quantized"), backend: BackendType.Cuda);
+        model.RouteTailSkipForTests = (0, 100);
+        model.WaitHostWarmForTests();
+        var executor = (TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests;
+        executor.GpuMissesForTests = 16;
+        executor.UploadsTierForTests = true;
+        executor.UnlocksTierAtLoadForTests = true;
+        model.DropHostExpertCopiesForTests();
+        Assert.Equal(0, model.HostExpertCopyBytesForTests);
+        int experts = model.ExpertCountForTests;
+        int[] layers = Enumerable.Range(0, model.Config.NumLayers).Where(l => model.ExpertHostForTests(l) != null).ToArray();
+        Assert.True(layers.Length > 0, "the fixture has no offloaded MoE layer");
+        foreach (int l in layers) model.SetExpertTierForTests(l, Enumerable.Range(0, experts / 2).ToArray());
+        TensorSharp.Graph.IGraphExpertHost host = model.ExpertHostForTests(layers[0]);
+        void RouteAHostExpertOften()
+        {
+            foreach (int l in layers)
+                host.Record(l, Enumerable.Repeat(Enumerable.Range(0, experts).First(x => !host.IsResident(l, x)), 40).ToArray());
+        }
+        RouteAHostExpertOften();
+        model.ForwardRefill(Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray());
+        long lockedAtStart = executor.LockedExpertBytesForTests(), lockedByWorkerAtStart = executor.TradeLockedBytes;
+        for (int i = 0; i < 20; i++)
+        {
+            RouteAHostExpertOften();
+            model.Forward(new[] { 60 + (i * 7) % 90 });
+        }
+        executor.FinishTradesForTests();
+        long locked = executor.LockedExpertBytesForTests(), lockedByWorker = executor.TradeLockedBytes - lockedByWorkerAtStart;
+        long trades = executor.OverlappedTrades + executor.BlockingTrades, hostRoutes = model.ExpertHostCountsForTests.HostRoutes;
+        _output.WriteLine($"{trades} trades ({executor.UnlockableTrades} dropped), {executor.LockingRounds} rounds waited for locks; locked "
+            + $"{lockedAtStart} -> {locked} bytes in the stacks, {lockedByWorker} by the worker; host routes {hostRoutes}");
+        Assert.True(trades > 0, "no trade was made");
+        Assert.True(executor.LockingRounds > 0 && lockedByWorker > 0, "no round locked its outgoing experts first");
+        Assert.Equal(0, executor.UnlockableTrades);
+        Assert.Equal(0, hostRoutes);
+        Assert.True(locked >= lockedAtStart && locked - lockedAtStart <= lockedByWorker,
+            $"locked {lockedAtStart} -> {locked} bytes in the stacks, the worker {lockedByWorker}");
+
+        // A prompt chunk continuing the conversation (wider than the doorbell takes): every layer's host experts on the device.
+        long device = executor.DeviceStagedLayers, planned = executor.HostPlannedLayers;
+        float[] logits = model.Forward(Enumerable.Range(0, 17).Select(i => 30 + (i * 13) % 150).ToArray());
+        _output.WriteLine($"the prompt chunk: {executor.DeviceStagedLayers - device} layers staged on the device, "
+            + $"{executor.HostPlannedLayers - planned} host-planned");
+        Assert.Equal(0, executor.HostPlannedLayers - planned);
+        Assert.Equal(layers.Length, executor.DeviceStagedLayers - device);
+        Assert.All(logits, v => Assert.True(float.IsFinite(v)));
+    }
+
+    /// <summary>
+    /// The host experts packed in pinned host memory on direct CUDA (the direct engines' layout, StandardDecoderModel's
+    /// TryPackHostExperts; packed again here for the tier the test names, as a planned tier's load packs them): forced trades
+    /// move each outgoing expert into the incoming one's place, so no host memory is registered while the model serves - no
+    /// lock round, nothing page-locked by the executor or by the load - and every host expert stays device-readable: with
+    /// every decode miss staged in a miss slot no route reaches the host's kernels, and a prompt chunk after the rounds stages
+    /// every MoE layer on the device. Overlapped and blocking trades give the logits no trades give, bit for bit.
+    /// </summary>
+    [CudaFact]
+    public void PackedHostExpertsTradeWithoutRegisteringHostMemoryOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-quantized");
+        (List<float[]> Rows, long Trades) Run(TensorSharp.Cuda.CudaGraphExecutor.TierTrades trades)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.RouteTailSkipForTests = (0, 100);
+            model.WaitHostWarmForTests();
+            var executor = (TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests;
+            executor.GpuMissesForTests = 16;
+            executor.UploadsTierForTests = true;
+            executor.TierTradesForTests = trades;
+            int experts = model.ExpertCountForTests;
+            int[] layers = Enumerable.Range(0, model.Config.NumLayers).Where(l => model.ExpertHostForTests(l) != null).ToArray();
+            Assert.True(layers.Length > 0, "the fixture has no offloaded MoE layer");
+            foreach (int l in layers) model.SetExpertTierForTests(l, Enumerable.Range(0, experts / 2).ToArray());
+            Assert.True(model.RepackHostExpertsForTests(), "the host experts were not packed");
+            Assert.False(model.HostRangesLockedForTests, "the load page-locked the experts' file ranges beside the packed copies");
+            TensorSharp.Graph.IGraphExpertHost host = model.ExpertHostForTests(layers[0]);
+            void RouteAHostExpertOften()
+            {
+                foreach (int l in layers)
+                    host.Record(l, Enumerable.Repeat(Enumerable.Range(0, experts).First(x => !host.IsResident(l, x)), 40).ToArray());
+            }
+            var rows = new List<float[]>();
+            RouteAHostExpertOften();
+            rows.Add((float[])model.ForwardRefill(Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray()).Clone());
+            for (int i = 0; i < 20; i++)
+            {
+                RouteAHostExpertOften();
+                rows.Add((float[])model.Forward(new[] { 60 + (i * 7) % 90 }).Clone());
+            }
+            executor.FinishTradesForTests();
+            long tradesMade = executor.OverlappedTrades + executor.BlockingTrades;
+            _output.WriteLine($"{trades}: {tradesMade} trades; lock rounds {executor.LockingRounds}, executor locks {executor.TradePinnedBytesForTests} "
+                + $"bytes; unmapped host experts {executor.UnmappedHostExpertsForTests()}; host routes {model.ExpertHostCountsForTests.HostRoutes}");
+            Assert.Equal(0, executor.LockingRounds);
+            Assert.Equal(0, executor.TradeLockedBytes);
+            Assert.Equal(0, executor.TradePinnedBytesForTests);
+            Assert.False(model.HostRangesLockedForTests);
+            Assert.Equal(0, executor.UnmappedHostExpertsForTests());
+            Assert.Equal(0, model.ExpertHostCountsForTests.HostRoutes);
+
+            // A prompt chunk continuing the conversation (wider than the doorbell takes): every layer's host experts on the device.
+            long device = executor.DeviceStagedLayers, planned = executor.HostPlannedLayers;
+            rows.Add((float[])model.Forward(Enumerable.Range(0, 17).Select(i => 30 + (i * 13) % 150).ToArray()).Clone());
+            Assert.Equal(0, executor.HostPlannedLayers - planned);
+            Assert.Equal(layers.Length, executor.DeviceStagedLayers - device);
+            return (rows, tradesMade);
+        }
+        var off = Run(TensorSharp.Cuda.CudaGraphExecutor.TierTrades.Off);
+        var blocking = Run(TensorSharp.Cuda.CudaGraphExecutor.TierTrades.Blocking);
+        var overlapped = Run(TensorSharp.Cuda.CudaGraphExecutor.TierTrades.Overlapped);
+        Assert.Equal(0, off.Trades);
+        Assert.True(blocking.Trades > 0 && overlapped.Trades > 0, $"trades: blocking {blocking.Trades}, overlapped {overlapped.Trades}");
+        for (int i = 0; i < off.Rows.Count; i++)
+        {
+            Assert.All(off.Rows[i], v => Assert.True(float.IsFinite(v)));
+            Assert.True(blocking.Rows[i].AsSpan().SequenceEqual(off.Rows[i]), $"row {i}: blocking trades moved it {RelL2(blocking.Rows[i], off.Rows[i]):E2}");
+            Assert.True(overlapped.Rows[i].AsSpan().SequenceEqual(off.Rows[i]), $"row {i}: overlapped trades moved it {RelL2(overlapped.Rows[i], off.Rows[i]):E2}");
+        }
+    }
+
+    /// <summary>A trade gives the outgoing expert the incoming one's place (HostExpertCopies.Move): the incoming expert has none
+    /// from then on (a late request for it reads the mapping), a place the outgoing expert held before is freed, and the
+    /// places - the pinned bytes - never change.</summary>
+    [Fact]
+    public void HostExpertCopiesGiveTheOutgoingExpertTheIncomingOnesPlace()
+    {
+        var stacks = new[] { (IntPtr)0x10000, (IntPtr)0x20000, (IntPtr)0x30000 };
+        var devices = new[] { (IntPtr)0x110000, (IntPtr)0x120000, (IntPtr)0x130000 };
+        // Experts 1 and 3 on the host (places 0 and 1), 0 and 2 in the tier.
+        var copies = new TensorSharp.Graph.HostExpertCopies(stacks, devices, new long[] { 256, 512, 1024 }, new[] { -1, 0, -1, 1 });
+        Assert.Equal(2, copies.Places);
+        Assert.Equal(new[] { -1, 0, -1, 1 }, Enumerable.Range(0, 4).Select(copies.PlaceOf).ToArray());
+        Assert.Equal((IntPtr)(0x20000 + 512), copies.Bytes(1, 3));
+        Assert.Equal((IntPtr)(0x130000 + 1024), copies.DeviceBytes(2, 3));
+        Assert.Equal(IntPtr.Zero, copies.Bytes(0, 0));
+        // Expert 3 comes into the tier, expert 0 leaves it: 0 takes place 1.
+        copies.Move(into: 3, outOf: 0);
+        Assert.Equal(new[] { 1, 0, -1, -1 }, Enumerable.Range(0, 4).Select(copies.PlaceOf).ToArray());
+        Assert.Equal((IntPtr)(0x10000 + 256), copies.Bytes(0, 0));
+        Assert.Throws<InvalidOperationException>(() => copies.Move(into: 2, outOf: 3));   // 2 has no place to give
+        Assert.Equal(2, copies.Places);
+    }
+
+    /// <summary>Process memory standing in for pinned host memory: a backend whose host alone reads the packed copies.</summary>
+    private sealed class ProcessMemoryHostAllocator : TensorSharp.Graph.IMappedHostAllocator
+    {
+        public unsafe IntPtr AllocateMappedHost(long bytes, out IntPtr devicePointer)
+        {
+            IntPtr p = (IntPtr)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)bytes, 4096);
+            devicePointer = p;
+            return p;
+        }
+
+        public unsafe void FreeMappedHost(IntPtr host) => System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)host);
+    }
+
+    /// <summary>The host's kernels compute host experts from packed copies (here in process memory, on MLX, where the host
+    /// computes every expert outside the tier) with the sums they compute from the model file's mapping, bit for bit: the ids
+    /// index the copies' places, the same bytes in the same order.</summary>
+    [MlxFact]
+    public void HostExpertsFromPackedCopiesMatchTheMappingOnMlx()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-quantized");
+        (List<float[]> Rows, long HostRoutes) Run(bool packed)
+        {
+            using var model = Create(path, backend: BackendType.Mlx);
+            model.RouteTailSkipForTests = (0, 100);
+            int experts = model.ExpertCountForTests;
+            foreach (int l in Enumerable.Range(0, model.Config.NumLayers).Where(l => model.ExpertHostForTests(l) != null))
+                model.SetExpertTierForTests(l, Enumerable.Range(0, experts / 2).ToArray());
+            if (packed)
+            {
+                Assert.True(model.PackHostExpertsForTests(new ProcessMemoryHostAllocator()), "the host experts were not packed");
+                Assert.True(model.HostExpertCopyBytesForTests > 0);
+            }
+            List<float[]> rows = Script(model);
+            return (rows, model.ExpertHostCountsForTests.HostRoutes);
+        }
+        var mapped = Run(packed: false);
+        var copies = Run(packed: true);
+        _output.WriteLine($"host routes: {copies.HostRoutes} from the packed copies, {mapped.HostRoutes} from the mapping");
+        Assert.True(copies.HostRoutes > 0, "no route was the host's");
+        Assert.Equal(mapped.HostRoutes, copies.HostRoutes);
+        for (int i = 0; i < mapped.Rows.Count; i++)
+            Assert.True(copies.Rows[i].AsSpan().SequenceEqual(mapped.Rows[i]), $"row {i}: {RelL2(copies.Rows[i], mapped.Rows[i]):E2} from the mapping's sums");
+    }
+
+    /// <summary>The host's kernels compute host experts from the packed copies (the ids index the copies' places) with the
+    /// sums they compute from the model file's mapping, bit for bit - the same bytes in the same order - and the device stages
+    /// a prompt's host experts from either alike: no miss slots, so every miss of a decode row is the host's.</summary>
+    [CudaFact]
+    public void HostExpertsFromPackedCopiesMatchTheMappingOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-quantized");
+        (List<float[]> Rows, long HostRoutes, long Packed) Run(bool packed)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.RouteTailSkipForTests = (0, 100);
+            model.WaitHostWarmForTests();
+            var executor = (TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests;
+            executor.GpuMissesForTests = 0;
+            executor.UploadsTierForTests = true;
+            executor.TierTradesForTests = TensorSharp.Cuda.CudaGraphExecutor.TierTrades.Off;
+            int experts = model.ExpertCountForTests;
+            foreach (int l in Enumerable.Range(0, model.Config.NumLayers).Where(l => model.ExpertHostForTests(l) != null))
+                model.SetExpertTierForTests(l, Enumerable.Range(0, experts / 2).ToArray());
+            if (packed) Assert.True(model.RepackHostExpertsForTests(), "the host experts were not packed");
+            else model.DropHostExpertCopiesForTests();
+            List<float[]> rows = Script(model);
+            return (rows, model.ExpertHostCountsForTests.HostRoutes, model.HostExpertCopyBytesForTests);
+        }
+        var mapped = Run(packed: false);
+        var copies = Run(packed: true);
+        _output.WriteLine($"host routes: {copies.HostRoutes} from the packed copies ({copies.Packed} bytes), {mapped.HostRoutes} from the mapping");
+        Assert.Equal(0, mapped.Packed);
+        Assert.True(copies.Packed > 0 && copies.HostRoutes > 0, $"packed {copies.Packed} bytes, host routes {copies.HostRoutes}");
+        Assert.Equal(mapped.HostRoutes, copies.HostRoutes);
+        for (int i = 0; i < mapped.Rows.Count; i++)
+            Assert.True(copies.Rows[i].AsSpan().SequenceEqual(mapped.Rows[i]), $"row {i}: {RelL2(copies.Rows[i], mapped.Rows[i]):E2} from the mapping's sums");
+    }
+
+    /// <summary>A short chunk of up to 16 rows (a continuation's few new tokens) with host experts rings the doorbell on direct
+    /// CUDA, as a decode row does, rather than reading every layer's routes back for the host to compute while the device
+    /// waits (a 13-row continuation of Qwen3.8 Flash Next took a second that way); a longer chunk streams.</summary>
+    [CudaFact]
+    public void AShortChunkOfHostExpertsRingsTheDoorbellOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        using var model = Create(Fixture("moe-quantized"), backend: BackendType.Cuda);
+        model.WaitHostWarmForTests();
+        var executor = (TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests;
+        var unified = (IUnifiedBatchModel)model;
+        unified.EnsureSequenceSlot("a", 128);
+        var logits = new float[1][];
+        int[] prompt = Enumerable.Range(0, 24).Select(i => 40 + i % 7).ToArray();
+        Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { prompt }, new[] { 0 }, logits));
+        long rung = executor.DoorbellCalls, fallen = executor.HostExpertFallbacks;
+        int[] chunk = Enumerable.Range(0, 13).Select(i => 50 + i % 5).ToArray();
+        Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { chunk }, new[] { prompt.Length }, logits));
+        Assert.True(executor.DoorbellCalls > rung, "the 13-row chunk's host experts did not ring the doorbell");
+        Assert.Equal(fallen, executor.HostExpertFallbacks);
+        Assert.All(logits[0], v => Assert.True(float.IsFinite(v)));
+    }
+
+    /// <summary>
+    /// A prompt chunk wider than the doorbell takes and shorter than the staged-ahead path's keeps its routes on the device
+    /// on direct CUDA (CudaGraphExecutor.PromptStage: the host experts it selects planned into staging slots and copied
+    /// there by kernels from their mapped pages, the grouped MoE kernels over the layer's tables, the tables restored):
+    /// every MoE layer of the chunk served so and none read back, with the logits the host-planned path gives (the routes
+    /// read back, the same kernels over the same bytes at other staging addresses) bit for bit, the prompt's and the
+    /// decode row's after it. The adaptive tier learns the prompt's routes as it did from the host's ids: counted on the
+    /// device and handed over at the next step's start, they leave the same recent counts, each route at the chunk's weight.
+    /// With the shorter chunks' arena smaller than a layer's host experts (<paramref name="shortArenaSlots"/>: 2 of the 8,
+    /// as Qwen3.8 Flash Next's arena, sized from its first layer's experts, was for most of its layers on an A40), every
+    /// layer stages through the long chunks' arena halves instead, still none read back, the same logits.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(17, 0)]
+    [InlineData(40, 0)]
+    [InlineData(100, 0)]
+    [InlineData(17, 2)]
+    [InlineData(100, 2)]
+    public void PromptChunksStagedOnTheDeviceMatchTheHostPlannedPathOnDirectCuda(int rows, int shortArenaSlots)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-quantized");
+        int[] prompt = Enumerable.Range(0, rows).Select(i => 40 + (i * 11) % 150).ToArray();
+        // The reference: the routes read back, through a short-chunk arena that holds a layer's host experts (the grouped kernels).
+        var planned = RunPromptStage(path, prompt, hostPlanned: true);
+        var device = RunPromptStage(path, prompt, hostPlanned: false, shortArenaSlots);
+        _output.WriteLine($"{rows} rows, short-chunk arena slots {(shortArenaSlots > 0 ? shortArenaSlots.ToString() : "sized")}: {device.Device} layers "
+            + $"staged on the device ({device.Halves} through the halves), {device.HostPlanned} host-planned; the host-planned run: "
+            + $"{planned.HostPlanned} layers");
+        Assert.True(device.Device > 0, "no prompt layer kept its routes on the device");
+        Assert.Equal(0, device.HostPlanned);
+        Assert.Equal(0, device.Fallbacks);
+        Assert.Equal(shortArenaSlots > 0 ? device.Device : 0, device.Halves);
+        Assert.True(planned.HostPlanned > 0 && planned.Device == 0, $"host-planned run: {planned.HostPlanned} host-planned, {planned.Device} device layers");
+        Assert.Equal(planned.HostPlanned, device.Device);
+        Assert.True(device.Prompt.AsSpan().SequenceEqual(planned.Prompt), $"prompt row: {RelL2(device.Prompt, planned.Prompt):E2} from the host-planned path");
+        Assert.True(device.Next.AsSpan().SequenceEqual(planned.Next), $"decode row: {RelL2(device.Next, planned.Next):E2} from the host-planned path");
+        for (int i = 0; i < device.Recent.Length; i++)
+        {
+            Assert.NotNull(planned.Recent[i]);
+            Assert.NotNull(device.Recent[i]);
+            Assert.True(device.Recent[i].Sum() > 0, $"MoE layer {i}: no prompt route was recorded");
+            Assert.Equal(planned.Recent[i], device.Recent[i]);
+        }
+    }
+
+    /// <summary>
+    /// Where neither arena holds a layer's host experts (the shorter chunks' arena 2 slots of the 8, the long chunks' never
+    /// allocated) a prompt chunk's layers read their routes back and stage the selected experts a batch at a time, as before
+    /// the device path: every layer host-planned, none on the device, finite logits near the device path's (the batches run
+    /// each expert on its own kernels, not the grouped ones, so the bits differ: bound as the fixture's other kernel
+    /// comparisons are).
+    /// </summary>
+    [CudaFact]
+    public void PromptChunksFallBackToTheHostPlannedPathWithoutStagingRoomOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var cpuMoe = MoeCpuOffloadConfig.AllLayersForCurrentFlowInTests();
+        string path = Fixture("moe-quantized");
+        int[] prompt = Enumerable.Range(0, 40).Select(i => 40 + (i * 11) % 150).ToArray();
+        var device = RunPromptStage(path, prompt, hostPlanned: false);
+        var cramped = RunPromptStage(path, prompt, hostPlanned: false, shortArenaSlots: 2, noHalves: true);
+        double rel = RelL2(cramped.Prompt, device.Prompt);
+        _output.WriteLine($"without staging room: {cramped.HostPlanned} host-planned layers, {cramped.Device} on the device; "
+            + $"prompt row {rel:E2} from the device path");
+        Assert.True(cramped.HostPlanned > 0, "no layer fell back to the host-planned path");
+        Assert.Equal(0, cramped.Device);
+        Assert.Equal(device.Device, cramped.HostPlanned);
+        Assert.All(cramped.Prompt, v => Assert.True(float.IsFinite(v)));
+        Assert.All(cramped.Next, v => Assert.True(float.IsFinite(v)));
+        Assert.True(rel <= 5e-2, $"prompt row: relL2 {rel:E2} from the device path");
+    }
+
+    /// <summary>A prompt and a decode step on direct CUDA, every MoE layer offloaded with half its experts in the tier, and
+    /// what the executor's prompt staging did: the rows, its counters and each MoE layer's recent route counts (read after
+    /// the decode step's start handed the prompt's device-counted routes to the expert hosts). No adaptive round runs: a
+    /// round decays the counts and moves the tier.</summary>
+    private static (float[] Prompt, float[] Next, long Device, long Halves, long HostPlanned, long Fallbacks, float[][] Recent) RunPromptStage(
+        string path, int[] prompt, bool hostPlanned, int shortArenaSlots = 0, bool noHalves = false)
+    {
+        using var model = Create(path, backend: BackendType.Cuda);
+        model.RouteTailSkipForTests = (0, 100);
+        model.WaitHostWarmForTests();
+        var executor = (TensorSharp.Cuda.CudaGraphExecutor)model.GraphExecutorForTests;
+        executor.HostPlannedStagingForTests = hostPlanned;
+        executor.ShortChunkArenaSlotsForTests = shortArenaSlots;
+        executor.PrefetchArenaRefusedForTests = noHalves;
+        executor.UploadsTierForTests = true;
+        executor.TierTradesForTests = TensorSharp.Cuda.CudaGraphExecutor.TierTrades.Off;
+        int experts = model.ExpertCountForTests;
+        int[] layers = Enumerable.Range(0, model.Config.NumLayers).Where(l => model.ExpertHostForTests(l) != null).ToArray();
+        Assert.True(layers.Length > 0, "the fixture has no offloaded MoE layer");
+        foreach (int l in layers) model.SetExpertTierForTests(l, Enumerable.Range(0, experts / 2).ToArray());
+        float[] first = (float[])model.ForwardRefill(prompt).Clone();
+        float[] next = (float[])model.Forward(new[] { 71 }).Clone();
+        float[][] recent = layers.Select(l => model.ExpertRecentRoutesForTests(l)).ToArray();
+        return (first, next, executor.DeviceStagedLayers, executor.DeviceStagedInHalves, executor.HostPlannedLayers, executor.HostExpertFallbacks,
+            recent);
+    }
+
     /// <summary>Quantized experts (IQ3_S / IQ4_XS): the prompt chunk's staged experts (on CUDA the grouped MoE kernels, F16
     /// operands and F32 accumulation) against the device's own kernels. Only the prompt row is judged: the decode rows' host
     /// routes round the activations to Q8_K as ggml's CPU backend does, against the device's unrounded ones, and on this

@@ -23,9 +23,12 @@ namespace TensorSharp.Cuda
     /// </summary>
     internal sealed unsafe class CudaExpertDoorbell : IDisposable
     {
-        /// <summary>Rows one doorbell carries: a decode step, or a verify window of up to seven drafts (as the Qwen3.8
-        /// engines served them).</summary>
-        public const int MaxRows = 8;
+        /// <summary>Rows one doorbell carries: a decode step, a verify window, or a short chunk of up to 16 rows (a
+        /// continuation's few new tokens), as the Qwen3.8 engines' host mailbox took them (HostExpertMaxRows), and as many as
+        /// the model's expert host computes in one call. Past 8 rows a 13-row continuation of Qwen3.8 Flash Next UD-Q2_K_XL
+        /// on an A40 fell to the executor's own host path, every layer's routes read back and computed on the host while
+        /// the device waited: 0.94-1.13 s to the first token where the engine took 0.07 s.</summary>
+        public const int MaxRows = 16;
 
         private readonly CudaHostExpertMailbox _box;
         private readonly ConcurrentDictionary<int, IGraphExpertHost> _hosts = new();
@@ -76,14 +79,15 @@ namespace TensorSharp.Cuda
 
         private void Loop()
         {
-            uint served = Volatile.Read(ref Unsafe.AsRef<uint>(_box.Seq));
             while (!_stop)
             {
+                // Every ring the flag has not answered, from whenever this thread first runs. It had taken the counter it
+                // found then as served: a ring the device made before the new thread was scheduled (the first decode step
+                // rings right after the doorbell is made) was never answered, and the step's wait kernel spun for good.
                 uint seq = Volatile.Read(ref Unsafe.AsRef<uint>(_box.Seq));
-                if (seq != served)
+                if (seq != Volatile.Read(ref Unsafe.AsRef<uint>(_box.Flag)))
                 {
                     Serve(seq);
-                    served = seq;
                     Volatile.Write(ref _hotUntil, System.Diagnostics.Stopwatch.GetTimestamp() + _hotTicks);
                     continue;
                 }

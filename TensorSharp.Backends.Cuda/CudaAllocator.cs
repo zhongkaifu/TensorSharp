@@ -6,7 +6,7 @@ using TensorSharp.Cuda.Interop;
 namespace TensorSharp.Cuda
 {
     [Serializable]
-    public sealed class CudaAllocator : IAllocator, IDeviceMemoryInfo, IHostRangePinner, IDisposable
+    public sealed class CudaAllocator : IAllocator, IDeviceMemoryInfo, IHostRangePinner, TensorSharp.Graph.IMappedHostAllocator, IDisposable
     {
         private int disposed;
 
@@ -351,6 +351,33 @@ namespace TensorSharp.Cuda
         }
 
         public bool SharesHostMemory => false;
+
+        /// <summary>Page-locked host memory the device reads in place (cuMemHostAlloc PORTABLE | DEVICEMAP), or zero where the
+        /// host refuses it: the host experts' packed copies. Any thread.</summary>
+        public IntPtr AllocateMappedHost(long bytes, out IntPtr devicePointer)
+        {
+            devicePointer = IntPtr.Zero;
+            if (bytes <= 0) return IntPtr.Zero;
+            Context.MakeCurrent();
+            if (CudaDriverApi.cuMemHostAlloc(out IntPtr host, new UIntPtr((ulong)bytes),
+                    CudaDriverApi.CU_MEMHOSTALLOC_PORTABLE | CudaDriverApi.CU_MEMHOSTALLOC_DEVICEMAP) != 0)
+                return IntPtr.Zero;
+            if (CudaDriverApi.cuMemHostGetDevicePointer(out devicePointer, host, 0) != 0)
+            {
+                CudaDriverApi.cuMemFreeHost(host);
+                devicePointer = IntPtr.Zero;
+                return IntPtr.Zero;
+            }
+            return host;
+        }
+
+        /// <inheritdoc cref="TensorSharp.Graph.IMappedHostAllocator.FreeMappedHost"/>
+        public void FreeMappedHost(IntPtr host)
+        {
+            if (host == IntPtr.Zero) return;
+            Context.MakeCurrent();
+            CudaDriverApi.cuMemFreeHost(host);
+        }
 
         public IDisposable PinHostRanges(IReadOnlyList<(IntPtr Pointer, long Bytes)> ranges, long allowance, System.Threading.CancellationToken cancel)
         {

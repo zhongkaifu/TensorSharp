@@ -35,6 +35,10 @@ namespace TensorSharp.Cuda
         private static long _allowed;
         private static long _pinned;
         private static bool _refused;
+        // Ranges whose driver calls are in flight outside the lock (LockOutside, Split): held in Ranges so nothing registers
+        // over them, never mapped for a kernel (DevicePointer), and their bytes reserved against the limit.
+        private static readonly HashSet<long> Pending = new();
+        private static long _reserved;
 
         /// <summary>Most bytes the process registers: 60% of the managed heap's limit, or what a planner allowed (the host
         /// memory it measured free, less a reserve), whichever is more.</summary>
@@ -77,7 +81,7 @@ namespace TensorSharp.Cuda
                 bool all = true;
                 foreach ((long s, long e) in gaps)
                 {
-                    if (_pinned + (e - s) > Limit) { all = false; continue; }
+                    if (_pinned + _reserved + (e - s) > Limit) { all = false; continue; }
                     // Mapped into the device's address space as well, so a kernel can read an expert where it lies (DevicePointer);
                     // a driver that refuses the mapping still locks the pages for copies.
                     bool mapped = true;
@@ -103,6 +107,140 @@ namespace TensorSharp.Cuda
                 }
                 return all;
             }
+        }
+
+        /// <summary>Register [<paramref name="s"/>, <paramref name="e"/>) mapped into the device's address space where the
+        /// driver allows, else locked for copies only (<see cref="Pin"/>'s flags); the CUDA error, or 0.</summary>
+        private static int Register(long s, long e, out bool mapped)
+        {
+            mapped = true;
+            int rc = CudaDriverApi.cuMemHostRegister(new IntPtr(s), new UIntPtr((ulong)(e - s)),
+                CudaDriverApi.CU_MEMHOSTREGISTER_PORTABLE | CudaDriverApi.CU_MEMHOSTREGISTER_READ_ONLY | CudaDriverApi.CU_MEMHOSTREGISTER_DEVICEMAP);
+            if (rc == 0) return 0;
+            mapped = false;
+            return CudaDriverApi.cuMemHostRegister(new IntPtr(s), new UIntPtr((ulong)(e - s)),
+                CudaDriverApi.CU_MEMHOSTREGISTER_PORTABLE | CudaDriverApi.CU_MEMHOSTREGISTER_READ_ONLY);
+        }
+
+        /// <summary>Placeholders [s, e) registered now, outside the lock; each made a registration of this instance, or
+        /// dropped where the driver refused it. The bytes registered.</summary>
+        private long RegisterPending(List<(long Start, long End)> pending, out bool all)
+        {
+            all = true;
+            long registered = 0;
+            foreach ((long s, long e) in pending)
+            {
+                int rc = Register(s, e, out bool mapped);
+                lock (Sync)
+                {
+                    Pending.Remove(s);
+                    _reserved -= e - s;
+                    if (rc != 0)
+                    {
+                        Ranges.Remove(s);
+                        all = false;
+                        continue;
+                    }
+                    Ranges[s] = (e, this, mapped);
+                    _pinned += e - s;
+                    OwnBytes += e - s;
+                    registered += e - s;
+                }
+            }
+            return registered;
+        }
+
+        /// <summary>
+        /// <see cref="Pin"/> with the driver's calls outside the process-wide lock: the gaps are held by placeholders while they
+        /// register, so a thread that stages and maps experts meanwhile (CopyToDevice, DevicePointer) never waits for a
+        /// registration (0.1-1 ms an expert's range on an A40). A worker locks the experts an adaptive trade is about to move
+        /// to the host this way. True when all of it is locked (and mapped where the driver maps); <paramref name="registered"/>
+        /// the bytes this call registered.
+        /// </summary>
+        internal bool LockOutside(IntPtr ptr, long bytes, out long registered)
+        {
+            registered = 0;
+            if (ptr == IntPtr.Zero || bytes <= 0) return false;
+            long start = ptr.ToInt64() / Page * Page, end = (ptr.ToInt64() + bytes + Page - 1) / Page * Page;
+            var gaps = new List<(long Start, long End)>();
+            bool all = true;
+            lock (Sync)
+            {
+                long at = start;
+                var found = new List<(long, long)>();
+                for (int i = FirstEndingAfter(start); i < Ranges.Count; i++)
+                {
+                    long s = Ranges.Keys[i], rEnd = Ranges.Values[i].End;
+                    if (s >= end) break;
+                    if (s > at) found.Add((at, s));
+                    at = Math.Max(at, rEnd);
+                }
+                if (at < end) found.Add((at, end));
+                if (found.Count == 0) return true;
+                if (_refused) return false;
+                foreach ((long s, long e) in found)
+                {
+                    if (_pinned + _reserved + (e - s) > Limit) { all = false; continue; }
+                    Ranges[s] = (e, this, false);
+                    Pending.Add(s);
+                    _reserved += e - s;
+                    gaps.Add((s, e));
+                }
+            }
+            registered = RegisterPending(gaps, out bool registeredAll);
+            return all && registeredAll;
+        }
+
+        /// <summary>
+        /// Registration [<paramref name="start"/>, <paramref name="end"/>) replaced by the page-aligned pieces
+        /// <paramref name="keep"/> (each within it, disjoint, in order), registered by this instance. Between the unregistration
+        /// and the pieces' registrations the kept pages are pageable, so nothing may copy from the range or read it on the
+        /// device meanwhile: never while a model serves (a test's executor unlocks the tier its load locked before any step
+        /// read it). False where the registration is not there or a piece could not be registered (it stays pageable).
+        /// </summary>
+        internal bool Split(long start, long end, IReadOnlyList<(long Start, long End)> keep)
+        {
+            (long End, CudaHostPins Owner, bool Mapped) r;
+            lock (Sync)
+            {
+                if (!Ranges.TryGetValue(start, out r) || r.End != end || Pending.Contains(start)) return false;
+                if (CudaDriverApi.cuMemHostUnregister(new IntPtr(start)) != 0) return false;
+                Ranges.Remove(start);
+                _pinned -= end - start;
+                r.Owner.OwnBytes -= end - start;
+            }
+            var pieces = new List<(long Start, long End)>();
+            lock (Sync)
+                foreach ((long s, long e) in keep)
+                {
+                    if (s < start || e > end || s >= e) continue;
+                    Ranges[s] = (e, this, false);
+                    Pending.Add(s);
+                    _reserved += e - s;
+                    pieces.Add((s, e));
+                }
+            RegisterPending(pieces, out bool all);
+            return all;
+        }
+
+        /// <summary>The registrations (not ones in flight) overlapping [<paramref name="start"/>, <paramref name="end"/>), in
+        /// order.</summary>
+        internal static List<(long Start, long End)> RegistrationsIn(long start, long end)
+        {
+            var found = new List<(long Start, long End)>();
+            lock (Sync)
+                for (int i = FirstEndingAfter(start); i < Ranges.Count && Ranges.Keys[i] < end; i++)
+                    if (!Pending.Contains(Ranges.Keys[i])) found.Add((Ranges.Keys[i], Ranges.Values[i].End));
+            return found;
+        }
+
+        /// <summary>Registered bytes within [<paramref name="start"/>, <paramref name="end"/>) (tests).</summary>
+        internal static long LockedBytesIn(long start, long end)
+        {
+            long locked = 0;
+            foreach ((long s, long e) in RegistrationsIn(start, end))
+                locked += Math.Min(e, end) - Math.Max(s, start);
+            return locked;
         }
 
         /// <summary>
@@ -155,7 +293,7 @@ namespace TensorSharp.Cuda
                 {
                     long s = Ranges.Keys[i];
                     var (rEnd, _, mapped) = Ranges.Values[i];
-                    if (s > at || !mapped) return IntPtr.Zero;
+                    if (s > at || !mapped || Pending.Contains(s)) return IntPtr.Zero;
                     at = rEnd;
                 }
                 if (at < end) return IntPtr.Zero;
@@ -183,8 +321,9 @@ namespace TensorSharp.Cuda
             lock (Sync)
             {
                 var mine = new List<long>();
+                // (A range in flight is its registering thread's: an owner disposes only once that thread is done.)
                 foreach (var (s, r) in Ranges)
-                    if (ReferenceEquals(r.Owner, this)) mine.Add(s);
+                    if (ReferenceEquals(r.Owner, this) && !Pending.Contains(s)) mine.Add(s);
                 foreach (long s in mine)
                 {
                     CudaDriverApi.cuMemHostUnregister(new IntPtr(s));

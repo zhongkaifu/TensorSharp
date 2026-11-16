@@ -64,15 +64,20 @@ namespace TensorSharp.Models
         {
             if (_backend == BackendType.GgmlMetal || _gguf == null) return;
             long available = MappedTableWarm.HostMemoryAvailable();
-            if (available <= 0) return;
-            // The offloaded experts' file ranges are page-locked after the warm (below), out of the same memory: what the warm
-            // reads and copies must leave them room. A cgroup's available figure counts its reclaimable page cache, so the warm
-            // had filled it beside the locks: on a 62 GB cgroup 46.5 GiB warmed beside 27.8 GB of locks, and a 16 GB card's 4K
-            // prompt took 15 s against the direct engine's 7.9 (which locks first, and then skipped the tables).
+            // The host experts packed into pinned host memory first, now (the direct engines' layout, TryPackHostExperts; an
+            // unknown available memory packs, as the engine does); where the host cannot pin them, their file ranges are
+            // page-locked after the warm instead (below).
             List<(IntPtr Pointer, long Bytes)> stacks = HostExpertRuns();
-            IHostRangePinner pinner = stacks.Count > 0 ? _allocator as IHostRangePinner : null;
+            bool packed = stacks.Count > 0
+                && TryPackHostExperts(available, (l, e) => _tierExperts?[l] is { } tier && Array.IndexOf(tier, e) >= 0);
+            if (available <= 0) return;
+            // The copies or the locks take the same memory: what the warm reads and copies must leave them room. A cgroup's
+            // available figure counts its reclaimable page cache, so the warm had filled it beside the locks: on a 62 GB cgroup
+            // 46.5 GiB warmed beside 27.8 GB of locks, and a 16 GB card's 4K prompt took 15 s against the direct engine's 7.9
+            // (which locks first, and then skipped the tables).
+            IHostRangePinner pinner = stacks.Count > 0 && !packed ? _allocator as IHostRangePinner : null;
             long locked = 0;
-            if (pinner != null)
+            if (pinner != null || packed)
                 foreach ((IntPtr _, long bytes) in stacks) locked += bytes;
             long room = available - MappedTableWarm.Headroom - locked;
             // The locks may take what the host has free less a reserve for the OS, the rest of the process and the page cache
@@ -106,8 +111,8 @@ namespace TensorSharp.Models
                 }
                 room -= q.RawBytes;
             }
-            // Experts the locks fault in are not read twice.
-            foreach (var (pointer, bytes) in pinner != null ? Array.Empty<(IntPtr, long)>() : HostServedExpertSlices())
+            // Experts the locks fault in, or the copies read, are not read twice.
+            foreach (var (pointer, bytes) in pinner != null || packed ? Array.Empty<(IntPtr, long)>() : HostServedExpertSlices())
             {
                 if (bytes > room) break;
                 ranges.Add((pointer, bytes));
@@ -446,12 +451,12 @@ namespace TensorSharp.Models
             }
             long? requested = ExpertTierBudgetOverride(Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER_GB"));
             int[][] tiers = plan.SelectTiers(expertBytes, requested ?? budget);
-            // A tier that holds every expert the routing profile routes to trades nothing (as the direct engines, whose residency
-            // covered 100% of the profiled routes, rarely did): a prompt's routes weigh 128 rows' worth in the recent counts and
-            // traded out members the decode routed to again. Qwen3.8 Flash Next UD-Q2_K_XL on an A40 with 38.5 GB of experts:
-            // 199 host routes a run and 58.8 / 54.3 tok/s with trades, 1 and 60.5 / 56.5 without.
+            // The tier still trades where it holds (nearly) every profiled route, as the direct engines did: a profile counts the
+            // routes of the text it was recorded on, and other text routes elsewhere. Qwen3.8 Flash Next UD-Q2_K_XL on an A40
+            // (37.3 GB of experts, 99.93% of the profiled routes), four web-UI conversations one after another: held, 6,097
+            // routes ran on the host and each request decoded 49.1 tok/s; trading, 765 routes (2,410 trades) and 59.8 tok/s
+            // (the engine 62.6); four at once 22.3 against 27.8.
             _tierRouteCoverage = ranked == moeLayers.Count ? TierRouteCoverage(moeLayers, tiers) : 0;
-            _tierHoldsProfile = _tierRouteCoverage >= TierHoldCoverage;
             _expertOnHost = new bool[n];
             foreach (int l in moeLayers) _expertOnHost[l] = true;
             _tierExperts = new int[n][];
@@ -463,24 +468,14 @@ namespace TensorSharp.Models
             }
             Console.WriteLine($"[moe-offload] {Config.Architecture} (tiered): every MoE layer's routed experts run through the " +
                 $"expert host; the device keeps each layer's most-routed experts ({Gb(held)} of {Gb(budget)}), " +
-                (ranked == moeLayers.Count ? $"ranked by {_routingProfilePath}{(_tierRouteCoverage > 0 ? $"; {_tierRouteCoverage * 100:F2}% of the profiled routes{(_tierHoldsProfile ? ", so adaptive trades are held" : "")}" : "")}."
+                (ranked == moeLayers.Count ? $"ranked by {_routingProfilePath}{(_tierRouteCoverage > 0 ? $"; {_tierRouteCoverage * 100:F2}% of the profiled routes" : "")}."
                     : ranked > 0 ? $"{ranked} of {moeLayers.Count} layers ranked by {_routingProfilePath}, the others an equal share."
                     : "an equal share of each layer (no routing profile yet: this load records one)."));
             return true;
         }
 
-        /// <summary>The planned tier holds (nearly) every route the routing profile counted (<see cref="TryPlanTensorExecutorTiers"/>):
-        /// adaptive trades are held, as the direct engines, whose residency reported 100.0% of the profiled routes, rarely
-        /// traded.</summary>
-        internal bool _tierHoldsProfile;
-
         /// <summary>The share of the profiled routes the planned tier holds (0 without a profile for every layer).</summary>
         private double _tierRouteCoverage;
-
-        /// <summary>The share of profiled routes past which trades are held: a trade could win back less than half a percent of
-        /// the routes and costs misses (Qwen3.8 Flash Next UD-Q2_K_XL on an A40: held at 99.74% the same speed as trading, at
-        /// 99.92% and 99.97% 1.5-3.3 tok/s faster).</summary>
-        private const double TierHoldCoverage = 0.995;
 
         private double TierRouteCoverage(List<int> layers, int[][] tiers)
         {

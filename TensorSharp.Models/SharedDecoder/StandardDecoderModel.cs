@@ -1340,6 +1340,8 @@ namespace TensorSharp.Models
             // are: a tier outliving its model served the next model mapped at the same addresses (and leaked its buffers).
             DetachRoutingProfile();
             ReleaseExpertTiers();
+            // The host experts' packed copies once nothing reads them (the executors' tables and doorbells are gone).
+            FreeHostExpertCopies();
         }
     }
 }

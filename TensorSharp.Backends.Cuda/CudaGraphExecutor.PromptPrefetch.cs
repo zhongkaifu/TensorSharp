@@ -97,9 +97,7 @@ namespace TensorSharp.Cuda
             HostedTables next = NextMoeLayer(layer);
             if (next != null && PrepareHostList(next) && next.HostList.Length * next.PerExpert <= _halfBytes)
                 StageLayer(next, 1 - h);
-            t.PromptCounts ??= Zeroed(experts);
-            Launch(new[] { sel }, t.PromptCounts, (kn, stream) => kn.LaunchCountRoutes(Ptr(sel), rows * k, Ptr(t.PromptCounts), experts, stream));
-            _promptCounted[t] = Math.Max(rows, _promptCounted.TryGetValue(t, out int counted) ? counted : 0);
+            CountPromptRoutes(t, sel, rows, k);
             PrefetchedLayers++;
             if (ahead) PrefetchedAhead++;
             result = output;
@@ -136,25 +134,31 @@ namespace TensorSharp.Cuda
             {
                 if (t.Mask[e] == 1) continue;   // (2: a host expert the device may also read in place)
                 for (int m = 0; m < 3; m++)
-                    if (HostBytes(t.Sets[m], e) == IntPtr.Zero) return false;
+                    if (HostBytes(t, m, e) == IntPtr.Zero) return false;
                 list.Add(e);
             }
             t.MemberBytes = bytes;
             // A slot per expert, 256-byte aligned (the kernels read the stacked rows in aligned words).
             t.PerExpert = (bytes[0] + bytes[1] + bytes[2] + 255) / 256 * 256;
             t.HostList = list.ToArray();
-            // A copy from pageable pages blocks this thread while the driver bounces it: lock what the load did not.
+            // A copy from pageable pages blocks this thread while the driver bounces it: lock what the load did not (only where
+            // the host experts are read from the mapping: the packed copies are pinned already).
             ((CudaAllocator)Allocator).Context.MakeCurrent();
-            _tradedPins ??= new CudaHostPins();
             foreach (int e in t.HostList)
                 for (int m = 0; m < 3; m++)
-                    _tradedPins.Pin(HostBytes(t.Sets[m], e), bytes[m]);
+                    if (t.Copies?.PlaceOf(e) is not >= 0)
+                        (_tradedPins ??= new CudaHostPins()).Pin(HostBytes(t.Sets[m], e), bytes[m]);
             return true;
         }
 
         /// <summary>An expert's matrix in its stack's host mapping (a member's own host copy may be released).</summary>
         private static IntPtr HostBytes(IGraphExpertWeights set, int e)
             => set.Data != IntPtr.Zero ? set.Data + (nint)(set.Bytes / set.Ne2 * e) : set.Expert(e).Data;
+
+        /// <summary>Where a host expert's matrix is read from: its place in the layer's packed host copies (pinned), else its
+        /// place in the stack's mapping.</summary>
+        private static IntPtr HostBytes(HostedTables t, int m, int e)
+            => t.Copies?.Bytes(m, e) is { } packed && packed != IntPtr.Zero ? packed : HostBytes(t.Sets[m], e);
 
         private HostedTables NextMoeLayer(int layer)
         {
@@ -177,7 +181,7 @@ namespace TensorSharp.Cuda
                 long offset = j * t.PerExpert;
                 for (int m = 0; m < 3; m++)
                 {
-                    int rc = CudaHostPins.CopyToDevice(half + (nint)offset, HostBytes(t.Sets[m], e), t.MemberBytes[m], _copyStream);
+                    int rc = CudaHostPins.CopyToDevice(half + (nint)offset, HostBytes(t, m, e), t.MemberBytes[m], _copyStream);
                     if (rc != 0)
                         throw new InvalidOperationException($"layer {t.Layer}: staging host expert {e} matrix {m} ahead failed (CUDA error {rc})");
                     offset += t.MemberBytes[m];
@@ -234,17 +238,19 @@ namespace TensorSharp.Cuda
             _arenasSized = true;
             int most = gate.Host.MostHostExperts;
             if (most <= 0) return;
-            long bytes;
-            try { bytes = gate.Expert(0).Bytes + up.Expert(0).Bytes + down.Expert(0).Bytes; }
+            long[] member = new long[3];
+            try { (member[0], member[1], member[2]) = (gate.Expert(0).Bytes, up.Expert(0).Bytes, down.Expert(0).Bytes); }
             catch (NotSupportedException) { return; }
+            long bytes = member[0] + member[1] + member[2];
             long half = most * ((bytes + 255) / 256 * 256);
             bool ahead = EnsurePrefetchArena(half);
-            EnsureStagingArena(bytes, most);
+            // In the device plan's slots (each matrix from a 256-byte boundary), which the host-planned copies fit too.
+            EnsureStagingArena(TradeStride(member), most);
             Console.Error.WriteLine(ahead
                 ? $"[cuda] long prompt chunks stage each next layer's host experts ahead: two halves of {_halfBytes >> 20} MiB "
                   + $"(up to {most} host experts a layer), and {_stagingBytes >> 20} MiB for shorter chunks."
-                : $"[cuda] long prompt chunks stage a layer's host experts after its routes ({_stagingBytes >> 20} MiB of staging): "
-                  + $"two halves of {half >> 20} MiB for {most} host experts a layer do not fit the device's free memory.");
+                : $"[cuda] long prompt chunks stage a layer's host experts as its routes select them ({_stagingBytes >> 20} MiB of "
+                  + $"staging): two halves of {half >> 20} MiB for {most} host experts a layer do not fit the device's free memory.");
         }
 
         /// <summary>Two halves of at least <paramref name="halfNeed"/> bytes each (a quarter more, for layers with a few
@@ -254,6 +260,7 @@ namespace TensorSharp.Cuda
         {
             if (halfNeed <= 0) halfNeed = 1;
             if (halfNeed <= _halfBytes) return true;
+            if (PrefetchArenaRefusedForTests) return false;
             long want = Math.Min(StagingArenaCapBytes / 2, halfNeed + halfNeed / 4);
             if (want < halfNeed) return false;
             var cuda = (CudaAllocator)Allocator;
@@ -289,28 +296,37 @@ namespace TensorSharp.Cuda
             return true;
         }
 
-        /// <summary>The routes prompt chunks counted on the device, handed to the expert hosts (weighted as the chunk's rows
-        /// weigh in the adaptive tiers) and zeroed; never inside a recording.</summary>
+        /// <summary>The routes prompt chunks counted on the device (<see cref="CountPromptRoutes"/>), handed to the expert hosts
+        /// (weighted as the chunk's rows weigh in the adaptive tiers) and zeroed, every layer's in one wait; never inside a
+        /// recording. A step's start harvests the step before it, so each chunk's routes carry its own weight.</summary>
         private void HarvestPromptCounts()
         {
             if (_promptCounted.Count == 0) return;
             var cuda = (CudaAllocator)Allocator;
             if (CudaGraphCapture.IsCapturing(cuda)) return;
-            var ids = new List<int>();
-            foreach ((HostedTables t, int rows) in _promptCounted)
-            {
-                ((CudaStorage)t.PromptCounts.Storage).MarkDeviceModified();
-                int[] counts = t.PromptCounts.GetElementsAsInt(t.Experts);
-                ids.Clear();
-                for (int e = 0; e < counts.Length; e++)
-                    for (int c = 0; c < counts[e]; c++) ids.Add(e);
-                cuda.Context.MakeCurrent();
-                CudaDriverApi.cuMemsetD32Async(Ptr(t.PromptCounts), 0, new UIntPtr((ulong)t.Experts), cuda.Stream.Handle).ThrowOnError();
-                ((CudaStorage)t.PromptCounts.Storage).MarkDeviceModified();
-                if (ids.Count > 0)
-                    t.Host.Record(t.Layer, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(ids), GraphExpertAdapt.Weight(rows));
-            }
+            var layers = new List<(HostedTables T, int Rows)>(_promptCounted.Count);
+            foreach ((HostedTables t, int rows) in _promptCounted) layers.Add((t, rows));
             _promptCounted.Clear();
+            var tensors = new Tensor[layers.Count];
+            var experts = new int[layers.Count];
+            for (int i = 0; i < layers.Count; i++)
+            {
+                tensors[i] = layers[i].T.PromptCounts;
+                experts[i] = layers[i].T.Experts;
+            }
+            int[][] counts = TakeCounts(tensors, experts);
+            var ids = new List<int>();
+            for (int i = 0; i < layers.Count; i++)
+                RecordCounts(layers[i].T, counts[i], GraphExpertAdapt.Weight(layers[i].Rows), ids);
+        }
+
+        /// <summary>A prompt chunk's routes counted on the device for the layer's expert host (the routing profile and the
+        /// adaptive tiers), handed over at the next step's start (<see cref="HarvestPromptCounts"/>).</summary>
+        private void CountPromptRoutes(HostedTables t, Tensor sel, int rows, int k)
+        {
+            t.PromptCounts ??= Zeroed(t.Experts);
+            Launch(new[] { sel }, t.PromptCounts, (kn, stream) => kn.LaunchCountRoutes(Ptr(sel), rows * k, Ptr(t.PromptCounts), t.Experts, stream));
+            _promptCounted[t] = Math.Max(rows, _promptCounted.TryGetValue(t, out int counted) ? counted : 0);
         }
 
         /// <summary>A trade moved the layer's tier: its host list and half tables are rebuilt when next used.</summary>
