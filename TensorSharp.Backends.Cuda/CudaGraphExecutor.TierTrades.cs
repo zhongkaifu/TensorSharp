@@ -12,8 +12,8 @@ using TensorSharp.Graph;
 namespace TensorSharp.Cuda
 {
     /// <summary>
-    /// Adaptive tier trades overlapped with the decode (the Qwen3.8 engines' asynchronous adaptive residency,
-    /// Q4eCudaEngine.AsyncSwaps). Copied on the step's stream before the next step, a round's trades made the decode wait for
+    /// Adaptive tier trades overlapped with the decode (the removed direct Qwen3.8 engine's asynchronous adaptive residency).
+    /// Copied on the step's stream before the next step, a round's trades made the decode wait for
     /// them: up to 64 trades of Qwen3.8 Flash Next UD-Q2_K_XL (about 200 MB) every 12 steps, and the runtime decoded 60.4 /
     /// 56.0 tok/s on an A40 (short prompt / after a 4K one) against the engine's 61.9 / 60.1, whose trades overlap its
     /// decode. Here a round's copies run on a stream of their own in three phases a step boundary apart, so the tables a step

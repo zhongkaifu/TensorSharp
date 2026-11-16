@@ -3,7 +3,7 @@
   // decoder runtime on the CUDA graph executor) with the shared MTP head (three drafts).
   //   TensorSharp.Server.Host --config config/qwen3.8-flash-next-cuda.json
   //
-  // Not re-measured since the direct-CUDA engine (Qwen4ExpCudaModel) was removed. That engine, on an RTX 5090 (32 GB),
+  // Not re-measured since the direct-CUDA Qwen3.8 engine was removed. That engine, on an RTX 5090 (32 GB),
   // 2026-11-09, eng/qwen38-engine-bench.py (greedy, two passes), one sequence lane: decode 141-148 tok/s on short
   // answers and 247-250 on a long generation, 185-204 after a 4K-token prompt and 237-271 after 16K; TTFT 0.65-0.67 s
   // at 4K and 2.73-2.74 s at 16K. Strata on the same card: TTFT 0.93 s at 4K and 2.74 s at 16K, decode 307 on a long

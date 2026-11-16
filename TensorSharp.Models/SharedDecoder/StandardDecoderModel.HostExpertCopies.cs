@@ -27,7 +27,7 @@ namespace TensorSharp.Models
         private IMappedHostAllocator _hostCopyAllocator;
 
         /// <summary>
-        /// The host experts packed, once, at load, as the direct engines keep them (Q4eCudaEngine.PinHostExperts): per offloaded
+        /// The host experts packed, once, at load, as the removed direct Qwen3.8 engine kept them: per offloaded
         /// layer and matrix one block of page-locked host memory the device addresses, each host expert at a place, in expert
         /// order, read from the model file's mapping by parallel runs. The device stages and reads its misses there and the
         /// host computes there, and an adaptive trade only moves bytes between places: nothing is page-locked while the model

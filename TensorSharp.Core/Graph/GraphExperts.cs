@@ -95,8 +95,8 @@ namespace TensorSharp.Graph
     }
 
     /// <summary>
-    /// One layer's host experts packed in page-locked host memory the device can address, as the direct engines keep them
-    /// (Q4eCudaEngine.PinHostExperts): per matrix (gate, up, down) a stack of places of one expert each. The host computes
+    /// One layer's host experts packed in page-locked host memory the device can address, as the removed direct Qwen3.8 engine
+    /// kept them: per matrix (gate, up, down) a stack of places of one expert each. The host computes
     /// its experts from here and the device reads them here (a prompt chunk's staging, a decode step's misses, a trade's
     /// copies), so nothing is page-locked while a model serves. A trade puts the tier member it moves to the host into the
     /// place of the expert it moves into the tier (<see cref="Move"/>): the places, and so the pinned bytes, never change.

@@ -20,9 +20,8 @@ namespace TensorSharp.Cuda
     /// layer into the other half (from the model file's page-locked mapping), and that layer's kernels wait for those
     /// copies. The routes stay on the device: the grouped MoE kernels read the router's ids through per-layer tables that
     /// point at the tier's copies and the half's slots, and a counting kernel keeps the routes for the routing profile and
-    /// the adaptive tiers (handed to the expert host at the next run). The Qwen3.8 engines stage their prompt groups the
-    /// same way (Q4eCudaEngine.PromptPrefetch); the bytes the kernels read are those the routed staging copies, so the
-    /// answers are the same.
+    /// the adaptive tiers (handed to the expert host at the next run). The removed direct Qwen3.8 engines staged their prompt
+    /// groups the same way; the bytes the kernels read are those the routed staging copies, so the answers are the same.
     /// </summary>
     public sealed partial class CudaGraphExecutor
     {
