@@ -2091,8 +2091,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
         string path = Fixture(variant);
         var options = new SpeculationOptions { Enabled = true, SpeculatorName = speculator, MaxDraftTokens = 3, MinDraftProb = 0 };
         // ggml's GPU products are not row-invariant (SpeculativeRuntimeChecks: a stream parts from plain decoding's only at a
-        // near-tie there).
-        double nearTie = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal ? 1e-3 : 0;
+        // near-tie there), within the tie tolerance the other ggml GPU speculation checks take: on two Blackwell MIG slices
+        // the tokens' logits were 2.15e-3 of the largest apart, 4e-4 on an A40.
+        double nearTie = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal ? 1e-2 : 0;
         await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() => Create(path, backend: backend), options,
             $"qwen35 {variant} {speculator} {backend}", nearTie: nearTie);
     }
