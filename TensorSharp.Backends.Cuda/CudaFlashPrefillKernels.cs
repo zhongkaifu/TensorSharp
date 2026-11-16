@@ -20,13 +20,13 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 6;
+        public const int CurrentVersion = 7;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
 
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
-        private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _combine;
+        private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _window128, _window256, _combine;
         private readonly int _smem128, _smem256;
 
         private CudaFlashPrefillKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
@@ -36,12 +36,16 @@ namespace TensorSharp.Cuda
             _attn256 = module.GetFunction("ts_flash_prefill_f16_d256");
             _rows128 = module.GetFunction("ts_flash_decode_rows_f16_d128");
             _rows256 = module.GetFunction("ts_flash_decode_rows_f16_d256");
+            _window128 = module.GetFunction("ts_flash_decode_window_f16_d128");
+            _window256 = module.GetFunction("ts_flash_decode_window_f16_d256");
             _combine = module.GetFunction("ts_flash_prefill_combine_f32");
             (_smem128, _smem256) = (SharedBytes(128), SharedBytes(256));
             CudaDriverApi.cuFuncSetAttribute(_attn128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_attn256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_rows128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_rows256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_window128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_window256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
             CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
             CudaDriverApi.cuDeviceGetAttribute(out int sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
             MultiprocessorCount = sms;
@@ -107,6 +111,8 @@ namespace TensorSharp.Cuda
         /// one-row <see cref="LaunchAttention"/>'s with the same <paramref name="splits"/>; the partials hold
         /// <see cref="PartialFloats"/>(rows, ...). With <paramref name="cells"/> (a sparse attention's selection) row z's
         /// keys are cells[z * cellStride ..], cellCount[z] of them, its mask row cellMask[z * cellStride ..] (or none).
+        /// Without a selection the rows share the launch's row tiles (ts_flash_decode_window_f16_d*: every key tile read once
+        /// for the window's rows, each row still its one-row launch's bits); with one, a row of the grid each.
         /// </summary>
         public unsafe void LaunchDecodeRows(IntPtr q, IntPtr k, IntPtr v, int cap, int rows, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
@@ -116,10 +122,20 @@ namespace TensorSharp.Cuda
             int a3 = cap, a4 = rows, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = splits, a17 = cellStride;
             float a9 = scale;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16, &a17 };
-            var (fn, smem) = headDim == 128 ? (_rows128, _smem128) : (_rows256, _smem256);
-            uint tiles = (uint)((heads / kvHeads + BlockRows - 1) / BlockRows);
-            CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, (uint)rows, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
-                IntPtr.Zero).ThrowOnError();
+            if (cells == IntPtr.Zero && !RowGridForTests)
+            {
+                var (wfn, wsmem) = headDim == 128 ? (_window128, _smem128) : (_window256, _smem256);
+                uint windowTiles = (uint)((rows * (heads / kvHeads) + BlockRows - 1) / BlockRows);
+                CudaDriverApi.cuLaunchKernel(wfn, windowTiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)wsmem, stream, (IntPtr)args,
+                    IntPtr.Zero).ThrowOnError();
+            }
+            else
+            {
+                var (fn, smem) = headDim == 128 ? (_rows128, _smem128) : (_rows256, _smem256);
+                uint tiles = (uint)((heads / kvHeads + BlockRows - 1) / BlockRows);
+                CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, (uint)rows, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
+                    IntPtr.Zero).ThrowOnError();
+            }
             if (splits <= 1) return;
             IntPtr c0 = partial, c3 = output;
             int c1 = splits, c2 = headDim;
@@ -127,6 +143,10 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuLaunchKernel(_combine, (uint)(rows * heads), 1, 1, (uint)headDim, 1, 1, 0, stream, (IntPtr)cargs,
                 IntPtr.Zero).ThrowOnError();
         }
+
+        /// <summary>Tests and A/B: <see cref="LaunchDecodeRows"/> runs a window's rows on the row grid (a row a z-slice) without a
+        /// selection too.</summary>
+        internal bool RowGridForTests { get; set; }
 
         /// <summary>The module this process loads (the build output's PTX, or the fatbin beside it),
         /// whether or not it is current; see <see cref="CudaPrefillModule.IsCurrent"/>. Requires a

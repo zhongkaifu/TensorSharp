@@ -27,7 +27,7 @@
 // so the committed compute_75 PTX carries working kernels.
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 6
+#define TS_FLASH_PREFILL_VERSION 7
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -152,7 +152,11 @@ struct TsFpAttnSmem
     half v[2][TS_FP_KT * ROW];
 };
 
-template <int HD>
+// WIN: the nq rows are a verify window's (q [nq][nHead][HD]), each run as the one-row launch at its position would run it:
+// a row's keys are split by its own length (the one-row launch's share), the block walks the union of its rows' key tiles
+// (each KT-aligned), and keys outside a row's own range are masked for it - they add exact zeros and leave its maximum, so a
+// row's sums are the one-row launch's bit for bit, while every key tile is read once for all the window's rows.
+template <int HD, bool WIN = false>
 __device__ __forceinline__ void ts_fp_attn(
     const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len,
     int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out,
@@ -176,13 +180,34 @@ __device__ __forceinline__ void ts_fp_attn(
     const int rowBase = (blockIdx.x / splits) * TS_FP_ROWS;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, qd = lane & 3;
     const int past = len - nq;   // keys before the first query row
-    const int kAll = past + (min(rowBase + TS_FP_ROWS, R) - 1) / G + 1;
-    const int share = ((kAll + splits - 1) / splits + TS_FP_KT - 1) / TS_FP_KT * TS_FP_KT;
-    const int kLo = max(min(kAll, split * share), min(kAll, floor / TS_FP_KT * TS_FP_KT)), kHi = min(kAll, split * share + share);
+    // A split's key range over kAll keys (the one-row launch's, kAll its row's length).
+    auto range = [&](int kAll, int& lo, int& hi) {
+        const int share = ((kAll + splits - 1) / splits + TS_FP_KT - 1) / TS_FP_KT * TS_FP_KT;
+        lo = max(min(kAll, split * share), min(kAll, floor / TS_FP_KT * TS_FP_KT));
+        hi = min(kAll, split * share + share);
+    };
+    int kLo, kHi;
+    if (WIN)
+    {
+        // The block's first and last rows' ranges bound its rows' (a range grows with its row's length).
+        int lo1, hi0;
+        range(past + rowBase / G + 1, kLo, hi0);
+        range(past + (min(rowBase + TS_FP_ROWS, R) - 1) / G + 1, lo1, kHi);
+        kHi = max(kHi, hi0);
+    }
+    else
+        range(past + (min(rowBase + TS_FP_ROWS, R) - 1) / G + 1, kLo, kHi);
 
     const int r0 = rowBase + warp * 16 + g, r1 = r0 + 8;
     const bool live0 = r0 < R, live1 = r1 < R;
     const int end0 = live0 ? past + r0 / G + 1 : 0, end1 = live1 ? past + r1 / G + 1 : 0;
+    // A window row's own key range (the whole block's elsewhere).
+    int lo0 = kLo, hi0 = kHi, lo1 = kLo, hi1 = kHi;
+    if (WIN)
+    {
+        if (live0) range(end0, lo0, hi0);
+        if (live1) range(end1, lo1, hi1);
+    }
     const bool warpLive = rowBase + warp * 16 < R;
     const half* kHead = kc + (long long)kvh * cap * HD;
     const half* vHead = vc + (long long)kvh * cap * HD;
@@ -206,8 +231,10 @@ __device__ __forceinline__ void ts_fp_attn(
     const float log2Scale = scale * 1.4426950408889634f;
     uint32_t qa[KS][4];
     {
-        const float* q0 = live0 ? q + ((long long)(kvh * G + r0 % G) * nq + r0 / G) * HD : nullptr;
-        const float* q1 = live1 ? q + ((long long)(kvh * G + r1 % G) * nq + r1 / G) * HD : nullptr;
+        const float* q0 = !live0 ? nullptr : WIN ? q + ((long long)(r0 / G) * nHead + kvh * G + r0 % G) * HD
+            : q + ((long long)(kvh * G + r0 % G) * nq + r0 / G) * HD;
+        const float* q1 = !live1 ? nullptr : WIN ? q + ((long long)(r1 / G) * nHead + kvh * G + r1 % G) * HD
+            : q + ((long long)(kvh * G + r1 % G) * nq + r1 / G) * HD;
 #pragma unroll
         for (int kk = 0; kk < KS; ++kk)
         {
@@ -275,10 +302,10 @@ __device__ __forceinline__ void ts_fp_attn(
                 mk0 = key < kHi ? cellMask[cells[key]] * 1.4426950408889634f : 0.0f;
                 mk1 = key + 1 < kHi ? cellMask[cells[key + 1]] * 1.4426950408889634f : 0.0f;
             }
-            s[j][0] = key < end0 && key >= floor ? s[j][0] + mk0 : -INFINITY;
-            s[j][1] = key + 1 < end0 && key + 1 >= floor ? s[j][1] + mk1 : -INFINITY;
-            s[j][2] = key < end1 && key >= floor ? s[j][2] + mk0 : -INFINITY;
-            s[j][3] = key + 1 < end1 && key + 1 >= floor ? s[j][3] + mk1 : -INFINITY;
+            s[j][0] = key < end0 && key >= floor && key >= lo0 && key < hi0 ? s[j][0] + mk0 : -INFINITY;
+            s[j][1] = key + 1 < end0 && key + 1 >= floor && key + 1 >= lo0 && key + 1 < hi0 ? s[j][1] + mk1 : -INFINITY;
+            s[j][2] = key < end1 && key >= floor && key >= lo1 && key < hi1 ? s[j][2] + mk0 : -INFINITY;
+            s[j][3] = key + 1 < end1 && key + 1 >= floor && key + 1 >= lo1 && key + 1 < hi1 ? s[j][3] + mk1 : -INFINITY;
             t0 = fmaxf(t0, fmaxf(s[j][0], s[j][1]));
             t1 = fmaxf(t1, fmaxf(s[j][2], s[j][3]));
         }
@@ -427,6 +454,20 @@ TS_FP_ATTN(256)
 
 TS_FP_ATTN_ROWS(128)
 TS_FP_ATTN_ROWS(256)
+
+// ts_flash_decode_rows_f16_d<hd> with the window's rows in the row tiles of one launch (ts_fp_attn's WIN): every key tile is
+// read once for all the rows, where the row grid read the window's keys once a row (8 times for a Qwen3.8-27B 8-row window:
+// 140 us a layer after a 4K prompt against the direct engine's 44). Each row's sums are its one-row launch's, bit for bit.
+// No selection (cells). Launch: grid (ceil(rows * nHead / nKv / 128) * splits, nKv), block 256, the same shared memory.
+#define TS_FP_ATTN_WINDOW(HD) \
+    extern "C" __global__ void __launch_bounds__(256) ts_flash_decode_window_f16_d##HD( \
+        const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int rows, int len, \
+        int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
+        const int* __restrict__ dyn) \
+    { ts_fp_attn<HD, true>(q, kc, vc, cap, rows, len, floor, nHead, nKv, scale, splits, partial, out, dyn, nullptr, nullptr, nullptr); }
+
+TS_FP_ATTN_WINDOW(128)
+TS_FP_ATTN_WINDOW(256)
 
 // The split partials of one (query, head): out = sum_s e^(m_s - m) acc_s / sum_s e^(m_s - m) l_s.
 // Launch: grid nq * heads, block HD.

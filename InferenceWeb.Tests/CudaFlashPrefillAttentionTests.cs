@@ -210,12 +210,19 @@ public sealed class CudaFlashPrefillAttentionTests
     }
 
     /// <summary>
-    /// A verify window's rows on the row grid (ts_flash_decode_rows_f16_d*) against one one-row launch a row: row z attends
-    /// the window less the rows - 1 - z keys after it (the length read from a device block, as a recorded step reads it),
-    /// or its own row of a selection's cells, with the window's key splits. Bit for bit: speculative decoding answers as
-    /// plain greedy decoding only if a window's row rounds as the decode row at its position.
+    /// A verify window's rows in one launch against one one-row launch a row: row z attends the window less the rows - 1 - z
+    /// keys after it (the length read from a device block, as a recorded step reads it) in the launch's shared row tiles
+    /// (ts_flash_decode_window_f16_d*), or its own row of a selection's cells on the row grid (ts_flash_decode_rows_f16_d*),
+    /// with the window's key splits. Bit for bit: speculative decoding answers as plain greedy decoding only if a window's
+    /// row rounds as the decode row at its position. Rows whose lengths split their keys at different tile boundaries (a
+    /// share rounded up past a 32-key tile between the window's first and last row) keep their own splits.
     /// </summary>
     [CudaTheory]
+    [InlineData(256, 24, 4, 8, 4100, 0, 0)]   // Qwen3.8-27B's heads, an 8-row window after 4K: shares straddle a tile
+    [InlineData(256, 24, 4, 8, 4097, 0, 0)]
+    [InlineData(128, 16, 2, 8, 2049, 0, 0)]
+    [InlineData(256, 24, 4, 8, 513, 0, 0)]
+    [InlineData(256, 24, 4, 8, 20, 0, 0)]     // one split, keys shorter than a tile for the first rows
     [InlineData(256, 16, 2, 4, 2100, 0, 0)]   // split over the keys
     [InlineData(256, 32, 4, 8, 700, 0, 0)]
     [InlineData(128, 8, 1, 3, 300, 40, 0)]    // keys below a floor masked
