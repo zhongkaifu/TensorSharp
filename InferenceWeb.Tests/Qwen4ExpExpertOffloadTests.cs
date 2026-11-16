@@ -27,10 +27,16 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     private readonly EnvScope _env = new EnvScope();
     // Adaptive tier slots are on by default; these tests hold fixed slots to the accelerator unless they turn it on.
     private readonly NativeEnvScope _nativeEnv = new NativeEnvScope();
+    // The process-wide KV choice the class found: other classes set an explicit F32 and leave it, and these tests judge the
+    // model's own cache type (F16 here; tsm's QSA attention reads only F16 caches, and the tier comparisons were bounded
+    // on it), so each test starts with no explicit choice and puts back what it found.
+    private readonly KvCacheDtype _kvFound = KvCacheDtypeConfig.Current;
+    private readonly bool _kvFoundExplicit = KvCacheDtypeConfig.IsExplicitlySet;
 
     public Qwen4ExpExpertOffloadTests(ITestOutputHelper output)
     {
         _output = output;
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, explicitlySet: false);
         _nativeEnv.Set("TS_MOE_TIER_ADAPT", "0");
         Directory.CreateDirectory(_dir);
         _env.Set("MAX_CONTEXT", "1024");
@@ -44,6 +50,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     public void Dispose()
     {
         MoeCpuOffloadConfig.Reset();
+        KvCacheDtypeConfig.RestoreForTests(_kvFound, _kvFoundExplicit);
         _nativeEnv.Dispose();
         _env.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
@@ -286,6 +293,8 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     {
         bool gdn = kernels.Contains("gdn"), hc = kernels.Contains("hc"), qsa = kernels.Contains("qsa");
         bool attn = kernels.Contains("attn"), fusedRead = hc && !kernels.Contains("hcmix");
+        // tsm's QSA attention reads only F16 caches: the cache type the run had says why no attention pass ran, if none did.
+        KvCacheDtype cache = default;
         float[][] Answer(bool useGdn, bool useHc, bool useQsa, bool useAttn)
         {
             using var env = new NativeEnvScope();
@@ -295,7 +304,8 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
             env.Set("TS_METAL_QSA_SELECT", useQsa ? "1" : "0");
             env.Set("TS_METAL_QSA_ATTN", useAttn ? "1" : "0");
             env.Set("TS_METAL_QSA_ATTN_MIN_CELLS", "1");   // the fixture's window is a few hundred cells
-            return Run(BackendType.GgmlMetal, hostExperts ? MoeCpuOffloadConfig.SetAllLayers : () => { }, LongPrompt);
+            return Run(BackendType.GgmlMetal, hostExperts ? MoeCpuOffloadConfig.SetAllLayers : () => { }, LongPrompt,
+                model => cache = model.KvCacheDtype);
         }
         // The attention over the chosen cells is compared with ggml's flash attention over the same (deterministic)
         // selection, so the tie freedom of the selection drops out of that comparison.
@@ -307,7 +317,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         long gdnLayers = GgmlBasicOps.TsmGdnPromptCount() - gdnBefore, hcPasses = GgmlBasicOps.TsmHcPromptCount() - hcBefore;
         long qsaLayers = GgmlBasicOps.TsmQsaSelectCount() - qsaBefore, attnLayers = GgmlBasicOps.TsmQsaAttnCount() - attnBefore;
         _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes, {qsaLayers} QSA selections, "
-            + $"{attnLayers} QSA attention passes");
+            + $"{attnLayers} QSA attention passes ({cache} cache)");
         // The fixture's 8 layers: 6 GDN, 2 QSA, 16 half-layers with a read (fused, tsm::hc_read_encode) and a scatter each.
         Assert.Equal(gdn ? 6 : 0, gdnLayers);
         Assert.Equal(hc ? 32 : 0, hcPasses);
