@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 from aiohttp import web
 
@@ -165,6 +166,126 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(seen), 1)
 
 
+class AudioBodyTests(unittest.TestCase):
+    def test_speech_leaves_defaults_out(self):
+        self.assertEqual(ts.build_speech_body("你好"), {"input": "你好", "response_format": "wav"})
+        self.assertEqual(ts.build_speech_body("你好", voice=" zf_xiaoxiao ", speed=1.25),
+                         {"input": "你好", "response_format": "wav", "voice": "zf_xiaoxiao", "speed": 1.25})
+        with self.assertRaises(ValueError):
+            ts.build_speech_body("  ")
+
+    def test_music_leaves_the_planners_choices_out(self):
+        body = ts.build_music_body("lofi, piano", seed=2**64 - 1)
+        self.assertEqual(body, {"prompt": "lofi, piano", "lyrics": "[Instrumental]", "duration": 30.0,
+                                "language": "en", "response_format": "wav", "seed": (2**64 - 1) % 2**63})
+        body = ts.build_music_body("ballad", lyrics="[verse]\nla", duration=12.5, bpm=80, key=" G major ",
+                                   time_signature="3", language="zh", steps=4, seed=1)
+        self.assertEqual((body["bpm"], body["key"], body["time_signature"], body["language"], body["steps"]),
+                         (80, "G major", "3", "zh", 4))
+        with self.assertRaises(ValueError):
+            ts.build_music_body("x", time_signature="5/4")
+        with self.assertRaises(ValueError):
+            ts.build_music_body("")
+
+    def test_wav_round_trip(self):
+        import numpy as np
+        samples = np.stack([np.linspace(-1, 1, 480, dtype=np.float32), np.zeros(480, np.float32)])
+        back, rate = ts.read_wav(ts.wav_bytes(samples, 24000))
+        self.assertEqual((back.shape, rate), ((2, 480), 24000))
+        self.assertLess(float(np.abs(back - samples).max()), 1e-4)
+
+    def test_srt_from_segments(self):
+        srt = ts.srt_from_segments([{"start": 0, "end": 1.5, "text": " Hello."},
+                                    {"start": 3725.125, "end": 3726, "text": " a --> b"}])
+        self.assertEqual(srt, "1\n00:00:00,000 --> 00:00:01,500\nHello.\n\n2\n01:02:05,125 --> 01:02:06,000\na -> b\n")
+
+
+class FakeAudioServer:
+    """Answers the audio routes the way TensorSharp does; records what it was sent."""
+
+    def __init__(self, delay=0.0):
+        self.delay = delay
+        self.seen = []
+        self.disconnected = asyncio.Event()
+
+    async def speech(self, request):
+        body = await request.json()
+        self.seen.append(body)
+        # aiohttp no longer cancels a handler whose client went away; watch the transport instead.
+        deadline = asyncio.get_running_loop().time() + self.delay
+        while asyncio.get_running_loop().time() < deadline:
+            if request.transport is None or request.transport.is_closing():
+                self.disconnected.set()
+                return web.Response(status=499)
+            await asyncio.sleep(0.05)
+        if body.get("voice") == "nobody":
+            return web.json_response({"error": {"message": "Kokoro has no voice 'nobody'", "type": "invalid_request_error"}},
+                                     status=400)
+        import numpy as np
+        return web.Response(body=ts.wav_bytes(np.zeros((1, 2400), np.float32), 24000), content_type="audio/wav")
+
+    async def transcribe(self, request):
+        form = await request.post()
+        self.seen.append({k: (v.filename if hasattr(v, "filename") else v) for k, v in form.items()})
+        return web.json_response({"text": " hi", "language": form.get("language", "en"),
+                                  "segments": [{"start": 0, "end": 1, "text": " hi"}]})
+
+
+class AudioRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def start(self, server):
+        app = web.Application()
+        app.router.add_post("/v1/audio/speech", server.speech)
+        app.router.add_post("/v1/audio/music", server.speech)
+        app.router.add_post("/v1/audio/transcriptions", server.transcribe)
+        app.router.add_post("/v1/audio/translations", server.transcribe)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await site.start()
+        return f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+
+    async def asyncTearDown(self):
+        await self.runner.cleanup()
+
+    async def test_speech_returns_the_wav(self):
+        server = FakeAudioServer()
+        url = await self.start(server)
+        async with ts.TensorSharpClient(url) as c:
+            data = await c.post_audio("/v1/audio/speech", ts.build_speech_body("你好", voice="zm_yunjian"))
+        samples, rate = ts.read_wav(data)
+        self.assertEqual((samples.shape, rate), ((1, 2400), 24000))
+        self.assertEqual(server.seen[0]["input"], "你好")
+
+    async def test_refusal_carries_the_servers_message(self):
+        url = await self.start(FakeAudioServer())
+        async with ts.TensorSharpClient(url) as c:
+            with self.assertRaisesRegex(ts.TensorSharpError, "no voice 'nobody'"):
+                await c.post_audio("/v1/audio/speech", ts.build_speech_body("x", voice="nobody"))
+
+    async def test_stop_abandons_a_long_request(self):
+        server = FakeAudioServer(delay=30)
+        url = await self.start(server)
+        async with ts.TensorSharpClient(url) as c:
+            stop = asyncio.get_running_loop().time() + 0.3
+            with self.assertRaises(ts.Interrupted):
+                await c.post_audio("/v1/audio/music", ts.build_music_body("x"),
+                                   should_stop=lambda: asyncio.get_running_loop().time() > stop, poll_seconds=0.1)
+        await asyncio.wait_for(server.disconnected.wait(), timeout=5)
+
+    async def test_transcribe_sends_the_form_openai_takes(self):
+        server = FakeAudioServer()
+        url = await self.start(server)
+        import numpy as np
+        wav = ts.wav_bytes(np.zeros((1, 1600), np.float32), 16000)
+        async with ts.TensorSharpClient(url) as c:
+            result = await c.transcribe(wav, language="zh", word_timestamps=True, prompt="names")
+            await c.transcribe(wav, language="zh", translate=True)
+        self.assertEqual(result["text"], " hi")
+        self.assertEqual(server.seen[0], {"file": "comfyui.wav", "response_format": "verbose_json", "language": "zh",
+                                          "prompt": "names", "timestamp_granularities[]": "word"})
+        self.assertNotIn("language", server.seen[1])
+
+
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 
 
@@ -256,11 +377,18 @@ class ProfileTests(unittest.TestCase):
 
     def test_shipped_profiles_name_presets_in_this_checkout(self):
         names = sm.list_profiles([sm.PROFILE_DIR])
-        self.assertEqual(names, ["ltx25-distilled", "qwen-image-2.1-turbo"])
+        for expected in ("ltx25-distilled", "qwen-image-2.1-turbo", "whisper-large-v3-turbo", "kokoro-82m",
+                         "ace-step-1.5-turbo"):
+            self.assertIn(expected, names)
         for name in names:
-            p = sm.load_profile(name, [sm.PROFILE_DIR])
-            self.assertTrue(os.path.isfile(p.config), p.config)
-            self.assertTrue(p.model_name().endswith(".gguf"), name)
+            # Model paths are under TENSORSHARP_MODELS, which a test machine need not set.
+            with unittest.mock.patch.dict(os.environ, {"TENSORSHARP_MODELS": os.path.join(REPO, "models")}):
+                p = sm.load_profile(name, [sm.PROFILE_DIR])
+            if p.config:
+                self.assertTrue(os.path.isfile(p.config), p.config)
+            else:
+                self.assertTrue(p.model.startswith(os.path.join(REPO, "models")), name)
+            self.assertTrue(p.model_name().endswith((".gguf", ".safetensors")), name)
             self.assertIn("--backend", p.args, name)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "setpriv is Linux-only")

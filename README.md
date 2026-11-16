@@ -104,6 +104,7 @@ The app includes its .NET runtime and native engine. Windows needs [WebView2 Eve
 - **Text diffusion:** [DiffusionGemma](docs/models/diffusiongemma.md), including [Jev typed decision inference](docs/models/jev.md) at `/v1/systemone`, over text, images, uploaded documents, sampled video frames and audio transcripts (configured ASR companion).
 - **Image generation/editing and video generation:** [Qwen-Image-2.1](docs/models/qwenimage21.md), [MiniMax-H3-Image](docs/models/minimax-h3-image.md), [LTX 2.5 Distilled (video + 48 kHz stereo audio)](docs/models/ltx-2.5.md), [MiniMax-H3 (video + stereo audio)](docs/models/minimax-h3.md), and [Wan 2.1 / 2.2](docs/models/wan.md).
 - **Embeddings:** [EmbeddingGemma 2](docs/embeddings.md), including text/code and optional image, audio, and video inputs; BERT / XLM-R encoders including Snowflake Arctic Embed L v2.0 and all-MiniLM-L6-v2.
+- **Audio:** [Whisper](docs/models/whisper.md) speech recognition with segment and word timestamps (`/v1/audio/transcriptions`), [Kokoro-82M](docs/models/kokoro.md) speech synthesis with a Mandarin text front end (`/v1/audio/speech`), and [ACE-Step 1.5](docs/models/ace-step.md) song generation from a caption and lyrics (`/v1/audio/music`).
 
 Backend, modality, feature support, and validation coverage vary by model. See the [supported models](docs/supported_models.md) tables, the [model cards](docs/models/README.md), and the [embedding guide](docs/embeddings.md) for details.
 

@@ -387,6 +387,36 @@ namespace TensorSharp.Chat
                 };
             }
 
+            // What the loaded model does with sound, when it is an audio model (Whisper, Kokoro,
+            // ACE-Step): the /v1/audio route it serves and what a request can name. Null for
+            // every other model, like video.
+            object audio = _svc.Model switch
+            {
+                TensorSharp.Models.Audio.ISpeechRecognitionModel asr => new
+                {
+                    kind = "transcription",
+                    family = asr.SpeechModelFamily,
+                    route = "/v1/audio/transcriptions",
+                    languages = asr.Languages,
+                },
+                TensorSharp.Models.Audio.ISpeechSynthesisModel tts => new
+                {
+                    kind = "speech",
+                    family = tts.SpeechModelFamily,
+                    route = "/v1/audio/speech",
+                    voices = tts.Voices,
+                    sampleRate = tts.OutputSampleRate,
+                },
+                TensorSharp.Models.Audio.IMusicGenerationModel music => (object)new
+                {
+                    kind = "music",
+                    family = music.MusicModelFamily,
+                    route = "/v1/audio/music",
+                    sampleRate = music.OutputSampleRate,
+                },
+                _ => null,
+            };
+
             return new
             {
                 models = files,
@@ -416,6 +446,7 @@ namespace TensorSharp.Chat
                 modelContextTokens = _svc.ModelContextTokens,
                 defaultMaxTokens = _options.DefaultMaxTokens,
                 video,
+                audio,
                 // Null when this build serves no skills at all, so the UI can hide the
                 // whole control by testing one field rather than discovering it after a
                 // failed /api/skills fetch. An older UI ignores the extra member.

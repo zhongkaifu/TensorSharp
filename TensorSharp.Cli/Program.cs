@@ -450,6 +450,7 @@ namespace TensorSharp.Cli
             string imagePath = null;
             var imagePathList = new List<string>();   // every --image in order (multi-image edit)
             var imageMask = new ImageMaskCliOptions();
+            var audioCli = new AudioCliOptions();   // --language, --voice, --lyrics, ... (audio models)
             bool keepSourceSize = false;   // Qwen-Image-2.1 edit: return the first --image's exact size
             string audioPath = null;
             string videoPath = null;
@@ -588,6 +589,18 @@ namespace TensorSharp.Cli
                     case "--ref-video-audio": refVideoAudioPaths.Add(args[++i]); break;
                     case "--no-audio": videoAudioEnabled = false; break;
                     case "--audio": audioPath = args[++i]; break;
+                    case "--language":
+                    case "--translate":
+                    case "--word-timestamps":
+                    case "--voice":
+                    case "--speed":
+                    case "--lyrics":
+                    case "--duration":
+                    case "--bpm":
+                    case "--key":
+                    case "--time-signature":
+                    case "--phonemes":
+                    case "--no-audio-codes": audioCli.Read(args, ref i); break;
                     case "--video": videoPath = args[++i]; break;
                     case "--mmproj": mmProjPath = args[++i]; break;
                     case "--draft-model": draftModelPath = args[++i]; break;
@@ -1132,6 +1145,13 @@ namespace TensorSharp.Cli
             // GPU memory gauges (with telemetry on) read the loaded model's allocator; the
             // server does this in ModelLifecycleService. Track never throws.
             TensorSharp.Models.Telemetry.GpuMemoryTelemetry.Track(model);
+
+            // Audio models: Whisper (--audio in, transcript out), Kokoro (--prompt in, speech
+            // out) and ACE-Step (--prompt style tags and --lyrics in, a song out).
+            if (AudioCli.TryRun(model, audioCli,
+                    editPrompt ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : null),
+                    audioPath, outputFile, diffusionStepsSet ? diffusionSteps : 0, diffusionSeedSet ? diffusionSeed : 0))
+                return;
 
             // Qwen-Image-2.1: prompt -> generated image, or prompt + input image(s) -> edited
             // image (no autoregressive path). Repeat --image for multi-image edits (e.g.

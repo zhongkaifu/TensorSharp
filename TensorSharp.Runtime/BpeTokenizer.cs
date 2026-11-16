@@ -199,6 +199,10 @@ namespace TensorSharp.Runtime
                 // complete text, splitting only at newline runs.
                 "gemma4" =>
                     @"[^\n]+|[\n]+",
+                // GPT-2's own pattern (llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT2), which Whisper's
+                // tokenizer keeps: whole digit runs, one optional leading space per piece.
+                "whisper" =>
+                    @"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
                 _ =>
                     @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             };
