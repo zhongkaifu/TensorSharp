@@ -86,6 +86,10 @@ namespace TensorSharp.Models
         /// tensors after their last use.</summary>
         private readonly Dictionary<string, GraphProgram> _streamTemplates = new();
 
+        /// <summary>The streamed kinds of steps that keep their recurrent states' snapshots (verify windows): only their
+        /// emission reads the states' verify buffers (<see cref="ForgetProgramsKeyedOtherwise"/>).</summary>
+        private readonly HashSet<string> _snapshotStreamedKinds = new();
+
         /// <summary>A stacked expert weight with its members (each a quantized weight with its own
         /// resident copy), for executors that run routed experts one at a time.</summary>
         private IGraphExpertWeights ExpertSet(string name, StackedExpertWeights stacked)
@@ -518,13 +522,25 @@ namespace TensorSharp.Models
             ForgetProgramsKeyedOtherwise();
         }
 
-        /// <summary>Programs cached by something other than their leaves' identities: the streamed kinds' templates and a
-        /// family's (Qwen3.5's commit copies, keyed by one state's identity).</summary>
+        /// <summary>
+        /// Programs cached by something other than their leaves' identities: a family's (Qwen3.5's commit copies, keyed by one
+        /// state's identity) and the streamed kinds' templates of steps that keep snapshots. A stream template is a step's
+        /// structure only - when each value is read last (the executor's liveness), never what it binds - and a slot's caches
+        /// grown, moved or freed change no step's structure; of a recurrent state's buffers only the verify buffers do (a
+        /// verify window's in-place recurrence, Qwen3.8's PLE history), and only a step that keeps snapshots reads them. Every
+        /// template had gone: a DFlash2 request's first verify window grows its slot's verify buffers, and every next request's
+        /// prompt step then recorded and built before the device started on it (1.9 ms of a Qwen3.8-27B 62-token prompt's
+        /// first token on an RTX PRO 6000 slice), and a 4K prompt's slot growth made both its chunks do so (3.2 and 3.5 ms).
+        /// </summary>
         private void ForgetProgramsKeyedOtherwise()
         {
             OnGraphCacheCleared();
-            _streamedKinds.Clear();
-            _streamTemplates.Clear();
+            foreach (string kind in _snapshotStreamedKinds)
+            {
+                _streamedKinds.Remove(kind);
+                _streamTemplates.Remove(kind);
+            }
+            _snapshotStreamedKinds.Clear();
         }
 
         private void DisposeParkedRecordings()
@@ -844,6 +860,7 @@ namespace TensorSharp.Models
             ClearRankGraphCache();
             _streamedKinds.Clear();
             _streamTemplates.Clear();
+            _snapshotStreamedKinds.Clear();
         }
 
         /// <summary>Steps that replayed a cached graph (tests check decode replays).</summary>
@@ -1218,7 +1235,11 @@ namespace TensorSharp.Models
                 if (!step.Run(graph.Plan))
                     throw new InvalidOperationException($"{Config.Architecture} graph step failed: {graph.Plan.LastError}");
                 GraphRuns++;
-                if (kind != null && _streamedKinds.Add(kind)) _streamTemplates[kind] = step.Program;
+                if (kind != null && _streamedKinds.Add(kind))
+                {
+                    _streamTemplates[kind] = step.Program;
+                    if (snapshots) _snapshotStreamedKinds.Add(kind);
+                }
                 foreach (Slot slot in slots) slot.DeviceDirty = true;
                 if (advance && !owned && step.Advanceable)
                 {
