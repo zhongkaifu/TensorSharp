@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 30;
+        public const int CurrentVersion = 32;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _ringAttn64, _ringAttn128, _ringAttnCombine;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -76,6 +76,7 @@ namespace TensorSharp.Cuda
             _addRmsNormReg = module.GetFunction("ts_graph_add_rms_norm_reg_f32");
             _repackQ6kTiled = module.GetFunction("ts_graph_repack_q6k_tiled");
             _qsaStorePool = module.GetFunction("ts_graph_qsa_store_pool_f32");
+            _attnPrep = module.GetFunction("ts_graph_attn_prep_f32");
             // The tiled head's products stream with cp.async into the int8 tensor cores: only an image with their sm_80 bodies.
             if (ArchGuardedKernelsUsable)
             {
@@ -136,6 +137,34 @@ namespace TensorSharp.Cuda
                 &mode, &ctx, &freqBase, &freqScale, &extFactor, &attnFactor, &betaFast, &betaSlow };
             CudaDriverApi.cuLaunchKernel(_qsaStorePool, (uint)rows, 1, 1, QsaStorePoolThreads, 1, 1, (uint)(d * 4), stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Warps of <see cref="LaunchAttentionPrep"/>'s blocks, a unit (a row's head) each.</summary>
+        public const int AttentionPrepWarps = 8;
+
+        /// <summary>
+        /// An attention layer's query/key prep and K/V cache writes for one sequence's <paramref name="rows"/> rows (GraphFusion.AttentionPrep;
+        /// see the kernel's contract), a warp per query, key and value head of each row: q [rows][heads][d], k [rows][kvHeads][d] and
+        /// v [rows][kvHeads][dv] (F32, each head's values contiguous, rows and heads the given strides apart, in floats) normed with
+        /// <paramref name="qNorm"/> / <paramref name="kNorm"/> [d] and rotated at <paramref name="positions"/> [rows]; the queries into
+        /// <paramref name="output"/> (rows <paramref name="outRow"/> and heads <paramref name="outHead"/> floats apart), the keys and
+        /// values into the head-first caches [kvHeads][cap][d] and [kvHeads][cap][dv] (F16 where <paramref name="f16Cache"/>, else F32)
+        /// at the KV indices <paramref name="cells"/> [rows].
+        /// </summary>
+        public void LaunchAttentionPrep(IntPtr q, long qRow, long qHead, IntPtr k, long kRow, long kHead, IntPtr v, long vRow, long vHead,
+            IntPtr qNorm, IntPtr kNorm, IntPtr output, long outRow, long outHead, IntPtr kCache, IntPtr vCache, bool f16Cache, int cap,
+            IntPtr positions, IntPtr cells, int rows, int heads, int kvHeads, int d, int dv, float eps, int ropeDim, int mode, int ctx,
+            float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow, IntPtr stream)
+        {
+            int half = f16Cache ? 1 : 0;
+            long units = (long)rows * (heads + 2L * kvHeads);
+            if (units < 1 || (units + AttentionPrepWarps - 1) / AttentionPrepWarps > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(rows), $"attention prep of {rows} rows of {heads} + 2 x {kvHeads} heads");
+            void** args = stackalloc void*[] { &q, &qRow, &qHead, &k, &kRow, &kHead, &v, &vRow, &vHead, &qNorm, &kNorm, &output, &outRow, &outHead,
+                &kCache, &vCache, &half, &cap, &positions, &cells, &rows, &heads, &kvHeads, &d, &dv, &eps, &ropeDim, &mode, &ctx, &freqBase,
+                &freqScale, &extFactor, &attnFactor, &betaFast, &betaSlow };
+            CudaDriverApi.cuLaunchKernel(_attnPrep, (uint)((units + AttentionPrepWarps - 1) / AttentionPrepWarps), 1, 1, AttentionPrepWarps * 32, 1, 1,
+                (uint)(AttentionPrepWarps * d * sizeof(float)), stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Whether this image runs a QSA region's kernels (<see cref="LaunchQsaScores"/>, <see cref="LaunchQsaSelect"/>

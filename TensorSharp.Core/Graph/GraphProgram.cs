@@ -206,6 +206,17 @@ namespace TensorSharp.Graph
         /// [kept, kept + convRows) of each channel. The writes are effects and aliases inside the region. Result: the last
         /// layer's conv window write.</summary>
         DeltaNetCommit = 15,
+        /// <summary>An attention layer's query and key prep and its cache writes for one sequence's rows: each query head of q
+        /// and KV head of k RMS-normed with its weight (x * rsqrt(mean(x^2) + eps), then times the weight) and rotated at the row's
+        /// position (ggml_rope_ext, single-axis); the rotated keys and the values written into the K and V caches at the rows' KV
+        /// indices, rounded to the caches' type. The writes are effects inside the region. Inputs: q [d, heads, rows] and k
+        /// [d, kvHeads, rows] (views of the projections, d contiguous: before the copies and norms the ops run), v
+        /// [dv, kvHeads, rows], the q and k norm weights [d], the K and V caches [d, capacity, kvHeads] and [dv, capacity, kvHeads],
+        /// the rows' rotary positions [rows] (I32) and their KV indices [rows]. Ip: heads, kvHeads, d, dv, the rotary dims, mode and
+        /// original context, then (optional) 1 where only the attention reads the result, through its [d, rows, heads] permute (an
+        /// executor may then lay it out head by head). Fp: the norms' eps, the rotary's base, frequency scale, extrapolation factor,
+        /// attention factor, beta fast and beta slow. Result: the rotated queries [d, heads, rows].</summary>
+        AttentionPrep = 16,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

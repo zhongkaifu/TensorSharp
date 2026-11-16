@@ -187,6 +187,11 @@ namespace TensorSharp.Models
         /// <see cref="GraphFusion.QsaKeys"/> region.</summary>
         internal bool QsaKeysRegionDisabledForTests { get; set; }
 
+        /// <summary>A QSA layer's selecting step reads the rotated queries as rows (its <see cref="GraphFusion.QsaAttention"/>
+        /// region); every other step only through the attention's head-major view.</summary>
+        protected override bool AttentionReadsQueriesAlone(GraphStep step, int layer)
+            => !(QsaRatio(layer) > 0 && step.Starts[0] + step.Counts[0] > Ple.QsaBudget);
+
         /// <summary>The blocks sequence <paramref name="s"/>'s step pools at a QSA layer of <paramref name="ratio"/>:
         /// those it completes; a decode or verify step pools its last ceil(count / ratio) complete blocks.</summary>
         private static (int First, int Count) PoolSpan(GraphStep step, int s, int ratio)

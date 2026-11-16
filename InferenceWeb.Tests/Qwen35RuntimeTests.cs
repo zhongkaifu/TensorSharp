@@ -1348,6 +1348,60 @@ public sealed class Qwen35RuntimeTests : IDisposable
                 $"step {w} differs with the commit region ({RelL2(fused.Logits[w], ops.Logits[w]):E2} relative L2)");
     }
 
+    /// <summary>
+    /// Every step's query/key prep and K/V cache writes on direct CUDA as one kernel (GraphFusion.AttentionPrep: q and k normed and
+    /// rotated where the projections put them, the rows written into the caches) against their ops: prompts of 17 rows (their
+    /// queries handed to the attention head by head) and 7, decode steps (recorded and replayed), 4-row verify windows accepted in
+    /// part or restored, and a 2,100-token prompt split at the 2,048-row chunk boundary with the decode after it, bit for bit.
+    /// </summary>
+    [CudaTheory]
+    [InlineData("dense")]
+    [InlineData("moe-quantized")]
+    public void AttentionPrepRegionOnDirectCudaAnswersAsItsOps(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        string path = Fixture(variant);
+        (List<float[]> Logits, long Regions, long HeadMajor, int Replays) Run(bool region)
+        {
+            using var model = Create(path, backend: BackendType.Cuda);
+            model.AttentionPrepRegionDisabledForTests = !region;
+            var executor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(model.GraphExecutorForTests);
+            List<float[]> trace = Script(model);
+            model.ResetKVCache();
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            int vocab = model.Config.VocabSize;
+            var prompt = new float[vocab];
+            spec.SpecForward(Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray(), null, prompt, false);
+            trace.Add(prompt);
+            // Accepted rows of each 4-row window (-1: restored to the state before it).
+            int[] accepted = { 3, 0, -1, 2 };
+            for (int w = 0; w < accepted.Length; w++)
+            {
+                int[] window = Enumerable.Range(0, 4).Select(i => 60 + (w * 4 + i) % 30).ToArray();
+                var logits = new float[4 * vocab];
+                spec.SpecForward(window, null, logits, true);
+                if (accepted[w] < 0) spec.SpecRestoreRecurrentState();
+                else spec.SpecOnVerifyAccepted(accepted[w], 4);
+                trace.Add(logits);
+            }
+            model.ResetKVCache();
+            trace.Add((float[])model.ForwardRefill(Enumerable.Range(0, 2100).Select(i => 3 + (i * 37) % 250).ToArray()).Clone());
+            foreach (int token in new[] { 81, 82, 83 })
+                trace.Add((float[])model.Forward(new[] { token }).Clone());
+            return (trace, executor.AttentionPrepRegions, executor.HeadMajorQueryPreps, model.GraphReplays);
+        }
+        var fused = Run(region: true);
+        var ops = Run(region: false);
+        Assert.True(fused.Regions > 0, "no step ran its attention prep as the region");
+        Assert.True(fused.HeadMajor > 0, "no prompt chunk handed its queries to the attention head by head");
+        Assert.Equal(0, ops.Regions);
+        Assert.True(fused.Replays > 0 && ops.Replays > 0, "the decode steps did not replay");
+        Assert.Equal(ops.Logits.Count, fused.Logits.Count);
+        for (int i = 0; i < fused.Logits.Count; i++)
+            Assert.True(fused.Logits[i].AsSpan().SequenceEqual(ops.Logits[i]),
+                $"step {i} differs with the prep region ({RelL2(fused.Logits[i], ops.Logits[i]):E2} relative L2)");
+    }
+
     private void AssertWindowsRetraceAfterRelease(BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);

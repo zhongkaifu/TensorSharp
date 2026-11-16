@@ -1927,6 +1927,23 @@ namespace TensorSharp.Models
         /// 3.8's QSA selection), what the region reads from outside it emitted before it opens; default none.</summary>
         protected virtual bool BeginWindowAttention(GraphStep step, int layer, int x, int s, in WindowAttentionOperands attention) => false;
 
+        /// <summary>A one-sequence step's attention prep operands in a layer: its rows' q [d, heads, rows] and k [d, kvHeads, rows]
+        /// as projected (views of the products, before the copies and <see cref="EmitQueryKey"/>'s ops), v [dv, kvHeads, rows], the
+        /// K and V caches [d, capacity, kvHeads], the rows the step writes them at (I64 [rows]: their KV indices), the local heads
+        /// and KV heads, and the key and value head widths.</summary>
+        protected readonly record struct AttentionPrepOperands(int Queries, int Keys, int Values, int KCache, int VCache, int Rows, int Heads,
+            int KvHeads, int HeadDim, int ValueDim);
+
+        /// <summary>Whether a one-sequence step whose rows are written into the caches by index takes <paramref name="layer"/>'s
+        /// query/key prep and cache writes as a region (<see cref="BeginAttentionPrep"/>); default none.</summary>
+        protected virtual bool TakesAttentionPrep(GraphStep step, int layer) => false;
+
+        /// <summary>Open a fused region over <paramref name="layer"/>'s query/key prep (the copies of q, k and v and
+        /// <see cref="EmitQueryKey"/>'s ops) and its K/V cache writes, which the rotated queries close: a family whose prep an
+        /// executor may run as one kernel opens one where <see cref="TakesAttentionPrep"/> said so.</summary>
+        protected virtual void BeginAttentionPrep(GraphStep step, int layer, in AttentionPrepOperands prep)
+            => throw new NotSupportedException($"{Config.Architecture} takes no attention prep region.");
+
         private int EmitAttention(GraphStep step, int layer, int x)
         {
             EmitAttentionInput(step, layer, x);
@@ -1954,12 +1971,28 @@ namespace TensorSharp.Models
                 k = step.Reshape(step.MatMul(LayerName(layer, "attn_k.weight"), x), d, kvHeads, rows);
                 v = step.Reshape(step.MatMul(LayerName(layer, "attn_v.weight"), x), dv, kvHeads, rows);
             }
+            int kvType = KvGgmlType(_kvCacheDtype.ToDType());
+            GraphCapabilities caps = GraphExecutor.Capabilities;
+            // Decode rows and short chunks (a verify window) are written by index. Tensor-parallel graphs write every chunk by
+            // index too: ggml's meta device splits set_rows by KV head, while a copy into a strided cache view fails on the ranks.
+            bool Indexed(int count) => count <= SmallChunkRows || _graphTpRanks != null || caps.IndexedCacheWrites
+                || (caps.PaddedCacheAttention && kvType != GraphFormat.F32);
+            // One sequence's rows written by index: a family may take their query/key prep and cache writes as one region, which
+            // the rotated queries close once the rows are written (the caches' leaves and the write rows exist before it opens).
+            bool prep = step.Sequences == 1 && Indexed(step.Counts[0]) && TakesAttentionPrep(step, layer);
+            if (prep)
+            {
+                Slot only = step.Slots[0];
+                BeginAttentionPrep(step, layer, new AttentionPrepOperands(q, k, v,
+                    step.State(only.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, only.Capacity, kvHeads),
+                    step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, only.Capacity, kvHeads),
+                    step.WriteRows(step.Starts[0], step.Counts[0]), heads, kvHeads, d, dv));
+            }
             q = step.Cont(q);
             k = step.Cont(k);
             v = step.Cont(v);
             EmitQueryKey(step, layer, ref q, ref k);
 
-            int kvType = KvGgmlType(_kvCacheDtype.ToDType());
             float scale = 1.0f / MathF.Sqrt(d);
             long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
             int n = step.Sequences;
@@ -1972,7 +2005,8 @@ namespace TensorSharp.Models
                 int qs = n == 1 ? q : step.View3(q, d, heads, count, d * f, d * heads * f, firstRow * d * heads * f);
                 int ks = n == 1 ? k : step.View3(k, d, kvHeads, count, d * f, d * kvHeads * f, firstRow * d * kvHeads * f);
                 int vs = n == 1 ? v : step.View3(v, dv, kvHeads, count, dv * f, dv * kvHeads * f, firstRow * dv * kvHeads * f);
-                int qPerm = step.Permute(qs, 0, 2, 1, 3);
+                // Under a prep region the queries are read past its end only (its result): their view follows it.
+                int qPerm = prep ? -1 : step.Permute(qs, 0, 2, 1, 3);
                 // [d, heads, count] -> [d, count, heads]; one row is the same bytes either way.
                 int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
                 int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
@@ -1982,11 +2016,7 @@ namespace TensorSharp.Models
                 int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cap, kvHeads);
 
                 int fa;
-                // Tensor-parallel graphs write every chunk by index too: ggml's meta device splits
-                // set_rows by KV head, while a copy into a strided cache view fails on the ranks.
-                GraphCapabilities caps = GraphExecutor.Capabilities;
-                if (count <= SmallChunkRows || _graphTpRanks != null || caps.IndexedCacheWrites
-                    || (caps.PaddedCacheAttention && kvType != GraphFormat.F32))
+                if (Indexed(count))
                 {
                     // Decode and short chunks (a verify window): rows are written by index and
                     // attention reads the padded cache window under a causal mask, so every row is
@@ -1994,6 +2024,11 @@ namespace TensorSharp.Models
                     int rowsAt = step.WriteRows(start, count);
                     step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, rowsAt));
                     step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, rowsAt));
+                    if (prep)
+                    {
+                        step.EndFused(stackalloc[] { q });
+                        qPerm = step.Permute(qs, 0, 2, 1, 3);
+                    }
                     int stepRows = DecodeWindowStep;
                     int window = Math.Min(cap, (start + count + stepRows - 1) / stepRows * stepRows);
                     int gqa = heads / kvHeads;
@@ -2228,8 +2263,10 @@ namespace TensorSharp.Models
             private readonly List<IntPtr> _inputData = new();
             private readonly List<long> _inputBytes = new();
             private int _mask = -1, _maskStart = -1, _maskCount = -1;
-            private int _decodeMask = -1, _decodeMaskWindow = -1, _decodeMaskValid = -1;   // valid: start * 64 + count
-            private readonly Dictionary<int, int> _writeIndex = new();
+            private int _decodeMask = -1, _decodeMaskWindow = -1, _decodeMaskStart = -1, _decodeMaskCount = -1;
+            // A chunk's write rows by (start, count): a step writes every sequence's chunk by index on executors that take
+            // indexed cache writes at any width, and start * 64 + count had named (0, 2048) and (31, 64) alike.
+            private readonly Dictionary<(int Start, int Count), int> _writeIndex = new();
             private readonly HashSet<int> _strided = new();   // nodes whose layout is not contiguous
 
             private readonly bool _record;
@@ -2542,26 +2579,27 @@ namespace TensorSharp.Models
             /// <summary>The rows [count, 1] (I64) a short chunk is written at: start .. start + count - 1.</summary>
             internal int WriteRows(int start, int count)
             {
-                if (_writeIndex.TryGetValue(start * 64 + count, out int node)) return node;
+                if (_writeIndex.TryGetValue((start, count), out int node)) return node;
                 node = Leaf(GraphLeafRole.Input, GraphFormat.I64, stackalloc long[] { count, 1 }, IntPtr.Zero, 0);
                 var rows = new long[count];
                 for (int i = 0; i < count; i++) rows[i] = start + i;
                 AddInput(node, Pin(rows), count * sizeof(long), kind: InputKind.WriteRows, values: rows);
-                _writeIndex[start * 64 + count] = node;
+                _writeIndex[(start, count)] = node;
                 return node;
             }
 
             /// <summary>An F16 causal mask [window, count]: row q sees cache rows 0 .. start + q.</summary>
             internal int ChunkMask(int window, int start, int count)
             {
-                if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskValid == start * 64 + count) return _decodeMask;
+                if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskStart == start && _decodeMaskCount == count) return _decodeMask;
                 var mask = new ushort[(long)window * count];
                 FillChunkMask(mask, window, start, count);
                 _decodeMask = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(_decodeMask, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: window, start: start, count: count);
                 _decodeMaskWindow = window;
-                _decodeMaskValid = start * 64 + count;
+                _decodeMaskStart = start;
+                _decodeMaskCount = count;
                 return _decodeMask;
             }
 

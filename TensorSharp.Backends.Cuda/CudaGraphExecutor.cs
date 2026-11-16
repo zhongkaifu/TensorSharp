@@ -1022,6 +1022,96 @@ namespace TensorSharp.Cuda
         internal long QsaKeysRegions { get; private set; }
 
         /// <summary>
+        /// A step's query/key prep and K/V cache writes (<see cref="GraphFusion.AttentionPrep"/>) in one launch
+        /// (ts_graph_attn_prep_f32: a warp per query, key and value head of each row, the direct engines' ts_q35_attn_prep /
+        /// ts_q4e_attn_prep layout) with the ops' arithmetic: each head read where the projection put it, ts_rmsnorm_f32's weighted
+        /// norm (its 256-thread sums replayed in a warp, and its expressions), ts_graph_rope_ex_strided_f32's rotation, and the row
+        /// writes' F16 rounding, so the queries and the caches hold the ops' bits. The ops are about seven launches a layer and
+        /// step: the queries' copy out of the gated projection, two norms, two rotaries, two cache writes, and for a prompt chunk
+        /// the copies that regroup K and V head-first first - for a decode token of Qwen3.8 Flash Next ~170 us on an A40 where the
+        /// direct engine's kernel took 36 us, and over a 4K prompt of Qwen3.8-27B on an RTX PRO 4000 the norms, rotaries, strided
+        /// copies and cache writes took ~28 ms (with the layers' other norms and copies) where the engine's kernel took 10.6. Where
+        /// the region says only the attention reads the queries (Ip[7]), a prompt chunk's go out head-first, as the attention's
+        /// [heads, rows, d] view of them: the flash attention then reads them in place, where it copied the permuted rows first.
+        /// The positions and KV indices are read on the device, so a recorded step replays. Declined (the ops run) unless the
+        /// caches are F16 or F32 and head-first, the projections' heads contiguous and the norm weights plain F32 vectors.
+        /// </summary>
+        private bool TryAttentionPrep(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || inputs.Length < 9 || ip == null || ip.Length < 7 || fp == null || fp.Length < 7 || results.Length < 1
+                || Array.Exists(ip, x => x < int.MinValue || x > int.MaxValue))
+                return false;
+            Tensor q = inputs[0], k = inputs[1], v = inputs[2], qNorm = inputs[3], kNorm = inputs[4], positions = inputs[7], rows = inputs[8];
+            int heads = (int)ip[0], kvHeads = (int)ip[1], d = (int)ip[2], dv = (int)ip[3];
+            if (!DeviceInts(positions) || !DeviceInts(rows) || !AllF32OnDevice(q, k, v, qNorm, kNorm) || !qNorm.IsContiguous() || !kNorm.IsContiguous())
+                return false;
+            long count = rows.ElementCount();
+            // A warp's row of d floats sits in shared memory, eight warps a block.
+            if (count < 1 || count > int.MaxValue || positions.ElementCount() < count || heads < 1 || kvHeads < 1 || d < 1 || dv < 1
+                || (long)d * CudaGraphKernels.AttentionPrepWarps * sizeof(float) > 48 * 1024 || qNorm.ElementCount() != d || kNorm.ElementCount() != d
+                || count * (heads + 2L * kvHeads) > (long)int.MaxValue * CudaGraphKernels.AttentionPrepWarps
+                || !TryHeadRows(q, count, heads, d, out long qRow, out long qHead) || !TryHeadRows(k, count, kvHeads, d, out long kRow, out long kHead)
+                || !TryHeadRows(v, count, kvHeads, dv, out long vRow, out long vHead))
+                return false;
+            using Tensor kc = HeadFirst(inputs[5]), vc = HeadFirst(inputs[6]);
+            if (kc.Storage is not CudaStorage || vc.Storage is not CudaStorage || kc.ElementType != vc.ElementType
+                || kc.ElementType is not (DType.Float16 or DType.Float32) || !kc.IsContiguous() || !vc.IsContiguous() || kc.DimensionCount != 3
+                || vc.DimensionCount != 3 || kc.Sizes[0] != kvHeads || vc.Sizes[0] != kvHeads || kc.Sizes[2] != d || vc.Sizes[2] != dv
+                || kc.Sizes[1] != vc.Sizes[1] || kc.Sizes[1] > int.MaxValue)
+                return false;
+            int cap = (int)kc.Sizes[1], n = (int)count;
+            bool f16 = kc.ElementType == DType.Float16;
+            // Rows past a verify window's (the flash attention copies their permuted queries contiguous) go out head-first where
+            // only the attention reads them; decode rows and windows keep rows of heads, which their kernels read.
+            bool headMajor = ip.Length > 7 && ip[7] != 0 && count > CudaDecodeDynParams.WindowRowBlocks && heads > 1;
+            Tensor output;
+            long outRow, outHead;
+            if (headMajor)
+            {
+                using var heads3 = new Tensor(Allocator, DType.Float32, heads, count, d);
+                output = new Tensor(new[] { count, heads, (long)d }, new[] { (long)d, count * d, 1L }, heads3.Storage, heads3.StorageOffset);
+                (outRow, outHead) = (d, count * d);
+                HeadMajorQueryPreps++;
+            }
+            else
+            {
+                // The rotary's result as the ops shape it ([d, heads, rows], trailing ones dropped).
+                output = new Tensor(Allocator, DType.Float32, Sizes(stackalloc long[] { d, heads, count }));
+                (outRow, outHead) = ((long)heads * d, d);
+            }
+            Launch(new[] { q, k, v, qNorm, kNorm, positions, rows }, new[] { output, kc, vc }, (kn, stream) => kn.LaunchAttentionPrep(Ptr(q), qRow, qHead,
+                Ptr(k), kRow, kHead, Ptr(v), vRow, vHead, Ptr(qNorm), Ptr(kNorm), Ptr(output), outRow, outHead, Ptr(kc), Ptr(vc), f16, cap,
+                Ptr(positions), Ptr(rows), n, heads, kvHeads, d, dv, fp[0], (int)ip[4], (int)ip[5], (int)ip[6], fp[1], fp[2], fp[3], fp[4], fp[5],
+                fp[6], stream));
+            results[0] = output;
+            AttentionPrepRegions++;
+            return true;
+        }
+
+        /// <summary>Preps whose queries went out head-first (tests check the layout engaged).</summary>
+        internal long HeadMajorQueryPreps { get; private set; }
+
+        /// <summary>Query/key preps run as <see cref="TryAttentionPrep"/> (tests check the region engaged).</summary>
+        internal long AttentionPrepRegions { get; private set; }
+
+        /// <summary><paramref name="x"/> as [rows][heads][width] floats, each head's values contiguous (a view of a packed projection,
+        /// or rows whose unit extents a leaf dropped): the floats between its rows and between its heads.</summary>
+        private static bool TryHeadRows(Tensor x, long rows, int heads, int width, out long rowStride, out long headStride)
+        {
+            rowStride = headStride = 0;
+            int nd = x.DimensionCount;
+            if (nd < 1 || x.Strides[nd - 1] != 1 || x.Sizes[nd - 1] != width || x.ElementCount() != rows * heads * width
+                || (nd >= 2 ? x.Sizes[nd - 2] : 1) != heads || (nd >= 3 ? x.Sizes[nd - 3] : 1) != rows)
+                return false;
+            for (int i = 0; i < nd - 3; i++)
+                if (x.Sizes[i] != 1) return false;
+            headStride = nd >= 2 ? x.Strides[nd - 2] : width;
+            rowStride = nd >= 3 ? x.Strides[nd - 3] : (long)heads * width;
+            return true;
+        }
+
+        /// <summary>
         /// A verify window's commit over a program's gated delta-net layers (<see cref="GraphFusion.DeltaNetCommit"/>) in one launch
         /// per 32 layers (ts_graph_gdn_commit_f32, every layer's pointers by value): a window's kept rows stepped again from
         /// the state before it (the live state, in place, where the window left it alone) on the rows4 kernel's body - the arithmetic the ops' re-step runs on the one-row and rows4 kernels, so
@@ -1264,7 +1354,7 @@ namespace TensorSharp.Cuda
                 or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
-            GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit => Kernels != null,
+            GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep => Kernels != null,
             _ => false,
         };
 
@@ -1282,6 +1372,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.QsaAttention) return TryQsaAttention(inputs, ip, fp, results);
             if (kind == GraphFusion.QsaKeys) return TryQsaKeys(inputs, ip, fp, results);
             if (kind == GraphFusion.DeltaNetCommit) return TryDeltaNetCommit(inputs, ip, results);
+            if (kind == GraphFusion.AttentionPrep) return TryAttentionPrep(inputs, ip, fp, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
@@ -1540,10 +1631,11 @@ namespace TensorSharp.Cuda
         /// <summary>Products that quantized a deferred norm's rows in its own pass (tests check the route engaged).</summary>
         internal long NormedProducts { get; private set; }
 
-        /// <summary>The gated delta rule's regions read views of a packed in-projection where they are (<see cref="TryRows"/>);
-        /// the others take contiguous inputs.</summary>
+        /// <summary>The gated delta rule's regions read views of a packed in-projection where they are (<see cref="TryRows"/>), as
+        /// the attention's gate and prep read the query projection's heads (<see cref="TryHeadRows"/>); the others take contiguous
+        /// inputs.</summary>
         protected override bool RegionReadsStridedInputs(GraphFusion kind)
-            => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate;
+            => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate or GraphFusion.AttentionPrep;
 
         /// <summary>
         /// A gated attention output (<see cref="GraphFusion.SigmoidGate"/>), attn * sigmoid(gate), in one pass with the gate

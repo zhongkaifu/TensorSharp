@@ -1587,7 +1587,11 @@ namespace TensorSharp.Graph
                 {
                     Value src = values[n.Srcs[0]];
                     if (src.Weight != null) return WeightRows(src, n.Ip);
-                    return V(View(src.Relaid ? Contig(src.Tensor, run) : src.Tensor, n.Ip));
+                    // A large F32 input stays on the host until its first reader uploads it (HostFloats), and a view is one: a
+                    // prompt-sized projection fed as an input and viewed head by head read a null tensor here. The upload is not a
+                    // read of the source's pending writes: the view's own readers finish them.
+                    Tensor whole = Device(values, n.Srcs[0], run, read: false);
+                    return V(View(src.Relaid ? Contig(whole, run) : whole, n.Ip));
                 }
                 case GraphOp.Permute:
                     return new Value { Tensor = run.Keep(Permute(As4(T(0), run), (int)Ip(0, 0), (int)Ip(1, 1), (int)Ip(2, 2), (int)Ip(3, 3))),

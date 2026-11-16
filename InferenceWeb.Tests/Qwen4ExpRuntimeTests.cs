@@ -339,14 +339,40 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         AssertSameBits(ops.Rows, region.Rows, "the keys' ops");
     }
 
+    /// <summary>
+    /// Every step's query/key prep and K/V cache writes on direct CUDA as one kernel (GraphFusion.AttentionPrep: the queries read
+    /// where the gated projection put them, the norms, the rotaries and the cache writes with the ops' arithmetic) against their
+    /// ops, the QSA regions on in both runs: the kernel leaves the queries and the caches the ops' bits, so every row - the chunks
+    /// of 3 to 8 rows dense and across the budget, a 40-row prompt past the budget (its queries read as rows by the QSA region),
+    /// and the decode steps (recorded and replayed) after them - answers bit for bit, with QSA layers and with plain attention
+    /// layers (whose 40-row prompt hands its queries to the attention head by head).
+    /// </summary>
+    [CudaTheory]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    public void AttentionPrepRegionOnDirectCudaAnswersAsItsOps(bool widePrompt, bool qsa)
+    {
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-prep-{qsa}.gguf"), indexerTopK: 8, qsa: qsa);
+        var region = QsaRegionRun(path, widePrompt, attentionOps: false, keysOps: false);
+        var ops = QsaRegionRun(path, widePrompt, attentionOps: false, keysOps: false, prepOps: true);
+        Assert.True(region.Prep > 0, "no step ran its attention prep as the region");
+        Assert.Equal(0, ops.Prep);
+        Assert.True(region.Replays > 0 && ops.Replays > 0, "the decode steps did not replay");
+        AssertSameBits(ops.Rows, region.Rows, "the attention prep's ops");
+    }
+
     /// <summary>A QSA run on direct CUDA (a prompt, then chunks of up to 8 rows or a 40-row prompt, then 12 decode steps)
-    /// with either region's ops: its rows, the regions run and the decode steps replayed.</summary>
-    private static (float[][] Rows, long Attention, long Keys, int Replays) QsaRegionRun(string path, bool widePrompt, bool attentionOps, bool keysOps)
+    /// with any region's ops: its rows, the regions run and the decode steps replayed.</summary>
+    private static (float[][] Rows, long Attention, long Keys, int Replays, long Prep) QsaRegionRun(string path, bool widePrompt, bool attentionOps,
+        bool keysOps, bool prepOps = false)
     {
         int[] tokens = Enumerable.Range(0, 64).Select(i => 3 + (i * 37) % 240).ToArray();
         using var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda);
         model.QsaRegionDisabledForTests = attentionOps;
         model.QsaKeysRegionDisabledForTests = keysOps;
+        model.AttentionPrepRegionDisabledForTests = prepOps;
         model.ResetKVCache();
         var rows = new List<float[]>();
         int at = widePrompt ? 40 : 6;
@@ -363,7 +389,7 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         for (int i = 0; i < 12; i++)
             rows.Add((float[])model.Forward(new[] { tokens[at + i] }).Clone());
         var executor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(model.GraphExecutorForTests);
-        return (rows.ToArray(), executor.QsaAttentionRegions, executor.QsaKeysRegions, model.GraphReplays);
+        return (rows.ToArray(), executor.QsaAttentionRegions, executor.QsaKeysRegions, model.GraphReplays, executor.AttentionPrepRegions);
     }
 
     private static void AssertSameBits(float[][] expected, float[][] actual, string label)

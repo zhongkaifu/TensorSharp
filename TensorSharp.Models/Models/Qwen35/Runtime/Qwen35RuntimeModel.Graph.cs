@@ -46,6 +46,48 @@ namespace TensorSharp.Models
             k = step.Rope(step.RmsNorm(k, LayerName(layer, "attn_k_norm.weight")), _rotary);
         }
 
+        /// <summary>Tests: a step's query/key prep and cache writes run as their ops, not as a
+        /// <see cref="GraphFusion.AttentionPrep"/> region.</summary>
+        internal bool AttentionPrepRegionDisabledForTests { get; set; }
+
+        /// <summary>
+        /// A step's query/key prep (<see cref="EmitQueryKey"/>'s norms and rotary on the copies of q and k) and its K/V cache writes
+        /// as one region (<see cref="GraphFusion.AttentionPrep"/>), which an executor may run as one kernel (direct CUDA, on the
+        /// direct engines' ts_q35_attn_prep / ts_q4e_attn_prep layout), decode rows, verify windows and prompt chunks alike. The ops
+        /// are about seven launches a layer and step - the queries' copy out of the gated projection, the two weighted norms, the
+        /// two rotaries and the two cache writes, a prompt chunk's after copies that regroup K and V head-first: for a decode token
+        /// of Qwen3.8 Flash Next's 12 attention layers ~170 us on an A40 (UD-Q2_K_XL, short context) where the engine's one kernel
+        /// took 36; over a 4K prompt of Qwen3.8-27B on an RTX PRO 4000 the norms, rotaries, strided copies and cache writes took
+        /// ~28 ms (with the layers' other norms and copies) where the engine's kernel took 10.6. Text positions only (a media step's
+        /// rotary is multi-axis), and F16 or F32 caches, the ones the kernel writes: a declined region runs its ops with each norm's
+        /// weight a product of its own, a launch more than the step without the region.
+        /// </summary>
+        protected override bool TakesAttentionPrep(GraphStep step, int layer)
+            => !AttentionPrepRegionDisabledForTests && step.PositionTable < 0 && step.Positions >= 0 && _rotary != null
+               && KvCacheGraphType is GraphFormat.F16 or GraphFormat.F32;
+
+        protected override void BeginAttentionPrep(GraphStep step, int layer, in AttentionPrepOperands prep)
+        {
+            RotarySpec rope = _rotary;
+            step.BeginFused(GraphFusion.AttentionPrep,
+                stackalloc[]
+                {
+                    prep.Queries, prep.Keys, prep.Values, step.Weight(LayerName(layer, "attn_q_norm.weight")),
+                    step.Weight(LayerName(layer, "attn_k_norm.weight")), prep.KCache, prep.VCache, step.Positions, prep.Rows,
+                },
+                stackalloc long[]
+                {
+                    prep.Heads, prep.KvHeads, prep.HeadDim, prep.ValueDim, rope.Dims, rope.NeoX ? 2 : 0, rope.OriginalContext,
+                    AttentionReadsQueriesAlone(step, layer) ? 1 : 0,
+                },
+                stackalloc[] { Config.Eps, rope.FreqBase, rope.FreqScale, rope.ExtFactor, rope.AttnFactor, rope.BetaFast, rope.BetaSlow });
+        }
+
+        /// <summary>Whether only the attention reads <paramref name="layer"/>'s rotated queries in this step, through its head-major
+        /// view (an executor may then lay them out so; <see cref="GraphFusion.AttentionPrep"/>); a family whose region reads them as
+        /// rows says no there.</summary>
+        protected virtual bool AttentionReadsQueriesAlone(GraphStep step, int layer) => true;
+
         // Commit programs replay per (verify buffer, kept, rows): only copies, no inputs.
         private readonly System.Collections.Generic.Dictionary<(IntPtr, int, int), IGraphPlan> _commitGraphs = new();
 
