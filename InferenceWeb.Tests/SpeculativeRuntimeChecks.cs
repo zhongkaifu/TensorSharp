@@ -208,8 +208,226 @@ internal static class SpeculativeRuntimeChecks
                 $"{label}: request {r} gave [{string.Join(",", actual[r])}], expected [{string.Join(",", expected[r])}]");
     }
 
+    /// <summary>
+    /// Several requests speculating through a per-token draft head at once draft in one pass a step
+    /// (<see cref="IBatchedSpeculativeTarget.TryDraftChainBatch"/>): their streams are plain decoding's and those of the
+    /// same requests drafting one at a time (the pass disabled), and each request drafts and keeps the drafts it does
+    /// drafting alone. <paramref name="create"/> makes a model whose head chains (<see cref="IDraftHead.SupportsDraftChain"/>).
+    /// </summary>
+    public static async Task AssertBatchedDraftChainsDraftAsEachRequest(Func<StandardDecoderModel> create,
+        SpeculationOptions speculation, string label, int maxNew = 20)
+    {
+        int[][] plain = await ServeAsync(create, EnginePrompts, null, maxNew, verifySteps: null);
+        int chains = 0, verified = 0, alone = -1;
+        var together = new List<SequenceState>();
+        int[][] batched = await ServeAsync(create, EnginePrompts, speculation, maxNew, steps => verified = steps, together,
+            model => chains = model.BatchedDraftChains);
+        var single = new List<SequenceState>();
+        int[][] perRequest = await ServeAsync(() =>
+        {
+            StandardDecoderModel model = create();
+            model.BatchedDraftChainDisabledForTests = true;
+            return model;
+        }, EnginePrompts, speculation, maxNew, verifySteps: null, single, model => alone = model.BatchedDraftChains);
+        for (int r = 0; r < EnginePrompts.Length; r++)
+        {
+            Assert.True(plain[r].SequenceEqual(batched[r]),
+                $"{label}: request {r} gave [{string.Join(",", batched[r])}], plain [{string.Join(",", plain[r])}]");
+            Assert.True(perRequest[r].SequenceEqual(batched[r]),
+                $"{label}: request {r} gave [{string.Join(",", batched[r])}] chained together, [{string.Join(",", perRequest[r])}] alone");
+        }
+        Assert.True(verified > 0, $"{label}: no batched verify ran");
+        Assert.True(chains > 0, $"{label}: no step chained its requests' draft heads together");
+        Assert.Equal(0, alone);
+        for (int r = 0; r < EnginePrompts.Length; r++)
+        {
+            SpeculationStats a = together[r].SpecStats, b = single[r].SpecStats;
+            Assert.True(a != null && b != null, $"{label}: request {r} did not speculate");
+            Assert.True(a.TokensDrafted == b.TokensDrafted && a.TokensAccepted == b.TokensAccepted,
+                $"{label}: request {r} drafted {a.TokensDrafted} (accepted {a.TokensAccepted}) chained together, "
+                + $"{b.TokensDrafted} ({b.TokensAccepted}) alone");
+        }
+    }
+
+    /// <summary>
+    /// The draft chains of several requests in one pass (<see cref="IBatchedSpeculativeTarget.TryDraftChainBatch"/>) are
+    /// each request's own chain (<see cref="IDraftHead.DraftChain"/> on its bound slot): four requests at different
+    /// positions folding 1, 3, 2 and 2 verified rows in front of their anchors, with different caps, the last one's draft
+    /// layer restarted after a gap (attending only its rows past it), give the same ids (their confidences within
+    /// <paramref name="tolerance"/>); a gate stops each lane where its own chain stops; a pass of the unfloored lanes alone
+    /// gives their drafts again; and each lane's slot is left as its own chain leaves it: a following draft of each gives
+    /// the same ids after either. A pass naming a request without a slot declines without running.
+    /// </summary>
+    public static void AssertBatchedDraftChainDraftsEachLane(Func<StandardDecoderModel> create, string label, double tolerance)
+    {
+        int[][] prompts =
+        {
+            Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray(),
+            Enumerable.Range(0, 23).Select(i => 33 + (i * 7) % 90).ToArray(),
+            Enumerable.Range(0, 12).Select(i => 60 + (i * 5) % 70).ToArray(),
+            Enumerable.Range(0, 15).Select(i => 50 + (i * 13) % 80).ToArray(),
+        };
+        int[] folds = { 1, 3, 2, 2 };
+        int[] caps = { 3, 2, 3, 2 };
+        bool[] gapped = { false, false, false, true };
+        int lanes = prompts.Length;
+        int[] all = Enumerable.Range(0, lanes).ToArray(), unfloored = { 0, 1, 2 };
+        string[] ids = Enumerable.Range(0, lanes).Select(r => $"lane{r}").ToArray();
+
+        using StandardDecoderModel together = create(), alone = create();
+        var lanesTogether = Prepare(together);
+        var lanesAlone = Prepare(alone);
+        for (int r = 0; r < lanes; r++)
+        {
+            Assert.Equal(lanesAlone[r].Tokens, lanesTogether[r].Tokens);
+            Assert.True(together.CanBatchDraftChain(ids[r]), $"{label}: lane {r} cannot join a batched chain");
+        }
+        Assert.False(together.CanBatchDraftChain("absent"), $"{label}: a request without a slot joined a batched chain");
+        Assert.False(Together(new[] { 0, -1 }, 0f, out _, out _, out _), $"{label}: a pass with a request without a slot ran");
+        Assert.Equal(0, together.BatchedDraftChains);
+
+        // Gate 0: every lane drafts its whole cap.
+        Assert.True(Together(all, 0f, out int[][] tIds, out float[][] tProbs, out int[] tSteps), $"{label}: the pass declined");
+        Alone(0f, out int[][] aIds, out float[][] aProbs, out int[] aSteps);
+        AssertSame("gate 0", all, tIds, tProbs, tSteps, aIds, aProbs, aSteps);
+        Assert.Equal(caps, tSteps);
+        // The unfloored lanes again on their own (one floor for the step; the rows past each anchor rewritten before any
+        // row reads them): the same drafts.
+        Assert.True(Together(unfloored, 0f, out int[][] again, out float[][] againProbs, out int[] againSteps));
+        AssertSame("unfloored again", unfloored, again, againProbs, againSteps, aIds, aProbs, aSteps);
+
+        // A gate above lane 0's second confidence, halfway to the next one any lane drafts with (so neither run's rounding
+        // moves a confidence across it): each lane stops after its first step below it, as its own chain does.
+        float second = aProbs[0][1];
+        float above = aProbs.SelectMany(p => p).Where(p => p > second).DefaultIfEmpty(1f).Min();
+        float gate = (second + above) / 2;
+        Assert.True(Together(all, gate, out tIds, out tProbs, out tSteps), $"{label}: the gated pass declined");
+        Alone(gate, out aIds, out aProbs, out aSteps);
+        AssertSame("gated", all, tIds, tProbs, tSteps, aIds, aProbs, aSteps);
+        Assert.True(tSteps[0] <= 2, $"{label}: lane 0 drafted {tSteps[0]} steps past a gate above its second confidence");
+
+        // Each lane's slot holds what its own chain left: a following draft over [anchor, first draft] at the anchor (the
+        // verified run the next fold replays) reads the rows each pass wrote, and drafts the same.
+        int feat = ((ISpeculativeModel)together).SpecFeatureSize;
+        for (int r = 0; r < lanes; r++)
+        {
+            int[] next = { lanesTogether[r].Tokens[^1], aIds[r][0] };
+            int rowsIn = lanesTogether[r].Tokens.Length;
+            float[] lastRow = lanesTogether[r].Rows[((rowsIn - 1) * feat)..(rowsIn * feat)];
+            float[] rows = lastRow.Concat(lastRow).ToArray();
+            int anchorAt = lanesTogether[r].Start + rowsIn - 1;
+            (int[] I, float[] P, int S) t = Chain(together, ids[r], next, rows, anchorAt, 2, 0f);
+            (int[] I, float[] P, int S) a = Chain(alone, ids[r], next, rows, anchorAt, 2, 0f);
+            Assert.True(t.I.SequenceEqual(a.I),
+                $"{label}: lane {r} drafted [{string.Join(",", t.I)}] after the passes, [{string.Join(",", a.I)}] after its own chains");
+            for (int k = 0; k < t.S; k++)
+                Assert.True(Math.Abs(t.P[k] - a.P[k]) <= tolerance,
+                    $"{label}: lane {r} step {k} confidence {t.P[k]} after the passes, {a.P[k]} after its own chains");
+        }
+        Assert.Equal(3, together.BatchedDraftChains);
+        return;
+
+        (int[] Tokens, float[] Rows, int Start)[] Prepare(StandardDecoderModel model)
+        {
+            var head = (ISpeculativeModel)model;
+            int width = head.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var prepared = new (int[] Tokens, float[] Rows, int Start)[lanes];
+            for (int r = 0; r < lanes; r++)
+            {
+                // The trunk holds the prompt; the head holds the rows before the lane's fold (or, after a gap, none: it attends
+                // from the fold on), whose verified tokens (all but the anchor) it runs again in front of the anchor, as the
+                // speculator's stash folds into its next draft.
+                model.BindSequenceCache(ids[r]);
+                int[] prompt = prompts[r];
+                int n = prompt.Length, fold = folds[r], caught = n - fold + 1;
+                var hAll = new float[(long)n * width];
+                var logits = new float[vocab];
+                head.SpecForward(prompt, hAll, logits, false);
+                head.DraftCatchUp(prompt[..caught], gapped[r] ? null : new float[width].Concat(hAll[..((caught - 1) * width)]).ToArray(), 0);
+                int[] tokens = prompt[caught..].Append(ArgMax(logits)).ToArray();
+                prepared[r] = (tokens, hAll[((caught - 1) * width)..], caught);
+            }
+            model.RestorePrimaryCache();
+            return prepared;
+        }
+
+        bool Together(int[] which, float stopBelow, out int[][] outIds, out float[][] outProbs, out int[] outSteps)
+        {
+            int m = which.Length;
+            outIds = new int[lanes][];
+            outProbs = new float[lanes][];
+            outSteps = new int[lanes];
+            var names = new string[m];
+            var tokens = new int[m][];
+            var rows = new float[m][];
+            var starts = new int[m];
+            var maxTokens = new int[m];
+            var laneIds = new int[m][];
+            var laneProbs = new float[m][];
+            var laneSteps = new int[m];
+            for (int j = 0; j < m; j++)
+            {
+                int r = Math.Max(0, which[j]);
+                names[j] = which[j] < 0 ? "absent" : ids[r];
+                tokens[j] = lanesTogether[r].Tokens;
+                rows[j] = lanesTogether[r].Rows;
+                starts[j] = lanesTogether[r].Start;
+                maxTokens[j] = caps[r];
+                laneIds[j] = new int[caps[r]];
+                laneProbs[j] = new float[caps[r]];
+            }
+            if (!together.TryDraftChainBatch(names, tokens, rows, starts, maxTokens, Enumerable.Repeat(stopBelow, m).ToArray(),
+                    laneIds, laneProbs, laneSteps))
+                return false;
+            for (int j = 0; j < m; j++)
+                (outIds[which[j]], outProbs[which[j]], outSteps[which[j]]) = (laneIds[j], laneProbs[j], laneSteps[j]);
+            return true;
+        }
+
+        void Alone(float stopBelow, out int[][] outIds, out float[][] outProbs, out int[] outSteps)
+        {
+            outIds = new int[lanes][];
+            outProbs = new float[lanes][];
+            outSteps = new int[lanes];
+            for (int r = 0; r < lanes; r++)
+                (outIds[r], outProbs[r], outSteps[r]) = Chain(alone, ids[r], lanesAlone[r].Tokens, lanesAlone[r].Rows, lanesAlone[r].Start,
+                    caps[r], stopBelow);
+        }
+
+        void AssertSame(string what, int[] which, int[][] tI, float[][] tP, int[] tS, int[][] aI, float[][] aP, int[] aS)
+        {
+            foreach (int r in which)
+            {
+                Assert.True(tS[r] == aS[r], $"{label} {what}: lane {r} drafted {tS[r]} steps in the pass, {aS[r]} alone");
+                Assert.True(tI[r].Take(tS[r]).SequenceEqual(aI[r].Take(aS[r])),
+                    $"{label} {what}: lane {r} drafted [{string.Join(",", tI[r].Take(tS[r]))}] in the pass, [{string.Join(",", aI[r].Take(aS[r]))}] alone");
+                for (int k = 0; k < tS[r]; k++)
+                    Assert.True(Math.Abs(tP[r][k] - aP[r][k]) <= tolerance,
+                        $"{label} {what}: lane {r} step {k} confidence {tP[r][k]} in the pass, {aP[r][k]} alone");
+            }
+        }
+    }
+
+    /// <summary><paramref name="requestId"/>'s draft chain on its bound slot (<see cref="IDraftHead.DraftChain"/>).</summary>
+    private static (int[] Ids, float[] Probs, int Steps) Chain(StandardDecoderModel model, string requestId, int[] tokens, float[] rows,
+        int start, int maxTokens, float stopBelow)
+    {
+        var ids = new int[maxTokens];
+        var probs = new float[maxTokens];
+        model.BindSequenceCache(requestId);
+        try
+        {
+            int steps = ((IDraftHead)model).DraftChain(tokens, rows, start, maxTokens, ids, probs, stopBelow);
+            return (ids, probs, steps);
+        }
+        finally
+        {
+            model.RestorePrimaryCache();
+        }
+    }
+
     private static async Task<int[][]> ServeAsync(Func<ModelBase> create, int[][] prompts, SpeculationOptions speculation,
-        int maxNew, Action<int> verifySteps, List<SequenceState> served = null)
+        int maxNew, Action<int> verifySteps, List<SequenceState> served = null, Action<StandardDecoderModel> inspect = null)
     {
         using ModelBase model = create();
         var cfg = new SchedulerConfig
@@ -242,6 +460,7 @@ internal static class SpeculativeRuntimeChecks
             return tokens.ToArray();
         })).WaitAsync(TimeSpan.FromMinutes(3));
         verifySteps?.Invoke(((StandardDecoderModel)model).BatchedSpecVerifySteps);
+        inspect?.Invoke((StandardDecoderModel)model);
         return outputs;
     }
 

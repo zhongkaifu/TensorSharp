@@ -24,10 +24,32 @@ namespace TensorSharp.Models
         internal int BatchedSpecVerifySteps { get; private set; }
 
         /// <summary>The widest window a verify takes per sequence: the rows a step writes by index and replays
-        /// (<see cref="SmallChunkRows"/>); the executor narrows it to the drafter's block.</summary>
+        /// (<see cref="SmallChunkRows"/>), which the executor narrows to the drafter's block; on a stack whose rows
+        /// read their own experts, the sequences' share of <see cref="ExpertVerifyRows"/>, and below two rows each
+        /// (0) the sequences decode plainly together.</summary>
         public int BatchedSpecWindow(int sequences)
-            => sequences < 1 || !SupportsUnifiedBatching || SpeculationRefusal != null || GraphUnsupportedReason() != null
-                ? 0 : SmallChunkRows;
+        {
+            if (sequences < 1 || !SupportsUnifiedBatching || SpeculationRefusal != null || GraphUnsupportedReason() != null)
+                return 0;
+            if (sequences == 1 || !RowsReadTheirOwnExperts) return SmallChunkRows;
+            int perSequence = ExpertVerifyRows / sequences;
+            return perSequence < 2 ? 0 : perSequence;
+        }
+
+        /// <summary>
+        /// Rows a batched verify of several sequences keeps to where each row reads its own experts
+        /// (<see cref="RowsReadTheirOwnExperts"/>), the sequences splitting them into their windows: a verify there costs
+        /// nearly in proportion to its rows (Qwen3.8 Flash Next on an RTX 5090: 4 / 8 / 12 rows in 9.5 / 14.5 / 24.4 ms, each
+        /// draft kept at about 0.62), so three sequences' 4-row windows decoded 211 tok/s in all against 296 for four
+        /// sequences' plain steps. Two sequences verify 4 rows each, three or four 2, more decode plainly together (the
+        /// direct engine's budget). Given every sequence its whole window, four Qwen3.8 Flash Next MTP conversations on an
+        /// A40 decoded 23.6 tok/s each against the engine's 37.0.
+        /// </summary>
+        private const int ExpertVerifyRows = 8;
+
+        /// <summary>Routed experts at least 16 times those a row takes (Qwen3.8 Flash Next: 512 and 10): the widest window's
+        /// rows read mostly different experts, where a small pool (8 and 2) is read whole by a few rows.</summary>
+        private bool RowsReadTheirOwnExperts => _anyMoe && _numExperts >= 16 * _expertsUsed;
 
         /// <summary>Verify graphs replay per width, so a window is never padded past the longest draft.</summary>
         public bool BatchedSpecExactWindow => true;

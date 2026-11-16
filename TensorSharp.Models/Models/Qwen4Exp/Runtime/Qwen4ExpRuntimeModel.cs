@@ -231,9 +231,9 @@ namespace TensorSharp.Models
             return step.Reshape(x, p.StreamFloats, rows);
         }
 
-        /// <summary>The head's mixer on the last row (nextn.hc_head_*), then the trunk's output.weight.</summary>
-        protected override int EmitDraftHead(GraphStep step, int layer, int last)
-            => HcMix(step, last, 1, LayerName(layer, "nextn.hc_head_norm.weight"), LayerName(layer, "nextn.hc_head_down.weight"),
+        /// <summary>The head's mixer on each sequence's last row (nextn.hc_head_*), then the trunk's output.weight.</summary>
+        protected override int EmitDraftHead(GraphStep step, int layer, int last, int rows)
+            => HcMix(step, last, rows, LayerName(layer, "nextn.hc_head_norm.weight"), LayerName(layer, "nextn.hc_head_down.weight"),
                 LayerName(layer, "nextn.hc_head_up.weight"), null, out _);
 
         // ---------------------------------------------------------------- verify windows

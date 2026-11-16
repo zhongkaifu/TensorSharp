@@ -183,9 +183,8 @@ namespace TensorSharp.Models
             x = EmitBlockOutput(step, n, x, BlockSite.Ffn, ffnContext, _moeLayer[n] ? EmitMoe(step, n, ffnIn) : EmitDenseFfn(step, n, ffnIn));
             int streamWidth = DraftChainsStream ? StreamWidth : hiddenSize;
             int last = rows == 1 ? x : step.View2(x, streamWidth, 1, streamWidth * 4L, (rows - 1) * streamWidth * 4L);
-            int head = EmitDraftHead(step, n, last);
-            string headWeight = HasWeight(LayerName(n, "nextn.shared_head_head.weight")) ? LayerName(n, "nextn.shared_head_head.weight")
-                : HasWeight("output.weight") ? "output.weight" : "token_embd.weight";
+            int head = EmitDraftHead(step, n, last, 1);
+            string headWeight = DraftHeadWeight;
             outputs.Final = step.Output(DraftChainsStream ? last : head, width);
             int vocab = ScoredDraftVocabulary;
             int logits = vocab < Config.VocabSize ? step.MatMulRows(headWeight, 0, vocab, head, alone: true) : step.MatMul(headWeight, head);
@@ -213,8 +212,9 @@ namespace TensorSharp.Models
             return step.MatMul(LayerName(layer, "nextn.eh_proj.weight"), step.Op(GraphOp.Concat, stackalloc[] { e, h }, stackalloc long[] { 0 }));
         }
 
-        /// <summary>The draft head's normed row [hidden, 1] from the layer's last row.</summary>
-        protected virtual int EmitDraftHead(GraphStep step, int layer, int last)
+        /// <summary>The draft head's normed rows [hidden, <paramref name="rows"/>] from the layer's last row of each sequence
+        /// (<paramref name="last"/>: those rows, one a sequence).</summary>
+        protected virtual int EmitDraftHead(GraphStep step, int layer, int last, int rows)
         {
             string headNorm = HasWeight(LayerName(layer, "nextn.shared_head_norm.weight"))
                 ? LayerName(layer, "nextn.shared_head_norm.weight") : "output_norm.weight";
@@ -255,7 +255,11 @@ namespace TensorSharp.Models
         /// ten values), and the chain stops after the first step below <paramref name="stopBelow"/> as the per-step loop did.
         /// </summary>
         public bool SupportsDraftChain => HasDraftLayer && !HasDFlash && !_rankGraphs && GraphUnsupportedReason() == null
-            && GraphExecutor?.Capabilities.GreedyIdOutputs == true;
+            && (GraphExecutor?.Capabilities.GreedyIdOutputs == true || DraftChainForTests);
+
+        /// <summary>Tests run draft chains on the managed CPU, whose executor reads a top-k's ids back as their values but does
+        /// not advertise greedy id outputs (its top-k sorts each row on the host).</summary>
+        internal bool DraftChainForTests { get; set; }
 
         public int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut, float stopBelow = 0f)
         {
@@ -281,6 +285,245 @@ namespace TensorSharp.Models
             }
             return steps;
         }
+
+        // ---- several requests' chains in one pass (IBatchedSpeculativeTarget.TryDraftChainBatch)
+
+        /// <summary>The replay shape of a batched chain's steps: one kept step a width, as a single chain keeps its own.</summary>
+        private const string DraftLanesShape = DraftShapePrefix + "lanes";
+
+        /// <summary>Batched draft chains served (tests check the step used them).</summary>
+        internal int BatchedDraftChains { get; private set; }
+
+        /// <summary>Tests draft every request on its own, as the scheduler did before batched chains.</summary>
+        internal bool BatchedDraftChainDisabledForTests { get; set; }
+
+        /// <summary>Each lane's last real row in the batched chain step being run; a kept step refills its row selector from it.</summary>
+        private int[] _draftLaneLast;
+
+        /// <summary>
+        /// The draft chains of several requests run as one draft-layer forward a step over their slots, every lane's ten
+        /// largest logits read back once a step. Drafted one request at a time, four Qwen3.8 Flash Next MTP conversations on an
+        /// A40 (2-row verify windows, one draft each) spent 6.3 ms of a 43.4 ms step in four draft runs and their readbacks,
+        /// against ~4.5 ms in the direct engine. Wherever one request's chain runs (<see cref="SupportsDraftChain"/>).
+        /// </summary>
+        public bool SupportsBatchedDraftChain => SupportsDraftChain && !BatchedDraftChainDisabledForTests;
+
+        /// <summary>A request joins a batched chain with its own slot (its draft layer's rows live there).</summary>
+        public bool CanBatchDraftChain(string requestId)
+        {
+            if (!SupportsBatchedDraftChain || string.IsNullOrEmpty(requestId)) return false;
+            if (string.Equals(_activeKey, requestId, StringComparison.Ordinal)) return _cacheK != null;
+            return _slots != null && _slots.TryGetValue(requestId, out Slot slot) && slot.K != null;
+        }
+
+        /// <summary>
+        /// <see cref="DraftChain"/> for several requests in one pass (<see cref="IBatchedSpeculativeTarget.TryDraftChainBatch"/>):
+        /// the first step runs every lane's folded rows and anchor, each lane padded to the widest (so the lanes keep one row
+        /// count and the step replays, and records, as the previous one advanced); later steps one row of each lane still
+        /// drafting. A lane's results are its single chain's: its rows attend only its own slot above its own floor (its
+        /// layer restarted after a gap: a reused prefix, a prompt run beside others' or plain steps, which in concurrent
+        /// serving is most lanes), its head reads its last real row, and the rows padding writes past its anchor are written
+        /// again (by its chain, or the next fold over the verified rows) before any row reads them. A step with a floored lane
+        /// runs unrecorded, as a single floored chain's steps do. Declines (false) unless every lane has its own slot,
+        /// settled, and room for the padded rows, and when a step finds no device memory for its compute buffer.
+        /// </summary>
+        public bool TryDraftChainBatch(IReadOnlyList<string> requestIds, int[][] tokens, float[][] hRows, int[] starts, int[] maxTokens,
+            float[] stopBelow, int[][] draftOut, float[][] probOut, int[] stepsOut)
+        {
+            int lanes = requestIds.Count, width = DraftFeatureWidth, widest = 0;
+            if (lanes < 1 || !SupportsBatchedDraftChain || _slots == null) return false;
+            for (int s = 0; s < lanes; s++)
+            {
+                int rows = tokens[s].Length;
+                if (rows < 1 || hRows[s] == null || hRows[s].LongLength < (long)rows * width)
+                    throw new ArgumentException($"Lane {s}: {rows} draft rows need {(long)rows * width} hidden floats.", nameof(hRows));
+                if (maxTokens[s] < 1 || draftOut[s].Length < maxTokens[s] || probOut[s].Length < maxTokens[s])
+                    throw new ArgumentException($"Lane {s} cannot draft {maxTokens[s]} tokens into its outputs.", nameof(maxTokens));
+                widest = Math.Max(widest, rows);
+            }
+            RestorePrimaryCache();
+            var slots = new Slot[lanes];
+            var reach = new int[lanes];
+            for (int s = 0; s < lanes; s++)
+            {
+                if (!_slots.TryGetValue(requestIds[s], out slots[s]) || slots[s].K == null || slots[s].VerifyRows != 0)
+                    return false;
+                for (int o = 0; o < s; o++)
+                    if (ReferenceEquals(slots[o], slots[s])) return false;
+                // The padded first step's rows, and the chain's: its anchor (the lane's last row), then a row a draft.
+                long end = (long)starts[s] + Math.Max(widest, tokens[s].Length - 1 + maxTokens[s]);
+                if (end > _maxContextLength) return false;
+                reach[s] = (int)end;
+            }
+            for (int s = 0; s < lanes; s++)
+            {
+                EnsureSlotCapacity(slots[s], reach[s]);
+                slots[s].DraftFollowed = -1;   // the layer's rows from here on are the speculator's, as a single chain's
+            }
+
+            int[] floors = Array.Exists(slots, slot => slot.DraftStart > 0) ? Array.ConvertAll(slots, slot => slot.DraftStart) : null;
+            Array.Clear(stepsOut, 0, lanes);
+            var running = new List<int>(lanes);
+            for (int s = 0; s < lanes; s++) running.Add(s);
+            var position = (int[])starts.Clone();
+            var chainToken = new int[lanes];
+            var chainRow = new float[lanes][];
+            bool first = true;
+            while (running.Count > 0)
+            {
+                int m = running.Count, count = first ? widest : 1;
+                var flatTokens = new int[m * count];
+                var flatRows = new float[(long)m * count * width];
+                var laneSlots = new Slot[m];
+                var laneFirst = new int[m];
+                var laneCounts = new int[m];
+                var laneStarts = new int[m];
+                var laneLast = new int[m];
+                int[] laneFloors = floors == null ? null : new int[m];
+                for (int j = 0; j < m; j++)
+                {
+                    int s = running[j], real = first ? tokens[s].Length : 1, at = j * count;
+                    laneSlots[j] = slots[s];
+                    laneFirst[j] = at;
+                    laneCounts[j] = count;
+                    laneStarts[j] = position[s];
+                    laneLast[j] = at + real - 1;
+                    if (laneFloors != null) laneFloors[j] = floors[s];
+                    if (first)
+                    {
+                        Array.Copy(tokens[s], 0, flatTokens, at, real);
+                        Array.Copy(hRows[s], 0, flatRows, (long)at * width, (long)real * width);
+                    }
+                    else
+                    {
+                        flatTokens[at] = chainToken[s];
+                        Array.Copy(chainRow[s], 0, flatRows, (long)at * width, width);
+                    }
+                    for (int r = real; r < count; r++)
+                    {
+                        flatTokens[at + r] = flatTokens[at + real - 1];
+                        Array.Copy(flatRows, (long)(at + real - 1) * width, flatRows, (long)(at + r) * width, width);
+                    }
+                }
+                if (laneFloors != null && Array.TrueForAll(laneFloors, f => f == 0)) laneFloors = null;
+                float[] ids, top, final;
+                try
+                {
+                    if (!RunDraftLanes(flatTokens, flatRows, laneSlots, laneFirst, laneCounts, laneStarts, laneLast, laneFloors,
+                            out ids, out top, out final))
+                    {
+                        if (first) return false;   // nothing ran
+                        break;                     // the lanes keep the steps they drafted
+                    }
+                }
+                catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
+                {
+                    // The lanes' rows want more compute memory than one lane's: each drafts on its own instead, from the
+                    // stash its speculator still holds (what this pass wrote is past each lane's anchor or its own fold).
+                    FreeGraphMemory();
+                    return false;
+                }
+                var next = new List<int>(m);
+                for (int j = 0; j < m; j++)
+                {
+                    int s = running[j], k = stepsOut[s];
+                    float prob = TensorSharp.Runtime.Speculative.DraftHeadSpeculator.TopConfidence(top.AsSpan(j * DraftTopK, DraftTopK));
+                    draftOut[s][k] = (int)ids[j * DraftTopK];
+                    probOut[s][k] = prob;
+                    stepsOut[s] = ++k;
+                    if (prob < stopBelow[s] || k >= maxTokens[s]) continue;
+                    chainToken[s] = draftOut[s][k - 1];
+                    chainRow[s] ??= new float[width];
+                    Array.Copy(final, (long)j * width, chainRow[s], 0, width);
+                    position[s] += first ? tokens[s].Length : 1;
+                    next.Add(s);
+                }
+                running = next;
+                first = false;
+            }
+            BatchedDraftChains++;
+            return true;
+        }
+
+        /// <summary>One draft-layer forward over <paramref name="slots"/> (lane j's rows from <paramref name="first"/>[j], attending
+        /// its slot from <paramref name="floors"/>[j]; null: none floored): each lane's ten largest logits as ids and values from
+        /// its row <paramref name="last"/>[j], and the row it chains. False when the lowering met a case it does not express
+        /// (nothing ran).</summary>
+        private bool RunDraftLanes(int[] tokens, float[] rows, Slot[] slots, int[] first, int[] counts, int[] starts, int[] last,
+            int[] floors, out float[] ids, out float[] top, out float[] chained)
+        {
+            ids = top = chained = null;
+            int lanes = slots.Length, n = tokens.Length, width = DraftFeatureWidth;
+            CachedGraph graph = null;
+            bool owned = false;
+            Tensor embedded = null, hidden = null;
+            _forwardSw.Start();
+            try
+            {
+                EnterStage(StageOfLayer(Config.NumLayers));
+                embedded = DraftEmbedding(tokens);
+                hidden = CreateFloatTensor(rows, n, width);
+                _draftLaneLast = last;
+                graph = RunTraced(n, slots, first, counts, starts, replayable: counts[0] <= SmallChunkRows, snapshots: false, attentionFloor: 0,
+                    step => EmitDraftLanes(step, embedded, hidden), out StepOutputs outputs, out owned,
+                    shape: DraftLanesShape, advanceInputs: new[] { embedded, hidden }, attentionFloors: floors);
+                if (graph == null) return false;
+                ids = graph.Outputs[outputs.Logits][..(lanes * DraftTopK)];
+                top = graph.Outputs[outputs.Hidden][..(lanes * DraftTopK)];
+                chained = graph.Outputs[outputs.Final][..(lanes * width)];
+                return true;
+            }
+            finally
+            {
+                if (owned) graph?.Dispose();
+                embedded?.Dispose();
+                hidden?.Dispose();
+                EnterStage(0);
+                _forwardSw.Stop();
+            }
+        }
+
+        /// <summary>Trace a batched chain step: the draft layer over every lane's rows (each lane's attention on its own slot),
+        /// then the head over each lane's last real row (<see cref="_draftLaneLast"/>), its ten largest logits as ids and
+        /// values, and the row it chains (as <see cref="EmitDraftLayer"/> traces one lane's top step).</summary>
+        private StepOutputs EmitDraftLanes(GraphStep step, Tensor embedded, Tensor hidden)
+        {
+            int rows = step.Rows, lanes = step.Sequences, hiddenSize = Config.HiddenSize, n = Config.NumLayers, width = DraftFeatureWidth;
+            var outputs = new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
+            var positions = new int[rows];
+            for (int s = 0; s < lanes; s++)
+                for (int i = 0; i < step.Counts[s]; i++) positions[step.First[s] + i] = step.Starts[s] + i + step.Slots[s].RopeDelta;
+            step.SetPositions(positions);
+            int x = EmitDraftInput(step, n, step.HiddenInput(embedded, hiddenSize, rows), step.HiddenInput(hidden, width, rows));
+            int normed = EmitBlockInput(step, n, x, BlockSite.Mixer, out int mixContext);
+            x = EmitBlockOutput(step, n, x, BlockSite.Mixer, mixContext, EmitAttention(step, n, normed));
+            int ffnIn = EmitBlockInput(step, n, x, BlockSite.Ffn, out int ffnContext);
+            x = EmitBlockOutput(step, n, x, BlockSite.Ffn, ffnContext, _moeLayer[n] ? EmitMoe(step, n, ffnIn) : EmitDenseFfn(step, n, ffnIn));
+            // Each lane's last real row (a lane padded to the step's width has rows past it); a step run again as the kept one
+            // advanced takes this run's rows.
+            var selected = (int[])_draftLaneLast.Clone();
+            int at = step.InputI32(selected, lanes);
+            step.RefillOnAdvance(at, () =>
+            {
+                Array.Copy(_draftLaneLast, selected, lanes);
+                return true;
+            });
+            int last = step.Op(GraphOp.GetRows, x, at);
+            int head = EmitDraftHead(step, n, last, lanes);
+            outputs.Final = step.Output(DraftChainsStream ? last : head, (long)width * lanes);
+            int vocab = ScoredDraftVocabulary;
+            string headWeight = DraftHeadWeight;
+            int logits = vocab < Config.VocabSize ? step.MatMulRows(headWeight, 0, vocab, head, alone: true) : step.MatMul(headWeight, head);
+            // Each lane's ten largest logits, as ids (a tie to the lower id) [10, lanes] and values.
+            int ids = step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { DraftTopK }));
+            outputs.Logits = step.Output(ids, (long)DraftTopK * lanes);
+            outputs.Hidden = step.Output(step.Op(GraphOp.GetRows, step.Reshape(logits, 1, vocab, lanes), ids), (long)DraftTopK * lanes);
+            return outputs;
+        }
+
+        /// <summary>The draft head's own output weight, else the trunk's head (tied to the embedding without one).</summary>
+        private string DraftHeadWeight => HasWeight(LayerName(Config.NumLayers, "nextn.shared_head_head.weight"))
+            ? LayerName(Config.NumLayers, "nextn.shared_head_head.weight") : HasWeight("output.weight") ? "output.weight" : "token_embd.weight";
 
         /// <summary>A draft step folds into the catch-up over the accepted rows (one graph).</summary>
         public bool SupportsFusedCatchUpStep => HasDraftLayer && !HasDFlash;

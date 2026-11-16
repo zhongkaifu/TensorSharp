@@ -147,13 +147,16 @@ namespace TensorSharp.Models
         /// gate tuned on sparse-MoE trunks cost speed (M5 Pro, Qwen3.8-27B UD-IQ3_XXS + DFlash2,
         /// 1,224 greedy tokens: 5 / no gate 28.9 tok/s, 7 / 0 28.5, 7 / 0.35 24.8, 3 / 0.35 26.1,
         /// plain 20.5); 7 on ggml_cuda, the most rows its matvec kernel serves (RTX Spark N1X,
-        /// coding workload: 7 beat 5 and 3 on every turn); 3 elsewhere and for other drafters.
-        /// Attention-only stacks take the speculator's own default.
+        /// coding workload: 7 beat 5 and 3 on every turn); the speculator's default (8) on direct CUDA, as the direct
+        /// engine drafted (Qwen3.8-27B + DFlash2 on an RTX PRO 4000, 256 greedy tokens: 92.8 / 86.3 tok/s short / after a
+        /// 4K prompt, against 77.4 / 79.5 at 3; four Web UI conversations at once 28.3 tok/s each, the engine 27.9); 3
+        /// elsewhere and for other drafters. Attention-only stacks take the speculator's own default.
         /// </summary>
         public virtual int SpecPreferredDraftWindow => !_anyRecurrent ? 0
             : !HasDFlash ? 3
             : _backend == BackendType.GgmlCuda ? 7
-            : _backend == BackendType.GgmlMetal ? 5 : 3;
+            : _backend == BackendType.GgmlMetal ? 5
+            : _backend == BackendType.Cuda ? 0 : 3;
 
         /// <summary>
         /// Weight-free n-gram drafts on a dense hybrid stack on ggml_metal whose matmul weights are mostly

@@ -1576,6 +1576,48 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.Equal(0, hindered.InjectedForwardAllocationFailures);
     }
 
+    /// <summary>The NextN layer's draft chains of several requests run as one draft-layer forward a step over their slots
+    /// (each lane's final-normed row chained, where qwen4exp chains its stream): each lane drafts what its own chain does,
+    /// on the managed CPU through the test seam and on the CUDA executor.</summary>
+    [Fact]
+    public void BatchedDraftChainDraftsEachLanesChain() => AssertBatchedDraftChain(BackendType.Cpu);
+
+    [CudaFact]
+    public void BatchedDraftChainDraftsEachLanesChainOnDirectCuda() => AssertBatchedDraftChain(BackendType.Cuda);
+
+    private void AssertBatchedDraftChain(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        SpeculativeRuntimeChecks.AssertBatchedDraftChainDraftsEachLane(() =>
+        {
+            Qwen35RuntimeModel model = Create(path, backend: backend);
+            model.DraftChainForTests = backend == BackendType.Cpu;
+            return model;
+        }, $"qwen35 nextn {backend}", backend == BackendType.Cpu ? 1e-5 : 1e-3);
+    }
+
+    /// <summary>Three requests speculating with the NextN layer through the engine draft in one pass a step, and emit
+    /// what plain decoding and drafting one request at a time emit.</summary>
+    [Fact]
+    public Task BatchedDraftChainsSpeculateAsEachRequest() => AssertBatchedDraftChains(BackendType.Cpu);
+
+    [CudaFact]
+    public Task BatchedDraftChainsSpeculateAsEachRequestOnDirectCuda() => AssertBatchedDraftChains(BackendType.Cuda);
+
+    private async Task AssertBatchedDraftChains(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = 0 };
+        await SpeculativeRuntimeChecks.AssertBatchedDraftChainsDraftAsEachRequest(() =>
+        {
+            Qwen35RuntimeModel model = Create(path, backend: backend);
+            model.DraftChainForTests = backend == BackendType.Cpu;
+            return model;
+        }, options, $"qwen35 nextn {backend}");
+    }
+
     /// <summary>The draft layer follows a speculating request's plain prompt (the trunk's own steps hand it their rows):
     /// its first draft is the one the speculator's catch-up over the same rows gives.</summary>
     [Fact]

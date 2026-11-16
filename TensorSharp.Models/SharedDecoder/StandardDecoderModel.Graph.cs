@@ -300,6 +300,8 @@ namespace TensorSharp.Models
             public RecurrentState[][][] Recurrent;
             public int[] Capacity, RopeDelta, Starts;
             public int Floor;
+            /// <summary>Each sequence's floor where they differ (GraphStep.AttentionFloors); null: <see cref="Floor"/>.</summary>
+            public int[] Floors;
             public string Shape;
             public long Epoch;
             /// <summary><see cref="RecurrentState.BindingChanges"/> when the step was kept.</summary>
@@ -335,7 +337,7 @@ namespace TensorSharp.Models
             {
                 Step = step, Graph = graph, Signature = step.Signature, Structure = step.StructuralSignature, Outputs = outputs, Slots = (Slot[])slots.Clone(),
                 K = new Tensor[n][][], V = new Tensor[n][][], Recurrent = new RecurrentState[n][][], Capacity = new int[n], RopeDelta = new int[n],
-                Starts = (int[])starts.Clone(), Floor = floor, Shape = shape, Epoch = _graphEpoch,
+                Starts = (int[])starts.Clone(), Floor = floor, Floors = (int[])step.AttentionFloors?.Clone(), Shape = shape, Epoch = _graphEpoch,
                 Bindings = System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges),
             };
             for (int s = 0; s < n; s++)
@@ -628,7 +630,7 @@ namespace TensorSharp.Models
         {
             // A floored step (the draft layer after a restored checkpoint) runs as usual: some decode kernels read the
             // recorded length as the count of keys past the floor.
-            if (r.CaptureFailed || DecodeCaptureDisabled || r.Floor > 0 || GraphExecutor is not IDecodeCaptureExecutor recorder
+            if (r.CaptureFailed || DecodeCaptureDisabled || r.Floor > 0 || AnyFloor(r.Floors) || GraphExecutor is not IDecodeCaptureExecutor recorder
                 || slots.Length > recorder.MaxRecordedSequences
                 || cached.Plan is not IGraphTensorOutputs keep || (_expertHost != null && !GraphExecutor.Capabilities.RecordsHostExperts))
                 return false;   // (a step whose host experts read the routes back mid-step cannot be recorded)
@@ -766,13 +768,14 @@ namespace TensorSharp.Models
         /// rewritten in place (positions, write rows, masks, the embedded rows); the cached graph's signature is the
         /// one the trace would compute. A trace was ~2% of a decode step (Qwen3.6-35B-A3B on an M5 Pro: 0.28 of 15 ms).
         /// </summary>
-        private bool TryAdvanceDecode(Slot[] slots, int[] starts, int floor, string shape, Tensor[] hidden,
+        private bool TryAdvanceDecode(Slot[] slots, int[] starts, int floor, int[] floors, string shape, Tensor[] hidden,
             out CachedGraph graph, out StepOutputs outputs)
         {
             graph = null;
             outputs = default;
             DecodeReplay r = _decodeReplays.GetValueOrDefault(shape ?? "");
-            if (r == null || r.Epoch != _graphEpoch || r.Floor != floor || r.Shape != shape || r.Slots.Length != slots.Length)
+            if (r == null || r.Epoch != _graphEpoch || r.Floor != floor || !SameFloors(r.Floors, floors) || r.Shape != shape
+                || r.Slots.Length != slots.Length)
                 return false;
             if (r.Bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges))
             {
@@ -823,6 +826,12 @@ namespace TensorSharp.Models
             outputs = r.Outputs;
             return true;
         }
+
+        /// <summary>Whether any sequence has an attention floor (<paramref name="floors"/> null: none of its own).</summary>
+        private static bool AnyFloor(int[] floors) => floors != null && Array.Exists(floors, f => f > 0);
+
+        private static bool SameFloors(int[] a, int[] b)
+            => ReferenceEquals(a, b) || (a != null && b != null && a.AsSpan().SequenceEqual(b));
 
         private void ClearGraphCache()
         {
@@ -1062,9 +1071,12 @@ namespace TensorSharp.Models
         /// </summary>
         /// <param name="advanceHidden">The step's embedded rows, when a decode step may run as the previous one
         /// advanced (<see cref="TryAdvanceDecode"/>) instead of being traced.</param>
+        /// <param name="attentionFloors">Each sequence's attention floor in place of <paramref name="attentionFloor"/>
+        /// (GraphStep.AttentionFloors), or null.</param>
         private CachedGraph RunTraced(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
             bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned,
-            bool deviceOutputs = false, string shape = null, Tensor advanceHidden = null, Tensor[] advanceInputs = null)
+            bool deviceOutputs = false, string shape = null, Tensor advanceHidden = null, Tensor[] advanceInputs = null,
+            int[] attentionFloors = null)
         {
             // A drafter's steps (IGraphExecutor.Drafting): its proposals are verified, so its products may take kernels whose
             // last bits vary (the direct engines ran their drafters' Q4_K products on the int8 tensor cores).
@@ -1074,7 +1086,7 @@ namespace TensorSharp.Models
             try
             {
                 return RunTracedAs(rows, slots, first, counts, starts, replayable, snapshots, attentionFloor, emit, out outputs, out owned,
-                    deviceOutputs, shape, advanceHidden, advanceInputs);
+                    deviceOutputs, shape, advanceHidden, advanceInputs, attentionFloors);
             }
             finally
             {
@@ -1084,7 +1096,7 @@ namespace TensorSharp.Models
 
         private CachedGraph RunTracedAs(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
             bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned,
-            bool deviceOutputs, string shape, Tensor advanceHidden, Tensor[] advanceInputs)
+            bool deviceOutputs, string shape, Tensor advanceHidden, Tensor[] advanceInputs, int[] attentionFloors)
         {
             GraphStep step = null;
             CachedGraph graph = null;
@@ -1097,7 +1109,7 @@ namespace TensorSharp.Models
                 && !DecodeAdvanceDisabled && GraphExecutor.Capabilities.Replays && counts.Length > 0 && counts[0] >= 1
                 && counts[0] <= MaxAdvancedWindowRows && Array.TrueForAll(counts, c => c == counts[0]) && (counts[0] > 1 || !snapshots);
             string replayShape = advance && (counts[0] > 1 || snapshots) ? $"{shape}|w{counts[0]}|{(snapshots ? "s" : "")}" : shape;
-            if (advance && TryAdvanceDecode(slots, starts, attentionFloor, replayShape, advancing, out graph, out outputs))
+            if (advance && TryAdvanceDecode(slots, starts, attentionFloor, attentionFloors, replayShape, advancing, out graph, out outputs))
                 return graph;
             try
             {
@@ -1110,7 +1122,8 @@ namespace TensorSharp.Models
                 {
                     // Everything that changes what the step emits: a stream frees each node after the template's
                     // last reader, so a step that emits differently (other outputs, another stage) must not share it.
-                    kind = $"{rows}|{slots.Length}|{snapshots}|{attentionFloor > 0}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}|{EmissionVariant(counts, starts)}";
+                    string floored = attentionFloors == null ? $"{attentionFloor > 0}" : string.Concat(Array.ConvertAll(attentionFloors, f => f > 0 ? '1' : '0'));
+                    kind = $"{rows}|{slots.Length}|{snapshots}|{floored}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}|{EmissionVariant(counts, starts)}";
                     // A decode step that could advance runs as the recorded program instead, so it is kept for the next
                     // step to advance (a streamed step keeps nothing: decode would re-emit every node of every step).
                     if (_streamedKinds.Contains(kind) && !advance)
@@ -1120,7 +1133,7 @@ namespace TensorSharp.Models
                         graph = new CachedGraph { Plan = stream };
                         owned = true;
                         step = new GraphStep(this, rows, slots, first, counts, starts, false, snapshots, record: false)
-                            { AttentionFloor = attentionFloor, Sink = stream };
+                            { AttentionFloor = attentionFloor, AttentionFloors = attentionFloors, Sink = stream };
                         StepOutputs emitted = default;
                         GraphStep streamed = step;
                         bool ok = stream.Execute(() =>
@@ -1138,7 +1151,8 @@ namespace TensorSharp.Models
                 }
                 if (replayable && _graphCache.Count > 0)
                 {
-                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, snapshots, record: false) { AttentionFloor = attentionFloor };
+                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, snapshots, record: false)
+                        { AttentionFloor = attentionFloor, AttentionFloors = attentionFloors };
                     outputs = emit(step);
                     if (_graphCache.TryGetValue(step.Signature, out graph))
                     {
@@ -1154,7 +1168,8 @@ namespace TensorSharp.Models
                 }
                 if (graph == null)
                 {
-                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, snapshots, record: true) { AttentionFloor = attentionFloor };
+                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, snapshots, record: true)
+                        { AttentionFloor = attentionFloor, AttentionFloors = attentionFloors };
                     outputs = emit(step);
                     graph = step.Build(replayable, reorder: replayable && GraphConcurrencyReorder);
                     GraphBuilds++;
@@ -2086,7 +2101,7 @@ namespace TensorSharp.Models
                         kAttn = step.Op(GraphOp.Concat, stackalloc[] { kPrev, kFresh }, stackalloc long[] { 1 });
                         vAttn = step.Op(GraphOp.Concat, stackalloc[] { vPrev, vFresh }, stackalloc long[] { 1 });
                     }
-                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, step.CausalMask(start, count), start + count), scale);
+                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, step.CausalMask(start, count, s), start + count), scale);
                 }
                 int part = step.Reshape(fa, heads * dv, count);
                 attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
@@ -2312,7 +2327,7 @@ namespace TensorSharp.Models
             private readonly List<int> _inputs = new();
             private readonly List<IntPtr> _inputData = new();
             private readonly List<long> _inputBytes = new();
-            private int _mask = -1, _maskStart = -1, _maskCount = -1;
+            private int _mask = -1, _maskStart = -1, _maskCount = -1, _maskFloor = -1;
             private int _decodeMask = -1, _decodeMaskWindow = -1, _decodeMaskStart = -1, _decodeMaskCount = -1, _decodeMaskSequence = -1;
             // A chunk's write rows by (start, count): a step writes every sequence's chunk by index on executors that take
             // indexed cache writes at any width, and start * 64 + count had named (0, 2048) and (31, 64) alike.
@@ -2363,6 +2378,12 @@ namespace TensorSharp.Models
             public bool RecurrentSnapshots { get; }
             /// <summary>Cache rows below this are masked out (a draft layer that resumed after a gap).</summary>
             public int AttentionFloor { get; init; }
+            /// <summary>Each sequence's floor in place of <see cref="AttentionFloor"/> (a batched draft step's lanes, whose
+            /// layers resumed at different rows); null: <see cref="AttentionFloor"/> for every sequence.</summary>
+            public int[] AttentionFloors { get; init; }
+            /// <summary>The attention floor of sequence <paramref name="sequence"/> (-1: <see cref="AttentionFloor"/>).</summary>
+            public int FloorOf(int sequence)
+                => AttentionFloors != null && (uint)sequence < (uint)AttentionFloors.Length ? AttentionFloors[sequence] : AttentionFloor;
             /// <summary>Token positions [rows] (I32).</summary>
             public int Positions { get; private set; } = -1;
             /// <summary>The positions' values (row order).</summary>
@@ -2647,7 +2668,7 @@ namespace TensorSharp.Models
                     && _decodeMaskSequence == sequence)
                     return _decodeMask;
                 var mask = new ushort[(long)window * count];
-                FillChunkMask(mask, window, start, count);
+                FillCausalRows(mask, window, start, count, FloorOf(sequence));
                 _decodeMask = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(_decodeMask, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: window, start: start, count: count, sequence: sequence);
@@ -2658,17 +2679,20 @@ namespace TensorSharp.Models
                 return _decodeMask;
             }
 
-            /// <summary>A causal F16 mask [start + count, count] for a chunk continuing at <paramref name="start"/>.</summary>
-            public int CausalMask(int start, int count)
+            /// <summary>A causal F16 mask [start + count, count] for a chunk of sequence <paramref name="sequence"/> (-1: any)
+            /// continuing at <paramref name="start"/>.</summary>
+            public int CausalMask(int start, int count, int sequence = -1)
             {
-                if (_mask >= 0 && _maskStart == start && _maskCount == count) return _mask;
+                int floor = FloorOf(sequence);
+                if (_mask >= 0 && _maskStart == start && _maskCount == count && _maskFloor == floor) return _mask;
                 int kv = start + count;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
-                FillCausalRows(mask, kv, start, count);
+                FillCausalRows(mask, kv, start, count, floor);
                 _mask = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(_mask, Pin(mask), mask.LongLength * sizeof(ushort));
                 _maskStart = start;
                 _maskCount = count;
+                _maskFloor = floor;
                 return _mask;
             }
 
@@ -2685,16 +2709,14 @@ namespace TensorSharp.Models
             /// <summary>A streaming executor's sink: entries and input values go there as they are emitted.</summary>
             internal IGraphSink Sink { get => _b.Sink; init => _b.Sink = value; }
 
-            private void FillChunkMask(ushort[] mask, int window, int start, int count) => FillCausalRows(mask, window, start, count);
-
             /// <summary>An F16 causal mask [<paramref name="width"/>, <paramref name="count"/>] for rows continuing at
-            /// <paramref name="start"/>: row q is -inf before the attention floor and past start + q, zero between. Whole
-            /// rows are filled at once, large masks row-parallel (a 3.6K-row prompt chunk's is 26 MB: element loops took
-            /// ~10 ms of its trace).</summary>
-            private void FillCausalRows(ushort[] mask, int width, int start, int count)
+            /// <paramref name="start"/>: row q is -inf before the attention floor <paramref name="attentionFloor"/> and past
+            /// start + q, zero between. Whole rows are filled at once, large masks row-parallel (a 3.6K-row prompt chunk's is
+            /// 26 MB: element loops took ~10 ms of its trace).</summary>
+            private static void FillCausalRows(ushort[] mask, int width, int start, int count, int attentionFloor)
             {
                 const ushort negInf = 0xFC00;
-                int floor = Math.Min(AttentionFloor, width);
+                int floor = Math.Min(attentionFloor, width);
                 if ((long)width * count >= 1 << 20) System.Threading.Tasks.Parallel.For(0, count, Row);
                 else for (int q = 0; q < count; q++) Row(q);
 
@@ -2711,9 +2733,9 @@ namespace TensorSharp.Models
             /// <summary>A causal mask of <see cref="FillCausalRows"/> for rows continuing at <paramref name="from"/>, moved on to
             /// <paramref name="to"/>: the cells each row opens since cleared, the rest as they are (the same values a fill at
             /// <paramref name="to"/> writes). A decode window as wide as its slot had been filled whole at every step.</summary>
-            private void OpenCausalRows(ushort[] mask, int width, int from, int to, int count)
+            private static void OpenCausalRows(ushort[] mask, int width, int from, int to, int count, int attentionFloor)
             {
-                int floor = Math.Min(AttentionFloor, width);
+                int floor = Math.Min(attentionFloor, width);
                 for (int q = 0; q < count; q++)
                 {
                     int lo = Math.Max(floor, Math.Min(width, from + q + 1)), hi = Math.Min(width, to + q + 1);
@@ -2855,7 +2877,7 @@ namespace TensorSharp.Models
                         case InputKind.DecodeMask:
                         {
                             int d = Delta(m.Sequence);
-                            OpenCausalRows((ushort[])m.Values, m.Window, m.Start, m.Start + d, m.Count);
+                            OpenCausalRows((ushort[])m.Values, m.Window, m.Start, m.Start + d, m.Count, FloorOf(m.Sequence));
                             _inputMeta[i] = m with { Start = m.Start + d };
                             break;
                         }
@@ -3136,7 +3158,7 @@ namespace TensorSharp.Models
                 if (_maskBindings != null && _maskBindings.TryGetValue(input, out var bound) && ReferenceEquals(bound.Stable, stable)
                     && bound.Start <= m.Start)
                 {
-                    int floor = Math.Min(AttentionFloor, m.Window);
+                    int floor = Math.Min(FloorOf(m.Sequence), m.Window);
                     for (int q = 0; q < m.Count; q++)
                     {
                         int lo = Math.Max(floor, Math.Min(m.Window, bound.Start + q + 1)), hi = Math.Min(m.Window, m.Start + q + 1);

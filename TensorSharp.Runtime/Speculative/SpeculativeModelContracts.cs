@@ -552,6 +552,29 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Width of the proposal block <see cref="TryDraftBatch"/> fills per sequence.</summary>
         int BatchDraftBlockWidth => 0;
 
+        /// <summary>Whether <see cref="TryDraftChainBatch"/> runs the per-token draft head chains
+        /// (<see cref="IDraftHead.DraftChain"/>) of several sequences in one pass.</summary>
+        bool SupportsBatchedDraftChain => false;
+
+        /// <summary>Whether <paramref name="requestId"/>'s draft head can join a <see cref="TryDraftChainBatch"/> pass now;
+        /// a sequence that cannot drafts on its own.</summary>
+        bool CanBatchDraftChain(string requestId) => false;
+
+        /// <summary>
+        /// The per-token draft chains of several sequences in one pass, each over its own drafter state: lane i runs
+        /// <paramref name="tokens"/>[i] (the verified rows its head folds in, then its anchor; row k of
+        /// <paramref name="hRows"/>[i] is the trunk row before token k) at <paramref name="starts"/>[i], and then one row a
+        /// step for each lane still drafting, as <see cref="IDraftHead.DraftChain"/> chains one sequence: each step's
+        /// first-max token and the head's own hidden output. Fills <paramref name="draftOut"/>[i] and
+        /// <paramref name="probOut"/>[i] (the top-1 probability over the step's ten largest logits) with
+        /// <paramref name="stepsOut"/>[i] steps, at most <paramref name="maxTokens"/>[i], a lane stopping after its first
+        /// step below <paramref name="stopBelow"/>[i]. False when the head cannot batch these lanes; the caller then drafts
+        /// each on its own from the same inputs (rows a declined pass wrote are past each lane's anchor or its own fold,
+        /// which that draft writes again).
+        /// </summary>
+        bool TryDraftChainBatch(IReadOnlyList<string> requestIds, int[][] tokens, float[][] hRows, int[] starts, int[] maxTokens,
+            float[] stopBelow, int[][] draftOut, float[][] probOut, int[] stepsOut) => false;
+
         /// <summary>The verify takes exactly the longest draft plus its anchor (one row when nothing was drafted),
         /// rather than a few fixed widths: a trunk whose graphs replay per width, where a padded row costs a row
         /// (Qwen3.8-Flash-Next MTP on ggml_metal: a 4-row window for a step that drafted nothing cost 100 ms, the

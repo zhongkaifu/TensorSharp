@@ -3452,8 +3452,11 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             // Draft every sequence's block in one pass when the drafter can; otherwise
-            // (or if the batched pass declines) one draft per sequence.
+            // (or if the batched pass declines) one draft per sequence. Per-token draft
+            // heads chain in one pass the same way, and a sequence that cannot join that
+            // pass drafts on its own.
             bool draftedTogether = false;
+            bool[]? chained = null;
             int blockWidth = batched.BatchDraftBlockWidth;
             if (blockWidth > 0)
             {
@@ -3492,10 +3495,16 @@ namespace TensorSharp.Runtime.Scheduling
                             ctxs[lanes[j]].Exec.AcceptBatchDraft(blockTokens[j], blockConf[j], caps[j], drafts[lanes[j]], share);
                 }
             }
+            else if (n >= 2 && batched.SupportsBatchedDraftChain)
+            {
+                chained = TryBatchedDraftChain(batched, ctxs, requestIds, anchors, positions, kMaxes, drafts);
+            }
             if (!draftedTogether)
             {
                 for (int i = 0; i < n; i++)
                 {
+                    if (chained != null && chained[i])
+                        continue;
                     batched.BindDraftState(requestIds[i]);
                     ctxs[i].Exec.ProposeForBatch(anchors[i], positions[i], kMaxes[i], drafts[i]);
                 }
@@ -3678,6 +3687,66 @@ namespace TensorSharp.Runtime.Scheduling
                     $"verify={Ms(verified - drafted):F1} commit={Ms(committed - verified):F1} drafter={Ms(done - committed):F1} ms");
             }
             return true;
+        }
+
+        /// <summary>
+        /// The per-token draft heads of a batched step's sequences chained in one pass
+        /// (<see cref="IBatchedSpeculativeTarget.TryDraftChainBatch"/>), each from the rows its own draft would start with:
+        /// drafted one at a time, four Qwen3.8 Flash Next MTP conversations on an A40 spent 6.3 ms of a 43.4 ms step in four
+        /// draft runs, each one's readback waited for. Returns which sequences the pass drafted, or null when it drafted none
+        /// (fewer than two could join, or the model declined); the others draft on their own.
+        /// </summary>
+        private static bool[]? TryBatchedDraftChain(IBatchedSpeculativeTarget batched, SpecSeqContext[] ctxs, string[] requestIds,
+            int[] anchors, int[] positions, int[] kMaxes, List<int>[] drafts)
+        {
+            int n = ctxs.Length;
+            var lanes = new List<int>(n);
+            var tokens = new List<int[]>(n);
+            var rows = new List<float[]>(n);
+            var starts = new List<int>(n);
+            var caps = new List<int>(n);
+            for (int i = 0; i < n; i++)
+            {
+                if (kMaxes[i] <= 0 || !ctxs[i].Exec.SupportsBatchChain || !batched.CanBatchDraftChain(requestIds[i]))
+                    continue;
+                // Preparing reads (and may take) the drafter's held carry and replays a stash that cannot fold.
+                batched.BindDraftState(requestIds[i]);
+                if (!ctxs[i].Exec.TryPrepareBatchChain(anchors[i], positions[i], kMaxes[i],
+                        out int[]? laneTokens, out float[]? laneRows, out int start, out int cap))
+                    continue;
+                lanes.Add(i);
+                tokens.Add(laneTokens);
+                rows.Add(laneRows);
+                starts.Add(start);
+                caps.Add(cap);
+            }
+            if (lanes.Count < 2)
+                return null;
+            int m = lanes.Count;
+            var laneIds = new string[m];
+            var gates = new float[m];
+            var ids = new int[m][];
+            var probs = new float[m][];
+            var steps = new int[m];
+            for (int j = 0; j < m; j++)
+            {
+                laneIds[j] = requestIds[lanes[j]];
+                gates[j] = ctxs[lanes[j]].Exec.MinDraftProb;
+                ids[j] = new int[caps[j]];
+                probs[j] = new float[caps[j]];
+            }
+            long t0 = Stopwatch.GetTimestamp();
+            if (!batched.TryDraftChainBatch(laneIds, tokens.ToArray(), rows.ToArray(), starts.ToArray(), caps.ToArray(), gates,
+                    ids, probs, steps))
+                return null;
+            long share = (Stopwatch.GetTimestamp() - t0) / m;
+            var drafted = new bool[n];
+            for (int j = 0; j < m; j++)
+            {
+                ctxs[lanes[j]].Exec.AcceptBatchChain(ids[j], probs[j], steps[j], drafts[lanes[j]], share);
+                drafted[lanes[j]] = true;
+            }
+            return drafted;
         }
 
         /// <summary>Emit a batched-speculation lane's anchor that ends its sequence (a stop

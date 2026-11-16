@@ -242,7 +242,7 @@ namespace TensorSharp.Models
         protected override bool BeginWindowAttention(GraphStep step, int layer, int x, int s, in WindowAttentionOperands attention)
         {
             int ratio = QsaRatio(layer);
-            if (ratio <= 0 || step.Starts[s] + step.Counts[s] <= Ple.QsaBudget || step.PositionTable >= 0 || step.AttentionFloor > 0
+            if (ratio <= 0 || step.Starts[s] + step.Counts[s] <= Ple.QsaBudget || step.PositionTable >= 0 || step.FloorOf(s) > 0
                 || QsaRegionDisabledForTests)
                 return false;
             // A decode row or verify window answers as its rows decoded alone (speculation stays lossless): one that straddles

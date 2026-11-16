@@ -69,6 +69,33 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         AssertClose(expected, actual, 2e-2, "mlx");
     }
 
+    /// <summary>Where each row reads its own experts (64 routed, 4 a row), several sequences' verify windows share eight
+    /// rows (two sequences 4 each, three or four 2, five or more decode plainly: 0), as the direct engine's budget did; a
+    /// lone sequence, and a pool a few rows read whole (16 routed, 4 a row), keep the whole window.</summary>
+    [Fact]
+    public void BatchedVerifyWindowsShareEightRowsWhereRowsReadTheirOwnExperts()
+    {
+        string wide = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-64x4.gguf"), qsa: false, expertCount: 64, expertUsedCount: 4);
+        string small = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-16x4.gguf"), qsa: false);
+        int whole;
+        using (var model = new Qwen4ExpRuntimeModel(small, BackendType.Cpu))
+        {
+            var batched = (TensorSharp.Runtime.Speculative.IBatchedSpeculativeTarget)model;
+            whole = batched.BatchedSpecWindow(1);
+            Assert.True(whole >= 4, $"a lone sequence's window is {whole} rows");
+            Assert.Equal(whole, batched.BatchedSpecWindow(4));
+        }
+        using (var model = new Qwen4ExpRuntimeModel(wide, BackendType.Cpu))
+        {
+            var batched = (TensorSharp.Runtime.Speculative.IBatchedSpeculativeTarget)model;
+            Assert.Equal(whole, batched.BatchedSpecWindow(1));
+            Assert.Equal(4, batched.BatchedSpecWindow(2));
+            Assert.Equal(2, batched.BatchedSpecWindow(3));
+            Assert.Equal(2, batched.BatchedSpecWindow(4));
+            Assert.Equal(0, batched.BatchedSpecWindow(5));
+        }
+    }
+
     /// <summary>TS_Q4E_HC_Q8=1 on the shared runtime: the BF16 hyper-connection matrices become Q8_0 at load for every
     /// backend (the managed CPU here), and the answers stay within Q8_0's rounding of the BF16 read.</summary>
     [Fact]
@@ -653,6 +680,57 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         var gated = Draft(chain: true, stopBelow: gate);
         Assert.Equal(expect, gated.Count);
         Assert.Equal(plain.Ids.Take(expect), gated.Ids.Take(expect));
+    }
+
+    /// <summary>The MTP head's draft chains of several requests run as one draft-layer forward a step over their slots
+    /// (IBatchedSpeculativeTarget.TryDraftChainBatch, lanes padded to one row count): each lane drafts what its own chain
+    /// drafts and leaves its slot as its chain does, on the managed CPU (whose executor reads the chain's top ten back as
+    /// its values, through the test seam) and on the CUDA executor, where chains run in production.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BatchedDraftChainDraftsEachLanesChain(bool qsa) => AssertBatchedDraftChain(qsa, BackendType.Cpu);
+
+    [CudaTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BatchedDraftChainDraftsEachLanesChainOnDirectCuda(bool qsa) => AssertBatchedDraftChain(qsa, BackendType.Cuda);
+
+    private void AssertBatchedDraftChain(bool qsa, BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        SpeculativeRuntimeChecks.AssertBatchedDraftChainDraftsEachLane(
+            () => new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp) { DraftChainForTests = backend == BackendType.Cpu },
+            $"qwen4exp mtp qsa={qsa} {backend}", backend == BackendType.Cpu ? 1e-5 : 1e-3);
+    }
+
+    /// <summary>Three requests speculating with the MTP head through the engine's unified step draft in one pass a step:
+    /// the streams are plain decoding's and those of the requests drafting one at a time, and each request drafts and keeps
+    /// what it does alone, with every draft kept (gate 0) and with the gate stopping lanes' chains at different steps.</summary>
+    [Theory]
+    [InlineData(false, 0f)]
+    [InlineData(true, 0f)]
+    [InlineData(false, 0.2f)]
+    public Task BatchedDraftChainsSpeculateAsEachRequest(bool qsa, float gate) => AssertBatchedDraftChains(qsa, gate, BackendType.Cpu);
+
+    [CudaTheory]
+    [InlineData(false, 0f)]
+    [InlineData(true, 0f)]
+    [InlineData(false, 0.2f)]
+    public Task BatchedDraftChainsSpeculateAsEachRequestOnDirectCuda(bool qsa, float gate) => AssertBatchedDraftChains(qsa, gate, BackendType.Cuda);
+
+    private async Task AssertBatchedDraftChains(bool qsa, float gate, BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        (string target, string mtp) = SpecFixtures(qsa);
+        var options = new TensorSharp.Runtime.Speculative.SpeculationOptions
+        {
+            Enabled = true, SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.DraftHead, MaxDraftTokens = 3, MinDraftProb = gate,
+        };
+        await SpeculativeRuntimeChecks.AssertBatchedDraftChainsDraftAsEachRequest(
+            () => new Qwen4ExpRuntimeModel(target, backend, draftModelPath: mtp) { DraftChainForTests = backend == BackendType.Cpu },
+            options, $"qwen4exp mtp qsa={qsa} gate={gate} {backend}");
     }
 
     [Theory]
