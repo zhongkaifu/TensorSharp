@@ -4292,7 +4292,6 @@
       ],
       "evidence": [
         "eng/validation/validate-speculative-rows.py",
-        "eng/qwen4exp-mtp-fixture.py",
         "eng/regression/scaling_profiles.py"
       ],
       "requirements": [
