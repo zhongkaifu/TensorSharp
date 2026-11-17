@@ -227,7 +227,9 @@ holds the vision tower (`lfm3vl`) and the audio tower (`lfm3a`), both loaded fro
   rows) runs as two programs with a yield between them.
 - **Refusals.** LFM3-1.7B, or Omni without its projector, refuses image, video and
   audio input with a message naming the projector, before any upload is written where
-  the request surface allows.
+  the request surface allows; the CLI exits 1 with one line. The Omni projector is
+  refused on LFM3-1.7B (a model-load refusal, exit 2), whether named with `--mmproj` or
+  found beside the model: LiquidAI publishes the 1.7B as a text model.
 
 ## Sampling
 
