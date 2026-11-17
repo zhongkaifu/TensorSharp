@@ -34,6 +34,16 @@ namespace TensorSharp.Models
         /// 1.06e-3).</summary>
         protected override bool PrunesLastLayerRows => true;
 
+        /// <summary>On ggml-cuda, Q4_K and Q8_0 feed-forwards keep ffn_gate and ffn_up apart: ggml-cuda then runs the two
+        /// products and the SwiGLU as one MMQ (prompt) or MMVQ (decode) kernel with the GLU in its write-back, as llama.cpp's
+        /// LFM3 graph has it, where the fused weight's product of twice the rows was followed by a SwiGLU pass. LFM3-1.7B on an
+        /// A40, interleaved (fused -> apart): Q4_K_M pp512 15,455 -> 15,849, pp4096 14,039 -> 14,764 tok/s, tg128 at 4K 328.8
+        /// -> 334.3; Q8_0 pp512 16,515 -> 18,139, pp4096 16,048 -> 16,883, tg128 238.0 -> 243.3. The fused weight stays where it
+        /// measured faster: QAD-Q4_0 (pp512 -2.4%, pp4096 -5.0% apart), BF16 (-16.6%, -15.0%; its prompt products take cuBLAS,
+        /// which has no GLU write-back) and NVFP4 (decode -2.7% apart).</summary>
+        protected override bool KeepsGateUpApart(int gateType, int upType)
+            => _backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */;
+
         /// <summary>The short convolutions trace one rank's channels (its in/out projection shards, filter slice and states).</summary>
         protected override bool RanksLower => true;
 

@@ -1288,12 +1288,22 @@ namespace TensorSharp.Models
         private bool KeepMixedGateUpSplitOnMlx =>
             _backend == BackendType.Mlx && SupportsSplitGateUpFfn && SplitsMixedGateUpOnMlx;
 
+        /// <summary>
+        /// Whether a gate/up pair of these GGML types stays two weights (two products and a SwiGLU of two operands, which a
+        /// family that <see cref="SupportsSplitGateUpFfn"/> runs on every path) instead of one fused ffn_gate_up. On ggml-cuda
+        /// the two products and their SwiGLU are one kernel of ggml's own (MMQ or MMVQ with the GLU in its write-back), where a
+        /// fused weight's product is followed by a separate SwiGLU pass over twice the rows; the products' K splits differ
+        /// with the row count, so a family opts in per type where it measures faster. Default: fused.
+        /// </summary>
+        protected virtual bool KeepsGateUpApart(int gateType, int upType) => false;
+
         protected unsafe void FuseGateUpWeights(int numLayers = 0)
         {
             if (numLayers <= 0)
                 numLayers = Config.NumLayers;
             int fused = 0;
             int requantized = 0;
+            int keptApart = 0;
             // "layer:gateType+upType" - the type pair is the only place the
             // mismatch is ever surfaced, and it is what a future GGUF tripping a
             // DIFFERENT combination has to be diagnosed from.
@@ -1313,6 +1323,11 @@ namespace TensorSharp.Models
                     _quantWeights.TryGetValue(upName, out var uw) &&
                     gw.Ne0 == uw.Ne0)
                 {
+                    if (SupportsSplitGateUpFfn && KeepsGateUpApart(gw.GgmlType, uw.GgmlType))
+                    {
+                        keptApart++;
+                        continue;
+                    }
                     // Mixed-quant "UD"/dynamic GGUFs (e.g. Qwen3.8 UD quants, where
                     // ffn_gate is IQ4_XS but ffn_up is Q5_K) store gate and up in
                     // different types, which a single fused tensor can't represent.
@@ -1409,6 +1424,8 @@ namespace TensorSharp.Models
                 Console.WriteLine(requantized > 0
                     ? $"  Fused projections: {fused} Gate+Up ({requantized} mixed-quant layers requantized to a common type)"
                     : $"  Fused projections: {fused} Gate+Up");
+            if (keptApart > 0)
+                Console.WriteLine($"  Gate and up kept apart: {keptApart} layers (the backend runs the two products and the SwiGLU as one kernel)");
             if (requantLayers.Count > 0)
             {
                 // A dequantize+requantize of already-lossy weights is a real
