@@ -24,15 +24,17 @@ namespace TensorSharp.Server.RequestParsers
         }
 
         /// <summary>
-        /// A Responses <c>input_video</c> part: <c>{"type": "input_video", "video_url": "data:video/...;base64,...",
-        /// "fps"?, "max_frames"?}</c> - the shape of <c>input_image</c>, with <c>video_url</c>'s sampling options.
+        /// A Responses <c>input_video</c> part: <c>{"type": "input_video", "input_video": {"url": "data:video/...;base64,...",
+        /// "fps"?, "max_frames"?}}</c> - the embeddings API's <c>input_video</c> (and llama.cpp's), with <c>video_url</c>'s
+        /// sampling options.
         /// </summary>
         private static void AppendResponsesVideo(ChatMessage message, JsonElement part, UploadStoragePolicy uploads,
             bool sampleFrames)
         {
-            if (!part.TryGetProperty("video_url", out var urlElement) || urlElement.ValueKind != JsonValueKind.String)
-                throw new JsonException("input_video.video_url must contain a base64 video data URI.");
-            AppendSampledVideo(message, urlElement.GetString(), part, uploads, sampleFrames);
+            if (!part.TryGetProperty("input_video", out var video) || video.ValueKind != JsonValueKind.Object
+                || !video.TryGetProperty("url", out var urlElement) || urlElement.ValueKind != JsonValueKind.String)
+                throw new JsonException("input_video must contain a base64 video data URI in input_video.url.");
+            AppendSampledVideo(message, urlElement.GetString(), video, uploads, sampleFrames);
         }
 
         /// <summary>

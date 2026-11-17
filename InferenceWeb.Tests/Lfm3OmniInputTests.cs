@@ -218,7 +218,7 @@ public sealed class Lfm3OmniInputTests : IDisposable
         var uploads = new UploadStoragePolicy(_directory);
         using var json = JsonDocument.Parse("""
             [{"type":"message","role":"user","content":[
-              {"type":"input_video","video_url":"data:video/mp4;base64,AQID","fps":1,"max_frames":3},
+              {"type":"input_video","input_video":{"url":"data:video/mp4;base64,AQID","fps":1,"max_frames":3}},
               {"type":"input_image","image_url":"data:image/png;base64,AQ=="},
               {"type":"input_text","text":"What happens?"}]}]
             """);
@@ -233,12 +233,12 @@ public sealed class Lfm3OmniInputTests : IDisposable
 
         // A protocol that does not sample video refuses the part, as the chat endpoint refuses video_url.
         using var plain = JsonDocument.Parse("""
-            [{"type":"message","role":"user","content":[{"type":"input_video","video_url":"data:video/mp4;base64,AQID"}]}]
+            [{"type":"message","role":"user","content":[{"type":"input_video","input_video":{"url":"data:video/mp4;base64,AQID"}}]}]
             """);
         var ex = Assert.Throws<JsonException>(() => ChatMessageParser.ParseResponsesInput(plain.RootElement, null, uploads, architecture: "llama"));
         Assert.Contains("input_video", ex.Message);
         using var bad = JsonDocument.Parse("""
-            [{"type":"message","role":"user","content":[{"type":"input_video","video_url":"https://example.com/a.mp4"}]}]
+            [{"type":"message","role":"user","content":[{"type":"input_video","input_video":{"url":"https://example.com/a.mp4"}}]}]
             """);
         Assert.Throws<JsonException>(() => ChatMessageParser.ParseResponsesInput(bad.RootElement, null, uploads, architecture: Arch));
     }

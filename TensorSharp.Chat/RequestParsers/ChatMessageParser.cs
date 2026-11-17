@@ -470,7 +470,7 @@ namespace TensorSharp.Server.RequestParsers
         /// string (shorthand for a single user turn) or an array of message
         /// items: <c>{role, content: string | [{type:"input_text"|"output_text", text} |
         /// {type:"input_image", image_url} | {type:"input_audio", input_audio} |
-        /// {type:"input_video", video_url, fps?, max_frames?}]}</c> (<c>input_video</c> only for a
+        /// {type:"input_video", input_video: {url, fps?, max_frames?}}]}</c> (<c>input_video</c> only for a
         /// protocol that samples video, <see cref="ChatProtocol.CapsVideoFrames"/>, as the chat
         /// endpoint's <c>video_url</c>). An optional <c>instructions</c>
         /// string is prepended as a system message, matching how the real API
