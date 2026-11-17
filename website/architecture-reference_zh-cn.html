@@ -86,7 +86,7 @@
   <details class="architecture-reference-item"><summary>可观测性</summary><div class="architecture-detail"><p><a href="http-api_zh-cn.html">使用与支持指南 →</a></p><p>结构化的逐轮日志、队列状态，以及跨 Web UI、Ollama 与 OpenAI 响应形态的 KV 缓存复用指标。</p></div></details>
   <details class="architecture-reference-item" id="distribution"><summary>源码分发与版本说明</summary><div class="architecture-detail">
   <p>TensorAgent 提供本地应用界面，支持可搜索的模型家族目录、个人知识库与生成中的回答引导。<a href="tensoragent_zh-cn.html">桌面指南</a> · <a href="knowledge_zh-cn.html">知识库</a>。个人知识库与回答引导在 <code>v2026.10.10</code> 后合入；请使用包含这些功能的新构建。</p>
-  <p>当前源码新增 LTX 2.5 两阶段音视频、EmbeddingGemma 2 多模态嵌入、17 个共享技能包与原生社区技能发现/安装。TensorAgent 目录为 39 个条目；实验标记和内存档位不等于所有设备已验证。 <a href="models-video_zh-cn.html#ltx-25">LTX 2.5</a> · <a href="embeddings_zh-cn.html">EmbeddingGemma 2</a> · <a href="agentic_zh-cn.html#find-skills">find-skills</a></p>
+  <p>当前源码新增 LTX 2.5 两阶段音视频、EmbeddingGemma 2 多模态嵌入、17 个共享技能包与原生社区技能发现/安装。TensorAgent 目录为 41 个条目；实验标记和内存档位不等于所有设备已验证。 <a href="models-video_zh-cn.html#ltx-25">LTX 2.5</a> · <a href="embeddings_zh-cn.html">EmbeddingGemma 2</a> · <a href="agentic_zh-cn.html#find-skills">find-skills</a></p>
   </div></details>
   <h2 id="sources">宿主路由的源码依据</h2>
   <p>这是一组已核对的源码入口，而非完整调用图。CLI 虽引用 Chat 程序集，其常规自回归生成仍通过自己的会话直接构造 Runtime 引擎；扩散、嵌入和独立基准有专门路径。</p>

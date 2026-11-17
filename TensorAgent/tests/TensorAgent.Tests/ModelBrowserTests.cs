@@ -13,7 +13,7 @@ public sealed class ModelBrowserTests
     public void EveryCatalogEntryAppearsExactlyOnceUnderItsFamilyWithoutCopyingIt()
     {
         var groups = Browse();
-        Assert.Equal(15, groups.Count);
+        Assert.Equal(16, groups.Count);
         Assert.Equal(groups.Count, groups.Select(group => group.Id).Distinct().Count());
         CatalogModel[] results = groups.SelectMany(group => group.Models).ToArray();
         Assert.Equal(ModelCatalog.BuiltIn.Count, results.Length);
@@ -45,6 +45,7 @@ public sealed class ModelBrowserTests
     [InlineData(CatalogFamily.HunyuanDense, "hunyuan", "Hunyuan")]
     [InlineData(CatalogFamily.DiffusionGemma, "diffusiongemma", "DiffusionGemma")]
     [InlineData(CatalogFamily.Wan, "wan", "Wan")]
+    [InlineData(CatalogFamily.Lfm3, "lfm", "LFM")]
     public void FamilyNamesAreHumanReadableAndVersionIndependent(CatalogFamily family, string id, string name)
     {
         CatalogModel model = ModelCatalog.BuiltIn.First(model => model.Family == family);

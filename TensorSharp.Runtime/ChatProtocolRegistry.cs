@@ -217,6 +217,50 @@ namespace TensorSharp.Runtime
                 CapsVideoFrames = true,
             });
 
+            // ---- Liquid LFM3 / LFM3-Omni -----------------------------------
+            // One architecture name ("lfm3") for both checkpoints; the GGUF template
+            // tells them apart (1.7B reasons by default, Omni does not, and only the
+            // Omni template renders audio parts). The GGUF template renders as shipped
+            // and matches llama.cpp's renders byte for byte (Lfm3ChatProtocolTests);
+            // RenderLfm3 is the fallback for a GGUF without one.
+            Register(new ChatProtocol
+            {
+                Id = "lfm3",
+                Architectures = new[] { "lfm3" },
+                Render = r => ChatTemplate.RenderLfm3(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
+                // `<|vision_start|><|image|><|vision_end|>` per image, one
+                // `<|vision_start|><|video|><|vision_end|>` per video and (Omni)
+                // `<|vision_start|><|audio|><|vision_end|>` per clip, before the text:
+                // the template's own spans. The multimodal expander replaces the inner
+                // token with the encoder rows (docs/models/lfm3.md, "Media placeholders").
+                AppendMediaPlaceholders = ChatTemplate.AppendLfm3MediaPlaceholders,
+                // A video is its sampled frames, a frame pair's worth of rows each, so
+                // `video_url` parts are sampled and capped like Qwen 3.8's.
+                CapsVideoFrames = true,
+                // Reasoning ends at `</think>`, or at a `<tool_call>` written while still
+                // reasoning; calls are the Qwen3-Coder XML body. llama.cpp routes this
+                // template to its Qwen3-Coder parser with the same end tags.
+                CreateOutputParser = () => new Qwen35OutputParser(),
+                // The generation prompt ends `<think>` (on) or `<think></think>` (off), no
+                // newline; past turns re-render as `<think></think>` + answer with their
+                // reasoning dropped, so the cache's raw turn needs the suffix back and the
+                // template's empty block removed.
+                AssistantGenerationSuffix = thinking => thinking
+                    ? ChatTemplate.Lfm3ThinkOpen : ChatTemplate.Lfm3ThinkOpen + ChatTemplate.Lfm3ThinkClose,
+                EmitsEmptyThinkBlockForPastTurns = _ => true,
+                // role=tool renders from the tool message alone (render_tool_response),
+                // never from the calling turn's structured tool_calls.
+                ToolCallRawSplicing = ToolCallRawSplicing.Always,
+                // The template re-renders `<think>reasoning</think>` only for assistant
+                // turns after the last user message (or with preserve_thinking, which the
+                // host never sets), the gate this flag requires.
+                RendersAssistantReasoning = true,
+                ThinkingGrammarActivationTrigger = ChatTemplate.Lfm3ThinkClose,
+                // `</think>` is one token (124902): a budget closes the block and the
+                // answer follows. No hand-over sentence: none is published for LFM3.
+                ThinkingBudgetEndToken = ChatTemplate.Lfm3ThinkClose,
+            });
+
             // ---- GPT-OSS / Harmony -----------------------------------------
             Register(new ChatProtocol
             {

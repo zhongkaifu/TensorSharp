@@ -88,6 +88,17 @@ namespace TensorSharp.Runtime
         public bool StopRepetition { get; set; } = true;
 
         /// <summary>
+        /// Generate past end-of-sequence tokens: an EOS draw is forwarded like any other
+        /// token instead of ending the request, so only the token limit (or a stop string
+        /// the caller set) ends it. The OpenAI-compatible <c>ignore_eos</c> request field of
+        /// vLLM, SGLang and llama.cpp, used for fixed-length benchmarks. The sampler is not
+        /// changed (vLLM's and SGLang's semantics, not llama.cpp's EOS logit ban), so the
+        /// decode path - device argmax included - is the one an ordinary request runs, and
+        /// the EOS tokens count as generated tokens. Default false.
+        /// </summary>
+        public bool IgnoreEos { get; set; }
+
+        /// <summary>
         /// Random seed for reproducible sampling. -1 = non-deterministic (time-based seed).
         /// </summary>
         public int Seed { get; set; } = -1;
@@ -257,6 +268,7 @@ namespace TensorSharp.Runtime
                 TopP = TopP,
                 MinP = MinP,
                 StopRepetition = StopRepetition,
+                IgnoreEos = IgnoreEos,
                 RepetitionPenalty = RepetitionPenalty,
                 PenaltyLastN = PenaltyLastN,
                 PresencePenalty = PresencePenalty,

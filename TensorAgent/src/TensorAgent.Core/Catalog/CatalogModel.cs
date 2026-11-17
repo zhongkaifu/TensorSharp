@@ -96,7 +96,7 @@ public enum CatalogFamily
 {
     // Append new families: the numeric values are part of persisted catalog data.
     Gemma4, Qwen35, Qwen36, Qwen38, QwenImage, GptOss, Bonsai, MuseGlimmer, MiniMaxH3, Qwen38FlashNext,
-    DeepSeek4, DeepSeek41, Glm5, Nemotron, Mistral3, HunyuanDense, DiffusionGemma, Wan, Ltx25,
+    DeepSeek4, DeepSeek41, Glm5, Nemotron, Mistral3, HunyuanDense, DiffusionGemma, Wan, Ltx25, Lfm3,
 }
 
 /// <summary>Dense or mixture-of-experts.</summary>
@@ -119,7 +119,16 @@ public enum CatalogModalities
 
 /// <summary>Sampling defaults the model card recommends; the app sends them with every
 /// chat request the way the Web UI sends the server's configured defaults.</summary>
-public sealed record CatalogSampling(float Temperature, int TopK, float TopP, float MinP);
+public sealed record CatalogSampling(float Temperature, int TopK, float TopP, float MinP)
+{
+    /// <summary>
+    /// The card's repetition penalty, or null for the engine's default (1.1, which coding
+    /// turns lower to 1.0). Stated where the card disagrees with that default: LFM3-Omni
+    /// decodes greedily with no penalty, and a penalty on greedy transcription would
+    /// rewrite repeated words.
+    /// </summary>
+    public float? RepetitionPenalty { get; init; }
+}
 
 /// <summary>How an entry's own draft file speculates, for an entry whose drafter measured faster
 /// away from the engine's defaults: tokens drafted per step (the CLI's <c>--spec-draft</c>) and

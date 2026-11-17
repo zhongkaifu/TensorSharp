@@ -145,6 +145,14 @@ public sealed partial class OpenAIChatAdapter
         // operator's configuration entirely).
         int maxTokens = _options.ResolveMaxTokens(
             SamplingConfigParser.ReadRequestedMaxTokens(body, "max_tokens", "max_completion_tokens"));
+        if (!SamplingConfigParser.TryValidateIgnoreEos(body, out string ignoreEosError))
+        {
+            openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/chat/completions rejected: {Error} (model={Model})", ignoreEosError, modelName);
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = ignoreEosError, type = "invalid_request_error" } }).ConfigureAwait(false);
+            return;
+        }
         var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
         var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens,
             reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);

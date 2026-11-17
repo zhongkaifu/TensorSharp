@@ -439,7 +439,7 @@ curl -s http://localhost:5000/api/video-generate \
   </table>
   </div>
   <h4>OpenAI 风格（顶层）</h4>
-  <p><code>max_tokens</code> 或 <code>max_completion_tokens</code>（省略时默认 <code>--max-tokens</code>，即 20000）、<code>temperature</code>、<code>top_p</code>、<code>presence_penalty</code>、<code>frequency_penalty</code>、<code>seed</code>、<code>stop</code>（字符串或数组），以及 <code>response_format</code>（<code>text</code> / <code>json_object</code> / <code>json_schema</code>）。在 OpenAI 规范之外，同一顶层还接受 <code>top_k</code>、<code>min_p</code>、<code>repeat_penalty</code>（或 <code>repetition_penalty</code>）与 <code>repeat_last_n</code>，默认值见上表。</p>
+  <p><code>max_tokens</code> 或 <code>max_completion_tokens</code>（省略时默认 <code>--max-tokens</code>，即 20000）、<code>temperature</code>、<code>top_p</code>、<code>presence_penalty</code>、<code>frequency_penalty</code>、<code>seed</code>、<code>stop</code>（字符串或数组），以及 <code>response_format</code>（<code>text</code> / <code>json_object</code> / <code>json_schema</code>）。在 OpenAI 规范之外，同一顶层还接受 <code>top_k</code>、<code>min_p</code>、<code>repeat_penalty</code>（或 <code>repetition_penalty</code>）与 <code>repeat_last_n</code>，默认值见上表；以及 <code>ignore_eos</code>（布尔值，默认 false）：遇到结束 token 也继续生成直到 <code>max_tokens</code>，用于定长基准测试，拼写与 vLLM、SGLang、llama.cpp 相同。惩罚只回看生成的 token，而 llama.cpp 还计入提示词最后 <code>repeat_last_n</code> 个 token，vLLM 计入整个提示词。</p>
 
   <h2 id="python">8 · Python 客户端示例</h2>
   <h4>使用 <code>requests</code>（Ollama 风格）</h4>

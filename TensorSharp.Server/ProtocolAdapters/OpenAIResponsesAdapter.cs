@@ -139,6 +139,13 @@ public sealed class OpenAIResponsesAdapter
         // hard-coded 200 that silently ignored the operator's config.
         int maxOutputTokens = _options.ResolveMaxTokens(requestedOutputTokens);
 
+        if (!SamplingConfigParser.TryValidateIgnoreEos(body, out string ignoreEosError))
+        {
+            logger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/responses rejected: {Error} (model={Model})", ignoreEosError, modelName);
+            await WriteErrorAsync(ctx, 400, ignoreEosError).ConfigureAwait(false);
+            return;
+        }
         var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
         var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens,
             reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);

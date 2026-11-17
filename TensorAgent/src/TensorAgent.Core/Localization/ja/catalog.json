@@ -51,6 +51,8 @@
   "catalog.extended.nemotronOmni.notes": "任意のプロジェクターで画像を使用できます。音声には別途変換した Parakeet コンポーネントが必要で、ここには含まれません。推測デコードには対応していません。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
   "catalog.extended.mistral.notes": "Pixtral 視覚プロジェクターは任意です。この実装はチャットと画像に対応し、思考モードやツール呼び出しには対応していません。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
   "catalog.extended.hunyuan.notes": "hunyuan-dense を使用する Tencent の翻訳モデルです。テキスト専用で単一デバイスを使用し、思考モードやツール呼び出しには対応していません。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
+  "catalog.lfm3.notes": "短い畳み込み層とアテンション層を組み合わせた Liquid のハイブリッドモデルです。思考モードとツール呼び出しに対応し、テキスト専用です。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
+  "catalog.lfm3Omni.notes": "Liquid のオムニモデルです。画像・動画・音声を入力し、テキストを出力します。思考モードはありません。必須のプロジェクターには音声生成器も含まれますが、音声での応答にはまだ対応していません。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
   "catalog.extended.deepseek4.notes": "3 つの分割ファイルがすべて必要です。対応する任意の 0731 DSpark ドラフトは CUDA 上で貪欲サンプリングを使用します。ワークステーション級のメモリが必要です。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
   "catalog.extended.deepseek41.notes": "Engram を内蔵した修正版の 10 分割モデルです。実用的な提供には CUDA を使用し、CPU は移植性のための経路です。視覚と DSpark は TensorSharp の変換が必要で、公開 clip/dflash は非互換です。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
   "catalog.extended.glm.notes": "テキスト専用で、全分割ファイルが必要です。NextN は内蔵され、追加ダウンロードは不要です。GLM 5.3 の NextN は単一デバイスまたは層分割が必要です。アプリの既定値は n-gram 推測です。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",

@@ -1847,6 +1847,7 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 | `frequency_penalty` | float       | 0       | 频率惩罚                            |
 | `seed`              | int         | -1      | 随机种子                            |
 | `stop`              | string/array| null    | 停止序列                            |
+| `ignore_eos`        | bool        | false   | 非标准（与 vLLM / SGLang / llama.cpp 拼写相同）：遇到结束 token 也继续生成，直到 `max_tokens`，用于定长基准测试。该请求的重复保护也随之关闭，只有 token 上限和请求自己的 `stop` 字符串会结束它；结束 token 计入 `usage.completion_tokens`，其标记文本不进入回复。必须是布尔值（否则返回 HTTP 400） |
 | `response_format`   | object      | null    | `text`、`json_object` 或 `json_schema` |
 | `think`             | bool        | false   | 非标准扩展：启用思维链 / 推理解析（以 `reasoning_content` 返回 / 流式输出） |
 | `chat_template_kwargs` | object  | null    | llama.cpp / vLLM / SGLang 的约定。只读取 `enable_thinking`（bool），与 `think` 是同一个开关；`think` 与 `enable_thinking` 不一致时返回 HTTP 400。其他键被忽略，服务端对每个键记录一次日志 |
@@ -1854,10 +1855,15 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 | `tool_choice`       | string/object | `auto` | Chat Completions：`auto`、`none`（不提供任何工具，包括内置技能、代码与子智能体工具）、`required`，或 `{"type": "function", "function": {"name": ...}}`；后两者须指向客户端声明的 `tools`（否则返回 HTTP 400），且只有 DeepSeek V4.1 会用工具调用语法强制执行，其他模型族接受该值但仍可能不调用工具直接作答 |
 | `parallel_tool_calls` | bool      | null    | Chat Completions：必须是布尔值（否则返回 HTTP 400）；只有 DeepSeek V4.1 会遵循 `false`（其工具调用语法只允许一次调用），其他模型族接受但忽略 |
 
-`top_k`、`min_p`、`repeat_penalty` / `repetition_penalty` 与 `repeat_last_n` 不属于 OpenAI
+`top_k`、`min_p`、`repeat_penalty` / `repetition_penalty`、`repeat_last_n` 与 `ignore_eos` 不属于 OpenAI
 规范；服务端按 llama.cpp 与 vLLM 的做法从顶层读取它们，因此 OpenAI 形态的客户端可以通过
 `extra_body` 传入。`/v1/responses` 读取相同的采样字段，只是用 `max_output_tokens` 代替
 `max_tokens`。上文的 `--sampling-precedence` 规则对所有接口都适用。
+
+重复、出现与频率惩罚只回看最近 `repeat_last_n` 个**生成的** token。各引擎在这一点上不同：
+llama-server 还会计入提示词最后 `repeat_last_n` 个 token（它先把提示词送入采样器），vLLM 与
+Hugging Face `generate` 对全部提示词和输出 token 施加惩罚且不设窗口，SGLang 则对全部输出 token
+施加。要与其他引擎比对输出，请使用 `repeat_penalty` 1.0（并采用贪心解码），与随附的回归配置相同。
 
 ---
 

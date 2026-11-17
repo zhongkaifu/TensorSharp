@@ -2086,6 +2086,7 @@ the request.
 | `frequency_penalty` | float       | 0       | Frequency penalty                  |
 | `seed`              | int         | -1      | Random seed                        |
 | `stop`              | string/array| null    | Stop sequences                     |
+| `ignore_eos`        | bool        | false   | Non-standard (vLLM / SGLang / llama.cpp spelling): keep generating through end-of-sequence tokens until `max_tokens`, for fixed-length benchmarks. The repetition guard is off for the request too, so only the token limit and the request's own `stop` strings end it; the EOS tokens count in `usage.completion_tokens` and their marker text is left out of the reply. Must be a boolean (HTTP 400 otherwise) |
 | `response_format`   | object      | null    | `text`, `json_object`, or `json_schema` |
 | `think`             | bool        | false   | Non-standard extension: enables thinking/reasoning parsing (returned/streamed as `reasoning_content`) |
 | `chat_template_kwargs` | object  | null    | llama.cpp / vLLM / SGLang convention. Only `enable_thinking` (bool) is read, as the same switch as `think`; a request whose `think` and `enable_thinking` disagree is HTTP 400. Other keys are ignored, and the server logs that once per key |
@@ -2093,12 +2094,20 @@ the request.
 | `tool_choice`       | string/object | `auto` | Chat Completions: `auto`, `none` (offers no tools, including the built-in skill, code and sub-agent tools), `required`, or `{"type": "function", "function": {"name": ...}}`; the last two must name client-declared `tools` (HTTP 400 otherwise). Only DeepSeek V4.1 enforces them with a tool-call grammar; other families accept them but can still answer without calling the tool |
 | `parallel_tool_calls` | bool      | null    | Chat Completions: must be a boolean (HTTP 400 otherwise). Only DeepSeek V4.1 honors `false` (its tool grammar then allows a single call); other families accept and ignore it |
 
-`top_k`, `min_p`, `repeat_penalty` / `repetition_penalty` and `repeat_last_n` are
+`top_k`, `min_p`, `repeat_penalty` / `repetition_penalty`, `repeat_last_n` and `ignore_eos` are
 not part of the OpenAI specification; they are read from the top level the way
 llama.cpp and vLLM expose them, so an OpenAI-shaped client can pass them through
 `extra_body`. `/v1/responses` reads the same sampling fields, with
 `max_output_tokens` in place of `max_tokens`. The `--sampling-precedence` rule
 above applies to every surface.
+
+The repetition, presence and frequency penalties look back over the last
+`repeat_last_n` **generated** tokens only. Engines differ here: llama-server also
+counts the last `repeat_last_n` prompt tokens (it feeds the prompt into its sampler
+first), vLLM and Hugging Face `generate` penalize every prompt and output token with
+no window, and SGLang every output token. For output parity with another engine,
+compare with `repeat_penalty` 1.0 (and greedy decoding), as the shipped regression
+configs do.
 
 ---
 

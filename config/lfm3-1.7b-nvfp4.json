@@ -1,0 +1,34 @@
+{
+  // Liquid LFM3-1.7B (NVFP4) for NVIDIA Blackwell. Only the 72 FFN projections are NVFP4
+  // (per-tensor .scale applied after the matmul, .input_scale unused, as in llama.cpp);
+  // embeddings, attention and short-conv projections stay Q8_0. The FP4 tensor-core GEMMs
+  // need an sm_100/sm_120 GPU; this route has NOT been run yet (no Blackwell device was
+  // available when the config was added) - treat it as unvalidated until a GPU run.
+  // Pinned to LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2; the SHA-256 is
+  // the file's LFS object id at that commit. LFM3-1.7B-NVFP4.gguf: 1280019776 bytes.
+  // License: LFM Open License v1.0 (lfm1.0).
+  // Run with:
+  //   TensorSharp.Server.Host --config config/lfm3-1.7b-nvfp4.json
+  // See config/lfm3-1.7b.json for the thinking default and the sampling rationale.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/lfm3"
+  },
+  "backend": "cuda",
+  "max-tokens": 8192,
+
+  "temperature": 0.1,
+  "top-k": 50,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1.1,
+  "repeat-last-n": -1,
+
+  "model": {
+    "path": "${root}/LFM3-1.7B-NVFP4.gguf",
+    "urls": [
+      "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-NVFP4.gguf"
+    ],
+    "sha256": "462c2379586a45b30fe3dbfa30e6ff08cbb440734d6934689e24e4fe59a67bec"
+  }
+}

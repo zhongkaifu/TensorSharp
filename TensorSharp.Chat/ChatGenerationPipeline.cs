@@ -881,7 +881,11 @@ namespace TensorSharp.Server
                 }
 
                 generatedTokens.Add(nextToken);
-                model.Tokenizer.AppendTokenBytes(nextToken, rawBytes);
+                // An ignore_eos request runs past its end-of-sequence tokens (SamplingConfig.IgnoreEos):
+                // they count as generated tokens, but their marker text (<|im_end|>) is not answer text,
+                // as vLLM and SGLang leave it out of theirs.
+                if (!(cfg.IgnoreEos && model.Tokenizer.IsEos(nextToken)))
+                    model.Tokenizer.AppendTokenBytes(nextToken, rawBytes);
                 int validLen = FindValidUtf8Length(rawBytes);
                 // Decode only the bytes that completed a UTF-8 boundary since the
                 // last token. The prior valid prefix already ended on a character
