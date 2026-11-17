@@ -992,7 +992,14 @@ namespace TensorSharp.Graph
                         {
                             GraphNode add = _nodes[sum];
                             Tensor a = Get(add.Srcs[0]), b = Get(add.Srcs[1]);
-                            if (a.Sizes.SequenceEqual(b.Sizes) && _x.TryAddWeightedNorm(a, b, weight, Eps(norm), out Tensor total, out Tensor normed))
+                            // The operands' rows as ggml counts them: a decode row's stream can be [hidden] where the block's
+                            // output beside it is [1, hidden], the same row. Compared by their tensor sizes, plain decoding's
+                            // residual adds and norms ran unfused (an add, then the row norm's other reduction) where a verify
+                            // window's rows took the fused kernel, so the window's rows rounded apart from the decode rows.
+                            using Tensor bAsA = !a.Sizes.SequenceEqual(b.Sizes) && Ne(a).AsSpan().SequenceEqual(Ne(b)) && b.IsContiguous()
+                                ? b.View(a.Sizes) : null;
+                            if ((bAsA != null || a.Sizes.SequenceEqual(b.Sizes))
+                                && _x.TryAddWeightedNorm(a, bAsA ?? b, weight, Eps(norm), out Tensor total, out Tensor normed))
                             {
                                 Set(sum, new Value { Tensor = Run.Keep(total) }, fresh: true);
                                 Consumed(n.Srcs[0]);
