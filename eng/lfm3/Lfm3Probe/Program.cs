@@ -149,10 +149,19 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     int[] Tokens(int n, int seed) => Enumerable.Range(0, n).Select(i => 1000 + (int)((uint)(i * 2654435761u + seed) % 60000u)).ToArray();
     static double Median(List<double> v) { v.Sort(); return v[v.Count / 2]; }
 
-    // Warm: kernels load and graphs build once.
+    // Warm: kernels load and graphs build once, and the host code the prompt and decode steps run is past .NET's first
+    // (tier-0) compilation, as in a server that has run a while: 40 prompt steps of up to 512 rows, then 64 decode steps.
+    // (A single 256-token prompt left most of the prompt path tier-0 for the first timed prompts: their host work per
+    // 512-row step was 2x a warmed process's on the A40 VM.)
+    int warm = Math.Max(256, Math.Min(5120, model.MaxContextLength - 64));
+    for (int w = 0; w < 4; w++)
+    {
+        model.ResetKVCache();
+        model.ForwardRefill(Tokens(warm, w + 101));
+    }
     model.ResetKVCache();
     model.ForwardRefill(Tokens(256, 1));
-    for (int i = 0; i < 8; i++) model.Forward(new[] { 1234 + i });
+    for (int i = 0; i < 64; i++) model.Forward(new[] { 1234 + i });
 
     foreach (int n in prompts)
     {

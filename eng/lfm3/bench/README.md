@@ -20,7 +20,8 @@ Build first (Release, this checkout): `TENSORSHARP_GGML_NO_UPDATE=1 dotnet build
   `RESULT name median min max` lines.
 - `ts-bench.sh MODEL BACKEND [PP,..|-] [TG] [DEPTH,..] [--reps N] [--greedy]`: `Lfm3Probe bench`, llama-bench's
   tests: ppN is one prompt of N tokens (TensorSharp's `ForwardRefill`), tgN@dD decodes N pseudo-random tokens after a
-  D-token prompt (no sampling in the timed loop). It also prints the K/V footprint (bytes a token and the sliding-window
+  D-token prompt (no sampling in the timed loop). It warms 40 prompt steps and 64 decode steps first, so the host code
+  the timed steps run is past .NET's first (tier-0) compilation, as in a server that has run a while. It also prints the K/V footprint (bytes a token and the sliding-window
   rings). `MAX_CONTEXT` must cover the deepest test.
 - `llama-bench-result.sh MODEL [PP,..|-] [TG] [DEPTH,..] [REPS] [-- llama-bench args]`: llama-bench (flash attention
   on, its defaults otherwise: n_batch 2048, n_ubatch 512, 6 threads) with the same RESULT lines.
@@ -36,6 +37,18 @@ Build first (Release, this checkout): `TENSORSHARP_GGML_NO_UPDATE=1 dotnet build
   to show it). A thinking-off TensorSharp stream holds a reply's text until 4,096 chars or its end (see
   docs/models/lfm3.md), so with more output tokens its client-side TTFT is the reply's end: max_tokens 1 measures the
   engines.
+- `gpu-bench.sh [QUANT ...]` (a Linux GPU machine): the single-sequence matrix of TensorSharp's ggml_cuda, direct cuda and
+  ggml_vulkan lanes against llama-bench's CUDA and Vulkan builds with flash attention on and off (`LLAMA_CPP` holds
+  `build-cuda/` and `build-vk/`), pp512/4096/16384/32768 and tg128 at depths 0/4K/16K/32K by default, every arm
+  interleaved; one table per quant under `artifacts/lfm3/bench/gpu-<stamp>/`. It refuses a busy GPU.
+- `serve-vs.sh OUTDIR ENGINE ...` and `serve-vs-summary.py DIR ...` (a Linux GPU machine): TensorSharp.Server.Host
+  (`ts-cuda`, `ts-ggml_cuda`, `ts-ggml_vulkan`) against vLLM, SGLang and llama-server (`llama-cuda`, `llama-vk`) measured
+  by one client, `vllm bench serve --backend openai-chat` (random token prompts, ignore_eos, temperature 0, thinking off),
+  over (ISL, OSL) shapes and concurrencies (environment knobs in the header: `SHAPES`, `CONC`, `PREFIX_CACHE`,
+  `RANDOM_PREFIX`, `MAX_CONTEXT`, `MAX_SEQS`, `BATCH_TOKENS`); every engine gets the same context, running-sequence limit
+  and per-step token budget, prefix caching off unless asked. One JSON per cell plus the GPU memory in use after it; the
+  summary tabulates rounds (median and min-max of each cell's metric over the directories given).
+- `llama-bench-result.sh` takes `LLAMA_BENCH` (the binary, e.g. a `build-cuda` tree's) and `FA` (llama-bench's `-fa`).
 - `metal-op-histogram.py LOG [--start REGEX]`: Metal dispatches per graph from a `GGML_METAL_GRAPH_DEBUG=1` log
   (TensorSharp also needs `TS_GGML_LOG_DEBUG=1`; llama-bench needs `-v`). Graph starts: TensorSharp
   `'^(GET_ROWS|RMS_NORM) node_0$'`, llama.cpp `'^RMS_NORM norm-0$'`.

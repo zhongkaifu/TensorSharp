@@ -3,12 +3,14 @@
 # interleave it with TensorSharp arms.
 #
 # usage: llama-bench-result.sh MODEL [PP,..|-] [TG] [DEPTH,..] [REPS] [-- extra llama-bench args]
-#   LLAMA_CPP_DIR (default ~/work/llama.cpp-lfm3) selects the build; extra args e.g. "-ngl 0 -t 8" for the CPU.
+#   LLAMA_CPP_DIR (default ~/work/llama.cpp-lfm3) selects the build (its build/bin/llama-bench), or LLAMA_BENCH names the
+#   binary (a Linux machine's build-cuda / build-vk); FA (default 1) is llama-bench's -fa; extra args e.g. "-ngl 0 -t 8"
+#   for the CPU.
 set -euo pipefail
 model=$1; pp=${2:-512,4096}; tg=${3:-128}; depths=${4:-0}; reps=${5:-3}
 shift $(( $# < 5 ? $# : 5 )); [[ ${1:-} == "--" ]] && shift
-bench=${LLAMA_CPP_DIR:-$HOME/work/llama.cpp-lfm3}/build/bin/llama-bench
-args=(-m "$model" -r "$reps" -fa 1 -o jsonl "$@")
+bench=${LLAMA_BENCH:-${LLAMA_CPP_DIR:-$HOME/work/llama.cpp-lfm3}/build/bin/llama-bench}
+args=(-m "$model" -r "$reps" -fa "${FA:-1}" -o jsonl "$@")
 {
   if [[ $pp != "-" ]]; then "$bench" "${args[@]}" -p "$pp" -n 0; fi
   if [[ $tg != "0" ]]; then "$bench" "${args[@]}" -p 0 -n "$tg" -d "$depths"; fi
