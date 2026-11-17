@@ -2204,9 +2204,13 @@ namespace TensorSharp.Models
                 int vs = n == 1 ? v : step.View3(v, dv, kvHeads, count, dv * f, dv * kvHeads * f, firstRow * dv * kvHeads * f);
                 // Under a prep region the queries are read past its end only (its result): their view follows it.
                 int qPerm = prep ? -1 : step.Permute(qs, 0, 2, 1, 3);
-                // [d, heads, count] -> [d, count, heads]; one row is the same bytes either way.
-                int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
-                int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
+                // [d, heads, count] -> [d, count, heads]; one row is the same bytes either way. Rows written by index are read
+                // from the permuted view (set_rows reads rows at any strides: no copy of every prompt chunk's K and V, 22 of a
+                // LFM3 prompt step's 471 Metal dispatches); a chunk that attends its own rows, and the tensor-parallel ranks'
+                // writes (ggml's meta device splits set_rows by KV head), take them contiguous.
+                bool indexedRows = Indexed(count) && _graphTpRanks == null;
+                int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : indexedRows ? step.Permute(ks, 0, 2, 1, 3) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
+                int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : indexedRows ? step.Permute(vs, 0, 2, 1, 3) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
 
                 // The layer's cells: a sliding-window layer's ring (StandardDecoderModel.SlidingRings.cs) holds at most its own.
                 int cap = CacheCells(layer, slot.Capacity);
@@ -2909,7 +2913,7 @@ namespace TensorSharp.Models
                 if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskStart == start && _decodeMaskCount == count
                     && _decodeMaskSequence == sequence)
                     return _decodeMask;
-                var mask = new ushort[(long)window * count];
+                var mask = GC.AllocateUninitializedArray<ushort>(checked(window * count));   // the fill writes every cell
                 FillCausalRows(mask, window, start, count, FloorOf(sequence));
                 _decodeMask = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(_decodeMask, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
@@ -2937,7 +2941,7 @@ namespace TensorSharp.Models
                 if (band <= 0) throw new ArgumentOutOfRangeException(nameof(band), band, "a sliding window needs a positive width");
                 var key = (window, offset, start, count, sequence, band);
                 if (_bandMasks != null && _bandMasks.TryGetValue(key, out int cached)) return cached;
-                var mask = new ushort[(long)window * count];
+                var mask = GC.AllocateUninitializedArray<ushort>(checked(window * count));   // the fill writes every cell
                 FillBandRows(mask, window, offset, start, count, FloorOf(sequence), band);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
@@ -2980,7 +2984,7 @@ namespace TensorSharp.Models
                     throw new ArgumentOutOfRangeException(nameof(ring), ring, $"a ring of {ring} cells does not hold a {band}-key window and {count} rows");
                 var key = (ring, start, count, sequence, band);
                 if (_ringMasks != null && _ringMasks.TryGetValue(key, out int cached)) return cached;
-                var mask = new ushort[(long)ring * count];
+                var mask = GC.AllocateUninitializedArray<ushort>(checked(ring * count));   // the fill writes every cell
                 FillRingBandRows(mask, ring, start, count, FloorOf(sequence), band);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { ring, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
@@ -3099,7 +3103,11 @@ namespace TensorSharp.Models
             private static void FillBandRows(ushort[] mask, int width, int offset, int start, int count, int attentionFloor, int band)
             {
                 const ushort negInf = 0xFC00;
-                for (int q = 0; q < count; q++)
+                // Large masks row-parallel, as FillCausalRows (a chunk of linear sliding-window caches attends its whole length).
+                if ((long)width * count >= 1 << 20) System.Threading.Tasks.Parallel.For(0, count, Row);
+                else for (int q = 0; q < count; q++) Row(q);
+
+                void Row(int q)
                 {
                     Span<ushort> row = mask.AsSpan(q * width, width);
                     (int lo, int hi) = BandRow(width, offset, start, q, attentionFloor, band);
