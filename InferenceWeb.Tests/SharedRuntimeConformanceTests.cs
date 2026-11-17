@@ -51,7 +51,13 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     public static readonly IReadOnlyDictionary<string, Type> DedicatedSuites = new Dictionary<string, Type>(StringComparer.Ordinal)
     {
         ["qwen35"] = typeof(Qwen35RuntimeTests),
+        // LFM3's short-conv layers rewind only to their length or to zero, as Qwen 3.5's recurrent layers do.
+        ["lfm3"] = typeof(Lfm3RuntimeTests),
     };
+
+    /// <summary>The mechanism test of routed experts on the host, which a dedicated suite of a dense family (no routed experts)
+    /// does not declare.</summary>
+    public const string HostExpertsMechanism = "HostExpertsMatchDeviceExperts";
 
     /// <summary>The tests a dedicated suite declares: one per mechanism the runtime claims.</summary>
     public static readonly string[] MechanismTests =
@@ -59,7 +65,7 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         nameof(PlacementMatchesOneDevice),                 // tensor parallelism, whole-layer stages, their hybrid
         nameof(SlotBatchesMatchEachSequenceAlone),         // batched slots in every placement
         "ConcurrentRequestsAreBatched",                    // continuous batching in every placement
-        "HostExpertsMatchDeviceExperts",                   // routed experts on the host
+        HostExpertsMechanism,                              // routed experts on the host (families with routed experts)
         nameof(CheckpointsContinueExactly),
         nameof(SpeculativeDecodingMatchesPlainGreedy),
         nameof(WholeForwardGraphMatchesThePerOpPath),

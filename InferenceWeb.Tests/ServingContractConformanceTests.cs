@@ -227,8 +227,12 @@ public sealed class ServingContractConformanceTests
             if (SharedRuntimeConformanceTests.DedicatedSuites.TryGetValue(arch.Id, out Type suite))
             {
                 foreach (string test in SharedRuntimeConformanceTests.MechanismTests)
+                {
+                    // Host experts are a claim of families with routed experts only: a dense family has none to place.
+                    if (test == SharedRuntimeConformanceTests.HostExpertsMechanism && !arch.Serving.HasRoutedExperts) continue;
                     Assert.True(suite.GetMethod(test)?.GetCustomAttributes(typeof(FactAttribute), inherit: true).Length > 0,
                         $"'{arch.Id}' is proven by {suite.Name}, which must declare the test {test}.");
+                }
                 continue;
             }
             Assert.True(withFixtures.Contains(arch.Id),
