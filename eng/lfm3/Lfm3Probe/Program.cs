@@ -2,9 +2,11 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 //
 // LFM3 validation probe (TensorSharp side of eng/lfm3's llama.cpp comparisons; outputs belong in ignored artifacts/):
-//   ppl    MODEL BACKEND FILE CTX CHUNKS   perplexity as llama-perplexity computes it: the file's tokens (no BOS, special
+//   ppl    MODEL BACKEND FILE CTX CHUNKS [--per-op]
+//                                          perplexity as llama-perplexity computes it: the file's tokens (no BOS, special
 //                                          tokens not parsed) in CHUNKS chunks of CTX, each from an empty cache, scoring the
-//                                          second half of every chunk (row i predicts token i + 1)
+//                                          second half of every chunk (row i predicts token i + 1); --per-op runs the shared
+//                                          runtime's per-op path instead of whole-forward graphs
 //   tokens MODEL FILE OUT                  the file's token ids as llama-perplexity tokenizes it (one id a line)
 //   bench  MODEL BACKEND [PP,...] [TG] [DEPTH,...]
 //                                          prefill tokens/s of each PP-token prompt and decode tokens/s of TG tokens after
@@ -29,7 +31,7 @@ KvCacheDtypeConfig.ConfigureFromEnvironment();
 switch (args[0])
 {
     case "ppl" when args.Length >= 6:
-        return Perplexity(args[1], Backend(args[2]), args[3], int.Parse(args[4]), int.Parse(args[5]));
+        return Perplexity(args[1], Backend(args[2]), args[3], int.Parse(args[4]), int.Parse(args[5]), args.Contains("--per-op"));
     case "tokens" when args.Length >= 4:
     {
         using var gguf = GgufFile.OpenWithoutSiblingShards(args[1]);
@@ -48,18 +50,19 @@ switch (args[0])
 
 static int Usage()
 {
-    Console.Error.WriteLine("usage: Lfm3Probe ppl MODEL BACKEND FILE CTX CHUNKS | tokens MODEL FILE OUT | bench MODEL BACKEND [PP,..] [TG] [DEPTH,..]");
+    Console.Error.WriteLine("usage: Lfm3Probe ppl MODEL BACKEND FILE CTX CHUNKS [--per-op] | tokens MODEL FILE OUT | bench MODEL BACKEND [PP,..] [TG] [DEPTH,..]");
     return 2;
 }
 
-static int Perplexity(string path, BackendType backend, string file, int ctx, int chunks)
+static int Perplexity(string path, BackendType backend, string file, int ctx, int chunks, bool perOp)
 {
     using ModelBase model = ModelBase.Create(path, backend);
+    if (perOp && model is StandardDecoderModel runtime) runtime.GraphLoweringEnabled = false;
     var spec = (ISpeculativeModel)model;
     int[] tokens = model.Tokenizer.Encode(File.ReadAllText(file), addSpecial: false).ToArray();
     int available = tokens.Length / ctx;
     if (chunks <= 0 || chunks > available) chunks = available;
-    Console.WriteLine($"tokens={tokens.Length} ctx={ctx} chunks={chunks} backend={backend}");
+    Console.WriteLine($"tokens={tokens.Length} ctx={ctx} chunks={chunks} backend={backend}{(perOp ? " per-op" : "")}");
     int vocab = model.Config.VocabSize, first = ctx / 2;
     const int block = 128;
     var logits = new float[block * vocab];
