@@ -5,8 +5,8 @@
 //
 // A prompt rebuilds its span graph for every chunk, because the attention window grows, and each rebuild freed the
 // graph allocator's arena and allocated a new one of a few GB. On Metal a new buffer is mapped and made resident
-// (residency sets) before the graph runs: ~75 ms a GB, 100-400 ms a chunk on Flash Next (M5 Pro), the "gallocr"
-// phase of TS_Q4E_PHASE=1. This buffer type sits over the backend's own and keeps the one buffer its owner freed last,
+// (residency sets) before the graph runs: ~75 ms a GB, 100-400 ms a chunk on Flash Next (M5 Pro), timed as the
+// prompt's "gallocr" phase. This buffer type sits over the backend's own and keeps the one buffer its owner freed last,
 // handing it to the owner's next allocation when it is large enough: any prompt-sized request (512 MB and up; a 16K
 // prompt's arenas grow 3.1 -> 3.5 -> 4.2 GB and its 1187-token tail needs 1.3 GB), and a smaller one only when the
 // kept buffer is not wastefully large, so a decode graph does not hold a prompt's arena idle. A new buffer gets a

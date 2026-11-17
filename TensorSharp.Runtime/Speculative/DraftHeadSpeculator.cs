@@ -114,6 +114,8 @@ namespace TensorSharp.Runtime.Speculative
 
         public bool ConditionsOnPrompt => _head.DraftHeadConditionsOnPrompt;
 
+        public bool TryTakeHeldCarry(int position, float[] carry) => _head.TryTakeHeldCarry(position, carry);
+
         /// <summary>
         /// A head that keeps per-position state of its own (a NextN/MTP block with
         /// its own KV cache) cannot start drafting after trunk positions it never
@@ -208,10 +210,25 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         private int ProposeChain(in DraftContext ctx, float[] hIn, List<int> draftOut)
         {
-            int[] tokens;
-            float[] hRows;
-            int start;
-            if (_hasPend && _pendStart + _pendCount != ctx.Position)
+            ChainInputs(ctx.LastToken, ctx.Position, hIn, out int[] tokens, out float[] hRows, out int start);
+            _hasPend = false;
+            if (_chainIds.Length < ctx.MaxTokens)
+            {
+                _chainIds = new int[ctx.MaxTokens];
+                _chainProbs = new float[ctx.MaxTokens];
+            }
+            int steps = _head.DraftChain(tokens, hRows, start, ctx.MaxTokens, _chainIds, _chainProbs, MinDraftProb);
+            return KeepChain(_chainIds, _chainProbs, steps, draftOut);
+        }
+
+        /// <summary>
+        /// The rows a chain from <paramref name="lastToken"/> at <paramref name="position"/> starts with: the stashed
+        /// catch-up folded in front of it when the stash runs right up to the position, else the token alone (a stash that
+        /// does not is replayed on its own first). The stash stays until the caller takes it.
+        /// </summary>
+        private void ChainInputs(int lastToken, int position, float[] hIn, out int[] tokens, out float[] hRows, out int start)
+        {
+            if (_hasPend && _pendStart + _pendCount != position)
                 FlushPending();
             if (_hasPend)
             {
@@ -221,33 +238,52 @@ namespace TensorSharp.Runtime.Speculative
                 if (_foldH == null || _foldH.Length < (long)n * _featureSize)
                     _foldH = new float[(long)n * _featureSize];
                 Array.Copy(_pendTokens, _foldTokens, _pendCount);
-                _foldTokens[_pendCount] = ctx.LastToken;
+                _foldTokens[_pendCount] = lastToken;
                 Array.Copy(_pendH, _foldH, (long)_pendCount * _featureSize);
                 Array.Copy(hIn, 0, _foldH, (long)_pendCount * _featureSize, _featureSize);
-                _hasPend = false;
                 tokens = _foldTokens;
                 hRows = _foldH;
                 start = _pendStart;
             }
             else
             {
-                tokens = new[] { ctx.LastToken };
+                tokens = new[] { lastToken };
                 hRows = hIn;
-                start = ctx.Position;
+                start = position;
             }
-            if (_chainIds.Length < ctx.MaxTokens)
-            {
-                _chainIds = new int[ctx.MaxTokens];
-                _chainProbs = new float[ctx.MaxTokens];
-            }
-            int steps = _head.DraftChain(tokens, hRows, start, ctx.MaxTokens, _chainIds, _chainProbs);
+        }
+
+        /// <summary>A chain's drafts up to the first one below <see cref="MinDraftProb"/>.</summary>
+        private int KeepChain(int[] ids, float[] probs, int steps, List<int> draftOut)
+        {
             for (int i = 0; i < steps; i++)
             {
-                if (_chainProbs[i] < MinDraftProb)
+                if (probs[i] < MinDraftProb)
                     break;
-                draftOut.Add(_chainIds[i]);
+                draftOut.Add(ids[i]);
             }
             return draftOut.Count;
+        }
+
+        /// <summary>
+        /// Batched step, first half, when several sequences' heads chain in one pass
+        /// (<see cref="IBatchedSpeculativeTarget.TryDraftChainBatch"/>): this sequence's rows, as <see cref="Propose"/> would
+        /// start its chain from <paramref name="lastToken"/> at <paramref name="position"/> with the carry
+        /// <paramref name="carry"/>. The stashed catch-up is folded in (or replayed now when it does not reach the position)
+        /// but stays stashed until <see cref="AcceptChain"/>: a pass that declines leaves it to this sequence's own draft.
+        /// </summary>
+        public void PrepareChain(int lastToken, int position, float[] carry, out int[] tokens, out float[] hRows, out int start)
+        {
+            ArgumentNullException.ThrowIfNull(carry);
+            ChainInputs(lastToken, position, carry, out tokens, out hRows, out start);
+        }
+
+        /// <summary>Batched step, second half: the pass ran this sequence's chain (<paramref name="steps"/> steps), so the
+        /// stash it folded is taken; the drafts are kept up to the first one below <see cref="MinDraftProb"/>.</summary>
+        public int AcceptChain(int[] ids, float[] probs, int steps, List<int> draftOut)
+        {
+            _hasPend = false;
+            return KeepChain(ids, probs, steps, draftOut);
         }
 
         public void Commit(int[] tokens, float[]? hRows, int startPos)
@@ -321,15 +357,24 @@ namespace TensorSharp.Runtime.Speculative
                     best = i;
             }
 
-            double denom = 0;
-            for (int j = 0; j < K; j++)
-            {
-                if (float.IsNegativeInfinity(topV[j]))
-                    break;
-                denom += Math.Exp(topV[j] - topV[0]);
-            }
-            prob = denom > 0 ? (float)(1.0 / denom) : 0f;
+            prob = TopConfidence(topV);
             return best;
+        }
+
+        /// <summary>
+        /// The confidence of <see cref="ArgmaxWithTopKConfidence"/> from a step's largest logits in descending order (up to
+        /// ten; a draft chain's device top-k reads back only these): the top-1 probability of a softmax over them.
+        /// </summary>
+        public static float TopConfidence(ReadOnlySpan<float> top)
+        {
+            double denom = 0;
+            for (int j = 0; j < top.Length; j++)
+            {
+                if (float.IsNegativeInfinity(top[j]))
+                    break;
+                denom += Math.Exp(top[j] - top[0]);
+            }
+            return denom > 0 ? (float)(1.0 / denom) : 0f;
         }
     }
 }

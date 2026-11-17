@@ -117,6 +117,12 @@ namespace TensorSharp.Runtime.Scheduling
             AttachSoloPrefillPolicy(model, cfg, _scheduler, _logger);
             _executor = new BatchExecutor(model, _pool, _scheduler, logger);
             _executor.InitializeRadixCache(cfg);
+            // A prompt a step finished before the step's verify windows ran streams its first token then.
+            _executor.PromptFinished = seq =>
+            {
+                if (_handles.TryGetValue(seq.RequestId, out var handle))
+                    PublishEarlyFirstToken(seq, handle);
+            };
             // So admission can say WHY a turn reused nothing.
             _scheduler.AttachReuseDiagnostics(() => _executor.LastFusedContinuationDeclineReason);
             // Shared-prefix checkpoints: end a prefill chunk exactly where the chat
@@ -227,6 +233,103 @@ namespace TensorSharp.Runtime.Scheduling
         /// reads it to prove the loop parked rather than merely that the gate closed.
         /// </summary>
         public long StepsHeldByGate => Interlocked.Read(ref _stepsHeldByGate);
+
+        /// <summary>Each step's schedule, on the engine's thread before the step runs (tests).</summary>
+        internal Action<SchedulerOutput>? ScheduledForTests { get; set; }
+
+        /// <summary>The engine's step executor (tests).</summary>
+        internal BatchExecutor ExecutorForTests => _executor;
+
+        // Requests being prepared for submission (BeginPreparation), and the signal each one's end raises.
+        private int _preparing;
+        private readonly ManualResetEventSlim _preparationEnded = new(false);
+
+        /// <summary>The longest an idle engine holds its first step for requests still being prepared
+        /// (<see cref="BeginPreparation"/>).</summary>
+        internal static readonly TimeSpan DefaultPreparationWait = TimeSpan.FromMilliseconds(20);
+
+        /// <summary><see cref="DefaultPreparationWait"/>, settable for tests.</summary>
+        internal TimeSpan PreparationWait { get; set; } = DefaultPreparationWait;
+
+        /// <summary>Steps an idle engine held for requests still being prepared (tests).</summary>
+        internal long StepsHeldForPreparation => Interlocked.Read(ref _stepsHeldForPreparation);
+        private long _stepsHeldForPreparation;
+
+        /// <summary>
+        /// A request is being prepared for this engine (its prompt rendered and tokenized): dispose the result once it was
+        /// submitted (<see cref="SubmitRequest"/>) or abandoned. While any request is, an engine with nothing running holds
+        /// the step that would start the requests already submitted until those being prepared were submitted too (at most
+        /// <see cref="PreparationWait"/>), so requests that arrive together prefill in one step. Started at the first
+        /// submission, four Qwen3.8-27B conversations sent together (all submitted within 0.4 ms) prefilled in two steps, the
+        /// first taking one, two or three of them, and the others' first tokens waited for that step whole: up to 0.21 s, where
+        /// one step of all four gives every one of them its first token by 0.16 s (an RTX PRO 6000 slice). A lone request ends
+        /// its own preparation when it is submitted, so it never waits.
+        /// </summary>
+        public IDisposable BeginPreparation()
+        {
+            Interlocked.Increment(ref _preparing);
+            return new PreparationScope(this);
+        }
+
+        private sealed class PreparationScope(InferenceEngine engine) : IDisposable
+        {
+            private int _ended;
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _ended, 1) != 0) return;
+                Interlocked.Decrement(ref engine._preparing);
+                engine._preparationEnded.Set();
+            }
+        }
+
+        /// <summary>
+        /// With nothing running, wait (at most <see cref="PreparationWait"/>) until no request is being prepared, then take the
+        /// commands their submissions queued, so the next step admits them with the requests already waiting. Running requests
+        /// are never held: requests arriving beside them join at the next step boundary.
+        /// </summary>
+        private void AwaitPreparedSubmissions()
+        {
+            if (Volatile.Read(ref _preparing) <= 0 || _scheduler.RunningCount > 0 || PreparationWait <= TimeSpan.Zero) return;
+            Interlocked.Increment(ref _stepsHeldForPreparation);
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            while (Volatile.Read(ref _preparing) > 0 && !_shutdownCts.IsCancellationRequested)
+            {
+                _preparationEnded.Reset();
+                if (Volatile.Read(ref _preparing) <= 0) break;
+                TimeSpan left = PreparationWait - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                if (left <= TimeSpan.Zero) break;
+                _preparationEnded.Wait(left);
+            }
+            while (_commands.Reader.TryRead(out var cmd))
+            {
+                lock (_model.GpuComputeLock)
+                    ApplyCommand(cmd);
+            }
+        }
+
+        /// <summary>Idle slices the model ran (tests).</summary>
+        internal long IdleSlicesRun => Interlocked.Read(ref _idleSlicesRun);
+        private long _idleSlicesRun;
+
+        /// <summary>
+        /// Nothing to run: the model's idle work (<see cref="IUnifiedBatchModel.RunIdleSlice"/>), a slice at a time while no
+        /// command has arrived, so a request that arrives meanwhile waits for one slice at most. Not while the host has closed
+        /// the compute gate.
+        /// </summary>
+        private void RunIdleWork()
+        {
+            if (_model is not IUnifiedBatchModel { SupportsUnifiedBatching: true } unified) return;
+            while (!_shutdownCts.IsCancellationRequested && !_commands.Reader.TryPeek(out _)
+                   && Volatile.Read(ref _computeGate) is not { IsOpen: false })
+            {
+                bool more;
+                lock (_model.GpuComputeLock)
+                    more = unified.RunIdleSlice();
+                Interlocked.Increment(ref _idleSlicesRun);
+                if (!more) return;
+            }
+        }
 
         /// <summary>Submit a sequence for inference. Returns immediately with a
         /// handle whose <see cref="InferenceRequestHandle.Tokens"/> channel
@@ -357,6 +460,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_disposed) return;
                 _disposed = true;
                 _shutdownCts.Cancel();
+                _preparationEnded.Set();
                 _commands.Writer.TryComplete();
             }
             // Wait for the worker to actually leave its step. The caller is about to
@@ -435,6 +539,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // If there's nothing in flight, block on command channel.
                 if (_scheduler.RunningCount == 0 && _scheduler.WaitingCount == 0)
                 {
+                    RunIdleWork();
                     try
                     {
                         // Wait for at least one command to arrive.
@@ -459,6 +564,8 @@ namespace TensorSharp.Runtime.Scheduling
                     continue;
                 }
 
+                AwaitPreparedSubmissions();
+
                 // Admission materializes model payloads, and completion captures them.
                 // They share the same compute gate as forwarding and media encoders.
                 lock (_model.GpuComputeLock)
@@ -470,6 +577,7 @@ namespace TensorSharp.Runtime.Scheduling
                     try
                     {
                         output = _scheduler.Schedule();
+                        ScheduledForTests?.Invoke(output);
                     }
                     catch (Exception ex)
                     {
@@ -502,6 +610,7 @@ namespace TensorSharp.Runtime.Scheduling
                         continue;
                     }
 
+                    PublishResumedFirstTokens(output);
                     try
                     {
                         results = _executor.ExecuteStep(output);
@@ -1203,6 +1312,31 @@ namespace TensorSharp.Runtime.Scheduling
                 return;
             handle.PublishToken(token);
             seq.EarlyFirstTokenPublished = true;
+        }
+
+        /// <summary>A request resumed at its prompt's end from a checkpoint that kept the prompt's
+        /// last logits (<see cref="SequenceState.ResumedAtPromptEnd"/>) has no prompt step after
+        /// which <see cref="PublishEarlyFirstToken"/> would stream its first token: it is drawn from
+        /// those logits and streamed now, before the step that forwards it, as for a prefilled prompt.
+        /// A draw that fails is left to that step, which draws again and fails only that request.</summary>
+        private void PublishResumedFirstTokens(SchedulerOutput output)
+        {
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                if (work.IsPrefill || seq.EarlyFirstToken >= 0 || !seq.ResumedAtPromptEnd
+                    || !_handles.TryGetValue(seq.RequestId, out var handle))
+                    continue;
+                try
+                {
+                    PublishEarlyFirstToken(seq, handle);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Drawing the first token of {EngineRequestId} from its checkpoint's logits failed; its step draws it.",
+                        seq.RequestId);
+                }
+            }
         }
 
         /// <summary>Drop speculatively accepted tokens past a mid-batch stop

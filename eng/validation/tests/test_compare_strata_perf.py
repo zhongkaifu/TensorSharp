@@ -131,13 +131,10 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "environment controls"):
             module.compare([self.report], [candidate])
 
-    def test_both_feature_flags_may_select_the_same_arm(self):
+    def test_only_the_direct_cuda_backend_has_arms(self):
+        self.report["backend"] = "GgmlCuda"
         candidate = self.candidate()
-        self.report["environment"]["TS_Q4E_PREFILL_COMBINE"] = "0"
-        candidate["environment"]["TS_Q4E_PREFILL_COMBINE"] = "1"
-        self.assertTrue(module.compare([self.report], [candidate])["passed"])
-        candidate["environment"]["TS_Q4E_PREFILL_COMBINE"] = "0"
-        with self.assertRaisesRegex(ValueError, "Unexpected TS_Q4E_PREFILL_COMBINE"):
+        with self.assertRaisesRegex(ValueError, "direct CUDA backend"):
             module.compare([self.report], [candidate])
 
     def test_wrong_effective_fusion_policy_fails(self):

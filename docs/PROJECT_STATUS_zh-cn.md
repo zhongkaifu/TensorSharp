@@ -115,6 +115,14 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 
 以下变化跨越多个发布标签。上文的 LTX 2.5、EmbeddingGemma 2、Muse Spark、从任意分片加载分片 GGUF、原生技能发现和最新 MiniMax-H3 改动晚于 `v2026.10.11`；知识集合与生成中引导已包含于该标签。下面保留早期工作的兼容性说明和性能实测记录。
 
+- **Qwen 直连 CUDA 引擎与 NInfer 支持已移除。** Qwen 3.5 / 3.6 / 3.8（`qwen35`、`qwen35moe`）与 Qwen 3.8 Flash Next（`qwen4exp`）
+  现在在所有后端上都运行在共享解码运行时上；`--backend cuda` 上它的图运行在 CUDA 图执行器上。`--backend cuda` 上的稠密 NVFP4
+  检查点不再有专属的直连引擎；Flash Next 在 `--backend cuda` 上现在与 `ggml_cuda` 一样接受 `--tp N` 与 `--n-cpu-moe` / `--cpu-moe`
+  （`--tp` 与 `--layer-split` 同时使用仍被拒绝）；NInfer 文件（`.ninfer`、`neroued/Qwen3.8-27B-nvfp4-NInfer`）不再能加载。引擎的环境变量
+  （引擎自己的开关、`TS_MOE_TIER_ADAPT_SWAPS` / `_EVERY` / `_ASYNC` / `_PROMPT_SWAPS`、`TS_NINFER_GGUF_DIR`）会让服务端
+  或 CLI 在启动时报错退出；`TS_Q4E_HC_Q8` 与 `TS_Q4E_MTP_EXPERTS` 保留，由运行时读取；预设 `config/qwen3.8-27b-ninfer.json`、`config/qwen3.8-27b-ninfer-64k.json` 与
+  `config/qwen3.8-flash-next-cuda-4lanes.json` 已删除。这些模型族的 `--backend cuda` 路径此后尚未在 GPU 上测量；见
+  [环境变量矩阵](env_var_feature_matrix_zh-cn.md#kv-cache--上下文)。
 - **Muse Spark 的两种多 GPU 模式都通过原生整模型执行器运行。** 它是 `ggml_cuda` / `ggml_vulkan` 上的默认路径，`ggml_cuda` 上的 `--tp N` 现在也用它，通过上游 ggml 的 meta 后端把每层切分到前 N 张 CUDA GPU；`TS_MUSE_SPARK_NATIVE=0` 恢复逐算子路径，`ggml_vulkan` 上的 `--tp N` 仍走这条路径。按层切分最多覆盖 16 张 GPU，无法满足的 GPU 数会被拒绝，而不是改用更少的 GPU；在 CUDA GPU 上，一个提示的 prefill 会以流水线方式分布到各 GPU（`TS_MUSE_SPARK_PIPELINE`、`TS_MUSE_SPARK_PIPELINE_UBATCH`）。未设 `MAX_CONTEXT` 时，放不下的声明上下文会被限制到能放下的最大值。启用流水线 prefill 时，若只有一个请求，它的 prefill 步长由 Muse Spark 自己选择（8,192 token），除非设置了 `TS_SCHED_SOLO_PREFILL_CHUNK`。在支持 P2P 的 GPU 达到十张及以上的 Linux 主机上，TensorSharp 自有的 `cuMemSetAccess` 保护层消除了曾让带 NCCL 构建的每次 `ggml_cuda` 运行都中止的 ggml-cuda 临时内存池错误（CUDA 允许每张 GPU 最多八个 peer 连接）。既没有 `TS_MUSE_SPARK_CPU_MOE=auto` 也没有 `--n-cpu-moe N` 时，GPU 放不下的按层切分 checkpoint 会在加载时被拒绝，错误信息会指明该选项。处理并发请求时，把 `TS_MUSE_SPARK_PLAN_SLOTS` 设为并发数再加一（留给共享前缀检查点）。见[实测启动配置](models/muse-spark_zh-cn.md#启动)与[十 GPU 对比](perf/muse-spark-vs-llama-cpp.md)（英文）。
 - **分片 GGUF 可从任意分片加载。** `--model` 可以指向 `-0000N-of-0000M` 分片组中的任意文件：TensorSharp 从第 1 片读取元数据、合并所有分片的张量表，并在加载权重前拒绝缺失的分片或不一致的分片数。指向第 1 片的用法照旧可用。
 - **TensorAgent 与显式启用的服务端请求支持知识集合。** 每个聊天或请求都需显式选择集合；加载兼容模型后可重新索引仅元数据的媒体。导入保留原文件；替换或重新索引会使旧版本引用失效。见[个人知识库](knowledge-system_zh-cn.md)。
@@ -132,7 +140,7 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   按需从 SSD 读取。只有每个分片都完整时它才算已安装；分片不完整时应用拒绝加载
   （“Qwen3.8 Flash Next is not completely downloaded yet.”），而不是让引擎在用户从未见过的文件上失败。见
   [Mac 专属模型](../TensorAgent/README.md#the-macs-own-models)。
-- **Direct CUDA 引擎（`cuda`）可以运行 Qwen 3.8 Flash Next 的 UD-Q2_K_XL。** 它过去会在加载时拒绝该文件的
+- **Direct CUDA 引擎（`cuda`）可以运行 Qwen 3.8 Flash Next 的 UD-Q2_K_XL**（该引擎此后已移除，见第一条）。它过去会在加载时拒绝该文件的
   IQ2_XS/IQ3_XXS 专家（"unsupported expert quant type 17"）；现在用移植自 ggml 点积的内核解码它们，整个解码步仍被捕获为
   CUDA graph，其 tensor core 与寄存器暂存的分组专家内核也能在预填充时处理这两种类型。在 2x A40（`--layer-split 2`）上，
   预填充从约 500 tok/s 提升到 1,612 tok/s（预热后），真实文本的解码速度达到 llama.cpp 的 95-96%。这个量化的多 GPU 用 `--layer-split N`：`--tp N` 仍会拒绝它（退出码 2）。见
@@ -251,10 +259,10 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
     与 `TS_MLX_KV_MATERIALIZE_INTERVAL`；
   - 关闭保留（重放）整模型计算图或其部件的开关（`TS_QWEN35_FD_PERSIST`、`TS_GEMMA4_FD_PERSIST`、
     `TS_GPTOSS_FD_PERSIST`、`TS_MUSE_GLIMMER_PERSIST`、`TS_DFLASH_PERSIST`、各 `*_BATCHED_ARENA` 开关、
-    `TS_QWEN35_METAL_*`、`TS_Q35_VERIFY_PERSIST` 等），GPT OSS 的 decode 与张量并行开关（`TS_GPTOSS_MODEL_DECODE`、
+    `TS_QWEN35_METAL_*` 等），GPT OSS 的 decode 与张量并行开关（`TS_GPTOSS_MODEL_DECODE`、
     `TS_GPTOSS_FUSED_DECODE`、`TS_GPTOSS_TP_*`、`TS_GPTOSS_MLX_MOE_GQMM`、`TS_GPTOSS_PAGED_ATTN_MANAGED`），以及关闭
     默认路径的 Qwen 3.5 与 Gemma 4 开关（`TS_QWEN35_FULL_DECODE`、`TS_QWEN35_FUSED_VERIFY`、`TS_QWEN35_TP_FUSED*`、
-    `TS_G4_*`、`TS_GMTP_NO_*` 等）。`TS_QWEN35_HOST_MOE_VERIFY` 改为 `TS_HOST_MOE_VERIFY`。`TS_Q35_VERIFY_SNAPSHOTS=0`
+    `TS_G4_*`、`TS_GMTP_NO_*` 等）。`TS_QWEN35_HOST_MOE_VERIFY` 改为 `TS_HOST_MOE_VERIFY`。关闭 Qwen 3.5 逐行 verify 快照的开关
     作为 `ggml_cuda` 上宽 verify 分歧的规避手段一直保留，直到 `Qwen35Model` 本身于 2026-11 删除；
   - 两个从未默认启用的实验：Qwen 3.5 的设备端常驻 verify 状态（`TS_QWEN35_VERIFY_RESIDENT`，已知结果错误）与
     Gemma 4 的批处理分页投机主干（`TS_GMTP_BATCHED_TRUNK`，速度约为融合线性 verify 的一半）。投机解码总在模型的
@@ -278,7 +286,7 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   - 另外四个从未默认启用的实验：原生批处理 GatedDeltaNet 步（`TS_QWEN35_BATCHED_GDN_NATIVE`，从未验证）、wmma Q8_0
     GEMM（`TS_CUDA_Q8_MMA`，已被 MMQ 内核取代）、设备端 MoE prefill（`TS_CUDA_MOE_PREFILL_ONDEVICE`，只有分组
     prefill 的 0.58 倍）以及 Gemma 4 的 GEMM 全局注意力（`TS_CUDA_GEMMA4_GLOBAL_GEMM_ATTN`）；
-  - 关闭默认路径的模型开关：`TS_Q4E_FUSED_ATTN` / `_FFN` / `_GDN`、`TS_NEMOTRON_FLASH_DECODE`、
+  - 关闭默认路径的模型开关：Qwen 3.8 Flash Next 的融合注意力、FFN 与 GDN 开关、`TS_NEMOTRON_FLASH_DECODE`、
     `TS_NEMOTRON_LINEAR_RESIDUAL_FUSED`、`TS_NEMOTRON_MAMBA2_NATIVE_DECODE` / `_PREFILL`、
     `TS_NEMOTRON_MOE_PREFILL_BATCHED`、`TS_MUSE_GLIMMER_FUSED` / `_FUSED_CPU` / `_TP_FUSED` / `_VENC_FUSED`、
     `TS_DFLASH_FUSED`、`TS_DSV4_MMA_EXPERTS` / `_STAGED_EXPERTS`、`TS_DSV4_DSPARK_CAPTURE`，以及超连接覆盖开关
@@ -290,11 +298,11 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   - 与 `--tp` / `--layer-split` 并存的放置拼写：`TS_DSV41_TP`（只用 `--tp N` 即可启用 DeepSeek V4.1 的 routed-MoE
     张量并行），以及 `TS_DSV4_NGPU` / `TS_GLM_NGPU`（GPU 数由 `--layer-split N` 设置；没有“全部可见 GPU”的简写，
     不给放置参数时这些执行器只用一张卡）；
-  - `TS_Q4E_RETAINED_CACHE` 与 `TS_Q4E_RETAINED_CACHE_MB`：Qwen 3.8 Flash Next 已结束的会话与共享前缀检查点
+  - Qwen 3.8 Flash Next 的保留缓存开关：它已结束的会话与共享前缀检查点
     由共享运行时的前缀缓存保留；
-  - 更多关闭默认路径或进入已结束实验的开关：Qwen 3.8 Flash Next 的 `TS_Q4E_TOKEN_GRAPH`、`TS_Q4E_SPAN_ATTN`、
-    `TS_Q4E_FLASH_ATTN`、`TS_Q4E_GRAPH_UID`、`TS_Q4E_SPAN_STATE`、`TS_Q4E_SPAN_REBUILD`、`TS_Q4E_SPAN_FA_MAX`、
-    `TS_Q4E_GDN_MAX_LAYERS` 与 `TS_Q4E_RES_RESIDENT`（已知结果错误）；GLM 5.x 的 `TS_GLM_FA`、`TS_GLM_FUSED_LID`、
+  - 更多关闭默认路径或进入已结束实验的开关：Qwen 3.8 Flash Next 的 token 图、token span、flash attention、
+    图 ID 与 span 状态开关，以及它的 span 重建、span flash attention 上限、GDN 层数上限与常驻残差实验
+    （最后一个已知结果错误）；GLM 5.x 的 `TS_GLM_FA`、`TS_GLM_FUSED_LID`、
     `TS_GLM_TOPK`、`TS_GLM_TP_FUSED` 与 `TS_GLM_VENC_FUSED`（flash attention 与融合 lightning 索引器由后端探测决定）；
     以及 `TS_GGML_REUSE_COMPUTE_BUF`、`TSG_USE_FLASH_ATTN_PREFILL`、`TS_DISABLE_FUSED_DENSE_FFN`、`TS_ENCODER_YIELD`、`TS_GEMMA4V_FUSED`、`TS_GGML_FUSED_NORM_ADD`、
     `TS_GGML_MOE_FUSED_DECODE`、`TS_QWEN_VAE_POOL` / `TS_QWEN_VAE_POOL_TRIM`、`TENSORSHARP_CUDA_POOL`（缓存大小由

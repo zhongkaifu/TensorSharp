@@ -1,24 +1,18 @@
 {
-  // Qwen3.8 Flash Next on NVIDIA, the fastest measured setup: ISTA-DASLab's GSQ-RCO Q2_0 (two GGUF shards, 66.4 GB)
-  // on the direct CUDA engine with the shared MTP head (three drafts).
+  // Qwen3.8 Flash Next on NVIDIA: ISTA-DASLab's GSQ-RCO Q2_0 (two GGUF shards, 66.4 GB) on --backend cuda (the shared
+  // decoder runtime on the CUDA graph executor) with the shared MTP head (three drafts).
   //   TensorSharp.Server.Host --config config/qwen3.8-flash-next-cuda.json
-  // For several concurrent users add config/qwen3.8-flash-next-cuda-4lanes.json after this file.
   //
-  // Measured on an RTX 5090 (32 GB), 2026-11-09, eng/qwen38-engine-bench.py (greedy, two passes), one sequence lane:
-  // decode 141-148 tok/s on short answers and 247-250 on a long generation, 185-204 after a 4K-token prompt and
-  // 237-271 after 16K; TTFT 0.65-0.67 s at 4K and 2.73-2.74 s at 16K (2026-11-08: 13.2 s at 48K, 30.4 s at 100K).
-  // The MTP head commits 3.1 tokens a window (78% of its drafts). With four lanes
-  // (config/qwen3.8-flash-next-cuda-4lanes.json) parallel_4 reached 272-299 tok/s in all.
-  // Strata on the same card: TTFT 0.93 s at 4K and 2.74 s at 16K, decode 307 on a long generation and 394 after long
-  // prompts. See docs/models/qwen38-flash-next.md.
+  // Not re-measured since the direct-CUDA Qwen3.8 engine was removed. That engine, on an RTX 5090 (32 GB),
+  // 2026-11-09, eng/qwen38-engine-bench.py (greedy, two passes), one sequence lane: decode 141-148 tok/s on short
+  // answers and 247-250 on a long generation, 185-204 after a 4K-token prompt and 237-271 after 16K; TTFT 0.65-0.67 s
+  // at 4K and 2.73-2.74 s at 16K. Strata on the same card: TTFT 0.93 s at 4K and 2.74 s at 16K, decode 307 on a long
+  // generation and 394 after long prompts. See docs/models/qwen38-flash-next.md.
   //
-  // The experts do not fit a 32 GB card: the engine keeps the most-routed ones in VRAM (ranked by a routing profile
+  // The experts do not fit a 32 GB card: the runtime keeps the most-routed ones in VRAM (ranked by a routing profile
   // it records on the first load) and computes the rest on the host, so the host needs ~45 GB of RAM (the 28.8 GB
-  // n-gram table, ~15 GB of pinned host experts, ~1.6 GB of pinned KV per sequence). Loading takes ~3 minutes.
-  // A host without the RAM to pin its share of the experts reads them from the model files' mapping instead (slower,
-  // at the speed the OS serves those pages; TS_Q4E_HOST_EXPERTS_PIN): a 16 GB RTX 3080 Laptop with 32 GB of RAM keeps
-  // 6.5 GiB of experts in VRAM, maps the other 25.1 GiB, loads in ~13 s and decoded at ~17 tok/s after a 3.5K-token
-  // prompt (TTFT 22 s from a cold page cache).
+  // n-gram table and the page-locked host experts). A host without the RAM to page-lock its share of the experts
+  // reads them from the model files' mapping instead (slower, at the speed the OS serves those pages).
   // Apple Silicon: config/qwen3.8-flash-next.json.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
@@ -31,7 +25,6 @@
   "backend": "cuda",
   "max-tokens": 4096,
   "continuous-batching": true,
-  // The engine's KV cache is q8_0 unless --kv-cache-dtype names another.
   "temperature": 1.0,
   "top-k": 20,
   "top-p": 0.95,
@@ -39,8 +32,7 @@
   "repeat-penalty": 1.0,
 
   "environment": {
-    // The model declares 262,144 tokens; 131,072 was the measured setup (a resident KV window keeps 32,960 cells
-    // in VRAM and the rest in pinned host memory).
+    // The model declares 262,144 tokens; 131,072 was the measured setup of the removed engine.
     "MAX_CONTEXT": "131072",
     // The hyper-connection matrices (BF16 in the file) run as a Q8_0 copy.
     "TS_Q4E_HC_Q8": "1",

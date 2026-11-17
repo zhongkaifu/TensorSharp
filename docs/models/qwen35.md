@@ -6,7 +6,7 @@
 |---|---|
 | Provider | Alibaba |
 | GGUF architecture keys | `qwen35`, `qwen35moe`, `qwen3next` |
-| Source class | [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) on the shared decoder runtime; [`Qwen35CudaModel`](../../TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs) for dense NVFP4 on `--backend cuda` |
+| Source class | [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) on the shared decoder runtime, on every backend |
 | Vision encoder | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | Image processor | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
 | Example models | Qwen3.5-9B (dense hybrid), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE-family), Qwen3.6-27B / Qwen3.8-27B (dense); also [Bonsai2 27B](bonsai2.md) (PRISM PQ2_0 / PTQ1_0) |
@@ -286,11 +286,10 @@ parallel.
 
 ### 4.4 RoPE
 
-NeoX-style rotary embeddings. Frequencies are cached in `_ropeFreqs[halfDim]`
-once. Position tensors are cached across attention layers per forward pass:
-`_cachedRoPEPosQ` / `_cachedRoPEPosK` are reused when `(seqLen, startPos)`
-match across all 12 attention layers, eliminating duplicate allocation +
-population.
+NeoX-style rotary embeddings over the first `rope.dimension_count` channels of
+each head (a partial rotary), applied after the per-head Q/K RMSNorm. The
+runtime computes a step's positions once (`StandardDecoderModel.Positions.cs`)
+and every attention layer of the step's graph reads them.
 
 `qwen3next` GGUFs additionally ship `qwen35.rope.dimension_sections` which
 defines MRoPE section boundaries. When present, the RoPE step uses
@@ -311,28 +310,20 @@ rope position = KV index + delta,   delta = max(last table row) + 1 - prompt len
 which is SGLang's `mrope_position_delta` (decode position `delta - 1 + seq_len`).
 The delta is per sequence ([`Qwen35RopePositions`](../../TensorSharp.Models/Models/Qwen35/Qwen35RopePositions.cs)):
 
-- **Settled before any kernel runs.** `BeginRopePositions` takes it from the staged
+- **Settled before any kernel runs.** `BeginRotaryPositions` (`StandardDecoderModel.Positions.cs`) takes it from the staged
   table of a prefill chunk; a forward from KV index 0 without a table starts a new
   history at delta 0; any other forward continues the active sequence's delta. A
   chunk whose rows are all text at `KV index + delta` drops the table and runs the
-  ordinary scalar-RoPE graphs, which rotate identically.
-- **Used by every path.** The whole-model decode (`rope_pos_delta`), the fused
-  prefill/verify graph (`rope_pos_delta` for scalar rows), the arena batched decode
-  (`rope_positions` per holder), the paged batched forward (the request's delta
-  from the injector), the per-op attention, the direct-CUDA prefill and decode
-  graphs, tensor parallelism and the MTP draft head. The per-layer native attention
-  kernels rotate at their KV index, so a sequence past an image does not take them.
-  (A DFlash drafter keeps its own
+  ordinary scalar rotary, which rotates identically.
+- **Used by every step.** Prompt chunks, decode rows, verify windows and batched steps
+  rotate each sequence's rows at `KV index + delta` from its own slot, on every backend
+  and placement, and the MTP draft layer does too. (A DFlash drafter keeps its own
   positions; they only affect how many drafts are accepted, never the output.)
-- **Stored with the state it describes.** Each per-request holder carries it through
-  swaps, retention, re-keying and pooling, a shared-prefix checkpoint and its clone
-  copy it, the per-block KV snapshot of the KV-swap concurrency path ends with it (like
-  the recurrent state, as of the block's end; an injected block whose size does not fit,
-  or whose delta would put the next token at a negative position, is refused before
-  anything is written, so a refusal leaves the model holding exactly the blocks before
-  it), and the checkpoint file format (`Q5KC`) is **version 2**, which writes it
-  after the row count. A version-1 file names no delta and is refused on import; the
-  engine logs that the saved checkpoint does not fit, prefills the prefix and saves it
+- **Stored with the state it describes.** Each slot carries it (`Slot.RopeDelta`) through
+  retention, donation to the next turn and pooling; a shared-prefix checkpoint and its
+  clone copy it, and the checkpoint file format is **version 2** or later
+  (`StandardDecoderModel.Checkpoints.cs`), which writes it. A file without it is not
+  read as a checkpoint of this format: the engine prefills the prefix and saves it
   again.
 
 Before this, decode, speculative verify and every scalar path rotated at the KV index
@@ -372,7 +363,7 @@ itself. Two things followed:
   conversation text -> image -> text -> text on Qwen3.5-9B-Q8_0. In the engine, turns
   3 and 4 must reuse the previous turn past the image, and every turn's greedy tokens
   are compared with a cold engine's, also with a text conversation decoding beside it
-  (per-request holders and the arena batched decode). On the model directly, a turn
+  (slots batched in one step). On the model directly, a turn
   built by decoding the previous reply and prefilling the new suffix is compared with a
   cold prefill of the whole prompt, logits step by step for 24 steps, and the same
   comparison runs on a text-only conversation as a control. A checkpoint taken after
@@ -413,7 +404,7 @@ On CUDA the decode and prefill kernels differ by up to about one logit even for 
 text-only conversation, so over 24 greedy tokens a low-margin token can flip between a
 reused and a cold turn with or without images.
 
-The concurrent test (holders and the arena) applies the same tie rule. At the first step
+The concurrent test (slots batched in one step) applies the same tie rule. At the first step
 where a request's tokens differ from its cold engine run it captures the cold logits (the
 same prompt prefilled cold straight on the model, which must have decoded the same tokens
 up to that step) and accepts the difference only when their top-2 margin is below the
@@ -526,13 +517,15 @@ output_norm.weight
 output.weight
 ```
 
-`FuseAttentionProjectionWeights()` fuses per-layer Q+K+V into
-`attn_qkv.weight` when all three GGUF tensors share a quantization type.
-Mixed-type importance-matrix/UD quant projections remain separate, avoiding
-multi-gigabyte FP32 expansion. `FuseRecurrentInputWeights()` packs five recurrent projections
-(`attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha`, plus an empty slot) into
-one fused `ssm_in_proj.weight` for GatedDeltaNet layers. `FuseGateUpWeights()`
-fuses dense FFN gate and up.
+At load the runtime fuses a full-attention layer's Q+K+V into one
+`attn_qkv.weight` when all three GGUF tensors share a quantization type
+(`TryFuseQkvWeights`), and dense FFN gate and up into `ffn_gate_up.weight`
+(`FuseGateUpWeights`). Mixed-type importance-matrix/UD quant projections remain
+separate, avoiding requantization and multi-gigabyte FP32 expansion. A
+GatedDeltaNet layer's `attn_qkv`, `attn_gate`, `ssm_beta` and `ssm_alpha` are
+packed into one `ssm_in_proj.weight` when the four share a type
+(`Qwen35RuntimeModel.PrepareLoadedWeights`): decode rows take it as one
+product, a prompt chunk takes the four.
 
 ## 7. TensorSharp implementation
 
@@ -540,12 +533,14 @@ Every load goes through [`Qwen35Architecture`](../../TensorSharp.Models/Models/Q
 
 | Load | Served by |
 |---|---|
-| `--backend cuda`, one GPU, a dense NVFP4 checkpoint, no `--tp` / `--layer-split` / host experts | [`Qwen35CudaModel`](../../TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs), the direct-CUDA engine (`TS_Q35_NATIVE=0` declines it) |
-| everything else: every backend (`cpu`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `mlx`, `cuda`), one device, `--tp`, `--layer-split`, their hybrid, a multi-node pipeline, host experts | [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) on the [shared decoder runtime](../design/unified-execution.md) |
+| every backend (`cpu`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `mlx`, `cuda`), one device, `--tp`, `--layer-split`, their hybrid, a multi-node pipeline, host experts, dense NVFP4 checkpoints included | [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) on the [shared decoder runtime](../design/unified-execution.md) |
 
 The family's own model class (`Qwen35Model`, its fused whole-model GGML graphs, the slot-stable
 arena, the persistent verify graphs and their native kernels) was removed in 2026-11; the runtime
-serves every placement it served.
+serves every placement it served. The direct-CUDA engine that `--backend cuda` used for dense NVFP4
+checkpoints on one GPU (`Qwen35CudaModel`, `Q35CudaEngine`) and its NInfer artifact route were
+removed after it, so those checkpoints now run on the runtime too; see
+[Direct-CUDA NVFP4 engine (removed)](#direct-cuda-nvfp4-engine-removed).
 
 `Qwen35RuntimeModel` is the family's recipe on the runtime:
 
@@ -588,39 +583,19 @@ own slot's K/V window and recurrent state. On the GGML backends the next step re
 with the positions, write rows and masks rewritten in place. On ggml_metal a decode row's
 recurrence updates its state in place.
 
-### Direct-CUDA NVFP4 route: LM head, verify GEMMs and prefill GEMMs
+### Direct-CUDA NVFP4 engine (removed)
 
-`--backend cuda` on the NVFP4 GGUF (`Q35CudaEngine`) reads every weight once per step, so a
-step costs what its kernels achieve of the RTX 5090's memory bandwidth. Three kernels fell
-well short and were replaced in 2026-11. Each computes the same values bit for bit (checked
-on every shape against the previous kernel); the answers did not change.
+Until 2026-11, `--backend cuda` ran a dense NVFP4 checkpoint on one GPU (no `--tp`, `--layer-split` or host experts)
+on a direct engine of its own (`Qwen35CudaModel`, `Q35CudaEngine` and its `ts_q35_*` kernels), which also loaded
+NInfer's NVFP4 artifact. The engine, its kernels, NInfer support and the engine's own environment variables are removed;
+setting one of those variables now stops the server or CLI at startup. `--backend cuda` serves these checkpoints on
+the shared runtime like every other load: its NVFP4 products run on the backend's FP4 kernels (`CudaFp4Kernels`,
+block-scaled FP4 tensor cores in an sm_120a / sm_121a build). The kernel and end-to-end figures this section used to
+list (RTX 5090, 2026-11) were measured on the removed engine and have not been repeated on the runtime.
 
-| Kernel | Before | Now (RTX 5090) |
-|---|---|---|
-| LM head, Q6_K 248,320 x 5,120 (the target head and the DFlash2 draft head, each step) | 210-byte superblocks read 2 bytes at a time, one superblock per `__syncthreads`: 0.83 TB/s, 1.27 ms at 32 rows | repacked at load into 64-row tiles (`ts_q35_repack_q6k_tiled`, the same bytes regrouped) and streamed through a cp.async pipeline: 32 rows 0.74 ms (1.41 TB/s), 8 rows 0.89 -> 0.69 ms, 1 row 1.06 -> 0.87 ms |
-| Split-K of the W4A4 verify GEMMs (9-64 rows) | split until the CTAs cover every SM: the 129-tile GDN input projection ran 2 splits in two waves | the most splits that still fit one wave: GDN input projection 38.1 -> 30.6 us, the 5,120-row output projections 18.1 -> 14.3 us at 32 rows |
-| Prefill W4A4 GEMMs (65+ rows) | cp.async 128-row tiles, about 830 TFLOPS | the TMA-fed, warp-specialized kernel of the NInfer route, plus an F32 SwiGLU epilogue for gate/up: 1,230-1,390 TFLOPS at 2,048-4,096 rows |
-
-End to end (GGUF + DFlash2 K7, 400-token answers to short prompts): 4 concurrent chats
-464 -> 521 tok/s, 2 concurrent chats 284 -> 308 tok/s. Prefill TTFT: an 11K-token prompt
-1.51 -> 1.20 s, a 36K-token prompt 6.57 -> 5.38 s, four 3.6K-token prompts at once 1.9-2.1 ->
-1.6-1.7 s.
-
-Still open on this route: the 1-8-row W4A8 GEMV reaches 1.17-1.37 TB/s at 8 rows. An int8
-tensor-core version that keeps the GEMV's summation order (one accumulator per GEMV lane)
-needed 242 registers and ran at 0.3-0.9 TB/s, so it was not kept.
-
-**Two concurrent chats and session turns on a long document.** With two chats a DFlash2 verify
-has 16 rows, so the projections leave the 8-row GEMV for the W4A4 GEMM, whose 32-row tile is then
-half empty. Profiling showed that this costs nothing: at 16 rows the GEMMs are memory-bound and as
-fast as or faster than the 8-row GEMV (gate/up 65 vs 73 us, GDN input projection 31.5 vs 40.5 us),
-and a bit-identical 16-row tile gained at most 3%. Three other costs were real and are fixed:
-
-| Cost | Before | Now (RTX 5090) |
-|---|---|---|
-| Pre-norm + NVFP4 quantization of 9+ rows (two per layer) | one dependent global-memory round trip per element group: 5.5 us | `ts_q35_add_rmsnorm_nvfp4_5120_f32` keeps the row in registers and issues every load first: 3.5 us, bit-identical |
-| A short prompt chunk (a session turn, a new chat's suffix) over a long cache | the 8-bit prompt attention, with no key split: a 47-token chunk over 127K cached tokens ran 8 CTAs, 5.3 ms a layer, after 0.65 ms converting the band | the 16-bit kernels, which split the keys across the device, until the 8-bit CTAs cover about 40% of the SMs (about 350 rows; both routes): that turn's first token 140 -> 50 ms |
-| Chats admitted in one step on a cached prefix | a request restored from the radix cache has no holder yet, so the batched prefill skipped it and each suffix ran on its own | the executor binds the holders and injects the prefixes first (`PrebindCachedPrefixPrefills`), so the suffixes share one forward: three such chats on a 120K-token document reach their first tokens within 3 ms of each other |
+One fix found on that route is shared and stays: chats admitted in one step on a cached prefix get their holders
+bound and their prefixes injected first (`PrebindCachedPrefixPrefills` in the batch executor), so their suffixes share
+one forward instead of each running on its own.
 
 ### MLX: UD quants and speculative decoding
 

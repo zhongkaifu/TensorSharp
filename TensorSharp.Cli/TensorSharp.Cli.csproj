@@ -8,6 +8,15 @@
     <Nullable>annotations</Nullable>
     <Description>Command-line host for TensorSharp local inference, diagnostics, prompt inspection, and JSONL batch processing.</Description>
     <PackageTags>$(TensorSharpPackageTags);cli;console;batch;diagnostics</PackageTags>
+    <!-- The server garbage collector, as the web host has by default: a recorded step's trace and capture allocate per op,
+         and the workstation collector's pauses sat inside decode cycles (Qwen3.8 Flash Next ISTA + MTP on an A40: 0.67-0.71 s
+         of pauses a run against 0.31-0.38 s, short-prompt decode +4.5%). -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <!-- Methods compiled fully optimized at their first call, not first at tier 0: a request's first decode steps trace and
+         record each step shape through code that had not been promoted yet (Qwen3.8 Flash Next ISTA + MTP on an A40: the
+         first request's eight trunk recordings 260-305 ms against 175-188 ms, short-prompt decode 100-104 tok/s against
+         111-113; model load 27-31 s either way). -->
+    <TieredCompilation>false</TieredCompilation>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />

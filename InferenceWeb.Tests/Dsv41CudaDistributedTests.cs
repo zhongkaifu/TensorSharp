@@ -541,11 +541,14 @@ public sealed partial class Dsv41CudaDistributedTests : IDisposable
             float[][] rows = drive != null
                 ? await drive(driver).WaitAsync(RunDeadline)
                 : await Task.Run(() => Script(driver.Forward, driver.ResetKVCache)).WaitAsync(RunDeadline);
-            StageCounters[] stages = models.Select(Counters).OrderBy(c => c.First).ToArray();
-            var run = new Run(rows, stages[0], Counters(driver), stages);
             groups[0].BroadcastControl(4, Array.Empty<int>());   // shutdown: every worker leaves its loop
             await Task.WhenAll(workers).WaitAsync(TimeSpan.FromSeconds(30));
-            return run;
+            // The counters once every worker has left its loop: a stage counts a boundary send after SendNext returns, so the
+            // next stage can have received it, and the driver its logits, before the sender's count moved (a three-node run on
+            // a 2-MIG RTX PRO 6000 read a middle node's 29 receives against 28 sends). The shutdown is a control broadcast,
+            // which no boundary counter counts.
+            StageCounters[] stages = models.Select(Counters).OrderBy(c => c.First).ToArray();
+            return new Run(rows, stages[0], Counters(driver), stages);
         }
         finally
         {

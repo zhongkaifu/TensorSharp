@@ -388,6 +388,32 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool DraftHeadConditionsOnPrompt => false;
 
+        /// <summary>
+        /// A speculating request's prompt runs on the plain path (it does not read through the speculative context
+        /// because the head keeps itself in step with the trunk, <see cref="DraftSelfCatchUp"/>): the head takes the
+        /// request's next prompt chunk's rows as the trunk forwards them, so its drafts condition on the prompt. Called
+        /// before each such chunk, with the request's id on a model that keeps a cache per request, or null for the
+        /// model's primary cache; a head that follows every forward anyway ignores it.
+        /// </summary>
+        void FollowPlainPrompt(string? requestId) { }
+
+        /// <summary>
+        /// <see cref="FollowPlainPrompt(string?)"/> knowing the prompt's end (<paramref name="promptEnd"/>, the position after
+        /// its last token): a head whose context keeps only the trailing positions (<see cref="DraftContextRows"/>, a block
+        /// drafter's ring) takes only the chunk's rows it still holds when the prompt ends.
+        /// </summary>
+        void FollowPlainPrompt(string? requestId, int promptEnd) => FollowPlainPrompt(requestId);
+
+        /// <summary>
+        /// The trunk's features of the row before <paramref name="position"/> (the carry a draft there chains from, as the
+        /// speculator's catch-up pairs them) when the head took that row as the trunk forwarded it (<see cref="DraftSelfCatchUp"/>:
+        /// the last row of a prompt read on the plain path) and nothing it holds was written since: copied into
+        /// <paramref name="carry"/> (<see cref="ISpeculativeTarget.SpecFeatureSize"/> floats), and true. Over the bound drafter
+        /// state (<see cref="IPerRequestDraftState.BindDraftState"/>). The first decode step after such a prompt then drafts
+        /// instead of running plainly to capture its carry, while the prompt's steps stay the plain ones. Default false.
+        /// </summary>
+        bool TryTakeHeldCarry(int position, float[] carry) => false;
+
         /// <summary>One per-token draft step at <paramref name="pos"/>: consume
         /// (token, previous hidden), fill next-token logits and the chained
         /// hidden state. Only called for <see cref="DraftHeadKind.PerToken"/>.</summary>
@@ -454,10 +480,11 @@ namespace TensorSharp.Runtime.Speculative
         /// <paramref name="maxTokens"/> - 1 further steps, each fed the previous step's first-max token and the head's own
         /// hidden output on the device. Writes each step's token to <paramref name="draftOut"/> and its confidence (the
         /// top-1 probability over the step's 10 largest logits, the per-token gate's measure) to
-        /// <paramref name="probOut"/>, and returns the steps run (at most <paramref name="maxTokens"/>). The head's own
-        /// state then covers every step's row; later calls start at or before positions it holds.
+        /// <paramref name="probOut"/>, and returns the steps run (at most <paramref name="maxTokens"/>). A head may stop after
+        /// the first step whose confidence is below <paramref name="stopBelow"/> (the speculator keeps no draft past it). The
+        /// head's own state then covers every step's row; later calls start at or before positions it holds.
         /// </summary>
-        int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut) => 0;
+        int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut, float stopBelow = 0f) => 0;
     }
 
     /// <summary>Convenience alias for the common case: a model that is its own
@@ -524,6 +551,29 @@ namespace TensorSharp.Runtime.Speculative
 
         /// <summary>Width of the proposal block <see cref="TryDraftBatch"/> fills per sequence.</summary>
         int BatchDraftBlockWidth => 0;
+
+        /// <summary>Whether <see cref="TryDraftChainBatch"/> runs the per-token draft head chains
+        /// (<see cref="IDraftHead.DraftChain"/>) of several sequences in one pass.</summary>
+        bool SupportsBatchedDraftChain => false;
+
+        /// <summary>Whether <paramref name="requestId"/>'s draft head can join a <see cref="TryDraftChainBatch"/> pass now;
+        /// a sequence that cannot drafts on its own.</summary>
+        bool CanBatchDraftChain(string requestId) => false;
+
+        /// <summary>
+        /// The per-token draft chains of several sequences in one pass, each over its own drafter state: lane i runs
+        /// <paramref name="tokens"/>[i] (the verified rows its head folds in, then its anchor; row k of
+        /// <paramref name="hRows"/>[i] is the trunk row before token k) at <paramref name="starts"/>[i], and then one row a
+        /// step for each lane still drafting, as <see cref="IDraftHead.DraftChain"/> chains one sequence: each step's
+        /// first-max token and the head's own hidden output. Fills <paramref name="draftOut"/>[i] and
+        /// <paramref name="probOut"/>[i] (the top-1 probability over the step's ten largest logits) with
+        /// <paramref name="stepsOut"/>[i] steps, at most <paramref name="maxTokens"/>[i], a lane stopping after its first
+        /// step below <paramref name="stopBelow"/>[i]. False when the head cannot batch these lanes; the caller then drafts
+        /// each on its own from the same inputs (rows a declined pass wrote are past each lane's anchor or its own fold,
+        /// which that draft writes again).
+        /// </summary>
+        bool TryDraftChainBatch(IReadOnlyList<string> requestIds, int[][] tokens, float[][] hRows, int[] starts, int[] maxTokens,
+            float[] stopBelow, int[][] draftOut, float[][] probOut, int[] stepsOut) => false;
 
         /// <summary>The verify takes exactly the longest draft plus its anchor (one row when nothing was drafted),
         /// rather than a few fixed widths: a trunk whose graphs replay per width, where a padded row costs a row

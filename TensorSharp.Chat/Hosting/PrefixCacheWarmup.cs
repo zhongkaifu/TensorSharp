@@ -88,7 +88,7 @@ namespace TensorSharp.Server.Hosting
         /// system prefix is public; the warm-up's user message and reply stay scoped to
         /// its own session.
         /// </remarks>
-        public static JsonElement BuildRequest(string sessionId, bool think, int maxTokens = 1)
+        public static JsonElement BuildRequest(string sessionId, bool think, int maxTokens = 1, string message = "hi")
         {
             if (string.IsNullOrWhiteSpace(sessionId))
                 throw new ArgumentException("a warm-up needs its own session id", nameof(sessionId));
@@ -96,7 +96,7 @@ namespace TensorSharp.Server.Hosting
             var body = new Dictionary<string, object>
             {
                 ["sessionId"] = sessionId,
-                ["messages"] = new[] { new Dictionary<string, string> { ["role"] = "user", ["content"] = "hi" } },
+                ["messages"] = new[] { new Dictionary<string, string> { ["role"] = "user", ["content"] = message } },
                 ["maxTokens"] = maxTokens,
                 ["think"] = think,
                 ["newChat"] = false,
@@ -146,25 +146,10 @@ namespace TensorSharp.Server.Hosting
             s_runningHere.Value++;
             try
             {
-                JsonElement body = BuildRequest(sessionId, think);
-                string failure = null;
-                bool completed = false;
-                await foreach (object frame in frames(body, cancellationToken).ConfigureAwait(false))
-                {
-                    failure ??= ErrorIn(frame);
-                    if (frame?.GetType().GetProperty("done")?.GetValue(frame) is true)
-                    {
-                        completed = true;
-                        if (frame.GetType().GetProperty("aborted")?.GetValue(frame) is true)
-                            failure ??= "warm-up request was aborted";
-                    }
-                }
-
+                string failure = await DriveAsync(frames, BuildRequest(sessionId, think), cancellationToken).ConfigureAwait(false);
                 clock.Stop();
                 if (cancellationToken.IsCancellationRequested)
                     return new Result(false, "cancelled", clock.Elapsed);
-                if (!completed)
-                    failure ??= "warm-up stream ended without completing the request";
                 if (!string.IsNullOrEmpty(failure))
                 {
                     logger?.LogWarning(LogEventIds.HostConfiguration,
@@ -188,6 +173,83 @@ namespace TensorSharp.Server.Hosting
                     "Prefix cache warm-up failed: {Error}", ex.Message);
                 return new Result(false, ex.Message, clock.Elapsed);
             }
+        }
+
+        /// <summary>
+        /// Several short conversations at once, on sessions of their own, after the shared prompt is warm: the steps that
+        /// run several requests together and decode past the first token - the drafter's graphs, a batched verify and its
+        /// recording, each new slot's - first run here instead of in the first real requests that arrive together.
+        /// Qwen3.8-27B with a DFlash2 drafter on an RTX PRO 4000: four Web UI conversations arriving at once waited 0.62 s
+        /// for their first token in a fresh process and 0.17 s in a warm one; after two 8-token conversations here, 0.14 s
+        /// (median; the direct engine 0.20 s).
+        /// </summary>
+        /// <param name="sessionIds">One session per conversation (each needs its own, as <see cref="BuildRequest"/> says).</param>
+        public static async Task<Result> RunConcurrentDecodeAsync(
+            Func<JsonElement, CancellationToken, IAsyncEnumerable<object>> frames,
+            IReadOnlyList<string> sessionIds,
+            bool think,
+            int maxTokens,
+            ILogger logger,
+            CancellationToken cancellationToken = default)
+        {
+            if (frames == null) throw new ArgumentNullException(nameof(frames));
+            if (sessionIds == null || sessionIds.Count == 0) throw new ArgumentException("no warm-up sessions", nameof(sessionIds));
+            var clock = Stopwatch.StartNew();
+            using IDisposable noDump = TensorSharp.Runtime.Scheduling.FirstTokenLogitsDump.Suppress();
+            s_runningHere.Value++;
+            try
+            {
+                var runs = new Task<string>[sessionIds.Count];
+                for (int i = 0; i < runs.Length; i++)
+                {
+                    // Different messages: the conversations' prompts part after the shared prefix, as real ones do.
+                    JsonElement body = BuildRequest(sessionIds[i], think, maxTokens, i == 0 ? "hi" : $"hello {i}");
+                    runs[i] = Task.Run(() => DriveAsync(frames, body, cancellationToken), cancellationToken);
+                }
+                string[] failures = await Task.WhenAll(runs).ConfigureAwait(false);
+                clock.Stop();
+                if (cancellationToken.IsCancellationRequested)
+                    return new Result(false, "cancelled", clock.Elapsed);
+                foreach (string failure in failures)
+                    if (!string.IsNullOrEmpty(failure))
+                    {
+                        logger?.LogWarning(LogEventIds.HostConfiguration, "Concurrent decode warm-up failed: {Error}", failure);
+                        return new Result(false, failure, clock.Elapsed);
+                    }
+                return new Result(true, $"{runs.Length} concurrent {maxTokens}-token warm-up requests completed", clock.Elapsed);
+            }
+            catch (OperationCanceledException)
+            {
+                clock.Stop();
+                return new Result(false, "cancelled", clock.Elapsed);
+            }
+            catch (Exception ex)
+            {
+                clock.Stop();
+                logger?.LogWarning(LogEventIds.HostConfiguration, "Concurrent decode warm-up failed: {Error}", ex.Message);
+                return new Result(false, ex.Message, clock.Elapsed);
+            }
+        }
+
+        /// <summary>One warm-up request's stream to its end: null when it completed, else why it did not.</summary>
+        private static async Task<string> DriveAsync(
+            Func<JsonElement, CancellationToken, IAsyncEnumerable<object>> frames, JsonElement body, CancellationToken cancellationToken)
+        {
+            string failure = null;
+            bool completed = false;
+            await foreach (object frame in frames(body, cancellationToken).ConfigureAwait(false))
+            {
+                failure ??= ErrorIn(frame);
+                if (frame?.GetType().GetProperty("done")?.GetValue(frame) is true)
+                {
+                    completed = true;
+                    if (frame.GetType().GetProperty("aborted")?.GetValue(frame) is true)
+                        failure ??= "warm-up request was aborted";
+                }
+            }
+            if (!completed && !cancellationToken.IsCancellationRequested)
+                failure ??= "warm-up stream ended without completing the request";
+            return failure;
         }
 
         /// <summary>The error a <c>done</c> frame carries, or null for every other frame.</summary>

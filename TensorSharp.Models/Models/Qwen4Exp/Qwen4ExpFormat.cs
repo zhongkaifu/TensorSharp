@@ -6,14 +6,33 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models
 {
-    /// <summary>Format facts and checks of qwen4exp (Qwen 3.8 Flash Next) checkpoints shared by its executors (the shared
-    /// runtime, the direct-CUDA engine and Qwen4ExpModel): none of them hold model state.</summary>
+    /// <summary>Format facts and checks of qwen4exp (Qwen 3.8 Flash Next) checkpoints shared by its loaders and
+    /// executors: none of them hold model state.</summary>
     internal static class Qwen4ExpFormat
     {
         public const string ArchitectureId = "qwen4exp";
 
-        /// <summary>TS_Q4E_HC_Q8=1: BF16 hyper-connection matrices run as Q8_0 copies.</summary>
-        internal static readonly bool HcQ8 = Environment.GetEnvironmentVariable("TS_Q4E_HC_Q8") == "1";
+        private static readonly bool s_hcQ8 = Environment.GetEnvironmentVariable("TS_Q4E_HC_Q8") == "1";
+        private static readonly System.Threading.AsyncLocal<bool?> s_hcQ8Flow = new();
+
+        /// <summary>TS_Q4E_HC_Q8=1: BF16 hyper-connection matrices run as Q8_0 copies (a test's flow may choose for the
+        /// models it constructs: <see cref="HcQ8ForCurrentFlowInTests"/>).</summary>
+        internal static bool HcQ8 => s_hcQ8Flow.Value ?? s_hcQ8;
+
+        /// <summary>Test seam: <see cref="HcQ8"/> for the models this flow constructs, until disposed.</summary>
+        internal static IDisposable HcQ8ForCurrentFlowInTests(bool on)
+        {
+            bool? previous = s_hcQ8Flow.Value;
+            s_hcQ8Flow.Value = on;
+            return new FlowScope(() => s_hcQ8Flow.Value = previous);
+        }
+
+        private sealed class FlowScope : IDisposable
+        {
+            private readonly Action _restore;
+            public FlowScope(Action restore) => _restore = restore;
+            public void Dispose() => _restore();
+        }
 
         /// <summary>True when <paramref name="path"/> names a DFlash/DFlash2 drafter (general.architecture = dflash) rather
         /// than a shared MTP head.</summary>

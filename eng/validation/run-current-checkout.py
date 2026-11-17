@@ -29,7 +29,6 @@ def main():
     p.add_argument('--source-manifest', type=Path, required=True)
     p.add_argument('--source-manifest-sha256', required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--fixtures', type=Path, required=True)
     p.add_argument('--dotnet', type=Path, required=True)
     p.add_argument('--gpus', required=True)
     p.add_argument('--jobs', type=int, default=16)
@@ -133,21 +132,6 @@ def main():
         report['ctest_cases'] = [{'name': c.get('name'), 'status': 'failed' if c.find('failure') is not None
                                  else 'unavailable' if c.find('skipped') is not None else 'passed'}
                                 for c in junit.iter('testcase')]
-        fixture_env = {'PYTHONPATH': '/workspace/tensorsharp-no-patch-20260915/fixture-python-deps'}
-        for backend in ('CPU', 'CUDA'):
-            for capacity in (32, 512):
-                for alignment in (4, 64):
-                    name = f'qwen-mtp-{backend}-{capacity}-{alignment}'
-                    run(name, ['python3', 'eng/tests/qwen4exp-mtp-operator.py', '--sample',
-                        a.fixtures / 'qwen4exp-mtp/sample.json', '--library', library, '--backend', backend,
-                        '--capacity', str(capacity), '--kv-alignment', str(alignment), '--report', out / (name + '.json')], fixture_env)
-            name = 'qwen-target-' + backend
-            run(name, ['python3', 'eng/tests/qwen4exp-target-snapshot.py', '--sample',
-                a.fixtures / 'qwen4exp-mtp/sample.json', '--library', library, '--backend', backend,
-                '--geometry', 'gdn32', '--report', out / (name + '.json')], fixture_env)
-            name = 'qwen-qsa-' + backend
-            run(name, ['python3', 'eng/tests/qwen4exp-qsa.py', '--library', library, '--backend', backend,
-                '--expected-native-sha256', report['native_sha256'], '--output', out / name], fixture_env)
         if not any(managed_codes):
             run('managed-portable', [a.dotnet, 'test', 'InferenceWeb.Tests/InferenceWeb.Tests.csproj',
                 *common, '--no-build', '--no-restore', '--filter', 'Requires!=Cuda&Requires!=Mlx&Requires!=Models&Requires!=Video',

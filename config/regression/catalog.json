@@ -128,7 +128,7 @@
         "image"
       ],
       "layout": "dense_or_moe",
-      "notes": "Vision requires the matching projector. Direct CUDA whole-model fast path depends on checkpoint types; per-op CUDA is a distinct route.",
+      "notes": "Vision requires the matching projector. Every backend, cuda included, loads the shared decoder runtime (Qwen35RuntimeModel); on cuda its graphs run on CudaGraphExecutor.",
       "source_evidence": [
         "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
         "docs/models/qwen35.md"
@@ -147,9 +147,7 @@
         "qwen3.6-35b-a3b",
         "qwen3.8-27b",
         "qwen3.8-27b-cuda-dflash2",
-        "qwen3.8-27b-metal-dflash2",
-        "qwen3.8-27b-ninfer",
-        "qwen3.8-27b-ninfer-64k"
+        "qwen3.8-27b-metal-dflash2"
       ]
     },
     {
@@ -171,7 +169,7 @@
         "video"
       ],
       "layout": "moe",
-      "notes": "MLX refused. MTP shared head requires GGML; f16/f32 KV only; cpu is a correctness path. No automatic disk-offload capacity claim.",
+      "notes": "MLX refused. The MTP shared head runs on every served backend's runtime; f16/f32 KV only; cpu is a correctness path. No automatic disk-offload capacity claim.",
       "source_evidence": [
         "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
         "docs/models/qwen38-flash-next.md"
@@ -180,7 +178,6 @@
       "presets": [
         "qwen3.8-flash-next",
         "qwen3.8-flash-next-cuda",
-        "qwen3.8-flash-next-cuda-4lanes",
         "qwen3.8-flash-next-iq1_m",
         "qwen3.8-flash-next-mtp",
         "qwen3.8-flash-next-ud-q2_k_xl"
@@ -320,6 +317,31 @@
         "lora-minimax-h3-fl2v-turbo-4step",
         "lora-minimax-h3-fl2v-turbo-8step",
         "minimax-h3-fl2va"
+      ]
+    },
+    {
+      "id": "minimax-h3-image",
+      "aliases": [
+        "minimax-h3-image",
+        "minimax_h3_image"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "modalities": [
+        "image_generation"
+      ],
+      "layout": "dense",
+      "notes": "Single device, ggml backends only. The MiniMax-H3 DiT without its audio stream; six distilled steps, guidance fixed at 1. Shares the Qwen3-VL-32B text encoder file with minimax-h3-fl2va.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "minimax-h3-image"
       ]
     },
     {
@@ -783,6 +805,73 @@
       "presets": [
         "bonsai-2-27b-ptq1"
       ]
+    },
+    {
+      "id": "whisper",
+      "aliases": [
+        "whisper"
+      ],
+      "backends": [
+        "cpu",
+        "cuda"
+      ],
+      "modalities": [
+        "audio"
+      ],
+      "layout": "dense",
+      "notes": "Speech recognition from a self-contained GGUF; one clip at a time, single device.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Whisper/WhisperArchitecture.cs",
+        "docs/models/whisper.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its model doc, so no regression preset can plan it.",
+      "presets": []
+    },
+    {
+      "id": "kokoro",
+      "aliases": [
+        "kokoro"
+      ],
+      "backends": [
+        "cpu"
+      ],
+      "modalities": [
+        "audio_generation"
+      ],
+      "layout": "dense",
+      "notes": "Text to speech on the CPU; single device.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Kokoro/KokoroArchitecture.cs",
+        "docs/models/kokoro.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its model doc, so no regression preset can plan it.",
+      "presets": []
+    },
+    {
+      "id": "ace-step",
+      "aliases": [
+        "ace-step-1.5",
+        "ace_step_1.5",
+        "ace-step"
+      ],
+      "backends": [
+        "cpu",
+        "cuda"
+      ],
+      "modalities": [
+        "audio_generation"
+      ],
+      "layout": "dense",
+      "notes": "Music generation; single device.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/AceStep/AceStepArchitecture.cs",
+        "docs/models/ace-step.md"
+      ],
+      "configuration_status": "missing_preset",
+      "gap_reason": "No config/ preset ships for this family yet; it runs from --model with the flags in its model doc, so no regression preset can plan it.",
+      "presets": []
     }
   ],
   "presets": [
@@ -2391,6 +2480,38 @@
       "status": "configured"
     },
     {
+      "id": "minimax-h3-image",
+      "config": "config/minimax-h3-image.json",
+      "kind": "image_generation",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "image_generation"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "image_generation"
+      ],
+      "source_evidence": [
+        "config/minimax-h3-image.json",
+        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "minimax_h3_image_pruned_bf16.safetensors": 40234657162,
+        "qwen3vl_32b_minimax_h3-Q4_K_M.gguf": 18218065024,
+        "vocab.json": 2776833,
+        "merges.txt": 1671839,
+        "tokenizer_config.json": 11003,
+        "minimax_h3_image_vae_fp16.safetensors": 1168505312
+      },
+      "status": "configured"
+    },
+    {
       "id": "minimax-m3.1-flash",
       "config": "config/minimax-m3.1-flash.json",
       "kind": "text",
@@ -2906,7 +3027,7 @@
         "config/qwen3.5-0.8b.json",
         "config/regression/source-pins.json",
         "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
-        "TensorSharp.Models/Models/Qwen35/Qwen35Model.cs",
+        "TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs",
         "TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs",
         "InferenceWeb.Tests/DirectCudaRealModelTests.cs",
         "docs/models/qwen35.md"
@@ -2919,7 +3040,7 @@
       },
       "notes": [
         "Small dense Q8_0 representative with optional matching image projector. Publisher metadata confirms qwen35 and exact pinned file identities; local file integrity and runtime qualification require execution.",
-        "The direct cuda route uses the generic Qwen35Model for Q8_0, not the NVFP4-only whole-model executor. No learned draft or speculative scenario is implied.",
+        "The cuda route loads the shared Qwen35RuntimeModel (graphs on CudaGraphExecutor), as every qwen35 checkpoint does. No learned draft or speculative scenario is implied.",
         "The F16 vision projector is converted to F32 on load; its 204987232-byte download is not a resident-memory estimate. Include model, expanded vision weights and scratch in a full image plan."
       ]
     },
@@ -3192,64 +3313,6 @@
       "status": "configured"
     },
     {
-      "id": "qwen3.8-27b-ninfer",
-      "config": "config/qwen3.8-27b-ninfer.json",
-      "kind": "text",
-      "family": "qwen35",
-      "modalities": [
-        "text"
-      ],
-      "backends": [
-        "cuda"
-      ],
-      "scenarios": [],
-      "source_evidence": [
-        "config/qwen3.8-27b-ninfer.json",
-        "config/README-ninfer.md",
-        "TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.Ninfer.cs",
-        "TensorSharp.Runtime/ConfigFileArgs.cs"
-      ],
-      "layout": "dense",
-      "file_sizes": {
-        "qwen3_8_27b_nvfp4.ninfer": 23719715844
-      },
-      "status": "configured",
-      "notes": [
-        "Shared CLI/Server.Host native NInfer/DFlash K7 profile; embedded frontend.",
-        "Offline inventory preserves environment defaults as metadata; no automatic runner scenario claims this full profile.",
-        "Configured context is not a completed long-context GPU/model quality test."
-      ]
-    },
-    {
-      "id": "qwen3.8-27b-ninfer-64k",
-      "config": "config/qwen3.8-27b-ninfer-64k.json",
-      "kind": "text",
-      "family": "qwen35",
-      "modalities": [
-        "text"
-      ],
-      "backends": [
-        "cuda"
-      ],
-      "scenarios": [],
-      "source_evidence": [
-        "config/qwen3.8-27b-ninfer-64k.json",
-        "config/README-ninfer.md",
-        "TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.Ninfer.cs",
-        "TensorSharp.Runtime/ConfigFileArgs.cs"
-      ],
-      "layout": "dense",
-      "file_sizes": {
-        "qwen3_8_27b_nvfp4.ninfer": 23719715844
-      },
-      "status": "configured",
-      "notes": [
-        "Shared CLI/Server.Host native NInfer/DFlash K7 profile; embedded frontend.",
-        "Offline inventory preserves environment defaults as metadata; no automatic runner scenario claims this full profile.",
-        "Configured context is not a completed long-context GPU/model quality test."
-      ]
-    },
-    {
       "id": "qwen3.8-27b-metal-dflash2",
       "config": "config/qwen3.8-27b-metal-dflash2.json",
       "kind": "text",
@@ -3486,7 +3549,8 @@
       "source_evidence": [
         "config/qwen3.8-flash-next-cuda.json",
         "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
-        "TensorSharp.Backends.Cuda/Qwen4Exp/Q4eCudaEngine.cs",
+        "TensorSharp.Models/Models/Qwen4Exp/Runtime/Qwen4ExpRuntimeModel.cs",
+        "TensorSharp.Backends.Cuda/CudaGraphExecutor.cs",
         "docs/models/qwen38-flash-next.md"
       ],
       "layout": "moe",
@@ -3496,36 +3560,7 @@
         "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": 2786568256
       },
       "notes": [
-        "The direct CUDA engine with the shared MTP head (3 drafts): RTX 5090 (2026-11-08) decode 131-250 tok/s, 4K / 16K / 100K TTFT 1.0 / 4.2 / 30.4 s. Needs ~45 GB of host RAM for the n-gram table and host experts."
-      ],
-      "status": "configured"
-    },
-    {
-      "id": "qwen3.8-flash-next-cuda-4lanes",
-      "config": "config/qwen3.8-flash-next-cuda-4lanes.json",
-      "kind": "overlay",
-      "family": "qwen4exp",
-      "modalities": [
-        "text"
-      ],
-      "backends": [
-        "cuda"
-      ],
-      "scenarios": [
-        "server_chat"
-      ],
-      "source_evidence": [
-        "config/qwen3.8-flash-next-cuda-4lanes.json",
-        "TensorSharp.Backends.Cuda/Qwen4Exp/Q4eCudaEngine.cs",
-        "docs/models/qwen38-flash-next.md"
-      ],
-      "layout": "moe",
-      "file_sizes": {},
-      "notes": [
-        "Apply after config/qwen3.8-flash-next-cuda.json; four sequence lanes for concurrent users (RTX 5090: four requests at once 243-258 tok/s). No standalone model."
-      ],
-      "requires_configs": [
-        "config/qwen3.8-flash-next-cuda.json"
+        "Loads Qwen4ExpRuntimeModel with its graphs on CudaGraphExecutor. The config's RTX 5090 figures (2026-11-08: decode 131-250 tok/s, 4K / 16K / 100K TTFT 1.0 / 4.2 / 30.4 s, ~45 GB of host RAM for the n-gram table and host experts) were measured on the removed direct-CUDA engine with its shared MTP head and are not re-measured on the runtime; no performance claim is implied."
       ],
       "status": "configured"
     },
@@ -4381,7 +4416,6 @@
       ],
       "evidence": [
         "eng/validation/validate-speculative-rows.py",
-        "eng/qwen4exp-mtp-fixture.py",
         "eng/regression/scaling_profiles.py"
       ],
       "requirements": [

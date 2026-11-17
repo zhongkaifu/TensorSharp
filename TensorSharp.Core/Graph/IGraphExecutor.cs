@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 
 namespace TensorSharp.Graph
 {
@@ -16,6 +17,18 @@ namespace TensorSharp.Graph
         public bool StridedViews { get; init; }
         /// <summary>An op may write its result in place inside a state leaf (<see cref="GraphNodeKind.Alias"/>).</summary>
         public bool InPlaceStateAlias { get; init; }
+
+        /// <summary>A verify window's recurrence writes only its rows' outputs and saves its scan inputs (a gated delta rule
+        /// with destination leaf 6), the live state read and left as it was: the commit steps the kept rows on it again, in
+        /// place (the direct engines' verify scan and replay). Elsewhere the window keeps a state after every row.</summary>
+        public bool WindowStateInPlace { get; init; }
+        /// <summary>A verify window's delta-net regions (prep, gated norm) read their inputs where a packed in-projection put
+        /// them, a packed row apart: the window takes the projection as one product, as decode rows do, instead of a product
+        /// per row block.</summary>
+        public bool WindowRegionsReadPackedRows { get; init; }
+        /// <summary>Its recorded steps bind a slot's buffers: a request that runs in a new slot relocates or records them again
+        /// (tens of milliseconds a step shape), so a finished request is retained as a copy and its slot serves the next.</summary>
+        public bool SlotBoundRecordings { get; init; }
         /// <summary>Reordering independent work pays off (and is safe) on this device.</summary>
         public bool ConcurrencyReorder { get; init; }
         /// <summary>The bucket a decode step's padded attention window grows by (a window's programs replay).</summary>
@@ -34,6 +47,14 @@ namespace TensorSharp.Graph
         /// <summary>It runs <see cref="GraphOp.MoeHostExperts"/>: routed experts computed from host memory at a
         /// pause in the program.</summary>
         public bool HostExperts { get; init; }
+
+        /// <summary>A decode step's <see cref="GraphOp.MoeHostExperts"/> stays on the device's stream (the host answers a
+        /// doorbell while the device waits), so a step with host experts can be recorded and replayed.</summary>
+        public bool RecordsHostExperts { get; init; }
+
+        /// <summary>The executor's kernels take a family's fusion regions at any row count, decode rows too (a family marks
+        /// some regions for prompt chunks only, where the backends that fuse them had prompt-width kernels).</summary>
+        public bool RegionsAtAnyWidth { get; init; }
         /// <summary>A compiled plan is worth keeping to run again (a replayable program is cached and
         /// looked up by its signature); otherwise every step is recorded and compiled once.</summary>
         public bool Replays { get; init; } = true;
@@ -45,6 +66,9 @@ namespace TensorSharp.Graph
         /// the host by syncs; false where the device reads the host bytes themselves (Metal's shared buffers, the
         /// CPU), so a host copy of them moves nothing across.</summary>
         public bool SeparateDeviceCopies { get; init; }
+        /// <summary>A program may end in each row's greedy token (a top-1 over the logits, a tie to the lower id), read
+        /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits.</summary>
+        public bool GreedyIdOutputs { get; init; }
     }
 
     /// <summary>A stable identity for a storage object, for program signatures of executors that bind
@@ -79,6 +103,44 @@ namespace TensorSharp.Graph
 
         /// <summary>The host bytes at <paramref name="data"/> changed (or are being freed): drop device copies.</summary>
         void Invalidate(IntPtr data);
+
+        /// <summary>A weight the model reads only through its products (an untied LM head, never gathered by rows), by its
+        /// cache key: the executor may keep it in a layout only its own products read. False where it keeps the weight as it
+        /// is.</summary>
+        bool KeepForProductsOnly(IntPtr weightKey) => false;
+
+        /// <summary>A weight only a drafter reads: its products make proposals a verify checks, in whichever step they run, so
+        /// they may take the kernels a <see cref="Drafting"/> step's products take there too (the trunk's prompt step that writes
+        /// a block drafter's ring). False where the executor runs them as any other weight's (it reads nothing of the weight:
+        /// a weight's device cache key is made on first use by the executors that key on it).</summary>
+        bool MarkDrafterWeight(IGraphWeight weight) => false;
+
+        /// <summary>Run <paramref name="weight"/>'s product over zero rows once for each count in <paramref name="rows"/>, the
+        /// results discarded, so whatever a product of that many rows loads at its first launch (a library's kernels the driver
+        /// loads lazily) is loaded before a request's step runs it. False where the executor does nothing.</summary>
+        bool WarmProducts(IGraphWeight weight, IReadOnlyList<int> rows) => false;
+
+        /// <summary>Whether decode rows and short chunks over a K/V cache of <paramref name="kvFormat"/> with
+        /// <paramref name="headDim"/>-wide heads may attend their slot's whole capacity as their padded window: the executor's
+        /// kernels then compute, from the rows' written length (read on the device when the step is recorded), what the window
+        /// of <see cref="GraphCapabilities.DecodeWindowRows"/>-row buckets around that length computes, bit for bit - so one
+        /// recorded step of a width serves every position of its slot. False where a window's width shapes the arithmetic.</summary>
+        bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
+
+        /// <summary>Host work to run while the device runs the next recorded step: after its launch, before anything waits for
+        /// its outputs (a recorded step leaves the host idle for its whole run). False where the executor runs no recorded
+        /// steps to hide it behind: the caller then does the work itself, or not at all.</summary>
+        bool RunWhileNextRecordedStepRuns(Action work) => false;
+
+        /// <summary>The steps run now are a drafter's: its proposals are verified, not trusted, so its products need not be
+        /// row-invariant (a verify window's rows a plain decode step's bit for bit) and may take faster kernels whose last
+        /// bits vary. Set around a draft step's runs, its recordings' included.</summary>
+        bool Drafting { get => false; set { } }
+
+        /// <summary>The sequences of the steps run now (0: not said). Set around a step's runs, its recordings' included: an
+        /// executor whose row-invariant products cost more past a few rows keeps them for the rows of one sequence's window
+        /// (several sequences' rows past them take its multi-row products, as they did before).</summary>
+        int StepSequences { get => 0; set { } }
     }
 
     /// <summary>A compiled program. Outputs are the plan's arrays, rewritten by each run.</summary>

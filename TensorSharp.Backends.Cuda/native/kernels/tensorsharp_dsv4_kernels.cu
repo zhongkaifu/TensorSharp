@@ -5830,7 +5830,7 @@ extern "C" __global__ void ts_moe_doorbell_publish_tail(
     }
 }
 
-// ---- missed experts split between the GPU and the host (TS_Q4E_HYBRID_MISSES) ----
+// ---- missed experts split between the GPU and the host ----
 // A decode step's missed experts are computed by the host at DRAM speed, ~30-35 us an (expert, row) route on the RTX
 // 5090 pod's 7950X, while the GPU, its own experts done, waits. ts_moe_doorbell_publish_tail that first plans the GPU's
 // share: in one warp, the first `capacity` distinct missed experts in slot order (only those the route-tail rule keeps:

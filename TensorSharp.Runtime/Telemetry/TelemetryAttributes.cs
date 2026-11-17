@@ -134,9 +134,6 @@ namespace TensorSharp.Runtime.Telemetry
         /// <summary>A captured CUDA graph's kind: <c>solo</c> (one sequence's decode step) or
         /// <c>batched</c>.</summary>
         public const string GraphKind = "tensorsharp.cuda_graph.kind";
-        /// <summary>One stage of a forward, as the engine's stage timer names it (<c>hc</c>,
-        /// <c>experts</c>, <c>attncore</c>, ...).</summary>
-        public const string EngineStage = "tensorsharp.engine.stage";
         /// <summary>The host's part of a decode step: <c>finish</c> (waiting for the step's logits and copying them),
         /// <c>sample</c>, <c>issue</c> (queueing the next step's GPU work), <c>draft</c>, <c>verify</c>.</summary>
         public const string StepPhase = "tensorsharp.engine.step.phase";

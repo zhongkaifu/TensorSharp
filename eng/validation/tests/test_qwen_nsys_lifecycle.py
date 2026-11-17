@@ -45,21 +45,21 @@ class EnvironmentTests(unittest.TestCase):
     def test_ambient_credentials_and_undeclared_model_settings_are_not_inherited(self):
         ambient = {"PATH": "/usr/bin", "HOME": "/home/profiler", "CUDA_VISIBLE_DEVICES": "2",
                    "LD_LIBRARY_PATH": "/cuda/lib", "HF_TOKEN": "synthetic-secret", "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
-                   "HTTP_PROXY": "synthetic-secret", "TS_Q35_UNDECLARED": "1", "DOTNET_UNDECLARED": "1",
+                   "HTTP_PROXY": "synthetic-secret", "TS_TEST_UNDECLARED": "1", "DOTNET_UNDECLARED": "1",
                    "PYTHONPATH": "synthetic-startup-hook", "LD_PRELOAD": "/ambient/inject.so"}
         with patch.dict(profile.os.environ, ambient, clear=True):
-            env = profile.process_environment({"TS_Q35_DECLARED": "1", "CUDA_VISIBLE_DEVICES": "3"})
+            env = profile.process_environment({"TS_TEST_DECLARED": "1", "CUDA_VISIBLE_DEVICES": "3"})
         self.assertEqual({"PATH": "/usr/bin", "HOME": "/home/profiler", "CUDA_VISIBLE_DEVICES": "3",
-                          "LD_LIBRARY_PATH": "/cuda/lib", "TS_Q35_DECLARED": "1"}, env)
+                          "LD_LIBRARY_PATH": "/cuda/lib", "TS_TEST_DECLARED": "1"}, env)
 
     def test_exec_keeps_only_named_nsight_interposition_and_explicit_server_overrides(self):
         with patch.dict(profile.os.environ, {"LD_PRELOAD": "/nsys/trace.so", "CUDA_INJECTION64_PATH": "/nsys/cuda.so",
                 "NVTX_INJECTION64_PATH": "/nsys/nvtx.so", "NSYS_TARGET_SESSION_ID": "session", "HF_TOKEN": "synthetic-secret",
-                "TS_Q35_UNDECLARED": "1", "NSYS_UNKNOWN_SECRET": "synthetic-secret"}, clear=True):
-            env = profile.process_environment({"TS_Q35_DECLARED": "1"}, target_exec=True)
-        for name in ("LD_PRELOAD", "CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH", "NSYS_TARGET_SESSION_ID", "TS_Q35_DECLARED"):
+                "TS_TEST_UNDECLARED": "1", "NSYS_UNKNOWN_SECRET": "synthetic-secret"}, clear=True):
+            env = profile.process_environment({"TS_TEST_DECLARED": "1"}, target_exec=True)
+        for name in ("LD_PRELOAD", "CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH", "NSYS_TARGET_SESSION_ID", "TS_TEST_DECLARED"):
             self.assertIn(name, env)
-        for name in ("HF_TOKEN", "TS_Q35_UNDECLARED", "NSYS_UNKNOWN_SECRET"):
+        for name in ("HF_TOKEN", "TS_TEST_UNDECLARED", "NSYS_UNKNOWN_SECRET"):
             self.assertNotIn(name, env)
         self.assertEqual(os.defpath, env["PATH"])
 
@@ -71,13 +71,13 @@ class EnvironmentTests(unittest.TestCase):
             "AWS_SECRET_ACCESS_KEY", "HF_TOKEN", "PYTHONPATH", "PYTHONSTARTUP", "LD_AUDIT")}
         injection = {"LD_PRELOAD": "/nsys/trace.so", "CUDA_INJECTION64_PATH": "/nsys/cuda.so"}
         with patch.dict(profile.os.environ, transport | rejected | injection, clear=True):
-            outer = profile.process_environment({"TS_Q35_DECLARED": "1"})
-            inner = profile.process_environment({"TS_Q35_DECLARED": "1"}, target_exec=True)
-        self.assertEqual({"PATH": os.defpath, "TS_Q35_DECLARED": "1"}, outer)
-        self.assertEqual({"PATH": os.defpath, "TS_Q35_DECLARED": "1"} | transport | injection, inner)
+            outer = profile.process_environment({"TS_TEST_DECLARED": "1"})
+            inner = profile.process_environment({"TS_TEST_DECLARED": "1"}, target_exec=True)
+        self.assertEqual({"PATH": os.defpath, "TS_TEST_DECLARED": "1"}, outer)
+        self.assertEqual({"PATH": os.defpath, "TS_TEST_DECLARED": "1"} | transport | injection, inner)
 
     def test_spec_env_and_command_are_validated_before_launch(self):
-        good = {"argv": ["server", ""], "env": {"EXPLICIT": "", "TS_Q35_X": "1"}}
+        good = {"argv": ["server", ""], "env": {"EXPLICIT": "", "TS_TEST_X": "1"}}
         self.assertEqual(good, profile.validate_server_spec(good))
         bad = [None, [], {}, {"argv": "server"}, {"argv": []}, {"argv": [""]}, {"argv": ["server", 1]},
                {"argv": ["server\x00"]}, {"argv": ["server"], "env": []}, {"argv": ["server"], "env": {"": "v"}},
@@ -91,7 +91,7 @@ class EnvironmentTests(unittest.TestCase):
     def test_exec_server_uses_scrubbed_environment_and_preserves_identity_before_exec(self):
         with tempfile.TemporaryDirectory() as temporary:
             spec = Path(temporary) / "server.json"; pid = Path(temporary) / "pid.json"
-            spec.write_text(json.dumps({"argv": ["server", "arg"], "env": {"TS_Q35_DECLARED": "1"}}))
+            spec.write_text(json.dumps({"argv": ["server", "arg"], "env": {"TS_TEST_DECLARED": "1"}}))
             transport = {name: "synthetic-transport-" + str(i) for i, name in enumerate(OBSERVED_NSIGHT_TRANSPORT)}
             ambient = {"PATH": "/bin", "HF_TOKEN": "synthetic-secret", "LD_PRELOAD": "/nsys/trace.so",
                        "QUADD_UNKNOWN_CONFIG": "synthetic-rejected", "PYTHONSTARTUP": "synthetic-hook"} | transport
@@ -101,7 +101,7 @@ class EnvironmentTests(unittest.TestCase):
             identity.assert_called_once_with(pid, "run")
             command, argv, env = execute.call_args.args
             self.assertEqual(("server", ["server", "arg"]), (command, argv))
-            self.assertEqual({"PATH": "/bin", "LD_PRELOAD": "/nsys/trace.so", "TS_Q35_DECLARED": "1"} | transport, env)
+            self.assertEqual({"PATH": "/bin", "LD_PRELOAD": "/nsys/trace.so", "TS_TEST_DECLARED": "1"} | transport, env)
 
 
 class CapabilityTests(unittest.TestCase):
@@ -139,12 +139,12 @@ class CapabilityTests(unittest.TestCase):
         directory = ROOT / "artifacts"; directory.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="nsys-preflight-", dir=directory) as temporary:
             p = Path(temporary); prefix = p / "capture"; server = p / "server.json"; fixture = p / "fixture.jsonl"
-            server.write_text(json.dumps({"argv": ["/nonexistent/expensive-server"], "env": {"TS_Q35_DECLARED": "1"}}))
+            server.write_text(json.dumps({"argv": ["/nonexistent/expensive-server"], "env": {"TS_TEST_DECLARED": "1"}}))
             body = {"messages": [], "max_tokens": 1}
             fixture.write_text(json.dumps({"scenario": "cpu", "lane": 0, "step": 0, "body": body,
                                            "request_sha256": profile.replay.digest(body)}) + "\n")
             with patch.object(profile, "linux_proc_available", return_value=True), patch.object(profile, "models", return_value=None), \
-                    patch.dict(profile.os.environ, {"PATH": "/bin", "HF_TOKEN": "synthetic-secret", "TS_Q35_AMBIENT": "1"}, clear=True), \
+                    patch.dict(profile.os.environ, {"PATH": "/bin", "HF_TOKEN": "synthetic-secret", "TS_TEST_AMBIENT": "1"}, clear=True), \
                     patch.object(profile.subprocess, "check_output", side_effect=["fake Nsight", START_HELP.replace("  --sample {none,process-tree}\n", "")]) as query, \
                     patch.object(profile.subprocess, "Popen") as launch, patch.object(profile.subprocess, "run") as run, \
                     patch.object(profile.replay, "request") as request:
@@ -153,7 +153,7 @@ class CapabilityTests(unittest.TestCase):
                                   "--scenario", "cpu", "--step", "0", "--prime-steps", "", "--output", str(prefix)])
             launch.assert_not_called(); run.assert_not_called(); request.assert_not_called()
             for call in query.call_args_list:
-                self.assertEqual({"PATH": "/bin", "TS_Q35_DECLARED": "1"}, call.kwargs["env"])
+                self.assertEqual({"PATH": "/bin", "TS_TEST_DECLARED": "1"}, call.kwargs["env"])
             metadata = json.loads(Path(str(prefix) + ".json").read_text())
             self.assertFalse(metadata["complete"]); self.assertEqual("NOT_RUN", metadata["capture_status"])
             self.assertNotIn("server_cleanup", metadata)
@@ -465,7 +465,7 @@ while True: time.sleep(10)
         def safe_environment(kwargs):
             self.assertIn("env", kwargs)
             self.assertNotIn("HF_TOKEN", kwargs["env"])
-            self.assertNotIn("TS_Q35_AMBIENT", kwargs["env"])
+            self.assertNotIn("TS_TEST_AMBIENT", kwargs["env"])
 
         class FinishedLauncher:
             def poll(self): return 0
@@ -499,7 +499,7 @@ while True: time.sleep(10)
                 return {"confirmed_exited": False, "error": "injected timeout"}
             return stop(*args)
 
-        with patch.dict(profile.os.environ, {"HF_TOKEN": "synthetic-secret", "TS_Q35_AMBIENT": "1"}), \
+        with patch.dict(profile.os.environ, {"HF_TOKEN": "synthetic-secret", "TS_TEST_AMBIENT": "1"}), \
                 patch.object(profile.subprocess, "Popen", side_effect=launch), \
                 patch.object(profile.subprocess, "run", side_effect=run), \
                 patch.object(profile.subprocess, "check_output", side_effect=query), \

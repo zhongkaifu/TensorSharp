@@ -435,33 +435,18 @@ public sealed class CudaMoeQ5_1ExpertTests
     }
 
     /// <summary>
-    /// Both direct-CUDA engines refuse such a layer from the loader's descriptors, before they create a
+    /// The GLM direct-CUDA engine refuses such a layer from the loader's descriptors, before it creates a
     /// device context: on a machine with no GPU at all the constructor still answers with the refusal.
     /// (In the per-device upload, two devices refusing at once was an AggregateException that aborted
     /// <c>--layer-split 2</c>.)
     /// </summary>
     [Fact]
-    public void TheEngines_RefuseTheLayerBeforeTouchingADevice()
+    public void TheEngine_RefusesTheLayerBeforeTouchingADevice()
     {
         CudaWeightDesc Desc(int type, string name) => new CudaWeightDesc
         {
             GgmlType = type, Name = name, Ne0 = 256, Ne1 = 128, Ne2 = 4, RowBytes = 256, Source = new NoBytes(),
         };
-        var q4e = new Q4eCudaEngine.ModelDesc
-        {
-            NLayer = 2, NEmbd = 256, Hc = 4, HcLowRank = 64, NHead = 2, NKvHead = 1, HeadDim = 256, NRot = 64,
-            NExpert = 4, NExpertUsed = 2, NFfExp = 128,
-            Layers = new[] { 0, 1 }.Select(il => new Q4eCudaEngine.LayerDesc
-            {
-                Recurrent = true,
-                GateExps = Desc((int)GgmlTensorType.Q4_K, $"blk.{il}.ffn_gate_exps.weight"),
-                UpExps = Desc((int)GgmlTensorType.Q4_K, $"blk.{il}.ffn_up_exps.weight"),
-                DownExps = Desc(il == 1 ? (int)GgmlTensorType.Q4_1 : Q5_1, $"blk.{il}.ffn_down_exps.weight"),
-            }).ToArray(),
-        };
-        var ex = Assert.Throws<NotSupportedException>(() => new Q4eCudaEngine(q4e, 2));
-        Assert.StartsWith("[q4e-cuda] blk.1.ffn_down_exps.weight is Q4_1", ex.Message);
-
         var glm = new GlmCudaEngine.ModelDesc
         {
             NLayer = 2, NEmbd = 256, KdaHeadDim = 128, KvLoraRank = 512, NExpert = 4, NExpertUsed = 2,
@@ -473,7 +458,7 @@ public sealed class CudaMoeQ5_1ExpertTests
                 DownExps = Desc((int)GgmlTensorType.Q4_0, $"blk.{il}.ffn_down_exps.weight"),
             }).ToArray(),
         };
-        ex = Assert.Throws<NotSupportedException>(() => new GlmCudaEngine(glm, 2));
+        var ex = Assert.Throws<NotSupportedException>(() => new GlmCudaEngine(glm, 2));
         Assert.StartsWith("[glm-cuda] blk.1.ffn_down_exps.weight is Q4_0", ex.Message);
     }
 

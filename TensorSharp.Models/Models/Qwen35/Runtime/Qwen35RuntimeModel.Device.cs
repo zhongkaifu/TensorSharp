@@ -241,7 +241,7 @@ namespace TensorSharp.Models
             protected readonly bool _host;
 
             public DeviceGdnState(IAllocator allocator, IGraphExecutor executor, Func<Tensor, IntPtr> hostPointer,
-                int convRows, int channels, int vHeads, int dv, int dk)
+                int convRows, int channels, int vHeads, int dv, int dk, int backingRows = 1)
             {
                 _hostPointer = hostPointer;
                 _executor = executor;
@@ -252,10 +252,13 @@ namespace TensorSharp.Models
                 StateFloats = (long)vHeads * dv * dk;
                 Conv = new Tensor(allocator, DType.Float32, channels, Math.Max(1, convRows));
                 // [one token's outputs | state]: a decode-row graph writes the recurrence's result
-                // into Backing, so its state part lands on Ssm in place (no state copy per token).
+                // into Backing, so its state part lands on Ssm in place (no state copy per token). Where verify windows
+                // update the state in place, room for a window's rows in front of it.
                 RowFloats = (long)vHeads * dv;
-                Backing = new Tensor(allocator, DType.Float32, RowFloats + (long)vHeads * dv * dk);
-                using (Tensor tail = Backing.Narrow(0, RowFloats, (long)vHeads * dv * dk))
+                VHeads = vHeads;
+                BackingRows = Math.Max(1, backingRows);
+                Backing = new Tensor(allocator, DType.Float32, StateOffset + (long)vHeads * dv * dk);
+                using (Tensor tail = Backing.Narrow(0, StateOffset, (long)vHeads * dv * dk))
                     Ssm = tail.View(vHeads, dv, dk);
                 // A fresh mapping is zero already: clearing it only faulted every page in (Qwen3.8-27B's 48 states took
                 // 64-102 ms of every new slot on ggml_cuda and ggml_vulkan). Subclasses reset their own tensors.
@@ -278,43 +281,88 @@ namespace TensorSharp.Models
             /// <summary>A verify window's recurrence result, written there in place: [outputs of its rows |
             /// state after the last row | state 1 row before it | ...], room for SnapshotCapacity rows.</summary>
             public Tensor Verify { get; private set; }
-            /// <summary>The conv inputs of a verify window, [channels, ConvRows + capacity]: columns
-            /// [k, k + ConvRows) are the window after k of its rows.</summary>
+            /// <summary>The conv inputs of a verify window of n rows, [channels, ConvRows + n] at the window's own pitch (room
+            /// for ConvRows + capacity a channel): columns [k, k + ConvRows) are the window after k of its rows.</summary>
             public Tensor ConvHistory { get; private set; }
             public int SnapshotCapacity { get; private set; }
+
+            /// <summary>Where a window of up to <see cref="BackingRows"/> rows leaves the state as it was: its scan inputs (the
+            /// planar regions of <see cref="SavedInputFloats"/>), from which the commit steps the kept rows on the state.</summary>
+            public Tensor SavedInputs { get; private set; }
+
+            /// <summary>A <paramref name="rows"/>-row verify window leaves the live state as it was and saves its inputs, the
+            /// commit stepping the kept rows on it in place (else it keeps a state after each row in <see cref="Verify"/>).</summary>
+            public bool WindowInPlace(int rows) => BackingRows > 1 && rows <= BackingRows;
+
+            /// <summary>What a commit after a <paramref name="rows"/>-row window reads (null: no window ran on this state).</summary>
+            public Tensor CommitSource(int rows) => ConvHistory == null ? null : WindowInPlace(rows) ? SavedInputs : Verify;
+
+            /// <summary>Floats of a window's saved scan inputs: q and k [rows, kHeads, dk], v [rows, vHeads, dv], the gates
+            /// and the betas [rows, vHeads], each a region of <see cref="BackingRows"/> rows (the conv channels are q|k|v).</summary>
+            public long SavedInputFloats => BackingRows * ((long)Channels + 2L * VHeads);
 
             /// <summary>A retained slot drops its verify buffers: [rows | states] for up to SnapshotCapacity rows is
             /// several GB on a 27B DFlash2 slot, which the prefix cache's budget did not see (a 24 GB A5000 ran out of
             /// memory on the fourth request).</summary>
             protected internal override void ReleaseSpecBuffers()
             {
+                if (Verify != null || ConvHistory != null || SavedInputs != null) NoteBindingsChanged();
                 Free(Verify);
                 Free(ConvHistory);
+                Free(SavedInputs);
                 Verify = null;
                 ConvHistory = null;
+                SavedInputs = null;
                 SnapshotCapacity = 0;
             }
 
             protected internal override long StateBytes
                 => Conv.Storage.ByteLength + Backing.Storage.ByteLength
-                   + (Verify?.Storage.ByteLength ?? 0) + (ConvHistory?.Storage.ByteLength ?? 0);
+                   + (Verify?.Storage.ByteLength ?? 0) + (ConvHistory?.Storage.ByteLength ?? 0)
+                   + (SavedInputs?.Storage.ByteLength ?? 0);
 
             /// <summary>Room for a <paramref name="rows"/>-row verify; true when the buffers moved.</summary>
             public virtual bool EnsureSpecBuffers(int rows)
             {
-                if (rows <= SnapshotCapacity) return false;
-                int capacity = 4;
-                while (capacity < rows) capacity *= 2;
-                Free(Verify);
-                Free(ConvHistory);
-                Verify = new Tensor(_allocator, DType.Float32, capacity * (RowFloats + StateFloats));
-                ConvHistory = new Tensor(_allocator, DType.Float32, Channels, ConvRows + capacity);
-                SnapshotCapacity = capacity;
-                return true;
+                bool moved = false;
+                if (rows > SnapshotCapacity)
+                {
+                    int capacity = 4;
+                    while (capacity < rows) capacity *= 2;
+                    Free(Verify);
+                    Free(ConvHistory);
+                    Verify = null;
+                    ConvHistory = new Tensor(_allocator, DType.Float32, Channels, ConvRows + capacity);
+                    SnapshotCapacity = capacity;
+                    moved = true;
+                }
+                if (WindowInPlace(rows))
+                {
+                    if (SavedInputs == null)
+                    {
+                        SavedInputs = new Tensor(_allocator, DType.Float32, SavedInputFloats);
+                        moved = true;
+                    }
+                }
+                else if (Verify == null)
+                {
+                    Verify = new Tensor(_allocator, DType.Float32, SnapshotCapacity * (RowFloats + StateFloats));
+                    moved = true;
+                }
+                if (moved) NoteBindingsChanged();
+                return moved;
             }
-            /// <summary>One token's recurrence outputs followed by the state (Ssm views its tail).</summary>
+            /// <summary>The recurrence outputs of <see cref="BackingRows"/> tokens followed by the state (Ssm views its tail).</summary>
             public Tensor Backing { get; }
             public long RowFloats { get; }
+            public int VHeads { get; }
+
+            /// <summary>Rows of outputs in front of the state in <see cref="Backing"/>: one (a decode row's [row | state] is
+            /// the backing), or more where a verify window's [rows | state] ends on the state too.</summary>
+            public int BackingRows { get; }
+
+            /// <summary>Floats in front of the state in <see cref="Backing"/>.</summary>
+            public long StateOffset => BackingRows * RowFloats;
 
             public override void Reset()
             {
@@ -523,6 +571,7 @@ namespace TensorSharp.Models
                 Free(Backing);
                 Free(Verify);
                 Free(ConvHistory);
+                Free(SavedInputs);
             }
         }
 

@@ -152,6 +152,48 @@ public class PrefixCacheStartupTests
         Assert.Contains("boom", result.Detail, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The concurrent decode warm-up runs its requests at the same time (the point is the steps that serve several at
+    /// once), each on its own session with the token budget it was given, and parting after the shared prompt.
+    /// </summary>
+    [Fact]
+    public async Task TheConcurrentDecodeWarmUpRunsItsRequestsTogether()
+    {
+        var bodies = new System.Collections.Concurrent.ConcurrentBag<JsonElement>();
+        var bothStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int started = 0;
+        async IAsyncEnumerable<object> Stream(JsonElement body)
+        {
+            bodies.Add(body);
+            if (Interlocked.Increment(ref started) == 2) bothStarted.SetResult();
+            // Neither finishes until both have started: run one after the other, this would time out.
+            await bothStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            yield return new { token = "o" };
+            yield return new { done = true, error = (string)null };
+        }
+
+        PrefixCacheWarmup.Result result = await PrefixCacheWarmup.RunConcurrentDecodeAsync(
+            (body, _) => Stream(body), new[] { "a", "b" }, think: false, maxTokens: 8, logger: null);
+
+        Assert.True(result.Warmed, result.Detail);
+        Assert.Equal(new[] { "a", "b" }, bodies.Select(b => b.GetProperty("sessionId").GetString()).OrderBy(s => s));
+        Assert.All(bodies, b => Assert.Equal(8, b.GetProperty("maxTokens").GetInt32()));
+        Assert.Equal(2, bodies.Select(b => b.GetProperty("messages")[0].GetProperty("content").GetString()).Distinct().Count());
+    }
+
+    [Fact]
+    public async Task AConcurrentDecodeWarmUpReportsAFailedRequest()
+    {
+        PrefixCacheWarmup.Result result = await PrefixCacheWarmup.RunConcurrentDecodeAsync(
+            (body, _) => body.GetProperty("sessionId").GetString() == "b"
+                ? Frames(new { done = true, error = "No model loaded" })
+                : Frames(new { done = true, error = (string)null }),
+            new[] { "a", "b" }, think: false, maxTokens: 8, logger: null);
+
+        Assert.False(result.Warmed);
+        Assert.Contains("No model loaded", result.Detail, StringComparison.Ordinal);
+    }
+
     private static async IAsyncEnumerable<object> Frames(params object[] frames)
     {
         foreach (object frame in frames)

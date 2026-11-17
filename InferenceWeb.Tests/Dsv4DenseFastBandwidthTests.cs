@@ -114,7 +114,7 @@ public sealed class Dsv4DenseFastBandwidthTests
                 using Tensor y = new Tensor(allocator, DType.Float32, 4, outDim);
                 using Tensor gemvScratch = new Tensor(allocator, DType.Float32, 1L << 20);
                 allocator.Kernels.LaunchQuantizeQ81Rows(Ptr(xT), Ptr(xq), inDim, 4, stream, warpCooperative: true);
-                // The engine's decode-size route (Q4eCudaEngine.MatMul): the decode-once kernels where they read the layout,
+                // The decode-size route (the CUDA graph executor's, as the removed qwen4exp engine's): the decode-once kernels where they read the layout,
                 // else the shared q8_1 kernels where they take it, else Dsv4Kernels.DenseQ81Rows's row kernels.
                 bool shared = !fast && type != BF16
                     && CudaQuantizedOps.TryResidentMatmulQ81(allocator, Ptr(mats[0]), type, Ptr(xq), Ptr(y), inDim, outDim, 1, stream);

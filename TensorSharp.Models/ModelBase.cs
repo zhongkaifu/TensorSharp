@@ -1497,7 +1497,10 @@ namespace TensorSharp.Models
                 GgmlTensorType.TQ1_0 or
                 GgmlTensorType.TQ2_0 or
                 GgmlTensorType.MXFP4 or
-                GgmlTensorType.NVFP4 => true,
+                GgmlTensorType.NVFP4 or
+                // ISTA-DASLab's Qwen3.8 Flash Next experts (CudaQuantizedOps.SupportsQuantizedType, the MoE dp4a and grouped
+                // kernels): without it --backend cuda widened the checkpoint's ~60 GB of Q2_0 to F32 at load.
+                GgmlTensorType.Q2_0 => true,
                 _ => false,
             };
         }
@@ -3681,18 +3684,6 @@ namespace TensorSharp.Models
             if (layerSplitDegree <= 1)
                 layerSplitDegree = ReadParallelDegree("TENSORSHARP_LAYER_SPLIT_DEGREE", layerSplitDegree);
 
-            if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
-            {
-                // The native CUDA engine reads the artifact directly; the ggml backends and MLX read a
-                // qwen35 GGUF converted from it once (NinferQwen38GgufConverter, cached beside it).
-                if (backend == BackendType.Cuda)
-                {
-                    NinferQwen38ModelSource.ValidateExecutionRoute(backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath);
-                    return Qwen35CudaModel.FromNinfer(ggufPath);
-                }
-                ggufPath = NinferQwen38GgufConverter.EnsureGguf(ggufPath);
-            }
-
             // MiniMax-H3-Image's denoiser ships as safetensors in its original tensor names,
             // which the DiT reads as they are; there is no GGUF header to probe.
             if (MiniMaxH3.MiniMaxH3ImageModel.IsImageDenoiserSafetensors(ggufPath))
@@ -3730,8 +3721,6 @@ namespace TensorSharp.Models
         /// execution before callers allocate GPU ranks or connect to peer nodes.</summary>
         public static void ValidateDistributedTensorParallelism(string ggufPath, BackendType backend)
         {
-            if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
-                throw new NotSupportedException("NInfer Qwen3.8 body inference does not implement distributed tensor parallelism.");
             using var probe = new GgufFile(ggufPath);
             var architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
             ValidateDistributedTensorParallelism(architecture, backend);
@@ -3759,8 +3748,6 @@ namespace TensorSharp.Models
         /// <summary>Reject unavailable stage executors before allocating GPUs or connecting peers.</summary>
         public static void ValidateDistributedLayerSplit(string ggufPath, BackendType backend)
         {
-            if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
-                throw new NotSupportedException("NInfer Qwen3.8 body inference does not implement distributed layer split.");
             using var probe = new GgufFile(ggufPath);
             ValidateDistributedLayerSplit(ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe), backend);
         }

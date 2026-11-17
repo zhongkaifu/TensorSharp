@@ -87,8 +87,8 @@ namespace TensorSharp.Models
                 return true;
             }
             // Likewise a per-token head the constructor attached itself: Qwen3.8-Flash-Next's shared MTP block loads with
-            // the model (the runtime's draft layer; on --backend cuda the direct engine's own placement).
-            if (model is Qwen4ExpCudaModel { HasDraftHead: true } or Qwen4ExpRuntimeModel { DraftHeadKind: DraftHeadKind.PerToken })
+            // the model (the runtime's draft layer).
+            if (model is Qwen4ExpRuntimeModel { DraftHeadKind: DraftHeadKind.PerToken })
                 return true;
 
             if (!File.Exists(draftPath))

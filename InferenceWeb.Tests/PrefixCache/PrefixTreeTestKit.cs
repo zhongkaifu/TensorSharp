@@ -156,7 +156,8 @@ internal static class Tk
         Func<long>? clock = null,
         bool branchSnapshots = false,
         bool blockedByScope = false,
-        bool strictReceipts = true) =>
+        bool strictReceipts = true,
+        Action<long[]>? allSpare = null) =>
         new(new PrefixTreeOptions
         {
             Capabilities = caps ?? Caps(),
@@ -169,6 +170,7 @@ internal static class Tk
             MinCloneTokens = minClone,
             PageHostBytes = pageHostBytes,
             QuerySpareBytes = spare,
+            QueryAllSpareBytes = allSpare,
             OptionCapBytes = optionCap,
             PoolPagesCap = poolPagesCap,
             ContextLength = contextLength,

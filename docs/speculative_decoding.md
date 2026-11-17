@@ -148,15 +148,16 @@ chat path: 1.02x → 1.85x.
 
 A per-token head can opt in too, through its weights adapter:
 `IDraftHead.DraftHeadResumesAfterGap`. Stateful heads without a suffix restart
-keep it false. Qwen 3.8 Flash Next's shared MTP head is one of them: it keeps
-its own K/V, so it speculates only for a solo request that prefilled from
-position 0, and a turn that continues a retained holder or a shared-prefix clone
-decodes plainly (the head ships as
-`--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`; parity and throughput
-measurements are on the
+keep it false. The shared decoder runtime's draft layer opts in
+(`StandardDecoderModel.DraftHeadResumesAfterGap`, true for a NextN/MTP layer and
+false for a DFlash drafter): that covers the embedded NextN block of Qwen
+3.5/3.6/3.8 and Qwen 3.8 Flash Next's shared MTP head
+(`--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`; parity and throughput
+are on the
 [Qwen 3.8 Flash Next card](models/qwen38-flash-next.md#speculative-decoding-with-the-shared-mtp-head)).
-Qwen 3.5/3.6/3.8 NextN/MTP opts in by restarting only its private
-attention cache at the end of a missing-hidden-state gap. Its compact KV indices
+The removed `Qwen4ExpModel` kept that head's K/V apart and drafted only for a
+solo request that prefilled from position 0. The draft layer resumes by
+restarting only its private attention rows at the end of a missing-hidden-state gap. Its compact KV indices
 retain absolute rotary positions; the trunk's complete Radix KV/recurrent state
 is unchanged. This covers startup-warmed and disk-restored shared prefixes,
 retained chat turns, and plain steps while speculation is parked. Pending folded
@@ -167,9 +168,6 @@ path, even with speculation enabled. Initial draft acceptance may be lower than
 with a fully replayed head prefix; the adaptive governor can still park a
 net-negative drafter. `--spec` does not disable Radix caching, and an explicit
 `--no-prefix-cache` still disables it.
-This applies to the default fused-verify linear/holder route when the request is
-running solo. The alternate paged speculative route selected by explicitly
-disabling fused verify still requires a fresh position-zero prefill.
 
 Gemma 4's assistant head keeps no state at all: every
 draft step reads the trunk's donor KV and the hidden state it is handed, so it
@@ -283,7 +281,7 @@ no drafter is loaded, so weight-free speculation is declined rather than
 crashed. Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash, Qwen 3.8 Flash Next and Gemma 4 have
 drafter-independent trunks and accept `--spec-type ngram` on any checkpoint,
 within each trunk's own backend gate: Gemma 4 on the ggml backends (`ggml_cpu`
-included) and on `cuda`, Qwen 3.8 Flash Next on its GGML token-graph path, and
+included) and on `cuda`, Qwen 3.8 Flash Next on every backend it loads on, and
 GLM-5.3-Flash where its recurrent-state rollback is available (for
 GLM-5.3-Flash it is the only drafter: its NextN block is not built, and its KDA
 recurrent state is snapshotted and restored the way Qwen's GDN state is - see
@@ -540,8 +538,8 @@ because each looks like an obvious suspect:
 
 - **CUDA-graph capture of the verify.** `TS_GGML_LOG_DEBUG=1` surfaces ggml's
   "CUDA graph warmup complete"/"reset" lines. Capture does churn (the persist
-  cache evicts across draft shapes), but raising
-  `TS_Q35_VERIFY_CACHE_BUDGET_MB` from 1536 to 3072 halves the resets and
+  cache evicts across draft shapes), but doubling its budget from 1536 to
+  3072 MB (measured with a switch since removed) halves the resets and
   changes throughput not at all.
 - **The MTP draft graph not persisting.** Persisting it (measured with a switch
   since removed) moved `draftMs` by less than the run-to-run noise.
@@ -610,8 +608,7 @@ native library) and pass the file to `--draft-model`. It is a `dflash` GGUF with
 `dflash.attention.causal = true` and `dflash.dspine.*` keys. The draft is one graph
 (`ggml_ops_dspine.cpp`; the context inject is DFlash's) on `ggml_metal`,
 `ggml_cuda` and `ggml_cpu`; there is no per-op path, so another backend refuses
-the file at load, and a failing draft stops drafting with a warning. The
-direct-CUDA Qwen 3.5 engine (`--backend cuda`) drafts with DFlash2 only.
+the file at load, and a failing draft stops drafting with a warning.
 
 `eng/dspine-reference.py` is a NumPy reference of the math. `GgmlOpsDSpineDraftTest`
 and `DSpineDraftTests` check every stage, the candidates, the lattice and the
@@ -691,6 +688,13 @@ The pass/fail verdicts are the same in every arm.
 
 ## Rejection on a recurrent trunk
 
+> **History.** The kernels and the caller this section describes (`ggml_ops_qwen35_verify.cpp`,
+> `ggml_ops_qwen35_batched_verify.cpp`, `Qwen35Model`) were removed in 2026-11 with the family's
+> own model class. The shared decoder runtime keeps the scheme: a verify window keeps the recurrent
+> state after every row (`GraphRequest.RecurrentSnapshots`), and the commit sets each slot's state to
+> the one after the rows it kept (`StandardDecoderModel.BatchedSpeculative.cs`). The measurements
+> below were taken on the removed implementation.
+
 Qwen 3.5/3.6/3.8 are hybrids: 48 of Qwen 3.8's 64 layers are GatedDeltaNet, and
 GDN carries a recurrent state that a KV cache's "drop the rejected tail" does not
 apply to. Rolling a partially-rejected verify back used to mean restoring a
@@ -743,8 +747,8 @@ the host round trip went through the state's unpack-and-repack; on the factual
 prompt the device path reproduces plain decoding byte for byte while the host
 path drifted in the last few tokens.
 
-`TS_Q35_VERIFY_SNAPSHOTS=0` restores the old path entirely; it is also what a
-shape the kernel will not persist falls back to, automatically. The cost of the snapshots is
+The old path is what a shape the kernel will not persist falls back to,
+automatically. The cost of the snapshots is
 VRAM: the GDN op's output grows by one state per slot, ~150 MB per slot for this
 model across all 48 recurrent layers, which is the other reason the default
 window is 3 rather than 8.
@@ -768,7 +772,7 @@ kind of acceptance (`GdnDecodeBench`, since removed, `TS_BENCH_MODE=verify TS_VE
 and `CudaReplayCommit_LeavesTheStateASnapshotCommitLeaves` on a toy trunk). It is the
 batched verify's commit (`ggml_ops_qwen35_batched_verify.cpp`): one captured graph
 serves every acceptance. A fully accepted window commits the verify's own post-window
-state, as before. `TS_Q35_VERIFY_REPLAY=0` restores the snapshots.
+state, as before.
 
 Qwen3.8-27B-UD-IQ3_XXS + DFlash2 Q4_K_M, RTX Spark N1X, 4.3K-token context,
 median ms of the verify forward (`GdnDecodeBench`, since removed, `TS_BENCH_MODE=verify`, 12 steps
@@ -1308,6 +1312,11 @@ a drafter can actually earn its verify.
 
 ### A correctness bug at a nine-row verify (Qwen 3.5, ggml)
 
+> **History.** Measured on the removed `Qwen35Model` and its `ggml_ops_qwen35_verify.cpp`; the
+> workaround and the fix site below refer to that code. The shared runtime's preferred windows keep
+> the same values (`StandardDecoderModel.SpecPreferredDraftWindow`: 3, or with a block drafter 7 on
+> `ggml_cuda` and 5 on `ggml_metal`); the nine-row case has not been re-measured on it.
+
 Speculation's whole contract is that the emitted stream is what plain greedy
 would have produced. On Qwen 3.5-0.8B / ggml_cuda that contract **breaks once the
 verify batch reaches nine rows**, which is a draft window of 8 or more.
@@ -1322,8 +1331,9 @@ and `TS_SPEC_ADAPTIVE=0` to force drafting:
 | 9 | 10 | **diverges at token 74** |
 | 10 | 11 | **diverges at token 74** |
 
-The culprit is the per-row recurrent-state snapshot path. `TS_Q35_VERIFY_SNAPSHOTS=0`
-at draft window 8 produces an identical stream; leaving it on diverges. Nine rows
+The culprit is the per-row recurrent-state snapshot path. Turning the snapshots off
+(with a switch since removed) at draft window 8 produces an identical stream; leaving
+them on diverges. Nine rows
 is also where ggml's 2..8-row matvec kernels give way to the large-batch path,
 which is the same boundary Gemma 4 already avoids for speed
 (`Gemma4Model.SpecPreferredDraftWindow`: 7, or 2 for a dense, mostly IQ4_XS
@@ -1333,13 +1343,13 @@ checkpoint on `ggml_metal`).
 on a recurrent trunk (a DFlash drafter on `ggml_cuda`; 3 otherwise), and a preferred window
 replaces the DEFAULT only - it never overrides a number the operator typed. So on
 `ggml_cuda` this is reachable by passing `--spec-draft 8` or wider, and not otherwise. That
-measurement predates the replayed commit (`TS_Q35_VERIFY_REPLAY`), which no longer keeps
+measurement predates the replayed commit, which no longer keeps
 snapshot slots on `ggml_cuda`; it has not been repeated on that path. On `ggml_metal`, n-gram's default
 for a dense, mostly IQ4_XS Qwen 3.5-family trunk is 12 drafts, a 13-row verify;
 a `ggml_metal` verify wider than eight rows now replays the accepted prefix at
 commit, as `ggml_cuda` does, instead of keeping the last three recurrent states
 (until 2026-11-09, an earlier rejection there restored and re-forwarded the
-accepted prefix; `TS_Q35_VERIFY_REPLAY=0` restores that). On an M5 Pro,
+accepted prefix). On an M5 Pro,
 Qwen3.8-27B-UD-IQ3_XXS, n-gram 12 on three copy prompts (1,110 tokens, identical
 text): 42.2 -> 46.6 tok/s, rollback 27.7 -> 0 ms per verify step, the 13-row
 verify graph 496 -> 97 MB; a DSpine block of 16 (six prompts, identical text):
@@ -1347,15 +1357,14 @@ verify graph 496 -> 97 MB; a DSpine block of 16 (six prompts, identical text):
 The earlier three-state comparison produced identical tokens too (see
 [Building against unchanged ggml](perf/ggml-without-patches.md)).
 
-**Workaround until it is fixed:** `--spec-draft 7` or lower, or
-`TS_Q35_VERIFY_SNAPSHOTS=0`.
+**Workaround until it is fixed:** `--spec-draft 7` or lower.
 
 Two C#-side guards were tried and do NOT work, which is worth recording so nobody
 repeats them: requesting one snapshot instead of N moved the divergence from
 token 74 to token 33, and additionally turning off the deferred state download
-moved it to token 18. The native reads `TS_Q35_VERIFY_SNAPSHOTS` itself for
-`fv_snapshots_cfg`, so the environment variable disables a combination the
-managed side cannot reproduce by toggling its own arguments. The fix belongs in
+moved it to token 18. The native read its snapshot switch itself for
+`fv_snapshots_cfg`, so that environment variable disabled a combination the
+managed side could not reproduce by toggling its own arguments. The fix belongs in
 `ggml_ops_qwen35_verify.cpp`, in how the snapshot slots are captured and
 committed for a batch wider than eight rows.
 
@@ -1480,7 +1489,14 @@ head ships for it) speculates on the same holder path since the session fix abov
 
 ## Concurrent requests
 
-A multi-sequence step never speculates: the planner rejects both speculative
+On the shared decoder runtime (the Qwen 3.5 family, Qwen 3.8 Flash Next and the other families it
+serves) concurrent requests do speculate: the unified step drafts each speculating request over its own
+drafter state and verifies every window in one forward (see
+[the unified step](design/unified-execution.md#the-unified-step)). The rest of this section describes
+the per-sequence and holder paths of the other families; its Qwen arena and holder notes predate the
+runtime.
+
+On those paths a multi-sequence step never speculates: the planner rejects both speculative
 paths for it, and the per-sequence fused path speculates only when the request
 is alone in the engine (a solo step with no other sequence running: while a
 newcomer prefills, the lone decoder gets steps of its own between the
@@ -1534,6 +1550,10 @@ by 600 ms on E4B), as was speculating on a solo step while another request is
 still prefilling; the gate is "alone in the engine".
 
 ### Taking turns (Flash Next on Metal)
+
+> **History.** The trunk below is the removed `Qwen4ExpModel`. No model in the tree prefers turns now
+> (`TS_SPEC_TURNS=1` still forces them on a trunk without a batched verify), and the shared runtime
+> verifies concurrent requests together.
 
 A trunk whose decode step is bound by the experts it reads, rather than by its dense weights, can serve
 concurrent requests faster one at a time than batched. Qwen 3.8 Flash Next on a 48 GB M5 Pro streams its

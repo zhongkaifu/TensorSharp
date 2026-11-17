@@ -1,7 +1,9 @@
 # Qwen3.8-Flash-Next (`qwen4exp`) on the shared decoder runtime
 
-Status (2026-11-13): done. `Qwen4ExpRuntimeModel` serves every backend but `--backend cuda` (the direct engine,
-`Qwen4ExpCudaModel`), and `Qwen4ExpModel` with its native token span, arenas and switches is removed. Its goldens on the
+Status (2026-11-14): done. `Qwen4ExpRuntimeModel` serves every backend, `--backend cuda` included (there its graphs
+run on the CUDA graph executor). The direct engine `Qwen4ExpCudaModel` and its Q4e kernels were removed after
+`Qwen4ExpModel`; that removal was not re-measured on a GPU against step 6 below, so `--backend cuda` has no measured
+parity claim. On 2026-11-13 `Qwen4ExpModel` with its native token span, arenas and switches was removed. Its goldens on the
 synthetic fixtures (`InferenceWeb.Tests/Fixtures/Qwen4ExpLegacy`) replace the comparisons below. What the removal
 needed beyond the steps below:
 
@@ -94,7 +96,7 @@ where a verify window's batched Metal kernels round differently from one row's, 
 
 Flash Next has 125 B parameters in total and 6 B active. Its routed experts take 46 GB at UD-Q2_K_XL.
 
-Today the family runs on its own code:
+When this plan was written, the family ran on its own code (all of it since removed):
 
 - `Qwen4ExpModel`: about 10.5 k lines over 21 files. It includes GGML token spans (fused native graphs), per-sequence holders, arenas, MTP, DFlash2, expert tiers and tensor parallelism.
 - `Qwen4ExpCudaModel`: the direct-CUDA engine with the Q4e kernels.

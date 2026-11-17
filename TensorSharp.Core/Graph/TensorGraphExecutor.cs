@@ -25,6 +25,12 @@ namespace TensorSharp.Graph
     /// </summary>
     public abstract class TensorGraphExecutor : IStreamingGraphExecutor
     {
+        /// <inheritdoc cref="IGraphExecutor.Drafting"/>
+        public bool Drafting { get; set; }
+
+        /// <inheritdoc cref="IGraphExecutor.StepSequences"/>
+        public virtual int StepSequences { get; set; }
+
         protected TensorGraphExecutor(IAllocator allocator)
             => Allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
 
@@ -49,7 +55,7 @@ namespace TensorSharp.Graph
         /// decode windows are exact (no padded rows to attend over).</summary>
         /// <summary>Exact decode windows; prompt chunks are written into the cache by row index and attend
         /// over its window, as the per-op paths do (the backends' cache kernels write and read it).</summary>
-        public virtual GraphCapabilities Capabilities { get; } = new() { StridedViews = true, DecodeWindowRows = 1, Replays = false, IndexedCacheWrites = true };
+        public virtual GraphCapabilities Capabilities { get; } = new() { StridedViews = true, DecodeWindowRows = 1, Replays = false, IndexedCacheWrites = true, HostExperts = true };
 
         /// <summary>The backend's binary kernels take a broadcast (stride-0) operand; otherwise it is
         /// gathered into a contiguous tensor first.</summary>
@@ -66,7 +72,16 @@ namespace TensorSharp.Graph
         /// <summary>The backend's element-wise kernels read strided views (no contiguous copy first).</summary>
         protected virtual bool KernelsReadStridedViews => false;
 
+        /// <summary>Whether a fused region of <paramref name="kind"/> takes its tensor inputs as they are (views of a packed
+        /// projection, say) rather than contiguous copies: <see cref="TryFused"/> then handles (or declines) any layout.</summary>
+        protected virtual bool RegionReadsStridedInputs(GraphFusion kind) => KernelsReadStridedViews;
+
         private Tensor In(Tensor t, RunState run) => KernelsReadStridedViews ? t : Contig(t, run);
+
+        /// <summary>Whether a row block of a packed weight's product of <paramref name="rows"/> rows stays a strided view of the
+        /// product (its readers copy it where they need it contiguous): fused regions that read strided inputs then take it
+        /// as it is.</summary>
+        protected virtual bool ProductRowBlocksAsViews(long rows) => KernelsReadStridedViews;
 
         private static readonly HashSet<GraphOp> s_ops = new()
         {
@@ -76,7 +91,7 @@ namespace TensorSharp.Graph
             GraphOp.View, GraphOp.Permute, GraphOp.Transpose, GraphOp.Cont, GraphOp.Cast, GraphOp.Cpy, GraphOp.SetRows,
             GraphOp.RopeExt, GraphOp.RopeMulti, GraphOp.FlashAttnExt, GraphOp.SoftMaxExt, GraphOp.TopK, GraphOp.SumRows,
             GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow, GraphOp.Sqr, GraphOp.Sqrt, GraphOp.Clamp,
-            GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce,
+            GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce, GraphOp.MoeHostExperts,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -96,6 +111,21 @@ namespace TensorSharp.Graph
 
         public virtual void Invalidate(IntPtr data) { }
 
+        /// <inheritdoc cref="IGraphExecutor.KeepForProductsOnly"/>
+        public virtual bool KeepForProductsOnly(IntPtr weightKey) => false;
+
+        /// <inheritdoc cref="IGraphExecutor.MarkDrafterWeight"/>
+        public virtual bool MarkDrafterWeight(IGraphWeight weight) => false;
+
+        /// <inheritdoc cref="IGraphExecutor.WarmProducts"/>
+        public virtual bool WarmProducts(IGraphWeight weight, IReadOnlyList<int> rows) => false;
+
+        /// <inheritdoc cref="IGraphExecutor.RunWhileNextRecordedStepRuns"/>
+        public virtual bool RunWhileNextRecordedStepRuns(Action work) => false;
+
+        /// <inheritdoc cref="IGraphExecutor.AttendsCapacityWindows"/>
+        public virtual bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
+
         // ================================================================ kernels a backend provides
 
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>
@@ -105,6 +135,35 @@ namespace TensorSharp.Graph
         /// registered by the assembly that holds the managed kernels. A backend without a kernel for a weight's
         /// format runs it through here, as its per-op path does.</summary>
         public static Action<IGraphWeight, float[], int, float[]> HostQuantizedProduct { get; set; }
+
+        /// <summary>The managed dequantization of a weight's host rows (rows[i] of the weight into F32 row i of the output,
+        /// <see cref="IGraphWeight.Ne0"/> values each), registered beside <see cref="HostQuantizedProduct"/>.</summary>
+        public static Action<IGraphWeight, long[], float[]> HostQuantizedRows { get; set; }
+
+        /// <summary>
+        /// ggml_get_rows over a quantized weight (a block drafter's selector codebooks): rows <paramref name="firstRow"/> +
+        /// ids of <paramref name="weight"/>, as F32 [ids, Ne0] (ggml's [Ne0, ids]). Default: dequantized from the weight's
+        /// host blocks through <see cref="HostQuantizedRows"/>, the ids read on the host; an executor with a device gather
+        /// for the weight's format overrides it.
+        /// </summary>
+        protected virtual Tensor QuantizedRows(IGraphWeight weight, long firstRow, Value ids, RunState run)
+        {
+            if (HostQuantizedRows == null || weight.Data == IntPtr.Zero)
+                throw new NotSupportedException($"{GetType().Name} has no row gather for weight type {weight.Format}, and no host copy to run it on");
+            int[] index = Ints(ids);
+            var rows = new long[index.Length];
+            for (int i = 0; i < index.Length; i++)
+            {
+                rows[i] = firstRow + index[i];
+                if (index[i] < 0 || rows[i] >= weight.Ne1 * Math.Max(1, weight.Ne2))
+                    throw new InvalidOperationException($"get_rows index {index[i]} outside the weight's {weight.Ne1} rows");
+            }
+            var values = new float[rows.LongLength * weight.Ne0];
+            HostQuantizedRows(weight, rows, values);
+            var result = new Tensor(Allocator, DType.Float32, rows.Length, weight.Ne0);
+            result.SetElementsAsFloat(values);
+            return result;
+        }
 
         /// <summary><see cref="HostQuantizedProduct"/> on <paramref name="x"/>'s rows (copied to the host and back).</summary>
         protected Tensor HostProduct(IGraphWeight weight, Tensor x)
@@ -123,6 +182,10 @@ namespace TensorSharp.Graph
         /// <summary>x [n, Ne0] times expert <paramref name="expert"/> of stacked weights: [n, Ne1].</summary>
         protected virtual Tensor ExpertMatMul(IGraphExpertWeights weights, int expert, Tensor x)
             => QuantizedMatMul(weights.Expert(expert), x);
+
+        /// <summary>Drop the device copy an expert streamed in for one step left behind (its experts are not the
+        /// layer's tier). Executors that keep device copies of weights release it; the default keeps nothing.</summary>
+        protected virtual void ReleaseStreamedExpert(IGraphWeight expert) { }
 
         /// <summary>Attention of q [heads, nq, d] over k [kvHeads, nkv, d] / v [kvHeads, nkv, dv] with an
         /// additive mask [nq, nkv] (or null); query head h reads KV head h / (heads / kvHeads). The
@@ -193,6 +256,39 @@ namespace TensorSharp.Graph
         /// </summary>
         protected virtual Tensor GatedDeltaNet(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots)
             => GatedDeltaNetHost(q, k, v, g, beta, state, snapshots);
+
+        /// <summary><see cref="GatedDeltaNet(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int)"/>; with
+        /// <paramref name="rowKernels"/> a backend with a chunked prompt kernel runs the decode rows' kernels instead, so a
+        /// window's re-step rounds as its rows did.</summary>
+        protected virtual Tensor GatedDeltaNet(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, int snapshots, bool rowKernels)
+            => GatedDeltaNet(q, k, v, g, beta, state, snapshots);
+
+        /// <summary>
+        /// A verify window's recurrence (one sequence, <see cref="GraphCapabilities.WindowStateInPlace"/>): the rows' outputs
+        /// ([rows, heads, S], the leading part of <see cref="GatedDeltaNet"/>'s result) on the decode rows' kernels, the state
+        /// left as it was, and the rows' q, k, v, gates and betas into <paramref name="inputs"/> in planar regions of
+        /// <paramref name="inputRows"/> tokens (q and k [rows, keyHeads, S], v [rows, heads, S], the gates [rows, heads, S or
+        /// 1], the betas [rows, heads]), from which the commit steps the kept rows on the state.
+        /// </summary>
+        protected virtual Tensor GatedDeltaNetWindow(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, Tensor inputs,
+            int inputRows)
+        {
+            long[] nq = Ne(q), nv = Ne(v), ng = Ne(g);
+            long s = nv[0], heads = nv[1], tokens = nv[2], keyHeads = nq[1], gate = ng[0];
+            Tensor result;
+            using (Tensor full = GatedDeltaNet(q, k, v, g, beta, state, 1, rowKernels: true))
+                result = full.Narrow(0, 0, tokens * heads * s);
+            long at = 0;
+            foreach ((Tensor part, long rowFloats) in new[] { (q, keyHeads * s), (k, keyHeads * s), (v, heads * s), (g, heads * gate), (beta, heads) })
+            {
+                using (Tensor flat = inputs.View(inputs.ElementCount()))
+                using (Tensor dst = flat.Narrow(0, at, tokens * rowFloats))
+                using (Tensor src = part.View(tokens * rowFloats))
+                    CopyInto(dst, src);
+                at += inputRows * rowFloats;
+            }
+            return result;
+        }
 
         /// <summary>ggml_ssm_conv: x [n_s, channels, width - 1 + n_t] (time innermost), kernel
         /// [channels, width]: [n_s, n_t, channels].</summary>
@@ -269,6 +365,9 @@ namespace TensorSharp.Graph
                 _make = make;
             }
 
+            /// <summary>The most keys a query attends (a sparse attention's budget: the op's hint), 0 when unknown.</summary>
+            public int KvMax { get; set; }
+
             /// <summary>The mask [nq, nkv] as a device tensor (uploaded on first use: a kernel that runs the
             /// pattern never needs it).</summary>
             public Tensor Tensor => _tensor ??= _make?.Invoke();
@@ -288,6 +387,36 @@ namespace TensorSharp.Graph
 
             public static readonly AttentionMask None = new(MaskPattern.None, 0, null);
         }
+
+        /// <summary>F16 host values widened to F32 (exactly) with the vectorized conversion: a prompt chunk's causal mask is
+        /// millions of values (1,565 x 3,613 for the second chunk of a 3.6K-token prompt), widened one at a time in 10-20 ms
+        /// of the step's emission while the device ran out of queued work.</summary>
+        private static unsafe float[] WidenF16(System.Half* src, long count)
+        {
+            var values = new float[count];
+            for (long done = 0; done < count;)
+            {
+                int n = (int)Math.Min(count - done, int.MaxValue);
+                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(new ReadOnlySpan<System.Half>(src + done, n), values.AsSpan((int)done, n));
+                done += n;
+            }
+            return values;
+        }
+
+        /// <summary>Every value of <paramref name="s"/> equals zero (either sign): the bits compared vectorized, a value not
+        /// +0 rechecked as a float.</summary>
+        private static bool AllZero(ReadOnlySpan<float> s)
+        {
+            int i = System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(s).IndexOfAnyExcept(0);
+            if (i < 0) return true;
+            for (; i < s.Length; i++)
+                if (s[i] != 0f) return false;
+            return true;
+        }
+
+        /// <summary>Every value of <paramref name="s"/> is -inf (one bit pattern), compared vectorized.</summary>
+        private static bool AllNegativeInfinity(ReadOnlySpan<float> s)
+            => System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(s).IndexOfAnyExcept(BitConverter.SingleToInt32Bits(float.NegativeInfinity)) < 0;
 
         private static AttentionMask Classify(Func<Tensor> mask, float[] host, long rows, long keys)
         {
@@ -311,16 +440,17 @@ namespace TensorSharp.Graph
                 if (!all) break;
                 valid--;
             }
+            // Row by row, vectorized (a prompt chunk's mask is millions of values): keys [floor, valid) all zero for None;
+            // for Causal those up to the last key the row sees (valid - rows + r) zero, the rest -inf.
             bool none = true, causal = true;
             for (long r = 0; r < rows && (none || causal); r++)
             {
-                long last = valid - rows + r;   // the last key row r sees when causal
-                for (long c = floor; c < valid; c++)
-                {
-                    float m = host[r * keys + c];
-                    none &= m == 0f;
-                    causal &= c <= last ? m == 0f : float.IsNegativeInfinity(m);
-                }
+                long open = Math.Min(Math.Max(valid - rows + r + 1, floor), valid);
+                ReadOnlySpan<float> seen = host.AsSpan((int)(r * keys + floor), (int)(open - floor));
+                ReadOnlySpan<float> past = host.AsSpan((int)(r * keys + open), (int)(valid - open));
+                bool seenZero = AllZero(seen);
+                none = none && seenZero && AllZero(past);
+                causal = causal && seenZero && AllNegativeInfinity(past);
             }
             MaskPattern pattern = none ? MaskPattern.None : causal ? MaskPattern.Causal : MaskPattern.Explicit;
             int trimmedFloor = pattern == MaskPattern.Explicit ? 0 : floor;
@@ -331,7 +461,7 @@ namespace TensorSharp.Graph
             return new AttentionMask(pattern, trimmedFloor, mask, (int)valid, pattern, trimmedFloor);
         }
 
-        private sealed class RunState
+        protected sealed class RunState
         {
             public readonly List<Tensor> Owned = new();
             /// <summary>Full products of a weight with a node's rows, shared by the row blocks a
@@ -360,6 +490,10 @@ namespace TensorSharp.Graph
             public readonly int[] Uses;
             private readonly GraphNode[] _nodes;
 
+            /// <summary>Each aliased node's state leaf and byte offset (<see cref="GraphNodeKind.Alias"/>): the session hands
+            /// them to the node's op, which may write its result there (<see cref="AliasDestination"/>).</summary>
+            public readonly Dictionary<int, (int Leaf, long Offset)> Aliases = new();
+
             public Liveness(GraphProgram program)
             {
                 Count = program.NodeCount;
@@ -384,9 +518,17 @@ namespace TensorSharp.Graph
                         case GraphNodeKind.Alias:
                             Uses[e.Node] += Forever;
                             Uses[e.Srcs[1]] += Forever;
+                            Aliases[e.Node] = (e.Srcs[0], e.Bytes);
                             break;
                         case GraphNodeKind.Boundary:
                             Uses[e.Node]++;
+                            break;
+                        case GraphNodeKind.Fused:
+                            // A region's inputs live until it closes (the session spends these reads there): its kernel reads
+                            // them, and an input whose last op reader ran before the region opened (a QSA layer's cache write
+                            // rows) had been released by then.
+                            foreach (int src in e.Srcs ?? Array.Empty<int>())
+                                if (src >= 0 && src < Count) Uses[src]++;
                             break;
                     }
                 }
@@ -444,6 +586,7 @@ namespace TensorSharp.Graph
 
             public Session(TensorGraphExecutor executor, bool[] dead = null, Liveness live = null)
             {
+                executor.BeginRun();
                 _x = executor;
                 _dead = dead;
                 _live = live;
@@ -454,7 +597,9 @@ namespace TensorSharp.Graph
             }
 
             private GraphNode _region;   // the open fused region this executor has a kernel for (Kind Fused), else default
+            private readonly Stack<int[]> _regionInputs = new();   // every open region's inputs, innermost on top
             private readonly List<int> _regionOps = new();   // the ops the open region deferred, in order
+            private readonly List<GraphNode> _regionWrites = new();   // the writes (effects, aliases) the open region deferred, in order
             private int _nested;         // regions opened inside it (part of it: their ends do not close it)
             private bool InRegion => _region.Kind == GraphNodeKind.Fused;
 
@@ -490,17 +635,17 @@ namespace TensorSharp.Graph
                         }
                         break;
                     }
-                    case GraphNodeKind.Effect: { int n = e.Node; Pinned(n); Attribute(() => Force(n)); break; }
-                    // The executor places the result in the leaf if it can, else the alias's copy runs.
+                    case GraphNodeKind.Effect:
                     case GraphNodeKind.Alias:
                     {
-                        GraphNode alias = e;
+                        GraphNode write = e;
                         Pinned(e.Node);
-                        Pinned(alias.Srcs[1]);
-                        Attribute(() =>
-                        {
-                            if (!_x.TryAlias(Get(alias.Node), Get(alias.Srcs[0]), alias.Bytes)) Force(alias.Srcs[1]);
-                        });
+                        if (e.Kind == GraphNodeKind.Alias) Pinned(e.Srcs[1]);
+                        // A write inside a region this executor serves is the region's (an effect, or an alias's in-place
+                        // result): its kernel makes it, else its ops run it when the region closes, in order with the
+                        // region's other writes.
+                        if (InRegion) _regionWrites.Add(write);
+                        else Attribute(() => Write(write));
                         break;
                     }
                     case GraphNodeKind.Output: Pinned(e.Node); _outputs.Add(e.Node); _outputFloats.Add(e.Bytes); break;
@@ -509,8 +654,9 @@ namespace TensorSharp.Graph
                         else _boundaryPending[e.Node] = 0;
                         break;
                     case GraphNodeKind.Fused:
+                        _regionInputs.Push(e.Srcs ?? Array.Empty<int>());
                         if (InRegion) _nested++;
-                        else if (_x.Fuses((GraphFusion)e.Node)) _region = e;
+                        else if (_x.Fuses((GraphFusion)e.Node) || _x.RunsConcurrently((GraphFusion)e.Node)) _region = e;
                         break;
                     case GraphNodeKind.FusedEnd:
                         if (InRegion && _nested > 0) _nested--;
@@ -518,9 +664,19 @@ namespace TensorSharp.Graph
                         {
                             GraphNode region = _region, end = e;
                             _region = default;
-                            Attribute(() => RunFused(region, end.Srcs));
+                            GraphNode[] writes = _regionWrites.Count == 0 ? Array.Empty<GraphNode>() : _regionWrites.ToArray();
+                            _regionWrites.Clear();
+                            // A region none of whose results the step reads does not run (its ops are dead too); its writes do.
+                            if (_dead == null || !Array.TrueForAll(end.Srcs, r => r >= 0 && r < _dead.Length && _dead[r]))
+                                Attribute(() => RunFused(region, end.Srcs, writes));
+                            else if (writes.Length > 0)
+                                Attribute(() => { foreach (GraphNode w in writes) Write(w); });
                             SkipUnrun();
                         }
+                        // The region's reads of its inputs (Liveness counts one each) are spent, run or not.
+                        if (_regionInputs.Count > 0)
+                            foreach (int src in _regionInputs.Pop())
+                                if (src >= 0 && src < _count) Use(src);
                         break;
                 }
             }
@@ -542,11 +698,32 @@ namespace TensorSharp.Graph
                 _regionOps.Clear();
             }
 
-            /// <summary>The region's results from its kernel, else from its ops.</summary>
-            private void RunFused(in GraphNode region, int[] results)
+            /// <summary>An effect: its node runs. An alias: the executor places the node's result in the leaf if it can, else
+            /// the alias's copy runs.</summary>
+            private void Write(in GraphNode w)
+            {
+                if (w.Kind == GraphNodeKind.Effect)
+                {
+                    Force(w.Node);
+                    return;
+                }
+                if (_x.TryAlias(Get(w.Node), Get(w.Srcs[0]), w.Bytes)) _x.AliasesInPlace++;
+                else
+                {
+                    _x.AliasCopies++;
+                    Force(w.Srcs[1]);
+                }
+            }
+
+            /// <summary>The region's results (and the writes inside it, <paramref name="writes"/>) from its kernel, else from its
+            /// ops: the writes first, in order, as they ran before regions held writes (an op after a write may read what it
+            /// wrote).</summary>
+            private void RunFused(in GraphNode region, int[] results, GraphNode[] writes)
             {
                 var inputs = new Tensor[region.Srcs.Length];
                 var weights = new IGraphWeight[region.Srcs.Length];
+                // A region whose kernel finishes writes left for later to its inputs itself takes them unread.
+                bool unread = _x.RegionFinishesDeferredInputs((GraphFusion)region.Node);
                 for (int i = 0; i < inputs.Length; i++)
                 {
                     Force(region.Srcs[i]);
@@ -555,8 +732,32 @@ namespace TensorSharp.Graph
                         weights[i] = weight;
                         continue;
                     }
-                    inputs[i] = Get(region.Srcs[i]);
-                    if (!_x.KernelsReadStridedViews && !inputs[i].IsContiguous()) inputs[i] = _x.Contig(inputs[i], Run);
+                    inputs[i] = _x.Device(_values, region.Srcs[i], Run, read: !unread);
+                    if (!_x.RegionReadsStridedInputs((GraphFusion)region.Node) && !inputs[i].IsContiguous())
+                    {
+                        if (unread && _x.PendingWrites) _x.BeforeRead(inputs[i]);
+                        inputs[i] = _x.Contig(inputs[i], Run);
+                    }
+                }
+                if (_x.RunsConcurrently((GraphFusion)region.Node))
+                {
+                    // The region's ops, now, beside what the step runs next (the executor waits where their results are read).
+                    bool beside = _x.BeginConcurrent(inputs);
+                    try
+                    {
+                        foreach (GraphNode w in writes) Write(w);
+                        foreach (int r in results) Force(r);
+                    }
+                    finally
+                    {
+                        if (beside)
+                        {
+                            var made = new Tensor[results.Length];
+                            for (int i = 0; i < results.Length; i++) made[i] = _values[results[i]].Tensor;
+                            _x.EndConcurrent(made);
+                        }
+                    }
+                    return;
                 }
                 var outs = new Tensor[results.Length];
                 if (_x.TryFused((GraphFusion)region.Node, inputs, weights, region.Ip, region.Fp, outs))
@@ -569,6 +770,7 @@ namespace TensorSharp.Graph
                     return;
                 }
                 foreach (Tensor t in outs) t?.Dispose();
+                foreach (GraphNode w in writes) Write(w);
                 foreach (int r in results) Force(r);
             }
 
@@ -584,9 +786,24 @@ namespace TensorSharp.Graph
             /// <summary>Read the outputs into <paramref name="outputs"/>.</summary>
             public void Finish(float[][] outputs, Tensor[] keep = null)
             {
+                _x.FinishWrites();
                 for (int o = 0; o < _outputs.Count; o++)
                 {
-                    Tensor c = _x.Contig(_x.F32(Get(_outputs[o]), Run.Owned), Run.Owned);
+                    Tensor src = _x.Contig(Get(_outputs[o]), Run.Owned);
+                    // An integer output (a top-k's ids) is read as its values: not every backend converts I32 to F32.
+                    if (src.ElementType == DType.Int32)
+                    {
+                        if (keep != null)
+                        {
+                            keep[o] = src.CopyRef();
+                            continue;
+                        }
+                        int n = (int)Math.Min(outputs[o].LongLength, src.ElementCount());
+                        int[] ints = src.GetElementsAsInt(n);
+                        for (int i = 0; i < n; i++) outputs[o][i] = ints[i];
+                        continue;
+                    }
+                    Tensor c = _x.F32(src, Run.Owned);
                     if (keep != null)
                     {
                         keep[o] = c.CopyRef();
@@ -604,6 +821,10 @@ namespace TensorSharp.Graph
 
             public void Dispose()
             {
+                // A run that ended early (an exception) still finishes the writes it left for later, while their tensors
+                // live; a failure there is the run's own error again, already on its way out.
+                try { _x.FinishWrites(); }
+                catch (Exception) { }
                 for (int i = 0; i < _count; i++) _own[i]?.Dispose();
                 foreach (Tensor t in Run.Owned) t.Dispose();
                 foreach (Tensor t in Run.Lasting) t.Dispose();
@@ -617,6 +838,7 @@ namespace TensorSharp.Graph
                 _regionOps.Clear();
                 _x._buffers = new Buffers { Nodes = _nodes, Values = _values, State = _state, Fresh = _fresh, Own = _own, Uses = _uses };
                 _count = 0;
+                _x.EndRun();
             }
 
             /// <summary>Run <paramref name="work"/>: the tensors it made that became a node's value stay owned by
@@ -631,7 +853,9 @@ namespace TensorSharp.Graph
                     int owner = -1;
                     for (int j = setMark; j < _setDuring.Count && owner < 0; j++)
                         if (ReferenceEquals(_values[_setDuring[j]].Tensor, t) && _own[_setDuring[j]] == null) owner = _setDuring[j];
-                    if (owner >= 0) _own[owner] = t;
+                    // A node made and read for the last time within this work (a fused region forcing its sources, the
+                    // add-and-norm peephole) was released before it had an owner: its tensor goes now, not at the step's end.
+                    if (owner >= 0 && _uses[owner] != Released) _own[owner] = t;
                     else t.Dispose();
                 }
                 Run.Owned.RemoveRange(mark, Run.Owned.Count - mark);
@@ -651,6 +875,7 @@ namespace TensorSharp.Graph
             }
 
             /// <summary>Node <paramref name="node"/> has been read once more: release it after its last reader.</summary>
+
             private void Use(int node)
             {
                 if (!_freeing || node < 0) return;
@@ -731,7 +956,7 @@ namespace TensorSharp.Graph
                 }
                 GraphNode n = _nodes[node];
                 Tensor result = n.Op == GraphOp.Add
-                    ? _x.Binary(Get(n.Srcs[0]), Get(n.Srcs[1]), Run, (r, a, b) => Ops.Add(r, a, b))
+                    ? _x.Binary(Get(n.Srcs[0]), Get(n.Srcs[1]), Run, (r, a, b) => Ops.Add(r, a, b), GraphOp.Add)
                     : _x.RowNorm(Get(n.Srcs[0]), Eps(n), Run);
                 Set(node, new Value { Tensor = Run.Keep(result) }, fresh: true);
             }
@@ -773,13 +998,30 @@ namespace TensorSharp.Graph
                         {
                             GraphNode add = _nodes[sum];
                             Tensor a = Get(add.Srcs[0]), b = Get(add.Srcs[1]);
-                            if (a.Sizes.SequenceEqual(b.Sizes) && _x.TryAddWeightedNorm(a, b, weight, Eps(norm), out Tensor total, out Tensor normed))
+                            // The operands' rows as ggml counts them: a decode row's stream can be [hidden] where the block's
+                            // output beside it is [1, hidden], the same row. Compared by their tensor sizes, plain decoding's
+                            // residual adds and norms ran unfused (an add, then the row norm's other reduction) where a verify
+                            // window's rows took the fused kernel, so the window's rows rounded apart from the decode rows.
+                            using Tensor bAsA = !a.Sizes.SequenceEqual(b.Sizes) && Ne(a).AsSpan().SequenceEqual(Ne(b)) && b.IsContiguous()
+                                ? b.View(a.Sizes) : null;
+                            if ((bAsA != null || a.Sizes.SequenceEqual(b.Sizes))
+                                && _x.TryAddWeightedNorm(a, bAsA ?? b, weight, Eps(norm), out Tensor total, out Tensor normed))
                             {
                                 Set(sum, new Value { Tensor = Run.Keep(total) }, fresh: true);
                                 Consumed(n.Srcs[0]);
                                 Set(node, new Value { Tensor = Run.Keep(normed) }, fresh: true);
                                 return;
                             }
+                        }
+                        // A residual add's norm that could not fuse - a reader took the sum first (a drafter's tap on the
+                        // stream, as its prompt step follows the trunk) - runs the fused kernel's reduction where the executor
+                        // has it: the norm's bits must not depend on what else reads the stream. The row norm had summed the
+                        // squares in another order, so a drafter loaded beside the trunk changed the trunk's own state.
+                        if (_nodes[sum].Op == GraphOp.Add && _x.TryResidualNorm(Get(sum), weight, Eps(norm), out Tensor residualNormed))
+                        {
+                            Consumed(n.Srcs[0]);
+                            Set(node, new Value { Tensor = Run.Keep(residualNormed) }, fresh: true);
+                            return;
                         }
                         Value weighted = _x.WeightedNorm(Get(sum), Eps(norm), weight, Run);
                         Consumed(n.Srcs[0]);
@@ -788,7 +1030,15 @@ namespace TensorSharp.Graph
                     }
                 }
                 foreach (int src in n.Srcs) Force(src);
-                Value v = _x.Eval(n, _values, Run);
+                // An aliased op may write its result into the alias's leaf (bound before it, on the template's nodes).
+                (int Leaf, long Offset) target = default;
+                bool aliased = _freeing && _x.TakesAliasDestinations && !_x.AliasDestinationsDisabledForTests
+                    && _live.Aliases.TryGetValue(node, out target)
+                    && target.Leaf < node && _state[target.Leaf] == Done && _values[target.Leaf].Tensor != null;
+                if (aliased) _x._aliasTarget = (Get(target.Leaf), target.Offset);
+                Value v;
+                try { v = _x.Eval(n, _values, Run); }
+                finally { if (aliased) _x._aliasTarget = default; }
                 bool fresh = n.Op switch
                 {
                     GraphOp.View or GraphOp.Reshape or GraphOp.Permute or GraphOp.Transpose or GraphOp.KvWindow => _fresh[n.Srcs[0]],
@@ -843,6 +1093,10 @@ namespace TensorSharp.Graph
                 _program = program;
                 var nodes = new GraphNode[program.NodeCount];
                 var roots = new List<int>();
+                // Fused regions (inputs, results): a region runs as one kernel reading every input it names, also one only
+                // its unneeded ops read (a hyper-connection read's injection weights where the step drops the injection).
+                var regions = new List<(int[] Inputs, int[] Results)>();
+                var open = new Stack<int[]>();
                 int n = 0;
                 foreach (GraphNode e in program.Entries)
                 {
@@ -853,17 +1107,30 @@ namespace TensorSharp.Graph
                         case GraphNodeKind.Output:
                         case GraphNodeKind.Effect: roots.Add(e.Node); break;
                         case GraphNodeKind.Alias: roots.Add(e.Srcs[1]); break;
+                        case GraphNodeKind.Fused: open.Push(e.Srcs ?? Array.Empty<int>()); break;
+                        case GraphNodeKind.FusedEnd: if (open.Count > 0) regions.Add((open.Pop(), e.Srcs ?? Array.Empty<int>())); break;
                     }
                 }
                 var live = new bool[n];
                 var stack = new Stack<int>(roots);
-                while (stack.Count > 0)
+                bool grew = true;
+                while (grew)
                 {
-                    int i = stack.Pop();
-                    if (live[i]) continue;
-                    live[i] = true;
-                    if (nodes[i].Kind == GraphNodeKind.Op)
-                        foreach (int s in nodes[i].Srcs) stack.Push(s);
+                    while (stack.Count > 0)
+                    {
+                        int i = stack.Pop();
+                        if (live[i]) continue;
+                        live[i] = true;
+                        if (nodes[i].Kind == GraphNodeKind.Op)
+                            foreach (int s in nodes[i].Srcs) stack.Push(s);
+                    }
+                    grew = false;
+                    foreach ((int[] inputs, int[] results) in regions)
+                    {
+                        if (!Array.Exists(results, r => r >= 0 && r < n && live[r])) continue;
+                        foreach (int input in inputs)
+                            if (input >= 0 && input < n && !live[input]) { stack.Push(input); grew = true; }
+                    }
                 }
                 _dead = new bool[n];
                 for (int i = 0; i < n; i++)
@@ -1007,6 +1274,31 @@ namespace TensorSharp.Graph
         /// without the alias's copy (the executor shares the result's memory); false runs the copy.</summary>
         protected virtual bool TryAlias(Tensor result, Tensor leaf, long offsetBytes) => false;
 
+        private (Tensor Leaf, long Offset) _aliasTarget;
+
+        /// <summary>Aliases whose op wrote its result in place, and those whose copy ran (tests).</summary>
+        internal long AliasesInPlace { get; private set; }
+        internal long AliasCopies { get; private set; }
+
+        /// <summary>Whether this executor's ops may write their results where an alias names (<see cref="AliasDestination"/>): the
+        /// session then binds the alias's leaf before the op runs.</summary>
+        protected virtual bool TakesAliasDestinations => false;
+
+        /// <summary>Tests: no op is offered its alias's destination (each alias then finds what the op allocated).</summary>
+        internal bool AliasDestinationsDisabledForTests { get; set; }
+
+        /// <summary>While an aliased op runs (<see cref="GraphNodeKind.Alias"/>): a view of <paramref name="elements"/> F32 values of
+        /// the alias's leaf at its offset, where the op may write its result so that <see cref="TryAlias"/> finds it in place (the
+        /// alias's copy then never runs); null when no alias names the op or its leaf has no room for them.</summary>
+        protected Tensor AliasDestination(long elements)
+        {
+            (Tensor leaf, long offset) = _aliasTarget;
+            if (leaf == null || leaf.ElementType != DType.Float32 || !leaf.IsContiguous() || offset % sizeof(float) != 0) return null;
+            long first = offset / sizeof(float);
+            if (first + elements > leaf.ElementCount()) return null;
+            return new Tensor(new[] { elements }, new[] { 1L }, leaf.Storage, leaf.StorageOffset + first);
+        }
+
         /// <summary>Rotary positions per row are a broadcast of the positions tensor on the device, not an upload of
         /// host values per step (a backend whose recorded steps must read their positions from the device).</summary>
         protected virtual bool BroadcastsPositionsOnDevice => false;
@@ -1021,9 +1313,29 @@ namespace TensorSharp.Graph
         /// and the region's ops run instead.</summary>
         protected virtual bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results) => false;
 
+
+        /// <summary>Whether a region of <paramref name="kind"/> (<see cref="GraphFusion.ConcurrentBranch"/>) runs its ops at its
+        /// end, where <see cref="BeginConcurrent"/> may move them beside the step's later work.</summary>
+        protected virtual bool RunsConcurrently(GraphFusion kind) => false;
+
+        /// <summary>A concurrent region's ops are about to run (its inputs computed): true where the executor runs them beside
+        /// the step's later work until <see cref="EndConcurrent"/>, false to run them in place.</summary>
+        protected virtual bool BeginConcurrent(Tensor[] inputs) => false;
+
+        /// <summary>A concurrent region's ops are queued; <paramref name="results"/> are what later ops will wait for.</summary>
+        protected virtual void EndConcurrent(Tensor[] results) { }
+
         protected virtual bool TryAddWeightedNorm(Tensor a, Tensor b, Tensor weight, float eps, out Tensor sum, out Tensor normed)
         {
             sum = normed = null;
+            return false;
+        }
+
+        /// <summary>The weighted norm of a residual add's sum <paramref name="x"/> made before its norm (it could not fuse) with
+        /// <see cref="TryAddWeightedNorm"/>'s reduction, so its rows are the fused rows' bits; false: the generic norm.</summary>
+        protected virtual bool TryResidualNorm(Tensor x, Tensor weight, float eps, out Tensor normed)
+        {
+            normed = null;
             return false;
         }
 
@@ -1045,6 +1357,9 @@ namespace TensorSharp.Graph
                 return new Value { Tensor = Shaped(given, leaf.Ne, run) };
             if (handle is StableInput stable)
             {
+                // A varying input binds its device copy alone: an op reading it on the host synchronizes, which aborts
+                // the recording, instead of recording this launch's values.
+                if (stable.Varies) return new Value { Tensor = Shaped(stable.Device, leaf.Ne, run) };
                 // The device copy a captured step binds; the host values still classify a mask and feed host reads.
                 Value host = HostValues(leaf.Format, leaf.Ne, data, bytes);
                 return host with { Tensor = Shaped(stable.Device, leaf.Ne, run) };
@@ -1066,13 +1381,7 @@ namespace TensorSharp.Graph
                     fixed (float* dst = values) Buffer.MemoryCopy((void*)data, dst, count * 4L, Math.Min(bytes, count * 4L));
                     return new Value { Floats = values, HostSizes = sizes };
                 }
-                case GraphFormat.F16:
-                {
-                    var values = new float[count];
-                    var src = (System.Half*)data;
-                    for (long i = 0; i < count; i++) values[i] = (float)src[i];
-                    return new Value { Floats = values, HostSizes = sizes };
-                }
+                case GraphFormat.F16: return new Value { Floats = WidenF16((System.Half*)data, count), HostSizes = sizes };
                 case GraphFormat.I32:
                 case GraphFormat.I64:
                 {
@@ -1150,6 +1459,11 @@ namespace TensorSharp.Graph
         /// a backend whose generic copy does not convert overrides it. Default: <see cref="Ops.Copy"/>.</summary>
         protected virtual void CopyInto(Tensor dst, Tensor src) => Ops.Copy(dst, src);
 
+        /// <summary>Single-axis rotary of <paramref name="x"/> ([tokens, heads, d], d contiguous, any token and head strides)
+        /// into new contiguous rows, the values the contiguous path writes; null where the backend cannot (it is copied, then
+        /// rotated). fp: freq base, freq scale, ext factor, attn factor, beta fast, beta slow.</summary>
+        protected virtual Tensor RopeStrided(Tensor x, Tensor positions, int tokens, int heads, int d, int dims, int mode, int ctx, float[] fp) => null;
+
         private Tensor Contig(Tensor t, RunState run) => Contig(t, run.Owned);
 
         private Tensor F32(Tensor t, List<Tensor> owned)
@@ -1182,13 +1496,7 @@ namespace TensorSharp.Graph
                     fixed (float* dst = values) Buffer.MemoryCopy((void*)data, dst, count * 4L, Math.Min(bytes, count * 4L));
                     return HostFloats(values, sizes, run);
                 }
-                case GraphFormat.F16:
-                {
-                    var values = new float[count];
-                    var src = (System.Half*)data;
-                    for (long i = 0; i < count; i++) values[i] = (float)src[i];
-                    return HostFloats(values, sizes, run);
-                }
+                case GraphFormat.F16: return HostFloats(WidenF16((System.Half*)data, count), sizes, run);
                 case GraphFormat.I32:
                 case GraphFormat.I64:
                 {
@@ -1215,9 +1523,10 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>The value's tensor, uploading a host-only input on first use (stored back).</summary>
-        private Tensor Device(Value[] values, int node, RunState run)
+        private Tensor Device(Value[] values, int node, RunState run, bool read = true)
         {
             Value v = values[node];
+            if (read && PendingWrites && v.Tensor != null) BeforeRead(v.Tensor);
             if (v.Tensor != null || v.HostSizes == null) return v.Tensor;
             var t = run.KeepLasting(new Tensor(Allocator, DType.Float32, v.HostSizes));
             t.SetElementsAsFloat(v.Floats);
@@ -1239,25 +1548,31 @@ namespace TensorSharp.Graph
             return t;
         }
 
-        private static int[] Ints(Value v) => v.Ints ?? v.Tensor.GetElementsAsInt((int)v.Tensor.ElementCount());
+        protected static int[] Ints(Value v) => v.Ints ?? v.Tensor.GetElementsAsInt((int)v.Tensor.ElementCount());
 
         // ================================================================ ops
 
         private Value Eval(GraphNode n, Value[] values, RunState run)
         {
-            Tensor T(int s) => Device(values, n.Srcs[s], run) ?? throw new NotSupportedException($"{n.Op}: source {s} is a quantized weight");
+            // A weight product's rows go to the executor unread when it finishes writes left for later to them itself.
+            int productRows = n.Op == GraphOp.MulMat && ProductsFinishDeferredRows && values[n.Srcs[0]].Weight != null ? n.Srcs[1] : -1;
+            if (PendingWrites && n.Srcs != null)
+                foreach (int src in n.Srcs)
+                    if (src >= 0 && src != productRows && values[src].Tensor is { } read) BeforeRead(read);
+            Tensor T(int s) => Device(values, n.Srcs[s], run, read: n.Srcs[s] != productRows)
+                ?? throw new NotSupportedException($"{n.Op}: source {s} is a quantized weight");
             Value V(Tensor t) => new() { Tensor = run.Keep(t) };
             long Ip(int i, long fallback) => n.Ip != null && n.Ip.Length > i ? n.Ip[i] : fallback;
             float Fp(int i, float fallback) => n.Fp != null && n.Fp.Length > i ? n.Fp[i] : fallback;
 
             switch (n.Op)
             {
-                case GraphOp.Add: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Add(r, a, b)));
-                case GraphOp.Sub: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Sub(r, a, b)));
-                case GraphOp.Mul: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Mul(r, a, b)));
-                case GraphOp.Div: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Div(r, a, b)));
+                case GraphOp.Add: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Add(r, a, b), GraphOp.Add));
+                case GraphOp.Sub: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Sub(r, a, b), GraphOp.Sub));
+                case GraphOp.Mul: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Mul(r, a, b), GraphOp.Mul));
+                case GraphOp.Div: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Div(r, a, b), GraphOp.Div));
                 case GraphOp.Sqr: { Tensor x = In(T(0), run); return V(Ops.Mul(null, x, x)); }
-                case GraphOp.Sqrt: return V(Ops.Pow(null, In(T(0), run), 0.5f));
+                case GraphOp.Sqrt: return V(Sqrt(In(T(0), run)));
                 case GraphOp.Clamp: return V(Ops.Clamp(null, In(T(0), run), Fp(0, float.MinValue), Fp(1, float.MaxValue)));
                 case GraphOp.Scale: return V(Ops.Mul(null, In(T(0), run), Fp(0, 1f)));
                 case GraphOp.Silu: return V(Ops.SiLU(null, In(T(0), run)));
@@ -1288,16 +1603,32 @@ namespace TensorSharp.Graph
                 }
                 case GraphOp.MulMat:
                 {
-                    Tensor y = MatMul(values[n.Srcs[0]], n.Srcs[1], T(1), run);
+                    // ip [1] set: a row block of the weight read alone (GraphStep.MatMulRows), which need not be a shared product.
+                    Tensor y = MatMul(values[n.Srcs[0]], n.Srcs[1], T(1), run, alone: n.Ip != null && n.Ip.Length > 1 && n.Ip[1] != 0);
                     return new Value { Tensor = y, Relaid = !y.IsContiguous() };
                 }
                 case GraphOp.MulMatId: return V(MatMulId(values[n.Srcs[0]], T(1), values[n.Srcs[2]], run));
-                case GraphOp.Reshape: return V(Contig(T(0), run).View(Sizes(n.Ip)));
+                case GraphOp.MoeHostExperts: return V(HostExperts(T(0), values[n.Srcs[1]], values[n.Srcs[2]], values[n.Srcs[3]],
+                    values[n.Srcs[4]], values[n.Srcs[5]], (int)Ip(0, 0), run));
+                case GraphOp.Reshape:
+                {
+                    // A relaid row block (a packed product's column block, rows a pitch apart) reshaped within its rows stays
+                    // a view of them, relaid too (Qwen3.8-27B's gated delta net copied its gate rows out of the in-projection's
+                    // product here, 50 MB a layer for a 2K-row chunk, for a region that reads them where they are).
+                    long[] sizes = Sizes(n.Ip);
+                    if (values[n.Srcs[0]].Relaid && RowsReshaped(T(0), sizes) is { } rows)
+                        return new Value { Tensor = run.Keep(rows), Relaid = true };
+                    return V(Contig(T(0), run).View(sizes));
+                }
                 case GraphOp.View:
                 {
                     Value src = values[n.Srcs[0]];
                     if (src.Weight != null) return WeightRows(src, n.Ip);
-                    return V(View(src.Relaid ? Contig(src.Tensor, run) : src.Tensor, n.Ip));
+                    // A large F32 input stays on the host until its first reader uploads it (HostFloats), and a view is one: a
+                    // prompt-sized projection fed as an input and viewed head by head read a null tensor here. The upload is not a
+                    // read of the source's pending writes: the view's own readers finish them.
+                    Tensor whole = Device(values, n.Srcs[0], run, read: false);
+                    return V(View(src.Relaid ? Contig(whole, run) : whole, n.Ip));
                 }
                 case GraphOp.Permute:
                     return new Value { Tensor = run.Keep(Permute(As4(T(0), run), (int)Ip(0, 0), (int)Ip(1, 1), (int)Ip(2, 2), (int)Ip(3, 3))),
@@ -1318,7 +1649,10 @@ namespace TensorSharp.Graph
                     return new Value { Tensor = dst };
                 }
                 case GraphOp.SetRows: return new Value { Tensor = SetRows(T(0), T(1), values[n.Srcs[2]], run) };
-                case GraphOp.GetRows: return V(GetRows(T(0), values[n.Srcs[1]], run));
+                case GraphOp.GetRows:
+                    return values[n.Srcs[0]].Weight is { } table
+                        ? V(QuantizedRows(table, values[n.Srcs[0]].FirstRow, values[n.Srcs[1]], run))
+                        : V(GetRows(T(0), values[n.Srcs[1]], run));
                 case GraphOp.Concat: return V(Concat(T(0), T(1), (int)Ip(0, 0), run));
                 case GraphOp.KvWindow:
                     return new Value { Tensor = run.Keep(KvWindow(T(0), n.Ip)), Window = new CacheWindow(T(0), n.Ip[3] % n.Ip[1]) };
@@ -1345,11 +1679,9 @@ namespace TensorSharp.Graph
                 {
                     int at = 2;
                     Tensor score = Ip(0, 0) != 0 ? T(at++) : null;
-                    int[] blocks = Ip(1, 0) != 0 ? Ints(values[n.Srcs[at++]]) : null;
-                    long[] blockNe = blocks != null ? Ne(values[n.Srcs[at - 1]].Tensor) : null;
-                    int[] extra = Ip(2, 0) != 0 ? Ints(values[n.Srcs[at++]]) : null;
-                    long[] extraNe = extra != null ? Ne(values[n.Srcs[at - 1]].Tensor) : null;
-                    return V(TopKMask(T(0), Ints(values[n.Srcs[1]]), Ne(values[n.Srcs[1]].Tensor), score, blocks, blockNe, extra, extraNe, run));
+                    Value blocks = Ip(1, 0) != 0 ? values[n.Srcs[at++]] : default;
+                    Value extra = Ip(2, 0) != 0 ? values[n.Srcs[at++]] : default;
+                    return V(TopKMask(T(0), values[n.Srcs[1]], score, blocks, extra, run));
                 }
                 case GraphOp.FlashAttnExt:
                 {
@@ -1368,6 +1700,7 @@ namespace TensorSharp.Graph
                         int maskNode = n.Srcs[3];
                         if (!run.Masks.TryGetValue((maskNode, nq), out mask))
                             run.Masks[(maskNode, nq)] = mask = Classify(() => Mask(Device(values, maskNode, run), nq, run), m.Floats, nq, keys);
+                        if (Ip(1, 0) > 0) mask.KvMax = (int)Ip(1, 0);
                     }
                     return V(FlashAttention(q, k, v, mask, Fp(0, 1f), values[n.Srcs[1]].Window, values[n.Srcs[2]].Window));
                 }
@@ -1380,7 +1713,7 @@ namespace TensorSharp.Graph
                     if (n.Srcs.Length > 1)
                     {
                         Tensor m = Mask(T(1), Ne(x)[1], run);
-                        Tensor sum = Binary(s, m, run, (r, a, b) => Ops.Add(r, a, b));
+                        Tensor sum = Binary(s, m, run, (r, a, b) => Ops.Add(r, a, b), GraphOp.Add);
                         s.Dispose();
                         s = sum;
                     }
@@ -1388,11 +1721,7 @@ namespace TensorSharp.Graph
                     return V(s);
                 }
                 case GraphOp.TopK: return TopK(Contig(T(0), run), (int)Ip(0, 1), run);
-                case GraphOp.SumRows:
-                {
-                    Tensor x = Contig(T(0), run);
-                    return V(Ops.Sum(null, x, x.DimensionCount - 1));
-                }
+                case GraphOp.SumRows: return V(SumRows(Contig(T(0), run)));
                 case GraphOp.SsmConv:
                 {
                     Tensor x = Contig(T(0), run), kernel = Contig(T(1), run);
@@ -1403,7 +1732,13 @@ namespace TensorSharp.Graph
                 {
                     Tensor q = Contig(T(0), run), k = Contig(T(1), run), v = Contig(T(2), run);
                     Tensor g = Contig(T(3), run), b = Contig(T(4), run), s = Contig(T(5), run);
-                    return V(GatedDeltaNet(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run), (int)Ip(0, 1)));
+                    // ip: [snapshots, rows the saved inputs hold (with destination leaf 6: a verify window's outputs alone), the
+                    // decode row kernels]
+                    if (n.Srcs.Length >= 7)
+                        return V(GatedDeltaNetWindow(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run),
+                            T(6), (int)Ip(1, 0)));
+                    return V(GatedDeltaNet(As4(q, run), As4(k, run), As4(v, run), As4(g, run), As4(b, run), As4(s, run), (int)Ip(0, 1),
+                        Ip(2, 0) != 0));
                 }
                 default:
                     throw new NotSupportedException($"{GetType().Name} has no kernel for {n.Op}");
@@ -1411,7 +1746,7 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>ggml's binary ops: b repeats over a (b's extents are ones or a's).</summary>
-        private Tensor Binary(Tensor a, Tensor b, RunState run, Action<Tensor, Tensor, Tensor> op)
+        private Tensor Binary(Tensor a, Tensor b, RunState run, Action<Tensor, Tensor, Tensor> op, GraphOp kind)
         {
             long[] na = Ne(a), nb = Ne(b);
             Tensor ac = In(a, run);
@@ -1427,10 +1762,65 @@ namespace TensorSharp.Graph
             for (int i = 0; i < 4; i++)
                 if (nb[i] != 1 && nb[i] != na[i])
                     throw new NotSupportedException($"binary op repeating [{string.Join(",", nb)}] over [{string.Join(",", na)}]");
+            if (TryBinaryBroadcast(kind, r4, a4, b4, na, nb))
+                return result;
             Tensor be = BroadcastsInKernels ? run.Keep(b4.Expand(Sizes4(na))) : Gathered(b4, Sizes4(na), run);
             op(r4, a4, be);
             return result;
         }
+
+        /// <summary>A binary op (<paramref name="kind"/>: Add, Sub, Mul or Div) whose b repeats over a, in one kernel reading
+        /// b in place; false (the repeated b is materialized first) where the backend has none for these operands.</summary>
+        protected virtual bool TryBinaryBroadcast(GraphOp kind, Tensor result, Tensor a, Tensor b, long[] na, long[] nb) => false;
+
+        /// <summary>ggml_sum_rows over a contiguous tensor: the sums of its innermost rows (executors with a kernel
+        /// override it).</summary>
+        protected virtual Tensor SumRows(Tensor x) => Ops.Sum(null, x, x.DimensionCount - 1);
+
+        /// <summary><paramref name="result"/> [n, m] = <paramref name="rows"/> [n, k] times the F32 <paramref name="weight"/>
+        /// [m, k] transposed (contiguous operands): an unquantized weight's product. A backend with a faster kernel for some
+        /// shapes overrides it.</summary>
+        protected virtual void DenseProduct(Tensor result, Tensor rows, Tensor weight)
+        {
+            using Tensor wt = weight.Transpose();
+            Ops.Addmm(result, 0, result, 1f, rows, wt);
+        }
+
+        /// <summary>Whether the executor queued a write to a node's tensor that it finishes later (<see cref="BeforeRead"/>):
+        /// then every op's sources pass through <see cref="BeforeRead"/> first.</summary>
+        protected bool PendingWrites { get; set; }
+
+        /// <summary>An op is about to read <paramref name="t"/> (called while <see cref="PendingWrites"/> is set): an executor
+        /// that left a write to it for later (a doorbell's host sum, joined after the work that does not need it) finishes
+        /// it now.</summary>
+        protected virtual void BeforeRead(Tensor t) { }
+
+        /// <summary>The run's outputs are about to be read: every write left for later is finished (or, while
+        /// <see cref="PendingWrites"/> stays set, finished as <see cref="BeforeRead"/> meets it).</summary>
+        protected virtual void FinishWrites() { }
+
+        /// <summary>A run (one step's program) begins: an executor drops what it cached for the previous one.</summary>
+        protected virtual void BeginRun() { }
+
+        /// <summary>A run ended (its outputs read, or its failure on its way out): an executor drops the writes it left for
+        /// later that nothing read.</summary>
+        protected virtual void EndRun() { }
+
+        /// <summary>The executor's weight products (<see cref="QuantizedMatMul"/>, <see cref="QuantizedMatMulRows"/>) finish
+        /// writes left for later to their rows themselves: a product's contiguous rows reach them without
+        /// <see cref="BeforeRead"/> (a product that quantizes its rows may compute them in the same pass).</summary>
+        protected virtual bool ProductsFinishDeferredRows => false;
+
+        /// <summary>A region of <paramref name="kind"/> whose kernel (<see cref="TryFused"/>) finishes writes left for later to
+        /// its inputs itself: its contiguous inputs reach it without <see cref="BeforeRead"/> (its ops, if it declines, read
+        /// them as any op does).</summary>
+        protected virtual bool RegionFinishesDeferredInputs(GraphFusion kind) => false;
+
+
+
+        /// <summary>The gather indices of <see cref="Gathered"/> by shape, on the device once (the first run, never inside a
+        /// recording: a recorded step reads the copy its recording bound).</summary>
+        private readonly Dictionary<string, Tensor> _gatherIndices = new();
 
         /// <summary><paramref name="b4"/> repeated to <paramref name="sizes"/> as a contiguous tensor: the rows
         /// of its longest unrepeated suffix gathered by index (one kernel on any backend).</summary>
@@ -1441,6 +1831,18 @@ namespace TensorSharp.Graph
             while (k > 0 && b4.Sizes[k - 1] == sizes[k - 1]) { width *= sizes[k - 1]; k--; }
             long outer = 1, bOuter = 1;
             for (int i = 0; i < k; i++) { outer *= sizes[i]; bOuter *= b4.Sizes[i]; }
+            Tensor rows = run.Keep(Contig(b4, run).View(bOuter, width));
+            string key = $"{string.Join(",", b4.Sizes.ToArray())}>{string.Join(",", sizes)}";
+            Tensor cached;
+            lock (_gatherIndices)
+                if (!_gatherIndices.TryGetValue(key, out cached))
+                    _gatherIndices[key] = cached = GatherIndex(b4, sizes, k, outer);
+            Tensor gathered = run.Keep(Ops.IndexSelect(null, rows, cached));
+            return run.Keep(gathered.View(sizes));
+        }
+
+        private Tensor GatherIndex(Tensor b4, long[] sizes, int k, long outer)
+        {
             var index = new int[outer];
             var at = new long[Math.Max(1, k)];
             for (long o = 0; o < outer; o++)
@@ -1454,12 +1856,13 @@ namespace TensorSharp.Graph
                     at[i] = 0;
                 }
             }
-            Tensor rows = run.Keep(Contig(b4, run).View(bOuter, width));
-            Tensor gathered = run.Keep(Ops.IndexSelect(null, rows, IntTensor(index, new long[] { outer }, run)));
-            return run.Keep(gathered.View(sizes));
+            return NewIntTensor(index, new long[] { outer });
         }
 
         /// <summary>log(1 + exp(x)) as max(x, 0) + log(1 + exp(-|x|)) (no overflow).</summary>
+        /// <summary>ggml_sqrt, elementwise (executors with a kernel of their own override it).</summary>
+        protected virtual Tensor Sqrt(Tensor x) => Ops.Pow(null, x, 0.5f);
+
         protected virtual Tensor Softplus(Tensor x)
         {
             using Tensor abs = Ops.Abs(null, x);
@@ -1491,7 +1894,7 @@ namespace TensorSharp.Graph
             if (weight.ElementCount() != cols)
             {
                 Tensor plain = run.Keep(RowNorm(x, eps, run));
-                return new Value { Tensor = run.Keep(Binary(plain, weight, run, (r, a, b) => Ops.Mul(r, a, b))) };
+                return new Value { Tensor = run.Keep(Binary(plain, weight, run, (r, a, b) => Ops.Mul(r, a, b), GraphOp.Mul)) };
             }
             using Tensor rows = x.View(x.ElementCount() / cols, cols);
             using Tensor gamma = Contig(weight, run).View(cols);
@@ -1509,13 +1912,25 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>ggml_mul_mat(a, b) = b · aᵀ: [a.ne1, b.ne1, b.ne2, b.ne3], a repeating over b's batches.</summary>
-        private Tensor MatMul(Value a, int bNode, Tensor b, RunState run)
+        private Tensor MatMul(Value a, int bNode, Tensor b, RunState run, bool alone = false)
         {
             long[] nb = Ne(b);
             if (a.Weight != null)
             {
                 IGraphWeight w = a.Weight;
                 if (nb[0] != w.Ne0) throw new NotSupportedException($"product of a {w.Ne0}-wide weight with {nb[0]}-wide rows");
+                // Strided rows are copied first: a read the executor's product does not finish itself (ProductsFinishDeferredRows).
+                if (PendingWrites && !b.IsContiguous()) BeforeRead(b);
+                if (alone && (a.FirstRow != 0 || a.Rows != w.Ne1) && !run.Products.ContainsKey((w, bNode)))
+                {
+                    Tensor rows = Contig(b, run);
+                    using Tensor x2 = rows.View(rows.ElementCount() / w.Ne0, w.Ne0);
+                    if (QuantizedMatMulRows(w, x2, a.FirstRow, a.Rows) is { } own)
+                    {
+                        run.Keep(own);
+                        return run.Keep(own.View(Sizes(stackalloc long[] { a.Rows, nb[1], nb[2], nb[3] })));
+                    }
+                }
                 if (!run.Products.TryGetValue((w, bNode), out Tensor full))
                 {
                     Tensor rows = Contig(b, run);
@@ -1528,7 +1943,7 @@ namespace TensorSharp.Graph
                 {
                     Tensor block = run.Keep(full.Narrow(1, a.FirstRow, a.Rows));
                     // A row block of a packed weight's product: a strided view where kernels read them.
-                    if (KernelsReadStridedViews && nb[2] * nb[3] == 1) return block;
+                    if (ProductRowBlocksAsViews(nb[1]) && nb[2] * nb[3] == 1) return block;
                     y = run.Keep(Ops.NewContiguous(block));
                 }
                 return run.Keep(y.View(Sizes(stackalloc long[] { a.Rows, nb[1], nb[2], nb[3] })));
@@ -1543,9 +1958,8 @@ namespace TensorSharp.Graph
             {
                 using Tensor a2 = ac.View(m, kd);
                 using Tensor b2 = bc.View(n, kd);
-                using Tensor a2t = a2.Transpose();
                 var r2 = run.Keep(new Tensor(Allocator, DType.Float32, n, m));
-                Ops.Addmm(r2, 0, r2, 1f, b2, a2t);
+                DenseProduct(r2, b2, a2);
                 return run.Keep(r2.View(Sizes(stackalloc long[] { m, n, 1, 1 })));
             }
             Tensor a3 = run.Keep(ac.View(na[2] * na[3], m, kd));
@@ -1575,6 +1989,11 @@ namespace TensorSharp.Graph
                 throw new NotSupportedException("a view of a quantized weight that is not a block of whole rows");
             return new Value { Weight = weight, FirstRow = w.FirstRow + offset / rowBytes, Rows = rows };
         }
+
+        /// <summary>Rows [<paramref name="firstRow"/>, + <paramref name="rows"/>) of <paramref name="weight"/> · x, the block
+        /// alone ([x rows, rows] F32), with each value the whole product's bit for bit; null where this executor computes the
+        /// whole product instead (then the block is a slice of it).</summary>
+        protected virtual Tensor QuantizedMatMulRows(IGraphWeight weight, Tensor x, long firstRow, long rows) => null;
 
         /// <summary>ggml_mul_mat_id(as, b, ids): [as.ne1, K, rows], row (j, t) = expert ids[t, j] · b[t, j or 0].</summary>
         private Tensor MatMulId(Value experts, Tensor b, Value ids, RunState run)
@@ -1613,6 +2032,124 @@ namespace TensorSharp.Graph
 
         private static long[] Ids(Value v) => Ne(v.Tensor);
 
+        /// <summary>
+        /// <see cref="GraphOp.MoeHostExperts"/> on any tensor executor: x [rows, hidden], the router's top-K ids and
+        /// weights ([rows, K]). The routes whose expert the layer's tier keeps on this device run here, each selected
+        /// expert once over its rows; the model's <see cref="IGraphExpertHost"/> computes the rest on the host. A step
+        /// the host streams (a prompt chunk) runs every route here, the experts outside the tier read in for it and
+        /// dropped after. Returns the weighted sum [rows, hidden].
+        /// </summary>
+        protected virtual Tensor HostExperts(Tensor x, Value selected, Value weightValue, Value gateValue, Value upValue, Value downValue,
+            int layer, RunState run)
+        {
+            if (gateValue.Weight is not IGraphHostedExperts gate || upValue.Weight is not IGraphExpertWeights up
+                || downValue.Weight is not IGraphExpertWeights down)
+                throw new NotSupportedException("host experts need the model's expert host on their stacks");
+            IGraphExpertHost host = gate.Host;
+            // ggml's order: x [hidden, rows] (a decode step's single row arrives as [hidden]), ids [K, rows].
+            int hidden = (int)Ne(x)[0];
+            int[] ids = Ints(selected);
+            long[] nid = Ids(selected);
+            int k = (int)nid[0], rows = (int)nid[1], routes = k * rows;
+            Tensor xc = run.Keep(Contig(x, run).View(rows, hidden));
+            float[] weights = weightValue.Floats ?? Contig(weightValue.Tensor, run).GetElementsAsFloat(routes);
+            host.Record(layer, ids, GraphExpertAdapt.Weight(rows));
+
+            bool stream = host.StreamsStep(layer, rows);
+            var here = new byte[routes];   // 1: the route runs on this device
+            bool anyDevice = false;
+            for (int i = 0; i < routes; i++)
+            {
+                here[i] = stream || host.IsResident(layer, ids[i]) ? (byte)1 : (byte)0;
+                anyDevice |= here[i] != 0;
+            }
+            // The host's routes, less those the route-tail skip leaves out (an expert every row routes at the rank or lower).
+            var skip = (byte[])here.Clone();
+            int tail = stream ? 0 : host.TailSkipRank(layer);
+            if (tail > 0)
+                for (int i = 0; i < routes; i++)
+                {
+                    if (skip[i] != 0 || ids[i] < 0) continue;
+                    bool high = false;
+                    for (int j = 0; j < routes && !high; j++) high = ids[j] == ids[i] && j % k < tail;
+                    if (!high) skip[i] = 1;
+                }
+            bool anyHost = false;
+            for (int i = 0; i < routes; i++) anyHost |= skip[i] == 0 && ids[i] >= 0;
+
+            // The returned tensor is the caller's to keep (V keeps it); the pieces summed into it are this run's.
+            Tensor device = anyDevice ? DeviceExperts(xc, ids, weights, here, k, gate, up, down, host, layer, stream, run) : null;
+            if (!anyHost)
+            {
+                if (device != null) return device;
+                var zeros = new Tensor(Allocator, DType.Float32, rows, hidden);   // every route left out
+                Ops.Fill(zeros, 0f);
+                return zeros;
+            }
+            float[] xs = xc.GetElementsAsFloat(rows * hidden);
+            var output = new float[(long)rows * hidden];
+            if (!host.Compute(layer, xs, ids, weights, skip, rows, output))
+                throw new NotSupportedException($"layer {layer}: the host's expert kernels do not cover these experts");
+            var fromHost = new Tensor(Allocator, DType.Float32, rows, hidden);
+            fromHost.SetElementsAsFloat(output);
+            if (device == null)
+                return fromHost;
+            return Ops.Add(null, run.Keep(device), run.Keep(fromHost));
+        }
+
+        /// <summary>The device's routes of <see cref="HostExperts"/>: each expert once over the rows routed to it,
+        /// weighted, then every row's routes summed (a host route reads a zero row).</summary>
+        private Tensor DeviceExperts(Tensor x, int[] ids, float[] weights, byte[] onDevice, int k, IGraphExpertWeights gate,
+            IGraphExpertWeights up, IGraphExpertWeights down, IGraphExpertHost host, int layer, bool stream, RunState run)
+        {
+            int rows = (int)x.Sizes[0], hidden = (int)x.Sizes[1], routes = ids.Length;
+            var byExpert = new List<int>[gate.Ne2];
+            for (int i = 0; i < routes; i++)
+                if (onDevice[i] != 0) (byExpert[ids[i]] ??= new List<int>()).Add(i);
+            var pieces = new List<Tensor>();
+            var position = new int[routes];
+            int at = 0;
+            for (int e = 0; e < byExpert.Length; e++)
+            {
+                List<int> list = byExpert[e];
+                if (list == null) continue;
+                var sourceRows = new int[list.Count];
+                var routeWeights = new float[list.Count];
+                for (int j = 0; j < list.Count; j++)
+                {
+                    sourceRows[j] = list[j] / k;
+                    routeWeights[j] = weights[list[j]];
+                    position[list[j]] = at + j;
+                }
+                at += list.Count;
+                Tensor xs = run.Keep(Ops.IndexSelect(null, x, IntTensor(sourceRows, new long[] { sourceRows.Length }, run)));
+                Tensor g = run.Keep(ExpertMatMul(gate, e, xs));
+                Tensor u = run.Keep(ExpertMatMul(up, e, xs));
+                Tensor act = run.Keep(Ops.SiLUMul(null, g, u));
+                Tensor d = run.Keep(ExpertMatMul(down, e, act));
+                var w = run.Keep(new Tensor(Allocator, DType.Float32, list.Count, 1));
+                w.SetElementsAsFloat(routeWeights);
+                pieces.Add(run.Keep(Binary(d, w, run, (r, a, b) => Ops.Mul(r, a, b), GraphOp.Mul)));
+                if (stream && !host.IsResident(layer, e))
+                {
+                    ReleaseStreamedExpert(gate.Expert(e));
+                    ReleaseStreamedExpert(up.Expert(e));
+                    ReleaseStreamedExpert(down.Expert(e));
+                }
+            }
+            // A host route reads the zero row past the device's pieces.
+            Tensor zero = run.Keep(new Tensor(Allocator, DType.Float32, 1, hidden));
+            Ops.Fill(zero, 0f);
+            pieces.Add(zero);
+            for (int i = 0; i < routes; i++)
+                if (onDevice[i] == 0) position[i] = at;
+            Tensor all = pieces.Count == 1 ? pieces[0] : run.Keep(Ops.Concat(null, 0, pieces.ToArray()));
+            Tensor byRoute = run.Keep(Ops.IndexSelect(null, all, IntTensor(position, new long[] { routes }, run)));   // [rows * K, hidden]
+            using Tensor perRow = byRoute.View(rows, k, hidden);
+            Tensor summed = run.Keep(Ops.Sum(null, perRow, 1));                                                   // [rows, 1, hidden]
+            return summed.View(rows, hidden);
+        }
+
         /// <summary>ggml_view_Nd: ip = nd, ne0..ne3, nb1..nb3, offset (bytes).</summary>
         private static Tensor View(Tensor src, long[] ip)
         {
@@ -1633,6 +2170,26 @@ namespace TensorSharp.Graph
                 strides[i] = nb[3 - i] / elem;
             }
             return Checked(new Tensor(sizes, strides, src.Storage, src.StorageOffset + ip[8] / elem), "view");
+        }
+
+        /// <summary>
+        /// <paramref name="t"/> [rows, width] (rows a pitch apart, each contiguous) as <paramref name="sizes"/> [rows, ...]
+        /// whose inner extents split a row: a view of the same bytes. Null for any other shape.
+        /// </summary>
+        private static Tensor RowsReshaped(Tensor t, long[] sizes)
+        {
+            if (t.DimensionCount != 2 || t.Strides[1] != 1 || sizes.Length < 2 || sizes[0] != t.Sizes[0] || t.Sizes[0] < 2)
+                return null;
+            var strides = new long[sizes.Length];
+            long inner = 1;
+            for (int i = sizes.Length - 1; i >= 1; i--)
+            {
+                strides[i] = inner;
+                inner *= sizes[i];
+            }
+            if (inner != t.Sizes[1]) return null;
+            strides[0] = t.Strides[0];
+            return Checked(new Tensor(sizes, strides, t.Storage, t.StorageOffset), "reshape");
         }
 
         /// <summary>A view must stay inside its storage: kernels write through views (cache rows, state
@@ -1681,6 +2238,8 @@ namespace TensorSharp.Graph
         /// higher index.</summary>
         private Tensor SetRows(Tensor dst, Tensor src, Value ids, RunState run)
         {
+            // Rows only on the device (a recorded step's varying input): written there.
+            if (ids.Ints == null && ids.Tensor != null && TrySetRowsOnDevice(dst, src, ids.Tensor)) return dst;
             int[] rows = Ints(ids);
             Tensor d4 = As4(dst, run);
             Tensor s4 = As4(F32(src, run.Owned), run);
@@ -1692,23 +2251,27 @@ namespace TensorSharp.Graph
             bool run1 = true;
             for (int i = 1; i < count; i++) run1 &= rows[i] == rows[0] + i;
             if (run1 && TryWriteRows(dst, s4, rows[0], count)) return dst;
-            if (run1)
+            // Each run of consecutive rows in one copy: a ring's write that wraps (a block drafter's prompt inject, 1,569 rows
+            // into a 2,080-row ring) is two, where a copy a row took 6 ms a layer on CUDA.
+            for (int i = 0; i < count;)
             {
-                using Tensor target = d4.Narrow(2, rows[0], count);
-                CopyInto(target, s4);
-                return dst;
-            }
-            for (int i = 0; i < count; i++)
-            {
-                using Tensor target = d4.Narrow(2, rows[i], 1);
-                using Tensor row = s4.Narrow(2, i, 1);
-                CopyInto(target, row);
+                int n = 1;
+                while (i + n < count && rows[i + n] == rows[i] + n) n++;
+                using Tensor target = d4.Narrow(2, rows[i], n);
+                using Tensor part = s4.Narrow(2, i, n);
+                CopyInto(target, part);
+                i += n;
             }
             return dst;
         }
 
-        /// <summary>ggml_get_rows(a, ids): a [ne0, ne1, ne2, ne3], ids [n, ne2, ne3]: [ne0, n, ne2, ne3].</summary>
-        private Tensor GetRows(Tensor src, Value ids, RunState run)
+        /// <summary>ggml_set_rows with the row ids on the device ([n] I32 or I64, every higher index of dst one block): false
+        /// where this executor has no kernel for it (the ids are then read on the host).</summary>
+        protected virtual bool TrySetRowsOnDevice(Tensor dst, Tensor src, Tensor ids) => false;
+
+        /// <summary>ggml_get_rows(a, ids): a [ne0, ne1, ne2, ne3], ids [n, ne2, ne3]: [ne0, n, ne2, ne3]; the ids are read
+        /// on the host (executors with a gather kernel override it).</summary>
+        protected virtual Tensor GetRows(Tensor src, Value ids, RunState run)
         {
             long[] na = Ne(src), ni = Ne(ids.Tensor);
             int[] index = Ints(ids);
@@ -1728,11 +2291,11 @@ namespace TensorSharp.Graph
             return r.View(Sizes(stackalloc long[] { na[0], n, ni[1], ni[2] }));
         }
 
+        /// <summary>Each source copied into its slice of the result as it is: a strided view (a fused projection's column block)
+        /// takes no contiguous copy of its own first (28 concats of a Qwen3.8 Flash Next verify window took 94 kernels).</summary>
         private Tensor Concat(Tensor a, Tensor b, int ggmlDim, RunState run)
         {
-            Tensor a4 = run.Keep(Contig(a, run).View(Sizes4(Ne(a))));
-            Tensor b4 = run.Keep(Contig(b, run).View(Sizes4(Ne(b))));
-            using Tensor r = Ops.Concat(null, 3 - ggmlDim, a4, b4);
+            using Tensor r = Ops.Concat(null, 3 - ggmlDim, As4(a, run), As4(b, run));
             return r.View(Sizes(Ne(r)));
         }
 
@@ -1767,7 +2330,7 @@ namespace TensorSharp.Graph
 
         /// <summary>ggml_lightning_indexer on the host: q [d, heads, rows], keys [d, 1, n], weights [heads, rows],
         /// mask [n, rows]; [n, rows] = sum over heads of weight * relu(q . key) + mask.</summary>
-        private Tensor LightningIndexer(Tensor q, Tensor keys, Tensor weights, Tensor mask, RunState run)
+        protected virtual Tensor LightningIndexer(Tensor q, Tensor keys, Tensor weights, Tensor mask, RunState run)
         {
             long[] nq = Ne(q), nk = Ne(keys);
             int d = (int)nq[0], heads = (int)nq[1], rows = (int)nq[2], n = (int)nk[2];
@@ -1791,7 +2354,13 @@ namespace TensorSharp.Graph
             return t;
         }
 
-        /// <summary>ggml_top_k_mask on the host (see <see cref="GraphOp.TopKMask"/>): an F32 [n_kv, rows] mask.</summary>
+        /// <summary>ggml_top_k_mask (see <see cref="GraphOp.TopKMask"/>): an F32 [n_kv, rows] mask; the picks, blocks and
+        /// cells read on the host (executors with a kernel override it).</summary>
+        protected virtual Tensor TopKMask(Tensor mask, Value picks, Tensor score, Value blocks, Value extra, RunState run)
+            => TopKMask(mask, Ints(picks), Ne(picks.Tensor), score, blocks.Tensor == null && blocks.Ints == null ? null : Ints(blocks),
+                blocks.Tensor == null && blocks.Ints == null ? null : Ne(blocks.Tensor),
+                extra.Tensor == null && extra.Ints == null ? null : Ints(extra), extra.Tensor == null && extra.Ints == null ? null : Ne(extra.Tensor), run);
+
         private Tensor TopKMask(Tensor mask, int[] picks, long[] pickNe, Tensor score, int[] blocks, long[] blockNe,
             int[] extra, long[] extraNe, RunState run)
         {
@@ -1833,7 +2402,8 @@ namespace TensorSharp.Graph
             return x.GetElementsAsFloat((int)x.ElementCount());
         }
 
-        private Value TopK(Tensor x, int k, RunState run)
+        /// <summary>ggml_top_k on the host (executors with a kernel override it; their result need not carry host ints).</summary>
+        protected virtual Value TopK(Tensor x, int k, RunState run)
         {
             long cols = x.Sizes[^1], rows = x.ElementCount() / cols;
             float[] v = x.GetElementsAsFloat((int)x.ElementCount());
@@ -1858,7 +2428,9 @@ namespace TensorSharp.Graph
             int d = (int)ne[0], heads = (int)ne[1], tokens = (int)ne[2];
             int dims = (int)n.Ip[0], mode = (int)n.Ip[1], ctx = (int)n.Ip[2];
             float freqBase = n.Fp[0], freqScale = n.Fp[1], extFactor = n.Fp[2], attnFactor = n.Fp[3];
-            int[] pos = Ints(positions);
+            // Read on the host only where the host needs them (multi-axis rows, or no device positions): a recorded step's
+            // varying positions are never read back.
+            int[] pos = multi || !BroadcastsPositionsOnDevice || positions.Tensor == null ? Ints(positions) : null;
             // Multi-axis rotary whose axes all carry the same position (every text token) is NeoX rotary at
             // that position: the device kernel, not the host loop below (which reads and writes the rows).
             if (multi && extFactor == 0f && pos.Length >= 3 * tokens && SameAxes(pos, tokens, n.Ip.Length > 6 && n.Ip[6] > 0 ? 4 : 3))
@@ -1885,6 +2457,7 @@ namespace TensorSharp.Graph
                     }
                     else
                     {
+                        pos ??= Ints(positions);
                         var perRow = new int[tokens * heads];
                         for (int t = 0; t < tokens; t++)
                             for (int h = 0; h < heads; h++) perRow[t * heads + h] = pos[t];
@@ -1896,6 +2469,12 @@ namespace TensorSharp.Graph
                 {
                     using Tensor rotated = Ops.RoPEEx(null, As4(x, run), p, dims, mode, ctx, freqBase, freqScale, extFactor, attnFactor, n.Fp[4], n.Fp[5]);
                     return rotated.View(Sizes(ne));
+                }
+                // Rotated where it lies into new rows (a fused projection's q or k block, or contiguous rows), where the backend
+                // can: one launch where the copy and the rotary in place took two.
+                if (RopeStrided(x, p, tokens, heads, d, dims, mode, ctx, n.Fp) is { } strided)
+                {
+                    using (strided) return strided.View(Sizes(ne));
                 }
                 Tensor copy = Ops.NewContiguous(x);
                 using Tensor r4 = copy.View(1, tokens, heads, d);

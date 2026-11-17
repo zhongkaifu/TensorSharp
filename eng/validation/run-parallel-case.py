@@ -413,7 +413,7 @@ def main():
                                                "TS_CPU_MOE_THREADS", "TS_HOST_MOE_PIN", "TS_N_CPU_MOE", "TS_CPU_MOE",
                                                "TS_SPEC", "TS_SPEC_TYPE", "TS_SPEC_DRAFT", "TS_SPEC_PMIN", "TS_SPEC_DRAFT_MODEL",
                                                "TS_GLM_UBATCH", "TS_GLM_THREADS", "TS_GLM_VRAM_RESERVE_MB",
-                                               "TS_GLM_LOAD_THREADS", "TS_GLM_LOAD_CHUNK_MB", "TS_Q4E_LAYER_SPLIT") if k in env}
+                                               "TS_GLM_LOAD_THREADS", "TS_GLM_LOAD_CHUNK_MB") if k in env}
     for key in ("TS_GGUF_PREFAULT", "TS_GGUF_PREFAULT_THREADS", "TS_GGUF_PREFAULT_RESIDENT",
                 "KV_CACHE_DTYPE", "TS_DSV41_COMPACT_RAW_GATHER", "TS_DSV41_SPARSE_FA",
                 "TS_DSV41_YOCO_KEEP", "TS_DSV4_FUSED", "TS_DSV4_FA", "TS_DSV4_GATHER",

@@ -310,19 +310,19 @@ Pi 回传每轮推理时保留了流式输出中的原样内容，包括 `</thin
 
 ## 其他硬件
 
-本示例只在 Apple Silicon 上用上述预设验证过。在 NVIDIA GPU 上，Qwen3.8-27B 最快的预设是
-[`config/qwen3.8-27b-ninfer.json`](../../config/qwen3.8-27b-ninfer.json)：直接 CUDA 引擎运行 NVFP4 NInfer 文件，
-带它自己的 DFlash2 权重。用 `TENSORSHARP_PRESET` 选择它：
+本示例只在 Apple Silicon 上用上述预设验证过。在 NVIDIA GPU 上，可以从
+[`config/qwen3.8-27b-cuda-dflash2.json`](../../config/qwen3.8-27b-cuda-dflash2.json) 开始：同一 UD-IQ3_XXS 检查点与
+DFlash2 草稿模型，运行在 `ggml_cuda` 上。用 `TENSORSHARP_PRESET` 选择它：
 
 ```bash
-TENSORSHARP_PRESET=config/qwen3.8-27b-ninfer.json examples/pi-coding-agent/scripts/start-server.sh
+TENSORSHARP_PRESET=config/qwen3.8-27b-cuda-dflash2.json examples/pi-coding-agent/scripts/start-server.sh
 ```
 
-该预设在自己的 `environment` 中把 `MAX_CONTEXT` 设为 40960。配置文件之间后者优先，所以叠加层的 65536 会覆盖它；
-shell 中导出的 `MAX_CONTEXT` 又优先于两者。例如 `MAX_CONTEXT=40960 TENSORSHARP_PRESET=... scripts/start-server.sh`
+该预设在自己的 `environment` 中把 `MAX_CONTEXT` 设为 32768。配置文件之间后者优先，所以叠加层的 65536 会覆盖它；
+shell 中导出的 `MAX_CONTEXT` 又优先于两者。例如 `MAX_CONTEXT=32768 TENSORSHARP_PRESET=... scripts/start-server.sh`
 保留预设的长度。请把 `models.json` 的 `contextWindow` 设为服务端实际使用的长度。
 
-这一组合尚未与 Pi 一起运行过，包括叠加层的 q8_0 KV 缓存在直接 CUDA 引擎上的效果。
+这一组合尚未与 Pi 一起运行过，包括叠加层的 q8_0 KV 缓存在 `ggml_cuda` 上的效果。
 
 ## 故障排查
 

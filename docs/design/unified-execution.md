@@ -2,6 +2,9 @@
 
 **Status:** Phase 1 implemented on branch `refactor/unified-execution` (see [§9](#9-phase-1-status-and-validation)). Phases 2–4 are planned.
 **Date:** 2026-11-10
+**Note (2026-11-15):** the Qwen implementations this document measures the runtime against —
+`Qwen35Model`, `Qwen4ExpModel` and the direct-CUDA engines `Qwen35CudaModel` / `Qwen4ExpCudaModel` — have
+since been removed; the runtime is the only Qwen 3.5 / 3.8 path. Their figures below are a record.
 **Scope:** how every model family gets continuous batching, tensor parallelism (TP), whole-layer
 placement (layer split / pipeline parallelism, PP), hybrid TP×PP and MoE expert offload, on every
 backend, without each family re-implementing them.
@@ -38,7 +41,7 @@ Today each family implements each mechanism by hand, so support is a patchwork:
 * **Expert offload is a process-wide static (`MoeCpuOffloadConfig`) that each family's FFN must
   remember to consult.** Some families do on some paths only; others warn
   (`WarnUnsupportedBackend`); native executors each re-implement placement with their own knobs
-  (`TS_MUSE_SPARK_CPU_MOE`, `TS_MINIMAX_M3_CPU_MOE`, `TS_Q4E_HOST_EXPERTS`, ...).
+  (`TS_MUSE_SPARK_CPU_MOE`, `TS_MINIMAX_M3_CPU_MOE`, ...).
 * **Nothing forces a new family to support any of this.** `HunyuanDense` (the newest dense family)
   shipped as `MultiGpu = SingleDevice`: no TP, no layer split. The descriptor's multi-GPU fields
   are optional and default to "tensor parallel", so an undeclared family silently claims TP.
@@ -1000,7 +1003,9 @@ from earlier loads ranks them; on unified memory, window slots fill on demand wh
 budgets (`ExpertPlacementPlanner`) are the ones measured for Flash Next.
 
 Direct CUDA (RTX PRO 6000) is not at parity yet: Qwen3.5-0.8B Q8_0 prompt 8,800 / 15,400 tok/s, decode
-209 / 272; 9B prompt 1,800 / 2,300, decode 38.4 / 38.7 (runtime / `Qwen35CudaModel`).
+209 / 272; 9B prompt 1,800 / 2,300, decode 38.4 / 38.7 (runtime / `Qwen35CudaModel`). `Qwen35CudaModel` and the Flash
+Next engine `Qwen4ExpCudaModel` were removed later in 2026-11, so the runtime now serves `--backend cuda` for both families;
+that removal was not re-measured on a GPU.
 
 ---
 

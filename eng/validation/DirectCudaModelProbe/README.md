@@ -21,23 +21,15 @@ does not validate fusion. The report hashes copied PTX files and assemblies.
 
 ## Optimization switches and coverage
 
-Both switches are read once per process; start a new process for each arm.
+The switch is read once per process; start a new process for each arm.
 
 | Switch | Default | Reference / candidate |
 | --- | --- | --- |
 | `TENSORSHARP_CUDA_MOE_FUSION` | Enabled | `0` restores separate activation/quantization launches and separate shared-MoE scratch allocations; `1` enables fusion and scratch reuse. |
-| `TS_Q4E_PREFILL_COMBINE` | Enabled | `0` uses the original ggml Qwen4Exp combine; otherwise the TensorSharp-owned CUDA prefill combine runs where eligible. |
-
-The ggml reduction is enabled only for CUDA token spans with 64–65,535 tokens
-and at least one resident expert layer. The 64-token deployment cutoff follows
-full-engine measurements; it is not a claim of an optimal threshold on every
-device. Smaller prompts and smaller final prefill chunks retain their original
-graph even when the switch is `1`. The standalone helper's numerical tests also
-exercise 9–63-token shapes, without enabling them in model execution.
 
 Direct CUDA fusion covers the quantized expert SwiGLU paths in the shared
 whole-model MoE code, Dsv4, and generic Qwen decode/batched execution. Scratch
-reuse applies only to `CudaMoeScratch`, used by the GLM and Qwen4Exp engines:
+reuse applies only to `CudaMoeScratch`, used by the GLM engine and `CudaGraphExecutor`'s MoE ops:
 gate/up and down activation buffers share capacity because their lifetimes do
 not overlap, and the interleaved/split layouts are mutually exclusive. Dsv4's
 separate scratch and generic Qwen3.5/3.6 scratch are unchanged. The direct CUDA
@@ -87,12 +79,12 @@ expert reduction kernel. Confirm actual placement and kernel engagement in the
 retained process log and any implementation diagnostics.
 
 Use `--synthetic-q4e artifacts/strata-perf/fixture.gguf` instead of `--model` to
-generate a deterministic eight-layer Qwen4Exp engine fixture. This automatically
+generate a deterministic eight-layer Qwen4Exp model fixture. This automatically
 disables quality generation. It supports `--synthetic-q2kxl true`,
 `--synthetic-experts N`, `--synthetic-experts-used K` and
 `--synthetic-indexer-top-k N` (defaults: false, 16, 4 and 16). Both arms must use
 the same settings and the recorded fixture checksum must match. This mode
-exercises full engine loading and execution but makes no trained-model claim.
+exercises full model loading and execution but makes no trained-model claim.
 
 `--quality false` skips semantic generation and explicitly reports it as
 unchecked. `--max-context` defaults to 1024. The probe clears speculative decoding
@@ -153,12 +145,11 @@ Keep reports, binaries, logs and captured logits in ignored `artifacts/` or
 
 Compare equal numbers of fresh reference and candidate processes with the
 same binary and checkpoint. Set `TENSORSHARP_CUDA_MOE_FUSION=0` for the direct
-CUDA reference and `1` for the candidate. For the ggml Qwen4Exp prefill combine,
-use `TS_Q4E_PREFILL_COMBINE=0` and `1`. Alternate process order between pairs;
+CUDA reference and `1` for the candidate; the comparator accepts only direct
+CUDA (`--backend cuda`) reports. Alternate process order between pairs;
 finish compilation and unrelated tests before recording timing comparisons.
-The runner may set both feature switches to the arm's value; only the relevant
-backend's switch changes execution. All other captured environment controls
-must remain equal, as must measured and warmup iteration counts.
+All other captured environment controls must remain equal, as must measured
+and warmup iteration counts.
 
 ```powershell
 python eng/validation/compare-strata-perf.py --before docs/validation/before1.json docs/validation/before2.json --after docs/validation/after1.json docs/validation/after2.json --output docs/validation/comparison.json

@@ -24,10 +24,32 @@ namespace TensorSharp.Models
         internal int BatchedSpecVerifySteps { get; private set; }
 
         /// <summary>The widest window a verify takes per sequence: the rows a step writes by index and replays
-        /// (<see cref="SmallChunkRows"/>); the executor narrows it to the drafter's block.</summary>
+        /// (<see cref="SmallChunkRows"/>), which the executor narrows to the drafter's block; on a stack whose rows
+        /// read their own experts, the sequences' share of <see cref="ExpertVerifyRows"/>, and below two rows each
+        /// (0) the sequences decode plainly together.</summary>
         public int BatchedSpecWindow(int sequences)
-            => sequences < 1 || !SupportsUnifiedBatching || SpeculationRefusal != null || GraphUnsupportedReason() != null
-                ? 0 : SmallChunkRows;
+        {
+            if (sequences < 1 || !SupportsUnifiedBatching || SpeculationRefusal != null || GraphUnsupportedReason() != null)
+                return 0;
+            if (sequences == 1 || !RowsReadTheirOwnExperts) return SmallChunkRows;
+            int perSequence = ExpertVerifyRows / sequences;
+            return perSequence < 2 ? 0 : perSequence;
+        }
+
+        /// <summary>
+        /// Rows a batched verify of several sequences keeps to where each row reads its own experts
+        /// (<see cref="RowsReadTheirOwnExperts"/>), the sequences splitting them into their windows: a verify there costs
+        /// nearly in proportion to its rows (Qwen3.8 Flash Next on an RTX 5090: 4 / 8 / 12 rows in 9.5 / 14.5 / 24.4 ms, each
+        /// draft kept at about 0.62), so three sequences' 4-row windows decoded 211 tok/s in all against 296 for four
+        /// sequences' plain steps. Two sequences verify 4 rows each, three or four 2, more decode plainly together (the
+        /// direct engine's budget). Given every sequence its whole window, four Qwen3.8 Flash Next MTP conversations on an
+        /// A40 decoded 23.6 tok/s each against the engine's 37.0.
+        /// </summary>
+        private const int ExpertVerifyRows = 8;
+
+        /// <summary>Routed experts at least 16 times those a row takes (Qwen3.8 Flash Next: 512 and 10): the widest window's
+        /// rows read mostly different experts, where a small pool (8 and 2) is read whole by a few rows.</summary>
+        private bool RowsReadTheirOwnExperts => _anyMoe && _numExperts >= 16 * _expertsUsed;
 
         /// <summary>Verify graphs replay per width, so a window is never padded past the longest draft.</summary>
         public bool BatchedSpecExactWindow => true;
@@ -68,29 +90,20 @@ namespace TensorSharp.Models
                 BindSequenceCache(requestId);
         }
 
-        public void ReleaseDraftState(string requestId) => ReleaseDFlashRing(requestId);
+        public void ReleaseDraftState(string requestId)
+        {
+            ReleaseDFlashRing(requestId);
+            if (requestId != null) _followPromptRequests?.Remove(requestId);
+        }
 
         public bool SupportsBatchedSpecLogits => true;
 
         public bool TryBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int window,
             int[] tokens, int[] drawn, float[] features)
         {
-            int vocab = Config.VocabSize;
-            long needed = (long)requestIds.Count * window * vocab;
-            if (_verifyLogits == null || _verifyLogits.LongLength < needed) _verifyLogits = new float[needed];
-            if (!TryVerifySlots(requestIds, positions, window, tokens, _verifyLogits, features)) return false;
-            for (int row = 0; row < requestIds.Count * window; row++)
-            {
-                var span = new ReadOnlySpan<float>(_verifyLogits, row * vocab, vocab);
-                int best = 0;
-                for (int v = 1; v < vocab; v++)
-                    if (span[v] > span[best]) best = v;
-                drawn[row] = best;
-            }
-            return true;
+            // Each row's greedy token, taken on the device (an id a row read back).
+            return TryVerifySlots(requestIds, positions, window, tokens, null, features, drawn);
         }
-
-        private float[] _verifyLogits;
 
         public bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
             int[] tokens, float[] logits, float[] features)
@@ -103,13 +116,18 @@ namespace TensorSharp.Models
         /// Qwen3.8-27B DFlash2 streams on a 24 GB GPU, where Qwen35Model serves them).
         /// </summary>
         private bool TryVerifySlots(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
-            float[] logitsOut, float[] featuresOut)
+            float[] logitsOut, float[] featuresOut, int[] idsOut = null)
         {
-            try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut); }
+            try
+            {
+                if (!TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, idsOut)) return false;
+                ReplenishSpareSlot();
+                return true;
+            }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {
                 FreeGraphMemory();
-                try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut); }
+                try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, idsOut); }
                 catch (InvalidOperationException again) when (IsGraphAllocationFailure(again)) { return false; }
             }
         }
@@ -117,10 +135,11 @@ namespace TensorSharp.Models
         /// <summary>Verifies that fail as a graph's compute allocation would, before running (tests).</summary>
         internal int InjectedVerifyAllocationFailures { get; set; }
 
-        /// <summary>One forward of every sequence's window on its own slot: all rows' logits, the drafter's feature
-        /// rows, and on a hybrid stack the recurrent state after each row (settled by the commit).</summary>
+        /// <summary>One forward of every sequence's window on its own slot: all rows' logits (or with
+        /// <paramref name="idsOut"/> each row's greedy token), the drafter's feature rows, and on a hybrid stack the recurrent
+        /// state after each row (settled by the commit).</summary>
         private bool TryVerifySlotsOnce(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
-            float[] logitsOut, float[] featuresOut)
+            float[] logitsOut, float[] featuresOut, int[] idsOut = null)
         {
             int n = requestIds.Count;
             if (n == 0 || window < 1 || window > SmallChunkRows || tokens.Length < n * window || positions.Length != n
@@ -149,17 +168,24 @@ namespace TensorSharp.Models
             }
 
             bool dflash = HasDFlash;
+            int rows = n * window;
+            var flat = new int[rows];
+            Array.Copy(tokens, flat, rows);
+            // A lone request's one-row step that captures its carry (no drafts yet) hands the draft layer its row when the
+            // layer followed the rows before it (its prompt).
+            DraftFollow follow = n == 1 && window == 1 && !dflash && featuresOut != null ? PlanDraftFollow(slots[0], positions[0], null) : DraftFollow.None;
+            if (follow == DraftFollow.FromStart) follow = DraftFollow.None;
             var request = new GraphRequest
             {
                 LastRowLogits = false,
                 AllRowLogits = true,
+                GreedyIds = idsOut != null && GraphExecutor.Capabilities.GreedyIdOutputs,
                 CaptureLayers = dflash && featuresOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
                 CaptureFinal = !dflash && featuresOut != null,
                 RecurrentSnapshots = _anyRecurrent && window > 1,
+                FollowDraft = follow,
+                DraftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], flat, media: false) : null,
             };
-            int rows = n * window;
-            var flat = new int[rows];
-            Array.Copy(tokens, flat, rows);
             Tensor hidden = EmbedStep(flat);
             GraphResult result;
             _forwardSw.Start();
@@ -178,7 +204,23 @@ namespace TensorSharp.Models
                 slots[s].Length = positions[s] + window;
                 slots[s].VerifyRows = request.RecurrentSnapshots ? window : 0;
             }
-            Array.Copy(result.Logits, 0, logitsOut, 0, Math.Min((long)rows * Config.VocabSize, logitsOut.LongLength));
+            if (follow != DraftFollow.None) NoteDraftFollowed(slots[0], positions[0], window);
+            if (idsOut != null)
+            {
+                int vocab = Config.VocabSize;
+                bool ids = result.Logits.LongLength == rows;   // a path that returns logits (a tensor-parallel head) is scanned here
+                for (int row = 0; row < rows; row++)
+                {
+                    if (ids) { idsOut[row] = (int)result.Logits[row]; continue; }   // the ids as F32 values (exact below 2^24)
+                    var span = new ReadOnlySpan<float>(result.Logits, row * vocab, vocab);
+                    int best = 0;
+                    for (int v = 1; v < vocab; v++)
+                        if (span[v] > span[best]) best = v;
+                    idsOut[row] = best;
+                }
+            }
+            else
+                Array.Copy(result.Logits, 0, logitsOut, 0, Math.Min((long)rows * Config.VocabSize, logitsOut.LongLength));
             WriteSpecFeatures(featuresOut, rows, result.Captures, result.Final);
             BatchedSpecVerifySteps++;
             return true;

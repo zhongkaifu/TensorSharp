@@ -8,12 +8,13 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Opt-in, on the real ISTA Q2_0 Qwen3.8-Flash-Next (TS_TEST_QWEN4EXP_MODEL) on <c>--backend cuda</c>: the prompt's
+/// Opt-in, on the real ISTA Q2_0 Qwen3.8-Flash-Next (TS_TEST_QWEN4EXP_MODEL) on <c>--backend cuda</c> (the shared runtime
+/// on the CUDA graph executor, whose routed experts run on <see cref="CudaMoe"/>): the prompt's
 /// routed experts on the int8 kernels (TS_Q2_0_EXPERTS_INT8) against the F16 tensor-core kernel, on one loaded model.
 /// Each prompt runs F16, int8, then F16 again (the control: what the same route gives twice). Reported: the
 /// last prompt row's logits (relative L2, largest difference, KL, argmax) and the greedy continuation of each arm.
-/// Run it with the history-dependent shortcuts off (TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0
-/// TS_Q4E_HYBRID_MISSES=0), or the control itself differs.
+/// Run it with the history-dependent shortcuts off (TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0), or the control
+/// itself differs.
 /// </summary>
 [Collection("Qwen4Exp MTP integration")]
 public sealed class Qwen4ExpQ2_0Int8PromptTests(ITestOutputHelper output)
@@ -29,7 +30,7 @@ public sealed class Qwen4ExpQ2_0Int8PromptTests(ITestOutputHelper output)
         env.ClearSpeculationVars();
         string doc = File.ReadAllText(Path.Combine(DeepSeek4LoadStageDocumentationTests.RepoRoot(), "docs", "models", "qwen38-flash-next.md"));
         using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
-        Assert.IsType<Qwen4ExpCudaModel>(model);
+        Assert.IsType<Qwen4ExpRuntimeModel>(model);
         int[] Chat(string user) => model.Tokenizer.Encode(
             "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n", addSpecial: false).ToArray();
         int[] Document(int tokens, string question)

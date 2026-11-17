@@ -16,13 +16,10 @@ namespace TensorSharp.Models
             Id = "qwen35",
             DisplayName = "Qwen 3.5 / Qwen 3.6 (Gated DeltaNet + MoE)",
             Aliases = new[] { "qwen35", "qwen35moe", "qwen3next" },
-            // The shared decoder runtime (Qwen35RuntimeModel) serves every placement on every backend: one device,
-            // --tp, whole-layer stages (local or multi-node), their hybrid, and routed experts on the host. --backend
-            // cuda on one GPU with a checkpoint the direct-CUDA engine serves (dense NVFP4; TS_Q35_NATIVE=0 declines it)
-            // runs that engine instead.
-            Factory = c => Qwen35CudaModel.ServesLoad(c)
-                ? new Qwen35CudaModel(c.GgufPath, c.DraftModelPath)
-                : new Qwen35RuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
+            // The shared decoder runtime (Qwen35RuntimeModel) serves every placement on every backend, --backend cuda
+            // included: one device, --tp, whole-layer stages (local or multi-node), their hybrid, and routed experts on
+            // the host.
+            Factory = c => new Qwen35RuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
             ProjectorFileHints = new[]
             {
                 "Qwen3.5-mmproj-F16.gguf",

@@ -38,6 +38,9 @@ namespace TensorSharp.Cuda
             public readonly HashSet<IntPtr> TrackedBlocks = new HashSet<IntPtr>();
             public readonly Dictionary<IntPtr, long> TrackedSizes = new Dictionary<IntPtr, long>();
             public readonly List<(IntPtr ptr, long bytes)> QuarantinedBlocks = new List<(IntPtr, long)>();
+            /// <summary>Blocks returned while a concurrent region held returns back (CudaAllocator.EnterSideStream): the
+            /// region's join can come after the capture ends, when they would go back to the pool unseen.</summary>
+            public readonly List<(IntPtr ptr, long bytes)> DeferredBlocks = new List<(IntPtr, long)>();
             public readonly List<IntPtr> DonatedHostBuffers = new List<IntPtr>();
         }
 
@@ -111,6 +114,16 @@ namespace TensorSharp.Cuda
             }
         }
 
+        /// <summary>A block held back by an open concurrent region while this allocator is capturing: the graph takes it
+        /// at the capture's end unless the region's join released it (through <see cref="InterceptReturn"/>) first.</summary>
+        internal static void OnDeferredReturn(CudaAllocator allocator, IntPtr ptr, long bytes)
+        {
+            CaptureContext ctx = active;
+            if (ctx == null || !ReferenceEquals(ctx.Allocator, allocator) || ptr == IntPtr.Zero)
+                return;
+            lock (Sync) ctx.DeferredBlocks.Add((ptr, bytes));
+        }
+
         internal static void OnHostBufferOrphaned(CudaAllocator allocator, IntPtr hostBuffer, out bool donated)
         {
             donated = false;
@@ -162,8 +175,24 @@ namespace TensorSharp.Cuda
     {
         // Slot layout must match the TS_DYN_* defines in tensorsharp_kernels.cu:
         // [0]=attend_len, [1]=kv write pos, [2]=conv ring write idx, [3]=rope pos.
+        // Then one such block for each row of a verify window run as the decode row at its position (WindowRow): the
+        // window's last row attends attend_len keys, the one before it one fewer, and so on, each written where its
+        // last key is. A batched step's sequences each have their own run of these blocks, sequence s's from block
+        // s * (1 + WindowRowBlocks) (the first sequence's, at the start, is a lone step's).
         private const int SlotCount = 4;
-        private const int ByteCount = SlotCount * sizeof(int);
+        private const int BlocksPerSequence = 1 + WindowRowBlocks;
+        private const int ByteCount = SlotCount * BlocksPerSequence * MaxSequences * sizeof(int);
+
+        /// <summary>The rows of a verify window that can read their own lengths (<see cref="WindowRow"/>).</summary>
+        public const int WindowRowBlocks = 8;
+
+        /// <summary>The sequences a recorded step may batch, each with its own length and write row.</summary>
+        public const int MaxSequences = 16;
+
+        // A batched step's: the storages its sequences' launchers name them by (each sequence's caches), while it is
+        // recorded. Null for a lone sequence's.
+        private Dictionary<Storage, int> sequenceOf;
+        private int sequences = 1;
 
         private readonly CudaAllocator allocator;
         private IntPtr devicePtr;
@@ -179,6 +208,19 @@ namespace TensorSharp.Cuda
         [ThreadStatic]
         private static int captureMaxAttendLen;
 
+        [ThreadStatic]
+        private static int windowRow;   // 0: the step's block; b + 1: the row b keys short of the step's last
+
+        /// <summary>While set, a launcher's dynamic block is the one of a verify window's row that attends
+        /// <paramref name="fewerKeys"/> keys fewer than the step's length (0 to <see cref="WindowRowBlocks"/> - 1); null
+        /// restores the step's own. Kernels that read only the length and the write position take it.</summary>
+        internal static void WindowRow(int? fewerKeys)
+        {
+            if (fewerKeys is int b && (b < 0 || b >= WindowRowBlocks))
+                throw new ArgumentOutOfRangeException(nameof(fewerKeys), b, $"a verify window row is 0 to {WindowRowBlocks - 1} keys short");
+            windowRow = fewerKeys is int f ? f + 1 : 0;
+        }
+
         /// <summary>Largest attention length the graph being captured stays
         /// valid for (0 = unlimited). Set by launchers that bake a
         /// length-dependent launch configuration (shared memory, grid).</summary>
@@ -186,15 +228,47 @@ namespace TensorSharp.Cuda
 
         /// <summary>Returns the ambient dynamic-parameter pointer only when it
         /// belongs to the allocator issuing this launch. Otherwise the caller
-        /// must use its ordinary scalar kernel arguments.</summary>
-        internal static IntPtr GetActiveDevicePtr(CudaAllocator launchAllocator)
+        /// must use its ordinary scalar kernel arguments. A batched step's launcher
+        /// names its sequence (<see cref="GetActiveDevicePtr(CudaAllocator, Storage)"/>):
+        /// one that does not aborts the recording, which then runs unrecorded.</summary>
+        internal static IntPtr GetActiveDevicePtr(CudaAllocator launchAllocator) => GetActiveDevicePtr(launchAllocator, null);
+
+        /// <summary>The ambient dynamic-parameter pointer of the sequence <paramref name="owner"/> (one of its caches' storages)
+        /// belongs to: a lone step's own, a batched step's that sequence's. A batched step's launcher whose storage names no
+        /// sequence aborts the recording (it would replay one sequence's length for another's).</summary>
+        internal static IntPtr GetActiveDevicePtr(CudaAllocator launchAllocator, Storage owner)
         {
             CudaDecodeDynParams active = activeInstance;
-            return active != null &&
-                ReferenceEquals(active.allocator, launchAllocator) &&
-                active.devicePtr != IntPtr.Zero
-                    ? active.devicePtr
-                    : IntPtr.Zero;
+            if (active == null || !ReferenceEquals(active.allocator, launchAllocator) || active.devicePtr == IntPtr.Zero)
+                return IntPtr.Zero;
+            int sequence = 0;
+            if (active.sequences > 1 && (owner == null || !active.sequenceOf.TryGetValue(owner, out sequence)))
+                throw new CudaGraphCaptureAbortedException("A batched decode step's launch read a length without naming its sequence.");
+            return active.devicePtr + (sequence * BlocksPerSequence + windowRow) * SlotCount * sizeof(int);
+        }
+
+        /// <summary>Whether a recorded step is being captured on <paramref name="launchAllocator"/> (its lengths read on the device).</summary>
+        internal static bool IsActive(CudaAllocator launchAllocator)
+        {
+            CudaDecodeDynParams active = activeInstance;
+            return active != null && ReferenceEquals(active.allocator, launchAllocator) && active.devicePtr != IntPtr.Zero;
+        }
+
+        /// <summary>The recorded step's sequences, by the tensors their launchers name them by (each sequence's caches): one
+        /// for a lone step's. Set before <see cref="Activate"/>.</summary>
+        internal void NameSequences(IReadOnlyList<IReadOnlyList<Tensor>> perSequence)
+        {
+            int n = perSequence?.Count ?? 1;
+            if (n < 1 || n > MaxSequences)
+                throw new ArgumentOutOfRangeException(nameof(perSequence), n, $"a recorded step holds 1 to {MaxSequences} sequences");
+            sequences = n;
+            sequenceOf = null;
+            if (n == 1) return;
+            sequenceOf = new Dictionary<Storage, int>(ReferenceEqualityComparer.Instance);
+            for (int s = 0; s < n; s++)
+                foreach (Tensor t in perSequence[s])
+                    if (t?.Storage != null && !sequenceOf.TryAdd(t.Storage, s) && sequenceOf[t.Storage] != s)
+                        throw new ArgumentException("two sequences of a recorded step share a cache", nameof(perSequence));
         }
 
         public CudaDecodeDynParams(IAllocator allocator)
@@ -223,12 +297,32 @@ namespace TensorSharp.Cuda
         /// <summary>Writes this token's values into the pinned host block. Must
         /// run before Replay (and before EndCaptureAndLaunch when capturing).</summary>
         public unsafe void Write(int attendLen, int kvWritePos, int convWriteIdx, int ropePos)
+            => WriteSequence((int*)hostPtr, attendLen, kvWritePos, convWriteIdx, ropePos);
+
+        /// <summary>A batched step's values, sequence s's attention length and cache write row its own blocks'
+        /// (<see cref="Write(int, int, int, int)"/>'s for each).</summary>
+        public unsafe void Write(ReadOnlySpan<int> attendLengths, ReadOnlySpan<int> kvWritePositions)
         {
-            int* p = (int*)hostPtr;
+            if (attendLengths.Length < 1 || attendLengths.Length > MaxSequences || kvWritePositions.Length != attendLengths.Length)
+                throw new ArgumentOutOfRangeException(nameof(attendLengths), attendLengths.Length, $"1 to {MaxSequences} sequences, a write row each");
+            for (int s = 0; s < attendLengths.Length; s++)
+                WriteSequence((int*)hostPtr + s * BlocksPerSequence * SlotCount, attendLengths[s], kvWritePositions[s], 0, 0);
+        }
+
+        private static unsafe void WriteSequence(int* p, int attendLen, int kvWritePos, int convWriteIdx, int ropePos)
+        {
             p[0] = attendLen;
             p[1] = kvWritePos;
             p[2] = convWriteIdx;
             p[3] = ropePos;
+            for (int b = 0; b < WindowRowBlocks; b++)
+            {
+                int* row = p + (b + 1) * SlotCount;
+                row[0] = attendLen - b;
+                row[1] = attendLen - b - 1;
+                row[2] = convWriteIdx;
+                row[3] = ropePos;
+            }
         }
 
         /// <summary>Enqueues the pinned-host -> device upload on the allocator
@@ -253,6 +347,7 @@ namespace TensorSharp.Cuda
         public static void Deactivate()
         {
             activeInstance = null;
+            windowRow = 0;
         }
 
         internal static void LimitCaptureAttendLen(int limit)
@@ -311,9 +406,12 @@ namespace TensorSharp.Cuda
         private sealed class Entry
         {
             public IntPtr Exec;
+            /// <summary>The captured graph the instantiation was made from (kept with <see cref="KeepTemplates"/>).</summary>
+            public IntPtr Template;
             public Tensor InputHidden;
             public List<Tensor> KeepAlive;
             public List<(IntPtr ptr, long bytes)> OwnedBlocks;
+            public List<IntPtr> Claimed;
             public List<IntPtr> OwnedHostBuffers;
             public long LastUse;
             /// <summary>Largest attention length this graph replays correctly
@@ -340,6 +438,32 @@ namespace TensorSharp.Cuda
         }
 
         public bool IsUsable => allocator != null && !disposed;
+
+        /// <summary>Keep each captured graph beside its instantiation: its nodes hold the recorded launch arguments, which a
+        /// relocation (CudaGraphRelocation) reads.</summary>
+        public bool KeepTemplates { get; set; }
+
+        /// <summary>The instantiated graph of <paramref name="key"/> and its template (zero without <see cref="KeepTemplates"/>).</summary>
+        internal bool TryGetGraphs(string key, out IntPtr exec, out IntPtr template)
+        {
+            exec = template = IntPtr.Zero;
+            if (!entries.TryGetValue(key, out Entry entry)) return false;
+            exec = entry.Exec;
+            template = entry.Template;
+            return true;
+        }
+
+        /// <summary>The tensors <paramref name="key"/>'s recording writes in place moved (its graph was relocated to others): it
+        /// keeps those alive and marks them written instead.</summary>
+        internal void ReplaceKeepAlive(string key, IEnumerable<Tensor> keepAlive)
+        {
+            Entry entry = entries[key];
+            // The first is the recording's own input tensor.
+            for (int i = 1; i < entry.KeepAlive.Count; i++) entry.KeepAlive[i].Dispose();
+            entry.KeepAlive.RemoveRange(1, entry.KeepAlive.Count - 1);
+            foreach (Tensor t in keepAlive)
+                if (t != null) entry.KeepAlive.Add(t.CopyRef());
+        }
 
         /// <summary>
         /// When a cached graph exists for <paramref name="key"/>, returns (a
@@ -463,7 +587,11 @@ namespace TensorSharp.Cuda
             }
 
             rc = CudaDriverApi.cuGraphInstantiateWithFlags(out IntPtr exec, graph, 0);
-            CudaDriverApi.cuGraphDestroy(graph);
+            if (!KeepTemplates || rc != 0 || exec == IntPtr.Zero)
+            {
+                CudaDriverApi.cuGraphDestroy(graph);
+                graph = IntPtr.Zero;
+            }
             if (rc != 0 || exec == IntPtr.Zero)
             {
                 ReleaseContextBlocks(ctx);
@@ -477,11 +605,24 @@ namespace TensorSharp.Cuda
             // free ones are stolen out of the pool so nothing else can rent them
             // while this graph can replay.
             var owned = new List<(IntPtr, long)>(ctx.QuarantinedBlocks);
+            // And the ones a concurrent region still holds back: its join would return them to the pool after this point.
+            owned.AddRange(allocator.TakeDeferredReturns(ctx.DeferredBlocks));
+            var taken = new HashSet<IntPtr>();
+            foreach ((IntPtr ptr, long _) in owned) taken.Add(ptr);
+            // The rest are rented still (a block the capture's work returned and then rented again for something kept past
+            // it): each becomes the graph's when its holder returns it.
+            var claimed = new List<IntPtr>();
             foreach (IntPtr ptr in ctx.TrackedBlocks)
             {
+                if (taken.Contains(ptr)) continue;
                 long bytes = ctx.TrackedSizes[ptr];
                 if (allocator.TryStealPooledBlock(ptr, bytes))
                     owned.Add((ptr, bytes));
+                else
+                {
+                    allocator.Claim(ptr, owned);
+                    claimed.Add(ptr);
+                }
             }
 
             if (entries.Count >= Capacity)
@@ -499,9 +640,11 @@ namespace TensorSharp.Cuda
             entries[key] = new Entry
             {
                 Exec = exec,
+                Template = graph,
                 InputHidden = pinnedHidden.CopyRef(),
                 KeepAlive = keep,
                 OwnedBlocks = owned,
+                Claimed = claimed,
                 OwnedHostBuffers = new List<IntPtr>(ctx.DonatedHostBuffers),
                 LastUse = ++useCounter,
                 MaxAttendLen = maxAttendLen,
@@ -576,9 +719,12 @@ namespace TensorSharp.Cuda
             // between forwards (each forward ends in a logits sync), so the
             // stream is idle with respect to this graph here.
             CudaDriverApi.cuGraphExecDestroy(entry.Exec);
+            if (entry.Template != IntPtr.Zero) CudaDriverApi.cuGraphDestroy(entry.Template);
             foreach (Tensor t in entry.KeepAlive)
                 t.Dispose();
             entry.InputHidden.Dispose();
+            foreach (IntPtr ptr in entry.Claimed)
+                allocator.Unclaim(ptr);
             foreach ((IntPtr ptr, long bytes) in entry.OwnedBlocks)
                 allocator.ReturnDeviceMemory(ptr, bytes);
             foreach (IntPtr host in entry.OwnedHostBuffers)

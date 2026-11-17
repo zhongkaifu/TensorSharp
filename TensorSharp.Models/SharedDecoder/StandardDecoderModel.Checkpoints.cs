@@ -97,24 +97,32 @@ namespace TensorSharp.Models
         private bool RankedSlotCopies => _rankGraphs && _graphTpRanks == null && _mesh.TensorParallel > 1 && _mesh.Stages == 1 && IsGgmlBackend;
 
         /// <summary>Every tensor of <paramref name="slot"/> a graph binds has a device copy of the size the graphs bind
-        /// (one device, or each rank's share on its own device under per-rank graphs), so a copy can read the device
-        /// instead of the host.</summary>
+        /// (one device; each rank's share on its own device under per-rank graphs; each whole-layer stage's layers on its
+        /// device), so a copy can read the device instead of the host. Stages had answered no: two stages on two ggml-cuda
+        /// devices cloned an exported checkpoint (synced to the host for its file) through the host, where one device
+        /// copied it on the device.</summary>
         private bool DeviceCopiesResident(Slot slot)
         {
-            bool ranked = RankedSlotCopies;
-            if (!KeepsDeviceCopies || _mesh.Stages != 1 || (_mesh.TensorParallel != 1 && !ranked)) return false;
-            int previous = ranked ? GgmlBasicOps.GetActiveRank() : 0;
+            bool ranked = RankedSlotCopies, staged = _mesh.Stages > 1;
+            if (!KeepsDeviceCopies || (_mesh.TensorParallel != 1 && !ranked)) return false;
+            int previous = ranked || staged ? GgmlBasicOps.GetActiveRank() : 0;
             try
             {
+                for (int stage = 0; stage < _mesh.Stages; stage++)
                 for (int rank = 0; rank < _mesh.TensorParallel; rank++)
                 {
-                    if (ranked) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, rank));
-                    foreach (Tensor t in RankCacheTensors(slot.K, rank).Concat(RankCacheTensors(slot.V, rank)))
-                        if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.Storage.ByteLength)
-                            return false;
+                    if (ranked || staged) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(stage, rank));
+                    foreach (Tensor[][] caches in new[] { slot.K, slot.V })
+                    {
+                        if (caches == null) continue;
+                        for (int e = 0; e < caches.Length; e++)
+                            if (CacheStage(e) == stage && caches[e] is { } entry && rank < entry.Length && entry[rank] is { } t
+                                && GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.Storage.ByteLength)
+                                return false;
+                    }
                     if (slot.Recurrent == null) continue;
-                    foreach (RecurrentState[] layer in slot.Recurrent)
-                        if (layer != null && rank < layer.Length && layer[rank]?.GraphTensors is { } tensors)
+                    for (int l = 0; l < slot.Recurrent.Length; l++)
+                        if (slot.Recurrent[l] is { } layer && StageOfLayer(l) == stage && rank < layer.Length && layer[rank]?.GraphTensors is { } tensors)
                             foreach (Tensor t in tensors)
                                 if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.ElementCount() * sizeof(float))
                                     return false;
@@ -123,7 +131,7 @@ namespace TensorSharp.Models
             }
             finally
             {
-                if (ranked) GgmlBasicOps.SetActiveRank(previous);
+                if (ranked || staged) GgmlBasicOps.SetActiveRank(previous);
             }
         }
 
@@ -144,12 +152,14 @@ namespace TensorSharp.Models
             || GraphExecutor is { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } };
 
         /// <summary>A deep copy of <paramref name="source"/> sized for <paramref name="capacityTokens"/>.</summary>
-        private Slot CopySlot(Slot source, int capacityTokens)
+        /// <param name="runSlotFirst">A request will run on the copy: a pooled slot a request ran on (its recordings adopted
+        /// where they are) before a spare.</param>
+        private Slot CopySlot(Slot source, int capacityTokens, bool runSlotFirst = false)
         {
             int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, capacityTokens));
             // A pooled slot's caches and states are overwritten whole and keep their device copies (cached graphs
             // bind them), so the host route writes them in place.
-            Slot slot = TakePooledSlot(capacity, mustFit: true);
+            Slot slot = TakePooledSlot(capacity, mustFit: true, spare: !runSlotFirst);
             bool inPlace = slot != null;
             if (slot == null)
             {
@@ -158,6 +168,7 @@ namespace TensorSharp.Models
             }
             slot.Length = source.Length;
             slot.DraftStart = source.DraftStart;
+            slot.DraftFollowed = -1;   // the copy has no carry
             slot.RopeDelta = source.RopeDelta;
             if (TryCopySlotOnDevice(source, slot, targetBound: inPlace))
                 return slot;
@@ -325,7 +336,7 @@ namespace TensorSharp.Models
                 foreach (Tensor t in AllCacheTensors(k).Concat(AllCacheTensors(v))) { InvalidateTensorDeviceCache(t); t.Dispose(); }
                 throw;
             }
-            ClearGraphCache();
+            ForgetGraphsOfGrowing(slot);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             slot.K = k;
@@ -484,6 +495,8 @@ namespace TensorSharp.Models
                 slot.Length = length;
                 slot.RopeDelta = ropeDelta;
                 slot.DraftStart = length;   // the file holds no draft-layer rows
+                slot.DraftFollowed = -1;
+                slot.RetainedAt = System.Threading.Interlocked.Increment(ref s_retainSerial);
                 _retainedSlots.Add(key, slot);
                 return true;
             }

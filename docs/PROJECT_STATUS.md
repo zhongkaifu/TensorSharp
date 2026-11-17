@@ -147,6 +147,18 @@ CUDA results are committed. See the [Bonsai2 card](models/bonsai2.md).
 
 The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse Spark, loading split GGUFs from any shard, native skill discovery and the latest MiniMax-H3 work are newer than `v2026.10.11`, as described above. Knowledge collections and active-turn steering are included in that tag; the entries below retain compatibility and measured-performance history from earlier work.
 
+- **The Qwen direct-CUDA engines and NInfer support are removed.** Qwen 3.5 / 3.6 / 3.8 (`qwen35`,
+  `qwen35moe`) and Qwen 3.8 Flash Next (`qwen4exp`) now run on the shared decoder runtime on every
+  backend; on `--backend cuda` its graphs run on the CUDA graph executor. Dense NVFP4 checkpoints on
+  `--backend cuda` no longer get a direct engine of their own, Flash Next on `--backend cuda` now
+  accepts `--tp N` and `--n-cpu-moe` / `--cpu-moe` as on `ggml_cuda` (`--tp` with `--layer-split`
+  stays refused), and NInfer artifacts (`.ninfer`, `neroued/Qwen3.8-27B-nvfp4-NInfer`) no longer
+  load. The engines' environment variables (their own switches, `TS_MOE_TIER_ADAPT_SWAPS` /
+  `_EVERY` / `_ASYNC` / `_PROMPT_SWAPS`, `TS_NINFER_GGUF_DIR`) stop the server or CLI at startup;
+  `TS_Q4E_HC_Q8` and `TS_Q4E_MTP_EXPERTS` stay, read by the runtime; and the presets `config/qwen3.8-27b-ninfer.json`,
+  `config/qwen3.8-27b-ninfer-64k.json` and `config/qwen3.8-flash-next-cuda-4lanes.json` are deleted.
+  The `--backend cuda` path of these families has not been measured on a GPU since; see the
+  [environment variable matrix](env_var_feature_matrix.md#kv-cache--context).
 - **Muse Spark runs through a native whole-model executor, in both multi-GPU modes.** It is the default on `ggml_cuda` / `ggml_vulkan`, and `--tp N` on `ggml_cuda` now runs it too, splitting every layer over the first N CUDA GPUs through upstream ggml's meta backend; `TS_MUSE_SPARK_NATIVE=0` restores the per-op path, which `--tp N` on `ggml_vulkan` still uses. Layer split spans up to 16 GPUs, refuses a GPU count it cannot honour instead of running on fewer, and pipelines one prompt's prefill across CUDA GPUs (`TS_MUSE_SPARK_PIPELINE`, `TS_MUSE_SPARK_PIPELINE_UBATCH`). Without `MAX_CONTEXT`, an advertised context that does not fit is capped to the largest that does. With pipelined prefill on, a request that is alone prefills in steps Muse Spark chooses (8,192 tokens) unless `TS_SCHED_SOLO_PREFILL_CHUNK` is set. On Linux hosts with ten or more peer-capable GPUs, a TensorSharp-owned `cuMemSetAccess` guard stops the ggml-cuda scratch-pool abort that ended every `ggml_cuda` run of an NCCL build (CUDA allows a GPU at most eight peer connections). With neither `TS_MUSE_SPARK_CPU_MOE=auto` nor `--n-cpu-moe N`, a layer-split checkpoint that does not fit the GPUs is refused at load with a message naming the option. For concurrent requests, raise `TS_MUSE_SPARK_PLAN_SLOTS` to the concurrency plus one for the shared-prefix checkpoint. See the [measured launch profile](models/muse-spark.md#launching) and the [ten-GPU comparison](perf/muse-spark-vs-llama-cpp.md).
 - **Split GGUFs load from any shard.** `--model` may name any file of a `-0000N-of-0000M` set: TensorSharp reads the metadata from shard 1, combines the tensor tables of every shard, and refuses a missing shard or an inconsistent split count before loading weights. Pointing at shard 1 keeps working as before.
 - **Knowledge collections are now part of TensorAgent and opt-in server requests.** Select collections explicitly for each chat/request, and reindex metadata-only media after loading a compatible model. Imports retain originals; replacement and reindexing invalidate old versioned citations. See [personal knowledge](knowledge-system.md).
@@ -171,7 +183,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
   ("Qwen3.8 Flash Next is not completely downloaded yet.") instead of letting the engine
   fail on a file the user never saw.
   See [the Mac's own models](../TensorAgent/README.md#the-macs-own-models).
-- **The direct `cuda` engine runs Qwen 3.8 Flash Next's UD-Q2_K_XL.** It used to refuse the
+- **The direct `cuda` engine runs Qwen 3.8 Flash Next's UD-Q2_K_XL** (since removed with the
+  engine; see the first entry). It used to refuse the
   file's IQ2_XS/IQ3_XXS experts at load ("unsupported expert quant type 17"); it now
   decodes them with kernels ported from ggml's dot products, in a decode step still
   captured as a CUDA graph, and its tensor-core and register-staged grouped expert kernels
@@ -358,13 +371,13 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
   - the switches that turned a retained whole-model graph or its pieces off
     (`TS_QWEN35_FD_PERSIST`, `TS_GEMMA4_FD_PERSIST`, `TS_GPTOSS_FD_PERSIST`,
     `TS_MUSE_GLIMMER_PERSIST`, `TS_DFLASH_PERSIST`, the `*_BATCHED_ARENA` switches,
-    `TS_QWEN35_METAL_*`, `TS_Q35_VERIFY_PERSIST` and friends), GPT OSS's decode and
+    `TS_QWEN35_METAL_*` and friends), GPT OSS's decode and
     tensor-parallel switches (`TS_GPTOSS_MODEL_DECODE`, `TS_GPTOSS_FUSED_DECODE`,
     `TS_GPTOSS_TP_*`, `TS_GPTOSS_MLX_MOE_GQMM`, `TS_GPTOSS_PAGED_ATTN_MANAGED`), and the
     Qwen 3.5 and Gemma 4 switches that turned a default path off
     (`TS_QWEN35_FULL_DECODE`, `TS_QWEN35_FUSED_VERIFY`, `TS_QWEN35_TP_FUSED*`,
     `TS_G4_*`, `TS_GMTP_NO_*` and the rest). `TS_QWEN35_HOST_MOE_VERIFY` is now
-    `TS_HOST_MOE_VERIFY`. `TS_Q35_VERIFY_SNAPSHOTS=0` stayed, as the workaround
+    `TS_HOST_MOE_VERIFY`. The switch off Qwen 3.5's per-row verify snapshots stayed, as the workaround
     for the wide-verify divergence on `ggml_cuda`, until `Qwen35Model` itself was removed (2026-11);
   - two never-default experiments: Qwen 3.5's device-resident verify state
     (`TS_QWEN35_VERIFY_RESIDENT`, known wrong) and Gemma 4's batched paged
@@ -399,8 +412,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
     (`TS_CUDA_Q8_MMA`, superseded by the MMQ kernel), on-device MoE prefill
     (`TS_CUDA_MOE_PREFILL_ONDEVICE`, 0.58x the grouped prefill) and Gemma 4's
     GEMM global attention (`TS_CUDA_GEMMA4_GLOBAL_GEMM_ATTN`);
-  - model switches that turned a default path off: `TS_Q4E_FUSED_ATTN` / `_FFN` /
-    `_GDN`, `TS_NEMOTRON_FLASH_DECODE`, `TS_NEMOTRON_LINEAR_RESIDUAL_FUSED`,
+  - model switches that turned a default path off: Qwen 3.8 Flash Next's fused attention, FFN and
+    GDN switches, `TS_NEMOTRON_FLASH_DECODE`, `TS_NEMOTRON_LINEAR_RESIDUAL_FUSED`,
     `TS_NEMOTRON_MAMBA2_NATIVE_DECODE` / `_PREFILL`, `TS_NEMOTRON_MOE_PREFILL_BATCHED`,
     `TS_MUSE_GLIMMER_FUSED` / `_FUSED_CPU` / `_TP_FUSED` / `_VENC_FUSED`,
     `TS_DFLASH_FUSED`, `TS_DSV4_MMA_EXPERTS` / `_STAGED_EXPERTS`,
@@ -415,12 +428,12 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
     alone enables DeepSeek V4.1's routed-MoE tensor parallelism), and `TS_DSV4_NGPU` /
     `TS_GLM_NGPU` (`--layer-split N` sets the GPU count; there is no all-visible-GPUs
     shorthand, and with no placement flag these executors use one device);
-  - `TS_Q4E_RETAINED_CACHE` and `TS_Q4E_RETAINED_CACHE_MB`: Qwen 3.8 Flash Next's finished
-    conversations and shared-prefix checkpoints are retained by the shared runtime's prefix cache;
+  - Qwen 3.8 Flash Next's retained-cache switches: its finished conversations and shared-prefix
+    checkpoints are retained by the shared runtime's prefix cache;
   - more switches that turned a default path off or reached a concluded experiment:
-    Qwen 3.8 Flash Next's `TS_Q4E_TOKEN_GRAPH`, `TS_Q4E_SPAN_ATTN`, `TS_Q4E_FLASH_ATTN`,
-    `TS_Q4E_GRAPH_UID`, `TS_Q4E_SPAN_STATE`, `TS_Q4E_SPAN_REBUILD`, `TS_Q4E_SPAN_FA_MAX`,
-    `TS_Q4E_GDN_MAX_LAYERS` and `TS_Q4E_RES_RESIDENT` (known wrong); GLM 5.x's
+    Qwen 3.8 Flash Next's token-graph, token-span, flash-attention, graph-id and span-state
+    switches and its span-rebuild, span flash-attention cap, GDN layer cap and resident-residual
+    experiments (the last known wrong); GLM 5.x's
     `TS_GLM_FA`, `TS_GLM_FUSED_LID`, `TS_GLM_TOPK`, `TS_GLM_TP_FUSED` and
     `TS_GLM_VENC_FUSED` (the backend probe decides flash attention and the fused
     lightning indexer); `TS_GGML_REUSE_COMPUTE_BUF`, `TSG_USE_FLASH_ATTN_PREFILL`,

@@ -93,6 +93,8 @@ namespace TensorSharp.Runtime.Speculative
         /// short-chat answer decoded at 13 tok/s, with most steps plain).</summary>
         public bool ConditionsOnPrompt => true;
 
+        public bool TryTakeHeldCarry(int position, float[] carry) => _head.TryTakeHeldCarry(position, carry);
+
         public int Propose(in DraftContext ctx, List<int> draftOut)
         {
             int[] tokens = _blockTokens;

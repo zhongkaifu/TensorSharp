@@ -76,8 +76,17 @@ namespace TensorSharp.Models
                 : executor.Compile(program);
         }
 
-        /// <summary>A family moved buffers a cached graph binds: drop the cached graphs.</summary>
-        protected void NoteGraphBindingsChanged() => ClearGraphCache();
+        /// <summary>
+        /// A family moved buffers a cached graph binds. Plans keyed by identity never bind the moved ones again and stay for
+        /// the steps that bind what did not move: a Qwen3.8 Flash Next request's first verify window grew 35 layers' verify
+        /// buffers, and each had dropped every plan and recording of every slot. Steps kept to advance see the move through
+        /// RecurrentState.BindingChanges. An executor that binds host addresses drops every graph.
+        /// </summary>
+        protected void NoteGraphBindingsChanged()
+        {
+            if (GraphsKeyedByIdentity) ForgetProgramsKeyedOtherwise();
+            else ClearGraphCache();
+        }
 
         /// <summary>Attach a DFlash / DFlash2 / DSpine drafter after the trunk loaded.</summary>
         protected void AttachDraftModel(string draftModelPath)
@@ -138,13 +147,16 @@ namespace TensorSharp.Models
         /// gate tuned on sparse-MoE trunks cost speed (M5 Pro, Qwen3.8-27B UD-IQ3_XXS + DFlash2,
         /// 1,224 greedy tokens: 5 / no gate 28.9 tok/s, 7 / 0 28.5, 7 / 0.35 24.8, 3 / 0.35 26.1,
         /// plain 20.5); 7 on ggml_cuda, the most rows its matvec kernel serves (RTX Spark N1X,
-        /// coding workload: 7 beat 5 and 3 on every turn); 3 elsewhere and for other drafters.
-        /// Attention-only stacks take the speculator's own default.
+        /// coding workload: 7 beat 5 and 3 on every turn); the speculator's default (8) on direct CUDA, as the direct
+        /// engine drafted (Qwen3.8-27B + DFlash2 on an RTX PRO 4000, 256 greedy tokens: 92.8 / 86.3 tok/s short / after a
+        /// 4K prompt, against 77.4 / 79.5 at 3; four Web UI conversations at once 28.3 tok/s each, the engine 27.9); 3
+        /// elsewhere and for other drafters. Attention-only stacks take the speculator's own default.
         /// </summary>
         public virtual int SpecPreferredDraftWindow => !_anyRecurrent ? 0
             : !HasDFlash ? 3
             : _backend == BackendType.GgmlCuda ? 7
-            : _backend == BackendType.GgmlMetal ? 5 : 3;
+            : _backend == BackendType.GgmlMetal ? 5
+            : _backend == BackendType.Cuda ? 0 : 3;
 
         /// <summary>
         /// Weight-free n-gram drafts on a dense hybrid stack on ggml_metal whose matmul weights are mostly
@@ -186,6 +198,8 @@ namespace TensorSharp.Models
             int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
             EnsureCacheCapacity(checked(start + rows));
             bool dflash = HasDFlash;
+            // A buffer smaller than every row's DFlash features takes the last row's: the step returns only that row.
+            bool lastFeatureRow = dflash && hAllOut != null && hAllOut.LongLength < (long)rows * DFlashSettings.FeatureSize;
             TokenPositions positions = BeginRotaryPositions(start, rows);
             var request = new GraphRequest
             {
@@ -193,6 +207,7 @@ namespace TensorSharp.Models
                 AllRowLogits = allLogitsRows,
                 LastRowLogits = !allLogitsRows,
                 CaptureLayers = dflash && hAllOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
+                CaptureTail = lastFeatureRow ? 1 : 0,
                 CaptureFinal = !dflash && hAllOut != null,
                 RecurrentSnapshots = _anyRecurrent && rows > 1 && rows <= SmallChunkRows,
             };
@@ -202,14 +217,44 @@ namespace TensorSharp.Models
                 SpecForwardPerOp(tokens, hAllOut, logitsOut, allLogitsRows, request, positions);
                 return;
             }
+            bool media = _pendingMedia.Count > 0;
             Tensor hidden = EmbedStep(tokens);
             InjectMedia(hidden, start);
-            GraphResult result;
+            // A forward that is not a verify hands the draft layer its rows (DraftSelfCatchUp) when it continues the ones the
+            // layer followed (the step that captures the carry after a followed prompt), or from position 0 when the caller
+            // takes only the last row's features (a prompt chunk through a context that leaves the catch-up to the trunk:
+            // a caller taking every row catches the layer up itself).
+            Slot active = SnapshotActive();
+            DraftFollow follow = !allLogitsRows && !dflash && hAllOut != null ? PlanDraftFollow(active, start, positions.Table) : DraftFollow.None;
+            if (follow == DraftFollow.FromStart && hAllOut.LongLength >= (long)rows * DraftFeatureWidth) follow = DraftFollow.None;
+            if (follow != DraftFollow.None)
+            {
+                request = new GraphRequest
+                {
+                    PositionTable = request.PositionTable, AllRowLogits = request.AllRowLogits, LastRowLogits = request.LastRowLogits,
+                    CaptureLayers = request.CaptureLayers, CaptureTail = request.CaptureTail, CaptureFinal = request.CaptureFinal,
+                    RecurrentSnapshots = request.RecurrentSnapshots,
+                    FollowDraft = follow, DraftRows = PrepareDraftFollow(active, tokens, media),
+                };
+                _draftCarry = active.DraftCarry;
+            }
+            // A DFlash drafter's ring takes the rows of a forward whose caller reads only the last row's features (a prompt
+            // through a context the trunk keeps in step, PrefillStep): rows a caller takes every feature row of, it commits.
+            DFlashFollowPlan ringFollow = !allLogitsRows && lastFeatureRow && rows > 1
+                ? PlanDFlashFollow(new string[1], new[] { start }, new[] { rows }, new[] { start + rows }) : null;
+            GraphResult result = null;
             _forwardSw.Start();
             try
             {
-                if (!TryRunGraphStep(hidden, new[] { SnapshotActive() }, new[] { 0 }, new[] { rows }, new[] { start }, request, out result))
+                if (!RunFollowingDFlash(ref ringFollow, plan => TryRunGraphStep(hidden, new[] { active }, new[] { 0 }, new[] { rows }, new[] { start },
+                        plan == null ? request : request.WithDFlashFollow(plan), out result)))
                     throw new NotSupportedException(SpeculationRefusal ?? $"{Config.Architecture}: this verify cannot run as a graph.");
+                if (follow != DraftFollow.None)
+                {
+                    NoteDraftFollowed(active, start, rows);
+                    LoadDraftFollow(active);
+                }
+                NoteDFlashFollowed(ringFollow, new[] { start }, new[] { rows });
             }
             finally
             {
@@ -295,8 +340,8 @@ namespace TensorSharp.Models
                     if (all)
                         for (int r = 0; r < rows; r++)
                             Array.Copy(layer, (long)r * hiddenSize, hAllOut, (long)r * feat + (long)c * hiddenSize, hiddenSize);
-                    else
-                        Array.Copy(layer, (long)(rows - 1) * hiddenSize, hAllOut, (long)c * hiddenSize, hiddenSize);
+                    else   // the last row of the rows captured (every row, or only the last: GraphRequest.CaptureTail)
+                        Array.Copy(layer, layer.LongLength - hiddenSize, hAllOut, (long)c * hiddenSize, hiddenSize);
                 }
             }
             else
@@ -325,8 +370,8 @@ namespace TensorSharp.Models
             CommitRecurrentPrefix(kept, rows);
         }
 
-        /// <summary>Back to the state before the last verify (the graphs' live state still is; the per-op
-        /// path's states restore the one they kept).</summary>
+        /// <summary>Back to the state before the last verify (the graphs' live state still is; the per-op path's states
+        /// restore the one they kept).</summary>
         public void SpecRestoreRecurrentState()
         {
             if (_verifyRows > 1)
@@ -348,6 +393,7 @@ namespace TensorSharp.Models
                 throw new ArgumentOutOfRangeException(nameof(length), $"rewind to {length} of {_cacheSeqLen}");
             MirrorRewind(length);
             _cacheSeqLen = length;
+            if (length < _draftFollowed) _draftFollowed = -1;
         }
 
         /// <summary>With a drafter attached, also warm each verify width (and its commit), so the first
@@ -356,7 +402,64 @@ namespace TensorSharp.Models
         {
             base.WarmUpKernels();
             WarmVerifyWidths();
+            WarmDFlashFollowProducts();
             WarmPooledSlot();
+        }
+
+        /// <summary>
+        /// The products a speculating request's prompt step runs to write its block drafter's ring (<see cref="EmitDFlashFollow"/>:
+        /// each draft layer's K and V projections over the chunk's kept rows, the encoder's over blocks of them), so the kernels
+        /// they take are loaded before a request's first token waits for them (<see cref="IGraphExecutor.WarmProducts"/>): the
+        /// first Qwen3.8-27B DFlash2 prompt step of four conversations at once ran 162-163 ms where it runs 110-112 warm (an RTX
+        /// PRO 6000 slice), its Q6_K V projections' first GEMM waiting 45 + 21 ms to launch. Every row count up to 64 and a
+        /// ladder above it, each weight shape once (0.18-0.19 s at load there): a sweep of every count from 1 to 2,081 loaded
+        /// kernels at 1, 33 and 65 rows only, and took 2.7 s.
+        /// </summary>
+        private void WarmDFlashFollowProducts() => WarmDFlashFollowProductsCounted();
+
+        /// <summary><see cref="WarmDFlashFollowProducts"/>; the weight shapes whose products the executor ran (tests).</summary>
+        internal int WarmDFlashFollowProductsCounted()
+        {
+            if (!HasDFlash || !DFlashSelfCatchUp || GraphUnsupportedReason() != null || GraphExecutor is not { } executor
+                || _dflashLayerNames == null)
+                return 0;
+            MarkDrafterWeights();
+            // A chunk keeps up to a ring's rows (and the zero row before them); the encoder joins them a block at a time.
+            int kept = Math.Max(1, DFlashRingRows) + 1;
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            var shapes = new System.Collections.Generic.HashSet<(int Format, long Ne0, long Ne1)>();
+            int warmed = 0;
+            void Warm(string name, int widest)
+            {
+                if (_quantWeights.TryGetValue(name, out QuantizedWeight weight) && weight != null
+                    && shapes.Add((weight.GgmlType, weight.Ne0, weight.Ne1)) && executor.WarmProducts(weight, FollowWarmRows(widest)))
+                    warmed++;
+            }
+            Warm(DFlashConfig.WeightPrefix + "fc.weight", Math.Min(kept, DFlashFollowBlockRows));
+            foreach (string[] names in _dflashLayerNames)
+            {
+                Warm(names[DfAttnK], kept);
+                Warm(names[DfAttnV], kept);
+            }
+            if (warmed > 0)
+                Console.WriteLine($"    Drafter follow warmup ({warmed} weight shapes, 1-{kept} rows): {started.Elapsed.TotalMilliseconds:F1} ms");
+            return warmed;
+        }
+
+        /// <summary>Row counts <see cref="WarmDFlashFollowProducts"/> runs a product at, up to <paramref name="widest"/>: every count
+        /// to 64, then a ladder of about four a doubling, and the widest.</summary>
+        internal static int[] FollowWarmRows(int widest)
+        {
+            var rows = new System.Collections.Generic.List<int>();
+            for (int r = 1; r <= Math.Min(64, widest); r++) rows.Add(r);
+            for (int octave = 64; octave < widest; octave *= 2)
+                for (int quarter = 1; quarter <= 4; quarter++)
+                {
+                    int r = octave + octave * quarter / 4;
+                    if (r < widest) rows.Add(r);
+                }
+            if (widest > 64) rows.Add(widest);
+            return rows.ToArray();
         }
 
         private void WarmVerifyWidths()
@@ -436,5 +539,40 @@ namespace TensorSharp.Models
             if (!HasDraftLayer) throw new InvalidOperationException($"{Config.Architecture} has no draft head.");
             DraftLayerCatchUp(tokens, hRows, startPos);
         }
+
+        /// <summary>
+        /// The carry the trunk's own plain steps left with the drafter when they followed a prompt (<see cref="DraftSelfCatchUp"/>):
+        /// the DFlash ring's feature row of the prompt's last position (written by the follow, <see cref="EmitDFlashFollow"/>),
+        /// or the draft layer's carry (the trunk's last followed row, <see cref="EmitDraftFollow"/>), read back from the device.
+        /// The prompt's steps stay exactly the plain ones (no features returned, no other kernels), and the first decode step
+        /// drafts from the carry instead of running plainly to capture it.
+        /// </summary>
+        public bool TryTakeHeldCarry(int position, float[] carry)
+        {
+            if (carry == null || position <= 0) return false;
+            Tensor held;
+            int width;
+            if (HasDFlash)
+            {
+                held = DFlashHeldCarry(position);
+                width = DFlashSettings.FeatureSize;
+            }
+            else
+            {
+                held = DraftLayerSelfCatchUp && _draftFollowed == position && position > _draftStart ? _draftCarry : null;
+                width = DraftFeatureWidth;
+            }
+            if (held == null || carry.Length < width) return false;
+            // The graph wrote the carry on the device: bring the host copy up to it (a GGML device copy, an executor that
+            // binds host pointers; a device-resident storage reads its device copy).
+            SyncTensorHostCache(held);
+            SyncStateTensor(held);
+            Array.Copy(held.GetElementsAsFloat(width), carry, width);
+            HeldCarriesTaken++;
+            return true;
+        }
+
+        /// <summary>Carries <see cref="TryTakeHeldCarry"/> handed over (tests check the first draft took one).</summary>
+        internal int HeldCarriesTaken { get; private set; }
     }
 }

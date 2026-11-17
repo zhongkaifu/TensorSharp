@@ -813,6 +813,7 @@ if (hostingOptions.WebUiEnabled && !hostingOptions.EmbeddingsEnabled && hostingO
 
     // Both thinking modes are reachable and can render different shared prefixes. A
     // client that omits `think` gets false, while the Web UI can send true.
+    bool prefixWarmed = true;
     foreach (bool think in new[] { false, true })
     {
         PrefixCacheWarmup.Result warmed = PrefixCacheWarmup
@@ -820,6 +821,7 @@ if (hostingOptions.WebUiEnabled && !hostingOptions.EmbeddingsEnabled && hostingO
             .GetAwaiter().GetResult();
         startupLogger.LogInformation(LogEventIds.HostConfiguration,
             "Prefix cache (thinking {Think}): {Outcome}", think ? "on" : "off", warmed.ToString());
+        prefixWarmed &= warmed.Warmed;
         if (!warmed.Warmed)
             break;
     }
@@ -828,6 +830,25 @@ if (hostingOptions.WebUiEnabled && !hostingOptions.EmbeddingsEnabled && hostingO
     // behind every time the server started.
     warmupSessions.TryRemove(warmupSession.Id);
     workspaceManager?.Release(warmupSession.Id);
+
+    // Then four short conversations at once: the steps that serve several requests together and decode past the first
+    // token (a drafter's graphs, a batched verify and its recordings, new slots) first run here, not in the first users'
+    // requests. Four: the slots a model keeps pooled for the next requests (two left the third and fourth of four
+    // Qwen3.8-27B conversations arriving together on an RTX PRO 4000 to make theirs, 18 ms of their first token).
+    if (prefixWarmed)
+    {
+        ChatSession[] decodeSessions = Enumerable.Range(0, 4).Select(_ => warmupSessions.CreateSession()).ToArray();
+        PrefixCacheWarmup.Result decoded = PrefixCacheWarmup
+            .RunConcurrentDecodeAsync(warmupAdapter.Chat.ChatStreamAsync, decodeSessions.Select(s => s.Id).ToArray(),
+                think: false, maxTokens: 8, startupLogger)
+            .GetAwaiter().GetResult();
+        startupLogger.LogInformation(LogEventIds.HostConfiguration, "Concurrent decode warm-up: {Outcome}", decoded.ToString());
+        foreach (ChatSession session in decodeSessions)
+        {
+            warmupSessions.TryRemove(session.Id);
+            workspaceManager?.Release(session.Id);
+        }
+    }
 }
 
 StartupBanner.Emit(startupLogger, hostingOptions, hostingOptions.ListenUrls);

@@ -89,15 +89,15 @@ Replicated hidden state (all GPUs hold identical copy)
 | `TensorSharp.Models/Models/Mistral3/Mistral3Model.cs` | Since 2026-11: built on the shared decoder runtime (`TensorSharp.Models/SharedDecoder/`), which provides TP, layer split, their hybrid and batched serving for every family on it; see [docs/design/unified-execution.md](docs/design/unified-execution.md) |
 | `TensorSharp.Models/Models/Gemma4/Gemma4Model.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
 | `TensorSharp.Models/Models/Gemma4/Gemma4Model.TensorParallel.cs` | **New.** TP forward pass with dense GeGLU + MoE dual-path FFN, per-layer head dims, shared KV layers |
-| `TensorSharp.Models/Models/Qwen35/Qwen35Model.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
-| `TensorSharp.Models/Models/Qwen35/Qwen35Model.TensorParallel.cs` | **New.** TP forward pass with GatedDeltaNet SSM + full attention + MoE, block-cyclic V-head assignment, CUDA-native GDN kernels |
+| `TensorSharp.Models/Models/Qwen35/Qwen35Model.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active. Removed in 2026-11: Qwen 3.5 / 3.6 / 3.8 and Qwen 3.8 Flash Next now run only on the shared decoder runtime (`Qwen35RuntimeModel`, `Qwen4ExpRuntimeModel`), which provides their TP; see [docs/design/unified-execution.md](docs/design/unified-execution.md) |
+| `TensorSharp.Models/Models/Qwen35/Qwen35Model.TensorParallel.cs` | **New.** TP forward pass with GatedDeltaNet SSM + full attention + MoE, block-cyclic V-head assignment, CUDA-native GDN kernels (removed with `Qwen35Model`) |
 | `TensorSharp.Models/Models/GptOss/GptOssModel.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
 | `TensorSharp.Models/Models/GptOss/GptOssModel.TensorParallel.cs` | **New.** TP forward pass with biased QKV, attention sinks, YaRN, clamped SiLU GLU MoE |
 | `TensorSharp.Models/Models/Nemotron/NemotronModel.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
 | `TensorSharp.Models/Models/Nemotron/NemotronModel.TensorParallel.cs` | **New.** TP forward pass with Mamba2 (replicated), attention (no RoPE), dense + MoE FFN |
 | `TensorSharp.Cli/Program.cs` | Added `--tp <N>` CLI argument |
 | `TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
-| `TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
+| `TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback); removed with `Qwen35Model` (the shared runtime keeps concurrent requests batched under TP) |
 | `TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
 | `TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
 
@@ -147,7 +147,7 @@ column/row-parallel pattern:
 | Architecture | Strategy | Details |
 |-------------|----------|---------|
 | **MoE (Gemma4, Qwen3.5, GptOss, Nemotron)** | Expert slicing | Each GPU holds 1/tp slice of every expert's weights (column-parallel gate/up, row-parallel down). Router is replicated. AllReduce after weighted expert sum. |
-| **GatedDeltaNet SSM (Qwen3.5)** | Per-rank V-head ownership | Block-cyclic V-head assignment. Each rank runs its own GDN kernel on its V-head subset with independent delta/conv state — no cross-rank communication needed for the recurrent path. Requires a device-resident packed-GDN kernel: `ts_qwen35_gdn_*` on direct CUDA, `TSGgml_Qwen35GdnLayerTP` on GGML. |
+| **GatedDeltaNet SSM (Qwen3.5)** | Per-rank V-head ownership | Block-cyclic V-head assignment. Each rank runs its own GDN kernel on its V-head subset with independent delta/conv state — no cross-rank communication needed for the recurrent path. Requires a device-resident packed-GDN kernel: `ts_qwen35_gdn_*` on direct CUDA (removed with `Qwen35Model`), `TSGgml_Qwen35GdnLayerTP` on GGML (still used by the shared runtime's per-op TP path). |
 | **Mamba2 SSM (Nemotron)** | Replicated on rank 0 | Mamba2 layers run on rank 0 only, result broadcast to all ranks. SSM state lives in host arrays with a managed per-token loop; sharding would require a device-resident per-rank kernel. Attention + FFN/MoE layers hold the bulk of weights, so TP still delivers most memory savings. |
 
 ### Known Limitations / Future Work (Stage 1)
@@ -206,7 +206,7 @@ Three things had to change:
 | `TensorSharp.GGML.Native/ggml_ops_core.cpp` | Per-rank backend creation (`create_backend_instance_on_device`, `gpu_device_count`), per-rank reuse buffers/gallocr, rank-wide teardown and budget config |
 | `TensorSharp.GGML.Native/ggml_ops_tensor_parallel.cpp` | **New.** TP init, collective resolution, device + host AllReduce, and the fused multi-rank matmul |
 | `TensorSharp.GGML.Native/ggml_ops_qwen35_gdn_tp.cpp` | **New.** Per-rank packed GatedDeltaNet block (norm + in-projection + ssm_conv + delta-rule scan + gated norm) as one cached graph, with device-resident recurrent state |
-| `TensorSharp.Models/Models/Qwen35/Qwen35Model.TensorParallelGgmlMoE.cs` | **New.** Expert-parallel MoE for Qwen 3.5/3.6 on GGML: whole-expert slices, per-rank route tables, Megatron-split shared expert |
+| `TensorSharp.Models/Models/Qwen35/Qwen35Model.TensorParallelGgmlMoE.cs` | **New.** Expert-parallel MoE for Qwen 3.5/3.6 on GGML: whole-expert slices, per-rank route tables, Megatron-split shared expert (removed with `Qwen35Model`) |
 | `TensorSharp.GGML.Native/CMakeLists.txt` | Auto-detect NCCL instead of forcing `GGML_CUDA_NCCL=OFF` |
 | `TensorSharp.Backends.GGML/GgmlContext.cs` | Accepts N device ids; exposes `Degree`, `DeviceIds`, `HasDeviceAllReduce` |
 | `TensorSharp.Backends.GGML/GgmlTensorParallel.cs` | **New.** P/Invoke surface: device enumeration, rank selection, AllReduce, multi-rank matmul |
@@ -560,6 +560,10 @@ Output is **byte-identical to a single-GPU run** over a 60-token greedy
 generation.
 
 ### Qwen 3.5 / 3.6 on GGML (SSM + MoE)
+
+> **History.** This records `Qwen35Model`'s GGML TP, removed in 2026-11. The shared decoder runtime
+> (`Qwen35RuntimeModel`) now serves Qwen 3.5 TP: per-rank graphs on `cuda` and `ggml_cuda`, and elsewhere
+> the packed per-rank GatedDeltaNet block (`TSGgml_Qwen35GdnLayerTP`) with the rest per op.
 
 Qwen 3.5 was the one architecture GGML TP rejected outright: its per-rank
 GatedDeltaNet ran as a single fused *CUDA* kernel and the GGML bridge exposed
@@ -953,7 +957,7 @@ Stage 3 (RDMA)              ░░░░░░░░░░░░░░░░░�
 |-------|-------------|-----------|-------|
 | Mistral3 | Dense transformer | ✅ Done | Fused/separate QKV, YaRN RoPE |
 | Gemma4 | Dense + MoE | ✅ Done | Expert slicing, dual dense+MoE FFN, per-layer head dims, shared KV layers |
-| Qwen3.5 | SSM + MoE | ✅ Done | GatedDeltaNet SSM with per-rank V-head ownership, packed GDN kernels on direct CUDA and GGML; expert-parallel MoE + column-parallel LM head on GGML |
+| Qwen3.5 | SSM + MoE | ✅ Done | GatedDeltaNet SSM with per-rank V-head ownership. Now on the shared decoder runtime: per-rank graphs (experts sliced by width, LM head by vocabulary) on `cuda` / `ggml_cuda`, the packed per-rank GDN block and whole-expert MoE on the per-op path |
 | GptOss | MoE | ✅ Done | Expert slicing with biased projections, attention sinks, YaRN; expert down-bias skipped in TP |
 | Nemotron | SSM + MoE | ✅ Done | Mamba2 replicated on rank 0, attention (no RoPE), MoE expert slicing |
 | Muse-Glimmer | Dense + vision | ✅ Done | Interleaved SWA/NoPE layers, per-head QK norm (replicated), attention output gate (column-parallel by head), segmented fused gate_up; **tp=2 max — 2 KV heads**; vision tower replicated on rank 0; DFlash and pooled KV snapshots stay single-GPU |

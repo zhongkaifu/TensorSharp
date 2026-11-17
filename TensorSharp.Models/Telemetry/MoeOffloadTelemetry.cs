@@ -24,10 +24,10 @@ namespace TensorSharp.Models.Telemetry
     /// routed experts ran (accelerator slots, slots that read them from storage, the host's expert kernel), the host
     /// kernel's time, adaptive residency swaps and expert I/O bytes, for any MoE model whose experts do not all live on
     /// the accelerator: the GGML expert tiers and host seams (every model with <c>--n-cpu-moe</c>, Qwen3.8-Flash-Next's
-    /// tiers) and the direct CUDA engines' expert residency.
+    /// tiers).
     ///
     /// <para>
-    /// The figures are process totals the native layer and the CUDA backend already keep, monotonic across model
+    /// The figures are process totals the native layer already keeps, monotonic across model
     /// unloads. They are read by <see cref="Snapshot"/> on the engine's thread (the hosts call it with the GPU memory
     /// snapshot after engine steps), at most four times a second and only while something collects the instruments,
     /// so telemetry off costs one property read a step. The collection thread reads only the published snapshot.
@@ -127,17 +127,16 @@ namespace TensorSharp.Models.Telemetry
             long[] n = null;
             try
             {
-                // TensorSharp's own counters in GgmlOps (no backend is touched); the direct CUDA engine's host experts
-                // run the same host kernel, so they count there too.
+                // TensorSharp's own counters in GgmlOps (no backend is touched).
                 n = GgmlBasicOps.MoeOffloadCounters();
             }
             catch (Exception)
             {
                 // No GGML native library in this process.
             }
-            long device = (n?[0] ?? 0) + CudaMoeOffloadCounters.DeviceRoutes;
+            long device = n?[0] ?? 0;
             long streamed = n?[1] ?? 0, host = n?[7] ?? 0, io = n?[8] ?? 0;
-            long swaps = (n?[4] ?? 0) + CudaMoeOffloadCounters.Swaps;
+            long swaps = n?[4] ?? 0;
             double hostSeconds = (n?[5] ?? 0) / 1e9;
             if (device == 0 && streamed == 0 && host == 0 && swaps == 0 && io == 0)
                 return null;

@@ -761,7 +761,7 @@ Engram layer.`；此前不完整的情况会在执行器内部以 `Missing or in
 deepseek41.engram.pad_id` 失败。
 
 Direct CUDA 引擎还会在上传任何数据之前，按实际执行位置检查每个路由专家张量。它的 GPU 专家
-内核与 GLM-5.3-Flash、Qwen3.8 的 Direct 引擎共用，在所有路径上（逐 token 解码内核，以及 prefill
+内核与 GLM-5.3-Flash 的 Direct 引擎共用，在所有路径上（逐 token 解码内核，以及 prefill
 的 tensor core、寄存器暂存与逐行 warp 内核）实现了 Q8_0、Q6_K、Q5_K、Q5_1、Q4_K、Q3_K、Q2_K、Q2_0、
 IQ4_XS、IQ4_NL、IQ3_S、IQ3_XXS、IQ2_S、IQ2_XS、IQ2_XXS、IQ1_S 与 MXFP4。这覆盖了 1017
 `UD-IQ2_XXS` 文件的全部路由专家类型：gate/up 为 IQ1_S（10 层）、IQ2_S（15 层）与 IQ2_XXS（15 层），

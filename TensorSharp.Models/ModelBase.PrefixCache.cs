@@ -62,6 +62,26 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>Every class's <see cref="QueryPrefixCacheSpareBytes(ResourceClass)"/> (<paramref name="perClass"/>[i] for
+        /// class i), the device classes from one query of the device's free memory, which they share.</summary>
+        protected void QueryPrefixCacheSpareBytes(long[] perClass)
+        {
+            long device = 0;
+            bool asked = false;
+            for (int i = 0; i < perClass.Length; i++)
+            {
+                var cls = (ResourceClass)i;
+                if (cls is not (ResourceClass.DeviceKv or ResourceClass.StateSnapshot or ResourceClass.NativeSlot))
+                    perClass[i] = QueryPrefixCacheSpareBytes(cls);
+                else
+                {
+                    if (!asked) device = QueryPrefixCacheSpareBytes(cls);
+                    asked = true;
+                    perClass[i] = device;
+                }
+            }
+        }
+
         /// <summary>
         /// <see cref="IPrefixCacheModel.QueryHostMemoryDeficitBytes"/>: on a Mac, how far what macOS can
         /// give without compressing has fallen below what it should keep (<see cref="UnifiedMemorySpareBytes"/>),
@@ -162,13 +182,39 @@ namespace TensorSharp.Models
             {
                 long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
                 if (available <= 0) return -1;
-                using var process = Process.GetCurrentProcess();
                 long reserve = Math.Max(GpuMemoryBudget.MinHeadroomBytes, available / 16);
-                return Math.Max(0, available - Math.Min(available, process.WorkingSet64) - reserve);
+                return Math.Max(0, available - Math.Min(available, ProcessWorkingSetBytes()) - reserve);
             }
             catch (InvalidOperationException) { return -1; }
             catch (System.ComponentModel.Win32Exception) { return -1; }
             catch (NotSupportedException) { return -1; }
+        }
+
+        /// <summary>
+        /// The process's resident bytes. On Linux from /proc/self/statm's resident pages, what Process.WorkingSet64 reports
+        /// there: that property reads the whole process's information, every thread's stat file included, and the prefix
+        /// cache asks at every eviction pass (a request's end, each checkpoint). In a CLI serving Qwen3.8-27B on CUDA the
+        /// reading took 1.5-1.7 ms of the 1.6-1.9 ms each pass did, at the end of every request, which the next one waited for;
+        /// read from the file, 0.1-0.16 ms. Elsewhere, or if the file is unreadable, the property.
+        /// </summary>
+        private static long ProcessWorkingSetBytes()
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                try
+                {
+                    // "size resident shared text lib data dt", in pages.
+                    string statm = System.IO.File.ReadAllText("/proc/self/statm");
+                    string[] fields = statm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (fields.Length > 1 && long.TryParse(fields[1], System.Globalization.NumberStyles.None,
+                            System.Globalization.CultureInfo.InvariantCulture, out long pages))
+                        return pages * Environment.SystemPageSize;
+                }
+                catch (System.IO.IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+            using var process = Process.GetCurrentProcess();
+            return process.WorkingSet64;
         }
     }
 }

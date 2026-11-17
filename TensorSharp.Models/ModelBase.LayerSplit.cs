@@ -49,6 +49,7 @@ public abstract partial class ModelBase
                 $"owns layers [{LayerPlacement.FirstLayer}, {LayerPlacement.EndLayer}) of {Config.NumLayers}.");
         // Local stage s starts at device s*T of the node's group (T = 1 for single-device stages).
         int stageDevices = LayerSplitGroup?.StageTensorParallel ?? 1;
+        if (LayerSplitGroup == null && _backend == BackendType.Cuda) RefuseLayerSplitPastTheCudaDevices();
         _layerAllocators = new IAllocator[LayerSplitDegree];
         for (int rank = 0; rank < _layerAllocators.Length; rank++)
             _layerAllocators[rank] = LayerSplitGroup?.GetAllocator(rank * stageDevices) ?? CreateLayerDeviceAllocator(rank);
@@ -74,6 +75,21 @@ public abstract partial class ModelBase
                 if (votes[bit] != (((digest[bit / 8] >> (bit % 8)) & 1) * LayerSplitGroup.NodeCount))
                     throw new InvalidOperationException("Layer-split nodes have different model metadata or execution settings.");
         }
+    }
+
+    /// <summary>
+    /// A direct-CUDA split over more devices than the process sees is refused before anything is uploaded: device n's
+    /// context failed inside the load (an unhandled "invalid device ordinal" that aborted the CLI) where the direct engine
+    /// had refused the load.
+    /// </summary>
+    private void RefuseLayerSplitPastTheCudaDevices()
+    {
+        int[] devices = ParseDeviceIds(LayerSplitDegree, "TENSORSHARP_LAYER_SPLIT_DEVICES");
+        int visible = TensorSharp.Cuda.CudaDevice.GetDeviceCount();
+        if (devices.Max() >= visible)
+            throw new ModelLoadRefusedException(
+                $"--layer-split {LayerSplitDegree} needs {devices.Max() + 1} CUDA devices; this process sees {visible} " +
+                "(CUDA_VISIBLE_DEVICES and TENSORSHARP_LAYER_SPLIT_DEVICES choose them).");
     }
 
     /// <summary>The allocator for local device <paramref name="rank"/> of a whole-layer split:

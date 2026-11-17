@@ -738,6 +738,10 @@ namespace TensorSharp.Models
                 var qw = kv.Value;
                 if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
                     continue;
+                // A weight the model serves from host memory (a planned expert offload's experts outside the tier, a
+                // host-only table) keeps its host view.
+                if (!ShouldPreloadDirectCudaWeight(kv.Key))
+                    continue;
 
                 IntPtr cacheKey = qw.EnsureDeviceCacheKey();
                 // Under layer split the weight belongs to its layer's GPU.
@@ -781,9 +785,11 @@ namespace TensorSharp.Models
         /// </summary>
         private void RefuseQuantizedWeightsThatCannotFit(CudaAllocator allocator)
         {
+            // What the preload uploads: a model that leaves weights in host memory (planned expert offload) is not
+            // refused for them.
             long needed = 0;
-            foreach (QuantizedWeight qw in _quantWeights.Values)
-                if (qw.HasHostData && CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
+            foreach (var (name, qw) in _quantWeights)
+                if (qw.HasHostData && CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType) && ShouldPreloadDirectCudaWeight(name))
                     needed += qw.RawBytes;
             long free, total;
             try { (free, total) = allocator.GetMemoryInfo(); }
@@ -830,6 +836,10 @@ namespace TensorSharp.Models
         /// <see cref="LayerSplitDegree"/> &gt; 1.
         /// </summary>
         protected virtual int PreloadRankForWeight(string weightName) => 0;
+
+        /// <summary>Whether the direct cuda backend's preload uploads <paramref name="weightName"/> (default: every weight it
+        /// supports; a model that serves some weights from host memory leaves them out).</summary>
+        protected virtual bool ShouldPreloadDirectCudaWeight(string weightName) => true;
 
         protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
             => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName);

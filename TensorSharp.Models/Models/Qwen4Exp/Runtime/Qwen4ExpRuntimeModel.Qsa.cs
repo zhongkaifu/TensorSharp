@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 
@@ -90,7 +91,10 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Every row's raw indexer key into its sequence's cache, and the blocks the step completes pooled into
-        /// their last members' rows, dense or not: a selecting step reads every block's pooled key.</summary>
+        /// their last members' rows, dense or not: a selecting step reads every block's pooled key. At text positions the
+        /// writes are one region (<see cref="GraphFusion.QsaKeys"/>), which an executor may run as one kernel (direct CUDA):
+        /// the ops are about a dozen a layer and step, and a decode step's pool the last complete block again whether or not
+        /// its row completed one.</summary>
         protected override void EmitAttentionInput(GraphStep step, int layer, int x)
         {
             int ratio = QsaRatio(layer);
@@ -98,45 +102,66 @@ namespace TensorSharp.Models
             int d = Qsa.Dim, kvType = KvCacheGraphType;
             const long f = sizeof(float);
             int raw = step.MatMul(LayerName(layer, "indexer.k_proj.weight"), x);   // [d, rows]
+            string norm = LayerName(layer, "indexer.k_norm.weight");
             for (int s = 0; s < step.Sequences; s++)
             {
                 int count = step.Counts[s], start = step.Starts[s];
                 Slot slot = step.Slots[s];
                 int cache = QsaCache(step, layer, s);
                 int rows = step.Sequences == 1 ? raw : step.View2(raw, d, count, d * f, step.First[s] * d * f);
-                // [raw | 0]: a row's pooled half is written once its block is complete (llama.cpp's packed rows).
-                int packed = step.Op(GraphOp.Concat, stackalloc[] { step.Cont(rows), step.Op(GraphOp.Scale, stackalloc[] { step.Cont(rows) }, default, stackalloc[] { 0f }) },
-                    stackalloc long[] { 0 });
-                step.Effect(step.Op(GraphOp.SetRows, cache, step.Reshape(packed, 2 * d, count, 1), step.WriteRows(start, count)));
+                int writeRows = step.WriteRows(start, count, s);
 
                 // The blocks to pool: those the step completes; a decode or verify step pools its last ceil(count /
                 // ratio) complete blocks (again where they were complete before: the same values), so its graph is the
                 // same at every position.
                 (int first, int n) = PoolSpan(step, s, ratio);
+                int[] members = null, lastRows = null;
+                int membersInput = -1, tableInput = -1, lastInput = -1;
+                bool multi = false;
+                if (n > 0)
+                {
+                    members = new int[ratio * n];
+                    lastRows = new int[n];
+                    var table = new int[4 * n];
+                    multi = FillPoolBlocks(step, s, ratio, first, n, members, lastRows, table);
+                    membersInput = step.InputI32(members, members.Length);
+                    tableInput = multi ? step.InputI32(table, table.Length) : step.InputI32(table.AsSpan(0, n).ToArray(), n);
+                    lastInput = step.InputRows(lastRows);
+                    // Run again one position on, a decode step pools the blocks complete there; another count of blocks, or
+                    // positions turning multi-axis, is another graph (the advance is refused and the step traced).
+                    int seq = s;
+                    step.RefillOnAdvance(membersInput, () =>
+                    {
+                        (int from, int blocksNow) = PoolSpan(step, seq, ratio);
+                        if (blocksNow != n || FillPoolBlocks(step, seq, ratio, from, n, members, lastRows, table) != multi) return false;
+                        step.RewriteInput(membersInput, members);
+                        step.RewriteInput(tableInput, multi ? table : table.AsSpan(0, n));
+                        step.RewriteInput(lastInput, lastRows);
+                        return true;
+                    });
+                    step.RefillOnAdvance(tableInput, () => true);
+                    step.RefillOnAdvance(lastInput, () => true);
+                }
+
+                // One region at text positions with blocks to pool: its kernel writes the rows' keys and pools the blocks they
+                // complete (a decode row's, one row in R), reading the rotary positions the ops read.
+                bool region = n > 0 && !multi && step.PositionTable < 0 && !QsaKeysRegionDisabledForTests;
+                if (region)
+                {
+                    RotarySpec rope = GraphRotary;
+                    step.BeginFused(GraphFusion.QsaKeys, stackalloc[] { rows, cache, writeRows, step.Weight(norm), tableInput },
+                        stackalloc long[] { d, ratio, count <= SmallChunkRows ? 1 : 0, rope.Dims, rope.NeoX ? 2 : 0, rope.OriginalContext },
+                        stackalloc[] { Config.Eps, 1f / ratio, rope.FreqBase, rope.FreqScale, rope.ExtFactor, rope.AttnFactor, rope.BetaFast, rope.BetaSlow });
+                }
+
+                // [raw | 0]: a row's pooled half is written once its block is complete (llama.cpp's packed rows).
+                int packed = step.Op(GraphOp.Concat, stackalloc[] { step.Cont(rows), step.Op(GraphOp.Scale, stackalloc[] { step.Cont(rows) }, default, stackalloc[] { 0f }) },
+                    stackalloc long[] { 0 });
+                step.Effect(step.Op(GraphOp.SetRows, cache, step.Reshape(packed, 2 * d, count, 1), writeRows));
                 if (n <= 0) continue;
-                var members = new int[ratio * n];
-                var lastRows = new int[n];
-                var table = new int[4 * n];
-                bool multi = FillPoolBlocks(step, s, ratio, first, n, members, lastRows, table);
+
                 // The members' raw keys (the cache's raw half, rows of 2d), read after this step's write.
                 int rawHalf = step.View2(cache, d, slot.Capacity, RowBytes(kvType, 2 * d), 0);
-                int membersInput = step.InputI32(members, members.Length);
-                int tableInput = multi ? step.InputI32(table, table.Length) : step.InputI32(table.AsSpan(0, n).ToArray(), n);
-                int lastInput = step.InputRows(lastRows);
-                // Run again one position on, a decode step pools the blocks complete there; another count of blocks, or
-                // positions turning multi-axis, is another graph (the advance is refused and the step traced).
-                int seq = s;
-                step.RefillOnAdvance(membersInput, () =>
-                {
-                    (int from, int blocksNow) = PoolSpan(step, seq, ratio);
-                    if (blocksNow != n || FillPoolBlocks(step, seq, ratio, from, n, members, lastRows, table) != multi) return false;
-                    step.RewriteInput(membersInput, members);
-                    step.RewriteInput(tableInput, multi ? table : table.AsSpan(0, n));
-                    step.RewriteInput(lastInput, lastRows);
-                    return true;
-                });
-                step.RefillOnAdvance(tableInput, () => true);
-                step.RefillOnAdvance(lastInput, () => true);
                 int gathered = step.Op(GraphOp.GetRows, rawHalf, membersInput);   // [d, ratio * n]
                 int sum = -1;
                 for (int i = 0; i < ratio; i++)
@@ -145,16 +170,27 @@ namespace TensorSharp.Models
                     sum = sum < 0 ? step.Cont(member) : step.Op(GraphOp.Add, sum, member);
                 }
                 int pooled = step.Op(GraphOp.Scale, stackalloc[] { sum }, default, stackalloc[] { 1f / ratio });
-                pooled = step.RmsNorm(pooled, LayerName(layer, "indexer.k_norm.weight"));
+                pooled = step.RmsNorm(pooled, norm);
                 pooled = multi
                     ? step.RopeMultiAt(step.Reshape(pooled, d, 1, n), GraphRotary, tableInput)
                     : step.RopeAt(step.Reshape(pooled, d, 1, n), GraphRotary, tableInput);
                 // [the last member's raw key | the pooled key] into the last member's row.
                 int lastRaw = step.Cont(step.View2(gathered, d, n, ratio * d * f, (ratio - 1) * d * f));
                 int row = step.Op(GraphOp.Concat, stackalloc[] { lastRaw, step.Reshape(pooled, d, n) }, stackalloc long[] { 0 });
-                step.Effect(step.Op(GraphOp.SetRows, cache, step.Reshape(row, 2 * d, n, 1), lastInput));
+                int poolWrite = step.Op(GraphOp.SetRows, cache, step.Reshape(row, 2 * d, n, 1), lastInput);
+                step.Effect(poolWrite);
+                if (region) step.EndFused(stackalloc[] { poolWrite });
             }
         }
+
+        /// <summary>Tests: a step's indexer keys are written and pooled by their ops, not as a
+        /// <see cref="GraphFusion.QsaKeys"/> region.</summary>
+        internal bool QsaKeysRegionDisabledForTests { get; set; }
+
+        /// <summary>A QSA layer's selecting step reads the rotated queries as rows (its <see cref="GraphFusion.QsaAttention"/>
+        /// region); every other step only through the attention's head-major view.</summary>
+        protected override bool AttentionReadsQueriesAlone(GraphStep step, int layer)
+            => !(QsaRatio(layer) > 0 && step.Starts[0] + step.Counts[0] > Ple.QsaBudget);
 
         /// <summary>The blocks sequence <paramref name="s"/>'s step pools at a QSA layer of <paramref name="ratio"/>:
         /// those it completes; a decode or verify step pools its last ceil(count / ratio) complete blocks.</summary>
@@ -184,6 +220,62 @@ namespace TensorSharp.Models
             return multi;
         }
 
+        /// <summary>Tests: a selecting step's selection and attention run as their ops, not as a
+        /// <see cref="GraphFusion.QsaAttention"/> region.</summary>
+        internal bool QsaRegionDisabledForTests { get; set; }
+
+        /// <summary>Rows up to which a step is a decode row or a verify window (the CUDA executor's window rows).</summary>
+        private const int CudaWindowRows = 8;
+
+        /// <summary>The indexer queries the open QsaAttention region read, for the selection's ops inside it.</summary>
+        private (GraphStep Step, int Layer, int Sequence, int Query)? _regionQuery;
+
+        /// <summary>
+        /// A selecting step's selection and attention as one region (<see cref="GraphFusion.QsaAttention"/>), which an executor
+        /// may run as the direct engine's kernels (direct CUDA): the blocks scored against their pooled keys where the cache
+        /// holds them, selected, and the selected cells alone attended. A prompt chunk's ops attend the whole window through a
+        /// widened mask: at 16K about 8x the work of the cells it keeps, and a second 16K prompt ran out of device memory.
+        /// The region reads the indexer queries, emitted before it opens. A step with an attention floor keeps the ops (the
+        /// region's cells are not masked below one), as does a media step (a position table), which the region has not been
+        /// checked on.
+        /// </summary>
+        protected override bool BeginWindowAttention(GraphStep step, int layer, int x, int s, in WindowAttentionOperands attention)
+        {
+            int ratio = QsaRatio(layer);
+            if (ratio <= 0 || step.Starts[s] + step.Counts[s] <= Ple.QsaBudget || step.PositionTable >= 0 || step.FloorOf(s) > 0
+                || QsaRegionDisabledForTests)
+                return false;
+            // A decode row or verify window answers as its rows decoded alone (speculation stays lossless): one that straddles
+            // the budget holds rows a lone decode step runs on the ops (dense below the budget), so it runs on them too.
+            if (step.Counts[s] <= CudaWindowRows && step.Starts[s] < Ple.QsaBudget)
+                return false;
+            QsaSpec q = Qsa;
+            int pools = (attention.Window + ratio - 1) / ratio;
+            int query = EmitIndexerQuery(step, layer, x, s);
+            _regionQuery = (step, layer, s, query);
+            step.BeginFused(GraphFusion.QsaAttention,
+                stackalloc[] { query, QsaCache(step, layer, s), attention.Queries, attention.KCache, attention.VCache, attention.Rows },
+                stackalloc long[]
+                {
+                    ratio, Math.Min(pools, q.TopK / ratio), attention.Window, q.Dim, q.Heads, attention.Heads, attention.KvHeads,
+                    attention.HeadDim, AttentionKvMax(step, layer, s),
+                },
+                stackalloc[] { attention.Scale, 1f / MathF.Sqrt(q.Dim) });   // the plan's weights: the reference's head sum, scaled
+            return true;
+        }
+
+        /// <summary>Sequence <paramref name="s"/>'s indexer queries [d, heads, count], rotated at the rows' own positions: a
+        /// media step's table (one sequence), else the KV index plus the slot's delta.</summary>
+        private int EmitIndexerQuery(GraphStep step, int layer, int x, int s)
+        {
+            QsaSpec q = Qsa;
+            int count = step.Counts[s];
+            int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);
+            int query = step.MatMul(LayerName(layer, "indexer.q_proj.weight"), step.Cont(xs));                // [d * heads, count]
+            query = step.RmsNorm(step.Reshape(query, q.Dim, q.Heads, count), LayerName(layer, "indexer.q_norm.weight"));
+            return step.PositionTable >= 0 ? step.Rope(query, GraphRotary) : step.RopeAt(query, GraphRotary, step.SequencePositions(s));
+        }
+
         protected override int EmitAttentionMask(GraphStep step, int layer, int x, int s, int mask, int keys)
         {
             int ratio = QsaRatio(layer);
@@ -191,54 +283,87 @@ namespace TensorSharp.Models
             if (ratio <= 0) return mask;
             if (start + count <= Ple.QsaBudget)
             {
-                step.LimitAdvance(start, (int)Math.Min(int.MaxValue, Ple.QsaBudget - count));   // past it, a step selects
+                step.LimitAdvance(start, (int)Math.Min(int.MaxValue, Ple.QsaBudget - count), s);   // past it, a step selects
                 return mask;
             }
             QsaSpec q = Qsa;
             int d = q.Dim, heads = q.Heads, kvType = KvCacheGraphType;
             Slot slot = step.Slots[s];
-
-            // The plan: blocks over the window, complete ones holding cells, the rest padded and invisible.
-            int pools = (keys + ratio - 1) / ratio, complete = (start + count) / ratio;
-            var pooledRows = new int[pools];              // the row holding a block's pooled key (padded blocks read row 0)
-            var cells = new int[ratio * pools];           // the members a picked block keeps (padded: out of range)
-            for (int b = 0; b < pools; b++)
-            {
-                pooledRows[b] = b < complete ? b * ratio + ratio - 1 : 0;
-                for (int i = 0; i < ratio; i++)
-                    cells[b * ratio + i] = b < complete ? b * ratio + i : keys;
-            }
-            var visible = new ushort[pools * count];      // 0 where row q sees all of block b, -inf elsewhere (F16)
-            var tail = new int[(ratio - 1) * count];      // row q's incomplete block's cells (out of range past them)
-            for (int r = 0; r < count; r++)
-            {
-                int p = start + r, tailStart = (p + 1) / ratio * ratio;
-                for (int b = 0; b < pools; b++)
-                    visible[r * pools + b] = b < complete && (b + 1) * ratio - 1 <= p ? (ushort)0 : (ushort)0xFC00;
-                for (int t = 0; t < ratio - 1; t++)
-                    tail[r * (ratio - 1) + t] = tailStart + t <= p ? tailStart + t : keys;
-            }
+            int pools = (keys + ratio - 1) / ratio;
+            QsaPlanInputs plan = QsaPlanFor(step, s, ratio, keys, count, heads, d);
 
             // Each block's pooled key, from its last member's row (the cache's pooled half).
             int pooledHalf = step.View2(QsaCache(step, layer, s), d, slot.Capacity, RowBytes(kvType, 2 * d), RowBytes(kvType, d));
-            int pooled = step.Reshape(step.Op(GraphOp.GetRows, pooledHalf, step.InputI32(pooledRows, pools)), d, 1, pools);
+            int pooled = step.Reshape(step.Op(GraphOp.GetRows, pooledHalf, plan.PooledRows), d, 1, pools);
 
-            // The rows' indexer queries, scored against every block.
-            int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);
-            int query = step.MatMul(LayerName(layer, "indexer.q_proj.weight"), step.Cont(xs));                // [d * heads, count]
-            query = step.RmsNorm(step.Reshape(query, d, heads, count), LayerName(layer, "indexer.q_norm.weight"));
-            // The rows' own rotary positions: a media step's table (one sequence), else the KV index plus the slot's delta.
-            query = step.PositionTable >= 0 ? step.Rope(query, GraphRotary) : step.RopeAt(query, GraphRotary, step.SequencePositions(s));
-            var weights = new float[heads * count];
-            Array.Fill(weights, 1f / MathF.Sqrt(d));   // the reference's unweighted head sum, scaled
-            int score = step.Op(GraphOp.LightningIndexer, stackalloc[]
-                { query, pooled, step.InputF32(weights, heads, count), step.InputF16(visible, pools, count) });   // [pools, count]
+            // The rows' indexer queries (a QsaAttention region's, emitted before it opened), scored against every block.
+            int query = _regionQuery is { } open && ReferenceEquals(open.Step, step) && open.Layer == layer && open.Sequence == s
+                ? open.Query
+                : EmitIndexerQuery(step, layer, x, s);
+            _regionQuery = null;
+            int score = step.Op(GraphOp.LightningIndexer, stackalloc[] { query, pooled, plan.Weights, plan.Visible });   // [pools, count]
             int picks = step.Op(GraphOp.TopK, stackalloc[] { score }, stackalloc long[] { Math.Min(pools, q.TopK / ratio) });
             return step.Op(GraphOp.TopKMask, stackalloc[]
             {
-                mask, picks, score, step.Reshape(step.InputI32(cells, cells.Length), ratio, pools),
-                step.Reshape(step.InputI32(tail, tail.Length), ratio - 1, count),
+                mask, picks, score, step.Reshape(plan.Cells, ratio, pools), step.Reshape(plan.Tail, ratio - 1, count),
             }, stackalloc long[] { 1, 1, 1 });
+        }
+
+        /// <summary>A step's selection plan for one sequence, as graph inputs: every QSA layer of the step with the same ratio
+        /// and window reads the same ones (as llama.cpp shares them across layers). Each layer had built and refilled its own
+        /// on the host at every step: four inputs and their uploads per layer and token, ~80 copies a token at 16K.</summary>
+        private sealed record QsaPlanInputs(int PooledRows, int Cells, int Visible, int Tail, int Weights);
+
+        private object _qsaPlanStep;
+        private readonly Dictionary<(int Sequence, int Ratio, int Keys), QsaPlanInputs> _qsaPlans = new();
+
+        private QsaPlanInputs QsaPlanFor(GraphStep step, int s, int ratio, int keys, int count, int heads, int d)
+        {
+            if (!ReferenceEquals(_qsaPlanStep, step))
+            {
+                _qsaPlanStep = step;
+                _qsaPlans.Clear();
+            }
+            if (_qsaPlans.TryGetValue((s, ratio, keys), out QsaPlanInputs shared)) return shared;
+            int start = step.Starts[s];
+            // The plan: blocks over the window, complete ones holding cells, the rest padded and invisible. It follows the
+            // rows' positions: run again one position on, a decode step refills it in place (the same graph: the window,
+            // and so the blocks, unchanged).
+            int pools = (keys + ratio - 1) / ratio;
+            var pooledRows = new int[pools];              // the row holding a block's pooled key (padded blocks read row 0)
+            var cells = new int[ratio * pools];           // the members a picked block keeps (padded: out of range)
+            var visible = new ushort[pools * count];      // 0 where row q sees all of block b, -inf elsewhere (F16)
+            var tail = new int[(ratio - 1) * count];      // row q's incomplete block's cells (out of range past them)
+            void Plan(int first)
+            {
+                int complete = (first + count) / ratio;
+                for (int b = 0; b < pools; b++)
+                {
+                    pooledRows[b] = b < complete ? b * ratio + ratio - 1 : 0;
+                    for (int i = 0; i < ratio; i++)
+                        cells[b * ratio + i] = b < complete ? b * ratio + i : keys;
+                }
+                for (int r = 0; r < count; r++)
+                {
+                    int p = first + r, tailStart = (p + 1) / ratio * ratio;
+                    for (int b = 0; b < pools; b++)
+                        visible[r * pools + b] = b < complete && (b + 1) * ratio - 1 <= p ? (ushort)0 : (ushort)0xFC00;
+                    for (int t = 0; t < ratio - 1; t++)
+                        tail[r * (ratio - 1) + t] = tailStart + t <= p ? tailStart + t : keys;
+                }
+            }
+            Plan(start);
+            int pooledInput = step.InputI32(pooledRows, pools);
+            var weights = new float[heads * count];
+            Array.Fill(weights, 1f / MathF.Sqrt(d));   // the reference's unweighted head sum, scaled
+            int visibleInput = step.InputF16(visible, pools, count);
+            int cellsInput = step.InputI32(cells, cells.Length), tailInput = step.InputI32(tail, tail.Length);
+            int seq = s;
+            step.RefillOnAdvance(pooledInput, () => { Plan(step.Starts[seq]); return true; });
+            foreach (int input in new[] { visibleInput, cellsInput, tailInput }) step.RefillOnAdvance(input, () => true);
+            var plan = new QsaPlanInputs(pooledInput, cellsInput, visibleInput, tailInput, step.ConstantInputF32(weights, heads, count));
+            _qsaPlans[(s, ratio, keys)] = plan;
+            return plan;
         }
     }
 }

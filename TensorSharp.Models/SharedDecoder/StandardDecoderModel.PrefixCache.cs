@@ -53,6 +53,7 @@ namespace TensorSharp.Models
         public void DetachPrefixCache() => _prefixCacheSink = null;
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
+        public void QuerySpareBytes(long[] perClass) => QueryPrefixCacheSpareBytes(perClass);
 
         // ---------------------------------------------------------------- end states
 
@@ -105,6 +106,7 @@ namespace TensorSharp.Models
         /// <summary>A slot entering the retained set no longer speculates: its states give up their verify buffers.</summary>
         private static Slot Retained(Slot slot)
         {
+            if (slot != null) slot.RetainedAt = System.Threading.Interlocked.Increment(ref s_retainSerial);
             if (slot?.Recurrent != null)
                 foreach (RecurrentState[] layer in slot.Recurrent)
                     if (layer != null)

@@ -257,14 +257,7 @@ namespace TensorSharp.Server
         /// </summary>
         private static void ValidateModelFiles(string modelPath, string mmProjPath)
         {
-            if (TensorSharp.Runtime.NinferArtifactReader.IsNinferArtifact(modelPath))
-            {
-                // Images use the Qwen3.8 vision tower from an mmproj GGUF (validated below).
-                using var artifact = new TensorSharp.Runtime.NinferArtifactReader(modelPath);
-                _ = NinferQwen38TargetPlan.Create(artifact);
-                _ = TensorSharp.Runtime.NinferQwen38Frontend.FromReader(artifact);
-            }
-            else if (!TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageModel.IsImageDenoiserSafetensors(modelPath))
+            if (!TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageModel.IsImageDenoiserSafetensors(modelPath))
             {
                 // (A MiniMax-H3-Image safetensors denoiser has no GGUF header; its own header
                 // was just parsed by the check above.)

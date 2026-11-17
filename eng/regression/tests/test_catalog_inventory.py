@@ -26,7 +26,8 @@ class CatalogInventoryTests(unittest.TestCase):
 
     def test_registered_architecture_sources_have_family_inventory(self):
         manifest = (REPO / "TensorSharp.Models/Architecture/BuiltInArchitectures.cs").read_text()
-        classes = set(re.findall(r"Register\((?:\w+\.)?(\w+Architecture)\.(?:Descriptor|FlashDescriptor)\)", manifest))
+        # The manifest lists each descriptor in BuiltInArchitectures.Descriptors ("Qwen35Architecture.Descriptor,").
+        classes = set(re.findall(r"(?:\w+\.)?(\w+Architecture)\.(?:Descriptor|FlashDescriptor)\b", manifest))
         self.assertTrue(classes)
         evidence = {path for family in self.families.values() for path in family["source_evidence"]}
         for architecture in classes:

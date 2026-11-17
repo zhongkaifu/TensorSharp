@@ -339,16 +339,23 @@ internal static class Qwen4ExpSyntheticModelBuilder
 
     /// <summary>A one-layer DFlash drafter for the checkpoint <see cref="Write"/> writes: it reads the stream entering
     /// layers [2, 5, 7], as Flash Next's DFlash2 reads [6, 16, 26, 36, 46], and borrows the trunk's embedding and head.
-    /// <paramref name="hidden"/>: another trunk's width (a Qwen 3.5 synthetic checkpoint's).</summary>
-    public static string WriteDFlash(string path, int blockSize = 4, int hidden = Hidden)
+    /// <paramref name="hidden"/>: another trunk's width (a Qwen 3.5 synthetic checkpoint's). <paramref name="dflash2"/>
+    /// adds DFlash2's grouped dynamic convolution (2 taps, groups of 16) and candidate selector (rank 32, top 8) with the
+    /// target's logit transform (scale 0.5, softcap 30); <paramref name="codebookType"/> stores the selector's codebooks
+    /// in that format. <paramref name="slidingWindow"/> short of the context makes the window slide and the ring wrap.
+    /// <paramref name="kQuantProjections"/> stores the encoder and K projections as Q4_K and the V projections as Q6_K, as
+    /// Qwen3.8-27B's DFlash2 Q4_K_M has them (the width must be a multiple of 256).</summary>
+    public static string WriteDFlash(string path, int blockSize = 4, int hidden = Hidden, int layers = 1, int slidingWindow = 4096,
+        bool dflash2 = false, GgmlType codebookType = GgmlType.F32, bool kQuantProjections = false)
     {
         const int heads = 4, kvHeads = 2, headDim = 64, ffn = 512;
+        const int convTaps = 2, convGroup = 16, selectorRank = 32, selectorTopK = 8;
         int Hidden = hidden;
         int[] taps = { 2, 5, 7 };
         var kv = new List<Kv>
         {
             new Str { Key = "general.architecture", V = "dflash" },
-            new U32 { Key = "dflash.block_count", V = 1 },
+            new U32 { Key = "dflash.block_count", V = (uint)layers },
             new U32 { Key = "dflash.embedding_length", V = (uint)Hidden },
             new U32 { Key = "dflash.feed_forward_length", V = ffn },
             new U32 { Key = "dflash.attention.head_count", V = heads },
@@ -359,27 +366,62 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new F32 { Key = "dflash.attention.layer_norm_rms_epsilon", V = 1e-6f },
             new U32 { Key = "dflash.block_size", V = (uint)blockSize },
             new I32Arr { Key = "dflash.target_layers", V = taps },
-            new U32 { Key = "dflash.attention.sliding_window", V = 4096 },
+            new U32 { Key = "dflash.attention.sliding_window", V = (uint)slidingWindow },
             new U32 { Key = "tokenizer.ggml.mask_token_id", V = Vocab - 3 },
         };
+        if (dflash2)
+        {
+            kv.Add(new U32 { Key = "dflash.conv_kernel_size", V = convTaps });
+            kv.Add(new U32 { Key = "dflash.conv_group_size", V = convGroup });
+            kv.Add(new U32 { Key = "dflash.selector_rank", V = selectorRank });
+            kv.Add(new U32 { Key = "dflash.selector_top_k", V = selectorTopK });
+            kv.Add(new F32 { Key = "dflash.logit_scale", V = 0.5f });
+            kv.Add(new F32 { Key = "dflash.final_logit_softcapping", V = 30f });
+        }
         float S(int inDim) => 1.5f / System.MathF.Sqrt(inDim);
+        Tensor Typed(Tensor tensor, GgmlType type)
+        {
+            if (kQuantProjections) tensor.Type = type;
+            return tensor;
+        }
         var t = new List<Tensor>
         {
-            Gen("fc.weight", S(taps.Length * Hidden), taps.Length * Hidden, Hidden),
+            Typed(Gen("fc.weight", S(taps.Length * Hidden), taps.Length * Hidden, Hidden), GgmlType.Q4_K),
             GenAround("enc.output_norm.weight", 1f, 0.1f, Hidden),
             GenAround("output_norm.weight", 1f, 0.1f, Hidden),
-            GenAround("blk.0.attn_norm.weight", 1f, 0.1f, Hidden),
-            Gen("blk.0.attn_q.weight", S(Hidden), Hidden, heads * headDim),
-            Gen("blk.0.attn_k.weight", S(Hidden), Hidden, kvHeads * headDim),
-            Gen("blk.0.attn_v.weight", S(Hidden), Hidden, kvHeads * headDim),
-            Gen("blk.0.attn_output.weight", 0.25f * S(heads * headDim), heads * headDim, Hidden),
-            GenAround("blk.0.attn_q_norm.weight", 1f, 0.1f, headDim),
-            GenAround("blk.0.attn_k_norm.weight", 1f, 0.1f, headDim),
-            GenAround("blk.0.ffn_norm.weight", 1f, 0.1f, Hidden),
-            Gen("blk.0.ffn_gate.weight", S(Hidden), Hidden, ffn),
-            Gen("blk.0.ffn_up.weight", S(Hidden), Hidden, ffn),
-            Gen("blk.0.ffn_down.weight", 0.25f * S(ffn), ffn, Hidden),
         };
+        for (int l = 0; l < layers; l++)
+        {
+            string p = $"blk.{l}.";
+            t.Add(GenAround(p + "attn_norm.weight", 1f, 0.1f, Hidden));
+            t.Add(Gen(p + "attn_q.weight", S(Hidden), Hidden, heads * headDim));
+            t.Add(Typed(Gen(p + "attn_k.weight", S(Hidden), Hidden, kvHeads * headDim), GgmlType.Q4_K));
+            t.Add(Typed(Gen(p + "attn_v.weight", S(Hidden), Hidden, kvHeads * headDim), GgmlType.Q6_K));
+            t.Add(Gen(p + "attn_output.weight", 0.25f * S(heads * headDim), heads * headDim, Hidden));
+            t.Add(GenAround(p + "attn_q_norm.weight", 1f, 0.1f, headDim));
+            t.Add(GenAround(p + "attn_k_norm.weight", 1f, 0.1f, headDim));
+            t.Add(GenAround(p + "ffn_norm.weight", 1f, 0.1f, Hidden));
+            t.Add(Gen(p + "ffn_gate.weight", S(Hidden), Hidden, ffn));
+            t.Add(Gen(p + "ffn_up.weight", S(Hidden), Hidden, ffn));
+            t.Add(Gen(p + "ffn_down.weight", 0.25f * S(ffn), ffn, Hidden));
+            if (!dflash2) continue;
+            // The static kernel near the identity's scale, each token's delta a small correction to it.
+            foreach (string part in new[] { "attn", "ffn" })
+            {
+                t.Add(GenAround(p + part + "_conv_base", 0.5f, 0.2f, Hidden, convTaps, 2));
+                t.Add(Gen(p + part + "_conv_proj.weight", 0.2f * S(Hidden), Hidden, 2 * convTaps * (Hidden / convGroup)));
+            }
+        }
+        if (dflash2)
+        {
+            t.Add(Gen("selector_hidden.weight", S(Hidden), Hidden, selectorRank));
+            foreach (string table in new[] { "selector_predecessor.weight", "selector_successor.weight" })
+            {
+                Tensor codebook = Gen(table, 1f, selectorRank, Vocab);
+                codebook.Type = codebookType;
+                t.Add(codebook);
+            }
+        }
         SyntheticGguf.Write(path, kv, t);
         return path;
     }

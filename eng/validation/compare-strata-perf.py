@@ -91,18 +91,14 @@ def compare(before, after, max_regression=5):
                 for key in ("model_path", "model_last_write_utc"):
                     if report.get(key) != reference.get(key):
                         raise ValueError(f"Checkpoint identity mismatch: {key}")
-            flag = "TENSORSHARP_CUDA_MOE_FUSION" if report["backend"] == "Cuda" else "TS_Q4E_PREFILL_COMBINE"
+            # The direct CUDA backend's MoE fusion is the only switch with an A/B arm.
+            if report["backend"] != "Cuda":
+                raise ValueError("Only the direct CUDA backend has a feature switch to compare")
+            flag = "TENSORSHARP_CUDA_MOE_FUSION"
             expected_flag = "0" if arm == "before" else "1"
             if report.get("environment", {}).get(flag) != expected_flag:
                 raise ValueError(f"Expected explicit {flag}={expected_flag} in {arm} arm")
-            # The runner may set both feature switches per arm. Only the switch
-            # for this backend affects execution; permit the other when it agrees.
-            feature_flags = ("TENSORSHARP_CUDA_MOE_FUSION", "TS_Q4E_PREFILL_COMBINE")
-            for feature_flag in feature_flags:
-                value = report.get("environment", {}).get(feature_flag)
-                if value is not None and value != expected_flag:
-                    raise ValueError(f"Unexpected {feature_flag}={value} in {arm} arm")
-            controls = lambda r: {key: value for key, value in r.get("environment", {}).items() if key not in feature_flags}
+            controls = lambda r: {key: value for key, value in r.get("environment", {}).items() if key != flag}
             if controls(report) != controls(reference):
                 raise ValueError("Other captured environment controls changed")
             if report["backend"] == "Cuda" and report.get("fusion", {}).get("kernel_available") is not True:

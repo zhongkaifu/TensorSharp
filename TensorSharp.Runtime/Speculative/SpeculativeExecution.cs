@@ -66,12 +66,17 @@ namespace TensorSharp.Runtime.Speculative
 
         // Reusable buffers (speculative windows are small; prefill chunk
         // buffers grow to the largest chunk seen).
-        private readonly float[] _verifyLogits;  // [(K+1) * vocab]
         private readonly float[]? _verifyH;       // [(K+1) * hidden]
         private readonly float[]? _catchUpH;      // [(K+1) * hidden]
-        private readonly float[] _stepLogits;    // [vocab] for plain/re-advance steps
-        private readonly float[] _rowLogits;     // [vocab] scratch row handed to drawNext
-        private readonly int[] _verifyDrawn;     // optional plain-greedy verify, one first-max id per row
+
+        // The serial steps' logits buffers, made on their first use: a request the batched executor drafts and verifies
+        // (its own buffers) never reads them, and Qwen3.8-27B's (K+1) x 248,320 verify rows alone are 8.9 MB a request.
+        private float[]? _verifyLogitsBuffer, _stepLogitsBuffer, _rowLogitsBuffer;
+        private int[]? _verifyDrawnBuffer;
+        private float[] VerifyLogits => _verifyLogitsBuffer ??= new float[(MaxDraftTokens + 1) * (long)_vocab];   // [(K+1) * vocab]
+        private float[] StepLogits => _stepLogitsBuffer ??= new float[_vocab];   // [vocab] for plain/re-advance steps
+        private float[] RowLogits => _rowLogitsBuffer ??= new float[_vocab];     // [vocab] scratch row handed to drawNext
+        private int[] VerifyDrawn => _verifyDrawnBuffer ??= new int[MaxDraftTokens + 1];   // optional plain-greedy verify, one first-max id per row
         private readonly int[] _oneToken = new int[1];
 
         /// <summary>Logits handed back for a plain step; see the allocation note at
@@ -160,10 +165,6 @@ namespace TensorSharp.Runtime.Speculative
 
             int k = Math.Min(speculator.MaxDraftTokens, Math.Max(0, model.SpecMaxDraftTokens));
             MaxDraftTokens = k;
-            _verifyLogits = new float[(k + 1) * (long)_vocab];
-            _stepLogits = new float[_vocab];
-            _rowLogits = new float[_vocab];
-            _verifyDrawn = new int[k + 1];
             if (speculator.NeedsHiddenState)
             {
                 _pendingH = new float[_hidden];
@@ -273,6 +274,22 @@ namespace TensorSharp.Runtime.Speculative
         // Always known when the model keeps it (ISpeculativeTarget.SpecCarryOnDevice).
         private bool CarryValid => _carryValid || _model.SpecCarryOnDevice;
 
+        /// <summary>
+        /// Whether a draft at <paramref name="position"/> has its carry: known already, or taken from the drafter that held
+        /// it (<see cref="ISpeculator.TryTakeHeldCarry"/>: the last row of a prompt the target kept the drafter in step with
+        /// on the plain path). Without the latter the first decode step after every such prompt ran plainly to capture the
+        /// carry, where the direct engines, whose carry stays on the device, drafted.
+        /// </summary>
+        private bool EnsureCarry(int position)
+        {
+            if (CarryValid)
+                return true;
+            if (!NeedsHidden || !_speculator.TryTakeHeldCarry(position, _pendingH))
+                return false;
+            _carryValid = true;
+            return true;
+        }
+
         /// <summary>Reset speculative state and statistics. Does NOT touch the model's KV cache.</summary>
         public void Reset()
         {
@@ -302,14 +319,14 @@ namespace TensorSharp.Runtime.Speculative
 
             if (!NeedsHidden)
             {
-                _trunk.Forward(chunk, null, _stepLogits, allLogitsRows: false);
+                _trunk.Forward(chunk, null, StepLogits, allLogitsRows: false);
                 _speculator.Commit(chunk, null, startPos);
             }
             else if (_speculator.HandlesOwnPrefill)
             {
                 // The trunk keeps the drafter in sync itself and only hands
                 // back the last row's hidden state.
-                _trunk.Forward(chunk, _pendingH, _stepLogits, allLogitsRows: false);
+                _trunk.Forward(chunk, _pendingH, StepLogits, allLogitsRows: false);
             }
             else if (promptEnd > 0 && _speculator.PrefillContextRows < int.MaxValue
                 && (long)startPos + n <= (long)promptEnd - _speculator.PrefillContextRows)
@@ -319,7 +336,7 @@ namespace TensorSharp.Runtime.Speculative
                 // Keep only the last row's hidden state: the next chunk's carry-in.
                 // A null-row commit reports the gap.
                 EnsureChunkBuffers(1);
-                _trunk.Forward(chunk, _lastRowH, _stepLogits, allLogitsRows: false);
+                _trunk.Forward(chunk, _lastRowH, StepLogits, allLogitsRows: false);
                 _speculator.Commit(chunk, null, startPos);
                 Array.Copy(_lastRowH, 0, _pendingH, 0, _hidden);
             }
@@ -327,7 +344,7 @@ namespace TensorSharp.Runtime.Speculative
             {
                 EnsureChunkBuffers(n);
 
-                _trunk.Forward(chunk, _chunkH, _stepLogits, allLogitsRows: false);
+                _trunk.Forward(chunk, _chunkH, StepLogits, allLogitsRows: false);
 
                 // Pair token k with the hidden state of the token before it. Done
                 // IN PLACE: the only row still needed after the shift is the last
@@ -345,9 +362,13 @@ namespace TensorSharp.Runtime.Speculative
 
                 Array.Copy(_lastRowH, 0, _pendingH, 0, _hidden);
             }
+            // Every branch that needs a carry left the chunk's last row in it: the next chunk, or the first draft, chains
+            // from it (an execution armed over a reused prefix, SeedCommitted, had none before this prompt).
+            if (NeedsHidden)
+                _carryValid = true;
 
             float[] logits = new float[_vocab];
-            Array.Copy(_stepLogits, logits, _vocab);
+            Array.Copy(StepLogits, logits, _vocab);
             return logits;
         }
 
@@ -464,9 +485,9 @@ namespace TensorSharp.Runtime.Speculative
             // Verify needs position + K + 1 trunk slots; drafting writes drafter
             // rows up to position + K.
             kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
-            // No carried hidden state yet (armed over a plain prefill): this step
-            // runs plain and captures it.
-            if (!CarryValid)
+            // No carried hidden state yet (armed over a plain prefill) and none the
+            // drafter held: this step runs plain and captures it.
+            if (kMax > 0 && !EnsureCarry(position))
                 kMax = 0;
 
             _draftTokens.Clear();
@@ -526,10 +547,10 @@ namespace TensorSharp.Runtime.Speculative
                 // until something actually drafts.
                 bool plainRunDominates = _plainRun > PlainRunBeforeSwitch;
                 if (cheapPlain)
-                    _trunk.ForwardPlain(lastToken, _stepLogits,
+                    _trunk.ForwardPlain(lastToken, StepLogits,
                         parked: governorDeclined || plainRunDominates);   // the model's own decode step
                 else
-                    _trunk.Forward(_oneToken, _verifyH, _stepLogits, allLogitsRows: false);
+                    _trunk.Forward(_oneToken, _verifyH, StepLogits, allLogitsRows: false);
                 if (NeedsHidden)
                     Array.Copy(_pendingH, 0, _catchUpH, 0, _hidden);
                 _speculator.Commit(_oneToken, NeedsHidden && !carryKnown ? null : _catchUpH, position);
@@ -554,7 +575,7 @@ namespace TensorSharp.Runtime.Speculative
                 // consume-before-the-next-forward contract; this buffer is written
                 // only here, so it survives until the next plain step.
                 _plainOut ??= new float[_vocab];
-                Array.Copy(_stepLogits, _plainOut, _vocab);
+                Array.Copy(StepLogits, _plainOut, _vocab);
                 float[] plainLogits = _plainOut;
                 // A step whose DRAFT ran and proposed nothing (the head under its gate)
                 // is speculation's cost - the head pass is in it - not the plain
@@ -594,9 +615,9 @@ namespace TensorSharp.Runtime.Speculative
             // Supplying drawGreedy is an explicit promise that each row reduces to
             // raw argmax after the caller's forced-token/stop checks. Legacy callers
             // always receive full logits, including when a target declines the hook.
-            bool greedyVerify = drawGreedy != null && _trunk.TryForwardGreedyVerify(batch, _verifyH, _verifyDrawn);
+            bool greedyVerify = drawGreedy != null && _trunk.TryForwardGreedyVerify(batch, _verifyH, VerifyDrawn);
             if (!greedyVerify)
-                _trunk.Forward(batch, _verifyH, _verifyLogits, allLogitsRows: true);
+                _trunk.Forward(batch, _verifyH, VerifyLogits, allLogitsRows: true);
             Stats.VerifyTicks += Stopwatch.GetTimestamp() - tVerify0;
 
             int m = 0;
@@ -605,11 +626,11 @@ namespace TensorSharp.Runtime.Speculative
             {
                 int drawn;
                 if (greedyVerify)
-                    drawn = drawGreedy!(_verifyDrawn[m]);
+                    drawn = drawGreedy!(VerifyDrawn[m]);
                 else
                 {
-                    Array.Copy(_verifyLogits, (long)m * _vocab, _rowLogits, 0, _vocab);
-                    drawn = drawNext(_rowLogits);
+                    Array.Copy(VerifyLogits, (long)m * _vocab, RowLogits, 0, _vocab);
+                    drawn = drawNext(RowLogits);
                 }
                 if (m < k && drawn == _draftTokens[m])
                 {
@@ -651,7 +672,7 @@ namespace TensorSharp.Runtime.Speculative
                 if (!_trunk.TryCommitVerifiedPrefix(position + m + 1))
                 {
                     _trunk.Rollback(position);
-                    _trunk.Forward(keep, null, _stepLogits, allLogitsRows: false);
+                    _trunk.Forward(keep, null, StepLogits, allLogitsRows: false);
                 }
                 Stats.RollbackTicks += Stopwatch.GetTimestamp() - tRoll0;
             }
@@ -677,7 +698,7 @@ namespace TensorSharp.Runtime.Speculative
             if (!greedyVerify)
             {
                 nextLogits = new float[_vocab];
-                Array.Copy(_verifyLogits, (long)m * _vocab, nextLogits, 0, _vocab);
+                Array.Copy(VerifyLogits, (long)m * _vocab, nextLogits, 0, _vocab);
             }
             // m accepted drafts plus the corrected/bonus token.
             RecordStep(speculated: true, tokensEmitted: m + 1, tStep0);
@@ -706,7 +727,7 @@ namespace TensorSharp.Runtime.Speculative
             draftsOut.Clear();
             kMax = Math.Min(kMax, MaxDraftTokens);
             kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
-            if (!CarryValid || kMax <= 0)
+            if (kMax <= 0 || !EnsureCarry(position))
                 return 0;
             long t0 = Stopwatch.GetTimestamp();
             _speculator.Propose(
@@ -757,6 +778,47 @@ namespace TensorSharp.Runtime.Speculative
             if (_speculator is not BlockDraftSpeculator block)
                 return 0;
             return block.SelectDrafts(blockTokens, blockConf, Math.Min(blockTokens.Length, blockConf.Length), maxTokens, draftsOut);
+        }
+
+        /// <summary>True when this execution's drafts can come from a per-token head's chain run for several
+        /// sequences in one pass (<see cref="IBatchedSpeculativeTarget.TryDraftChainBatch"/>).</summary>
+        public bool SupportsBatchChain => NeedsHidden && _speculator is DraftHeadSpeculator;
+
+        /// <summary>
+        /// Batched step, first half when several sequences' draft heads chain in one pass: whether this sequence drafts
+        /// at all this step (the same gates as <see cref="ProposeForBatch"/>, the held carry taken as it takes it) and, if
+        /// so, the rows its chain starts with (the stashed catch-up folded in front of <paramref name="lastToken"/>, see
+        /// <see cref="DraftHeadSpeculator.PrepareChain"/>), where they start, and its draft cap. The caller binds this
+        /// sequence's drafter state first; nothing is taken from the speculator until <see cref="AcceptBatchChain"/>.
+        /// </summary>
+        public bool TryPrepareBatchChain(int lastToken, int position, int kMax, [NotNullWhen(true)] out int[]? tokens,
+            [NotNullWhen(true)] out float[]? hRows, out int start, out int maxTokens)
+        {
+            tokens = null;
+            hRows = null;
+            start = position;
+            maxTokens = Math.Min(Math.Min(kMax, MaxDraftTokens), _model.MaxContextLength - position - 2);
+            if (!SupportsBatchChain || maxTokens <= 0 || !EnsureCarry(position))
+                return false;
+            ((DraftHeadSpeculator)_speculator).PrepareChain(lastToken, position, _pendingH!, out tokens, out hRows, out start);
+            return true;
+        }
+
+        /// <summary>Batched step, second half: the pass ran this sequence's chain (<paramref name="steps"/> steps of
+        /// <paramref name="ids"/> and <paramref name="probs"/>); the drafter's gate keeps its drafts. Returns the number of
+        /// drafts in <paramref name="draftsOut"/>.</summary>
+        public int AcceptBatchChain(int[] ids, float[] probs, int steps, List<int> draftsOut, long draftTicks)
+        {
+            ArgumentNullException.ThrowIfNull(draftsOut);
+            draftsOut.Clear();
+            Stats.DraftTicks += draftTicks;
+            if (_speculator is not DraftHeadSpeculator head)
+                return 0;
+            int count = head.AcceptChain(ids, probs, steps, draftsOut);
+            if (count > MaxDraftTokens)
+                throw new InvalidOperationException(
+                    $"A batched draft chain proposed {count} tokens for a window limited to {MaxDraftTokens} drafts.");
+            return count;
         }
 
         /// <summary>One verify window's accepted drafts, by how many it drafted

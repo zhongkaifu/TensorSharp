@@ -39,7 +39,13 @@ namespace TensorSharp.Models
             public int DraftStart;                 // the draft layers attend to rows from here on
             public int RopeDelta;                  // rotary position = KV index + this past a position table
             public int VerifyRows;                 // a batched verify's window, its recurrent states awaiting the commit
+            public int DraftFollowed = -1;         // the draft layer holds the trunk's own rows through here (see DraftFollowReady)
+            public bool Spare;                     // made ahead of a request (no recordings bind it yet), see ReplenishSpareSlot
+            public Tensor DraftCarry;              // the trunk's last followed row's stream (the next followed row's input)
+            public long RetainedAt;                // when it entered the retained set (the oldest goes first under pressure)
         }
+
+        private static long s_retainSerial;
 
         /// <summary>Rows of a batched step: sequence s owns rows [QueryStart[s], QueryStart[s] + Counts[s])
         /// and continues its slot from position Starts[s].</summary>
@@ -54,7 +60,15 @@ namespace TensorSharp.Models
 
         // Parked slots keep their whole allocation; a few cover a burst of short requests.
         private const int SlotPoolMax = 4;
-        private const int FreshSlotTokens = 512;
+
+        /// <summary>
+        /// The fewest cells a new slot (and a copy into one) holds: 512, and a whole <see cref="ReservationStepTokens"/> where
+        /// recorded steps bind their slots (the CUDA executor). There a slot that grows records its steps again, and a chat's
+        /// next turn - its history and its answer's reservation - outgrew a 512-cell slot: four Qwen3.8-27B conversations at
+        /// once on an RTX PRO 4000 grew every second turn's slot (545-728 cells reserved), 13-30 ms of its first token, where
+        /// the direct engine's slots never grew.
+        /// </summary>
+        private int FreshSlotTokens => GraphExecutor?.Capabilities.SlotBoundRecordings == true ? ReservationStepTokens : 512;
 
         /// <summary>Cells a grown slot keeps past what it needs (see <see cref="EnsureSlotCapacity"/>).</summary>
         private const int SlotGrowthHeadroomTokens = 4096;
@@ -117,6 +131,8 @@ namespace TensorSharp.Models
             DeviceDirty = _cacheDeviceDirty,
             DraftStart = _draftStart,
             RopeDelta = _ropeDelta,
+            DraftFollowed = _draftFollowed,
+            DraftCarry = _draftCarry,
         };
 
         private void LoadActive(Slot slot)
@@ -129,6 +145,8 @@ namespace TensorSharp.Models
             _cacheDeviceDirty = slot.DeviceDirty;
             _draftStart = slot.DraftStart;
             _ropeDelta = slot.RopeDelta;
+            _draftFollowed = slot.DraftFollowed;
+            _draftCarry = slot.DraftCarry;
         }
 
         // The active cache's draft-layer floor (see Slot.DraftStart).
@@ -195,7 +213,12 @@ namespace TensorSharp.Models
                     ClearGraphCache();
                 return pooled;
             }
-            int capacity = AlignedSlotCapacity(Math.Max(Math.Max(1, reserveTokens), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength))));
+            return FreshSlot(AlignedSlotCapacity(Math.Max(Math.Max(1, reserveTokens), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength)))));
+        }
+
+        /// <summary>A new empty slot of <paramref name="capacity"/> cells (zeroed caches, reset states).</summary>
+        private Slot FreshSlot(int capacity)
+        {
             var slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
             (slot.K, slot.V) = AllocateCaches(capacity);
             PrimeDeviceCopies(slot, overwritten: false);
@@ -208,24 +231,40 @@ namespace TensorSharp.Models
         // A slot's cache bytes per token and its states' bytes, measured on the first slot (-1 until then).
         private long _slotBytesPerToken = -1, _slotStateBytes = -1;
 
+        // Each device's share of a slot (its caches' bytes per token and its states' bytes), by its place in the mesh: a layer
+        // split's stage or a tensor-parallel rank holds its layers' or heads' part; one device holds all of it.
+        private (int Stage, int Rank, long PerToken, long States)[] _slotShares;
+
         /// <summary>Beside a slot's caches and states: its drafter buffers and its share of the graphs' memory (the margin
         /// Qwen4ExpModel keeps for a holder on Metal).</summary>
         private const long SlotExtraBytes = 256L << 20;
 
         private void MeasureSlotBytes(Slot slot)
         {
-            long cache = 0;
-            foreach (Tensor t in AllCacheTensors(slot.K).Concat(AllCacheTensors(slot.V))) cache += t.Storage.ByteLength;
-            long states = 0;
+            var shares = new SortedDictionary<(int Stage, int Rank), (long Cache, long States)>();
+            void Add(int stage, int rank, long cache, long states)
+            {
+                shares.TryGetValue((stage, rank), out var share);
+                shares[(stage, rank)] = (share.Cache + cache, share.States + states);
+            }
+            for (int e = 0; e < CacheEntries; e++)
+                for (int r = 0; r < _mesh.TensorParallel; r++)
+                {
+                    long bytes = (slot.K?[e] is { } k && r < k.Length && k[r] != null ? k[r].Storage.ByteLength : 0)
+                        + (slot.V?[e] is { } v && r < v.Length && v[r] != null ? v[r].Storage.ByteLength : 0);
+                    if (bytes > 0) Add(CacheStage(e), r, bytes, 0);
+                }
             if (slot.Recurrent != null)
-                foreach (RecurrentState[] layer in slot.Recurrent)
-                    if (layer != null)
-                        foreach (RecurrentState state in layer)
-                            if (state != null)
-                                states += state.StateBytes > 0 ? state.StateBytes
-                                    : state.CheckpointTensors.Sum(t => t.ElementCount() * t.ElementType.Size());
-            _slotBytesPerToken = cache / Math.Max(1, slot.Capacity);
-            _slotStateBytes = states;
+                for (int l = 0; l < slot.Recurrent.Length; l++)
+                    if (slot.Recurrent[l] is { } layer)
+                        for (int r = 0; r < layer.Length; r++)
+                            if (layer[r] is { } state)
+                                Add(_mesh.StageOf(l), r, 0, state.StateBytes > 0 ? state.StateBytes
+                                    : state.CheckpointTensors.Sum(t => t.ElementCount() * t.ElementType.Size()));
+            int capacity = Math.Max(1, slot.Capacity);
+            _slotShares = shares.Select(kv => (kv.Key.Stage, kv.Key.Rank, kv.Value.Cache / capacity, kv.Value.States)).ToArray();
+            _slotBytesPerToken = shares.Values.Sum(v => v.Cache) / capacity;
+            _slotStateBytes = shares.Values.Sum(v => v.States);
         }
 
         /// <summary>Device bytes a slot of <paramref name="capacity"/> tokens takes, with its margin; -1 before the first
@@ -392,22 +431,32 @@ namespace TensorSharp.Models
 
         /// <summary>The pooled slot that best holds <paramref name="tokens"/> (the smallest that does, else the largest;
         /// <paramref name="mustFit"/>: null unless one does), emptied but its states as they were; null when the
-        /// pool has none.</summary>
-        private Slot TakePooledSlot(int tokens, bool mustFit)
+        /// pool has none. Among the slots that hold the tokens, a request's own (<paramref name="spare"/> false) takes a slot
+        /// a request ran on - its recordings are parked and adopted where they are - before a spare one; a copy that
+        /// overwrites every byte (true) takes a spare first.</summary>
+        private Slot TakePooledSlot(int tokens, bool mustFit, bool spare = false)
         {
             if (_slotPool == null || _slotPool.Count == 0) return null;
             int pick = 0;
             for (int i = 1; i < _slotPool.Count; i++)
             {
-                int best = _slotPool[pick].Capacity, cap = _slotPool[i].Capacity;
+                Slot b = _slotPool[pick], c = _slotPool[i];
+                int best = b.Capacity, cap = c.Capacity;
                 bool fits = cap >= tokens, bestFits = best >= tokens;
+                if (fits && bestFits && b.Spare != c.Spare)
+                {
+                    if (c.Spare == spare) pick = i;
+                    continue;
+                }
                 if (fits ? !bestFits || cap < best : !bestFits && cap > best) pick = i;
             }
             Slot pooled = _slotPool[pick];
             if (mustFit && pooled.Capacity < tokens) return null;
             _slotPool.RemoveAt(pick);
+            pooled.Spare = false;
             pooled.Length = 0;
             pooled.DraftStart = 0;
+            pooled.DraftFollowed = -1;
             pooled.RopeDelta = 0;
             pooled.VerifyRows = 0;
             return pooled;
@@ -419,29 +468,36 @@ namespace TensorSharp.Models
         {
             var k = new Tensor[CacheEntries][];
             var v = new Tensor[CacheEntries][];
-            for (int e = 0; e < CacheEntries; e++)
-            {
-                Tensor first = NewCacheTensor(e, 0, capacity, value: false);
-                if (first == null) continue;
-                k[e] = new Tensor[_mesh.TensorParallel];
-                k[e][0] = first;
-                for (int r = 1; r < _mesh.TensorParallel; r++) k[e][r] = NewCacheTensor(e, r, capacity, value: false);
-                if (e >= TotalLayers) continue;
-                v[e] = new Tensor[_mesh.TensorParallel];
-                for (int r = 0; r < _mesh.TensorParallel; r++) v[e][r] = NewCacheTensor(e, r, capacity, value: true);
-            }
+            for (int e = 0; e < CacheEntries; e++) AllocateCacheEntry(k, v, e, capacity);
             return (k, v);
+        }
+
+        /// <summary>Cache entry <paramref name="e"/>'s K (and V, for a layer's) at <paramref name="capacity"/> cells, every
+        /// rank's, into <paramref name="k"/> and <paramref name="v"/>; nothing for an entry this node does not hold.</summary>
+        private void AllocateCacheEntry(Tensor[][] k, Tensor[][] v, int e, int capacity)
+        {
+            Tensor first = NewCacheTensor(e, 0, capacity, value: false);
+            if (first == null) return;
+            k[e] = new Tensor[_mesh.TensorParallel];
+            k[e][0] = first;
+            for (int r = 1; r < _mesh.TensorParallel; r++) k[e][r] = NewCacheTensor(e, r, capacity, value: false);
+            if (e >= TotalLayers) return;
+            v[e] = new Tensor[_mesh.TensorParallel];
+            for (int r = 0; r < _mesh.TensorParallel; r++) v[e][r] = NewCacheTensor(e, r, capacity, value: true);
         }
 
         private void DisposeSlot(Slot slot)
         {
             if (slot == null) return;
-            ClearGraphCache();
+            _idleSpareRefused = false;
+            ForgetGraphsOf(slot);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             slot.K = slot.V = null;
             DisposeStates(slot.Recurrent);
             slot.Recurrent = null;
+            slot.DraftCarry?.Dispose();
+            slot.DraftCarry = null;
         }
 
         private void RecycleSlot(Slot slot)
@@ -485,7 +541,10 @@ namespace TensorSharp.Models
             if (TryGrowSlotOnDevice(slot, capacity)) return;
             SyncToHost(slot);
             (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
-            ClearGraphCache();
+            // Only this slot's graphs bound the caches it gives up: every other request's steps and recordings stay. Clearing
+            // the whole cache when a pooled 512-cell slot grew for a 4K prompt had every slot's decode trace and record again
+            // (Qwen3.8 Flash Next on an A40: five graphs and two parked recordings, 2,200 allocations and a 109 ms recording).
+            ForgetGraphsOfGrowing(slot);
             CopyRows(slot.K, k, slot.Length);
             CopyRows(slot.V, v, slot.Length);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
@@ -549,6 +608,8 @@ namespace TensorSharp.Models
         {
             if (_slots == null || string.IsNullOrEmpty(requestId)) return;
             if (!_slots.TryGetValue(requestId, out Slot slot)) return;
+            DropReplaysOf(slot.K, slot.Recurrent);
+            if (string.Equals(_activeKey, requestId, StringComparison.Ordinal)) DropReplaysOf(_cacheK, _recurrentPrimary);
             if (string.Equals(_activeKey, requestId, StringComparison.Ordinal))
             {
                 slot = SnapshotActive();
@@ -571,6 +632,8 @@ namespace TensorSharp.Models
         {
             if (_slots == null || string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key)) return false;
             if (!_slots.TryGetValue(requestId, out Slot slot)) return false;
+            DropReplaysOf(slot.K, slot.Recurrent);
+            if (string.Equals(_activeKey, requestId, StringComparison.Ordinal)) DropReplaysOf(_cacheK, _recurrentPrimary);
             _retainedSlots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_retainedSlots.ContainsKey(key)) return false;
             if (string.Equals(_activeKey, requestId, StringComparison.Ordinal))
@@ -632,6 +695,8 @@ namespace TensorSharp.Models
                 foreach (Slot slot in _retainedSlots.Values) DisposeSlot(slot);
             if (_slotPool != null)
                 foreach (Slot slot in _slotPool) DisposeSlot(slot);
+            DisposeSlot(_spareBuild);
+            _spareBuild = null;
             _slots = _retainedSlots = null;
             ClearGraphCache();
             _slotPool = null;
@@ -783,17 +848,28 @@ namespace TensorSharp.Models
             };
 
             Tensor embedded = null;
+            int[] promptEnds = null;
             try
             {
                 embedded = EmbedStep(flatTokens);
                 bool capture = features != null && Array.Exists(features, f => f != null);
+                // A lone speculating request's prompt chunk hands the draft layer its rows, and every speculating request's
+                // chunk its DFlash ring's (FollowPlainPrompt).
+                promptEnds = capture ? null : TakeFollowedPrompts(requestIds);
+                DraftFollow follow = n == 1 && promptEnds != null && promptEnds[0] != DFlashNoFollow
+                    ? PlanDraftFollow(slots[0], starts[0], null) : DraftFollow.None;
+                float[] draftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], chunks[0], media: false) : null;
+                DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds);
                 if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
-                    : TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(), wantLogits: true, out float[][] graphLogits)
-                      && CopyLogits(graphLogits, outLogits))
+                    : RunFollowingDFlash(ref dflash, plan => TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(),
+                          wantLogits: true, out float[][] graphLogits, follow: follow, draftRows: draftRows, dflash: plan)
+                          && CopyLogits(graphLogits, outLogits)))
                 {
                     BatchedForwardCount++;
                     for (int s = 0; s < n; s++)
                         slots[s].Length = starts[s] + counts[s];
+                    if (follow != DraftFollow.None) NoteDraftFollowed(slots[0], starts[0], counts[0]);
+                    NoteDFlashFollowed(dflash, starts, counts);
                     return true;
                 }
                 static bool CopyLogits(float[][] from, float[][] to)
@@ -801,6 +877,12 @@ namespace TensorSharp.Models
                     Array.Copy(from, to, to.Length);
                     return true;
                 }
+            }
+            catch
+            {
+                // A step that found no device memory is retried (TryForwardSlots): the chunks still follow there.
+                RestoreFollowedPrompts(requestIds, promptEnds);
+                throw;
             }
             finally
             {

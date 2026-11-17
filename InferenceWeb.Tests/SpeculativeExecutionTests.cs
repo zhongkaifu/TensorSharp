@@ -428,6 +428,66 @@ public partial class SpeculativeExecutionTests
         Assert.Equal(new[] { position }, head.DraftPositions);
     }
 
+    /// <summary>
+    /// A sequence preparing for a batched chain pass hands over the rows its own chain would start with - the stashed verified
+    /// run folded in front of its anchor - without taking the stash: a pass that declines leaves it to fold into the
+    /// sequence's own draft, and a pass that ran takes it (the next draft folds nothing old) and its drafts pass the gate.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DraftHeadSpeculator_PreparedChainKeepsItsStashUntilThePassRan(bool ran)
+    {
+        var head = new RecordingGapDraftHead();
+        using var spec = new DraftHeadSpeculator(head, vocabSize: 8, featureSize: 1, maxDraftTokens: 2) { MinDraftProb = 0.5f };
+        spec.Commit(new[] { 1, 2 }, new[] { 0f, 1f }, startPos: 3);
+        spec.PrepareChain(lastToken: 6, position: 5, carry: new[] { 5f }, out int[] tokens, out float[] rows, out int start);
+        Assert.Equal(new[] { 1, 2, 6 }, tokens);
+        Assert.Equal(new[] { 0f, 1f, 5f }, rows.Take(3));
+        Assert.Equal(3, start);
+        Assert.Empty(head.CatchUps);
+        Assert.Empty(head.FoldedSteps);
+
+        var drafts = new List<int>();
+        if (ran)
+        {
+            Assert.Equal(1, spec.AcceptChain(new[] { 7, 4 }, new[] { 0.9f, 0.3f }, 2, drafts));
+            Assert.Equal(new[] { 7 }, drafts);
+            drafts.Clear();
+        }
+        spec.Propose(new DraftContext { LastToken = 6, Position = 5, CarryHidden = new[] { 5f }, MaxTokens = 1 }, drafts);
+        if (ran)
+        {
+            Assert.Empty(head.FoldedSteps);
+            Assert.Equal(new[] { 5 }, head.DraftPositions);
+        }
+        else
+        {
+            var folded = Assert.Single(head.FoldedSteps);
+            Assert.Equal(3, folded.Start);
+            Assert.Equal(new[] { 1, 2, 6 }, folded.Tokens);
+        }
+        Assert.Empty(head.CatchUps);
+        Assert.Equal(new[] { 7 }, drafts);
+    }
+
+    /// <summary>A stash that does not run up to the position is replayed on its own as the pass is prepared (as the
+    /// sequence's own chain replays it), and the chain starts from the anchor alone.</summary>
+    [Fact]
+    public void DraftHeadSpeculator_PreparedChainReplaysAStashThatCannotFold()
+    {
+        var head = new RecordingGapDraftHead();
+        using var spec = new DraftHeadSpeculator(head, vocabSize: 8, featureSize: 1, maxDraftTokens: 2);
+        spec.Commit(new[] { 1, 2 }, new[] { 0f, 1f }, startPos: 0);
+        spec.PrepareChain(lastToken: 6, position: 5, carry: new[] { 5f }, out int[] tokens, out float[] rows, out int start);
+        var replayed = Assert.Single(head.CatchUps);
+        Assert.Equal((0, true), (replayed.Start, replayed.HasHidden));
+        Assert.Equal(new[] { 1, 2 }, replayed.Tokens);
+        Assert.Equal(new[] { 6 }, tokens);
+        Assert.Equal(5f, rows[0]);
+        Assert.Equal(5, start);
+    }
+
     private sealed class RecordingGapDraftHead : IDraftHead
     {
         public DraftHeadKind DraftHeadKind => DraftHeadKind.PerToken;

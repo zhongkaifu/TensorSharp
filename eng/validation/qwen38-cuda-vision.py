@@ -195,8 +195,9 @@ def main():
               "ggml": git_identity(args.ggml_dir), "cli": file_identity(args.cli), "image": file_identity(args.image),
               "projector": file_identity(args.mmproj), "model_shards": [file_identity(path, False) for path in shards],
               "harness_sha256": sha256(Path(__file__)), "environment": {key: value for key, value in os.environ.items()
-                 if key.startswith(("TS_Q4E_", "TS_TP_", "TS_GGML_", "TS_SCHED_", "GGML_"))
-                 or key in ("CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERRIDE", "TS_N_CPU_MOE", "TS_CPU_MOE")},
+                 if key.startswith(("TS_TP_", "TS_GGML_", "TS_SCHED_", "GGML_"))
+                 or key in ("CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERRIDE", "TS_N_CPU_MOE", "TS_CPU_MOE",
+                            "TS_Q4E_HC_Q8", "TS_Q4E_MTP_EXPERTS")},
               "scope": "Original thinking banner turn, retained image follow-up, or greedy OCR in a separate invocation. No broad visual-quality or comparative performance claim.",
               "limitations": ["Model shards are identified by path, size and mtime, not content hash.", "Interactive sampling uses CLI defaults and is not deterministic.", "Wall time includes model loading; turn prefill/decode times are reported by the CLI."]}
     library = args.cli.parent / "libGgmlOps.so"

@@ -179,12 +179,10 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     /// Q8_0, see DirectCudaRealModelTests). So a repeated trajectory must be bit-identical from
     /// its second run on, and the first run may differ on its decode rows by this much (the
     /// Qwen3.5 prefill-graph ring-phase defect D5, fixed, moved them 0.13-0.75, D3 by 0.07 and more).
-    /// The sliding-window Gemma file's first run differs from later runs on a few decode rows
-    /// (with the D3 fixes: 1.7e-3 at 64 tokens, 4.75e-3 at 511, 0 at the other lengths; runs 2 and
-    /// 3 bit-identical): rounding between its per-op and graph-replayed decode steps, not traced
-    /// further.
+    /// Gemma-4 runs its uncaptured decode steps (a graph key's first sighting) as the recorded
+    /// kernel sequence, so its first run must be bit-identical too (FirstDecodeSteps_MatchTheirReplays).
     /// </summary>
-    private static double FirstRunDecodeBand(string family) => family == "gemma4moe" ? 0.0072 : 1e-4;
+    private static double FirstRunDecodeBand(string family) => family is "gemma4moe" or "gemma4moe_global" ? 0 : 1e-4;
 
     private void AssertReproduces(string what, IReadOnlyList<List<float[]>> runs, string family)
     {
@@ -278,7 +276,9 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         [("gptoss", 96)] = (0.037, 0.061, 0.11),
         [("gptoss", 97)] = (0.047, 0.056, 0.063),
         [("qwen35moe", 96)] = (0.072, 0.090, 0.19),
-        [("qwen35moe", 97)] = (0.049, 0.11, 0.23),
+        // Worst row 0.232 since decode-size products run on the decode-once kernels (q8_1 activations, a verify window's
+        // rows a decode step's bit for bit): this random router's near-ties flip (A40, 2026-11-14).
+        [("qwen35moe", 97)] = (0.049, 0.11, 0.25),
         [("qwen35", 96)] = (0.0025, 0.0032, 0.0042),
         [("qwen35", 97)] = (0.0029, 0.0029, 0.0042),
         [("gemma4moe_global", 96)] = (0.0056, 0.0082, 0.017),
@@ -348,8 +348,16 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     private static double ChunkTolerance(string family, int length, int[] chunks, int row) => family switch
     {
         "gptoss" => row == 0 ? 0.0075 : 0.0068,
-        "qwen35moe" => row == 0 ? 0.0075 : 0.015,
-        "qwen35" => row == 0 ? 0.0012 : 0.00031,   // row 0 of [64] at 96 tokens: 1.105e-3 on an RTX A5000 (sm_86)
+        // Row 0 up to 1.58e-2 ([64]: RTX PRO 6000 slice and RTX 2000 Ada; [1,15,33] 8.1e-3 on an A40) since decode-size
+        // products run on the decode-once kernels (q8_1 activations where some went F32): this random router's near-ties.
+        "qwen35moe" => row == 0 ? 0.02 : 0.015,
+        // [24,24,24] at 97 tokens on an A40 (sm_86) since prompt chunks run the chunked Gated DeltaNet (WY form,
+        // BF16-split operands: the direct engine's arithmetic) and the flash prefill attention: row 0 1.49e-3 and the
+        // decode rows up to 3.86e-4; with the per-row kernel 0.93e-3 and 2.0e-4, with neither 0.89e-3 (row 0 of [64] at 96
+        // tokens was 1.105e-3 on an RTX A5000). [16,16,16,16,16] row 0 2.11e-3 / 1.75e-3 (96 / 97 tokens, RTX 2000 Ada), the
+        // decode rows up to 7.1e-4 (A40) since products of 9-32 rows run on the decode-once kernels in pieces of 8 (a decode
+        // row's sums however many rows share the step) where 9-16 had taken the q8_1 multi-row kernel.
+        "qwen35" => row == 0 ? 0.0025 : 0.001,
         "gemma4moe" => row == 0 ? 0.0089 : 0.017,  // A 5.9e-3 / 1.08e-2 (with the D3 fixes)
         "gemma4moe_global" => row == 0 ? 0.0074 : 0.017,
         "nemotron_h" => chunks[0] is 1 or 64 ? 0 : row == 0 ? 0.015 : row == 1 && length == 96 ? 0.013 : 0,
@@ -520,6 +528,44 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         using var cuda = Load(path, BackendType.Cuda);
         var runs = Enumerable.Range(0, 3).Select(_ => Trajectory(cuda, prompt, forced)).ToList();
         AssertReproduces($"{family} default decode", runs, family);
+    }
+
+    /// <summary>Prompt lengths whose first trajectory's uncaptured decode steps rounded differently from their replays
+    /// before Gemma-4 ran those steps as the recorded kernel sequence (RTX PRO 6000 slice, sm_120: the all-global file
+    /// at 33, 510, 511 and 1023 tokens, the sliding-window file at 97 and 514; an A40 and an RTX PRO 4000 failed at
+    /// other lengths), with lengths on both sides of the 512-key attention tier, the 32-row window and 1024.</summary>
+    private static readonly int[] FirstDecodeLengths = { 17, 31, 33, 64, 97, 130, 257, 400, 510, 511, 512, 514, 600, 1023, 1025 };
+
+    [CudaTheory]
+    [InlineData("gemma4moe_global")]
+    [InlineData("gemma4moe")]
+    public void FirstDecodeSteps_MatchTheirReplays(string family)
+    {
+        // A fresh model runs a decode-graph key's first sighting uncaptured: its first decode step, and its first step
+        // past the 512-key attention tier when the trajectory crosses it. Those steps must compute what a replay of the
+        // same step computes, bit for bit. Before they ran the recorded kernel sequence they built their RoPE tables on
+        // the host (MathF.Cos/Sin against the graph's sincosf): a last-bit difference that the Q8_1 activations mostly
+        // round away, so a length showed it only where it flipped a rounding (one in a few dozen decode rows, at lengths
+        // that depend on the GPU: RepeatedPrefill_Reproduces caught it at 511 tokens on an A40 and an RTX PRO 6000,
+        // ForwardRefill_TracksSinglePass at 600 on an RTX PRO 4000). Hence many lengths, each on a fresh model.
+        string path = WriteModel(family);
+        int[] forced = Forced(8);
+        var differing = new List<string>();
+        foreach (int length in FirstDecodeLengths)
+        {
+            int[] prompt = Prompt(length);
+            using var cuda = Load(path, BackendType.Cuda);
+            List<float[]> first = Trajectory(cuda, prompt, forced);
+            List<float[]> replayed = Trajectory(cuda, prompt, forced);
+            AssertFinite(first, family);
+            int same = replayed.Select((row, i) => BitIdentical(row, first[i])).Count(x => x);
+            Report($"{family} {length}: second trajectory vs the first (bit-identical rows {same}/{first.Count})",
+                replayed.Select((row, i) => RelL2(row, first[i])));
+            if (same != first.Count)
+                differing.Add($"{length} ({first.Count - same} rows)");
+        }
+        Assert.True(differing.Count == 0,
+            $"{family}: the second trajectory differs from the first (whose uncaptured decode steps must match their replays) at {string.Join(", ", differing)} tokens");
     }
 
     [CudaTheory]
@@ -924,7 +970,7 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     private static readonly Dictionary<string, double> BatchedVsSolo = new()
     {
         ["qwen35"] = 0.0048,
-        ["qwen35moe"] = 0.011,
+        ["qwen35moe"] = 0.013,   // 1.126e-2 on an RTX PRO 6000 slice with the decode-once kernels (decode-size rows)
     };
 
     [CudaTheory]

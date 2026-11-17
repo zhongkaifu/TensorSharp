@@ -41,11 +41,35 @@ public sealed class CliInferenceSessionTests
         using var cold = new CliInferenceSession(reference, Config, NullLogger.Instance);
         var expected = cold.Generate(prompt, 4, SamplingConfig.Greedy, cancellationToken: timeout.Token,
             enablePrefixCache: false);
-        // A recurrent cache cannot rewind, so its automatic prompt checkpoint sits one
-        // token before the prompt end (PrefixCacheCoordinator.AutomaticCheckpointBoundary):
-        // the same prompt can then be served again, and this extension re-prefills that token.
-        Assert.Equal(recurrent ? 63 : 64, reused.Completion.PrefixCacheReusedTokens);
+        // A recurrent cache cannot rewind, so its automatic prompt checkpoint sits at the
+        // prompt's end with the last row's logits (PrefixCacheCoordinator.AutomaticCheckpointBoundary):
+        // the same prompt can then be served again, and this extension continues right after it.
+        Assert.Equal(64, reused.Completion.PrefixCacheReusedTokens);
         Assert.Equal(expected.Tokens, reused.Tokens);
+    }
+
+    /// <summary>The CLI's own retry of a prompt: a recurrent cache resumes it at the prompt's end from the
+    /// checkpoint that kept its last logits, prefilling nothing, with the cold output.</summary>
+    [Fact]
+    public void IdenticalPromptResumesAtItsEndWithColdEquivalentOutput()
+    {
+        using var model = OracleFakes.R();
+        using var session = new CliInferenceSession(model, Config, NullLogger.Instance);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        int[] prompt = Enumerable.Range(1, 64).ToArray();
+        var first = session.Generate(prompt, 4, SamplingConfig.Greedy, cancellationToken: timeout.Token);
+        int forwards = model.ForwardLengths.Count;
+        var again = session.Generate(prompt, 4, SamplingConfig.Greedy, cancellationToken: timeout.Token);
+        Assert.Equal(64, again.Completion.PrefixCacheReusedTokens);
+        // Only the decode steps ran: one single-token forward per generated token, no prompt step.
+        Assert.Equal(new[] { 1, 1, 1, 1 }, model.ForwardLengths.Skip(forwards));
+
+        using var reference = OracleFakes.R();
+        using var cold = new CliInferenceSession(reference, Config, NullLogger.Instance);
+        var expected = cold.Generate(prompt, 4, SamplingConfig.Greedy, cancellationToken: timeout.Token,
+            enablePrefixCache: false);
+        Assert.Equal(expected.Tokens, first.Tokens);
+        Assert.Equal(expected.Tokens, again.Tokens);
     }
 
     [Theory]

@@ -333,7 +333,7 @@ namespace TensorSharp.Runtime
                 "Qwen 3.8 attention layers always run inside the token-span graph; the per-layer attention "
                 + "split was removed."),
             // Qwen 3.8 Flash Next's own GGML implementation (Qwen4ExpModel) was removed: the shared decoder runtime serves
-            // every backend but --backend cuda (the direct engine, whose TS_Q4E_* switches stay).
+            // every backend.
             ("TS_Q4E_ARENA_BATCHED_ATTN", Qwen4ExpModelRemoved),
             ("TS_Q4E_ARENA_BATCHED_GDN", Qwen4ExpModelRemoved),
             ("TS_Q4E_DEBUG_SPAN_INPUT", Qwen4ExpModelRemoved),
@@ -351,6 +351,7 @@ namespace TensorSharp.Runtime
             ("TS_Q4E_NODE_DUMP", Qwen4ExpModelRemoved),
             ("TS_Q4E_NODE_DUMP_LAYER", Qwen4ExpModelRemoved),
             ("TS_Q4E_PLE_PREFETCH", Qwen4ExpModelRemoved),
+            ("TS_PLE_EXPLICIT_READ", Qwen4ExpModelRemoved),
             ("TS_Q4E_PREFILL_COMBINE", Qwen4ExpModelRemoved),
             ("TS_Q4E_PROFILE", Qwen4ExpModelRemoved),
             ("TS_Q4E_PROMPT_SPAN_CAP", Qwen4ExpModelRemoved),
@@ -443,6 +444,122 @@ namespace TensorSharp.Runtime
             ("TS_JSON_FORCE_OPEN",
                 "the first-token constraint always applies where no grammar can be built for the requested format; "
                 + "the switch was removed."),
+            // The direct-CUDA engines of the Qwen 3.5 / 3.6 / 3.8 family (Qwen35CudaModel) and of Qwen 3.8 Flash Next
+            // (Qwen4ExpCudaModel) were removed: the shared decoder runtime serves both on every backend, --backend cuda
+            // included. Their switches, and NInfer artifact support, went with them.
+            ("TS_Q35_ATTN8", Qwen35CudaModelRemoved),
+            ("TS_Q35_ATTN8_CHECK", Qwen35CudaModelRemoved),
+            ("TS_Q35_ATTN_PREFILL", Qwen35CudaModelRemoved),
+            ("TS_Q35_CUDA_GRAPHS", Qwen35CudaModelRemoved),
+            ("TS_Q35_DECODE_ATTN_PIPE", Qwen35CudaModelRemoved),
+            ("TS_Q35_DRAFT_SPLITK", Qwen35CudaModelRemoved),
+            ("TS_Q35_GDN_PREPARED_PREFILL", Qwen35CudaModelRemoved),
+            ("TS_Q35_GEMM_SPLITK", Qwen35CudaModelRemoved),
+            ("TS_Q35_GREEDY_VERIFY", Qwen35CudaModelRemoved),
+            ("TS_Q35_HOST_CACHE_MB", Qwen35CudaModelRemoved),
+            ("TS_Q35_MIXED_FP4_VERIFY", Qwen35CudaModelRemoved),
+            ("TS_Q35_MIXED_STEP", Qwen35CudaModelRemoved),
+            ("TS_Q35_NATIVE", Qwen35CudaModelRemoved),
+            ("TS_Q35_PROJECTION_TRACE", Qwen35CudaModelRemoved),
+            ("TS_Q35_RECLAIM_VISION_POOL", Qwen35CudaModelRemoved),
+            ("TS_Q35_SERVING_TRACE", Qwen35CudaModelRemoved),
+            ("TS_Q35_SERVING_TRACE_FILE", Qwen35CudaModelRemoved),
+            ("TS_Q35_SHARED_PREFIX_ATTN", Qwen35CudaModelRemoved),
+            ("TS_Q35_SHARED_PREFIX_CHECK", Qwen35CudaModelRemoved),
+            ("TS_Q35_SHARED_SCRATCH", Qwen35CudaModelRemoved),
+            ("TS_Q35_T1_GEMV", Qwen35CudaModelRemoved),
+            ("TS_Q35_TOPK_PARTITIONED", Qwen35CudaModelRemoved),
+            ("TS_Q35_UBATCH", Qwen35CudaModelRemoved),
+            ("TS_Q35_VERIFY_CACHE_BUDGET_MB", Qwen35CudaModelRemoved),
+            ("TS_Q35_VERIFY_DECODE_Q81", Qwen35CudaModelRemoved),
+            ("TS_Q35_VERIFY_GRAPHS", Qwen35CudaModelRemoved),
+            ("TS_Q35_VERIFY_REPLAY", Qwen35CudaModelRemoved),
+            ("TS_Q35_VERIFY_SNAPSHOTS", Qwen35CudaModelRemoved),
+            ("TS_MOE_TIER_ADAPT_ASYNC", Qwen4ExpCudaModelRemoved),
+            ("TS_MOE_TIER_ADAPT_EVERY", Qwen4ExpCudaModelRemoved),
+            ("TS_MOE_TIER_ADAPT_PROMPT_SWAPS", Qwen4ExpCudaModelRemoved),
+            ("TS_MOE_TIER_ADAPT_SWAPS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_ATTN_GQA", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_ATTN_MMA", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_ATTN_SPLITS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_BATCHED_ATTN", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_BATCHED_VERIFY_ROWS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_BATCH_GRAPHS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_BATCH_GRAPHS_MAX", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_BF16_ROUTER", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_COLLAPSE_Q81", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_DECODE_LANES", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_DOORBELL_SKIP", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_DRAFT_PICK_SPLIT", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_DRAFT_VOCAB", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_EXPERT_READERS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_EXPERT_VEC", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_EXPERT_VRAM_GB", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_FORK_SHEXP", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_FUSE_HC", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_GDN_CHUNKED", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_GRAPHS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_GREEDY_VERIFY", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_GROUP_EXPERTS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_GROUP_F16", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_HOST_EXPERTS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_HOST_EXPERTS_PIN", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_HOST_EXPERT_ROWS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_HYBRID_MISSES", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_HYBRID_SPLIT", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_KV_RESIDENT", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_LANES", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_MTP_CHAIN", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_MTP_CHAIN_SPLIT", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_MTP_D2D", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_MTP_FOLLOW", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_MTP_KV_ONLY", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_MTP_PROMPT", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_MTP_RESUME", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PERF", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PERF_SAMPLE", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PERF_SAMPLE_MIN_MS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PHASE", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PIPELINE_OVER_SPEC", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PLACEMENT_SLOTS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PLE_GATHER_THREADS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PLE_RAM", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PROMPT_GROUP", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PROMPT_PIPELINE", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_PROMPT_PREFETCH", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_Q2_0_PROMPT_GEMM", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_Q80_PAIR", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_QSA_SCORES_MMA", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_REWIND_CHECKPOINT", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_SLOT_TOKENS", Qwen4ExpCudaModelRemoved),
+            ("TS_Q4E_UBATCH", Qwen4ExpCudaModelRemoved),
+            ("TS_NINFER_GGUF_DIR", NinferRemoved),
+            ("TS_Q35_NINFER_A16_AUTO", NinferRemoved),
+            ("TS_Q35_NINFER_A16_BATCH_EXACT_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_A16_LEGACY_EXACT_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_A16_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_DECODE_GRAPHS", NinferRemoved),
+            ("TS_Q35_NINFER_DRAFT_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_DRAFT_SHORTLIST_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_EMBEDDING", NinferRemoved),
+            ("TS_Q35_NINFER_EXACT_VERIFY_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_FI_BRIDGE_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_FI_MANIFEST", NinferRemoved),
+            ("TS_Q35_NINFER_GATEUP_SWIGLU", NinferRemoved),
+            ("TS_Q35_NINFER_GDN_CHUNK", NinferRemoved),
+            ("TS_Q35_NINFER_GDN_CHUNK_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_KERNELS", NinferRemoved),
+            ("TS_Q35_NINFER_KV", NinferRemoved),
+            ("TS_Q35_NINFER_PREFILL_ATTN", NinferRemoved),
+            ("TS_Q35_NINFER_PREFILL_ATTN_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_PREFILL_ATTN_THREADS", NinferRemoved),
+            ("TS_Q35_NINFER_PREFILL_EPILOGUE", NinferRemoved),
+            ("TS_Q35_NINFER_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_REPACK", NinferRemoved),
+            ("TS_Q35_NINFER_REPACK_PTX", NinferRemoved),
+            ("TS_Q35_NINFER_RESIDUAL_NORM", NinferRemoved),
+            ("TS_Q35_NINFER_VERIFY", NinferRemoved),
+            ("TS_Q35_NINFER_VERIFY8_GEMM", NinferRemoved),
         };
 
         private const string CpuPreviousKernelsRemoved =
@@ -468,12 +585,23 @@ namespace TensorSharp.Runtime
             + "shapes it declines); the switch was removed.";
 
         private const string Qwen4ExpModelRemoved =
-            "Qwen 3.8 Flash Next runs on the shared decoder runtime on the GGML backends and cpu; the switch of the "
+            "Qwen 3.8 Flash Next runs on the shared decoder runtime on every backend; the switch of the "
             + "removed Qwen4ExpModel (its token span, arenas and holders) was removed with it.";
 
         private const string Qwen4ExpRetentionRemoved =
             "Qwen 3.8 Flash Next's finished conversations and shared-prefix checkpoints are retained by the shared "
             + "runtime's prefix cache, within the memory its slots leave; the removed Qwen4ExpModel's retention switches went with it.";
+
+        private const string Qwen35CudaModelRemoved =
+            "Qwen 3.5 / 3.6 / 3.8 always run on the shared decoder runtime, --backend cuda included; the switch of the "
+            + "removed direct-CUDA engine (Qwen35CudaModel) was removed with it.";
+
+        private const string Qwen4ExpCudaModelRemoved =
+            "Qwen 3.8 Flash Next always runs on the shared decoder runtime, --backend cuda included; the switch of the "
+            + "removed direct-CUDA engine (Qwen4ExpCudaModel) was removed with it.";
+
+        private const string NinferRemoved =
+            "NInfer artifact support was removed with the direct-CUDA Qwen 3.5 engine; load the model's GGUF instead.";
 
         private const string HostMoeExpertCacheRemoved =
             "the opt-in CUDA expert cache served only the removed Qwen4ExpModel's token span; host-served experts keep "

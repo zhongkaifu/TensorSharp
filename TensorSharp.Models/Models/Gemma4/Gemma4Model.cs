@@ -185,6 +185,9 @@ namespace TensorSharp.Models
         private Tensor _cudaDecodeRopeCosLocal, _cudaDecodeRopeSinLocal;
         private Tensor _cudaDecodeRopeCosGlobal, _cudaDecodeRopeSinGlobal;
         private bool _cudaDecodeGraphCaptureActive;
+        // Set while a decode step runs the recorded kernel sequence, captured or not
+        // (RunCudaDecodeStepAsRecorded): the tables above hold this step's position.
+        private bool _cudaDecodeRopeTablesLive;
         private CudaPrefillGraphCache _cudaDecodeGraphs;
         private CudaDecodeDynParams _cudaDecodeDynParams;
         // PLE is freshly allocated by ComputePLE for every token. Captured
@@ -2315,7 +2318,7 @@ namespace TensorSharp.Models
             }
 
             if (!graphs.ShouldCapture(key))
-                return RunCudaDecodePerOpLoop(hidden, startPos, graphPle);
+                return RunCudaDecodeStepAsRecorded(hidden, startPos, graphPle, dyn);
 
             // All persistent inputs must be device-current before capture; a
             // pageable HtoD upload inside stream capture is illegal.
@@ -2329,7 +2332,7 @@ namespace TensorSharp.Models
             hidden.Dispose();
 
             if (!graphs.BeginCapture(key))
-                return RunCudaDecodePerOpLoop(pinnedIn, startPos, graphPle);
+                return RunCudaDecodeStepAsRecorded(pinnedIn, startPos, graphPle, dyn);
 
             bool captured = false;
             try
@@ -2350,6 +2353,7 @@ namespace TensorSharp.Models
                 }
 
                 _cudaDecodeGraphCaptureActive = true;
+                _cudaDecodeRopeTablesLive = true;
                 Tensor result;
                 try
                 {
@@ -2358,6 +2362,7 @@ namespace TensorSharp.Models
                 finally
                 {
                     _cudaDecodeGraphCaptureActive = false;
+                    _cudaDecodeRopeTablesLive = false;
                 }
                 CudaDecodeDynParams.Deactivate();
                 if (ReferenceEquals(result, pinnedIn))
@@ -2391,17 +2396,58 @@ namespace TensorSharp.Models
             finally
             {
                 _cudaDecodeGraphCaptureActive = false;
+                _cudaDecodeRopeTablesLive = false;
                 CudaDecodeDynParams.Deactivate();
             }
 
             if (!captured)
             {
                 // A failed capture executes no kernels. Run the same step
-                // plainly; the key is blacklisted so future tokens stay safe.
-                return RunCudaDecodePerOpLoop(pinnedIn, startPos, graphPle);
+                // uncaptured; the key is blacklisted so future tokens stay safe.
+                return RunCudaDecodeStepAsRecorded(pinnedIn, startPos, graphPle, dyn);
             }
 
             return pinnedIn;
+        }
+
+        /// <summary>
+        /// A decode step that is neither replayed nor captured (a graph key's first sighting, which only grows the scratch
+        /// buffers and lazy caches the capture will use; a capture that could not start or failed) runs the recorded kernel
+        /// sequence uncaptured: the dyn block active with this step's lengths, so every launcher takes the route, split and
+        /// grid a capture bakes, and RoPE reads the cos/sin tables the device fills from the position. The step then rounds
+        /// exactly as a replay of it does. A plain per-op step built its RoPE tables on the host (MathF.Cos/Sin, where the
+        /// graph's kernel runs sincosf, a last-bit difference at some positions) and ran the plain launch routes, so a
+        /// model's first trajectory differed from every later one on the rows where such a difference happened to flip a
+        /// rounding that matters (the all-global synthetic Gemma file at 511 tokens: decode rows 2 and 5, 3.7e-3 and
+        /// 3.4e-3 relative L2; the eager row 512 left K/V rows that a later replay read).
+        /// </summary>
+        private Tensor RunCudaDecodeStepAsRecorded(Tensor hidden, int startPos, Tensor graphPle, CudaDecodeDynParams dyn)
+        {
+            dyn.Write(startPos + 1, startPos, 0, startPos);
+            dyn.EnqueueUpload();
+            dyn.Activate();
+            try
+            {
+                if (!CudaFusedOps.TryFillNeoXRopeTablesDynamic(
+                    _cudaDecodeRopeCosLocal,
+                    _cudaDecodeRopeSinLocal,
+                    _cudaDecodeRopeFreqsLocal,
+                    _cudaDecodeRopeCosGlobal,
+                    _cudaDecodeRopeSinGlobal,
+                    _cudaDecodeRopeFreqsGlobal))
+                {
+                    // No recorded sequence to match (a capture would abort the same way): the plain step.
+                    CudaDecodeDynParams.Deactivate();
+                    return RunCudaDecodePerOpLoop(hidden, startPos, graphPle);
+                }
+                _cudaDecodeRopeTablesLive = true;
+                return RunCudaDecodePerOpLoop(hidden, startPos, graphPle);
+            }
+            finally
+            {
+                _cudaDecodeRopeTablesLive = false;
+                CudaDecodeDynParams.Deactivate();
+            }
         }
 
         private Tensor PrepareCudaDecodeGraphPleInput(Tensor source)
@@ -7087,10 +7133,10 @@ namespace TensorSharp.Models
         {
             int ropeHalf = freqs.Length;
 
-            // Capture binds stable tables populated once at the head of the
-            // graph from the live dynamic position. Reusing them here mirrors
-            // eager decode and avoids doing sincosf for every head and layer.
-            if (_backend == BackendType.Cuda && _cudaDecodeGraphCaptureActive)
+            // A recorded decode step (captured, or run as recorded uncaptured) binds
+            // stable tables populated once at its head from the live dynamic
+            // position, which avoids doing sincosf for every head and layer.
+            if (_backend == BackendType.Cuda && _cudaDecodeRopeTablesLive)
             {
                 Tensor graphCos = ReferenceEquals(freqs, _ropeFreqsLocal)
                     ? _cudaDecodeRopeCosLocal
@@ -7110,8 +7156,9 @@ namespace TensorSharp.Models
                     return;
                 }
 
-                throw new CudaGraphCaptureAbortedException(
-                    "Gemma graph-stable NeoX RoPE tables unavailable.");
+                if (_cudaDecodeGraphCaptureActive)
+                    throw new CudaGraphCaptureAbortedException(
+                        "Gemma graph-stable NeoX RoPE tables unavailable.");
             }
 
             SelectNeoXRopeSlot(freqs);

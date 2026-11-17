@@ -209,6 +209,7 @@ namespace TensorSharp.Models
         public void AbortImport(object importTicket) { }
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
+        public void QuerySpareBytes(long[] perClass) => QueryPrefixCacheSpareBytes(perClass);
 
         // ---------------------------------------------------------------- diagnostics
 

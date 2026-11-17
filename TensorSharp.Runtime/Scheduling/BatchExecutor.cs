@@ -273,6 +273,8 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     if (RadixCache != null)
                     {
+                        // Prompt-end checkpoints the last step finished, before anything forwards their slots.
+                        RadixCache.CapturePending();
                         RadixCache.Drain();
                         if (RadixCache.DisplacePrimary())
                         {
@@ -2493,9 +2495,51 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             HashSet<string>? handled = null;
-            if (UnifiedSpeculativeDecodes(prepared) is { } speculating)
+            List<ScheduledSequenceWork>? speculating = UnifiedSpeculativeDecodes(prepared);
+            if (speculating != null && PromptFinished != null && prepared.Exists(work => work.IsPrefill))
+            {
+                // The prompts (and the decode tokens that do not speculate) forward first and their requests' first tokens
+                // are published before the verify windows run. Verified first, a request that arrived while others
+                // speculated waited for their drafts and verify before its own prompt: four Qwen3.8-27B DFlash2
+                // conversations arriving together had the last one's first token 356 ms after it was submitted, where its
+                // prompt step took 58 ms (an RTX PRO 6000 slice). Every request's step is its own: the order changes none
+                // of their results, and the speculating requests' tokens are published with the step's results as before.
+                var speculatingIds = new HashSet<string>(speculating.ConvertAll(work => work.Sequence.RequestId), StringComparer.Ordinal);
+                ForwardUnifiedWork(model, prepared, speculatingIds, results);
+                foreach (var result in results)
+                    if (result.IsPrefill && result.Error == null && result.Sequence != null) PromptFinished(result.Sequence);
                 TryRunBatchedSpeculativeSubset(speculating, results, ref handled);
+                // A subset the drafters declined decodes plainly, in a forward of its own.
+                if (handled == null || handled.Count < speculating.Count)
+                {
+                    var plain = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var work in prepared)
+                        if (!speculatingIds.Contains(work.Sequence.RequestId) || (handled != null && handled.Contains(work.Sequence.RequestId)))
+                            plain.Add(work.Sequence.RequestId);
+                    ForwardUnifiedWork(model, prepared, plain, results);
+                }
+                return results;
+            }
+            if (speculating != null)
+                TryRunBatchedSpeculativeSubset(speculating, results, ref handled);
+            ForwardUnifiedWork(model, prepared, handled, results);
+            return results;
+        }
 
+        /// <summary>
+        /// Invoked on the engine's thread, inside a step, for each request whose prompt a unified step has just finished while
+        /// the step has more to run (the verify windows of requests that speculate), so its first token can be published then
+        /// (InferenceEngine sets it). Null: first tokens are published with the step's results.
+        /// </summary>
+        internal Action<SequenceState>? PromptFinished { get; set; }
+
+        /// <summary>One forward of the prepared requests not in <paramref name="skip"/>: their prompt chunks and decode tokens
+        /// (a request with pending media embeddings through the model's media path), each request's result into
+        /// <paramref name="results"/>. A failed forward fails the requests it carried.</summary>
+        private void ForwardUnifiedWork(IUnifiedBatchModel model, List<ScheduledSequenceWork> prepared, HashSet<string>? skip,
+            List<SequenceStepResult> results)
+        {
+            HashSet<string>? handled = skip;
             var batch = new List<(ScheduledSequenceWork Work, int[] Tokens, int Start, int Sampled, SpecSeqContext? Drafter)>(prepared.Count);
             var injector = _model.MultimodalInjector;
             // The step's host phases (tensorsharp.engine.step.phase.duration), as the batched decode records them: the
@@ -2540,7 +2584,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (decoders > 0)
                 RecordStepPhase(s_phaseSample, Stopwatch.GetTimestamp() - sampleTicks, decoders);
             if (batch.Count == 0)
-                return results;
+                return;
 
             var ids = new string[batch.Count];
             var tokens = new int[batch.Count][];
@@ -2565,6 +2609,29 @@ namespace TensorSharp.Runtime.Scheduling
             try
             {
                 long started = Stopwatch.GetTimestamp();
+                // Every request decodes, draws greedily and nothing reads its logits: the model picks the next tokens where the
+                // logits are and the next step takes them from the stash (as the batched fused decode's device-sampled path
+                // does). A prompt's last chunk reads its logits: its draw is the first token, which a first-token constraint
+                // may narrow.
+                if (features == null && model.SupportsUnifiedGreedyIds && !FirstTokenLogitsDump.IsArmed
+                    && batch.TrueForAll(item => item.Sampled >= 0 && item.Work.Sequence.GetOrCreateSampler().IsPlainGreedyArgmax))
+                {
+                    var next = new int[batch.Count];
+                    if (model.TryForwardUnifiedGreedy(ids, tokens, starts, next))
+                    {
+                        RecordStepPhase(s_phaseIssue, started, stepRows);
+                        long ticks = (Stopwatch.GetTimestamp() - started) / batch.Count;
+                        if (batch.Count >= 2) ReportBatchedFusedDecodeSuccess(batch.Count);
+                        for (int i = 0; i < batch.Count; i++)
+                        {
+                            var seq = batch[i].Work.Sequence;
+                            CompleteUnified(seq, tokens[i].Length, batch[i].Sampled, null, ticks, results);
+                            seq.PendingDeviceToken = next[i];
+                            seq.PendingDevicePosition = seq.NumComputedTokens;
+                        }
+                        return;
+                    }
+                }
                 if (!model.TryForwardUnified(ids, tokens, starts, lastLogits, features))
                     throw new InvalidOperationException("the model declined a unified step whose slots it had prepared");
                 RecordStepPhase(s_phaseIssue, started, stepRows);
@@ -2581,7 +2648,6 @@ namespace TensorSharp.Runtime.Scheduling
                 foreach (var item in batch)
                     FailUnified(item.Work.Sequence, ex, results);
             }
-            return results;
         }
 
         /// <summary>The speculative context of a request whose prompt chunk at <paramref name="start"/> should feed its
@@ -2594,6 +2660,9 @@ namespace TensorSharp.Runtime.Scheduling
                 || _fusedSpecDeclined.Contains(seq.RequestId)
                 || !TryGetFusedSpecContext(spec, seq, start, out SpecSeqContext? ctx))
                 return null;
+            // A head the trunk keeps in step (DraftSelfCatchUp) takes this chunk's rows as the forward runs them.
+            if (ctx.Exec.PrefillSelfCatchUp && _model is IDraftHead follower)
+                follower.FollowPlainPrompt(seq.RequestId, seq.PromptTokens.Count);
             return ctx.Exec.PrefillsThroughContext ? ctx : null;
         }
 
@@ -2733,7 +2802,15 @@ namespace TensorSharp.Runtime.Scheduling
                     // head: 856 vs 627 ms) of its time to first token - and every
                     // request arriving behind it waited on that. Prefill plainly on
                     // the fused path; the late-arming branch below seeds the drafter
-                    // at the first decode step.
+                    // at the first decode step. A head the trunk keeps in step
+                    // (DraftSelfCatchUp) takes this chunk's rows as the trunk forwards
+                    // them, so its drafts still read the prompt.
+                    if (exec.PrefillSelfCatchUp && _model is IDraftHead follower)
+                    {
+                        // Over the request's own drafter state (a block drafter's ring), which its decode steps bind.
+                        (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
+                        follower.FollowPlainPrompt(null, seq.PromptTokens.Count);
+                    }
                     exec.Dispose();
                     return null;
                 }
@@ -3416,8 +3493,11 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             // Draft every sequence's block in one pass when the drafter can; otherwise
-            // (or if the batched pass declines) one draft per sequence.
+            // (or if the batched pass declines) one draft per sequence. Per-token draft
+            // heads chain in one pass the same way, and a sequence that cannot join that
+            // pass drafts on its own.
             bool draftedTogether = false;
+            bool[]? chained = null;
             int blockWidth = batched.BatchDraftBlockWidth;
             if (blockWidth > 0)
             {
@@ -3456,10 +3536,16 @@ namespace TensorSharp.Runtime.Scheduling
                             ctxs[lanes[j]].Exec.AcceptBatchDraft(blockTokens[j], blockConf[j], caps[j], drafts[lanes[j]], share);
                 }
             }
+            else if (n >= 2 && batched.SupportsBatchedDraftChain)
+            {
+                chained = TryBatchedDraftChain(batched, ctxs, requestIds, anchors, positions, kMaxes, drafts);
+            }
             if (!draftedTogether)
             {
                 for (int i = 0; i < n; i++)
                 {
+                    if (chained != null && chained[i])
+                        continue;
                     batched.BindDraftState(requestIds[i]);
                     ctxs[i].Exec.ProposeForBatch(anchors[i], positions[i], kMaxes[i], drafts[i]);
                 }
@@ -3642,6 +3728,66 @@ namespace TensorSharp.Runtime.Scheduling
                     $"verify={Ms(verified - drafted):F1} commit={Ms(committed - verified):F1} drafter={Ms(done - committed):F1} ms");
             }
             return true;
+        }
+
+        /// <summary>
+        /// The per-token draft heads of a batched step's sequences chained in one pass
+        /// (<see cref="IBatchedSpeculativeTarget.TryDraftChainBatch"/>), each from the rows its own draft would start with:
+        /// drafted one at a time, four Qwen3.8 Flash Next MTP conversations on an A40 spent 6.3 ms of a 43.4 ms step in four
+        /// draft runs, each one's readback waited for. Returns which sequences the pass drafted, or null when it drafted none
+        /// (fewer than two could join, or the model declined); the others draft on their own.
+        /// </summary>
+        private static bool[]? TryBatchedDraftChain(IBatchedSpeculativeTarget batched, SpecSeqContext[] ctxs, string[] requestIds,
+            int[] anchors, int[] positions, int[] kMaxes, List<int>[] drafts)
+        {
+            int n = ctxs.Length;
+            var lanes = new List<int>(n);
+            var tokens = new List<int[]>(n);
+            var rows = new List<float[]>(n);
+            var starts = new List<int>(n);
+            var caps = new List<int>(n);
+            for (int i = 0; i < n; i++)
+            {
+                if (kMaxes[i] <= 0 || !ctxs[i].Exec.SupportsBatchChain || !batched.CanBatchDraftChain(requestIds[i]))
+                    continue;
+                // Preparing reads (and may take) the drafter's held carry and replays a stash that cannot fold.
+                batched.BindDraftState(requestIds[i]);
+                if (!ctxs[i].Exec.TryPrepareBatchChain(anchors[i], positions[i], kMaxes[i],
+                        out int[]? laneTokens, out float[]? laneRows, out int start, out int cap))
+                    continue;
+                lanes.Add(i);
+                tokens.Add(laneTokens);
+                rows.Add(laneRows);
+                starts.Add(start);
+                caps.Add(cap);
+            }
+            if (lanes.Count < 2)
+                return null;
+            int m = lanes.Count;
+            var laneIds = new string[m];
+            var gates = new float[m];
+            var ids = new int[m][];
+            var probs = new float[m][];
+            var steps = new int[m];
+            for (int j = 0; j < m; j++)
+            {
+                laneIds[j] = requestIds[lanes[j]];
+                gates[j] = ctxs[lanes[j]].Exec.MinDraftProb;
+                ids[j] = new int[caps[j]];
+                probs[j] = new float[caps[j]];
+            }
+            long t0 = Stopwatch.GetTimestamp();
+            if (!batched.TryDraftChainBatch(laneIds, tokens.ToArray(), rows.ToArray(), starts.ToArray(), caps.ToArray(), gates,
+                    ids, probs, steps))
+                return null;
+            long share = (Stopwatch.GetTimestamp() - t0) / m;
+            var drafted = new bool[n];
+            for (int j = 0; j < m; j++)
+            {
+                ctxs[lanes[j]].Exec.AcceptBatchChain(ids[j], probs[j], steps[j], drafts[lanes[j]], share);
+                drafted[lanes[j]] = true;
+            }
+            return drafted;
         }
 
         /// <summary>Emit a batched-speculation lane's anchor that ends its sequence (a stop
@@ -3844,7 +3990,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// every per-sequence path with the sequence's cache active (the primary cache on
         /// the linear path, its own holder on the fused one).
         /// </summary>
-        private void MaybeCheckpointSharedPrefix(SequenceState seq) => RadixCache?.CaptureCheckpoint(seq);
+        /// <summary>A shared-prefix or prompt-end checkpoint of <paramref name="seq"/>; a prompt-end copy of a sequence in its own
+        /// slot waits for the next step (after its first token), a live primary cache's is taken now.</summary>
+        private void MaybeCheckpointSharedPrefix(SequenceState seq)
+            => RadixCache?.CaptureCheckpoint(seq, deferPromptEnd: !(_liveCacheValid && ReferenceEquals(_liveCacheSeq, seq)));
 
         /// <summary>How many leading prompt tokens of <paramref name="seq"/> the prefix
         /// cache can resume, or 0 (with <see cref="LastFusedContinuationDeclineReason"/>

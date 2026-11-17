@@ -20,7 +20,7 @@
 | 批处理执行 | 实现 `IBatchedPagedModel.ForwardBatch` 的模型会把本轮所有序列打包到一次模型调用中，显式传入 `positions`、`slotMapping`、`queryStartLoc` 与每序列 block table。 |
 | 回退执行 | 路径选择集中在 `ExecutionPlanner`：模型+后端能力（`ExecutionCapabilities`）、运维覆盖（`ExecutionOptions`）与每步请求特征共同产出 `ExecutionPlan`（选中路径、回退链、被拒原因）。模型仍可对某个具体 batch 抛出 `NotSupportedException`，该步会落入计划中的下一个候选，最终止于按序列 KV-swap 路径。 |
 | 原生注意力 | `TSGgml_PagedAttentionForward` 在 C++ 中聚合分页 K/V 并派发 `ggml_flash_attn_ext`；GPT OSS 使用 `TSGgml_PagedAttentionForwardWithSinks`。 |
-| 投机解码 | 为单序列（无并发）请求提供可选的投机解码：学习型草稿头（内嵌 NextN / MTP、Gemma 4 独立的 `gemma4-assistant` GGUF、Qwen 3.8 Flash Next 的共享 MTP 头）、块级草稿器（DSpark、DFlash）以及无需权重的 n-gram 投机器。`BatchExecutor` 为实现了 `ISpeculativeTarget` 的模型驱动共享的 `SpeculativeExecution` 起草 / 验证 / 回滚核心。默认关闭；CLI 与服务端用 `--spec` 或 `--draft-model` 开启。详见 [投机解码（MTP / NextN）](#投机解码mtp--nextn)。 |
+| 投机解码 | 为单序列（无并发）请求提供可选的投机解码，在共享解码运行时（Qwen 3.5 家族、Qwen 3.8 Flash Next 及其服务的其他模型族）上并发请求也可投机：学习型草稿头（内嵌 NextN / MTP、Gemma 4 独立的 `gemma4-assistant` GGUF、Qwen 3.8 Flash Next 的共享 MTP 头）、块级草稿器（DSpark、DFlash）以及无需权重的 n-gram 投机器。`BatchExecutor` 为实现了 `ISpeculativeTarget` 的模型驱动共享的 `SpeculativeExecution` 起草 / 验证 / 回滚核心。默认关闭；CLI 与服务端用 `--spec` 或 `--draft-model` 开启。详见 [投机解码（MTP / NextN）](#投机解码mtp--nextn)。 |
 | 并发吞吐 | 通用的主机驻留 `BatchedPaged` 路径本身不能扩展合计 decode 吞吐；Gemma 4 的一次测量在约 **69 tok/s** 处饱和。模型实现 `TryForwardBatchedFusedDecode` 时，per-sequence-fused 路径会先尝试用一张设备图处理活跃 decode 子集，仅在该批次不满足条件或被拒绝时才按请求回退。参见[并发实测表现](#并发实测表现)。 |
 | 队列 API | `/api/queue/status` 报告引擎的实时负载：正在处理的请求、等待批处理槽位的请求与已完成的请求。引擎之外没有任何地方把请求串行化。 |
 | 扩散模型 | DiffusionGemma 不进入这套自回归 `ForwardBatch` 契约。CLI 生成使用 `DiffusionGemmaSampler`；Web UI 使用 `DiffusionBatchScheduler` 在 block 边界批处理去噪工作。 |
@@ -40,9 +40,8 @@
   decode，这大约是 **7.7 倍的每 token 开销**，而且随总历史长度增长。
 - **默认并发路径由能力决定。** 对声明了 `SupportsPerSequenceFusedForward` 的模型，
   `ExecutionPlanner` 在 N >= 2 时选择 `PerSequenceFused`。executor 会先把满足条件的
-  decode 子集交给 `TryForwardBatchedFusedDecode`，让一张图摊薄权重读取（包括 Qwen
-  3.5/3.6/3.8 在 GGML CUDA/Metal 上的 slot-stable arena——在 CUDA 上它也支持 K/IQ 量化的
-  token embedding——以及 Gemma 4 支持按序列缓存容量的内核）；模型拒绝时，同一步再回退为
+  decode 子集交给 `TryForwardBatchedFusedDecode`，让一张图摊薄权重读取（包括 Gemma 4 支持按序列缓存容量的内核）。共享解码运行时的模型族（包括 Qwen 3.5 / 3.6 / 3.8
+  家族与 Qwen 3.8 Flash Next）改走统一步：所有运行中请求的行在同一次前向中、各自的 slot 上计算；模型拒绝时，同一步再回退为
   N 个相互隔离的 fused 前向；服务端会记录第一次成功的批次和第一次被拒绝的原因。
 - **确实有效的部分。** 迭代级调度、前缀共享（默认为 Radix 树）、抢占、按序列原生 slot、
   per-request fused holder，以及按能力启用的 token 批量融合 decode。批次被拒绝时
@@ -289,17 +288,16 @@ logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输�
 | `block` | 通过 `--draft-model` 加载的块级草稿器：DeepSeek V4 DSpark，以及用于 Muse-Glimmer 与 Qwen 3.5 家族的 DFlash / DFlash2。DeepSeek V4.1 DSpark 是实验性的：`ggml_cuda` / `ggml_cpu` 上的 `deepseek41-dspark` 草稿器，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。 |
 | `ngram` | 无需权重：在序列自身的 token 上做后缀匹配。 |
 
-草稿被拒时，Qwen 3.5 家族主干恢复其 GatedDeltaNet 递归状态（GGML 融合验证为每一行保留快照，
-`ggml_metal` 上超过 8 行的验证只保留最后三份，并在设备上提交被接受的那一份；更早的拒绝则恢复并重新前向
-已接受前缀）；Gemma 4 回退注意力 KV 位置，并放回被验证覆盖的滑动窗口行（其草稿器在给定 `(token, h)`
+草稿被拒时，Qwen 3.5 家族或 Qwen 3.8 Flash Next 主干（共享解码运行时）无需第二次前向即可提交已接受行之后的
+GatedDeltaNet 状态（GGML 计算图为每个验证行保留状态；逐算子路径保留窗口的输入并重放已接受前缀）；Gemma 4 回退注意力 KV 位置，并放回被验证覆盖的滑动窗口行（其草稿器在给定 `(token, h)`
 时无状态）；GLM-5.3-Flash 恢复其 KDA 状态快照（原生执行器上为设备副本），再重新前向已接受的前缀。
 
 投机只在模型声明有收益（`SpeculationProfitable`）时启用，这由各模型自己决定：Qwen 3.5/3.6/3.8 与
 GLM 5.2 / GLM-5.3 在所有后端上；Gemma 4 在 ggml 后端（含 `ggml_cpu`）与纯 C# `cuda` 后端上；
-Qwen 3.8 Flash Next 在其 GGML token 计算图路径上；GLM-5.3-Flash 在其 KDA 回滚可用时；Muse Spark 在 GGML 后端上（仅 n-gram），其原生 `--tp` 除外；DeepSeek V4 / V4.1
+Qwen 3.8 Flash Next 在其可加载的所有后端上；GLM-5.3-Flash 在其 KDA 回滚可用时；Muse Spark 在 GGML 后端上（仅 n-gram），其原生 `--tp` 除外；DeepSeek V4 / V4.1
 与 Muse-Glimmer 只在加载了各自草稿器时。Nemotron-H 直接拒绝投机（`SpeculationRefusal`）。GPT OSS、Mistral 3 与
-Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都走标准 decode。并发批次从不投机——当有多个
-序列在运行时，每个序列都走普通的批处理 / 回退步骤。无法挂载的 `--draft-model`（草稿器不匹配或不完整，
+Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都走标准 decode。在共享解码运行时之外，并发批次从不投机——当有多个
+序列在运行时，每个序列都走普通的批处理 / 回退步骤；运行时的统一步则在一次前向中验证每个投机请求的窗口。无法挂载的 `--draft-model`（草稿器不匹配或不完整，
 或模型拒绝投机）会在服务端启动时立即失败（`SpeculationStartupValidation`）。`--spec` 不会关闭 Radix
 前缀缓存；Qwen 3.5 家族的 NextN 头会在复用前缀之后重启自己的私有缓存（见
 [Arming after a reused KV prefix](speculative_decoding.md#arming-after-a-reused-kv-prefix)，英文）。
@@ -312,7 +310,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 |---|---|---|
 | Mistral 3 | 默认 `ForwardBatch` 路径。使用分页 K/V、YaRN 感知位置、原生分页注意力，并在 prompt 准备后注入视觉 embedding。已在 Ministral-3-14B 上验证；长上下文原生分页注意力比旧按序列 GGML 路径快约 21%。 | `TS_PAGED_ATTN_KERNEL` 选择 `native`、`tensor` 或 `managed`。 |
 | Gemma 4 | 密集文本负载默认走批处理路径，覆盖逐层 SWA / 全局注意力、可变 head dim、PLE、KV donor 层别名。当前回退场景包括待注入多模态 embedding、MoE 层与块量化 KV cache。已完成请求的 request-owned fused K/V holder 可被保留，用于精确前缀续接。并发（N>=2）的 decode 步骤跑 token 批量融合内核（`TSGgml_Gemma4ModelDecodeBatched`：一张图、每序列一个 token、权重只读一次），它覆盖 per-layer embedding、KV-donor 层、已回绕的 SWA 环，以及每个序列不同的缓存容量（保留前缀的克隆比新建缓存小），因此 E2B/E4B 不再回退到轮询。MoE 检查点仍走轮询，除非设置 `TS_BATCHED_FUSED_MOE=1`。可选地通过独立 `gemma4-assistant` 草稿 GGUF 做 MTP 投机解码。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭 retained-holder 续接。只需 `--draft-model` 即可启用投机（显式 `--no-spec` 可否决）。 |
-| Qwen 3.5 / 3.6 / 3.8 family | 共享解码器运行时（`Qwen35RuntimeModel`）。每个请求有自己的 slot：attention K/V 加上 GatedDeltaNet 递归状态。运行中请求的 decode 与 verify 步作为一张图执行（GGML 上为分页批量前向，其他后端为按 slot 的程序）。已结束的会话与共享前缀检查点由 radix 前缀缓存保留，仅限精确前缀，因为递归无法回退。投机使用内嵌的 NextN/MTP 块、DFlash / DFlash2 草稿器或 n-gram。`--backend cuda` 上的稠密 NVFP4 检查点使用直连 `Qwen35CudaModel` 引擎。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭保留；`--spec` 开启投机。 |
+| Qwen 3.5 / 3.6 / 3.8 family | 共享解码器运行时（`Qwen35RuntimeModel`）。每个请求有自己的 slot：attention K/V 加上 GatedDeltaNet 递归状态。运行中请求的 decode 与 verify 步作为一张图执行（GGML 上为分页批量前向，其他后端为按 slot 的程序）。已结束的会话与共享前缀检查点由 radix 前缀缓存保留，仅限精确前缀，因为递归无法回退。投机使用内嵌的 NextN/MTP 块、DFlash / DFlash2 草稿器或 n-gram。所有后端（包括 `--backend cuda` 上的稠密 NVFP4 检查点）都运行这一运行时。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭保留；`--spec` 开启投机。 |
 | GPT OSS | 默认批处理路径。支持 Q/K/V/O bias、YaRN RoPE、滑窗层、attention sinks、MXFP4 MoE expert 与原生 sinks 注意力。已与按序列路径做贪心正确性验证；性能仍主要受逐层图构建限制。在 GGML 后端上（非 TP），并发 decode 改走 per-request fused holder 与 token 批量融合 decode，在 `ggml_cuda` / `ggml_vulkan` 上使用 slot-stable arena。每个结束请求的 holder 会作为它所属会话的终态保留下来并交给下一轮，因此并行的会话各自续接自己的状态（此前，与其他会话并行运行过的会话在下一轮什么都复用不了）。不走 arena 时（Metal），token 批量 decode 的计算图上下文超过了原生上下文池的缓冲区，每个并发步骤都退回到一次只处理一个序列；现在八个并行会话用时 26.8 秒，而不是 45.2 秒。 | — |
 | Nemotron-H | 默认批处理路径。Attention 层使用分页 K/V；Mamba2 层使用每槽位 conv/SSM 状态池；MoE 层使用批处理 expert 内核；准备好的图像 / 音频 embedding 可注入到批处理 hidden state。页面无法在会话中途恢复递归状态，因此结束的批处理序列的 Mamba2 slot 会和它的池块一起作为会话终态保留，并以精确长度交给下一轮：八个并行会话从什么都复用不了变为每一轮都复用上一轮，完成时间缩短 12%。 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 step。 |
 | GLM 5.x | 没有 `ForwardBatch`：MLA 每个 token 只存一行压缩表示，DSA indexer 又要对同一段连续历史打分，没有分页 KV 布局可批。并发改由原生**序列 slot** 承担（`TSGgml_GlmSlotAlloc` / `SetActiveSlot` / `SlotFree`）——绑定请求只是切换活动 slot，不搬运 KV 字节，每个 slot 的计算图独立缓存与捕获。在此之上默认启用批量融合 decode（一张图、每序列一个 token，整批只读一遍权重）：4 个并发请求时合计 decode 提速 1.81×。批处理会改变 GEMM 形状，而 2 bit MoE 可能把这点差别放大成不同的专家选择。 | `TS_BATCHED_FUSED_DECODE=0` 关闭批量 decode。 |
@@ -320,7 +318,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 | Muse-Glimmer | 没有 `ForwardBatch`（它不是 `IBatchedPagedModel`）：并发请求走按序列 KV 换入回退路径，把每个序列的 K/V 快照到主机内存，`--tp` 下同样如此。属于 Radix 页面家族（主机 slab 页面）。只在加载了 DFlash 草稿器（`--draft-model`）时投机。 | 没有批处理开关；`TS_MUSE_GLIMMER_*` 是内核 A/B 开关（见 [Muse-Glimmer 模型卡](models/muse-glimmer_zh-cn.md#7-环境变量)）。 |
 | Muse Spark | 在 `ggml_cuda` / `ggml_vulkan` 上，原生整模型执行器用自己的**序列 slot** 处理并发（每个 slot 在各层所在 GPU 上持有 F16 K/V，`ggml_cuda` 上 `--tp N` 时则按 KV 组切分到各 GPU；46 个滑动窗口层使用环形缓冲）：所有运行中请求的 decode 步共享一张带按序列掩码的计算图，同时到达的文本提示在一张图中 prefill，图像嵌入在图内替换占位行。完成的 slot 会被保留并移交给延续该会话的请求（可先回退），模板前导与共享系统提示会被写入一个检查点 slot，再克隆进新会话。按层切分在 CUDA GPU 间流水化 prefill 时，单个 prompt 按模型选择的步长 prefill（8,192 token；见下文 `TS_SCHED_SOLO_PREFILL_CHUNK`）。逐算子路径（`TS_MUSE_SPARK_NATIVE=0`，以及 `ggml_vulkan` 上的 `--tp`）属于 Radix 页面家族；它的打包分页 `ForwardBatch` 需要 F32 KV 且只接受纯文本请求。 | `TS_MUSE_SPARK_NATIVE=0` 选择逐算子路径；`TS_MUSE_SPARK_PLAN_SLOTS` 在放置规划中预留 slot；`TS_MUSE_SPARK_PIPELINE=0` 关闭流水化 prefill（见 [Muse Spark 卡片](models/muse-spark_zh-cn.md#选项)）。 |
 | DeepSeek V4 / V4.1 | 没有 `ForwardBatch`：压缩注意力缓存没有分页布局。并发由原生执行器的序列 slot 承担（纯 C# `cpu` 与直连 CUDA `cuda` 执行器保持串行）。默认启用的 token 批量融合 decode 每步只读一遍权重，最多 16 个序列，更多时分窗口执行；加载了 DSpark 草稿器时不启用。V4.1 会把已结束会话的 slot 保留给它的下一轮（加载了 DSpark 草稿器时不保留）。 | `TS_BATCHED_FUSED_DECODE=0`；V4.1 保留 slot 的预算由 `TS_DSV41_RETAINED_CACHE_MB`（默认 2048）决定。 |
-| Qwen 3.8 Flash Next（`qwen4exp`） | 共享解码器运行时（`Qwen4ExpRuntimeModel`），与 Qwen 3.5 相同的 slot、批量步与保留机制，另加该家族的 hyper-connection 流、PLE n-gram 行与 QSA。`--layer-split N` 按整层放置，`--tp N` 在 GGML 上运行按 rank 的图。共享 MTP 头或 DFlash2 草稿器（`--draft-model`）负责投机。`--backend cuda` 保留直连 `Qwen4ExpCudaModel` 引擎。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭保留；`TS_MOE_HOT_TIER_GB` 设定主机专家在加速器上的 tier 大小。 |
+| Qwen 3.8 Flash Next（`qwen4exp`） | 共享解码器运行时（`Qwen4ExpRuntimeModel`），与 Qwen 3.5 相同的 slot、批量步与保留机制，另加该家族的 hyper-connection 流、PLE n-gram 行与 QSA。`--layer-split N` 按整层放置，`--tp N` 在 GGML 与 `cuda` 上运行按 rank 的图。共享 MTP 头或 DFlash2 草稿器（`--draft-model`）负责投机。`--backend cuda` 同样运行这一运行时，其图运行在 CUDA 图执行器上。 | `TS_RETAINED_FUSED_CACHE_MAX=0` 关闭保留；`TS_MOE_HOT_TIER_GB` 设定主机专家在加速器上的 tier 大小。 |
 | DiffusionGemma | 独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求，并可选择批处理活跃 canvas。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`、`DIFFUSION_BATCHED_FORWARD`；`DIFFUSION_NO_FUSED_DECODE=1` 关闭 GGML 融合整模型 diffusion decode。 |
 
 ### Radix 前缀缓存
@@ -334,9 +332,9 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
   Mistral 3、Hunyuan Dense、Muse-Glimmer、Nemotron-H）。
 - **终态（end state）**：模型自己持有的续接状态。Gemma 4、Qwen 3.5 / 3.6 / 3.8 家族（`qwen35`、
   `qwen35moe`、`qwen3next`）与 Qwen 3.8 Flash Next 可以复制它，因此已结束的会话会被保留给下一轮，
-  共享公开前缀末尾的状态会被做成检查点并克隆到每个新会话中。前提是它们运行按请求的 fused holder：
-  GGML 后端上的 Gemma 4、`ggml_cuda` / `ggml_metal` 上且非 TP 的 Qwen 3.5 家族、GGML token-span 路径上的
-  Flash Next，且 `TS_PER_SEQ_FUSED=0` 时一律没有；其他情况下只续接主缓存。
+  共享公开前缀末尾的状态会被做成检查点并克隆到每个新会话中。前提是它们运行按请求的状态：
+  GGML 后端上使用 fused holder 的 Gemma 4，以及在共享解码运行时 slot 上、递归状态可复制时的 Qwen 3.5 家族与
+  Flash Next（多节点流水线除外），且 `TS_PER_SEQ_FUSED=0` 时一律没有；其他情况下只续接主缓存。
   GLM 5.x（原生执行器）与 DeepSeek V4.1 无法复制原生 slot：只能把它整体交给延续该会话的那一轮（只在
   `TS_RETAINED_FUSED_CACHE_MAX` 不为 0 时；V4.1 在加载了 DSpark 草稿器时不交出），也不做共享前缀检查点。
 
@@ -346,8 +344,8 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 渲染出的 token 完全相同（包括工具 schema、聊天模板与思考设置），止于每个模型可续接的边界与显式的缓存断点，
 并且总会留下至少一个 prompt token 去计算。下文的会话作用域规则照常适用，媒体身份也一样（区间以内容为键，
 复用长度不会切断区间）。复用能否越过媒体区间取决于各家族的前缀缓存能力：Gemma 4、Qwen 3.5 / 3.6 / 3.8
-家族与 GPT OSS 可以越过；其他树家族（Mistral 3、Nemotron-H、Muse-Glimmer、Hunyuan Dense、
-Qwen 3.8 Flash Next、GLM 5.x、DeepSeek V4 / V4.1）的复用止于第一张图片、视频帧或音频片段。DiffusionGemma
+家族、Qwen 3.8 Flash Next 与 GPT OSS 可以越过；其他树家族（Mistral 3、Nemotron-H、Muse-Glimmer、Hunyuan Dense、
+GLM 5.x、DeepSeek V4 / V4.1）的复用止于第一张图片、视频帧或音频片段。DiffusionGemma
 与图像/视频模型不使用它。
 
 在 Mac 上，字节数由 macOS 能给出的内存约束。那里 GPU 与其他一切共用同一块内存，保留的状态与权重一样被固定（wired），
@@ -419,7 +417,7 @@ chat 层的原始 token 拼接遵循同样的身份。每个生成的回合都�
 图片之前的全部内容。
 
 无法精确越过媒体续接缓存的模型声明 `SupportsReuseAcrossMediaSpan = false`，此时复用止于第一个媒体区间。
-Radix 树从各家族的前缀缓存能力中读取这条规则，只有 Gemma 4、Qwen 3.5/3.6/3.8 家族与 GPT OSS 能越过媒体区间续接（见
+Radix 树从各家族的前缀缓存能力中读取这条规则，只有 Gemma 4、Qwen 3.5/3.6/3.8 家族、Qwen 3.8 Flash Next 与 GPT OSS 能越过媒体区间续接（见
 [Radix 前缀缓存](#radix-前缀缓存)）。Gemma 4 使用绝对位置。Qwen 3.5/3.6 的 M-RoPE 提示位置在图片
 之后被压缩，位置表之外的每个 token（decode、投机 verify、文本续接）都按其 KV 下标加上该序列的
 M-RoPE 偏移（delta）旋转，而每个 holder、检查点和检查点文件（格式版本 2）都保存这个 delta；因此后续
@@ -478,7 +476,7 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | `TS_BATCHED_FUSED_DECODE` | `1` | `0` 在 per-seq fused 路径内关闭真正的 token 批量融合 decode（一张图同时 decode 全部 N 个序列）。 |
 | `TS_BATCHED_FUSED_MOE` | `0` | `1` 允许 Gemma 4 MoE 检查点走 token 批量融合 decode；默认关闭，因为在实测的 16 GB 显卡上它并不比轮询快。 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 运行中请求上限，至少 `4` | 对声明支持保留 holder 的模型，为下一轮保留多少个已结束会话的终态：Gemma 4 K/V、Qwen 3.5/3.6/3.8 的 attention K/V 与 GDN 递归状态、Qwen 3.8 Flash Next 的按序列 holder、DeepSeek V4.1 的原生 slot，以及 GLM 5.x 交出的原生 slot。每个都会占用模型完整的 per-request 续接状态。未设置时跟随 `TS_SCHED_MAX_RUNNING_SEQS`，使每个并行运行的请求都保有自己的终态；`0` 关闭保留。 |
-| `TS_PREFIX_CHECKPOINTS_MAX` | `4` | Radix 树在共享提示前缀结束处（由 chat 层在请求上标记的边界）保留多少个模型完整状态的检查点；每个新会话从其中一个的副本开始。适用于能复制自身状态的模型（GGML 后端上的 Gemma 4；`ggml_cuda` / `ggml_metal` 上的 Qwen 3.5/3.6/3.8，非 TP；GGML token-span 路径上的 Qwen 3.8 Flash Next，包括 `--layer-split N` 按层切分时）。一个提示在每个声明的边界（系统指令末尾与整个共享前缀末尾）各发布一个检查点，因此 4 可覆盖同时预热两种思考模式的主机；`0` 关闭检查点。 |
+| `TS_PREFIX_CHECKPOINTS_MAX` | `4` | Radix 树在共享提示前缀结束处（由 chat 层在请求上标记的边界）保留多少个模型完整状态的检查点；每个新会话从其中一个的副本开始。适用于能复制自身状态的模型（GGML 后端上的 Gemma 4；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，只要其 slot 的递归状态可复制，多节点流水线除外）。一个提示在每个声明的边界（系统指令末尾与整个共享前缀末尾）各发布一个检查点，因此 4 可覆盖同时预热两种思考模式的主机；`0` 关闭检查点。 |
 | `TS_MM_EMBEDDING_CACHE_MB` | 主机内存的 1/64，512-4096 MB | 视觉/音频嵌入缓存的字节预算，缓存以媒体内容（SHA-256）为键；超出后淘汰没有被已准备提示引用的最近最少使用条目。 |
 | `TS_KV_INITIAL_TOKENS` | `0` | 缓存创建时、任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口）。缓存仍按需增长。 |
 | `TS_KV_GENERATION_RESERVE_MAX` | `0` | 请求预先保留的 K/V（prompt + max_new_tokens）中生成部分的上限；`0` = 不限制。超过上限后缓存按需增长。 |
@@ -516,8 +514,7 @@ TensorAgent 为每个模型在应用缓存目录下挂一个。CLI 只在内存�
 CLI 与服务端均支持。默认按模型自动选择（模型权重低于 F32 时为 `f16`，否则为 `f32`）；
 块量化档位（`q8_0`、`q4_0`）要求原生 GGML
 flash-attention 路径，`q4_0`（约为 f32 的 1/7）面向 KV cache 主导内存占用的
-128K–256K 超长上下文。Qwen3.8-Flash-Next 的直接引擎（`--backend cuda`）有自己的 `q8_0`
-注意力内核，默认使用 `q8_0`，`q4_0` 时保持 `f16`（见 `docs/models/qwen38-flash-next_zh-cn.md`）。
+128K–256K 超长上下文。
 
 ## 后续工作
 

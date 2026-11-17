@@ -72,6 +72,7 @@ internal sealed class PrefixTreeOptions
     public IPrefixTreePageHost? PageHost { get; init; }
     public IPayloadValidator? PayloadValidator { get; init; }          // null = no model calls (tests, benches)
     public Func<ResourceClass, long>? QuerySpareBytes { get; init; }   // −1 = unknown
+    public Action<long[]>? QueryAllSpareBytes { get; init; }           // every class at once (an eviction pass reads them once)
     public ResourceVector OptionCapBytes { get; init; }                // 0 = auto; no env var feeds it (tests, RadixTreeBench)
     public long HostRamBytes { get; init; }                            // auto HostKv cap = 50%; 0 = unknown
     public long PoolPagesCap { get; init; }                            // BlockPool.NumBlocks; 0 = unbounded
@@ -549,7 +550,11 @@ internal sealed class PrefixTree
                 continue;
             }
             ClampReasons local = ClampReasons.None;
-            if (Rules.ClampLength(length, r, ref local) != length)
+            // The prompt's end serves only a state that kept the prompt's last logits: anything else
+            // leaves the last token to forward for them (K6).
+            if (r.PromptEnd && length >= r.KeyLength && c.EndState.PromptLogits is null)
+                local |= ClampReasons.LeaveOne;
+            if (local != ClampReasons.None || Rules.ClampLength(length, r, ref local) != length)
             {
                 CandidateKind declined = primary ? CandidateKind.PrimaryResident : CandidateKind.EndState;
                 clamps |= local;
@@ -1531,7 +1536,7 @@ internal sealed class PrefixTree
     {
         long cap = AbsoluteCap(cls);
         if (cls == ResourceClass.PoolPages) return cap;
-        long spare = _options.QuerySpareBytes?.Invoke(cls) ?? -1;
+        long spare = _sparePass ? _spare[(int)cls] : _options.QuerySpareBytes?.Invoke(cls) ?? -1;
         if (spare >= 0) cap = Math.Min(cap, _cached[cls] + Math.Max(0, spare - _runningReserve[cls]));
         return cap;
     }
@@ -1578,6 +1583,23 @@ internal sealed class PrefixTree
     }
 
     /// <summary>Re-evaluates the per-scope quota and scope activity (tier inputs), relinking what changed.</summary>
+    // The spare bytes of an eviction pass (EnforceCaps, RelieveMemoryPressure), read once at its start: each class's
+    // EffectiveCap asked the model, twice a pass, and on CUDA every device class asked the driver for its free memory
+    // (Qwen3.8-27B on an RTX PRO 4000: 3.0 ms of the 3.8 ms between one request's end and the next one's first step).
+    // A pass frees nothing before it ends (evicted payloads drain after it), so the reading holds throughout.
+    private readonly long[] _spare = new long[ResourceVector.ClassCount];
+    private bool _sparePass;
+
+    /// <summary>Reads every class's spare bytes for the pass about to run; false (nothing to end) inside one already, or
+    /// where the options query each class alone.</summary>
+    private bool BeginSparePass()
+    {
+        if (_sparePass || _options.QueryAllSpareBytes is null) return false;
+        _options.QueryAllSpareBytes(_spare);
+        _sparePass = true;
+        return true;
+    }
+
     internal void RefreshBudgets()
     {
         long total = 0;
@@ -1604,22 +1626,30 @@ internal sealed class PrefixTree
     /// <summary>Evicts until every class is within its effective cap (I21). Returns false when a cap still is exceeded.</summary>
     internal bool EnforceCaps(EvictionTier ceiling, ReleaseReason why = ReleaseReason.Evicted)
     {
-        RefreshBudgets();
-        bool ok = true;
-        for (int i = 0; i < ResourceVector.ClassCount; i++)
+        bool pass = BeginSparePass();
+        try
         {
-            var c = (ResourceClass)i;
-            long cap = EffectiveCap(c);
-            if (_cached[c] > cap)
+            RefreshBudgets();
+            bool ok = true;
+            for (int i = 0; i < ResourceVector.ClassCount; i++)
             {
-                if (s_capDebug)
-                    Console.Error.WriteLine($"[prefix-cap] {c} cached={_cached[c] >> 20}MiB cap={cap >> 20}MiB " +
-                        $"option={AbsoluteCap(c) >> 20}MiB spare={(_options.QuerySpareBytes?.Invoke(c) ?? -1) >> 20}MiB " +
-                        $"reserve={_runningReserve[c] >> 20}MiB");
-                ok &= Evict(c, _cached[c] - cap, why, ceiling);
+                var c = (ResourceClass)i;
+                long cap = EffectiveCap(c);
+                if (_cached[c] > cap)
+                {
+                    if (s_capDebug)
+                        Console.Error.WriteLine($"[prefix-cap] {c} cached={_cached[c] >> 20}MiB cap={cap >> 20}MiB " +
+                            $"option={AbsoluteCap(c) >> 20}MiB spare={(_sparePass ? _spare[i] : _options.QuerySpareBytes?.Invoke(c) ?? -1) >> 20}MiB " +
+                            $"reserve={_runningReserve[c] >> 20}MiB");
+                    ok &= Evict(c, _cached[c] - cap, why, ceiling);
+                }
             }
+            return ok;
         }
-        return ok;
+        finally
+        {
+            if (pass) _sparePass = false;
+        }
     }
 
     private static readonly bool s_capDebug = Environment.GetEnvironmentVariable("TS_PREFIX_RELEASE_DEBUG") == "1";
@@ -1707,6 +1737,16 @@ internal sealed class PrefixTree
     /// used scope's newest leaf.
     /// </summary>
     internal void RelieveMemoryPressure(PressureLevel level)
+    {
+        bool pass = BeginSparePass();
+        try { RelieveMemoryPressureInPass(level); }
+        finally
+        {
+            if (pass) _sparePass = false;
+        }
+    }
+
+    private void RelieveMemoryPressureInPass(PressureLevel level)
     {
         RefreshBudgets();
         if (level == PressureLevel.Moderate)

@@ -131,11 +131,13 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>The fewest otherwise-unprotected prompt tokens an automatic prompt-tail
         /// checkpoint of a recurrent model must protect, for a request whose reply is rendered
         /// back verbatim (<see cref="SequenceState.PromptTailCheckpointOptional"/>; every other
-        /// request always takes it). The checkpoint stops prefill one
-        /// token short of the prompt end, so it costs one extra single-row forward (18.7 ms
-        /// on Qwen3.8-27B / RTX 5090) on every request it is taken for; a shorter unprotected
-        /// tail is cheaper to prefill again on the rare exact retry. Default 1024; 0 takes
-        /// one on every prompt. Env: <c>TS_SCHED_PROMPT_TAIL_CHECKPOINT_MIN</c>.</summary>
+        /// request always takes it). The checkpoint copies the request's state at the prompt's
+        /// end (keeping the last row's logits for an exact retry); where it cannot keep them (a
+        /// prompt with media, a family that forwards more than one tail token) it stops prefill
+        /// one token short of the prompt end instead, an extra single-row forward (18.7 ms on
+        /// Qwen3.8-27B / RTX 5090). Either is paid on every request it is taken for; a shorter
+        /// unprotected tail is cheaper to prefill again on the rare exact retry. Default 1024; 0
+        /// takes one on every prompt. Env: <c>TS_SCHED_PROMPT_TAIL_CHECKPOINT_MIN</c>.</summary>
         public int PromptTailCheckpointMinTokens { get; init; } = 1024;
 
         /// <summary>

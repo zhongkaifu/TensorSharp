@@ -157,7 +157,7 @@ The reserved `environment` object maps environment-variable names to **strings**
 {
   "environment": {
     "MAX_CONTEXT": "40960",
-    "TS_Q35_NINFER_DRAFT_PTX": "${appBaseDirectory}/cuda_kernels/tensorsharp_q35_ninfer_draft.fatbin"
+    "TS_Q4E_HC_Q8": "1"
   }
 }
 ```
@@ -182,11 +182,6 @@ the `"otel-endpoint"` option (`--otel-endpoint`) wins over both:
   }
 }
 ```
-
-The [NInfer guide](README-ninfer.md) provides two shared CLI/Server.Host presets,
-[40K](qwen3.8-27b-ninfer.json) and [64K](qwen3.8-27b-ninfer-64k.json), including
-the embedded DFlash module path. The 64K optimized profile's actual GPU/model
-qualification is separate from parsing or configured context capacity.
 
 ## Auto-download
 
@@ -292,11 +287,10 @@ TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 | [`qwen3.6-27b.json`](qwen3.6-27b.json) | Qwen3.6-27B + vision | Multimodal LLM |
 | [`qwen3.6-35b-a3b.json`](qwen3.6-35b-a3b.json) | Qwen3.6-35B-A3B (MoE) + vision | Multimodal MoE LLM |
 | [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json) | Qwen3.8 Flash Next (ISTA-DASLab GSQ-RCO Q2_0, two shards) + vision + DFlash2 Q4_K_M drafter | Multimodal MoE LLM; the fastest setup on Apple Silicon (`ggml_metal`): 50-51 tok/s long-generation decode, 4K-token prompt TTFT 4.4-4.6 s, 55.5-56.3 tok/s for four requests at once on an M5 Pro (48 GB) |
-| [`qwen3.8-flash-next-cuda.json`](qwen3.8-flash-next-cuda.json) | Qwen3.8 Flash Next (ISTA-DASLab GSQ-RCO Q2_0) + shared MTP head | MoE LLM; the fastest setup on NVIDIA (direct `cuda` engine): 141-250 tok/s decode (247-250 on a long generation), 4K-token prompt TTFT 0.65-0.67 s on an RTX 5090; ~45 GB of host RAM |
-| [`qwen3.8-flash-next-cuda-4lanes.json`](qwen3.8-flash-next-cuda-4lanes.json) | Overlay for `qwen3.8-flash-next-cuda.json` | Four sequence lanes for concurrent users: 243-299 tok/s for four requests at once on an RTX 5090 |
+| [`qwen3.8-flash-next-cuda.json`](qwen3.8-flash-next-cuda.json) | Qwen3.8 Flash Next (ISTA-DASLab GSQ-RCO Q2_0) + shared MTP head | MoE LLM on NVIDIA (`--backend cuda`, the shared runtime on the CUDA graph executor); ~45 GB of host RAM. Not re-measured since the direct `cuda` engine was removed; that engine measured 141-250 tok/s decode (247-250 on a long generation) and 4K-token prompt TTFT 0.65-0.67 s on an RTX 5090 |
 | [`qwen3.8-flash-next-ud-q2_k_xl.json`](qwen3.8-flash-next-ud-q2_k_xl.json) | Qwen3.8 Flash Next (UD-Q2_K_XL, three shards) + vision + shared MTP head | The previous `ggml_metal` preset, for the UD-Q2_K_XL files |
 | [`qwen3.8-27b-metal-dflash2.json`](qwen3.8-27b-metal-dflash2.json) | Qwen3.8-27B (UD-IQ3_XXS) + vision + DFlash2 Q4_K_M drafter | Multimodal LLM on Apple Silicon (`ggml_metal`), speculative decoding: 34.5 tok/s long-generation decode (21 plain), 49.7 after a 4K-token prompt, 39-52 on code and lists on an M5 Pro |
-| [`qwen3.8-27b-cuda-dflash2.json`](qwen3.8-27b-cuda-dflash2.json) | Qwen3.8-27B (UD-IQ3_XXS) + vision + DFlash2 Q4_K_M drafter | Multimodal LLM on NVIDIA (`ggml_cuda`), speculative decoding: 155-178 tok/s long-generation decode (89-96 plain), 168-192 for four requests at once on an RTX 5090. On RTX 50-series GPUs the [NInfer presets](README-ninfer.md) are faster |
+| [`qwen3.8-27b-cuda-dflash2.json`](qwen3.8-27b-cuda-dflash2.json) | Qwen3.8-27B (UD-IQ3_XXS) + vision + DFlash2 Q4_K_M drafter | Multimodal LLM on NVIDIA (`ggml_cuda`), speculative decoding: 155-178 tok/s long-generation decode (89-96 plain), 168-192 for four requests at once on an RTX 5090 |
 | [`gemma-4-e4b.json`](gemma-4-e4b.json) | Gemma-4 E4B **uncensored** (TrevorJS's community build, Q8_0) + stock unsloth vision projector + AtomicChat MTP draft | Multimodal LLM |
 | [`gemma-4-12b.json`](gemma-4-12b.json) | Gemma-4 12B (QAT) + vision + MTP draft | Multimodal LLM |
 | [`gemma-4-26b-a4b.json`](gemma-4-26b-a4b.json) | Gemma-4 26B-A4B (MoE) + vision + MTP draft | Multimodal MoE LLM |

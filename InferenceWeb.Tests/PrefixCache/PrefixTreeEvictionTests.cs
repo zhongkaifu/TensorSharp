@@ -118,6 +118,29 @@ public class PrefixTreeEvictionTests
         Tk.Valid(t, new InvariantCheckContext(AfterEvictionTrigger: true));
     }
 
+    /// <summary>An eviction pass reads every class's spare bytes once, through the all-classes query, and evicts as it did
+    /// asking each class: every class's cap had asked the model twice a pass, a device query each on CUDA.</summary>
+    [Fact]
+    public void EvictionPassReadsTheSpareBytesOnce()
+    {
+        int all = 0, single = 0;
+        PrefixTree t = Tk.Tree(Tk.Caps(pages: PageSupport.None),
+                               optionCap: new ResourceVector { HostKv = 500, DeviceKv = 500, StateSnapshot = 500, NativeSlot = 500 },
+                               spare: _ => { single++; return 400; }, allSpare: perClass => { all++; Array.Fill(perClass, 400L); });
+        int s = Tk.Scope(t);
+        RadixNode a = Tk.Put(t, Tk.Key(t, Tk.Seq(1, 20)), 10, s, host: 300);
+        RadixNode b = Tk.Put(t, Tk.Key(t, Tk.Seq(100, 20)), 10, s, host: 300);   // 600 cached over the 500 cap
+        all = single = 0;
+        Assert.True(t.EnforceCaps(EvictionTier.PublicTop));
+        Assert.Equal((1, 0), (all, single));
+        Assert.False(a.InTree);                       // the older one
+        Assert.True(b.InTree);
+        all = single = 0;
+        t.RelieveMemoryPressure(PressureLevel.Moderate);
+        Assert.Equal((1, 0), (all, single));
+        Tk.Valid(t);
+    }
+
     [Fact]
     public void ScopeQuota_AndScopedCountSubCap()
     {

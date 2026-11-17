@@ -447,6 +447,24 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>A draft head's verify windows (up to four rows: three drafts and the anchor) keep each recurrent layer's
+        /// output and state after every row (DeviceGdnState's verify buffers): 456 MB on Qwen3.8 Flash Next, which an
+        /// offloaded plan had handed to the expert tiers (an RTX PRO 6000 slice then ran out of memory in a verify).</summary>
+        protected override long SpeculationReserveBytes
+        {
+            get
+            {
+                if (_draftLayers == 0) return 0;
+                const int rows = 4;
+                int channels = 2 * _numKHeads * _headKDim + _numVHeads * _headVDim;
+                long perLayer = rows * ((long)_numVHeads * _headVDim + (long)_numVHeads * _headVDim * _headKDim) * sizeof(float)
+                    + (long)channels * (_convKernel - 1 + rows) * sizeof(float);
+                long layers = 0;
+                foreach (bool recurrent in _isRecurrent) if (recurrent) layers++;
+                return layers * perLayer;
+            }
+        }
+
         protected override RecurrentState CreateRecurrentState(RankScope scope, int layer)
         {
             int vHeads = _numVHeads / ShardDegree;
@@ -459,7 +477,19 @@ namespace TensorSharp.Models
 
         /// <summary>A layer's tensor state (a family adds what its layer keeps besides the recurrence).</summary>
         protected virtual DeviceGdnState CreateDeviceGdnState(RankScope scope, int layer, int convRows, int channels, int vHeads, int dv, int dk)
-            => new(scope.Allocator, ExecutorFor(scope.Allocator), HostPointer, convRows, channels, vHeads, dv, dk);
+            => new(scope.Allocator, ExecutorFor(scope.Allocator), HostPointer, convRows, channels, vHeads, dv, dk,
+                WindowStateRows(ExecutorFor(scope.Allocator)));
+
+        /// <summary>The widest verify window that updates its states in place
+        /// (<see cref="TensorSharp.Graph.GraphCapabilities.WindowStateInPlace"/>: MTP's windows and drafts of up to 8 rows), else 1 (a window
+        /// keeps a state after each row and its commit copies one).</summary>
+        protected int WindowStateRows(TensorSharp.Graph.IGraphExecutor executor)
+            => executor?.Capabilities.WindowStateInPlace == true && !_windowStatesInPlaceOff ? 8 : 1;
+
+        /// <summary>Tests: a model constructed on this thread while it is set keeps a state after each verify window row
+        /// (as on executors without in-place windows). Read at construction, which creates the first states.</summary>
+        [ThreadStatic] internal static bool WindowStatesInPlaceOffForTests;
+        private readonly bool _windowStatesInPlaceOff = WindowStatesInPlaceOffForTests;
 
         /// <summary>The recurrence's output gate: sigmoid(z) (Qwen3.8-Flash-Next) instead of silu(z).</summary>
         protected virtual bool MixerSigmoidGate => false;

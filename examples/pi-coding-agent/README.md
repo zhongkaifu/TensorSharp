@@ -336,22 +336,20 @@ sub-agents). The model sees exactly Pi's four tools. See
 
 ## Other hardware
 
-This example was validated only on Apple Silicon with the preset above. On an NVIDIA GPU the fastest
-Qwen3.8-27B preset is [`config/qwen3.8-27b-ninfer.json`](../../config/qwen3.8-27b-ninfer.json): the
-NVFP4 NInfer artifact on the direct CUDA engine, with its own DFlash2 weights. Select it with
-`TENSORSHARP_PRESET`:
+This example was validated only on Apple Silicon with the preset above. On an NVIDIA GPU, start from
+[`config/qwen3.8-27b-cuda-dflash2.json`](../../config/qwen3.8-27b-cuda-dflash2.json): the same UD-IQ3_XXS
+checkpoint and DFlash2 drafter on `ggml_cuda`. Select it with `TENSORSHARP_PRESET`:
 
 ```bash
-TENSORSHARP_PRESET=config/qwen3.8-27b-ninfer.json examples/pi-coding-agent/scripts/start-server.sh
+TENSORSHARP_PRESET=config/qwen3.8-27b-cuda-dflash2.json examples/pi-coding-agent/scripts/start-server.sh
 ```
 
-That preset sets `MAX_CONTEXT` to 40960 in its own `environment`. The overlay's 65536 replaces it,
+That preset sets `MAX_CONTEXT` to 32768 in its own `environment`. The overlay's 65536 replaces it,
 because among config files the later one wins. A `MAX_CONTEXT` exported in your shell wins over both.
-For example, `MAX_CONTEXT=40960 TENSORSHARP_PRESET=... scripts/start-server.sh` keeps the preset's
+For example, `MAX_CONTEXT=32768 TENSORSHARP_PRESET=... scripts/start-server.sh` keeps the preset's
 length. Set `contextWindow` in `models.json` to the length the server actually uses.
 
-This combination has not been run with Pi. That includes the overlay's q8_0 KV cache on the direct
-CUDA engine.
+This combination has not been run with Pi, including the overlay's q8_0 KV cache on `ggml_cuda`.
 
 ## Troubleshooting
 

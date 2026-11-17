@@ -97,7 +97,7 @@ def same_deployment(original, fresh):
         return found
     oldenv=original.get('environment')or{};newenv=fresh.get('environment')or{}
     fixed={'KV_CACHE_DTYPE','MAX_CONTEXT','TS_SCHED_MAX_RUNNING_SEQS','TS_PREFIX_CACHE_ISOLATION','TS_BACKEND','CUDA_VISIBLE_DEVICES'}
-    keys=sorted(k for k in set(oldenv)|set(newenv)|fixed if k in fixed or k.startswith(('TS_Q35_','TS_CUDA_','GGML_')))
+    keys=sorted(k for k in set(oldenv)|set(newenv)|fixed if k in fixed or k.startswith(('TS_CUDA_','GGML_')))
     checks={k:original.get(k)==fresh.get(k) for k in ('engine','mode','argv','working_directory','context_tokens','lanes')}
     checks.update(binaries_path_sha256=files(original.get('binaries'))==files(fresh.get('binaries')),
         models_path_sha256=files(original.get('models'))==files(fresh.get('models')),

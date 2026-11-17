@@ -97,13 +97,30 @@ namespace TensorSharp.Models
             if (!IsExpertMember(weightName)) return true;
             // Per-rank graphs run every member's shard on its rank (GGML ranks read their own stacks instead); the per-op
             // tensor-parallel path runs whole experts from the host, and one GGML device places its experts by the plan.
-            return _mesh != null && (_mesh.TensorParallel == 1 || _rankGraphs) && !IsGgmlBackend;
+            // A tensor executor's planned offload uploads an offloaded layer's tier only (its expert host serves the rest).
+            if (_mesh == null || !(_mesh.TensorParallel == 1 || _rankGraphs) || IsGgmlBackend) return false;
+            return !TryParseExpertMember(weightName, out int layer, out int expert) || PreloadsExpert(layer, expert);
         }
+
+        /// <summary>The direct cuda backend uploads what the device-preload rule keeps (an offloaded layer's tier, never a
+        /// host-only table).</summary>
+        protected override bool ShouldPreloadDirectCudaWeight(string weightName) => ShouldPreloadCudaQuantWeightToDevice(weightName);
 
         protected override bool ShouldPreloadMlxQuantWeightToDevice(string weightName, QuantizedWeight weight)
             => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName) && base.ShouldPreloadMlxQuantWeightToDevice(weightName, weight);
 
         private static string ExpertName(int layer, string kind, int expert) => $"blk.{layer}.ffn_{kind}_exps.{expert}.weight";
+
+        /// <summary>The layer and expert of a stacked expert's member name (<see cref="ExpertName"/>).</summary>
+        private static bool TryParseExpertMember(string name, out int layer, out int expert)
+        {
+            layer = expert = -1;
+            if (!name.StartsWith("blk.", StringComparison.Ordinal) || !name.EndsWith(".weight", StringComparison.Ordinal)) return false;
+            string[] parts = name.Split('.');
+            // blk . N . ffn_<kind>_exps . E . weight
+            return parts.Length == 5 && parts[2].EndsWith("_exps", StringComparison.Ordinal)
+                && int.TryParse(parts[1], out layer) && int.TryParse(parts[3], out expert);
+        }
 
         // ---------------------------------------------------------------- routing
 

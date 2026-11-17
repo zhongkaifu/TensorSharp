@@ -9,6 +9,11 @@
 	  <IsPackable>true</IsPackable>
 	  <Description>ASP.NET Core server host package for TensorSharp with embedding and chat inference, web UI, and Ollama/OpenAI-compatible APIs.</Description>
 	  <PackageTags>$(TensorSharpPackageTags);server;host;aspnetcore;openai;ollama;embeddings;web</PackageTags>
+	  <!-- Methods compiled fully optimized at their first call, not first at tier 0: a request's first decode steps trace and
+	       record each step shape through code that had not been promoted yet (Qwen3.8 Flash Next ISTA + MTP on an A40, the CLI:
+	       the first request's eight trunk recordings 260-305 ms against 175-188 ms, short-prompt decode 100-104 tok/s against
+	       111-113; model load 27-31 s either way). -->
+	  <TieredCompilation>false</TieredCompilation>
   </PropertyGroup>
 
 	<ItemGroup>

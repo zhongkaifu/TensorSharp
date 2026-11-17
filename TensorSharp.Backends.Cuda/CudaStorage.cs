@@ -137,15 +137,6 @@ namespace TensorSharp.Cuda
             return AddBytes(deviceBuffer, checked(index * ElementType.Size()));
         }
 
-        /// <summary>The device address of element <paramref name="index"/> once the device copy is
-        /// current, for a reader in the same context (on another stream: synchronize this
-        /// allocator's stream first).</summary>
-        public IntPtr DevicePtrForRead(long index)
-        {
-            EnsureDeviceCurrent();
-            return DevicePtrAtElement(index);
-        }
-
         public override void EnsureDeviceCurrent()
         {
             ThrowIfDisposed();
@@ -186,11 +177,26 @@ namespace TensorSharp.Cuda
             lock (sync)
             {
                 AllocatorImpl.Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyHtoDAsync(DevicePtrAtElement(storageIndex), src, new UIntPtr((ulong)byteCount),
-                    AllocatorImpl.Stream.Handle).ThrowOnError();
+                // The source may be a model file's mapping with page-locked ranges a copy must not span (CudaHostPins).
+                CudaHostPins.CopyToDevice(DevicePtrAtElement(storageIndex), src, byteCount, AllocatorImpl.Stream.Handle).ThrowOnError();
                 CudaDriverApi.cuStreamSynchronize(AllocatorImpl.Stream.Handle).ThrowOnError();
                 deviceDirty = true;
                 hostDirty = false;
+            }
+        }
+
+        /// <summary>The host writes not yet on the device copied to <paramref name="destination"/> (pinned memory a recorded
+        /// step's copy node reads; <see cref="ByteLength"/> bytes) instead of uploaded now. The device copy counts as the
+        /// current one from here (the recorded copy delivers these bytes before any kernel reads them).</summary>
+        internal unsafe void TakeHostWrites(IntPtr destination)
+        {
+            ThrowIfDisposed();
+            lock (sync)
+            {
+                if (hostDirty && hostBuffer != IntPtr.Zero)
+                    Buffer.MemoryCopy(hostBuffer.ToPointer(), destination.ToPointer(), ByteLength, ByteLength);
+                hostDirty = false;
+                deviceDirty = true;
             }
         }
 
@@ -309,6 +315,10 @@ namespace TensorSharp.Cuda
                 return;
 
             src.EnsureDeviceCurrent();
+            // Host writes not yet on the device reach it first unless the copy overwrites every byte: the device copy is the
+            // current one after it, and the bytes outside the copied range would otherwise be the device's stale ones.
+            if (destinationByteOffset != 0 || byteCount != ByteLength)
+                EnsureDeviceCurrent();
             AllocatorImpl.Context.MakeCurrent();
             IntPtr dst = AddBytes(deviceBuffer, destinationByteOffset);
             IntPtr source = AddBytes(src.deviceBuffer, sourceByteOffset);
@@ -399,6 +409,8 @@ namespace TensorSharp.Cuda
                 return false;
 
             src.EnsureDeviceCurrent();
+            // Pitched rows write part of this storage: its host writes reach the device first (CopyDeviceFrom's rule).
+            EnsureDeviceCurrent();
             AllocatorImpl.Context.MakeCurrent();
             IntPtr dst = AddBytes(deviceBuffer, destByteOffset);
             IntPtr source = AddBytes(src.deviceBuffer, srcByteOffset);
@@ -435,6 +447,7 @@ namespace TensorSharp.Cuda
                 return false;
 
             src.EnsureDeviceCurrent();
+            EnsureDeviceCurrent();   // a partial write as well (CopyDeviceFrom's rule)
             AllocatorImpl.Context.MakeCurrent();
             kernels.LaunchCopy4DBytes(
                 AddBytes(src.deviceBuffer, srcByteOffset), AddBytes(deviceBuffer, destByteOffset),

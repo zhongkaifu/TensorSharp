@@ -6,7 +6,7 @@
 |---|---|
 | 提供方 | 阿里巴巴 |
 | GGUF 架构标识 | `qwen35`、`qwen35moe`、`qwen3next` |
-| 模型类 | 共享解码运行时上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs)；`--backend cuda` 上的稠密 NVFP4 由 [`Qwen35CudaModel`](../../TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs) 执行 |
+| 模型类 | 共享解码运行时上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs)，所有后端通用 |
 | 视觉编码器 | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | 图像处理器 | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
 | 示例模型 | Qwen3.5-9B（dense hybrid）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE 系列）、Qwen3.6-27B / Qwen3.8-27B（dense）；另有 [Bonsai2 27B](bonsai2_zh-cn.md)（PRISM PQ2_0 / PTQ1_0） |
@@ -247,7 +247,7 @@ deinterleave 步骤（`SplitQGateInterleaved`）把 Q 写入一个 buffer、gate
 
 ### 4.4 RoPE
 
-NeoX 风格旋转嵌入。频率在 `_ropeFreqs[halfDim]` 一次性预计算。位置张量在每个 forward pass 内跨 attention 层缓存：当 `(seqLen, startPos)` 在所有 12 个 attention 层之间一致时，复用 `_cachedRoPEPosQ` / `_cachedRoPEPosK`，省去重复分配 + 填充。
+NeoX 风格旋转嵌入，作用于每个头的前 `rope.dimension_count` 个通道（部分旋转），在逐头 Q/K RMSNorm 之后应用。运行时每一步只计算一次位置（`StandardDecoderModel.Positions.cs`），该步计算图中的每个 attention 层都读取它们。
 
 `qwen3next` GGUF 额外提供 `qwen35.rope.dimension_sections`，定义 MRoPE section 边界。存在时 RoPE 步骤使用多模态 RoPE；不存在时使用纯 NeoX RoPE。
 
@@ -265,21 +265,15 @@ rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分�
 即 SGLang 的 `mrope_position_delta`（decode 位置为 `delta - 1 + seq_len`）。delta 按序列保存
 （[`Qwen35RopePositions`](../../TensorSharp.Models/Models/Qwen35/Qwen35RopePositions.cs)）：
 
-- **在任何内核运行之前确定。** `BeginRopePositions` 从 prefill 分块暂存的位置表取得它；从 KV 下标
+- **在任何内核运行之前确定。** `BeginRotaryPositions`（`StandardDecoderModel.Positions.cs`）从 prefill 分块暂存的位置表取得它；从 KV 下标
   0 开始且没有位置表的前向会开启新历史（delta 为 0）；其他前向沿用当前序列的 delta。若一个分块的
-  所有行都是位于 `KV 下标 + delta` 的文本，则丢弃位置表，改走普通的标量 RoPE 图，旋转完全相同。
-- **所有路径都使用它。** 整模型 decode（`rope_pos_delta`）、融合 prefill/verify 图（标量行使用
-  `rope_pos_delta`）、arena 批处理 decode（每个 holder 的 `rope_positions`）、分页批处理前向
-  （来自注入器的请求 delta）、逐算子 attention、direct-CUDA 的 prefill 与 decode 图、张量并行以及
-  MTP 草稿头。逐层原生 attention 内核按 KV 下标旋转，因此越过图片的序列不会走它们。
-  （DFlash 草稿器保留自己的位置；它们只影响草稿被接受的数量，
-  从不影响输出。）
-- **与其描述的状态一起保存。** 每个请求的 holder 在换入换出、保留、重新绑定和池化过程中携带它；
-  共享前缀检查点及其克隆会复制它；KV-swap 并发路径的逐块 KV 快照在末尾保存它（与递归状态一样，
-  取块结束时的值；注入的块若大小不符，或其 delta 会让下一个 token 落在负位置，会在写入任何内容之前被
-  拒绝，因此被拒绝后模型恰好保留该块之前的内容）；检查点文件格式（`Q5KC`）升级为**版本 2**，在行数之后写入 delta。
-  版本 1 的文件没有 delta，导入时会被拒绝；引擎记录“保存的检查点与模型不符”，重新 prefill 该前缀
-  并再次保存。
+  所有行都是位于 `KV 下标 + delta` 的文本，则丢弃位置表，改走普通的标量旋转，旋转完全相同。
+- **每一步都使用它。** 提示分块、decode 行、verify 窗口与批处理步在每个后端和放置方式下，都让每个序列的行
+  从自己的 slot 按 `KV 下标 + delta` 旋转，MTP 草稿层也一样。（DFlash 草稿器保留自己的位置；它们只影响
+  草稿被接受的数量，从不影响输出。）
+- **与其描述的状态一起保存。** 每个 slot 携带它（`Slot.RopeDelta`），经过保留、交给下一轮和池化都不丢失；
+  共享前缀检查点及其克隆会复制它；检查点文件格式为**版本 2** 或更高（`StandardDecoderModel.Checkpoints.cs`），
+  会写入它。不含它的文件不会被当作这种格式的检查点读取：引擎重新 prefill 该前缀并再次保存。
 
 在此之前，decode、投机 verify 以及所有标量路径都直接按 KV 下标旋转，带来两个后果：
 
@@ -308,7 +302,7 @@ rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分�
   高与宽的网格、两对帧的视频和纯文本。若 decode 按 KV 下标（旧规则），26 个用例中有 10 个失败。
 - `Qwen35ImageFollowUpExactnessTests`（需要模型，`TS_TEST_MODEL_DIR`）在 Qwen3.5-9B-Q8_0 上运行
   “文本 -> 图片 -> 文本 -> 文本”的对话。在引擎中，第 3、4 轮必须越过图片复用上一轮，每一轮的贪心
-  token 都与冷启动引擎比较；旁边同时有一段文本对话在 decode（按请求的 holder 与 arena 批处理 decode）
+  token 都与冷启动引擎比较；旁边同时有一段文本对话在 decode（slot 合并在同一步中批处理）
   时同样比较。直接在模型上，把“decode 上一轮回复再 prefill 新后缀”构建出的回合与整段提示的冷启动
   prefill 逐步比较 24 步 logits，并对一段纯文本对话做同样的比较作为对照。在图片之后建立的检查点经过
   导出、导入和克隆后，decode logits 逐位相同；版本 1 文件会被拒绝。关闭 delta 时测试失败：在 Metal
@@ -340,7 +334,7 @@ M-RoPE）。因此测试检查三点：
 在 CUDA 上，即使是纯文本对话，decode 与 prefill 内核也会相差约一个 logit，因此在 24 个贪心 token 内，
 无论有没有图片，复用回合与冷启动回合都可能在低差距 token 上翻转。
 
-并发测试（holder 与 arena）采用同样的平局规则。在某个请求的 token 与其冷启动引擎运行首次不同的那一步，
+并发测试（slot 合并在同一步中批处理）采用同样的平局规则。在某个请求的 token 与其冷启动引擎运行首次不同的那一步，
 测试捕获冷启动 logits（直接在模型上对同一提示做冷启动 prefill，且到该步为止必须解码出相同的 token），
 只有当其 top-2 差距低于该后端的 logit 容差时才接受这一差异，并且不再比较该请求的剩余部分。它的纯文本
 对照以长于一个块的系统提示开头（第 1 轮 346 token）：使用一行系统提示时每个文本回合都短于一个块，因此在旧版路径下没有
@@ -441,7 +435,7 @@ output_norm.weight
 output.weight
 ```
 
-`FuseAttentionProjectionWeights()` 在三个 GGUF 张量量化类型相同时，把每层的 Q+K+V 融合为 `attn_qkv.weight`；混合类型的 importance-matrix / UD 量化投影保持分开，避免展开成数 GB 的 FP32。`FuseRecurrentInputWeights()` 把 GatedDeltaNet 的五路递归投影（`attn_qkv`、`attn_gate`、`ssm_beta`、`ssm_alpha`、加一个空槽）融合为 `ssm_in_proj.weight`。`FuseGateUpWeights()` 融合 dense FFN 的 gate 与 up。
+加载时，运行时在三个 GGUF 张量量化类型相同时把全注意力层的 Q+K+V 融合为一个 `attn_qkv.weight`（`TryFuseQkvWeights`），并把 dense FFN 的 gate 与 up 融合为 `ffn_gate_up.weight`（`FuseGateUpWeights`）；混合类型的 importance-matrix / UD 量化投影保持分开，避免重新量化或展开成数 GB 的 FP32。GatedDeltaNet 层的 `attn_qkv`、`attn_gate`、`ssm_beta` 与 `ssm_alpha` 在四者类型一致时打包为一个 `ssm_in_proj.weight`（`Qwen35RuntimeModel.PrepareLoadedWeights`）：decode 行把它作为一次乘积，提示分块则用四次乘积。
 
 ## 7. TensorSharp 实现
 
@@ -449,10 +443,9 @@ output.weight
 
 | 加载 | 由谁执行 |
 |---|---|
-| `--backend cuda`、单 GPU、稠密 NVFP4 检查点、没有 `--tp` / `--layer-split` / 主机专家 | [`Qwen35CudaModel`](../../TensorSharp.Models/Models/Qwen35/Qwen35CudaModel.cs)，直连 CUDA 引擎（`TS_Q35_NATIVE=0` 让它让位） |
-| 其余全部：每个后端（`cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`mlx`、`cuda`）、单设备、`--tp`、`--layer-split`、二者混合、多节点流水线、主机专家 | 运行在[共享解码运行时](../design/unified-execution.md)上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) |
+| 每个后端（`cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`mlx`、`cuda`）、单设备、`--tp`、`--layer-split`、二者混合、多节点流水线、主机专家，包括稠密 NVFP4 检查点 | 运行在[共享解码运行时](../design/unified-execution.md)上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) |
 
-本家族自己的模型类（`Qwen35Model`，及其融合整模型 GGML 图、槽位稳定 arena、常驻验证图与原生内核）已于 2026-11 删除；它服务过的每种放置都由运行时接管。
+本家族自己的模型类（`Qwen35Model`，及其融合整模型 GGML 图、槽位稳定 arena、常驻验证图与原生内核）已于 2026-11 删除；它服务过的每种放置都由运行时接管。`--backend cuda` 过去为单 GPU 稠密 NVFP4 检查点使用的直连 CUDA 引擎（`Qwen35CudaModel`、`Q35CudaEngine`）及其 NInfer 文件路线随后也已删除，这些检查点现在同样运行在运行时上；见[直连 CUDA NVFP4 引擎（已移除）](#直连-cuda-nvfp4-引擎已移除)。
 
 `Qwen35RuntimeModel` 是本家族在运行时上的配方：
 
@@ -472,27 +465,11 @@ output.weight
 
 decode 每步对所有运行中的序列只跑一张图：每个序列的行读取自己槽位的 K/V 窗口与递归状态。GGML 后端上下一步就地改写位置、写入行与掩码后重放该图。ggml_metal 上 decode 行的递归原地更新其状态。
 
-### Direct CUDA NVFP4 路线：输出层、验证 GEMM 与预填充 GEMM
+### 直连 CUDA NVFP4 引擎（已移除）
 
-NVFP4 GGUF 走 `--backend cuda`（`Q35CudaEngine`）时，每一步都要把全部权重读一遍，所以每步耗时取决于核函数能用到多少 RTX 5090 显存带宽。2026-11 替换了三个明显偏慢的核函数；每个形状都与旧核函数逐位比对过，结果完全一致，回答不变。
+2026-11 之前，`--backend cuda` 在单 GPU 上（没有 `--tp`、`--layer-split` 或主机专家）用自己的直连引擎（`Qwen35CudaModel`、`Q35CudaEngine` 及其 `ts_q35_*` 核函数）运行稠密 NVFP4 检查点，该引擎也能加载 NInfer 的 NVFP4 文件。引擎、其核函数、NInfer 支持以及引擎自己的环境变量均已移除；现在设置这些变量会让服务端或 CLI 在启动时报错退出。`--backend cuda` 像其他加载一样在共享运行时上服务这些检查点：NVFP4 乘积运行在后端的 FP4 核函数上（`CudaFp4Kernels`，sm_120a / sm_121a 构建中的块缩放 FP4 张量核）。本节以前列出的核函数与端到端数据（RTX 5090，2026-11）都测于已移除的引擎，尚未在运行时上重测。
 
-| 核函数 | 改前 | 改后（RTX 5090） |
-|---|---|---|
-| 输出层，Q6_K 248,320 x 5,120（每步目标头与 DFlash2 草稿头各一次） | 210 字节超块每次读 2 字节，每个超块一次 `__syncthreads`：0.83 TB/s，32 行 1.27 ms | 加载时重排为 64 行一块（`ts_q35_repack_q6k_tiled`，同样的字节换顺序），用 cp.async 流水线读取：32 行 0.74 ms（1.41 TB/s），8 行 0.89 -> 0.69 ms，1 行 1.06 -> 0.87 ms |
-| W4A4 验证 GEMM（9-64 行）的 split-K | 切分到 CTA 覆盖所有 SM：129 块的 GDN 输入投影切 2 份、跑两波 | 取仍能一波放下的最大切分：32 行时 GDN 输入投影 38.1 -> 30.6 us，5,120 行输出投影 18.1 -> 14.3 us |
-| 预填充 W4A4 GEMM（65 行以上） | cp.async 128 行块，约 830 TFLOPS | 改用 NInfer 路线的 TMA warp 专用核函数，并为 gate/up 增加 F32 SwiGLU epilogue：2,048-4,096 行时 1,230-1,390 TFLOPS |
-
-端到端（GGUF + DFlash2 K7，短提示、400 token 回答）：4 路并发 464 -> 521 tok/s，2 路并发 284 -> 308 tok/s。预填充首 token：11K token 提示 1.51 -> 1.20 s，36K token 6.57 -> 5.38 s，4 个 3.6K token 提示同时到达 1.9-2.1 -> 1.6-1.7 s。
-
-仍未解决：1-8 行的 W4A8 GEMV 在 8 行时只有 1.17-1.37 TB/s。保持 GEMV 求和顺序的 int8 张量核版本（每个 GEMV lane 一个累加器）需要 242 个寄存器，只有 0.3-0.9 TB/s，没有采用。
-
-**长文档上的 2 路并发与多轮会话。** 2 路并发时 DFlash2 验证有 16 行，投影从 8 行 GEMV 切到 W4A4 GEMM，32 行块只用了一半。实测这一半并不花时间：16 行时这些 GEMM 受显存带宽限制，与 8 行 GEMV 一样快甚至更快（gate/up 65 vs 73 us，GDN 输入投影 31.5 vs 40.5 us），逐位一致的 16 行块最多只快 3%。真正的开销有三处，均已修复：
-
-| 开销 | 改前 | 改后（RTX 5090） |
-|---|---|---|
-| 9 行以上的 pre-norm + NVFP4 量化（每层两次） | 每组元素都要等一次全局内存往返：5.5 us | `ts_q35_add_rmsnorm_nvfp4_5120_f32` 把整行放在寄存器里，先发出全部读取：3.5 us，逐位一致 |
-| 长缓存上的短提示块（会话的新一轮、新对话的后缀） | 8 位提示注意力不切分键：127K 缓存上 47 token 的块只有 8 个 CTA，每层 5.3 ms，另加 0.65 ms 转换 band | 改用把键切分到整卡的 16 位核函数，直到 8 位 CTA 能覆盖约 40% 的 SM（约 350 行；两条路线都适用）：该轮首 token 140 -> 50 ms |
-| 同一步进入、共享缓存前缀的多个对话 | 从 radix 缓存恢复的请求还没有 holder，批量预填充跳过它，后缀逐个预填充 | 执行器先绑定 holder、注入前缀（`PrebindCachedPrefixPrefills`），后缀共用一次前向：120K token 文档上 3 个这样的对话首 token 相差不到 3 ms |
+该路线上发现的一处修复是共享的，仍然保留：同一步进入、共享缓存前缀的多个对话，会先绑定 holder 并注入前缀（批处理执行器中的 `PrebindCachedPrefixPrefills`），使各后缀共用一次前向，而不是逐个运行。
 
 ### MLX：UD 量化与推测解码
 

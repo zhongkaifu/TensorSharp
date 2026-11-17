@@ -156,6 +156,67 @@ namespace TensorSharp.Graph
         /// gates. Inputs: the normed streams and the gates before their sigmoid, both [hc * n, rows]. Ip: n, hc. Result:
         /// the mix [n, rows].</summary>
         HcMix = 8,
+        /// <summary>Ops that read only the region's inputs and whose results are read later (a shared expert beside the
+        /// router and the routed experts): an executor may run them beside the step's other work (a second stream), and
+        /// waits for them where their results are first read. Inputs: what the region reads. Results: what it computes.
+        /// Executors that do not run it so compute the ops in place.</summary>
+        ConcurrentBranch = 9,
+        /// <summary>A softmax router's selection: each row's top-K experts by their softmax probabilities (a tie to the lower
+        /// expert) and their weights - the probabilities, renormalized over the K (Ip[1] = 1) or as they are. Inputs: the
+        /// router logits [E, rows]. Ip: K, renormalize. Results: the ids [K, rows] (I32) and the weights [1, K, rows].</summary>
+        MoeSelect = 10,
+        /// <summary>A gated attention output: attn * sigmoid(gate). Inputs: attn [d * heads, rows] and gate [d, heads, rows] (a
+        /// view of the query projection, its heads interleaved with the queries). Result: [d * heads, rows].</summary>
+        SigmoidGate = 11,
+        /// <summary>A MoE layer's output plus its shared expert gated per row: moe + shared * sigmoid(x . w). Inputs: moe and
+        /// shared [n, rows], x [n, rows] (the layer's input) and w [n] (ffn_gate_inp_shexp). Result: [n, rows].</summary>
+        SharedExpertGate = 12,
+        /// <summary>A sparse attention layer's block selection and its attention, for one sequence over its cache window (Qwen
+        /// 3.8's QSA past its dense budget): the selection's ops (the pooled keys' gather, the lightning indexer, the top-k and
+        /// the top-k mask) and the flash attention under that mask. Block b is cells b R .. b R + R - 1, visible to the row at
+        /// KV index p iff b &lt; (p + 1) / R; its pooled key is the second half of its last member's row of the indexer cache.
+        /// A row attends its <c>picks</c> best visible blocks whole (by score, a tie to the lower block; every visible block
+        /// where there are no more) and its own incomplete tail block's cells up to p. Inputs: the rows' indexer queries
+        /// [idxDim, idxHeads, rows] (rotated), the indexer cache [2 idxDim, capacity], the attention's queries [d, heads, rows],
+        /// the K and V caches [d, capacity, kvHeads] and the rows' KV indices [rows] (the rows the step wrote). Ip: R, picks,
+        /// the window (the keys the mask spans), idxDim, idxHeads, heads, kvHeads, d, the attention's key bound (its kvMax).
+        /// Fp: the attention's scale, the indexer's weight of every head. Result: the attention [d, heads, rows].</summary>
+        QsaAttention = 13,
+        /// <summary>A sparse attention layer's indexer keys for one sequence's rows (Qwen 3.8's QSA): each row's raw key into
+        /// its [raw | pooled] row of the indexer cache (the pooled half 0 times the raw key), and every block the rows complete
+        /// pooled into its last member's row - the mean of its members' raw keys as the cache holds them, RMS-normed with the
+        /// norm weight and rotated at its first cell's position. The writes are effects inside the region. The ops also pool
+        /// again blocks complete before the step (a short chunk's last ones), to the values they hold; a kernel need not.
+        /// Inputs: the rows' raw keys [d, rows], the indexer cache [2 d, capacity], the rows' KV indices [rows] (consecutive),
+        /// the norm weight [d] and the rotary positions [n] of the first cells of the blocks the ops pool: from the first
+        /// block the rows complete, or (Ip[2] = 1, a short chunk) the last n blocks complete once they are written. Ip: d, R, the
+        /// short chunk flag, the rotary dims, mode and original context. Fp: the norm's eps, 1 / R, the rotary's base,
+        /// frequency scale, extrapolation factor, attention factor, beta fast and beta slow. Result: the pooled write.</summary>
+        QsaKeys = 14,
+        /// <summary>A verify window's commit over the gated delta-net layers of one program (a pipeline stage's, a rank's):
+        /// each layer's recurrent state after the window's first <c>kept</c> rows and its conv window after them. Inputs, five a
+        /// layer: the state source, the state target, the window's saved scan inputs (q and k [saved rows, kHeads, S], v
+        /// [saved rows, vHeads, S], the gates and the betas [saved rows, vHeads], each a region of its own), the conv history
+        /// [convRows + capacity, channels] and the conv window [convRows, channels]. Ip: S (the key and value head width), vHeads,
+        /// kHeads, the saved rows, convRows, channels, the history's pitch (floats a channel), kept, then three a layer: the rows
+        /// to step, the source's and the target's offsets (floats). A layer with rows to step takes the gated delta rule over the
+        /// first of them in its saved inputs from the source's state (on the decode rows' kernels: the window's rounding), the
+        /// rows' outputs and the state after them written at the target's offset ([outputs | state]); with none, the source's
+        /// state at the target's offset; with -1, its state stays. Every layer's conv window takes the history's columns
+        /// [kept, kept + convRows) of each channel. The writes are effects and aliases inside the region. Result: the last
+        /// layer's conv window write.</summary>
+        DeltaNetCommit = 15,
+        /// <summary>An attention layer's query and key prep and its cache writes for one sequence's rows: each query head of q
+        /// and KV head of k RMS-normed with its weight (x * rsqrt(mean(x^2) + eps), then times the weight) and rotated at the row's
+        /// position (ggml_rope_ext, single-axis); the rotated keys and the values written into the K and V caches at the rows' KV
+        /// indices, rounded to the caches' type. The writes are effects inside the region. Inputs: q [d, heads, rows] and k
+        /// [d, kvHeads, rows] (views of the projections, d contiguous: before the copies and norms the ops run), v
+        /// [dv, kvHeads, rows], the q and k norm weights [d], the K and V caches [d, capacity, kvHeads] and [dv, capacity, kvHeads],
+        /// the rows' rotary positions [rows] (I32) and their KV indices [rows]. Ip: heads, kvHeads, d, dv, the rotary dims, mode and
+        /// original context, then (optional) 1 where only the attention reads the result, through its [d, rows, heads] permute (an
+        /// executor may then lay it out head by head). Fp: the norms' eps, the rotary's base, frequency scale, extrapolation factor,
+        /// attention factor, beta fast and beta slow. Result: the rotated queries [d, heads, rows].</summary>
+        AttentionPrep = 16,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
@@ -219,6 +280,8 @@ namespace TensorSharp.Graph
         private readonly List<GraphNode>? _entries;
         private readonly List<long> _outputs = new();
         private ulong _h1 = 14695981039346656037UL, _h2 = 0x9E3779B97F4A7C15UL;
+        private ulong _s1 = 14695981039346656037UL, _s2 = 0x9E3779B97F4A7C15UL;
+        private bool _signatureOnly;
 
         public GraphProgramBuilder(bool record) => _entries = record ? new List<GraphNode>() : null;
 
@@ -238,11 +301,18 @@ namespace TensorSharp.Graph
         public int OutputCount => _outputs.Count;
         public (ulong, ulong) Signature => (_h1, _h2);
 
+        /// <summary>The signature without the state leaves' identities: two steps that run the same kernels over different
+        /// caches and states (another slot's) share it.</summary>
+        public (ulong, ulong) StructuralSignature => (_s1, _s2);
+
         public void Mix(long value)
         {
             ulong v = unchecked((ulong)value);
             _h1 = (_h1 ^ v) * 1099511628211UL;
             _h2 = (_h2 ^ (v + 0x9E3779B97F4A7C15UL + (_h2 << 6) + (_h2 >> 2))) * 0xC2B2AE3D27D4EB4FUL;
+            if (_signatureOnly) return;
+            _s1 = (_s1 ^ v) * 1099511628211UL;
+            _s2 = (_s2 ^ (v + 0x9E3779B97F4A7C15UL + (_s2 << 6) + (_s2 >> 2))) * 0xC2B2AE3D27D4EB4FUL;
         }
 
         public void Mix(ReadOnlySpan<long> values) { Mix(values.Length); foreach (long v in values) Mix(v); }
@@ -254,7 +324,13 @@ namespace TensorSharp.Graph
         public int Leaf(GraphLeafRole role, int format, ReadOnlySpan<long> ne, IntPtr data, long bytes, GraphSplit? split = null, object? handle = null)
         {
             Mix(1); Mix((int)role); Mix(format); Mix(ne);
-            if (role != GraphLeafRole.Input) { Mix(data.ToInt64()); Mix(bytes); }
+            if (role != GraphLeafRole.Input)
+            {
+                _signatureOnly = role == GraphLeafRole.State;
+                Mix(data.ToInt64());
+                _signatureOnly = false;
+                Mix(bytes);
+            }
             if (split != null) { Mix(100 + split.Axis); Mix(split.Ne); }
             if (Keeping) Emit(NodeCount, new GraphNode { Kind = GraphNodeKind.Leaf, Role = role, Format = format, Ne = ne.ToArray(), Data = data, Bytes = bytes, Split = split, Handle = handle });
             return NodeCount++;
@@ -300,9 +376,10 @@ namespace TensorSharp.Graph
 
         /// <summary>
         /// Open a region of <paramref name="kind"/> over <paramref name="inputs"/> (nodes that exist now). The ops
-        /// up to <see cref="EndFused"/> compute its results from the inputs alone (no effects, no state); an
-        /// executor with a kernel for the kind may run that instead, and nodes inside are then computed
-        /// only if something else reads them.
+        /// up to <see cref="EndFused"/> compute its results from the inputs alone; an executor with a kernel for the
+        /// kind may run that instead, and nodes inside are then computed only if something else reads them. Writes
+        /// inside it (effects, aliases) are the region's where its kind says so: the kernel makes them, else they run
+        /// in order when the region closes.
         /// </summary>
         public void BeginFused(GraphFusion kind, ReadOnlySpan<int> inputs, ReadOnlySpan<long> ip = default, ReadOnlySpan<float> fp = default)
         {

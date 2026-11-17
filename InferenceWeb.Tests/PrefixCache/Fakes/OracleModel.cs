@@ -66,6 +66,9 @@ internal sealed record OracleTraits
     public bool LinearKvMigration { get; init; } = true;
 
     public bool ReuseAcrossMediaSpan { get; init; } = true;
+    /// <summary>A prompt with media also checkpoints before its tail
+    /// (<see cref="PrefixCacheCapabilities.CheckpointPromptTailWithMedia"/>), as Qwen3.5 on direct CUDA does.</summary>
+    public bool CheckpointPromptTailWithMedia { get; init; }
     /// <summary>A clone shares the payload's K/V (<see cref="PrefixCacheCapabilities.ClonesShareKv"/>).</summary>
     public bool ClonesShareKv { get; init; }
 }
@@ -481,6 +484,7 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
         PageWindowTokens = Traits.PageWindowTokens,
         SupportsCopyPagedToHolder = Traits.SupportsCopyPagedToHolder,
         ReuseAcrossMediaSpan = Traits.ReuseAcrossMediaSpan,
+        CheckpointPromptTailWithMedia = Traits.CheckpointPromptTailWithMedia,
         Persistable = Traits.Persistable,
         PagedEndStates = Traits.PagedEndStates,
         ClonesShareKv = Traits.ClonesShareKv,

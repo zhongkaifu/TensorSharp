@@ -70,7 +70,7 @@ class ColdControlTests(unittest.TestCase):
             launch = {"engine": "tensorsharp", "mode": "dflash2", "context_tokens": 65536,
                 "lanes": 2, "argv": ["dotnet", "MOCK_ONLY.dll", "--backend", "cuda"],
                 "working_directory": "/mock/bin", "environment": {
-                    "TS_Q35_GREEDY_VERIFY": "0", "TS_PREFIX_CACHE_ISOLATION": "shared"},
+                    "GGML_CUDA_PDL": "0", "TS_PREFIX_CACHE_ISOLATION": "shared"},
                 "binaries": [{"path": "/mock/bin/MOCK_ONLY.dll", "sha256": "a" * 64}],
                 "models": [{"path": "/mock/model.gguf", "sha256": "b" * 64}],
                 "process": {"pid": 1001, "starttime": 500, "boot_id": "MOCK_BOOT"}}
@@ -179,7 +179,7 @@ class ColdControlTests(unittest.TestCase):
             fresh = copy.deepcopy(old)
             if change == "argv": fresh["argv"] += ["--temperature", "1"]
             elif change in ("binaries", "models"): fresh[change][0]["sha256"] = "f" * 64
-            else: fresh["environment"]["TS_Q35_GREEDY_VERIFY"] = "1"
+            else: fresh["environment"]["GGML_CUDA_PDL"] = "1"
             with self.assertRaises(ValueError): TOOL.same_deployment(old, fresh)
 
 

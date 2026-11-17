@@ -57,12 +57,6 @@ namespace TensorSharp.Models
         /// <summary>One request's DFlash KV ring (Flash Next DFlash2: 2080 rows x 5 layers, 81 MB F32), rounded up.</summary>
         internal const long DFlashRingAllowanceBytes = 128L << 20;
 
-        /// <summary>Concurrent sequences ggml_cuda plans VRAM for (<c>TS_Q4E_LANES</c>, as on the direct CUDA engine):
-        /// 1 to 16, 1 when unset or unreadable. Requests beyond what fits wait for a running one either way.</summary>
-        internal static int GgmlCudaLanes(string value)
-            => int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int lanes)
-                ? Math.Clamp(lanes, 1, 16) : 1;
-
         /// <summary>VRAM the expert plan keeps for the sequences beside the first: each a holder of
         /// <paramref name="holderBytes"/> plus <paramref name="extraBytes"/> of recurrent state and arena share.</summary>
         internal static long ConcurrentSequenceReserveBytes(int lanes, long holderBytes, long extraBytes)

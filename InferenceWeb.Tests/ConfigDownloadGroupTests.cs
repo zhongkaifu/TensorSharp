@@ -144,7 +144,7 @@ public sealed class ConfigDownloadGroupTests : IDisposable
             File.WriteAllText(local, "cached fixture");
         }
 
-        string[] variables = { "MAX_CONTEXT", "TS_Q4E_HC_Q8", "TS_Q4E_VERIFY_ROW_KERNELS" };
+        string[] variables = { "MAX_CONTEXT", "TS_Q4E_HC_Q8" };
         string?[] before = variables.Select(Environment.GetEnvironmentVariable).ToArray();
         foreach (string name in variables) NativeEnvironment.Set(name, null);
         try
@@ -160,8 +160,8 @@ public sealed class ConfigDownloadGroupTests : IDisposable
             Assert.Equal("ggml_metal", expanded[Array.IndexOf(expanded, "--backend") + 1]);
             Assert.Equal("32768", Environment.GetEnvironmentVariable("MAX_CONTEXT"));
             Assert.Equal("1", Environment.GetEnvironmentVariable("TS_Q4E_HC_Q8"));
-            // Batched verify is the ggml_metal default; the preset does not set the switch.
-            Assert.Null(Environment.GetEnvironmentVariable("TS_Q4E_VERIFY_ROW_KERNELS"));
+            // The preset sets no other switch: the rest of its speed is the backend's defaults.
+            Assert.Equal(variables, config["environment"]!.AsObject().Select(entry => entry.Key));
             var options = ServerOptionsBuilder.Build(expanded, _directory);
             Assert.Equal(1.0f, options.DefaultSamplingConfig.Temperature);
 

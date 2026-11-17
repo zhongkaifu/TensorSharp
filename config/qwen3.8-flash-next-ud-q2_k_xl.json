@@ -18,9 +18,8 @@
   // forward, accepted rows committed without a re-forward) 31.3 / 25.7 / 32.5; time to first token 0.8 / 6.4 / 0.5 s (was 3.1 / 13.6 / 2.8). See
   // docs/models/qwen38-flash-next.md ("Larger than memory", "Speculative decoding").
   //
-  // NVIDIA: the direct engine (--backend cuda) is the fastest there but has no MTP head; pass
-  // --backend cuda --no-spec, or --backend ggml_cuda to keep the head (measured gains are
-  // smaller there; prose can be slower). ggml_cpu also works.
+  // NVIDIA: --backend cuda (the shared runtime on the CUDA graph executor, MTP head included)
+  // or --backend ggml_cuda; neither was measured with this file. ggml_cpu also works.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "root": "${modelRoot}/qwen3.8-flash-next",

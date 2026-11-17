@@ -250,6 +250,9 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
 internal sealed class Qwen35DenseSyntheticModelBuilder
 {
     public const int Hidden = 256;
+    /// <summary>The hidden width (embedding_length): wider rows than the 256 default make the row norms' reductions
+    /// span several values a thread.</summary>
+    public int Width { get; init; } = Hidden;
     public const int NumHeads = 8;
     public const int NumKvHeads = 2;         // group 4, as the 0.8B (8 / 2)
     public const int HeadDim = 256;
@@ -331,7 +334,7 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
             new U32 { Key = $"{a}.block_count", V = (uint)(Layers + (NextN ? 1 : 0)) },
             new U32 { Key = $"{a}.nextn_predict_layers", V = NextN ? 1u : 0u },
             new U32 { Key = $"{a}.context_length", V = 4096 },
-            new U32 { Key = $"{a}.embedding_length", V = Hidden },
+            new U32 { Key = $"{a}.embedding_length", V = (uint)Width },
             new U32 { Key = $"{a}.feed_forward_length", V = (uint)Ff },
             new U32 { Key = $"{a}.attention.head_count", V = NumHeads },
             new U32 { Key = $"{a}.attention.head_count_kv", V = NumKvHeads },
@@ -352,48 +355,48 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
 
         var t = new List<Tensor>
         {
-            W(Gen("token_embd.weight", EmbeddingScale, Hidden, Vocab)),   // tied output head, as the 0.8B
-            GenAround("output_norm.weight", 1f, 0.1f, Hidden),
+            W(Gen("token_embd.weight", EmbeddingScale, Width, Vocab)),   // tied output head, as the 0.8B
+            GenAround("output_norm.weight", 1f, 0.1f, Width),
         };
         if (UntiedOutput)
-            t.Add(W(Gen("output.weight", 0.08f, Hidden, Vocab)));
+            t.Add(W(Gen("output.weight", 0.08f, Width, Vocab)));
         int qkvDim = 2 * SsmKHeads * SsmHeadDim + SsmInner;
         for (int l = 0; l < Layers + (NextN ? 1 : 0); l++)
         {
             string p = $"blk.{l}.";
-            t.Add(GenAround(p + "attn_norm.weight", 1f, 0.1f, Hidden));
-            t.Add(GenAround(p + "post_attention_norm.weight", 1f, 0.1f, Hidden));
+            t.Add(GenAround(p + "attn_norm.weight", 1f, 0.1f, Width));
+            t.Add(GenAround(p + "post_attention_norm.weight", 1f, 0.1f, Width));
             if (l == Layers)
             {
-                t.Add(W(Gen(p + "nextn.eh_proj.weight", 0.06f, 2 * Hidden, Hidden)));
-                t.Add(GenAround(p + "nextn.enorm.weight", 1f, 0.1f, Hidden));
-                t.Add(GenAround(p + "nextn.hnorm.weight", 1f, 0.1f, Hidden));
-                t.Add(GenAround(p + "nextn.shared_head_norm.weight", 1f, 0.1f, Hidden));
+                t.Add(W(Gen(p + "nextn.eh_proj.weight", 0.06f, 2 * Width, Width)));
+                t.Add(GenAround(p + "nextn.enorm.weight", 1f, 0.1f, Width));
+                t.Add(GenAround(p + "nextn.hnorm.weight", 1f, 0.1f, Width));
+                t.Add(GenAround(p + "nextn.shared_head_norm.weight", 1f, 0.1f, Width));
             }
             if (l < Layers && (l + 1) % 4 != 0)
             {
-                t.Add(W(Gen(p + "attn_qkv.weight", 0.06f, Hidden, qkvDim)));
-                t.Add(W(Gen(p + "attn_gate.weight", 0.06f, Hidden, SsmInner)));
-                t.Add(W(Gen(p + "ssm_alpha.weight", 0.06f, Hidden, SsmVHeads)));
-                t.Add(W(Gen(p + "ssm_beta.weight", 0.06f, Hidden, SsmVHeads)));
+                t.Add(W(Gen(p + "attn_qkv.weight", 0.06f, Width, qkvDim)));
+                t.Add(W(Gen(p + "attn_gate.weight", 0.06f, Width, SsmInner)));
+                t.Add(W(Gen(p + "ssm_alpha.weight", 0.06f, Width, SsmVHeads)));
+                t.Add(W(Gen(p + "ssm_beta.weight", 0.06f, Width, SsmVHeads)));
                 t.Add(GenAround(p + "ssm_a", -1f, 0.25f, SsmVHeads));
                 t.Add(Gen(p + "ssm_dt.bias", 0.5f, SsmVHeads));
                 t.Add(Gen(p + "ssm_conv1d.weight", 0.3f, SsmConv, qkvDim));
                 t.Add(GenAround(p + "ssm_norm.weight", 1f, 0.1f, SsmHeadDim));
-                t.Add(W(Gen(p + "ssm_out.weight", 0.04f, SsmInner, Hidden)));
+                t.Add(W(Gen(p + "ssm_out.weight", 0.04f, SsmInner, Width)));
             }
             else
             {
-                t.Add(W(Gen(p + "attn_q.weight", 0.06f, Hidden, 2 * NumHeads * HeadDim)));   // Q and its gate
-                t.Add(W(Gen(p + "attn_k.weight", 0.06f, Hidden, NumKvHeads * HeadDim)));
-                t.Add(W(Gen(p + "attn_v.weight", 0.06f, Hidden, NumKvHeads * HeadDim)));
+                t.Add(W(Gen(p + "attn_q.weight", 0.06f, Width, 2 * NumHeads * HeadDim)));   // Q and its gate
+                t.Add(W(Gen(p + "attn_k.weight", 0.06f, Width, NumKvHeads * HeadDim)));
+                t.Add(W(Gen(p + "attn_v.weight", 0.06f, Width, NumKvHeads * HeadDim)));
                 t.Add(GenAround(p + "attn_q_norm.weight", 1f, 0.1f, HeadDim));
                 t.Add(GenAround(p + "attn_k_norm.weight", 1f, 0.1f, HeadDim));
-                t.Add(W(Gen(p + "attn_output.weight", 0.04f, NumHeads * HeadDim, Hidden)));
+                t.Add(W(Gen(p + "attn_output.weight", 0.04f, NumHeads * HeadDim, Width)));
             }
-            t.Add(W(Gen(p + "ffn_gate.weight", 0.06f, Hidden, Ff)));
-            t.Add(W(Gen(p + "ffn_up.weight", 0.06f, Hidden, Ff)));
-            t.Add(W(Gen(p + "ffn_down.weight", 0.05f, Ff, Hidden)));
+            t.Add(W(Gen(p + "ffn_gate.weight", 0.06f, Width, Ff)));
+            t.Add(W(Gen(p + "ffn_up.weight", 0.06f, Width, Ff)));
+            t.Add(W(Gen(p + "ffn_down.weight", 0.05f, Ff, Width)));
         }
         if (Prism) ApplyPrism(kv, t);
         SyntheticGguf.Write(path, kv, t);

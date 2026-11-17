@@ -66,7 +66,6 @@ class NgramTests(unittest.TestCase):
         self.assertNotIn("TS_SPEC_DRAFT_MODEL", kwargs["env"])
         self.assertNotIn("TS_QWEN35_DFLASH", kwargs["env"])
         self.assertEqual(kwargs["env"]["TS_N_CPU_MOE"], "2")
-        self.assertEqual(kwargs["env"]["TS_Q4E_VERIFY_ROW_KERNELS"], "1")
         self.assertTrue(result["evidence"]["parity"]["activated"])
         self.assertTrue(result["inputs"]["sources"])
         self.assertEqual(result["inputs"]["sampling"]["seed"], -1)
