@@ -218,14 +218,20 @@ namespace TensorSharp.Cuda
 
         /// <summary>A prompt chunk's or a decode row's K/V rows into the head-first cache (F32 or F16) with the
         /// per-op path's kernel.</summary>
-        protected override bool TryWriteRows(Tensor dst, Tensor src, int first, int count)
+        protected override bool TryWriteRows(Tensor dst, Tensor src, int first, int count) => WriteRows(dst, src, first, count, circular: false);
+
+        /// <summary>A ring's rows past its last cell (a sliding-window layer's ring cache: an F16 one had no copy that converts
+        /// a strided run) in the same kernel, its cells taken modulo the ring.</summary>
+        protected override bool TryWriteRingRows(Tensor dst, Tensor src, int first, int count) => WriteRows(dst, src, first, count, circular: true);
+
+        private static bool WriteRows(Tensor dst, Tensor src, int first, int count, bool circular)
         {
             if (dst.DimensionCount is < 2 or > 3 || !dst.IsContiguous()) return false;
             using Tensor cache = HeadFirst(dst);
             using Tensor rows = src.View(src.Sizes[^3], src.Sizes[^2], src.Sizes[^1]);
             Tensor contiguous = rows.IsContiguous() ? rows.CopyRef() : Ops.NewContiguous(rows);
             using (contiguous)
-                return CudaFusedOps.TryCopyHeadFirstToCache(cache, contiguous, first, count, (int)cache.Sizes[1], false);
+                return CudaFusedOps.TryCopyHeadFirstToCache(cache, contiguous, first, count, (int)cache.Sizes[1], circular);
         }
 
         /// <summary>A head-first cache or window [heads, cells, dim] as the kernels take it: a single head's binds as

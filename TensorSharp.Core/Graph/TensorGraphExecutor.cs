@@ -69,6 +69,11 @@ namespace TensorSharp.Graph
         /// <paramref name="src"/> ([.., count, ne0], F32) with a backend kernel; false to use copies.</summary>
         protected virtual bool TryWriteRows(Tensor dst, Tensor src, int first, int count) => false;
 
+        /// <summary>Write rows (<paramref name="first"/> + i) mod cells of <paramref name="dst"/> (along ne1) from
+        /// <paramref name="src"/> ([.., count, ne0], F32): a ring's write that passes its last cell (a sliding-window layer's
+        /// ring cache, a block drafter's K/V ring) in one backend kernel; false to copy each run of cells.</summary>
+        protected virtual bool TryWriteRingRows(Tensor dst, Tensor src, int first, int count) => false;
+
         /// <summary>The backend's element-wise kernels read strided views (no contiguous copy first).</summary>
         protected virtual bool KernelsReadStridedViews => false;
 
@@ -2253,9 +2258,17 @@ namespace TensorSharp.Graph
             for (int i = 0; i < count; i++)
                 if (rows[i] < 0 || rows[i] >= d4.Sizes[2])
                     throw new InvalidOperationException($"set_rows index {rows[i]} outside {d4.Sizes[2]} rows");
-            bool run1 = true;
-            for (int i = 1; i < count; i++) run1 &= rows[i] == rows[0] + i;
+            bool run1 = true, ring = true;
+            long cells = d4.Sizes[2];
+            for (int i = 1; i < count; i++)
+            {
+                run1 &= rows[i] == rows[0] + i;
+                ring &= rows[i] == (rows[0] + i) % cells;
+            }
             if (run1 && TryWriteRows(dst, s4, rows[0], count)) return dst;
+            // A ring's write past its last cell: one kernel where the backend has one. Its runs copied apart converted F32 rows
+            // into an F16 ring through the generic copy, which direct CUDA has no strided converting kernel for.
+            if (!run1 && ring && TryWriteRingRows(dst, s4, rows[0], count)) return dst;
             // Each run of consecutive rows in one copy: a ring's write that wraps (a block drafter's prompt inject, 1,569 rows
             // into a 2,080-row ring) is two, where a copy a row took 6 ms a layer on CUDA.
             for (int i = 0; i < count;)

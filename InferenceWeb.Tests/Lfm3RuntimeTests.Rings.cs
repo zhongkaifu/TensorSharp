@@ -164,9 +164,9 @@ public sealed partial class Lfm3RuntimeTests
     [MlxFact]
     public void LongPromptsOverProductionRingsOnMlxMatchTheReferenceForward() => AssertLongPromptMatchesReference(BackendType.Mlx, graphs: true);
 
-    private void AssertLongPromptMatchesReference(BackendType backend, bool graphs)
+    private void AssertLongPromptMatchesReference(BackendType backend, bool graphs, KvCacheDtype kv = KvCacheDtype.F32, double tolerance = 0)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
         Lfm3SyntheticModelBuilder builder = Builder("f32");
         string path = builder.Write(Path.Combine(_dir, "lfm3-f32-long.gguf"));
         var reference = new Lfm3Reference(builder);
@@ -184,8 +184,7 @@ public sealed partial class Lfm3RuntimeTests
             model.ResetKVCache();
             var actual = new List<float[]> { (float[])model.ForwardRefill(prompt).Clone() };
             foreach (int token in decode) actual.Add((float[])model.Forward(new[] { token }).Clone());
-            double tolerance = backend == BackendType.Cpu ? 2e-5 : 5e-3;
-            AssertRows(actual, expected, tolerance, $"{backend} graphs={graphs} round {round}");
+            AssertRows(actual, expected, tolerance > 0 ? tolerance : backend == BackendType.Cpu ? 2e-5 : 5e-3, $"{backend} graphs={graphs} kv={kv} round {round}");
         }
     }
 

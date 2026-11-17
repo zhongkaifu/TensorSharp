@@ -677,6 +677,9 @@ namespace TensorSharp.Models
         /// <summary>Decode steps recorded on the device (tests check how often a request records).</summary>
         internal int DecodeRecordings { get; private set; }
 
+        /// <summary>Kept decode steps that ran as their device recording's replay (tests check that recordings serve steps).</summary>
+        internal int RecordedDecodeReplays { get; private set; }
+
         private bool _slidingWindowUnrecordedReported;
 
         /// <summary>Kept decode steps a recorder ran unrecorded because a sliding-window layer's floor moved inside its window.</summary>
@@ -781,6 +784,7 @@ namespace TensorSharp.Models
                         return false;
                     }
                     r.Capture.MarkWritten(r.CaptureOutputs);
+                    RecordedDecodeReplays++;
                 }
                 for (int o = 0; o < r.CaptureOutputs.Length; o++)
                 {

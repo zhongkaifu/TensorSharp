@@ -70,9 +70,12 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
         return rows;
     }
 
-    /// <summary>Backends whose matmuls round activations (ggml_cpu to BF16 / Q8; ggml_cuda and ggml_vulkan likewise).</summary>
+    /// <summary>Backends whose matmuls round activations (ggml_cpu to BF16 / Q8; ggml_cuda and ggml_vulkan likewise; direct
+    /// CUDA's BF16 GEMMs past a few rows and its per-op BF16 products take BF16 activations, its quantized products q8_1 ones:
+    /// A40, 2026-11-17, a 43-row prompt read whole sits 1.04e-2 from the same prompt read a token at a time on BF16 weights,
+    /// 4e-7 on F32 weights).</summary>
     private static bool RoundsActivations(BackendType backend)
-        => backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlVulkan;
+        => backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.Cuda;
 
     private static double RelL2(float[] a, float[] b)
     {
@@ -141,9 +144,9 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [MlxFact]
     public void MlxMatchesTheReferenceForward() => AssertMatchesReference(BackendType.Mlx, graphs: true, 5e-3);
 
-    private void AssertMatchesReference(BackendType backend, bool graphs, double tolerance)
+    private void AssertMatchesReference(BackendType backend, bool graphs, double tolerance, KvCacheDtype kv = KvCacheDtype.F32)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
         Lfm3SyntheticModelBuilder builder = Builder("f32");
         string path = builder.Write(Path.Combine(_dir, "lfm3-f32.gguf"));
         var reference = new Lfm3Reference(builder);
@@ -252,10 +255,12 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
 
     /// <summary>The managed executor rounds the activations of a quantized product as ggml-cpu does (q8 on ggml_cpu sits 9e-8
     /// from it where no window slides), and that rounding flips with the last bits of its inputs: against a backend that does
-    /// not round them (ggml_metal, MLX) a quantized fixture sits 3-6e-2 away, as the real Q8_0 checkpoint's CPU and Metal runs
-    /// of llama.cpp itself do (2-4e-2). Unquantized fixtures compare tightly.</summary>
+    /// not round them the same way (ggml_metal, MLX; ggml_cuda, ggml_vulkan and direct CUDA, whose prompt products round
+    /// otherwise) a quantized fixture sits 3-6e-2 away (A40: ggml_cuda 6.0e-2 q8, 6.4e-2 nvfp4; direct CUDA 3.6e-2 q8,
+    /// 5.0e-2 nvfp4), as the real Q8_0 checkpoint's CPU and Metal runs of llama.cpp itself do (2-4e-2). Unquantized fixtures
+    /// compare tightly.</summary>
     private static double Tolerance(string variant, BackendType backend)
-        => variant is "q8" or "nvfp4" ? (RoundsActivations(backend) ? 5e-2 : 8e-2) : RoundsActivations(backend) ? 2.5e-2 : 5e-3;
+        => variant is "q8" or "nvfp4" ? (backend == BackendType.GgmlCpu ? 5e-2 : 8e-2) : RoundsActivations(backend) ? 2.5e-2 : 5e-3;
 
     /// <summary>On every graph executor each step (attention, short convolutions on the slot's window) runs as one graph and
     /// computes what the per-op path computes.</summary>
@@ -289,11 +294,12 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     /// <summary>One request alternating between graph steps and per-op steps (as an adapter step forces) keeps its caches and
     /// short-conv windows coherent across both bindings.</summary>
     [Fact]
-    public void GraphAndPerOpStepsShareTheState()
+    public void GraphAndPerOpStepsShareTheState() => AssertGraphAndPerOpShareTheState(TestGates.PinnedGgmlBackend);
+
+    private void AssertGraphAndPerOpShareTheState(BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture("dense");
-        BackendType backend = TestGates.PinnedGgmlBackend;
         int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
         int[] tokens = { 71, 72, 73, 74, 75, 76 };
         var perOp = new List<float[]>();
@@ -311,7 +317,7 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
             rows.Add((float[])mixed.Forward(new[] { tokens[i] }).Clone());
         }
         Assert.True(mixed.GraphRuns > 0);
-        AssertRows(rows, perOp, RoundsActivations(backend) ? 2.5e-2 : 5e-3, "mixed vs per-op");
+        AssertRows(rows, perOp, RoundsActivations(backend) ? 2.5e-2 : 5e-3, $"mixed vs per-op on {backend}");
     }
 
     // ---------------------------------------------------------------- the sliding window
@@ -330,10 +336,10 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [MlxFact]
     public void PromptMatchesTokenByTokenAndChunkedAcrossTheWindowOnMlx() => AssertPromptPaths(BackendType.Mlx);
 
-    private void AssertPromptPaths(BackendType backend)
+    private void AssertPromptPaths(BackendType backend, KvCacheDtype kv = KvCacheDtype.F32, string variant = "dense", double tolerance = 0)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
-        string path = Fixture("dense");
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
+        string path = Fixture(variant);
         int[] prompt = Enumerable.Range(0, 43).Select(i => 40 + (i * 13) % 170).ToArray();
         using var model = Create(path, backend: backend);
         float[] whole = (float[])model.ForwardRefill(prompt).Clone();
@@ -353,9 +359,10 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
         }
         Assert.Equal(prompt.Length, at);
         AssertRingsWrapped(model, prompt.Length);
-        double tolerance = RoundsActivations(backend) ? 2.5e-2 : 2e-3;
-        Assert.True(RelL2(stepped, whole) <= tolerance, $"{backend}: token by token vs whole relL2 {RelL2(stepped, whole):E2}");
-        Assert.True(RelL2(chunked, whole) <= tolerance, $"{backend}: chunked vs whole relL2 {RelL2(chunked, whole):E2}");
+        if (tolerance == 0) tolerance = RoundsActivations(backend) ? 2.5e-2 : 2e-3;
+        _output.WriteLine($"{backend} kv={kv}: token by token vs whole relL2 {RelL2(stepped, whole):E2}, chunked vs whole {RelL2(chunked, whole):E2}");
+        Assert.True(RelL2(stepped, whole) <= tolerance, $"{backend} kv={kv}: token by token vs whole relL2 {RelL2(stepped, whole):E2}");
+        Assert.True(RelL2(chunked, whole) <= tolerance, $"{backend} kv={kv}: chunked vs whole relL2 {RelL2(chunked, whole):E2}");
     }
 
     /// <summary>A decode step that repeats the last one a position on runs again without a trace, past the window and across
@@ -364,11 +371,15 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [Theory]
     [InlineData("ggml")]
     [InlineData("managed")]
-    public void AdvancedDecodeStepsMatchTracedOnes(string executor)
+    public void AdvancedDecodeStepsMatchTracedOnes(string executor) => AssertAdvancedDecodeMatchesTraced(BackendOf(executor), KvCacheDtype.F32);
+
+    /// <summary><see cref="AdvancedDecodeStepsMatchTracedOnes"/> on <paramref name="backend"/>; <paramref name="advanced"/> sees
+    /// the model whose steps advanced (a recorder's counters) before it is disposed.</summary>
+    private void AssertAdvancedDecodeMatchesTraced(BackendType backend, KvCacheDtype kv, string path = null,
+        Action<Lfm3RuntimeModel> advanced = null, int minAdvances = 250)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
-        string path = Fixture("dense");
-        BackendType backend = executor == "ggml" ? TestGates.PinnedGgmlBackend : BackendType.Cpu;
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
+        path ??= Fixture("dense");
 
         List<float[]> Run(bool advance, out int advances)
         {
@@ -409,16 +420,17 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
             Decode(new[] { "b" }, 260);
             advances = model.DecodeAdvances;
             AssertRingsWrapped(model, 0);
+            if (advance) advanced?.Invoke(model);
             return trace;
         }
 
         List<float[]> traced = Run(advance: false, out int none);
-        List<float[]> advanced = Run(advance: true, out int advances);
+        List<float[]> stepped = Run(advance: true, out int advances);
         Assert.Equal(0, none);
-        Assert.True(advances > 250, $"{advances} decode steps advanced");
-        Assert.Equal(traced.Count, advanced.Count);
+        Assert.True(advances > minAdvances, $"{advances} decode steps advanced");
+        Assert.Equal(traced.Count, stepped.Count);
         for (int i = 0; i < traced.Count; i++)
-            Assert.True(traced[i].AsSpan().SequenceEqual(advanced[i]), $"row {i}: advanced logits differ (relL2 {RelL2(advanced[i], traced[i]):E2})");
+            Assert.True(traced[i].AsSpan().SequenceEqual(stepped[i]), $"{backend} kv={kv} row {i}: advanced logits differ (relL2 {RelL2(stepped[i], traced[i]):E2})");
     }
 
     /// <summary>
@@ -433,11 +445,11 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     public void VerifyWindowsAcrossTheWindowCommitTheKeptRows(string executor)
         => AssertVerifyWindowCommits(executor, new[] { 41, 52, 63, 74, 85, 96 });
 
-    private void AssertVerifyWindowCommits(string executor, int[] prompt)
+    private void AssertVerifyWindowCommits(string executor, int[] prompt, KvCacheDtype kv = KvCacheDtype.F32, double tolerance = 0)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
         string path = Fixture("dense");
-        BackendType backend = executor == "ggml" ? TestGates.PinnedGgmlBackend : BackendType.Cpu;
+        BackendType backend = BackendOf(executor);
         int[] window = { 101, 112, 123, 134, 145 };
         int[] after = { 77, 78, 79 };
         const int kept = 2;
@@ -448,7 +460,7 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
         using (var reference = Create(path, backend: backend))
         {
             vocab = reference.Config.VocabSize;
-            reference.GraphLoweringEnabled = executor != "per-op";
+            reference.GraphLoweringEnabled = !PerOp(executor);
             reference.ForwardRefill(prompt);
             foreach (int t in window) plain.Add((float[])reference.Forward(new[] { t }).Clone());
             reference.ResetKVCache();
@@ -457,12 +469,12 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
         }
 
         using var model = Create(path, backend: backend);
-        model.GraphLoweringEnabled = executor != "per-op";
+        model.GraphLoweringEnabled = !PerOp(executor);
         var spec = (ISpeculativeModel)model;
         model.ForwardRefill(prompt);
         var logits = new float[window.Length * vocab];
         spec.SpecForward(window, null, logits, allLogitsRows: true);
-        double tolerance = RoundsActivations(backend) ? 2.5e-2 : 2e-3;
+        if (tolerance == 0) tolerance = RoundsActivations(backend) ? 2.5e-2 : 2e-3;
         for (int r = 0; r < window.Length; r++)
         {
             float[] row = logits.AsSpan(r * vocab, vocab).ToArray();
@@ -531,22 +543,27 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [MlxFact]
     public void SlotBatchesMatchEachSequenceAloneOnMlx() => CompareSlotBatches(1, 1, BackendType.Mlx);
 
-    private void CompareSlotBatches(int tp, int stages, BackendType backend)
+    private void CompareSlotBatches(int tp, int stages, BackendType backend, KvCacheDtype kv = KvCacheDtype.F32, double tolerance = 0)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
         string path = Fixture("dense");
         // The managed executor's batched rows sit 1.5e-6 from the lone ones (its F32 products' blocking follows the rows).
-        double tolerance = backend == BackendType.Cpu ? 1e-5 : RoundsActivations(backend) ? 2.5e-2 : 5e-3;
-        SlotParity.AssertBatchedSlotsMatchAlone(() => Create(path, tp, stages, backend), tolerance, $"lfm3 tp={tp} stages={stages} {backend}");
+        if (tolerance == 0) tolerance = backend == BackendType.Cpu ? 1e-5 : RoundsActivations(backend) ? 2.5e-2 : 5e-3;
+        SlotParity.AssertBatchedSlotsMatchAlone(() => Create(path, tp, stages, backend), tolerance, $"lfm3 tp={tp} stages={stages} {backend} kv={kv}");
     }
 
     public static TheoryData<int, int> BatchedPlacements() => new() { { 1, 1 }, { 2, 1 }, { 1, 2 }, { 2, 2 } };
 
     [Theory]
     [MemberData(nameof(BatchedPlacements))]
-    public async Task ConcurrentRequestsAreBatched(int tp, int stages)
+    public Task ConcurrentRequestsAreBatched(int tp, int stages) => AssertConcurrentRequestsAreBatched(tp, stages, BackendType.Cpu, KvCacheDtype.F32);
+
+    /// <summary>The engine's greedy streams of three requests served together on <paramref name="backend"/> equal each request's
+    /// alone on the same backend (<paramref name="nearTie"/>: a stream may part only where plain greedy's top two logits are
+    /// that close, for backends whose batched rows round apart from lone ones).</summary>
+    private async Task AssertConcurrentRequestsAreBatched(int tp, int stages, BackendType backend, KvCacheDtype kv, double nearTie = 0)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
         string path = Fixture("dense");
         const int maxNewTokens = 8;
         var prompts = new List<int[]>
@@ -557,25 +574,29 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
         };
 
         var expected = new List<int[]>();
-        using (var reference = Create(path))
+        var margins = new List<double[]>();
+        using (var reference = Create(path, backend: backend))
         {
             foreach (int[] prompt in prompts)
             {
                 reference.ResetKVCache();
                 float[] logits = reference.ForwardRefill(prompt);
                 var produced = new List<int>();
+                var margin = new List<double>();
                 for (int i = 0; i < maxNewTokens; i++)
                 {
                     int token = ArgMax(logits);
                     produced.Add(token);
+                    margin.Add(TopTwoMargin(logits));
                     if (reference.Tokenizer.EosTokenIds.Contains(token)) break;
                     if (i + 1 < maxNewTokens) logits = reference.Forward(new[] { token });
                 }
                 expected.Add(produced.ToArray());
+                margins.Add(margin.ToArray());
             }
         }
 
-        using var model = Create(path, tp, stages);
+        using var model = Create(path, tp, stages, backend);
         Assert.True(((IBatchedPagedModel)model).SupportsPerSequenceFusedForward);
         var cfg = new SchedulerConfig
         {
@@ -604,8 +625,25 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
         {
             int n = Math.Min(outputs[i].Length, expected[i].Length);
             Assert.True(n > 0, $"request {i} produced nothing");
-            Assert.Equal(expected[i].Take(n), outputs[i].Take(n));
+            // Equal up to the first step whose plain greedy is a near-tie (none with nearTie 0).
+            int at = Enumerable.Range(0, n).FirstOrDefault(t => outputs[i][t] != expected[i][t], -1);
+            if (at >= 0)
+                Assert.True(margins[i][at] <= nearTie,
+                    $"{backend} request {i} parts from its lone greedy stream at token {at} ({outputs[i][at]} vs {expected[i][at]}, top-two margin {margins[i][at]:E2})");
         }
+    }
+
+    /// <summary>The relative gap between the two largest logits.</summary>
+    private static double TopTwoMargin(float[] logits)
+    {
+        float first = float.NegativeInfinity, second = float.NegativeInfinity, scale = 0;
+        foreach (float v in logits)
+        {
+            scale = Math.Max(scale, Math.Abs(v));
+            if (v > first) { second = first; first = v; }
+            else if (v > second) second = v;
+        }
+        return (first - second) / Math.Max(scale, 1e-30f);
     }
 
     /// <summary>A shared-prefix checkpoint (attention rows and short-conv windows), cloned or written to a file and read back,
@@ -614,12 +652,13 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [InlineData("ggml")]
     [InlineData("managed")]
     public void CheckpointsContinueExactly(string executor)
+        => AssertCheckpointsContinue(BackendOf(executor), KvCacheDtype.F32, deviceCopies: executor == "ggml");
+
+    private void AssertCheckpointsContinue(BackendType backend, KvCacheDtype kv, bool deviceCopies)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
         string path = Fixture("dense");
-        bool ggml = executor == "ggml";
-        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(path, backend: ggml ? TestGates.PinnedGgmlBackend : BackendType.Cpu),
-            1e-5, $"lfm3 {executor}", deviceCopies: ggml);
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(path, backend: backend), 1e-5, $"lfm3 {backend} kv={kv}", deviceCopies);
     }
 
     /// <summary>Greedy speculative decoding (n-gram drafts, partly accepted) emits exactly the plain greedy tokens: a verify
@@ -628,12 +667,13 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [InlineData("ggml")]
     [InlineData("managed")]
     public void SpeculativeDecodingMatchesPlainGreedy(string executor)
+        => AssertSpeculationMatchesPlainGreedy(BackendOf(executor), KvCacheDtype.F32, RoundsActivations(BackendOf(executor)) ? 1e-2 : 0);
+
+    private void AssertSpeculationMatchesPlainGreedy(BackendType backend, KvCacheDtype kv, double tieTolerance)
     {
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
         string path = Fixture("dense");
-        BackendType backend = executor == "ggml" ? TestGates.PinnedGgmlBackend : BackendType.Cpu;
-        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, backend: backend), $"lfm3 {executor}",
-            tieTolerance: RoundsActivations(backend) ? 1e-2 : 0);
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, backend: backend), $"lfm3 {backend} kv={kv}", tieTolerance: tieTolerance);
     }
 
     /// <summary>Speculation on per-rank graphs (tensor parallelism 2): each rank's short-conv states keep their channels'
@@ -694,7 +734,7 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     [MlxFact]
     public void Nvfp4FeedForwardsOnMlxMatchTheManagedReference() => AssertNvfp4(BackendType.Mlx);
 
-    private void AssertNvfp4(BackendType backend)
+    private void AssertNvfp4(BackendType backend, double tolerance = 0)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture("nvfp4");
@@ -707,7 +747,7 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
         using var model = Create(path, backend: backend);
         int expectedType = ModelBase.WidensNvfp4ToF16(backend) ? 1 : 40;
         Assert.Equal(expectedType, model.QuantizedWeightTypeForTests("blk.0.ffn_down.weight"));
-        AssertRows(Script(model), reference, Tolerance("nvfp4", backend), $"nvfp4 on {backend}");
+        AssertRows(Script(model), reference, tolerance > 0 ? tolerance : Tolerance("nvfp4", backend), $"nvfp4 on {backend}");
     }
 
     /// <summary>The .scale sidecars matter: the same checkpoint with them ignored gives other logits (so the comparison above
