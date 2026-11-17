@@ -1205,8 +1205,7 @@ namespace TensorSharp.Runtime.Scheduling
                         // An ignore_eos request (fixed-length benchmarks) forwards it like
                         // any token and runs on to its limit; its consumer counts it and
                         // leaves its text out (ChatGenerationPipeline).
-                        if (_model.Tokenizer != null && _model.Tokenizer.IsEos(token)
-                            && seq.SamplingConfig?.IgnoreEos != true)
+                        if (BatchExecutor.EndsSequence(_model.Tokenizer, seq, token))
                         {
                             TruncateUnpublishedTail(seq, emittedCount);
                             LogSpeculationStatsIfAny(seq);

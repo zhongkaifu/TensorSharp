@@ -636,6 +636,24 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
             tieTolerance: RoundsActivations(backend) ? 1e-2 : 0);
     }
 
+    /// <summary>Two ignore_eos requests speculating together (n-gram) run through their EOS draws exactly as plain decoding
+    /// does, each to its length limit (the batched verify used to end a lane at an EOS anchor and then fail every request of
+    /// its next step). Scheduler logic, every family alike: the managed executor is exact.</summary>
+    [Fact]
+    public async Task IgnoreEosRequestsSpeculateThroughEos()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.NGram, MaxDraftTokens = 3, MinDraftProb = 0 };
+        var paths = new Dictionary<int, string>();
+        await SpeculativeRuntimeChecks.AssertIgnoreEosSpeculationMatchesPlain(eos =>
+        {
+            if (!paths.TryGetValue(eos, out string path))
+                paths[eos] = path = new Lfm3SyntheticModelBuilder { UntiedOutput = true, Eos = (uint)eos }
+                    .Write(Path.Combine(_dir, $"lfm3-eos{eos}.gguf"));
+            return Create(path);
+        }, 2, options, "lfm3 ignore_eos");
+    }
+
     /// <summary>Speculation on per-rank graphs (tensor parallelism 2): each rank's short-conv states keep their channels'
     /// verify history and commit on their own device.</summary>
     [Fact]
