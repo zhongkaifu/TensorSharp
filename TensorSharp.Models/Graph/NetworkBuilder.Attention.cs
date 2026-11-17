@@ -25,9 +25,10 @@ namespace TensorSharp.Models.Graph
                 throw new ArgumentException($"attention of q {q} over k {k}, v {v}");
             if (mask.Valid && (mask.Ne0 != keys || mask.Ne1 != rows || mask.Format != GraphFormat.F16))
                 throw new ArgumentException($"attention mask {mask}: F16 [keys {keys}, rows {rows}]");
-            NetValue qp = Permute(q, 0, 2, 1, 3);                                   // [d, rows, heads]
-            NetValue kp = Cont(Permute(k, 0, 2, 1, 3));                             // [d, keys, kvHeads]
-            NetValue scores = Emit(GraphOp.MulMat, kp, Cont(qp), keys, rows, heads, 1);   // [keys, rows, heads]
+            // Executors whose products read strided views (ggml-metal, ggml-cuda) take q and k as permuted views, as llama.cpp does.
+            NetValue qp = Packed(Permute(q, 0, 2, 1, 3));                           // [d, rows, heads]
+            NetValue kp = Packed(Permute(k, 0, 2, 1, 3));                           // [d, keys, kvHeads]
+            NetValue scores = Emit(GraphOp.MulMat, kp, qp, keys, rows, heads, 1);   // [keys, rows, heads]
             Span<int> srcs = stackalloc[] { scores.Id, mask.Valid ? mask.Id : 0 };
             NetValue p = new(_b.Op(GraphOp.SoftMaxExt, mask.Valid ? srcs : srcs[..1], default, stackalloc[] { scale, 0f }), keys, rows, heads, 1,
                 false, GraphFormat.F32);
