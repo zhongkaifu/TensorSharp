@@ -222,7 +222,7 @@ namespace TensorSharp.Cuda
             }
             // A padded decode window (its unwritten tail masked) runs its pattern over the written keys only.
             bool trimmed = mask.Pattern == MaskPattern.Explicit && mask.Trimmed != MaskPattern.Explicit && mask.Keys > 0;
-            if (q.DimensionCount == 3 && q.Sizes[1] > 1 && q.Sizes[1] <= CudaDecodeDynParams.WindowRowBlocks
+            if (q.DimensionCount == 3 && q.Sizes[1] > 1 && q.Sizes[1] <= WidestVerifyWindow
                 && TryWindowRowsAsDecode(q, k, v, mask, trimmed, scale, kWindow, vWindow, out Tensor byRow))
                 return byRow;
             if (mask.Pattern == MaskPattern.Explicit && !trimmed && TrySparseDecodeAttention(q, k, v, mask, scale, kWindow, vWindow, out Tensor sparse))
@@ -457,12 +457,14 @@ namespace TensorSharp.Cuda
         internal bool RingAttentionDisabledForTests { get; set; }
 
         /// <summary>
-        /// A verify window's rows (up to 8 a sequence, causal over the cache window or a sparse attention's selection) each
-        /// run as the decode row at their position: row r attends the window's keys less the nq - 1 - r after it, read on
-        /// the device from that row's block of the step's parameters when the step is recorded. The multi-row kernels split
-        /// the keys by the window's length (the flash kernel's split share), or ran another product altogether (an F32
-        /// cache, a selection), so a window row rounded apart from the decode row at its position, and speculative
-        /// decoding could answer other than plain greedy at a near-tie.
+        /// A verify window's rows (up to <see cref="WidestVerifyWindow"/> a sequence, causal over the cache window or a sparse
+        /// attention's selection) each run as the decode row at their position: row r attends the window's keys less the
+        /// nq - 1 - r after it, read on the device from the step's parameters when the step is recorded. The multi-row kernels
+        /// split the keys by the window's length (the flash kernel's split share), or ran another product altogether (an F32
+        /// cache, a selection), so a window row rounded apart from the decode row at its position, and speculative decoding
+        /// could answer other than plain greedy at a near-tie (9-16 row windows had taken them). One launch for the rows where
+        /// the flash kernels run; otherwise a launch a row, each reading its own block of the step's parameters (up to
+        /// <see cref="CudaDecodeDynParams.WindowRowBlocks"/> rows).
         /// </summary>
         private bool TryWindowRowsAsDecode(Tensor q, Tensor k, Tensor v, AttentionMask mask, bool trimmed, float scale,
             CacheWindow kWindow, CacheWindow vWindow, out Tensor attended)
@@ -482,6 +484,7 @@ namespace TensorSharp.Cuda
             if (selection && (whole == null || whole.DimensionCount != 2 || whole.Sizes[0] != nq)) return false;
             if (TryWindowRowsInOneLaunch(q, k, v, mask, selection, whole, keys, floor, scale, kWindow, vWindow, out attended))
                 return true;
+            if (nq > CudaDecodeDynParams.WindowRowBlocks) return false;
             var rowMasks = new List<Tensor>();
             using Tensor permuted = q.Permute(1, 0, 2);
             using Tensor byRow = Ops.NewContiguous(permuted);

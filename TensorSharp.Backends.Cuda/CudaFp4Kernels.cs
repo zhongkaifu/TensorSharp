@@ -12,7 +12,7 @@ namespace TensorSharp.Cuda
     /// <summary>
     /// NVFP4 products of the direct-CUDA backend's quantized matmul on GPUs whose image carries the block-scaled FP4
     /// tensor cores (tensorsharp_fp4_kernels: an sm_120a / sm_121a build). A resident NVFP4 matrix is kept as two planes,
-    /// codes [rows][k/2] then UE4M3 scales [rows][k/16] (<see cref="Repack"/>): up to 8 rows run the q8 matvec, more the
+    /// codes [rows][k/2] then UE4M3 scales [rows][k/16] (<see cref="Repack"/>): up to 16 rows run the q8 matvec, more the
     /// FP4 GEMMs (split over K for few rows, TMA-fed for prompt rows).
     /// </summary>
     internal sealed unsafe class CudaFp4Kernels : CudaPrefillModule
@@ -22,7 +22,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FP4_VERSION in tensorsharp_fp4_kernels.cu: bump both together whenever a kernel is added or
         /// changes its signature.</summary>
-        public const int CurrentVersion = 5;
+        public const int CurrentVersion = 6;
 
         /// <summary>K values one GEMM stage takes: a planar matrix's row width must be a multiple of it.</summary>
         public const int StageK = 256;
@@ -30,8 +30,10 @@ namespace TensorSharp.Cuda
         /// <summary>Weight rows one GEMM tile takes.</summary>
         public const int TileRows = 128;
 
-        /// <summary>Activation rows the q8 matvec takes; more run on the FP4 GEMMs.</summary>
-        public const int GemvMaxRows = 8;
+        /// <summary>Activation rows the q8 matvec takes (a decode step's and every verify window's: each row's sums a one-row
+        /// call's, so a window's rows are the decode rows bit for bit); more run on the FP4 GEMMs, whose activations are
+        /// quantized to NVFP4 (9-16 row windows of Qwen3.8-27B had taken them, their rows rounding far from the decode rows').</summary>
+        public const int GemvMaxRows = 16;
 
         /// <summary>Fewest activation rows the TMA-fed GEMM takes.</summary>
         public const int TmaMinRows = 65;

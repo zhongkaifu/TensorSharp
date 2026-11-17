@@ -897,9 +897,9 @@ namespace TensorSharp.Cuda
         /// always do; Q8_0 then takes its matvec rather than the int8 MMA GEMM.
         /// </summary>
         /// <summary>
-        /// result[rows, outDim] = input[rows, inDim] W^T for an NVFP4 matrix in the planar layout: up to 8 rows on the q8
-        /// matvec; more quantized to NVFP4 and multiplied on the FP4 tensor cores, TMA-fed from 65 rows, otherwise through
-        /// the cp.async GEMM split over K (up to 64 rows) as far as one wave of CTAs.
+        /// result[rows, outDim] = input[rows, inDim] W^T for an NVFP4 matrix in the planar layout: up to 16 rows (decode steps,
+        /// verify windows) on the q8 matvec; more quantized to NVFP4 and multiplied on the FP4 tensor cores, TMA-fed from 65
+        /// rows, otherwise through the cp.async GEMM split over K (up to 64 rows) as far as one wave of CTAs.
         /// </summary>
         private static void RunNvfp4Planar(CudaAllocator allocator, IntPtr planes, IntPtr inputPtr, IntPtr resultPtr, int inDim,
             int outDim, int rows)

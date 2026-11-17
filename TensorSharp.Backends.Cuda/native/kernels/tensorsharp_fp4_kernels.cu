@@ -14,11 +14,12 @@
 // the cp.async, TMA and vector loads need.
 //
 //   * ts_fp4_repack_nvfp4: ggml block_nvfp4 rows -> the planes (once, as the weight becomes resident).
-//   * ts_fp4_quantize_q81_f32 + ts_fp4_gemv_nvfp4_<n>: up to 8 rows (decode, verify windows) against q8 activations.
+//   * ts_fp4_quantize_q81_f32 + ts_fp4_gemv_nvfp4_<n>: up to 16 rows (decode, verify windows) against q8 activations, every
+//     row's sums a one-row call's.
 //   * ts_fp4_quantize_nvfp4_f32: F32 rows -> NVFP4 activation planes and row scales (ggml-cuda's quantize_mmq_nvfp4);
 //     ts_fp4_quantize_swiglu_nvfp4_f32 the planes of silu(gate) * up of fused gate|up rows, ts_fp4_add_rmsnorm_nvfp4_f32
 //     those of a residual add's RMSNorm.
-//   * ts_fp4_gemm_w4a4_<bn>: 9+ rows on the FP4 tensor cores through a cp.async ring, split over K for few rows.
+//   * ts_fp4_gemm_w4a4_<bn>: 17+ rows on the FP4 tensor cores through a cp.async ring, split over K for few rows.
 //   * ts_fp4_gemm_w4a4_tma<bm>: prompt rows, TMA-fed and warp-specialized (the same products in the same order);
 //     ts_fp4_gemm_w4a4_tma<bm>_swiglu a fused gate|up projection's rows with silu(gate) * up in the epilogue.
 //   * ts_fp4_get_rows_f32: rows of a planar matrix as F32 (an NVFP4 table's lookup).
@@ -38,7 +39,7 @@
 #define TS_FP4_NVFP4_BLOCK 64
 #define TS_FP4_NVFP4_BLOCK_BYTES 36
 
-#define TS_FP4_VERSION 5
+#define TS_FP4_VERSION 6
 
 __device__ __forceinline__ float ts_fp4_warp_sum(float v)
 {
@@ -147,7 +148,7 @@ extern "C" __global__ void ts_fp4_repack_nvfp4(
 }
 
 // ---------------------------------------------------------------------------
-// NVFP4 GEMV for N <= 8 activation rows. A warp owns R consecutive weight rows; lane l reads
+// NVFP4 GEMV for N <= 16 activation rows (a decode step's, a verify window's: each row's sums the same whatever N). A warp owns R consecutive weight rows; lane l reads
 // blocks l, l + 32, ... of each (36 contiguous bytes, so the warp's loads cover contiguous
 // spans) and every activation slice it loads serves all R rows: past a few activation rows the
 // kernel is bound by those loads, not by the weight stream.
@@ -248,12 +249,20 @@ TS_FP4_GEMV(5, TS_FP4_GEMV_ROWS(5))
 TS_FP4_GEMV(6, TS_FP4_GEMV_ROWS(6))
 TS_FP4_GEMV(7, TS_FP4_GEMV_ROWS(7))
 TS_FP4_GEMV(8, TS_FP4_GEMV_ROWS(8))
+TS_FP4_GEMV(9, TS_FP4_GEMV_ROWS(9))
+TS_FP4_GEMV(10, TS_FP4_GEMV_ROWS(10))
+TS_FP4_GEMV(11, TS_FP4_GEMV_ROWS(11))
+TS_FP4_GEMV(12, TS_FP4_GEMV_ROWS(12))
+TS_FP4_GEMV(13, TS_FP4_GEMV_ROWS(13))
+TS_FP4_GEMV(14, TS_FP4_GEMV_ROWS(14))
+TS_FP4_GEMV(15, TS_FP4_GEMV_ROWS(15))
+TS_FP4_GEMV(16, TS_FP4_GEMV_ROWS(16))
 
 /// Weight rows one warp of ts_fp4_gemv_nvfp4_<n> owns (the launcher sizes its grid by it).
 extern "C" __global__ void ts_fp4_gemv_rows_per_warp(int* out)
 {
 #pragma unroll
-    for (int n = 1; n <= 8; ++n)
+    for (int n = 1; n <= 16; ++n)
         out[n] = TS_FP4_GEMV_ROWS(n);
 }
 

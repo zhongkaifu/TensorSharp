@@ -56,11 +56,11 @@ public sealed class CudaNvfp4MatmulTests
                 Array.Copy(y.GetElementsAsFloat(outDim), 0, alone, r * outDim, outDim);
             }
 
-            // The matvec's rows: up to 8 where NVFP4 weights are planar for the FP4 tensor cores (more run on the GEMMs),
-            // up to 16 on the ggml blocks elsewhere.
+            // The matvec's rows: up to 16 (a decode step's or a verify window's) where NVFP4 weights are planar for the FP4
+            // tensor cores (more run on the GEMMs) and on the ggml blocks elsewhere.
             bool planar = allocator.Fp4Kernels != null;
             float[] got = null;
-            foreach (int rows in planar ? new[] { 2, 3, 4, 5, 8 } : new[] { 2, 3, 4, 5, 8, 9, 16 })
+            foreach (int rows in new[] { 2, 3, 4, 5, 8, 9, 12, 16 })
             {
                 using Tensor x = input.Narrow(0, 0, rows);
                 using var y = new Tensor(allocator, DType.Float32, rows, outDim);
