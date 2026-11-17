@@ -2670,7 +2670,7 @@ LiquidCodec 解码器）后即可说话。语音回复与文本运行在同一�
 | CLI `--speech-temperature T` | 语音编码的温度（默认取 mmproj 的 0.4）；文本仍用 `--temperature`。 |
 | CLI `--voice female\|male`、`--language CODE`、`--seed N` | 写入系统提示的音色与语言；语音采样器的种子。 |
 | `POST /v1/audio/speech` | `input`、`voice`（`female`/`male`；其他值，包括 OpenAI 默认的 `alloy`，返回 400 并列出可用音色）、`language`、`response_format` `wav`/`pcm`/`pcm16`、`stream: true`（分块；WAV 流以未知长度头开头）或 `stream_format: "audio"`/`"sse"`、`seed`、`temperature`、`max_frames`。`speed` 不为 1 时返回 400。 |
-| `POST /v1/chat/completions`、`POST /v1/responses` | `"modalities": ["text","audio"]`（交错：文本即转写）或 `["audio"]`，配合 `"audio": {"voice": "female", "format": "wav"\|"pcm16"}`（TensorSharp 还读取其中的 `language`、`seed`、`temperature`）。非流式：`message.audio = {id, expires_at, data, transcript}`；流式（仅 pcm16）：`delta.audio` 先发 `id`，再按顺序发 `transcript` 与 `data` 片段，最后是 `expires_at`。一小时内把回复以 `{"role":"assistant","audio":{"id":...}}` 发回，会按其转写渲染。 |
+| `POST /v1/chat/completions`、`POST /v1/responses` | `"modalities": ["text","audio"]`（交错：文本即转写；对话模式）或 `["audio"]`（纯语音，以 `<|audio_start|>` 开始：LFM3-Omni 会朗读用户的消息而不是回答，与 llama.cpp 相同），配合 `"audio": {"voice": "female", "format": "wav"\|"pcm16"}`（TensorSharp 还读取其中的 `language`、`seed`、`temperature`）。非流式：`message.audio = {id, expires_at, data, transcript}`；流式（仅 pcm16）：`delta.audio` 先发 `id`，再按顺序发 `transcript` 与 `data` 片段，最后是 `expires_at`。一小时内把回复以 `{"role":"assistant","audio":{"id":...}}` 发回，会按其转写渲染。 |
 | `GET /v1/models` | 会说话的模型列出 `"capabilities": ["chat","audio_output"]` 及其音色。 |
 
 LFM3-Omni 的文本回复永不采样媒体占位符，纯文本回复也不会开启语音（禁止 `<|audio_start|>`、`<|mixed_start|>`），
