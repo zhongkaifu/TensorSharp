@@ -261,9 +261,12 @@ namespace TensorSharp.Models
         {
             const long f = sizeof(float);
             long width = channels;
-            // Decode rows (every sequence one row) take the packed product once; other steps take its three row blocks as their
-            // own products, so each is contiguous for the executors that copy strided operands.
-            bool split = step.Rows > step.Sequences;
+            // Decode rows (every sequence one row) take the packed product once, and so do prompt chunks where the executor's
+            // element-wise ops read its row blocks where they lie (GraphCapabilities.PackedProductBlocks: one product of 3C rows,
+            // as llama.cpp's graph takes it, not three); elsewhere a chunk takes the three row blocks as their own products, so
+            // each is contiguous for the executors that copy strided operands.
+            bool packedBlocks = GraphExecutor?.Capabilities.PackedProductBlocks == true;
+            bool split = step.Rows > step.Sequences && !packedBlocks;
             int proj = -1, bAll = -1, cAll = -1, xAll = -1;
             if (split)
             {
@@ -291,9 +294,15 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    b = step.Cont(step.View2(proj, width, count, packed, first * packed));
-                    c = step.Cont(step.View2(proj, width, count, packed, first * packed + width * f));
-                    x = step.Cont(step.View2(proj, width, count, packed, first * packed + 2 * width * f));
+                    b = step.View2(proj, width, count, packed, first * packed);
+                    c = step.View2(proj, width, count, packed, first * packed + width * f);
+                    x = step.View2(proj, width, count, packed, first * packed + 2 * width * f);
+                    if (!packedBlocks)
+                    {
+                        b = step.Cont(b);
+                        c = step.Cont(c);
+                        x = step.Cont(x);
+                    }
                 }
                 var state = (ShortConvState)step.SequenceState(s, layer);
                 int window = step.State(state.Conv, GraphFormat.F32, convRows, channels);

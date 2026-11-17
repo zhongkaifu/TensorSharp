@@ -2230,10 +2230,20 @@ namespace TensorSharp.Models
                     step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads),
                     step.WriteRows(step.Starts[0], step.Counts[0], 0), heads, kvHeads, d, dv));
             }
+            // Where the executor's ops read a packed product's row blocks where they lie (GraphCapabilities.PackedProductBlocks),
+            // a fused QKV product's queries and keys go to the family's prep as its views (the norms and rotary write fresh
+            // rows) and one sequence's values to the cache writes (set_rows reads any strides): no copies of every prompt
+            // chunk's q, k and v. Elsewhere, and for what the prep leaves a view, contiguous copies.
+            bool blocks = GraphExecutor.Capabilities.PackedProductBlocks && !prep;
+            if (!blocks)
+            {
+                q = step.Cont(q);
+                k = step.Cont(k);
+            }
+            if (!blocks || step.Sequences > 1 || !Indexed(step.Counts[0]) || _graphTpRanks != null) v = step.Cont(v);
+            EmitQueryKey(step, layer, ref q, ref k);
             q = step.Cont(q);
             k = step.Cont(k);
-            v = step.Cont(v);
-            EmitQueryKey(step, layer, ref q, ref k);
 
             float scale = 1.0f / MathF.Sqrt(d);
             long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
