@@ -133,7 +133,7 @@ def s_seed(ts, ref, R):
 
 def s_card_sampling(ts, ref, R):
     msgs = U("Give me a two-sentence summary of what photosynthesis is.")
-    outs = [ts.chat(msgs, sampling=CARD, max_tokens=120) for _ in range(3)]
+    outs = [ts.chat(msgs, sampling=CARD, max_tokens=400) for _ in range(3)]   # room for stray reasoning
     R.check("coherent answers", all("light" in o["content"].lower() or "sun" in o["content"].lower() for o in outs),
             [o["content"] for o in outs])
     R.check("stopped by EOS", all(o["finish_reason"] == "stop" for o in outs), [o["finish_reason"] for o in outs])
