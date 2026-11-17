@@ -26,6 +26,9 @@ from oaiclient import Client, GREEDY, CARD  # noqa: E402
 from toolcall_cases import TOOLS  # noqa: E402
 
 TAGS = ("<think>", "</think>", "<tool_call>", "<|im_end|>", "<|im_start|>")
+# False for a checkpoint that does not reason (LFM3-Omni closes its block at once with thinking
+# on): the reasoning checks then require that no reasoning and no tags come back.
+MODEL_REASONS = True
 
 
 class Result:
@@ -182,7 +185,8 @@ def s_webui_chat(ts, ref, R):
     R.check("recalls across turns", "pelican" in b["text"].lower(), b["text"])
     R.check("turn 2 reuses the cache", (b["done"] or {}).get("kvReusedTokens", 0) > 0, b["done"])
     t = ts.webchat(U("What is 15+27?"), think=True, max_tokens=1500, session=ts.new_session(), new_chat=True)
-    R.check("thinking frames", bool(t["thinking"].strip()), t["text"][:200])
+    R.check("thinking frames" if MODEL_REASONS else "no thinking frames (model does not reason)",
+            bool(t["thinking"].strip()) == MODEL_REASONS, t["text"][:200])
     R.check("answer after thinking", "42" in t["text"], t["text"])
     R.metrics.update(turn2=b["done"])
 
@@ -193,11 +197,16 @@ def s_thinking(ts, ref, R):
     msgs = U("A train leaves at 3pm and travels 120 km at 60 km/h. When does it arrive? Answer briefly.")
     a = ts.chat(msgs, thinking=True, sampling=GREEDY, max_tokens=2000)
     b = ts.chat(msgs, stream=True, thinking=True, sampling=GREEDY, max_tokens=2000)
-    R.check("reasoning returned", len(a["reasoning"]) > 20, a["reasoning"][:200])
-    R.check("answer returned", "5" in a["content"], a["content"])
+    if MODEL_REASONS:
+        R.check("reasoning returned", len(a["reasoning"]) > 20, a["reasoning"][:200])
+        R.check("answer returned", "5" in a["content"], a["content"])
+    else:
+        R.check("no reasoning (model does not reason)", a["reasoning"] == "", a["reasoning"][:200])
+        R.check("an answer returned", bool(a["content"].strip()), a["content"])
     R.check("no tags in reasoning or answer", clean(a["reasoning"]) and clean(a["content"]), [a["reasoning"][-80:], a["content"][:80]])
-    R.check("non-stream reasoning field is reasoning_content", a.get("reasoning_field") == "reasoning_content",
-            a.get("reasoning_field"))
+    if MODEL_REASONS:
+        R.check("non-stream reasoning field is reasoning_content", a.get("reasoning_field") == "reasoning_content",
+                a.get("reasoning_field"))
     R.check("stream == non-stream", (a["content"], a["reasoning"]) == (b["content"], b["reasoning"]),
             [a["content"][:100], b["content"][:100]])
     c = ts.chat(msgs, thinking=False, sampling=GREEDY, max_tokens=300)
@@ -260,7 +269,8 @@ def s_tool_stream_deltas(ts, ref, R):
     a = ts.chat(msgs, sampling=GREEDY, max_tokens=300, tools=tools)
     b = ts.chat(msgs, stream=True, sampling=GREEDY, max_tokens=300, tools=tools)
     norm = lambda calls: [(c["name"], json.loads(c["arguments"] or "{}")) for c in calls]
-    R.check("two calls", len(a["tool_calls"]) == 2, a["tool_calls"])
+    R.check("two calls" if MODEL_REASONS else "at least one call", len(a["tool_calls"]) == 2 if MODEL_REASONS
+            else len(a["tool_calls"]) >= 1, a["tool_calls"])
     R.check("streamed calls == non-stream calls", norm(a["tool_calls"]) == norm(b["tool_calls"]), [a["tool_calls"], b["tool_calls"]])
     tc_deltas = [tc for d in b["deltas"] for tc in d.get("tool_calls") or []]
     R.check("each delta has index", all("index" in t for t in tc_deltas), tc_deltas[:3])
@@ -470,7 +480,11 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--scenarios")
     ap.add_argument("--label", default="")
+    ap.add_argument("--no-model-reasons", action="store_true",
+                    help="the checkpoint does not reason (LFM3-Omni): reasoning checks expect none")
     args = ap.parse_args()
+    global MODEL_REASONS
+    MODEL_REASONS = not args.no_model_reasons
     ts = Client(args.url)
     ref = Client(args.ref) if args.ref else None
     want = set(args.scenarios.split(",")) if args.scenarios else None

@@ -34,10 +34,26 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   (`InferenceWeb.Tests/Lfm3ChatProtocolTests.cs`). Reply parsing is checked on real
   greedy replies of both Q4_K_M GGUFs from llama.cpp, streamed in chunks of 1 to 4096
   characters. The pinned files' SHA-256 equal the Hugging Face LFS object ids.
-- **Not yet validated:** generation itself on any backend, the Omni vision and audio
-  towers, the TensorAgent app on a device, and every CUDA route (no NVIDIA GPU was
-  available; `config/lfm3-1.7b-nvfp4.json` in particular has never run). Speed
-  against llama.cpp, vLLM and SGLang has not been measured.
+- **End to end (text, 2026-11-17, `eng/lfm3/e2e`):** the server's OpenAI chat
+  completions, Responses and Web UI surfaces and the CLI, checked by 20 scripted
+  scenarios (streaming, stop strings, seeds, thinking and its budget, tool calls and
+  `tool_choice`, structured output, prefix reuse, cancel, robustness) on ggml_metal for
+  Q4_K_M, Q8_0, QAD-Q4_0, BF16, NVFP4 and LFM3-Omni-2B as a text model, and on MLX,
+  ggml_cpu and the managed CPU for a subset. Against llama-server on the same GGUF,
+  greedy, the same rendered prompts: GSM8K (200 questions thinking off, 50 on) scores
+  the same on Q4_K_M (81.5% / 98%) and Q8_0 (86% / 98%), and 92-93% of the thinking-off
+  replies are the same text; needle retrieval at 8K-128K finds every needle on both engines
+  with identical replies; the 33-prompt instruction-following and 35-case
+  function-calling sets score equal or higher, the differences being the two
+  behaviors below (stray reasoning with thinking off, `tool_choice`). 4 and 16
+  concurrent conversations, n-gram speculation (identical replies) and client
+  cancellation hold. Prompt processing past 16K tokens is slower than llama.cpp's
+  (about 3,000 vs 5,400 tokens/s at 32K on an M5 Pro); decoding after a long prompt is
+  on par.
+- **Not yet validated:** the Omni vision and audio towers, the TensorAgent app on a
+  device, and every CUDA route (no NVIDIA GPU was available;
+  `config/lfm3-1.7b-nvfp4.json` in particular has never run). vLLM and SGLang were not
+  compared.
 
 ## Run it
 
@@ -117,6 +133,19 @@ GGUF). `RenderLfm3` reproduces the same text for a GGUF without a template.
   the template does.
 - `</think>` (124902) is one token: the thinking budget closes the block there and the
   answer follows, and a `response_format` grammar arms after it.
+- With thinking off the 1.7B often reasons anyway: it writes reasoning (sometimes after
+  a `<think>` of its own) and closes the block itself before it answers (52 of 200
+  greedy GSM8K replies and 5 of 33 instruction prompts on the Q4_K_M; llama.cpp's
+  replies are the same tokens). The model card warns that thinking off "can be
+  inconsistent". TensorSharp parses such a reply as it does Nemotron-H
+  Reasoning-128K's: a `</think>` within 4,096 characters makes the text before it
+  reasoning, returned as `reasoning_content` (OpenAI) or `thinking` (Ollama, Web UI),
+  streamed or not, and a block the model opens itself is capped like Gemma 4's
+  unrequested channel (closed at a line break, after at most 64 tokens). llama.cpp,
+  vLLM and SGLang return such a reply whole, `</think>` included, as the answer. The
+  price: a stream that cannot take text back (OpenAI, Ollama, Responses, CLI) shows a
+  thinking-off answer once 4,096 characters are generated or the reply ends, whichever
+  comes first; the Web UI shows it at once and takes the reasoning back.
 - LFM3-Omni does not reason: with thinking on it closes the block at once.
 
 ### Tool calls
@@ -138,8 +167,12 @@ template: reasoning ends at `</think>` or at a `<tool_call>` written while still
 reasoning; declared string parameters keep their text, other declared types are
 parsed as JSON. Results render as `<|im_start|>tool\n<tool_response>\n…\n</tool_response>`,
 from the tool message alone, so a tool round's generated tokens are spliced back and
-the next round continues the live cache. `tool_choice: required` is accepted but not
-grammar-enforced, as for Qwen 3.5.
+the next round continues the live cache. `tool_choice: required` and a named function
+are enforced by a grammar (`QwenXmlToolGrammar`): the reply is well-formed calls to the
+declared functions (only the named one), required parameters present, values of the
+declared types and enums; it arms after `</think>` when the request reasons. `auto`
+and `none` stay unconstrained (`none` leaves the tools out of the prompt). llama-server
+does not enforce a named choice for this template.
 
 Tool declarations go through TensorSharp's shared tool builder, which keeps each
 parameter's `type`, `description` and `enum` but not nested schemas (`items`, nested
@@ -198,7 +231,8 @@ sampling on every engine.
 - A video's soundtrack is not extracted (the CLI and Web UI pass frames only).
 - Audio sent to LFM3-1.7B, or to Omni without its projector, is not refused yet; the
   multimodal integration has to refuse it rather than drop it.
-- `tool_choice: required` is not grammar-enforced; nested tool schemas are flattened.
+- Nested tool schemas are flattened in the prompt (the tool-call grammar reads the
+  client's schema).
 - TensorAgent's catalog counts 22,528 K/V bytes per token until the sliding-window
   ring lands; the QAD-Q4_0 file is not in the catalog pending a quality and speed
   measurement against Q4_K_M.

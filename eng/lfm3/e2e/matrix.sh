@@ -6,7 +6,9 @@
 #   eng/lfm3/e2e/matrix.sh LABEL MODEL BACKEND OUT_DIR [PORT] [REF_PORT]
 #
 # TS_SERVER_BIN (a copy of TensorSharp.Server.Host/bin, one per concurrently running server) and
-# REF=1 / LLAMA_CPP_BIN are read from the environment. SCENARIOS narrows e2e.py (comma list).
+# REF=1 / LLAMA_CPP_BIN are read from the environment. SCENARIOS narrows e2e.py (comma list);
+# E2E_ARGS adds e2e.py options (--no-model-reasons for LFM3-Omni). A cell whose server does not
+# come up fails; check that nothing else listens on PORT first.
 set -uo pipefail
 label="$1"; model="$2"; backend="$3"; out="$4"; port="${5:-5737}"; ref_port="${6:-5738}"
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -24,7 +26,7 @@ if [ "${REF:-0}" = "1" ]; then
   wait_up "http://127.0.0.1:$ref_port/health" && ref_args=(--ref "http://127.0.0.1:$ref_port")
 fi
 python3 -I "$here/e2e.py" --url "http://127.0.0.1:$port" ${ref_args[@]+"${ref_args[@]}"} --label "$label" \
-  --out "$out/e2e-$label.jsonl" ${SCENARIOS:+--scenarios "$SCENARIOS"} > "$out/e2e-$label.log" 2>&1
+  --out "$out/e2e-$label.jsonl" ${SCENARIOS:+--scenarios "$SCENARIOS"} ${E2E_ARGS:-} > "$out/e2e-$label.log" 2>&1
 python3 -I "$here/ifeval.py" --url "http://127.0.0.1:$port" --out "$out/ifeval-$label-ts.jsonl" > "$out/ifeval-$label-ts.log" 2>&1
 python3 -I "$here/toolcall_eval.py" --url "http://127.0.0.1:$port" --out "$out/tools-$label-ts.jsonl" > "$out/tools-$label-ts.log" 2>&1
 if [ ${#ref_args[@]} -gt 0 ]; then
