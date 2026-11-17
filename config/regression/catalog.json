@@ -605,10 +605,13 @@
         "audio"
       ],
       "layout": "dense",
-      "notes": "Liquid LFM3 (1.7B) and LFM3-Omni (2B) share general.architecture lfm3: 13 short-conv + 11 GQA attention layers (5 sliding-window). The chat protocol (GGUF template, reasoning, Qwen3-Coder XML tools, Omni media placeholders) is in place and matches llama.cpp's renders; the model family and the Omni vision/audio towers are separate work. Image/video/audio need the Omni projector; speech output is not served. CUDA and Vulkan routes are unvalidated (no GPU run yet).",
+      "notes": "Liquid LFM3 (1.7B) and LFM3-Omni (2B) share general.architecture lfm3: 13 short-conv + 11 GQA attention layers (5 sliding-window). The text decoder runs on the shared runtime (sliding-window attention, head-wise gates, sandwich norms, short convolutions) and matches llama.cpp; the chat protocol (GGUF template, reasoning, Qwen3-Coder XML tools, Omni media placeholders) matches llama.cpp's renders. Image/video/audio need the Omni projector; speech output is not served. CUDA and Vulkan routes are unvalidated (no GPU run yet).",
       "source_evidence": [
+        "TensorSharp.Models/Models/Lfm3/Lfm3Architecture.cs",
+        "TensorSharp.Models/Models/Lfm3/Lfm3RuntimeModel.cs",
         "TensorSharp.Runtime/ChatProtocolRegistry.cs",
         "TensorSharp.Runtime/ChatTemplate.Lfm3.cs",
+        "InferenceWeb.Tests/Lfm3RuntimeTests.cs",
         "InferenceWeb.Tests/Lfm3ChatProtocolTests.cs",
         "docs/models/lfm3.md"
       ],
