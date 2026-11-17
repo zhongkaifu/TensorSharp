@@ -1642,8 +1642,12 @@ namespace TensorSharp.Models
                     // A direct host dequant is faster for single-token decode, and it is
                     // also the compatibility path for CUDA quant types whose get_rows
                     // kernel is not implemented upstream, and for a table too large to
-                    // be device-resident (DevicePreloadTooLarge).
-                    if ((tokens.Length == 1 || !canUseGgmlLookup || qw.DevicePreloadTooLarge) && qw.HasHostData)
+                    // be device-resident (DevicePreloadTooLarge). Where the device reads the
+                    // host's rows themselves (Metal's shared memory, the CPU), a prompt's rows
+                    // too: the device lookup was a graph of its own and a wait before the
+                    // step's graph (LFM3-1.7B pp128 on Metal +1.4%).
+                    bool hostRows = tokens.Length == 1 || _backend is BackendType.GgmlMetal or BackendType.GgmlCpu;
+                    if ((hostRows || !canUseGgmlLookup || qw.DevicePreloadTooLarge) && qw.HasHostData)
                     {
                         var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
                         PopulateQuantizedRows(result, qw, tokens);
