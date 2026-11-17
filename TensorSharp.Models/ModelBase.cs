@@ -1458,7 +1458,9 @@ namespace TensorSharp.Models
             if (backend == BackendType.Cpu && !ManagedQuantizedOps.SupportsCpuQuantizedStorage(info.Type))
                 return false;
 
-            if (backend == BackendType.Mlx && !MlxQuantizedOps.SupportsQuantizedType(info.Type))
+            // NVFP4 matrices load as F16 there (LoadNvfp4AsF16), which MLX stores as it is.
+            if (backend == BackendType.Mlx && !MlxQuantizedOps.SupportsQuantizedType(info.Type)
+                && !(info.Type == GgmlTensorType.NVFP4 && info.Shape.Length == 2))
                 return false;
 
             if (info.Shape.Length == 2)
@@ -2401,6 +2403,10 @@ namespace TensorSharp.Models
                 return false;
             if (!_weights.TryGetValue(normWeightName, out var normW) || normW == null)
                 return false;
+            // The fused graph multiplies by the blocks alone: a per-tensor scale (NVFP4 scale2) runs the unfused chain,
+            // whose projections apply it.
+            if (gateUpQW.Scale != 1.0f || downQW.Scale != 1.0f)
+                return false;
 
             int intermSize = Config.IntermediateSize;
             int halfDim = intermSize > 0 ? intermSize : (int)(gateUpQW.Ne1 / 2);
@@ -2449,6 +2455,8 @@ namespace TensorSharp.Models
                 return null;
             if (!_weights.TryGetValue(normWeightName, out var normW) || normW == null)
                 return null;
+            if (gateUpQW.Scale != 1.0f || downQW.Scale != 1.0f)
+                return null;   // see TryFusedDenseSwiGLUFFNInto
 
             int intermSize = Config.IntermediateSize;
             int halfDim = intermSize > 0 ? intermSize : (int)(gateUpQW.Ne1 / 2);
