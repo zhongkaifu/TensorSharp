@@ -358,6 +358,59 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
         Assert.True(RelL2(chunked, whole) <= tolerance, $"{backend}: chunked vs whole relL2 {RelL2(chunked, whole):E2}");
     }
 
+    /// <summary>
+    /// A prompt step whose head reads only its sequences' last rows runs the last layer's feed-forward on those rows alone
+    /// (LFM3 opts into PrunesLastLayerRows, as llama.cpp's graphs cut the stream to the output rows): the logits of a step over
+    /// every row, for lone prompts (a view of the last row; one past the window) and for three prompts in one batched prefill
+    /// (their last rows gathered).
+    /// </summary>
+    [Theory]
+    [InlineData("managed")]
+    [InlineData("ggml")]
+    public void PrunedLastLayerMatchesEveryRow(string executor)
+        => AssertPrunedLastLayer(executor == "ggml" ? TestGates.PinnedGgmlBackend : BackendType.Cpu);
+
+    [MlxFact]
+    public void PrunedLastLayerMatchesEveryRowOnMlx() => AssertPrunedLastLayer(BackendType.Mlx);
+
+    private void AssertPrunedLastLayer(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        int[][] prompts =
+        {
+            Enumerable.Range(0, 23).Select(i => 65 + (i * 7) % 50).ToArray(),
+            Enumerable.Range(0, 6).Select(i => 97 + (i * 5) % 26).ToArray(),
+            Enumerable.Range(0, 13).Select(i => 48 + (i * 3) % 10).ToArray(),
+        };
+        List<float[]> Run(bool prune, out int prunedSteps)
+        {
+            using var model = Create(path, backend: backend);
+            model.LastLayerPruningDisabledForTests = !prune;
+            var rows = new List<float[]>();
+            foreach (int[] prompt in prompts)
+            {
+                model.ResetKVCache();
+                rows.Add((float[])model.ForwardRefill(prompt).Clone());
+            }
+            var slots = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
+            string[] ids = { "a", "b", "c" };
+            foreach (string id in ids) Assert.True(slots.BindSequenceCache(id), "a new request gets a fresh slot");
+            var logits = new float[ids.Length][];
+            Assert.True(slots.TryForwardBatchedFusedPrefill(ids, prompts, new int[ids.Length], logits));
+            rows.AddRange(logits.Select(l => (float[])l.Clone()));
+            prunedSteps = model.LastLayerPrunedSteps;
+            return rows;
+        }
+        List<float[]> every = Run(prune: false, out int none);
+        List<float[]> pruned = Run(prune: true, out int steps);
+        Assert.Equal(0, none);
+        Assert.True(steps >= prompts.Length + 1, $"{backend}: {steps} steps pruned their last layer");
+        // The managed executor's F32 products block by rows (1.5e-6 between a row alone and in a batch).
+        double tolerance = backend == BackendType.Cpu ? 1e-5 : RoundsActivations(backend) ? 2.5e-2 : 5e-3;
+        AssertRows(pruned, every, tolerance, $"{backend}: last layer over the last rows vs every row");
+    }
+
     /// <summary>A decode step that repeats the last one a position on runs again without a trace, past the window and across
     /// its buckets (the band's first cell moves a bucket at a time): every logit is the traced step's, for one request and
     /// for two in one step.</summary>
