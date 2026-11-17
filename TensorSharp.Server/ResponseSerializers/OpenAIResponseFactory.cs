@@ -174,6 +174,10 @@ internal static class OpenAIResponseFactory
             usage = BuildUsage(promptTokens, evalTokens, kvCacheReusedTokens),
         };
 
+    // A non-streamed reply carries the reasoning as `reasoning_content`, the field the streamed
+    // deltas above use and that OpenAI-compatible clients (and llama.cpp, vLLM) read from a
+    // complete message. `thinking` is the same text under the name this route used before,
+    // kept for clients that already read it. Both are omitted when there is no reasoning.
     public static object ParsedAssistantMessage(
         string content,
         string? thinking,
@@ -183,6 +187,7 @@ internal static class OpenAIResponseFactory
         {
             role = "assistant",
             content = content ?? "",
+            reasoning_content = thinking,
             thinking,
             tool_calls = BuildToolCalls(toolCalls),
         };
