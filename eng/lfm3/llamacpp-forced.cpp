@@ -11,13 +11,24 @@
 //   c++ -std=c++17 -O2 eng/lfm3/llamacpp-forced.cpp -I$LLAMA/include -I$LLAMA/ggml/include \
 //       -L$LLAMA/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin -o artifacts/lfm3/llamacpp-forced
 // Run:
-//   llamacpp-forced MODEL OUT_DIR STEPS NGL CASE.txt [CASE.txt ...]
+//   llamacpp-forced MODEL OUT_DIR STEPS NGL [OPTIONS] CASE.txt [CASE.txt ...]
 //   (NGL 99 = every layer on the GPU (Metal); -1 = ggml-cpu only, no GPU device or op offload; the case name is the
 //   file's stem)
+// OPTIONS (to match a TensorSharp lane's arithmetic; defaults are libllama's context defaults):
+//   --threads N        decode and batch threads (default 4, GGML_DEFAULT_N_THREADS)
+//   --fa on|off|auto   flash attention (default auto)
+//   --kv f16|f32       K and V cache type (default f16); TensorSharp's ggml_cpu lane uses f16 for quantized and BF16
+//                      checkpoints unless KV_CACHE_DTYPE says otherwise
+//   --no-repack        keep weights in their GGUF layout (no CPU repacked buffer types; TensorSharp binds the mapped
+//                      GGUF and runs ggml-cpu's plain vec_dot products)
+//   --ubatch N         physical batch rows (default 512)
+//   --force DIR        teacher-force the generated tokens of DIR/cases.json (another reference run, same prompts)
+//                      instead of decoding greedily, so two llama.cpp configurations compare row by row on one history
 #include "llama.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -38,6 +49,24 @@ static std::string stem(const std::string & path) {
     return dot == std::string::npos ? name : name.substr(0, dot);
 }
 
+// The ids of `key` in the case named `name` of a cases.json (this tool's or ForcedLogitProbe's layout).
+static std::vector<llama_token> case_ids(const std::string & json, const std::string & name, const std::string & key) {
+    size_t at = json.find("\"name\": \"" + name + "\"");
+    if (at == std::string::npos) { fprintf(stderr, "--force: no case %s\n", name.c_str()); exit(2); }
+    size_t k = json.find("\"" + key + "\"", at);
+    size_t open = json.find('[', k), close = json.find(']', open);
+    if (k == std::string::npos || open == std::string::npos || close == std::string::npos) {
+        fprintf(stderr, "--force: case %s has no %s\n", name.c_str(), key.c_str()); exit(2);
+    }
+    std::vector<llama_token> ids;
+    std::stringstream ss(json.substr(open + 1, close - open - 1));
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (item.find_first_of("0123456789") != std::string::npos) ids.push_back((llama_token) atoi(item.c_str()));
+    }
+    return ids;
+}
+
 static void append_ids(std::string & json, const std::vector<llama_token> & ids) {
     json += "[";
     for (size_t i = 0; i < ids.size(); i++) {
@@ -49,14 +78,54 @@ static void append_ids(std::string & json, const std::vector<llama_token> & ids)
 
 int main(int argc, char ** argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: %s MODEL OUT_DIR STEPS NGL CASE.txt [CASE.txt ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL OUT_DIR STEPS NGL [--threads N] [--fa on|off|auto] [--kv f16|f32] "
+                        "[--no-repack] [--ubatch N] [--force DIR] CASE.txt [CASE.txt ...]\n", argv[0]);
         return 2;
     }
     const std::string model_path = argv[1], out_dir = argv[2];
     const int steps = atoi(argv[3]), ngl = atoi(argv[4]);
 
+    int threads = 0, ubatch = 512;
+    std::string force_json;
+    bool repack = true;
+    llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    ggml_type kv_type = GGML_TYPE_F16;
+    int first_case = 5;
+    for (; first_case < argc && strncmp(argv[first_case], "--", 2) == 0; first_case++) {
+        const std::string opt = argv[first_case];
+        auto value = [&]() -> std::string {
+            if (first_case + 1 >= argc) { fprintf(stderr, "%s needs a value\n", opt.c_str()); exit(2); }
+            return argv[++first_case];
+        };
+        if (opt == "--threads") {
+            threads = atoi(value().c_str());
+        } else if (opt == "--ubatch") {
+            ubatch = atoi(value().c_str());
+        } else if (opt == "--no-repack") {
+            repack = false;
+        } else if (opt == "--force") {
+            force_json = read_file(value() + "/cases.json");
+        } else if (opt == "--fa") {
+            const std::string v = value();
+            if (v == "on") fa = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            else if (v == "off") fa = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            else if (v == "auto") fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
+            else { fprintf(stderr, "--fa on|off|auto\n"); return 2; }
+        } else if (opt == "--kv") {
+            const std::string v = value();
+            if (v == "f16") kv_type = GGML_TYPE_F16;
+            else if (v == "f32") kv_type = GGML_TYPE_F32;
+            else { fprintf(stderr, "--kv f16|f32\n"); return 2; }
+        } else {
+            fprintf(stderr, "unknown option %s\n", opt.c_str());
+            return 2;
+        }
+    }
+    if (first_case >= argc) { fprintf(stderr, "no cases\n"); return 2; }
+
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
+    mp.use_extra_bufts = repack;
     ggml_backend_dev_t no_devices[] = { nullptr };
     if (ngl < 0) {
         mp.devices = no_devices;   // ggml-cpu alone
@@ -70,7 +139,7 @@ int main(int argc, char ** argv) {
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
     std::string cases_json = "[\n";
-    for (int c = 5; c < argc; c++) {
+    for (int c = first_case; c < argc; c++) {
         const std::string text = read_file(argv[c]);
         const std::string name = stem(argv[c]);
         std::vector<llama_token> prompt(text.size() + 16);
@@ -78,11 +147,27 @@ int main(int argc, char ** argv) {
                                /*add_special*/ false, /*parse_special*/ true);
         if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
         prompt.resize(n);
+        std::vector<llama_token> forced;
+        if (!force_json.empty()) {
+            if (case_ids(force_json, name, "prompt_tokens") != prompt) {
+                fprintf(stderr, "--force: %s prompt differs\n", name.c_str());
+                return 2;
+            }
+            forced = case_ids(force_json, name, "generated_tokens");
+            if ((int) forced.size() < steps) {
+                fprintf(stderr, "--force: %s has %zu steps\n", name.c_str(), forced.size());
+                return 2;
+            }
+        }
 
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = (uint32_t) (n + steps + 64);
         cp.n_batch = 2048;
-        cp.n_ubatch = 512;
+        cp.n_ubatch = (uint32_t) ubatch;
+        cp.flash_attn_type = fa;
+        cp.type_k = kv_type;
+        cp.type_v = kv_type;
+        if (threads > 0) { cp.n_threads = threads; cp.n_threads_batch = threads; }
         if (ngl < 0) cp.op_offload = false;
         llama_context * ctx = llama_init_from_model(model, cp);
         if (!ctx) { fprintf(stderr, "context failed\n"); return 1; }
@@ -110,9 +195,9 @@ int main(int argc, char ** argv) {
             fwrite(logits, sizeof(float), n_vocab, f);
             int top = 0;
             for (int i = 1; i < n_vocab; i++) if (logits[i] > logits[top]) top = i;
-            generated.push_back(top);
+            llama_token token = forced.empty() ? top : forced[s];
+            generated.push_back(token);
             if (s + 1 == steps) break;
-            llama_token token = top;
             llama_batch one = llama_batch_get_one(&token, 1);
             (void) pos;
             if (llama_decode(ctx, one) != 0) { fprintf(stderr, "decode failed\n"); return 1; }
@@ -121,7 +206,7 @@ int main(int argc, char ** argv) {
         fclose(f);
         llama_free(ctx);
 
-        if (c > 5) cases_json += ",\n";
+        if (c > first_case) cases_json += ",\n";
         cases_json += "  {\"name\": \"" + name + "\", \"prompt_tokens\": ";
         append_ids(cases_json, prompt);
         cases_json += ", \"generated_tokens\": ";

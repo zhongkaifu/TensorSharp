@@ -15,6 +15,13 @@ in the ignored `artifacts/lfm3/`.
   ```
 
   ForcedLogitProbe's `metrics.json` holds every row's top-1 agreement, relative L2, KL and largest logit difference.
+  Options before the cases match a TensorSharp lane's arithmetic or a second llama.cpp configuration: `--threads N`,
+  `--fa on|off|auto`, `--kv f16|f32` (llama.cpp's flash attention reads K/V as F16 either way), `--no-repack` (weights
+  in their GGUF layout, as TensorSharp's ggml_cpu binds them), `--ubatch N`, and `--force DIR`, which teacher-forces
+  another reference's tokens so two llama.cpp builds or configurations compare row by row over one history. On the CPU
+  lanes (`-1`; that mode leaves out the BLAS device as well) llama.cpp's own kernel variants (llamafile and repacked
+  weights against neither) land 1.7-3.8e-2 apart in relative L2: products round their activations to 8 bits, so any
+  difference in summation order grows to that floor within a few layers.
 - `Lfm3Probe` (`dotnet build eng/lfm3/Lfm3Probe -c Release`):
   - `ppl MODEL BACKEND FILE CTX CHUNKS` computes perplexity as `llama-perplexity -f FILE -c CTX --chunks CHUNKS` does
     (no BOS, special tokens not parsed, the second half of each chunk scored);
