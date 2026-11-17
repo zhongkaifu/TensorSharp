@@ -137,6 +137,12 @@ namespace TensorSharp.Graph
         /// recorded step of a width serves every position of its slot. False where a window's width shapes the arithmetic.</summary>
         bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
 
+        /// <summary>A scope in which a one-shot step's run hands the host nothing back returns with its device work queued, so
+        /// the host traces and builds the next step while the device runs this one (a prompt's steps of one sequence, as
+        /// llama.cpp's scheduler overlaps a prompt's ubatches): the work is waited for before anything reads, releases or
+        /// rewrites what it touches, and when the scope ends. Null where every run completes before it returns.</summary>
+        IDisposable OverlapSteps() => null;
+
         /// <summary>Host work to run while the device runs the next recorded step: after its launch, before anything waits for
         /// its outputs (a recorded step leaves the host idle for its whole run). False where the executor runs no recorded
         /// steps to hide it behind: the caller then does the work itself, or not at all.</summary>

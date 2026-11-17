@@ -4071,6 +4071,8 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 
 TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)
 {
+    // Queued work (an overlapped graph step, Metal's lazy sync) may still write what this downloads.
+    host_read_barrier();
     bool any = tsg_graphtp::sync_to_host(ptr, size);
     for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
     {
@@ -4183,6 +4185,7 @@ TSG_EXPORT void TSGgml_PrefaultHostSpans(void* const* ptrs, const std::int64_t* 
 
 TSG_EXPORT int TSGgml_SyncHostBufferRanges(void* ptr, const std::int64_t* offsets, const std::int64_t* lengths, int count)
 {
+    host_read_barrier();   // as TSGgml_SyncHostBuffer
     bool ok = true;
     for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
     {

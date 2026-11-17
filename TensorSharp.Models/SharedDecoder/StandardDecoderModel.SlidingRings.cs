@@ -145,13 +145,21 @@ namespace TensorSharp.Models
         /// with the piece that holds them, a staged position table is consumed piece by piece (BeginRotaryPositions), and a
         /// speculating request's follow of its prompt holds for every piece. Returns the last piece's result.
         /// </summary>
-        private float[] InRingSteps(int[] tokens, bool wantLogits, Func<int[], bool, float[]> run)
+        private float[] InRingSteps(int[] tokens, bool wantLogits, Func<int[], bool, float[]> run, bool overlapSteps = false)
         {
             int step = _maxSequenceStepRows;
             var media = _pendingMedia.ToArray();
             _pendingMedia.Clear();
             bool follow = _followPlainPrompt;
             float[] result = null;
+            // A plain prompt's pieces overlap on the device (IGraphExecutor.OverlapSteps): each piece's run returns with its work
+            // queued while the next is traced and built. The caches hold the whole prompt first, so no piece grows them.
+            IDisposable overlap = null;
+            if (overlapSteps && OverlapPromptSteps && !follow && media.Length == 0 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null)
+            {
+                EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
+                overlap = GraphExecutor.OverlapSteps();
+            }
             try
             {
                 for (int at = 0; at < tokens.Length; at += step)
@@ -168,6 +176,7 @@ namespace TensorSharp.Models
             }
             finally
             {
+                overlap?.Dispose();
                 foreach (var (rows, _) in media) rows.Dispose();
             }
             return result;

@@ -435,6 +435,21 @@ namespace TensorSharp.Models
         /// layers read more than the embedding (Flash Next's per-layer n-gram rows).</summary>
         protected int[] StepTokens { get; private set; }
 
+        /// <summary>A plain prompt's steps of one sequence overlap on the device (<see cref="IGraphExecutor.OverlapSteps"/>): each
+        /// step's run returns with its work queued while the host embeds, traces and builds the next. Off by default: a family
+        /// opts in once its prompt path between steps is known to read nothing back from the device unwaited (every host read,
+        /// buffer release and upload waits for the queued work first).</summary>
+        protected virtual bool OverlapsPromptSteps => false;
+
+        /// <summary>Tests: prompt steps run one after another even where the family overlaps them.</summary>
+        internal bool PromptOverlapDisabledForTests { get; set; }
+
+        private bool OverlapPromptSteps => OverlapsPromptSteps && !PromptOverlapDisabledForTests;
+
+        /// <summary>A family whose prompt steps overlap (<see cref="OverlapsPromptSteps"/>) embeds them on the host on ggml-cuda
+        /// and ggml-vulkan too: the device lookup was a graph of its own whose download waited for the step before it.</summary>
+        protected override bool EmbedsPromptRowsOnHost => OverlapsPromptSteps && _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
+
         private Tensor EmbedStep(int[] tokens)
         {
             StepTokens = tokens;
@@ -638,10 +653,24 @@ namespace TensorSharp.Models
             if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
                 return ForwardCore(tokens);
             int last = tokens.Length - 1;
-            for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+            // The chunks' steps overlap on the device across chunk boundaries too (InRingSteps' scopes nest in this one).
+            IDisposable overlap = null;
+            if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null)
             {
-                int len = Math.Min(PrefillChunkTokens, last - pos);
-                RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+                EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
+                overlap = GraphExecutor.OverlapSteps();
+            }
+            try
+            {
+                for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+                {
+                    int len = Math.Min(PrefillChunkTokens, last - pos);
+                    RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+                }
+            }
+            finally
+            {
+                overlap?.Dispose();
             }
             return ForwardCore(new[] { tokens[last] });
         }
@@ -662,7 +691,7 @@ namespace TensorSharp.Models
         private float[] RunSequence(int[] tokens, bool wantLogits)
         {
             if (tokens.Length > _maxSequenceStepRows)
-                return InRingSteps(tokens, wantLogits, RunSequence);
+                return InRingSteps(tokens, wantLogits, RunSequence, overlapSteps: true);
             SettlePendingVerify();
             int seqLen = tokens.Length;
             int start = _cacheSeqLen;

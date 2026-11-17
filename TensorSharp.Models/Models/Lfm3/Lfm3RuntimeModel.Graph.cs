@@ -44,6 +44,10 @@ namespace TensorSharp.Models
         protected override bool KeepsGateUpApart(int gateType, int upType)
             => _backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */;
 
+        /// <summary>A plain prompt's 512-row steps overlap on the device: the short convolutions' windows and the caches stay on
+        /// the device between steps, so nothing between them reads the device back.</summary>
+        protected override bool OverlapsPromptSteps => true;
+
         /// <summary>The short convolutions trace one rank's channels (its in/out projection shards, filter slice and states).</summary>
         protected override bool RanksLower => true;
 

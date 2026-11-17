@@ -1171,7 +1171,10 @@ namespace TensorSharp.Models
             return bytes;
         }
 
-        protected unsafe void PopulateQuantizedRows(Tensor result, QuantizedWeight weight, int[] rowIndices)
+        /// <param name="freshResult">The result was just allocated on a discrete GPU's GGML backend: its host bytes are written
+        /// through the storage pointer without waiting for queued device work (an overlapped prompt step's,
+        /// <see cref="IGraphExecutor.OverlapSteps"/>), which never writes a host buffer it did not download into.</param>
+        protected unsafe void PopulateQuantizedRows(Tensor result, QuantizedWeight weight, int[] rowIndices, bool freshResult = false)
         {
             if (result == null)
                 throw new ArgumentNullException(nameof(result));
@@ -1191,7 +1194,7 @@ namespace TensorSharp.Models
 
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
             IntPtr basePtr = weight.Data;
-            IntPtr dst = (IntPtr)GetFloatPtr(result);
+            IntPtr dst = freshResult ? TensorComputePrimitives.GetStoragePointer(result) : (IntPtr)GetFloatPtr(result);
             // A prompt's rows in parallel (each row is its own dequant: the same values either way).
             if (rowIndices.Length >= 64)
                 System.Threading.Tasks.Parallel.For(0, rowIndices.Length, Row);

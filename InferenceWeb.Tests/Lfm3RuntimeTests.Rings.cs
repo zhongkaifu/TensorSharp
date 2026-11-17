@@ -19,6 +19,49 @@ public sealed partial class Lfm3RuntimeTests
 {
     private const int SmallRingStepRows = 8, SmallRingCells = 16;
 
+    /// <summary>
+    /// A prompt's ring steps overlapped on the device (IGraphExecutor.OverlapSteps: each step's run returns with its work queued
+    /// while the next is embedded, traced and built; ggml-cuda and ggml-vulkan) give the logits of the same steps run one after
+    /// another, bit for bit: a lone prompt (ForwardRefill: 41 rows, 6 ring steps) and a batched prefill of two requests in rounds
+    /// (37 and 21 rows: rounds that end no request run no head), then decode steps. On the other lanes nothing overlaps and the
+    /// two runs are the same path.
+    /// </summary>
+    [Fact]
+    public void OverlappedPromptStepsMatchStepsRunOneAfterAnotherOnThePinnedGgmlBackend()
+    {
+        using var rings = SmallRings();
+        string path = Fixture("dense");
+        List<float[]> Run(bool overlap)
+        {
+            using var model = Create(path, backend: TestGates.PinnedGgmlBackend);
+            model.PromptOverlapDisabledForTests = !overlap;
+            var rows = new List<float[]>();
+            rows.Add((float[])model.ForwardRefill(Enumerable.Range(0, 41).Select(i => 40 + (i * 13) % 150).ToArray()).Clone());
+            rows.Add((float[])model.Forward(new[] { 77 }).Clone());
+            var unified = (IUnifiedBatchModel)model;
+            string[] ids = { "a", "b" };
+            int[][] prompts = { Enumerable.Range(0, 37).Select(i => 30 + (i * 7) % 120).ToArray(), Enumerable.Range(0, 21).Select(i => 60 + i).ToArray() };
+            foreach (string id in ids) unified.EnsureSequenceSlot(id, 96);
+            var logits = new float[2][];
+            Assert.True(unified.TryForwardUnified(ids, prompts, new[] { 0, 0 }, logits));
+            rows.AddRange(logits.Select(l => (float[])l.Clone()));
+            int[] lengths = { prompts[0].Length, prompts[1].Length };
+            for (int t = 0; t < 6; t++)
+            {
+                Assert.True(unified.TryForwardUnified(ids, new[] { new[] { ArgMax(logits[0]) }, new[] { ArgMax(logits[1]) } }, lengths, logits));
+                rows.AddRange(logits.Select(l => (float[])l.Clone()));
+                lengths[0]++;
+                lengths[1]++;
+            }
+            return rows;
+        }
+        List<float[]> sequential = Run(overlap: false), overlapped = Run(overlap: true);
+        Assert.Equal(sequential.Count, overlapped.Count);
+        for (int i = 0; i < sequential.Count; i++)
+            Assert.True(sequential[i].AsSpan().SequenceEqual(overlapped[i]),
+                $"row {i}: overlapped prompt steps differ (relL2 {RelL2(overlapped[i], sequential[i]):E2})");
+    }
+
     /// <summary>Rings of 16 cells for models constructed inside the scope (the geometry is read at construction).</summary>
     private static IDisposable SmallRings()
     {

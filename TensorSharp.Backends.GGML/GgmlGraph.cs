@@ -300,6 +300,10 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial void TSGgml_GraphOverlapSteps(int open);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static unsafe partial int TSGgml_GraphRunRanked(IntPtr* graphs, int nranks, IntPtr* inputs, IntPtr* data, IntPtr* bytes,
             int* ninputs, int exactF32);
 

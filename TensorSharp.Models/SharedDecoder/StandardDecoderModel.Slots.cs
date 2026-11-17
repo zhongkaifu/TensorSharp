@@ -806,41 +806,64 @@ namespace TensorSharp.Models
                     "which its sliding-window ring caches take in steps.");
             int step = _maxSequenceStepRows, n = requestIds.Count, rounds = 0;
             for (int s = 0; s < n; s++) rounds = Math.Max(rounds, ((chunks[s]?.Length ?? 0) + step - 1) / step);
-            for (int round = 0; round < rounds; round++)
+            // Plain prompts' rounds overlap on the device (IGraphExecutor.OverlapSteps): a round that ends no request's chunk runs
+            // no head and hands the host nothing, so its run returns with its work queued while the next round is embedded,
+            // traced and built. The slots hold their whole chunks first, so no round grows them.
+            IDisposable overlap = null;
+            if (OverlapPromptSteps && rounds > 1 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null
+                && (_followPromptRequests == null || !requestIds.Any(_followPromptRequests.ContainsKey)) && _slots != null
+                && requestIds.All(id => _slots.ContainsKey(id)))
             {
-                var ids = new List<string>();
-                var parts = new List<int[]>();
-                var partStarts = new List<int>();
-                var owners = new List<int>();
-                // A request's row input and hidden output belong to its last row, so they go with its last piece.
-                var inputRows = new List<float[]>();
-                var hidden = new List<float[]>();
                 for (int s = 0; s < n; s++)
+                    if (chunks[s] != null) EnsureSlotCapacity(_slots[requestIds[s]], checked(starts[s] + chunks[s].Length));
+                overlap = GraphExecutor.OverlapSteps();
+            }
+            try
+            {
+                for (int round = 0; round < rounds; round++)
                 {
-                    int at = round * step, length = chunks[s]?.Length ?? 0;
-                    if (at >= length) continue;
-                    bool last = at + step >= length;
-                    ids.Add(requestIds[s]);
-                    parts.Add(chunks[s].AsSpan(at, Math.Min(step, length - at)).ToArray());
-                    partStarts.Add(starts[s] + at);
-                    owners.Add(s);
-                    inputRows.Add(last ? rowIO?.InputRows?[s] : null);
-                    hidden.Add(last ? rowIO?.Hidden?[s] : null);
+                    var ids = new List<string>();
+                    var parts = new List<int[]>();
+                    var partStarts = new List<int>();
+                    var owners = new List<int>();
+                    // A request's row input and hidden output belong to its last row, so they go with its last piece.
+                    var inputRows = new List<float[]>();
+                    var hidden = new List<float[]>();
+                    for (int s = 0; s < n; s++)
+                    {
+                        int at = round * step, length = chunks[s]?.Length ?? 0;
+                        if (at >= length) continue;
+                        bool last = at + step >= length;
+                        ids.Add(requestIds[s]);
+                        parts.Add(chunks[s].AsSpan(at, Math.Min(step, length - at)).ToArray());
+                        partStarts.Add(starts[s] + at);
+                        owners.Add(s);
+                        inputRows.Add(last ? rowIO?.InputRows?[s] : null);
+                        hidden.Add(last ? rowIO?.Hidden?[s] : null);
+                    }
+                    bool anyLast = false;
+                    foreach (int o in owners) anyLast |= (round + 1) * step >= chunks[o].Length;
+                    var roundRowIO = rowIO == null
+                        ? overlap != null && !anyLast ? new SlotRowIO { Logits = false } : null
+                        : new SlotRowIO
+                        {
+                            InputRows = rowIO.InputRows == null ? null : inputRows.ToArray(),
+                            Logits = rowIO.Logits && (overlap == null || anyLast),
+                            Hidden = rowIO.Hidden == null ? null : hidden.ToArray(),
+                        };
+                    var logits = new float[ids.Count][];
+                    if (!TryForwardSlots(ids, parts, partStarts.ToArray(), logits, null, roundRowIO))
+                    {
+                        if (round == 0) return false;
+                        throw new InvalidOperationException($"{Config.Architecture}: round {round} of a batched step in ring steps declined after the first ran.");
+                    }
+                    for (int i = 0; i < owners.Count; i++)
+                        if ((round + 1) * step >= chunks[owners[i]].Length) outLogits[owners[i]] = logits[i];
                 }
-                var roundRowIO = rowIO == null ? null : new SlotRowIO
-                {
-                    InputRows = rowIO.InputRows == null ? null : inputRows.ToArray(),
-                    Logits = rowIO.Logits,
-                    Hidden = rowIO.Hidden == null ? null : hidden.ToArray(),
-                };
-                var logits = new float[ids.Count][];
-                if (!TryForwardSlots(ids, parts, partStarts.ToArray(), logits, null, roundRowIO))
-                {
-                    if (round == 0) return false;
-                    throw new InvalidOperationException($"{Config.Architecture}: round {round} of a batched step in ring steps declined after the first ran.");
-                }
-                for (int i = 0; i < owners.Count; i++)
-                    if ((round + 1) * step >= chunks[owners[i]].Length) outLogits[owners[i]] = logits[i];
+            }
+            finally
+            {
+                overlap?.Dispose();
             }
             return true;
         }

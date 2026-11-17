@@ -73,6 +73,29 @@ namespace TensorSharp.GGML
 
         public GraphCapabilities Capabilities { get; }
 
+        /// <summary>A prompt's one-shot steps return with their work queued, the host building the next meanwhile (see
+        /// <see cref="IGraphExecutor.OverlapSteps"/>; TSGgml_GraphOverlapSteps): a 512-row LFM3-1.7B step at 4K on an A40 had
+        /// left the device idle for ~5 ms of host work (the next step's embedding, trace and graph build, its inputs' upload)
+        /// after its ~25 ms run; overlapped, pp4096 16,817 -> 18,216 tok/s and pp16384 15,460 -> 17,137 on ggml-cuda, pp4096
+        /// 9,344 -> 10,092 on ggml-vulkan (interleaved, decode unchanged). On the discrete GPUs only, whose queued work writes no
+        /// host buffer it does not download into (Metal's buffers are the host's: its own lazy sync has its own rules).</summary>
+        public IDisposable OverlapSteps()
+            => Backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan ? new OverlapScope() : null;
+
+        private sealed class OverlapScope : IDisposable
+        {
+            private bool _open = true;
+
+            public OverlapScope() => GgmlNative.TSGgml_GraphOverlapSteps(1);
+
+            public void Dispose()
+            {
+                if (!_open) return;
+                _open = false;
+                GgmlNative.TSGgml_GraphOverlapSteps(0);
+            }
+        }
+
         public IGraphPlan Compile(GraphProgram program)
         {
             ArgumentNullException.ThrowIfNull(program);

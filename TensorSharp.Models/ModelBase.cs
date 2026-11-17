@@ -1634,6 +1634,11 @@ namespace TensorSharp.Models
             return contiguous.GetElementsAsFloat((int)contiguous.ElementCount());
         }
 
+        /// <summary>A prompt's token embeddings are looked up on the host on a discrete GPU's GGML backend too (Metal and the CPU
+        /// always do): the step's graph uploads them with its other inputs, where the device lookup was a graph of its own with
+        /// a download and a wait before every prompt step. Default: on the device.</summary>
+        protected virtual bool EmbedsPromptRowsOnHost => false;
+
         protected unsafe Tensor Embedding(int[] tokens)
         {
             int dim = Config.HiddenSize;
@@ -1651,11 +1656,12 @@ namespace TensorSharp.Models
                     // host's rows themselves (Metal's shared memory, the CPU), a prompt's rows
                     // too: the device lookup was a graph of its own and a wait before the
                     // step's graph (LFM3-1.7B pp128 on Metal +1.4%).
-                    bool hostRows = tokens.Length == 1 || _backend is BackendType.GgmlMetal or BackendType.GgmlCpu;
+                    bool hostRows = tokens.Length == 1 || _backend is BackendType.GgmlMetal or BackendType.GgmlCpu || EmbedsPromptRowsOnHost;
                     if ((hostRows || !canUseGgmlLookup || qw.DevicePreloadTooLarge) && qw.HasHostData)
                     {
                         var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
-                        PopulateQuantizedRows(result, qw, tokens);
+                        PopulateQuantizedRows(result, qw, tokens, freshResult: EmbedsPromptRowsOnHost && tokens.Length > 1
+                            && _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan);
                         return result;
                     }
 

@@ -1238,7 +1238,11 @@ namespace
                 if (try_bind_cached_tensor(g_backend, dev, leaf.tensor, leaf.data, leaf.bytes, needs_upload, usage))
                 {
                     if (needs_upload)
+                    {
+                        // An overlapped step still running may read the device copy this rewrites (TSGgml_GraphOverlapSteps).
+                        host_read_barrier();
                         ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
+                    }
                     leaf.uploaded = false;
                     continue;
                 }
@@ -1535,6 +1539,31 @@ namespace
     }
 }
 
+namespace
+{
+    // Open TSGgml_GraphOverlapSteps scopes: while any is open, a one-shot graph whose run hands the host nothing (no output
+    // to download, no state leaf to write back, no host-expert pause) returns once its work is queued, marked as pending GPU
+    // work like Metal's lazy sync (g_pending_gpu_work): every host read, buffer release and upload drains it first
+    // (host_read_barrier), the next graph's run among them. The host then traces and builds the next prompt step while the
+    // device runs this one, as llama.cpp's scheduler overlaps a prompt's ubatches.
+    std::atomic<int> g_overlap_steps{0};
+}
+
+// Open (open != 0) or close an overlapped-steps scope; closing the last one drains the pending work.
+TSG_EXPORT void TSGgml_GraphOverlapSteps(int open)
+{
+    if (open != 0)
+    {
+        g_overlap_steps.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    if (g_overlap_steps.fetch_sub(1, std::memory_order_acq_rel) <= 1)
+    {
+        g_overlap_steps.store(0, std::memory_order_release);
+        host_read_barrier();
+    }
+}
+
 TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* input_data,
                                const std::int64_t* input_bytes, int ninputs)
 {
@@ -1586,12 +1615,27 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             set_last_error("graph builder: backend graph execution failed.");
             return 0;
         }
+        bool host_results = false;
         for (const Output& o : g->outputs)
             if (o.data != nullptr)
+            {
                 ggml_backend_tensor_get_async(graph_backend(g), o.tensor, o.data, 0, o.bytes);
+                host_results = true;
+            }
         for (const Leaf& leaf : g->leaves)
             if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
+            {
                 ggml_backend_tensor_get_async(graph_backend(g), leaf.tensor, leaf.data, 0, leaf.bytes);
+                host_results = true;
+            }
+        if (!host_results && !g->replayable && g->tp == nullptr && g->host_moe.empty() && !graph_node_profile_enabled()
+            && g_overlap_steps.load(std::memory_order_acquire) > 0)
+        {
+            // Nothing for the host to read: the run returns with its work queued (TSGgml_GraphOverlapSteps).
+            mark_pending_gpu_work();
+            clear_last_error();
+            return 1;
+        }
         sync_backend(graph_backend(g));
         clear_last_error();
         return 1;
