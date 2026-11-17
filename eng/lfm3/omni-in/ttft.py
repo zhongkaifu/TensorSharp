@@ -33,7 +33,19 @@ CASES = [
     ("audio_47s", "audio", "long_harvard", None),
     ("video_10s_sound", "video", "test3", "What happens in this video?"),
     ("video_11s_speech", "video", "recipe_narrated", "What are the steps?"),
+    # Controls: text prompts as long as the media prompts above, so a media case's prefill share can be told apart.
+    ("text_2k", "text", 2000, "Summarize the text above in one sentence."),
+    ("text_6k", "text", 5850, "Summarize the text above in one sentence."),
 ]
+
+_WORDS = ("the birch canoe slid on the smooth planks glue the sheet to the dark blue background it is easy to tell the "
+          "depth of a well these days a chicken leg is a rare dish rice is often served in round bowls").split()
+
+
+def text_prompt(tokens, k):
+    """About `tokens` tokens of text (one word is about one token here), opened by a nonce so no prefix is shared."""
+    words = [f"Request {k}:"] + [_WORDS[(i * 5) % len(_WORDS)] for i in range(tokens)]  # the same text for every k
+    return " ".join(words)
 
 
 def variant(kind, src, k, work):
@@ -66,6 +78,8 @@ def variant(kind, src, k, work):
 
 
 def request(kind, path, text):
+    if kind == "text":
+        return oc.body([{"role": "user", "content": path + "\n\n" + text}], 4, extra={"cache_prompt": False})
     msgs = []
     if kind == "audio":
         msgs.append({"role": "system", "content": "Perform ASR in English."})
@@ -79,16 +93,21 @@ def cold(args, manifest):
     groups = {"image": manifest["images"], "audio": manifest["audio"], "video": manifest["video"]}
     results = {}
     for name, kind, key, text in CASES:
-        src = groups[kind][key]["path"]
+        if args.only and name not in args.only.split(","):
+            continue
+        src = groups[kind][key]["path"] if kind != "text" else None
+
+        def variant_of(k):
+            return text_prompt(key, k) if kind == "text" else variant(kind, src, k, work)
         # warm both servers on this shape (program compile, first-size kernels) with its own variant
-        warm = variant(kind, src, 99, work)
+        warm = variant_of(99)
         for base in (args.llama, args.ts):
             oc.chat(base, request(kind, warm, text))
         t = {"llama": [], "ts": [], "prompt": {}}
         for rep in range(args.reps):
             order = [("llama", args.llama), ("ts", args.ts)] if rep % 2 == 0 else [("ts", args.ts), ("llama", args.llama)]
             for who, base in order:
-                path = variant(kind, src, rep * 2 + (0 if who == "llama" else 1), work)
+                path = variant_of(rep * 2 + (0 if who == "llama" else 1))
                 r = oc.chat(base, request(kind, path, text))
                 t[who].append(r["ttft"])
                 t["prompt"][who] = (r.get("usage") or {}).get("prompt_tokens")
@@ -147,6 +166,7 @@ def main():
     ap.add_argument("--concurrent-llama", action="store_true")
     ap.add_argument("--concurrent-cases", default="image_2048,audio_47s,video_11s_speech")
     ap.add_argument("--delay", type=float, default=0.15)
+    ap.add_argument("--only", default=None, help="comma-separated case names (cold mode)")
     a = ap.parse_args()
     with open(a.media) as f:
         manifest = json.load(f)

@@ -176,11 +176,26 @@ namespace TensorSharp.Models
             int maxFrames = vision.MaxVideoFrames;
             var read = RunOutsideGpuComputeLock(() =>
             {
-                (Lfm3VideoPlan plan, Lfm3RgbImage[] frames) = Lfm3Video.Read(path, maxFrames);
+                // The soundtrack's decoder (an ffmpeg process on desktop hosts) runs while the frames decode.
+                System.Threading.Tasks.Task<float[]> soundtrack = audio != null
+                    ? System.Threading.Tasks.Task.Run(() => ReadSoundtrack(path))
+                    : System.Threading.Tasks.Task.FromResult<float[]>(null);
+                Lfm3VideoPlan plan;
+                Lfm3RgbImage[] frames;
+                try
+                {
+                    (plan, frames) = Lfm3Video.Read(path, maxFrames);
+                }
+                catch
+                {
+                    // the frames' failure is the one to report; the decoder process is only waited for
+                    try { soundtrack.Wait(); } catch (AggregateException) { }
+                    throw;
+                }
                 float[] features = null;
                 int featureFrames = 0;
                 IReadOnlyList<Lfm3AudioPrompt.SoundtrackPiece> pieces = Array.Empty<Lfm3AudioPrompt.SoundtrackPiece>();
-                float[] track = audio != null ? ReadSoundtrack(path) : null;
+                float[] track = soundtrack.GetAwaiter().GetResult();
                 if (track != null)
                 {
                     pieces = Lfm3AudioPrompt.SplitSoundtrack(plan.FrameIndices, plan.SourceFps, plan.SourceFrames, track.Length, out long trimmed);
