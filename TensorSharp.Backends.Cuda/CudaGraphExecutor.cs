@@ -228,10 +228,11 @@ namespace TensorSharp.Cuda
         {
             if (dst.DimensionCount is < 2 or > 3 || !dst.IsContiguous()) return false;
             using Tensor cache = HeadFirst(dst);
-            using Tensor rows = src.View(src.Sizes[^3], src.Sizes[^2], src.Sizes[^1]);
-            Tensor contiguous = rows.IsContiguous() ? rows.CopyRef() : Ops.NewContiguous(rows);
-            using (contiguous)
-                return CudaFusedOps.TryCopyHeadFirstToCache(cache, contiguous, first, count, (int)cache.Sizes[1], circular);
+            // A chunk's rows may come as their permuted view (the graph no longer copies K and V before an indexed write): the
+            // cache-write kernel reads [heads, rows, d] packed, so such rows are packed here first (the copy the graph made).
+            using Tensor contiguous = src.IsContiguous() ? src.CopyRef() : Ops.NewContiguous(src);
+            using Tensor rows = contiguous.View(src.Sizes[^3], src.Sizes[^2], src.Sizes[^1]);
+            return CudaFusedOps.TryCopyHeadFirstToCache(cache, rows, first, count, (int)cache.Sizes[1], circular);
         }
 
         /// <summary>A head-first cache or window [heads, cells, dim] as the kernels take it: a single head's binds as
