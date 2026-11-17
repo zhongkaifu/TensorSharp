@@ -1007,6 +1007,16 @@ namespace TensorSharp.Graph
                                 return;
                             }
                         }
+                        // A residual add's norm that could not fuse - a reader took the sum first (a drafter's tap on the
+                        // stream, as its prompt step follows the trunk) - runs the fused kernel's reduction where the executor
+                        // has it: the norm's bits must not depend on what else reads the stream. The row norm had summed the
+                        // squares in another order, so a drafter loaded beside the trunk changed the trunk's own state.
+                        if (_nodes[sum].Op == GraphOp.Add && _x.TryResidualNorm(Get(sum), weight, Eps(norm), out Tensor residualNormed))
+                        {
+                            Consumed(n.Srcs[0]);
+                            Set(node, new Value { Tensor = Run.Keep(residualNormed) }, fresh: true);
+                            return;
+                        }
                         Value weighted = _x.WeightedNorm(Get(sum), Eps(norm), weight, Run);
                         Consumed(n.Srcs[0]);
                         Set(node, weighted, fresh: true);
@@ -1312,6 +1322,14 @@ namespace TensorSharp.Graph
         protected virtual bool TryAddWeightedNorm(Tensor a, Tensor b, Tensor weight, float eps, out Tensor sum, out Tensor normed)
         {
             sum = normed = null;
+            return false;
+        }
+
+        /// <summary>The weighted norm of a residual add's sum <paramref name="x"/> made before its norm (it could not fuse) with
+        /// <see cref="TryAddWeightedNorm"/>'s reduction, so its rows are the fused rows' bits; false: the generic norm.</summary>
+        protected virtual bool TryResidualNorm(Tensor x, Tensor weight, float eps, out Tensor normed)
+        {
+            normed = null;
             return false;
         }
 

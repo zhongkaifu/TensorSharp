@@ -1535,6 +1535,27 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>A residual add's norm whose sum was made before it (a reader took the sum first): the add-and-norm kernel's
+        /// reduction over the sum, so the rows are the bits <see cref="TryAddWeightedNorm"/> gives.</summary>
+        protected override bool TryResidualNorm(Tensor x, Tensor weight, float eps, out Tensor normed)
+        {
+            normed = null;
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || x.Storage is not CudaStorage || weight.Storage is not CudaStorage || !x.IsContiguous() || !weight.IsContiguous()
+                || x.ElementType != DType.Float32 || weight.ElementType != DType.Float32)
+                return false;
+            long cols = x.Sizes[^1];
+            if (weight.ElementCount() != cols || x.ElementCount() % cols != 0 || cols > int.MaxValue)
+                return false;
+            ReadNow(x);
+            int rows = checked((int)(x.ElementCount() / cols));
+            var norm = new Tensor(Allocator, DType.Float32, x.Sizes);
+            Launch(new[] { x, weight }, new[] { norm }, (k, stream) => k.LaunchAddRmsNorm(Ptr(x), IntPtr.Zero, Ptr(weight), IntPtr.Zero, Ptr(norm),
+                rows, (int)cols, eps, stream));
+            normed = norm;
+            return true;
+        }
+
         // ---- a residual add and norm left for the product that quantizes its rows
 
         /// <summary>

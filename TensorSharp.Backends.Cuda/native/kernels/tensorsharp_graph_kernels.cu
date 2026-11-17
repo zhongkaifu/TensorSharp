@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 32
+#define TS_GRAPH_KERNELS_VERSION 33
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1958,20 +1958,21 @@ extern "C" __global__ void ts_graph_sigmoid_gate_f32(const float* __restrict__ a
 }
 
 // The residual add and the next block's input norm in one pass: sum = a + b, normed = sum * rsqrt(mean(sum^2) + eps) * w
-// over rows of cols (ggml_rms_norm(ggml_add(a, b)) * w). Launch: grid rows, block 512.
+// over rows of cols (ggml_rms_norm(ggml_add(a, b)) * w). b null: the sum is a (a residual add's norm whose sum was already
+// made: the same reduction, so the same bits); sum null: not written. Launch: grid rows, block 512.
 extern "C" __global__ void ts_graph_add_rms_norm_f32(const float* __restrict__ a, const float* __restrict__ b,
     const float* __restrict__ w, float* __restrict__ sum, float* __restrict__ normed, int cols, float eps)
 {
     __shared__ float partial[32];
     const size_t r = blockIdx.x;
     const float* ar = a + r * cols;
-    const float* br = b + r * cols;
-    float* sr = sum + r * cols;
+    const float* br = b != nullptr ? b + r * cols : nullptr;
+    float* sr = sum != nullptr ? sum + r * cols : nullptr;
     float ss = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
     {
-        const float v = ar[i] + br[i];
-        sr[i] = v;
+        const float v = br != nullptr ? ar[i] + br[i] : ar[i];
+        if (sr != nullptr) sr[i] = v;
         ss += v * v;
     }
     ss = ts_graph_warp_sum(ss);
@@ -1987,14 +1988,14 @@ extern "C" __global__ void ts_graph_add_rms_norm_f32(const float* __restrict__ a
     const float scale = rsqrtf(partial[0] / (float)cols + eps);
     float* nr = normed + r * cols;
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
-        nr[i] = sr[i] * scale * w[i];
+        nr[i] = (sr != nullptr ? sr[i] : br != nullptr ? ar[i] + br[i] : ar[i]) * scale * w[i];
 }
 
 // ts_graph_add_rms_norm_f32 for rows of up to 16 * 512 = 8192 values at 512 threads, the row and its norm weights held in
 // registers with every global load issued up front (the direct engine's ts_q35_add_rmsnorm_nvfp4_5120_f32 rule): the loop
 // above waits one dependent round trip per element, and a verify window's rows are a block each. Thread t takes elements
-// t, t + 512, ... in that order, so its sum, the reductions and the expressions are the loop's: the same bits.
-// Launch: grid rows, block 512.
+// t, t + 512, ... in that order, so its sum, the reductions and the expressions are the loop's: the same bits. b and sum may
+// be null as the loop's. Launch: grid rows, block 512.
 #define TS_GRAPH_ADD_RMS_NORM_REG_PER 16
 extern "C" __global__ void __launch_bounds__(512) ts_graph_add_rms_norm_reg_f32(const float* __restrict__ a,
     const float* __restrict__ b, const float* __restrict__ w, float* __restrict__ sum, float* __restrict__ normed, int cols,
@@ -2005,13 +2006,13 @@ extern "C" __global__ void __launch_bounds__(512) ts_graph_add_rms_norm_reg_f32(
     const size_t r = blockIdx.x;
     const int tid = threadIdx.x;
     const float* ar = a + r * cols;
-    const float* br = b + r * cols;
+    const float* br = b != nullptr ? b + r * cols : nullptr;
     float v[PER], wv[PER];
 #pragma unroll
     for (int p = 0; p < PER; p++)
     {
         const int i = tid + p * T;
-        v[p] = i < cols ? ar[i] + br[i] : 0.0f;
+        v[p] = i < cols ? (br != nullptr ? ar[i] + br[i] : ar[i]) : 0.0f;
     }
 #pragma unroll
     for (int p = 0; p < PER; p++)
@@ -2019,7 +2020,7 @@ extern "C" __global__ void __launch_bounds__(512) ts_graph_add_rms_norm_reg_f32(
         const int i = tid + p * T;
         wv[p] = i < cols ? w[i] : 0.0f;
     }
-    float* sr = sum + r * cols;
+    float* sr = sum != nullptr ? sum + r * cols : nullptr;
     float ss = 0.0f;
 #pragma unroll
     for (int p = 0; p < PER; p++)
@@ -2027,7 +2028,7 @@ extern "C" __global__ void __launch_bounds__(512) ts_graph_add_rms_norm_reg_f32(
         const int i = tid + p * T;
         if (i < cols)
         {
-            sr[i] = v[p];
+            if (sr != nullptr) sr[i] = v[p];
             ss += v[p] * v[p];
         }
     }

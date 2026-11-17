@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 32;
+        public const int CurrentVersion = 33;
 
         private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
@@ -785,7 +785,8 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>sum = a + b and normed = rms_norm(sum) * w over <paramref name="rows"/> contiguous rows of
-        /// <paramref name="cols"/>, one pass.</summary>
+        /// <paramref name="cols"/>, one pass. <paramref name="b"/> zero: the sum is a (a norm with the same reduction, so the
+        /// same bits as a's add); <paramref name="sum"/> zero: not written.</summary>
         public void LaunchAddRmsNorm(IntPtr a, IntPtr b, IntPtr w, IntPtr sum, IntPtr normed, int rows, int cols, float eps, IntPtr stream)
         {
             void** args = stackalloc void*[] { &a, &b, &w, &sum, &normed, &cols, &eps };
