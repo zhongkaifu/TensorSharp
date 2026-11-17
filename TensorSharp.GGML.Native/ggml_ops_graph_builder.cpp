@@ -1245,6 +1245,10 @@ namespace
             }
             // Compute memory: the allocator must neither reuse nor clobber it before it is read.
             ggml_set_input(leaf.tensor);
+            // A state is written back to its host bytes after the run (TSGgml_GraphRun): its memory must stay its own to the
+            // end, or a program that only reads it (a projection kept from an earlier program) writes back whatever reused
+            // that memory after the last read (ggml-alloc frees inputs, never outputs).
+            if (leaf.role == LEAF_STATE) ggml_set_output(leaf.tensor);
         }
         for (const Output& o : g->outputs) ggml_set_output(o.tensor);
 
