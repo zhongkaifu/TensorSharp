@@ -76,6 +76,23 @@ namespace TensorSharp.Cuda
         // Decode once, dot every row (optional): [R (rows a pass, 1..8), W index (1, 2, 4 warps an output)]. A module from
         // before the 3/5/6/7-row instantiations fills those widths with the next power of two's kernel.
         private readonly IntPtr[,] denseFast = new IntPtr[9, 3];
+        /// <summary>
+        /// ts_dsv4_dense_fast_r1_w1_p2_f32 at [2] (zero where the module predates it): a decode row against P output rows
+        /// a warp, each row's sum the one-row warp's bit for bit, with P rows' weight loads in flight a lane. The rule:
+        /// a one-warp output of a decode row takes two rows a warp where the grid keeps two blocks a multiprocessor
+        /// (LFM3-1.7B Q4_K_M on an A40, interleaved, decode at 0 / 4K: 251.0 / 241.5 tok/s with one row a warp, 277.8 / 266.9
+        /// with two, 276.1 / 265.1 with four).
+        /// </summary>
+        private readonly IntPtr[] denseFastRows = new IntPtr[3];
+        private int _multiprocessors;
+
+        private int Multiprocessors()
+        {
+            if (_multiprocessors > 0) return _multiprocessors;
+            CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
+            CudaDriverApi.cuDeviceGetAttribute(out int sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
+            return _multiprocessors = Math.Max(1, sms);
+        }
         private readonly bool _hasDenseFast;
 
         /// <summary>Whether the module has a decode-once kernel for every width 1..8 (each window computes its own rows).</summary>
@@ -329,6 +346,8 @@ namespace TensorSharp.Cuda
                         for (int wi = 0; wi < 3; wi++)
                             denseFast[r, wi] = module.GetFunction($"ts_dsv4_dense_fast_r{r}_w{ws[wi]}_f32");
                     _hasDenseFast = true;
+                    try { denseFastRows[2] = module.GetFunction("ts_dsv4_dense_fast_r1_w1_p2_f32"); }
+                    catch (CudaException ex) when (ex.ErrorCode == 500) { denseFastRows[2] = IntPtr.Zero; }
                     try
                     {
                         foreach (int r in new[] { 3, 5, 6, 7 })
@@ -1086,6 +1105,14 @@ namespace TensorSharp.Cuda
             {
                 int wi = DenseFastWarps(outDim);
                 int r = fastWidth > 0 ? Math.Min(fastWidth, 8) : Math.Min(Math.Max(rows, 1), 8);
+                // A decode row over one-warp outputs: two output rows a warp (the same sums), where that still gives every
+                // multiprocessor two blocks (see denseFastRows).
+                if (r == 1 && rows == 1 && wi == 1 && fastWidth == 0 && denseFastRows[2] != IntPtr.Zero
+                    && (outDim + 15) / 16 >= 2 * Multiprocessors())
+                {
+                    Launch(denseFastRows[2], (uint)((outDim + 15) / 16), 1, 1, BlockSize, 0, stream, args);
+                    return;
+                }
                 int perBlock = 8 / wi;
                 Launch(denseFast[r, wi == 1 ? 0 : wi == 2 ? 1 : 2], (uint)((outDim + perBlock - 1) / perBlock), 1, 1, BlockSize, 0, stream, args);
                 return;

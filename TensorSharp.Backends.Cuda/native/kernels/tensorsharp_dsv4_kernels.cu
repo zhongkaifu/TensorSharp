@@ -5411,6 +5411,82 @@ TS_DSV4_DENSE_FAST(1, 4)
 TS_DSV4_DENSE_FAST(2, 4)
 TS_DSV4_DENSE_FAST(4, 4)
 TS_DSV4_DENSE_FAST(8, 4)
+// One activation row (a decode step) against P output rows a warp (W = 1) instead of one: a lane takes its units of each of
+// the warp's P rows in turn, so it has P rows' weight loads in flight where it had one, and each row's sum is the one-row
+// warp's (the same units in the same order, then the same butterfly): bit for bit ts_dsv4_dense_fast_r1_w1_f32's outputs.
+// Rows of 2048 inputs (Q4_K: one 64-value unit a lane) left the one-row warp latency-bound: LFM3-1.7B's 7680 x 2 -> 2048
+// gate/up product took 40.5 us against ggml-cuda's MMVQ 30.5 on an A40 (Dsv4Kernels.DenseQ81Rows takes P = 2 where the grid
+// keeps two blocks a multiprocessor). grid ceil(outDim / (8 P)), 256 threads.
+template <int P>
+__device__ __forceinline__ void ts_dsv4_dense_fast_rows_r1(
+    const uint8_t* __restrict__ w, const ts_dsv4_block_q8_1* __restrict__ act, float* __restrict__ out,
+    const int wtype, const int outDim, const int inDim, const long long rowBytes)
+{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int rr0 = (blockIdx.x * 8 + warp) * P;
+    ts_dsv4_table16 tb;
+    if (wtype == TS_DSV4_WTYPE_IQ4XS)
+        tb = ts_dsv4_load_table16(ts_dsv4_kvalues_iq4nl);
+    const ts_dsv4_block_q8_1* const a[1] = { act };
+    float s[P][1];
+    const uint8_t* rows[P];
+#pragma unroll
+    for (int p = 0; p < P; ++p)
+    {
+        s[p][0] = 0.0f;
+        rows[p] = w + (size_t)min(rr0 + p, outDim - 1) * rowBytes;
+    }
+    const int first = lane, step = 32;
+    if (wtype == TS_DSV4_WTYPE_IQ4XS)
+        for (int u = first; u < inDim / 32; u += step)
+#pragma unroll
+            for (int p = 0; p < P; ++p) ts_dsv4_fast_iq4xs<1>(rows[p], u, tb, a, s[p]);
+    else if (wtype == TS_DSV4_WTYPE_Q8_0)
+        for (int u = first; u < inDim / 32; u += step)
+#pragma unroll
+            for (int p = 0; p < P; ++p) ts_dsv4_fast_q8_0<1>(rows[p], u, a, s[p]);
+    else if (wtype == TS_DSV4_WTYPE_Q2_0)
+        for (int u = first; u < inDim / 32; u += step)
+#pragma unroll
+            for (int p = 0; p < P; ++p) ts_dsv4_fast_q2_0<1>(rows[p], u, a, s[p]);
+    else if (wtype == TS_DSV4_WTYPE_Q4_K)
+        for (int u = first; u < inDim / 64; u += step)
+#pragma unroll
+            for (int p = 0; p < P; ++p) ts_dsv4_fast_q45k<1, false>(rows[p], u, a, s[p]);
+    else if (wtype == TS_DSV4_WTYPE_Q5_K)
+        for (int u = first; u < inDim / 64; u += step)
+#pragma unroll
+            for (int p = 0; p < P; ++p) ts_dsv4_fast_q45k<1, true>(rows[p], u, a, s[p]);
+    else if (wtype == TS_DSV4_WTYPE_Q3_K)
+        for (int u = first; u < inDim / 32; u += step)
+#pragma unroll
+            for (int p = 0; p < P; ++p) ts_dsv4_fast_q3k<1>(rows[p], u, a, s[p]);
+    else if (wtype == TS_DSV4_WTYPE_Q6_K || wtype == TS_DSV4_WTYPE_IQ4NL)
+        for (int u = first; u < inDim / 32; u += step)
+#pragma unroll
+            for (int p = 0; p < P; ++p) ts_dsv4_fast_sub<1>(rows[p], wtype, u, a, s[p]);
+    else
+    {
+#pragma unroll
+        for (int p = 0; p < P; ++p)
+            s[p][0] = __int_as_float(0x7fc00000);
+    }
+#pragma unroll
+    for (int p = 0; p < P; ++p)
+    {
+        const float v = ts_dsv4_warp_sum(s[p][0]);
+        if (lane == 0 && rr0 + p < outDim)
+            out[rr0 + p] = v;
+    }
+}
+
+#define TS_DSV4_DENSE_FAST_ROWS(P)                                                                                         \
+    extern "C" __global__ void __launch_bounds__(256) ts_dsv4_dense_fast_r1_w1_p##P##_f32(                                \
+        const uint8_t* w, const ts_dsv4_block_q8_1* act, float* out, const int wtype, const int outDim, const int inDim,   \
+        const long long rowBytes, const int rows)                                                                          \
+    { TS_PDL_ENTRY(); (void)rows; ts_dsv4_dense_fast_rows_r1<P>(w, act, out, wtype, outDim, inDim, rowBytes); }
+TS_DSV4_DENSE_FAST_ROWS(2)
+
 // Every width up to 8, so a window of 3, 5, 6 or 7 rows (a verify of 2, 4, 5 or 6 drafts) computes its own rows instead of
 // the next power of two's: a row's arithmetic does not depend on R, so each width answers as the padded dispatch did.
 TS_DSV4_DENSE_FAST(3, 1)
