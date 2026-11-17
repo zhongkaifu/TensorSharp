@@ -253,6 +253,17 @@ namespace TensorSharp.Cuda
         /// copies (their own measured speed).</summary>
         protected override bool ProductRowBlocksAsViews(long rows) => rows > DenseDecodeRows;
 
+        /// <summary>The generic attention's mask as one row added to every head's scores (the scores [heads, nq * nkv], the
+        /// mask their row): the mask expanded over the heads has no kernel here and went through the element-by-element host
+        /// fallback (a 64-request LFM3 burst's chunks over a sliding window's cells). The same sums.</summary>
+        protected override void AddAttentionMask(Tensor scores, Tensor mask)
+        {
+            using Tensor rows = scores.View(scores.Sizes[0], scores.Sizes[1] * scores.Sizes[2]);
+            using Tensor row = mask.View(scores.Sizes[1] * scores.Sizes[2]);
+            if (!CudaKernelOps.TryBinaryRowBroadcast(rows, rows, row, CudaBinaryOp.Add))
+                base.AddAttentionMask(scores, mask);
+        }
+
         /// <summary>
         /// Attention over cache windows with the per-op path's kernels: a decode row runs the GQA decode kernel
         /// on the head-first cache in place (F32 or F16); a prompt chunk expands the window's KV heads, runs the

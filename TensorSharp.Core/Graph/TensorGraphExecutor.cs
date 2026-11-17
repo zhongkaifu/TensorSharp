@@ -215,12 +215,7 @@ namespace TensorSharp.Graph
                 owned.Add(scores);
                 Ops.AddmmBatch(scores, 0, scores, scale, q, kt);
                 if (mask != null)
-                {
-                    Tensor m = Contig(F32(mask, owned), owned);
-                    using Tensor m3 = m.View(1, nq, nkv);
-                    using Tensor me = m3.Expand(heads, nq, nkv);
-                    Ops.Add(scores, scores, me);
-                }
+                    AddAttentionMask(scores, Contig(F32(mask, owned), owned));
                 Ops.Softmax(scores, scores);
                 var result = new Tensor(Allocator, DType.Float32, heads, nq, dv);
                 Ops.AddmmBatch(result, 0, result, 1.0f, scores, vh);
@@ -230,6 +225,15 @@ namespace TensorSharp.Graph
             {
                 foreach (Tensor t in owned) t.Dispose();
             }
+        }
+
+        /// <summary><see cref="Attention"/>'s additive mask (contiguous, nq x nkv values) on every head's scores
+        /// [heads, nq, nkv] (contiguous). Default: one add of the mask expanded over the heads.</summary>
+        protected virtual void AddAttentionMask(Tensor scores, Tensor mask)
+        {
+            using Tensor m3 = mask.View(1, scores.Sizes[1], scores.Sizes[2]);
+            using Tensor me = m3.Expand(scores.Sizes);
+            Ops.Add(scores, scores, me);
         }
 
         /// <summary>ggml's flash attention: q [heads, nq, d], k/v [kvHeads, nkv, d] (views), the mask [nq, nkv]
