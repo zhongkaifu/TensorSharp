@@ -139,6 +139,19 @@ public sealed class Lfm3OmniInputTests : IDisposable
         Assert.Empty(Lfm3MediaLayout.Items(elided));
     }
 
+    [Fact]
+    public void ElidedFileOnlyVideo_IsCountedAndDropped()
+    {
+        // A video_url for a family that reads the clip itself has no frames at all.
+        var m = new ChatMessage { Role = "user", Content = "Q", IsVideo = true, ImagePaths = ["s.png"], VideoFilePaths = ["c.mp4"] };
+        ChatMessage elided = ChatHistoryPreparer.WithMediaReplacedByNote(m, images: 1, audio: 0);
+        Assert.Null(elided.VideoFilePaths);
+        Assert.Contains("earlier video", elided.Content);
+        var fileOnly = new ChatMessage { Role = "user", Content = "Q", IsVideo = true, VideoFilePaths = ["c.mp4"] };
+        Assert.True(ChatHistoryPreparer.HasMultimodalContent(fileOnly));
+        Assert.Null(ChatHistoryPreparer.WithMediaReplacedByNote(fileOnly, images: 1, audio: 0).VideoFilePaths);
+    }
+
     // ---------------------------------------------------------------- request surfaces
 
     [Fact]
@@ -160,7 +173,7 @@ public sealed class Lfm3OmniInputTests : IDisposable
     }
 
     [Fact]
-    public void OpenAiVideoUrl_KeepsTheClipBesideItsSampledFrames()
+    public void OpenAiVideoUrl_ForLfm3_SavesTheClipWithoutSamplingFrames()
     {
         var uploads = new UploadStoragePolicy(_directory);
         using var json = JsonDocument.Parse("""
@@ -174,8 +187,29 @@ public sealed class Lfm3OmniInputTests : IDisposable
         string clip = Assert.Single(m.VideoFilePaths!);
         Assert.True(File.Exists(clip));
         Assert.Equal(new byte[] { 1, 2, 3 }, File.ReadAllBytes(clip));
-        Assert.Equal(new double?[] { 0, 1, 2, null }, m.ImageTimestamps);
-        Assert.Equal($"v[{clip}],i3", Kinds(m));
+        // LFM3 reads the clip itself: it is probed (an unreadable one is refused here), no frame is decoded or written.
+        Assert.Equal(1, _decoder.Probes);
+        Assert.Empty(_decoder.Requested);
+        Assert.Single(m.ImagePaths!);
+        Assert.Equal($"i0,v[{clip}]", Kinds(m));
+
+        _decoder.Unreadable = true;
+        Assert.Throws<JsonException>(() => ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: Arch));
+    }
+
+    [Fact]
+    public void OpenAiVideoUrl_ForAFrameFamily_KeepsTheClipBesideItsSampledFrames()
+    {
+        var uploads = new UploadStoragePolicy(_directory);
+        using var json = JsonDocument.Parse("""
+            [{"role":"user","content":[
+              {"type":"video_url","video_url":{"url":"data:video/mp4;base64,AQID","fps":1,"max_frames":3}},
+              {"type":"text","text":"What happens?"}]}]
+            """);
+        ChatMessage m = Assert.Single(ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: "qwen4exp"));
+        Assert.Equal(new[] { 0, 2, 4 }, _decoder.Requested);
+        Assert.Equal(new double?[] { 0, 1, 2 }, m.ImageTimestamps);
+        Assert.True(File.Exists(Assert.Single(m.VideoFilePaths!)));
     }
 
     [Fact]
@@ -191,8 +225,11 @@ public sealed class Lfm3OmniInputTests : IDisposable
         List<ChatMessage> messages = ChatMessageParser.ParseResponsesInput(json.RootElement, null, uploads, architecture: Arch);
         ChatMessage m = Assert.Single(messages);
         string clip = Assert.Single(m.VideoFilePaths!);
-        Assert.Equal(new double?[] { 0, 1, 2, null }, m.ImageTimestamps);
-        Assert.Equal($"v[{clip}],i3", Kinds(m));
+        Assert.Empty(_decoder.Requested);
+        Assert.Equal($"i0,v[{clip}]", Kinds(m));
+        // A frame family samples it, timed, with a still beside it keeping no time.
+        ChatMessage q = Assert.Single(ChatMessageParser.ParseResponsesInput(json.RootElement, null, uploads, architecture: "qwen4exp"));
+        Assert.Equal(new double?[] { 0, 1, 2, null }, q.ImageTimestamps);
 
         // A protocol that does not sample video refuses the part, as the chat endpoint refuses video_url.
         using var plain = JsonDocument.Parse("""
@@ -284,11 +321,21 @@ public sealed class Lfm3OmniInputTests : IDisposable
 
     private sealed class FakeDecoder : IVideoDecoder
     {
-        public VideoInfo Probe(string path) => new(2, 6, 2, 2);
+        public List<int> Requested { get; } = new();
+        public int Probes { get; private set; }
+        public bool Unreadable { get; set; }
+
+        public VideoInfo Probe(string path)
+        {
+            Probes++;
+            return Unreadable ? throw new InvalidDataException("not a video") : new(2, 6, 2, 2);
+        }
+
         public void ReadFrames(string path, IReadOnlyList<int> indices, FrameCallback onFrame)
         {
             foreach (int index in indices)
             {
+                Requested.Add(index);
                 byte[] rgb = Enumerable.Repeat((byte)(index * 20), 12).ToArray();
                 onFrame(index, rgb, 2, 2, 6, PixelLayout.Rgb);
             }

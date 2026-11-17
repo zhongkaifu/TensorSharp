@@ -3022,8 +3022,8 @@ namespace TensorSharp.Server
                 if (IsInstructionRole(message?.Role) || !ChatHistoryPreparer.HasMultimodalContent(message))
                     continue;
                 int images = message.ImagePaths?.Count ?? 0;
-                if (images > 0 && message.IsVideo)
-                    items.Add(new EarlierMedia(i, images, 0));
+                if (message.IsVideo && (images > 0 || message.VideoFilePaths is { Count: > 0 }))
+                    items.Add(new EarlierMedia(i, Math.Max(1, images), 0));
                 else
                     for (int k = 0; k < images; k++)
                         items.Add(new EarlierMedia(i, 1, 0));

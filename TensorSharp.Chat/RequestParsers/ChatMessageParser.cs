@@ -337,9 +337,10 @@ namespace TensorSharp.Server.RequestParsers
                             }
                             else if (type == "video_url" && part.TryGetProperty("video_url", out var videoUrl))
                             {
-                                if (ChatProtocolRegistry.For(architecture)?.CapsVideoFrames != true)
+                                ChatProtocol protocol = ChatProtocolRegistry.For(architecture);
+                                if (protocol?.CapsVideoFrames != true)
                                     throw new JsonException("video_url frame sampling is not supported by this model's chat protocol.");
-                                AppendSampledVideo(msg, videoUrl, uploads);
+                                AppendSampledVideo(msg, videoUrl, uploads, sampleFrames: !protocol.ReadsVideoFiles);
                             }
                             else if (type == "input_audio" && part.TryGetProperty("input_audio", out var audioEl))
                             {
@@ -368,7 +369,7 @@ namespace TensorSharp.Server.RequestParsers
                         }
 
                         msg.Content = string.Join("\n", textParts);
-                        if (msg.ImagePaths.Count == 0) msg.ImagePaths = null;
+                        if (msg.ImagePaths.Count == 0) { msg.ImagePaths = null; msg.ImageTimestamps = null; }
                         if (msg.AudioPaths.Count == 0) msg.AudioPaths = null;
                     }
                 }
@@ -593,9 +594,10 @@ namespace TensorSharp.Server.RequestParsers
                         }
                         else if (partType == "input_video")
                         {
-                            if (ChatProtocolRegistry.For(architecture)?.CapsVideoFrames != true)
+                            ChatProtocol protocol = ChatProtocolRegistry.For(architecture);
+                            if (protocol?.CapsVideoFrames != true)
                                 throw new JsonException("input_video is not supported by this model's chat protocol.");
-                            AppendResponsesVideo(msg, part, uploads);
+                            AppendResponsesVideo(msg, part, uploads, sampleFrames: !protocol.ReadsVideoFiles);
                         }
                         else if (partType == "input_image")
                         {
@@ -622,7 +624,7 @@ namespace TensorSharp.Server.RequestParsers
                     }
 
                     msg.Content = string.Join("\n", textParts);
-                    if (msg.ImagePaths.Count == 0) msg.ImagePaths = null;
+                    if (msg.ImagePaths.Count == 0) { msg.ImagePaths = null; msg.ImageTimestamps = null; }
                     if (msg.AudioPaths.Count == 0) msg.AudioPaths = null;
                 }
 

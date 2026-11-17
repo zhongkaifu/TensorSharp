@@ -234,9 +234,10 @@ namespace TensorSharp.Runtime
                 // the template's own spans. The multimodal expander replaces the inner
                 // token with the encoder rows (docs/models/lfm3.md, "Media placeholders").
                 AppendMediaPlaceholders = ChatTemplate.AppendLfm3MediaPlaceholders,
-                // A video is its sampled frames, a frame pair's worth of rows each, so
-                // `video_url` parts are sampled and capped like Qwen 3.8's.
+                // `video_url` / `input_video` are accepted; the model samples the saved clip
+                // itself (2 fps, with its soundtrack), so the host samples no frames from it.
                 CapsVideoFrames = true,
+                ReadsVideoFiles = true,
                 // Reasoning ends at `</think>`, or at a `<tool_call>` written while still
                 // reasoning; calls are the Qwen3-Coder XML body. llama.cpp routes this
                 // template to its Qwen3-Coder parser with the same end tags.

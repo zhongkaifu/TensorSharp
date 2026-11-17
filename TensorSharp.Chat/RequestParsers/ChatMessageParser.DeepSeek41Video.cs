@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
+using TensorSharp.Models.Media;
 using TensorSharp.Server.Hosting;
 
 namespace TensorSharp.Server.RequestParsers
@@ -14,33 +15,35 @@ namespace TensorSharp.Server.RequestParsers
         /// An OpenAI chat <c>video_url</c> part's object: <c>{"url": "data:video/...;base64,...", "fps"?, "max_frames"?}</c>.
         /// </summary>
         private static void AppendSampledVideo(ChatMessage message, JsonElement video,
-            UploadStoragePolicy uploads)
+            UploadStoragePolicy uploads, bool sampleFrames)
         {
             if (video.ValueKind != JsonValueKind.Object || !video.TryGetProperty("url", out var urlElement) ||
                 urlElement.ValueKind != JsonValueKind.String)
                 throw new JsonException("video_url must contain a base64 video data URI in url.");
-            AppendSampledVideo(message, urlElement.GetString(), video, uploads);
+            AppendSampledVideo(message, urlElement.GetString(), video, uploads, sampleFrames);
         }
 
         /// <summary>
         /// A Responses <c>input_video</c> part: <c>{"type": "input_video", "video_url": "data:video/...;base64,...",
         /// "fps"?, "max_frames"?}</c> - the shape of <c>input_image</c>, with <c>video_url</c>'s sampling options.
         /// </summary>
-        private static void AppendResponsesVideo(ChatMessage message, JsonElement part, UploadStoragePolicy uploads)
+        private static void AppendResponsesVideo(ChatMessage message, JsonElement part, UploadStoragePolicy uploads,
+            bool sampleFrames)
         {
             if (!part.TryGetProperty("video_url", out var urlElement) || urlElement.ValueKind != JsonValueKind.String)
                 throw new JsonException("input_video.video_url must contain a base64 video data URI.");
-            AppendSampledVideo(message, urlElement.GetString(), part, uploads);
+            AppendSampledVideo(message, urlElement.GetString(), part, uploads, sampleFrames);
         }
 
         /// <summary>
-        /// Save the clip of a data URI to the upload directory, sample its frames into <see cref="ChatMessage.ImagePaths"/>
-        /// (timed, <see cref="ChatMessage.ImageTimestamps"/>) at <paramref name="options"/>' <c>fps</c> / <c>max_frames</c>,
-        /// and name the saved clip in <see cref="ChatMessage.VideoFilePaths"/>, so a family that samples a video itself
-        /// (LFM3-Omni: its own 2 fps frames and the soundtrack) reads the file instead of the frames.
+        /// Save the clip of a data URI to the upload directory and name it in <see cref="ChatMessage.VideoFilePaths"/>; with
+        /// <paramref name="sampleFrames"/>, also sample its frames into <see cref="ChatMessage.ImagePaths"/> (timed,
+        /// <see cref="ChatMessage.ImageTimestamps"/>) at <paramref name="options"/>' <c>fps</c> / <c>max_frames</c>. A
+        /// family that reads the clip itself (<see cref="ChatProtocol.ReadsVideoFiles"/>: LFM3-Omni's own 2 fps frames and
+        /// the soundtrack) takes no host frames: the clip is only probed, so an unreadable one is still refused here.
         /// </summary>
         private static void AppendSampledVideo(ChatMessage message, string url, JsonElement options,
-            UploadStoragePolicy uploads)
+            UploadStoragePolicy uploads, bool sampleFrames)
         {
             int comma = url?.IndexOf(',') ?? -1;
             if (comma <= 0 || !url.StartsWith("data:video/", StringComparison.Ordinal) ||
@@ -77,6 +80,18 @@ namespace TensorSharp.Server.RequestParsers
             {
                 Directory.CreateDirectory(uploads.DirectoryPath);
                 File.WriteAllBytes(path, data);
+                if (!sampleFrames)
+                {
+                    VideoInfo info = MediaCodecs.Video.Probe(path);
+                    if (info.FrameCount < 1 || !(info.Fps > 0))
+                        throw new InvalidDataException($"the clip reports {info.FrameCount} frames at {info.Fps} fps.");
+                    message.IsVideo = true;
+                    (message.VideoFilePaths ??= new List<string>()).Add(path);
+                    // The message is now a video one: its stills, before and after this part, keep an explicit
+                    // no-time entry so no reader takes them for frames.
+                    message.ImageTimestamps ??= new List<double?>(new double?[message.ImagePaths.Count]);
+                    return;
+                }
                 var (frames, timestamps) = MediaHelper.ExtractVideoFramesWithTimestamps(
                     path, uploads.DirectoryPath, prefix, maxFrames, fps);
                 if (frames.Count == 0 || frames.Count != timestamps.Count)

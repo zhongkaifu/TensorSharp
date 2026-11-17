@@ -436,11 +436,14 @@ namespace TensorSharp.Server
         {
             int imageCount = message.ImagePaths?.Count ?? 0;
             int audioCount = message.AudioPaths?.Count ?? 0;
-            images = message.IsVideo && images > 0 ? imageCount : Math.Clamp(images, 0, imageCount);
+            // A video goes whole: its frames with the clip a family reads itself (VideoFilePaths), which may
+            // be all a message has of it (ChatProtocol.ReadsVideoFiles).
+            bool video = message.IsVideo && images > 0 && (imageCount > 0 || message.VideoFilePaths is { Count: > 0 });
+            images = video ? imageCount : Math.Clamp(images, 0, imageCount);
             audio = Math.Clamp(audio, 0, audioCount);
 
             var notes = new List<string>();
-            if (images > 0 && message.IsVideo)
+            if (video)
             {
                 // The frames are the server's extraction, not something the user named.
                 notes.Add("[an earlier video is no longer shown]");
@@ -454,7 +457,7 @@ namespace TensorSharp.Server
                 notes.Add(Note("audio", message.AudioPaths[i], "included"));
 
             ChatMessage copy = CloneShallow(message);
-            if (images > 0)
+            if (images > 0 || video)
             {
                 copy.ImagePaths = images < imageCount ? message.ImagePaths.Skip(images).ToList() : null;
                 copy.ImageTimestamps = images < imageCount && message.ImageTimestamps != null
@@ -510,7 +513,8 @@ namespace TensorSharp.Server
         {
             if (msg == null) return false;
             return (msg.ImagePaths != null && msg.ImagePaths.Count > 0) ||
-                   (msg.AudioPaths != null && msg.AudioPaths.Count > 0);
+                   (msg.AudioPaths != null && msg.AudioPaths.Count > 0) ||
+                   (msg.VideoFilePaths != null && msg.VideoFilePaths.Count > 0);
         }
 
         public static bool HasMultimodalContent(List<ChatMessage> history)
