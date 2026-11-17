@@ -39,6 +39,7 @@
 | [Nemotron-H / Omni](nemotron_zh-cn.md) | 文本；Omni 图像；有条件的音频 | 文本 | 条件支持：音频需要公开 GGUF 未附带的 Parakeet 伴随文件。不支持投机解码。 |
 | [Mistral 3](mistral3_zh-cn.md) | 文本、图像 | 文本 | 不支持：显式思考模式与工具。验证范围以具体检查点与后端为准。 |
 | [Hunyuan Dense](hunyuan-dense_zh-cn.md) | 文本 | 文本 | 已实现：单设备文本路径；不支持工具、张量并行与层切分。 |
+| [LFM3 / LFM3-Omni](lfm3_zh-cn.md) | 文本；Omni 借助投影器输入图像、视频、音频 | 文本 | 有条件：聊天协议已与 llama.cpp 核对；生成、Omni 编码器与所有 CUDA 路径尚未验证。不提供语音输出。 |
 | [GLM 5.x](glm_zh-cn.md) | 文本；仅 5.3-Flash 支持图像 | 文本 | 条件支持：5.2/5.3 仅文本。NextN 不支持启用张量并行的运行；CPU 参考路径有数值限制。 |
 | [DeepSeek V4 Flash](deepseek4_zh-cn.md) | 文本 | 文本 | 条件支持：核对内存与放置；可选的 DSpark 投机解码需要匹配草稿器。 |
 | [DeepSeek V4.1 Flash / 1017](deepseek41_zh-cn.md) | 文本；有条件的图像与视频 | 文本 | 实验性：路由 MoE TP / DSpark。纯 C# CPU 为夹具级验证；1017 默认 YOCO prefill 是近似计算。 |
