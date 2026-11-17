@@ -21,6 +21,12 @@ namespace TensorSharp.Graph
         public bool PackedProductBlocks { get; init; }
         /// <summary>An op may write its result in place inside a state leaf (<see cref="GraphNodeKind.Alias"/>).</summary>
         public bool InPlaceStateAlias { get; init; }
+        /// <summary>A sliding-window attention over a capacity window or a ring (<see cref="GraphOp.FlashAttnExt"/> ip[2]: its band)
+        /// reads its mask on the device as the selection it is, every run: the band's floor moves with each position, so a
+        /// recorded decode step replays the band of the position it runs at (a mask classified from its host values would
+        /// replay the recorded position's floor). Only for windows this executor attends that way
+        /// (<see cref="IGraphExecutor.AttendsCapacityWindows"/>).</summary>
+        public bool BandMasksOnDevice { get; init; }
 
         /// <summary>A verify window's recurrence writes only its rows' outputs and saves its scan inputs (a gated delta rule
         /// with destination leaf 6), the live state read and left as it was: the commit steps the kept rows on it again, in

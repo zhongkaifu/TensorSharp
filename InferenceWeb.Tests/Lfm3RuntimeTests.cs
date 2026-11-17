@@ -40,6 +40,8 @@ public sealed partial class Lfm3RuntimeTests : IDisposable
     {
         // Untied: the small files' greedy streams then depend on the history (a tied head repeats its last token).
         "dense" => new Lfm3SyntheticModelBuilder { UntiedOutput = true },
+        // The real checkpoints' head width: direct CUDA's flash kernels run 128-wide heads only.
+        "dense128" => new Lfm3SyntheticModelBuilder { UntiedOutput = true, HeadDimension = 128 },
         // The real checkpoints' layout: the head is the token embedding.
         "tied" => new Lfm3SyntheticModelBuilder(),
         // F32 everywhere: the reference forward's exact weights.

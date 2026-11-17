@@ -35,6 +35,9 @@ internal sealed class Lfm3SyntheticModelBuilder
     public bool UntiedOutput { get; init; }
     /// <summary>Rotated pairs of the full layers (rope_freqs ones; the rest 1e30).</summary>
     public int RotatedPairs { get; init; } = HeadDim / 4;
+    /// <summary>The attention heads' width (<see cref="HeadDim"/> by default; 128, the real checkpoints', where a backend's
+    /// kernels run only that width: direct CUDA's flash attention).</summary>
+    public int HeadDimension { get; init; } = HeadDim;
     /// <summary>The end-of-sequence token id (the weights do not depend on it: a test can make a token the greedy stream
     /// draws the EOS).</summary>
     public uint Eos { get; init; } = 2;
@@ -51,7 +54,7 @@ internal sealed class Lfm3SyntheticModelBuilder
             Gen("token_embd.weight", 0.5f, Hidden, Vocab),
             GenAround("output_norm.weight", 1f, 0.1f, Hidden),
         };
-        var factors = new float[HeadDim / 2];
+        var factors = new float[HeadDimension / 2];
         for (int i = 0; i < factors.Length; i++) factors[i] = i < RotatedPairs ? 1f : 1.0000000150474662e+30f;
         t.Add(new Tensor { Name = "rope_freqs.weight", Dims = new ulong[] { (ulong)factors.Length }, Data = factors });
         if (UntiedOutput) t.Add(Gen("output.weight", 0.08f, Hidden, Vocab));
@@ -70,13 +73,13 @@ internal sealed class Lfm3SyntheticModelBuilder
             }
             else
             {
-                t.Add(Gen(p + "attn_q.weight", 0.06f, Hidden, Heads * HeadDim));
-                t.Add(Gen(p + "attn_k.weight", 0.06f, Hidden, KvHeads * HeadDim));
-                t.Add(Gen(p + "attn_v.weight", 0.06f, Hidden, KvHeads * HeadDim));
-                t.Add(GenAround(p + "attn_q_norm.weight", 1f, 0.2f, HeadDim));
-                t.Add(GenAround(p + "attn_k_norm.weight", 1f, 0.2f, HeadDim));
+                t.Add(Gen(p + "attn_q.weight", 0.06f, Hidden, Heads * HeadDimension));
+                t.Add(Gen(p + "attn_k.weight", 0.06f, Hidden, KvHeads * HeadDimension));
+                t.Add(Gen(p + "attn_v.weight", 0.06f, Hidden, KvHeads * HeadDimension));
+                t.Add(GenAround(p + "attn_q_norm.weight", 1f, 0.2f, HeadDimension));
+                t.Add(GenAround(p + "attn_k_norm.weight", 1f, 0.2f, HeadDimension));
                 t.Add(Gen(p + "attn_gate.weight", 0.15f, Hidden, Heads));
-                t.Add(Gen(p + "attn_output.weight", 0.05f, Heads * HeadDim, Hidden));
+                t.Add(Gen(p + "attn_output.weight", 0.05f, Heads * HeadDimension, Hidden));
             }
             t.Add(Gen(p + "ffn_gate.weight", 0.06f, Hidden, Ff));
             t.Add(Gen(p + "ffn_up.weight", 0.06f, Hidden, Ff));
@@ -104,9 +107,9 @@ internal sealed class Lfm3SyntheticModelBuilder
             new U32 { Key = $"{a}.feed_forward_length", V = Ff },
             new U32 { Key = $"{a}.attention.head_count", V = Heads },
             new I32Arr { Key = $"{a}.attention.head_count_kv", V = kvPerLayer },
-            new U32 { Key = $"{a}.attention.key_length", V = HeadDim },
-            new U32 { Key = $"{a}.attention.value_length", V = HeadDim },
-            new U32 { Key = $"{a}.rope.dimension_count", V = HeadDim },
+            new U32 { Key = $"{a}.attention.key_length", V = (uint)HeadDimension },
+            new U32 { Key = $"{a}.attention.value_length", V = (uint)HeadDimension },
+            new U32 { Key = $"{a}.rope.dimension_count", V = (uint)HeadDimension },
             new F32 { Key = $"{a}.rope.freq_base", V = RopeBase },
             new F32 { Key = $"{a}.rope.freq_base_swa", V = RopeBaseSliding },
             new U32 { Key = $"{a}.attention.sliding_window", V = Window },

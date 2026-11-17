@@ -2292,7 +2292,7 @@ namespace TensorSharp.Models
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, ring, kvType, count, gqa });
                     int mask = step.RingBandMask(ring, start, count, s, band);
                     fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, mask, ring), scale,
-                        AttentionKvMax(step, layer, s));
+                        AttentionKvMax(step, layer, s), DeviceBand(step, band, d, kvType));
                 }
                 else if (wrapped)
                 {
@@ -2363,7 +2363,7 @@ namespace TensorSharp.Models
                     bool region = BeginWindowAttention(step, layer, x, s, new WindowAttentionOperands(qs, ck, cv, rowsAt, window, heads, kvHeads, d, scale));
                     int mask = band > 0 ? step.BandMask(keys, first, start, count, s, band) : step.ChunkMask(window, start, count, s);
                     fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, mask, keys), scale,
-                        AttentionKvMax(step, layer, s));
+                        AttentionKvMax(step, layer, s), capacity ? DeviceBand(step, band, d, kvType) : 0);
                     if (region) step.EndFused(stackalloc[] { fa });
                 }
                 else
@@ -2412,6 +2412,14 @@ namespace TensorSharp.Models
         /// <see cref="GateAttentionOutput"/>; a per-head weight it reads shards by heads under tensor parallelism
         /// (<see cref="HeadParallelLayerWeights"/>).</summary>
         protected virtual int EmitAttentionOutput(GraphStep step, int layer, int x, int attn) => attn;
+
+        /// <summary>The band a sliding-window attention over a ring or a capacity window passes its executor, where that executor
+        /// reads band masks on the device (<see cref="GraphCapabilities.BandMasksOnDevice"/>) and attends this cache that way
+        /// (decode rows and verify windows, <see cref="MaxAdvancedWindowRows"/> rows a sequence at most); 0 otherwise (the
+        /// mask is classified from its host values, and a recorded step then cannot replay the band's moving floor).</summary>
+        private int DeviceBand(GraphStep step, int band, int headDim, int kvType)
+            => band > 0 && GraphExecutor.Capabilities.BandMasksOnDevice && Array.TrueForAll(step.Counts, c => c <= MaxAdvancedWindowRows)
+               && GraphExecutor.AttendsCapacityWindows(headDim, kvType) ? band : 0;
 
         /// <summary>The first cache cell a sliding-window layer's rows continuing at <paramref name="start"/> read: the bucket of
         /// <paramref name="stepRows"/> cells below the first row's window (positions (start - window, start]), so every position
@@ -3079,6 +3087,7 @@ namespace TensorSharp.Models
             {
                 get
                 {
+                    if (DeviceBandMasks) return false;   // the executor reads the bands where they are, at every run
                     foreach (InputMeta m in _inputMeta)
                         if (m.Kind == InputKind.DecodeMask && m.Band > 0 && m.Start + m.Count - m.Band > m.Offset) return true;
                     return false;
@@ -3492,12 +3501,20 @@ namespace TensorSharp.Models
             /// <summary>Flash attention of q [d, rows, heads] over k/v [d, kv, kv_heads]: [dv, heads, rows].</summary>
             /// <summary>Flash attention; <paramref name="kvMax"/> &gt; 0 bounds the finite entries of every mask row, which
             /// lets a backend attend only those (ggml_flash_attn_ext_set_n_kv_max).</summary>
-            public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0)
+            /// <param name="band">A sliding-window layer's window (ip[2]) where the executor reads such masks on the device
+            /// (<see cref="GraphCapabilities.BandMasksOnDevice"/>; <see cref="DeviceBandMasks"/>), 0 elsewhere.</param>
+            public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0, int band = 0)
             {
                 Span<int> srcs = stackalloc[] { q, k, v, mask };
-                ReadOnlySpan<long> ip = kvMax > 0 ? stackalloc long[] { 10 /* F32 accumulation */, kvMax } : stackalloc long[] { 10 };
+                ReadOnlySpan<long> ip = band > 0 ? stackalloc long[] { 10 /* F32 accumulation */, kvMax, band }
+                    : kvMax > 0 ? stackalloc long[] { 10, kvMax } : stackalloc long[] { 10 };
+                if (band > 0) DeviceBandMasks = true;
                 return Op(GraphOp.FlashAttnExt, mask >= 0 ? srcs : srcs[..3], ip, stackalloc[] { scale, 0f, 0f });
             }
+
+            /// <summary>The step's sliding-window attentions read their masks on the device (their band passed to the executor,
+            /// <see cref="GraphCapabilities.BandMasksOnDevice"/>): a recording replays each position's band.</summary>
+            internal bool DeviceBandMasks { get; private set; }
 
             private InvalidOperationException Reject(string why)
             {

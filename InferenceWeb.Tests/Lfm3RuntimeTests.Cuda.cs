@@ -111,23 +111,37 @@ public sealed partial class Lfm3RuntimeTests
 
     /// <summary>
     /// Decode steps of one request and of two together, advanced in place, give the traced steps' logits bit for bit, past the
-    /// window and (with rings) round the ring. Direct CUDA records an advanced step as a CUDA graph and replays it while no
-    /// sliding-window band closes a cell inside its window; these steps are all past the window, so each runs as its plan
-    /// and the runtime counts it.
+    /// window and (with rings) round the ring. Direct CUDA records an advanced step as a CUDA graph and replays it. Where its
+    /// flash kernels attend the caches (F16, 128-wide heads: capacity windows) the sliding layers' bands are read on the device
+    /// (GraphCapabilities.BandMasksOnDevice), so the steps past the window record and replay too - with rings, their writes
+    /// taken round the ring at every replay. Elsewhere a band is classified on the host, and a step whose band closes a cell
+    /// inside its window runs as its plan (the runtime counts it).
     /// </summary>
     [CudaTheory]
-    [InlineData(KvCacheDtype.F32, false)]
-    [InlineData(KvCacheDtype.F16, false)]
-    [InlineData(KvCacheDtype.F16, true)]
-    public void DirectCudaAdvancedDecodeStepsMatchTracedOnes(KvCacheDtype kv, bool rings)
+    [InlineData(KvCacheDtype.F32, false, 64)]
+    [InlineData(KvCacheDtype.F16, false, 64)]
+    [InlineData(KvCacheDtype.F16, true, 64)]
+    [InlineData(KvCacheDtype.F16, false, 128)]
+    [InlineData(KvCacheDtype.F16, true, 128)]
+    public void DirectCudaAdvancedDecodeStepsMatchTracedOnes(KvCacheDtype kv, bool rings, int headDim)
     {
         using IDisposable scope = rings ? SmallRings() : null;
-        AssertAdvancedDecodeMatchesTraced(BackendType.Cuda, kv, advanced: model =>
+        bool deviceBands = kv == KvCacheDtype.F16 && headDim == 128;
+        AssertAdvancedDecodeMatchesTraced(BackendType.Cuda, kv, Fixture(headDim == 128 ? "dense128" : "dense"), advanced: model =>
         {
-            _output.WriteLine($"kv={kv} rings={rings}: {model.DecodeAdvances} advances, {model.DecodeRecordings} recordings, " +
+            _output.WriteLine($"kv={kv} rings={rings} d={headDim}: {model.DecodeAdvances} advances, {model.DecodeRecordings} recordings, " +
                 $"{model.RecordedDecodeReplays} replays, {model.SlidingWindowUnrecordedSteps} sliding-window steps unrecorded");
-            Assert.True(model.SlidingWindowUnrecordedSteps > 250, $"{model.SlidingWindowUnrecordedSteps} steps past the window ran unrecorded");
-            Assert.Equal(0, model.RecordedDecodeReplays);
+            if (!deviceBands)
+            {
+                Assert.True(model.SlidingWindowUnrecordedSteps > 250, $"{model.SlidingWindowUnrecordedSteps} steps past the window ran unrecorded");
+                Assert.Equal(0, model.RecordedDecodeReplays);
+            }
+            else
+            {
+                Assert.Equal(0, model.SlidingWindowUnrecordedSteps);
+                Assert.True(model.DecodeRecordings >= 2, $"{model.DecodeRecordings} recordings (one lone, one batched expected)");
+                Assert.True(model.RecordedDecodeReplays > 250, $"{model.RecordedDecodeReplays} steps replayed a recording");
+            }
         });
     }
 
@@ -152,16 +166,19 @@ public sealed partial class Lfm3RuntimeTests
     }
 
     /// <summary>
-    /// A request whose decode starts below the window: its advanced steps record and replay until the sliding layers' band
-    /// closes a cell inside its window (position W), then run as plans (reported once); every logit is the traced steps'.
+    /// A request whose decode starts below the window: its advanced steps record and replay; until the sliding layers' band
+    /// closes a cell inside its window (position W), then they run as plans (reported once) - except where the flash kernels
+    /// attend the caches (F16, 128-wide heads), whose bands are read on the device: the one recording replays through the
+    /// window. Every logit is the traced steps'.
     /// </summary>
     [CudaTheory]
-    [InlineData(KvCacheDtype.F32)]
-    [InlineData(KvCacheDtype.F16)]
-    public void DirectCudaRecordsDecodeStepsUntilTheBandSlides(KvCacheDtype kv)
+    [InlineData(KvCacheDtype.F32, 64)]
+    [InlineData(KvCacheDtype.F16, 64)]
+    [InlineData(KvCacheDtype.F16, 128)]
+    public void DirectCudaRecordsDecodeStepsUntilTheBandSlides(KvCacheDtype kv, int headDim)
     {
         KvCacheDtypeConfig.RestoreForTests(kv, true);
-        string path = Fixture("dense");
+        string path = Fixture(headDim == 128 ? "dense128" : "dense");
         const int steps = 30;
         int[] prompt = { 41, 52 };
         (List<float[]> Rows, int Recordings, int Replays, int Unrecorded) Run(bool advance)
@@ -186,10 +203,19 @@ public sealed partial class Lfm3RuntimeTests
         var traced = Run(advance: false);
         var advanced = Run(advance: true);
         _output.WriteLine($"kv={kv}: {advanced.Recordings} recordings, {advanced.Replays} replays, {advanced.Unrecorded} unrecorded past the band");
-        // Steps at positions 2 (traced), 3 (advanced: recorded), 4..7 (replayed); from 8 on the band closes cell 0.
+        // Steps at positions 2 (traced), 3 (advanced: recorded), 4.. (replayed): over F32 caches to 7, as from 8 on the band
+        // closes cell 0; over F16 caches to the last.
         Assert.Equal(1, advanced.Recordings);
-        Assert.Equal(Lfm3SyntheticModelBuilder.Window - 4, advanced.Replays);
-        Assert.Equal(prompt.Length + steps - Lfm3SyntheticModelBuilder.Window, advanced.Unrecorded);
+        if (kv == KvCacheDtype.F32 || headDim != 128)
+        {
+            Assert.Equal(Lfm3SyntheticModelBuilder.Window - 4, advanced.Replays);
+            Assert.Equal(prompt.Length + steps - Lfm3SyntheticModelBuilder.Window, advanced.Unrecorded);
+        }
+        else
+        {
+            Assert.Equal(steps - 2, advanced.Replays);
+            Assert.Equal(0, advanced.Unrecorded);
+        }
         for (int i = 0; i < traced.Rows.Count; i++)
             Assert.True(traced.Rows[i].AsSpan().SequenceEqual(advanced.Rows[i]),
                 $"kv={kv} row {i}: advanced logits differ (relL2 {RelL2(advanced.Rows[i], traced.Rows[i]):E2})");
@@ -213,22 +239,34 @@ public sealed partial class Lfm3RuntimeTests
 
     /// <summary>
     /// Verify windows of 4 rows starting at every position from 1 to W + 2 (each keeps one row, so the next starts a position
-    /// on): the window advances in place, and direct CUDA records it while its rows sit below the band (start + 4 &lt;= W). From
-    /// start W - 3 its LAST rows' band closes cells inside the window while its first row's does not, so a replay would attend
-    /// those rows under the floor the recording classified (0): such steps run as plans. Every row is plain decoding's.
+    /// on): the window advances in place, and direct CUDA records it. Over F32 caches it records while its rows sit below the
+    /// band (start + 4 &lt;= W): from start W - 3 its LAST rows' band closes cells inside the window while its first row's does
+    /// not, so a replay would attend those rows under the floor the recording classified (0), and such steps run as plans.
+    /// Where the flash kernels attend the caches (F16, 128-wide heads) each row's band is read on the device, so the recording
+    /// replays across the band edge. Every row is plain decoding's.
     /// </summary>
     [CudaTheory]
-    [InlineData(KvCacheDtype.F32)]
-    [InlineData(KvCacheDtype.F16)]
-    public void DirectCudaVerifyWindowsCrossingTheBandRowByRowMatchPlainDecoding(KvCacheDtype kv)
+    [InlineData(KvCacheDtype.F32, 64)]
+    [InlineData(KvCacheDtype.F16, 64)]
+    [InlineData(KvCacheDtype.F16, 128)]
+    public void DirectCudaVerifyWindowsCrossingTheBandRowByRowMatchPlainDecoding(KvCacheDtype kv, int headDim)
         => AssertVerifyWindowsAcrossTheBandEdge(BackendType.Cuda, kv, CudaDenseTolerance, model =>
         {
-            _output.WriteLine($"kv={kv}: {model.WindowAdvances} window advances, {model.DecodeRecordings} recordings, " +
+            _output.WriteLine($"kv={kv} d={headDim}: {model.WindowAdvances} window advances, {model.DecodeRecordings} recordings, " +
                 $"{model.RecordedDecodeReplays} replays, {model.SlidingWindowUnrecordedSteps} unrecorded");
-            Assert.True(model.DecodeRecordings >= 1, "no verify window was recorded below the band");
-            Assert.True(model.RecordedDecodeReplays >= 1, "no recorded verify window was replayed below the band");
-            Assert.True(model.SlidingWindowUnrecordedSteps >= 3, $"{model.SlidingWindowUnrecordedSteps} windows crossing the band ran unrecorded");
-        });
+            Assert.True(model.DecodeRecordings >= 1, "no verify window was recorded");
+            if (kv == KvCacheDtype.F32 || headDim != 128)
+            {
+                Assert.True(model.RecordedDecodeReplays >= 1, "no recorded verify window was replayed below the band");
+                Assert.True(model.SlidingWindowUnrecordedSteps >= 3, $"{model.SlidingWindowUnrecordedSteps} windows crossing the band ran unrecorded");
+            }
+            else
+            {
+                Assert.Equal(0, model.SlidingWindowUnrecordedSteps);
+                Assert.True(model.RecordedDecodeReplays >= Lfm3SyntheticModelBuilder.Window - 2,
+                    $"{model.RecordedDecodeReplays} recorded verify windows replayed (across the band edge expected)");
+            }
+        }, headDim == 128 ? "dense128" : "dense");
 
     /// <summary><see cref="DirectCudaVerifyWindowsCrossingTheBandRowByRowMatchPlainDecoding"/> on the managed executor and the
     /// pinned GGML backend (whose steps advance without recordings).</summary>
@@ -242,10 +280,11 @@ public sealed partial class Lfm3RuntimeTests
             model => Assert.True(model.WindowAdvances > 0, "no verify window advanced in place"));
     }
 
-    private void AssertVerifyWindowsAcrossTheBandEdge(BackendType backend, KvCacheDtype kv, double tolerance, Action<Lfm3RuntimeModel> check)
+    private void AssertVerifyWindowsAcrossTheBandEdge(BackendType backend, KvCacheDtype kv, double tolerance, Action<Lfm3RuntimeModel> check,
+        string variant = "dense")
     {
         KvCacheDtypeConfig.RestoreForTests(kv, true);
-        string path = Fixture("dense");
+        string path = Fixture(variant);
         const int count = 4, last = Lfm3SyntheticModelBuilder.Window + 2;
         int[] tokens = Enumerable.Range(0, last + count).Select(i => 41 + (i * 11) % 90).ToArray();
         var plain = new List<float[]>();

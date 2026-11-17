@@ -1708,9 +1708,14 @@ namespace TensorSharp.Graph
                         long keys = m.HostSizes != null ? m.HostSizes[^1] : Ne(m.Tensor)[0];
                         if (keys != nkv) throw new NotSupportedException("a mask wider than the keys");
                         int maskNode = n.Srcs[3];
+                        // A sliding window's band (ip[2]) where this executor reads it on the device: the mask is the selection
+                        // it is, read at every run (a recorded step replays each position's band), at most `band` keys a row.
+                        int band = Capabilities.BandMasksOnDevice ? (int)Ip(2, 0) : 0;
                         if (!run.Masks.TryGetValue((maskNode, nq), out mask))
-                            run.Masks[(maskNode, nq)] = mask = Classify(() => Mask(Device(values, maskNode, run), nq, run), m.Floats, nq, keys);
-                        if (Ip(1, 0) > 0) mask.KvMax = (int)Ip(1, 0);
+                            run.Masks[(maskNode, nq)] = mask = band > 0
+                                ? new AttentionMask(MaskPattern.Explicit, 0, () => Mask(Device(values, maskNode, run), nq, run)) { KvMax = band }
+                                : Classify(() => Mask(Device(values, maskNode, run), nq, run), m.Floats, nq, keys);
+                        if (band <= 0 && Ip(1, 0) > 0) mask.KvMax = (int)Ip(1, 0);
                     }
                     return V(FlashAttention(q, k, v, mask, Fp(0, 1f), values[n.Srcs[1]].Window, values[n.Srcs[2]].Window));
                 }

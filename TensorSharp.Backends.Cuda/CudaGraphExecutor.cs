@@ -34,6 +34,11 @@ namespace TensorSharp.Cuda
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
             WindowStateInPlace = true, WindowRegionsReadPackedRows = true, SlotBoundRecordings = true,
             HostExperts = true, RecordsHostExperts = true, RegionsAtAnyWidth = true, GreedyIdOutputs = true,
+            // A sliding-window layer's decode rows and verify windows list their band's cells on the device
+            // (TrySparseDecodeAttention, the window rows' selection): their steps record past the window, where a band
+            // classified on the host had kept every later step unrecorded (LFM3-1.7B Q4_K_M on an A40, interleaved: decode
+            // at 4K 183.3 -> 241.0 tok/s, at 16K 182.1 -> 224.5).
+            BandMasksOnDevice = true,
         };
 
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
@@ -217,8 +222,11 @@ namespace TensorSharp.Cuda
                && result.StorageOffset * result.ElementType.Size() == leaf.StorageOffset * leaf.ElementType.Size() + offsetBytes;
 
         /// <summary>A prompt chunk's or a decode row's K/V rows into the head-first cache (F32 or F16) with the
-        /// per-op path's kernel.</summary>
-        protected override bool TryWriteRows(Tensor dst, Tensor src, int first, int count) => WriteRows(dst, src, first, count, circular: false);
+        /// per-op path's kernel. A recorded step's write reads its first row from the step's parameters (the position) on
+        /// every replay: it is taken modulo the cache's cells, which a ring needs (a sliding-window layer's 768 cells, its
+        /// decode rows recorded past the first lap) and a linear cache never reaches.</summary>
+        protected override bool TryWriteRows(Tensor dst, Tensor src, int first, int count)
+            => WriteRows(dst, src, first, count, circular: CudaDecodeDynParams.IsActive((CudaAllocator)Allocator));
 
         /// <summary>A ring's rows past its last cell (a sliding-window layer's ring cache: an F16 one had no copy that converts
         /// a strided run) in the same kernel, its cells taken modulo the ring.</summary>
