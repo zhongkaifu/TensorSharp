@@ -789,7 +789,8 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 
 请求 JSON 中的字段（如 `temperature`、`top_p`、`top_k`、`min_p`、
 `repeat_penalty`、`repeat_last_n`、`presence_penalty`、`frequency_penalty`、`seed`、
-`stop`/`stop_sequences`）会填充所有你**没有**在上面配置过的参数。对于你
+`stop`/`stop_sequences`）会填充所有你**没有**在上面配置过的参数。OpenAI 端点还接受 `ignore_eos`
+（定长基准测试：遇到结束 token 也继续生成直到 `max_tokens`；见 [API 参考](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#4-采样选项)）。对于你
 **已经**配置过的参数，默认的 `--sampling-precedence config` 保留你的取值
 并忽略请求中的值 —— 很多聊天客户端会把 `temperature`/`top_p` 硬编码进每一
 次调用，终端用户无从修改，因此只有服务端未配置的参数才应由请求决定。若需

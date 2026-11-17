@@ -878,7 +878,9 @@ of quietly losing a setting.
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
 `top_p`, `top_k`, `min_p`, `repeat_penalty`, `repeat_last_n`, `presence_penalty`,
 `frequency_penalty`, `seed`, `stop`/`stop_sequences`) fill in every parameter
-you did **not** configure above. For a parameter you *did* configure, the
+you did **not** configure above. The OpenAI endpoints also take `ignore_eos`
+(fixed-length benchmarks: generate through end-of-sequence tokens until `max_tokens`;
+see the [API reference](TensorSharp.Server.Host/API_EXAMPLES.md#4-sampling-options)). For a parameter you *did* configure, the
 default `--sampling-precedence config` keeps your value and ignores the
 request's — many chat clients hardcode `temperature`/`top_p` into every call
 with no way for the end user to change them, so an unconfigured server-side

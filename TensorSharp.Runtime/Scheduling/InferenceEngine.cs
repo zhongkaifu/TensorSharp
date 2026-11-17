@@ -1184,7 +1184,11 @@ namespace TensorSharp.Runtime.Scheduling
                         // marker (e.g. <|im_end|>) that would
                         // otherwise be decoded by AppendTokenBytes and leak
                         // into the streamed assistant output.
-                        if (_model.Tokenizer != null && _model.Tokenizer.IsEos(token))
+                        // An ignore_eos request (fixed-length benchmarks) forwards it like
+                        // any token and runs on to its limit; its consumer counts it and
+                        // leaves its text out (ChatGenerationPipeline).
+                        if (_model.Tokenizer != null && _model.Tokenizer.IsEos(token)
+                            && seq.SamplingConfig?.IgnoreEos != true)
                         {
                             TruncateUnpublishedTail(seq, emittedCount);
                             LogSpeculationStatsIfAny(seq);
