@@ -102,7 +102,8 @@ namespace TensorSharp.Models
 
         private Lfm3AudioEncoder Audio => AudioEncoder ?? throw new NotSupportedException(AudioInputSupport.Lfm3Message);
 
-        /// <summary>An image file's rows [rows, hidden]: decoded and resized off the GPU lock, encoded under it.</summary>
+        /// <summary>An image file's rows [rows, hidden]: decoded and resized off the GPU lock, encoded under it (a large
+        /// image in several programs with the lock yielded between them, <see cref="Lfm3VisionEncoder.YieldPatches"/>).</summary>
         internal Tensor EncodeImageFile(string path)
         {
             Lfm3VisionEncoder vision = Vision;
@@ -112,7 +113,7 @@ namespace TensorSharp.Models
                 (int w, int h) = vision.ImageSize(image.Width, image.Height);
                 return Lfm3ImageProcessor.Resize(image, w, h);
             });
-            return vision.EncodeFrame(frame).ToTensor(_allocator);
+            return vision.EncodeFrame(frame, YieldGpuComputeLock).ToTensor(_allocator);
         }
 
         /// <summary>An audio file's rows [rows, hidden] (16 kHz mono features computed off the GPU lock).</summary>

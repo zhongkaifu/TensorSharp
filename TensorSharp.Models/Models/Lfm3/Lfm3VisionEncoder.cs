@@ -163,10 +163,11 @@ namespace TensorSharp.Models
                     || (n.StartsWith("mm.", StringComparison.Ordinal) && !n.StartsWith("mm.a.", StringComparison.Ordinal)));
                 ValidateWeights();
                 AddPatchKernels();
-                // One program a frame size: a clip needs two (its pairs, an odd last frame), an image one. A cached GGML
-                // program keeps its own compute memory, which grows with the frame, so few are kept (a miss recompiles:
-                // tens of ms against an encode of tens to hundreds).
-                Graph = new NetworkGraph(Weights, executor, "lfm3 vision tower") { MaxCachedPlans = 2 };
+                // One program a frame size: a clip needs two (its pairs, an odd last frame), an image one, or up to MaxParts
+                // when it is split for yields (YieldPatches). A cached GGML program keeps its own compute memory, which
+                // grows with the frame, so few are kept (a miss recompiles: tens of ms against an encode of tens to
+                // hundreds; about half a second for a 2048-row image).
+                Graph = new NetworkGraph(Weights, executor, "lfm3 vision tower") { MaxCachedPlans = MaxParts };
                 _materializesAttention = Graph.Executor is TensorGraphExecutor && Graph.Executor is not MlxGraphExecutor;
             }
             catch
@@ -232,6 +233,21 @@ namespace TensorSharp.Models
         /// (tests). GGML (flash attention) and MLX (fused attention) run one piece.
         /// </summary>
         public int AttentionChunkRows { get; set; }
+
+        /// <summary>
+        /// Patches of work per program when the caller can yield between programs (a <c>betweenParts</c> callback: the
+        /// model's GPU-lock yield): a larger frame runs the tower as several programs split at layer boundaries,
+        /// ceil(patches / this) of them (at most <see cref="MaxParts"/>), the activations passing between them in F32, so
+        /// concurrent requests step between the parts of a large image instead of waiting for all of it. 0 never splits;
+        /// without a callback a frame is one program. Default 4096: a 2048-row image (about 8000 patches) runs as two
+        /// programs. Measured on ggml-metal (1920 x 1056, interleaved, medians of 7 under load): one program 891 ms, two
+        /// 893 ms, four 945 ms, the rows bit-identical; on MLX, which compiles every call, 679 / 720 / 752 ms and the rows
+        /// within 1.4e-3 / 2.5e-3 relative (its fusion differs across the boundary).
+        /// </summary>
+        public int YieldPatches { get; set; } = 4096;
+
+        /// <summary>Most programs a split frame runs as (<see cref="YieldPatches"/>).</summary>
+        public const int MaxParts = 4;
 
         private void ReadHyperparameters(GgufFile gguf)
         {
@@ -334,29 +350,30 @@ namespace TensorSharp.Models
         public Lfm3VisionEmbedding EncodeImage(string path) => EncodeImage(Lfm3ImageProcessor.LoadImage(path));
 
         /// <summary>Preprocess (<see cref="ImageSize"/>, torchvision bicubic) and encode a still image.</summary>
-        public Lfm3VisionEmbedding EncodeImage(Lfm3RgbImage image)
+        public Lfm3VisionEmbedding EncodeImage(Lfm3RgbImage image, Action betweenParts = null)
         {
             ArgumentNullException.ThrowIfNull(image);
             (int w, int h) = ImageSize(image.Width, image.Height);
-            return EncodeFrame(Lfm3ImageProcessor.Resize(image, w, h));
+            return EncodeFrame(Lfm3ImageProcessor.Resize(image, w, h), betweenParts);
         }
 
         /// <summary>Encode one preprocessed frame (sides multiples of 32) through both temporal kernels: a still image, or the
-        /// odd last frame of a clip (HF repeats it to fill the pair).</summary>
-        public Lfm3VisionEmbedding EncodeFrame(Lfm3RgbImage frame)
+        /// odd last frame of a clip (HF repeats it to fill the pair). <paramref name="betweenParts"/> runs between the
+        /// programs of a frame split for yields (<see cref="YieldPatches"/>).</summary>
+        public Lfm3VisionEmbedding EncodeFrame(Lfm3RgbImage frame, Action betweenParts = null)
         {
             ArgumentNullException.ThrowIfNull(frame);
             CheckFrame(frame);
-            return Run(Lfm3ImageProcessor.Patchify(frame), Lfm3ImageProcessor.PatchValues, StillKernel, frame.Width, frame.Height);
+            return Run(Lfm3ImageProcessor.Patchify(frame), Lfm3ImageProcessor.PatchValues, StillKernel, frame.Width, frame.Height, betweenParts);
         }
 
         /// <summary>Encode two preprocessed frames of one size as one temporal patch (the first through
         /// <c>v.patch_embd.weight</c>, the second through <c>.weight.1</c>). <paramref name="second"/> null, or the same
         /// frame, runs <see cref="EncodeFrame"/> (identical rows, one product fewer).</summary>
-        public Lfm3VisionEmbedding EncodePair(Lfm3RgbImage first, Lfm3RgbImage second)
+        public Lfm3VisionEmbedding EncodePair(Lfm3RgbImage first, Lfm3RgbImage second, Action betweenParts = null)
         {
             ArgumentNullException.ThrowIfNull(first);
-            if (second == null || ReferenceEquals(first, second)) return EncodeFrame(first);
+            if (second == null || ReferenceEquals(first, second)) return EncodeFrame(first, betweenParts);
             CheckFrame(first);
             if (second.Width != first.Width || second.Height != first.Height)
                 throw new ArgumentException($"a frame pair of {first.Width} x {first.Height} and {second.Width} x {second.Height}");
@@ -365,7 +382,7 @@ namespace TensorSharp.Models
             var patches = new float[(long)n * 2 * k];
             Lfm3ImageProcessor.Patchify(first, patches, 2 * k, 0);
             Lfm3ImageProcessor.Patchify(second, patches, 2 * k, k);
-            return Run(patches, 2 * k, PairKernel, first.Width, first.Height);
+            return Run(patches, 2 * k, PairKernel, first.Width, first.Height, betweenParts);
         }
 
         /// <summary>Sample (<see cref="Lfm3Video"/>), decode with <paramref name="decoder"/> (null:
@@ -393,8 +410,8 @@ namespace TensorSharp.Models
                 Lfm3VideoGroup group = plan.Groups[g];
                 Lfm3RgbImage first = Lfm3ImageProcessor.Resize(frames[group.First], plan.Width, plan.Height);
                 groups[g] = group.Second == group.First
-                    ? EncodeFrame(first)
-                    : EncodePair(first, Lfm3ImageProcessor.Resize(frames[group.Second], plan.Width, plan.Height));
+                    ? EncodeFrame(first, betweenGroups)
+                    : EncodePair(first, Lfm3ImageProcessor.Resize(frames[group.Second], plan.Width, plan.Height), betweenGroups);
             }
             return new Lfm3VideoEncoding(plan, groups);
         }
@@ -406,26 +423,62 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Encode patch rows [<paramref name="patchWidth"/>, patches] (raster order) of a <paramref name="width"/> x
-        /// <paramref name="height"/> frame with patch kernel <paramref name="kernel"/>.</summary>
-        private Lfm3VisionEmbedding Run(float[] patches, int patchWidth, string kernel, int width, int height)
+        /// <paramref name="height"/> frame with patch kernel <paramref name="kernel"/>: one program, or with
+        /// <paramref name="betweenParts"/> and more than <see cref="YieldPatches"/> patches, consecutive layer ranges as
+        /// programs of their own with <paramref name="betweenParts"/> between them.</summary>
+        private Lfm3VisionEmbedding Run(float[] patches, int patchWidth, string kernel, int width, int height, Action betweenParts)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             int gw = width / Lfm3ImageProcessor.PatchSize, gh = height / Lfm3ImageProcessor.PatchSize;
-            float[] rows = Graph.Run(b => b.Output(EmitTower(b, b.Input(patches, patchWidth, (long)gw * gh), kernel, gw, gh)))[0];
+            int n = gw * gh;
+            int parts = PartsFor(n, betweenParts != null);
+            float[] rows;
+            if (parts == 1)
+            {
+                rows = Graph.Run(b => b.Output(EmitTower(b, b.Input(patches, patchWidth, (long)n), kernel, gw, gh)))[0];
+            }
+            else
+            {
+                float[] x = null;
+                for (int part = 0; part < parts; part++)
+                {
+                    int first = part * BlockCount / parts, last = (part + 1) * BlockCount / parts;
+                    if (part > 0) betweenParts();
+                    float[] input = x;
+                    x = Graph.Run(b => b.Output(part == 0
+                        ? EmitTower(b, b.Input(patches, patchWidth, (long)n), kernel, gw, gh, first, last, projector: false)
+                        : EmitTower(b, b.Input(input, EmbeddingLength, (long)n), null, gw, gh, first, last, projector: last == BlockCount)))[0];
+                }
+                rows = x;
+            }
             return new Lfm3VisionEmbedding((float[])rows.Clone(), width, height, ProjectionDim);
         }
+
+        /// <summary>Programs a frame of <paramref name="patches"/> patches runs as (<see cref="YieldPatches"/>).</summary>
+        internal int PartsFor(int patches, bool canYield)
+            => !canYield || YieldPatches <= 0 || patches <= YieldPatches
+                ? 1
+                : Math.Min(Math.Min(MaxParts, BlockCount), (patches + YieldPatches - 1) / YieldPatches);
 
         // ================================================================ the network
 
         /// <summary>The tower and projector over patch rows <paramref name="patches"/> of a <paramref name="gw"/> x
         /// <paramref name="gh"/> patch grid: [<see cref="ProjectionDim"/>, gw * gh / 4].</summary>
         internal NetValue EmitTower(NetworkBuilder b, NetValue patches, string kernel, int gw, int gh)
+            => EmitTower(b, patches, kernel, gw, gh, 0, BlockCount, projector: true);
+
+        /// <summary>Layers [<paramref name="firstLayer"/>, <paramref name="lastLayer"/>) of the tower: from the patch rows
+        /// (<paramref name="kernel"/> set, the patchifier and its norm first) or from the activations [width, patches] the
+        /// previous part left (<paramref name="kernel"/> null), with the projector after the last layer when
+        /// <paramref name="projector"/>.</summary>
+        internal NetValue EmitTower(NetworkBuilder b, NetValue input, string kernel, int gw, int gh, int firstLayer, int lastLayer,
+            bool projector)
         {
             int c = EmbeddingLength, n = gw * gh;
             float eps = NormEps;
-            NetValue x = b.RmsNorm(b.Linear(patches, kernel), "v.embedding_norm.weight", eps);
+            NetValue x = kernel != null ? b.RmsNorm(b.Linear(input, kernel), "v.embedding_norm.weight", eps) : input;
             NetValue positions = default;
-            for (int l = 0; l < BlockCount; l++)
+            for (int l = firstLayer; l < lastLayer; l++)
             {
                 string p = $"v.blk.{l}.";
                 NetValue h = b.RmsNorm(x, p + "ln1.weight", eps);
@@ -446,6 +499,7 @@ namespace TensorSharp.Models
                 x = b.Add(x, mixed);
                 x = b.Add(x, b.FeedForward(b.RmsNorm(x, p + "ln2.weight", eps), p + "ffn_gate.weight", p + "ffn_up.weight", p + "ffn_down.weight"));
             }
+            if (!projector) return x;
             // Projector: LayerNorm per patch, then each 2 x 2 block's patches side by side in (0,0), (0,1), (1,0), (1,1) order.
             NetValue e = b.LayerNorm(x, "mm.input_norm.weight", "mm.input_norm.bias", ProjectorNormEps);
             NetValue merged = b.Reshape(b.Permute(b.Reshape(e, 2 * c, gw / 2, 2, gh / 2), 0, 2, 1, 3), 4 * c, n / 4);

@@ -358,6 +358,57 @@ public sealed class Lfm3OmniModelTests : IDisposable
         Assert.All(spans, s => Assert.StartsWith("lfm3vf:", s.ContentId));
     }
 
+    // ================================================================ split encodes
+
+    [Lfm3OmniFact(BackendType.GgmlMetal)] public void LargeImage_InParts_EqualsOneProgram_GgmlMetal() => LargeImageInParts(BackendType.GgmlMetal);
+    [Lfm3OmniFact(BackendType.Mlx)] public void LargeImage_InParts_EqualsOneProgram_Mlx() => LargeImageInParts(BackendType.Mlx);
+    [Lfm3OmniFact(BackendType.Cpu)] public void LargeImage_InParts_EqualsOneProgram_Cpu() => LargeImageInParts(BackendType.Cpu);
+
+    /// <summary>A 1920 x 1088 frame (8160 patches, 2040 rows) encoded with a yield callback runs as two programs by default
+    /// and as four with YieldPatches 2048, split at layer boundaries with the callback between them: its rows are the
+    /// single program's (F32 activations between parts; bit-identical on GGML and the managed CPU, within 5e-3 on MLX,
+    /// which compiles and fuses each program on its own).</summary>
+    private void LargeImageInParts(BackendType lane)
+    {
+        Lfm3RuntimeModel model = Model(lane);
+        Lfm3VisionEncoder vision = model.VisionEncoder!;
+        Lfm3RgbImage image = Lfm3ImageProcessor.LoadImage(WritePicture("hd.png", 1920, 1080, 31));
+        (int w, int h) = vision.ImageSize(image.Width, image.Height);
+        Lfm3RgbImage frame = Lfm3ImageProcessor.Resize(image, w, h);
+        int patches = w / 16 * (h / 16);
+        Assert.Equal(2, vision.PartsFor(patches, canYield: true));
+        Assert.Equal(1, vision.PartsFor(patches, canYield: false));
+        Assert.Equal(1, vision.PartsFor(4096, canYield: true));
+        Lfm3VisionEmbedding whole, split;
+        int yields = 0;
+        int previous = vision.YieldPatches;
+        vision.YieldPatches = 2048;
+        try
+        {
+            Assert.Equal(4, vision.PartsFor(patches, canYield: true));
+            lock (model.GpuComputeLock)
+            {
+                whole = vision.EncodeFrame(frame);
+                split = vision.EncodeFrame(frame, () => { yields++; model.YieldGpuComputeLock(); });
+            }
+        }
+        finally
+        {
+            vision.YieldPatches = previous;
+        }
+        Assert.Equal(3, yields);
+        Assert.Equal(whole.RowCount, split.RowCount);
+        double num = 0, den = 0, dot = 0, sa = 0, sb = 0;
+        for (int i = 0; i < whole.Rows.Length; i++)
+        {
+            double a = whole.Rows[i], b = split.Rows[i];
+            num += (a - b) * (a - b); den += a * a; dot += a * b; sa += a * a; sb += b * b;
+        }
+        double rel = Math.Sqrt(num / den), cos = dot / Math.Sqrt(sa * sb);
+        _output.WriteLine($"[{lane}] {whole.RowCount} rows, split in 4 vs one program: rel RMS {rel:E2}, cos {cos:F8}");
+        Assert.True(rel <= (lane == BackendType.Mlx ? 5e-3 : 1e-6), $"rel RMS {rel:E2}");
+    }
+
     // ================================================================ prefix reuse
 
     [Lfm3OmniFact(BackendType.GgmlMetal)] public Task PrefixReuse_FollowsTheSameImage_StopsAtAnotherOne_GgmlMetal() => PrefixReuse(BackendType.GgmlMetal);
