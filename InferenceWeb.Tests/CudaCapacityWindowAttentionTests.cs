@@ -18,8 +18,9 @@ namespace InferenceWeb.Tests;
 /// capacity's window, the bucket's run on the device from the length it reads there) against the launch over the 256-key
 /// bucket window around its length that a recorded step made before: the same bits at lengths around the buckets' edges
 /// (1, 255, 256, 257, 1,000, 4,097) and one short of a capacity that is not a whole bucket - a decode row, verify windows in
-/// one launch, and a window's rows run one at a time (each its window's length, a row's fewer keys added back). An unrecorded
-/// launch with the bucket's splits gives them too.
+/// one launch, and a window's rows run one at a time. Every row runs the splits of its own length's bucket (the decode row's
+/// at its position), so a window across a bucket's edge splits its earlier rows as the bucket before. An unrecorded launch
+/// with the bucket's splits gives them too.
 /// </summary>
 public sealed class CudaCapacityWindowAttentionTests
 {
@@ -106,11 +107,13 @@ public sealed class CudaCapacityWindowAttentionTests
                 {
                     long at = (long)z * heads * d;
                     IntPtr rowDyn = At(dyn, 4L * z);
+                    // Each row its own length's splits, as the decode row at its position (the executor's rows run alone).
+                    int rowSplits = flash.Splits(group, kvHeads, CudaFlashPrefillKernels.BucketKeys(window, len - Fewer(z), Bucket));
                     flash.LaunchAttention(At(q, at), P(k), P(v), Cap, 1, 1, 0, heads, kvHeads, d, scale, bucketSplits, P(partial),
-                        At(bucketOut, at), stream, rowDyn);
+                        At(bucketOut, at), stream, rowDyn, windowKeys: window, bucket: Bucket);
                     flash.LaunchAttention(At(q, at), P(k), P(v), Cap, 1, 1, 0, heads, kvHeads, d, scale, capacitySplits, P(partial),
-                        At(capacityOut, at), stream, rowDyn, windowKeys: Cap, bucket: Bucket, lenBias: Fewer(z));
-                    flash.LaunchAttention(At(q, at), P(k), P(v), Cap, 1, len - Fewer(z), 0, heads, kvHeads, d, scale, bucketSplits,
+                        At(capacityOut, at), stream, rowDyn, windowKeys: Cap, bucket: Bucket);
+                    flash.LaunchAttention(At(q, at), P(k), P(v), Cap, 1, len - Fewer(z), 0, heads, kvHeads, d, scale, rowSplits,
                         P(partial), At(eagerOut, at), stream);
                 }
             }
@@ -125,12 +128,13 @@ public sealed class CudaCapacityWindowAttentionTests
             }
             else
             {
+                // Every launch with the bucket rule, as the executor launches a window: each row its own length's splits.
                 flash.LaunchDecodeRows(P(q), P(k), P(v), Cap, n, 1, 0, heads, kvHeads, d, scale, bucketSplits, P(partial), P(bucketOut),
-                    stream, P(dyn));
+                    stream, P(dyn), windowKeys: window, bucket: Bucket);
                 flash.LaunchDecodeRows(P(q), P(k), P(v), Cap, n, 1, 0, heads, kvHeads, d, scale, capacitySplits, P(partial),
                     P(capacityOut), stream, P(dyn), windowKeys: Cap, bucket: Bucket);
                 flash.LaunchDecodeRows(P(q), P(k), P(v), Cap, n, len, 0, heads, kvHeads, d, scale, bucketSplits, P(partial), P(eagerOut),
-                    stream);
+                    stream, windowKeys: window, bucket: Bucket);
             }
             allocator.Stream.Synchronize();
             foreach (Tensor t in new[] { bucketOut, capacityOut, eagerOut }) ((CudaStorage)t.Storage).MarkDeviceModified();
