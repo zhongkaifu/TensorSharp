@@ -117,6 +117,12 @@ namespace TensorSharp.Runtime.Scheduling
             AttachSoloPrefillPolicy(model, cfg, _scheduler, _logger);
             _executor = new BatchExecutor(model, _pool, _scheduler, logger);
             _executor.InitializeRadixCache(cfg);
+            // A prompt a step finished before the step's verify windows ran streams its first token then.
+            _executor.PromptFinished = seq =>
+            {
+                if (_handles.TryGetValue(seq.RequestId, out var handle))
+                    PublishEarlyFirstToken(seq, handle);
+            };
             // So admission can say WHY a turn reused nothing.
             _scheduler.AttachReuseDiagnostics(() => _executor.LastFusedContinuationDeclineReason);
             // Shared-prefix checkpoints: end a prefill chunk exactly where the chat
@@ -227,6 +233,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// reads it to prove the loop parked rather than merely that the gate closed.
         /// </summary>
         public long StepsHeldByGate => Interlocked.Read(ref _stepsHeldByGate);
+
+        /// <summary>Each step's schedule, on the engine's thread before the step runs (tests).</summary>
+        internal Action<SchedulerOutput>? ScheduledForTests { get; set; }
+
+        /// <summary>The engine's step executor (tests).</summary>
+        internal BatchExecutor ExecutorForTests => _executor;
 
         /// <summary>Submit a sequence for inference. Returns immediately with a
         /// handle whose <see cref="InferenceRequestHandle.Tokens"/> channel
@@ -470,6 +482,7 @@ namespace TensorSharp.Runtime.Scheduling
                     try
                     {
                         output = _scheduler.Schedule();
+                        ScheduledForTests?.Invoke(output);
                     }
                     catch (Exception ex)
                     {

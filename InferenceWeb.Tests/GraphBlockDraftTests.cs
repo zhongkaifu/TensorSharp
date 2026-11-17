@@ -259,6 +259,116 @@ public sealed class GraphBlockDraftTests : IDisposable
     public Task FirstDecodeStepAfterThePromptDraftsOnDirectCuda(string family, string variant)
         => FirstDecodeStepDrafts(family, variant, BackendType.Cuda);
 
+    /// <summary>
+    /// A prompt that arrives while other requests speculate is read before their drafts and verify windows in the step that
+    /// admits it, and its first token streams then (BatchExecutor.PromptFinished), not after their verify; every stream is
+    /// still plain decoding's.
+    /// </summary>
+    [Theory]
+    [InlineData("qwen35", "dflash2", BackendType.Cpu)]
+    public Task APromptBesideSpeculatingRequestsStreamsItsFirstTokenBeforeTheirVerify(string family, string variant, BackendType backend)
+        => PromptBesideSpeculatingRequests(family, variant, backend);
+
+    [CudaTheory]
+    [InlineData("qwen35", "dflash2", BackendType.Cuda)]
+    public Task APromptBesideSpeculatingRequestsStreamsItsFirstTokenBeforeTheirVerifyOnDirectCuda(string family, string variant,
+        BackendType backend)
+        => PromptBesideSpeculatingRequests(family, variant, backend);
+
+    private async Task PromptBesideSpeculatingRequests(string family, string variant, BackendType backend)
+    {
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        var files = Files(family, variant);
+        int[][] prompts =
+        {
+            Enumerable.Range(0, 24).Select(i => 40 + i % 6).ToArray(),
+            Enumerable.Range(0, 19).Select(i => 50 + (i * 5) % 9).ToArray(),
+            Enumerable.Range(0, 27).Select(i => 44 + i % 4).ToArray(),
+        };
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.Block, MaxDraftTokens = 3, MinDraftProb = 0 };
+        var (plain, _) = await ServeWithALatePrompt(files, backend, prompts, null);
+        var (drafted, published) = await ServeWithALatePrompt(files, backend, prompts, options);
+        for (int r = 0; r < prompts.Length; r++)
+            Assert.Equal(plain[r], drafted[r]);
+        // Only the late request's prompt shared a step with speculating requests, and it streamed before their verify ran.
+        var late = Assert.Single(published);
+        Assert.Equal("req2", late.Id);
+        Assert.True(late.BeforeVerify, "the late prompt's first token waited for the step's verify windows");
+        Assert.True(late.VerifiedInItsStep, "the step that read the late prompt verified no window");
+    }
+
+    /// <summary>Two requests, then (once both decode) a third: each request's tokens, and each prompt the executor finished
+    /// before the rest of its step (whether that step's verify windows had run yet, and whether they ran after).</summary>
+    private static async Task<(int[][] Outputs, List<(string Id, bool BeforeVerify, bool VerifiedInItsStep)> Published)> ServeWithALatePrompt(
+        (string Family, string Target, string Draft) files, BackendType backend, int[][] prompts, SpeculationOptions speculation)
+    {
+        using StandardDecoderModel model = Create(files, backend);
+        var cfg = new TensorSharp.Runtime.Scheduling.SchedulerConfig
+        {
+            MaxNumBatchedTokens = 256,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 32,
+            NumBlocks = 64,
+            BlockSize = 16,
+            EnablePrefixCaching = false,
+            Speculation = speculation ?? new SpeculationOptions { Enabled = false },
+        };
+        using var engine = new TensorSharp.Runtime.Scheduling.InferenceEngine(model, cfg,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+        var gate = new TensorSharp.Runtime.Scheduling.ComputeGate();
+        gate.Close();
+        engine.ComputeGate = gate;
+        var published = new List<(string Id, bool BeforeVerify, bool VerifiedInItsStep)>();
+        int verifiesAtStepStart = 0, pending = -1;
+        var bothDecode = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        engine.ScheduledForTests = output =>
+        {
+            // The previous step's published prompt: did that step verify after it?
+            if (pending >= 0)
+            {
+                var last = published[pending];
+                published[pending] = last with { VerifiedInItsStep = model.BatchedSpecVerifySteps > verifiesAtStepStart };
+                pending = -1;
+            }
+            verifiesAtStepStart = model.BatchedSpecVerifySteps;
+            // Once the first two requests both decode, the loop parks before its next step for the third to arrive.
+            if (output.ScheduledWork.Count == 2 && output.ScheduledWork.TrueForAll(work => !work.IsPrefill) && bothDecode.TrySetResult())
+                gate.Close();
+        };
+        var executor = engine.ExecutorForTests;
+        Action<TensorSharp.Runtime.Scheduling.SequenceState> publish = executor.PromptFinished;
+        executor.PromptFinished = seq =>
+        {
+            published.Add((seq.RequestId, model.BatchedSpecVerifySteps == verifiesAtStepStart, false));
+            pending = published.Count - 1;
+            publish(seq);
+        };
+        var sequences = prompts.Select((p, i) => new TensorSharp.Runtime.Scheduling.SequenceState($"req{i}", p, 24, cfg.BlockSize,
+            TensorSharp.Runtime.SamplingConfig.Greedy)).ToList();
+        var handles = new List<TensorSharp.Runtime.Scheduling.InferenceRequestHandle>
+        {
+            engine.SubmitRequest(sequences[0]),
+            engine.SubmitRequest(sequences[1]),
+        };
+        gate.Open();
+        await bothDecode.Task.WaitAsync(TimeSpan.FromMinutes(1));
+        // Parked before the step after the first decode step: the third request joins the next one.
+        var parked = System.Diagnostics.Stopwatch.StartNew();
+        while (engine.StepsHeldByGate == 0 && parked.Elapsed < TimeSpan.FromMinutes(1)) await Task.Delay(1);
+        Assert.True(engine.StepsHeldByGate > 0, "the engine did not park for the third request");
+        handles.Add(engine.SubmitRequest(sequences[2]));
+        gate.Open();
+        int[][] outputs = await Task.WhenAll(handles.Select(async h =>
+        {
+            var tokens = new List<int>();
+            await foreach (int t in h.Tokens.ReadAllAsync())
+                tokens.Add(t);
+            await h.Completion;
+            return tokens.ToArray();
+        })).WaitAsync(TimeSpan.FromMinutes(3));
+        return (outputs, published);
+    }
+
     private async Task FirstDecodeStepDrafts(string family, string variant, BackendType backend)
     {
         using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);

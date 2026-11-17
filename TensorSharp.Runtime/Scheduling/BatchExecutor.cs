@@ -2495,9 +2495,51 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             HashSet<string>? handled = null;
-            if (UnifiedSpeculativeDecodes(prepared) is { } speculating)
+            List<ScheduledSequenceWork>? speculating = UnifiedSpeculativeDecodes(prepared);
+            if (speculating != null && PromptFinished != null && prepared.Exists(work => work.IsPrefill))
+            {
+                // The prompts (and the decode tokens that do not speculate) forward first and their requests' first tokens
+                // are published before the verify windows run. Verified first, a request that arrived while others
+                // speculated waited for their drafts and verify before its own prompt: four Qwen3.8-27B DFlash2
+                // conversations arriving together had the last one's first token 356 ms after it was submitted, where its
+                // prompt step took 58 ms (an RTX PRO 6000 slice). Every request's step is its own: the order changes none
+                // of their results, and the speculating requests' tokens are published with the step's results as before.
+                var speculatingIds = new HashSet<string>(speculating.ConvertAll(work => work.Sequence.RequestId), StringComparer.Ordinal);
+                ForwardUnifiedWork(model, prepared, speculatingIds, results);
+                foreach (var result in results)
+                    if (result.IsPrefill && result.Error == null && result.Sequence != null) PromptFinished(result.Sequence);
                 TryRunBatchedSpeculativeSubset(speculating, results, ref handled);
+                // A subset the drafters declined decodes plainly, in a forward of its own.
+                if (handled == null || handled.Count < speculating.Count)
+                {
+                    var plain = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var work in prepared)
+                        if (!speculatingIds.Contains(work.Sequence.RequestId) || (handled != null && handled.Contains(work.Sequence.RequestId)))
+                            plain.Add(work.Sequence.RequestId);
+                    ForwardUnifiedWork(model, prepared, plain, results);
+                }
+                return results;
+            }
+            if (speculating != null)
+                TryRunBatchedSpeculativeSubset(speculating, results, ref handled);
+            ForwardUnifiedWork(model, prepared, handled, results);
+            return results;
+        }
 
+        /// <summary>
+        /// Invoked on the engine's thread, inside a step, for each request whose prompt a unified step has just finished while
+        /// the step has more to run (the verify windows of requests that speculate), so its first token can be published then
+        /// (InferenceEngine sets it). Null: first tokens are published with the step's results.
+        /// </summary>
+        internal Action<SequenceState>? PromptFinished { get; set; }
+
+        /// <summary>One forward of the prepared requests not in <paramref name="skip"/>: their prompt chunks and decode tokens
+        /// (a request with pending media embeddings through the model's media path), each request's result into
+        /// <paramref name="results"/>. A failed forward fails the requests it carried.</summary>
+        private void ForwardUnifiedWork(IUnifiedBatchModel model, List<ScheduledSequenceWork> prepared, HashSet<string>? skip,
+            List<SequenceStepResult> results)
+        {
+            HashSet<string>? handled = skip;
             var batch = new List<(ScheduledSequenceWork Work, int[] Tokens, int Start, int Sampled, SpecSeqContext? Drafter)>(prepared.Count);
             var injector = _model.MultimodalInjector;
             // The step's host phases (tensorsharp.engine.step.phase.duration), as the batched decode records them: the
@@ -2542,7 +2584,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (decoders > 0)
                 RecordStepPhase(s_phaseSample, Stopwatch.GetTimestamp() - sampleTicks, decoders);
             if (batch.Count == 0)
-                return results;
+                return;
 
             var ids = new string[batch.Count];
             var tokens = new int[batch.Count][];
@@ -2587,7 +2629,7 @@ namespace TensorSharp.Runtime.Scheduling
                             seq.PendingDeviceToken = next[i];
                             seq.PendingDevicePosition = seq.NumComputedTokens;
                         }
-                        return results;
+                        return;
                     }
                 }
                 if (!model.TryForwardUnified(ids, tokens, starts, lastLogits, features))
@@ -2606,7 +2648,6 @@ namespace TensorSharp.Runtime.Scheduling
                 foreach (var item in batch)
                     FailUnified(item.Work.Sequence, ex, results);
             }
-            return results;
         }
 
         /// <summary>The speculative context of a request whose prompt chunk at <paramref name="start"/> should feed its
