@@ -252,22 +252,24 @@ namespace TensorSharp.Cuda
             {
                 var cudaAllocator = (CudaAllocator)Allocator;
                 IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(cudaAllocator, kc.Storage);
-                // Splits from the bucket window the step's length falls in, recorded or not: a row's arithmetic must not depend
+                // Splits from the bucket window the row's length falls in, recorded or not: a row's arithmetic must not depend
                 // on whether its step was recorded (a verify window's row and the decode row at its position, a speculating
                 // request and a plain one). A recorded launch holds the splits of its whole window - the slot's capacity where
                 // windows span it (AttendsCapacityWindows), so one recording replays at every length - and runs the bucket's,
                 // from the length it reads on the device; an unrecorded one is launched with the bucket's. A verify window's row
-                // run alone (fewer keys than its last) takes its window's length, as the window's own launch does.
-                int fewer = CudaDecodeDynParams.WindowRowFewer, windowKeys = (int)k.Sizes[^2];
+                // run alone (fewer keys than its last) takes its own length's, as the decode row at its position does: the
+                // window's length had split the keys of rows before a bucket's end as the next bucket's (Qwen3.8-27B: 2 splits
+                // at 256 keys, 4 past them), and the speculating stream rounded apart from plain decoding there.
+                int windowKeys = (int)k.Sizes[^2];
                 int splits = decodeFlash.Splits(heads / kvHeads, kvHeads,
-                    dyn != IntPtr.Zero ? windowKeys : CudaFlashPrefillKernels.BucketKeys(windowKeys, len + fewer, DecodeWindowBucket));
+                    dyn != IntPtr.Zero ? windowKeys : CudaFlashPrefillKernels.BucketKeys(windowKeys, len, DecodeWindowBucket));
                 var attended = new Tensor(Allocator, DType.Float32, 1, heads, d);
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(1, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
                 Launch(new[] { qc, kc, vc }, written, (_, stream) => decodeFlash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, 1, len, floor,
                     heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn,
-                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0, lenBias: fewer));
+                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0));
                 return attended;
             }
             if (nq == 1)
@@ -550,9 +552,10 @@ namespace TensorSharp.Cuda
             using Tensor permuted = q.Permute(1, 0, 2);
             using Tensor qc = Ops.NewContiguous(permuted);
             IntPtr dyn = selection ? IntPtr.Zero : CudaDecodeDynParams.GetActiveDevicePtr(cuda, kc.Storage);
-            // A selection's rows split their selection's width; the others the bucket window the window's length falls in (a
-            // recorded launch holds the splits of its whole window and runs the bucket's, the length read on the device), as
-            // the decode row at the last row's position does.
+            // A selection's rows split their selection's width; the others are launched with the splits of the bucket window the
+            // window's length falls in (a recorded launch holds those of its whole window, the length read on the device), the
+            // most any of its rows runs: each row runs its own length's bucket window's (the bucket rule on the device), as the
+            // decode row at its position does.
             int splits = flash.Splits(heads / kvHeads, kvHeads, selection ? (mask.KvMax > 0 ? Math.Min(mask.KvMax, nkv) : nkv)
                 : dyn != IntPtr.Zero ? nkv : CudaFlashPrefillKernels.BucketKeys(nkv, keys, DecodeWindowBucket));
             using Tensor cells = selection ? new Tensor(Allocator, DType.Int32, nq, nkv) : null;
@@ -568,7 +571,7 @@ namespace TensorSharp.Cuda
                 selection ? nkv : keys, selection ? 0 : floor, heads, kvHeads, d, scale, splits,
                 partial == null ? IntPtr.Zero : Ptr(partial), Ptr(output), stream, dyn,
                 selection ? Ptr(cells) : IntPtr.Zero, selection ? Ptr(count) : IntPtr.Zero, selection ? Ptr(rows) : IntPtr.Zero, nkv,
-                windowKeys: nkv, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0));
+                windowKeys: nkv, bucket: selection ? 0 : DecodeWindowBucket));
             attended = output;
             return true;
         }

@@ -27,7 +27,7 @@
 // so the committed compute_75 PTX carries working kernels.
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 9
+#define TS_FLASH_PREFILL_VERSION 10
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -165,24 +165,34 @@ __device__ __forceinline__ int ts_fp_splits(int rows, int nKv, int keys, int sms
     return splits;
 }
 
-// The splits a recorded step's launch runs (bucket > 0, dyn set): the host's rule over the window of `bucket`-key steps the
-// step's length falls in - min(windowKeys, its length rounded up to the bucket), the length dyn[0] plus lenBias (the keys a
-// verify window's later rows have past a row launched alone) - so a window as wide as the slot's capacity splits each length
-// as the bucket window around it would; the launch's own count otherwise (and never more: it covers the widest window).
-__device__ __forceinline__ int ts_fp_live_splits(int launched, const int* __restrict__ dyn, int lenBias, int windowKeys, int bucket,
-    int rows, int nKv, int sms)
+// The splits a row of `len` keys runs under the bucket rule (bucket > 0): the host's rule over the window of `bucket`-key
+// steps its length falls in - min(windowKeys, the length rounded up to the bucket) - never more than the launch holds; the
+// launch's own count without the rule.
+__device__ __forceinline__ int ts_fp_rule_splits(int launched, int len, int windowKeys, int bucket, int rows, int nKv, int sms)
 {
-    if (dyn == nullptr || bucket <= 0)
+    if (bucket <= 0)
         return launched;
-    const int len = dyn[0] + lenBias;
     const int keys = min(windowKeys, (len + bucket - 1) / bucket * bucket);
     return min(launched, ts_fp_splits(rows, nKv, keys, sms));
 }
 
+// The splits a recorded step's launch runs (bucket > 0, dyn set): the bucket rule over its length dyn[0] plus lenBias, so a
+// window as wide as the slot's capacity splits each length as the bucket window around it would; the launch's own count
+// otherwise (and never more: it covers the widest window).
+__device__ __forceinline__ int ts_fp_live_splits(int launched, const int* __restrict__ dyn, int lenBias, int windowKeys, int bucket,
+    int rows, int nKv, int sms)
+{
+    if (dyn == nullptr)
+        return launched;
+    return ts_fp_rule_splits(launched, dyn[0] + lenBias, windowKeys, bucket, rows, nKv, sms);
+}
+
 // WIN: the nq rows are a verify window's (q [nq][nHead][HD]), each run as the one-row launch at its position would run it:
-// a row's keys are split by its own length (the one-row launch's share), the block walks the union of its rows' key tiles
-// (each KT-aligned), and keys outside a row's own range are masked for it - they add exact zeros and leave its maximum, so a
-// row's sums are the one-row launch's bit for bit, while every key tile is read once for all the window's rows.
+// a row runs the splits its own length's bucket window gives (ts_fp_rule_splits over windowKeys and bucket: the decode row's
+// at its position, `live` - the window's last row's - at most) and splits its keys by its own length (the one-row launch's
+// share), the block walks the union of its rows' key tiles (each KT-aligned), and keys outside a row's own range are masked
+// for it - they add exact zeros and leave its maximum, so a row's sums are the one-row launch's bit for bit, while every key
+// tile is read once for all the window's rows.
 // PROMPT: a prompt chunk's rows (more than a verify window's), scheduled for the causal triangle: the row tiles run heaviest
 // first (block x takes tile tiles - 1 - x / splits: the last rows see the most keys, and a light tile now ends the grid where
 // the heaviest had started last), and a warp skips the key tiles past every one of its rows' ends (a whole tile its rows
@@ -192,7 +202,7 @@ __device__ __forceinline__ void ts_fp_attn(
     const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len,
     int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out,
     const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask,
-    int live)
+    int live, int windowKeys = 0, int bucket = 0, int sms = 0)
 {
     // A recorded decode step reads the window's length from the step's parameter block (CudaDecodeDynParams).
     if (dyn != nullptr)
@@ -218,33 +228,48 @@ __device__ __forceinline__ void ts_fp_attn(
         return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, qd = lane & 3;
     const int past = len - nq;   // keys before the first query row
-    // A split's key range over kAll keys (the one-row launch's, kAll its row's length).
-    auto range = [&](int kAll, int& lo, int& hi) {
-        const int share = ((kAll + live - 1) / live + TS_FP_KT - 1) / TS_FP_KT * TS_FP_KT;
+    // A split's key range over kAll keys run in `runs` splits (the one-row launch's, kAll its row's length).
+    auto range = [&](int kAll, int runs, int& lo, int& hi) {
+        const int share = ((kAll + runs - 1) / runs + TS_FP_KT - 1) / TS_FP_KT * TS_FP_KT;
         lo = max(min(kAll, split * share), min(kAll, floor / TS_FP_KT * TS_FP_KT));
         hi = min(kAll, split * share + share);
     };
+    // The splits a row of kAll keys runs: a window row its own length's (the decode row's at its position), else the launch's.
+    auto runsOf = [&](int kAll) { return WIN ? ts_fp_rule_splits(live, kAll, windowKeys, bucket, G, nKv, sms) : live; };
     int kLo, kHi;
     if (WIN)
     {
-        // The block's first and last rows' ranges bound its rows' (a range grows with its row's length).
-        int lo1, hi0;
-        range(past + rowBase / G + 1, kLo, hi0);
-        range(past + (min(rowBase + TS_FP_ROWS, R) - 1) / G + 1, lo1, kHi);
-        kHi = max(kHi, hi0);
+        // The union of the block's rows' ranges that hold keys (each row's splits its own, so a later row's range need not
+        // reach below an earlier one's): each starts on a tile boundary, so every row's tiles are its one-row launch's.
+        kLo = len;
+        kHi = 0;
+        const int tLast = (min(rowBase + TS_FP_ROWS, R) - 1) / G;
+        for (int t = rowBase / G; t <= tLast; ++t)
+        {
+            int lo, hi;
+            range(past + t + 1, runsOf(past + t + 1), lo, hi);
+            if (hi > lo)
+            {
+                kLo = min(kLo, lo);
+                kHi = max(kHi, hi);
+            }
+        }
+        if (kHi <= kLo)
+            kLo = kHi = 0;
     }
     else
-        range(past + (min(rowBase + TS_FP_ROWS, R) - 1) / G + 1, kLo, kHi);
+        range(past + (min(rowBase + TS_FP_ROWS, R) - 1) / G + 1, live, kLo, kHi);
 
     const int r0 = rowBase + warp * 16 + g, r1 = r0 + 8;
     const bool live0 = r0 < R, live1 = r1 < R;
     const int end0 = live0 ? past + r0 / G + 1 : 0, end1 = live1 ? past + r1 / G + 1 : 0;
-    // A window row's own key range (the whole block's elsewhere).
+    // A window row's own splits and key range (the launch's and the whole block's elsewhere).
+    const int runs0 = live0 ? runsOf(end0) : live, runs1 = live1 ? runsOf(end1) : live;
     int lo0 = kLo, hi0 = kHi, lo1 = kLo, hi1 = kHi;
     if (WIN)
     {
-        if (live0) range(end0, lo0, hi0);
-        if (live1) range(end1, lo1, hi1);
+        if (live0) range(end0, runs0, lo0, hi0);
+        if (live1) range(end1, runs1, lo1, hi1);
     }
     const bool warpLive = rowBase + warp * 16 < R;
     // A prompt chunk's warp: the end of its last-seeing row (tiles from there are masked for every row of it).
@@ -433,7 +458,11 @@ __device__ __forceinline__ void ts_fp_attn(
         const int t = r / G, h = kvh * G + r % G;
         const long long base = (long long)t * nHead + h;
         const float l = half_ ? l1 : l0;
-        if (live > 1)
+        // A window row that runs fewer splits than the block's: this split is not one of them.
+        const int runs = half_ ? runs1 : runs0;
+        if (split >= runs)
+            continue;
+        if (runs > 1)
         {
             float* p = partial + (base * splits + split) * (HD + 2);
 #pragma unroll
@@ -498,7 +527,8 @@ TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256)
 // window row, which attends the window's keys less the rows - 1 - z after it (the window's length read from dyn[0] on
 // the device when the step is recorded). One launch for what were `rows` one-row launches, each row through the same
 // code as ts_flash_prefill_f16_d<hd> with nq = 1, so a row's sums are the decode row's bit for bit. Every row splits its
-// keys as the window's length's bucket says (ts_fp_live_splits over the query heads of one KV head, as a decode row).
+// keys as its own length's bucket says (ts_fp_rule_splits over the query heads of one KV head, as the decode row at its
+// position); a selection's rows run the launch's splits (bucket 0).
 //   q, out  [rows][nHead][HD] F32;  partial  rows x nHead x splits x (HD + 2) floats (combined over rows * nHead).
 // With cells (a sparse attention's selection): row z's keys are cells[z * cellStride ..], cellCount[z] of them, each with
 // its value in the mask row cellMask[z * cellStride ..] added (len and floor unused; none without cellMask).
@@ -513,11 +543,13 @@ TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256)
         const int z = blockIdx.z; \
         const long long at = (long long)z * nHead * HD; \
         const bool listed = cells != nullptr; \
-        ts_fp_attn<HD>(q + at, kc, vc, cap, 1, (dyn != nullptr ? dyn[0] : len) - (rows - 1 - z), floor, nHead, nKv, scale, \
+        const int rowLen = (dyn != nullptr ? dyn[0] : len) - (rows - 1 - z); \
+        ts_fp_attn<HD>(q + at, kc, vc, cap, 1, rowLen, floor, nHead, nKv, scale, \
             splits, partial != nullptr ? partial + (long long)z * nHead * splits * (HD + 2) : nullptr, out + at, nullptr, \
             listed ? cells + (long long)z * cellStride : nullptr, listed ? cellCount + z : nullptr, \
             listed && cellMask != nullptr ? cellMask + (long long)z * cellStride : nullptr, \
-            ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms)); \
+            listed ? ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms) \
+                : ts_fp_rule_splits(splits, rowLen, windowKeys, bucket, nHead / nKv, nKv, sms)); \
     }
 
 TS_FP_ATTN_ROWS(128)
@@ -525,8 +557,9 @@ TS_FP_ATTN_ROWS(256)
 
 // ts_flash_decode_rows_f16_d<hd> with the window's rows in the row tiles of one launch (ts_fp_attn's WIN): every key tile is
 // read once for all the rows, where the row grid read the window's keys once a row (8 times for a Qwen3.8-27B 8-row window:
-// 140 us a layer after a 4K prompt against the direct engine's 44). Each row's sums are its one-row launch's, bit for bit.
-// No selection (cells). Launch: grid (ceil(rows * nHead / nKv / 128) * splits, nKv), block 256, the same shared memory.
+// 140 us a layer after a 4K prompt against the direct engine's 44). Each row's sums are its one-row launch's, bit for bit,
+// its splits its own length's (`splits` holds the last row's, the most). No selection (cells). Launch: grid
+// (ceil(rows * nHead / nKv / 128) * splits, nKv), block 256, the same shared memory.
 #define TS_FP_ATTN_WINDOW(HD) \
     extern "C" __global__ void __launch_bounds__(256) ts_flash_decode_window_f16_d##HD( \
         const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int rows, int len, \
@@ -534,7 +567,7 @@ TS_FP_ATTN_ROWS(256)
         const int* __restrict__ dyn, int windowKeys, int bucket, int sms) \
     { \
         ts_fp_attn<HD, true>(q, kc, vc, cap, rows, len, floor, nHead, nKv, scale, splits, partial, out, dyn, nullptr, nullptr, nullptr, \
-            ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms)); \
+            ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms), windowKeys, bucket, sms); \
     }
 
 TS_FP_ATTN_WINDOW(128)
@@ -550,6 +583,34 @@ extern "C" __global__ void ts_flash_prefill_combine_f32(const float* __restrict_
     if (live <= 1)
         return;
     const long long base = blockIdx.x;
+    const float* p = partial + base * splits * (hd + 2);
+    float mx = -INFINITY;
+    for (int s = 0; s < live; ++s)
+        mx = fmaxf(mx, p[s * (hd + 2) + hd]);
+    float num = 0.0f, den = 0.0f;
+    const int x = threadIdx.x;
+    for (int s = 0; s < live; ++s)
+    {
+        const float* ps = p + s * (hd + 2);
+        const float w = mx == -INFINITY ? 0.0f : expf(ps[hd] - mx);
+        num = fmaf(ps[x], w, num);
+        den = fmaf(ps[hd + 1], w, den);
+    }
+    out[base * hd + x] = den > 0.0f ? num / den : 0.0f;
+}
+
+// ts_flash_prefill_combine_f32 over a verify window's rows (ts_flash_decode_window / ts_flash_decode_rows without a
+// selection): output (t, head) combines the splits its row ran - its own length's under the bucket rule (row t of `rows`
+// attends the window's length, dyn[0] when recorded, less the rows - 1 - t keys after it), as the decode row at its position
+// combines them. Launch: grid rows * nHead, block HD.
+extern "C" __global__ void ts_flash_window_combine_f32(const float* __restrict__ partial, int splits, int hd, float* __restrict__ out,
+    const int* __restrict__ dyn, int len, int rows, int nHead, int windowKeys, int bucket, int ruleRows, int nKv, int sms)
+{
+    const long long base = blockIdx.x;
+    const int t = (int)(base / nHead);
+    const int live = ts_fp_rule_splits(splits, (dyn != nullptr ? dyn[0] : len) - (rows - 1 - t), windowKeys, bucket, ruleRows, nKv, sms);
+    if (live <= 1)
+        return;
     const float* p = partial + base * splits * (hd + 2);
     float mx = -INFINITY;
     for (int s = 0; s < live; ++s)

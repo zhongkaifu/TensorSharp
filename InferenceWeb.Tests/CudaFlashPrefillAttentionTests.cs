@@ -314,4 +314,117 @@ public sealed class CudaFlashPrefillAttentionTests
             Assert.True(zeros < a.Length / 4, $"{zeros} of {a.Length} outputs are zero");
         }
     }
+
+    /// <summary>
+    /// A verify window whose rows' lengths fall in two 256-key buckets (CudaGraphExecutor's decode bucket) against the decode
+    /// row at each row's position, launched as the executor launches a decode row: unrecorded with the splits of its own
+    /// length's bucket window, and recorded (the length read from its device block, the launch holding the whole window's
+    /// splits). Both window kernels (the shared row tiles and the row grid), recorded and not, bit for bit. Each row had run
+    /// the splits of the window's last row's bucket, so the rows before a bucket's end split their keys as the next bucket's
+    /// (Qwen3.8-27B on an RTX PRO 4000: 2 splits at 256 keys, 4 past them) and a speculating stream rounded apart from plain
+    /// decoding wherever a window straddled one.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(256, 24, 4, 8, 260, false, false)]   // Qwen3.8-27B's heads, rows of 253..260 keys
+    [InlineData(256, 24, 4, 8, 260, true, false)]
+    [InlineData(256, 24, 4, 8, 260, true, true)]
+    [InlineData(256, 24, 4, 16, 1030, true, false)]  // 16 rows of 1015..1030 keys
+    [InlineData(256, 24, 4, 16, 1030, false, true)]
+    [InlineData(128, 16, 2, 5, 2050, false, false)]  // 2046..2050 keys
+    [InlineData(128, 16, 2, 5, 2050, true, true)]
+    [InlineData(256, 8, 2, 3, 300, true, false)]     // one bucket: every row the window's splits
+    public void WindowRowsSplitTheirKeysAsTheDecodeRowAtTheirPosition(int d, int heads, int kvHeads, int rows, int len, bool recorded,
+        bool rowGrid)
+    {
+        using var allocator = new CudaAllocator();
+        CudaFlashPrefillKernels flash = allocator.FlashPrefillKernels;
+        if (flash == null || !flash.RunsAttention(d))
+        {
+            _output.WriteLine("no flash prefill attention for this GPU");
+            return;
+        }
+        const int bucket = 256;
+        int group = heads / kvHeads, windowKeys = (len / bucket + 2) * bucket, cap = windowKeys;
+        var rng = new Random(43);
+        float[] qv = new float[rows * heads * d];
+        for (int i = 0; i < qv.Length; i++) qv[i] = (float)(rng.NextDouble() * 2 - 1);
+        var kh = new float[kvHeads * cap * d];
+        var vh = new float[kvHeads * cap * d];
+        for (int i = 0; i < kh.Length; i++)
+        {
+            kh[i] = (float)(System.Half)(rng.NextDouble() * 2 - 1);
+            vh[i] = (float)(System.Half)(rng.NextDouble() * 2 - 1);
+        }
+        float scale = 1f / MathF.Sqrt(d);
+        int Bucketed(int keys) => flash.Splits(group, kvHeads, CudaFlashPrefillKernels.BucketKeys(windowKeys, keys, bucket));
+        // A recorded launch holds the whole window's splits; an unrecorded one is launched with its length's bucket's.
+        int launched = recorded ? flash.Splits(group, kvHeads, windowKeys) : Bucketed(len);
+        var lengths = new int[rows + 1];
+        for (int z = 0; z < rows; z++) lengths[z + 1] = len - (rows - 1 - z);
+        lengths[0] = len;
+        var dynHost = new int[(rows + 1) * 4];
+        for (int block = 0; block <= rows; block++) dynHost[4 * block] = lengths[block];
+        using var q = Tensor.FromArray(allocator, qv);
+        using var k32 = Tensor.FromArray(allocator, kh);
+        using var v32 = Tensor.FromArray(allocator, vh);
+        using var dyn = Tensor.FromArray(allocator, dynHost);
+        using var k = new Tensor(allocator, DType.Float16, kvHeads * cap * d);
+        using var v = new Tensor(allocator, DType.Float16, kvHeads * cap * d);
+        using var together = new Tensor(allocator, DType.Float32, rows * heads * d);
+        using var alone = new Tensor(allocator, DType.Float32, rows * heads * d);
+        using var aloneRecorded = new Tensor(allocator, DType.Float32, rows * heads * d);
+        int widest = flash.Splits(group, kvHeads, windowKeys);
+        using var partial = new Tensor(allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(rows, heads, d, widest));
+        using var rowPartial = new Tensor(allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(1, heads, d, widest));
+        foreach (Tensor t in new[] { q, k32, v32, dyn, k, v, together, alone, aloneRecorded, partial, rowPartial })
+            ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+        IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
+        IntPtr At(Tensor t, long element) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset + element);
+        IntPtr stream = allocator.Stream.Handle;
+        allocator.Context.MakeCurrent();
+        allocator.Kernels.LaunchConvertF32F16(P(k32), P(k), kh.Length, stream);
+        allocator.Kernels.LaunchConvertF32F16(P(v32), P(v), vh.Length, stream);
+        flash.RowGridForTests = rowGrid;
+        try
+        {
+            // The window's launch: its length from the step's block when recorded (the scalar one wrong on purpose).
+            flash.LaunchDecodeRows(P(q), P(k), P(v), cap, rows, recorded ? 1 : len, 0, heads, kvHeads, d, scale, launched,
+                launched > 1 ? P(partial) : IntPtr.Zero, P(together), stream, recorded ? P(dyn) : IntPtr.Zero, windowKeys: windowKeys,
+                bucket: bucket);
+        }
+        finally
+        {
+            flash.RowGridForTests = false;
+        }
+        var splitsOf = new int[rows];
+        for (int z = 0; z < rows; z++)
+        {
+            long at = (long)z * heads * d;
+            int lenZ = lengths[z + 1];
+            splitsOf[z] = Bucketed(lenZ);
+            // The decode row unrecorded (its length's bucket splits), then recorded (the length its block holds).
+            flash.LaunchAttention(At(q, at), P(k), P(v), cap, 1, lenZ, 0, heads, kvHeads, d, scale, splitsOf[z],
+                splitsOf[z] > 1 ? P(rowPartial) : IntPtr.Zero, At(alone, at), stream);
+            flash.LaunchAttention(At(q, at), P(k), P(v), cap, 1, 1, 0, heads, kvHeads, d, scale, widest,
+                widest > 1 ? P(rowPartial) : IntPtr.Zero, At(aloneRecorded, at), stream, At(dyn, 4L * (z + 1)), windowKeys: windowKeys,
+                bucket: bucket);
+        }
+        allocator.Stream.Synchronize();
+        foreach (Tensor t in new[] { together, alone, aloneRecorded }) ((CudaStorage)t.Storage).MarkDeviceModified();
+        int n = rows * heads * d;
+        float[] a = together.GetElementsAsFloat(n), b = alone.GetElementsAsFloat(n), c = aloneRecorded.GetElementsAsFloat(n);
+        int Differ(float[] x, float[] y)
+        {
+            int count = 0;
+            for (int i = 0; i < x.Length; i++)
+                if (BitConverter.SingleToInt32Bits(x[i]) != BitConverter.SingleToInt32Bits(y[i])) count++;
+            return count;
+        }
+        int differ = Differ(a, b), recordedDiffer = Differ(c, b);
+        _output.WriteLine($"d {d}, {heads}/{kvHeads} heads, {rows} rows of {lengths[1]}..{len} keys, row splits [{string.Join(",", splitsOf)}], " +
+            $"launched {launched} ({(recorded ? "recorded" : "unrecorded")}, {(rowGrid ? "row grid" : "row tiles")}): {differ} of {n} differ " +
+            $"from the decode rows ({recordedDiffer} between the decode rows recorded and not)");
+        Assert.Equal(0, recordedDiffer);
+        Assert.Equal(0, differ);
+    }
 }

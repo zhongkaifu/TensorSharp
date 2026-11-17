@@ -20,13 +20,13 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 9;
+        public const int CurrentVersion = 10;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
 
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
-        private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _window128, _window256, _combine;
+        private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _window128, _window256, _combine, _windowCombine;
         private readonly IntPtr _prompt128, _prompt256;
         private readonly int _smem128, _smem256;
 
@@ -40,6 +40,7 @@ namespace TensorSharp.Cuda
             _window128 = module.GetFunction("ts_flash_decode_window_f16_d128");
             _window256 = module.GetFunction("ts_flash_decode_window_f16_d256");
             _combine = module.GetFunction("ts_flash_prefill_combine_f32");
+            _windowCombine = module.GetFunction("ts_flash_window_combine_f32");
             _prompt128 = module.GetFunction("ts_flash_prompt_f16_d128");
             _prompt256 = module.GetFunction("ts_flash_prompt_f16_d256");
             (_smem128, _smem256) = (SharedBytes(128), SharedBytes(256));
@@ -136,13 +137,14 @@ namespace TensorSharp.Cuda
         /// A verify window's <paramref name="rows"/> rows, each as the decode row at its position, in one launch: row z of q
         /// [rows][heads][d] F32 attends keys [floor, len - (rows - 1 - z)) of the head-first F16 caches (len read from
         /// <paramref name="dyn"/>[0] on the device when given), into out [rows][heads][d] F32. Each row's arithmetic is a
-        /// one-row <see cref="LaunchAttention"/>'s with the same <paramref name="splits"/>; the partials hold
-        /// <see cref="PartialFloats"/>(rows, ...). With <paramref name="cells"/> (a sparse attention's selection) row z's
-        /// keys are cells[z * cellStride ..], cellCount[z] of them, its mask row cellMask[z * cellStride ..] (or none).
-        /// Without a selection the rows share the launch's row tiles (ts_flash_decode_window_f16_d*: every key tile read once
-        /// for the window's rows, each row still its one-row launch's bits); with one, a row of the grid each.
-        /// <paramref name="windowKeys"/> and <paramref name="bucket"/> as <see cref="LaunchAttention"/>'s, for every row the
-        /// splits of the window's length (a row's as the decode row at its position).
+        /// one-row <see cref="LaunchAttention"/>'s; the partials hold <see cref="PartialFloats"/>(rows, ...). With
+        /// <paramref name="cells"/> (a sparse attention's selection) row z's keys are cells[z * cellStride ..], cellCount[z] of
+        /// them, its mask row cellMask[z * cellStride ..] (or none), every row on <paramref name="splits"/>. Without a selection
+        /// the rows share the launch's row tiles (ts_flash_decode_window_f16_d*: every key tile read once for the window's rows,
+        /// each row still its one-row launch's bits); with one, a row of the grid each. Without a selection and with
+        /// <paramref name="bucket"/> &gt; 0, row z runs the splits <see cref="Splits"/> gives <see cref="BucketKeys"/> of
+        /// <paramref name="windowKeys"/> and its own length (the decode row's at its position, recorded or not), never more than
+        /// <paramref name="splits"/> (the last row's); bucket 0 runs every row on <paramref name="splits"/>.
         /// </summary>
         public unsafe void LaunchDecodeRows(IntPtr q, IntPtr k, IntPtr v, int cap, int rows, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
@@ -169,7 +171,19 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, (uint)rows, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
                     IntPtr.Zero).ThrowOnError();
             }
-            if (splits > 1) LaunchCombine(partial, splits, headDim, output, rows * heads, dyn, 0, windowKeys, bucket, heads / kvHeads, kvHeads, stream);
+            if (splits <= 1) return;
+            if (cells != IntPtr.Zero)
+            {
+                LaunchCombine(partial, splits, headDim, output, rows * heads, dyn, 0, windowKeys, bucket, heads / kvHeads, kvHeads, stream);
+                return;
+            }
+            // Each row combines the splits its own length gave it.
+            IntPtr c0 = partial, c3 = output, c4 = dyn;
+            int c1 = splits, c2 = headDim, c5 = len, c6 = rows, c7 = heads, c8 = windowKeys, c9 = bucket, c10 = heads / kvHeads, c11 = kvHeads,
+                c12 = MultiprocessorCount;
+            void** cargs = stackalloc void*[] { &c0, &c1, &c2, &c3, &c4, &c5, &c6, &c7, &c8, &c9, &c10, &c11, &c12 };
+            CudaDriverApi.cuLaunchKernel(_windowCombine, (uint)(rows * heads), 1, 1, (uint)headDim, 1, 1, 0, stream, (IntPtr)cargs,
+                IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Tests and A/B: <see cref="LaunchDecodeRows"/> runs a window's rows on the row grid (a row a z-slice) without a

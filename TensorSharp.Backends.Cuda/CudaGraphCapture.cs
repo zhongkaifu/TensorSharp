@@ -211,10 +211,6 @@ namespace TensorSharp.Cuda
         [ThreadStatic]
         private static int windowRow;   // 0: the step's block; b + 1: the row b keys short of the step's last
 
-        /// <summary>The keys the verify window row a launcher runs now has fewer than the window's last (<see cref="WindowRow"/>;
-        /// 0 outside one): what its length lacks of the window's.</summary>
-        internal static int WindowRowFewer => windowRow > 0 ? windowRow - 1 : 0;
-
         /// <summary>While set, a launcher's dynamic block is the one of a verify window's row that attends
         /// <paramref name="fewerKeys"/> keys fewer than the step's length (0 to <see cref="WindowRowBlocks"/> - 1); null
         /// restores the step's own. Kernels that read only the length and the write position take it.</summary>
