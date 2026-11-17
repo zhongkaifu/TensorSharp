@@ -37,9 +37,10 @@ output).
 
 ## Speech output
 
-- `speech-ref.sh` / `speech-ref.cpp`: llama.cpp's TTS pipeline on a fixed text and seed, with the LM hidden row of every
-  frame, the depthformer logits, codes, PCM and timings; the fixture of `Lfm3SpeechRealWeightsTests` and the
-  `TS_LFM3_SPEECH_REF` directory of `Lfm3SpeechIntegrationRealModelTests` (hidden.f32, llama-tts.wav).
+- `speech-ref.sh` / `speech-ref.cpp` (`LLAMA_BUILD=build-cpu` for a CPU-only reference): llama.cpp's TTS pipeline on a
+  fixed text and seed, with the LM hidden row of every frame, the depthformer logits, codes, PCM and timings; the
+  fixture of `Lfm3SpeechRealWeightsTests` and the `TS_LFM3_SPEECH_REF` directory of
+  `Lfm3SpeechIntegrationRealModelTests` (hidden.f32, codes.txt, llama-tts.wav).
 - `speech-chat-ref.cpp`: llama.cpp's speech pipeline continuing a conversation (its realtime server's path: the turn as
   text, `n_past > 0`, out_mode MIXED or AUDIO, greedy text slots with the pipeline's logit bias) for each question of a
   TSV; each reply's WAV and transcript. Build it like `speech-ref.cpp` (see its header).
