@@ -44,10 +44,11 @@ namespace TensorSharp.GGML
             {
                 // Metal and CUDA read row-contiguous strided views (the fused Qwen graphs rely on it).
                 StridedViews = metal || backend == GgmlBackendType.Cuda,
-                // A prompt chunk's packed products as one product and views (ggml-metal's element-wise kernels, norms, rotary
-                // and set_rows read row-contiguous strided rows): LFM3-1.7B Q4_K_M pp128 4,083 -> 4,320 tok/s, pp512 +2.3%
-                // (M5 Pro). ggml-cuda reads them too (llama.cpp's graphs do) but is not validated here.
-                PackedProductBlocks = metal,
+                // A prompt chunk's packed products as one product and views (ggml-metal's and ggml-cuda's element-wise kernels,
+                // norms, rotary and set_rows read row-contiguous strided rows): LFM3-1.7B Q4_K_M pp128 4,083 -> 4,320 tok/s,
+                // pp512 +2.3% (M5 Pro); on an A40 pp512 +4.7%, pp4096 +4.1% (26 fewer products a 512-row step). ggml-vulkan
+                // measured no gain (pp512 +0.8%, pp4096 -0.3%, decode -0.4..-0.9%), so it keeps the separate products.
+                PackedProductBlocks = metal || backend == GgmlBackendType.Cuda,
                 // ggml-metal finishes reading a head's recurrent state before writing it.
                 InPlaceStateAlias = metal,
                 // Metal's concurrency reorder (+8% decode on Qwen 3.5 A3B).
