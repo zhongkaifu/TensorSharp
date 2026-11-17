@@ -52,6 +52,7 @@
     <EmbeddedResource Include="Fixtures/DeepSeek41/layout-1017.json" />
     <EmbeddedResource Include="Fixtures/DesktopSurface/create_surface.c" />
     <EmbeddedResource Include="Fixtures/WindowsKnownFolders/probe.py" />
+    <EmbeddedResource Include="Fixtures/Lfm3Speech/*.json" />
     <None Update="Fixtures/Images/edit-photo-1024x768.heic" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
