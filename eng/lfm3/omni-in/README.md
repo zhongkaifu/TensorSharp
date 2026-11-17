@@ -38,6 +38,9 @@ llama.cpp side is a Metal build of `llama-server` / `llama-mtmd-cli` (`LLAMA`, d
     prompt of the same length;
   - `split MODEL MMPROJ BACKEND IMAGE`: an image's encode as one program and split for GPU-lock yields (2 and 4
     programs), interleaved, with the rows' distance;
+  - `encode MODEL MMPROJ BACKEND IMAGE [REPS]`: an image's encode as one program, REPS times after a warm one (median,
+    min, max and a `RESULT vision_ms` line for `eng/lfm3/bench/ab.py`); the CPU lanes take their threads from
+    `TS_GGML_CPU_THREADS` / `TS_CPU_THREADS`, to compare with `llama-mtmd-cli -t N`'s "image slice encoded in" time;
   - `stages MODEL MMPROJ BACKEND VIDEO`: a video's preparation stage by stage (the host frame sampling a frame family
     would pay, decode + resize, soundtrack decode, features, pair encodes, soundtrack encode).
 

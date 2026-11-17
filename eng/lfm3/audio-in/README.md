@@ -4,6 +4,7 @@ Tools that check TensorSharp's LFM3-Omni audio input (`Lfm3AudioPreprocessor`, `
 mtmd on the same mmproj. Outputs belong in the ignored `artifacts/lfm3/audio-in/`.
 
 - `lfm3-audio-ref.cpp` uses only the public libmtmd / libllama API, so the llama.cpp sources stay unchanged.
+  `LFM3_REF_THREADS` sets mtmd's CPU threads (default 8), the encoder's on a CPU-only build tree.
   - `dump` writes each clip's encoder input (the log-mel), the downsampler output, every layer's operator norm, the final
     norm and the LM rows, read through mtmd's eval callback. It also records llama.cpp's encode time, with and without the
     mel computation.

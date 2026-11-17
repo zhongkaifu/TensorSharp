@@ -23,6 +23,8 @@
 //       the user turn, the assistant turn opened with <think></think>); with ROWS.f32 ([rows][2048], e.g. TensorSharp's)
 //       the LM reads those rows in place of llama.cpp's own encode. Prints the transcript between "<<<" and ">>>".
 //
+// LFM3_REF_THREADS sets mtmd's CPU threads (default 8): the encoder's on a CPU-only build tree.
+//
 // Build against a llama.cpp build tree (see eng/lfm3/audio-in/README.md):
 //   c++ -std=c++17 -O2 lfm3-audio-ref.cpp -I$LLAMA/include -I$LLAMA/ggml/include -I$LLAMA/tools/mtmd \
 //       -L$LLAMA/build/bin -lmtmd -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin -o lfm3-audio-ref
@@ -123,7 +125,8 @@ static void open_session(session & s, const char * model_path, const char * mmpr
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu = true;
     cp.print_timings = false;
-    cp.n_threads = 8;
+    const char * threads = getenv("LFM3_REF_THREADS");
+    cp.n_threads = threads != nullptr && atoi(threads) > 0 ? atoi(threads) : 8;
     cp.cb_eval = capture_cb;
     cp.cb_eval_user_data = &s.capture;
     s.mtmd = mtmd_init_from_file(mmproj_path, s.model, cp);
