@@ -1152,23 +1152,36 @@ namespace TensorSharp.Cli
 
             // Audio models: Whisper (--audio in, transcript out), Kokoro (--prompt in, speech
             // out) and ACE-Step (--prompt style tags and --lyrics in, a song out).
+            // --tts with a chat model that speaks (LFM3-Omni): its speech decoder is in the projector, which the chat
+            // routes below load; the TTS route returns before them, so it is loaded here.
+            if (audioCli.Tts && mmProjPath != null && model is TensorSharp.Models.Audio.ISpeechOutputLoader)
+            {
+                try
+                {
+                    model.MultimodalInjector.LoadProjectors(ModelArchitectureRegistry.ResolveProjectorPath(model.Config.Architecture, mmProjPath));
+                }
+                catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string projectorRefusal))
+                {
+                    ReportProjectorRefusal(ex, mmProjPath, projectorRefusal);
+                    return;
+                }
+            }
             if (AudioCli.TryRun(model, audioCli,
                     editPrompt ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : null),
                     audioPath, outputFile, diffusionStepsSet ? diffusionSteps : 0, diffusionSeedSet ? diffusionSeed : 0,
                     samplingConfig.Seed >= 0 ? (uint)samplingConfig.Seed : null))
                 return;
-
-            // A spoken chat reply (--speech-out): a single-prompt run of a model that speaks. The speech flags do nothing
-            // anywhere else, so they are refused there rather than ignored.
-            string speechRefusal = SpeechOutRefusal(model, audioCli, runInteractive, inputJsonl != null || multiTurnJsonl != null,
-                runTest || runBenchmark || runChunkedPrefillCorrectness || runKvCacheBenchmark);
-            if (speechRefusal != null)
+            // A model that cannot speak at all refuses the speech flags before its own routes (image and video
+            // generation return before the projector is loaded); a model that speaks is checked once its projector is.
+            if (model is not TensorSharp.Models.Audio.ISpeechOutputModel
+                && SpeechOutRefusal(model, audioCli, false, false, false) is { } cannotSpeak)
             {
-                _log.LogError(LogEventIds.CliFailed, "{Reason}", speechRefusal);
-                Console.Error.WriteLine(speechRefusal);
-                Environment.ExitCode = 2;
+                _log.LogError(LogEventIds.CliFailed, "{Reason}", cannotSpeak);
+                Console.Error.WriteLine(cannotSpeak);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
                 return;
             }
+
 
             // Qwen-Image-2.1: prompt -> generated image, or prompt + input image(s) -> edited
             // image (no autoregressive path). Repeat --image for multi-image edits (e.g.
@@ -1291,6 +1304,18 @@ namespace TensorSharp.Cli
                         return;
                     }
                 }
+            }
+
+            // A spoken chat reply (--speech-out): a single-prompt run of a model that speaks (its projector loaded above).
+            // The speech flags do nothing anywhere else, so they are refused there rather than ignored.
+            string speechRefusal = SpeechOutRefusal(model, audioCli, runInteractive, inputJsonl != null || multiTurnJsonl != null,
+                runTest || runBenchmark || runChunkedPrefillCorrectness || runKvCacheBenchmark);
+            if (speechRefusal != null)
+            {
+                _log.LogError(LogEventIds.CliFailed, "{Reason}", speechRefusal);
+                Console.Error.WriteLine(speechRefusal);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
             }
 
             if (runTest)
@@ -1631,7 +1656,18 @@ namespace TensorSharp.Cli
             // the model so beats ending its turn on a guess.
             List<ToolFunction> clientTools = tools != null ? new List<ToolFunction>(tools) : null;
 
-            if (skillRegistry != null && (selectedSkills.Count > 0 || (skillOptions.Discovery && skillRegistry.Skills.Count > 0)))
+            // A spoken reply (--speech-out) is a conversational answer: skills, code execution and tools are not combined
+            // with it (as on the server), and discovered skills are not offered to it.
+            if (audioCli.SpeechOut != null && (selectedSkills.Count > 0 || codeRunner != null || tools is { Count: > 0 }))
+            {
+                string refusal = "--speech-out is a spoken reply, which is not combined with selected skills, --code-exec or --tools: run without them.";
+                _log.LogError(LogEventIds.CliFailed, "{Reason}", refusal);
+                Console.Error.WriteLine(refusal);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+            if (skillRegistry != null && audioCli.SpeechOut == null
+                && (selectedSkills.Count > 0 || (skillOptions.Discovery && skillRegistry.Skills.Count > 0)))
             {
                 var skillCaps = SkillCapabilities.For(model.Config.Architecture);
                 var catalogSkills = skillOptions.Discovery
@@ -1778,12 +1814,6 @@ namespace TensorSharp.Cli
             // run still ends in an answer rather than a printed tool call the user would
             // have to service by hand.
             string result;
-            if (audioCli.SpeechOut != null && skillToolContext != null)
-            {
-                Console.Error.WriteLine("--speech-out is a spoken reply, which is not combined with skills or code execution: run without them.");
-                Environment.ExitCode = 2;
-                return;
-            }
             if (skillToolContext != null)
             {
                 result = RunInferenceWithSkills(

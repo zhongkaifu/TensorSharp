@@ -321,8 +321,9 @@ namespace TensorSharp.Cli
                 new OptionHelp("--speech-out <file>",
                     "A single-prompt chat reply is also spoken (LFM3-Omni with its mmproj): its speech is written to " +
                     "this WAV file (24 kHz mono 16-bit) and its text - the speech's transcript - printed as usual. " +
-                    "Refused for a model without speech output, the interactive chat, JSONL batches, benchmarks and " +
-                    "skills. Default: none (a text reply).",
+                    "Refused for a model without speech output, the interactive chat, JSONL batches, benchmarks, and " +
+                    "with selected skills, --code-exec or --tools (discovered skills are not offered to it). Default: none " +
+                    "(a text reply).",
                     "--input question.txt --speech-out reply.wav"),
                 new OptionHelp("--speech-mode <interleaved|audio>",
                     "How a --speech-out reply speaks: interleaved = text and speech in turns (6 text tokens, then " +
