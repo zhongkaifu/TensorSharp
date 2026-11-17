@@ -138,6 +138,17 @@ namespace TensorSharp.Server.Skills
         /// </summary>
         internal bool ClientStreamsAppendOnly { get; set; }
 
+        private int _reasoningTokens;
+
+        /// <summary>The reasoning tokens every generation of this turn has reported so far
+        /// (<see cref="ChatStreamUpdate.ReasoningTokens"/>), for the turn's usage.</summary>
+        internal int ReasoningTokens => System.Threading.Volatile.Read(ref _reasoningTokens);
+
+        internal void AddReasoningTokens(int count)
+        {
+            if (count > 0) System.Threading.Interlocked.Add(ref _reasoningTokens, count);
+        }
+
         /// <summary>
         /// The single artifact that passed the routed completion contract. Until this is
         /// set, adapters must not expose files captured by guarded invocations: a partial

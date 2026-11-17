@@ -135,6 +135,10 @@ namespace TensorSharp.Server
         /// </summary>
         public IReadOnlyList<int> RawOutputTokens { get; init; }
 
+        /// <summary>How many of the generated tokens were reasoning (<see cref="ReasoningTokenCount"/>), for OpenAI's
+        /// <c>reasoning_tokens</c>. Terminal update only; a loop of several generations reports the sum.</summary>
+        public int ReasoningTokens { get; init; }
+
         /// <summary>
         /// Exact whitespace at the end of the prompt that preceded
         /// <see cref="RawOutputTokens"/>. The skills loop and tracked session history
@@ -1184,6 +1188,10 @@ namespace TensorSharp.Server
                 // Carried so the skills loop can splice this round back verbatim on its
                 // next render instead of re-tokenizing it. See RawOutputTokens.
                 RawOutputTokens = speechDriver != null ? null : generatedTokens,
+                // Read only when the reply reasoned at all: most replies pay nothing for it.
+                ReasoningTokens = speechDriver != null || string.IsNullOrEmpty(emittedTurn.Thinking) ? 0
+                    : ReasoningTokenCount.Count(arch, model.Tokenizer, generatedTokens, enableThinking, tools,
+                        announceSuffix ? recordedSuffix : null),
                 RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
                 RawGenerationSuffix = recordedSuffix,
                 SpeechFrames = speechDriver?.FrameCodes,

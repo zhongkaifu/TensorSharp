@@ -216,7 +216,7 @@ internal static class OpenAIResponseFactory
         {
             id = $"call_{Guid.NewGuid():N}"[..24],
             type = "function",
-            function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) },
+            function = new { name = tc.Name, arguments = ToolCallArgumentsJson.Serialize(tc.Arguments) },
         }).ToArray();
     }
 
@@ -233,7 +233,7 @@ internal static class OpenAIResponseFactory
             index = tc.Index,
             id = $"call_{Guid.NewGuid():N}"[..24],
             type = "function",
-            function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) },
+            function = new { name = tc.Name, arguments = ToolCallArgumentsJson.Serialize(tc.Arguments) },
         }).ToArray();
     }
 

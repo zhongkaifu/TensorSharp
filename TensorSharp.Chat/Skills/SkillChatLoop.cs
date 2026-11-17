@@ -175,6 +175,7 @@ namespace TensorSharp.Server.Skills
                     if (update.Done)
                     {
                         terminal = update;
+                        plan.AddReasoningTokens(update.ReasoningTokens);
                         continue;
                     }
                     if (update.RawGenerationSuffix != null)
@@ -294,7 +295,7 @@ namespace TensorSharp.Server.Skills
                         + ". Ask it to try a different approach, or rephrase the request.)_",
                         null, null);
                     // Quoted, so no UI should add the plain version on top of it.
-                    yield return Combine(terminal, promptTokens, evalTokens, reusedTokens, promptNs, evalNs, totalNs)
+                    yield return Combine(plan, terminal, promptTokens, evalTokens, reusedTokens, promptNs, evalNs, totalNs)
                         with { RepetitionExplained = true };
                     yield break;
                 }
@@ -381,7 +382,7 @@ namespace TensorSharp.Server.Skills
                         yield return ChatStreamUpdate.Parsed(string.Empty, null, clientCalls);
                     }
 
-                    yield return Combine(terminal, promptTokens, evalTokens, reusedTokens, promptNs, evalNs, totalNs);
+                    yield return Combine(plan, terminal, promptTokens, evalTokens, reusedTokens, promptNs, evalNs, totalNs);
                     yield break;
                 }
 
@@ -453,6 +454,7 @@ namespace TensorSharp.Server.Skills
                     yield return ChatStreamUpdate.Parsed(
                         DescribeCompletedArtifact(completedArtifact), null, null);
                     yield return Combine(
+                        plan,
                         terminal,
                         promptTokens, evalTokens, reusedTokens, promptNs, evalNs, totalNs,
                         finishReason: "stop");
@@ -524,6 +526,7 @@ namespace TensorSharp.Server.Skills
                 if (update.Done)
                 {
                     finalTerminal = update;
+                    plan.AddReasoningTokens(update.ReasoningTokens);
                     continue;
                 }
                 if (update.RawGenerationSuffix != null)
@@ -637,6 +640,7 @@ namespace TensorSharp.Server.Skills
             }
 
             yield return Combine(
+                plan,
                 finalTerminal,
                 promptTokens + finalTerminal.PromptTokens,
                 evalTokens + finalTerminal.EvalTokens,
@@ -772,6 +776,7 @@ namespace TensorSharp.Server.Skills
                 if (update.Done)
                 {
                     terminal = update;
+                    plan.AddReasoningTokens(update.ReasoningTokens);
                     continue;
                 }
                 if (update.RawGenerationSuffix != null)
@@ -871,6 +876,7 @@ namespace TensorSharp.Server.Skills
             // `final` already explains a loop, so no UI may add its own note even if
             // this reason is ever changed.
             yield return Combine(
+                plan,
                 terminal,
                 promptTokens + terminal.PromptTokens,
                 evalTokens + terminal.EvalTokens,
@@ -1527,6 +1533,7 @@ namespace TensorSharp.Server.Skills
         }
 
         private static ChatStreamUpdate Combine(
+            SkillRequestPlan plan,
             ChatStreamUpdate terminal,
             int promptTokens,
             int evalTokens,
@@ -1541,6 +1548,8 @@ namespace TensorSharp.Server.Skills
                 RawOutputTokens = terminal.RawOutputTokens,
                 RawPromptTrailingWhitespace = terminal.RawPromptTrailingWhitespace,
                     RawGenerationSuffix = terminal.RawGenerationSuffix,
+                // Every round's reasoning, as the other counts sum every round.
+                ReasoningTokens = plan.ReasoningTokens,
             };
 
         /// <summary>

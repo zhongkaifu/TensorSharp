@@ -487,6 +487,33 @@ public sealed class NemotronHThinkOffServingTests : IDisposable
         Assert.True(deltas.Count >= 10, $"{deltas.Count} output_text deltas: the reply was held");
     }
 
+    /// <summary>The Responses API's usage reports the reasoning the reply generated (it was always 0): the stray
+    /// reasoning and its close, one character a token here; streamed or not, through the adapter or the root loop.</summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task Lfm3_ResponsesUsage_CountsTheReasoningTokens(bool stream, bool loop)
+    {
+        string request = "{\"model\":\"probe.gguf\",\"input\":\"Name three.\",\"max_output_tokens\":900,\"stream\":"
+            + (stream ? "true" : "false") + LoopField(loop) + "}";
+        string body = await Invoke(Service(Lfm3StrayReply, lfm3: true), request, Options(skills: false),
+            async (svc, options, ctx) =>
+            {
+                using var store = new InMemoryResponsesStore();
+                await new OpenAIResponsesAdapter(svc, options, Uploads(), Registry(false), null, Workspaces(),
+                    NullLoggerFactory.Instance, store).CreateResponseAsync(ctx);
+            });
+        JsonElement response = stream
+            ? SseData(body).Last(d => d.TryGetProperty("type", out JsonElement t) && t.GetString() == "response.completed")
+                .GetProperty("response")
+            : JsonDocument.Parse(body).RootElement;
+        JsonElement usage = response.GetProperty("usage");
+        Assert.Equal("Brazil\nArgentina\nChile</think>".Length,
+            usage.GetProperty("output_tokens_details").GetProperty("reasoning_tokens").GetInt32());
+        Assert.True(usage.GetProperty("output_tokens").GetInt32() >= Lfm3StrayReply.Length);
+    }
+
     // ---------------------------------------------------------------- surfaces
 
     private Task<string> OpenAIChat(string script, bool stream, bool loop, string extra = "", bool lfm3 = false)
