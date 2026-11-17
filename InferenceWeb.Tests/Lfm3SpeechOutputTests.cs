@@ -276,6 +276,18 @@ public sealed class Lfm3SpeechOutputTests
     [MemberData(nameof(Variants))]
     public void Mlx(string variant) => CheckNetworks(Lane.Mlx, variant);
 
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [MemberData(nameof(Variants))]
+    public void GgmlCuda(string variant) => CheckNetworks(Lane.GgmlCuda, variant);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [MemberData(nameof(Variants))]
+    public void GgmlVulkan(string variant) => CheckNetworks(Lane.GgmlVulkan, variant);
+
+    [CudaTheory]
+    [MemberData(nameof(Variants))]
+    public void DirectCuda(string variant) => CheckNetworks(Lane.Cuda, variant);
+
     private static readonly bool[] s_codecLayers = { true, true, false, true, false };
 
     internal static Lfm3SpeechConfig SyntheticConfig()
@@ -382,7 +394,7 @@ public sealed class Lfm3SpeechOutputTests
         Lfm3SpeechConfig c = speech.Config;
         var reference = new HostReference(lane.Weights, c);
         // CPU block products quantize their activations to 8 bits; GGML metal / MLX products and attention round to F16.
-        double tol = variant == "q8_0" ? 6e-2 : laneKind is Lane.GgmlMetal or Lane.Mlx ? 1.5e-2 : variant == "f16" && laneKind == Lane.GgmlCpu ? 1e-2 : 2e-3;
+        double tol = variant == "q8_0" ? 6e-2 : laneKind == Lane.Mlx || HalfOperandLane(laneKind) ? 1.5e-2 : variant == "f16" && laneKind == Lane.GgmlCpu ? 1e-2 : 2e-3;
         var rng = new Random(23);
 
         // ---- depthformer: a frame's three passes (the projection kept between them), codes revealed 4 at a time ----
@@ -442,7 +454,12 @@ public sealed class Lfm3SpeechOutputTests
         {
             var pcm = new List<float>(whole.Decode(all));
             whole.Flush(pcm);
-            AssertClose(streamed, pcm.ToArray(), laneKind is Lane.GgmlMetal or Lane.Mlx ? 1e-2 : 1e-4, $"{laneKind}/{variant} codec whole vs streamed");
+            // A frame at a time and five at once run other GPU kernels (row counts): within F16-operand rounding on ggml-metal,
+            // MLX, ggml-vulkan and direct CUDA [direct CUDA f16 5.4e-4, A40]; ggml-cuda's Q8_0 products requantize each layer's
+            // activations (q8_1), so the two kernels' last bits flip 8-bit codes the codec's exp() amplifies [6.2e-2].
+            double streamedTolerance = variant == "q8_0" && laneKind == Lane.GgmlCuda ? 0.1
+                : laneKind == Lane.Mlx || laneKind == Lane.Cuda || HalfOperandLane(laneKind) ? 1e-2 : 1e-4;
+            AssertClose(streamed, pcm.ToArray(), streamedTolerance, $"{laneKind}/{variant} codec whole vs streamed");
         }
         _output.WriteLine($"{laneKind}/{variant}: depthformer max error / scale {worst:G3}; codec pcm {MaxRelative(expectedPcm, streamed):G3}");
 

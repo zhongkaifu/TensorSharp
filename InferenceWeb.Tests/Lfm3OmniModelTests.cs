@@ -32,6 +32,9 @@ public sealed class Lfm3OmniFactAttribute : FactAttribute, ITraitAttribute
             BackendType.Mlx => "Models,Mlx",
             BackendType.GgmlMetal => "Models,GgmlMetal",
             BackendType.GgmlCpu => "Models,GgmlCpu",
+            BackendType.GgmlCuda => "Models,GgmlCuda",
+            BackendType.GgmlVulkan => "Models,GgmlVulkan",
+            BackendType.Cuda => "Models,Cuda",
             _ => "Models",
         } + (video ? ",Video" : "");
         Skip = TestGates.ModelSkip(Lfm3OmniModelTests.ModelEnv, "lfm3-omni")
@@ -40,6 +43,7 @@ public sealed class Lfm3OmniFactAttribute : FactAttribute, ITraitAttribute
             {
                 BackendType.Mlx => TestGates.MlxSkip,
                 BackendType.Cpu => null,
+                BackendType.Cuda => TestGates.CudaSkip,
                 _ => TestGates.GgmlPinSkip(lane),
             };
     }
@@ -154,6 +158,9 @@ public sealed class Lfm3OmniModelTests : IDisposable
     // ================================================================ images and audio
 
     [Lfm3OmniFact(BackendType.GgmlMetal)] public void ImageAndAudio_FillTheTemplateSpans_GgmlMetal() => ImageAndAudio(BackendType.GgmlMetal);
+    [Lfm3OmniFact(BackendType.GgmlCuda)] public void ImageAndAudio_FillTheTemplateSpans_GgmlCuda() => ImageAndAudio(BackendType.GgmlCuda);
+    [Lfm3OmniFact(BackendType.GgmlVulkan)] public void ImageAndAudio_FillTheTemplateSpans_GgmlVulkan() => ImageAndAudio(BackendType.GgmlVulkan);
+    [Lfm3OmniFact(BackendType.Cuda)] public void ImageAndAudio_FillTheTemplateSpans_DirectCuda() => ImageAndAudio(BackendType.Cuda);
     [Lfm3OmniFact(BackendType.GgmlCpu)] public void ImageAndAudio_FillTheTemplateSpans_GgmlCpu() => ImageAndAudio(BackendType.GgmlCpu);
     [Lfm3OmniFact(BackendType.Mlx)] public void ImageAndAudio_FillTheTemplateSpans_Mlx() => ImageAndAudio(BackendType.Mlx);
     [Lfm3OmniFact(BackendType.Cpu)] public void ImageAndAudio_FillTheTemplateSpans_Cpu() => ImageAndAudio(BackendType.Cpu);
@@ -223,6 +230,9 @@ public sealed class Lfm3OmniModelTests : IDisposable
     // ================================================================ video
 
     [Lfm3OmniFact(BackendType.GgmlMetal, video: true)] public void VideoFile_IsLaidOutAsLlamaCppsMtmd_GgmlMetal() => VideoFileLayout(BackendType.GgmlMetal);
+    [Lfm3OmniFact(BackendType.GgmlCuda, video: true)] public void VideoFile_IsLaidOutAsLlamaCppsMtmd_GgmlCuda() => VideoFileLayout(BackendType.GgmlCuda);
+    [Lfm3OmniFact(BackendType.GgmlVulkan, video: true)] public void VideoFile_IsLaidOutAsLlamaCppsMtmd_GgmlVulkan() => VideoFileLayout(BackendType.GgmlVulkan);
+    [Lfm3OmniFact(BackendType.Cuda, video: true)] public void VideoFile_IsLaidOutAsLlamaCppsMtmd_DirectCuda() => VideoFileLayout(BackendType.Cuda);
     [Lfm3OmniFact(BackendType.Mlx, video: true)] public void VideoFile_IsLaidOutAsLlamaCppsMtmd_Mlx() => VideoFileLayout(BackendType.Mlx);
     [Lfm3OmniFact(BackendType.Cpu, video: true)] public void VideoFile_IsLaidOutAsLlamaCppsMtmd_Cpu() => VideoFileLayout(BackendType.Cpu);
 
@@ -267,6 +277,9 @@ public sealed class Lfm3OmniModelTests : IDisposable
     }
 
     [Lfm3OmniFact(BackendType.GgmlMetal)] public void VideoSoundtrack_FollowsEachFramePair_GgmlMetal() => VideoSoundtrack(BackendType.GgmlMetal);
+    [Lfm3OmniFact(BackendType.GgmlCuda)] public void VideoSoundtrack_FollowsEachFramePair_GgmlCuda() => VideoSoundtrack(BackendType.GgmlCuda);
+    [Lfm3OmniFact(BackendType.GgmlVulkan)] public void VideoSoundtrack_FollowsEachFramePair_GgmlVulkan() => VideoSoundtrack(BackendType.GgmlVulkan);
+    [Lfm3OmniFact(BackendType.Cuda)] public void VideoSoundtrack_FollowsEachFramePair_DirectCuda() => VideoSoundtrack(BackendType.Cuda);
     [Lfm3OmniFact(BackendType.Mlx)] public void VideoSoundtrack_FollowsEachFramePair_Mlx() => VideoSoundtrack(BackendType.Mlx);
 
     /// <summary>A clip with a soundtrack (ffmpeg: a 2.5 s test pattern at 30 fps with a tone): after each pair's
@@ -334,6 +347,9 @@ public sealed class Lfm3OmniModelTests : IDisposable
     }
 
     [Lfm3OmniFact(BackendType.GgmlMetal)] public void SampledFrames_PairByTheirTimes_GgmlMetal() => SampledFrames(BackendType.GgmlMetal);
+    [Lfm3OmniFact(BackendType.GgmlCuda)] public void SampledFrames_PairByTheirTimes_GgmlCuda() => SampledFrames(BackendType.GgmlCuda);
+    [Lfm3OmniFact(BackendType.GgmlVulkan)] public void SampledFrames_PairByTheirTimes_GgmlVulkan() => SampledFrames(BackendType.GgmlVulkan);
+    [Lfm3OmniFact(BackendType.Cuda)] public void SampledFrames_PairByTheirTimes_DirectCuda() => SampledFrames(BackendType.Cuda);
     [Lfm3OmniFact(BackendType.Cpu)] public void SampledFrames_PairByTheirTimes_Cpu() => SampledFrames(BackendType.Cpu);
 
     /// <summary>Frames a client sampled (timed, no file): consecutive frames up to 0.575 s apart share a pair labelled with
@@ -361,6 +377,9 @@ public sealed class Lfm3OmniModelTests : IDisposable
     // ================================================================ split encodes
 
     [Lfm3OmniFact(BackendType.GgmlMetal)] public void LargeImage_InParts_EqualsOneProgram_GgmlMetal() => LargeImageInParts(BackendType.GgmlMetal);
+    [Lfm3OmniFact(BackendType.GgmlCuda)] public void LargeImage_InParts_EqualsOneProgram_GgmlCuda() => LargeImageInParts(BackendType.GgmlCuda);
+    [Lfm3OmniFact(BackendType.GgmlVulkan)] public void LargeImage_InParts_EqualsOneProgram_GgmlVulkan() => LargeImageInParts(BackendType.GgmlVulkan);
+    [Lfm3OmniFact(BackendType.Cuda)] public void LargeImage_InParts_EqualsOneProgram_DirectCuda() => LargeImageInParts(BackendType.Cuda);
     [Lfm3OmniFact(BackendType.Mlx)] public void LargeImage_InParts_EqualsOneProgram_Mlx() => LargeImageInParts(BackendType.Mlx);
     [Lfm3OmniFact(BackendType.Cpu)] public void LargeImage_InParts_EqualsOneProgram_Cpu() => LargeImageInParts(BackendType.Cpu);
 
@@ -406,12 +425,16 @@ public sealed class Lfm3OmniModelTests : IDisposable
         }
         double rel = Math.Sqrt(num / den), cos = dot / Math.Sqrt(sa * sb);
         _output.WriteLine($"[{lane}] {whole.RowCount} rows, split in 4 vs one program: rel RMS {rel:E2}, cos {cos:F8}");
-        Assert.True(rel <= (lane == BackendType.Mlx ? 5e-3 : 1e-6), $"rel RMS {rel:E2}");
+        // Direct CUDA's products pick their kernels by row count (2.09e-3 between one program and four, A40), as MLX does.
+        Assert.True(rel <= (lane is BackendType.Mlx or BackendType.Cuda ? 5e-3 : 1e-6), $"rel RMS {rel:E2}");
     }
 
     // ================================================================ prefix reuse
 
     [Lfm3OmniFact(BackendType.GgmlMetal)] public Task PrefixReuse_FollowsTheSameImage_StopsAtAnotherOne_GgmlMetal() => PrefixReuse(BackendType.GgmlMetal);
+    [Lfm3OmniFact(BackendType.GgmlCuda)] public Task PrefixReuse_FollowsTheSameImage_StopsAtAnotherOne_GgmlCuda() => PrefixReuse(BackendType.GgmlCuda);
+    [Lfm3OmniFact(BackendType.GgmlVulkan)] public Task PrefixReuse_FollowsTheSameImage_StopsAtAnotherOne_GgmlVulkan() => PrefixReuse(BackendType.GgmlVulkan);
+    [Lfm3OmniFact(BackendType.Cuda)] public Task PrefixReuse_FollowsTheSameImage_StopsAtAnotherOne_DirectCuda() => PrefixReuse(BackendType.Cuda);
     [Lfm3OmniFact(BackendType.Mlx)] public Task PrefixReuse_FollowsTheSameImage_StopsAtAnotherOne_Mlx() => PrefixReuse(BackendType.Mlx);
 
     /// <summary>
@@ -509,6 +532,9 @@ public sealed class Lfm3OmniModelTests : IDisposable
     // ================================================================ encoder concurrency
 
     [Lfm3OmniFact(BackendType.GgmlMetal)] public void LongClips_EncodedConcurrently_WithGpuYields_DoNotDeadlock_GgmlMetal() => LongClips(BackendType.GgmlMetal);
+    [Lfm3OmniFact(BackendType.GgmlCuda)] public void LongClips_EncodedConcurrently_WithGpuYields_DoNotDeadlock_GgmlCuda() => LongClips(BackendType.GgmlCuda);
+    [Lfm3OmniFact(BackendType.GgmlVulkan)] public void LongClips_EncodedConcurrently_WithGpuYields_DoNotDeadlock_GgmlVulkan() => LongClips(BackendType.GgmlVulkan);
+    [Lfm3OmniFact(BackendType.Cuda)] public void LongClips_EncodedConcurrently_WithGpuYields_DoNotDeadlock_DirectCuda() => LongClips(BackendType.Cuda);
     [Lfm3OmniFact(BackendType.Cpu)] public void LongClips_EncodedConcurrently_WithGpuYields_DoNotDeadlock_Cpu() => LongClips(BackendType.Cpu);
 
     /// <summary>Two clips longer than one chunk, each encoded under the model's GPU lock and yielding it between chunks

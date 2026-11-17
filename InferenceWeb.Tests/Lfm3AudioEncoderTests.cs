@@ -32,7 +32,7 @@ namespace InferenceWeb.Tests;
 /// </summary>
 public sealed class Lfm3AudioEncoderTests
 {
-    public enum Lane { Managed, Reference, GgmlCpu, GgmlMetal, Mlx }
+    public enum Lane { Managed, Reference, GgmlCpu, GgmlMetal, Mlx, GgmlCuda, GgmlVulkan, Cuda }
 
     /// <summary>The tensor executor with none of a backend's kernels, on the CPU: the reference decompositions direct CUDA
     /// runs for the network ops it has no kernel of (TensorGraphExecutor.Network.cs), here with the products on the host.</summary>
@@ -52,9 +52,47 @@ public sealed class Lfm3AudioEncoderTests
         }
     }
 
+    private static GgmlBackendType GgmlBackendOf(Lane lane) => lane switch
+    {
+        Lane.GgmlMetal => GgmlBackendType.Metal,
+        Lane.GgmlCuda => GgmlBackendType.Cuda,
+        Lane.GgmlVulkan => GgmlBackendType.Vulkan,
+        _ => GgmlBackendType.Cpu,
+    };
+
+    private static BackendType GgmlLaneBackend(Lane lane) => lane switch
+    {
+        Lane.GgmlMetal => BackendType.GgmlMetal,
+        Lane.GgmlCuda => BackendType.GgmlCuda,
+        Lane.GgmlVulkan => BackendType.GgmlVulkan,
+        _ => BackendType.GgmlCpu,
+    };
+
     private readonly ITestOutputHelper _output;
 
     public Lfm3AudioEncoderTests(ITestOutputHelper output) => _output = output;
+
+    // The GPU lanes against llama.cpp's Metal rows (the fixture). ggml-cuda and direct CUDA quantize the activations of the
+    // Q8_0 mmproj's products (q8_1) as the CPU lanes do, with the CPU lanes' bounds (A40: min cosine 0.99957 / 0.99964, row
+    // norms 1.95% / 1.6%); ggml-vulkan takes F16 operands as ggml-metal does, a little further from it (0.99983, 1.25%). A
+    // frame window of 64 and the whole clip run other kernels: 1.9% (CUDA lanes), 0.48% (Vulkan).
+    [Lfm3AudioFact(Lane.GgmlCuda)]
+    public void GgmlCudaRowsMatchLlamaCpp() => Compare(Lane.GgmlCuda, Lfm3AudioSignals.Names, minCosine: 0.995, normTolerance: 3e-2);
+
+    [Lfm3AudioFact(Lane.GgmlVulkan)]
+    public void GgmlVulkanRowsMatchLlamaCpp() => Compare(Lane.GgmlVulkan, Lfm3AudioSignals.Names, minCosine: 0.9995, normTolerance: 2e-2);
+
+    [Lfm3AudioFact(Lane.Cuda)]
+    public void DirectCudaRowsMatchLlamaCpp() => Compare(Lane.Cuda, Lfm3AudioSignals.Names, minCosine: 0.995, normTolerance: 3e-2);
+
+    [Lfm3AudioFact(Lane.GgmlCuda)]
+    public void GgmlCudaChunkedAndStreamedRowsEqualTheWholeClip() => ChunkedAndStreamed(Lane.GgmlCuda, "speech_10s", 3e-2);
+
+    [Lfm3AudioFact(Lane.GgmlVulkan)]
+    public void GgmlVulkanChunkedAndStreamedRowsEqualTheWholeClip() => ChunkedAndStreamed(Lane.GgmlVulkan, "speech_10s", 1e-2);
+
+    [Lfm3AudioFact(Lane.Cuda)]
+    public void DirectCudaChunkedAndStreamedRowsEqualTheWholeClip() => ChunkedAndStreamed(Lane.Cuda, "speech_10s", 3e-2);
 
     /// <summary>The encoder on one lane's allocator.</summary>
     private sealed class LaneEncoder : IDisposable
@@ -81,9 +119,15 @@ public sealed class Lfm3AudioEncoderTests
                     _owner = mlx;
                     backend = BackendType.Mlx;
                     break;
+                case Lane.Cuda:
+                    var cuda = new TensorSharp.Cuda.CudaAllocator();
+                    allocator = cuda;
+                    _owner = cuda;
+                    backend = BackendType.Cuda;
+                    break;
                 default:
-                    allocator = new GgmlAllocator(new GgmlContext([0], lane == Lane.GgmlMetal ? GgmlBackendType.Metal : GgmlBackendType.Cpu), 0);
-                    backend = lane == Lane.GgmlMetal ? BackendType.GgmlMetal : BackendType.GgmlCpu;
+                    allocator = new GgmlAllocator(new GgmlContext([0], GgmlBackendOf(lane)), 0);
+                    backend = GgmlLaneBackend(lane);
                     _ggml = true;
                     break;
             }
@@ -96,8 +140,9 @@ public sealed class Lfm3AudioEncoderTests
                 case Lane.Managed: Assert.IsType<ManagedGraphExecutor>(Encoder.Executor); break;
                 case Lane.Reference: Assert.IsType<ReferenceExecutor>(Encoder.Executor); break;
                 case Lane.Mlx: Assert.IsType<MlxGraphExecutor>(Encoder.Executor); break;
+                case Lane.Cuda: Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(Encoder.Executor); break;
                 default:
-                    Assert.Equal(lane == Lane.GgmlMetal ? GgmlBackendType.Metal : GgmlBackendType.Cpu, Assert.IsType<GgmlGraphExecutor>(Encoder.Executor).Backend);
+                    Assert.Equal(GgmlBackendOf(lane), Assert.IsType<GgmlGraphExecutor>(Encoder.Executor).Backend);
                     break;
             }
         }
@@ -378,6 +423,18 @@ public sealed class Lfm3AudioFactAttribute : FactAttribute, ITraitAttribute
             case Lfm3AudioEncoderTests.Lane.GgmlMetal:
                 Skip ??= TestGates.GgmlPinSkip(BackendType.GgmlMetal);
                 RequiresValue = "Models";
+                break;
+            case Lfm3AudioEncoderTests.Lane.GgmlCuda:
+                Skip ??= TestGates.GgmlPinSkip(BackendType.GgmlCuda);
+                RequiresValue = "Models";
+                break;
+            case Lfm3AudioEncoderTests.Lane.GgmlVulkan:
+                Skip ??= TestGates.GgmlPinSkip(BackendType.GgmlVulkan);
+                RequiresValue = "Models";
+                break;
+            case Lfm3AudioEncoderTests.Lane.Cuda:
+                Skip ??= TestGates.CudaSkip;
+                RequiresValue = "Models,Cuda";
                 break;
             default:
                 RequiresValue = "Models";

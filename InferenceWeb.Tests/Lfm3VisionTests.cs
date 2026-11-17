@@ -45,6 +45,7 @@ public sealed class Lfm3VisionFactAttribute : FactAttribute, ITraitAttribute
             Lfm3VisionTests.Lane.GgmlMetal => "Models,GgmlMetal",
             Lfm3VisionTests.Lane.GgmlCpu => "Models,GgmlCpu",
             Lfm3VisionTests.Lane.GgmlCuda => "Models,GgmlCuda",
+            Lfm3VisionTests.Lane.GgmlVulkan => "Models,GgmlVulkan",
             _ => "Models",
         };
         Skip = TestGates.ModelSkip("TS_LFM3_MMPROJ")
@@ -56,6 +57,7 @@ public sealed class Lfm3VisionFactAttribute : FactAttribute, ITraitAttribute
                 Lfm3VisionTests.Lane.GgmlMetal => TestGates.GgmlPinSkip(BackendType.GgmlMetal),
                 Lfm3VisionTests.Lane.GgmlCpu => TestGates.GgmlPinSkip(BackendType.GgmlCpu),
                 Lfm3VisionTests.Lane.GgmlCuda => TestGates.GgmlPinSkip(BackendType.GgmlCuda),
+                Lfm3VisionTests.Lane.GgmlVulkan => TestGates.GgmlPinSkip(BackendType.GgmlVulkan),
                 _ => null,
             };
     }
@@ -70,7 +72,7 @@ public sealed class Lfm3VisionFactAttribute : FactAttribute, ITraitAttribute
 /// </summary>
 public sealed class Lfm3VisionTests
 {
-    public enum Lane { Managed, Reference, GgmlCpu, GgmlMetal, Mlx, Cuda, GgmlCuda }
+    public enum Lane { Managed, Reference, GgmlCpu, GgmlMetal, Mlx, Cuda, GgmlCuda, GgmlVulkan }
 
     private readonly ITestOutputHelper _output;
 
@@ -443,9 +445,17 @@ public sealed class Lfm3VisionTests
                     backend = BackendType.Cuda;
                     break;
                 default:
-                    GgmlBackendType g = lane switch { Lane.GgmlMetal => GgmlBackendType.Metal, Lane.GgmlCuda => GgmlBackendType.Cuda, _ => GgmlBackendType.Cpu };
+                    GgmlBackendType g = lane switch
+                    {
+                        Lane.GgmlMetal => GgmlBackendType.Metal, Lane.GgmlCuda => GgmlBackendType.Cuda, Lane.GgmlVulkan => GgmlBackendType.Vulkan,
+                        _ => GgmlBackendType.Cpu,
+                    };
                     allocator = new GgmlAllocator(new GgmlContext([0], g), 0);
-                    backend = lane switch { Lane.GgmlMetal => BackendType.GgmlMetal, Lane.GgmlCuda => BackendType.GgmlCuda, _ => BackendType.GgmlCpu };
+                    backend = lane switch
+                    {
+                        Lane.GgmlMetal => BackendType.GgmlMetal, Lane.GgmlCuda => BackendType.GgmlCuda, Lane.GgmlVulkan => BackendType.GgmlVulkan,
+                        _ => BackendType.GgmlCpu,
+                    };
                     _ggml = true;
                     break;
             }
@@ -566,6 +576,11 @@ public sealed class Lfm3VisionTests
     {
         using var lanes = new LaneEncoder(lane);
         bool cpuBlocks = lanes.MmprojType == "Q8_0" && lane is Lane.Managed or Lane.Reference or Lane.GgmlCpu;
+        // The fixture is llama.cpp's Metal run; llama.cpp's own CUDA run of the same mmproj sits up to cos 0.99640 / 5.9% rel
+        // RMS from it (the 3000 x 4000 'cap' case; q8_1 activations in its Q8_0 products), its Vulkan run 0.99981 / 1.3%
+        // (A40, llama.cpp d3c3e242c, eng/lfm3/vision-reference.sh): the GPU lanes are held to those distances.
+        bool cuda = lanes.MmprojType == "Q8_0" && lane is Lane.GgmlCuda or Lane.Cuda;
+        bool vulkan = lane == Lane.GgmlVulkan;
         var failures = new List<string>();
         foreach (string name in names)
         {
@@ -577,7 +592,12 @@ public sealed class Lfm3VisionTests
             Console.WriteLine(line);
             // measured (M5 Pro, llama.cpp d3c3e242c): ggml-metal cos >= 0.99998, rel RMS <= 0.18%; MLX >= 0.99993, <= 0.72%;
             // F16 on the CPUs <= 0.22%; Q8_0 on the CPUs >= 0.9988, <= 2.2% (8-bit activations in the block products)
-            bool ok = cpuBlocks
+            // A40: ggml-cuda cos >= 0.99733, rel RMS <= 5.2%; direct CUDA >= 0.99741, <= 2.7%; ggml-vulkan >= 0.99970, <= 1.4%.
+            bool ok = cuda
+                ? a.MinCos >= 0.996 && a.RelRms <= 0.06 && a.MeanDiff <= 0.002 && Math.Abs(a.RmsRatio - 1) <= 0.006
+                : vulkan
+                ? a.MinCos >= 0.9995 && a.RelRms <= 0.02 && a.MeanDiff <= 0.001 && Math.Abs(a.RmsRatio - 1) <= 0.003
+                : cpuBlocks
                 ? a.MinCos >= 0.998 && a.RelRms <= 0.04 && a.MeanDiff <= 0.002 && Math.Abs(a.RmsRatio - 1) <= 0.006
                 : a.MinCos >= 0.9999 && a.RelRms <= 0.01 && a.MeanDiff <= 0.001 && Math.Abs(a.RmsRatio - 1) <= 0.003;
             if (!ok) failures.Add(line);
@@ -609,6 +629,9 @@ public sealed class Lfm3VisionTests
 
     [Lfm3VisionFact(Lane.GgmlCuda)]
     public void GgmlCudaMatchesLlamaCpp() => TowerMatchesLlamaCpp(Lane.GgmlCuda, AllCases);
+
+    [Lfm3VisionFact(Lane.GgmlVulkan)]
+    public void GgmlVulkanMatchesLlamaCpp() => TowerMatchesLlamaCpp(Lane.GgmlVulkan, AllCases);
 
     /// <summary>Attention split into query pieces (the managed CPU's and direct CUDA's bound on score memory) gives the rows
     /// of one piece.</summary>

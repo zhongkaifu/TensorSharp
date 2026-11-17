@@ -61,6 +61,16 @@ public sealed class Lfm3SpeechRealWeightsTests
     [Lfm3SpeechMlxFact]
     public void MlxMatchesLlamaCpp() => Compare(Lane.Mlx, codecFrames: int.MaxValue);
 
+    /// <summary>The GPU lanes over the whole utterance, against llama.cpp's Metal run (the fixture).</summary>
+    [ModelFact("TS_LFM3_MMPROJ", GgmlBackend = BackendType.GgmlCuda)]
+    public void GgmlCudaMatchesLlamaCpp() => Compare(Lane.GgmlCuda, codecFrames: int.MaxValue);
+
+    [ModelFact("TS_LFM3_MMPROJ", GgmlBackend = BackendType.GgmlVulkan)]
+    public void GgmlVulkanMatchesLlamaCpp() => Compare(Lane.GgmlVulkan, codecFrames: int.MaxValue);
+
+    [CudaFact("TS_LFM3_MMPROJ")]
+    public void DirectCudaMatchesLlamaCpp() => Compare(Lane.Cuda, codecFrames: int.MaxValue);
+
     /// <summary>Per-frame time on ggml-metal (one frame = 80 ms of audio): the sampler's three depthformer passes, the
     /// feedback row and the codec's frame (graph + host ISTFT), against llama.cpp's medians of the same pieces on the same
     /// Mac (the fixture's timing_ms; llama.cpp computes every codebook's logits and the projection in each pass).</summary>
@@ -74,6 +84,11 @@ public sealed class Lfm3SpeechRealWeightsTests
     {
         string path = Environment.GetEnvironmentVariable("TS_LFM3_MMPROJ");
         var gguf = new GgufFile(path);
+        // llama.cpp's run on this machine's GPU (eng/lfm3/speech-ref.sh's fixture.json, the same mmproj): the GPU lanes then
+        // compare with llama.cpp on the same device and backend family instead of its Metal run.
+        string local = Environment.GetEnvironmentVariable("TS_LFM3_SPEECH_FIXTURE");
+        if (!string.IsNullOrEmpty(local))
+            return (gguf, JsonDocument.Parse(File.ReadAllText(local)).RootElement.Clone(), Path.GetFileName(Path.GetDirectoryName(Path.GetFullPath(local))) + "/" + Path.GetFileName(local));
         GgmlTensorType type = gguf.Tensors["a.gen.code.proj_in.weight"].Type;
         string name = type switch
         {
@@ -216,14 +231,19 @@ public sealed class Lfm3SpeechRealWeightsTests
             // equal llama.cpp's Metal run bit for bit [0], its PCM within float rounding [~122 dB]. MLX rounds products through
             // F16 operands [1-2e-3, 53-60 dB]. The CPU lanes match an F16 mmproj closely [4e-4, 113 dB] and quantize the
             // activations of Q8_0 products to 8 bits (as ggml-cpu does) [2e-2, 33 dB] where llama.cpp's reference ran on Metal.
-            bool q8 = fixtureName.Contains("q8_0");
+            // A40, against the Metal fixture: ggml-vulkan as MLX [4.7e-3, 0.039]; ggml-cuda and direct CUDA quantize Q8_0
+            // products' activations (q8_1) as the CPU lanes do [2.0-2.5e-2, lse 0.13-0.18, 30.6-31.2 dB, codes 35-37 of 48].
+            bool q8 = gguf.Tensors["a.gen.code.proj_in.weight"].Type == GgmlTensorType.Q8_0;
+            bool q8Activations = laneKind is Lane.Managed or Lane.GgmlCpu or Lane.GgmlCuda or Lane.Cuda;
             (double logit, double lse, double minSnr) = laneKind switch
             {
                 Lane.GgmlMetal => (2e-3, 0.02, 60.0),
-                Lane.Mlx => (5e-3, 0.05, 40.0),
-                _ => q8 ? (8e-2, 0.3, 25.0) : (2e-3, 0.02, 60.0),
+                Lane.Mlx or Lane.GgmlVulkan => (5e-3, 0.05, 40.0),
+                _ when q8Activations && q8 => (8e-2, 0.3, 25.0),
+                Lane.GgmlCuda or Lane.Cuda => (5e-3, 0.05, 40.0),
+                _ => (2e-3, 0.02, 60.0),
             };
-            bool cpu = laneKind is Lane.Managed or Lane.GgmlCpu;
+            bool cpu = q8Activations;
             Assert.True(worstSample <= logit, line);
             Assert.True(worstLse <= lse, line);
             Assert.True(top1 >= logitRows - (cpu && q8 ? 4 : 1), line);

@@ -63,12 +63,33 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
         return model;
     }
 
+    /// <summary>The backend name the server and CLI take for <paramref name="backend"/>.</summary>
+    private static string BackendName(BackendType backend) => backend switch
+    {
+        BackendType.GgmlMetal => "ggml_metal",
+        BackendType.GgmlCuda => "ggml_cuda",
+        BackendType.GgmlVulkan => "ggml_vulkan",
+        BackendType.Cuda => "cuda",
+        _ => throw new ArgumentOutOfRangeException(nameof(backend)),
+    };
+
     /// <summary>The TTS prompt is llama.cpp's (46 tokens for the reference text), the synthesis ends at the end-of-speech frame,
     /// and with llama-tts's seed its PCM16 equals llama-tts's WAV where the LM's hidden rows let the same codes be drawn.</summary>
     [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlMetal)]
-    public void SynthesisOnGgmlMetalReproducesLlamaTts()
+    public void SynthesisOnGgmlMetalReproducesLlamaTts() => SynthesisReproducesLlamaTts(BackendType.GgmlMetal);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlCuda)]
+    public void SynthesisOnGgmlCudaReproducesLlamaTts() => SynthesisReproducesLlamaTts(BackendType.GgmlCuda);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlVulkan)]
+    public void SynthesisOnGgmlVulkanReproducesLlamaTts() => SynthesisReproducesLlamaTts(BackendType.GgmlVulkan);
+
+    [CudaFact(ModelEnv)]
+    public void SynthesisOnDirectCudaReproducesLlamaTts() => SynthesisReproducesLlamaTts(BackendType.Cuda);
+
+    private void SynthesisReproducesLlamaTts(BackendType backend)
     {
-        using Lfm3RuntimeModel model = LoadOmni(BackendType.GgmlMetal);
+        using Lfm3RuntimeModel model = LoadOmni(backend);
         Assert.True(model.HasSpeechOutput, model.SpeechOutputUnavailableReason);
         List<int> prompt = model.SpeechSynthesisPrompt(ReferenceText, "en", "female");
         _output.WriteLine($"prompt {prompt.Count} tokens");
@@ -88,7 +109,7 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
         Assert.Equal(1440, chunks[0]);
         string outDir = Path.Combine(Lfm3AudioFrontEndTests.RepoRoot(), "artifacts", "lfm3", "speech-int");
         Directory.CreateDirectory(outDir);
-        File.WriteAllBytes(Path.Combine(outDir, "ts-standalone-en1.wav"), Lfm3SpeechAudio.Wav(pcm, 24000));
+        File.WriteAllBytes(Path.Combine(outDir, $"ts-standalone-en1-{BackendName(backend)}.wav"), Lfm3SpeechAudio.Wav(pcm, 24000));
         string reference = Environment.GetEnvironmentVariable("TS_LFM3_TTS_REFERENCE");
         if (!string.IsNullOrEmpty(reference) && File.Exists(reference))
         {
@@ -110,14 +131,21 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
     /// 1234): the WAV is llama-tts's to 1 LSB and ends at the same end-of-speech frame. The LM is the only part of the
     /// integrated TTS this leaves out; its rows sit 2-7e-4 (relative L2) from llama.cpp's on ggml-metal.
     /// </summary>
+    /// <remarks>ggml-metal only: there TensorSharp's depthformer computes llama.cpp's Metal logits bit for bit, so the same
+    /// codes are drawn. On an A40 the codec matches llama.cpp's CUDA run to 136 dB and the depthformer to 4.3e-3 (rms rel) on
+    /// ggml-cuda, but llama.cpp's CUDA run draws codes no lane of TensorSharp's sampler reproduces from its own hidden rows
+    /// (5 of 48, the managed CPU lane included), so its WAV is not a bit-exact target there; eng/lfm3/speech-asr.py checks
+    /// the GPU lanes' speech instead.</remarks>
     [Lfm3SpeechReferenceFact]
-    public void TheDriverOnLlamaCppHiddenRowsReproducesLlamaTts()
+    public void TheDriverOnLlamaCppHiddenRowsReproducesLlamaTts() => DriverReproducesLlamaTts(BackendType.GgmlMetal);
+
+    private void DriverReproducesLlamaTts(BackendType backend)
     {
         string refDir = Environment.GetEnvironmentVariable("TS_LFM3_SPEECH_REF")!;
         byte[] raw = File.ReadAllBytes(Path.Combine(refDir, "hidden.f32"));
         var rows = new float[raw.Length / 4];
         Buffer.BlockCopy(raw, 0, rows, 0, raw.Length);
-        using Lfm3RuntimeModel model = LoadOmni(BackendType.GgmlMetal);
+        using Lfm3RuntimeModel model = LoadOmni(backend);
         int width = model.Config.HiddenSize, frames = rows.Length / width;
         List<int> prompt = model.SpeechSynthesisPrompt(ReferenceText, "en", "female");
         using SpeechReplyDriver driver = model.CreateSpeechDriver(prompt, new SpeechReplyOptions { Synthesis = true, Seed = 1234 });
@@ -143,7 +171,7 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
             if (d > 0) differ++;
             worst = Math.Max(worst, d);
         }
-        _output.WriteLine($"end of speech at frame {f} of {frames} rows; {ours.Length / 2} vs {theirs.Length / 2} samples; {differ} differ, max {worst} LSB");
+        _output.WriteLine($"{backend}: end of speech at frame {f} of {frames} rows; {ours.Length / 2} vs {theirs.Length / 2} samples; {differ} differ, max {worst} LSB");
         Assert.Equal(frames - 1, f);
         Assert.Equal(theirs.Length, ours.Length);
         Assert.True(worst <= 1, $"{differ} samples differ, by up to {worst} LSB");
@@ -156,7 +184,18 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
     /// id renders it as its transcript.
     /// </summary>
     [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlMetal)]
-    public async Task ChatCompletionsSpeakThroughTheServerAdapter()
+    public Task ChatCompletionsSpeakThroughTheServerAdapter() => ChatCompletionsSpeak(BackendType.GgmlMetal);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlCuda)]
+    public Task ChatCompletionsSpeakThroughTheServerAdapterOnGgmlCuda() => ChatCompletionsSpeak(BackendType.GgmlCuda);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlVulkan)]
+    public Task ChatCompletionsSpeakThroughTheServerAdapterOnGgmlVulkan() => ChatCompletionsSpeak(BackendType.GgmlVulkan);
+
+    [CudaFact(ModelEnv)]
+    public Task ChatCompletionsSpeakThroughTheServerAdapterOnDirectCuda() => ChatCompletionsSpeak(BackendType.Cuda);
+
+    private async Task ChatCompletionsSpeak(BackendType backend)
     {
         string dir = Environment.GetEnvironmentVariable(ModelEnv)!;
         string lm = Path.Combine(dir, "LFM3-Omni-2B-Q8_0.gguf"), mmproj = Path.Combine(dir, "mmproj-LFM3-Omni-2B-Q8_0.gguf");
@@ -165,9 +204,9 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
         try
         {
             using var service = new ModelService();
-            service.LoadModel(lm, mmproj, "ggml_metal");
+            service.LoadModel(lm, mmproj, BackendName(backend));
             Assert.True(service.HasSpeechOutput);
-            ServerHostingOptions options = ServerOptionsBuilder.Build(new[] { "--model", lm, "--mmproj", mmproj, "--backend", "ggml_metal", "--no-skills" }, root);
+            ServerHostingOptions options = ServerOptionsBuilder.Build(new[] { "--model", lm, "--mmproj", mmproj, "--backend", BackendName(backend), "--no-skills" }, root);
             var adapter = new OpenAIChatAdapter(service, options, new UploadStoragePolicy(Path.Combine(root, "uploads")),
                 new SkillRegistry(new SkillRegistryOptions { Roots = Array.Empty<string>() }), null,
                 new SessionWorkspaceManager(Path.Combine(root, "workspaces")), NullLoggerFactory.Instance);
@@ -279,13 +318,24 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
     /// <summary>A TTS reply served by the engine (a driven request on the unified runtime) is the reply the standalone
     /// synthesis makes: the same prompt chunk and one-row steps, so the same hidden rows, codes and PCM, bit for bit.</summary>
     [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlMetal)]
-    public async Task EngineSynthesisEqualsTheStandaloneSynthesis()
+    public Task EngineSynthesisEqualsTheStandaloneSynthesis() => EngineSynthesisEqualsStandalone(BackendType.GgmlMetal);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlCuda)]
+    public Task EngineSynthesisEqualsTheStandaloneSynthesisOnGgmlCuda() => EngineSynthesisEqualsStandalone(BackendType.GgmlCuda);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlVulkan)]
+    public Task EngineSynthesisEqualsTheStandaloneSynthesisOnGgmlVulkan() => EngineSynthesisEqualsStandalone(BackendType.GgmlVulkan);
+
+    [CudaFact(ModelEnv)]
+    public Task EngineSynthesisEqualsTheStandaloneSynthesisOnDirectCuda() => EngineSynthesisEqualsStandalone(BackendType.Cuda);
+
+    private async Task EngineSynthesisEqualsStandalone(BackendType backend)
     {
-        using Lfm3RuntimeModel model = LoadOmni(BackendType.GgmlMetal);
+        using Lfm3RuntimeModel model = LoadOmni(backend);
         float[] alone = model.Synthesize(ReferenceText, new SpeechSynthesisOptions { Voice = "female", Language = "en", Seed = 1234 }).Channels[0];
         using var engine = new InferenceEngine(model, EngineConfig(), NullLogger.Instance);
         var (pcm, firstMs, frames, finish) = await SpeakOnEngine(engine, model, ReferenceText, "en", "female", 1234).WaitAsync(TimeSpan.FromMinutes(5));
-        _output.WriteLine($"engine: {frames} frame rows, {pcm.Length} samples, first audio {firstMs:F0} ms, finish {finish}; standalone {alone.Length} samples");
+        _output.WriteLine($"{backend} engine: {frames} frame rows, {pcm.Length} samples, first audio {firstMs:F0} ms, finish {finish}; standalone {alone.Length} samples");
         Assert.Equal("eos", finish);
         Assert.Equal(alone.Length, pcm.Length);
         Assert.Equal(Lfm3SpeechAudio.Pcm16(alone), Lfm3SpeechAudio.Pcm16(pcm));
@@ -294,9 +344,20 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
     /// <summary>A text request served while a TTS reply speaks on the same engine (their steps batched) keeps working: its
     /// greedy reply is the one it gets alone, and the speech is complete.</summary>
     [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlMetal)]
-    public async Task ATextRequestDuringSynthesisKeepsItsReply()
+    public Task ATextRequestDuringSynthesisKeepsItsReply() => TextRequestDuringSynthesis(BackendType.GgmlMetal);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlCuda)]
+    public Task ATextRequestDuringSynthesisKeepsItsReplyOnGgmlCuda() => TextRequestDuringSynthesis(BackendType.GgmlCuda);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlVulkan)]
+    public Task ATextRequestDuringSynthesisKeepsItsReplyOnGgmlVulkan() => TextRequestDuringSynthesis(BackendType.GgmlVulkan);
+
+    [CudaFact(ModelEnv)]
+    public Task ATextRequestDuringSynthesisKeepsItsReplyOnDirectCuda() => TextRequestDuringSynthesis(BackendType.Cuda);
+
+    private async Task TextRequestDuringSynthesis(BackendType backend)
     {
-        using Lfm3RuntimeModel model = LoadOmni(BackendType.GgmlMetal);
+        using Lfm3RuntimeModel model = LoadOmni(backend);
         List<int> textPrompt = model.Tokenizer.Encode(
             "<|startoftext|><|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n<think></think>", addSpecial: false);
         const int replyTokens = 40;
