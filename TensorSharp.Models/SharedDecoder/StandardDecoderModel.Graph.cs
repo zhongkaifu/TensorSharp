@@ -3008,13 +3008,15 @@ namespace TensorSharp.Models
             }
 
             /// <summary>Whether a sliding-window mask of this step closes cells inside its window: rows that attend from past the
-            /// window's first cell, whose lower bound a recorded step would replay stale (<see cref="BandMask"/>).</summary>
+            /// window's first cell, whose lower bound a recorded step would replay stale (<see cref="BandMask"/>). The floors
+            /// rise by one a row, so the step's last row decides: a verify window recorded below the band whose last rows
+            /// cross it would otherwise replay their floor as the first row's.</summary>
             internal bool SlidingFloorInWindow
             {
                 get
                 {
                     foreach (InputMeta m in _inputMeta)
-                        if (m.Kind == InputKind.DecodeMask && m.Band > 0 && m.Start - m.Band + 1 > m.Offset) return true;
+                        if (m.Kind == InputKind.DecodeMask && m.Band > 0 && m.Start + m.Count - m.Band > m.Offset) return true;
                     return false;
                 }
             }
