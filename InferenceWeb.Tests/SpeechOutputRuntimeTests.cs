@@ -38,9 +38,11 @@ public sealed class SpeechOutputRuntimeTests : IDisposable
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-speech-runtime-" + Guid.NewGuid().ToString("N"));
     private readonly KvCacheDtype _dtype;
     private readonly bool _dtypeExplicit;
+    private readonly Xunit.Abstractions.ITestOutputHelper _output;
 
-    public SpeechOutputRuntimeTests()
+    public SpeechOutputRuntimeTests(Xunit.Abstractions.ITestOutputHelper output)
     {
+        _output = output;
         Directory.CreateDirectory(_dir);
         (_dtype, _dtypeExplicit) = (KvCacheDtypeConfig.Current, KvCacheDtypeConfig.IsExplicitlySet);
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
@@ -75,6 +77,56 @@ public sealed class SpeechOutputRuntimeTests : IDisposable
 
     [MlxFact]
     public void RowIoOnMlx() => CheckRowIo(BackendType.Mlx, true, 5e-3);
+
+    [CudaTheory]
+    [MemberData(nameof(Paths))]
+    public void RowIoOnDirectCuda(bool graphs) => CheckRowIo(BackendType.Cuda, graphs, 5e-3);
+
+    /// <summary>
+    /// Head-free steps of embedding rows (speech frames: the input an embedding row, the output the final hidden row, no head)
+    /// advance in place and, on direct CUDA, record and replay as text decode steps do: the hidden rows, each step's input the
+    /// previous step's output rescaled (the frames' feedback chain), are the traced steps' bit for bit. With sliding-window
+    /// layers the steps record below the band and run as plans past it; without them every advanced step replays.
+    /// </summary>
+    [CudaTheory]
+    [InlineData("csfcsfsc")]
+    [InlineData("cfcfcf")]
+    public void HeadFreeRowStepsRecordAndReplayOnDirectCuda(string layout)
+    {
+        string path = new Lfm3SyntheticModelBuilder { WeightType = SyntheticGguf.GgmlType.F32, Layout = layout }
+            .Write(Path.Combine(_dir, $"lfm3-rows-{layout}.gguf"));
+        int[] prompt = { 41, 52 };
+        const int Steps = 24;
+        (List<float[]> Rows, int Recordings, int Replays, int Advances) Run(bool advance)
+        {
+            using var model = new Lfm3RuntimeModel(path, BackendType.Cuda) { DecodeAdvanceDisabled = !advance };
+            IUnifiedBatchModel unified = model;
+            int hidden = model.Config.HiddenSize;
+            unified.EnsureSequenceSlot("s", prompt.Length + Steps + 8);
+            var h = new float[hidden];
+            Assert.True(unified.TryForwardUnifiedRows(new[] { "s" }, new[] { prompt }, new[] { 0 }, new float[1][], new[] { false },
+                new float[1][], new[] { h }));
+            var rows = new List<float[]> { (float[])h.Clone() };
+            for (int t = 0; t < Steps; t++)
+            {
+                float[] input = h.Select(v => v * 0.5f).ToArray();
+                var logits = new float[1][];
+                Assert.True(unified.TryForwardUnifiedRows(new[] { "s" }, new[] { new[] { 0 } }, new[] { prompt.Length + t }, new[] { input },
+                    new[] { false }, logits, new[] { h }));
+                Assert.Null(logits[0]);
+                rows.Add((float[])h.Clone());
+            }
+            return (rows, model.DecodeRecordings, model.RecordedDecodeReplays, model.DecodeAdvances);
+        }
+        var traced = Run(advance: false);
+        var advanced = Run(advance: true);
+        _output.WriteLine($"{layout}: {advanced.Advances} advances, {advanced.Recordings} recordings, {advanced.Replays} replays");
+        Assert.Equal(0, traced.Advances);
+        Assert.True(advanced.Recordings >= 1 && advanced.Replays >= 3, $"{advanced.Recordings} recordings, {advanced.Replays} replays");
+        if (!layout.Contains('s')) Assert.Equal(Steps - 2, advanced.Replays);
+        for (int i = 0; i < traced.Rows.Count; i++)
+            Assert.True(traced.Rows[i].AsSpan().SequenceEqual(advanced.Rows[i]), $"{layout} step {i}: the hidden row moved");
+    }
 
     private void CheckRowIo(BackendType backend, bool graphs, double tolerance)
     {
@@ -399,8 +451,10 @@ public sealed class SpeechOutputRuntimeTests : IDisposable
     public Task EngineSpeechOnTheManagedCpu() => CheckEngineSpeech(Lane.Managed, BackendType.Cpu);
 
     [Fact]
-    public Task EngineSpeechOnThePinnedGgmlBackend()
-        => CheckEngineSpeech(TestGates.PinnedGgmlBackend == BackendType.GgmlMetal ? Lane.GgmlMetal : Lane.GgmlCpu, TestGates.PinnedGgmlBackend);
+    public Task EngineSpeechOnThePinnedGgmlBackend() => CheckEngineSpeech(PinnedGgmlLane, TestGates.PinnedGgmlBackend);
+
+    [CudaFact]
+    public Task EngineSpeechOnDirectCuda() => CheckEngineSpeech(Lane.Cuda, BackendType.Cuda);
 
     [MlxFact]
     public Task EngineSpeechOnMlx() => CheckEngineSpeech(Lane.Mlx, BackendType.Mlx);
