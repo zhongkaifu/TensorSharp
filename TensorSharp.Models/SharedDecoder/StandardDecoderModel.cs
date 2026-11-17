@@ -673,8 +673,10 @@ namespace TensorSharp.Models
                 _draftCarry = active.DraftCarry;
 
                 float[][] graphLogits = null;
+                // A driven request's media prompt also returns its last final hidden row (ForwardUnifiedMediaRows).
+                float[][] lastHidden = wantLogits && _promptHiddenOut != null ? new[] { _promptHiddenOut } : null;
                 if (RunFollowingDFlash(ref dflash, plan => TryRunGraph(hidden, new[] { active }, new[] { 0 }, new[] { seqLen }, new[] { start },
-                        wantLogits, out graphLogits, positions.Table, follow, draftRows, plan)))
+                        wantLogits, out graphLogits, lastHidden, positions.Table, follow, draftRows, plan)))
                 {
                     hidden.Dispose();
                     _cacheDeviceDirty = true;
@@ -693,7 +695,7 @@ namespace TensorSharp.Models
                 hidden = RunLayers(hidden, positions, batch: null);
                 float[] logits = null;
                 if (wantLogits)
-                    logits = ProjectRows(hidden, new[] { seqLen - 1 });
+                    logits = ProjectRows(hidden, new[] { seqLen - 1 }, wantLogits: true, lastHidden);
                 hidden.Dispose();
                 _cacheSeqLen += seqLen;
                 return logits;
@@ -789,7 +791,12 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Final norm and LM head for <paramref name="rows"/> of <paramref name="hidden"/>.</summary>
-        private float[] ProjectRows(Tensor hidden, int[] rows)
+        private float[] ProjectRows(Tensor hidden, int[] rows) => ProjectRows(hidden, rows, wantLogits: true, lastHidden: null);
+
+        /// <summary>The final norm of <paramref name="rows"/> of <paramref name="hidden"/>, then the head (with
+        /// <paramref name="wantLogits"/>; null without); row i's normed values go to <paramref name="lastHidden"/>[i] where it
+        /// is set (a step driver's input).</summary>
+        private float[] ProjectRows(Tensor hidden, int[] rows, bool wantLogits, float[][] lastHidden)
         {
             Tensor normed = RMSNormOp(hidden, "output_norm.weight");
             Tensor selected;
@@ -812,6 +819,19 @@ namespace TensorSharp.Models
                 for (int i = 0; i < rows.Length; i++)
                     Array.Copy(all, (long)rows[i] * dim, packed, (long)i * dim, dim);
                 selected = CreateFloatTensor(packed, rows.Length, dim);
+            }
+
+            if (lastHidden != null && Array.Exists(lastHidden, h => h != null))
+            {
+                int dim = Config.HiddenSize;
+                float[] values = selected.GetElementsAsFloat(rows.Length * dim);
+                for (int i = 0; i < rows.Length; i++)
+                    if (lastHidden[i] != null) Array.Copy(values, (long)i * dim, lastHidden[i], 0, dim);
+            }
+            if (!wantLogits)
+            {
+                selected.Dispose();
+                return null;
             }
 
             long t0 = Stopwatch.GetTimestamp();

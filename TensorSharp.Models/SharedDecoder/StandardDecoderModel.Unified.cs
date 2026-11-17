@@ -186,6 +186,44 @@ namespace TensorSharp.Models
             return true;
         }
 
+        /// <summary>Decode rows whose input is an embedding row and steps that return the last rows' final hidden rows serve
+        /// wherever slot steps do (graphs on every executor, and the per-op layers).</summary>
+        public bool SupportsUnifiedRowIO => SupportsUnifiedBatching;
+
+        public bool TryForwardUnifiedRows(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts,
+            float[][] inputRows, bool[] wantLogits, float[][] lastRowLogits, float[][] lastHidden)
+        {
+            int n = requestIds.Count;
+            if (inputRows == null || wantLogits == null || lastHidden == null || inputRows.Length != n || wantLogits.Length != n || lastHidden.Length != n)
+                throw new ArgumentException("one input row, logits flag and hidden buffer a request");
+            for (int s = 0; s < n; s++)
+                if (lastHidden[s] != null && lastHidden[s].Length < Config.HiddenSize)
+                    throw new ArgumentException($"a hidden buffer of {lastHidden[s].Length} values, the model's rows {Config.HiddenSize}", nameof(lastHidden));
+            var rowIO = new SlotRowIO
+            {
+                InputRows = Array.Exists(inputRows, r => r != null) ? inputRows : null,
+                Logits = Array.Exists(wantLogits, w => w),
+                Hidden = Array.Exists(lastHidden, h => h != null) ? lastHidden : null,
+            };
+            if (!TryForwardSlots(requestIds, tokens, starts, lastRowLogits, null, rowIO)) return false;
+            ReplenishSpareSlot(tokens);
+            return true;
+        }
+
+        /// <summary>Set while <see cref="ForwardUnifiedMediaRows"/> runs: the prompt forward also writes its last final hidden
+        /// row here.</summary>
+        private float[] _promptHiddenOut;
+
+        public float[] ForwardUnifiedMediaRows(string requestId, int[] tokens, int start, float[] lastHidden)
+        {
+            ArgumentNullException.ThrowIfNull(lastHidden);
+            if (lastHidden.Length < Config.HiddenSize)
+                throw new ArgumentException($"a hidden buffer of {lastHidden.Length} values, the model's rows {Config.HiddenSize}", nameof(lastHidden));
+            _promptHiddenOut = lastHidden;
+            try { return ForwardUnifiedMedia(requestId, tokens, start); }
+            finally { _promptHiddenOut = null; }
+        }
+
         /// <summary>On executors that return integer outputs (the CUDA executor), a greedy step's head ends in a top-1 over each
         /// sequence's last row, read back as an id: a plain decode step had read back Qwen3.8's 248,320 logits (1 MB) and
         /// scanned them on the host.</summary>

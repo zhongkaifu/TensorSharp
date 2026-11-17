@@ -4,6 +4,7 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
 using System.Collections.Generic;
 
 namespace TensorSharp.Runtime.Scheduling
@@ -41,9 +42,30 @@ namespace TensorSharp.Runtime.Scheduling
         /// logits are not read back. Declines as <see cref="TryForwardUnified"/> does.</summary>
         bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens) => false;
 
+        /// <summary>Whether <see cref="TryForwardUnifiedRows"/> serves (requests driven by an
+        /// <see cref="ISequenceStepDriver"/> need it).</summary>
+        bool SupportsUnifiedRowIO => false;
+
+        /// <summary>
+        /// <see cref="TryForwardUnified"/> with per-request row input and output: <paramref name="inputRows"/>[s], when set,
+        /// is decoded in place of the embedding of request s's LAST row (the model's embedding width, unscaled);
+        /// <paramref name="lastRowLogits"/>[s] receives the last row's logits only where <paramref name="wantLogits"/>[s]
+        /// (else it may stay null: a step no request wants logits from skips the LM head); <paramref name="lastHidden"/>[s],
+        /// when given (a buffer of the embedding width), receives the last row's final hidden row (after the final norm,
+        /// before the head). Declines as <see cref="TryForwardUnified"/> does.
+        /// </summary>
+        bool TryForwardUnifiedRows(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts,
+            float[]?[] inputRows, bool[] wantLogits, float[][] lastRowLogits, float[]?[] lastHidden) => false;
+
         /// <summary>A request with pending media embeddings runs its prompt chunk on its own slot through the model's
         /// media path; the last row's logits.</summary>
         float[] ForwardUnifiedMedia(string requestId, int[] tokens, int start);
+
+        /// <summary><see cref="ForwardUnifiedMedia"/> that also writes the last row's final hidden row into
+        /// <paramref name="lastHidden"/> (a buffer of the embedding width): a driven request's prompt with media
+        /// (<see cref="SupportsUnifiedRowIO"/>).</summary>
+        float[] ForwardUnifiedMediaRows(string requestId, int[] tokens, int start, float[] lastHidden)
+            => throw new NotSupportedException("This model's media prompts do not return the final hidden row.");
 
         /// <summary>One short slice of work the model does while the engine has nothing to run (it prepares what the next
         /// requests would otherwise wait for); the engine calls again while it stays idle and this returns true.</summary>

@@ -337,6 +337,14 @@ namespace TensorSharp.Runtime.Scheduling
         public InferenceRequestHandle SubmitRequest(SequenceState seq, CancellationToken ct = default)
         {
             if (seq == null) throw new ArgumentNullException(nameof(seq));
+            // A request whose slots a driver chooses (speech output) runs only on the unified runtime's row I/O.
+            if (seq.StepDriver != null && _model is not IUnifiedBatchModel { SupportsUnifiedBatching: true, SupportsUnifiedRowIO: true })
+                throw new NotSupportedException(
+                    $"{_model.Config?.Architecture ?? "The model"}: this request's output (speech) needs decode steps whose input is an " +
+                    "embedding row and whose output is the final hidden row, which only the unified runtime's slot steps provide; " +
+                    "this load does not run them (a multi-node pipeline, or a model off the shared runtime).");
+            if (_model is IReplyTokenPolicy policy && policy.SuppressedReplyTokens(seq.StepDriver != null) is { Count: > 0 } suppressed)
+                seq.SuppressedTokens = suppressed;
             lock (_submissionGate)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
@@ -1135,6 +1143,16 @@ namespace TensorSharp.Runtime.Scheduling
                     continue;
                 }
 
+                // The request's step driver ended it before its next slot (nothing was forwarded for it).
+                if (r.DriverStopReason != null)
+                {
+                    _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, r.DriverStopReason, output);
+                    handle?.CompleteFinished();
+                    _handles.TryRemove(seq.RequestId, out _);
+                    Interlocked.Increment(ref _totalCompleted);
+                    continue;
+                }
+
                 if (r.SampledToken < 0 && r.IsPrefill && handle != null)
                     PublishEarlyFirstToken(seq, handle);
 
@@ -1244,8 +1262,10 @@ namespace TensorSharp.Runtime.Scheduling
                         // streaming the same phrase until somebody presses Stop.
                         // Reported as its own reason so the layers above can say
                         // what happened rather than "the answer was cut off".
+                        // A driven request's output holds a placeholder for every embedding row (a speech frame), which
+                        // repeats by design: its driver ends it.
                         if (_stopRepetition
-                            && (seq.SamplingConfig?.StopRepetition ?? true)
+                            && (seq.SamplingConfig?.StopRepetition ?? true) && seq.StepDriver == null
                             && RepetitionGuard.IsLooping(seq.OutputTokens, emittedCount, out int period, out int repeats))
                         {
                             // V4.1's trained reasoning close can recover a looping

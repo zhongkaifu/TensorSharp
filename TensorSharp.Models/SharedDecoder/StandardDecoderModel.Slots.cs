@@ -745,13 +745,13 @@ namespace TensorSharp.Models
         /// every request it carried: four Qwen3.8-27B DFlash2 prompts on a 24 GB GPU, where Qwen35Model serves them.
         /// </remarks>
         private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
-            float[][] features = null)
+            float[][] features = null, SlotRowIO rowIO = null)
         {
-            try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
+            try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features, rowIO); }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {
                 FreeGraphMemory();
-                try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
+                try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features, rowIO); }
                 catch (InvalidOperationException again) when (IsGraphAllocationFailure(again) && requestIds.Count > 1)
                 {
                     FreeGraphMemory();
@@ -776,7 +776,7 @@ namespace TensorSharp.Models
                     logits[i] = outLogits[from + i];
                     if (partFeatures != null) partFeatures[i] = features[from + i];
                 }
-                bool ran = TryForwardSlots(ids, parts, partStarts, logits, partFeatures);
+                bool ran = TryForwardSlots(ids, parts, partStarts, logits, partFeatures, rowIO?.Slice(from, count));
                 Array.Copy(logits, 0, outLogits, from, count);
                 if (partFeatures != null) Array.Copy(partFeatures, 0, features, from, count);
                 return ran;
@@ -799,8 +799,50 @@ namespace TensorSharp.Models
         /// <summary>Forwards over several requests that fail as a graph's compute allocation would, before running (tests).</summary>
         internal int InjectedForwardAllocationFailures { get; set; }
 
+        /// <summary>
+        /// A step's per-request row input and output (<see cref="IUnifiedBatchModel.TryForwardUnifiedRows"/>): the rows that
+        /// replace some requests' last embedded rows, whether the step runs the LM head, and the buffers of the requests' last
+        /// final-normed rows.
+        /// </summary>
+        private sealed class SlotRowIO
+        {
+            /// <summary>Per request, the embedding row of its last row, or null (its token's).</summary>
+            public float[][] InputRows;
+            /// <summary>The step runs the head (some request wants logits); without it, every request's logits stay null.</summary>
+            public bool Logits = true;
+            /// <summary>Per request, a buffer for its last final-normed row, or null.</summary>
+            public float[][] Hidden;
+
+            public SlotRowIO Slice(int from, int count) => new()
+            {
+                InputRows = InputRows?[from..(from + count)],
+                Logits = Logits,
+                Hidden = Hidden?[from..(from + count)],
+            };
+        }
+
+        /// <summary>Write the requests' input rows over their last embedded rows (<paramref name="lastRows"/>).</summary>
+        private unsafe void InjectRows(Tensor embedded, SlotRowIO rowIO, int[] lastRows)
+        {
+            if (rowIO?.InputRows == null) return;
+            int dim = Config.HiddenSize;
+            bool wrote = false;
+            float* destination = GetFloatPtr(embedded);
+            for (int s = 0; s < lastRows.Length; s++)
+            {
+                float[] row = rowIO.InputRows[s];
+                if (row == null) continue;
+                if (row.Length != dim)
+                    throw new ArgumentException($"{Config.Architecture}: an input row has {row.Length} values, the embedding {dim}.");
+                fixed (float* source = row)
+                    Buffer.MemoryCopy(source, destination + (long)lastRows[s] * dim, (long)dim * sizeof(float), (long)dim * sizeof(float));
+                wrote = true;
+            }
+            if (wrote) HostWritten(embedded);
+        }
+
         private bool TryForwardSlotsOnce(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
-            float[][] features)
+            float[][] features, SlotRowIO rowIO = null)
         {
             if (!SupportsPerSequenceFusedForward || _slots == null || HasPendingMedia || _pendingPositionTable != null) return false;
             int n = requestIds.Count;
@@ -852,7 +894,8 @@ namespace TensorSharp.Models
             try
             {
                 embedded = EmbedStep(flatTokens);
-                bool capture = features != null && Array.Exists(features, f => f != null);
+                InjectRows(embedded, rowIO, lastRows);
+                bool capture = rowIO == null && features != null && Array.Exists(features, f => f != null);
                 // A lone speculating request's prompt chunk hands the draft layer its rows, and every speculating request's
                 // chunk its DFlash ring's (FollowPlainPrompt).
                 promptEnds = capture ? null : TakeFollowedPrompts(requestIds);
@@ -862,7 +905,7 @@ namespace TensorSharp.Models
                 DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds);
                 if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
                     : RunFollowingDFlash(ref dflash, plan => TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(),
-                          wantLogits: true, out float[][] graphLogits, follow: follow, draftRows: draftRows, dflash: plan)
+                          wantLogits: rowIO?.Logits ?? true, out float[][] graphLogits, rowIO?.Hidden, follow: follow, draftRows: draftRows, dflash: plan)
                           && CopyLogits(graphLogits, outLogits)))
                 {
                     BatchedForwardCount++;
@@ -874,7 +917,8 @@ namespace TensorSharp.Models
                 }
                 static bool CopyLogits(float[][] from, float[][] to)
                 {
-                    Array.Copy(from, to, to.Length);
+                    if (from != null) Array.Copy(from, to, to.Length);
+                    else Array.Clear(to);   // a step no request wanted logits from ran no head
                     return true;
                 }
             }
@@ -901,8 +945,9 @@ namespace TensorSharp.Models
                 BatchedForwardCount++;
                 EnterStage(0);
                 Tensor hidden = EmbedStep(flatTokens);
+                InjectRows(hidden, rowIO, lastRows);
                 hidden = RunLayers(hidden, TokenPositions.Explicit(positions), batch);
-                all = ProjectRows(hidden, lastRows);
+                all = ProjectRows(hidden, lastRows, rowIO?.Logits ?? true, rowIO?.Hidden);
                 hidden.Dispose();
                 if (loraAudit) VerifyLoraForwardAudit(producedLogits: true);
             }
@@ -917,6 +962,11 @@ namespace TensorSharp.Models
             for (int s = 0; s < n; s++)
             {
                 slots[s].Length = starts[s] + counts[s];
+                if (all == null)
+                {
+                    outLogits[s] = null;   // no request wanted logits: no head ran
+                    continue;
+                }
                 slots[s].Logits ??= new float[vocab];
                 Array.Copy(all, (long)s * vocab, slots[s].Logits, 0, vocab);
                 outLogits[s] = slots[s].Logits;
