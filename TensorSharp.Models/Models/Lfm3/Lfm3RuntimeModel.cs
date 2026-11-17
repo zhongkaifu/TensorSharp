@@ -346,6 +346,7 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            DisposeSpeechOutput();
             if (_convKernelRank != null)
                 foreach (Tensor[] layer in _convKernelRank)
                     if (layer != null)

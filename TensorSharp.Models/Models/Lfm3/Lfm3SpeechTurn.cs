@@ -31,6 +31,10 @@ namespace TensorSharp.Models.Lfm3
         public int TextEnd { get; init; } = -1;
         public int ImEnd { get; init; } = -1;
 
+        /// <summary>&lt;|audio_out|&gt;: the placeholder a reply's output records for each speech frame (HF's processor writes
+        /// one per frame where a past turn's speech is re-rendered); -1 where the vocabulary has none.</summary>
+        public int AudioOut { get; init; } = -1;
+
         /// <summary>Media placeholders HF never samples as text (&lt;|audio|&gt;, &lt;|audio_out|&gt;, &lt;|image|&gt;,
         /// &lt;|video|&gt;); -1 where the vocabulary has none.</summary>
         public int[] Placeholders { get; init; } = Array.Empty<int>();
@@ -58,6 +62,7 @@ namespace TensorSharp.Models.Lfm3
                 MixedStart = Required("<|mixed_start|>"),
                 TextEnd = Required("<|text_end|>"),
                 ImEnd = Required("<|im_end|>"),
+                AudioOut = lookup("<|audio_out|>"),
                 Placeholders = placeholders.ToArray(),
             };
         }
