@@ -655,7 +655,14 @@ namespace
         case OP_GET_ROWS: need(2); return ggml_get_rows(ctx, src(0), src(1));
         case OP_ADD: need(2); return ggml_add(ctx, src(0), src(1));
         case OP_SUB: need(2); return ggml_sub(ctx, src(0), src(1));
-        case OP_MUL: need(2); return ggml_mul(ctx, src(0), src(1));
+        case OP_MUL:
+            need(2);
+            // A square (both operands one node) as SQR on Vulkan: ggml-vulkan fuses a UNARY followed by a MUL of its result
+            // (ggml_vk_can_fuse_unary_mul at d9fe7bf) and takes the MUL's other operand from memory; when that operand is the
+            // unary's own result, which the fused kernel never writes, it multiplies by whatever that memory held (silu(x)^2
+            // came out 0.3 off: NetworkGraphTests unary_squared). SQR computes the same products and fuses with nothing.
+            if (g_backend_type == BACKEND_TYPE_VULKAN && s[0] == s[1]) return ggml_sqr(ctx, src(0));
+            return ggml_mul(ctx, src(0), src(1));
         case OP_DIV: need(2); return ggml_div(ctx, src(0), src(1));
         case OP_SCALE: need(1); return ggml_scale(ctx, src(0), fpar(0, 1.0f));
         case OP_SCALE_BIAS: need(1); return ggml_scale_bias(ctx, src(0), fpar(0, 1.0f), fpar(1, 0.0f));

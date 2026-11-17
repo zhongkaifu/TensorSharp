@@ -22,11 +22,45 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// The non-decoder network helpers (TensorSharp.Models.Graph.NetworkBuilder) against straightforward host references on
 /// random data, on every executor this machine runs: the managed CPU, the tensor executor's own reference decompositions
-/// (what direct CUDA runs for the ops it has no kernel of), GGML cpu and metal (one per process: TS_TEST_GGML_BACKEND), MLX.
+/// (what direct CUDA runs for the ops it has no kernel of), GGML cpu, metal, cuda and vulkan (one per process:
+/// TS_TEST_GGML_BACKEND), MLX and direct CUDA.
 /// </summary>
 public sealed class NetworkGraphTests
 {
-    public enum Lane { Managed, Reference, GgmlCpu, GgmlMetal, Mlx }
+    public enum Lane { Managed, Reference, GgmlCpu, GgmlMetal, Mlx, GgmlCuda, GgmlVulkan, Cuda }
+
+    /// <summary>The GGML backend of a GGML lane.</summary>
+    public static GgmlBackendType GgmlBackendOf(Lane lane) => lane switch
+    {
+        Lane.GgmlMetal => GgmlBackendType.Metal,
+        Lane.GgmlCuda => GgmlBackendType.Cuda,
+        Lane.GgmlVulkan => GgmlBackendType.Vulkan,
+        _ => GgmlBackendType.Cpu,
+    };
+
+    /// <summary>The model-level backend of a lane.</summary>
+    public static BackendType BackendOf(Lane lane) => lane switch
+    {
+        Lane.GgmlCpu => BackendType.GgmlCpu,
+        Lane.GgmlMetal => BackendType.GgmlMetal,
+        Lane.GgmlCuda => BackendType.GgmlCuda,
+        Lane.GgmlVulkan => BackendType.GgmlVulkan,
+        Lane.Mlx => BackendType.Mlx,
+        Lane.Cuda => BackendType.Cuda,
+        _ => BackendType.Cpu,
+    };
+
+    /// <summary>The lane of this process's pinned GGML backend (TS_TEST_GGML_BACKEND).</summary>
+    public static Lane PinnedGgmlLane => TestGates.PinnedGgmlBackend switch
+    {
+        BackendType.GgmlMetal => Lane.GgmlMetal,
+        BackendType.GgmlCuda => Lane.GgmlCuda,
+        BackendType.GgmlVulkan => Lane.GgmlVulkan,
+        _ => Lane.GgmlCpu,
+    };
+
+    /// <summary>GPU lanes whose products and attention take F16 (or F16-rounded) operands: tolerances as ggml-metal's.</summary>
+    public static bool HalfOperandLane(Lane lane) => lane is Lane.GgmlMetal or Lane.GgmlCuda or Lane.GgmlVulkan;
 
     /// <summary>The tensor executor with none of a backend's kernels (CPU ops): the reference decompositions direct CUDA
     /// takes for the network ops (TensorGraphExecutor.Network.cs).</summary>
@@ -64,9 +98,17 @@ public sealed class NetworkGraphTests
                     break;
                 case Lane.GgmlCpu:
                 case Lane.GgmlMetal:
-                    Allocator = new GgmlAllocator(new GgmlContext([0], lane == Lane.GgmlMetal ? GgmlBackendType.Metal : GgmlBackendType.Cpu), 0);
-                    Backend = lane == Lane.GgmlMetal ? BackendType.GgmlMetal : BackendType.GgmlCpu;
+                case Lane.GgmlCuda:
+                case Lane.GgmlVulkan:
+                    Allocator = new GgmlAllocator(new GgmlContext([0], GgmlBackendOf(lane)), 0);
+                    Backend = BackendOf(lane);
                     _ggml = true;
+                    break;
+                case Lane.Cuda:
+                    var cuda = new TensorSharp.Cuda.CudaAllocator();
+                    Allocator = cuda;
+                    _allocatorOwner = cuda;
+                    Backend = BackendType.Cuda;
                     break;
                 case Lane.Mlx:
                     var mlx = new MlxAllocator();
@@ -83,8 +125,9 @@ public sealed class NetworkGraphTests
                 case Lane.Managed: Assert.IsType<ManagedGraphExecutor>(Graph.Executor); break;
                 case Lane.Reference: Assert.IsType<ReferenceExecutor>(Graph.Executor); break;
                 case Lane.Mlx: Assert.IsType<MlxGraphExecutor>(Graph.Executor); break;
+                case Lane.Cuda: Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(Graph.Executor); break;
                 default:
-                    Assert.Equal(lane == Lane.GgmlMetal ? GgmlBackendType.Metal : GgmlBackendType.Cpu, Assert.IsType<GgmlGraphExecutor>(Graph.Executor).Backend);
+                    Assert.Equal(GgmlBackendOf(lane), Assert.IsType<GgmlGraphExecutor>(Graph.Executor).Backend);
                     Assert.True(Graph.AttentionHalfKv);
                     break;
             }
@@ -124,6 +167,7 @@ public sealed class NetworkGraphTests
         ["layernorm"] = LayerNorm,
         ["gelu_erf"] = GeluErf,
         ["silu_sigmoid_swiglu"] = SiluSigmoidSwiglu,
+        ["unary_squared"] = UnarySquared,
         ["residual_scale_broadcast"] = ResidualScaleBroadcast,
         ["causal_conv1d"] = c => CausalConv1d(c, withState: false),
         ["causal_conv1d_state"] = c => CausalConv1d(c, withState: true),
@@ -170,6 +214,18 @@ public sealed class NetworkGraphTests
     [MlxTheory]
     [MemberData(nameof(Cases))]
     public void Mlx(string name) => Check(Lane.Mlx, name);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [MemberData(nameof(Cases))]
+    public void GgmlCuda(string name) => Check(Lane.GgmlCuda, name);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [MemberData(nameof(Cases))]
+    public void GgmlVulkan(string name) => Check(Lane.GgmlVulkan, name);
+
+    [CudaTheory]
+    [MemberData(nameof(Cases))]
+    public void DirectCuda(string name) => Check(Lane.Cuda, name);
 
     private static void Check(Lane lane, string name)
     {
@@ -263,6 +319,30 @@ public sealed class NetworkGraphTests
         AssertClose(g.Select((v, i) => (float)(v * Sig(v) * u[i])).ToArray(), outputs[0], 1e-5, "swiglu");
         AssertClose(g.Select(v => (float)Sig(v)).ToArray(), outputs[1], 1e-5, "sigmoid");
         AssertClose(u.Select(v => (float)(v * Sig(v))).ToArray(), outputs[2], 1e-5, "silu");
+    }
+
+    /// <summary>A unary op's result times itself (silu(x)^2, sigmoid(x)^2), then another op: ggml-vulkan fuses a UNARY followed
+    /// by a MUL reading the other operand from memory, which for a square is the unary's own result, never written (silu(x)^2
+    /// came out 0.3 off; ggml d9fe7bf). The graph builder emits a square as SQR on Vulkan.</summary>
+    private static void UnarySquared(LaneContext c)
+    {
+        var rng = new Random(15);
+        int n = 24, rows = 3;
+        float[] x = Rand(rng, n * rows).Select(v => v * 2).ToArray(), o = Rand(rng, n * rows);
+        float[][] outputs = c.Graph.Run(b =>
+        {
+            NetValue t = b.Silu(b.Scale(b.Add(b.Input(x, n, rows), b.Input(o, n, rows)), 0.5f));
+            b.Output(b.Sub(b.Mul(t, t), b.Input(o, n, rows)));
+            NetValue g = b.Sigmoid(b.Input(x, n, rows));
+            b.Output(b.Mul(g, g));
+        });
+        static double Sig(double v) => 1 / (1 + Math.Exp(-v));
+        AssertClose(x.Select((v, i) =>
+        {
+            double s = 0.5 * (v + o[i]), t = s * Sig(s);
+            return (float)(t * t - o[i]);
+        }).ToArray(), outputs[0], 1e-5, $"{c.Lane} silu(x)^2 - o");
+        AssertClose(x.Select(v => (float)(Sig(v) * Sig(v))).ToArray(), outputs[1], 1e-5, $"{c.Lane} sigmoid(x)^2");
     }
 
     private static void ResidualScaleBroadcast(LaneContext c)
@@ -724,7 +804,7 @@ public sealed class NetworkGraphTests
             }
         float[] hidden = Lin(M, N / 4, "mm0", "mm0.b").Select(v => (float)(0.5 * v * (1 + Erf(v / Math.Sqrt(2))))).ToArray();
         float[] expected = Lin(hidden, N / 4, "mm2", "mm2.b");
-        AssertClose(expected, actual, c.Lane is Lane.GgmlMetal or Lane.GgmlCpu ? 3e-2 : 2e-2, "mini network");
+        AssertClose(expected, actual, HalfOperandLane(c.Lane) || c.Lane == Lane.GgmlCpu ? 3e-2 : 2e-2, "mini network");
     }
 
     // ================================================================ program cache, drift
@@ -740,6 +820,15 @@ public sealed class NetworkGraphTests
 
     [MlxFact]
     public void MlxProgramCacheReplaysByShape() => ProgramCache(Lane.Mlx);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void GgmlCudaProgramCacheReplaysByShape() => ProgramCache(Lane.GgmlCuda);
+
+    [GgmlFact(BackendType.GgmlVulkan)]
+    public void GgmlVulkanProgramCacheReplaysByShape() => ProgramCache(Lane.GgmlVulkan);
+
+    [CudaFact]
+    public void DirectCudaProgramCacheReplaysByShape() => ProgramCache(Lane.Cuda);
 
     private static void ProgramCache(Lane lane)
     {

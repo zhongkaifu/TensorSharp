@@ -52,6 +52,18 @@ public sealed class NetworkGraphSpeechFoundationTests
     [MemberData(nameof(Formats))]
     public void ExpertsMlx(int format) => Experts(Lane.Mlx, format);
 
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [MemberData(nameof(Formats))]
+    public void ExpertsGgmlCuda(int format) => Experts(Lane.GgmlCuda, format);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [MemberData(nameof(Formats))]
+    public void ExpertsGgmlVulkan(int format) => Experts(Lane.GgmlVulkan, format);
+
+    [CudaTheory]
+    [MemberData(nameof(Formats))]
+    public void ExpertsDirectCuda(int format) => Experts(Lane.Cuda, format);
+
     /// <summary>A [64, 5 x 40] table read as 5 matrices of 40 rows: rows of x each multiplied by the matrix its index picks;
     /// three different picks replay one program. Where the format is held dense (F16 on MLX) the stack is not made and the
     /// caller multiplies every matrix (checked: <see cref="NetworkBuilder.Experts"/> returns no value).</summary>
@@ -111,6 +123,18 @@ public sealed class NetworkGraphSpeechFoundationTests
     [MemberData(nameof(AttentionKinds))]
     public void AttentionByProductsMlx(string kind) => AttentionByProducts(Lane.Mlx, kind);
 
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [MemberData(nameof(AttentionKinds))]
+    public void AttentionByProductsGgmlCuda(string kind) => AttentionByProducts(Lane.GgmlCuda, kind);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [MemberData(nameof(AttentionKinds))]
+    public void AttentionByProductsGgmlVulkan(string kind) => AttentionByProducts(Lane.GgmlVulkan, kind);
+
+    [CudaTheory]
+    [MemberData(nameof(AttentionKinds))]
+    public void AttentionByProductsDirectCuda(string kind) => AttentionByProducts(Lane.Cuda, kind);
+
     /// <summary>Grouped-query attention (8 / 2 heads of 32) as products, against a host softmax: bidirectional over 12 rows
     /// (the depthformer's), and a sliding window of 30 over 29 carried keys plus 6 rows (the codec's streaming call).</summary>
     private static void AttentionByProducts(Lane laneKind, string kind)
@@ -152,7 +176,7 @@ public sealed class NetworkGraphSpeechFoundationTests
                 }
             }
         // ggml-metal's and MLX's F32 products round through F16 operands (llama.cpp's Metal run of these graphs too).
-        AssertClose(expected, got, laneKind is Lane.Mlx or Lane.GgmlMetal ? 2e-3 : 1e-5, $"{laneKind} attention by products ({kind})");
+        AssertClose(expected, got, laneKind == Lane.Mlx || HalfOperandLane(laneKind) ? 2e-3 : 1e-5, $"{laneKind} attention by products ({kind})");
     }
 
     public static IEnumerable<object[]> StateSizes => new[] { 24, 3000 }.Select(n => new object[] { n });
@@ -172,6 +196,18 @@ public sealed class NetworkGraphSpeechFoundationTests
     [MlxTheory]
     [MemberData(nameof(StateSizes))]
     public void ReadOnlyStateReplaysMlx(int n) => ReadOnlyStateReplays(Lane.Mlx, n);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [MemberData(nameof(StateSizes))]
+    public void ReadOnlyStateReplaysGgmlCuda(int n) => ReadOnlyStateReplays(Lane.GgmlCuda, n);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [MemberData(nameof(StateSizes))]
+    public void ReadOnlyStateReplaysGgmlVulkan(int n) => ReadOnlyStateReplays(Lane.GgmlVulkan, n);
+
+    [CudaTheory]
+    [MemberData(nameof(StateSizes))]
+    public void ReadOnlyStateReplaysDirectCuda(int n) => ReadOnlyStateReplays(Lane.Cuda, n);
 
     /// <summary>
     /// One program writes a state, another only reads it (the depthformer's projection, kept from a frame's first pass for its
