@@ -324,6 +324,8 @@ public sealed partial class OpenAIChatAdapter
                 toolGrammar = PrepareDeepSeek41ToolGrammar(body, openaiTools, effectiveTools, responseFormat);
             else if (IsMiniMaxM3(_svc.Architecture))
                 toolGrammar = PrepareMiniMaxM3ToolGrammar(body, openaiTools, responseFormat);
+            else if (UsesQwenXmlToolGrammar(_svc.Architecture))
+                toolGrammar = PrepareQwenXmlToolGrammar(body, openaiTools, responseFormat);
         }
         catch (Exception ex) when (ex is NotSupportedException or JsonException or ArgumentException)
         {
