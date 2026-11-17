@@ -208,6 +208,15 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --video clip
 # Audio inference (Gemma 4)
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --audio speech.wav --backend ggml_metal
 
+# Speech output (LFM3-Omni with its mmproj; see "Speech output (LFM3-Omni)" below).
+# --tts speaks --prompt with the GGUF's "tts" template (as llama-tts does) and writes --output;
+# --speech-out speaks a chat reply too (--speech-mode interleaved|audio, --voice female|male,
+# --language, --seed, --speech-temperature).
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf \
+    --backend ggml_metal --tts --prompt "Hello there, nice to meet you." --voice male --language en --output hello.wav
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf \
+    --backend ggml_metal --input question.txt --speech-out reply.wav --speech-mode interleaved --voice female
+
 # PDF document input: born-digital PDFs are text-extracted and inlined into the
 # prompt; scanned PDFs become page images and need a vision model (--mmproj or a
 # built-in vision encoder). --input provides the instruction over the document.
@@ -3027,6 +3036,36 @@ phases, Studio jobs, model loads and the logs of one request.
   CLI, never writes it anywhere, and queries the resource until the rows arrive
   ([how to run them](eng/telemetry/README.md)). Both write their evidence to the git-ignored
   `docs/validation/`.
+
+## Speech output (LFM3-Omni)
+
+LFM3-Omni speaks when its mmproj is loaded (`--mmproj mmproj-LFM3-Omni-2B-*.gguf`: the `a.gen.*` depthformer
+and LiquidCodec decoder). A spoken reply runs on the same continuous-batching engine as text: each 80 ms frame
+is a decode step whose input is the previous frame's embedding row and whose output is the LM's final hidden
+row (no LM head when no request of the step needs logits), so speech and text requests batch together.
+
+| Surface | What it does |
+|---|---|
+| CLI `--tts` | Speak `--prompt` with the GGUF's `tts` template; write `--output` (WAV, 24 kHz mono 16-bit). A chat model that speaks synthesizes only with `--tts`. |
+| CLI `--speech-out FILE` | Speak a single-prompt chat reply too; `--speech-mode interleaved` (default: 6 text tokens, then 12 frames, ...; the text is the transcript) or `audio`. |
+| CLI `--speech-temperature T` | The speech codes' temperature (default the mmproj's, 0.4); text keeps `--temperature`. |
+| CLI `--voice female\|male`, `--language CODE`, `--seed N` | The voice and language named in the system prompt; the speech sampler's seed. |
+| `POST /v1/audio/speech` | `input`, `voice` (`female`/`male`; anything else, OpenAI's default `alloy` included, is a 400 listing the voices), `language`, `response_format` `wav`/`pcm`/`pcm16`, `stream: true` (chunked; a WAV stream starts with an unknown-length header) or `stream_format: "audio"`/`"sse"`, `seed`, `temperature`, `max_frames`. `speed` other than 1 is a 400. |
+| `POST /v1/chat/completions`, `POST /v1/responses` | `"modalities": ["text","audio"]` (interleaved: the text is the transcript) or `["audio"]`, with `"audio": {"voice": "female", "format": "wav"\|"pcm16"}` (TensorSharp also reads `language`, `seed`, `temperature` there). Non-streaming: `message.audio = {id, expires_at, data, transcript}`; streaming (pcm16 only): `delta.audio` `id`, then `transcript` and `data` pieces in order, then `expires_at`. Sending the reply back as `{"role":"assistant","audio":{"id":...}}` renders it as its transcript for an hour. |
+| `GET /v1/models` | A model that speaks lists `"capabilities": ["chat","audio_output"]` and its voices. |
+
+Text replies of LFM3-Omni never sample the media placeholders, and a text-only reply never opens speech
+(`<|audio_start|>`, `<|mixed_start|>` are banned), as the model card's `generate` does. Speech requests are not
+retained in the prefix cache (their frames are rows, not tokens), and a spoken assistant turn in later history
+re-renders as its transcript, not as audio. See [docs/models/lfm3.md](docs/models/lfm3.md#speech-output).
+
+```bash
+curl http://localhost:5000/v1/audio/speech -H "content-type: application/json" \
+  -d '{"model":"LFM3-Omni-2B-Q4_K_M","input":"Hello there.","voice":"female","seed":1234}' -o hello.wav
+curl http://localhost:5000/v1/chat/completions -H "content-type: application/json" \
+  -d '{"model":"LFM3-Omni-2B-Q4_K_M","messages":[{"role":"user","content":"What is the capital of France?"}],
+       "modalities":["text","audio"],"audio":{"voice":"female","format":"wav"}}'
+```
 
 ## HTTP APIs
 

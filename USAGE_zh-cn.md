@@ -165,6 +165,15 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --video clip
 # 音频推理（Gemma 4）
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --audio speech.wav --backend ggml_metal
 
+# 语音输出（LFM3-Omni 加载其 mmproj；见下文“语音输出（LFM3-Omni）”）。
+# --tts 用 GGUF 的 "tts" 模板朗读 --prompt（与 llama-tts 相同）并写入 --output；
+# --speech-out 让对话回复也说出来（--speech-mode interleaved|audio、--voice female|male、
+# --language、--seed、--speech-temperature）。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf \
+    --backend ggml_metal --tts --prompt "你好，很高兴认识你。" --voice male --language zh --output hello.wav
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf \
+    --backend ggml_metal --input question.txt --speech-out reply.wav --speech-mode interleaved --voice female
+
 # PDF 文档输入：文字型 PDF 会提取文本层并内联进提示词；扫描型 PDF 会转成页面
 # 图像，需要视觉模型（--mmproj 或内置视觉编码器）。--input 提供针对文档的指令。
 echo "Summarize the key findings of this paper." > question.txt
@@ -2646,6 +2655,35 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
   针对真实的 Application Insights 资源做同样的检查：它用 Azure CLI 读取连接串，从不把连接串写到任何地方，并持续
   查询该资源直到数据到达（[运行方法](eng/telemetry/README.md)，英文）。两者都把证据写入被 git 忽略的
   `docs/validation/`。
+
+## 语音输出（LFM3-Omni）
+
+LFM3-Omni 在加载其 mmproj（`--mmproj mmproj-LFM3-Omni-2B-*.gguf`，其中的 `a.gen.*` 即 depthformer 与
+LiquidCodec 解码器）后即可说话。语音回复与文本运行在同一个连续批处理引擎上：每个 80 ms 的语音帧是一次解码步骤，
+输入是上一帧的嵌入行，输出是 LM 的最终隐藏行（该步没有请求需要 logits 时不运行 LM head），因此语音请求与文本请求
+在同一批中执行。
+
+| 入口 | 作用 |
+|---|---|
+| CLI `--tts` | 用 GGUF 的 `tts` 模板朗读 `--prompt`，写入 `--output`（WAV，24 kHz 单声道 16 位）。会说话的对话模型只有加 `--tts` 才做语音合成。 |
+| CLI `--speech-out FILE` | 单次提示的对话回复也说出来；`--speech-mode interleaved`（默认：6 个文本 token，然后 12 帧，……；文本即语音的转写）或 `audio`。 |
+| CLI `--speech-temperature T` | 语音编码的温度（默认取 mmproj 的 0.4）；文本仍用 `--temperature`。 |
+| CLI `--voice female\|male`、`--language CODE`、`--seed N` | 写入系统提示的音色与语言；语音采样器的种子。 |
+| `POST /v1/audio/speech` | `input`、`voice`（`female`/`male`；其他值，包括 OpenAI 默认的 `alloy`，返回 400 并列出可用音色）、`language`、`response_format` `wav`/`pcm`/`pcm16`、`stream: true`（分块；WAV 流以未知长度头开头）或 `stream_format: "audio"`/`"sse"`、`seed`、`temperature`、`max_frames`。`speed` 不为 1 时返回 400。 |
+| `POST /v1/chat/completions`、`POST /v1/responses` | `"modalities": ["text","audio"]`（交错：文本即转写）或 `["audio"]`，配合 `"audio": {"voice": "female", "format": "wav"\|"pcm16"}`（TensorSharp 还读取其中的 `language`、`seed`、`temperature`）。非流式：`message.audio = {id, expires_at, data, transcript}`；流式（仅 pcm16）：`delta.audio` 先发 `id`，再按顺序发 `transcript` 与 `data` 片段，最后是 `expires_at`。一小时内把回复以 `{"role":"assistant","audio":{"id":...}}` 发回，会按其转写渲染。 |
+| `GET /v1/models` | 会说话的模型列出 `"capabilities": ["chat","audio_output"]` 及其音色。 |
+
+LFM3-Omni 的文本回复永不采样媒体占位符，纯文本回复也不会开启语音（禁止 `<|audio_start|>`、`<|mixed_start|>`），
+与模型卡中 `generate` 的做法一致。语音请求不保留在前缀缓存中（其帧是嵌入行而非 token），之后历史中的语音助手回合
+按其转写重新渲染，而不是按音频。见 [docs/models/lfm3_zh-cn.md](docs/models/lfm3_zh-cn.md#语音输出)。
+
+```bash
+curl http://localhost:5000/v1/audio/speech -H "content-type: application/json" \
+  -d '{"model":"LFM3-Omni-2B-Q4_K_M","input":"你好。","voice":"female","language":"zh","seed":1234}' -o hello.wav
+curl http://localhost:5000/v1/chat/completions -H "content-type: application/json" \
+  -d '{"model":"LFM3-Omni-2B-Q4_K_M","messages":[{"role":"user","content":"法国的首都是哪里？"}],
+       "modalities":["text","audio"],"audio":{"voice":"female","format":"wav"}}'
+```
 
 ## HTTP API
 

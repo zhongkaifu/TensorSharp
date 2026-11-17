@@ -308,6 +308,44 @@ namespace TensorSharp.Cli
                     "family's. Default: the GGUF's template.",
                     ChatTemplateFile.Flag + " chat_template.jinja"),
             }),
+            ("Speech output (TTS models; LFM3-Omni speaking through its mmproj)", new[]
+            {
+                new OptionHelp("--tts",
+                    "Speak --prompt (or --input) with the model's text-to-speech and write the WAV to --output " +
+                    "(default speech.wav). A dedicated TTS model (Kokoro) always synthesizes; a chat model that also " +
+                    "speaks (LFM3-Omni with its mmproj) synthesizes only with --tts - without it the prompt is a chat " +
+                    "turn. LFM3-Omni renders the GGUF's \"tts\" template (as llama-tts), speaks 80 ms frames until its " +
+                    "end-of-speech frame (at most 512 frames), and takes --voice, --language, --seed and " +
+                    "--speech-temperature. Default: off.",
+                    "--tts --prompt \"Hello there.\" --voice male --output hello.wav"),
+                new OptionHelp("--speech-out <file>",
+                    "A single-prompt chat reply is also spoken (LFM3-Omni with its mmproj): its speech is written to " +
+                    "this WAV file (24 kHz mono 16-bit) and its text - the speech's transcript - printed as usual. " +
+                    "Refused for a model without speech output, the interactive chat, JSONL batches, benchmarks and " +
+                    "skills. Default: none (a text reply).",
+                    "--input question.txt --speech-out reply.wav"),
+                new OptionHelp("--speech-mode <interleaved|audio>",
+                    "How a --speech-out reply speaks: interleaved = text and speech in turns (6 text tokens, then " +
+                    "12 frames of 80 ms; the text is the transcript; the system prompt gets \"Respond with " +
+                    "interleaved text and audio.\"), audio = speech only (no transcript). Needs --speech-out. " +
+                    "Default: interleaved.",
+                    "--speech-out reply.wav --speech-mode audio"),
+                new OptionHelp("--speech-temperature <t>",
+                    "Temperature of the speech codes of --tts or --speech-out (0 = argmax). The text slots keep " +
+                    "--temperature. Range: 0 or more. Default: the model's (LFM3-Omni: 0.4, with repetition penalty " +
+                    "1.2 over 64 frames).",
+                    "--speech-temperature 0.6"),
+                new OptionHelp("--voice <name>",
+                    "Voice of the speech: a Kokoro voice (zf_xiaoxiao, af_heart, ...), or female / male for " +
+                    "LFM3-Omni (case-insensitive; the voice is named in the system prompt). Default: the model's first " +
+                    "(LFM3-Omni: female).",
+                    "--voice male"),
+                new OptionHelp("--language <code>",
+                    "Language of the speech (--tts, --speech-out) or of the audio to transcribe (Whisper). LFM3-Omni " +
+                    "speaks ar, da, de, el, en (en-us), en-gb, es, fi, fr, he, it, ja, ko, nl, pl, pt, sv, tr, zh. " +
+                    "Default: en for LFM3-Omni's TTS; detected for Whisper.",
+                    "--language zh"),
+            }),
             ("Compute backend and GPUs", new[]
             {
                 new OptionHelp("--backend <type>",
@@ -1026,6 +1064,8 @@ namespace TensorSharp.Cli
             writer.WriteLine("  TensorSharp.Cli --config config/qwen-image-2.1.json --prompt \"A small orange cat beside a blue vase\" --width 1024 --height 1024 --output generated.png");
             writer.WriteLine("  TensorSharp.Cli --config config/qwen-image-2.1.json --image generated.png --prompt \"Change the blue vase to a red vase\" --output edited.png");
             writer.WriteLine("  TensorSharp.Cli --config config/minimax-h3-fl2va.json --lora config/lora/minimax-h3-fl2v-turbo-8step.json --prompt \"A red fox trotting through falling snow\" --output fox.mp4    (MiniMax-H3 Turbo: 8 steps)");
+            writer.WriteLine("  TensorSharp.Cli --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf --backend ggml_metal --tts --prompt \"Hello there.\" --output hello.wav");
+            writer.WriteLine("  TensorSharp.Cli --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf --backend ggml_metal --input question.txt --speech-out reply.wav    (a spoken reply)");
             writer.WriteLine("  TensorSharp.Cli --model model.gguf --backend ggml_cuda --benchmark --bench-prefill 512 --bench-decode 128");
             writer.WriteLine("  TensorSharp.Cli --config run.json    (read options from a file)");
         }
