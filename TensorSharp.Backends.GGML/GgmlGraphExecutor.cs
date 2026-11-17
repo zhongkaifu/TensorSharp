@@ -59,6 +59,7 @@ namespace TensorSharp.GGML
                 // ggml-cuda groups a KV head's queries only over K whose length is a multiple of 256: over exact-length
                 // rows Qwen3.6-35B-A3B's 3.6K prompt spent 133.6 ms in flash attention, Qwen35Model's padded window 31.5
                 // (A40, nsys).
+                // (ggml-vulkan: a family opts in, StandardDecoderModel.PadsPromptWindowsOnVulkan.)
                 PaddedCacheAttention = metal || backend == GgmlBackendType.Cuda,
                 TensorParallel = backend == GgmlBackendType.Cuda,
                 BindsHostPointers = true,

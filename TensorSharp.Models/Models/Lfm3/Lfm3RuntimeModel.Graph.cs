@@ -48,6 +48,11 @@ namespace TensorSharp.Models
         /// the device between steps, so nothing between them reads the device back.</summary>
         protected override bool OverlapsPromptSteps => true;
 
+        /// <summary>On ggml-vulkan a prompt chunk attends the padded F16 cache window, not F32 copies of the cached prefix.
+        /// LFM3-1.7B Q4_K_M on an A40, interleaved: pp4096 10,144 -> 10,693 tok/s, pp16384 8,265 -> 9,419, pp32768 6,576 ->
+        /// 7,861, decode unchanged (llama.cpp's Vulkan build: 11,014 / 10,767 / 9,778).</summary>
+        protected override bool PadsPromptWindowsOnVulkan => true;
+
         /// <summary>The short convolutions trace one rank's channels (its in/out projection shards, filter slice and states).</summary>
         protected override bool RanksLower => true;
 

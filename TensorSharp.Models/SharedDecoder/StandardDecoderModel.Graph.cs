@@ -69,6 +69,14 @@ namespace TensorSharp.Models
         /// </summary>
         protected virtual bool PrunesLastLayerRows => false;
 
+        /// <summary>
+        /// Whether a prompt chunk on ggml-vulkan writes its K/V rows by index and attends the padded F16 cache window, as decode
+        /// rows do (and every chunk does on ggml-metal and ggml-cuda, GraphCapabilities.PaddedCacheAttention), instead of F32
+        /// copies of the whole cached prefix concatenated with its own rows (a cast and a concat a layer, then flash attention
+        /// over F32 K/V). Off by default: a family opts in once its prompts are validated that way on ggml-vulkan.
+        /// </summary>
+        protected virtual bool PadsPromptWindowsOnVulkan => false;
+
         /// <summary>A reason the current configuration cannot run whole-forward graphs, or null.</summary>
         private string GraphUnsupportedReason()
         {
@@ -2219,7 +2227,7 @@ namespace TensorSharp.Models
             // Decode rows and short chunks (a verify window) are written by index. Tensor-parallel graphs write every chunk by
             // index too: ggml's meta device splits set_rows by KV head, while a copy into a strided cache view fails on the ranks.
             bool Indexed(int count) => count <= SmallChunkRows || _graphTpRanks != null || caps.IndexedCacheWrites
-                || (caps.PaddedCacheAttention && kvType != GraphFormat.F32);
+                || ((caps.PaddedCacheAttention || (PadsPromptWindowsOnVulkan && _backend == BackendType.GgmlVulkan)) && kvType != GraphFormat.F32);
             // One sequence's rows written by index: a family may take their query/key prep and cache writes as one region, which
             // the rotated queries close once the rows are written (the caches' leaves and the write rows exist before it opens).
             // (A sliding-window ring past its first lap writes its rows at their cells, which the prep region does not take.)
