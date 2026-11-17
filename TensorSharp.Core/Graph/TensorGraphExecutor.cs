@@ -23,7 +23,7 @@ namespace TensorSharp.Graph
     /// overrides the kernels it has its own implementation of (quantized products, attention,
     /// the recurrences).
     /// </summary>
-    public abstract class TensorGraphExecutor : IStreamingGraphExecutor
+    public abstract partial class TensorGraphExecutor : IStreamingGraphExecutor
     {
         /// <inheritdoc cref="IGraphExecutor.Drafting"/>
         public bool Drafting { get; set; }
@@ -92,6 +92,8 @@ namespace TensorSharp.Graph
             GraphOp.RopeExt, GraphOp.RopeMulti, GraphOp.FlashAttnExt, GraphOp.SoftMaxExt, GraphOp.TopK, GraphOp.SumRows,
             GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow, GraphOp.Sqr, GraphOp.Sqrt, GraphOp.Clamp,
             GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce, GraphOp.MoeHostExperts,
+            // Non-decoder networks (TensorGraphExecutor.Network.cs).
+            GraphOp.Norm, GraphOp.GeluErf, GraphOp.DepthwiseConv2d,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -1593,6 +1595,9 @@ namespace TensorSharp.Graph
                     return V(Ops.SiLUMul(null, In(gate, run), In(up, run)));
                 }
                 case GraphOp.RmsNorm: return V(RowNorm(T(0), Fp(0, 1e-6f), run));
+                case GraphOp.Norm: return V(LayerNormRows(T(0), Fp(0, 1e-6f), run));
+                case GraphOp.GeluErf: return V(GeluErf(In(T(0), run)));
+                case GraphOp.DepthwiseConv2d: return V(DepthwiseConv2dNode(T(0), T(1), n, run));
                 case GraphOp.L2Norm:
                 {
                     // x / max(|x|, eps) as an unweighted RMS norm: 1 / sqrt(sum / n + eps^2 / n) / sqrt(n).
@@ -2431,6 +2436,9 @@ namespace TensorSharp.Graph
             // Read on the host only where the host needs them (multi-axis rows, or no device positions): a recorded step's
             // varying positions are never read back.
             int[] pos = multi || !BroadcastsPositionsOnDevice || positions.Tensor == null ? Ints(positions) : null;
+            // A vision tower's 2-D rotary (ggml's VISION mode) rotates pairs (i, i + n_dims) over the whole head, sections
+            // reading different axes: never the NeoX shortcut below, and not the interleaved host loop after it.
+            if (multi && mode == RopeTypeVision) return RopeVision(x, pos, n, run);
             // Multi-axis rotary whose axes all carry the same position (every text token) is NeoX rotary at
             // that position: the device kernel, not the host loop below (which reads and writes the rows).
             if (multi && extFactor == 0f && pos.Length >= 3 * tokens && SameAxes(pos, tokens, n.Ip.Length > 6 && n.Ip[6] > 0 ? 4 : 3))
