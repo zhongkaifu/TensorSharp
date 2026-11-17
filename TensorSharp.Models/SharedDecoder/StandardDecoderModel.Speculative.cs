@@ -402,7 +402,64 @@ namespace TensorSharp.Models
         {
             base.WarmUpKernels();
             WarmVerifyWidths();
+            WarmDFlashFollowProducts();
             WarmPooledSlot();
+        }
+
+        /// <summary>
+        /// The products a speculating request's prompt step runs to write its block drafter's ring (<see cref="EmitDFlashFollow"/>:
+        /// each draft layer's K and V projections over the chunk's kept rows, the encoder's over blocks of them), so the kernels
+        /// they take are loaded before a request's first token waits for them (<see cref="IGraphExecutor.WarmProducts"/>): the
+        /// first Qwen3.8-27B DFlash2 prompt step of four conversations at once ran 162-163 ms where it runs 110-112 warm (an RTX
+        /// PRO 6000 slice), its Q6_K V projections' first GEMM waiting 45 + 21 ms to launch. Every row count up to 64 and a
+        /// ladder above it, each weight shape once (0.18-0.19 s at load there): a sweep of every count from 1 to 2,081 loaded
+        /// kernels at 1, 33 and 65 rows only, and took 2.7 s.
+        /// </summary>
+        private void WarmDFlashFollowProducts() => WarmDFlashFollowProductsCounted();
+
+        /// <summary><see cref="WarmDFlashFollowProducts"/>; the weight shapes whose products the executor ran (tests).</summary>
+        internal int WarmDFlashFollowProductsCounted()
+        {
+            if (!HasDFlash || !DFlashSelfCatchUp || GraphUnsupportedReason() != null || GraphExecutor is not { } executor
+                || _dflashLayerNames == null)
+                return 0;
+            MarkDrafterWeights();
+            // A chunk keeps up to a ring's rows (and the zero row before them); the encoder joins them a block at a time.
+            int kept = Math.Max(1, DFlashRingRows) + 1;
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            var shapes = new System.Collections.Generic.HashSet<(int Format, long Ne0, long Ne1)>();
+            int warmed = 0;
+            void Warm(string name, int widest)
+            {
+                if (_quantWeights.TryGetValue(name, out QuantizedWeight weight) && weight != null
+                    && shapes.Add((weight.GgmlType, weight.Ne0, weight.Ne1)) && executor.WarmProducts(weight, FollowWarmRows(widest)))
+                    warmed++;
+            }
+            Warm(DFlashConfig.WeightPrefix + "fc.weight", Math.Min(kept, DFlashFollowBlockRows));
+            foreach (string[] names in _dflashLayerNames)
+            {
+                Warm(names[DfAttnK], kept);
+                Warm(names[DfAttnV], kept);
+            }
+            if (warmed > 0)
+                Console.WriteLine($"    Drafter follow warmup ({warmed} weight shapes, 1-{kept} rows): {started.Elapsed.TotalMilliseconds:F1} ms");
+            return warmed;
+        }
+
+        /// <summary>Row counts <see cref="WarmDFlashFollowProducts"/> runs a product at, up to <paramref name="widest"/>: every count
+        /// to 64, then a ladder of about four a doubling, and the widest.</summary>
+        internal static int[] FollowWarmRows(int widest)
+        {
+            var rows = new System.Collections.Generic.List<int>();
+            for (int r = 1; r <= Math.Min(64, widest); r++) rows.Add(r);
+            for (int octave = 64; octave < widest; octave *= 2)
+                for (int quarter = 1; quarter <= 4; quarter++)
+                {
+                    int r = octave + octave * quarter / 4;
+                    if (r < widest) rows.Add(r);
+                }
+            if (widest > 64) rows.Add(widest);
+            return rows.ToArray();
         }
 
         private void WarmVerifyWidths()

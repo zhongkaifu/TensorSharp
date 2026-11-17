@@ -91,6 +91,32 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>
+        /// The weight's product at each row count over zeros, as a step's product of those rows runs (its route chosen by the
+        /// rows, the weight's format and whether only a drafter reads it), the results discarded. A route through cuBLAS loads
+        /// the kernel its heuristics pick for the shape at that kernel's first launch: the first Qwen3.8-27B DFlash2 prompt of
+        /// 41 rows to write its drafter's ring waited 45 + 21 ms for the GEMM of its Q6_K V projections to launch (an RTX PRO
+        /// 6000 slice; later prompts of 30-48 rows, none), inside four conversations' first tokens.
+        /// </summary>
+        public override bool WarmProducts(IGraphWeight weight, IReadOnlyList<int> rows)
+        {
+            if (weight == null || rows == null || rows.Count == 0 || Kernels == null || weight.Ne0 <= 0 || weight.Ne0 > int.MaxValue
+                || weight.Ne2 > 1 || CudaGraphCapture.IsCapturing((CudaAllocator)Allocator))
+                return false;
+            return OnBackendThread(() =>
+            {
+                foreach (int count in rows)
+                {
+                    if (count < 1) continue;
+                    using var x = new Tensor(Allocator, DType.Float32, count, weight.Ne0);
+                    Ops.Fill(x, 0);
+                    using Tensor product = QuantizedMatMul(weight, x);
+                }
+                ((CudaAllocator)Allocator).Stream.Synchronize();
+                return true;
+            });
+        }
+
         public bool HasRoomToRecord()
         {
             if (Allocator is not CudaAllocator cuda) return false;

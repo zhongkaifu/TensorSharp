@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 
 namespace TensorSharp.Graph
 {
@@ -113,6 +114,11 @@ namespace TensorSharp.Graph
         /// a block drafter's ring). False where the executor runs them as any other weight's (it reads nothing of the weight:
         /// a weight's device cache key is made on first use by the executors that key on it).</summary>
         bool MarkDrafterWeight(IGraphWeight weight) => false;
+
+        /// <summary>Run <paramref name="weight"/>'s product over zero rows once for each count in <paramref name="rows"/>, the
+        /// results discarded, so whatever a product of that many rows loads at its first launch (a library's kernels the driver
+        /// loads lazily) is loaded before a request's step runs it. False where the executor does nothing.</summary>
+        bool WarmProducts(IGraphWeight weight, IReadOnlyList<int> rows) => false;
 
         /// <summary>Whether decode rows and short chunks over a K/V cache of <paramref name="kvFormat"/> with
         /// <paramref name="headDim"/>-wide heads may attend their slot's whole capacity as their padded window: the executor's

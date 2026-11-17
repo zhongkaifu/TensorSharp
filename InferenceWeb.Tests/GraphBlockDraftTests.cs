@@ -259,6 +259,38 @@ public sealed class GraphBlockDraftTests : IDisposable
     public Task FirstDecodeStepAfterThePromptDraftsOnDirectCuda(string family, string variant)
         => FirstDecodeStepDrafts(family, variant, BackendType.Cuda);
 
+    /// <summary>The drafter-follow warm-up runs its products at every row count up to 64 and a ladder above it, up to the
+    /// widest a chunk keeps.</summary>
+    [Fact]
+    public void TheFollowWarmupRowsCoverEveryCountTo64AndALadderAbove()
+    {
+        Assert.Equal(Enumerable.Range(1, 10), StandardDecoderModel.FollowWarmRows(10));
+        int[] rows = StandardDecoderModel.FollowWarmRows(2081);
+        Assert.Equal(Enumerable.Range(1, 64), rows.Take(64));
+        Assert.Equal(2081, rows[^1]);
+        Assert.True(rows.Zip(rows.Skip(1)).All(pair => pair.Second > pair.First));
+        Assert.All(new[] { 80, 128, 256, 512, 1024, 2048 }, r => Assert.Contains(r, rows));
+        Assert.True(rows.Length < 120, $"{rows.Length} row counts");
+    }
+
+    /// <summary>On direct CUDA the drafter-follow warm-up runs the follow's products, one per weight shape (a drafter with
+    /// DFlash2 Q4_K_M's formats: Q4_K encoder and K projections, Q6_K V projections), where the managed executor runs none, and
+    /// a model warmed so still drafts what plain decoding emits.</summary>
+    [CudaFact]
+    public void TheFollowWarmupRunsTheFollowsProductsOnDirectCuda()
+    {
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        var files = Files("qwen35", "dflash2-kquant");
+        using (StandardDecoderModel cpu = Create(files, BackendType.Cpu))
+            Assert.Equal(0, cpu.WarmDFlashFollowProductsCounted());
+        SpeculativeRuntimeChecks.AssertBlockDraftMatchesPlainGreedy(() =>
+        {
+            StandardDecoderModel model = Create(files, BackendType.Cuda);
+            Assert.Equal(3, model.WarmDFlashFollowProductsCounted());
+            return model;
+        }, "qwen35 dflash2-kquant cuda warmed follow");
+    }
+
     /// <summary>
     /// A prompt that arrives while other requests speculate is read before their drafts and verify windows in the step that
     /// admits it, and its first token streams then (BatchExecutor.PromptFinished), not after their verify; every stream is
@@ -755,6 +787,8 @@ public sealed class GraphBlockDraftTests : IDisposable
             "dflash2" => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: 5, hidden: hidden, layers: 2, slidingWindow: 16, dflash2: true),
             "dflash2-q8" => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: 5, hidden: hidden, slidingWindow: 16, dflash2: true,
                 codebookType: SyntheticGguf.GgmlType.Q8_0),
+            "dflash2-kquant" => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: 5, hidden: hidden, layers: 2, slidingWindow: 16,
+                dflash2: true, kQuantProjections: true),
             _ => throw new ArgumentOutOfRangeException(nameof(variant)),
         };
         return (target, draft);
