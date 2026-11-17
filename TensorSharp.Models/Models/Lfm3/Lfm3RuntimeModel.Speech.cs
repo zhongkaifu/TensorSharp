@@ -56,7 +56,7 @@ namespace TensorSharp.Models
         public bool HasSpeechVocabulary => SpeechTokens != null;
 
         /// <summary>The speech control tokens, or null where the checkpoint has no "tts" template or lacks one of them.</summary>
-        private Lfm3SpeechTokens SpeechTokens
+        internal Lfm3SpeechTokens SpeechTokens
         {
             get
             {

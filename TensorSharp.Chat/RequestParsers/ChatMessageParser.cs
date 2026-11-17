@@ -254,10 +254,12 @@ namespace TensorSharp.Server.RequestParsers
         /// <see cref="ParseOpenAI(JsonElement, UploadStoragePolicy, ILogger, string, bool)"/> where an assistant message may
         /// carry an earlier spoken reply as OpenAI's <c>audio: {"id": ...}</c> (content null): <paramref name="assistantAudio"/>
         /// gives that reply's transcript, which the turn renders as. An id it does not know (null) is a
-        /// <see cref="JsonException"/> (an HTTP 400).
+        /// <see cref="JsonException"/> (an HTTP 400). Where <paramref name="assistantAudioTurn"/> knows the reply as generation
+        /// decoded it, the turn is spliced back as that (its tokens, its frames' rows) instead (<see cref="SpokenTurnRecord"/>).
         /// </summary>
         public static List<ChatMessage> ParseOpenAI(JsonElement messagesEl, UploadStoragePolicy uploads, ILogger logger,
-            string architecture, bool audioEncoderLoaded, Func<string, string> assistantAudio)
+            string architecture, bool audioEncoderLoaded, Func<string, string> assistantAudio,
+            Func<string, SpokenTurnRecord> assistantAudioTurn = null)
         {
             // Scan the complete request before writing any uploads: an image
             // preceding unsupported audio or an invalid image must not leave
@@ -398,6 +400,7 @@ namespace TensorSharp.Server.RequestParsers
                     string transcript = assistantAudio?.Invoke(audioId.GetString());
                     msg.Content = transcript ?? throw new JsonException(
                         $"assistant audio '{audioId.GetString()}' is not known here (an unknown or expired id): send the reply's transcript as its content instead.");
+                    assistantAudioTurn?.Invoke(audioId.GetString())?.ApplyTo(msg);
                 }
 
                 messages.Add(msg);

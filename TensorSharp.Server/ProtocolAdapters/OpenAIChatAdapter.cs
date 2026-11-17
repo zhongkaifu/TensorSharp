@@ -184,9 +184,11 @@ public sealed partial class OpenAIChatAdapter
         List<ChatMessage> messages;
         try
         {
-            // An assistant turn may be an earlier spoken reply sent back by its audio id: its transcript renders it.
+            // An assistant turn may be an earlier spoken reply sent back by its audio id: it is spliced back as generation
+            // decoded it (its tokens, its frames' rows), or rendered as its transcript where that is not known.
             messages = ChatMessageParser.ParseOpenAI(messagesEl, _uploads, openaiLogger, _svc.Architecture,
-                _svc.IsAudioEncoderLoaded, SpeechReplies.TranscriptOf);
+                _svc.IsAudioEncoderLoaded, SpeechReplies.TranscriptOf,
+                id => SpeechReplies.TryGet(id, out var e) ? e.Turn : null);
         }
         catch (UploadLimitExceededException ex)
         {

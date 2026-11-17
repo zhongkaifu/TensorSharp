@@ -10,6 +10,7 @@ using System.Globalization;
 using System.Text;
 
 using TensorSharp.Models.Architecture;
+using TensorSharp.Models.Lfm3;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models
@@ -50,7 +51,7 @@ namespace TensorSharp.Models
                     foreach (Lfm3MediaItem item in Lfm3MediaLayout.Items(message))
                         items.Add((message, item));
             if (items.Count == 0)
-                return inputTokens;
+                return PlaceLfm3SpeechRows(model, history, inputTokens);
 
             if (model.VisionEncoder == null && items.Exists(i => i.Item.Kind != Lfm3MediaKind.Audio))
                 throw new NotSupportedException(Lfm3RuntimeModel.VisionInputUnsupportedMessage);
@@ -94,7 +95,73 @@ namespace TensorSharp.Models
             }
             for (int i = copied; i < inputTokens.Count; i++)
                 output.Add(inputTokens[i]);
-            return output;
+            return PlaceLfm3SpeechRows(model, history, output);
+        }
+
+        /// <summary>
+        /// The speech of past spoken turns (<see cref="ChatMessage.SpeechFrames"/>): their spliced output holds one
+        /// <c>&lt;|audio_out|&gt;</c> per frame the reply decoded, in order, and each gets that frame's feedback row
+        /// (<see cref="Lfm3SpeechOutput.FeedbackRow(ReadOnlySpan{int})"/>, the row generation decoded), so the turn re-renders
+        /// as what generation produced (HF's processor gives a past speech turn's placeholders the same codebook sums). Each
+        /// run of placeholders is one span whose content identity is its codes, for prompt reuse. A prompt whose placeholders
+        /// and frames disagree is refused rather than given rows of the wrong frames.
+        /// </summary>
+        private List<int> PlaceLfm3SpeechRows(Lfm3RuntimeModel model, List<ChatMessage> history, List<int> tokens)
+        {
+            var frames = new List<int[]>();
+            if (history != null)
+                foreach (ChatMessage message in history)
+                    if (message?.SpeechFrames is { Count: > 0 } spoken)
+                        frames.AddRange(spoken);
+            if (frames.Count == 0)
+                return tokens;
+            int audioOut = model.SpeechTokens?.AudioOut ?? -1;
+            int placeholders = 0;
+            if (audioOut >= 0)
+                foreach (int t in tokens)
+                    if (t == audioOut) placeholders++;
+            Lfm3SpeechOutput speech = model.SpeechOutput ?? throw new NotSupportedException(
+                "lfm3: the history holds a spoken reply, whose speech re-renders through the speech decoder of the mmproj; " +
+                "load the LFM3-Omni mmproj with speech output, or send the reply's transcript as its content");
+            if (placeholders != frames.Count)
+                throw new InvalidOperationException(
+                    $"lfm3: the prompt holds {placeholders} <|audio_out|> placeholder(s) for {frames.Count} speech frame(s) of " +
+                    "past spoken replies; the rendered prompt and the replies disagree.");
+            int next = 0;
+            for (int i = 0; i < tokens.Count;)
+            {
+                if (tokens[i] != audioOut) { i++; continue; }
+                int start = i;
+                while (i < tokens.Count && tokens[i] == audioOut) i++;
+                CachedEmbedding rows = GetOrCreateLfm3SpeechRows(model, speech, frames, next, i - start);
+                _preparedAudioEmbeddings.Add(new PreparedEmbeddingSpan(rows, start, start, i));
+                next += i - start;
+            }
+            return tokens;
+        }
+
+        /// <summary>Feedback rows of frames [<paramref name="first"/>, + <paramref name="count"/>) as a cached embedding keyed by
+        /// their codes.</summary>
+        private CachedEmbedding GetOrCreateLfm3SpeechRows(Lfm3RuntimeModel model, Lfm3SpeechOutput speech, List<int[]> frames,
+            int first, int count)
+        {
+            var codes = new List<byte>(count * Lfm3SpeechConfig.Codebooks * 4);
+            for (int f = first; f < first + count; f++)
+                foreach (int c in frames[f])
+                    codes.AddRange(BitConverter.GetBytes(c));
+            string key = "lfm3-speech:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(codes.ToArray()));
+            if (_audioCache.TryGetValue(key, out CachedEmbedding cached))
+            {
+                TouchAndPin(cached);
+                return cached;
+            }
+            int width = speech.Config.HiddenSize;
+            var values = new float[(long)count * width];
+            for (int f = 0; f < count; f++)
+                speech.FeedbackRow(frames[first + f], values.AsSpan(f * width, width));
+            var t = new Tensor(model.MediaAllocator, DType.Float32, count, width);
+            t.SetElementsAsFloat(values);
+            return StoreLfm3Entry(_audioCache, key, key, t);
         }
 
         /// <summary><c>&lt;|audio|&gt;</c>: the template's placeholder of an audio part, and the slot token of audio rows.</summary>

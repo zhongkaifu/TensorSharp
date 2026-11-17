@@ -348,9 +348,17 @@ greedy pick is not used for LFM3-Omni's text replies.)
   3-5x faster for both). Audio-only steps skip the LM head (-15% of the step). MLX runs at about
   half Metal's speed (its fixed cost per graph run).
 
-Limits: no `/v1/realtime`; a spoken assistant turn in later history renders as its
-transcript (OpenAI's `audio.id` maps to it for an hour), not as its audio frames; speech
-requests are not retained in the prefix cache; speech and CUDA are untested on NVIDIA GPUs.
+History: a spoken assistant turn sent back in a later request (OpenAI's
+`{"role":"assistant","audio":{"id":...}}`, kept for an hour) is spliced back as generation decoded
+it: the token that opened the mode, the text tokens and one `<|audio_out|>` per decoded frame, each
+given that frame's codebook-sum row (the end-of-speech frame included), as HF's processor gives a
+past speech turn's placeholders. Its prompt tokens are therefore the reply's own sequence (checked
+token for token against generation on LFM3-Omni Q8_0). Each run of frames is one media span keyed
+by its codes. An id whose generation is not known renders as its transcript.
+
+Limits: no `/v1/realtime`; speech requests are not retained in the prefix cache, and a later turn
+does not yet reuse the cache across a spliced spoken turn (open issue); speech and CUDA are untested
+on NVIDIA GPUs.
 
 ## Benchmarking
 
@@ -361,8 +369,8 @@ sampling on every engine.
 
 ## Current limits
 
-- Speech output has no realtime endpoint (`/v1/realtime`), and past spoken turns re-render
-  as their transcripts (see [Speech output](#speech-output)).
+- Speech output has no realtime endpoint (`/v1/realtime`), and a later turn does not yet reuse
+  the prefix cache across a past spoken turn (see [Speech output](#speech-output)).
 - Media input and speech output on CUDA (direct and ggml-cuda) and Vulkan have not run (no device).
 - Speech input as a live stream (a realtime endpoint) is not served; clips are encoded
   whole (30 s chunks).

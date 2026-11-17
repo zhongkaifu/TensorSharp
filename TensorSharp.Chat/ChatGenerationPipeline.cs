@@ -94,6 +94,9 @@ namespace TensorSharp.Server
         /// the reply's audio for a later turn.</summary>
         public IReadOnlyList<int[]> SpeechFrames { get; init; }
 
+        /// <summary>A spoken reply as a later turn splices it back (terminal update of a reply that spoke, else null).</summary>
+        public SpokenTurnRecord SpokenTurn { get; init; }
+
         /// <summary>A piece of a spoken reply's speech.</summary>
         public static ChatStreamUpdate AudioChunk(float[] samples, int sampleRate) =>
             new(string.Empty, false, 0, 0, 0, 0, 0, 0, null) { Audio = samples, AudioSampleRate = sampleRate };
@@ -558,6 +561,8 @@ namespace TensorSharp.Server
             // however far the request got.
             SequenceState seq = null;
             TensorSharp.Models.Audio.SpeechReplyDriver speechDriver = null;
+            string speechPromptSuffix = null;
+            int speechOpening = -1;
             bool submitted = false;
             InferenceCompletion completion = null;
             List<int> generatedTokens = null;
@@ -782,6 +787,10 @@ namespace TensorSharp.Server
             if (speaker != null)
             {
                 int opening = speaker.SpeechOpeningToken(speech.Mode);
+                // How a later turn splices this reply back: the prompt's own framing, then the opening token and the output.
+                speechPromptSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking,
+                    model.Config.ChatTemplate);
+                speechOpening = opening;
                 if (opening >= 0)
                 {
                     inputTokens = new List<int>(inputTokens) { opening };
@@ -1196,6 +1205,11 @@ namespace TensorSharp.Server
                 RawGenerationSuffix = recordedSuffix,
                 SpeechFrames = speechDriver?.FrameCodes,
                 AudioSampleRate = speechDriver?.SampleRate ?? 0,
+                // A spoken reply, for a later turn to splice back with its frames' rows (ChatMessage.SpeechFrames).
+                SpokenTurn = speechDriver == null || wasCancelled ? null : new SpokenTurnRecord(
+                    speechOpening >= 0 ? new List<int>(generatedTokens.Count + 1) { speechOpening }.Concat(generatedTokens).ToList()
+                        : new List<int>(generatedTokens),
+                    speechDriver.FedFrameCodes, generationPromptTrailingWhitespace, speechPromptSuffix),
             };
             }
             finally
@@ -2983,6 +2997,8 @@ namespace TensorSharp.Server
                 if (m.ImagePaths != null && m.ImagePaths.Count > 0) return true;
                 if (m.AudioPaths != null && m.AudioPaths.Count > 0) return true;
                 if (m.VideoFilePaths != null && m.VideoFilePaths.Count > 0) return true;
+                // A past spoken reply: its frames' rows go in through the expander.
+                if (m.SpeechFrames != null && m.SpeechFrames.Count > 0) return true;
             }
             return false;
         }

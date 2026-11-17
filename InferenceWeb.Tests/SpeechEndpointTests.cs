@@ -319,6 +319,31 @@ public sealed class SpeechEndpointTests : IDisposable
         Assert.True(entry.ExpiresAt > DateTimeOffset.UtcNow.AddMinutes(59));
     }
 
+    /// <summary>A stored reply whose generation is known splices back as it: its tokens (the opening token, text and one
+    /// frame placeholder per decoded frame), its frames' codes for their rows, its prompt framing; the transcript stays
+    /// its content (what a renderer without splicing shows). One without falls back to the transcript alone.</summary>
+    [Fact]
+    public void AStoredReply_SplicesBackAsGenerationDecodedIt()
+    {
+        var frames = new[] { Enumerable.Repeat(5, 12).ToArray(), Enumerable.Repeat(2016, 12).ToArray() };
+        var turn = new SpokenTurnRecord(new[] { 241, 60, 243, 61, 243 }, frames, "", "<think></think>");
+        var entry = OpenAIChatAdapter.SpeechReplies.Add("Hi.", frames, turn: turn);
+        var plain = OpenAIChatAdapter.SpeechReplies.Add("Plain.", frames);
+        using var doc = JsonDocument.Parse("[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":null,\"audio\":{\"id\":\""
+            + entry.Id + "\"}},{\"role\":\"assistant\",\"content\":null,\"audio\":{\"id\":\"" + plain.Id + "\"}}]");
+        List<ChatMessage> messages = TensorSharp.Server.RequestParsers.ChatMessageParser.ParseOpenAI(doc.RootElement,
+            new UploadStoragePolicy(Path.Combine(_root, "uploads")), null, "lfm3", false, OpenAIChatAdapter.SpeechReplies.TranscriptOf,
+            id => OpenAIChatAdapter.SpeechReplies.TryGet(id, out var e) ? e.Turn : null);
+        Assert.Equal("Hi.", messages[1].Content);
+        Assert.Equal(new[] { 241, 60, 243, 61, 243 }, messages[1].RawOutputTokens);
+        Assert.Same(frames, messages[1].SpeechFrames);
+        Assert.Equal("<think></think>", messages[1].RawGenerationSuffix);
+        Assert.Equal("", messages[1].RawPromptTrailingWhitespace);
+        Assert.Equal("Plain.", messages[2].Content);
+        Assert.Null(messages[2].RawOutputTokens);
+        Assert.Null(messages[2].SpeechFrames);
+    }
+
     [Theory]
     [InlineData(",\"modalities\":[\"text\",\"audio\"],\"audio\":{\"voice\":\"alloy\"}", "alloy")]
     [InlineData(",\"modalities\":[\"audio\"],\"stream\":true,\"audio\":{\"format\":\"wav\"}", "pcm16")]
