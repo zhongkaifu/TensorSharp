@@ -252,7 +252,12 @@ namespace TensorSharp.Models
                 {
                     long bytes = (slot.K?[e] is { } k && r < k.Length && k[r] != null ? k[r].Storage.ByteLength : 0)
                         + (slot.V?[e] is { } v && r < v.Length && v[r] != null ? v[r].Storage.ByteLength : 0);
-                    if (bytes > 0) Add(CacheStage(e), r, bytes, 0);
+                    if (bytes <= 0) continue;
+                    // A sliding-window ring costs its whole ring a slot, whatever the slot's length.
+                    if (RingOf(e) is > 0 and var ring)
+                        Add(CacheStage(e), r, 0, bytes / Math.Max(1, CacheCells(e, slot.Capacity)) * ring);
+                    else
+                        Add(CacheStage(e), r, bytes, 0);
                 }
             if (slot.Recurrent != null)
                 for (int l = 0; l < slot.Recurrent.Length; l++)
@@ -563,8 +568,10 @@ namespace TensorSharp.Models
                 for (int r = 0; r < from[l].Length; r++)
                 {
                     if (from[l][r] == null) continue;   // a rank that does not run this entry (a draft layer off rank 0)
-                    using Tensor src = from[l][r].Narrow(1, 0, rows);
-                    using Tensor dst = to[l][r].Narrow(1, 0, rows);
+                    // A ring past its first lap moves whole (same cells on both sides).
+                    int n = (int)Math.Min(rows, from[l][r].Sizes[1]);
+                    using Tensor src = from[l][r].Narrow(1, 0, n);
+                    using Tensor dst = to[l][r].Narrow(1, 0, n);
                     Ops.Copy(dst, src);
                 }
             }
@@ -747,6 +754,8 @@ namespace TensorSharp.Models
         private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
             float[][] features = null)
         {
+            if (_maxSequenceStepRows != int.MaxValue && chunks.Any(c => c != null && c.Length > _maxSequenceStepRows))
+                return TryForwardSlotsInRingSteps(requestIds, chunks, starts, outLogits, features);
             try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {
@@ -781,6 +790,47 @@ namespace TensorSharp.Models
                 if (partFeatures != null) Array.Copy(partFeatures, 0, features, from, count);
                 return ran;
             }
+        }
+
+        /// <summary>
+        /// A batched step whose chunks hold more rows of a sequence than its sliding-window rings hold beside their window, as
+        /// rounds of at most <see cref="MaxSequenceStepRows"/> rows a sequence (StandardDecoderModel.SlidingRings.cs): round k
+        /// carries piece k of every chunk that has one, and each sequence's logits come from the round of its last piece.
+        /// Declines (nothing run) where the first round does.
+        /// </summary>
+        private bool TryForwardSlotsInRingSteps(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
+            float[][] features)
+        {
+            if (features != null && Array.Exists(features, f => f != null))
+                throw new NotSupportedException($"{Config.Architecture}: drafter features of a chunk longer than {_maxSequenceStepRows} rows, " +
+                    "which its sliding-window ring caches take in steps.");
+            int step = _maxSequenceStepRows, n = requestIds.Count, rounds = 0;
+            for (int s = 0; s < n; s++) rounds = Math.Max(rounds, ((chunks[s]?.Length ?? 0) + step - 1) / step);
+            for (int round = 0; round < rounds; round++)
+            {
+                var ids = new List<string>();
+                var parts = new List<int[]>();
+                var partStarts = new List<int>();
+                var owners = new List<int>();
+                for (int s = 0; s < n; s++)
+                {
+                    int at = round * step, length = chunks[s]?.Length ?? 0;
+                    if (at >= length) continue;
+                    ids.Add(requestIds[s]);
+                    parts.Add(chunks[s].AsSpan(at, Math.Min(step, length - at)).ToArray());
+                    partStarts.Add(starts[s] + at);
+                    owners.Add(s);
+                }
+                var logits = new float[ids.Count][];
+                if (!TryForwardSlots(ids, parts, partStarts.ToArray(), logits))
+                {
+                    if (round == 0) return false;
+                    throw new InvalidOperationException($"{Config.Architecture}: round {round} of a batched step in ring steps declined after the first ran.");
+                }
+                for (int i = 0; i < owners.Count; i++)
+                    if ((round + 1) * step >= chunks[owners[i]].Length) outLogits[owners[i]] = logits[i];
+            }
+            return true;
         }
 
         /// <summary>Frees the device memory a step can do without: the cached graphs, the kept arenas and the idle slots'
@@ -958,8 +1008,10 @@ namespace TensorSharp.Models
         {
             Tensor cacheK = slot.K[layer][scope.Rank], cacheV = slot.V[layer][scope.Rank];
             int band = SlidingWindow(layer);
+            if (RingWrapped(layer, start, count))
+                return RingAttention(scope, cacheK, cacheV, RingOf(layer), q, k, v, start, count, band);
             return count == 1
-                ? DecodeAttention(scope, cacheK, cacheV, slot.Capacity, q, k, v, start, band)
+                ? DecodeAttention(scope, cacheK, cacheV, (int)cacheK.Sizes[1], q, k, v, start, band)
                 : PrefillAttention(scope, cacheK, cacheV, q, k, v, start, count, band);
         }
     }

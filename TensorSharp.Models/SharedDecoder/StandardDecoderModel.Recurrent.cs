@@ -255,11 +255,14 @@ namespace TensorSharp.Models
         public override bool CanTruncateKVCache(int cachedTokenCount, int targetTokenCount)
             => _anyRecurrent
                 ? targetTokenCount == cachedTokenCount || targetTokenCount == 0
-                : base.CanTruncateKVCache(cachedTokenCount, targetTokenCount);
+                : base.CanTruncateKVCache(cachedTokenCount, targetTokenCount) && RingsKeepTruncation(cachedTokenCount, targetTokenCount);
 
         protected override bool TryTruncateKVCacheCore(int tokenCount)
         {
             if (_anyRecurrent && tokenCount != _cacheSeqLen && tokenCount != 0)
+                return false;
+            // A sliding-window ring that overwrote the positions the next row's window reads cannot rewind there.
+            if (!RingsKeepTruncation(_cacheSeqLen, tokenCount))
                 return false;
             TruncateKVCacheCore(tokenCount);
             return true;
