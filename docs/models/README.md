@@ -39,7 +39,7 @@ Media in the input column is content the model receives; the output column disti
 | [Nemotron-H / Omni](nemotron.md) | Text; image on Omni; conditional audio | Text | Conditional: audio needs a Parakeet companion absent from public GGUFs. Speculation is unsupported. |
 | [Mistral 3](mistral3.md) | Text, image | Text | Unsupported: explicit thinking mode and tools. Check the named checkpoint/backend coverage. |
 | [Hunyuan Dense](hunyuan-dense.md) | Text | Text | Implemented: single-device text path; tools, tensor parallelism and layer split are unsupported. |
-| [LFM3 / LFM3-Omni](lfm3.md) | Text; image, video, audio on Omni with its projector | Text | Conditional: the chat protocol is checked against llama.cpp; generation, the Omni encoders and every CUDA route are not yet validated. Speech output is not served. |
+| [LFM3 / LFM3-Omni](lfm3.md) | Text; image, video, audio on Omni with its projector | Text | Conditional: the chat protocol and Omni image, video and audio input are checked against llama.cpp end to end (Metal, MLX, CPU); every CUDA route is not yet validated. Speech output is not served. |
 | [GLM 5.x](glm.md) | Text; image only on 5.3-Flash | Text | Conditional: 5.2/5.3 are text-only. NextN excludes active tensor parallelism; the CPU reference has numerical limits. |
 | [DeepSeek V4 Flash](deepseek4.md) | Text | Text | Conditional: check memory and placement; optional DSpark speculation requires a matching drafter. |
 | [DeepSeek V4.1 Flash / 1017](deepseek41.md) | Text; conditional image/video | Text | Experimental: routed-MoE TP/DSpark. Pure-C# CPU coverage is fixture-only; default 1017 YOCO prefill is approximate. |

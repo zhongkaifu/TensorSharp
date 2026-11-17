@@ -2445,7 +2445,7 @@ with `--sampling-precedence request` (see [Web Application](#web-application)).
 | Jev endpoint limits (`POST /v1/systemone`) | 8 MiB body, 64-token canvas, 32 admitted requests | `TS_JEV_MAX_BODY_MB`, `TS_JEV_MAX_CANVAS`, `TS_JEV_MAX_PENDING` |
 | Text-LoRA adapter directory (startup load + `POST /v1/loras`, at most 32 adapters) | unset: no adapters, `POST /v1/loras` answers 403 | `TS_LORAS_DIR` (`--loras-dir`, which wins) |
 | Text and born-digital PDF uploads | Full extracted content; the final rendered prompt must fit the loaded model context | — |
-| Video-frame extraction | 1 fps (time-based, no cap). An OpenAI `video_url` part (DeepSeek V4.1, Qwen 3.8 Flash Next) may set its own `fps` / `max_frames` and caps at 16 frames when `VIDEO_MAX_FRAMES` is unset; Qwen 3.8 merges the sampled frames in pairs with Qwen-VL temporal coordinates (see [its card](docs/models/qwen38-flash-next.md#video-input)) | `VIDEO_SAMPLE_FPS`, `VIDEO_MAX_FRAMES` |
+| Video-frame extraction | 1 fps (time-based, no cap). An OpenAI `video_url` part (DeepSeek V4.1, Qwen 3.8 Flash Next) may set its own `fps` / `max_frames` and caps at 16 frames when `VIDEO_MAX_FRAMES` is unset; Qwen 3.8 merges the sampled frames in pairs with Qwen-VL temporal coordinates (see [its card](docs/models/qwen38-flash-next.md#video-input)). LFM3-Omni reads the clip itself (`--video`, `video_url`, the Web UI's `videoFilePaths`): 2 fps with its soundtrack, whatever these settings say (see [its card](docs/models/lfm3.md#media-input)) | `VIDEO_SAMPLE_FPS`, `VIDEO_MAX_FRAMES` |
 | DiffusionGemma Web UI denoising | 48 steps, max batch 2 | `DIFFUSION_STEPS`, `DIFFUSION_MAX_BATCH` |
 
 #### Logging (server + CLI)

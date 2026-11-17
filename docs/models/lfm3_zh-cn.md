@@ -28,7 +28,15 @@ TensorSharp 暂不提供语音输出）。两者共用一套聊天协议，由 G
   OpenAI 消息与工具解析器处理后，无论走 GGUF 模板还是后备渲染器，渲染结果都与 llama-server `/apply-template`
   **逐字节一致**（`InferenceWeb.Tests/Lfm3ChatProtocolTests.cs`）。回复解析使用 llama.cpp 对两个 Q4_K_M GGUF 的
   真实贪心输出，以 1 到 4096 字符的分块流式验证。固定文件的 SHA-256 与 Hugging Face LFS 对象 id 一致。
-- **尚未验证：** 任何后端上的实际生成、Omni 的视觉与音频编码器、设备上的 TensorAgent 应用，以及所有 CUDA 路径
+- **已验证（2026-11-17），Omni 媒体输入端到端**：与 llama-server（`--mmproj`，相同 GGUF 与 mmproj，贪心解码，
+  完全相同的 OpenAI 请求体；见[媒体输入](#媒体输入)）对比。7 个图像提示（照片、报纸版面、流程图、收据、
+  2048 行的风景图、一次两张图）、8 段 ASR 音频（6 到 47 秒）、2 个音频问答与 2 个图像多轮对话的提示 token 数相同
+  （一段 MP3 例外：两边解码器的样本数相差约一行），并且这 19 个用例中在 ggml_metal 上有 18 个**回复逐 token 一致**
+  （一个多轮回复在 97 个相同 token 后分叉），在 MLX 上 18 个一致（一个流程图描述在 93 个 token 后分叉）；
+  在 ggml_cpu 与托管 CPU 上运行的 4 个图像与音频用例全部一致。7 段已知原文的音频中有 5 段 ASR 词错误率为 0，
+  另外两段各错一个词，且两个引擎错得完全相同。视频按模型自己的方式读取（2 fps 并带音轨），布局与 llama.cpp
+  相差至多一行音频（见下文）；由于两边解码出的帧不同，回复在 6 到 14 个 token 后分叉。
+- **尚未验证：** 任何后端上的实际生成、设备上的 TensorAgent 应用，以及所有 CUDA 路径
   （没有可用的 NVIDIA GPU；`config/lfm3-1.7b-nvfp4.json` 从未运行过）。尚未与 llama.cpp、vLLM、SGLang 对比速度。
 
 ## 运行
@@ -102,14 +110,44 @@ LFM3-Omni 在多模态展开器运行之前的占位符约定（同一条消息�
 | 每段音频 | `<\|vision_start\|><\|audio\|><\|vision_end\|>` | 把 `<\|audio\|>`（125031）替换为编码器输出的各行 |
 
 这些就是模板为 `image`、`video`、`audio` 内容片段渲染的片段，最终布局与 llama.cpp 的 mtmd（Omni 音频同样包在视觉标记中）
-以及 HF（成对标记中放 N 个 `<|image|>`）一致。OpenAI `video_url` 片段会被抽样为带时间的帧并限制帧数（`CapsVideoFrames`）；
-llama.cpp 对 Omni 以 2 fps 抽样，帧数限制在 [4, 384]。
+以及 HF（成对标记中放 N 个 `<|image|>`）一致。一条消息有哪些媒体项由同一条规则决定，渲染器与展开器共用
+（[`Lfm3MediaLayout`](../../TensorSharp.Runtime/Lfm3MediaLayout.cs)）：静态图与视频按附件顺序，然后是音频。
+以文件给出的视频（`ChatMessage.VideoFilePaths`）从文件读取；只有没有给出文件时，宿主抽好的帧才作为视频。
 
 ### 停止 token
 
 `<|im_end|>`（GGUF 的 EOS）与 `<|endoftext|>`，与 llama.cpp 的词表一致。Omni 的 `generation_config.json` 还列出
 `<|text_end|>`（125014）；llama.cpp 只用它结束语音与交错生成，在 LFM3-Omni-2B-Q4_K_M 的 12 次贪心文本对话中它从未出现，
 因此文本对话不以它停止。
+
+## 媒体输入
+
+加载投影器（`--mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf`；配置文件已写明）后，LFM3-Omni 接受图像、视频（含音轨）与音频。
+这一个 mmproj 同时包含视觉塔（`lfm3vl`）与音频塔（`lfm3a`），两者都从它加载。
+
+| 入口 | 图像 | 音频 | 视频 |
+|---|---|---|---|
+| CLI | `--image`（可重复） | `--audio` | `--video clip.mp4` |
+| `/v1/chat/completions` | `image_url`（data URI） | `input_audio` / `audio_url` | `video_url`（data URI） |
+| `/v1/responses` | `input_image` | `input_audio` | `input_video` `{url}` |
+| `/api/chat`（Web UI、TensorAgent） | `imagePaths` | `audioPaths` | `videoFilePaths`（另带 `isVideo` 与 `imagePaths` 中的帧） |
+
+- **视频从文件读取。** 模型像 llama.cpp 与 HF 一样自行抽帧：每秒 2 帧，按 `round(linspace)` 取下标，帧数限制在
+  [4, 384]，所有帧同一尺寸，相邻两帧合成一对并标注 `<t.t seconds>`；音轨（桌面：`PATH` 中的 ffmpeg 或 `TS_FFMPEG`；
+  Apple：AVFoundation）整段编码一次，再切分放在每对帧之后。因此对这个模型族，`video_url` / `input_video` 不在宿主上抽帧
+  （`ChatProtocol.ReadsVideoFiles`），其 `fps` / `max_frames` 不起作用。没有音频流的视频只用画面；音轨无法解码时会给出警告，
+  并只用画面。
+- **他处抽好的帧**（客户端只发送帧）按时间配对：相距不超过 0.575 秒的帧合成一对，标注两者的平均时间；更稀疏的帧各自成为
+  一个时间块；没有时间的帧按 `1 / VIDEO_SAMPLE_FPS` 计时。这不是模型自己的抽帧方式，也没有音轨。
+- **视频上与 llama.cpp 的差异。** TensorSharp 遵循 HF：取精确的源帧（逐帧前进而非定位）、torchvision 的双三次缩放、
+  解码器的平均帧率。llama.cpp 用 swscale 缩放、读取 ffmpeg 的恒定帧率输出并按标称帧率计时，因此在标称帧率与平均帧率
+  不同的视频上，某个时间标签可能相差 0.1 秒，音轨可能多或少一行（`test-3.mp4`：3,221 与 3,220 个提示 token）。
+- **前缀复用遵循媒体身份。** 每张图、每段音频、每对帧与每段音轨都是一个以内容（字节而非文件名）命名的片段：针对同一张图
+  的追问会复用到图之后的缓存提示，换一张图则在其片段处停止复用（`Lfm3OmniModelTests`）。
+- **并发。** 解码文件、缩放帧与计算音频特征时会释放模型的 GPU 锁；视频在每对帧之间让出锁，超过 30 秒的音频在分块之间
+  让出，超过 4,096 个 patch（1,024 行以上）的图像分成两个程序运行，中间让出一次。
+- **拒绝。** LFM3-1.7B，或未加载投影器的 Omni，会拒绝图像、视频与音频输入，并在消息中指明投影器；在请求入口允许的
+  地方，拒绝发生在写入任何上传之前。
 
 ## 采样
 
@@ -130,8 +168,9 @@ SGLang 计入全部输出。`repeat-last-n -1` 与 SGLang 一致；与其他引�
 ## 当前限制
 
 - 不提供语音输出（投影器中的 `lfm3a_gen` 生成器与编解码器）：该模型族尚无聊天音频输出、`/v1/audio/speech` 或实时端点。
-- 不提取视频的音轨（CLI 与 Web UI 只传递帧）。
-- 发给 LFM3-1.7B 或未加载投影器的 Omni 的音频尚未被拒绝；多模态集成必须拒绝它，而不是丢弃它。
+- 媒体输入在 CUDA（直连与 ggml-cuda）和 Vulkan 上没有运行过（没有设备）。
+- 不提供以实时流方式输入语音（实时端点）；音频整段编码（30 秒一块）。
+- 无论客户端顺序如何，一条消息中的静态图都排在视频之前；以 `video_url` 发送的视频在它们之间没有位置。
 - `tool_choice: required` 不由语法强制；嵌套工具 schema 会被展平。
 - 在滑动窗口环形缓存落地之前，TensorAgent 目录按每 token 22,528 字节 K/V 计算；QAD-Q4_0 文件尚未列入目录，等待与 Q4_K_M
   的质量与速度测量。

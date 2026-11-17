@@ -34,8 +34,21 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   (`InferenceWeb.Tests/Lfm3ChatProtocolTests.cs`). Reply parsing is checked on real
   greedy replies of both Q4_K_M GGUFs from llama.cpp, streamed in chunks of 1 to 4096
   characters. The pinned files' SHA-256 equal the Hugging Face LFS object ids.
-- **Not yet validated:** generation itself on any backend, the Omni vision and audio
-  towers, the TensorAgent app on a device, and every CUDA route (no NVIDIA GPU was
+- **Validated (2026-11-17), Omni media input end to end** against llama-server
+  (`--mmproj`, same GGUF and mmproj, greedy, identical OpenAI request bodies; see
+  [Media input](#media-input)): 7 image prompts (photos, a newspaper page, a flowchart, a
+  receipt, a 2048-row landscape, two images at once), 8 ASR clips (6 to 47 s), 2 audio
+  questions and 2 image multi-turn conversations give the same prompt token count (one
+  MP3 clip excepted: its decoders differ by one row's worth of samples) and
+  **token-identical replies** in 18 of these 19 cases on ggml_metal (a multi-turn reply
+  diverges after 97 identical tokens) and 18 of 19 on MLX (a flowchart description
+  diverges after 93), and in all 4 image and audio cases run on ggml_cpu and the managed
+  CPU. ASR word error rate against the spoken text is 0 on 5 of the 7 clips with known
+  text; the other two misread one word each, identically in both engines. Videos are read
+  the model's way (2 fps with the soundtrack) and agree in layout to one audio row (see
+  below); their replies differ after 6 to 14 tokens because the decoders' frames differ.
+- **Not yet validated:** generation itself on any backend, the TensorAgent app on a
+  device, and every CUDA route (no NVIDIA GPU was
   available; `config/lfm3-1.7b-nvfp4.json` in particular has never run). Speed
   against llama.cpp, vLLM and SGLang has not been measured.
 
@@ -159,9 +172,12 @@ message's media always precede its text):
 
 These are the templates' own spans for `image`, `video` and `audio` content parts, and
 the final layout is llama.cpp's mtmd one (which wraps Omni audio in the same vision
-markers) and HF's (`<|image|>` x N inside the pair). OpenAI `video_url` parts are
-sampled into timed frames and capped (`CapsVideoFrames`); llama.cpp samples 2 fps
-clamped to [4, 384] frames for Omni.
+markers) and HF's (`<|image|>` x N inside the pair). One rule decides a message's
+items, for the renderer and the expander alike
+([`Lfm3MediaLayout`](../../TensorSharp.Runtime/Lfm3MediaLayout.cs)): stills and videos in
+attachment order, then audio clips. A video named by its file
+(`ChatMessage.VideoFilePaths`) is read from the file; frames a host sampled are a
+video only when no file is named.
 
 ### Stop tokens
 
@@ -169,6 +185,49 @@ clamped to [4, 384] frames for Omni.
 `generation_config.json` also lists `<|text_end|>` (125014); llama.cpp uses it only to
 end speech and interleaved generation, and in twelve greedy text chats with
 LFM3-Omni-2B-Q4_K_M it never appeared, so text chat does not stop on it.
+
+## Media input
+
+LFM3-Omni takes images, video (with its soundtrack) and audio once its projector is
+loaded (`--mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf`; the configs name it). The one mmproj
+holds the vision tower (`lfm3vl`) and the audio tower (`lfm3a`), both loaded from it.
+
+| Surface | Image | Audio | Video |
+|---|---|---|---|
+| CLI | `--image` (repeatable) | `--audio` | `--video clip.mp4` |
+| `/v1/chat/completions` | `image_url` (data URI) | `input_audio` / `audio_url` | `video_url` (data URI) |
+| `/v1/responses` | `input_image` | `input_audio` | `input_video` `{url}` |
+| `/api/chat` (Web UI, TensorAgent) | `imagePaths` | `audioPaths` | `videoFilePaths` (+ `isVideo`, `imagePaths` frames) |
+
+- **Video is read from the file.** The model samples the clip itself as llama.cpp and
+  HF do: 2 frames a second at `round(linspace)` indices, clamped to [4, 384], one size
+  for all frames, consecutive frames merged in pairs labelled `<t.t seconds>`, and the
+  soundtrack (desktop: ffmpeg on `PATH` or `TS_FFMPEG`; Apple: AVFoundation) encoded once
+  and split after each pair. `video_url` / `input_video` therefore sample no frames on
+  the host for this family (`ChatProtocol.ReadsVideoFiles`), and their `fps` /
+  `max_frames` do not apply. A clip without an audio stream is its frames alone; a
+  soundtrack that cannot be decoded is warned about and the frames are used without it.
+- **Frames sampled elsewhere** (a client that sends only frames) are paired by their
+  times: frames at most 0.575 s apart share a patch labelled with their mean time,
+  sparser ones fill a patch each; untimed frames are taken at `1 / VIDEO_SAMPLE_FPS`.
+  That is not the model's own sampling and has no soundtrack.
+- **Differences from llama.cpp on video.** TensorSharp follows HF: exact source frames
+  (stepping, not seeking), torchvision's bicubic resize and the decoder's average frame
+  rate. llama.cpp resizes with swscale, reads ffmpeg's constant-rate output and clocks
+  with the nominal rate, so on clips whose nominal and average rates differ a label can
+  read one tenth of a second apart and the soundtrack can take one row more or fewer
+  (`test-3.mp4`: 3,221 vs 3,220 prompt tokens).
+- **Prefix reuse follows media identity.** Each image, clip, frame pair and soundtrack
+  piece is a span named by its content (bytes, not file name): a follow-up question
+  about the same image reuses the cached prompt through it, and a different image stops
+  reuse at its span (`Lfm3OmniModelTests`).
+- **Concurrency.** Decoding files, resizing frames and computing audio features run
+  with the model's GPU lock released; a video yields it between frame pairs, audio
+  longer than 30 s between chunks, and an image of more than 4,096 patches (above 1,024
+  rows) runs as two programs with a yield between them.
+- **Refusals.** LFM3-1.7B, or Omni without its projector, refuses image, video and
+  audio input with a message naming the projector, before any upload is written where
+  the request surface allows.
 
 ## Sampling
 
@@ -195,9 +254,11 @@ sampling on every engine.
 
 - Speech output (the projector's `lfm3a_gen` generator and codec) is not served: no
   chat audio-out, `/v1/audio/speech` or realtime endpoint for this family yet.
-- A video's soundtrack is not extracted (the CLI and Web UI pass frames only).
-- Audio sent to LFM3-1.7B, or to Omni without its projector, is not refused yet; the
-  multimodal integration has to refuse it rather than drop it.
+- Media input on CUDA (direct and ggml-cuda) and Vulkan has not run (no device).
+- Speech input as a live stream (a realtime endpoint) is not served; clips are encoded
+  whole (30 s chunks).
+- A message's still images come before its videos in the prompt whatever the client's
+  order; a video sent as `video_url` has no position among them.
 - `tool_choice: required` is not grammar-enforced; nested tool schemas are flattened.
 - TensorAgent's catalog counts 22,528 K/V bytes per token until the sliding-window
   ring lands; the QAD-Q4_0 file is not in the catalog pending a quality and speed

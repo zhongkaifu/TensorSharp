@@ -826,6 +826,38 @@ are 1 fps and 16 frames. Frames keep their source order and each carries its sou
 seconds, so this is frame sampling rather than a temporal encoder. Remote HTTP URLs are not
 fetched — send a data URI. Audio parts are refused with HTTP 400 rather than dropped.
 
+### Chat Completions with Images, Video and Audio (LFM3-Omni)
+
+LFM3-Omni-2B with its projector (`--mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf`) takes images,
+audio and video in one message. A `video_url` clip is saved and read by the model itself:
+2 frames a second (at most 384) and its soundtrack, the way llama.cpp and Hugging Face
+read it, so `fps` / `max_frames` do not apply and no frames are sampled on the host.
+Without the projector (or with LFM3-1.7B) every media part is refused with HTTP 400.
+
+```bash
+VID_B64=$(base64 < clip.mp4 | tr -d '\n')
+WAV_B64=$(base64 < question.wav | tr -d '\n')
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"LFM3-Omni-2B-Q4_K_M.gguf\",
+    \"messages\": [
+      {\"role\": \"system\", \"content\": \"Answer questions about the video using what you see and hear.\"},
+      {\"role\": \"user\", \"content\": [
+        {\"type\": \"video_url\", \"video_url\": {\"url\": \"data:video/mp4;base64,$VID_B64\"}},
+        {\"type\": \"input_audio\", \"input_audio\": {\"data\": \"$WAV_B64\", \"format\": \"wav\"}},
+        {\"type\": \"text\", \"text\": \"Answer the spoken question about the clip.\"}
+      ]}
+    ],
+    \"temperature\": 0,
+    \"max_tokens\": 200
+  }"
+```
+
+The model sees a message's media before its text, still images before videos, then audio
+clips. For speech recognition use the system prompt `Perform ASR in English.` and send the
+audio alone. See [the model card](../docs/models/lfm3.md#media-input).
+
 ### Chat Completions with Tool Calling
 
 ```bash
@@ -1050,6 +1082,14 @@ starts with `--redis-url` or `TS_RESPONSES_STORE_REDIS_URL`. Every request is
 self-contained: `previous_response_id` is refused with HTTP 400, so send the
 earlier turns in `input`. `text.format` cannot be combined with `reasoning` or
 `tools` (HTTP 400).
+
+Message items take media content parts as well: `{"type": "input_image", "image_url":
+"data:image/...;base64,..."}`, `{"type": "input_audio", "input_audio": {"data": "<base64>",
+"format": "wav"}}` and, for the families that take Chat Completions `video_url` (DeepSeek
+V4.1, Qwen 3.8 Flash Next, LFM3-Omni), `{"type": "input_video", "input_video": {"url":
+"data:video/mp4;base64,...", "fps": 1, "max_frames": 16}}` — the embeddings API's
+`input_video` part, with `video_url`'s optional sampling fields. Other families refuse
+`input_video` with HTTP 400.
 
 ### Sub-agents (`multi_agent`)
 
@@ -1446,9 +1486,10 @@ Every response carries `ok, file, url, mediaType, fileName`; the media type is
 classified by file extension (image / video / audio / pdf / text). `file` is
 the server-assigned filename inside the upload directory. The client then
 references that `file` name in the next `/api/chat` request —
-images via `imagePaths`, extracted video frames via `isVideo: true` +
-`imagePaths`, audio via `audioPaths`, and text content by inlining the returned
-`textContent` into the message.
+images via `imagePaths`, a video via `isVideo: true` + its extracted frames in
+`imagePaths` + the video itself in `videoFilePaths` (a family that reads the clip,
+LFM3-Omni, samples it and hears its soundtrack; the others use the frames), audio via
+`audioPaths`, and text content by inlining the returned `textContent` into the message.
 
 **PDF documents** get a two-stage treatment:
 

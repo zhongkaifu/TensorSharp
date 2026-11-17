@@ -770,6 +770,36 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 并各自带上以秒为单位的源时间，所以这是抽帧而不是时序编码器。远程 HTTP URL 不会被拉取，
 请发送 data URI。带音频的部分以 HTTP 400 拒绝，而不是被丢弃。
 
+### Chat Completions + 图像、视频与音频（LFM3-Omni）
+
+带投影器（`--mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf`）的 LFM3-Omni-2B 可以在一条消息中接收图像、音频与视频。
+`video_url` 片段会被保存并由模型自己读取：每秒 2 帧（最多 384 帧）并带上音轨，与 llama.cpp 和 Hugging Face
+的读取方式相同，因此 `fps` / `max_frames` 不起作用，宿主也不抽帧。没有投影器（或使用 LFM3-1.7B）时，
+所有媒体片段都以 HTTP 400 拒绝。
+
+```bash
+VID_B64=$(base64 < clip.mp4 | tr -d '\n')
+WAV_B64=$(base64 < question.wav | tr -d '\n')
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"LFM3-Omni-2B-Q4_K_M.gguf\",
+    \"messages\": [
+      {\"role\": \"system\", \"content\": \"Answer questions about the video using what you see and hear.\"},
+      {\"role\": \"user\", \"content\": [
+        {\"type\": \"video_url\", \"video_url\": {\"url\": \"data:video/mp4;base64,$VID_B64\"}},
+        {\"type\": \"input_audio\", \"input_audio\": {\"data\": \"$WAV_B64\", \"format\": \"wav\"}},
+        {\"type\": \"text\", \"text\": \"回答音频里关于这段视频的问题。\"}
+      ]}
+    ],
+    \"temperature\": 0,
+    \"max_tokens\": 200
+  }"
+```
+
+模型看到的一条消息中，媒体在文本之前：先静态图，再视频，然后是音频。语音识别请使用系统提示 `Perform ASR in English.`
+（或其他语言），并只发送音频。见[模型卡](../docs/models/lfm3_zh-cn.md#媒体输入)。
+
 ### Chat Completions + 工具调用
 
 ```bash
@@ -953,6 +983,12 @@ curl -X POST http://localhost:5000/v1/responses \
 `TS_RESPONSES_STORE_REDIS_URL` 则改存 Redis。每个请求都是自包含的：`previous_response_id`
 会以 HTTP 400 拒绝，请在 `input` 中带上之前的轮次。`text.format` 不能与 `reasoning` 或
 `tools` 同时使用（HTTP 400）。
+
+消息项同样接受媒体内容片段：`{"type": "input_image", "image_url": "data:image/...;base64,..."}`、
+`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`，以及对接受 Chat Completions
+`video_url` 的模型族（DeepSeek V4.1、Qwen 3.8 Flash Next、LFM3-Omni）使用
+`{"type": "input_video", "input_video": {"url": "data:video/mp4;base64,...", "fps": 1, "max_frames": 16}}`——
+即 embeddings API 的 `input_video` 片段，并带有 `video_url` 的可选抽帧字段。其他模型族以 HTTP 400 拒绝 `input_video`。
 
 ### 子智能体（`multi_agent`）
 
@@ -1294,8 +1330,9 @@ curl -X POST http://localhost:5000/api/upload -F "file=@report.pdf"
 
 每个响应都携带 `ok, file, url, mediaType, fileName`；媒体类型按文件扩展名分类
 （image / video / audio / pdf / text）。客户端随后在下一次 `/api/chat` 请求中
-引用服务端返回的 `file` 文件名 —— 图像通过 `imagePaths`，抽取出的视频帧通过
-`isVideo: true` + `imagePaths`，音频通过 `audioPaths`，文本内容则把返回的
+引用服务端返回的 `file` 文件名 —— 图像通过 `imagePaths`，视频通过 `isVideo: true` +
+`imagePaths` 中抽取出的帧 + `videoFilePaths` 中的视频文件本身（自行读取视频的模型族 LFM3-Omni
+会对其抽帧并听取音轨，其他模型族使用抽出的帧），音频通过 `audioPaths`，文本内容则把返回的
 `textContent` 内联进消息。
 
 **PDF 文档**采用两段式处理：

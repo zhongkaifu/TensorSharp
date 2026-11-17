@@ -2162,7 +2162,7 @@ CLI 没有子智能体。参见 [Web 应用](#web-应用)一节中的子智能�
 | Jev 端点限制（`POST /v1/systemone`） | 8 MiB 请求体、64 token 画布、同时接纳 32 个请求 | `TS_JEV_MAX_BODY_MB`、`TS_JEV_MAX_CANVAS`、`TS_JEV_MAX_PENDING` |
 | 文本 LoRA 适配器目录（启动时加载 + `POST /v1/loras`，最多 32 个适配器） | 未设置：没有适配器，`POST /v1/loras` 返回 403 | `TS_LORAS_DIR`（`--loras-dir` 优先） |
 | 文本及原生数字 PDF 上传 | 保留全部提取内容；最终渲染的提示词必须能放入已加载模型的上下文 | — |
-| 视频帧抽取 | 1 fps（基于时间，不限制）。OpenAI 的 `video_url` part（DeepSeek V4.1、Qwen 3.8 Flash Next）可自带 `fps` / `max_frames`，`VIDEO_MAX_FRAMES` 未设置时上限 16 帧；Qwen 3.8 把采样到的帧两两合并并使用 Qwen-VL 时间轴坐标（见[模型卡](docs/models/qwen38-flash-next_zh-cn.md#视频输入)） | `VIDEO_SAMPLE_FPS`、`VIDEO_MAX_FRAMES` |
+| 视频帧抽取 | 1 fps（基于时间，不限制）。OpenAI 的 `video_url` part（DeepSeek V4.1、Qwen 3.8 Flash Next）可自带 `fps` / `max_frames`，`VIDEO_MAX_FRAMES` 未设置时上限 16 帧；Qwen 3.8 把采样到的帧两两合并并使用 Qwen-VL 时间轴坐标（见[模型卡](docs/models/qwen38-flash-next_zh-cn.md#视频输入)）。LFM3-Omni 自行读取视频文件（`--video`、`video_url`、Web UI 的 `videoFilePaths`）：不论这些设置如何，都以 2 fps 抽帧并带音轨（见[模型卡](docs/models/lfm3_zh-cn.md#媒体输入)） | `VIDEO_SAMPLE_FPS`、`VIDEO_MAX_FRAMES` |
 | DiffusionGemma Web UI 去噪 | 48 步，最大 batch 2 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH` |
 
 #### 日志（服务端 + CLI）
