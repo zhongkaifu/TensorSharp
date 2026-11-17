@@ -48,11 +48,41 @@ namespace TensorSharp.Models
         /// <summary>Whether the audio tower is loaded (<see cref="AudioInputSupport"/> refuses audio otherwise).</summary>
         public bool IsAudioEncoderLoaded => AudioEncoder != null;
 
+        /// <summary>
+        /// Whether this checkpoint is LFM3-Omni, the decoder the Omni projector feeds. Its GGUF says so: <c>general.tags</c>
+        /// holds <c>omni</c>, <c>general.basename</c> is <c>LFM3-Omni</c>, or it ships the named <c>tts</c> template only Omni
+        /// carries. LFM3-1.7B shares the architecture but is published as a text model with no projector.
+        /// </summary>
+        public bool IsOmniCheckpoint
+        {
+            get
+            {
+                string[] tags = _gguf.GetStringArray("general.tags");
+                string basename = _gguf.GetString("general.basename") ?? _gguf.GetString("general.name");
+                return (tags != null && Array.Exists(tags, t => string.Equals(t, "omni", StringComparison.OrdinalIgnoreCase)))
+                    || (basename != null && basename.Contains("Omni", StringComparison.OrdinalIgnoreCase))
+                    || _gguf.GetString("tokenizer.chat_template.tts") != null;
+            }
+        }
+
+        /// <summary>The Omni projector belongs to LFM3-Omni: on another LFM3 checkpoint (LFM3-1.7B) it is refused at load,
+        /// whether named with --mmproj or found beside the model, rather than pairing weights LiquidAI does not
+        /// publish together.</summary>
+        private void RefuseProjectorOffOmni(string mmProjPath)
+        {
+            if (IsOmniCheckpoint) return;
+            string name = _gguf.GetString("general.name") ?? Config.Architecture;
+            throw new NotSupportedException(
+                $"'{Path.GetFileName(mmProjPath)}' is LFM3-Omni's projector, and this checkpoint ('{name}') is not LFM3-Omni: " +
+                "LFM3-1.7B is a text model with no media input. Load LFM3-Omni-2B with this projector, or run without --mmproj.");
+        }
+
         /// <summary>Load the vision tower of an Omni mmproj. A projector that carries no vision tower (an audio-only one)
         /// leaves images refused, and says so; one of another family's type is refused by the encoder.</summary>
         public void LoadVisionEncoder(string mmProjPath)
         {
             ArgumentException.ThrowIfNullOrEmpty(mmProjPath);
+            RefuseProjectorOffOmni(mmProjPath);
             VisionEncoder?.Dispose();
             VisionEncoder = null;
             using var gguf = new GgufFile(mmProjPath);
@@ -71,6 +101,7 @@ namespace TensorSharp.Models
         public void LoadAudioEncoder(string mmProjPath)
         {
             ArgumentException.ThrowIfNullOrEmpty(mmProjPath);
+            RefuseProjectorOffOmni(mmProjPath);
             AudioEncoder?.Dispose();
             AudioEncoder = null;
             AudioEncoder = Lfm3AudioEncoder.Load(mmProjPath, _allocator, _backend);

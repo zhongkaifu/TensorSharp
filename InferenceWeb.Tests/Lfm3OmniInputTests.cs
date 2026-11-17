@@ -288,6 +288,15 @@ public sealed class Lfm3OmniInputTests : IDisposable
         var aex = Assert.Throws<NotSupportedException>(() => model.MultimodalInjector.ProcessPromptTokens([audio], tokens, "a"));
         Assert.Equal(AudioInputSupport.Lfm3Message, aex.Message);
         Assert.False(model.MultimodalInjector.HasPendingEmbeddings("a"));
+
+        // The Omni projector is not paired with a checkpoint that is not LFM3-Omni (LFM3-1.7B is the text model; the
+        // CLI's lookup beside the model would otherwise load it): refused at load, a model-load refusal.
+        Assert.False(lfm3.IsOmniCheckpoint);
+        var pex = Assert.Throws<NotSupportedException>(() => model.MultimodalInjector.LoadProjectors(
+            Path.Combine(_directory, "mmproj-LFM3-Omni-2B-Q8_0.gguf")));
+        Assert.Contains("is not LFM3-Omni", pex.Message);
+        Assert.True(ModelLoadRefusal.IsRefusal(pex));
+        Assert.False(model.HasVisionEncoder());
     }
 
     [Fact]

@@ -1604,6 +1604,20 @@ namespace TensorSharp.Cli
             if (pdfPageImages != null && pdfPageImages.Count > 0)
                 imagePaths = pdfPageImages;
 
+            // The shared chat pipeline's rule: pictures for a model that can see but has no vision tower
+            // loaded (--mmproj none, or no projector beside it) are refused, not answered without them. The
+            // CLI used to warn and go on, and a family's expander then refused mid-run (an unhandled
+            // exception: LFM3, Qwen-VL) or the pictures were dropped.
+            if (imagePaths is { Count: > 0 } && model is IVisionCapableModel && !model.HasVisionEncoder())
+            {
+                _log.LogError(LogEventIds.CliFailed, "{Flag} rejected: {Reason}",
+                    videoPath != null ? "--video" : pdfPageImages != null ? "--pdf" : "--image",
+                    "the model has no vision encoder loaded; pass its projector with --mmproj (LFM3-1.7B and other " +
+                    "text-only checkpoints have none).");
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+
             // Now that the model is loaded its context length is known, so the skills
             // block can be budgeted against it rather than against a guess, and the
             // family's ability to carry tool declarations can be consulted: Mistral 3
