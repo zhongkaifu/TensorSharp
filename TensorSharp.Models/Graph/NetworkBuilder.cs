@@ -130,7 +130,32 @@ namespace TensorSharp.Models.Graph
 
         /// <summary>Rows [<paramref name="firstRow"/>, + <paramref name="rows"/>) of product weight <paramref name="name"/>
         /// (<see cref="NetworkWeights.RowBlock"/>): a product with it computes those rows only.</summary>
-        public NetValue WeightRows(string name, long firstRow, long rows) => Weight(Weights.RowBlock(name, firstRow, rows).Name);
+        /// <remarks>An executor that binds host pointers (GGML) keys its device copies on them, one copy a pointer: a block bound
+        /// as a leaf of its own at row 0 has the whole weight's pointer with fewer bytes, so binding the one replaced (freed)
+        /// the device copy a cached program of the other still read. There the block is a view of the whole weight's leaf: one
+        /// binding, one copy, whatever rows a program reads. The tensor executors key copies on the block's own weight object
+        /// and read the block itself.</remarks>
+        public NetValue WeightRows(string name, long firstRow, long rows)
+        {
+            NetworkWeight block = Weights.RowBlock(name, firstRow, rows);
+            if (!_bindsHost) return Weight(block.Name);
+            NetworkWeight whole = Weights.Get(name);
+            if (ReferenceEquals(block, whole)) return Weight(name);
+            if (_weightLeaves.TryGetValue(block.Name, out NetValue v)) return v;
+            NetValue all = Weight(name);
+            long rowBytes = whole.Quantized != null ? NetworkWeights.RowBytes(whole.Format, whole.RowWidth) : whole.RowWidth * sizeof(float);
+            Span<long> ip = stackalloc long[9];
+            ip[0] = 2;
+            ip[1] = whole.RowWidth;
+            ip[2] = rows;
+            ip[3] = ip[4] = 1;
+            ip[5] = rowBytes;
+            ip[6] = ip[7] = rowBytes * rows;
+            ip[8] = firstRow * rowBytes;
+            v = new NetValue(_b.Op(GraphOp.View, stackalloc[] { all.Id }, ip), whole.RowWidth, rows, 1, 1, false, all.Format);
+            _weightLeaves[block.Name] = v;
+            return v;
+        }
 
         /// <summary>The per-tensor multiplier of a product weight (an NVFP4 sidecar; 1 otherwise).</summary>
         public float WeightScale(string name) => Weights.Get(name).Quantized?.Scale ?? 1f;

@@ -809,6 +809,73 @@ public sealed class NetworkGraphTests
         Assert.Throws<KeyNotFoundException>(() => weights.Get("missing"));
     }
 
+    // ================================================================ row blocks beside their whole weight
+
+    [Fact]
+    public void ManagedRowBlocksBesideTheirWholeWeight() => RowBlocksBesideTheirWholeWeight(Lane.Managed);
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void GgmlCpuRowBlocksBesideTheirWholeWeight() => RowBlocksBesideTheirWholeWeight(Lane.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void GgmlMetalRowBlocksBesideTheirWholeWeight() => RowBlocksBesideTheirWholeWeight(Lane.GgmlMetal);
+
+    [MlxFact]
+    public void MlxRowBlocksBesideTheirWholeWeight() => RowBlocksBesideTheirWholeWeight(Lane.Mlx);
+
+    /// <summary>
+    /// A network that reads a product weight whole and as row blocks (its first rows, and rows further in), in programs of
+    /// their own replayed alternately and in one program, gets the right rows each time. GGML keys device copies on host
+    /// pointers: the first block, bound as a leaf of its own, had the whole weight's pointer with fewer bytes, and binding
+    /// it freed the copy a cached program of the whole weight still read. There both read one copy of the whole weight.
+    /// </summary>
+    private static void RowBlocksBesideTheirWholeWeight(Lane lane)
+    {
+        using var c = new LaneContext(lane);
+        var rng = new Random(23);
+        const int width = 64, rows = 8, tokens = 3;
+        foreach (int format in new[] { GraphFormat.Q8_0, GraphFormat.F32 })
+        {
+            string name = $"w{format}";
+            MakeProductWeight(c.Weights, name, format, width, rows, rng);
+            float[] x = Rand(rng, width * tokens);
+            float[] w = c.Weights.ReadF32(name);
+            float[] Expected(int first, int count)
+            {
+                var y = new float[count * tokens];
+                for (int t = 0; t < tokens; t++)
+                    for (int r = 0; r < count; r++)
+                    {
+                        double sum = 0;
+                        for (int i = 0; i < width; i++) sum += (double)w[(first + r) * width + i] * x[t * width + i];
+                        y[t * count + r] = (float)sum;
+                    }
+                return y;
+            }
+            double tol = c.Lane is Lane.GgmlMetal or Lane.GgmlCpu ? 3e-2 : 2e-2;
+            string what = $"{lane} {(GgmlTensorType)format}";
+            float[] Whole() => c.Run(b => b.MatMul(b.Weight(name), b.Input(x, width, tokens)));
+            float[] Block(int first, int count) => c.Run(b => b.MatMul(b.WeightRows(name, first, count), b.Input(x, width, tokens)));
+            for (int round = 0; round < 3; round++)
+            {
+                AssertClose(Expected(0, rows), Whole(), tol, $"{what} whole, round {round}");
+                AssertClose(Expected(0, 3), Block(0, 3), tol, $"{what} rows [0, 3), round {round}");
+                AssertClose(Expected(3, 5), Block(3, 5), tol, $"{what} rows [3, 8), round {round}");
+            }
+            float[][] both = c.Graph.Run(b =>
+            {
+                NetValue input = b.Input(x, width, tokens);
+                b.Output(b.MatMul(b.Weight(name), input));
+                b.Output(b.MatMul(b.WeightRows(name, 0, 3), input));
+            });
+            AssertClose(Expected(0, rows), both[0], tol, $"{what} whole beside its first rows");
+            AssertClose(Expected(0, 3), both[1], tol, $"{what} first rows beside the whole");
+            // One binding a host pointer: the weight's cached copy (negated when zero-copy) covers all of its bytes.
+            if (lane is Lane.GgmlCpu or Lane.GgmlMetal && c.Weights.Get(name).Quantized is { } q)
+                Assert.Equal(q.RawBytes, Math.Abs(GgmlBasicOps.CachedBufferBytes(q.Data)));
+        }
+    }
+
     // ================================================================ helpers
 
     internal static float[] Rand(Random rng, int n, float lo = -1f, float hi = 1f)
