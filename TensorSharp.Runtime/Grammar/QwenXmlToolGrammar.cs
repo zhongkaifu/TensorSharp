@@ -15,7 +15,7 @@ public enum QwenXmlToolChoice { Required, Named }
 /// <c>tool_choice</c> <c>required</c> or a named function for families that write Qwen3-Coder
 /// XML calls (LFM3), as an immutable recipe; every generation gets its own constraint.
 /// <code>
-/// root    := ws BLOCK (ws BLOCK)* ws          (one BLOCK without parallel_tool_calls)
+/// root    := ws BLOCK (ws BLOCK)* ws          (one BLOCK for a named choice or without parallel_tool_calls)
 /// BLOCK   := &lt;tool_call&gt; ws CALL ws &lt;/tool_call&gt;
 /// CALL    := &lt;function=NAME&gt; MEMBERS ws &lt;/function&gt;
 /// MEMBERS := required parameters in schema order, then optional ones in any order
@@ -84,7 +84,10 @@ public sealed class QwenXmlToolGrammar : IToolCallGrammar
         if (calls.Count == 0) throw Unsupported($"tool_choice names undeclared function '{namedTool}'");
         rules.Add("call", string.Join(" | ", calls));
         rules.Add("block", Literal(CallOpen) + " ws call ws " + Literal(CallClose));
-        rules.Add("root", "ws block" + (parallelToolCalls ? " (ws block)*" : "") + " ws");
+        // A named choice is one call to that function, as OpenAI and vLLM serve it: with thinking
+        // on, LFM3 forced to a function it did not want wrote the same call twice.
+        bool several = parallelToolCalls && choice != QwenXmlToolChoice.Named;
+        rules.Add("root", "ws block" + (several ? " (ws block)*" : "") + " ws");
         return new(rules.Emit(), choice);
     }
 

@@ -161,6 +161,9 @@ public class QwenXmlToolGrammarTests
         var named = QwenXmlToolGrammar.Compile(Tools, QwenXmlToolChoice.Named, "get_time");
         AssertAccepted(named, Call("get_time", Param("timezone", "Europe/Lisbon")));
         AssertRejected(named, Call("get_weather", Param("city", "Lisbon")), "<tool_call>\n<function=get_");
+        // One call: forced to get_time with thinking on, the 1.7B wrote the same call twice.
+        string once = Call("get_time", Param("timezone", "Europe/Lisbon"));
+        AssertRejected(named, once + "\n" + once, once + "\n");
 
         var single = QwenXmlToolGrammar.Compile(Tools, QwenXmlToolChoice.Required, parallelToolCalls: false);
         string first = Call("get_time", Param("timezone", "UTC"));
