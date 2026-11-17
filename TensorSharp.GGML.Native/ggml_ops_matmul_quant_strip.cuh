@@ -29,26 +29,18 @@ struct quant_strip_args {
     float * out2 = nullptr, * partial2 = nullptr;
 };
 
-// Upstream mul_mat_q_process_tile gained a has_fusion template parameter and
-// x_gate/glu_op/glu_limit arguments for its fused gate/up path (ggml after
-// da8e2a54). Detect which form the fetched ggml has and call that one without
-// fusion, so this builds against either checkout.
-template<ggml_type type, int J, bool fixup, typename = void>
-struct quant_strip_tile_has_fusion_arg : std::false_type {};
-template<ggml_type type, int J, bool fixup>
-struct quant_strip_tile_has_fusion_arg<type, J, fixup,
-    std::void_t<decltype(&mul_mat_q_process_tile<type, J, false, fixup, GGML_PREC_Q8, false>)>> : std::true_type {};
-
+// Upstream's MMQ tile as ggml has it from fa8c6179 ("linearize MoE data layout", 2026-11-12) on, which the ids helper's tile
+// specs below need as well: a has_fusion template parameter with x_gate / glu_op / glu_limit for the fused gate/up path, the
+// weights' optional per-tensor scales (x_scale, gate_scale: NVFP4; null multiplies by 1) after glu_limit, and the tile's
+// column bound exclusive (tile_y_j_sup; it was the last column's index, tile_y_max_j, which the strips still compute). Passed
+// the last index as the bound, every tile's last column went unwritten.
 template<ggml_type type, int J, bool fixup>
 static __device__ __forceinline__ void quant_strip_process_tile(
         const char * x, int offset_x, const int * y, const int * ids_dst, float * dst, float * tmp_fixup,
         int stride_row_x, int ncols_y, int stride_col_dst, int tile_x_max_i, int tile_y_max_j, int kb0_start, int kb0_stop) {
-    if constexpr (quant_strip_tile_has_fusion_arg<type, J, fixup>::value)
-        mul_mat_q_process_tile<type, J, false, fixup, GGML_PREC_Q8, false>(x, nullptr, offset_x, y, ids_dst, dst, tmp_fixup,
-            nullptr, ggml_glu_op{}, 0.0f, stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
-    else
-        mul_mat_q_process_tile<type, J, false, fixup, GGML_PREC_Q8>(x, offset_x, y, ids_dst, dst, tmp_fixup,
-            nullptr, stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+    mul_mat_q_process_tile<type, J, false, fixup, GGML_PREC_Q8, false>(x, nullptr, offset_x, y, ids_dst, dst, tmp_fixup,
+        nullptr, ggml_glu_op{}, 0.0f, nullptr, nullptr, stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j + 1,
+        kb0_start, kb0_stop);
 }
 
 template<ggml_type type, int J>
@@ -133,6 +125,26 @@ __global__ void quant_strip_fixup(quant_strip_args a) {
     }
 }
 
+
+// The sorted expert slices' bounds: expert e's compact columns are [bounds[e], bounds[e + 1]) (the selections of a lower
+// expert first, as ggml's ids helper sorts them). The helper wrote them itself until ggml d9fe7bf replaced them with MMQ tile
+// specs; the strips partition by expert and read the bounds. One block: every selection counted, then the prefix sums.
+__global__ void quant_strip_expert_bounds(const int32_t * __restrict__ ids, int32_t * __restrict__ bounds, int experts, int tokens,
+        int used, int si1) {
+    extern __shared__ int counts[];
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) counts[e] = 0;
+    __syncthreads();
+    for (int s = threadIdx.x; s < tokens * used; s += blockDim.x) {
+        const int expert = ids[(s / used) * si1 + s % used];
+        if (expert >= 0 && expert < experts) atomicAdd(&counts[expert], 1);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int sum = 0;
+        for (int e = 0; e < experts; ++e) { bounds[e] = sum; sum += counts[e]; }
+        bounds[experts] = sum;
+    }
+}
 
 int quant_strip_width(ggml_type type, int tokens, int device) {
     const auto & info = ggml_cuda_info().devices[device];
