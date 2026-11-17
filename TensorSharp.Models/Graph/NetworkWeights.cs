@@ -386,13 +386,14 @@ namespace TensorSharp.Models.Graph
 
         /// <summary>
         /// Whether a product weight stays in its block format here: the decoder's rule for the backend, and on MLX only formats
-        /// its executor multiplies on the device (MlxGraphExecutor takes any other format's products on the host, a CPU GEMM a
-        /// call: an F16 mmproj's projections there ran ~40x slower). A format that is not kept is held as F32, noted once.
+        /// its executor multiplies on the device - its quantized kernels and the F32/F16/BF16 products over the weights' own
+        /// bytes (MlxQuantizedOps.TryAddmmFloatWeight); any other format's products would run on the host. A format that is
+        /// not kept is held as F32, noted once.
         /// </summary>
         private bool KeepsBlocks(GgufTensorInfo flat)
         {
             bool keep = Backend == BackendType.Mlx
-                ? MlxQuantizedOps.CanPreloadDirectFloatType((int)flat.Type)
+                ? MlxQuantizedOps.CanPreloadDirectFloatType((int)flat.Type) || MlxQuantizedOps.IsFloatWeightType((int)flat.Type)
                 : ModelBase.ShouldStoreWeightQuantized(Backend, flat);
             if (!keep)
             {
