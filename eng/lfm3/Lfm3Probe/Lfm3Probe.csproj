@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TensorSharpSkipGgmlNative>true</TensorSharpSkipGgmlNative>
+    <TensorSharpSkipMlxNative>true</TensorSharpSkipMlxNative>
+    <!-- The deployment target copies an existing library only; it never
+         configures or compiles GGML. Callers can select an isolated build. -->
+    <GgmlNativeBuildDir Condition="'$(GgmlNativeBuildDir)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../../../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDir>
+    <GgmlNativeBuildDir Condition="'$(GgmlNativeBuildDir)' == ''">$(MSBuildProjectDirectory)/../../../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
+    <Lfm3ProbeRequireGgmlNative Condition="'$(Lfm3ProbeRequireGgmlNative)' == ''">false</Lfm3ProbeRequireGgmlNative>
+  </PropertyGroup>
+  <ItemGroup>
+    
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+  </ItemGroup>
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <_Lfm3ProbeGgmlSource></_Lfm3ProbeGgmlSource>
+      <!-- Match the hosts' Release output when both layouts are present, but
+           select exactly one source instead of overwriting the destination twice. -->
+      <_Lfm3ProbeGgmlSource Condition="'$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')">$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)</_Lfm3ProbeGgmlSource>
+      <_Lfm3ProbeGgmlSource Condition="'$(_Lfm3ProbeGgmlSource)' == '' And '$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')">$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)</_Lfm3ProbeGgmlSource>
+      <_Lfm3ProbeNativeOutput>$(TargetDir)</_Lfm3ProbeNativeOutput>
+      <_Lfm3ProbeNativeOutput Condition="'$(_Lfm3ProbeNativeOutput)' == ''">$(OutDir)</_Lfm3ProbeNativeOutput>
+      <_Lfm3ProbeNativeOutput Condition="'$(_Lfm3ProbeNativeOutput)' == ''">$(OutputPath)</_Lfm3ProbeNativeOutput>
+    </PropertyGroup>
+    <Error Condition="'$(_Lfm3ProbeGgmlSource)' == '' And '$(Lfm3ProbeRequireGgmlNative)' == 'true'"
+           Text="Lfm3Probe GGML deployment unavailable: no prebuilt $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir) or its Release directory. Build GGML separately or set -p:GgmlNativeBuildDir to the matching prebuilt directory. No native build was attempted." />
+    <Warning Condition="'$(_Lfm3ProbeGgmlSource)' == '' And '$(Lfm3ProbeRequireGgmlNative)' != 'true'"
+             Text="Lfm3Probe GGML deployment unavailable: no prebuilt $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir) or its Release directory. Managed build completion does not establish GGML runtime availability; any existing output library is unchanged. No native build was attempted." />
+    <Error Condition="'$(_Lfm3ProbeGgmlSource)' != '' And '$(_Lfm3ProbeNativeOutput)' == ''"
+           Text="Lfm3Probe cannot deploy its prebuilt GGML library without a resolved output directory." />
+    <MakeDir Directories="$(_Lfm3ProbeNativeOutput)" Condition="'$(_Lfm3ProbeGgmlSource)' != ''" />
+    <Copy SourceFiles="$(_Lfm3ProbeGgmlSource)" DestinationFolder="$(_Lfm3ProbeNativeOutput)"
+          SkipUnchangedFiles="true" Condition="'$(_Lfm3ProbeGgmlSource)' != ''" />
+    <Message Importance="high" Condition="'$(_Lfm3ProbeGgmlSource)' != ''"
+             Text="Lfm3Probe prebuilt GGML runtime: $(_Lfm3ProbeGgmlSource) -> $(_Lfm3ProbeNativeOutput). Copying a library does not qualify its runtime backend." />
+  </Target>
+</Project>
