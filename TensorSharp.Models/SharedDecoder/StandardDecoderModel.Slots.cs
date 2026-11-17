@@ -489,6 +489,7 @@ namespace TensorSharp.Models
         private void DisposeSlot(Slot slot)
         {
             if (slot == null) return;
+            _idleSpareRefused = false;
             ForgetGraphsOf(slot);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }

@@ -486,8 +486,38 @@ namespace TensorSharp.Models
             return false;
         }
 
-        /// <summary>Spare slots made during decode (tests check the route engaged).</summary>
+        /// <summary>Spare slots made during decode or while idle (tests check the route engaged).</summary>
         internal int SpareSlotsMade { get; private set; }
+
+        /// <summary>Slots in the pool, and how many it keeps at most (tests).</summary>
+        internal (int Pooled, int Cap) SlotPoolForTests => (_slotPool?.Count ?? 0, Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax));
+
+        // The device had no room for an idle spare: none is tried again until a slot is given back.
+        private bool _idleSpareRefused;
+
+        /// <summary>
+        /// While the engine is idle, where recorded steps bind slots, the slot pool is filled to its cap with spare slots, a slice
+        /// of one (<see cref="MakeSpareSlot"/>) a call, while the device has room for each and one more beside its headroom and
+        /// a prompt's step. Spares are otherwise made beside recorded decode steps, two at most: the prefix cache's copies of
+        /// the startup warm-up's requests left three slots pooled, and the fourth of four Qwen3.8-27B conversations sent
+        /// together allocated its slot inside their prompt step, 13-39 ms before any of their first tokens (an RTX PRO 6000
+        /// slice; the step 131-160 ms, 110-117 with the pool filled), where the direct engines' slots were made at load.
+        /// </summary>
+        public bool RunIdleSlice()
+        {
+            if (GraphExecutor is not { Capabilities.SlotBoundRecordings: true } || _slotStateBytes < 0 || _sparePending
+                || _idleSpareRefused || !SupportsUnifiedBatching)
+                return false;
+            int cap = Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax);
+            if (_spareBuild == null && (_slotPool?.Count ?? 0) >= cap) return false;
+            int capacity = _spareBuild?.Capacity ?? AlignedSlotCapacity(Math.Max(FreshSlotTokens, _spareCapacity));
+            if (_spareBuild == null && RoomForTwoSlots(capacity) != true)
+            {
+                _idleSpareRefused = true;
+                return false;
+            }
+            return MakeSpareSlot(capacity) || (_slotPool?.Count ?? 0) < cap;
+        }
 
         /// <summary>Requests run in slots of their own: <see cref="IPrefixCacheModel.TryCaptureCopy"/> reads a request's slot
         /// whether or not it is bound.</summary>

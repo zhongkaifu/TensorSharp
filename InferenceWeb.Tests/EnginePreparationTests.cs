@@ -87,6 +87,23 @@ public sealed class EnginePreparationTests
         Assert.Equal(0, engine.StepsHeldForPreparation);
     }
 
+    [Fact]
+    public async Task AnIdleEngineRunsTheModelsIdleSlicesUntilItHasNoMore()
+    {
+        using var model = new UnifiedSlotModel { IdleSlices = 3 };
+        using var engine = new InferenceEngine(model, Config());
+        // Idle from the start: the slices run until the model says it is done, and not again until the engine idles again.
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (model.IdleCalls < 4 && waited.Elapsed < TimeSpan.FromSeconds(10)) await Task.Delay(5);
+        Assert.Equal(4, model.IdleCalls);
+        var completion = await engine.SubmitRequest(Sequence("a")).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(4, completion.OutputTokenCount);
+        Assert.True(model.UnifiedForwards > 0, "the request did not run on the unified path");
+        waited.Restart();
+        while (model.IdleCalls < 5 && waited.Elapsed < TimeSpan.FromSeconds(10)) await Task.Delay(5);
+        Assert.Equal(5, model.IdleCalls);
+    }
+
     private static string Describe(SchedulerOutput output)
         => string.Join(" ", output.ScheduledWork.Select(work => work.Sequence.RequestId + (work.IsPrefill ? ":P" : ":D")));
 
@@ -138,6 +155,68 @@ public sealed class EnginePreparationTests
         public void ResetKVCache() { }
         public void TruncateKVCache(int count) { }
         public void Dispose() { }
+    }
+
+    /// <summary>A model served on the unified path (every request on its own slot, one forward a step), with idle work of
+    /// <see cref="IdleSlices"/> slices.</summary>
+    private sealed class UnifiedSlotModel : IModelArchitecture, IBatchedPagedModel, IUnifiedBatchModel
+    {
+        private readonly Dictionary<string, int> _lengths = new(StringComparer.Ordinal);
+        public int IdleSlices { get; init; }
+        public int IdleCalls;
+        public int UnifiedForwards;
+        public ModelConfig Config { get; } = new() { Architecture = "qwen35", VocabSize = 16 };
+        public ITokenizer Tokenizer { get; } = new StubTokenizer();
+        public IMultimodalInjector MultimodalInjector => null;
+        public IBackendExecutionPlan ExecutionPlan => null;
+        public bool SupportsKVCacheTruncation => false;
+        public bool SupportsKVStateSnapshot => false;
+        public bool SupportsCrossSequenceKvReuse => false;
+        public int MaxContextLength => 256;
+        public bool BatchedForwardAvailable => false;
+        public bool SupportsPerSequenceFusedForward => true;
+        public bool SupportsUnifiedBatching => true;
+        public bool CanBatchDecode(string requestId, int position) => false;
+        public float[] Forward(int[] tokens) => Logits();
+        public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext context)
+            => throw new InvalidOperationException("The slots have no batched graph.");
+        public bool BindSequenceCache(string id) => _lengths.TryAdd(id, 0);
+        public void AdoptPrimaryCacheToFused(string id) => BindSequenceCache(id);
+        public bool HasFusedSequenceCache(string id) => _lengths.ContainsKey(id);
+        public void OnSequenceReleased(string id) => _lengths.Remove(id);
+        public void RestorePrimaryCache() { }
+        public void ResetKVCache() { }
+        public void TruncateKVCache(int count) { }
+        public void Dispose() { }
+
+        public int EnsureSequenceSlot(string requestId, int reserveTokens)
+        {
+            _lengths.TryAdd(requestId, 0);
+            return _lengths[requestId];
+        }
+
+        public bool TryForwardUnified(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, float[][] lastRowLogits,
+            float[][] features = null)
+        {
+            for (int s = 0; s < requestIds.Count; s++)
+            {
+                _lengths[requestIds[s]] = starts[s] + tokens[s].Length;
+                lastRowLogits[s] = Logits();
+            }
+            UnifiedForwards++;
+            return true;
+        }
+
+        public float[] ForwardUnifiedMedia(string requestId, int[] tokens, int start) => Logits();
+
+        public bool RunIdleSlice() => ++IdleCalls <= IdleSlices;
+
+        private static float[] Logits()
+        {
+            var logits = new float[16];
+            logits[7] = 100;
+            return logits;
+        }
     }
 
     private sealed class StubTokenizer : ITokenizer

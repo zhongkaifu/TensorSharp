@@ -1572,6 +1572,58 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(first[i].AsSpan().SequenceEqual(second[i]), $"row {i} differs on the reclaimed slot");
     }
 
+    /// <summary>On direct CUDA an idle engine's slices (<see cref="IUnifiedBatchModel.RunIdleSlice"/>) fill the slot pool to its
+    /// cap while the device has room, and make none where it has none; a request then runs on a spare as on a fresh slot.</summary>
+    [CudaFact]
+    public void IdleSlicesFillTheSlotPoolOnDirectCuda()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
+        using var model = Create(Fixture("dense"), backend: BackendType.Cuda);
+        var unified = (IUnifiedBatchModel)model;
+        int[] prompt = Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray();
+        List<float[]> Request(string id)
+        {
+            unified.EnsureSequenceSlot(id, 64);
+            var logits = new float[1][];
+            Assert.True(unified.TryForwardUnified(new[] { id }, new[] { prompt }, new[] { 0 }, logits));
+            var trace = new List<float[]> { (float[])logits[0].Clone() };
+            int next = ArgMax(logits[0]), length = prompt.Length;
+            for (int t = 0; t < 6; t++)
+            {
+                Assert.True(unified.TryForwardUnified(new[] { id }, new[] { new[] { next } }, new[] { length }, logits));
+                trace.Add((float[])logits[0].Clone());
+                next = ArgMax(logits[0]);
+                length++;
+            }
+            return trace;
+        }
+        // A first request measures a slot's bytes; its slot goes back to the pool.
+        List<float[]> first = Request("a");
+        model.OnSequenceReleased("a");
+        int made = model.SpareSlotsMade;
+        model.SlotDeviceMemoryForTests = _ => (1L << 40, 1L << 40);
+        int slices = 0;
+        while (unified.RunIdleSlice() && slices < 100_000) slices++;
+        var (pooled, cap) = model.SlotPoolForTests;
+        Assert.Equal(cap, pooled);
+        Assert.Equal(cap - 1, model.SpareSlotsMade - made);
+        Assert.False(unified.RunIdleSlice());
+        // A request takes a pooled slot; with no room for another, idle slices make none.
+        List<float[]> second = Request("b");
+        model.SlotDeviceMemoryForTests = _ => (0, 1L << 40);
+        Assert.False(unified.RunIdleSlice());
+        Assert.Equal(cap - 1, model.SlotPoolForTests.Pooled);
+        for (int i = 0; i < first.Count; i++)
+            Assert.True(first[i].AsSpan().SequenceEqual(second[i]), $"row {i} differs on the pooled slot");
+        // Requests on every pooled slot (spares among them) run as the first did.
+        for (int r = 0; r < cap - 1; r++)
+        {
+            List<float[]> trace = Request($"c{r}");
+            for (int i = 0; i < first.Count; i++)
+                Assert.True(first[i].AsSpan().SequenceEqual(trace[i]), $"request c{r}: row {i} differs on a spare slot");
+        }
+    }
+
     /// <summary>On direct CUDA a slot that grows forgets only its own graphs: another request's recorded decode step keeps
     /// replaying, and the grown slot's request continues as it would have.</summary>
     [CudaFact]

@@ -44,5 +44,9 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>A request with pending media embeddings runs its prompt chunk on its own slot through the model's
         /// media path; the last row's logits.</summary>
         float[] ForwardUnifiedMedia(string requestId, int[] tokens, int start);
+
+        /// <summary>One short slice of work the model does while the engine has nothing to run (it prepares what the next
+        /// requests would otherwise wait for); the engine calls again while it stays idle and this returns true.</summary>
+        bool RunIdleSlice() => false;
     }
 }

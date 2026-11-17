@@ -308,6 +308,29 @@ namespace TensorSharp.Runtime.Scheduling
             }
         }
 
+        /// <summary>Idle slices the model ran (tests).</summary>
+        internal long IdleSlicesRun => Interlocked.Read(ref _idleSlicesRun);
+        private long _idleSlicesRun;
+
+        /// <summary>
+        /// Nothing to run: the model's idle work (<see cref="IUnifiedBatchModel.RunIdleSlice"/>), a slice at a time while no
+        /// command has arrived, so a request that arrives meanwhile waits for one slice at most. Not while the host has closed
+        /// the compute gate.
+        /// </summary>
+        private void RunIdleWork()
+        {
+            if (_model is not IUnifiedBatchModel { SupportsUnifiedBatching: true } unified) return;
+            while (!_shutdownCts.IsCancellationRequested && !_commands.Reader.TryPeek(out _)
+                   && Volatile.Read(ref _computeGate) is not { IsOpen: false })
+            {
+                bool more;
+                lock (_model.GpuComputeLock)
+                    more = unified.RunIdleSlice();
+                Interlocked.Increment(ref _idleSlicesRun);
+                if (!more) return;
+            }
+        }
+
         /// <summary>Submit a sequence for inference. Returns immediately with a
         /// handle whose <see cref="InferenceRequestHandle.Tokens"/> channel
         /// streams sampled tokens.</summary>
@@ -516,6 +539,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // If there's nothing in flight, block on command channel.
                 if (_scheduler.RunningCount == 0 && _scheduler.WaitingCount == 0)
                 {
+                    RunIdleWork();
                     try
                     {
                         // Wait for at least one command to arrive.
