@@ -12,6 +12,9 @@
 //                                          prefill tokens/s of each PP-token prompt and decode tokens/s of TG tokens after
 //                                          DEPTH tokens (llama-bench's pp / tg / tg@d), each the median of three runs, with
 //                                          the decode steps' graph counters (runs, advances in place, builds)
+//   spec   MODEL BACKEND FILE N            N greedy tokens after the file's prompt, plainly and with n-gram speculation (a verify
+//                                          window keeps the short-conv inputs and attends under the sliding window; the accept
+//                                          count commits a prefix): the two streams must be equal
 // BACKEND: ggml_metal | ggml_cpu | cpu | mlx | ggml_cuda | cuda
 using System.Diagnostics;
 using System.Globalization;
@@ -39,6 +42,8 @@ switch (args[0])
         File.WriteAllLines(args[3], tokenizer.Encode(File.ReadAllText(args[2]), addSpecial: false).Select(t => t.ToString(CultureInfo.InvariantCulture)));
         return 0;
     }
+    case "spec" when args.Length >= 5:
+        return Speculation(args[1], Backend(args[2]), args[3], int.Parse(args[4]));
     case "bench" when args.Length >= 3:
         return Bench(args[1], Backend(args[2]),
             args.Length > 3 ? args[3].Split(',').Select(int.Parse).ToArray() : new[] { 512, 4096 },
@@ -50,8 +55,40 @@ switch (args[0])
 
 static int Usage()
 {
-    Console.Error.WriteLine("usage: Lfm3Probe ppl MODEL BACKEND FILE CTX CHUNKS [--per-op] | tokens MODEL FILE OUT | bench MODEL BACKEND [PP,..] [TG] [DEPTH,..]");
+    Console.Error.WriteLine("usage: Lfm3Probe ppl MODEL BACKEND FILE CTX CHUNKS [--per-op] | spec MODEL BACKEND FILE N | tokens MODEL FILE OUT | bench MODEL BACKEND [PP,..] [TG] [DEPTH,..]");
     return 2;
+}
+
+static int Speculation(string path, BackendType backend, string file, int count)
+{
+    using ModelBase model = ModelBase.Create(path, backend);
+    int[] prompt = model.Tokenizer.Encode(File.ReadAllText(file), addSpecial: false).ToArray();
+    int vocab = model.Config.VocabSize;
+    int ArgMax(float[] l) { int b = 0; for (int v = 1; v < vocab; v++) if (l[v] > l[b]) b = v; return b; }
+    var plain = new List<int>();
+    var sw = Stopwatch.StartNew();
+    model.ResetKVCache();
+    float[] logits = model.ForwardRefill(prompt);
+    for (int i = 0; i < count; i++)
+    {
+        plain.Add(ArgMax(logits));
+        if (i + 1 < count) logits = model.Forward(new[] { plain[^1] });
+    }
+    double plainSeconds = sw.Elapsed.TotalSeconds;
+    model.ResetKVCache();
+    var decoder = new SpeculativeDecoder((ISpeculativeModel)model, new SpeculationOptions
+    {
+        Enabled = true, SpeculatorName = SpeculatorRegistry.NGram, MaxDraftTokens = 3, MinDraftProb = 0,
+    }) { AdaptiveSpeculation = false };
+    sw.Restart();
+    List<int> drafted = decoder.GenerateGreedy(prompt, count);
+    double specSeconds = sw.Elapsed.TotalSeconds;
+    int same = 0;
+    while (same < Math.Min(plain.Count, drafted.Count) && plain[same] == drafted[same]) same++;
+    Console.WriteLine($"prompt={prompt.Length} tokens; plain {plain.Count} in {plainSeconds:F1} s, speculative {drafted.Count} in {specSeconds:F1} s");
+    Console.WriteLine($"verify steps {decoder.VerifySteps}, drafted {decoder.TokensDrafted}, accepted {decoder.TokensAccepted}, plain steps {decoder.PlainSteps}");
+    Console.WriteLine(same == plain.Count && drafted.Count == plain.Count ? "streams equal" : $"streams part at token {same}");
+    return same == plain.Count && drafted.Count == plain.Count ? 0 : 1;
 }
 
 static int Perplexity(string path, BackendType backend, string file, int ctx, int chunks, bool perOp)
