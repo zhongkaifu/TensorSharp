@@ -1057,7 +1057,11 @@ namespace TensorSharp.Models
                 Ops.Fill(tensor, 0f);
         }
 
-        protected void ResetCacheTensor(Tensor tensor)
+        /// <param name="keepDeviceCopy">The caller's cache rows past its length are masked out of every read (the shared
+        /// decoder runtime's K/V), so GgmlCuda keeps its device copy too, as GgmlVulkan and GgmlMetal always do: dropping it
+        /// freed and re-allocated every cache's device memory and uploaded the host bytes again on the next step (LFM3-1.7B at
+        /// 8K: 35 buffers and ~100 MB, 13 ms of the next 512-token prompt on an A40).</param>
+        protected void ResetCacheTensor(Tensor tensor, bool keepDeviceCopy = false)
         {
             if (tensor == null)
                 return;
@@ -1071,7 +1075,8 @@ namespace TensorSharp.Models
             // makes those rows semantically empty until overwritten. Besides
             // avoiding a full KV re-upload, stable Metal bindings let a warmed
             // persistent decode graph survive from startup into the first request.
-            if (_backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal)
+            if (_backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal
+                && !(keepDeviceCopy && _backend == BackendType.GgmlCuda))
                 InvalidateTensorDeviceCache(tensor);
         }
 

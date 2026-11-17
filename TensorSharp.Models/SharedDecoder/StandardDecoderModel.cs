@@ -550,8 +550,9 @@ namespace TensorSharp.Models
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
-            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t);
-            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t);
+            // Rows past the length are masked out of every read: the device copies stay (no re-upload on the next step).
+            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t, keepDeviceCopy: true);
+            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t, keepDeviceCopy: true);
             ResetRecurrentPrimary();
             // Rows past the length are dead and the states were rewritten on the host.
             _cacheDeviceDirty = false;
