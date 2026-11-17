@@ -77,8 +77,8 @@ public class MediaLayeringTests
         Assert.Same(DesktopMediaProvider.Instance, MediaCodecs.Video);
         Assert.Same(DesktopMediaProvider.Instance, MediaCodecs.VideoEncoder);
 
-        // Audio was never native on desktop; it stays on the managed decoders.
-        Assert.Same(ManagedMediaProvider.Instance, MediaCodecs.Audio);
+        // Audio past the managed WAV/MP3/OGG readers (FLAC, M4A, a video's soundtrack) goes to ffmpeg.
+        Assert.Same(DesktopMediaProvider.Instance, MediaCodecs.Audio);
         Assert.Contains("DesktopMediaProvider", MediaCodecs.Describe());
     }
 

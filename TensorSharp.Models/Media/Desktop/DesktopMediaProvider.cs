@@ -38,21 +38,24 @@ namespace TensorSharp.Models.Media.Desktop
     /// The desktop media stack, exactly as before the seam existed: Magick.NET for every
     /// still-image format (HEIC via its bundled libheif, EXIF auto-orientation, Lanczos
     /// resize, PNG encode), OpenCvSharp <c>VideoCapture</c> for frame access, and ffmpeg →
-    /// OpenCV <c>avc1</c> → OpenCV <c>mp4v</c> for MP4 export. Audio is not overridden: the
-    /// desktop build never had a native audio decoder, so WAV/MP3/OGG stay on the managed one.
+    /// OpenCV <c>avc1</c> → OpenCV <c>mp4v</c> for MP4 export. Audio: WAV/MP3/OGG stay on the
+    /// managed readers (every caller tries them first); everything else, a video's soundtrack
+    /// included, goes to ffmpeg (DesktopMediaProvider.Audio.cs).
     /// </summary>
     public sealed partial class DesktopMediaProvider : IImageCodec, IVideoDecoder, IVideoEncoder
     {
         /// <summary>The instance the module initializer registers. Stateless.</summary>
         public static DesktopMediaProvider Instance { get; } = new DesktopMediaProvider();
 
-        /// <summary>Register this provider for images, video decode and MP4 encode. Idempotent;
-        /// a host that swapped in something else can call it to get the desktop stack back.</summary>
+        /// <summary>Register this provider for images, video decode, MP4 encode and the audio formats
+        /// the managed readers do not cover. Idempotent; a host that swapped in something else can
+        /// call it to get the desktop stack back.</summary>
         public static void Register()
         {
             MediaCodecs.Image = Instance;
             MediaCodecs.Video = Instance;
             MediaCodecs.VideoEncoder = Instance;
+            MediaCodecs.Audio = Instance;
         }
 
         // ------------------------------------------------------------------
