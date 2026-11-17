@@ -221,6 +221,9 @@ namespace TensorSharp.Models
             public int CaptureTail { get; init; }
             /// <summary>Return the final-normed rows [hidden, rows] (a per-token draft head's input).</summary>
             public bool CaptureFinal { get; init; }
+            /// <summary>Return each sequence's last row after the final norm [hidden, sequences] (a step driver's input:
+            /// speech output); with <see cref="LastRowLogits"/> false the step runs no head.</summary>
+            public bool LastRowHidden { get; init; }
             /// <summary>Keep the recurrent state after every row (a verify the accept count rewinds).</summary>
             public bool RecurrentSnapshots { get; init; }
             /// <summary>Flat (T, H, W) rotary positions of a single sequence's rows (multi-axis rotary).</summary>
@@ -237,7 +240,7 @@ namespace TensorSharp.Models
             /// <summary>What the request changes in the emitted program (a streamed step's template key).</summary>
             public string Shape =>
                 $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}:{CaptureTail}"
-                + (GreedyIds ? ":g" : "")
+                + (GreedyIds ? ":g" : "") + (LastRowHidden ? ":h" : "")
                 + (FollowDraft == DraftFollow.None ? "" : $":f{(int)FollowDraft}{(DraftRows != null ? "e" : "")}")
                 + (FollowDFlash == null ? "" : $":df{FollowDFlash.Key}");
 
@@ -245,7 +248,7 @@ namespace TensorSharp.Models
             public GraphRequest WithDFlashFollow(DFlashFollowPlan plan) => new()
             {
                 LastRowLogits = LastRowLogits, AllRowLogits = AllRowLogits, GreedyIds = GreedyIds, CaptureLayers = CaptureLayers,
-                CaptureTail = CaptureTail, CaptureFinal = CaptureFinal, RecurrentSnapshots = RecurrentSnapshots,
+                CaptureTail = CaptureTail, CaptureFinal = CaptureFinal, LastRowHidden = LastRowHidden, RecurrentSnapshots = RecurrentSnapshots,
                 PositionTable = PositionTable, FollowDraft = FollowDraft, DraftRows = DraftRows, FollowDFlash = plan,
             };
         }
@@ -255,6 +258,8 @@ namespace TensorSharp.Models
             public float[] Logits;
             public float[][] Captures;
             public float[] Final;
+            /// <summary>Each sequence's last row after the final norm [hidden, sequences] (<see cref="GraphRequest.LastRowHidden"/>).</summary>
+            public float[] LastHidden;
         }
 
         /// <summary>Rows per sequence up to which a step writes K/V by index and attends to the padded
@@ -996,16 +1001,33 @@ namespace TensorSharp.Models
         private bool TryRunGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
             bool wantLogits, out float[][] logits, int[] positionTable = null, DraftFollow follow = DraftFollow.None,
             float[] draftRows = null, DFlashFollowPlan dflash = null)
+            => TryRunGraph(hidden, slots, first, counts, starts, wantLogits, out logits, null, positionTable, follow, draftRows, dflash);
+
+        /// <summary><see cref="TryRunGraph(Tensor, Slot[], int[], int[], int[], bool, out float[][], int[], DraftFollow, float[], DFlashFollowPlan)"/>
+        /// that also writes each sequence's last final-normed row into <paramref name="lastHidden"/>[s] where it is set
+        /// (a step driver's input); with <paramref name="wantLogits"/> false the step runs no head.</summary>
+        private bool TryRunGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
+            bool wantLogits, out float[][] logits, float[][] lastHidden, int[] positionTable = null, DraftFollow follow = DraftFollow.None,
+            float[] draftRows = null, DFlashFollowPlan dflash = null)
         {
             logits = null;
             bool greedy = wantLogits && _greedyLastRows && GraphExecutor.Capabilities.GreedyIdOutputs;
+            bool wantHidden = lastHidden != null && Array.Exists(lastHidden, h => h != null);
             var request = new GraphRequest
             {
                 LastRowLogits = wantLogits, GreedyIds = greedy, PositionTable = positionTable, FollowDraft = follow, DraftRows = draftRows,
-                FollowDFlash = dflash,
+                FollowDFlash = dflash, LastRowHidden = wantHidden,
             };
             if (!TryRunGraphStep(hidden, slots, first, counts, starts, request, out GraphResult result))
                 return false;
+            if (wantHidden)
+            {
+                int width = Config.HiddenSize;
+                if (result.LastHidden == null || result.LastHidden.LongLength < (long)width * slots.Length)
+                    throw new InvalidOperationException($"{Config.Architecture}: the step returned no final hidden rows.");
+                for (int s = 0; s < slots.Length; s++)
+                    if (lastHidden[s] != null) Array.Copy(result.LastHidden, (long)s * width, lastHidden[s], 0, width);
+            }
             if (result.Logits != null && greedy)
             {
                 // Each sequence's id as its F32 value (TryForwardUnifiedGreedy reads it).
@@ -1078,6 +1100,7 @@ namespace TensorSharp.Models
                 Logits = outputs.Logits >= 0 ? graph.Outputs[outputs.Logits] : null,
                 Final = outputs.Final >= 0 ? graph.Outputs[outputs.Final] : null,
                 Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => graph.Outputs[i]),
+                LastHidden = outputs.LastHiddenAt > 0 ? graph.Outputs[outputs.LastHiddenAt - 1] : null,
             };
             if (owned) graph.Dispose();
             return true;
@@ -1132,6 +1155,7 @@ namespace TensorSharp.Models
                             Logits = outputs.Logits >= 0 ? graph.Outputs[outputs.Logits] : null,
                             Final = outputs.Final >= 0 ? graph.Outputs[outputs.Final] : null,
                             Captures = captures,
+                            LastHidden = outputs.LastHiddenAt > 0 ? (float[])graph.Outputs[outputs.LastHiddenAt - 1].Clone() : null,
                         };
                     }
                     finally
@@ -1398,6 +1422,9 @@ namespace TensorSharp.Models
         private struct StepOutputs
         {
             public int Logits, Final, Hidden;
+            /// <summary>The output of the sequences' last final-normed rows, plus one (0: none), so every construction that
+            /// does not set it means none.</summary>
+            public int LastHiddenAt;
             public int[] RankLogits;   // each rank's slice of the vocabulary (a vocabulary-split head), in rank order
             public int[] Captures;   // -1: the captured layer is another stage's
             public (int Output, int Layer)[] Routes;   // resident MoE layers' top-K ids while device routes are recorded
@@ -1512,7 +1539,7 @@ namespace TensorSharp.Models
                 if (!DraftChainsStream) final = EmitStreamOutput(step, h);
                 EmitDraftFollow(step, DraftChainsStream ? h : final, embedded, request);
             }
-            if (!request.LastRowLogits && !request.AllRowLogits && !request.CaptureFinal) return;
+            if (!request.LastRowLogits && !request.AllRowLogits && !request.CaptureFinal && !request.LastRowHidden) return;
 
             if (final < 0) final = EmitStreamOutput(step, h);
             if (request.CaptureFinal)
@@ -1526,7 +1553,7 @@ namespace TensorSharp.Models
                     ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1 })), rows)
                     : step.Output(logits, (long)Config.VocabSize * rows);
             }
-            else if (request.LastRowLogits)
+            else if (request.LastRowLogits || request.LastRowHidden)
             {
                 int selected;
                 if (n == 1 && rows == 1) selected = final;
@@ -1537,6 +1564,10 @@ namespace TensorSharp.Models
                     for (int s = 0; s < n; s++) last[s] = step.First[s] + step.Counts[s] - 1;
                     selected = step.Op(GraphOp.GetRows, final, step.ConstantInputI32(last, n));
                 }
+                if (request.LastRowHidden)
+                    outputs.LastHiddenAt = 1 + step.Output(n == 1 && rows > 1 ? step.Op(GraphOp.Cont, selected) : selected, (long)hiddenSize * n);
+                // A step that wants only the rows (every sequence's next slot is made from its hidden row) runs no head.
+                if (!request.LastRowLogits) return;
                 int logits = step.MatMul(headName, selected);
                 outputs.Logits = request.GreedyIds
                     ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1 })), n)
@@ -1629,6 +1660,8 @@ namespace TensorSharp.Models
                 int selected = n == 1 && rows == 1 ? final
                     : n == 1 ? step.View2(final, hiddenSize, 1, hiddenSize * 4L, (rows - 1) * hiddenSize * 4L)
                     : step.Op(GraphOp.GetRows, final, step.ConstantInputI32((int[])last.Clone(), n));
+                if (r == 0 && request.LastRowHidden)
+                    outputs.LastHiddenAt = 1 + step.Output(n == 1 && rows > 1 ? step.Op(GraphOp.Cont, selected) : selected, (long)hiddenSize * n);
                 outputs.RankLogits[r] = step.Output(step.MatMul(VocabHeadName, selected), (long)_vocabHeadRows[r] * n);
             }
         }
@@ -1722,6 +1755,7 @@ namespace TensorSharp.Models
                         : outputs.RankLogits != null ? JoinVocabSlices(outputs.RankLogits, slots.Length, (r, o) => ((IGraphPlan)streams[r]).Outputs[o]) : null,
                     Final = outputs.Final >= 0 ? lead.Outputs[outputs.Final] : null,
                     Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => i >= 0 ? lead.Outputs[i] : null),
+                    LastHidden = outputs.LastHiddenAt > 0 ? lead.Outputs[outputs.LastHiddenAt - 1] : null,
                 };
                 return true;
             }
@@ -1953,6 +1987,7 @@ namespace TensorSharp.Models
                         : outputs.RankLogits != null ? JoinVocabSlices(outputs.RankLogits, slots.Length, (r, o) => plans[r].Outputs[o]) : null,
                     Final = outputs.Final >= 0 ? lead.Outputs[outputs.Final] : null,
                     Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => i >= 0 ? lead.Outputs[i] : null),
+                    LastHidden = outputs.LastHiddenAt > 0 ? lead.Outputs[outputs.LastHiddenAt - 1] : null,
                 };
                 return true;
             }

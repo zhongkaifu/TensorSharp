@@ -248,6 +248,16 @@ namespace TensorSharp.Server.RequestParsers
         /// </summary>
         public static List<ChatMessage> ParseOpenAI(JsonElement messagesEl, UploadStoragePolicy uploads, ILogger logger = null,
             string architecture = null, bool audioEncoderLoaded = false)
+            => ParseOpenAI(messagesEl, uploads, logger, architecture, audioEncoderLoaded, assistantAudio: null);
+
+        /// <summary>
+        /// <see cref="ParseOpenAI(JsonElement, UploadStoragePolicy, ILogger, string, bool)"/> where an assistant message may
+        /// carry an earlier spoken reply as OpenAI's <c>audio: {"id": ...}</c> (content null): <paramref name="assistantAudio"/>
+        /// gives that reply's transcript, which the turn renders as. An id it does not know (null) is a
+        /// <see cref="JsonException"/> (an HTTP 400).
+        /// </summary>
+        public static List<ChatMessage> ParseOpenAI(JsonElement messagesEl, UploadStoragePolicy uploads, ILogger logger,
+            string architecture, bool audioEncoderLoaded, Func<string, string> assistantAudio)
         {
             // Scan the complete request before writing any uploads: an image
             // preceding unsupported audio or an invalid image must not leave
@@ -379,6 +389,16 @@ namespace TensorSharp.Server.RequestParsers
                 AppendMessageLevelAudios(msgEl, msg, uploads);
 
                 ReadOpenAIHistory(msgEl, msg);
+
+                // An earlier spoken reply (OpenAI's assistant audio.id): its transcript renders the turn.
+                if (msg.Role == "assistant" && string.IsNullOrEmpty(msg.Content)
+                    && msgEl.TryGetProperty("audio", out JsonElement audioRef) && audioRef.ValueKind == JsonValueKind.Object
+                    && audioRef.TryGetProperty("id", out JsonElement audioId) && audioId.ValueKind == JsonValueKind.String)
+                {
+                    string transcript = assistantAudio?.Invoke(audioId.GetString());
+                    msg.Content = transcript ?? throw new JsonException(
+                        $"assistant audio '{audioId.GetString()}' is not known here (an unknown or expired id): send the reply's transcript as its content instead.");
+                }
 
                 messages.Add(msg);
             }

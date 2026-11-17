@@ -11,6 +11,7 @@
 // resamples what it is given and says what it returns.
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using TensorSharp.Models.Video;
 
 namespace TensorSharp.Models.Audio
@@ -113,6 +114,37 @@ namespace TensorSharp.Models.Audio
         int OutputSampleRate { get; }
 
         DecodedAudio Synthesize(string text, SpeechSynthesisOptions options = null);
+
+        /// <summary>Whether this load can synthesize now. A model whose speech decoder is optional (an LLM that speaks
+        /// through its projector: LFM3-Omni) says false without it; a dedicated TTS model always can.</summary>
+        bool SpeechSynthesisAvailable => true;
+
+        /// <summary>Why <see cref="SpeechSynthesisAvailable"/> is false (what to load), or null.</summary>
+        string SpeechSynthesisUnavailableReason => null;
+
+        /// <summary>Whether <see cref="SpeechSynthesisOptions.Speed"/> other than 1 is honored (an LLM speaker has no rate
+        /// control).</summary>
+        bool SupportsSpeed => true;
+
+        /// <summary>Whether the speech is sampled (a seed, a temperature and a frame limit apply:
+        /// <see cref="SpeechSynthesisOptions.Seed"/>, <see cref="SpeechSynthesisOptions.Temperature"/>,
+        /// <see cref="SpeechSynthesisOptions.MaxFrames"/>); false for a deterministic synthesizer.</summary>
+        bool SamplesSpeech => false;
+
+        /// <summary>
+        /// <see cref="Synthesize"/> that hands the mono samples to <paramref name="onSamples"/> as they are made (each call
+        /// the samples after the previous one's) and returns the whole clip. A model that makes the clip at once hands it
+        /// over in one call (the default); a streaming one (LFM3-Omni: 80 ms a frame) as it goes.
+        /// </summary>
+        DecodedAudio SynthesizeStream(string text, SpeechSynthesisOptions options, Action<float[]> onSamples,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            DecodedAudio audio = Synthesize(text, options);
+            if (onSamples != null && audio?.Channels is { Length: > 0 } channels)
+                onSamples(channels[0]);
+            return audio;
+        }
     }
 
     public sealed class SpeechSynthesisOptions
@@ -129,6 +161,17 @@ namespace TensorSharp.Models.Audio
         /// <summary>Phonemes to speak instead of the text (the model's phoneme alphabet), for callers
         /// that run their own grapheme-to-phoneme step.</summary>
         public string Phonemes { get; set; }
+
+        /// <summary>The random stream's seed of a model that samples its speech (<see cref="ISpeechSynthesisModel.SamplesSpeech"/>),
+        /// or null for a random one.</summary>
+        public uint? Seed { get; set; }
+
+        /// <summary>The speech temperature of a model that samples its speech, or null for the model's default.</summary>
+        public float? Temperature { get; set; }
+
+        /// <summary>The most speech frames a model that samples its speech makes (LFM3: 80 ms each), or null for its
+        /// default.</summary>
+        public int? MaxFrames { get; set; }
     }
 
     /// <summary>A text-to-music model: a style description and lyrics in, a song out.</summary>

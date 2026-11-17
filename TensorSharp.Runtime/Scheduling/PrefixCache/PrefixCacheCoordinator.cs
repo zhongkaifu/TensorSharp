@@ -252,8 +252,9 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     /// </summary>
     private bool TryPlanPromptEnd(SequenceState sequence)
     {
+        // A driven request (speech output) may need the prompt's last final hidden row, which no checkpoint keeps.
         if (!CheckpointsSupported || sequence.CacheScope is null || sequence.OutputTokens.Count != 0
-            || !PromptEndKeepsLogits(sequence))
+            || !PromptEndKeepsLogits(sequence) || sequence.StepDriver != null)
             return false;
         _tree.Plan(BuildRequest(sequence, ExpectedRoute.PerSequenceFused, promptEnd: true), _plan);
         if (_plan.Kind == CandidateKind.EndState && _plan.Length == sequence.PromptTokens.Count
@@ -666,7 +667,9 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         DropPending(sequence);
         Drain();
         int length = Math.Min(sequence.NumComputedTokens, sequence.NumTotalTokens);
-        if (length < _tree.Caps.MinRetainTokens || sequence.CacheBreakpoints is not null) return false;
+        // A driven request's output holds one placeholder token for each embedding row it decoded (speech frames of any
+        // content), so its end state is not keyed by what it holds: it is not retained.
+        if (length < _tree.Caps.MinRetainTokens || sequence.CacheBreakpoints is not null || sequence.StepDriver != null) return false;
         KeyRope key = GetKey(sequence);
         RadixNode node = _tree.Insert(key, length, GetScope(sequence), sequence.SharedPrefixTokens,
             NodeFlags.None, GetSpans(sequence));

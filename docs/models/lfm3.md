@@ -4,8 +4,8 @@
 
 Liquid AI's LFM3 checkpoints declare `general.architecture = lfm3`: **LFM3-1.7B**, a text
 model with reasoning and tool calls, and **LFM3-Omni-2B**, the same decoder with one
-multimodal projector that takes images, video and audio in (and carries a speech
-generator, which TensorSharp does not serve yet). Both share one chat protocol; the
+multimodal projector that takes images, video and audio in and speaks (its speech
+generator and codec: [Speech output](#speech-output)). Both share one chat protocol; the
 GGUF's own template tells them apart.
 
 | Property | Value |
@@ -245,6 +245,73 @@ it for chat). TensorSharp's repetition penalty looks back over the last
 output. `repeat-last-n -1` matches SGLang; compare with other engines at repeat penalty
 1.0 and greedy decoding.
 
+## Speech output
+
+LFM3-Omni's mmproj carries the speech generator (`a.gen.code.*`: a 3-layer bidirectional
+depthformer that turns the LM's final hidden row into a frame of 12 codes in 3 MaskGIT
+passes) and the LiquidCodec decoder (`a.gen.wav.*`: frames to 24 kHz PCM through a host
+ISTFT). Loading the mmproj (`--mmproj`) turns speech on; `TensorSharp.Models.Lfm3.Lfm3SpeechOutput`
+is the component, bit-exact with llama.cpp's on ggml-metal.
+
+**How a spoken reply runs.** One engine request whose slots a driver chooses
+(`Lfm3SpeechDriver`, llama.cpp's `step_gen` schedule): a text slot samples a token from the
+logits; a speech slot samples a frame from the previous position's final hidden row, queues
+its 80 ms of PCM, and decodes the frame's feedback row (the sum of its 12 codebook
+embeddings) as the next input row. The runtime's slot steps take an embedding row in place
+of a token and return the last row's final hidden row, and a step no request wants logits
+from skips the 128000 x 2048 LM head, so spoken and text requests batch in the same steps
+on every executor. Modes: `audio` (`<|audio_start|>`), `interleaved` (`<|mixed_start|>`: 6 text
+tokens, then 12 frames, ..., until `<|text_end|>`; the text is the speech's transcript), and
+TTS (the GGUF's `tokenizer.chat_template.tts`, ending at the end-of-speech frame). A
+conversation's reply goes on in text after its speech, as the model card's `generate` and
+llama.cpp's realtime server do; a TTS reply stops at the end of its speech, as llama-tts does.
+
+Where to use it: CLI `--tts` / `--speech-out` (with `--speech-mode`, `--speech-temperature`,
+`--voice`, `--language`, `--seed`), `POST /v1/audio/speech`, and `/v1/chat/completions` /
+`/v1/responses` with `modalities` `["text","audio"]` or `["audio"]` — see
+[USAGE.md → Speech output](../../USAGE.md#speech-output-lfm3-omni). Voices are `female`
+and `male` (named in the system prompt; there is no speaker embedding); an unknown voice,
+OpenAI's default `alloy` included, is a 400 that lists them. A spoken chat reply's system
+prompt gets llama.cpp's realtime line ("Speak in English using a female voice.") and, for
+interleaved replies, the card's "Respond with interleaved text and audio.".
+
+Text replies of LFM3-Omni never draw the media placeholders (`<|audio|>`, `<|audio_out|>`,
+`<|image|>`, `<|video|>`), and a text-only reply never opens speech (`<|audio_start|>`,
+`<|mixed_start|>` banned), as HF's `generate` does; llama.cpp suppresses neither in plain
+chat. (A sampler with suppressed tokens is not a plain argmax, so direct CUDA's on-device
+greedy pick is not used for LFM3-Omni's text replies.)
+
+**Validation (2026-11-17, M5 Pro, ggml-metal, Q8_0 LM + Q8_0 mmproj, llama.cpp `d3c3e242c`):**
+
+- The reply driver on llama.cpp's own hidden rows of a llama-tts run reproduces llama-tts's
+  WAV to 1 LSB (20 of 130,560 samples differ, end of speech at the same frame 68).
+- End to end, TensorSharp's TTS with llama-tts's seed draws the same codes as llama-tts for
+  the first 2-7 frames, then parts: the LM's hidden rows sit 2-7e-4 (relative L2) from
+  llama.cpp's and a frame's sample flips. At speech temperature 0 (argmax), 2 of 5 texts
+  match llama-tts within 1 LSB for the whole utterance (72 and 86 frames).
+- Intelligibility (LFM3-Omni's own ASR through llama.cpp, `eng/lfm3/speech-asr.py`): over 5
+  texts (English, British English, French, Chinese) x 5 seeds, TensorSharp 0.00% WER/CER (25
+  of 25 exact) against llama-tts 1.38% (22 of 25).
+- Interleaved replies: the ASR of each English reply's speech equals its transcript (6 of 6,
+  0% WER), as for llama.cpp's realtime path driven the same way (`eng/lfm3/speech-chat-ref.cpp`).
+  Chinese interleaved speech is not intelligible in either engine (a model limit; Chinese TTS
+  is).
+- Speech-only replies (`modalities ["audio"]`, which opens `<|audio_start|>` as llama.cpp's
+  realtime AUDIO mode does): LFM3-Omni reads the user's message aloud instead of answering it,
+  in TensorSharp and llama.cpp alike (8 of 8 questions, ASR = the question), and without a
+  voice line its speech is unintelligible. For spoken answers ask for `["text","audio"]`.
+- A text request served while a TTS reply speaks keeps its greedy reply; the engine's TTS
+  equals the standalone synthesis bit for bit.
+- Speed (streaming `/v1/audio/speech`, one client against TensorSharp and llama-server, requests
+  interleaved, on a shared and loaded Mac): at parity on Metal - time to first audio 88-114 ms
+  against 119-141 ms, real-time factor 1.83x against 1.38-1.92x at load 36-95 (a quiet machine is
+  3-5x faster for both). Audio-only steps skip the LM head (-15% of the step). MLX runs at about
+  half Metal's speed (its fixed cost per graph run).
+
+Limits: no `/v1/realtime`; a spoken assistant turn in later history renders as its
+transcript (OpenAI's `audio.id` maps to it for an hour), not as its audio frames; speech
+requests are not retained in the prefix cache; speech and CUDA are untested on NVIDIA GPUs.
+
 ## Benchmarking
 
 `ignore_eos: true` on `/v1/chat/completions` (and `/v1/responses`) generates exactly
@@ -254,9 +321,9 @@ sampling on every engine.
 
 ## Current limits
 
-- Speech output (the projector's `lfm3a_gen` generator and codec) is not served: no
-  chat audio-out, `/v1/audio/speech` or realtime endpoint for this family yet.
-- Media input on CUDA (direct and ggml-cuda) and Vulkan has not run (no device).
+- Speech output has no realtime endpoint (`/v1/realtime`), and past spoken turns re-render
+  as their transcripts (see [Speech output](#speech-output)).
+- Media input and speech output on CUDA (direct and ggml-cuda) and Vulkan have not run (no device).
 - Speech input as a live stream (a realtime endpoint) is not served; clips are encoded
   whole (30 s chunks).
 - A message's still images come before its videos in the prompt whatever the client's

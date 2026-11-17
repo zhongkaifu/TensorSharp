@@ -37,7 +37,7 @@ namespace TensorSharp.Server.ProtocolAdapters;
 /// share one temporary request workspace, which is deleted before this method
 /// returns and never becomes cross-request state.
 /// </summary>
-public sealed class OpenAIResponsesAdapter
+public sealed partial class OpenAIResponsesAdapter
 {
     private readonly ModelService _svc;
     private readonly KnowledgeStore? _knowledge;
@@ -147,6 +147,15 @@ public sealed class OpenAIResponsesAdapter
             return;
         }
         var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
+        // A spoken response (modalities with "audio"), as /v1/chat/completions takes it.
+        SpeechReplyRequest speech = SpeechReplyRequest.Parse(body, stream, out string speechError);
+        speechError ??= speech?.Refusal(_svc.SpeechOutputModel, _svc.Architecture);
+        if (speechError != null)
+        {
+            logger.LogWarning(LogEventIds.HttpRequestRejected, "/v1/responses rejected: {Error} (model={Model})", speechError, modelName);
+            await WriteErrorAsync(ctx, 400, speechError).ConfigureAwait(false);
+            return;
+        }
         var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens,
             reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);
         if (knowledge == null) return;
@@ -191,6 +200,24 @@ public sealed class OpenAIResponsesAdapter
         }
         samplingConfig.ReasoningEffort = reasoningEffort;
         var requestedSkills = SkillSelectionParser.Parse(body);
+        if (speech != null)
+        {
+            string conflict = tools is { Count: > 0 } ? "tools"
+                : body.TryGetProperty("text", out var textFormat) && textFormat.ValueKind == JsonValueKind.Object && textFormat.TryGetProperty("format", out _) ? "text.format"
+                : enableThinking ? "reasoning"
+                : requestedSkills is { Count: > 0 } ? "skills"
+                : knowledge.Enabled ? "knowledge retrieval"
+                : null;
+            if (conflict != null)
+            {
+                await WriteErrorAsync(ctx, 400, $"A spoken response (modalities with \"audio\") is not combined with {conflict}: ask for modalities [\"text\"] for that.")
+                    .ConfigureAwait(false);
+                return;
+            }
+            await SpeechResponseAsync(ctx, OpenAIResponsesFactory.NewResponseId(), modelName!, instructions, maxOutputTokens, messages,
+                samplingConfig, speech, stream, store, logger).ConfigureAwait(false);
+            return;
+        }
 
         string requestId = OpenAIResponsesFactory.NewResponseId();
         // gen_ai.response.id on the HTTP server span (see OpenAIChatAdapter for why there) —

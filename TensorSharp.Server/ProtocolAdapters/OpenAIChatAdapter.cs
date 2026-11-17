@@ -111,6 +111,19 @@ public sealed partial class OpenAIChatAdapter
                     })
                     .ToList(),
             }];
+        // A model that speaks (its speech decoder loaded) says so: the chat modalities it serves and its voices.
+        if (data.Count > 0 && _svc.SpeechOutputModel is { HasSpeechOutput: true } speaker)
+        {
+            data[0]["capabilities"] = new[] { "chat", "audio_output" };
+            data[0]["audio"] = new
+            {
+                voices = speaker.SpeechVoices,
+                sample_rate = speaker.SpeechSampleRate,
+                modalities = new[] { new[] { "text" }, new[] { "text", "audio" }, new[] { "audio" } },
+                formats = new[] { "wav", "pcm16" },
+                speech_route = "/v1/audio/speech",
+            };
+        }
         return Results.Json(new { @object = "list", data });
     }
 
@@ -154,14 +167,26 @@ public sealed partial class OpenAIChatAdapter
             return;
         }
         var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
+        // A spoken reply (modalities with "audio"): settled before anything else is prepared.
+        SpeechReplyRequest speech = SpeechReplyRequest.Parse(body, stream, out string speechError);
+        speechError ??= speech?.Refusal(_svc.SpeechOutputModel, _svc.Architecture);
+        if (speechError != null)
+        {
+            openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/chat/completions rejected: {Error} (model={Model})", speechError, modelName);
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = speechError, type = "invalid_request_error" } }).ConfigureAwait(false);
+            return;
+        }
         var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens,
             reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);
         if (knowledge == null) return;
         List<ChatMessage> messages;
         try
         {
+            // An assistant turn may be an earlier spoken reply sent back by its audio id: its transcript renders it.
             messages = ChatMessageParser.ParseOpenAI(messagesEl, _uploads, openaiLogger, _svc.Architecture,
-                _svc.IsAudioEncoderLoaded);
+                _svc.IsAudioEncoderLoaded, SpeechReplies.TranscriptOf);
         }
         catch (UploadLimitExceededException ex)
         {
@@ -212,6 +237,25 @@ public sealed partial class OpenAIChatAdapter
         }
         WarnIgnoredTemplateKwargsOnce(openaiLogger, ignoredKwargs);
         var requestedSkills = SkillSelectionParser.Parse(body);
+
+        // A spoken reply is a conversational answer: the protocol features that shape text are not combined with it.
+        if (speech != null)
+        {
+            string conflict = openaiTools is { Count: > 0 } ? "tools"
+                : body.TryGetProperty("response_format", out var rf) && rf.ValueKind != JsonValueKind.Null ? "response_format"
+                : openaiThink ? "thinking (think / enable_thinking)"
+                : requestedSkills is { Count: > 0 } ? "skills"
+                : knowledge.Enabled ? "knowledge retrieval"
+                : null;
+            if (conflict != null)
+            {
+                string message = $"A spoken reply (modalities with \"audio\") is not combined with {conflict}: ask for modalities [\"text\"] for that.";
+                openaiLogger.LogWarning(LogEventIds.HttpRequestRejected, "/v1/chat/completions rejected: {Error} (id={ChatcmplId})", message, requestId);
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsJsonAsync(new { error = new { message, type = "invalid_request_error" } }).ConfigureAwait(false);
+                return;
+            }
+        }
 
         // A block-diffusion model has no tool-call loop: nothing could feed a result
         // back into a denoising turn, and it used to answer a "required" call with
@@ -378,6 +422,14 @@ public sealed partial class OpenAIChatAdapter
             if (lora != null)
                 openaiLogger.LogInformation(LogEventIds.ChatStarted,
                     "/v1/chat/completions lora: id={ChatcmplId} adapter={Adapter}", requestId, lora.Id);
+        }
+
+        if (speech != null)
+        {
+            // Spoken: the client's messages as they are (no skill tools or instructions), on the engine as a driven request.
+            await SpeechCompletionAsync(ctx, requestId, modelName!, messages, maxTokens, samplingConfig, speech, stream, lora, openaiLogger)
+                .ConfigureAwait(false);
+            return;
         }
 
         inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,

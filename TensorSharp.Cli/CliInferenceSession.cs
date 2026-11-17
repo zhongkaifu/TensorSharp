@@ -49,7 +49,8 @@ internal sealed class CliInferenceSession : IDisposable
     public Result Generate(IReadOnlyList<int> prompt, int maxTokens, SamplingConfig sampling,
         Func<int, bool> onToken = null, CancellationToken cancellationToken = default,
         string requestId = null, IReadOnlyList<PromptMediaSpan> mediaSpans = null,
-        bool enablePrefixCache = true, int sharedPrefixTokens = 0, bool promptTailCheckpointOptional = false)
+        bool enablePrefixCache = true, int sharedPrefixTokens = 0, bool promptTailCheckpointOptional = false,
+        ISequenceStepDriver stepDriver = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(maxTokens);
         cancellationToken.ThrowIfCancellationRequested();
@@ -81,6 +82,8 @@ internal sealed class CliInferenceSession : IDisposable
             // state, so a short unprotected prompt tail takes no checkpoint (an extra checkpoint copy and one-row
             // forward on every request otherwise: 65 ms of a 60-token prompt's 116 ms TTFT, Qwen3.8-27B on CUDA).
             PromptTailCheckpointOptional = promptTailCheckpointOptional,
+            // A spoken reply's slots (text tokens and speech frames) are its driver's.
+            StepDriver = stepDriver,
         };
 
         // One chat span and the request metrics per call, recorded the way the server's

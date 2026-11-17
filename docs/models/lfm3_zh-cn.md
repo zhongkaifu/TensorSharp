@@ -3,8 +3,8 @@
 [← 返回模型索引](README_zh-cn.md) | [English](lfm3.md)
 
 Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B** 是支持推理与工具调用的文本模型；
-**LFM3-Omni-2B** 使用同一解码器，外加一个多模态投影器，可输入图像、视频与音频（投影器中还带有语音生成器，
-TensorSharp 暂不提供语音输出）。两者共用一套聊天协议，由 GGUF 自带的模板区分。
+**LFM3-Omni-2B** 使用同一解码器，外加一个多模态投影器，可输入图像、视频与音频并能说话（投影器中的语音生成器与编解码器：
+见[语音输出](#语音输出)）。两者共用一套聊天协议，由 GGUF 自带的模板区分。
 
 | 属性 | 值 |
 |---|---|
@@ -161,6 +161,53 @@ LFM3-Omni 在多模态展开器运行之前的占位符约定（同一条消息�
 `repeat_last_n` 个**生成的** token；llama-server 还计入提示词最后 `repeat_last_n` 个 token，vLLM 与 HF 计入整个提示词和输出，
 SGLang 计入全部输出。`repeat-last-n -1` 与 SGLang 一致；与其他引擎比较时请使用 repeat penalty 1.0 并贪心解码。
 
+## 语音输出
+
+LFM3-Omni 的 mmproj 中带有语音生成器（`a.gen.code.*`：3 层双向 depthformer，用 3 次 MaskGIT 把 LM 的最终隐藏行变成
+一帧 12 个编码）与 LiquidCodec 解码器（`a.gen.wav.*`：帧经主机端 ISTFT 变成 24 kHz PCM）。加载 mmproj（`--mmproj`）
+即开启语音；组件为 `TensorSharp.Models.Lfm3.Lfm3SpeechOutput`，在 ggml-metal 上与 llama.cpp 逐位一致。
+
+**语音回复如何运行。** 一个请求的各个槽由驱动器决定（`Lfm3SpeechDriver`，即 llama.cpp 的 `step_gen` 调度）：文本槽从
+logits 采样 token；语音槽用上一位置的最终隐藏行采样一帧，排入其 80 ms PCM，并把该帧的反馈行（12 个码本嵌入之和）作为
+下一个输入行解码。运行时的槽步骤可以用嵌入行代替 token，并返回最后一行的最终隐藏行；某步没有请求需要 logits 时跳过
+128000 x 2048 的 LM head，因此语音请求与文本请求在每个执行器上同批运行。模式：`audio`（`<|audio_start|>`）、
+`interleaved`（`<|mixed_start|>`：6 个文本 token，然后 12 帧，……，直到 `<|text_end|>`；文本即语音的转写），以及
+TTS（GGUF 的 `tokenizer.chat_template.tts`，在语音结束帧停止）。对话回复在语音之后继续以文本进行（与模型卡的
+`generate` 和 llama.cpp 的 realtime 服务一致）；TTS 回复在语音结束时停止（与 llama-tts 一致）。
+
+用法：CLI `--tts` / `--speech-out`（配合 `--speech-mode`、`--speech-temperature`、`--voice`、`--language`、`--seed`）、
+`POST /v1/audio/speech`，以及带 `modalities` `["text","audio"]` 或 `["audio"]` 的 `/v1/chat/completions` /
+`/v1/responses`——见 [USAGE_zh-cn.md → 语音输出](../../USAGE_zh-cn.md#语音输出lfm3-omni)。音色为 `female` 与 `male`
+（写在系统提示中，没有说话人嵌入）；未知音色（包括 OpenAI 默认的 `alloy`）返回 400 并列出可用音色。语音对话回复的系统提示
+加上 llama.cpp 的 realtime 句子（“Speak in English using a female voice.”），交错回复再加上模型卡的
+“Respond with interleaved text and audio.”。
+
+LFM3-Omni 的文本回复永不采样媒体占位符（`<|audio|>`、`<|audio_out|>`、`<|image|>`、`<|video|>`），纯文本回复也不会开启
+语音（禁止 `<|audio_start|>`、`<|mixed_start|>`），与 HF 的 `generate` 一致；llama.cpp 在普通对话中两者都不抑制。（有被抑制
+token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用直接 CUDA 的设备端贪心选择。）
+
+**验证（2026-11-17，M5 Pro，ggml-metal，Q8_0 LM + Q8_0 mmproj，llama.cpp `d3c3e242c`）：**
+
+- 回复驱动器使用 llama.cpp 在一次 llama-tts 运行中的隐藏行时，重现 llama-tts 的 WAV，误差在 1 LSB 以内（130,560 个采样中
+  20 个不同），并在同一帧 68 结束语音。
+- 端到端：TensorSharp 的 TTS 使用 llama-tts 的种子时，前 2-7 帧的编码与 llama-tts 相同，之后分叉：LM 的隐藏行与
+  llama.cpp 相差 2-7e-4（相对 L2），某帧的采样翻转。语音温度为 0（argmax）时，5 段文本中有 2 段整句与 llama-tts 相差
+  不超过 1 LSB（72 帧与 86 帧）。
+- 可懂度（通过 llama.cpp 运行 LFM3-Omni 自身的 ASR，`eng/lfm3/speech-asr.py`）：5 段文本（美式英语、英式英语、法语、
+  中文）x 5 个种子，TensorSharp 的 WER/CER 为 0.00%（25 段中 25 段完全正确），llama-tts 为 1.38%（25 段中 22 段）。
+- 交错回复：每条英文回复的语音经 ASR 后与其转写一致（6/6，WER 0%），与用同样方式驱动的 llama.cpp realtime 路径相同
+  （`eng/lfm3/speech-chat-ref.cpp`）。两个引擎的中文交错语音都不可懂（模型的限制；中文 TTS 是可懂的）。
+- 纯语音回复（`modalities ["audio"]`，与 llama.cpp realtime 的 AUDIO 模式一样以 `<|audio_start|>` 开始）：LFM3-Omni
+  会把用户的消息朗读出来而不是回答，TensorSharp 与 llama.cpp 相同（8/8 个问题，ASR 结果即问题本身）；没有音色句时语音不可懂。
+  需要语音回答时请用 `["text","audio"]`。
+- TTS 回复说话期间处理的文本请求保持其贪心回复不变；引擎上的 TTS 与独立合成逐位相同。
+- 速度（流式 `/v1/audio/speech`，同一客户端交替请求 TensorSharp 与 llama-server，在共享且高负载的 Mac 上）：Metal 上两者持平——
+  首段音频 88-114 ms 对 119-141 ms，实时倍率 1.83x 对 1.38-1.92x（负载 36-95；空闲机器上两者都快 3-5 倍）。纯语音步骤跳过 LM
+  head（该步 -15%）。MLX 约为 Metal 的一半速度（每次图运行的固定开销）。
+
+限制：没有 `/v1/realtime`；之后历史中的语音助手回合按其转写渲染（OpenAI 的 `audio.id` 在一小时内映射到它），而不是按音频帧；
+语音请求不保留在前缀缓存中；语音与 CUDA 未在 NVIDIA GPU 上测试。
+
 ## 基准测试
 
 在 `/v1/chat/completions`（以及 `/v1/responses`）上设置 `ignore_eos: true`，会越过结束 token 精确生成 `max_tokens` 个 token，
@@ -168,8 +215,8 @@ SGLang 计入全部输出。`repeat-last-n -1` 与 SGLang 一致；与其他引�
 
 ## 当前限制
 
-- 不提供语音输出（投影器中的 `lfm3a_gen` 生成器与编解码器）：该模型族尚无聊天音频输出、`/v1/audio/speech` 或实时端点。
-- 媒体输入在 CUDA（直连与 ggml-cuda）和 Vulkan 上没有运行过（没有设备）。
+- 语音输出没有实时端点（`/v1/realtime`），历史中的语音回合按其转写重新渲染（见[语音输出](#语音输出)）。
+- 媒体输入与语音输出在 CUDA（直连与 ggml-cuda）和 Vulkan 上没有运行过（没有设备）。
 - 不提供以实时流方式输入语音（实时端点）；音频整段编码（30 秒一块）。
 - 无论客户端顺序如何，一条消息中的静态图都排在视频之前；以 `video_url` 发送的视频在它们之间没有位置。
 - `tool_choice: required` 不由语法强制；嵌套工具 schema 会被展平。

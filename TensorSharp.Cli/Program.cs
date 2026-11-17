@@ -600,7 +600,11 @@ namespace TensorSharp.Cli
                     case "--key":
                     case "--time-signature":
                     case "--phonemes":
-                    case "--no-audio-codes": audioCli.Read(args, ref i); break;
+                    case "--no-audio-codes":
+                    case "--tts":
+                    case "--speech-out":
+                    case "--speech-mode":
+                    case "--speech-temperature": audioCli.Read(args, ref i); break;
                     case "--video": videoPath = args[++i]; break;
                     case "--mmproj": mmProjPath = args[++i]; break;
                     case "--draft-model": draftModelPath = args[++i]; break;
@@ -1148,10 +1152,36 @@ namespace TensorSharp.Cli
 
             // Audio models: Whisper (--audio in, transcript out), Kokoro (--prompt in, speech
             // out) and ACE-Step (--prompt style tags and --lyrics in, a song out).
+            // --tts with a chat model that speaks (LFM3-Omni): its speech decoder is in the projector, which the chat
+            // routes below load; the TTS route returns before them, so it is loaded here.
+            if (audioCli.Tts && mmProjPath != null && model is TensorSharp.Models.Audio.ISpeechOutputLoader)
+            {
+                try
+                {
+                    model.MultimodalInjector.LoadProjectors(ModelArchitectureRegistry.ResolveProjectorPath(model.Config.Architecture, mmProjPath));
+                }
+                catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string projectorRefusal))
+                {
+                    ReportProjectorRefusal(ex, mmProjPath, projectorRefusal);
+                    return;
+                }
+            }
             if (AudioCli.TryRun(model, audioCli,
                     editPrompt ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : null),
-                    audioPath, outputFile, diffusionStepsSet ? diffusionSteps : 0, diffusionSeedSet ? diffusionSeed : 0))
+                    audioPath, outputFile, diffusionStepsSet ? diffusionSteps : 0, diffusionSeedSet ? diffusionSeed : 0,
+                    samplingConfig.Seed >= 0 ? (uint)samplingConfig.Seed : null))
                 return;
+            // A model that cannot speak at all refuses the speech flags before its own routes (image and video
+            // generation return before the projector is loaded); a model that speaks is checked once its projector is.
+            if (model is not TensorSharp.Models.Audio.ISpeechOutputModel
+                && SpeechOutRefusal(model, audioCli, false, false, false) is { } cannotSpeak)
+            {
+                _log.LogError(LogEventIds.CliFailed, "{Reason}", cannotSpeak);
+                Console.Error.WriteLine(cannotSpeak);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+
 
             // Qwen-Image-2.1: prompt -> generated image, or prompt + input image(s) -> edited
             // image (no autoregressive path). Repeat --image for multi-image edits (e.g.
@@ -1274,6 +1304,18 @@ namespace TensorSharp.Cli
                         return;
                     }
                 }
+            }
+
+            // A spoken chat reply (--speech-out): a single-prompt run of a model that speaks (its projector loaded above).
+            // The speech flags do nothing anywhere else, so they are refused there rather than ignored.
+            string speechRefusal = SpeechOutRefusal(model, audioCli, runInteractive, inputJsonl != null || multiTurnJsonl != null,
+                runTest || runBenchmark || runChunkedPrefillCorrectness || runKvCacheBenchmark);
+            if (speechRefusal != null)
+            {
+                _log.LogError(LogEventIds.CliFailed, "{Reason}", speechRefusal);
+                Console.Error.WriteLine(speechRefusal);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
             }
 
             if (runTest)
@@ -1628,7 +1670,18 @@ namespace TensorSharp.Cli
             // the model so beats ending its turn on a guess.
             List<ToolFunction> clientTools = tools != null ? new List<ToolFunction>(tools) : null;
 
-            if (skillRegistry != null && (selectedSkills.Count > 0 || (skillOptions.Discovery && skillRegistry.Skills.Count > 0)))
+            // A spoken reply (--speech-out) is a conversational answer: skills, code execution and tools are not combined
+            // with it (as on the server), and discovered skills are not offered to it.
+            if (audioCli.SpeechOut != null && (selectedSkills.Count > 0 || codeRunner != null || tools is { Count: > 0 }))
+            {
+                string refusal = "--speech-out is a spoken reply, which is not combined with selected skills, --code-exec or --tools: run without them.";
+                _log.LogError(LogEventIds.CliFailed, "{Reason}", refusal);
+                Console.Error.WriteLine(refusal);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+            if (skillRegistry != null && audioCli.SpeechOut == null
+                && (selectedSkills.Count > 0 || (skillOptions.Discovery && skillRegistry.Skills.Count > 0)))
             {
                 var skillCaps = SkillCapabilities.For(model.Config.Architecture);
                 var catalogSkills = skillOptions.Discovery
@@ -1794,7 +1847,15 @@ namespace TensorSharp.Cli
                     enableThinking: enableThinking, tools: tools,
                     preserveAllInput: pdfPath != null,
                     specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
-                    systemPrompt: systemPrompt, inference: inference, videoFilePaths: videoFilePaths);
+                    systemPrompt: systemPrompt, inference: inference, videoFilePaths: videoFilePaths,
+                    speech: audioCli.SpeechOut == null ? null : new CliSpeechRequest(audioCli.SpeechOut, new TensorSharp.Models.Audio.SpeechReplyOptions
+                    {
+                        Mode = audioCli.SpeechMode,
+                        Voice = audioCli.Voice,
+                        Language = audioCli.Language,
+                        Seed = samplingConfig.Seed >= 0 ? (uint)samplingConfig.Seed : null,
+                        Temperature = audioCli.SpeechTemperature,
+                    }));
             }
 
             _log.LogInformation(LogEventIds.ChatCompleted,
@@ -2970,8 +3031,12 @@ namespace TensorSharp.Cli
             bool preserveAllInput = false, int specDraftMax = 0, float specDraftConfMin = -1f,
             string systemPrompt = null, List<ChatMessage> priorTurns = null,
             Action<ParsedOutput> onParsed = null, CliInferenceSession inference = null,
-            Action<List<int>, string> onGenerated = null, List<string> videoFilePaths = null)
+            Action<List<int>, string> onGenerated = null, List<string> videoFilePaths = null, CliSpeechRequest speech = null)
         {
+            // A spoken reply: the system prompt says how (voice, interleaving), as the server's pipeline adds it.
+            var speaker = speech != null ? (TensorSharp.Models.Audio.ISpeechOutputModel)model : null;
+            if (speaker != null && speaker.SpeechReplyInstruction(speech.Options) is { Length: > 0 } instruction)
+                systemPrompt = string.IsNullOrWhiteSpace(systemPrompt) ? instruction : systemPrompt.TrimEnd() + "\n" + instruction;
             var messages = BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns, videoFilePaths);
 
             var inputTokens = new KVCachePromptRenderer(PromptRenderer).RenderToTokens(
@@ -3008,6 +3073,19 @@ namespace TensorSharp.Cli
                 var sampler = new TokenSampler(cfg);
                 var streamed = new List<int>();
                 string trimmedAtStop = null;
+                // A spoken reply opens its mode and is driven slot by slot; each frame's speech is taken as its
+                // placeholder arrives.
+                TensorSharp.Models.Audio.SpeechReplyDriver speechDriver = null;
+                var speechPcm = new List<float>();
+                if (speaker != null)
+                {
+                    int opening = speaker.SpeechOpeningToken(speech.Options.Mode);
+                    if (opening >= 0) inputTokens = new List<int>(inputTokens) { opening };
+                    speechDriver = speaker.CreateSpeechDriver(inputTokens, speech.Options);
+                }
+                using var ownedDriver = speechDriver;
+                var speechClock = Stopwatch.StartNew();
+                double firstAudioMs = -1;
                 // A family that writes its tool's result itself ends the turn at its call.
                 string promptTail = CliOutputParser.PromptTail(model.Config.Architecture, model.Config.ChatTemplate,
                     model.Tokenizer, inputTokens);
@@ -3015,6 +3093,13 @@ namespace TensorSharp.Cli
                     model.Config.ChatTemplate, enableThinking, tools, promptTail);
                 bool Emit(int token)
                 {
+                    if (speechDriver != null && (token == speechDriver.FrameToken || speechDriver.IsControlToken(token)))
+                    {
+                        float[] samples = speechDriver.TakeAudio();
+                        if (samples.Length > 0 && firstAudioMs < 0) firstAudioMs = speechClock.Elapsed.TotalMilliseconds;
+                        speechPcm.AddRange(samples);
+                        return true;
+                    }
                     streamed.Add(token);
                     if (toolCallTurnEnd != null && toolCallTurnEnd.ObserveToken(model.Tokenizer, token))
                         return false;
@@ -3028,7 +3113,23 @@ namespace TensorSharp.Cli
                 var result = inference.Generate(inputTokens, maxTokens, cfg, Emit,
                     requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId),
                     sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens),
-                    promptTailCheckpointOptional: !TensorSharp.Server.ChatGenerationPipeline.ReasonsWhetherAsked(model.Config.Architecture, enableThinking));
+                    promptTailCheckpointOptional: !TensorSharp.Server.ChatGenerationPipeline.ReasonsWhetherAsked(model.Config.Architecture, enableThinking),
+                    stepDriver: speechDriver);
+                if (speechDriver != null)
+                {
+                    speechDriver.Complete();
+                    speechPcm.AddRange(speechDriver.TakeAudio());
+                    File.WriteAllBytes(speech.OutputPath, TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Wav(speechPcm.ToArray(), speechDriver.SampleRate));
+                    double seconds = speechPcm.Count / (double)speechDriver.SampleRate;
+                    _log.LogInformation(LogEventIds.ChatCompleted,
+                        "cli.speech wrote {Seconds:F2}s of speech ({Frames} frames, {Mode}) to {Path}; first audio after {FirstAudioMs:F0} ms, " +
+                        "{Rtf:F1}x real time", seconds, speechDriver.Frames, speech.Options.Mode, speech.OutputPath, firstAudioMs,
+                        seconds / Math.Max(1e-9, speechClock.Elapsed.TotalSeconds));
+                    Console.WriteLine($"Wrote {seconds:F2}s of speech to {speech.OutputPath} (first audio after {firstAudioMs:F0} ms, " +
+                        $"{seconds / Math.Max(1e-9, speechClock.Elapsed.TotalSeconds):F1}x real time)");
+                    // The transcript: the text slots only (frames and control tokens are the schedule).
+                    result = result with { Tokens = streamed };
+                }
                 onGenerated?.Invoke(result.Tokens, trailingWhitespace);
                 if (!silent)
                 {
@@ -3055,6 +3156,31 @@ namespace TensorSharp.Cli
             {
                 model.MultimodalInjector.ClearPreparedPromptState(requestId);
             }
+        }
+
+        /// <summary>Why the speech flags cannot apply to this run (null: they can, or none is set): --speech-out needs a
+        /// model that speaks with its speech decoder loaded, and a single-prompt run (not the REPL, a JSONL batch or a
+        /// benchmark); --speech-mode / --speech-temperature need --speech-out or --tts.</summary>
+        internal static string SpeechOutRefusal(ModelBase model, AudioCliOptions audio, bool interactive, bool batch, bool diagnostic)
+        {
+            if (audio.SpeechOut == null)
+            {
+                if (!audio.Tts && audio.SpeechTemperature.HasValue)
+                    return "--speech-temperature applies to --tts or --speech-out; neither is set.";
+                if (!audio.Tts && audio.SpeechMode != TensorSharp.Models.Audio.SpeechReplyMode.Interleaved)
+                    return "--speech-mode applies to --speech-out, which is not set.";
+                return null;
+            }
+            if (model is not TensorSharp.Models.Audio.ISpeechOutputModel speaker)
+                return $"--speech-out needs a chat model that speaks (LFM3-Omni with its mmproj); the loaded model ({model.Config?.Architecture}) does not.";
+            if (!speaker.HasSpeechOutput)
+                return $"--speech-out: {speaker.SpeechOutputUnavailableReason}";
+            if (audio.Voice != null && !speaker.IsSpeechVoice(audio.Voice))
+                return $"--voice '{audio.Voice}' is not one of the model's voices ({string.Join(", ", speaker.SpeechVoices)}).";
+            if (interactive || batch || diagnostic)
+                return "--speech-out speaks a single-prompt reply (--input / the default prompt); the interactive chat, JSONL batches and " +
+                       "benchmarks do not write speech.";
+            return null;
         }
 
         private static List<int> ComputeSharedPrefix(ModelBase model, IReadOnlyList<ChatMessage> messages,
