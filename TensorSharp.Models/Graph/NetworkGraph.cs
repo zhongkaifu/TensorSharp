@@ -91,6 +91,13 @@ namespace TensorSharp.Models.Graph
         /// </summary>
         public bool AttentionHalfKv { get; set; }
 
+        /// <summary>
+        /// <see cref="NetworkBuilder.Attention"/> as two products around a masked softmax (q k^T, softmax, then the values), all
+        /// in F32, where it is otherwise one flash-attention op: llama.cpp's mtmd graphs with flash attention off (its LFM3
+        /// speech projector), for a network whose attention is a few rows over a few dozen keys. Default off.
+        /// </summary>
+        public bool AttentionByProducts { get; set; }
+
         /// <summary>Programs compiled (cache misses).</summary>
         public int Builds { get; private set; }
 

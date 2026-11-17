@@ -287,6 +287,62 @@ namespace TensorSharp.Models.Graph
             });
         }
 
+        /// <summary>
+        /// Product weight <paramref name="name"/> [width, experts * rows] read as <paramref name="experts"/> stacked matrices
+        /// [width, rows, experts] (a GraphOp.MulMatId operand, built once a name and count): the same bytes, each expert a
+        /// <see cref="RowBlock"/> member for the executors that run routed products one expert at a time. A product per
+        /// selected expert then reads only that expert's rows, the selection riding the run (one codebook's logits of a stacked
+        /// table, chosen per call, with one program). Null where the weight is held dense (a format the backend has no
+        /// product kernel for): the caller computes every expert then (<see cref="NetworkBuilder.MatMul"/> over the dense
+        /// [width, rows, experts] view).
+        /// </summary>
+        public IGraphExpertWeights ExpertStack(string name, long experts)
+        {
+            NetworkWeight w = Get(name);
+            if (experts < 1 || w.Rows % experts != 0)
+                throw new ArgumentException($"network weight '{name}' ({w.Rows} rows) is not {experts} stacked experts");
+            if (w.Quantized == null) return null;
+            lock (_sync)
+                if (_expertStacks.TryGetValue((name, experts), out NetworkExpertStack stack)) return stack;
+            long rows = w.Rows / experts;
+            var members = new QuantizedWeight[experts];
+            for (long e = 0; e < experts; e++) members[e] = RowBlock(name, e * rows, rows).Quantized ?? w.Quantized;
+            var made = new NetworkExpertStack(w.Quantized, members, rows);
+            lock (_sync)
+            {
+                if (_expertStacks.TryGetValue((name, experts), out NetworkExpertStack raced)) return raced;
+                _expertStacks[(name, experts)] = made;
+            }
+            return made;
+        }
+
+        private readonly Dictionary<(string, long), NetworkExpertStack> _expertStacks = new();
+
+        /// <summary>A block-format product weight read as stacked experts: GGML binds the whole table's bytes as a 3-D tensor;
+        /// the tensor executors run each selected expert through its member (a row block with its own resident copy).</summary>
+        private sealed class NetworkExpertStack : IGraphExpertWeights
+        {
+            private readonly QuantizedWeight _whole;
+            private readonly QuantizedWeight[] _members;
+
+            public NetworkExpertStack(QuantizedWeight whole, QuantizedWeight[] members, long rows)
+            {
+                _whole = whole;
+                _members = members;
+                Ne1 = rows;
+                CacheKey = GraphIdentity.Of(this);
+            }
+
+            public int Format => _whole.GgmlType;
+            public long Ne0 => _whole.Ne0;
+            public long Ne1 { get; }
+            public long Ne2 => _members.Length;
+            public IntPtr Data => _whole.Data;
+            public IntPtr CacheKey { get; }
+            public long Bytes => _whole.RawBytes;
+            public IGraphWeight Expert(int index) => _members[index];
+        }
+
         /// <summary>Weight <paramref name="name"/>'s values as F32 on the host (dequantized where it is held in a block
         /// format), in ggml order.</summary>
         public float[] ReadF32(string name)

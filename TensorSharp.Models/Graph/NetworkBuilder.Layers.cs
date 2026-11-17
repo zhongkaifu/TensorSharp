@@ -463,6 +463,7 @@ namespace TensorSharp.Models.Graph
                 throw new ArgumentException($"attention of q {q} over k {k}, v {v}");
             if (mask.Valid && (mask.Ne0 != keys || mask.Ne1 != rows || mask.Format != GraphFormat.F16))
                 throw new ArgumentException($"attention mask {mask}: F16 [keys {keys}, rows {rows}]");
+            if (_graph.AttentionByProducts) return AttentionByProducts(q, k, v, scale, mask);
             NetValue qp = Permute(q, 0, 2, 1, 3), kp = Permute(k, 0, 2, 1, 3), vp = Permute(v, 0, 2, 1, 3);
             if (_graph.AttentionHalfKv)
             {
