@@ -7,7 +7,9 @@
         --haystack-dir docs --lengths 4096,16384,32768 --rounds 2 --out bench.jsonl
 
 Each round sends, for every length, the same prompt (repo prose cut to the length with llama-server's
-/tokenize, a fresh nonce per round so no prefix cache serves it) to TensorSharp and then to llama-server
+/tokenize, opened by a nonce of the round and the length, so no prefix cache serves it: with the round's nonce
+alone, llama-server's slot reused the previous, shorter prompt of the round and its prefill timed only the
+new tokens) to TensorSharp and then to llama-server
 (A/B, then the next round), greedy, ignore_eos, max_tokens --decode. Prefill time and decode rate come
 from llama-server's "timings" and TensorSharp's chat.complete log line (ttftMs = prefill plus the first
 token, tokensPerSec). The machine may be shared: read the spread across rounds before any claim.
@@ -43,7 +45,7 @@ def main():
                 chars = n_tok * 4
                 prompt = None
                 for _ in range(6):
-                    prompt = f"Round {rnd} document:\n" + text[:chars] + "\n\nSummarize the document above."
+                    prompt = f"Round {rnd}, {n_tok} tokens, document:\n" + text[:chars] + "\n\nSummarize the document above."
                     have = count_tokens(args.llama, prompt)
                     if abs(have - (n_tok - 30)) <= 16:
                         break
@@ -55,7 +57,9 @@ def main():
                     pt = (res.get("usage") or {}).get("prompt_tokens")
                     if name == "llama":
                         t = res.get("raw", {}).get("timings") or {}
-                        tim = {"prefill_s": t.get("prompt_ms", 0) / 1000, "decode_tps": t.get("predicted_per_second")}
+                        # prompt_n: the tokens it prefilled (less than the prompt where a cached prefix served the rest).
+                        tim = {"prefill_s": t.get("prompt_ms", 0) / 1000, "prefilled": t.get("prompt_n"),
+                               "decode_tps": t.get("predicted_per_second")}
                     else:
                         tim = ts_timings(args.ts_log, offset, pt)
                     rec = {"engine": name, "round": rnd, "target": n_tok, "prompt_tokens": pt,
@@ -68,7 +72,7 @@ def main():
         for name in ("ts", "llama"):
             sel = [r for r in rows if r["engine"] == name and r["target"] == n_tok and r.get("prefill_s")]
             if sel:
-                pp = [r["prompt_tokens"] / r["prefill_s"] for r in sel]
+                pp = [(r.get("prefilled") or r["prompt_tokens"]) / r["prefill_s"] for r in sel]
                 tg = [r["decode_tps"] for r in sel if r.get("decode_tps")]
                 print(f"{name:6s} {n_tok:>7}: prefill {statistics.median(pp):8.0f} tok/s (runs {[round(x) for x in pp]}) "
                       f"decode {statistics.median(tg):6.1f} tok/s (runs {[round(x, 1) for x in tg]})")

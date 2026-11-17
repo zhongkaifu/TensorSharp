@@ -114,6 +114,7 @@ namespace TensorSharp.Models.Lfm3
                     QueueAudio(_pcm);
                     RecordFrame(frame.Codes);
                 }
+                RecordFedFrame(frame.Codes);
                 return DriverSlot.Embedding(_tokens.AudioOut, _speech.FeedbackRow(frame.Codes));
             }
         }

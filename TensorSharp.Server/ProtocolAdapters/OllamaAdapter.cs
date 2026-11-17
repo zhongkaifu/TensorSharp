@@ -415,6 +415,8 @@ public sealed class OllamaAdapter
             workspace: workspaceLease?.Workspace, logger: ollamaLogger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does.
+        if (skillPlan != null) skillPlan.ClientStreamsAppendOnly = stream;
 
         knowledge.Plan = skillPlan;
 
@@ -485,6 +487,8 @@ public sealed class OllamaAdapter
 
         var parser = OutputParserFactory.Create(_svc.Architecture);
         parser.Init(enableThinking, tools);
+        // NDJSON lines cannot be taken back (IOutputParser.StreamWithoutHolding).
+        parser.StreamWithoutHolding();
         bool useParser = enableThinking || (tools != null && tools.Count > 0)
             || OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate);
         List<ToolCall>? collectedToolCalls = null;

@@ -21,6 +21,19 @@ namespace TensorSharp.Models
 
         protected override bool RecurrentMixerLowers => true;
 
+        /// <summary>Decode steps run under ggml-metal's concurrency reorder, as llama.cpp's scheduler always runs them: the
+        /// attention block's Q/K/V products and the gate product beside the flash attention encode concurrently. LFM3-1.7B
+        /// Q4_K_M on an M5 Pro, interleaved: tg128 188.5 -> 192.0 tok/s at depth 0, 180.9 -> 184.6 at 4K (llama.cpp 188.3 /
+        /// 180.8).</summary>
+        protected override bool GraphConcurrencyReorder => true;
+
+        /// <summary>A prompt step's last layer runs its feed-forward on the rows the head reads only, as llama.cpp's LFM3 graph
+        /// does (the stream cut to the output rows after the last mixer). LFM3-1.7B on ggml_metal, M5 Pro, interleaved: pp512
+        /// 5,710 -> 5,872 tok/s on Q4_K_M and 5,919 -> 6,086 on Q8_0, pp128 +2%; Q8_0 teacher-forced against llama.cpp Metal
+        /// stays 0/320 top-1 mismatches (median relL2 3.10e-4; the prompt rows closer: 1.01e-3 max on the long prompt, was
+        /// 1.06e-3).</summary>
+        protected override bool PrunesLastLayerRows => true;
+
         /// <summary>The short convolutions trace one rank's channels (its in/out projection shards, filter slice and states).</summary>
         protected override bool RanksLower => true;
 

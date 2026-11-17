@@ -250,8 +250,9 @@ namespace TensorSharp.Models
             {
                 return Lfm3AudioPreprocessor.LoadAudio(path);
             }
-            catch (InvalidDataException ex) when (ex.Message.Contains("no audio stream", StringComparison.Ordinal)
-                                                  || ex.Message.Contains("decodes to no audio samples", StringComparison.Ordinal))
+            catch (Exception ex) when (ex is InvalidDataException or Media.MediaInputException
+                                       && (ex.Message.Contains("no audio stream", StringComparison.Ordinal)
+                                           || ex.Message.Contains("decodes to no audio samples", StringComparison.Ordinal)))
             {
                 return null;
             }

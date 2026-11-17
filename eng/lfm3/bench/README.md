@@ -8,11 +8,13 @@ Build first (Release, this checkout): `TENSORSHARP_GGML_NO_UPDATE=1 dotnet build
 `~/work/llama.cpp-lfm3`, Metal + BLAS build). MLX runs need `TENSORSHARP_MLX_LIBRARY_DIR` (a directory holding
 `libmlxc`, e.g. `InferenceWeb.Tests/bin/Release/net10.0`).
 
-- `run-matrix.sh [metal] [mlx] [cpu] [serve]`: the whole matrix (environment knobs in its header): every GPU quant's
-  pp512/pp4096 and tg128 at depths 0/4K/16K/32K on ggml_metal, MLX next to ggml_metal and llama.cpp, the CPU lanes
-  (ggml_cpu and the managed CPU against `llama-bench -ngl 0` at equal threads) and serving. Results under
+- `run-matrix.sh [metal] [mlx] [cpu] [serve] [ttft]`: the whole matrix (environment knobs in its header): every GPU
+  quant's pp512/pp4096/pp16384/pp32768 (`PP`) and tg128 at depths 0/4K/16K/32K on ggml_metal, MLX next to ggml_metal
+  and llama.cpp, the CPU lanes (ggml_cpu and the managed CPU against `llama-bench -ngl 0` at equal threads), serving,
+  and the servers' time to first token (`ttft.py`, 16 to 32K-token prompts). Results under
   `artifacts/lfm3/bench/<stamp>/`, one markdown table per section plus the raw logs and `conditions.txt` (load
-  before/after, commit).
+  before/after, commit). `llama-bench -ngl 0` on a Metal + BLAS build runs its prompt products on Accelerate (the
+  `MTL,BLAS` backend column; `--repack 0` moves even more of them there), not on ggml-cpu alone.
 - `ab.py [--rounds N] NAME=COMMAND ...`: runs the commands alternately (the first arm rotating each round) and
   tabulates each test's median of the rounds' medians with the min-max spread. Commands print
   `RESULT name median min max` lines.
@@ -28,6 +30,12 @@ Build first (Release, this checkout): `TENSORSHARP_GGML_NO_UPDATE=1 dotnet build
   p50/p95, per-request decode tok/s, aggregate tok/s and the server's peak physical footprint (`footprint`, Metal
   buffers included; mapped weights are clean pages and not in it). llama-server runs `-np C` with continuous batching,
   TensorSharp its scheduler with `TS_SCHED_MAX_RUNNING_SEQS=C`.
+- `ttft.py --server NAME=URL ... [--lengths 16,128,..] [--reps N] [--tokenizer-url LLAMA_URL]`: time to first token
+  from the client over streamed chat completions (max_tokens 1, greedy, thinking off), the servers' requests
+  interleaved, every prompt opened by its own nonce so no prefix cache serves it (llama-server's `prompt_n` is recorded
+  to show it). A thinking-off TensorSharp stream holds a reply's text until 4,096 chars or its end (see
+  docs/models/lfm3.md), so with more output tokens its client-side TTFT is the reply's end: max_tokens 1 measures the
+  engines.
 - `metal-op-histogram.py LOG [--start REGEX]`: Metal dispatches per graph from a `GGML_METAL_GRAPH_DEBUG=1` log
   (TensorSharp also needs `TS_GGML_LOG_DEBUG=1`; llama-bench needs `-v`). Graph starts: TensorSharp
   `'^(GET_ROWS|RMS_NORM) node_0$'`, llama.cpp `'^RMS_NORM norm-0$'`.

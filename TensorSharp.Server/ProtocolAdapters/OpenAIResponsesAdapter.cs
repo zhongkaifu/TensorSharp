@@ -270,6 +270,8 @@ public sealed partial class OpenAIResponsesAdapter
             workspace: workspaceLease?.Workspace, logger: logger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does.
+        if (skillPlan != null) skillPlan.ClientStreamsAppendOnly = stream;
 
         knowledge.Plan = skillPlan;
 
@@ -410,7 +412,7 @@ public sealed partial class OpenAIResponsesAdapter
         }
 
         var collector = new ChatStreamCollector();
-        int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
+        int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0, reasoningTokens = 0;
         string? pipelineFinishReason = null;
 
         await foreach (var update
@@ -426,6 +428,7 @@ public sealed partial class OpenAIResponsesAdapter
                 promptTokens = update.PromptTokens;
                 evalTokens = update.EvalTokens;
                 kvReusedTokens = update.KvCacheReusedTokens;
+                reasoningTokens = update.ReasoningTokens;
                 pipelineFinishReason = update.FinishReason;
             }
         }
@@ -470,7 +473,7 @@ public sealed partial class OpenAIResponsesAdapter
         var response = knowledge.WithSources(OpenAIResponsesFactory.Response(
             requestId, _svc.LoadedModelName, status, instructions, maxOutputTokens, output,
             store, samplingConfig, promptTokens, evalTokens, kvReusedTokens,
-            incompleteReason: incompleteReason));
+            incompleteReason: incompleteReason, reasoningTokens: reasoningTokens));
 
         string json = JsonSerializer.Serialize(response, JsonOptions.IgnoreNulls);
         if (store)
@@ -522,6 +525,8 @@ public sealed partial class OpenAIResponsesAdapter
         {
             parser = OutputParserFactory.Create(_svc.Architecture);
             parser.Init(enableThinking, tools);
+            // Output deltas cannot be taken back (IOutputParser.StreamWithoutHolding).
+            parser.StreamWithoutHolding();
         }
 
         var buffer = bufferForStructured ? new StringBuilder() : null;
@@ -529,7 +534,7 @@ public sealed partial class OpenAIResponsesAdapter
         var messageText = new StringBuilder();
         var toolCalls = new List<ToolCall>();
         int outputIndex = 0;
-        int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
+        int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0, reasoningTokens = 0;
         string? pipelineFinishReason = null;
         // Set when the skills loop hands over already-separated pieces (see
         // SkillChatLoop). `parser` is bypassed for those, so it must not be flushed
@@ -613,6 +618,7 @@ public sealed partial class OpenAIResponsesAdapter
             promptTokens = update.PromptTokens;
             evalTokens = update.EvalTokens;
             kvReusedTokens = update.KvCacheReusedTokens;
+            reasoningTokens = update.ReasoningTokens;
             pipelineFinishReason = update.FinishReason;
         }
 
@@ -684,7 +690,7 @@ public sealed partial class OpenAIResponsesAdapter
         var response = knowledge.WithSources(OpenAIResponsesFactory.Response(
             requestId, _svc.LoadedModelName, status, instructions, maxOutputTokens, output,
             store, samplingConfig, promptTokens, evalTokens, kvReusedTokens,
-            incompleteReason: incompleteReason));
+            incompleteReason: incompleteReason, reasoningTokens: reasoningTokens));
 
         if (store)
             _store.Store(new StoredResponse { Id = requestId, Json = JsonSerializer.Serialize(response, JsonOptions.IgnoreNulls) });

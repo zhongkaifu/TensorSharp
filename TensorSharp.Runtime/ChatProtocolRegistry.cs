@@ -50,9 +50,10 @@ namespace TensorSharp.Runtime
         // GSM8K replies and 5 of 33 instruction-following prompts, llama.cpp's replies alike
         // (eng/lfm3/e2e): the answer the client read was "reasoning</think>answer". The 57
         // closes came at 83-3562 characters, median 1983, 95th percentile 3425; 2048 would
-        // have caught 32 of them, 4096 catches all. Same price as above, at LFM3's speed: an
-        // answer longer than this shows its first character on a stream that cannot take text
-        // back after about 1,000 tokens, 5-6 s at the 1.7B's ~180 tok/s on an M5 Pro.
+        // have caught 32 of them, 4096 catches all. Unlike Nemotron-H, an LFM3 stream that
+        // cannot take text back is not held for it (the protocol's parser streams such text as
+        // content at once, IOutputParser.StreamWithoutHolding): the window decides the reply
+        // for whole replies and for retracting streams only.
         internal const int Lfm3StrayReasoningWindow = 4096;
 
         private static readonly object Gate = new();
@@ -251,12 +252,17 @@ namespace TensorSharp.Runtime
                 // Reasoning ends at `</think>`, or at a `<tool_call>` written while still
                 // reasoning; calls are the Qwen3-Coder XML body. llama.cpp routes this
                 // template to its Qwen3-Coder parser with the same end tags.
-                CreateOutputParser = () => new Qwen35OutputParser(Lfm3StrayReasoningWindow),
+                CreateOutputParser = () => new Qwen35OutputParser(Lfm3StrayReasoningWindow, holdsAppendOnlyStreams: false),
                 // With thinking off (prompt ends `<think></think>`) the 1.7B often reasons
                 // anyway and closes the block itself: the reply opens undecided and a close
-                // within the window makes it reasoning. llama.cpp, vLLM and SGLang return
-                // such a reply whole as the answer, `</think>` and all (their parsers do not
-                // look for reasoning with thinking off).
+                // within the window makes it reasoning, for a whole reply (non-streaming
+                // responses) and a stream that can take text back (the Web UI, TensorAgent).
+                // An append-only stream (the OpenAI, Ollama and Responses streams, the CLI) is
+                // not held for it: it streams the reply as content as it is generated, as
+                // llama.cpp, vLLM and SGLang return such a reply whole as the answer,
+                // `</think>` and all (their parsers do not look for reasoning with thinking
+                // off). Holding it cost a short answer its whole stream: nothing arrived
+                // before the end of the reply or 4,096 characters.
                 ThinkingOffReplyMayReason = ChatTemplate.IsLfm3ThinkingOffTemplate,
                 // The generation prompt ends `<think>` (on) or `<think></think>` (off), no
                 // newline; past turns re-render as `<think></think>` + answer with their

@@ -3193,7 +3193,7 @@ namespace TensorSharp.Runtime.Scheduling
             // and the trunk agrees with it. The window therefore does not start at a
             // stop token, and the accept loop ends at the first stop it draws.
             bool stopRepetition = _scheduler.Config.StopRepetition && (seq.SamplingConfig?.StopRepetition ?? true);
-            bool IsStop(int token) => _model.Tokenizer != null && _model.Tokenizer.IsEos(token);
+            bool IsStop(int token) => EndsSequence(_model.Tokenizer, seq, token);
             if (IsStop(sampledToken))
                 kMax = 0;
             // The sampled token can itself complete a repetition loop. The engine then
@@ -3430,6 +3430,13 @@ namespace TensorSharp.Runtime.Scheduling
 
         private long _batchedSpecSteps;
 
+        /// <summary>Whether <paramref name="token"/> ends <paramref name="seq"/>: an end-of-sequence token of the
+        /// model's tokenizer, unless the request ignores them (<see cref="SamplingConfig.IgnoreEos"/>: a fixed-length
+        /// request forwards such a token like any other and runs to its length limit). The engine's stop check and
+        /// both speculative paths ask this one rule, so a lane is never ended where the engine continues it.</summary>
+        internal static bool EndsSequence(ITokenizer? tokenizer, SequenceState seq, int token)
+            => tokenizer != null && tokenizer.IsEos(token) && seq.SamplingConfig?.IgnoreEos != true;
+
         /// <summary>Batched speculative steps served (each verifies every decoding
         /// sequence's window in one trunk forward).</summary>
         internal long BatchedSpeculativeSteps => _batchedSpecSteps;
@@ -3503,7 +3510,11 @@ namespace TensorSharp.Runtime.Scheduling
             var drafts = new List<int>[n];
             var kMaxes = new int[n];
             bool stopRepetition = _scheduler.Config.StopRepetition;
-            bool IsStop(int token) => _model.Tokenizer != null && _model.Tokenizer.IsEos(token);
+            // Per sequence: an end-of-sequence token ends only a request that does not
+            // ignore them. An ignore_eos lane's EOS anchor is verified like any token
+            // (emitted without a forward, it left the lane with no logits for its next
+            // step, and that step's failure failed every co-batched request).
+            bool IsStop(SequenceState seq, int token) => EndsSequence(_model.Tokenizer, seq, token);
             // The verify-drawn token when one is pending, else the stash or a sample;
             // nothing is consumed until the verify has succeeded. A lane whose anchor
             // ends it (a stop token, or the last token its budget allows) emits it
@@ -3514,7 +3525,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 var seq = decodeWork[i].Sequence;
                 peeked[i] = ctxs[i].PendingNextToken >= 0 ? PendingVerifyDraw(seq, ctxs[i].PendingNextToken) : PeekPendingOrSample(seq);
-                if (IsStop(peeked[i]) || seq.OutputTokens.Count + 1 >= seq.MaxNewTokens)
+                if (IsStop(seq, peeked[i]) || seq.OutputTokens.Count + 1 >= seq.MaxNewTokens)
                     (ending ??= new()).Add((seq, ctxs[i], peeked[i]));
             }
             if (ending != null)
@@ -3560,7 +3571,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int kMax = Math.Min(window - 1, Math.Min(
                     seq.MaxNewTokens - seq.OutputTokens.Count - 1,
                     seq.BlockTable.FreeSlotsInCurrentBlocks - 1));
-                if (IsStop(anchors[i]))
+                if (IsStop(seq, anchors[i]))
                     kMax = 0;
                 if (kMax > 0 && stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true))
                 {
@@ -3713,7 +3724,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 var seq = decodeWork[i].Sequence;
                 bool seqStopRepetition = stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true);
-                bool stopped = IsStop(anchors[i]);
+                bool stopped = IsStop(seq, anchors[i]);
                 var acc = new List<int>();
                 int m = 0;
                 // A row is drawn once: a sampled row advances the sequence's sampler.
@@ -3738,7 +3749,7 @@ namespace TensorSharp.Runtime.Scheduling
                     seq.AppendOutputToken(d);
                     acc.Add(d);
                     m++;
-                    if (IsStop(d) || (seqStopRepetition
+                    if (IsStop(seq, d) || (seqStopRepetition
                             && RepetitionGuard.IsLooping(seq.OutputTokens, seq.OutputTokens.Count, out _, out _)))
                         stopped = true;
                     else

@@ -15,6 +15,10 @@ namespace TensorSharp.Graph
     {
         /// <summary>Its kernels read row-contiguous strided views directly (no contiguous copies needed).</summary>
         public bool StridedViews { get; init; }
+        /// <summary>A prompt chunk's packed projection is one product whose row blocks its element-wise ops read where they lie
+        /// (strided views, no copies), as decode rows' is; otherwise a chunk takes each block as its own product, so each is
+        /// contiguous.</summary>
+        public bool PackedProductBlocks { get; init; }
         /// <summary>An op may write its result in place inside a state leaf (<see cref="GraphNodeKind.Alias"/>).</summary>
         public bool InPlaceStateAlias { get; init; }
 

@@ -1190,17 +1190,19 @@ namespace TensorSharp.Models
             }
 
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
-            byte* basePtr = (byte*)weight.Data.ToPointer();
-            float* dst = GetFloatPtr(result);
-            for (int i = 0; i < rowIndices.Length; i++)
+            IntPtr basePtr = weight.Data;
+            IntPtr dst = (IntPtr)GetFloatPtr(result);
+            // A prompt's rows in parallel (each row is its own dequant: the same values either way).
+            if (rowIndices.Length >= 64)
+                System.Threading.Tasks.Parallel.For(0, rowIndices.Length, Row);
+            else
+                for (int i = 0; i < rowIndices.Length; i++) Row(i);
+
+            void Row(int i)
             {
-                byte* rowPtr = basePtr + (long)rowIndices[i] * rowBytes;
-                NativeDequant.DequantizeToFloat32Native(
-                    weight.GgmlType,
-                    (IntPtr)rowPtr,
-                    (IntPtr)(dst + (long)i * dim),
-                    dim);
-                weight.InverseBonsaiEmbeddingRow(new Span<float>(dst + (long)i * dim, dim));
+                float* row = (float*)dst + (long)i * dim;
+                NativeDequant.DequantizeToFloat32Native(weight.GgmlType, basePtr + (nint)((long)rowIndices[i] * rowBytes), (IntPtr)row, dim);
+                weight.InverseBonsaiEmbeddingRow(new Span<float>(row, dim));
             }
 
             InvalidateTensorDeviceCache(result);

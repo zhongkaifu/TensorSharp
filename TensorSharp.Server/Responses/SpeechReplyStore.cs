@@ -13,7 +13,8 @@ namespace TensorSharp.Server.Responses;
 /// <summary>
 /// The spoken replies this server sent (OpenAI's <c>message.audio.id</c>), kept for an hour (<c>expires_at</c>) so a client
 /// that sends one back in a later request's history (<c>{"role":"assistant","audio":{"id":...}}</c>) gets that turn
-/// rendered: as its transcript, and the frames' codes are kept with it. In memory, per process.
+/// rendered: spliced back as generation decoded it (its tokens, each frame's row from its codes) where the turn is known,
+/// else as its transcript. In memory, per process.
 /// </summary>
 public sealed class SpeechReplyStore
 {
@@ -25,14 +26,17 @@ public sealed class SpeechReplyStore
 
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
 
-    public sealed record Entry(string Id, string Transcript, IReadOnlyList<int[]> Frames, DateTimeOffset ExpiresAt);
+    /// <param name="Turn">The reply as generation decoded it (its tokens and every decoded frame's codes), which a later
+    /// turn splices back with the frames' rows; null where it is not known (the turn then renders as its transcript).</param>
+    public sealed record Entry(string Id, string Transcript, IReadOnlyList<int[]> Frames, DateTimeOffset ExpiresAt,
+        TensorSharp.Runtime.SpokenTurnRecord Turn = null);
 
     /// <summary>Keep a reply; returns its entry (id and expiry).</summary>
-    public Entry Add(string transcript, IReadOnlyList<int[]> frames, string id = null)
+    public Entry Add(string transcript, IReadOnlyList<int[]> frames, string id = null, TensorSharp.Runtime.SpokenTurnRecord turn = null)
     {
         Purge();
         var entry = new Entry(id ?? NewId(), transcript ?? string.Empty, frames ?? Array.Empty<int[]>(),
-            DateTimeOffset.UtcNow + Lifetime);
+            DateTimeOffset.UtcNow + Lifetime, turn);
         _entries[entry.Id] = entry;
         return entry;
     }

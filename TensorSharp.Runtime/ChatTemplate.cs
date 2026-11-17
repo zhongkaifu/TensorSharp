@@ -154,6 +154,14 @@ namespace TensorSharp.Runtime
         /// from the cache at every earlier answer.
         /// </summary>
         public string? RawGenerationSuffix { get; set; }
+
+        /// <summary>
+        /// A spoken assistant turn's speech (LFM3-Omni): the codes of every frame whose row the reply decoded, in order, the
+        /// end-of-speech frame included. Its <see cref="RawOutputTokens"/> hold one <c>&lt;|audio_out|&gt;</c> per frame; the
+        /// multimodal expander gives each its frame's row, so the re-rendered turn is what generation decoded. Null for
+        /// every other message.
+        /// </summary>
+        public IReadOnlyList<int[]>? SpeechFrames { get; set; }
         /// <summary>
         /// Render-only placeholder used by the Gemma 4 GGUF template adapter to put a
         /// cached raw tool-calling round at the template's tool-call position while
@@ -2024,6 +2032,7 @@ namespace TensorSharp.Runtime
                     Thinking = msg.Thinking,
                     RawOutputTokens = msg.RawOutputTokens,
                     RawPromptTrailingWhitespace = msg.RawPromptTrailingWhitespace,
+                    SpeechFrames = msg.SpeechFrames,
                     RawToolCallReplayPlaceholder = msg.RawToolCallReplayPlaceholder,
                     CacheControl = msg.CacheControl,
                     ContentCacheBreakpoints = msg.ContentCacheBreakpoints,

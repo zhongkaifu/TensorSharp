@@ -58,6 +58,17 @@ namespace TensorSharp.Models
         /// live set and measured slower on some families; a family opts in where it measures faster.</summary>
         protected virtual bool GraphConcurrencyReorder => false;
 
+        /// <summary>
+        /// Whether a step that reads only each sequence's last row (its logits or its final hidden row) runs the last layer's
+        /// feed-forward on those rows alone, as llama.cpp's graphs do: the stream leaving the last layer's mixer is cut to the
+        /// sequences' last rows, and the other rows' feed-forward (dead work: nothing reads it) is not computed. The rows kept
+        /// take products of fewer rows (a matrix-vector kernel where the step had a matrix-matrix one), so their logits round
+        /// differently from the unpruned step's: off by default, a family opts in where it measures faster and its parity
+        /// holds. A MoE last layer, a step reading every row's logits or the final rows, captures past the stack, draft follows
+        /// and the drafter's rings never prune (<see cref="PrunesLastLayer"/>).
+        /// </summary>
+        protected virtual bool PrunesLastLayerRows => false;
+
         /// <summary>A reason the current configuration cannot run whole-forward graphs, or null.</summary>
         private string GraphUnsupportedReason()
         {
@@ -1475,6 +1486,8 @@ namespace TensorSharp.Models
                 taps = new int[targets.Length];
                 Array.Fill(taps, -1);
             }
+            bool prune = head && PrunesLastLayer(step, request, from, to);
+            if (prune) LastLayerPrunedSteps++;
             for (int layer = from; layer < to; layer++)
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
@@ -1486,6 +1499,8 @@ namespace TensorSharp.Models
                 int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
                 int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
                 h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
+                // The last layer's feed-forward over the rows the head reads only (PrunesLastLayerRows).
+                if (prune && layer == Config.NumLayers - 1) h = EmitLastRows(step, h, width);
                 int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
                 int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
                 h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
@@ -1500,8 +1515,37 @@ namespace TensorSharp.Models
             // A target past the stack taps the stream leaving it.
             if (TapDFlashFollow(step, h, Config.NumLayers, targets, taps))
                 EmitDFlashFollow(step, taps, dflash);
-            EmitHead(step, h, request, ref outputs, embedded);
+            EmitHead(step, h, request, ref outputs, embedded, lastRowsOnly: prune);
             return outputs;
+        }
+
+        /// <summary>Whether this step runs its last layer's feed-forward on each sequence's last row only
+        /// (<see cref="PrunesLastLayerRows"/>): the family opts in, the step holds the last layer and more rows than sequences, the
+        /// layer's feed-forward is dense, and the head reads nothing but those rows.</summary>
+        private bool PrunesLastLayer(GraphStep step, GraphRequest request, int from, int to)
+        {
+            int last = Config.NumLayers - 1;
+            return PrunesLastLayerRows && !LastLayerPruningDisabledForTests && from <= last && to == Config.NumLayers && step.Rows > step.Sequences && !_moeLayer[last]
+                && (request.LastRowLogits || request.LastRowHidden) && !request.AllRowLogits && !request.CaptureFinal
+                && request.FollowDraft == DraftFollow.None && request.FollowDFlash == null
+                && !Array.Exists(request.CaptureLayers, c => c >= Config.NumLayers);
+        }
+
+        /// <summary>Tests: every step runs its last layer over every row (<see cref="PrunesLastLayerRows"/> off).</summary>
+        internal bool LastLayerPruningDisabledForTests { get; set; }
+
+        /// <summary>Steps traced with their last layer's feed-forward over the sequences' last rows only (tests).</summary>
+        internal int LastLayerPrunedSteps { get; private set; }
+
+        /// <summary>Each sequence's last row of the stream <paramref name="x"/> [<paramref name="width"/>, rows], in sequence
+        /// order: [width, sequences].</summary>
+        private static int EmitLastRows(GraphStep step, int x, int width)
+        {
+            int n = step.Sequences, rows = step.Rows;
+            if (n == 1) return step.View2(x, width, 1, width * 4L, (rows - 1) * (long)width * 4);
+            var last = new int[n];
+            for (int s = 0; s < n; s++) last[s] = step.First[s] + step.Counts[s] - 1;
+            return step.Op(GraphOp.GetRows, x, step.ConstantInputI32(last, n));
         }
 
         /// <summary>Tap the stream <paramref name="h"/> entering <paramref name="layer"/> (the stack's end at NumLayers) for
@@ -1530,8 +1574,9 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The head over the stream <paramref name="h"/> leaving the last layer: the captures past it, the final
-        /// rows and the logits the request asks for.</summary>
-        private void EmitHead(GraphStep step, int h, GraphRequest request, ref StepOutputs outputs, int embedded = -1)
+        /// rows and the logits the request asks for. <paramref name="lastRowsOnly"/>: <paramref name="h"/> holds each sequence's
+        /// last row only, in sequence order (<see cref="PrunesLastLayer"/>).</summary>
+        private void EmitHead(GraphStep step, int h, GraphRequest request, ref StepOutputs outputs, int embedded = -1, bool lastRowsOnly = false)
         {
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             for (int c = 0; c < request.CaptureLayers.Length; c++)
@@ -1561,7 +1606,7 @@ namespace TensorSharp.Models
             else if (request.LastRowLogits || request.LastRowHidden)
             {
                 int selected;
-                if (n == 1 && rows == 1) selected = final;
+                if (lastRowsOnly || (n == 1 && rows == 1)) selected = final;
                 else if (n == 1) selected = step.View2(final, hiddenSize, 1, hiddenSize * 4L, (rows - 1) * hiddenSize * 4L);
                 else
                 {
@@ -1570,7 +1615,8 @@ namespace TensorSharp.Models
                     selected = step.Op(GraphOp.GetRows, final, step.ConstantInputI32(last, n));
                 }
                 if (request.LastRowHidden)
-                    outputs.LastHiddenAt = 1 + step.Output(n == 1 && rows > 1 ? step.Op(GraphOp.Cont, selected) : selected, (long)hiddenSize * n);
+                    outputs.LastHiddenAt = 1 + step.Output(n == 1 && rows > 1 && !lastRowsOnly ? step.Op(GraphOp.Cont, selected) : selected,
+                        (long)hiddenSize * n);
                 // A step that wants only the rows (every sequence's next slot is made from its hidden row) runs no head.
                 if (!request.LastRowLogits) return;
                 int logits = step.MatMul(headName, selected);
@@ -2188,10 +2234,20 @@ namespace TensorSharp.Models
                     step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads),
                     step.WriteRows(step.Starts[0], step.Counts[0], 0), heads, kvHeads, d, dv));
             }
+            // Where the executor's ops read a packed product's row blocks where they lie (GraphCapabilities.PackedProductBlocks),
+            // a fused QKV product's queries and keys go to the family's prep as its views (the norms and rotary write fresh
+            // rows) and one sequence's values to the cache writes (set_rows reads any strides): no copies of every prompt
+            // chunk's q, k and v. Elsewhere, and for what the prep leaves a view, contiguous copies.
+            bool blocks = GraphExecutor.Capabilities.PackedProductBlocks && !prep;
+            if (!blocks)
+            {
+                q = step.Cont(q);
+                k = step.Cont(k);
+            }
+            if (!blocks || step.Sequences > 1 || !Indexed(step.Counts[0]) || _graphTpRanks != null) v = step.Cont(v);
+            EmitQueryKey(step, layer, ref q, ref k);
             q = step.Cont(q);
             k = step.Cont(k);
-            v = step.Cont(v);
-            EmitQueryKey(step, layer, ref q, ref k);
 
             float scale = 1.0f / MathF.Sqrt(d);
             long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
@@ -2208,9 +2264,13 @@ namespace TensorSharp.Models
                 int vs = n == 1 ? v : step.View3(v, dv, kvHeads, count, dv * f, dv * kvHeads * f, firstRow * dv * kvHeads * f);
                 // Under a prep region the queries are read past its end only (its result): their view follows it.
                 int qPerm = prep ? -1 : step.Permute(qs, 0, 2, 1, 3);
-                // [d, heads, count] -> [d, count, heads]; one row is the same bytes either way.
-                int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
-                int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
+                // [d, heads, count] -> [d, count, heads]; one row is the same bytes either way. Rows written by index are read
+                // from the permuted view (set_rows reads rows at any strides: no copy of every prompt chunk's K and V, 22 of a
+                // LFM3 prompt step's 471 Metal dispatches); a chunk that attends its own rows, and the tensor-parallel ranks'
+                // writes (ggml's meta device splits set_rows by KV head), take them contiguous.
+                bool indexedRows = Indexed(count) && _graphTpRanks == null;
+                int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : indexedRows ? step.Permute(ks, 0, 2, 1, 3) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
+                int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : indexedRows ? step.Permute(vs, 0, 2, 1, 3) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
 
                 // The layer's cells: a sliding-window layer's ring (StandardDecoderModel.SlidingRings.cs) holds at most its own.
                 int cap = CacheCells(layer, slot.Capacity);
@@ -2913,7 +2973,7 @@ namespace TensorSharp.Models
                 if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskStart == start && _decodeMaskCount == count
                     && _decodeMaskSequence == sequence)
                     return _decodeMask;
-                var mask = new ushort[(long)window * count];
+                var mask = GC.AllocateUninitializedArray<ushort>(checked(window * count));   // the fill writes every cell
                 FillCausalRows(mask, window, start, count, FloorOf(sequence));
                 _decodeMask = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(_decodeMask, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
@@ -2941,7 +3001,7 @@ namespace TensorSharp.Models
                 if (band <= 0) throw new ArgumentOutOfRangeException(nameof(band), band, "a sliding window needs a positive width");
                 var key = (window, offset, start, count, sequence, band);
                 if (_bandMasks != null && _bandMasks.TryGetValue(key, out int cached)) return cached;
-                var mask = new ushort[(long)window * count];
+                var mask = GC.AllocateUninitializedArray<ushort>(checked(window * count));   // the fill writes every cell
                 FillBandRows(mask, window, offset, start, count, FloorOf(sequence), band);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
@@ -2984,7 +3044,7 @@ namespace TensorSharp.Models
                     throw new ArgumentOutOfRangeException(nameof(ring), ring, $"a ring of {ring} cells does not hold a {band}-key window and {count} rows");
                 var key = (ring, start, count, sequence, band);
                 if (_ringMasks != null && _ringMasks.TryGetValue(key, out int cached)) return cached;
-                var mask = new ushort[(long)ring * count];
+                var mask = GC.AllocateUninitializedArray<ushort>(checked(ring * count));   // the fill writes every cell
                 FillRingBandRows(mask, ring, start, count, FloorOf(sequence), band);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { ring, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
@@ -3103,7 +3163,11 @@ namespace TensorSharp.Models
             private static void FillBandRows(ushort[] mask, int width, int offset, int start, int count, int attentionFloor, int band)
             {
                 const ushort negInf = 0xFC00;
-                for (int q = 0; q < count; q++)
+                // Large masks row-parallel, as FillCausalRows (a chunk of linear sliding-window caches attends its whole length).
+                if ((long)width * count >= 1 << 20) System.Threading.Tasks.Parallel.For(0, count, Row);
+                else for (int q = 0; q < count; q++) Row(q);
+
+                void Row(int q)
                 {
                     Span<ushort> row = mask.AsSpan(q * width, width);
                     (int lo, int hi) = BandRow(width, offset, start, q, attentionFloor, band);

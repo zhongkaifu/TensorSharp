@@ -445,6 +445,57 @@ public sealed class SpeechOutputRuntimeTests : IDisposable
         driver.Dispose();
     }
 
+    /// <summary>
+    /// A spoken reply carried back in a later request's history (<see cref="ChatMessage.SpeechFrames"/>, spliced with its
+    /// raw tokens) re-renders as generation decoded it: each <c>&lt;|audio_out|&gt;</c> of the prompt gets its frame's
+    /// feedback row (the row the reply decoded), one span a run keyed by its codes, so the same speech in another request
+    /// has the same identity for prompt reuse; a prompt whose placeholders and frames disagree is refused.
+    /// </summary>
+    [Fact]
+    public void ASpokenTurnReRendersWithItsFramesRows()
+    {
+        string path = Lm(tied: false);
+        Lfm3SpeechTokens tokens = Tokens();
+        using var lane = new LaneContext(Lane.Managed);
+        using var model = new Lfm3RuntimeModel(path, BackendType.Cpu);
+        Lfm3SpeechOutput speech = Speech(lane);
+        model.AttachSpeechOutputForTests(speech, tokens);
+        var rng = new Random(3);
+        int[] Frame(bool end) => Enumerable.Range(0, Lfm3SpeechConfig.Codebooks)
+            .Select(_ => end ? Lfm3SpeechConfig.EndOfAudioCode : rng.Next(Lfm3SpeechConfig.CodebookSize - 1)).ToArray();
+        var frames = new List<int[]> { Frame(false), Frame(false), Frame(true) };
+        List<ChatMessage> History(IReadOnlyList<int[]> spoken) => new()
+        {
+            new ChatMessage { Role = "user", Content = "hi" },
+            new ChatMessage { Role = "assistant", Content = "Hello.", SpeechFrames = spoken },
+            new ChatMessage { Role = "user", Content = "again" },
+        };
+        int o = tokens.AudioOut;
+        // Interleaved: text, two frames, text, the end-of-speech frame, text.
+        var prompt = new List<int> { 50, 51, tokens.MixedStart, 60, o, o, 61, o, 52 };
+
+        List<int> placed = model.MultimodalInjector.ProcessPromptTokens(History(frames), prompt, "spoken-1");
+        Assert.Equal(prompt, placed);
+        IReadOnlyList<PromptMediaSpan> spans = model.MultimodalInjector.GetPreparedMediaSpans("spoken-1");
+        Assert.Equal(new[] { (4, 6), (7, 8) }, spans.Select(s => (s.Start, s.End)).ToArray());
+        Assert.All(spans, s => Assert.StartsWith("lfm3-speech:", s.ContentId));
+        Assert.NotEqual(spans[0].ContentId, spans[1].ContentId);
+
+        // The same speech in another request: the same identities.
+        model.MultimodalInjector.ProcessPromptTokens(History(frames), prompt, "spoken-2");
+        Assert.Equal(spans.Select(s => s.ContentId), model.MultimodalInjector.GetPreparedMediaSpans("spoken-2").Select(s => s.ContentId));
+        // The rows are the frames' feedback rows.
+        Assert.True(model.MultimodalInjector.HasPendingEmbeddings("spoken-1"));
+
+        // A frame too few for the placeholders: refused, not given another frame's row.
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            model.MultimodalInjector.ProcessPromptTokens(History(frames.Take(2).ToList()), prompt, "spoken-3"));
+        Assert.Contains("3 <|audio_out|> placeholder(s) for 2 speech frame(s)", ex.Message);
+        model.MultimodalInjector.ClearPreparedPromptState("spoken-1");
+        model.MultimodalInjector.ClearPreparedPromptState("spoken-2");
+        model.MultimodalInjector.ClearPreparedPromptState("spoken-3");
+    }
+
     /// <summary>End to end on the synthetic checkpoints: a TTS reply served by the engine (batched with a text request) is
     /// the standalone synthesis of the same seed alone, and the text request keeps its reply. Every Mac lane.</summary>
     [Fact]
