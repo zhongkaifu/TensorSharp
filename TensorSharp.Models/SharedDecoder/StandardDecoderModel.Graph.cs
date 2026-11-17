@@ -575,6 +575,7 @@ namespace TensorSharp.Models
         private void ForgetProgramsKeyedOtherwise()
         {
             OnGraphCacheCleared();
+            ClearShortConvCommits();
             foreach (string kind in _snapshotStreamedKinds)
             {
                 _streamedKinds.Remove(kind);
@@ -671,6 +672,22 @@ namespace TensorSharp.Models
         /// <summary>Decode steps recorded on the device (tests check how often a request records).</summary>
         internal int DecodeRecordings { get; private set; }
 
+        private bool _slidingWindowUnrecordedReported;
+
+        /// <summary>Kept decode steps a recorder ran unrecorded because a sliding-window layer's floor moved inside its window.</summary>
+        internal int SlidingWindowUnrecordedSteps { get; private set; }
+
+        /// <summary>Count (and report once) a decode step that runs unrecorded because a sliding-window mask's floor moves.</summary>
+        private void NoteSlidingWindowUnrecorded()
+        {
+            SlidingWindowUnrecordedSteps++;
+            if (_slidingWindowUnrecordedReported) return;
+            _slidingWindowUnrecordedReported = true;
+            Console.Error.WriteLine($"[{Config.Architecture}] sliding-window layers past their window: decode steps run as their " +
+                "plans instead of device recordings (a recording would replay its first window's attention floor). Output is exact; " +
+                "each such step pays its launches on the host.");
+        }
+
         /// <summary>Programs traced and compiled (a graph cache miss; tests check how often a request builds one).</summary>
         internal int GraphBuilds { get; private set; }
 
@@ -690,6 +707,13 @@ namespace TensorSharp.Models
                 || slots.Length > recorder.MaxRecordedSequences
                 || cached.Plan is not IGraphTensorOutputs keep || (_expertHost != null && !GraphExecutor.Capabilities.RecordsHostExperts))
                 return false;   // (a step whose host experts read the routes back mid-step cannot be recorded)
+            if (r.Step.SlidingFloorInWindow)
+            {
+                // A recording replays its launches' scalars, and the attention kernels take the floor a mask's values give
+                // them as one: past a sliding window the floor moves every step, so such a step runs as its plan does.
+                NoteSlidingWindowUnrecorded();
+                return false;
+            }
             if (r.Capture == null) r.Advances++;
             // Too little device memory left for another recording: this step runs as usual and tries again later, and the next
             // step first gives finished conversations' retained slots back (RoomForRecordings).
@@ -894,6 +918,7 @@ namespace TensorSharp.Models
             _graphEpoch++;
             DropDecodeReplay();
             OnGraphCacheCleared();
+            ClearShortConvCommits();
             foreach (CachedGraph entry in _graphCache.Values) entry.Dispose();
             _graphCache.Clear();
             _graphLru.Clear();
@@ -1992,9 +2017,15 @@ namespace TensorSharp.Models
             return step.RmsNorm(stream, site == BlockSite.Mixer ? LayerName(layer, "attn_norm.weight") : FfnNormWeight(layer));
         }
 
-        /// <summary>The stream after a block's output [hidden, rows] joins it. Default: the residual add.</summary>
+        /// <summary>The stream after a block's output [hidden, rows] joins it. Default: the residual add, after the block's
+        /// post-norm where the family has one (<see cref="MixerPostNormWeight"/>, <see cref="FfnPostNormWeight"/>). The normed
+        /// output is the add's first operand: ggml-metal fuses RMS_NORM + MUL + ADD only when each fused node's first source is
+        /// the previous node (llama.cpp's LFM3 graph swapped its adds for that, e574a17b0).</summary>
         protected virtual int EmitBlockOutput(GraphStep step, int layer, int stream, BlockSite site, int context, int output)
-            => step.Op(GraphOp.Add, stream, output);
+        {
+            string post = site == BlockSite.Mixer ? MixerPostNormWeight(layer) : FfnPostNormWeight(layer);
+            return post == null ? step.Op(GraphOp.Add, stream, output) : step.Op(GraphOp.Add, step.RmsNorm(output, post), stream);
+        }
 
         /// <summary>The head's input [hidden, rows] from the stream. Default: the output norm.</summary>
         protected virtual int EmitStreamOutput(GraphStep step, int stream) => step.RmsNorm(stream, "output_norm.weight");
@@ -2122,6 +2153,7 @@ namespace TensorSharp.Models
             float scale = 1.0f / MathF.Sqrt(d);
             long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
             int n = step.Sequences;
+            int band = SlidingWindow(layer);
             int attn = -1;
             for (int s = 0; s < n; s++)
             {
@@ -2156,12 +2188,20 @@ namespace TensorSharp.Models
                         qPerm = step.Permute(qs, 0, 2, 1, 3);
                     }
                     int stepRows = DecodeWindowStep;
-                    int window = CapacityWindow(step, d, dv, kvType) ? cap : Math.Min(cap, (start + count + stepRows - 1) / stepRows * stepRows);
+                    bool capacity = CapacityWindow(step, d, dv, kvType);
+                    int window = capacity ? cap : Math.Min(cap, (start + count + stepRows - 1) / stepRows * stepRows);
+                    // A sliding-window layer reads only the cells its rows attend: from the bucket below the first row's
+                    // window (so the graph is the same for a bucket's positions, as the window's end is) to the window's end.
+                    // A capacity window keeps the slot's whole extent (one graph at every position) and masks the band.
+                    int first = band > 0 && !capacity ? SlidingWindowFirstCell(start, band, stepRows) : 0;
+                    if (band > 0 && !capacity) step.LimitAdvance(start, first + stepRows + band - 1, s);
+                    int keys = window - first;
                     int gqa = heads / kvHeads;
-                    int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, window, kvType, count, gqa });
-                    int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, window, kvType, count, gqa });
+                    int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, first, keys, kvType, count, gqa });
+                    int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, first, keys, kvType, count, gqa });
                     bool region = BeginWindowAttention(step, layer, x, s, new WindowAttentionOperands(qs, ck, cv, rowsAt, window, heads, kvHeads, d, scale));
-                    fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, step.ChunkMask(window, start, count, s), window), scale,
+                    int mask = band > 0 ? step.BandMask(keys, first, start, count, s, band) : step.ChunkMask(window, start, count, s);
+                    fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, mask, keys), scale,
                         AttentionKvMax(step, layer, s));
                     if (region) step.EndFused(stackalloc[] { fa });
                 }
@@ -2172,10 +2212,12 @@ namespace TensorSharp.Models
                     step.Effect(step.Op(GraphOp.Cpy, kFresh, step.View3(ck, d, count, kvHeads, kRow, kRow * cap, start * kRow)));
                     step.Effect(step.Op(GraphOp.Cpy, vFresh, step.View3(cv, dv, count, kvHeads, vRow, vRow * cap, start * vRow)));
                     int kAttn = kFresh, vAttn = vFresh;
-                    if (start > 0)
+                    // A sliding-window layer's chunk attends the cached rows its first row's window reaches, not the whole prefix.
+                    int first = band > 0 ? Math.Max(0, start - band + 1) : 0;
+                    if (start > first)
                     {
-                        int kPrev = step.View3(ck, d, start, kvHeads, kRow, kRow * cap, 0);
-                        int vPrev = step.View3(cv, dv, start, kvHeads, vRow, vRow * cap, 0);
+                        int kPrev = step.View3(ck, d, start - first, kvHeads, kRow, kRow * cap, first * kRow);
+                        int vPrev = step.View3(cv, dv, start - first, kvHeads, vRow, vRow * cap, first * vRow);
                         if (kvType != GraphFormat.F32)
                         {
                             kPrev = step.Op(GraphOp.Cast, stackalloc[] { kPrev }, stackalloc long[] { GraphFormat.F32 });
@@ -2184,7 +2226,8 @@ namespace TensorSharp.Models
                         kAttn = step.Op(GraphOp.Concat, stackalloc[] { kPrev, kFresh }, stackalloc long[] { 1 });
                         vAttn = step.Op(GraphOp.Concat, stackalloc[] { vPrev, vFresh }, stackalloc long[] { 1 });
                     }
-                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, step.CausalMask(start, count, s), start + count), scale);
+                    int mask = band > 0 ? step.BandCausalMask(first, start, count, s, band) : step.CausalMask(start, count, s);
+                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, mask, start + count - first), scale);
                 }
                 int part = step.Reshape(fa, heads * dv, count);
                 attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
@@ -2198,8 +2241,22 @@ namespace TensorSharp.Models
                 attn = step.Op(GraphOp.Mul, attn, step.Op(GraphOp.Sigmoid, g));
                 step.EndFused(stackalloc[] { attn });
             }
+            attn = EmitAttentionOutput(step, layer, x, attn);
             return step.MatMul(LayerName(layer, "attn_output.weight"), attn);
         }
+
+        /// <summary>What a family applies to the attention result [heads * dv, rows] (the rank's heads) before the output
+        /// projection, given the layer's input <paramref name="x"/> [hidden, rows]: LFM2/LFM3's head-wise sigmoid gate
+        /// (a separate projection to one logit per head). Default: nothing. The per-op path's counterpart is
+        /// <see cref="GateAttentionOutput"/>; a per-head weight it reads shards by heads under tensor parallelism
+        /// (<see cref="HeadParallelLayerWeights"/>).</summary>
+        protected virtual int EmitAttentionOutput(GraphStep step, int layer, int x, int attn) => attn;
+
+        /// <summary>The first cache cell a sliding-window layer's rows continuing at <paramref name="start"/> read: the bucket of
+        /// <paramref name="stepRows"/> cells below the first row's window (positions (start - window, start]), so every position
+        /// of a bucket reads the same cells (a decode step advances through them) and a window moves a bucket at a time.</summary>
+        private static int SlidingWindowFirstCell(int start, int window, int stepRows)
+            => start <= window ? 0 : (start - window) / stepRows * stepRows;
 
         private int EmitDenseFfn(GraphStep step, int layer, int x)
         {
@@ -2762,6 +2819,60 @@ namespace TensorSharp.Models
                 return _decodeMask;
             }
 
+            /// <summary>Sliding-window masks of this step by (window, offset, start, count, sequence, band): every layer of one
+            /// window reads the same input.</summary>
+            private Dictionary<(int Window, int Offset, int Start, int Count, int Sequence, int Band), int> _bandMasks;
+
+            /// <summary>
+            /// A sliding-window F16 mask [<paramref name="window"/>, count] of sequence <paramref name="sequence"/> over cache rows
+            /// [<paramref name="offset"/>, offset + window): row q (position start + q) sees the keys at positions
+            /// (start + q - <paramref name="band"/>, start + q] (llama.cpp's LLAMA_SWA_TYPE_STANDARD: a key is masked when
+            /// p_query - p_key &gt;= band) and none before the sequence's attention floor. An advance closes the cells the band leaves
+            /// as it opens the new ones (<see cref="TryAdvance(Tensor[], int[])"/>).
+            /// </summary>
+            internal int BandMask(int window, int offset, int start, int count, int sequence, int band)
+            {
+                if (band <= 0) throw new ArgumentOutOfRangeException(nameof(band), band, "a sliding window needs a positive width");
+                var key = (window, offset, start, count, sequence, band);
+                if (_bandMasks != null && _bandMasks.TryGetValue(key, out int cached)) return cached;
+                var mask = new ushort[(long)window * count];
+                FillBandRows(mask, window, offset, start, count, FloorOf(sequence), band);
+                int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
+                AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
+                    window: window, start: start, count: count, sequence: sequence, offset: offset, band: band);
+                (_bandMasks ??= new())[key] = node;
+                return node;
+            }
+
+            /// <summary>A sliding-window F16 mask [start + count - offset, count] for a prompt chunk of sequence
+            /// <paramref name="sequence"/> attending to cache rows from <paramref name="offset"/> on (see <see cref="BandMask"/>);
+            /// its values do not follow an advance (a chunk runs once).</summary>
+            internal int BandCausalMask(int offset, int start, int count, int sequence, int band)
+            {
+                if (band <= 0) throw new ArgumentOutOfRangeException(nameof(band), band, "a sliding window needs a positive width");
+                int kv = start + count - offset;
+                var key = (kv, offset, start, count, sequence, -band);   // negative band: a chunk's mask, not a decode mask
+                if (_bandMasks != null && _bandMasks.TryGetValue(key, out int cached)) return cached;
+                var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
+                FillBandRows(mask, kv, offset, start, count, FloorOf(sequence), band);
+                int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
+                AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort));
+                (_bandMasks ??= new())[key] = node;
+                return node;
+            }
+
+            /// <summary>Whether a sliding-window mask of this step closes cells inside its window: rows that attend from past the
+            /// window's first cell, whose lower bound a recorded step would replay stale (<see cref="BandMask"/>).</summary>
+            internal bool SlidingFloorInWindow
+            {
+                get
+                {
+                    foreach (InputMeta m in _inputMeta)
+                        if (m.Kind == InputKind.DecodeMask && m.Band > 0 && m.Start - m.Band + 1 > m.Offset) return true;
+                    return false;
+                }
+            }
+
             /// <summary>A causal F16 mask [start + count, count] for a chunk of sequence <paramref name="sequence"/> (-1: any)
             /// continuing at <paramref name="start"/>.</summary>
             public int CausalMask(int start, int count, int sequence = -1)
@@ -2826,15 +2937,60 @@ namespace TensorSharp.Models
                 }
             }
 
+            /// <summary>The open cells [Lo, Hi) of row q of a sliding-window mask over cache rows [offset, offset + width), for rows
+            /// continuing at <paramref name="start"/>: positions (start + q - band, start + q], none before the attention floor.</summary>
+            private static (int Lo, int Hi) BandRow(int width, int offset, int start, int q, int attentionFloor, int band)
+            {
+                int p = start + q;
+                int lo = Math.Clamp(Math.Max(attentionFloor, p - band + 1) - offset, 0, width);
+                int hi = Math.Clamp(p + 1 - offset, 0, width);
+                return (lo, Math.Max(lo, hi));
+            }
+
+            /// <summary>A sliding-window mask (<see cref="BandMask"/>): each row zero over its open cells, -inf elsewhere.</summary>
+            private static void FillBandRows(ushort[] mask, int width, int offset, int start, int count, int attentionFloor, int band)
+            {
+                const ushort negInf = 0xFC00;
+                for (int q = 0; q < count; q++)
+                {
+                    Span<ushort> row = mask.AsSpan(q * width, width);
+                    (int lo, int hi) = BandRow(width, offset, start, q, attentionFloor, band);
+                    row[..lo].Fill(negInf);
+                    row[lo..hi].Clear();
+                    row[hi..].Fill(negInf);
+                }
+            }
+
+            /// <summary>A sliding-window mask moved from rows at <paramref name="from"/> to rows at <paramref name="to"/>: per row the
+            /// cells the band left closed and the cells it reached opened (the same values a fill at <paramref name="to"/> writes).</summary>
+            private static void MoveBandRows(ushort[] mask, int width, int offset, int from, int to, int count, int attentionFloor, int band)
+            {
+                const ushort negInf = 0xFC00;
+                for (int q = 0; q < count; q++)
+                {
+                    Span<ushort> row = mask.AsSpan(q * width, width);
+                    (int oldLo, int oldHi) = BandRow(width, offset, from, q, attentionFloor, band);
+                    (int lo, int hi) = BandRow(width, offset, to, q, attentionFloor, band);
+                    if (lo >= oldHi || hi <= oldLo)
+                    {
+                        row[oldLo..oldHi].Fill(negInf);
+                        row[lo..hi].Clear();
+                        continue;
+                    }
+                    if (lo > oldLo) row[oldLo..lo].Fill(negInf);
+                    if (hi > oldHi) row[oldHi..hi].Clear();
+                }
+            }
+
             private void AddInput(int node, IntPtr data, long bytes, object handle = null, InputKind kind = InputKind.Opaque,
-                Array values = null, int window = 0, int start = 0, int count = 0, int sequence = -1)
+                Array values = null, int window = 0, int start = 0, int count = 0, int sequence = -1, int offset = 0, int band = 0)
             {
                 _b.Sink?.InputData(node, data, bytes, handle);
                 _inputs.Add(node);
                 _inputData.Add(data);
                 _inputBytes.Add(bytes);
                 _inputHandles.Add(handle);
-                _inputMeta.Add(new InputMeta(kind, values, window, start, count, Sequence: sequence));
+                _inputMeta.Add(new InputMeta(kind, values, window, start, count, Sequence: sequence, Offset: offset, Band: band));
             }
 
             private readonly List<object> _inputHandles = new();
@@ -2844,8 +3000,10 @@ namespace TensorSharp.Models
             /// <summary>How an input follows the rows' positions.</summary>
             private enum InputKind : byte { Opaque, Hidden, Positions, WriteRows, DecodeMask, Constant, Refill }
 
+            /// <summary>A decode mask's <see cref="Window"/> cells cover cache rows [<see cref="Offset"/>, Offset + Window); a
+            /// sliding-window mask has its <see cref="Band"/> (0: causal).</summary>
             private readonly record struct InputMeta(InputKind Kind, Array Values, int Window, int Start, int Count,
-                Func<bool> Refill = null, int Sequence = -1);
+                Func<bool> Refill = null, int Sequence = -1, int Offset = 0, int Band = 0);
 
             /// <summary>An input the family rewrites when the step runs again one position on: <paramref name="refill"/>
             /// runs after the positions moved (through <see cref="RewriteInput"/>, or into the input's own array) and
@@ -2916,7 +3074,7 @@ namespace TensorSharp.Models
                 foreach (InputMeta m in _inputMeta)
                 {
                     if (m.Kind is InputKind.DecodeMask or InputKind.WriteRows && Delta(m.Sequence) < 1) return false;
-                    if (m.Kind == InputKind.DecodeMask && m.Start + m.Count + Delta(m.Sequence) > m.Window) return false;
+                    if (m.Kind == InputKind.DecodeMask && m.Start + m.Count + Delta(m.Sequence) > m.Offset + m.Window) return false;
                     if (m.Kind == InputKind.Positions && !uniform && m.Values.Length != Rows) return false;
                 }
                 if (_advanceLimits != null)
@@ -2960,7 +3118,10 @@ namespace TensorSharp.Models
                         case InputKind.DecodeMask:
                         {
                             int d = Delta(m.Sequence);
-                            OpenCausalRows((ushort[])m.Values, m.Window, m.Start, m.Start + d, m.Count, FloorOf(m.Sequence));
+                            if (m.Band > 0)
+                                MoveBandRows((ushort[])m.Values, m.Window, m.Offset, m.Start, m.Start + d, m.Count, FloorOf(m.Sequence), m.Band);
+                            else
+                                OpenCausalRows((ushort[])m.Values, m.Window, m.Start, m.Start + d, m.Count, FloorOf(m.Sequence));
                             _inputMeta[i] = m with { Start = m.Start + d };
                             break;
                         }
@@ -3238,7 +3399,8 @@ namespace TensorSharp.Models
             /// </summary>
             private void BindDecodeMask(int input, in InputMeta m, ushort[] half, Tensor stable)
             {
-                if (_maskBindings != null && _maskBindings.TryGetValue(input, out var bound) && ReferenceEquals(bound.Stable, stable)
+                // A sliding-window mask also closes cells as it moves: it is converted whole.
+                if (m.Band == 0 && _maskBindings != null && _maskBindings.TryGetValue(input, out var bound) && ReferenceEquals(bound.Stable, stable)
                     && bound.Start <= m.Start)
                 {
                     int floor = Math.Min(FloorOf(m.Sequence), m.Window);

@@ -957,9 +957,10 @@ namespace TensorSharp.Models
         private Tensor SequenceAttention(RankScope scope, int layer, Slot slot, Tensor q, Tensor k, Tensor v, int start, int count)
         {
             Tensor cacheK = slot.K[layer][scope.Rank], cacheV = slot.V[layer][scope.Rank];
+            int band = SlidingWindow(layer);
             return count == 1
-                ? DecodeAttention(scope, cacheK, cacheV, slot.Capacity, q, k, v, start)
-                : PrefillAttention(scope, cacheK, cacheV, q, k, v, start, count);
+                ? DecodeAttention(scope, cacheK, cacheV, slot.Capacity, q, k, v, start, band)
+                : PrefillAttention(scope, cacheK, cacheV, q, k, v, start, count, band);
         }
     }
 }

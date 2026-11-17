@@ -44,6 +44,8 @@ namespace TensorSharp.Models
         /// family whose graphs keep it in device buffers overrides this.</summary>
         protected virtual void CommitRecurrentPrefix(int kept, int rows)
         {
+            // The runtime's own short-conv states keep a graph verify window in device buffers: their copy programs first.
+            CommitShortConvWindows(kept, rows);
             foreach (RecurrentState state in ActiveRecurrentStates())
                 state.CommitVerify(kept);
         }
