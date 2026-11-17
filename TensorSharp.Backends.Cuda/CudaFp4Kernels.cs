@@ -35,6 +35,12 @@ namespace TensorSharp.Cuda
         /// quantized to NVFP4 (9-16 row windows of Qwen3.8-27B had taken them, their rows rounding far from the decode rows').</summary>
         public const int GemvMaxRows = 16;
 
+        /// <summary>Rows the q8 matvec takes in a step of several sequences: their rows past it run on the FP4 GEMMs, as
+        /// before the matvec took 16. Several sequences' windows past 16 rows round apart from their decode rows on the GEMMs
+        /// anyway, and the matvec at 9-16 rows cost four Qwen3.8-27B DFlash2 conversations at once 15% of their decode
+        /// (23.6 against 27.7 tok/s each on an RTX PRO 4000): one sequence's window of 9-16 rows keeps it.</summary>
+        public const int MultiSequenceGemvRows = 8;
+
         /// <summary>Fewest activation rows the TMA-fed GEMM takes.</summary>
         public const int TmaMinRows = 65;
 

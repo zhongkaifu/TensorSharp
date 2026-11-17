@@ -160,6 +160,11 @@ namespace TensorSharp.Cuda
         /// where the image has no tensor-core code for this GPU or is missing.</summary>
         internal CudaFp4Kernels Fp4Kernels => LoadOnce(ref fp4Kernels, ref fp4State, CudaFp4Kernels.TryCreate);
 
+        /// <summary>Rows an NVFP4 product takes on the q8 matvec (row-invariant) before the FP4 GEMMs: up to
+        /// <see cref="CudaFp4Kernels.GemvMaxRows"/>, <see cref="CudaFp4Kernels.MultiSequenceGemvRows"/> while a step of
+        /// several sequences runs (CudaGraphExecutor.StepSequences).</summary>
+        internal int Nvfp4MatvecRows { get; set; } = CudaFp4Kernels.GemvMaxRows;
+
         /// <summary>The recurrent-layer prefill kernels for this device (tensorsharp_ssm_prefill), loaded on first use;
         /// null where the module is missing or stale.</summary>
         internal CudaSsmPrefillKernels SsmPrefillKernels => LoadOnce(ref ssmPrefillKernels, ref ssmPrefillState, CudaSsmPrefillKernels.TryCreate);

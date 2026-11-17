@@ -39,6 +39,18 @@ namespace TensorSharp.Cuda
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
         protected override bool BroadcastsPositionsOnDevice => true;
 
+        /// <summary>A step of several sequences keeps the NVFP4 matvec to <see cref="CudaFp4Kernels.MultiSequenceGemvRows"/> rows
+        /// (<see cref="CudaAllocator.Nvfp4MatvecRows"/>); one sequence's step to <see cref="CudaFp4Kernels.GemvMaxRows"/>.</summary>
+        public override int StepSequences
+        {
+            get => base.StepSequences;
+            set
+            {
+                base.StepSequences = value;
+                ((CudaAllocator)Allocator).Nvfp4MatvecRows = value > 1 ? CudaFp4Kernels.MultiSequenceGemvRows : CudaFp4Kernels.GemvMaxRows;
+            }
+        }
+
         /// <summary>The widest verify window the shared runtime runs (a block drafter's 16 rows, StandardDecoderModel.SmallChunkRows):
         /// a step of more rows is a prompt chunk, whose attention takes the prompt kernels; the windows keep theirs.</summary>
         private const int WidestVerifyWindow = 16;
@@ -1540,7 +1552,7 @@ namespace TensorSharp.Cuda
             int rows = checked((int)(a.ElementCount() / cols));
             Tensor total = new Tensor(Allocator, DType.Float32, a.Sizes), norm = new Tensor(Allocator, DType.Float32, a.Sizes);
             var cuda = (CudaAllocator)Allocator;
-            if (rows > CudaFp4Kernels.GemvMaxRows && CudaFp4Kernels.TakesWidth(cols) && _branchQuantized == null && cuda.Fp4Kernels != null
+            if (rows > cuda.Nvfp4MatvecRows && CudaFp4Kernels.TakesWidth(cols) && _branchQuantized == null && cuda.Fp4Kernels != null
                 && Array.TrueForAll(inputs, t => ((CudaStorage)t.Storage).DeviceId == cuda.DeviceId))
             {
                 DropUnreadNorms();

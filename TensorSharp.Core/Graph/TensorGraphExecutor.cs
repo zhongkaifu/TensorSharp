@@ -28,6 +28,9 @@ namespace TensorSharp.Graph
         /// <inheritdoc cref="IGraphExecutor.Drafting"/>
         public bool Drafting { get; set; }
 
+        /// <inheritdoc cref="IGraphExecutor.StepSequences"/>
+        public virtual int StepSequences { get; set; }
+
         protected TensorGraphExecutor(IAllocator allocator)
             => Allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
 

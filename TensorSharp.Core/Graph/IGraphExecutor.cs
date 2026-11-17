@@ -136,6 +136,11 @@ namespace TensorSharp.Graph
         /// row-invariant (a verify window's rows a plain decode step's bit for bit) and may take faster kernels whose last
         /// bits vary. Set around a draft step's runs, its recordings' included.</summary>
         bool Drafting { get => false; set { } }
+
+        /// <summary>The sequences of the steps run now (0: not said). Set around a step's runs, its recordings' included: an
+        /// executor whose row-invariant products cost more past a few rows keeps them for the rows of one sequence's window
+        /// (several sequences' rows past them take its multi-row products, as they did before).</summary>
+        int StepSequences { get => 0; set { } }
     }
 
     /// <summary>A compiled program. Outputs are the plan's arrays, rewritten by each run.</summary>

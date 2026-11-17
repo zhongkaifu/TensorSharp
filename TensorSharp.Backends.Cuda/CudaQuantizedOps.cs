@@ -907,7 +907,7 @@ namespace TensorSharp.Cuda
             CudaFp4Kernels fp4 = allocator.Fp4Kernels
                 ?? throw new InvalidOperationException("an NVFP4 weight is resident in the planar layout, but the FP4 kernels are not loaded");
             IntPtr stream = allocator.Stream.Handle;
-            if (rows <= CudaFp4Kernels.GemvMaxRows)
+            if (rows <= allocator.Nvfp4MatvecRows)
             {
                 IntPtr scratch = EnsureQ81Scratch(allocator, CudaFp4Kernels.GemvScratchBytes(rows, inDim));
                 fp4.Gemv(planes, outDim, inDim, inputPtr, rows, scratch, resultPtr, stream);
@@ -956,7 +956,7 @@ namespace TensorSharp.Cuda
         {
             if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
                 || !CudaKernelOps.TryGetContiguousRows(gateUp, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
-                || rows != inputRows || cols != ne1 || inputCols != 2 * ne0 || rows <= CudaFp4Kernels.GemvMaxRows
+                || rows != inputRows || cols != ne1 || inputCols != 2 * ne0 || rows <= resultStorage.AllocatorImpl.Nvfp4MatvecRows
                 || result.ElementType != DType.Float32 || gateUp.ElementType != DType.Float32)
                 return false;
             CudaAllocator allocator = resultStorage.AllocatorImpl;
@@ -987,7 +987,7 @@ namespace TensorSharp.Cuda
         internal static bool TryAddmmNvfp4Planes(Tensor result, IntPtr planes, int outDim, int k, Nvfp4ActivationWriter quantize)
         {
             if (!CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
-                || cols != outDim || rows <= CudaFp4Kernels.GemvMaxRows || result.ElementType != DType.Float32
+                || cols != outDim || rows <= resultStorage.AllocatorImpl.Nvfp4MatvecRows || result.ElementType != DType.Float32
                 || !CudaFp4Kernels.TakesWidth(k))
                 return false;
             CudaAllocator allocator = resultStorage.AllocatorImpl;

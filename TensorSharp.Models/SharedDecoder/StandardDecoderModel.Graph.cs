@@ -1158,7 +1158,9 @@ namespace TensorSharp.Models
             // last bits vary (the direct engines ran their drafters' Q4_K products on the int8 tensor cores).
             IGraphExecutor executor = GraphExecutor;
             bool drafting = executor.Drafting;
+            int sequences = executor.StepSequences;
             executor.Drafting = shape != null && shape.StartsWith(DraftShapePrefix, StringComparison.Ordinal);
+            executor.StepSequences = counts.Length;
             try
             {
                 return RunTracedAs(rows, slots, first, counts, starts, replayable, snapshots, attentionFloor, emit, out outputs, out owned,
@@ -1167,6 +1169,7 @@ namespace TensorSharp.Models
             finally
             {
                 executor.Drafting = drafting;
+                executor.StepSequences = sequences;
             }
         }
 
