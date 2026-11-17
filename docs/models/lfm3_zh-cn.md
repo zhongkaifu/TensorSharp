@@ -42,8 +42,16 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
   上运行子集。与同一 GGUF 上的 llama-server 对比（贪心解码、相同的渲染提示）：GSM8K（关闭思考 200 题、开启思考 50 题）在
   Q4_K_M（81.5% / 98%）与 Q8_0（86% / 98%）上得分相同，关闭思考时 92-93% 的回复文本完全一致；8K-128K 的大海捞针在两个引擎上全部
   命中且回复一致；33 条指令遵循与 35 个函数调用用例得分相同或更高，差异来自下文两项行为（关闭思考时的游离推理、
-  `tool_choice`）。4 与 16 个并发对话、n-gram 推测解码（回复一致）与客户端取消均正常。超过 16K token 的提示处理慢于
-  llama.cpp（M5 Pro 上 32K 时约 3,000 对 5,400 token/s）；长提示之后的解码速度相当。
+  `tool_choice`）。4 与 16 个并发对话、n-gram 推测解码（回复一致）与客户端取消均正常。长提示的预填充速度与 llama.cpp 相当
+  （见下一项；早先“32K 时 3,000 对 5,400 token/s”的数字计时的是 llama-server 处理一个前半段已被上一请求留在缓存中的提示）；
+  长提示之后的解码速度相当。
+- **速度（2026-11-17，M5 Pro，ggml_metal，`eng/lfm3/bench`，每次运行与同一 GGUF 上的 llama.cpp `d3c3e242c` 交替进行，机器空闲）：**
+  LFM3-1.7B Q4_K_M 在 128、512、2,048 个提示 token 时预填充 4,320、6,043、5,971 token/s，llama-bench 为 4,471 / 5,962 / 5,883
+  （Q8_0：4,446 / 6,298 / 6,210 对 4,544 / 6,195 / 6,084）；16K 与 32K 时为 4,952 与 4,129，对 4,932 / 4,126；解码在深度 0 时
+  195 token/s 对 193（4K 时 185 对 181）。经由服务器，首个 token（`max_tokens` 为 1）在 40 到 2K 提示 token 时与 llama-server
+  相差 5% 以内，在 16K-32K 时晚 3-5%。在被其他任务占用的机器上，TensorSharp 的多步提示比 llama.cpp 多损失 5-10%。MLX 对 512
+  个以上 token 的提示预填充快于 ggml_metal（Q4_K_M 在 512 时 6,589 token/s），但解码慢约 15%（165 token/s，来自每步的主机开销）；
+  ggml_cpu 的预填充约为 `llama-bench -ngl 0` 的一半，后者的提示矩阵乘法在 Accelerate 的 BLAS 上运行。
 - **尚未验证：** 设备上的 TensorAgent 应用，以及所有 CUDA 与 Vulkan 路径（`config/lfm3-1.7b-nvfp4.json` 从未运行过）。尚未与 vLLM、SGLang 对比。
 
 ## 运行

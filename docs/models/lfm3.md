@@ -60,9 +60,21 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   function-calling sets score equal or higher, the differences being the two
   behaviors below (stray reasoning with thinking off, `tool_choice`). 4 and 16
   concurrent conversations, n-gram speculation (identical replies) and client
-  cancellation hold. Prompt processing past 16K tokens is slower than llama.cpp's
-  (about 3,000 vs 5,400 tokens/s at 32K on an M5 Pro); decoding after a long prompt is
-  on par.
+  cancellation hold. Long prompts prefill at llama.cpp's speed (next item; an earlier
+  "3,000 vs 5,400 tokens/s at 32K" timed llama-server on a prompt whose first half the
+  previous request had left in its cache); decoding after a long prompt is on par.
+- **Speed (2026-11-17, M5 Pro, ggml_metal, `eng/lfm3/bench`, each run interleaved with
+  llama.cpp `d3c3e242c` on the same GGUF, quiet machine):** LFM3-1.7B Q4_K_M prefills
+  4,320 tokens/s at 128 prompt tokens, 6,043 at 512 and 5,971 at 2,048 against
+  llama-bench's 4,471 / 5,962 / 5,883 (Q8_0: 4,446 / 6,298 / 6,210 against 4,544 / 6,195 /
+  6,084), 4,952 at 16K and 4,129 at 32K against 4,932 / 4,126, and decodes 195 tokens/s
+  at depth 0 against 193 (185 against 181 at 4K). Through the servers the first token
+  (`max_tokens` 1) comes within 5% of llama-server's from 40 to 2K prompt tokens and
+  3-5% later at 16K-32K. On a machine busy with other jobs TensorSharp's multi-step
+  prompts lose 5-10% more than llama.cpp's. MLX prefills 512+ token prompts faster than
+  ggml_metal (6,589 tokens/s at 512 on Q4_K_M) but decodes about 15% slower (165 tokens/s,
+  a per-step host cost); ggml_cpu prefills at about half the speed of
+  `llama-bench -ngl 0`, whose prompt products run on Accelerate's BLAS.
 - **Not yet validated:** the TensorAgent app on a device, and every CUDA and Vulkan route
   (`config/lfm3-1.7b-nvfp4.json` in particular has never run). vLLM and SGLang were not
   compared yet.
