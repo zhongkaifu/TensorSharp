@@ -3,7 +3,7 @@
 
 For each (concurrency C, prompt length P) it sends R requests (R = max(--min-requests, 2 C)), C at a time, each a
 distinct prompt of P tokens (a unique first line, so no prefix cache can reuse another request's prompt), asking for
-exactly --gen tokens (ignore_eos, greedy, thinking off). It reports TTFT p50/p95 (request sent -> first streamed token,
+exactly --gen tokens (ignore_eos, greedy, no repetition penalty, thinking off). It reports TTFT p50/p95 (request sent -> first streamed token,
 content or reasoning), per-request decode tok/s ((tokens - 1) / (last token - first token)), aggregate output tok/s
 (all output tokens / the level's wall time) and the server process's peak physical footprint (`footprint`, which counts
 Metal buffers) sampled every 0.25 s.
@@ -85,7 +85,12 @@ def request(port, model_name, text, gen, timeout=1200):
         "model": model_name,
         "messages": [{"role": "user", "content": text}],
         "max_tokens": gen,
+        # Greedy and no penalty on both engines (config/lfm3-1.7b.json's defaults are the model card's 0.1 / 1.1).
         "temperature": 0,
+        "top_k": 1,
+        "top_p": 1.0,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
         "stream": True,
         "ignore_eos": True,
         "chat_template_kwargs": {"enable_thinking": False},
