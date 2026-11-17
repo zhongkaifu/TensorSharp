@@ -552,8 +552,13 @@ namespace TensorSharp.Server
             // maxVideoFrames <= 0 means "no cap" (pure time-based extraction); leave history untouched.
             // Whether a family expands a video into per-frame images (and so needs the
             // cap) is declared with the rest of its chat protocol, not matched on here.
-            bool capsFrames = ChatProtocolRegistry.For(arch)?.CapsVideoFrames ?? false;
+            ChatProtocol protocol = ChatProtocolRegistry.For(arch);
+            bool capsFrames = protocol?.CapsVideoFrames ?? false;
             if (!capsFrames || maxVideoFrames <= 0 || !msg.IsVideo || msg.ImagePaths == null || msg.ImagePaths.Count <= maxVideoFrames)
+                return msg;
+            // A family that reads the clip itself samples it its own way: the host's frames are not what it sees, and
+            // thinning them would only drop stills that share the list.
+            if (protocol.ReadsVideoFiles && msg.VideoFilePaths is { Count: > 0 })
                 return msg;
 
             var sampledIndices = MediaHelper.SelectEvenlySpacedIndices(msg.ImagePaths.Count, maxVideoFrames);
