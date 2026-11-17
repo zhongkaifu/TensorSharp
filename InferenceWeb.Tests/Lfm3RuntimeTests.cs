@@ -630,6 +630,16 @@ public sealed class Lfm3RuntimeTests : IDisposable
             tieTolerance: RoundsActivations(backend) ? 1e-2 : 0);
     }
 
+    /// <summary>Speculation on per-rank graphs (tensor parallelism 2): each rank's short-conv states keep their channels'
+    /// verify history and commit on their own device.</summary>
+    [Fact]
+    public void SpeculationOnRankGraphsMatchesPlainGreedy()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, tp: 2), "lfm3 tp2");
+    }
+
     [MlxFact]
     public void SpeculativeDecodingMatchesPlainGreedyOnMlx()
     {
