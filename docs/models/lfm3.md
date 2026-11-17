@@ -73,11 +73,13 @@ and 20 as sliding-window (window 256, RoPE base 10,000); layers 2, 6, 10, 14, 18
 attend to the whole context (RoPE base 1,000,000). The GGUF declares a 262,144-token
 window (1.7B) and 128,000 (Omni); `MAX_CONTEXT` bounds it.
 
-K/V per token at F16: 11 layers x 4 heads x 128 x 2 x 2 = 22,528 bytes while every
-attention layer keeps a linear cache, 12,288 bytes once the five sliding-window
-layers keep a fixed 256-row ring (llama.cpp's iSWA cache). The short-conv state is
-fixed per sequence and cannot be rewound, so a prefix is reused exactly or not at all
-(the recurrent-state rule the Qwen 3.5 family follows).
+K/V per token at F16: 6 full layers x 4 heads x 128 x 2 x 2 = 12,288 bytes, as
+llama.cpp's iSWA cache. The five sliding-window layers keep rings of 768 cells each
+(the 256-key window plus a 512-row prompt step, aligned to 256: 7.5 MB a sequence),
+so prompts run in steps of at most 512 rows a sequence once a ring would wrap; with
+linear caches on all eleven layers it would be 22,528 bytes a token. The short-conv
+state is fixed per sequence and cannot be rewound, so a prefix is reused exactly or
+not at all (the recurrent-state rule the Qwen 3.5 family follows).
 
 ## Chat template
 
@@ -199,6 +201,5 @@ sampling on every engine.
 - Audio sent to LFM3-1.7B, or to Omni without its projector, is not refused yet; the
   multimodal integration has to refuse it rather than drop it.
 - `tool_choice: required` is not grammar-enforced; nested tool schemas are flattened.
-- TensorAgent's catalog counts 22,528 K/V bytes per token until the sliding-window
-  ring lands; the QAD-Q4_0 file is not in the catalog pending a quality and speed
+- The QAD-Q4_0 file is not in TensorAgent's catalog pending a quality and speed
   measurement against Q4_K_M.
