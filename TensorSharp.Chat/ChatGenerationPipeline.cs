@@ -1932,6 +1932,22 @@ namespace TensorSharp.Server
             {
                 throw new OperationCanceledException(ex.Message, ex, cancellationToken);
             }
+            // Media the decoders refuse (undecodable bytes, a format nothing on this host reads, a decode that timed out)
+            // is the request's fault: a client error that names the attachment, not a server failure.
+            catch (Exception ex) when (TensorSharp.Models.Media.MediaInputException.IsDecodeFailure(ex))
+            {
+                throw TensorSharp.Models.Media.MediaInputException.From(ex, MediaPaths(history));
+            }
+        }
+
+        private static IEnumerable<string> MediaPaths(List<ChatMessage> history)
+        {
+            foreach (ChatMessage message in history)
+            {
+                if (message.ImagePaths != null) foreach (string p in message.ImagePaths) yield return p;
+                if (message.AudioPaths != null) foreach (string p in message.AudioPaths) yield return p;
+                if (message.VideoFilePaths != null) foreach (string p in message.VideoFilePaths) yield return p;
+            }
         }
 
         /// <summary>

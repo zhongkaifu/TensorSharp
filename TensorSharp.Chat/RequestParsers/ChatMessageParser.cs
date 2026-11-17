@@ -814,32 +814,82 @@ namespace TensorSharp.Server.RequestParsers
             return slash >= 0 ? mime.Substring(slash + 1) : mime;
         }
 
-        private static string AudioExtension(string format, byte[] data)
+        /// <summary>
+        /// The extension an audio upload is stored with, which picks its decoder: WAV, MP3 and Ogg Vorbis read by the managed
+        /// decoders, every other container (FLAC, M4A / MP4, raw AAC, WebM, Ogg Opus, AIFF, CAF) by the platform decoder
+        /// (ffmpeg on desktop hosts). The declared format (OpenAI's <c>format</c>, a data URI's MIME subtype) first, else
+        /// the bytes' signature, else MP3 (bare MPEG frames have none). A FLAC or M4A clip used to be stored as .mp3 and
+        /// read by the MP3 decoder, which made a fraction of a second of noise of it.
+        /// </summary>
+        internal static string AudioExtension(string format, byte[] data)
         {
             switch ((format ?? string.Empty).Trim().TrimStart('.').ToLowerInvariant())
             {
                 case "wav":
                 case "wave":
                 case "x-wav":
+                case "vnd.wave":
                 case "pcm":
                     return ".wav";
                 case "mp3":
                 case "mpeg":
                 case "mpga":
+                case "mpeg3":
+                case "x-mpeg-3":
                     return ".mp3";
                 case "ogg":
                 case "oga":
                 case "vorbis":
-                    return ".ogg";
+                    return IsOggOpus(data) ? ".opus" : ".ogg";
+                case "opus":
+                    return ".opus";
+                case "flac":
+                case "x-flac":
+                    return ".flac";
+                case "m4a":
+                case "x-m4a":
+                case "mp4":
+                case "mp4a-latm":
+                    return ".m4a";
+                case "aac":
+                case "aacp":
+                case "x-aac":
+                    return ".aac";
+                case "webm":
+                    return ".webm";
+                case "aiff":
+                case "x-aiff":
+                case "aif":
+                    return ".aiff";
+                case "caf":
+                case "x-caf":
+                    return ".caf";
             }
 
-            if (data.Length >= 12 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F'
-                && data[8] == 'W' && data[9] == 'A' && data[10] == 'V' && data[11] == 'E')
+            ReadOnlySpan<byte> d = data;
+            if (d.Length >= 12 && d[..4].SequenceEqual("RIFF"u8) && d.Slice(8, 4).SequenceEqual("WAVE"u8))
                 return ".wav";
-            if (data.Length >= 4 && data[0] == 'O' && data[1] == 'g' && data[2] == 'g' && data[3] == 'S')
-                return ".ogg";
+            if (d.Length >= 4 && d[..4].SequenceEqual("OggS"u8))
+                return IsOggOpus(data) ? ".opus" : ".ogg";
+            if (d.Length >= 4 && d[..4].SequenceEqual("fLaC"u8))
+                return ".flac";
+            if (d.Length >= 12 && d.Slice(4, 4).SequenceEqual("ftyp"u8))
+                return ".m4a";
+            if (d.Length >= 4 && d[0] == 0x1A && d[1] == 0x45 && d[2] == 0xDF && d[3] == 0xA3)
+                return ".webm";
+            if (d.Length >= 12 && d[..4].SequenceEqual("FORM"u8) && (d.Slice(8, 4).SequenceEqual("AIFF"u8) || d.Slice(8, 4).SequenceEqual("AIFC"u8)))
+                return ".aiff";
+            if (d.Length >= 4 && d[..4].SequenceEqual("caff"u8))
+                return ".caf";
+            // ADTS (raw AAC) frames: a 12-bit sync and the layer bits 00 (MPEG audio frames have a non-zero layer).
+            if (d.Length >= 2 && d[0] == 0xFF && (d[1] & 0xF6) == 0xF0)
+                return ".aac";
             return ".mp3";                 // ID3-tagged or bare MPEG frames
         }
+
+        /// <summary>An Ogg stream whose first packet is an Opus header (the managed Ogg reader decodes Vorbis only).</summary>
+        private static bool IsOggOpus(byte[] data)
+            => data.AsSpan(0, Math.Min(data.Length, 128)).IndexOf("OpusHead"u8) >= 0;
 
         /// <summary>
         /// Read a message-level <c>"audios"</c> array of base64 clips (optionally
