@@ -16,7 +16,7 @@ namespace TensorSharp.MLX
     /// MLX's executor plugin: programs run node by node on MLX arrays (lazily, as MLX evaluates), with
     /// MLX's quantized products and fused attention.
     /// </summary>
-    public sealed class MlxGraphExecutor : TensorGraphExecutor
+    public sealed partial class MlxGraphExecutor : TensorGraphExecutor
     {
         [ModuleInitializer]
         internal static void Register()

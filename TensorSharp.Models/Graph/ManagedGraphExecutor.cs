@@ -17,7 +17,7 @@ namespace TensorSharp.Models.Graph
     /// The managed CPU backend's executor plugin: programs run node by node on host tensors, quantized
     /// products through the managed GEMM kernels (the reference every other executor is checked against).
     /// </summary>
-    public sealed class ManagedGraphExecutor : TensorGraphExecutor
+    public sealed partial class ManagedGraphExecutor : TensorGraphExecutor
     {
         [ModuleInitializer]
         internal static unsafe void Register()

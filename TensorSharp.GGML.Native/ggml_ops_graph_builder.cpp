@@ -117,6 +117,8 @@ namespace
         OP_LIGHTNING_INDEXER = 55, // srcs: q [d, heads, T], k [d, 1, n_kv], weights [heads, T], mask [n_kv, T] (F16)
         OP_TOP_K_MASK = 56,     // srcs: mask [n_kv, T], top_k [n_top, T], then (ip[0..2] flags) score, blocks, extra
         OP_ALLREDUCE = 57,      // srcs: a tensor-parallel partial; summed in place across the ranks (TSGgml_GraphRunRanked)
+        OP_DEPTHWISE_CONV_2D = 70, // srcs: x [C, W, H, N] (channels innermost), kernel [KW, KH, 1, C]; ip: s0, s1, p0, p1, d0, d1
+        OP_GELU_ERF = 71,       // 0.5 x (1 + erf(x / sqrt 2))
     };
 
     struct Leaf
@@ -610,6 +612,36 @@ namespace
         return ggml_add(ctx, summed, ggml_cast(ctx, mask, GGML_TYPE_F32));
     }
 
+    // A depthwise 2-D convolution of rows of channels x [C, W, H, N] (the IR's token layout) with ggml's depthwise kernel
+    // [KW, KH, 1, C]: ggml_conv_2d_dw_direct on x viewed channels-innermost (CWHN: a permute, no copy) with the kernel laid
+    // out channels-innermost too (a copy of KW * KH * C values, which ggml-cpu's and ggml-cuda's CWHN kernels index that
+    // way), whose result comes back CWHN and, permuted to [C, OW, OH, N], is contiguous. A shape ggml's CWHN kernels do not
+    // take (one channel, or one column: not "contiguous channels") runs the same convolution WHCN, through two copies.
+    ggml_tensor* depthwise_conv_2d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* k, int s0, int s1, int p0, int p1, int d0, int d1)
+    {
+        const std::int64_t C = x->ne[0], KW = k->ne[0], KH = k->ne[1];
+        if (ggml_nelements(k) != KW * KH * C)
+            throw std::runtime_error("graph builder: a depthwise conv kernel holds KW x KH values a channel");
+        if (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16)
+            throw std::runtime_error("graph builder: a depthwise conv kernel is F32 or F16");
+        if (x->type != GGML_TYPE_F32) throw std::runtime_error("graph builder: a depthwise conv reads F32 rows");
+        if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+        if (!ggml_is_contiguous(k)) k = ggml_cont(ctx, k);
+        ggml_tensor* xw = ggml_permute(ctx, x, 2, 0, 1, 3);                     // [W, H, C, N], channels innermost
+        ggml_tensor* k4 = ggml_reshape_4d(ctx, k, KW, KH, 1, C);
+        if (ggml_is_contiguous_channels(xw))
+        {
+            ggml_tensor* kc = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, k4, KW * KH, C)));   // [C, KW * KH]
+            const std::size_t es = ggml_element_size(kc);
+            // [KW, KH, 1, C] over that memory: ne2's stride (one element) is what makes it "CWHN" to ggml-cpu's check.
+            ggml_tensor* kv = ggml_view_4d(ctx, kc, C, KW, KH, 1, C * es, C * KW * es, es, 0);
+            ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, ggml_permute(ctx, kv, 3, 0, 1, 2), xw, s0, s1, p0, p1, d0, d1);
+            return ggml_permute(ctx, r, 1, 2, 0, 3);                            // [C, OW, OH, N], contiguous
+        }
+        ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, k4, ggml_cont(ctx, xw), s0, s1, p0, p1, d0, d1);
+        return ggml_cont(ctx, ggml_permute(ctx, r, 1, 2, 0, 3));
+    }
+
     ggml_tensor* build_op(TsgGraph* g, int op, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
     {
         ggml_context* ctx = g->ctx;
@@ -781,6 +813,12 @@ namespace
         case OP_ARGMAX: need(1); return ggml_argmax(ctx, src(0));
         case OP_SWIGLU: need(1); return ggml_swiglu(ctx, src(0));
         case OP_GEGLU: need(1); return ggml_geglu(ctx, src(0));
+        case OP_GELU_ERF: need(1); return ggml_gelu_erf(ctx, src(0));
+        case OP_DEPTHWISE_CONV_2D:
+            need(2);
+            return depthwise_conv_2d(ctx, src(0), src(1), static_cast<int>(ipar(0, 1)), static_cast<int>(ipar(1, 1)),
+                                     static_cast<int>(ipar(2, 0)), static_cast<int>(ipar(3, 0)), static_cast<int>(ipar(4, 1)),
+                                     static_cast<int>(ipar(5, 1)));
         case OP_KV_WINDOW:
         {
             need(1);

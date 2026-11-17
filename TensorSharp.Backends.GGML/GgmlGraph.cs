@@ -35,6 +35,10 @@ namespace TensorSharp.GGML
         MoeHostExperts = 54, LightningIndexer = 55, TopKMask = 56,
         /// <summary>A tensor-parallel partial, summed in place across the ranks of <see cref="GgmlGraph.RunRanked"/>.</summary>
         AllReduce = 57,
+        /// <summary>A depthwise 2-D convolution of rows of channels (GraphOp.DepthwiseConv2d).</summary>
+        DepthwiseConv2d = 70,
+        /// <summary>The exact GELU, 0.5 x (1 + erf(x / sqrt 2)) (ggml_gelu_erf).</summary>
+        GeluErf = 71,
     }
 
     /// <summary>ggml tensor types used by graph leaves (ggml.h's enum ggml_type).</summary>
