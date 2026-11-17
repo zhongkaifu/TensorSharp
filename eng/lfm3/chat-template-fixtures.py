@@ -23,6 +23,9 @@ off, the templates' defaults differ: 1.7B on, Omni off) and preserve_reasoning=f
 turns the template's preserve_thinking ON by default (--reasoning-preserve), while HF, vLLM, SGLang
 and TensorSharp render the template default (off), which strips earlier turns' reasoning.
 
+`expected_tokens` is llama.cpp's tokenization of `expected` (its /tokenize, special tokens parsed):
+the gated Lfm3ChatProtocolTests case compares TensorSharp's tokenizer with it.
+
 Media parts: llama-server replaces each image_url / input_audio part with its media marker and
 mtmd later wraps the encoder rows in <|vision_start|> ... <|vision_end|>. The fixture stores the raw
 llama prompt and an `expected` in which every marker is replaced by the template's own placeholder
@@ -181,6 +184,15 @@ def render(base, request):
         return json.loads(resp.read())["prompt"]
 
 
+def tokenize(base, text):
+    """llama.cpp's token ids for a rendered prompt: special tokens parsed, BOS taken from the text."""
+    data = json.dumps({"content": text, "add_special": False, "parse_special": True}).encode()
+    req = urllib.request.Request(base.rstrip("/") + "/tokenize", data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read())["tokens"]
+
+
 def run(base, cases, template):
     out = []
     for c in cases:
@@ -194,7 +206,8 @@ def run(base, cases, template):
         if MEDIA_MARKER in expected:
             sys.exit(f"{template}/{c['name']}: unmatched media marker")
         out.append({"template": template, "name": c["name"], "request": c["request"],
-                    "llama_prompt": prompt, "expected": expected})
+                    "llama_prompt": prompt, "expected": expected,
+                    "expected_tokens": tokenize(base, expected)})
     return out
 
 
@@ -248,9 +261,16 @@ def main():
                    "omni": "LiquidAI/LFM3-Omni-2B-GGUF@d508b88f08a5b4286f2d2805a6a8d69a0ff44c72 (tokenizer.chat_template)"},
         "cases": run(args.text, text_cases(), "text") + run(args.omni, omni_cases(), "omni"),
     }
+    # One line per token list, so the fixture stays reviewable.
+    token_lists = []
+    for case in fixture["cases"]:
+        token_lists.append(case["expected_tokens"])
+        case["expected_tokens"] = f"@@TOKENS{len(token_lists) - 1}@@"
+    text = json.dumps(fixture, ensure_ascii=False, indent=1)
+    for i, tokens in enumerate(token_lists):
+        text = text.replace(f'"@@TOKENS{i}@@"', json.dumps(tokens, separators=(",", ":")))
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(fixture, f, ensure_ascii=False, indent=1)
-        f.write("\n")
+        f.write(text + "\n")
     print(f"wrote {len(fixture['cases'])} cases to {args.out}")
 
 

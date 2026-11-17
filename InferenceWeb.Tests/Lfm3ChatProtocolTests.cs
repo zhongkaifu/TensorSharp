@@ -24,7 +24,8 @@ public class Lfm3ChatProtocolTests : IDisposable
     private const string Arch = "lfm3";
     private const string Bos = "<|startoftext|>";
 
-    internal sealed record ReferenceCase(string Template, string Name, JsonElement Request, string Expected);
+    internal sealed record ReferenceCase(string Template, string Name, JsonElement Request, string Expected,
+        IReadOnlyList<int> ExpectedTokens);
 
     private static readonly Lazy<IReadOnlyList<ReferenceCase>> Cases = new(LoadCases);
     private static readonly Lazy<string> TextTemplate = new(() => ReadResource("text_chat_template.jinja"));
@@ -52,7 +53,8 @@ public class Lfm3ChatProtocolTests : IDisposable
             c.GetProperty("template").GetString()!,
             c.GetProperty("name").GetString()!,
             c.GetProperty("request").Clone(),
-            c.GetProperty("expected").GetString()!)).ToList();
+            c.GetProperty("expected").GetString()!,
+            c.GetProperty("expected_tokens").EnumerateArray().Select(t => t.GetInt32()).ToList())).ToList();
     }
 
     public static IEnumerable<object[]> CaseIds()
@@ -95,6 +97,36 @@ public class Lfm3ChatProtocolTests : IDisposable
         var (messages, tools, think, addGenerationPrompt) = Parse(c.Request);
         string rendered = ChatTemplate.RenderLfm3(messages, addGenerationPrompt, tools, think);
         Assert.Equal(c.Expected, Bos + rendered);
+    }
+
+    private const string ModelEnv = "TS_TEST_LFM3_MODEL";
+    private static readonly Dictionary<string, ITokenizer> Tokenizers = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The real vocabulary turns every reference prompt into llama.cpp's own ids (the fixture's
+    /// <c>expected_tokens</c>, from llama-server's /tokenize): the BOS the tokenizer adds,
+    /// each think / tool / media marker as one token, and the "lfm2" pre-tokenizer's
+    /// digit grouping. <c>TS_TEST_LFM3_MODEL</c> names a directory holding LFM3-1.7B and
+    /// LFM3-Omni-2B GGUFs; a template whose GGUF is missing fails rather than passing unseen.
+    /// </summary>
+    [ModelTheory(ModelEnv, "lfm3-1.7b|lfm3-omni")]
+    [MemberData(nameof(CaseIds))]
+    public void TheVocabulary_EncodesEachReferencePromptToLlamaCppsIds(string template, string name)
+    {
+        string pattern = template == "omni" ? "lfm3-omni" : "lfm3-1.7b";
+        string? path = TestGates.FindSmallestGguf(Environment.GetEnvironmentVariable(ModelEnv)!, pattern);
+        Assert.True(path != null, $"{ModelEnv} holds no *{pattern}* GGUF for the {template} template's cases.");
+        ITokenizer tokenizer;
+        lock (Tokenizers)
+        {
+            if (!Tokenizers.TryGetValue(path!, out tokenizer!))
+            {
+                using var gguf = new GgufFile(path!);
+                Tokenizers[path!] = tokenizer = ModelBase.CreateTokenizerFromGguf(gguf);
+            }
+        }
+        ReferenceCase c = Find(template, name);
+        Assert.Equal(c.ExpectedTokens, tokenizer.Encode(c.Expected.Substring(Bos.Length), addSpecial: true));
     }
 
     [Fact]
