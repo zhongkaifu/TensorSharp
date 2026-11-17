@@ -22,5 +22,8 @@ in the ignored `artifacts/lfm3/`.
   - `bench MODEL BACKEND [PP,...] [TG] [DEPTH,...]` measures prefill and decode tokens/s as llama-bench's pp / tg /
     tg@d do, with the decode steps' graph counters (runs, advances in place, builds).
 
+- `omni-in/`: LFM3-Omni image, video and audio input end to end against llama-server (media set, request
+  comparison, cold and concurrent TTFT, the three chat surfaces, a layout / encode probe); see its README.
+
 MLX runs need `TENSORSHARP_MLX_LIBRARY_DIR` pointing at a directory holding `libmlxc` (for example the test project's
 output).
