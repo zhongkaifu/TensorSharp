@@ -232,7 +232,7 @@ public sealed partial class OpenAIChatAdapter
             await updates.DisposeAsync().ConfigureAwait(false);
         }
         if (rate == 0) rate = terminal.AudioSampleRate > 0 ? terminal.AudioSampleRate : 24000;
-        SpeechReplyStore.Entry entry = SpeechReplies.Add(transcript.ToString(), terminal.SpeechFrames, audioId);
+        SpeechReplyStore.Entry entry = SpeechReplies.Add(transcript.ToString(), terminal.SpeechFrames, audioId, terminal.SpokenTurn);
         long expiresAt = entry.ExpiresAt.ToUnixTimeSeconds();
         string finish = FinishReasonMapper.ToOpenAIChat(terminal.FinishReason, false);
         logger.LogInformation(LogEventIds.ChatCompleted,

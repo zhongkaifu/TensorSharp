@@ -181,6 +181,25 @@ namespace TensorSharp.Models.Audio
             lock (_audioGate) _frames.Add((int[])codes.Clone());
         }
 
+        private readonly List<int[]> _fed = new();
+
+        /// <summary>The codes of every frame whose row the reply decoded into its sequence (one array a frame, in order; an
+        /// end-of-speech frame that handed back to text included), one per <see cref="FrameToken"/> of its output: what a
+        /// later turn re-renders the reply's speech from (<c>ChatMessage.SpeechFrames</c>).</summary>
+        public IReadOnlyList<int[]> FedFrameCodes
+        {
+            get
+            {
+                lock (_audioGate) return _fed.ToArray();
+            }
+        }
+
+        /// <summary>Record the codes of a frame whose row is decoded into the sequence.</summary>
+        protected void RecordFedFrame(int[] codes)
+        {
+            lock (_audioGate) _fed.Add((int[])codes.Clone());
+        }
+
         public abstract void Dispose();
     }
 }

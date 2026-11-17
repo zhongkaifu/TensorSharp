@@ -45,11 +45,13 @@ public sealed class Lfm3ThinkingOffReasoningTests
     }
 
     private static (string Content, string Thinking, List<ToolCall> Calls, int Retractions) Drive(
-        string reply, int chunk, bool retract, string? suffix = Closed, List<ToolFunction>? tools = null)
+        string reply, int chunk, bool retract, string? suffix = Closed, List<ToolFunction>? tools = null,
+        bool appendOnlyStream = false, List<string>? contentPieces = null, string arch = Arch)
     {
-        IOutputParser parser = ChatProtocolRegistry.For(Arch)!.CreateOutputParser!();
+        IOutputParser parser = ChatProtocolRegistry.For(arch)!.CreateOutputParser!();
         parser.Init(false, tools ?? Tools);
         if (retract) parser.AcceptRetractions();
+        if (appendOnlyStream) parser.StreamWithoutHolding();
         parser.SetGenerationPromptSuffix(suffix);
         var content = new StringBuilder();
         var thinking = new StringBuilder();
@@ -64,6 +66,7 @@ public sealed class Lfm3ThinkingOffReasoningTests
                 retractions++;
             }
             content.Append(p.Content);
+            contentPieces?.Add(p.Content ?? "");
             thinking.Append(p.Thinking);
             if (p.ToolCalls != null) calls.AddRange(p.ToolCalls);
         }
@@ -109,6 +112,64 @@ public sealed class Lfm3ThinkingOffReasoningTests
             Assert.Empty(held.Thinking);
             Assert.Equal(0, shown.Retractions);
         }
+    }
+
+    /// <summary>
+    /// An append-only stream (the OpenAI, Ollama and Responses streams, the CLI) is not held while a thinking-off reply is
+    /// undecided: it gets the reply as content as it is generated, a stray close and all, as llama.cpp, vLLM and SGLang
+    /// stream it; the first piece arrives with the first characters, where it used to wait for the close, the end of the
+    /// reply or 4,096 characters. A whole reply and a retracting stream still keep the reasoning apart.
+    /// </summary>
+    [Theory]
+    [InlineData(CountriesReply)]
+    [InlineData(SpiderReply)]
+    [InlineData(PlainReply)]
+    public void AnAppendOnlyStreamGetsTheReplyAsItIsGenerated(string reply)
+    {
+        foreach (int chunk in new[] { 1, 3, 7 })
+        {
+            var pieces = new List<string>();
+            var streamed = Drive(reply, chunk, retract: false, appendOnlyStream: true, contentPieces: pieces);
+            Assert.Equal(reply, streamed.Content);
+            Assert.Empty(streamed.Thinking);
+            Assert.Equal(0, streamed.Retractions);
+            // Nothing is held past a possible partial tag: the first piece's text is out after at most "</think>".Length characters.
+            int firstShown = pieces.FindIndex(p => p.Length > 0);
+            Assert.InRange(firstShown * chunk, 0, "</think>".Length);
+
+            // The same reply whole, and to a stream that can take text back: the reasoning is told apart as before.
+            var retracting = Drive(reply, chunk, retract: true, appendOnlyStream: true);
+            var whole = Drive(reply, 0, retract: false, appendOnlyStream: false);
+            Assert.Equal(whole.Content, retracting.Content);
+            Assert.Equal(whole.Thinking, retracting.Thinking);
+        }
+    }
+
+    /// <summary>A reply that opens a block of its own is reasoning from its first token, so an append-only stream gets it
+    /// as reasoning at once (nothing to hold), and a call is a call.</summary>
+    [Fact]
+    public void AnAppendOnlyStreamStillSeparatesABlockTheModelOpens_AndParsesCalls()
+    {
+        var gold = Drive(GoldReply, 3, retract: false, appendOnlyStream: true);
+        Assert.Equal("Au", gold.Content.Trim());
+        Assert.StartsWith("We need to answer the question.", gold.Thinking);
+        const string call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        var run = Drive("Checking.\n" + call, 5, retract: false, appendOnlyStream: true);
+        Assert.Equal("Paris", Assert.Single(run.Calls).Arguments["city"]);
+        Assert.Equal("Checking.", run.Content.Trim());
+    }
+
+    /// <summary>Nemotron-H keeps holding append-only streams (its policy is its own; ChatProtocolRegistry).</summary>
+    [Fact]
+    public void NemotronHStillHoldsAnAppendOnlyStream()
+    {
+        const string reply = "Reasoning about it.</think>The answer.";
+        var pieces = new List<string>();
+        var run = Drive(reply, 4, retract: false, suffix: "<think></think>", appendOnlyStream: true, contentPieces: pieces,
+            arch: "nemotron_h");
+        Assert.Equal("The answer.", run.Content.Trim());
+        Assert.Equal("Reasoning about it.", run.Thinking.Trim());
+        Assert.DoesNotContain(pieces.Take(4), p => p.Length > 0);
     }
 
     [Fact]

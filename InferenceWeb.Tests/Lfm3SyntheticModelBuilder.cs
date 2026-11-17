@@ -35,6 +35,9 @@ internal sealed class Lfm3SyntheticModelBuilder
     public bool UntiedOutput { get; init; }
     /// <summary>Rotated pairs of the full layers (rope_freqs ones; the rest 1e30).</summary>
     public int RotatedPairs { get; init; } = HeadDim / 4;
+    /// <summary>The end-of-sequence token id (the weights do not depend on it: a test can make a token the greedy stream
+    /// draws the EOS).</summary>
+    public uint Eos { get; init; } = 2;
 
     public int Layers => Layout.Length;
     public bool IsConv(int l) => Layout[l] == 'c';
@@ -111,7 +114,7 @@ internal sealed class Lfm3SyntheticModelBuilder
             new U32 { Key = $"{a}.shortconv.l_cache", V = ConvTaps },
             new F32 { Key = $"{a}.attention.layer_norm_rms_epsilon", V = Eps },
         };
-        AddByteTokenizer(kv, Vocab, bos: 1, eos: 2);
+        AddByteTokenizer(kv, Vocab, bos: 1, eos: Eos);
 
         var tensors = new List<Tensor>();
         foreach (Tensor x in Tensors())

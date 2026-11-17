@@ -78,7 +78,7 @@ public sealed partial class EmbeddingAdapter
         {
             throw Invalid("Media payload must contain valid base64 data.", "input");
         }
-        catch (InvalidDataException ex)
+        catch (Exception ex) when (ex is InvalidDataException or TensorSharp.Models.Media.MediaInputException)
         {
             throw Invalid(ex.Message, "input");
         }

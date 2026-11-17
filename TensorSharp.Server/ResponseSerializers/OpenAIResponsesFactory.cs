@@ -53,7 +53,7 @@ internal static class OpenAIResponsesFactory
         status = "completed",
         call_id = callId,
         name = toolCall.Name,
-        arguments = JsonSerializer.Serialize(toolCall.Arguments),
+        arguments = ToolCallArgumentsJson.Serialize(toolCall.Arguments),
     };
 
     // ---- Non-streaming / final response object ----------------------------
@@ -71,7 +71,8 @@ internal static class OpenAIResponsesFactory
         int evalTokens,
         int kvCacheReusedTokens,
         string? errorMessage = null,
-        string? incompleteReason = null) => new
+        string? incompleteReason = null,
+        int reasoningTokens = 0) => new
         {
             id = responseId,
             @object = "response",
@@ -95,7 +96,7 @@ internal static class OpenAIResponsesFactory
             // An "incomplete" response still generated (and billed) tokens — in fact
             // its usage is the whole point, since output_tokens is what proves the
             // budget was the thing that stopped it. Only a failed response has none.
-            usage = status != "failed" ? BuildUsage(promptTokens, evalTokens, kvCacheReusedTokens) : null,
+            usage = status != "failed" ? BuildUsage(promptTokens, evalTokens, kvCacheReusedTokens, reasoningTokens) : null,
             metadata = new Dictionary<string, string>(),
         };
 
@@ -191,12 +192,14 @@ internal static class OpenAIResponsesFactory
 
     private static long UnixNow() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-    private static object BuildUsage(int promptTokens, int evalTokens, int kvCacheReusedTokens) => new
+    // reasoning_tokens: the generated tokens that were reasoning (ChatStreamUpdate.ReasoningTokens), counted with the
+    // output tokens as OpenAI counts them; the response carries no reasoning item.
+    private static object BuildUsage(int promptTokens, int evalTokens, int kvCacheReusedTokens, int reasoningTokens) => new
     {
         input_tokens = promptTokens,
         output_tokens = evalTokens,
         total_tokens = promptTokens + evalTokens,
         input_tokens_details = new { cached_tokens = kvCacheReusedTokens },
-        output_tokens_details = new { reasoning_tokens = 0 },
+        output_tokens_details = new { reasoning_tokens = Math.Min(Math.Max(reasoningTokens, 0), evalTokens) },
     };
 }

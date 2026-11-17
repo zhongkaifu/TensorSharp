@@ -176,7 +176,9 @@ public static class ApiExceptionMiddleware
 
     private static async Task WriteErrorAsync(HttpContext context, Exception ex)
     {
-        bool malformed = IsMalformedRequest(ex);
+        // Media the request carried that no decoder could read: the caller's input, and its message names the attachment
+        // (by file name only), so it is returned as the 400's reason.
+        bool malformed = IsMalformedRequest(ex) || ex is TensorSharp.Models.Media.MediaInputException;
 
         // Response.Clear() drops headers as well as the body, and the
         // correlation id RequestLoggingMiddleware promises on every response
@@ -195,7 +197,9 @@ public static class ApiExceptionMiddleware
         // target element has type 'Number'"), so it is safe and useful to
         // return. Anything else is a server fault whose detail stays in the
         // log, where RequestLoggingMiddleware has already written it.
-        string message = malformed
+        string message = ex is TensorSharp.Models.Media.MediaInputException
+            ? ex.Message
+            : malformed
             ? $"Could not read the request body: {ex.Message}"
             : "The server failed to handle the request.";
 

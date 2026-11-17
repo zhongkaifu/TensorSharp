@@ -593,6 +593,7 @@ namespace TensorSharp.Server
                 RawOutputTokens = msg.RawOutputTokens,
                 RawPromptTrailingWhitespace = msg.RawPromptTrailingWhitespace,
                 RawGenerationSuffix = msg.RawGenerationSuffix,
+                SpeechFrames = msg.SpeechFrames,
                 CacheControl = msg.CacheControl,
                 ContentCacheBreakpoints = msg.ContentCacheBreakpoints != null
                     ? new List<int>(msg.ContentCacheBreakpoints)
@@ -622,6 +623,7 @@ namespace TensorSharp.Server
                 RawOutputTokens = src.RawOutputTokens,
                 RawPromptTrailingWhitespace = src.RawPromptTrailingWhitespace,
                 RawGenerationSuffix = src.RawGenerationSuffix,
+                SpeechFrames = src.SpeechFrames,
                 CacheControl = src.CacheControl != null
                     ? new CacheControlMarker { Type = src.CacheControl.Type }
                     : null,

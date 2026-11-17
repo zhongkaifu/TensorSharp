@@ -287,7 +287,7 @@ public sealed class Lfm3AudioFrontEndTests
             }
             string silentVideo = Path.Combine(dir, "silent.mp4");
             Run(ffmpeg, "-f", "lavfi", "-i", "color=c=gray:s=64x64:r=4:d=1", "-c:v", "mpeg4", silentVideo);
-            var ex = Assert.Throws<InvalidDataException>(() => Lfm3AudioPreprocessor.LoadAudio(silentVideo));
+            var ex = Assert.Throws<MediaInputException>(() => Lfm3AudioPreprocessor.LoadAudio(silentVideo));
             Assert.Contains("no audio stream", ex.Message);
         }
         finally

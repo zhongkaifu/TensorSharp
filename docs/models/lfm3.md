@@ -151,15 +151,21 @@ GGUF). `RenderLfm3` reproduces the same text for a GGUF without a template.
   a `<think>` of its own) and closes the block itself before it answers (52 of 200
   greedy GSM8K replies and 5 of 33 instruction prompts on the Q4_K_M; llama.cpp's
   replies are the same tokens). The model card warns that thinking off "can be
-  inconsistent". TensorSharp parses such a reply as it does Nemotron-H
-  Reasoning-128K's: a `</think>` within 4,096 characters makes the text before it
-  reasoning, returned as `reasoning_content` (OpenAI) or `thinking` (Ollama, Web UI),
-  streamed or not, and a block the model opens itself is capped like Gemma 4's
-  unrequested channel (closed at a line break, after at most 64 tokens). llama.cpp,
-  vLLM and SGLang return such a reply whole, `</think>` included, as the answer. The
-  price: a stream that cannot take text back (OpenAI, Ollama, Responses, CLI) shows a
-  thinking-off answer once 4,096 characters are generated or the reply ends, whichever
-  comes first; the Web UI shows it at once and takes the reasoning back.
+  inconsistent". How TensorSharp returns such a reply depends on whether the client
+  can take text back:
+  - A non-streaming reply (OpenAI, Ollama, Responses) and a stream that can take text
+    back (the Web UI, TensorAgent): a `</think>` within 4,096 characters makes the text
+    before it reasoning, returned as `reasoning_content` (OpenAI) or `thinking` (Ollama,
+    Web UI); the Web UI shows the text at once and takes the reasoning back when the
+    close arrives.
+  - A stream that cannot take text back (the OpenAI, Ollama and Responses streams, the
+    CLI's interactive mode): the reply streams as content as it is generated, a
+    `</think>` and the text around it included, as llama.cpp, vLLM and SGLang return it.
+    Nothing is held, so a short answer arrives token by token; such a stream and the
+    non-streaming reply to the same request can therefore differ in where the reasoning
+    is. A reply that opens with a `<think>` of its own streams that block as reasoning.
+  A block the model opens itself is capped like Gemma 4's unrequested channel (closed at
+  a line break, after at most 64 tokens).
 - LFM3-Omni does not reason: with thinking on it closes the block at once.
 
 ### Tool calls
@@ -342,9 +348,17 @@ greedy pick is not used for LFM3-Omni's text replies.)
   3-5x faster for both). Audio-only steps skip the LM head (-15% of the step). MLX runs at about
   half Metal's speed (its fixed cost per graph run).
 
-Limits: no `/v1/realtime`; a spoken assistant turn in later history renders as its
-transcript (OpenAI's `audio.id` maps to it for an hour), not as its audio frames; speech
-requests are not retained in the prefix cache; speech and CUDA are untested on NVIDIA GPUs.
+History: a spoken assistant turn sent back in a later request (OpenAI's
+`{"role":"assistant","audio":{"id":...}}`, kept for an hour) is spliced back as generation decoded
+it: the token that opened the mode, the text tokens and one `<|audio_out|>` per decoded frame, each
+given that frame's codebook-sum row (the end-of-speech frame included), as HF's processor gives a
+past speech turn's placeholders. Its prompt tokens are therefore the reply's own sequence (checked
+token for token against generation on LFM3-Omni Q8_0). Each run of frames is one media span keyed
+by its codes. An id whose generation is not known renders as its transcript.
+
+Limits: no `/v1/realtime`; speech requests are not retained in the prefix cache, and a later turn
+does not yet reuse the cache across a spliced spoken turn (open issue); speech and CUDA are untested
+on NVIDIA GPUs.
 
 ## Benchmarking
 
@@ -355,8 +369,8 @@ sampling on every engine.
 
 ## Current limits
 
-- Speech output has no realtime endpoint (`/v1/realtime`), and past spoken turns re-render
-  as their transcripts (see [Speech output](#speech-output)).
+- Speech output has no realtime endpoint (`/v1/realtime`), and a later turn does not yet reuse
+  the prefix cache across a past spoken turn (see [Speech output](#speech-output)).
 - Media input and speech output on CUDA (direct and ggml-cuda) and Vulkan have not run (no device).
 - Speech input as a live stream (a realtime endpoint) is not served; clips are encoded
   whole (30 s chunks).

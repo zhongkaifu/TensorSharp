@@ -89,6 +89,7 @@ public partial class ModelService
                 Append(parser.Add(string.Empty, true));
                 Interlocked.Add(ref promptTokens, terminal.PromptTokens);
                 Interlocked.Add(ref evalTokens, terminal.EvalTokens);
+                plan.AddReasoningTokens(terminal.ReasoningTokens);
                 Interlocked.Add(ref reusedTokens, terminal.KvCacheReusedTokens);
                 Interlocked.Add(ref promptNs, terminal.PromptNs);
                 Interlocked.Add(ref evalNs, terminal.EvalNs);

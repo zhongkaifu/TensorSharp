@@ -836,6 +836,7 @@ namespace TensorSharp.Runtime
                     RawOutputTokens = msg.RawOutputTokens,
                     RawPromptTrailingWhitespace = msg.RawPromptTrailingWhitespace,
                     RawGenerationSuffix = msg.RawGenerationSuffix,
+                    SpeechFrames = msg.SpeechFrames,
                     RawToolCallReplayPlaceholder = rawToolCallReplayPlaceholder,
                 });
             }

@@ -344,11 +344,13 @@ namespace TensorSharp.Server
         }
 
         /// <summary>Where the client-visible history ends: the first message carrying raw
-        /// tokens starts the in-process tool loop's own rounds, which no client sent.</summary>
+        /// tokens starts the in-process tool loop's own rounds, which no client sent. A spoken
+        /// reply the client sent back by its audio id carries the raw tokens it is spliced from
+        /// (<see cref="ChatMessage.SpeechFrames"/>) and is the client's own turn.</summary>
         private static int VisibleEnd(IReadOnlyList<ChatMessage> history)
         {
             for (int i = 0; i < history.Count; i++)
-                if (history[i].RawOutputTokens is { Count: > 0 })
+                if (history[i].RawOutputTokens is { Count: > 0 } && history[i].SpeechFrames is not { Count: > 0 })
                     return i;
             return history.Count;
         }
@@ -581,6 +583,8 @@ namespace TensorSharp.Server
             RawOutputTokens = recorded.RawOutputTokens,
             RawPromptTrailingWhitespace = recorded.RawPromptTrailingWhitespace,
             RawGenerationSuffix = recorded.RawGenerationSuffix,
+            // The frames go with the raw tokens they fill.
+            SpeechFrames = recorded.SpeechFrames,
             CacheControl = src.CacheControl,
             ContentCacheBreakpoints = src.ContentCacheBreakpoints,
         };
@@ -664,6 +668,7 @@ namespace TensorSharp.Server
             copy.RawOutputTokens = src.RawOutputTokens;
             copy.RawPromptTrailingWhitespace = src.RawPromptTrailingWhitespace;
             copy.RawGenerationSuffix = src.RawGenerationSuffix;
+            copy.SpeechFrames = src.SpeechFrames;
             copy.CacheControl = src.CacheControl != null
                 ? new CacheControlMarker { Type = src.CacheControl.Type }
                 : null;

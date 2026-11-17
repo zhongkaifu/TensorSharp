@@ -184,9 +184,11 @@ public sealed partial class OpenAIChatAdapter
         List<ChatMessage> messages;
         try
         {
-            // An assistant turn may be an earlier spoken reply sent back by its audio id: its transcript renders it.
+            // An assistant turn may be an earlier spoken reply sent back by its audio id: it is spliced back as generation
+            // decoded it (its tokens, its frames' rows), or rendered as its transcript where that is not known.
             messages = ChatMessageParser.ParseOpenAI(messagesEl, _uploads, openaiLogger, _svc.Architecture,
-                _svc.IsAudioEncoderLoaded, SpeechReplies.TranscriptOf);
+                _svc.IsAudioEncoderLoaded, SpeechReplies.TranscriptOf,
+                id => SpeechReplies.TryGet(id, out var e) ? e.Turn : null);
         }
         catch (UploadLimitExceededException ex)
         {
@@ -338,6 +340,8 @@ public sealed partial class OpenAIChatAdapter
             workspace: workspaceLease?.Workspace, logger: openaiLogger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does.
+        if (skillPlan != null) skillPlan.ClientStreamsAppendOnly = stream;
 
         knowledge.Plan = skillPlan;
 
@@ -711,6 +715,8 @@ public sealed partial class OpenAIChatAdapter
         {
             parser = OutputParserFactory.Create(_svc.Architecture);
             parser.Init(openaiThink, openaiTools);
+            // Deltas cannot be taken back: a family that streams a possibly-reasoning reply as generated does so here.
+            parser.StreamWithoutHolding();
         }
 
         // json_object streams incrementally: strip code fences / leading prose /
