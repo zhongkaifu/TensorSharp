@@ -58,6 +58,17 @@ namespace TensorSharp.Models
         /// live set and measured slower on some families; a family opts in where it measures faster.</summary>
         protected virtual bool GraphConcurrencyReorder => false;
 
+        /// <summary>
+        /// Whether a step that reads only each sequence's last row (its logits or its final hidden row) runs the last layer's
+        /// feed-forward on those rows alone, as llama.cpp's graphs do: the stream leaving the last layer's mixer is cut to the
+        /// sequences' last rows, and the other rows' feed-forward (dead work: nothing reads it) is not computed. The rows kept
+        /// take products of fewer rows (a matrix-vector kernel where the step had a matrix-matrix one), so their logits round
+        /// differently from the unpruned step's: off by default, a family opts in where it measures faster and its parity
+        /// holds. A MoE last layer, a step reading every row's logits or the final rows, captures past the stack, draft follows
+        /// and the drafter's rings never prune (<see cref="PrunesLastLayer"/>).
+        /// </summary>
+        protected virtual bool PrunesLastLayerRows => false;
+
         /// <summary>A reason the current configuration cannot run whole-forward graphs, or null.</summary>
         private string GraphUnsupportedReason()
         {
@@ -1471,6 +1482,8 @@ namespace TensorSharp.Models
                 taps = new int[targets.Length];
                 Array.Fill(taps, -1);
             }
+            bool prune = head && PrunesLastLayer(step, request, from, to);
+            if (prune) LastLayerPrunedSteps++;
             for (int layer = from; layer < to; layer++)
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
@@ -1482,6 +1495,8 @@ namespace TensorSharp.Models
                 int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
                 int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
                 h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
+                // The last layer's feed-forward over the rows the head reads only (PrunesLastLayerRows).
+                if (prune && layer == Config.NumLayers - 1) h = EmitLastRows(step, h, width);
                 int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
                 int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
                 h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
@@ -1496,8 +1511,37 @@ namespace TensorSharp.Models
             // A target past the stack taps the stream leaving it.
             if (TapDFlashFollow(step, h, Config.NumLayers, targets, taps))
                 EmitDFlashFollow(step, taps, dflash);
-            EmitHead(step, h, request, ref outputs, embedded);
+            EmitHead(step, h, request, ref outputs, embedded, lastRowsOnly: prune);
             return outputs;
+        }
+
+        /// <summary>Whether this step runs its last layer's feed-forward on each sequence's last row only
+        /// (<see cref="PrunesLastLayerRows"/>): the family opts in, the step holds the last layer and more rows than sequences, the
+        /// layer's feed-forward is dense, and the head reads nothing but those rows.</summary>
+        private bool PrunesLastLayer(GraphStep step, GraphRequest request, int from, int to)
+        {
+            int last = Config.NumLayers - 1;
+            return PrunesLastLayerRows && !LastLayerPruningDisabledForTests && from <= last && to == Config.NumLayers && step.Rows > step.Sequences && !_moeLayer[last]
+                && (request.LastRowLogits || request.LastRowHidden) && !request.AllRowLogits && !request.CaptureFinal
+                && request.FollowDraft == DraftFollow.None && request.FollowDFlash == null
+                && !Array.Exists(request.CaptureLayers, c => c >= Config.NumLayers);
+        }
+
+        /// <summary>Tests: every step runs its last layer over every row (<see cref="PrunesLastLayerRows"/> off).</summary>
+        internal bool LastLayerPruningDisabledForTests { get; set; }
+
+        /// <summary>Steps traced with their last layer's feed-forward over the sequences' last rows only (tests).</summary>
+        internal int LastLayerPrunedSteps { get; private set; }
+
+        /// <summary>Each sequence's last row of the stream <paramref name="x"/> [<paramref name="width"/>, rows], in sequence
+        /// order: [width, sequences].</summary>
+        private static int EmitLastRows(GraphStep step, int x, int width)
+        {
+            int n = step.Sequences, rows = step.Rows;
+            if (n == 1) return step.View2(x, width, 1, width * 4L, (rows - 1) * (long)width * 4);
+            var last = new int[n];
+            for (int s = 0; s < n; s++) last[s] = step.First[s] + step.Counts[s] - 1;
+            return step.Op(GraphOp.GetRows, x, step.ConstantInputI32(last, n));
         }
 
         /// <summary>Tap the stream <paramref name="h"/> entering <paramref name="layer"/> (the stack's end at NumLayers) for
@@ -1526,8 +1570,9 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The head over the stream <paramref name="h"/> leaving the last layer: the captures past it, the final
-        /// rows and the logits the request asks for.</summary>
-        private void EmitHead(GraphStep step, int h, GraphRequest request, ref StepOutputs outputs, int embedded = -1)
+        /// rows and the logits the request asks for. <paramref name="lastRowsOnly"/>: <paramref name="h"/> holds each sequence's
+        /// last row only, in sequence order (<see cref="PrunesLastLayer"/>).</summary>
+        private void EmitHead(GraphStep step, int h, GraphRequest request, ref StepOutputs outputs, int embedded = -1, bool lastRowsOnly = false)
         {
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             for (int c = 0; c < request.CaptureLayers.Length; c++)
@@ -1557,7 +1602,7 @@ namespace TensorSharp.Models
             else if (request.LastRowLogits || request.LastRowHidden)
             {
                 int selected;
-                if (n == 1 && rows == 1) selected = final;
+                if (lastRowsOnly || (n == 1 && rows == 1)) selected = final;
                 else if (n == 1) selected = step.View2(final, hiddenSize, 1, hiddenSize * 4L, (rows - 1) * hiddenSize * 4L);
                 else
                 {
@@ -1566,7 +1611,8 @@ namespace TensorSharp.Models
                     selected = step.Op(GraphOp.GetRows, final, step.ConstantInputI32(last, n));
                 }
                 if (request.LastRowHidden)
-                    outputs.LastHiddenAt = 1 + step.Output(n == 1 && rows > 1 ? step.Op(GraphOp.Cont, selected) : selected, (long)hiddenSize * n);
+                    outputs.LastHiddenAt = 1 + step.Output(n == 1 && rows > 1 && !lastRowsOnly ? step.Op(GraphOp.Cont, selected) : selected,
+                        (long)hiddenSize * n);
                 // A step that wants only the rows (every sequence's next slot is made from its hidden row) runs no head.
                 if (!request.LastRowLogits) return;
                 int logits = step.MatMul(headName, selected);
