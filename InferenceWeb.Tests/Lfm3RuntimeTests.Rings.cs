@@ -337,6 +337,38 @@ public sealed partial class Lfm3RuntimeTests
             Assert.True(RelL2(logits[s], alone[s]) <= 1e-5, $"sequence {s}: relL2 {RelL2(logits[s], alone[s]):E2}");
     }
 
+    /// <summary>Media rows (an image's embeddings) in a forward that rings take in steps: each step carries the rows of the
+    /// spans it holds (a span cut across two steps included), giving the logits of linear caches reading it whole.</summary>
+    [Theory]
+    [InlineData("graphs")]
+    [InlineData("per-op")]
+    public void MediaRowsFollowTheirRingSteps(string path)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string file = Fixture("dense");
+        int[] prompt = Enumerable.Range(0, 45).Select(i => 40 + (i * 13) % 170).ToArray();
+        var random = new Random(5);
+        float[] Rows(int n) => Enumerable.Range(0, n * Lfm3SyntheticModelBuilder.Hidden).Select(_ => (float)(random.NextDouble() - 0.5)).ToArray();
+        float[] first = Rows(12), second = Rows(9);   // rows [5, 17) cross the steps at 8 and 16; [30, 39) the one at 32
+        float[] Run(bool rings)
+        {
+            using IDisposable scope = rings ? SmallRings() : null;
+            using var model = Create(file);
+            model.GraphLoweringEnabled = path == "graphs";
+            foreach ((float[] values, int at) in new[] { (first, 5), (second, 30) })
+            {
+                var media = new Tensor(model.DirectAllocatorForTelemetry, DType.Float32, values.Length / Lfm3SyntheticModelBuilder.Hidden, Lfm3SyntheticModelBuilder.Hidden);
+                media.SetElementsAsFloat(values);
+                model.QueueMediaForTests(media, at);
+            }
+            float[] logits = (float[])model.Forward(prompt).Clone();
+            if (rings) AssertRingsWrapped(model, prompt.Length);
+            return logits;
+        }
+        float[] linear = Run(rings: false), ringed = Run(rings: true);
+        Assert.True(RelL2(ringed, linear) <= 1e-5, $"media over ring steps vs whole: relL2 {RelL2(ringed, linear):E2}");
+    }
+
     /// <summary>A stack without recurrent layers rewinds as far as its rings keep the next row's window: within the ring's
     /// slack past its window, never to positions it overwrote; the cache truncated there continues as a fresh run.</summary>
     [Fact]

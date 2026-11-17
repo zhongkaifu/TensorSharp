@@ -395,8 +395,13 @@ namespace TensorSharp.Models
         private long CloneBytes(Slot slot, int targetTokens)
         {
             long bytes = 0;
-            foreach (Tensor t in AllCacheTensors(slot.K).Concat(AllCacheTensors(slot.V)))
-                bytes += t.Storage.ByteLength / Math.Max(1, t.Sizes[1]) * Math.Max(targetTokens, slot.Length);
+            int tokens = Math.Max(targetTokens, slot.Length);
+            // Each entry's cells for the clone: a sliding-window ring holds at most its own.
+            foreach (Tensor[][] caches in new[] { slot.K, slot.V })
+                for (int e = 0; caches != null && e < caches.Length; e++)
+                    if (caches[e] != null)
+                        foreach (Tensor t in caches[e])
+                            if (t != null) bytes += t.Storage.ByteLength / Math.Max(1, t.Sizes[1]) * CacheCells(e, tokens);
             foreach (Tensor t in CheckpointStateTensors(slot)) bytes += t.ElementCount() * t.ElementType.Size();
             return bytes;
         }

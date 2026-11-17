@@ -33,6 +33,10 @@ namespace TensorSharp.Models
             _pendingMedia.Add((embeddings, insertPosition));
         }
 
+        /// <summary><see cref="QueueMedia"/> for tests of the runtime's own media handling (families expose it through their
+        /// multimodal interfaces).</summary>
+        internal void QueueMediaForTests(Tensor embeddings, int insertPosition) => QueueMedia(embeddings, insertPosition);
+
         /// <summary>True while media embeddings wait for the forward that holds their rows (prompts are
         /// then not chunked, so the offsets stay the injector's).</summary>
         protected bool HasPendingMedia => _pendingMedia.Count > 0;
