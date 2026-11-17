@@ -275,6 +275,19 @@ namespace TensorSharp.Runtime
         /// what an append-only stream (an API delta, a terminal) needs.
         /// </summary>
         void AcceptRetractions() { }
+
+        /// <summary>
+        /// Called once, before the first piece, by an append-only consumer that shows each piece
+        /// as it arrives (an API stream, a terminal) and cannot take text back. A family whose
+        /// thinking-off replies may reason past the closed block
+        /// (<see cref="ChatProtocol.ThinkingOffReplyMayReason"/>) and that streams such replies
+        /// as they are generated then returns that text as content at once, as llama.cpp, vLLM
+        /// and SGLang stream a thinking-off reply: a <c>&lt;/think&gt;</c> the model writes later
+        /// stays in the content with the text around it. A reply that opens a block of its own
+        /// still streams as reasoning. A family that holds such text until it is decided (or a
+        /// consumer that retracts, or one that parses the whole reply) is not affected.
+        /// </summary>
+        void StreamWithoutHolding() { }
     }
 
     // ========================================================================
@@ -297,6 +310,11 @@ namespace TensorSharp.Runtime
         private readonly int _strayReasoningWindow;
         // Set once by a consumer that can take shown text back; Init does not clear it.
         private bool _retractable;
+        // Whether an append-only stream is held while a thinking-off reply is undecided (the
+        // family's choice), and whether this parser's consumer is such a stream (set once by
+        // StreamWithoutHolding; Init does not clear it).
+        private readonly bool _holdsAppendOnlyStreams = true;
+        private bool _appendOnlyStream;
         // Whether any generated text has arrived since Init. The prompt's tail primes the
         // state only before that.
         private bool _started;
@@ -320,8 +338,19 @@ namespace TensorSharp.Runtime
         /// reasoning: a <c>&lt;/think&gt;</c> that starts within them closes it, a later one is
         /// the answer's own text. Zero for a family whose replies start where the prompt says.</param>
         protected ChatMlOutputParser(int strayReasoningWindow)
+            : this(strayReasoningWindow, holdsAppendOnlyStreams: true)
+        {
+        }
+
+        /// <param name="strayReasoningWindow">See <see cref="ChatMlOutputParser(int)"/>.</param>
+        /// <param name="holdsAppendOnlyStreams">Whether an append-only stream
+        /// (<see cref="IOutputParser.StreamWithoutHolding"/>) waits while a reply after a closed
+        /// block is undecided (true), or is shown it as content at once (false: the reasoning and
+        /// the answer are told apart for retracting consumers and whole replies only).</param>
+        protected ChatMlOutputParser(int strayReasoningWindow, bool holdsAppendOnlyStreams)
         {
             _strayReasoningWindow = Math.Max(0, strayReasoningWindow);
+            _holdsAppendOnlyStreams = holdsAppendOnlyStreams;
         }
 
         private static readonly (string Open, string Close)[] HermesTags = { ("<tool_call>", "</tool_call>") };
@@ -409,6 +438,11 @@ namespace TensorSharp.Runtime
         }
 
         public void AcceptRetractions() => _retractable = true;
+
+        public void StreamWithoutHolding() => _appendOnlyStream = true;
+
+        /// <summary>An append-only stream of a family that does not hold one: undecided text is content as generated.</summary>
+        private bool StreamsUndecidedAsContent => _appendOnlyStream && !_holdsAppendOnlyStreams && !_retractable;
 
         public ParsedOutput Add(string text, bool done)
         {
@@ -525,6 +559,13 @@ namespace TensorSharp.Runtime
                             }
                             if (!done && "<think>".StartsWith(lead, StringComparison.Ordinal))
                                 break;   // nothing yet, or a partial opener
+                            if (StreamsUndecidedAsContent)
+                            {
+                                // Not held: the reply streams as the answer, a later close included.
+                                _state = State.CollectingContent;
+                                keepParsing = true;
+                                break;
+                            }
                         }
 
                         int strayClose = FindStrayClose(buf);
@@ -1362,6 +1403,13 @@ namespace TensorSharp.Runtime
         /// block); zero parses from Init's state alone, as Qwen 3.5 does.</param>
         public Qwen35OutputParser(int strayReasoningWindow)
             : base(strayReasoningWindow)
+        {
+        }
+
+        /// <param name="strayReasoningWindow">See <see cref="ChatMlOutputParser(int)"/>.</param>
+        /// <param name="holdsAppendOnlyStreams">See <see cref="ChatMlOutputParser(int, bool)"/>.</param>
+        public Qwen35OutputParser(int strayReasoningWindow, bool holdsAppendOnlyStreams)
+            : base(strayReasoningWindow, holdsAppendOnlyStreams)
         {
         }
     }

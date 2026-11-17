@@ -60,7 +60,12 @@ def s_nonstream_vs_stream(ts, ref, R):
     b = ts.chat(msgs, stream=True, sampling=GREEDY, max_tokens=60)
     R.check("non-stream 200", a["status"] == 200, a.get("error"))
     R.check("stream ends with [DONE]", b.get("done_marker"), None)
-    R.check("stream == non-stream", a["content"] == b["content"], [a["content"], b["content"]])
+    # Thinking off, an append-only stream gets a reply that reasons past the closed block as content as it is generated
+    # (llama.cpp / vLLM / SGLang behaviour, docs/models/lfm3.md); the non-streaming reply returns that reasoning apart.
+    whole = a["content"] if not a.get("reasoning") else a["reasoning"] + "</think>" + a["content"]
+    norm = lambda t: re.sub(r"\s*</think>\s*", "</think>", (t or "").strip())
+    R.check("stream == non-stream (stray reasoning streamed as content)", norm(b["content"]) == norm(whole),
+            [whole, b["content"]])
     R.check("usage in the stream", (b.get("usage") or {}).get("completion_tokens") == (a.get("usage") or {}).get("completion_tokens"),
             [b.get("usage"), a.get("usage")])
     R.check("no template tags", clean(a["content"]), a["content"])

@@ -97,11 +97,14 @@ GGUF 模板按原样渲染：TensorSharp 的 Jinja 引擎把 `{% generation %}` 
 - `</think>`（124902）是单个 token：思考预算在此结束推理块并继续生成答案，`response_format` 语法也在其后生效。
 - 关闭思考时 1.7B 仍常常推理：它写出推理（有时先自己写一个 `<think>`），自行关闭推理块后再作答（Q4_K_M 贪心解码下，
   200 道 GSM8K 中有 52 道、33 条指令提示中有 5 条如此；llama.cpp 生成的 token 相同）。模型卡也提示关闭思考"可能不稳定"。
-  TensorSharp 按 Nemotron-H Reasoning-128K 的方式解析这类回复：4,096 字符内出现的 `</think>` 使其之前的文本成为推理，
-  以 `reasoning_content`（OpenAI）或 `thinking`（Ollama、Web UI）返回，流式与非流式相同；模型自己打开的推理块像 Gemma 4
-  的未请求通道一样被限制（最多 64 个 token，在换行处关闭）。llama.cpp、vLLM 与 SGLang 会把这类回复连同 `</think>` 整体作为答案
-  返回。代价：不能撤回文本的流（OpenAI、Ollama、Responses、CLI）要等生成满 4,096 字符或回复结束才显示关闭思考时的答案；
-  Web UI 会立即显示并在之后撤回推理部分。
+  TensorSharp 如何返回这类回复取决于客户端能否撤回已显示的文本：
+  - 非流式回复（OpenAI、Ollama、Responses）以及能撤回文本的流（Web UI、TensorAgent）：4,096 字符内出现的 `</think>`
+    使其之前的文本成为推理，以 `reasoning_content`（OpenAI）或 `thinking`（Ollama、Web UI）返回；Web UI 立即显示文本，
+    在关闭标记到来时撤回推理部分。
+  - 不能撤回文本的流（OpenAI、Ollama 与 Responses 的流、CLI 交互模式）：回复在生成时即作为内容流出，`</think>` 及其前后的
+    文本都包含在内，与 llama.cpp、vLLM 和 SGLang 的返回方式相同。不做任何缓冲，短答案逐 token 到达；因此同一请求的
+    流式回复与非流式回复在推理所在位置上可能不同。以模型自己写出的 `<think>` 开头的回复，该推理块作为推理流出。
+  模型自己打开的推理块像 Gemma 4 的未请求通道一样被限制（最多 64 个 token，在换行处关闭）。
 - LFM3-Omni 不做推理：开启思考时它会立即关闭推理块。
 
 ### 工具调用

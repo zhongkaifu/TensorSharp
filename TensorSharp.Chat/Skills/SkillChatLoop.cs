@@ -1481,6 +1481,8 @@ namespace TensorSharp.Server.Skills
             parser.Init(enableThinking, plan.Tools);
             if (plan.ClientRetractsAnswerText)
                 parser.AcceptRetractions();
+            else if (plan.ClientStreamsAppendOnly)
+                parser.StreamWithoutHolding();
             return parser;
         }
 

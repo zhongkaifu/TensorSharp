@@ -151,15 +151,21 @@ GGUF). `RenderLfm3` reproduces the same text for a GGUF without a template.
   a `<think>` of its own) and closes the block itself before it answers (52 of 200
   greedy GSM8K replies and 5 of 33 instruction prompts on the Q4_K_M; llama.cpp's
   replies are the same tokens). The model card warns that thinking off "can be
-  inconsistent". TensorSharp parses such a reply as it does Nemotron-H
-  Reasoning-128K's: a `</think>` within 4,096 characters makes the text before it
-  reasoning, returned as `reasoning_content` (OpenAI) or `thinking` (Ollama, Web UI),
-  streamed or not, and a block the model opens itself is capped like Gemma 4's
-  unrequested channel (closed at a line break, after at most 64 tokens). llama.cpp,
-  vLLM and SGLang return such a reply whole, `</think>` included, as the answer. The
-  price: a stream that cannot take text back (OpenAI, Ollama, Responses, CLI) shows a
-  thinking-off answer once 4,096 characters are generated or the reply ends, whichever
-  comes first; the Web UI shows it at once and takes the reasoning back.
+  inconsistent". How TensorSharp returns such a reply depends on whether the client
+  can take text back:
+  - A non-streaming reply (OpenAI, Ollama, Responses) and a stream that can take text
+    back (the Web UI, TensorAgent): a `</think>` within 4,096 characters makes the text
+    before it reasoning, returned as `reasoning_content` (OpenAI) or `thinking` (Ollama,
+    Web UI); the Web UI shows the text at once and takes the reasoning back when the
+    close arrives.
+  - A stream that cannot take text back (the OpenAI, Ollama and Responses streams, the
+    CLI's interactive mode): the reply streams as content as it is generated, a
+    `</think>` and the text around it included, as llama.cpp, vLLM and SGLang return it.
+    Nothing is held, so a short answer arrives token by token; such a stream and the
+    non-streaming reply to the same request can therefore differ in where the reasoning
+    is. A reply that opens with a `<think>` of its own streams that block as reasoning.
+  A block the model opens itself is capped like Gemma 4's unrequested channel (closed at
+  a line break, after at most 64 tokens).
 - LFM3-Omni does not reason: with thinking on it closes the block at once.
 
 ### Tool calls

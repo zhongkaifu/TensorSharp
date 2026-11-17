@@ -338,6 +338,8 @@ public sealed partial class OpenAIChatAdapter
             workspace: workspaceLease?.Workspace, logger: openaiLogger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does.
+        if (skillPlan != null) skillPlan.ClientStreamsAppendOnly = stream;
 
         knowledge.Plan = skillPlan;
 
@@ -711,6 +713,8 @@ public sealed partial class OpenAIChatAdapter
         {
             parser = OutputParserFactory.Create(_svc.Architecture);
             parser.Init(openaiThink, openaiTools);
+            // Deltas cannot be taken back: a family that streams a possibly-reasoning reply as generated does so here.
+            parser.StreamWithoutHolding();
         }
 
         // json_object streams incrementally: strip code fences / leading prose /

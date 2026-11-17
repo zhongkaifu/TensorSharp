@@ -1694,6 +1694,8 @@ namespace TensorSharp.Cli
             // console output (they're surfaced separately when --think is on).
             string promptTail = CliOutputParser.PromptTail(arch, _model.Config.ChatTemplate, _model.Tokenizer, inputTokens);
             var parser = CliOutputParser.Create(arch, _enableThinking, _tools, promptTail);
+            // The terminal shows each piece as it arrives and cannot take text back.
+            parser.StreamWithoutHolding();
             bool parserRequired = OutputParserFactory.IsAlwaysRequired(arch, _model.Config.ChatTemplate);
             bool useParser = _enableThinking || (_tools != null && _tools.Count > 0) || parserRequired;
             bool showThinking = _enableThinking || parserRequired;

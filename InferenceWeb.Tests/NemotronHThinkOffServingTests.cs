@@ -420,14 +420,81 @@ public sealed class NemotronHThinkOffServingTests : IDisposable
         Assert.True(keepAlivesBeforeTheAnswer >= 3, $"{keepAlivesBeforeTheAnswer} keep-alives before the answer");
     }
 
+    // ---------------------------------------------------------------- LFM3: append-only streams are not held
+
+    // As far as detection reads LFM3's template (ChatTemplate.IsLfm3ThinkingOffTemplate): thinking off closes the block.
+    private const string Lfm3Template = "{{ '<|im_start|>assistant\n' }}{% if not enable_thinking %}{{ '<think></think>' }}{% endif %}";
+    // A verbatim thinking-off reply of LFM3-1.7B-Q4_K_M (Lfm3ThinkingOffReasoningTests).
+    private const string Lfm3StrayReply = "Brazil\nArgentina\nChile</think>Brazil\nArgentina\nChile";
+
+    /// <summary>
+    /// LFM3's append-only streams (OpenAI here; Ollama and Responses below) stream a thinking-off reply as it is generated,
+    /// a stray close and all, as llama.cpp, vLLM and SGLang do: the text arrives in many deltas instead of one after the
+    /// close. The non-streaming reply to the same request still returns the stray reasoning apart. Through the adapter's own
+    /// parser and through the sub-agent root loop.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Lfm3_OpenAIStream_SendsTheReplyAsItIsGenerated(bool loop)
+    {
+        string sse = await OpenAIChat(Lfm3StrayReply, stream: true, loop, lfm3: true);
+        (string content, string reasoning) = OpenAIDeltas(sse);
+        Assert.Equal(Lfm3StrayReply, content);
+        Assert.Empty(reasoning);
+        int deltas = SseData(sse).Count(d => d.TryGetProperty("choices", out JsonElement c) && c.GetArrayLength() > 0
+            && c[0].GetProperty("delta").TryGetProperty("content", out JsonElement t) && t.ValueKind == JsonValueKind.String
+            && t.GetString()!.Length > 0);
+        Assert.True(deltas >= 10, $"{deltas} content deltas: the reply was held");
+
+        using JsonDocument doc = JsonDocument.Parse(await OpenAIChat(Lfm3StrayReply, stream: false, loop, lfm3: true));
+        JsonElement message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        Assert.Equal("Brazil\nArgentina\nChile", message.GetProperty("content").GetString()!.Trim());
+        Assert.Equal("Brazil\nArgentina\nChile", message.GetProperty("reasoning_content").GetString()!.Trim());
+    }
+
+    [Fact]
+    public async Task Lfm3_OllamaAndResponsesStreams_SendTheReplyAsItIsGenerated()
+    {
+        string request = "{\"model\":\"probe.gguf\",\"messages\":[{\"role\":\"user\",\"content\":\"Name three.\"}],"
+            + "\"think\":false,\"stream\":true,\"options\":{\"num_predict\":900}" + LoopField(false) + "}";
+        string ndjson = await Invoke(Service(Lfm3StrayReply, lfm3: true), request, Options(skills: false),
+            (svc, options, ctx) => new OllamaAdapter(svc, options, Uploads(), Registry(false), null, Workspaces(),
+                NullLoggerFactory.Instance).ChatAsync(ctx));
+        var pieces = new List<string>();
+        foreach (string line in ndjson.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            using JsonDocument doc = JsonDocument.Parse(line);
+            if (doc.RootElement.TryGetProperty("message", out JsonElement m) && m.TryGetProperty("content", out JsonElement c)
+                && c.GetString() is { Length: > 0 } piece)
+                pieces.Add(piece);
+        }
+        Assert.Equal(Lfm3StrayReply, string.Concat(pieces));
+        Assert.True(pieces.Count >= 10, $"{pieces.Count} Ollama content chunks: the reply was held");
+
+        string responses = "{\"model\":\"probe.gguf\",\"input\":\"Name three.\",\"max_output_tokens\":900,\"stream\":true"
+            + LoopField(false) + "}";
+        string sse = await Invoke(Service(Lfm3StrayReply, lfm3: true), responses, Options(skills: false),
+            async (svc, options, ctx) =>
+            {
+                using var store = new InMemoryResponsesStore();
+                await new OpenAIResponsesAdapter(svc, options, Uploads(), Registry(false), null, Workspaces(),
+                    NullLoggerFactory.Instance, store).CreateResponseAsync(ctx);
+            });
+        var deltas = SseData(sse).Where(d => d.TryGetProperty("type", out JsonElement t) && t.GetString() == "response.output_text.delta")
+            .Select(d => d.GetProperty("delta").GetString()).ToList();
+        Assert.Equal(Lfm3StrayReply, string.Concat(deltas));
+        Assert.True(deltas.Count >= 10, $"{deltas.Count} output_text deltas: the reply was held");
+    }
+
     // ---------------------------------------------------------------- surfaces
 
-    private Task<string> OpenAIChat(string script, bool stream, bool loop, string extra = "")
+    private Task<string> OpenAIChat(string script, bool stream, bool loop, string extra = "", bool lfm3 = false)
     {
         string request = "{\"model\":\"probe.gguf\",\"messages\":[{\"role\":\"user\",\"content\":\"How many lines?\"}],"
             + "\"max_tokens\":900,\"stream\":" + (stream ? "true" : "false") + LoopField(loop)
             + (extra.Length == 0 ? "" : "," + extra) + "}";
-        return Invoke(Service(script), request, Options(skills: false),
+        return Invoke(Service(script, lfm3: lfm3), request, Options(skills: false),
             (svc, options, ctx) => new OpenAIChatAdapter(svc, options, Uploads(), Registry(false), null, Workspaces(),
                 NullLoggerFactory.Instance).ChatCompletionsAsync(ctx));
     }
@@ -522,10 +589,12 @@ public sealed class NemotronHThinkOffServingTests : IDisposable
         return await new StreamReader(context.Response.Body).ReadToEndAsync();
     }
 
-    private ModelService Service(string script, int msPerToken = 0)
+    private ModelService Service(string script, int msPerToken = 0, bool lfm3 = false)
     {
         var service = new ModelService(NullLogger<ModelService>.Instance,
-            (path, _, _, _) => new ScriptModel(path, ReasoningTemplate, script, msPerToken));
+            (path, _, _, _) => lfm3
+                ? new ScriptModel(path, Lfm3Template, script, msPerToken, "lfm3", "<|im_start|>assistant\n")
+                : new ScriptModel(path, ReasoningTemplate, script, msPerToken));
         service.EngineHost.SchedulerConfigOverride = new SchedulerConfig
         {
             BlockSize = 16, NumBlocks = 2_048, MaxNumRunningSequences = 2,
@@ -560,17 +629,19 @@ public sealed class NemotronHThinkOffServingTests : IDisposable
     /// </summary>
     private sealed class ScriptModel : ModelBase
     {
-        private const string AssistantMarker = "<SPECIAL_11>Assistant\n";
+        private readonly string AssistantMarker;
         private readonly string _script;
         private readonly StringBuilder _seen = new();
 
         private readonly int _msPerToken;
 
-        public ScriptModel(string path, string template, string script, int msPerToken) : base(path, BackendType.Cpu)
+        public ScriptModel(string path, string template, string script, int msPerToken, string architecture = "nemotron_h",
+            string assistantMarker = "<SPECIAL_11>Assistant\n") : base(path, BackendType.Cpu)
         {
             _script = script;
             _msPerToken = msPerToken;
-            Config = new ModelConfig { Architecture = "nemotron_h", VocabSize = 128, NumLayers = 1, ChatTemplate = template };
+            AssistantMarker = assistantMarker;
+            Config = new ModelConfig { Architecture = architecture, VocabSize = 128, NumLayers = 1, ChatTemplate = template };
             Tokenizer = new CharTokenizer();
             _maxContextLength = 32_768;
         }

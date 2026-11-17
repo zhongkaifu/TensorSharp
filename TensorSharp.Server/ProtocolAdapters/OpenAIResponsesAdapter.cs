@@ -270,6 +270,8 @@ public sealed partial class OpenAIResponsesAdapter
             workspace: workspaceLease?.Workspace, logger: logger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does.
+        if (skillPlan != null) skillPlan.ClientStreamsAppendOnly = stream;
 
         knowledge.Plan = skillPlan;
 
@@ -522,6 +524,8 @@ public sealed partial class OpenAIResponsesAdapter
         {
             parser = OutputParserFactory.Create(_svc.Architecture);
             parser.Init(enableThinking, tools);
+            // Output deltas cannot be taken back (IOutputParser.StreamWithoutHolding).
+            parser.StreamWithoutHolding();
         }
 
         var buffer = bufferForStructured ? new StringBuilder() : null;

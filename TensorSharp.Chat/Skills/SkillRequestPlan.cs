@@ -131,6 +131,14 @@ namespace TensorSharp.Server.Skills
         internal bool ClientRetractsAnswerText { get; set; }
 
         /// <summary>
+        /// True when the client of this turn streams each piece as it arrives and cannot take it
+        /// back (an OpenAI, Ollama or Responses stream). The loop's parsers are then told so
+        /// (<see cref="IOutputParser.StreamWithoutHolding"/>): a family that streams a reply it
+        /// cannot classify yet as it is generated does so for this client too.
+        /// </summary>
+        internal bool ClientStreamsAppendOnly { get; set; }
+
+        /// <summary>
         /// The single artifact that passed the routed completion contract. Until this is
         /// set, adapters must not expose files captured by guarded invocations: a partial
         /// ZIP is useful evidence for repair, but it is not a user deliverable.
