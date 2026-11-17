@@ -963,7 +963,11 @@ public sealed partial class OpenAIChatAdapter
         {
             var parsed = collector.Resolve(_svc.Architecture, openaiThink, openaiTools);
 
-            string? thinkingOut = openaiThink && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
+            // Whatever the parser separated as reasoning goes out as reasoning, as the stream
+            // sends it, with thinking off too: a model that reasons although the prompt closed
+            // the block (LFM3, Nemotron-H Reasoning-128K) often states its result there, and
+            // a reply cut by max_tokens in the answer that follows otherwise lost it entirely.
+            string? thinkingOut = !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
             responseMessage = OpenAIResponseFactory.ParsedAssistantMessage(knowledge.Normalize(parsed.Content), thinkingOut, parsed.ToolCalls);
 
             sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;

@@ -81,6 +81,23 @@ public sealed class NemotronHThinkOffServingTests : IDisposable
         JsonElement message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
 
         Assert.Equal(Answer, message.GetProperty("content").GetString()!.Trim());
+        // The reasoning goes out as reasoning, as the stream sends it: dropped, a reply whose
+        // answer max_tokens cut lost the result the reasoning had stated (LFM3, eng/lfm3/e2e).
+        Assert.StartsWith("Okay, the user", message.GetProperty("reasoning_content").GetString());
+    }
+
+    [Fact]
+    public async Task Ollama_NonStreaming_ReturnsTheStrayReasoningAsThinking()
+    {
+        string request = "{\"model\":\"probe.gguf\",\"messages\":[{\"role\":\"user\",\"content\":\"How many lines?\"}],"
+            + "\"think\":false,\"stream\":false,\"options\":{\"num_predict\":900}" + LoopField(false) + "}";
+        string body = await Invoke(Service(NemotronHLoggedReplies.ToolRoundWithAnswer), request, Options(skills: false),
+            (svc, options, ctx) => new OllamaAdapter(svc, options, Uploads(), Registry(false), null, Workspaces(),
+                NullLoggerFactory.Instance).ChatAsync(ctx));
+        using JsonDocument doc = JsonDocument.Parse(body);
+        JsonElement message = doc.RootElement.GetProperty("message");
+        Assert.Equal(Answer, message.GetProperty("content").GetString()!.Trim());
+        Assert.StartsWith("Okay, the user", message.GetProperty("thinking").GetString());
     }
 
     [Theory]
