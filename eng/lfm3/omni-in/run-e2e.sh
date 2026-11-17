@@ -9,7 +9,8 @@
 #   e.g. eng/lfm3/omni-in/run-e2e.sh ggml_metal artifacts/lfm3/omni-in/e2e/metal
 #        eng/lfm3/omni-in/run-e2e.sh mlx artifacts/lfm3/omni-in/e2e/mlx --reuse-llama artifacts/lfm3/omni-in/e2e/metal/llama.json
 #
-# Environment: LLAMA (llama.cpp checkout, default ~/work/llama.cpp-lfm3), MODELS (default ~/work/models/lfm3), MODEL
+# Environment: LLAMA (llama.cpp checkout, default ~/work/llama.cpp-lfm3), LLAMA_BUILD (its build tree, default build; e.g.
+# build-cuda on a Linux GPU machine), MODELS (default ~/work/models/lfm3), MODEL
 # (default LFM3-Omni-2B-Q4_K_M.gguf), MMPROJ (default mmproj-LFM3-Omni-2B-Q8_0.gguf), MEDIA (manifest, default
 # artifacts/lfm3/omni-in/media/manifest.json), LPORT / TPORT (8181 / 5181), LLAMA_NP (llama-server slots, 1). llama-server always runs: a --reuse-llama
 # run still tokenizes with it. Build first with TENSORSHARP_GGML_NO_UPDATE=1.
@@ -28,7 +29,7 @@ pids=()
 cleanup() { for p in "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
 trap cleanup EXIT
 
-"$LLAMA/build/bin/llama-server" -m "$MODELS/$MODEL" -mm "$MODELS/$MMPROJ" --port "$LPORT" -ngl 99 --jinja -c 32768 -np "${LLAMA_NP:-1}" \
+"$LLAMA/${LLAMA_BUILD:-build}/bin/llama-server" -m "$MODELS/$MODEL" -mm "$MODELS/$MMPROJ" --port "$LPORT" -ngl 99 --jinja -c 32768 -np "${LLAMA_NP:-1}" \
   > "$out/llama-server.log" 2>&1 &
 pids+=($!)
 MAX_CONTEXT="${MAX_CONTEXT:-32768}" dotnet "$repo/TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll" \

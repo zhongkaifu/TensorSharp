@@ -11,7 +11,8 @@
 // f<index>.rgb, the resized frames TensorSharp encoded) for the harness's frames: case, so llama.cpp can encode the very
 // same pixels.
 //
-//   dotnet run --project eng/lfm3/Lfm3VisionProbe -c Release -- <mmproj> <out dir> [--backend ggml_metal|ggml_cpu|mlx|cpu]
+//   dotnet run --project eng/lfm3/Lfm3VisionProbe -c Release -- <mmproj> <out dir>
+//       [--backend ggml_metal|ggml_cpu|ggml_cuda|ggml_vulkan|cuda|mlx|cpu]
 //       [--reps N] case...
 //   cases: synth:NAME:W:H:SEED | synthvideo:NAME:W:H:FRAMES:FPS | file:NAME:PATH | video:NAME:PATH
 using System.Diagnostics;
@@ -49,7 +50,7 @@ internal static class Program
         }
         if (args.Length < 3)
         {
-            Console.Error.WriteLine("usage: Lfm3VisionProbe <mmproj> <out dir> [--backend ggml_metal|ggml_cpu|mlx|cpu] [--reps N] case...");
+            Console.Error.WriteLine("usage: Lfm3VisionProbe <mmproj> <out dir> [--backend ggml_metal|ggml_cpu|ggml_cuda|ggml_vulkan|cuda|mlx|cpu] [--reps N] case...");
             return 2;
         }
         string mmproj = args[0], outDir = args[1], backendName = "ggml_metal";
@@ -70,9 +71,22 @@ internal static class Program
         {
             case "ggml_metal":
             case "ggml_cpu":
-                bool metal = backendName == "ggml_metal";
-                allocator = new GgmlAllocator(new GgmlContext(new[] { 0 }, metal ? GgmlBackendType.Metal : GgmlBackendType.Cpu), 0);
-                backend = metal ? BackendType.GgmlMetal : BackendType.GgmlCpu;
+            case "ggml_cuda":
+            case "ggml_vulkan":
+                (GgmlBackendType ggml, backend) = backendName switch
+                {
+                    "ggml_metal" => (GgmlBackendType.Metal, BackendType.GgmlMetal),
+                    "ggml_cuda" => (GgmlBackendType.Cuda, BackendType.GgmlCuda),
+                    "ggml_vulkan" => (GgmlBackendType.Vulkan, BackendType.GgmlVulkan),
+                    _ => (GgmlBackendType.Cpu, BackendType.GgmlCpu),
+                };
+                allocator = new GgmlAllocator(new GgmlContext(new[] { 0 }, ggml), 0);
+                break;
+            case "cuda":
+                var cuda = new TensorSharp.Cuda.CudaAllocator();
+                owner = cuda;
+                allocator = cuda;
+                backend = BackendType.Cuda;
                 break;
             case "mlx":
                 var mlx = new MlxAllocator();

@@ -12,8 +12,9 @@
 //       -L$LLAMA/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin -o artifacts/lfm3/llamacpp-forced
 // Run:
 //   llamacpp-forced MODEL OUT_DIR STEPS NGL CASE.txt [CASE.txt ...]
-//   (NGL 99 = every layer on the GPU (Metal); -1 = ggml-cpu only, no GPU device or op offload; the case name is the
-//   file's stem)
+//   (NGL 99 = every layer on the GPU (Metal, CUDA, Vulkan: the build's); -1 = ggml-cpu only, no GPU device or op offload;
+//   the case name is the file's stem). LLAMACPP_FORCED_UBATCH sets n_ubatch (default 512): llama.cpp's own run at another
+//   prompt batch measures how far its kernel choice alone moves the logits.
 #include "llama.h"
 
 #include <cstdio>
@@ -82,12 +83,13 @@ int main(int argc, char ** argv) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = (uint32_t) (n + steps + 64);
         cp.n_batch = 2048;
-        cp.n_ubatch = 512;
+        cp.n_ubatch = getenv("LLAMACPP_FORCED_UBATCH") ? (uint32_t) atoi(getenv("LLAMACPP_FORCED_UBATCH")) : 512;
         if (ngl < 0) cp.op_offload = false;
         llama_context * ctx = llama_init_from_model(model, cp);
         if (!ctx) { fprintf(stderr, "context failed\n"); return 1; }
 
         FILE * f = fopen((out_dir + "/" + name + ".f32").c_str(), "wb");
+        if (!f) { fprintf(stderr, "cannot write %s/%s.f32 (does OUT_DIR exist?)\n", out_dir.c_str(), name.c_str()); return 1; }
         std::vector<llama_token> generated;
         // The prompt in batches of n_batch rows, logits of the last row only.
         for (int at = 0; at < n; at += (int) cp.n_batch) {

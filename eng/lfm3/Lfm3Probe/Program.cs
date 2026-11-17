@@ -17,7 +17,7 @@
 //   spec   MODEL BACKEND FILE N            N greedy tokens after the file's prompt, plainly and with n-gram speculation (a verify
 //                                          window keeps the short-conv inputs and attends under the sliding window; the accept
 //                                          count commits a prefix): the two streams must be equal
-// BACKEND: ggml_metal | ggml_cpu | cpu | mlx | ggml_cuda | cuda
+// BACKEND: ggml_metal | ggml_cpu | cpu | mlx | ggml_cuda | ggml_vulkan | cuda
 using System.Diagnostics;
 using System.Globalization;
 using TensorSharp;
@@ -29,7 +29,7 @@ if (args.Length < 2) return Usage();
 BackendType Backend(string name) => name switch
 {
     "ggml_metal" => BackendType.GgmlMetal, "ggml_cpu" => BackendType.GgmlCpu, "cpu" => BackendType.Cpu, "mlx" => BackendType.Mlx,
-    "ggml_cuda" => BackendType.GgmlCuda, "cuda" => BackendType.Cuda,
+    "ggml_cuda" => BackendType.GgmlCuda, "ggml_vulkan" => BackendType.GgmlVulkan, "cuda" => BackendType.Cuda,
     _ => throw new ArgumentException("unknown backend " + name),
 };
 KvCacheDtypeConfig.ConfigureFromEnvironment();

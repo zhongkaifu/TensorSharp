@@ -5,10 +5,12 @@
 # llama.cpp references for TensorSharp's LFM3-Omni speech output (see speech-ref.cpp):
 #   eng/lfm3/speech-ref.sh LLAMA_DIR LM_GGUF MMPROJ OUT_DIR [SEED] [TEXT]
 # builds speech-ref against LLAMA_DIR's build tree (sources unchanged), runs it (fixture.json, PCM, timings) and runs
-# llama-tts on the same text and seed for the end-to-end reference audio (llama-tts.wav, llama-tts.log).
+# llama-tts on the same text and seed for the end-to-end reference audio (llama-tts.wav, llama-tts.log). LLAMA_BUILD names
+# the build tree under LLAMA_DIR (default build; e.g. build-cuda on a Linux GPU machine).
 # The test fixture is InferenceWeb.Tests/Fixtures/Lfm3Speech/llamacpp-reference.json (copy OUT_DIR/fixture.json there).
 set -euo pipefail
 LLAMA=${1:?llama.cpp checkout with a build/ tree}
+BUILD="$LLAMA/${LLAMA_BUILD:-build}"
 LM=${2:?LFM3-Omni LM GGUF}
 MMPROJ=${3:?LFM3-Omni mmproj GGUF}
 OUT=${4:?output directory}
@@ -19,13 +21,13 @@ mkdir -p "$OUT"
 BIN="$OUT/speech-ref"
 if [[ ! -x "$BIN" || "$HERE/speech-ref.cpp" -nt "$BIN" ]]; then
   c++ -std=c++17 -O2 "$HERE/speech-ref.cpp" -I"$LLAMA/include" -I"$LLAMA/ggml/include" -I"$LLAMA/tools/mtmd" \
-    -I"$LLAMA/common" -I"$LLAMA/vendor" -L"$LLAMA/build/bin" -lllama -lmtmd -lllama-common -lggml -lggml-base \
-    -Wl,-rpath,"$LLAMA/build/bin" -o "$BIN"
+    -I"$LLAMA/common" -I"$LLAMA/vendor" -L"$BUILD/bin" -lllama -lmtmd -lllama-common -lggml -lggml-base \
+    -Wl,-rpath,"$BUILD/bin" -o "$BIN"
 fi
 echo "llama.cpp $(git -C "$LLAMA" rev-parse --short HEAD)" > "$OUT/versions.txt"
 "$BIN" "$LM" "$MMPROJ" "$OUT" --text "$TEXT" --seed "$SEED" 2> "$OUT/speech-ref.log" || { cat "$OUT/speech-ref.log"; exit 1; }
 tail -n 6 "$OUT/speech-ref.log"
-"$LLAMA/build/bin/llama-tts" -m "$LM" -mm "$MMPROJ" -p "$TEXT" --seed "$SEED" -ngl 99 --output "$OUT/llama-tts.wav" \
+"$BUILD/bin/llama-tts" -m "$LM" -mm "$MMPROJ" -p "$TEXT" --seed "$SEED" -ngl 99 --output "$OUT/llama-tts.wav" \
   > "$OUT/llama-tts.log" 2>&1 || { tail -n 20 "$OUT/llama-tts.log"; exit 1; }
 grep -E "timings|output audio|generated" "$OUT/llama-tts.log" || true
 # llama-tts writes the pipeline's WAV16: the same bytes as speech-ref's pipeline.wav for the same seed and text

@@ -22,6 +22,16 @@ in the ignored `artifacts/lfm3/`.
   - `bench MODEL BACKEND [PP,...] [TG] [DEPTH,...]` measures prefill and decode tokens/s as llama-bench's pp / tg /
     tg@d do, with the decode steps' graph counters (runs, advances in place, builds).
 
+- `gpu-matrix.sh OUT MODELS_DIR CASES_DIR CORPUS [MODEL ...]` runs the text comparison on a Linux GPU machine (CUDA and
+  Vulkan): builds `llamacpp-forced` against llama.cpp's `build-cuda/` and `build-vk/` trees (`LLAMA`), records llama.cpp's
+  references on each, teacher-forces TensorSharp's `ggml_cuda` and direct `cuda` lanes through the CUDA references and
+  `ggml_vulkan` through the Vulkan ones, and computes perplexity on both sides (`PHASES`, `LANES`, `STEPS`, `PPL_CTX`,
+  `PPL_CHUNKS` narrow it). `forced-summary.py [--markdown] RUN_DIR...` prints each run's agreement. `LLAMACPP_FORCED_UBATCH`
+  reruns llama.cpp at another prompt batch: the distance between its own two runs is the noise floor its kernels alone set
+  (on CUDA, q8_1 activations make it ~2e-2 relative L2 for prompts longer than the batch).
+- `speech-ref.sh` and `omni-in/run-e2e.sh` take `LLAMA_BUILD` (the build tree under the llama.cpp checkout, e.g.
+  `build-cuda`); `Lfm3VisionProbe` takes `ggml_cuda`, `ggml_vulkan` and `cuda`, so `vision-compare.py` can set TensorSharp's
+  tower against llama.cpp's on the same GPU.
 - `omni-in/`: LFM3-Omni image, video and audio input end to end against llama-server (media set, request
   comparison, cold and concurrent TTFT, the three chat surfaces, a layout / encode probe); see its README.
 
