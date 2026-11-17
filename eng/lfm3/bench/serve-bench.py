@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Serving benchmark: TensorSharp.Server.Host vs llama-server with one client (OpenAI chat completions, streamed).
 
-For each (concurrency C, prompt length P) it sends R requests (R = max(--min-requests, 2 C)), C at a time, each a
-distinct prompt of P tokens (a unique first line, so no prefix cache can reuse another request's prompt), asking for
+For each (concurrency C, prompt length P) it sends R requests (R = max(--min-requests, --waves x C), by default 2 C), C at
+a time, each a distinct prompt of P tokens (a unique first line, so no prefix cache can reuse another request's prompt), asking for
 exactly --gen tokens (ignore_eos, greedy, no repetition penalty, thinking off). It reports TTFT p50/p95 (request sent -> first streamed token,
 content or reasoning), per-request decode tok/s ((tokens - 1) / (last token - first token)), aggregate output tok/s
 (all output tokens / the level's wall time) and the server process's peak physical footprint (`footprint`, which counts
@@ -13,10 +13,17 @@ The servers are started and stopped by this script (one process per engine per c
   serve-bench.py --engine llama --model MODEL.gguf ...
 Prompts are cut from --corpus to exact token counts with llama-tokenize (the GGUF's tokenizer, the same for both).
 
-usage: serve-bench.py --engine {ts,llama} --model GGUF [--concurrency 1,4,16] [--prompts 128,1024,4096] [--gen 256]
-                      [--corpus FILE] [--out DIR] [--port 18080]
-Environment: LLAMA_CPP_DIR (default ~/work/llama.cpp-lfm3); the TS server is this checkout's Release build of
-TensorSharp.Server.Host (build it first); MAX_CONTEXT is set from the largest prompt.
+usage: serve-bench.py --engine {ts,llama} --model GGUF [--backend B] [--threads N] [--concurrency 1,4,16]
+                      [--prompts 128,1024,4096] [--gen 256] [--corpus FILE] [--out DIR] [--port 18080] [--tag NAME]
+  --backend  TensorSharp's backend (ggml_metal, ggml_cpu, cpu, mlx); for llama-server, cpu or ggml_cpu keeps every
+             layer on the CPU (-ngl 0), anything else offloads them
+  --threads  CPU threads: llama-server -t N -tb N; TensorSharp TS_GGML_CPU_THREADS, TS_CPU_THREADS and
+             DOTNET_PROCESSOR_COUNT (as eng/lfm3/bench/ts-bench.sh --threads); 0 keeps each engine's defaults
+  --llama-fa llama-server -fa (default on)
+  --tag      names this run's files and table rows (default: the engine)
+Environment: LLAMA_CPP_DIR (default ~/work/llama.cpp-lfm3) and LLAMA_BUILD (its build directory, default build; e.g.
+build-cpu); the TS server is this checkout's Release build of TensorSharp.Server.Host (build it first; TS_SERVER_DLL
+overrides it); MAX_CONTEXT is set from the largest prompt.
 """
 import argparse
 import http.client
@@ -32,10 +39,12 @@ import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 LLAMA = os.environ.get("LLAMA_CPP_DIR", os.path.expanduser("~/work/llama.cpp-lfm3"))
+LLAMA_BIN = os.path.join(LLAMA, os.environ.get("LLAMA_BUILD", "build"), "bin")
+CPU_BACKENDS = ("cpu", "ggml_cpu")
 
 
 def tokenize(model, text):
-    p = subprocess.run([f"{LLAMA}/build/bin/llama-tokenize", "-m", model, "--ids", "--log-disable", "--no-bos", "-p", text],
+    p = subprocess.run([f"{LLAMA_BIN}/llama-tokenize", "-m", model, "--ids", "--log-disable", "--no-bos", "-p", text],
                        capture_output=True, text=True)
     m = re.search(r"\[([0-9, ]*)\]", p.stdout)
     if not m:
@@ -169,7 +178,11 @@ def start_server(args, concurrency, ctx, log):
     if args.engine == "ts":
         env["MAX_CONTEXT"] = str(ctx)
         env.setdefault("TS_SCHED_MAX_RUNNING_SEQS", str(max(concurrency, 1)))
-        dll = os.path.join(ROOT, "TensorSharp.Server.Host", "bin", "Release", "net10.0", "TensorSharp.Server.Host.dll")
+        if args.threads:
+            for k in ("TS_GGML_CPU_THREADS", "TS_CPU_THREADS", "DOTNET_PROCESSOR_COUNT"):
+                env[k] = str(args.threads)
+        dll = os.environ.get("TS_SERVER_DLL") or os.path.join(ROOT, "TensorSharp.Server.Host", "bin", "Release", "net10.0",
+                                                              "TensorSharp.Server.Host.dll")
         if not os.path.exists(dll):
             dll = os.path.join(ROOT, "TensorSharp.Server.Host", "bin", "TensorSharp.Server.Host.dll")
         cmd = ["dotnet", dll, "--model", args.model, "--backend", args.backend, "--port", str(args.port),
@@ -177,11 +190,11 @@ def start_server(args, concurrency, ctx, log):
         if args.config:
             cmd[2:2] = ["--config", args.config]
     else:
-        cmd = [f"{LLAMA}/build/bin/llama-server", "-m", args.model, "--port", str(args.port), "-np", str(concurrency),
-               "-c", str(ctx * concurrency), "-fa", "on", "--jinja", "-ngl", "99" if args.backend != "cpu" else "0",
-               "--no-webui", "-b", "2048", "-ub", "512"]
+        cmd = [f"{LLAMA_BIN}/llama-server", "-m", args.model, "--port", str(args.port), "-np", str(concurrency),
+               "-c", str(ctx * concurrency), "-fa", args.llama_fa, "--jinja",
+               "-ngl", "0" if args.backend in CPU_BACKENDS else "99", "--no-webui", "-b", "2048", "-ub", "512"]
         if args.threads:
-            cmd += ["-t", str(args.threads)]
+            cmd += ["-t", str(args.threads), "-tb", str(args.threads)]
     print("$ " + " ".join(cmd), file=sys.stderr)
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
 
@@ -193,15 +206,19 @@ def main():
     ap.add_argument("--config", default=None, help="TS: a config file (its model path is overridden by --model)")
     ap.add_argument("--backend", default="ggml_metal", help="TS backend; llama: anything but cpu offloads every layer")
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--llama-fa", default="on", help="llama-server -fa (on, off, auto)")
+    ap.add_argument("--tag", default=None)
     ap.add_argument("--concurrency", default="1,4,16")
     ap.add_argument("--prompts", default="128,1024,4096")
     ap.add_argument("--gen", type=int, default=256)
     ap.add_argument("--min-requests", type=int, default=4)
+    ap.add_argument("--waves", type=int, default=2, help="requests per level: max(--min-requests, WAVES x C)")
     ap.add_argument("--corpus", default=os.path.join(ROOT, "docs", "models", "lfm3.md"))
     ap.add_argument("--out", default=os.path.join(ROOT, "artifacts", "lfm3", "serve"))
     ap.add_argument("--port", type=int, default=18080)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    tag = args.tag or args.engine
     levels = [int(c) for c in args.concurrency.split(",")]
     lengths = [int(p) for p in args.prompts.split(",")]
 
@@ -219,14 +236,14 @@ def main():
     results = []
     ctx = max(lengths) + args.gen + 128
     for c in levels:
-        log = open(os.path.join(args.out, f"{args.engine}-c{c}.server.log"), "w")
+        log = open(os.path.join(args.out, f"{tag}-c{c}.server.log"), "w")
         proc = start_server(args, c, ctx, log)
         try:
             name = wait_ready(args.port, proc)
             for i in range(2):   # warm: kernels, graphs, slots
                 request(args.port, name, f"(warm {i})\n" + prompts[str(lengths[0])], 16)
             for n in lengths:
-                total = max(args.min_requests, 2 * c)
+                total = max(args.min_requests, args.waves * c)
                 texts = [f"(request {n}-{k})\n" + prompts[str(n)] for k in range(total)]
                 out, lock, it = [], threading.Lock(), iter(texts)
                 sampler = Sampler(proc.pid)
@@ -254,7 +271,7 @@ def main():
                 rates = [(r["chunks"] - 1) / (r["last"] - r["first"]) for r in out if r["chunks"] > 1 and r["last"] > r["first"]]
                 tokens = sum(r["tokens"] for r in out)
                 row = {
-                    "engine": args.engine, "concurrency": c, "prompt": n, "requests": len(out),
+                    "engine": tag, "concurrency": c, "prompt": n, "requests": len(out),
                     "prompt_tokens": statistics.median([r["prompt_tokens"] for r in out if r["prompt_tokens"]] or [0]),
                     "ttft_p50_ms": 1000 * pct(ttft, 0.5), "ttft_p95_ms": 1000 * pct(ttft, 0.95),
                     "decode_tok_s_p50": pct(rates, 0.5), "decode_tok_s_min": min(rates) if rates else float("nan"),
@@ -271,7 +288,7 @@ def main():
             except Exception:
                 os.killpg(proc.pid, signal.SIGKILL)
             log.close()
-    with open(os.path.join(args.out, f"{args.engine}-results.jsonl"), "a") as f:
+    with open(os.path.join(args.out, f"{tag}-results.jsonl"), "a") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
     print("| engine | C | prompt | TTFT p50 ms | TTFT p95 ms | decode tok/s/req p50 | aggregate tok/s | peak GB | short |")
