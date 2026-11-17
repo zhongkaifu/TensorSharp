@@ -8,10 +8,12 @@
 //                                          second half of every chunk (row i predicts token i + 1); --per-op runs the shared
 //                                          runtime's per-op path instead of whole-forward graphs
 //   tokens MODEL FILE OUT                  the file's token ids as llama-perplexity tokenizes it (one id a line)
-//   bench  MODEL BACKEND [PP,...] [TG] [DEPTH,...]
+//   bench  MODEL BACKEND [PP,...|-] [TG] [DEPTH,...] [--reps N] [--greedy]
 //                                          prefill tokens/s of each PP-token prompt and decode tokens/s of TG tokens after
-//                                          DEPTH tokens (llama-bench's pp / tg / tg@d), each the median of three runs, with
-//                                          the decode steps' graph counters (runs, advances in place, builds)
+//                                          DEPTH tokens (llama-bench's pp / tg / tg@d), each the median of N runs (3), with
+//                                          the decode steps' graph counters (runs, advances in place, builds). As llama-bench,
+//                                          decode feeds pseudo-random tokens (the timed loop holds no sampling); --greedy feeds
+//                                          each step's host argmax instead. A "RESULT name median min max" line per test.
 //   spec   MODEL BACKEND FILE N            N greedy tokens after the file's prompt, plainly and with n-gram speculation (a verify
 //                                          window keeps the short-conv inputs and attends under the sliding window; the accept
 //                                          count commits a prefix): the two streams must be equal
@@ -45,17 +47,22 @@ switch (args[0])
     case "spec" when args.Length >= 5:
         return Speculation(args[1], Backend(args[2]), args[3], int.Parse(args[4]));
     case "bench" when args.Length >= 3:
-        return Bench(args[1], Backend(args[2]),
-            args.Length > 3 ? args[3].Split(',').Select(int.Parse).ToArray() : new[] { 512, 4096 },
-            args.Length > 4 ? int.Parse(args[4]) : 128,
-            args.Length > 5 ? args[5].Split(',').Select(int.Parse).ToArray() : new[] { 0 });
+    {
+        string[] positional = args.Where((a, i) => !a.StartsWith("--", StringComparison.Ordinal) && (i == 0 || args[i - 1] != "--reps")).ToArray();
+        int reps = Array.IndexOf(args, "--reps") is int r && r >= 0 && r + 1 < args.Length ? int.Parse(args[r + 1]) : 3;
+        return Bench(positional[1], Backend(positional[2]),
+            positional.Length > 3 && positional[3] != "-" ? positional[3].Split(',').Select(int.Parse).ToArray() : Array.Empty<int>(),
+            positional.Length > 4 ? int.Parse(positional[4]) : 128,
+            positional.Length > 5 ? positional[5].Split(',').Select(int.Parse).ToArray() : new[] { 0 },
+            reps, args.Contains("--greedy"));
+    }
     default:
         return Usage();
 }
 
 static int Usage()
 {
-    Console.Error.WriteLine("usage: Lfm3Probe ppl MODEL BACKEND FILE CTX CHUNKS [--per-op] | spec MODEL BACKEND FILE N | tokens MODEL FILE OUT | bench MODEL BACKEND [PP,..] [TG] [DEPTH,..]");
+    Console.Error.WriteLine("usage: Lfm3Probe ppl MODEL BACKEND FILE CTX CHUNKS [--per-op] | spec MODEL BACKEND FILE N | tokens MODEL FILE OUT | bench MODEL BACKEND [PP,..|-] [TG] [DEPTH,..] [--reps N] [--greedy]");
     return 2;
 }
 
@@ -134,7 +141,7 @@ static int Perplexity(string path, BackendType backend, string file, int ctx, in
     return 0;
 }
 
-static int Bench(string path, BackendType backend, int[] prompts, int generate, int[] depths)
+static int Bench(string path, BackendType backend, int[] prompts, int generate, int[] depths, int reps, bool greedy)
 {
     using ModelBase model = ModelBase.Create(path, backend);
     var runtime = model as StandardDecoderModel;
@@ -150,7 +157,7 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     foreach (int n in prompts)
     {
         var rates = new List<double>();
-        for (int rep = 0; rep < 3; rep++)
+        for (int rep = 0; rep < reps; rep++)
         {
             model.ResetKVCache();
             int[] t = Tokens(n, rep + 7);
@@ -159,22 +166,26 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
             rates.Add(n / sw.Elapsed.TotalSeconds);
         }
         Console.WriteLine($"pp{n}: {Median(rates):F1} tok/s  (runs {string.Join(", ", rates.Select(r => r.ToString("F0")))})");
+        Console.WriteLine(FormattableString.Invariant($"RESULT pp{n} {Median(rates):F2} {rates.Min():F2} {rates.Max():F2}"));
     }
-    foreach (int depth in depths)
+    foreach (int depth in generate > 0 ? depths : Array.Empty<int>())
     {
         var rates = new List<double>();
         int runs0 = runtime?.GraphRuns ?? 0, advances0 = runtime?.DecodeAdvances ?? 0, builds0 = runtime?.GraphBuilds ?? 0;
-        for (int rep = 0; rep < 3; rep++)
+        for (int rep = 0; rep < reps; rep++)
         {
             model.ResetKVCache();
             float[] logits = model.ForwardRefill(depth > 0 ? Tokens(depth, rep + 3) : new[] { 1 });
+            int[] stream = Tokens(generate, rep + 11);
             var sw = Stopwatch.StartNew();
-            int next = 1000;
             for (int i = 0; i < generate; i++)
             {
-                int best = 0;
-                for (int v = 1; v < vocab; v++) if (logits[v] > logits[best]) best = v;
-                next = best;
+                int next = stream[i];
+                if (greedy)
+                {
+                    next = 0;
+                    for (int v = 1; v < vocab; v++) if (logits[v] > logits[next]) next = v;
+                }
                 logits = model.Forward(new[] { next });
             }
             rates.Add(generate / sw.Elapsed.TotalSeconds);
@@ -182,6 +193,12 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
         string counters = runtime == null ? "" :
             $"  graph runs +{runtime.GraphRuns - runs0}, decode advances +{runtime.DecodeAdvances - advances0}, graph builds +{runtime.GraphBuilds - builds0}";
         Console.WriteLine($"tg{generate}@d{depth}: {Median(rates):F1} tok/s  (runs {string.Join(", ", rates.Select(r => r.ToString("F1")))}){counters}");
+        Console.WriteLine(FormattableString.Invariant($"RESULT tg{generate}@d{depth} {Median(rates):F2} {rates.Min():F2} {rates.Max():F2}"));
+    }
+    if (runtime != null)
+    {
+        (long perToken, long rings) = runtime.KvCacheFootprint();
+        Console.WriteLine($"kv cache: {perToken} B/token (layers that keep every position) + {rings / 1048576.0:F1} MB of sliding-window rings a sequence");
     }
     return 0;
 }

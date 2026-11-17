@@ -67,3 +67,6 @@ library Python only; outputs go to the ignored `artifacts/lfm3/e2e/`.
   sets, optional llama-server reference).
 - Concurrency: `eng/validation/parallel-multiturn-webui.py --conversations 16 --greedy --plain`, with a
   `--sequential` run as the `--compare-with` control.
+
+Performance: `bench/` (README there) compares TensorSharp with llama.cpp - the llama-bench matrix on Metal, MLX and the
+CPU lanes, and serving against llama-server - with every arm interleaved.

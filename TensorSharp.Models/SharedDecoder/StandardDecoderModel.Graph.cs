@@ -1251,7 +1251,8 @@ namespace TensorSharp.Models
                     // Everything that changes what the step emits: a stream frees each node after the template's
                     // last reader, so a step that emits differently (other outputs, another stage) must not share it.
                     string floored = attentionFloors == null ? $"{attentionFloor > 0}" : string.Concat(Array.ConvertAll(attentionFloors, f => f > 0 ? '1' : '0'));
-                    kind = $"{rows}|{slots.Length}|{snapshots}|{floored}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}|{EmissionVariant(counts, starts)}";
+                    kind = $"{rows}|{slots.Length}|{snapshots}|{floored}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}|{EmissionVariant(counts, starts)}" +
+                        RingWrapVariant(counts, starts);
                     // A decode step that could advance runs as the recorded program instead, so it is kept for the next
                     // step to advance (a streamed step keeps nothing: decode would re-emit every node of every step).
                     if (_streamedKinds.Contains(kind) && !advance)
@@ -1705,7 +1706,7 @@ namespace TensorSharp.Models
             int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
             string kind = $"{rows}|{slots.Length}|{request.RecurrentSnapshots}|{string.Join(",", counts)}|{request.Shape}|" +
                           $"{request.LastRowLogits}|{request.AllRowLogits}|{request.CaptureFinal}|{string.Join(",", request.CaptureLayers)}|" +
-                          $"{request.PositionTable != null}|{EmissionVariant(counts, starts)}";
+                          $"{request.PositionTable != null}|{EmissionVariant(counts, starts)}" + RingWrapVariant(counts, starts);
             Tensor[] inputs = RankInputs(hidden);
             var steps = new GraphStep[ranks];
             var streams = new IGraphStream[ranks];
@@ -2171,13 +2172,16 @@ namespace TensorSharp.Models
                 || (caps.PaddedCacheAttention && kvType != GraphFormat.F32);
             // One sequence's rows written by index: a family may take their query/key prep and cache writes as one region, which
             // the rotated queries close once the rows are written (the caches' leaves and the write rows exist before it opens).
-            bool prep = step.Sequences == 1 && Indexed(step.Counts[0]) && TakesAttentionPrep(step, layer);
+            // (A sliding-window ring past its first lap writes its rows at their cells, which the prep region does not take.)
+            bool prep = step.Sequences == 1 && Indexed(step.Counts[0]) && !RingWrapped(layer, step.Starts[0], step.Counts[0])
+                && TakesAttentionPrep(step, layer);
             if (prep)
             {
                 Slot only = step.Slots[0];
+                int cells = CacheCells(layer, only.Capacity);
                 BeginAttentionPrep(step, layer, new AttentionPrepOperands(q, k, v,
-                    step.State(only.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, only.Capacity, kvHeads),
-                    step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, only.Capacity, kvHeads),
+                    step.State(only.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cells, kvHeads),
+                    step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads),
                     step.WriteRows(step.Starts[0], step.Counts[0], 0), heads, kvHeads, d, dv));
             }
             q = step.Cont(q);
@@ -2204,12 +2208,70 @@ namespace TensorSharp.Models
                 int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
                 int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
 
-                int cap = slot.Capacity;
+                // The layer's cells: a sliding-window layer's ring (StandardDecoderModel.SlidingRings.cs) holds at most its own.
+                int cap = CacheCells(layer, slot.Capacity);
+                int ring = RingOf(layer);
+                bool wrapped = RingWrapped(layer, start, count);
                 int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cap, kvHeads);
                 int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cap, kvHeads);
 
                 int fa;
-                if (Indexed(count))
+                if (Indexed(count) && wrapped)
+                {
+                    // Rows reaching a ring past its first lap: written at their cells, and attending the whole ring under the mask
+                    // of the positions its cells hold (one graph for every position on: decode steps advance in place).
+                    int rowsAt = step.RingWriteRows(start, count, s, ring);
+                    step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, rowsAt));
+                    step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, rowsAt));
+                    int gqa = heads / kvHeads;
+                    int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, ring, kvType, count, gqa });
+                    int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, ring, kvType, count, gqa });
+                    int mask = step.RingBandMask(ring, start, count, s, band);
+                    fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, mask, ring), scale,
+                        AttentionKvMax(step, layer, s));
+                }
+                else if (wrapped)
+                {
+                    // A prompt chunk over a ring past its first lap: its rows go to their cells (at most two runs), and it attends
+                    // the cached rows its first row's window reaches (at most two runs, in position order) and its own. The ring's
+                    // W - 1 + rows cells keep the two sets apart (MaxSequenceStepRows).
+                    (int c1, int n1, int c2, int n2) = RingRuns(ring, start, start + count);
+                    WriteRun(kFresh, ck, d, kRow, c1, 0, n1);
+                    WriteRun(vFresh, cv, dv, vRow, c1, 0, n1);
+                    if (n2 > 0)
+                    {
+                        WriteRun(kFresh, ck, d, kRow, c2, n1, n2);
+                        WriteRun(vFresh, cv, dv, vRow, c2, n1, n2);
+                    }
+                    int first = Math.Max(0, start - band + 1);
+                    (int p1, int m1, int p2, int m2) = RingRuns(ring, first, start);
+                    int kAttn = kFresh, vAttn = vFresh;
+                    if (m1 > 0)
+                    {
+                        kAttn = step.Op(GraphOp.Concat, stackalloc[] { ReadRuns(ck, d, kRow, p1, m1, p2, m2), kFresh }, stackalloc long[] { 1 });
+                        vAttn = step.Op(GraphOp.Concat, stackalloc[] { ReadRuns(cv, dv, vRow, p1, m1, p2, m2), vFresh }, stackalloc long[] { 1 });
+                    }
+                    int mask = step.BandCausalMask(first, start, count, s, band);
+                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, mask, start + count - first), scale);
+
+                    void WriteRun(int fresh, int cache, int width, long rowBytes, int cell, int from, int n)
+                        => step.Effect(step.Op(GraphOp.Cpy,
+                            step.View3(fresh, width, n, kvHeads, width * f, width * f * count, from * width * f),
+                            step.View3(cache, width, n, kvHeads, rowBytes, rowBytes * cap, cell * rowBytes)));
+
+                    int ReadRuns(int cache, int width, long rowBytes, int cell, int n, int cell2, int n2)
+                    {
+                        int run = Read(cell, n);
+                        return n2 > 0 ? step.Op(GraphOp.Concat, stackalloc[] { run, Read(cell2, n2) }, stackalloc long[] { 1 }) : run;
+
+                        int Read(int at, int rows)
+                        {
+                            int view = step.View3(cache, width, rows, kvHeads, rowBytes, rowBytes * cap, at * rowBytes);
+                            return kvType != GraphFormat.F32 ? step.Op(GraphOp.Cast, stackalloc[] { view }, stackalloc long[] { GraphFormat.F32 }) : view;
+                        }
+                    }
+                }
+                else if (Indexed(count))
                 {
                     // Decode and short chunks (a verify window): rows are written by index and
                     // attention reads the padded cache window under a causal mask, so every row is
@@ -2506,7 +2568,7 @@ namespace TensorSharp.Models
             private int _decodeMask = -1, _decodeMaskWindow = -1, _decodeMaskStart = -1, _decodeMaskCount = -1, _decodeMaskSequence = -1;
             // A chunk's write rows by (start, count): a step writes every sequence's chunk by index on executors that take
             // indexed cache writes at any width, and start * 64 + count had named (0, 2048) and (31, 64) alike.
-            private readonly Dictionary<(int Start, int Count, int Sequence), int> _writeIndex = new();
+            private readonly Dictionary<(int Start, int Count, int Sequence, int Ring), int> _writeIndex = new();
             private readonly HashSet<int> _strided = new();   // nodes whose layout is not contiguous
 
             private readonly bool _record;
@@ -2824,14 +2886,19 @@ namespace TensorSharp.Models
 
             /// <summary>The rows [count, 1] (I64) sequence <paramref name="sequence"/>'s short chunk is written at: start ..
             /// start + count - 1 (one input a sequence: an advance moves each sequence's on by its own rows).</summary>
-            internal int WriteRows(int start, int count, int sequence)
+            internal int WriteRows(int start, int count, int sequence) => RingWriteRows(start, count, sequence, 0);
+
+            /// <summary>The cells [count, 1] (I64) sequence <paramref name="sequence"/>'s rows are written at in a ring of
+            /// <paramref name="ring"/> cells (0: a linear cache, cell = position): (start + i) mod ring. An advance moves them
+            /// round the ring.</summary>
+            internal int RingWriteRows(int start, int count, int sequence, int ring)
             {
-                if (_writeIndex.TryGetValue((start, count, sequence), out int node)) return node;
+                if (_writeIndex.TryGetValue((start, count, sequence, ring), out int node)) return node;
                 node = Leaf(GraphLeafRole.Input, GraphFormat.I64, stackalloc long[] { count, 1 }, IntPtr.Zero, 0);
                 var rows = new long[count];
-                for (int i = 0; i < count; i++) rows[i] = start + i;
-                AddInput(node, Pin(rows), count * sizeof(long), kind: InputKind.WriteRows, values: rows, sequence: sequence);
-                _writeIndex[(start, count, sequence)] = node;
+                for (int i = 0; i < count; i++) rows[i] = ring > 0 ? (start + i) % ring : start + i;
+                AddInput(node, Pin(rows), count * sizeof(long), kind: InputKind.WriteRows, values: rows, sequence: sequence, ring: ring);
+                _writeIndex[(start, count, sequence, ring)] = node;
                 return node;
             }
 
@@ -2894,6 +2961,50 @@ namespace TensorSharp.Models
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort));
                 (_bandMasks ??= new())[key] = node;
                 return node;
+            }
+
+            /// <summary>Ring band masks of this step by (ring, start, count, sequence, band): every ring layer of one geometry reads
+            /// the same input.</summary>
+            private Dictionary<(int Ring, int Start, int Count, int Sequence, int Band), int> _ringMasks;
+
+            /// <summary>
+            /// A sliding-window F16 mask [<paramref name="ring"/>, count] of sequence <paramref name="sequence"/> over a ring's
+            /// cells, position p in cell p mod ring: row q (position start + q) sees the cells of positions
+            /// (start + q - <paramref name="band"/>, start + q] (none before the sequence's attention floor). The ring holds
+            /// those positions (ring &gt;= band - 1 + count), so the open cells are one run round the ring. An advance moves it
+            /// (<see cref="TryAdvance(Tensor[], int[])"/>); a ring never runs out of cells.
+            /// </summary>
+            internal int RingBandMask(int ring, int start, int count, int sequence, int band)
+            {
+                if (band <= 0 || ring < band - 1 + count)
+                    throw new ArgumentOutOfRangeException(nameof(ring), ring, $"a ring of {ring} cells does not hold a {band}-key window and {count} rows");
+                var key = (ring, start, count, sequence, band);
+                if (_ringMasks != null && _ringMasks.TryGetValue(key, out int cached)) return cached;
+                var mask = new ushort[(long)ring * count];
+                FillRingBandRows(mask, ring, start, count, FloorOf(sequence), band);
+                int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { ring, count }, IntPtr.Zero, 0);
+                AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
+                    window: ring, start: start, count: count, sequence: sequence, band: band, ring: ring);
+                (_ringMasks ??= new())[key] = node;
+                return node;
+            }
+
+            /// <summary>A ring band mask (<see cref="RingBandMask"/>): each row zero over the cells of its window's positions,
+            /// -inf elsewhere.</summary>
+            private static void FillRingBandRows(ushort[] mask, int ring, int start, int count, int attentionFloor, int band)
+            {
+                const ushort negInf = 0xFC00;
+                mask.AsSpan(0, ring * count).Fill(negInf);
+                for (int q = 0; q < count; q++)
+                {
+                    Span<ushort> row = mask.AsSpan(q * ring, ring);
+                    int p = start + q, lo = Math.Max(attentionFloor, p - band + 1);
+                    if (lo > p) continue;
+                    int cell = lo % ring, n = p - lo + 1;
+                    int first = Math.Min(n, ring - cell);
+                    row.Slice(cell, first).Clear();
+                    if (n > first) row[..(n - first)].Clear();
+                }
             }
 
             /// <summary>Whether a sliding-window mask of this step closes cells inside its window: rows that attend from past the
@@ -3018,14 +3129,14 @@ namespace TensorSharp.Models
             }
 
             private void AddInput(int node, IntPtr data, long bytes, object handle = null, InputKind kind = InputKind.Opaque,
-                Array values = null, int window = 0, int start = 0, int count = 0, int sequence = -1, int offset = 0, int band = 0)
+                Array values = null, int window = 0, int start = 0, int count = 0, int sequence = -1, int offset = 0, int band = 0, int ring = 0)
             {
                 _b.Sink?.InputData(node, data, bytes, handle);
                 _inputs.Add(node);
                 _inputData.Add(data);
                 _inputBytes.Add(bytes);
                 _inputHandles.Add(handle);
-                _inputMeta.Add(new InputMeta(kind, values, window, start, count, Sequence: sequence, Offset: offset, Band: band));
+                _inputMeta.Add(new InputMeta(kind, values, window, start, count, Sequence: sequence, Offset: offset, Band: band, Ring: ring));
             }
 
             private readonly List<object> _inputHandles = new();
@@ -3036,9 +3147,10 @@ namespace TensorSharp.Models
             private enum InputKind : byte { Opaque, Hidden, Positions, WriteRows, DecodeMask, Constant, Refill }
 
             /// <summary>A decode mask's <see cref="Window"/> cells cover cache rows [<see cref="Offset"/>, Offset + Window); a
-            /// sliding-window mask has its <see cref="Band"/> (0: causal).</summary>
+            /// sliding-window mask has its <see cref="Band"/> (0: causal). A mask or write rows over a sliding-window ring of
+            /// <see cref="Ring"/> cells (0: a linear cache) follow positions round it.</summary>
             private readonly record struct InputMeta(InputKind Kind, Array Values, int Window, int Start, int Count,
-                Func<bool> Refill = null, int Sequence = -1, int Offset = 0, int Band = 0);
+                Func<bool> Refill = null, int Sequence = -1, int Offset = 0, int Band = 0, int Ring = 0);
 
             /// <summary>An input the family rewrites when the step runs again one position on: <paramref name="refill"/>
             /// runs after the positions moved (through <see cref="RewriteInput"/>, or into the input's own array) and
@@ -3109,7 +3221,7 @@ namespace TensorSharp.Models
                 foreach (InputMeta m in _inputMeta)
                 {
                     if (m.Kind is InputKind.DecodeMask or InputKind.WriteRows && Delta(m.Sequence) < 1) return false;
-                    if (m.Kind == InputKind.DecodeMask && m.Start + m.Count + Delta(m.Sequence) > m.Offset + m.Window) return false;
+                    if (m.Kind == InputKind.DecodeMask && m.Ring == 0 && m.Start + m.Count + Delta(m.Sequence) > m.Offset + m.Window) return false;
                     if (m.Kind == InputKind.Positions && !uniform && m.Values.Length != Rows) return false;
                 }
                 if (_advanceLimits != null)
@@ -3147,13 +3259,18 @@ namespace TensorSharp.Models
                         case InputKind.WriteRows:
                         {
                             int d = Delta(m.Sequence);
-                            foreach (ref long r in ((long[])m.Values).AsSpan()) r += d;
+                            if (m.Ring > 0)
+                                foreach (ref long r in ((long[])m.Values).AsSpan()) r = (r + d) % m.Ring;
+                            else
+                                foreach (ref long r in ((long[])m.Values).AsSpan()) r += d;
                             break;
                         }
                         case InputKind.DecodeMask:
                         {
                             int d = Delta(m.Sequence);
-                            if (m.Band > 0)
+                            if (m.Ring > 0)
+                                FillRingBandRows((ushort[])m.Values, m.Ring, m.Start + d, m.Count, FloorOf(m.Sequence), m.Band);
+                            else if (m.Band > 0)
                                 MoveBandRows((ushort[])m.Values, m.Window, m.Offset, m.Start, m.Start + d, m.Count, FloorOf(m.Sequence), m.Band);
                             else
                                 OpenCausalRows((ushort[])m.Values, m.Window, m.Start, m.Start + d, m.Count, FloorOf(m.Sequence));

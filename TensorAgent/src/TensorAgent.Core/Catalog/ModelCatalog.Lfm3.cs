@@ -13,11 +13,11 @@ public static partial class ModelCatalog
     // config/lfm3-omni-2b.json's: sizes and SHA-256 are the LFS objects at the pinned commits,
     // checked against the Hugging Face tree API the same day.
     //
-    // KvBytesPerToken counts what the runtime allocates in its first version: a linear cache
-    // on all 11 attention layers, 11 x 4 x 128 x 2 x 2 bytes. Once the five sliding-window
-    // layers keep a fixed 256-row ring (llama.cpp's iSWA cache), only the six full layers grow
-    // with the context - 6 x 4 x 128 x 2 x 2 = 12,288 bytes - and this number should follow.
-    private const long Lfm3KvBytesPerToken = 11 * 4 * 128 * 2 * 2;
+    // KvBytesPerToken counts what grows with the context: the five sliding-window layers keep
+    // rings of 768 cells (window 256 + a 512-row step, llama.cpp's iSWA sizing: 7.5 MB a
+    // sequence at F16, StandardDecoderModel.SlidingRings.cs), so only the six full layers grow,
+    // 6 x 4 x 128 x 2 x 2 = 12,288 bytes a token (22,528 with linear caches on all eleven).
+    private const long Lfm3KvBytesPerToken = 6 * 4 * 128 * 2 * 2;
     private const string Lfm3License = "LFM Open License v1.0";
 
     private static CatalogModel Lfm3Text() => new()
@@ -35,10 +35,10 @@ public static partial class ModelCatalog
                 1_099_627_808, "3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4"),
         },
         Modalities = CatalogModalities.Text,
-        // The phone tier: a 1.1 GB mapped file and 0.7 GB of F16 K/V at the full window
+        // The phone tier: a 1.1 GB mapped file and 0.4 GB of F16 K/V at the full window
         // (charged twice on Metal) sit far inside a 12 GB phone's ~8.5 GB budget.
         MinDeviceMemoryGB = 12,
-        // A reasoning model: its traces need room (see qwen3.5-9b-iq4xs), and at 22 KiB a
+        // A reasoning model: its traces need room (see qwen3.5-9b-iq4xs), and at 12 KiB a
         // token the window is cheap. Desktop window 32,768.
         ContextLength = 32768,
         KvBytesPerToken = Lfm3KvBytesPerToken,

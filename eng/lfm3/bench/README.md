@@ -1,0 +1,36 @@
+# LFM3 benchmark tools
+
+TensorSharp against llama.cpp on one machine, with the arms interleaved so a shared machine's drift lands on both.
+Outputs belong in the ignored `artifacts/lfm3/`.
+
+Build first (Release, this checkout): `TENSORSHARP_GGML_NO_UPDATE=1 dotnet build eng/lfm3/Lfm3Probe -c Release` and
+`dotnet build TensorSharp.Server.Host -c Release`. llama.cpp comes from `LLAMA_CPP_DIR` (default
+`~/work/llama.cpp-lfm3`, Metal + BLAS build). MLX runs need `TENSORSHARP_MLX_LIBRARY_DIR` (a directory holding
+`libmlxc`, e.g. `InferenceWeb.Tests/bin/Release/net10.0`).
+
+- `run-matrix.sh [metal] [mlx] [cpu] [serve]`: the whole matrix (environment knobs in its header): every GPU quant's
+  pp512/pp4096 and tg128 at depths 0/4K/16K/32K on ggml_metal, MLX next to ggml_metal and llama.cpp, the CPU lanes
+  (ggml_cpu and the managed CPU against `llama-bench -ngl 0` at equal threads) and serving. Results under
+  `artifacts/lfm3/bench/<stamp>/`, one markdown table per section plus the raw logs and `conditions.txt` (load
+  before/after, commit).
+- `ab.py [--rounds N] NAME=COMMAND ...`: runs the commands alternately (the first arm rotating each round) and
+  tabulates each test's median of the rounds' medians with the min-max spread. Commands print
+  `RESULT name median min max` lines.
+- `ts-bench.sh MODEL BACKEND [PP,..|-] [TG] [DEPTH,..] [--reps N] [--greedy]`: `Lfm3Probe bench`, llama-bench's
+  tests: ppN is one prompt of N tokens (TensorSharp's `ForwardRefill`), tgN@dD decodes N pseudo-random tokens after a
+  D-token prompt (no sampling in the timed loop). It also prints the K/V footprint (bytes a token and the sliding-window
+  rings). `MAX_CONTEXT` must cover the deepest test.
+- `llama-bench-result.sh MODEL [PP,..|-] [TG] [DEPTH,..] [REPS] [-- llama-bench args]`: llama-bench (flash attention
+  on, its defaults otherwise: n_batch 2048, n_ubatch 512, 6 threads) with the same RESULT lines.
+- `serve-bench.py --engine {ts,llama} --model GGUF ...`: TensorSharp.Server.Host vs llama-server with one client over
+  streamed OpenAI chat completions: concurrency 1/4/16, prompts of 128/1024/4096 tokens (cut with llama-tokenize, a
+  unique first line per request), 256 output tokens (`ignore_eos`, greedy, no repetition penalty, thinking off). TTFT
+  p50/p95, per-request decode tok/s, aggregate tok/s and the server's peak physical footprint (`footprint`, Metal
+  buffers included; mapped weights are clean pages and not in it). llama-server runs `-np C` with continuous batching,
+  TensorSharp its scheduler with `TS_SCHED_MAX_RUNNING_SEQS=C`.
+- `metal-op-histogram.py LOG [--start REGEX]`: Metal dispatches per graph from a `GGML_METAL_GRAPH_DEBUG=1` log
+  (TensorSharp also needs `TS_GGML_LOG_DEBUG=1`; llama-bench needs `-v`). Graph starts: TensorSharp
+  `'^(GET_ROWS|RMS_NORM) node_0$'`, llama.cpp `'^RMS_NORM norm-0$'`.
+
+Machine discipline: run with nothing else on the GPU (`uptime` load under ~2, no other llama-server or test run),
+interleave (ab.py does), repeat at least three rounds, and quote the spreads.

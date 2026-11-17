@@ -166,8 +166,10 @@ namespace TensorSharp.Models
                 if (draft && rank > 0) return null;
                 IAllocator alloc = _mesh.Allocator(CacheStage(entry), rank);
                 int kvHeads = draft ? Config.NumKVHeads : _localKvHeads;
-                t = value ? new Tensor(alloc, dtype, kvHeads, capacity, _valueDim)
-                          : new Tensor(alloc, dtype, kvHeads, capacity, _keyDim);
+                // A sliding-window layer's ring holds at most its cells (StandardDecoderModel.SlidingRings.cs).
+                int cells = CacheCells(entry, capacity);
+                t = value ? new Tensor(alloc, dtype, kvHeads, cells, _valueDim)
+                          : new Tensor(alloc, dtype, kvHeads, cells, _keyDim);
             }
             InitializeCacheTensor(t);
             return t;
@@ -215,10 +217,11 @@ namespace TensorSharp.Models
         /// <summary>
         /// The sliding attention window of an attention layer: a query at position p attends the keys at positions
         /// (p - window, p] (llama.cpp's LLAMA_SWA_TYPE_STANDARD: a key is masked when p_query - p_key &gt;= window); 0 for
-        /// full causal attention (the default). The layer's cache stays linear - every position keeps its row, so slots,
-        /// checkpoints and prefix reuse are unchanged - and each step reads only the cells its rows' windows reach: the graph
-        /// path's cache window starts below the first row's window (or masks the band over a capacity window), the per-op
-        /// path's kernels start there.
+        /// full causal attention (the default). The layer keeps a ring of the window plus a prompt step's rows
+        /// (StandardDecoderModel.SlidingRings.cs): linear until a slot's positions reach it, where each step reads only the cells
+        /// its rows' windows reach (the graph path's cache window starts below the first row's window, or masks the band over a
+        /// capacity window; the per-op path's kernels start there), then the whole ring under the mask of the positions its
+        /// cells hold.
         /// </summary>
         protected virtual int SlidingWindow(int layer) => 0;
 
@@ -479,6 +482,7 @@ namespace TensorSharp.Models
             _maxContextLength = maxContext;
             _cacheCapacity = initial;
             InitExtraCaches();
+            InitRingCaches();
             (_cacheK, _cacheV) = AllocateCaches(initial);
             _cacheSeqLen = 0;
         }
@@ -510,10 +514,12 @@ namespace TensorSharp.Models
 
         private Tensor Grow(Tensor old, Tensor grown)
         {
-            if (_cacheSeqLen > 0)
+            // A ring past its first lap moves whole (its cells keep their positions: both have the ring's cells).
+            int rows = (int)Math.Min(_cacheSeqLen, old.Sizes[1]);
+            if (rows > 0)
             {
-                using Tensor src = old.Narrow(1, 0, _cacheSeqLen);
-                using Tensor dst = grown.Narrow(1, 0, _cacheSeqLen);
+                using Tensor src = old.Narrow(1, 0, rows);
+                using Tensor dst = grown.Narrow(1, 0, rows);
                 Ops.Copy(dst, src);
             }
             InvalidateTensorDeviceCache(old);
@@ -564,6 +570,9 @@ namespace TensorSharp.Models
                         $"{Config.Architecture} has recurrent layers: its cache truncates only to its length or to zero, not {tokenCount}.");
                 ResetRecurrentPrimary();
             }
+            if (!RingsKeepTruncation(_cacheSeqLen, tokenCount))
+                throw new NotSupportedException(
+                    $"{Config.Architecture}: its sliding-window rings overwrote positions a {tokenCount}-token history reads (length {_cacheSeqLen}).");
             base.TruncateKVCacheCore(tokenCount);
             foreach (Tensor t in AllCacheTensors(_cacheK)) InvalidateTensorDeviceCache(t);
             foreach (Tensor t in AllCacheTensors(_cacheV)) InvalidateTensorDeviceCache(t);
@@ -574,7 +583,9 @@ namespace TensorSharp.Models
         // snapshot restores exactly what a fresh prefill writes. The fingerprint carries the
         // mesh shape: a TP=2 snapshot holds half-head rows and must never reach a TP=1 cache.
 
-        public override bool SupportsKVStateSnapshot => LayerSplitGroup == null && _cacheK != null && !_anyRecurrent;
+        // Ring caches (sliding-window layers past their first lap) are not position-addressed pages.
+        public override bool SupportsKVStateSnapshot => LayerSplitGroup == null && _cacheK != null && !_anyRecurrent
+            && !HasRingCaches;
 
         public override string KVStateFingerprint =>
             $"{Config.Architecture}|decoder|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}" +
@@ -639,7 +650,9 @@ namespace TensorSharp.Models
             ArgumentNullException.ThrowIfNull(tokens);
             if (tokens.Length == 0) throw new ArgumentException("A forward needs at least one token.", nameof(tokens));
             if (LayerSplitGroup?.NodeCount > 1)
-                return ForwardDistributedPipeline(tokens);
+                return tokens.Length > _maxSequenceStepRows
+                    ? InRingSteps(tokens, true, (piece, _) => ForwardDistributedPipeline(piece))
+                    : ForwardDistributedPipeline(tokens);
             _logitsBuffer = RunSequence(tokens, wantLogits: true);
             _forwardCount++;
             return _logitsBuffer;
@@ -647,6 +660,8 @@ namespace TensorSharp.Models
 
         private float[] RunSequence(int[] tokens, bool wantLogits)
         {
+            if (tokens.Length > _maxSequenceStepRows)
+                return InRingSteps(tokens, wantLogits, RunSequence);
             SettlePendingVerify();
             int seqLen = tokens.Length;
             int start = _cacheSeqLen;
@@ -1048,8 +1063,10 @@ namespace TensorSharp.Models
             int band = SlidingWindow(layer);
             Tensor attn = batch != null
                 ? SlotAttention(scope, layer, q, k, v, batch)
+                : RingWrapped(layer, positions.Start, tokens)
+                    ? RingAttention(scope, cacheK, cacheV, RingOf(layer), q, k, v, positions.Start, tokens, band)
                 : decode
-                    ? DecodeAttention(scope, cacheK, cacheV, _cacheCapacity, q, k, v, positions.Start, band)
+                    ? DecodeAttention(scope, cacheK, cacheV, (int)cacheK.Sizes[1], q, k, v, positions.Start, band)
                     : AttendsWindowOnHost(cacheK, tokens)
                         ? WindowAttention(scope, cacheK, cacheV, q, k, v, positions.Start, tokens, band)
                         : PrefillAttention(scope, cacheK, cacheV, q, k, v, positions.Start, tokens, band);

@@ -17,7 +17,7 @@ using TensorSharp.Runtime.Scheduling;
 
 namespace InferenceWeb.Tests;
 
-public sealed class Lfm3RuntimeTests : IDisposable
+public sealed partial class Lfm3RuntimeTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-lfm3-runtime-" + Guid.NewGuid().ToString("N"));
     private readonly KvCacheDtype _dtype = KvCacheDtypeConfig.Current;
@@ -157,6 +157,7 @@ public sealed class Lfm3RuntimeTests : IDisposable
         var actual = new List<float[]> { (float[])model.ForwardRefill(prompt).Clone() };
         foreach (int token in decode) actual.Add((float[])model.Forward(new[] { token }).Clone());
         Assert.True(graphs ? model.GraphRuns > 0 : model.GraphRuns == 0, $"graphs={graphs} but {model.GraphRuns} graph runs");
+        AssertRingsWrapped(model, prompt.Length + decode.Length);
         AssertRows(actual, expected, tolerance, $"{backend} graphs={graphs}");
     }
 
@@ -351,6 +352,7 @@ public sealed class Lfm3RuntimeTests : IDisposable
             at += n;
         }
         Assert.Equal(prompt.Length, at);
+        AssertRingsWrapped(model, prompt.Length);
         double tolerance = RoundsActivations(backend) ? 2.5e-2 : 2e-3;
         Assert.True(RelL2(stepped, whole) <= tolerance, $"{backend}: token by token vs whole relL2 {RelL2(stepped, whole):E2}");
         Assert.True(RelL2(chunked, whole) <= tolerance, $"{backend}: chunked vs whole relL2 {RelL2(chunked, whole):E2}");
@@ -406,6 +408,7 @@ public sealed class Lfm3RuntimeTests : IDisposable
             Decode(new[] { "a", "b" }, 30);
             Decode(new[] { "b" }, 260);
             advances = model.DecodeAdvances;
+            AssertRingsWrapped(model, 0);
             return trace;
         }
 
@@ -428,11 +431,13 @@ public sealed class Lfm3RuntimeTests : IDisposable
     [InlineData("managed")]
     [InlineData("per-op")]
     public void VerifyWindowsAcrossTheWindowCommitTheKeptRows(string executor)
+        => AssertVerifyWindowCommits(executor, new[] { 41, 52, 63, 74, 85, 96 });
+
+    private void AssertVerifyWindowCommits(string executor, int[] prompt)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture("dense");
         BackendType backend = executor == "ggml" ? TestGates.PinnedGgmlBackend : BackendType.Cpu;
-        int[] prompt = { 41, 52, 63, 74, 85, 96 };
         int[] window = { 101, 112, 123, 134, 145 };
         int[] after = { 77, 78, 79 };
         const int kept = 2;
@@ -470,6 +475,7 @@ public sealed class Lfm3RuntimeTests : IDisposable
             float[] row = model.Forward(new[] { after[i] });
             Assert.True(RelL2(row, continued[i]) <= tolerance, $"{executor} after the commit, row {i}: relL2 {RelL2(row, continued[i]):E2}");
         }
+        AssertRingsWrapped(model, prompt.Length + window.Length);
     }
 
     // ---------------------------------------------------------------- the runtime's mechanisms

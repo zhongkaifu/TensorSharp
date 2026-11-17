@@ -65,8 +65,8 @@ public sealed class Lfm3CatalogTests
         Assert.Equal(CatalogArchitectureKind.Dense, model.Kind);
         Assert.Equal(12, model.MinDeviceMemoryGB);
         Assert.Contains(ModelCatalog.ForDevice(12), m => m.Id == id);
-        // Linear caches on all eleven attention layers (four KV heads of 128, F16).
-        Assert.Equal(11 * 4 * 128 * 2 * 2, model.KvBytesPerToken);
+        // The six full-attention layers (four KV heads of 128, F16); the five sliding-window layers keep fixed rings.
+        Assert.Equal(6 * 4 * 128 * 2 * 2, model.KvBytesPerToken);
         Assert.Equal(32768, model.ContextLength);
         Assert.Equal(32768, model.DesktopContextLength);
         Assert.Equal("f16", model.KvCacheDtype);
