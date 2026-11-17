@@ -25,6 +25,17 @@ namespace TensorSharp.Runtime
         public const string Lfm3ThinkClose = "</think>";
 
         /// <summary>
+        /// Whether an LFM3 template closes the reasoning block for thinking off
+        /// (<c>&lt;think&gt;&lt;/think&gt;</c> as the generation prompt's tail) - both published
+        /// templates do. LFM3-1.7B then still reasons in about a quarter of its math replies
+        /// and closes the block itself before answering (the model card: thinking off "can be
+        /// inconsistent"), so its replies are parsed with a stray-reasoning window
+        /// (<see cref="ChatProtocol.ThinkingOffReplyMayReason"/>).
+        /// </summary>
+        public static bool IsLfm3ThinkingOffTemplate(string? template)
+            => template != null && template.Contains(Lfm3ThinkOpen + Lfm3ThinkClose, StringComparison.Ordinal);
+
+        /// <summary>
         /// The placeholder for one still image, exactly as the LFM3 / LFM3-Omni templates
         /// render an <c>image</c> content part. The multimodal expander replaces the single
         /// <c>&lt;|image|&gt;</c> (125030) with the encoder's N rows, which gives

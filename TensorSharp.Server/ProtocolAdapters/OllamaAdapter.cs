@@ -663,7 +663,9 @@ public sealed class OllamaAdapter
         if (useParser || collector.IsParsed)
         {
             var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools);
-            string? thinkingOut = enableThinking && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
+            // As the stream does, and as the OpenAI adapter does: reasoning the parser separated
+            // with thinking off is the model's (see OpenAIChatAdapter), not dropped.
+            string? thinkingOut = !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
             finalMessage = OllamaResponseFactory.ChatNonStreamingMessage(knowledge.Normalize(parsed.Content), thinkingOut, parsed.ToolCalls);
             sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;
         }

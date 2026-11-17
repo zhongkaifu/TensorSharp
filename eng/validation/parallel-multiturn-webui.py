@@ -5,6 +5,10 @@ and check that concurrent serving keeps every conversation's state its own.
     parallel-multiturn-webui.py --url http://127.0.0.1:5100 --conversations 4 \
         --think on --max-tokens 1200 --out artifacts/parallel-multiturn/deepseek-tp6
 
+Up to 16 conversations. With --greedy, a --sequential run is the control for a concurrent
+one: pass its --out as --compare-with and the summary counts the turns whose answers differ
+(informational: batched decoding agrees with solo decoding only up to near-ties).
+
 Each conversation is its own Web UI session (POST /api/sessions) and posts its whole
 history every turn, as index.html does (POST /api/chat, SSE; assistant turns carry
 their `thinking`). Turns run in LOCKSTEP by default: every conversation sends turn k
@@ -42,9 +46,12 @@ import time
 import urllib.request
 
 TOPICS = ["Final Fantasy VII", "The Legend of Zelda: Ocarina of Time", "Chrono Trigger", "Half-Life 2",
-          "Super Mario 64", "Metal Gear Solid", "Portal", "StarCraft"]
+          "Super Mario 64", "Metal Gear Solid", "Portal", "StarCraft",
+          "Tetris", "Minecraft", "Pac-Man", "The Elder Scrolls V: Skyrim",
+          "Street Fighter II", "Civilization IV", "Doom (1993)", "Myst"]
 CODES = ["ORCHID-742", "FALCON-318", "GLACIER-905", "COBALT-261", "MERIDIAN-477", "SAFFRON-683",
-         "TUNDRA-529", "VORTEX-146"]
+         "TUNDRA-529", "VORTEX-146", "LANTERN-833", "PRAIRIE-207", "QUARTZ-594", "HARBOR-368",
+         "EMBER-715", "NEBULA-452", "CANYON-189", "SPRUCE-926"]
 
 
 def post_json(url, body=None, timeout=60):
@@ -110,6 +117,13 @@ def main():
     ap.add_argument("--no-lockstep", action="store_true", help="let conversations drift instead of turn barriers")
     ap.add_argument("--stagger", type=float, default=0.0,
                     help="start conversation i this many seconds times i after the first (implies --no-lockstep)")
+    ap.add_argument("--greedy", action="store_true",
+                    help="send temperature 0, top-k 1, no repetition penalty (the server must let requests "
+                         "set sampling: --sampling-precedence request), so --sequential runs are a control "
+                         "for the concurrent ones; compare with --compare-with")
+    ap.add_argument("--compare-with", help="a --sequential --greedy run's --out directory: count the turns whose "
+                                           "answers differ from it (informational; batched decoding agrees with "
+                                           "solo decoding up to near-ties)")
     ap.add_argument("--min-repeats", type=int, default=12)
     ap.add_argument("--min-tail-diversity", type=float, default=0.25)
     ap.add_argument("--timeout", type=int, default=3600)
@@ -152,6 +166,8 @@ def main():
                        "sessionId": session, "newChat": k == 0}
             if args.plain:
                 payload.update({"skills": [], "skills_discovery": False, "multi_agent": False})
+            if args.greedy:
+                payload.update({"temperature": 0, "topK": 1, "topP": 1, "minP": 0, "repeatPenalty": 1})
             t = {"turn": k + 1, "startedAt": round(time.time(), 3)}
             try:
                 thinking, text, done, frames, elapsed, ttft = stream_chat(args.url, payload, args.timeout)
@@ -222,6 +238,29 @@ def main():
             "kvReusedTokens": [t["kvReusedTokens"] for t in rows],
             "tokenCount": [t["tokenCount"] for t in rows],
             "tokPerSec": [t["tokPerSec"] for t in rows]})
+    if args.compare_with:
+        same = differ = 0
+        first_diff = []
+        for i in range(n):
+            try:
+                with open(os.path.join(args.compare_with, f"conversation{i}.json"), encoding="utf-8") as f:
+                    ref = json.load(f)
+            except OSError:
+                continue
+            mine = results[i] or {"turns": []}
+            for k, (a, b) in enumerate(zip(mine["turns"], ref["turns"])):
+                if "answer" not in a or "answer" not in b:
+                    continue
+                if a["answer"] == b["answer"] and a.get("thinking") == b.get("thinking"):
+                    same += 1
+                else:
+                    differ += 1
+                    x, y = a.get("thinking", "") + a["answer"], b.get("thinking", "") + b["answer"]
+                    at = next((j for j in range(min(len(x), len(y))) if x[j] != y[j]), min(len(x), len(y)))
+                    first_diff.append({"conversation": i, "turn": k + 1, "char": at,
+                                       "this": x[max(0, at - 40):at + 40], "control": y[max(0, at - 40):at + 40]})
+                    break   # later turns build on a different history
+        summary["againstControl"] = {"sameTurns": same, "differentTurns": differ, "firstDifferences": first_diff}
     with open(os.path.join(args.out, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=1)
     print(json.dumps({k: v for k, v in summary.items() if k != "configuration"}, ensure_ascii=False))

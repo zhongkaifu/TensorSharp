@@ -36,8 +36,15 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
   在 ggml_cpu 与托管 CPU 上运行的 4 个图像与音频用例全部一致。7 段已知原文的音频中有 5 段 ASR 词错误率为 0，
   另外两段各错一个词，且两个引擎错得完全相同。视频按模型自己的方式读取（2 fps 并带音轨），布局与 llama.cpp
   相差至多一行音频（见下文）；由于两边解码出的帧不同，回复在 6 到 14 个 token 后分叉。
-- **尚未验证：** 任何后端上的实际生成、设备上的 TensorAgent 应用，以及所有 CUDA 路径
-  （没有可用的 NVIDIA GPU；`config/lfm3-1.7b-nvfp4.json` 从未运行过）。尚未与 llama.cpp、vLLM、SGLang 对比速度。
+- **端到端（文本，2026-11-17，`eng/lfm3/e2e`）：** 服务器的 OpenAI chat completions、Responses、Web UI 接口与 CLI 由
+  20 个脚本化场景检查（流式、停止串、随机种子、思考及其预算、工具调用与 `tool_choice`、结构化输出、前缀复用、取消、健壮性），
+  覆盖 ggml_metal 上的 Q4_K_M、Q8_0、QAD-Q4_0、BF16、NVFP4 以及作为文本模型的 LFM3-Omni-2B，并在 MLX、ggml_cpu 与托管 CPU
+  上运行子集。与同一 GGUF 上的 llama-server 对比（贪心解码、相同的渲染提示）：GSM8K（关闭思考 200 题、开启思考 50 题）在
+  Q4_K_M（81.5% / 98%）与 Q8_0（86% / 98%）上得分相同，关闭思考时 92-93% 的回复文本完全一致；8K-128K 的大海捞针在两个引擎上全部
+  命中且回复一致；33 条指令遵循与 35 个函数调用用例得分相同或更高，差异来自下文两项行为（关闭思考时的游离推理、
+  `tool_choice`）。4 与 16 个并发对话、n-gram 推测解码（回复一致）与客户端取消均正常。超过 16K token 的提示处理慢于
+  llama.cpp（M5 Pro 上 32K 时约 3,000 对 5,400 token/s）；长提示之后的解码速度相当。
+- **尚未验证：** 设备上的 TensorAgent 应用，以及所有 CUDA 与 Vulkan 路径（`config/lfm3-1.7b-nvfp4.json` 从未运行过）。尚未与 vLLM、SGLang 对比。
 
 ## 运行
 
@@ -87,6 +94,13 @@ GGUF 模板按原样渲染：TensorSharp 的 Jinja 引擎把 `{% generation %}` 
   自己的对话会把过去轮次生成的 token 原样拼回，使下一轮精确延续 KV 缓存。客户端为当前轮次的工具轮次发送的推理会被保留，
   与模板一致。
 - `</think>`（124902）是单个 token：思考预算在此结束推理块并继续生成答案，`response_format` 语法也在其后生效。
+- 关闭思考时 1.7B 仍常常推理：它写出推理（有时先自己写一个 `<think>`），自行关闭推理块后再作答（Q4_K_M 贪心解码下，
+  200 道 GSM8K 中有 52 道、33 条指令提示中有 5 条如此；llama.cpp 生成的 token 相同）。模型卡也提示关闭思考"可能不稳定"。
+  TensorSharp 按 Nemotron-H Reasoning-128K 的方式解析这类回复：4,096 字符内出现的 `</think>` 使其之前的文本成为推理，
+  以 `reasoning_content`（OpenAI）或 `thinking`（Ollama、Web UI）返回，流式与非流式相同；模型自己打开的推理块像 Gemma 4
+  的未请求通道一样被限制（最多 64 个 token，在换行处关闭）。llama.cpp、vLLM 与 SGLang 会把这类回复连同 `</think>` 整体作为答案
+  返回。代价：不能撤回文本的流（OpenAI、Ollama、Responses、CLI）要等生成满 4,096 字符或回复结束才显示关闭思考时的答案；
+  Web UI 会立即显示并在之后撤回推理部分。
 - LFM3-Omni 不做推理：开启思考时它会立即关闭推理块。
 
 ### 工具调用
@@ -94,7 +108,9 @@ GGUF 模板按原样渲染：TensorSharp 的 Jinja 引擎把 `{% generation %}` 
 模型输出 Qwen3-Coder XML，并行调用之间以空行分隔。`Qwen35OutputParser` 负责解析，与 llama.cpp 为该模板使用的
 `qwen3-coder` 解析器一致：推理在 `</think>` 处结束，或在推理过程中写出 `<tool_call>` 时结束；声明为字符串的参数保留原文，
 其他声明类型按 JSON 解析。工具结果渲染为 `<|im_start|>tool\n<tool_response>\n…\n</tool_response>`，只依赖工具消息本身，
-因此工具轮次生成的 token 会被拼回，下一轮延续实时缓存。接受 `tool_choice: required`，但不用语法强制（与 Qwen 3.5 相同）。
+因此工具轮次生成的 token 会被拼回，下一轮延续实时缓存。`tool_choice: required` 与指定函数由语法（`QwenXmlToolGrammar`）强制：
+回复必须是对已声明函数（指定时只能是该函数）的合法调用，必需参数齐全，取值符合声明的类型与枚举；请求开启思考时语法在
+`</think>` 之后生效。`auto` 与 `none` 不受约束（`none` 不把工具放进提示）。llama-server 对该模板不强制指定函数。
 
 工具声明经由 TensorSharp 共用的工具构建器，保留每个参数的 `type`、`description` 与 `enum`，但不保留嵌套 schema（`items`、
 嵌套 `properties`、默认值）：这是所有模型族共有的限制，而 llama.cpp 与 vLLM 会原样打印客户端的 schema。
@@ -219,6 +235,6 @@ token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用�
 - 媒体输入与语音输出在 CUDA（直连与 ggml-cuda）和 Vulkan 上没有运行过（没有设备）。
 - 不提供以实时流方式输入语音（实时端点）；音频整段编码（30 秒一块）。
 - 无论客户端顺序如何，一条消息中的静态图都排在视频之前；以 `video_url` 发送的视频在它们之间没有位置。
-- `tool_choice: required` 不由语法强制；嵌套工具 schema 会被展平。
+- 提示中的嵌套工具 schema 会被展平（工具调用语法读取客户端原始 schema）。
 - 在滑动窗口环形缓存落地之前，TensorAgent 目录按每 token 22,528 字节 K/V 计算；QAD-Q4_0 文件尚未列入目录，等待与 Q4_K_M
   的质量与速度测量。

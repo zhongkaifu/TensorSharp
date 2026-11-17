@@ -45,6 +45,16 @@ namespace TensorSharp.Runtime
         // idle timeout closes them. Clients that can take text back are not held.
         internal const int NemotronHStrayReasoningWindow = 2048;
 
+        // The same for LFM3 (ChatTemplate.IsLfm3ThinkingOffTemplate). With thinking off,
+        // LFM3-1.7B Q4_K_M (greedy, Metal) reasoned and closed the block itself in 52 of 200
+        // GSM8K replies and 5 of 33 instruction-following prompts, llama.cpp's replies alike
+        // (eng/lfm3/e2e): the answer the client read was "reasoning</think>answer". The 57
+        // closes came at 83-3562 characters, median 1983, 95th percentile 3425; 2048 would
+        // have caught 32 of them, 4096 catches all. Same price as above, at LFM3's speed: an
+        // answer longer than this shows its first character on a stream that cannot take text
+        // back after about 1,000 tokens, 5-6 s at the 1.7B's ~180 tok/s on an M5 Pro.
+        internal const int Lfm3StrayReasoningWindow = 4096;
+
         private static readonly object Gate = new();
         private static readonly Dictionary<string, ChatProtocol> ByArchitecture =
             new(StringComparer.OrdinalIgnoreCase);
@@ -241,7 +251,13 @@ namespace TensorSharp.Runtime
                 // Reasoning ends at `</think>`, or at a `<tool_call>` written while still
                 // reasoning; calls are the Qwen3-Coder XML body. llama.cpp routes this
                 // template to its Qwen3-Coder parser with the same end tags.
-                CreateOutputParser = () => new Qwen35OutputParser(),
+                CreateOutputParser = () => new Qwen35OutputParser(Lfm3StrayReasoningWindow),
+                // With thinking off (prompt ends `<think></think>`) the 1.7B often reasons
+                // anyway and closes the block itself: the reply opens undecided and a close
+                // within the window makes it reasoning. llama.cpp, vLLM and SGLang return
+                // such a reply whole as the answer, `</think>` and all (their parsers do not
+                // look for reasoning with thinking off).
+                ThinkingOffReplyMayReason = ChatTemplate.IsLfm3ThinkingOffTemplate,
                 // The generation prompt ends `<think>` (on) or `<think></think>` (off), no
                 // newline; past turns re-render as `<think></think>` + answer with their
                 // reasoning dropped, so the cache's raw turn needs the suffix back and the
@@ -260,6 +276,14 @@ namespace TensorSharp.Runtime
                 // `</think>` is one token (124902): a budget closes the block and the
                 // answer follows. No hand-over sentence: none is published for LFM3.
                 ThinkingBudgetEndToken = ChatTemplate.Lfm3ThinkClose,
+                // `<think>` (124901) is one token too, and with thinking off the 1.7B
+                // sometimes writes it itself right after the prompt's `<think></think>` and
+                // reasons on (4 of 33 instruction prompts): the client asked for no
+                // reasoning and, past max_tokens, got an empty answer. Declaring the opener
+                // caps such a block (UnrequestedThinkingBudgetFor, at a line break past a
+                // quarter of max_tokens, at most 64 tokens); a requested block opens in the
+                // prompt and keeps its ordinary budget.
+                ThinkingBudgetOpenToken = ChatTemplate.Lfm3ThinkOpen,
             });
 
             // ---- GPT-OSS / Harmony -----------------------------------------
