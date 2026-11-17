@@ -240,6 +240,74 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>The engine's step executor (tests).</summary>
         internal BatchExecutor ExecutorForTests => _executor;
 
+        // Requests being prepared for submission (BeginPreparation), and the signal each one's end raises.
+        private int _preparing;
+        private readonly ManualResetEventSlim _preparationEnded = new(false);
+
+        /// <summary>The longest an idle engine holds its first step for requests still being prepared
+        /// (<see cref="BeginPreparation"/>).</summary>
+        internal static readonly TimeSpan DefaultPreparationWait = TimeSpan.FromMilliseconds(20);
+
+        /// <summary><see cref="DefaultPreparationWait"/>, settable for tests.</summary>
+        internal TimeSpan PreparationWait { get; set; } = DefaultPreparationWait;
+
+        /// <summary>Steps an idle engine held for requests still being prepared (tests).</summary>
+        internal long StepsHeldForPreparation => Interlocked.Read(ref _stepsHeldForPreparation);
+        private long _stepsHeldForPreparation;
+
+        /// <summary>
+        /// A request is being prepared for this engine (its prompt rendered and tokenized): dispose the result once it was
+        /// submitted (<see cref="SubmitRequest"/>) or abandoned. While any request is, an engine with nothing running holds
+        /// the step that would start the requests already submitted until those being prepared were submitted too (at most
+        /// <see cref="PreparationWait"/>), so requests that arrive together prefill in one step. Started at the first
+        /// submission, four Qwen3.8-27B conversations sent together (all submitted within 0.4 ms) prefilled in two steps, the
+        /// first taking one, two or three of them, and the others' first tokens waited for that step whole: up to 0.21 s, where
+        /// one step of all four gives every one of them its first token by 0.16 s (an RTX PRO 6000 slice). A lone request ends
+        /// its own preparation when it is submitted, so it never waits.
+        /// </summary>
+        public IDisposable BeginPreparation()
+        {
+            Interlocked.Increment(ref _preparing);
+            return new PreparationScope(this);
+        }
+
+        private sealed class PreparationScope(InferenceEngine engine) : IDisposable
+        {
+            private int _ended;
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _ended, 1) != 0) return;
+                Interlocked.Decrement(ref engine._preparing);
+                engine._preparationEnded.Set();
+            }
+        }
+
+        /// <summary>
+        /// With nothing running, wait (at most <see cref="PreparationWait"/>) until no request is being prepared, then take the
+        /// commands their submissions queued, so the next step admits them with the requests already waiting. Running requests
+        /// are never held: requests arriving beside them join at the next step boundary.
+        /// </summary>
+        private void AwaitPreparedSubmissions()
+        {
+            if (Volatile.Read(ref _preparing) <= 0 || _scheduler.RunningCount > 0 || PreparationWait <= TimeSpan.Zero) return;
+            Interlocked.Increment(ref _stepsHeldForPreparation);
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            while (Volatile.Read(ref _preparing) > 0 && !_shutdownCts.IsCancellationRequested)
+            {
+                _preparationEnded.Reset();
+                if (Volatile.Read(ref _preparing) <= 0) break;
+                TimeSpan left = PreparationWait - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                if (left <= TimeSpan.Zero) break;
+                _preparationEnded.Wait(left);
+            }
+            while (_commands.Reader.TryRead(out var cmd))
+            {
+                lock (_model.GpuComputeLock)
+                    ApplyCommand(cmd);
+            }
+        }
+
         /// <summary>Submit a sequence for inference. Returns immediately with a
         /// handle whose <see cref="InferenceRequestHandle.Tokens"/> channel
         /// streams sampled tokens.</summary>
@@ -369,6 +437,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_disposed) return;
                 _disposed = true;
                 _shutdownCts.Cancel();
+                _preparationEnded.Set();
                 _commands.Writer.TryComplete();
             }
             // Wait for the worker to actually leave its step. The caller is about to
@@ -470,6 +539,8 @@ namespace TensorSharp.Runtime.Scheduling
                     catch (OperationCanceledException) { break; }
                     continue;
                 }
+
+                AwaitPreparedSubmissions();
 
                 // Admission materializes model payloads, and completion captures them.
                 // They share the same compute gate as forwarding and media encoders.

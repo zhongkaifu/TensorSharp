@@ -470,6 +470,9 @@ namespace TensorSharp.Server
                     "(the model supports neither IBatchedPagedModel.ForwardBatch " +
                     "nor IModelArchitecture.SupportsKVStateSnapshot).");
             }
+            // Until this request is submitted, an idle engine holds the step that would start the requests already submitted
+            // (at most a few milliseconds), so requests sent together prefill together (InferenceEngine.BeginPreparation).
+            using IDisposable preparing = engine.BeginPreparation();
             var enginePoolStats = engine.PoolStats;
             long engineCapacityLong = (long)enginePoolStats.totalBlocks * enginePoolStats.blockSize;
             int engineContextLimit = (int)Math.Min(int.MaxValue, engineCapacityLong);
@@ -807,6 +810,7 @@ namespace TensorSharp.Server
                 throw new ModelUnloadedException(ex);
             }
             submitted = true;
+            preparing.Dispose();
             generatedTokens = new List<int>();
             var rawBytes = new List<byte>();
             int prevValidLen = 0;
