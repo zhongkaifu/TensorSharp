@@ -126,6 +126,8 @@ namespace TensorSharp.Cli
         private readonly List<(string Path, string Content)> _pendingTextFiles
             = new List<(string Path, string Content)>();
         private bool _pendingIsVideo;
+        // The /video clip itself, beside its extracted frames (ChatMessage.VideoFilePaths).
+        private string _pendingVideoFile;
 
         private volatile InteractiveChatLoop _chatLoop;
         // Commands run on the session loop; Ctrl+C arrives on a console event
@@ -739,6 +741,7 @@ namespace TensorSharp.Cli
 
             _pendingImages.AddRange(frames);
             _pendingIsVideo = true;
+            _pendingVideoFile = Path.GetFullPath(path);
             Console.WriteLine($"Video attached: {path}. Extracted {frames.Count} frame(s) for next turn.");
         }
 
@@ -786,6 +789,7 @@ namespace TensorSharp.Cli
             _pendingAudios.Clear();
             _pendingTextFiles.Clear();
             _pendingIsVideo = false;
+            _pendingVideoFile = null;
             Console.WriteLine(total > 0
                 ? $"Dropped {total} pending attachment(s)."
                 : "No pending attachments.");
@@ -1479,6 +1483,7 @@ namespace TensorSharp.Cli
                     ? _pendingTextFiles.Select(f => f.Path).ToList()
                     : null,
                 IsVideo = _pendingIsVideo,
+                VideoFilePaths = _pendingVideoFile != null ? new List<string> { _pendingVideoFile } : null,
             };
             _history.Add(userMsg);
             // These attachments belong to the submitted user message even if an
@@ -1488,6 +1493,7 @@ namespace TensorSharp.Cli
             _pendingAudios.Clear();
             _pendingTextFiles.Clear();
             _pendingIsVideo = false;
+            _pendingVideoFile = null;
 
             var rendered = new List<ChatMessage>();
             // ONE leading system message carrying both, never two: several chat

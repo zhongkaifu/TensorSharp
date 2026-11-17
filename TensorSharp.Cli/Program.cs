@@ -1748,13 +1748,15 @@ namespace TensorSharp.Cli
             using var inference = new CliInferenceSession(model,
                 SchedulerConfig.FromEnvironment().WithSpeculation(
                     SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin)), _log);
+            // The clip itself beside its extracted frames (ChatMessage.VideoFilePaths).
+            List<string> videoFilePaths = videoPath != null ? new List<string> { videoPath } : null;
             RunWarmupPasses(model, inference, warmupInferenceRuns, maxTokens,
                 warmupDecodeTokens => _ = RunInference(model, rawText, imagePaths, warmupDecodeTokens, audioPaths,
                     isVideo: videoPath != null, samplingConfig: samplingConfig,
                     enableThinking: enableThinking, tools: tools, silent: true,
                     preserveAllInput: pdfPath != null,
                     specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
-                    systemPrompt: systemPrompt, inference: inference));
+                    systemPrompt: systemPrompt, inference: inference, videoFilePaths: videoFilePaths));
 
             // With skills in play the model may answer by asking to read one first. Those
             // reads are served here, in process, and the loop re-enters — so a single-shot
@@ -1769,7 +1771,7 @@ namespace TensorSharp.Cli
                     specDraftMax, specDraftConfMin, systemPrompt,
                     skillToolContext, skillOptions.RoundsFor(skillToolContext.CodeRunner is { CanRun: true }),
                     SkillCapabilities.For(model.Config.Architecture).ToolResultsRendered,
-                    clientTools, inference);
+                    clientTools, inference, videoFilePaths);
             }
             else
             {
@@ -1778,7 +1780,7 @@ namespace TensorSharp.Cli
                     enableThinking: enableThinking, tools: tools,
                     preserveAllInput: pdfPath != null,
                     specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
-                    systemPrompt: systemPrompt, inference: inference);
+                    systemPrompt: systemPrompt, inference: inference, videoFilePaths: videoFilePaths);
             }
 
             _log.LogInformation(LogEventIds.ChatCompleted,
@@ -2694,7 +2696,8 @@ namespace TensorSharp.Cli
             bool enableThinking, List<ToolFunction> tools, bool preserveAllInput,
             int specDraftMax, float specDraftConfMin, string systemPrompt,
             SkillToolContext skillContext, int maxRounds, bool toolResultsRendered,
-            List<ToolFunction> clientTools = null, CliInferenceSession inference = null)
+            List<ToolFunction> clientTools = null, CliInferenceSession inference = null,
+            List<string> videoFilePaths = null)
         {
             var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
             using var ownedInference = inference == null
@@ -2717,7 +2720,7 @@ namespace TensorSharp.Cli
                     specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
                     systemPrompt: systemPrompt,
                     priorTurns: priorTurns.Count > 0 ? priorTurns : null,
-                    onParsed: p => parsed = p, inference: inference,
+                    onParsed: p => parsed = p, inference: inference, videoFilePaths: videoFilePaths,
                     onGenerated: (tokens, whitespace) => { rawTokens = tokens; rawTrailingWhitespace = whitespace; });
 
                 // Three ways, so a name nobody declared is answered here rather than
@@ -2776,7 +2779,7 @@ namespace TensorSharp.Cli
                 // past the window.
                 AddSkillResultsWithinContext(model, rawText, imagePaths, audioPaths, isVideo, systemPrompt,
                     priorTurns, roundResults, tools, enableThinking, maxTokens, toolResultsRendered, round,
-                    SkillRoundTrailingNote(round, rounds, toolResultsRendered));
+                    SkillRoundTrailingNote(round, rounds, toolResultsRendered), videoFilePaths);
             }
 
             _log.LogWarning(LogEventIds.SkillLoopCapped,
@@ -2786,7 +2789,8 @@ namespace TensorSharp.Cli
                 enableThinking: enableThinking, tools: tools,
                 preserveAllInput: preserveAllInput,
                 specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
-                systemPrompt: systemPrompt, priorTurns: priorTurns, inference: inference);
+                systemPrompt: systemPrompt, priorTurns: priorTurns, inference: inference,
+                videoFilePaths: videoFilePaths);
         }
 
         /// <summary>The note that ends the skills loop, placed after the last round's results
@@ -2811,7 +2815,7 @@ namespace TensorSharp.Cli
             ModelBase model, string rawText, List<string> imagePaths, List<string> audioPaths, bool isVideo,
             string systemPrompt, List<ChatMessage> priorTurns, List<(string Content, string Tool)> results,
             List<ToolFunction> tools, bool enableThinking, int maxTokens, bool toolResultsRendered, int round,
-            ChatMessage trailing = null)
+            ChatMessage trailing = null, List<string> videoFilePaths = null)
         {
             int firstResult = priorTurns.Count;
             void Place(IReadOnlyList<string> contents)
@@ -2837,7 +2841,7 @@ namespace TensorSharp.Cli
                 model.Config.Architecture, addGenerationPrompt: true,
                 tools: tools, enableThinking: enableThinking);
             List<ChatMessage> NextRound() =>
-                BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns);
+                BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns, videoFilePaths);
 
             int promptLimit = SkillRoundPromptLimit(model, maxTokens, NextRound(), Render);
             IReadOnlyList<string> fitted = TensorSharp.Server.Skills.ToolResultContextBudget.Fit(
@@ -2898,12 +2902,19 @@ namespace TensorSharp.Cli
         /// <summary>The messages one single-shot round renders: the system turn, the user's
         /// request, and the assistant/tool exchanges earlier rounds produced.</summary>
         static List<ChatMessage> BuildInferenceMessages(string systemPrompt, string rawText,
-            List<string> imagePaths, List<string> audioPaths, bool isVideo, List<ChatMessage> priorTurns)
+            List<string> imagePaths, List<string> audioPaths, bool isVideo, List<ChatMessage> priorTurns,
+            List<string> videoFilePaths = null)
         {
             var messages = new List<ChatMessage>();
             if (!string.IsNullOrWhiteSpace(systemPrompt))
                 messages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
-            messages.Add(new ChatMessage { Role = "user", Content = rawText, ImagePaths = imagePaths, AudioPaths = audioPaths, IsVideo = isVideo });
+            // --video: imagePaths holds the frames extracted for families that see frames; the clip itself
+            // (videoFilePaths) is what a family that samples video itself reads (LFM3-Omni: 2 fps + soundtrack).
+            messages.Add(new ChatMessage
+            {
+                Role = "user", Content = rawText, ImagePaths = imagePaths, AudioPaths = audioPaths, IsVideo = isVideo,
+                VideoFilePaths = videoFilePaths,
+            });
             if (priorTurns != null)
                 messages.AddRange(priorTurns);
             return messages;
@@ -2945,9 +2956,9 @@ namespace TensorSharp.Cli
             bool preserveAllInput = false, int specDraftMax = 0, float specDraftConfMin = -1f,
             string systemPrompt = null, List<ChatMessage> priorTurns = null,
             Action<ParsedOutput> onParsed = null, CliInferenceSession inference = null,
-            Action<List<int>, string> onGenerated = null)
+            Action<List<int>, string> onGenerated = null, List<string> videoFilePaths = null)
         {
-            var messages = BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns);
+            var messages = BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns, videoFilePaths);
 
             var inputTokens = new KVCachePromptRenderer(PromptRenderer).RenderToTokens(
                 model.Tokenizer, model.Config.ChatTemplate, messages, model.Config.Architecture,

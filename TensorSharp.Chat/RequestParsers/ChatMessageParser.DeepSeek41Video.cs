@@ -10,13 +10,38 @@ namespace TensorSharp.Server.RequestParsers
 {
     internal static partial class ChatMessageParser
     {
+        /// <summary>
+        /// An OpenAI chat <c>video_url</c> part's object: <c>{"url": "data:video/...;base64,...", "fps"?, "max_frames"?}</c>.
+        /// </summary>
         private static void AppendSampledVideo(ChatMessage message, JsonElement video,
             UploadStoragePolicy uploads)
         {
             if (video.ValueKind != JsonValueKind.Object || !video.TryGetProperty("url", out var urlElement) ||
                 urlElement.ValueKind != JsonValueKind.String)
                 throw new JsonException("video_url must contain a base64 video data URI in url.");
-            string url = urlElement.GetString();
+            AppendSampledVideo(message, urlElement.GetString(), video, uploads);
+        }
+
+        /// <summary>
+        /// A Responses <c>input_video</c> part: <c>{"type": "input_video", "video_url": "data:video/...;base64,...",
+        /// "fps"?, "max_frames"?}</c> - the shape of <c>input_image</c>, with <c>video_url</c>'s sampling options.
+        /// </summary>
+        private static void AppendResponsesVideo(ChatMessage message, JsonElement part, UploadStoragePolicy uploads)
+        {
+            if (!part.TryGetProperty("video_url", out var urlElement) || urlElement.ValueKind != JsonValueKind.String)
+                throw new JsonException("input_video.video_url must contain a base64 video data URI.");
+            AppendSampledVideo(message, urlElement.GetString(), part, uploads);
+        }
+
+        /// <summary>
+        /// Save the clip of a data URI to the upload directory, sample its frames into <see cref="ChatMessage.ImagePaths"/>
+        /// (timed, <see cref="ChatMessage.ImageTimestamps"/>) at <paramref name="options"/>' <c>fps</c> / <c>max_frames</c>,
+        /// and name the saved clip in <see cref="ChatMessage.VideoFilePaths"/>, so a family that samples a video itself
+        /// (LFM3-Omni: its own 2 fps frames and the soundtrack) reads the file instead of the frames.
+        /// </summary>
+        private static void AppendSampledVideo(ChatMessage message, string url, JsonElement options,
+            UploadStoragePolicy uploads)
+        {
             int comma = url?.IndexOf(',') ?? -1;
             if (comma <= 0 || !url.StartsWith("data:video/", StringComparison.Ordinal) ||
                 !url.AsSpan(0, comma).EndsWith(";base64", StringComparison.Ordinal))
@@ -31,10 +56,10 @@ namespace TensorSharp.Server.RequestParsers
             double fps = MediaHelper.GetConfiguredVideoSampleFps();
             int maxFrames = MediaHelper.GetConfiguredMaxVideoFrames();
             if (maxFrames <= 0) maxFrames = 16;
-            if (video.TryGetProperty("fps", out var fpsElement) &&
+            if (options.TryGetProperty("fps", out var fpsElement) &&
                 (fpsElement.ValueKind != JsonValueKind.Number || !fpsElement.TryGetDouble(out fps)))
                 throw new JsonException("video_url.fps must be a number.");
-            if (video.TryGetProperty("max_frames", out var countElement) &&
+            if (options.TryGetProperty("max_frames", out var countElement) &&
                 (countElement.ValueKind != JsonValueKind.Number || !countElement.TryGetInt32(out maxFrames)))
                 throw new JsonException("video_url.max_frames must be an integer.");
             if (!double.IsFinite(fps) || fps <= 0 || fps > 60 || maxFrames <= 0 || maxFrames > 64)
@@ -61,6 +86,7 @@ namespace TensorSharp.Server.RequestParsers
                 message.ImagePaths.AddRange(frames);
                 foreach (double time in timestamps) message.ImageTimestamps.Add(time);
                 message.IsVideo = true;
+                (message.VideoFilePaths ??= new List<string>()).Add(path);
             }
             catch (Exception ex)
             {

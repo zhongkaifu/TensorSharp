@@ -52,6 +52,9 @@ namespace TensorSharp.Server.RequestParsers
 
                 msg.ImagePaths = StringList(msgEl, "imagePaths");
                 msg.AudioPaths = StringList(msgEl, "audioPaths");
+                // The clips themselves (imagePaths carries the frames the upload extracted): a
+                // family that samples video itself reads these (ChatMessage.VideoFilePaths).
+                msg.VideoFilePaths = StringList(msgEl, "videoFilePaths");
 
                 // Text uploads usually inline their content into msg.Content. Large CSV
                 // tables use the explicit fileBacked attachment marker instead; either
@@ -180,6 +183,7 @@ namespace TensorSharp.Server.RequestParsers
             {
                 string error = ResolvePathList(msg?.ImagePaths, uploadRoot)
                     ?? ResolvePathList(msg?.AudioPaths, uploadRoot)
+                    ?? ResolvePathList(msg?.VideoFilePaths, uploadRoot)
                     ?? ResolvePathList(msg?.TextFilePaths, uploadRoot)
                     ?? ResolvePathList(msg?.AttachmentPaths, uploadRoot);
                 if (error != null)
@@ -464,7 +468,10 @@ namespace TensorSharp.Server.RequestParsers
         /// Parse the Responses API <c>input</c> field, which is either a plain
         /// string (shorthand for a single user turn) or an array of message
         /// items: <c>{role, content: string | [{type:"input_text"|"output_text", text} |
-        /// {type:"input_image", image_url}]}</c>. An optional <c>instructions</c>
+        /// {type:"input_image", image_url} | {type:"input_audio", input_audio} |
+        /// {type:"input_video", video_url, fps?, max_frames?}]}</c> (<c>input_video</c> only for a
+        /// protocol that samples video, <see cref="ChatProtocol.CapsVideoFrames"/>, as the chat
+        /// endpoint's <c>video_url</c>). An optional <c>instructions</c>
         /// string is prepended as a system message, matching how the real API
         /// folds it into the model's system prompt.
         /// </summary>
@@ -584,6 +591,12 @@ namespace TensorSharp.Server.RequestParsers
                             if (audioPath != null)
                                 msg.AudioPaths.Add(audioPath);
                         }
+                        else if (partType == "input_video")
+                        {
+                            if (ChatProtocolRegistry.For(architecture)?.CapsVideoFrames != true)
+                                throw new JsonException("input_video is not supported by this model's chat protocol.");
+                            AppendResponsesVideo(msg, part, uploads);
+                        }
                         else if (partType == "input_image")
                         {
                             string url = part.TryGetProperty("image_url", out var u)
@@ -596,6 +609,8 @@ namespace TensorSharp.Server.RequestParsers
                             {
                                 string b64 = url.Substring(commaIdx + 1);
                                 msg.ImagePaths.Add(WriteBase64Image(b64, uploads));
+                                // A still beside an input_video's timed frames keeps no time.
+                                msg.ImageTimestamps?.Add(null);
                             }
                             else if (!string.IsNullOrEmpty(url))
                             {
