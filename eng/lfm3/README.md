@@ -24,3 +24,6 @@ in the ignored `artifacts/lfm3/`.
 
 MLX runs need `TENSORSHARP_MLX_LIBRARY_DIR` pointing at a directory holding `libmlxc` (for example the test project's
 output).
+
+Performance: `bench/` (README there) compares TensorSharp with llama.cpp - the llama-bench matrix on Metal, MLX and the
+CPU lanes, and serving against llama-server - with every arm interleaved.
