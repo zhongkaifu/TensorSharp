@@ -1,0 +1,1561 @@
+{
+ "generator": "eng/lfm3/chat-template-fixtures.py",
+ "source": "llama-server /apply-template",
+ "llama_cpp_revision": "d3c3e242c16b8cbf51400fad410cd69b22d64f35",
+ "models": {
+  "text": "LiquidAI/LFM3-1.7B-GGUF@cd0c74c575b5c416f3011b5b4c298077f26ca8c2 (tokenizer.chat_template)",
+  "omni": "LiquidAI/LFM3-Omni-2B-GGUF@d508b88f08a5b4286f2d2805a6a8d69a0ff44c72 (tokenizer.chat_template)"
+ },
+ "cases": [
+  {
+   "template": "text",
+   "name": "user_only_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "system_user_on",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is 2+2?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "multi_turn_on",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is 2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4",
+      "reasoning_content": "2 plus 2 is 4."
+     },
+     {
+      "role": "user",
+      "content": "And 3+3?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "tools_declared_on",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_docs",
+       "description": "Search the documentation — returns \"quotes\" & <tags>.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string",
+          "description": "What to look for"
+         },
+         "limit": {
+          "type": "integer",
+          "description": "Maximum hits"
+         },
+         "exact": {
+          "type": "boolean",
+          "description": "Exact match only"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "tool_round_on",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temp\": 20, \"sky\": \"clear\"}"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 20, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 20, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "parallel_calls_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Compare Paris and Oslo."
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "call_a",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\"}"
+        }
+       },
+       {
+        "id": "call_b",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Oslo\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_a",
+      "content": "Paris: 20C"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_b",
+      "content": "Oslo: 5C"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nCompare Paris and Oslo.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\nParis: 20C\n</tool_response><|im_end|>\n<|im_start|>tool\n<tool_response>\nOslo: 5C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nCompare Paris and Oslo.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\nParis: 20C\n</tool_response><|im_end|>\n<|im_start|>tool\n<tool_response>\nOslo: 5C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "user_only_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "text",
+   "name": "system_user_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is 2+2?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "text",
+   "name": "multi_turn_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is 2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4",
+      "reasoning_content": "2 plus 2 is 4."
+     },
+     {
+      "role": "user",
+      "content": "And 3+3?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "text",
+   "name": "tools_declared_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_docs",
+       "description": "Search the documentation — returns \"quotes\" & <tags>.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string",
+          "description": "What to look for"
+         },
+         "limit": {
+          "type": "integer",
+          "description": "Maximum hits"
+         },
+         "exact": {
+          "type": "boolean",
+          "description": "Exact match only"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "text",
+   "name": "tool_round_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temp\": 20, \"sky\": \"clear\"}"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 20, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 20, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "text",
+   "name": "parallel_calls_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Compare Paris and Oslo."
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "call_a",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\"}"
+        }
+       },
+       {
+        "id": "call_b",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Oslo\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_a",
+      "content": "Paris: 20C"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_b",
+      "content": "Oslo: 5C"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nCompare Paris and Oslo.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\nParis: 20C\n</tool_response><|im_end|>\n<|im_start|>tool\n<tool_response>\nOslo: 5C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nCompare Paris and Oslo.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\nParis: 20C\n</tool_response><|im_end|>\n<|im_start|>tool\n<tool_response>\nOslo: 5C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "text",
+   "name": "tools_no_system_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ping it."
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "ping",
+       "description": "Check the service.",
+       "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"ping\", \"description\": \"Check the service.\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}\n</tools><|im_end|>\n<|im_start|>user\nPing it.<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"ping\", \"description\": \"Check the service.\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}\n</tools><|im_end|>\n<|im_start|>user\nPing it.<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "tool_round_with_reasoning_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "I need the weather tool.",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "20C"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>I need the weather tool.</think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n20C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>I need the weather tool.</think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n20C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "past_tool_round_then_user_on",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "Use the tool.",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "20C"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 20C in Paris.",
+      "reasoning_content": "Report it."
+     },
+     {
+      "role": "user",
+      "content": "Thanks! And Oslo?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n20C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>It is 20C in Paris.<|im_end|>\n<|im_start|>user\nThanks! And Oslo?<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n20C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>It is 20C in Paris.<|im_end|>\n<|im_start|>user\nThanks! And Oslo?<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "typed_arguments_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Search."
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "search_docs",
+         "arguments": "{\"query\": \"line one\\nline two\", \"limit\": 5, \"exact\": true, \"score\": 0.5, \"tags\": [\"a\", \"b\"], \"filter\": {\"field\": \"x\", \"value\": null}, \"note\": null}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": ""
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "search_docs",
+       "description": "Search the documentation — returns \"quotes\" & <tags>.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string",
+          "description": "What to look for"
+         },
+         "limit": {
+          "type": "integer",
+          "description": "Maximum hits"
+         },
+         "exact": {
+          "type": "boolean",
+          "description": "Exact match only"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nSearch.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=search_docs>\n<parameter=query>\nline one\nline two\n</parameter>\n<parameter=limit>\n5\n</parameter>\n<parameter=exact>\ntrue\n</parameter>\n<parameter=score>\n0.5\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n<parameter=filter>\n{\"field\": \"x\", \"value\": null}\n</parameter>\n<parameter=note>\nnull\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nSearch.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=search_docs>\n<parameter=query>\nline one\nline two\n</parameter>\n<parameter=limit>\n5\n</parameter>\n<parameter=exact>\ntrue\n</parameter>\n<parameter=score>\n0.5\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n<parameter=filter>\n{\"field\": \"x\", \"value\": null}\n</parameter>\n<parameter=note>\nnull\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "think_tags_in_past_content_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     },
+     {
+      "role": "assistant",
+      "content": "<think>greeting</think>\n\nHello there!"
+     },
+     {
+      "role": "user",
+      "content": "Bye"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>Hello there!<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>Hello there!<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "text",
+   "name": "unicode_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "翻译：你好，世界 🌍 — «ça va?»"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\n翻译：你好，世界 🌍 — «ça va?»<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>user\n翻译：你好，世界 🌍 — «ça va?»<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "omni",
+   "name": "user_only_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "omni",
+   "name": "user_only_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "system_user_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is 2+2?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "multi_turn_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is 2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4",
+      "reasoning_content": "2 plus 2 is 4."
+     },
+     {
+      "role": "user",
+      "content": "And 3+3?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think></think>4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "tools_declared_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_docs",
+       "description": "Search the documentation — returns \"quotes\" & <tags>.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string",
+          "description": "What to look for"
+         },
+         "limit": {
+          "type": "integer",
+          "description": "Maximum hits"
+         },
+         "exact": {
+          "type": "boolean",
+          "description": "Exact match only"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "tool_round_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temp\": 20, \"sky\": \"clear\"}"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 20, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 20, \"sky\": \"clear\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "parallel_calls_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Compare Paris and Oslo."
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "call_a",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\"}"
+        }
+       },
+       {
+        "id": "call_b",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Oslo\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_a",
+      "content": "Paris: 20C"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_b",
+      "content": "Oslo: 5C"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nCompare Paris and Oslo.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\nParis: 20C\n</tool_response><|im_end|>\n<|im_start|>tool\n<tool_response>\nOslo: 5C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nCompare Paris and Oslo.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\nParis: 20C\n</tool_response><|im_end|>\n<|im_start|>tool\n<tool_response>\nOslo: 5C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "past_tool_round_then_user_on",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "Use the tool.",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "20C"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 20C in Paris.",
+      "reasoning_content": "Report it."
+     },
+     {
+      "role": "user",
+      "content": "Thanks! And Oslo?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "unit": {
+          "type": "string",
+          "description": "Temperature unit",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n20C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>It is 20C in Paris.<|im_end|>\n<|im_start|>user\nThanks! And Oslo?<|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"description\": \"Temperature unit\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n20C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>It is 20C in Paris.<|im_end|>\n<|im_start|>user\nThanks! And Oslo?<|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "omni",
+   "name": "typed_arguments_on",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Search."
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "search_docs",
+         "arguments": "{\"query\": \"line one\\nline two\", \"limit\": 5, \"exact\": true, \"score\": 0.5, \"tags\": [\"a\", \"b\"], \"filter\": {\"field\": \"x\", \"value\": null}, \"note\": null}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": ""
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": true,
+     "preserve_reasoning": false
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "search_docs",
+       "description": "Search the documentation — returns \"quotes\" & <tags>.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string",
+          "description": "What to look for"
+         },
+         "limit": {
+          "type": "integer",
+          "description": "Maximum hits"
+         },
+         "exact": {
+          "type": "boolean",
+          "description": "Exact match only"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nSearch.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=search_docs>\n<parameter=query>\nline one\nline two\n</parameter>\n<parameter=limit>\n5\n</parameter>\n<parameter=exact>\ntrue\n</parameter>\n<parameter=score>\n0.5\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n<parameter=filter>\n{\"field\": \"x\", \"value\": null}\n</parameter>\n<parameter=note>\nnull\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>",
+   "expected": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"search_docs\", \"description\": \"Search the documentation — returns \\\"quotes\\\" & <tags>.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}, \"limit\": {\"type\": \"integer\", \"description\": \"Maximum hits\"}, \"exact\": {\"type\": \"boolean\", \"description\": \"Exact match only\"}}, \"required\": [\"query\"]}}\n</tools><|im_end|>\n<|im_start|>user\nSearch.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=search_docs>\n<parameter=query>\nline one\nline two\n</parameter>\n<parameter=limit>\n5\n</parameter>\n<parameter=exact>\ntrue\n</parameter>\n<parameter=score>\n0.5\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n<parameter=filter>\n{\"field\": \"x\", \"value\": null}\n</parameter>\n<parameter=note>\nnull\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>"
+  },
+  {
+   "template": "omni",
+   "name": "image_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "image_url",
+        "image_url": {
+         "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        }
+       },
+       {
+        "type": "text",
+        "text": "Describe it."
+       }
+      ]
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\n<__media__>Describe it.<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>user\n<|vision_start|><|image|><|vision_end|>Describe it.<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "two_images_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "image_url",
+        "image_url": {
+         "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        }
+       },
+       {
+        "type": "image_url",
+        "image_url": {
+         "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        }
+       },
+       {
+        "type": "text",
+        "text": "Compare."
+       }
+      ]
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\n<__media__><__media__>Compare.<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>user\n<|vision_start|><|image|><|vision_end|><|vision_start|><|image|><|vision_end|>Compare.<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "audio_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "input_audio",
+        "input_audio": {
+         "data": "UklGRqQMAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YYAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+         "format": "wav"
+        }
+       },
+       {
+        "type": "text",
+        "text": "Transcribe."
+       }
+      ]
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\n<__media__>Transcribe.<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>user\n<|vision_start|><|audio|><|vision_end|>Transcribe.<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "image_and_audio_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "image_url",
+        "image_url": {
+         "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        }
+       },
+       {
+        "type": "input_audio",
+        "input_audio": {
+         "data": "UklGRqQMAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YYAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+         "format": "wav"
+        }
+       },
+       {
+        "type": "text",
+        "text": "Answer in one sentence."
+       }
+      ]
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>user\n<__media__><__media__>Answer in one sentence.<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>user\n<|vision_start|><|image|><|vision_end|><|vision_start|><|audio|><|vision_end|>Answer in one sentence.<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "template": "omni",
+   "name": "image_history_off",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a concise assistant."
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "image_url",
+        "image_url": {
+         "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        }
+       },
+       {
+        "type": "text",
+        "text": "What color?"
+       }
+      ]
+     },
+     {
+      "role": "assistant",
+      "content": "Red."
+     },
+     {
+      "role": "user",
+      "content": "Are you sure?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+     "enable_thinking": false,
+     "preserve_reasoning": false
+    }
+   },
+   "llama_prompt": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\n<__media__>What color?<|im_end|>\n<|im_start|>assistant\n<think></think>Red.<|im_end|>\n<|im_start|>user\nAre you sure?<|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "expected": "<|startoftext|><|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image|><|vision_end|>What color?<|im_end|>\n<|im_start|>assistant\n<think></think>Red.<|im_end|>\n<|im_start|>user\nAre you sure?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  }
+ ]
+}
