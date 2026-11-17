@@ -24,3 +24,20 @@ in the ignored `artifacts/lfm3/`.
 
 MLX runs need `TENSORSHARP_MLX_LIBRARY_DIR` pointing at a directory holding `libmlxc` (for example the test project's
 output).
+
+## Speech output
+
+- `speech-ref.sh` / `speech-ref.cpp`: llama.cpp's TTS pipeline on a fixed text and seed, with the LM hidden row of every
+  frame, the depthformer logits, codes, PCM and timings; the fixture of `Lfm3SpeechRealWeightsTests` and the
+  `TS_LFM3_SPEECH_REF` directory of `Lfm3SpeechIntegrationRealModelTests` (hidden.f32, llama-tts.wav).
+- `speech-chat-ref.cpp`: llama.cpp's speech pipeline continuing a conversation (its realtime server's path: the turn as
+  text, `n_past > 0`, out_mode MIXED or AUDIO, greedy text slots with the pipeline's logit bias) for each question of a
+  TSV; each reply's WAV and transcript. Build it like `speech-ref.cpp` (see its header).
+- `speech-asr.py LLAMA_BIN LM MMPROJ MANIFEST.tsv OUT.json`: round-trip intelligibility. LFM3-Omni's own ASR
+  (`llama-mtmd-cli`, "Perform ASR in <Language>.", greedy) transcribes each WAV, scored against the text spoken (WER, or
+  CER for Chinese/Japanese/Korean; case, punctuation and English numbers normalized).
+- `speech-chat.py URL OUT_DIR [interleaved|audio]`: spoken chat replies from an OpenAI-compatible server
+  (`modalities` with "audio"), each reply's WAV beside its transcript, and a manifest for `speech-asr.py` that checks
+  the speech says what the transcript says.
+- `speech-bench.py OUT.json REPEATS NAME=URL ...`: streaming `/v1/audio/speech` from several servers in turn (TensorSharp,
+  llama-server) with one client: time to the first audio byte, total time, real-time factor.
