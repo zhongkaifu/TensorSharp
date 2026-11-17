@@ -53,27 +53,24 @@ namespace TensorSharp.Runtime
         private const string Lfm3ContinueFinalMessageTag = "CONTINUE_FINAL_MESSAGE_TAG ";
 
         /// <summary>
-        /// The media placeholders of one message, before its text: one
-        /// <see cref="Lfm3VideoPlaceholder"/> for a video (all its frames), otherwise one
-        /// <see cref="Lfm3ImagePlaceholder"/> per image, then one
-        /// <see cref="Lfm3AudioPlaceholder"/> per audio clip. TensorSharp keeps a message's
-        /// media as attachment lists rather than ordered content parts, so media always
-        /// precede the text - the order of the model card's examples and of llama.cpp's
-        /// render of an <c>[image, audio, text]</c> request.
+        /// The media placeholders of one message, before its text, one per
+        /// <see cref="Lfm3MediaLayout.Items"/> entry: <see cref="Lfm3ImagePlaceholder"/> per
+        /// still image, <see cref="Lfm3VideoPlaceholder"/> per video (all its frames, read from
+        /// its file or from the host-sampled frames), then <see cref="Lfm3AudioPlaceholder"/>
+        /// per audio clip. TensorSharp keeps a message's media as attachment lists rather
+        /// than ordered content parts, so media always precede the text - the order of the
+        /// model card's examples and of llama.cpp's render of an <c>[image, audio, text]</c>
+        /// request.
         /// </summary>
         public static void AppendLfm3MediaPlaceholders(ChatMessage msg, StringBuilder sb)
         {
-            if (msg.ImagePaths is { Count: > 0 })
-            {
-                if (msg.IsVideo)
-                    sb.Append(Lfm3VideoPlaceholder);
-                else
-                    for (int i = 0; i < msg.ImagePaths.Count; i++)
-                        sb.Append(Lfm3ImagePlaceholder);
-            }
-            if (msg.AudioPaths is { Count: > 0 })
-                for (int i = 0; i < msg.AudioPaths.Count; i++)
-                    sb.Append(Lfm3AudioPlaceholder);
+            foreach (Lfm3MediaItem item in Lfm3MediaLayout.Items(msg))
+                sb.Append(item.Kind switch
+                {
+                    Lfm3MediaKind.Image => Lfm3ImagePlaceholder,
+                    Lfm3MediaKind.Video => Lfm3VideoPlaceholder,
+                    _ => Lfm3AudioPlaceholder,
+                });
         }
 
         /// <summary>

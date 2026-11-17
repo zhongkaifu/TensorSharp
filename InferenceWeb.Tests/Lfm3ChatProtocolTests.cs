@@ -63,12 +63,14 @@ public class Lfm3ChatProtocolTests : IDisposable
     private static ReferenceCase Find(string template, string name)
         => Cases.Value.Single(c => c.Template == template && c.Name == name);
 
-    /// <summary>The request as the OpenAI adapter hands it to the renderer.</summary>
+    /// <summary>The request as the OpenAI adapter hands it to the renderer: Omni's media cases are rendered as llama.cpp
+    /// rendered them, with the mmproj (and so the audio tower) loaded; without it audio is refused before rendering
+    /// (Lfm3OmniInputTests).</summary>
     private (List<ChatMessage> Messages, List<ToolFunction>? Tools, bool Think, bool AddGenerationPrompt) Parse(JsonElement request)
     {
         Directory.CreateDirectory(_uploads);
         var messages = ChatMessageParser.ParseOpenAI(request.GetProperty("messages"), new UploadStoragePolicy(_uploads),
-            architecture: Arch);
+            architecture: Arch, audioEncoderLoaded: true);
         var tools = ToolFunctionParser.ParseOpenAI(request);
         Assert.True(ThinkingSwitchParser.TryParse(request, out bool think, out _, out string? error), error);
         bool addGenerationPrompt = !request.TryGetProperty("add_generation_prompt", out JsonElement add) || add.GetBoolean();

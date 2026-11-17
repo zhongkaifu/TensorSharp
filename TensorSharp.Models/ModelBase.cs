@@ -3277,6 +3277,38 @@ namespace TensorSharp.Models
                 throw new ModelUnloadedException();
         }
 
+        /// <summary>
+        /// Run host-only <paramref name="work"/> - decoding a file, resizing pictures, computing audio features - with
+        /// <see cref="GpuComputeLock"/> released, when the calling thread holds it (a media preparation does), so engine
+        /// steps and other preparations run meanwhile instead of waiting for work that never touches the device. The
+        /// work must not touch the model, its backend or the multimodal injector's state. The lock is taken again
+        /// before this returns (registered with <see cref="GpuLockWaiters"/> so the engine worker lets the thread in at
+        /// its next step boundary); a model being unloaded meanwhile throws <see cref="ModelUnloadedException"/> there,
+        /// as <see cref="YieldGpuComputeLock"/> does. Without the lock held (the CLI), or inside an adapter step, the
+        /// work runs as it is.
+        /// </summary>
+        public T RunOutsideGpuComputeLock<T>(Func<T> work)
+        {
+            ArgumentNullException.ThrowIfNull(work);
+            if (_stepLora != null || !Monitor.IsEntered(GpuComputeLock))
+                return work();
+            Monitor.Exit(GpuComputeLock);
+            T result;
+            try
+            {
+                result = work();
+            }
+            finally
+            {
+                GpuLockWaiters.Enter(GpuComputeLock);
+                try { Monitor.Enter(GpuComputeLock); }
+                finally { GpuLockWaiters.Exit(GpuComputeLock); }
+            }
+            if (_retiring)
+                throw new ModelUnloadedException();
+            return result;
+        }
+
         // No lock object: some callers build a model without running its constructor
         // (tests use RuntimeHelpers.GetUninitializedObject), and an unload is rare enough
         // that waiting for the count to reach zero by polling costs nothing.

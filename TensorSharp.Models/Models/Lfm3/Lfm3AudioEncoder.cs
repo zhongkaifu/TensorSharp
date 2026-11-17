@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 
 using TensorSharp.Graph;
 using TensorSharp.Models.Graph;
@@ -254,7 +255,24 @@ namespace TensorSharp.Models
             int rows = Lfm3AudioPreprocessor.RowCount(frames);
             var result = new float[(long)rows * OutputWidth];
             if (frames == 0) return result;
-            lock (_offlineSync)
+            // A caller that yields between chunks (betweenChunks: the model's GPU-lock yield) holds that lock around every
+            // program, so the only time another such encode holds the shared state set is inside ITS yield. Waiting for it
+            // here, while this thread holds the GPU lock the other needs back, would deadlock both: the clip runs on a state
+            // set and program cache of its own instead (its first program compiles). Callers without a yield are
+            // serialized on the shared set as before.
+            bool shared;
+            if (betweenChunks == null)
+            {
+                Monitor.Enter(_offlineSync);
+                shared = true;
+            }
+            else
+            {
+                shared = Monitor.TryEnter(_offlineSync);
+            }
+            StateSet states = shared ? _offlineStates : new StateSet(this);
+            NetworkGraph graph = shared ? _graph : NewStreamGraph();
+            try
             {
                 int chunk = intermediates != null ? frames : MaxChunkFrames;
                 int position = 0;
@@ -263,9 +281,21 @@ namespace TensorSharp.Models
                     if (first > 0) betweenChunks?.Invoke();
                     int count = Math.Min(chunk, frames - first);
                     float[] part = count == frames ? features : features.AsSpan((int)((long)first * MelBins), count * MelBins).ToArray();
-                    float[] y = Run(_graph, _offlineStates, part, count, fresh: first == 0, position, intermediates);
+                    float[] y = Run(graph, states, part, count, fresh: first == 0, position, intermediates);
                     Array.Copy(y, 0, result, (long)position * OutputWidth, y.LongLength);
                     position += Lfm3AudioPreprocessor.RowCount(count);
+                }
+            }
+            finally
+            {
+                if (shared)
+                {
+                    Monitor.Exit(_offlineSync);
+                }
+                else
+                {
+                    graph.Dispose();
+                    states.Dispose();
                 }
             }
             return result;

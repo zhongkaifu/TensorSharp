@@ -2760,6 +2760,7 @@ namespace TensorSharp.Server
                 if (m == null) continue;
                 if (m.ImagePaths != null && m.ImagePaths.Count > 0) return true;
                 if (m.AudioPaths != null && m.AudioPaths.Count > 0) return true;
+                if (m.VideoFilePaths != null && m.VideoFilePaths.Count > 0) return true;
             }
             return false;
         }
@@ -2769,7 +2770,7 @@ namespace TensorSharp.Server
             if (history == null) return false;
             foreach (ChatMessage message in history)
             {
-                if (message?.ImagePaths is { Count: > 0 })
+                if (message?.ImagePaths is { Count: > 0 } || message?.VideoFilePaths is { Count: > 0 })
                     return true;
             }
             return false;

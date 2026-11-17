@@ -85,6 +85,16 @@ namespace TensorSharp.Runtime
         /// </summary>
         public bool IsVideo { get; set; }
         /// <summary>
+        /// The video files this message attaches, in attachment order (the Web UI's
+        /// <c>videoFilePaths</c>, the saved clip of an OpenAI <c>video_url</c> or Responses
+        /// <c>input_video</c> part, the CLI's <c>--video</c>). <see cref="ImagePaths"/> still
+        /// carries the frames the host sampled from them, which is what most families see;
+        /// a family that samples video itself reads these files instead - LFM3-Omni takes
+        /// its own 2 fps frames and the clip's soundtrack from them
+        /// (<see cref="Lfm3MediaLayout"/>) and then ignores the pre-sampled frames.
+        /// </summary>
+        public List<string>? VideoFilePaths { get; set; }
+        /// <summary>
         /// Tool calls made by assistant in this message (for multi-turn tool calling).
         /// </summary>
         public List<ToolCall>? ToolCalls { get; set; }
@@ -1977,7 +1987,8 @@ namespace TensorSharp.Runtime
             foreach (var msg in messages)
             {
                 bool hasMedia = (msg.ImagePaths != null && msg.ImagePaths.Count > 0) ||
-                                (msg.AudioPaths != null && msg.AudioPaths.Count > 0);
+                                (msg.AudioPaths != null && msg.AudioPaths.Count > 0) ||
+                                (msg.VideoFilePaths != null && msg.VideoFilePaths.Count > 0);
 
                 if (!hasMedia)
                 {
@@ -2004,7 +2015,10 @@ namespace TensorSharp.Runtime
                     TextFilePaths = msg.TextFilePaths,
                     TextFileNames = msg.TextFileNames,
                     HasFileBackedTextAttachments = msg.HasFileBackedTextAttachments,
+                    AttachmentPaths = msg.AttachmentPaths,
+                    AttachmentNames = msg.AttachmentNames,
                     IsVideo = msg.IsVideo,
+                    VideoFilePaths = msg.VideoFilePaths,
                     ToolCalls = msg.ToolCalls,
                     ToolCallId = msg.ToolCallId,
                     Thinking = msg.Thinking,

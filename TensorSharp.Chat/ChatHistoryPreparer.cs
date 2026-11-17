@@ -462,6 +462,9 @@ namespace TensorSharp.Server
                     : null;
                 if (copy.ImagePaths == null)
                     copy.IsVideo = false;
+                // A video goes as a whole: the clip a family reads itself (LFM3) with its frames.
+                if (message.IsVideo)
+                    copy.VideoFilePaths = null;
             }
             if (audio > 0)
                 copy.AudioPaths = audio < audioCount ? message.AudioPaths.Skip(audio).ToList() : null;
@@ -571,7 +574,10 @@ namespace TensorSharp.Server
                 TextFilePaths = msg.TextFilePaths != null ? new List<string>(msg.TextFilePaths) : null,
                 TextFileNames = msg.TextFileNames != null ? new List<string>(msg.TextFileNames) : null,
                 HasFileBackedTextAttachments = msg.HasFileBackedTextAttachments,
+                AttachmentPaths = msg.AttachmentPaths,
+                AttachmentNames = msg.AttachmentNames,
                 IsVideo = msg.IsVideo,
+                VideoFilePaths = msg.VideoFilePaths,
                 ToolCalls = msg.ToolCalls,
                 ToolCallId = msg.ToolCallId,
                 Thinking = msg.Thinking,
@@ -600,6 +606,7 @@ namespace TensorSharp.Server
                 AttachmentPaths = src.AttachmentPaths,
                 AttachmentNames = src.AttachmentNames,
                 IsVideo = src.IsVideo,
+                VideoFilePaths = src.VideoFilePaths,
                 ToolCalls = src.ToolCalls,
                 ToolCallId = src.ToolCallId,
                 Thinking = src.Thinking,

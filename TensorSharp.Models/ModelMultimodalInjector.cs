@@ -18,7 +18,7 @@ using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
-    internal sealed class ModelMultimodalInjector : IMultimodalInjector, IDisposable
+    internal sealed partial class ModelMultimodalInjector : IMultimodalInjector, IDisposable
     {
         private readonly ModelBase _model;
         private readonly Dictionary<string, CachedEmbedding> _visionCache = new(StringComparer.OrdinalIgnoreCase);

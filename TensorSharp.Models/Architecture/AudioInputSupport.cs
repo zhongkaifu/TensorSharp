@@ -46,6 +46,16 @@ namespace TensorSharp.Models.Architecture
             "vision tower only). Remove the audio attachment; images are supported once the vision projector is loaded.";
 
         /// <summary>
+        /// LiquidAI LFM3: one architecture for LFM3-1.7B (text only) and LFM3-Omni-2B, whose
+        /// audio tower is in the Omni mmproj beside the vision tower. Without that tower loaded
+        /// an audio clip has nothing to encode it.
+        /// </summary>
+        public const string Lfm3Message =
+            "This LFM3 model has no audio encoder loaded: audio input needs LFM3-Omni-2B with its projector " +
+            "(--mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf, which carries the audio tower beside the vision one). " +
+            "LFM3-1.7B is text only. Remove the audio attachment or load LFM3-Omni with its mmproj.";
+
+        /// <summary>
         /// The refusal <paramref name="architecture"/> gives audio input when no
         /// optional audio tower is known to be loaded, or null when the family can
         /// consume audio or is not one this table knows (an unknown family is left
@@ -58,7 +68,8 @@ namespace TensorSharp.Models.Architecture
         /// <summary>
         /// The refusal <paramref name="architecture"/> gives audio input, given
         /// whether the loaded model actually carries a supported audio tower.
-        /// DeepSeek V4.1 has no audio path whatever is loaded. Nemotron-H serves
+        /// DeepSeek V4.1 has no audio path whatever is loaded. LFM3 serves audio
+        /// only with LFM3-Omni's audio tower loaded from its mmproj. Nemotron-H serves
         /// audio only when its companion GGUF contained the Parakeet/FastConformer
         /// tower and sound projector (<see cref="NemotronModel.IsAudioEncoderLoaded"/>):
         /// the public Omni mmproj carries only the vision tower, so the default is
@@ -80,6 +91,10 @@ namespace TensorSharp.Models.Architecture
                 ModelArchitectureRegistry.TryGet(architecture, out ModelArchitectureDescriptor descriptor) &&
                 string.Equals(descriptor.Id, "nemotron_h", StringComparison.OrdinalIgnoreCase))
                 return NemotronModel.AudioInputUnsupportedMessage;
+            if (!audioEncoderLoaded &&
+                ModelArchitectureRegistry.TryGet(architecture, out ModelArchitectureDescriptor lfm3) &&
+                string.Equals(lfm3.Id, "lfm3", StringComparison.OrdinalIgnoreCase))
+                return Lfm3Message;
             return null;
         }
 
@@ -89,10 +104,10 @@ namespace TensorSharp.Models.Architecture
 
         /// <summary>
         /// Whether <paramref name="model"/> has an optional audio tower loaded that
-        /// this table's refusals depend on. Only Nemotron-H's tower is optional
-        /// here; other families answer false, which the table ignores for them.
+        /// this table's refusals depend on: Nemotron-H's and LFM3-Omni's (from the
+        /// mmproj); other families answer false, which the table ignores for them.
         /// </summary>
         public static bool IsAudioEncoderLoaded(ModelBase model)
-            => model is NemotronModel { IsAudioEncoderLoaded: true };
+            => model is NemotronModel { IsAudioEncoderLoaded: true } or Lfm3RuntimeModel { IsAudioEncoderLoaded: true };
     }
 }

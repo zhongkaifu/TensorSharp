@@ -657,6 +657,7 @@ namespace TensorSharp.Server
             copy.AttachmentPaths = src.AttachmentPaths;
             copy.AttachmentNames = src.AttachmentNames;
             copy.IsVideo = src.IsVideo;
+            copy.VideoFilePaths = src.VideoFilePaths;
             copy.ToolCalls = src.ToolCalls;
             copy.ToolCallId = src.ToolCallId;
             copy.Thinking = src.Thinking;
