@@ -1352,6 +1352,18 @@ namespace TensorSharp.Runtime
 
     public class Qwen35OutputParser : ChatMlOutputParser
     {
+        public Qwen35OutputParser()
+            : this(0)
+        {
+        }
+
+        /// <param name="strayReasoningWindow">See <see cref="ChatMlOutputParser(int)"/>. The
+        /// registry passes LFM3's (same Qwen3-Coder body, a model that reasons past a closed
+        /// block); zero parses from Init's state alone, as Qwen 3.5 does.</param>
+        public Qwen35OutputParser(int strayReasoningWindow)
+            : base(strayReasoningWindow)
+        {
+        }
     }
 
     // ========================================================================
