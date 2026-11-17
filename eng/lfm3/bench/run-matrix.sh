@@ -6,7 +6,9 @@
 #   MODELS     model directory (default ~/work/models/lfm3)
 #   ROUNDS     interleaved rounds per section (default 3); REPS repeats inside a run (default 3)
 #   QUANTS     GPU quants (default "Q4_K_M Q8_0 QAD-Q4_0 BF16"); CPU_QUANTS (default "Q4_K_M Q8_0")
-#   DEPTHS     decode depths (default 0,4096,16384,32768); CPU_THREADS (default 6)
+#   DEPTHS     decode depths (default 0,4096,16384,32768); CPU_THREADS (default 6, both engines)
+#   LLAMA_CPU_BUILD  llama.cpp's CPU-only build directory for the cpu section (default build-cpu: the Metal build can
+#              still run ops on the GPU with -ngl 0)
 # Build first (Release): TENSORSHARP_GGML_NO_UPDATE=1 dotnet build eng/lfm3/Lfm3Probe -c Release and
 # dotnet build TensorSharp.Server.Host -c Release; MLX needs TENSORSHARP_MLX_LIBRARY_DIR (defaults to the test output).
 # The machine must be quiet: check `uptime` and that no other GPU job runs; the tables carry each arm's min-max spread.
@@ -20,6 +22,7 @@ QUANTS=${QUANTS:-"Q4_K_M Q8_0 QAD-Q4_0 BF16"}
 CPU_QUANTS=${CPU_QUANTS:-"Q4_K_M Q8_0"}
 DEPTHS=${DEPTHS:-0,4096,16384,32768}
 CPU_THREADS=${CPU_THREADS:-6}
+LLAMA_CPU_BUILD=${LLAMA_CPU_BUILD:-build-cpu}
 export TENSORSHARP_MLX_LIBRARY_DIR=${TENSORSHARP_MLX_LIBRARY_DIR:-$root/InferenceWeb.Tests/bin/Release/net10.0}
 stamp=$(date +%Y%m%d-%H%M%S)
 out=$root/artifacts/lfm3/bench/$stamp
@@ -48,9 +51,9 @@ for s in $sections; do
     cpu)
       for q in $CPU_QUANTS; do
         python3 "$here/ab.py" --rounds "$ROUNDS" --log "$out/cpu-$q" \
-          "ts-ggml_cpu=TS_GGML_CPU_THREADS=$CPU_THREADS MAX_CONTEXT=4096 $here/ts-bench.sh $M/LFM3-1.7B-$q.gguf ggml_cpu 512 64 0,1024 --reps $REPS" \
-          "ts-managed=MAX_CONTEXT=4096 $here/ts-bench.sh $M/LFM3-1.7B-$q.gguf cpu 512 64 0,1024 --reps $REPS" \
-          "llama-cpu=$here/llama-bench-result.sh $M/LFM3-1.7B-$q.gguf 512 64 0,1024 $REPS -- -ngl 0 -t $CPU_THREADS" | tee "$out/cpu-$q.md"
+          "ts-ggml_cpu=MAX_CONTEXT=4096 $here/ts-bench.sh $M/LFM3-1.7B-$q.gguf ggml_cpu 512 64 0,1024 --reps $REPS --threads $CPU_THREADS" \
+          "ts-managed=MAX_CONTEXT=4096 $here/ts-bench.sh $M/LFM3-1.7B-$q.gguf cpu 512 64 0,1024 --reps $REPS --threads $CPU_THREADS" \
+          "llama-cpu=LLAMA_BUILD=$LLAMA_CPU_BUILD $here/llama-bench-result.sh $M/LFM3-1.7B-$q.gguf 512 64 0,1024 $REPS -- -ngl 0 -t $CPU_THREADS" | tee "$out/cpu-$q.md"
       done ;;
     serve)
       for e in llama ts; do
