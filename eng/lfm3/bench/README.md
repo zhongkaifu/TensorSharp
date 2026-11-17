@@ -45,8 +45,10 @@ Build first (Release, this checkout): `TENSORSHARP_GGML_NO_UPDATE=1 dotnet build
   (`ts-cuda`, `ts-ggml_cuda`, `ts-ggml_vulkan`) against vLLM, SGLang and llama-server (`llama-cuda`, `llama-vk`) measured
   by one client, `vllm bench serve --backend openai-chat` (random token prompts, ignore_eos, temperature 0, thinking off),
   over (ISL, OSL) shapes and concurrencies (environment knobs in the header: `SHAPES`, `CONC`, `PREFIX_CACHE`,
-  `RANDOM_PREFIX`, `MAX_CONTEXT`, `MAX_SEQS`, `BATCH_TOKENS`); every engine gets the same context, running-sequence limit
-  and per-step token budget, prefix caching off unless asked. One JSON per cell plus the GPU memory in use after it; the
+  `RANDOM_PREFIX`, `MAX_CONTEXT`, `MAX_SEQS`, `BATCH_TOKENS`, `KV_POOL`); every engine gets the same context,
+  running-sequence limit and per-step token budget, prefix caching off unless asked. TensorSharp's KV block pool is sized
+  for `MAX_SEQS` full contexts (`KV_POOL=sized`, as vLLM and SGLang size theirs from free memory); `KV_POOL=default`
+  keeps the server's own 65,536-token pool, past which running requests wait or are preempted and re-prefilled. One JSON per cell plus the GPU memory in use after it; the
   summary tabulates rounds (median and min-max of each cell's metric over the directories given).
 - `llama-bench-result.sh` takes `LLAMA_BENCH` (the binary, e.g. a `build-cuda` tree's) and `FA` (llama-bench's `-fa`).
 - `metal-op-histogram.py LOG [--start REGEX]`: Metal dispatches per graph from a `GGML_METAL_GRAPH_DEBUG=1` log

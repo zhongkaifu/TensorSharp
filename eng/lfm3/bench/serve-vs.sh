@@ -21,6 +21,11 @@
 #                 --max-running-requests, llama-server -np)
 #   BATCH_TOKENS  per-step token budget (default 8192: TS_SCHED_MAX_BATCHED_TOKENS, vLLM --max-num-batched-tokens,
 #                 SGLang --chunked-prefill-size)
+#   KV_POOL       sized (default): TensorSharp's KV block pool holds MAX_SEQS x MAX_CONTEXT tokens (TS_SCHED_NUM_BLOCKS),
+#                 as vLLM and SGLang size theirs from free memory, so no running request waits or is preempted for blocks
+#                 (LFM3's block pool is bookkeeping: its sequences' caches grow with what they hold); default: the
+#                 server's own pool (256 blocks of 256 tokens, or one context): past 65,536 tokens of running requests
+#                 they wait, or are preempted and re-prefilled
 #   HF_MODEL (/root/models/hf/LFM3-1.7B), GGUF (/root/models/lfm3/LFM3-1.7B-BF16.gguf), TS_ROOT (/root/ts),
 #   TS_SERVER_BIN (TS_ROOT/TensorSharp.Server.Host/bin), VLLM_VENV (/root/venv-vllm), SGLANG_VENV (/root/venv-sglang),
 #   LLAMA_CPP (/root/llama.cpp: build-cuda, build-vk), PORT (18431), SEED (1)
@@ -36,6 +41,7 @@ RANDOM_PREFIX=${RANDOM_PREFIX:-0}
 MAX_CONTEXT=${MAX_CONTEXT:-32768}
 MAX_SEQS=${MAX_SEQS:-64}
 BATCH_TOKENS=${BATCH_TOKENS:-8192}
+KV_POOL=${KV_POOL:-sized}
 HF_MODEL=${HF_MODEL:-/root/models/hf/LFM3-1.7B}
 GGUF=${GGUF:-/root/models/lfm3/LFM3-1.7B-BF16.gguf}
 TS_ROOT=${TS_ROOT:-/root/ts}
@@ -67,8 +73,9 @@ start() {   # ENGINE LOG -> sets SERVER_PID
         --chunked-prefill-size "$BATCH_TOKENS" --sampling-defaults openai $pc --host 127.0.0.1 --port "$PORT" > "$log" 2>&1 < /dev/null & ;;
     ts-*)
       local pc=; [[ $PREFIX_CACHE == 1 ]] || pc=--no-prefix-cache
+      local pool=; [[ $KV_POOL == sized ]] && pool="TS_SCHED_NUM_BLOCKS=$(( (MAX_SEQS * MAX_CONTEXT + 255) / 256 ))"
       ( cd "$TS_ROOT" && MAX_CONTEXT=$MAX_CONTEXT TS_SCHED_MAX_RUNNING_SEQS=$MAX_SEQS TS_SCHED_MAX_BATCHED_TOKENS=$BATCH_TOKENS \
-        exec setsid dotnet "$TS_SERVER_BIN/TensorSharp.Server.Host.dll" --model "$GGUF" --backend "${e#ts-}" \
+        exec setsid env $pool dotnet "$TS_SERVER_BIN/TensorSharp.Server.Host.dll" --model "$GGUF" --backend "${e#ts-}" \
         --host 127.0.0.1 --port "$PORT" --no-multi-agent --no-skills --no-webui $pc \
         --sampling-precedence request --repeat-penalty 1.0 --max-tokens 32768 > "$log" 2>&1 < /dev/null ) & ;;
     llama-cuda|llama-vk)
