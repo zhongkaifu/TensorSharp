@@ -399,7 +399,8 @@ namespace TensorSharp.Chat
                     route = "/v1/audio/transcriptions",
                     languages = asr.Languages,
                 },
-                TensorSharp.Models.Audio.ISpeechSynthesisModel tts => new
+                // A language model that speaks (LFM3-Omni) is a speech model only with its speech decoder loaded.
+                TensorSharp.Models.Audio.ISpeechSynthesisModel { SpeechSynthesisAvailable: true } tts => new
                 {
                     kind = "speech",
                     family = tts.SpeechModelFamily,

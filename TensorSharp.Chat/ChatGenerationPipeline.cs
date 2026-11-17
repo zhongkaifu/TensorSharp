@@ -81,6 +81,24 @@ namespace TensorSharp.Server
         public static ChatStreamUpdate Text(string piece) => new(piece, false, 0, 0, 0, 0, 0, 0, null);
 
         /// <summary>
+        /// Speech of a spoken reply (<see cref="ChatTurnContext.Speech"/>) decoded since the last update: mono float PCM at
+        /// <see cref="AudioSampleRate"/>, in order with the text pieces (an interleaved reply's text is the speech's
+        /// transcript). Null on every other update; an adapter that predates it sees an empty text update.
+        /// </summary>
+        public float[] Audio { get; init; }
+
+        /// <summary>The rate of <see cref="Audio"/> (and of a spoken reply's terminal update), or 0.</summary>
+        public int AudioSampleRate { get; init; }
+
+        /// <summary>A spoken reply's speech frames (the codes of each, in order), on its TERMINAL update only: what stores
+        /// the reply's audio for a later turn.</summary>
+        public IReadOnlyList<int[]> SpeechFrames { get; init; }
+
+        /// <summary>A piece of a spoken reply's speech.</summary>
+        public static ChatStreamUpdate AudioChunk(float[] samples, int sampleRate) =>
+            new(string.Empty, false, 0, 0, 0, 0, 0, 0, null) { Audio = samples, AudioSampleRate = sampleRate };
+
+        /// <summary>
         /// True on a terminal update whose own stream has ALREADY told the user, in the
         /// answer, that generation was stopped for repeating itself.
         ///
@@ -273,6 +291,10 @@ namespace TensorSharp.Server
         /// user's display name, which two photos can share.</summary>
         public IReadOnlyDictionary<string, string> StagedAttachmentNames { get; set; }
 
+        /// <summary>The reply speaks (a model with speech output, <see cref="TensorSharp.Models.Audio.ISpeechOutputModel"/>): its
+        /// mode, voice and speech sampling. Null for a text reply.</summary>
+        public TensorSharp.Models.Audio.SpeechReplyOptions Speech { get; set; }
+
         /// <summary>The LoRA adapter the request resolved (<c>ModelService.TryResolveLora</c>),
         /// or null for the base model. Every generation of the turn, including skill-loop
         /// rounds and sub-agents, runs with it; it never affects another request.</summary>
@@ -418,6 +440,17 @@ namespace TensorSharp.Server
             if (audioError != null)
                 throw new InvalidOperationException(audioError);
 
+            // A spoken reply: the model must speak now, and its system prompt says how (voice, mode).
+            TensorSharp.Models.Audio.SpeechReplyOptions speech = turnContext?.Speech;
+            var speaker = speech != null ? model as TensorSharp.Models.Audio.ISpeechOutputModel : null;
+            if (speech != null)
+            {
+                if (speaker is not { HasSpeechOutput: true })
+                    throw new NotSupportedException(speaker?.SpeechOutputUnavailableReason
+                        ?? $"The loaded model ({model.Config.Architecture}) has no speech output.");
+                history = WithSpeechInstruction(history, speaker.SpeechReplyInstruction(speech));
+            }
+
             // DiffusionGemma does not use the autoregressive continuous-batching engine; it generates a
             // whole block via iterative denoising. Drive it here and surface only the final answer to the
             // append-only protocols (OpenAI/Ollama/non-streaming). The Web UI uses DiffusionChatStreamAsync
@@ -520,6 +553,7 @@ namespace TensorSharp.Server
             // that stopped reading), so usage and the engine phases are recorded once, for
             // however far the request got.
             SequenceState seq = null;
+            TensorSharp.Models.Audio.SpeechReplyDriver speechDriver = null;
             bool submitted = false;
             InferenceCompletion completion = null;
             List<int> generatedTokens = null;
@@ -740,6 +774,18 @@ namespace TensorSharp.Server
                     forModel: model);
             }
 
+            // A spoken reply opens its forced mode and is driven slot by slot (text tokens and speech frames).
+            if (speaker != null)
+            {
+                int opening = speaker.SpeechOpeningToken(speech.Mode);
+                if (opening >= 0)
+                {
+                    inputTokens = new List<int>(inputTokens) { opening };
+                    effectiveMaxTokens = Math.Max(1, effectiveMaxTokens - 1);
+                }
+                speechDriver = speaker.CreateSpeechDriver(inputTokens, speech);
+            }
+
             promptTokenCount = inputTokens.Count;
             if (requestTelemetry.IsRecording && effectiveMaxTokens != maxTokens)
                 requestTelemetry.SetTag(EffectiveMaxTokensAttribute, effectiveMaxTokens);
@@ -782,6 +828,7 @@ namespace TensorSharp.Server
                 publicCheckpointBoundaries: publicCheckpointBoundaries,
                 adapter: turnContext.Adapter)
             {
+                StepDriver = speechDriver,
                 // Without reasoning the reply is rendered back verbatim, so the next turn
                 // resumes from this request's end state rather than its prompt tail.
                 PromptTailCheckpointOptional = !budgetThinking,
@@ -881,6 +928,25 @@ namespace TensorSharp.Server
                 }
 
                 generatedTokens.Add(nextToken);
+                // A spoken reply's frame placeholder arrives once the frame's audio is queued; its control tokens
+                // (<|text_end|>, the speech switches) are schedule, not transcript.
+                if (speechDriver != null)
+                {
+                    if (nextToken == speechDriver.FrameToken)
+                    {
+                        float[] samples = speechDriver.TakeAudio();
+                        if (!firstTokenSampled)
+                        {
+                            firstTokenSampled = true;
+                            timeToFirstTokenMs = (long)totalSw.Elapsed.TotalMilliseconds;
+                        }
+                        if (samples.Length > 0)
+                            yield return ChatStreamUpdate.AudioChunk(samples, speechDriver.SampleRate);
+                        continue;
+                    }
+                    if (speechDriver.IsControlToken(nextToken))
+                        continue;
+                }
                 // An ignore_eos request runs past its end-of-sequence tokens (SamplingConfig.IgnoreEos):
                 // they count as generated tokens, but their marker text (<|im_end|>) is not answer text,
                 // as vLLM and SGLang leave it out of theirs.
@@ -987,6 +1053,16 @@ namespace TensorSharp.Server
                     yield return ChatStreamUpdate.Text(rest);
             }
 
+            // A spoken reply's last speech: what the codec held back when the reply ended (or was cut at its limit).
+            if (speechDriver != null && !wasCancelled)
+            {
+                // The token stream ended with the request: the engine calls the driver no more.
+                speechDriver.Complete();
+                float[] tail = speechDriver.TakeAudio();
+                if (tail.Length > 0)
+                    yield return ChatStreamUpdate.AudioChunk(tail, speechDriver.SampleRate);
+            }
+
             try
             {
                 completion = await handle.Completion.ConfigureAwait(false);
@@ -1066,7 +1142,9 @@ namespace TensorSharp.Server
                 {
                     Role = "assistant",
                     Content = assistantText,
-                    RawOutputTokens = generatedTokens,
+                    // A spoken reply's output holds a placeholder for each speech frame, whose input was the frame's row,
+                    // not that token's embedding: the next turn re-renders its transcript instead of splicing them.
+                    RawOutputTokens = speechDriver != null ? null : generatedTokens,
                     RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
                     RawGenerationSuffix = recordedSuffix,
                 },
@@ -1105,13 +1183,17 @@ namespace TensorSharp.Server
             {
                 // Carried so the skills loop can splice this round back verbatim on its
                 // next render instead of re-tokenizing it. See RawOutputTokens.
-                RawOutputTokens = generatedTokens,
+                RawOutputTokens = speechDriver != null ? null : generatedTokens,
                 RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
                 RawGenerationSuffix = recordedSuffix,
+                SpeechFrames = speechDriver?.FrameCodes,
+                AudioSampleRate = speechDriver?.SampleRate ?? 0,
             };
             }
             finally
             {
+                // The engine is done with a spoken reply's driver (its request ended): its codec stream goes back.
+                speechDriver?.Dispose();
                 if (injectorBucketCreated)
                 {
                     // Drop the per-request prepared-embedding bucket so it
@@ -1145,6 +1227,122 @@ namespace TensorSharp.Server
                 if (wasCancelled)
                     requestTelemetry.MarkCancelled();
             }
+        }
+
+        /// <summary>
+        /// Speech synthesis on the engine by a model that speaks (<see cref="TensorSharp.Models.Audio.ISpeechOutputModel"/>):
+        /// its TTS prompt of <paramref name="text"/> is one request driven slot by slot, which batches with every other
+        /// request; the reply ends at the end of its speech (or <see cref="TensorSharp.Models.Audio.SpeechSynthesisOptions.MaxFrames"/>,
+        /// default 512 frames). Updates carry each frame's PCM as it is decoded, then the codec's tail, then a terminal
+        /// update (prompt tokens, frames, timings, the finish reason).
+        /// </summary>
+        public async IAsyncEnumerable<ChatStreamUpdate> SpeechSynthesisStreamAsync(string text,
+            TensorSharp.Models.Audio.SpeechSynthesisOptions options, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(text);
+            options ??= new TensorSharp.Models.Audio.SpeechSynthesisOptions();
+            var model = _lifecycle.Model ?? throw new InvalidOperationException("No model is loaded.");
+            if (model is not TensorSharp.Models.Audio.ISpeechOutputModel { HasSpeechOutput: true } speaker)
+                throw new NotSupportedException((model as TensorSharp.Models.Audio.ISpeechOutputModel)?.SpeechOutputUnavailableReason
+                    ?? $"The loaded model ({model.Config.Architecture}) has no speech output.");
+            var engine = _engineHost.TryGetEngine();
+            if (engine == null)
+            {
+                if (model.IsRetiring) throw new ModelUnloadedException();
+                throw new InvalidOperationException("The continuous-batching engine is unavailable for this model.");
+            }
+            int maxFrames = options.MaxFrames ?? 512;
+            if (maxFrames < 1) throw new ArgumentOutOfRangeException(nameof(options), "max_frames must be at least 1.");
+            var totalSw = Stopwatch.StartNew();
+            List<int> prompt = speaker.SpeechSynthesisPrompt(text, options.Language, options.Voice);
+            using TensorSharp.Models.Audio.SpeechReplyDriver driver = speaker.CreateSpeechDriver(prompt, new TensorSharp.Models.Audio.SpeechReplyOptions
+            {
+                Mode = TensorSharp.Models.Audio.SpeechReplyMode.Text,
+                Voice = options.Voice,
+                Language = options.Language,
+                Seed = options.Seed,
+                Temperature = options.Temperature,
+                Synthesis = true,
+            });
+            // No prefix caching: a TTS prompt is a few dozen tokens, and a checkpoint of its state (a slot copy) would only
+            // add to the time to the first audio.
+            var seq = new SequenceState($"tts-{Guid.NewGuid():N}", prompt, maxFrames, engine.PoolStats.blockSize, SamplingConfig.Greedy,
+                cacheBreakpoints: Array.Empty<int>())
+            {
+                StepDriver = driver,
+            };
+            InferenceRequestHandle handle;
+            try
+            {
+                handle = engine.SubmitRequest(seq, cancellationToken);
+            }
+            catch (ObjectDisposedException ex) when (model.IsRetiring || cancellationToken.IsCancellationRequested)
+            {
+                if (cancellationToken.IsCancellationRequested) throw new OperationCanceledException(ex.Message, ex, cancellationToken);
+                throw new ModelUnloadedException(ex);
+            }
+            int frames = 0;
+            bool ended = false;
+            InferenceCompletion completion;
+            try
+            {
+                await foreach (int token in handle.Tokens.ReadAllAsync().ConfigureAwait(false))
+                {
+                    if (cancellationToken.IsCancellationRequested) break;
+                    if (token != driver.FrameToken) continue;
+                    frames++;
+                    float[] samples = driver.TakeAudio();
+                    if (samples.Length > 0) yield return ChatStreamUpdate.AudioChunk(samples, driver.SampleRate);
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                completion = await handle.Completion.ConfigureAwait(false);
+                ended = true;
+            }
+            finally
+            {
+                // A consumer that stopped reading (a client gone) or a cancellation stops the request in the engine.
+                if (!ended) engine.Abort(seq.RequestId);
+            }
+            driver.Complete();
+            float[] tail = driver.TakeAudio();
+            if (tail.Length > 0) yield return ChatStreamUpdate.AudioChunk(tail, driver.SampleRate);
+            totalSw.Stop();
+            _logger.LogInformation(LogEventIds.ChatCompleted,
+                "speech.synthesis id={RequestId} promptTokens={PromptTokens} frames={Frames} audioSeconds={Seconds:F2} " +
+                "firstAudioMs={FirstAudioMs:F0} totalMs={TotalMs:F0} finish={Finish}",
+                seq.RequestId, prompt.Count, driver.Frames, driver.SamplesQueued / (double)driver.SampleRate,
+                driver.FirstAudioAt.HasValue ? (driver.FirstAudioAt.Value - seq.SubmittedAt).TotalMilliseconds : -1,
+                totalSw.Elapsed.TotalMilliseconds, completion.FinishReason);
+            yield return new ChatStreamUpdate("", true, prompt.Count, frames, completion.PrefixCacheReusedTokens,
+                InferenceTelemetry.ToNanos(totalSw.ElapsedTicks), InferenceTelemetry.ToNanos(completion.PrefillElapsedTicks),
+                InferenceTelemetry.ToNanos(completion.DecodeElapsedTicks), completion.FinishReason ?? "eos")
+            {
+                SpeechFrames = driver.FrameCodes,
+                AudioSampleRate = driver.SampleRate,
+            };
+        }
+
+        /// <summary>
+        /// The history with a spoken reply's instruction (<see cref="TensorSharp.Models.Audio.ISpeechOutputModel.SpeechReplyInstruction"/>)
+        /// at the end of its system message, which is added when there is none (the HF card: "append the corresponding
+        /// instructions to the end of your system prompt"). The caller's list is not changed.
+        /// </summary>
+        internal static List<ChatMessage> WithSpeechInstruction(List<ChatMessage> history, string instruction)
+        {
+            if (string.IsNullOrEmpty(instruction) || history == null) return history;
+            var result = new List<ChatMessage>(history);
+            int system = result.FindIndex(m => m.Role == "system");
+            if (system < 0)
+            {
+                result.Insert(0, new ChatMessage { Role = "system", Content = instruction });
+                return result;
+            }
+            ChatMessage copy = result[system].WithRole("system");
+            string content = copy.Content ?? string.Empty;
+            // Cache breakpoints index the original text: the appended line comes after every one of them.
+            copy.Content = content.Length == 0 ? instruction : content.EndsWith('\n') ? content + instruction : content + "\n" + instruction;
+            result[system] = copy;
+            return result;
         }
 
         // Span attributes of this file that TelemetryAttributes does not name. Spans only.
