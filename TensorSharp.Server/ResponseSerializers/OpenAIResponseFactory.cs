@@ -174,6 +174,12 @@ internal static class OpenAIResponseFactory
             usage = BuildUsage(promptTokens, evalTokens, kvCacheReusedTokens),
         };
 
+    // The reasoning goes out as `reasoning_content`, the field the streaming deltas
+    // (ReasoningContentChunk) already use and the one OpenAI-compatible clients of
+    // llama.cpp, vLLM, SGLang and DeepSeek read; API_EXAMPLES documents it for both
+    // shapes. A client reading only `reasoning_content` saw no reasoning in a
+    // non-streaming reply. `thinking` (this server's earlier spelling, still read by
+    // older probes) carries the same text.
     public static object ParsedAssistantMessage(
         string content,
         string? thinking,
@@ -183,6 +189,7 @@ internal static class OpenAIResponseFactory
         {
             role = "assistant",
             content = content ?? "",
+            reasoning_content = thinking,
             thinking,
             tool_calls = BuildToolCalls(toolCalls),
         };
