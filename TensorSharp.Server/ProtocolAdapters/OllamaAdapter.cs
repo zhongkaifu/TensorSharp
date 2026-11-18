@@ -415,8 +415,13 @@ public sealed class OllamaAdapter
             workspace: workspaceLease?.Workspace, logger: ollamaLogger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
-        // An append-only stream: the loop's parsers stream as the adapter's own parser does.
-        if (skillPlan != null) skillPlan.ClientStreamsAppendOnly = stream;
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does. A whole
+        // reply: a round cut short reads as its stream would, as the adapter's own parse does.
+        if (skillPlan != null)
+        {
+            skillPlan.ClientStreamsAppendOnly = stream;
+            skillPlan.ClientReadsWholeReply = !stream;
+        }
 
         knowledge.Plan = skillPlan;
 
@@ -666,7 +671,8 @@ public sealed class OllamaAdapter
 
         if (useParser || collector.IsParsed)
         {
-            var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools);
+            var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools,
+                FinishReasonMapper.IsTruncated(pipelineFinishReason));
             // As the stream does, and as the OpenAI adapter does: reasoning the parser separated
             // with thinking off is the model's (see OpenAIChatAdapter), not dropped.
             string? thinkingOut = !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;

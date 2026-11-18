@@ -234,7 +234,7 @@ public sealed class Lfm3ThinkingOffReasoningTests
             Arch, SpiderReply, false, Tools, generationSuffix: Closed, cancelled: false);
         Assert.Equal("8", turn.Content.Trim());
         Assert.Equal(SpiderReply, turn.RawText);
-        // What an append-only stream sent instead.
+        // What an append-only stream (and a whole reply cut short) sent instead.
         Assert.Equal(SpiderReply, turn.StreamedContent);
 
         EmittedAssistantTurn plain = ChatGenerationPipeline.BuildEmittedTurn(
@@ -242,10 +242,73 @@ public sealed class Lfm3ThinkingOffReasoningTests
         Assert.Null(plain.StreamedContent);
     }
 
+    // ---------------------------------------------------------------- a whole reply cut short
+
     /// <summary>
-    /// The next request sends back whichever form the client got - the reasoning apart (a page, a whole reply) or the
-    /// reply as generated (an API stream), prose before a call included - and either one splices the turn's generated
-    /// tokens back, so its KV cache is continued. Edited text still is not.
+    /// A whole reply cut short (max_tokens) after a stray close reads as its append-only stream did: the answer after the
+    /// close is incomplete, and the client keeps the reasoning that states the result, as llama.cpp, vLLM and SGLang return
+    /// it. On GSM8K (first 200, thinking off, Q4_K_M) this was 5 replies on ggml_cpu and 7 on the managed CPU, all cut so.
+    /// The same reply finished (or a whole reply the parse is not told was cut) keeps the reasoning apart, as before.
+    /// </summary>
+    [Fact]
+    public void AWholeReplyCutInItsAnswer_ReadsAsItsStream()
+    {
+        ParsedOutput cut = ChatStreamCollector.ParseWhole(Arch, CutReply, false, Tools, Closed, asStreamed: true);
+        Assert.Equal(CutReply, cut.Content);
+        Assert.True(string.IsNullOrEmpty(cut.Thinking));
+
+        ParsedOutput finished = ChatStreamCollector.ParseWhole(Arch, CutReply, false, Tools, Closed, asStreamed: false);
+        Assert.Equal("John runs a total of 60 miles", finished.Content);
+        Assert.EndsWith("We'll put in the required format.", finished.Thinking);
+
+        // The non-streaming endpoints' collector: told by the finish reason.
+        foreach (bool replyWasCut in new[] { true, false })
+        {
+            var collector = new ChatStreamCollector();
+            collector.Add(new ChatStreamUpdate { Piece = CutReply[..100], RawGenerationSuffix = Closed });
+            collector.Add(ChatStreamUpdate.Text(CutReply[100..]));
+            ParsedOutput resolved = collector.Resolve(Arch, false, Tools, replyWasCut);
+            Assert.Equal(replyWasCut ? cut.Content : finished.Content, resolved.Content);
+            Assert.Equal(replyWasCut ? cut.Thinking : finished.Thinking, resolved.Thinking);
+        }
+        Assert.True(FinishReasonMapper.IsTruncated(FinishReasonMapper.PipelineMaxTokens));
+    }
+
+    /// <summary>Reading a cut reply as its stream changes only stray reasoning: a block the model opened itself is still
+    /// reasoning, a call still a call, an ordinary answer and a thinking-on reply parse the same, and Nemotron-H (which
+    /// holds its streams) still separates its stray reasoning.</summary>
+    [Fact]
+    public void ReadingACutReplyAsItsStream_ChangesOnlyStrayReasoning()
+    {
+        const string goldCut = "<think>We need to answer the question. The chemical symbol for gold is \"Au\".</think>A";
+        ParsedOutput gold = ChatStreamCollector.ParseWhole(Arch, goldCut, false, Tools, Closed, asStreamed: true);
+        Assert.Equal("A", gold.Content);
+        Assert.StartsWith("We need to answer the question.", gold.Thinking);
+
+        const string call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        ParsedOutput withCall = ChatStreamCollector.ParseWhole(Arch, "Checking.\n" + call + "\nMore", false, Tools, Closed, asStreamed: true);
+        Assert.Equal("Paris", Assert.Single(withCall.ToolCalls!).Arguments["city"]);
+
+        foreach (bool asStreamed in new[] { true, false })
+            Assert.Equal(PlainReply, ChatStreamCollector.ParseWhole(Arch, PlainReply, false, Tools, Closed, asStreamed).Content);
+
+        const string thinkingOn = "Reasoning about it.</think>The answ";
+        ParsedOutput onStreamed = ChatStreamCollector.ParseWhole(Arch, thinkingOn, true, Tools, "<think>", asStreamed: true);
+        ParsedOutput onWhole = ChatStreamCollector.ParseWhole(Arch, thinkingOn, true, Tools, "<think>", asStreamed: false);
+        Assert.Equal(onWhole.Content, onStreamed.Content);
+        Assert.Equal(onWhole.Thinking, onStreamed.Thinking);
+        Assert.Equal("Reasoning about it.", onStreamed.Thinking.Trim());
+
+        const string nemotron = "Reasoning about it.</think>The answ";
+        ParsedOutput held = ChatStreamCollector.ParseWhole("nemotron_h", nemotron, false, null, Closed, asStreamed: true);
+        Assert.Equal("The answ", held.Content.Trim());
+        Assert.Equal("Reasoning about it.", held.Thinking.Trim());
+    }
+
+    /// <summary>
+    /// The next request sends back whichever form the client got - the reasoning apart (a page, a whole reply the model
+    /// finished) or the reply as generated (an API stream, a whole reply cut short), prose before a call included - and
+    /// either one splices the turn's generated tokens back, so its KV cache is continued. Edited text still is not.
     /// </summary>
     [Fact]
     public void TheTranscriptMatchesEitherFormTheClientWasSent()
@@ -284,7 +347,7 @@ public sealed class Lfm3ThinkingOffReasoningTests
         Assert.Equal(new[] { 7, 8, 9 }, store.Augment(Replay(reasoning + "</think>", null)).History[1].RawOutputTokens);
         Assert.Null(store.Augment(Replay("The user wants rain. Use the tool.</think>", null)).History[1].RawOutputTokens);
 
-        // A reply cut short after its close: either form the client got.
+        // A reply cut short, returned as generated, comes back as its raw text.
         EmittedAssistantTurn cut = ChatGenerationPipeline.BuildEmittedTurn(Arch, CutReply, false, Tools, Closed, cancelled: false);
         var cutStore = new ConversationTranscriptStore(maxChains: 16, maxTokens: 10_000);
         cutStore.Record(new List<ChatMessage> { ask },
@@ -298,6 +361,18 @@ public sealed class Lfm3ThinkingOffReasoningTests
         };
         Assert.Equal(new[] { 4, 5 }, cutStore.Augment(Next(CutReply, null)).History[1].RawOutputTokens);
         Assert.Equal(new[] { 4, 5 }, cutStore.Augment(Next(cut.Content, cut.Thinking)).History[1].RawOutputTokens);
+    }
+
+    /// <summary>The Responses API's reasoning_tokens counts a reply cut short as its whole reply reads: the stray reasoning
+    /// went out as content, so none of it is reasoning. A reply the model finished counts it, as before.</summary>
+    [Fact]
+    public void AReplyCutShort_CountsNoStrayReasoningTokens()
+    {
+        var tokenizer = new TagTokenizer();
+        List<int> tokens = tokenizer.Encode(CutReply);
+        Assert.Equal(0, ReasoningTokenCount.Count(Arch, tokenizer, tokens, false, Tools, Closed, replyWasCut: true));
+        int finished = ReasoningTokenCount.Count(Arch, tokenizer, tokens, false, Tools, Closed, replyWasCut: false);
+        Assert.Equal(tokenizer.Encode(CutReply[..(CutReply.IndexOf("</think>", StringComparison.Ordinal) + 8)]).Count, finished);
     }
 
     /// <summary>

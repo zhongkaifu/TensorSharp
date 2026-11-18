@@ -285,7 +285,15 @@ namespace TensorSharp.Runtime
         /// and SGLang stream a thinking-off reply: a <c>&lt;/think&gt;</c> the model writes later
         /// stays in the content with the text around it. A reply that opens a block of its own
         /// still streams as reasoning. A family that holds such text until it is decided (or a
-        /// consumer that retracts, or one that parses the whole reply) is not affected.
+        /// consumer that retracts) is not affected.
+        /// <para>
+        /// A consumer of a whole API reply that was cut short (max_tokens, a thinking budget,
+        /// the repetition guard) calls it too, so the reply reads as its stream did: the
+        /// answer after a stray close is then incomplete, and returned as generated the client
+        /// keeps what the reasoning before it concluded (LFM3-1.7B wrote "Answer: N" there and
+        /// was cut in the answer that followed). A whole reply the model finished keeps the
+        /// reasoning apart.
+        /// </para>
         /// </summary>
         void StreamWithoutHolding() { }
     }
@@ -346,7 +354,8 @@ namespace TensorSharp.Runtime
         /// <param name="holdsAppendOnlyStreams">Whether an append-only stream
         /// (<see cref="IOutputParser.StreamWithoutHolding"/>) waits while a reply after a closed
         /// block is undecided (true), or is shown it as content at once (false: the reasoning and
-        /// the answer are told apart for retracting consumers and whole replies only).</param>
+        /// the answer are told apart for retracting consumers and for whole replies the model
+        /// finished; a whole reply cut short reads as its stream did).</param>
         protected ChatMlOutputParser(int strayReasoningWindow, bool holdsAppendOnlyStreams)
         {
             _strayReasoningWindow = Math.Max(0, strayReasoningWindow);

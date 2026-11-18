@@ -138,6 +138,18 @@ namespace TensorSharp.Server.Skills
         /// </summary>
         internal bool ClientStreamsAppendOnly { get; set; }
 
+        /// <summary>
+        /// True when the client of this turn reads the reply only once it is whole (a
+        /// non-streaming OpenAI, Ollama or Responses request). A round cut short (max_tokens,
+        /// a thinking budget, the repetition guard) then reaches it as the round's API stream
+        /// would have (<see cref="IOutputParser.StreamWithoutHolding"/>), as the adapter's own
+        /// parse of a whole reply does (<c>ChatStreamCollector.Resolve</c>): for LFM3 the text
+        /// before a stray <c>&lt;/think&gt;</c> stays in the content when the answer after it
+        /// was cut. Such a round's pieces are held until the round ends, which a client that
+        /// waits for the whole reply cannot tell.
+        /// </summary>
+        internal bool ClientReadsWholeReply { get; set; }
+
         private int _reasoningTokens;
 
         /// <summary>The reasoning tokens every generation of this turn has reported so far

@@ -11,19 +11,23 @@ namespace TensorSharp.Server;
 /// text. A token whose text the parser holds back (a partial tag, a close marker, a thinking-off reply not decided yet) is
 /// counted with the text that follows it, or with the reasoning before it when the answer follows: the close marker of a
 /// reasoning block counts as reasoning, and a reply that reasoned past a closed block counts that stretch once a close
-/// shows it was reasoning. Tool calls and answer text are not reasoning.
+/// shows it was reasoning. Tool calls and answer text are not reasoning. A reply cut short (<c>replyWasCut</c>)
+/// is read as a whole API reply of it is (ChatStreamCollector.ParseWhole): for LFM3 a thinking-off reply's stray reasoning
+/// is then content and counts as answer.
 /// </summary>
 internal static class ReasoningTokenCount
 {
     private enum Kind { None, Reasoning, Answer }
 
     internal static int Count(string architecture, ITokenizer tokenizer, IReadOnlyList<int> tokens, bool enableThinking,
-        List<ToolFunction> tools, string generationSuffix)
+        List<ToolFunction> tools, string generationSuffix, bool replyWasCut = false)
     {
         if (tokenizer == null || tokens == null || tokens.Count == 0)
             return 0;
         IOutputParser parser = OutputParserFactory.Create(architecture);
         parser.Init(enableThinking, tools);
+        if (replyWasCut)
+            parser.StreamWithoutHolding();
         if (generationSuffix != null)
             parser.SetGenerationPromptSuffix(generationSuffix);
 

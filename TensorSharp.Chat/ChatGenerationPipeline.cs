@@ -1197,10 +1197,12 @@ namespace TensorSharp.Server
                 // Carried so the skills loop can splice this round back verbatim on its
                 // next render instead of re-tokenizing it. See RawOutputTokens.
                 RawOutputTokens = speechDriver != null ? null : generatedTokens,
-                // Read only when the reply reasoned at all: most replies pay nothing for it.
+                // Read only when the reply reasoned at all: most replies pay nothing for it. A
+                // reply cut short is counted as a whole API reply of it reads (ChatStreamCollector.ParseWhole).
                 ReasoningTokens = speechDriver != null || string.IsNullOrEmpty(emittedTurn.Thinking) ? 0
                     : ReasoningTokenCount.Count(arch, model.Tokenizer, generatedTokens, enableThinking, tools,
-                        announceSuffix ? recordedSuffix : null),
+                        announceSuffix ? recordedSuffix : null,
+                        replyWasCut: ProtocolAdapters.FinishReasonMapper.IsTruncated(finishReason)),
                 RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
                 RawGenerationSuffix = recordedSuffix,
                 SpeechFrames = speechDriver?.FrameCodes,
@@ -2009,7 +2011,8 @@ namespace TensorSharp.Server
         /// (thinking mode, tools, the prompt's open channel), plus the raw text for a
         /// client that runs no parser. When reasoning was told apart with thinking off, the
         /// content an append-only stream sent instead (<see cref="EmittedAssistantTurn.StreamedContent"/>:
-        /// LFM3 streams such a reply as generated). A parser failure leaves the raw text as content.
+        /// LFM3 streams such a reply as generated, and returns a whole reply cut short the
+        /// same way). A parser failure leaves the raw text as content.
         /// </summary>
         internal static EmittedAssistantTurn BuildEmittedTurn(
             string arch, string rawText, bool enableThinking, List<ToolFunction> tools,

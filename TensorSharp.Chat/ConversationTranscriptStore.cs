@@ -32,8 +32,9 @@ namespace TensorSharp.Server
         /// The content an append-only API stream of this turn sent, when it differs from
         /// <see cref="Content"/>; null otherwise. LFM3 streams a thinking-off reply that
         /// reasons past the closed block as generated (<see cref="IOutputParser.StreamWithoutHolding"/>),
-        /// while a retracting page and a whole reply get the reasoning apart: the client's next
-        /// request sends back either form, the stream's prose before a tool call included.
+        /// and returns a whole reply cut short the same way, while a retracting page and a
+        /// whole reply the model finished get the reasoning apart: the client's next request
+        /// sends back either form, the stream's prose before a tool call included.
         /// </summary>
         public string StreamedContent { get; init; }
     }
@@ -452,8 +453,8 @@ namespace TensorSharp.Server
             if (ContentMatches(clientContent, emitted.Content ?? string.Empty, emitted, record))
                 return true;
             // What an append-only stream sent (LFM3: a thinking-off reply that reasoned past the
-            // closed block, as generated) when the parse above kept the reasoning apart: a client
-            // sends back whichever it got.
+            // closed block, as generated, and a whole reply cut short the same way) when the parse
+            // above kept the reasoning apart: a client sends back whichever it got.
             if (emitted.StreamedContent != null
                 && ContentMatches(clientContent, emitted.StreamedContent, emitted, record))
                 return true;

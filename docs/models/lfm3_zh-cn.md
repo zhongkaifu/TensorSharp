@@ -92,8 +92,11 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
   合成逐位一致）。GSM8K（前 200 题，关闭思考，Q4_K_M）ggml_cpu 得分 79.0%、托管 CPU 为 80.0%，llama.cpp CPU 为
   81.0%（配对 McNemar 检验 p = 0.50 与 0.82；Metal 上两个引擎都是 81.5%）。这次运行先在 50 题时停过一次，当时
   ggml_cpu 以 37 对 43 落后（p = 0.07；对比更早一次 llama.cpp CPU 运行时 p = 0.03）。只按回复内容计分（关闭思考时客户端
-  读到的部分：TensorSharp 把多余 `</think>` 之前的文字移入 `reasoning_content`，llama-server 则留在内容里），两条路径都是
-  76.5%，llama.cpp 为 81.0%（p = 0.09）。CPU 上的贪心回复会在几百个字符内于近似平局
+  读到的部分）时，两条路径曾都是 76.5%，llama.cpp 为 81.0%（p = 0.09）：对随后被 max_tokens 截断的回复，TensorSharp
+  把多余 `</think>` 之前的文字移入了 `reasoning_content`（ggml_cpu 有 5 道、托管 CPU 有 7 道的答案只在那里）。现在这类
+  回复按其流式回复的方式返回（见下文"推理"）：在 ggml_cpu 上重跑，200 道回复与上次运行逐字相同，只按内容计分为 79.0%，与
+  整段回复得分一致（对 llama.cpp CPU 的 81.0%，p = 0.50）；托管 CPU 的已记录回复按同样方式重新计分为 80.0%
+  （p = 0.82；未重跑）。CPU 上的贪心回复会在几百个字符内于近似平局
   处与 llama.cpp CPU 的回复分叉，llama.cpp 自己的 CPU 与 Metal 回复之间也是如此。4 个并发对话（Q4_K_M）在托管 CPU 上与逐个运行逐 token 一致；在 ggml_cpu 上会在近似平局处
   分叉（与 llama.cpp 相同），因为批量解码步经 ggml-cpu 的 GEMM 读取重排后的权重，而单条解码经其 GEMV
   （`TS_GGML_CPU_REPACK=0` 可恢复一致，但提示速度减半）。以下在优化前验证过、未重做：8K 与 32K 的大海捞针、CLI 检查、
@@ -170,14 +173,22 @@ GGUF 模板按原样渲染：TensorSharp 的 Jinja 引擎把 `{% generation %}` 
 - `</think>`（124902）是单个 token：思考预算在此结束推理块并继续生成答案，`response_format` 语法也在其后生效。
 - 关闭思考时 1.7B 仍常常推理：它写出推理（有时先自己写一个 `<think>`），自行关闭推理块后再作答（Q4_K_M 贪心解码下，
   200 道 GSM8K 中有 52 道、33 条指令提示中有 5 条如此；llama.cpp 生成的 token 相同）。模型卡也提示关闭思考"可能不稳定"。
-  TensorSharp 如何返回这类回复取决于客户端能否撤回已显示的文本：
-  - 非流式回复（OpenAI、Ollama、Responses）以及能撤回文本的流（Web UI、TensorAgent）：4,096 字符内出现的 `</think>`
-    使其之前的文本成为推理，以 `reasoning_content`（OpenAI）或 `thinking`（Ollama、Web UI）返回；Web UI 立即显示文本，
-    在关闭标记到来时撤回推理部分。
+  TensorSharp 渲染的关闭思考提示与 llama.cpp、Hugging Face 完全相同（200 道 GSM8K 提示及 50 道开启思考的提示 token id
+  全部一致；`eng/lfm3/prompt-parity.py`），因此多余的 `</think>` 是模型自身的行为。TensorSharp 如何返回这类回复取决于
+  客户端能否撤回已显示的文本，以及模型是否写完了回复：
+  - 能撤回文本的流（Web UI、TensorAgent），以及模型已写完的非流式回复（OpenAI、Ollama、Responses）：4,096 字符内出现的
+    `</think>` 使其之前的文本成为推理，以 `reasoning_content`（OpenAI）或 `thinking`（Ollama、Web UI）返回；Web UI
+    立即显示文本，在关闭标记到来时撤回推理部分。
   - 不能撤回文本的流（OpenAI、Ollama 与 Responses 的流、CLI 交互模式）：回复在生成时即作为内容流出，`</think>` 及其前后的
-    文本都包含在内，与 llama.cpp、vLLM 和 SGLang 的返回方式相同。不做任何缓冲，短答案逐 token 到达；因此同一请求的
-    流式回复与非流式回复在推理所在位置上可能不同。以模型自己写出的 `<think>` 开头的回复，该推理块作为推理流出。
-  模型自己打开的推理块像 Gemma 4 的未请求通道一样被限制（最多 64 个 token，在换行处关闭）。
+    文本都包含在内，与 llama.cpp、vLLM 和 SGLang 的返回方式相同。不做任何缓冲，短答案逐 token 到达。以模型自己写出的
+    `<think>` 开头的回复，该推理块作为推理流出。
+  - 被截断的非流式回复（`finish_reason: length`：max_tokens、思考预算、重复保护）按其流式回复的方式返回：推理和
+    `</think>` 留在内容中，也不计入 `reasoning_tokens`。此时关闭标记之后的答案并不完整，而之前的推理常常已给出结果：
+    在 GSM8K（前 200 道，关闭思考，max_tokens 1,024）上，ggml_cpu 有 5 道、托管 CPU 有 7 道回复的答案只出现在关闭标记
+    之前，且都在其后的答案中被截断，只读内容的客户端因此丢失了答案。无论是否经过服务器的子代理循环都是如此：对这类
+    客户端，循环的每一轮都等到该轮结束后再输出。
+  因此模型已写完的非流式回复与其流式回复在推理所在位置上仍可能不同；客户端在下一次请求中发回其中任一种形式，都能延续
+  该对话的 KV 缓存。模型自己打开的推理块像 Gemma 4 的未请求通道一样被限制（最多 64 个 token，在换行处关闭）。
 - LFM3-Omni 不做推理：开启思考时它会立即关闭推理块。
 
 ### 工具调用

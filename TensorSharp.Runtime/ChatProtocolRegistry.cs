@@ -52,8 +52,9 @@ namespace TensorSharp.Runtime
         // closes came at 83-3562 characters, median 1983, 95th percentile 3425; 2048 would
         // have caught 32 of them, 4096 catches all. Unlike Nemotron-H, an LFM3 stream that
         // cannot take text back is not held for it (the protocol's parser streams such text as
-        // content at once, IOutputParser.StreamWithoutHolding): the window decides the reply
-        // for whole replies and for retracting streams only.
+        // content at once, IOutputParser.StreamWithoutHolding), and a whole API reply cut short
+        // reads as that stream did: the window decides the reply for retracting streams and for
+        // whole replies the model finished only.
         internal const int Lfm3StrayReasoningWindow = 4096;
 
         private static readonly object Gate = new();
@@ -262,7 +263,13 @@ namespace TensorSharp.Runtime
                 // llama.cpp, vLLM and SGLang return such a reply whole as the answer,
                 // `</think>` and all (their parsers do not look for reasoning with thinking
                 // off). Holding it cost a short answer its whole stream: nothing arrived
-                // before the end of the reply or 4,096 characters.
+                // before the end of the reply or 4,096 characters. A whole reply cut short
+                // (max_tokens) reads as its stream did (ChatStreamCollector.ParseWhole): the
+                // answer after the close is incomplete, and the reasoning before it often
+                // holds the result (GSM8K on the CPU lanes: 5 and 7 of 200 replies had their
+                // answer only there, all cut in the answer that followed). A reply the model
+                // finished keeps the reasoning apart, which kept 4-6 of 33 instruction prompts
+                // a client reads as content from showing it.
                 ThinkingOffReplyMayReason = ChatTemplate.IsLfm3ThinkingOffTemplate,
                 // The generation prompt ends `<think>` (on) or `<think></think>` (off), no
                 // newline; past turns re-render as `<think></think>` + answer with their

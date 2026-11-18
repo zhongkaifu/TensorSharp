@@ -138,8 +138,13 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   (paired McNemar p = 0.50 and 0.82; on Metal both engines score 81.5%). The run first
   stopped at 50 questions, where ggml_cpu trailed 37 to 43 (p = 0.07; 0.03 against an
   earlier llama.cpp CPU run). Scored on the content alone (what a client reads with thinking
-  off: TensorSharp moves text before a stray `</think>` into `reasoning_content`,
-  llama-server leaves it in the content), both lanes score 76.5% against 81.0% (p = 0.09).
+  off), both lanes scored 76.5% against 81.0% (p = 0.09) while TensorSharp moved the text
+  before a stray `</think>` into `reasoning_content` in replies max_tokens then cut (5 on
+  ggml_cpu and 7 on the managed CPU had their answer only there). Such a reply now reads as
+  its stream does (Reasoning, below): re-run on ggml_cpu, the 200 replies are the earlier
+  run's text and the content alone scores 79.0%, its whole-reply score (p = 0.50 against llama.cpp
+  CPU's 81.0%); the managed CPU's recorded replies, re-scored the same way, give 80.0%
+  (p = 0.82; not re-run).
   Greedy CPU replies part from llama.cpp's CPU replies at near-ties within a few hundred
   characters, as llama.cpp's own CPU and Metal replies part from each other. Four concurrent
   conversations (Q4_K_M) equal their one-at-a-time runs token for token on the managed CPU; on
@@ -267,21 +272,34 @@ GGUF). `RenderLfm3` reproduces the same text for a GGUF without a template.
   a `<think>` of its own) and closes the block itself before it answers (52 of 200
   greedy GSM8K replies and 5 of 33 instruction prompts on the Q4_K_M; llama.cpp's
   replies are the same tokens). The model card warns that thinking off "can be
-  inconsistent". How TensorSharp returns such a reply depends on whether the client
-  can take text back:
-  - A non-streaming reply (OpenAI, Ollama, Responses) and a stream that can take text
-    back (the Web UI, TensorAgent): a `</think>` within 4,096 characters makes the text
-    before it reasoning, returned as `reasoning_content` (OpenAI) or `thinking` (Ollama,
-    Web UI); the Web UI shows the text at once and takes the reasoning back when the
-    close arrives.
+  inconsistent". TensorSharp renders the thinking-off prompt exactly as llama.cpp and
+  Hugging Face do (the same token ids for all 200 GSM8K prompts and 50 thinking-on ones;
+  `eng/lfm3/prompt-parity.py`), so the stray close is the model's own. How TensorSharp
+  returns such a reply depends on whether the client can take text back and on whether
+  the model finished it:
+  - A stream that can take text back (the Web UI, TensorAgent), and a non-streaming reply
+    (OpenAI, Ollama, Responses) the model finished: a `</think>` within 4,096 characters
+    makes the text before it reasoning, returned as `reasoning_content` (OpenAI) or
+    `thinking` (Ollama, Web UI); the Web UI shows the text at once and takes the
+    reasoning back when the close arrives.
   - A stream that cannot take text back (the OpenAI, Ollama and Responses streams, the
     CLI's interactive mode): the reply streams as content as it is generated, a
     `</think>` and the text around it included, as llama.cpp, vLLM and SGLang return it.
-    Nothing is held, so a short answer arrives token by token; such a stream and the
-    non-streaming reply to the same request can therefore differ in where the reasoning
-    is. A reply that opens with a `<think>` of its own streams that block as reasoning.
-  A block the model opens itself is capped like Gemma 4's unrequested channel (closed at
-  a line break, after at most 64 tokens).
+    Nothing is held, so a short answer arrives token by token. A reply that opens with a
+    `<think>` of its own streams that block as reasoning.
+  - A non-streaming reply cut short (`finish_reason: length`: max_tokens, a thinking
+    budget, the repetition guard) reads as its stream did: the reasoning and the
+    `</think>` stay in the content, and none of it counts as `reasoning_tokens`. The
+    answer after the close is incomplete there, and the reasoning before it often holds
+    the result: on GSM8K (first 200, thinking off, max_tokens 1,024) 5 replies on
+    ggml_cpu and 7 on the managed CPU had their answer only before the close, all cut in
+    the answer that followed, and a client reading the content lost them. This holds
+    with and without the server's sub-agent loop, whose rounds wait for their end for
+    such a client.
+  A finished non-streaming reply and its stream therefore still differ in where the
+  reasoning is; a client's next request may send back either form, and both continue
+  the conversation's KV cache. A block the model opens itself is capped like Gemma 4's
+  unrequested channel (closed at a line break, after at most 64 tokens).
 - LFM3-Omni does not reason: with thinking on it closes the block at once.
 
 ### Tool calls

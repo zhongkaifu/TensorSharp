@@ -514,12 +514,74 @@ public sealed class NemotronHThinkOffServingTests : IDisposable
         Assert.True(usage.GetProperty("output_tokens").GetInt32() >= Lfm3StrayReply.Length);
     }
 
+    /// <summary>
+    /// A whole reply cut short by max_tokens after its stray close reads as its stream did, on every non-streaming
+    /// surface, through the adapter's own parser and through the sub-agent root loop: the reasoning and the close stay in
+    /// the content (the answer after them is incomplete, and LFM3 stated its result before the close in 5-7 of 200 GSM8K
+    /// replies cut so), and none of it is counted as reasoning. The finished reply above keeps the reasoning apart.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Lfm3_AWholeReplyCutShort_ReadsAsItsStream(bool loop)
+    {
+        // "Brazil\nArgentina\nChile</think>Brazi": 35 one-character tokens, the close among them.
+        const int cutAt = 35;
+        string cut = Lfm3StrayReply[..cutAt];
+
+        using (JsonDocument doc = JsonDocument.Parse(await OpenAIChat(Lfm3StrayReply, stream: false, loop, lfm3: true, maxTokens: cutAt)))
+        {
+            JsonElement choice = doc.RootElement.GetProperty("choices")[0];
+            Assert.Equal("length", choice.GetProperty("finish_reason").GetString());
+            JsonElement message = choice.GetProperty("message");
+            Assert.Equal(cut, message.GetProperty("content").GetString());
+            Assert.False(message.TryGetProperty("reasoning_content", out JsonElement r) && r.ValueKind == JsonValueKind.String
+                && r.GetString()!.Length > 0, "the cut reply's reasoning was put apart");
+        }
+
+        string ollama = "{\"model\":\"probe.gguf\",\"messages\":[{\"role\":\"user\",\"content\":\"Name three.\"}],"
+            + "\"think\":false,\"stream\":false,\"options\":{\"num_predict\":" + cutAt + "}" + LoopField(loop) + "}";
+        string ollamaBody = await Invoke(Service(Lfm3StrayReply, lfm3: true), ollama, Options(skills: false),
+            (svc, options, ctx) => new OllamaAdapter(svc, options, Uploads(), Registry(false), null, Workspaces(),
+                NullLoggerFactory.Instance).ChatAsync(ctx));
+        using (JsonDocument doc = JsonDocument.Parse(ollamaBody))
+        {
+            Assert.Equal("length", doc.RootElement.GetProperty("done_reason").GetString());
+            JsonElement message = doc.RootElement.GetProperty("message");
+            Assert.Equal(cut, message.GetProperty("content").GetString());
+            Assert.False(message.TryGetProperty("thinking", out JsonElement t) && t.ValueKind == JsonValueKind.String
+                && t.GetString()!.Length > 0, "the cut reply's reasoning was put apart");
+        }
+
+        string responses = "{\"model\":\"probe.gguf\",\"input\":\"Name three.\",\"max_output_tokens\":" + cutAt
+            + ",\"stream\":false" + LoopField(loop) + "}";
+        string body = await Invoke(Service(Lfm3StrayReply, lfm3: true), responses, Options(skills: false),
+            async (svc, options, ctx) =>
+            {
+                using var store = new InMemoryResponsesStore();
+                await new OpenAIResponsesAdapter(svc, options, Uploads(), Registry(false), null, Workspaces(),
+                    NullLoggerFactory.Instance, store).CreateResponseAsync(ctx);
+            });
+        using (JsonDocument doc = JsonDocument.Parse(body))
+        {
+            JsonElement response = doc.RootElement;
+            Assert.Equal("incomplete", response.GetProperty("status").GetString());
+            string text = string.Concat(response.GetProperty("output").EnumerateArray()
+                .Where(item => item.GetProperty("type").GetString() == "message")
+                .SelectMany(item => item.GetProperty("content").EnumerateArray())
+                .Select(part => part.GetProperty("text").GetString()));
+            Assert.Equal(cut, text);
+            Assert.Equal(0, response.GetProperty("usage").GetProperty("output_tokens_details").GetProperty("reasoning_tokens").GetInt32());
+        }
+    }
+
     // ---------------------------------------------------------------- surfaces
 
-    private Task<string> OpenAIChat(string script, bool stream, bool loop, string extra = "", bool lfm3 = false)
+    private Task<string> OpenAIChat(string script, bool stream, bool loop, string extra = "", bool lfm3 = false,
+        int maxTokens = 900)
     {
         string request = "{\"model\":\"probe.gguf\",\"messages\":[{\"role\":\"user\",\"content\":\"How many lines?\"}],"
-            + "\"max_tokens\":900,\"stream\":" + (stream ? "true" : "false") + LoopField(loop)
+            + "\"max_tokens\":" + maxTokens + ",\"stream\":" + (stream ? "true" : "false") + LoopField(loop)
             + (extra.Length == 0 ? "" : "," + extra) + "}";
         return Invoke(Service(script, lfm3: lfm3), request, Options(skills: false),
             (svc, options, ctx) => new OpenAIChatAdapter(svc, options, Uploads(), Registry(false), null, Workspaces(),

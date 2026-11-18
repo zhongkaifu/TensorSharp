@@ -340,8 +340,13 @@ public sealed partial class OpenAIChatAdapter
             workspace: workspaceLease?.Workspace, logger: openaiLogger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
-        // An append-only stream: the loop's parsers stream as the adapter's own parser does.
-        if (skillPlan != null) skillPlan.ClientStreamsAppendOnly = stream;
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does. A whole
+        // reply: a round cut short reads as its stream would, as the adapter's own parse does.
+        if (skillPlan != null)
+        {
+            skillPlan.ClientStreamsAppendOnly = stream;
+            skillPlan.ClientReadsWholeReply = !stream;
+        }
 
         knowledge.Plan = skillPlan;
 
@@ -997,7 +1002,8 @@ public sealed partial class OpenAIChatAdapter
             // message frame around it holds text (and braces) that are not the
             // structured output, exactly as the streaming path strips them first.
             string structuredText = useParser || collector.IsParsed
-                ? collector.Resolve(_svc.Architecture, openaiThink, openaiTools).Content ?? ""
+                ? collector.Resolve(_svc.Architecture, openaiThink, openaiTools,
+                    FinishReasonMapper.IsTruncated(pipelineFinishReason)).Content ?? ""
                 : rawOutput;
             var normalized = StructuredOutputValidator.NormalizeOutput(structuredText, responseFormat);
             if (!normalized.IsValid)
@@ -1019,7 +1025,9 @@ public sealed partial class OpenAIChatAdapter
         }
         else if (useParser || collector.IsParsed)
         {
-            var parsed = collector.Resolve(_svc.Architecture, openaiThink, openaiTools);
+            // A reply cut short reads as its stream did (ChatStreamCollector.ParseWhole).
+            var parsed = collector.Resolve(_svc.Architecture, openaiThink, openaiTools,
+                FinishReasonMapper.IsTruncated(pipelineFinishReason));
 
             // Whatever the parser separated as reasoning goes out as reasoning, as the stream
             // sends it, with thinking off too: a model that reasons although the prompt closed

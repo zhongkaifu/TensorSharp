@@ -152,6 +152,8 @@ namespace TensorSharp.Server.Skills
                 // SEPARATED pieces rather than the raw text, so tool markup never
                 // reaches the adapter and every round streams as it decodes.
                 IOutputParser parser = NewParser(architecture, enableThinking, plan);
+                // A client that reads the reply whole gets a round cut short as its stream would.
+                WholeReplyRound wholeReply = WholeReplyRound.For(plan, enableThinking);
 
                 var content = new StringBuilder();
                 var thinking = new StringBuilder();
@@ -179,13 +181,17 @@ namespace TensorSharp.Server.Skills
                         continue;
                     }
                     if (update.RawGenerationSuffix != null)
+                    {
                         parser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
+                        wholeReply?.SetGenerationPromptSuffix(update.RawGenerationSuffix);
+                    }
                     if (string.IsNullOrEmpty(update.Piece))
                         continue;
 
                     rawTail.Append(update.Piece);
                     if (rawTail.Length > RawTailChars * 2)
                         rawTail.Remove(0, rawTail.Length - RawTailChars);
+                    wholeReply?.AddRaw(update.Piece);
 
                     ParsedOutput delta = parser.Add(update.Piece, false);
                     Accumulate(delta, content, thinking, calls);
@@ -195,11 +201,14 @@ namespace TensorSharp.Server.Skills
                     // user-facing success claims in the reasoning channel, so buffering
                     // only content still leaks the very false claim this guard rejects.
                     // A tool call does not stream as an answer either; it is ours to
-                    // answer or the caller's to service.
+                    // answer or the caller's to service. A client that reads the reply
+                    // whole gets the round's pieces at its end (WholeReplyRound).
                     bool forwarded = false;
                     if (Separated(delta) is { } piece)
                     {
-                        if (holdAnswer)
+                        if (wholeReply != null)
+                            wholeReply.Hold(piece);
+                        else if (holdAnswer)
                             heldAnswer.Add(piece);
                         else
                         {
@@ -233,10 +242,23 @@ namespace TensorSharp.Server.Skills
                 Accumulate(flushed, content, thinking, calls);
                 if (Separated(flushed) is { } flushedPiece)
                 {
-                    if (holdAnswer)
+                    if (wholeReply != null)
+                        wholeReply.Hold(flushedPiece);
+                    else if (holdAnswer)
                         heldAnswer.Add(flushedPiece);
                     else
                         yield return flushedPiece;
+                }
+                if (wholeReply != null)
+                {
+                    foreach (ChatStreamUpdate roundPiece in wholeReply.End(
+                        architecture, plan.Tools, terminal.FinishReason, content, thinking))
+                    {
+                        if (holdAnswer)
+                            heldAnswer.Add(roundPiece);
+                        else
+                            yield return roundPiece;
+                    }
                 }
 
                 // A round the engine ended for repeating itself is not a round to act on.
@@ -511,6 +533,7 @@ namespace TensorSharp.Server.Skills
             // client — forwarding it raw here would surface a tool call the caller
             // cannot service, which is the exact stall this loop exists to prevent.
             IOutputParser finalParser = NewParser(architecture, enableThinking, plan);
+            WholeReplyRound finalWholeReply = WholeReplyRound.For(plan, enableThinking);
             var finalCalls = new List<ToolCall>();
             var finalContent = new StringBuilder();
             var finalThinking = new StringBuilder();
@@ -530,16 +553,22 @@ namespace TensorSharp.Server.Skills
                     continue;
                 }
                 if (update.RawGenerationSuffix != null)
+                {
                     finalParser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
+                    finalWholeReply?.SetGenerationPromptSuffix(update.RawGenerationSuffix);
+                }
                 if (string.IsNullOrEmpty(update.Piece))
                     continue;
+                finalWholeReply?.AddRaw(update.Piece);
 
                 ParsedOutput delta = finalParser.Add(update.Piece, false);
                 Accumulate(delta, finalContent, finalThinking, finalCalls);
                 bool forwarded = false;
                 if (Separated(delta) is { } piece)
                 {
-                    if (guardCompletion)
+                    if (finalWholeReply != null)
+                        finalWholeReply.Hold(piece);
+                    else if (guardCompletion)
                         finalHeldAnswer.Add(piece);
                     else
                     {
@@ -560,10 +589,23 @@ namespace TensorSharp.Server.Skills
             Accumulate(last, finalContent, finalThinking, finalCalls);
             if (Separated(last) is { } lastPiece)
             {
-                if (guardCompletion)
+                if (finalWholeReply != null)
+                    finalWholeReply.Hold(lastPiece);
+                else if (guardCompletion)
                     finalHeldAnswer.Add(lastPiece);
                 else
                     yield return lastPiece;
+            }
+            if (finalWholeReply != null)
+            {
+                foreach (ChatStreamUpdate roundPiece in finalWholeReply.End(
+                    architecture, plan.Tools, finalTerminal.FinishReason, finalContent, finalThinking))
+                {
+                    if (guardCompletion)
+                        finalHeldAnswer.Add(roundPiece);
+                    else
+                        yield return roundPiece;
+                }
             }
 
             // Only the client's own tools may be forwarded here — this is ordinarily
@@ -1478,6 +1520,54 @@ namespace TensorSharp.Server.Skills
 
         private static string Truncate(string text, int max) =>
             text.Length <= max ? text : text.Substring(0, max - 1) + "\u2026";
+
+        /// <summary>
+        /// One round's text for a client that reads the reply only once it is whole
+        /// (<see cref="SkillRequestPlan.ClientReadsWholeReply"/>, thinking off): the round's
+        /// separated pieces wait for its end, and a round cut short (max_tokens, a thinking
+        /// budget, the repetition guard) whose parse put text apart as reasoning is parsed
+        /// again as its API stream would have been (<see cref="ChatStreamCollector.ParseWhole"/>),
+        /// as the adapter's own parse of a whole reply is. For LFM3 the text before a stray
+        /// <c>&lt;/think&gt;</c> then stays in the content when the answer after it was cut; a
+        /// block the model opened itself, and every family that holds its streams, parse the
+        /// same either way, so their pieces go out unchanged.
+        /// </summary>
+        private sealed class WholeReplyRound
+        {
+            private readonly StringBuilder _raw = new();
+            private readonly List<ChatStreamUpdate> _pieces = new();
+            private string _generationSuffix;
+
+            internal static WholeReplyRound For(SkillRequestPlan plan, bool enableThinking)
+                => plan.ClientReadsWholeReply && !plan.ClientRetractsAnswerText && !enableThinking
+                    ? new WholeReplyRound() : null;
+
+            internal void SetGenerationPromptSuffix(string suffix) => _generationSuffix = suffix;
+
+            internal void AddRaw(string piece) => _raw.Append(piece);
+
+            internal void Hold(ChatStreamUpdate piece) => _pieces.Add(piece);
+
+            /// <summary>The round's pieces to forward. When the round is parsed again,
+            /// <paramref name="content"/> and <paramref name="thinking"/> become what the
+            /// client gets, so the round's history says what it was sent.</summary>
+            internal List<ChatStreamUpdate> End(string architecture, List<ToolFunction> tools, string finishReason,
+                StringBuilder content, StringBuilder thinking)
+            {
+                if (thinking.Length == 0 || !FinishReasonMapper.IsTruncated(finishReason))
+                    return _pieces;
+                ParsedOutput asStreamed = ChatStreamCollector.ParseWhole(architecture, _raw.ToString(),
+                    enableThinking: false, tools, _generationSuffix, asStreamed: true);
+                if (string.Equals(asStreamed.Thinking ?? string.Empty, thinking.ToString(), StringComparison.Ordinal))
+                    return _pieces;
+                content.Clear().Append(asStreamed.Content);
+                thinking.Clear().Append(asStreamed.Thinking);
+                _pieces.Clear();
+                if (Separated(asStreamed) is { } whole)
+                    _pieces.Add(whole);
+                return _pieces;
+            }
+        }
 
         /// <summary>A round's parser. It streams text it cannot classify yet only to a client
         /// that can take it back (<see cref="SkillRequestPlan.ClientRetractsAnswerText"/>).</summary>
