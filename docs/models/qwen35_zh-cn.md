@@ -54,11 +54,13 @@
 > `--backend ggml_cuda`（+0.13 / +0.01）、llama.cpp（`llama-perplexity` 在 `-ub 512`
 > 下 7.36，`-ub 8` 下 6.65；Q6_K 两者都是 5.60）以及已移除的直连引擎都有同样的差距。
 > 请求在第一个生成 token（它来自 prompt 行）上受影响，其后几十个 decode 行略受影响。
-> 把 prompt 的最后一个 token 单独作为一行步运行并不能挽回：代价在 prompt 行建立的上下文里。
+> 把 prompt 的最后一个 token 单独作为一行步运行（已移除的引擎即如此）只能挽回一部分：
+> 在 256 个散文目标上，该行分布与 8-bit 路径分布的 KL 比 prompt 行低约 40%，大部分代价
+> 仍在 prompt 行建立的上下文里。
 > 代价来自这些 prompt 路径所用的 W4A4 kernel，而不只是 NVFP4 权重本身：同样的 prompt
-> 行改用 8-bit 激活就没有差距。prompt 侧精度比 prefill 速度更重要时，请选用 Q6_K
-> 文件。测量工具为 `eng/LongContextQualityProbe`（`--arms default,q8act`），
-> RTX PRO 4500，2026-11。
+> 行改用 8-bit 激活就没有差距。prompt 侧精度比 prefill 速度更重要时，请选用同一仓库的
+> `Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf`（22.858 GB）。测量工具为
+> `eng/LongContextQualityProbe`（`--arms default,q8act`），RTX PRO 4500，2026-11。
 
 转换模型卡将对应的 Qwen 官方仓库标记为基础模型；这些上游模型卡声明 Apache-2.0。
 

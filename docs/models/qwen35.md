@@ -63,12 +63,15 @@ name their projector `mmproj-F16.gguf`, so they must not share a directory):
 > both) and the removed direct engine show the same gap. A request feels it in
 > its first generated token, which comes from a prompt row, and slightly in its
 > first few dozen decode rows. Running the prompt's last token as a one-row step
-> of its own does not recover it: the cost is in the context the prompt rows
-> built. The cost comes from the W4A4 kernels these prompt paths run, not from
-> the NVFP4 weights alone: the same prompt rows with 8-bit activations show no
-> gap. Prefer the Q6_K file where prompt-side precision matters more than
-> prefill speed. Measured with `eng/LongContextQualityProbe` (`--arms
-> default,q8act`) on an RTX PRO 4500, 2026-11.
+> of its own (the removed engine did) recovers only part of it: on 256 prose
+> targets that row's distribution is about 40% closer (KL) to the 8-bit path's
+> than the prompt row's, and most of the cost stays in the context the prompt
+> rows built. The cost comes from the W4A4 kernels these prompt paths run, not
+> from the NVFP4 weights alone: the same prompt rows with 8-bit activations show
+> no gap. Prefer `Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf` from the same repo (22.858
+> GB) where prompt-side precision matters more than prefill speed. Measured with
+> `eng/LongContextQualityProbe` (`--arms default,q8act`) on an RTX PRO 4500,
+> 2026-11.
 
 The conversion cards identify the corresponding official Qwen repositories as
 their base models; those upstream cards declare Apache-2.0.
