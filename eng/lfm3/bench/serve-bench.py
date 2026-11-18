@@ -96,7 +96,8 @@ def request(port, model_name, text, gen, timeout=1200):
         "model": model_name,
         "messages": [{"role": "user", "content": text}],
         "max_tokens": gen,
-        # Greedy and no penalty on both engines (config/lfm3-1.7b.json's defaults are the model card's 0.1 / 1.1).
+        # Greedy and no penalty on both engines (config/lfm3-1.7b.json's defaults are the model card's 0.1 / 1.1; the
+        # TensorSharp server runs with --sampling-precedence request so these win).
         "temperature": 0,
         "top_k": 1,
         "top_p": 1.0,
@@ -192,8 +193,11 @@ def start_server(args, concurrency, ctx, log):
                                                               "TensorSharp.Server.Host.dll")
         if not os.path.exists(dll):
             dll = os.path.join(ROOT, "TensorSharp.Server.Host", "bin", "TensorSharp.Server.Host.dll")
+        # --sampling-precedence request: the request's greedy / no-penalty settings below win over the config's model-card
+        # sampling (temperature 0.1, top-k 50, repetition penalty 1.1), which `config` precedence would otherwise keep.
         cmd = ["dotnet", dll, "--model", args.model, "--backend", args.backend, "--port", str(args.port),
-               "--no-multi-agent", "--no-skills", "--no-webui", "--max-tokens", str(args.gen + 64)]
+               "--no-multi-agent", "--no-skills", "--no-webui", "--max-tokens", str(args.gen + 64),
+               "--sampling-precedence", "request"]
         if args.config:
             cmd[2:2] = ["--config", args.config]
     else:

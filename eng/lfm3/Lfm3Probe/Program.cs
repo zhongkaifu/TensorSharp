@@ -160,6 +160,10 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
 
     foreach (int n in prompts)
     {
+        // One untimed prompt of this size first, as llama-bench warms every test with its own prompt: a size's first
+        // step builds its graphs, and on the managed lane its kernels are still being tiered up by the JIT.
+        model.ResetKVCache();
+        model.ForwardRefill(Tokens(n, 5));
         var rates = new List<double>();
         for (int rep = 0; rep < reps; rep++)
         {
