@@ -68,7 +68,8 @@ library Python only; outputs go to the ignored `artifacts/lfm3/e2e/`.
   prefix-cache reuse and branching, robustness inputs, cancel and client disconnect).
 - `gsm8k.py`, `ifeval.py` (33 verifiable prompts), `toolcall_eval.py` (35 cases in `toolcall_cases.py`) and
   `compare.py` (paired accuracy, Wilson intervals, exact McNemar); `quality.sh` runs all of them on one server.
-- `needle.py` (needle in a haystack at 8K-128K, sized with llama-server's `/tokenize`) and `longctx_bench.py`
+- `needle.py` (needle in a haystack at 8K-128K, sized with llama-server's `/tokenize`, which then also gives the
+  corpus' characters per token, so the server under test sees only the needle prompts) and `longctx_bench.py`
   (interleaved prefill / decode speed after a long prompt).
 - `spec.py` (speculative server == plain server, acceptance from the log), `cli.py` (TensorSharp.Cli checks,
   `--dump-prompt` against llama-server), `matrix.sh` (one model x backend cell: server, scenarios, quality
