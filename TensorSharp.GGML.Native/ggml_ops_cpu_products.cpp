@@ -22,7 +22,10 @@
 #include <cstring>
 #include <vector>
 
-#if defined(__aarch64__) && defined(__ARM_NEON)
+// Every ARM64 build: clang and GCC define __aarch64__, MSVC only _M_ARM64 (the guard ggml_ops_cpu_graph.cpp's repack
+// default uses too). With the two guards apart, an MSVC ARM64 build repacked the quantized weights but left BF16 weights
+// on ggml-cpu's scalar dot.
+#if (defined(__aarch64__) && defined(__ARM_NEON)) || defined(_M_ARM64)
 #include <arm_neon.h>
 #define TSG_CPU_BF16_NEON 1
 #endif
@@ -53,6 +56,30 @@ namespace tsg
             return f;
         }
 
+#if defined(TSG_CPU_BF16_NEON)
+        // The low / high four BF16 lanes of v as F32, exactly: each 16-bit pattern moved to the top of its 32-bit lane.
+        // MSVC gets the ARMv7-era widen-then-shift pair instead of the shift-by-lane-width SHLL forms (the same bits;
+        // no MSVC ARM64 toolchain has compiled either here).
+        inline float32x4_t bf16_low_f32(uint16x8_t v)
+        {
+#if defined(_MSC_VER) && !defined(__clang__)
+            return vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vget_low_u16(v)), 16));
+#else
+            return vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16));
+#endif
+        }
+
+        inline float32x4_t bf16_high_f32(uint16x8_t v)
+        {
+#if defined(_MSC_VER) && !defined(__clang__)
+            return vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vget_high_u16(v)), 16));
+#else
+            return vreinterpretq_f32_u32(vshll_high_n_u16(v, 16));
+#endif
+        }
+#endif
+
+#if defined(TSG_GGML_USE_ACCELERATE)
         // NVFP4's UE4M3 sub-block scales as floats, read from ggml's own decoding (a block whose first code is 1).
         const float* nvfp4_scales()
         {
@@ -90,8 +117,8 @@ namespace tsg
                     for (; k + 8 <= K; k += 8)
                     {
                         const uint16x8_t v = vld1q_u16(s + k);
-                        vst1q_f32(d + k, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16)));
-                        vst1q_f32(d + k + 4, vreinterpretq_f32_u32(vshll_high_n_u16(v, 16)));
+                        vst1q_f32(d + k, bf16_low_f32(v));
+                        vst1q_f32(d + k + 4, bf16_high_f32(v));
                     }
 #endif
                     for (; k < K; k++) d[k] = bf16_to_f32(s[k]);
@@ -131,6 +158,7 @@ namespace tsg
             for (std::int64_t r = 0; r < rows; r++)
                 to_float(base + r * w->nb[1], dst + r * K, K);
         }
+#endif
 
 #if defined(TSG_CPU_BF16_NEON)
         // out[r] = w · x_r for R activation rows (x_r = x + r * ldx): the BF16 row widened exactly, F32 multiply-adds.
@@ -144,10 +172,8 @@ namespace tsg
             for (; k + 16 <= K; k += 16)
             {
                 const uint16x8_t v0 = vld1q_u16(w + k), v1 = vld1q_u16(w + k + 8);
-                const float32x4_t w0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v0), 16));
-                const float32x4_t w1 = vreinterpretq_f32_u32(vshll_high_n_u16(v0, 16));
-                const float32x4_t w2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v1), 16));
-                const float32x4_t w3 = vreinterpretq_f32_u32(vshll_high_n_u16(v1, 16));
+                const float32x4_t w0 = bf16_low_f32(v0), w1 = bf16_high_f32(v0);
+                const float32x4_t w2 = bf16_low_f32(v1), w3 = bf16_high_f32(v1);
                 for (int r = 0; r < R; r++)
                 {
                     const float* xr = x + r * ldx + k;
