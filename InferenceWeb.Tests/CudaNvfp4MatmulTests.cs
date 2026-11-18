@@ -317,16 +317,13 @@ public sealed class CudaNvfp4MatmulTests
     /// <see cref="CudaAllocator.AllNvfp4RowsOnMatvecForTests"/> (the quality probe's q8act arm): a product of prompt rows runs
     /// on the q8 matvec, 16 rows a call, so each row equals its one-row call to the bit where the FP4 GEMM quantizes the same
     /// rows to NVFP4; the fused gate|up epilogue (a GEMM) declines under it. Cleared, the products are the GEMM's again.
+    /// Without the FP4 tensor-core products NVFP4 rows never take the GEMMs and the seam changes no route: the test skips there.
     /// </summary>
-    [CudaFact]
+    [CudaFact(Fp4TensorCores = true)]
     public void PromptRowsOnTheMatvecSeamRoundAsTheirOneRowCalls()
     {
         using var allocator = new CudaAllocator();
-        if (allocator.Fp4Kernels == null)
-        {
-            _output.WriteLine("no FP4 tensor-core products here: NVFP4 prompt rows never take the GEMMs, so the seam changes no route");
-            return;
-        }
+        Assert.True(allocator.Fp4Kernels != null, "the gate found the FP4 tensor-core products on GPU 0, but this allocator did not load them");
         const int inDim = 5120, outDim = 512, rows = 70, ff = 512, guIn = 1024;
         byte[] weights = Nvfp4Rows(outDim, inDim, seed: 13), gateUpWeights = Nvfp4Rows(2 * ff, guIn, seed: 19);
         var act = new float[rows, inDim];

@@ -170,6 +170,38 @@ namespace InferenceWeb.Tests
             return null;
         }
 
+        private static readonly Lazy<string> Fp4TensorCoresRefusal = new(() =>
+        {
+            try
+            {
+                using var context = TensorSharp.Cuda.CudaContext.Create(0);
+                context.MakeCurrent();
+                if (!TensorSharp.Cuda.CudaFp4Kernels.TryCreate(out TensorSharp.Cuda.CudaFp4Kernels kernels, out string reason))
+                    return reason;
+                kernels.Dispose();
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return $"{ex.GetType().Name}: {ex.Message}";
+            }
+        });
+
+        /// <summary>
+        /// Skip reason for a test that launches the FP4 tensor-core products (tensorsharp_fp4_kernels' W4A4 GEMMs, the planar NVFP4
+        /// matvec), or null when the module this process loads carries them on GPU 0: a current sm_120a / sm_121a image. Everywhere
+        /// else <c>CudaAllocator.Fp4Kernels</c> is null, NVFP4 weights stay ggml blocks and none of those routes exists.
+        /// </summary>
+        public static string Fp4TensorCoresSkip
+        {
+            get
+            {
+                if (CudaSkip != null) return CudaSkip;
+                string refusal = Fp4TensorCoresRefusal.Value;
+                return refusal == null ? null : $"Requires the FP4 tensor-core products of tensorsharp_fp4_kernels on GPU 0: {refusal}.";
+            }
+        }
+
         public static string MlxSkip =>
             MlxAvailable.Value ? null : "Requires the MLX native backend.";
 
@@ -440,6 +472,14 @@ namespace InferenceWeb.Tests
             set { _rtxBlackwellImage = value; if (value) Skip ??= TestGates.RtxBlackwellImageSkip; }
         }
         private bool _rtxBlackwellImage;
+
+        /// <summary>The test launches the FP4 tensor-core products; skips where the loaded image has none (<see cref="TestGates.Fp4TensorCoresSkip"/>).</summary>
+        public bool Fp4TensorCores
+        {
+            get => _fp4TensorCores;
+            set { _fp4TensorCores = value; if (value) Skip ??= TestGates.Fp4TensorCoresSkip; }
+        }
+        private bool _fp4TensorCores;
     }
 
     /// <summary>
