@@ -243,6 +243,23 @@ public sealed class DeviceRoomTests : IDisposable
         Continue(model, "run");
     }
 
+    /// <summary>The warm-up's pooled slot is a convenience: where the device has no room for it beside the headroom and a
+    /// prompt step, the warm-up keeps none, as it does for its second slot, instead of ending the load with a request's
+    /// refusal (on 4c819ed2 a lone slot was never refused, and the warm-up never failed the load).</summary>
+    [Fact]
+    public void AWarmUpWhoseSlotDoesNotFitTheDeviceDoesNotEndTheLoad()
+    {
+        using Qwen35RuntimeModel model = Create();
+        model.DeviceRoomForTests = () => (GB / 4, 16 * GB);
+        model.WarmUpKernels();
+        Assert.Equal(0, model.SlotPoolForTests.Pooled);
+        Assert.Equal(0, model.PrivateHolderCount);
+
+        // A request is still refused with the numbers, before any of it runs.
+        var refused = Assert.Throws<InvalidOperationException>(() => ((IUnifiedBatchModel)model).EnsureSequenceSlot("lone", 2048));
+        Assert.Contains("refused before any of it ran", refused.Message);
+    }
+
     /// <summary>Behind an engine, the conversations a new request's room released are dropped from the prefix tree as the
     /// model reported them: the tree stays consistent and names no payload the model no longer holds.</summary>
     [Fact]

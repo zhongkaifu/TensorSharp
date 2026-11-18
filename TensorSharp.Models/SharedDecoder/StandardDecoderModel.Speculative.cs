@@ -504,9 +504,18 @@ namespace TensorSharp.Models
                 foreach (string key in keys)
                 {
                     // A device with no room for the second slot (EnsureDeviceRoomForSlot) keeps the first warm: refused
-                    // here, the exception ended the load.
+                    // here, the exception ended the load. On a device this model manages (NewSlotWithRoom) the first one
+                    // is refused like a lone request where it does not fit beside the headroom and a prompt step: the
+                    // warm-up then keeps none, and the requests are refused (or run) by their own slots' room.
+                    int refusals = SlotRefusals;
                     try { EnsureSequenceSlot(key, FreshSlotTokens); }
                     catch (SequenceSlotUnavailableException) { break; }
+                    catch (InvalidOperationException) when (SlotRefusals > refusals)
+                    {
+                        Console.Error.WriteLine($"[{Config.Architecture}] the device has no room for the warm-up's pooled slot beside "
+                            + "its headroom and a prompt step: none is kept, and the first request allocates its own slot.");
+                        break;
+                    }
                     TryForwardUnified(new[] { key }, new[] { new[] { safeToken } }, new[] { 0 }, logits);
                 }
             }
