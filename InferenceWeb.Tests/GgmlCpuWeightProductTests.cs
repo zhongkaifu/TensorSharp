@@ -73,6 +73,8 @@ public sealed class GgmlCpuWeightProductTests
             case 8: size = 34; blocks = K / 32; break;    // Q8_0: d, 32 int8
             case 12: size = 144; blocks = K / 256; break; // Q4_K: d, dmin, 12 scale bytes, 128 bytes of nibbles
             case 14: size = 210; blocks = K / 256; break; // Q6_K: 128 ql, 64 qh, 16 int8 scales, d
+            case 20: size = 18; blocks = K / 32; break;   // IQ4_NL: d, 16 bytes of nibbles
+            case 39: size = 17; blocks = K / 32; break;   // MXFP4: an E8M0 exponent, 16 bytes of E2M1 codes
             case 30: size = 2; blocks = K; break;          // BF16
             case 40: size = 36; blocks = K / 64; break;    // NVFP4: four UE4M3 sub-block scales, 32 bytes of E2M1 codes
             default: throw new ArgumentOutOfRangeException(nameof(type));
@@ -87,6 +89,8 @@ public sealed class GgmlCpuWeightProductTests
                 case 2:
                 case 8: WriteHalf(b, at, (float)(rng.NextDouble() * 0.02 + 0.005)); break;
                 case 12: WriteHalf(b, at, (float)(rng.NextDouble() * 0.01 + 0.002)); WriteHalf(b, at + 2, (float)(rng.NextDouble() * 0.005)); break;
+                case 20: WriteHalf(b, at, (float)(rng.NextDouble() * 0.02 + 0.005)); break;
+                case 39: b[at] = (byte)(118 + rng.Next(8)); break;   // 2^-9 .. 2^-2
                 case 14: WriteHalf(b, at + 208, (float)(rng.NextDouble() * 0.005 + 0.001)); break;
                 case 30:
                 {
@@ -197,7 +201,8 @@ public sealed class GgmlCpuWeightProductTests
     /// A weight read only by products (whole, or 8-row-aligned row blocks) runs from the repacked layout; the same bytes
     /// read by a GET_ROWS, or through a row block that splits an interleaved group, stay plain in that graph. All of them
     /// compute the same products: the repacked and plain kernels differ only in their summation order, and both round
-    /// the activations to Q8 as ggml-cpu does (so the double-precision reference sits ~1e-2 away).
+    /// the activations to Q8 as ggml-cpu does (so the double-precision reference sits ~1e-2 away). (Which repacked products
+    /// give a row the same bits at every width: see <see cref="RepackedNonKQuantProductsGiveEveryRowItsOwnBits"/>.)
     /// </summary>
     [GgmlFact(BackendType.GgmlCpu)]
     public void RepackedAndPlainLayoutsComputeTheSameProducts()
@@ -307,6 +312,42 @@ public sealed class GgmlCpuWeightProductTests
                     Assert.True(SameBits(wide[1], j * 32, one[1], 0, 32), $"rows {n}: row {j} of the row block's product");
                 }
             }
+        });
+    }
+
+    /// <summary>
+    /// ggml-cpu's repacked product runs groups of four activation rows through its GEMM and the rows past the last group
+    /// through its GEMV. For Q4_0, Q8_0, IQ4_NL and MXFP4 the two give a row the same bits, so every row of a product has
+    /// the bits it has alone whatever rows share the step (a decode token, a batch of sequences' tokens, a prompt's tail):
+    /// concurrent greedy replies equal one-at-a-time ones on those files. (The K-quants' GEMM sums a row in another order
+    /// than their GEMV, so theirs depend on the batch, as on llama.cpp; padding their rows to the GEMM halved decode speed.)
+    /// A drift guard on the ggml kernels these files rely on.
+    /// </summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void RepackedNonKQuantProductsGiveEveryRowItsOwnBits()
+    {
+        WithCpuBackend(() =>
+        {
+            var rng = new Random(17);
+            var differing = new List<string>();
+            foreach (int type in new[] { 2, 8, 20, 39 })   // Q4_0, Q8_0, IQ4_NL, MXFP4
+            {
+                using var native = new Native();
+                byte[] bytes = RandomWeight(type, rng);
+                IntPtr w = native.Copy(bytes);
+                const int most = 13;
+                float[] x = Activations(most, rng);
+                var alone = new float[most][];
+                for (int j = 0; j < most; j++)
+                    alone[j] = Run(type, w, bytes.Length, native.Copy(x.AsSpan(j * K, K).ToArray()), 1, new[] { (0, M) }, null, native)[0];
+                foreach (int n in new[] { 2, 3, 4, 5, 6, 7, 8, 9, 13 })
+                {
+                    float[] batch = Run(type, w, bytes.Length, native.Copy(x.AsSpan(0, n * K).ToArray()), n, new[] { (0, M) }, null, native)[0];
+                    for (int j = 0; j < n; j++)
+                        if (!SameBits(batch, j * M, alone[j], 0, M)) differing.Add($"type {type} row {j} of {n}");
+                }
+            }
+            Assert.True(differing.Count == 0, "rows whose bits differ from the row alone: " + string.Join(", ", differing));
         });
     }
 
