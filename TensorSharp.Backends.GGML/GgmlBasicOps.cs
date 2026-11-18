@@ -1789,6 +1789,9 @@ namespace TensorSharp.GGML
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
         /// <summary>The width of the thread pool ggml_cpu's next compute runs on (0 on any other backend).</summary>
         public static int CpuPoolThreads() => GgmlNative.CpuPoolThreads();
+        /// <summary>Whether ggml_cpu copies the quantized weights products read into ggml-cpu's repacked layouts
+        /// (TS_GGML_CPU_REPACK).</summary>
+        public static bool CpuRepacksWeights() => GgmlNative.CpuRepacksWeights();
         public static void Shutdown() => GgmlNative.Shutdown();
 
         /// <summary>

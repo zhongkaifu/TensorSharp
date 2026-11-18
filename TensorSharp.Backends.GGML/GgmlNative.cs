@@ -1436,6 +1436,10 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_CpuRepacksWeights();
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial IntPtr TSGgml_GetBackendFailureText();
 
         [LibraryImport(DllName)]
@@ -6570,6 +6574,10 @@ internal enum GgmlIndexReductionOp
         /// <summary>The width of the thread pool ggml_cpu's next compute runs on: its prompt pool, or its decode pool after a
         /// step of decode width (TS_GGML_CPU_THREADS / TS_GGML_CPU_DECODE_THREADS); 0 on any other backend.</summary>
         public static int CpuPoolThreads() => TSGgml_CpuPoolThreads();
+
+        /// <summary>Whether ggml_cpu copies the quantized weights products read into ggml-cpu's repacked layouts
+        /// (TS_GGML_CPU_REPACK: on by default on ARM64).</summary>
+        public static bool CpuRepacksWeights() => TSGgml_CpuRepacksWeights() != 0;
 
         /// <summary>
         /// Graph builds, since the process started, that ran an attention as explicit

@@ -40,9 +40,22 @@ namespace TensorSharp.Models
         /// A40, interleaved (fused -> apart): Q4_K_M pp512 15,455 -> 15,849, pp4096 14,039 -> 14,764 tok/s, tg128 at 4K 328.8
         /// -> 334.3; Q8_0 pp512 16,515 -> 18,139, pp4096 16,048 -> 16,883, tg128 238.0 -> 243.3. The fused weight stays where it
         /// measured faster: QAD-Q4_0 (pp512 -2.4%, pp4096 -5.0% apart), BF16 (-16.6%, -15.0%; its prompt products take cuBLAS,
-        /// which has no GLU write-back) and NVFP4 (decode -2.7% apart).</summary>
+        /// which has no GLU write-back) and NVFP4 (decode -2.7% apart).
+        /// On ggml_cpu, where ggml-cpu repacks the pair's type (ggml_ops_cpu_graph.h), it stays apart too: every product
+        /// reads the repacked copies, and the plain bytes they are made from are the GGUF's mapped pages, where a fused
+        /// weight was an anonymous host copy resident beside its repacked copy. Server peak footprint on an M5 Pro (one
+        /// stream, 512-token prompts): LFM3-1.7B Q4_K_M 1,962 -> 1,557 MB, Q8_0 3,075 -> 2,310 MB, QAD-Q4_0 1,921 -> 1,515 MB.
+        /// The same bits (logits digests of those files); prompts within their run-to-run spread; decode 0-4% slower (two
+        /// products a layer instead of one). NVFP4 and BF16, which ggml-cpu does not repack, keep the fused weight as their
+        /// only copy (apart, NVFP4 decoded 2% slower and BF16 prompts ran 6-11% slower).</summary>
         protected override bool KeepsGateUpApart(int gateType, int upType)
-            => _backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */;
+            => (_backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */)
+               || (_backend == BackendType.GgmlCpu && gateType == upType && CpuRepacks(gateType));
+
+        /// <summary>The types ggml-cpu repacks (ggml_ops_cpu_graph.cpp repackable_type), when this build and machine repack.</summary>
+        private static bool CpuRepacks(int ggmlType)
+            => ggmlType is 2 /* Q4_0 */ or 8 /* Q8_0 */ or 12 /* Q4_K */ or 13 /* Q5_K */ or 14 /* Q6_K */ or 20 /* IQ4_NL */ or 39 /* MXFP4 */
+               && TensorSharp.GGML.GgmlBasicOps.CpuRepacksWeights();
 
         /// <summary>A plain prompt's 512-row steps overlap on the device: the short convolutions' windows and the caches stay on
         /// the device between steps, so nothing between them reads the device back.</summary>
