@@ -41,6 +41,12 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   TensorSharp its scheduler with `TS_SCHED_MAX_RUNNING_SEQS=C`. CPU runs: `--backend ggml_cpu|cpu` (llama-server gets
   `-ngl 0`), `--threads N` (llama-server `-t N -tb N`, TensorSharp as `ts-bench.sh --threads`), `--tag` to name each
   run's rows and files, `--waves` for fewer requests per level on a slow lane.
+- `cpu-matrix.sh QUANT pp|tg [ROUNDS] [DEPTHS]`: TensorSharp ggml_cpu against llama.cpp CPU for one quant, as the CPU
+  baseline lays it out (prompts at 18 threads, decode at 12, flash attention on, `ab.py --quiet`): llama.cpp noblas,
+  noblas `--repack 0` (its weights placed as TensorSharp places them) and optionally the BLAS build; `TS_ARMS` adds
+  TensorSharp A/B arms (`'ts-new=PROBE=/path/Lfm3Probe.dll'`). Results under `artifacts/lfm3/cpu/<stamp>-...`.
+- `cpu-profile.sh [QUANT] [T]`: the CPU attribution in one run (per-op profiles of both engines, `sample` profiles of
+  decode and a long prompt), reduced into `summary.txt` under `artifacts/lfm3/cpu/<stamp>-profile-...`.
 - CPU attribution:
   - `llamacpp-op-profile.cpp` (build line in its header, against a CPU-only tree): llama.cpp's time per op, product
     shape and weight buffer (`@CPU_REPACK` or not) for one prompt and decode steps, every node computed and synchronized
