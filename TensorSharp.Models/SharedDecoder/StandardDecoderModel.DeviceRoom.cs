@@ -422,8 +422,13 @@ namespace TensorSharp.Models
         /// release may be what the section reads, and the section made its own room).</summary>
         private int _slotMutationDepth;
 
-        // The thread the model's steps run on (the first EnsureSequenceSlot's): the only one the reclaimer acts on.
+        // The thread the model's steps run on (the latest step entry's: EnsureSequenceSlot, TryForwardSlots): the only one the
+        // reclaimer acts on. Not the first one's: a host warms the kernels on its loading thread (WarmPooledSlot makes a slot
+        // there), and the engine's own worker runs every later step, where a reclaimer bound to the loader never acted.
         private int _engineThread;
+
+        /// <summary>The calling thread runs the model's steps from here on (<see cref="ReclaimForAllocator"/> acts only there).</summary>
+        private void NoteEngineThread() => _engineThread = Environment.CurrentManagedThreadId;
 
         private bool _reclaiming;
         private DeviceRoomReclaimer _reclaimer;

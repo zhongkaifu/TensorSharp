@@ -149,7 +149,7 @@ namespace TensorSharp.Models
         {
             if (string.IsNullOrEmpty(requestId))
                 throw new ArgumentException("RequestId required", nameof(requestId));
-            if (_engineThread == 0) _engineThread = Environment.CurrentManagedThreadId;
+            NoteEngineThread();
             RestorePrimaryCache();
             ForgetDeferredGraphs();
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);

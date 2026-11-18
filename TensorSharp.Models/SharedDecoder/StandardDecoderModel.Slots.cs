@@ -789,6 +789,7 @@ namespace TensorSharp.Models
         private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
             float[][] features = null)
         {
+            NoteEngineThread();
             ForgetDeferredGraphs();
             try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))

@@ -214,6 +214,35 @@ public sealed class DeviceRoomTests : IDisposable
         Continue(model, "run");   // the freed slots' steps are forgotten at this entry
     }
 
+    /// <summary>A host warms the kernels on its loading thread (StartupModelLoader, the CLI), and the warm-up makes its pooled
+    /// slot there (WarmPooledSlot, through EnsureSequenceSlot); the engine's own worker thread runs every later step. The
+    /// reclaimer acts on the thread that runs the steps: bound to the first thread that made a slot, it never released anything
+    /// in a server (rung 3 went straight to the last resort).</summary>
+    [Fact]
+    public void TheReclaimerActsOnTheThreadThatRunsTheStepsAfterAWarmUpOnTheLoadingThread()
+    {
+        using Qwen35RuntimeModel model = Create();
+        Exception failed = null;
+        var loader = new Thread(() =>
+        {
+            try { model.WarmUpKernels(); }
+            catch (Exception ex) { failed = ex; }
+        });
+        loader.Start();
+        loader.Join();
+        Assert.Null(failed);
+        Assert.True(model.SlotPoolForTests.Pooled > 0, "the warm-up made no pooled slot (it did not go through EnsureSequenceSlot)");
+
+        var sink = new RecordingPayloadSink();
+        model.AttachPrefixCache(sink);   // the engine attaches its prefix cache after the warm-up
+        Prompt(model, "run");
+        Prompt(model, "k0");
+        Assert.True(model.RetainSequenceCacheAs("k0", "k0"));
+        Assert.True(model.ReclaimForAllocator(1L << 40) > 0, "the reclaimer stayed bound to the loading thread");
+        Assert.Contains(("k0", InvalidationReason.NativeSlotReclaimed), sink.Reports);
+        Continue(model, "run");
+    }
+
     /// <summary>Behind an engine, the conversations a new request's room released are dropped from the prefix tree as the
     /// model reported them: the tree stays consistent and names no payload the model no longer holds.</summary>
     [Fact]
