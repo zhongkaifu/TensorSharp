@@ -340,6 +340,34 @@ probability over its top-10 logits), `0.35` for a block drafter (the CUMULATIVE
 prefix probability, so the same number is far stricter), `0` for n-gram (where it
 scales the required match length instead).
 
+### The per-request stats line
+
+A request that speculated logs one line when it finishes:
+
+```
+Speculative decoding stats for chat-…: drafted=175 accepted=165 acceptance=94 % verifySteps=26 plainSteps=0 rollbacks=3
+  | phaseMs draft=103 verify=749 commit=21 snapshot=0 rollback=0 catchUp=2 plain=0
+  | perVerifyMs draft=4.0 verify=28.8 commit=0.8 catchUp=0.1 | governor plain=… spec=… wins=0 losses=0 parked=0
+```
+
+`phaseMs` are the request's wall-clock totals by phase, each counted once:
+
+| Phase | What it holds |
+| --- | --- |
+| `draft` | the drafter proposing, including steps whose draft proposed nothing |
+| `verify` | the trunk forward over the window and its readback, nothing else; where one forward verifies several requests (the unified runtime's batched step, which serves a lone request too), this request's share of it |
+| `commit` | drawing the window's rows, accepting the drafts and the trunk's commit of the kept rows (a recurrent trunk's replay of them, or keeping the verify's own rows); a share on a batched step |
+| `snapshot` | the recurrent-state snapshot before a solo verify |
+| `rollback` | the re-forward of the kept rows where the trunk could not keep the verify's own |
+| `catchUp` | handing the kept tokens to the drafter |
+| `plain` | steps that verified no draft; on a batched step, the request's share of the forward and of the draws |
+
+`perVerifyMs` divides `draft`, `verify`, `commit` and `catchUp` by `verifySteps`: what one
+verify step spent in each. Until 2026-11 the batched step timed its verify from the start
+of the step, so `verify` held the draft as well (also counted under `draft`), and nothing
+counted the commit; per-step figures read off older logs overstate the verify by the
+draft. `TS_BATCHED_SPEC_LOG=1` prints the same phases for every batched step.
+
 ## DFlash and DFlash2
 
 A **DFlash** drafter is a small block-diffusion model that ships as its own GGUF

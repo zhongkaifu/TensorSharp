@@ -21,7 +21,8 @@ Per request it prints, from the server's lines:
   prompt    prompt steps: count, ms summed, idle gaps summed
   decode    decode steps: count, median and p90 ms, tokens a step
   spec      the "Speculative decoding stats" line: verify steps, acceptance, and per verify step the draft, verify,
-            commit and catch-up ms (verify still holds the draft on a runtime without a commit phase in that line)
+            commit and catch-up ms (the line's perVerifyMs section where it has one; on a runtime whose line has no
+            commit phase, the shared runtime's verify still holds the draft)
   error     the request's failure (HTTP status, the exception and where it was thrown)
 and the notes the server logged while the request ran ([cuda...], [prefix-...] and warning lines, plus --note REGEX).
 A size's summary row puts A, B and C side by side: the issue's table. Nothing is written but stdout and --json.
@@ -383,9 +384,12 @@ def metrics(c: dict | None, s: dict | None) -> dict:
         n = fnum(tot.get("verifySteps")) or 0
         m["verify_steps"] = n
         m["acceptance"] = tot.get("acceptance")
+        per = sp.get("perVerifyMs", {})
         if n:
             for key in ("draft", "verify", "commit", "catchUp"):
-                if key in ph:
+                if key in per:
+                    m[f"{key}_ms"] = fnum(per[key], 1)
+                elif key in ph:
                     m[f"{key}_ms"] = round(float(ph[key]) / n, 1)
     if err or s["error"] or s["http_error"]:
         parts = [p for p in (err, s["error"], s["error_site"]) if p]

@@ -2957,7 +2957,7 @@ namespace TensorSharp.Runtime.Scheduling
             // state - release it here rather than leaving it to the GC.
             _specCtx?.Exec?.Dispose();
 
-            var exec = new SpeculativeExecution(spec, speculator, trunk, SharedGovernorFor(spec, speculator, seq));
+            var exec = new SpeculativeExecution(spec, speculator, trunk, SharedGovernorFor(spec, speculator, seq)) { Timestamp = Timestamp };
             _logger.LogInformation(
                 "Speculative decoding armed for {EngineRequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
                 + "pMin={PMin}, trunk={Trunk}, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
@@ -3348,6 +3348,10 @@ namespace TensorSharp.Runtime.Scheduling
 
         private long _batchedSpecSteps;
 
+        /// <summary>The clock a speculative step's phases are timed with (<see cref="Stopwatch.GetTimestamp"/>; tests
+        /// script it). The speculative executions this executor arms read the same one.</summary>
+        internal Func<long> Timestamp { get; set; } = Stopwatch.GetTimestamp;
+
         /// <summary>Batched speculative steps served (each verifies every decoding
         /// sequence's window in one trunk forward).</summary>
         internal long BatchedSpeculativeSteps => _batchedSpecSteps;
@@ -3463,7 +3467,7 @@ namespace TensorSharp.Runtime.Scheduling
                 drafts = new List<int>[n];
                 kMaxes = new int[n];
             }
-            long started = Stopwatch.GetTimestamp();
+            long started = Timestamp();
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
@@ -3527,10 +3531,10 @@ namespace TensorSharp.Runtime.Scheduling
                         blockTokens[j] = new int[blockWidth];
                         blockConf[j] = new float[blockWidth];
                     }
-                    long tDraft0 = Stopwatch.GetTimestamp();
+                    long tDraft0 = Timestamp();
                     draftedTogether = batched.TryDraftBatch(laneIds, laneAnchors, carries.ToArray(), lanePositions,
                         blockTokens, blockConf);
-                    long share = (Stopwatch.GetTimestamp() - tDraft0) / m;
+                    long share = (Timestamp() - tDraft0) / m;
                     if (draftedTogether)
                         for (int j = 0; j < m; j++)
                             ctxs[lanes[j]].Exec.AcceptBatchDraft(blockTokens[j], blockConf[j], caps[j], drafts[lanes[j]], share);
@@ -3538,7 +3542,7 @@ namespace TensorSharp.Runtime.Scheduling
             }
             else if (n >= 2 && batched.SupportsBatchedDraftChain)
             {
-                chained = TryBatchedDraftChain(batched, ctxs, requestIds, anchors, positions, kMaxes, drafts);
+                chained = TryBatchedDraftChain(batched, ctxs, requestIds, anchors, positions, kMaxes, drafts, Timestamp);
             }
             if (!draftedTogether)
             {
@@ -3575,7 +3579,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (_batchedSpecFeatures == null || _batchedSpecFeatures.LongLength < featNeeded)
                 _batchedSpecFeatures = new float[featNeeded];
             var drawn = new int[n * window];
-            long drafted = Stopwatch.GetTimestamp();
+            long drafted = Timestamp();
             int vocab = _model.Config.VocabSize;
             if (sampledVerify)
             {
@@ -3587,8 +3591,10 @@ namespace TensorSharp.Runtime.Scheduling
             }
             else if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, _batchedSpecFeatures))
                 return false;
-            long verified = Stopwatch.GetTimestamp();
-            long verifyTicks = verified - started;
+            long verified = Timestamp();
+            // The verify forward alone: each sequence's draft is counted where it ran (ProposeForBatch, AcceptBatchDraft,
+            // AcceptBatchChain). Measured from the step's start, it had counted the draft twice.
+            long verifyTicks = verified - drafted;
 
             // Accept per sequence exactly as the solo step does: a draft is kept while
             // it equals its row's draw, and nothing is accepted past a stop. A row's draw
@@ -3685,9 +3691,11 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             batched.CommitBatchedSpecVerify(requestIds, positions, kept);
-            long committed = Stopwatch.GetTimestamp();
+            long committed = Timestamp();
+            // The anchors' and rows' draws, the acceptance and the trunk's commit of the kept rows.
+            long commitTicks = committed - verified;
 
-            long ticksPerSequence = (Stopwatch.GetTimestamp() - started) / n;
+            long ticksPerSequence = (Timestamp() - started) / n;
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
@@ -3695,7 +3703,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int m = kept[i] - 1;
                 batched.BindDraftState(seq.RequestId);
                 ctx.Exec.CommitBatch(anchors[i], positions[i], drafts[i], m,
-                    _batchedSpecFeatures, (long)i * window * feat, verifyTicks / n);
+                    _batchedSpecFeatures, (long)i * window * feat, verifyTicks / n, commitTicks / n);
                 int next = nexts[i];
                 seq.LastLogits = null;
                 seq.AdvanceComputedTokens(kept[i]);
@@ -3722,7 +3730,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (s_batchedSpecLog)
             {
                 static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
-                long done = Stopwatch.GetTimestamp();
+                long done = Timestamp();
                 Console.Error.WriteLine(
                     $"[batched-spec] n={n} window={window} kept=[{string.Join(",", kept)}] draft={Ms(drafted - started):F1} " +
                     $"verify={Ms(verified - drafted):F1} commit={Ms(committed - verified):F1} drafter={Ms(done - committed):F1} ms");
@@ -3738,7 +3746,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// (fewer than two could join, or the model declined); the others draft on their own.
         /// </summary>
         private static bool[]? TryBatchedDraftChain(IBatchedSpeculativeTarget batched, SpecSeqContext[] ctxs, string[] requestIds,
-            int[] anchors, int[] positions, int[] kMaxes, List<int>[] drafts)
+            int[] anchors, int[] positions, int[] kMaxes, List<int>[] drafts, Func<long> timestamp)
         {
             int n = ctxs.Length;
             var lanes = new List<int>(n);
@@ -3776,11 +3784,11 @@ namespace TensorSharp.Runtime.Scheduling
                 ids[j] = new int[caps[j]];
                 probs[j] = new float[caps[j]];
             }
-            long t0 = Stopwatch.GetTimestamp();
+            long t0 = timestamp();
             if (!batched.TryDraftChainBatch(laneIds, tokens.ToArray(), rows.ToArray(), starts.ToArray(), caps.ToArray(), gates,
                     ids, probs, steps))
                 return null;
-            long share = (Stopwatch.GetTimestamp() - t0) / m;
+            long share = (timestamp() - t0) / m;
             var drafted = new bool[n];
             for (int j = 0; j < m; j++)
             {
@@ -3903,7 +3911,8 @@ namespace TensorSharp.Runtime.Scheduling
                 _fusedSpecDeclined.Add(seq.RequestId);
                 return false;
             }
-            var exec = new SpeculativeExecution(spec, speculator, trunk: null, SharedGovernorFor(spec, speculator, seq));
+            var exec = new SpeculativeExecution(spec, speculator, trunk: null, SharedGovernorFor(spec, speculator, seq))
+                { Timestamp = Timestamp };
             if (!exec.CanSeedCommitted)
             {
                 exec.Dispose();

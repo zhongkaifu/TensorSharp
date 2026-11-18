@@ -281,6 +281,18 @@ class ReportTests(unittest.TestCase):
             self.assertIn("CudaException: CUDA error 2: out of memory", d["error"])
             self.assertIn("ExecuteStepUnified -> EnsureSequenceSlot -> AllocateCaches (in AllocateDeviceMemory)", d["error"])
 
+    def test_the_per_verify_step_section_is_read_when_the_line_has_one(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_run(root)
+            log = Path(root, "server.log")
+            log.write_text(log.read_text().replace(
+                "phaseMs draft=10 verify=70 snapshot=0 rollback=0 catchUp=2 plain=0 |",
+                "phaseMs draft=10 verify=70 commit=3 snapshot=0 rollback=0 catchUp=2 plain=0 "
+                "| perVerifyMs draft=5.2 verify=34.9 commit=1.4 catchUp=0.9 |"))
+            run = report.load_run(str(log), os.path.join(root, "client.jsonl"), [])
+            c = run["rows"][2]
+            self.assertEqual((5.2, 34.9, 1.4, 0.9), (c["draft_ms"], c["verify_ms"], c["commit_ms"], c["catchUp_ms"]))
+
     def test_markdown_puts_a_size_s_requests_side_by_side(self):
         with tempfile.TemporaryDirectory() as root:
             self.write_run(root)

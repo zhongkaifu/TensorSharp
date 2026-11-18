@@ -133,6 +133,10 @@ namespace TensorSharp.Runtime.Speculative
 
         public SpeculationStats Stats { get; } = new();
 
+        /// <summary>The clock the phase timings read (<see cref="Stopwatch.GetTimestamp"/>; tests script it). The
+        /// executor that arms this execution hands it its own, so a step's phases and the stats share one clock.</summary>
+        internal Func<long> Timestamp { get; set; } = Stopwatch.GetTimestamp;
+
         // Tag of the process-wide drafted/accepted counters (TensorSharpMetrics), built once per
         // execution so a verify step records them without allocating. The counters add the same
         // deltas as Stats, here and not at completion: a preempted request that re-arms gets a
@@ -464,7 +468,7 @@ namespace TensorSharp.Runtime.Speculative
         {
             ArgumentNullException.ThrowIfNull(drawNext);
 
-            long tStep0 = Stopwatch.GetTimestamp();
+            long tStep0 = Timestamp();
             // Governor: a step it declines becomes a plain decode, which is the
             // same path an all-low-confidence draft window already takes (and so
             // keeps the drafter's own state in sync via the commit below).
@@ -493,7 +497,7 @@ namespace TensorSharp.Runtime.Speculative
             _draftTokens.Clear();
             if (kMax > 0)
             {
-                long tDraft0 = Stopwatch.GetTimestamp();
+                long tDraft0 = Timestamp();
                 _model.SpecEnsureCapacity(position + kMax + 1);
                 _speculator.Propose(
                     new DraftContext
@@ -510,7 +514,7 @@ namespace TensorSharp.Runtime.Speculative
                     throw new InvalidOperationException(
                         $"The {_speculator.Name} speculator proposed {_draftTokens.Count} tokens "
                         + $"for a verification window limited to {kMax} drafts.");
-                Stats.DraftTicks += Stopwatch.GetTimestamp() - tDraft0;
+                Stats.DraftTicks += Timestamp() - tDraft0;
             }
 
             if (_draftTokens.Count == 0)
@@ -518,7 +522,7 @@ namespace TensorSharp.Runtime.Speculative
                 // Plain decode step (still captures h + keeps the drafter in sync).
                 Stats.PlainSteps++;
                 _plainRun++;
-                long tPlain0 = Stopwatch.GetTimestamp();
+                long tPlain0 = Timestamp();
                 _oneToken[0] = lastToken;
                 // A seeded start has no carry for this token: hand the speculator the
                 // token with no hidden row (a head that starts mid-sequence accepts
@@ -566,7 +570,7 @@ namespace TensorSharp.Runtime.Speculative
                         _carryValid = true;
                     }
                 }
-                Stats.PlainTicks += Stopwatch.GetTimestamp() - tPlain0;
+                Stats.PlainTicks += Timestamp() - tPlain0;
 
                 // Reused, not freshly allocated: a vocabulary row is 500-600 KB, so
                 // one array per decoded token is a large-object allocation per token
@@ -608,9 +612,9 @@ namespace TensorSharp.Runtime.Speculative
             for (int i = 0; i < k; i++)
                 batch[i + 1] = _draftTokens[i];
 
-            long tSnap0 = Stopwatch.GetTimestamp();
+            long tSnap0 = Timestamp();
             _trunk.SnapshotRecurrentState();
-            long tVerify0 = Stopwatch.GetTimestamp();
+            long tVerify0 = Timestamp();
             Stats.SnapshotTicks += tVerify0 - tSnap0;
             // Supplying drawGreedy is an explicit promise that each row reduces to
             // raw argmax after the caller's forced-token/stop checks. Legacy callers
@@ -618,7 +622,8 @@ namespace TensorSharp.Runtime.Speculative
             bool greedyVerify = drawGreedy != null && _trunk.TryForwardGreedyVerify(batch, _verifyH, VerifyDrawn);
             if (!greedyVerify)
                 _trunk.Forward(batch, _verifyH, VerifyLogits, allLogitsRows: true);
-            Stats.VerifyTicks += Stopwatch.GetTimestamp() - tVerify0;
+            long tCommit0 = Timestamp();
+            Stats.VerifyTicks += tCommit0 - tVerify0;
 
             int m = 0;
             int nextToken;
@@ -659,28 +664,30 @@ namespace TensorSharp.Runtime.Speculative
             int[] keep = new int[m + 1];
             Array.Copy(batch, keep, m + 1);
 
+            // Partial acceptance. Fast path: if the verify already persisted
+            // reusable KV for the accepted prefix (no recurrent state), just keep
+            // those writes and advance the position - the kept-prefix re-forward
+            // is redundant (it would recompute byte-identical KV). This is the
+            // dominant rollback cost on long contexts. Otherwise roll back to the
+            // pre-verify checkpoint and re-advance over the kept prefix.
+            // The row draws, the accept count's settling and that fast path are the
+            // step's commit; a rollback is the re-forward alone.
+            bool keptInPlace = m == k || _trunk.TryCommitVerifiedPrefix(position + m + 1);
+            Stats.CommitTicks += Timestamp() - tCommit0;
             if (m < k)
-            {
-                // Partial acceptance. Fast path: if the verify already persisted
-                // reusable KV for the accepted prefix (no recurrent state), just keep
-                // those writes and advance the position - the kept-prefix re-forward
-                // is redundant (it would recompute byte-identical KV). This is the
-                // dominant rollback cost on long contexts. Otherwise roll back to the
-                // pre-verify checkpoint and re-advance over the kept prefix.
                 Stats.RollbackSteps++;
-                long tRoll0 = Stopwatch.GetTimestamp();
-                if (!_trunk.TryCommitVerifiedPrefix(position + m + 1))
-                {
-                    _trunk.Rollback(position);
-                    _trunk.Forward(keep, null, StepLogits, allLogitsRows: false);
-                }
-                Stats.RollbackTicks += Stopwatch.GetTimestamp() - tRoll0;
+            if (!keptInPlace)
+            {
+                long tRoll0 = Timestamp();
+                _trunk.Rollback(position);
+                _trunk.Forward(keep, null, StepLogits, allLogitsRows: false);
+                Stats.RollbackTicks += Timestamp() - tRoll0;
             }
 
             // Hand the kept tokens to the speculator with their exact trunk
             // hidden states.
             {
-                long tCatch0 = Stopwatch.GetTimestamp();
+                long tCatch0 = Timestamp();
                 if (NeedsHidden)
                 {
                     Array.Copy(_pendingH, 0, _catchUpH, 0, _hidden);
@@ -688,7 +695,7 @@ namespace TensorSharp.Runtime.Speculative
                         Array.Copy(_verifyH, 0, _catchUpH, _hidden, (long)m * _hidden);
                 }
                 _speculator.Commit(keep, _catchUpH, position);
-                Stats.CatchUpTicks += Stopwatch.GetTimestamp() - tCatch0;
+                Stats.CatchUpTicks += Timestamp() - tCatch0;
             }
 
             if (NeedsHidden)
@@ -729,7 +736,7 @@ namespace TensorSharp.Runtime.Speculative
             kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
             if (kMax <= 0 || !EnsureCarry(position))
                 return 0;
-            long t0 = Stopwatch.GetTimestamp();
+            long t0 = Timestamp();
             _speculator.Propose(
                 new DraftContext
                 {
@@ -744,7 +751,7 @@ namespace TensorSharp.Runtime.Speculative
                 throw new InvalidOperationException(
                     $"The {_speculator.Name} speculator proposed {draftsOut.Count} tokens "
                     + $"for a verification window limited to {kMax} drafts.");
-            Stats.DraftTicks += Stopwatch.GetTimestamp() - t0;
+            Stats.DraftTicks += Timestamp() - t0;
             return draftsOut.Count;
         }
 
@@ -839,9 +846,12 @@ namespace TensorSharp.Runtime.Speculative
         /// <paramref name="rowOffset"/>, one SpecFeatureSize row per verify row) and
         /// carries the last kept row into the next draft. The caller binds this
         /// sequence's drafter state first and has already advanced the trunk.
+        /// <paramref name="verifyTicks"/> is this sequence's share of the verify forward alone (its draft is counted
+        /// where it ran), <paramref name="commitTicks"/> its share of the row draws and the trunk's commit; a step that
+        /// drafted nothing is a plain step, charged both.
         /// </summary>
         public void CommitBatch(int lastToken, int position, IReadOnlyList<int> drafts, int accepted,
-            float[]? rowFeatures, long rowOffset, long verifyTicks)
+            float[]? rowFeatures, long rowOffset, long verifyTicks, long commitTicks = 0)
         {
             ArgumentNullException.ThrowIfNull(drafts);
             if (accepted < 0 || accepted > drafts.Count)
@@ -858,19 +868,20 @@ namespace TensorSharp.Runtime.Speculative
                 if (accepted < k)
                     Stats.RollbackSteps++;
                 Stats.VerifyTicks += verifyTicks;
+                Stats.CommitTicks += commitTicks;
                 _plainRun = 0;
             }
             else
             {
                 Stats.PlainSteps++;
-                Stats.PlainTicks += verifyTicks;
+                Stats.PlainTicks += verifyTicks + commitTicks;
             }
 
             int[] keep = new int[accepted + 1];
             keep[0] = lastToken;
             for (int i = 0; i < accepted; i++)
                 keep[i + 1] = drafts[i];
-            long tCatch0 = Stopwatch.GetTimestamp();
+            long tCatch0 = Timestamp();
             if (!NeedsHidden || rowFeatures == null)
             {
                 _speculator.Commit(keep, null, position);
@@ -888,7 +899,7 @@ namespace TensorSharp.Runtime.Speculative
                 Array.Copy(rowFeatures, rowOffset + (long)accepted * _hidden, _pendingH, 0, _hidden);
                 _carryValid = true;
             }
-            Stats.CatchUpTicks += Stopwatch.GetTimestamp() - tCatch0;
+            Stats.CatchUpTicks += Timestamp() - tCatch0;
         }
 
         public void Dispose() => _speculator.Dispose();
@@ -897,7 +908,7 @@ namespace TensorSharp.Runtime.Speculative
 
         private void RecordStep(bool speculated, int tokensEmitted, long tStep0)
         {
-            Governor.Record(speculated, tokensEmitted, Stopwatch.GetTimestamp() - tStep0);
+            Governor.Record(speculated, tokensEmitted, Timestamp() - tStep0);
             Stats.PlainMsPerToken = Governor.PlainMsPerToken;
             Stats.SpecMsPerToken = Governor.SpecMsPerToken;
             Stats.GovernorWins = Governor.Wins - _governorWinsAtStart;
