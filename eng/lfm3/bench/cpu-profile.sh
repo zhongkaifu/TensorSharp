@@ -6,7 +6,8 @@
 # Results under artifacts/lfm3/cpu/<stamp>-profile-<quant>-t<T>/ with the reduced tables in summary.txt.
 #
 # usage: cpu-profile.sh [QUANT] [T]      (default Q4_K_M 6); MODELS, LLAMA_CPP_DIR, PROBE as for ts-bench.sh
-# CPU-heavy for ~4 minutes: on a shared machine run it under the CPU lock.
+# CPU-heavy for ~8 minutes at 6 threads (about half of it Lfm3Probe's start-up warm-ups, ~40-57 s a run): on a shared
+# machine run it under the CPU lock.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -32,19 +33,24 @@ done
 "$prof" "$M" "$T" 1 512 128 > "$out/llama-p512-d128.log" 2>&1
 "$prof" "$M" "$T" 1 4096 64 > "$out/llama-p4096-d64.log" 2>&1
 
-# 2. sample (the dotnet host runs the app in its own process, so $! is the process to sample)
-sample_run() {  # name delay seconds command...
-  local name=$1 delay=$2 secs=$3; shift 3
+# 2. sample (the dotnet host runs the app in its own process, so $! is the process to sample). Lfm3Probe's start-up
+# warm-up grows with MAX_CONTEXT (four prompts of up to 5,120 tokens: about a minute at 6 threads), so a TensorSharp run
+# is sampled DELAY seconds after its "INFO warm-up done" line, a llama-bench run DELAY seconds after its start.
+sample_run() {  # name warmed|- delay seconds command...
+  local name=$1 after=$2 delay=$3 secs=$4; shift 4
   "$@" > "$out/$name.run.log" 2>&1 &
   local pid=$!
+  if [[ $after == warmed ]]; then
+    until grep -q '^INFO warm-up done' "$out/$name.run.log" 2>/dev/null || ! kill -0 "$pid" 2>/dev/null; do sleep 1; done
+  fi
   sleep "$delay"
   sample "$pid" "$secs" 1 -mayDie -file "$out/$name.sample.txt" > /dev/null 2>&1 || true
   wait "$pid" || true
 }
-sample_run ts-decode 7 6 env MAX_CONTEXT=4096 "$here/ts-bench.sh" "$M" ggml_cpu - 2048 0 --reps 1 --threads "$T"
-sample_run llama-decode 3 6 "$L/build-cpu-noblas/bin/llama-bench" -m "$M" -ngl 0 -t "$T" -fa 1 -p 0 -n 2048 -r 1
-sample_run ts-prompt 8 6 env MAX_CONTEXT=10240 "$here/ts-bench.sh" "$M" ggml_cpu 8192 0 0 --reps 1 --threads "$T"
-sample_run llama-prompt 4 6 "$L/build-cpu-noblas/bin/llama-bench" -m "$M" -ngl 0 -t "$T" -fa 1 -p 8192 -n 0 -r 1
+sample_run ts-decode warmed 2 6 env MAX_CONTEXT=4096 "$here/ts-bench.sh" "$M" ggml_cpu - 2048 0 --reps 1 --threads "$T"
+sample_run llama-decode - 3 6 "$L/build-cpu-noblas/bin/llama-bench" -m "$M" -ngl 0 -t "$T" -fa 1 -p 0 -n 2048 -r 1
+sample_run ts-prompt warmed 2 6 env MAX_CONTEXT=10240 "$here/ts-bench.sh" "$M" ggml_cpu 8192 0 0 --reps 1 --threads "$T"
+sample_run llama-prompt - 4 6 "$L/build-cpu-noblas/bin/llama-bench" -m "$M" -ngl 0 -t "$T" -fa 1 -p 8192 -n 0 -r 1
 
 {
   for f in ts-prefill ts-decode-d0 ts-decode-d4096; do python3 "$here/node-profile-diff.py" "$out/$f.log" || true; done

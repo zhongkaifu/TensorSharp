@@ -35,11 +35,12 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   directories (a campaign split over several quiet windows), with the busy figures.
 - `ts-bench.sh MODEL BACKEND [PP,..|-] [TG] [DEPTH,..] [--reps N] [--greedy] [--threads N]`: `Lfm3Probe bench`,
   llama-bench's tests: ppN is one prompt of N tokens (TensorSharp's `ForwardRefill`). It warms 40 prompt steps and 64
-  decode steps first, so the host code the timed steps run is past .NET's first (tier-0) compilation, as in a server
-  that has run a while, and each prompt size by one untimed prompt of that size as llama-bench warms each test (a
-  size's first step builds its graphs). The managed lane's kernels keep
-  being tiered up by the JIT over its first few prompts of a size, so its short prompts need more than 3 reps for a
-  steady-state figure (LFM3 Q8_0 pp128 on an M5 Pro: 660-918 tok/s over 3 reps, 826-957 over 10). tgN@dD decodes N
+  decode steps first (fewer prompt steps when `MAX_CONTEXT` is under 5,184; an `INFO warm-up done` line on stderr marks
+  the end), so the host code the timed steps run is past .NET's first (tier-0) compilation, as in a server that has run
+  a while, and each prompt size by one untimed prompt of that size as llama-bench warms each test (a size's first step
+  builds its graphs). The managed lane's kernels keep being tiered up by the JIT over its first few prompts of a size,
+  so its short prompts need more than 3 reps for a steady-state figure (LFM3 Q8_0 pp128 on an M5 Pro: 660-918 tok/s
+  over 3 reps, 826-957 over 10). tgN@dD decodes N
   pseudo-random tokens after a D-token prompt (no sampling in the timed loop), after one untimed run of N tokens at
   depth 0 (llama-bench warms each test with one token; the managed lane's first decode run was 25-35 % slower than the
   rest while the JIT tiered its kernels up). Each figure is the median of `--reps` runs, the mean of the middle two for
@@ -90,14 +91,16 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   weights rotated past the caches, GOPS above); `TS_CPU_THREADS` sets the pool. `Lfm3Probe ppl` prints a digest of
   every scored logit's bits, which two builds whose kernels claim the same arithmetic must share.
 - `cpu-profile.sh [QUANT] [T]`: the CPU attribution in one run (per-op profiles of both engines, `sample` profiles of
-  decode and a long prompt), reduced into `summary.txt` under `artifacts/lfm3/cpu/<stamp>-profile-...`.
+  decode and a long prompt, a TensorSharp run sampled after its start-up warm-up), reduced into `summary.txt` under
+  `artifacts/lfm3/cpu/<stamp>-profile-...`.
 - CPU attribution:
   - `llamacpp-op-profile.cpp` (build line in its header, against a CPU-only tree): llama.cpp's time per op, product
     shape and weight buffer (`@CPU_REPACK` or not) for one prompt and decode steps, every node computed and synchronized
     on its own through the scheduler's eval callback. TensorSharp's side is `TS_GGML_NODE_PROFILE=shapes` with
     `TS_GGML_NODE_PROFILE_TAG=prefill|decode` (ggml_ops_core.cpp), reduced by `node-profile-diff.py LOG [--first N]`
-    (the graphs after the warm-up's report). The per-node synchronize inflates small decode nodes, much more on
-    llama.cpp's side (its decode step profiles at ~4x its real time; TensorSharp's at ~1x), so compare products.
+    (the graphs after Lfm3Probe's `INFO warm-up done` line, or after the first report). The per-node synchronize
+    inflates small decode nodes, much more on llama.cpp's side (its decode step profiles at ~4x its real time;
+    TensorSharp's at ~1x), so compare products.
   - `sample-top.py SAMPLE.txt`: a macOS `sample PID SECONDS 1 -file SAMPLE.txt` profile of an unmodified run, grouped by
     leaf function (dot kernels, repacked GEMV/GEMM, flash attention, thread-pool spinning, idle threads, host code).
   - `speedscope-top.py FILE [--match REGEX]`: self / inclusive time per frame of `dotnet-trace collect --profile

@@ -16,7 +16,8 @@
 //                                          run as llama-bench warms its tests (a decode test: TG tokens after a 1-token prompt,
 //                                          so the managed lane's JIT has tiered the decode kernels up). As llama-bench, decode
 //                                          feeds pseudo-random tokens (the timed loop holds no sampling); --greedy feeds each
-//                                          step's host argmax instead. A "RESULT name median min max" line per test.
+//                                          step's host argmax instead. A "RESULT name median min max" line per test, and on
+//                                          stderr an "INFO warm-up done" line where the start-up warm-up ends.
 //   spec   MODEL BACKEND FILE N            N greedy tokens after the file's prompt, plainly and with n-gram speculation (a verify
 //                                          window keeps the short-conv inputs and attends under the sliding window; the accept
 //                                          count commits a prefix): the two streams must be equal
@@ -166,6 +167,9 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     // (tier-0) compilation, as in a server that has run a while: 40 prompt steps of up to 512 rows, then 64 decode steps.
     // (A single 256-token prompt left most of the prompt path tier-0 for the first timed prompts: their host work per
     // 512-row step was 2x a warmed process's on the A40 VM.)
+    // The warm-up's length depends on MAX_CONTEXT and the lane (a minute on a CPU lane at 6 threads), so tools that profile
+    // the tests (bench/cpu-profile.sh, node-profile-diff.py) start from its end: one stderr line when it is done.
+    var warmClock = Stopwatch.StartNew();
     int warm = Math.Max(256, Math.Min(5120, model.MaxContextLength - 64));
     for (int w = 0; w < 4; w++)
     {
@@ -175,6 +179,8 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     model.ResetKVCache();
     model.ForwardRefill(Tokens(256, 1));
     for (int i = 0; i < 64; i++) model.Forward(new[] { 1234 + i });
+    Console.Error.WriteLine(FormattableString.Invariant(
+        $"INFO warm-up done in {warmClock.Elapsed.TotalSeconds:F1} s (4 prompts of {warm} tokens, 256 tokens and 64 decode steps)"));
 
     foreach (int n in prompts)
     {
@@ -197,9 +203,9 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     foreach (int depth in generate > 0 ? depths : Array.Empty<int>())
     {
         // One untimed decode run first, as llama-bench warms every test (with one token: its kernels are compiled ahead
-        // of time). The managed lane's decode kernels are still being tiered up by the JIT after the start-up warm-up's
-        // 8 tokens, and its first timed run was 25-35 % slower than the rest. At depth 0, so a deep test does not pay
-        // its prompt twice.
+        // of time). The managed lane's decode kernels were still being tiered up by the JIT after a start-up warm-up of 8
+        // decode steps (the warm-up's length before it took 64), and its first timed run was 25-35 % slower than the rest.
+        // At depth 0, so a deep test does not pay its prompt twice.
         model.ResetKVCache();
         model.ForwardRefill(new[] { 1 });
         foreach (int token in Tokens(generate, 9)) model.Forward(new[] { token });
