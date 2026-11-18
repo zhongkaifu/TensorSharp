@@ -272,9 +272,11 @@ namespace TensorSharp.Cuda
             _halfLayer[0] = _halfLayer[1] = -1;
             _arenaGeneration++;
             CudaDriverApi.cuMemGetInfo(out UIntPtr free, out _).ThrowOnError();
-            if ((long)free.ToUInt64() - StagingFreeFloorBytes < 2 * want)
+            long shortfall = 2 * want - ((long)free.ToUInt64() - StagingFreeFloorBytes);
+            if (shortfall > 0)
             {
-                cuda.TrimPool();
+                // Only what the halves lack goes back, the least recently used cached blocks first.
+                cuda.TrimLargeCache(shortfall);
                 cuda.Context.MakeCurrent();
                 CudaDriverApi.cuMemGetInfo(out free, out _).ThrowOnError();
             }

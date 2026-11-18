@@ -2619,11 +2619,13 @@ namespace TensorSharp.Cuda
                 _stagingBytes = 0;
             }
             CudaDriverApi.cuMemGetInfo(out UIntPtr free, out _).ThrowOnError();
-            if ((long)free.ToUInt64() - StagingFreeFloorBytes < Math.Min(need, StagingArenaCapBytes))
+            long shortfall = Math.Min(need, StagingArenaCapBytes) - ((long)free.ToUInt64() - StagingFreeFloorBytes);
+            if (shortfall > 0)
             {
-                // The memory pool keeps the blocks earlier steps returned: release them before settling for a smaller
-                // arena (a capped arena runs a long chunk's staged experts one at a time).
-                cuda.TrimPool();
+                // The memory pool keeps the blocks earlier steps returned: release what the arena lacks, the least
+                // recently used first, before settling for a smaller arena (a capped arena runs a long chunk's staged
+                // experts one at a time). The blocks the steps rent again stay cached.
+                cuda.TrimLargeCache(shortfall);
                 cuda.Context.MakeCurrent();
                 CudaDriverApi.cuMemGetInfo(out free, out _).ThrowOnError();
             }

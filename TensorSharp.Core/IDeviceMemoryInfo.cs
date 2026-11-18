@@ -12,8 +12,9 @@ namespace TensorSharp
     /// </summary>
     public interface IDeviceMemoryInfo
     {
-        /// <summary>The device's free and total bytes (free counts what the allocator caches for reuse); false when the
-        /// device cannot say.</summary>
+        /// <summary>The device's free and total bytes; false when the device cannot say. Free counts the cached blocks the
+        /// allocator gives back as soon as an allocation needs the room (on CUDA its large-block cache, not the small
+        /// blocks its shards keep), so what it reports can be allocated.</summary>
         bool TryGetDeviceMemory(out long freeBytes, out long totalBytes);
 
         /// <summary>Whether the device's memory is the host's (unified memory): what stays "on the device" then competes
