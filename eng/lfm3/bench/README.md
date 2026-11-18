@@ -126,6 +126,20 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   for `MAX_SEQS` full contexts (`KV_POOL=sized`, as vLLM and SGLang size theirs from free memory); `KV_POOL=default`
   keeps the server's own 65,536-token pool, past which running requests wait or are preempted and re-prefilled. One JSON per cell plus the GPU memory in use after it; the
   summary tabulates rounds (median and min-max of each cell's metric over the directories given).
+- `step-census.sh MODEL BACKEND [N ...]` (a Linux CUDA machine; `ggml_cuda` or `cuda`) and `step-census.py --steps S
+  SQLITE...`: the census of batched decode steps (stage B0 of the batched-serving design). For each N (default 1 2 4 8
+  16 32 64) one untraced `Lfm3Probe batch --sequences N` (its `CENSUS` line: step time, host time outside the executor's
+  runs, graph builds / replays / recordings, input leaves and bytes, results read back, executor nodes and kernels),
+  then the same cell under `nsys profile --capture-range=cudaProfilerApi --cuda-graph-trace=node` with only its timed
+  steps captured (`--profile-range` marks them through the CUDA profiler API), exported to SQLite and reduced per
+  step: kernels and the share launched inside CUDA graphs, GPU busy time and the idle gaps where the device waits for
+  the host, kernel / graph launch, memcpy and synchronize API calls, H2D / D2H copies and bytes, the busiest kernels and
+  API calls, and the growth per added sequence from N = 4. Knobs in the header (`PROMPT`, `WARM`, `STEPS`, `REPS`,
+  `GREEDY`, `GRAPH_TRACE`, `NSYS=none` for the plain runs only, `WRAP` for a lock prefix such as `/root/gpu-lo.sh
+  flock /root/build.lock`). Results under `artifacts/lfm3/batch/census-<backend>-<stamp>/` (`census.md`, `census.json`,
+  `conditions.txt` with `uptime` per cell). Traced times carry nsys's per-kernel overhead: read times from the plain
+  rows and counts from the traced ones. On the Mac lanes the probe's own census is the whole tool:
+  `dotnet Lfm3Probe.dll batch MODEL ggml_metal --sequences 1,2,4,8,16 --ps`.
 - `metal-op-histogram.py LOG [--start REGEX]`: Metal dispatches per graph from a `GGML_METAL_GRAPH_DEBUG=1` log
   (TensorSharp also needs `TS_GGML_LOG_DEBUG=1`; llama-bench needs `-v`). Graph starts: TensorSharp
   `'^(GET_ROWS|RMS_NORM) node_0$'`, llama.cpp `'^RMS_NORM norm-0$'`.

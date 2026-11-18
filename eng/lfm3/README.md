@@ -31,8 +31,22 @@ in the ignored `artifacts/lfm3/`.
   - `bench MODEL BACKEND [PP,...] [TG] [DEPTH,...]` measures prefill and decode tokens/s as llama-bench's pp / tg /
     tg@d do, with the decode steps' graph counters (runs, advances in place, builds);
   - `chat MODEL REQUESTS OUT` writes each chat request's prompt token ids as the server renders a fresh request (the
-    GGUF template through `KVCachePromptRenderer`, the tokenizer's BOS).
-- `prompt-parity.py` compares those ids with llama-server's (`/apply-template` + `/tokenize`) and Hugging Face's
+    GGUF template through `KVCachePromptRenderer`, the tokenizer's BOS);
+  - `batch MODEL BACKEND [--sequences N,...] [--prompt P] [--warm W] [--steps S] [--reps R] [--greedy] [--ps]
+    [--profile-range]` is the census of batched decode steps (stage B0 of the batched-serving design): for each N, N
+    slots take a P-token prompt each, then decode together through `IUnifiedBatchModel.TryForwardUnified` as the
+    server's scheduler drives them (W untimed steps, then R runs of S timed ones). A `CENSUS` line per N gives, per
+    step: the time (median, p10, p90), the host's share outside the executor's runs (`host_ms`) and the runs'
+    (`run_ms`: input uploads, the device's work, the results' download), graph builds, replays, advances in place,
+    recordings, input leaves and KB, results read back (KB), the executor's nodes and kernels (ggml graph nodes;
+    the managed, CUDA and MLX executors' live ops), the leaves every run copies to the device and back, managed
+    allocation and collections. `RESULT batch.nN.step_ms|tok_s` lines feed `ab.py`. Then a least-squares line of each
+    metric against N (cells from N = 4 up) and the growth from N = 4 to the largest N split into the host's, the
+    runs' and the sampling's shares. `--ps` prints the busiest processes before each cell (with the load average
+    each cell records); `--profile-range` marks each cell's timed steps for nsys (`bench/step-census.sh`). The counters
+    are the runtime's `StandardDecoderModel.Census` (internal, beside `GraphBuilds`) and the plans'
+    `IGraphPlanCensus` (ggml: `TSGgml_GraphCensus`).
+- `prompt-parity.py` compares the `chat` ids with llama-server's (`/apply-template` + `/tokenize`) and Hugging Face's
   (`apply_chat_template`, run with a Python that has transformers) for the same requests: `requests` writes GSM8K
   requests as `e2e/gsm8k.py` sends them, `llama` / `hf` render them, `diff` reports identical requests and the first
   differing token of each that is not (exit 1).
