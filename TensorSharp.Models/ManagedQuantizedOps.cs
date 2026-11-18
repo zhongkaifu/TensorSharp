@@ -367,6 +367,11 @@ namespace TensorSharp.Models
             byte* weightBase = (byte*)weights.ToPointer();
             int dop = ResolveDop(options);
 
+            // ARM64 BF16: DequantMatMulColumns' arithmetic, widened in registers (ManagedQuantGemm.ArmBf16.cs).
+            if (isa != QGemmIsa.PerRow && TryBf16Arm(ggmlType, weightBase, rowBytes, inDim, outDim,
+                    input, inputRowStride, rowCount, output, outputRowStride, options))
+                return;
+
             // Register-blocked float GEMM over a dequantized weight panel (see
             // ManagedQuantGemm.Float.cs). DequantMatMulColumns below remains the
             // path of hosts without AVX2.
@@ -875,6 +880,17 @@ namespace TensorSharp.Models
                 return true;
             }
 
+            // ARM64: the multi-row GEMM, bit-identical to the per-row dots below (ManagedQuantGemm.Arm.cs).
+            if (rowCount >= ArmGemmMinRows && isa != QGemmIsa.PerRow &&
+                TryQGemmArm(ggmlType, weights, (int)ne0, (int)ne1, input, inputRowStride, rowCount,
+                    output, outputRowStride, options))
+            {
+                if (QGemmVerify)
+                    VerifyQGemmAgainstPerRow("arm-gemm", ggmlType, weights, (int)ne0, (int)ne1, input, inputRowStride,
+                        rowCount, output, outputRowStride, floatPanel: false);
+                return true;
+            }
+
             long totalActivationBytes = (long)rowCount * activationRowBytes;
             if (totalActivationBytes > int.MaxValue)
                 return false;
@@ -1285,6 +1301,16 @@ namespace TensorSharp.Models
                 {
                     Vector256<int> wide = Avx2.ConvertToVector256Int32(Vector128.Load((ushort*)(src + i * 2)));
                     Avx2.ShiftLeftLogical(wide, 16).AsSingle().Store(dst + i);
+                }
+            }
+            else if (AdvSimd.Arm64.IsSupported)
+            {
+                // bf16 in the high half of each fp32: interleave with zeros.
+                for (; i <= numElements - 8; i += 8)
+                {
+                    Vector128<ushort> v = AdvSimd.LoadVector128((ushort*)(src + i * 2));
+                    AdvSimd.Store(dst + i, AdvSimd.Arm64.ZipLow(Vector128<ushort>.Zero, v).AsSingle());
+                    AdvSimd.Store(dst + i + 4, AdvSimd.Arm64.ZipHigh(Vector128<ushort>.Zero, v).AsSingle());
                 }
             }
             for (; i < numElements; i++)
@@ -2291,7 +2317,13 @@ namespace TensorSharp.Models
                 return VecDotQ4_0Q8_0Avx512Wide(q4, q8, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ4_0Q8_0Avx2(q4, q8, blockCount);
+            if (ArmDotSupported)
+                return VecDotQ4_0Q8_0Neon(q4, q8, blockCount);
+            return VecDotQ4_0Q8_0Scalar(q4, q8, blockCount);
+        }
 
+        private static unsafe float VecDotQ4_0Q8_0Scalar(byte* q4, byte* q8, int blockCount)
+        {
             float sum = 0.0f;
             for (int block = 0; block < blockCount; block++)
             {
@@ -2634,9 +2666,13 @@ namespace TensorSharp.Models
                 return VecDotQ8_0Q8_0Avx512(q8w, q8x, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ8_0Q8_0Avx2(q8w, q8x, blockCount);
-            if (Dp.IsSupported && AdvSimd.Arm64.IsSupported)
-                return VecDotQ8_0Q8_0Arm(q8w, q8x, blockCount);
+            if (ArmDotSupported)
+                return VecDotQ8_0Q8_0Neon(q8w, q8x, blockCount);
+            return VecDotQ8_0Q8_0Scalar(q8w, q8x, blockCount);
+        }
 
+        private static unsafe float VecDotQ8_0Q8_0Scalar(byte* q8w, byte* q8x, int blockCount)
+        {
             float sum = 0.0f;
             for (int block = 0; block < blockCount; block++)
             {
@@ -2653,26 +2689,6 @@ namespace TensorSharp.Models
                 sum += dw * dx * isum;
             }
 
-            return sum;
-        }
-
-        private static unsafe float VecDotQ8_0Q8_0Arm(byte* q8w, byte* q8x, int blockCount)
-        {
-            float sum = 0;
-            for (int block = 0; block < blockCount; ++block)
-            {
-                byte* wb = q8w + block * Q8_0BlockBytes;
-                byte* xb = q8x + block * Q8_0BlockBytes;
-                var partial = Dp.DotProduct(Vector128<int>.Zero,
-                    Unsafe.ReadUnaligned<Vector128<sbyte>>(wb + 2),
-                    Unsafe.ReadUnaligned<Vector128<sbyte>>(xb + 2));
-                partial = Dp.DotProduct(partial,
-                    Unsafe.ReadUnaligned<Vector128<sbyte>>(wb + 18),
-                    Unsafe.ReadUnaligned<Vector128<sbyte>>(xb + 18));
-                int dot = AdvSimd.Arm64.AddAcross(partial).GetElement(0);
-                // Preserve the scalar block reduction order and GGUF half scales.
-                sum += HalfToSingle(ReadUInt16(wb)) * HalfToSingle(ReadUInt16(xb)) * dot;
-            }
             return sum;
         }
 
@@ -2904,6 +2920,8 @@ namespace TensorSharp.Models
         {
             if (Avx2.IsSupported)
                 return VecDotQ4_KQ8_KAvx2(q4k, q8k, superBlockCount);
+            if (ArmDotSupported)
+                return VecDotQ4_KQ8_KNeon(q4k, q8k, superBlockCount);
 
             return VecDotQ4_KQ8_KScalar(q4k, q8k, superBlockCount);
         }
@@ -3125,6 +3143,8 @@ namespace TensorSharp.Models
                 return VecDotQ6_KQ8_KAvx2(q6k, q8k, superBlockCount);
             if (Ssse3.IsSupported)
                 return VecDotQ6_KQ8_KSse(q6k, q8k, superBlockCount);
+            if (ArmDotSupported)
+                return VecDotQ6_KQ8_KNeon(q6k, q8k, superBlockCount);
 
             return VecDotQ6_KQ8_KScalar(q6k, q8k, superBlockCount);
         }
@@ -3782,7 +3802,13 @@ namespace TensorSharp.Models
         {
             if (Avx2.IsSupported)
                 return VecDotNvfp4Q8_0Avx2(nv, q8, blockCount);
+            if (ArmDotSupported)
+                return VecDotNvfp4Q8_0Neon(nv, q8, blockCount);
+            return VecDotNvfp4Q8_0Scalar(nv, q8, blockCount);
+        }
 
+        private static unsafe float VecDotNvfp4Q8_0Scalar(byte* nv, byte* q8, int blockCount)
+        {
             float sum = 0.0f;
             for (int block = 0; block < blockCount; block++)
             {
