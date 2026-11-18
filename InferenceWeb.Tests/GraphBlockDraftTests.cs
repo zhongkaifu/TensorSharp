@@ -119,12 +119,31 @@ public sealed class GraphBlockDraftTests : IDisposable
     [InlineData("dflash2")]
     public void RingStepsMoveBehindForALaterRequestOnDirectCuda(string variant) => RingStepsMoveBehind(BackendType.Cuda, variant);
 
+    /// <summary>The same on the GGML builders, whose plans replay too (GraphCapabilities.Replays): their kept ring steps move
+    /// behind as well, with the inputs rewritten on the host.</summary>
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequestOnGgmlCpu(string variant) => RingStepsMoveBehind(BackendType.GgmlCpu, variant);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequestOnMetal(string variant) => RingStepsMoveBehind(BackendType.GgmlMetal, variant);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequestOnGgmlCuda(string variant) => RingStepsMoveBehind(BackendType.GgmlCuda, variant);
+
     private void RingStepsMoveBehind(BackendType backend, string variant)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         var (target, draft) = Fixtures(variant);
-        using var kept = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft);
-        using var traced = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { DecodeAdvanceDisabled = true };
+        // (ggml_metal keeps DFlash2 on its fused selector tail unless a test asks for the graph programs.)
+        using var kept = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { GraphBlockDraftOnMetalForTests = true };
+        using var traced = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft)
+            { DecodeAdvanceDisabled = true, GraphBlockDraftOnMetalForTests = true };
         string label = $"{backend} {variant}";
         int recorded = 0, built = 0, moved = 0;
         // The first request runs past position 40; the second starts again at 9, after another state's buffers changed.
@@ -159,6 +178,8 @@ public sealed class GraphBlockDraftTests : IDisposable
     [Theory]
     [InlineData("dflash2")]
     [InlineData("dflash2-k4b5")]
+    [InlineData("dflash2-k2b2")]
+    [InlineData("dflash2-k4b16")]
     public void DFlashConvRegionDraftsAsItsOps(string variant) => ConvRegionDraftsAsItsOps(BackendType.Cpu, variant);
 
     [CudaTheory]
@@ -166,6 +187,10 @@ public sealed class GraphBlockDraftTests : IDisposable
     [InlineData("dflash2-k3b5")]
     [InlineData("dflash2-k4b5")]
     [InlineData("dflash2-k4b4")]
+    // The narrowest block, Qwen3.8-27B DFlash2's 8 rows (--spec-draft 7) and the widest replayed block (SmallChunkRows).
+    [InlineData("dflash2-k2b2")]
+    [InlineData("dflash2-k4b8")]
+    [InlineData("dflash2-k4b16")]
     public void DFlashConvRegionDraftsAsItsOpsOnDirectCuda(string variant) => ConvRegionDraftsAsItsOps(BackendType.Cuda, variant);
 
     private void ConvRegionDraftsAsItsOps(BackendType backend, string variant)
