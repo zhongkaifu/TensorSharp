@@ -110,16 +110,16 @@ namespace TensorSharp.Cuda
         private long lastFreeReading;
         private long lastFreeReadTicks;
 
-        // Whether a return that finds the device under the reserve may give back cached large blocks the work stopped using
-        // instead of its own block (null: never; false while a CUDA graph is captured on the allocator, which must not free,
-        // and while a capture that just ended is taking the blocks its work returned to the pool: CudaGraphCapture.
-        // MayFreeCachedBlocksUnasked).
+        // Whether a return that finds the device under the reserve, or the large-block cache at its cap, may give back cached
+        // large blocks the work stopped using instead of its own block (null: never; false while a CUDA graph is captured on
+        // the allocator, which must not free, and while a capture that just ended is taking the blocks its work returned to
+        // the pool: CudaGraphCapture.MayFreeCachedBlocksUnasked).
         // The valve alone handed every returned block to the driver while the cache kept stale sizes: once a 3.1 GB K/V slot
         // left an RTX PRO 4500 at the reserve, a 47K-token prompt of Qwen3.8-27B freed and allocated its own activations
         // again at every layer (~1,400 synchronizing cuMemFree calls, about 4% of the prefill).
         private readonly Func<bool> mayRelievePressure;
 
-        /// <summary>What a relief frees beyond the reserve, so the next returns do not relieve again at once.</summary>
+        /// <summary>What a relief frees beyond the reserve or the cap, so the next returns do not relieve again at once.</summary>
         private const long PressureReliefSlackBytes = 64L << 20;
 
         public CudaDeviceMemoryPool(
@@ -277,10 +277,10 @@ namespace TensorSharp.Cuda
             return RelievePressure(need, keepBlockBytes: returningBytes) < need;
         }
 
-        /// <summary>The pressure valve's relief: cached large blocks the work stopped using go back to the driver, unasked by
-        /// their holder and without a synchronize (<see cref="TrimLarge"/>), where <see cref="mayRelievePressure"/> allows it;
-        /// the bytes freed (0 where it is not allowed). It runs on whichever thread returns a block, the GC finalizer's
-        /// included.</summary>
+        /// <summary>The pressure valve's relief, and the large-block cap's: cached large blocks the work stopped using go back to
+        /// the driver, unasked by their holder and without a synchronize (<see cref="TrimLarge"/>), where
+        /// <see cref="mayRelievePressure"/> allows it; the bytes freed (0 where it is not allowed). It runs on whichever thread
+        /// returns a block, the GC finalizer's included.</summary>
         internal long RelievePressure(long bytes, long keepBlockBytes)
             => mayRelievePressure == null || !mayRelievePressure() ? 0 : TrimLarge(bytes, keepBlockBytes);
 
@@ -298,6 +298,18 @@ namespace TensorSharp.Cuda
 
             if (allocationBytes >= LargeBlockThreshold)
             {
+                if (allocationBytes > largeCap)
+                    return false;
+
+                // At the cap, the cached sizes the work stopped using go back first (the least recently used, never this
+                // size), as under the reserve and where that is allowed; the block is cached once they made its room.
+                // Refusing it instead handed every returned activation to the driver while the blocks of K/V slots given up
+                // earlier filled the cache: 577 refusals, ~650 synchronizing cuMemFree/cuMemAlloc pairs and 613 ms of
+                // cuMemFree in one 829 ms prompt step of Qwen3.8-27B at a 69K context on an RTX PRO 4500 (issue #376).
+                long over = LargeCachedBytes + allocationBytes - largeCap;
+                if (over > 0)
+                    RelievePressure(over + PressureReliefSlackBytes, keepBlockBytes: allocationBytes);
+
                 lock (largeSync)
                 {
                     if (largeCachedBytes + allocationBytes > largeCap)

@@ -261,6 +261,62 @@ public class CudaDeviceMemoryPoolStatsTests
         }
     }
 
+    /// <summary>At the large-block cap, a return gives back the cached sizes the work stopped using (blocks of K/V slots given
+    /// up earlier) and caches its own block, so a step's activations are allocated once: refused at the cap, every activation
+    /// went to the driver and was allocated again by the next op (577 refusals and 613 ms of synchronizing cuMemFree in one
+    /// 829 ms prompt step of Qwen3.8-27B at 69K on an RTX PRO 4500, issue #376). Not where relief is not allowed (a capture):
+    /// the block goes to the driver, as before. A block larger than the cap is never cached and frees nothing.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void AtTheLargeCap_AReturnGivesBackStaleSizesFirst_SoActivationsAreAllocatedOnce(bool mayRelieve)
+    {
+        var sizes = new Dictionary<IntPtr, long>();
+        var frees = new List<long>();
+        long next = 0x100000;
+        int allocations = 0;
+        var pool = new CudaDeviceMemoryPool(64 * MiB, 256 * MiB, enabled: true,
+            bytes => { allocations++; var p = new IntPtr(next += 0x1000); sizes[p] = bytes; return p; },
+            p => { frees.Add(sizes[p]); sizes.Remove(p); },
+            shardCount: 1, largeCachedBytesCap: 512 * MiB, mayRelievePressure: () => mayRelieve);
+
+        // Three blocks of a K/V slot given up: cached, 450 MiB of the 512 MiB cap.
+        Cache(pool, 150 * MiB, 150 * MiB, 150 * MiB);
+        Assert.Equal(450 * MiB, pool.LargeCachedBytes);
+        int staleAllocations = allocations;
+
+        // A step's ops: each rents its activations and returns them; the second return reaches the cap.
+        const int Ops = 20;
+        for (int op = 0; op < Ops; op++)
+        {
+            IntPtr a = pool.Rent(40 * MiB, out long aBytes), b = pool.Rent(24 * MiB, out long bBytes);
+            pool.Return(a, aBytes);
+            pool.Return(b, bBytes);
+        }
+
+        if (mayRelieve)
+        {
+            Assert.Equal(2, allocations - staleAllocations);   // each activation size once
+            Assert.Equal(new[] { 150 * MiB }, frees);          // one stale block made the room, no activation went back
+            Assert.Equal((2 * 150 + 40 + 24) * MiB, pool.LargeCachedBytes);
+        }
+        else
+        {
+            Assert.Equal(1 + Ops, allocations - staleAllocations);   // the refused size is allocated again by every op
+            Assert.Equal(Ops, frees.Count);
+            Assert.All(frees, bytes => Assert.Equal(24 * MiB, bytes));
+            Assert.Equal((450 + 40) * MiB, pool.LargeCachedBytes);
+        }
+
+        // Larger than the cap: freed, and the cache keeps what it holds.
+        frees.Clear();
+        long cached = pool.LargeCachedBytes;
+        IntPtr huge = pool.Rent(600 * MiB, out long hugeBytes);
+        pool.Return(huge, hugeBytes);
+        Assert.Equal(new[] { 600 * MiB }, frees);
+        Assert.Equal(cached, pool.LargeCachedBytes);
+    }
+
     /// <summary>A large rent counts as a hit or a miss like a small one, so the cuMemAlloc count covers every allocation.</summary>
     [Fact]
     public void Rent_CountsLargeHitsAndMisses()
