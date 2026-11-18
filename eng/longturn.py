@@ -37,6 +37,7 @@ import argparse
 import datetime
 import glob
 import hashlib
+import http.client
 import json
 import os
 import subprocess
@@ -163,10 +164,11 @@ def chat(base: str, body: dict, timeout: float) -> dict:
         rec["status"] = e.code
         try:
             detail = e.read().decode("utf-8", errors="replace")
-        except OSError:
+        except (OSError, http.client.HTTPException):
             detail = ""
         rec["error"] = f"HTTP {e.code}: {detail.strip()[:300]}"
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    # http.client.HTTPException: a server that dies mid-answer leaves IncompleteRead, which is not an OSError.
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
         rec["error"] = f"{type(e).__name__}: {e}"[:300]
     rec["wall_s"] = round(time.monotonic() - t0, 3)
     rec["done"] = iso(utc_now())

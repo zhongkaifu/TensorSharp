@@ -80,10 +80,11 @@ class FakeServer(http.server.ThreadingHTTPServer):
     """/v1/models and /v1/chat/completions; a request whose max_tokens is 1 and has 4 messages fails with 500 when its
     document is longer than fail_above characters."""
 
-    def __init__(self, fail_above=None):
+    def __init__(self, fail_above=None, truncate_c=False):
         super().__init__(("127.0.0.1", 0), FakeHandler)
         self.bodies = []
         self.fail_above = fail_above
+        self.truncate_c = truncate_c   # every C's answer stops mid-body, as from a server that dies while answering
 
 
 class FakeHandler(http.server.BaseHTTPRequestHandler):
@@ -108,6 +109,13 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
         if self.server.fail_above is not None and len(body["messages"]) == 4 and body["max_tokens"] == 1 \
                 and doc > self.server.fail_above:
             self._send(500, {"error": {"message": "CUDA error 2: out of memory"}})
+            return
+        if self.server.truncate_c and body["max_tokens"] > 1:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.write(b'{"id": "chatcmpl-cut", "us')
             return
         n = len(self.server.bodies)
         self._send(200, {"id": f"chatcmpl-{n}", "choices": [{"finish_reason": "length"}],
@@ -174,6 +182,18 @@ class ClientTests(unittest.TestCase):
             self.assertIsNone(meta["sampling"])
             for body in server.bodies:
                 self.assertEqual({"model", "messages", "max_tokens"}, set(body))
+
+    def test_an_answer_cut_off_mid_body_is_a_failed_request_not_a_crash(self):
+        # http.client's IncompleteRead is not an OSError: it had escaped chat() and ended the run without a record.
+        with tempfile.TemporaryDirectory() as root, serving(truncate_c=True) as server:
+            make_checkout(root)
+            rc, records, _ = self.run_client(root, server, ["--sizes", "100", "200"])
+            self.assertEqual(1, rc)
+            self.assertEqual([(100, "A"), (100, "B"), (100, "C"), (200, "A"), (200, "B"), (200, "C")],
+                             [(r["size"], r["step"]) for r in records])
+            for c in (records[2], records[5]):
+                self.assertEqual(200, c["status"])
+                self.assertIn("IncompleteRead", c["error"])
 
     def test_stop_on_error_stops_at_the_first_failure(self):
         with tempfile.TemporaryDirectory() as root, serving(fail_above=500) as server:
