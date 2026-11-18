@@ -97,6 +97,22 @@ python3 eng/validation/long-context-quality.py report --ref artifacts/prompt-att
 - A configuration that cannot load is written as a `load_failed` run record, and the probe exits 3. The report then names
   the load error instead of pairing anything.
 
+**NVFP4 models: the ppl gate on q8 activations.** On the FP4 tensor cores NVFP4 prompt rows run W4A4 (decode rows keep q8
+activations), and that rounding (about 0.16 KL a prompt row on Qwen3.8-27B prose) swamps an attention change on the prompt
+path, which only re-seeds it: the 8-bit attention's served-arm ppl swung -8% and +1% on two windows. So for such a model
+the 8-bit prompt attention's `ppl` gate is read from a second process whose arms keep q8 activations, and every other gate
+from the served arms. `report --kinds` grades and gates only the kinds it names:
+
+```
+dotnet .../LongContextQualityProbe.dll --model M --cases C --output artifacts/prompt-attention/q8act.jsonl --kinds ppl \
+    --arms f16q=f16+q8act,a8q=8bit+q8act
+python3 eng/validation/long-context-quality.py report --ref artifacts/prompt-attention/q8act.jsonl:f16q \
+    --cand artifacts/prompt-attention/q8act.jsonl:a8q --kinds ppl --gates t2-attn8 --out artifacts/prompt-attention/report-ppl.md
+python3 eng/validation/long-context-quality.py report --ref artifacts/prompt-attention/attn8.jsonl:f16 \
+    --cand artifacts/prompt-attention/attn8.jsonl:8bit --kinds continue,layers,greedy,retrieval,gsm8k,humaneval \
+    --gates t2-attn8 --execute-humaneval --out artifacts/prompt-attention/report-served.md
+```
+
 **Noise floor.** Run the same cases on another backend, such as `--backend ggml_cuda --arms gg=default --reference
 attn8.jsonl:f16`. Then `report --floor RUN.jsonl:gg` tables that numerics difference, which the project already ships,
 beside the candidate's, without gates. Read the candidate's ΔPPL and KL against it.

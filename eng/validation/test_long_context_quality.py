@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """CPU-only tests of long-context-quality.py: grading, statistics, the report's pairing and gates on synthetic runs, the
 estimate's fit. No model, GPU or network."""
+import contextlib
 import importlib.util
+import io
 import json
 import math
 from pathlib import Path
@@ -162,6 +164,27 @@ class ReportOnSyntheticRuns(unittest.TestCase):
             self.assertEqual("FAIL", verdicts["retrieval (no check the reference passes is lost)"])
             self.assertEqual("FAIL", verdicts["greedy (divergences at near-ties only)"])   # diverged at position 2, gap 3.0
             self.assertEqual("PASS", verdicts["gsm8k"])
+
+    def test_kinds_grades_and_gates_only_those_cases(self):
+        # t2-2 on NVFP4 reads its ppl gate from a run whose arms keep q8 activations and every other gate from the served arms:
+        # a report over some kinds neither judges nor lists the others, and the exit status is theirs alone.
+        with tempfile.TemporaryDirectory() as d:
+            run, cases = self.runs(d, cand_nll_shift=0.01)
+            args = ["report", "--ref", f"{run}:f16", "--cand", f"{run}:8bit", "--cases", str(cases), "--gates", "t2-attn8"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(1, tool.main(args))
+                self.assertEqual(0, tool.main(args + ["--kinds", "greedy,retrieval,gsm8k"]))
+                self.assertEqual(1, tool.main(args + ["--kinds", "ppl"]))
+            served = out.getvalue().split("# Long-context quality")[2]
+            self.assertIn("graded kinds:** greedy, retrieval, gsm8k only", served)
+            self.assertNotIn("## ppl", served)
+            self.assertNotIn("| ppl", served)
+            self.assertIn("| gsm8k | PASS |", served)
+            with self.assertRaises(SystemExit):
+                tool.main(args + ["--kinds", "humaneval"])   # the case file has none
+            with self.assertRaises(SystemExit):
+                tool.main(args + ["--kinds", "perplexity"])
 
     def test_a_floor_arm_is_tabled_without_gates(self):
         with tempfile.TemporaryDirectory() as d:

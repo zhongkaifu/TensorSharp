@@ -514,8 +514,8 @@ def fmt_pct(x):
 
 
 class Report:
-    def __init__(self, ref, cand, cases, gates, execute_humaneval, floor=None):
-        self.ref, self.cand, self.cases, self.gates, self.floor = ref, cand, cases, GATES[gates], floor
+    def __init__(self, ref, cand, cases, gates, execute_humaneval, floor=None, kinds=None):
+        self.ref, self.cand, self.cases, self.gates, self.floor, self.kinds = ref, cand, cases, GATES[gates], floor, kinds
         self.gate_name, self.execute = gates, execute_humaneval
         self.lines, self.summary, self.verdicts = [], {"reference": ref["spec"], "candidate": cand["spec"], "gates": gates}, []
 
@@ -605,6 +605,10 @@ class Report:
             self.out(f"- **{role}** `{arm['spec']}`: {run.get('architecture')} on {run.get('backend')} ({run.get('device')}), KV "
                      f"{run.get('kv_cache_dtype')}, prompt attention {attention}, "
                      f"records {', '.join(f'{k} {v}' for k, v in sorted(kinds.items()))}; label {run.get('label')!r}")
+        if self.kinds:
+            self.out(f"- **graded kinds:** {', '.join(self.kinds)} only (`--kinds`); the case file's other kinds are neither graded nor "
+                     "gated in this report")
+            self.summary["kinds"] = list(self.kinds)
         self.out()
 
     def scored(self, kind, cand=None):
@@ -826,7 +830,12 @@ def report(args):
     if not cases_path or not Path(cases_path).exists():
         raise SystemExit("--cases CASES.jsonl (the run's cases_file is not readable here)")
     _, cases = load_cases(cases_path)
-    rep = Report(ref, cand, cases, args.gates, args.execute_humaneval, load_arm(args.floor) if args.floor else None)
+    kinds = parse_kinds(args.kinds) if args.kinds else None
+    if kinds:
+        cases = {cid: case for cid, case in cases.items() if case_kind(case) in kinds}
+        if not cases:
+            raise SystemExit(f"--kinds {args.kinds}: the case file has no such case")
+    rep = Report(ref, cand, cases, args.gates, args.execute_humaneval, load_arm(args.floor) if args.floor else None, kinds)
     text = rep.run()
     sys.stdout.write(text)
     if args.out:
@@ -834,6 +843,19 @@ def report(args):
     if args.json:
         Path(ignored_output(Path(args.json).parent), Path(args.json).name).write_text(json.dumps(rep.summary, indent=1) + "\n", encoding="utf-8")
     return exit_status(rep.verdicts)
+
+
+def case_kind(case):
+    """A case's kind as KINDS names it: a chat case's group (retrieval, gsm8k, humaneval), else its kind."""
+    return case.get("group") if case.get("kind") == "chat" else case.get("kind")
+
+
+def parse_kinds(text):
+    kinds = [k.strip() for k in text.split(",") if k.strip()]
+    unknown = [k for k in kinds if k not in KINDS]
+    if unknown or not kinds:
+        raise SystemExit(f"--kinds {text}: a comma list of {', '.join(KINDS)}")
+    return kinds
 
 
 def exit_status(verdicts):
@@ -990,6 +1012,8 @@ def main(argv=None):
     r.add_argument("--cases", help="the case file (default: the reference run's cases_file)")
     r.add_argument("--gates", choices=sorted(GATES), default="none")
     r.add_argument("--floor", help="RUN.jsonl:ARM of a noise-floor arm (a shipped numerics difference) shown against the reference")
+    r.add_argument("--kinds", help=f"comma list of {', '.join(KINDS)}: grade and gate only these cases (default all), e.g. the ppl "
+                                   "gate from a run whose arms keep q8 activations and every other gate from the served arms")
     r.add_argument("--execute-humaneval", action="store_true", help="run generated HumanEval code in a restricted subprocess")
     r.add_argument("--out", help="write the Markdown report here (ignored directories only)")
     r.add_argument("--json", help="write the summary JSON here (ignored directories only)")
