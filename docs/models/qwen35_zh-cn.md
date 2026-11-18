@@ -501,7 +501,7 @@ M5 Pro（48 GB）实测：Qwen3.8-27B GGUF，DFlash2 Q4_K_M 草稿模型（`--sp
 
 ## 10. 内存与 KV cache 策略
 
-- **全注意力层**：每个槽位一份 K/V cache，`[kv_heads, capacity, head_dim]`，类型由 `--kv-cache-dtype` 决定（`f32`、`f16`、`q8_0`、`q4_0`）。槽位从小容量开始，按需增长到上下文长度；在一步即将耗尽显存前，空闲的保留槽位会先交还其设备副本。
+- **全注意力层**：每个槽位一份 K/V cache，`[kv_heads, capacity, head_dim]`，类型由 `--kv-cache-dtype` 决定（`f32`、`f16`、`q8_0`、`q4_0`）。槽位从小容量开始，按需增长到上下文长度；在一步即将耗尽显存前，空闲的保留槽位会先交还其设备副本。在 `--backend cuda` 上，cache 为 `f16`（权重低于 F32 时），除非 `--kv-cache-dtype` 指定其他类型。`q8_0` 让它减半：Qwen3.8-27B NVFP4 加 DFlash2 草稿器在 32 GB 显卡上用 `q8_0` 能完整服务一轮 130K token 的智能体对话；130K token 的全新预填充比 `f16` 慢 5%，69K token 以内验证步耗时与 `f16` 相同（RTX PRO 4500 Blackwell；见 `docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md`）。
 - **递归层**：每个槽位保存卷积窗口 `(conv_kernel - 1) x qkv_dim` 与 delta 状态 `[v_heads, head_v_dim, head_k_dim]`。递归状态无法回退，因此槽位只能截断到自身长度或清零。
 - **文件映射权重**：后端能直接读取时（GGML CUDA、Metal、CPU、集成 GPU），量化张量绑定 GGUF 映射而不复制。
 

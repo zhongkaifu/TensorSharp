@@ -681,6 +681,16 @@ about half the bytes of `f16` a step; its slots, copies and growth halve too), w
 keeps a model off whole-forward graphs there. `q4_0` (~1/7 of f32) targets very
 long 128K–256K contexts where the KV cache dominates memory.
 
+`f16` stays the default on `--backend cuda`. `q8_0` holds about twice the context in the same
+device memory, but on an RTX PRO 4500 Blackwell (sm_120) its kernels are bound by their arithmetic,
+not by memory traffic: with Qwen3.8-27B NVFP4 a verify step took the same time as with `f16`, and a
+fresh prefill took 1-5% longer, more for longer prompts (issue #376's reproducer, 6.6K-130K tokens). Its
+perplexity stayed within 0.16% of `f16` on Qwen3.5-0.8B and Ministral 3 3B (8K-96K tokens) and within 0.3% on
+Qwen3.8-27B with Q6_K weights (8K-16K). Qwen3.8-27B NVFP4 runs its prompt rows on 4-bit activations, which amplify any
+change of attention arithmetic: there `q8_0` moved a few long code windows' perplexity a lot, in both directions (as the
+8-bit prompt attention does), and lost the document order in 1 of 18 retrieval prompts (8K-128K) that `f16` answered.
+Choose `q8_0` on `--backend cuda` when a long context does not fit at `f16`.
+
 ## Remaining Work
 
 - Build one native GGML graph for an entire attention batch instead of one

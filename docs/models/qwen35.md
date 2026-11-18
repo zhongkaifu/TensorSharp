@@ -673,7 +673,11 @@ Plain decode is 46.8 ms a token on MLX against 48.4 on ggml_metal. Decode after 
 - **Full-attention layers**: a K/V cache per slot, `[kv_heads, capacity, head_dim]`, in the
   `--kv-cache-dtype` type (`f32`, `f16`, `q8_0`, `q4_0`). A slot starts small and grows on demand
   up to the context length; idle retained slots give their device copies back before a step would
-  run out of device memory.
+  run out of device memory. On `--backend cuda` the cache is `f16` (for weights below F32) unless
+  `--kv-cache-dtype` names another. `q8_0` halves it: Qwen3.8-27B NVFP4 with its DFlash2 drafter
+  serves a whole 130K-token agent turn on a 32 GB card with `q8_0`; its fresh 130K-token prefill
+  takes 5% longer than at `f16`, and its verify steps take as long as at `f16` up to 69K tokens
+  (RTX PRO 4500 Blackwell; see `docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`).
 - **Recurrent layers**: the conv window `(conv_kernel - 1) x qkv_dim` and the delta state
   `[v_heads, head_v_dim, head_k_dim]` per slot. A recurrent state cannot rewind, so a slot truncates
   only to its length or to zero.
