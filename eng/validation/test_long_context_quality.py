@@ -24,6 +24,10 @@ RETRIEVAL_GRADE = {"type": "retrieval", "codes": {"alpha": "AMBER-OTTER-1234", "
                    "order": ["beta", "gamma", "alpha", "delta", "epsilon"], "before_gamma": "beta", "after_gamma": "alpha"}
 
 
+TOPK = "AAAAAAAAAAA="   # one row's top-1 (id 0, log-probability 0) as the probe encodes it
+TOPK_SHA = tool.sha256_bytes(TOPK.encode())
+
+
 def retrieval_answer(**changes):
     answer = dict(RETRIEVAL_GRADE["codes"], order=RETRIEVAL_GRADE["order"], before_gamma="beta", after_gamma="alpha")
     answer.update(changes)
@@ -111,8 +115,9 @@ class ReportOnSyntheticRuns(unittest.TestCase):
             return [
                 {"type": "run", "arms": [{"name": arm, "prompt_attention": arm}], "cases_file": str(cases_path), "backend": "cuda"},
                 {"type": "record", "case": "ppl/prose/8k/w0", "kind": "ppl", "arm": arm, "status": "ok", "input_sha256": "x",
-                 "nll": [x + shift for x in nll], "top1": [7] * 512, "kl": [1e-4] * 512 if shift else None,
-                 "kl_reference": "f16 (this run)" if shift else None, "attn8_launches": 3 if arm == "8bit" else 0},
+                 "nll": [x + shift for x in nll], "top1": [7] * 512, "kl": [1e-4] * 512 if shift else None, "topk_k": 1, "topk": TOPK,
+                 "kl_reference": "f16 (this run)" if shift else None, "kl_reference_topk_sha256": TOPK_SHA if shift else None,
+                 "attn8_launches": 3 if arm == "8bit" else 0},
                 {"type": "record", "case": "greedy/code/8k/p0", "kind": "greedy", "arm": arm, "status": "ok", "input_sha256": "y",
                  "generated": g, "gaps": [5.0, 0.4, 3.0, 2.0]},
                 {"type": "record", "case": "retrieval/8k/r0", "kind": "chat", "group": "retrieval", "arm": arm, "status": "ok",
@@ -163,6 +168,99 @@ class ReportOnSyntheticRuns(unittest.TestCase):
             _, verdicts, summary = self.report(run, cases, "t2-attn8")
             self.assertEqual("PASS", verdicts["greedy (divergences at near-ties only)"])
             self.assertEqual(1, summary["greedy"]["rows"][0]["prefix"])
+
+    # Gates over part of their cases (review of A2): a gate never reads PASS while one of its cases did not pair.
+    def case_file(self, d, extra):
+        return self.write(d, "cases.jsonl", [{"type": "header", "schema": tool.SCHEMA}] + extra)
+
+    def ppl_case(self, cid, tokens):
+        return {"type": "case", "id": cid, "kind": "ppl", "corpus": "prose", "tokens": tokens, "start_token": 0, "score_tokens": 512}
+
+    def ppl_record(self, cid, arm, **fields):
+        rec = {"type": "record", "case": cid, "kind": "ppl", "arm": arm, "status": "ok", "input_sha256": cid,
+               "nll": [0.5] * 512, "top1": [7] * 512}
+        rec.update(fields)
+        return rec
+
+    def gated(self, d, cases, rows, gates="t2-attn8"):
+        run = self.write(d, "run.jsonl", [{"type": "run"}] + rows)
+        ref, cand = tool.load_arm(f"{run}:f16"), tool.load_arm(f"{run}:8bit")
+        rep = tool.Report(ref, cand, tool.load_cases(cases)[1], gates, execute_humaneval=False)
+        text = rep.run()
+        return text, {name: state for name, state, _ in rep.verdicts}, rep
+
+    def test_a_case_the_candidate_failed_fails_its_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = self.case_file(d, [self.ppl_case("ppl/prose/8k/w0", 8192), self.ppl_case("ppl/prose/64k/w0", 65536)])
+            rows = [self.ppl_record("ppl/prose/8k/w0", "f16"), self.ppl_record("ppl/prose/8k/w0", "8bit"),
+                    self.ppl_record("ppl/prose/64k/w0", "f16"),
+                    {"type": "record", "case": "ppl/prose/64k/w0", "kind": "ppl", "arm": "8bit", "status": "error",
+                     "error": "CUDA_ERROR_OUT_OF_MEMORY", "out_of_memory": True}]
+            text, verdicts, rep = self.gated(d, cases, rows)
+            self.assertEqual("FAIL", verdicts["ppl (every corpus and L run)"], text)
+            self.assertEqual(1, tool.exit_status(rep.verdicts))
+
+    def test_cases_neither_arm_ran_leave_a_passing_gate_incomplete(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = self.case_file(d, [self.ppl_case("ppl/prose/8k/w0", 8192), self.ppl_case("ppl/prose/96k/w0", 98304)])
+            skipped = {"status": "skipped", "reason": "not run: 98304 tokens is above --max-tokens 66000"}
+            rows = [self.ppl_record("ppl/prose/8k/w0", "f16"), self.ppl_record("ppl/prose/8k/w0", "8bit"),
+                    self.ppl_record("ppl/prose/96k/w0", "f16", **skipped), self.ppl_record("ppl/prose/96k/w0", "8bit", **skipped)]
+            text, verdicts, rep = self.gated(d, cases, rows)
+            self.assertEqual("INCOMPLETE", verdicts["ppl (every corpus and L run)"], text)
+            self.assertEqual(3, tool.exit_status(rep.verdicts))
+            self.assertIn("ppl/prose/96k/w0", dict((n, x) for n, _, x in rep.verdicts)["ppl (every corpus and L run)"])
+            self.assertEqual(0, tool.exit_status([("x", "PASS", "")]))
+
+    def test_a_layers_case_no_arm_checked_is_a_not_run_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = self.case_file(d, [{"type": "case", "id": "layers/prose/32k", "kind": "layers", "corpus": "prose", "tokens": 32768}])
+            rows = [{"type": "record", "case": "layers/prose/32k", "kind": "layers", "arm": "f16", "status": "skipped", "reason": "not applicable"},
+                    {"type": "record", "case": "layers/prose/32k", "kind": "layers", "arm": "8bit", "status": "error", "error": "out of memory"}]
+            text, verdicts, rep = self.gated(d, cases, rows)
+            self.assertEqual("NOT RUN", verdicts["layers"], text)
+            self.assertIn("not checked: `layers/prose/32k`", text)
+            self.assertEqual(3, tool.exit_status(rep.verdicts))
+
+    def greedy_runs(self, d, ref_gaps, ref_generated=(1, 2), stop="eos"):
+        cases = self.case_file(d, [{"type": "case", "id": "greedy/code/8k/p0", "kind": "greedy", "corpus": "code", "tokens": 8192,
+                                    "end_char": 9, "new_tokens": 4}])
+        rows = [{"type": "record", "case": "greedy/code/8k/p0", "kind": "greedy", "arm": "f16", "status": "ok", "input_sha256": "y",
+                 "generated": list(ref_generated), "gaps": ref_gaps, "stop": stop},
+                {"type": "record", "case": "greedy/code/8k/p0", "kind": "greedy", "arm": "8bit", "status": "ok", "input_sha256": "y",
+                 "generated": [1, 2, 3, 4], "gaps": [5.0, 4.0, 0.1, 2.0], "stop": "length"}]
+        return self.gated(d, cases, rows)
+
+    def test_a_divergence_where_the_reference_ended_reads_the_end_steps_gap(self):
+        name = "greedy (divergences at near-ties only)"
+        with tempfile.TemporaryDirectory() as d:
+            # The reference chose end of sequence at step 2 with a gap of 3.0; the candidate went on: a confident divergence.
+            text, verdicts, _ = self.greedy_runs(d, [5.0, 4.0, 3.0])
+            self.assertEqual("FAIL", verdicts[name], text)
+            self.assertIn("at 2 (an arm ended): 3.000 / 0.100", text)
+        with tempfile.TemporaryDirectory() as d:
+            _, verdicts, _ = self.greedy_runs(d, [5.0, 4.0, 0.2])
+            self.assertEqual("PASS", verdicts[name])
+        with tempfile.TemporaryDirectory() as d:
+            # A record without the end step's gap (written before the probe recorded it) cannot show the divergence was a tie.
+            text, verdicts, _ = self.greedy_runs(d, [5.0, 4.0])
+            self.assertEqual("INCOMPLETE", verdicts[name], text)
+
+    def test_a_kl_is_read_only_against_the_distribution_it_was_computed_from(self):
+        with tempfile.TemporaryDirectory() as d:
+            cases = self.case_file(d, [self.ppl_case("ppl/prose/8k/w0", 8192)])
+            ref = self.ppl_record("ppl/prose/8k/w0", "f16", topk_k=1, topk=TOPK)
+            # A candidate whose KL was computed against another run's f16 arm (an arm name alone matches).
+            other = self.ppl_record("ppl/prose/8k/w0", "8bit", kl=[0.5] * 512, kl_reference="/elsewhere/run.jsonl:f16",
+                                    kl_reference_topk_sha256=tool.sha256_bytes(b"another distribution"))
+            _, _, rep = self.gated(d, cases, [ref, other])
+            self.assertIsNone(rep.summary["ppl"][0]["kl_mean"])
+        with tempfile.TemporaryDirectory() as d:
+            cases = self.case_file(d, [self.ppl_case("ppl/prose/8k/w0", 8192)])
+            same = self.ppl_record("ppl/prose/8k/w0", "8bit", kl=[0.5] * 512, kl_reference="/elsewhere/run.jsonl:f16",
+                                   kl_reference_topk_sha256=TOPK_SHA)
+            _, _, rep = self.gated(d, cases, [ref, same])
+            self.assertAlmostEqual(0.5, rep.summary["ppl"][0]["kl_mean"])
 
     def test_estimate_extrapolates_from_measured_points(self):
         with tempfile.TemporaryDirectory() as d:

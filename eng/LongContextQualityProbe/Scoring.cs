@@ -123,12 +123,15 @@ internal sealed class RowScores
         => new(values.Select(v => double.IsFinite(v) ? (JsonNode)Math.Round(v, 6) : null).ToArray());
 }
 
-/// <summary>A record's top-K tokens a row (ids, then log-probabilities, as little-endian int32 / float32 in base64).</summary>
+/// <summary>A record's top-K tokens a row (ids, then log-probabilities, as little-endian int32 / float32 in base64), with the
+/// record's input (the sha256 of its token ids) and the sha256 of its topk string, which names the distribution a KL was
+/// computed against.</summary>
 internal sealed class TopK
 {
     public int K, Rows;
     public int[] Ids;
     public float[] LogProbs;
+    public string InputSha256, Digest;
 
     public static string Encode(List<int> ids, List<float> logProbs)
     {
@@ -146,7 +149,12 @@ internal sealed class TopK
         if (k <= 0 || data == null) return null;
         byte[] bytes = Convert.FromBase64String(data);
         int rows = bytes.Length / (8 * k);
-        var t = new TopK { K = k, Rows = rows, Ids = new int[rows * k], LogProbs = new float[rows * k] };
+        var t = new TopK
+        {
+            K = k, Rows = rows, Ids = new int[rows * k], LogProbs = new float[rows * k],
+            InputSha256 = record["input_sha256"]?.GetValue<string>(),
+            Digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(data))).ToLowerInvariant(),
+        };
         Buffer.BlockCopy(bytes, 0, t.Ids, 0, rows * k * 4);
         Buffer.BlockCopy(bytes, rows * k * 4, t.LogProbs, 0, rows * k * 4);
         return t;

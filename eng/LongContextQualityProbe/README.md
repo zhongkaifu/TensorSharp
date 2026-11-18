@@ -24,6 +24,9 @@ pre-registered gates, and estimates GPU time. Everything it writes goes under ig
   - The report pairs them by case id and checks that their inputs are identical (the sha256 of the token ids).
   - `--reference RUN.jsonl:ARM` makes a second process compute each scored token's KL divergence against the first
     process's stored top-K distribution.
+  - A reference record whose input or scored rows differ from the case's is refused (`kl_refused`), never compared row
+    by row. A KL names the distribution it was computed against (`kl_reference_topk_sha256`, the sha256 of that record's
+    `topk`), and the report shows it only when that is its own reference record's.
 - **No arm is ever chosen through process environment variables.**
 
 ## Case kinds
@@ -32,7 +35,7 @@ pre-registered gates, and estimates GPU time. Everything it writes goes under ig
 |---|---|---|
 | `ppl` | A corpus window's prefix of `tokens - score_tokens` as 2,048-row prompt chunks (`--prefill-chunk`, the served solo chunk). Then the scored rows as marked prompt chunks of `--score-chunk` (512) rows with every row's logits (`StandardDecoderModel.ForwardPromptRowsForTests`). | Per scored token: NLL, argmax, the top-K log-probabilities (`--topk`, 32), and the KL against the reference. Also the PPL. |
 | `continue` | The same prefix, then the scored tokens one decode row at a time (`Forward`). This is the served situation: a long prompt, then generation. | As `ppl`. |
-| `greedy` | A code prompt cut at a member boundary, then `new_tokens` greedy decode rows. | The generated ids, each step's top-2 logit gap, and the text. |
+| `greedy` | A code prompt cut at a member boundary, then `new_tokens` greedy decode rows. | The generated ids, each step's top-2 logit gap (also the step that chose end of sequence, so `gaps` then has one more entry than `generated`), and the text. |
 | `chat` | A chat prompt rendered with the model's own template. Its `{{document}}` holds corpus paragraphs, with the case's inserts at depth fractions, fitted to `fit_tokens` exactly with the model's tokenizer. Then greedy decoding to end of sequence or `max_new_tokens`. Used for retrieval, GSM8K and HumanEval. | The prompt tokens and sha256, the generated ids and gaps, and the text. Grading is in the report. |
 | `layers` | An `8bit` arm's prompt, with the executor's check hook: each 8-bit launch is followed by the 16-bit kernel on the same rows. | The relative RMS and max \|d\| of each launch. |
 
@@ -46,7 +49,11 @@ How failures are recorded:
 - An out-of-memory case is recorded as an error.
 - The larger cases of its kind and arm are then recorded as "not run".
 - `--max-tokens` skips cases above a footprint.
-- Skips and errors stay in the output and in the report. They are never counted as passes.
+- Skips and errors stay in the output and in the report. They are never counted as passes:
+  - a case the reference ran and the candidate failed makes its gate FAIL;
+  - any other case of a gate that did not pair (skipped, not run, out of memory in both arms) makes a passing gate
+    INCOMPLETE, and a gate with no paired case is NOT RUN;
+  - `report` exits 0 only when every gate passed, 1 when one failed, and 3 when one was NOT RUN or INCOMPLETE.
 - `--resume` continues a killed run. It also retries the cases an earlier pass skipped, such as a first pass under `--max-tokens`.
 
 ## Build and run (an sm_120a / sm_121a build for the 8-bit arm)

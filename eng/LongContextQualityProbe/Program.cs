@@ -244,6 +244,15 @@ string RunScored(Case c, Inputs inputs, TopK reference, JsonObject rec, Dictiona
     rec["input_tokens"] = tokens.Length;
     rec["input_sha256"] = inputs.Sha256;
     rec["score_tokens"] = c.ScoreTokens;
+    // A reference is another record's distribution over the same scored tokens: one whose input or scored rows differ (a case
+    // file rebuilt differently, another tokenizer) is refused, never compared row by row with these. A KL names the exact
+    // distribution it was computed against (the sha256 of its topk), which the report checks against its reference arm.
+    if (reference != null && (reference.InputSha256 != inputs.Sha256 || reference.Rows != c.ScoreTokens))
+    {
+        rec["kl_refused"] = $"the reference record scores other tokens (input sha256 {reference.InputSha256 ?? "none"}, {reference.Rows} rows)";
+        reference = null;
+    }
+    if (reference != null) rec["kl_reference_topk_sha256"] = reference.Digest;
     var scores = new RowScores(topK);
     var sw = Stopwatch.StartNew();
     float[] last = m.Prefill(tokens[..prefix], prefillChunk);
@@ -354,9 +363,11 @@ string RunLayers(Case c, Inputs inputs, JsonObject rec)
     for (int step = 0; ; step++)
     {
         RowScores.Row row = RowScores.Score(logits, -1, 0, null, 0);
+        // Every step's gap, the one that chose end of sequence included (gaps then holds one more entry than generated): where
+        // one arm ends and the other goes on, the report reads the divergence's gap there.
+        gaps.Add(row.Gap);
         if (tokenizer.IsEos(row.Top1)) return (generated, gaps, "eos");
         generated.Add(row.Top1);
-        gaps.Add(row.Gap);
         if (generated.Count >= maxNew) return (generated, gaps, "length");
         logits = m.Decode(row.Top1);
     }

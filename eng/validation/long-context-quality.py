@@ -13,7 +13,9 @@ Three steps, the middle one in eng/LongContextQualityProbe (one loaded model, ar
                         GSM8K and HumanEval subsets behind a long shared reference (pinned upstream files)
   (probe)   dotnet eng/LongContextQualityProbe/bin/Release/net10.0/LongContextQualityProbe.dll --model M --cases
             CASES/cases.jsonl --output RUN.jsonl --arms f16,8bit         (or one arm a process: --kv-cache-dtype q8_0)
-  report    pair a reference arm with a candidate arm (any two RUN.jsonl:ARM), grade, and check pre-registered gates
+  report    pair a reference arm with a candidate arm (any two RUN.jsonl:ARM), grade, and check pre-registered gates: a gate is
+            PASS only over all its cases (a case the candidate failed and the reference ran is a FAIL; others not paired make
+            it INCOMPLETE); exit 0 every gate passed, 1 a gate failed, 3 a gate was NOT RUN or INCOMPLETE
   estimate  GPU time of a case file, extrapolated from a run's measured prefill, scoring and decode times
 
 Outputs belong in ignored directories (artifacts/ or docs/validation/); the tool refuses other paths inside the repository.
@@ -502,6 +504,11 @@ def topk_of(rec):
     return list(struct.unpack(f"<{n}i", raw[:4 * n]))[::k]   # each row's argmax id
 
 
+def topk_digest(rec):
+    """The sha256 of a record's topk string: the distribution a KL against it names (kl_reference_topk_sha256)."""
+    return sha256_bytes(rec["topk"].encode("utf-8")) if rec.get("topk") else None
+
+
 def fmt_pct(x):
     return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:+.3f}%"
 
@@ -515,12 +522,24 @@ class Report:
     def out(self, line=""):
         self.lines.append(line)
 
-    def verdict(self, name, ok, detail):
-        state = "NOT RUN" if ok is None else ("PASS" if ok else "FAIL")
+    def verdict(self, name, ok, detail, unpaired=()):
+        """A pre-registered gate over its cases: ok is the paired cases' result (None: none paired). Never a PASS over part of
+        the gate's cases: a case the reference ran and the candidate failed (an error) makes it FAIL, and any other case of
+        the gate that did not pair (skipped, not run, out of memory in both arms, inputs that differ, a divergence gap no record
+        holds) turns a pass into INCOMPLETE."""
+        failed = [cid for cid, _, cand_failed in unpaired if cand_failed]
+        missing = [cid for cid, _, cand_failed in unpaired if not cand_failed]
+        if failed:
+            ok = False
+            detail += f"; the candidate failed {len(failed)} case(s) the reference ran ({', '.join(failed[:4])}{', ...' if len(failed) > 4 else ''})"
+        state = "NOT RUN" if ok is None else ("FAIL" if not ok else ("INCOMPLETE" if missing else "PASS"))
+        if missing:
+            detail += f"; {len(missing)} case(s) of the gate not paired ({', '.join(missing[:4])}{', ...' if len(missing) > 4 else ''})"
         self.verdicts.append((name, state, detail))
 
     def pairs(self, predicate, cand=None):
-        """(case, ref record, cand record) of the cases both arms ran; the others are listed as not paired."""
+        """(case, ref record, cand record) of the cases both arms ran; the others (case id, why, whether the candidate failed a
+        case the reference ran) are listed as not paired."""
         both, unpaired = [], []
         cand = cand or self.cand
         for cid, case in self.cases.items():
@@ -530,16 +549,17 @@ class Report:
             if r and c and r.get("status") == "ok" and c.get("status") == "ok":
                 key = "input_sha256" if "input_sha256" in r else "prompt_sha256"
                 if r.get(key) != c.get(key):
-                    unpaired.append((cid, "the arms' inputs differ"))
+                    unpaired.append((cid, "the arms' inputs differ", False))
                 else:
                     both.append((case, r, c))
             else:
                 state = lambda x: "absent" if not x else x.get("status") + (f" ({x.get('reason') or x.get('error')})" if x.get("status") != "ok" else "")
-                unpaired.append((cid, f"reference {state(r)}, candidate {state(c)}"))
+                cand_failed = bool(r) and r.get("status") == "ok" and bool(c) and c.get("status") == "error"
+                unpaired.append((cid, f"reference {state(r)}, candidate {state(c)}", cand_failed))
         return both, unpaired
 
     def not_paired(self, unpaired):
-        for cid, why in unpaired:
+        for cid, why, _ in unpaired:
             self.out(f"- not paired: `{cid}`: {why}")
 
     def run(self):
@@ -608,8 +628,9 @@ class Report:
             se = block_se(diffs)
             dppl = (math.exp(sum(nc) / n - sum(nr) / n) - 1) * 100
             kls = [x for _, c in items for x in (c.get("kl") or [])]
-            kl_ok = all(c.get("kl_reference") and (c["kl_reference"].endswith(":" + self.ref["arm"]) or
-                                                   c["kl_reference"].startswith(self.ref["arm"] + " ")) for _, c in items)
+            # A KL is the reference arm's only when the candidate's record names this reference record's distribution (the
+            # sha256 of its topk; an arm name alone does not say which run or case file it came from), for every window.
+            kl_ok = all(c.get("kl") and topk_digest(r) and c.get("kl_reference_topk_sha256") == topk_digest(r) for r, c in items)
             klm = sum(kls) / len(kls) if kls and kl_ok else None
             klp = sorted(kls)[int(0.99 * (len(kls) - 1))] if kls and kl_ok else None
             agree = sum(a == b for r, c in items for a, b in zip(r["top1"], c["top1"])) / n
@@ -631,27 +652,40 @@ class Report:
         self.summary[("floor_" if floor else "") + kind] = rows
         if gate:
             self.verdict(f"{kind} (every corpus and L run)", ok_all if rows else None,
-                         f"{len(rows)} groups; worst dPPL {max((r['delta_ppl_pct'] for r in rows), default=float('nan')):+.3f}%")
+                         f"{len(rows)} groups; worst dPPL {max((r['delta_ppl_pct'] for r in rows), default=float('nan')):+.3f}%", unpaired)
 
     def layers(self):
-        recs = [r for cid, r in self.cand["records"].items() if r.get("kind") == "layers" and r.get("status") == "ok"]
-        recs += [r for cid, r in self.ref["records"].items() if r.get("kind") == "layers" and r.get("status") == "ok"
-                 and cid not in self.cand["records"]]
-        if not recs:
+        """The layers cases of the case file, each checked in whichever arm ran it with 8-bit launches (the candidate's record
+        first); a case no arm checked is listed, and leaves the gate NOT RUN or INCOMPLETE, never silently absent."""
+        case_ids = [cid for cid, case in self.cases.items() if case["kind"] == "layers"]
+        if not case_ids:
             return
+        recs, missing = [], []
+        for cid in case_ids:
+            found = [x for x in (self.cand["records"].get(cid), self.ref["records"].get(cid)) if x]
+            checked = next((x for x in found if x.get("status") == "ok" and x.get("checks")), None)
+            if checked:
+                recs.append(checked)
+            else:
+                why = "; ".join(f"{x.get('arm')}: {x.get('status')}"
+                                + (f" ({x.get('reason') or x.get('error')})" if x.get("status") != "ok" else " (no 8-bit launch to check)")
+                                for x in found) or "absent in both arms"
+                missing.append((cid, why, False))
         self.out("## layers: 8-bit prompt attention vs the 16-bit kernel on the same rows (real activations)")
         self.out()
         rels = [x[1] for r in recs for x in r.get("checks", [])]
         for r in recs:
             self.out(f"- `{r['case']}` ({r['arm']}): {len(r.get('checks', []))} launches, rel RMS median {r.get('median_rel_rms', float('nan')) * 100:.2f}%, "
                      f"max {r.get('max_rel_rms', float('nan')) * 100:.2f}%, max |d| {r.get('max_abs')}")
+        for cid, why, _ in missing:
+            self.out(f"- not checked: `{cid}`: {why}")
         self.out()
+        med, mx = (statistics.median(rels), max(rels)) if rels else (float("nan"), float("nan"))
         if rels:
-            med, mx = statistics.median(rels), max(rels)
             self.summary["layers"] = {"launches": len(rels), "median_rel_rms": med, "max_rel_rms": mx}
-            if self.gates["layers"]:
-                self.verdict("layers", med <= self.gates["layers"][0] and mx <= self.gates["layers"][1],
-                             f"median {med * 100:.2f}%, max {mx * 100:.2f}% over {len(rels)} launches")
+        if self.gates["layers"]:
+            self.verdict("layers", med <= self.gates["layers"][0] and mx <= self.gates["layers"][1] if rels else None,
+                         f"median {med * 100:.2f}%, max {mx * 100:.2f}% over {len(rels)} launches", missing)
 
     def greedy(self, cand=None):
         floor = cand is not None
@@ -662,27 +696,35 @@ class Report:
         self.out()
         self.out("| case | tokens | identical prefix | identical | divergence: ref gap / cand gap |")
         self.out("|---|---:|---:|---|---|")
-        gaps_at, identical, rows = [], 0, []
+        gaps_at, identical, rows, unknown = [], 0, [], []
+        gap = lambda rec, i: (rec.get("gaps") or [])[i] if i < len(rec.get("gaps") or []) else None
         for case, r, c in both:
             a, b = r["generated"], c["generated"]
             prefix = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
             same = a == b
             identical += same
-            detail = "-"
-            if not same and prefix < min(len(a), len(b)):
-                gr, gc = r["gaps"][prefix], c["gaps"][prefix]
-                gaps_at.append(gr)
-                detail = f"at {prefix}: {gr:.3f} / {gc:.3f}"
-            rows.append({"case": case["id"], "prefix": prefix, "identical": same, "ref_gap": gaps_at[-1] if detail != "-" else None})
+            detail, gr = "-", None
+            if not same:
+                # Where one arm ended (end of sequence) and the other went on, the divergence is the step that chose the end:
+                # its gap is the record's entry past the generated tokens.
+                gr, gc = gap(r, prefix), gap(c, prefix)
+                if gr is None:
+                    unknown.append((case["id"], f"diverged at {prefix}, where the reference record holds no gap", False))
+                else:
+                    gaps_at.append(gr)
+                ended = " (an arm ended)" if prefix == min(len(a), len(b)) else ""
+                detail = f"at {prefix}{ended}: {'?' if gr is None else f'{gr:.3f}'} / {'?' if gc is None else f'{gc:.3f}'}"
+            rows.append({"case": case["id"], "prefix": prefix, "identical": same, "ref_gap": gr})
             self.out(f"| {case['id']} | {case['tokens'] // 1024}K | {prefix}/{len(a)} | {'yes' if same else 'no'} | {detail} |")
         self.not_paired(unpaired)
         self.out()
-        self.out(f"Identical: {identical}/{len(both)}; divergences at reference top-2 gaps {', '.join(f'{g:.3f}' for g in gaps_at) or 'none'}.")
+        self.out(f"Identical: {identical}/{len(both)}; divergences at reference top-2 gaps {', '.join(f'{g:.3f}' for g in gaps_at) or 'none'}"
+                 + (f"; {len(unknown)} at an unknown gap" if unknown else "") + ".")
         self.out()
         self.summary["floor_greedy" if floor else "greedy"] = {"identical": identical, "cases": len(both), "rows": rows}
         if self.gates["greedy_gap"] is not None and not floor:
             self.verdict("greedy (divergences at near-ties only)", all(g < self.gates["greedy_gap"] for g in gaps_at) if both else None,
-                         f"{identical}/{len(both)} identical; max ref gap at a divergence {max(gaps_at, default=0):.3f}")
+                         f"{identical}/{len(both)} identical; max ref gap at a divergence {max(gaps_at, default=0):.3f}", unpaired + unknown)
 
     def chat_pairs(self, group):
         return self.pairs(lambda c: c["kind"] == "chat" and c.get("group") == group)
@@ -709,10 +751,11 @@ class Report:
         self.summary["retrieval"] = rows
         rule = self.gates["retrieval"]
         if rule == "no_regression":
-            self.verdict("retrieval (no check the reference passes is lost)", regressions == 0 if both else None, f"{regressions} lost checks")
+            self.verdict("retrieval (no check the reference passes is lost)", regressions == 0 if both else None, f"{regressions} lost checks",
+                         unpaired)
         elif rule == "all_pass":
             self.verdict("retrieval (the candidate passes every check)", cand_all if both else None,
-                         f"{sum(all(x['cand'].values()) for x in rows)}/{len(rows)} cases fully passed")
+                         f"{sum(all(x['cand'].values()) for x in rows)}/{len(rows)} cases fully passed", unpaired)
 
     def task(self, group):
         both, unpaired = self.chat_pairs(group)
@@ -724,7 +767,7 @@ class Report:
             self.out(f"{len(both)} paired completions, not graded: pass --execute-humaneval to run the generated code (restricted subprocess).")
             self.not_paired(unpaired)
             self.out()
-            self.verdict(group, None, "not graded (--execute-humaneval not given)")
+            self.verdict(group, None, "not graded (--execute-humaneval not given)", unpaired)
             return
         grades, cache = [], {}
         for case, r, c in both:
@@ -756,7 +799,7 @@ class Report:
         self.summary[group] = {"ref": ref_ok, "cand": cand_ok, "n": len(grades), "lost": b, "gained": c_, "p": p, "identical": same}
         if self.gates["tasks"]:
             loss, pmin = self.gates["tasks"]
-            self.verdict(group, (b - c_ <= loss and (p > pmin or c_ >= b)) if grades else None, f"net {c_ - b:+d}, p {p:.3f}")
+            self.verdict(group, (b - c_ <= loss and (p > pmin or c_ >= b)) if grades else None, f"net {c_ - b:+d}, p {p:.3f}", unpaired)
 
     def evidence(self):
         self.out("## Arms' evidence")
@@ -788,7 +831,13 @@ def report(args):
         Path(ignored_output(Path(args.out).parent), Path(args.out).name).write_text(text, encoding="utf-8")
     if args.json:
         Path(ignored_output(Path(args.json).parent), Path(args.json).name).write_text(json.dumps(rep.summary, indent=1) + "\n", encoding="utf-8")
-    return 1 if any(state == "FAIL" for _, state, _ in rep.verdicts) else 0
+    return exit_status(rep.verdicts)
+
+
+def exit_status(verdicts):
+    """0 only when every gate passed: 1 when a gate failed, else 3 when a gate was not run or ran on part of its cases."""
+    states = {state for _, state, _ in verdicts}
+    return 1 if "FAIL" in states else 3 if states & {"NOT RUN", "INCOMPLETE"} else 0
 
 
 # --------------------------------------------------------------------------- estimate
