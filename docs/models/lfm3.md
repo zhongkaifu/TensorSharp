@@ -63,6 +63,17 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   cancellation hold. Prompt processing past 16K tokens is slower than llama.cpp's
   (about 3,000 vs 5,400 tokens/s at 32K on an M5 Pro); decoding after a long prompt is
   on par.
+- **ggml_cpu on an M5 Pro (2026-11-17, `eng/lfm3/bench`)** against llama.cpp's CPU
+  builds (noblas and Accelerate BLAS, flash attention on, both engines at their best
+  thread counts, 3 interleaved rounds): decode is ahead on every file (1.09-1.27x at
+  depth 0 and 4K, 1.95x at 16K on Q4_K_M, 4.6x on BF16 whose ggml-cpu dot is scalar on
+  ARM), prompts of 2K tokens and more are at parity (0.97-1.03x; NVFP4 1.15-1.19x from
+  512), 128-512-token prompts run at 0.89-0.96x, four concurrent streams serve at
+  parity, and the Omni encoders and speech output are faster (vision 0.55x the time,
+  audio 0.48-0.52x, speech 6.9x real time vs 4.0x). Teacher-forced against llama.cpp
+  CPU: 0-5 top-1 differences in 320 rows per file, within llama.cpp's own CPU-vs-Metal
+  spread. The knobs are in the [environment variable
+  matrix](../env_var_feature_matrix.md#out-of-matrix-ggml-cpu-backend-knobs).
 - **Not yet validated:** the TensorAgent app on a device, and every CUDA and Vulkan route
   (`config/lfm3-1.7b-nvfp4.json` in particular has never run). vLLM and SGLang were not
   compared yet.

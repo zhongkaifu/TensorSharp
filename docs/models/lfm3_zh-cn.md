@@ -44,6 +44,12 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
   命中且回复一致；33 条指令遵循与 35 个函数调用用例得分相同或更高，差异来自下文两项行为（关闭思考时的游离推理、
   `tool_choice`）。4 与 16 个并发对话、n-gram 推测解码（回复一致）与客户端取消均正常。超过 16K token 的提示处理慢于
   llama.cpp（M5 Pro 上 32K 时约 3,000 对 5,400 token/s）；长提示之后的解码速度相当。
+- **M5 Pro 上的 ggml_cpu（2026-11-17，`eng/lfm3/bench`）**：与 llama.cpp 的 CPU 构建（noblas 与 Accelerate BLAS，开启
+  flash attention，两个引擎都用各自最佳线程数，交替 3 轮）相比，每个文件的解码都领先（深度 0 与 4K 时 1.09-1.27 倍，Q4_K_M
+  在 16K 时 1.95 倍，BF16 为 4.6 倍——ggml-cpu 的 BF16 点积在 ARM 上是标量实现），2K token 及以上的提示持平（0.97-1.03 倍；
+  NVFP4 从 512 起为 1.15-1.19 倍），128-512 token 的提示为 0.89-0.96 倍，4 路并发服务持平，Omni 编码器与语音输出更快（视觉耗时为
+  0.55 倍，音频 0.48-0.52 倍，语音 6.9 倍实时对 4.0 倍）。与 llama.cpp CPU 的强制教学对比：每个文件 320 行中 top-1 差异
+  0-5 处，处于 llama.cpp 自身 CPU 与 Metal 之间的差异范围内。相关开关见[环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的-ggml-cpu-后端开关)。
 - **尚未验证：** 设备上的 TensorAgent 应用，以及所有 CUDA 与 Vulkan 路径（`config/lfm3-1.7b-nvfp4.json` 从未运行过）。尚未与 vLLM、SGLang 对比。
 
 ## 运行
