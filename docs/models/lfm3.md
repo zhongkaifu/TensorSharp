@@ -520,6 +520,31 @@ rounds) ggml_cpu ran pp512 at 498 / 605 / 508 / 361 on Q4_K_M / Q8_0 / QAD-Q4_0 
 (BF16: 22, the CPU baseline's figure) and the managed CPU at 20 / 135 / 25 / 28 / 143 on the
 five files.
 
+**Managed CPU after the worker-pool round** (later the same day, `wip/lfm3-cpu-pool`; the
+same machine shared with other jobs, 3 interleaved rounds, rounds that started with the
+machine more than 5% busy left out). Decode-sized steps leave two cores to the process's
+other threads (`TS_CPU_DECODE_THREADS`, default every core but two on a Mac with
+performance and efficiency cores), the submitter polls for a job's last blocks before it
+yields, products split their columns into shrinking blocks so the faster cores take the
+tail, and the hosts let hot framework code tier up (the .NET vector `exp` under every
+SiLU and softmax ran precompiled under `TieredCompilation=false`). Every logit is the
+same bits as before (perplexity digests on all five files at 18, 9 and 4 threads; 320
+teacher-forced decode rows on Q4_K_M, Q8_0 and NVFP4).
+
+| | before | after | llama.cpp |
+|---|---|---|---|
+| tg128, Q4_K_M / Q8_0 / QAD-Q4_0 / NVFP4 / BF16 | 122 / 87 / 125 / 107 / 53 | 143 / 101 / 140 / 125 / 58 | 160 / 114 / 180 / 131 / 16 |
+| Q4_K_M pp128 / pp512 | 880 / 924 | 937 / 939 | 920 / 946 |
+| served, one stream: decode tok/s, TTFT (Q4_K_M, 512 + 128) | 76, 702 ms | 126, 575 ms | 151, 589 ms |
+| served, four streams: tok/s in all, TTFT | 87, 2,806 ms | 113, 1,808 ms | 115, 2,371 ms |
+| TTS (Omni-2B Q8_0, `speech-bench.py`): real-time factor, first audio | 3.5x, 123 ms | 5.1x, 70 ms | 4.1x, 112 ms |
+| audio encoder, 10 s / 30 s clip (15 calls a process, 4 rounds) | 54 / 110 ms | 44 / 98 ms | 35 / 97 ms |
+
+llama.cpp: decode `build-cpu-noblas -t 16`, prompts the same build at `-t 18`; served
+`llama-server` from the same build at `-t 16 -tb 18`; TTS `llama-server` from the Accelerate build at `-t 12` (its best of the
+two); audio its encoder at 18 threads. The managed audio encoder keeps speeding up over its
+first hundred calls while the JIT tiers it up (30 ms on the 10 s clip after 300 calls).
+
 ## Current limits
 
 - Speech output has no realtime endpoint (`/v1/realtime`), and a later turn does not yet reuse
@@ -542,16 +567,16 @@ five files.
   products are at parity; each 512-row step carries ~25-30 ms of prompt K/V copies llama.cpp
   writes in place), and its NVFP4 prompts under 256 tokens still run ggml's own NVFP4
   product, half the speed of the managed CPU's NEON GEMM. The managed CPU decodes quantized
-  files at 0.70-0.86x (its pool waits on the slowest of 6 + 12 unequal cores for small
-  products, and the graph interpreter costs a few percent a step), runs Q8_0 / Q4_0 prompts
-  of 512 tokens and more at 0.77-0.84x (llama.cpp's repacked GEMMs use i8mm, which .NET 10
-  does not expose) and 128-token ones at 0.54-0.70x (0.70-0.88x once the JIT has tiered its
-  kernels up), BF16 prompts at 0.44x of llama.cpp's Accelerate build, and its audio encoder
-  takes 1.1-2x llama.cpp's time. Served through TensorSharp.Server.Host, the managed CPU
-  decodes at ~78 tokens/s against its 128 in the engine benchmark (ggml_cpu: 153 against
-  171): its worker pool takes every core, so the server's own threads stall it at every
-  join. `TS_CPU_THREADS=16` serves 94 tokens/s; a decode width of its own, as ggml_cpu has,
-  is the open fix.
+  files at 0.78-0.95x (see the worker-pool round under [Benchmarking](#benchmarking); what
+  remains is per-step work outside the products: the graph interpreter and the
+  single-threaded elementwise ops are ~20% of a decode step's main-thread time), runs Q8_0 /
+  Q4_0 prompts of 512 tokens and more at 0.77-0.84x (llama.cpp's repacked GEMMs use i8mm,
+  which .NET 10 does not expose), Q4_K_M prompts of 128-512 tokens at 0.99-1.02x, BF16
+  prompts at 0.44x of llama.cpp's Accelerate build, and its audio encoder takes 1.0-1.25x
+  llama.cpp's time (a 30 s / 10 s clip). Served through TensorSharp.Server.Host (one stream,
+  512-token prompts), it decodes Q4_K_M at 126 tokens/s against llama-server's 151, with the
+  first token sooner (575 against 589 ms), and four streams at 113 against 115 tokens/s in
+  all.
 - ggml_cpu keeps its own load-time host copies (the fused gate|up and permuted attention
   weights) resident beside their repacked copies: peak footprint ~2.0 GB for Q4_K_M against
   llama-server's 1.2 GB. `TS_GGML_CPU_REPACK=0` restores the smaller footprint at half the
