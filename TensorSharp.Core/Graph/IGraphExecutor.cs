@@ -259,6 +259,21 @@ namespace TensorSharp.Graph
         Tensor TakeOutput(int index);
     }
 
+    /// <summary>
+    /// What one run of a plan evaluates and moves, for censuses of steps (eng/lfm3/Lfm3Probe batch): the executor's nodes, those
+    /// that run a kernel (not a view, reshape, permute or transpose), and the leaves besides the inputs that every run copies to
+    /// the device and back (ggml: states and weights placed in the graph's compute memory) with their bytes.
+    /// </summary>
+    public readonly record struct GraphPlanCensus(long Nodes, long Kernels, long LeafUploads, long LeafUploadBytes, long LeafDownloads,
+        long LeafDownloadBytes);
+
+    /// <summary>A plan that reports its <see cref="GraphPlanCensus"/>. Read only by censuses: nothing the runtime decides.</summary>
+    public interface IGraphPlanCensus
+    {
+        /// <summary>One run's census, or null where the plan does not know it yet (a graph built on its first run).</summary>
+        GraphPlanCensus? Census { get; }
+    }
+
     /// <summary>Executor plugins, by the allocator type of the backend they serve.</summary>
     public static class GraphExecutors
     {

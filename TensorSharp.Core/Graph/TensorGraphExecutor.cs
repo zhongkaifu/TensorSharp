@@ -1128,7 +1128,7 @@ namespace TensorSharp.Graph
 
         /// <summary>A compiled program: validated once, and run by replaying its entries into a session
         /// (nodes nothing reaches are skipped).</summary>
-        private sealed class Plan : IGraphPlan, IGraphTensorOutputs
+        private sealed class Plan : IGraphPlan, IGraphTensorOutputs, IGraphPlanCensus
         {
             public bool KeepTensors { get; set; }
             private Tensor[] _kept;
@@ -1190,20 +1190,31 @@ namespace TensorSharp.Graph
                     }
                 }
                 _dead = new bool[n];
+                long ops = 0, kernels = 0;
                 for (int i = 0; i < n; i++)
                 {
                     _dead[i] = !live[i];
                     if (!live[i]) continue;
                     GraphNode node = nodes[i];
+                    if (node.Kind == GraphNodeKind.Op)
+                    {
+                        ops++;
+                        if (node.Op is not (GraphOp.Reshape or GraphOp.View or GraphOp.Permute or GraphOp.Transpose)) kernels++;
+                    }
                     if (node.Kind == GraphNodeKind.Op && !s_ops.Contains(node.Op))
                         throw new NotSupportedException($"{executor.GetType().Name} has no kernel for {node.Op}");
                     if (node.Kind == GraphNodeKind.Leaf && node.Role != GraphLeafRole.Input && node.Handle is not (Tensor or IGraphWeight))
                         throw new NotSupportedException($"{executor.GetType().Name}: leaf {i} ({node.Role}) carries no tensor or weight");
                 }
                 Outputs = program.OutputFloats.Select(f => new float[f]).ToArray();
+                Census = new GraphPlanCensus(ops, kernels, 0, 0, 0, 0);
             }
 
             public float[][] Outputs { get; }
+
+            /// <summary>The ops a run evaluates (those no output, effect or alias reaches are skipped); every leaf is a tensor
+            /// where the ops run, so no run copies one.</summary>
+            public GraphPlanCensus? Census { get; }
 
             public string LastError { get; private set; }
 

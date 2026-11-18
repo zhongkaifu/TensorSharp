@@ -184,7 +184,7 @@ namespace TensorSharp.GGML
 
         public void Invalidate(IntPtr data) => GgmlBasicOps.InvalidateHostBuffer(data);
 
-        private sealed class Plan : IGraphPlan
+        private sealed class Plan : IGraphPlan, IGraphPlanCensus
         {
             private readonly GgmlGraph _graph;
             private readonly GCHandle[] _pins;
@@ -210,6 +210,22 @@ namespace TensorSharp.GGML
             }
 
             public bool IsLeafResident(int node) => _graph.IsResident(node);
+
+            private GraphPlanCensus? _census;
+
+            /// <summary>The built ggml graph's census (TSGgml_GraphCensus), read once after its first run: a replayable graph
+            /// is fixed from then on.</summary>
+            public GraphPlanCensus? Census
+            {
+                get
+                {
+                    if (_census != null) return _census;
+                    long[] v = _graph.Census();
+                    if (v == null) return null;
+                    _census = new GraphPlanCensus(v[0], v[1], v[2], v[3], v[4], v[5]);
+                    return _census;
+                }
+            }
 
             public void Dispose()
             {

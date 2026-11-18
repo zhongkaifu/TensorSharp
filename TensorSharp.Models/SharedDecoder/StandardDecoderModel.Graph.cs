@@ -822,6 +822,55 @@ namespace TensorSharp.Models
         internal int GraphBuilds { get; private set; }
 
         /// <summary>
+        /// What the runs of whole-forward steps moved and launched, summed over runs (stage B0's census: eng/lfm3/Lfm3Probe
+        /// batch). Counted beside <see cref="GraphRuns"/> and <see cref="GraphBuilds"/>; nothing the runtime decides reads it.
+        /// </summary>
+        internal sealed class StepCensus
+        {
+            /// <summary>Runs of steps' plans (GraphStep.Run), a recorded replay included. Not counted: tensor-parallel ranks run
+            /// together (RunRanked) and the side plans that commit verify windows' states.</summary>
+            public long Runs;
+            /// <summary>Per-run input leaves (positions, write rows, masks, embedded rows, ...) and their bytes.</summary>
+            public long InputLeaves, InputBytes;
+            /// <summary>Results read back to the host: logits, greedy ids, hidden rows (bytes).</summary>
+            public long OutputBytes;
+            /// <summary>Stopwatch ticks inside the executors' runs: input uploads, the device's work and the results' download
+            /// (a recorded replay's launch and wait). A streamed step's ops run while it is emitted, outside these.</summary>
+            public long RunTicks;
+            /// <summary>Of <see cref="Runs"/>, those whose plan reported a <see cref="GraphPlanCensus"/>, and its sums.</summary>
+            public long CensusRuns, Nodes, Kernels, LeafUploads, LeafUploadBytes, LeafDownloads, LeafDownloadBytes;
+
+            public StepCensus Clone() => (StepCensus)MemberwiseClone();
+        }
+
+        /// <summary>The steps' census so far (<see cref="StepCensus"/>).</summary>
+        internal StepCensus Census { get; } = new();
+
+        /// <summary>Count one run of <paramref name="plan"/> with <paramref name="inputs"/> input leaves of
+        /// <paramref name="inputBytes"/> bytes that took <paramref name="ticks"/> Stopwatch ticks.</summary>
+        private void CountRun(IGraphPlan plan, int inputs, long inputBytes, long ticks)
+        {
+            StepCensus c = Census;
+            c.Runs++;
+            c.InputLeaves += inputs;
+            c.InputBytes += inputBytes;
+            c.RunTicks += ticks;
+            if (plan is not IGraphTensorOutputs { KeepTensors: true } && plan.Outputs is { } outputs)
+                foreach (float[] o in outputs)
+                    if (o != null) c.OutputBytes += (long)o.Length * sizeof(float);
+            if (plan is IGraphPlanCensus { Census: { } p })
+            {
+                c.CensusRuns++;
+                c.Nodes += p.Nodes;
+                c.Kernels += p.Kernels;
+                c.LeafUploads += p.LeafUploads;
+                c.LeafUploadBytes += p.LeafUploadBytes;
+                c.LeafDownloads += p.LeafDownloads;
+                c.LeafDownloadBytes += p.LeafDownloadBytes;
+            }
+        }
+
+        /// <summary>
         /// Run a kept decode step as the device's recording of it: its first run records it and every later one (each
         /// advance) replays the recording with this position's inputs and each sequence's attention length and cache write
         /// row - a batched step's sequences as well, up to the recorder's <see cref="IDecodeCaptureExecutor.MaxRecordedSequences"/>
@@ -897,6 +946,7 @@ namespace TensorSharp.Models
                 }
                 else
                 {
+                    long launched = System.Diagnostics.Stopwatch.GetTimestamp();
                     if (RecordedLaunchFailsForTests?.Invoke(r.Shape) == true || !r.Capture.TryLaunch(attends, writeRows))
                     {
                         // Out of device memory (a 4K request beside Qwen3.8 Flash Next's ISTA pack and MTP head on an A40): every
@@ -907,6 +957,7 @@ namespace TensorSharp.Models
                     }
                     r.Capture.MarkWritten(r.CaptureOutputs);
                     RecordedDecodeReplays++;
+                    r.Step.CountRun(cached.Plan, System.Diagnostics.Stopwatch.GetTimestamp() - launched);
                 }
                 for (int o = 0; o < r.CaptureOutputs.Length; o++)
                 {
@@ -3762,8 +3813,22 @@ namespace TensorSharp.Models
             /// <summary>This step's per-run inputs, for a run of several ranks' plans together.</summary>
             internal GraphRunInputs RunInputs() => new(_inputs.ToArray(), _inputData.ToArray(), _inputBytes.ToArray());
 
-            internal bool Run(IGraphPlan plan) => plan.Run(CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData),
-                CollectionsMarshal.AsSpan(_inputBytes), CollectionsMarshal.AsSpan(_inputHandles));
+            internal bool Run(IGraphPlan plan)
+            {
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
+                bool ran = plan.Run(CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData),
+                    CollectionsMarshal.AsSpan(_inputBytes), CollectionsMarshal.AsSpan(_inputHandles));
+                CountRun(plan, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                return ran;
+            }
+
+            /// <summary>Count a run of <paramref name="plan"/> with this step's inputs (<see cref="StepCensus"/>).</summary>
+            internal void CountRun(IGraphPlan plan, long ticks)
+            {
+                long bytes = 0;
+                foreach (long b in _inputBytes) bytes += b;
+                _m.CountRun(plan, _inputs.Count, bytes, ticks);
+            }
 
             private object[] _unstable;
 

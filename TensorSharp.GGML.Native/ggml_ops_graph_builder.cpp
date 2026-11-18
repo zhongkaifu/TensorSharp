@@ -1840,6 +1840,44 @@ TSG_EXPORT int TSGgml_GraphLeafIsResident(void* handle, int node)
     return 0;
 }
 
+// What one run of a built graph evaluates and moves, for censuses of steps (eng/lfm3/Lfm3Probe batch): out[0] its ggml
+// nodes, out[1] those that run a kernel (not a no-op, view, reshape, permute or transpose, nor an empty tensor), out[2] and
+// out[3] the leaves in compute memory every run uploads besides its inputs (upload_run_inputs) and their bytes, out[4] and
+// out[5] the state leaves every run downloads after it and their bytes. Reads the graph only. Returns the values written:
+// 6, or 0 before the graph is built (on its first run).
+TSG_EXPORT int TSGgml_GraphCensus(void* handle, std::int64_t* out, int n)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    if (g == nullptr || out == nullptr || n < 6 || !g->built || g->graph == nullptr) return 0;
+    const int nodes = ggml_graph_n_nodes(g->graph);
+    std::int64_t kernels = 0;
+    for (int i = 0; i < nodes; i++)
+    {
+        const ggml_tensor* t = ggml_graph_node(g->graph, i);
+        if (t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE
+            || t->op == GGML_OP_TRANSPOSE || ggml_is_empty(t))
+            continue;
+        kernels++;
+    }
+    std::int64_t uploads = 0, upload_bytes = 0, downloads = 0, download_bytes = 0;
+    for (const Leaf& leaf : g->leaves)
+    {
+        if (!leaf.uploaded || leaf.data == nullptr || leaf.tensor->buffer == nullptr) continue;
+        uploads++;
+        upload_bytes += static_cast<std::int64_t>(leaf.bytes);
+        if (leaf.role != LEAF_STATE) continue;
+        downloads++;
+        download_bytes += static_cast<std::int64_t>(leaf.bytes);
+    }
+    out[0] = nodes;
+    out[1] = kernels;
+    out[2] = uploads;
+    out[3] = upload_bytes;
+    out[4] = downloads;
+    out[5] = download_bytes;
+    return 6;
+}
+
 // Make `node`'s result live in `base`'s buffer at `offset` bytes (an in-place state update).
 // When `base` is not resident in a persistent buffer, `fallback` (a node that copies the
 // state out of `node`) runs instead.
