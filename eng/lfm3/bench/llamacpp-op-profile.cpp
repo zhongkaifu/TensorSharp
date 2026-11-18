@@ -105,6 +105,9 @@ int main(int argc, char ** argv) {
     cp.n_threads = threads;
     cp.n_threads_batch = threads;
     cp.flash_attn_type = fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // The sliding-window layers in their own small cache, as llama-bench and llama-server run them (the library default
+    // keeps a full-size SWA cache, whose attention reads every key).
+    cp.swa_full = false;
     cp.cb_eval = eval_cb;
     cp.cb_eval_user_data = nullptr;
     llama_context * ctx = llama_init_from_model(model, cp);
