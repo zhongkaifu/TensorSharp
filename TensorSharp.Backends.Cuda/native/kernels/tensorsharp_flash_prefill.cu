@@ -33,9 +33,15 @@
 // The keys are converted once per layer and chunk into a band (INT8 K with one F32 scale per key, E4M3 V^T tiles with one
 // power-of-two scale per 32 keys), which the attention streams instead of the F16 cache. The direct engine's kernels
 // (038fb303, ts_q35_attn8_prefill_f32) on the graph op's operands: the same arithmetic per row (about 2% relative RMS
-// against the 16-bit kernel a layer). A row's result depends on where its chunk ends only through the V scale of the
-// chunk's last, partial 32-key tile: the at most 31 rows whose causal end lies in that tile (the other tiles are whole,
-// K and Q are scaled per key and per row). Off by default (CudaGraphExecutor.PromptAttention8Enabled).
+// against the 16-bit kernel a layer). At one key split, a row's result depends on where its chunk ends only through the V
+// scale of the chunk's last, partial 32-key tile: the at most 31 rows whose causal end lies in that tile (the other tiles
+// are whole, K and Q are scaled per key and per row). The key splits add a second dependence: the executor picks their
+// count from the chunk's own row count (CudaFlashPrefillKernels.Splits), and each split's key range is a share of the keys
+// of its block's last row (kAll), so two chunkings that give a row another split count or another block round it apart
+// outside that tile too: each split rounds its probabilities to E4M3 against its own running max, so such rows differ by
+// about the 8-bit arithmetic's own error (a 24-row chunk over 3,618 keys runs 16 splits on 82 SMs, the same rows inside a
+// 1,570-row chunk one: 3.0% relative RMS apart on Gaussian data). The 16-bit prompt kernel splits the same way, with F16
+// probabilities. Off by default (CudaGraphExecutor.PromptAttention8Enabled).
 // ---------------------------------------------------------------------------
 
 #define TS_FLASH_PREFILL_VERSION 12

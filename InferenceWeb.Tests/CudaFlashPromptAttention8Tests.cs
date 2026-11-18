@@ -19,8 +19,9 @@ namespace InferenceWeb.Tests;
 /// The 8-bit prompt attention (tensorsharp_flash_prefill's ts_flash_prompt_band_f16_d256 + ts_flash_prompt_i8e4_d256), on an
 /// RTX Blackwell image (skipped elsewhere): within its precision budget of an F64 attention over Qwen3.8-27B's prompt shapes
 /// (24 query heads over 4 KV heads of 256) and others (a floor, GQA groups of 4 and 8, a split launch), on Gaussian data, keys
-/// with outlier channels and peaked rows; deterministic; its key splits agreeing with the unsplit launch; a row's result
-/// independent of where its chunk ends outside the last partial key tile; and its band exactly what the band's definition says.
+/// with outlier channels and peaked rows; deterministic; its key splits agreeing with the unsplit launch; at one split, a row's
+/// result independent of where its chunk ends outside the last partial key tile, and with the executor's own splits within their
+/// tolerance; and its band exactly what the band's definition says.
 /// </summary>
 public sealed class CudaFlashPromptAttention8Tests
 {
@@ -320,30 +321,42 @@ public sealed class CudaFlashPromptAttention8Tests
         }
     }
 
+    /// <summary><paramref name="whole"/>'s rows forwarded as two chunks, [0, boundary) and [boundary, nq), each launched with the
+    /// key splits <paramref name="splits"/> gives its row count and keys; out [nq][heads][256].</summary>
+    private static float[] TwoChunks(CudaAllocator allocator, CudaFlashPrefillKernels flash, Chunk whole, int boundary,
+        Func<int, int, int> splits)
+    {
+        int n = whole.Nq, width = whole.Heads * D;
+        var result = new float[(long)n * width];
+        using var first = new Chunk(allocator, whole, 0, boundary);
+        using var second = new Chunk(allocator, whole, boundary, n - boundary);
+        Array.Copy(first.Run8(allocator, flash, splits(boundary, boundary)), 0, result, 0, (long)boundary * width);
+        Array.Copy(second.Run8(allocator, flash, splits(n - boundary, n)), 0, result, (long)boundary * width, (long)(n - boundary) * width);
+        return result;
+    }
+
+    /// <summary>The rows whose bits differ between <paramref name="a"/> and <paramref name="b"/>.</summary>
+    private static int[] RowsApart(float[] a, float[] b, int rows, int heads)
+        => Enumerable.Range(0, rows)
+            .Where(t => !a.AsSpan(t * heads * D, heads * D).SequenceEqual(b.AsSpan(t * heads * D, heads * D))).ToArray();
+
     /// <summary>
-    /// A row's result does not depend on where its chunk ends, except through the V scale of the chunk's last, partial 32-key
-    /// tile: 3,618 keys forwarded as 2,048 + 1,570 rows and as 2,000 + 1,618 give every row the same bits but the 16 whose causal
-    /// end lies in the partial tile [1984, 2000) of the 2,000-row chunk (within 3% relative RMS there).
+    /// At one key split, a row's result does not depend on where its chunk ends, except through the V scale of the chunk's last,
+    /// partial 32-key tile: 3,618 keys forwarded as 2,048 + 1,570 rows and as 2,000 + 1,618, each chunk at one split, give every
+    /// row the same bits except possibly the 16 whose causal end lies in the partial tile [1984, 2000) of the 2,000-row chunk
+    /// (within 3% relative RMS there; bit-equal on this seeded data on an RTX PRO 4500, where the partial tile's power-of-two V
+    /// scale comes out the same). The executor's own split counts add a dependence of their own
+    /// (<see cref="TheExecutorsKeySplitsAddTheirRoundingToTheChunkDependence"/>).
     /// </summary>
     [CudaFact(PromptAttention8 = true)]
-    public void RowsOutsideTheLastPartialTileAreChunkInvariant()
+    public void RowsOutsideTheLastPartialTileAreChunkInvariantAtOneSplit()
     {
         var (allocator, flash) = Open();
         using (allocator)
         using (var whole = new Chunk(allocator, 24, 4, 3618, 3618, 0, Data.Gaussian))
         {
-            float[] Forward(int split)
-            {
-                var result = new float[3618 * 24 * D];
-                using var first = new Chunk(allocator, whole, 0, split);
-                using var second = new Chunk(allocator, whole, split, 3618 - split);
-                Array.Copy(first.Run8(allocator, flash, 1), 0, result, 0, (long)split * 24 * D);
-                Array.Copy(second.Run8(allocator, flash, 1), 0, result, (long)split * 24 * D, (long)(3618 - split) * 24 * D);
-                return result;
-            }
-            float[] a = Forward(2048), b = Forward(2000);
-            var apart = Enumerable.Range(0, 3618)
-                .Where(t => !a.AsSpan(t * 24 * D, 24 * D).SequenceEqual(b.AsSpan(t * 24 * D, 24 * D))).ToArray();
+            float[] a = TwoChunks(allocator, flash, whole, 2048, (_, _) => 1), b = TwoChunks(allocator, flash, whole, 2000, (_, _) => 1);
+            int[] apart = RowsApart(a, b, 3618, 24);
             _output.WriteLine($"rows apart between the 2,048 and 2,000-row chunkings: {apart.Length} ([{string.Join(",", apart.Take(40))}])");
             Assert.All(apart, t => Assert.InRange(t, 1984, 1999));
             if (apart.Length > 0)
@@ -351,6 +364,51 @@ public sealed class CudaFlashPromptAttention8Tests
                 var (rel, _) = Compare(b, t => Row(a, t, 24), apart, 24);
                 _output.WriteLine($"those rows' relative RMS: {rel:E3}");
                 Assert.True(rel <= 0.03, $"the partial tile's rows: relative RMS {rel:E3}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// With the key splits the executor picks for each chunk (<see cref="CudaFlashPrefillKernels.Splits"/>, from the chunk's own
+    /// row count, as CudaGraphExecutor.PromptAttention8 launches it), a row's result depends on its chunking beyond the last
+    /// partial tile. 3,618 keys forwarded as 2,048 + 1,570 rows run one split a chunk; as 3,594 + 24 the 24-row chunk runs several
+    /// (16 on 82 SMs), each split a share of its block's keys. Rows outside the 3,594-row chunk's partial tile [3584, 3594) and
+    /// the split chunk keep their bits; the partial tile's rows agree within 3% relative RMS (bit-equal here). The split chunk's
+    /// rows differ by about the 8-bit arithmetic's own error, since each split rounds its probabilities to E4M3 against its own
+    /// running max: 3.0% relative RMS on this Gaussian data on an RTX PRO 4500 (the peaked data of
+    /// <see cref="SplitsAgreeWithTheUnsplitLaunch"/> stays within 1%), gated at the kernel's 5% precision budget
+    /// (<see cref="MatchesAnF64Reference"/>). That bound, not bit-exactness, is what a change that sends prompt chunks to this
+    /// attention can lean on across chunkings.
+    /// </summary>
+    [CudaFact(PromptAttention8 = true)]
+    public void TheExecutorsKeySplitsAddTheirRoundingToTheChunkDependence()
+    {
+        const int Heads = 24, KvHeads = 4, N = 3618;
+        var (allocator, flash) = Open();
+        using (allocator)
+        using (var whole = new Chunk(allocator, Heads, KvHeads, N, N, 0, Data.Gaussian))
+        {
+            int Splits(int nq, int keys) => flash.Splits(nq * (Heads / KvHeads), KvHeads, keys);
+            _output.WriteLine($"{flash.MultiprocessorCount} SMs: 2,048 + 1,570 rows at {Splits(2048, 2048)} + {Splits(1570, N)} splits, " +
+                $"3,594 + 24 rows at {Splits(3594, 3594)} + {Splits(24, N)}");
+            Assert.Equal(1, Splits(1570, N));
+            Assert.True(Splits(24, N) > 1, $"the 24-row chunk runs {Splits(24, N)} split on this GPU: nothing here tells the chunkings apart by splits");
+            float[] a = TwoChunks(allocator, flash, whole, 2048, Splits), b = TwoChunks(allocator, flash, whole, 3594, Splits);
+            int[] apart = RowsApart(a, b, N, Heads);
+            int[] tile = apart.Where(t => t < 3594).ToArray(), split = apart.Where(t => t >= 3594).ToArray();
+            _output.WriteLine($"rows apart: {apart.Length}, {tile.Length} in the partial tile [3584, 3594) and {split.Length} of the 24 split rows");
+            Assert.All(apart, t => Assert.InRange(t, 3584, N - 1));
+            if (tile.Length > 0)
+            {
+                var (rel, _) = Compare(b, t => Row(a, t, Heads), tile, Heads);
+                _output.WriteLine($"the partial tile's rows: relative RMS {rel:E3}");
+                Assert.True(rel <= 0.03, $"the partial tile's rows: relative RMS {rel:E3}");
+            }
+            if (split.Length > 0)
+            {
+                var (rel, _) = Compare(b, t => Row(a, t, Heads), split, Heads);
+                _output.WriteLine($"the split chunk's rows: relative RMS {rel:E3}");
+                Assert.True(rel <= 0.05, $"the split chunk's rows: relative RMS {rel:E3} against the one-split chunking");
             }
         }
     }
