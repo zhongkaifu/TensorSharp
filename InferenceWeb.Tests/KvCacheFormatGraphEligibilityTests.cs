@@ -66,38 +66,63 @@ public sealed class KvCacheFormatGraphEligibilityTests : IDisposable
         Assert.Equal("KV dtype Q8_0 on this backend's executor", model.GraphRefusalForTests);
     }
 
-    /// <summary>Direct CUDA: q8_0 for 128- and 256-wide heads whose K and V widths agree, nothing for q4_0.</summary>
+    /// <summary>Direct CUDA takes q8_0 exactly where its flash kernels run it (an image with their sm_80 code), never for heads
+    /// they do not have or K and V of different widths, and never q4_0; F16 always.</summary>
     [CudaFact]
-    public void DirectCudaTakesQ8ForItsFlashKernelsHeads()
+    public void DirectCudaTakesQ8OnlyWhereItsFlashKernelsRunIt()
     {
         using var allocator = new CudaAllocator();
         using var executor = new CudaGraphExecutor(allocator);
-        if (allocator.FlashPrefillKernels is not { } flash || !flash.RunsAttentionQ8(256))
-        {
-            Assert.False(executor.TakesKvCacheFormat(GraphFormat.Q8_0, 256, 256));
-            return;
-        }
-        Assert.True(executor.TakesKvCacheFormat(GraphFormat.Q8_0, 256, 256));
-        Assert.True(executor.TakesKvCacheFormat(GraphFormat.Q8_0, 128, 128));
+        bool runs = allocator.FlashPrefillKernels is { } flash && flash.RunsAttentionQ8(256);
+        Assert.Equal(runs, executor.TakesKvCacheFormat(GraphFormat.Q8_0, 256, 256));
+        Assert.Equal(runs, executor.AttendsCapacityWindows(256, GraphFormat.Q8_0));
         Assert.False(executor.TakesKvCacheFormat(GraphFormat.Q8_0, 64, 64));
         Assert.False(executor.TakesKvCacheFormat(GraphFormat.Q8_0, 256, 128));
         Assert.False(executor.TakesKvCacheFormat(GraphFormat.Q4_0, 256, 256));
         Assert.True(executor.TakesKvCacheFormat(GraphFormat.F16, 64, 64));
+    }
+
+    /// <summary>Direct CUDA with its flash kernels' sm_80 code: q8_0 for 128- and 256-wide heads whose K and V widths agree.
+    /// Where the loaded module has no such code (the committed compute_75 PTX, an sm_7x build) the gate skips it.</summary>
+    [CudaFact(TensorCoreModule = "tensorsharp_flash_prefill")]
+    public void DirectCudaTakesQ8ForItsFlashKernelsHeads()
+    {
+        using var allocator = new CudaAllocator();
+        using var executor = new CudaGraphExecutor(allocator);
+        Assert.True(allocator.FlashPrefillKernels is { } flash && flash.RunsAttentionQ8(256),
+            "the loaded tensorsharp_flash_prefill module carries sm_80 code but runs no q8_0 attention (a stale image?)");
+        Assert.True(executor.TakesKvCacheFormat(GraphFormat.Q8_0, 256, 256));
+        Assert.True(executor.TakesKvCacheFormat(GraphFormat.Q8_0, 128, 128));
         Assert.True(executor.AttendsCapacityWindows(256, GraphFormat.Q8_0));
     }
 
-    /// <summary>On direct CUDA a q8_0 Qwen 3.5 runs as graphs; q4_0 keeps it off them, and so does q8_0 for a model with QSA
-    /// layers (their indexer cache and selection kernels read F16).</summary>
+    /// <summary>On direct CUDA q4_0 keeps a model off whole-forward graphs, and q8_0 does where the flash kernels cannot run it,
+    /// saying so.</summary>
     [CudaFact]
+    public void DirectCudaGraphsRefuseQ4AndQ8WithoutItsKernels()
+    {
+        string dense = new Qwen35DenseSyntheticModelBuilder { Layers = 4 }.Write(Path.Combine(_dir, "q35.gguf"));
+        using (KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q4_0))
+        using (var model = new Qwen35RuntimeModel(dense, BackendType.Cuda))
+            Assert.Equal("KV dtype Q4_0 on this backend's executor", model.GraphRefusalForTests);
+        bool runs;
+        using (var allocator = new CudaAllocator())
+            runs = allocator.FlashPrefillKernels is { } flash && flash.RunsAttentionQ8(Qwen35DenseSyntheticModelBuilder.HeadDim);
+        using (KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0))
+        using (var model = new Qwen35RuntimeModel(dense, BackendType.Cuda))
+            Assert.Equal(runs ? null : "KV dtype Q8_0 on this backend's executor", model.GraphRefusalForTests);
+    }
+
+    /// <summary>On direct CUDA with its flash kernels' sm_80 code a q8_0 Qwen 3.5 runs as graphs; q8_0 keeps a model with QSA
+    /// layers off them (their indexer cache and selection kernels read F16). Where the loaded module has no such code the gate
+    /// skips it.</summary>
+    [CudaFact(TensorCoreModule = "tensorsharp_flash_prefill")]
     public void DirectCudaGraphsTakeQ8ForPlainAttentionFamilies()
     {
         string dense = new Qwen35DenseSyntheticModelBuilder { Layers = 4 }.Write(Path.Combine(_dir, "q35.gguf"));
         using (KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0))
         using (var model = new Qwen35RuntimeModel(dense, BackendType.Cuda))
             Assert.Null(model.GraphRefusalForTests);
-        using (KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q4_0))
-        using (var model = new Qwen35RuntimeModel(dense, BackendType.Cuda))
-            Assert.Equal("KV dtype Q4_0 on this backend's executor", model.GraphRefusalForTests);
         string qsa = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e.gguf"), indexerTopK: 8, qsa: true);
         using (KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0))
         using (var model = new Qwen4ExpRuntimeModel(qsa, BackendType.Cuda))

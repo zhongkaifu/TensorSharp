@@ -116,7 +116,10 @@ public sealed class CudaQ8KvCacheTests
 
     private static IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
 
-    [CudaTheory]
+    /// <summary>The _q8 flash kernels against the F16 ones over the dequantized cache. Their bodies are sm_80 code: where the
+    /// module this process loads has none (the committed compute_75 PTX of a build without nvcc, an nvcc build for an sm_7x GPU)
+    /// the gate skips the test, and a module that has them must run them (a stale image fails here).</summary>
+    [CudaTheory(TensorCoreModule = "tensorsharp_flash_prefill")]
     [InlineData("decode", 256, 24, 4, 1, 3700, 0)]             // Qwen3.8-27B's heads, a decode row over a long window
     [InlineData("decode", 128, 16, 2, 1, 2100, 33)]            // 128-wide heads (8-byte rows), keys below a floor
     [InlineData("decode-recorded", 256, 24, 4, 1, 1030, 0)]    // the length read on the device, the launch over the capacity
@@ -132,12 +135,9 @@ public sealed class CudaQ8KvCacheTests
     {
         using var allocator = new CudaAllocator();
         CudaFlashPrefillKernels flash = allocator.FlashPrefillKernels;
-        if (flash == null || !flash.RunsAttentionQ8(d))
-        {
-            // Reported as skipped by the caller's log: the kernels need an sm_80+ image.
-            _output.WriteLine("SKIPPED: no q8 flash attention for this GPU");
-            return;
-        }
+        Assert.True(flash != null && flash.RunsAttentionQ8(d),
+            $"the loaded tensorsharp_flash_prefill module carries sm_80 code but runs no q8_0 attention for {d}-wide heads " +
+            $"(current image: {flash?.IsCurrent.ToString() ?? "none loaded"})");
         allocator.Context.MakeCurrent();
         Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels graph, out string reason), reason);
         using (graph)
