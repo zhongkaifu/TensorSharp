@@ -48,6 +48,25 @@ name their projector `mmproj-F16.gguf`, so they must not share a directory):
 > and are ignored at inference). On sm_120 GPUs prefill uses ggml-cuda's
 > native block-scaled FP4 tensor-core path.
 
+> **NVFP4 prompt rows are W4A4.** On the FP4 tensor cores (`--backend cuda` in
+> an sm_120a / sm_121a build, and ggml-cuda on Blackwell) a step of more than 16
+> rows - a prompt chunk - quantizes its activations to NVFP4 as well, while
+> decode steps and verify windows keep 8-bit activations. Prompt rows therefore
+> predict worse than decode rows: on 8K windows of Qwen3.8-27B NVFP4 the prompt
+> rows' mean NLL is 0.12 nats above the decode rows' on the same tokens for
+> English prose (top-1 agreement 85%) and 0.005 for C# code. With 8-bit
+> activations on the prompt rows, or with the Q6_K file, the two paths agree
+> within 0.002. `--backend ggml_cuda` (+0.13 / +0.01), llama.cpp
+> (`llama-perplexity` 7.36 at `-ub 512` against 6.65 at `-ub 8`, Q6_K 5.60 at
+> both) and the removed direct engine show the same gap. A request feels it in
+> its first generated token, which comes from a prompt row, and slightly in its
+> first few dozen decode rows. Running the prompt's last token as a one-row step
+> of its own does not recover it: the cost is in the context the prompt rows
+> built. It is a property of the format, not of a backend.
+> Prefer a Q6_K / Q4_K file where prompt-side precision matters more than
+> prefill speed. Measured with `eng/LongContextQualityProbe` (`--arms
+> default,q8act`) on an RTX PRO 4500, 2026-11.
+
 The conversion cards identify the corresponding official Qwen repositories as
 their base models; those upstream cards declare Apache-2.0.
 
