@@ -48,10 +48,12 @@ name their projector `mmproj-F16.gguf`, so they must not share a directory):
 > and are ignored at inference). On sm_120 GPUs prefill uses ggml-cuda's
 > native block-scaled FP4 tensor-core path.
 
-> **NVFP4 prompt rows are W4A4.** On the FP4 tensor cores (`--backend cuda` in
-> an sm_120a / sm_121a build, and ggml-cuda on Blackwell) a step of more than 16
-> rows - a prompt chunk - quantizes its activations to NVFP4 as well, while
-> decode steps and verify windows keep 8-bit activations. Prompt rows therefore
+> **NVFP4 prompt rows are W4A4.** On the FP4 tensor cores a product of more
+> rows than the 8-bit matvec takes quantizes its activations to NVFP4 as well:
+> on `--backend cuda` (an sm_120a / sm_121a build) more than 16 rows, or more
+> than 8 in a step of several sequences; on ggml-cuda on Blackwell more than 8
+> rows. A prompt chunk is such a product. A decode step keeps 8-bit
+> activations, and so does a verify window within those limits. Prompt rows therefore
 > predict worse than decode rows: on 8K windows of Qwen3.8-27B NVFP4 the prompt
 > rows' mean NLL is 0.12 nats above the decode rows' on the same tokens for
 > English prose (top-1 agreement 85%) and 0.005 for C# code. With 8-bit
@@ -62,8 +64,9 @@ name their projector `mmproj-F16.gguf`, so they must not share a directory):
 > its first generated token, which comes from a prompt row, and slightly in its
 > first few dozen decode rows. Running the prompt's last token as a one-row step
 > of its own does not recover it: the cost is in the context the prompt rows
-> built. It is a property of the format, not of a backend.
-> Prefer a Q6_K / Q4_K file where prompt-side precision matters more than
+> built. The cost comes from the W4A4 kernels these prompt paths run, not from
+> the NVFP4 weights alone: the same prompt rows with 8-bit activations show no
+> gap. Prefer the Q6_K file where prompt-side precision matters more than
 > prefill speed. Measured with `eng/LongContextQualityProbe` (`--arms
 > default,q8act`) on an RTX PRO 4500, 2026-11.
 
