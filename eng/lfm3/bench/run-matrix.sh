@@ -14,10 +14,13 @@
 #                       and llama.cpp's best prompt count on an M5 Pro)
 #     CPU_DEPTHS        decode depths (default 0,4096; BF16 0); CPU_DEEP_QUANTS / CPU_DEEP_DEPTH one more decode run
 #                       per listed quant at that depth (default Q4_K_M / 16384, one rep)
+#     CPU_TG_REPS       decode repeats inside a run (default 5: odd, so each side's median is one of its runs; with 2,
+#                       the median is the mean of two, and a run that is slow for its own reasons moves it by half)
 #     CPU_THREADS       an equal-thread decode count (default 12, the CPU baseline's): TensorSharp decodes at its
 #                       defaults and at CPU_THREADS, llama.cpp at CPU_THREADS and at CPU_WIDE_THREADS (default
 #                       hw.physicalcpu - 2: ggml_cpu's decode-pool default on a hybrid Mac, and llama.cpp's best decode
-#                       count on an M5 Pro: 16-17 threads beat 12 by 6-12 % (BF16 27 %), 14 by 2-4 %, and 18 collapses)
+#                       count on an M5 Pro: 16-17 threads beat 12 by 4-12 % (BF16 and the 16K depth by 27 %) and 14
+#                       by 2-3 %, and 18 is about 8 % slower than 16)
 #     LLAMA_CPU_BUILD   llama.cpp's Accelerate BLAS CPU build (default build-cpu), LLAMA_CPU_NOBLAS its ggml-cpu-alone
 #                       build (default build-cpu-noblas; never the Metal build, which can still run ops on the GPU)
 #     BASE_PROBE        optional: another build's Lfm3Probe.dll, added as before arms (prompt pp512,pp2048 at
@@ -48,6 +51,7 @@ CPU_PP_BF16=${CPU_PP_BF16:-128,512,2048}
 CPU_DEPTHS=${CPU_DEPTHS:-0,4096}
 CPU_DEEP_QUANTS=${CPU_DEEP_QUANTS-Q4_K_M}
 CPU_DEEP_DEPTH=${CPU_DEEP_DEPTH:-16384}
+CPU_TG_REPS=${CPU_TG_REPS:-5}
 physical=$(sysctl -n hw.physicalcpu 2>/dev/null || nproc)
 CPU_PROMPT_THREADS=${CPU_PROMPT_THREADS:-$physical}
 CPU_THREADS=${CPU_THREADS:-12}
@@ -97,7 +101,7 @@ for s in $sections; do
           "ts-cpu-base=PROBE=$BASE_PROBE MAX_CONTEXT=1024 $here/ts-bench.sh $g cpu 512 0 0 --reps 1 --threads $pt")
         python3 "$here/ab.py" --rounds "$ROUNDS" --quiet 12 --log "$out/cpu-$q-pp" --json "$out/cpu-$q-pp.json" "${arms[@]}" \
           | tee "$out/cpu-$q-pp.md"
-        runs=("$d:2"); [[ " $CPU_DEEP_QUANTS " == *" $q "* ]] && runs+=("$CPU_DEEP_DEPTH:1")
+        runs=("$d:$CPU_TG_REPS"); [[ " $CPU_DEEP_QUANTS " == *" $q "* ]] && runs+=("$CPU_DEEP_DEPTH:1")
         for run in "${runs[@]}"; do
           dd=${run%%:*}; reps=${run##*:}; c=$(( ${dd##*,} + 1024 ))
           arms=("ts-ggml_cpu=MAX_CONTEXT=$c $here/ts-bench.sh $g ggml_cpu - 128 $dd --reps $reps"

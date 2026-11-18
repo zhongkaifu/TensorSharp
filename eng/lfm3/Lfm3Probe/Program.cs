@@ -10,10 +10,13 @@
 //   tokens MODEL FILE OUT                  the file's token ids as llama-perplexity tokenizes it (one id a line)
 //   bench  MODEL BACKEND [PP,...|-] [TG] [DEPTH,...] [--reps N] [--greedy]
 //                                          prefill tokens/s of each PP-token prompt and decode tokens/s of TG tokens after
-//                                          DEPTH tokens (llama-bench's pp / tg / tg@d), each the median of N runs (3), with
-//                                          the decode steps' graph counters (runs, advances in place, builds). As llama-bench,
-//                                          decode feeds pseudo-random tokens (the timed loop holds no sampling); --greedy feeds
-//                                          each step's host argmax instead. A "RESULT name median min max" line per test.
+//                                          DEPTH tokens (llama-bench's pp / tg / tg@d), each the median of N runs (3; the mean
+//                                          of the middle two for an even N, as llama-bench's statistic), with the decode steps'
+//                                          graph counters (runs, advances in place, builds). Each test is warmed by one untimed
+//                                          run as llama-bench warms its tests (a decode test: TG tokens after a 1-token prompt,
+//                                          so the managed lane's JIT has tiered the decode kernels up). As llama-bench, decode
+//                                          feeds pseudo-random tokens (the timed loop holds no sampling); --greedy feeds each
+//                                          step's host argmax instead. A "RESULT name median min max" line per test.
 //   spec   MODEL BACKEND FILE N            N greedy tokens after the file's prompt, plainly and with n-gram speculation (a verify
 //                                          window keeps the short-conv inputs and attends under the sliding window; the accept
 //                                          count commits a prefix): the two streams must be equal
@@ -151,7 +154,13 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     var runtime = model as StandardDecoderModel;
     int vocab = model.Config.VocabSize;
     int[] Tokens(int n, int seed) => Enumerable.Range(0, n).Select(i => 1000 + (int)((uint)(i * 2654435761u + seed) % 60000u)).ToArray();
-    static double Median(List<double> v) { v.Sort(); return v[v.Count / 2]; }
+    // The true median: the mean of the middle two for an even count (llama-bench-result.sh's statistics.median). Taking
+    // the upper one made a 2-rep figure the faster run, while llama.cpp's was the mean of its two.
+    static double Median(List<double> v)
+    {
+        v.Sort();
+        return v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2;
+    }
 
     // Warm: kernels load and graphs build once.
     model.ResetKVCache();
@@ -178,6 +187,13 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     }
     foreach (int depth in generate > 0 ? depths : Array.Empty<int>())
     {
+        // One untimed decode run first, as llama-bench warms every test (with one token: its kernels are compiled ahead
+        // of time). The managed lane's decode kernels are still being tiered up by the JIT after the start-up warm-up's
+        // 8 tokens, and its first timed run was 25-35 % slower than the rest. At depth 0, so a deep test does not pay
+        // its prompt twice.
+        model.ResetKVCache();
+        model.ForwardRefill(new[] { 1 });
+        foreach (int token in Tokens(generate, 9)) model.Forward(new[] { token });
         var rates = new List<double>();
         int runs0 = runtime?.GraphRuns ?? 0, advances0 = runtime?.DecodeAdvances ?? 0, builds0 = runtime?.GraphBuilds ?? 0;
         for (int rep = 0; rep < reps; rep++)

@@ -17,7 +17,8 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   ggml-cpu alone), prompts of 128-8192 tokens with every engine on all physical cores (both TensorSharp lanes' default
   and llama.cpp's best prompt count), tg128 at depths 0 and 4K (16K for Q4_K_M) with TensorSharp at its defaults and at
   `CPU_THREADS` (12) and llama.cpp at 12 and at `CPU_WIDE_THREADS` (16: ggml_cpu's decode width and llama.cpp's best
-  decode count here; 12 is 6-12 % slower), each pass `ab.py --quiet 12`; `BASE_PROBE` adds an older build as before
+  decode count here; 12 is 4-11 % slower at depth 0 and 4K, 21 % on BF16 and at 16K), 5 decode reps an arm
+  (`CPU_TG_REPS`, odd so each median is one run), each pass `ab.py --quiet 12`; `BASE_PROBE` adds an older build as before
   arms. `cpu-serve` measures TTFT and 1 / 4 streams through both servers against llama-server, `cpu-omni` the LFM3-Omni
   vision and audio encoders and streaming speech on both lanes against llama.cpp's CPU build. Results under
   `artifacts/lfm3/bench/<stamp>/`, one markdown table per section plus the raw logs and `conditions.txt` (load
@@ -35,7 +36,10 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   the same size as llama-bench warms each test (a size's first step builds its graphs). The managed lane's kernels keep
   being tiered up by the JIT over its first few prompts of a size, so its short prompts need more than 3 reps for a
   steady-state figure (LFM3 Q8_0 pp128 on an M5 Pro: 660-918 tok/s over 3 reps, 826-957 over 10). tgN@dD decodes N
-  pseudo-random tokens after a D-token prompt (no sampling in the timed loop). It also prints the K/V footprint (bytes
+  pseudo-random tokens after a D-token prompt (no sampling in the timed loop), after one untimed run of N tokens at
+  depth 0 (llama-bench warms each test with one token; the managed lane's first decode run was 25-35 % slower than the
+  rest while the JIT tiered its kernels up). Each figure is the median of `--reps` runs, the mean of the middle two for
+  an even count, as `llama-bench-result.sh` computes llama.cpp's. It also prints the K/V footprint (bytes
   a token and the sliding-window rings). `MAX_CONTEXT` must cover the deepest test. `--threads N` runs the CPU lanes on
   N threads as `llama-bench -t N` does: `TS_GGML_CPU_THREADS` (ggml_cpu's prompt and decode pools; defaults every
   physical core for prompts and every physical core but two for decode on a hybrid Mac), `TS_CPU_THREADS` (the
