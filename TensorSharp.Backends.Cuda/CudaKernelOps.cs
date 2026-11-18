@@ -61,9 +61,10 @@ namespace TensorSharp.Cuda
         // Below this live window the single-block kernel's lower fixed overhead
         // (no partial scratch + reduce pass) wins over partitioning.
         private const int Group4RingPartitionMinTokens = 128;
-        // Keep the ring partition grid bounded if a model ever runs a large
-        // circular cache through this route.
-        private const int Group4RingMaxPartitions = 64;
+        // The group-4 partition grids stay bounded at this many partitions: past
+        // 64 x the base size the partitions grow with the live length
+        // (GqaLivePartitionSize; TS_GQA_LIVE_PARTITIONS in tensorsharp_kernels.cu).
+        private const int GqaLivePartitions = 64;
         // A/B-tunable because the crossover depends on head width, context and
         // GPU SM count. On the RTX 3080 report system, partitioning from 512
         // tokens keeps the small-KV-head Gemma/Qwen grids populated and improved
@@ -1875,6 +1876,40 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>
+        /// The keys each partition of a partitioned group-4 decode attention takes, from the length it attends:
+        /// max(<paramref name="basePartition"/>, ceil(len / 64)) rounded up to 32. The kernels apply the same rule
+        /// (ts_gqa_live_partition_size) to the length a recorded launch reads on the device, so a row is split the same way
+        /// in a cache of any capacity, recorded or not. A length up to 64 x the base keeps the base size; past it there are
+        /// at most 64 partitions.
+        /// </summary>
+        internal static int GqaLivePartitionSize(int len, int basePartition)
+        {
+            int size = Math.Max(basePartition, (Math.Max(0, len) + GqaLivePartitions - 1) / GqaLivePartitions);
+            return (size + 31) & ~31;
+        }
+
+        /// <summary>The partitions a recorded launch over a cache of <paramref name="cacheSize"/> cells holds: the most any
+        /// length up to it takes under <see cref="GqaLivePartitionSize"/>. The ones past the live length write empty rows
+        /// the reduce skips.</summary>
+        internal static int GqaLivePartitionGrid(int cacheSize, int basePartition)
+            => Math.Max(1, Math.Min(GqaLivePartitions, (cacheSize + basePartition - 1) / basePartition));
+
+        private static int capacityPartitionsWarned;
+
+        /// <summary>A kernel module without live-length partitions (an older tensorsharp_kernels PTX) splits a recorded row
+        /// by the room its launcher passes, the capacity's partitioning: say so once.</summary>
+        private static void WarnIfCapacityPartitions(CudaKernels kernels)
+        {
+            if (kernels.GqaLivePartitions || System.Threading.Interlocked.Exchange(ref capacityPartitionsWarned, 1) != 0)
+                return;
+            Console.Error.WriteLine(
+                "WARNING: [cuda] the loaded tensorsharp_kernels module predates live-length decode partitions, so a recorded " +
+                "group-4 decode attention row splits its keys by its KV cache's capacity: the same request can round differently " +
+                "in slots of different capacities. Rebuild TensorSharp.Backends.Cuda (or redeploy cuda_kernels/tensorsharp_kernels.ptx) " +
+                "to remove this. Reported once.");
+        }
+
         internal static bool TryLaunchPartitionedGqaDecodeAttention(
             CudaKernels kernels,
             CudaAllocator allocator,
@@ -1927,12 +1962,15 @@ namespace TensorSharp.Cuda
                 int ringLen = Math.Min(attendLen, cacheSize);
                 if (dyn == IntPtr.Zero && ringLen <= Group4RingPartitionMinTokens)
                     return false;
-                int ringPartSize = Math.Max(
-                    Group4RingPartitionSize,
-                    (cacheSize + Group4RingMaxPartitions - 1) / Group4RingMaxPartitions);
-                ringPartSize = (ringPartSize + 31) & ~31;
-                int coveredLen = dyn != IntPtr.Zero ? cacheSize : ringLen;
-                int ringParts = (coveredLen + ringPartSize - 1) / ringPartSize;
+                // Partitions follow the live length, not the capacity, so a row rounds the same in a cache of any capacity,
+                // recorded or not (a slot's capacity depends on its request's history). A recorded launch reads the length
+                // on the device: its grid and shared memory hold the largest partitioning a length up to the capacity takes.
+                if (dyn != IntPtr.Zero)
+                    WarnIfCapacityPartitions(kernels);
+                int ringPartSize = GqaLivePartitionSize(dyn != IntPtr.Zero ? cacheSize : ringLen, Group4RingPartitionSize);
+                int ringParts = dyn != IntPtr.Zero
+                    ? GqaLivePartitionGrid(cacheSize, Group4RingPartitionSize)
+                    : (ringLen + ringPartSize - 1) / ringPartSize;
                 using var ringPartial = new Tensor(
                     allocator, DType.Float32, numQHeads, ringParts, headDim + 2);
                 if (!TryGetContiguousFloat(ringPartial, out _, out IntPtr ringPartialPtr, out _))
@@ -1951,7 +1989,8 @@ namespace TensorSharp.Cuda
                     ringParts,
                     ringPartSize,
                     allocator.Stream.Handle,
-                    dyn);
+                    dyn,
+                    Group4RingPartitionSize);
                 kernels.LaunchGqaDecodeAttentionPartitionReduceF32(
                     ringPartialPtr,
                     resultPtr,
@@ -1975,15 +2014,6 @@ namespace TensorSharp.Cuda
             int partitionSize = useGroup4D512
                 ? Group4DecodeAttentionPartitionSize
                 : DecodeAttentionPartitionSize;
-            if (useGroup4D512 && dyn != IntPtr.Zero)
-            {
-                // Keep the capacity-sized capture grid bounded: empty partitions
-                // still write their partial rows and the reduce still reads them,
-                // so a huge KV capacity must not explode the partition count.
-                int minSize = (cacheSize + Group4RingMaxPartitions - 1) / Group4RingMaxPartitions;
-                partitionSize = Math.Max(partitionSize, (minSize + 31) & ~31);
-            }
-
             // Decode-graph capture: the partition grid and scratch are baked into
             // the graph, so size them for the cache CAPACITY and let the kernels
             // read the live attend_len from the dyn block. Partitions past the
@@ -1992,6 +2022,20 @@ namespace TensorSharp.Cuda
             int numPartitions = dyn != IntPtr.Zero
                 ? (cacheSize + partitionSize - 1) / partitionSize
                 : (attendLen + partitionSize - 1) / partitionSize;
+            int livePartitionBase = 0;
+            if (useGroup4D512 && dyn != IntPtr.Zero)
+            {
+                // Keep the capacity-sized capture grid bounded (empty partitions
+                // still write their partial rows and the reduce still reads them):
+                // the kernel sizes the partitions from the live length it reads, as
+                // the d=256 ring route does, and the grid and shared memory hold the
+                // largest partitioning a length up to the capacity takes. Sized from
+                // the capacity, a recorded row's rounding followed its slot's capacity.
+                WarnIfCapacityPartitions(kernels);
+                livePartitionBase = Group4DecodeAttentionPartitionSize;
+                partitionSize = GqaLivePartitionSize(cacheSize, livePartitionBase);
+                numPartitions = GqaLivePartitionGrid(cacheSize, livePartitionBase);
+            }
             using var partial = new Tensor(allocator, DType.Float32, numQHeads, numPartitions, headDim + 2);
             if (!TryGetContiguousFloat(partial, out _, out IntPtr partialPtr, out _))
                 return false;
@@ -2011,7 +2055,8 @@ namespace TensorSharp.Cuda
                     numPartitions,
                     partitionSize,
                     allocator.Stream.Handle,
-                    dyn);
+                    dyn,
+                    livePartitionBase);
             }
             else if (keyIsHalf)
             {
