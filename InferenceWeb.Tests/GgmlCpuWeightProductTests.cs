@@ -245,7 +245,7 @@ public sealed class GgmlCpuWeightProductTests
     /// <summary>
     /// BF16 weights at every width (NEON rows below 64, Accelerate's sgemm from there), and NVFP4 weights from 256 rows
     /// where sgemm takes them, run TensorSharp's products over unrounded F32 activations: within F32 summation error of
-    /// the double-precision reference. Narrower NVFP4 products stay on ggml-cpu's own kernel (activations rounded to Q8_0).
+    /// the double-precision reference. Narrower NVFP4 products keep ggml-cpu's own arithmetic (activations rounded to Q8_0).
     /// </summary>
     [GgmlFact(BackendType.GgmlCpu)]
     public void FloatWeightProductsReadUnroundedActivations()
@@ -270,6 +270,41 @@ public sealed class GgmlCpuWeightProductTests
                     Assert.True(rel < tolerance, $"type {type} rows {n}: {rel:E2} from the reference (tolerance {tolerance:E0})");
                     Assert.True(block < tolerance, $"type {type} rows {n}: row block {block:E2} from the reference");
                 }
+        });
+    }
+
+    private static bool SameBits(float[] a, int aAt, float[] b, int bAt, int count)
+    {
+        for (int i = 0; i < count; i++)
+            if (BitConverter.SingleToInt32Bits(a[aAt + i]) != BitConverter.SingleToInt32Bits(b[bAt + i])) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// NVFP4 products of 2 to 255 rows run TensorSharp's GEMM over ggml's own Q8_0 activation rows with
+    /// ggml_vec_dot_nvfp4_q8_0's arithmetic: every row of a wide product has the bits ggml-cpu's product gives that row
+    /// alone (a one-row product is ggml's dot), for the whole weight and for a row block.
+    /// </summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void Nvfp4ProductsOfSeveralRowsHaveEachRowsOwnBits()
+    {
+        WithCpuBackend(() =>
+        {
+            var rng = new Random(13);
+            foreach (int n in new[] { 2, 3, 4, 5, 8, 37, 255 })
+            {
+                using var native = new Native();
+                byte[] bytes = RandomWeight(40, rng);
+                IntPtr w = native.Copy(bytes);
+                float[] x = Activations(n, rng);
+                float[][] wide = Run(40, w, bytes.Length, native.Copy(x), n, new[] { (0, M), (16, 32) }, null, native);
+                foreach (int j in n <= 8 ? System.Linq.Enumerable.Range(0, n) : new[] { 0, 1, n / 2, n - 1 })
+                {
+                    float[][] one = Run(40, w, bytes.Length, native.Copy(x.AsSpan(j * K, K).ToArray()), 1, new[] { (0, M), (16, 32) }, null, native);
+                    Assert.True(SameBits(wide[0], j * M, one[0], 0, M), $"rows {n}: row {j} of the whole weight's product");
+                    Assert.True(SameBits(wide[1], j * 32, one[1], 0, 32), $"rows {n}: row {j} of the row block's product");
+                }
+            }
         });
     }
 }
