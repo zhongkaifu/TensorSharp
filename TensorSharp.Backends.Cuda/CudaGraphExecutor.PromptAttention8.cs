@@ -17,8 +17,11 @@ namespace TensorSharp.Cuda
     /// </summary>
     public sealed partial class CudaGraphExecutor
     {
-        /// <summary>Whether marked prompt chunks attend in 8 bits where the image carries the kernels: not yet (the 16-bit
-        /// kernels, bit for bit as before), until its quality on long contexts is measured.</summary>
+        /// <summary>Whether marked prompt chunks attend in 8 bits where the image carries the kernels: no (the 16-bit kernels,
+        /// bit for bit as before). Its pre-registered quality gates (design t2-attn8 sec. 12.3) failed on Qwen3.8-27B NVFP4
+        /// (2026-11-18, RTX PRO 4500): a few long C# code windows moved more than they allow (with q8 activations on the prompt
+        /// rows of both arms, +0.8% PPL at 64K keys and +18% on a 96K window), although ggml_cuda's own arithmetic moved the
+        /// same windows further; prose and long-context retrieval did not move.</summary>
         private const bool PromptAttention8Default = false;
 
         /// <summary>Tests and the eng probe: null keeps the default; true asks for the 8-bit prompt attention wherever it runs,
@@ -91,14 +94,36 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>Room for a band of <paramref name="bytes"/>: a cached block of its size, or the driver's free memory past the
-        /// band and the reserve. Never the pool's reclaim (a refused band falls back without allocating).</summary>
+        /// band and the reserve once the pool has given back as many of its idle large blocks as that needs
+        /// (<see cref="BandTrimBytes"/>). A server near the device's edge keeps its room there: the slots and retained
+        /// conversations the model released for a long prompt (its EnsureDeviceRoom counts the pool's cached blocks as free)
+        /// wait in the pool's cache, so the driver alone had no room for even a 32 MB band beside a 47K-token prompt of
+        /// Qwen3.8-27B with DFlash2 on a 32 GB card. Never the out-of-memory ladder (no GC, no drain): a band that still has no
+        /// room falls back without allocating.</summary>
         private bool BandHasRoom(CudaAllocator cuda, long bytes)
         {
+            bool seam = Attn8BandHeadroomForTests != null;
             long headroom = Attn8BandHeadroomForTests ?? Attn8BandHeadroomBytes;
-            if (Attn8BandHeadroomForTests == null && cuda.HasCachedBlock(bytes))
-                return true;
+            long trim = BandTrimBytes(!seam && cuda.HasCachedBlock(bytes), cuda.FreeDeviceBytes(), seam ? 0 : cuda.ReclaimableBytes, bytes, headroom);
+            if (trim <= 0)
+                return trim == 0;
+            cuda.TrimLargeCache(trim, keepBlockBytes: cuda.AllocationBlockBytes(bytes));
             long free = cuda.FreeDeviceBytes();
             return free >= bytes && free - bytes >= headroom;
+        }
+
+        /// <summary>
+        /// What a band of <paramref name="bytes"/> needs from the pool's idle large blocks (<paramref name="reclaimable"/>, none
+        /// of the band's own size when <paramref name="cachedOfItsSize"/> is false): 0 when it has room as things are (a cached
+        /// block of its size, or <paramref name="driverFree"/> past the band and <paramref name="headroom"/>), the bytes to give
+        /// back when those blocks make the room, -1 when even all of them would not.
+        /// </summary>
+        internal static long BandTrimBytes(bool cachedOfItsSize, long driverFree, long reclaimable, long bytes, long headroom)
+        {
+            if (cachedOfItsSize || (driverFree >= bytes && driverFree - bytes >= headroom))
+                return 0;
+            long shortfall = headroom > long.MaxValue - bytes - Math.Max(0, -driverFree) ? long.MaxValue : bytes + headroom - driverFree;
+            return reclaimable >= shortfall ? shortfall : -1;
         }
 
         private void CheckPromptAttention8(Action<long, double, double> check, Tensor qc, Tensor kc, Tensor vc, int cap, int nq, int len,

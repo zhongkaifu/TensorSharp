@@ -22,7 +22,7 @@ namespace InferenceWeb.Tests;
 /// image (skipped elsewhere), over a synthetic Qwen 3.5 dense trunk with an F16 cache: a marked prompt chunk takes it (the
 /// logits near the 16-bit run's), verify windows, decode rows and plain forwards never do (a verify row still the decode row
 /// at its position, bit for bit), speculation over 8-bit prompts emits plain greedy decoding's stream, a band without device
-/// room keeps the 16-bit kernel's bits, and the path is off by default.
+/// room keeps the 16-bit kernel's bits (and takes the pool's idle blocks before it is refused), and the path is off by default.
 /// </summary>
 public sealed class CudaPromptAttention8ExecutorTests : IDisposable
 {
@@ -212,5 +212,21 @@ public sealed class CudaPromptAttention8ExecutorTests : IDisposable
             Assert.Equal(0, executor.PromptAttention8Launches);
             Assert.True(((TensorSharp.Graph.TensorGraphExecutor)executor).PromptChunkAttentions > 0, "the prompt was not marked");
         }
+    }
+
+    /// <summary>The band's room: a cached block of its size, or the driver's free memory past the band and the reserve, made
+    /// where the pool's idle large blocks can make it (only the shortfall given back), refused where even all of them could
+    /// not; a reserve of long.MaxValue (the tests' refusal seam) refuses without overflowing.</summary>
+    [Fact]
+    public void TheBandTakesThePoolsIdleBlocksBeforeItIsRefused()
+    {
+        const long MB = 1L << 20;
+        Assert.Equal(0, CudaGraphExecutor.BandTrimBytes(true, 0, 0, 100 * MB, 512 * MB));
+        Assert.Equal(0, CudaGraphExecutor.BandTrimBytes(false, 612 * MB, 0, 100 * MB, 512 * MB));
+        Assert.Equal(1 * MB, CudaGraphExecutor.BandTrimBytes(false, 611 * MB, 1 * MB, 100 * MB, 512 * MB));
+        Assert.Equal(400 * MB, CudaGraphExecutor.BandTrimBytes(false, 212 * MB, 2048 * MB, 100 * MB, 512 * MB));
+        Assert.Equal(-1, CudaGraphExecutor.BandTrimBytes(false, 212 * MB, 399 * MB, 100 * MB, 512 * MB));
+        Assert.Equal(-1, CudaGraphExecutor.BandTrimBytes(false, 30_000 * MB, long.MaxValue / 2, 100 * MB, long.MaxValue));
+        Assert.Equal(-1, CudaGraphExecutor.BandTrimBytes(false, 0, 0, 100 * MB, 512 * MB));
     }
 }

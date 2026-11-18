@@ -39,8 +39,11 @@ namespace TensorSharp.Cuda
         public const int Attn8HeadDim = 256, Attn8MinKeys = 1024;
 
         /// <summary>The fewest prompt rows the 8-bit attention takes: below them the band (converted once per layer whatever
-        /// the rows) costs more than the rows save. Provisional until measured per architecture (an RTX PRO 4500 row sweep).</summary>
-        public const int Attn8MinRows = 256;
+        /// the rows) costs more than the rows save. Measured on an RTX PRO 4500 (sm_120, eng/PromptAttentionProbe's row sweep
+        /// over 8K-64K keys and groups of 4 and 6): from 128 rows the 8-bit pair with its band beats the 16-bit kernel in every
+        /// cell (1.19x at the worst), at 64 rows it loses past 32K keys (0.91x). sm_121 (GB10) takes sm_120's value until it is
+        /// measured there. Fixed per architecture, never chosen by timing at run time.</summary>
+        public const int Attn8MinRows = 128;
 
         /// <summary>The band is sized in quanta of this many keys (the direct engine's Attn8BandStepKeys), so the pool's cached
         /// block of one quantum serves every layer and chunk whose keys it holds.</summary>
