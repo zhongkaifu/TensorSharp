@@ -1204,12 +1204,19 @@ CUDA-only.
 
 #### Q8_0 KV cache on the direct engine, 2026-11-08
 
-`q8_0` is the KV cache of `--backend cuda` unless `--kv-cache-dtype` names another (`f16` keeps F16). The 12
-attention layers keep K and V as int8 codes with
-one F16 scale per 32 values (ggml's Q8_0 arithmetic; codes and scales stored apart so a lane reads its 8 codes in one
-load), half the F16 cache's bytes. The planner gives the freed VRAM to expert slots. `q4_0` falls back to F16 with a
-line on stderr. Against the F16 cache the synthetic fixture's logits move by 3.7e-3 to 4.8e-3 (relative), and a
-verify window over the Q8_0 cache answers exactly as a plain decode on that cache.
+On the direct engine, `q8_0` was the KV cache of `--backend cuda` unless `--kv-cache-dtype` named another (`f16`
+kept F16). The 12 attention layers kept K and V as int8 codes with
+one F16 scale per 32 values (ggml's Q8_0 arithmetic; codes and scales stored apart so a lane read its 8 codes in one
+load), half the F16 cache's bytes. The planner gave the freed VRAM to expert slots. `q4_0` fell back to F16 with a
+line on stderr. Against the F16 cache the synthetic fixture's logits moved by 3.7e-3 to 4.8e-3 (relative), and a
+verify window over the Q8_0 cache answered exactly as a plain decode on that cache.
+
+> That engine was removed with #371, and its `q8_0` default with it. The runtime that serves `--backend cuda` now keeps
+> an F16 cache for Flash Next unless `--kv-cache-dtype` names another. On the CUDA executor the QSA layers' indexer keys,
+> QSA selection and sparse attention read F16 caches only, so an explicit `--kv-cache-dtype q8_0` takes a model with QSA
+> layers off whole-forward graphs: it runs per-op, and its first step prints
+> `qwen4exp: per-op execution (KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor)`. That path
+> has not been measured on a GPU; keep `f16` for Flash Next on `--backend cuda`.
 
 Same session, RTX 5090, `Q2_0`, `TS_Q4E_HC_Q8=1`, MTP with Q2_0 draft experts, `TS_MOE_TIER_ADAPT=1`, 131K context:
 
