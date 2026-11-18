@@ -2007,7 +2007,9 @@ namespace TensorSharp.Server
         /// What a client received for <paramref name="rawText"/>: the family's output
         /// parser run over it the way the protocol adapters and the Web UI run it
         /// (thinking mode, tools, the prompt's open channel), plus the raw text for a
-        /// client that runs no parser. A parser failure leaves the raw text as content.
+        /// client that runs no parser. When reasoning was told apart with thinking off, the
+        /// content an append-only stream sent instead (<see cref="EmittedAssistantTurn.StreamedContent"/>:
+        /// LFM3 streams such a reply as generated). A parser failure leaves the raw text as content.
         /// </summary>
         internal static EmittedAssistantTurn BuildEmittedTurn(
             string arch, string rawText, bool enableThinking, List<ToolFunction> tools,
@@ -2016,12 +2018,18 @@ namespace TensorSharp.Server
             rawText ??= string.Empty;
             try
             {
-                IOutputParser parser = OutputParserFactory.Create(arch);
-                parser.Init(enableThinking, tools);
-                parser.SetGenerationPromptSuffix(generationSuffix);
-                ParsedOutput parsed = parser.Add(rawText, true);
+                ParsedOutput parsed = ProtocolAdapters.ChatStreamCollector.ParseWhole(
+                    arch, rawText, enableThinking, tools, generationSuffix, asStreamed: false);
+                string streamedContent = null;
+                if (!enableThinking && !string.IsNullOrEmpty(parsed.Thinking))
+                {
+                    string streamed = ProtocolAdapters.ChatStreamCollector.ParseWhole(
+                        arch, rawText, enableThinking, tools, generationSuffix, asStreamed: true).Content ?? string.Empty;
+                    if (!string.Equals(streamed, parsed.Content ?? string.Empty, StringComparison.Ordinal))
+                        streamedContent = streamed;
+                }
                 return new EmittedAssistantTurn(parsed.Content ?? string.Empty, parsed.ToolCalls,
-                    parsed.Thinking, rawText, cancelled);
+                    parsed.Thinking, rawText, cancelled) { StreamedContent = streamedContent };
             }
             catch (Exception)
             {

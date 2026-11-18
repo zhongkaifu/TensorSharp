@@ -94,10 +94,26 @@ namespace TensorSharp.Server.ProtocolAdapters
                 };
             }
 
+            return ParseWhole(architecture, _raw.ToString(), enableThinking, tools, _generationSuffix, asStreamed: false);
+        }
+
+        /// <summary>
+        /// One whole reply through <paramref name="architecture"/>'s parser, primed with the
+        /// prompt's tail. <paramref name="asStreamed"/> parses it as an append-only API stream
+        /// of it does (<see cref="IOutputParser.StreamWithoutHolding"/>): for a family that
+        /// streams a thinking-off reply as generated (LFM3) the text before a stray
+        /// <c>&lt;/think&gt;</c> then stays in the content, as llama.cpp, vLLM and SGLang return
+        /// it. Every other family parses the same either way.
+        /// </summary>
+        internal static ParsedOutput ParseWhole(string architecture, string rawText, bool enableThinking,
+            List<ToolFunction>? tools, string? generationSuffix, bool asStreamed)
+        {
             var parser = OutputParserFactory.Create(architecture);
             parser.Init(enableThinking, tools);
-            parser.SetGenerationPromptSuffix(_generationSuffix);
-            return parser.Add(_raw.ToString(), true);
+            if (asStreamed)
+                parser.StreamWithoutHolding();
+            parser.SetGenerationPromptSuffix(generationSuffix);
+            return parser.Add(rawText ?? string.Empty, true);
         }
 
         /// <summary>

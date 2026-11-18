@@ -26,7 +26,17 @@ namespace TensorSharp.Server
         IReadOnlyList<ToolCall> ToolCalls,
         string Thinking,
         string RawText,
-        bool Cancelled);
+        bool Cancelled)
+    {
+        /// <summary>
+        /// The content an append-only API stream of this turn sent, when it differs from
+        /// <see cref="Content"/>; null otherwise. LFM3 streams a thinking-off reply that
+        /// reasons past the closed block as generated (<see cref="IOutputParser.StreamWithoutHolding"/>),
+        /// while a retracting page and a whole reply get the reasoning apart: the client's next
+        /// request sends back either form, the stream's prose before a tool call included.
+        /// </summary>
+        public string StreamedContent { get; init; }
+    }
 
     /// <summary>The render history <see cref="ConversationTranscriptStore.Augment"/> built,
     /// and the conversation it proved the request continues (null when none).</summary>
@@ -276,6 +286,7 @@ namespace TensorSharp.Server
             {
                 // The loop streamed every round's content AND reasoning to the client, so
                 // both are compared over all rounds.
+                string earlierRounds = emittedContent.ToString();
                 emittedContent.Append(emitted.Content);
                 emittedThinking.Append(emitted.Thinking);
                 emitted = emitted with
@@ -283,6 +294,7 @@ namespace TensorSharp.Server
                     Content = emittedContent.ToString(),
                     Thinking = emittedThinking.Length == 0 ? null : emittedThinking.ToString(),
                     RawText = null,
+                    StreamedContent = emitted.StreamedContent == null ? null : earlierRounds + emitted.StreamedContent,
                 };
             }
 
@@ -437,7 +449,23 @@ namespace TensorSharp.Server
                 return false;
 
             string clientContent = client.Content ?? string.Empty;
-            string emittedContent = emitted.Content ?? string.Empty;
+            if (ContentMatches(clientContent, emitted.Content ?? string.Empty, emitted, record))
+                return true;
+            // What an append-only stream sent (LFM3: a thinking-off reply that reasoned past the
+            // closed block, as generated) when the parse above kept the reasoning apart: a client
+            // sends back whichever it got.
+            if (emitted.StreamedContent != null
+                && ContentMatches(clientContent, emitted.StreamedContent, emitted, record))
+                return true;
+            return emitted.RawText != null
+                && string.Equals(clientContent, emitted.RawText, StringComparison.Ordinal);
+        }
+
+        /// <summary>Whether the client's assistant content is <paramref name="emittedContent"/>,
+        /// one form of what this turn sent it.</summary>
+        private static bool ContentMatches(string clientContent, string emittedContent,
+            EmittedAssistantTurn emitted, TurnRecord record)
+        {
             if (string.Equals(clientContent, emittedContent, StringComparison.Ordinal))
                 return true;
             // Parallel tool calls: the stream sends the newline between two calls as a content
@@ -455,9 +483,6 @@ namespace TensorSharp.Server
             // the shared prefix (agent loops on Qwen3.8: 0.27 s TTFT per round instead of 0.03 s).
             if (emitted.ToolCalls is { Count: > 0 }
                 && string.Equals(clientContent.TrimEnd(), emittedContent.TrimEnd(), StringComparison.Ordinal))
-                return true;
-            if (emitted.RawText != null
-                && string.Equals(clientContent, emitted.RawText, StringComparison.Ordinal))
                 return true;
 
             // A stopped turn: the client kept what streamed before the stop, which can be

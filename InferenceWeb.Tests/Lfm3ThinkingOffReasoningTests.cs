@@ -7,6 +7,7 @@
 // Parsed from Init's state the reasoning and the literal "</think>" were the answer the client
 // read. The replies below are verbatim greedy replies of LFM3-1.7B-Q4_K_M (ggml_metal).
 using System.Text;
+using TensorSharp.Server.ProtocolAdapters;
 
 namespace InferenceWeb.Tests;
 
@@ -25,6 +26,12 @@ public sealed class Lfm3ThinkingOffReasoningTests
     private const string GoldReply = "<think>We need to answer the question. The chemical symbol for gold is \"Au\". " +
         "The answer should be just \"Au\". So I'll output \"Au\".</think>Au";
     private const string PlainReply = "The capital of Australia is **Canberra**.";
+    // GSM8K test id 38 ("How fast does he run?", thinking off, max_tokens 1,024, ggml_cpu): the result is stated only in
+    // the reasoning, and max_tokens cut the answer after the close. The reply's first and last sentences verbatim, its
+    // middle (3,300 characters) left out.
+    private const string CutReply = "We are given: John runs 60 miles a week. He runs 3 days a week. " +
+        "Total hours = 6. Total distance = 60 miles. So speed = 60/6 = 10 miles per hour.\n\nThus final answer: 10.\n\n" +
+        "Thus: Answer: 10\n\nWe'll put in the required format.</think>John runs a total of 60 miles";
 
     private static readonly List<ToolFunction> Tools =
     [
@@ -227,6 +234,70 @@ public sealed class Lfm3ThinkingOffReasoningTests
             Arch, SpiderReply, false, Tools, generationSuffix: Closed, cancelled: false);
         Assert.Equal("8", turn.Content.Trim());
         Assert.Equal(SpiderReply, turn.RawText);
+        // What an append-only stream sent instead.
+        Assert.Equal(SpiderReply, turn.StreamedContent);
+
+        EmittedAssistantTurn plain = ChatGenerationPipeline.BuildEmittedTurn(
+            Arch, PlainReply, false, Tools, generationSuffix: Closed, cancelled: false);
+        Assert.Null(plain.StreamedContent);
+    }
+
+    /// <summary>
+    /// The next request sends back whichever form the client got - the reasoning apart (a page, a whole reply) or the
+    /// reply as generated (an API stream), prose before a call included - and either one splices the turn's generated
+    /// tokens back, so its KV cache is continued. Edited text still is not.
+    /// </summary>
+    [Fact]
+    public void TheTranscriptMatchesEitherFormTheClientWasSent()
+    {
+        const string call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        const string reasoning = "The user wants the weather. Use the tool.";
+        string raw = reasoning + "</think>\n" + call;
+        EmittedAssistantTurn emitted = ChatGenerationPipeline.BuildEmittedTurn(Arch, raw, false, Tools, Closed, cancelled: false);
+        Assert.Equal(reasoning, emitted.Thinking.Trim());
+        Assert.True(string.IsNullOrWhiteSpace(emitted.Content));
+        Assert.Equal(reasoning + "</think>", emitted.StreamedContent!.TrimEnd());
+
+        var store = new ConversationTranscriptStore(maxChains: 16, maxTokens: 10_000);
+        var ask = new ChatMessage { Role = "user", Content = "Weather in Paris?" };
+        store.Record(new List<ChatMessage> { ask },
+            new ChatMessage { Role = "assistant", Content = raw, RawOutputTokens = new List<int> { 7, 8, 9 } },
+            emitted, scope: "lfm3");
+
+        List<ChatMessage> Replay(string content, string? thinking) => new()
+        {
+            new() { Role = "user", Content = ask.Content },
+            new()
+            {
+                Role = "assistant", Content = content, Thinking = thinking,
+                ToolCalls = new List<ToolCall>
+                {
+                    new() { Id = "call_1", Name = "get_weather", Arguments = new Dictionary<string, object> { ["city"] = "Paris" } },
+                },
+            },
+            new() { Role = "tool", Content = "18C, clear", ToolCallId = "call_1" },
+        };
+
+        Assert.Equal(new[] { 7, 8, 9 }, store.Augment(Replay("", reasoning)).History[1].RawOutputTokens);
+        // As the OpenAI stream sent it: the reasoning and the close as content, the blank line before the call included.
+        Assert.Equal(new[] { 7, 8, 9 }, store.Augment(Replay(reasoning + "</think>\n", null)).History[1].RawOutputTokens);
+        Assert.Equal(new[] { 7, 8, 9 }, store.Augment(Replay(reasoning + "</think>", null)).History[1].RawOutputTokens);
+        Assert.Null(store.Augment(Replay("The user wants rain. Use the tool.</think>", null)).History[1].RawOutputTokens);
+
+        // A reply cut short after its close: either form the client got.
+        EmittedAssistantTurn cut = ChatGenerationPipeline.BuildEmittedTurn(Arch, CutReply, false, Tools, Closed, cancelled: false);
+        var cutStore = new ConversationTranscriptStore(maxChains: 16, maxTokens: 10_000);
+        cutStore.Record(new List<ChatMessage> { ask },
+            new ChatMessage { Role = "assistant", Content = CutReply, RawOutputTokens = new List<int> { 4, 5 } },
+            cut, scope: "lfm3");
+        List<ChatMessage> Next(string content, string? thinking) => new()
+        {
+            new() { Role = "user", Content = ask.Content },
+            new() { Role = "assistant", Content = content, Thinking = thinking },
+            new() { Role = "user", Content = "And in Rome?" },
+        };
+        Assert.Equal(new[] { 4, 5 }, cutStore.Augment(Next(CutReply, null)).History[1].RawOutputTokens);
+        Assert.Equal(new[] { 4, 5 }, cutStore.Augment(Next(cut.Content, cut.Thinking)).History[1].RawOutputTokens);
     }
 
     /// <summary>
