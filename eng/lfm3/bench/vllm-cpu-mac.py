@@ -21,7 +21,8 @@ Python (it imports vllm, transformers and torch). Outputs go to --out (never int
 
 ENGINE options (gen-server, arm): --engine {vllm,ts,llama} --name LABEL --threads T [--threads-batch TB]
   vllm:  --dtype {float16,bfloat16,float32} [--shortconv-fix]   (HF checkpoint --hf)
-  ts:    --backend {ggml_cpu,cpu} --gguf FILE      (this checkout's Release TensorSharp.Server.Host)
+  ts:    --backend {ggml_cpu,cpu} --gguf FILE      (this checkout's Release TensorSharp.Server.Host; --threads 0 keeps the
+         lane's own thread defaults, T > 0 sets TS_GGML_CPU_THREADS / TS_CPU_THREADS, which pin every step to T)
   llama: --gguf FILE                               (llama-server from LLAMA_BIN, default ~/work/llama.cpp-lfm3/build-cpu/bin)
 """
 import argparse
@@ -98,7 +99,9 @@ def server_command(a, concurrency, ctx):
     elif a.engine == "ts":
         env["MAX_CONTEXT"] = str(ctx)
         env["TS_SCHED_MAX_RUNNING_SEQS"] = str(concurrency)
-        env["TS_GGML_CPU_THREADS" if a.backend == "ggml_cpu" else "TS_CPU_THREADS"] = str(a.threads)
+        # 0: the lane's own defaults (ggml_cpu's prompt and decode pools are sized apart; TS_GGML_CPU_THREADS pins both)
+        if a.threads > 0:
+            env["TS_GGML_CPU_THREADS" if a.backend == "ggml_cpu" else "TS_CPU_THREADS"] = str(a.threads)
         cmd = ["dotnet", ts_dll(), "--model", a.gguf, "--backend", a.backend, "--host", "127.0.0.1",
                "--port", str(a.port), "--no-multi-agent", "--no-skills", "--no-webui", "--no-prefix-cache",
                "--max-tokens", str(ctx)]

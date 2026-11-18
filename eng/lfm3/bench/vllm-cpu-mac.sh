@@ -28,7 +28,8 @@
 #          that PyTorch's macOS wheels (no oneDNN) run 2048 groups at a time (~1.5 s per decode step); the
 #          workaround routes it to vLLM's own causal_conv1d_update_cpu_vec kernel (bit-identical outputs).
 #   ts-{ggml,cpu}-{bf16,q4km}[-tN]  TensorSharp.Server.Host (this checkout's Release build) --backend ggml_cpu|cpu
-#          --no-prefix-cache, TS_SCHED_MAX_RUNNING_SEQS=C, TS_GGML_CPU_THREADS=TS_GGML_T / TS_CPU_THREADS=TS_CPU_T
+#          --no-prefix-cache, TS_SCHED_MAX_RUNNING_SEQS=C; TS_GGML_CPU_THREADS=TS_GGML_T / TS_CPU_THREADS=TS_CPU_T (or N)
+#          when that count is above 0, else the lane's own thread defaults
 #   llama-{bf16,q4km}  llama-server -ngl 0 -np C -cb -fa on -t LLAMA_T -tb LLAMA_TB --no-cache-prompt -cram 0
 #
 # Environment (defaults in brackets):
@@ -46,12 +47,15 @@
 #   VLLM_DTYPES [float16 bfloat16 float32]  (correct; FIX= runs them without the workaround)
 #   VLLM_BENCH_DTYPE [float16]  (the vLLM server in `correct`)
 #   SWEEP_ARM [vllm-fp16fix]  SWEEP_THREADS [6 12 18]  SWEEP_EXTRA [vllm-bf16fix vllm-fp32fix]  VLLM_THREADS [sweep]
-#   TS_GGML_T [12] TS_CPU_T [12] LLAMA_T [12] LLAMA_TB [18]  threads (on a 6P+12E M5 Pro ggml-cpu decodes best at 12
-#                 and prompts best at 18; TensorSharp has one count for both, llama.cpp takes -t and -tb)
+#   TS_GGML_T [0] TS_CPU_T [0] LLAMA_T [16] LLAMA_TB [18]  threads. 0 keeps TensorSharp's own defaults, which already
+#                 split prompts from decode (ggml_cpu: prompts on every physical core, decode on every physical core but
+#                 two on a hybrid Mac; the managed cpu lane: every core); N pins every step of the lane to N
+#                 (TS_GGML_CPU_THREADS / TS_CPU_THREADS, as ts-bench.sh --threads does). llama.cpp takes -t and -tb: on
+#                 a 6P+12E M5 Pro it decodes best at 16 and prompts best at 18 (bench/run-matrix.sh cpu)
 #   REQUESTS [1:4,4:8]  requests per cell by concurrency
-#   SLOW_ARMS [ts-ggml-bf16 llama-bf16 ts-cpu-bf16 ts-cpu-q4km vllm-fp16]  SLOW_REQUESTS [1:3,4:4]  SLOW_CELLS [$CELLS]
-#                 (the scalar BF16 / K-quant paths today, and stock vLLM; e.g. SLOW_CELLS=512x128@1,128x256@1 when a
-#                 group would hold the lock past ~20 min)
+#   SLOW_ARMS [llama-bf16 vllm-fp16]  SLOW_REQUESTS [1:3,4:4]  SLOW_CELLS [$CELLS]
+#                 (llama.cpp's BF16 decode, a scalar dot on ARM, and stock vLLM; e.g. SLOW_CELLS=512x128@1,128x256@1
+#                 when a group would hold the lock past ~20 min)
 #   HOLD_GAP [0]  seconds to wait between lock holds, so other users of a shared lock get their turn
 set -euo pipefail
 # Run from a private copy: bash reads a script as it goes, so editing the checkout's copy would derail a long run.
@@ -79,9 +83,9 @@ VLLM_DTYPES="${VLLM_DTYPES:-float16 bfloat16 float32}"
 VLLM_BENCH_DTYPE="${VLLM_BENCH_DTYPE:-float16}"
 SWEEP_ARM="${SWEEP_ARM:-vllm-fp16fix}" SWEEP_THREADS="${SWEEP_THREADS:-6 12 18}"
 SWEEP_EXTRA="${SWEEP_EXTRA-vllm-bf16fix vllm-fp32fix}"
-TS_GGML_T="${TS_GGML_T:-12}" TS_CPU_T="${TS_CPU_T:-12}" LLAMA_T="${LLAMA_T:-12}" LLAMA_TB="${LLAMA_TB:-18}"
+TS_GGML_T="${TS_GGML_T:-0}" TS_CPU_T="${TS_CPU_T:-0}" LLAMA_T="${LLAMA_T:-16}" LLAMA_TB="${LLAMA_TB:-18}"
 REQUESTS="${REQUESTS:-1:4,4:8}" SLOW_REQUESTS="${SLOW_REQUESTS:-1:3,4:4}"
-SLOW_ARMS="${SLOW_ARMS:-ts-ggml-bf16 llama-bf16 ts-cpu-bf16 ts-cpu-q4km vllm-fp16}"
+SLOW_ARMS="${SLOW_ARMS:-llama-bf16 vllm-fp16}"
 SLOW_CELLS="${SLOW_CELLS:-$CELLS}"
 PY="$VLLM_VENV/bin/python"
 TOOL="$here/eng/lfm3/bench/vllm-cpu-mac.py"
@@ -97,7 +101,7 @@ conditions() {
     echo "llama.cpp: $(git -C "$LLAMA_BIN/../.." rev-parse --short HEAD 2>/dev/null || echo '?') ($LLAMA_BIN)"
     echo "vLLM: $("$PY" -c 'import vllm, torch; print(vllm.__version__, "torch", torch.__version__)' 2>/dev/null)  ($(git -C "$("$PY" -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))' 2>/dev/null)" rev-parse --short HEAD 2>/dev/null || echo wheel))"
     echo "dotnet: $(dotnet --version)"
-    echo "threads: VLLM_THREADS=${VLLM_THREADS:-sweep} TS_GGML_T=$TS_GGML_T TS_CPU_T=$TS_CPU_T LLAMA_T=$LLAMA_T LLAMA_TB=$LLAMA_TB"
+    echo "threads: VLLM_THREADS=${VLLM_THREADS:-sweep} TS_GGML_T=$TS_GGML_T TS_CPU_T=$TS_CPU_T (0: TensorSharp's defaults) LLAMA_T=$LLAMA_T LLAMA_TB=$LLAMA_TB"
     echo "cells: $CELLS, requests $REQUESTS (slow arms $SLOW_ARMS: $SLOW_CELLS, $SLOW_REQUESTS)  ctx: $CTX  rounds: $ROUNDS"
   } | tee -a "$OUT/conditions.txt"
 }
