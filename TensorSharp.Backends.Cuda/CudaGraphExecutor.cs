@@ -389,7 +389,7 @@ namespace TensorSharp.Cuda
             using var vx = new Tensor(Allocator, DType.Float32, kvHeads, len, d);
             // A q8_0 cache's rows as the flash kernels' values (the tiled products here are its generic attention).
             bool q8Cache = kc.ElementType == DType.Q8_0 || vc.ElementType == DType.Q8_0;
-            if (q8Cache) WarnQ8Generic(explicitRows ? "prompt or verify rows under a selection's mask" : "rows the flash kernels decline");
+            if (q8Cache) WarnQ8Generic(explicitRows ? "prompt or verify rows under an explicit mask" : "rows the flash kernels decline");
             if (q8Cache ? !TryQ8RowsToF32(kx, kc, len) || !TryQ8RowsToF32(vx, vc, len)
                 : !CudaFusedOps.TryExpandKvHeads(kx, kc, 1, len) || !CudaFusedOps.TryExpandKvHeads(vx, vc, 1, len))
                 return GenericAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk, "a cache window the tiled path cannot widen");

@@ -2170,14 +2170,27 @@ public sealed class Qwen35RuntimeTests : IDisposable
         => EngineSpeculationMatchesPlain(variant, speculator, BackendType.Cuda);
 
     /// <summary>The same over a q8_0 cache (an explicit <c>--kv-cache-dtype q8_0</c>: the CUDA executor's _q8 flash kernels and
-    /// q8_0 row writes, the verify windows' rows the decode rows' bits): the plain greedy streams.</summary>
+    /// q8_0 row writes, the verify windows' rows the decode rows' bits): the plain greedy streams. Every model of both runs held
+    /// the q8_0 cache, ran graphs, and sent no attention to the generic or tiled path
+    /// (<see cref="CudaQ8KvAttentionRoutesTests.AssertFlashKernelsOnly"/>).</summary>
     [CudaTheory]
     [InlineData("dense", SpeculatorRegistry.NGram)]
     [InlineData("dense-nextn", SpeculatorRegistry.DraftHead)]
     public async Task EngineSpeculationOnDirectCudaMatchesPlainOverAQ8Cache(string variant, string speculator)
     {
         using IDisposable kv = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0);
-        await EngineSpeculationMatchesPlain(variant, speculator, BackendType.Cuda);
+        string path = Fixture(variant);
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = speculator, MaxDraftTokens = 3, MinDraftProb = 0 };
+        var models = new List<CudaQ8KvAttentionRoutesTests.Q8Watch>();
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() =>
+        {
+            Qwen35RuntimeModel model = Create(path, backend: BackendType.Cuda);
+            lock (models) models.Add(CudaQ8KvAttentionRoutesTests.Watch(model));
+            return model;
+        }, options, $"qwen35 {variant} {speculator} Cuda q8_0");
+        Assert.NotEmpty(models);
+        foreach (CudaQ8KvAttentionRoutesTests.Q8Watch model in models)
+            CudaQ8KvAttentionRoutesTests.AssertFlashKernelsOnly(model, $"qwen35 {variant} {speculator}", _output);
     }
 
     /// <summary>A batched verify whose graph finds no device memory for its compute buffer is retried once after the
