@@ -85,7 +85,7 @@ namespace TensorSharp.Cuda
                 () => Stream.Synchronize(),
                 bytes => pool.TrimLarge(bytes),
                 pool.DrainSmall,
-                () => Volatile.Read(ref reclaimers),
+                () => RegisteredReclaimers,
                 () => CudaGraphCapture.IsCapturing(this),
                 CollectAndDrain,
                 ReportOnce.FullDrain,
@@ -100,6 +100,9 @@ namespace TensorSharp.Cuda
         // Copy-on-write: the ladder reads it without a lock.
         private IDeviceMemoryReclaimer[] reclaimers = Array.Empty<IDeviceMemoryReclaimer>();
         private readonly object reclaimerSync = new();
+
+        /// <summary>The reclaimers an allocation that finds the device full asks, in the order they are asked.</summary>
+        internal IReadOnlyList<IDeviceMemoryReclaimer> RegisteredReclaimers => Volatile.Read(ref reclaimers);
 
         /// <summary>Ask <paramref name="reclaimer"/> for device memory when an allocation here finds the device full, after
         /// the cached blocks went back and before the last resort (a full GC and a drain of every cached block). Once per

@@ -88,16 +88,24 @@ public class CudaAllocatorReclaimTests
     public void Reclaimers_RegisterOnceAndUnregister()
     {
         using var allocator = new CudaAllocator();
-        var reclaimer = new CountingReclaimer();
-        allocator.RegisterReclaimer(reclaimer);
-        allocator.RegisterReclaimer(reclaimer);
-        allocator.UnregisterReclaimer(reclaimer);
-        allocator.UnregisterReclaimer(reclaimer);
+        var first = new CountingReclaimer();
+        var second = new CountingReclaimer();
+        allocator.RegisterReclaimer(first);
+        allocator.RegisterReclaimer(second);
+        allocator.RegisterReclaimer(first);
+        Assert.Equal(new IDeviceMemoryReclaimer[] { first, second }, allocator.RegisteredReclaimers);
+
+        allocator.UnregisterReclaimer(first);
+        allocator.UnregisterReclaimer(first);
         allocator.UnregisterReclaimer(null);
+        Assert.Equal(new IDeviceMemoryReclaimer[] { second }, allocator.RegisteredReclaimers);
 
         // An allocation that fits never asks.
         using var t = new Tensor(allocator, DType.Float32, 1024);
-        Assert.Equal(0, reclaimer.Calls);
+        Assert.Equal(0, first.Calls + second.Calls);
+
+        allocator.UnregisterReclaimer(second);
+        Assert.Empty(allocator.RegisteredReclaimers);
     }
 
     private sealed class CountingReclaimer : IDeviceMemoryReclaimer
