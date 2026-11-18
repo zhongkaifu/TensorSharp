@@ -373,7 +373,8 @@ public sealed class DeviceRoomReclaimerCudaTests : IDisposable
 
     /// <summary>An allocation no site sized that finds the device full climbs the allocator's ladder to the model's reclaimer
     /// (rung 3), which releases the conversations the prefix cache keeps; the allocation then succeeds without the last
-    /// resort, and the running request continues.</summary>
+    /// resort, and the running request continues. The kernels are warmed on another thread first, as a server's loader
+    /// does before its engine's worker runs the steps.</summary>
     [CudaFact]
     public void AnAllocationThatFindsTheDeviceFullReleasesRetainedConversationsThroughTheReclaimer()
     {
@@ -382,6 +383,15 @@ public sealed class DeviceRoomReclaimerCudaTests : IDisposable
             model = new Qwen35RuntimeModel(new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }
                 .Write(Path.Combine(_dir, "q35-dense.gguf")), BackendType.Cuda, 1, null, 1);
         using var owned = model;
+        Exception warmUpFailed = null;
+        var loader = new Thread(() =>
+        {
+            try { model.WarmUpKernels(); }
+            catch (Exception ex) { warmUpFailed = ex; }
+        });
+        loader.Start();
+        loader.Join();
+        Assert.Null(warmUpFailed);
         var sink = new RecordingPayloadSink();
         model.AttachPrefixCache(sink);
         var unified = (IUnifiedBatchModel)model;
