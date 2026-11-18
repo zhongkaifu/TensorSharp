@@ -181,6 +181,53 @@ namespace InferenceWeb.Tests
         }
 
         [Fact]
+        public void AWorkerBlockThatFailsLastFailsItsOwnJob()
+        {
+            // A worker's block that throws and is the last block to finish. The pool used to count the block done in a
+            // finally that runs before the catch recording its exception, so the submitter could see every block done,
+            // find no error and return normally - the block's output never written, nothing thrown - and the late
+            // exception then surfaced in the NEXT job. The window is narrow: the old pool lost or misrouted 1-4 of every
+            // 100,000 such jobs on an M5 Pro, so this runs 200,000 (about 1.5 s).
+            const int pools = 4, jobsPerPool = 50_000;
+            int lost = 0, foreign = 0, propagated = 0;
+            int submitter = Environment.CurrentManagedThreadId;
+            for (int p = 0; p < pools; p++)
+            {
+                using var pool = new CpuWorkerPool(2);
+                for (int job = 0; job < jobsPerPool; job++)
+                {
+                    int workerStarted = 0;
+                    var failure = new InvalidOperationException($"pool {p} job {job}");
+                    try
+                    {
+                        pool.For(2, _ =>
+                        {
+                            if (Environment.CurrentManagedThreadId != submitter)
+                            {
+                                Volatile.Write(ref workerStarted, 1);
+                                throw failure;
+                            }
+                            // The submitter's block waits for the worker's to start, so the worker's finishes last. (The
+                            // bound only keeps a starved worker from hanging the test: the job then runs both blocks on
+                            // this thread and counts as neither lost nor propagated.)
+                            var spin = new SpinWait();
+                            var waited = System.Diagnostics.Stopwatch.StartNew();
+                            while (Volatile.Read(ref workerStarted) == 0 && waited.Elapsed < TimeSpan.FromSeconds(10)) spin.SpinOnce(-1);
+                        });
+                        if (Volatile.Read(ref workerStarted) == 1) lost++;
+                    }
+                    catch (AggregateException error)
+                    {
+                        if (error.InnerExceptions.Contains(failure)) propagated++;
+                        else foreign++;
+                    }
+                }
+            }
+            Assert.True(lost == 0 && foreign == 0,
+                $"{lost} jobs returned normally although a worker's block threw, {foreign} threw another job's exception ({propagated} correct)");
+        }
+
+        [Fact]
         public void ConcurrentSubmittersAllComplete()
         {
             // The pool runs one job at a time; a second submitter has to fall back
@@ -205,6 +252,9 @@ namespace InferenceWeb.Tests
             Assert.Equal(8, CpuWorkerPool.DefaultThreadCountFor(16));
             Assert.Equal(61, CpuWorkerPool.DefaultThreadCountFor(122));
             Assert.True(CpuWorkerPool.DefaultThreadCountFor(384) < 384);
+            // Apple silicon has no SMT: one worker per core.
+            Assert.Equal(18, CpuWorkerPool.DefaultThreadCountFor(18, oneThreadPerCore: true));
+            Assert.Equal(6, CpuWorkerPool.DefaultThreadCountFor(6, oneThreadPerCore: true));
         }
 
         [Fact]

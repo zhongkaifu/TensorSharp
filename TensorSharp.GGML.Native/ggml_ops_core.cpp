@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
+#include "ggml_ops_cpu_graph.h"
 #include "ggml_ops_attention_alloc.h"
 #include "ggml_ops_graph_alloc.h"
 #include "ggml_ops_moe_stream_memory.h"
@@ -624,41 +625,9 @@ namespace tsg
                 set_last_error("ggml-cpu backend initialization failed.");
                 return backend;
             }
-            // A bare ggml_backend_cpu_init() runs GGML_DEFAULT_N_THREADS (4) and
-            // spawns a DISPOSABLE thread pool per graph_compute - on the per-op
-            // path that is ~940 pool spawn/join cycles per decoded token, on 4 of
-            // however many cores the machine has. Default to ALL physical cores
-            // plus one persistent thread pool for the life of the backend.
-            // llama.cpp defaults to P-cores only on Apple Silicon; measured on an
-            // M5 Pro (6P+12E) that leaves 2x on the table for this workload -
-            // Muse-Glimmer 30B IQ2_XXS decode is 3.8 tok/s at 6 threads and
-            // 8.2 at 18 (llama.cpp itself moves 3.7 -> 7.9 when given -t 18,
-            // and its prompt throughput DROPS with E-cores while ours rises).
-            // TS_GGML_CPU_THREADS overrides the count.
-            int cpu_threads = 0;
-            if (const char* e = std::getenv("TS_GGML_CPU_THREADS"))
-            {
-                const int v = std::atoi(e);
-                if (v > 0) cpu_threads = v;
-            }
-#if defined(__APPLE__)
-            if (cpu_threads <= 0)
-            {
-                std::uint32_t cores = 0;
-                std::size_t len = sizeof(cores);
-                if (sysctlbyname("hw.physicalcpu", &cores, &len, nullptr, 0) == 0 && cores > 0)
-                    cpu_threads = static_cast<int>(cores);
-            }
-#endif
-            if (cpu_threads <= 0)
-                cpu_threads = available_cpu_parallelism();
-            ggml_backend_cpu_set_n_threads(backend, cpu_threads);
-            ggml_threadpool_params tpp = ggml_threadpool_params_default(cpu_threads);
-            if (ggml_threadpool_t pool = ggml_threadpool_new(&tpp))
-            {
-                g_cpu_pools.push_back(pool);
-                ggml_backend_cpu_set_threadpool(backend, pool);
-            }
+            // The prompt and decode thread pools (ggml_ops_cpu_graph.cpp): every physical core for prompt steps,
+            // fewer for decode steps on a hybrid Apple CPU; TS_GGML_CPU_THREADS / TS_GGML_CPU_DECODE_THREADS override.
+            cpu_pools_create(backend, g_cpu_pools);
             return backend;
         }
 
@@ -1336,6 +1305,8 @@ namespace tsg
             return false;
 
         qwen_image21_invalidate_weight(data);
+        // ggml-cpu's repacked copy (graphs bound to it keep theirs; the next graph repacks the new bytes).
+        cpu_repack_forget(data);
 
         {
             std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
@@ -3478,6 +3449,8 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     tsg_cuda_q4k_gemm_release();
 #endif
     forget_cache_keys();
+    // ggml-cpu's repacked weight copies (graphs still bound to one keep it until they are freed).
+    tsg::cpu_repack_clear();
     // Host-MoE streaming page-locks the expert stacks it streams (cudaHostRegister
     // on the GGUF mapping, or on a private copy of it). Like everything else here
     // the release is process-wide. Left registered, a model's ranges outlive its
@@ -3657,7 +3630,9 @@ TSG_EXPORT void TSGgml_Shutdown()
         }
         tsg::dev(r).device_index = -1;
     }
+    tsg::cpu_repack_clear();
     // After the backend: a CPU backend still references its pool until it is freed.
+    tsg::cpu_pools_forget_all();
     for (ggml_threadpool_t pool : tsg::g_cpu_pools)
         ggml_threadpool_free(pool);
     tsg::g_cpu_pools.clear();

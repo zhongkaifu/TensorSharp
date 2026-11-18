@@ -39,8 +39,8 @@ arm() {   # NAME QUANT -> "NAME=COMMAND" for ab.py
   local m=$M/LFM3-1.7B-$2.gguf
   case $1 in
     ts-*) echo "$1=MAX_CONTEXT=$ctx $here/ts-bench.sh $m ${1#ts-} $PP $TG $DEPTHS --reps $REPS" ;;
-    llama-cuda-fa*) echo "$1=LLAMA_BENCH=$L/build-cuda/bin/llama-bench FA=${1##*fa} $here/llama-bench-result.sh $m $PP $TG $DEPTHS $REPS" ;;
-    llama-vk-fa*) echo "$1=LLAMA_BENCH=$L/build-vk/bin/llama-bench FA=${1##*fa} $here/llama-bench-result.sh $m $PP $TG $DEPTHS $REPS" ;;
+    llama-cuda-fa*) echo "$1=LLAMA_CPP_DIR=$L LLAMA_BUILD=build-cuda FA=${1##*fa} $here/llama-bench-result.sh $m $PP $TG $DEPTHS $REPS" ;;
+    llama-vk-fa*) echo "$1=LLAMA_CPP_DIR=$L LLAMA_BUILD=build-vk FA=${1##*fa} $here/llama-bench-result.sh $m $PP $TG $DEPTHS $REPS" ;;
     *) echo "unknown arm $1" >&2; exit 2 ;;
   esac
 }

@@ -3,7 +3,8 @@
 TensorSharp's LFM3-Omni image, video and audio input against llama.cpp on the same GGUF and mmproj, through the
 servers' OpenAI endpoints with identical request bodies. Outputs belong in the ignored `artifacts/lfm3/omni-in/`.
 Build TensorSharp first (`TENSORSHARP_GGML_NO_UPDATE=1 dotnet build TensorSharp.Server.Host -c Release`); the
-llama.cpp side is a Metal build of `llama-server` / `llama-mtmd-cli` (`LLAMA`, default `~/work/llama.cpp-lfm3`).
+llama.cpp side is a Metal build of `llama-server` / `llama-mtmd-cli` (`LLAMA`, default `~/work/llama.cpp-lfm3`;
+`LLAMA_BUILD=build-cpu` runs a CPU-only build as the reference of a CPU lane).
 
 - `make-media.py --out DIR --llama LLAMA [--signal MP4] [--ticket WAV]` builds the media set and its `manifest.json`
   (macOS: `sips`, `say`, ffmpeg, PIL): three animal photos and a newspaper page (llama.cpp's `test-1.jpeg`), a
@@ -38,6 +39,9 @@ llama.cpp side is a Metal build of `llama-server` / `llama-mtmd-cli` (`LLAMA`, d
     prompt of the same length;
   - `split MODEL MMPROJ BACKEND IMAGE`: an image's encode as one program and split for GPU-lock yields (2 and 4
     programs), interleaved, with the rows' distance;
+  - `encode MODEL MMPROJ BACKEND IMAGE [REPS]`: an image's encode as one program, REPS times after a warm one (median,
+    min, max and a `RESULT vision_ms` line for `eng/lfm3/bench/ab.py`); the CPU lanes take their threads from
+    `TS_GGML_CPU_THREADS` / `TS_CPU_THREADS`, to compare with `llama-mtmd-cli -t N`'s "image slice encoded in" time;
   - `stages MODEL MMPROJ BACKEND VIDEO`: a video's preparation stage by stage (the host frame sampling a frame family
     would pay, decode + resize, soundtrack decode, features, pair encodes, soundtrack encode).
 

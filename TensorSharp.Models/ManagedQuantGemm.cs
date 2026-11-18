@@ -12,6 +12,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
 using TensorSharp.Cpu;
@@ -704,6 +705,8 @@ namespace TensorSharp.Models
                 QuantizeInt8Groups16Avx512(x, invScale, q, n, groupSums);
             else if (Avx2.IsSupported)
                 QuantizeInt8Groups16Avx2(x, invScale, q, n, groupSums);
+            else if (AdvSimd.Arm64.IsSupported)
+                QuantizeInt8Groups16Neon(x, invScale, q, n, groupSums);
             else
                 QuantizeInt8Groups16Scalar(x, invScale, q, n, groupSums);
         }
@@ -719,6 +722,8 @@ namespace TensorSharp.Models
                 QuantizeInt8Groups16Avx512(x, invScale, q, n, groupSums);
             else if (Avx2.IsSupported)
                 QuantizeInt8Groups16Avx2(x, invScale, q, n, groupSums);
+            else if (AdvSimd.Arm64.IsSupported)
+                QuantizeInt8Groups16Neon(x, invScale, q, n, groupSums);
             else
                 QuantizeInt8Groups16Scalar(x, invScale, q, n, groupSums);
         }

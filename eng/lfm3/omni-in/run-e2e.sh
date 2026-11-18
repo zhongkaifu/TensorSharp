@@ -2,15 +2,15 @@
 # Copyright (c) Zhongkai Fu. All rights reserved.
 # Licensed under the BSD-3-Clause license in the repository root.
 #
-# LFM3-Omni end to end against llama.cpp: start llama-server (Metal) and TensorSharp.Server.Host on <backend> with the
+# LFM3-Omni end to end against llama.cpp: start llama-server (Metal by default) and TensorSharp.Server.Host on <backend> with the
 # same GGUF + mmproj, run compare.py (TOOL=ttft: ttft.py, cold TTFT or --concurrent), stop both.
 #
 #   eng/lfm3/omni-in/run-e2e.sh <ts-backend> <out-dir> [compare.py args...]
 #   e.g. eng/lfm3/omni-in/run-e2e.sh ggml_metal artifacts/lfm3/omni-in/e2e/metal
 #        eng/lfm3/omni-in/run-e2e.sh mlx artifacts/lfm3/omni-in/e2e/mlx --reuse-llama artifacts/lfm3/omni-in/e2e/metal/llama.json
 #
-# Environment: LLAMA (llama.cpp checkout, default ~/work/llama.cpp-lfm3), LLAMA_BUILD (its build tree, default build; e.g.
-# build-cuda on a Linux GPU machine), MODELS (default ~/work/models/lfm3), MODEL
+# Environment: LLAMA (llama.cpp checkout, default ~/work/llama.cpp-lfm3), LLAMA_BUILD (its build tree, default build = Metal;
+# build-cpu for the CPU-only reference of a CPU lane, build-cuda on a Linux GPU machine), MODELS (default ~/work/models/lfm3), MODEL
 # (default LFM3-Omni-2B-Q4_K_M.gguf), MMPROJ (default mmproj-LFM3-Omni-2B-Q8_0.gguf), MEDIA (manifest, default
 # artifacts/lfm3/omni-in/media/manifest.json), LPORT / TPORT (8181 / 5181), LLAMA_NP (llama-server slots, 1). llama-server always runs: a --reuse-llama
 # run still tokenizes with it. Build first with TENSORSHARP_GGML_NO_UPDATE=1.

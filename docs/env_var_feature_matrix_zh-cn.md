@@ -524,6 +524,23 @@ sweep。runner 也不会清除它们，所以 runner 自身环境中设置的值
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | 服务端、CLI | `true` 时导出内容：不脱敏的日志、聊天 span 上的提示与输出消息、视频提示词、工具参数与结果、命令、上传路径 | 关闭（内容脱敏） | 未注册 | 否 |
 | `TENSORSHARP_OTEL_TRACE_STEPS` | 服务端、CLI | 每个引擎步骤一个 `inference.step` span，并链接到它运行的请求；用于剖析单次运行 | 关闭 | 未注册 | 否 |
 
+## 矩阵外的 GGML CPU 后端开关
+
+这些用于调节 `--backend ggml_cpu`（TensorSharp 图运行时下的 ggml-cpu，`TensorSharp.GGML.Native/ggml_ops_cpu_graph.cpp`）。
+它们没有注册进 `EnvVarMatrix.All`，默认的 TestMatrix 配置也不会扫它们。实测数据来自一台 Apple M5 Pro（6 个性能核 +
+12 个能效核、48 GB），模型为 LFM3-1.7B，各组在空闲机器上交替运行。
+
+ggml-cpu 在 ARM64 上的两处空缺由 TensorSharp 自己的乘法补上，没有开关：BF16 权重（ggml-cpu 的 BF16 点积在那里没有
+NEON 实现，走标量循环）被精确展宽为 F32，与原样的 F32 激活相乘（解码 54 vs 12 tok/s）；在 Apple 上，提示宽度的 BF16 与
+NVFP4 乘法（分别从 64 与 256 行激活起）先把权重转成 F32，再交给一次 Accelerate `sgemm`，与 llama.cpp 的 BLAS 后端做法
+相同。两者读取的激活都不经舍入（ggml 会把激活舍入为 BF16，NVFP4 时为 Q8_0）。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描值 | 默认扫描 |
+|---|---|---|---|---|---|
+| `TS_GGML_CPU_THREADS` | `ggml_cpu` 后端 | ggml-cpu 提示线程池的宽度：凡是权重乘法读取超过 4 行激活的步骤（提示分块、验证窗口、编码器）。没有权重乘法的图步骤，以及图运行时之外的每个 ggml 算子，沿用上一步留下的线程池：在第一个解码步之前就是这个线程池。单独设置时它也是解码线程池的宽度，与 `llama-bench -t` 同时设置二者一致。默认取全部物理核：LFM3-1.7B Q4_K_M 的 pp512 在 12 / 14 / 16 / 18 线程下为 667 / 763 / 881 / 874 tok/s | 全部物理核（macOS 上为 `hw.physicalcpu`） | 未注册 | 否 |
+| `TS_GGML_CPU_DECODE_THREADS` | `ggml_cpu` 后端 | 解码线程池的宽度：权重乘法最多读取 4 行激活的步骤（一个序列的一个 token，或一步里几个序列的 token）在一个独立的常驻线程池上运行，此时提示线程池休眠。解码一步把每个权重读一遍，并在几百个小节点处停在每个线程都必须到达的屏障上，因此一个被调度走的工作线程就会拖住整步：每个核都放一个工作线程时，宿主自己的线程会从线程池手里抢走核。LFM3-1.7B tg128 在深度 0 / 4096：Q4_K_M 在 10 线程下 166.6 / 139.6 tok/s，12 线程 157.3 / 134.4，14 线程 166.2 / 143.7，16 线程 168.6 / 147.6，18 线程 124.5 / 128.4；Q4_0 与 Q8_0 在 16 线程时都在各自最佳值的 4 % 以内 | 在同时有性能核与能效核的 macOS 上（`hw.perflevel0` / `hw.perflevel1`）：全部物理核减二（M5 Pro 上为 16）；其他平台与提示线程池相同；只设置了 `TS_GGML_CPU_THREADS` 时取该值 | 未注册 | 否 |
+| `TS_GGML_CPU_REPACK` | `ggml_cpu` 后端 | `0` 让量化权重保持 GGUF 布局；`1` 在默认关闭的平台上开启重排。图中只作为乘法权重被读取（对 F32 行做 MUL_MAT，整体读取或按 8 行对齐的行块读取）、且属于 ggml-cpu 可重排类型（Q4_0、Q4_K、Q5_K、Q6_K、Q8_0、IQ4_NL、MXFP4）的权重，会被复制一次到 ggml-cpu 的 `CPU_REPACK` 缓冲类型中——即它交错排列的 i8mm / dotprod GEMM 与 GEMV 布局，也就是 llama.cpp 加载权重时使用的布局——之后读取它的每个图都绑定这份副本；以其他方式读取的权重（按行收集、复制）在那个图中仍使用自己的字节。副本是与这些权重同样大小的匿名内存（LFM3-1.7B Q4_K_M 为 1.04 GB，首步时用 18 个线程约 90 ms 完成），文件的映射页随之变冷。它让提示吞吐大约翻倍（LFM3-1.7B Q4_K_M 在 18 线程下 pp512：462 -> 874 tok/s；Q8_0 与 Q4_0 类似），单序列解码保持原样。无法分配或绑定副本的权重保持 GGUF 布局，并打印一次警告指明该权重。默认只在实测过的 ARM64 上开启 | ARM64（Apple Silicon、ARM64 Linux 与 Windows）上开启，其他平台关闭 | 未注册 | 否 |
+
 ## 矩阵外的通用运行时开关
 
 这些变量是真实运行时开关，但目前未注册到 `EnvVarMatrix.All`，也不在默认

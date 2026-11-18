@@ -45,7 +45,9 @@ internal sealed class Lfm3SpeechReferenceFactAttribute : FactAttribute, Xunit.Sd
 /// <summary>
 /// LFM3-Omni speaking through the shared runtime on the real checkpoint: <c>TS_TEST_LFM3_MODEL</c> names the directory
 /// holding <c>LFM3-Omni-2B-Q8_0.gguf</c> and <c>mmproj-LFM3-Omni-2B-Q8_0.gguf</c>. Optional <c>TS_LFM3_TTS_REFERENCE</c>
-/// names llama-tts's WAV of <see cref="ReferenceText"/> (female, en, seed 1234) to compare the synthesis with.
+/// names llama-tts's WAV of <see cref="ReferenceText"/> (female, en, seed 1234) to compare the synthesis with. The tests run
+/// on ggml-metal, ggml-cuda, ggml-vulkan, ggml-cpu (the process pinning that GGML backend), direct CUDA and the managed CPU
+/// executor; the bit-level driver test on ggml-metal only.
 /// </summary>
 public sealed class Lfm3SpeechIntegrationRealModelTests
 {
@@ -70,6 +72,8 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
         BackendType.GgmlCuda => "ggml_cuda",
         BackendType.GgmlVulkan => "ggml_vulkan",
         BackendType.Cuda => "cuda",
+        BackendType.GgmlCpu => "ggml_cpu",
+        BackendType.Cpu => "cpu",
         _ => throw new ArgumentOutOfRangeException(nameof(backend)),
     };
 
@@ -86,6 +90,12 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
 
     [CudaFact(ModelEnv)]
     public void SynthesisOnDirectCudaReproducesLlamaTts() => SynthesisReproducesLlamaTts(BackendType.Cuda);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlCpu)]
+    public void SynthesisOnGgmlCpuReproducesLlamaTts() => SynthesisReproducesLlamaTts(BackendType.GgmlCpu);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.Cpu)]
+    public void SynthesisOnManagedCpuReproducesLlamaTts() => SynthesisReproducesLlamaTts(BackendType.Cpu);
 
     private void SynthesisReproducesLlamaTts(BackendType backend)
     {
@@ -135,7 +145,12 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
     /// codes are drawn. On an A40 the codec matches llama.cpp's CUDA run to 136 dB and the depthformer to 4.3e-3 (rms rel) on
     /// ggml-cuda, but llama.cpp's CUDA run draws codes no lane of TensorSharp's sampler reproduces from its own hidden rows
     /// (5 of 48, the managed CPU lane included), so its WAV is not a bit-exact target there; eng/lfm3/speech-asr.py checks
-    /// the GPU lanes' speech instead.</remarks>
+    /// the GPU lanes' speech instead. On the CPU lanes (ggml-cpu, managed) the depthformer's products round their
+    /// activations to 8 bits, as llama.cpp's CPU backend does, and two CPU implementations that differ only in summation
+    /// order land about 2% apart in the logits (the LM shows the same floor), so the temperature-0.4 draws part within a few
+    /// frames (measured against llama.cpp's CPU run: the first two frames equal, the third differs). The CPU lanes check the
+    /// depthformer and codec within tolerances (<see cref="Lfm3SpeechRealWeightsTests"/>) and the synthesis end to end
+    /// below.</remarks>
     [Lfm3SpeechReferenceFact]
     public void TheDriverOnLlamaCppHiddenRowsReproducesLlamaTts() => DriverReproducesLlamaTts(BackendType.GgmlMetal);
 
@@ -172,6 +187,23 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
             worst = Math.Max(worst, d);
         }
         _output.WriteLine($"{backend}: end of speech at frame {f} of {frames} rows; {ours.Length / 2} vs {theirs.Length / 2} samples; {differ} differ, max {worst} LSB");
+        string codesPath = Path.Combine(refDir, "codes.txt");
+        if (File.Exists(codesPath))
+        {
+            // llama.cpp's sampled codes, one frame a line: where the waveforms part, the first code drawn differently.
+            int[][] reference = File.ReadAllLines(codesPath).Where(l => l.Trim().Length > 0)
+                .Select(l => l.Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToArray()).ToArray();
+            IReadOnlyList<int[]> drawn = driver.FedFrameCodes;
+            int same = 0, firstFrame = -1, firstBook = -1;
+            for (int i = 0; i < Math.Min(drawn.Count, reference.Length); i++)
+            {
+                int book = Enumerable.Range(0, Math.Min(drawn[i].Length, reference[i].Length)).FirstOrDefault(c => drawn[i][c] != reference[i][c], -1);
+                if (book < 0) same++;
+                else if (firstFrame < 0) (firstFrame, firstBook) = (i, book);
+            }
+            _output.WriteLine($"codes: {same} of {Math.Min(drawn.Count, reference.Length)} frames as llama.cpp drew them" +
+                (firstFrame >= 0 ? $"; first difference at frame {firstFrame}, codebook {firstBook}" : ""));
+        }
         Assert.Equal(frames - 1, f);
         Assert.Equal(theirs.Length, ours.Length);
         Assert.True(worst <= 1, $"{differ} samples differ, by up to {worst} LSB");
@@ -194,6 +226,12 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
 
     [CudaFact(ModelEnv)]
     public Task ChatCompletionsSpeakThroughTheServerAdapterOnDirectCuda() => ChatCompletionsSpeak(BackendType.Cuda);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlCpu)]
+    public Task ChatCompletionsSpeakThroughTheServerAdapterOnGgmlCpu() => ChatCompletionsSpeak(BackendType.GgmlCpu);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.Cpu)]
+    public Task ChatCompletionsSpeakThroughTheServerAdapterOnManagedCpu() => ChatCompletionsSpeak(BackendType.Cpu);
 
     private async Task ChatCompletionsSpeak(BackendType backend)
     {
@@ -329,6 +367,12 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
     [CudaFact(ModelEnv)]
     public Task EngineSynthesisEqualsTheStandaloneSynthesisOnDirectCuda() => EngineSynthesisEqualsStandalone(BackendType.Cuda);
 
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlCpu)]
+    public Task EngineSynthesisEqualsTheStandaloneSynthesisOnGgmlCpu() => EngineSynthesisEqualsStandalone(BackendType.GgmlCpu);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.Cpu)]
+    public Task EngineSynthesisEqualsTheStandaloneSynthesisOnManagedCpu() => EngineSynthesisEqualsStandalone(BackendType.Cpu);
+
     private async Task EngineSynthesisEqualsStandalone(BackendType backend)
     {
         using Lfm3RuntimeModel model = LoadOmni(backend);
@@ -354,6 +398,12 @@ public sealed class Lfm3SpeechIntegrationRealModelTests
 
     [CudaFact(ModelEnv)]
     public Task ATextRequestDuringSynthesisKeepsItsReplyOnDirectCuda() => TextRequestDuringSynthesis(BackendType.Cuda);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.GgmlCpu)]
+    public Task ATextRequestDuringSynthesisKeepsItsReplyOnGgmlCpu() => TextRequestDuringSynthesis(BackendType.GgmlCpu);
+
+    [ModelFact(ModelEnv, GgmlBackend = BackendType.Cpu)]
+    public Task ATextRequestDuringSynthesisKeepsItsReplyOnManagedCpu() => TextRequestDuringSynthesis(BackendType.Cpu);
 
     private async Task TextRequestDuringSynthesis(BackendType backend)
     {

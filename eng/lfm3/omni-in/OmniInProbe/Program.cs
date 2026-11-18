@@ -8,6 +8,9 @@
 //                                        each pair's piece takes (llama.cpp's split)
 //   split  MODEL MMPROJ BACKEND IMAGE    an image's encode as one program and split for yields (2 and 4 programs),
 //                                        interleaved, seven times each: median ms and the rows' distance
+//   encode MODEL MMPROJ BACKEND IMAGE [REPS]
+//                                        an image's encode as one program, REPS times (default 5) after a warm one:
+//                                        median / min / max ms and a "RESULT vision_ms median min max" line (ab.py)
 //   stages MODEL MMPROJ BACKEND VIDEO     a video file's preparation stage by stage (decode + resize, soundtrack decode,
 //                                        features, pair encodes, soundtrack encode), three times
 //   layout MODEL MMPROJ BACKEND SYSTEM TEXT KIND=PATH...
@@ -31,6 +34,8 @@ switch (args[0])
         return Plan(args[1]);
     case "split" when args.Length >= 5:
         return Split(args[1], args[2], Backend(args[3]), args[4]);
+    case "encode" when args.Length >= 5:
+        return Encode(args[1], args[2], Backend(args[3]), args[4], args.Length > 5 ? int.Parse(args[5]) : 5);
     case "stages" when args.Length >= 5:
         return Stages(args[1], args[2], Backend(args[3]), args[4]);
     case "layout" when args.Length >= 6:
@@ -48,7 +53,7 @@ static BackendType Backend(string name) => name switch
 
 static int Usage()
 {
-    Console.Error.WriteLine("usage: OmniInProbe plan VIDEO | layout MODEL MMPROJ BACKEND SYSTEM TEXT KIND=PATH...");
+    Console.Error.WriteLine("usage: OmniInProbe plan VIDEO | split|encode MODEL MMPROJ BACKEND IMAGE [REPS] | stages MODEL MMPROJ BACKEND VIDEO | layout MODEL MMPROJ BACKEND SYSTEM TEXT KIND=PATH...");
     return 2;
 }
 
@@ -142,6 +147,32 @@ static int Split(string modelPath, string mmproj, BackendType backend, string im
         var t = times[parts].OrderBy(x => x).ToList();
         Console.WriteLine($"{w}x{h} ({patches} patches) in {parts} program(s): median {t[t.Count / 2]:F1} ms (min {t[0]:F1}), rel RMS vs one {Math.Sqrt(num / den):E2}");
     }
+    return 0;
+}
+
+static int Encode(string modelPath, string mmproj, BackendType backend, string imagePath, int reps)
+{
+    using ModelBase model = ModelBase.Create(modelPath, backend);
+    model.MultimodalInjector.LoadProjectors(mmproj);
+    Lfm3VisionEncoder vision = ((Lfm3RuntimeModel)model).VisionEncoder;
+    Lfm3RgbImage image = Lfm3ImageProcessor.LoadImage(imagePath);
+    (int w, int h) = vision.ImageSize(image.Width, image.Height);
+    Lfm3RgbImage frame = Lfm3ImageProcessor.Resize(image, w, h);
+    vision.YieldPatches = 0;
+    var sw = Stopwatch.StartNew();
+    int rows = vision.EncodeFrame(frame, () => { }).Rows.Length;
+    double cold = sw.Elapsed.TotalMilliseconds;
+    var times = new List<double>();
+    for (int rep = 0; rep < reps; rep++)
+    {
+        sw.Restart();
+        vision.EncodeFrame(frame, () => { });
+        times.Add(sw.Elapsed.TotalMilliseconds);
+    }
+    times.Sort();
+    double median = times[times.Count / 2];
+    Console.WriteLine($"{w}x{h} ({w / 16 * (h / 16)} patches, {rows} values): first {cold:F1} ms, then median {median:F1} ms (min {times[0]:F1}, max {times[^1]:F1}) of {reps} on {backend}");
+    Console.WriteLine(FormattableString.Invariant($"RESULT vision_ms {median:F2} {times[0]:F2} {times[^1]:F2}"));
     return 0;
 }
 

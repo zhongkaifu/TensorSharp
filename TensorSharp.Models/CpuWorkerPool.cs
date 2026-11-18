@@ -72,13 +72,24 @@ namespace TensorSharp.Models
         private readonly int _workers;
         private readonly Thread[] _threads;
 
+        // The job in flight, published under a sequence lock (_jobSeq odd while the
+        // submitter rewrites it): its body and its range [_jobBase, _jobEnd) of the
+        // claim counter. _next (the next unclaimed block) and _done (blocks finished)
+        // only ever grow, across all jobs: a job's range starts where the previous
+        // job's ended. So a block index belongs to exactly one job, a worker that read
+        // a job's fields can claim (CAS) only an index of that job while the job is
+        // still open, and a worker that is late - descheduled, or still parked - holds
+        // nothing up: the submitter waits for the blocks that were CLAIMED, not for
+        // every worker to look in. (Waiting for every worker made a 12-18 thread pool
+        // collapse whenever another process held one core: each of a step's few
+        // hundred jobs waited out that worker's time slice.)
         private Action<int> _body;
-        private int _blockCount;
-        private int _nextBlock;
-        private int _activeCount;
+        private long _jobBase;
+        private long _jobEnd;
+        private long _jobSeq;
+        private long _next;
+        private long _done;
         private int _parked;
-        private int _ready;
-        private bool _started;   // guarded by _submitLock
         private long _generation;
         private Exception _error;
         private volatile bool _shutdown;
@@ -109,16 +120,22 @@ namespace TensorSharp.Models
             // type's statics, so a thread that reaches them while the type
             // initializer is still running blocks on it - and the initializer is
             // what runs this constructor. Waiting here deadlocked every worker
-            // against the cctor. The handshake happens on the first For()
-            // instead, by which point the initializer has completed.
+            // against the cctor. Nothing waits for them later either: a job
+            // completes when its claimed blocks do, so a worker that starts late
+            // joins whatever job is in flight then.
         }
 
         private static int DefaultThreadCount()
         {
             string s = Environment.GetEnvironmentVariable("TS_CPU_THREADS");
             if (int.TryParse(s, out int n) && n > 0) return n;
-            return DefaultThreadCountFor(Environment.ProcessorCount);
+            return DefaultThreadCountFor(Environment.ProcessorCount, AppleSilicon);
         }
+
+        /// <summary>Apple silicon: no SMT, every logical processor is a core of its own.</summary>
+        private static bool AppleSilicon =>
+            (OperatingSystem.IsMacOS() || OperatingSystem.IsIOS() || OperatingSystem.IsMacCatalyst())
+            && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
 
         /// <summary>
         /// How wide the pool should be. NOT every core. The rationale dates from
@@ -131,9 +148,13 @@ namespace TensorSharp.Models
         /// run here as well, which the default has not been re-tuned for: above 8
         /// logical processors it is half of them (one per core on an SMT part such
         /// as the 8-core/16-thread i7-11800H). TS_CPU_THREADS overrides it.
+        ///
+        /// Apple silicon takes every core (<paramref name="oneThreadPerCore"/>): it has no SMT, and on an M5 Pro (6 + 12
+        /// cores) LFM3-1.7B Q4_K_M ran 596 / 526 / 426 tok/s prompts and 116 / 114 / 97 tok/s decode at 18 / 12 / 9
+        /// threads (once a job stopped waiting for every worker to look in: a descheduled worker no longer stalls it).
         /// </summary>
-        internal static int DefaultThreadCountFor(int processors)
-            => processors <= 8 ? Math.Max(1, processors) : Math.Max(8, processors / 2);
+        internal static int DefaultThreadCountFor(int processors, bool oneThreadPerCore = false)
+            => processors <= 8 || oneThreadPerCore ? Math.Max(1, processors) : Math.Max(8, processors / 2);
 
         /// <summary>Threads that will run a job, including the submitting one.</summary>
         public int ThreadCount => _workers + 1;
@@ -163,25 +184,17 @@ namespace TensorSharp.Models
             try
             {
                 ObjectDisposedException.ThrowIf(_shutdown, this);
-                // Every worker must have latched a generation before the first
-                // job is published. One that started late would otherwise latch a
-                // generation already in flight, skip that job, and never
-                // decrement the completion count - hanging the submitter.
-                if (!_started)
-                {
-                    var startSpin = new SpinWait();
-                    while (Volatile.Read(ref _ready) != _workers) startSpin.SpinOnce(-1);
-                    _started = true;
-                }
-
-                _body = body;
-                _blockCount = blockCount;
+                // Every earlier job is complete, so _next == _done == the new job's base.
+                long start = Volatile.Read(ref _next);
+                long end = start + blockCount;
                 _error = null;
-                Volatile.Write(ref _nextBlock, 0);
-                Volatile.Write(ref _activeCount, _workers);
+                Interlocked.Increment(ref _jobSeq);           // odd: fields being written
+                _body = body;
+                _jobBase = start;
+                _jobEnd = end;
+                Interlocked.Increment(ref _jobSeq);           // even: published (full fence)
 
-                // Full fence: publishes the fields above to every worker that
-                // subsequently observes the new generation.
+                // Full fence: workers that observe the new generation see the job.
                 Interlocked.Increment(ref _generation);
 
                 // Only pay for a wakeup when someone is actually parked. The
@@ -193,13 +206,19 @@ namespace TensorSharp.Models
                     lock (_sleepLock) Monitor.PulseAll(_sleepLock);
                 }
 
-                RunBlocks();
+                RunBlocks(body, start, end);
 
                 var spin = new SpinWait();
-                while (Volatile.Read(ref _activeCount) != 0) spin.SpinOnce(-1);
+                while (Volatile.Read(ref _done) != end) spin.SpinOnce(-1);
 
+                // Drop the delegate (and what it captured) until the next job.
+                Interlocked.Increment(ref _jobSeq);
                 _body = null;
-                Exception error = _error;
+                Interlocked.Increment(ref _jobSeq);
+
+                // A block's failure is recorded before the block is counted (Fail), so once _done == end every failure
+                // of this job is visible here, and none can land after this job returns.
+                Exception error = Volatile.Read(ref _error);
                 if (error != null)
                 {
                     _error = null;
@@ -244,32 +263,81 @@ namespace TensorSharp.Models
             }
         }
 
-        private void RunBlocks()
+        /// <summary>Claim and run blocks of the job [start, end) until none is left. A block index is claimed by a
+        /// compare-exchange that succeeds only while the index is still the next unclaimed one, so it can never take a
+        /// block of a later job.</summary>
+        private void RunBlocks(Action<int> body, long start, long end)
         {
-            Action<int> body = _body;
-            int count = _blockCount;
-            try
+            while (true)
             {
-                while (true)
+                long i = Volatile.Read(ref _next);
+                if (i < start || i >= end) return;
+                if (Interlocked.CompareExchange(ref _next, i + 1, i) != i) continue;
+                try
                 {
-                    int i = Interlocked.Increment(ref _nextBlock) - 1;
-                    if (i >= count) return;
-                    body(i);
+                    body((int)(i - start));
+                }
+                catch (Exception ex)
+                {
+                    Fail(ex, start, end);
+                    return;
+                }
+                Interlocked.Increment(ref _done);
+            }
+        }
+
+        /// <summary>
+        /// A block of the job [start, end) threw: record the first failure, claim the rest of the range so the other
+        /// threads wind down, and only then count the failed block (and the claimed rest) done. The order is the point:
+        /// the submitter returns once every block is counted, so a failure recorded after its block was counted (by a
+        /// <c>finally</c> that counted it, which runs before the <c>catch</c> that recorded it) was lost when that block
+        /// finished last, or surfaced in the NEXT job after the submitter had cleared <see cref="_error"/> for it.
+        /// </summary>
+        private void Fail(Exception ex, long start, long end)
+        {
+            Interlocked.CompareExchange(ref _error, ex, null);   // a full fence: visible before _done moves
+            long counted = 1;                                   // the block that threw
+            while (true)
+            {
+                long i = Volatile.Read(ref _next);
+                if (i < start || i >= end) break;
+                if (Interlocked.CompareExchange(ref _next, end, i) == i)
+                {
+                    counted += end - i;
+                    break;
                 }
             }
-            catch (Exception ex)
+            Interlocked.Add(ref _done, counted);
+        }
+
+        /// <summary>The job in flight, read consistently (retried while the submitter rewrites it).</summary>
+        private bool TryReadJob(out Action<int> body, out long start, out long end)
+        {
+            var spin = new SpinWait();
+            while (true)
             {
-                // Claim the rest of the range so the other threads wind down,
-                // and hand the first failure back to the submitter.
-                Interlocked.Exchange(ref _nextBlock, count);
-                Interlocked.CompareExchange(ref _error, ex, null);
+                long seq = Volatile.Read(ref _jobSeq);
+                if ((seq & 1) == 0)
+                {
+                    body = Volatile.Read(ref _body);
+                    start = Volatile.Read(ref _jobBase);
+                    end = Volatile.Read(ref _jobEnd);
+                    if (Volatile.Read(ref _jobSeq) == seq)
+                        return body != null;
+                }
+                if (_shutdown)
+                {
+                    body = null; start = end = 0;
+                    return false;
+                }
+                spin.SpinOnce(-1);
             }
         }
 
         private void WorkerLoop()
         {
-            long seen = Volatile.Read(ref _generation);
-            Interlocked.Increment(ref _ready);
+            // No generation seen yet: a worker that starts while a job is in flight joins it.
+            long seen = -1;
             _inJob = true;
             int spins = 0;
 
@@ -279,8 +347,8 @@ namespace TensorSharp.Models
                 if (gen != seen)
                 {
                     seen = gen;
-                    RunBlocks();
-                    Interlocked.Decrement(ref _activeCount);
+                    if (TryReadJob(out Action<int> body, out long start, out long end))
+                        RunBlocks(body, start, end);
                     spins = 0;
                     continue;
                 }

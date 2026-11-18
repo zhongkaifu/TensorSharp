@@ -2,7 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 //
 // LFM3 validation probe (TensorSharp side of eng/lfm3's llama.cpp comparisons; outputs belong in ignored artifacts/):
-//   ppl    MODEL BACKEND FILE CTX CHUNKS [--per-op]
+//   ppl    MODEL BACKEND FILE CTX CHUNKS [--per-op]   (also prints a digest of every scored logit's bits)
 //                                          perplexity as llama-perplexity computes it: the file's tokens (no BOS, special
 //                                          tokens not parsed) in CHUNKS chunks of CTX, each from an empty cache, scoring the
 //                                          second half of every chunk (row i predicts token i + 1); --per-op runs the shared
@@ -10,10 +10,13 @@
 //   tokens MODEL FILE OUT                  the file's token ids as llama-perplexity tokenizes it (one id a line)
 //   bench  MODEL BACKEND [PP,...|-] [TG] [DEPTH,...] [--reps N] [--greedy]
 //                                          prefill tokens/s of each PP-token prompt and decode tokens/s of TG tokens after
-//                                          DEPTH tokens (llama-bench's pp / tg / tg@d), each the median of N runs (3), with
-//                                          the decode steps' graph counters (runs, advances in place, builds). As llama-bench,
-//                                          decode feeds pseudo-random tokens (the timed loop holds no sampling); --greedy feeds
-//                                          each step's host argmax instead. A "RESULT name median min max" line per test.
+//                                          DEPTH tokens (llama-bench's pp / tg / tg@d), each the median of N runs (3; the mean
+//                                          of the middle two for an even N, as llama-bench's statistic), with the decode steps'
+//                                          graph counters (runs, advances in place, builds). Each test is warmed by one untimed
+//                                          run as llama-bench warms its tests (a decode test: TG tokens after a 1-token prompt,
+//                                          so the managed lane's JIT has tiered the decode kernels up). As llama-bench, decode
+//                                          feeds pseudo-random tokens (the timed loop holds no sampling); --greedy feeds each
+//                                          step's host argmax instead. A "RESULT name median min max" line per test.
 //   spec   MODEL BACKEND FILE N            N greedy tokens after the file's prompt, plainly and with n-gram speculation (a verify
 //                                          window keeps the short-conv inputs and attends under the sliding window; the accept
 //                                          count commits a prefix): the two streams must be equal
@@ -112,6 +115,7 @@ static int Perplexity(string path, BackendType backend, string file, int ctx, in
     var logits = new float[block * vocab];
     double nll = 0;
     long count = 0;
+    ulong digest = 14695981039346656037UL;   // FNV-1a over every scored row's logit bits: equal digests, equal logits
     var timer = Stopwatch.StartNew();
     for (int c = 0; c < chunks; c++)
     {
@@ -126,6 +130,8 @@ static int Perplexity(string path, BackendType backend, string file, int ctx, in
             for (int r = 0; r < rows && at + r < ctx - 1; r++)
             {
                 ReadOnlySpan<float> row = logits.AsSpan(r * vocab, vocab);
+                foreach (float v in row)
+                    digest = (digest ^ BitConverter.SingleToUInt32Bits(v)) * 1099511628211UL;
                 float max = float.NegativeInfinity;
                 foreach (float v in row) max = Math.Max(max, v);
                 double sum = 0;
@@ -138,6 +144,7 @@ static int Perplexity(string path, BackendType backend, string file, int ctx, in
     }
     Console.WriteLine();
     Console.WriteLine($"Final estimate: PPL = {Math.Exp(nll / count):F4} over {count} tokens ({timer.Elapsed.TotalSeconds:F1} s)");
+    Console.WriteLine($"logits digest {digest:X16}, nll {nll:R}");
     return 0;
 }
 
@@ -147,7 +154,13 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     var runtime = model as StandardDecoderModel;
     int vocab = model.Config.VocabSize;
     int[] Tokens(int n, int seed) => Enumerable.Range(0, n).Select(i => 1000 + (int)((uint)(i * 2654435761u + seed) % 60000u)).ToArray();
-    static double Median(List<double> v) { v.Sort(); return v[v.Count / 2]; }
+    // The true median: the mean of the middle two for an even count (llama-bench-result.sh's statistics.median). Taking
+    // the upper one made a 2-rep figure the faster run, while llama.cpp's was the mean of its two.
+    static double Median(List<double> v)
+    {
+        v.Sort();
+        return v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2;
+    }
 
     // Warm: kernels load and graphs build once, and the host code the prompt and decode steps run is past .NET's first
     // (tier-0) compilation, as in a server that has run a while: 40 prompt steps of up to 512 rows, then 64 decode steps.
@@ -165,6 +178,10 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
 
     foreach (int n in prompts)
     {
+        // One untimed prompt of this size first, as llama-bench warms every test with its own prompt: a size's first
+        // step builds its graphs, and on the managed lane its kernels are still being tiered up by the JIT.
+        model.ResetKVCache();
+        model.ForwardRefill(Tokens(n, 5));
         var rates = new List<double>();
         for (int rep = 0; rep < reps; rep++)
         {
@@ -179,6 +196,13 @@ static int Bench(string path, BackendType backend, int[] prompts, int generate, 
     }
     foreach (int depth in generate > 0 ? depths : Array.Empty<int>())
     {
+        // One untimed decode run first, as llama-bench warms every test (with one token: its kernels are compiled ahead
+        // of time). The managed lane's decode kernels are still being tiered up by the JIT after the start-up warm-up's
+        // 8 tokens, and its first timed run was 25-35 % slower than the rest. At depth 0, so a deep test does not pay
+        // its prompt twice.
+        model.ResetKVCache();
+        model.ForwardRefill(new[] { 1 });
+        foreach (int token in Tokens(generate, 9)) model.Forward(new[] { token });
         var rates = new List<double>();
         int runs0 = runtime?.GraphRuns ?? 0, advances0 = runtime?.DecodeAdvances ?? 0, builds0 = runtime?.GraphBuilds ?? 0;
         for (int rep = 0; rep < reps; rep++)

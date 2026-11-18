@@ -198,13 +198,15 @@ public sealed class Qwen35RuntimeTests : IDisposable
         // Measured 2026-11-12 (M5 Pro) against Qwen35Model on the same backend: ggml_metal 1.1e-5 at most, ggml_cpu
         // 2.0e-2 (its BF16-rounded activations, as PerOpTolerance bounds); the golden is ggml_cpu's, so every backend
         // sits within that rounding of it, plus its own where it rounds activations too (ggml_cuda on an RTX A5000:
-        // 2.52e-2). With the rotations left out the first row is 1.2 away.
-        double tolerance = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan ? 3.5e-2 : 2.5e-2;
+        // 2.52e-2). ggml_cpu on ARM64 no longer rounds them (BF16 products over F32 activations,
+        // ggml_ops_cpu_products.cpp: LFM3's BF16 fixture moved from 1.1-2.0e-2 to 1.3-2.2e-6 off the managed reference),
+        // so it sits the golden's own rounding away (1.8-3.0e-2 per row on an M5 Pro, 2026-11-17). With the rotations
+        // left out the first row is 1.2 away.
+        double tolerance = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlCpu ? 3.5e-2 : 2.5e-2;
+        double[] rel = actual.Take(legacy.Count).Select((row, i) => RelL2(row, legacy[i])).ToArray();
+        _output.WriteLine($"{backend}: relL2 per row from Qwen35Model {string.Join(" ", rel.Select(r => r.ToString("E2")))}");
         for (int i = 0; i < legacy.Count; i++)
-        {
-            double rel = RelL2(actual[i], legacy[i]);
-            Assert.True(rel <= tolerance, $"row {i}: relL2 {rel:E2} from Qwen35Model");
-        }
+            Assert.True(rel[i] <= tolerance, $"row {i}: relL2 {rel[i]:E2} from Qwen35Model");
     }
 
     /// <summary>Off GGML no path applies the rotations: the load says so instead of answering unrotated.</summary>
