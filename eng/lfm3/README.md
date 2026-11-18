@@ -29,7 +29,13 @@ in the ignored `artifacts/lfm3/`.
     logit's bits: two builds whose kernels claim the same arithmetic must print the same digest;
   - `tokens MODEL FILE OUT` writes the file's ids, to compare with `llama-tokenize --ids --no-bos --no-parse-special`;
   - `bench MODEL BACKEND [PP,...] [TG] [DEPTH,...]` measures prefill and decode tokens/s as llama-bench's pp / tg /
-    tg@d do, with the decode steps' graph counters (runs, advances in place, builds).
+    tg@d do, with the decode steps' graph counters (runs, advances in place, builds);
+  - `chat MODEL REQUESTS OUT` writes each chat request's prompt token ids as the server renders a fresh request (the
+    GGUF template through `KVCachePromptRenderer`, the tokenizer's BOS).
+- `prompt-parity.py` compares those ids with llama-server's (`/apply-template` + `/tokenize`) and Hugging Face's
+  (`apply_chat_template`, run with a Python that has transformers) for the same requests: `requests` writes GSM8K
+  requests as `e2e/gsm8k.py` sends them, `llama` / `hf` render them, `diff` reports identical requests and the first
+  differing token of each that is not (exit 1).
 
 - `gpu-matrix.sh OUT MODELS_DIR CASES_DIR CORPUS [MODEL ...]` runs the text comparison on a Linux GPU machine (CUDA and
   Vulkan): builds `llamacpp-forced` against llama.cpp's `build-cuda/` and `build-vk/` trees (`LLAMA`), records llama.cpp's

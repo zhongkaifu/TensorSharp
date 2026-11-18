@@ -21,9 +21,15 @@
 //   spec   MODEL BACKEND FILE N            N greedy tokens after the file's prompt, plainly and with n-gram speculation (a verify
 //                                          window keeps the short-conv inputs and attends under the sliding window; the accept
 //                                          count commits a prefix): the two streams must be equal
+//   chat   MODEL REQUESTS OUT              each chat request's prompt token ids as TensorSharp.Server renders a fresh request
+//                                          (the GGUF template through KVCachePromptRenderer, the tokenizer's BOS): REQUESTS is
+//                                          JSONL {"id", "messages": [{"role", "content"}], "enable_thinking"}, OUT gets
+//                                          {"id", "tokens"} a line; eng/lfm3/prompt-parity.py compares them with llama-server's
+//                                          and Hugging Face's renders of the same requests
 // BACKEND: ggml_metal | ggml_cpu | cpu | mlx | ggml_cuda | ggml_vulkan | cuda
 using System.Diagnostics;
 using System.Globalization;
+using System.Text.Json;
 using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
@@ -50,6 +56,8 @@ switch (args[0])
     }
     case "spec" when args.Length >= 5:
         return Speculation(args[1], Backend(args[2]), args[3], int.Parse(args[4]));
+    case "chat" when args.Length >= 4:
+        return ChatPromptTokens(args[1], args[2], args[3]);
     case "bench" when args.Length >= 3:
     {
         string[] positional = args.Where((a, i) => !a.StartsWith("--", StringComparison.Ordinal) && (i == 0 || args[i - 1] != "--reps")).ToArray();
@@ -66,8 +74,35 @@ switch (args[0])
 
 static int Usage()
 {
-    Console.Error.WriteLine("usage: Lfm3Probe ppl MODEL BACKEND FILE CTX CHUNKS [--per-op] | spec MODEL BACKEND FILE N | tokens MODEL FILE OUT | bench MODEL BACKEND [PP,..|-] [TG] [DEPTH,..] [--reps N] [--greedy]");
+    Console.Error.WriteLine("usage: Lfm3Probe ppl MODEL BACKEND FILE CTX CHUNKS [--per-op] | spec MODEL BACKEND FILE N | tokens MODEL FILE OUT | chat MODEL REQUESTS OUT | bench MODEL BACKEND [PP,..|-] [TG] [DEPTH,..] [--reps N] [--greedy]");
     return 2;
+}
+
+static int ChatPromptTokens(string path, string requests, string output)
+{
+    using var gguf = GgufFile.OpenWithoutSiblingShards(path);
+    ITokenizer tokenizer = ModelBase.CreateTokenizerFromGguf(gguf);
+    string template = gguf.GetString("tokenizer.chat_template");
+    string architecture = gguf.GetString("general.architecture");
+    var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
+    using var writer = new StreamWriter(output);
+    int count = 0;
+    foreach (string line in File.ReadLines(requests))
+    {
+        if (string.IsNullOrWhiteSpace(line)) continue;
+        using JsonDocument doc = JsonDocument.Parse(line);
+        JsonElement root = doc.RootElement;
+        var messages = root.GetProperty("messages").EnumerateArray()
+            .Select(m => new ChatMessage { Role = m.GetProperty("role").GetString(), Content = m.GetProperty("content").GetString() })
+            .ToList();
+        bool thinking = root.TryGetProperty("enable_thinking", out JsonElement t) && t.GetBoolean();
+        List<int> tokens = renderer.RenderToTokens(tokenizer, template, messages, architecture, addGenerationPrompt: true,
+            enableThinking: thinking);
+        writer.WriteLine(JsonSerializer.Serialize(new { id = root.GetProperty("id").GetRawText(), tokens }));
+        count++;
+    }
+    Console.Error.WriteLine($"rendered {count} requests ({architecture}, template {template?.Length ?? 0} chars)");
+    return 0;
 }
 
 static int Speculation(string path, BackendType backend, string file, int count)
