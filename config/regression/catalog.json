@@ -605,7 +605,7 @@
         "audio"
       ],
       "layout": "dense",
-      "notes": "Liquid LFM3 (1.7B) and LFM3-Omni (2B) share general.architecture lfm3: 13 short-conv + 11 GQA attention layers (5 sliding-window). The text decoder runs on the shared runtime (sliding-window attention, head-wise gates, sandwich norms, short convolutions) and matches llama.cpp; the chat protocol (GGUF template, reasoning, Qwen3-Coder XML tools, Omni media placeholders) matches llama.cpp's renders. Image/video/audio need the Omni projector; speech output is not served. CUDA and Vulkan routes are unvalidated (no GPU run yet).",
+      "notes": "Liquid LFM3 (1.7B) and LFM3-Omni (2B) share general.architecture lfm3: 13 short-conv + 11 GQA attention layers (5 sliding-window). The text decoder runs on the shared runtime (sliding-window attention, head-wise gates, sandwich norms, short convolutions) and matches llama.cpp; the chat protocol (GGUF template, reasoning, Qwen3-Coder XML tools, Omni media placeholders) matches llama.cpp's renders. Image/video/audio in and speech out need the Omni projector. ggml_cuda, direct CUDA and ggml_vulkan were checked against llama.cpp on an NVIDIA A40; the NVFP4 config's FP4 tensor-core route (Blackwell) has not run.",
       "source_evidence": [
         "TensorSharp.Models/Models/Lfm3/Lfm3Architecture.cs",
         "TensorSharp.Models/Models/Lfm3/Lfm3RuntimeModel.cs",
@@ -2108,7 +2108,7 @@
       },
       "notes": [
         "Not a reasoning model (template default enable_thinking=false), so no cli_thinking scenario.",
-        "One mmproj holds the vision tower (lfm3vl), the audio encoder (lfm3a) and the speech generator (lfm3a_gen); media scenarios need the LFM3 encoders, and an absent encoder event is untested, not a pass. Speech output is not served.",
+        "One mmproj holds the vision tower (lfm3vl), the audio encoder (lfm3a) and the speech generator (lfm3a_gen); media scenarios need the LFM3 encoders, and an absent encoder event is untested, not a pass. Speech output (TTS, chat modalities audio) is not among this entry's scenarios.",
         "The Q8_0 projector is 506842528 bytes on disk; plan for its dequantized copies, not the download size."
       ],
       "status": "configured"

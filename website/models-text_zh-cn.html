@@ -213,7 +213,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
   <p>第一版：仅文本、单设备、走通用 per-op 路径，没有思考通道也没有工具解析器。多余的 GPU 会闲置，启动时会明说，而不用去猜。</p>
 
   <h3 id="lfm3">LFM3 / LFM3-Omni（文本；Omni 支持图像、视频、音频）</h3>
-  <p>Liquid 的 LFM3-1.7B 与 LFM3-Omni-2B 都声明 <code>general.architecture = lfm3</code>：24 层，其中 13 层是带固定逐序列状态的门控短卷积层，11 层是带 sigmoid 输出门的 GQA 注意力层（5 层为 256 滑动窗口）。1.7B 支持推理与工具调用（Qwen3-Coder XML）；Omni 另带一个含视觉编码器、音频编码器与语音生成器的投影器，不做推理。GGUF 模板按原样渲染，与 llama.cpp 的渲染逐字节一致；TensorSharp 请求默认关闭思考，要使用 1.7B 模型卡的默认模式请发送 <code>"think": true</code>。生成、Omni 编码器以及 CUDA 与 Vulkan 路径已与 llama.cpp 核对；不提供语音输出。</p>
+  <p>Liquid 的 LFM3-1.7B 与 LFM3-Omni-2B 都声明 <code>general.architecture = lfm3</code>：24 层，其中 13 层是带固定逐序列状态的门控短卷积层，11 层是带 sigmoid 输出门的 GQA 注意力层（5 层为 256 滑动窗口）。1.7B 支持推理与工具调用（Qwen3-Coder XML）；Omni 另带一个含视觉编码器、音频编码器与语音生成器的投影器，不做推理。GGUF 模板按原样渲染，与 llama.cpp 的渲染逐字节一致；TensorSharp 请求默认关闭思考，要使用 1.7B 模型卡的默认模式请发送 <code>"think": true</code>。生成、Omni 编码器以及 CUDA 与 Vulkan 路径已与 llama.cpp 核对；Omni 还能说话（<code>/v1/audio/speech</code>，以及 <code>modalities</code> 含 audio 的聊天回复）。</p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/lfm3-1.7b.json --think --input prompt.txt
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/lfm3-omni-2b.json</code></pre>
   <p>→ <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/lfm3_zh-cn.md">模型卡</a>（文件、聊天模板、媒体占位符、采样）</p>
