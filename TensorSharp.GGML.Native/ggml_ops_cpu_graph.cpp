@@ -377,34 +377,36 @@ namespace tsg
     void cpu_pools_create(ggml_backend_t backend, std::vector<ggml_threadpool_t>& owned)
     {
         // A bare ggml_backend_cpu_init() runs GGML_DEFAULT_N_THREADS (4) and spawns a DISPOSABLE thread pool per
-        // graph_compute. Prompt steps default to ALL physical cores on one persistent pool: llama.cpp defaults to the
-        // P-cores on Apple Silicon, which on an M5 Pro (6P+12E) leaves ~2x of prompt throughput on the table (LFM3-1.7B
-        // Q4_K_M pp512: 166 tok/s at 6 threads, 381 at 18; Muse-Glimmer 30B decode 3.8 -> 8.2 tok/s).
+        // graph_compute. Prompt steps run on one persistent pool over the physical cores: llama.cpp defaults to the P-cores
+        // on Apple Silicon, which on an M5 Pro (6P+12E) leaves ~2x of prompt throughput on the table (LFM3-1.7B Q4_K_M
+        // pp512: 166 tok/s at 6 threads, 381 at 18; Muse-Glimmer 30B decode 3.8 -> 8.2 tok/s). The pool's workers wait for
+        // each other at every node, so a worker that loses its core to one of the host's own threads (the .NET runtime,
+        // the server) stalls the step: on a hybrid Apple CPU the pool leaves one physical core to them (M5 Pro, LFM3-1.7B,
+        // 18 -> 17 threads, interleaved, 4 rounds: Q4_K_M pp128 / pp512 / pp2048 812 -> 893 / 893 -> 899 / 860 -> 868
+        // tok/s, Q8_0 1149 -> 1170 / 1115 -> 1170 / 1089 -> 1096). Elsewhere (no measurement yet) every physical core.
         // TS_GGML_CPU_THREADS overrides the count for every step.
         const int forced = env_threads("TS_GGML_CPU_THREADS");
-        int prompt = forced;
+        int physical = 0, perf = 0, eff = 0;
 #if defined(__APPLE__)
-        if (prompt <= 0) prompt = sysctl_int("hw.physicalcpu");
+        physical = sysctl_int("hw.physicalcpu");
+        perf = sysctl_int("hw.perflevel0.physicalcpu");
+        eff = sysctl_int("hw.perflevel1.physicalcpu");
 #endif
+        const bool hybrid = physical > 0 && perf > 0 && eff > 0;
+        int prompt = forced;
+        if (prompt <= 0 && physical > 0) prompt = hybrid ? std::max(perf, physical - 1) : physical;
         if (prompt <= 0) prompt = available_cpu_parallelism();
 
         // Decode steps read every weight once per token and end a few hundred small nodes at barriers every thread must
-        // reach, so one descheduled worker stalls the step. With a worker on every core the host's own threads (the
-        // .NET runtime, the calling loop) take cores from the pool; on a hybrid Apple CPU decode runs best on every
-        // physical core but two (M5 Pro, 6P+12E, LFM3-1.7B tg128 at depth 0 / 4096 tok/s, interleaved: Q4_K_M 166.6 /
-        // 139.6 on 10 threads, 157.3 / 134.4 on 12, 166.2 / 143.7 on 14, 168.6 / 147.6 on 16, 124.5 / 128.4 on 18;
-        // Q4_0 and Q8_0 likewise within 4 % of their best at 16). Elsewhere (no measurement yet) decode keeps the
+        // reach, so one descheduled worker stalls the step, more so than a prompt step's: on a hybrid Apple CPU decode
+        // runs best on every physical core but two (M5 Pro, 6P+12E, LFM3-1.7B tg128 at depth 0 / 4096 tok/s, interleaved:
+        // Q4_K_M 166.6 / 139.6 on 10 threads, 157.3 / 134.4 on 12, 166.2 / 143.7 on 14, 168.6 / 147.6 on 16, 124.5 / 128.4
+        // on 18; Q4_0 and Q8_0 likewise within 4 % of their best at 16). Elsewhere (no measurement yet) decode keeps the
         // prompt count. TS_GGML_CPU_DECODE_THREADS overrides it; with only TS_GGML_CPU_THREADS set, decode takes that
         // count too.
         int decode = env_threads("TS_GGML_CPU_DECODE_THREADS");
         if (decode <= 0) decode = forced;
-#if defined(__APPLE__)
-        if (decode <= 0)
-        {
-            const int perf = sysctl_int("hw.perflevel0.physicalcpu"), eff = sysctl_int("hw.perflevel1.physicalcpu");
-            if (perf > 0 && eff > 0) decode = std::max(perf, prompt - 2);
-        }
-#endif
+        if (decode <= 0 && hybrid) decode = std::max(perf, physical - 2);
         if (decode <= 0) decode = prompt;
 
         CpuPools p;
