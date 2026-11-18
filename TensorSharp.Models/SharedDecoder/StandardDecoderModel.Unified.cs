@@ -70,18 +70,21 @@ namespace TensorSharp.Models
             // fixed order (EnsureDeviceRoom: pooled slots, parked recordings, finished conversations the oldest first, the
             // cached graphs last; dropping every graph first had every running request trace and record again); elsewhere the
             // recordings go first, then finished requests' retained slots, the oldest first. A step that still does not fit
-            // is narrower, this prompt only.
+            // is narrower, this prompt only. On one device the step is sized from the room EnsureDeviceRoom counted: a reading
+            // after it leaves out the retained window buffers it freed (they wait in the allocator's small-block cache), and
+            // narrowed the step anyway, those buffers given up for nothing.
             long need = rows * CudaPromptRowBytes() + CudaPromptReserveBytes;
             if (PromptFreeBytes(cuda) < need)
             {
+                long now;
                 if (DeviceRoomManaged)
-                    EnsureDeviceRoom(need, RunningSlots(), RoomUse.PromptStep, mayEvict: true, "a prompt step");
+                    EnsureDeviceRoom(need, RunningSlots(), RoomUse.PromptStep, mayEvict: true, "a prompt step", out now);
                 else
                 {
                     ClearGraphCache();
                     if (PromptFreeBytes(cuda) < need) ReleaseRetainedSlotsFor(need, cuda);
+                    now = PromptFreeBytes(cuda);
                 }
-                long now = PromptFreeBytes(cuda);
                 if (now < need)
                     return (int)Math.Clamp((now - CudaPromptReserveBytes) / CudaPromptRowBytes() / 256 * 256, 256, _cudaPromptRows);
             }

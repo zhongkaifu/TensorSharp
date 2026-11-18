@@ -1535,9 +1535,13 @@ public sealed class Qwen35RuntimeTests : IDisposable
             $"the kept copy continues {RelL2(logits[0], expected):E2} (relative L2) from the request it copied");
     }
 
-    /// <summary>On direct CUDA, where the device has no room for a fresh slot, a new request takes the oldest retained slot (its
-    /// payload reclaimed) rather than allocating: it replays the recordings the finished request parked there, and answers as
-    /// that request did.</summary>
+    /// <summary>On direct CUDA, where the device has no room for a fresh slot, a new request takes the oldest retained slot that
+    /// holds it (its payload reclaimed) rather than allocating, and answers as the finished request did. The device is full as
+    /// the model reads it (DeviceRoomForTests, what making room measures; its answer is final) and as the takeover's own check
+    /// reads it (SlotDeviceMemoryForTests). Making room gave up the parked recordings first (the cheapest loss), the finished
+    /// request's among them, so the new request records its steps again: before, this test's device had room by the model's
+    /// own reading and was full only by the takeover's, which took the slot with its recordings, a state no real device
+    /// reaches.</summary>
     [CudaFact]
     public void ANewRequestReclaimsARetainedSlotWhenTheDeviceIsFullOnDirectCuda()
     {
@@ -1563,12 +1567,11 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
         List<float[]> first = Request("a");
         Assert.True(model.RetainSequenceCacheAs("a", "kept"));
+        model.DeviceRoomForTests = () => (0, 1L << 34);
         model.SlotDeviceMemoryForTests = _ => (0, 1L << 34);
-        int adopted = model.RecordingsAdopted;
         List<float[]> second = Request("b");
         Assert.Equal(1, model.RetainedSlotsReclaimed);
         Assert.False(model.TryRebindRetainedCache("kept", "c"));
-        Assert.True(model.RecordingsAdopted > adopted, "the new request recorded its steps again on a new slot");
         for (int i = 0; i < first.Count; i++)
             Assert.True(first[i].AsSpan().SequenceEqual(second[i]), $"row {i} differs on the reclaimed slot");
     }

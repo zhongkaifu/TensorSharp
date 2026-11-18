@@ -150,15 +150,27 @@ namespace TensorSharp.Models
         /// </list>
         /// <paramref name="keep"/> holds the slots a step or a copy is about to use. False when even these made no room. One
         /// line goes to stderr for every call that released a conversation, naming what for.
+        /// <para>The answer is the room: a caller does not read the device again to second-guess it. The window buffers stage 4
+        /// frees wait in the CUDA allocator's small-block cache, which no reading of the device counts (an allocation that needs
+        /// them takes them back at the reclaim ladder's second rung), so a reading after a true answer can still look short, and
+        /// acting on it lost a conversation or narrowed a prompt step for room that had been made.</para>
         /// </summary>
         /// <param name="blockBytes">The size of the tensors the allocation is made of, whose cached blocks stay.</param>
         private bool EnsureDeviceRoom(long bytes, ReadOnlySpan<Slot> keep, RoomUse use, bool mayEvict, string what, long blockBytes = 0)
+            => EnsureDeviceRoom(bytes, keep, use, mayEvict, what, out _, blockBytes);
+
+        /// <summary>Make room as above, and say how much there is.</summary>
+        /// <param name="room">The free bytes the stages reached, with the window buffers stage 4 freed (what a caller sizes its
+        /// allocation from); long.MaxValue where the model does not manage the device or <paramref name="bytes"/> are none.</param>
+        private bool EnsureDeviceRoom(long bytes, ReadOnlySpan<Slot> keep, RoomUse use, bool mayEvict, string what, out long room, long blockBytes = 0)
         {
+            room = long.MaxValue;
             if (!DeviceRoomManaged || bytes <= 0) return true;
             _slotMutationDepth++;
             try
             {
                 long free = RoomFree(use), before = free;
+                room = free;
                 long total = _deviceReading.Total;
                 if (DeviceRoomForTests is { } stand) total = stand().Total;
                 if (total <= 0) return true;   // the device does not say
@@ -243,6 +255,7 @@ namespace TensorSharp.Models
                     free = RoomFree(use);
                 }
 
+                room = free;
                 if (free < need) return false;
                 // 1. The allocation's room at the driver: the free bytes counted the cached large blocks (the last reading's).
                 if (DeviceRoomForTests == null && _allocator is TensorSharp.Cuda.CudaAllocator cuda
@@ -372,23 +385,27 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// A new request's slot on a device this model manages, made only where it fits: a pooled slot that holds the request,
-        /// else room for a fresh one beside the headroom and a prompt's step or its recordings, made from pooled slots and
-        /// parked recordings; short of that, the oldest retained slot that holds the request runs it (the recordings its
-        /// request parked there adopted, <see cref="ReclaimRetainedSlot"/>), then finished conversations are released for a
-        /// fresh one. A request that still finds no room waits beside running ones
+        /// else room for a fresh one beside the headroom and a prompt's step or its recordings, made from pooled slots, parked
+        /// recordings and retained slots' window buffers; short of that, the oldest retained slot that holds the request runs it
+        /// (<see cref="ReclaimRetainedSlot"/>: nothing is allocated; the recordings its request parked there went with the
+        /// parked recordings making room gave up), then finished conversations are released for a fresh one. Room made is room
+        /// had: no reading of the device second-guesses it. A request that still finds no room waits beside running ones
         /// (<see cref="SequenceSlotUnavailableException"/>); alone, it runs where its slot fits beside the headroom and the
         /// narrowest prompt step, and is refused with the numbers where it does not, before any of its prompt runs (it had
         /// failed part way with CUDA error 2).
         /// </summary>
         private Slot NewSlotWithRoom(string requestId, int reserve)
         {
-            int capacity = AlignedSlotCapacity(Math.Max(Math.Max(1, reserve), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength))));
+            int capacity = NewSlotCapacity(reserve);
             if (_slotPool?.Exists(p => p.Capacity >= capacity) == true)
                 return ReclaimRetainedSlot(reserve) ?? NewSlot(reserve);
             Slot[] keep = RunningSlots();
             long bytes = SlotBytesEstimate(capacity), block = CacheBlockBytes(capacity);
+            // Room made is room had: a retained slot is taken over only where none could be made (ReclaimRetainedSlot's own
+            // check reads the device, which leaves out the window buffers stage 4 freed, and took the oldest conversation over
+            // for nothing where they had made the room).
             if (EnsureDeviceRoom(bytes, keep, RoomUse.Slot, mayEvict: false, "a new request's slot", block))
-                return ReclaimRetainedSlot(reserve) ?? NewSlot(reserve);
+                return NewSlot(reserve);
             if (ReclaimRetainedSlot(reserve, roomShort: true) is { } reclaimed)
                 return reclaimed;
             if (EnsureDeviceRoom(bytes, keep, RoomUse.Slot, mayEvict: true, "a new request's slot", block))
@@ -407,6 +424,18 @@ namespace TensorSharp.Models
             SlotRefusals++;
             throw SlotRefusal(requestId, capacity, bytes);
         }
+
+        /// <summary>The cells of a new request's slot for a reservation of <paramref name="reserve"/> tokens.</summary>
+        private int NewSlotCapacity(int reserve)
+            => AlignedSlotCapacity(Math.Max(Math.Max(1, reserve), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength))));
+
+        /// <summary>Tests: the free bytes a new request's slot for <paramref name="reserve"/> tokens wants (<see cref="RoomNeed"/>),
+        /// against the device's total as the model reads it.</summary>
+        internal long NewSlotRoomNeedForTests(int reserve)
+            => RoomNeed(SlotBytesEstimate(NewSlotCapacity(reserve)), DeviceMemory(fresh: true).Total, RoomUse.Slot);
+
+        /// <summary>Tests: the bytes of a lone prompt's widest step on direct CUDA (its rows' activations and scratch).</summary>
+        internal long PromptStepBytesForTests => PromptStepBytes;
 
         /// <summary>The refusal of a request whose slot does not fit the device alone, with the numbers.</summary>
         private InvalidOperationException SlotRefusal(string requestId, int capacity, long bytes)

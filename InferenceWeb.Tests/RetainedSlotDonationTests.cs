@@ -336,6 +336,101 @@ public sealed class RetainedSlotDonationTests : IDisposable
         Assert.Equal(k1, Buffers("k1"));
     }
 
+    /// <summary>The verify buffers <paramref name="key"/>'s retained slot keeps (-1 once it is gone).</summary>
+    private static long RetainedWindowBytes(Qwen35RuntimeModel model, string key)
+        => model.RetainedStatesForTests(key)?.SelectMany(l => l ?? Array.Empty<StandardDecoderModel.RecurrentState>())
+            .Sum(s => s?.SpecBufferBytes ?? 0) ?? -1;
+
+    /// <summary>Two finished conversations, k0 then k1, donated on direct CUDA with the window buffers a verify window bound.</summary>
+    private (Qwen35RuntimeModel Model, long K0, long K1) TwoRetainedConversationsOnDirectCuda(RecordingPayloadSink sink)
+    {
+        Qwen35RuntimeModel model = Create(BackendType.Cuda, sink: sink);
+        model.RetainCopyMaxBytesForTests = 0;   // donated whatever its size: the retained slots keep their window buffers
+        foreach (string key in new[] { "k0", "k1" })
+        {
+            (int length, int next) = Run(model, key, steps: 1);
+            Window(model, key, ref length, next);
+            Assert.True(model.RetainSequenceCacheAs(key, key));
+        }
+        long k0 = RetainedWindowBytes(model, "k0"), k1 = RetainedWindowBytes(model, "k1");
+        Assert.True(k0 > 0 && k1 > 0, "the retained slots kept no window buffers");
+        return (model, k0, k1);
+    }
+
+    /// <summary>
+    /// On direct CUDA a new request's slot whose room the retained window buffers made is a fresh one: no retained conversation
+    /// is taken over for it (reported reclaimed, its next turn prefilling again). The buffers making room frees are each under
+    /// the allocator's 2 MiB large-block size, so they wait in its small-block cache, which no reading of the device counts:
+    /// making room counts them, and had then been second-guessed by the retained-slot takeover's own check, which reads the
+    /// device without them. Here that check's reading (SlotDeviceMemoryForTests) is short of a slot, as the allocator's reading
+    /// is once the counted buffers outgrow the gap between the two checks' needs (a request's 1.5 GiB of recordings against a
+    /// prompt step's room: about 0.4 GiB on Qwen3.8-27B, some ten retained slots' buffers); the device's reading for making
+    /// room (DeviceRoomForTests) never sees the buffers freed. The new request reserves 2,048 tokens, more than the spare slots
+    /// the prefix cache's copies leave pooled here hold (1,024 cells, the largest slot a request ran in), so it makes room.
+    /// </summary>
+    [CudaFact]
+    public void ANewSlotWhoseRoomRetainedWindowBuffersMadeTakesNoConversationOverOnDirectCuda()
+    {
+        const long GB = 1L << 30;
+        const int Reserve = 2048;
+        var sink = new RecordingPayloadSink();
+        var (model, k0, k1) = TwoRetainedConversationsOnDirectCuda(sink);
+        using (model)
+        {
+            long free = 0;
+            model.DeviceRoomForTests = () => (free, 16 * GB);
+            free = model.NewSlotRoomNeedForTests(Reserve) - k0 + 1;   // short by less than the oldest slot's buffers
+            model.SlotDeviceMemoryForTests = _ => (free - GB, 16 * GB);
+            int[] stages = model.DeviceRoomStages.ToArray();
+            int reclaimed = model.RetainedSlotsReclaimed;
+
+            Assert.Equal(0, ((IUnifiedBatchModel)model).EnsureSequenceSlot("new", Reserve));
+
+            Assert.Empty(sink.Reports);
+            Assert.Equal(reclaimed, model.RetainedSlotsReclaimed);
+            Assert.Equal(new[] { "k0", "k1" }, model.RetainedPayloadKeys.OrderBy(k => k, StringComparer.Ordinal));
+            Assert.Equal(stages[4] + 1, model.DeviceRoomStages[4]);
+            Assert.Equal(stages[5], model.DeviceRoomStages[5]);
+            Assert.Equal(0, RetainedWindowBytes(model, "k0"));
+            Assert.Equal(k1, RetainedWindowBytes(model, "k1"));
+            model.DeviceRoomForTests = null;
+            model.SlotDeviceMemoryForTests = null;
+            Assert.True(((IUnifiedBatchModel)model).TryForwardUnified(new[] { "new" }, new[] { _prompt }, new[] { 0 }, new float[1][]));
+        }
+    }
+
+    /// <summary>
+    /// On direct CUDA a lone prompt's step whose room the retained window buffers made keeps its width: it is sized from the
+    /// room making it counted, not from a reading after it, which leaves out the buffers freed into the allocator's
+    /// small-block cache and had narrowed the step anyway (2,048 rows to 1,792 here), the buffers given up for nothing. The
+    /// prompt's reading (PromptFreeBytesForTests) never sees the buffers freed.
+    /// </summary>
+    [CudaFact]
+    public void APromptStepWhoseRoomRetainedWindowBuffersMadeKeepsItsWidthOnDirectCuda()
+    {
+        var sink = new RecordingPayloadSink();
+        var (model, k0, k1) = TwoRetainedConversationsOnDirectCuda(sink);
+        using (model)
+        {
+            const int Remaining = 1 << 16;
+            int rows = model.PreferredSoloPrefillTokens(0, Remaining);   // the widest step, sized from the device's memory
+            Assert.True(rows >= 256, $"a {Remaining}-token prompt runs in {rows}-row steps");
+            long need = model.PromptStepBytesForTests;
+            model.PromptFreeBytesForTests = () => need - k0 + 1;   // short by less than the oldest slot's buffers
+            int[] stages = model.DeviceRoomStages.ToArray();
+
+            Assert.Equal(rows, model.PreferredSoloPrefillTokens(0, Remaining));
+
+            Assert.Empty(sink.Reports);
+            Assert.Equal(new[] { "k0", "k1" }, model.RetainedPayloadKeys.OrderBy(k => k, StringComparer.Ordinal));
+            Assert.Equal(stages[4] + 1, model.DeviceRoomStages[4]);
+            Assert.Equal(stages[5], model.DeviceRoomStages[5]);
+            Assert.Equal(stages[6], model.DeviceRoomStages[6]);
+            Assert.Equal(0, RetainedWindowBytes(model, "k0"));
+            Assert.Equal(k1, RetainedWindowBytes(model, "k1"));
+        }
+    }
+
     /// <summary>
     /// On direct CUDA a conversation's next turn on its donated slot replays the recordings its first turn made: its decode
     /// steps and its verify windows are adopted where they are (none recorded again, none moved from another slot), and it
