@@ -905,8 +905,13 @@ namespace TensorSharp.Cuda
             IntPtr stream = allocator.Stream.Handle;
             if (rows <= allocator.Nvfp4MatvecRows)
             {
-                IntPtr scratch = EnsureQ81Scratch(allocator, CudaFp4Kernels.GemvScratchBytes(rows, inDim));
-                fp4.Gemv(planes, outDim, inDim, inputPtr, rows, scratch, resultPtr, stream);
+                // More rows than one call takes reach here only under CudaAllocator.AllNvfp4RowsOnMatvecForTests: they run in
+                // slices, each row computing as a one-row call's.
+                int slice = Math.Min(rows, CudaFp4Kernels.GemvMaxRows);
+                IntPtr scratch = EnsureQ81Scratch(allocator, CudaFp4Kernels.GemvScratchBytes(slice, inDim));
+                for (int first = 0; first < rows; first += slice)
+                    fp4.Gemv(planes, outDim, inDim, inputPtr + (nint)((long)first * inDim * sizeof(float)), Math.Min(slice, rows - first), scratch,
+                        resultPtr + (nint)((long)first * outDim * sizeof(float)), stream);
                 return;
             }
             var (codes, scales, rowScale) = Fp4Activations(allocator, rows, inDim);
@@ -1015,6 +1020,7 @@ namespace TensorSharp.Cuda
             if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
                 || !CudaKernelOps.TryGetContiguousRows(input, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
                 || rows != inputRows || 2L * cols != ne1 || inputCols != ne0 || rows < CudaFp4Kernels.TmaMinRows
+                || rows <= resultStorage.AllocatorImpl.Nvfp4MatvecRows
                 || result.ElementType != DType.Float32 || input.ElementType != DType.Float32)
                 return false;
             CudaAllocator allocator = resultStorage.AllocatorImpl;

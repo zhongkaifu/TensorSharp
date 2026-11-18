@@ -313,6 +313,99 @@ public sealed class CudaNvfp4MatmulTests
         }
     }
 
+    /// <summary>
+    /// <see cref="CudaAllocator.AllNvfp4RowsOnMatvecForTests"/> (the quality probe's q8act arm): a product of prompt rows runs
+    /// on the q8 matvec, 16 rows a call, so each row equals its one-row call to the bit where the FP4 GEMM quantizes the same
+    /// rows to NVFP4; the fused gate|up epilogue (a GEMM) declines under it. Cleared, the products are the GEMM's again.
+    /// </summary>
+    [CudaFact]
+    public void PromptRowsOnTheMatvecSeamRoundAsTheirOneRowCalls()
+    {
+        using var allocator = new CudaAllocator();
+        if (allocator.Fp4Kernels == null)
+        {
+            _output.WriteLine("no FP4 tensor-core products here: NVFP4 prompt rows never take the GEMMs, so the seam changes no route");
+            return;
+        }
+        const int inDim = 5120, outDim = 512, rows = 70, ff = 512, guIn = 1024;
+        byte[] weights = Nvfp4Rows(outDim, inDim, seed: 13), gateUpWeights = Nvfp4Rows(2 * ff, guIn, seed: 19);
+        var act = new float[rows, inDim];
+        for (int t = 0; t < rows; t++)
+            for (int k = 0; k < inDim; k++)
+                act[t, k] = MathF.Sin(0.0173f * (k + 1) * (t + 2)) + 0.3f * MathF.Cos(0.061f * k - 3 * t);
+        var guAct = new float[rows, guIn];
+        for (int t = 0; t < rows; t++)
+            for (int k = 0; k < guIn; k++)
+                guAct[t, k] = 1.5f * MathF.Sin(0.0137f * (k + 1) * (t + 2)) + 0.25f * MathF.Cos(0.047f * k - 2 * t);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length), guHost = Marshal.AllocHGlobal(gateUpWeights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            Marshal.Copy(gateUpWeights, 0, guHost, gateUpWeights.Length);
+            using var input = Tensor.FromArray(allocator, act);
+            using var guInput = Tensor.FromArray(allocator, guAct);
+            var alone = new float[rows * outDim];
+            for (int r = 0; r < rows; r++)
+            {
+                using Tensor x = input.Narrow(0, r, 1);
+                using var y = new Tensor(allocator, DType.Float32, 1, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(y, x, host, host, Nvfp4, inDim, outDim, weights.Length));
+                Array.Copy(y.GetElementsAsFloat(outDim), 0, alone, r * outDim, outDim);
+            }
+            float[] Product()
+            {
+                using var y = new Tensor(allocator, DType.Float32, rows, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(y, input, host, host, Nvfp4, inDim, outDim, weights.Length));
+                return y.GetElementsAsFloat(rows * outDim);
+            }
+            bool GateUpEpilogue()
+            {
+                using var y = new Tensor(allocator, DType.Float32, rows, ff);
+                return CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(y, guInput, guHost, guHost, Nvfp4, guIn, 2 * ff, gateUpWeights.Length);
+            }
+
+            float[] gemm = Product();
+            Assert.True(GateUpEpilogue());
+            float[] seam;
+            allocator.AllNvfp4RowsOnMatvecForTests = true;
+            try
+            {
+                seam = Product();
+                Assert.False(GateUpEpilogue());
+            }
+            finally
+            {
+                allocator.AllNvfp4RowsOnMatvecForTests = false;
+            }
+            float[] again = Product();
+
+            int gemmRowsApart = 0;
+            for (int r = 0; r < rows; r++)
+            {
+                bool apart = false;
+                for (int o = 0; o < outDim; o++)
+                {
+                    int i = r * outDim + o;
+                    if (BitConverter.SingleToInt32Bits(seam[i]) != BitConverter.SingleToInt32Bits(alone[i]))
+                        Assert.Fail($"row {r} of {rows} under the seam gives {seam[i]:R} at column {o}, its one-row call {alone[i]:R}");
+                    if (BitConverter.SingleToInt32Bits(again[i]) != BitConverter.SingleToInt32Bits(gemm[i]))
+                        Assert.Fail($"row {r}: the GEMM gives {again[i]:R} at column {o} after the seam, {gemm[i]:R} before it");
+                    apart |= BitConverter.SingleToInt32Bits(gemm[i]) != BitConverter.SingleToInt32Bits(alone[i]);
+                }
+                gemmRowsApart += apart ? 1 : 0;
+            }
+            _output.WriteLine($"{rows} rows under the seam equal their one-row calls; on the FP4 GEMM {gemmRowsApart} of them round apart");
+            Assert.True(gemmRowsApart > 0, "the FP4 GEMM's rows equal the matvec's: the seam changed no route");
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, guHost);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+            Marshal.FreeHGlobal(guHost);
+        }
+    }
+
     /// <summary>Rows of an NVFP4 table gathered on the device (the planar layout's lookup where weights are planar) equal
     /// the host's dequantization.</summary>
     [CudaFact]

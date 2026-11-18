@@ -17,10 +17,11 @@ using TensorSharp.Runtime;
 
 namespace LongContextQualityProbe;
 
-/// <summary>One arm of a run: a name the records carry and the prompt-attention setting it runs with.</summary>
+/// <summary>One arm of a run: a name the records carry and the setting it runs with: the prompt attention (default, f16, 8bit)
+/// or q8act (the build's prompt attention, every NVFP4 product on the q8 matvec: prompt rows keep the decode rows' q8 activations).</summary>
 internal sealed record Arm(string Name, string PromptAttention)
 {
-    public static readonly string[] Settings = { "default", "f16", "8bit" };
+    public static readonly string[] Settings = { "default", "f16", "8bit", "q8act" };
 
     /// <summary>"8bit", "f16", "default" or "name=setting".</summary>
     public static Arm Parse(string spec)
@@ -61,9 +62,10 @@ internal sealed class ModelHandle
 
     public void SetArm(Arm arm)
     {
-        if (arm.PromptAttention == "default") { if (Cuda != null) Cuda.PromptAttention8ForTests = null; return; }
-        if (Cuda == null) throw new InvalidOperationException($"arm {arm.Name}: the prompt-attention setting is a seam of the CUDA executor (--backend cuda)");
-        Cuda.PromptAttention8ForTests = arm.PromptAttention == "8bit";
+        if (arm.PromptAttention != "default" && (Cuda == null || CudaAllocator == null))
+            throw new InvalidOperationException($"arm {arm.Name}: the {arm.PromptAttention} setting is a seam of the CUDA executor (--backend cuda)");
+        if (CudaAllocator != null) CudaAllocator.AllNvfp4RowsOnMatvecForTests = arm.PromptAttention == "q8act";
+        if (Cuda != null) Cuda.PromptAttention8ForTests = arm.PromptAttention switch { "f16" => false, "8bit" => true, _ => null };
     }
 
     public Counters Snapshot() => new(Cuda?.PromptAttention8Launches ?? 0, Cuda?.PromptAttention8BandRefusals ?? 0, Graph?.PromptChunkAttentions ?? 0);

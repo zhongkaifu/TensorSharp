@@ -19,6 +19,10 @@ pre-registered gates, and estimates GPU time. Everything it writes goes under ig
   - An `8bit` arm is refused where the image has no 8-bit kernels. The arm would otherwise silently run the 16-bit
     kernel.
   - Names are free: `--arms ref=f16,cand=8bit`.
+  - `q8act` keeps the build's prompt attention and runs every NVFP4 product on the q8 matvec, 16 rows a call
+    (`CudaAllocator.AllNvfp4RowsOnMatvecForTests`). Prompt rows then keep the q8 activations of decode rows, where they
+    are otherwise quantized to NVFP4 for the FP4 GEMMs: `--arms default,q8act` over `ppl` and `continue` cases measures
+    what the prompt path's NVFP4 activations cost. A model without NVFP4 weights runs it as `default`.
 - **Arms that differ in what is fixed at load run as separate processes over the same case file.** For example,
   `--kv-cache-dtype f16` and `--kv-cache-dtype q8_0`, which spell the option as the CLI and server do.
   - The report pairs them by case id and checks that their inputs are identical (the sha256 of the token ids).

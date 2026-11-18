@@ -233,8 +233,20 @@ namespace TensorSharp.Cuda
 
         /// <summary>Rows an NVFP4 product takes on the q8 matvec (row-invariant) before the FP4 GEMMs: up to
         /// <see cref="CudaFp4Kernels.GemvMaxRows"/>, <see cref="CudaFp4Kernels.MultiSequenceGemvRows"/> while a step of
-        /// several sequences runs (CudaGraphExecutor.StepSequences).</summary>
-        internal int Nvfp4MatvecRows { get; set; } = CudaFp4Kernels.GemvMaxRows;
+        /// several sequences runs (CudaGraphExecutor.StepSequences); every row count under
+        /// <see cref="AllNvfp4RowsOnMatvecForTests"/>.</summary>
+        internal int Nvfp4MatvecRows
+        {
+            get => AllNvfp4RowsOnMatvecForTests ? int.MaxValue : nvfp4MatvecRows;
+            set => nvfp4MatvecRows = value;
+        }
+
+        private int nvfp4MatvecRows = CudaFp4Kernels.GemvMaxRows;
+
+        /// <summary>Test seam, never set by the product: every NVFP4 product runs on the q8 matvec (<see cref="CudaFp4Kernels.GemvMaxRows"/>
+        /// rows a call), so prompt rows keep q8 activations as decode rows do instead of NVFP4 ones on the FP4 GEMMs. It measures what
+        /// the prompt path's NVFP4 activations cost (eng/LongContextQualityProbe's q8act arm).</summary>
+        internal bool AllNvfp4RowsOnMatvecForTests { get; set; }
 
         /// <summary>The recurrent-layer prefill kernels for this device (tensorsharp_ssm_prefill), loaded on first use;
         /// null where the module is missing or stale.</summary>
