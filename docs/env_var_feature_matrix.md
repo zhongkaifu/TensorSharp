@@ -585,6 +585,12 @@ These tune `--backend ggml_cpu` (ggml-cpu under TensorSharp's graph runtime, `Te
 They are not registered in `EnvVarMatrix.All` and are not swept by the default TestMatrix config. Measurements were taken
 on an Apple M5 Pro (6 performance + 12 efficiency cores, 48 GB) with LFM3-1.7B, every arm interleaved on a quiet machine.
 
+Two of ggml-cpu's gaps on ARM64 are filled by TensorSharp's own products, with no knob: BF16 weights (ggml-cpu's BF16 dot
+has no NEON body there and runs a scalar loop) are widened to F32 exactly and multiplied with the F32 activations as they
+are (decode 54 vs 12 tok/s), and on Apple, BF16 and NVFP4 products of prompt width (from 64 and 256 activation rows) go to
+one Accelerate `sgemm` after the weight is converted to F32, as llama.cpp's BLAS backend does. Both read the activations
+unrounded (ggml rounds them to BF16, or to Q8_0 for NVFP4).
+
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
 | `TS_GGML_CPU_THREADS` | `ggml_cpu` backend | Width of ggml-cpu's prompt thread pool: every step whose weight products read more than 4 activation rows (prompt chunks, verify windows, encoders) and every ggml op outside the graph runtime. Set alone, it is the decode pool's width too, as `llama-bench -t` sets both. Every physical core by default: LFM3-1.7B Q4_K_M pp512 runs 667 / 763 / 881 / 874 tok/s on 12 / 14 / 16 / 18 threads | every physical core (`hw.physicalcpu` on macOS) | not registered | no |

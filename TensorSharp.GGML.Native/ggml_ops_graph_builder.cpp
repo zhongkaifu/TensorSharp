@@ -477,6 +477,13 @@ namespace
                 && tsg::bonsai_weight_has_transform(leaf->data))
                 return tsg::bonsai_mul_mat_memo(g->ctx, w, x, leaf->data, g->bonsai);
         }
+        // ggml-cpu: weights it has no fast kernel for here (BF16 on ARM64; BF16 and NVFP4 prompt products on Apple).
+        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU)
+        {
+            const ggml_tensor* base = w->view_src != nullptr ? w->view_src : w;
+            if (Leaf* leaf = leaf_of(g, base); leaf != nullptr && leaf->role == LEAF_WEIGHT)
+                if (ggml_tensor* r = tsg::cpu_weight_product(g->ctx, w, x)) return r;
+        }
         return ggml_mul_mat(g->ctx, w, x);
     }
 
@@ -1144,10 +1151,12 @@ namespace
         for (std::size_t i = 0; i < of.size(); i++)
             of[i]->repacked = bound[i] != 0;
 
-        // A weight product: ggml's MUL_MAT / MUL_MAT_ID of a weight (or a row block of one).
+        // A weight product: ggml's MUL_MAT / MUL_MAT_ID of a weight (or a row block of one), or TensorSharp's product of
+        // one (tsg::cpu_weight_product: a custom op over the weight, or over its F32 conversion, and the activations).
         std::unordered_map<const ggml_tensor*, int> is_weight;
         for (const tsg::CpuWeightLeaf& w : weights) is_weight[w.tensor] = 1;
         auto weight_operand = [&](const ggml_tensor* t) {
+            if (t != nullptr && t->op == GGML_OP_CUSTOM) t = t->src[0];
             if (t != nullptr && t->view_src != nullptr) t = t->view_src;
             return t != nullptr && is_weight.find(t) != is_weight.end();
         };
@@ -1155,7 +1164,7 @@ namespace
         for (int i = 0; i < ggml_graph_n_nodes(g->graph); i++)
         {
             const ggml_tensor* node = ggml_graph_node(g->graph, i);
-            if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) continue;
+            if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_CUSTOM) continue;
             const ggml_tensor* x = node->src[1];
             if (x == nullptr || !weight_operand(node->src[0])) continue;
             const std::int64_t rows = node->op == GGML_OP_MUL_MAT_ID ? x->ne[2] * x->ne[3] : x->ne[1] * x->ne[2] * x->ne[3];

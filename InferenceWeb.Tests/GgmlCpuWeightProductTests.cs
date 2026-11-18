@@ -18,8 +18,9 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// The ggml-cpu side of the generic graph (ggml_ops_cpu_graph.cpp): weights only products read run from ggml-cpu's
-/// repacked layouts (CPU_REPACK), and every other reader keeps the plain bytes.
+/// The ggml-cpu side of the generic graph (ggml_ops_cpu_graph.cpp, ggml_ops_cpu_products.cpp): weights only products read
+/// run from ggml-cpu's repacked layouts (CPU_REPACK), every other reader keeps the plain bytes, and the weights ggml-cpu has
+/// no fast product for on ARM64 (BF16; BF16 and NVFP4 at prompt width on Apple) run TensorSharp's products.
 /// </summary>
 public sealed class GgmlCpuWeightProductTests
 {
@@ -237,6 +238,37 @@ public sealed class GgmlCpuWeightProductTests
                             Assert.True(Math.Abs(got - want) <= 1e-6f * Math.Max(1f, Math.Abs(want)),
                                 $"type {type}: gathered row {ids[i]} value {k}: {got} vs {want}");
                         }
+                }
+        });
+    }
+
+    /// <summary>
+    /// BF16 weights at every width (NEON rows below 64, Accelerate's sgemm from there), and NVFP4 weights from 256 rows
+    /// where sgemm takes them, run TensorSharp's products over unrounded F32 activations: within F32 summation error of
+    /// the double-precision reference. Narrower NVFP4 products stay on ggml-cpu's own kernel (activations rounded to Q8_0).
+    /// </summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void FloatWeightProductsReadUnroundedActivations()
+    {
+        WithCpuBackend(() =>
+        {
+            var rng = new Random(11);
+            bool arm64 = RuntimeInformation.ProcessArchitecture == Architecture.Arm64;
+            foreach ((int type, int[] widths) in new[] { (30, new[] { 1, 3, 4, 7, 32, 63, 64, 65 }), (40, new[] { 1, 31, 255, 256, 300 }) })
+                foreach (int n in widths)
+                {
+                    using var native = new Native();
+                    byte[] bytes = RandomWeight(type, rng);
+                    float[] wf = Dequantize(type, bytes);
+                    float[] x = Activations(n, rng);
+                    float[][] y = Run(type, native.Copy(bytes), bytes.Length, native.Copy(x), n, new[] { (0, M), (16, 32) }, null, native);
+                    double rel = RelL2(y[0], Reference(wf, x, n));
+                    double block = RelL2(y[1], Reference(wf, x, n, 16, 32));
+                    _output.WriteLine($"type {type} rows {n}: {rel:E2} (row block {block:E2})");
+                    bool ours = arm64 && (type == 30 || (OperatingSystem.IsMacOS() && n >= 256));
+                    double tolerance = ours ? 1e-6 : 3e-2;
+                    Assert.True(rel < tolerance, $"type {type} rows {n}: {rel:E2} from the reference (tolerance {tolerance:E0})");
+                    Assert.True(block < tolerance, $"type {type} rows {n}: row block {block:E2} from the reference");
                 }
         });
     }

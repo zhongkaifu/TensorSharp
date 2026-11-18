@@ -50,6 +50,12 @@ namespace tsg
     /// Drops every cached copy (graphs still holding one keep it until they are freed).
     void cpu_repack_clear();
 
+    /// w · x for a weight ggml-cpu has no fast kernel for on this CPU, as TensorSharp's product (a GGML_OP_CUSTOM node
+    /// over the graph's thread pool, ggml_ops_cpu_products.cpp), or null to keep ggml's MUL_MAT. ARM64: BF16 weights
+    /// (ggml-cpu's BF16 dot is scalar there) at any width, and on Apple BF16 and NVFP4 weights of prompt width through
+    /// Accelerate's sgemm. F32 activations unrounded; w a 2-D weight or a row block of one.
+    ggml_tensor* cpu_weight_product(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x);
+
     /// Creates the CPU backend's thread pools (the prompt pool always; a decode pool when its width differs) and sets
     /// the prompt pool; the pools are appended to `owned` (freed at shutdown).
     void cpu_pools_create(ggml_backend_t backend, std::vector<ggml_threadpool_t>& owned);

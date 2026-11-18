@@ -530,6 +530,11 @@ sweep。runner 也不会清除它们，所以 runner 自身环境中设置的值
 它们没有注册进 `EnvVarMatrix.All`，默认的 TestMatrix 配置也不会扫它们。实测数据来自一台 Apple M5 Pro（6 个性能核 +
 12 个能效核、48 GB），模型为 LFM3-1.7B，各组在空闲机器上交替运行。
 
+ggml-cpu 在 ARM64 上的两处空缺由 TensorSharp 自己的乘法补上，没有开关：BF16 权重（ggml-cpu 的 BF16 点积在那里没有
+NEON 实现，走标量循环）被精确展宽为 F32，与原样的 F32 激活相乘（解码 54 vs 12 tok/s）；在 Apple 上，提示宽度的 BF16 与
+NVFP4 乘法（分别从 64 与 256 行激活起）先把权重转成 F32，再交给一次 Accelerate `sgemm`，与 llama.cpp 的 BLAS 后端做法
+相同。两者读取的激活都不经舍入（ggml 会把激活舍入为 BF16，NVFP4 时为 Q8_0）。
+
 | 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描值 | 默认扫描 |
 |---|---|---|---|---|---|
 | `TS_GGML_CPU_THREADS` | `ggml_cpu` 后端 | ggml-cpu 提示线程池的宽度：凡是权重乘法读取超过 4 行激活的步骤（提示分块、验证窗口、编码器），以及图运行时之外的每个 ggml 算子。单独设置时它也是解码线程池的宽度，与 `llama-bench -t` 同时设置二者一致。默认取全部物理核：LFM3-1.7B Q4_K_M 的 pp512 在 12 / 14 / 16 / 18 线程下为 667 / 763 / 881 / 874 tok/s | 全部物理核（macOS 上为 `hw.physicalcpu`） | 未注册 | 否 |
