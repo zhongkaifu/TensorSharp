@@ -37,6 +37,15 @@ namespace TensorSharp.Server
         /// sends back either form, the stream's prose before a tool call included.
         /// </summary>
         public string StreamedContent { get; init; }
+
+        /// <summary>
+        /// The reasoning that went out apart with <see cref="StreamedContent"/> (empty when the
+        /// stream sent all of it as content; a tool-loop transcript prefixes the earlier rounds'
+        /// reasoning, which the client got apart). A client that got the stream form sends back
+        /// this reasoning or none, not the reasoning <see cref="Thinking"/> kept apart from
+        /// <see cref="Content"/>. Null when <see cref="StreamedContent"/> is.
+        /// </summary>
+        public string StreamedThinking { get; init; }
     }
 
     /// <summary>The render history <see cref="ConversationTranscriptStore.Augment"/> built,
@@ -86,6 +95,7 @@ namespace TensorSharp.Server
             public List<ChatMessage> Replacement;   // the generated message(s), raw tokens attached
             public EmittedAssistantTurn Emitted;
             public string FinalThinking;   // the final round, before tool-loop reasoning is combined
+            public string FinalStreamedThinking;   // the same for the stream form (Emitted.StreamedThinking)
             public string Scope;
             public long Tokens;
             // Which load of the model produced these tokens (ModelLifecycleService.LoadEpoch).
@@ -252,6 +262,7 @@ namespace TensorSharp.Server
             if (generated?.RawOutputTokens is not { Count: > 0 } || emitted == null)
                 return;
             string finalThinking = emitted.Thinking;
+            string finalStreamedThinking = emitted.StreamedThinking;
             history ??= Array.Empty<ChatMessage>();
             int visibleEnd = VisibleEnd(history);
 
@@ -288,6 +299,7 @@ namespace TensorSharp.Server
                 // The loop streamed every round's content AND reasoning to the client, so
                 // both are compared over all rounds.
                 string earlierRounds = emittedContent.ToString();
+                string earlierThinking = emittedThinking.ToString();
                 emittedContent.Append(emitted.Content);
                 emittedThinking.Append(emitted.Thinking);
                 emitted = emitted with
@@ -296,13 +308,14 @@ namespace TensorSharp.Server
                     Thinking = emittedThinking.Length == 0 ? null : emittedThinking.ToString(),
                     RawText = null,
                     StreamedContent = emitted.StreamedContent == null ? null : earlierRounds + emitted.StreamedContent,
+                    StreamedThinking = emitted.StreamedContent == null ? null : earlierThinking + emitted.StreamedThinking,
                 };
             }
 
             var record = new TurnRecord
             {
                 Replacement = replacement, Emitted = emitted, FinalThinking = finalThinking,
-                Scope = scope, Tokens = tokens, Epoch = epoch,
+                FinalStreamedThinking = finalStreamedThinking, Scope = scope, Tokens = tokens, Epoch = epoch,
             };
             lock (_lock)
             {
@@ -440,26 +453,29 @@ namespace TensorSharp.Server
             // restores the exact generated tokens; any difference inside the reasoning still
             // refuses the match.
             string clientThinking = (client.Thinking ?? string.Empty).Trim();
-            string emittedThinking = (emitted.Thinking ?? string.Empty).Trim();
             // A tool-loop transcript records every round's reasoning; a client may send back
             // all of it or only the complete final round, not an arbitrary suffix.
-            if (clientThinking.Length > 0
-                && !string.Equals(clientThinking, emittedThinking, StringComparison.Ordinal)
-                && !(record.Replacement.Count > 1
-                     && string.Equals(clientThinking, (record.FinalThinking ?? string.Empty).Trim(), StringComparison.Ordinal)))
-                return false;
+            bool ThinkingMatches(string all, string finalRound) =>
+                clientThinking.Length == 0
+                || string.Equals(clientThinking, (all ?? string.Empty).Trim(), StringComparison.Ordinal)
+                || (record.Replacement.Count > 1
+                    && string.Equals(clientThinking, (finalRound ?? string.Empty).Trim(), StringComparison.Ordinal));
 
             string clientContent = client.Content ?? string.Empty;
-            if (ContentMatches(clientContent, emitted.Content ?? string.Empty, emitted, record))
+            if (ThinkingMatches(emitted.Thinking, record.FinalThinking)
+                && (ContentMatches(clientContent, emitted.Content ?? string.Empty, emitted, record)
+                    || (emitted.RawText != null
+                        && string.Equals(clientContent, emitted.RawText, StringComparison.Ordinal))))
                 return true;
             // What an append-only stream sent (LFM3: a thinking-off reply that reasoned past the
             // closed block, as generated, and a whole reply cut short the same way) when the parse
-            // above kept the reasoning apart: a client sends back whichever it got.
-            if (emitted.StreamedContent != null
-                && ContentMatches(clientContent, emitted.StreamedContent, emitted, record))
-                return true;
-            return emitted.RawText != null
-                && string.Equals(clientContent, emitted.RawText, StringComparison.Ordinal);
+            // above kept the reasoning apart: a client sends back whichever it got, each form with
+            // its own reasoning. The stream form went out with the earlier rounds' reasoning of a
+            // tool loop and none of the stray reasoning it carries as content; the split form's
+            // reasoning beside it would be that text twice.
+            return emitted.StreamedContent != null
+                && ThinkingMatches(emitted.StreamedThinking, record.FinalStreamedThinking)
+                && ContentMatches(clientContent, emitted.StreamedContent, emitted, record);
         }
 
         /// <summary>Whether the client's assistant content is <paramref name="emittedContent"/>,

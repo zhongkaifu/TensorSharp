@@ -2023,16 +2023,19 @@ namespace TensorSharp.Server
             {
                 ParsedOutput parsed = ProtocolAdapters.ChatStreamCollector.ParseWhole(
                     arch, rawText, enableThinking, tools, generationSuffix, asStreamed: false);
-                string streamedContent = null;
+                string streamedContent = null, streamedThinking = null;
                 if (!enableThinking && !string.IsNullOrEmpty(parsed.Thinking))
                 {
-                    string streamed = ProtocolAdapters.ChatStreamCollector.ParseWhole(
-                        arch, rawText, enableThinking, tools, generationSuffix, asStreamed: true).Content ?? string.Empty;
-                    if (!string.Equals(streamed, parsed.Content ?? string.Empty, StringComparison.Ordinal))
-                        streamedContent = streamed;
+                    ParsedOutput streamed = ProtocolAdapters.ChatStreamCollector.ParseWhole(
+                        arch, rawText, enableThinking, tools, generationSuffix, asStreamed: true);
+                    if (!string.Equals(streamed.Content ?? string.Empty, parsed.Content ?? string.Empty, StringComparison.Ordinal))
+                    {
+                        streamedContent = streamed.Content ?? string.Empty;
+                        streamedThinking = streamed.Thinking ?? string.Empty;
+                    }
                 }
                 return new EmittedAssistantTurn(parsed.Content ?? string.Empty, parsed.ToolCalls,
-                    parsed.Thinking, rawText, cancelled) { StreamedContent = streamedContent };
+                    parsed.Thinking, rawText, cancelled) { StreamedContent = streamedContent, StreamedThinking = streamedThinking };
             }
             catch (Exception)
             {

@@ -361,6 +361,54 @@ public sealed class Lfm3ThinkingOffReasoningTests
         };
         Assert.Equal(new[] { 4, 5 }, cutStore.Augment(Next(CutReply, null)).History[1].RawOutputTokens);
         Assert.Equal(new[] { 4, 5 }, cutStore.Augment(Next(cut.Content, cut.Thinking)).History[1].RawOutputTokens);
+        // The stream form went out with no reasoning apart.
+        Assert.Equal(CutReply, cut.StreamedContent);
+        Assert.Equal("", cut.StreamedThinking);
+    }
+
+    /// <summary>
+    /// A tool-loop turn whose last round went out as generated (a whole reply cut short, or an API stream): the client got
+    /// the earlier rounds' reasoning apart and none of the last round's, and sends back that reasoning or none. Either
+    /// expands the turn into the loop's rounds, so the next request continues its KV cache. Before, the reasoning was
+    /// compared with every round's split reasoning, the last round's included, and the turn re-prefilled. The stream form
+    /// beside the split form's reasoning (the last round's stray reasoning twice) was never sent and does not expand.
+    /// </summary>
+    [Fact]
+    public void ALoopTurnWhoseLastRoundWentOutAsGenerated_MatchesTheReasoningSentWithIt()
+    {
+        const string plan = "Plan: look the weather up first.";
+        var ask = new ChatMessage { Role = "user", Content = "Weather in Paris?" };
+        var lookup = new ToolCall { Id = "call_1", Name = "get_weather", Arguments = new Dictionary<string, object> { ["city"] = "Paris" } };
+        List<int> round1 = new() { 1, 2, 3 }, round2 = new() { 4, 5 };
+        var store = new ConversationTranscriptStore(maxChains: 16, maxTokens: 10_000);
+        EmittedAssistantTurn last = ChatGenerationPipeline.BuildEmittedTurn(Arch, CutReply, false, Tools, Closed, cancelled: false);
+        store.Record(new List<ChatMessage>
+            {
+                ask,
+                new() { Role = "assistant", Content = "Checking.", Thinking = plan, ToolCalls = new List<ToolCall> { lookup }, RawOutputTokens = round1 },
+                new() { Role = "tool", Content = "18C, clear", ToolCallId = "call_1" },
+            },
+            new ChatMessage { Role = "assistant", Content = CutReply, RawOutputTokens = round2 }, last, scope: "lfm3");
+
+        List<ChatMessage> Next(string content, string? thinking) => new()
+        {
+            new() { Role = "user", Content = ask.Content },
+            new() { Role = "assistant", Content = content, Thinking = thinking },
+            new() { Role = "user", Content = "And in Rome?" },
+        };
+
+        // What the client got: the first round's content and reasoning, the last round as generated.
+        foreach (string? thinking in new[] { plan, null })
+        {
+            List<ChatMessage> expanded = store.Augment(Next("Checking." + CutReply, thinking)).History;
+            Assert.Equal(5, expanded.Count);
+            Assert.Same(round1, expanded[1].RawOutputTokens);
+            Assert.Same(round2, expanded[3].RawOutputTokens);
+        }
+        // The split form with every round's reasoning, as before.
+        Assert.Equal(5, store.Augment(Next("Checking." + last.Content, plan + last.Thinking)).History.Count);
+        // Never sent: the stream form beside the last round's split reasoning.
+        Assert.Equal(3, store.Augment(Next("Checking." + CutReply, plan + last.Thinking)).History.Count);
     }
 
     /// <summary>The Responses API's reasoning_tokens counts a reply cut short as its whole reply reads: the stray reasoning
