@@ -205,6 +205,9 @@ namespace InferenceWeb.Tests
             Assert.Equal(8, CpuWorkerPool.DefaultThreadCountFor(16));
             Assert.Equal(61, CpuWorkerPool.DefaultThreadCountFor(122));
             Assert.True(CpuWorkerPool.DefaultThreadCountFor(384) < 384);
+            // Apple silicon has no SMT: one worker per core.
+            Assert.Equal(18, CpuWorkerPool.DefaultThreadCountFor(18, oneThreadPerCore: true));
+            Assert.Equal(6, CpuWorkerPool.DefaultThreadCountFor(6, oneThreadPerCore: true));
         }
 
         [Fact]

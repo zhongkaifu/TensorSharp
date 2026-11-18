@@ -129,8 +129,13 @@ namespace TensorSharp.Models
         {
             string s = Environment.GetEnvironmentVariable("TS_CPU_THREADS");
             if (int.TryParse(s, out int n) && n > 0) return n;
-            return DefaultThreadCountFor(Environment.ProcessorCount);
+            return DefaultThreadCountFor(Environment.ProcessorCount, AppleSilicon);
         }
+
+        /// <summary>Apple silicon: no SMT, every logical processor is a core of its own.</summary>
+        private static bool AppleSilicon =>
+            (OperatingSystem.IsMacOS() || OperatingSystem.IsIOS() || OperatingSystem.IsMacCatalyst())
+            && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
 
         /// <summary>
         /// How wide the pool should be. NOT every core. The rationale dates from
@@ -143,9 +148,13 @@ namespace TensorSharp.Models
         /// run here as well, which the default has not been re-tuned for: above 8
         /// logical processors it is half of them (one per core on an SMT part such
         /// as the 8-core/16-thread i7-11800H). TS_CPU_THREADS overrides it.
+        ///
+        /// Apple silicon takes every core (<paramref name="oneThreadPerCore"/>): it has no SMT, and on an M5 Pro (6 + 12
+        /// cores) LFM3-1.7B Q4_K_M ran 596 / 526 / 426 tok/s prompts and 116 / 114 / 97 tok/s decode at 18 / 12 / 9
+        /// threads (once a job stopped waiting for every worker to look in: a descheduled worker no longer stalls it).
         /// </summary>
-        internal static int DefaultThreadCountFor(int processors)
-            => processors <= 8 ? Math.Max(1, processors) : Math.Max(8, processors / 2);
+        internal static int DefaultThreadCountFor(int processors, bool oneThreadPerCore = false)
+            => processors <= 8 || oneThreadPerCore ? Math.Max(1, processors) : Math.Max(8, processors / 2);
 
         /// <summary>Threads that will run a job, including the submitting one.</summary>
         public int ThreadCount => _workers + 1;

@@ -33,7 +33,7 @@ EmbeddingGemma 2 加载投影器后，两个嵌入端点也接受有序媒体 co
 | GGML CUDA | `--backend ggml_cuda` | 通过 ggml 使用 NVIDIA 推理 | 通过 GGML CUDA 在 Windows 或 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
 | GGML Vulkan | `--backend ggml_vulkan` | 通过 ggml 的厂商无关 GPU 推理 | 通过 GGML Vulkan 在 Windows 或 Linux 上加速——支持带 Vulkan 1.3 驱动的 AMD、Intel 与 NVIDIA GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。机器有 Vulkan 运行时（已安装 loader）时原生构建会自动启用；未安装 Vulkan SDK 或发行版开发包时，构建会通过 `eng/fetch-vulkan-toolchain.ps1` / `eng/fetch-vulkan-toolchain.sh` 自动下载便携工具链（headers、glslc、SPIRV-Headers，Windows 上还有 loader 导入库）。用 `--no-vulkan`（或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`）退出。 |
 | GGML CPU | `--backend ggml_cpu` | 原生 CPU 内核 | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
-| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 可移植的 CPU 推理：模型计算不加载任何原生库（桌面平台上的图像文件读写仍经由 Magick.NET，服务端启动时也会探测 GGML / CUDA 后端）。托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，默认宽度是可用核心数的一半（`TS_CPU_THREADS` 及下文其余 `TS_CPU_*` 开关）；在 direct 视频网络（Wan、MiniMax-H3）上，量化权重直接以 GGUF 存储类型参与乘法，而不再在加载时展开成 F32。DeepSeek V4.1 Flash 与下文的 DeepSeek V4 Flash 一样，在这里也走自己的整模型执行器——100% 纯 C# 的 `DeepSeek4CpuExecutor`，它是正确性与可移植性路径，而非服务路径，其计算宽度来自 `TS_DSV4_THREADS`（这个后端上默认取全部处理器）而不是 `TS_CPU_THREADS`。 |
+| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 可移植的 CPU 推理：模型计算不加载任何原生库（桌面平台上的图像文件读写仍经由 Magick.NET，服务端启动时也会探测 GGML / CUDA 后端）。托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，默认宽度是可用核心数的一半，Apple 芯片上取全部核心（`TS_CPU_THREADS` 及下文其余 `TS_CPU_*` 开关）；在 direct 视频网络（Wan、MiniMax-H3）上，量化权重直接以 GGUF 存储类型参与乘法，而不再在加载时展开成 F32。DeepSeek V4.1 Flash 与下文的 DeepSeek V4 Flash 一样，在这里也走自己的整模型执行器——100% 纯 C# 的 `DeepSeek4CpuExecutor`，它是正确性与可移植性路径，而非服务路径，其计算宽度来自 `TS_DSV4_THREADS`（这个后端上默认取全部处理器）而不是 `TS_CPU_THREADS`。 |
 
 **嵌入编码器使用独立执行器。** `cpu` 路径持有紧凑的量化数组与模型专属线程池，通过 `--embedding-threads` 配置（默认四个线程）；原生嵌入后端可能复制或重排权重。该路径的存储与线程策略见[嵌入执行](docs/embeddings_zh-cn.md#c-api-与实现)。
 
@@ -2063,7 +2063,7 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
-| 工作线程池宽度（托管 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image 内核） | 8 核及以下取全部核心；8 核以上取一半，且不低于 8 | `TS_CPU_THREADS=N` | — |
+| 工作线程池宽度（托管 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image 内核） | 8 核及以下取全部核心；8 核以上取一半，且不低于 8；Apple 芯片（无 SMT）取全部核心 | `TS_CPU_THREADS=N` | — |
 | 是否启用工作线程池 | 启用 | `TS_CPU_POOL=0` 让所有分派并行任务的托管内核——量化 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的 VAE、文本编码器与视觉塔（VAE 的宽度上限为 `TS_CPU_GEMM_THREADS`）——回退到 ThreadPool 的 `Parallel.For`，用于负担不起自旋线程的主机，也便于在同一个二进制里做 A/B；结果不变。Direct 视频网络的行循环仍在线程池上 | — |
 | 工作线程挂起前的自旋次数 | `4096` | `TS_CPU_SPIN=N` —— 在这个宽度下挂起才是最贵的部分，所以默认自旋次数足够多，使稳态下根本不会挂起 | — |
 | 单次托管矩阵乘的任务切分 | 每个工作项 `131072` 字节权重，每个线程最多 `4` 个工作项 | `TS_CPU_TASK_BYTES`、`TS_CPU_TASKS_PER_WORKER` —— 按**工作量**而不是线程数来切 | — |
