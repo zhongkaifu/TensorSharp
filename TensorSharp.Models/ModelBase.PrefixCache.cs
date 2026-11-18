@@ -98,9 +98,14 @@ namespace TensorSharp.Models
         /// </summary>
         public long QueryHostMemoryDeficitBytes()
         {
-            long host = OperatingSystem.IsMacOS() && UnifiedMemorySpareBytes() is long spare && spare < 0 ? -spare : 0;
+            long? spare = HostMemorySpareForTests != null ? HostMemorySpareForTests() : OperatingSystem.IsMacOS() ? UnifiedMemorySpareBytes() : null;
+            long host = spare is long s && s < 0 ? -s : 0;
             return Math.Max(host, DeviceMemoryDeficitBytes());
         }
+
+        /// <summary>Tests stand in for the host's spare memory (<see cref="UnifiedMemorySpareBytes"/>; null: not measured), so
+        /// what a test's prefix cache keeps does not depend on what else the machine runs.</summary>
+        internal Func<long?> HostMemorySpareForTests { get; set; }
 
         /// <summary>
         /// Bytes the device is short of room for one more request's state beside a headroom, which the prefix

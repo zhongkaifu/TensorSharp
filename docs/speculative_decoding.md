@@ -140,11 +140,26 @@ Which algorithms survive a gap is now the algorithm's own call —
 `ISpeculator.CanArmAfterPrefixReuse`, default `false`. `BlockDraftSpeculator` and
 `NGramSpeculator` opt in: n-gram mines the emitted token history, which is complete
 whatever the KV cache did, and a block drafter reads its own sliding KV ring, which
-refills from the freshly forwarded suffix and from every committed token, so an
-adopted prefix costs it a shorter drafting context for a block or two and nothing
-after that. Every draft is still verified by the trunk either way, so a stale
-speculator can only cost throughput, never a wrong token. Measured in the server
-chat path: 1.02x → 1.85x.
+refills from the freshly forwarded suffix and from every committed token. Every draft
+is still verified by the trunk either way, so a stale speculator can only cost
+throughput, never a wrong token. Measured in the server chat path: 1.02x → 1.85x.
+
+The ring is the context of a sequence, not of the request that wrote it
+(`IPerRequestDraftState.KeepDraftState` / `ContinueDraftState`). A finished request's
+ring keeps its rows, and the runtime hands it to the next request whose tokens begin
+with the ones it covers (matched as the prefix cache matches them: media spans, cache
+scopes), over the positions that request reuses. A prompt read by a request that does
+not speculate (one token to emit) still writes its ring where the trunk keeps the ring
+in step itself (`IDraftHead.FollowUnspeculatedPrompt`: the prompt's last ring-length
+rows, never a speculating request's ring). So a turn that reuses its conversation's
+whole prompt drafts over the conversation from its first step. Before, such a turn
+drafted over whatever ring the last speculating request had left - another
+conversation's rows at the positions the two shared: Qwen3.8-27B NVFP4 with DFlash2 on
+direct CUDA accepted 51-60% of its drafts in issue #376's long agent turns, against
+93-98% for the deleted direct engine, whose ring lived in the sequence's slot. A ring
+taken anew starts empty; rings kept for finished requests are made only where the
+device has room for them, and a device short of memory gives them back before any
+conversation the prefix cache keeps.
 
 A per-token head can opt in too, through its weights adapter:
 `IDraftHead.DraftHeadResumesAfterGap`. Stateful heads without a suffix restart

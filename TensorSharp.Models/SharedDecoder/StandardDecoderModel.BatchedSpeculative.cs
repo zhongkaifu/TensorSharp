@@ -96,6 +96,17 @@ namespace TensorSharp.Models
             if (requestId != null) _followPromptRequests?.Remove(requestId);
         }
 
+        /// <summary>The request's DFlash ring keeps its sequence's context (ModelBase.KeepDFlashRing). The draft layer's rows
+        /// live in the request's slot, which the prefix cache keeps or the release disposes.</summary>
+        public int KeepDraftState(string requestId)
+        {
+            if (requestId != null) _followPromptRequests?.Remove(requestId);
+            return KeepDFlashRing(requestId);
+        }
+
+        public bool ContinueDraftState(string requestId, string keptRequestId, int tokens)
+            => ContinueDFlashRing(requestId, keptRequestId, tokens);
+
         public bool SupportsBatchedSpecLogits => true;
 
         public bool TryBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int window,

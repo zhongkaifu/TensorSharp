@@ -145,6 +145,14 @@ namespace TensorSharp.Models
             return slot;
         }
 
+        /// <summary>A pooled ring given back (ModelBase.ReleaseIdleDFlashRings): the steps, recordings and graphs over it go,
+        /// as a disposed slot's do.</summary>
+        private protected override void OnDFlashRingDisposing(Tensor[] ringK)
+        {
+            if (_dflashRingSlots == null || !_dflashRingSlots.Remove(ringK, out Slot slot)) return;
+            ForgetGraphsOf(slot);
+        }
+
         /// <summary>The drafter's rotary: NeoX over the whole head at its own base (llama.cpp maps LLM_ARCH_DFLASH to
         /// LLAMA_ROPE_TYPE_NEOX), the per-op <c>DFlashRoPE</c>'s parameters.</summary>
         private RotarySpec DFlashRotary => _dflashRotary ??= new RotarySpec(DFlashSettings.HeadDim, neoX: true, DFlashSettings.RopeBase);
@@ -335,8 +343,10 @@ namespace TensorSharp.Models
         /// the next draft would have injected). A chunk starting right past that one-row hole writes a zero row there, as
         /// the speculative context's catch-up did (its carry is zeros when a request arms after a reused prefix), so the
         /// ring keeps the turn before as context instead of restarting at the hole.
+        /// <para>A sequence marked in <paramref name="aside"/> does not speculate (<see cref="FollowUnspeculatedPrompt"/>): it
+        /// takes a ring only where no running request loses its own.</para>
         /// </summary>
-        private DFlashFollowPlan PlanDFlashFollow(string[] requests, int[] starts, int[] counts, int[] promptEnds)
+        private DFlashFollowPlan PlanDFlashFollow(string[] requests, int[] starts, int[] counts, int[] promptEnds, bool[] aside = null)
         {
             if (!DFlashSelfCatchUp) return null;
             int n = counts.Length, ringRows = DFlashRingRows;
@@ -352,7 +362,7 @@ namespace TensorSharp.Models
                 int end = starts[s] + counts[s], first = Math.Max(starts[s], end - ringRows);
                 if (promptEnds[s] > 0) first = Math.Max(first, promptEnds[s] - ringRows);
                 if (first >= end) continue;
-                (Tensor[] k, Tensor[] v, int filled, Tensor ringCarry) = DFlashRingOf(requests[s]);
+                (Tensor[] k, Tensor[] v, int filled, Tensor ringCarry) = DFlashRingOf(requests[s], mayTake: aside == null || !aside[s]);
                 // Two sequences on one ring (more speculating requests than rings): the later one's prompt is not kept.
                 bool shared = false;
                 for (int o = 0; o < s; o++) shared |= ReferenceEquals(ringK[o], k);

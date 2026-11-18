@@ -2659,11 +2659,18 @@ namespace TensorSharp.Runtime.Scheduling
         /// null for any other request (an n-gram or per-token drafter arms at its first decode step).</summary>
         private SpecSeqContext? PromptConditionedDrafter(SequenceState seq, int start)
         {
-            if (!SpeculationEnabledThisStep || !CanSpeculate(seq) || _model is not IBatchedSpeculativeTarget
-                || _model is not ISpeculativeTarget { SpeculationProfitable: true } spec
-                || _fusedSpecDeclined.Contains(seq.RequestId)
-                || !TryGetFusedSpecContext(spec, seq, start, out SpecSeqContext? ctx))
+            if (!SpeculationEnabledThisStep || _model is not IBatchedSpeculativeTarget
+                || _model is not ISpeculativeTarget { SpeculationProfitable: true } spec)
                 return null;
+            // The request's drafter state continues its conversation's before anything writes it.
+            EnsureDraftContinuation(seq);
+            if (!CanSpeculate(seq) || _fusedSpecDeclined.Contains(seq.RequestId)
+                || !TryGetFusedSpecContext(spec, seq, start, out SpecSeqContext? ctx))
+            {
+                // Not speculating, its prompt still feeds the drafter's context of the conversation for the next turn.
+                FollowUnspeculatedPrompt(seq);
+                return null;
+            }
             // A head the trunk keeps in step (DraftSelfCatchUp) takes this chunk's rows as the forward runs them.
             if (ctx.Exec.PrefillSelfCatchUp && _model is IDraftHead follower)
                 follower.FollowPlainPrompt(seq.RequestId, seq.PromptTokens.Count);
@@ -2812,6 +2819,7 @@ namespace TensorSharp.Runtime.Scheduling
                     if (exec.PrefillSelfCatchUp && _model is IDraftHead follower)
                     {
                         // Over the request's own drafter state (a block drafter's ring), which its decode steps bind.
+                        EnsureDraftContinuation(seq);
                         (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
                         follower.FollowPlainPrompt(null, seq.PromptTokens.Count);
                     }
@@ -3002,6 +3010,7 @@ namespace TensorSharp.Runtime.Scheduling
         private SequenceStepResult ExecuteSpeculativeWorkCore(
             SpecSeqContext context, SequenceState seq, ScheduledSequenceWork work, int prevComputed)
         {
+            EnsureDraftContinuation(seq);
             (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
             if (work.IsPrefill)
             {
@@ -3204,6 +3213,106 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly Dictionary<string, SpecSeqContext> _fusedSpecCtx = new(StringComparer.Ordinal);
         private readonly HashSet<string> _fusedSpecDeclined = new(StringComparer.Ordinal);
 
+        // The drafter contexts the model kept past their requests, by the tokens each covers, and the requests whose drafter
+        // state is in use (each asked once for a context to continue; at release, its state is kept for the sequence).
+        private readonly DraftContextRegistry _draftContexts = new();
+        private readonly Dictionary<string, SequenceState> _draftSequences = new(StringComparer.Ordinal);
+
+        /// <summary>Requests that continued a drafter context a finished request kept (tests check the context moved).</summary>
+        internal int DraftContextsContinued { get; private set; }
+
+        /// <summary>
+        /// Before <paramref name="seq"/>'s drafter state is first used (a followed prompt chunk, a speculative step): where the
+        /// model keeps drafter state per request, the request continues the context a finished request kept whose tokens its
+        /// own begin with (the previous turn of its conversation, whose cache it reuses), as the context of the positions it
+        /// reuses. Only where it reuses part of its drafter's window at the prompt's end (a prompt it reads whole fills that
+        /// window itself), and only over the rows that context holds (its last <see cref="IDraftHead.DraftContextRows"/>
+        /// positions). Tokens, media and cache scopes match as the prefix reuse matches them. Once per request.
+        /// </summary>
+        private void EnsureDraftContinuation(SequenceState seq)
+        {
+            if (_model is not IPerRequestDraftState states || !_draftSequences.TryAdd(seq.RequestId, seq) || _draftContexts.Count == 0)
+                return;
+            int window = (_model as IDraftHead)?.DraftContextRows ?? int.MaxValue;
+            int reused = seq.NumComputedTokens;
+            if (reused <= 0 || (window != int.MaxValue && (long)reused + window <= seq.PromptTokens.Count))
+                return;
+            int known = seq.PromptTokens.Count + seq.OutputTokens.Count;
+            foreach (var (key, tokens) in _draftContexts.Candidates(kept => UsableDraftContext(kept, seq, known, reused, window)))
+            {
+                bool continued = states.ContinueDraftState(seq.RequestId, key, tokens);
+                // Continued, the state is this request's now; not, the model no longer keeps it.
+                _draftContexts.Forget(key);
+                if (!continued) continue;
+                DraftContextsContinued++;
+                if (_cbDebug)
+                    Console.Error.WriteLine($"[cb] {seq.RequestId} continues the drafter context {key} kept over its first {tokens} tokens");
+                return;
+            }
+        }
+
+        /// <summary>The positions of <paramref name="kept"/> that <paramref name="seq"/> may continue: their tokens are its own
+        /// (clamped to the first media span that differs, and to the shared prefix across cache scopes, as prefix reuse is),
+        /// it reuses them (its first <paramref name="reused"/>), and the context holds rows among them; 0 when none.</summary>
+        private int UsableDraftContext(KeptDraftContext kept, SequenceState seq, int known, int reused, int window)
+        {
+            int prefix = DraftContextRegistry.CommonPrefix(kept, seq.TokenAt, known);
+            prefix = PromptMediaSpans.ClampReusablePrefix(prefix, seq.MediaSpans, kept.Media, _model.SupportsReuseAcrossMediaSpan);
+            if (!ScopeAllows(kept.Scope, seq.CacheScope))
+                prefix = Math.Min(prefix, seq.SharedPrefixTokens);
+            prefix = Math.Min(prefix, reused);
+            return window == int.MaxValue || prefix > kept.Tokens.Length - window ? prefix : 0;
+        }
+
+        /// <summary>
+        /// A prompt chunk of a request that does not speculate: a drafter whose context outlives its request takes the
+        /// chunk's rows where it has a free state for it (<see cref="IDraftHead.FollowUnspeculatedPrompt"/>), so the turn after
+        /// this one, which reuses this prompt's cache, drafts over the conversation. longturn's A and B turns (one token each)
+        /// had left the C turn that reuses B's whole prompt drafting over another conversation's ring (issue #376).
+        /// </summary>
+        private void FollowUnspeculatedPrompt(SequenceState seq)
+        {
+            if (_model is not IDraftHead { DraftSelfCatchUp: true } head || _model is not IPerRequestDraftState)
+                return;
+            EnsureDraftContinuation(seq);
+            head.FollowUnspeculatedPrompt(seq.RequestId, seq.PromptTokens.Count);
+        }
+
+        /// <summary>The request's drafter state is over: kept as its sequence's context when the request ended without an
+        /// error and the model keeps one (<see cref="IPerRequestDraftState.KeepDraftState"/>), else released.</summary>
+        private void EndDraftState(string requestId)
+        {
+            if (_model is not IPerRequestDraftState states)
+                return;
+            if (!_draftSequences.Remove(requestId, out SequenceState? seq) || seq.Error != null)
+            {
+                states.ReleaseDraftState(requestId);
+                return;
+            }
+            int covered = states.KeepDraftState(requestId);
+            if (covered <= 0)
+                return;
+            int known = seq.PromptTokens.Count + seq.OutputTokens.Count;
+            var tokens = new SequenceTokens(seq);
+            string? dropped = _draftContexts.Note(requestId, tokens, Math.Min(covered, known), seq.MediaSpans, seq.CacheScope);
+            if (dropped != null)
+                states.ReleaseDraftState(dropped);
+        }
+
+        /// <summary>A sequence's tokens (prompt, then output) as a list.</summary>
+        private sealed class SequenceTokens : IReadOnlyList<int>
+        {
+            private readonly SequenceState _seq;
+            public SequenceTokens(SequenceState seq) => _seq = seq;
+            public int this[int index] => _seq.TokenAt(index);
+            public int Count => _seq.PromptTokens.Count + _seq.OutputTokens.Count;
+            public IEnumerator<int> GetEnumerator()
+            {
+                for (int i = 0; i < Count; i++) yield return _seq.TokenAt(i);
+            }
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+        }
+
         // Speculative turns (TrySpeculativeTurn): TS_SPEC_TURNS=0 never, =1 always (where the trunk can), unset where
         // the trunk prefers them (ISpeculativeTarget.SpecTurnsPreferred).
         private static readonly string? s_specTurns = Environment.GetEnvironmentVariable("TS_SPEC_TURNS");
@@ -3288,7 +3397,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (_fusedSpecCtx.Remove(requestId, out var ctx))
                 ctx.Exec?.Dispose();
             _fusedSpecDeclined.Remove(requestId);
-            (_model as IPerRequestDraftState)?.ReleaseDraftState(requestId);
+            EndDraftState(requestId);
         }
 
         /// <summary>
@@ -3319,6 +3428,7 @@ namespace TensorSharp.Runtime.Scheduling
             // The bound holder must agree with the scheduler about the position.
             if (spec.CacheSeqLen != prevComputed)
                 return false;
+            EnsureDraftContinuation(seq);
             (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
             if (!TryGetFusedSpecContext(spec, seq, prevComputed, out SpecSeqContext? ctx))
                 return false;
@@ -3403,6 +3513,7 @@ namespace TensorSharp.Runtime.Scheduling
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
+                EnsureDraftContinuation(seq);
                 batched.BindDraftState(seq.RequestId);
                 if (!TryGetFusedSpecContext(spec, seq, seq.NumComputedTokens, out ctxs[i]))
                     return false;

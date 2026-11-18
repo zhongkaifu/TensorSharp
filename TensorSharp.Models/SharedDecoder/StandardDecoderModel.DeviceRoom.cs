@@ -143,7 +143,9 @@ namespace TensorSharp.Models
         /// <item>pooled slots, the largest first (they belong to no conversation);</item>
         /// <item>parked recordings that bind none of <paramref name="keep"/> (a later step records again), not for recordings;</item>
         /// <item>the window buffers the conversations the prefix cache keeps hold (<see cref="Retained"/>), the oldest first, never
-        /// one of <paramref name="keep"/> (the next verify on such a slot allocates them again and records its windows anew);</item>
+        /// one of <paramref name="keep"/> (the next verify on such a slot allocates them again and records its windows anew);
+        /// then the drafter rings no request holds, with the contexts they keep for finished requests' next turns
+        /// (ModelBase.ReleaseIdleDFlashRings);</item>
         /// <item>with <paramref name="mayEvict"/>, the conversations the prefix cache keeps, the oldest first, each reported to
         /// it as reclaimed (their next turns prefill again), never one of <paramref name="keep"/>;</item>
         /// <item>for a prompt step, the cached graphs and every recording, which had been the first reaction.</item>
@@ -222,6 +224,19 @@ namespace TensorSharp.Models
                     if (buffers) DeviceRoomStages[4]++;
                 }
 
+                // 4. Then the drafter rings finished requests keep for their conversations' next turns (a turn whose ring went
+                // drafts without its context until its rows come back), with the graphs over them.
+                if (free < need)
+                {
+                    long ringBytes = ReleaseIdleDFlashRings();
+                    if (ringBytes > 0)
+                    {
+                        DeviceRoomStages[4]++;
+                        NoteDeviceMemoryChanged();
+                        free = Math.Max(RoomFree(use), free + ringBytes);
+                    }
+                }
+
                 // 5. The conversations the prefix cache keeps, the oldest first.
                 int released = 0;
                 long releasedBytes = 0;
@@ -273,6 +288,21 @@ namespace TensorSharp.Models
         }
 
         private static long Mib(long bytes) => Math.Max(0, bytes) >> 20;
+
+        /// <summary>A drafter ring made to keep a finished request's context takes only room a slot would leave (its headroom
+        /// and a prompt step's or recordings' room) on a device this model manages, or one ggml_cuda or Metal device; anywhere
+        /// else the pool's bound alone limits it.</summary>
+        private protected override bool RoomForDFlashRing(long bytes)
+        {
+            if (DeviceRoomManaged)
+            {
+                var (free, total) = DeviceMemory();
+                return total <= 0 || free >= RoomNeed(bytes, total, RoomUse.Slot);
+            }
+            if (AdmitsSlotsByDeviceMemory && DeviceMemoryProbe() is { } memory)
+                return memory.Free >= bytes + DeviceHeadroom(memory.Total);
+            return true;
+        }
 
         /// <summary>Whether <paramref name="keep"/> holds <paramref name="slot"/> or a slot over its caches.</summary>
         private static bool Holds(ReadOnlySpan<Slot> keep, Slot slot)

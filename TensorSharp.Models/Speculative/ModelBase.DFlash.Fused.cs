@@ -99,6 +99,10 @@ namespace TensorSharp.Models
         /// sequence) are not context. See <see cref="NoteDFlashRingWrite"/>.</summary>
         private protected int _dflashRingValidFrom;
 
+        /// <summary>One past the highest position the ring may hold a row of since its valid run began: the frontier's
+        /// highest, plus the block a draft there writes ahead of it (see <see cref="NoteDFlashRingWrite"/>).</summary>
+        private int _dflashRingHigh;
+
         /// <summary>Set when the fused kernels or the runtime's graph programs
         /// (StandardDecoderModel.BlockDraft.cs) have written the ring on the device, so
         /// the host mirror is behind.</summary>
@@ -453,6 +457,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.DSpineResetCaches();
             _dflashRingFilled = 0;
             _dflashRingValidFrom = 0;
+            _dflashRingHigh = 0;
             _dflashRingCarryEnd = -1;
         }
 
@@ -463,13 +468,47 @@ namespace TensorSharp.Models
         /// arms mid-sequence with an empty ring, and the slots under its first write's
         /// frontier hold zeros or another sequence's rows at colliding positions, which
         /// the slot map used to label as live context.
+        /// <para>
+        /// A write that moves the frontier back (a request that continues a sequence the ring held further, from where its
+        /// cache resumes) leaves the rows below it, except those whose slots a later position took: position p and
+        /// p + ringRows share a slot, so a row under the old frontier's last ring length had been overwritten by one past the
+        /// new frontier, which the slot map would label as p. The run then starts past them. A draft's catch-up rewrites the
+        /// row its carry inject wrote and the block a draft writes ahead of the frontier is never context (the ring holds a
+        /// window and a block), so moving back by no more than a block keeps the run as it was.
+        /// </para>
         /// </summary>
         private protected void NoteDFlashRingWrite(int startPos, int n)
         {
+            int end = startPos + n;
             if (startPos > _dflashRingFilled || startPos < _dflashRingValidFrom)
+            {
                 _dflashRingValidFrom = startPos;
-            _dflashRingFilled = startPos + n;
+                _dflashRingHigh = end;
+            }
+            else
+            {
+                MoveDFlashRunBack(startPos, end);
+            }
+            _dflashRingFilled = end;
+            _dflashRingHigh = Math.Max(_dflashRingHigh, end + DFlashRingLookahead);
             _dflashRingCarryEnd = -1;   // the carry no longer sits at the frontier (a followed step sets it again)
+        }
+
+        /// <summary>Rows a draft writes ahead of the frontier: its block (the ring's slots of positions it does not hold yet).</summary>
+        private int DFlashRingLookahead => _dflash?.BlockSize ?? 0;
+
+        /// <summary>
+        /// The bound ring's valid run where rows <paramref name="startPos"/> .. <paramref name="end"/> are its newest (a write
+        /// inside the run, or none: <paramref name="startPos"/> = <paramref name="end"/>): rows below the run's start whose
+        /// slots a position past <paramref name="end"/> took since are not context (see <see cref="NoteDFlashRingWrite"/>).
+        /// Unchanged while the ring held nothing past <paramref name="end"/> but a draft's block.
+        /// </summary>
+        private void MoveDFlashRunBack(int startPos, int end)
+        {
+            if (_dflashRingHigh <= end + DFlashRingLookahead)
+                return;
+            _dflashRingValidFrom = Math.Min(startPos, Math.Max(_dflashRingValidFrom, _dflashRingHigh - _dflashRingRows));
+            _dflashRingHigh = end + DFlashRingLookahead;
         }
 
         /// <summary>

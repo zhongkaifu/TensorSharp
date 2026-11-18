@@ -1187,17 +1187,19 @@ namespace TensorSharp.Models
 
             Tensor embedded = null;
             int[] promptEnds = null;
+            bool[] aside = null;
             try
             {
                 embedded = EmbedStep(flatTokens);
                 bool capture = features != null && Array.Exists(features, f => f != null);
                 // A lone speculating request's prompt chunk hands the draft layer its rows, and every speculating request's
-                // chunk its DFlash ring's (FollowPlainPrompt).
-                promptEnds = capture ? null : TakeFollowedPrompts(requestIds);
-                DraftFollow follow = n == 1 && promptEnds != null && promptEnds[0] != DFlashNoFollow
+                // chunk its DFlash ring's (FollowPlainPrompt); a request that does not speculate, its ring's where one is free
+                // (FollowUnspeculatedPrompt).
+                promptEnds = capture ? null : TakeFollowedPrompts(requestIds, out aside);
+                DraftFollow follow = n == 1 && promptEnds != null && promptEnds[0] != DFlashNoFollow && aside?[0] != true
                     ? PlanDraftFollow(slots[0], starts[0], null) : DraftFollow.None;
                 float[] draftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], chunks[0], media: false) : null;
-                DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds);
+                DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds, aside);
                 if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
                     : RunFollowingDFlash(ref dflash, plan => TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(),
                           wantLogits: true, out float[][] graphLogits, follow: follow, draftRows: draftRows, dflash: plan, prompt: true)
@@ -1219,7 +1221,7 @@ namespace TensorSharp.Models
             catch
             {
                 // A step that found no device memory is retried (TryForwardSlots): the chunks still follow there.
-                RestoreFollowedPrompts(requestIds, promptEnds);
+                RestoreFollowedPrompts(requestIds, promptEnds, aside);
                 throw;
             }
             finally
