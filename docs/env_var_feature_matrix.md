@@ -585,11 +585,15 @@ These tune `--backend ggml_cpu` (ggml-cpu under TensorSharp's graph runtime, `Te
 They are not registered in `EnvVarMatrix.All` and are not swept by the default TestMatrix config. Measurements were taken
 on an Apple M5 Pro (6 performance + 12 efficiency cores, 48 GB) with LFM3-1.7B, every arm interleaved on a quiet machine.
 
-Two of ggml-cpu's gaps on ARM64 are filled by TensorSharp's own products, with no knob: BF16 weights (ggml-cpu's BF16 dot
+Two of ggml-cpu's gaps on ARM64 are filled by TensorSharp's own products, with no knob. BF16 weights (ggml-cpu's BF16 dot
 has no NEON body there and runs a scalar loop) are widened to F32 exactly and multiplied with the F32 activations as they
-are (decode 54 vs 12 tok/s), and on Apple, BF16 and NVFP4 products of prompt width (from 64 and 256 activation rows) go to
-one Accelerate `sgemm` after the weight is converted to F32, as llama.cpp's BLAS backend does. Both read the activations
-unrounded (ggml rounds them to BF16, or to Q8_0 for NVFP4).
+are (decode 54 vs 12 tok/s), and on Apple, BF16 products of prompt width (from 64 activation rows) go to one Accelerate
+`sgemm` after the weight is widened, as llama.cpp's BLAS backend does; both read the activations unrounded (ggml rounds
+them to BF16). NVFP4 products of 2 activation rows and more (ARM64 with the dot-product instructions) run TensorSharp's
+GEMM with ggml's own NVFP4 arithmetic: the activations are ggml-cpu's Q8_0 rows and every output has the bits ggml's
+one-row product gives it, while each weight block is decoded once for every four rows instead of once a row (LFM3-1.7B
+NVFP4 on an M5 Pro: 128-token prompts 382 -> 972 tok/s, 512-token prompts 612 -> 1,038 tok/s, against Accelerate's
+`sgemm` over the dequantized weight, which took prompts from 256 rows before).
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|

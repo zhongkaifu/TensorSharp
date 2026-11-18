@@ -20,7 +20,8 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// The ggml-cpu side of the generic graph (ggml_ops_cpu_graph.cpp, ggml_ops_cpu_products.cpp): weights only products read
 /// run from ggml-cpu's repacked layouts (CPU_REPACK), every other reader keeps the plain bytes, and the weights ggml-cpu has
-/// no fast product for on ARM64 (BF16; BF16 and NVFP4 at prompt width on Apple) run TensorSharp's products.
+/// no fast product for on ARM64 (BF16 at every width, sgemm at prompt width on Apple; NVFP4 from two rows) run TensorSharp's
+/// products.
 /// </summary>
 public sealed class GgmlCpuWeightProductTests
 {
@@ -243,9 +244,10 @@ public sealed class GgmlCpuWeightProductTests
     }
 
     /// <summary>
-    /// BF16 weights at every width (NEON rows below 64, Accelerate's sgemm from there), and NVFP4 weights from 256 rows
-    /// where sgemm takes them, run TensorSharp's products over unrounded F32 activations: within F32 summation error of
-    /// the double-precision reference. Narrower NVFP4 products keep ggml-cpu's own arithmetic (activations rounded to Q8_0).
+    /// BF16 weights at every width (NEON rows below 64, Accelerate's sgemm from there) run TensorSharp's products over
+    /// unrounded F32 activations: within F32 summation error of the double-precision reference. NVFP4 products keep
+    /// ggml-cpu's own arithmetic at every width (activations rounded to Q8_0; see
+    /// <see cref="Nvfp4ProductsOfSeveralRowsHaveEachRowsOwnBits"/>).
     /// </summary>
     [GgmlFact(BackendType.GgmlCpu)]
     public void FloatWeightProductsReadUnroundedActivations()
@@ -265,7 +267,7 @@ public sealed class GgmlCpuWeightProductTests
                     double rel = RelL2(y[0], Reference(wf, x, n));
                     double block = RelL2(y[1], Reference(wf, x, n, 16, 32));
                     _output.WriteLine($"type {type} rows {n}: {rel:E2} (row block {block:E2})");
-                    bool ours = arm64 && (type == 30 || (OperatingSystem.IsMacOS() && n >= 256));
+                    bool ours = arm64 && type == 30;
                     double tolerance = ours ? 1e-6 : 3e-2;
                     Assert.True(rel < tolerance, $"type {type} rows {n}: {rel:E2} from the reference (tolerance {tolerance:E0})");
                     Assert.True(block < tolerance, $"type {type} rows {n}: row block {block:E2} from the reference");
@@ -281,7 +283,7 @@ public sealed class GgmlCpuWeightProductTests
     }
 
     /// <summary>
-    /// NVFP4 products of 2 to 255 rows run TensorSharp's GEMM over ggml's own Q8_0 activation rows with
+    /// NVFP4 products of two rows and more run TensorSharp's GEMM over ggml's own Q8_0 activation rows with
     /// ggml_vec_dot_nvfp4_q8_0's arithmetic: every row of a wide product has the bits ggml-cpu's product gives that row
     /// alone (a one-row product is ggml's dot), for the whole weight and for a row block.
     /// </summary>
@@ -291,7 +293,7 @@ public sealed class GgmlCpuWeightProductTests
         WithCpuBackend(() =>
         {
             var rng = new Random(13);
-            foreach (int n in new[] { 2, 3, 4, 5, 8, 37, 255 })
+            foreach (int n in new[] { 2, 3, 4, 5, 8, 37, 255, 256, 300, 512 })
             {
                 using var native = new Native();
                 byte[] bytes = RandomWeight(40, rng);

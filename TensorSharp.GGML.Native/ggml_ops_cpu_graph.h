@@ -52,8 +52,9 @@ namespace tsg
 
     /// w · x for a weight ggml-cpu has no fast kernel for on this CPU, as TensorSharp's product (a GGML_OP_CUSTOM node
     /// over the graph's thread pool, ggml_ops_cpu_products.cpp), or null to keep ggml's MUL_MAT. ARM64: BF16 weights
-    /// (ggml-cpu's BF16 dot is scalar there) at any width, and on Apple BF16 and NVFP4 weights of prompt width through
-    /// Accelerate's sgemm. F32 activations unrounded; w a 2-D weight or a row block of one.
+    /// (ggml-cpu's BF16 dot is scalar there) at any width, through Accelerate's sgemm at prompt width on Apple, over F32
+    /// activations unrounded; NVFP4 weights from two activation rows, as a GEMM over ggml's own Q8_0 activation rows that
+    /// gives every row the bits ggml's product gives it. w a 2-D weight or a row block of one.
     ggml_tensor* cpu_weight_product(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x);
 
     /// Creates the CPU backend's thread pools (the prompt pool always; a decode pool when its width differs) and sets

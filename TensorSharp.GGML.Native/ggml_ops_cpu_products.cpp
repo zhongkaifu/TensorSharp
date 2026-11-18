@@ -10,14 +10,14 @@
 //   - BF16 below prompt width: ggml-cpu's BF16 dot has no NEON body (vec.cpp's ARM build runs the scalar loop, ~12 tok/s
 //     decode on a 1.7B model). Here the weight rows are widened to F32 (exact) and multiplied with the F32 activations as
 //     they are, every thread on its own rows.
-//   - BF16 and NVFP4 products of prompt width (from kSgemmRowsBf16 / kSgemmRowsNvfp4 rows, Apple): the weight is widened / dequantized to F32
-//     by every thread (one graph tensor, row tiles past kTileBytes), then multiplied by one Accelerate sgemm call (Apple's
-//     matrix units), as llama.cpp's BLAS backend does for the products it takes.
-// Both read F32 activations unrounded (ggml rounds them to the weight's dot type: BF16, or Q8_0 for NVFP4).
-//   - NVFP4 products of a few rows up to prompt width (kNvfp4GemmRows up to kSgemmRowsNvfp4, ARM64 with the dot-product
-//     instructions): ggml-cpu's own NVFP4 product, a row at a time (nrows = 1: every weight block is decoded again for every
-//     activation row), as a GEMM. Four weight rows are decoded once into int8 vectors laid out for SDOT by lane, and tiles
-//     of four activation rows run against them with the columns in vector lanes. The activations are ggml's own Q8_0 rows
+//   - BF16 products of prompt width (from kSgemmRowsBf16 rows, Apple): the weight is widened to F32 by every thread (one
+//     graph tensor, row tiles past kTileBytes), then multiplied by one Accelerate sgemm call (Apple's matrix units), as
+//     llama.cpp's BLAS backend does for the products it takes.
+// Both read F32 activations unrounded (ggml rounds them to BF16).
+//   - NVFP4 products of kNvfp4GemmRows rows and more (ARM64 with the dot-product instructions): ggml-cpu's own NVFP4
+//     product, a row at a time (nrows = 1: every weight block is decoded again for every activation row), as a GEMM.
+//     Four weight rows are decoded once into int8 vectors laid out for SDOT by lane, and tiles of four activation rows run
+//     against them with the columns in vector lanes. The activations are ggml's own Q8_0 rows
 //     (ggml-cpu's from_float), and every output is ggml_vec_dot_nvfp4_q8_0's NEON arithmetic evaluated lane-wise (exact
 //     integer sums per 16-value sub-block, one fused multiply-add per sub-block into its own accumulator, the four
 //     accumulators summed as vaddvq_f32 sums them): the same bits as ggml's product, faster.
@@ -50,13 +50,12 @@ namespace tsg
 {
     namespace
     {
-        // Activation rows from which a product's weight goes through sgemm, per weight type. The conversion to F32 is
-        // paid per product whatever its width, so sgemm pays off from the width where its speed covers it (M5 Pro,
-        // LFM3-1.7B at 18 threads, interleaved): BF16 (widened) loses to the NEON rows at 32 (121 vs 185 tok/s) and
-        // leads from 64 (210 vs 199; 241 vs 203 at 96, 315 vs 283 at 128); NVFP4 (dequantized) loses to ggml-cpu's own
-        // NVFP4 product at 128 (261 vs 374) and leads from 256 (468 vs 353; 638 vs 348 at 512).
+        // Activation rows from which a BF16 product's weight goes through sgemm. The conversion to F32 is paid per product
+        // whatever its width, so sgemm pays off from the width where its speed covers it (M5 Pro, LFM3-1.7B at 18 threads,
+        // interleaved): the widened weight loses to the NEON rows at 32 (121 vs 185 tok/s) and leads from 64 (210 vs 199;
+        // 241 vs 203 at 96, 315 vs 283 at 128). (NVFP4 went this way from 256 rows until its GEMM below outran it at
+        // every width: LFM3-1.7B NVFP4 pp512 683 -> 1038 tok/s.)
         constexpr std::int64_t kSgemmRowsBf16 = 64;
-        constexpr std::int64_t kSgemmRowsNvfp4 = 256;
         // The F32 copy of a prompt product's weight is at most this big (larger weights go in row tiles).
         constexpr std::int64_t kTileBytes = std::int64_t(128) << 20;
 
@@ -91,7 +90,7 @@ namespace tsg
         }
 #endif
 
-#if defined(TSG_GGML_USE_ACCELERATE) || defined(TSG_CPU_NVFP4_SDOT)
+#if defined(TSG_CPU_NVFP4_SDOT)
         // NVFP4's UE4M3 sub-block scales as floats, read from ggml's own decoding (a block whose first code is 1).
         const float* nvfp4_scales()
         {
@@ -139,35 +138,6 @@ namespace tsg
                 }
                 return;
             }
-#if defined(TSG_CPU_BF16_NEON)
-            if (w->type == GGML_TYPE_NVFP4 && K % 64 == 0)
-            {
-                // ggml's dequantize_row_nvfp4 (value = kvalues_fp4[code] * ue4m3(scale)) with a table lookup per 16 codes:
-                // the same float products, bit for bit.
-                static const std::int8_t kvalues[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
-                const int8x16_t lut = vld1q_s8(kvalues);
-                const float* scales = nvfp4_scales();
-                const uint8x8_t low = vdup_n_u8(0x0F);
-                for (std::int64_t r = 0; r < rows; r++)
-                {
-                    const auto* blk = reinterpret_cast<const std::uint8_t*>(base + r * w->nb[1]);
-                    float* d = dst + r * K;
-                    for (std::int64_t b = 0; b < K / 64; b++, blk += 36)
-                        for (int sb = 0; sb < 4; sb++, d += 16)
-                        {
-                            const float32x4_t scale = vdupq_n_f32(scales[blk[sb]]);
-                            const uint8x8_t q = vld1_u8(blk + 4 + sb * 8);
-                            const int8x16_t v = vqtbl1q_s8(lut, vcombine_u8(vand_u8(q, low), vshr_n_u8(q, 4)));
-                            const int16x8_t v0 = vmovl_s8(vget_low_s8(v)), v1 = vmovl_high_s8(v);
-                            vst1q_f32(d + 0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(v0))), scale));
-                            vst1q_f32(d + 4, vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(v0)), scale));
-                            vst1q_f32(d + 8, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(v1))), scale));
-                            vst1q_f32(d + 12, vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(v1)), scale));
-                        }
-                }
-                return;
-            }
-#endif
             const ggml_to_float_t to_float = ggml_get_type_traits(w->type)->to_float;
             for (std::int64_t r = 0; r < rows; r++)
                 to_float(base + r * w->nb[1], dst + r * K, K);
@@ -410,8 +380,7 @@ namespace tsg
 #if defined(TSG_CPU_BF16_NEON)
         [[maybe_unused]] const std::int64_t rows = x->ne[1] * x->ne[2];
 #if defined(TSG_CPU_NVFP4_SDOT)
-        if (w->type == GGML_TYPE_NVFP4 && rows >= kNvfp4GemmRows && rows < kSgemmRowsNvfp4 && w->ne[0] % kNvfp4Block == 0
-            && w->ne[1] % 4 == 0)
+        if (w->type == GGML_TYPE_NVFP4 && rows >= kNvfp4GemmRows && w->ne[0] % kNvfp4Block == 0 && w->ne[1] % 4 == 0)
         {
             // ggml's Q8_0 activation rows (a tensor of the graph), then the GEMM over them.
             ggml_tensor* quant_args[1] = { x };
@@ -421,7 +390,7 @@ namespace tsg
         }
 #endif
 #if defined(TSG_GGML_USE_ACCELERATE)
-        if ((w->type == GGML_TYPE_BF16 && rows >= kSgemmRowsBf16) || (w->type == GGML_TYPE_NVFP4 && rows >= kSgemmRowsNvfp4))
+        if (w->type == GGML_TYPE_BF16 && rows >= kSgemmRowsBf16)
         {
             // The weight as F32 (one graph tensor, at most kTileBytes: a wider weight - a vocabulary head read for every
             // row - goes in row tiles whose products are concatenated), then one sgemm per tile.
