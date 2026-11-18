@@ -848,7 +848,7 @@ namespace TensorSharp.Runtime.Speculative
         /// sequence's drafter state first and has already advanced the trunk.
         /// <paramref name="verifyTicks"/> is this sequence's share of the verify forward alone (its draft is counted
         /// where it ran), <paramref name="commitTicks"/> its share of the row draws and the trunk's commit; a step that
-        /// drafted nothing is a plain step, charged both.
+        /// drafted nothing is a plain step, charged both and its own catch-up, as the solo plain step is.
         /// </summary>
         public void CommitBatch(int lastToken, int position, IReadOnlyList<int> drafts, int accepted,
             float[]? rowFeatures, long rowOffset, long verifyTicks, long commitTicks = 0)
@@ -899,7 +899,14 @@ namespace TensorSharp.Runtime.Speculative
                 Array.Copy(rowFeatures, rowOffset + (long)accepted * _hidden, _pendingH, 0, _hidden);
                 _carryValid = true;
             }
-            Stats.CatchUpTicks += Timestamp() - tCatch0;
+            // A plain step's catch-up is the plain step's, as on the solo path (DecodeStep's plain branch times its
+            // speculator commit as plain): counted as catch-up, it made perVerifyMs' catch-up hold steps that verified
+            // nothing.
+            long catchUpTicks = Timestamp() - tCatch0;
+            if (k > 0)
+                Stats.CatchUpTicks += catchUpTicks;
+            else
+                Stats.PlainTicks += catchUpTicks;
         }
 
         public void Dispose() => _speculator.Dispose();

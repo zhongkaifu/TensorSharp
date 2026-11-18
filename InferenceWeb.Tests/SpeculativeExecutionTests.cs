@@ -1340,6 +1340,7 @@ public partial class SpeculativeExecutionTests
         public long AcceptCost { get; set; }     // SpecOnVerifyAccepted
         public long RestoreCost { get; set; }
         public long RewindCost { get; set; }
+        public long CatchUpCost { get; set; }    // DraftCatchUp: the drafter taking committed tokens
         public bool PersistsAcceptedKv { get; set; }
         public bool SpecVerifyPersistsAcceptedKv => PersistsAcceptedKv;
         public void SpecOnVerifyAccepted(int acceptedRows, int verifyRows) => Clock?.Advance(AcceptCost);
@@ -1616,6 +1617,7 @@ public partial class SpeculativeExecutionTests
 
         public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
+            Clock?.Advance(CatchUpCost);
             if (hRows != null && tokens.Length > 0)
                 FirstHiddenCatchUpPosition = Math.Min(FirstHiddenCatchUpPosition, startPos);
             if (hRows == null)

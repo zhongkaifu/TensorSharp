@@ -48,9 +48,9 @@ namespace TensorSharp.Runtime.Speculative
         //   snapshot  the recurrent-state snapshot before a solo verify;
         //   rollback  the re-forward of the kept rows where the trunk could not keep the
         //             verify's own;
-        //   catch-up  handing the kept tokens to the drafter;
-        //   plain     steps that verified no draft (a shared step's whole share: its forward
-        //             and its draws).
+        //   catch-up  handing a verify step's kept tokens to the drafter;
+        //   plain     steps that verified no draft: their forward and catch-up (a shared
+        //             step's whole share: its forward, its draws and its catch-up).
         // The shared step's verify had included its draft (counted in draft as well), and no
         // step counted its commit: the issue #376 log read 98.7 ms a verify step.
         internal long DraftTicks;

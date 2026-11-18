@@ -359,11 +359,12 @@ Speculative decoding stats for chat-…: drafted=175 accepted=165 acceptance=94 
 | `commit` | drawing the window's rows, accepting the drafts and the trunk's commit of the kept rows (a recurrent trunk's replay of them, or keeping the verify's own rows); a share on a batched step |
 | `snapshot` | the recurrent-state snapshot before a solo verify |
 | `rollback` | the re-forward of the kept rows where the trunk could not keep the verify's own |
-| `catchUp` | handing the kept tokens to the drafter |
-| `plain` | steps that verified no draft; on a batched step, the request's share of the forward and of the draws |
+| `catchUp` | handing a verify step's kept tokens to the drafter |
+| `plain` | steps that verified no draft: their forward and the drafter's catch-up; on a batched step, the request's share of the forward and of the draws, and its catch-up |
 
 `perVerifyMs` divides `draft`, `verify`, `commit` and `catchUp` by `verifySteps`: what one
-verify step spent in each. Until 2026-11 the batched step timed its verify from the start
+verify step spent in each. `draft` also holds the drafts that proposed nothing (their steps
+ran plain), so its per-step figure is drafting's whole cost per verify step. Until 2026-11 the batched step timed its verify from the start
 of the step, so `verify` held the draft as well (also counted under `draft`), and nothing
 counted the commit; per-step figures read off older logs overstate the verify by the
 draft. `TS_BATCHED_SPEC_LOG=1` prints the same phases for every batched step.

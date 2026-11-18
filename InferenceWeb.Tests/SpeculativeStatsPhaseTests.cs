@@ -130,6 +130,9 @@ public partial class SpeculativeExecutionTests
         var model = new FakeSpeculativeModel { ResumesAfterGap = true };
         var exec = NewExec(model, maxDraftTokens: 4);
         int pos = PrefillPrompt(model, exec, promptLen: 5, out int last);
+        // The catch-up CommitBatch times itself reads this clock, which no call moves here: a plain step's catch-up is
+        // the plain step's, so a real clock would put real time in the plain total.
+        exec.Timestamp = new SimulatedClock().Read;
         var features = new float[5 * HiddenSize];
         for (int r = 0; r < 5; r++)
             Array.Fill(features, pos + r + 1, r * HiddenSize, HiddenSize);
@@ -143,6 +146,43 @@ public partial class SpeculativeExecutionTests
         Assert.Equal((1L, 1L, 300L, 40L, 207L), (exec.Stats.VerifySteps, exec.Stats.PlainSteps, exec.Stats.VerifyTicks,
             exec.Stats.CommitTicks, exec.Stats.PlainTicks));
         Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void PlainStepCatchUp_IsThePlainStepsOnBothPaths_SoCatchUpHoldsVerifyStepsOnly()
+    {
+        const long catchUp = 7_000;
+        // The batched second half: a verify step's catch-up is catch-up, a plain step's is the plain step's. It had been
+        // catch-up too, so perVerifyMs' catch-up divided plain steps' injects by the verify steps.
+        var model = new FakeSpeculativeModel { ResumesAfterGap = true };
+        var exec = NewExec(model, maxDraftTokens: 4);
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int last);
+        var clock = new SimulatedClock();
+        exec.Timestamp = clock.Read;
+        (model.Clock, model.CatchUpCost) = (clock, catchUp);
+        var features = new float[5 * HiddenSize];
+        for (int r = 0; r < 5; r++)
+            Array.Fill(features, pos + r + 1, r * HiddenSize, HiddenSize);
+        var drafts = new List<int> { model.ExpectedNext(pos), model.ExpectedNext(pos + 1) };
+
+        exec.CommitBatch(last, pos, drafts, accepted: 2, features, 0, verifyTicks: 300, commitTicks: 40);
+        Assert.Equal((catchUp, 0L), (exec.Stats.CatchUpTicks, exec.Stats.PlainTicks));
+        exec.CommitBatch(model.ExpectedNext(pos + 2), pos + 3, new List<int>(), accepted: 0, features, 0, verifyTicks: 200,
+            commitTicks: 7);
+        Assert.Equal((1L, 1L), (exec.Stats.VerifySteps, exec.Stats.PlainSteps));
+        Assert.Equal((catchUp, 200L + 7L + catchUp), (exec.Stats.CatchUpTicks, exec.Stats.PlainTicks));
+        Assert.Equal(exec.Stats.CatchUpMs, exec.Stats.PerVerifyStep(exec.Stats.CatchUpMs));
+        Assert.Empty(model.ProtocolViolations);
+
+        // The solo plain step: its forward and its catch-up are plain, nothing is catch-up.
+        var (soloModel, solo, soloClock, soloPos, soloLast) = TimedSoloStep(persistsAcceptedKv: false);
+        soloModel.CatchUpCost = catchUp;
+        long t0 = soloClock.Now;
+        var outcome = solo.DecodeStep(soloLast, soloPos, kMax: 0, drawNext: logits => Argmax(logits));
+        Assert.False(outcome.UsedSpeculation);
+        Assert.Equal((1L, Reforward + catchUp, 0L), (solo.Stats.PlainSteps, solo.Stats.PlainTicks, solo.Stats.CatchUpTicks));
+        Assert.Equal(soloClock.Now - t0, PhaseTicks(solo.Stats));
+        Assert.Empty(soloModel.ProtocolViolations);
     }
 
     [Fact]
