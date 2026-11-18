@@ -160,7 +160,10 @@ namespace TensorSharp.Models
                 counts[s] = window;
             }
             for (int s = 0; s < n; s++)
-                EnsureSlotCapacity(slots[s], checked(positions[s] + window));
+            {
+                int required = checked(positions[s] + window);
+                EnsureSlotCapacity(slots[s], required, wanted: WantedCells(requestIds[s], required));
+            }
             if (InjectedVerifyAllocationFailures > 0)
             {
                 InjectedVerifyAllocationFailures--;

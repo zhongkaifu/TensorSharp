@@ -148,7 +148,9 @@ namespace TensorSharp.Models
 
         /// <summary>Entry <paramref name="entry"/>'s cache tensor for one rank at <paramref name="capacity"/> cells (null where
         /// it has none: a recurrent layer, another node's layer, an extra cache's value side).</summary>
-        private Tensor NewCacheTensor(int entry, int rank, int capacity, bool value)
+        /// <param name="zeroFrom">The first row the new tensor's zero fill covers: a copy writes the rows before it (a grown or
+        /// copied slot's), so only the rows past them are filled (<see cref="ZeroCacheRows"/>).</param>
+        private Tensor NewCacheTensor(int entry, int rank, int capacity, bool value, int zeroFrom = 0)
         {
             DType dtype = _kvCacheDtype.ToDType();
             Tensor t;
@@ -169,8 +171,35 @@ namespace TensorSharp.Models
                 t = value ? new Tensor(alloc, dtype, kvHeads, capacity, _valueDim)
                           : new Tensor(alloc, dtype, kvHeads, capacity, _keyDim);
             }
-            InitializeCacheTensor(t);
+            ZeroCacheRows(t, zeroFrom);
             return t;
+        }
+
+        /// <summary>
+        /// A new cache tensor's allocation-time zero (<see cref="ModelBase.InitializeCacheTensor"/>: a padded window reads cells
+        /// no row has written, which must be finite), from row <paramref name="from"/> of each head on: the rows before it are
+        /// the ones a copy into the tensor writes next (a grown slot's, a copied one's). Filled whole, a 47K-token slot's growth
+        /// or copy zeroed gigabytes it then overwrote. Nothing where the allocation is zero already, or on MLX.
+        /// </summary>
+        private void ZeroCacheRows(Tensor t, int from)
+        {
+            if (t == null || _backend == BackendType.Mlx || t.Storage.TakeAllocationZeroGuarantee()) return;
+            long heads = t.Sizes[0], cells = t.Sizes[1];
+            if (from <= 0)
+            {
+                Ops.Fill(t, 0f);
+                CacheZeroFillBytes += t.Storage.ByteLength;
+                return;
+            }
+            if (from >= cells) return;
+            // A head's rows past `from` are contiguous: one fill each (a block-quantized row is whole blocks).
+            for (long h = 0; h < heads; h++)
+            {
+                using Tensor head = t.Narrow(0, h, 1);
+                using Tensor tail = head.Narrow(1, from, cells - from);
+                Ops.Fill(tail, 0f);
+            }
+            CacheZeroFillBytes += t.Storage.ByteLength / cells * (cells - from);
         }
 
         /// <summary>The extra key cache of <paramref name="layer"/> in <paramref name="k"/> (a slot's K array), or null.</summary>

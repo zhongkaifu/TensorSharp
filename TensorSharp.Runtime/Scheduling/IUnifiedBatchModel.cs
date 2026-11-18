@@ -24,6 +24,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// Returns the tokens the slot holds.</summary>
         int EnsureSequenceSlot(string requestId, int reserveTokens);
 
+        /// <summary><see cref="EnsureSequenceSlot(string, int)"/> where the step needs only <paramref name="requiredTokens"/>
+        /// (its prompt, its first token and a verify window's slack): a model that sizes slots to the device's memory may hold
+        /// less than the reservation and grow the slot when a later step needs it. Others hold the reservation.</summary>
+        int EnsureSequenceSlot(string requestId, int reserveTokens, int requiredTokens) => EnsureSequenceSlot(requestId, reserveTokens);
+
         /// <summary>One forward: request s's <paramref name="tokens"/>[s] at positions <paramref name="starts"/>[s]
         /// onward, every request's rows together; <paramref name="lastRowLogits"/>[s] its last row's logits. Declines
         /// (false, nothing written) when a request's slot does not continue at its start.

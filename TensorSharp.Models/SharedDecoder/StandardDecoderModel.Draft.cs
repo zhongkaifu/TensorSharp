@@ -357,7 +357,7 @@ namespace TensorSharp.Models
             }
             for (int s = 0; s < lanes; s++)
             {
-                EnsureSlotCapacity(slots[s], reach[s]);
+                EnsureSlotCapacity(slots[s], reach[s], wanted: WantedCells(requestIds[s], reach[s]));
                 slots[s].DraftFollowed = -1;   // the layer's rows from here on are the speculator's, as a single chain's
             }
 

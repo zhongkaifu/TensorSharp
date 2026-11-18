@@ -1721,7 +1721,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
             model.OnSequenceReleased("big");
             // The conversation's next turn adopts the retained slot.
             Assert.True(model.TryRebindRetainedCache("conversation", "turn2"));
-            Assert.Equal(prompt.Length, unified.EnsureSequenceSlot("turn2", 1500));   // past a new slot (512 cells, 1,024 on CUDA)
+            // Past the adopted slot: 512 cells on the managed executor; on direct CUDA, where slots are sized to the device's
+            // room, its capacity class with headroom (2,048 cells).
+            Assert.Equal(prompt.Length, unified.EnsureSequenceSlot("turn2", 3000));
             Assert.True(unified.TryForwardUnified(new[] { "turn2" }, new[] { new[] { 11, 12 } }, new[] { prompt.Length }, logits));
             moves = model.PooledSlotMoves;
             return (float[])logits[0].Clone();

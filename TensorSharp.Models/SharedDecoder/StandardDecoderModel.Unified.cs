@@ -148,7 +148,18 @@ namespace TensorSharp.Models
             return 4L * (3 * ff + 8 * width);
         }
 
-        public int EnsureSequenceSlot(string requestId, int reserveTokens)
+        public int EnsureSequenceSlot(string requestId, int reserveTokens) => EnsureSequenceSlot(requestId, reserveTokens, reserveTokens);
+
+        /// <summary>
+        /// The request's slot, with room for its reservation (<paramref name="reserveTokens"/>: its prompt and generation budget)
+        /// where it is held as asked; where slots are sized to the device's room (<see cref="SizesSlotsToRoom"/>, the CUDA executor
+        /// on one device) the reservation is fitted to the device once (<see cref="SlotTarget"/>: its class with headroom where
+        /// memory allows, else the largest capacity that fits, and finished conversations released only for the
+        /// <paramref name="requiredTokens"/> the step needs), and the slot grows only when a step needs more than it holds. Held as
+        /// asked, a 60K-token agent prompt with a 32K max_tokens pinned 92K cells (6.4 GB of Qwen3.8-27B's K/V) from its first
+        /// step.
+        /// </summary>
+        public int EnsureSequenceSlot(string requestId, int reserveTokens, int requiredTokens)
         {
             if (string.IsNullOrEmpty(requestId))
                 throw new ArgumentException("RequestId required", nameof(requestId));
@@ -157,21 +168,42 @@ namespace TensorSharp.Models
             ForgetDeferredGraphs();
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             int reserve = Math.Min(_maxContextLength, reserveTokens);
+            bool fitted = SizesSlotsToRoom;
+            int required = fitted ? Math.Clamp(requiredTokens, 1, Math.Max(1, reserve)) : reserve;
             if (!_slots.TryGetValue(requestId, out Slot slot))
             {
                 if (DeviceRoomManaged)
-                    slot = NewSlotWithRoom(requestId, reserve);
+                    slot = NewSlotWithRoom(requestId, reserve, required);
                 else
                 {
                     EnsureDeviceRoomForSlot(requestId, Math.Max(reserve, FreshSlotTokens));
                     slot = ReclaimRetainedSlot(reserve) ?? NewSlot(reserve);
                 }
                 _slots[requestId] = slot;
+                if (fitted) (_fittedReservations ??= new(StringComparer.Ordinal))[requestId] = reserve;
             }
-            if (reserve > slot.Capacity && !TryMoveToPooledSlot(requestId, ref slot, reserve))
-                EnsureSlotCapacity(slot, reserve, reservation: true);
+            if (!fitted)
+            {
+                if (reserve > slot.Capacity && !TryMoveToPooledSlot(requestId, ref slot, reserve))
+                    EnsureSlotCapacity(slot, reserve, reservation: true);
+                return slot.Length;
+            }
+            // A slot the request adopted (a conversation's finished slot, a copy of a cached prefix) or a reservation not fitted
+            // yet is fitted once; later steps ask again only when they need more than the slot holds.
+            _fittedReservations ??= new Dictionary<string, int>(StringComparer.Ordinal);
+            bool asked = _fittedReservations.TryGetValue(requestId, out int tried) && tried >= reserve;
+            if (!asked && reserve > slot.Capacity && !TryMoveToPooledSlot(requestId, ref slot, reserve))
+            {
+                int target = RoomySlotTarget(required, reserve, RunningSlots(slot), "a request's reservation", slot.Capacity);
+                if (target > slot.Capacity) GrowSlotRolling(slot, target);
+            }
+            _fittedReservations[requestId] = Math.Max(tried, reserve);
+            if (required > slot.Capacity) EnsureSlotCapacity(slot, required, wanted: reserve);
             return slot.Length;
         }
+
+        /// <summary>Reservations fitted to the device (tests: a request's later steps do not ask again).</summary>
+        internal int FittedReservationsForTests => _fittedReservations?.Count ?? 0;
 
         /// <summary>
         /// A request whose slot holds rows (the prefix it adopted: a retained conversation's slot, exactly its length) but not
@@ -421,6 +453,23 @@ namespace TensorSharp.Models
         // The largest slot a request has run in: a spare holds that request's copies (see ReplenishSpareSlot).
         private int _spareCapacity;
 
+        /// <summary>Tests: <see cref="SpareCapacity"/>.</summary>
+        internal int SpareCapacityForTests => SpareCapacity;
+
+        /// <summary>A spare slot's cells: as large as the largest slot a request has run in. Where slots are sized to the
+        /// device's room (<see cref="SizesSlotsToRoom"/>) only slots whose finished request's copy fits a spare are counted
+        /// (<see cref="RetainsShortSlotCopy"/>: up to <see cref="RetainCopyMaxBytes"/> of K/V), and a spare is at least the
+        /// smallest class: a long conversation's slot is donated, not copied, so a spare of its size (gigabytes at long context)
+        /// only took the room the next prompt needed, while a short slot's copy still takes a spare (<see cref="RetainsAsCopy"/>).</summary>
+        private int SpareCapacity => SizesSlotsToRoom
+            ? Math.Max(SlotCapacityClass(FreshSlotTokens), AlignedSlotCapacity(Math.Max(FreshSlotTokens, _spareCapacity)))
+            : AlignedSlotCapacity(Math.Max(FreshSlotTokens, _spareCapacity));
+
+        /// <summary>Whether a finished request's slot of <paramref name="capacity"/> cells is short enough to be retained as a copy
+        /// (<see cref="RetainsAsCopy"/>): its K/V at most <see cref="RetainCopyMaxBytes"/>.</summary>
+        private bool RetainsShortSlotCopy(int capacity)
+            => _slotBytesPerToken >= 0 && (long)capacity * _slotBytesPerToken <= (RetainCopyMaxBytesForTests ?? RetainCopyMaxBytes);
+
         /// <summary>Spares the pool keeps: one for the next request's prompt-end checkpoint, one for its retained copy.</summary>
         private const int SpareSlotsWanted = 2;
 
@@ -453,8 +502,9 @@ namespace TensorSharp.Models
                 return;
             if (_slots != null)
                 foreach (Slot running in _slots.Values)
-                    if (running?.K != null) _spareCapacity = Math.Max(_spareCapacity, running.Capacity);
-            int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, _spareCapacity));
+                    if (running?.K != null && (!SizesSlotsToRoom || RetainsShortSlotCopy(running.Capacity)))
+                        _spareCapacity = Math.Max(_spareCapacity, running.Capacity);
+            int capacity = SpareCapacity;
             int spares = 0;
             if (_slotPool != null)
                 foreach (Slot pooled in _slotPool)
@@ -565,7 +615,7 @@ namespace TensorSharp.Models
                 return false;
             int cap = Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax);
             if (_spareBuild == null && (_slotPool?.Count ?? 0) >= cap) return false;
-            int capacity = _spareBuild?.Capacity ?? AlignedSlotCapacity(Math.Max(FreshSlotTokens, _spareCapacity));
+            int capacity = _spareBuild?.Capacity ?? SpareCapacity;
             if (_spareBuild == null && RoomForTwoSlots(capacity) != true)
             {
                 _idleSpareRefused = true;

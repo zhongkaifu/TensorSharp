@@ -2475,7 +2475,11 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     int reserve = ResolvePrefillReservation(seq.PromptTokens.Count, seq.MaxNewTokens, _model.MaxContextLength, kvReserveMax);
                     reserve = (int)Math.Min(_model.MaxContextLength, (long)reserve + verifySlack);
-                    int held = model.EnsureSequenceSlot(seq.RequestId, reserve);
+                    // What this step needs: the prompt and its first token (a request too long for the device is refused before
+                    // any of it runs), or past it the rows this step writes, with the verify window's slack.
+                    long needed = Math.Max((long)seq.PromptTokens.Count + 1, (long)seq.NumComputedTokens + work.NumScheduledTokens) + verifySlack;
+                    int required = (int)Math.Min(reserve, Math.Min(_model.MaxContextLength, needed));
+                    int held = model.EnsureSequenceSlot(seq.RequestId, reserve, required);
                     if (held != seq.NumComputedTokens)
                         throw new InvalidOperationException(
                             $"{seq.RequestId}: its slot holds {held} tokens, the sequence {seq.NumComputedTokens}.");

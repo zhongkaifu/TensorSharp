@@ -489,6 +489,20 @@ whenever free memory falls below the device's headroom (the larger of 1 GB and 1
 of the device), and the CUDA allocator asks the model to release finished
 conversations before its last resort (a full GC and a drain of every cached block).
 
+There a request's slot is sized to the device's room, not held at its reservation
+(prompt + max_new_tokens + verify window). It is made at the reservation's capacity
+class with an eighth more (classes are whole 1,024s up to 4,096 cells, then 1.25, 1.5,
+1.75 and 2 times a power of two) where that fits without releasing a finished
+conversation, else at the largest whole 1,024 that fits; finished conversations are
+released only for the cells the step needs (the prompt and its first token). A slot
+that needs more grows one cache tensor at a time, so a growth needs the added cells
+and one tensor beside the slot, not a second copy of it, and a conversation's next
+turn usually fits the class its slot already has. A spare slot is no larger than the
+largest short slot a request ran in (one whose copy is retained, up to 512 MiB of K/V),
+so long conversations leave no multi-gigabyte spares, and a finished request's slot is
+pooled only while the device keeps as much again free beside its headroom and a prompt
+step. A request's tokens do not depend on the capacity its slot gets.
+
 ### Prompt reuse across requests: conversation scopes and media identity
 
 Every cross-request reuse - the live primary cache, retained end states, the

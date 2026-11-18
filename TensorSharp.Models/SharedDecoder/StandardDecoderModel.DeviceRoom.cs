@@ -394,12 +394,34 @@ namespace TensorSharp.Models
         /// narrowest prompt step, and is refused with the numbers where it does not, before any of its prompt runs (it had
         /// failed part way with CUDA error 2).
         /// </summary>
-        private Slot NewSlotWithRoom(string requestId, int reserve)
+        /// <param name="required">The cells the request's first step needs (its prompt, its first token and the verify window);
+        /// where slots are sized to the device's room (<see cref="SizesSlotsToRoom"/>) the slot is <see cref="SlotTarget"/>'s:
+        /// the class of the reservation with headroom where memory allows, else the largest that fits, and only for the required
+        /// cells are finished conversations released.</param>
+        private Slot NewSlotWithRoom(string requestId, int reserve, int required)
         {
             int capacity = NewSlotCapacity(reserve);
             if (_slotPool?.Exists(p => p.Capacity >= capacity) == true)
                 return ReclaimRetainedSlot(reserve) ?? NewSlot(reserve);
             Slot[] keep = RunningSlots();
+            if (SizesSlotsToRoom)
+            {
+                int least = NewSlotCapacity(required);
+                int roomy = RoomySlotTarget(least, reserve, keep, "a new request's slot", 0);
+                if (roomy > 0) return Logged(FreshSlot(Math.Max(roomy, least)));
+                if (_slotPool?.Exists(p => p.Capacity >= least) == true) return Logged(NewSlot(least));
+                if (ReclaimRetainedSlot(least, roomShort: true) is { } taken) return Logged(taken);
+                int tight = TightSlotTarget(least, keep, "a new request's slot", 0);
+                if (tight > 0) return Logged(FreshSlot(Math.Max(tight, least)));
+                capacity = least;
+
+                Slot Logged(Slot slot)
+                {
+                    (_allocator as TensorSharp.Cuda.CudaAllocator)?.LogDeviceRoom(string.Create(CultureInfo.InvariantCulture,
+                        $"{Config.Architecture} {requestId}'s slot: {slot.Capacity:N0} cells (reserved {reserve:N0}, required {required:N0})"));
+                    return slot;
+                }
+            }
             long bytes = SlotBytesEstimate(capacity), block = CacheBlockBytes(capacity);
             // Room made is room had: a retained slot is taken over only where none could be made (ReclaimRetainedSlot's own
             // check reads the device, which leaves out the window buffers stage 4 freed, and took the oldest conversation over
@@ -420,7 +442,7 @@ namespace TensorSharp.Models
                     $"{requestId} waits for one of the {keep.Length} running requests to finish."));
             }
             if (FitsBesideHeadroom(bytes))
-                return NewSlot(reserve);
+                return SizesSlotsToRoom ? FreshSlot(capacity) : NewSlot(reserve);
             SlotRefusals++;
             throw SlotRefusal(requestId, capacity, bytes);
         }
@@ -462,12 +484,21 @@ namespace TensorSharp.Models
             if (EnsureDeviceRoom(bytes, keep, RoomUse.Slot, mayEvict: true, "a slot's growth", CacheBlockBytes(capacity))
                 || FitsBesideHeadroom(bytes))
                 return;
+            throw GrowthExhausted(slot, capacity, keep, bytes);
+        }
+
+        /// <summary>A running request's growth that found no room even with every finished conversation released: what holds
+        /// the device. <paramref name="bytes"/>: what the growth needs (default: the added cells and one tensor, as a slot
+        /// grown a tensor at a time does, <see cref="GrowSlotRolling"/>).</summary>
+        private InvalidOperationException GrowthExhausted(Slot slot, int capacity, Slot[] keep, long bytes = -1)
+        {
+            if (bytes < 0) bytes = SlotTargetBytes(capacity, slot.Capacity);
             long held = 0;
             var seen = new HashSet<Tensor[][]>(ReferenceEqualityComparer.Instance);
             foreach (Slot running in keep)
                 if (running?.K != null && seen.Add(running.K)) held += SlotStorageBytes(running);
             var (free, total) = DeviceMemory(fresh: true);
-            throw new InvalidOperationException(string.Create(CultureInfo.InvariantCulture,
+            return new InvalidOperationException(string.Create(CultureInfo.InvariantCulture,
                 $"{Config.Architecture}: device memory exhausted by running requests: {seen.Count} slots hold {held / 1e9:F2} GB, and " +
                 $"growing a slot from {slot.Capacity:N0} to {capacity:N0} cells needs {bytes / 1e9:F2} GB beside the " +
                 $"{DeviceHeadroom(total) / 1e9:F2} GB headroom and a prompt step, where {Math.Max(0, free) / 1e9:F2} GB are free."));
@@ -481,11 +512,29 @@ namespace TensorSharp.Models
         /// the whole room.
         /// </summary>
         private bool RoomForSlotCopy(Slot source, int capacityTokens, bool mayEvict, bool needed, string what)
+            => RoomForSlotCopy(source, capacityTokens, mayEvict, needed, what, out _);
+
+        /// <summary>Room for a copy as above, and the cells to make it with (<see cref="CopySlot"/>): where slots are sized to the
+        /// device's room (<see cref="SizesSlotsToRoom"/>) a <paramref name="needed"/> copy - a request runs on it - is
+        /// <see cref="SlotTarget"/>'s, with headroom where memory allows; a checkpoint stays as long as its rows (nothing runs on it
+        /// yet, and the request it was taken from runs beside it).</summary>
+        private bool RoomForSlotCopy(Slot source, int capacityTokens, bool mayEvict, bool needed, string what, out int copyCapacity)
         {
+            copyCapacity = capacityTokens;
             if (!DeviceRoomManaged) return true;
             int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, capacityTokens));
             if (_slotPool?.Exists(p => p.Capacity >= capacity) == true) return true;
             long bytes = SlotBytesEstimate(capacity);
+            if (SizesSlotsToRoom && needed)
+            {
+                int target = SlotTarget(capacity, capacity, RunningSlots(source), what, mayEvict: mayEvict);
+                if (target > 0)
+                {
+                    copyCapacity = target;
+                    return true;
+                }
+                return FitsBesideHeadroom(bytes);
+            }
             return EnsureDeviceRoom(bytes, RunningSlots(source), RoomUse.Slot, mayEvict, what, CacheBlockBytes(capacity))
                 || (needed && FitsBesideHeadroom(bytes));
         }

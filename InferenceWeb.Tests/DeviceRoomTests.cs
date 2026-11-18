@@ -332,7 +332,9 @@ public sealed class DeviceRoomTests : IDisposable
         Assert.Equal(1, model.SlotPoolForTests.Pooled);
         model.DeviceRoomForTests = () =>
             (model.SlotPoolForTests.Pooled == 0 && model.RetainedPayloadKeys.Count <= 1 ? 8 * GB : 2 * GB, 16 * GB);
-        Assert.Equal(0, ((IUnifiedBatchModel)model).EnsureSequenceSlot("new", 2048));
+        // More than the pooled slot holds: on direct CUDA slots are sized to the device's room, and the pooled one is the class of
+        // its 64-token reservation (2,048 cells), which a 2,048-token request takes without making room.
+        Assert.Equal(0, ((IUnifiedBatchModel)model).EnsureSequenceSlot("new", 3000));
         Assert.Equal(new[] { ("k0", InvalidationReason.NativeSlotReclaimed) }, sink.Reports);
         Assert.Equal(1, model.DeviceRoomStages[2]);
         Assert.Equal(1, model.DeviceRoomStages[5]);

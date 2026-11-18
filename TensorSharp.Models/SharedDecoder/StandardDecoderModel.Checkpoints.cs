@@ -78,8 +78,8 @@ namespace TensorSharp.Models
             // On a device this model manages the copy's room is made first (never from the source); declined, the request
             // prefills its prompt instead of running out of memory part way through the copy.
             int capacity = Math.Max(source.Length, requiredContextTokens);
-            if (!RoomForSlotCopy(source, capacity, mayEvict: true, needed: true, "a clone of a cached prefix")) return false;
-            _slots.Add(newRequestId, CopySlot(source, capacity));
+            if (!RoomForSlotCopy(source, capacity, mayEvict: true, needed: true, "a clone of a cached prefix", out int copyCapacity)) return false;
+            _slots.Add(newRequestId, CopySlot(source, copyCapacity));
             return true;
         }
 
@@ -176,7 +176,8 @@ namespace TensorSharp.Models
             if (slot == null)
             {
                 slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
-                (slot.K, slot.V) = AllocateCaches(capacity);
+                // The copy writes rows [0, length): where slots are sized to the device's room only the rows past them are zeroed.
+                (slot.K, slot.V) = AllocateCaches(capacity, SizesSlotsToRoom ? source.Length : 0);
             }
             slot.Length = source.Length;
             slot.DraftStart = source.DraftStart;
