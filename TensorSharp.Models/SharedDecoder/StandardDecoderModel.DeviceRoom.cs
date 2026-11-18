@@ -145,9 +145,10 @@ namespace TensorSharp.Models
         /// <item>the window buffers the conversations the prefix cache keeps hold (<see cref="Retained"/>), the oldest first, never
         /// one of <paramref name="keep"/> (the next verify on such a slot allocates them again and records its windows anew);
         /// then the drafter rings no request holds, with the contexts they keep for finished requests' next turns
-        /// (ModelBase.ReleaseIdleDFlashRings);</item>
+        /// (ModelBase.ReleaseIdleDFlashRings), the least recently used first - each only where they cover the shortfall;</item>
         /// <item>with <paramref name="mayEvict"/>, the conversations the prefix cache keeps, the oldest first, each reported to
-        /// it as reclaimed (their next turns prefill again), never one of <paramref name="keep"/>;</item>
+        /// it as reclaimed (their next turns prefill again), never one of <paramref name="keep"/>; then, still short, the drafter
+        /// rings stage 4 left;</item>
         /// <item>for a prompt step, the cached graphs and every recording, which had been the first reaction.</item>
         /// </list>
         /// <paramref name="keep"/> holds the slots a step or a copy is about to use. False when even these made no room. One
@@ -225,17 +226,12 @@ namespace TensorSharp.Models
                 }
 
                 // 4. Then the drafter rings finished requests keep for their conversations' next turns (a turn whose ring went
-                // drafts without its context until its rows come back), with the graphs over them.
-                if (free < need)
-                {
-                    long ringBytes = ReleaseIdleDFlashRings();
-                    if (ringBytes > 0)
-                    {
-                        DeviceRoomStages[4]++;
-                        NoteDeviceMemoryChanged();
-                        free = Math.Max(RoomFree(use), free + ringBytes);
-                    }
-                }
+                // drafts without its context until its rows come back), with the graphs over them, the least recently used first
+                // and only where they cover the shortfall: short of it, conversations go next, and the contexts would be lost for
+                // nothing (on a 32 GB RTX PRO 4500 at 131K context every new long prompt ran short by a gigabyte or more, and
+                // giving back every idle 81 MB ring each time left the next conversation's reused turn drafting without its own).
+                if (free < need && IdleDFlashRingBytes() >= need - free)
+                    free = ReleaseRingsForRoom(need - free, free, use);
 
                 // 5. The conversations the prefix cache keeps, the oldest first.
                 int released = 0;
@@ -261,6 +257,10 @@ namespace TensorSharp.Models
                             $"conversation{(released == 1 ? "" : "s")} ({Mib(releasedBytes)} MiB; their next turns prefill again)."));
                     }
                 }
+
+                // 5b. Still short: the drafter rings stage 4 left.
+                if (free < need)
+                    free = ReleaseRingsForRoom(need - free, free, use);
 
                 // 6. The cached graphs and every recording (a prompt step only).
                 if (free < need && use == RoomUse.PromptStep)
@@ -288,6 +288,17 @@ namespace TensorSharp.Models
         }
 
         private static long Mib(long bytes) => Math.Max(0, bytes) >> 20;
+
+        /// <summary>Gives back idle drafter rings for <paramref name="shortBy"/> bytes of room (ModelBase.ReleaseIdleDFlashRings,
+        /// counted as stage 4) and returns the free bytes after them.</summary>
+        private long ReleaseRingsForRoom(long shortBy, long free, RoomUse use)
+        {
+            long ringBytes = ReleaseIdleDFlashRings(shortBy);
+            if (ringBytes <= 0) return free;
+            DeviceRoomStages[4]++;
+            NoteDeviceMemoryChanged();
+            return Math.Max(RoomFree(use), free + ringBytes);
+        }
 
         /// <summary>A drafter ring made to keep a finished request's context takes only room a slot would leave (its headroom
         /// and a prompt step's or recordings' room) on a device this model manages, or one ggml_cuda or Metal device; anywhere

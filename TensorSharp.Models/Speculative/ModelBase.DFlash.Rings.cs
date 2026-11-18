@@ -401,26 +401,44 @@ namespace TensorSharp.Models
         private long DFlashRingBytes => _dflash == null ? 0
             : 2L * _dflash.NumLayers * _dflash.NumKVHeads * _dflashRingRows * _dflash.HeadDim * sizeof(float) + (long)_dflash.FeatureSize * sizeof(float);
 
-        /// <summary>
-        /// Gives back the pooled rings no request holds, the contexts they keep with them (a later turn of those conversations
-        /// drafts without its context until its rows come back), and the graphs bound to them: room a model's device is short
-        /// of. The model's own ring and the bound one stay. Returns the bytes given back.
-        /// </summary>
-        private protected long ReleaseIdleDFlashRings()
+        /// <summary>The device bytes of the pooled rings no request holds (what <see cref="ReleaseIdleDFlashRings"/> can give back).</summary>
+        private protected long IdleDFlashRingBytes()
         {
-            if (_dflashRingPool == null || _dflashRingPool.Count == 0)
+            long bytes = 0;
+            if (_dflashRingPool != null)
+                foreach (DFlashRing ring in _dflashRingPool)
+                    if (ring.Owner == null && !ReferenceEquals(ring, _dflashActiveRing))
+                        bytes += DFlashRingBytes;
+            return bytes;
+        }
+
+        /// <summary>
+        /// Gives back pooled rings no request holds, the least recently used first, until <paramref name="bytes"/> are freed
+        /// (all of them by default): the contexts they keep go with them (a later turn of those conversations drafts without
+        /// its context until its rows come back), and the graphs bound to them. Room a model's device is short of. The model's
+        /// own ring and the bound one stay, and so does every ring a request holds - a request that continues a kept context
+        /// takes it before its slot asks for room (the runtime continues it as it binds the request's reused prefix).
+        /// Returns the bytes given back.
+        /// </summary>
+        private protected long ReleaseIdleDFlashRings(long bytes = long.MaxValue)
+        {
+            if (_dflashRingPool == null || _dflashRingPool.Count == 0 || bytes <= 0)
                 return 0;
+            var idle = new List<DFlashRing>();
+            foreach (DFlashRing ring in _dflashRingPool)
+                if (ring.Owner == null && !ReferenceEquals(ring, _dflashActiveRing))
+                    idle.Add(ring);
+            idle.Sort((a, b) => a.LastUsed.CompareTo(b.LastUsed));
             long freed = 0;
-            for (int i = _dflashRingPool.Count - 1; i >= 0; i--)
+            foreach (DFlashRing ring in idle)
             {
-                DFlashRing ring = _dflashRingPool[i];
-                if (ring.Owner != null || ReferenceEquals(ring, _dflashActiveRing))
-                    continue;
+                if (freed >= bytes)
+                    break;
                 OnDFlashRingDisposing(ring.K);
                 foreach (Tensor t in ring.K) { InvalidateTensorDeviceCache(t); t.Dispose(); }
                 foreach (Tensor t in ring.V) { InvalidateTensorDeviceCache(t); t.Dispose(); }
                 if (ring.Carry != null) { InvalidateTensorDeviceCache(ring.Carry); ring.Carry.Dispose(); }
-                _dflashRingPool.RemoveAt(i);
+                _dflashRingPool.Remove(ring);
                 freed += DFlashRingBytes;
             }
             // The fused drafters' persistent graphs are cached by ring addresses: none may replay over a freed one.

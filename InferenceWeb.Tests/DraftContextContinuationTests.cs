@@ -161,11 +161,11 @@ public sealed class DraftContextContinuationTests : IDisposable
     }
 
     /// <summary>
-    /// Device memory short: the rings finished requests keep go (with their contexts) before a conversation the prefix cache
-    /// keeps, and the running requests' rings stay.
+    /// Device memory short by no more than the kept rings hold: the rings finished requests keep go (with their contexts)
+    /// before a conversation the prefix cache keeps, and the running requests' rings stay.
     /// </summary>
     [Fact]
-    public void KeptRingsGoBeforeRetainedConversationsWhenTheDeviceIsShort()
+    public void KeptRingsThatCoverTheShortfallGoBeforeRetainedConversations()
     {
         using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
         var (target, draft) = Fixtures();
@@ -191,6 +191,52 @@ public sealed class DraftContextContinuationTests : IDisposable
         Assert.Equal((0, prompt.Length), model.DFlashRingRunForTests("k0"));
         Assert.Null(model.DFlashRingRunForTests("k1"));
         Assert.False(states.ContinueDraftState("n", "k1", prompt.Length));
+    }
+
+    /// <summary>
+    /// Device memory short by more than the kept rings hold: they stay while a conversation the prefix cache keeps goes (an 81
+    /// MB ring beside a gigabyte conversation: given back first, the contexts were lost for nothing, and a 32 GB RTX PRO 4500
+    /// at 131K context ran that short at every long prompt). Short by less, only the least recently kept rings needed go.
+    /// </summary>
+    [Fact]
+    public void KeptRingsShortOfTheShortfallStayWhileAConversationGoes()
+    {
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        var (target, draft) = Fixtures();
+        using var model = new Qwen35RuntimeModel(target, BackendType.Cpu, 1, null, 1, draft);
+        var states = (IPerRequestDraftState)model;
+        var unified = (IUnifiedBatchModel)model;
+        int[] prompt = Enumerable.Range(0, 20).Select(i => 41 + (i * 5) % 19).ToArray();
+        // k0 on the model's own ring, k1 and k2 on pooled ones, kept in that order.
+        for (int r = 0; r < 3; r++)
+            Prefill(model, $"k{r}", prompt, speculates: true);
+        for (int r = 0; r < 3; r++)
+            Assert.Equal(prompt.Length, states.KeepDraftState($"k{r}"));
+        // A conversation the prefix cache keeps.
+        unified.EnsureSequenceSlot("conv", prompt.Length + 32);
+        Assert.True(unified.TryForwardUnified(new[] { "conv" }, new[] { prompt }, new[] { 0 }, new float[1][]));
+        Assert.True(model.RetainSequenceCacheAs("conv", "conv"));
+        Assert.Equal(3, model.DFlashRingCountForTests);
+        long ringBytes = 2L * model.DFlashSettings.NumLayers * model.DFlashSettings.NumKVHeads * model.DFlashRingRowsForTests
+            * model.DFlashSettings.HeadDim * sizeof(float) + model.DFlashSettings.FeatureSize * sizeof(float);
+        const long gb = 1L << 30;
+
+        // Three rings' worth short, two kept rings to give: the conversation goes and makes the room, the rings stay.
+        model.DeviceRoomForTests = () => (model.RetainedPayloadKeys.Count == 0 ? 3 * ringBytes : 0, 64 * gb);
+        Assert.True(model.EnsureRecordingRoomForTests(3 * ringBytes));
+        Assert.Empty(model.RetainedPayloadKeys);
+        Assert.Equal(3, model.DFlashRingCountForTests);
+        Assert.Equal(0, model.DeviceRoomStages[4]);
+        Assert.Equal(1, model.DeviceRoomStages[5]);
+
+        // One ring's worth short: the ring kept the longest ago goes (k1's), k2's stays.
+        model.DeviceRoomForTests = () => ((3 - model.DFlashRingCountForTests) * ringBytes, 64 * gb);
+        Assert.True(model.EnsureRecordingRoomForTests(ringBytes));
+        Assert.Equal(2, model.DFlashRingCountForTests);
+        Assert.Equal(1, model.DeviceRoomStages[4]);
+        Assert.Null(model.DFlashRingRunForTests("k1"));
+        Assert.Equal((0, prompt.Length), model.DFlashRingRunForTests("k2"));
+        Assert.Equal((0, prompt.Length), model.DFlashRingRunForTests("k0"));
     }
 
     // ---------------------------------------------------------------- the engine
@@ -246,6 +292,54 @@ public sealed class DraftContextContinuationTests : IDisposable
         var run = model.DFlashRingRunForTests(seq.RequestId);
         Assert.True(run is { } r && r.Filled > turns[2].Length && r.ValidFrom == Math.Max(0, r.Filled - model.DFlashRingRowsForTests)
             && r.ValidFrom < turns[2].Length - 1, $"{label}: C's ring holds {run}");
+    }
+
+    /// <summary>
+    /// The reused turn takes its conversation's context as it adopts the cached prefix, before the copy of that prefix (or
+    /// its slot) asks the device for room, which gives back the contexts no request holds: with two other conversations'
+    /// first turns kept (X on the model's own ring, Y and the conversation on pooled ones) and the device short as C starts,
+    /// Y's ring goes and C still drafts over B's prompt. On a 32 GB RTX PRO 4500 at 131K context every reused longturn turn
+    /// past 8K ran short there and, its context given back, drafted over another conversation's rows (issue #376).
+    /// </summary>
+    [Fact]
+    public async Task AReusedTurnHoldsItsContextBeforeItsCacheAsksForRoom()
+    {
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        var (target, draft) = Fixtures();
+        int[][] turns = Conversation(0);
+        int[] plain = (await ServeConversation(target, draft, BackendType.Cpu, speculate: false, turns)).Outputs[2];
+
+        using var model = new Qwen35RuntimeModel(target, BackendType.Cpu, 1, null, 1, draft);
+        model.HostMemorySpareForTests = () => null;   // the machine's other programs do not evict its conversations
+        const long gb = 1L << 30;
+        // Room everywhere until C starts; then only the headroom (2 GB of 64: the prefix cache sees no deficit and keeps B's
+        // end state for C) while three rings are held - giving one back makes the room.
+        bool tight = false;
+        model.DeviceRoomForTests = () => (tight && model.DFlashRingCountForTests >= 3 ? 2 * gb : 64 * gb, 64 * gb);
+        using var engine = new InferenceEngine(model, Config(speculate: true), NullLogger.Instance);
+        await Serve(engine, "c1t0", Conversation(1)[0], 1).WaitAsync(TimeSpan.FromMinutes(3));
+        await Serve(engine, "c2t0", Conversation(2)[0], 1).WaitAsync(TimeSpan.FromMinutes(3));
+        await Serve(engine, "c0t0", turns[0], 1).WaitAsync(TimeSpan.FromMinutes(3));
+        await Serve(engine, "c0t1", turns[1], 1).WaitAsync(TimeSpan.FromMinutes(3));
+        Assert.Equal(3, model.DFlashRingCountForTests);
+        int stages = model.DeviceRoomStages[4];
+        tight = true;
+        var (tokens, completion, seq) = await Serve(engine, "c0t2", turns[2], CMaxNew).WaitAsync(TimeSpan.FromMinutes(3));
+        _output.WriteLine($"C reused {completion.PrefixCacheReusedTokens} of {turns[2].Length}, drafted {seq.SpecStats?.TokensDrafted} " +
+            $"accepted {seq.SpecStats?.TokensAccepted}, continued {engine.ExecutorForTests.DraftContextsContinued}, " +
+            $"{model.DFlashRingCountForTests} rings, room stages {string.Join(",", model.DeviceRoomStages)}, kept run {model.DFlashRingRunForTests(seq.RequestId)}");
+        // The device ran short as C started, and gave a ring back for it.
+        Assert.Equal(2, model.DFlashRingCountForTests);
+        Assert.True(model.DeviceRoomStages[4] > stages);
+        Assert.Equal(turns[2].Length, completion.PrefixCacheReusedTokens);
+        Assert.Equal(plain, tokens);
+        // B continued A's context, and C B's: the ring that went was Y's.
+        Assert.Equal(2, engine.ExecutorForTests.DraftContextsContinued);
+        Assert.Null(model.DFlashRingRunForTests("c2t0"));
+        Assert.True(seq.SpecStats is { TokensDrafted: > 0 }, "C did not draft");
+        var run = model.DFlashRingRunForTests(seq.RequestId);
+        Assert.True(run is { } r && r.Filled > turns[2].Length && r.ValidFrom == Math.Max(0, r.Filled - model.DFlashRingRowsForTests)
+            && r.ValidFrom < turns[2].Length - 1, $"C's ring holds {run}");
     }
 
     /// <summary>

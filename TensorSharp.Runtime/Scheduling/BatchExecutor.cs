@@ -2462,6 +2462,10 @@ namespace TensorSharp.Runtime.Scheduling
                 var seq = work.Sequence;
                 try
                 {
+                    // A request whose cache holds a reused prefix it did not adopt at admission (TryAdoptFusedContinuation
+                    // continued the others) continues its conversation's drafter context before its slot asks the device for
+                    // room, which gives back the kept contexts no request holds.
+                    if (SpeculationEnabledThisStep) EnsureDraftContinuation(seq);
                     // A slot adopted past this prompt rewinds, a revoked live-cache claim is dropped and a reused
                     // prefix is injected the way a per-request holder binds (BindFusedHolder).
                     if (_model is IBatchedPagedModel holders
@@ -3222,19 +3226,25 @@ namespace TensorSharp.Runtime.Scheduling
         internal int DraftContextsContinued { get; private set; }
 
         /// <summary>
-        /// Before <paramref name="seq"/>'s drafter state is first used (a followed prompt chunk, a speculative step): where the
+        /// Before <paramref name="seq"/>'s drafter state is first used (a followed prompt chunk, a speculative step) - and
+        /// first as the request adopts a cached prefix (<see cref="TryAdoptFusedContinuation"/>), before the copy of that prefix
+        /// or its slot asks the device for room, since a device short of memory gives back the contexts no request holds
+        /// (ModelBase.ReleaseIdleDFlashRings): where the
         /// model keeps drafter state per request, the request continues the context a finished request kept whose tokens its
         /// own begin with (the previous turn of its conversation, whose cache it reuses), as the context of the positions it
-        /// reuses. Only where it reuses part of its drafter's window at the prompt's end (a prompt it reads whole fills that
+        /// reuses (<paramref name="reused"/>: the prefix it adopts; by default the positions its cache holds). Only where it
+        /// reuses part of its drafter's window at the prompt's end (a prompt it reads whole fills that
         /// window itself), and only over the rows that context holds (its last <see cref="IDraftHead.DraftContextRows"/>
-        /// positions). Tokens, media and cache scopes match as the prefix reuse matches them. Once per request.
+        /// positions). Tokens, media and cache scopes match as the prefix reuse matches them. Once per request. Taken as the
+        /// prefix is adopted, the context still holds only the request's own tokens where the adoption then reuses fewer of
+        /// them: the rows past what it reuses are those its prompt writes again.
         /// </summary>
-        private void EnsureDraftContinuation(SequenceState seq)
+        private void EnsureDraftContinuation(SequenceState seq, int reused = -1)
         {
             if (_model is not IPerRequestDraftState states || !_draftSequences.TryAdd(seq.RequestId, seq) || _draftContexts.Count == 0)
                 return;
             int window = (_model as IDraftHead)?.DraftContextRows ?? int.MaxValue;
-            int reused = seq.NumComputedTokens;
+            if (reused < 0) reused = seq.NumComputedTokens;
             if (reused <= 0 || (window != int.MaxValue && (long)reused + window <= seq.PromptTokens.Count))
                 return;
             int known = seq.PromptTokens.Count + seq.OutputTokens.Count;
@@ -4158,6 +4168,10 @@ namespace TensorSharp.Runtime.Scheduling
         public bool TryAdoptFusedContinuation(SequenceState seq, int lcp)
         {
             if (RadixCache == null) return false;
+            // The request continues its conversation's drafter context before the copy of the prefix asks the device for room
+            // (EnsureDraftContinuation): on a 32 GB RTX PRO 4500 at 131K context every reused longturn turn past 8K ran short
+            // there, and the kept contexts that copy gave back left its drafts over another conversation (issue #376).
+            if (Speculation.Enabled && seq.Adapter == null) EnsureDraftContinuation(seq, lcp);
             // Reserve rewind metadata before materialization transfers ownership.
             _pendingRetainedFusedTruncations.EnsureCapacity(_pendingRetainedFusedTruncations.Count + 1);
             bool adopted = RadixCache.TryAdopt(seq, lcp,

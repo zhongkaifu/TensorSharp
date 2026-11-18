@@ -158,8 +158,11 @@ conversation's rows at the positions the two shared: Qwen3.8-27B NVFP4 with DFla
 direct CUDA accepted 51-60% of its drafts in issue #376's long agent turns, against
 93-98% for the deleted direct engine, whose ring lived in the sequence's slot. A ring
 taken anew starts empty; rings kept for finished requests are made only where the
-device has room for them, and a device short of memory gives them back before any
-conversation the prefix cache keeps.
+device has room for them. A request takes the context it continues as it adopts the
+cached prefix, before that prefix's copy or its slot asks the device for room. A device
+short of memory gives kept rings back, the least recently kept first, where they cover
+the shortfall; short of it, the conversations the prefix cache keeps go first (an 81 MB
+ring beside a gigabyte conversation), and the rings left go last.
 
 A per-token head can opt in too, through its weights adapter:
 `IDraftHead.DraftHeadResumesAfterGap`. Stateful heads without a suffix restart
