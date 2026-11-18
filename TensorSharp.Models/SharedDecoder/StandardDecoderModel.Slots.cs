@@ -70,6 +70,18 @@ namespace TensorSharp.Models
         /// </summary>
         private int FreshSlotTokens => GraphExecutor?.Capabilities.SlotBoundRecordings == true ? ReservationStepTokens : 512;
 
+        /// <summary>Slot policies of executors whose recorded steps bind a slot's buffers (the CUDA executor,
+        /// <see cref="TensorSharp.Graph.GraphCapabilities.SlotBoundRecordings"/>): a unified model's primary cache starts at a
+        /// fresh slot's size whatever the window (<see cref="PrimaryCacheAllocationLength"/>).</summary>
+        private bool SlotBoundPolicies => GraphExecutor?.Capabilities.SlotBoundRecordings == true || SlotBoundPoliciesForTests;
+
+        /// <summary>Tests run the slot-bound policies on another executor (the managed CPU one). Initialized from
+        /// <see cref="SlotBoundPoliciesOnFlowForTests"/>, so a decision the constructor makes (the primary's size) follows it.</summary>
+        internal bool SlotBoundPoliciesForTests { get; set; } = SlotBoundPoliciesOnFlowForTests.Value;
+
+        /// <summary>Tests: the models constructed on this flow take the slot-bound policies from their construction on.</summary>
+        internal static readonly System.Threading.AsyncLocal<bool> SlotBoundPoliciesOnFlowForTests = new();
+
         /// <summary>Cells a grown slot keeps past what it needs (see <see cref="EnsureSlotCapacity"/>).</summary>
         private const int SlotGrowthHeadroomTokens = 4096;
 

@@ -478,7 +478,7 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | `TS_RETAINED_FUSED_CACHE_MAX` | 运行中请求上限，至少 `4` | 对声明支持保留 holder 的模型，为下一轮保留多少个已结束会话的终态：Gemma 4 K/V、Qwen 3.5/3.6/3.8 的 attention K/V 与 GDN 递归状态、Qwen 3.8 Flash Next 的按序列 holder、DeepSeek V4.1 的原生 slot，以及 GLM 5.x 交出的原生 slot。每个都会占用模型完整的 per-request 续接状态。未设置时跟随 `TS_SCHED_MAX_RUNNING_SEQS`，使每个并行运行的请求都保有自己的终态；`0` 关闭保留。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | `4` | Radix 树在共享提示前缀结束处（由 chat 层在请求上标记的边界）保留多少个模型完整状态的检查点；每个新会话从其中一个的副本开始。适用于能复制自身状态的模型（GGML 后端上的 Gemma 4；共享解码运行时上的 Qwen 3.5/3.6/3.8 与 Qwen 3.8 Flash Next，只要其 slot 的递归状态可复制，多节点流水线除外）。一个提示在每个声明的边界（系统指令末尾与整个共享前缀末尾）各发布一个检查点，因此 4 可覆盖同时预热两种思考模式的主机；`0` 关闭检查点。 |
 | `TS_MM_EMBEDDING_CACHE_MB` | 主机内存的 1/64，512-4096 MB | 视觉/音频嵌入缓存的字节预算，缓存以媒体内容（SHA-256）为键；超出后淘汰没有被已准备提示引用的最近最少使用条目。 |
-| `TS_KV_INITIAL_TOKENS` | `0` | 缓存创建时、任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口）。缓存仍按需增长。 |
+| `TS_KV_INITIAL_TOKENS` | `0` | 缓存创建时、任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口）。在 `--backend cuda` 上，共享解码运行时让每个请求都在自己的 slot 里运行，因此取 `0` 时它的主缓存无论 `MAX_CONTEXT` 是多少都从一个新 slot 的大小（1,024 个单元）起步，`MAX_CONTEXT` 只限定窗口上限。缓存仍按需增长。 |
 | `TS_KV_GENERATION_RESERVE_MAX` | `0` | 请求预先保留的 K/V（prompt + max_new_tokens）中生成部分的上限；`0` = 不限制。超过上限后缓存按需增长。 |
 | `TS_KV_HOLDER_POOL_MAX` | `64` | 模型最多可停放多少个已释放的 per-request holder 以待复用；停放期间每个都占用其完整 K/V 分配。 |
 | `TS_SPEC` | `0` | `1` 为单序列启用投机解码（`--spec`）。 |

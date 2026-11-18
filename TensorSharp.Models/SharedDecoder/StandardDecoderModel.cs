@@ -368,7 +368,7 @@ namespace TensorSharp.Models
                 PrepareResidency();
 
                 int maxContext = ResolveConfiguredContextLength();
-                int initial = ResolveInitialCacheAllocationLength(maxContext);
+                int initial = PrimaryCacheAllocationLength(InitialCacheLengthForTests.Value ?? ResolveInitialCacheAllocationLength(maxContext), maxContext);
                 if (initial < maxContext)
                     Console.WriteLine($"Initial {_backend} KV cache allocation: {initial} tokens (grows on demand up to {maxContext}).");
                 InitCaches(initial, maxContext);
@@ -437,6 +437,30 @@ namespace TensorSharp.Models
         protected bool OwnsLayer(int layer) => LayerPlacement == null || LayerPlacement.Owns(PlacementLayer(layer));
 
         // ---------------------------------------------------------------- KV caches
+
+        /// <summary>Tests: what <see cref="ModelBase.ResolveInitialCacheAllocationLength(int, int)"/> answers for the models
+        /// constructed on this flow (it reads MAX_CONTEXT from the environment, which tests do not set: an explicit window
+        /// answers the whole window).</summary>
+        internal static readonly System.Threading.AsyncLocal<int?> InitialCacheLengthForTests = new();
+
+        /// <summary>
+        /// The primary cache's cells at load. Where recorded steps bind slots (<see cref="SlotBoundPolicies"/>, the CUDA executor)
+        /// a unified model serves every request in a slot of its own (<see cref="EnsureSequenceSlot"/>), and the primary serves
+        /// only the warm-up and the paths outside the scheduler, growing on demand (<see cref="EnsureCacheCapacity"/>): it starts
+        /// at a fresh slot's size, and MAX_CONTEXT bounds the window without committing it. Allocated at an explicit 131,072-token
+        /// window, Qwen3.8-27B's primary held 8.5 GB no request used (26,297 against 19,769 MiB at 32,768 tokens), and a 24 or
+        /// 32 GB card then had no room for a 47K-token request's slot (CUDA error 2, HTTP 500; issue #376). An explicit
+        /// TS_KV_INITIAL_TOKENS still sizes it (<paramref name="initial"/> already holds it).
+        /// </summary>
+        private int PrimaryCacheAllocationLength(int initial, int maxContext)
+        {
+            if (!SlotBoundPolicies || LayerSplitGroup != null || TensorSharp.Runtime.Scheduling.ExecutionOptions.FromEnvironment().KvInitialTokens > 0)
+                return initial;
+            return Math.Max(1, Math.Min(maxContext, FreshSlotTokens));
+        }
+
+        /// <summary>The primary cache's cells, whichever cache is active (tests).</summary>
+        internal int PrimaryCacheCapacityForTests => _activeKey == null ? _cacheCapacity : _primary?.Capacity ?? 0;
 
         private void InitCaches(int initial, int maxContext)
         {
