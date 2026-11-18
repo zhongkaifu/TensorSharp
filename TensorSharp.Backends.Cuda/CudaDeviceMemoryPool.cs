@@ -111,7 +111,9 @@ namespace TensorSharp.Cuda
         private long lastFreeReadTicks;
 
         // Whether a return that finds the device under the reserve may give back cached large blocks the work stopped using
-        // instead of its own block (null: never; false while a CUDA graph is captured on the allocator, which must not free).
+        // instead of its own block (null: never; false while a CUDA graph is captured on the allocator, which must not free,
+        // and while a capture that just ended is taking the blocks its work returned to the pool: CudaGraphCapture.
+        // MayFreeCachedBlocksUnasked).
         // The valve alone handed every returned block to the driver while the cache kept stale sizes: once a 3.1 GB K/V slot
         // left an RTX PRO 4500 at the reserve, a 47K-token prompt of Qwen3.8-27B freed and allocated its own activations
         // again at every layer (~1,400 synchronizing cuMemFree calls, about 4% of the prefill).
@@ -269,11 +271,18 @@ namespace TensorSharp.Cuda
 
             if (free >= minFreeReserveBytes)
                 return false;
-            if (mayRelievePressure == null || LargeCachedBytes == 0 || !mayRelievePressure())
+            if (LargeCachedBytes == 0)
                 return true;
             long need = minFreeReserveBytes - free + PressureReliefSlackBytes;
-            return TrimLarge(need, keepBlockBytes: returningBytes) < need;
+            return RelievePressure(need, keepBlockBytes: returningBytes) < need;
         }
+
+        /// <summary>The pressure valve's relief: cached large blocks the work stopped using go back to the driver, unasked by
+        /// their holder and without a synchronize (<see cref="TrimLarge"/>), where <see cref="mayRelievePressure"/> allows it;
+        /// the bytes freed (0 where it is not allowed). It runs on whichever thread returns a block, the GC finalizer's
+        /// included.</summary>
+        internal long RelievePressure(long bytes, long keepBlockBytes)
+            => mayRelievePressure == null || !mayRelievePressure() ? 0 : TrimLarge(bytes, keepBlockBytes);
 
         public bool TryReturnToPool(IntPtr ptr, long allocationBytes)
         {

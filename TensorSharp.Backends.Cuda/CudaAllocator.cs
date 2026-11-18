@@ -78,7 +78,7 @@ namespace TensorSharp.Cuda
                 largeCachedBytesCap: largeCachedBytes,
                 queryFreeBytes: QueryFreeDeviceBytes,
                 minFreeReserveBytes: minFreeReserveBytes,
-                mayRelievePressure: () => !CudaGraphCapture.IsCapturing(this));
+                mayRelievePressure: () => CudaGraphCapture.MayFreeCachedBlocksUnasked(this));
 
             ladder = new DeviceMemoryReclaimLadder(
                 TryAllocateDevice,
@@ -510,6 +510,10 @@ namespace TensorSharp.Cuda
         /// <summary>Bytes of the large blocks the pool caches: an allocation that finds the device full gives them back
         /// first (<see cref="TrimLargeCache"/>), so they count as free room.</summary>
         public long ReclaimableBytes => pool.LargeCachedBytes;
+
+        /// <summary>The pool's pressure relief as a return under the free-memory reserve runs it, on this thread (tests: the
+        /// device need not be full); the bytes freed.</summary>
+        internal long RelievePressureForTests(long bytes) => pool.RelievePressure(bytes, keepBlockBytes: 0);
 
         /// <summary>
         /// Give cached large blocks back to the driver, the least recently used size first, until <paramref name="bytes"/> are
