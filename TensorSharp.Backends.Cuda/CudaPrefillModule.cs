@@ -58,6 +58,10 @@ namespace TensorSharp.Cuda
         /// <summary>Compute capability major of the device whose context loaded the module.</summary>
         public int DeviceCcMajor { get; }
 
+        /// <summary>Whether the image came from the build's fatbin (<see cref="CudaModule.FromFatbin"/>): the only way its
+        /// arch-specific (sm_12Xa) code reaches the GPU; a PTX file's ImageArch reads the same number without it.</summary>
+        public bool FromFatbin => Module.FromFatbin;
+
         /// <summary>Whether the loaded image matches the launchers (see <see cref="ExpectedVersion"/>).</summary>
         public bool IsCurrent => Version == ExpectedVersion;
 

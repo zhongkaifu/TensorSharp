@@ -104,7 +104,7 @@ namespace InferenceWeb.Tests
             }
         }
 
-        private static readonly Lazy<(int Cc, int ImageArch, bool Current, bool Attn8, string Error)> FlashPrefillImage = new(() =>
+        private static readonly Lazy<(int Cc, int ImageArch, bool Current, bool FromFatbin, bool Attn8, string Error)> FlashPrefillImage = new(() =>
         {
             try
             {
@@ -113,11 +113,11 @@ namespace InferenceWeb.Tests
                 using var context = TensorSharp.Cuda.CudaContext.Create(0);
                 context.MakeCurrent();
                 using var kernels = TensorSharp.Cuda.CudaFlashPrefillKernels.Create();
-                return (cc, kernels.ImageArch, kernels.IsCurrent, kernels.Runs8BitPrompt(256), null);
+                return (cc, kernels.ImageArch, kernels.IsCurrent, kernels.FromFatbin, kernels.Runs8BitPrompt(256), null);
             }
             catch (Exception ex)
             {
-                return (0, 0, false, false, $"{ex.GetType().Name}: {ex.Message}");
+                return (0, 0, false, false, false, $"{ex.GetType().Name}: {ex.Message}");
             }
         });
 
@@ -139,7 +139,7 @@ namespace InferenceWeb.Tests
             }
         }
 
-        /// <summary>Skip reason for a test about an RTX Blackwell build (GPU 0 of CC 12.x running the fatbin's sm_12X code of
+        /// <summary>Skip reason for a test about an RTX Blackwell build (GPU 0 of CC 12.x running the fatbin's sm_12Xa code of
         /// tensorsharp_flash_prefill), or null on one.</summary>
         public static string RtxBlackwellImageSkip
         {
@@ -148,10 +148,26 @@ namespace InferenceWeb.Tests
                 if (CudaSkip != null) return CudaSkip;
                 var image = FlashPrefillImage.Value;
                 if (image.Error != null) return $"Requires a loadable tensorsharp_flash_prefill module on GPU 0 ({image.Error}).";
-                if (image.Cc / 10 != 12) return $"Requires an RTX Blackwell GPU (CC 12.x); GPU 0 is sm_{image.Cc}.";
-                return image.Current && image.ImageArch >= 120 ? null
-                    : $"Requires an nvcc build for this GPU: the loaded tensorsharp_flash_prefill image is arch {image.ImageArch} (current: {image.Current}).";
+                return RtxBlackwellImageSkipFor(image.Cc, image.ImageArch, image.Current, image.FromFatbin);
             }
+        }
+
+        /// <summary>
+        /// <see cref="RtxBlackwellImageSkip"/> for GPU 0 of compute capability <paramref name="cc"/> (major x 10 + minor) and a
+        /// loaded image of <paramref name="imageArch"/> (its __CUDA_ARCH__ / 10): null only when the image is current and is
+        /// the fatbin's code for exactly this GPU's arch, which the build compiles for the arch-specific sm_12Xa target. The
+        /// arch number alone cannot tell: a PTX file (CudaEmitFatbin=false) or the fatbin's own compute_120 PTX that a
+        /// different 12.x GPU JITs (an RTX 50xx build copied to a GB10) read 120 as sm_120a code does, and carry no 'a' code.
+        /// </summary>
+        internal static string RtxBlackwellImageSkipFor(int cc, int imageArch, bool current, bool fromFatbin)
+        {
+            if (cc / 10 != 12) return $"Requires an RTX Blackwell GPU (CC 12.x); GPU 0 is sm_{cc}.";
+            if (!current) return $"Requires a current tensorsharp_flash_prefill image for this build (the loaded one is stale, arch {imageArch}).";
+            if (!fromFatbin || imageArch != cc)
+                return $"Requires the build's fatbin with sm_{cc}a code for this GPU: the loaded tensorsharp_flash_prefill image is " +
+                       $"{(fromFatbin ? "the fatbin's" : "a PTX file's")} arch {imageArch} code (a PTX-only build, a fatbin without {cc} in " +
+                       "CudaFatbinArchitectures, or one built for another 12.x GPU carries no sm_12Xa code).";
+            return null;
         }
 
         public static string MlxSkip =>

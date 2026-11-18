@@ -130,6 +130,7 @@ public sealed class CudaPrefillModuleTests
         using var module = CudaModule.LoadFromBytes(File.ReadAllBytes(CommittedPtx("flash_prefill")));
         Assert.False(CudaFlashPrefillKernels.ReadAttn8Caps(module));
         using var kernels = CudaFlashPrefillKernels.FromModule(CudaModule.LoadFromBytes(File.ReadAllBytes(CommittedPtx("flash_prefill"))));
+        Assert.False(kernels.FromFatbin, "a module loaded from PTX bytes reported a fatbin");
         Assert.False(kernels.Attn8Code);
         Assert.False(kernels.Runs8BitPrompt(256));
     }
@@ -142,9 +143,30 @@ public sealed class CudaPrefillModuleTests
         using var allocator = new CudaAllocator();
         allocator.Context.MakeCurrent();
         using var kernels = CudaFlashPrefillKernels.Create();
+        Assert.True(kernels.FromFatbin);
         Assert.True(kernels.Attn8Code, "an sm_12Xa image loaded on a CC 12.x GPU must carry the 8-bit prompt attention");
         Assert.True(kernels.Runs8BitPrompt(256));
         Assert.False(kernels.Runs8BitPrompt(128));
+    }
+
+    /// <summary>
+    /// The RTX Blackwell build gate admits only the fatbin's code for exactly this GPU's arch (sm_120a on CC 12.0, sm_121a on
+    /// CC 12.1). Images that read the same arch number with no 'a' code skip with the reason instead of failing
+    /// <see cref="Attn8Probe_IsOneOnAnRtxBlackwellBuild"/>: a PTX-only build (CudaEmitFatbin=false: the compute_120 PTX, arch
+    /// 120 on an RTX PRO 4500, failed there before the gate checked this), an RTX 50xx fatbin on a GB10 (its compute_120 PTX
+    /// JIT'd), a fatbin without the GPU's arch, the committed baseline.
+    /// </summary>
+    [Fact]
+    public void RtxBlackwellGate_AdmitsOnlyTheFatbinsCodeForThisGpu()
+    {
+        Assert.Null(TestGates.RtxBlackwellImageSkipFor(120, 120, current: true, fromFatbin: true));
+        Assert.Null(TestGates.RtxBlackwellImageSkipFor(121, 121, current: true, fromFatbin: true));
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(120, 120, current: true, fromFatbin: false));   // a PTX-only build
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(121, 120, current: true, fromFatbin: true));    // an RTX 50xx fatbin on a GB10
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(120, 90, current: true, fromFatbin: true));     // a fatbin without 120
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(120, 75, current: true, fromFatbin: false));    // the committed baseline
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(120, 120, current: false, fromFatbin: true));   // a stale image
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(100, 100, current: true, fromFatbin: true));    // datacenter Blackwell
     }
 
     /// <summary>The committed compute_75 baseline JITs here, and its probe reports the version the
