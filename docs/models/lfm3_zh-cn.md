@@ -84,14 +84,17 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
   0.5），只有 Q4_K_M 的两行例外，而 llama.cpp 自己的内核变体在这两行上也翻转或相差 18%。两条路径离 llama.cpp Metal 运行的
   距离与 llama.cpp 自己的 CPU 运行相同（量化文件上相差在 7% 以内）。ForcedLogitProbe 的通过门槛（相对 L2 1e-3，即 GPU
   路径的标准）在每次 CPU 运行上都不通过，llama.cpp 的变体也一样。BF16 在两条路径上都不再舍入激活值：与 llama.cpp CPU 运行相差 4e-3，与其 Metal
-  运行相差 4e-4，比 llama.cpp 自己的 CPU 运行离 Metal 近十倍。Q4_K_M 的困惑度（32 x 1,024 token）ggml_cpu 为 26.79、托管
+  运行相差 4e-4，比 llama.cpp 自己的 CPU 运行离 Metal 近十倍。提示的最后一层只对输出行运行前馈（与 llama.cpp 的图相同），
+  因此在 CPU 路径上该行的矩阵乘走单行内核：其 logits 与整宽矩阵乘相比最多相差 8.3e-7（相对 L2），之后的各行不变；在 42 个
+  测量用例中有 14 个出现差异，top-1 全部相同（ggml_cpu 的 Q4_K_M 与托管 CPU 的 BF16 在提示最后一段 512 行分块的行数为 4
+  的倍数时；ggml_cpu 的 BF16 从 64 行起；两条路径上的 Q8_0 与托管 CPU 的 Q4_K_M 从不变化）。Q4_K_M 的困惑度（32 x 1,024 token）ggml_cpu 为 26.79、托管
   CPU 为 26.75，llama.cpp CPU 为 26.79。20 个服务器场景在两条路径上均通过，8 个 CPU 语音合成测试也通过（引擎内合成与独立
   合成逐位一致）。GSM8K（前 200 题，关闭思考，Q4_K_M）ggml_cpu 得分 79.0%、托管 CPU 为 80.0%，llama.cpp CPU 为
   81.0%（配对 McNemar 检验 p = 0.50 与 0.82；Metal 上两个引擎都是 81.5%）。这次运行先在 50 题时停过一次，当时
   ggml_cpu 以 37 对 43 落后（p = 0.07；对比更早一次 llama.cpp CPU 运行时 p = 0.03）。只按回复内容计分（关闭思考时客户端
   读到的部分：TensorSharp 把多余 `</think>` 之前的文字移入 `reasoning_content`，llama-server 则留在内容里），两条路径都是
   76.5%，llama.cpp 为 81.0%（p = 0.09）。CPU 上的贪心回复会在几百个字符内于近似平局
-  处与 llama.cpp CPU 的回复分叉，llama.cpp 自己的 CPU 与 Metal 回复之间也是如此。4 个并发对话在托管 CPU 上与逐个运行逐 token 一致；在 ggml_cpu 上会在近似平局处
+  处与 llama.cpp CPU 的回复分叉，llama.cpp 自己的 CPU 与 Metal 回复之间也是如此。4 个并发对话（Q4_K_M）在托管 CPU 上与逐个运行逐 token 一致；在 ggml_cpu 上会在近似平局处
   分叉（与 llama.cpp 相同），因为批量解码步经 ggml-cpu 的 GEMM 读取重排后的权重，而单条解码经其 GEMV
   （`TS_GGML_CPU_REPACK=0` 可恢复一致，但提示速度减半）。以下在优化前验证过、未重做：8K 与 32K 的大海捞针、CLI 检查、
   LFM3-Omni 的图像与音频输入（提示 token 数与 llama-server 相同）以及语音输出（回读识别的词错误率为 0）。
@@ -112,7 +115,8 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
   llama.cpp Accelerate 构建的 0.44 倍。与 vLLM 0.34 的 CPU 后端相比（fp16，带其 macOS short-conv 变通；它在这里没有量化
   CPU 路径），512 token 提示：ggml_cpu 在 Q4_K_M 上首 token 0.64 s 对 1.9 s，解码每 token 6.2 对 37.9 ms（该测试工具的
   TPOT；llama-server 在其中为 6.6 ms）；BF16 上为 1.1 s 与 17.2 ms。相关开关见[环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的-ggml-cpu-后端开关)。
-- **尚未验证：** 设备上的 TensorAgent 应用；CUDA 上的张量并行与多 GPU 布局（只有一块 GPU 可用）。vLLM 在 A40 与 Mac 的
+- **尚未验证：** 设备上的 TensorAgent 应用；CUDA 上的张量并行与多 GPU 布局（只有一块 GPU 可用）；`config/lfm3-1.7b-nvfp4.json`
+  的 FP4 张量核心路径（Blackwell GPU 上的直连 CUDA：A40 没有 FP4 张量核心，NVFP4 文件在其上走的是其他内核）。vLLM 在 A40 与 Mac 的
   CPU 上都对比过，SGLang 只在 A40 上对比过（其 CPU 后端只支持 x86 AMX）。
 
 ## 运行
@@ -359,5 +363,6 @@ QAD-Q4_0 / NVFP4 上的 pp512 为 498 / 605 / 508 / 361（BF16：22，取自 CPU
   94 token/s；像 ggml_cpu 那样为解码单独设定宽度是尚待完成的修复。
 - ggml_cpu 在重排副本之外还保留自己在加载时生成的主机副本（融合的 gate|up 与重排列的注意力权重）：Q4_K_M 峰值占用约
   2.0 GB，llama-server 为 1.2 GB。`TS_GGML_CPU_REPACK=0` 恢复较小的占用，但提示速度减半。开启重排时，批量解码步经 ggml-cpu 的 GEMM 读取权重、单条解码经其 GEMV，因此并发的贪心回复可能在
-  近似平局处与逐个运行的回复分叉（llama.cpp 也是如此）；托管 CPU 保持一致。重排与解码线程池只在 M5 Pro 上测量过；BF16/NVFP4
+  近似平局处与逐个运行的回复分叉（llama.cpp 也是如此）；托管 CPU 在 Q4_K_M 上保持一致（已测量），但其 BF16 矩阵乘
+  按每四个激活行一组计算、单独一行另走一条路径，因此 BF16 回复在托管 CPU 上同样可能分叉。重排与解码线程池只在 M5 Pro 上测量过；BF16/NVFP4
   的 Accelerate 路径仅限 Apple。

@@ -124,7 +124,13 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   quantized files). ForcedLogitProbe's pass gate (relative L2 1e-3, the GPU lanes' bar)
   fails on every CPU run, llama.cpp's variant included. BF16 no longer rounds activations on
   either lane: 4e-3 from llama.cpp's CPU run and 4e-4 from its Metal run, ten times closer
-  to Metal than llama.cpp's own CPU run. Perplexity on Q4_K_M (32 x 1,024 tokens) is 26.79
+  to Metal than llama.cpp's own CPU run. A prompt's last layer runs its feed-forward on the
+  output row only (as llama.cpp's graph does), so on the CPU lanes that row's products take
+  the one-row kernels: its logits move by at most 8.3e-7 relative L2 against a full-width
+  product, with every later row unchanged and the same top-1 in all 14 of 42 measured cases
+  where they move (Q4_K_M on ggml_cpu and BF16 on the managed CPU when the prompt's last
+  512-row piece is a multiple of 4 rows; BF16 on ggml_cpu from 64 rows; never Q8_0 on either
+  lane or Q4_K_M on the managed CPU). Perplexity on Q4_K_M (32 x 1,024 tokens) is 26.79
   on ggml_cpu and 26.75 on the managed CPU against llama.cpp CPU's 26.79. The 20 server
   scenarios pass on both lanes, as do the 8 CPU speech-synthesis tests (engine speech equal
   bit for bit to standalone synthesis). GSM8K (first 200 questions, thinking off, Q4_K_M)
@@ -136,7 +142,7 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   llama-server leaves it in the content), both lanes score 76.5% against 81.0% (p = 0.09).
   Greedy CPU replies part from llama.cpp's CPU replies at near-ties within a few hundred
   characters, as llama.cpp's own CPU and Metal replies part from each other. Four concurrent
-  conversations equal their one-at-a-time runs token for token on the managed CPU; on
+  conversations (Q4_K_M) equal their one-at-a-time runs token for token on the managed CPU; on
   ggml_cpu they part at a near-tie, as on llama.cpp, because a batched decode step reads the
   repacked weights through ggml-cpu's GEMM and a single one through its GEMV
   (`TS_GGML_CPU_REPACK=0` restores the equality at half the prompt speed). Checked before
@@ -172,7 +178,9 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   the [environment variable
   matrix](../env_var_feature_matrix.md#out-of-matrix-ggml-cpu-backend-knobs).
 - **Not yet validated:** the TensorAgent app on a device; tensor parallelism and multi-GPU
-  placements on CUDA (one GPU was available). vLLM was compared on the A40 and on the Mac's CPU,
+  placements on CUDA (one GPU was available); the FP4 tensor-core route of
+  `config/lfm3-1.7b-nvfp4.json` (direct CUDA on a Blackwell GPU: the A40 has no FP4 tensor cores,
+  so the NVFP4 file ran there on its other kernels). vLLM was compared on the A40 and on the Mac's CPU,
   SGLang on the A40 only (its CPU backend is x86 AMX only).
 
 ## Run it
@@ -549,6 +557,8 @@ five files.
   llama-server's 1.2 GB. `TS_GGML_CPU_REPACK=0` restores the smaller footprint at half the
   prompt speed. With repacking, a batched decode step reads the weights through ggml-cpu's
   GEMM and a single one through its GEMV, so concurrent greedy replies can part from
-  one-at-a-time ones at a near-tie (as on llama.cpp); the managed CPU keeps them equal.
+  one-at-a-time ones at a near-tie (as on llama.cpp); the managed CPU keeps them equal on
+  Q4_K_M (measured), but its BF16 products take activation rows four at a time and a lone row
+  another way, so BF16 replies can part there too.
   Repacking and the decode pool were measured only on an M5 Pro; the BF16/NVFP4 Accelerate
   paths are Apple-only.
