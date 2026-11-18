@@ -19,6 +19,8 @@ usage: serve-bench.py --engine {ts,llama} --model GGUF [--backend B] [--threads 
              layer on the CPU (-ngl 0), anything else offloads them
   --threads  CPU threads: llama-server -t N -tb N; TensorSharp TS_GGML_CPU_THREADS, TS_CPU_THREADS and
              DOTNET_PROCESSOR_COUNT (as eng/lfm3/bench/ts-bench.sh --threads); 0 keeps each engine's defaults
+  --threads-batch  prompt-batch threads apart from --threads: llama-server -tb N; TensorSharp ggml_cpu's prompt pool
+             (TS_GGML_CPU_THREADS = N, its decode pool TS_GGML_CPU_DECODE_THREADS = --threads)
   --llama-fa llama-server -fa (default on)
   --tag      names this run's files and table rows (default: the engine)
 Environment: LLAMA_CPP_DIR (default ~/work/llama.cpp-lfm3) and LLAMA_BUILD (its build directory, default build; e.g.
@@ -181,6 +183,11 @@ def start_server(args, concurrency, ctx, log):
         if args.threads:
             for k in ("TS_GGML_CPU_THREADS", "TS_CPU_THREADS", "DOTNET_PROCESSOR_COUNT"):
                 env[k] = str(args.threads)
+        if args.threads_batch:
+            # ggml_cpu's prompt pool takes the batch count, its decode pool --threads (as llama-server -tb / -t).
+            env["TS_GGML_CPU_THREADS"] = str(args.threads_batch)
+            if args.threads:
+                env["TS_GGML_CPU_DECODE_THREADS"] = str(args.threads)
         dll = os.environ.get("TS_SERVER_DLL") or os.path.join(ROOT, "TensorSharp.Server.Host", "bin", "Release", "net10.0",
                                                               "TensorSharp.Server.Host.dll")
         if not os.path.exists(dll):
@@ -194,7 +201,9 @@ def start_server(args, concurrency, ctx, log):
                "-c", str(ctx * concurrency), "-fa", args.llama_fa, "--jinja",
                "-ngl", "0" if args.backend in CPU_BACKENDS else "99", "--no-webui", "-b", "2048", "-ub", "512"]
         if args.threads:
-            cmd += ["-t", str(args.threads), "-tb", str(args.threads)]
+            cmd += ["-t", str(args.threads)]
+        if args.threads or args.threads_batch:
+            cmd += ["-tb", str(args.threads_batch or args.threads)]
     print("$ " + " ".join(cmd), file=sys.stderr)
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
 
@@ -206,6 +215,7 @@ def main():
     ap.add_argument("--config", default=None, help="TS: a config file (its model path is overridden by --model)")
     ap.add_argument("--backend", default="ggml_metal", help="TS backend; llama: anything but cpu offloads every layer")
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--threads-batch", type=int, default=0)
     ap.add_argument("--llama-fa", default="on", help="llama-server -fa (on, off, auto)")
     ap.add_argument("--tag", default=None)
     ap.add_argument("--concurrency", default="1,4,16")
