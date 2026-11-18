@@ -75,9 +75,41 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   ggml_metal (6,589 tokens/s at 512 on Q4_K_M) but decodes about 15% slower (165 tokens/s,
   a per-step host cost); ggml_cpu prefills at about half the speed of
   `llama-bench -ngl 0`, whose prompt products run on Accelerate's BLAS.
-- **Not yet validated:** the TensorAgent app on a device, and every CUDA and Vulkan route
-  (`config/lfm3-1.7b-nvfp4.json` in particular has never run). vLLM and SGLang were not
-  compared yet.
+- **CUDA and Vulkan (2026-11-17, one NVIDIA A40, sm_86; llama.cpp `d3c3e242c`'s CUDA and Vulkan
+  builds on the same GPU):** the text decoder, the Omni media input and the speech output run on
+  ggml_cuda, the direct `cuda` backend and ggml_vulkan. Teacher-forced against llama.cpp (5 prompts
+  x 64 steps, one of them 9,294 tokens): 0-1 of 320 top-1 mismatches on ggml_vulkan and up to 7 on
+  the CUDA lanes, every one at a near-tie - as far from llama.cpp CUDA as llama.cpp's own Vulkan run
+  is, because ggml-cuda and direct CUDA requantize each quantized product's activations to q8_1
+  (BF16: 0-1 everywhere); perplexity within 0.4% of llama.cpp's for all five quantizations. The
+  server's e2e scenarios, the CLI checks and 4 and 16 concurrent conversations pass on all three
+  lanes; speech output round-trips through ASR with no word errors (it is not bit-exact to
+  llama-tts on CUDA, whose sampler draws other codes from the same hidden rows).
+- **Speed on the A40 (`eng/lfm3/bench/gpu-bench.sh`, each arm interleaved with llama-bench, which
+  gets the better of flash attention on and off):** ggml_cuda matches or beats llama.cpp CUDA (-1.5% to
+  +17%) at every length tested on Q4_K_M, Q8_0, QAD-Q4_0 and BF16. Q4_K_M: 17,004 / 18,283 / 17,132 /
+  15,156 prompt tokens/s at 512 / 4K / 16K / 32K against 17,003 / 17,946 / 16,961 / 15,390, and
+  347 / 337 / 309 / 280 decoded tokens/s at depth 0 / 4K / 16K / 32K against 334 / 327 / 299 / 268
+  (Q8_0, QAD-Q4_0 and BF16 likewise ahead; NVFP4 prompts 9-11% behind, its decode 3-5% ahead).
+  The direct `cuda` backend decodes 16-19% below llama.cpp on Q4_K_M (277 / 264 / 246 / 225) and
+  prefills about 60% of its speed: its quantized prompt products dequantize every weight to F16
+  each step where ggml-cuda runs them on the quantized blocks. ggml_vulkan against llama.cpp's Vulkan
+  build: Q4_K_M prefills 10,119 / 10,430 / 9,258 / 7,749 tokens/s against 11,021 / 10,833 / 10,600 /
+  9,633 and decodes 272 / 251 / 242 / 217 against 295 / 283 / 254 / 226 (4-20% behind, mostly host
+  time between steps); BF16 and NVFP4 at parity.
+- **Serving on the A40 (`eng/lfm3/bench/serve-vs.sh`: one client for every engine, random prompts, prefix
+  caching off; BF16 against vLLM 0.34 and SGLang, whose short convolution takes its torch fallback on
+  this GPU):** one request at a time, ggml_cuda decodes faster (6.7 ms a token against 7.3 and 7.2)
+  and a 128-token prompt's first token comes sooner (26 ms against 56 and 43), but a 4K-token prompt's
+  comes later (275 ms against 204 and 192). Under concurrency the server falls behind: 9.4 / 17.4 /
+  51 ms a token at 4 / 16 / 64 requests against vLLM's 7.6 / 8.1 / 11.0, about a fifth of its output
+  at 64 (1,203 against 5,506 tokens/s), because a batched step still runs each sequence's attention
+  and short convolution as ops of its own. The server holds 4-6 GB of GPU memory (ggml_cuda) where
+  vLLM and SGLang reserve about 40 GB. Against llama-server on Q4_K_M (CUDA build, as many slots as
+  requests) both TensorSharp lanes decode faster at 1, 4 and 16 concurrent requests (ggml_cuda 3.0 /
+  5.8 / 14.1 ms a token against 3.8 / 7.0 / 20.1).
+- **Not yet validated:** the TensorAgent app on a device; tensor parallelism and multi-GPU
+  placements on CUDA (one GPU was available).
 
 ## Run it
 
@@ -369,8 +401,8 @@ token for token against generation on LFM3-Omni Q8_0). Each run of frames is one
 by its codes. An id whose generation is not known renders as its transcript.
 
 Limits: no `/v1/realtime`; speech requests are not retained in the prefix cache, and a later turn
-does not yet reuse the cache across a spliced spoken turn (open issue); speech and CUDA are untested
-on NVIDIA GPUs.
+does not yet reuse the cache across a spliced spoken turn (open issue). On CUDA the speech output is
+checked by an ASR round trip (no word errors), not bit for bit against llama-tts.
 
 ## Benchmarking
 
@@ -383,7 +415,11 @@ sampling on every engine.
 
 - Speech output has no realtime endpoint (`/v1/realtime`), and a later turn does not yet reuse
   the prefix cache across a past spoken turn (see [Speech output](#speech-output)).
-- Media input and speech output on CUDA (direct and ggml-cuda) and Vulkan have not run (no device).
+- Many concurrent requests decode slower than vLLM and SGLang (see the speed item above): a batched
+  step runs each sequence's attention and short convolution as ops of its own.
+- The direct `cuda` backend runs parts of the Omni vision and audio towers on its element-by-element
+  host fallback (abs, exp, neg, a fill and some of the towers' products have no kernel for their
+  operands there): an image or audio prompt's first token comes later than on ggml_cuda.
 - Speech input as a live stream (a realtime endpoint) is not served; clips are encoded
   whole (30 s chunks).
 - A message's still images come before its videos in the prompt whatever the client's

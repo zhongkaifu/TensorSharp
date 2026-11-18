@@ -52,7 +52,28 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
   相差 5% 以内，在 16K-32K 时晚 3-5%。在被其他任务占用的机器上，TensorSharp 的多步提示比 llama.cpp 多损失 5-10%。MLX 对 512
   个以上 token 的提示预填充快于 ggml_metal（Q4_K_M 在 512 时 6,589 token/s），但解码慢约 15%（165 token/s，来自每步的主机开销）；
   ggml_cpu 的预填充约为 `llama-bench -ngl 0` 的一半，后者的提示矩阵乘法在 Accelerate 的 BLAS 上运行。
-- **尚未验证：** 设备上的 TensorAgent 应用，以及所有 CUDA 与 Vulkan 路径（`config/lfm3-1.7b-nvfp4.json` 从未运行过）。尚未与 vLLM、SGLang 对比。
+- **CUDA 与 Vulkan（2026-11-17，一块 NVIDIA A40，sm_86；同一 GPU 上 llama.cpp `d3c3e242c` 的 CUDA 与 Vulkan 构建）：** 文本解码器、
+  Omni 媒体输入与语音输出均可在 ggml_cuda、直连 `cuda` 后端与 ggml_vulkan 上运行。与 llama.cpp 做教师强制对比（5 个提示 × 64 步，
+  其中一个 9,294 token）：ggml_vulkan 上 320 行中 top-1 不一致为 0-1 行，CUDA 路径上最多 7 行，且全部发生在近乎打平之处——与
+  llama.cpp CUDA 的距离和 llama.cpp 自身 Vulkan 运行相当，因为 ggml-cuda 与直连 CUDA 会把每个量化矩阵乘的激活重新量化为 q8_1
+  （BF16：各处 0-1 行）；五种量化的困惑度均在 llama.cpp 的 0.4% 以内。服务器端到端场景、CLI 检查以及 4 与 16 个并发对话在三条路径上
+  全部通过；语音输出经 ASR 往返无词错误（在 CUDA 上与 llama-tts 并非逐位一致：其采样器从相同隐藏行抽到其他码）。
+- **A40 上的速度（`eng/lfm3/bench/gpu-bench.sh`，每个分支与 llama-bench 交替运行，llama-bench 取开启与关闭 flash attention 中更快者）：**
+  在 Q4_K_M、Q8_0、QAD-Q4_0 与 BF16 上，ggml_cuda 在所有测试长度上与 llama.cpp CUDA 持平或更快（-1.5% 到 +17%）。Q4_K_M：在
+  512 / 4K / 16K / 32K 个提示 token 时预填充 17,004 / 18,283 / 17,132 / 15,156 token/s，对 17,003 / 17,946 / 16,961 / 15,390；
+  在深度 0 / 4K / 16K / 32K 时解码 347 / 337 / 309 / 280 token/s，对 334 / 327 / 299 / 268（Q8_0、QAD-Q4_0 与 BF16 同样领先；NVFP4
+  的提示慢 9-11%，解码快 3-5%）。直连 `cuda` 后端在 Q4_K_M 上解码比 llama.cpp 低 16-19%（277 / 264 / 246 / 225），预填充约为其
+  60%：其量化提示矩阵乘每一步都要把所有权重反量化为 F16，而 ggml-cuda 直接在量化块上计算。ggml_vulkan 对比 llama.cpp 的 Vulkan
+  构建：Q4_K_M 预填充 10,119 / 10,430 / 9,258 / 7,749 token/s，对 11,021 / 10,833 / 10,600 / 9,633，解码 272 / 251 / 242 / 217，
+  对 295 / 283 / 254 / 226（落后 4-20%，主要是步与步之间的主机时间）；BF16 与 NVFP4 持平。
+- **A40 上的服务（`eng/lfm3/bench/serve-vs.sh`：所有引擎使用同一客户端、随机提示、关闭前缀缓存；BF16 对比 vLLM 0.34 与 SGLang，
+  后者的短卷积在这块 GPU 上走 torch 回退）：** 单个请求时，ggml_cuda 解码更快（每 token 6.7 ms，对 7.3 与 7.2 ms），128 token
+  提示的首 token 更早（26 ms，对 56 与 43 ms），但 4K token 提示的首 token 更晚（275 ms，对 204 与 192 ms）。并发时服务器落后：
+  4 / 16 / 64 个请求时每 token 9.4 / 17.4 / 51 ms，对 vLLM 的 7.6 / 8.1 / 11.0 ms，64 个请求时输出吞吐约为其五分之一（1,203 对
+  5,506 token/s），原因是批处理步骤中每个序列的注意力与短卷积仍是各自独立的算子。服务器占用 4-6 GB 显存（ggml_cuda），而 vLLM 与
+  SGLang 预留约 40 GB。在 Q4_K_M 上对比 llama-server（CUDA 构建，槽位数与请求数相同），两条 TensorSharp 路径在 1、4、16 个
+  并发请求时解码都更快（ggml_cuda 每 token 3.0 / 5.8 / 14.1 ms，对 3.8 / 7.0 / 20.1 ms）。
+- **尚未验证：** 设备上的 TensorAgent 应用；CUDA 上的张量并行与多 GPU 布局（只有一块 GPU 可用）。
 
 ## 运行
 
@@ -238,8 +259,8 @@ token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用�
 处理器为过去语音回合的占位符所做的一致。因此其提示 token 就是该回复自己的序列（在 LFM3-Omni Q8_0 上与生成逐 token 核对）。
 每段连续帧是一个以其编码为键的媒体片段。生成信息未知的 id 按其转写渲染。
 
-限制：没有 `/v1/realtime`；语音请求不保留在前缀缓存中，之后的回合暂时还不能跨越拼回的语音回合复用缓存（未解决问题）；
-语音与 CUDA 未在 NVIDIA GPU 上测试。
+限制：没有 `/v1/realtime`；语音请求不保留在前缀缓存中，之后的回合暂时还不能跨越拼回的语音回合复用缓存（未解决问题）。
+在 CUDA 上，语音输出通过 ASR 往返检查（无词错误），而不是与 llama-tts 逐位比对。
 
 ## 基准测试
 
@@ -249,7 +270,9 @@ token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用�
 ## 当前限制
 
 - 语音输出没有实时端点（`/v1/realtime`），之后的回合暂时还不能跨越历史中的语音回合复用前缀缓存（见[语音输出](#语音输出)）。
-- 媒体输入与语音输出在 CUDA（直连与 ggml-cuda）和 Vulkan 上没有运行过（没有设备）。
+- 大量并发请求的解码慢于 vLLM 与 SGLang（见上文速度一项）：批处理步骤中每个序列的注意力与短卷积都是各自独立的算子。
+- 直连 `cuda` 后端在其逐元素主机回退上运行 Omni 视觉与音频编码器的部分算子（abs、exp、neg、一次填充以及编码器的部分矩阵乘
+  在那里没有适用于其操作数的内核）：图像或音频提示的首个 token 比 ggml_cuda 晚。
 - 不提供以实时流方式输入语音（实时端点）；音频整段编码（30 秒一块）。
 - 无论客户端顺序如何，一条消息中的静态图都排在视频之前；以 `video_url` 发送的视频在它们之间没有位置。
 - 提示中的嵌套工具 schema 会被展平（工具调用语法读取客户端原始 schema）。
