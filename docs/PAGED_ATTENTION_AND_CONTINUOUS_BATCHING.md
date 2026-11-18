@@ -469,11 +469,17 @@ not lose its state because another chat arrived between two of its turns.
 
 On `--backend cuda` with one GPU, the shared decoder runtime accounts its device
 memory itself, counting the large blocks the CUDA allocator caches as free (it gives
-them back on demand). Before it allocates a request's slot, copies one (a prompt-end
-checkpoint, a retained copy, a clone at admission) or runs a lone prompt's step, it
-makes room in a fixed order, the cheapest loss first: the pool's spare slots, then
-parked decode recordings, then the finished conversations the prefix cache keeps,
-oldest first, and for a prompt step the cached graphs last. A conversation released
+them back on demand). A finished request's slot is retained as it is (donated, no
+copy): the conversation's next turn runs on it and replays the decode steps and
+verify windows its earlier turn recorded. Only a short slot (up to 512 MiB of K/V) is
+copied, into a pooled slot that already holds it, so the next request of another
+conversation runs on the finished request's slot and its recordings. Before it
+allocates a request's slot, copies one (a prompt-end checkpoint, a clone at admission)
+or runs a lone prompt's step, it makes room in a fixed order, the cheapest loss first:
+the pool's spare slots, then parked decode recordings, then the small verify-window
+buffers retained slots keep (where they alone cover the shortfall; that conversation's
+next turn records its windows again), then the finished conversations the prefix cache
+keeps, oldest first, and for a prompt step the cached graphs last. A conversation released
 this way prefills its next turn again, and one stderr line says how many went and
 for what. A new request whose slot does not fit waits while other requests run;
 alone, it is refused with the numbers before any of its prompt runs, instead of
