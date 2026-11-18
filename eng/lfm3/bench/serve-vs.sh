@@ -26,6 +26,13 @@
 #                 (LFM3's block pool is bookkeeping: its sequences' caches grow with what they hold); default: the
 #                 server's own pool (256 blocks of 256 tokens, or one context): past 65,536 tokens of running requests
 #                 they wait, or are preempted and re-prefilled
+#   TS_SERVER_ENV extra VAR=VALUE assignments for the TensorSharp servers' command lines (space-separated; e.g.
+#                 TS_SCHED_STEP_LOG=1 for the scheduler's per-step line in the server log); default none
+#   ENGINE_TAG    appended to each engine's label in the result files (e.g. -q4 for a Q4_K_M GGUF run beside BF16 runs
+#                 in one directory); default none
+# Every cell's line in OUTDIR/serve.log ends with the 1/5/15-minute load average after the cell (a shared machine's
+# other tenants), and each engine start gets a server log of its own (server-<engine><tag>-<UTC stamp>.log), so several
+# invocations (slices of a matrix, rounds) can write into one OUTDIR.
 #   HF_MODEL (/root/models/hf/LFM3-1.7B), GGUF (/root/models/lfm3/LFM3-1.7B-BF16.gguf), TS_ROOT (/root/ts),
 #   TS_SERVER_BIN (TS_ROOT/TensorSharp.Server.Host/bin), VLLM_VENV (/root/venv-vllm), SGLANG_VENV (/root/venv-sglang),
 #   LLAMA_CPP (/root/llama.cpp: build-cuda, build-vk), PORT (18431), SEED (1)
@@ -52,10 +59,13 @@ LLAMA_CPP=${LLAMA_CPP:-/root/llama.cpp}
 PORT=${PORT:-18431}
 SEED=${SEED:-1}
 WARMUP=${WARMUP:-8}
+TS_SERVER_ENV=${TS_SERVER_ENV:-}
+ENGINE_TAG=${ENGINE_TAG:-}
 NAME=lfm3
 
 gpu_mem() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1; }
 gpu_idle() { [[ -z $(nvidia-smi --query-compute-apps=pid --format=csv,noheader) ]]; }
+load() { cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo -; }
 
 start() {   # ENGINE LOG -> sets SERVER_PID
   local e=$1 log=$2
@@ -75,7 +85,7 @@ start() {   # ENGINE LOG -> sets SERVER_PID
       local pc=; [[ $PREFIX_CACHE == 1 ]] || pc=--no-prefix-cache
       local pool=; [[ $KV_POOL == sized ]] && pool="TS_SCHED_NUM_BLOCKS=$(( (MAX_SEQS * MAX_CONTEXT + 255) / 256 ))"
       ( cd "$TS_ROOT" && MAX_CONTEXT=$MAX_CONTEXT TS_SCHED_MAX_RUNNING_SEQS=$MAX_SEQS TS_SCHED_MAX_BATCHED_TOKENS=$BATCH_TOKENS \
-        exec setsid env $pool dotnet "$TS_SERVER_BIN/TensorSharp.Server.Host.dll" --model "$GGUF" --backend "${e#ts-}" \
+        exec setsid env $pool $TS_SERVER_ENV dotnet "$TS_SERVER_BIN/TensorSharp.Server.Host.dll" --model "$GGUF" --backend "${e#ts-}" \
         --host 127.0.0.1 --port "$PORT" --no-multi-agent --no-skills --no-webui $pc \
         --sampling-precedence request --repeat-penalty 1.0 --max-tokens 32768 > "$log" 2>&1 < /dev/null ) & ;;
     llama-cuda|llama-vk)
@@ -116,20 +126,20 @@ bench() {   # ISL OSL C N LABEL [extra]
 
 for e in "$@"; do
   gpu_idle || { echo "GPU busy before $e: $(nvidia-smi --query-compute-apps=pid,name --format=csv,noheader)" >&2; exit 3; }
-  echo "=== $e $(date -u +%H:%M:%S) idle GPU memory $(gpu_mem) MiB" | tee -a "$out/serve.log"
+  echo "=== $e$ENGINE_TAG $(date -u +%H:%M:%S) idle GPU memory $(gpu_mem) MiB load1 $(load)" | tee -a "$out/serve.log"
   NAME=lfm3
-  start "$e" "$out/server-$e.log" || { stop; continue; }
+  start "$e" "$out/server-$e$ENGINE_TAG-$(date -u +%Y%m%dT%H%M%S).log" || { stop; continue; }
   # The name the server hosts (TensorSharp and llama-server serve the GGUF's own; vLLM and SGLang the one given).
   NAME=$(curl -sf -m 5 "http://127.0.0.1:$PORT/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
-  echo "$e ready $(date -u +%H:%M:%S) as $NAME, GPU memory $(gpu_mem) MiB" | tee -a "$out/serve.log"
-  bench 256 64 4 "$WARMUP" "warmup-$e" > "$out/warmup-$e.log" 2>&1
+  echo "$e$ENGINE_TAG ready $(date -u +%H:%M:%S) as $NAME, GPU memory $(gpu_mem) MiB" | tee -a "$out/serve.log"
+  bench 256 64 4 "$WARMUP" "warmup-$e$ENGINE_TAG" > "$out/warmup-$e$ENGINE_TAG.log" 2>&1
   for shape in $SHAPES; do
     isl=${shape%,*}; osl=${shape#*,}
     for c in $CONC; do
       if [[ $NPROMPTS == x* ]]; then n=$(( c * ${NPROMPTS#x} )); (( n < MIN_PROMPTS )) && n=$MIN_PROMPTS; else n=$NPROMPTS; fi
-      label="$e-i$isl-o$osl-c$c"
+      label="$e$ENGINE_TAG-i$isl-o$osl-c$c"
       bench "$isl" "$osl" "$c" "$n" "$label" > "$out/$label.log" 2>&1
-      echo "$label exit $? $(date -u +%H:%M:%S) gpu_mem_mib $(gpu_mem)" | tee -a "$out/serve.log"
+      echo "$label exit $? $(date -u +%H:%M:%S) gpu_mem_mib $(gpu_mem) load1 $(load)" | tee -a "$out/serve.log"
     done
   done
   stop

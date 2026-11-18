@@ -121,11 +121,18 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   (`ts-cuda`, `ts-ggml_cuda`, `ts-ggml_vulkan`) against vLLM, SGLang and llama-server (`llama-cuda`, `llama-vk`) measured
   by one client, `vllm bench serve --backend openai-chat` (random token prompts, ignore_eos, temperature 0, thinking off),
   over (ISL, OSL) shapes and concurrencies (environment knobs in the header: `SHAPES`, `CONC`, `PREFIX_CACHE`,
-  `RANDOM_PREFIX`, `MAX_CONTEXT`, `MAX_SEQS`, `BATCH_TOKENS`, `KV_POOL`); every engine gets the same context,
+  `RANDOM_PREFIX`, `MAX_CONTEXT`, `MAX_SEQS`, `BATCH_TOKENS`, `KV_POOL`, `TS_SERVER_ENV`, `ENGINE_TAG`); every engine gets the same context,
   running-sequence limit and per-step token budget, prefix caching off unless asked. TensorSharp's KV block pool is sized
   for `MAX_SEQS` full contexts (`KV_POOL=sized`, as vLLM and SGLang size theirs from free memory); `KV_POOL=default`
-  keeps the server's own 65,536-token pool, past which running requests wait or are preempted and re-prefilled. One JSON per cell plus the GPU memory in use after it; the
-  summary tabulates rounds (median and min-max of each cell's metric over the directories given).
+  keeps the server's own 65,536-token pool, past which running requests wait or are preempted and re-prefilled. One JSON per cell plus the GPU memory in use after it and the
+  load average (a shared machine's other tenants); the summary tabulates rounds (median and min-max of each cell's metric
+  over the directories given). `TS_SERVER_ENV` puts extra assignments on the TensorSharp servers' command lines (e.g.
+  `TS_SCHED_STEP_LOG=1`), `ENGINE_TAG` names a run's rows apart from others in one directory (e.g. `-q4`); each engine
+  start writes its own `server-<engine><tag>-<stamp>.log`, so slices of a matrix can share an output directory.
+- `step-log-summary.py LOG...`: the scheduler's per-step lines of a TensorSharp server run with `TS_SCHED_STEP_LOG=1`
+  (`gap` = idle time since the previous step returned, `ms` = the serving path's time for the step): pure decode steps
+  grouped by their row count with the median and p10/p90 of the gap, the path time and their sum (the cadence n streams
+  see), and the steps that carried prompt rows.
 - `step-census.sh MODEL BACKEND [N ...]` (a Linux CUDA machine; `ggml_cuda` or `cuda`) and `step-census.py --steps S
   SQLITE...`: the census of batched decode steps (stage B0 of the batched-serving design). For each N (default 1 2 4 8
   16 32 64) one untraced `Lfm3Probe batch --sequences N` (its `CENSUS` line: step time, host time outside the executor's
