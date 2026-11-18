@@ -1945,12 +1945,6 @@ namespace TensorSharp.Cuda
             => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate or GraphFusion.AttentionPrep;
 
         /// <summary>
-        /// A gated attention output (<see cref="GraphFusion.SigmoidGate"/>), attn * sigmoid(gate), in one pass with the gate
-        /// read where the query projection put it (ts_graph_sigmoid_gate_f32: the region's sigmoid and product expressions).
-        /// The ops copied the gate out of the projection, then ran the sigmoid and the product as two passes (Qwen3.8-27B, a
-        /// 2K-row chunk: 50 MB each of the three, 16 layers).
-        /// </summary>
-        /// <summary>
         /// DFlash2's grouped dynamic convolution (<see cref="GraphFusion.DFlashConv"/>) in one launch (ts_graph_dflash_conv_f32)
         /// with its ops' roundings: about ten elementwise, copy and concatenation kernels a convolution otherwise, twenty
         /// convolutions a Qwen3.8-27B DFlash2 block. Declined (the ops run) unless the operands are contiguous F32 on the device
@@ -1981,6 +1975,12 @@ namespace TensorSharp.Cuda
         /// <summary>DFlash2 convolutions <see cref="TryDFlashConv"/> ran (tests check the kernel served them).</summary>
         internal long DFlashConvRegions { get; private set; }
 
+        /// <summary>
+        /// A gated attention output (<see cref="GraphFusion.SigmoidGate"/>), attn * sigmoid(gate), in one pass with the gate
+        /// read where the query projection put it (ts_graph_sigmoid_gate_f32: the region's sigmoid and product expressions).
+        /// The ops copied the gate out of the projection, then ran the sigmoid and the product as two passes (Qwen3.8-27B, a
+        /// 2K-row chunk: 50 MB each of the three, 16 layers).
+        /// </summary>
         private bool TrySigmoidGate(Tensor[] inputs, Tensor[] results)
         {
             Tensor attn = inputs[0], gate = inputs[1];
