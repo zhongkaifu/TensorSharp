@@ -430,6 +430,17 @@ namespace TensorSharp.Cuda
             return ((long)free.ToUInt64(), (long)total.ToUInt64());
         }
 
+        /// <summary>Whether a rent of <paramref name="requestedBytes"/> would reuse a block the pool caches (no driver
+        /// allocation, so no out-of-memory reclaim).</summary>
+        internal bool HasCachedBlock(long requestedBytes) => pool.HasCachedBlock(requestedBytes);
+
+        /// <summary>The driver's free device memory in bytes (the pool's cached blocks not counted); 0 when the query fails.</summary>
+        internal long FreeDeviceBytes()
+        {
+            Context.MakeCurrent();
+            return CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr _) == 0 ? (long)free.ToUInt64() : 0;
+        }
+
         /// <summary>Free device memory, with the large blocks the pool caches counted as free (an allocation that needs the
         /// room gives them back, <see cref="ReclaimableBytes"/>), and the total. The shards' small cached blocks are not
         /// counted: they go back only once the large ones did not make room.</summary>

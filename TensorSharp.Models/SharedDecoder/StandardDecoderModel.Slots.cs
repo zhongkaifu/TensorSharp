@@ -906,7 +906,7 @@ namespace TensorSharp.Models
                 DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds);
                 if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
                     : RunFollowingDFlash(ref dflash, plan => TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(),
-                          wantLogits: true, out float[][] graphLogits, follow: follow, draftRows: draftRows, dflash: plan)
+                          wantLogits: true, out float[][] graphLogits, follow: follow, draftRows: draftRows, dflash: plan, prompt: true)
                           && CopyLogits(graphLogits, outLogits)))
                 {
                     BatchedForwardCount++;

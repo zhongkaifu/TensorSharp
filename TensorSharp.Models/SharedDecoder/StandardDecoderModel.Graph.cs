@@ -241,13 +241,19 @@ namespace TensorSharp.Models
             /// <summary>The DFlash drafter's rings take the following sequences' rows as the trunk finishes them
             /// (<see cref="EmitDFlashFollow"/>).</summary>
             public DFlashFollowPlan FollowDFlash { get; init; }
+            /// <summary>The step forwards prompt tokens: each sequence whose rows number more than <see cref="SmallChunkRows"/>
+            /// forwards a prompt chunk, and its attention op says so (<see cref="GraphAttentionRows.PromptChunk"/>). Set only by
+            /// the prompt entry points (<see cref="PromptStep"/>), never for a verify window, a re-forward of generated rows or
+            /// a draft step.</summary>
+            public bool PromptChunks { get; init; }
 
             /// <summary>What the request changes in the emitted program (a streamed step's template key).</summary>
             public string Shape =>
                 $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}:{CaptureTail}"
                 + (GreedyIds ? ":g" : "")
                 + (FollowDraft == DraftFollow.None ? "" : $":f{(int)FollowDraft}{(DraftRows != null ? "e" : "")}")
-                + (FollowDFlash == null ? "" : $":df{FollowDFlash.Key}");
+                + (FollowDFlash == null ? "" : $":df{FollowDFlash.Key}")
+                + (PromptChunks ? ":p" : "");
 
             /// <summary>This request with the DFlash rings' follow <paramref name="plan"/> (null: none).</summary>
             public GraphRequest WithDFlashFollow(DFlashFollowPlan plan) => new()
@@ -255,8 +261,30 @@ namespace TensorSharp.Models
                 LastRowLogits = LastRowLogits, AllRowLogits = AllRowLogits, GreedyIds = GreedyIds, CaptureLayers = CaptureLayers,
                 CaptureTail = CaptureTail, CaptureFinal = CaptureFinal, RecurrentSnapshots = RecurrentSnapshots,
                 PositionTable = PositionTable, FollowDraft = FollowDraft, DraftRows = DraftRows, FollowDFlash = plan,
+                PromptChunks = PromptChunks,
             };
         }
+
+        /// <summary>Whether a step of these per-sequence row <paramref name="counts"/> forwarding prompt tokens marks its
+        /// attention as a prompt chunk's (<see cref="GraphRequest.PromptChunks"/>): some sequence forwards more than
+        /// <see cref="SmallChunkRows"/> rows. A decode step's and a short prompt tail's programs then stay as they were (their
+        /// shape, signature and advance).</summary>
+        private static bool PromptStep(int[] counts) => Array.Exists(counts, c => c > SmallChunkRows);
+
+        /// <summary>Tests: no step marks its attention as a prompt chunk's (the programs as they were before the mark).</summary>
+        internal bool PromptChunkMarksDisabledForTests { get; set; }
+
+        /// <summary>Tests: when set, every attention op a traced step emits adds its ip here (GraphStep.FlashAttention).</summary>
+        internal List<long[]> AttentionIpForTests { get; set; }
+
+        /// <summary>Set while a prompt entry point that forwards through <see cref="RunSequence"/> or
+        /// <see cref="SpecForward"/> runs (<see cref="ForwardRefillCore"/>, <see cref="SpecForwardPrompt"/>): its chunks are
+        /// prompt tokens.</summary>
+        private bool _promptScope;
+
+        /// <summary>Whether a step of <paramref name="counts"/> rows a sequence marks its prompt chunks: it forwards prompt tokens
+        /// (<paramref name="prompt"/>) and some sequence's rows are a chunk (<see cref="PromptStep"/>).</summary>
+        private bool MarksPromptChunks(bool prompt, int[] counts) => prompt && !PromptChunkMarksDisabledForTests && PromptStep(counts);
 
         private sealed class GraphResult
         {
@@ -1015,14 +1043,14 @@ namespace TensorSharp.Models
 
         private bool TryRunGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
             bool wantLogits, out float[][] logits, int[] positionTable = null, DraftFollow follow = DraftFollow.None,
-            float[] draftRows = null, DFlashFollowPlan dflash = null)
+            float[] draftRows = null, DFlashFollowPlan dflash = null, bool prompt = false)
         {
             logits = null;
             bool greedy = wantLogits && _greedyLastRows && GraphExecutor.Capabilities.GreedyIdOutputs;
             var request = new GraphRequest
             {
                 LastRowLogits = wantLogits, GreedyIds = greedy, PositionTable = positionTable, FollowDraft = follow, DraftRows = draftRows,
-                FollowDFlash = dflash,
+                FollowDFlash = dflash, PromptChunks = MarksPromptChunks(prompt, counts),
             };
             if (!TryRunGraphStep(hidden, slots, first, counts, starts, request, out GraphResult result))
                 return false;
@@ -1432,6 +1460,7 @@ namespace TensorSharp.Models
         /// the head when <paramref name="head"/>, else the stage's output rows for the next stage.</summary>
         private StepOutputs EmitStep(GraphStep step, Tensor hidden, GraphRequest request, int from, int to, bool head)
         {
+            step.PromptChunks = request.PromptChunks;
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             var outputs = new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
             // The first stage widens the embedded rows into the residual stream; later stages receive it.
@@ -1581,6 +1610,7 @@ namespace TensorSharp.Models
             var h = new int[ranks];
             for (int r = 0; r < ranks; r++)
             {
+                steps[r].PromptChunks = request.PromptChunks;
                 steps[r].SetPositions(r == 0 ? positions : (int[])positions.Clone());   // each rank's own: an advance bumps it
                 if (request.PositionTable != null)
                 {
@@ -2174,6 +2204,8 @@ namespace TensorSharp.Models
                 int count = step.Counts[s], start = step.Starts[s];
                 Slot slot = step.Slots[s];
                 long firstRow = step.First[s];
+                // This sequence's rows are a prompt chunk (a mixed step marks only its prompt sequences' attention).
+                bool promptChunk = step.PromptChunks && count > SmallChunkRows;
                 int qs = n == 1 ? q : step.View3(q, d, heads, count, d * f, d * heads * f, firstRow * d * heads * f);
                 int ks = n == 1 ? k : step.View3(k, d, kvHeads, count, d * f, d * kvHeads * f, firstRow * d * kvHeads * f);
                 int vs = n == 1 ? v : step.View3(v, dv, kvHeads, count, dv * f, dv * kvHeads * f, firstRow * dv * kvHeads * f);
@@ -2208,7 +2240,7 @@ namespace TensorSharp.Models
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, window, kvType, count, gqa });
                     bool region = BeginWindowAttention(step, layer, x, s, new WindowAttentionOperands(qs, ck, cv, rowsAt, window, heads, kvHeads, d, scale));
                     fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, step.ChunkMask(window, start, count, s), window), scale,
-                        AttentionKvMax(step, layer, s));
+                        AttentionKvMax(step, layer, s), promptChunk);
                     if (region) step.EndFused(stackalloc[] { fa });
                 }
                 else
@@ -2230,7 +2262,8 @@ namespace TensorSharp.Models
                         kAttn = step.Op(GraphOp.Concat, stackalloc[] { kPrev, kFresh }, stackalloc long[] { 1 });
                         vAttn = step.Op(GraphOp.Concat, stackalloc[] { vPrev, vFresh }, stackalloc long[] { 1 });
                     }
-                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, step.CausalMask(start, count, s), start + count), scale);
+                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, step.CausalMask(start, count, s), start + count), scale,
+                        promptChunk: promptChunk);
                 }
                 int part = step.Reshape(fa, heads * dv, count);
                 attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
@@ -2506,6 +2539,9 @@ namespace TensorSharp.Models
             internal void OwnPositions() => Starts = (int[])Starts.Clone();
             /// <summary>Every sequence forwards a short chunk (the graph may be replayed).</summary>
             public bool IsDecode { get; }
+            /// <summary>The step forwards prompt tokens (<see cref="GraphRequest.PromptChunks"/>): a sequence's attention over more
+            /// than <see cref="SmallChunkRows"/> rows is marked as its prompt chunk's. Draft steps never set it.</summary>
+            internal bool PromptChunks { get; set; }
             /// <summary>Keep the recurrent state after every row (a verify window).</summary>
             public bool RecurrentSnapshots { get; }
             /// <summary>Cache rows below this are masked out (a draft layer that resumed after a gap).</summary>
@@ -3149,11 +3185,16 @@ namespace TensorSharp.Models
 
             /// <summary>Flash attention of q [d, rows, heads] over k/v [d, kv, kv_heads]: [dv, heads, rows].</summary>
             /// <summary>Flash attention; <paramref name="kvMax"/> &gt; 0 bounds the finite entries of every mask row, which
-            /// lets a backend attend only those (ggml_flash_attn_ext_set_n_kv_max).</summary>
-            public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0)
+            /// lets a backend attend only those (ggml_flash_attn_ext_set_n_kv_max). <paramref name="promptChunk"/>: the rows are one
+            /// sequence's prompt chunk (<see cref="GraphAttentionRows.PromptChunk"/>), set only by <see cref="EmitAttention"/> under
+            /// <see cref="PromptChunks"/>.</summary>
+            public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0, bool promptChunk = false)
             {
                 Span<int> srcs = stackalloc[] { q, k, v, mask };
-                ReadOnlySpan<long> ip = kvMax > 0 ? stackalloc long[] { 10 /* F32 accumulation */, kvMax } : stackalloc long[] { 10 };
+                // ip[2] only on a prompt chunk's op (GraphAttentionRows): every other op keeps the ip, bytes and signature it had.
+                ReadOnlySpan<long> ip = promptChunk ? stackalloc long[] { 10 /* F32 accumulation */, Math.Max(kvMax, 0), GraphAttentionRows.PromptChunk }
+                    : kvMax > 0 ? stackalloc long[] { 10, kvMax } : stackalloc long[] { 10 };
+                _m.AttentionIpForTests?.Add(ip.ToArray());
                 return Op(GraphOp.FlashAttnExt, mask >= 0 ? srcs : srcs[..3], ip, stackalloc[] { scale, 0f, 0f });
             }
 

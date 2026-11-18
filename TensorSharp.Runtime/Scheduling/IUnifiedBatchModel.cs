@@ -29,7 +29,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// (false, nothing written) when a request's slot does not continue at its start.
         /// <paramref name="features"/>[s], when given for request s (a buffer of c x the drafter's feature width, c no
         /// more than its rows), receives the drafter features of its LAST c rows (a prompt-conditioned drafter's prefill
-        /// needs only the rows its context holds); it is set to null when this forward could not capture them.</summary>
+        /// needs only the rows its context holds); it is set to null when this forward could not capture them.
+        /// A request's tokens are its prompt chunk or its one decode token: a model may attend a prompt chunk with
+        /// arithmetic decode rows do not share (a plain and a speculating request prefill through it alike). A caller
+        /// forwarding generated tokens as a chunk (a re-forward, a verify) must use another entry.</summary>
         bool TryForwardUnified(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, float[][] lastRowLogits,
             float[][]? features = null);
 

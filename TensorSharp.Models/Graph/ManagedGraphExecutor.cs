@@ -286,7 +286,7 @@ namespace TensorSharp.Models.Graph
         /// shapes take the interpreter's attention.
         /// </summary>
         protected override unsafe Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
-            CacheWindow kWindow, CacheWindow vWindow)
+            CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
             long heads = q.Sizes[0], d = q.Sizes[2], kvHeads = k.Sizes[0], keys = k.Sizes[1];
             // A padded decode window (its unwritten tail masked) runs its pattern over the written keys only.
@@ -299,7 +299,7 @@ namespace TensorSharp.Models.Graph
                 || q.ElementType != DType.Float32 || !(half || (k.ElementType == DType.Float32 && v.ElementType == DType.Float32))
                 || k.Strides[2] != 1 || k.Strides[1] != d || v.Strides[2] != 1 || v.Strides[1] != d
                 || k.Strides[0] != v.Strides[0] || k.Strides[0] % d != 0 || v.Sizes[1] != keys)
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             if (trimmed) keys = mask.Keys;
             Tensor packed = q.IsContiguous() ? null : Ops.NewContiguous(q);
             try

@@ -78,6 +78,23 @@ namespace TensorSharp.Graph
         public const int F32 = 0, F16 = 1, Q4_0 = 2, Q8_0 = 8, I32 = 26, I64 = 27, BF16 = 30;
     }
 
+    /// <summary>
+    /// <see cref="GraphOp.FlashAttnExt"/>'s ip[2]: what its query rows are, as the model that emitted them says. The op's ip:
+    /// [0] ggml's accumulation precision, [1] the most keys a mask row leaves finite (0: unknown), [2] one of these. An
+    /// unmarked op carries at most two ip, so its program keeps the bytes and signature it had.
+    /// </summary>
+    public static class GraphAttentionRows
+    {
+        /// <summary>Not said (decode rows, a verify window, a drafter's rows): an executor keeps the arithmetic decode rows
+        /// share.</summary>
+        public const long Unsaid = 0;
+
+        /// <summary>One sequence's prompt chunk: prompt tokens a plain and a speculating request forward through the same
+        /// chunks, never a verify window's or a drafter's rows. An executor may attend them with arithmetic decode rows do not
+        /// share (the CUDA executor's 8-bit prompt attention).</summary>
+        public const long PromptChunk = 1;
+    }
+
     /// <summary>A weight held in a quantized block layout (GGUF's formats): what a backend needs to
     /// run a product with it (its resident copy is found by <see cref="CacheKey"/>).</summary>
     public interface IGraphWeight

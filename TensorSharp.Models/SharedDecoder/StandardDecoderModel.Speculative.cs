@@ -187,6 +187,17 @@ namespace TensorSharp.Models
         /// <summary>The per-token draft head's confidence gate; NaN keeps the speculator's default.</summary>
         public virtual float SpecPreferredDraftGate => float.NaN;
 
+        /// <summary>A prompt chunk through <see cref="SpecForward"/> (a speculating request's prefill,
+        /// <see cref="TensorSharp.Runtime.Speculative.SpeculativeExecution.PrefillStep"/>): its attention is marked as a prompt
+        /// chunk's, as a plain request's prefill of the same chunk is.</summary>
+        public void SpecForwardPrompt(int[] tokens, float[] hAllOut, float[] logitsOut)
+        {
+            bool outer = _promptScope;
+            _promptScope = true;
+            try { SpecForward(tokens, hAllOut, logitsOut, allLogitsRows: false); }
+            finally { _promptScope = outer; }
+        }
+
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             ArgumentNullException.ThrowIfNull(tokens);
@@ -211,6 +222,7 @@ namespace TensorSharp.Models
                 CaptureTail = lastFeatureRow ? 1 : 0,
                 CaptureFinal = !dflash && hAllOut != null,
                 RecurrentSnapshots = _anyRecurrent && rows > 1 && rows <= SmallChunkRows,
+                PromptChunks = MarksPromptChunks(_promptScope && !allLogitsRows, new[] { rows }),
             };
             if (GraphUnsupportedReason() != null)
             {
@@ -234,7 +246,7 @@ namespace TensorSharp.Models
                 {
                     PositionTable = request.PositionTable, AllRowLogits = request.AllRowLogits, LastRowLogits = request.LastRowLogits,
                     CaptureLayers = request.CaptureLayers, CaptureTail = request.CaptureTail, CaptureFinal = request.CaptureFinal,
-                    RecurrentSnapshots = request.RecurrentSnapshots,
+                    RecurrentSnapshots = request.RecurrentSnapshots, PromptChunks = request.PromptChunks,
                     FollowDraft = follow, DraftRows = PrepareDraftFollow(active, tokens, media),
                 };
                 _draftCarry = active.DraftCarry;

@@ -101,13 +101,50 @@ public sealed class CudaPrefillModuleTests
         // The committed PTX must report the same number. CI has no GPU (the CudaTheory below never
         // runs there), so read the literal the probe stores first, at offset 0 of its output
         // (the arch follows at +4):  mov.u32 %rA, <version>;  st.global.u32 [%rdB], %rA;
-        // A PR that bumps the source and C# constants but not the PTX fails here on every machine.
-        var store = Regex.Matches(File.ReadAllText(CommittedPtx(module)),
+        // A PR that bumps the source and C# constants but not the PTX fails here on every machine. Read in the probe's
+        // own body: another probe of the module (the flash module's attn8 caps) stores at offset 0 too.
+        var store = Regex.Matches(EntryBody(File.ReadAllText(CommittedPtx(module)), CapsKernel(module)),
             @"mov\.u32\s+(%r\d+),\s*(\d+);\s+st\.global\.u32\s+\[%rd\d+\],\s*\1;");
         Assert.True(store.Count == 1, $"tensorsharp_{module}.ptx: expected one version store at offset 0, found {store.Count}; update this pattern if the probe changed");
         Assert.True(int.Parse(store[0].Groups[2].Value) == ExpectedVersion(module),
             $"the committed tensorsharp_{module}.ptx reports version {store[0].Groups[2].Value} but {macro} is {ExpectedVersion(module)}: " +
             "refresh the committed PTX with the source (nvcc 13.0.88, DEVELOPMENT.md).");
+    }
+
+    /// <summary>The PTX text of entry <paramref name="name"/>: from its .entry line to the next entry's .globl marker.</summary>
+    private static string EntryBody(string ptx, string name)
+    {
+        var entry = Regex.Match(ptx, @"(?m)^\.visible \.entry " + Regex.Escape(name) + @"\(");
+        Assert.True(entry.Success, $"no .entry {name} in the PTX");
+        int end = ptx.IndexOf("// .globl", entry.Index, StringComparison.Ordinal);
+        return end < 0 ? ptx[entry.Index..] : ptx[entry.Index..end];
+    }
+
+    /// <summary>The committed compute_75 baseline carries the 8-bit prompt attention's probe, which reports 0 there (it has
+    /// no block-scaled E4M3 MMA); the launchers never take the kernels on it.</summary>
+    [CudaFact]
+    public void Attn8Probe_IsZeroOnTheCommittedBaseline()
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        using var module = CudaModule.LoadFromBytes(File.ReadAllBytes(CommittedPtx("flash_prefill")));
+        Assert.False(CudaFlashPrefillKernels.ReadAttn8Caps(module));
+        using var kernels = CudaFlashPrefillKernels.FromModule(CudaModule.LoadFromBytes(File.ReadAllBytes(CommittedPtx("flash_prefill"))));
+        Assert.False(kernels.Attn8Code);
+        Assert.False(kernels.Runs8BitPrompt(256));
+    }
+
+    /// <summary>On an RTX Blackwell GPU (CC 12.x) whose build loaded the fatbin's sm_12Xa code, the image carries the 8-bit
+    /// prompt attention (skipped, with the reason, anywhere else).</summary>
+    [CudaFact(RtxBlackwellImage = true)]
+    public void Attn8Probe_IsOneOnAnRtxBlackwellBuild()
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        using var kernels = CudaFlashPrefillKernels.Create();
+        Assert.True(kernels.Attn8Code, "an sm_12Xa image loaded on a CC 12.x GPU must carry the 8-bit prompt attention");
+        Assert.True(kernels.Runs8BitPrompt(256));
+        Assert.False(kernels.Runs8BitPrompt(128));
     }
 
     /// <summary>The committed compute_75 baseline JITs here, and its probe reports the version the

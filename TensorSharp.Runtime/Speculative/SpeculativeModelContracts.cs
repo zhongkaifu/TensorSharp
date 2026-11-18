@@ -266,6 +266,16 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         void SpecForward(int[] tokens, float[]? hAllOut, float[] logitsOut, bool allLogitsRows);
 
+        /// <summary>
+        /// <see cref="SpecForward"/> of a prompt chunk (the last row's logits): the speculative prefill
+        /// (<see cref="SpeculativeExecution.PrefillStep"/>). A model may attend a prompt chunk with arithmetic decode
+        /// rows and verify windows do not share, as long as a plain request's prefill of the same chunk does too
+        /// (the speculative contract compares the two); a verify, a re-forward of kept rows and a plain step stay on
+        /// <see cref="SpecForward"/>.
+        /// </summary>
+        void SpecForwardPrompt(int[] tokens, float[]? hAllOut, float[] logitsOut)
+            => SpecForward(tokens, hAllOut, logitsOut, allLogitsRows: false);
+
         /// <summary>Optional verify with the same state/hidden-row semantics as
         /// <see cref="SpecForward"/>, returning each raw row's first-max token instead
         /// of host logits. Only a caller whose sampler is plain greedy may use it;

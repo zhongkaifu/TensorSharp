@@ -214,6 +214,17 @@ namespace TensorSharp.Cuda
             return backingAllocate(allocationBytes);
         }
 
+        /// <summary>Whether a rent of <paramref name="requestedBytes"/> would take a cached large block (no driver allocation):
+        /// the pool caches large blocks by their exact rounded size. False for small blocks (per-thread shards).</summary>
+        public bool HasCachedBlock(long requestedBytes)
+        {
+            long allocationBytes = RoundAllocationSize(Math.Max(requestedBytes, 1));
+            if (!enabled || allocationBytes < LargeBlockThreshold)
+                return false;
+            lock (largeSync)
+                return largePool.TryGetValue(allocationBytes, out Stack<IntPtr> stack) && stack.Count > 0;
+        }
+
         /// <summary>Every shard's cached small blocks, read without their locks (a shard past its share asks).</summary>
         private long CachedSnapshot()
         {

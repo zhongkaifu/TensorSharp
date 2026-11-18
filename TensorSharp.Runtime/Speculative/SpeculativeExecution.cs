@@ -323,14 +323,14 @@ namespace TensorSharp.Runtime.Speculative
 
             if (!NeedsHidden)
             {
-                _trunk.Forward(chunk, null, StepLogits, allLogitsRows: false);
+                _trunk.ForwardPrompt(chunk, null, StepLogits);
                 _speculator.Commit(chunk, null, startPos);
             }
             else if (_speculator.HandlesOwnPrefill)
             {
                 // The trunk keeps the drafter in sync itself and only hands
                 // back the last row's hidden state.
-                _trunk.Forward(chunk, _pendingH, StepLogits, allLogitsRows: false);
+                _trunk.ForwardPrompt(chunk, _pendingH, StepLogits);
             }
             else if (promptEnd > 0 && _speculator.PrefillContextRows < int.MaxValue
                 && (long)startPos + n <= (long)promptEnd - _speculator.PrefillContextRows)
@@ -340,7 +340,7 @@ namespace TensorSharp.Runtime.Speculative
                 // Keep only the last row's hidden state: the next chunk's carry-in.
                 // A null-row commit reports the gap.
                 EnsureChunkBuffers(1);
-                _trunk.Forward(chunk, _lastRowH, StepLogits, allLogitsRows: false);
+                _trunk.ForwardPrompt(chunk, _lastRowH, StepLogits);
                 _speculator.Commit(chunk, null, startPos);
                 Array.Copy(_lastRowH, 0, _pendingH, 0, _hidden);
             }
@@ -348,7 +348,7 @@ namespace TensorSharp.Runtime.Speculative
             {
                 EnsureChunkBuffers(n);
 
-                _trunk.Forward(chunk, _chunkH, StepLogits, allLogitsRows: false);
+                _trunk.ForwardPrompt(chunk, _chunkH, StepLogits);
 
                 // Pair token k with the hidden state of the token before it. Done
                 // IN PLACE: the only row still needed after the shift is the last

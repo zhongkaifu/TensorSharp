@@ -104,6 +104,56 @@ namespace InferenceWeb.Tests
             }
         }
 
+        private static readonly Lazy<(int Cc, int ImageArch, bool Current, bool Attn8, string Error)> FlashPrefillImage = new(() =>
+        {
+            try
+            {
+                var device = TensorSharp.Cuda.CudaDevice.GetDevice(0);
+                int cc = device.ComputeCapabilityMajor * 10 + device.ComputeCapabilityMinor;
+                using var context = TensorSharp.Cuda.CudaContext.Create(0);
+                context.MakeCurrent();
+                using var kernels = TensorSharp.Cuda.CudaFlashPrefillKernels.Create();
+                return (cc, kernels.ImageArch, kernels.IsCurrent, kernels.Runs8BitPrompt(256), null);
+            }
+            catch (Exception ex)
+            {
+                return (0, 0, false, false, $"{ex.GetType().Name}: {ex.Message}");
+            }
+        });
+
+        /// <summary>
+        /// Skip reason for a test that launches the 8-bit prompt attention (tensorsharp_flash_prefill's
+        /// ts_flash_prompt_i8e4_d256), or null when the module this process loads carries it on GPU 0: an sm_120a /
+        /// sm_121a image on an RTX Blackwell GPU. Everywhere else its kernels trap and the executor never takes them.
+        /// </summary>
+        public static string PromptAttention8Skip
+        {
+            get
+            {
+                if (CudaSkip != null) return CudaSkip;
+                var image = FlashPrefillImage.Value;
+                if (image.Error != null) return $"Requires a loadable tensorsharp_flash_prefill module on GPU 0 ({image.Error}).";
+                return image.Attn8 ? null
+                    : $"Requires the 8-bit prompt attention (an sm_120a / sm_121a tensorsharp_flash_prefill image on an RTX Blackwell GPU): " +
+                      $"GPU 0 is sm_{image.Cc}, the loaded image is arch {image.ImageArch} (current: {image.Current}), and its attn8 probe reports 0.";
+            }
+        }
+
+        /// <summary>Skip reason for a test about an RTX Blackwell build (GPU 0 of CC 12.x running the fatbin's sm_12X code of
+        /// tensorsharp_flash_prefill), or null on one.</summary>
+        public static string RtxBlackwellImageSkip
+        {
+            get
+            {
+                if (CudaSkip != null) return CudaSkip;
+                var image = FlashPrefillImage.Value;
+                if (image.Error != null) return $"Requires a loadable tensorsharp_flash_prefill module on GPU 0 ({image.Error}).";
+                if (image.Cc / 10 != 12) return $"Requires an RTX Blackwell GPU (CC 12.x); GPU 0 is sm_{image.Cc}.";
+                return image.Current && image.ImageArch >= 120 ? null
+                    : $"Requires an nvcc build for this GPU: the loaded tensorsharp_flash_prefill image is arch {image.ImageArch} (current: {image.Current}).";
+            }
+        }
+
         public static string MlxSkip =>
             MlxAvailable.Value ? null : "Requires the MLX native backend.";
 
@@ -358,6 +408,22 @@ namespace InferenceWeb.Tests
             set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
         }
         private BackendType _ggmlBackend;
+
+        /// <summary>The test launches the 8-bit prompt attention; skips where the loaded image has none (<see cref="TestGates.PromptAttention8Skip"/>).</summary>
+        public bool PromptAttention8
+        {
+            get => _promptAttention8;
+            set { _promptAttention8 = value; if (value) Skip ??= TestGates.PromptAttention8Skip; }
+        }
+        private bool _promptAttention8;
+
+        /// <summary>The test is about an RTX Blackwell build; skips elsewhere (<see cref="TestGates.RtxBlackwellImageSkip"/>).</summary>
+        public bool RtxBlackwellImage
+        {
+            get => _rtxBlackwellImage;
+            set { _rtxBlackwellImage = value; if (value) Skip ??= TestGates.RtxBlackwellImageSkip; }
+        }
+        private bool _rtxBlackwellImage;
     }
 
     /// <summary>
@@ -431,6 +497,14 @@ namespace InferenceWeb.Tests
             set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
         }
         private BackendType _ggmlBackend;
+
+        /// <summary>The test launches the 8-bit prompt attention; skips where the loaded image has none (<see cref="TestGates.PromptAttention8Skip"/>).</summary>
+        public bool PromptAttention8
+        {
+            get => _promptAttention8;
+            set { _promptAttention8 = value; if (value) Skip ??= TestGates.PromptAttention8Skip; }
+        }
+        private bool _promptAttention8;
     }
 
     /// <summary>

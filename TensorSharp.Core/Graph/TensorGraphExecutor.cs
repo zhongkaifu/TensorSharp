@@ -226,9 +226,12 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>ggml's flash attention: q [heads, nq, d], k/v [kvHeads, nkv, d] (views), the mask [nq, nkv]
-        /// with its pattern; returns ggml's layout [nq, heads, dv]. Default: <see cref="Attention"/>, permuted.</summary>
+        /// with its pattern; returns ggml's layout [nq, heads, dv]. Default: <see cref="Attention"/>, permuted.
+        /// <paramref name="promptChunk"/>: the op says its rows are one sequence's prompt chunk
+        /// (<see cref="GraphAttentionRows.PromptChunk"/>), which an executor may attend with arithmetic decode rows do not
+        /// share; the default ignores it.</summary>
         protected virtual Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
-            CacheWindow kWindow, CacheWindow vWindow)
+            CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
             using Tensor a = Attention(q, k, v, mask.Pattern == MaskPattern.None && mask.Floor == 0 ? null : mask.Tensor, scale);
             using Tensor p = a.Permute(1, 0, 2);
@@ -1318,6 +1321,11 @@ namespace TensorSharp.Graph
         internal long AliasesInPlace { get; private set; }
         internal long AliasCopies { get; private set; }
 
+        /// <summary>Attention ops run whose rows their program marks as a prompt chunk (<see cref="GraphAttentionRows.PromptChunk"/>),
+        /// and the other attention ops of more than one query row (tests).</summary>
+        internal long PromptChunkAttentions { get; private set; }
+        internal long OtherMultiRowAttentions { get; private set; }
+
         /// <summary>Whether this executor's ops may write their results where an alias names (<see cref="AliasDestination"/>): the
         /// session then binds the alias's leaf before the op runs.</summary>
         protected virtual bool TakesAliasDestinations => false;
@@ -1768,7 +1776,10 @@ namespace TensorSharp.Graph
                         }
                         if (Ip(1, 0) > 0) mask.KvMax = (int)Ip(1, 0);
                     }
-                    return V(FlashAttention(q, k, v, mask, Fp(0, 1f), values[n.Srcs[1]].Window, values[n.Srcs[2]].Window));
+                    bool promptChunk = Ip(2, GraphAttentionRows.Unsaid) == GraphAttentionRows.PromptChunk;
+                    if (promptChunk) PromptChunkAttentions++;
+                    else if (nq > 1) OtherMultiRowAttentions++;
+                    return V(FlashAttention(q, k, v, mask, Fp(0, 1f), values[n.Srcs[1]].Window, values[n.Srcs[2]].Window, promptChunk));
                 }
                 case GraphOp.SoftMaxExt:
                 {

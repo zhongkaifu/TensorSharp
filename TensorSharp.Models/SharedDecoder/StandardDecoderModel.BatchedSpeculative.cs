@@ -242,6 +242,8 @@ namespace TensorSharp.Models
                 CaptureLayers = dflash ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
                 CaptureFinal = !dflash,
                 CaptureTail = tail,
+                // A unified step: prompt chunks and decode tokens, as the plain unified step marks them.
+                PromptChunks = MarksPromptChunks(true, counts),
             };
             if (!TryRunGraphStep(hidden, slots, first, counts, (int[])starts.Clone(), request, out GraphResult result))
                 return false;

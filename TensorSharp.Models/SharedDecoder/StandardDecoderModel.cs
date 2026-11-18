@@ -608,18 +608,28 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardRefillCore(int[] tokens)
         {
-            // Long prompts run in chunks so the per-layer score tensor stays bounded
-            // (~heads x chunk x context). Media carry positions within one forward, and a
-            // multi-node pipeline follows the serialized protocol, so neither is chunked.
-            if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
-                return ForwardCore(tokens);
-            int last = tokens.Length - 1;
-            for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+            // A refill forwards prompt tokens: its chunks attend as prompt chunks (GraphRequest.PromptChunks).
+            bool outer = _promptScope;
+            _promptScope = true;
+            try
             {
-                int len = Math.Min(PrefillChunkTokens, last - pos);
-                RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+                // Long prompts run in chunks so the per-layer score tensor stays bounded
+                // (~heads x chunk x context). Media carry positions within one forward, and a
+                // multi-node pipeline follows the serialized protocol, so neither is chunked.
+                if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
+                    return ForwardCore(tokens);
+                int last = tokens.Length - 1;
+                for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+                {
+                    int len = Math.Min(PrefillChunkTokens, last - pos);
+                    RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+                }
+                return ForwardCore(new[] { tokens[last] });
             }
-            return ForwardCore(new[] { tokens[last] });
+            finally
+            {
+                _promptScope = outer;
+            }
         }
 
         protected override float[] ForwardCore(int[] tokens)
@@ -662,7 +672,7 @@ namespace TensorSharp.Models
 
                 float[][] graphLogits = null;
                 if (RunFollowingDFlash(ref dflash, plan => TryRunGraph(hidden, new[] { active }, new[] { 0 }, new[] { seqLen }, new[] { start },
-                        wantLogits, out graphLogits, positions.Table, follow, draftRows, plan)))
+                        wantLogits, out graphLogits, positions.Table, follow, draftRows, plan, prompt: ForwardIsPrompt || _promptScope)))
                 {
                     hidden.Dispose();
                     _cacheDeviceDirty = true;

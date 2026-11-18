@@ -254,7 +254,7 @@ namespace TensorSharp.Cuda
         /// explicit mask, an operand that is not a cache window) takes the generic path.
         /// </summary>
         protected override Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
-            CacheWindow kWindow, CacheWindow vWindow)
+            CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
             // Rows over K and V that are tensors, not cache windows (a block drafter's ring), with a mask tensor: its values, whatever
             // pattern an eager run reads in them (a recorded run cannot read them; the eager run had then taken the generic path,
@@ -281,7 +281,7 @@ namespace TensorSharp.Cuda
                 || q.DimensionCount != 3 || k.DimensionCount is < 2 or > 3 || v.DimensionCount is < 2 or > 3
                 || kWindow.Cache.DimensionCount is < 2 or > 3 || vWindow.Cache.DimensionCount is < 2 or > 3
                 || k.Sizes[^1] != v.Sizes[^1])
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2];
             // A single KV head's window and cache bind without their head extent.
             int kvHeads = k.DimensionCount == 3 ? (int)k.Sizes[0] : 1;
@@ -329,16 +329,21 @@ namespace TensorSharp.Cuda
                     using (result) return result.View(1, heads, d);
                 }
                 result.Dispose();
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             }
             if (kWindow.Start != 0 || vWindow.Start != 0 || heads % kvHeads != 0)
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             // Causal rows over an F16 cache: the tensor-core flash attention (K and V tiles streamed once per block of
             // 128 query rows, split over the keys when the rows are few), not the scores of every query and key.
             if (kc.ElementType == DType.Float16 && vc.ElementType == DType.Float16 && kc.Sizes[^1] == d && vc.Sizes[^1] == d
                 && (trimmed ? mask.Trimmed : mask.Pattern) == MaskPattern.Causal
                 && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && flash.RunsAttention(d))
             {
+                // A marked prompt chunk's rows may attend in 8 bits (TryPromptAttention8); else, and for every other row, the
+                // 16-bit kernels below.
+                if (promptChunk && nq > WidestVerifyWindow
+                    && TryPromptAttention8(qc, kc, vc, cap, nq, len, floor, heads, kvHeads, d, scale, flash, out Tensor attended8))
+                    return attended8;
                 var attended = new Tensor(Allocator, DType.Float32, nq, heads, d);
                 // A recorded verify window reads its length on the device (the window's rows the last nq of it), as a
                 // recorded decode row does: the splits then follow the bucket window its length falls in (the launch holds its
@@ -362,7 +367,7 @@ namespace TensorSharp.Cuda
             if (trimmed && nq > 1 && mask.HasTensor && CudaDecodeDynParams.IsActive((CudaAllocator)Allocator))
             {
                 Tensor whole = mask.Tensor;
-                return FlashAttention(q, k, v, new AttentionMask(MaskPattern.Explicit, 0, () => whole), scale, kWindow, vWindow);
+                return FlashAttention(q, k, v, new AttentionMask(MaskPattern.Explicit, 0, () => whole), scale, kWindow, vWindow, promptChunk);
             }
             int group = heads / kvHeads;
             // K and V once as F32 [kvHeads, len, d] (the cache may hold F16); the query heads of a group share
@@ -371,11 +376,11 @@ namespace TensorSharp.Cuda
             using var kx = new Tensor(Allocator, DType.Float32, kvHeads, len, d);
             using var vx = new Tensor(Allocator, DType.Float32, kvHeads, len, d);
             if (!CudaFusedOps.TryExpandKvHeads(kx, kc, 1, len) || !CudaFusedOps.TryExpandKvHeads(vx, vc, 1, len))
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             using Tensor kt = kx.Transpose(1, 2);
             using Tensor maskTensor = explicitRows ? Contiguous2(mask.Tensor, nq, len) : null;
             if (explicitRows && maskTensor == null)
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             var output = new Tensor(Allocator, DType.Float32, nq, heads, d);
             // Query tiles keep the scores [heads, tile, len] within ScoreBudgetBytes at any context length.
             int tile = (int)Math.Clamp(ScoreBudgetBytes / ((long)heads * len * sizeof(float)), 1, nq);
@@ -557,7 +562,7 @@ namespace TensorSharp.Cuda
                     CudaDecodeDynParams.WindowRow(fewer);
                     try
                     {
-                        using Tensor one = FlashAttention(q1, k, v, rowMask, scale, kWindow, vWindow);
+                        using Tensor one = FlashAttention(q1, k, v, rowMask, scale, kWindow, vWindow, promptChunk: false);
                         using Tensor target = output.Narrow(0, r, 1);
                         using Tensor source = one.View(1, heads, d);
                         Ops.Copy(target, source);
