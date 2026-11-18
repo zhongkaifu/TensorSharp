@@ -375,6 +375,7 @@ public sealed class CudaNvfp4MatmulTests
                 allocator.AllNvfp4RowsOnMatvecForTests = false;
             }
             float[] again = Product();
+            Assert.True(GateUpEpilogue(), "the gate|up epilogue still declines after the seam was cleared");
 
             int gemmRowsApart = 0;
             for (int r = 0; r < rows; r++)

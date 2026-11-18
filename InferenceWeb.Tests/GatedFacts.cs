@@ -198,7 +198,7 @@ namespace InferenceWeb.Tests
             {
                 if (CudaSkip != null) return CudaSkip;
                 string refusal = Fp4TensorCoresRefusal.Value;
-                return refusal == null ? null : $"Requires the FP4 tensor-core products of tensorsharp_fp4_kernels on GPU 0: {refusal}.";
+                return refusal == null ? null : $"Requires the FP4 tensor-core products of tensorsharp_fp4_kernels on GPU 0: {refusal.TrimEnd('.')}.";
             }
         }
 
