@@ -48,7 +48,7 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   a token and the sliding-window rings). `MAX_CONTEXT` must cover the deepest test. `--threads N` runs the CPU lanes on
   N threads as `llama-bench -t N` does: `TS_GGML_CPU_THREADS` (ggml_cpu's prompt and decode pools; defaults every
   physical core for prompts and every physical core but two for decode on a hybrid Mac), `TS_CPU_THREADS` (the
-  managed pool, default every core on Apple silicon) and `DOTNET_PROCESSOR_COUNT` all become N. `PROBE` points at
+  managed pool, default every core on Apple silicon, and every core but two for decode on a hybrid Mac) and `DOTNET_PROCESSOR_COUNT` all become N. `PROBE` points at
   another build's `Lfm3Probe.dll` (an A/B arm's copied bin directory).
 - `llama-bench-result.sh MODEL [PP,..|-] [TG] [DEPTH,..] [REPS] [-- llama-bench args]`: llama-bench (flash attention
   `FA`, default 1; its defaults otherwise: n_batch 2048, n_ubatch 512, threads = the performance cores) with the same
