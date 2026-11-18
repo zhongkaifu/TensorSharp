@@ -31,6 +31,14 @@ namespace TensorSharp.Models
         /// <summary>Steps served by a whole-forward graph (tests check the lowering ran).</summary>
         internal int GraphRuns { get; private set; }
 
+        /// <summary>Causal mask inputs the traced steps emitted (<see cref="GraphStep.ChunkMask"/>,
+        /// <see cref="GraphStep.CausalMask"/>): one a sequence and step, whatever the attention layers.</summary>
+        internal long CausalMaskInputs { get; private set; }
+
+        /// <summary>Tests: a step caches only the last causal mask of each kind it emitted, as before masks were cached per
+        /// sequence (a step of several sequences then emitted every sequence's mask again in every attention layer).</summary>
+        internal bool SingleMaskCacheForTests { get; set; }
+
         private string _graphDeclined;
 
         /// <summary>The family's rotary as one ggml rope over [head_dim, heads, rows]; null when
@@ -2448,8 +2456,11 @@ namespace TensorSharp.Models
             private readonly List<int> _inputs = new();
             private readonly List<IntPtr> _inputData = new();
             private readonly List<long> _inputBytes = new();
-            private int _mask = -1, _maskStart = -1, _maskCount = -1, _maskFloor = -1;
-            private int _decodeMask = -1, _decodeMaskWindow = -1, _decodeMaskStart = -1, _decodeMaskCount = -1, _decodeMaskSequence = -1;
+            // Causal masks by what fills them: every attention layer reads its sequence's. A step of several sequences had kept
+            // one mask, which each sequence's evicted, so every layer emitted every sequence's again (a 2048-row chunk's 67M
+            // values at 32K keys built 16 times in a step that carried other requests' decode rows).
+            private readonly Dictionary<(int Start, int Count, int Floor), int> _causalMasks = new();
+            private readonly Dictionary<(int Window, int Start, int Count, int Sequence), int> _chunkMasks = new();
             // A chunk's write rows by (start, count): a step writes every sequence's chunk by index on executors that take
             // indexed cache writes at any width, and start * 64 + count had named (0, 2048) and (31, 64) alike.
             private readonly Dictionary<(int Start, int Count, int Sequence), int> _writeIndex = new();
@@ -2785,19 +2796,14 @@ namespace TensorSharp.Models
             /// start + q.</summary>
             internal int ChunkMask(int window, int start, int count, int sequence)
             {
-                if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskStart == start && _decodeMaskCount == count
-                    && _decodeMaskSequence == sequence)
-                    return _decodeMask;
+                var key = (window, start, count, sequence);
+                if (_chunkMasks.TryGetValue(key, out int cached)) return cached;
                 var mask = new ushort[(long)window * count];
                 FillCausalRows(mask, window, start, count, FloorOf(sequence));
-                _decodeMask = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
-                AddInput(_decodeMask, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
+                int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
+                AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: window, start: start, count: count, sequence: sequence);
-                _decodeMaskWindow = window;
-                _decodeMaskStart = start;
-                _decodeMaskCount = count;
-                _decodeMaskSequence = sequence;
-                return _decodeMask;
+                return CacheMask(_chunkMasks, key, node);
             }
 
             /// <summary>A causal F16 mask [start + count, count] for a chunk of sequence <paramref name="sequence"/> (-1: any)
@@ -2805,16 +2811,24 @@ namespace TensorSharp.Models
             public int CausalMask(int start, int count, int sequence = -1)
             {
                 int floor = FloorOf(sequence);
-                if (_mask >= 0 && _maskStart == start && _maskCount == count && _maskFloor == floor) return _mask;
+                var key = (start, count, floor);
+                if (_causalMasks.TryGetValue(key, out int cached)) return cached;
                 int kv = start + count;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
                 FillCausalRows(mask, kv, start, count, floor);
-                _mask = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
-                AddInput(_mask, Pin(mask), mask.LongLength * sizeof(ushort));
-                _maskStart = start;
-                _maskCount = count;
-                _maskFloor = floor;
-                return _mask;
+                int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
+                AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort));
+                return CacheMask(_causalMasks, key, node);
+            }
+
+            /// <summary>Keep a new mask input for every later reader of its key (with
+            /// <see cref="SingleMaskCacheForTests"/>, only until the next mask of its kind).</summary>
+            private int CacheMask<TKey>(Dictionary<TKey, int> masks, TKey key, int node)
+            {
+                if (_m.SingleMaskCacheForTests) masks.Clear();
+                masks[key] = node;
+                _m.CausalMaskInputs++;
+                return node;
             }
 
             private IntPtr Pin(Array values)
