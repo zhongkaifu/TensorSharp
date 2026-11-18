@@ -3,10 +3,11 @@
 #
 # usage: ts-bench.sh MODEL BACKEND [PP,..|-] [TG] [DEPTH,..] [--reps N] [--greedy] [--threads N]
 #   MAX_CONTEXT must cover the deepest test (depth + TG); MLX needs TENSORSHARP_MLX_LIBRARY_DIR.
-#   --threads N runs the CPU lanes on N threads, as llama-bench -t N does: TS_GGML_CPU_THREADS (ggml_cpu's thread pool;
-#   default every physical core), TS_CPU_THREADS (the managed worker pool; default half the logical processors above 8)
-#   and DOTNET_PROCESSOR_COUNT (Environment.ProcessorCount: the .NET thread pool and the managed kernels that size their
-#   loops from it) all become N. Without it each lane keeps its own defaults.
+#   --threads N runs the CPU lanes on N threads, as llama-bench -t N does: TS_GGML_CPU_THREADS (ggml_cpu's prompt and
+#   decode pools; defaults every physical core for prompts and, on a hybrid Mac, every physical core but two for steps of
+#   at most 4 rows), TS_CPU_THREADS (the managed worker pool; default every core on Apple silicon, half the logical
+#   processors above 8 elsewhere) and DOTNET_PROCESSOR_COUNT (Environment.ProcessorCount: the .NET thread pool and the
+#   managed kernels that size their loops from it) all become N. Without it each lane keeps its own defaults.
 #   PROBE overrides the Lfm3Probe.dll (an A/B arm's copied bin directory).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../../.." && pwd)

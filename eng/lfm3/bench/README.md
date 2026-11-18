@@ -10,11 +10,19 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
 `build-cpu-noblas`, ggml-cpu alone - configure with `-DGGML_METAL=OFF -DGGML_BLAS=ON|OFF`). MLX runs need
 `TENSORSHARP_MLX_LIBRARY_DIR` (a directory holding `libmlxc`, e.g. `InferenceWeb.Tests/bin/Release/net10.0`).
 
-- `run-matrix.sh [metal] [mlx] [cpu] [serve]`: the whole matrix (environment knobs in its header): every GPU quant's
-  pp512/pp4096 and tg128 at depths 0/4K/16K/32K on ggml_metal, MLX next to ggml_metal and llama.cpp, the CPU lanes
-  (ggml_cpu and the managed CPU against `llama-bench -ngl 0` at equal threads) and serving. Results under
+- `run-matrix.sh [metal] [mlx] [cpu] [serve] [cpu-serve] [cpu-omni]`: the whole matrix (environment knobs in its
+  header): every GPU quant's pp512/pp4096 and tg128 at depths 0/4K/16K/32K on ggml_metal, MLX next to ggml_metal and
+  llama.cpp, and serving. `cpu` is the CPU lanes' matrix: every LFM3 file (Q4_K_M, Q8_0, QAD-Q4_0, NVFP4, BF16) on
+  ggml_cpu and the managed CPU against `llama-bench -ngl 0` from llama.cpp's CPU-only builds (Accelerate BLAS and
+  ggml-cpu alone), prompts of 128-8192 tokens with every engine on all physical cores (both TensorSharp lanes' default
+  and llama.cpp's best prompt count), tg128 at depths 0 and 4K (16K for Q4_K_M) with TensorSharp at its defaults and at
+  `CPU_THREADS` (12) and llama.cpp at 12 and at `CPU_WIDE_THREADS` (16: ggml_cpu's decode width and llama.cpp's best
+  decode count here; 12 is 6-12 % slower), each pass `ab.py --quiet 12`; `BASE_PROBE` adds an older build as before
+  arms. `cpu-serve` measures TTFT and 1 / 4 streams through both servers against llama-server, `cpu-omni` the LFM3-Omni
+  vision and audio encoders and streaming speech on both lanes against llama.cpp's CPU build. Results under
   `artifacts/lfm3/bench/<stamp>/`, one markdown table per section plus the raw logs and `conditions.txt` (load
-  before/after, commit).
+  before/after, the busiest processes, commit). The CPU sections take about 3 hours on an M5 Pro; run them on a machine
+  nothing else uses.
 - `ab.py [--rounds N] [--quiet PCT] [--json FILE] NAME=COMMAND ...`: runs the commands alternately (the first arm
   rotating each round) and tabulates each test's median of the rounds' medians with the min-max spread. Commands print
   `RESULT name median min max` lines. `--quiet PCT` waits before each arm (up to `--quiet-wait` seconds) until the
@@ -29,9 +37,10 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   steady-state figure (LFM3 Q8_0 pp128 on an M5 Pro: 660-918 tok/s over 3 reps, 826-957 over 10). tgN@dD decodes N
   pseudo-random tokens after a D-token prompt (no sampling in the timed loop). It also prints the K/V footprint (bytes
   a token and the sliding-window rings). `MAX_CONTEXT` must cover the deepest test. `--threads N` runs the CPU lanes on
-  N threads as `llama-bench -t N` does: `TS_GGML_CPU_THREADS` (ggml_cpu's pool, default every physical core),
-  `TS_CPU_THREADS` (the managed pool, default half the logical processors above 8) and `DOTNET_PROCESSOR_COUNT` all
-  become N. `PROBE` points at another build's `Lfm3Probe.dll` (an A/B arm's copied bin directory).
+  N threads as `llama-bench -t N` does: `TS_GGML_CPU_THREADS` (ggml_cpu's prompt and decode pools; defaults every
+  physical core for prompts and every physical core but two for decode on a hybrid Mac), `TS_CPU_THREADS` (the
+  managed pool, default every core on Apple silicon) and `DOTNET_PROCESSOR_COUNT` all become N. `PROBE` points at
+  another build's `Lfm3Probe.dll` (an A/B arm's copied bin directory).
 - `llama-bench-result.sh MODEL [PP,..|-] [TG] [DEPTH,..] [REPS] [-- llama-bench args]`: llama-bench (flash attention
   `FA`, default 1; its defaults otherwise: n_batch 2048, n_ubatch 512, threads = the performance cores) with the same
   RESULT lines, and an INFO line per test (backends, threads, flash attention, batch sizes, K type, samples). For the
