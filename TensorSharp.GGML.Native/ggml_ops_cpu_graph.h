@@ -5,9 +5,10 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// The ggml-cpu backend's side of the generic graph (ggml_ops_graph_builder.cpp), through public ggml APIs only: weights
-// the graph reads only as the first operand of products are placed in ggml-cpu's CPU_REPACK buffer type (its interleaved
-// GEMM/GEMV layouts, which llama.cpp loads its weights into).
+// The ggml-cpu backend's side of the generic graph (ggml_ops_graph_builder.cpp), through public ggml APIs only:
+//   - weights the graph reads only as the first operand of products are placed in ggml-cpu's CPU_REPACK buffer type
+//     (its interleaved GEMM/GEMV layouts, which llama.cpp loads its weights into), and
+//   - a step runs on the thread pool its width calls for: decode steps on fewer threads than prompt steps.
 #pragma once
 
 #include "ggml.h"
@@ -48,4 +49,18 @@ namespace tsg
 
     /// Drops every cached copy (graphs still holding one keep it until they are freed).
     void cpu_repack_clear();
+
+    /// Creates the CPU backend's thread pools (the prompt pool always; a decode pool when its width differs) and sets
+    /// the prompt pool; the pools are appended to `owned` (freed at shutdown).
+    void cpu_pools_create(ggml_backend_t backend, std::vector<ggml_threadpool_t>& owned);
+
+    /// Runs the next graph on the pool for its width: `product_rows` is the most activation rows any weight product of
+    /// the graph reads (0 when it has none). Steps of at most kCpuDecodeRows rows run on the decode pool.
+    void cpu_pools_select(ggml_backend_t backend, std::int64_t product_rows);
+
+    /// Forgets every backend's pools (before TSGgml_Shutdown frees them).
+    void cpu_pools_forget_all();
+
+    /// Decode-width steps: one sequence's token, or a few sequences' (a small batch still reads every weight once).
+    constexpr std::int64_t kCpuDecodeRows = 4;
 }

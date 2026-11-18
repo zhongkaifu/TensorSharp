@@ -25,6 +25,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 namespace tsg
 {
     struct CpuRepacked
@@ -307,5 +311,123 @@ namespace tsg
     {
         std::lock_guard<std::mutex> lock(g_repack_mu);
         g_repacked.clear();
+    }
+
+    // ---- thread pools
+
+    namespace
+    {
+        struct CpuPools
+        {
+            ggml_backend_t backend = nullptr;
+            ggml_threadpool_t prompt = nullptr, decode = nullptr, current = nullptr;
+            int n_prompt = 0, n_decode = 0;
+        };
+
+        std::mutex g_pools_mu;
+        std::vector<CpuPools> g_pools;   // one per CPU backend instance (TSGgml_RecreateBackend makes another)
+
+        int env_threads(const char* name)
+        {
+            if (const char* e = std::getenv(name))
+            {
+                const int v = std::atoi(e);
+                if (v > 0) return v;
+            }
+            return 0;
+        }
+
+#if defined(__APPLE__)
+        int sysctl_int(const char* name)
+        {
+            std::uint32_t v = 0;
+            std::size_t len = sizeof(v);
+            return sysctlbyname(name, &v, &len, nullptr, 0) == 0 ? static_cast<int>(v) : 0;
+        }
+#endif
+
+        ggml_threadpool_t new_pool(int threads, bool paused)
+        {
+            ggml_threadpool_params tpp = ggml_threadpool_params_default(threads);
+            tpp.paused = paused;
+            return ggml_threadpool_new(&tpp);
+        }
+    }
+
+    void cpu_pools_create(ggml_backend_t backend, std::vector<ggml_threadpool_t>& owned)
+    {
+        // A bare ggml_backend_cpu_init() runs GGML_DEFAULT_N_THREADS (4) and spawns a DISPOSABLE thread pool per
+        // graph_compute. Prompt steps default to ALL physical cores on one persistent pool: llama.cpp defaults to the
+        // P-cores on Apple Silicon, which on an M5 Pro (6P+12E) leaves ~2x of prompt throughput on the table (LFM3-1.7B
+        // Q4_K_M pp512: 166 tok/s at 6 threads, 381 at 18; Muse-Glimmer 30B decode 3.8 -> 8.2 tok/s).
+        // TS_GGML_CPU_THREADS overrides the count for every step.
+        const int forced = env_threads("TS_GGML_CPU_THREADS");
+        int prompt = forced;
+#if defined(__APPLE__)
+        if (prompt <= 0) prompt = sysctl_int("hw.physicalcpu");
+#endif
+        if (prompt <= 0) prompt = available_cpu_parallelism();
+
+        // Decode steps read every weight once per token and end a few hundred small nodes at barriers every thread must
+        // reach, so one descheduled worker stalls the step. With a worker on every core the host's own threads (the
+        // .NET runtime, the calling loop) take cores from the pool; on a hybrid Apple CPU decode runs best on every
+        // physical core but two (M5 Pro, 6P+12E, LFM3-1.7B tg128 at depth 0 / 4096 tok/s, interleaved: Q4_K_M 166.6 /
+        // 139.6 on 10 threads, 157.3 / 134.4 on 12, 166.2 / 143.7 on 14, 168.6 / 147.6 on 16, 124.5 / 128.4 on 18;
+        // Q4_0 and Q8_0 likewise within 4 % of their best at 16). Elsewhere (no measurement yet) decode keeps the
+        // prompt count. TS_GGML_CPU_DECODE_THREADS overrides it; with only TS_GGML_CPU_THREADS set, decode takes that
+        // count too.
+        int decode = env_threads("TS_GGML_CPU_DECODE_THREADS");
+        if (decode <= 0) decode = forced;
+#if defined(__APPLE__)
+        if (decode <= 0)
+        {
+            const int perf = sysctl_int("hw.perflevel0.physicalcpu"), eff = sysctl_int("hw.perflevel1.physicalcpu");
+            if (perf > 0 && eff > 0) decode = std::max(perf, prompt - 2);
+        }
+#endif
+        if (decode <= 0) decode = prompt;
+
+        CpuPools p;
+        p.backend = backend;
+        p.n_prompt = prompt;
+        p.prompt = new_pool(prompt, false);
+        if (p.prompt != nullptr) owned.push_back(p.prompt);
+        if (decode != prompt && p.prompt != nullptr)
+        {
+            p.n_decode = decode;
+            p.decode = new_pool(decode, true);
+            if (p.decode != nullptr) owned.push_back(p.decode);
+        }
+        ggml_backend_cpu_set_n_threads(backend, prompt);
+        if (p.prompt != nullptr) ggml_backend_cpu_set_threadpool(backend, p.prompt);
+        p.current = p.prompt;
+        std::lock_guard<std::mutex> lock(g_pools_mu);
+        g_pools.erase(std::remove_if(g_pools.begin(), g_pools.end(), [&](const CpuPools& q) { return q.backend == backend; }),
+                      g_pools.end());
+        g_pools.push_back(p);
+    }
+
+    void cpu_pools_select(ggml_backend_t backend, std::int64_t product_rows)
+    {
+        std::lock_guard<std::mutex> lock(g_pools_mu);
+        for (CpuPools& p : g_pools)
+        {
+            if (p.backend != backend) continue;
+            if (p.decode == nullptr) return;
+            const bool decode = product_rows > 0 && product_rows <= kCpuDecodeRows;
+            ggml_threadpool_t want = decode ? p.decode : p.prompt;
+            if (want == p.current) return;
+            // Switching pauses the pool it leaves (its threads sleep instead of polling for the next graph).
+            ggml_backend_cpu_set_threadpool(backend, want);
+            ggml_backend_cpu_set_n_threads(backend, decode ? p.n_decode : p.n_prompt);
+            p.current = want;
+            return;
+        }
+    }
+
+    void cpu_pools_forget_all()
+    {
+        std::lock_guard<std::mutex> lock(g_pools_mu);
+        g_pools.clear();
     }
 }

@@ -410,8 +410,10 @@ namespace
         int hc_last_role = -1;
         // Bonsai2 PRISM: the rotated activation each (input, transform) products share (see weight_product).
         tsg::BonsaiMemo bonsai;
-        // ggml-cpu: the repacked weight copies this graph's leaves are bound to (kept alive while it lives).
+        // ggml-cpu: the repacked weight copies this graph's leaves are bound to (kept alive while it lives), and the most
+        // activation rows any weight product reads (which thread pool runs the graph).
         std::vector<tsg::CpuRepackedRef> repacked;
+        std::int64_t product_rows = 0;
 
         ~TsgGraph()
         {
@@ -1125,7 +1127,8 @@ namespace
                     throw std::runtime_error("graph builder: binding a device operation's operand failed");
     }
 
-    // ggml-cpu (ggml_ops_cpu_graph.h): weights only products read go into its repacked layout.
+    // ggml-cpu (ggml_ops_cpu_graph.h): weights only products read go into its repacked layout, and the graph's widest
+    // weight product picks the thread pool that runs it.
     void bind_cpu_weights(TsgGraph* g)
     {
         std::vector<tsg::CpuWeightLeaf> weights;
@@ -1140,6 +1143,24 @@ namespace
         g->repacked = tsg::cpu_repack_bind(g->graph, weights, bound);
         for (std::size_t i = 0; i < of.size(); i++)
             of[i]->repacked = bound[i] != 0;
+
+        // A weight product: ggml's MUL_MAT / MUL_MAT_ID of a weight (or a row block of one).
+        std::unordered_map<const ggml_tensor*, int> is_weight;
+        for (const tsg::CpuWeightLeaf& w : weights) is_weight[w.tensor] = 1;
+        auto weight_operand = [&](const ggml_tensor* t) {
+            if (t != nullptr && t->view_src != nullptr) t = t->view_src;
+            return t != nullptr && is_weight.find(t) != is_weight.end();
+        };
+        g->product_rows = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(g->graph); i++)
+        {
+            const ggml_tensor* node = ggml_graph_node(g->graph, i);
+            if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) continue;
+            const ggml_tensor* x = node->src[1];
+            if (x == nullptr || !weight_operand(node->src[0])) continue;
+            const std::int64_t rows = node->op == GGML_OP_MUL_MAT_ID ? x->ne[2] * x->ne[3] : x->ne[1] * x->ne[2] * x->ne[3];
+            g->product_rows = std::max(g->product_rows, rows);
+        }
     }
 
     // Bind the leaves, then let the graph's own allocator place every other tensor.
@@ -1576,6 +1597,7 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         // Device work queued by earlier calls may still read or write these host buffers.
         host_read_barrier();
         upload_run_inputs(g, inputs, input_data, input_bytes, ninputs);
+        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU) tsg::cpu_pools_select(g_backend, g->product_rows);
 
         // Enqueue the graph and the downloads back to back, then synchronize once (as llama.cpp's
         // scheduler does): a synchronous compute followed by a download is a second command-buffer
