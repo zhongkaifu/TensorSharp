@@ -48,7 +48,15 @@ namespace TensorSharp.GGML
                 // norms, rotary and set_rows read row-contiguous strided rows): LFM3-1.7B Q4_K_M pp128 4,083 -> 4,320 tok/s,
                 // pp512 +2.3% (M5 Pro); on an A40 pp512 +4.7%, pp4096 +4.1% (26 fewer products a 512-row step). ggml-vulkan
                 // measured no gain (pp512 +0.8%, pp4096 -0.3%, decode -0.4..-0.9%), so it keeps the separate products.
-                PackedProductBlocks = metal || backend == GgmlBackendType.Cuda,
+                // ggml-cpu likewise (its norms, rotary, binary ops, set_rows, concat and flash attention read rows at any
+                // strides), and it takes a prompt chunk's fresh K/V rows as their permuted views (FreshRowViews: written by
+                // index, attended where they lie): no copies of every chunk's q, k and v, nor of its fresh K/V rows, and one
+                // short-convolution in-projection product instead of three. The same bits (logits digests of LFM3-1.7B
+                // Q4_K_M and Q8_0, Ministral-3 3B, Hunyuan-MT2 1.8B, Qwen3.5 0.8B). LFM3-1.7B Q4_K_M on an M5 Pro (18 threads,
+                // interleaved): pp128 807 -> 953 tok/s, pp512 876 -> 953, pp2048 844 -> 877; the other families' prompts
+                // within their run-to-run spread (Qwen3.5 pp512 2,170 -> 2,313).
+                PackedProductBlocks = metal || backend is GgmlBackendType.Cuda or GgmlBackendType.Cpu,
+                FreshRowViews = backend == GgmlBackendType.Cpu,
                 // ggml-metal finishes reading a head's recurrent state before writing it.
                 InPlaceStateAlias = metal,
                 // Metal's concurrency reorder (+8% decode on Qwen 3.5 A3B).

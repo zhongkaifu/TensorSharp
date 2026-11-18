@@ -47,6 +47,11 @@ namespace TensorSharp.Graph
         public bool TensorParallel { get; init; }
         /// <summary>Prompt chunks write K/V by row index (no copy into a strided cache view).</summary>
         public bool IndexedCacheWrites { get; init; }
+        /// <summary>A prompt chunk that attends its own fresh K/V rows takes them as the permuted views of its projections: it
+        /// writes them into the caches by index from those views, and its attention (and the concatenation with the cached
+        /// prefix) reads them where they lie, instead of contiguous copies of every chunk's K and V first. For executors whose
+        /// set_rows, concat and flash attention read rows at any strides (ggml-cpu).</summary>
+        public bool FreshRowViews { get; init; }
         /// <summary>A prompt chunk over an F16 or block-quantized K/V cache is written by row index and attends the
         /// cache's window padded to <see cref="DecodeWindowRows"/>, as decode does, instead of its own fresh F32 rows:
         /// the device's fast attention needs reduced-precision K/V in whole windows. An F32 cache keeps the fresh rows
