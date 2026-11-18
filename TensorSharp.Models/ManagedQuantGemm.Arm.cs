@@ -620,7 +620,7 @@ namespace TensorSharp.Models
             int nsb = inDim / QK_K;
             float* side = (float*)(scratch + inDim * 4);
             float* f0 = (float*)(x0 + inDim), f1 = (float*)(x1 + inDim), f2 = (float*)(x2 + inDim), f3 = (float*)(x3 + inDim);
-            s0 = s1 = s2 = s3 = Vector128<float>.Zero;
+            Vector128<float> t0 = default, t1 = default, t2 = default, t3 = default;   // locals: out parameters would live in memory
             for (int sb = 0; sb < nsb; sb++)
             {
                 Vector128<float> d0 = Vector128.Create(f0[sb]), d1 = Vector128.Create(f1[sb]);
@@ -635,12 +635,13 @@ namespace TensorSharp.Models
                     Sdot16x4(w + 64, (sbyte*)x0 + k + 16, (sbyte*)x1 + k + 16, (sbyte*)x2 + k + 16, (sbyte*)x3 + k + 16, ref a0, ref a1, ref a2, ref a3);
                     Vector128<float> A = AdvSimd.LoadVector128(side + (sb * 8 + j) * 8);
                     Vector128<float> C = AdvSimd.LoadVector128(side + (sb * 8 + j) * 8 + 4);
-                    s0 += d0 * (A * AdvSimd.ConvertToSingle(a0) - C * Vector128.Create(q0[j]));
-                    s1 += d1 * (A * AdvSimd.ConvertToSingle(a1) - C * Vector128.Create(q1[j]));
-                    s2 += d2 * (A * AdvSimd.ConvertToSingle(a2) - C * Vector128.Create(q2[j]));
-                    s3 += d3 * (A * AdvSimd.ConvertToSingle(a3) - C * Vector128.Create(q3[j]));
+                    t0 += d0 * (A * AdvSimd.ConvertToSingle(a0) - C * Vector128.Create(q0[j]));
+                    t1 += d1 * (A * AdvSimd.ConvertToSingle(a1) - C * Vector128.Create(q1[j]));
+                    t2 += d2 * (A * AdvSimd.ConvertToSingle(a2) - C * Vector128.Create(q2[j]));
+                    t3 += d3 * (A * AdvSimd.ConvertToSingle(a3) - C * Vector128.Create(q3[j]));
                 }
             }
+            s0 = t0; s1 = t1; s2 = t2; s3 = t3;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -650,7 +651,7 @@ namespace TensorSharp.Models
             int nsb = inDim / QK_K;
             float* side = (float*)(scratch + inDim * 4);
             float* f0 = (float*)(x0 + inDim), f1 = (float*)(x1 + inDim), f2 = (float*)(x2 + inDim), f3 = (float*)(x3 + inDim);
-            s0 = s1 = s2 = s3 = Vector128<float>.Zero;
+            Vector128<float> t0 = default, t1 = default, t2 = default, t3 = default;   // locals: out parameters would live in memory
             for (int sb = 0; sb < nsb; sb++)
             {
                 float* sv = side + sb * 68;
@@ -664,12 +665,13 @@ namespace TensorSharp.Models
                     Vector128<int> a0 = Vector128<int>.Zero, a1 = Vector128<int>.Zero, a2 = Vector128<int>.Zero, a3 = Vector128<int>.Zero;
                     Sdot16x4(scratch + k * 4, (sbyte*)x0 + k, (sbyte*)x1 + k, (sbyte*)x2 + k, (sbyte*)x3 + k, ref a0, ref a1, ref a2, ref a3);
                     Vector128<float> sc = AdvSimd.LoadVector128(sv + 4 + 4 * s);
-                    s0 += (b0 * sc) * AdvSimd.ConvertToSingle(a0);
-                    s1 += (b1 * sc) * AdvSimd.ConvertToSingle(a1);
-                    s2 += (b2 * sc) * AdvSimd.ConvertToSingle(a2);
-                    s3 += (b3 * sc) * AdvSimd.ConvertToSingle(a3);
+                    t0 += (b0 * sc) * AdvSimd.ConvertToSingle(a0);
+                    t1 += (b1 * sc) * AdvSimd.ConvertToSingle(a1);
+                    t2 += (b2 * sc) * AdvSimd.ConvertToSingle(a2);
+                    t3 += (b3 * sc) * AdvSimd.ConvertToSingle(a3);
                 }
             }
+            s0 = t0; s1 = t1; s2 = t2; s3 = t3;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -679,7 +681,7 @@ namespace TensorSharp.Models
             int nb = inDim / QK8_0;
             float* side = (float*)(scratch + inDim * 4);
             float* f0 = (float*)(x0 + inDim), f1 = (float*)(x1 + inDim), f2 = (float*)(x2 + inDim), f3 = (float*)(x3 + inDim);
-            s0 = s1 = s2 = s3 = Vector128<float>.Zero;
+            Vector128<float> t0 = default, t1 = default, t2 = default, t3 = default;   // locals: out parameters would live in memory
             for (int b = 0; b < nb; b++)
             {
                 int k = b * QK8_0;
@@ -688,11 +690,12 @@ namespace TensorSharp.Models
                 Sdot16x4(w, (sbyte*)x0 + k, (sbyte*)x1 + k, (sbyte*)x2 + k, (sbyte*)x3 + k, ref a0, ref a1, ref a2, ref a3);
                 Sdot16x4(w + 64, (sbyte*)x0 + k + 16, (sbyte*)x1 + k + 16, (sbyte*)x2 + k + 16, (sbyte*)x3 + k + 16, ref a0, ref a1, ref a2, ref a3);
                 Vector128<float> dw = AdvSimd.LoadVector128(side + 4 * b);
-                s0 += (dw * Vector128.Create(f0[b])) * AdvSimd.ConvertToSingle(a0);
-                s1 += (dw * Vector128.Create(f1[b])) * AdvSimd.ConvertToSingle(a1);
-                s2 += (dw * Vector128.Create(f2[b])) * AdvSimd.ConvertToSingle(a2);
-                s3 += (dw * Vector128.Create(f3[b])) * AdvSimd.ConvertToSingle(a3);
+                t0 += (dw * Vector128.Create(f0[b])) * AdvSimd.ConvertToSingle(a0);
+                t1 += (dw * Vector128.Create(f1[b])) * AdvSimd.ConvertToSingle(a1);
+                t2 += (dw * Vector128.Create(f2[b])) * AdvSimd.ConvertToSingle(a2);
+                t3 += (dw * Vector128.Create(f3[b])) * AdvSimd.ConvertToSingle(a3);
             }
+            s0 = t0; s1 = t1; s2 = t2; s3 = t3;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -702,7 +705,7 @@ namespace TensorSharp.Models
             int nsub = inDim / 16;
             float* side = (float*)(scratch + inDim * 4);
             float* f0 = (float*)(x0 + inDim), f1 = (float*)(x1 + inDim), f2 = (float*)(x2 + inDim), f3 = (float*)(x3 + inDim);
-            s0 = s1 = s2 = s3 = Vector128<float>.Zero;
+            Vector128<float> t0 = default, t1 = default, t2 = default, t3 = default;   // locals: out parameters would live in memory
             for (int s = 0; s < nsub; s++)
             {
                 int k = s * 16;
@@ -710,11 +713,12 @@ namespace TensorSharp.Models
                 Sdot16x4(scratch + k * 4, (sbyte*)x0 + k, (sbyte*)x1 + k, (sbyte*)x2 + k, (sbyte*)x3 + k, ref a0, ref a1, ref a2, ref a3);
                 Vector128<float> ue = AdvSimd.LoadVector128(side + 4 * s);
                 int b = s >> 1;
-                s0 += (Vector128.Create(f0[b]) * ue) * AdvSimd.ConvertToSingle(a0);
-                s1 += (Vector128.Create(f1[b]) * ue) * AdvSimd.ConvertToSingle(a1);
-                s2 += (Vector128.Create(f2[b]) * ue) * AdvSimd.ConvertToSingle(a2);
-                s3 += (Vector128.Create(f3[b]) * ue) * AdvSimd.ConvertToSingle(a3);
+                t0 += (Vector128.Create(f0[b]) * ue) * AdvSimd.ConvertToSingle(a0);
+                t1 += (Vector128.Create(f1[b]) * ue) * AdvSimd.ConvertToSingle(a1);
+                t2 += (Vector128.Create(f2[b]) * ue) * AdvSimd.ConvertToSingle(a2);
+                t3 += (Vector128.Create(f3[b]) * ue) * AdvSimd.ConvertToSingle(a3);
             }
+            s0 = t0; s1 = t1; s2 = t2; s3 = t3;
         }
     }
 }
