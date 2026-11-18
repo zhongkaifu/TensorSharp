@@ -123,11 +123,14 @@ catch (Exception ex)
 using ModelBase model = loaded;
 loadTimer.Stop();
 var m = new ModelHandle(model);
-if (arms.Any(a => a.PromptAttention != "default") && m.Cuda == null)
+if (arms.Any(a => a.Setting != "default") && m.Cuda == null)
     return Usage("arms f16 / 8bit / q8act set seams of the CUDA executor: --backend cuda with a shared-decoder model");
 if (arms.Any(a => a.PromptAttention == "8bit") && !m.Runs8BitPrompt)
     return Usage("an 8bit arm needs a CUDA image with the 8-bit prompt attention (an sm_120a / sm_121a build on its GPU); this one has none, " +
         "so the arm would run the 16-bit kernel");
+if (arms.Any(a => a.Q8Act) && !m.RunsFp4TensorCores)
+    return Usage("an arm with q8act needs the FP4 tensor-core products (an sm_120a / sm_121a build on its GPU); this one has none, so " +
+        "NVFP4 prompt rows never take the W4A4 GEMMs and the arm would run without q8act");
 ITokenizer tokenizer = model.Tokenizer;
 
 Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
@@ -137,7 +140,7 @@ Write(new JsonObject
     ["type"] = "run", ["probe"] = ProbeVersion, ["started_utc"] = DateTime.UtcNow.ToString("O"), ["label"] = options.GetValueOrDefault("label"),
     ["model"] = modelPath, ["model_bytes"] = new FileInfo(modelPath).Length, ["architecture"] = model.Config.Architecture,
     ["backend"] = backendName, ["kv_cache_dtype"] = model.KvCacheDtype.ToShortString(), ["kv_cache_dtype_requested"] = kvRequested,
-    ["arms"] = new JsonArray(arms.Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["prompt_attention"] = a.PromptAttention }).ToArray()),
+    ["arms"] = new JsonArray(arms.Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["prompt_attention"] = a.PromptAttention, ["q8act"] = a.Q8Act }).ToArray()),
     ["kl_reference"] = klReference, ["device"] = DeviceName(), ["flash_image_arch"] = m.CudaAllocator?.FlashPrefillKernels?.ImageArch,
     ["runs_8bit_prompt"] = m.CudaAllocator != null ? (bool?)m.Runs8BitPrompt : null, ["free_device_mb"] = Mb(m.FreeDeviceBytes()),
     ["load_s"] = Math.Round(loadTimer.Elapsed.TotalSeconds, 2), ["cases_file"] = caseFile.Path, ["cases_sha256"] = caseFile.Sha256,
@@ -145,7 +148,7 @@ Write(new JsonObject
     ["max_tokens"] = maxTokens == int.MaxValue ? null : (int?)maxTokens, ["resumed_records"] = done.Count,
 });
 Console.WriteLine($"{model.Config.Architecture} on {backendName} (KV {model.KvCacheDtype.ToShortString()}), loaded in {loadTimer.Elapsed.TotalSeconds:F1} s; " +
-    $"{selected.Count} cases x {arms.Length} arms ({string.Join(", ", arms.Select(a => $"{a.Name}={a.PromptAttention}"))}) -> {outputPath}");
+    $"{selected.Count} cases x {arms.Length} arms ({string.Join(", ", arms.Select(a => $"{a.Name}={a.Setting}"))}) -> {outputPath}");
 
 // The smallest footprint of a kind and arm that ran out of device memory: larger cases of that kind are not run.
 var outOfMemory = new Dictionary<(string Kind, string Arm), int>();
@@ -160,7 +163,7 @@ foreach (Case c in selected)
         var rec = new JsonObject
         {
             ["type"] = "record", ["case"] = c.Id, ["kind"] = c.Kind, ["group"] = c.Group, ["arm"] = arm.Name,
-            ["prompt_attention"] = arm.PromptAttention, ["kv_cache_dtype"] = model.KvCacheDtype.ToShortString(),
+            ["prompt_attention"] = arm.PromptAttention, ["q8act"] = arm.Q8Act, ["kv_cache_dtype"] = model.KvCacheDtype.ToShortString(),
         };
         string skip = c.Footprint > maxTokens ? $"not run: {c.Footprint} tokens is above --max-tokens {maxTokens}"
             : outOfMemory.TryGetValue((c.Kind, arm.Name), out int oom) && c.Footprint >= oom
@@ -444,7 +447,8 @@ static int Usage(string error)
     Console.Error.WriteLine("         [--kinds ppl,continue,greedy,chat,layers] [--groups retrieval,gsm8k,humaneval] [--ids REGEX]");
     Console.Error.WriteLine("         [--max-tokens N] [--prefill-chunk 2048] [--score-chunk 512] [--topk 32] [--label TEXT] [--resume]");
     Console.Error.WriteLine("Arm settings: default (the build's own), f16 (the 16-bit prompt kernel), 8bit (the 8-bit prompt attention),");
-    Console.Error.WriteLine("  q8act (the build's prompt attention; every NVFP4 product on the q8 matvec, so prompt rows keep q8 activations).");
+    Console.Error.WriteLine("  q8act (the build's prompt attention; every NVFP4 product on the q8 matvec, so prompt rows keep q8 activations),");
+    Console.Error.WriteLine("  f16+q8act / 8bit+q8act (that prompt attention with q8 activations).");
     return 2;
 }
 

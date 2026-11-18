@@ -600,8 +600,10 @@ class Report:
             for r in arm["records"].values():
                 kinds.setdefault(r.get("status"), 0)
                 kinds[r.get("status")] += 1
+            setting = next((a for a in run.get('arms', []) if a['name'] == arm['arm']), None)
+            attention = '?' if setting is None else setting['prompt_attention'] + (', q8 activations (q8act)' if setting.get('q8act') else '')
             self.out(f"- **{role}** `{arm['spec']}`: {run.get('architecture')} on {run.get('backend')} ({run.get('device')}), KV "
-                     f"{run.get('kv_cache_dtype')}, prompt attention {next((a['prompt_attention'] for a in run.get('arms', []) if a['name'] == arm['arm']), '?')}, "
+                     f"{run.get('kv_cache_dtype')}, prompt attention {attention}, "
                      f"records {', '.join(f'{k} {v}' for k, v in sorted(kinds.items()))}; label {run.get('label')!r}")
         self.out()
 

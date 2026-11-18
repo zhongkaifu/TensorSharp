@@ -22,7 +22,12 @@ pre-registered gates, and estimates GPU time. Everything it writes goes under ig
   - `q8act` keeps the build's prompt attention and runs every NVFP4 product on the q8 matvec, 16 rows a call
     (`CudaAllocator.AllNvfp4RowsOnMatvecForTests`). Prompt rows then keep the q8 activations of decode rows, where they
     are otherwise quantized to NVFP4 for the FP4 GEMMs: `--arms default,q8act` over `ppl` and `continue` cases measures
-    what the prompt path's NVFP4 activations cost. A model without NVFP4 weights runs it as `default`.
+    what the prompt path's NVFP4 activations cost. `f16+q8act` and `8bit+q8act` pair a prompt attention with q8
+    activations, so `--arms ref=f16+q8act,cand=8bit+q8act` compares the two attentions without the W4A4 rounding of NVFP4
+    prompt rows (about 0.16 KL on Qwen3.8-27B prose) in either arm. Records carry `q8act` next to
+    `prompt_attention`. A model without NVFP4 weights runs an arm with q8act as the same arm without it. An arm with
+    q8act is refused where the image has no FP4 tensor-core products (anything but an sm_120a / sm_121a build on its GPU):
+    NVFP4 prompt rows never take the W4A4 GEMMs there, so the arm would silently run without it.
 - **Arms that differ in what is fixed at load run as separate processes over the same case file.** For example,
   `--kv-cache-dtype f16` and `--kv-cache-dtype q8_0`, which spell the option as the CLI and server do.
   - The report pairs them by case id and checks that their inputs are identical (the sha256 of the token ids).

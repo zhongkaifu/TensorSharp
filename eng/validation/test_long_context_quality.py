@@ -141,6 +141,17 @@ class ReportOnSyntheticRuns(unittest.TestCase):
             self.assertTrue(verdicts and all(v == "PASS" for v in verdicts.values()), text)
             self.assertAlmostEqual(0.0, summary["ppl"][0]["delta_ppl_pct"])
 
+    def test_an_arm_with_q8_activations_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, cases = self.runs(d)
+            rows = [json.loads(line) for line in run.read_text().splitlines()]
+            rows[0]["arms"] = [{"name": "f16", "prompt_attention": "f16", "q8act": True},
+                               {"name": "8bit", "prompt_attention": "8bit", "q8act": False}]
+            self.write(d, "run.jsonl", rows)
+            text, _, _ = self.report(run, cases, "t2-attn8")
+            self.assertIn("prompt attention f16, q8 activations (q8act),", text)
+            self.assertIn("prompt attention 8bit, records", text)
+
     def test_a_ppl_shift_a_lost_check_and_a_confident_divergence_fail(self):
         with tempfile.TemporaryDirectory() as d:
             run, cases = self.runs(d, cand_nll_shift=0.01, cand_order=["alpha"], greedy_cut=2)

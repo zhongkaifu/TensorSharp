@@ -17,21 +17,30 @@ using TensorSharp.Runtime;
 
 namespace LongContextQualityProbe;
 
-/// <summary>One arm of a run: a name the records carry and the setting it runs with: the prompt attention (default, f16, 8bit)
-/// or q8act (the build's prompt attention, every NVFP4 product on the q8 matvec: prompt rows keep the decode rows' q8 activations).</summary>
-internal sealed record Arm(string Name, string PromptAttention)
+/// <summary>One arm of a run: a name the records carry, the prompt attention it runs (default, f16, 8bit) and whether every NVFP4
+/// product runs on the q8 matvec (<paramref name="Q8Act"/>: prompt rows keep the decode rows' q8 activations).</summary>
+internal sealed record Arm(string Name, string PromptAttention, bool Q8Act = false)
 {
-    public static readonly string[] Settings = { "default", "f16", "8bit", "q8act" };
+    public static readonly string[] Settings = { "default", "f16", "8bit" };
 
-    /// <summary>"8bit", "f16", "default" or "name=setting".</summary>
+    private const string Q8ActSuffix = "+q8act";
+
+    /// <summary>"8bit", "f16", "default", "q8act" (the build's prompt attention with q8 activations), a prompt attention with
+    /// "+q8act" ("8bit+q8act", "f16+q8act"), or "name=setting".</summary>
     public static Arm Parse(string spec)
     {
         int eq = spec.IndexOf('=');
         string name = eq < 0 ? spec : spec[..eq], setting = eq < 0 ? spec : spec[(eq + 1)..];
-        if (!Settings.Contains(setting)) throw new ArgumentException($"arm '{spec}': the setting is one of {string.Join(", ", Settings)}");
+        bool q8act = setting == "q8act" || setting.EndsWith(Q8ActSuffix, StringComparison.Ordinal);
+        string attention = setting == "q8act" ? "default" : q8act ? setting[..^Q8ActSuffix.Length] : setting;
+        if (!Settings.Contains(attention))
+            throw new ArgumentException($"arm '{spec}': the setting is one of {string.Join(", ", Settings)}, q8act, or one of the first with {Q8ActSuffix}");
         if (name.Length == 0 || name.Contains(':') || name.Contains(',')) throw new ArgumentException($"arm '{spec}': a name without ':' or ','");
-        return new Arm(name, setting);
+        return new Arm(name, attention, q8act);
     }
+
+    /// <summary>The setting as <see cref="Parse"/> reads it back.</summary>
+    public string Setting => !Q8Act ? PromptAttention : PromptAttention == "default" ? "q8act" : PromptAttention + Q8ActSuffix;
 }
 
 internal readonly record struct Counters(long Attn8Launches, long Attn8BandRefusals, long MarkedAttentions);
@@ -60,11 +69,15 @@ internal sealed class ModelHandle
     /// <summary>Whether the loaded CUDA image carries the 8-bit prompt attention (an sm_120a / sm_121a build on its GPU).</summary>
     public bool Runs8BitPrompt => CudaAllocator?.FlashPrefillKernels?.Runs8BitPrompt(256) == true;
 
+    /// <summary>Whether the loaded CUDA image carries the FP4 tensor-core products (an sm_120a / sm_121a build on its GPU): only
+    /// there do NVFP4 prompt rows take the W4A4 GEMMs that the q8act arm moves to the q8 matvec.</summary>
+    public bool RunsFp4TensorCores => CudaAllocator?.Fp4Kernels != null;
+
     public void SetArm(Arm arm)
     {
-        if (arm.PromptAttention != "default" && (Cuda == null || CudaAllocator == null))
-            throw new InvalidOperationException($"arm {arm.Name}: the {arm.PromptAttention} setting is a seam of the CUDA executor (--backend cuda)");
-        if (CudaAllocator != null) CudaAllocator.AllNvfp4RowsOnMatvecForTests = arm.PromptAttention == "q8act";
+        if (arm.Setting != "default" && (Cuda == null || CudaAllocator == null))
+            throw new InvalidOperationException($"arm {arm.Name}: the {arm.Setting} setting is a seam of the CUDA executor (--backend cuda)");
+        if (CudaAllocator != null) CudaAllocator.AllNvfp4RowsOnMatvecForTests = arm.Q8Act;
         if (Cuda != null) Cuda.PromptAttention8ForTests = arm.PromptAttention switch { "f16" => false, "8bit" => true, _ => null };
     }
 
