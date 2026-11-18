@@ -155,10 +155,21 @@ namespace TensorSharp.Cuda
         private CudaSsmPrefillKernels ssmPrefillKernels;
         private CudaFlashPrefillKernels flashPrefillKernels;
         private int fp4State, ssmPrefillState, flashPrefillState;   // 0: not loaded yet, 1: loaded, 2: unavailable
+        private string fp4Refusal, ssmPrefillRefusal, flashPrefillRefusal;
 
         /// <summary>The FP4 tensor-core products for this device (tensorsharp_fp4_kernels), loaded on first use; null
-        /// where the image has no tensor-core code for this GPU or is missing.</summary>
-        internal CudaFp4Kernels Fp4Kernels => LoadOnce(ref fp4Kernels, ref fp4State, CudaFp4Kernels.TryCreate);
+        /// where the image has no tensor-core code for this GPU or is missing. Its refusal is reported where an NVFP4
+        /// weight needs it (<see cref="WarnNvfp4WithoutFp4Kernels"/>): every prompt step's add-norm asks for it too.</summary>
+        internal CudaFp4Kernels Fp4Kernels => LoadOnce(ref fp4Kernels, ref fp4State, ref fp4Refusal, CudaFp4Kernels.TryCreate, null, null);
+
+        /// <summary>An NVFP4 weight is being made resident: warn once, with the reason, when the FP4 kernels are refused
+        /// here and its products therefore run without them.</summary>
+        internal void WarnNvfp4WithoutFp4Kernels()
+        {
+            if (Fp4Kernels == null)
+                CudaModuleRefusals.Process.Warn(CudaModuleRefusals.ModuleName(CudaFp4Kernels.PtxFileName), DeviceId, fp4Refusal,
+                    CudaModuleRefusals.Fp4Consequence);
+        }
 
         /// <summary>Rows an NVFP4 product takes on the q8 matvec (row-invariant) before the FP4 GEMMs: up to
         /// <see cref="CudaFp4Kernels.GemvMaxRows"/>, <see cref="CudaFp4Kernels.MultiSequenceGemvRows"/> while a step of
@@ -167,11 +178,13 @@ namespace TensorSharp.Cuda
 
         /// <summary>The recurrent-layer prefill kernels for this device (tensorsharp_ssm_prefill), loaded on first use;
         /// null where the module is missing or stale.</summary>
-        internal CudaSsmPrefillKernels SsmPrefillKernels => LoadOnce(ref ssmPrefillKernels, ref ssmPrefillState, CudaSsmPrefillKernels.TryCreate);
+        internal CudaSsmPrefillKernels SsmPrefillKernels => LoadOnce(ref ssmPrefillKernels, ref ssmPrefillState, ref ssmPrefillRefusal,
+            CudaSsmPrefillKernels.TryCreate, CudaSsmPrefillKernels.PtxFileName, CudaModuleRefusals.SsmPrefillConsequence);
 
         /// <summary>The flash prefill attention kernels for this device (tensorsharp_flash_prefill), loaded on first use;
         /// null where the module is missing or stale.</summary>
-        internal CudaFlashPrefillKernels FlashPrefillKernels => LoadOnce(ref flashPrefillKernels, ref flashPrefillState, CudaFlashPrefillKernels.TryCreate);
+        internal CudaFlashPrefillKernels FlashPrefillKernels => LoadOnce(ref flashPrefillKernels, ref flashPrefillState, ref flashPrefillRefusal,
+            CudaFlashPrefillKernels.TryCreate, CudaFlashPrefillKernels.PtxFileName, CudaModuleRefusals.FlashPrefillConsequence);
 
         /// <summary>Raised before a recorded step is launched (or recorded): host threads its kernels wait on spin up.</summary>
         internal event Action RecordedStepLaunching;
@@ -192,20 +205,17 @@ namespace TensorSharp.Cuda
             lock (ownedResources) ownedResources.Add(resource);
         }
 
-        private delegate bool ModuleFactory<T>(out T module, out string reason);
+        /// <summary>A module loaded on first use (<see cref="CudaModuleRefusals.LoadOnce"/>); a refusal is warned about once,
+        /// naming <paramref name="consequence"/>, unless that is null (the caller reports it where it matters).</summary>
+        private T LoadOnce<T>(ref T module, ref int state, ref string refusal, CudaModuleFactory<T> create, string ptxFileName,
+            string consequence) where T : class
+            => Volatile.Read(ref state) != 0 ? module : LoadFirst(ref module, ref state, ref refusal, create, ptxFileName, consequence);
 
-        private T LoadOnce<T>(ref T module, ref int state, ModuleFactory<T> create) where T : class
-        {
-            if (Volatile.Read(ref state) != 0) return module;
-            lock (this)
-            {
-                if (state != 0) return module;
-                Context.MakeCurrent();
-                bool loaded = create(out module, out _);
-                Volatile.Write(ref state, loaded ? 1 : 2);
-                return module;
-            }
-        }
+        private T LoadFirst<T>(ref T module, ref int state, ref string refusal, CudaModuleFactory<T> create, string ptxFileName,
+            string consequence) where T : class
+            => CudaModuleRefusals.LoadOnce(this, ref module, ref state, ref refusal, Context.MakeCurrent, create,
+                consequence == null ? null : reason => CudaModuleRefusals.Process.Warn(CudaModuleRefusals.ModuleName(ptxFileName),
+                    DeviceId, reason, consequence));
 
         public Storage Allocate(DType elementType, long elementCount)
         {

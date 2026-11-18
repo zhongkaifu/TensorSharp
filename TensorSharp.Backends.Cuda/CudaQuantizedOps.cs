@@ -1623,6 +1623,10 @@ namespace TensorSharp.Cuda
                     RepackNvfp4(allocator, fp4, devicePtr, rawBytes, checked((int)ne1), checked((int)ne0));
                     layout = Nvfp4PlanarType;
                 }
+                else if (ggmlType == 40 && CudaFp4Kernels.TakesWidth(ne0))
+                {
+                    allocator.WarnNvfp4WithoutFp4Kernels();
+                }
                 var entry = new DeviceWeight
                 {
                     DevicePtr = devicePtr,
