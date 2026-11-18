@@ -467,7 +467,8 @@ slot). A request of a scoped conversation that finished on the primary (N=1) cac
 is kept the same way when a fused step takes the model over, so a conversation does
 not lose its state because another chat arrived between two of its turns.
 
-On `--backend cuda` with one GPU, the shared decoder runtime accounts its device
+On `--backend cuda` with one GPU, the shared decoder runtime (every family on it: Qwen
+3.5/3.6/3.8, Qwen 3.8 Flash Next, Mistral 3, Hunyuan Dense) accounts its device
 memory itself, counting the large blocks the CUDA allocator caches as free (it gives
 them back on demand). A finished request's slot is retained as it is (donated, no
 copy): the conversation's next turn runs on it and replays the decode steps and
@@ -660,8 +661,9 @@ Request KV state is owned by `InferenceEngine`. The KV cache can be stored at re
 both the CLI and the server. The default is chosen automatically per model
 (`f16` when the model's weights are below F32, `f32` otherwise); the block-quantized tiers
 (`q8_0`, `q4_0`) run on the GGML backends' flash-attention path, and `q8_0` also
-on `--backend cuda`, whose executor's flash kernels read it directly (about half
-the bytes of `f16` a step; its slots, copies and growth halve too), while `q4_0`
+on `--backend cuda`, whose executor's flash kernels read it directly for every
+family on the shared decoder runtime (Qwen 3.5/3.6/3.8, Mistral 3, Hunyuan Dense;
+about half the bytes of `f16` a step; its slots, copies and growth halve too), while `q4_0`
 keeps a model off whole-forward graphs there. `q4_0` (~1/7 of f32) targets very
 long 128K–256K contexts where the KV cache dominates memory.
 
