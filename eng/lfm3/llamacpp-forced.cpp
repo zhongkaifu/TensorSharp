@@ -19,8 +19,9 @@
 //   --fa on|off|auto   flash attention (default auto)
 //   --kv f16|f32       K and V cache type (default f16); TensorSharp's ggml_cpu lane uses f16 for quantized and BF16
 //                      checkpoints unless KV_CACHE_DTYPE says otherwise
-//   --no-repack        keep weights in their GGUF layout (no CPU repacked buffer types; TensorSharp binds the mapped
-//                      GGUF and runs ggml-cpu's plain vec_dot products)
+//   --no-repack        keep weights in their GGUF layout (no CPU repacked buffer types), as TensorSharp's ggml_cpu
+//                      binds them with TS_GGML_CPU_REPACK=0 (ggml-cpu's plain vec_dot products); by default on ARM64 it
+//                      reads them from ggml-cpu's repacked layouts, as llama.cpp does without this option
 //   --ubatch N         physical batch rows (default 512); llama.cpp's own run at another prompt batch measures how far
 //                      its kernel choice alone moves the logits
 //   --force DIR        teacher-force the generated tokens of DIR/cases.json (another reference run, same prompts)

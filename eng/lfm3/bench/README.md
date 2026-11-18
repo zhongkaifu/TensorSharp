@@ -83,8 +83,8 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   Results under `artifacts/lfm3/cpu/vllm/<stamp>/`.
 - `cpu-matrix.sh QUANT pp|tg [ROUNDS] [DEPTHS]`: TensorSharp ggml_cpu against llama.cpp CPU for one quant, as the CPU
   baseline lays it out (prompts at 18 threads, decode at 12, flash attention on, `ab.py --quiet`): llama.cpp noblas,
-  noblas `--repack 0` (its weights placed as TensorSharp places them) and optionally the BLAS build; `TS_ARMS` adds
-  TensorSharp A/B arms (`'ts-new=PROBE=/path/Lfm3Probe.dll'`). Results under `artifacts/lfm3/cpu/<stamp>-...`.
+  noblas `--repack 0` (its weights in their GGUF layout, as TensorSharp places them with `TS_GGML_CPU_REPACK=0`) and
+  optionally the BLAS build; `TS_ARMS` adds TensorSharp A/B arms (`'ts-new=PROBE=/path/Lfm3Probe.dll'`). Results under `artifacts/lfm3/cpu/<stamp>-...`.
 - Managed CPU lane kernels: `benchmarks/CpuQuantBench shapes TYPES ROWS SHAPES [REPS]` times the managed quantized
   products at LFM3's shapes (`lfm3`, or `KxN,...`) and prints RESULT lines for `ab.py` (weight GB/s at one row with the
   weights rotated past the caches, GOPS above); `TS_CPU_THREADS` sets the pool. `Lfm3Probe ppl` prints a digest of

@@ -5,7 +5,7 @@
 #
 # usage: cpu-matrix.sh QUANT pp|tg [ROUNDS] [DEPTHS]
 #   pp: PROMPTS (default 128,512,2048) for TS ggml_cpu, llama.cpp noblas, noblas --repack 0 (llama.cpp with its
-#       weights placed as TensorSharp places them) and, with BLAS_ARM=1, the BLAS build; REPS (default 3) a round
+#       weights in their GGUF layout, as TensorSharp places them with TS_GGML_CPU_REPACK=0) and, with BLAS_ARM=1, the BLAS build; REPS (default 3) a round
 #   tg: tg128 at DEPTHS (default 0,4096) for TS, llama.cpp noblas and noblas --repack 0; 2 reps a round (1 past 8K)
 #   MODELS (default ~/work/models/lfm3), TPP / TTG (default 18 / 12), QUIET (ab.py --quiet, default 12),
 #   LLAMA_CPP_DIR (build-cpu and build-cpu-noblas under it), PROBE (an A/B arm's Lfm3Probe.dll, see ts-bench.sh),
