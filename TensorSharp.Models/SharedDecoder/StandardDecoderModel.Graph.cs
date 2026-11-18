@@ -310,6 +310,8 @@ namespace TensorSharp.Models
             public long Epoch;
             /// <summary><see cref="RecurrentState.BindingChanges"/> when the step was kept.</summary>
             public long Bindings;
+            /// <summary>The binding versions of the states the step binds when it was kept (<see cref="BindingStamp"/>).</summary>
+            public long Stamp;
             /// <summary>The step recorded on the device (an executor that records decode steps; one sequence).</summary>
             public IDecodeCapture Capture;
             public Tensor[] CaptureOutputs;
@@ -352,8 +354,35 @@ namespace TensorSharp.Models
                 r.Capacity[s] = slots[s].Capacity;
                 r.RopeDelta[s] = slots[s].RopeDelta;
             }
+            r.Stamp = BindingStamp(r.Recurrent);
             r.Bound = BoundStorages(slots);
             _decodeReplays[shape ?? ""] = r;
+        }
+
+        /// <summary>
+        /// Whether the buffers a kept step binds changed since it was kept (<paramref name="bindings"/> and
+        /// <paramref name="stamp"/> as it was kept, <paramref name="recurrent"/> its slots' states). Where recorded steps bind a
+        /// slot's buffers (<see cref="SlotBoundPolicies"/>) only the states it binds count (<see cref="BindingStamp"/>): a step
+        /// binds its own slots' states, compared by reference before it advances, and the freed verify buffer of CUDA error 700
+        /// changed the version of the state that held it. Elsewhere any state's change counts
+        /// (<see cref="RecurrentState.BindingChanges"/>), as before.
+        /// </summary>
+        private bool BindingsChanged(long bindings, long stamp, RecurrentState[][][] recurrent)
+            => SlotBoundPolicies ? stamp != BindingStamp(recurrent) : bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges);
+
+        /// <summary>The binding versions of every state of <paramref name="recurrent"/> (a step's slots' states, [slot][layer][rank]),
+        /// summed: versions only grow, so the sum changes exactly when one of them does.</summary>
+        private static long BindingStamp(RecurrentState[][][] recurrent)
+        {
+            long stamp = 0;
+            if (recurrent == null) return stamp;
+            foreach (RecurrentState[][] states in recurrent)
+                if (states != null)
+                    foreach (RecurrentState[] layer in states)
+                        if (layer != null)
+                            foreach (RecurrentState state in layer)
+                                if (state != null) stamp += state.BindingVersion;
+            return stamp;
         }
 
         private void DropDecodeReplay()
@@ -833,7 +862,7 @@ namespace TensorSharp.Models
             if (r == null || r.Epoch != _graphEpoch || r.Floor != floor || !SameFloors(r.Floors, floors) || r.Shape != shape
                 || r.Slots.Length != slots.Length)
                 return false;
-            if (r.Bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges))
+            if (BindingsChanged(r.Bindings, r.Stamp, r.Recurrent))
             {
                 DropDecodeReplay(shape, park: false);
                 return false;
@@ -1738,7 +1767,7 @@ namespace TensorSharp.Models
             public int[] Capacity, RopeDelta, Starts;
             public string Shape;
             public long Epoch;
-            public long Bindings;
+            public long Bindings, Stamp;
         }
 
         private RankedReplay _rankedReplay;
@@ -1762,6 +1791,7 @@ namespace TensorSharp.Models
                 r.Capacity[s] = slots[s].Capacity;
                 r.RopeDelta[s] = slots[s].RopeDelta;
             }
+            r.Stamp = BindingStamp(r.Recurrent);
             _rankedReplay = r;
         }
 
@@ -1781,7 +1811,7 @@ namespace TensorSharp.Models
             outputs = default;
             RankedReplay r = _rankedReplay;
             if (r == null || r.Epoch != _graphEpoch || r.Shape != shape || r.Slots.Length != slots.Length
-                || r.Bindings != System.Threading.Interlocked.Read(ref RecurrentState.BindingChanges)) return false;
+                || BindingsChanged(r.Bindings, r.Stamp, r.Recurrent)) return false;
             for (int s = 0; s < slots.Length; s++)
             {
                 Slot slot = slots[s];

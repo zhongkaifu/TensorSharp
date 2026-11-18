@@ -149,6 +149,10 @@ namespace TensorSharp.Models
         internal RecurrentState[][] RetainedStatesForTests(string payloadKey)
             => TryGetRetained(payloadKey, out Slot slot) ? slot.Recurrent : null;
 
+        /// <summary>A running request's states (tests).</summary>
+        internal RecurrentState[][] SlotStatesForTests(string requestId)
+            => TryGetSlot(requestId, out Slot slot) ? slot.Recurrent : null;
+
         /// <summary>The caches of a request's slot, or of a retained payload (tests compare them by reference).</summary>
         internal Tensor[][] SlotCachesForTests(string requestOrPayloadKey)
             => TryGetSlot(requestOrPayloadKey, out Slot slot) || TryGetRetained(requestOrPayloadKey, out slot) ? slot.K : null;

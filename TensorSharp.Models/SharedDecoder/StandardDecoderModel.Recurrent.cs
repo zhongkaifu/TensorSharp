@@ -83,13 +83,25 @@ namespace TensorSharp.Models
             /// <summary>Bytes of the buffers only a verify window needs, which <see cref="ReleaseSpecBuffers"/> frees.</summary>
             protected internal virtual long SpecBufferBytes => 0;
 
-            /// <summary>Counts every change of a state's graph-bound buffers (a verify buffer grown, or freed when its slot
+            /// <summary>Counts every change of any state's graph-bound buffers (a verify buffer grown, or freed when its slot
             /// was retained or pooled). A decode step kept to advance binds the buffers it was traced with, so it is never
             /// advanced or replayed across a change: a recorded verify window had written a freed verify buffer of the
-            /// pooled slot the next request took (CUDA error 700).</summary>
+            /// pooled slot the next request took (CUDA error 700). Where recorded steps bind a slot's buffers a kept step
+            /// compares the versions of its own states instead (<see cref="BindingVersion"/>).</summary>
             internal static long BindingChanges;
 
-            protected static void NoteBindingsChanged() => System.Threading.Interlocked.Increment(ref BindingChanges);
+            /// <summary>Changes of this state's graph-bound buffers. Where recorded steps bind a slot's buffers (the CUDA
+            /// executor) a kept step is checked against the versions of the states it binds alone: compared with
+            /// <see cref="BindingChanges"/>, a new conversation's first verify window (its states' buffers allocated) dropped
+            /// every other running request's kept steps and their recordings, which then recorded again (issue #376).</summary>
+            internal long BindingVersion { get; private set; }
+
+            /// <summary>This state's graph-bound buffers changed (<see cref="BindingVersion"/>, <see cref="BindingChanges"/>).</summary>
+            protected void NoteBindingsChanged()
+            {
+                BindingVersion++;
+                System.Threading.Interlocked.Increment(ref BindingChanges);
+            }
 
             /// <summary>Bytes of the state's tensors (a retained slot's footprint counts them with its caches).</summary>
             protected internal virtual long StateBytes => 0;

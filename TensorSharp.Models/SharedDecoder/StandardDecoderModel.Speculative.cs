@@ -79,8 +79,9 @@ namespace TensorSharp.Models
         /// <summary>
         /// A family moved buffers a cached graph binds. Plans keyed by identity never bind the moved ones again and stay for
         /// the steps that bind what did not move: a Qwen3.8 Flash Next request's first verify window grew 35 layers' verify
-        /// buffers, and each had dropped every plan and recording of every slot. Steps kept to advance see the move through
-        /// RecurrentState.BindingChanges. An executor that binds host addresses drops every graph.
+        /// buffers, and each had dropped every plan and recording of every slot. Steps kept to advance see the move through the
+        /// binding versions of their states (RecurrentState.NoteBindingsChanged). An executor that binds host addresses drops
+        /// every graph.
         /// </summary>
         protected void NoteGraphBindingsChanged()
         {
