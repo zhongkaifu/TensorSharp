@@ -62,7 +62,10 @@ namespace TensorSharp.Models.Graph
             long qa = (long)q, ka = (long)k, va = (long)v, ma = (long)mask, oa = (long)output;
             TensorSharp.Cpu.CpuParallel.For(kvHeads * qBlocks, task =>
             {
-                int kvHead = task / qBlocks, qb = task % qBlocks;
+                // The last query blocks first: under a causal mask a later block sees more keys, and the pool hands tasks out
+                // in index order, so the tasks claimed last are the shortest. A block's result does not depend on when, or on
+                // which thread, it runs.
+                int qb = qBlocks - 1 - task / kvHeads, kvHead = task % kvHeads;
                 int r0 = qb * QueryRows, r1 = Math.Min(nq, r0 + QueryRows);
                 RunBlock((float*)qa, qHeadStride, (byte*)ka, (byte*)va, kvHeadStride, half, heads, group, kvHead, nq, d, scale,
                     kind, floor, valid, (byte*)ma, maskRowStride, maskHalf, (float*)oa, r0, r1);
