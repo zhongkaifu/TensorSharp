@@ -344,6 +344,10 @@ namespace TensorSharp.Models
         /// (<see cref="GraphStep.TryRebase"/>; tests check a new request's drafts reuse the kept steps).</summary>
         internal int DraftRebases { get; private set; }
 
+        /// <summary>Tests: true for a kept step's shape fails its recording's next launch as a launch the device has no memory
+        /// for does (nothing launched; the step runs as usual and its recording is not tried again).</summary>
+        internal Func<string, bool> RecordedLaunchFailsForTests { get; set; }
+
         /// <summary>The last decode step, kept to run again one position on.</summary>
         private sealed class DecodeReplay
         {
@@ -371,6 +375,8 @@ namespace TensorSharp.Models
             public Tensor[] CaptureOutputs;
             public int Advances;
             public bool CaptureFailed;
+            /// <summary>A step over a block drafter's ring: the ring's <see cref="Slot.DraftRingOwners"/> when the step last ran.</summary>
+            public int RingOwners;
             /// <summary>The storages the step reads and writes in place (each slot's caches and recurrent states), as kept.</summary>
             public object[] Bound;
 
@@ -410,6 +416,7 @@ namespace TensorSharp.Models
             }
             r.Stamp = BindingStamp(r.Recurrent);
             r.Bound = BoundStorages(slots);
+            if (n == 1 && slots[0].DraftRing) r.RingOwners = slots[0].DraftRingOwners;
             _decodeReplays[shape ?? ""] = r;
         }
 
@@ -826,7 +833,7 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    if (!r.Capture.TryLaunch(attends, writeRows))
+                    if (RecordedLaunchFailsForTests?.Invoke(r.Shape) == true || !r.Capture.TryLaunch(attends, writeRows))
                     {
                         // Out of device memory (a 4K request beside Qwen3.8 Flash Next's ISTA pack and MTP head on an A40): every
                         // recording gives its memory back and this step runs as usual; this one is not recorded again.
@@ -956,6 +963,18 @@ namespace TensorSharp.Models
             Array.Copy(starts, r.Starts, starts.Length);
             _graphLru.Remove(r.Signature);
             _graphLru.AddFirst(r.Signature);
+            if (ring && slots.Length == 1 && r.RingOwners != slots[0].DraftRingOwners)
+            {
+                // The ring changed hands since the step last ran (a new request's drafts): a recording that failed for the
+                // last owner (a launch out of memory, a capture failing twice) is tried again. Kept across requests, a failed
+                // drafter step had run unrecorded for the rest of the process, where each request used to trace it afresh.
+                r.RingOwners = slots[0].DraftRingOwners;
+                if (r.CaptureFailed)
+                {
+                    r.CaptureFailed = false;
+                    r.Advances = 0;
+                }
+            }
             if (!TryRunRecorded(r, cached, slots, starts))
             {
                 if (cached.Plan is IGraphTensorOutputs keep) keep.KeepTensors = false;

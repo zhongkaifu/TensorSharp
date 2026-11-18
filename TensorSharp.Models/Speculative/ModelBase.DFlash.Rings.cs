@@ -284,6 +284,7 @@ namespace TensorSharp.Models
                 _dflashRingCarryEnd = -1;
             }
             SelectDFlashRing(previous);
+            OnDFlashRingOwnerChanged(ring.K);
             DFlashRingsContinued++;
             return true;
         }
@@ -365,6 +366,7 @@ namespace TensorSharp.Models
                 ring.Filled = ring.ValidFrom = ring.High = 0;
                 ring.CarryEnd = -1;
             }
+            OnDFlashRingOwnerChanged(ring.K);
         }
 
         private bool AnyKeptDFlashRing()
@@ -383,6 +385,10 @@ namespace TensorSharp.Models
                     lru = ring;
             return lru;
         }
+
+        /// <summary>A ring changed hands (a new request took it, or continued the context it kept): a model whose steps keep
+        /// state over a ring hears of it (StandardDecoderModel: a recording that failed for the last owner is tried again).</summary>
+        private protected virtual void OnDFlashRingOwnerChanged(Tensor[] ringK) { }
 
         /// <summary>Whether the device has room for <paramref name="bytes"/> of another ring beside what it keeps free: a ring is
         /// made to keep a finished request's context only then (a model that manages its device says; elsewhere yes).</summary>

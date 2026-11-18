@@ -47,6 +47,9 @@ namespace TensorSharp.Models
             /// recurrent state, and its steps' inputs are functions of their positions alone, so a step kept over it may run at
             /// any position (<see cref="GraphStep.TryRebase"/>).</summary>
             public bool DraftRing;
+            /// <summary>For a <see cref="DraftRing"/>: how often the ring changed hands (a request took it, or continued the
+            /// context it kept); a recording of a step over it that failed for one owner is tried again for the next.</summary>
+            public int DraftRingOwners;
         }
 
         private static long s_retainSerial;

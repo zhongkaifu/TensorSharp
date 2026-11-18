@@ -170,6 +170,57 @@ public sealed class GraphBlockDraftTests : IDisposable
     }
 
     /// <summary>
+    /// A block step over a ring whose recording failed to launch (the device out of memory) runs unrecorded for the rest of
+    /// that request, and records again once the ring changes hands: the next request's blocks launch their recording. Kept
+    /// across requests (the steps over a ring move behind for the next request), the failed step had stayed unrecorded for
+    /// the life of the process. Every block drafts bit for bit what steps traced at each call draft.
+    /// </summary>
+    [CudaTheory]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void ARingStepWhoseLaunchFailedRecordsAgainForTheRingsNextOwnerOnDirectCuda(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var (target, draft) = Fixtures(variant);
+        using var kept = new Qwen35RuntimeModel(target, BackendType.Cuda, 1, null, 1, draft);
+        using var traced = new Qwen35RuntimeModel(target, BackendType.Cuda, 1, null, 1, draft) { DecodeAdvanceDisabled = true };
+        string label = $"cuda {variant}";
+        // The block's recorded launches each request makes, the first one after the prompt of request 0 failing.
+        var launches = new int[2];
+        int request = 0, fail = 0;
+        kept.RecordedLaunchFailsForTests = shape =>
+        {
+            // (A block's kept step is keyed by its width too: "draft-dflash-block|w5|".)
+            if (!shape.Contains("dflash-block", StringComparison.Ordinal)) return false;
+            launches[request]++;
+            return Interlocked.Exchange(ref fail, 0) == 1;
+        };
+        var models = new IPerRequestDraftState[] { kept, traced };
+        List<string> mismatches = DraftBitwise(kept, traced, new[] { 21, 9 },
+            beforeRequest: r =>
+            {
+                request = r;
+                // Each request on its own ring: the first request's is given back, and the second takes it anew.
+                foreach (var model in models)
+                {
+                    if (r > 0) model.ReleaseDraftState($"req{r - 1}");
+                    model.BindDraftState($"req{r}");
+                }
+            },
+            afterPrompt: r =>
+            {
+                if (r == 0) fail = 1;
+            });
+        _output.WriteLine($"{label}: the block's recorded launches {launches[0]} in the first request (its first one failed), " +
+            $"{launches[1]} in the second; {kept.DecodeRecordings} recordings in all");
+        Assert.True(mismatches.Count == 0, $"{label}: {string.Join("; ", mismatches.Take(12))}");
+        Assert.Null(kept.GraphBlockDraftDeclineReason);
+        Assert.Equal(0, fail);
+        Assert.Equal(1, launches[0]);
+        Assert.True(launches[1] > 0, $"{label}: the block stayed unrecorded for the ring's next owner");
+    }
+
+    /// <summary>
     /// DFlash2's convolutions as a region (GraphFusion.DFlashConv) draft bit for bit what their ops draft alone, over 2, 3 and
     /// 4 taps (a block as wide as its taps too: the drafter refuses a wider convolution): on direct CUDA the region's kernel
     /// (ts_graph_dflash_conv_f32) serves them,

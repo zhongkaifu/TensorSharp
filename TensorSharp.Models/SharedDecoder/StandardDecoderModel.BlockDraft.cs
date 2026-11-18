@@ -145,6 +145,11 @@ namespace TensorSharp.Models
             return slot;
         }
 
+        private protected override void OnDFlashRingOwnerChanged(Tensor[] ringK)
+        {
+            if (_dflashRingSlots != null && _dflashRingSlots.TryGetValue(ringK, out Slot slot)) slot.DraftRingOwners++;
+        }
+
         /// <summary>A pooled ring given back (ModelBase.ReleaseIdleDFlashRings): the steps, recordings and graphs over it go,
         /// as a disposed slot's do.</summary>
         private protected override void OnDFlashRingDisposing(Tensor[] ringK)
