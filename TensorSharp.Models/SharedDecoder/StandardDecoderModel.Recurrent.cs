@@ -74,7 +74,14 @@ namespace TensorSharp.Models
 
             /// <summary>The slot holding this state no longer speculates (it was retained for prefix reuse): free what
             /// only a verify window needs; a later verify allocates it again.</summary>
-            protected internal virtual void ReleaseSpecBuffers() { }
+            /// <param name="keepInPlaceBuffers">Keep the small buffers a window that updates the state in place binds
+            /// (its saved inputs and conv history, under a megabyte a layer), so the steps recorded over them replay when the
+            /// slot runs again (a conversation's next turn takes its retained slot); free only what a window that keeps a
+            /// state after each row needs, which can be gigabytes a slot. False frees every verify buffer.</param>
+            protected internal virtual void ReleaseSpecBuffers(bool keepInPlaceBuffers) { }
+
+            /// <summary>Bytes of the buffers only a verify window needs, which <see cref="ReleaseSpecBuffers"/> frees.</summary>
+            protected internal virtual long SpecBufferBytes => 0;
 
             /// <summary>Counts every change of a state's graph-bound buffers (a verify buffer grown, or freed when its slot
             /// was retained or pooled). A decode step kept to advance binds the buffers it was traced with, so it is never
@@ -113,7 +120,7 @@ namespace TensorSharp.Models
             if (_recurrentPrimary == null) return;
             foreach (RecurrentState[] layer in _recurrentPrimary)
                 if (layer != null)
-                    foreach (RecurrentState state in layer) state?.ReleaseSpecBuffers();
+                    foreach (RecurrentState state in layer) state?.ReleaseSpecBuffers(keepInPlaceBuffers: false);
         }
 
         // ---------------------------------------------------------------- family hooks

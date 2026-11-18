@@ -18,15 +18,15 @@ namespace TensorSharp.Models
     /// <summary>
     /// Device memory on one direct-CUDA device (<see cref="DeviceRoomManaged"/>), which the model accounts and reclaims itself.
     /// Before it allocates a slot, copies one or runs a lone prompt's step, it makes room in a fixed order, the cheapest loss
-    /// first (<see cref="EnsureDeviceRoom"/>): finished requests' pooled slots, parked recordings, then finished conversations
-    /// the prefix cache keeps, the oldest first, and for a prompt step the cached graphs last. A new request whose slot cannot
-    /// fit waits beside running ones and is refused, with the numbers, when it runs alone; a running request's growth that
-    /// cannot fit fails with what holds the device. The prefix cache sees the device's deficit below its headroom
-    /// (<see cref="DeviceMemoryDeficitBytes"/>), and the allocator asks the model for memory when an allocation no site sized
-    /// finds the device full (<see cref="ReclaimForAllocator"/>). Before, room checks counted every block the allocator cached
-    /// as free, a prompt step's first reaction to pressure was to drop every cached graph, and a 47K-token request on a 32 GB
-    /// RTX PRO 4500 failed part way with CUDA error 2 (HTTP 500) where releasing a finished conversation would have made room
-    /// (issue #376).
+    /// first (<see cref="EnsureDeviceRoom"/>): finished requests' pooled slots, parked recordings, the window buffers retained
+    /// slots keep, then finished conversations the prefix cache keeps, the oldest first, and for a prompt step the cached graphs
+    /// last. A new request whose slot cannot fit waits beside running ones and is refused, with the numbers, when it runs
+    /// alone; a running request's growth that cannot fit fails with what holds the device. The prefix cache sees the device's
+    /// deficit below its headroom (<see cref="DeviceMemoryDeficitBytes"/>), and the allocator asks the model for memory when
+    /// an allocation no site sized finds the device full (<see cref="ReclaimForAllocator"/>). Before, room checks counted every
+    /// block the allocator cached as free, a prompt step's first reaction to pressure was to drop every cached graph, and a
+    /// 47K-token request on a 32 GB RTX PRO 4500 failed part way with CUDA error 2 (HTTP 500) where releasing a finished
+    /// conversation would have made room (issue #376).
     /// </summary>
     public abstract partial class StandardDecoderModel
     {
@@ -41,7 +41,7 @@ namespace TensorSharp.Models
         internal Func<(long Free, long Total)> DeviceRoomForTests { get; set; }
 
         /// <summary>How often each stage of <see cref="EnsureDeviceRoom"/> (and the allocator's reclaimer) freed something,
-        /// by stage: 1 cached blocks trimmed, 2 pooled slots, 3 parked recordings, 4 retained slots' window buffers (none yet),
+        /// by stage: 1 cached blocks trimmed, 2 pooled slots, 3 parked recordings, 4 retained slots' window buffers,
         /// 5 retained conversations, 6 the cached graphs.</summary>
         internal int[] DeviceRoomStages { get; } = new int[7];
 
@@ -137,7 +137,8 @@ namespace TensorSharp.Models
         /// its tensors do not each fail a cuMemAlloc and climb (nothing is lost);</item>
         /// <item>pooled slots, the largest first (they belong to no conversation);</item>
         /// <item>parked recordings that bind none of <paramref name="keep"/> (a later step records again), not for recordings;</item>
-        /// <item>(none yet: retained slots give up their window buffers when they are retained);</item>
+        /// <item>the window buffers the conversations the prefix cache keeps hold (<see cref="Retained"/>), the oldest first, never
+        /// one of <paramref name="keep"/> (the next verify on such a slot allocates them again and records its windows anew);</item>
         /// <item>with <paramref name="mayEvict"/>, the conversations the prefix cache keeps, the oldest first, each reported to
         /// it as reclaimed (their next turns prefill again), never one of <paramref name="keep"/>;</item>
         /// <item>for a prompt step, the cached graphs and every recording, which had been the first reaction.</item>
@@ -178,6 +179,22 @@ namespace TensorSharp.Models
                 {
                     DeviceRoomStages[3]++;
                     free = RoomFree(use);
+                }
+
+                // 4. The window buffers the conversations the prefix cache keeps hold, the oldest first, where they cover the
+                // shortfall (short of it, conversations go next, and the buffers of those that stay would be lost for nothing).
+                if (free < need && WindowBufferBytes(keep) >= need - free)
+                {
+                    bool buffers = false;
+                    foreach (Slot slot in _retainedSlots.Values.OrderBy(s => s.RetainedAt).ToList())
+                    {
+                        if (free >= need) break;
+                        if (slot.K == null || Holds(keep, slot) || ReleaseWindowBuffers(slot) <= 0) continue;
+                        buffers = true;
+                        NoteDeviceMemoryChanged();
+                        free = RoomFree(use);
+                    }
+                    if (buffers) DeviceRoomStages[4]++;
                 }
 
                 // 5. The conversations the prefix cache keeps, the oldest first.
@@ -259,6 +276,21 @@ namespace TensorSharp.Models
             long bytes = RecurrentStateBytes(slot);
             foreach (Tensor t in AllCacheTensors(slot.K)) bytes += t.Storage.ByteLength;
             foreach (Tensor t in AllCacheTensors(slot.V)) bytes += t.Storage.ByteLength;
+            return bytes;
+        }
+
+        /// <summary>The verify buffers the retained slots outside <paramref name="keep"/> kept (<see cref="Retained"/>): what stage 4
+        /// of <see cref="EnsureDeviceRoom"/> can free.</summary>
+        private long WindowBufferBytes(ReadOnlySpan<Slot> keep)
+        {
+            if (_retainedSlots is not { Count: > 0 }) return 0;
+            long bytes = 0;
+            foreach (Slot slot in _retainedSlots.Values)
+                if (slot.K != null && slot.Recurrent != null && !Holds(keep, slot))
+                    foreach (RecurrentState[] layer in slot.Recurrent)
+                        if (layer != null)
+                            foreach (RecurrentState state in layer)
+                                if (state != null) bytes += state.SpecBufferBytes;
             return bytes;
         }
 
@@ -403,7 +435,7 @@ namespace TensorSharp.Models
         /// Room for a copy of <paramref name="source"/> sized for <paramref name="capacityTokens"/> (<see cref="CopySlot"/>): a
         /// pooled slot that holds it, or a fresh one's room made as for a new slot (conversations released only with
         /// <paramref name="mayEvict"/>; never the source). A <paramref name="needed"/> copy (a request adopts it) is made wherever
-        /// it fits beside the headroom and the narrowest prompt step; an optional one (a checkpoint, a retained copy) only with
+        /// it fits beside the headroom and the narrowest prompt step; an optional one (a checkpoint) only with
         /// the whole room.
         /// </summary>
         private bool RoomForSlotCopy(Slot source, int capacityTokens, bool mayEvict, bool needed, string what)
@@ -485,7 +517,8 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// The allocator's rung 3: release towards <paramref name="bytes"/> what no running request uses - pooled slots, the
-        /// largest first, then the conversations the prefix cache keeps, the oldest first (each reported to it as reclaimed) -
+        /// largest first, the window buffers retained slots keep, then the conversations the prefix cache keeps, the oldest first
+        /// (each reported to it as reclaimed) -
         /// and return the bytes released. Only on the engine's thread, never while a graph is captured, never re-entered and
         /// never while slots are being changed (0 then): the slots' caches go at once, the steps and recordings that bind them
         /// at the model's next entry (<see cref="ForgetDeferredGraphs"/>), since an allocation may run inside a step that walks
@@ -512,6 +545,24 @@ namespace TensorSharp.Models
                     pooled = true;
                 }
                 if (pooled) DeviceRoomStages[2]++;
+                // The window buffers retained slots keep, where they cover what is asked: no step binds them (a retained slot's
+                // kept steps went when it was retained), and a parked recording over them is adopted only by their identity, which
+                // no new buffer has, or moved with every state pointer patched (TakeRelocated).
+                if (released < bytes && WindowBufferBytes(keep) >= bytes - released)
+                {
+                    long buffers = 0;
+                    foreach (Slot slot in _retainedSlots.Values.OrderBy(s => s.RetainedAt).ToList())
+                    {
+                        if (released + buffers >= bytes) break;
+                        if (slot.K != null && !Holds(keep, slot)) buffers += ReleaseWindowBuffers(slot);
+                    }
+                    if (buffers > 0)
+                    {
+                        released += buffers;
+                        DeviceRoomStages[4]++;
+                        NoteDeviceMemoryChanged();
+                    }
+                }
                 int conversations = 0;
                 long conversationBytes = 0;
                 if (released < bytes && _retainedSlots is { Count: > 0 })

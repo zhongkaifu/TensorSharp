@@ -112,16 +112,46 @@ namespace TensorSharp.Models
             return bytes;
         }
 
-        /// <summary>A slot entering the retained set no longer speculates: its states give up their verify buffers.</summary>
-        private static Slot Retained(Slot slot)
+        /// <summary>A slot entering the retained set no longer speculates: its states give up their verify buffers. Where recorded
+        /// steps bind a slot's buffers (<see cref="SlotBoundPolicies"/>) they keep the small ones an in-place window binds
+        /// (<see cref="RecurrentState.ReleaseSpecBuffers"/>): the conversation's next turn takes this slot, and its verify windows
+        /// replay what the finished request recorded; on a device short of memory they go later
+        /// (<see cref="ReleaseWindowBuffers"/>).</summary>
+        private Slot Retained(Slot slot)
         {
             if (slot != null) slot.RetainedAt = System.Threading.Interlocked.Increment(ref s_retainSerial);
+            bool keepInPlace = SlotBoundPolicies;
             if (slot?.Recurrent != null)
                 foreach (RecurrentState[] layer in slot.Recurrent)
                     if (layer != null)
-                        foreach (RecurrentState state in layer) state?.ReleaseSpecBuffers();
+                        foreach (RecurrentState state in layer) state?.ReleaseSpecBuffers(keepInPlace);
             return slot;
         }
+
+        /// <summary>Every verify buffer <paramref name="slot"/>'s states kept (a retained slot's, <see cref="Retained"/>); the bytes
+        /// freed.</summary>
+        private static long ReleaseWindowBuffers(Slot slot)
+        {
+            if (slot?.Recurrent == null) return 0;
+            long freed = 0;
+            foreach (RecurrentState[] layer in slot.Recurrent)
+                if (layer != null)
+                    foreach (RecurrentState state in layer)
+                        if (state != null)
+                        {
+                            freed += state.SpecBufferBytes;
+                            state.ReleaseSpecBuffers(keepInPlaceBuffers: false);
+                        }
+            return freed;
+        }
+
+        /// <summary>A retained payload's states (tests).</summary>
+        internal RecurrentState[][] RetainedStatesForTests(string payloadKey)
+            => TryGetRetained(payloadKey, out Slot slot) ? slot.Recurrent : null;
+
+        /// <summary>The caches of a request's slot, or of a retained payload (tests compare them by reference).</summary>
+        internal Tensor[][] SlotCachesForTests(string requestOrPayloadKey)
+            => TryGetSlot(requestOrPayloadKey, out Slot slot) || TryGetRetained(requestOrPayloadKey, out slot) ? slot.K : null;
 
         private bool TryGetRetained(string payloadKey, out Slot slot)
         {
@@ -138,5 +168,9 @@ namespace TensorSharp.Models
         public int PrivateHolderCount => _slots?.Count ?? 0;
 
         public int PrimaryCacheLength => _activeKey == null ? _cacheSeqLen : (_primary?.Length ?? 0);
+
+        /// <summary>The last retention (<see cref="IPrefixCacheModel.TryCaptureDonate"/>) kept a copy of the request's slot rather
+        /// than the slot itself.</summary>
+        public bool LastRetentionCopied { get; private set; }
     }
 }

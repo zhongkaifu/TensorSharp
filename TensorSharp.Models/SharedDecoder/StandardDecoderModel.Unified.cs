@@ -262,25 +262,29 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// A finished request's retention. Where recorded steps bind a slot's buffers
-        /// (<see cref="TensorSharp.Graph.GraphCapabilities.SlotBoundRecordings"/>, the CUDA executor), the slot holding exactly the
-        /// retained length is copied into the retained set and stays the request's, so its release returns it to the slot pool and
-        /// the next request runs on it, its recordings adopted where they are. Donated, the slot went with the retained state and
-        /// every request ran in a new one: each recorded step shape relocated or recorded again (Qwen3.8 Flash Next ISTA + MTP after
-        /// a 4K prompt: 102 against 130 tok/s over 64 tokens without the prefix cache) and the new slot's allocation sat in the
-        /// next request's time to first token (Qwen3.8-27B, a short prompt: 52 against 39 ms). Elsewhere the slot is donated.
+        /// A finished request's retention: its slot is donated to the retained set (zero copy), and the conversation's next turn
+        /// takes it. Where recorded steps bind a slot's buffers (<see cref="SlotBoundPolicies"/>, the CUDA executor) that turn's
+        /// decode steps and verify windows then replay the recordings the request parked there (<see cref="Retained"/> keeps the
+        /// buffers they bind). There a short slot is copied instead (<see cref="RetainsAsCopy"/>), into a pooled slot that holds
+        /// it: the slot stays the request's, so its release returns it to the pool and the next request - another
+        /// conversation's, as a benchmark's short prompts are - runs on it, its recordings adopted where they are. Donated, each
+        /// such request ran in a new slot (Qwen3.8-27B, a short prompt: 52 against 39 ms to the first token; Qwen3.8 Flash Next
+        /// ISTA + MTP after a 4K prompt: 102 against 130 tok/s over 64 tokens without the prefix cache). Copied whatever its size,
+        /// a long conversation paid a whole slot's allocation and copy at every turn's end (3.3 GB for Qwen3.8-27B at 47K tokens,
+        /// seconds on a device near full) and its next turn, on the copy, recorded its windows again (issue #376).
         /// </summary>
         bool IPrefixCacheModel.TryCaptureDonate(string requestId, string payloadKey, int length, out PayloadFootprint footprint)
         {
             footprint = default;
-            if (GraphExecutor?.Capabilities.SlotBoundRecordings == true && SupportsPrefixCheckpoints && !string.IsNullOrEmpty(payloadKey)
-                && TryGetSlot(requestId, out Slot slot) && length > 0 && slot.Length == length && RoomForRetainedCopy(slot))
+            LastRetentionCopied = false;
+            if (RetainsAsCopy(requestId, payloadKey, length, out Slot slot))
             {
                 _retainedSlots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
                 if (_retainedSlots.ContainsKey(payloadKey)) return false;
-                _retainedSlots.Add(payloadKey, Retained(CopySlot(slot, slot.Length)));
+                _retainedSlots.Add(payloadKey, Retained(CopySlot(slot, slot.Capacity)));
                 footprint = MeasureEndState(payloadKey);
                 RetainedByCopy++;
+                LastRetentionCopied = true;
                 return true;
             }
             return HolderPrefixCacheAdapter.TryCaptureDonate(this, requestId, payloadKey, length, out footprint);
@@ -289,16 +293,29 @@ namespace TensorSharp.Models
         /// <summary>Finished requests retained as a copy of their slot (tests check the route engaged).</summary>
         internal int RetainedByCopy { get; private set; }
 
-        /// <summary>A retained copy of <paramref name="slot"/> goes into a pooled slot that holds it, or the device has room for
-        /// it and one more slot as large (<see cref="RoomForTwoSlots"/>): the copy keeps two slots where a donation kept one,
-        /// which beside a full expert tier (Qwen3.8 Flash Next after a 16K prompt on an A40: 52.0 against 54.9 tok/s) cost more
-        /// than the recordings it keeps. On a device this model manages, the copy's room is made as a slot's without releasing a
-        /// conversation for it (<see cref="RoomForSlotCopy"/>); otherwise the slot is donated.</summary>
-        private bool RoomForRetainedCopy(Slot slot)
+        /// <summary>The rows a finished request's slot holds at most where it is retained as a copy (<see cref="RetainsAsCopy"/>):
+        /// about 7.7K tokens of Qwen3.8-27B's F16 K/V, a few milliseconds of device copy.</summary>
+        private const long RetainCopyMaxBytes = 512L << 20;
+
+        /// <summary>Tests stand in for <see cref="RetainCopyMaxBytes"/>.</summary>
+        internal long? RetainCopyMaxBytesForTests { get; set; }
+
+        /// <summary>
+        /// Whether a finished request's slot of exactly <paramref name="length"/> rows is retained as a copy: where recorded steps
+        /// bind slots, its rows are at most <see cref="RetainCopyMaxBytes"/>, and a pooled slot at least as large as it takes the
+        /// copy, so nothing is allocated (a copy keeps two slots where a donation keeps one, which beside a full expert tier cost
+        /// more than the recordings it kept: Qwen3.8 Flash Next after a 16K prompt on an A40, 52.0 against 54.9 tok/s).
+        /// </summary>
+        private bool RetainsAsCopy(string requestId, string payloadKey, int length, out Slot slot)
         {
-            if (DeviceRoomManaged) return RoomForSlotCopy(slot, slot.Length, mayEvict: false, needed: false, "a finished request's retained copy");
-            int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, slot.Length));
-            return (_slotPool != null && _slotPool.Exists(p => p.Capacity >= capacity)) || RoomForTwoSlots(capacity) == true;
+            slot = null;
+            if (!SlotBoundPolicies || !SupportsPrefixCheckpoints || string.IsNullOrEmpty(payloadKey) || length <= 0
+                || !TryGetSlot(requestId, out slot) || slot.Length != length || _slotBytesPerToken < 0
+                || (long)slot.Length * _slotBytesPerToken > (RetainCopyMaxBytesForTests ?? RetainCopyMaxBytes))
+                return false;
+            // The copy takes this capacity (CopySlot), a pooled slot's: the conversation's next turn holds as much as on its own.
+            int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, slot.Capacity));
+            return _slotPool?.Exists(p => p.Capacity >= capacity) == true;
         }
 
         /// <summary>
@@ -579,7 +596,7 @@ namespace TensorSharp.Models
         /// <summary>
         /// Where recorded steps bind slots (the CUDA executor), a checkpoint of <paramref name="length"/> tokens is copied into a
         /// pooled slot that holds it, or where the device has room for the copy and one more slot as large beside its headroom
-        /// (as a spare slot and a retained copy are made); otherwise there is none. The copy's slot was allocated where the
+        /// (as a spare slot is made); otherwise there is none. The copy's slot was allocated where the
         /// device had no room for it: after a 16K prompt beside Qwen3.8 Flash Next's expert tier on an A40 the allocator first
         /// gave the prompt's cached blocks back to the driver, 190-200 ms at the first decode step (52.9 against 56.5 tok/s
         /// without the prefix cache), where the direct engine took no checkpoint at all; after a 4K prompt the copy fit beside

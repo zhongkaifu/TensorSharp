@@ -775,12 +775,16 @@ namespace TensorSharp.Models
             public Tensor PleConvHistory { get; private set; }
             private int[] _verifyTokens = Array.Empty<int>();
 
-            protected internal override void ReleaseSpecBuffers()
+            /// <summary>The PLE history stays with the conv history it is sized beside (<paramref name="keepInPlaceBuffers"/>).</summary>
+            protected internal override void ReleaseSpecBuffers(bool keepInPlaceBuffers)
             {
-                base.ReleaseSpecBuffers();
+                base.ReleaseSpecBuffers(keepInPlaceBuffers);
+                if (keepInPlaceBuffers) return;
                 Free(PleConvHistory);
                 PleConvHistory = null;
             }
+
+            protected internal override long SpecBufferBytes => base.SpecBufferBytes + (PleConvHistory?.Storage.ByteLength ?? 0);
 
             public override bool EnsureSpecBuffers(int rows)
             {

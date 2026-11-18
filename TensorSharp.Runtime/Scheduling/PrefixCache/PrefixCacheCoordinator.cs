@@ -699,6 +699,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             && _model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(sequence.RequestId)
             && ReleaseOldestScopedPayload())
             captured = _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
+        // A model may keep a copy of the request's holder (the CUDA executor's short slots): the log says which.
+        bool copied = captured && _cacheModel is IPrefixCacheModelDiagnostics { LastRetentionCopied: true };
         PayloadOrigin origin = PayloadOrigin.Donation;
         bool conversionFailed = false;
         if (!captured && RetentionEnabled && primary && _tree.Caps.AdoptPrimaryOnDisplacement)
@@ -711,7 +713,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         }
         if (ReleaseDebug)
             _logger.LogInformation("[prefix-retain] {EngineRequestId} length={Length} primary={Primary} captured={Captured} origin={Origin}",
-                sequence.RequestId, length, primary, captured, origin);
+                sequence.RequestId, length, primary, captured, copied ? "Copy" : origin.ToString());
         if (captured)
         {
             bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin);

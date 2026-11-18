@@ -209,4 +209,7 @@ public interface IPrefixCacheModelDiagnostics
     int PrimaryCacheLength { get; }
     /// <summary>Decode-graph resets issued since load (<c>ModelBase.DecodeGraphResets</c>).</summary>
     long DecodeGraphResets { get; }
+    /// <summary>The last <see cref="IPrefixCacheModel.TryCaptureDonate"/> kept a copy of the request's holder rather than
+    /// the holder itself (the retention log names it); false after one that donated or failed. False by default.</summary>
+    bool LastRetentionCopied => false;
 }

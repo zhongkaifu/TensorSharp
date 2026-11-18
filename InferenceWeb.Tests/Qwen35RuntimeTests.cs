@@ -1487,9 +1487,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
 
     /// <summary>
     /// On direct CUDA, whose recorded steps bind a slot's buffers, the prefix cache's retention of a finished request
-    /// (<see cref="TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel.TryCaptureDonate"/>) copies its slot: the slot
-    /// returns to the pool and the next request replays the parked recordings on it, none moved to a new slot, and the kept
-    /// copy continues as the request did, bit for bit.
+    /// (<see cref="TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel.TryCaptureDonate"/>) copies a short slot into a
+    /// pooled one (a spare made beside its recorded decode steps): the slot returns to the pool and the next request replays
+    /// the parked recordings on it, none moved to a new slot, and the kept copy continues as the request did, bit for bit.
     /// </summary>
     [CudaFact]
     public void FinishedRequestsAreRetainedAsCopiesOnDirectCuda()
@@ -1516,6 +1516,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
 
         var (token, kept) = Decode("a", 40);
+        Assert.True(model.SlotPoolForTests.Pooled > 0, "no spare slot was made beside the recorded decode steps");
         Assert.True(cache.TryCaptureDonate("a", "kept", kept, out _));
         Assert.Equal(1, model.RetainedByCopy);
         Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { new[] { token } }, new[] { kept }, logits));
