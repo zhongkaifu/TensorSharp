@@ -85,7 +85,8 @@ extern "C" __global__ void ts_flash_prefill_caps(int* out)
 //
 // The _q8 kernels take a q8_0 cache (ggml's block_q8_0 rows: per 32 values an F16 scale d then 32 int8 codes, 34 bytes, so
 // HD / 32 * 34 bytes a row, [nKv][cap] rows) and run the F16 kernels' arithmetic on its values: each 32-key tile's raw rows
-// stream through the same two-stage cp.async pipeline, and every thread of the block - the warps a decode row or a verify
+// stream through a ring of TS_FP_Q8_STAGES (three) cp.async stages, two tiles in flight ahead of the one being dequantized
+// (the F16 kernels' pipeline has two stages), and every thread of the block - the warps a decode row or a verify
 // window leaves idle among them - dequantizes them into one F16 tile pair, value = RN_F16(code * d) (__hmul2: code * d is exact
 // in F32), before the warps compute exactly as the F16 kernel does from its tile. A q8_0 cache then answers as the F16 kernel
 // over the F16 cache of its values, bit for bit, with half the bytes read.

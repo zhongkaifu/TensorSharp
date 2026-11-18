@@ -111,6 +111,24 @@ public sealed class CudaPrefillModuleTests
             "refresh the committed PTX with the source (nvcc 13.0.88, DEVELOPMENT.md).");
     }
 
+    /// <summary>The q8_0 flash kernels' raw-tile ring: the stage count the source compiles (TS_FP_Q8_STAGES, which sizes their
+    /// TsFpAttnSmemQ8) is the one the launchers size their dynamic shared memory by (CudaFlashPrefillKernels.Q8Stages), and the
+    /// module header's description of the _q8 pipeline names that constant (it had described the F16 kernels' two stages).</summary>
+    [Fact]
+    public void Q8StageCount_MatchesTheLaunchers()
+    {
+        string text = File.ReadAllText(Source("flash_prefill"));
+        var define = Regex.Match(text, @"(?m)^[ \t]*#[ \t]*define[ \t]+TS_FP_Q8_STAGES[ \t]+(\d+)\b");
+        Assert.True(define.Success, "tensorsharp_flash_prefill.cu defines no TS_FP_Q8_STAGES.");
+        Assert.True(int.Parse(define.Groups[1].Value) == CudaFlashPrefillKernels.Q8Stages,
+            $"TS_FP_Q8_STAGES is {define.Groups[1].Value} in the source but CudaFlashPrefillKernels.Q8Stages is " +
+            $"{CudaFlashPrefillKernels.Q8Stages}: the launchers would size the _q8 kernels' shared memory for another ring.");
+        int q8 = text.IndexOf("// The _q8 kernels take a q8_0 cache", StringComparison.Ordinal);
+        Assert.True(q8 >= 0, "the module header no longer describes the _q8 kernels");
+        int end = text.IndexOf("// ----", q8, StringComparison.Ordinal);
+        Assert.Contains("TS_FP_Q8_STAGES", end < 0 ? text[q8..] : text[q8..end]);
+    }
+
     /// <summary>The PTX text of entry <paramref name="name"/>: from its .entry line to the next entry's .globl marker.</summary>
     private static string EntryBody(string ptx, string name)
     {
