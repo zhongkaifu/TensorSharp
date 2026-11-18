@@ -947,7 +947,21 @@ namespace TensorSharp.Models
                         byte* weightPtr = (byte*)weightAddress;
                         float* outputPtr = (float*)outputAddress;
 
-                        for (int col = startCol; col < endCol; col++)
+                        int col = startCol;
+                        if (rowCount == 1 && HasDot4Rows(type) && (weightRowBytes <= Dot4RowsMaxRowBytes || type == GgmlTensorType.NVFP4))
+                        {
+                            // A decode row against four weight rows at a time (ManagedQuantizedOps.Arm.cs): each the per-row bits.
+                            // Short rows only (four adjacent rows read as one stream; four long rows apart read slower than one
+                            // row after another, CpuQuantBench shapes: -5 to -13 % at K = 7680), NVFP4 at every length (+9-22 %).
+                            for (; col + 4 <= endCol; col += 4)
+                            {
+                                byte* w = weightPtr + (long)col * weightRowBytes;
+                                Vector128<float> r4 = DotQuantized4Rows(type, w, w + weightRowBytes, w + 2L * weightRowBytes,
+                                    w + 3L * weightRowBytes, activationPtr, inDim);
+                                r4.Store(outputPtr + col);
+                            }
+                        }
+                        for (; col < endCol; col++)
                         {
                             byte* weightRow = weightPtr + (long)col * weightRowBytes;
                             for (int row = 0; row < rowCount; row++)

@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.Intrinsics;
 
 namespace InferenceWeb.Tests;
 
@@ -141,6 +142,49 @@ public class ManagedQuantArmTests
             for (int c = 0; c < n; c++)
                 Assert.True(BitConverter.SingleToInt32Bits(expected[r * outStride + c]) == BitConverter.SingleToInt32Bits(actual[r * outStride + c]),
                     $"BF16 rows={rows} K={k} N={n} [{r},{c}]: {expected[r * outStride + c]:R} vs {actual[r * outStride + c]:R}");
+    }
+
+    /// <summary>The four-row decode matvec (Q4_K, Q6_K, Q4_0, Q8_0, NVFP4) against the per-row dot, lane by lane, bit for bit.</summary>
+    [ArmDotTheory]
+    [InlineData(GgmlTensorType.Q4_K, 256)]
+    [InlineData(GgmlTensorType.Q4_K, 2048)]
+    [InlineData(GgmlTensorType.Q4_K, 7680)]
+    [InlineData(GgmlTensorType.Q6_K, 256)]
+    [InlineData(GgmlTensorType.Q6_K, 2048)]
+    [InlineData(GgmlTensorType.Q6_K, 7680)]
+    [InlineData(GgmlTensorType.Q4_0, 96)]
+    [InlineData(GgmlTensorType.Q4_0, 2048)]
+    [InlineData(GgmlTensorType.Q8_0, 160)]
+    [InlineData(GgmlTensorType.Q8_0, 2048)]
+    [InlineData(GgmlTensorType.NVFP4, 64)]
+    [InlineData(GgmlTensorType.NVFP4, 2048)]
+    public unsafe void FourRowMatvec_IsBitIdenticalToThePerRowDot(GgmlTensorType type, int k)
+    {
+        var rng = new Random(500 + (int)type + k);
+        Assert.True(ManagedQuantizedOps.HasDot4Rows(type));
+        Assert.True(ManagedQuantizedOps.TryGetActivationPlan(type, k, out int actBytes));
+        byte[] weights = RandomWeights(rng, type, 12, k);
+        int rowBytes = weights.Length / 12;
+        float[] x = new float[k];
+        byte[] act = new byte[actBytes];
+        for (int trial = 0; trial < 3; trial++)
+        {
+            for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * (trial == 1 ? 1e-3f : 3f);
+            fixed (float* xp = x)
+            fixed (byte* ap = act)
+            fixed (byte* wp = weights)
+            {
+                ManagedQuantizedOps.QuantizeActivationRow(type, xp, ap, k);
+                byte* w = wp + (long)trial * 4 * rowBytes;
+                var four = ManagedQuantizedOps.DotQuantized4Rows(type, w, w + rowBytes, w + 2 * rowBytes, w + 3 * rowBytes, ap, k);
+                for (int lane = 0; lane < 4; lane++)
+                {
+                    float expected = ManagedQuantizedOps.DotQuantizedRow(type, w + lane * rowBytes, ap, k);
+                    Assert.True(BitConverter.SingleToInt32Bits(expected) == BitConverter.SingleToInt32Bits(four.GetElement(lane)),
+                        $"{type} K={k} trial {trial} lane {lane}: per-row {expected:R} vs four-row {four.GetElement(lane):R}");
+                }
+            }
+        }
     }
 
     [ArmDotFact]
