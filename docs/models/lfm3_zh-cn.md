@@ -47,30 +47,42 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
 - **CPU 路径的质量（2026-11-18，M5 Pro，CPU 优化之后）：** 在相同 GGUF 上把 ggml_cpu 与托管 CPU 执行器同 llama.cpp
   （`d3c3e242c`，仅 CPU 构建）的 CPU 后端对比。CPU 上的矩阵乘会把激活值舍入到 8 位，因此两个只在求和顺序上不同、都正确的
   CPU 实现，其 logits 会相差 2-4%：llama.cpp 自己的不同 CPU 内核之间就是如此（320 行教师强制对比中相对 L2 中位数为
-  1.7-3.8e-2）。沿 llama.cpp 的生成历史做教师强制（5 个提示，14 到 9,294 个 token，各 64 步），两条路径在 Q8_0、Q4_K_M、
-  QAD-Q4_0 与 NVFP4 上都落在这一噪声底上：每个文件 320 行中 top-1 差异 ggml_cpu 为 1-5 处、托管 CPU 为 0-9 处，均位于近似
-  平局处（llama.cpp 自己的前两名 logit 相差不到 0.5），只有 Q4_K_M 的两行例外，而 llama.cpp 自己的内核变体在这两行上也翻转
-  或相差 18%；相对 L2 中位数为 1.8-4.7e-2。BF16 在两条路径上都不再舍入激活值：与 llama.cpp CPU 运行相差 4e-3，与其 Metal
+  1.7-3.8e-2）。沿 llama.cpp 的生成历史做教师强制（5 个提示，14 到 9,294 个 token，各 64 步），ggml_cpu 落在这一噪声底的
+  1.03-1.16 倍，托管 CPU 为 1.17-1.37 倍（与 llama.cpp 关闭 llamafile 与重排的内核变体比较相对 L2 中位数）：Q8_0 与
+  QAD-Q4_0 上为 1.8 与 2.0-2.1e-2（变体 1.7e-2），Q4_K_M 上为 4.4e-2 与 4.7e-2（变体 3.8e-2），NVFP4 上为 1.9e-2 与
+  2.4e-2（变体 1.8e-2，ggml_cpu 的 5 处翻转中有 4 处变体自己也翻转）。每个文件
+  320 行中 top-1 差异 ggml_cpu 为 1-5 处、托管 CPU 为 0-9 处，均位于近似平局处（llama.cpp 自己的前两名 logit 相差不到
+  0.5），只有 Q4_K_M 的两行例外，而 llama.cpp 自己的内核变体在这两行上也翻转或相差 18%。两条路径离 llama.cpp Metal 运行的
+  距离与 llama.cpp 自己的 CPU 运行相同（量化文件上相差在 7% 以内）。ForcedLogitProbe 的通过门槛（相对 L2 1e-3，即 GPU
+  路径的标准）在每次 CPU 运行上都不通过，llama.cpp 的变体也一样。BF16 在两条路径上都不再舍入激活值：与 llama.cpp CPU 运行相差 4e-3，与其 Metal
   运行相差 4e-4，比 llama.cpp 自己的 CPU 运行离 Metal 近十倍。Q4_K_M 的困惑度（32 x 1,024 token）ggml_cpu 为 26.79、托管
   CPU 为 26.75，llama.cpp CPU 为 26.79。20 个服务器场景在两条路径上均通过，8 个 CPU 语音合成测试也通过（引擎内合成与独立
   合成逐位一致）。GSM8K（前 200 题，关闭思考，Q4_K_M）ggml_cpu 得分 79.0%、托管 CPU 为 80.0%，llama.cpp CPU 为
-  81.0%（配对 McNemar 检验 p = 0.50 与 0.82；Metal 上两个引擎都是 81.5%）。CPU 上的贪心回复会在几百个字符内于近似平局
+  81.0%（配对 McNemar 检验 p = 0.50 与 0.82；Metal 上两个引擎都是 81.5%）。这次运行先在 50 题时停过一次，当时
+  ggml_cpu 以 37 对 43 落后（p = 0.07；对比更早一次 llama.cpp CPU 运行时 p = 0.03）。只按回复内容计分（关闭思考时客户端
+  读到的部分：TensorSharp 把多余 `</think>` 之前的文字移入 `reasoning_content`，llama-server 则留在内容里），两条路径都是
+  76.5%，llama.cpp 为 81.0%（p = 0.09）。CPU 上的贪心回复会在几百个字符内于近似平局
   处与 llama.cpp CPU 的回复分叉，llama.cpp 自己的 CPU 与 Metal 回复之间也是如此。4 个并发对话在托管 CPU 上与逐个运行逐 token 一致；在 ggml_cpu 上会在近似平局处
   分叉（与 llama.cpp 相同），因为批量解码步经 ggml-cpu 的 GEMM 读取重排后的权重，而单条解码经其 GEMV
   （`TS_GGML_CPU_REPACK=0` 可恢复一致，但提示速度减半）。以下在优化前验证过、未重做：8K 与 32K 的大海捞针、CLI 检查、
   LFM3-Omni 的图像与音频输入（提示 token 数与 llama-server 相同）以及语音输出（回读识别的词错误率为 0）。
 - **CPU 路径的速度（2026-11-18，6 个性能核 + 12 个能效核的 M5 Pro，`eng/lfm3/bench/run-matrix.sh cpu cpu-serve
   cpu-omni`）：** TensorSharp 用默认设置，llama.cpp 取其最佳（Accelerate BLAS 与纯 ggml-cpu 两种构建中较快者，提示用 18
-  线程，解码用 16 线程——12 线程要慢 6-12%），开启 flash attention，在空闲机器上交替 3 轮；数据表见[基准测试](#基准测试)。
-  *ggml_cpu* 在每个文件上解码都快于 llama.cpp（深度 0 与 4K 时 1.03-1.16 倍，16K 时 1.56 倍，BF16 为 3.6 倍——ggml-cpu 的
-  BF16 点积在 ARM 上是标量实现），512 token 及以上的提示为 0.94-1.00 倍（NVFP4 为 1.11-1.20 倍），128 token 的提示为
-  0.94-0.98 倍；服务单路请求时解码与 llama-server 一样快（每 token 6.2 对 6.6 ms），首 token 延迟长 50 ms（512 token 提示
-  0.60-0.64 对 0.53-0.59 s），4 路并发的总吞吐为其 1.0-1.08 倍；图像与音频编码耗时为 llama.cpp 的一半，语音为 6.8-7.0 倍
-  实时，llama.cpp 为 4.2 倍。*托管 CPU* 的 NVFP4 提示为 llama.cpp 的 1.4-2.0 倍、BF16 解码为 3.5 倍，Q4_K_M 512 token 及以上
-  的提示为 0.92-0.97 倍，Q8_0 与 Q4_0 的提示为 0.77-0.84 倍，量化文件的解码为 0.72-0.87 倍，BF16 提示为 llama.cpp
-  Accelerate 构建的 0.44 倍。与 vLLM 0.34 的 CPU 后端相比（fp16，带其 macOS short-conv 变通；它在这里没有量化 CPU 路径），
-  512 token 提示：ggml_cpu 在 Q4_K_M 上首 token 0.64 s 对 1.9 s，解码每 token 6.2 对 37.9 ms；BF16 上为 1.1 s 与 17.2 ms。
-  相关开关见[环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的-ggml-cpu-后端开关)。
+  线程，解码用 16 线程——12 线程在深度 0 与 4K 时慢 4-11%，BF16 与 16K 时慢 21%，18 线程慢 6%），开启 flash attention，在
+  空闲机器上交替 3 轮（服务测试为 2 轮）。解码取两边各 5 次运行的中位数，之前先跑一次不计时的运行（评审后重测：第一版矩阵
+  拿 TensorSharp 两次运行中较快的一次对比 llama.cpp 两次的平均，掩盖了托管路径 JIT 预热的那一次）。数据表见
+  [基准测试](#基准测试)。*ggml_cpu* 在每个文件上解码都快于 llama.cpp（深度 0 与 4K 时 1.03-1.16 倍，16K 时 1.60 倍，BF16
+  为 3.9 倍——ggml-cpu 的 BF16 点积在 ARM 上是标量实现），512 token 及以上的提示为 0.93-1.00 倍（NVFP4 为 1.11-1.20
+  倍），128 token 的提示为 0.91-0.97 倍；同一格在不同测量批次之间会变动最多 5%（Q4_K_M pp512 在六个批次中为 0.93-0.98
+  倍）。服务单路请求时解码与 llama-server 一样快（每 token 6.4-6.5 对 6.5-6.6 ms），首 token 延迟长 20-75 ms（512 token
+  提示 0.60-0.65 对 0.53-0.60 s），4 路并发的总吞吐为其 0.97-1.08 倍；512 x 512 图像编码耗时约为 llama.cpp 的 0.6 倍
+  （热编码 0.58 倍，进程内首次编码 0.66 倍），音频编码为 0.48-0.50 倍（含 mel 前端为 0.50-0.63 倍），两个引擎都用 18
+  线程；语音为 6.8-7.0 倍实时，llama.cpp 为 4.2 倍。*托管 CPU* 的 NVFP4 提示为 llama.cpp 的 1.4-2.0 倍、BF16 解码为
+  3.5 倍，Q4_K_M 512 token 及以上的提示为 0.92-0.95 倍，Q8_0 与 Q4_0 的同类提示为 0.77-0.84 倍，这三个文件的 128 token
+  提示为 0.54-0.70 倍（JIT 完成分层编译后为 0.70-0.88 倍），量化文件的解码为 0.70-0.86 倍（16K 时 0.94 倍），BF16 提示为
+  llama.cpp Accelerate 构建的 0.44 倍。与 vLLM 0.34 的 CPU 后端相比（fp16，带其 macOS short-conv 变通；它在这里没有量化
+  CPU 路径），512 token 提示：ggml_cpu 在 Q4_K_M 上首 token 0.64 s 对 1.9 s，解码每 token 6.2 对 37.9 ms（该测试工具的
+  TPOT；llama-server 在其中为 6.6 ms）；BF16 上为 1.1 s 与 17.2 ms。相关开关见[环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的-ggml-cpu-后端开关)。
 - **尚未验证：** 设备上的 TensorAgent 应用，以及所有 CUDA 与 Vulkan 路径（`config/lfm3-1.7b-nvfp4.json` 从未运行过）。vLLM 只在 CPU 上对比过（见上文）；SGLang 未对比（其 CPU 后端只支持 x86 AMX）。
 
 ## 运行
@@ -267,28 +279,30 @@ token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用�
 
 M5 Pro（6 个性能核 + 12 个能效核，2026-11-18，LFM3-1.7B）上的 CPU 路径：每秒 token 数，交替 3 轮的中位数
 （`eng/lfm3/bench/run-matrix.sh cpu`）。TensorSharp 用默认设置（提示 18 线程；解码 ggml_cpu 16 线程、托管 CPU 18 线程）。
-llama.cpp（`d3c3e242c`）取其最佳：Accelerate BLAS 与纯 ggml-cpu 两种构建中较快者，提示 18 线程，解码取 12 与 16 线程中较快者。
-ppN 为 N 个 token 的提示，tg 为在 0 或 4,096 个 token 之后解码 128 个 token。
+llama.cpp（`d3c3e242c`）取其最佳：Accelerate BLAS 与纯 ggml-cpu 两种构建中较快者，提示 18 线程，解码 16 线程（其最快的
+线程数）。ppN 为 N 个 token 的提示，tg 为在 0 或 4,096 个 token 之后解码 128 个 token：两边各 5 次运行的中位数，之前先跑一次
+不计时的运行，评审后另测 3 轮（每次运行前机器忙碌度 0-3%）。提示的同一格在不同批次之间会变动最多 5%：Q4_K_M pp512 在六个
+批次中为 llama.cpp 的 0.93-0.98 倍。
 
 | 文件 | 引擎 | pp128 | pp512 | pp2048 | pp8192 | tg | 4K 处 tg |
 |---|---|---|---|---|---|---|---|
-| Q4_K_M | TS ggml_cpu | 953 | 960 | 885 | 759 | **171** | **151** |
-| | TS cpu（托管） | 575 | 898 | 849 | 712 | 132 | 107 |
-| | llama.cpp | 1001 | 978 | 919 | 759 | 162 | 139 |
-| Q8_0 | TS ggml_cpu | 1178 | 1170 | 1160 | 917 | **117** | **107** |
-| | TS cpu（托管） | 880 | 1014 | 934 | 776 | 89 | 81 |
-| | llama.cpp | 1255 | 1249 | 1161 | 923 | 114 | 102 |
-| QAD-Q4_0 | TS ggml_cpu | 1223 | 1222 | 1158 | 933 | **189** | **164** |
-| | TS cpu（托管） | 699 | 994 | 939 | 783 | 129 | 110 |
-| | llama.cpp | 1292 | 1288 | 1190 | 938 | 181 | 152 |
-| NVFP4 | TS ggml_cpu | 380 | 628 | 645 | 561 | **153** | **135** |
-| | TS cpu（托管） | **777** | **820** | **791** | **665** | 117 | 93 |
-| | llama.cpp | 399 | 566 | 537 | 488 | 134 | 117 |
-| BF16 | TS ggml_cpu | 267 | 487 | 491 | - | **57** | - |
+| Q4_K_M | TS ggml_cpu | 953 | 960 | 885 | 759 | **171** | **148** |
+| | TS cpu（托管） | 575 | 898 | 849 | 712 | 128 | 107 |
+| | llama.cpp | 1001 | 978 | 919 | 759 | 163 | 139 |
+| Q8_0 | TS ggml_cpu | 1178 | 1170 | 1160 | 917 | **118** | **107** |
+| | TS cpu（托管） | 880 | 1014 | 934 | 776 | 92 | 81 |
+| | llama.cpp | 1255 | 1249 | 1161 | 923 | 115 | 103 |
+| QAD-Q4_0 | TS ggml_cpu | 1223 | 1222 | 1158 | 933 | **190** | **164** |
+| | TS cpu（托管） | 699 | 994 | 939 | 783 | 131 | 107 |
+| | llama.cpp | 1292 | 1288 | 1190 | 938 | 182 | 153 |
+| NVFP4 | TS ggml_cpu | 380 | 628 | 645 | 561 | **152** | **135** |
+| | TS cpu（托管） | **777** | **820** | **791** | **665** | 114 | 94 |
+| | llama.cpp | 399 | 566 | 537 | 488 | 133 | 116 |
+| BF16 | TS ggml_cpu | 267 | 487 | 491 | - | **60** | - |
 | | TS cpu（托管） | 224 | 228 | 223 | - | 55 | - |
 | | llama.cpp | 274 | 520 | 508 | - | 16 | - |
 
-16K token 上下文时 Q4_K_M 的解码为 112（ggml_cpu）、63（托管）与 72（llama.cpp）token/s。托管 CPU 的短提示在最初几次运行中
+16K token 上下文时 Q4_K_M 的解码为 115（ggml_cpu）、67（托管）与 71（llama.cpp）token/s（不计时运行一次后测一次，3 轮）。托管 CPU 的短提示在最初几次运行中
 会随 .NET JIT 对内核的分层编译而变快；稳定状态（10 次运行）下其 pp128 在 Q4_K_M / Q8_0 / QAD-Q4_0 上为 838 / 935 / 892，
 llama.cpp 为 952 / 1238 / 1270。CPU 优化之前（`feature/lfm3` 052db7ed，在同一轮中测量），ggml_cpu 在 Q4_K_M / Q8_0 /
 QAD-Q4_0 / NVFP4 上的 pp512 为 498 / 605 / 508 / 361（BF16：22，取自 CPU 基线报告），托管 CPU 在五个文件上为
@@ -302,12 +316,13 @@ QAD-Q4_0 / NVFP4 上的 pp512 为 498 / 605 / 508 / 361（BF16：22，取自 CPU
 - 无论客户端顺序如何，一条消息中的静态图都排在视频之前；以 `video_url` 发送的视频在它们之间没有位置。
 - 提示中的嵌套工具 schema 会被展平（工具调用语法读取客户端原始 schema）。
 - QAD-Q4_0 文件尚未列入 TensorAgent 目录，等待与 Q4_K_M 的质量与速度测量。
-- M5 Pro 上 CPU 路径与 llama.cpp CPU 构建的差距（见[基准测试](#基准测试)）：ggml_cpu 在重排量化格式上的提示落后 0-6%，
+- M5 Pro 上 CPU 路径与 llama.cpp CPU 构建的差距（见[基准测试](#基准测试)）：ggml_cpu 在重排量化格式上的提示落后 0-9%，
   主要在 128-512 token（矩阵乘持平；每个 512 行的步骤多出约 25-30 ms 的提示 K/V 复制，而 llama.cpp 原地写入），其 256 token
-  以下的 NVFP4 提示仍走 ggml 自己的 NVFP4 乘法，速度只有托管 CPU NEON GEMM 的一半。托管 CPU 的量化文件解码为 0.72-0.87 倍（其线程池
-  在小矩阵乘上要等 6 + 12 个快慢不一的核中最慢的一个，图解释器每步也有几个百分点的开销），Q8_0 / Q4_0 提示为 0.77-0.84 倍
-  （llama.cpp 的重排 GEMM 使用 i8mm，而 .NET 10 没有暴露该指令），BF16 提示为 llama.cpp Accelerate 构建的 0.44 倍，音频编码器
-  耗时为 llama.cpp 的 1.1-2 倍。经 TensorSharp.Server.Host 服务时，托管 CPU 的解码约为 78 token/s，而引擎基准为 132
+  以下的 NVFP4 提示仍走 ggml 自己的 NVFP4 乘法，速度只有托管 CPU NEON GEMM 的一半。托管 CPU 的量化文件解码为 0.70-0.86 倍（其线程池
+  在小矩阵乘上要等 6 + 12 个快慢不一的核中最慢的一个，图解释器每步也有几个百分点的开销），Q8_0 / Q4_0 的 512 token 及以上提示为 0.77-0.84 倍
+  （llama.cpp 的重排 GEMM 使用 i8mm，而 .NET 10 没有暴露该指令），128 token 提示为 0.54-0.70 倍（JIT 完成分层编译后为
+  0.70-0.88 倍），BF16 提示为 llama.cpp Accelerate 构建的 0.44 倍，音频编码器
+  耗时为 llama.cpp 的 1.1-2 倍。经 TensorSharp.Server.Host 服务时，托管 CPU 的解码约为 78 token/s，而引擎基准为 128
   （ggml_cpu：153 对 171）：其线程池占用全部核心，服务器自身的线程会在每次汇合时拖住它。`TS_CPU_THREADS=16` 时服务解码为
   94 token/s；像 ggml_cpu 那样为解码单独设定宽度是尚待完成的修复。
 - ggml_cpu 在重排副本之外还保留自己在加载时生成的主机副本（融合的 gate|up 与重排列的注意力权重）：Q4_K_M 峰值占用约
