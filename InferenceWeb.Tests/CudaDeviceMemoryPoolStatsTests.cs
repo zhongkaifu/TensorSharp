@@ -317,6 +317,46 @@ public class CudaDeviceMemoryPoolStatsTests
         Assert.Equal(cached, pool.LargeCachedBytes);
     }
 
+    /// <summary>At the large-block cap, a return gives back only sizes not used since its own size was last used. An op whose
+    /// activations together pass the cap (a working set the cache cannot hold) keeps the sizes that fit, as refusing did:
+    /// giving back the least recently used size instead gave up each size of the op for the next one, and the op allocated and
+    /// freed every size in turn (twice the driver calls of refusing). A size the work stopped using still goes back first.</summary>
+    [Fact]
+    public void AtTheLargeCap_AnOpLargerThanTheCapKeepsTheSizesThatFit_AndGivesBackOnlyStaleOnes()
+    {
+        var sizes = new Dictionary<IntPtr, long>();
+        var frees = new List<long>();
+        long next = 0x100000;
+        int allocations = 0;
+        var pool = new CudaDeviceMemoryPool(64 * MiB, 256 * MiB, enabled: true,
+            bytes => { allocations++; var p = new IntPtr(next += 0x1000); sizes[p] = bytes; return p; },
+            p => { frees.Add(sizes[p]); sizes.Remove(p); },
+            shardCount: 1, largeCachedBytesCap: 512 * MiB, mayRelievePressure: () => true);
+
+        // One block of a K/V slot given up, cached.
+        Cache(pool, 150 * MiB);
+        int staleAllocations = allocations;
+
+        // Each op holds five activations at once, 600 MiB in all, then returns them.
+        long[] op = { 100 * MiB, 110 * MiB, 120 * MiB, 130 * MiB, 140 * MiB };
+        const int Ops = 20;
+        for (int n = 0; n < Ops; n++)
+        {
+            var held = new List<(IntPtr Ptr, long Bytes)>();
+            foreach (long size in op)
+                held.Add((pool.Rent(size, out long bytes), bytes));
+            foreach ((IntPtr ptr, long bytes) in held)
+                pool.Return(ptr, bytes);
+        }
+
+        // The stale block made room once; then the four sizes that fit stay cached and only the fifth goes to the driver.
+        Assert.Equal(op.Length + Ops - 1, allocations - staleAllocations);
+        Assert.Equal(1 + Ops, frees.Count);
+        Assert.Equal(150 * MiB, frees[0]);
+        Assert.All(frees.GetRange(1, Ops), bytes => Assert.Equal(140 * MiB, bytes));
+        Assert.Equal((100 + 110 + 120 + 130) * MiB, pool.LargeCachedBytes);
+    }
+
     /// <summary>A large rent counts as a hit or a miss like a small one, so the cuMemAlloc count covers every allocation.</summary>
     [Fact]
     public void Rent_CountsLargeHitsAndMisses()

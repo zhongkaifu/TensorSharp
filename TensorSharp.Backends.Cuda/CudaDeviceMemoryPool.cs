@@ -281,8 +281,8 @@ namespace TensorSharp.Cuda
         /// the driver, unasked by their holder and without a synchronize (<see cref="TrimLarge"/>), where
         /// <see cref="mayRelievePressure"/> allows it; the bytes freed (0 where it is not allowed). It runs on whichever thread
         /// returns a block, the GC finalizer's included.</summary>
-        internal long RelievePressure(long bytes, long keepBlockBytes)
-            => mayRelievePressure == null || !mayRelievePressure() ? 0 : TrimLarge(bytes, keepBlockBytes);
+        internal long RelievePressure(long bytes, long keepBlockBytes, long usedBefore = long.MaxValue)
+            => mayRelievePressure == null || !mayRelievePressure() ? 0 : TrimLarge(bytes, keepBlockBytes, usedBefore);
 
         public bool TryReturnToPool(IntPtr ptr, long allocationBytes)
         {
@@ -306,9 +306,17 @@ namespace TensorSharp.Cuda
                 // Refusing it instead handed every returned activation to the driver while the blocks of K/V slots given up
                 // earlier filled the cache: 577 refusals, ~650 synchronizing cuMemFree/cuMemAlloc pairs and 613 ms of
                 // cuMemFree in one 829 ms prompt step of Qwen3.8-27B at a 69K context on an RTX PRO 4500 (issue #376).
-                long over = LargeCachedBytes + allocationBytes - largeCap;
+                // Only sizes not used since this size was last used go back: a size used since then is in the working set
+                // of the op this block served. Where an op's blocks together pass the cap, least recently used alone gave up
+                // each size of the op for the next one, and every size was allocated and freed again at every op.
+                long over, usedBefore;
+                lock (largeSync)
+                {
+                    over = largeCachedBytes + allocationBytes - largeCap;
+                    usedBefore = largeLastUse.TryGetValue(allocationBytes, out long used) ? used : largeUseClock;
+                }
                 if (over > 0)
-                    RelievePressure(over + PressureReliefSlackBytes, keepBlockBytes: allocationBytes);
+                    RelievePressure(over + PressureReliefSlackBytes, keepBlockBytes: allocationBytes, usedBefore);
 
                 lock (largeSync)
                 {
@@ -490,7 +498,11 @@ namespace TensorSharp.Cuda
         /// full freed every cached block of every size: 1,614 cuMemFree calls and 1,091 ms in one prompt step of
         /// Qwen3.8-27B at a 24K context (issue #376).
         /// </summary>
-        public long TrimLarge(long bytes, long keepBlockBytes = 0)
+        public long TrimLarge(long bytes, long keepBlockBytes = 0) => TrimLarge(bytes, keepBlockBytes, long.MaxValue);
+
+        /// <summary><see cref="TrimLarge(long, long)"/> over the sizes last rented or returned before the use-clock value
+        /// <paramref name="usedBefore"/> only (the large-block cap's relief: sizes not used since the returning size was).</summary>
+        internal long TrimLarge(long bytes, long keepBlockBytes, long usedBefore)
         {
             if (bytes <= 0) return 0;
             List<IntPtr> release = null;
@@ -500,8 +512,13 @@ namespace TensorSharp.Cuda
                 if (largeCachedBytes == 0) return 0;
                 var sizes = new List<(long LastUse, long Size)>(largePool.Count);
                 foreach (KeyValuePair<long, Stack<IntPtr>> bucket in largePool)
-                    if (bucket.Value.Count > 0 && bucket.Key != keepBlockBytes)
-                        sizes.Add((largeLastUse.TryGetValue(bucket.Key, out long used) ? used : 0, bucket.Key));
+                {
+                    if (bucket.Value.Count == 0 || bucket.Key == keepBlockBytes)
+                        continue;
+                    long used = largeLastUse.TryGetValue(bucket.Key, out long u) ? u : 0;
+                    if (used < usedBefore)
+                        sizes.Add((used, bucket.Key));
+                }
                 sizes.Sort((a, b) => a.LastUse != b.LastUse ? a.LastUse.CompareTo(b.LastUse) : b.Size.CompareTo(a.Size));
                 foreach ((long _, long size) in sizes)
                 {
