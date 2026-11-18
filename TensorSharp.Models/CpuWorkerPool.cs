@@ -216,7 +216,9 @@ namespace TensorSharp.Models
                 _body = null;
                 Interlocked.Increment(ref _jobSeq);
 
-                Exception error = _error;
+                // A block's failure is recorded before the block is counted (Fail), so once _done == end every failure
+                // of this job is visible here, and none can land after this job returns.
+                Exception error = Volatile.Read(ref _error);
                 if (error != null)
                 {
                     _error = null;
@@ -266,33 +268,46 @@ namespace TensorSharp.Models
         /// block of a later job.</summary>
         private void RunBlocks(Action<int> body, long start, long end)
         {
-            try
+            while (true)
             {
-                while (true)
+                long i = Volatile.Read(ref _next);
+                if (i < start || i >= end) return;
+                if (Interlocked.CompareExchange(ref _next, i + 1, i) != i) continue;
+                try
                 {
-                    long i = Volatile.Read(ref _next);
-                    if (i < start || i >= end) return;
-                    if (Interlocked.CompareExchange(ref _next, i + 1, i) != i) continue;
-                    try { body((int)(i - start)); }
-                    finally { Interlocked.Increment(ref _done); }
+                    body((int)(i - start));
+                }
+                catch (Exception ex)
+                {
+                    Fail(ex, start, end);
+                    return;
+                }
+                Interlocked.Increment(ref _done);
+            }
+        }
+
+        /// <summary>
+        /// A block of the job [start, end) threw: record the first failure, claim the rest of the range so the other
+        /// threads wind down, and only then count the failed block (and the claimed rest) done. The order is the point:
+        /// the submitter returns once every block is counted, so a failure recorded after its block was counted (by a
+        /// <c>finally</c> that counted it, which runs before the <c>catch</c> that recorded it) was lost when that block
+        /// finished last, or surfaced in the NEXT job after the submitter had cleared <see cref="_error"/> for it.
+        /// </summary>
+        private void Fail(Exception ex, long start, long end)
+        {
+            Interlocked.CompareExchange(ref _error, ex, null);   // a full fence: visible before _done moves
+            long counted = 1;                                   // the block that threw
+            while (true)
+            {
+                long i = Volatile.Read(ref _next);
+                if (i < start || i >= end) break;
+                if (Interlocked.CompareExchange(ref _next, end, i) == i)
+                {
+                    counted += end - i;
+                    break;
                 }
             }
-            catch (Exception ex)
-            {
-                // Claim the rest of the range so the other threads wind down (and count
-                // it done), and hand the first failure back to the submitter.
-                Interlocked.CompareExchange(ref _error, ex, null);
-                while (true)
-                {
-                    long i = Volatile.Read(ref _next);
-                    if (i < start || i >= end) return;
-                    if (Interlocked.CompareExchange(ref _next, end, i) == i)
-                    {
-                        Interlocked.Add(ref _done, end - i);
-                        return;
-                    }
-                }
-            }
+            Interlocked.Add(ref _done, counted);
         }
 
         /// <summary>The job in flight, read consistently (retried while the submitter rewrites it).</summary>
