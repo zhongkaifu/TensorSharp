@@ -63,6 +63,21 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   cancellation hold. Prompt processing past 16K tokens is slower than llama.cpp's
   (about 3,000 vs 5,400 tokens/s at 32K on an M5 Pro); decoding after a long prompt is
   on par.
+- **CPU lanes (2026-11-17, M5 Pro):** ggml_cpu and the managed CPU executor against
+  llama.cpp's CPU backend on the same GGUFs. CPU products round their activations to 8
+  bits, so two correct CPU implementations that differ only in summation order land 2-4%
+  apart in the logits: llama.cpp's own CPU kernel variants do (median relative L2
+  1.7-3.8e-2, teacher-forced over 320 rows), and both TensorSharp lanes sit at that floor
+  (1.9-4.7e-2 on Q8_0, Q4_K_M, QAD-Q4_0 and NVFP4; 4e-3 on BF16), as close to the GPU
+  result as llama.cpp's CPU run is. Perplexity equals llama.cpp's CPU to 0.05% (Q8_0
+  25.93, Q4_K_M 26.79, NVFP4 26.52). On Q4_K_M, GSM8K-50 with thinking off scores 40
+  (ggml_cpu) and 44 (managed) against llama.cpp CPU's 43; needles at 8K and 32K are all
+  found (ggml_cpu; 8K checked on the managed CPU); the 20 server scenarios, the CLI
+  checks, 4 concurrent conversations (each equal to its one-at-a-time run), LFM3-Omni
+  image and audio input and speech output (the replies transcribe back at word error rate
+  0) pass on both lanes. Greedy CPU replies part from llama.cpp's CPU replies within a few
+  hundred characters (5 of 50 GSM8K replies identical), as llama.cpp's own CPU and Metal
+  replies part from each other (8 of 50).
 - **Not yet validated:** the TensorAgent app on a device, and every CUDA and Vulkan route
   (`config/lfm3-1.7b-nvfp4.json` in particular has never run). vLLM and SGLang were not
   compared yet.

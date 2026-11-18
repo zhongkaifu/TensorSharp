@@ -44,6 +44,15 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
   命中且回复一致；33 条指令遵循与 35 个函数调用用例得分相同或更高，差异来自下文两项行为（关闭思考时的游离推理、
   `tool_choice`）。4 与 16 个并发对话、n-gram 推测解码（回复一致）与客户端取消均正常。超过 16K token 的提示处理慢于
   llama.cpp（M5 Pro 上 32K 时约 3,000 对 5,400 token/s）；长提示之后的解码速度相当。
+- **CPU 路径（2026-11-17，M5 Pro）：** 在相同 GGUF 上把 ggml_cpu 与托管 CPU 执行器同 llama.cpp 的 CPU 后端对比。CPU
+  上的矩阵乘会把激活值舍入到 8 位，因此两个只在求和顺序上不同、都正确的 CPU 实现，其 logits 会相差 2-4%：llama.cpp
+  自己的不同 CPU 内核之间就是如此（在 320 行教师强制对比中相对 L2 中位数为 1.7-3.8e-2），TensorSharp 的两条路径都落在
+  这一噪声底上（Q8_0、Q4_K_M、QAD-Q4_0、NVFP4 为 1.9-4.7e-2，BF16 为 4e-3），与 GPU 结果的距离和 llama.cpp 的 CPU 运行
+  相同。困惑度与 llama.cpp CPU 相差不超过 0.05%（Q8_0 25.93、Q4_K_M 26.79、NVFP4 26.52）。Q4_K_M 上，关闭思考的
+  GSM8K 前 50 题得分为 40（ggml_cpu）与 44（托管），llama.cpp CPU 为 43；8K 与 32K 的大海捞针全部命中（ggml_cpu；托管 CPU
+  验证了 8K）；20 个服务器场景、CLI 检查、4 个并发对话（每个都与单独运行时一致）、LFM3-Omni 的图像与音频输入以及语音输出
+  （回读识别的词错误率为 0）在两条路径上均通过。CPU 上的贪心回复在几百个字符内就会与 llama.cpp CPU 的回复分叉（GSM8K
+  50 题中 5 题完全相同），llama.cpp 自己的 CPU 与 Metal 回复之间也是如此（50 题中 8 题相同）。
 - **尚未验证：** 设备上的 TensorAgent 应用，以及所有 CUDA 与 Vulkan 路径（`config/lfm3-1.7b-nvfp4.json` 从未运行过）。尚未与 vLLM、SGLang 对比。
 
 ## 运行
