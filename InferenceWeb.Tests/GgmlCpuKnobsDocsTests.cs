@@ -58,6 +58,14 @@ public class GgmlCpuKnobsDocsTests
         Assert.Contains("env_threads(\"TS_GGML_CPU_DECODE_THREADS\")", code);
         Assert.Contains("std::max(perf, prompt - 2)", code);
         Assert.Contains("std::getenv(\"TS_GGML_CPU_REPACK\")", code);
+        // A graph without weight products keeps the pool the last step left (the rows say so), and a repack copy that
+        // cannot be made warns.
+        Assert.Contains("product_rows <= 0 ? -1", header);
+        Assert.Contains("warn_repack_skipped(t, \"out of memory\")", code);
+        Assert.Contains("the last step left set", Row(en, "TS_GGML_CPU_THREADS", "env_var_feature_matrix.md"));
+        Assert.Contains("沿用上一步留下的线程池", Row(zh, "TS_GGML_CPU_THREADS", "env_var_feature_matrix_zh-cn.md"));
+        Assert.Contains("one-time warning", Row(en, "TS_GGML_CPU_REPACK", "env_var_feature_matrix.md"));
+        Assert.Contains("打印一次警告", Row(zh, "TS_GGML_CPU_REPACK", "env_var_feature_matrix_zh-cn.md"));
         Match rows = Regex.Match(header, @"kCpuDecodeRows\s*=\s*(\d+)\s*;");
         Assert.True(rows.Success, "kCpuDecodeRows not found");
         foreach ((string markdown, string file) in new[] { (en, "env_var_feature_matrix.md"), (zh, "env_var_feature_matrix_zh-cn.md") })

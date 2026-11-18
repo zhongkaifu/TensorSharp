@@ -153,6 +153,20 @@ namespace tsg
             }();
             return v;
         }
+
+        // A weight that was to be repacked stays in its GGUF layout (its copy could not be allocated or bound): said
+        // once a process, naming the first such weight, since its products then run at about half the prompt speed.
+        void warn_repack_skipped(const ggml_tensor* t, const char* why)
+        {
+            static std::atomic<bool> warned{false};
+            if (warned.exchange(true)) return;
+            std::fprintf(stderr,
+                "[ggml-cpu] %s for the CPU_REPACK copy of weight '%s' (%s, %.1f MiB): it stays in its GGUF layout on the "
+                "plain dot kernels, about half the prompt speed of the repacked ones (said once; later weights that hit "
+                "this are not named)\n",
+                why, t->name, ggml_type_name(t->type), ggml_nbytes(t) / (1024.0 * 1024.0));
+            std::fflush(stderr);
+        }
     }
 
     bool cpu_repack_enabled()
@@ -239,6 +253,7 @@ namespace tsg
             if (!ok[i] || !used[i]) continue;
             ggml_tensor* t = weights[i].tensor;
             CpuRepackedRef& e = g_repacked[weights[i].key];
+            bool made_now = false;
             if (e == nullptr || e->type != t->type || e->ne0 != t->ne[0] || e->ne1 != t->ne[1]
                 || (!e->ready && made_here.count(e.get()) == 0))
             {
@@ -250,19 +265,24 @@ namespace tsg
                 if (made->buf == nullptr)
                 {
                     g_repacked.erase(weights[i].key);
-                    continue;   // out of memory for the copy: this weight stays on the plain kernels
+                    warn_repack_skipped(t, "out of memory");   // this weight stays on the plain kernels
+                    continue;
                 }
                 ggml_backend_buffer_set_usage(made->buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                 e = made;
                 made_here.insert(made.get());
-                fresh.push_back(i);
+                made_now = true;
             }
             // Binding runs the buffer's init_tensor, which gives the leaf its repack traits (tensor->extra).
             if (ggml_backend_tensor_alloc(e->buf, t, ggml_backend_buffer_get_base(e->buf)) != GGML_STATUS_SUCCESS)
             {
+                // (Erasing the entry frees a copy made here; it is not in `fresh`, which only takes bound copies: the
+                // repack below would otherwise set an unbound tensor's bytes and mark an erased entry ready.)
                 g_repacked.erase(weights[i].key);
+                warn_repack_skipped(t, "binding failed");
                 continue;
             }
+            if (made_now) fresh.push_back(i);
             bound[i] = 1;
             held.push_back(e);
         }
@@ -407,20 +427,33 @@ namespace tsg
         g_pools.push_back(p);
     }
 
+    // cpu_pool_for_step's cases, checked at compile time.
+    static_assert(cpu_pool_for_step(0) == -1, "a graph without weight products keeps the pool it finds");
+    static_assert(cpu_pool_for_step(1) == 1 && cpu_pool_for_step(kCpuDecodeRows) == 1, "decode-width steps: decode pool");
+    static_assert(cpu_pool_for_step(kCpuDecodeRows + 1) == 0 && cpu_pool_for_step(512) == 0, "prompt-width steps: prompt pool");
+
     void cpu_pools_select(ggml_backend_t backend, std::int64_t product_rows)
     {
+        const int choice = cpu_pool_for_step(product_rows);
+        if (choice < 0) return;
         std::lock_guard<std::mutex> lock(g_pools_mu);
         for (CpuPools& p : g_pools)
         {
             if (p.backend != backend) continue;
             if (p.decode == nullptr) return;
-            const bool decode = product_rows > 0 && product_rows <= kCpuDecodeRows;
+            const bool decode = choice == 1;
             ggml_threadpool_t want = decode ? p.decode : p.prompt;
             if (want == p.current) return;
             // Switching pauses the pool it leaves (its threads sleep instead of polling for the next graph).
             ggml_backend_cpu_set_threadpool(backend, want);
             ggml_backend_cpu_set_n_threads(backend, decode ? p.n_decode : p.n_prompt);
             p.current = want;
+            if (debug_log())
+            {
+                std::fprintf(stderr, "[ggml-cpu] %s pool (%d threads) for a step whose products read %lld rows\n",
+                    decode ? "decode" : "prompt", decode ? p.n_decode : p.n_prompt, static_cast<long long>(product_rows));
+                std::fflush(stderr);
+            }
             return;
         }
     }

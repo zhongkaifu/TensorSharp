@@ -60,8 +60,10 @@ namespace tsg
     /// the prompt pool; the pools are appended to `owned` (freed at shutdown).
     void cpu_pools_create(ggml_backend_t backend, std::vector<ggml_threadpool_t>& owned);
 
-    /// Runs the next graph on the pool for its width: `product_rows` is the most activation rows any weight product of
-    /// the graph reads (0 when it has none). Steps of at most kCpuDecodeRows rows run on the decode pool.
+    /// Runs the next graph on the pool for its width (cpu_pool_for_step): `product_rows` is the most activation rows any
+    /// weight product of the graph reads (0 when it has none). Only the graph runtime (TSGgml_GraphRun) selects a pool:
+    /// every other ggml compute on the CPU backend runs on the pool the last graph step left set (the prompt pool until
+    /// a decode step runs).
     void cpu_pools_select(ggml_backend_t backend, std::int64_t product_rows);
 
     /// Forgets every backend's pools (before TSGgml_Shutdown frees them).
@@ -69,4 +71,12 @@ namespace tsg
 
     /// Decode-width steps: one sequence's token, or a few sequences' (a small batch still reads every weight once).
     constexpr std::int64_t kCpuDecodeRows = 4;
+
+    /// The pool a graph step runs on: 1 the decode pool (weight products of at most kCpuDecodeRows activation rows), 0
+    /// the prompt pool (wider products), -1 the pool the previous step used (no weight products: an auxiliary graph
+    /// between two decode steps would otherwise pause the decode pool and resume it again around itself).
+    constexpr int cpu_pool_for_step(std::int64_t product_rows)
+    {
+        return product_rows <= 0 ? -1 : product_rows <= kCpuDecodeRows ? 1 : 0;
+    }
 }
