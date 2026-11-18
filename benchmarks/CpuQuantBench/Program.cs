@@ -7,6 +7,7 @@
 //   dotnet run -c Release --project benchmarks/CpuQuantBench batch           # MoE: many jobs in one call
 //   dotnet run -c Release --project benchmarks/CpuQuantBench perrow [quant]  # per-row path GB/s table
 //   dotnet run -c Release --project benchmarks/CpuQuantBench dg <gguf> cpu|ggml_cpu [reps] [width] [multi|step]
+//   dotnet run -c Release --project benchmarks/CpuQuantBench shapes q4_k,q8_0 1,512 lfm3 [reps]  # RESULT lines (ab.py)
 //
 // "gemm" runs every (M, K, N) shape through the per-row path (PerRow) and
 // the multi-row GEMM (AVX-512 and AVX2 kernels) in ONE process, checks the GEMM
@@ -25,6 +26,12 @@
 // per-row path per quant type for rowCount 1 and 4, next to what the default
 // (Auto) routing does with the same call. Decode tok/s for a model is
 // ~ (bytes read per token) / (GB/s here).
+//
+// "shapes TYPES ROWS SHAPES [REPS]" times the default routing (what a model runs) at the given
+// row counts and weight shapes ("lfm3" = LFM3-1.7B's products, or KxN,KxN,...) and prints
+// eng/lfm3/bench/ab.py's "RESULT name median min max" lines: weight GB/s at one row (weights
+// rotated over >= 384 MB of copies so every call reads DRAM, as a decoded token does), GOPS
+// (2*M*N*K/s) above one row. An A/B builds each arm into its own directory and alternates them.
 //
 // "dg" profiles DiffusionGemma end to end (structured read or one 256-canvas
 // diffusion step) with the model's per-stage forward timing; run it with
@@ -48,6 +55,8 @@ switch (mode)
     case "batch":
         RunBatchTable();
         return 0;
+    case "shapes":
+        return RunShapes(args.Skip(1).ToArray());
     case "gemm":
     {
         string typeFilter = args.Length > 1 ? args[1].ToLowerInvariant() : "all";
@@ -344,6 +353,8 @@ static byte[] BuildRandom(Random rng, GgmlTensorType type, int outDim, int inDim
             case GgmlTensorType.Q3_K:
                 WriteHalf(raw, sb + blockBytes - 2, 0.01f + 0.02f * (float)rng.NextDouble());
                 break;
+            case GgmlTensorType.NVFP4:
+                break;   // UE4M3 sub-scales: every byte decodes
             default:
                 throw new NotSupportedException(type.ToString());
         }
@@ -525,4 +536,92 @@ static int RunDg(string[] a)
     }
     model.PrintForwardTiming();
     return 0;
+}
+
+static int RunShapes(string[] a)
+{
+    if (a.Length < 3)
+    {
+        Console.Error.WriteLine("usage: shapes TYPES ROWS SHAPES [REPS]   e.g. shapes q4_k,q6_k 1,4,512 lfm3 5");
+        return 2;
+    }
+    var types = a[0].Split(',').Select(t => ParseShapeType(t)).ToArray();
+    var rows = a[1].Split(',').Select(int.Parse).ToArray();
+    var shapes = a[2] == "lfm3"
+        ? new (int k, int n)[] { (2048, 7680), (7680, 2048), (2048, 6144), (2048, 2048), (2048, 512) }
+        : a[2].Split(',').Select(s => { var p = s.Split('x'); return (int.Parse(p[0]), int.Parse(p[1])); }).ToArray();
+    int reps = a.Length > 3 ? int.Parse(a[3]) : 5;
+    Console.Error.WriteLine($"INFO shapes TS_CPU_THREADS={Environment.GetEnvironmentVariable("TS_CPU_THREADS") ?? "default"} cores={Environment.ProcessorCount}");
+    foreach (var (name, type) in types)
+        foreach (var (k, n) in shapes)
+            foreach (int m in rows)
+            {
+                double[] rates = BenchShape(type, m, k, n, reps);
+                Array.Sort(rates);
+                string unit = m == 1 ? "gbs" : "gops";
+                Console.WriteLine($"RESULT {name}-m{m}-{k}x{n}-{unit} {rates[rates.Length / 2]:F2} {rates[0]:F2} {rates[^1]:F2}");
+            }
+    return 0;
+}
+
+static (string name, GgmlTensorType type) ParseShapeType(string t)
+{
+    t = NormalizeQuant(t);
+    return t switch
+    {
+        "q4_0" => (t, GgmlTensorType.Q4_0),
+        "q8_0" => (t, GgmlTensorType.Q8_0),
+        "q4_k" => (t, GgmlTensorType.Q4_K),
+        "q5_k" => (t, GgmlTensorType.Q5_K),
+        "q6_k" => (t, GgmlTensorType.Q6_K),
+        "nvfp4" => (t, GgmlTensorType.NVFP4),
+        "bf16" => (t, GgmlTensorType.BF16),
+        "f16" => (t, GgmlTensorType.F16),
+        _ => throw new ArgumentException($"unknown type {t}"),
+    };
+}
+
+static unsafe double[] BenchShape(GgmlTensorType type, int m, int k, int n, int reps)
+{
+    var rng = new Random(4242 + (int)type);
+    long rowBytes = NativeDequant.RowSize((int)type, k);
+    long bytes = rowBytes * n;
+    int copies = m == 1 ? (int)Math.Max(1, (384L << 20) / bytes) : 1;
+    byte[] one = BuildRandom(rng, type, n, k);
+    var buffers = new byte[copies][];
+    for (int c = 0; c < copies; c++) buffers[c] = (byte[])one.Clone();
+    var handles = buffers.Select(b => System.Runtime.InteropServices.GCHandle.Alloc(b, System.Runtime.InteropServices.GCHandleType.Pinned)).ToArray();
+    try
+    {
+        float[] input = new float[(long)m * k];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() - 0.5);
+        float[] output = new float[(long)m * n];
+        int next = 0;
+        fixed (float* x = input)
+        fixed (float* o = output)
+        {
+            float* xp = x, op = o;
+            void Call()
+            {
+                IntPtr w = handles[next].AddrOfPinnedObject();
+                next = (next + 1) % copies;
+                ManagedQuantizedOps.AddmmQuantizedToFloat32((int)type, w, k, n, xp, k, m, op, n);
+            }
+            Call(); Call();
+            var rates = new double[reps];
+            for (int r = 0; r < reps; r++)
+            {
+                int calls = 0;
+                var sw = Stopwatch.StartNew();
+                do { Call(); calls++; } while (calls < 3 || sw.Elapsed.TotalSeconds < 0.25);
+                double s = sw.Elapsed.TotalSeconds / calls;
+                rates[r] = m == 1 ? bytes / s / 1e9 : 2.0 * m * n * k / s / 1e9;
+            }
+            return rates;
+        }
+    }
+    finally
+    {
+        foreach (var h in handles) h.Free();
+    }
 }

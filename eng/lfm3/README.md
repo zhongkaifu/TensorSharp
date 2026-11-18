@@ -17,7 +17,8 @@ in the ignored `artifacts/lfm3/`.
   ForcedLogitProbe's `metrics.json` holds every row's top-1 agreement, relative L2, KL and largest logit difference.
 - `Lfm3Probe` (`dotnet build eng/lfm3/Lfm3Probe -c Release`):
   - `ppl MODEL BACKEND FILE CTX CHUNKS` computes perplexity as `llama-perplexity -f FILE -c CTX --chunks CHUNKS` does
-    (no BOS, special tokens not parsed, the second half of each chunk scored);
+    (no BOS, special tokens not parsed, the second half of each chunk scored), and prints a digest of every scored
+    logit's bits: two builds whose kernels claim the same arithmetic must print the same digest;
   - `tokens MODEL FILE OUT` writes the file's ids, to compare with `llama-tokenize --ids --no-bos --no-parse-special`;
   - `bench MODEL BACKEND [PP,...] [TG] [DEPTH,...]` measures prefill and decode tokens/s as llama-bench's pp / tg /
     tg@d do, with the decode steps' graph counters (runs, advances in place, builds).
