@@ -10,7 +10,10 @@ public class CpuDecodeAttentionSplitTests
     /// kernel, bit for bit: GQA groups of 4 and others, key counts off the chunk and 4-value boundaries, head dims with
     /// and without a partial slice, sharply peaked rows (flushed exp tails).</summary>
     [Theory]
+    [InlineData(16, 4, 128, 130, 200)]
+    [InlineData(16, 4, 128, 257, 768)]
     [InlineData(16, 4, 128, 1024, 1500)]
+    [InlineData(16, 4, 128, 16383, 16400)]
     [InlineData(16, 4, 128, 3001, 3100)]
     [InlineData(8, 4, 64, 1027, 1030)]
     [InlineData(6, 3, 80, 2050, 2050)]

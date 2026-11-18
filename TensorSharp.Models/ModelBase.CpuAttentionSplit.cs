@@ -25,7 +25,7 @@ namespace TensorSharp.Models
     //
     // This runs the same computation in four phases whose work splits further
     // WITHOUT changing a single operation of any output:
-    //   1. scores, per (KV head, key chunk): the same Dot4F32F16 / DotF32F16 per key,
+    //   1. scores, per (KV head, key chunk of 64-512): the same Dot4F32F16 / DotF32F16 per key,
     //      times the scale; each chunk's running max (the max is exact, and chunks
     //      combined in order keep the first of equal values, as the one-pass loop does);
     //   2. exp(score - max), per (head, key chunk): VecExpRow's per-lane exp on the
@@ -43,9 +43,16 @@ namespace TensorSharp.Models
     public abstract partial class ModelBase
     {
         /// <summary>Keys from which the split kernel replaces the per-KV-head one (a speed choice: the bits agree).</summary>
-        internal const int SplitDecodeKeys = 1024;
+        internal const int SplitDecodeKeys = 128;
 
-        private const int SplitKeyChunk = 512;
+        /// <summary>Key chunks: about two per worker over the KV heads, 64 to 512 keys (multiples of 64, so every chunk
+        /// starts on a 4-value group).</summary>
+        private static int SplitKeyChunk(int keys, int kvHeads)
+        {
+            long perWorker = ((long)keys * kvHeads + 2L * CpuParallel.DegreeOfParallelism - 1) / (2L * CpuParallel.DegreeOfParallelism);
+            return (int)Math.Clamp((perWorker + 63) / 64 * 64, 64, 512);
+        }
+
         private const int SplitHeadDimSlice = 16;
 
         /// <summary>The split kernel's results equal the one-pass kernel's on this host (VecExpRow's 128-bit path).</summary>
@@ -59,7 +66,8 @@ namespace TensorSharp.Models
         {
             int groupSize = numHeads / numKVHeads;
             int n = totalSeqLen;
-            int chunks = (n + SplitKeyChunk - 1) / SplitKeyChunk;
+            int chunk = SplitKeyChunk(n, numKVHeads);
+            int chunks = (n + chunk - 1) / chunk;
             float[] scoresArr = ArrayPool<float>.Shared.Rent(checked(numHeads * n));
             float[] maxArr = ArrayPool<float>.Shared.Rent(numHeads * chunks);
             try
@@ -73,7 +81,7 @@ namespace TensorSharp.Models
                     CpuParallel.For(numKVHeads * chunks, task =>
                     {
                         int kvHead = task / chunks, c = task % chunks;
-                        int t0 = c * SplitKeyChunk, t1 = Math.Min(n, t0 + SplitKeyChunk);
+                        int t0 = c * chunk, t1 = Math.Min(n, t0 + chunk);
                         int hStart = kvHead * groupSize;
                         ushort* kHead = (ushort*)k + (long)kvHead * maxSeqLen * headDim;
                         float* scores = (float*)s;
@@ -125,7 +133,7 @@ namespace TensorSharp.Models
                         float max = float.NegativeInfinity;
                         for (int i = 0; i < chunks; i++)
                             if (chunkMax[i] > max) max = chunkMax[i];
-                        int t0 = c * SplitKeyChunk, t1 = Math.Min(n, t0 + SplitKeyChunk);
+                        int t0 = c * chunk, t1 = Math.Min(n, t0 + chunk);
                         ExpGroups128((float*)s + (long)h * n, max, t0, t1);
                     });
 
