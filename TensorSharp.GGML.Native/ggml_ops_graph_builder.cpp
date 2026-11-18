@@ -25,12 +25,14 @@
 
 #include "ggml_ops_internal.h"
 #include "ggml_ops_bonsai.h"
+#include "ggml_ops_cpu_graph.h"
 #include "ggml_ops_graph_optimize.h"
 #include "ggml_ops_transformer_common.h"
 #include "ggml_ops_precision_policy.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -129,6 +131,7 @@ namespace
         int role;
         bool uploaded;   // bound to compute memory: uploaded every run (and downloaded after, for STATE)
         bool host_only = false;                        // read from host memory at a host-expert pause, never bound
+        bool repacked = false;                         // ggml-cpu: bound to its CPU_REPACK copy (ggml_ops_cpu_graph.h)
         bool has_split = false;                        // tensor parallelism: how the leaf spreads over the ranks
         ggml_backend_meta_split_state split{};
     };
@@ -407,6 +410,8 @@ namespace
         int hc_last_role = -1;
         // Bonsai2 PRISM: the rotated activation each (input, transform) products share (see weight_product).
         tsg::BonsaiMemo bonsai;
+        // ggml-cpu: the repacked weight copies this graph's leaves are bound to (kept alive while it lives).
+        std::vector<tsg::CpuRepackedRef> repacked;
 
         ~TsgGraph()
         {
@@ -1120,6 +1125,23 @@ namespace
                     throw std::runtime_error("graph builder: binding a device operation's operand failed");
     }
 
+    // ggml-cpu (ggml_ops_cpu_graph.h): weights only products read go into its repacked layout.
+    void bind_cpu_weights(TsgGraph* g)
+    {
+        std::vector<tsg::CpuWeightLeaf> weights;
+        std::vector<Leaf*> of;
+        for (Leaf& leaf : g->leaves)
+        {
+            if (leaf.role != LEAF_WEIGHT || leaf.data == nullptr || leaf.host_only) continue;
+            weights.push_back({ leaf.tensor, leaf.data, resolve_upload_source(leaf.data) });
+            of.push_back(&leaf);
+        }
+        std::vector<char> bound;
+        g->repacked = tsg::cpu_repack_bind(g->graph, weights, bound);
+        for (std::size_t i = 0; i < of.size(); i++)
+            of[i]->repacked = bound[i] != 0;
+    }
+
     // Bind the leaves, then let the graph's own allocator place every other tensor.
     bool build(TsgGraph* g)
     {
@@ -1207,9 +1229,15 @@ namespace
                     offset += (ggml_backend_buft_get_alloc_size(buft, t) + align - 1) / align * align;
                 }
         }
+        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU) bind_cpu_weights(g);
         for (Leaf& leaf : g->leaves)
         {
             leaf.uploaded = !leaf.host_only;
+            if (leaf.repacked)
+            {
+                leaf.uploaded = false;
+                continue;
+            }
             if (leaf.role == LEAF_INPUT || leaf.data == nullptr || leaf.host_only) continue;
             if (g->tp != nullptr)
             {

@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
+#include "ggml_ops_cpu_graph.h"
 #include "ggml_ops_attention_alloc.h"
 #include "ggml_ops_graph_alloc.h"
 #include "ggml_ops_moe_stream_memory.h"
@@ -1336,6 +1337,8 @@ namespace tsg
             return false;
 
         qwen_image21_invalidate_weight(data);
+        // ggml-cpu's repacked copy (graphs bound to it keep theirs; the next graph repacks the new bytes).
+        cpu_repack_forget(data);
 
         {
             std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
@@ -3478,6 +3481,8 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     tsg_cuda_q4k_gemm_release();
 #endif
     forget_cache_keys();
+    // ggml-cpu's repacked weight copies (graphs still bound to one keep it until they are freed).
+    tsg::cpu_repack_clear();
     // Host-MoE streaming page-locks the expert stacks it streams (cudaHostRegister
     // on the GGUF mapping, or on a private copy of it). Like everything else here
     // the release is process-wide. Left registered, a model's ranges outlive its
@@ -3657,6 +3662,7 @@ TSG_EXPORT void TSGgml_Shutdown()
         }
         tsg::dev(r).device_index = -1;
     }
+    tsg::cpu_repack_clear();
     // After the backend: a CPU backend still references its pool until it is freed.
     for (ggml_threadpool_t pool : tsg::g_cpu_pools)
         ggml_threadpool_free(pool);

@@ -579,6 +579,16 @@ including what is traced and what is redacted, is
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | server, CLI | `true` exports content: unredacted logs, prompt and output messages on chat spans, video prompts, tool arguments and results, commands, upload paths | off (content redacted) | not registered | no |
 | `TENSORSHARP_OTEL_TRACE_STEPS` | server, CLI | One `inference.step` span per engine step, linked to the requests it ran; for profiling a single run | off | not registered | no |
 
+## Out-of-Matrix GGML CPU Backend Knobs
+
+These tune `--backend ggml_cpu` (ggml-cpu under TensorSharp's graph runtime, `TensorSharp.GGML.Native/ggml_ops_cpu_graph.cpp`).
+They are not registered in `EnvVarMatrix.All` and are not swept by the default TestMatrix config. Measurements were taken
+on an Apple M5 Pro (6 performance + 12 efficiency cores, 48 GB) with LFM3-1.7B, every arm interleaved on a quiet machine.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_GGML_CPU_REPACK` | `ggml_cpu` backend | `0` keeps quantized weights in their GGUF layout; `1` repacks where it is off by default. A weight the graph reads only as a product's weight (MUL_MAT over F32 rows, whole or in 8-row-aligned row blocks) of a type ggml-cpu repacks (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_NL, MXFP4) is copied once into ggml-cpu's `CPU_REPACK` buffer type - its interleaved i8mm / dotprod GEMM and GEMV layouts, the ones llama.cpp loads its weights into - and every graph reading it binds that copy; a weight read any other way (a row gather, a copy) keeps its own bytes in that graph. The copies are anonymous memory the size of those weights (1.04 GB for LFM3-1.7B Q4_K_M, made in ~90 ms on 18 threads at the first step) while the file's mapped pages go cold. It roughly doubles prompt throughput (LFM3-1.7B Q4_K_M pp512 at 18 threads: 462 -> 874 tok/s; Q8_0 and Q4_0 alike) and keeps single-sequence decode where it was. On by default on ARM64, where it was measured | ON on ARM64 (Apple Silicon, ARM64 Linux and Windows), OFF elsewhere | not registered | no |
+
 ## Out-of-Matrix General Runtime Knobs
 
 These variables are real runtime knobs, but they are not registered in

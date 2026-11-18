@@ -524,6 +524,16 @@ sweep。runner 也不会清除它们，所以 runner 自身环境中设置的值
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | 服务端、CLI | `true` 时导出内容：不脱敏的日志、聊天 span 上的提示与输出消息、视频提示词、工具参数与结果、命令、上传路径 | 关闭（内容脱敏） | 未注册 | 否 |
 | `TENSORSHARP_OTEL_TRACE_STEPS` | 服务端、CLI | 每个引擎步骤一个 `inference.step` span，并链接到它运行的请求；用于剖析单次运行 | 关闭 | 未注册 | 否 |
 
+## 矩阵外的 GGML CPU 后端开关
+
+这些用于调节 `--backend ggml_cpu`（TensorSharp 图运行时下的 ggml-cpu，`TensorSharp.GGML.Native/ggml_ops_cpu_graph.cpp`）。
+它们没有注册进 `EnvVarMatrix.All`，默认的 TestMatrix 配置也不会扫它们。实测数据来自一台 Apple M5 Pro（6 个性能核 +
+12 个能效核、48 GB），模型为 LFM3-1.7B，各组在空闲机器上交替运行。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描值 | 默认扫描 |
+|---|---|---|---|---|---|
+| `TS_GGML_CPU_REPACK` | `ggml_cpu` 后端 | `0` 让量化权重保持 GGUF 布局；`1` 在默认关闭的平台上开启重排。图中只作为乘法权重被读取（对 F32 行做 MUL_MAT，整体读取或按 8 行对齐的行块读取）、且属于 ggml-cpu 可重排类型（Q4_0、Q4_K、Q5_K、Q6_K、Q8_0、IQ4_NL、MXFP4）的权重，会被复制一次到 ggml-cpu 的 `CPU_REPACK` 缓冲类型中——即它交错排列的 i8mm / dotprod GEMM 与 GEMV 布局，也就是 llama.cpp 加载权重时使用的布局——之后读取它的每个图都绑定这份副本；以其他方式读取的权重（按行收集、复制）在那个图中仍使用自己的字节。副本是与这些权重同样大小的匿名内存（LFM3-1.7B Q4_K_M 为 1.04 GB，首步时用 18 个线程约 90 ms 完成），文件的映射页随之变冷。它让提示吞吐大约翻倍（LFM3-1.7B Q4_K_M 在 18 线程下 pp512：462 -> 874 tok/s；Q8_0 与 Q4_0 类似），单序列解码保持原样。默认只在实测过的 ARM64 上开启 | ARM64（Apple Silicon、ARM64 Linux 与 Windows）上开启，其他平台关闭 | 未注册 | 否 |
+
 ## 矩阵外的通用运行时开关
 
 这些变量是真实运行时开关，但目前未注册到 `EnvVarMatrix.All`，也不在默认
