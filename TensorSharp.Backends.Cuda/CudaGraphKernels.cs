@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 34;
+        public const int CurrentVersion = 35;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32, _dflashConv;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -79,6 +79,7 @@ namespace TensorSharp.Cuda
             _attnPrep = module.GetFunction("ts_graph_attn_prep_f32");
             _setRowsQ8 = module.GetFunction("ts_graph_set_rows_q8_0");
             _q8ToF32 = module.GetFunction("ts_graph_q8_0_to_f32");
+            _dflashConv = module.GetFunction("ts_graph_dflash_conv_f32");
             // The tiled head's products stream with cp.async into the int8 tensor cores: only an image with their sm_80 bodies.
             if (ArchGuardedKernelsUsable)
             {
@@ -807,6 +808,17 @@ namespace TensorSharp.Cuda
             }
             CudaDriverApi.cuLaunchKernel(_deltaNetPrep, (uint)(2 * kHeads + vHeads), (uint)rows, 1, (uint)d, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>GraphFusion.DFlashConv: DFlash2's grouped dynamic convolution of <paramref name="rows"/> rows of
+        /// <paramref name="hidden"/> channels (x, taps [rows][<paramref name="stride"/>] and base [2][width][hidden] contiguous)
+        /// into <paramref name="output"/> [rows][hidden], with the region's ops' roundings.</summary>
+        public void LaunchDFlashConv(IntPtr x, IntPtr taps, IntPtr kernel, IntPtr output, int rows, int hidden, int width, int group,
+            int groups, int side, long stride, IntPtr stream)
+        {
+            long n = (long)rows * hidden;
+            void** args = stackalloc void*[] { &x, &taps, &kernel, &output, &rows, &hidden, &width, &group, &groups, &side, &stride };
+            CudaDriverApi.cuLaunchKernel(_dflashConv, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>GraphFusion.SigmoidGate: output = attn * sigmoid(gate) over <paramref name="rows"/> x <paramref name="heads"/>

@@ -151,6 +151,46 @@ public sealed class GraphBlockDraftTests : IDisposable
     }
 
     /// <summary>
+    /// DFlash2's convolutions as a region (GraphFusion.DFlashConv) draft bit for bit what their ops draft alone, over 2, 3 and
+    /// 4 taps (a block as wide as its taps too: the drafter refuses a wider convolution): on direct CUDA the region's kernel
+    /// (ts_graph_dflash_conv_f32) serves them,
+    /// elsewhere (the managed CPU here) the region's ops run as they did.
+    /// </summary>
+    [Theory]
+    [InlineData("dflash2")]
+    [InlineData("dflash2-k4b5")]
+    public void DFlashConvRegionDraftsAsItsOps(string variant) => ConvRegionDraftsAsItsOps(BackendType.Cpu, variant);
+
+    [CudaTheory]
+    [InlineData("dflash2")]
+    [InlineData("dflash2-k3b5")]
+    [InlineData("dflash2-k4b5")]
+    [InlineData("dflash2-k4b4")]
+    public void DFlashConvRegionDraftsAsItsOpsOnDirectCuda(string variant) => ConvRegionDraftsAsItsOps(BackendType.Cuda, variant);
+
+    private void ConvRegionDraftsAsItsOps(BackendType backend, string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var (target, draft) = Fixtures(variant);
+        using var region = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft);
+        using var ops = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { DFlashConvRegionsDisabledForTests = true };
+        string label = $"{backend} {variant}";
+        Assert.True(region.DFlashSettings.HasConv, $"{label}: the drafter has no convolution");
+        List<string> mismatches = DraftBitwise(region, ops, new[] { 21, 9 });
+        Assert.True(mismatches.Count == 0, $"{label}: {string.Join("; ", mismatches.Take(12))}");
+        Assert.Null(region.GraphBlockDraftDeclineReason);
+        Assert.Null(ops.GraphBlockDraftDeclineReason);
+        Assert.True(region.GraphBlockDrafts > 0, $"{label}: no block ran as a graph");
+        if (region.GraphExecutorForTests is TensorSharp.Cuda.CudaGraphExecutor cuda)
+        {
+            var opsExecutor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(ops.GraphExecutorForTests);
+            _output.WriteLine($"{label}: {cuda.DFlashConvRegions} convolutions on the region's kernel");
+            Assert.True(cuda.DFlashConvRegions > 0, $"{label}: no convolution ran on the region's kernel");
+            Assert.Equal(0, opsExecutor.DFlashConvRegions);
+        }
+    }
+
+    /// <summary>
     /// Drafts through two models' graph drafters from the same synthetic feature rows: per request (one a prompt length in
     /// <paramref name="prompts"/>, each on the model's ring from position 0) the prompt's rows, then draft / commit cycles
     /// whose accept counts walk 0 .. gamma three times (every catch-up width runs, and advances, in each request); every
@@ -903,6 +943,10 @@ public sealed class GraphBlockDraftTests : IDisposable
                 codebookType: SyntheticGguf.GgmlType.Q8_0),
             "dflash2-kquant" => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: 5, hidden: hidden, layers: 2, slidingWindow: 16,
                 dflash2: true, kQuantProjections: true),
+            // dflash2-k{taps}b{block}: DFlash2 with a convolution of that many taps over blocks of that width.
+            _ when variant.StartsWith("dflash2-k", StringComparison.Ordinal) && variant.IndexOf('b', 9) is int at and > 9
+                => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: int.Parse(variant[(at + 1)..]), hidden: hidden, layers: 2,
+                    slidingWindow: 16, dflash2: true, convTaps: int.Parse(variant[9..at])),
             _ => throw new ArgumentOutOfRangeException(nameof(variant)),
         };
         return (target, draft);

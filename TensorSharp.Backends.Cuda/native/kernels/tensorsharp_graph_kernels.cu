@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 34
+#define TS_GRAPH_KERNELS_VERSION 35
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1955,6 +1955,36 @@ extern "C" __global__ void ts_graph_sigmoid_gate_f32(const float* __restrict__ a
     out[i] = o;
     if (outq != nullptr)
         ts_graph_quantize_q8_1(o, outq + i / 32, (int)(i & 31));
+}
+
+// GraphFusion.DFlashConv: DFlash2's grouped dynamic convolution of a block's rows (StandardDecoderModel.BlockDraft.cs,
+// EmitDFlashConv), the region's ops' values bit for bit: tap t's term at row r >= t is x[r - t][c] * base[side][t][c] plus
+// x[r - t][c] * taps[r][side * width * groups + t * groups + c / group] (each product rounded, as the ops' two broadcast
+// products and their sum), tap 0's term starts the sum and each later tap's is added in order, zero on the rows before it
+// (the ops' concatenation behind zeros: an added +0 turns a -0 sum into +0, as there). x [rows][hidden], taps [rows][stride]
+// and base [2][width][hidden] contiguous; out [rows][hidden]. Launch: grid ceil(rows * hidden / 256), block 256.
+extern "C" __global__ void ts_graph_dflash_conv_f32(const float* __restrict__ x, const float* __restrict__ taps,
+    const float* __restrict__ base, float* __restrict__ out, int rows, int hidden, int width, int group, int groups, int side,
+    long long stride)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * hidden)
+        return;
+    const int r = (int)(i / hidden), c = (int)(i - (long long)r * hidden), g = c / group;
+    const int n = min(width, rows);
+    const float* delta = taps + (long long)r * stride + (long long)side * width * groups + g;
+    float acc = 0.0f;
+    for (int t = 0; t < n; ++t)
+    {
+        float term = 0.0f;
+        if (r >= t)
+        {
+            const float xv = x[(long long)(r - t) * hidden + c];
+            term = __fadd_rn(__fmul_rn(xv, base[((long long)side * width + t) * hidden + c]), __fmul_rn(xv, delta[(long long)t * groups]));
+        }
+        acc = t == 0 ? term : __fadd_rn(acc, term);
+    }
+    out[i] = acc;
 }
 
 // The residual add and the next block's input norm in one pass: sum = a + b, normed = sum * rsqrt(mean(sum^2) + eps) * w

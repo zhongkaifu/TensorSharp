@@ -346,10 +346,10 @@ internal static class Qwen4ExpSyntheticModelBuilder
     /// <paramref name="kQuantProjections"/> stores the encoder and K projections as Q4_K and the V projections as Q6_K, as
     /// Qwen3.8-27B's DFlash2 Q4_K_M has them (the width must be a multiple of 256).</summary>
     public static string WriteDFlash(string path, int blockSize = 4, int hidden = Hidden, int layers = 1, int slidingWindow = 4096,
-        bool dflash2 = false, GgmlType codebookType = GgmlType.F32, bool kQuantProjections = false)
+        bool dflash2 = false, GgmlType codebookType = GgmlType.F32, bool kQuantProjections = false, int convTaps = 2)
     {
         const int heads = 4, kvHeads = 2, headDim = 64, ffn = 512;
-        const int convTaps = 2, convGroup = 16, selectorRank = 32, selectorTopK = 8;
+        const int convGroup = 16, selectorRank = 32, selectorTopK = 8;
         int Hidden = hidden;
         int[] taps = { 2, 5, 7 };
         var kv = new List<Kv>
@@ -371,7 +371,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
         };
         if (dflash2)
         {
-            kv.Add(new U32 { Key = "dflash.conv_kernel_size", V = convTaps });
+            kv.Add(new U32 { Key = "dflash.conv_kernel_size", V = (uint)convTaps });
             kv.Add(new U32 { Key = "dflash.conv_group_size", V = convGroup });
             kv.Add(new U32 { Key = "dflash.selector_rank", V = selectorRank });
             kv.Add(new U32 { Key = "dflash.selector_top_k", V = selectorTopK });

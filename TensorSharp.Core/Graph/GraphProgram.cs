@@ -234,6 +234,13 @@ namespace TensorSharp.Graph
         /// executor may then lay it out head by head). Fp: the norms' eps, the rotary's base, frequency scale, extrapolation factor,
         /// attention factor, beta fast and beta slow. Result: the rotated queries [d, heads, rows].</summary>
         AttentionPrep = 16,
+        /// <summary>DFlash2's grouped dynamic convolution of a block's rows: out[r][c] = sum over taps t &lt;= r of
+        /// x[r - t][c] * base[side][t][c] + x[r - t][c] * taps[r][side * width * groups + t * groups + c / group], each product
+        /// rounded on its own, each tap's two products added, and the taps added in order (tap 0's term, then the result plus
+        /// each later tap's: zero on the rows before that tap reaches). Inputs: x [hidden, rows], taps [stride, rows] (the
+        /// conv projection of the sublayer's input) and the base kernel [hidden, width, 2]. Ip: width, group, groups, side,
+        /// stride. Result: [hidden, rows].</summary>
+        DFlashConv = 17,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

@@ -43,6 +43,10 @@ namespace TensorSharp.Models
         /// DFlash2 selector tail).</summary>
         internal bool GraphBlockDraftOnMetalForTests { get; set; }
 
+        /// <summary>Tests: DFlash2's convolutions are emitted as their ops alone, not as a region an executor may serve with
+        /// its kernel (<see cref="GraphFusion.DFlashConv"/>).</summary>
+        internal bool DFlashConvRegionsDisabledForTests { get; set; }
+
         /// <summary>Blocks and ring injects the graph programs served (tests check the lowering ran).</summary>
         internal int GraphBlockDrafts { get; private set; }
 
@@ -629,7 +633,9 @@ namespace TensorSharp.Models
         /// is (base[side][t][c] + taps[r][side][t][c / group]) times x[r - t][c], nothing for r &lt; t (the filter never reaches
         /// across the block). <paramref name="taps"/> is the conv projection [2 * taps * groups, b] of the sublayer's input;
         /// side 0 filters the input, side 1 the sublayer's output. Each tap is the product of the shifted rows with the
-        /// per-channel base and with the per-group delta (each broadcast), the shift a concatenation behind zeros.
+        /// per-channel base and with the per-group delta (each broadcast), the shift a concatenation behind zeros. The ops are
+        /// a region (<see cref="GraphFusion.DFlashConv"/>): an executor with its kernel computes them in one dispatch, with
+        /// their roundings (about ten small kernels a convolution, twenty convolutions a Qwen3.8-27B DFlash2 block).
         /// </summary>
         private int EmitDFlashConv(GraphStep step, int x, int taps, string baseName, int side, int b, int zeros)
         {
@@ -638,6 +644,9 @@ namespace TensorSharp.Models
             long stride = cfg.ConvProjOutSize, half = (long)width * groups;
             const long f = sizeof(float);
             int baseKernel = step.Weight(baseName);   // [hidden, taps, 2]
+            bool region = !DFlashConvRegionsDisabledForTests;
+            if (region)
+                step.BeginFused(GraphFusion.DFlashConv, stackalloc[] { x, taps, baseKernel }, stackalloc long[] { width, group, groups, side, stride });
             int result = -1;
             for (int t = 0; t < width && t < b; t++)
             {
@@ -651,6 +660,7 @@ namespace TensorSharp.Models
                     term = step.Op(GraphOp.Concat, stackalloc[] { step.View2(zeros, hidden, t, hidden * f, 0), term }, stackalloc long[] { 1 });
                 result = result < 0 ? term : step.Op(GraphOp.Add, result, term);
             }
+            if (region) step.EndFused(stackalloc[] { result });
             return result;
         }
 

@@ -1639,7 +1639,7 @@ namespace TensorSharp.Cuda
                 or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
-            GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep => Kernels != null,
+            GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep or GraphFusion.DFlashConv => Kernels != null,
             _ => false,
         };
 
@@ -1658,6 +1658,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.QsaKeys) return TryQsaKeys(inputs, ip, fp, results);
             if (kind == GraphFusion.DeltaNetCommit) return TryDeltaNetCommit(inputs, ip, results);
             if (kind == GraphFusion.AttentionPrep) return TryAttentionPrep(inputs, ip, fp, results);
+            if (kind == GraphFusion.DFlashConv) return TryDFlashConv(inputs, ip, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
@@ -1949,6 +1950,37 @@ namespace TensorSharp.Cuda
         /// The ops copied the gate out of the projection, then ran the sigmoid and the product as two passes (Qwen3.8-27B, a
         /// 2K-row chunk: 50 MB each of the three, 16 layers).
         /// </summary>
+        /// <summary>
+        /// DFlash2's grouped dynamic convolution (<see cref="GraphFusion.DFlashConv"/>) in one launch (ts_graph_dflash_conv_f32)
+        /// with its ops' roundings: about ten elementwise, copy and concatenation kernels a convolution otherwise, twenty
+        /// convolutions a Qwen3.8-27B DFlash2 block. Declined (the ops run) unless the operands are contiguous F32 on the device
+        /// and their extents agree with the region's.
+        /// </summary>
+        private bool TryDFlashConv(Tensor[] inputs, long[] ip, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || inputs.Length != 3 || ip == null || ip.Length < 5) return false;
+            Tensor x = inputs[0], taps = inputs[1], kernel = inputs[2];
+            if (Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32 || !t.IsContiguous()))
+                return false;
+            int width = (int)ip[0], group = (int)ip[1], groups = (int)ip[2], side = (int)ip[3];
+            long stride = ip[4];
+            long hidden = (long)group * groups, rows = x.ElementCount() / Math.Max(1, hidden);
+            if (width < 1 || group < 1 || groups < 1 || side is not (0 or 1) || hidden > int.MaxValue || rows < 1 || rows > int.MaxValue
+                || x.ElementCount() != rows * hidden || taps.ElementCount() != rows * stride || stride < 2L * width * groups
+                || kernel.ElementCount() != 2L * width * hidden)
+                return false;
+            var result = new Tensor(Allocator, DType.Float32, rows, hidden);
+            Launch(inputs, result, (k, stream) => k.LaunchDFlashConv(Ptr(x), Ptr(taps), Ptr(kernel), Ptr(result), (int)rows, (int)hidden, width,
+                group, groups, side, stride, stream));
+            results[0] = result;
+            DFlashConvRegions++;
+            return true;
+        }
+
+        /// <summary>DFlash2 convolutions <see cref="TryDFlashConv"/> ran (tests check the kernel served them).</summary>
+        internal long DFlashConvRegions { get; private set; }
+
         private bool TrySigmoidGate(Tensor[] inputs, Tensor[] results)
         {
             Tensor attn = inputs[0], gate = inputs[1];
