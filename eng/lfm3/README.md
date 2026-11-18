@@ -10,7 +10,7 @@ in the ignored `artifacts/lfm3/`.
   llama.cpp build tree (see the file's header), then teacher-force TensorSharp through the same histories:
 
   ```
-  llamacpp-forced MODEL REF_DIR 64 99 cases/*.txt          # 99: Metal; -1: ggml-cpu only
+  llamacpp-forced MODEL REF_DIR 64 99 cases/*.txt          # 99: the build's GPU (Metal, CUDA, Vulkan); -1: ggml-cpu only
   dotnet eng/ForcedLogitProbe/bin/Release/net10.0/ForcedLogitProbe.dll MODEL OUT_DIR ggml_metal --reference REF_DIR
   ```
 
