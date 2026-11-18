@@ -703,6 +703,55 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// Tests and the eng quality probe (eng/LongContextQualityProbe): <paramref name="tokens"/> as one prompt chunk of the
+        /// active sequence, its attention marked as the prompt entry points mark theirs (<see cref="GraphRequest.PromptChunks"/>,
+        /// more than <see cref="SmallChunkRows"/> rows), returning every row's logits (row i's at <c>i * VocabSize</c>): the
+        /// prompt path's next-token predictions, to score a text by. The chunk advances the sequence as a prompt chunk does;
+        /// only the projection of every row differs from <see cref="RunSequence"/>'s graph step. One device, graphs only.
+        /// </summary>
+        internal float[] ForwardPromptRowsForTests(int[] tokens)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (tokens.Length == 0) throw new ArgumentException("A forward needs at least one token.", nameof(tokens));
+            if (IsMultiNodePipeline || _rankGraphs || _pendingMedia.Count > 0)
+                throw new NotSupportedException("Scored prompt chunks run on one device, without media.");
+            if (GraphUnsupportedReason() is { } reason)
+                throw new NotSupportedException($"{Config.Architecture}: scored prompt chunks run as graphs, which this model cannot use ({reason}).");
+            SettlePendingVerify();
+            int rows = tokens.Length, start = _cacheSeqLen;
+            EnsureCacheCapacity(checked(start + rows));
+            _forwardSw.Start();
+            try
+            {
+                TokenPositions positions = BeginRotaryPositions(start, rows);
+                EnterStage(0);
+                var request = new GraphRequest
+                {
+                    PositionTable = positions.Table, AllRowLogits = true, PromptChunks = MarksPromptChunks(true, new[] { rows }),
+                };
+                Tensor hidden = EmbedStep(tokens);
+                GraphResult result;
+                try
+                {
+                    if (!TryRunGraphStep(hidden, new[] { SnapshotActive() }, new[] { 0 }, new[] { rows }, new[] { start }, request, out result))
+                        throw new NotSupportedException($"{Config.Architecture}: this scored prompt chunk did not run as a graph.");
+                }
+                finally
+                {
+                    hidden.Dispose();
+                }
+                _cacheDeviceDirty = true;
+                _cacheSeqLen += rows;
+                return result.Logits;
+            }
+            finally
+            {
+                EnterStage(0);
+                _forwardSw.Stop();
+            }
+        }
+
         /// <summary>A multi-node layer split: the serialized stage protocol (ModelBase).</summary>
         private float[] ForwardDistributedPipeline(int[] tokens)
         {

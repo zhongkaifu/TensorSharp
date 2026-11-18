@@ -185,6 +185,52 @@ public sealed class GraphAttentionRowsTests : IDisposable
         Assert.Equal(0, other);
     }
 
+    /// <summary>The quality probe's scored prompt chunk (ForwardPromptRowsForTests): a marked chunk returning every row's
+    /// logits, the last of which is a plain prompt chunk's, and advancing the sequence as one does (the next token's logits
+    /// equal after either).</summary>
+    [Fact]
+    public void ScoredPromptChunksAreMarkedAndAdvanceAsPromptChunks()
+    {
+        using var model = new Qwen35RuntimeModel(Trunk(), BackendType.Cpu);
+        long layers = AttentionLayers(model);
+        int vocab = model.Config.VocabSize;
+        int[] prompt = Tokens(40), next = { 17 };
+        float[] rows = null;
+        var (marked, other) = Count(model, () => rows = model.ForwardPromptRowsForTests(prompt));
+        Assert.Equal(layers, marked);
+        Assert.Equal(0, other);
+        Assert.Equal(prompt.Length * vocab, rows.Length);
+        float[] afterScored = (float[])model.Forward(next).Clone();
+
+        model.ResetKVCache();
+        float[] last = (float[])model.ForwardPrompt(prompt).Clone();
+        float[] afterPrompt = (float[])model.Forward(next).Clone();
+        float[] scoredLast = rows.AsSpan((prompt.Length - 1) * vocab, vocab).ToArray();
+        Assert.True(RelativeL2(scoredLast, last) <= 1e-5, $"the scored chunk's last row is {RelativeL2(scoredLast, last):E3} from a prompt chunk's logits");
+        Assert.True(RelativeL2(afterScored, afterPrompt) <= 1e-5,
+            $"the next token's logits after a scored chunk are {RelativeL2(afterScored, afterPrompt):E3} from those after a prompt chunk");
+        Assert.Equal(ArgMax(last), ArgMax(scoredLast));
+    }
+
+    private static double RelativeL2(float[] a, float[] b)
+    {
+        double diff = 0, norm = 0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            double e = (double)a[i] - b[i];
+            diff += e * e;
+            norm += (double)b[i] * b[i];
+        }
+        return Math.Sqrt(diff / Math.Max(norm, 1e-30));
+    }
+
+    private static int ArgMax(float[] v)
+    {
+        int best = 0;
+        for (int i = 1; i < v.Length; i++) if (v[i] > v[best]) best = i;
+        return best;
+    }
+
     /// <summary>Unmarked attention ops keep the ip they had before the mark (one or two values: ggml's precision and a mask
     /// row's finite keys), so a decode step's, a verify step's and a short chunk's programs keep their bytes and signatures; a
     /// prompt chunk's ops carry the mark as ip[2], and none do with the mark machinery off.</summary>
