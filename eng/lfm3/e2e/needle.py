@@ -78,8 +78,12 @@ def main():
     args = ap.parse_args()
     cl = Client(args.url)
     text = corpus(args.haystack_dir)
-    probe = cl.chat([{"role": "user", "content": text[:40000]}], sampling=GREEDY, max_tokens=1)
-    cpt = 40000 / max(1, (probe["usage"] or {}).get("prompt_tokens", 10000))
+    if args.tokenize_url:
+        # Sized by the tokenizer endpoint: no 10K-token probe prompt on the server under test (minutes on a slow lane).
+        cpt = 40000 / max(1, count_tokens(args.tokenize_url, text[:40000]))
+    else:
+        probe = cl.chat([{"role": "user", "content": text[:40000]}], sampling=GREEDY, max_tokens=1)
+        cpt = 40000 / max(1, (probe["usage"] or {}).get("prompt_tokens", 10000))
     print(f"corpus {len(text)} chars, {cpt:.2f} chars/token", flush=True)
     with open(args.out, "a", encoding="utf-8") as f:
         for n_tok in [int(x) for x in args.lengths.split(",")]:

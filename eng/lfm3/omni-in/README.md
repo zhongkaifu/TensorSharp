@@ -3,7 +3,8 @@
 TensorSharp's LFM3-Omni image, video and audio input against llama.cpp on the same GGUF and mmproj, through the
 servers' OpenAI endpoints with identical request bodies. Outputs belong in the ignored `artifacts/lfm3/omni-in/`.
 Build TensorSharp first (`TENSORSHARP_GGML_NO_UPDATE=1 dotnet build TensorSharp.Server.Host -c Release`); the
-llama.cpp side is a Metal build of `llama-server` / `llama-mtmd-cli` (`LLAMA`, default `~/work/llama.cpp-lfm3`).
+llama.cpp side is a Metal build of `llama-server` / `llama-mtmd-cli` (`LLAMA`, default `~/work/llama.cpp-lfm3`;
+`LLAMA_BUILD=build-cpu` runs a CPU-only build as the reference of a CPU lane).
 
 - `make-media.py --out DIR --llama LLAMA [--signal MP4] [--ticket WAV]` builds the media set and its `manifest.json`
   (macOS: `sips`, `say`, ffmpeg, PIL): three animal photos and a newspaper page (llama.cpp's `test-1.jpeg`), a
