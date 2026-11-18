@@ -104,6 +104,165 @@ public class ManagedQuantArmTests
             }
     }
 
+    /// <summary>A decode row's product as the pool runs it (ARM64: the shrinking column blocks of
+    /// <see cref="ManagedQuantizedOps.DecodeColumnBounds"/>, at the pool's full width and narrowed to two threads) against
+    /// the same product on one thread, bit for bit: which thread computes a column must never change it.</summary>
+    [ArmDotTheory]
+    [InlineData(GgmlTensorType.Q4_K, 2048, 3072)]
+    [InlineData(GgmlTensorType.Q6_K, 7680, 2048)]
+    [InlineData(GgmlTensorType.Q4_0, 2048, 2050)]
+    [InlineData(GgmlTensorType.Q8_0, 2048, 1030)]
+    [InlineData(GgmlTensorType.NVFP4, 2048, 4099)]
+    public unsafe void DecodeProducts_AreBitIdenticalAtAnyPoolWidth(GgmlTensorType type, int k, int n)
+    {
+        var rng = new Random(5 + k + n + (int)type);
+        byte[] weights = RandomWeights(rng, type, n, k);
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * (i % 61 == 0 ? 30f : 1f);
+        float[] serial = new float[n], pooled = new float[n], narrow = new float[n];
+        CpuWorkerPool pool = CpuWorkerPool.Shared;
+        fixed (byte* w = weights)
+        fixed (float* xp = x)
+        fixed (float* s = serial)
+        fixed (float* p = pooled)
+        fixed (float* q = narrow)
+        {
+            Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32((int)type, (IntPtr)w, k, n, xp, k, 1, s, n,
+                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = 1 }));
+            Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32((int)type, (IntPtr)w, k, n, xp, k, 1, p, n));
+            int width = pool.ActiveThreads;
+            try
+            {
+                pool.SetActiveThreads(2);
+                Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32((int)type, (IntPtr)w, k, n, xp, k, 1, q, n));
+            }
+            finally
+            {
+                pool.SetActiveThreads(width);
+            }
+        }
+        for (int c = 0; c < n; c++)
+        {
+            Assert.True(BitConverter.SingleToInt32Bits(serial[c]) == BitConverter.SingleToInt32Bits(pooled[c]),
+                $"{type} K={k} N={n} col {c}: one thread {serial[c]:R} vs the pool {pooled[c]:R}");
+            Assert.True(BitConverter.SingleToInt32Bits(serial[c]) == BitConverter.SingleToInt32Bits(narrow[c]),
+                $"{type} K={k} N={n} col {c}: one thread {serial[c]:R} vs two threads {narrow[c]:R}");
+        }
+    }
+
+    /// <summary>Multi-row products as the pool runs them (ARM64: <see cref="ManagedQuantizedOps.GuidedBounds"/>' shrinking
+    /// column blocks, at the pool's full width and narrowed to two threads) against the same product on one thread, bit for
+    /// bit: few-row batches, prompt chunks, and a chunk past one row block (600 rows of K = 2048).</summary>
+    [ArmDotTheory]
+    [InlineData(GgmlTensorType.Q4_K, 128, 2048, 1030)]
+    [InlineData(GgmlTensorType.Q4_K, 600, 2048, 516)]
+    [InlineData(GgmlTensorType.Q6_K, 37, 7680, 260)]
+    [InlineData(GgmlTensorType.Q8_0, 3, 2048, 3072)]
+    [InlineData(GgmlTensorType.Q4_0, 128, 2048, 2050)]
+    [InlineData(GgmlTensorType.NVFP4, 4, 2048, 1030)]
+    [InlineData(GgmlTensorType.BF16, 1, 2048, 3074)]
+    [InlineData(GgmlTensorType.BF16, 70, 2048, 1030)]
+    public unsafe void MultiRowProducts_AreBitIdenticalAtAnyPoolWidth(GgmlTensorType type, int rows, int k, int n)
+    {
+        var rng = new Random(11 + rows + k + n + (int)type);
+        byte[] weights;
+        if (type == GgmlTensorType.BF16)
+        {
+            weights = new byte[2L * n * k];
+            for (long i = 0; i < weights.Length; i += 2)
+                BinaryPrimitives.WriteUInt16LittleEndian(weights.AsSpan((int)i),
+                    (ushort)(BitConverter.SingleToUInt32Bits((float)(rng.NextDouble() - 0.5) * 0.2f) >> 16));
+        }
+        else
+        {
+            weights = RandomWeights(rng, type, n, k);
+        }
+        float[] x = new float[(long)rows * k];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * (i % 61 == 0 ? 30f : 1f);
+        float[] serial = new float[(long)rows * n], pooled = new float[(long)rows * n], narrow = new float[(long)rows * n];
+        CpuWorkerPool pool = CpuWorkerPool.Shared;
+        fixed (byte* w = weights)
+        fixed (float* xp = x)
+        fixed (float* s = serial)
+        fixed (float* p = pooled)
+        fixed (float* q = narrow)
+        {
+            ManagedQuantizedOps.AddmmQuantizedToFloat32((int)type, (IntPtr)w, k, n, xp, k, rows, s, n,
+                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = 1 });
+            ManagedQuantizedOps.AddmmQuantizedToFloat32((int)type, (IntPtr)w, k, n, xp, k, rows, p, n);
+            int width = pool.ActiveThreads;
+            try
+            {
+                pool.SetActiveThreads(2);
+                ManagedQuantizedOps.AddmmQuantizedToFloat32((int)type, (IntPtr)w, k, n, xp, k, rows, q, n);
+            }
+            finally
+            {
+                pool.SetActiveThreads(width);
+            }
+        }
+        for (long i = 0; i < serial.Length; i++)
+        {
+            Assert.True(BitConverter.SingleToInt32Bits(serial[i]) == BitConverter.SingleToInt32Bits(pooled[i]),
+                $"{type} rows={rows} K={k} N={n} [{i / n},{i % n}]: one thread {serial[i]:R} vs the pool {pooled[i]:R}");
+            Assert.True(BitConverter.SingleToInt32Bits(serial[i]) == BitConverter.SingleToInt32Bits(narrow[i]),
+                $"{type} rows={rows} K={k} N={n} [{i / n},{i % n}]: one thread {serial[i]:R} vs two threads {narrow[i]:R}");
+        }
+    }
+
+    /// <summary>Guided blocks cover the units once, in order, none empty, none below the floor but the last, never
+    /// growing.</summary>
+    [Theory]
+    [InlineData(3840, 1, 18)]
+    [InlineData(3840, 1, 16)]
+    [InlineData(258, 4, 18)]
+    [InlineData(7, 3, 2)]
+    [InlineData(1, 1, 18)]
+    [InlineData(100, 200, 4)]
+    public void GuidedBounds_CoverEveryUnitOnceLargestFirst(int units, int minUnits, int threads)
+    {
+        int[] b = ManagedQuantizedOps.GuidedBounds(units, minUnits, threads);
+        Assert.Equal(0, b[0]);
+        Assert.Equal(units, b[^1]);
+        for (int i = 1; i < b.Length; i++)
+        {
+            Assert.True(b[i] > b[i - 1], $"block {i - 1} is empty");
+            if (i < b.Length - 1) Assert.True(b[i] - b[i - 1] >= minUnits, $"block {i - 1}: {b[i] - b[i - 1]} units");
+            if (i >= 2) Assert.True(b[i] - b[i - 1] <= b[i - 1] - b[i - 2], $"block {i - 1} is larger than the one before it");
+        }
+        // the first block is a 1 / (2 x threads) share (or the floor)
+        Assert.Equal(Math.Min(units, Math.Max(minUnits, (units + 2 * threads - 1) / (2 * threads))), b[1]);
+    }
+
+    /// <summary>The decode blocks cover the columns once, in order, every inner boundary on a four-column group, each
+    /// block at least 16 KB of weights (but the last), the large ones first.</summary>
+    [Theory]
+    [InlineData(2048, 1152, 16)]
+    [InlineData(15360, 1152, 16)]
+    [InlineData(2048, 6300, 18)]
+    [InlineData(128000, 1680, 16)]
+    [InlineData(37, 1152, 16)]
+    [InlineData(3, 64, 4)]
+    [InlineData(4099, 1088, 1)]
+    public void DecodeColumnBounds_CoverEveryColumnOnceLargestFirst(int outDim, int rowBytes, int threads)
+    {
+        int[] b = ManagedQuantizedOps.DecodeColumnBounds(outDim, rowBytes, threads);
+        Assert.Equal(0, b[0]);
+        Assert.Equal(outDim, b[^1]);
+        int minColumns = Math.Max(4, (16 * 1024 + rowBytes - 1) / rowBytes);
+        for (int i = 1; i < b.Length; i++)
+        {
+            Assert.True(b[i] > b[i - 1], $"block {i - 1} is empty");
+            if (i < b.Length - 1)
+            {
+                Assert.Equal(0, b[i] % 4);
+                Assert.True(b[i] - b[i - 1] >= minColumns, $"block {i - 1}: {b[i] - b[i - 1]} columns");
+            }
+            if (i >= 2) Assert.True(b[i] - b[i - 1] <= b[i - 1] - b[i - 2], $"block {i - 1} is larger than the one before it");
+        }
+        Assert.Same(b, ManagedQuantizedOps.DecodeColumnBounds(outDim, rowBytes, threads));
+    }
+
     /// <summary>BF16 products on ARM64 against DequantMatMulColumns (what they replace), bit for bit: row groups of
     /// four, leftover rows, K with and without 4- and 8-value tails, column counts that leave a partial group.</summary>
     [ArmDotTheory]
