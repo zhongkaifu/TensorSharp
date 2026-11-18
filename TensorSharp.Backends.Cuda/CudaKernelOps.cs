@@ -114,6 +114,8 @@ namespace TensorSharp.Cuda
 
         public static bool TryFill(Tensor result, float value)
         {
+            if (result != null && IsBlockQuantized(result.ElementType))
+                return value == 0f && TryZeroBlockQuantized(result);
             if (!TryGetContiguous(result, out CudaStorage storage, out IntPtr ptr, out long longCount) ||
                 longCount > int.MaxValue ||
                 (result.ElementType != DType.Float32 && result.ElementType != DType.Float16))
@@ -131,6 +133,84 @@ namespace TensorSharp.Cuda
                 kernels.LaunchFillF32(ptr, count, value, allocator.Stream.Handle);
             else
                 kernels.LaunchFillF16(ptr, count, value, allocator.Stream.Handle);
+            storage.MarkDeviceModified();
+            return true;
+        }
+
+        /// <summary>ggml's block-quantized K/V types (32 values a block: Q8_0 34 bytes, Q4_0 18): element offsets and strides are
+        /// bytes only at block boundaries.</summary>
+        private static bool IsBlockQuantized(DType dtype) => dtype is DType.Q8_0 or DType.Q4_0;
+
+        /// <summary>
+        /// A zero fill of a block-quantized tensor (a KV cache, or rows of it: a narrow from some row to its capacity) as byte
+        /// memsets of its blocks: zero bytes are blocks of d = 0, every value 0 and finite. One memset where the tensor is
+        /// contiguous; else one pitched memset per group of its outer extents (a [heads, rows, d] narrow of a head-first cache:
+        /// one). False (nothing written) where a run or a pitch falls inside a 32-value block. Through the host fallback a new
+        /// cache's fill had mirrored the whole tensor.
+        /// </summary>
+        private static bool TryZeroBlockQuantized(Tensor result)
+        {
+            if (result.Storage is not CudaStorage storage)
+                return false;
+            DType dtype = result.ElementType;
+            long count = result.ElementCount();
+            if (count == 0)
+                return true;
+            if (result.StorageOffset % 32 != 0)
+                return false;
+            int dimCount = result.DimensionCount;
+            ReadOnlySpan<long> sizes = result.Sizes, strides = result.Strides;
+            // The innermost extents that are one contiguous run.
+            long inner = 1;
+            int outer = dimCount;
+            for (int d = dimCount - 1; d >= 0; d--)
+            {
+                if (sizes[d] == 1) { outer = d; continue; }
+                if (strides[d] != inner) break;
+                inner = checked(inner * sizes[d]);
+                outer = d;
+            }
+            if (inner % 32 != 0)
+                return false;
+            for (int d = 0; d < outer; d++)
+                if (sizes[d] > 1 && strides[d] % 32 != 0)
+                    return false;
+            CudaAllocator allocator = storage.AllocatorImpl;
+            allocator.Context.MakeCurrent();
+            // Bytes the fill leaves alone stay as they are: the device copy is made current first.
+            storage.EnsureDeviceCurrent();
+            IntPtr stream = allocator.Stream.Handle;
+            IntPtr basePtr = storage.DevicePtrAtElement(0);
+            long innerBytes = dtype.ByteLengthFor(inner);
+            if (outer == 0 || inner == count)
+            {
+                CudaDriverApi.cuMemsetD8Async(basePtr + (nint)ElementOffsetToBytes(result.StorageOffset, dtype), 0, new UIntPtr((ulong)innerBytes),
+                    stream).ThrowOnError();
+                storage.MarkDeviceModified();
+                return true;
+            }
+            // The outer extent next to the run is the memset's rows; any further outer extents are looped on the host.
+            int rowDim = outer - 1;
+            while (rowDim > 0 && sizes[rowDim] == 1) rowDim--;
+            long rows = sizes[rowDim], pitch = ElementOffsetToBytes(strides[rowDim], dtype);
+            if (pitch < innerBytes)
+                return false;
+            var counter = new long[rowDim];
+            while (true)
+            {
+                long at = result.StorageOffset;
+                for (int d = 0; d < rowDim; d++) at = checked(at + counter[d] * strides[d]);
+                CudaDriverApi.cuMemsetD2D8Async(basePtr + (nint)ElementOffsetToBytes(at, dtype), new UIntPtr((ulong)pitch), 0,
+                    new UIntPtr((ulong)innerBytes), new UIntPtr((ulong)rows), stream).ThrowOnError();
+                int dim = rowDim - 1;
+                while (dim >= 0)
+                {
+                    if (++counter[dim] < sizes[dim]) break;
+                    counter[dim] = 0;
+                    dim--;
+                }
+                if (dim < 0) break;
+            }
             storage.MarkDeviceModified();
             return true;
         }
@@ -196,7 +276,7 @@ namespace TensorSharp.Cuda
                 return false;
 
             DType dtype = result.ElementType;
-            if (dtype == DType.Q8_0 && (innerElems % 32) != 0)
+            if (IsBlockQuantized(dtype) && (innerElems % 32) != 0)
                 return false;
 
             long innerBytes = checked(dtype.ByteLengthFor(innerElems));
@@ -209,7 +289,7 @@ namespace TensorSharp.Cuda
             // thousands of driver submissions per prefill forward pass.
             int rowDim = outerDims - 1;
             long rowCount = resultSizes[rowDim];
-            bool pitchOk = dtype != DType.Q8_0
+            bool pitchOk = !IsBlockQuantized(dtype)
                 || ((srcStrides[rowDim] % 32) == 0 && (resultStrides[rowDim] % 32) == 0);
 
             if (pitchOk)
@@ -220,7 +300,7 @@ namespace TensorSharp.Cuda
 
                 // Up to two group dimensions go into the same launch (a 3D/4D view of a prompt chunk had been a
                 // launch per row: ~90K launches in one Qwen3.5-9B 3.6K-token prefill on direct CUDA).
-                bool oneLaunch = groupDims is 1 or 2 && dtype != DType.Q8_0;
+                bool oneLaunch = groupDims is 1 or 2 && !IsBlockQuantized(dtype);
                 if (oneLaunch)
                 {
                     int g1 = groupDims - 1, g0 = groupDims - 2;
@@ -333,12 +413,12 @@ namespace TensorSharp.Cuda
 
         private static long ElementOffsetToBytes(long elementOffset, DType dtype)
         {
-            if (dtype == DType.Q8_0)
+            if (IsBlockQuantized(dtype))
             {
                 if ((elementOffset % 32) != 0)
                     throw new InvalidOperationException(
-                        $"Q8_0 byte offset requires element offset ({elementOffset}) to align to 32-element blocks.");
-                return checked((elementOffset / 32) * 34);
+                        $"{dtype} byte offset requires element offset ({elementOffset}) to align to 32-element blocks.");
+                return checked((elementOffset / 32) * (dtype == DType.Q8_0 ? 34 : 18));
             }
 
             return checked(elementOffset * dtype.Size());

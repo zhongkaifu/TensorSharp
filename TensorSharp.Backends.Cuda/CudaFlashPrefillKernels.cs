@@ -7,7 +7,7 @@
 //
 // Launchers for the tensor-core flash prefill attention kernels
 // (native/kernels/tensorsharp_flash_prefill.cu, compiled to tensorsharp_flash_prefill.ptx): the
-// attention CudaGraphExecutor runs a prompt chunk's rows on, over a head-first F16 cache.
+// attention CudaGraphExecutor runs prompt chunks, verify windows and decode rows on, over a head-first F16 or q8_0 cache.
 using System;
 using TensorSharp.Cuda.Interop;
 
@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 11;
+        public const int CurrentVersion = 12;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
@@ -30,6 +30,9 @@ namespace TensorSharp.Cuda
         private readonly IntPtr _prompt128, _prompt256;
         private readonly IntPtr _band256, _attn8_256;
         private readonly int _smem128, _smem256;
+        // The same kernels over a q8_0 cache (ts_flash_*_q8_d*), and their shared memory (raw rows and one F16 tile pair).
+        private readonly IntPtr _attnQ8128, _attnQ8256, _rowsQ8128, _rowsQ8256, _windowQ8128, _windowQ8256, _promptQ8128, _promptQ8256;
+        private readonly int _smemQ8128, _smemQ8256;
 
         /// <summary>The 8-bit prompt attention's head width, and the fewest keys a chunk attends before it takes it (the direct
         /// engine's Attn8MinKeys: below them the band is most of the work).</summary>
@@ -86,6 +89,19 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuFuncSetAttribute(_window256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_prompt128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(_prompt256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
+            _attnQ8128 = module.GetFunction("ts_flash_prefill_q8_d128");
+            _attnQ8256 = module.GetFunction("ts_flash_prefill_q8_d256");
+            _rowsQ8128 = module.GetFunction("ts_flash_decode_rows_q8_d128");
+            _rowsQ8256 = module.GetFunction("ts_flash_decode_rows_q8_d256");
+            _windowQ8128 = module.GetFunction("ts_flash_decode_window_q8_d128");
+            _windowQ8256 = module.GetFunction("ts_flash_decode_window_q8_d256");
+            _promptQ8128 = module.GetFunction("ts_flash_prompt_q8_d128");
+            _promptQ8256 = module.GetFunction("ts_flash_prompt_q8_d256");
+            (_smemQ8128, _smemQ8256) = (SharedBytes(128, q8: true), SharedBytes(256, q8: true));
+            foreach (IntPtr fn in new[] { _attnQ8128, _rowsQ8128, _windowQ8128, _promptQ8128 })
+                CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8128).ThrowOnError();
+            foreach (IntPtr fn in new[] { _attnQ8256, _rowsQ8256, _windowQ8256, _promptQ8256 })
+                CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8256).ThrowOnError();
             CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
             CudaDriverApi.cuDeviceGetAttribute(out int sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
             MultiprocessorCount = sms;
@@ -132,11 +148,25 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>Dynamic shared memory of the <paramref name="headDim"/> kernel (its TsFpAttnSmem): two stages of K and
-        /// V tiles, <see cref="TileKeys"/> rows of headDim + 8 halves each.</summary>
-        public static int SharedBytes(int headDim) => 2 * 2 * TileKeys * (headDim + 8) * 2;
+        /// V tiles, <see cref="TileKeys"/> rows of headDim + 8 halves each; over a q8_0 cache (TsFpAttnSmemQ8)
+        /// <see cref="Q8Stages"/> stages of K and V tiles of raw rows (<see cref="Q8RowBytes"/> each) and one F16 tile pair their
+        /// values are dequantized into.</summary>
+        public static int SharedBytes(int headDim, bool q8 = false)
+            => q8 ? Q8Stages * 2 * TileKeys * Q8RowBytes(headDim) + 2 * TileKeys * (headDim + 8) * 2 : 2 * 2 * TileKeys * (headDim + 8) * 2;
+
+        /// <summary>TS_FP_Q8_STAGES: raw q8_0 tiles the _q8 kernels keep in flight (a tile is half an F16 tile's bytes).</summary>
+        public const int Q8Stages = 3;
+
+        /// <summary>Bytes of a q8_0 cache row of <paramref name="headDim"/> values (ggml's block_q8_0: an F16 scale and 32 int8
+        /// codes, 34 bytes, per 32 values).</summary>
+        public static int Q8RowBytes(int headDim) => headDim / 32 * 34;
 
         /// <summary>Whether <see cref="LaunchAttention"/> runs here for <paramref name="headDim"/>-wide heads (sm_80 code).</summary>
         public bool RunsAttention(int headDim) => IsCurrent && ArchGuardedKernelsUsable && (headDim == 128 || headDim == 256);
+
+        /// <summary>Whether the launchers take a q8_0 cache (q8: true) for <paramref name="headDim"/>-wide heads: the _q8 kernels
+        /// of a current image (version 12 on) with its sm_80 code.</summary>
+        public bool RunsAttentionQ8(int headDim) => RunsAttention(headDim);
 
         /// <summary>Key splits for <paramref name="rows"/> query rows of each of <paramref name="kvHeads"/> KV heads over
         /// <paramref name="keys"/> keys: enough blocks for about two waves, each split at least four key tiles.</summary>
@@ -171,12 +201,14 @@ namespace TensorSharp.Cuda
         /// <paramref name="lenBias"/> (the keys a verify window's last row has past this row): one recording of a window padded
         /// to the slot's capacity then splits every length as the bucket window around it does. <paramref name="prompt"/>: the
         /// rows are a prompt chunk's (more than any verify window's): its row tiles run heaviest first and its warps skip the key
-        /// tiles past their rows (each row's arithmetic unchanged).
+        /// tiles past their rows (each row's arithmetic unchanged). <paramref name="q8"/>: k and v are q8_0 caches
+        /// (<see cref="Q8RowBytes"/> a row), whose values (RN_F16(code * d)) the kernels attend exactly as the F16 kernels attend an
+        /// F16 cache holding them.
         /// </summary>
         public unsafe void LaunchAttention(IntPtr q, IntPtr k, IntPtr v, int cap, int nq, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
             IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default, int windowKeys = 0, int bucket = 0, int lenBias = 0,
-            bool prompt = false)
+            bool prompt = false, bool q8 = false)
         {
             int rows = nq * (heads / kvHeads);
             IntPtr a0 = q, a1 = k, a2 = v, a11 = partial, a12 = output, a13 = dyn, a14 = cells, a15 = cellCount, a16 = cellMask;
@@ -185,8 +217,10 @@ namespace TensorSharp.Cuda
             float a9 = scale;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16,
                 &a17, &a18, &a19, &a20 };
-            IntPtr fn = !prompt ? (headDim == 128 ? _attn128 : _attn256) : headDim == 128 ? _prompt128 : _prompt256;
-            int smem = headDim == 128 ? _smem128 : _smem256;
+            IntPtr fn = q8
+                ? (!prompt ? (headDim == 128 ? _attnQ8128 : _attnQ8256) : headDim == 128 ? _promptQ8128 : _promptQ8256)
+                : (!prompt ? (headDim == 128 ? _attn128 : _attn256) : headDim == 128 ? _prompt128 : _prompt256);
+            int smem = q8 ? (headDim == 128 ? _smemQ8128 : _smemQ8256) : headDim == 128 ? _smem128 : _smem256;
             uint tiles = (uint)((rows + BlockRows - 1) / BlockRows);
             CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();
@@ -257,11 +291,13 @@ namespace TensorSharp.Cuda
         /// each row still its one-row launch's bits); with one, a row of the grid each. Without a selection and with
         /// <paramref name="bucket"/> &gt; 0, row z runs the splits <see cref="Splits"/> gives <see cref="BucketKeys"/> of
         /// <paramref name="windowKeys"/> and its own length (the decode row's at its position, recorded or not), never more than
-        /// <paramref name="splits"/> (the last row's); bucket 0 runs every row on <paramref name="splits"/>.
+        /// <paramref name="splits"/> (the last row's); bucket 0 runs every row on <paramref name="splits"/>. <paramref name="q8"/>: k and
+        /// v are q8_0 caches (as <see cref="LaunchAttention"/>).
         /// </summary>
         public unsafe void LaunchDecodeRows(IntPtr q, IntPtr k, IntPtr v, int cap, int rows, int len, int floor, int heads,
             int kvHeads, int headDim, float scale, int splits, IntPtr partial, IntPtr output, IntPtr stream, IntPtr dyn = default,
-            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default, int cellStride = 0, int windowKeys = 0, int bucket = 0)
+            IntPtr cells = default, IntPtr cellCount = default, IntPtr cellMask = default, int cellStride = 0, int windowKeys = 0, int bucket = 0,
+            bool q8 = false)
         {
             IntPtr a0 = q, a1 = k, a2 = v, a11 = partial, a12 = output, a13 = dyn, a14 = cells, a15 = cellCount, a16 = cellMask;
             int a3 = cap, a4 = rows, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = splits, a17 = cellStride, a18 = windowKeys, a19 = bucket,
@@ -270,7 +306,8 @@ namespace TensorSharp.Cuda
             if (cells == IntPtr.Zero && !RowGridForTests)
             {
                 void** wargs = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a18, &a19, &a20 };
-                var (wfn, wsmem) = headDim == 128 ? (_window128, _smem128) : (_window256, _smem256);
+                var (wfn, wsmem) = q8 ? (headDim == 128 ? (_windowQ8128, _smemQ8128) : (_windowQ8256, _smemQ8256))
+                    : headDim == 128 ? (_window128, _smem128) : (_window256, _smem256);
                 uint windowTiles = (uint)((rows * (heads / kvHeads) + BlockRows - 1) / BlockRows);
                 CudaDriverApi.cuLaunchKernel(wfn, windowTiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)wsmem, stream, (IntPtr)wargs,
                     IntPtr.Zero).ThrowOnError();
@@ -279,7 +316,8 @@ namespace TensorSharp.Cuda
             {
                 void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16, &a17,
                     &a18, &a19, &a20 };
-                var (fn, smem) = headDim == 128 ? (_rows128, _smem128) : (_rows256, _smem256);
+                var (fn, smem) = q8 ? (headDim == 128 ? (_rowsQ8128, _smemQ8128) : (_rowsQ8256, _smemQ8256))
+                    : headDim == 128 ? (_rows128, _smem128) : (_rows256, _smem256);
                 uint tiles = (uint)((heads / kvHeads + BlockRows - 1) / BlockRows);
                 CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, (uint)rows, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
                     IntPtr.Zero).ThrowOnError();

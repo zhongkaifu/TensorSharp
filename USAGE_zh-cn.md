@@ -344,7 +344,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 
 | 参数 | 说明 |
 |---|---|
-| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（默认：自动——由后端 / 模型决定；环境变量 `KV_CACHE_DTYPE`）。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径；DeepSeek V4 / V4.1 会在加载时拒绝它们（其执行器的 cache 固定为 F16，由自己的内核读取），显式的 `f32` 会按 `f16` 报告。 |
+| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（默认：自动——由后端 / 模型决定；环境变量 `KV_CACHE_DTYPE`）。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）在 GGML 后端走其 flash 路径；在 `--backend cuda` 上，`q8_0` 由 CUDA 执行器自己的 flash 内核运行（decode、验证窗口与 prompt 分块读取的字节约为 `f16` 的一半；这些内核不接的路径会警告一次并走通用注意力），而 `q4_0`，以及带 Qwen3.8 Flash Next QSA 层的模型上的 `q8_0`，会让模型在那里不走整图前向；DeepSeek V4 / V4.1 会在加载时拒绝它们（其执行器的 cache 固定为 F16，由自己的内核读取），显式的 `f32` 会按 `f16` 报告。 |
 | `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。与 `--layer-split P` 一起使用时，在声明支持的架构上选择混合放置（P 个整层阶段，每个阶段 N 张 GPU，仅限单进程）；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
 | `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。支持的架构可配合 `--tp-node-id`、`--tp-peers` 跨节点运行；与大于 1 的 `--tp T` 一起使用时选择混合放置（仅限单进程）。详见[多节点推理](docs/multi-node-inference.md)。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
 | `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |

@@ -2164,6 +2164,17 @@ public sealed class Qwen35RuntimeTests : IDisposable
     public Task EngineSpeculationOnDirectCudaMatchesPlain(string variant, string speculator)
         => EngineSpeculationMatchesPlain(variant, speculator, BackendType.Cuda);
 
+    /// <summary>The same over a q8_0 cache (an explicit <c>--kv-cache-dtype q8_0</c>: the CUDA executor's _q8 flash kernels and
+    /// q8_0 row writes, the verify windows' rows the decode rows' bits): the plain greedy streams.</summary>
+    [CudaTheory]
+    [InlineData("dense", SpeculatorRegistry.NGram)]
+    [InlineData("dense-nextn", SpeculatorRegistry.DraftHead)]
+    public async Task EngineSpeculationOnDirectCudaMatchesPlainOverAQ8Cache(string variant, string speculator)
+    {
+        using IDisposable kv = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0);
+        await EngineSpeculationMatchesPlain(variant, speculator, BackendType.Cuda);
+    }
+
     /// <summary>A batched verify whose graph finds no device memory for its compute buffer is retried once after the
     /// cached graphs are freed, and declined (the step decodes plainly) when it fails again: the requests get the plain
     /// greedy streams either way, where the failure used to fail them.</summary>

@@ -60,11 +60,14 @@ namespace TensorSharp.Models
         /// took 36; over a 4K prompt of Qwen3.8-27B on an RTX PRO 4000 the norms, rotaries, strided copies and cache writes took
         /// ~28 ms (with the layers' other norms and copies) where the engine's kernel took 10.6. Text positions only (a media step's
         /// rotary is multi-axis), and F16 or F32 caches, the ones the kernel writes: a declined region runs its ops with each norm's
-        /// weight a product of its own, a launch more than the step without the region.
+        /// weight a product of its own, a launch more than the step without the region. A q8_0 cache's too where the executor
+        /// takes q8_0 in its own kernels alone (direct CUDA, whose prep kernel quantizes the rows as its row writes do); an
+        /// executor that takes block caches in every view (GGML) keeps the graphs it ran.
         /// </summary>
         protected override bool TakesAttentionPrep(GraphStep step, int layer)
             => !AttentionPrepRegionDisabledForTests && step.PositionTable < 0 && step.Positions >= 0 && _rotary != null
-               && KvCacheGraphType is GraphFormat.F16 or GraphFormat.F32;
+               && (KvCacheGraphType is GraphFormat.F16 or GraphFormat.F32
+                   || (KvCacheGraphType == GraphFormat.Q8_0 && GraphExecutor is { Capabilities.QuantizedKvCache: false }));
 
         protected override void BeginAttentionPrep(GraphStep step, int layer, in AttentionPrepOperands prep)
         {

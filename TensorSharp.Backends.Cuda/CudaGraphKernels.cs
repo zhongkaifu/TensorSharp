@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 33;
+        public const int CurrentVersion = 34;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -77,6 +77,8 @@ namespace TensorSharp.Cuda
             _repackQ6kTiled = module.GetFunction("ts_graph_repack_q6k_tiled");
             _qsaStorePool = module.GetFunction("ts_graph_qsa_store_pool_f32");
             _attnPrep = module.GetFunction("ts_graph_attn_prep_f32");
+            _setRowsQ8 = module.GetFunction("ts_graph_set_rows_q8_0");
+            _q8ToF32 = module.GetFunction("ts_graph_q8_0_to_f32");
             // The tiled head's products stream with cp.async into the int8 tensor cores: only an image with their sm_80 bodies.
             if (ArchGuardedKernelsUsable)
             {
@@ -148,15 +150,18 @@ namespace TensorSharp.Cuda
         /// v [rows][kvHeads][dv] (F32, each head's values contiguous, rows and heads the given strides apart, in floats) normed with
         /// <paramref name="qNorm"/> / <paramref name="kNorm"/> [d] and rotated at <paramref name="positions"/> [rows]; the queries into
         /// <paramref name="output"/> (rows <paramref name="outRow"/> and heads <paramref name="outHead"/> floats apart), the keys and
-        /// values into the head-first caches [kvHeads][cap][d] and [kvHeads][cap][dv] (F16 where <paramref name="f16Cache"/>, else F32)
-        /// at the KV indices <paramref name="cells"/> [rows].
+        /// values into the head-first caches [kvHeads][cap][d] and [kvHeads][cap][dv] (<paramref name="cacheFormat"/>: <see cref="CacheF32"/>,
+        /// <see cref="CacheF16"/>, or <see cref="CacheQ8_0"/>'s rows of d / 32 * 34 bytes, d and dv multiples of 32) at the KV indices
+        /// <paramref name="cells"/> [rows].
         /// </summary>
         public void LaunchAttentionPrep(IntPtr q, long qRow, long qHead, IntPtr k, long kRow, long kHead, IntPtr v, long vRow, long vHead,
-            IntPtr qNorm, IntPtr kNorm, IntPtr output, long outRow, long outHead, IntPtr kCache, IntPtr vCache, bool f16Cache, int cap,
+            IntPtr qNorm, IntPtr kNorm, IntPtr output, long outRow, long outHead, IntPtr kCache, IntPtr vCache, int cacheFormat, int cap,
             IntPtr positions, IntPtr cells, int rows, int heads, int kvHeads, int d, int dv, float eps, int ropeDim, int mode, int ctx,
             float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow, IntPtr stream)
         {
-            int half = f16Cache ? 1 : 0;
+            if (cacheFormat is not (CacheF32 or CacheF16 or CacheQ8_0) || (cacheFormat == CacheQ8_0 && (d % 32 != 0 || dv % 32 != 0)))
+                throw new ArgumentOutOfRangeException(nameof(cacheFormat), $"attention prep into cache format {cacheFormat} of {d} / {dv} values a row");
+            int half = cacheFormat;
             long units = (long)rows * (heads + 2L * kvHeads);
             if (units < 1 || (units + AttentionPrepWarps - 1) / AttentionPrepWarps > int.MaxValue)
                 throw new ArgumentOutOfRangeException(nameof(rows), $"attention prep of {rows} rows of {heads} + 2 x {kvHeads} heads");
@@ -460,6 +465,38 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &src, &ids, &output, &rowLen, &n, &rowsPerBatch, &rowPitch };
             CudaDriverApi.cuLaunchKernel(half ? _getRowsF16 : _getRows, (uint)(n * batches), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The cache formats <see cref="LaunchAttentionPrep"/> writes (TS_GRAPH_CACHE_* in the kernel).</summary>
+        public const int CacheF32 = 0, CacheF16 = 1, CacheQ8_0 = 2;
+
+        /// <summary>
+        /// ggml_set_rows into a q8_0 cache, and the F32 -> q8_0 copy of rows: for each of <paramref name="heads"/> heads, dst row
+        /// ids[i] (first + i where <paramref name="ids"/> is zero, first re-read from a recorded step's dynamic block
+        /// <paramref name="dyn"/> on every replay where it is given; rows <paramref name="dstRowBytes"/> and heads
+        /// <paramref name="dstHeadBytes"/> bytes apart, <paramref name="dstRows"/> of them) takes F32 src row i of
+        /// <paramref name="width"/> values (rows <paramref name="srcRow"/> and heads <paramref name="srcHead"/> floats apart), quantized
+        /// as ggml's quantize_row_q8_0 - the bytes <see cref="LaunchAttentionPrep"/> writes for the same values.
+        /// </summary>
+        public void LaunchSetRowsQ8(IntPtr src, long srcRow, long srcHead, IntPtr ids, int first, IntPtr dst, long dstRowBytes, long dstHeadBytes,
+            int dstRows, int width, int count, int heads, IntPtr stream, IntPtr dyn = default)
+        {
+            if (width < 32 || width % 32 != 0 || count < 1 || heads < 1 || heads > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(width), $"q8_0 rows: {count} rows of {heads} heads of {width} values");
+            void** args = stackalloc void*[] { &src, &srcRow, &srcHead, &ids, &first, &dyn, &dst, &dstRowBytes, &dstHeadBytes, &dstRows, &width };
+            uint warps = (uint)Math.Min(8, width / 32);
+            CudaDriverApi.cuLaunchKernel(_setRowsQ8, (uint)count, (uint)heads, 1, 32 * warps, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>q8_0 rows [0, <paramref name="rows"/>) of <paramref name="heads"/> heads (rows <paramref name="rowBytes"/> and heads
+        /// <paramref name="headBytes"/> bytes apart) as F32 [heads][rows][width]: RN_F16(code * d) widened, the values the flash
+        /// kernels' tiles hold.</summary>
+        public void LaunchQ8ToF32(IntPtr src, long rowBytes, long headBytes, IntPtr dst, int rows, int heads, int width, IntPtr stream)
+        {
+            if (width < 32 || width % 32 != 0 || rows < 1 || heads < 1 || heads > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(width), $"q8_0 to F32: {rows} rows of {heads} heads of {width} values");
+            void** args = stackalloc void*[] { &src, &rowBytes, &headBytes, &dst, &rows, &width };
+            CudaDriverApi.cuLaunchKernel(_q8ToF32, (uint)rows, (uint)heads, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>ggml_set_rows by device int32 ids: dst row ids[i] (F32, or F16 when <paramref name="half"/>; rows

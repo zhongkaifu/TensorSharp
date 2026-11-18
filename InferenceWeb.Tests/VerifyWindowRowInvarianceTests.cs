@@ -45,15 +45,22 @@ public sealed class VerifyWindowRowInvarianceTests : IDisposable
     private static readonly (int Width, int Keep)[] Windows =
         { (2, 0), (3, 0), (4, 0), (5, 0), (7, 0), (8, 0), (9, 0), (12, 0), (16, 0), (4, 3), (8, 5), (16, 11) };
 
+    /// <remarks>Over a q8_0 cache too (the CUDA executor's _q8 flash kernels and q8_0 row writes): a row's bytes depend on its
+    /// values alone, and a window's rows read the dequantized tiles the decode rows read. With the attention prep region off
+    /// ("ops"), every row is written by the set_rows ops, whose recorded appends re-read their write row on every replay:
+    /// baked at the capture, a q8_0 window's replay at a later position had rewritten the capture's rows.</remarks>
     [CudaTheory]
-    [InlineData("qwen35")]
-    public void WindowRowsAreTheDecodeRowsBitForBit(string family)
+    [InlineData("qwen35", "f16")]
+    [InlineData("qwen35", "q8_0")]
+    [InlineData("qwen35", "q8_0-ops")]
+    public void WindowRowsAreTheDecodeRowsBitForBit(string family, string kv)
     {
-        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(kv.StartsWith("q8_0", StringComparison.Ordinal) ? KvCacheDtype.Q8_0 : KvCacheDtype.F16);
         // Rows of 1,024: the row norm's reductions (256 threads) and the fused add and norm's (512) sum other partials there.
         string path = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, Width = 1024 }
             .Write(Path.Combine(_dir, family + ".gguf"));
-        using var model = new Qwen35RuntimeModel(path, BackendType.Cuda);
+        using var model = new Qwen35RuntimeModel(path, BackendType.Cuda) { AttentionPrepRegionDisabledForTests = kv.EndsWith("-ops", StringComparison.Ordinal) };
+        Assert.Equal(kv.Split('-')[0], model.KvCacheDtype.ToShortString());
         var unified = Assert.IsAssignableFrom<IUnifiedBatchModel>(model);
         var batched = Assert.IsAssignableFrom<IBatchedSpeculativeTarget>(model);
         int vocab = model.Config.VocabSize;
@@ -68,7 +75,7 @@ public sealed class VerifyWindowRowInvarianceTests : IDisposable
             int differ = rows.Count(r => !r.Value.AsSpan().SequenceEqual(plain[r.Key]));
             int afterDiffer = after.Where((a, i) => !a.AsSpan().SequenceEqual(plainAfter[i])).Count();
             int first = rows.Where(r => !r.Value.AsSpan().SequenceEqual(plain[r.Key])).Select(r => r.Key).DefaultIfEmpty(-1).Min();
-            _output.WriteLine($"{family} {width}-row windows{(keep > 0 ? $" keeping {keep}" : "")}: {rows.Count - differ} of {rows.Count} rows " +
+            _output.WriteLine($"{family} ({kv}) {width}-row windows{(keep > 0 ? $" keeping {keep}" : "")}: {rows.Count - differ} of {rows.Count} rows " +
                 $"the decode rows' bits{(first >= 0 ? $" (first apart at position {first})" : "")}; {Follow - afterDiffer} of {Follow} steps after them the same");
             if (differ > 0 || afterDiffer > 0) failures++;
         }

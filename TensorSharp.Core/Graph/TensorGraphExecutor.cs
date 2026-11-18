@@ -126,6 +126,11 @@ namespace TensorSharp.Graph
         /// <inheritdoc cref="IGraphExecutor.AttendsCapacityWindows"/>
         public virtual bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
 
+        /// <inheritdoc cref="IGraphExecutor.TakesKvCacheFormat"/>
+        public virtual bool TakesKvCacheFormat(int kvFormat, int keyDim, int valueDim)
+            => kvFormat is GraphFormat.F32 or GraphFormat.F16
+               || (kvFormat is GraphFormat.Q8_0 or GraphFormat.Q4_0 && Capabilities.QuantizedKvCache);
+
         // ================================================================ kernels a backend provides
 
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>

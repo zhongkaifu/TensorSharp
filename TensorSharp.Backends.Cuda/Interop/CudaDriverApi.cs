@@ -132,6 +132,9 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName, EntryPoint = "cuMemsetD8Async")]
         public static partial int cuMemsetD8Async(IntPtr dstDevice, byte value, UIntPtr count, IntPtr stream);
 
+        [LibraryImport(LibName, EntryPoint = "cuMemsetD2D8Async")]
+        public static partial int cuMemsetD2D8Async(IntPtr dstDevice, UIntPtr dstPitch, byte value, UIntPtr width, UIntPtr height, IntPtr stream);
+
         [LibraryImport(LibName, EntryPoint = "cuMemsetD32Async")]
         public static partial int cuMemsetD32Async(IntPtr dstDevice, uint value, UIntPtr count, IntPtr stream);
 

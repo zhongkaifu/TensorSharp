@@ -80,9 +80,23 @@ namespace TensorSharp.Models
                 if (_moeLayer[l] && IsExpertLayerOffloaded(l) && !GraphExecutor.Capabilities.HostExperts) return "host-offloaded experts";
             DType kv = _kvCacheDtype.ToDType();
             if (kv != DType.Float32 && kv != DType.Float16 && kv != DType.Q8_0 && kv != DType.Q4_0) return $"KV dtype {kv}";
-            if ((kv == DType.Q8_0 || kv == DType.Q4_0) && !GraphExecutor.Capabilities.QuantizedKvCache) return $"KV dtype {kv} on this backend's executor";
+            if ((kv == DType.Q8_0 || kv == DType.Q4_0) && !GraphExecutor.TakesKvCacheFormat(KvGgmlType(kv), _keyDim, _valueDim))
+                return $"KV dtype {kv} on this backend's executor";
+            // An executor that takes the block format in its attention kernels and row writes only (not in every view of a cache:
+            // direct CUDA's q8_0) serves the families whose attention is those kernels' alone.
+            if ((kv == DType.Q8_0 || kv == DType.Q4_0) && !GraphExecutor.Capabilities.QuantizedKvCache && !AttentionRoutesTakeQuantizedKv)
+                return $"KV dtype {kv} with {Config.Architecture}'s attention routes on this backend's executor";
             return null;
         }
+
+        /// <summary>Tests: why this model runs no whole-forward graphs (null where it runs them).</summary>
+        internal string GraphRefusalForTests => GraphUnsupportedReason();
+
+        /// <summary>Whether every route this family's attention takes reads and writes its K/V caches through the plain
+        /// attention and row writes (no extra key caches, no selective-attention regions or masks of its own), so an executor
+        /// that takes a block-quantized cache in those alone (<see cref="IGraphExecutor.TakesKvCacheFormat"/> without
+        /// <see cref="GraphCapabilities.QuantizedKvCache"/>) runs the family's graphs over one. Default true.</summary>
+        protected virtual bool AttentionRoutesTakeQuantizedKv => true;
 
         private readonly Dictionary<string, IGraphExpertWeights> _graphExpertSets = new();
 

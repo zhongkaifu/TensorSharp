@@ -2679,10 +2679,12 @@ namespace TensorSharp.Models
                 return;
             }
             if (source.Storage is TensorSharp.Cuda.CudaStorage && destination.Storage is TensorSharp.Cuda.CudaStorage
-                && source.ElementType is DType.Float16 or DType.Float32)
+                && source.ElementType is DType.Float16 or DType.Float32 or DType.Q8_0 or DType.Q4_0)
             {
                 // On the device too (one strided byte copy): through the host mirror, a direct-CUDA checkpoint
-                // downloaded both caches at their whole capacity and the copy was uploaded again at its next use.
+                // downloaded both caches at their whole capacity and the copy was uploaded again at its next use. A
+                // block-quantized cache's rows are whole blocks (a head's capacity times its width a multiple of 32), so
+                // its heads are one pitched copy as well.
                 using Tensor from = source.Narrow(1, 0, rows);
                 using Tensor to = destination.Narrow(1, 0, rows);
                 Ops.Copy(to, from);

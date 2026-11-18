@@ -659,9 +659,11 @@ Request KV state is owned by `InferenceEngine`. The KV cache can be stored at re
 `--kv-cache-dtype <f32|f16|q8_0|q4_0>` (or the `KV_CACHE_DTYPE` env var) on
 both the CLI and the server. The default is chosen automatically per model
 (`f16` when the model's weights are below F32, `f32` otherwise); the block-quantized tiers
-(`q8_0`, `q4_0`) require the native GGML flash-attention path, and `q4_0`
-(~1/7 of f32) targets very long 128K–256K contexts where the KV cache
-dominates memory.
+(`q8_0`, `q4_0`) run on the GGML backends' flash-attention path, and `q8_0` also
+on `--backend cuda`, whose executor's flash kernels read it directly (about half
+the bytes of `f16` a step; its slots, copies and growth halve too), while `q4_0`
+keeps a model off whole-forward graphs there. `q4_0` (~1/7 of f32) targets very
+long 128K–256K contexts where the KV cache dominates memory.
 
 ## Remaining Work
 

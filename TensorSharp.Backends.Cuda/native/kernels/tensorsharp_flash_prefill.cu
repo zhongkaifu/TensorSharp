@@ -38,7 +38,7 @@
 // K and Q are scaled per key and per row). Off by default (CudaGraphExecutor.PromptAttention8Enabled).
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 11
+#define TS_FLASH_PREFILL_VERSION 12
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -76,6 +76,13 @@ extern "C" __global__ void ts_flash_prefill_caps(int* out)
 // without cellMask (a selection whose kept cells all hold 0: QSA's) nothing is added, the same sums.
 // sm_80+ (cp.async, ldmatrix, mma.f16): the compute_75 image traps here; the host launches it only where
 // CudaPrefillModule.ArchGuardedKernelsUsable holds.
+//
+// The _q8 kernels take a q8_0 cache (ggml's block_q8_0 rows: per 32 values an F16 scale d then 32 int8 codes, 34 bytes, so
+// HD / 32 * 34 bytes a row, [nKv][cap] rows) and run the F16 kernels' arithmetic on its values: each 32-key tile's raw rows
+// stream through the same two-stage cp.async pipeline, and every thread of the block - the warps a decode row or a verify
+// window leaves idle among them - dequantizes them into one F16 tile pair, value = RN_F16(code * d) (__hmul2: code * d is exact
+// in F32), before the warps compute exactly as the F16 kernel does from its tile. A q8_0 cache then answers as the F16 kernel
+// over the F16 cache of its values, bit for bit, with half the bytes read.
 // ---------------------------------------------------------------------------
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -98,6 +105,17 @@ __device__ __forceinline__ void ts_fp_cp16(void* dst, const void* src, bool vali
 #endif
 }
 
+// 8 bytes (a q8_0 row of 128 values is 136 bytes: its rows are 8-byte aligned only).
+__device__ __forceinline__ void ts_fp_cp8(void* dst, const void* src, bool valid)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n"
+                 :: "r"(ts_fp_smem_u32(dst)), "l"(src), "r"(valid ? 8 : 0));
+#else
+    __trap();
+#endif
+}
+
 __device__ __forceinline__ void ts_fp_cp_commit()
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -111,6 +129,17 @@ __device__ __forceinline__ void ts_fp_cp_wait0()
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 0;\n" ::);
+#else
+    __trap();
+#endif
+}
+
+// Until at most N of this thread's newest cp.async groups are pending.
+template <int N>
+__device__ __forceinline__ void ts_fp_cp_wait()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 #else
     __trap();
 #endif
@@ -163,7 +192,70 @@ struct TsFpAttnSmem
     static constexpr int ROW = HD + 8;   // F16 tile row stride (bank-spread)
     half k[2][TS_FP_KT * ROW];
     half v[2][TS_FP_KT * ROW];
+    __device__ __forceinline__ const half* kt(int st) const { return k[st]; }
+    __device__ __forceinline__ const half* vt(int st) const { return v[st]; }
 };
+
+// Bytes of a q8_0 cache row of HD values (ggml's block_q8_0: F16 d, then 32 int8 codes).
+template <int HD>
+struct TsFpQ8Row
+{
+    static constexpr int BYTES = HD / 32 * 34;
+    static constexpr int CHUNK = BYTES % 16 == 0 ? 16 : 8;   // the cp.async size its rows' alignment allows
+    static constexpr int CHUNKS = BYTES / CHUNK;
+};
+
+// Raw q8_0 tile stages in flight: a q8_0 tile is half an F16 tile's bytes, so two of them ahead of the one being dequantized
+// keep as many bytes coming as the F16 kernel's one (with two stages the q8_0 kernels waited on memory latency, not bandwidth:
+// an 8-row Qwen3.8-27B window 4% faster than F16, not 40%, on an RTX PRO 4500).
+#define TS_FP_Q8_STAGES 3
+
+// Dynamic shared memory of ts_flash_*_q8_d<HD>: TS_FP_Q8_STAGES stages x (K, V) x TS_FP_KT raw q8_0 rows, and one F16 tile pair
+// their values are dequantized into (CudaFlashPrefillKernels.SharedBytes computes the same).
+template <int HD>
+struct TsFpAttnSmemQ8
+{
+    static constexpr int ROW = HD + 8;
+    static constexpr int RAW = TsFpQ8Row<HD>::BYTES;
+    uint8_t raw[TS_FP_Q8_STAGES][2][TS_FP_KT * RAW];   // [stage][K, V]
+    half k[TS_FP_KT * ROW];
+    half v[TS_FP_KT * ROW];
+    __device__ __forceinline__ const half* kt(int) const { return k; }
+    __device__ __forceinline__ const half* vt(int) const { return v; }
+};
+
+template <int HD, bool Q8> struct TsFpSmemOf { typedef TsFpAttnSmem<HD> T; typedef half Cache; };
+template <int HD> struct TsFpSmemOf<HD, true> { typedef TsFpAttnSmemQ8<HD> T; typedef uint8_t Cache; };
+
+// The cache row `row` of the head at `head` (q8_0 rows of TsFpQ8Row<HD>::BYTES bytes): the one place a tile loader forms a row's
+// address (a block table would change it alone).
+template <int HD>
+__device__ __forceinline__ const uint8_t* ts_fp_q8_row(const uint8_t* head, int row)
+{
+    return head + (long long)row * TsFpQ8Row<HD>::BYTES;
+}
+
+// One q8_0 block (34 bytes at b: F16 d, then 32 int8 codes, 2-byte aligned) as 32 F16 values RN_F16(code * d) at dst (16-byte
+// aligned): each pair of codes biased into the mantissa of 1024 (0x6400 | (code + 128): exact), less 1152, times d.
+__device__ __forceinline__ void ts_fp_q8_block_to_h(const uint8_t* b, half* dst)
+{
+    const uint16_t* w = reinterpret_cast<const uint16_t*>(b);
+    const half2 d2 = __half2half2(__ushort_as_half(w[0]));
+    const half2 bias = __half2half2(__ushort_as_half((unsigned short)0x6480));   // 1152
+    uint32_t o[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+    {
+        const uint32_t h = __byte_perm((uint32_t)w[1 + j] ^ 0x8080u, 0x64u, 0x4140);
+        half2 x = __hsub2(*reinterpret_cast<const half2*>(&h), bias);
+        x = __hmul2(x, d2);
+        o[j] = *reinterpret_cast<const uint32_t*>(&x);
+    }
+    uint4* out = reinterpret_cast<uint4*>(dst);
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        out[j] = make_uint4(o[4 * j], o[4 * j + 1], o[4 * j + 2], o[4 * j + 3]);
+}
 
 // CudaFlashPrefillKernels.Splits on the device: key splits for `rows` query rows of each of nKv KV heads over `keys` keys,
 // enough blocks for about two waves of the device's sms multiprocessors, each split at least four key tiles.
@@ -208,9 +300,13 @@ __device__ __forceinline__ int ts_fp_live_splits(int launched, const int* __rest
 // first (block x takes tile tiles - 1 - x / splits: the last rows see the most keys, and a light tile now ends the grid where
 // the heaviest had started last), and a warp skips the key tiles past every one of its rows' ends (a whole tile its rows
 // mask: the zeros it added left every sum as it was) - each row's arithmetic is the plain launch's.
-template <int HD, bool WIN = false, bool PROMPT = false>
+// Q8: kc and vc are q8_0 caches (TsFpQ8Row<HD>::BYTES a row): each tile's raw rows are dequantized into the F16 tile by the
+// whole block between two barriers, then every warp computes from it as the F16 kernel computes from its own (keys a tile does
+// not load are zero rows in both).
+template <int HD, bool WIN = false, bool PROMPT = false, bool Q8 = false>
 __device__ __forceinline__ void ts_fp_attn(
-    const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len,
+    const float* __restrict__ q, const typename TsFpSmemOf<HD, Q8>::Cache* __restrict__ kc,
+    const typename TsFpSmemOf<HD, Q8>::Cache* __restrict__ vc, int cap, int nq, int len,
     int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out,
     const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask,
     int live, int windowKeys = 0, int bucket = 0, int sms = 0)
@@ -223,9 +319,10 @@ __device__ __forceinline__ void ts_fp_attn(
         len = cellCount[0];
         floor = 0;
     }
-    constexpr int ROW = TsFpAttnSmem<HD>::ROW, KS = HD / 16, NS = HD / 8;
+    typedef typename TsFpSmemOf<HD, Q8>::T Smem;
+    constexpr int ROW = Smem::ROW, KS = HD / 16, NS = HD / 8;
     extern __shared__ __align__(16) uint8_t ts_fp_attn_smem[];
-    TsFpAttnSmem<HD>& sm = *reinterpret_cast<TsFpAttnSmem<HD>*>(ts_fp_attn_smem);
+    Smem& sm = *reinterpret_cast<Smem*>(ts_fp_attn_smem);
     const int kvh = blockIdx.y;
     const int G = nHead / nKv;
     const int R = nq * G;
@@ -290,24 +387,57 @@ __device__ __forceinline__ void ts_fp_attn(
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) warpEnd = max(warpEnd, __shfl_xor_sync(0xffffffffu, warpEnd, o));
     }
-    const half* kHead = kc + (long long)kvh * cap * HD;
-    const half* vHead = vc + (long long)kvh * cap * HD;
+    typedef typename TsFpSmemOf<HD, Q8>::Cache Cache;
+    const Cache* kHead = kc + (long long)kvh * cap * (Q8 ? TsFpQ8Row<HD>::BYTES : HD);
+    const Cache* vHead = vc + (long long)kvh * cap * (Q8 ? TsFpQ8Row<HD>::BYTES : HD);
 
     auto load = [&](int st, int first) {
-        constexpr int CHUNKS = HD / 8;   // 16-byte chunks of a key row
-        for (int i = tid; i < 2 * TS_FP_KT * CHUNKS; i += blockDim.x)
+        if constexpr (Q8)
         {
-            const int isV = i >= TS_FP_KT * CHUNKS, c = isV ? i - TS_FP_KT * CHUNKS : i;
-            const int key = c / CHUNKS, part = c % CHUNKS;
-            const bool ok = first + key < kHi;
-            const int row = !ok ? 0 : cells != nullptr ? cells[first + key] : first + key;
-            const half* src = (isV ? vHead : kHead) + (long long)row * HD + part * 8;
-            ts_fp_cp16((isV ? sm.v[st] : sm.k[st]) + key * ROW + part * 8, src, ok);
+            // The tile's raw q8_0 rows, in the cp.async chunks their alignment allows.
+            constexpr int CH = TsFpQ8Row<HD>::CHUNK, CHUNKS = TsFpQ8Row<HD>::CHUNKS, RAW = TsFpQ8Row<HD>::BYTES;
+            for (int i = tid; i < 2 * TS_FP_KT * CHUNKS; i += blockDim.x)
+            {
+                const int isV = i >= TS_FP_KT * CHUNKS, c = isV ? i - TS_FP_KT * CHUNKS : i;
+                const int key = c / CHUNKS, part = c % CHUNKS;
+                const bool ok = first + key < kHi;
+                const int row = !ok ? 0 : cells != nullptr ? cells[first + key] : first + key;
+                const uint8_t* src = ts_fp_q8_row<HD>(isV ? vHead : kHead, row) + part * CH;
+                uint8_t* dst = sm.raw[st][isV] + key * RAW + part * CH;
+                if constexpr (CH == 16) ts_fp_cp16(dst, src, ok);
+                else ts_fp_cp8(dst, src, ok);
+            }
+        }
+        else
+        {
+            constexpr int CHUNKS = HD / 8;   // 16-byte chunks of a key row
+            for (int i = tid; i < 2 * TS_FP_KT * CHUNKS; i += blockDim.x)
+            {
+                const int isV = i >= TS_FP_KT * CHUNKS, c = isV ? i - TS_FP_KT * CHUNKS : i;
+                const int key = c / CHUNKS, part = c % CHUNKS;
+                const bool ok = first + key < kHi;
+                const int row = !ok ? 0 : cells != nullptr ? cells[first + key] : first + key;
+                const half* src = (isV ? vHead : kHead) + (long long)row * HD + part * 8;
+                ts_fp_cp16((isV ? sm.v[st] : sm.k[st]) + key * ROW + part * 8, src, ok);
+            }
         }
     };
-    if (kHi > kLo)
-        load(0, kLo);
-    ts_fp_cp_commit();
+    if constexpr (Q8)
+    {
+#pragma unroll
+        for (int s = 0; s < TS_FP_Q8_STAGES - 1; ++s)
+        {
+            if (kLo + s * TS_FP_KT < kHi)
+                load(s, kLo + s * TS_FP_KT);
+            ts_fp_cp_commit();
+        }
+    }
+    else
+    {
+        if (kHi > kLo)
+            load(0, kLo);
+        ts_fp_cp_commit();
+    }
 
     const float log2Scale = scale * 1.4426950408889634f;
     uint32_t qa[KS][4];
@@ -333,21 +463,45 @@ __device__ __forceinline__ void ts_fp_attn(
         acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
 
-    for (int first = kLo, t = 0; first < kHi; first += TS_FP_KT, ++t)
+    for (int first = kLo, t = 0, q8Stage = 0; first < kHi; first += TS_FP_KT, ++t)
     {
-        const int st = t & 1;
-        ts_fp_cp_wait0();
+        const int st = Q8 ? q8Stage : t & 1;
+        if constexpr (Q8)
+            ts_fp_cp_wait<TS_FP_Q8_STAGES - 2>();
+        else
+            ts_fp_cp_wait0();
         __syncthreads();   // this tile landed; every warp is done with the previous one
-        if (first + TS_FP_KT < kHi)
+        if constexpr (Q8)
+        {
+            // The stage the previous tile was dequantized from takes the tile TS_FP_Q8_STAGES - 1 ahead.
+            const int ahead = first + (TS_FP_Q8_STAGES - 1) * TS_FP_KT;
+            if (ahead < kHi)
+                load(q8Stage == 0 ? TS_FP_Q8_STAGES - 1 : q8Stage - 1, ahead);
+            q8Stage = q8Stage + 1 == TS_FP_Q8_STAGES ? 0 : q8Stage + 1;
+        }
+        else if (first + TS_FP_KT < kHi)
             load(st ^ 1, first + TS_FP_KT);
         ts_fp_cp_commit();
+        if constexpr (Q8)
+        {
+            // Every thread dequantizes (key, block) pairs of this stage's raw rows into the one F16 tile pair (the warps a
+            // decode row or window leaves idle among them); the barrier above saw every warp done with the tile's last values.
+            constexpr int NB = HD / 32, RAW = TsFpQ8Row<HD>::BYTES;
+            for (int i = tid; i < 2 * TS_FP_KT * NB; i += blockDim.x)
+            {
+                const int isV = i >= TS_FP_KT * NB, c = isV ? i - TS_FP_KT * NB : i;
+                const int key = c / NB, blk = c % NB;
+                ts_fp_q8_block_to_h(sm.raw[st][isV] + key * RAW + blk * 34, (isV ? sm.v : sm.k) + key * ROW + blk * 32);
+            }
+            __syncthreads();
+        }
         if (!warpLive || (PROMPT && first >= warpEnd))
             continue;
 
         float s[4][4];
         {
             // B fragments of 2 n-tiles x 1 k-step per ldmatrix.x4 (rows = keys).
-            const half* kb = sm.k[st] + ((lane & 7) + ((lane >> 4) << 3)) * ROW + ((lane >> 3) & 1) * 8;
+            const half* kb = sm.kt(st) + ((lane & 7) + ((lane >> 4) << 3)) * ROW + ((lane >> 3) & 1) * 8;
 #pragma unroll
             for (int np = 0; np < 2; ++np)
             {
@@ -430,7 +584,7 @@ __device__ __forceinline__ void ts_fp_attn(
             pa[kk][2] = ts_fp_pack_h2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
             pa[kk][3] = ts_fp_pack_h2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
         }
-        const half* vrow = sm.v[st] + ((lane & 7) + (((lane >> 3) & 1) << 3)) * ROW + ((lane >> 4) << 3);
+        const half* vrow = sm.vt(st) + ((lane & 7) + (((lane >> 3) & 1) << 3)) * ROW + ((lane >> 4) << 3);
 #pragma unroll
         for (int dn = 0; dn < HD / 16; ++dn)
         {
@@ -503,36 +657,37 @@ __device__ __forceinline__ void ts_fp_attn(
     }
 }
 
-#define TS_FP_ATTN(HD) \
-    extern "C" __global__ void __launch_bounds__(256) ts_flash_prefill_f16_d##HD( \
-        const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len, \
+// T: the cache's element (half, or uint8_t for the q8_0 rows of the _q8 kernels, Q8 true).
+#define TS_FP_ATTN(NAME, HD, T, Q8) \
+    extern "C" __global__ void __launch_bounds__(256) NAME( \
+        const float* __restrict__ q, const T* __restrict__ kc, const T* __restrict__ vc, int cap, int nq, int len, \
         int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
         const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask, \
         int lenBias, int windowKeys, int bucket, int sms) \
     { \
-        ts_fp_attn<HD>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn, cells, cellCount, cellMask, \
-            ts_fp_live_splits(splits, dyn, lenBias, windowKeys, bucket, nq * (nHead / nKv), nKv, sms)); \
+        ts_fp_attn<HD, false, false, Q8>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn, cells, cellCount, \
+            cellMask, ts_fp_live_splits(splits, dyn, lenBias, windowKeys, bucket, nq * (nHead / nKv), nKv, sms)); \
     }
 
-TS_FP_ATTN(128)
-TS_FP_ATTN(256)
+TS_FP_ATTN(ts_flash_prefill_f16_d128, 128, half, false)
+TS_FP_ATTN(ts_flash_prefill_f16_d256, 256, half, false)
 
 // A prompt chunk's rows (CudaGraphExecutor's attention past a verify window's rows): ts_flash_prefill_f16_d<hd>'s operands and
 // launch, scheduled for the causal triangle (ts_fp_attn's PROMPT: each row's arithmetic theirs, bit for bit). Qwen3.8-27B on an
 // RTX PRO 4000: a 16K prompt 4.08 s against 4.23 s with the plain launch, the same perplexity to the last digit.
-#define TS_FP_PROMPT(NAME, HD) \
+#define TS_FP_PROMPT(NAME, HD, T, Q8) \
     extern "C" __global__ void __launch_bounds__(256) NAME( \
-        const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int nq, int len, \
+        const float* __restrict__ q, const T* __restrict__ kc, const T* __restrict__ vc, int cap, int nq, int len, \
         int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
         const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, const float* __restrict__ cellMask, \
         int lenBias, int windowKeys, int bucket, int sms) \
     { \
-        ts_fp_attn<HD, false, true>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn, cells, \
+        ts_fp_attn<HD, false, true, Q8>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, splits, partial, out, dyn, cells, \
             cellCount, cellMask, ts_fp_live_splits(splits, dyn, lenBias, windowKeys, bucket, nq * (nHead / nKv), nKv, sms)); \
     }
 
-TS_FP_PROMPT(ts_flash_prompt_f16_d128, 128)
-TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256)
+TS_FP_PROMPT(ts_flash_prompt_f16_d128, 128, half, false)
+TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256, half, false)
 
 // A verify window's rows, each run as the decode row at its position (CudaGraphExecutor's window rows): grid z is the
 // window row, which attends the window's keys less the rows - 1 - z after it (the window's length read from dyn[0] on
@@ -544,9 +699,9 @@ TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256)
 // With cells (a sparse attention's selection): row z's keys are cells[z * cellStride ..], cellCount[z] of them, each with
 // its value in the mask row cellMask[z * cellStride ..] added (len and floor unused; none without cellMask).
 // Launch: grid (row tiles * splits, nKv, rows), block 256, the dynamic shared memory of ts_flash_prefill_f16_d<hd>.
-#define TS_FP_ATTN_ROWS(HD) \
-    extern "C" __global__ void __launch_bounds__(256) ts_flash_decode_rows_f16_d##HD( \
-        const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int rows, int len, \
+#define TS_FP_ATTN_ROWS(NAME, HD, T, Q8) \
+    extern "C" __global__ void __launch_bounds__(256) NAME( \
+        const float* __restrict__ q, const T* __restrict__ kc, const T* __restrict__ vc, int cap, int rows, int len, \
         int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
         const int* __restrict__ dyn, const int* __restrict__ cells, const int* __restrict__ cellCount, \
         const float* __restrict__ cellMask, int cellStride, int windowKeys, int bucket, int sms) \
@@ -555,7 +710,7 @@ TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256)
         const long long at = (long long)z * nHead * HD; \
         const bool listed = cells != nullptr; \
         const int rowLen = (dyn != nullptr ? dyn[0] : len) - (rows - 1 - z); \
-        ts_fp_attn<HD>(q + at, kc, vc, cap, 1, rowLen, floor, nHead, nKv, scale, \
+        ts_fp_attn<HD, false, false, Q8>(q + at, kc, vc, cap, 1, rowLen, floor, nHead, nKv, scale, \
             splits, partial != nullptr ? partial + (long long)z * nHead * splits * (HD + 2) : nullptr, out + at, nullptr, \
             listed ? cells + (long long)z * cellStride : nullptr, listed ? cellCount + z : nullptr, \
             listed && cellMask != nullptr ? cellMask + (long long)z * cellStride : nullptr, \
@@ -563,26 +718,26 @@ TS_FP_PROMPT(ts_flash_prompt_f16_d256, 256)
                 : ts_fp_rule_splits(splits, rowLen, windowKeys, bucket, nHead / nKv, nKv, sms)); \
     }
 
-TS_FP_ATTN_ROWS(128)
-TS_FP_ATTN_ROWS(256)
+TS_FP_ATTN_ROWS(ts_flash_decode_rows_f16_d128, 128, half, false)
+TS_FP_ATTN_ROWS(ts_flash_decode_rows_f16_d256, 256, half, false)
 
 // ts_flash_decode_rows_f16_d<hd> with the window's rows in the row tiles of one launch (ts_fp_attn's WIN): every key tile is
 // read once for all the rows, where the row grid read the window's keys once a row (8 times for a Qwen3.8-27B 8-row window:
 // 140 us a layer after a 4K prompt against the direct engine's 44). Each row's sums are its one-row launch's, bit for bit,
 // its splits its own length's (`splits` holds the last row's, the most). No selection (cells). Launch: grid
 // (ceil(rows * nHead / nKv / 128) * splits, nKv), block 256, the same shared memory.
-#define TS_FP_ATTN_WINDOW(HD) \
-    extern "C" __global__ void __launch_bounds__(256) ts_flash_decode_window_f16_d##HD( \
-        const float* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc, int cap, int rows, int len, \
+#define TS_FP_ATTN_WINDOW(NAME, HD, T, Q8) \
+    extern "C" __global__ void __launch_bounds__(256) NAME( \
+        const float* __restrict__ q, const T* __restrict__ kc, const T* __restrict__ vc, int cap, int rows, int len, \
         int floor, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out, \
         const int* __restrict__ dyn, int windowKeys, int bucket, int sms) \
     { \
-        ts_fp_attn<HD, true>(q, kc, vc, cap, rows, len, floor, nHead, nKv, scale, splits, partial, out, dyn, nullptr, nullptr, nullptr, \
-            ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms), windowKeys, bucket, sms); \
+        ts_fp_attn<HD, true, false, Q8>(q, kc, vc, cap, rows, len, floor, nHead, nKv, scale, splits, partial, out, dyn, nullptr, nullptr, \
+            nullptr, ts_fp_live_splits(splits, dyn, 0, windowKeys, bucket, nHead / nKv, nKv, sms), windowKeys, bucket, sms); \
     }
 
-TS_FP_ATTN_WINDOW(128)
-TS_FP_ATTN_WINDOW(256)
+TS_FP_ATTN_WINDOW(ts_flash_decode_window_f16_d128, 128, half, false)
+TS_FP_ATTN_WINDOW(ts_flash_decode_window_f16_d256, 256, half, false)
 
 // ---------------------------------------------------------------------------
 // 8-bit prompt attention (see the header). The band of one sequence's keys, per KV head h of nKv, for a band of bandKeys
@@ -1089,3 +1244,15 @@ extern "C" __global__ void ts_flash_window_combine_f32(const float* __restrict__
     }
     out[base * hd + x] = den > 0.0f ? num / den : 0.0f;
 }
+
+// The kernels over a q8_0 cache (ts_fp_attn's Q8): each the F16 kernel of its name with the q8_0 tile loader and dequant
+// stage, the same operands and launch (the dynamic shared memory of TsFpAttnSmemQ8), the combine kernels shared. Last in the
+// module, so the kernels above keep their committed PTX.
+TS_FP_ATTN(ts_flash_prefill_q8_d128, 128, uint8_t, true)
+TS_FP_ATTN(ts_flash_prefill_q8_d256, 256, uint8_t, true)
+TS_FP_PROMPT(ts_flash_prompt_q8_d128, 128, uint8_t, true)
+TS_FP_PROMPT(ts_flash_prompt_q8_d256, 256, uint8_t, true)
+TS_FP_ATTN_ROWS(ts_flash_decode_rows_q8_d128, 128, uint8_t, true)
+TS_FP_ATTN_ROWS(ts_flash_decode_rows_q8_d256, 256, uint8_t, true)
+TS_FP_ATTN_WINDOW(ts_flash_decode_window_q8_d128, 128, uint8_t, true)
+TS_FP_ATTN_WINDOW(ts_flash_decode_window_q8_d256, 256, uint8_t, true)

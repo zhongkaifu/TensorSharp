@@ -132,6 +132,15 @@ namespace TensorSharp.Graph
         /// recorded step of a width serves every position of its slot. False where a window's width shapes the arithmetic.</summary>
         bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
 
+        /// <summary>Whether a model's whole-forward graphs may hold their K/V caches in <paramref name="kvFormat"/> (a
+        /// <see cref="GraphFormat"/>) with <paramref name="keyDim"/>-wide keys and <paramref name="valueDim"/>-wide values: F32 and
+        /// F16 always, the block-quantized Q8_0 and Q4_0 where every view and write addresses their blocks
+        /// (<see cref="GraphCapabilities.QuantizedKvCache"/>). An executor whose attention kernels and row writes read and write a
+        /// block format without the generic views of it (direct CUDA's q8_0) says so here.</summary>
+        bool TakesKvCacheFormat(int kvFormat, int keyDim, int valueDim)
+            => kvFormat is GraphFormat.F32 or GraphFormat.F16
+               || (kvFormat is GraphFormat.Q8_0 or GraphFormat.Q4_0 && Capabilities.QuantizedKvCache);
+
         /// <summary>Host work to run while the device runs the next recorded step: after its launch, before anything waits for
         /// its outputs (a recorded step leaves the host idle for its whole run). False where the executor runs no recorded
         /// steps to hide it behind: the caller then does the work itself, or not at all.</summary>
