@@ -69,6 +69,11 @@ namespace TensorSharp.Graph
         /// <summary>A program may end in each row's greedy token (a top-1 over the logits, a tie to the lower id), read
         /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits.</summary>
         public bool GreedyIdOutputs { get; init; }
+        /// <summary>An F16 causal mask input may arrive as its pattern (a <see cref="CausalMaskInput"/> as the input's handle,
+        /// no host bytes): the executor classifies it from the pattern and makes its values only for an op that reads them.
+        /// The shared runtime gives prompt chunks' masks so (more rows than a verify window: never replayed, advanced or
+        /// recorded); decode rows and verify windows keep their host values, which their advances move on.</summary>
+        public bool StructuralCausalMasks { get; init; }
     }
 
     /// <summary>A stable identity for a storage object, for program signatures of executors that bind

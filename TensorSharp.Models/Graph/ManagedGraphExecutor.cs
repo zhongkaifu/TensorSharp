@@ -46,8 +46,16 @@ namespace TensorSharp.Models.Graph
         /// <summary>The base executor's capabilities, and a decode row's recurrence updates the slot's state in place (see
         /// <see cref="GatedDeltaNet"/>); decode steps replay their program a position on over windows padded to
         /// <see cref="DecodeWindowRows"/> rows, whose unwritten keys the attention stops before (see <see cref="FlashAttention"/>).</summary>
-        public override GraphCapabilities Capabilities { get; } =
+        public override GraphCapabilities Capabilities => StructuralMasksForTests ? s_structuralMaskCapabilities : s_capabilities;
+
+        private static readonly GraphCapabilities s_capabilities =
             new() { StridedViews = true, DecodeWindowRows = DecodeWindowRows, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true, HostExperts = true };
+
+        private static readonly GraphCapabilities s_structuralMaskCapabilities = s_capabilities with { StructuralCausalMasks = true };
+
+        /// <summary>Tests: prompt chunks' causal masks arrive as their pattern (<see cref="GraphCapabilities.StructuralCausalMasks"/>),
+        /// as on the CUDA executor; this executor's attention reads their values, which the interpreter then makes.</summary>
+        internal bool StructuralMasksForTests { get; set; }
 
         /// <summary>Decode window bucket: one program serves this many decode steps of a sequence.</summary>
         private const int DecodeWindowRows = 256;

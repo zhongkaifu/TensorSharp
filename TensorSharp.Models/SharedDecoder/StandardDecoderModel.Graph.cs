@@ -2793,14 +2793,24 @@ namespace TensorSharp.Models
             }
 
             /// <summary>An F16 causal mask [window, count] of sequence <paramref name="sequence"/>: row q sees cache rows 0 ..
-            /// start + q.</summary>
+            /// start + q. A prompt chunk's (more rows than a verify window: never replayed, advanced or recorded) goes to an
+            /// executor that takes <see cref="GraphCapabilities.StructuralCausalMasks"/> as its pattern, no host values: their
+            /// fill, widening and scan had cost about 2 ns a value at every step (137M values for a 2048-row chunk at 67K keys)
+            /// for a kernel that reads only the pattern. Decode rows and verify windows keep their values, which an advance
+            /// opens a column on.</summary>
             internal int ChunkMask(int window, int start, int count, int sequence)
             {
                 var key = (window, start, count, sequence);
                 if (_chunkMasks.TryGetValue(key, out int cached)) return cached;
-                var mask = new ushort[(long)window * count];
-                FillCausalRows(mask, window, start, count, FloorOf(sequence));
+                var pattern = new CausalMaskInput(window, start, count, FloorOf(sequence));
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
+                if (count > SmallChunkRows && _m.GraphExecutor?.Capabilities.StructuralCausalMasks == true)
+                {
+                    AddInput(node, IntPtr.Zero, pattern.Values * sizeof(ushort), handle: pattern);
+                    return CacheMask(_chunkMasks, key, node);
+                }
+                var mask = new ushort[pattern.Values];
+                pattern.FillF16(mask);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort), kind: InputKind.DecodeMask, values: mask,
                     window: window, start: start, count: count, sequence: sequence);
                 return CacheMask(_chunkMasks, key, node);
@@ -2815,7 +2825,7 @@ namespace TensorSharp.Models
                 if (_causalMasks.TryGetValue(key, out int cached)) return cached;
                 int kv = start + count;
                 var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
-                FillCausalRows(mask, kv, start, count, floor);
+                new CausalMaskInput(kv, start, count, floor).FillF16(mask);
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(mask), mask.LongLength * sizeof(ushort));
                 return CacheMask(_causalMasks, key, node);
@@ -2844,28 +2854,7 @@ namespace TensorSharp.Models
             /// <summary>A streaming executor's sink: entries and input values go there as they are emitted.</summary>
             internal IGraphSink Sink { get => _b.Sink; init => _b.Sink = value; }
 
-            /// <summary>An F16 causal mask [<paramref name="width"/>, <paramref name="count"/>] for rows continuing at
-            /// <paramref name="start"/>: row q is -inf before the attention floor <paramref name="attentionFloor"/> and past
-            /// start + q, zero between. Whole rows are filled at once, large masks row-parallel (a 3.6K-row prompt chunk's is
-            /// 26 MB: element loops took ~10 ms of its trace).</summary>
-            private static void FillCausalRows(ushort[] mask, int width, int start, int count, int attentionFloor)
-            {
-                const ushort negInf = 0xFC00;
-                int floor = Math.Min(attentionFloor, width);
-                if ((long)width * count >= 1 << 20) System.Threading.Tasks.Parallel.For(0, count, Row);
-                else for (int q = 0; q < count; q++) Row(q);
-
-                void Row(int q)
-                {
-                    Span<ushort> row = mask.AsSpan(q * width, width);
-                    int open = Math.Min(width, start + q + 1);
-                    row[..floor].Fill(negInf);
-                    if (open > floor) row[floor..open].Clear();
-                    row[Math.Max(open, floor)..].Fill(negInf);
-                }
-            }
-
-            /// <summary>A causal mask of <see cref="FillCausalRows"/> for rows continuing at <paramref name="from"/>, moved on to
+            /// <summary>A causal mask (<see cref="CausalMaskInput"/>'s values) for rows continuing at <paramref name="from"/>, moved on to
             /// <paramref name="to"/>: the cells each row opens since cleared, the rest as they are (the same values a fill at
             /// <paramref name="to"/> writes). A decode window as wide as its slot had been filled whole at every step.</summary>
             private static void OpenCausalRows(ushort[] mask, int width, int from, int to, int count, int attentionFloor)

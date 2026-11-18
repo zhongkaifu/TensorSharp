@@ -28,13 +28,22 @@ namespace TensorSharp.Cuda
         /// <summary>The base executor's capabilities, and a decode row's recurrence updates its state in place (see
         /// <see cref="GatedDeltaNet"/>); decode steps replay their program a position on over windows padded to 256 rows,
         /// whose unwritten keys the attention stops before (<see cref="FlashAttention"/>), and record as one CUDA graph
-        /// (<see cref="OpenDecodeCapture"/>).</summary>
-        public override GraphCapabilities Capabilities { get; } = new()
+        /// (<see cref="OpenDecodeCapture"/>). A prompt chunk's causal mask arrives as its pattern
+        /// (<see cref="GraphCapabilities.StructuralCausalMasks"/>): the prompt kernels read only its keys and floor.</summary>
+        public override GraphCapabilities Capabilities => StructuralMasksForTests ? s_capabilities : s_hostMaskCapabilities;
+
+        private static readonly GraphCapabilities s_capabilities = new()
         {
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
             WindowStateInPlace = true, WindowRegionsReadPackedRows = true, SlotBoundRecordings = true,
             HostExperts = true, RecordsHostExperts = true, RegionsAtAnyWidth = true, GreedyIdOutputs = true,
+            StructuralCausalMasks = true,
         };
+
+        private static readonly GraphCapabilities s_hostMaskCapabilities = s_capabilities with { StructuralCausalMasks = false };
+
+        /// <summary>Tests: false gives prompt chunks' causal masks as host values, as before they arrived as their pattern.</summary>
+        internal bool StructuralMasksForTests { get; set; } = true;
 
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
         protected override bool BroadcastsPositionsOnDevice => true;
