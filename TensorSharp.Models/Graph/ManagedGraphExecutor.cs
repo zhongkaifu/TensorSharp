@@ -7,6 +7,7 @@
 using System;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 
 using TensorSharp.Cpu;
 using TensorSharp.Graph;
@@ -541,10 +542,85 @@ namespace TensorSharp.Models.Graph
 
             long rows = ns * channels;
             if (rows * nt * width >= ParallelRecurrenceWork * 4)
-                System.Threading.Tasks.Parallel.For(0L, rows, Channel);
+            {
+                // On the worker pool (whose threads would otherwise spin through a ThreadPool loop), channels in chunks.
+                long perChunk = Math.Max(1, (ParallelRecurrenceWork * 4) / Math.Max(1, nt * width));
+                int chunks = (int)((rows + perChunk - 1) / perChunk);
+                CpuParallel.For(chunks, c =>
+                {
+                    long i1 = Math.Min(rows, (c + 1) * perChunk);
+                    for (long i = c * perChunk; i < i1; i++) Channel(i);
+                });
+            }
             else
                 for (long i = 0; i < rows; i++) Channel(i);
             return result;
+        }
+
+        /// <summary>Elements a parallel chunk of a broadcast binary op takes.</summary>
+        private const long BroadcastChunkElements = 1 << 15;
+
+        /// <summary>
+        /// A binary op whose b repeats over a (the attention output gate per head, the short convolutions' gates), F32 and
+        /// contiguous: one pass over the rows on the worker pool, b read in place - where the interpreter's expanded view ran
+        /// TensorApplyCPU's generic strided loop on one thread (12 % of an LFM3 prompt step on the managed lane). Each element
+        /// is the same single IEEE operation (a op b), so the result is the same bits.
+        /// </summary>
+        protected override unsafe bool TryBinaryBroadcast(GraphOp kind, Tensor result, Tensor a, Tensor b, long[] na, long[] nb)
+        {
+            if (kind is not (GraphOp.Add or GraphOp.Sub or GraphOp.Mul or GraphOp.Div)) return false;
+            if (result.ElementType != DType.Float32 || a.ElementType != DType.Float32 || b.ElementType != DType.Float32
+                || !result.IsContiguous() || !a.IsContiguous() || !b.IsContiguous() || na.Length != 4 || nb.Length != 4)
+                return false;
+            long n0 = na[0], n1 = na[1], n2 = na[2], rows = na[1] * na[2] * na[3];
+            long b1 = nb[0], b2 = nb[0] * nb[1], b3 = nb[0] * nb[1] * nb[2];   // b's strides in its own shape
+            bool inner = nb[0] == n0;                                           // b varies along the row
+            long ra = (long)TensorComputePrimitives.GetFloatPointer(result), aa = (long)TensorComputePrimitives.GetFloatPointer(a);
+            long ba = (long)TensorComputePrimitives.GetFloatPointer(b);
+            long rowsPerChunk = Math.Max(1, BroadcastChunkElements / Math.Max(1, n0));
+            int chunks = (int)Math.Min(int.MaxValue, (rows + rowsPerChunk - 1) / rowsPerChunk);
+
+            void Chunk(int c)
+            {
+                long r0 = c * rowsPerChunk, r1 = Math.Min(rows, r0 + rowsPerChunk);
+                for (long row = r0; row < r1; row++)
+                {
+                    long i1 = row % n1, i2 = row / n1 % n2, i3 = row / (n1 * n2);
+                    long boff = (nb[1] == 1 ? 0 : i1 * b1) + (nb[2] == 1 ? 0 : i2 * b2) + (nb[3] == 1 ? 0 : i3 * b3);
+                    float* r = (float*)ra + row * n0, x = (float*)aa + row * n0, y = (float*)ba + boff;
+                    if (inner) BinaryRow(kind, r, x, y, n0);
+                    else BinaryRowScalar(kind, r, x, *y, n0);
+                }
+            }
+
+            if (chunks > 1) CpuParallel.For(chunks, Chunk);
+            else Chunk(0);
+            return true;
+        }
+
+        private static unsafe void BinaryRow(GraphOp kind, float* r, float* x, float* y, long n)
+        {
+            long i = 0;
+            for (; i + 4 <= n; i += 4)
+            {
+                Vector128<float> u = Vector128.Load(x + i), w = Vector128.Load(y + i);
+                Vector128.Store(kind switch { GraphOp.Add => u + w, GraphOp.Sub => u - w, GraphOp.Mul => u * w, _ => u / w }, r + i);
+            }
+            for (; i < n; i++)
+                r[i] = kind switch { GraphOp.Add => x[i] + y[i], GraphOp.Sub => x[i] - y[i], GraphOp.Mul => x[i] * y[i], _ => x[i] / y[i] };
+        }
+
+        private static unsafe void BinaryRowScalar(GraphOp kind, float* r, float* x, float y, long n)
+        {
+            Vector128<float> w = Vector128.Create(y);
+            long i = 0;
+            for (; i + 4 <= n; i += 4)
+            {
+                Vector128<float> u = Vector128.Load(x + i);
+                Vector128.Store(kind switch { GraphOp.Add => u + w, GraphOp.Sub => u - w, GraphOp.Mul => u * w, _ => u / w }, r + i);
+            }
+            for (; i < n; i++)
+                r[i] = kind switch { GraphOp.Add => x[i] + y, GraphOp.Sub => x[i] - y, GraphOp.Mul => x[i] * y, _ => x[i] / y };
         }
 
         protected override unsafe Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
