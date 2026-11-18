@@ -307,4 +307,50 @@ public sealed class GgmlCpuWeightProductTests
             }
         });
     }
+
+    /// <summary>
+    /// A per-op product (outside the graph runtime) runs on the pool for its width, as graph steps do: a wide one on the
+    /// prompt pool after a decode step left the decode pool set, a decode-width one on the decode pool; an op without
+    /// products keeps the pool it finds. (On a machine whose two pools have the same width the widths agree trivially.)
+    /// </summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void PerOpProductsRunOnThePoolForTheirWidth()
+    {
+        WithCpuBackend(() =>
+        {
+            var rng = new Random(19);
+            using var native = new Native();
+            byte[] bytes = RandomWeight(8, rng);
+            IntPtr w = native.Copy(bytes);
+            Run(8, w, bytes.Length, native.Copy(Activations(8, rng)), 8, new[] { (0, M) }, null, native);
+            int prompt = GgmlBasicOps.CpuPoolThreads();
+            Run(8, w, bytes.Length, native.Copy(Activations(1, rng)), 1, new[] { (0, M) }, null, native);
+            int decode = GgmlBasicOps.CpuPoolThreads();
+            _output.WriteLine($"prompt pool {prompt} threads, decode pool {decode}");
+            Assert.True(prompt > 0 && decode > 0, $"pools {prompt} / {decode}");
+
+            var allocator = new GgmlAllocator(new GgmlContext([0], GgmlBackendType.Cpu), 0);
+            using var weight = new Tensor(allocator, DType.Float32, K, M);
+            weight.SetElementsAsFloat(Activations(M, rng));
+            int PerOp(int rows)
+            {
+                using var x = new Tensor(allocator, DType.Float32, rows, K);
+                using var y = new Tensor(allocator, DType.Float32, rows, M);
+                x.SetElementsAsFloat(Activations(rows, rng));
+                Ops.Addmm(y, 0f, y, 1f, x, weight);
+                return GgmlBasicOps.CpuPoolThreads();
+            }
+            Assert.Equal(prompt, PerOp(8));
+            Assert.Equal(decode, PerOp(1));
+            Assert.Equal(decode, PerOp(4));
+            Assert.Equal(prompt, PerOp(5));
+            Assert.Equal(decode, PerOp(2));
+            using (var a = new Tensor(allocator, DType.Float32, 8, K))
+            {
+                a.SetElementsAsFloat(Activations(8, rng));
+                Ops.Add(a, a, a);
+            }
+            Assert.Equal(decode, GgmlBasicOps.CpuPoolThreads());
+        });
+    }
 }

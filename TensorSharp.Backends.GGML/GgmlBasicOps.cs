@@ -1787,6 +1787,8 @@ namespace TensorSharp.GGML
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
+        /// <summary>The width of the thread pool ggml_cpu's next compute runs on (0 on any other backend).</summary>
+        public static int CpuPoolThreads() => GgmlNative.CpuPoolThreads();
         public static void Shutdown() => GgmlNative.Shutdown();
 
         /// <summary>

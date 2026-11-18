@@ -61,10 +61,32 @@ namespace tsg
     void cpu_pools_create(ggml_backend_t backend, std::vector<ggml_threadpool_t>& owned);
 
     /// Runs the next graph on the pool for its width (cpu_pool_for_step): `product_rows` is the most activation rows any
-    /// weight product of the graph reads (0 when it has none). Only the graph runtime (TSGgml_GraphRun) selects a pool:
-    /// every other ggml compute on the CPU backend runs on the pool the last graph step left set (the prompt pool until
-    /// a decode step runs).
+    /// weight product of the graph reads (0 when it has none). The graph runtime (TSGgml_GraphRun) selects from its weight
+    /// products; the ggml computes outside it that go through tsg::compute_graph select from their products'
+    /// (cpu_pools_select_for).
     void cpu_pools_select(ggml_backend_t backend, std::int64_t product_rows);
+
+    /// A compute outside the graph runtime (a per-op graph through tsg::compute_graph): the pool for the most activation
+    /// rows any of its products (MUL_MAT, MUL_MAT_ID) reads, as cpu_pools_select; a graph without products keeps the pool
+    /// it finds, so the small per-op graphs between decode steps never pause the decode pool. A no-op inside the graph
+    /// runtime's own computes (CpuGraphRuntimeScope), which selected their pool from their weight products.
+    void cpu_pools_select_for(ggml_backend_t backend, const ggml_cgraph* graph);
+
+    /// Marks this thread's computes as the graph runtime's for its lifetime (see cpu_pools_select_for).
+    class CpuGraphRuntimeScope
+    {
+    public:
+        CpuGraphRuntimeScope();
+        ~CpuGraphRuntimeScope();
+        CpuGraphRuntimeScope(const CpuGraphRuntimeScope&) = delete;
+        CpuGraphRuntimeScope& operator=(const CpuGraphRuntimeScope&) = delete;
+
+    private:
+        bool was_ = false;
+    };
+
+    /// The width of the pool the backend's next compute runs on (0 when it has no TensorSharp pools).
+    int cpu_pool_threads(ggml_backend_t backend);
 
     /// Forgets every backend's pools (before TSGgml_Shutdown frees them).
     void cpu_pools_forget_all();

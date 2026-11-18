@@ -458,6 +458,38 @@ namespace tsg
         }
     }
 
+    namespace
+    {
+        thread_local bool t_graph_runtime = false;
+    }
+
+    CpuGraphRuntimeScope::CpuGraphRuntimeScope() : was_(t_graph_runtime) { t_graph_runtime = true; }
+    CpuGraphRuntimeScope::~CpuGraphRuntimeScope() { t_graph_runtime = was_; }
+
+    void cpu_pools_select_for(ggml_backend_t backend, const ggml_cgraph* graph)
+    {
+        if (t_graph_runtime || graph == nullptr) return;
+        std::int64_t rows = 0;
+        const int n = ggml_graph_n_nodes(const_cast<ggml_cgraph*>(graph));
+        for (int i = 0; i < n; i++)
+        {
+            const ggml_tensor* node = ggml_graph_node(const_cast<ggml_cgraph*>(graph), i);
+            const ggml_tensor* x = node->src[1];
+            if (x == nullptr) continue;
+            if (node->op == GGML_OP_MUL_MAT) rows = std::max<std::int64_t>(rows, x->ne[1] * x->ne[2] * x->ne[3]);
+            else if (node->op == GGML_OP_MUL_MAT_ID) rows = std::max<std::int64_t>(rows, x->ne[2] * x->ne[3]);
+        }
+        if (rows > 0) cpu_pools_select(backend, rows);
+    }
+
+    int cpu_pool_threads(ggml_backend_t backend)
+    {
+        std::lock_guard<std::mutex> lock(g_pools_mu);
+        for (const CpuPools& p : g_pools)
+            if (p.backend == backend) return p.current == p.decode && p.decode != nullptr ? p.n_decode : p.n_prompt;
+        return 0;
+    }
+
     void cpu_pools_forget_all()
     {
         std::lock_guard<std::mutex> lock(g_pools_mu);
