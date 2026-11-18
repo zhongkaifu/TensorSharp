@@ -101,6 +101,120 @@ public sealed class GraphBlockDraftTests : IDisposable
         Assert.True(executor.RingAttentions > 0, $"{family} {variant}: no draft attention ran on the ring kernel");
     }
 
+    /// <summary>
+    /// A later request's drafts on the model's ring at positions behind the earlier request's last ones (another, shorter
+    /// conversation), after another state's buffers changed in between (a new request's first verify window grows its own):
+    /// the steps kept over the ring move there (no trace, no build, and where the executor records its steps, no new
+    /// recording), and every block drafts bit for bit what steps traced at each call draft, the ring's rows too.
+    /// </summary>
+    [Theory]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequest(string variant) => RingStepsMoveBehind(BackendType.Cpu, variant);
+
+    /// <summary>The same on direct CUDA, whose kept steps replay their recordings: a recorded step moved behind its last
+    /// position answers as the eager steps of a model that traces every call.</summary>
+    [CudaTheory]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequestOnDirectCuda(string variant) => RingStepsMoveBehind(BackendType.Cuda, variant);
+
+    private void RingStepsMoveBehind(BackendType backend, string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var (target, draft) = Fixtures(variant);
+        using var kept = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft);
+        using var traced = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { DecodeAdvanceDisabled = true };
+        string label = $"{backend} {variant}";
+        int recorded = 0, built = 0, moved = 0;
+        // The first request runs past position 40; the second starts again at 9, after another state's buffers changed.
+        List<string> mismatches = DraftBitwise(kept, traced, new[] { 21, 9 },
+            beforeRequest: request =>
+            {
+                if (request == 1) Interlocked.Increment(ref StandardDecoderModel.RecurrentState.BindingChanges);
+            },
+            afterPrompt: request =>
+            {
+                // (The prompt's rows reach the ring in one program of their width; the server's prompt step writes them itself.)
+                if (request == 1) (recorded, built, moved) = (kept.DecodeRecordings, kept.GraphBuilds, kept.DraftRebases);
+            });
+        _output.WriteLine($"{label}: {kept.DraftRebases - moved} steps moved behind in the second request, {kept.DraftAdvances} advanced " +
+            $"in all; {kept.GraphBuilds - built} builds and {kept.DecodeRecordings - recorded} recordings in the second request");
+        Assert.True(mismatches.Count == 0, $"{label}: {string.Join("; ", mismatches.Take(12))}");
+        Assert.Null(kept.GraphBlockDraftDeclineReason);
+        Assert.Null(traced.GraphBlockDraftDeclineReason);
+        Assert.True(kept.DraftRebases > moved, $"{label}: no kept step moved behind for the second request");
+        Assert.Equal(built, kept.GraphBuilds);
+        Assert.Equal(recorded, kept.DecodeRecordings);
+        Assert.Equal(0, traced.DraftAdvances);
+        Assert.Equal(0, traced.DraftRebases);
+    }
+
+    /// <summary>
+    /// Drafts through two models' graph drafters from the same synthetic feature rows: per request (one a prompt length in
+    /// <paramref name="prompts"/>, each on the model's ring from position 0) the prompt's rows, then draft / commit cycles
+    /// whose accept counts walk 0 .. gamma three times (every catch-up width runs, and advances, in each request); every
+    /// block's ids and confidences and every draft layer's ring rows are compared bit for bit. Returns the mismatches.
+    /// </summary>
+    private static List<string> DraftBitwise(StandardDecoderModel a, StandardDecoderModel b, int[] prompts,
+        Action<int> beforeRequest = null, Action<int> afterPrompt = null)
+    {
+        var heads = new IDraftHead[] { a, b };
+        var spec = (ISpeculativeModel)a;
+        int feat = spec.SpecFeatureSize, gamma = spec.DraftBlockSize, vocab = a.Config.VocabSize;
+        var rng = new Random(376);
+        float[] Features(int count)
+        {
+            var values = new float[count];
+            for (int i = 0; i < count; i++) values[i] = (float)(rng.NextDouble() * 2 - 1);
+            return values;
+        }
+        var mismatches = new List<string>();
+        for (int request = 0; request < prompts.Length; request++)
+        {
+            beforeRequest?.Invoke(request);
+            int promptLength = prompts[request];
+            int[] prompt = Enumerable.Range(0, promptLength).Select(i => 40 + (i * 7 + request) % 23).ToArray();
+            float[] rows = Features(promptLength * feat);
+            Array.Clear(rows, 0, feat);   // the token before the prompt has no features
+            foreach (IDraftHead head in heads) head.DraftCatchUp(prompt, rows, 0);
+            afterPrompt?.Invoke(request);
+            int position = promptLength, last = prompt[^1];
+            float[] pending = Features(feat);
+            for (int cycle = 0; cycle < 3 * (gamma + 1); cycle++)
+            {
+                var ids = new int[2][];
+                var conf = new float[2][];
+                for (int m = 0; m < 2; m++)
+                {
+                    ids[m] = new int[gamma];
+                    conf[m] = new float[gamma];
+                    Assert.Equal(gamma, heads[m].DraftBlock(last, pending, position, ids[m], conf[m]));
+                }
+                for (int e = 0; e < gamma; e++)
+                    if (ids[0][e] != ids[1][e] || BitConverter.SingleToInt32Bits(conf[0][e]) != BitConverter.SingleToInt32Bits(conf[1][e]))
+                        mismatches.Add($"request {request} position {position} slot {e}: {ids[0][e]} ({conf[0][e]:R}) against " +
+                            $"{ids[1][e]} ({conf[1][e]:R})");
+                for (int layer = 0; layer < a.DFlashSettings.NumLayers; layer++)
+                {
+                    var (ak, av) = a.DFlashRingContextForTests(layer, out int aFirst);
+                    var (bk, bv) = b.DFlashRingContextForTests(layer, out int bFirst);
+                    if (aFirst != bFirst || !ak.AsSpan().SequenceEqual(bk) || !av.AsSpan().SequenceEqual(bv))
+                        mismatches.Add($"request {request} position {position}: layer {layer}'s ring rows differ");
+                }
+                int accepted = cycle % (gamma + 1);
+                int[] window = new[] { last }.Concat(ids[0].Take(accepted)).ToArray();
+                float[] catchUp = Features((accepted + 1) * feat);
+                Array.Copy(pending, catchUp, feat);
+                foreach (IDraftHead head in heads) head.DraftCatchUp(window, catchUp, position);
+                pending = Features(feat);
+                last = (ids[0][Math.Min(accepted, gamma - 1)] + cycle) % vocab;
+                position += accepted + 1;
+            }
+        }
+        return mismatches;
+    }
+
     /// <summary>The same on ggml_cuda, where the old path is the fused native drafter.</summary>
     [GgmlTheory(BackendType.GgmlCuda)]
     [InlineData("dflash")]

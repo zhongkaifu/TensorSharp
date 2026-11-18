@@ -136,7 +136,7 @@ namespace TensorSharp.Models
                 k[l] = new[] { ringK[l] };
                 v[l] = new[] { ringV[l] };
             }
-            slot = new Slot { K = k, V = v, Capacity = DFlashRingRows };
+            slot = new Slot { K = k, V = v, Capacity = DFlashRingRows, DraftRing = true };
             _dflashRingSlots[ringK] = slot;
             return slot;
         }

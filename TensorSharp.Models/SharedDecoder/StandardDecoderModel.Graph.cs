@@ -340,6 +340,10 @@ namespace TensorSharp.Models
         /// <summary>Of <see cref="DecodeAdvances"/>, the draft layer's steps.</summary>
         internal int DraftAdvances { get; private set; }
 
+        /// <summary>Of <see cref="DraftAdvances"/>, steps over a block drafter's ring moved to a position behind their last one
+        /// (<see cref="GraphStep.TryRebase"/>; tests check a new request's drafts reuse the kept steps).</summary>
+        internal int DraftRebases { get; private set; }
+
         /// <summary>The last decode step, kept to run again one position on.</summary>
         private sealed class DecodeReplay
         {
@@ -912,7 +916,11 @@ namespace TensorSharp.Models
             if (r == null || r.Epoch != _graphEpoch || r.Floor != floor || !SameFloors(r.Floors, floors) || r.Shape != shape
                 || r.Slots.Length != slots.Length)
                 return false;
-            if (BindingsChanged(r.Bindings, r.Stamp, r.Recurrent))
+            // A block drafter's ring holds no recurrent state: another request's state buffers changing (a new request's first
+            // verify window grows its own) leaves the steps kept over the ring, and their recordings, as they are (where states
+            // carry their own binding versions the ring's stamp is 0 anyway; elsewhere the global counter would drop them).
+            bool ring = Array.TrueForAll(slots, slot => slot.DraftRing);
+            if (!ring && BindingsChanged(r.Bindings, r.Stamp, r.Recurrent))
             {
                 DropDecodeReplay(shape, park: false);
                 return false;
@@ -927,7 +935,7 @@ namespace TensorSharp.Models
                 deltas[s] = starts[s] - r.Starts[s];
                 // What the kept graph binds: the same caches and states (a batched step may hand them in another slot
                 // object), the same capacity and rotary offset.
-                if (deltas[s] < 1 || !ReferenceEquals(slot.K, r.K[s]) || !ReferenceEquals(slot.V, r.V[s])
+                if ((deltas[s] < 1 && !ring) || !ReferenceEquals(slot.K, r.K[s]) || !ReferenceEquals(slot.V, r.V[s])
                     || !ReferenceEquals(slot.Recurrent, r.Recurrent[s]) || slot.Capacity != r.Capacity[s] || slot.RopeDelta != r.RopeDelta[s])
                     return false;
             }
@@ -936,8 +944,11 @@ namespace TensorSharp.Models
                 DropDecodeReplay(shape, park: false);
                 return false;
             }
+            // A step over the ring runs at a position behind its last one too (a new request's on the model's ring: the step,
+            // its plan and its recording are the ones a trace there would make, so it moves there instead of being traced).
+            bool rebase = ring && Array.Exists(deltas, d => d < 1);
             if (!_graphCache.TryGetValue(r.Signature, out CachedGraph cached) || !ReferenceEquals(cached, r.Graph)
-                || !r.Step.TryAdvance(hidden, deltas))
+                || !(rebase ? r.Step.TryRebase(hidden, starts) : r.Step.TryAdvance(hidden, deltas)))
             {
                 DropDecodeReplay(shape);
                 return false;
@@ -956,6 +967,7 @@ namespace TensorSharp.Models
             DecodeAdvances++;
             if (r.Step.Counts.Length > 0 && r.Step.Counts[0] > 1) WindowAdvances++;
             if (shape != null && shape.StartsWith(DraftShapePrefix, StringComparison.Ordinal)) DraftAdvances++;
+            if (rebase) DraftRebases++;
             foreach (Slot slot in slots) slot.DeviceDirty = true;
             graph = cached;
             outputs = r.Outputs;
@@ -3058,6 +3070,45 @@ namespace TensorSharp.Models
                     }
                 }
                 for (int s = 0; s < Starts.Length; s++) Starts[s] += deltas[s];
+                foreach (InputMeta m in _inputMeta)
+                    if (m.Kind == InputKind.Refill && !m.Refill()) return false;
+                return true;
+            }
+
+            /// <summary>
+            /// <see cref="TryAdvance(Tensor[], int[])"/> for a step of one sequence moved to <paramref name="starts"/>[0] wherever
+            /// that is, behind its last position too: the positions and write rows by the difference, every refill run, the rows
+            /// rebound. Only a step whose inputs follow from its position alone takes it (a block drafter's ring steps): one with
+            /// a decode mask (opened in place, never closed), an opaque input or an advance limit refuses before anything changes
+            /// (false); a refill that refuses returns false too, and the caller drops the step.
+            /// </summary>
+            internal bool TryRebase(Tensor[] hidden, int[] starts)
+            {
+                if (starts.Length != 1 || Starts.Length != 1 || _advanceLimits != null
+                    || _inputMeta.Exists(m => m.Kind is InputKind.DecodeMask or InputKind.Opaque))
+                    return false;
+                int delta = starts[0] - Starts[0], hiddenAt = 0;
+                for (int i = 0; i < _inputMeta.Count; i++)
+                {
+                    InputMeta m = _inputMeta[i];
+                    switch (m.Kind)
+                    {
+                        case InputKind.Hidden:
+                        {
+                            Tensor rows = hidden[Math.Min(hiddenAt++, hidden.Length - 1)];
+                            _inputData[i] = _m.GraphExecutor.Capabilities.BindsHostPointers ? TensorComputePrimitives.GetStoragePointer(rows) : IntPtr.Zero;
+                            _inputHandles[i] = rows;
+                            break;
+                        }
+                        case InputKind.Positions:
+                            foreach (ref int p in ((int[])m.Values).AsSpan()) p += delta;
+                            break;
+                        case InputKind.WriteRows:
+                            foreach (ref long r in ((long[])m.Values).AsSpan()) r += delta;
+                            break;
+                    }
+                }
+                Starts[0] = starts[0];
                 foreach (InputMeta m in _inputMeta)
                     if (m.Kind == InputKind.Refill && !m.Refill()) return false;
                 return true;

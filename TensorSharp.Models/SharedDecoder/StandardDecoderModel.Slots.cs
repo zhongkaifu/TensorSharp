@@ -43,6 +43,10 @@ namespace TensorSharp.Models
             public bool Spare;                     // made ahead of a request (no recordings bind it yet), see ReplenishSpareSlot
             public Tensor DraftCarry;              // the trunk's last followed row's stream (the next followed row's input)
             public long RetainedAt;                // when it entered the retained set (the oldest goes first under pressure)
+            /// <summary>A block drafter's KV ring as a slot (StandardDecoderModel.BlockDraft.cs): no request owns it, it holds no
+            /// recurrent state, and its steps' inputs are functions of their positions alone, so a step kept over it may run at
+            /// any position (<see cref="GraphStep.TryRebase"/>).</summary>
+            public bool DraftRing;
         }
 
         private static long s_retainSerial;
