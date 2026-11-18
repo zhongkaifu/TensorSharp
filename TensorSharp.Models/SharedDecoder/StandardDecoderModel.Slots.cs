@@ -807,8 +807,13 @@ namespace TensorSharp.Models
             try
             {
                 SyncToHost(slot);
-                // Only this slot's graphs bound the caches it gives up (see the whole-slot growth below).
-                ForgetGraphsOfGrowing(slot);
+                // Only this slot's graphs bound the caches it gives up, and they go now: a recording keeps the tensors it
+                // writes alive (CudaGraphCapture's KeepAlive), so disposed later, beside the next recorded step
+                // (ForgetGraphsOfGrowing), every old tensor stayed allocated through the growth, which then needed a second
+                // slot's memory, not the added cells and one tensor its room was made for (Qwen3.8-27B, three 47K
+                // conversations at once on an RTX PRO 4500: a growth from 48,128 to 55,296 cells ran out of memory after 29
+                // of its 34 tensors, HTTP 500).
+                ForgetGraphsOf(slot);
                 NoteDeviceMemoryChanged();
                 long driverFree = cuda == null ? long.MaxValue : cuda.GetMemoryInfo().freeBytes;
                 int rows = slot.Length;

@@ -302,6 +302,63 @@ public sealed class SlotTargetTests : IDisposable
             Assert.True(whole[i].AsSpan().SequenceEqual(grown[i]), $"step {i} differs after the slot grew");
     }
 
+    /// <summary>The references a storage has (RefCounted's count; 0 once destroyed and its device memory released).</summary>
+    private static int References(Storage storage)
+        => (int)typeof(RefCounted).GetField("refCount", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(storage)!;
+
+    /// <summary>
+    /// On direct CUDA a slot's decode steps are recorded, and a recording keeps the tensors it writes alive: a growth a tensor
+    /// at a time releases each old cache tensor as it goes - the recordings bound to the slot go first - so the device holds the
+    /// added cells and one tensor at the peak, the room its target was made for. Left to go beside the next recorded step, they
+    /// kept every old tensor through the growth, which then needed a second slot's memory (Qwen3.8-27B, three 47K conversations
+    /// at once on an RTX PRO 4500: out of memory after 29 of 34 tensors, HTTP 500).
+    /// </summary>
+    [CudaFact]
+    public void OnDirectCuda_ARecordedSlotsGrowthReleasesItsOldCachesAsItGoes()
+    {
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        string path = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, ContextLength = 16384 }
+            .Write(Path.Combine(_dir, "q35-cuda-recorded.gguf"));
+        int[] prompt = Enumerable.Range(0, 1980).Select(i => 3 + (i * 37 + i / 7) % 250).ToArray();
+        using var model = new Qwen35RuntimeModel(path, BackendType.Cuda, 1, null, 1);
+        var unified = (IUnifiedBatchModel)model;
+        long free = 32 * GB;
+        model.DeviceRoomForTests = () => (free, 32 * GB);
+        free = model.SlotRoomNeedForTests(2048);
+        Assert.Equal(0, unified.EnsureSequenceSlot("a", 3000, prompt.Length + 1));
+        Assert.Equal(2048, model.SlotCapacityForTests("a"));
+        free = 32 * GB;
+        var logits = new float[1][];
+        Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { prompt }, new[] { 0 }, logits));
+        int length = prompt.Length, next = ArgMax(logits[0]);
+        for (int t = 0; t < 48; t++)
+        {
+            Assert.Equal(length, unified.EnsureSequenceSlot("a", 3000, length + 1));
+            Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { new[] { next } }, new[] { length }, logits));
+            next = ArgMax(logits[0]);
+            length++;
+        }
+        Assert.True(model.DecodeRecordings > 0, "no decode step was recorded");
+
+        Tensor[][] caches = model.SlotCachesForTests("a");
+        var old = new List<Storage>();
+        foreach (Tensor[] entry in caches)
+            if (entry?[0] != null) old.Add(entry[0].Storage);
+        Assert.NotEmpty(old);
+        // The slot and a recording hold each of them.
+        Assert.All(old, s => Assert.True(References(s) >= 2, $"a cache storage has {References(s)} reference(s); no recording holds it"));
+
+        Assert.Equal(length, unified.EnsureSequenceSlot("a", 3000, 2100));
+        Assert.Equal(1, model.RollingGrowths);
+        Assert.True(model.SlotCapacityForTests("a") >= 2100);
+        Assert.All(old, s => Assert.Equal(0, References(s)));
+
+        // The grown slot decodes on.
+        Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { new[] { next } }, new[] { length }, logits));
+        model.OnSequenceReleased("a");
+    }
+
     /// <summary>A growth whose allocation fails part way fails the request with what happened; the slot, its caches of two
     /// capacities, is released, and the next request runs.</summary>
     [Fact]
