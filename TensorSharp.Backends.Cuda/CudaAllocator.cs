@@ -16,6 +16,9 @@ namespace TensorSharp.Cuda
         // transient tensors. See CudaDeviceMemoryPool for the design.
         private readonly CudaDeviceMemoryPool pool;
 
+        // TENSORSHARP_CUDA_POOL_MIN_FREE_MB: the free memory the pool keeps beside what it caches (see the constructor).
+        private readonly long freeReserveBytes;
+
         public CudaAllocator(int deviceId = 0)
         {
             CudaBackend.Register();
@@ -64,6 +67,7 @@ namespace TensorSharp.Cuda
                 * 1024L * 1024L;
 
             Context = context;
+            freeReserveBytes = minFreeReserveBytes;
             _stream = stream;
             Blas = blas;
             Kernels = kernels;
@@ -532,6 +536,71 @@ namespace TensorSharp.Cuda
             Context.MakeCurrent();
             Stream.Synchronize();
             return pool.TrimLarge(bytes, keepBlockBytes);
+        }
+
+        /// <summary>
+        /// Give back cached large blocks, the least recently used size first, so that an allocation of <paramref name="bytes"/>
+        /// about to be made (a model's slot, a prompt step) finds them at the driver beside the pool's free-memory reserve and
+        /// the ladder's slack, instead of failing a cuMemAlloc and climbing the ladder once for each of its tensors; never a block
+        /// of <paramref name="keepBlockBytes"/> (the size its tensors rent, which cached blocks of serve). Nothing while a graph is
+        /// captured here. Synchronizes this thread's stream when it frees. Returns the bytes freed.
+        /// </summary>
+        /// <param name="driverFreeBytes">The driver's free bytes when the caller just read them (<see cref="TryGetDeviceMemory"/>
+        /// less <see cref="ReclaimableBytes"/>), or a negative value to read them here.</param>
+        public long TrimForAllocation(long bytes, long keepBlockBytes = 0, long driverFreeBytes = -1)
+        {
+            ThrowIfDisposed();
+            if (bytes <= 0 || pool.LargeCachedBytes == 0 || CudaGraphCapture.IsCapturing(this)) return 0;
+            long free = driverFreeBytes >= 0 ? driverFreeBytes : GetMemoryInfo().freeBytes;
+            long shortfall = DeviceMemoryReclaimLadder.TrimTarget(bytes, freeReserveBytes) - free;
+            return shortfall > 0 ? TrimLargeCache(shortfall, keepBlockBytes) : 0;
+        }
+
+        /// <summary>The block the pool hands out for an allocation of <paramref name="bytes"/>: a cached block of this size
+        /// serves it.</summary>
+        public long AllocationBlockBytes(long bytes) => CudaDeviceMemoryPool.RoundAllocationSize(Math.Max(bytes, 1));
+
+        /// <summary>Whether a CUDA graph is being captured on this allocator: a holder that gives memory back on its own waits
+        /// (a captured graph may come to own blocks the pool caches).</summary>
+        public bool CapturesGraph => CudaGraphCapture.IsCapturing(this);
+
+        private int integrated = -1;
+
+        /// <summary>
+        /// Diagnostic (TS_CUDA_LOG_VRAM=1): what a model's device-room accounting reads (the driver's free memory and the
+        /// cached large blocks it counts as free), with whether the GPU is integrated and the host's MemAvailable: on a unified
+        /// device (GB10) cuMemGetInfo may or may not count the host's reclaimable page cache, which decides how eagerly the
+        /// prefix cache gives conversations up.
+        /// </summary>
+        public void LogDeviceRoom(string label)
+        {
+            if (!VramLogEnabled) return;
+            try
+            {
+                (long free, long total) = GetMemoryInfo();
+                if (integrated < 0)
+                    integrated = CudaDriverApi.cuDeviceGet(out int device, DeviceId) == 0
+                        && CudaDriverApi.cuDeviceGetAttribute(out int value, 18 /* CU_DEVICE_ATTRIBUTE_INTEGRATED */, device) == 0
+                        ? value : 0;
+                Console.WriteLine($"[vram] {label}: GPU {DeviceId} cuMemGetInfo free={free >> 20} MiB of {total >> 20} MiB, "
+                    + $"large cached={pool.LargeCachedBytes >> 20} MiB, integrated={integrated}, host MemAvailable={HostMemAvailable()}");
+            }
+            catch (Exception)
+            {
+                // Diagnostics must never break inference.
+            }
+
+            static string HostMemAvailable()
+            {
+                if (!OperatingSystem.IsLinux()) return "n/a";
+                foreach (string line in System.IO.File.ReadLines("/proc/meminfo"))
+                    if (line.StartsWith("MemAvailable:", StringComparison.Ordinal))
+                    {
+                        string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        return parts.Length >= 2 && long.TryParse(parts[1], out long kb) ? $"{kb >> 10} MiB" : "n/a";
+                    }
+                return "n/a";
+            }
         }
 
         public void Synchronize()

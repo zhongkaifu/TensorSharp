@@ -354,8 +354,17 @@ namespace TensorSharp.Models
 
         /// <summary>The prefix cache evicts finished requests' slots before a new request needs their room: what the device
         /// lacks for one more fresh slot (<see cref="ModelBase.QueryHostMemoryDeficitBytes"/>).</summary>
+        /// <remarks>On a device this model manages (<see cref="DeviceRoomManaged"/>, one direct-CUDA device), what the device
+        /// lacks of its headroom alone: at admission the incoming request may adopt the very payload a slot's room would evict
+        /// (a conversation's next turn takes its finished slot), so a slot's or a prompt step's room is made when it is
+        /// allocated (<see cref="EnsureDeviceRoom"/>), which knows what to keep.</remarks>
         protected override long DeviceMemoryDeficitBytes()
-            => AdmitsSlotsByDeviceMemory ? DeviceDeficit(SlotDeviceBytes(FreshSlotTokens)) : 0;
+        {
+            if (AdmitsSlotsByDeviceMemory) return DeviceDeficit(SlotDeviceBytes(FreshSlotTokens));
+            if (!DeviceRoomManaged) return 0;
+            var (free, total) = DeviceMemory();
+            return total <= 0 ? 0 : Math.Max(0, DeviceHeadroom(total) - free);
+        }
 
         /// <summary><see cref="DeviceMemoryDeficitBytes"/> alone (tests).</summary>
         internal long DeviceSlotDeficitBytes => DeviceMemoryDeficitBytes();
@@ -480,6 +489,7 @@ namespace TensorSharp.Models
         {
             var k = new Tensor[CacheEntries][];
             var v = new Tensor[CacheEntries][];
+            NoteDeviceMemoryChanged();
             for (int e = 0; e < CacheEntries; e++) AllocateCacheEntry(k, v, e, capacity);
             return (k, v);
         }
@@ -502,14 +512,23 @@ namespace TensorSharp.Models
         {
             if (slot == null) return;
             _idleSpareRefused = false;
-            ForgetGraphsOf(slot);
-            foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-            foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-            slot.K = slot.V = null;
-            DisposeStates(slot.Recurrent);
-            slot.Recurrent = null;
-            slot.DraftCarry?.Dispose();
-            slot.DraftCarry = null;
+            _slotMutationDepth++;
+            try
+            {
+                ForgetGraphsOf(slot);
+                foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                slot.K = slot.V = null;
+                DisposeStates(slot.Recurrent);
+                slot.Recurrent = null;
+                slot.DraftCarry?.Dispose();
+                slot.DraftCarry = null;
+            }
+            finally
+            {
+                _slotMutationDepth--;
+                NoteDeviceMemoryChanged();
+            }
         }
 
         private void RecycleSlot(Slot slot)
@@ -551,19 +570,30 @@ namespace TensorSharp.Models
                 capacity = AlignedSlotCapacity(Math.Min(capacity, (long)required + SlotGrowthHeadroomTokens));
             }
             if (TryGrowSlotOnDevice(slot, capacity)) return;
-            SyncToHost(slot);
-            (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
-            // Only this slot's graphs bound the caches it gives up: every other request's steps and recordings stay. Clearing
-            // the whole cache when a pooled 512-cell slot grew for a 4K prompt had every slot's decode trace and record again
-            // (Qwen3.8 Flash Next on an A40: five graphs and two parked recordings, 2,200 allocations and a 109 ms recording).
-            ForgetGraphsOfGrowing(slot);
-            CopyRows(slot.K, k, slot.Length);
-            CopyRows(slot.V, v, slot.Length);
-            foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-            foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-            slot.K = k;
-            slot.V = v;
-            slot.Capacity = capacity;
+            // On a device this model manages the grown caches' room is made first, or the growth fails with what holds the
+            // device: running out part way left a request failed with CUDA error 2 (issue #376).
+            if (DeviceRoomManaged) EnsureRoomToGrow(slot, capacity);
+            _slotMutationDepth++;
+            try
+            {
+                SyncToHost(slot);
+                (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
+                // Only this slot's graphs bound the caches it gives up: every other request's steps and recordings stay. Clearing
+                // the whole cache when a pooled 512-cell slot grew for a 4K prompt had every slot's decode trace and record again
+                // (Qwen3.8 Flash Next on an A40: five graphs and two parked recordings, 2,200 allocations and a 109 ms recording).
+                ForgetGraphsOfGrowing(slot);
+                CopyRows(slot.K, k, slot.Length);
+                CopyRows(slot.V, v, slot.Length);
+                foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                slot.K = k;
+                slot.V = v;
+                slot.Capacity = capacity;
+            }
+            finally
+            {
+                _slotMutationDepth--;
+            }
         }
 
         private static void CopyRows(Tensor[][] from, Tensor[][] to, int rows)
@@ -759,6 +789,7 @@ namespace TensorSharp.Models
         private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
             float[][] features = null)
         {
+            ForgetDeferredGraphs();
             try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {

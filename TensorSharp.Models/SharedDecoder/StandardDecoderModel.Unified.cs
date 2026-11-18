@@ -66,13 +66,21 @@ namespace TensorSharp.Models
             int rows = Math.Min(_cudaPromptRows, remaining);
             // What the first prompt found may be held since: recorded steps keep the pool blocks their kernels used, a
             // speculating request its verify buffers, retained slots their caches (an RTX PRO 6000 slice ran out of memory
-            // part way through the second 4K prompt of a speculating run). The recordings go first (they record again), then
-            // finished requests' retained slots, the oldest first; a step that still does not fit is narrower, this prompt only.
+            // part way through the second 4K prompt of a speculating run). On one device the model makes the room in its
+            // fixed order (EnsureDeviceRoom: pooled slots, parked recordings, finished conversations the oldest first, the
+            // cached graphs last; dropping every graph first had every running request trace and record again); elsewhere the
+            // recordings go first, then finished requests' retained slots, the oldest first. A step that still does not fit
+            // is narrower, this prompt only.
             long need = rows * CudaPromptRowBytes() + CudaPromptReserveBytes;
             if (PromptFreeBytes(cuda) < need)
             {
-                ClearGraphCache();
-                if (PromptFreeBytes(cuda) < need) ReleaseRetainedSlotsFor(need, cuda);
+                if (DeviceRoomManaged)
+                    EnsureDeviceRoom(need, RunningSlots(), RoomUse.PromptStep, mayEvict: true, "a prompt step");
+                else
+                {
+                    ClearGraphCache();
+                    if (PromptFreeBytes(cuda) < need) ReleaseRetainedSlotsFor(need, cuda);
+                }
                 long now = PromptFreeBytes(cuda);
                 if (now < need)
                     return (int)Math.Clamp((now - CudaPromptReserveBytes) / CudaPromptRowBytes() / 256 * 256, 256, _cudaPromptRows);
@@ -102,7 +110,11 @@ namespace TensorSharp.Models
         /// <summary>Tests stand in for the device's free memory a lone prompt's step is fitted to (after its first sizing).</summary>
         internal Func<long> PromptFreeBytesForTests { get; set; }
 
-        private long PromptFreeBytes(TensorSharp.Cuda.CudaAllocator cuda) => PromptFreeBytesForTests?.Invoke() ?? CudaFreeBytes(cuda);
+        /// <summary>The free bytes a lone prompt's step is fitted to: on a device this model manages, the driver's free memory
+        /// and the large blocks the allocator frees on demand (<see cref="DeviceMemory"/>); elsewhere also the shards' small
+        /// blocks, as before.</summary>
+        private long PromptFreeBytes(TensorSharp.Cuda.CudaAllocator cuda)
+            => PromptFreeBytesForTests?.Invoke() ?? (DeviceRoomManaged ? DeviceMemory(fresh: true).Free : CudaFreeBytes(cuda));
 
         /// <summary>The device's free bytes and its pool's cached ones (long.MaxValue when unknown).</summary>
         private static long CudaFreeBytes(TensorSharp.Cuda.CudaAllocator cuda)
@@ -137,13 +149,21 @@ namespace TensorSharp.Models
         {
             if (string.IsNullOrEmpty(requestId))
                 throw new ArgumentException("RequestId required", nameof(requestId));
+            if (_engineThread == 0) _engineThread = Environment.CurrentManagedThreadId;
             RestorePrimaryCache();
+            ForgetDeferredGraphs();
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             int reserve = Math.Min(_maxContextLength, reserveTokens);
             if (!_slots.TryGetValue(requestId, out Slot slot))
             {
-                EnsureDeviceRoomForSlot(requestId, Math.Max(reserve, FreshSlotTokens));
-                _slots[requestId] = slot = ReclaimRetainedSlot(reserve) ?? NewSlot(reserve);
+                if (DeviceRoomManaged)
+                    slot = NewSlotWithRoom(requestId, reserve);
+                else
+                {
+                    EnsureDeviceRoomForSlot(requestId, Math.Max(reserve, FreshSlotTokens));
+                    slot = ReclaimRetainedSlot(reserve) ?? NewSlot(reserve);
+                }
+                _slots[requestId] = slot;
             }
             if (reserve > slot.Capacity && !TryMoveToPooledSlot(requestId, ref slot, reserve))
                 EnsureSlotCapacity(slot, reserve, reservation: true);
@@ -254,7 +274,7 @@ namespace TensorSharp.Models
         {
             footprint = default;
             if (GraphExecutor?.Capabilities.SlotBoundRecordings == true && SupportsPrefixCheckpoints && !string.IsNullOrEmpty(payloadKey)
-                && TryGetSlot(requestId, out Slot slot) && length > 0 && slot.Length == length && RoomForRetainedCopy(slot.Length))
+                && TryGetSlot(requestId, out Slot slot) && length > 0 && slot.Length == length && RoomForRetainedCopy(slot))
             {
                 _retainedSlots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
                 if (_retainedSlots.ContainsKey(payloadKey)) return false;
@@ -269,13 +289,15 @@ namespace TensorSharp.Models
         /// <summary>Finished requests retained as a copy of their slot (tests check the route engaged).</summary>
         internal int RetainedByCopy { get; private set; }
 
-        /// <summary>A retained copy of <paramref name="length"/> tokens goes into a pooled slot that holds it, or the device has
-        /// room for it and one more slot as large (<see cref="RoomForTwoSlots"/>): the copy keeps two slots where a donation kept
-        /// one, which beside a full expert tier (Qwen3.8 Flash Next after a 16K prompt on an A40: 52.0 against 54.9 tok/s) cost
-        /// more than the recordings it keeps.</summary>
-        private bool RoomForRetainedCopy(int length)
+        /// <summary>A retained copy of <paramref name="slot"/> goes into a pooled slot that holds it, or the device has room for
+        /// it and one more slot as large (<see cref="RoomForTwoSlots"/>): the copy keeps two slots where a donation kept one,
+        /// which beside a full expert tier (Qwen3.8 Flash Next after a 16K prompt on an A40: 52.0 against 54.9 tok/s) cost more
+        /// than the recordings it keeps. On a device this model manages, the copy's room is made as a slot's without releasing a
+        /// conversation for it (<see cref="RoomForSlotCopy"/>); otherwise the slot is donated.</summary>
+        private bool RoomForRetainedCopy(Slot slot)
         {
-            int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, length));
+            if (DeviceRoomManaged) return RoomForSlotCopy(slot, slot.Length, mayEvict: false, needed: false, "a finished request's retained copy");
+            int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, slot.Length));
             return (_slotPool != null && _slotPool.Exists(p => p.Capacity >= capacity)) || RoomForTwoSlots(capacity) == true;
         }
 
@@ -300,16 +322,19 @@ namespace TensorSharp.Models
         /// recorded its steps again (Qwen3.8 Flash Next UD-Q2_K_XL on an A40 with the prefix cache: each request's slot was new,
         /// 2-4% of its decode spent recording), and the allocation sat in its time to the first token.
         /// </summary>
-        private Slot ReclaimRetainedSlot(int reserve)
+        /// <param name="roomShort">The device was found short of a fresh slot's room (<see cref="NewSlotWithRoom"/>): only a
+        /// retained slot that holds the request is taken, which then allocates nothing.</param>
+        private Slot ReclaimRetainedSlot(int reserve, bool roomShort = false)
         {
             if (GraphExecutor?.Capabilities.SlotBoundRecordings != true || _retainedSlots is not { Count: > 0 }) return null;
             int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, reserve));
             if (_slotPool != null && _slotPool.Exists(p => p.Capacity >= capacity)) return null;
-            if (RoomForSlots(capacity, 1) != false) return null;
+            if (!roomShort && RoomForSlots(capacity, 1) != false) return null;
             string key = null;
             Slot oldest = null;
             foreach (var (k, retained) in _retainedSlots)
-                if (retained.K != null && (oldest == null || retained.RetainedAt < oldest.RetainedAt))
+                if (retained.K != null && (!roomShort || retained.Capacity >= capacity)
+                    && (oldest == null || retained.RetainedAt < oldest.RetainedAt))
                 {
                     key = k;
                     oldest = retained;
@@ -470,12 +495,22 @@ namespace TensorSharp.Models
             Slot slot = _spareBuild;
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             int layers = _anyRecurrent ? Config.NumLayers : 0;
-            while (_spareBuildNext < CacheEntries + layers)
+            // A spare is a convenience: the allocator's reclaimer releases no conversation for it.
+            _slotMutationDepth++;
+            NoteDeviceMemoryChanged();
+            try
             {
-                if (_spareBuildNext < CacheEntries) AllocateCacheEntry(slot.K, slot.V, _spareBuildNext, slot.Capacity);
-                else NewRecurrentLayer(slot.Recurrent, _spareBuildNext - CacheEntries);
-                _spareBuildNext++;
-                if (System.Diagnostics.Stopwatch.GetTimestamp() - start >= SpareSliceTicks) break;
+                while (_spareBuildNext < CacheEntries + layers)
+                {
+                    if (_spareBuildNext < CacheEntries) AllocateCacheEntry(slot.K, slot.V, _spareBuildNext, slot.Capacity);
+                    else NewRecurrentLayer(slot.Recurrent, _spareBuildNext - CacheEntries);
+                    _spareBuildNext++;
+                    if (System.Diagnostics.Stopwatch.GetTimestamp() - start >= SpareSliceTicks) break;
+                }
+            }
+            finally
+            {
+                _slotMutationDepth--;
             }
             if (_spareBuildNext < CacheEntries + layers) return true;
             _spareBuild = null;
@@ -532,7 +567,7 @@ namespace TensorSharp.Models
             if (!TryGetSlot(requestId, out Slot slot))
                 return HolderPrefixCacheAdapter.TryCaptureCopy(this, requestId, payloadKey, out footprint);
             _retainedSlots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
-            if (_retainedSlots.ContainsKey(payloadKey) || slot.Length <= 0 || !RoomForCheckpointCopy(slot.Length)) return false;
+            if (_retainedSlots.ContainsKey(payloadKey) || slot.Length <= 0 || !RoomForCheckpointCopy(slot)) return false;
             _retainedSlots.Add(payloadKey, Retained(CopySlot(slot, slot.Length)));
             footprint = MeasureEndState(payloadKey);
             return true;
@@ -548,12 +583,21 @@ namespace TensorSharp.Models
         /// device had no room for it: after a 16K prompt beside Qwen3.8 Flash Next's expert tier on an A40 the allocator first
         /// gave the prompt's cached blocks back to the driver, 190-200 ms at the first decode step (52.9 against 56.5 tok/s
         /// without the prefix cache), where the direct engine took no checkpoint at all; after a 4K prompt the copy fit beside
-        /// the headroom alone and still cost the decode 2 tok/s.
+        /// the headroom alone and still cost the decode 2 tok/s. On a device this model manages, the copy's room is made as a
+        /// slot's, finished conversations released for it the oldest first (the newest checkpoint is worth more than the oldest
+        /// conversation: declined, a conversation's next turn prefilled its whole prompt again, issue #376), and it is declined
+        /// only where even that made no room.
         /// </summary>
-        private bool RoomForCheckpointCopy(int length)
+        private bool RoomForCheckpointCopy(Slot slot)
         {
+            if (DeviceRoomManaged)
+            {
+                if (RoomForSlotCopy(slot, slot.Length, mayEvict: true, needed: false, "a prompt-end checkpoint")) return true;
+                CheckpointsDeclinedForRoom++;
+                return false;
+            }
             if (GraphExecutor?.Capabilities.SlotBoundRecordings != true) return true;
-            int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, length));
+            int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, slot.Length));
             if (_slotPool != null && _slotPool.Exists(p => p.Capacity >= capacity)) return true;
             if (RoomForTwoSlots(capacity) != false) return true;
             CheckpointsDeclinedForRoom++;

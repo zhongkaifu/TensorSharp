@@ -467,6 +467,21 @@ slot). A request of a scoped conversation that finished on the primary (N=1) cac
 is kept the same way when a fused step takes the model over, so a conversation does
 not lose its state because another chat arrived between two of its turns.
 
+On `--backend cuda` with one GPU, the shared decoder runtime accounts its device
+memory itself, counting the large blocks the CUDA allocator caches as free (it gives
+them back on demand). Before it allocates a request's slot, copies one (a prompt-end
+checkpoint, a retained copy, a clone at admission) or runs a lone prompt's step, it
+makes room in a fixed order, the cheapest loss first: the pool's spare slots, then
+parked decode recordings, then the finished conversations the prefix cache keeps,
+oldest first, and for a prompt step the cached graphs last. A conversation released
+this way prefills its next turn again, and one stderr line says how many went and
+for what. A new request whose slot does not fit waits while other requests run;
+alone, it is refused with the numbers before any of its prompt runs, instead of
+failing part way with CUDA error 2. The prefix cache also evicts its oldest payloads
+whenever free memory falls below the device's headroom (the larger of 1 GB and 1/32
+of the device), and the CUDA allocator asks the model to release finished
+conversations before its last resort (a full GC and a drain of every cached block).
+
 ### Prompt reuse across requests: conversation scopes and media identity
 
 Every cross-request reuse - the live primary cache, retained end states, the

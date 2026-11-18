@@ -1340,6 +1340,7 @@ namespace TensorSharp.Models
 
         private void ReleaseDecoderResources()
         {
+            UnregisterDeviceRoomReclaimer();
             StopHostWarm();
             foreach (RankExpertStack stack in _rankStacks.Values) stack.Stack.Dispose();
             _rankStacks.Clear();

@@ -61,6 +61,7 @@ namespace TensorSharp.Models
             if (_retainedSlots.ContainsKey(key)) return false;
             Slot active = SnapshotActive();
             if (active.K == null || active.Length <= 0) return false;
+            if (!RoomForSlotCopy(active, active.Length, mayEvict: true, needed: false, "a shared-prefix checkpoint")) return false;
             _retainedSlots.Add(key, Retained(CopySlot(active, active.Length)));
             return true;
         }
@@ -74,7 +75,11 @@ namespace TensorSharp.Models
             if (!_retainedSlots.TryGetValue(retainedKey, out Slot source) || source.K == null) return false;
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_slots.ContainsKey(newRequestId) || string.Equals(_activeKey, newRequestId, StringComparison.Ordinal)) return false;
-            _slots.Add(newRequestId, CopySlot(source, Math.Max(source.Length, requiredContextTokens)));
+            // On a device this model manages the copy's room is made first (never from the source); declined, the request
+            // prefills its prompt instead of running out of memory part way through the copy.
+            int capacity = Math.Max(source.Length, requiredContextTokens);
+            if (!RoomForSlotCopy(source, capacity, mayEvict: true, needed: true, "a clone of a cached prefix")) return false;
+            _slots.Add(newRequestId, CopySlot(source, capacity));
             return true;
         }
 
@@ -155,6 +160,13 @@ namespace TensorSharp.Models
         /// <param name="runSlotFirst">A request will run on the copy: a pooled slot a request ran on (its recordings adopted
         /// where they are) before a spare.</param>
         private Slot CopySlot(Slot source, int capacityTokens, bool runSlotFirst = false)
+        {
+            _slotMutationDepth++;
+            try { return CopySlotCore(source, capacityTokens, runSlotFirst); }
+            finally { _slotMutationDepth--; }
+        }
+
+        private Slot CopySlotCore(Slot source, int capacityTokens, bool runSlotFirst)
         {
             int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, capacityTokens));
             // A pooled slot's caches and states are overwritten whole and keep their device copies (cached graphs

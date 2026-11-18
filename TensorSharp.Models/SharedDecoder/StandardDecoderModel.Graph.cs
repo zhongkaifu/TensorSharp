@@ -928,10 +928,18 @@ namespace TensorSharp.Models
         /// replays anything (releasing a slot drops the cached graphs). An unrecorded verify window of Qwen3.8-27B took 101 ms
         /// against 41 recorded on a 24 GB RTX PRO 4000, for the whole request after two 4K prompts' slots were kept.
         /// </summary>
+        /// <remarks>On a device this model manages, the room is made in its fixed order (<see cref="EnsureDeviceRoom"/>) short of
+        /// the parked recordings, which are what wants it: pooled slots, then finished conversations, the oldest first.</remarks>
         private void RoomForRecordings()
         {
             if (!_recordingWantsRoom) return;
             _recordingWantsRoom = false;
+            if (DeviceRoomManaged)
+            {
+                if (_retainedSlots is { Count: > 0 } || _slotPool is { Count: > 0 })
+                    EnsureDeviceRoom(RecordingRoomBytes, RunningSlots(), RoomUse.Recording, mayEvict: true, "recorded steps");
+                return;
+            }
             if (_allocator is TensorSharp.Cuda.CudaAllocator cuda && _retainedSlots is { Count: > 0 } && PromptFreeBytes(cuda) < RecordingRoomBytes)
                 ReleaseRetainedSlotsFor(RecordingRoomBytes, cuda);
         }

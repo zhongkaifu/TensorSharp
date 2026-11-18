@@ -47,10 +47,19 @@ namespace TensorSharp.Models
             };
         }
 
+        /// <remarks>On one direct-CUDA device the model's reclaimer is registered with its allocator, which asks it for the
+        /// conversations the prefix cache keeps before its last resort (<see cref="ReclaimForAllocator"/>).</remarks>
         public void AttachPrefixCache(IPrefixPayloadSink sink)
-            => _prefixCacheSink = sink ?? throw new ArgumentNullException(nameof(sink));
+        {
+            _prefixCacheSink = sink ?? throw new ArgumentNullException(nameof(sink));
+            RegisterDeviceRoomReclaimer();
+        }
 
-        public void DetachPrefixCache() => _prefixCacheSink = null;
+        public void DetachPrefixCache()
+        {
+            UnregisterDeviceRoomReclaimer();
+            _prefixCacheSink = null;
+        }
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
         public void QuerySpareBytes(long[] perClass) => QueryPrefixCacheSpareBytes(perClass);
