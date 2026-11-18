@@ -50,6 +50,16 @@ namespace TensorSharp.Models
         private static readonly int SpinsBeforePark = EnvInt("TS_CPU_SPIN", 4096);
 
         /// <summary>
+        /// Completion polls a submitter takes, a pause instruction apart, before <see cref="SpinWait"/>'s yields: after its
+        /// own blocks the submitter waits for the other threads' last ones, and a job of a decode step lasts tens of
+        /// microseconds. SpinWait yields the thread from its eleventh round on (a <c>swtch_pri</c> system call on macOS),
+        /// which on its own measured 30-40 % of a decoding submitter's samples, and returns well after the job is done; 2,000
+        /// polls is some 0.1 ms, past which a long job's wait yields as before. LFM3-1.7B Q4_K_M on an M5 Pro, 16-thread
+        /// decode, tg128 at depth 0 / 1,024: 138.9 / 128.2 tok/s yielding at once, 142.5 / 130.6 polling (4 interleaved rounds).
+        /// </summary>
+        private const int JoinPolls = 2000;
+
+        /// <summary>
         /// Stack reserved for each worker. Smaller than a ThreadPool thread's, and running out of
         /// stack aborts the process, so a kernel never sizes a stackalloc by its input here: a
         /// buffer that grows with the context, the heads or the batch goes through
@@ -208,6 +218,7 @@ namespace TensorSharp.Models
 
                 RunBlocks(body, start, end);
 
+                for (int poll = 0; poll < JoinPolls && Volatile.Read(ref _done) != end; poll++) Thread.SpinWait(1);
                 var spin = new SpinWait();
                 while (Volatile.Read(ref _done) != end) spin.SpinOnce(-1);
 
