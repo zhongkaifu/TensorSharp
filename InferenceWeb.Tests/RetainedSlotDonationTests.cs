@@ -33,13 +33,13 @@ public sealed class RetainedSlotDonationTests : IDisposable
 
     /// <summary>A Qwen3.5 dense fixture; on the managed CPU executor with the slot-bound policies of the CUDA executor
     /// (<paramref name="slotBound"/>), on direct CUDA with its own.</summary>
-    private Qwen35RuntimeModel Create(BackendType backend = BackendType.Cpu, bool slotBound = true)
+    private Qwen35RuntimeModel Create(BackendType backend = BackendType.Cpu, bool slotBound = true, RecordingPayloadSink sink = null)
     {
         using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(backend == BackendType.Cpu ? KvCacheDtype.F32 : KvCacheDtype.F16);
         string path = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "q35-dense.gguf"));
         var model = new Qwen35RuntimeModel(path, backend, 1, null, 1);
         if (backend == BackendType.Cpu) model.SlotBoundPoliciesForTests = slotBound;
-        model.AttachPrefixCache(new RecordingPayloadSink());
+        model.AttachPrefixCache(sink ?? new RecordingPayloadSink());
         return model;
     }
 
@@ -291,6 +291,48 @@ public sealed class RetainedSlotDonationTests : IDisposable
         Assert.Equal(1, model.DeviceRoomStages[4]);
         Assert.Equal(1, model.DeviceRoomStages[5]);
         Assert.Equal(new[] { "k1" }, model.RetainedPayloadKeys);
+        Assert.Equal(k1, Buffers("k1"));
+    }
+
+    /// <summary>
+    /// Making room takes the oldest retained slot's window buffers where they cover the shortfall, and stops there: k1 keeps
+    /// its buffers and no conversation is released. The buffers are counted as they are freed, since the device's reading
+    /// need not see them: on direct CUDA each is under the allocator's 2 MiB large-block size, so a freed one waits in the
+    /// small-block cache, which the reading leaves out (CudaAllocator.TryGetDeviceMemory) and the next allocation that needs
+    /// it takes back before anything else (the reclaim ladder's second rung). Re-read only, the reading never moved: every
+    /// retained slot gave its buffers up, and the conversations were released anyway (<paramref name="readingSeesFrees"/>
+    /// false). Where the reading does see them (a device under the pool's free reserve hands them to the driver), they are not
+    /// counted twice.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void MakingRoomTakesTheOldestRetainedWindowBuffersAndCountsThemWhereTheReadingDoesNot(bool readingSeesFrees)
+    {
+        var sink = new RecordingPayloadSink();
+        using Qwen35RuntimeModel model = Create(sink: sink);
+        foreach (string key in new[] { "k0", "k1" })
+        {
+            (int length, int next) = Run(model, key, steps: 1);
+            Window(model, key, ref length, next);
+            Assert.True(model.RetainSequenceCacheAs(key, key));
+        }
+        Run(model, "run", steps: 0);
+        long Buffers(string key) => model.RetainedStatesForTests(key)?.SelectMany(l => l ?? Array.Empty<StandardDecoderModel.RecurrentState>())
+            .Sum(s => s?.SpecBufferBytes ?? 0) ?? -1;
+        long k0 = Buffers("k0"), k1 = Buffers("k1");
+        Assert.True(k0 > 0 && k1 > 0);
+
+        const long GB = 1L << 30;
+        long free = 8 * GB;
+        model.DeviceRoomForTests = () => (readingSeesFrees ? free + k0 + k1 - Buffers("k0") - Buffers("k1") : free, 16 * GB);
+        Assert.True(model.EnsureRecordingRoomForTests(free + k0 - 1), "no room was made from the oldest retained slot's window buffers");
+
+        Assert.Equal(new[] { "k0", "k1" }, model.RetainedPayloadKeys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Empty(sink.Reports);
+        Assert.Equal(0, model.DeviceRoomStages[5]);
+        Assert.Equal(1, model.DeviceRoomStages[4]);
+        Assert.Equal(0, Buffers("k0"));
         Assert.Equal(k1, Buffers("k1"));
     }
 

@@ -45,6 +45,11 @@ namespace TensorSharp.Models
         /// 5 retained conversations, 6 the cached graphs.</summary>
         internal int[] DeviceRoomStages { get; } = new int[7];
 
+        /// <summary>Tests: room for <paramref name="bytes"/> of recorded steps beside the running requests, as a step that could
+        /// not record asks for it (<see cref="RecordingRoomBytes"/>), at a size the test chooses.</summary>
+        internal bool EnsureRecordingRoomForTests(long bytes)
+            => EnsureDeviceRoom(bytes, RunningSlots(), RoomUse.Recording, mayEvict: true, "recorded steps (test)");
+
         /// <summary>New requests refused because their slot does not fit the device alone (tests check the route).</summary>
         internal int SlotRefusals { get; private set; }
 
@@ -183,16 +188,24 @@ namespace TensorSharp.Models
 
                 // 4. The window buffers the conversations the prefix cache keeps hold, the oldest first, where they cover the
                 // shortfall (short of it, conversations go next, and the buffers of those that stay would be lost for nothing).
+                // They count as freed: each is under the CUDA allocator's large-block size, so a freed one waits in its
+                // small-block cache, which the reading leaves out and an allocation that needs it takes back before it asks
+                // anyone for memory (the reclaim ladder's second rung). Re-read only, the reading did not move: every retained
+                // slot gave its buffers up, and the conversations went anyway.
                 if (free < need && WindowBufferBytes(keep) >= need - free)
                 {
                     bool buffers = false;
+                    long counted = free;
                     foreach (Slot slot in _retainedSlots.Values.OrderBy(s => s.RetainedAt).ToList())
                     {
                         if (free >= need) break;
-                        if (slot.K == null || Holds(keep, slot) || ReleaseWindowBuffers(slot) <= 0) continue;
+                        if (slot.K == null || Holds(keep, slot)) continue;
+                        long windowBytes = ReleaseWindowBuffers(slot);
+                        if (windowBytes <= 0) continue;
                         buffers = true;
+                        counted += windowBytes;
                         NoteDeviceMemoryChanged();
-                        free = RoomFree(use);
+                        free = Math.Max(RoomFree(use), counted);   // a reading that sees them (frees past the pool) counts them once
                     }
                     if (buffers) DeviceRoomStages[4]++;
                 }
