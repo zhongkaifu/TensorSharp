@@ -3,9 +3,10 @@
 # Licensed under the BSD-3-Clause license in the repository root.
 """Paired comparison of two eval result files (gsm8k.py, ifeval.py, toolcall_eval.py output).
 
-    compare.py A.jsonl B.jsonl [--show 5]
+    compare.py A.jsonl B.jsonl [--show 5] [--field content_correct]
 
-Each line holds an "id" and a boolean "correct". Prints both accuracies with 95% Wilson intervals,
+Each line holds an "id" and a boolean "correct" (or the --field named: gsm8k.py's content_correct scores what
+a client reading only the content got; a line without it falls back to "correct"). Prints both accuracies with 95% Wilson intervals,
 the items only one engine got right, the exact McNemar p-value of that split, and how many replies
 were identical text (a greedy pair that matches token for token gives identical replies).
 """
@@ -28,11 +29,12 @@ def main():
     ap.add_argument("b")
     ap.add_argument("--show", type=int, default=0, help="print this many discordant items")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--field", default="correct", help="the boolean scored (default: correct)")
     args = ap.parse_args()
     A, B = load(args.a), load(args.b)
     ids = sorted(set(A) & set(B), key=lambda x: (str(type(x)), x))
-    a = [bool(A[i]["correct"]) for i in ids]
-    b = [bool(B[i]["correct"]) for i in ids]
+    a = [bool(A[i].get(args.field, A[i]["correct"])) for i in ids]
+    b = [bool(B[i].get(args.field, B[i]["correct"])) for i in ids]
     s = paired_summary(a, b)
     same = sum(1 for i in ids if A[i].get("reply") is not None and A[i].get("reply") == B[i].get("reply"))
     s["identical_replies"] = same

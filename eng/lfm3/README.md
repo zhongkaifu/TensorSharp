@@ -85,7 +85,12 @@ library Python only; outputs go to the ignored `artifacts/lfm3/e2e/`.
   past reasoning, thinking budget, streamed tool-call deltas, tool_choice, an agent loop, structured output,
   prefix-cache reuse and branching, robustness inputs, cancel and client disconnect).
 - `gsm8k.py`, `ifeval.py` (33 verifiable prompts), `toolcall_eval.py` (35 cases in `toolcall_cases.py`) and
-  `compare.py` (paired accuracy, Wilson intervals, exact McNemar); `quality.sh` runs all of them on one server.
+  `compare.py` (paired accuracy, Wilson intervals, exact McNemar; `--field content_correct` pairs gsm8k.py's
+  content-only scores); `quality.sh` runs all of them on one server.
+- `thinkoff_cut.py` finds GSM8K replies that reasoned past the thinking-off prompt's closed block and finished, asks
+  again with max_tokens cut in the answer after the close, and checks that the non-streaming reply reads as its
+  stream (the reasoning and `</think>` in the content, no `reasoning_content`, `finish_reason` length) while the
+  finished reply keeps the reasoning apart. Start the host without `--no-multi-agent` to check the sub-agent loop.
 - `needle.py` (needle in a haystack at 8K-128K, sized with llama-server's `/tokenize`, which then also gives the
   corpus' characters per token, so the server under test sees only the needle prompts) and `longctx_bench.py`
   (interleaved prefill / decode speed after a long prompt).
