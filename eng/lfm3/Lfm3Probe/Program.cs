@@ -2,7 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 //
 // LFM3 validation probe (TensorSharp side of eng/lfm3's llama.cpp comparisons; outputs belong in ignored artifacts/):
-//   ppl    MODEL BACKEND FILE CTX CHUNKS [--per-op]
+//   ppl    MODEL BACKEND FILE CTX CHUNKS [--per-op]   (also prints a digest of every scored logit's bits)
 //                                          perplexity as llama-perplexity computes it: the file's tokens (no BOS, special
 //                                          tokens not parsed) in CHUNKS chunks of CTX, each from an empty cache, scoring the
 //                                          second half of every chunk (row i predicts token i + 1); --per-op runs the shared
@@ -112,6 +112,7 @@ static int Perplexity(string path, BackendType backend, string file, int ctx, in
     var logits = new float[block * vocab];
     double nll = 0;
     long count = 0;
+    ulong digest = 14695981039346656037UL;   // FNV-1a over every scored row's logit bits: equal digests, equal logits
     var timer = Stopwatch.StartNew();
     for (int c = 0; c < chunks; c++)
     {
@@ -126,6 +127,8 @@ static int Perplexity(string path, BackendType backend, string file, int ctx, in
             for (int r = 0; r < rows && at + r < ctx - 1; r++)
             {
                 ReadOnlySpan<float> row = logits.AsSpan(r * vocab, vocab);
+                foreach (float v in row)
+                    digest = (digest ^ BitConverter.SingleToUInt32Bits(v)) * 1099511628211UL;
                 float max = float.NegativeInfinity;
                 foreach (float v in row) max = Math.Max(max, v);
                 double sum = 0;
@@ -138,6 +141,7 @@ static int Perplexity(string path, BackendType backend, string file, int ctx, in
     }
     Console.WriteLine();
     Console.WriteLine($"Final estimate: PPL = {Math.Exp(nll / count):F4} over {count} tokens ({timer.Elapsed.TotalSeconds:F1} s)");
+    Console.WriteLine($"logits digest {digest:X16}, nll {nll:R}");
     return 0;
 }
 
