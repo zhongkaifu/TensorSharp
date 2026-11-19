@@ -50,8 +50,10 @@ namespace TensorSharp.Models.SharedDiffusion
         private IDenoiser _denoiser;
         private bool _disposed;
 
-        /// <param name="planner">The residency planner; null plans against the backend's free device memory
-        /// (<see cref="GpuMemoryBudget"/>: the CUDA and Vulkan backends; elsewhere everything stays resident).</param>
+        /// <param name="planner">The residency planner; null plans against the backend's free device memory less its
+        /// headroom (<see cref="GpuMemoryBudget.TryGetReservationSpareBytes(BackendType, out long)"/>: the CUDA and Vulkan
+        /// backends' device memory, and Metal's recommended working set, a hard ceiling on unified memory past which command
+        /// buffers fail; elsewhere everything stays resident).</param>
         /// <param name="log">Where progress lines go (null: the console).</param>
         public DiffusionPipeline(IDiffusionFamily family, DiffusionLoad load, ResidencyPlanner planner = null, Action<string> log = null)
         {
@@ -61,7 +63,7 @@ namespace TensorSharp.Models.SharedDiffusion
             family.DefaultRecipe.Validate();
             BackendType backend = load.Backend;
             _planner = planner ?? new ResidencyPlanner(
-                () => GpuMemoryBudget.TryGetSpareBytes(backend, out long spare) ? spare : null, _log);
+                () => GpuMemoryBudget.TryGetReservationSpareBytes(backend, out long spare) ? spare : null, _log);
         }
 
         public IDiffusionFamily Family => _family;
