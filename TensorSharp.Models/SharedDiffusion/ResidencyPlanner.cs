@@ -91,6 +91,10 @@ namespace TensorSharp.Models.SharedDiffusion
             _log = log ?? Console.WriteLine;
         }
 
+        /// <summary>The device bytes a request may use when the components hold <paramref name="heldBytes"/> now (the spare
+        /// bytes plus those), or null when the backend reports no budget.</summary>
+        public long? Budget(long heldBytes) => _spareBytes() is long spare ? spare + heldBytes : null;
+
         /// <summary>
         /// The plan for a request running <paramref name="phases"/> in order, with <paramref name="weights"/> the device
         /// bytes of each component's weights and <paramref name="resident"/> what the device holds now (weights, and

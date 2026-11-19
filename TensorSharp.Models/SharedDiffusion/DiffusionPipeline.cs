@@ -122,8 +122,7 @@ namespace TensorSharp.Models.SharedDiffusion
             // ---- Condition: text, and the references' vision copies.
             EnterPhase(request, DiffusionPhase.Condition, DiffusionComponent.Conditioner, plan);
             IConditioner conditioner = Conditioner;
-            var pictures = new PresentedImage[job.Inputs.Length];
-            for (int i = 0; i < pictures.Length; i++) pictures[i] = policy.ForVision(job.Inputs[i], i);
+            PresentedImage[] pictures = job.Pictures;
             ConditioningSet positive = conditioner.Encode(request.Prompt ?? string.Empty, pictures, ct);
             ConditioningSet negative = job.Guided ? conditioner.Encode(request.NegativePrompt ?? string.Empty, pictures, ct) : null;
             LeavePhase(DiffusionComponent.Conditioner, job.Demand(DiffusionPhase.Condition));
@@ -222,7 +221,7 @@ namespace TensorSharp.Models.SharedDiffusion
             Report(request, new DiffusionProgress(DiffusionPhase.Composite));
             RgbImage output = job.Mask != null ? job.Mask.Composite(image)
                 : image.Width == job.Canvas.Output.Width && image.Height == job.Canvas.Output.Height ? image
-                : ImageIO.Resize(image, job.Canvas.Output.Width, job.Canvas.Output.Height);
+                : _family.ResizeOutput(image, job.Canvas.Output.Width, job.Canvas.Output.Height);
             double compositeSeconds = clock.Elapsed.TotalSeconds;
 
             var timings = new DiffusionTimings
@@ -295,6 +294,7 @@ namespace TensorSharp.Models.SharedDiffusion
             public EditMask Mask;
             public RgbImage[] Inputs;
             public RgbImage[] VaeCopies;
+            public PresentedImage[] Pictures = Array.Empty<PresentedImage>();
             public bool EncodesReferences;
             public List<PhaseDemand> Demands;
 
@@ -353,22 +353,60 @@ namespace TensorSharp.Models.SharedDiffusion
             // A selection's canvas (or crop) is the first picture the encoders see; the others keep their own.
             if (mask != null) job.Inputs[0] = mask.Reference;
             job.Target = geometry.LatentOf(job.Canvas.Sampling.Width, job.Canvas.Sampling.Height);
+            // Both copies of every reference are made (and a bad one refused) before any component runs: the vision copy
+            // the conditioner reads, and the VAE copy the encoder reads.
             job.VaeCopies = new RgbImage[job.Inputs.Length];
-            for (int i = 0; i < job.Inputs.Length; i++) job.VaeCopies[i] = _family.References.ForVae(job.Inputs[i], i);
+            job.Pictures = new PresentedImage[job.Inputs.Length];
+            for (int i = 0; i < job.Inputs.Length; i++)
+            {
+                job.Pictures[i] = _family.References.ForVision(job.Inputs[i], i);
+                job.VaeCopies[i] = _family.References.ForVae(job.Inputs[i], i);
+            }
             job.EncodesReferences = job.Inputs.Length > 0 || mask is { IsFull: false };
 
             var workload = new DiffusionWorkload(job.Target,
                 job.VaeCopies.Select(c => new LatentShape(geometry.LatentChannels, 1, c.Height / geometry.VaeFactor, c.Width / geometry.VaeFactor)).ToArray(),
-                r.Prompt ?? string.Empty);
-            job.Demands = new List<PhaseDemand> { new(DiffusionPhase.Condition, DiffusionComponent.Conditioner, Conditioner.WorkingBytes(workload)) };
-            if (job.EncodesReferences) job.Demands.Add(new(DiffusionPhase.EncodeReferences, DiffusionComponent.Vae, Vae.WorkingBytes(workload)));
-            job.Demands.Add(new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, Denoiser.WorkingBytes(workload)));
-            job.Demands.Add(new(DiffusionPhase.Decode, DiffusionComponent.Vae, Vae.WorkingBytes(workload)));
+                r.Prompt ?? string.Empty) { Pictures = job.Pictures };
+            job.Demands = new List<PhaseDemand> { new(DiffusionPhase.Condition, DiffusionComponent.Conditioner, Conditioner.WorkingBytes(workload, DiffusionPhase.Condition)) };
+            if (job.EncodesReferences)
+                job.Demands.Add(new(DiffusionPhase.EncodeReferences, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.EncodeReferences)));
+            job.Demands.Add(new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, Denoiser.WorkingBytes(workload, DiffusionPhase.Denoise)));
+            job.Demands.Add(new(DiffusionPhase.Decode, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.Decode)));
+            if (job.Inputs.Length > 0) RefuseOverTheRowBudget(job, workload);
             _log($"{name}: {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height}" +
                  (job.Canvas.Output != job.Canvas.Sampling ? $" (returned at {job.Canvas.Output.Width}x{job.Canvas.Output.Height})" : "") +
                  $", {recipe.Describe(steps)}, seed {r.Seed}, {job.Inputs.Length} reference(s)" +
                  (mask != null ? ", masked" : "") + (adapters.IsEmpty ? "" : $", adapters {string.Join(", ", adapters.Adapters.Select(a => a.Name))}"));
             return job;
+        }
+
+        /// <summary>
+        /// An edit whose conditioning or denoising phase alone needs more device memory than the device has (its component's
+        /// weights beside the phase's working memory, against the planner's budget) is refused before anything runs, naming
+        /// its rows: references add rows to both phases, and fewer or smaller ones are the remedy (decision D11). Text to
+        /// image is never refused here; a device with no budget (the CPU backends) refuses nothing.
+        /// </summary>
+        private void RefuseOverTheRowBudget(Prepared job, DiffusionWorkload workload)
+        {
+            long held = _resident.Sum(c => Created(c)?.WeightBytes ?? 0) + _workspaces.Values.Sum();
+            if (_planner.Budget(held) is not long budget) return;
+            DiffusionGeometry g = _family.Geometry;
+            long Rows(LatentShape s) => (long)(s.Height / g.Patch) * (s.Width / g.Patch);
+            long targetRows = Rows(job.Target), referenceRows = workload.References.Sum(Rows);
+            foreach ((DiffusionPhase phase, IResidentComponent component, string what) in new (DiffusionPhase, IResidentComponent, string)[]
+                     {
+                         (DiffusionPhase.Condition, Conditioner, "the text and vision encoding"),
+                         (DiffusionPhase.Denoise, Denoiser, "a denoising step"),
+                     })
+            {
+                long need = component.WeightBytes + job.Demand(phase);
+                if (need <= budget) continue;
+                throw new ArgumentException(
+                    $"{_family.DisplayName}: this edit is too large for the device. Its {job.Inputs.Length} reference image(s) add " +
+                    $"{referenceRows:N0} rows to the {targetRows:N0} rows of the {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height} " +
+                    $"picture (and their vision tokens to the prompt), and {what} would need about {need / 1e9:F1} GB of the " +
+                    $"{budget / 1e9:F1} GB the device has. Use fewer or smaller reference images, or a smaller size.");
+            }
         }
 
         // ---- residency
