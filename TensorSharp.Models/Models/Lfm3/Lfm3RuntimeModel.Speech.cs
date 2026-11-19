@@ -46,7 +46,8 @@ namespace TensorSharp.Models
         private string _speechUnavailable;
         private readonly Stack<Lfm3CodecStream> _codecPool = new();
         private Lfm3SpeechTokens _speechTokens;
-        private bool _speechTokensResolved;
+        private volatile bool _speechTokensResolved;
+        private readonly object _speechTokensGate = new();
         private int[] _textReplySuppressed, _speechReplySuppressed;
 
         /// <summary>The speech output (null until an mmproj with one is loaded).</summary>
@@ -60,17 +61,28 @@ namespace TensorSharp.Models
         {
             get
             {
+                // Resolved once, under a lock and published after the tokens: requests are submitted from several threads
+                // (InferenceEngine.SubmitRequest asks for the reply-token policy), and a caller that saw the flag before
+                // the tokens were set had read none - its text reply could draw a media placeholder, and its sampler
+                // suppressed nothing where its batch's others did.
                 if (_speechTokensResolved) return _speechTokens;
-                _speechTokensResolved = true;
-                if (string.IsNullOrEmpty(_gguf.GetString("tokenizer.chat_template.tts")) || Tokenizer == null) return null;
-                try
+                lock (_speechTokensGate)
                 {
-                    _speechTokens = Lfm3SpeechTokens.FromVocabulary(text => Tokenizer.LookupToken(text));
-                }
-                catch (InvalidOperationException ex)
-                {
-                    Console.Error.WriteLine($"  {Config.Architecture}: the vocabulary has a \"tts\" template but {ex.Message}: speech output is off.");
-                    _speechTokens = null;
+                    if (_speechTokensResolved) return _speechTokens;
+                    Lfm3SpeechTokens tokens = null;
+                    if (!string.IsNullOrEmpty(_gguf.GetString("tokenizer.chat_template.tts")) && Tokenizer != null)
+                    {
+                        try
+                        {
+                            tokens = Lfm3SpeechTokens.FromVocabulary(text => Tokenizer.LookupToken(text));
+                        }
+                        catch (InvalidOperationException ex)
+                        {
+                            Console.Error.WriteLine($"  {Config.Architecture}: the vocabulary has a \"tts\" template but {ex.Message}: speech output is off.");
+                        }
+                    }
+                    _speechTokens = tokens;
+                    _speechTokensResolved = true;
                 }
                 return _speechTokens;
             }
@@ -116,9 +128,12 @@ namespace TensorSharp.Models
             DisposeSpeechOutput();
             _speech = speech;
             _speechSource = "tests";
-            _speechTokens = tokens;
-            _speechTokensResolved = true;
-            _textReplySuppressed = _speechReplySuppressed = null;
+            lock (_speechTokensGate)
+            {
+                _speechTokens = tokens;
+                _speechTokensResolved = true;
+                _textReplySuppressed = _speechReplySuppressed = null;
+            }
         }
 
         private void DisposeSpeechOutput()
@@ -245,13 +260,18 @@ namespace TensorSharp.Models
         {
             Lfm3SpeechTokens tokens = SpeechTokens;
             if (tokens == null) return Array.Empty<int>();
-            if (_textReplySuppressed == null)
+            lock (_speechTokensGate)
             {
-                _speechReplySuppressed = (int[])tokens.Placeholders.Clone();
-                var text = new List<int>(tokens.Placeholders) { tokens.AudioStart, tokens.MixedStart };
-                _textReplySuppressed = text.ToArray();
+                // One array of each kind for the model: a scheduler step of requests that suppress the same tokens takes
+                // the device's greedy pick over one mask.
+                if (_textReplySuppressed == null)
+                {
+                    _speechReplySuppressed = (int[])tokens.Placeholders.Clone();
+                    var text = new List<int>(tokens.Placeholders) { tokens.AudioStart, tokens.MixedStart };
+                    _textReplySuppressed = text.ToArray();
+                }
+                return speechReply ? _speechReplySuppressed : _textReplySuppressed;
             }
-            return speechReply ? _speechReplySuppressed : _textReplySuppressed;
         }
 
         // ---------------------------------------------------------------- ISpeechSynthesisModel
