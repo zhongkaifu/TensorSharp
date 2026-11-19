@@ -432,8 +432,10 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         Assert.Equal(cellOfValue, weights);
     }
 
+    /// <summary>Editing is stage S5's: the family refuses references; its components need their files (a load without
+    /// them names the missing role).</summary>
     [Fact]
-    public void TheFamilyRefusesEditsAndTheComponentsLaterStagesBring()
+    public void TheFamilyRefusesEditsAndComponentsWithoutTheirFiles()
     {
         var family = new MiniMaxH3ImageFamily(MiniMaxH3ImageSampling.ReleaseSigmas);
         var image = new TensorSharp.Models.QwenImage.RgbImage(32, 32, new float[32 * 32 * 3]);
@@ -445,8 +447,8 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         Assert.Equal(DiffusionCanvas.Of(2048, 2048), family.ResolveCanvas(new DiffusionRequest { Prompt = "x" }, null));
         Assert.Equal(DiffusionCanvas.Of(1024, 512), family.ResolveCanvas(new DiffusionRequest { Prompt = "x", Width = 1024, Height = 512 }, null));
         var load = new DiffusionLoad { Backend = TestGates.PinnedGgmlBackend };
-        Assert.Throws<NotSupportedException>(() => family.CreateConditioner(load));
-        Assert.Throws<NotSupportedException>(() => family.CreateVae(load));
+        Assert.Contains("text-encoder", Assert.Throws<InvalidOperationException>(() => family.CreateConditioner(load)).Message);
+        Assert.Contains("vae", Assert.Throws<InvalidOperationException>(() => family.CreateVae(load)).Message);
         Assert.Throws<NotSupportedException>(() => family.References.ForVae(image, 0));
     }
 }

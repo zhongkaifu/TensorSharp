@@ -31,13 +31,24 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
     /// <summary>ggml type ids of the formats a fixture's projections take.</summary>
     internal const int F32 = 0, F16 = 1, Q8_0 = 8, Q4_K = 12, BF16 = 30;
 
-    internal MiniMaxH3ImageFixture(int projections, int seed = 2051)
+    /// <param name="safetensors">Write the release's form instead (a .safetensors file in the original names, torch-order
+    /// shapes; F32, F16 or BF16 projections only), as Comfy-Org ships the bf16 denoiser.</param>
+    internal MiniMaxH3ImageFixture(int projections, int seed = 2051, bool safetensors = false)
     {
         Projections = projections;
         Dir = Path.Combine(Path.GetTempPath(), "ts-h3img-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(Dir);
-        DitPath = System.IO.Path.Combine(Dir, $"minimax_h3_image_tiny-{Name(projections)}.gguf");
-        Write(DitPath, Tensors(projections, seed));
+        if (safetensors)
+        {
+            if (projections is not (F32 or F16 or BF16)) throw new ArgumentException("safetensors holds F32, F16 or BF16 tensors");
+            DitPath = System.IO.Path.Combine(Dir, $"minimax_h3_image_tiny-{Name(projections)}.safetensors");
+            WriteSafetensors(DitPath, Tensors(projections, seed));
+        }
+        else
+        {
+            DitPath = System.IO.Path.Combine(Dir, $"minimax_h3_image_tiny-{Name(projections)}.gguf");
+            Write(DitPath, Tensors(projections, seed));
+        }
     }
 
     internal string Dir { get; }
@@ -138,6 +149,30 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
         uint bits = BitConverter.SingleToUInt32Bits(v);
         bits += 0x7FFFu + ((bits >> 16) & 1u);   // round to nearest even
         return (ushort)(bits >> 16);
+    }
+
+    /// <summary>A safetensors file without metadata: the shapes in torch order (the GGUF's ne order reversed).</summary>
+    private static void WriteSafetensors(string path, IReadOnlyList<T> tensors)
+    {
+        var header = new Dictionary<string, object>();
+        byte[][] data = tensors.Select(Encode).ToArray();
+        long offset = 0;
+        for (int i = 0; i < tensors.Count; i++)
+        {
+            string dtype = tensors[i].Type switch { F32 => "F32", F16 => "F16", BF16 => "BF16", _ => throw new ArgumentException(tensors[i].Name) };
+            header[tensors[i].Name] = new Dictionary<string, object>
+            {
+                ["dtype"] = dtype,
+                ["shape"] = tensors[i].Shape.Reverse().ToArray(),
+                ["data_offsets"] = new[] { offset, offset + data[i].LongLength },
+            };
+            offset += data[i].LongLength;
+        }
+        byte[] json = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(header));
+        using var stream = File.Create(path);
+        stream.Write(BitConverter.GetBytes((ulong)json.Length));
+        stream.Write(json);
+        foreach (byte[] bytes in data) stream.Write(bytes);
     }
 
     /// <summary>A GGUF v3 without metadata, 32-byte aligned.</summary>

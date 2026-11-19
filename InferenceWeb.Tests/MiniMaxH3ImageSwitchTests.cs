@@ -1,0 +1,141 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
+using System.IO;
+using System.Linq;
+using TensorSharp.Models;
+using TensorSharp.Models.Architecture;
+using TensorSharp.Models.MiniMaxH3;
+using TensorSharp.Models.MiniMaxH3Image;
+using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.SharedDiffusion;
+using TensorSharp.Runtime;
+using Xunit;
+
+namespace InferenceWeb.Tests;
+
+/// <summary>
+/// MiniMax-H3-Image is served by the shared diffusion runtime (stage S4 of docs/design/diffusion-runtime.md): the registry
+/// claims the safetensors release through the family's detector and a GGUF denoiser through its tensors (the 'hyvid' label
+/// included), both loads build the runtime's model, the contract is the runtime's, and the legacy model is a test seam only.
+/// </summary>
+public sealed class MiniMaxH3ImageSwitchTests : IDisposable
+{
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-h3img-switch-" + Guid.NewGuid().ToString("N"));
+
+    public MiniMaxH3ImageSwitchTests() => Directory.CreateDirectory(_dir);
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+    }
+
+    /// <summary>The companions the model resolves beside its denoiser: a text encoder file (only its name is read at load)
+    /// and the tiny VAE.</summary>
+    private static void Companions(string dir, MiniMaxH3ImageVaeFixture vae)
+    {
+        File.WriteAllBytes(Path.Combine(dir, "qwen3vl_32b_minimax_h3-Q4_K_M.gguf"), new byte[16]);
+        File.Copy(vae.VaePath, Path.Combine(dir, "minimax_h3_image_vae_fp16.safetensors"));
+    }
+
+    [Fact]
+    public void TheDescriptorIsTheDiffusionRuntimesWithTheFamilysDetectors()
+    {
+        ModelArchitectureDescriptor d = ModelArchitectureRegistry.All.Single(a => a.Id == MiniMaxH3ImageFamily.ArchitectureId);
+        Assert.Equal(ServingImplementation.SharedDiffusionRuntime, d.Serving.Implementation);
+        Assert.Equal(new[] { BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda }, d.Serving.Backends);
+        Assert.False(d.Serving.Autoregressive);
+        Assert.Equal(SupportKind.NotApplicable, d.Serving.ContinuousBatching.Kind);
+        Assert.Equal(ServingContract.DiffusionJobsReason, d.Serving.ContinuousBatching.Reason);
+        Assert.NotNull(d.DetectSafetensors);
+        Assert.NotNull(d.DetectFromTensors);
+        Assert.NotNull(d.RecognizeRelabelledFile);
+        Assert.Contains("minimax_h3_image", d.Aliases);
+    }
+
+    [Fact]
+    public void TheLegacyModelIsReachableOnlyThroughTheTestSeam()
+    {
+        Assert.False(typeof(MiniMaxH3ImageModel).IsPublic);
+        Assert.True(typeof(MiniMaxH3ImageDiffusionModel).IsPublic);
+        Assert.True(typeof(IImageGenerationModel).IsAssignableFrom(typeof(MiniMaxH3ImageDiffusionModel)));
+        // No public member of the models assembly hands out the legacy type.
+        var exposed = typeof(ModelBase).Assembly.GetExportedTypes()
+            .SelectMany(t => t.GetMembers())
+            .Where(m => m switch
+            {
+                System.Reflection.MethodInfo mi => mi.ReturnType == typeof(MiniMaxH3ImageModel),
+                System.Reflection.PropertyInfo pi => pi.PropertyType == typeof(MiniMaxH3ImageModel),
+                _ => false,
+            })
+            .Select(m => m.DeclaringType + "." + m.Name)
+            .ToArray();
+        Assert.Empty(exposed);
+    }
+
+    /// <summary>The safetensors release goes through the registry's safetensors hook (no special case in ModelBase.Create)
+    /// and builds the runtime's model, with the checkpoint's grid and the companions beside it; nothing reaches a device
+    /// before the first image.</summary>
+    [Fact]
+    public void TheSafetensorsReleaseLoadsAsTheRuntimesModel()
+    {
+        using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.BF16, safetensors: true);
+        using var vae = new MiniMaxH3ImageVaeFixture(2);
+        Companions(dit.Dir, vae);
+        Assert.Equal(MiniMaxH3ImageFamily.ArchitectureId, ModelArchitectureRegistry.ResolveSafetensors(dit.DitPath)?.Id);
+        using ModelBase model = ModelBase.Create(dit.DitPath, TestGates.PinnedGgmlBackend);
+        var runtime = Assert.IsType<MiniMaxH3ImageDiffusionModel>(model);
+        Assert.False(runtime.SupportsImageEdit);
+        Assert.Equal(MiniMaxH3ImageFamily.ArchitectureId, model.Config.Architecture);
+        Assert.Equal(MiniMaxH3ImageSampling.GridFrom(new System.Collections.Generic.Dictionary<string, string>(), MiniMaxH3ImageFixture.PddSteps),
+            runtime.PddSigmas.ToArray());
+        Assert.Equal(MiniMaxH3ImageFixture.Blocks, runtime.DitConfig.NumLayers);
+        Assert.False(runtime.Pipeline.IsResident(DiffusionComponent.Denoiser));
+        Assert.Throws<NotSupportedException>(() => runtime.EditImage("x", Array.Empty<RgbImage>(), new QwenImageParams()));
+        // The legacy refusals, in the legacy order, before any component is made.
+        Assert.Contains("cfg must be 1", Assert.Throws<ArgumentException>(() => runtime.GenerateImage("x", new QwenImageParams { CfgScale = 2 })).Message);
+        Assert.Contains("negative prompt", Assert.Throws<ArgumentException>(() => runtime.GenerateImage("x", new QwenImageParams { NegativePrompt = "no" })).Message);
+        Assert.Contains("no mask", Assert.Throws<ArgumentException>(() =>
+            runtime.GenerateImage("x", new QwenImageParams { Mask = new RgbImage(1, 1, new float[3]) })).Message);
+    }
+
+    /// <summary>A GGUF denoiser (unlabelled, as the published quantized files' tensors are read) builds the same model.</summary>
+    [Fact]
+    public void AGgufDenoiserLoadsAsTheRuntimesModel()
+    {
+        using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.Q8_0);
+        using var vae = new MiniMaxH3ImageVaeFixture(2);
+        Companions(dit.Dir, vae);
+        Assert.Null(ModelArchitectureRegistry.ResolveSafetensors(dit.DitPath));
+        using ModelBase model = ModelBase.Create(dit.DitPath, TestGates.PinnedGgmlBackend);
+        Assert.IsType<MiniMaxH3ImageDiffusionModel>(model);
+    }
+
+    /// <summary>Multi-GPU requests are refused by the contract's gaps, as for any family, before anything loads.</summary>
+    [Fact]
+    public void TensorParallelAndLayerSplitAreTheContractsGaps()
+    {
+        using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.BF16, safetensors: true);
+        var tp = Assert.Throws<NotSupportedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlCuda, tpDegree: 2));
+        Assert.Contains("tensor-parallel", tp.Message);
+        var split = Assert.Throws<NotSupportedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlCuda, layerSplitDegree: 2));
+        Assert.Contains("layer-split", split.Message);
+    }
+
+    /// <summary>The family's detector: the H3 DiT's video and text projections under one prefix, and no audio stream.</summary>
+    [Fact]
+    public void TheFamilysDetectorTellsTheImageDenoiserFromTheVideoOne()
+    {
+        Assert.True(MiniMaxH3ImageFamily.IsDenoiser(new[] { "video_patch_proj.weight", "condition_proj.weight", "blocks.0.norm1.weight" }));
+        Assert.True(MiniMaxH3ImageFamily.IsDenoiser(new[] { "model.diffusion_model.video_patch_proj.weight", "model.diffusion_model.condition_proj.weight" }));
+        Assert.False(MiniMaxH3ImageFamily.IsDenoiser(new[] { "video_patch_proj.weight", "condition_proj.weight", "audio_patch_proj.weight" }));
+        Assert.False(MiniMaxH3ImageFamily.IsDenoiser(new[] { "video_patch_proj.weight" }));
+        Assert.False(MiniMaxH3ImageFamily.IsDenoiser(new[] { "decoder.x_embedder.weight" }));
+        using var vae = new MiniMaxH3ImageVaeFixture(1);
+        Assert.Null(ModelArchitectureRegistry.ResolveSafetensors(vae.VaePath));
+    }
+}

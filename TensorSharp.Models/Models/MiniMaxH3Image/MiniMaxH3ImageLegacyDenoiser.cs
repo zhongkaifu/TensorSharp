@@ -7,7 +7,7 @@
 //
 // A test seam: the legacy MiniMax-H3-Image denoiser (MiniMaxH3DiT.ForwardImage, one native graph a step through
 // TSGgml_MiniMaxH3DitForward) behind the runtime's IDenoiser, so the runtime's denoiser can be compared with it step for
-// step on the same inputs. Not a production path: production runs MiniMaxH3ImageModel until stage S4 switches it.
+// step on the same inputs. Not a production path: production runs MiniMaxH3ImageDiffusionModel on the runtime.
 using System;
 using System.Threading;
 using TensorSharp.Models.MiniMaxH3;

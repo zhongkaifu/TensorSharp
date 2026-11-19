@@ -8,8 +8,8 @@
 // MiniMax-H3-Image as a family of the shared diffusion runtime (docs/design/diffusion-runtime.md section 3.2): its
 // geometry, its recipe (ComfyUI's "simple" schedule over the checkpoint's PDD grid, the grid interval's head), the CPU
 // torch noise, the packed layout of MiniMaxH3ImageLayout and the 2x2-patch token rows MiniMaxH3ImageModel denoises on.
-// The denoiser runs on the runtime (MiniMaxH3ImageDenoiser); the conditioner and the VAE come with stage S4, editing
-// with S5.
+// Its components are the MiniMax-H3 text encoder (MiniMaxH3ImageConditioner), the DiT (MiniMaxH3ImageDenoiser) and the
+// image VAE's decoder (MiniMaxH3ImageVaeCodec), all on the runtime; editing is stage S5's.
 using System;
 using System.Collections.Generic;
 using TensorSharp.Models.MiniMaxH3;
@@ -59,9 +59,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
             LatentChannels = Channels,
             VaeFactor = Downsample,
             Patch = Patch,
-            SizeMultiple = MiniMaxH3ImageModel.SizeMultiple,
-            DefaultWidth = MiniMaxH3ImageModel.DefaultSize,
-            DefaultHeight = MiniMaxH3ImageModel.DefaultSize,
+            SizeMultiple = MiniMaxH3ImageDiffusionModel.SizeMultiple,
+            DefaultWidth = MiniMaxH3ImageDiffusionModel.DefaultSize,
+            DefaultHeight = MiniMaxH3ImageDiffusionModel.DefaultSize,
         };
 
         public DiffusionGuidance Guidance => DiffusionGuidance.None;
@@ -72,8 +72,11 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         public IReferencePolicy References { get; } = new NoReferences();
 
-        public IConditioner CreateConditioner(DiffusionLoad load) =>
-            throw new NotSupportedException("MiniMax-H3-Image's conditioner on the diffusion runtime arrives with stage S4.");
+        public IConditioner CreateConditioner(DiffusionLoad load)
+        {
+            ArgumentNullException.ThrowIfNull(load);
+            return Conditioner = new MiniMaxH3ImageConditioner(load.File(DiffusionLoad.TextEncoder), load.Backend);
+        }
 
         public IDenoiser CreateDenoiser(DiffusionLoad load)
         {
@@ -81,8 +84,35 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend);
         }
 
-        public IVaeCodec CreateVae(DiffusionLoad load) =>
-            throw new NotSupportedException("MiniMax-H3-Image's VAE on the diffusion runtime arrives with stage S4.");
+        public IVaeCodec CreateVae(DiffusionLoad load)
+        {
+            ArgumentNullException.ThrowIfNull(load);
+            return Vae = new MiniMaxH3ImageVaeCodec(load.File(DiffusionLoad.Vae), load.Backend);
+        }
+
+        /// <summary>The conditioner this family made last (its token count is the model's timing line's).</summary>
+        internal MiniMaxH3ImageConditioner Conditioner { get; private set; }
+
+        /// <summary>The VAE this family made last (its tile count and decoder time are the model's timing line's).</summary>
+        internal MiniMaxH3ImageVaeCodec Vae { get; private set; }
+
+        /// <summary>Whether <paramref name="names"/> are a MiniMax-H3-Image denoiser's tensors: the H3 DiT's video patch and
+        /// text projections under one prefix, and no audio stream (an H3 audio-video denoiser is minimax-h3).</summary>
+        public static bool IsDenoiser(IEnumerable<string> names)
+        {
+            ArgumentNullException.ThrowIfNull(names);
+            const string VideoPatch = "video_patch_proj.weight", AudioPatch = "audio_patch_proj.weight", Condition = "condition_proj.weight";
+            var set = new HashSet<string>(names, StringComparer.Ordinal);
+            bool image = false;
+            foreach (string name in set)
+            {
+                if (!name.EndsWith(VideoPatch, StringComparison.Ordinal)) continue;
+                string prefix = name[..^VideoPatch.Length];
+                if (set.Contains(prefix + AudioPatch)) return false;
+                if (set.Contains(prefix + Condition)) image = true;
+            }
+            return image;
+        }
 
         /// <summary>torch.randn on the CPU generator, as ComfyUI draws MiniMax-H3-Image's initial latent.</summary>
         public INoiseSource Noise(long seed) => new TorchCpuRandn(unchecked((ulong)seed));

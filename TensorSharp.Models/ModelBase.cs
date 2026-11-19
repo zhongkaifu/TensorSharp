@@ -3691,13 +3691,18 @@ namespace TensorSharp.Models
             if (layerSplitDegree <= 1)
                 layerSplitDegree = ReadParallelDegree("TENSORSHARP_LAYER_SPLIT_DEGREE", layerSplitDegree);
 
-            // MiniMax-H3-Image's denoiser ships as safetensors in its original tensor names,
-            // which the DiT reads as they are; there is no GGUF header to probe.
-            if (MiniMaxH3.MiniMaxH3ImageModel.IsImageDenoiserSafetensors(ggufPath))
+            // A safetensors model file (a diffusion family's denoiser in its original tensor names, such as
+            // MiniMax-H3-Image's release) has no GGUF header: the family whose detector claims it builds it, through the
+            // same multi-GPU gate as any GGUF family.
+            if (ModelArchitectureRegistry.ResolveSafetensors(ggufPath) is { } safetensorsArchitecture)
             {
-                if (tpDegree > 1 || tpGroup != null || layerSplitDegree > 1)
-                    throw new NotSupportedException("minimax-h3-image runs on one GPU; remove --tp / --layer-split.");
-                return new MiniMaxH3.MiniMaxH3ImageModel(ggufPath, backend);
+                tpDegree = ResolveTensorParallelSupport(safetensorsArchitecture, backend, tpDegree, ref tpGroup,
+                    out int safetensorsLayerSplit, layerSplitDegree);
+                using var header = new SafetensorsFile(ggufPath);
+                var safetensorsContext = new ModelCreateContext(ggufPath, backend, null, tpDegree, tpGroup, draftModelPath,
+                    safetensorsLayerSplit) { SafetensorsProbe = header };
+                safetensorsArchitecture.ApplyNativeTunables?.Invoke(safetensorsContext);
+                return safetensorsArchitecture.Factory(safetensorsContext);
             }
 
             using var probe = new GgufFile(ggufPath);
@@ -3728,6 +3733,11 @@ namespace TensorSharp.Models
         /// execution before callers allocate GPU ranks or connect to peer nodes.</summary>
         public static void ValidateDistributedTensorParallelism(string ggufPath, BackendType backend)
         {
+            if (ModelArchitectureRegistry.ResolveSafetensors(ggufPath) is { } claimed)
+            {
+                ValidateDistributedTensorParallelism(claimed, backend);
+                return;
+            }
             using var probe = new GgufFile(ggufPath);
             var architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
             ValidateDistributedTensorParallelism(architecture, backend);
@@ -3755,6 +3765,11 @@ namespace TensorSharp.Models
         /// <summary>Reject unavailable stage executors before allocating GPUs or connecting peers.</summary>
         public static void ValidateDistributedLayerSplit(string ggufPath, BackendType backend)
         {
+            if (ModelArchitectureRegistry.ResolveSafetensors(ggufPath) is { } claimed)
+            {
+                ValidateDistributedLayerSplit(claimed, backend);
+                return;
+            }
             using var probe = new GgufFile(ggufPath);
             ValidateDistributedLayerSplit(ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe), backend);
         }

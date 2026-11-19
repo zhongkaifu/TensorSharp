@@ -17,6 +17,12 @@
 // (Comfy-Org/MiniMax-H3-Image, diffusion_models/minimax_h3_image_pruned_bf16.safetensors)
 // or from a GGUF with the same tensors. The text encoder is the H3 video model's
 // (--video-text-encoder) and the VAE is passed as --video-vae, the H3 companion flags.
+//
+// LEGACY ORACLE. Production MiniMax-H3-Image runs on the shared diffusion runtime
+// (TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageDiffusionModel); the registry no longer
+// builds this class. It is reachable only from tests and the eng/validation A/B tools
+// (InternalsVisibleTo), as the text-to-image reference the runtime is compared with, until
+// stage S10 deletes it (docs/design/diffusion-runtime.md section 1.6).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -28,7 +34,7 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.MiniMaxH3
 {
-    public sealed class MiniMaxH3ImageModel : ModelBase, IImageGenerationModel
+    internal sealed class MiniMaxH3ImageModel : ModelBase, IImageGenerationModel
     {
         public const string ArchitectureId = "minimax-h3-image";
 
@@ -56,26 +62,19 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>Phase seconds of the last image: text encode, denoise, VAE decode.</summary>
         public (double Text, double Denoise, double Decode, int Steps) LastTimings { get; private set; }
 
-        /// <summary>True when <paramref name="path"/> is a safetensors file holding a
-        /// MiniMax-H3-Image denoiser (read from its header only).</summary>
-        public static bool IsImageDenoiserSafetensors(string path)
-        {
-            if (!MiniMaxH3WeightFile.IsSafetensors(path) || !File.Exists(path)) return false;
-            try
-            {
-                using var file = new MiniMaxH3WeightFile(path);
-                return MiniMaxH3Config.IsMiniMaxH3Image(file.Tensors);
-            }
-            catch (Exception e) when (e is IOException or InvalidDataException or NotSupportedException
-                or System.Text.Json.JsonException)
-            {
-                return false;
-            }
-        }
+        /// <summary>A test seam (the bf16 verification's local TS_TMP_H3_IMAGE_RELEASE_TE patch): dispose the text
+        /// encoder right after each encode, so a 40 GB denoiser fits beside nothing else; the next image reloads it.</summary>
+        internal bool ReleaseTextEncoderAfterEncode { get; set; }
 
-        /// <summary>The architecture detector for a GGUF that holds the image denoiser.</summary>
-        public static bool LooksLikeMiniMaxH3Image(GgufFile gguf) =>
-            gguf != null && MiniMaxH3Config.IsMiniMaxH3Image(gguf.Tensors);
+        /// <summary>A test seam: the VAE decoder's tiles a call (TS_H3_IMAGE_VAE_BATCH; 0 keeps it).</summary>
+        internal int VaeBatchOverride { get; set; }
+
+        /// <summary>Seconds the last image spent releasing the text encoder (<see cref="ReleaseTextEncoderAfterEncode"/>).</summary>
+        internal double LastTextEncoderReleaseSeconds { get; private set; }
+
+        /// <summary>The last image's VAE tiles and the seconds its native decodes took.</summary>
+        internal int LastVaeTileCount => _vae?.LastTileCount ?? 0;
+        internal double LastVaeNativeSeconds => _vae?.LastNativeSeconds ?? 0;
 
         public MiniMaxH3ImageModel(string ditPath, BackendType backend)
             : base(ditPath, backend, openGguf: false)
@@ -183,6 +182,15 @@ namespace TensorSharp.Models.MiniMaxH3
             float[] textHidden = _textEncoder.Encode(ids);
             int textLength = ids.Count;
             double textSeconds = clock.Elapsed.TotalSeconds;
+            LastTextEncoderReleaseSeconds = 0;
+            if (ReleaseTextEncoderAfterEncode)
+            {
+                var releaseClock = Stopwatch.StartNew();
+                _textEncoder.Dispose();
+                _textEncoder = null;
+                LastTextEncoderReleaseSeconds = releaseClock.Elapsed.TotalSeconds;
+                Console.WriteLine($"  [h3-image] released the text encoder ({LastTextEncoderReleaseSeconds:F2}s)");
+            }
 
             // ---- noise: torch.randn([1, 24, 1, lh, lw]) on the CPU generator ----
             float[] chw = TorchCpuRandn.Normal((long)MiniMaxH3ImageVae.LatentChannels * lh * lw, unchecked((ulong)p.Seed));
@@ -217,6 +225,7 @@ namespace TensorSharp.Models.MiniMaxH3
             clock.Restart();
             float[] latent = MiniMaxH3DiT.UnpatchifyVideo(x, 1, lh, lw, MiniMaxH3ImageVae.LatentChannels);
             _vae ??= new MiniMaxH3ImageVae(_vaePath);
+            _vae.BatchOverride = VaeBatchOverride;
             RgbImage image = _vae.Decode(latent, lh, lw);
             double decodeSeconds = clock.Elapsed.TotalSeconds;
 
