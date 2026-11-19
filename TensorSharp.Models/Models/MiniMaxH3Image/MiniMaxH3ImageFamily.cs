@@ -81,8 +81,18 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public IDenoiser CreateDenoiser(DiffusionLoad load)
         {
             ArgumentNullException.ThrowIfNull(load);
-            return new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend);
+            return Denoiser = new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend)
+            {
+                AdapterBytes = () => Lora?.FactorBytes ?? 0,
+            };
         }
+
+        /// <summary>The denoiser this family made last (the model releases its LoRA binding before replacing a set).</summary>
+        internal MiniMaxH3ImageDenoiser Denoiser { get; private set; }
+
+        /// <summary>The LoRA set the model's requests run with (null: none), whose factors residency counts with the denoiser's
+        /// weights.</summary>
+        internal MiniMaxH3ImageLoraSet Lora { get; set; }
 
         public IVaeCodec CreateVae(DiffusionLoad load)
         {

@@ -45,6 +45,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
         private (ulong, ulong) _planSignature;
         private bool _preloaded;
         private bool _disposed;
+        // The LoRA set the cached plan binds (null: none), and a tensor executor's handles for its factors.
+        private MiniMaxH3ImageLoraSet _lora;
+        private readonly Dictionary<IntPtr, MiniMaxH3ImageWeight> _loraHandles = new();
 
         /// <summary>The denoiser in <paramref name="path"/> (a GGUF, or the safetensors release in its original names) on
         /// <paramref name="backend"/>: a GGML backend (its graph executor) or <see cref="BackendType.Cpu"/> (the managed
@@ -113,7 +116,13 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         public DenoiserCaps Caps { get; } = new();
 
-        public long WeightBytes => _w.Bytes;
+        public long WeightBytes => _w.Bytes + (AdapterBytes?.Invoke() ?? 0);
+
+        /// <summary>The device bytes of the LoRA factors the next steps bind (the family's current set), for residency.</summary>
+        internal Func<long> AdapterBytes { get; set; }
+
+        /// <summary>The LoRA set the cached plan was compiled with (a test seam).</summary>
+        internal MiniMaxH3ImageLoraSet BoundLora => _lora;
 
         /// <summary>The step's activations at <paramref name="workload"/>: the compute buffer's high water
         /// (<see cref="WorkingBytesFor"/>), from the packed sequence's rows.</summary>
@@ -184,8 +193,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public StepOutput Step(DenoiseStepInputs inputs, AdapterSet adapters, CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(inputs);
-            if (adapters is { IsEmpty: false })
-                throw new NotSupportedException("MiniMax-H3-Image's denoiser takes no LoRA adapters yet.");
+            MiniMaxH3ImageLoraSet lora = LoraOf(adapters);
             cancellationToken.ThrowIfCancellationRequested();
             var layout = inputs.Layout.FamilyLayout as MiniMaxH3PackedLayout
                 ?? throw new ArgumentException("the layout was not packed by MiniMax-H3-Image's family", nameof(inputs));
@@ -207,8 +215,57 @@ namespace TensorSharp.Models.MiniMaxH3Image
             }
             int imageRows = checked((int)(inputs.Latent.LongLength / _w.Config.VideoPatchDim));
             float[] velocity = Forward(inputs.Latent, imageRows, text.Hidden, text.Rows, layout, inputs.Recipe.Grid,
-                inputs.Step.HeadStart, inputs.Step.HeadStop, references, referenceRows);
+                inputs.Step.HeadStart, inputs.Step.HeadStop, references, referenceRows, lora);
             return new StepOutput(velocity);
+        }
+
+        /// <summary>The packed LoRA set a request's adapters carry (each adapter's payload is the one set the model loaded for
+        /// them), or null for none.</summary>
+        private MiniMaxH3ImageLoraSet LoraOf(AdapterSet adapters)
+        {
+            if (adapters is null or { IsEmpty: true }) return null;
+            var set = adapters.Adapters[0].Payload as MiniMaxH3ImageLoraSet
+                ?? throw new ArgumentException($"LoRA {adapters.Adapters[0].Name} was not loaded by MiniMax-H3-Image's LoRA loader.", nameof(adapters));
+            foreach (DiffusionAdapter a in adapters.Adapters)
+                if (!ReferenceEquals(a.Payload, set))
+                    throw new ArgumentException("A request's LoRA adapters are one loaded set: the adapters carry different sets.", nameof(adapters));
+            if (!set.Fits(_w.Config))
+                throw new ArgumentException("The LoRA set was loaded for a MiniMax-H3-Image checkpoint of another shape.", nameof(adapters));
+            if ((set.Backend == BackendType.Cpu) != (_tensorAllocator != null))
+                throw new ArgumentException($"The LoRA set is packed for {set.Backend}; this denoiser runs on {Backend}.", nameof(adapters));
+            return set;
+        }
+
+        /// <summary>Bind <paramref name="lora"/> for the steps that follow: a different set than the cached plan's drops the plan
+        /// and the previous set's device copies first, so no step ever runs with factors of a set it was not given (a set
+        /// disposed in between may hand its addresses to the next one).</summary>
+        private void BindLora(MiniMaxH3ImageLoraSet lora)
+        {
+            if (ReferenceEquals(lora, _lora)) return;
+            _plan?.Dispose();
+            _plan = null;
+            ReleaseLoraDevice();
+            _lora = lora;
+        }
+
+        /// <summary>Drop the bound set's device copies and the tensor executor's handles for them.</summary>
+        private void ReleaseLoraDevice()
+        {
+            if (_lora == null) return;
+            if (_tensorAllocator == null)
+                foreach (IntPtr p in _lora.FactorPointers()) _executor.Invalidate(p);
+            _loraHandles.Clear();
+        }
+
+        /// <summary>Forget the bound LoRA set (and its device copies and the plan that binds them): the model calls it under its
+        /// generation lock before it disposes a set it replaces.</summary>
+        internal void ReleaseLora()
+        {
+            lock (_gate)
+            {
+                if (_disposed) return;
+                BindLora(null);
+            }
         }
 
         /// <summary>
@@ -218,7 +275,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// plan's output buffer, valid until the next step.
         /// </summary>
         internal float[] Forward(float[] imageTokens, int imageCount, float[] textHidden, int textCount, MiniMaxH3PackedLayout layout,
-            float[] grid, int headStart, int headStop, float[] referenceTokens = null, int referenceCount = 0)
+            float[] grid, int headStart, int headStop, float[] referenceTokens = null, int referenceCount = 0,
+            MiniMaxH3ImageLoraSet lora = null)
         {
             ArgumentNullException.ThrowIfNull(imageTokens);
             ArgumentNullException.ThrowIfNull(layout);
@@ -235,6 +293,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     throw new ArgumentException($"{textCount} text rows of {c.TextDim} need {(long)textCount * c.TextDim} values.");
                 if (layout.VideoSpan.End - layout.VideoSpan.Start != imageCount || layout.TokenCount != textCount + referenceCount + imageCount)
                     throw new ArgumentException("the layout does not pack these text, reference and image rows.");
+                if (lora != null && !lora.Fits(c))
+                    throw new ArgumentException("The LoRA set was loaded for a MiniMax-H3-Image checkpoint of another shape.", nameof(lora));
+                BindLora(lora);
 
                 var step = new StepValues
                 {
@@ -247,6 +308,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                     Segments = Segments(layout),
                     TimeEmbed = TimeEmbedding(layout.Timesteps),
                     Head = Head(grid, headStart, headStop),
+                    Lora = lora,
                 };
                 (step.Cos, step.Sin) = Rope(layout.Positions);
                 PreloadLocked();
@@ -381,6 +443,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             public float[] TimeEmbed;      // [timeEmbedDim, timesteps]
             public float[] Cos, Sin;       // [rot, tokens]
             public (float[] Weight, float[] Bias) Head;
+            public MiniMaxH3ImageLoraSet Lora;   // null: no adapters
         }
 
         /// <summary>
@@ -427,6 +490,31 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 int o = guard ? Product(b, w, x) : b.Op(GraphOp.MulMat, w, x);
                 return l.Bias != null ? b.Op(GraphOp.Add, o, Leaf(l.Bias)) : o;
             }
+            // A block projection with the LoRA set's unmerged updates (a LoraLinear region: w x plus up (down x) on each part's
+            // slot, the guard around w x where Linear takes it), then its bias; exactly Linear where the set has none for it.
+            MiniMaxH3ImageLoraSet lora = s.Lora;
+            int Factor(MiniMaxH3ImageLoraSet.Part p, bool up)
+            {
+                IntPtr data = up ? p.Up : p.Down;
+                long bytes = up ? p.UpBytes : p.DownBytes;
+                ReadOnlySpan<long> ne = up ? stackalloc long[] { p.Rank, p.Out } : stackalloc long[] { p.In, p.Rank };
+                if (_tensorAllocator == null) return e.HostWeight(p.Format, ne, data, bytes);
+                if (!_loraHandles.TryGetValue(data, out MiniMaxH3ImageWeight handle))
+                    _loraHandles[data] = handle = new MiniMaxH3ImageWeight(p.Format, ne[0], ne[1], data, bytes);
+                return e.HostWeight(p.Format, ne, GraphIdentity.Of(handle), bytes, handle);
+            }
+            int Adapted(MiniMaxH3ImageLinear l, int x, long rows, bool refiner, int block, MiniMaxH3ImageLoraSet.Projection projection)
+            {
+                MiniMaxH3ImageLoraSet.Factors f = lora?.Get(refiner, block, projection);
+                if (f == null) return Linear(l, x);
+                var parts = new GraphDitRegions.LoraPart[f.Parts.Length];
+                for (int i = 0; i < parts.Length; i++)
+                    parts[i] = new GraphDitRegions.LoraPart(f.Parts[i].Slot, Factor(f.Parts[i], up: false), Factor(f.Parts[i], up: true));
+                int y = GraphDitRegions.LoraLinear(b, x, Leaf(l.Weight), parts, l.Weight.Ne1, f.SlotRows, rows, Product);
+                return l.Bias != null ? b.Op(GraphOp.Add, y, Leaf(l.Bias)) : y;
+            }
+            bool HasLora(bool refiner, int block, MiniMaxH3ImageLoraSet.Projection projection) =>
+                lora?.Get(refiner, block, projection) != null;
             int Norm(int x, MiniMaxH3ImageWeight w) => b.Op(GraphOp.Mul, b.Op(GraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps }), Leaf(w));
             // q, k and v of a stacked [q | k | v] product: [hd, heads, rows] views, rows a product row apart.
             int Third(int qkv, int i, int rows) => b.Op(GraphOp.View, stackalloc[] { qkv },
@@ -435,6 +523,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 stackalloc long[] { 2, width, count, 1, 1, width * 4, 0, 0, (long)start * width * 4 });
 
             e.MarkWideTokenProducts();
+            // A plan binds one LoRA set's factors: another set compiles its own even where it reuses the addresses.
+            if (lora != null) e.Mix(lora.Generation);
 
             // ---- inputs
             int vin = e.InputF32(s.Video, c.VideoPatchDim, s.ReferenceCount + s.ImageCount);
@@ -454,18 +544,20 @@ namespace TensorSharp.Models.MiniMaxH3Image
             if (tin >= 0)
             {
                 int ctx = Linear(_w.ConditionProj, tin);
-                foreach (MiniMaxH3ImageBlock r in _w.Refiner)
+                for (int ri = 0; ri < _w.Refiner.Length; ri++)
                 {
+                    MiniMaxH3ImageBlock r = _w.Refiner[ri];
                     int n1 = Norm(ctx, r.Norm1);
-                    int qkv = Linear(r.Qkv, n1);
+                    int qkv = Adapted(r.Qkv, n1, s.TextCount, true, ri, MiniMaxH3ImageLoraSet.Projection.Qkv);
                     int q = Third(qkv, 0, s.TextCount), k = Third(qkv, 1, s.TextCount), v = Third(qkv, 2, s.TextCount);
                     q = r.QNorm != null ? Norm(q, r.QNorm) : b.Op(GraphOp.Cont, q);
                     k = r.KNorm != null ? Norm(k, r.KNorm) : b.Op(GraphOp.Cont, k);
                     int merged = GraphDitRegions.Attention(b, q, k, v, hd, heads, s.TextCount, scale, GraphDitRegions.FlashVScale(s.TextCount));
-                    ctx = b.Op(GraphOp.Add, ctx, Linear(r.Out, merged));
+                    ctx = b.Op(GraphOp.Add, ctx, Adapted(r.Out, merged, s.TextCount, true, ri, MiniMaxH3ImageLoraSet.Projection.Out));
                     int n2 = Norm(ctx, r.Norm2);
-                    int gv = Linear(r.Fc1, n2);
-                    ctx = b.Op(GraphOp.Add, ctx, Linear(r.Fc2, b.Op(GraphOp.Swiglu, gv)));
+                    int gv = Adapted(r.Fc1, n2, s.TextCount, true, ri, MiniMaxH3ImageLoraSet.Projection.Fc1);
+                    ctx = b.Op(GraphOp.Add, ctx, Adapted(r.Fc2, b.Op(GraphOp.Swiglu, gv), s.TextCount, true, ri,
+                        MiniMaxH3ImageLoraSet.Projection.Fc2));
                 }
                 if (_w.RefinerFinalNorm != null) ctx = Norm(ctx, _w.RefinerFinalNorm);
                 x = ctx;
@@ -484,18 +576,24 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
             // ---- the blocks
             float vScale = GraphDitRegions.FlashVScale(ntok);
-            foreach (MiniMaxH3ImageBlock blk in _w.Blocks)
+            for (int bi = 0; bi < _w.Blocks.Length; bi++)
             {
+                MiniMaxH3ImageBlock blk = _w.Blocks[bi];
                 // The curve-table variant feeds the interpolated embedding straight in (no SiLU), and takes no guard.
                 int mods = Modulations(blk.AdaLn, 18L * nts);
                 int h = GraphDitRegions.AdaLnModulate(b, x, Leaf(blk.Norm1), mods, table, s.Segments, hidden, 0, 1, eps);
-                int qkv = Product(b, Leaf(blk.Qkv.Weight), h);
+                int qkv = Adapted(blk.Qkv, h, ntok, false, bi, MiniMaxH3ImageLoraSet.Projection.Qkv);
                 int merged = GraphDitRegions.TableRopeQkNormAttention(b, Third(qkv, 0, ntok), Third(qkv, 1, ntok), Third(qkv, 2, ntok),
                     Leaf(blk.QNorm), Leaf(blk.KNorm), cosT, sinS, hd, heads, ntok, rot, eps, scale, vScale);
-                int attn = Product(b, Leaf(blk.Out.Weight), merged);
+                int attn = Adapted(blk.Out, merged, ntok, false, bi, MiniMaxH3ImageLoraSet.Projection.Out);
                 x = GraphDitRegions.GatedResidual(b, x, attn, -1, -1, mods, table, s.Segments, hidden, 2);
                 h = GraphDitRegions.AdaLnModulate(b, x, Leaf(blk.Norm2), mods, table, s.Segments, hidden, 3, 4, eps);
-                int m = GraphDitRegions.SwigluFfn(b, h, Leaf(blk.Fc1.Weight), Leaf(blk.Fc2.Weight), -1, -1, Product);
+                // With an update on fc1 or fc2 the MLP is its two projections around the SwiGLU (a SwigluFfn region holds
+                // only its weights' products); without, the region the native graph fuses.
+                int m = HasLora(false, bi, MiniMaxH3ImageLoraSet.Projection.Fc1) || HasLora(false, bi, MiniMaxH3ImageLoraSet.Projection.Fc2)
+                    ? Adapted(blk.Fc2, b.Op(GraphOp.Swiglu, Adapted(blk.Fc1, h, ntok, false, bi, MiniMaxH3ImageLoraSet.Projection.Fc1)),
+                        ntok, false, bi, MiniMaxH3ImageLoraSet.Projection.Fc2)
+                    : GraphDitRegions.SwigluFfn(b, h, Leaf(blk.Fc1.Weight), Leaf(blk.Fc2.Weight), -1, -1, Product);
                 x = GraphDitRegions.GatedResidual(b, x, m, -1, -1, mods, table, s.Segments, hidden, 5);
             }
 
@@ -548,6 +646,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 _plan?.Dispose();
                 _plan = null;
                 foreach (MiniMaxH3ImageWeight w in _w.All) _executor.Invalidate(w.Data);
+                // The LoRA factors' copies too; the set stays bound and the next step uploads them again.
+                if (_lora != null && _tensorAllocator == null)
+                    foreach (IntPtr p in _lora.FactorPointers()) _executor.Invalidate(p);
                 _preloaded = false;
             }
         }
@@ -560,6 +661,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 _disposed = true;
                 _plan?.Dispose();
                 _plan = null;
+                ReleaseLoraDevice();
+                _lora = null;
                 // The pinned vectors are this denoiser's own; a borrowed mapping's projections are its owner's to release.
                 foreach (MiniMaxH3ImageWeight w in _w.All)
                     if (w.Vector || _w.OwnsFile) _executor.Invalidate(w.Data);

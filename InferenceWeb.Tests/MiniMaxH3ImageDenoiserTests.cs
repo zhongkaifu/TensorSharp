@@ -311,7 +311,7 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void TheDenoiserRefusesAdaptersAndAForeignLayout()
+    public void TheDenoiserRefusesForeignAdaptersAndAForeignLayout()
     {
         using var fx = new MiniMaxH3ImageFixture(F32);
         using var runtime = new MiniMaxH3ImageDenoiser(fx.DitPath, TestGates.PinnedGgmlBackend);
@@ -327,8 +327,9 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
             Step = state,
             Recipe = family.DefaultRecipe,
         };
+        // Adapters the family's loader did not load (MiniMaxH3ImageLoraDenoiserTests covers the ones it did).
         var adapters = new AdapterSet(new[] { new DiffusionAdapter { Name = "style" } });
-        Assert.Throws<NotSupportedException>(() => runtime.Step(inputs, adapters, CancellationToken.None));
+        Assert.Throws<ArgumentException>(() => runtime.Step(inputs, adapters, CancellationToken.None));
         var foreign = new DenoiseStepInputs
         {
             Latent = inputs.Latent, Conditioning = text, Step = state, Recipe = family.DefaultRecipe,
