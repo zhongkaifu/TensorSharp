@@ -566,6 +566,11 @@ struct TSGgmlMiniMaxH3TextEncodeDesc
     std::int32_t causal;     // 1 = causal mask
     float eps;
     std::int32_t num_deepstack;
+    // 1 = the causal attention through ggml_flash_attn_ext (F16 K/V with h3_attend's power-of-two V pre-scale, an F16
+    // causal mask) instead of the materialized [seq, seq, heads] F32 scores. MiniMax-H3-Image's edits ask for it: their
+    // pictures' vision rows make sequences whose scores would not fit (16 pictures, ~17K rows: 70 GB). 0 builds the
+    // graph this function has always built.
+    std::int32_t flash_attention;
 };
 
 TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d)
@@ -647,9 +652,11 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         // An explicit additive mask, not ggml_diag_mask_inf: Metal implements no
         // diag-mask kernel, so the whole-trunk graph would fail its supports_op
         // sweep and fall back to the per-op path.
+        const bool flash = d->flash_attention != 0;
         ggml_tensor* causalMask = nullptr;
         std::vector<float> causalMaskData;
-        if (d->causal != 0)
+        std::vector<ggml_fp16_t> causalMaskF16;
+        if (d->causal != 0 && !flash)
         {
             causalMask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
             ggml_set_input(causalMask);
@@ -659,6 +666,20 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
                 for (int k = q + 1; k < seq; k++)
                     causalMaskData[static_cast<std::size_t>(q) * seq + k] = neg_inf;
         }
+        else if (d->causal != 0)
+        {
+            // ggml_flash_attn_ext's mask: F16 [n_kv, n_q], contiguous.
+            causalMask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, seq, seq);
+            ggml_set_input(causalMask);
+            const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+            causalMaskF16.assign(static_cast<std::size_t>(seq) * seq, zero);
+            for (int q = 0; q < seq; q++)
+                std::fill(causalMaskF16.begin() + static_cast<std::size_t>(q) * seq + q + 1,
+                          causalMaskF16.begin() + static_cast<std::size_t>(q + 1) * seq, neg_inf);
+        }
+        // The flash path's V pre-scale: the CUDA kernel's FP16 numerator sums over up to `seq` keys (h3_flash_v_scale).
+        const float flashVScale = flash ? h3_flash_v_scale(seq) : 1.0f;
 
         // Qwen3-VL injects the vision tower's DeepStack taps into the first layers.
         const int nds = d->deepstack != nullptr ? d->num_deepstack : 0;
@@ -696,13 +717,29 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
             k = h3_vit_rope(ctx, k, cosf, sinS, hd, kvh, seq, hd);
 
             ggml_tensor* qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-            ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-            ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp);              // GQA broadcasts kv heads
-            ggml_tensor* probs = ggml_soft_max_ext(ctx, kq, causalMask, scale, 0.0f);
-            ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
-            ggml_tensor* kqv = ggml_mul_mat(ctx, vt, probs);
-            ggml_tensor* merged = ggml_reshape_2d(ctx,
-                ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), heads * hd, seq);
+            ggml_tensor* merged = nullptr;
+            if (flash)
+            {
+                // [hd, seq, heads] queries, F16 [hd, seq, kv_heads] keys and values (GQA broadcasts the kv heads); the
+                // result is [hd, heads, seq].
+                ggml_tensor* kf = ggml_cast(ctx, ggml_permute(ctx, k, 0, 2, 1, 3), GGML_TYPE_F16);
+                ggml_tensor* vp = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+                ggml_tensor* vf = ggml_cast(ctx, flashVScale == 1.0f ? vp : ggml_scale(ctx, vp, 1.0f / flashVScale), GGML_TYPE_F16);
+                ggml_tensor* out = ggml_flash_attn_ext(ctx, qp, kf, vf, causalMask, scale, 0.0f, 0.0f);
+                ggml_prec_set_acc(out, GGML_PREC_F32);
+                merged = ggml_reshape_2d(ctx, ggml_cont(ctx, out), heads * hd, seq);
+                if (flashVScale != 1.0f) merged = ggml_scale(ctx, merged, flashVScale);
+            }
+            else
+            {
+                ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+                ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp);              // GQA broadcasts kv heads
+                ggml_tensor* probs = ggml_soft_max_ext(ctx, kq, causalMask, scale, 0.0f);
+                ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
+                ggml_tensor* kqv = ggml_mul_mat(ctx, vt, probs);
+                merged = ggml_reshape_2d(ctx,
+                    ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), heads * hd, seq);
+            }
             h = ggml_add(ctx, h, lin(ow, merged, ob, /*guard*/ true));
 
             // ---- SwiGLU ----
@@ -755,8 +792,10 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
             ggml_backend_tensor_set(deepstack, d->deepstack, 0, ggml_nbytes(deepstack));
         ggml_backend_tensor_set(cosf, d->cosf, 0, static_cast<std::size_t>(hd) * seq * f);
         ggml_backend_tensor_set(sinf, d->sinf, 0, static_cast<std::size_t>(hd) * seq * f);
-        if (causalMask)
+        if (causalMask && !flash)
             ggml_backend_tensor_set(causalMask, causalMaskData.data(), 0, causalMaskData.size() * f);
+        else if (causalMask)
+            ggml_backend_tensor_set(causalMask, causalMaskF16.data(), 0, causalMaskF16.size() * sizeof(ggml_fp16_t));
 
         if (h3_compute(g_backend, graph, "minimax-h3/text-encode") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3TextEncode: graph compute failed."); return 0; }

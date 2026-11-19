@@ -779,6 +779,9 @@ public struct H3TextEncodeArgs
     public int Causal;
     public float Eps;
     public int NumDeepstack;
+    /// <summary>1: the causal attention through ggml_flash_attn_ext (F16 K/V, an F16 causal mask) instead of the
+    /// materialized [seq, seq, heads] scores (MiniMax-H3-Image's edits, whose pictures make long sequences).</summary>
+    public int FlashAttention;
 }
 
 /// <summary>One run of conditioning tokens and the projection it goes through:
