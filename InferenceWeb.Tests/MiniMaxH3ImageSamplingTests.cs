@@ -12,6 +12,7 @@
 using System;
 using System.Linq;
 using TensorSharp.Models.MiniMaxH3;
+using TensorSharp.Models.SharedDiffusion;
 using Xunit;
 
 namespace InferenceWeb.Tests

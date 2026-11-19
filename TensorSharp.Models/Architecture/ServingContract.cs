@@ -44,6 +44,13 @@ namespace TensorSharp.Models.Architecture
         /// native whole-model executor). Allowed only for the families that predate the
         /// shared runtime; the conformance tests hold that list closed.</summary>
         Bespoke,
+
+        /// <summary>A diffusion family on the shared diffusion runtime (TensorSharp.Models.SharedDiffusion:
+        /// the family supplies its components and layout; the runtime's pipeline, residency, sampling and
+        /// job queue serve it). A job is one image or clip, so continuous batching does not apply; tensor
+        /// parallelism is the runtime's per-rank emission where the family's denoiser is shardable. Every
+        /// new diffusion family must be built this way. See docs/design/diffusion-runtime.md.</summary>
+        SharedDiffusionRuntime,
     }
 
     public enum SupportKind
@@ -300,6 +307,43 @@ namespace TensorSharp.Models.Architecture
             };
         }
 
+        /// <summary>Why continuous batching does not apply to a family on the shared diffusion runtime.</summary>
+        public const string DiffusionJobsReason = "step-interleaved jobs; see Scheduling/Diffusion";
+
+        /// <summary>
+        /// The contract of a family built on the shared diffusion runtime: continuous batching does not apply (a job
+        /// is one image or clip, run by the model's DiffusionJobQueue); tensor parallelism is supported on
+        /// <paramref name="tensorParallelBackends"/>, where the family's denoiser declares shardable blocks, and a gap
+        /// (<paramref name="tensorParallelGap"/>) on its other multi-device backends; layer split and the hybrid are
+        /// gaps (<paramref name="layerSplitGap"/>); expert offload does not apply (no routed experts).
+        /// </summary>
+        public static ServingContract SharedDiffusionRuntime(IReadOnlyList<BackendType> backends,
+            IReadOnlyList<BackendType> tensorParallelBackends = null, string tensorParallelGap = null, string layerSplitGap = null)
+        {
+            ArgumentNullException.ThrowIfNull(backends);
+            var all = backends.Distinct().ToArray();
+            var multi = all.Intersect(MultiDeviceBackends).ToArray();
+            tensorParallelGap ??= "the family's denoiser declares no shardable blocks on this backend";
+            layerSplitGap ??= "whole-layer placement is not implemented for diffusion denoisers";
+            MechanismSupport singleDevice = MechanismSupport.NotApplicable("the family runs only on single-device backends");
+            MechanismSupport tensorParallel = multi.Length == 0 ? singleDevice
+                : tensorParallelBackends is { Count: > 0 } ? MechanismSupport.On(tensorParallelBackends.ToArray()).ElsewhereGap(tensorParallelGap)
+                : MechanismSupport.None(tensorParallelGap);
+            MechanismSupport layerSplit = multi.Length == 0 ? singleDevice : MechanismSupport.None(layerSplitGap);
+            return new ServingContract
+            {
+                Implementation = ServingImplementation.SharedDiffusionRuntime,
+                Backends = all,
+                Autoregressive = false,
+                HasRoutedExperts = false,
+                ContinuousBatching = MechanismSupport.NotApplicable(DiffusionJobsReason),
+                TensorParallel = tensorParallel,
+                LayerSplit = layerSplit,
+                HybridParallel = layerSplit,
+                ExpertOffload = MechanismSupport.NotApplicable("dense: no routed experts"),
+            };
+        }
+
         /// <summary>Structural checks run at registration. Throws with the family id.</summary>
         internal void Validate(string id)
         {
@@ -339,6 +383,17 @@ namespace TensorSharp.Models.Architecture
                         throw new InvalidOperationException(
                             $"Architecture '{id}' claims hybrid TP x layer split on {BackendNames.OptionName(backend)} without supporting both halves there.");
                 }
+            }
+
+            if (Implementation == ServingImplementation.SharedDiffusionRuntime)
+            {
+                if (Autoregressive)
+                    throw new InvalidOperationException(
+                        $"Architecture '{id}' is built on the shared diffusion runtime, which serves media jobs; it cannot decode autoregressively.");
+                if (ContinuousBatching.Kind != SupportKind.NotApplicable)
+                    throw new InvalidOperationException(
+                        $"Architecture '{id}' is built on the shared diffusion runtime, whose jobs run through the model's queue; " +
+                        "continuous batching must be NotApplicable. Use ServingContract.SharedDiffusionRuntime(...).");
             }
 
             if (Implementation == ServingImplementation.SharedRuntime)
