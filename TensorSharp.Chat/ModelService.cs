@@ -746,8 +746,10 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// A spoken reply on <paramref name="session"/> (a web chat session: its cache scope and its transcript), as the
-        /// stateless overload gives the protocols without sessions. No tools: a driven request is one generation, never a
-        /// tool loop.
+        /// stateless overload gives the protocols without sessions. No tools: a spoken reply is one generation, never a
+        /// tool loop. Its language is <see cref="TensorSharp.Models.Audio.SpeechReplyOptions.Language"/>, else the one the user's
+        /// last message is written in; a language the model's speech modes do not speak is spoken from the text reply by its
+        /// TTS prompt, sentence by sentence (<see cref="TensorSharp.Models.Audio.SpeechReplyPath.Synthesized"/>).
         /// </summary>
         internal virtual IAsyncEnumerable<ChatStreamUpdate>
             ChatStreamWithSpeechAsync(
@@ -762,9 +764,8 @@ namespace TensorSharp.Server
         {
             ArgumentNullException.ThrowIfNull(session);
             ArgumentNullException.ThrowIfNull(speech);
-            return _generation.ChatStreamWithMetricsAsync(
-                session, history, maxTokens, cancellationToken, samplingConfig, null, enableThinking,
-                new ChatTurnContext { Speech = speech, Adapter = lora });
+            return _generation.SpokenReplyStreamAsync(
+                session, history, maxTokens, cancellationToken, samplingConfig, enableThinking, speech, lora);
         }
 
         /// <summary>

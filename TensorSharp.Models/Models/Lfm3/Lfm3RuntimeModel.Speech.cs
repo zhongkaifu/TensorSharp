@@ -211,6 +211,15 @@ namespace TensorSharp.Models
         /// <summary>The HF card's system prompt for interleaved replies.</summary>
         public const string InterleavedInstruction = "Respond with interleaved text and audio.";
 
+        /// <inheritdoc cref="Lfm3SpeechPrompt.SpeechLanguageOf"/>
+        public string SpeechLanguageOf(string text, string preferred) => Lfm3SpeechPrompt.SpeechLanguageOf(text, preferred);
+
+        /// <summary>English replies speak in the reply itself (interleaved or audio mode, as llama.cpp's realtime server and
+        /// HF's generate run them); a reply in any other language is generated as text and spoken by the TTS prompt, which is
+        /// what speaks it (<see cref="Lfm3SpeechPrompt.SpeaksRepliesIn"/>).</summary>
+        public SpeechReplyPath SpeechReplyPathFor(string language)
+            => Lfm3SpeechPrompt.SpeaksRepliesIn(language) ? SpeechReplyPath.Direct : SpeechReplyPath.Synthesized;
+
         public int SpeechOpeningToken(SpeechReplyMode mode)
         {
             Lfm3SpeechTokens tokens = SpeechTokens;

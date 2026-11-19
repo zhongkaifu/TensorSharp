@@ -3033,8 +3033,23 @@ namespace TensorSharp.Cli
             Action<ParsedOutput> onParsed = null, CliInferenceSession inference = null,
             Action<List<int>, string> onGenerated = null, List<string> videoFilePaths = null, CliSpeechRequest speech = null)
         {
-            // A spoken reply: the system prompt says how (voice, interleaving), as the server's pipeline adds it.
+            // A spoken reply: the system prompt says how (voice, interleaving), as the server's pipeline adds it. A language
+            // the model's speech modes do not speak (LFM3-Omni's speak English only) is spoken from the text reply instead,
+            // sentence by sentence, by its TTS prompt (the server's SpeechReplyPath.Synthesized).
             var speaker = speech != null ? (TensorSharp.Models.Audio.ISpeechOutputModel)model : null;
+            string speechLanguage = null;
+            CliSpeechRequest synthesized = null;
+            if (speaker != null && speech.Options.Mode != TensorSharp.Models.Audio.SpeechReplyMode.Text)
+            {
+                speechLanguage = string.IsNullOrWhiteSpace(speech.Options.Language)
+                    ? speaker.SpeechLanguageOf(rawText, null) : speech.Options.Language.Trim();
+                if (speaker.SpeechReplyPathFor(speechLanguage) == TensorSharp.Models.Audio.SpeechReplyPath.Synthesized)
+                {
+                    synthesized = speech;
+                    speech = null;
+                    speaker = null;
+                }
+            }
             if (speaker != null && speaker.SpeechReplyInstruction(speech.Options) is { Length: > 0 } instruction)
                 systemPrompt = string.IsNullOrWhiteSpace(systemPrompt) ? instruction : systemPrompt.TrimEnd() + "\n" + instruction;
             var messages = BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns, videoFilePaths);
@@ -3150,12 +3165,56 @@ namespace TensorSharp.Cli
                 bool useParser = enableThinking || (tools != null && tools.Count > 0) || parserRequired;
                 var parsed = useParser ? parser.Add(decoded, true) : new ParsedOutput { Content = decoded };
                 onParsed?.Invoke(parsed);
+                if (synthesized != null)
+                    SpeakReply(model, parsed.Content ?? decoded, speechLanguage, synthesized);
                 return useParser ? FormatParsedResult(parsed, enableThinking || parserRequired) : decoded;
             }
             finally
             {
                 model.MultimodalInjector.ClearPreparedPromptState(requestId);
             }
+        }
+
+        /// <summary>
+        /// A reply spoken from its text (<see cref="TensorSharp.Models.Audio.SpeechReplyPath.Synthesized"/>): each sentence of
+        /// the reply's speakable text (<see cref="TensorSharp.Models.Audio.SpeechTextSegmenter"/>) by the model's TTS prompt, in
+        /// the sentence's language, written as one WAV to the request's path.
+        /// </summary>
+        static void SpeakReply(ModelBase model, string text, string language, CliSpeechRequest speech)
+        {
+            var tts = (TensorSharp.Models.Audio.ISpeechSynthesisModel)model;
+            var speaker = (TensorSharp.Models.Audio.ISpeechOutputModel)model;
+            var segmenter = new TensorSharp.Models.Audio.SpeechTextSegmenter();
+            var pieces = new List<string>(segmenter.Append(text ?? string.Empty));
+            pieces.AddRange(segmenter.Flush());
+            var clock = Stopwatch.StartNew();
+            double firstAudioMs = -1;
+            var pcm = new List<float>();
+            int rate = tts.OutputSampleRate;
+            for (int i = 0; i < pieces.Count; i++)
+            {
+                var audio = tts.SynthesizeStream(pieces[i], new TensorSharp.Models.Audio.SpeechSynthesisOptions
+                {
+                    Voice = speech.Options.Voice,
+                    Language = speaker.SpeechLanguageOf(pieces[i], language),
+                    Seed = speech.Options.Seed is uint seed ? unchecked(seed + (uint)i) : null,
+                    Temperature = speech.Options.Temperature,
+                }, _ =>
+                {
+                    if (firstAudioMs < 0) firstAudioMs = clock.Elapsed.TotalMilliseconds;
+                });
+                pcm.AddRange(audio.Channels[0]);
+                rate = audio.SampleRate;
+            }
+            File.WriteAllBytes(speech.OutputPath, TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Wav(pcm.ToArray(), rate));
+            double seconds = pcm.Count / (double)rate;
+            double rtf = seconds / Math.Max(1e-9, clock.Elapsed.TotalSeconds);
+            _log.LogInformation(LogEventIds.ChatCompleted,
+                "cli.speech wrote {Seconds:F2}s of speech ({Pieces} sentences spoken by the TTS prompt, language {Language}) to {Path}; " +
+                "first audio after {FirstAudioMs:F0} ms of synthesis, {Rtf:F1}x real time", seconds, pieces.Count, language, speech.OutputPath,
+                firstAudioMs, rtf);
+            Console.WriteLine($"Wrote {seconds:F2}s of speech to {speech.OutputPath} ({pieces.Count} sentences spoken in " +
+                $"{language}; {rtf:F1}x real time)");
         }
 
         /// <summary>Why the speech flags cannot apply to this run (null: they can, or none is set): --speech-out needs a

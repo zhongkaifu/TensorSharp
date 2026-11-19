@@ -66,6 +66,9 @@ namespace TensorSharp.Models.Lfm3
             return dash > 0 && TtsLanguages.TryGetValue(code.Substring(0, dash), out name) ? name : language;
         }
 
+        /// <summary>The speech languages written in a script of their own (the rest use Latin letters).</summary>
+        private static readonly HashSet<string> OwnScript = new(StringComparer.Ordinal) { "zh", "ja", "ko", "ar", "he", "el" };
+
         /// <summary>
         /// The speech language <paramref name="text"/>'s script names, or null for Latin letters (English, French, ... look
         /// alike) and text without letters: the script with the most of the text, a run of Latin letters counting as one
@@ -108,6 +111,47 @@ namespace TensorSharp.Models.Lfm3
             Take("he", hebrew);
             Take("el", greek);
             return best;
+        }
+
+        /// <summary>
+        /// The language to speak <paramref name="text"/> in (<see cref="TensorSharp.Models.Audio.ISpeechOutputModel.SpeechLanguageOf"/>):
+        /// <paramref name="preferred"/> where the text's script suits it; the script's language where it names another
+        /// (Chinese in a French reply), or English for Latin letters in a reply whose language has a script of its own;
+        /// without <paramref name="preferred"/>, the script's language (null for Latin letters: the default, English). Kanji
+        /// alone in a Japanese reply stays Japanese.
+        /// </summary>
+        public static string SpeechLanguageOf(string text, string preferred)
+        {
+            string script = LanguageOfText(text);
+            if (string.IsNullOrWhiteSpace(preferred)) return script;
+            string code = preferred.Trim().ToLowerInvariant();
+            int dash = code.IndexOf('-');
+            string baseCode = dash > 0 ? code.Substring(0, dash) : code;
+            if (script == null)
+            {
+                // Latin letters (or none): English in a reply whose language has a script of its own, unless nothing is said.
+                bool letters = false;
+                foreach (System.Text.Rune r in (text ?? string.Empty).EnumerateRunes())
+                    if (System.Text.Rune.IsLetter(r)) { letters = true; break; }
+                return letters && OwnScript.Contains(baseCode) ? "en" : preferred;
+            }
+            if (script == baseCode || (script == "zh" && baseCode == "ja")) return preferred;
+            return script;
+        }
+
+        /// <summary>
+        /// Whether LFM3-Omni's own spoken-reply modes (interleaved and audio) speak <paramref name="language"/> (null: the
+        /// default, English): English only. Their speech is English whatever the text: Chinese replies in interleaved mode
+        /// are read with English sounds under every system prompt tried (llama.cpp and TensorSharp alike, Whisper's language
+        /// ID "en"; LFM3-Audio's card: "voice chat currently supports English only"), while its TTS prompt speaks all of
+        /// <see cref="TtsLanguages"/>.
+        /// </summary>
+        public static bool SpeaksRepliesIn(string language)
+        {
+            if (string.IsNullOrWhiteSpace(language)) return true;
+            string code = language.Trim().ToLowerInvariant();
+            return code == "en" || code.StartsWith("en-", StringComparison.Ordinal) || code == "english" || code == "american english"
+                   || code == "british english";
         }
 
         /// <summary>
