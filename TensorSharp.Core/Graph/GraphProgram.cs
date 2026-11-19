@@ -276,9 +276,9 @@ namespace TensorSharp.Graph
         /// then q's and k's norm weights [D] (as Ip[1]'s bits 0 and 1 say), cos and sinSigned [rot, rows], and with Ip[2] = 1
         /// v [D, heads, rows]. Ip: rot (even, at most D), norm weights (bit 0 q, bit 1 k), attend. Fp: eps, then with
         /// attend the attention's scale and V's power-of-two scale. Results: the rotated q and k [D, heads, rows]; with
-        /// attend the region goes on through the unmasked attention that reads them, and its result is that attention
-        /// [D * heads, rows]: softmax(scale q k^T) v per head with K and V at F16, V divided by its scale before and the
-        /// result multiplied by it after (<see cref="GraphDitRegions.TableRopeQkNorm"/>).</summary>
+        /// attend the region goes on through the unmasked attention that reads them (a nested <see cref="DitAttention"/>
+        /// region), and its result is that attention [D * heads, rows]: softmax(scale q k^T) v per head with K and V at F16, V
+        /// divided by its scale before and the result multiplied by it after (<see cref="GraphDitRegions.TableRopeQkNorm"/>).</summary>
         TableRopeQkNorm = 20,
         /// <summary>A projection with unmerged low-rank updates: w · x plus up_i · (down_i · x) on the rows of each part's slot.
         /// Inputs: x [in, rows] (F32), the weight w [in, out], then each part's down [in, rank] and up [rank, slot rows]
@@ -286,6 +286,14 @@ namespace TensorSharp.Graph
         /// [s * slot rows, (s + 1) * slot rows) of the output, at most three slots), the slot rows (0: out, one slot). Result
         /// [out, rows] (no bias).</summary>
         LoraLinear = 21,
+        /// <summary>A diffusion transformer's unmasked attention over a packed sequence: softmax(scale q k^T) v per head, with K
+        /// and V at F16, V divided by its power-of-two scale before (the F16 accumulator's headroom) and the result multiplied
+        /// by it after. Inputs: q, k and v [D, heads, rows] (F32, D contiguous, any head and row strides: views of a
+        /// projection). Fp: scale, V's scale. Result: [D * heads, rows]. The ops (<see cref="GraphDitRegions.Attention"/>) are
+        /// the flash path of MiniMax-H3's native graph; the GGML executor lowers the region to that graph's own nodes
+        /// (ggml_h3_attention.h: on ggml-metal's tensor API the keys padded to 64 and the queries chunked, which the ops cannot
+        /// say), and <see cref="TableRopeQkNorm"/>'s attend form holds it.</summary>
+        DitAttention = 22,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
