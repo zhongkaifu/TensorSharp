@@ -29,6 +29,8 @@
 #include "ggml_ops_transformer_common.h"
 #include "ggml_ops_precision_policy.h"
 #include "ggml_ops_dit_offload.h"
+#include "ggml_h3_attention.h"
+#include "ggml_h3_upload.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -279,6 +281,9 @@ namespace
         FUSED_GATED_RESIDUAL = 19,    // GraphFusion.GatedResidual
         FUSED_TABLE_ROPE_QK_NORM = 20,// GraphFusion.TableRopeQkNorm (with its attention)
         FUSED_LORA_LINEAR = 21,       // GraphFusion.LoraLinear (Q4_K weight)
+        // Lowered on every backend (try_lower_dit_attention): MiniMax-H3's own attention nodes (h3_attend), in place of the
+        // region's ops; inside a served TableRopeQkNorm it is part of that region.
+        FUSED_DIT_ATTENTION = 22,     // GraphFusion.DitAttention
         SELECTED_ATTENTION = 100,     // a prompt chunk's flash attention under a selection's mask (no region: the op)
     };
 
@@ -428,6 +433,8 @@ namespace
         // offload's wide routes and it may serve the DiT regions in the graph. Set before the first node.
         bool wide_token_products = false;
         int dit_regions = 0;                                     // regions served as DiT offload nodes
+        // The key-padding masks of the graph's lowered DiT attentions (h3_attend on ggml-metal), one per sequence length.
+        tsg::H3FlashMasks flash_masks;
         std::vector<std::unique_ptr<HostSegments>> host_segments;
         // The residual versions bound to a hyper-connection scatter region (IO_HC_RES0 / IO_HC_RES1), and the region the
         // newest one lives in (-1: none yet).
@@ -1235,6 +1242,30 @@ namespace
     }
 #endif
 
+    // GraphFusion.DitAttention lowered on any backend (no tensor parallelism) as MiniMax-H3's native DiT graphs build it:
+    // tsg::h3_attend, with the keys padded to 64 and the queries chunked on ggml-metal's tensor API (the per-graph mask
+    // shared) and ggml's flash kernel or the explicit softmax elsewhere, exactly the nodes the region's ops build there.
+    // The region's ops are numbered and not built. False (the ops are built) where the operands or the V scale are not
+    // what h3_attend takes.
+    bool try_lower_dit_attention(TsgGraph* g, int kind, const int* s, int ns, const float* fp, int nfp,
+                                 std::vector<ggml_tensor*>& results)
+    {
+        if (kind != FUSED_DIT_ATTENTION || g->tp != nullptr || ns != 3 || nfp < 2) return false;
+        ggml_tensor* q = node_at(g, s[0]);
+        ggml_tensor* k = node_at(g, s[1]);
+        ggml_tensor* v = node_at(g, s[2]);
+        const std::int64_t D = q->ne[0], H = q->ne[1], S = q->ne[2];
+        for (const ggml_tensor* t : { q, k, v })
+            if (t->type != GGML_TYPE_F32 || t->ne[0] != D || t->ne[1] != H || t->ne[2] != S || t->ne[3] != 1 || t->nb[0] != sizeof(float))
+                return false;
+        if (D > INT32_MAX || H > INT32_MAX || S > INT32_MAX || S < 1) return false;
+        // h3_attend derives V's power-of-two scale from the sequence; a region that asks for another runs its ops.
+        if (fp[1] != tsg::h3_flash_v_scale(static_cast<int>(S))) return false;
+        results = { tsg::h3_attend(g->ctx, graph_backend(g), q, k, v, static_cast<int>(D), static_cast<int>(H), static_cast<int>(S),
+                                   fp[0], /*allowFlash*/ true, &g->flash_masks) };
+        return results[0] != nullptr;
+    }
+
     // Whether this graph's backend runs region `kind` over these operands as one device operation; if so, records
     // the region (its ops are then skipped until its end).
     bool try_serve_region(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
@@ -1878,6 +1909,76 @@ TSG_EXPORT int TSGgml_GraphWideTokenProducts(void* handle, int on)
     return 1;
 }
 
+// One weight TSGgml_GraphPreloadWeights makes resident: its host bytes (the key of its device copy, as a graph's WEIGHT
+// leaf binds it), their count, the ggml type and the extents.
+struct TSGgmlPreloadWeight
+{
+    void* data;
+    std::int64_t bytes;
+    std::int32_t type;
+    std::int32_t nd;
+    std::int64_t ne[4];
+};
+static_assert(sizeof(TSGgmlPreloadWeight) == 56, "TSGgmlPreloadWeight must match the managed layout");
+
+// Make `count` weights resident on the active device before a graph binds them, through MiniMax-H3's weight uploader
+// (ggml_h3_upload.h: direct reads from a registered file mapping, else prefaulted parallel copies), into the device copies
+// a WEIGHT leaf of the same host bytes binds (try_bind_cached_tensor), so the first graph that reads them uploads nothing.
+// A weight the device cache does not take (a zero-copy host wrap) is left to the graph's binding. `uploaded` (nullable)
+// receives how many were copied now. 1 on success, 0 with the error set.
+TSG_EXPORT int TSGgml_GraphPreloadWeights(const TSGgmlPreloadWeight* items, int count, const char* tag, int* uploaded)
+{
+    try
+    {
+        if (uploaded != nullptr) *uploaded = 0;
+        if (count < 0 || (count > 0 && items == nullptr)) throw std::runtime_error("graph builder: bad weight preload list");
+        if (!ensure_backend()) return 0;
+        if (count == 0) { clear_last_error(); return 1; }
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead() * static_cast<std::size_t>(count) + 1024;
+        params.no_alloc = true;
+        ContextHandle ctx(ggml_init(params));
+        if (ctx.value == nullptr) throw std::runtime_error("graph builder: the weight preload's context could not be made");
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct Binding { ggml_tensor* t; void* data; std::size_t bytes; };
+        std::vector<Binding> uploads;
+        for (int i = 0; i < count; i++)
+        {
+            const TSGgmlPreloadWeight& w = items[i];
+            if (w.data == nullptr || w.nd < 1 || w.nd > 4 || w.type < 0 || w.type >= GGML_TYPE_COUNT)
+                throw std::runtime_error("graph builder: preload weight " + std::to_string(i) + " is not a weight");
+            ggml_tensor* t = ggml_new_tensor(ctx.value, static_cast<ggml_type>(w.type), w.nd, w.ne);
+            if (t == nullptr) throw std::runtime_error("graph builder: preload weight " + std::to_string(i) + " could not be made");
+            const std::size_t bytes = ggml_nbytes(t);
+            if (w.bytes < 0 || static_cast<std::size_t>(w.bytes) < bytes)
+                throw std::runtime_error("graph builder: preload weight " + std::to_string(i) + " has fewer host bytes than its tensor");
+            bool needs = false;
+            if (!try_bind_cached_tensor(g_backend, dev, t, w.data, bytes, needs, GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) continue;
+            if (needs) uploads.push_back({ t, w.data, bytes });
+        }
+        host_read_barrier();
+        tsg::h3_upload_weights(tag != nullptr ? tag : "graph builder/preload", uploads);
+#if defined(TSG_GGML_USE_CUDA)
+        // The int8 and FP8 routes keep what they derive from a weight by its device address (as a graph's fresh weights do).
+        for (const Binding& u : uploads)
+            if (u.bytes >= 4096)
+            {
+                tsg_cuda_q4k_gemm_forget_weights();
+                tsg_cuda_f16_gemm_forget_weights();
+                break;
+            }
+#endif
+        if (uploaded != nullptr) *uploaded = static_cast<int>(uploads.size());
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+}
+
 // Run the graph: build and bind it on the first run, then upload this run's inputs (and the
 // leaves living in compute memory), compute, download the outputs and write back any STATE
 // leaf that lives in compute memory. `inputs`/`input_data`/`input_bytes` name per-run values
@@ -2074,8 +2175,9 @@ extern "C" void TSGgml_GraphReleaseDeviceIo()
 }
 
 // A fused region of GraphFusion `kind` over `srcs` begins: 1 when a device operation computes it (its ops, effects and
-// aliases up to the matching TSGgml_GraphFusedEnd are then numbered but not built), 0 when its ops are built. A region
-// nested in a served one is part of it.
+// aliases up to the matching TSGgml_GraphFusedEnd are then numbered but not built), 2 when the backend lowers it to graph
+// nodes of its own (GraphFusion.DitAttention: the ops are numbered but not built either), 0 when its ops are built. A
+// region nested in a served one is part of it.
 TSG_EXPORT int TSGgml_GraphFusedBegin(void* handle, int kind, const int* srcs, int nsrc,
                                       const std::int64_t* ip, int nip, const float* fp, int nfp)
 {
@@ -2103,6 +2205,18 @@ TSG_EXPORT int TSGgml_GraphFusedBegin(void* handle, int kind, const int* srcs, i
             return 1;
         }
 #endif
+        std::vector<ggml_tensor*> lowered;
+        if (try_lower_dit_attention(g, kind, srcs, nsrc, fp, nfp, lowered))
+        {
+            DeviceRegion r;
+            r.kind = kind;
+            r.in_graph = true;
+            r.results = std::move(lowered);
+            g->regions.push_back(std::move(r));
+            g->open_regions.push_back(static_cast<int>(g->regions.size()) - 1);
+            g->serving = g->open_regions.back();
+            return 2;
+        }
         const bool served = try_serve_region(g, kind, srcs, nsrc, ip, nip, fp, nfp);
         g->open_regions.push_back(served ? static_cast<int>(g->regions.size()) - 1 : -1);
         if (served) g->serving = g->open_regions.back();

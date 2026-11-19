@@ -199,13 +199,28 @@ namespace TensorSharp.Graph
         public static int TableRopeQkNormAttention(GraphProgramBuilder g, int q, int k, int v, int qNorm, int kNorm, int cos,
             int sinSigned, long d, long heads, long rows, int rot, float eps, float scale, float vScale)
         {
-            if (!(vScale > 0f) || MathF.Log2(vScale) != MathF.Round(MathF.Log2(vScale)))
-                throw new ArgumentOutOfRangeException(nameof(vScale), "V's scale is a power of two (exact through the F16 cast)");
+            CheckVScale(vScale);
             BeginRope(g, q, k, v, qNorm, kNorm, cos, sinSigned, d, rot, eps, attend: true, scale, vScale);
             var (qr, kr) = RopeOps(g, q, k, qNorm, kNorm, cos, sinSigned, d, heads, rows, rot, eps);
+            int y = Attention(g, qr, kr, v, d, heads, rows, scale, vScale);
+            g.EndFused(stackalloc[] { y });
+            return y;
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.DitAttention"/>: softmax(scale q k^T) v per head over q, k and v [d, heads, rows] (F32, any
+        /// head and row strides), no mask, as the H3 graph's flash path computes it: each permuted to [d, rows, heads] and
+        /// copied, K and V cast to F16, V divided by <paramref name="vScale"/> first (a power of two: the F16 accumulator's
+        /// headroom) and the result [d * heads, rows] multiplied by it after.
+        /// </summary>
+        public static int Attention(GraphProgramBuilder g, int q, int k, int v, long d, long heads, long rows, float scale, float vScale)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+            CheckVScale(vScale);
+            g.BeginFused(GraphFusion.DitAttention, stackalloc[] { q, k, v }, default, stackalloc[] { scale, vScale });
             Span<long> permute = stackalloc long[] { 0, 2, 1, 3 };
-            int qp = g.Op(GraphOp.Cont, g.Op(GraphOp.Permute, stackalloc[] { qr }, permute));
-            int kp = g.Op(GraphOp.Cont, g.Op(GraphOp.Permute, stackalloc[] { kr }, permute));
+            int qp = g.Op(GraphOp.Cont, g.Op(GraphOp.Permute, stackalloc[] { q }, permute));
+            int kp = g.Op(GraphOp.Cont, g.Op(GraphOp.Permute, stackalloc[] { k }, permute));
             int vp = g.Op(GraphOp.Cont, g.Op(GraphOp.Permute, stackalloc[] { v }, permute));
             int kf = g.Op(GraphOp.Cast, stackalloc[] { kp }, stackalloc long[] { GraphFormat.F16 });
             int vf = g.Op(GraphOp.Cast, stackalloc[] { vScale == 1f ? vp : Scale(g, vp, 1f / vScale) }, stackalloc long[] { GraphFormat.F16 });
@@ -215,6 +230,22 @@ namespace TensorSharp.Graph
             int y = vScale == 1f ? merged : Scale(g, merged, vScale);
             g.EndFused(stackalloc[] { y });
             return y;
+        }
+
+        /// <summary>The power-of-two V scale an F16 attention accumulator keeps its headroom with, for <paramref name="keys"/>
+        /// keys (MiniMax-H3's h3_flash_v_scale): the smallest power of two that brings the keys down to 256, 1 for 256 or
+        /// fewer.</summary>
+        public static float FlashVScale(long keys)
+        {
+            float s = 1f;
+            while (keys > 256 * s) s *= 2f;
+            return s;
+        }
+
+        private static void CheckVScale(float vScale)
+        {
+            if (!(vScale > 0f) || MathF.Log2(vScale) != MathF.Round(MathF.Log2(vScale)))
+                throw new ArgumentOutOfRangeException(nameof(vScale), "V's scale is a power of two (exact through the F16 cast)");
         }
 
         private static void BeginRope(GraphProgramBuilder g, int q, int k, int v, int qNorm, int kNorm, int cos, int sinSigned, long d,
