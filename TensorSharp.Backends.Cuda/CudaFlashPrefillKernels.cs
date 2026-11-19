@@ -301,7 +301,10 @@ namespace TensorSharp.Cuda
         /// waves of 1/s of a block's time, costed (floor(x) + p(frac(x))) / s plus 2% of a block's time for each extra split (its
         /// Q load, partial write and combine), where a wave filled to f costs p(f) = max(0.8, sqrt(f)) of a full one: its blocks
         /// start as earlier ones end, and the device clocks up to a quarter higher under its power cap while SMs idle (an RTX PRO
-        /// 4500 sweep, 300 to 2,048 rows over 30K to 100K keys, interleaved). <c>TailSplits</c> 1: no split.</summary>
+        /// 4500 sweep, 300 to 2,048 rows over 30K to 100K keys, interleaved). A launch of fewer row tiles than the device has
+        /// multiprocessors (a short chunk, few KV heads) splits them until their blocks fill one wave, up to
+        /// <see cref="MaxPromptTailSplits"/>: there each block's time falls with its share of the keys, which the wave cost's floor
+        /// and per-split cost do not see. <c>TailSplits</c> 1: no split.</summary>
         public (int FullTiles, int TailSplits) PromptPlan(int rows, int kvHeads, int keys) => PromptPlan(rows, kvHeads, keys, MultiprocessorCount);
 
         internal static (int FullTiles, int TailSplits) PromptPlan(int rows, int kvHeads, int keys, int sms)
@@ -315,17 +318,28 @@ namespace TensorSharp.Cuda
             }
             int best = 1;
             double bestCost = Cost(tail, 1, sms);
-            for (int s = 2; s <= MaxPromptTailSplits && keys / s >= 4 * TileKeys && tail * s <= 3 * sms; s++)
+            for (int s = 2; s <= CostedPromptTailSplits && keys / s >= 4 * TileKeys && tail * s <= 3 * sms; s++)
             {
                 double cost = Cost(tail, s, sms);
                 if (cost < bestCost - 1e-9) (best, bestCost) = (s, cost);
             }
+            // Fewer row tiles than multiprocessors: as many splits as fill one wave. The costed plan had stopped at 6 there:
+            // Qwen3.8-27B's 24/4 heads, 17 rows over 100K keys (4 tiles), took 1.58x the 16-bit-run launch's time, 20 splits
+            // 0.81x; 8/2 heads of 256 (2 tiles) 3.28x, 41 splits 0.82x (RTX PRO 4500). With whole waves before the tail, filling
+            // its wave gained nothing (0.98-1.01x), so those plans stay the costed ones.
+            if (total < sms)
+            {
+                int fill = Math.Min(Math.Min(sms / total, MaxPromptTailSplits), keys / (4 * TileKeys));
+                if (fill > best) best = fill;
+            }
             return best == 1 ? (total, 1) : (total - tail, best);
         }
 
-        /// <summary>The most splits a tail tile of <see cref="PromptPlan"/> takes, and the cost of each split's own work in block
-        /// times (its Q load, partial write and combine).</summary>
-        public const int MaxPromptTailSplits = 16;
+        /// <summary>The most splits a tail tile of <see cref="PromptPlan"/> takes (a launch of fewer row tiles than multiprocessors
+        /// splits until it fills a wave); the cost model weighs up to <see cref="CostedPromptTailSplits"/>, with the cost of each
+        /// split's own work in block times (its Q load, partial write and combine).</summary>
+        public const int MaxPromptTailSplits = 64;
+        private const int CostedPromptTailSplits = 16;
         private const double PromptSplitCost = 0.02;
 
         /// <summary>Whether <paramref name="plan"/> is a grid <see cref="LaunchPromptAttention"/> can run for <paramref name="rows"/>

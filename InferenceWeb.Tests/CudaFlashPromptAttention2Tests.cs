@@ -69,6 +69,50 @@ public sealed class CudaFlashPromptAttention2Tests : IDisposable
     }
 
     /// <summary>
+    /// The prompt grid's plan (no device): a launch of fewer row tiles than multiprocessors splits them until their blocks fill one
+    /// wave, each split at least four key tiles and at most <see cref="CudaFlashPrefillKernels.MaxPromptTailSplits"/> (the costed
+    /// plan had stopped at 6 splits there: a short chunk over a long window then took 1.6x to 3.3x the 16-bit-run launch's time);
+    /// a launch with whole waves of row tiles keeps the costed tail plan.
+    /// </summary>
+    [Fact]
+    public void PromptPlanSplitsFewerRowTilesThanMultiprocessorsUntilTheyFillAWave()
+    {
+        // 82 multiprocessors (RTX PRO 4500). Qwen3.8-27B's 24/4 heads: 17 rows are 4 row tiles; 8/2 heads: 2.
+        Assert.Equal((0, 20), CudaFlashPrefillKernels.PromptPlan(17 * 6, 4, 100_000, 82));
+        Assert.Equal((0, 41), CudaFlashPrefillKernels.PromptPlan(17 * 4, 2, 100_000, 82));
+        Assert.Equal((0, 31), CudaFlashPrefillKernels.PromptPlan(17 * 4, 2, 4080, 82));      // four key tiles a split
+        Assert.Equal((0, 64), CudaFlashPrefillKernels.PromptPlan(17 * 8, 1, 100_000, 188));  // MaxPromptTailSplits
+        // Whole waves before the tail, or a tail its costed splits already fill: the costed plan (the issue's B turn, a 2,048-row
+        // chunk at 47K, 756 rows over 100K, 300 rows over 60K).
+        Assert.Equal((164, 4), CudaFlashPrefillKernels.PromptPlan(968 * 6, 4, 47_981 - 968 + 1, 82));
+        Assert.Equal((328, 4), CudaFlashPrefillKernels.PromptPlan(2048 * 6, 4, 47_104 - 2048 + 1, 82));
+        Assert.Equal((144, 1), CudaFlashPrefillKernels.PromptPlan(756 * 6, 4, 100_000 - 756 + 1, 82));
+        Assert.Equal((0, 4), CudaFlashPrefillKernels.PromptPlan(300 * 6, 4, 60_000 - 300 + 1, 82));
+        Assert.Equal((246, 5), CudaFlashPrefillKernels.PromptPlan(2048 * 8, 2, 4096 - 2048 + 1, 82));
+        foreach (int sms in new[] { 23, 82, 188 })
+            foreach (int kvHeads in new[] { 1, 2, 4, 8, 16 })
+                foreach (int keys in new[] { 1, 127, 128, 256, 1000, 4080, 50_000, 100_000 })
+                    for (int rows = 1; rows <= 4200; rows += rows < 300 ? 1 : 97)
+                    {
+                        var (full, splits) = CudaFlashPrefillKernels.PromptPlan(rows, kvHeads, keys, sms);
+                        int total = (rows + CudaFlashPrefillKernels.BlockRows - 1) / CudaFlashPrefillKernels.BlockRows * kvHeads;
+                        string at = $"{rows} rows of {kvHeads} KV heads over {keys} keys, {sms} SMs: ({full}, {splits})";
+                        Assert.True(full <= total && splits >= 1, at);
+                        if (splits == 1)
+                        {
+                            Assert.True(full == total, at);
+                            continue;
+                        }
+                        Assert.True(keys / splits >= 4 * CudaFlashPrefillKernels.TileKeys && splits <= CudaFlashPrefillKernels.MaxPromptTailSplits
+                            && (total - full) * splits <= 3 * sms, at);
+                        // Fewer tiles than SMs: one more split would overfill the wave, pass the cap or go under four key tiles.
+                        if (total < sms)
+                            Assert.True(total * (splits + 1) > sms || splits == CudaFlashPrefillKernels.MaxPromptTailSplits
+                                || keys / (splits + 1) < 4 * CudaFlashPrefillKernels.TileKeys, at);
+                    }
+    }
+
+    /// <summary>
     /// "gauss": q, K, V standard normal; "peaked": q four times wider (a sharp softmax); "outlier": a K channel in 64 twenty times
     /// wider, a V channel in 64 offset by 30 (the accumulators' magnitude far past each tile's product), q's matching channel a
     /// quarter. K and V are values an F16 cache holds exactly. <paramref name="sms"/> &gt; 0 plans the grid as on a device of that
@@ -84,6 +128,7 @@ public sealed class CudaFlashPromptAttention2Tests : IDisposable
     [InlineData("peaked", 256, 24, 4, 1100, 1100, 0, 0)]     // a fresh chunk: the causal triangle
     [InlineData("gauss", 128, 16, 2, 300, 700, 33, 0)]       // 128-wide heads
     [InlineData("outlier", 128, 32, 8, 1024, 2048, 0, 0)]
+    [InlineData("outlier", 256, 8, 2, 20, 9000, 0, 82)]      // two row tiles split 41 ways to fill a wave of 82 multiprocessors
     public void CloserToAnExactReferenceThanThe16BitRunKernel(string dist, int d, int heads, int kvHeads, int nq, int len, int floor, int sms)
     {
         using var allocator = new CudaAllocator();
