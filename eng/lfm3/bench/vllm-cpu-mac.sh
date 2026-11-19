@@ -20,7 +20,8 @@
 #   stock    stock vLLM (vllm-fp16, no workaround), one reduced round: STOCK_CELLS with STOCK_REQUESTS
 #   summary  medians over rounds with min-max spreads -> $OUT/bench/summary.md
 #
-# Arms (all: prefix/prompt caching off, max context CTX per sequence, greedy, ignore_eos, thinking off):
+# Arms (all: prefix/prompt caching off, max context CTX per sequence, greedy with no repetition penalty, ignore_eos,
+# thinking off):
 #   vllm-{fp16,bf16,fp32}[fix][-tN]  vllm serve HF --dtype .. --max-model-len CTX --no-enable-prefix-caching
 #          --max-num-seqs C; VLLM_CPU_OMP_THREADS_BIND=0-(N-1) (the CPU worker's OpenMP width; macOS has no
 #          affinity, only the count matters; N defaults to VLLM_THREADS), VLLM_CPU_KVCACHE_SPACE=2 (GiB).

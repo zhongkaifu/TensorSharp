@@ -68,8 +68,9 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
 - `vllm-cpu-mac.sh [check] [correct] [sweep] [bench] [summary]` (helper `vllm-cpu-mac.py`; the header lists every
   knob): the CPU lanes on an Apple-silicon Mac against vLLM's CPU backend (built from source into a uv venv,
   `VLLM_VENV`, serving the HF checkpoint `HF`) and llama.cpp's CPU build, with one client for every engine (`vllm
-  bench serve --backend openai-chat`: random prompts identical across engines, greedy, `ignore_eos`, thinking off,
-  prefix/prompt caching off everywhere, one slot per concurrent request, 4096 context). `correct` checks the engines
+  bench serve --backend openai-chat`: random prompts identical across engines, greedy with no repetition penalty
+  (`repetition_penalty` and `repeat_penalty` 1.0 in every request), `ignore_eos`, thinking off, prefix/prompt
+  caching off everywhere, one slot per concurrent request, 4096 context). `correct` checks the engines
   agree before anything is timed: greedy generations of five chat prompts (64 tokens) from vLLM offline
   (float16/bfloat16/float32), the vLLM, TensorSharp ggml_cpu / cpu and llama-server servers on the BF16 weights, and
   HF transformers float32 (`generate()`, and the reference: greedy by full forwards without a cache), reported as tokens

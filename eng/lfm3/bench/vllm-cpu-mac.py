@@ -509,8 +509,13 @@ def cmd_arm(a):
                        "--random-input-len", str(isl), "--random-output-len", str(osl), "--random-range-ratio", "0",
                        "--num-prompts", str(n), "--max-concurrency", str(c), "--request-rate", "inf",
                        "--ignore-eos", "--temperature", "0", "--num-warmups", "0",
+                       # The same body for every engine, with no repetition penalty anywhere: vLLM reads
+                       # repetition_penalty (1.0 by default under --generation-config vllm), llama-server
+                       # repeat_penalty (1.0 by default) and TensorSharp either one. Without them TensorSharp applied
+                       # the GGUF's recommended 1.1 to every benchmark request.
                        "--extra-body", json.dumps({"chat_template_kwargs": {"enable_thinking": False}, "top_k": 1,
-                                                   "top_p": 1.0, "cache_prompt": False}),
+                                                   "top_p": 1.0, "cache_prompt": False,
+                                                   "repetition_penalty": 1.0, "repeat_penalty": 1.0}),
                        "--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", "50,99",
                        "--seed", str(a.seed + 7 * isl + 31 * c), "--disable-tqdm",
                        "--save-result", "--result-dir", a.out, "--result-filename", fn]
