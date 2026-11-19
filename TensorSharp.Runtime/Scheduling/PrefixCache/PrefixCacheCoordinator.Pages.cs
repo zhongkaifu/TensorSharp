@@ -84,6 +84,9 @@ internal sealed partial class PrefixCacheCoordinator
             length = Math.Min(length, _tree.Caps.PageWindowTokens);
         length = PromptMediaSpans.ClampReusablePrefix(length, seq.MediaSpans, seq.MediaSpans,
             _tree.Caps.ReuseAcrossMediaSpan);
+        // A driven request's output is keyed only as far as its driver named its rows (KeyDrivenOutput).
+        if (seq.StepDriver != null)
+            length = Math.Min(length, _tree.Caps.ReuseAcrossMediaSpan ? GetKey(seq).Length : seq.PromptTokens.Count);
         int count = Math.Min(length / blockSize, seq.BlockTable.NumBlocks);
         // A decode restore point stays out until the sequence stops: the next one replaces
         // it, and a cached page is immutable (SequenceState.HeldDecodeRestoreBlock).

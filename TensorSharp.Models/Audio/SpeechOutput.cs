@@ -104,7 +104,7 @@ namespace TensorSharp.Models.Audio
     /// takes (<see cref="TakeAudio"/>) when the request's token stream carries <see cref="FrameToken"/>, and the codec's tail
     /// when the reply ends (<see cref="Complete"/>).
     /// </summary>
-    public abstract class SpeechReplyDriver : ISequenceStepDriver
+    public abstract class SpeechReplyDriver : ISequenceStepDriver, IOutputMediaDriver
     {
         private readonly object _audioGate = new();
         private List<float> _audio = new();
@@ -198,6 +198,46 @@ namespace TensorSharp.Models.Audio
         protected void RecordFedFrame(int[] codes)
         {
             lock (_audioGate) _fed.Add((int[])codes.Clone());
+        }
+
+        /// <summary>The content id the model's prompt expander gives the rows of fed frames [<paramref name="first"/>,
+        /// + <paramref name="count"/>) (one run of <see cref="FrameToken"/>s) when a later turn carries this reply back, or
+        /// null when it has none: the reply's rows are then not keyed, and its end state is not retained.</summary>
+        protected virtual string SpanContentId(IReadOnlyList<int[]> frames, int first, int count) => null;
+
+        /// <summary>The runs of <see cref="FrameToken"/> in the reply's output, each named by its fed frames' content id
+        /// (<see cref="SpanContentId"/>), so its end state is keyed as the next turn's prompt keys the reply
+        /// (<see cref="IOutputMediaDriver"/>). A run at the end of an output that is not complete may still grow: it is left
+        /// out, and the output keyed up to its start.</summary>
+        public IReadOnlyList<PromptMediaSpan> OutputMediaSpans(IReadOnlyList<int> output, int outputStart, bool complete,
+            out int keyedOutput)
+        {
+            ArgumentNullException.ThrowIfNull(output);
+            keyedOutput = 0;
+            IReadOnlyList<int[]> frames = FedFrameCodes;
+            int placeholder = FrameToken;
+            var spans = new List<PromptMediaSpan>();
+            int frame = 0;
+            for (int i = 0; i < output.Count;)
+            {
+                if (output[i] != placeholder)
+                {
+                    keyedOutput = ++i;
+                    continue;
+                }
+                int start = i;
+                while (i < output.Count && output[i] == placeholder) i++;
+                if (i == output.Count && !complete) break;
+                int count = i - start;
+                // One fed frame a placeholder, in order; a run without its frames is not keyed.
+                if (frame + count > frames.Count) break;
+                string id = SpanContentId(frames, frame, count);
+                if (id == null) return null;
+                spans.Add(new PromptMediaSpan(outputStart + start, outputStart + i, id));
+                frame += count;
+                keyedOutput = i;
+            }
+            return spans;
         }
 
         public abstract void Dispose();

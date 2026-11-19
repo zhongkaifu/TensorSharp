@@ -135,9 +135,61 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     {
         EnsureRequest(sequence);
         KeyRope key = _requests[sequence].Key;
+        if (sequence.StepDriver != null)
+        {
+            KeyDrivenOutput(sequence);
+            return key;
+        }
         for (int i = key.Length; i < sequence.NumTotalTokens; i++)
             key.Append(KeyElem.Text(sequence.TokenAt(i)), _tree.KeyPool);
         return key;
+    }
+
+    /// <summary>
+    /// A driven request's output (an LFM3-Omni spoken reply) is keyed as the later prompt that carries the reply back keys
+    /// it: each run of the rows it decoded is a media span named by their content (<see cref="IOutputMediaDriver"/>),
+    /// added to the request's spans, so the next turn matches its end state through the reply. Keyed only as far as the
+    /// output is settled (a run of rows still open is not), so the key may end before the output does; a driver that does
+    /// not name its rows keys nothing past the prompt, and the request is then never retained.
+    /// </summary>
+    private void KeyDrivenOutput(SequenceState sequence)
+    {
+        RequestKey request = _requests[sequence];
+        KeyRope key = request.Key;
+        int promptCount = sequence.PromptTokens.Count;
+        if (sequence.StepDriver is not IOutputMediaDriver media || key.Length >= sequence.NumTotalTokens) return;
+        bool complete = sequence.Status is SequenceStatus.FinishedStopped or SequenceStatus.FinishedLengthCapped
+            or SequenceStatus.FinishedAborted;
+        IReadOnlyList<PromptMediaSpan>? spans = media.OutputMediaSpans(sequence.OutputTokens, promptCount, complete,
+            out int keyedOutput);
+        if (spans is null) return;
+        int end = promptCount + Math.Clamp(keyedOutput, 0, sequence.OutputTokens.Count);
+        if (end <= key.Length) return;
+        var added = new List<MediaSpanRecord>();
+        foreach (PromptMediaSpan span in spans)
+        {
+            if (span.Start < key.Length || span.End > end) continue;
+            if (span.Start < promptCount || span.End <= span.Start
+                || (added.Count > 0 && span.Start < added[^1].End))
+                throw new InvalidOperationException(
+                    $"Request {sequence.RequestId}'s driver named output media span [{span.Start}, {span.End}) that is not "
+                    + $"inside its output [{promptCount}, {sequence.NumTotalTokens}) in order.");
+            added.Add(MediaSpanRecord.FromContentId(span.Start, span.End, span.ContentId));
+        }
+        int next = 0;
+        for (int i = key.Length; i < end; i++)
+        {
+            while (next < added.Count && added[next].End <= i) next++;
+            key.Append(next < added.Count && added[next].Start <= i ? KeyElem.Media(added[next].Id)
+                : KeyElem.Text(sequence.TokenAt(i)), _tree.KeyPool);
+        }
+        if (added.Count > 0)
+        {
+            var all = new MediaSpanRecord[request.Spans.Length + added.Count];
+            request.Spans.CopyTo(all, 0);
+            added.CopyTo(all, request.Spans.Length);
+            _requests[sequence] = request with { Spans = all };
+        }
     }
 
     internal int GetScope(SequenceState sequence) { EnsureRequest(sequence); return _requests[sequence].Scope; }
@@ -638,7 +690,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     {
         if (publicBoundary && length == sequence.SharedPrefixTokens) sequence.PrefixCheckpointTaken = true;
         Drain();
-        RadixNode node = _tree.Insert(GetKey(sequence), length, GetScope(sequence),
+        KeyRope captureKey = GetKey(sequence);
+        // A driven request's key ends where its output is not settled yet (KeyDrivenOutput).
+        if (length > captureKey.Length) return;
+        RadixNode node = _tree.Insert(captureKey, length, GetScope(sequence),
             publicBoundary ? length : sequence.SharedPrefixTokens,
             explicitBoundary ? NodeFlags.EndsAtBreakpoint
                 : length == sequence.PromptTokens.Count ? NodeFlags.PromptEnd : NodeFlags.None,
@@ -692,10 +747,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         DropPending(sequence);
         Drain();
         int length = Math.Min(sequence.NumComputedTokens, sequence.NumTotalTokens);
-        // A driven request's output holds one placeholder token for each embedding row it decoded (speech frames of any
-        // content), so its end state is not keyed by what it holds: it is not retained.
-        if (length < _tree.Caps.MinRetainTokens || sequence.CacheBreakpoints is not null || sequence.StepDriver != null) return false;
+        if (length < _tree.Caps.MinRetainTokens || sequence.CacheBreakpoints is not null) return false;
         KeyRope key = GetKey(sequence);
+        // A driven request's output holds one placeholder token for each embedding row it decoded: it is retained only
+        // when its driver keyed those rows by their content (KeyDrivenOutput), through all it computed.
+        if (length > key.Length) return false;
         RadixNode node = _tree.Insert(key, length, GetScope(sequence), sequence.SharedPrefixTokens,
             NodeFlags.None, GetSpans(sequence));
         if (node.EndState is not null) return false;

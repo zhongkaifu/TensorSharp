@@ -57,6 +57,10 @@ namespace TensorSharp.Models.Lfm3
 
         public override int FrameToken => _tokens.AudioOut;
 
+        /// <summary>The id the prompt expander gives a past spoken turn's run of rows (<see cref="Lfm3SpeechOutput.FramesContentId"/>).</summary>
+        protected override string SpanContentId(IReadOnlyList<int[]> frames, int first, int count)
+            => Lfm3SpeechOutput.FramesContentId(frames, first, count);
+
         public override bool IsControlToken(int token)
             => token == _tokens.AudioStart || token == _tokens.MixedStart || token == _tokens.TextEnd || token == _tokens.ImEnd
                || token == _tokens.AudioOut;

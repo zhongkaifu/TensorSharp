@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 
 using TensorSharp.Graph;
 using TensorSharp.Models.Graph;
@@ -116,6 +117,22 @@ namespace TensorSharp.Models.Lfm3
                 if ((uint)codes[c] >= V) throw new ArgumentOutOfRangeException(nameof(codes), $"code {codes[c]} of codebook {c}");
                 _feedback.AddTo((long)c * V + codes[c], row);
             }
+        }
+
+        /// <summary>
+        /// The content id of the rows of frames [<paramref name="first"/>, + <paramref name="count"/>) (one run of a spoken
+        /// turn's frame placeholders): "lfm3-speech:" and the SHA-256 of their codes. The prompt expander names a past spoken
+        /// turn's rows by it and the reply driver names the rows it decodes by it, so a reply's cached end state and the next
+        /// turn's prompt that carries the reply back key those positions alike.
+        /// </summary>
+        public static string FramesContentId(IReadOnlyList<int[]> frames, int first, int count)
+        {
+            ArgumentNullException.ThrowIfNull(frames);
+            var codes = new List<byte>(count * Lfm3SpeechConfig.Codebooks * 4);
+            for (int f = first; f < first + count; f++)
+                foreach (int c in frames[f])
+                    codes.AddRange(BitConverter.GetBytes(c));
+            return "lfm3-speech:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(codes.ToArray()));
         }
 
         /// <summary>The LM input row of a frame as a new array.</summary>

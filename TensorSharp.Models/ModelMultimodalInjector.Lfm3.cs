@@ -145,11 +145,8 @@ namespace TensorSharp.Models
         private CachedEmbedding GetOrCreateLfm3SpeechRows(Lfm3RuntimeModel model, Lfm3SpeechOutput speech, List<int[]> frames,
             int first, int count)
         {
-            var codes = new List<byte>(count * Lfm3SpeechConfig.Codebooks * 4);
-            for (int f = first; f < first + count; f++)
-                foreach (int c in frames[f])
-                    codes.AddRange(BitConverter.GetBytes(c));
-            string key = "lfm3-speech:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(codes.ToArray()));
+            // The reply driver names the rows it decoded by the same id (Lfm3SpeechDriver.SpanContentId).
+            string key = Lfm3SpeechOutput.FramesContentId(frames, first, count);
             if (_audioCache.TryGetValue(key, out CachedEmbedding cached))
             {
                 TouchAndPin(cached);

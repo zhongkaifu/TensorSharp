@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 
 namespace TensorSharp.Runtime.Scheduling
 {
@@ -51,8 +52,9 @@ namespace TensorSharp.Runtime.Scheduling
     /// The engine runs such a request on the unified runtime (<see cref="IUnifiedBatchModel.TryForwardUnifiedRows"/>),
     /// batched with every other request; it calls <see cref="Next"/> on its thread, inside the step and the model's compute
     /// lock, so the driver may run device work of its own there. The request's token stream carries every slot's
-    /// <see cref="DriverSlot.Token"/> (a consumer tells placeholders and control tokens apart). Speculation, the device-greedy
-    /// shortcut and end-state retention are off for it; it is refused off the unified runtime.
+    /// <see cref="DriverSlot.Token"/> (a consumer tells placeholders and control tokens apart). Speculation and the
+    /// device-greedy shortcut are off for it; it is refused off the unified runtime. Its end state is retained for a later
+    /// turn only when the driver names its rows' content (<see cref="IOutputMediaDriver"/>).
     /// </para>
     /// The creator owns the driver and disposes it once the request has ended; <see cref="Next"/> after that returns a stop.
     /// </summary>
@@ -69,5 +71,25 @@ namespace TensorSharp.Runtime.Scheduling
         /// <see cref="NextNeedsLogits"/> was true, <paramref name="hidden"/> when <see cref="NextNeedsHidden"/> was).
         /// <paramref name="drawToken"/> draws a text token from the logits with the request's sampler.</summary>
         DriverSlot Next(float[]? logits, float[]? hidden, Func<int> drawToken);
+    }
+
+    /// <summary>
+    /// A step driver whose embedding rows are content a later prompt carries back (LFM3-Omni's speech frames: a spoken turn
+    /// sent back by its audio id is spliced with each frame's row made from its codes). It names the spans its rows occupy
+    /// in the request's output with the content ids the later prompt's multimodal expander gives those same rows, so the
+    /// request's prefix-cache key holds media where it decoded rows rather than the placeholder token: its end state can
+    /// then be retained, and the next turn resume from it. A driven request whose driver is not one is keyed through its
+    /// prompt only and never retained (its rows' content is unknown to the key).
+    /// </summary>
+    public interface IOutputMediaDriver
+    {
+        /// <summary>
+        /// The media spans, in absolute positions (the output starts at <paramref name="outputStart"/>), of the rows among
+        /// <paramref name="output"/>: one span a run of rows. <paramref name="keyedOutput"/> is how many output tokens can be
+        /// keyed: all of them, or (when the output is not <paramref name="complete"/>) up to a run of rows still open at its
+        /// end, whose content is not settled. Null when the driver cannot name them (the output is then not keyed).
+        /// </summary>
+        IReadOnlyList<PromptMediaSpan>? OutputMediaSpans(IReadOnlyList<int> output, int outputStart, bool complete,
+            out int keyedOutput);
     }
 }
