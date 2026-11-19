@@ -533,7 +533,8 @@ sweep。runner 也不会清除它们，所以 runner 自身环境中设置的值
 ggml-cpu 在 ARM64 上的两处空缺由 TensorSharp 自己的乘法补上，没有开关。BF16 权重（ggml-cpu 的 BF16 点积在那里没有
 NEON 实现，走标量循环）被精确展宽为 F32，与原样的 F32 激活相乘（解码 54 vs 12 tok/s）；在 Apple 上，提示宽度的 BF16
 乘法（从 64 行激活起）先把权重展宽，再交给一次 Accelerate `sgemm`，与 llama.cpp 的 BLAS 后端做法相同；两者读取的激活
-都不经舍入（ggml 会把激活舍入为 BF16）。2 行激活及以上的 NVFP4 乘法（支持点积指令的 ARM64）走 TensorSharp 的 GEMM，
+都不经舍入（ggml 会把激活舍入为 BF16）。2 行激活及以上的 NVFP4 乘法（为点积指令编译的 ARM64 构建：Apple silicon Mac、iOS 模拟器，以及经
+`GGML_CPU_ARM_ARCH` 编译的 iOS 真机切片；默认的 ARM64 Linux 或 Windows 构建仍用 ggml 自己的乘法）走 TensorSharp 的 GEMM，
 算术与 ggml 自己的 NVFP4 乘法相同：激活是 ggml-cpu 的 Q8_0 行，每个输出都与 ggml 单行乘法给出的位完全一致，而每个
 权重块每四行只解码一次，而不是每行一次（M5 Pro 上的 LFM3-1.7B NVFP4：128 token 提示 382 -> 972 tok/s，512 token 提示
 612 -> 1,038 tok/s；此前从 256 行起使用对反量化权重的 Accelerate `sgemm`）。

@@ -41,7 +41,8 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
-// The NVFP4 GEMM needs SDOT by lane (ARMv8.2 dot product; every Apple silicon core has it).
+// The NVFP4 GEMM needs SDOT by lane (ARMv8.2 dot product; every Apple silicon core has it). An iOS device target's default
+// CPU lacks it at compile time: CMakeLists.txt compiles this file for GGML_CPU_ARM_ARCH, as ggml-cpu, where a build names it.
 #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD) && defined(__ARM_FEATURE_FMA)
 #define TSG_CPU_NVFP4_SDOT 1
 #endif
