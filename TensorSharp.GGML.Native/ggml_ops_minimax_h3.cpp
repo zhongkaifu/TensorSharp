@@ -214,6 +214,8 @@ static int h3_vit_decode(const TSGgmlMiniMaxH3VideoVaeDecodeDesc* d, int batch)
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<HostBinding> uploads;
+        // Device copies bound below and not yet written: invalidated on any return before the upload.
+        tsg::PendingDeviceCopies pending;
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
             if (t == nullptr || data == nullptr) return;
             // Large weights go through the device buffer cache so a second call
@@ -224,7 +226,7 @@ static int h3_vit_decode(const TSGgmlMiniMaxH3VideoVaeDecodeDesc* d, int batch)
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
                     ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                 {
-                    if (needs) uploads.push_back({ t, data, bytes });
+                    if (needs) { uploads.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(data);
@@ -489,6 +491,7 @@ static int h3_vit_decode(const TSGgmlMiniMaxH3VideoVaeDecodeDesc* d, int batch)
 
         host_read_barrier();
         h3_upload_weights("minimax-h3/video-vae-decode", uploads);
+        pending.commit();
 #if defined(TSG_GGML_USE_CUDA)
         // tsg_cuda_f16_gemm keeps what it derives from a weight by the weight's device
         // address, and only this graph gives it weights. Anything uploaded that is
@@ -595,6 +598,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<HostBinding> uploads;
+        // Device copies bound below and not yet written: invalidated on any return before the upload.
+        tsg::PendingDeviceCopies pending;
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
             if (t == nullptr || data == nullptr) return;
             if (bytes >= 4096)
@@ -603,7 +608,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
                     ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                 {
-                    if (needs) uploads.push_back({ t, data, bytes });
+                    if (needs) { uploads.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(data);
@@ -750,6 +755,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         const std::size_t f = sizeof(float);
         host_read_barrier();
         h3_upload_weights("minimax-h3/text-encode", uploads);
+        pending.commit();
         ggml_backend_tensor_set(x, d->embeddings, 0, static_cast<std::size_t>(hidden) * seq * f);
         if (deepstack != nullptr)
             ggml_backend_tensor_set(deepstack, d->deepstack, 0, ggml_nbytes(deepstack));
@@ -1034,6 +1040,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<HostBinding> uploads;
+        // Device copies bound below and not yet written: invalidated on any return before the upload.
+        tsg::PendingDeviceCopies pending;
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
             if (t == nullptr || data == nullptr) return;
             if (bytes >= 4096)
@@ -1046,7 +1054,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
                        ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS);
                 if (bound)
                 {
-                    if (needs) uploads.push_back({ t, data, bytes });
+                    if (needs) { uploads.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(data);
@@ -1685,6 +1693,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
 
         host_read_barrier();
         h3_upload_weights("minimax-h3/dit-forward", uploads);
+        pending.commit();
 #if defined(TSG_GGML_USE_CUDA)
         // As the video VAE decoder does for tsg_cuda_f16_gemm: the int8 route keeps a
         // weight's merged rows by the device addresses of the weight and its LoRA
@@ -1847,6 +1856,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode(const TSGgmlMiniMaxH3VideoVaeEncod
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<HostBinding> uploads;
+        // Device copies bound below and not yet written: invalidated on any return before the upload.
+        tsg::PendingDeviceCopies pending;
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
             if (t == nullptr || data == nullptr) return;
             if (bytes >= 4096)
@@ -1855,7 +1866,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode(const TSGgmlMiniMaxH3VideoVaeEncod
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
                     ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                 {
-                    if (needs) uploads.push_back({ t, data, bytes });
+                    if (needs) { uploads.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(data);
@@ -1971,6 +1982,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode(const TSGgmlMiniMaxH3VideoVaeEncod
 
         host_read_barrier();
         h3_upload_weights("minimax-h3/video-vae-encode", uploads);
+        pending.commit();
         ggml_backend_tensor_set(img, d->image, 0, ggml_nbytes(img));
 
         if (h3_compute(g_backend, graph, "minimax-h3/video-vae-encode") != GGML_STATUS_SUCCESS)
@@ -2095,6 +2107,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeDecode(const TSGgmlMiniMaxH3AudioVaeDecod
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<HostBinding> uploads;
+        // Device copies bound below and not yet written: invalidated on any return before the upload.
+        tsg::PendingDeviceCopies pending;
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
             if (t == nullptr || data == nullptr) return;
             if (bytes >= 4096)
@@ -2103,7 +2117,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeDecode(const TSGgmlMiniMaxH3AudioVaeDecod
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
                     ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                 {
-                    if (needs) uploads.push_back({ t, data, bytes });
+                    if (needs) { uploads.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(data);
@@ -2283,6 +2297,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeDecode(const TSGgmlMiniMaxH3AudioVaeDecod
 
         host_read_barrier();
         h3_upload_weights("minimax-h3/audio-vae-decode", uploads);
+        pending.commit();
         ggml_backend_tensor_set(z, d->latent, 0, ggml_nbytes(z));
 
         if (h3_compute(g_backend, graph, "minimax-h3/audio-vae-decode") != GGML_STATUS_SUCCESS)
@@ -2398,6 +2413,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<HostBinding> uploads;
+        // Device copies bound below and not yet written: invalidated on any return before the upload.
+        tsg::PendingDeviceCopies pending;
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
             if (t == nullptr || data == nullptr) return;
             if (bytes >= 4096)
@@ -2406,7 +2423,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
                     ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                 {
-                    if (needs) uploads.push_back({ t, data, bytes });
+                    if (needs) { uploads.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(data);
@@ -2605,6 +2622,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
 
         host_read_barrier();
         h3_upload_weights("minimax-h3/vision-encode", uploads);
+        pending.commit();
         ggml_backend_tensor_set(patches, d->patches, 0, ggml_nbytes(patches));
         ggml_backend_tensor_set(posEmbed, d->pos_embed, 0, ggml_nbytes(posEmbed));
         ggml_backend_tensor_set(cosf, d->cosf, 0, ggml_nbytes(cosf));
@@ -2739,6 +2757,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeEncode(const TSGgmlMiniMaxH3AudioVaeEncod
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<HostBinding> uploads;
+        // Device copies bound below and not yet written: invalidated on any return before the upload.
+        tsg::PendingDeviceCopies pending;
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
             if (t == nullptr || data == nullptr) return;
             if (bytes >= 4096)
@@ -2747,7 +2767,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeEncode(const TSGgmlMiniMaxH3AudioVaeEncod
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
                     ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                 {
-                    if (needs) uploads.push_back({ t, data, bytes });
+                    if (needs) { uploads.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(data);
@@ -2933,6 +2953,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeEncode(const TSGgmlMiniMaxH3AudioVaeEncod
 
         host_read_barrier();
         h3_upload_weights("minimax-h3/audio-vae-encode", uploads);
+        pending.commit();
         ggml_backend_tensor_set(wave, d->wave, 0, ggml_nbytes(wave));
         ggml_backend_tensor_set(mask, maskData.data(), 0, ggml_nbytes(mask));
 
@@ -3102,6 +3123,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode3D(const TSGgmlMiniMaxH3VideoVaeEnc
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<HostBinding> uploads;
+        // Device copies bound below and not yet written: invalidated on any return before the upload.
+        tsg::PendingDeviceCopies pending;
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
             if (t == nullptr || data == nullptr) return;
             if (bytes >= 4096)
@@ -3110,7 +3133,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode3D(const TSGgmlMiniMaxH3VideoVaeEnc
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
                     ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                 {
-                    if (needs) uploads.push_back({ t, data, bytes });
+                    if (needs) { uploads.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(data);
@@ -3266,6 +3289,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode3D(const TSGgmlMiniMaxH3VideoVaeEnc
             }
             host_read_barrier();
             h3_upload_weights("minimax-h3/video-vae-encode-3d-probe", uploads);
+            pending.commit();
             ggml_backend_tensor_set(video, d->video, 0, ggml_nbytes(video));
             if (tsg::compute_graph(g_backend, pg) != GGML_STATUS_SUCCESS)
             { set_last_error("MiniMaxH3VideoVaeEncode3D: probe compute failed."); return 0; }
@@ -3336,6 +3360,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode3D(const TSGgmlMiniMaxH3VideoVaeEnc
 
         host_read_barrier();
         h3_upload_weights("minimax-h3/video-vae-encode-3d", uploads);
+        pending.commit();
         ggml_backend_tensor_set(video, d->video, 0, ggml_nbytes(video));
 
         if (h3_compute(g_backend, graph, "minimax-h3/video-vae-encode-3d") != GGML_STATUS_SUCCESS)

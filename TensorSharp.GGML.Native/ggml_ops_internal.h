@@ -1858,6 +1858,43 @@ namespace tsg
     // must invalidate downstream state keyed on that buffer use the result to skip
     // the work when the pointer had no device copy to begin with.
     bool invalidate_cached_buffer(void* data);
+
+    // The device copies an entry point has bound but not yet written. try_get_cacheable_tensor_buffer (and
+    // try_bind_cached_tensor over it) publishes a new device copy, marked initialised, BEFORE any byte reaches it
+    // (out_needs_upload): a later bind of the same host bytes is a cache hit that uploads nothing. An entry point that
+    // queues its uploads for after the graph is allocated, and then returns early (a failed compute allocation, an
+    // unsupported op, an exception), would leave those copies holding uninitialised device memory that every later
+    // graph reads as the weights: measured on MiniMax-H3, one request that failed for VRAM turned every later picture
+    // of the same server into noise. Such an entry point records each key it must still fill (`add`) and calls
+    // `commit` once the uploads are written; on any other way out the destructor invalidates them, so the next bind
+    // allocates and uploads afresh.
+    class PendingDeviceCopies
+    {
+    public:
+        PendingDeviceCopies() = default;
+        PendingDeviceCopies(const PendingDeviceCopies&) = delete;
+        PendingDeviceCopies& operator=(const PendingDeviceCopies&) = delete;
+        ~PendingDeviceCopies() { abandon(); }
+
+        void add(void* key) { if (key != nullptr) keys_.push_back(key); }
+        // The uploads are written: the copies hold the weights from here on.
+        void commit() noexcept { keys_.clear(); }
+        std::size_t size() const noexcept { return keys_.size(); }
+        // Drop every copy still unwritten (the destructor does this on an early return or an exception).
+        void abandon() noexcept
+        {
+            for (void* key : keys_)
+            {
+                try { invalidate_cached_buffer(key); }
+                catch (...) {}
+            }
+            keys_.clear();
+        }
+
+    private:
+        std::vector<void*> keys_;
+    };
+
     // The cached-buffer epoch (ggml_ops_core.cpp): it moves when a path frees or replaces a cached device/host-pointer
     // buffer that a persisted graph holds (key registered through PersistedBindings), or on a bulk clear (key null).
     std::uint64_t cached_buffer_epoch();
