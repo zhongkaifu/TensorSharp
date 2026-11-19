@@ -322,6 +322,17 @@ TTS（GGUF 的 `tokenizer.chat_template.tts`，在语音结束帧停止）。对
 加上 llama.cpp 的 realtime 句子（“Speak in English using a female voice.”），交错回复再加上模型卡的
 “Respond with interleaved text and audio.”。
 
+**语言。** LFM3-Omni 的交错模式与纯语音模式只会说英语（LFM3-Audio 的模型卡也说其语音对话只支持英语）：无论系统提示
+怎么写，这两种模式下的中文回复都按英语的发音读出，而只用模型卡的交错提示时，模型会用英语回答中文问题（测量见下文）。
+它的 TTS 提示能说全部 19 种语音语言。因此语音回复的语言取请求中的语言（`/api/chat` 的 `speech.language`，chat
+completions 与 Responses 的 `audio.language`，CLI 的 `--language`），否则取用户最近一条消息所用的语言，按文字判断（汉字
+`zh`，假名 `ja`，谚文 `ko`，以及阿拉伯文、希伯来文、希腊文；拉丁字母则用默认的英语）。英文回复如上在回复本身中说出。
+其他语言的回复按普通文本回复生成（系统提示中不加语音句：即文本请求得到的回复），每句话一完成就由 TTS 提示用该句的语言
+说出，与仍在生成的文本在引擎上同批运行（`TensorSharp.Models.Audio.SpeechReplyPath.Synthesized`）。文本即语音的转写；
+markdown 标记、表情符号与围栏代码不会朗读；第一段在满 8 个字符后的逗号处结束，使语音尽早开始。未指定语言的 TTS
+（`/v1/audio/speech`、`--tts`）说文本所用的语言（拉丁字母为模板默认的美式英语），中文文本在交给 TTS 提示前先把数字读出来
+（`2024年10月1日` 读作 `二零二四年十月一日`，`199元` 读作 `一百九十九元`），否则模型会把数字说成噪声。
+
 LFM3-Omni 的文本回复永不采样媒体占位符（`<|audio|>`、`<|audio_out|>`、`<|image|>`、`<|video|>`），纯文本回复也不会开启
 语音（禁止 `<|audio_start|>`、`<|mixed_start|>`），与 HF 的 `generate` 一致；llama.cpp 在普通对话中两者都不抑制。（有被抑制
 token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用直接 CUDA 的设备端贪心选择。）
@@ -336,10 +347,19 @@ token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用�
 - 可懂度（通过 llama.cpp 运行 LFM3-Omni 自身的 ASR，`eng/lfm3/speech-asr.py`）：5 段文本（美式英语、英式英语、法语、
   中文）x 5 个种子，TensorSharp 的 WER/CER 为 0.00%（25 段中 25 段完全正确），llama-tts 为 1.38%（25 段中 22 段）。
 - 交错回复：每条英文回复的语音经 ASR 后与其转写一致（6/6，WER 0%），与用同样方式驱动的 llama.cpp realtime 路径相同
-  （`eng/lfm3/speech-chat-ref.cpp`）。两个引擎的中文交错语音都不可懂（模型的限制；中文 TTS 是可懂的）。
+  （`eng/lfm3/speech-chat-ref.cpp`）。两个引擎的中文交错语音听起来都是英语（模型的限制；中文 TTS 正常），因此有上文的“语言”规则。
+- 中文回复（2026-11-19，Q4_K_M + Q8_0 mmproj，ggml-metal；`eng/lfm3/speech-lang-eval.py` 与 `speech-whisper.py`，以 Whisper
+  medium 作独立评判）：llama.cpp 的 realtime 路径在六种系统提示下（无、模型卡的、“Speak in Chinese ...”、“Perform TTS in
+  Chinese ...”、中文指令、音色句），23 条中文文本回复中只有 1 条被 Whisper 听作中文；只用模型卡的提示时，它用英语回答中文
+  问题（5/5）。按网页聊天的方式经 `/api/chat` 发送 12 个中文提示 x 2 种音色：修改前为交错回复，24 条中 1 条听作中文（语音对
+  其转写的 CER 为 102%）；改为由文本回复说出后 24/24（CER 10.7%，中位数 3.8%；LFM3 自身 ASR 为 18.3%）；chat completions
+  12/12（8.3%），带 `audio.language: "zh"` 时 12/12（8.8%，修改前 0/12）。语音回复的文本即文本回复（24/24），与 llama-server
+  的贪心回复有 20/24 相同；39 个请求的提示 token 与 llama-server、HF 均相同。英文回复不变（12/12，WER 0-0.4%）。中文回复的
+  首段音频中位数 136 ms（p90 196 ms），英文为 66 ms；实时倍率 9.2x。12 段中文文本 x 2 种音色 x 3 个种子、不指定语言的
+  TTS：CER 修改前 18.6%（“American English”，72 段中 70 段听作中文），现为 5.0%（72/72；含数字的文本 39.0% -> 2.0%）。
 - 纯语音回复（`modalities ["audio"]`，与 llama.cpp realtime 的 AUDIO 模式一样以 `<|audio_start|>` 开始）：LFM3-Omni
   会把用户的消息朗读出来而不是回答，TensorSharp 与 llama.cpp 相同（8/8 个问题，ASR 结果即问题本身）；没有音色句时语音不可懂。
-  需要语音回答时请用 `["text","audio"]`。
+  需要英文语音回答时请用 `["text","audio"]`；其他语言的回复在两种模态下都由其文本说出（见“语言”）。
 - TTS 回复说话期间处理的文本请求保持其贪心回复不变；引擎上的 TTS 与独立合成逐位相同。
 - 速度（流式 `/v1/audio/speech`，同一客户端交替请求 TensorSharp 与 llama-server，在共享且高负载的 Mac 上）：Metal 上两者持平——
   首段音频 88-114 ms 对 119-141 ms，实时倍率 1.83x 对 1.38-1.92x（负载 36-95；空闲机器上两者都快 3-5 倍）。纯语音步骤跳过 LM
@@ -356,7 +376,8 @@ token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用�
 在 LFM3-Omni Q8_0 + Q8_0 mmproj 上检查（ggml-metal 服务器，网页聊天，三个语音回合）：第 2 回合的 111 个提示 token 中复用了
 84 个（即第 1 回合的全部：提示、`<|mixed_start|>` 与它计算过的 40 个槽位），第 3 回合 179 个中复用 156 个，且第 3 回合
 依据语音回合作答（“I named Paris first.”）。语音回合的系统提示写明了声音并要求交错回复，因此语音回合之后的文本回合
-（或反过来）从系统消息起就不同，需要重新预填。
+（或反过来）从系统消息起就不同，需要重新预填。由文本说出的回复（英语以外的语言）不在系统提示中添加任何内容：它作为
+文本回合被保留和复用，下一回合无论是哪一种都能复用。
 
 限制：没有 `/v1/realtime`。在 CUDA 上，语音输出通过 ASR 往返检查（无词错误），而不是与 llama-tts 逐位比对。
 
