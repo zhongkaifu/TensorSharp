@@ -11,9 +11,10 @@
   //   TensorSharp.Cli         --config config/lfm3-omni-2b.json --image photo.png --input prompt.txt
   //   TensorSharp.Server.Host --config config/lfm3-omni-2b.json
   // Omni is not a reasoning model (its template defaults enable_thinking to false). Text
-  // chat works without the projector; image, video and audio input need it, and speech
-  // output is not served yet (see docs/models/lfm3.md). The GGUF declares a 128,000-token
-  // window; MAX_CONTEXT (environment) bounds it.
+  // chat works without the projector; image, video and audio input need it, and so do spoken
+  // replies (/v1/audio/speech, and chat completions or Responses asking for audio; see
+  // docs/models/lfm3.md#speech-output). The GGUF declares a 128,000-token window;
+  // MAX_CONTEXT (environment) bounds it.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "root": "${modelRoot}/lfm3"
