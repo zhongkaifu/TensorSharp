@@ -210,6 +210,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GptOssResetDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphAlias" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphCensus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphCreate" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphCreateTp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphEffect" SymbolType="Function" />
@@ -225,6 +226,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GraphRun" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphRunRanked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphShape" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GreedyFullRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostAvailableMemoryBytes" SymbolType="Function" />
