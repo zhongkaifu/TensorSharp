@@ -7,7 +7,10 @@ namespace InferenceWeb.Tests;
 /// The ARM64 (AdvSimd + DotProd) bodies of the managed quantized kernels (ManagedQuantizedOps.Arm.cs) against the
 /// scalar loops they replace, BIT FOR BIT: they may only change how fast the managed CPU backend runs on ARM64,
 /// never what it computes. Skipped on hosts without the ARM64 dot-product extension.
+/// The pool-width cases narrow the process-wide shared pool (CpuWorkerPool.Shared.SetActiveThreads), which every
+/// managed graph step also sets, so the class runs alone with the other tests that flip process-wide CPU state.
 /// </summary>
+[Collection("CPU kernel selection")]
 public class ManagedQuantArmTests
 {
     public static IEnumerable<object[]> DotCases()
