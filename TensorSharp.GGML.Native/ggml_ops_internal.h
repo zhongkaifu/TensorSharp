@@ -46,6 +46,7 @@
 #include "ggml_ops_flash_attn_guard.h"
 #include "ggml_ops_bonsai.h"
 #include "ggml_ops_host_read_gate.h"
+#include "ggml_ops_cpu_graph.h"
 
 #if defined(_WIN32)
 #define TSG_EXPORT extern "C" __declspec(dllexport)
@@ -488,6 +489,8 @@ namespace tsg
     // TSGgml_RecreateBackend exists for, and it is the only thing that clears this.
     inline ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph* graph)
     {
+        // ggml-cpu: a compute outside the graph runtime runs on the thread pool for its products' width.
+        if (g_backend_type == BACKEND_TYPE_CPU) cpu_pools_select_for(backend, graph);
         const std::uint64_t before = g_ggml_error_count.load(std::memory_order_acquire);
         const ggml_status status = ggml_backend_graph_compute(backend, graph);
         if (g_ggml_error_count.load(std::memory_order_acquire) != before)

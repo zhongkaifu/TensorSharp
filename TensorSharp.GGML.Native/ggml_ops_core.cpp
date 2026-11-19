@@ -3233,6 +3233,18 @@ TSG_EXPORT const char* TSGgml_GetLastError()
     return g_last_error.c_str();
 }
 
+// The width of the thread pool ggml_cpu's next compute runs on (ggml_ops_cpu_graph.h), 0 on any other backend.
+TSG_EXPORT int TSGgml_CpuPoolThreads()
+{
+    return g_backend_type == BACKEND_TYPE_CPU && g_backend != nullptr ? tsg::cpu_pool_threads(g_backend) : 0;
+}
+
+// Whether ggml_cpu copies the quantized weights products read into ggml-cpu's repacked layouts (TS_GGML_CPU_REPACK).
+TSG_EXPORT int TSGgml_CpuRepacksWeights()
+{
+    return tsg::cpu_repack_enabled() ? 1 : 0;
+}
+
 // Whether a GPU command buffer has failed at any point in this process, together
 // with what ggml said about it. Latched by sync_backend() (ggml_ops_internal.h)
 // rather than reported by the op that hit it, because the op that drains a dead

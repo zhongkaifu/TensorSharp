@@ -52,8 +52,9 @@ namespace tsg
 
     /// w · x for a weight ggml-cpu has no fast kernel for on this CPU, as TensorSharp's product (a GGML_OP_CUSTOM node
     /// over the graph's thread pool, ggml_ops_cpu_products.cpp), or null to keep ggml's MUL_MAT. ARM64: BF16 weights
-    /// (ggml-cpu's BF16 dot is scalar there) at any width, and on Apple BF16 and NVFP4 weights of prompt width through
-    /// Accelerate's sgemm. F32 activations unrounded; w a 2-D weight or a row block of one.
+    /// (ggml-cpu's BF16 dot is scalar there) at any width, through Accelerate's sgemm at prompt width on Apple, over F32
+    /// activations unrounded; NVFP4 weights from two activation rows, as a GEMM over ggml's own Q8_0 activation rows that
+    /// gives every row the bits ggml's product gives it. w a 2-D weight or a row block of one.
     ggml_tensor* cpu_weight_product(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x);
 
     /// Creates the CPU backend's thread pools (the prompt pool always; a decode pool when its width differs) and sets
@@ -61,10 +62,32 @@ namespace tsg
     void cpu_pools_create(ggml_backend_t backend, std::vector<ggml_threadpool_t>& owned);
 
     /// Runs the next graph on the pool for its width (cpu_pool_for_step): `product_rows` is the most activation rows any
-    /// weight product of the graph reads (0 when it has none). Only the graph runtime (TSGgml_GraphRun) selects a pool:
-    /// every other ggml compute on the CPU backend runs on the pool the last graph step left set (the prompt pool until
-    /// a decode step runs).
+    /// weight product of the graph reads (0 when it has none). The graph runtime (TSGgml_GraphRun) selects from its weight
+    /// products; the ggml computes outside it that go through tsg::compute_graph select from their products'
+    /// (cpu_pools_select_for).
     void cpu_pools_select(ggml_backend_t backend, std::int64_t product_rows);
+
+    /// A compute outside the graph runtime (a per-op graph through tsg::compute_graph): the pool for the most activation
+    /// rows any of its products (MUL_MAT, MUL_MAT_ID) reads, as cpu_pools_select; a graph without products keeps the pool
+    /// it finds, so the small per-op graphs between decode steps never pause the decode pool. A no-op inside the graph
+    /// runtime's own computes (CpuGraphRuntimeScope), which selected their pool from their weight products.
+    void cpu_pools_select_for(ggml_backend_t backend, const ggml_cgraph* graph);
+
+    /// Marks this thread's computes as the graph runtime's for its lifetime (see cpu_pools_select_for).
+    class CpuGraphRuntimeScope
+    {
+    public:
+        CpuGraphRuntimeScope();
+        ~CpuGraphRuntimeScope();
+        CpuGraphRuntimeScope(const CpuGraphRuntimeScope&) = delete;
+        CpuGraphRuntimeScope& operator=(const CpuGraphRuntimeScope&) = delete;
+
+    private:
+        bool was_ = false;
+    };
+
+    /// The width of the pool the backend's next compute runs on (0 when it has no TensorSharp pools).
+    int cpu_pool_threads(ggml_backend_t backend);
 
     /// Forgets every backend's pools (before TSGgml_Shutdown frees them).
     void cpu_pools_forget_all();

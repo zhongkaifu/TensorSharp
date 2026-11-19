@@ -59,7 +59,8 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   unique first line per request), 256 output tokens (`ignore_eos`, greedy, no repetition penalty, thinking off; the
   TensorSharp server runs with `--sampling-precedence request`, so a `--config`'s model-card sampling does not override
   the request's greedy settings). TTFT p50/p95, per-request decode tok/s, aggregate tok/s and the server's peak physical
-  footprint (`footprint`, Metal buffers included; mapped weights are clean pages and not in it). llama-server runs
+  footprint (`footprint`, Metal buffers included; mapped weights are clean pages and not in it) and peak resident set
+  size (`ps -o rss`, which counts those mapped pages too). llama-server runs
   `-np C` with continuous batching, TensorSharp its scheduler with `TS_SCHED_MAX_RUNNING_SEQS=C`. CPU runs:
   `--backend ggml_cpu|cpu` (llama-server gets `-ngl 0`), `--threads N` (llama-server `-t N -tb N`, TensorSharp as
   `ts-bench.sh --threads`), `--tag` to name each run's rows and files, `--waves` for fewer requests per level on a slow

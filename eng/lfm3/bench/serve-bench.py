@@ -6,7 +6,8 @@ a time, each a distinct prompt of P tokens (a unique first line, so no prefix ca
 exactly --gen tokens (ignore_eos, greedy, no repetition penalty, thinking off). It reports TTFT p50/p95 (request sent -> first streamed token,
 content or reasoning), per-request decode tok/s ((tokens - 1) / (last token - first token)), aggregate output tok/s
 (all output tokens / the level's wall time) and the server process's peak physical footprint (`footprint`, which counts
-Metal buffers) sampled every 0.25 s.
+Metal buffers) and peak resident set size (`ps -o rss`: the footprint plus the clean pages of mapped files, such as
+weights a server reads from their mapping) sampled every 0.25 s.
 
 The servers are started and stopped by this script (one process per engine per concurrency, warmed by two requests):
   serve-bench.py --engine ts    --model MODEL.gguf [--config config/lfm3-1.7b.json] ...
@@ -80,14 +81,24 @@ def footprint_bytes(pid):
     return float(m.group(1)) * {"KB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30}[m.group(2)]
 
 
+def rss_bytes(pid):
+    """Resident set size: the footprint plus the clean pages of mapped files (weights read from their mapping)."""
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout
+        return int(out.strip()) * 1024
+    except Exception:
+        return 0
+
+
 class Sampler(threading.Thread):
     def __init__(self, pid):
         super().__init__(daemon=True)
-        self.pid, self.peak, self.stop = pid, 0, False
+        self.pid, self.peak, self.peak_rss, self.stop = pid, 0, 0, False
 
     def run(self):
         while not self.stop:
             self.peak = max(self.peak, footprint_bytes(self.pid))
+            self.peak_rss = max(self.peak_rss, rss_bytes(self.pid))
             time.sleep(0.25)
 
 
@@ -290,7 +301,7 @@ def main():
                     "ttft_p50_ms": 1000 * pct(ttft, 0.5), "ttft_p95_ms": 1000 * pct(ttft, 0.95),
                     "decode_tok_s_p50": pct(rates, 0.5), "decode_tok_s_min": min(rates) if rates else float("nan"),
                     "aggregate_tok_s": tokens / wall, "output_tokens": tokens, "wall_s": wall,
-                    "peak_footprint_gb": sampler.peak / (1 << 30),
+                    "peak_footprint_gb": sampler.peak / (1 << 30), "peak_rss_gb": sampler.peak_rss / (1 << 30),
                     "short": sum(1 for r in out if r["tokens"] < args.gen),
                 }
                 results.append(row)
@@ -305,11 +316,12 @@ def main():
     with open(os.path.join(args.out, f"{tag}-results.jsonl"), "a") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
-    print("| engine | C | prompt | TTFT p50 ms | TTFT p95 ms | decode tok/s/req p50 | aggregate tok/s | peak GB | short |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    print("| engine | C | prompt | TTFT p50 ms | TTFT p95 ms | decode tok/s/req p50 | aggregate tok/s | peak footprint GB | peak RSS GB | short |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
         print(f"| {r['engine']} | {r['concurrency']} | {r['prompt']} | {r['ttft_p50_ms']:.0f} | {r['ttft_p95_ms']:.0f} | "
-              f"{r['decode_tok_s_p50']:.1f} | {r['aggregate_tok_s']:.1f} | {r['peak_footprint_gb']:.2f} | {r['short']} |")
+              f"{r['decode_tok_s_p50']:.1f} | {r['aggregate_tok_s']:.1f} | {r['peak_footprint_gb']:.2f} | "
+              f"{r['peak_rss_gb']:.2f} | {r['short']} |")
 
 
 if __name__ == "__main__":

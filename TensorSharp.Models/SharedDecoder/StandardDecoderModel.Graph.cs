@@ -2247,12 +2247,15 @@ namespace TensorSharp.Models
             // rows) and one sequence's values to the cache writes (set_rows reads any strides): no copies of every prompt
             // chunk's q, k and v. Elsewhere, and for what the prep leaves a view, contiguous copies.
             bool blocks = GraphExecutor.Capabilities.PackedProductBlocks && !prep;
+            // A prompt chunk's fresh rows as their permuted views (GraphCapabilities.FreshRowViews): written by index, attended
+            // where they lie.
+            bool freshViews = caps.FreshRowViews && _graphTpRanks == null;
             if (!blocks)
             {
                 q = step.Cont(q);
                 k = step.Cont(k);
             }
-            if (!blocks || step.Sequences > 1 || !Indexed(step.Counts[0]) || _graphTpRanks != null) v = step.Cont(v);
+            if (!blocks || step.Sequences > 1 || !(Indexed(step.Counts[0]) || freshViews) || _graphTpRanks != null) v = step.Cont(v);
             EmitQueryKey(step, layer, ref q, ref k);
             q = step.Cont(q);
             k = step.Cont(k);
@@ -2276,14 +2279,16 @@ namespace TensorSharp.Models
                 // from the permuted view (set_rows reads rows at any strides: no copy of every prompt chunk's K and V, 22 of a
                 // LFM3 prompt step's 471 Metal dispatches); a chunk that attends its own rows, and the tensor-parallel ranks'
                 // writes (ggml's meta device splits set_rows by KV head), take them contiguous.
-                bool indexedRows = Indexed(count) && _graphTpRanks == null;
+                // A chunk that attends its own rows reads them from the views too where the executor takes them so
+                // (FreshRowViews; not past a ring's first lap, whose runs address the rows' contiguous copies).
+                bool wrapped = RingWrapped(layer, start, count);
+                bool indexedRows = (Indexed(count) || (freshViews && !wrapped)) && _graphTpRanks == null;
                 int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : indexedRows ? step.Permute(ks, 0, 2, 1, 3) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
                 int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : indexedRows ? step.Permute(vs, 0, 2, 1, 3) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
 
                 // The layer's cells: a sliding-window layer's ring (StandardDecoderModel.SlidingRings.cs) holds at most its own.
                 int cap = CacheCells(layer, slot.Capacity);
                 int ring = RingOf(layer);
-                bool wrapped = RingWrapped(layer, start, count);
                 int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cap, kvHeads);
                 int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cap, kvHeads);
 
@@ -2378,8 +2383,18 @@ namespace TensorSharp.Models
                 {
                     // A prompt chunk is written at its offset and attends to the cached prefix and
                     // its own fresh rows (F32), as the fused prefill graphs do.
-                    step.Effect(step.Op(GraphOp.Cpy, kFresh, step.View3(ck, d, count, kvHeads, kRow, kRow * cap, start * kRow)));
-                    step.Effect(step.Op(GraphOp.Cpy, vFresh, step.View3(cv, dv, count, kvHeads, vRow, vRow * cap, start * vRow)));
+                    if (freshViews)
+                    {
+                        // From the permuted views, by index (set_rows converts a row at a time).
+                        int rowsAt = step.WriteRows(start, count, s);
+                        step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, rowsAt));
+                        step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, rowsAt));
+                    }
+                    else
+                    {
+                        step.Effect(step.Op(GraphOp.Cpy, kFresh, step.View3(ck, d, count, kvHeads, kRow, kRow * cap, start * kRow)));
+                        step.Effect(step.Op(GraphOp.Cpy, vFresh, step.View3(cv, dv, count, kvHeads, vRow, vRow * cap, start * vRow)));
+                    }
                     int kAttn = kFresh, vAttn = vFresh;
                     // A sliding-window layer's chunk attends the cached rows its first row's window reaches, not the whole prefix.
                     int first = band > 0 ? Math.Max(0, start - band + 1) : 0;

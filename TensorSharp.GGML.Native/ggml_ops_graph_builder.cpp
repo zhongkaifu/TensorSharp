@@ -1643,6 +1643,8 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         host_read_barrier();
         upload_run_inputs(g, inputs, input_data, input_bytes, ninputs);
         if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU) tsg::cpu_pools_select(g_backend, g->product_rows);
+        // Its computes (segments, profiled nodes) keep that pool (tsg::compute_graph would pick one per segment).
+        tsg::CpuGraphRuntimeScope runtime;
 
         // Enqueue the graph and the downloads back to back, then synchronize once (as llama.cpp's
         // scheduler does): a synchronous compute followed by a download is a second command-buffer
