@@ -130,6 +130,9 @@ public sealed class CudaQ8KvCacheTests
     [InlineData("verify", 256, 24, 4, 3, 2100, 0)]             // a short chunk's rows on the prefill kernel
     [InlineData("prompt", 256, 24, 4, 130, 1100, 0)]           // a prompt chunk on the prompt kernel
     [InlineData("prompt", 128, 16, 2, 300, 300, 40)]
+    [InlineData("prompt2", 256, 24, 4, 130, 1100, 0)]          // a prompt chunk on the prompt kernel with F32 accumulation
+    [InlineData("prompt2", 128, 16, 2, 300, 300, 40)]
+    [InlineData("prompt2-tail", 256, 24, 4, 300, 2100, 0)]     // its last wave's tiles split over the keys
     [InlineData("selection", 256, 16, 2, 4, 3000, 0)]          // each row's own cells of a selection
     public void Q8CacheEqualsF16KernelOverDequantizedCache(string mode, int d, int heads, int kvHeads, int rows, int len, int floor)
     {
@@ -183,6 +186,13 @@ public sealed class CudaQ8KvCacheTests
                 _ => flash.Splits(nq * group, kvHeads, len),
             };
             using Tensor partial = splits > 1 ? new Tensor(allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
+            // The prompt kernel with F32 accumulation: its own grid (prompt2-tail: as on a device of 23 SMs, whose last wave's tiles split).
+            var plan = mode == "prompt2-tail" ? CudaFlashPrefillKernels.PromptPlan(nq * group, kvHeads, len - nq + 1 - floor, 23)
+                : flash.PromptPlan(nq * group, kvHeads, len - nq + 1 - floor);
+            if (mode == "prompt2-tail") Assert.True(plan.TailSplits > 1, $"{plan}");
+            long promptFloats = CudaFlashPrefillKernels.PromptPartialFloats(nq * group, kvHeads, d, plan);
+            using Tensor promptPartial = promptFloats > 0 ? new Tensor(allocator, DType.Float32, promptFloats) : null;
+            if (promptPartial != null) ((CudaStorage)promptPartial.Storage).EnsureDeviceCurrent();
             foreach (Tensor t in new[] { q, k32, v32, k16, v16, mt, dyn, cells, count, outF16, outQ8 })
                 ((CudaStorage)t.Storage).EnsureDeviceCurrent();
             IntPtr stream = allocator.Stream.Handle, none = IntPtr.Zero, part = partial == null ? none : P(partial);
@@ -222,6 +232,11 @@ public sealed class CudaQ8KvCacheTests
                     case "selection":
                         flash.LaunchDecodeRows(P(q), P(k), P(v), cap, rows, len, 0, heads, kvHeads, d, scale, splits, part, P(output), stream, none,
                             P(cells), P(count), P(mt), len, q8: q8);
+                        break;
+                    case "prompt2":
+                    case "prompt2-tail":
+                        flash.LaunchPromptAttention(P(q), P(k), P(v), cap, nq, len, floor, heads, kvHeads, d, scale, plan,
+                            plan.TailSplits > 1 ? P(promptPartial) : none, P(output), stream, q8: q8);
                         break;
                     default:   // "verify", "prompt"
                         flash.LaunchAttention(P(q), P(k), P(v), cap, nq, len, floor, heads, kvHeads, d, scale, splits, part, P(output), stream,

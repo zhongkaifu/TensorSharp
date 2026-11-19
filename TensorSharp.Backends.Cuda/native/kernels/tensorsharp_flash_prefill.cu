@@ -44,7 +44,7 @@
 // probabilities. Off by default (CudaGraphExecutor.PromptAttention8Enabled).
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 12
+#define TS_FLASH_PREFILL_VERSION 13
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -1263,3 +1263,434 @@ TS_FP_ATTN_ROWS(ts_flash_decode_rows_q8_d128, 128, uint8_t, true)
 TS_FP_ATTN_ROWS(ts_flash_decode_rows_q8_d256, 256, uint8_t, true)
 TS_FP_ATTN_WINDOW(ts_flash_decode_window_q8_d128, 128, uint8_t, true)
 TS_FP_ATTN_WINDOW(ts_flash_decode_window_q8_d256, 256, uint8_t, true)
+
+// ---------------------------------------------------------------------------
+// Prompt attention with F32 accumulation (ts_flash_prompt2_*), for a prompt chunk's rows: the
+// operands of ts_flash_prompt_f16_d<hd> (q [heads][nq][HD] F32, the head-first caches, out [nq][heads][HD] F32, query t
+// seeing keys [floor, len - nq + t]), the same GQA-packed 128-row tiles of 8 warps x 16 rows and 32-key K and V tiles in two
+// cp.async stages, with every tensor-core product accumulated in F32 inside the MMA:
+//   - S = Q K^T over all HD dims in one F32 chain an n-tile (Q in F16 pre-scaled to log2 units, K in F16);
+//   - P = 2^(S - m) in F32 (the online softmax in base 2, its maximum and sums in F32; ex2.approx.ftz), rounded to F16 for the
+//     product, the row sum taken over those rounded values, the weights the product applies (a constant V comes out as itself);
+//   - each 32-key tile's P V in F32 from zero inside the MMA, then added to the F32 accumulators in one rounding (fmaf with the
+//     tile's rescale). The tensor core's F32 sums truncate, so a chain through the accumulators over a long window would drift
+//     with its length (a V channel offset by 30 over 20,000 keys: 1.2e-4 relative; flushed each tile: 1.4e-6).
+// ts_fp_attn rounds each 16-dim step of Q K^T and each 32-key run of P V to F16 before an F32 add (816 of a 32-key tile's 1,833
+// instructions a warp on sm_120a, the widening); here the same F16 inputs give a smaller error against an exact reference, other
+// bits than ts_flash_prompt_f16_d<hd>'s. F32 accumulation runs at the F16-accumulation rate on the sm_120 workstation parts (RTX
+// PRO 4500 Blackwell: 236 TFLOP/s either way). A warp masks only the tiles that straddle one of its rows' ends or the floor.
+// Grid (1-D): the nKv * T row tiles (T = ceil(nq * G / 128) a KV head), tile i of KV head i % nKv and row tile T - 1 - i / nKv
+// (the heaviest first); the first fullTiles of them a block each, every later one (the last wave's: a part-filled wave idles
+// most of the device) tailSplits blocks, each a 32-key-aligned share of its rows' keys writing unnormalized partials
+// [tail tile][128 rows][tailSplits][HD + 2] (acc, ln-domain max, sum) that ts_flash_prompt2_combine_f32 merges.
+// Launch: fullTiles + (nKv * T - fullTiles) * tailSplits blocks of 256, the dynamic shared memory of ts_flash_prompt_f16_d<hd>
+// (ts_flash_prompt2_q8_d<hd>: that of ts_flash_prompt_q8_d<hd>). The _q8 kernels: the q8_0 tile loader and dequant stage of
+// ts_fp_attn's Q8, the same arithmetic on the values RN_F16(code * d) (bit for bit the F16 kernel over an F16 cache of them).
+// sm_80+ (cp.async, ldmatrix, mma.f32.f16): the compute_75 image traps here.
+// ---------------------------------------------------------------------------
+
+// m16n8k16 with F32 accumulation (D = C + A B).
+__device__ __forceinline__ void ts_fp_mma_f32(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
+}
+
+// Row tile `tile` of the prompt2 grid: its KV head and first GQA-packed row (T row tiles a KV head, the heaviest first).
+__device__ __forceinline__ void ts_fp2_tile(int tile, int T, int nKv, int& kvh, int& rowBase)
+{
+    kvh = tile % nKv;
+    rowBase = (T - 1 - tile / nKv) * TS_FP_ROWS;
+}
+
+template <int HD, bool Q8>
+__device__ __forceinline__ void ts_fp_prompt2(
+    const float* __restrict__ q, const typename TsFpSmemOf<HD, Q8>::Cache* __restrict__ kc,
+    const typename TsFpSmemOf<HD, Q8>::Cache* __restrict__ vc, int cap, int nq, int len, int floor, int nHead, int nKv, float scale,
+    int fullTiles, int tailSplits, float* __restrict__ partial, float* __restrict__ out)
+{
+    typedef typename TsFpSmemOf<HD, Q8>::T Smem;
+    typedef typename TsFpSmemOf<HD, Q8>::Cache Cache;
+    constexpr int ROW = Smem::ROW, KS = HD / 16, NS = HD / 8;
+    extern __shared__ __align__(16) uint8_t ts_fp_attn_smem[];
+    Smem& sm = *reinterpret_cast<Smem*>(ts_fp_attn_smem);
+    const int G = nHead / nKv;
+    const int R = nq * G;
+    const int T = (R + TS_FP_ROWS - 1) / TS_FP_ROWS;
+    // This block's row tile and key split (one split for the first fullTiles tiles).
+    const int b = (int)blockIdx.x;
+    const bool tail = b >= fullTiles;
+    const int tile = tail ? fullTiles + (b - fullTiles) / tailSplits : b;
+    const int split = tail ? (b - fullTiles) % tailSplits : 0, splits = tail ? tailSplits : 1;
+    int kvh, rowBase;
+    ts_fp2_tile(tile, T, nKv, kvh, rowBase);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, qd = lane & 3;
+    const int past = len - nq;
+    // The block's keys (its last row's) and this split's 32-key-aligned share of them, from the floor's tile.
+    const int kAll = past + (min(rowBase + TS_FP_ROWS, R) - 1) / G + 1;
+    const int share = ((kAll + splits - 1) / splits + TS_FP_KT - 1) / TS_FP_KT * TS_FP_KT;
+    const int kLo = max(min(kAll, split * share), min(kAll, floor / TS_FP_KT * TS_FP_KT));
+    const int kHi = min(kAll, split * share + share);
+
+    const int r0 = rowBase + warp * 16 + g, r1 = r0 + 8;
+    const bool live0 = r0 < R, live1 = r1 < R;
+    const int end0 = live0 ? past + r0 / G + 1 : 0, end1 = live1 ? past + r1 / G + 1 : 0;
+    const bool warpLive = rowBase + warp * 16 < R;
+    // The warp's last-seeing row's end (tiles from there are masked for every row of it) and its first-ending live row's
+    // (tiles that end by then, and start at or past the floor, need no mask).
+    int warpEnd = max(end0, end1);
+    int warpMin = min(live0 ? end0 : 0x7fffffff, live1 ? end1 : 0x7fffffff);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        warpEnd = max(warpEnd, __shfl_xor_sync(0xffffffffu, warpEnd, o));
+        warpMin = min(warpMin, __shfl_xor_sync(0xffffffffu, warpMin, o));
+    }
+    const Cache* kHead = kc + (long long)kvh * cap * (Q8 ? TsFpQ8Row<HD>::BYTES : HD);
+    const Cache* vHead = vc + (long long)kvh * cap * (Q8 ? TsFpQ8Row<HD>::BYTES : HD);
+
+    // The tile of keys [first, first + 32) into stage st (keys at or past kHi zero rows): ts_fp_attn's loaders.
+    auto load = [&](int st, int first) {
+        if constexpr (Q8)
+        {
+            constexpr int CH = TsFpQ8Row<HD>::CHUNK, CHUNKS = TsFpQ8Row<HD>::CHUNKS, RAW = TsFpQ8Row<HD>::BYTES;
+            for (int i = tid; i < 2 * TS_FP_KT * CHUNKS; i += blockDim.x)
+            {
+                const int isV = i >= TS_FP_KT * CHUNKS, c = isV ? i - TS_FP_KT * CHUNKS : i;
+                const int key = c / CHUNKS, part = c % CHUNKS;
+                const bool ok = first + key < kHi;
+                const uint8_t* src = ts_fp_q8_row<HD>(isV ? vHead : kHead, ok ? first + key : 0) + part * CH;
+                uint8_t* dst = sm.raw[st][isV] + key * RAW + part * CH;
+                if constexpr (CH == 16) ts_fp_cp16(dst, src, ok);
+                else ts_fp_cp8(dst, src, ok);
+            }
+        }
+        else
+        {
+            constexpr int CHUNKS = HD / 8;
+            // 256 threads a block (the launch's): the parts' offsets unroll to constants.
+#pragma unroll
+            for (int i = tid; i < 2 * TS_FP_KT * CHUNKS; i += 256)
+            {
+                const int isV = i >= TS_FP_KT * CHUNKS, c = isV ? i - TS_FP_KT * CHUNKS : i;
+                const int key = c / CHUNKS, part = c % CHUNKS;
+                const bool ok = first + key < kHi;
+                const half* src = (isV ? vHead : kHead) + (long long)(ok ? first + key : 0) * HD + part * 8;
+                ts_fp_cp16((isV ? sm.v[st] : sm.k[st]) + key * ROW + part * 8, src, ok);
+            }
+        }
+    };
+    if constexpr (Q8)
+    {
+#pragma unroll
+        for (int s = 0; s < TS_FP_Q8_STAGES - 1; ++s)
+        {
+            if (kLo + s * TS_FP_KT < kHi)
+                load(s, kLo + s * TS_FP_KT);
+            ts_fp_cp_commit();
+        }
+    }
+    else
+    {
+        if (kHi > kLo)
+            load(0, kLo);
+        ts_fp_cp_commit();
+    }
+
+    const float log2Scale = scale * 1.4426950408889634f;
+    uint32_t qa[KS][4];
+    {
+        const float* q0 = live0 ? q + ((long long)(kvh * G + r0 % G) * nq + r0 / G) * HD : nullptr;
+        const float* q1 = live1 ? q + ((long long)(kvh * G + r1 % G) * nq + r1 / G) * HD : nullptr;
+#pragma unroll
+        for (int kk = 0; kk < KS; ++kk)
+        {
+            const int c = kk * 16 + qd * 2;
+            qa[kk][0] = q0 ? ts_fp_pack_h2(q0[c] * log2Scale, q0[c + 1] * log2Scale) : 0u;
+            qa[kk][1] = q1 ? ts_fp_pack_h2(q1[c] * log2Scale, q1[c + 1] * log2Scale) : 0u;
+            qa[kk][2] = q0 ? ts_fp_pack_h2(q0[c + 8] * log2Scale, q0[c + 9] * log2Scale) : 0u;
+            qa[kk][3] = q1 ? ts_fp_pack_h2(q1[c + 8] * log2Scale, q1[c + 9] * log2Scale) : 0u;
+        }
+    }
+
+    float acc[NS][4];
+#pragma unroll
+    for (int n = 0; n < NS; ++n)
+        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+
+    for (int first = kLo, t = 0, q8Stage = 0; first < kHi; first += TS_FP_KT, ++t)
+    {
+        const int st = Q8 ? q8Stage : t & 1;
+        if constexpr (Q8)
+            ts_fp_cp_wait<TS_FP_Q8_STAGES - 2>();
+        else
+            ts_fp_cp_wait0();
+        __syncthreads();   // this tile landed; every warp is done with the previous one
+        if constexpr (Q8)
+        {
+            const int ahead = first + (TS_FP_Q8_STAGES - 1) * TS_FP_KT;
+            if (ahead < kHi)
+                load(q8Stage == 0 ? TS_FP_Q8_STAGES - 1 : q8Stage - 1, ahead);
+            q8Stage = q8Stage + 1 == TS_FP_Q8_STAGES ? 0 : q8Stage + 1;
+        }
+        else if (first + TS_FP_KT < kHi)
+            load(st ^ 1, first + TS_FP_KT);
+        ts_fp_cp_commit();
+        if constexpr (Q8)
+        {
+            constexpr int NB = HD / 32, RAW = TsFpQ8Row<HD>::BYTES;
+            for (int i = tid; i < 2 * TS_FP_KT * NB; i += blockDim.x)
+            {
+                const int isV = i >= TS_FP_KT * NB, c = isV ? i - TS_FP_KT * NB : i;
+                const int key = c / NB, blk = c % NB;
+                ts_fp_q8_block_to_h(sm.raw[st][isV] + key * RAW + blk * 34, (isV ? sm.v : sm.k) + key * ROW + blk * 32);
+            }
+            __syncthreads();
+        }
+        if (!warpLive || first >= warpEnd)
+            continue;
+
+        // S = Q K^T in F32 (each n-tile's chain over the HD dims inside the MMA).
+        float s[4][4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+        {
+            const half* kb = sm.kt(st) + ((lane & 7) + ((lane >> 4) << 3)) * ROW + ((lane >> 3) & 1) * 8;
+#pragma unroll
+            for (int kk = 0; kk < KS; ++kk)
+            {
+#pragma unroll
+                for (int np = 0; np < 2; ++np)
+                {
+                    uint32_t b[4];
+                    ts_fp_ldsm_x4(b, kb + np * 16 * ROW + kk * 16);
+                    ts_fp_mma_f32(s[2 * np], qa[kk], b[0], b[1]);
+                    ts_fp_mma_f32(s[2 * np + 1], qa[kk], b[2], b[3]);
+                }
+            }
+        }
+
+        // Rows' ends and the floor: only a tile that straddles one (a warp-uniform test) masks.
+        const bool masked = first + TS_FP_KT > warpMin || first < floor;
+        if (masked)
+        {
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                const int key = first + j * 8 + qd * 2;
+                s[j][0] = key < end0 && key >= floor ? s[j][0] : -INFINITY;
+                s[j][1] = key + 1 < end0 && key + 1 >= floor ? s[j][1] : -INFINITY;
+                s[j][2] = key < end1 && key >= floor ? s[j][2] : -INFINITY;
+                s[j][3] = key + 1 < end1 && key + 1 >= floor ? s[j][3] : -INFINITY;
+            }
+        }
+        float t0 = m0, t1 = m1;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            t0 = fmaxf(t0, fmaxf(s[j][0], s[j][1]));
+            t1 = fmaxf(t1, fmaxf(s[j][2], s[j][3]));
+        }
+#pragma unroll
+        for (int off = 1; off < 4; off <<= 1)
+        {
+            t0 = fmaxf(t0, __shfl_xor_sync(0xffffffff, t0, off));
+            t1 = fmaxf(t1, __shfl_xor_sync(0xffffffff, t1, off));
+        }
+        // 2^x by ex2.approx.ftz: exp2f's result wherever it is normal, and the F16 probabilities cannot hold what it flushes. A
+        // tile no row masks has a finite maximum for every row (a dead row's scores are zeros).
+        const float c0 = t0 == -INFINITY ? 1.0f : ts_fp_ex2(m0 - t0);
+        const float c1 = t1 == -INFINITY ? 1.0f : ts_fp_ex2(m1 - t1);
+        m0 = t0;
+        m1 = t1;
+        if (!masked)
+        {
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                s[j][0] = ts_fp_ex2(s[j][0] - t0);
+                s[j][1] = ts_fp_ex2(s[j][1] - t0);
+                s[j][2] = ts_fp_ex2(s[j][2] - t1);
+                s[j][3] = ts_fp_ex2(s[j][3] - t1);
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                s[j][0] = t0 == -INFINITY ? 0.0f : ts_fp_ex2(s[j][0] - t0);
+                s[j][1] = t0 == -INFINITY ? 0.0f : ts_fp_ex2(s[j][1] - t0);
+                s[j][2] = t1 == -INFINITY ? 0.0f : ts_fp_ex2(s[j][2] - t1);
+                s[j][3] = t1 == -INFINITY ? 0.0f : ts_fp_ex2(s[j][3] - t1);
+            }
+        }
+        // P in F16 (the A fragments of the value product), the row sums over those rounded values.
+        uint32_t pa[2][4];
+        float ps0 = 0.0f, ps1 = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk)
+        {
+            pa[kk][0] = ts_fp_pack_h2(s[2 * kk][0], s[2 * kk][1]);
+            pa[kk][1] = ts_fp_pack_h2(s[2 * kk][2], s[2 * kk][3]);
+            pa[kk][2] = ts_fp_pack_h2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+            pa[kk][3] = ts_fp_pack_h2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+            const float2 a = __half22float2(*reinterpret_cast<const half2*>(&pa[kk][0]));
+            const float2 b = __half22float2(*reinterpret_cast<const half2*>(&pa[kk][2]));
+            const float2 c = __half22float2(*reinterpret_cast<const half2*>(&pa[kk][1]));
+            const float2 d = __half22float2(*reinterpret_cast<const half2*>(&pa[kk][3]));
+            ps0 += (a.x + a.y) + (b.x + b.y);
+            ps1 += (c.x + c.y) + (d.x + d.y);
+        }
+        l0 = fmaf(l0, c0, ps0);
+        l1 = fmaf(l1, c1, ps1);
+        // O = O c + P V: each tile's product from zero in F32, then one rounding into the accumulators.
+        const half* vrow = sm.vt(st) + ((lane & 7) + (((lane >> 3) & 1) << 3)) * ROW + ((lane >> 4) << 3);
+#pragma unroll
+        for (int dn = 0; dn < HD / 16; ++dn)
+        {
+            float h0[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, h1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+            for (int kk = 0; kk < 2; ++kk)
+            {
+                uint32_t b[4];
+                ts_fp_ldsm_x4_t(b, vrow + kk * 16 * ROW + dn * 16);
+                ts_fp_mma_f32(h0, pa[kk], b[0], b[1]);
+                ts_fp_mma_f32(h1, pa[kk], b[2], b[3]);
+            }
+            acc[2 * dn][0] = fmaf(acc[2 * dn][0], c0, h0[0]); acc[2 * dn][1] = fmaf(acc[2 * dn][1], c0, h0[1]);
+            acc[2 * dn][2] = fmaf(acc[2 * dn][2], c1, h0[2]); acc[2 * dn][3] = fmaf(acc[2 * dn][3], c1, h0[3]);
+            acc[2 * dn + 1][0] = fmaf(acc[2 * dn + 1][0], c0, h1[0]); acc[2 * dn + 1][1] = fmaf(acc[2 * dn + 1][1], c0, h1[1]);
+            acc[2 * dn + 1][2] = fmaf(acc[2 * dn + 1][2], c1, h1[2]); acc[2 * dn + 1][3] = fmaf(acc[2 * dn + 1][3], c1, h1[3]);
+        }
+    }
+    ts_fp_cp_wait0();
+    if (!warpLive)
+        return;
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1)
+    {
+        l0 += __shfl_xor_sync(0xffffffff, l0, off);
+        l1 += __shfl_xor_sync(0xffffffff, l1, off);
+    }
+#pragma unroll
+    for (int half_ = 0; half_ < 2; ++half_)
+    {
+        const int r = half_ ? r1 : r0;
+        if (r >= R)
+            continue;
+        const float l = half_ ? l1 : l0;
+        if (tail)
+        {
+            // The tail tile's partial of row r (an empty share's too: max -inf, sum 0).
+            float* p = partial + ((long long)((tile - fullTiles) * TS_FP_ROWS + r - rowBase) * tailSplits + split) * (HD + 2);
+#pragma unroll
+            for (int n = 0; n < NS; ++n)
+            {
+                const int x = n * 8 + qd * 2;
+                p[x] = acc[n][half_ * 2];
+                p[x + 1] = acc[n][half_ * 2 + 1];
+            }
+            if (qd == 0)
+            {
+                const float m = half_ ? m1 : m0;
+                p[HD] = m == -INFINITY ? -INFINITY : m * 0.6931471805599453f;   // log2 -> ln domain
+                p[HD + 1] = l;
+            }
+            continue;
+        }
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        float* o = out + ((long long)(r / G) * nHead + kvh * G + r % G) * HD;
+#pragma unroll
+        for (int n = 0; n < NS; ++n)
+        {
+            const int x = n * 8 + qd * 2;
+            o[x] = acc[n][half_ * 2] * inv;
+            o[x + 1] = acc[n][half_ * 2 + 1] * inv;
+        }
+    }
+}
+
+#define TS_FP_PROMPT2(NAME, HD, T, Q8) \
+    extern "C" __global__ void __launch_bounds__(256) NAME( \
+        const float* __restrict__ q, const T* __restrict__ kc, const T* __restrict__ vc, int cap, int nq, int len, \
+        int floor, int nHead, int nKv, float scale, int fullTiles, int tailSplits, float* __restrict__ partial, float* __restrict__ out) \
+    { \
+        ts_fp_prompt2<HD, Q8>(q, kc, vc, cap, nq, len, floor, nHead, nKv, scale, fullTiles, tailSplits, partial, out); \
+    }
+
+TS_FP_PROMPT2(ts_flash_prompt2_f16_d128, 128, half, false)
+TS_FP_PROMPT2(ts_flash_prompt2_f16_d256, 256, half, false)
+TS_FP_PROMPT2(ts_flash_prompt2_q8_d128, 128, uint8_t, true)
+TS_FP_PROMPT2(ts_flash_prompt2_q8_d256, 256, uint8_t, true)
+
+// The tail tiles' partials of a ts_flash_prompt2 launch: out = sum_s e^(m_s - m) acc_s / sum_s e^(m_s - m) l_s for each live
+// row of each tail tile (ts_flash_prefill_combine_f32's arithmetic). Launch: grid (nKv * T - fullTiles) * 128, block hd.
+extern "C" __global__ void ts_flash_prompt2_combine_f32(const float* __restrict__ partial, int nq, int nHead, int nKv, int fullTiles,
+    int tailSplits, int hd, float* __restrict__ out)
+{
+    const int G = nHead / nKv, R = nq * G, T = (R + TS_FP_ROWS - 1) / TS_FP_ROWS;
+    const int idx = (int)blockIdx.x, rr = idx % TS_FP_ROWS;
+    int kvh, rowBase;
+    ts_fp2_tile(fullTiles + idx / TS_FP_ROWS, T, nKv, kvh, rowBase);
+    const int r = rowBase + rr;
+    if (r >= R)
+        return;
+    const float* p = partial + (long long)idx * tailSplits * (hd + 2);
+    float mx = -INFINITY;
+    for (int s = 0; s < tailSplits; ++s)
+        mx = fmaxf(mx, p[s * (hd + 2) + hd]);
+    float num = 0.0f, den = 0.0f;
+    const int x = threadIdx.x;
+    for (int s = 0; s < tailSplits; ++s)
+    {
+        const float* ps = p + s * (hd + 2);
+        const float w = mx == -INFINITY ? 0.0f : expf(ps[hd] - mx);
+        num = fmaf(ps[x], w, num);
+        den = fmaf(ps[hd + 1], w, den);
+    }
+    out[((long long)(r / G) * nHead + kvh * G + r % G) * hd + x] = den > 0.0f ? num / den : 0.0f;
+}
+
+// The F16 tensor-core rate with F32 accumulation against F16 accumulation (f32acc 1 / 0): every warp runs iters x 8
+// independent m16n8k16 MMAs, which the host times. Workstation and datacenter parts run both at one rate (RTX PRO 4500
+// Blackwell: 236 TFLOP/s either way); GeForce parts run F32 accumulation at half (their data sheets), where
+// ts_flash_prompt2_* would lose to the 16-bit-run prompt kernels (CudaFlashPrefillKernels.PromptAccumulatesInF32). Launch:
+// any grid of 128-thread blocks; sink receives a value only to keep the MMAs.
+extern "C" __global__ void __launch_bounds__(128) ts_flash_prefill_mma_rate(int f32acc, int iters, float* sink)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t a[4] = { threadIdx.x | 0x3c003c00u, 0x3c003c00u, 0x3c003c00u, 0x3c003c00u }, b0 = 0x3c003c00u, b1 = blockIdx.x | 0x3c003c00u;
+    float acc = 0.0f;
+    if (f32acc)
+    {
+        float c[8][4] = {};
+        for (int i = 0; i < iters; ++i)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                ts_fp_mma_f32(c[j], a, b0, b1);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc += c[j][0] + c[j][1] + c[j][2] + c[j][3];
+    }
+    else
+    {
+        uint32_t c[8][2] = {};
+        for (int i = 0; i < iters; ++i)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                ts_fp_mma_f16h(c[j], a, b0, b1);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc += __half2float(__ushort_as_half((unsigned short)c[j][0])) + __half2float(__ushort_as_half((unsigned short)c[j][1]));
+    }
+    if (acc == 1.2345f)
+        sink[0] = acc;
+#else
+    __trap();
+#endif
+}
