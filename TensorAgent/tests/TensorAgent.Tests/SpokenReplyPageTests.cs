@@ -108,7 +108,8 @@ public sealed partial class WebUiPageTests
         Assert.Equal("/uploads/speech-20261119-101500-0123456789ab.wav", result.GetProperty("player").GetString());
         Assert.Equal("Save audio (0.2 s)", result.GetProperty("saveLabel").GetString());
         Assert.Equal("speech-20261119-101500-0123456789ab.wav", result.GetProperty("saveName").GetString());
-        Assert.Equal(new[] { "This reply is spoken, so it runs without reasoning, tools or skills." },
+        // Once in each spoken turn, in the interface language (the route answers both turns with the same frames).
+        Assert.Equal(Enumerable.Repeat("This reply is spoken, so it runs without reasoning, tools or skills.", 2),
             result.GetProperty("notes").EnumerateArray().Select(n => n.GetString()));
 
         JsonElement answer = result.GetProperty("answer");
