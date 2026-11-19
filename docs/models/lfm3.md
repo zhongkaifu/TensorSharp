@@ -724,12 +724,13 @@ results). In the same session ggml_metal ran Q4_K_M pp512 / tg128 at 6,041 / 191
   prompts at 0.86-0.92x (llama.cpp's repacked GEMMs use i8mm, which .NET 10 does not expose), BF16
   prompts at 0.44x of llama.cpp's Accelerate build, and serves one Q4_K_M stream at 0.83x llama-server's
   decode speed (first token at parity).
-- Served ggml_cpu can run 8-10x slower for a whole server's life: on 2026-11-18, 2 of 10 one-stream Q4_K_M
-  runs of the vLLM harness's cell (65-69 against 6.7-6.8 ms a token) and 3 of 23 BF16 runs, on the final tree
-  and on the tree before that day's merges alike, and never llama-server or the managed CPU in the same
-  rounds. During such a run 15 of the decode pool's 16 threads stay busy instead of 16, so every node waits
-  on a thread that is not running; the cause (how one pool thread is scheduled, or a pool switch) is not
-  isolated. Served BF16 prompts on ggml_cpu also took 2.1-6.0 s for 523 tokens that day on every build
+- Served ggml_cpu can run 8-10x slower for a whole server's life: on 2026-11-18, 2 of 40 one-stream Q4_K_M
+  runs of the vLLM harness's cell (65-69 against 6.7-6.8 ms a token; both in its first two interleaved rounds,
+  none in 30 back-to-back runs later that evening) and 3 of 23 BF16 runs, on the final tree and on the tree
+  before that day's merges alike, and never llama-server or the managed CPU in the same rounds. During such a
+  run the server keeps 15 threads busy instead of the 16 a decode step runs on, as if one of the step's threads
+  (a pool worker or the calling thread) were not running while the others wait for it at every node; the cause
+  is not isolated. Served BF16 prompts on ggml_cpu also took 2.1-6.0 s for 523 tokens that day on every build
   tested, the CPU integration's included, against the engine's ~1.0 s.
 - ggml_cpu's repacked weight copies are anonymous memory: served peak footprint 1.56 GB for
   Q4_K_M (2.31 GB Q8_0, 1.52 GB QAD-Q4_0) against llama-server's 1.20 GB (1.91, 1.15), down from
