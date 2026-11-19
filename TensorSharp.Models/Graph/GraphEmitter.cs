@@ -273,6 +273,10 @@ namespace TensorSharp.Models.Graph
 
         // ---- programs and runs
 
+        /// <summary>Marks the program as a step whose products have thousands of rows, a diffusion denoiser's step over a
+        /// whole image (<see cref="GraphProgramBuilder.MarkWideTokenProducts"/>). Call it before the first entry.</summary>
+        public void MarkWideTokenProducts() => _b.MarkWideTokenProducts();
+
         /// <summary>The recorded program (see <see cref="GraphProgramBuilder.ToProgram"/>).</summary>
         public GraphProgram ToProgram(bool replayable, bool reorder = false, int[] tensorParallelRanks = null)
         {
