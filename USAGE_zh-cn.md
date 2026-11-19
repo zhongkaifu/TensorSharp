@@ -2673,10 +2673,12 @@ LiquidCodec 解码器）后即可说话。语音回复与文本运行在同一�
 | `POST /v1/audio/speech` | `input`、`voice`（`female`/`male`；其他值，包括 OpenAI 默认的 `alloy`，返回 400 并列出可用音色）、`language`、`response_format` `wav`/`pcm`/`pcm16`、`stream: true`（分块；WAV 流以未知长度头开头）或 `stream_format: "audio"`/`"sse"`、`seed`、`temperature`、`max_frames`。`speed` 不为 1 时返回 400。 |
 | `POST /v1/chat/completions`、`POST /v1/responses` | `"modalities": ["text","audio"]`（交错：文本即转写；对话模式）或 `["audio"]`（纯语音，以 `<|audio_start|>` 开始：LFM3-Omni 会朗读用户的消息而不是回答，与 llama.cpp 相同），配合 `"audio": {"voice": "female", "format": "wav"\|"pcm16"}`（TensorSharp 还读取其中的 `language`、`seed`、`temperature`）。非流式：`message.audio = {id, expires_at, data, transcript}`；流式（仅 pcm16）：`delta.audio` 先发 `id`，再按顺序发 `transcript` 与 `data` 片段，最后是 `expires_at`。一小时内把回复以 `{"role":"assistant","audio":{"id":...}}` 发回，会按其转写渲染。 |
 | `GET /v1/models` | 会说话的模型列出 `"capabilities": ["chat","audio_output"]` 及其音色。 |
+| `POST /api/chat`（Web UI、TensorAgent） | `"speech": true` 或 `{"voice": ..., "language": ...}`：交错回复并关闭思考，转写在 `token` 帧中，语音在夹于其间的 `audio` 帧中（base64 PCM16，采样率为 `sampleRate`），`done` 帧带有 `audioId`、`audioUrl`（整段回复的 WAV，位于 `/uploads/`）和 `audioSeconds`。语音轮次中技能、工具和知识库检索都不会运行（会有一个 `notice` 帧说明）。`GET /api/models` 报告 `speechOutput: {available, voices, reason}`；页面只在其可用时显示 **Speak replies** 开关，边生成边播放，并保留播放器与下载链接。见 [API_EXAMPLES_zh-cn.md → 语音回复](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#语音回复speechlfm3-omni)。 |
 
 LFM3-Omni 的文本回复永不采样媒体占位符，纯文本回复也不会开启语音（禁止 `<|audio_start|>`、`<|mixed_start|>`），
-与模型卡中 `generate` 的做法一致。语音请求不保留在前缀缓存中（其帧是嵌入行而非 token），之后历史中的语音助手回合
-按其转写重新渲染，而不是按音频。见 [docs/models/lfm3_zh-cn.md](docs/models/lfm3_zh-cn.md#语音输出)。
+与模型卡中 `generate` 的做法一致。按其 id 送回的语音助手回合（`/v1/chat/completions` 上的 `audio.id`，`/api/chat` 上的
+`audioId`，保留一小时）按生成时解码的样子拼回；语音回复的结束状态会被保留，其每段连续帧以编码为键，因此下一个语音回合
+能跨越它复用缓存的提示。未知的 id 按其转写渲染。见 [docs/models/lfm3_zh-cn.md](docs/models/lfm3_zh-cn.md#语音输出)。
 
 ```bash
 curl http://localhost:5000/v1/audio/speech -H "content-type: application/json" \

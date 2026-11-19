@@ -312,8 +312,9 @@ TTS（GGUF 的 `tokenizer.chat_template.tts`，在语音结束帧停止）。对
 `generate` 和 llama.cpp 的 realtime 服务一致）；TTS 回复在语音结束时停止（与 llama-tts 一致）。
 
 用法：CLI `--tts` / `--speech-out`（配合 `--speech-mode`、`--speech-temperature`、`--voice`、`--language`、`--seed`）、
-`POST /v1/audio/speech`，以及带 `modalities` `["text","audio"]` 或 `["audio"]` 的 `/v1/chat/completions` /
-`/v1/responses`——见 [USAGE_zh-cn.md → 语音输出](../../USAGE_zh-cn.md#语音输出lfm3-omni)。音色为 `female` 与 `male`
+`POST /v1/audio/speech`、带 `modalities` `["text","audio"]` 或 `["audio"]` 的 `/v1/chat/completions` /
+`/v1/responses`，以及网页聊天（带 `speech` 的 `/api/chat`：内置 Web UI 与 TensorAgent 的 **Speak replies** 开关，
+边生成边播放，并保留播放器与下载链接）——见 [USAGE_zh-cn.md → 语音输出](../../USAGE_zh-cn.md#语音输出lfm3-omni)。音色为 `female` 与 `male`
 （写在系统提示中，没有说话人嵌入）；未知音色（包括 OpenAI 默认的 `alloy`）返回 400 并列出可用音色。语音对话回复的系统提示
 加上 llama.cpp 的 realtime 句子（“Speak in English using a female voice.”），交错回复再加上模型卡的
 “Respond with interleaved text and audio.”。
@@ -344,10 +345,17 @@ token 的采样器不是纯 argmax，因此 LFM3-Omni 的文本回复不使用�
 历史：之后请求中送回的语音助手回合（OpenAI 的 `{"role":"assistant","audio":{"id":...}}`，保留一小时）按生成时解码的样子拼回：
 开启模式的 token、文本 token，以及每个已解码帧一个 `<|audio_out|>`，每个占位符取该帧的码本求和行（包括语音结束帧），与 HF
 处理器为过去语音回合的占位符所做的一致。因此其提示 token 就是该回复自己的序列（在 LFM3-Omni Q8_0 上与生成逐 token 核对）。
-每段连续帧是一个以其编码为键的媒体片段。生成信息未知的 id 按其转写渲染。
+每段连续帧是一个以其编码为键的媒体片段。生成信息未知的 id 按其转写渲染。网页聊天（`/api/chat`）以同样的方式送回
+语音回复：通过其 assistant 消息上的 `audioId`。
 
-限制：没有 `/v1/realtime`；语音请求不保留在前缀缓存中，之后的回合暂时还不能跨越拼回的语音回合复用缓存（未解决问题）。
-在 CUDA 上，语音输出通过 ASR 往返检查（无词错误），而不是与 llama-tts 逐位比对。
+前缀复用：语音回复的结束状态与文本回复一样被保留。其驱动器用与展开器给拼回回合相同的、以编码为键的 id 命名它解码的每段
+连续帧（`IOutputMediaDriver`、`Lfm3SpeechOutput.FramesContentId`），因此下一回合能从它的结束状态继续，覆盖整个回复。
+在 LFM3-Omni Q8_0 + Q8_0 mmproj 上检查（ggml-metal 服务器，网页聊天，三个语音回合）：第 2 回合的 111 个提示 token 中复用了
+84 个（即第 1 回合的全部：提示、`<|mixed_start|>` 与它计算过的 40 个槽位），第 3 回合 179 个中复用 156 个，且第 3 回合
+依据语音回合作答（“I named Paris first.”）。语音回合的系统提示写明了声音并要求交错回复，因此语音回合之后的文本回合
+（或反过来）从系统消息起就不同，需要重新预填。
+
+限制：没有 `/v1/realtime`。在 CUDA 上，语音输出通过 ASR 往返检查（无词错误），而不是与 llama-tts 逐位比对。
 
 ## 基准测试
 
@@ -472,7 +480,8 @@ pp512 / tg128 为 6,041 / 191，llama.cpp Metal 为 5,871 / 188，MLX 为 6,598 
 
 ## 当前限制
 
-- 语音输出没有实时端点（`/v1/realtime`），之后的回合暂时还不能跨越历史中的语音回合复用前缀缓存（见[语音输出](#语音输出)）。
+- 语音输出没有实时端点（`/v1/realtime`）；语音回合之后的文本回合会从系统提示起重新预填，因为只有语音回合的系统提示
+  写明声音（见[语音输出](#语音输出)）。
 - 大量并发请求的解码慢于 vLLM 与 SGLang（A40 上 16 / 64 个请求时每 token 17.4 / 51 ms，vLLM 为 8.1 / 11.0 ms）：批处理步骤中
   每个序列的注意力与短卷积都是各自独立的算子（在 ggml_cuda 上每个序列约 128 个内核），且每当有请求加入或离开都要重新构图。
   分组步骤的设计已经起草、尚未实现：解码行与验证行按行数分组，短卷积的窗口每层放在一个池中，ggml 路径上使用行列表注意力

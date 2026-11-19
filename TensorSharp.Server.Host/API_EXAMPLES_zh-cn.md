@@ -1201,7 +1201,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`，以及[技能](#技能apiskills)一节介绍的 `skills` 块。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"ltx-2.5"`、`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsKeyframeConditioning`、`defaultPreviewFrames`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`、[技能](#技能apiskills)一节介绍的 `skills` 块，以及 `speechOutput`（`available`、`voices`、`reason`：`/api/chat` 能否给出语音回复，见[语音回复](#语音回复speechlfm3-omni)）。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"ltx-2.5"`、`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsKeyframeConditioning`、`defaultPreviewFrames`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
 
 ---
 
@@ -1273,6 +1273,8 @@ curl -N -X POST http://localhost:5000/api/chat \
 | `tool_progress`、`tool`、`text`、`seconds`、`detail`、`agents` | 进程内技能/代码/子智能体调用正在写出或运行时 | 短暂的实时活动：阶段为 `writing`、`running` 或 `finished`；内置 Web UI 只保留有界的当前尾部，并在 `finished` 时清除。`wait_agent` 处于 `running` 时，`agents` 是本请求中所有子智能体的快照（`agent_id`、`parent_id`、`task`、`agent_type`、`status`、`tool`、`tool_status`、`detail`、`result`、`error`），其他情况下为 `null` |
 | `skill_step`、`agent_id`、`skill`、`detail`、`ok`、`round`、`files` | 每次进程内技能、代码或子智能体工具调用完成后 | 工具、目标与结果的完成元数据；`agent_id` 指明发起调用的智能体（主对话为 `/root`）；生成的制品以可选的 `{name, bytes, url}` 条目出现在 `files` 中 |
 | `artifact_verified`、`files` | 路由式交付工作流（例如 PowerPoint 请求）证明其产出时，仅一次 | 通过宿主结构校验的那一个交付物，以单个 `{name, bytes, url}` 条目给出；这类请求的 `skill_step.files` 保持为空，临时文件因此永远不会被提供下载 |
+| `audio`、`sampleRate` | 语音回复（`speech`，见下文），按生成顺序夹在 `token` 帧之间 | base64 编码的 PCM16 小端单声道音频，每帧 80 ms 语音（结尾为编解码器的尾音），采样率为 `sampleRate` Hz |
+| `notice`、`code`、`without` | 语音回复舍弃了请求所要求的功能时，在最前面发送一次；或在音频无法写入时于 `done` 之前发送 | `code` 为 `speech_direct`：该回复不使用 `without` 中列出的功能（`reasoning`、`tools`、`skills`、`knowledge`）；为 `speech_not_saved`：没有生成 WAV，因此没有 `audioUrl`。`notice` 是英文说明句 |
 | `done`、`tokenCount`、`elapsed`、`tokPerSec`、`aborted`、`truncated`、`error`、`sessionId`、`promptTokens`、`kvReusedTokens`、`kvReusePercent` | 末尾帧 | 终态汇总：`tokenCount` 计入本轮生成的全部 token（推理、工具调用与回答，跨所有轮次），`elapsed` 是本轮的墙钟秒数（含工具运行时间），`tokPerSec` 是解码速度；`truncated` 为 true 表示回答因 max-tokens 预算用尽而中断（用户中止用 `aborted` 表示） |
 
 末尾帧示例：
@@ -1320,6 +1322,57 @@ data: {"replace":"A refined draft of the whole answer","diffusionStep":12,"diffu
 OpenAI 的 `usage.prompt_tokens_details.cached_tokens` 含义一致 —— 都表示有多
 少 prompt token 复用了已缓存的 KV 状态（对应会话的上一轮，或多个会话共享的
 system/工具前缀）。
+
+### 语音回复（`speech`，LFM3-Omni）
+
+能说话的模型（加载了 mmproj 的 LFM3-Omni，语音解码器就在 mmproj 中）可以一边写回复一边把它说出来。
+`/api/models` 会报告当前加载的模型是否支持：
+
+```json
+"speechOutput": { "available": true, "voices": ["female", "male"], "reason": null }
+```
+
+`voices` 中第一个是默认声音；`available` 为 false 时 `reason` 说明原因（模型没有语音输出，或 LFM3-Omni
+未加载其 mmproj）。用 `speech` 请求语音回复：`true`（默认声音），或 `{"voice": "...", "language": "..."}`
+（两者均可省略；`language` 是 `en`、`fr` 这样的语言代码，会写入系统提示中的那一行）。
+
+```bash
+curl -N -X POST http://localhost:5000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sessionId": "a3b1c2...",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "speech": {"voice": "female"}
+  }'
+```
+
+回复为文字与语音交错（文字即语音的转写），并关闭思考。转写通过普通的 `token` 帧到达，语音通过夹在其间的
+`audio` 帧到达；`done` 帧额外带有 `audioId`、`audioUrl`（整段回复写成 `/uploads/` 下的 24 kHz 单声道 16 位
+WAV，按说出的时间命名）和 `audioSeconds`：
+
+```
+data: {"token":"The capital "}
+data: {"audio":"AAAAQADA/38...","sampleRate":24000}
+data: {"token":"of France is Paris."}
+data: {"audio":"...","sampleRate":24000}
+data: {"done":true,"tokenCount":41,"elapsed":2.9,"tokPerSec":19.3,"aborted":false,"truncated":false,"error":null,"sessionId":"a3b...","promptTokens":44,"kvReusedTokens":0,"kvReusePercent":0.0,"audioId":"audio_5f0c...","audioUrl":"/uploads/speech-20261119-101500-5f0c1a2b3c4d4e5f8a9b0c1d2e3f4a5b.wav","audioSeconds":3.36}
+```
+
+语音轮次是一次生成，而不是工具循环：技能、工具、知识库检索和推理都不会运行；请求如果要求了其中任何一项，
+回复开始前会收到一个 `notice` 帧说明这一点（`code` 为 `speech_direct`，`without` 列出被舍弃的项）。
+不能说话的模型会以 HTTP 400 拒绝 `speech` 并给出原因（`{"code": "speech_unavailable", "error": "..."}`）；
+模型没有的声音、以及既不是 `true` 也不是只含 `voice` / `language` 的对象的 `speech`，同样被拒绝。
+被停止的回复不会写入 WAV，也没有 `audioId`。
+
+请把回复连同其 `audioId` 保留在历史中（以及 `audioUrl`，内置页面用它显示播放器和下载链接）：在 assistant 消息上
+发回 `{"role": "assistant", "content": "<转写>", "audioId": "audio_5f0c..."}`，该轮会按模型生成时的样子拼接回去
+（它的 token，以及每个语音帧对应的行），使提示与缓存中保存的内容完全一致。语音轮次在内存中保留一小时，
+且只对生成它的那次模型加载有效；更早或未知的 id、或文字与转写不同的消息，都按其文字渲染，服务日志会提示一次。
+语音轮次的系统提示中写明了声音，因此下一轮同样是语音回复时才能复用缓存的提示。
+
+内置 Web UI 只在 `speechOutput.available` 时显示 **Speak replies** 开关（以及声音选择）；它会在 `audio` 帧到达时
+立即播放，回复完成后在气泡中留下 `<audio>` 播放器和 **Download audio** 链接。TensorAgent 的聊天界面同样如此，
+其 **保存音频** 通过应用的保存对话框完成。
 
 ### 文件上传（`/api/upload`）—— 图像、视频、音频、文本、PDF
 

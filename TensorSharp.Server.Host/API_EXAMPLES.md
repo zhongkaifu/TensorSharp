@@ -1336,7 +1336,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, and the `skills` block described under [Skills](#skills-apiskills). When the hosted model generates video it also returns a `video` object — `family` (`"ltx-2.5"`, `"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsKeyframeConditioning`, `defaultPreviewFrames`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, the `skills` block described under [Skills](#skills-apiskills), and `speechOutput` (`available`, `voices`, `reason`: whether `/api/chat` can give a spoken reply, see [Spoken replies](#spoken-replies-speech-lfm3-omni)). When the hosted model generates video it also returns a `video` object — `family` (`"ltx-2.5"`, `"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsKeyframeConditioning`, `defaultPreviewFrames`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
 
 ---
 
@@ -1425,6 +1425,8 @@ Event shapes:
 | `tool_progress`, `tool`, `text`, `seconds`, `detail`, `agents` | while an in-process skill/code/agent call is being written or run | transient live activity: phase is `writing`, `running`, or `finished`; the bundled Web UI keeps only a bounded current tail and clears it on `finished`. While `wait_agent` is `running`, `agents` is a snapshot of every sub-agent in the request (`agent_id`, `parent_id`, `task`, `agent_type`, `status`, `tool`, `tool_status`, `detail`, `result`, `error`); otherwise it is `null` |
 | `skill_step`, `agent_id`, `skill`, `detail`, `ok`, `round`, `files` | after each in-process skill, code or agent tool call finishes | completion metadata for the tool, target and result; `agent_id` names the agent that made the call (`/root` for the main conversation); produced artifacts appear as optional `{name, bytes, url}` entries in `files` |
 | `artifact_verified`, `files` | once, when a routed deliverable workflow (such as a PowerPoint request) proves its output | the one deliverable that passed the host's structural checks, as a single `{name, bytes, url}` entry; `skill_step.files` stays empty on those requests so provisional files are never offered |
+| `audio`, `sampleRate` | a spoken reply (`speech`, below), between its `token` frames in the order generated | base64 PCM16 little-endian mono, one 80 ms speech frame (or the codec's tail at the end) at `sampleRate` Hz |
+| `notice`, `code`, `without` | once, first, on a spoken reply that drops what the request asked for; or before `done` when its audio could not be written | `code` `speech_direct`: the reply runs without `without` (`reasoning`, `tools`, `skills`, `knowledge`); `speech_not_saved`: no WAV, so no `audioUrl`. `notice` is the English sentence |
 | `done`, `tokenCount`, `elapsed`, `tokPerSec`, `aborted`, `truncated`, `error`, `sessionId`, `promptTokens`, `kvReusedTokens`, `kvReusePercent` | last frame | terminal summary: `tokenCount` counts every token the turn generated (reasoning, tool calls and answer, across all rounds), `elapsed` is the turn's wall-clock seconds including tool runs, and `tokPerSec` is the decode speed; `truncated` is true when the max-tokens budget ended the answer (not the user; `aborted` covers that) |
 
 Sample terminal frame:
@@ -1474,6 +1476,71 @@ Use `kvReusedTokens` / `kvReusePercent` in the same way as the Ollama
 fields - they all measure the same thing (prompt tokens served from cached KV
 state: the session's prior turn, or a system/tool prefix shared across
 conversations).
+
+### Spoken replies (`speech`, LFM3-Omni)
+
+A model that speaks (LFM3-Omni with its mmproj, which carries the speech
+decoder) can say its reply aloud while it writes it. `/api/models` reports
+whether the loaded model can:
+
+```json
+"speechOutput": { "available": true, "voices": ["female", "male"], "reason": null }
+```
+
+`voices` lists the default first; `reason` says why not when `available` is
+false (a model without speech output, or LFM3-Omni loaded without its mmproj).
+Ask for a spoken reply with `speech`: `true` (the default voice), or
+`{"voice": "...", "language": "..."}` (both optional; `language` is a code such
+as `en` or `fr` that the system line names).
+
+```bash
+curl -N -X POST http://localhost:5000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sessionId": "a3b1c2...",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "speech": {"voice": "female"}
+  }'
+```
+
+The reply interleaves text and speech, the text being the speech's
+transcript, with thinking off. The transcript arrives in the ordinary `token`
+frames and the speech in `audio` frames between them; the `done` frame adds
+`audioId`, `audioUrl` (the whole reply as a 24 kHz mono 16-bit WAV under
+`/uploads/`, named by when it was spoken) and `audioSeconds`:
+
+```
+data: {"token":"The capital "}
+data: {"audio":"AAAAQADA/38...","sampleRate":24000}
+data: {"token":"of France is Paris."}
+data: {"audio":"...","sampleRate":24000}
+data: {"done":true,"tokenCount":41,"elapsed":2.9,"tokPerSec":19.3,"aborted":false,"truncated":false,"error":null,"sessionId":"a3b...","promptTokens":44,"kvReusedTokens":0,"kvReusePercent":0.0,"audioId":"audio_5f0c...","audioUrl":"/uploads/speech-20261119-101500-5f0c1a2b3c4d4e5f8a9b0c1d2e3f4a5b.wav","audioSeconds":3.36}
+```
+
+A spoken turn is one generation, not a tool loop: skills, tools, knowledge
+lookups and reasoning do not run in it, and a request that asked for any of
+them gets one `notice` frame saying so (`code` `speech_direct`, `without`
+naming them) before the reply. A model that cannot speak refuses `speech` with
+HTTP 400 and its reason (`{"code": "speech_unavailable", "error": "..."}`); so
+does a voice the model does not have, and a `speech` that is not `true` or an
+object of `voice` / `language`. A stopped reply writes no WAV and has no
+`audioId`.
+
+Keep the reply in the history with its `audioId` (and `audioUrl`, which the
+bundled pages use to show a player and a download): sent back on the assistant
+message, `{"role": "assistant", "content": "<transcript>", "audioId": "audio_5f0c..."}`
+splices the turn as the model generated it (its tokens, and each speech frame's
+row), so the prompt holds exactly what the cache holds. A spoken turn is kept
+for an hour in memory, for the model load that made it; an older or unknown id,
+or a message whose text is not the transcript, renders as its text, and the
+server log says so once. The spoken turn's system prompt names the voice, so the
+next turn reuses the cached prompt when it is spoken too.
+
+The bundled Web UI shows a **Speak replies** switch (and a voice picker) only
+when `speechOutput.available`; it plays the `audio` frames as they arrive, and
+leaves an `<audio>` player and a **Download audio** link in the bubble when the
+reply is done. TensorAgent's chat does the same, with **Save audio** going
+through the app's save picker.
 
 ### File Uploads (`/api/upload`) — images, video, audio, text, PDF
 

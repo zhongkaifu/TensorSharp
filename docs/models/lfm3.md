@@ -477,8 +477,10 @@ conversation's reply goes on in text after its speech, as the model card's `gene
 llama.cpp's realtime server do; a TTS reply stops at the end of its speech, as llama-tts does.
 
 Where to use it: CLI `--tts` / `--speech-out` (with `--speech-mode`, `--speech-temperature`,
-`--voice`, `--language`, `--seed`), `POST /v1/audio/speech`, and `/v1/chat/completions` /
-`/v1/responses` with `modalities` `["text","audio"]` or `["audio"]` — see
+`--voice`, `--language`, `--seed`), `POST /v1/audio/speech`, `/v1/chat/completions` /
+`/v1/responses` with `modalities` `["text","audio"]` or `["audio"]`, and the web chat
+(`/api/chat` with `speech`: the bundled Web UI's and TensorAgent's **Speak replies** switch, which
+play the reply as it is generated and keep a player and a download) — see
 [USAGE.md → Speech output](../../USAGE.md#speech-output-lfm3-omni). Voices are `female`
 and `male` (named in the system prompt; there is no speaker embedding); an unknown voice,
 OpenAI's default `alloy` included, is a 400 that lists them. A spoken chat reply's system
@@ -524,11 +526,20 @@ it: the token that opened the mode, the text tokens and one `<|audio_out|>` per 
 given that frame's codebook-sum row (the end-of-speech frame included), as HF's processor gives a
 past speech turn's placeholders. Its prompt tokens are therefore the reply's own sequence (checked
 token for token against generation on LFM3-Omni Q8_0). Each run of frames is one media span keyed
-by its codes. An id whose generation is not known renders as its transcript.
+by its codes. An id whose generation is not known renders as its transcript. The web chat
+(`/api/chat`) sends a spoken reply back the same way, by the `audioId` on its assistant message.
 
-Limits: no `/v1/realtime`; speech requests are not retained in the prefix cache, and a later turn
-does not yet reuse the cache across a spliced spoken turn (open issue). On CUDA the speech output is
-checked by an ASR round trip (no word errors), not bit for bit against llama-tts.
+Prefix reuse: a spoken reply's end state is retained like a text reply's. Its driver names each run of
+the frames it decoded by the same codes-keyed id the expander gives the spliced turn
+(`IOutputMediaDriver`, `Lfm3SpeechOutput.FramesContentId`), so the next turn resumes from it through the
+whole reply. Checked on LFM3-Omni Q8_0 + Q8_0 mmproj (ggml-metal server, web chat, three spoken turns):
+turn 2 reused 84 of its 111 prompt tokens (all of turn 1: prompt, `<|mixed_start|>` and the 40 slots it
+computed), turn 3 156 of 179, and turn 3 answered from the spoken turns ("I named Paris first."). The
+spoken system prompt names the voice and asks for interleaved replies, so a text turn after a spoken one
+(or the reverse) differs from the system message on and re-prefills.
+
+Limits: no `/v1/realtime`. On CUDA the speech output is checked by an ASR round trip (no word errors),
+not bit for bit against llama-tts.
 
 ## Benchmarking
 
@@ -685,8 +696,9 @@ results). In the same session ggml_metal ran Q4_K_M pp512 / tg128 at 6,041 / 191
 
 ## Current limits
 
-- Speech output has no realtime endpoint (`/v1/realtime`), and a later turn does not yet reuse
-  the prefix cache across a past spoken turn (see [Speech output](#speech-output)).
+- Speech output has no realtime endpoint (`/v1/realtime`), and a text turn after a spoken one
+  re-prefills from the system prompt, which names the voice only on spoken turns (see
+  [Speech output](#speech-output)).
 - Many concurrent requests decode slower than vLLM and SGLang (A40: 17.4 / 51 ms a token at 16 / 64
   requests against vLLM's 8.1 / 11.0): a batched step runs each sequence's attention and short
   convolution as ops of its own (about 128 kernels a sequence on ggml_cuda), and is traced again whenever

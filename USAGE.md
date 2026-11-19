@@ -3054,11 +3054,14 @@ row (no LM head when no request of the step needs logits), so speech and text re
 | `POST /v1/audio/speech` | `input`, `voice` (`female`/`male`; anything else, OpenAI's default `alloy` included, is a 400 listing the voices), `language`, `response_format` `wav`/`pcm`/`pcm16`, `stream: true` (chunked; a WAV stream starts with an unknown-length header) or `stream_format: "audio"`/`"sse"`, `seed`, `temperature`, `max_frames`. `speed` other than 1 is a 400. |
 | `POST /v1/chat/completions`, `POST /v1/responses` | `"modalities": ["text","audio"]` (interleaved: the text is the transcript; the conversational mode) or `["audio"]` (speech only, opened with `<|audio_start|>`: LFM3-Omni then reads the user's message aloud rather than answering, as in llama.cpp), with `"audio": {"voice": "female", "format": "wav"\|"pcm16"}` (TensorSharp also reads `language`, `seed`, `temperature` there). Non-streaming: `message.audio = {id, expires_at, data, transcript}`; streaming (pcm16 only): `delta.audio` `id`, then `transcript` and `data` pieces in order, then `expires_at`. Sending the reply back as `{"role":"assistant","audio":{"id":...}}` renders it as its transcript for an hour. |
 | `GET /v1/models` | A model that speaks lists `"capabilities": ["chat","audio_output"]` and its voices. |
+| `POST /api/chat` (the Web UI, TensorAgent) | `"speech": true` or `{"voice": ..., "language": ...}`: an interleaved reply with thinking off, its transcript in `token` frames and its speech in `audio` frames (base64 PCM16 at `sampleRate`) between them, and a `done` frame with `audioId`, `audioUrl` (the whole reply's WAV under `/uploads/`) and `audioSeconds`. Skills, tools and knowledge lookups do not run in a spoken turn (a `notice` frame says so). `GET /api/models` reports `speechOutput: {available, voices, reason}`; the pages show a **Speak replies** switch only when it is available, play the reply as it arrives, and keep a player and a download. See [API_EXAMPLES.md → Spoken replies](TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni). |
 
 Text replies of LFM3-Omni never sample the media placeholders, and a text-only reply never opens speech
-(`<|audio_start|>`, `<|mixed_start|>` are banned), as the model card's `generate` does. Speech requests are not
-retained in the prefix cache (their frames are rows, not tokens), and a spoken assistant turn in later history
-re-renders as its transcript, not as audio. See [docs/models/lfm3.md](docs/models/lfm3.md#speech-output).
+(`<|audio_start|>`, `<|mixed_start|>` are banned), as the model card's `generate` does. A spoken assistant turn
+sent back by its id (`audio.id` on `/v1/chat/completions`, `audioId` on `/api/chat`, kept for an hour) is spliced as
+generation decoded it, and a spoken reply's end state is retained with each run of its frames keyed by its codes,
+so the next spoken turn reuses the cached prompt through it. An unknown id renders as its transcript. See
+[docs/models/lfm3.md](docs/models/lfm3.md#speech-output).
 
 ```bash
 curl http://localhost:5000/v1/audio/speech -H "content-type: application/json" \
