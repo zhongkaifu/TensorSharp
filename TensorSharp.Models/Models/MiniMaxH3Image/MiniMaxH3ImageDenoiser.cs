@@ -59,16 +59,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
         internal MiniMaxH3ImageDenoiser(MiniMaxH3WeightFile file, bool ownsFile, BackendType backend, IGraphExecutor executor,
             IAllocator tensorAllocator)
         {
-            try
-            {
-                Backend = backend;
-                _w = new MiniMaxH3ImageWeights(file, ownsFile, backend);
-            }
-            catch
-            {
-                if (ownsFile) file?.Dispose();
-                throw;
-            }
+            Backend = backend;
+            _w = new MiniMaxH3ImageWeights(file, ownsFile, backend);   // disposes an owned file when it throws
             try
             {
                 (_executor, _tensorAllocator) = executor != null
