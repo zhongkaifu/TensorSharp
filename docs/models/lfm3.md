@@ -558,6 +558,18 @@ Q4_K_M at 16K: 111.4 (second round), 112.7 (before) and 71.2 (llama.cpp) tokens/
 in aggregate against 126.8 and 118.3. Decode pays up to 4% on Q4_K_M and 2% on Q8_0 for the
 separate gate and up products, which saved 405-765 MB (below).
 
+A review re-run that evening (same machine and builds, interleaved, 3 rounds; Q4_K_M prompts 4)
+put the second round, the tree before it and llama.cpp at: Q4_K_M pp128 / pp512 923 / 922, 910 /
+917 and 949 / 942; Q8_0 1122 / 1128, 1087 / 1107 and 1149 / 1137; NVFP4 955 / 971, 357 / 613 and
+366 (ggml-cpu build) / 528 (BLAS); Q4_K_M decode at depth 0 / 4K 160.8 / 141.9, 164.5 / 144.4 and
+160.7 / 136.3. Served Q4_K_M, the time to first token of one stream was 568 ms against 617 before,
+628 for the second round with its prompt pool on 18 threads, and llama-server's 612; four streams
+reached 127.9 tokens/s in aggregate against 121.0 and 106.8. Prompt cells move by up to 10%
+between sessions: on Q4_K_M and Q8_0 the round's engine-bench prompt gain is 1-3% in the re-run
+(the table's 12% at Q4_K_M pp128 came from slow runs of the tree before it), and decode is at parity with
+llama.cpp at depth 0 rather than ahead; the served time-to-first-token gain (8-10%) holds and comes
+from the prompt pool leaving one core to the server's own threads.
+
 ## Current limits
 
 - Speech output has no realtime endpoint (`/v1/realtime`), and a later turn does not yet reuse
@@ -576,9 +588,9 @@ separate gate and up products, which saved 405-765 MB (below).
 - The QAD-Q4_0 file is not in TensorAgent's catalog pending a quality and speed
   measurement against Q4_K_M.
 - CPU lanes against llama.cpp's CPU builds on an M5 Pro (see [Benchmarking](#benchmarking)):
-  ggml_cpu's Q4_K_M prompts of 128 and 512 tokens are 6-7% behind (Q8_0 2-4%, QAD-Q4_0 and
-  2,048-token prompts at parity; Q8_0's products and thread-pool waits sample alike in both
-  engines, and the cell moves by up to 5% between sessions). The managed CPU decodes quantized
+  ggml_cpu's Q4_K_M prompts of 128 and 512 tokens are 2-7% behind depending on the session
+  (Q8_0 0-4%, QAD-Q4_0 and 2,048-token prompts at parity; Q8_0's products and thread-pool waits
+  sample alike in both engines, and the cell moves by up to 10% between sessions). The managed CPU decodes quantized
   files at 0.70-0.86x (its pool waits on the slowest of 6 + 12 unequal cores for small
   products, and the graph interpreter costs a few percent a step), runs Q8_0 / Q4_0 prompts
   of 512 tokens and more at 0.77-0.84x (llama.cpp's repacked GEMMs use i8mm, which .NET 10

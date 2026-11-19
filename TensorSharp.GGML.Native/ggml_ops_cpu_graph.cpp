@@ -381,9 +381,10 @@ namespace tsg
         // on Apple Silicon, which on an M5 Pro (6P+12E) leaves ~2x of prompt throughput on the table (LFM3-1.7B Q4_K_M
         // pp512: 166 tok/s at 6 threads, 381 at 18; Muse-Glimmer 30B decode 3.8 -> 8.2 tok/s). The pool's workers wait for
         // each other at every node, so a worker that loses its core to one of the host's own threads (the .NET runtime,
-        // the server) stalls the step: on a hybrid Apple CPU the pool leaves one physical core to them (M5 Pro, LFM3-1.7B,
-        // 18 -> 17 threads, interleaved, 4 rounds: Q4_K_M pp128 / pp512 / pp2048 812 -> 893 / 893 -> 899 / 860 -> 868
-        // tok/s, Q8_0 1149 -> 1170 / 1115 -> 1170 / 1089 -> 1096). Elsewhere (no measurement yet) every physical core.
+        // the server) stalls the step: on a hybrid Apple CPU the pool leaves one physical core to them (M5 Pro, LFM3-1.7B
+        // Q4_K_M, 18 -> 17 threads, interleaved: a served 512-token prompt's first token 628 -> 568 ms, p50 of 3 rounds;
+        // engine prompts within their run-to-run spread, Q4_K_M pp128 / pp512 909 -> 923 / 933 -> 922 tok/s, Q8_0
+        // 1107 -> 1122 / 1173 -> 1128). Elsewhere (no measurement yet) every physical core.
         // TS_GGML_CPU_THREADS overrides the count for every step.
         const int forced = env_threads("TS_GGML_CPU_THREADS");
         int physical = 0, perf = 0, eff = 0;

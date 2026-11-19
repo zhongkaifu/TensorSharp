@@ -53,7 +53,8 @@ namespace TensorSharp.GGML
                 // index, attended where they lie): no copies of every chunk's q, k and v, nor of its fresh K/V rows, and one
                 // short-convolution in-projection product instead of three. The same bits (logits digests of LFM3-1.7B
                 // Q4_K_M and Q8_0, Ministral-3 3B, Hunyuan-MT2 1.8B, Qwen3.5 0.8B). LFM3-1.7B Q4_K_M on an M5 Pro (18 threads,
-                // interleaved): pp128 807 -> 953 tok/s, pp512 876 -> 953, pp2048 844 -> 877; the other families' prompts
+                // interleaved): pp128 807 -> 953 tok/s, pp512 876 -> 953, pp2048 844 -> 877 in one session, within the
+                // run-to-run spread in another (pp128 / pp512 910 -> 909 / 917 -> 933, 4 rounds); the other families' prompts
                 // within their run-to-run spread (Qwen3.5 pp512 2,170 -> 2,313).
                 PackedProductBlocks = metal || backend is GgmlBackendType.Cuda or GgmlBackendType.Cpu,
                 FreshRowViews = backend == GgmlBackendType.Cpu,
