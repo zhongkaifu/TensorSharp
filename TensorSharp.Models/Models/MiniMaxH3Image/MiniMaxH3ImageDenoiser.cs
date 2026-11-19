@@ -124,13 +124,17 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return WorkingBytesFor(_w.Config, RowsOf(workload), fused: Backend == BackendType.GgmlCuda, quantized);
         }
 
-        /// <summary>The packed sequence's rows for <paramref name="workload"/>: the target's and the references' 2x2 patches and
-        /// about a token every three characters of the prompt (small beside the image).</summary>
+        /// <summary>The packed sequence's rows for <paramref name="workload"/>: the target's and the references' 2x2 patches,
+        /// about a token every three characters of the prompt, and an edit's vision blocks in the text (a merged patch of
+        /// each picture's vision copy, its markers and its label).</summary>
         internal static long RowsOf(DiffusionWorkload workload)
         {
             long rows = (long)(workload.Target.Height / 2) * (workload.Target.Width / 2);
             if (workload.References != null)
                 foreach (LatentShape r in workload.References) rows += (long)(r.Height / 2) * (r.Width / 2);
+            if (workload.Pictures != null)
+                foreach (PresentedImage p in workload.Pictures)
+                    rows += MiniMaxH3ImageConditioner.VisionTokens(p.Image.Width, p.Image.Height) + 2 + 6;
             return rows + Math.Max(1, (workload.Prompt?.Length ?? 0) / 3);
         }
 

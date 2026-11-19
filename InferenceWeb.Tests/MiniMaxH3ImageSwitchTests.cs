@@ -89,13 +89,21 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
         Assert.Equal(MiniMaxH3ImageFamily.ArchitectureId, ModelArchitectureRegistry.ResolveSafetensors(dit.DitPath)?.Id);
         using ModelBase model = ModelBase.Create(dit.DitPath, TestGates.PinnedGgmlBackend);
         var runtime = Assert.IsType<MiniMaxH3ImageDiffusionModel>(model);
-        Assert.False(runtime.SupportsImageEdit);
+        Assert.True(runtime.SupportsImageEdit);
         Assert.Equal(MiniMaxH3ImageFamily.ArchitectureId, model.Config.Architecture);
         Assert.Equal(MiniMaxH3ImageSampling.GridFrom(new System.Collections.Generic.Dictionary<string, string>(), MiniMaxH3ImageFixture.PddSteps),
             runtime.PddSigmas.ToArray());
         Assert.Equal(MiniMaxH3ImageFixture.Blocks, runtime.DitConfig.NumLayers);
         Assert.False(runtime.Pipeline.IsResident(DiffusionComponent.Denoiser));
-        Assert.Throws<NotSupportedException>(() => runtime.EditImage("x", Array.Empty<RgbImage>(), new QwenImageParams()));
+        Assert.Contains("at least one reference image", Assert.Throws<ArgumentException>(() =>
+            runtime.EditImage("x", Array.Empty<RgbImage>(), new QwenImageParams())).Message);
+        var picture = new RgbImage(64, 64, new float[64 * 64 * 3]);
+        Assert.Contains("cfg must be 1", Assert.Throws<ArgumentException>(() =>
+            runtime.EditImage("x", new[] { picture }, new QwenImageParams { CfgScale = 2 })).Message);
+        Assert.Contains("negative prompt", Assert.Throws<ArgumentException>(() =>
+            runtime.EditImage("x", new[] { picture }, new QwenImageParams { NegativePrompt = "no" })).Message);
+        Assert.Contains("edit mask", Assert.Throws<ArgumentException>(() =>
+            runtime.EditImage("x", new[] { picture }, new QwenImageParams { Mask = picture })).Message);
         // The legacy refusals, in the legacy order, before any component is made.
         Assert.Contains("cfg must be 1", Assert.Throws<ArgumentException>(() => runtime.GenerateImage("x", new QwenImageParams { CfgScale = 2 })).Message);
         Assert.Contains("negative prompt", Assert.Throws<ArgumentException>(() => runtime.GenerateImage("x", new QwenImageParams { NegativePrompt = "no" })).Message);

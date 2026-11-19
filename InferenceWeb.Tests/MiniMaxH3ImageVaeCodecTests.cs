@@ -204,7 +204,7 @@ public sealed class MiniMaxH3ImageVaeCodecTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void TheCodecDeclaresItsWeightsAndARowsWorkingMemoryAndRefusesToEncode()
+    public void TheCodecDeclaresItsWeightsAndARowsWorkingMemoryAndRefusesToEncodeWithoutAnEncoder()
     {
         using var fx = new MiniMaxH3ImageVaeFixture(2);
         using var codec = new MiniMaxH3ImageVaeCodec(fx.VaePath, TestGates.PinnedGgmlBackend);
@@ -218,7 +218,10 @@ public sealed class MiniMaxH3ImageVaeCodecTests(ITestOutputHelper output)
         var narrow = new DiffusionWorkload(new LatentShape(24, 1, 16, 16), Array.Empty<LatentShape>(), "");
         var wide = new DiffusionWorkload(new LatentShape(24, 1, 16, 128), Array.Empty<LatentShape>(), "");
         Assert.True(codec.WorkingBytes(wide) > codec.WorkingBytes(narrow));
-        Assert.Throws<NotSupportedException>(() => codec.Encode(new RgbImage(16, 16, new float[16 * 16 * 3]), CancellationToken.None));
+        // A file with no encoder (this decoder-only fixture) cannot encode references; its weights stay the decoder's.
+        Assert.Contains("no encoder", Assert.Throws<InvalidOperationException>(() =>
+            codec.Encode(new RgbImage(16, 16, new float[16 * 16 * 3]), CancellationToken.None)).Message);
+        Assert.Equal(projections + vectors, codec.WeightBytes);
         Assert.Throws<NotSupportedException>(() => new MiniMaxH3ImageVaeCodec(fx.VaePath, BackendType.Cpu));
     }
 }
