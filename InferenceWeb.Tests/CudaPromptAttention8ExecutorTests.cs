@@ -214,11 +214,12 @@ public sealed class CudaPromptAttention8ExecutorTests : IDisposable
         }
     }
 
-    /// <summary>The band's room: a cached block of its size, or the driver's free memory past the band and the reserve, made
-    /// where the pool's idle large blocks can make it (only the shortfall given back), refused where even all of them could
-    /// not; a reserve of long.MaxValue (the tests' refusal seam) refuses without overflowing.</summary>
+    /// <summary>The arithmetic of the band's room (the device path is CudaPromptAttention8BandRoomTests): a cached block of its
+    /// size, or the driver's free memory past the band and the reserve, made where the pool's idle large blocks can make it
+    /// (only the shortfall asked for), refused where even all of them could not; a reserve of long.MaxValue (the tests' refusal
+    /// seam) refuses without overflowing.</summary>
     [Fact]
-    public void TheBandTakesThePoolsIdleBlocksBeforeItIsRefused()
+    public void TheBandsTrimIsItsShortfallWhereTheIdleBlocksCoverIt()
     {
         const long MB = 1L << 20;
         Assert.Equal(0, CudaGraphExecutor.BandTrimBytes(true, 0, 0, 100 * MB, 512 * MB));
@@ -228,5 +229,74 @@ public sealed class CudaPromptAttention8ExecutorTests : IDisposable
         Assert.Equal(-1, CudaGraphExecutor.BandTrimBytes(false, 212 * MB, 399 * MB, 100 * MB, 512 * MB));
         Assert.Equal(-1, CudaGraphExecutor.BandTrimBytes(false, 30_000 * MB, long.MaxValue / 2, 100 * MB, long.MaxValue));
         Assert.Equal(-1, CudaGraphExecutor.BandTrimBytes(false, 0, 0, 100 * MB, 512 * MB));
+    }
+}
+
+/// <summary>
+/// The 8-bit prompt attention's band on the device when the driver alone has no room for it (a server near the card's edge,
+/// whose model released conversations into the pool's cache for a long prompt): it gives back as many of the pool's idle large
+/// blocks as its room needs, not all of them, and every marked chunk still attends in 8 bits; where even all of them would
+/// not make the room it is refused without giving any back. Runs alone: it reads the driver's free memory, which another
+/// test's allocations or frees would move between that reading and the band's.
+/// </summary>
+[Collection(DeviceFillingCollection.Name)]
+public sealed class CudaPromptAttention8BandRoomTests : IDisposable
+{
+    private const long MiB = 1L << 20;
+    private const int PromptLength = 1300;
+    private readonly string _dir = Directory.CreateTempSubdirectory("prompt-attn8-band").FullName;
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+    }
+
+    private static int[] Tokens(int n) => Enumerable.Range(0, n).Select(i => 3 + (i * 37 + i / 7) % 250).ToArray();
+
+    [CudaFact(PromptAttention8 = true)]
+    public void TheBandTakesThePoolsIdleBlocksBeforeItIsRefused()
+    {
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        string trunk = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "trunk.gguf"));
+        using var model = new Qwen35RuntimeModel(trunk, BackendType.Cuda);
+        var executor = Assert.IsType<CudaGraphExecutor>(model.GraphExecutorForTests);
+        var cuda = Assert.IsType<CudaAllocator>(executor.Allocator);
+        executor.PromptAttention8ForTests = true;
+
+        // A first prompt rents the step's buffers, so the measured ones allocate little beyond the band.
+        model.ForwardPrompt(Tokens(PromptLength));
+        model.ResetKVCache();
+        long layers = executor.PromptAttention8Launches;
+        Assert.True(layers > 0, "the prompt did not attend in 8 bits");
+        Assert.Equal(0, executor.PromptAttention8BandRefusals);
+
+        // Idle large blocks of a size the trunk never rents.
+        const long Block = 130 * MiB;
+        const int Blocks = 8;
+        var parked = Enumerable.Range(0, Blocks).Select(_ => new Tensor(cuda, DType.Float32, Block / sizeof(float))).ToList();
+        cuda.Synchronize();
+        parked.ForEach(t => t.Dispose());
+        Assert.True(cuda.HasCachedBlock(Block), "the parked blocks were not cached");
+
+        // The band asks for 300 MiB more than the driver has free: the pool's idle blocks make the room.
+        long band = CudaFlashPrefillKernels.Attn8BandBytes(CudaFlashPrefillKernels.Attn8BandKeys(PromptLength), kvHeads: 2);
+        CudaAllocatorStats before = cuda.GetStats();
+        executor.Attn8BandHeadroomForTests = cuda.FreeDeviceBytes() - band + 300 * MiB;
+        model.ForwardPrompt(Tokens(PromptLength));
+        model.ResetKVCache();
+        CudaAllocatorStats after = cuda.GetStats();
+        Assert.Equal(0, executor.PromptAttention8BandRefusals);
+        Assert.Equal(2 * layers, executor.PromptAttention8Launches);
+        Assert.True(after.LargeTrimFrees > before.LargeTrimFrees, "the band found room without giving an idle block back");
+        Assert.True(after.LargeCachedBytes < before.LargeCachedBytes,
+            $"the pool caches {before.LargeCachedBytes / MiB} -> {after.LargeCachedBytes / MiB} MiB across a 300 MiB shortfall");
+        Assert.True(cuda.HasCachedBlock(Block), "the band gave back every idle block, not its shortfall");
+
+        // More than every idle block would make: refused on every attention layer, and nothing given back.
+        executor.Attn8BandHeadroomForTests = cuda.FreeDeviceBytes() + cuda.ReclaimableBytes + 1024 * MiB;
+        model.ForwardPrompt(Tokens(PromptLength));
+        Assert.Equal(2 * layers, executor.PromptAttention8Launches);
+        Assert.Equal(layers, executor.PromptAttention8BandRefusals);
+        Assert.Equal(after.LargeTrimFrees, cuda.GetStats().LargeTrimFrees);
     }
 }

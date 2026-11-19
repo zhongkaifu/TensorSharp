@@ -41,7 +41,9 @@ namespace TensorSharp.Cuda
         internal Action<long, double, double> PromptAttention8CheckForTests { get; set; }
 
         /// <summary>Tests: the device memory a band must leave free in place of <see cref="Attn8BandHeadroomBytes"/>, a cached
-        /// block of its size not counted as room.</summary>
+        /// block of its size not counted as room; the pool's other idle large blocks still make room as they do without the
+        /// seam (<see cref="BandTrimBytes"/>), so a test can make the band give them back, and long.MaxValue refuses every band
+        /// without giving any back.</summary>
         internal long? Attn8BandHeadroomForTests { get; set; }
 
         /// <summary>Device memory a band that is not in the pool's cache must leave free (the direct engine's growth reserve):
@@ -106,7 +108,7 @@ namespace TensorSharp.Cuda
         {
             bool seam = Attn8BandHeadroomForTests != null;
             long headroom = Attn8BandHeadroomForTests ?? Attn8BandHeadroomBytes;
-            long trim = BandTrimBytes(!seam && cuda.HasCachedBlock(bytes), cuda.FreeDeviceBytes(), seam ? 0 : cuda.ReclaimableBytes, bytes, headroom);
+            long trim = BandTrimBytes(!seam && cuda.HasCachedBlock(bytes), cuda.FreeDeviceBytes(), cuda.ReclaimableBytes, bytes, headroom);
             if (trim <= 0)
                 return trim == 0;
             cuda.TrimLargeCache(trim, keepBlockBytes: cuda.AllocationBlockBytes(bytes));
