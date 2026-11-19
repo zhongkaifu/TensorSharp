@@ -522,6 +522,7 @@ namespace TensorSharp.Models
                 }
             }
             _cacheCapacity = capacity;
+            NoteShareCapacity(_cacheK, capacity);   // the arrays are the same objects, their tensors larger
             Console.WriteLine($"Expanded {Config.Architecture} attention cache to {capacity} tokens.");
         }
 
@@ -551,6 +552,7 @@ namespace TensorSharp.Models
 
         protected override void ResetKVCacheCore()
         {
+            PrepareWrite(_cacheK, 0);   // every row is rewritten: the checkpoints over them go first
             _verifyRows = 0;   // the state is reset; nothing to settle
             DropReplaysOf(_cacheK, _recurrentPrimary);
             _draftStart = 0;
@@ -571,6 +573,8 @@ namespace TensorSharp.Models
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
+            // The checkpoints past the new length go first: the rows from it on are written again.
+            PrepareWrite(_cacheK, tokenCount);
             SyncActiveToHost();
             ClearGraphCache();
             if (tokenCount < _draftFollowed) _draftFollowed = -1;   // the rows the draft layer followed are rewritten
@@ -678,6 +682,7 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int start = _cacheSeqLen;
             EnsureCacheCapacity(checked(start + seqLen));
+            PrepareWrite(_cacheK, start);
             _forwardSw.Start();
             try
             {

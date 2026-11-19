@@ -209,6 +209,7 @@ namespace TensorSharp.Models
             SettlePendingVerify();
             int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
             EnsureCacheCapacity(checked(start + rows));
+            PrepareWrite(_cacheK, start);
             bool dflash = HasDFlash;
             // A buffer smaller than every row's DFlash features takes the last row's: the step returns only that row.
             bool lastFeatureRow = dflash && hAllOut != null && hAllOut.LongLength < (long)rows * DFlashSettings.FeatureSize;

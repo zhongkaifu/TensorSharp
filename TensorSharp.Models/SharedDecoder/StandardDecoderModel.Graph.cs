@@ -1272,6 +1272,8 @@ namespace TensorSharp.Models
             bool deviceOutputs = false, string shape = null, Tensor advanceHidden = null, Tensor[] advanceInputs = null,
             int[] attentionFloors = null)
         {
+            // The rows from each start on are written: the checkpoints sharing them past it go first (StandardDecoderModel.RowShares.cs).
+            PrepareWrites(slots, starts);
             // A drafter's steps (IGraphExecutor.Drafting): its proposals are verified, so its products may take kernels whose
             // last bits vary (the direct engines ran their drafters' Q4_K products on the int8 tensor cores).
             IGraphExecutor executor = GraphExecutor;

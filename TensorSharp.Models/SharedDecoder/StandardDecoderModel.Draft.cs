@@ -123,6 +123,7 @@ namespace TensorSharp.Models
         /// through the per-op layer, its attention floored at the rows it replayed.</summary>
         private void RunDraftLayerPerOp(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
         {
+            PrepareWrite(_cacheK, startPos);
             int rows = tokens.Length, hiddenSize = Config.HiddenSize, n = Config.NumLayers;
             _forwardSw.Start();
             Tensor x = null;

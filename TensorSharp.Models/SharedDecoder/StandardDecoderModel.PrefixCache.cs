@@ -85,8 +85,14 @@ namespace TensorSharp.Models
         {
             if (!TryGetRetained(payloadKey, out Slot slot)) return default;
             long bytes = RecurrentStateBytes(slot);
-            foreach (Tensor t in AllCacheTensors(slot.K)) bytes = checked(bytes + t.Storage.ByteLength);
-            foreach (Tensor t in AllCacheTensors(slot.V)) bytes = checked(bytes + t.Storage.ByteLength);
+            // A shared-row checkpoint is charged its states only: its rows are its owner's (as the direct engine charged its
+            // checkpoints no K/V). After a hand-over the tree under-counts it until it goes; the device's measured room bounds
+            // memory (EnsureDeviceRoom, the deficit).
+            if (!slot.SharesRows)
+            {
+                foreach (Tensor t in AllCacheTensors(slot.K)) bytes = checked(bytes + t.Storage.ByteLength);
+                foreach (Tensor t in AllCacheTensors(slot.V)) bytes = checked(bytes + t.Storage.ByteLength);
+            }
             bool host = _backend is BackendType.Cpu or BackendType.GgmlCpu;
             var vector = new ResourceVector { HostKv = host ? bytes : 0, DeviceKv = host ? 0 : bytes };
             return new PayloadFootprint(slot.Length, slot.Capacity, vector, PositionDelta: 0);

@@ -304,7 +304,7 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_DFLASH_SELECTOR_DEBUG` | DFlash2 草稿器（逐算子路径） | `1` 打印前几个 block 的候选格归因：一元项分布、转移项分布，以及这次游走是否离开了一元 argmax | 关 | 未注册 | 否 |
 | `TS_DSPINE_DUMP` | DSpine 草稿器 | 一个目录：把前四次草稿的输入（环里保存的每个上下文特征行及其位置、block）和输出（候选、候选格、链）写成 `draftN.bin`，供 `eng/dspine-reference.py real` 用检查点重新计算（诊断用） | 未设置 | 未注册 | 否 |
 | `TS_DSPINE_BF16_POINTS` | DSpine 草稿器 | `1` 在参考实现舍入的位置把代码桥的激活舍入为 BF16（raw、归一化行、读投影、码、打包投影、消息、写入增量、写入后的行、下一层归一化），而不是保持 F32——用来衡量 TensorSharp 的 F32 激活带来的差别（诊断用） | 关 | 未注册 | 否 |
-| `TS_PREFIX_RELEASE_DEBUG` | Qwen 3.5 / 3.8 前缀缓存 | `1` 记录保留/规划/整理决策、降级（`[prefix-demote]`）及其主机同步（`[prefix-sync]`） | 关 | 未注册 | 否 |
+| `TS_PREFIX_RELEASE_DEBUG` | Qwen 3.5 / 3.8 前缀缓存 | `1` 记录保留/规划/整理决策、降级（`[prefix-demote]`）及其主机同步（`[prefix-sync]`），以及在 `--backend cuda` 上与请求共享行的提示末尾检查点、下一轮接管的槽位和复制（`[prefix-share]`） | 关 | 未注册 | 否 |
 | `TS_GGML_HOST_POOL_MB` | GGML CUDA 主机内存分配 | 保留任意大小已释放主机块以供复用的字节预算（新映射首次访问会产生缺页）；`0` 仅保留按数量限制的小块池 | `min(8 GiB, 内存/16)` | 未注册 | 否 |
 | `TS_BATCHED_SPEC_LOG` | 批量推测解码 | `1` 打印每个批量步骤保留的 token 数以及草稿 / 验证 / 提交 / 草稿模型提交的毫秒数（`[batched-spec]`） | 关 | 未注册 | 否 |
 | `TS_SCHED_STEP_LOG` | 连续批处理执行器 | `1` 每步打印一行：距上一步的空闲间隔、服务路径耗时毫秒数，以及每个序列的预填充/解码 token 数（`[step]`） | 关 | 未注册 | 否 |

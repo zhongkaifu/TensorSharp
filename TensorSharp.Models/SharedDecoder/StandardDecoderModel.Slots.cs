@@ -50,6 +50,10 @@ namespace TensorSharp.Models
             /// <summary>For a <see cref="DraftRing"/>: how often the ring changed hands (a request took it, or continued the
             /// context it kept); a recording of a step over it that failed for one owner is tried again for the next.</summary>
             public int DraftRingOwners;
+            /// <summary>A shared-row checkpoint (StandardDecoderModel.RowShares.cs): <see cref="K"/> and <see cref="V"/> are another
+            /// slot's arrays, whose rows below <see cref="Length"/> that slot never writes again while this lasts; its
+            /// <see cref="Recurrent"/> states are its own. Retained only: it never runs a request, and is never pooled.</summary>
+            public bool SharesRows;
         }
 
         private static long s_retainSerial;
@@ -680,6 +684,18 @@ namespace TensorSharp.Models
         private void DisposeSlot(Slot slot)
         {
             if (slot == null) return;
+            _spareStatesRefused = false;
+            // A checkpoint frees its own parts only; a slot whose rows checkpoints share hands them to the longest.
+            if (slot.SharesRows)
+            {
+                DisposeDependent(slot);
+                return;
+            }
+            if (HasDependents(slot))
+            {
+                HandOverRows(slot);
+                return;
+            }
             _idleSpareRefused = false;
             _slotMutationDepth++;
             try
@@ -703,6 +719,12 @@ namespace TensorSharp.Models
         private void RecycleSlot(Slot slot)
         {
             if (slot?.K == null) return;
+            // Never pooled: a checkpoint's rows are another slot's, and a slot whose rows checkpoints share hands them over.
+            if (InAnyShare(slot))
+            {
+                DisposeSlot(slot);
+                return;
+            }
             _slotPool ??= new List<Slot>(SlotPoolMax);
             if (_slotPool.Count < Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax) && RoomToPool(slot))
                 _slotPool.Add(slot);
@@ -784,9 +806,11 @@ namespace TensorSharp.Models
                 CopyRows(slot.V, v, slot.Length);
                 foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
                 foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                Tensor[][] oldK = slot.K;
                 slot.K = k;
                 slot.V = v;
                 slot.Capacity = capacity;
+                RepointDependents(oldK, slot);   // the grown caches hold every row the checkpoints share
             }
             finally
             {
@@ -808,6 +832,7 @@ namespace TensorSharp.Models
             _slotMutationDepth++;
             var cuda = DeviceRoomForTests == null ? _allocator as TensorSharp.Cuda.CudaAllocator : null;
             Tensor[][] k = new Tensor[CacheEntries][], v = new Tensor[CacheEntries][];
+            Tensor[][] oldK = slot.K;
             int made = 0;
             try
             {
@@ -838,6 +863,7 @@ namespace TensorSharp.Models
                 slot.K = k;
                 slot.V = v;
                 slot.Capacity = capacity;
+                RepointDependents(oldK, slot);   // the grown caches hold every row the checkpoints share
                 RollingGrowths++;
 
                 Tensor Replace(Tensor[] old, int r, int e, bool value)
@@ -875,6 +901,7 @@ namespace TensorSharp.Models
                 slot.Recurrent = null;
                 slot.DraftCarry?.Dispose();
                 slot.DraftCarry = null;
+                InvalidateDependents(oldK, Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed);   // their rows went too
                 throw new InvalidOperationException(string.Create(System.Globalization.CultureInfo.InvariantCulture,
                     $"{Config.Architecture}: growing a slot from {slot.Capacity:N0} to {capacity:N0} cells failed after {made} of its " +
                     $"cache tensors ({ex.Message}); the request's slot was released."), ex);
@@ -992,6 +1019,8 @@ namespace TensorSharp.Models
         {
             if (_retainedSlots == null || string.IsNullOrEmpty(retainedKey) || string.IsNullOrEmpty(newRequestId)) return false;
             if (!_retainedSlots.TryGetValue(retainedKey, out Slot slot) || slot.K == null) return false;
+            // A checkpoint over another slot's rows is never rebound: it is copied (nothing here may use up its rows' holder).
+            if (slot.SharesRows) return MaterializeShared(retainedKey, slot, newRequestId, donate: true, consumable: null, 0);
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_slots.ContainsKey(newRequestId) || string.Equals(_activeKey, newRequestId, StringComparison.Ordinal)) return false;
             _slots.Add(newRequestId, slot);
@@ -1018,6 +1047,12 @@ namespace TensorSharp.Models
 
         private void DisposeSlots()
         {
+            DisposeSpareCheckpointStates();
+            // The checkpoints' own parts first, so every slot then frees its rows once.
+            if (_rowShares != null)
+                foreach (List<Slot> dependents in _rowShares.Values.ToList())
+                    foreach (Slot d in dependents.ToList()) DisposeDependent(d);
+            _rowShares = null;
             if (_activeKey != null)
             {
                 // The active fields are the bound slot: the primary is parked.
@@ -1087,6 +1122,7 @@ namespace TensorSharp.Models
         {
             NoteEngineThread();
             ForgetDeferredGraphs();
+            if (SlotInvariantChecksForTests) CheckSlotShareInvariants();
             try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {
@@ -1166,6 +1202,7 @@ namespace TensorSharp.Models
                 int required = checked(starts[s] + counts[s]);
                 EnsureSlotCapacity(slots[s], required, wanted: WantedCells(requestIds[s], required));
             }
+            PrepareWrites(slots, starts);   // the graph step's RunTraced does it too; the per-op layers below need it here
             if (n > 1 && InjectedForwardAllocationFailures > 0)
             {
                 InjectedForwardAllocationFailures--;

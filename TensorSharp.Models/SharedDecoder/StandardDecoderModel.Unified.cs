@@ -219,6 +219,7 @@ namespace TensorSharp.Models
             int capacity = (int)Math.Min(_maxContextLength, (reserve + (long)ReservationStepTokens - 1) / ReservationStepTokens * ReservationStepTokens);
             if (!_slotPool.Exists(p => p.Capacity >= capacity)) return false;
             Slot moved = CopySlot(slot, capacity, runSlotFirst: true);
+            RepointDependents(slot.K, moved);   // the copy holds every row the slot's checkpoints share
             DropReplaysOf(slot.K, slot.Recurrent);
             _slots[requestId] = moved;
             RecycleSlot(slot);
@@ -316,7 +317,10 @@ namespace TensorSharp.Models
             {
                 _retainedSlots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
                 if (_retainedSlots.ContainsKey(payloadKey)) return false;
-                _retainedSlots.Add(payloadKey, Retained(CopySlot(slot, slot.Capacity)));
+                Slot copy = CopySlot(slot, slot.Capacity);
+                // The request's checkpoints share the copy's rows (the same bytes), so its own slot still goes back to the pool.
+                RepointDependents(slot.K, copy);
+                _retainedSlots.Add(payloadKey, Retained(copy));
                 footprint = MeasureEndState(payloadKey);
                 RetainedByCopy++;
                 LastRetentionCopied = true;
@@ -385,7 +389,7 @@ namespace TensorSharp.Models
             string key = null;
             Slot oldest = null;
             foreach (var (k, retained) in _retainedSlots)
-                if (retained.K != null && (!roomShort || retained.Capacity >= capacity)
+                if (retained.K != null && !InAnyShare(retained) && (!roomShort || retained.Capacity >= capacity)
                     && (oldest == null || retained.RetainedAt < oldest.RetainedAt))
                 {
                     key = k;
@@ -610,9 +614,13 @@ namespace TensorSharp.Models
         /// </summary>
         public bool RunIdleSlice()
         {
-            if (GraphExecutor is not { Capabilities.SlotBoundRecordings: true } || _slotStateBytes < 0 || _sparePending
-                || _idleSpareRefused || !SupportsUnifiedBatching)
+            if (GraphExecutor is not { Capabilities.SlotBoundRecordings: true } || _slotStateBytes < 0 || !SupportsUnifiedBatching)
                 return false;
+            // A shared checkpoint's states first (StandardDecoderModel.RowShares.cs): the next prompt's end takes them. Not held
+            // back by a spare slot's slice waiting for a recorded step: a request's last decode step queues one, and the
+            // next request's prompt end came with no states made.
+            if (BuildSpareCheckpointStates()) return true;
+            if (_sparePending || _idleSpareRefused) return false;
             int cap = Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax);
             if (_spareBuild == null && (_slotPool?.Count ?? 0) >= cap) return false;
             int capacity = _spareBuild?.Capacity ?? SpareCapacity;

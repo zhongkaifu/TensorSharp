@@ -66,6 +66,8 @@ namespace TensorSharp.Models
             PromptStep,
             /// <summary>Recorded steps (<see cref="RecordingRoomBytes"/>); the parked recordings are not given up for them.</summary>
             Recording,
+            /// <summary>A shared-row checkpoint's recurrent states (StandardDecoderModel.RowShares.cs): beside the headroom.</summary>
+            States,
             /// <summary>A slot at its floor: beside the headroom and the narrowest prompt step only (a lone request's slot, a
             /// running one's growth, an adopted copy, where their whole room could not be made).</summary>
             SlotFloor,
@@ -129,6 +131,7 @@ namespace TensorSharp.Models
             {
                 RoomUse.Slot => bytes + DeviceHeadroom(total) + Math.Max(PromptStepBytes, RecordingRoomBytes),
                 RoomUse.SlotFloor => bytes + DeviceHeadroom(total) + NarrowestPromptStepBytes,
+                RoomUse.States => bytes + DeviceHeadroom(total),
                 _ => bytes,
             };
 
@@ -191,6 +194,12 @@ namespace TensorSharp.Models
                     freed = true;
                     free = RoomFree(use);
                 }
+                // A shared checkpoint's spare states are a pooled slot's kind of convenience (StandardDecoderModel.RowShares.cs).
+                if (free < need && DisposeSpareCheckpointStates() > 0)
+                {
+                    freed = true;
+                    free = RoomFree(use);
+                }
                 if (freed) DeviceRoomStages[2]++;
 
                 // 3. Parked recordings no slot of keep binds.
@@ -237,8 +246,9 @@ namespace TensorSharp.Models
                     foreach (var (key, slot) in _retainedSlots.OrderBy(kv => kv.Value.RetainedAt).ToList())
                     {
                         if (free >= need) break;
-                        if (slot.K == null || Holds(keep, slot)) continue;
-                        releasedBytes += SlotStorageBytes(slot);
+                        // A slot already gone (a checkpoint a hand-over or a release above took along) is skipped.
+                        if (slot.K == null || Holds(keep, slot) || !_retainedSlots.ContainsKey(key)) continue;
+                        releasedBytes += ReleasedBytes(slot);
                         _retainedSlots.Remove(key);
                         DisposeSlot(slot);
                         _prefixCacheSink?.OnPayloadInvalidated(key, InvalidationReason.NativeSlotReclaimed);
@@ -327,14 +337,16 @@ namespace TensorSharp.Models
         internal Func<string, long> RetainedPayloadBytesForTests { get; set; }
 
         /// <summary>Whether releasing every finished conversation outside <paramref name="keep"/> frees
-        /// <paramref name="shortBy"/> bytes (their caches and states).</summary>
+        /// <paramref name="shortBy"/> bytes: a conversation's caches and states, a shared checkpoint's states (the rows it shares
+        /// go with their holder).</summary>
         private bool ReleasesCanReach(long shortBy, ReadOnlySpan<Slot> keep)
         {
             if (DeviceRoomForTests != null && RetainedPayloadBytesForTests == null) return true;
             long bytes = 0;
             foreach (var (key, slot) in _retainedSlots)
                 if (slot.K != null && !Holds(keep, slot))
-                    bytes += RetainedPayloadBytesForTests?.Invoke(key) ?? SlotStorageBytes(slot);
+                    bytes += RetainedPayloadBytesForTests?.Invoke(key)
+                        ?? (slot.SharesRows ? RecurrentStateBytes(slot) : SlotStorageBytes(slot));
             return bytes >= shortBy;
         }
 
@@ -702,6 +714,12 @@ namespace TensorSharp.Models
                     released += DisposeSlotLater(largest);
                     pooled = true;
                 }
+                if (released < bytes)
+                {
+                    long spare = DisposeSpareCheckpointStates();
+                    released += spare;
+                    pooled |= spare > 0;
+                }
                 if (pooled) DeviceRoomStages[2]++;
                 // The window buffers retained slots keep, where they cover what is asked: no step binds them (a retained slot's
                 // kept steps went when it was retained), and a parked recording over them is adopted only by their identity, which
@@ -728,7 +746,9 @@ namespace TensorSharp.Models
                     foreach (var (key, slot) in _retainedSlots.OrderBy(kv => kv.Value.RetainedAt).ToList())
                     {
                         if (released >= bytes) break;
-                        if (slot.K == null || Holds(keep, slot)) continue;
+                        // A slot whose rows checkpoints share is left (its release would free its states only; its
+                        // checkpoints, older, go first and leave it whole).
+                        if (slot.K == null || Holds(keep, slot) || HasDependents(slot)) continue;
                         _retainedSlots.Remove(key);
                         long b = DisposeSlotLater(slot);
                         released += b;
@@ -756,6 +776,20 @@ namespace TensorSharp.Models
         /// bind them at the model's next entry. The bytes freed.</summary>
         private long DisposeSlotLater(Slot slot)
         {
+            if (slot.SharesRows)
+            {
+                // A checkpoint: its states only (its rows are its holder's).
+                long states = RecurrentStateBytes(slot);
+                (_deferredForgets ??= new()).Add((null, slot.Recurrent, BoundStorages(new[] { new Slot { Recurrent = slot.Recurrent } })));
+                Unregister(slot);
+                DisposeStates(slot.Recurrent);
+                slot.Recurrent = null;
+                slot.DraftCarry?.Dispose();
+                slot.DraftCarry = null;
+                slot.K = slot.V = null;
+                NoteDeviceMemoryChanged();
+                return states;
+            }
             long bytes = SlotStorageBytes(slot);
             (_deferredForgets ??= new()).Add((slot.K, slot.Recurrent, BoundStorages(new[] { slot })));
             _idleSpareRefused = false;
