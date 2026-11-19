@@ -10,7 +10,7 @@ AutoencoderKLMiniMaxH3Image (main d5df05ed) in strict float32 (no TF32 anywhere:
 with the official float32 weights and with Comfy-Org's float16 weights, beside the float16 rounding of the result (the
 yardstick). One or more dump directories may be given; each is reported by itself.
 
-    python -I vae_moments_parity.py --official DIR --comfy-vae FILE [--device cpu|cuda] --out report.json DUMP [DUMP ...]
+    python -I vae_moments_parity.py --official DIR --comfy-vae FILE [--device cpu|cuda] [--tf32-reference] --out report.json DUMP [DUMP ...]
 """
 import argparse
 import json
@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--comfy-vae", required=True)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--tf32-reference", action="store_true", help="also run diffusers' own CUDA default (TF32 cuDNN convolutions)")
     ap.add_argument("dumps", nargs="+")
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -75,7 +76,7 @@ def main():
                 with torch.no_grad():
                     m = vae.encode(x, return_dict=False)[0].parameters.float().cpu().numpy()[0]
                 res[label] = m
-            if torch.cuda.is_available():
+            if a.tf32_reference and torch.cuda.is_available():
                 # diffusers' own default on a GPU: cuDNN convolutions in TF32 (torch.backends.cudnn.allow_tf32 is True by default).
                 vae.load_state_dict(official_sd, strict=False)
                 vae_gpu = vae.to("cuda")
