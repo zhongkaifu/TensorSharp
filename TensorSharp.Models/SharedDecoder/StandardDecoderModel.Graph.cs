@@ -1228,7 +1228,7 @@ namespace TensorSharp.Models
             float[] draftRows = null, DFlashFollowPlan dflash = null, bool prompt = false)
         {
             logits = null;
-            bool greedy = wantLogits && _greedyLastRows && GraphExecutor.Capabilities.GreedyIdOutputs;
+            bool greedy = wantLogits && _greedyLastRows && GraphGreedyIds;
             bool wantHidden = lastHidden != null && Array.Exists(lastHidden, h => h != null);
             var request = new GraphRequest
             {
@@ -1261,10 +1261,14 @@ namespace TensorSharp.Models
                 }
                 else
                 {
+                    // Each sequence's row in its slot's buffer, reused step after step as the per-op path's and as a lone
+                    // sequence's (the plan's own output array): a new array a row a step was 32 MB of large-object heap at
+                    // 64 sequences of LFM3's 128,000 logits, and the collections it drove.
                     for (int s = 0; s < n; s++)
                     {
-                        logits[s] = new float[vocab];
-                        Array.Copy(result.Logits, (long)s * vocab, logits[s], 0, vocab);
+                        float[] row = slots[s].Logits is { Length: var length } kept && length == vocab ? kept : slots[s].Logits = new float[vocab];
+                        Array.Copy(result.Logits, (long)s * vocab, row, 0, vocab);
+                        logits[s] = row;
                     }
                 }
             }
@@ -1805,7 +1809,7 @@ namespace TensorSharp.Models
             {
                 int logits = step.MatMul(headName, final);
                 outputs.Logits = request.GreedyIds
-                    ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1 })), rows)
+                    ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1, 1 })), rows)
                     : step.Output(logits, (long)Config.VocabSize * rows);
             }
             else if (request.LastRowLogits || request.LastRowHidden)
@@ -1826,7 +1830,7 @@ namespace TensorSharp.Models
                 if (!request.LastRowLogits) return;
                 int logits = step.MatMul(headName, selected);
                 outputs.Logits = request.GreedyIds
-                    ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1 })), n)
+                    ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1, 1 })), n)
                     : step.Output(logits, (long)Config.VocabSize * n);
             }
         }

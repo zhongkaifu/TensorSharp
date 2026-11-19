@@ -235,6 +235,10 @@ namespace TensorSharp.GGML
             }
         }
 
+        /// <summary>Greedy-head rows (<see cref="GgmlGraphOp.TopK"/> with ip[1] = 1) whose id the host took from their full
+        /// logits since the process started: every candidate tied, or the row held a NaN or an infinity. For tests.</summary>
+        public static long GreedyFullRows => GgmlNative.TSGgml_GreedyFullRows();
+
         /// <summary>Whether a STATE leaf lives in device memory that outlives the run.</summary>
         public bool IsResident(int leaf) => GgmlNative.TSGgml_GraphLeafIsResident(Handle, leaf) != 0;
 
@@ -336,6 +340,10 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static unsafe partial int TSGgml_GraphCensus(IntPtr graph, long* values, int count);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial long TSGgml_GreedyFullRows();
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

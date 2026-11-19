@@ -280,10 +280,14 @@ namespace TensorSharp.Models
             finally { _promptHiddenOut = null; }
         }
 
-        /// <summary>On executors that return integer outputs (the CUDA executor), a greedy step's head ends in a top-1 over each
-        /// sequence's last row, read back as an id: a plain decode step had read back Qwen3.8's 248,320 logits (1 MB) and
-        /// scanned them on the host.</summary>
-        public bool SupportsUnifiedGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true && !_rankGraphs && _mesh.Stages == 1;
+        /// <summary>On executors that return greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>: the CUDA executor, GGML
+        /// on discrete GPUs), a greedy step's head ends in a top-1 over each sequence's last row, read back as an id: a plain
+        /// decode step had read back Qwen3.8's 248,320 logits (1 MB) and scanned them on the host.</summary>
+        public bool SupportsUnifiedGreedyIds => GraphGreedyIds && !_rankGraphs && _mesh.Stages == 1;
+
+        /// <summary>This model's graphs may end in greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>) - except
+        /// tensor-parallel graphs on ggml's meta device, whose head reads its logits.</summary>
+        private bool GraphGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true && _graphTpRanks == null;
 
         public bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens)
         {

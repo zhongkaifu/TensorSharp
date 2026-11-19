@@ -143,6 +143,32 @@ namespace
         std::size_t bytes;
     };
 
+    // A greedy head (OP_TOP_K with ip[1] = 1: GraphCapabilities.GreedyIdOutputs): each row's largest logit, a tie to the
+    // lowest id, written to the head's output as the id's F32 value - the host's argmax exactly (TokenSampler's ordered '>'
+    // scan from the row's first value). ggml's top-k and argmax break ties in no defined order (ggml-cuda's argmax takes
+    // any lane of a warp's maxima), so the device gives each row's kGreedyCandidates largest logits with their ids and the
+    // row's sum, and the host takes the largest candidate of the lowest id. That is the argmax unless every candidate ties
+    // the largest (another logit of that value may lie outside them) or the row holds a NaN or an infinity (its sum is not
+    // finite; the host scan's NaN rule picks by position): such a row reads its logits and is scanned as the host scans.
+    constexpr int kGreedyCandidates = 8;
+
+    struct GreedyHead
+    {
+        ggml_tensor* logits = nullptr;   // [vocab, rows] F32: kept to the end of the run for a row's full read
+        ggml_tensor* ids = nullptr;      // [k, rows] I32: ggml_top_k (in no particular order)
+        ggml_tensor* values = nullptr;   // [1, k, rows] F32: the logits at those ids
+        ggml_tensor* sums = nullptr;     // [1, rows] F32: each row's sum (finite iff every logit is)
+        ggml_tensor* result = nullptr;   // the node the program reads (its output takes the ids below instead)
+        std::int64_t vocab = 0, rows = 0;
+        int k = 0;
+        float* out = nullptr;            // the output's host floats: one id a row
+        std::vector<std::int32_t> host_ids;
+        std::vector<float> host_values, host_sums, row;
+    };
+
+    // Rows whose greedy id was read from their full logits (a tie of every candidate, or a NaN or infinity), for tests.
+    std::atomic<std::int64_t> g_greedy_full_rows{0};
+
     // ---- tensor parallelism: a graph on ggml's meta device over several ranks (upstream's
     // tensor-split mechanism). Weights and states live in meta buffers, spread by the split state
     // the managed side gives each leaf (heads, channels, experts; mirrored otherwise); compute
@@ -375,6 +401,7 @@ namespace
         std::vector<ggml_tensor*> nodes;
         std::vector<Leaf> leaves;
         std::vector<Output> outputs;
+        std::vector<GreedyHead> greedy;
         std::vector<ggml_tensor*> effects;
         std::vector<BufferHandle> ephemeral;
         struct Alias { ggml_tensor* node; ggml_tensor* base; std::size_t offset; ggml_tensor* fallback; };
@@ -656,6 +683,96 @@ namespace
         return ggml_cont(ctx, ggml_permute(ctx, r, 1, 2, 0, 3));
     }
 
+    // A greedy head over x [vocab, rows] F32 (see GreedyHead): the candidates' ids and logits and each row's sum, kept for
+    // the run's end; the program's node is a view of the ids (its output receives the resolved ids instead of its bytes).
+    ggml_tensor* greedy_head(TsgGraph* g, ggml_tensor* x)
+    {
+        if (g->tp != nullptr) throw std::runtime_error("graph builder: a greedy head runs on one device's graph");
+        if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] < 1)
+            throw std::runtime_error("graph builder: a greedy head reads contiguous F32 rows [vocab, rows]");
+        if (x->ne[0] > (std::int64_t{1} << 24))
+            throw std::runtime_error("graph builder: a greedy head's ids are F32 values, exact below 2^24");
+        GreedyHead h;
+        h.vocab = x->ne[0];
+        h.rows = x->ne[1];
+        h.k = static_cast<int>(std::min<std::int64_t>(kGreedyCandidates, h.vocab));
+        h.logits = x;
+        h.ids = ggml_top_k(g->ctx, x, h.k);
+        h.values = ggml_get_rows(g->ctx, ggml_reshape_3d(g->ctx, x, 1, h.vocab, h.rows), h.ids);
+        h.sums = ggml_sum_rows(g->ctx, x);
+        h.result = ggml_view_2d(g->ctx, h.ids, 1, h.rows, h.ids->nb[1], 0);
+        g->greedy.push_back(std::move(h));
+        return g->greedy.back().result;
+    }
+
+    // The greedy head (if any) whose result `t` is or copies (the program's Cont of it).
+    GreedyHead* greedy_head_of(TsgGraph* g, const ggml_tensor* t)
+    {
+        for (GreedyHead& h : g->greedy)
+            if (t == h.result || (t->op == GGML_OP_CONT && t->src[0] == h.result)) return &h;
+        return nullptr;
+    }
+
+    // The host's argmax of one row (TokenSampler.ArgmaxScalar): the first value no later value exceeds, so a leading NaN
+    // is never replaced and later NaNs are never taken.
+    std::int64_t host_row_argmax(const float* v, std::int64_t n)
+    {
+        std::int64_t best = 0;
+        float best_value = v[0];
+        for (std::int64_t i = 1; i < n; i++)
+            if (v[i] > best_value)
+            {
+                best_value = v[i];
+                best = i;
+            }
+        return best;
+    }
+
+    // After a run (the device synchronized, the candidates downloaded): each greedy head's rows to their ids.
+    void resolve_greedy_heads(TsgGraph* g, bool download)
+    {
+        for (GreedyHead& h : g->greedy)
+        {
+            if (h.out == nullptr) continue;
+            const std::size_t k = static_cast<std::size_t>(h.k), rows = static_cast<std::size_t>(h.rows);
+            if (download)
+            {
+                ggml_backend_tensor_get(h.ids, h.host_ids.data(), 0, h.host_ids.size() * sizeof(std::int32_t));
+                ggml_backend_tensor_get(h.values, h.host_values.data(), 0, h.host_values.size() * sizeof(float));
+                ggml_backend_tensor_get(h.sums, h.host_sums.data(), 0, h.host_sums.size() * sizeof(float));
+            }
+            for (std::size_t r = 0; r < rows; r++)
+            {
+                const std::int32_t* ids = h.host_ids.data() + r * k;
+                const float* values = h.host_values.data() + r * k;
+                std::int64_t id = -1;
+                if (std::isfinite(h.host_sums[r]))
+                {
+                    float best = values[0];
+                    for (std::size_t c = 1; c < k; c++) best = std::max(best, values[c]);
+                    std::size_t ties = 0;
+                    for (std::size_t c = 0; c < k; c++)
+                        if (values[c] == best)
+                        {
+                            ties++;
+                            if (id < 0 || ids[c] < id) id = ids[c];
+                        }
+                    // Every candidate ties the largest: a logit of that value may lie outside them (unless they are the row).
+                    if (ties == k && static_cast<std::int64_t>(k) < h.vocab) id = -1;
+                }
+                if (id < 0 || id >= h.vocab)
+                {
+                    h.row.resize(static_cast<std::size_t>(h.vocab));
+                    ggml_backend_tensor_get(h.logits, h.row.data(), r * static_cast<std::size_t>(h.vocab) * sizeof(float),
+                                            static_cast<std::size_t>(h.vocab) * sizeof(float));
+                    id = host_row_argmax(h.row.data(), h.vocab);
+                    g_greedy_full_rows.fetch_add(1, std::memory_order_relaxed);
+                }
+                h.out[r] = static_cast<float>(id);
+            }
+        }
+    }
+
     ggml_tensor* build_op(TsgGraph* g, int op, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
     {
         ggml_context* ctx = g->ctx;
@@ -799,7 +916,11 @@ namespace
         case OP_ARGSORT: need(1); return ggml_argsort(ctx, src(0), ipar(0, 0) == 0 ? GGML_SORT_ORDER_ASC : GGML_SORT_ORDER_DESC);
         // Descending, as the IR defines it (ggml_top_k's are in no particular order): a route's position is its rank
         // to the host seams' route-tail skip, and argsort + view is the chain ggml-metal's top-k MoE fusion matches.
-        case OP_TOP_K: need(1); return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
+        // ip[1] = 1: a greedy head (GreedyHead), its ids read back as F32 values.
+        case OP_TOP_K:
+            need(1);
+            if (ipar(1, 0) == 1) return greedy_head(g, src(0));
+            return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
         case OP_SUM_ROWS: need(1); return ggml_sum_rows(ctx, src(0));
         case OP_LIGHTNING_INDEXER:
         {
@@ -1212,6 +1333,12 @@ namespace
             if (hm.pred_next != nullptr) ggml_build_forward_expand(g->graph, hm.pred_next);   // read at this pause
         }
         for (const Output& o : g->outputs) ggml_build_forward_expand(g->graph, o.tensor);
+        // A greedy head's candidates and sums (its output reads them, not the node the program reads).
+        for (const GreedyHead& h : g->greedy)
+        {
+            ggml_build_forward_expand(g->graph, h.values);
+            ggml_build_forward_expand(g->graph, h.sums);
+        }
         // Every tensor-parallel partial is computed and reduced on every rank, read or not: a rank that does not run the
         // head never reads its last block's sum, yet the other ranks' reduce needs its partial (and the ranks must cut
         // their graphs at the same boundaries).
@@ -1320,6 +1447,14 @@ namespace
             if (leaf.role == LEAF_STATE) ggml_set_output(leaf.tensor);
         }
         for (const Output& o : g->outputs) ggml_set_output(o.tensor);
+        // Kept to the run's end: the candidates the host reads, and the logits a tied or non-finite row is read from.
+        for (GreedyHead& h : g->greedy)
+        {
+            for (ggml_tensor* t : { h.logits, h.ids, h.values, h.sums }) ggml_set_output(t);
+            h.host_ids.assign(static_cast<std::size_t>(h.k * h.rows), 0);
+            h.host_values.assign(static_cast<std::size_t>(h.k * h.rows), 0.0f);
+            h.host_sums.assign(static_cast<std::size_t>(h.rows), 0.0f);
+        }
 
         // Place aliased op results inside their (persistent) base buffers, so the op writes the
         // state in place. A base living in compute memory cannot host it: run the fallback copy.
@@ -1542,6 +1677,15 @@ TSG_EXPORT int TSGgml_GraphOutput(void* handle, int node, void* data, std::int64
     {
         if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
         ggml_tensor* t = node_at(g, node);
+        if (GreedyHead* h = greedy_head_of(g, t))
+        {
+            // A greedy head's output: one id a row as its F32 value, written after the run (resolve_greedy_heads).
+            if (data == nullptr || bytes < h->rows * static_cast<std::int64_t>(sizeof(float)) || h->out != nullptr)
+                throw std::runtime_error("graph builder: a greedy head has one output of a float a row");
+            h->out = static_cast<float*>(data);
+            g->outputs.push_back({ t, nullptr, 0 });
+            return 1;
+        }
         if (data != nullptr && static_cast<std::size_t>(bytes) < ggml_nbytes(t))
             throw std::runtime_error("graph builder: output buffer is smaller than its node");
         g->outputs.push_back({ t, data, data != nullptr ? ggml_nbytes(t) : 0 });
@@ -1683,6 +1827,14 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
                 ggml_backend_tensor_get_async(graph_backend(g), o.tensor, o.data, 0, o.bytes);
                 host_results = true;
             }
+        for (GreedyHead& h : g->greedy)
+            if (h.out != nullptr)
+            {
+                ggml_backend_tensor_get_async(graph_backend(g), h.ids, h.host_ids.data(), 0, h.host_ids.size() * sizeof(std::int32_t));
+                ggml_backend_tensor_get_async(graph_backend(g), h.values, h.host_values.data(), 0, h.host_values.size() * sizeof(float));
+                ggml_backend_tensor_get_async(graph_backend(g), h.sums, h.host_sums.data(), 0, h.host_sums.size() * sizeof(float));
+                host_results = true;
+            }
         for (const Leaf& leaf : g->leaves)
             if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
             {
@@ -1698,6 +1850,7 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             return 1;
         }
         sync_backend(graph_backend(g));
+        resolve_greedy_heads(g, false);
         clear_last_error();
         return 1;
     }
@@ -1760,6 +1913,13 @@ TSG_EXPORT int TSGgml_GraphRunRanked(void* const* handles, int nranks, const int
             plan_ptrs[static_cast<std::size_t>(r)] = &plan;
         }
         if (!tsg::tp_execute_plans(plan_ptrs.data(), nranks)) return 0;
+        for (int r = 0; r < nranks; r++)
+        {
+            auto* g = static_cast<TsgGraph*>(handles[r]);
+            if (g->greedy.empty()) continue;
+            ScopedRank scope(g->rank);
+            resolve_greedy_heads(g, true);
+        }
         clear_last_error();
         return 1;
     }
@@ -1838,6 +1998,13 @@ TSG_EXPORT int TSGgml_GraphLeafIsResident(void* handle, int node)
     for (const Leaf& leaf : g->leaves)
         if (leaf.tensor == t) return leaf.uploaded ? 0 : 1;
     return 0;
+}
+
+// How many greedy-head rows (OP_TOP_K ip[1] = 1) took their id from their full logits since the process started: rows
+// whose candidates all tie, or that hold a NaN or an infinity (GreedyHead). For tests.
+TSG_EXPORT std::int64_t TSGgml_GreedyFullRows()
+{
+    return g_greedy_full_rows.load(std::memory_order_relaxed);
 }
 
 // What one run of a built graph evaluates and moves, for censuses of steps (eng/lfm3/Lfm3Probe batch): out[0] its ggml

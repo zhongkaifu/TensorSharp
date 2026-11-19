@@ -76,6 +76,11 @@ namespace TensorSharp.GGML
                 QuantizedKvCache = true,
                 // Routed experts in host memory run at a pause in the graph (ggml_ops_graph_builder.cpp).
                 HostExperts = true,
+                // Greedy heads end in each row's id on the discrete GPUs (ggml_ops_graph_builder.cpp's GreedyHead: the
+                // device's top candidates, the host's tie rule): a 64-sequence LFM3-1.7B step had read back 32 MB of logits
+                // and scanned 8.2 M floats on the engine thread (B0 census, A40). Metal and the CPU read their logits in
+                // place, where the host's scan stays.
+                GreedyIdOutputs = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
             };
         }
 

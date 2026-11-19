@@ -82,7 +82,10 @@ namespace TensorSharp.Graph
         /// CPU), so a host copy of them moves nothing across.</summary>
         public bool SeparateDeviceCopies { get; init; }
         /// <summary>A program may end in each row's greedy token (a top-1 over the logits, a tie to the lower id), read
-        /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits.</summary>
+        /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits. The head is
+        /// <see cref="GraphOp.TopK"/> with Ip { 1, 1 } (k 1, greedy) read through a <see cref="GraphOp.Cont"/> as one float a
+        /// row; an executor lowers it to whatever gives exactly those ids (GGML: each row's top candidates on the device,
+        /// the lowest id of the largest taken on the host, a row whose candidates all tie read in full).</summary>
         public bool GreedyIdOutputs { get; init; }
         /// <summary>An F16 causal mask input may arrive as its pattern (a <see cref="CausalMaskInput"/> as the input's handle,
         /// no host bytes): the executor classifies it from the pattern and makes its values only for an op that reads them.
