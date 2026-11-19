@@ -23,7 +23,21 @@ GGUF's own template tells them apart.
 
 ## Validation status
 
-As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
+Where LFM3-1.7B stands on 2026-11-18 (`feature/lfm3` after the think, worker-pool and second ggml_cpu
+rounds were merged; llama.cpp `d3c3e242c` on the same GGUF and device; each figure is detailed in the
+items below and under [Benchmarking](#benchmarking)):
+
+| backend (device) | quality against llama.cpp | one sequence against llama.cpp | serving |
+|---|---|---|---|
+| ggml_metal (M5 Pro) | teacher-forced median relative L2 3-4e-4, no top-1 difference in 320 rows (Q4_K_M, Q8_0, BF16); GSM8K equal (81.5%) | prompts 0.97-1.03x, decode 1.01-1.02x | first token within 5% of llama-server's up to 2K tokens, 3-5% later at 16K-32K |
+| MLX (M5 Pro) | Omni image and audio replies token-identical in 18 of 19 cases | prompts 1.12x at 512 tokens, decode 0.87x | - |
+| ggml_cpu (M5 Pro) | at the CPU lanes' 8-bit-activation floor (1.03-1.16x llama.cpp's own kernel variants' distance); GSM8K 79.0% against 81.0% (p = 0.50) | decode 0.97-1.14x (BF16 3.9x), prompts 0.95-1.00x (NVFP4 1.9-2.6x) | one stream: first token 0.95x the time, decode 0.96x; four streams 1.17x llama-server's aggregate; against vLLM's CPU backend (fp16): first token 0.30x the time, decode 5.6x, four streams 3.5x |
+| cpu, managed (M5 Pro) | 1.17-1.37x that floor; GSM8K 80.0% (p = 0.82) | decode 0.78-0.95x (BF16 3.7x), prompts 0.86-0.92x (NVFP4 1.6-2.2x) | one stream: decode 0.83x, first token at parity; four streams 1.06x |
+| ggml_cuda (A40; RTX PRO 4500) | perplexity within 0.4% (A40) and 0.13% (sm_120) | A40 0.99-1.17x; sm_120 0.92-1.00x (NVFP4 prompts 0.86-0.90x) | A40, BF16: faster than vLLM and SGLang at one request (6.7 against 7.3 / 7.2 ms a token), behind from 4 requests (51 against 11.0 ms at 64); Q4_K_M ahead of llama-server at 1-16 requests |
+| cuda, direct (A40; RTX PRO 4500) | as ggml_cuda | prompts 0.58-0.85x, decode 0.78-0.91x | A40, BF16: one request 7.0 ms a token (vLLM 7.3), behind from 4 requests (68 against 11.0 ms at 64) |
+| ggml_vulkan (A40; RTX PRO 4500) | 0-1 top-1 differences in 320 rows | A40: 0.80-0.96x on the quantized files, BF16 and NVFP4 at parity | not measured |
+
+Details (llama.cpp reference `d3c3e242c`):
 
 - **Validated:** the chat protocol. 32 OpenAI request bodies (plain chat, system
   prompts, multi-turn with reasoning, tools, single and parallel tool rounds, typed
@@ -107,6 +121,25 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   vLLM and SGLang reserve about 40 GB. Against llama-server on Q4_K_M (CUDA build, as many slots as
   requests) both TensorSharp lanes decode faster at 1, 4 and 16 concurrent requests (ggml_cuda 3.0 /
   5.8 / 14.1 ms a token against 3.8 / 7.0 / 20.1).
+- **CUDA and Vulkan on an RTX PRO 4500 (Blackwell sm_120, 32 GB, 2026-11-18; llama.cpp `d3c3e242c`'s CUDA
+  build on the same GPU):** teacher-forced against llama.cpp CUDA (5 prompts x 64 steps), Q4_K_M, Q8_0 and BF16 land
+  as on the A40: 0-3 top-1 differences in 320 rows, median relative L2 2.2e-3 to 2.4e-2; perplexity (32 x 1,024
+  tokens) is within 0.13% of llama.cpp's on both CUDA lanes. NVFP4 takes its FP4 tensor-core route there: prompt
+  products are W4A4 (the activations quantized to NVFP4 too: `ts_fp4_gemm_w4a4_tma128` on direct cuda, ggml's MMQ on
+  ggml_cuda), as in llama.cpp's own default on this GPU, at perplexity 27.47 (direct cuda) and 27.38 (ggml_cuda)
+  against llama.cpp's 27.27. With q8 activations (ggml's `GGML_CUDA_MMQ_PREC=q8`) ggml_cuda reaches 26.50 against
+  llama.cpp's 26.51, while W4A4 runs prompts 1.51-1.55x faster. ggml_cuda runs Q4_K_M at 0.99 / 1.00 / 0.98x
+  llama-bench at pp512 / pp4096 / tg128 (26,160 / 29,027 / 476 tokens/s), BF16 at 0.92 / 0.98 / 0.99x and NVFP4 at
+  0.86 / 0.90 / 1.01x; direct cuda runs prompts at 0.58-0.85x and decode at 0.78-0.91x. The 1-2% decode gap is
+  TensorSharp's process-wide `GGML_CUDA_PDL=0` on CC 12 devices (set for Qwen 3.5's batched graphs): with PDL on in
+  both engines TensorSharp decodes 1.0% faster, and LFM3's one-sequence logits are the same bytes. The server's 20
+  e2e scenarios pass on ggml_cuda and direct cuda. The LFM3 test classes pass on ggml_cuda, direct cuda and
+  ggml_vulkan except four tolerance tests calibrated on the A40 (two NVFP4 feed-forward tests, which expect q8
+  activations, and two synthetic speech-network bounds exceeded by 0.1% and 6%) and one Qwen DFlash test that fails
+  at this ggml pin on every CUDA GPU. The tree after the 2026-11-18 lane merges gives the same logit bytes as the tree
+  before them on all three GPU lanes (12 file x lane runs, 3,648 rows, and 9 perplexity digests); the speed figures
+  were measured on the tree before them, whose GPU code paths are the same. Not measured on this GPU: serving under
+  concurrency, ggml_vulkan's speed, and Q8_0 / QAD-Q4_0 speed.
 - **CPU lanes, quality (2026-11-18, M5 Pro, after the CPU optimizations):** ggml_cpu and the
   managed CPU executor against llama.cpp's CPU backend (`d3c3e242c`, CPU-only builds) on the
   same GGUFs. CPU products round their activations to 8 bits, so two correct CPU
@@ -157,42 +190,39 @@ As of 2026-11-16 (llama.cpp reference `d3c3e242c`):
   the optimizations and not repeated: needles at 8K and 32K, the CLI checks, LFM3-Omni image
   and audio input (prompt token counts equal to llama-server's) and speech output that
   transcribes back at word error rate 0.
-- **CPU lanes, speed (2026-11-18, M5 Pro with 6 performance and 12 efficiency cores,
-  `eng/lfm3/bench/run-matrix.sh cpu cpu-serve cpu-omni`):** TensorSharp at its defaults against
-  llama.cpp at its best (the faster of its Accelerate BLAS and ggml-cpu-only builds, prompts on
-  18 threads, decode on 16: 12 is 4-11% slower at depth 0 and 4K and 21% on BF16 and at 16K, 18
-  is 6% slower), flash attention on, 3 interleaved rounds on a quiet machine (serving: 2).
-  Decode is the median of 5 runs on both sides after an untimed run (re-measured after review:
-  the first matrix set the faster of TensorSharp's two runs against the mean of llama.cpp's two,
-  which hid the managed lane's JIT warm-up run). The table is under
-  [Benchmarking](#benchmarking). *ggml_cpu* decodes faster than llama.cpp on every file
-  (1.03-1.16x at depth 0 and 4K, 1.60x at 16K, 3.9x on BF16, whose ggml-cpu dot is scalar on
-  ARM), runs prompts of 512 tokens and more at 0.93-1.00x (NVFP4 1.11-1.20x) and 128-token
-  prompts at 0.91-0.97x; the same cell moves by up to 5% between sessions (Q4_K_M pp512:
-  0.93-0.98x over six sessions). A later round the same day (the figures under
-  [Benchmarking](#benchmarking)) moved its prompts to 0.93-1.01x on the repacked quants, NVFP4
-  to 1.8-2.5x and BF16 to 1.03-1.26x, and its served time to first token below llama-server's
-  (0.56 vs 0.59 s for 512 tokens, one stream; four streams decode at 1.11x llama-server's
-  aggregate). Before that round it decoded one served stream as fast as llama-server (6.4-6.5 vs
-  6.5-6.6 ms a token) with a 20-75 ms longer time to first token (0.60-0.65 vs 0.53-0.60 s for
-  512 tokens), served four streams at 0.97-1.08x its aggregate. It encodes a 512 x 512 image in
-  about 0.6x llama.cpp's time (0.58x warm, 0.66x for a process's first encode) and audio in
-  0.48-0.50x (0.50-0.63x with the mel front end), both engines on 18 threads, and speaks at
-  6.8-7.0x real time against 4.2x. The *managed CPU* runs NVFP4 prompts at 1.4-2.0x llama.cpp's
-  speed and BF16 decode at 3.5x, Q4_K_M prompts of 512 tokens and more at 0.92-0.95x, Q8_0 and
-  Q4_0 ones at 0.77-0.84x, these three files' 128-token prompts at 0.54-0.70x (0.70-0.88x once
-  the JIT has tiered its kernels up), quantized decode at 0.70-0.86x (0.94x at 16K) and BF16
-  prompts at 0.44x of llama.cpp's Accelerate build. Against vLLM 0.34's CPU backend (fp16 with
-  its macOS short-conv workaround; it has no quantized CPU path here), 512-token prompts:
-  ggml_cpu on Q4_K_M answers in 0.64 s against 1.9 s and decodes at 6.2 against 37.9 ms a token
-  (that harness's TPOT; llama-server 6.6 ms in it); on BF16 1.1 s and 17.2 ms. The knobs are in
-  the [environment variable
+- **CPU lanes, speed (2026-11-18, M5 Pro with 6 performance and 12 efficiency cores):** TensorSharp at
+  its defaults against llama.cpp at its best (the faster of its Accelerate BLAS and ggml-cpu-only builds,
+  prompts on 18 threads, decode on 16), flash attention on, interleaved rounds. The final tree, measured
+  that evening (3 rounds; the table is under [Benchmarking](#benchmarking)): *ggml_cpu* decodes Q4_K_M at
+  0.97x llama.cpp (155 against 160 tokens/s; 0.97-1.04x by round), Q8_0 at 1.07x, QAD-Q4_0 at 1.03x and
+  NVFP4 at 1.14x (BF16 3.9x, whose ggml-cpu dot is a scalar loop on ARM; Q4_K_M 1.56-1.60x at 16K tokens
+  of context in the day's earlier rounds), and runs 128- and 512-token prompts at 0.95-0.97x on Q4_K_M,
+  1.00x on Q8_0 and 1.9-2.6x on NVFP4. Served (Q4_K_M, 512-token prompts, 128 out) its first token comes
+  sooner than llama-server's (570 against 600 ms), one stream decodes at 0.96x (144 against 150
+  tokens/s), and four streams reach 1.17x llama-server's aggregate (127 against 108 tokens/s). The
+  *managed CPU* decodes the quantized files at 0.78-0.95x (Q4_K_M 0.81x, Q8_0 0.95x, QAD-Q4_0 0.78x,
+  NVFP4 0.92x; BF16 3.7x in the worker-pool round), runs Q4_K_M and Q8_0 prompts of 128-512 tokens at
+  0.86-0.92x and NVFP4 ones at 1.6-2.2x, and serves one Q4_K_M stream at 0.83x llama-server's decode
+  with the first token at parity (589 against 600 ms) and four streams at 1.06x its aggregate. Measured
+  earlier the same day and not repeated: ggml_cpu encodes a 512 x 512 image in about 0.6x llama.cpp's
+  time and audio in 0.48-0.50x (both engines on 18 threads) and speaks at 6.8-7.0x real time against
+  4.2x; the managed CPU speaks at 5.1x real time against llama-server's 4.1x (first audio 70 against
+  112 ms) and its audio encoder takes 1.0-1.25x llama.cpp's time; BF16 prompts run at 1.03-1.26x
+  (ggml_cpu) and 0.44x (managed) of llama.cpp's Accelerate build. Against vLLM 0.34's CPU backend (fp16 with its macOS short-conv
+  workaround, 18 threads; it has no quantized CPU path here) with one client for every engine and no
+  repetition penalty anywhere (ISL 512 / OSL 128, `eng/lfm3/bench/vllm-cpu-mac.sh`): one request at a time
+  ggml_cpu on Q4_K_M answers in 0.59 s against 1.98 s and decodes at 6.8 against 38.1 ms a token (median of
+  5 rounds; llama-server 0.61 s and 6.6 ms, the managed CPU 0.61 s and 7.5 ms), and four at a time it
+  delivers 126 tokens/s against vLLM's 36 (llama-server 112, the managed CPU 114). On BF16 ggml_cpu decodes
+  at 18.3 ms a token against vLLM's 38.1, but its first token took 2.1-6.0 s this session on every build
+  tested (see [Current limits](#current-limits)). The knobs
+  are in the [environment variable
   matrix](../env_var_feature_matrix.md#out-of-matrix-ggml-cpu-backend-knobs).
 - **Not yet validated:** the TensorAgent app on a device; tensor parallelism and multi-GPU
-  placements on CUDA (one GPU was available); the FP4 tensor-core route of
-  `config/lfm3-1.7b-nvfp4.json` (direct CUDA on a Blackwell GPU: the A40 has no FP4 tensor cores,
-  so the NVFP4 file ran there on its other kernels). vLLM was compared on the A40 and on the Mac's CPU,
-  SGLang on the A40 only (its CPU backend is x86 AMX only).
+  placements on CUDA (one GPU was available); serving under concurrency on a Blackwell or a datacenter GPU
+  (vLLM and SGLang were compared on the A40, vLLM also on the Mac's CPU; SGLang's CPU backend is x86 AMX
+  only); the CPU lanes' newest code (the managed worker pool's guided splits and decode width, ggml_cpu's
+  NVFP4 GEMM and prompt pool) on Linux, Windows and iOS devices, where it was not built or measured.
 
 ## Run it
 
@@ -507,8 +537,10 @@ checked by an ASR round trip (no word errors), not bit for bit against llama-tts
 expect (`vllm bench serve --ignore-eos`, SGLang's default). Pin `think` and the
 sampling on every engine.
 
-CPU lanes on an M5 Pro (6 performance + 12 efficiency cores, 2026-11-18, LFM3-1.7B; tokens
-per second, median of 3 interleaved rounds; `eng/lfm3/bench/run-matrix.sh cpu`). TensorSharp
+The full CPU matrix, measured at the CPU integration (`wip/lfm3-cpu`, before the worker-pool and
+second ggml_cpu rounds below; the final tree's cells follow them): CPU lanes on an M5 Pro (6
+performance + 12 efficiency cores, 2026-11-18, LFM3-1.7B; tokens per second, median of 3
+interleaved rounds; `eng/lfm3/bench/run-matrix.sh cpu`). TensorSharp
 runs at its defaults (prompts on 18 threads; decode on 16 for ggml_cpu, 18 for the managed
 CPU). llama.cpp (`d3c3e242c`) is at its best: the faster of its Accelerate BLAS and
 ggml-cpu-only builds, prompts on 18 threads, decode on 16 (its fastest count). ppN is an
@@ -617,12 +649,61 @@ between sessions: on Q4_K_M and Q8_0 the round's engine-bench prompt gain is 1-3
 llama.cpp at depth 0 rather than ahead; the served time-to-first-token gain (8-10%) holds and comes
 from the prompt pool leaving one core to the server's own threads.
 
+**The final tree** (`feature/lfm3` after the think, worker-pool and second ggml_cpu rounds were merged; the
+evening of 2026-11-18). Tokens/s, median of 3 interleaved rounds [min-max of the round medians]; prompts 5
+runs a round, decode 5 runs of 128 tokens after an untimed one; llama.cpp's prompts are the faster of its
+two builds per cell at 18 threads (Q4_K_M and Q8_0: ggml-cpu alone; NVFP4 pp128 ggml-cpu alone, pp512
+BLAS), its decode the ggml-cpu-alone build at 16. Each lane's branch head ran in the same rounds and
+measured within 4.5% of these medians, in both directions, with overlapping spreads (its logits are the
+same bits).
+
+| file | engine | pp128 | pp512 | tg128 |
+|---|---|---|---|---|
+| Q4_K_M | TS ggml_cpu | 930 [833-936] | 893 [841-902] | 155 [155-165] |
+| | TS cpu (managed) | 846 [795-862] | 862 [856-862] | 130 [126-138] |
+| | llama.cpp | 956 [939-960] | 938 [841-940] | 160 [158-160] |
+| Q8_0 | TS ggml_cpu | 1167 [1145-1227] | 1169 [1163-1221] | 114 [111-116] |
+| | TS cpu (managed) | 1002 [949-1040] | 1021 [988-1053] | 101 [100-102] |
+| | llama.cpp | 1161 [1160-1190] | 1165 [1159-1184] | 107 [100-113] |
+| QAD-Q4_0 | TS ggml_cpu | - | - | **186** [185-186] |
+| | TS cpu (managed) | - | - | 140 [130-141] |
+| | llama.cpp | - | - | 180 [179-181] |
+| NVFP4 | TS ggml_cpu | **993** [949-999] | **1024** [1023-1026] | **150** [146-150] |
+| | TS cpu (managed) | 855 [853-873] | 853 [850-870] | 121 [120-124] |
+| | llama.cpp | 384 [382-387] | 548 [546-554] | 132 [132-132] |
+
+Served (Q4_K_M, 512-token prompts, 128 out, `serve-bench.py`, 3 rounds; llama-server from the ggml-cpu-alone
+build at `-t 16 -tb 18`): one stream decodes at 144 (ggml_cpu), 125 (managed) and 150 (llama-server) tokens/s
+with the first token after 570, 589 and 600 ms; four streams reach 127, 115 and 108 tokens/s in all (first
+tokens after 2.1, 1.7 and 2.4 s, the TensorSharp lanes' moving between 1.5 and 2.3 s by round). Peak footprint 1.58, 1.59-1.67 and 1.22 GB at one
+stream, 2.05-2.13, 2.11-2.29 and 1.30 GB at four. TensorSharp's decode cells sit below the lanes' own sessions
+(ggml_cpu Q4_K_M 155 against 161, managed 130 against 142) while llama.cpp's did not move, and the lane heads
+measured the same in these rounds (161 and 129): a session effect, not the merge; its cause was not
+isolated. Spotlight indexing ran at the start of some rounds (each cell's process snapshot is kept with the
+results). In the same session ggml_metal ran Q4_K_M pp512 / tg128 at 6,041 / 191 against llama.cpp Metal's
+5,871 / 188, and MLX at 6,598 / 164.
+
 ## Current limits
 
 - Speech output has no realtime endpoint (`/v1/realtime`), and a later turn does not yet reuse
   the prefix cache across a past spoken turn (see [Speech output](#speech-output)).
-- Many concurrent requests decode slower than vLLM and SGLang (see the speed item above): a batched
-  step runs each sequence's attention and short convolution as ops of its own.
+- Many concurrent requests decode slower than vLLM and SGLang (A40: 17.4 / 51 ms a token at 16 / 64
+  requests against vLLM's 8.1 / 11.0): a batched step runs each sequence's attention and short
+  convolution as ops of its own (about 128 kernels a sequence on ggml_cuda), and is traced again whenever
+  a request joins or leaves. A design for grouped steps is drafted, not built: decode and verify rows
+  grouped by row count, the short convolutions' windows in one pool per layer, row-list attention
+  (upstream `ggml_flash_attn_ext_rows`) on the ggml lanes and a per-step sequence table on direct CUDA,
+  so a batched graph depends on its group shapes only and its recording outlives requests. Its first
+  stages are bit-identical; the attention stage changes arithmetic on the ggml lanes and will be a
+  labelled default change. Its estimate (not measured): 7-8 / 8.5-10.5 ms a token at 16 / 64 requests
+  on the A40. One request at a time is unchanged by it.
+- NVFP4 on a Blackwell GPU (sm_100 / sm_120) runs its prompt products as W4A4, the activations quantized to
+  NVFP4 too, as llama.cpp's CUDA build does by default: perplexity +3.3% (ggml_cuda) and +3.6% (direct cuda)
+  against q8 activations, for prompts 1.5x faster. Only ggml_cuda can take q8 activations (ggml's own
+  `GGML_CUDA_MMQ_PREC=q8`); the direct-CUDA route of `config/lfm3-1.7b-nvfp4.json` has no such option.
+- On CC 12 GPUs (sm_120) TensorSharp turns ggml-cuda's programmatic dependent launch off for the whole
+  process (`GGML_CUDA_PDL=0`, set for Qwen 3.5's batched graphs), which costs LFM3 about 3% of its decode
+  speed; llama.cpp keeps it on.
 - The direct `cuda` backend runs parts of the Omni vision and audio towers on its element-by-element
   host fallback (abs, exp, neg, a fill and some of the towers' products have no kernel for their
   operands there): an image or audio prompt's first token comes later than on ggml_cuda.
@@ -634,20 +715,22 @@ from the prompt pool leaving one core to the server's own threads.
   client's schema).
 - The QAD-Q4_0 file is not in TensorAgent's catalog pending a quality and speed
   measurement against Q4_K_M.
-- CPU lanes against llama.cpp's CPU builds on an M5 Pro (see [Benchmarking](#benchmarking)):
-  ggml_cpu's Q4_K_M prompts of 128 and 512 tokens are 2-7% behind depending on the session
-  (Q8_0 0-4%, QAD-Q4_0 and 2,048-token prompts at parity; Q8_0's products and thread-pool waits
-  sample alike in both engines, and the cell moves by up to 10% between sessions). The managed CPU decodes quantized
-  files at 0.74-0.95x (see the worker-pool round under [Benchmarking](#benchmarking); what
-  remains is per-step work outside the products: the graph interpreter and the
-  single-threaded elementwise ops are ~20% of a decode step's main-thread time), runs Q8_0 /
-  Q4_0 prompts of 512 tokens and more at 0.77-0.84x (llama.cpp's repacked GEMMs use i8mm,
-  which .NET 10 does not expose), Q4_K_M prompts of 128-512 tokens at 0.99-1.02x, BF16
-  prompts at 0.44x of llama.cpp's Accelerate build, and its audio encoder takes 1.0-1.25x
-  llama.cpp's time (a 30 s / 10 s clip). Served through TensorSharp.Server.Host (one stream,
-  512-token prompts), it decodes Q4_K_M at 125-126 tokens/s against llama-server's 149-151,
-  with the first token at parity (575-615 against 589-605 ms), and four streams at 111-113
-  against 105-115 tokens/s in all.
+- CPU lanes against llama.cpp's CPU builds on an M5 Pro (the final tree's cells are under
+  [Benchmarking](#benchmarking)): ggml_cpu's Q4_K_M prompts of 128 and 512 tokens are 2-7% behind
+  depending on the session (Q8_0 and QAD-Q4_0 at parity; the cell moves by up to 10% between
+  sessions), and its Q4_K_M decode is at 0.97-1.04x. The managed CPU decodes quantized files at
+  0.78-0.95x (what remains is per-step work outside the products: the graph interpreter and the
+  single-threaded elementwise ops are ~20% of a decode step's main-thread time), runs Q4_K_M and Q8_0
+  prompts at 0.86-0.92x (llama.cpp's repacked GEMMs use i8mm, which .NET 10 does not expose), BF16
+  prompts at 0.44x of llama.cpp's Accelerate build, and serves one Q4_K_M stream at 0.83x llama-server's
+  decode speed (first token at parity).
+- Served ggml_cpu can run 8-10x slower for a whole server's life: on 2026-11-18, 2 of 10 one-stream Q4_K_M
+  runs of the vLLM harness's cell (65-69 against 6.7-6.8 ms a token) and 3 of 23 BF16 runs, on the final tree
+  and on the tree before that day's merges alike, and never llama-server or the managed CPU in the same
+  rounds. During such a run 15 of the decode pool's 16 threads stay busy instead of 16, so every node waits
+  on a thread that is not running; the cause (how one pool thread is scheduled, or a pool switch) is not
+  isolated. Served BF16 prompts on ggml_cpu also took 2.1-6.0 s for 523 tokens that day on every build
+  tested, the CPU integration's included, against the engine's ~1.0 s.
 - ggml_cpu's repacked weight copies are anonymous memory: served peak footprint 1.56 GB for
   Q4_K_M (2.31 GB Q8_0, 1.52 GB QAD-Q4_0) against llama-server's 1.20 GB (1.91, 1.15), down from
   1.96 GB (3.08, 1.92) since LFM3 keeps the gate and up weights apart there; NVFP4 (1.57 GB
