@@ -1031,6 +1031,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
         // g4v-timing attribution: where bind time goes (cache lookups vs
         // tensor_alloc vs fallthrough), and how many tensors were re-uploaded.
@@ -1045,7 +1046,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             {
                 ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
                 if (try_bind_cached_tensor(g_backend, dev, t, data, bytes, needs_upload, usage))
-                { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
+                { if (needs_upload) { upload_list.push_back({t, data, bytes}); pending.add(data); } return; }
             }
             if (bytes >= 4096)
             {
@@ -1161,6 +1162,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
 
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
 
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * N * sizeof(float));
         if (NQ > N)
@@ -1495,6 +1497,7 @@ TSG_EXPORT int TSGgml_Gemma4DraftStep(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
                                 enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
@@ -1503,7 +1506,7 @@ TSG_EXPORT int TSGgml_Gemma4DraftStep(
             {
                 ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
                 if (try_bind_cached_tensor(g_backend, dev, t, data, bytes, needs_upload, usage))
-                { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
+                { if (needs_upload) { upload_list.push_back({t, data, bytes}); pending.add(data); } return; }
             }
             if (bytes >= 4096)
             {
@@ -1549,6 +1552,7 @@ TSG_EXPORT int TSGgml_Gemma4DraftStep(
         host_read_barrier();
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
 
         std::int32_t tok = token;
         ggml_backend_tensor_set(tok_idx, &tok, 0, sizeof(std::int32_t));

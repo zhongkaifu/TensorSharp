@@ -1876,7 +1876,7 @@ namespace tsg
         PendingDeviceCopies& operator=(const PendingDeviceCopies&) = delete;
         ~PendingDeviceCopies() { abandon(); }
 
-        void add(void* key) { if (key != nullptr) keys_.push_back(key); }
+        void add(const void* key) { if (key != nullptr) keys_.push_back(const_cast<void*>(key)); }
         // The uploads are written: the copies hold the weights from here on.
         void commit() noexcept { keys_.clear(); }
         std::size_t size() const noexcept { return keys_.size(); }

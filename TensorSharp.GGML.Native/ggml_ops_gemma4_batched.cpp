@@ -764,6 +764,7 @@ static int gemma4_model_decode_batched_impl(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
                                 enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
@@ -775,7 +776,7 @@ static int gemma4_model_decode_batched_impl(
                 {
                     if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                     {
-                        if (needs_upload) upload_list.push_back({t, data, bytes});
+                        if (needs_upload) { upload_list.push_back({t, data, bytes}); pending.add(data); }
                         return;
                     }
                     invalidate_cached_buffer(data);
@@ -870,6 +871,7 @@ static int gemma4_model_decode_batched_impl(
         host_read_barrier();
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
 
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * n_seqs * sizeof(float));
         ggml_backend_tensor_set(pos_tensor, positions, 0, static_cast<std::size_t>(n_seqs) * sizeof(std::int32_t));
@@ -1356,6 +1358,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
                                 enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
@@ -1365,7 +1368,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
                 ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
                 {
-                    if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS) { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
+                    if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS) { if (needs_upload) { upload_list.push_back({t, data, bytes}); pending.add(data); } return; }
                     invalidate_cached_buffer(data);
                 }
             }
@@ -1437,6 +1440,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
 
         host_read_barrier();
         for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(H) * n_seqs * sizeof(float));
         ggml_backend_tensor_set(pos_tensor, positions, 0, static_cast<std::size_t>(n_seqs) * sizeof(std::int32_t));
         if (can_persist)

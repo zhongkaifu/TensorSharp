@@ -722,6 +722,7 @@ static int gptoss_model_prefill_impl(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; const void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
 
         auto bind_or_mark = [&](ggml_tensor* tgt, const void* data, std::size_t bytes, bool cacheable,
@@ -733,7 +734,7 @@ static int gptoss_model_prefill_impl(
                 bool needs_upload = false;
                 if (try_bind_cached_tensor(g_backend, dev, tgt, raw, bytes, needs_upload, usage))
                 {
-                    if (needs_upload) upload_list.push_back({tgt, data, bytes});
+                    if (needs_upload) { upload_list.push_back({tgt, data, bytes}); pending.add(data); }
                     return;
                 }
             }
@@ -839,6 +840,7 @@ static int gptoss_model_prefill_impl(
 
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
 
         ggml_backend_tensor_set(hidden_t, hidden_data, 0,
                                 static_cast<std::size_t>(H) * static_cast<std::size_t>(N) * sizeof(float));
