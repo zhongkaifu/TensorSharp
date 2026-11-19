@@ -3,14 +3,22 @@
 //
 //   dotnet MiniMaxH3ImageStepProbe.dll --dit <denoiser.gguf|.safetensors> --te <qwen3vl...gguf> --backend ggml_metal \
 //       --prompt "..." --width 2048 --height 2048 --seed 7 [--steps 6] --out <dir> [--text <dir of an earlier run>]
+//       [--engine legacy|runtime|both] [--rounds N]
 //
 // The loop is MiniMaxH3ImageModel.Generate's (the same layout, schedule, PDD heads, noise and Euler update), driven
 // through the legacy denoiser (MiniMaxH3DiT.ForwardImage). The text encoder runs once and its layer-50 hidden state is
 // written to <out>/text-hidden.f32; --text reuses another run's, so two builds' denoisers see identical inputs. Writes
 // <out>/velocity-<i>.f32 per step, <out>/latent.f32 (after the last step) and <out>/result.json with their SHA-256s.
 //
+// --engine runtime denoises through the diffusion runtime's denoiser instead (MiniMaxH3ImageDenoiser, one GraphProgram a
+// step; stage S3 of docs/design/diffusion-runtime.md). --engine both runs the two on the same inputs at every step (the
+// runtime's over the legacy DiT's file mapping, so the weights are resident once), compares the velocities bit for bit,
+// times each, and advances with the legacy one's; --rounds repeats the loop from the same noise, the two arms' order
+// alternating by round and step (A B, then B A). Writes <out>/runtime-velocity-<i>.f32 beside the legacy ones (round 1)
+// and the per-step comparison into result.json.
+//
 // The members the loop needs are TensorSharp.Models internals: they are reached by reflection, so one build of this
-// probe runs against any TensorSharp.Models.dll placed beside it (a base build's and a changed build's).
+// probe runs against any TensorSharp.Models.dll placed beside it (a base build's and a changed build's; --engine legacy).
 using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
@@ -31,6 +39,10 @@ long seed = long.Parse(Value("--seed") ?? "7", CultureInfo.InvariantCulture);
 int steps = int.Parse(Value("--steps") ?? "6", CultureInfo.InvariantCulture);
 string outDir = Path.GetFullPath(Required("--out"));
 string? textDir = Value("--text");
+string engine = Value("--engine") ?? "legacy";
+int rounds = int.Parse(Value("--rounds") ?? "1", CultureInfo.InvariantCulture);
+if (engine is not ("legacy" or "runtime" or "both")) throw new ArgumentException("--engine is legacy, runtime or both");
+if (rounds < 1 || (rounds > 1 && engine != "both")) throw new ArgumentException("--rounds takes a positive count, with --engine both");
 BackendType backend = backendName switch
 {
     "ggml_metal" => BackendType.GgmlMetal,
@@ -116,7 +128,9 @@ int imageTokens = (lh / 2) * (lw / 2);
 Type sampling = Internal("MiniMaxH3ImageSampling");
 Type layoutType = Internal("MiniMaxH3ImageLayout");
 var stepRecords = new List<object>();
+var comparisons = new List<object>();
 var total = Stopwatch.StartNew();
+float[] x0 = (float[])x.Clone();
 using (var dit = new MiniMaxH3DiT(ditPath, backend, null))
 {
     float[] grid;
@@ -127,24 +141,84 @@ using (var dit = new MiniMaxH3DiT(ditPath, backend, null))
         grid = (float[])Invoke(sampling, null, "GridFrom", metadata, dit.Config.PddSteps)!;
     }
     var sigmas = (float[])Invoke(sampling, null, "Schedule", grid, steps)!;
-    for (int i = 0; i < steps; i++)
+    // The runtime's denoiser over the legacy DiT's mapping (one device copy of each weight), made at its first use.
+    Type? runtimeType = engine == "legacy" ? null : models.GetType("TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageDenoiser", throwOnError: true);
+    IDisposable? runtime = null;
+    double preloadSeconds = 0;
+    try
     {
-        float sigma = sigmas[i], next = sigmas[i + 1];
-        object layout = Invoke(layoutType, null, "Build", textLength, lh, lw, sigma, null, null)!;
-        var interval = Invoke(sampling, null, "Interval", grid, sigma, next)!;
-        int start = (int)interval.GetType().GetField("Item1")!.GetValue(interval)!;
-        int stop = (int)interval.GetType().GetField("Item2")!.GetValue(interval)!;
-        var clock = Stopwatch.StartNew();
-        var v = (float[])Invoke(typeof(MiniMaxH3DiT), dit, "ForwardImage", x, imageTokens, textHidden, textLength, layout, grid, start,
-            stop, null, 0)!;
-        double seconds = clock.Elapsed.TotalSeconds;
-        if (v.Any(f => !float.IsFinite(f))) throw new InvalidDataException($"step {i + 1}: a non-finite velocity");
-        byte[] vb = Bytes(v);
-        File.WriteAllBytes(Path.Combine(outDir, $"velocity-{i + 1}.f32"), vb);
-        float dt = next - sigma;
-        for (long k = 0; k < x.Length; k++) x[k] += v[k] * dt;
-        stepRecords.Add(new { step = i + 1, sigma, next, heads = new[] { start, stop }, seconds, sha256 = Sha(vb) });
-        Console.WriteLine($"step {i + 1}/{steps} sigma {sigma:0.#####} -> {next:0.#####} heads {start}..{stop} {seconds:F2}s {Sha(vb)}");
+        if (runtimeType != null)
+        {
+            runtime = (IDisposable)Invoke(runtimeType, null, "SharingLegacyWeights", dit, backend)!;
+            if (engine == "runtime")
+            {
+                var clock = Stopwatch.StartNew();
+                Invoke(runtimeType, runtime, "Preload");
+                preloadSeconds = clock.Elapsed.TotalSeconds;
+            }
+        }
+        float[] Legacy(object layout, int start, int stop) =>
+            (float[])Invoke(typeof(MiniMaxH3DiT), dit, "ForwardImage", x, imageTokens, textHidden, textLength, layout, grid, start, stop, null, 0)!;
+        float[] Runtime(object layout, int start, int stop) =>
+            (float[])((float[])Invoke(runtimeType!, runtime, "Forward", x, imageTokens, textHidden, textLength, layout, grid, start, stop, null, 0)!).Clone();
+        for (int round = 0; round < rounds; round++)
+        {
+            Array.Copy(x0, x, x.Length);
+            for (int i = 0; i < steps; i++)
+            {
+                float sigma = sigmas[i], next = sigmas[i + 1];
+                object layout = Invoke(layoutType, null, "Build", textLength, lh, lw, sigma, null, null)!;
+                var interval = Invoke(sampling, null, "Interval", grid, sigma, next)!;
+                int start = (int)interval.GetType().GetField("Item1")!.GetValue(interval)!;
+                int stop = (int)interval.GetType().GetField("Item2")!.GetValue(interval)!;
+                float[]? v = null, r = null;
+                double legacySeconds = 0, runtimeSeconds = 0;
+                bool legacyFirst = (round + i) % 2 == 0;
+                for (int arm = 0; arm < 2; arm++)
+                {
+                    bool legacyArm = (arm == 0) == legacyFirst;
+                    if (legacyArm ? engine == "runtime" : engine == "legacy") continue;
+                    var clock = Stopwatch.StartNew();
+                    if (legacyArm) { v = Legacy(layout, start, stop); legacySeconds = clock.Elapsed.TotalSeconds; }
+                    else { r = Runtime(layout, start, stop); runtimeSeconds = clock.Elapsed.TotalSeconds; }
+                }
+                float[] advance = v ?? r!;
+                if (advance.Any(f => !float.IsFinite(f))) throw new InvalidDataException($"step {i + 1}: a non-finite velocity");
+                if (round == 0)
+                {
+                    byte[] vb = Bytes(advance);
+                    File.WriteAllBytes(Path.Combine(outDir, $"velocity-{i + 1}.f32"), vb);
+                    if (v != null && r != null) File.WriteAllBytes(Path.Combine(outDir, $"runtime-velocity-{i + 1}.f32"), Bytes(r));
+                    stepRecords.Add(new { step = i + 1, sigma, next, heads = new[] { start, stop },
+                        seconds = v != null ? legacySeconds : runtimeSeconds, sha256 = Sha(vb) });
+                }
+                string line = $"round {round + 1} step {i + 1}/{steps} sigma {sigma:0.#####} -> {next:0.#####} heads {start}..{stop}";
+                if (v != null && r != null)
+                {
+                    int differ = 0;
+                    double maxAbs = 0, maxV = 0;
+                    for (int k = 0; k < v.Length; k++)
+                    {
+                        if (BitConverter.SingleToInt32Bits(v[k]) != BitConverter.SingleToInt32Bits(r[k])) differ++;
+                        maxAbs = Math.Max(maxAbs, Math.Abs((double)r[k] - v[k]));
+                        maxV = Math.Max(maxV, Math.Abs((double)v[k]));
+                    }
+                    comparisons.Add(new { round = round + 1, step = i + 1, legacyFirst, legacySeconds, runtimeSeconds, valuesDiffering = differ,
+                        maxAbsDiff = maxAbs, maxRelDiff = maxAbs / Math.Max(maxV, 1e-30), legacySha256 = Sha(Bytes(v)), runtimeSha256 = Sha(Bytes(r)) });
+                    line += $" legacy {legacySeconds:F2}s runtime {runtimeSeconds:F2}s ({(legacyFirst ? "A B" : "B A")}) " +
+                            (differ == 0 ? "bit-exact" : $"{differ} values differ, max |d| {maxAbs:E3} ({maxAbs / Math.Max(maxV, 1e-30):E3} rel)");
+                }
+                else line += $" {(v != null ? legacySeconds : runtimeSeconds):F2}s {Sha(Bytes(advance))}";
+                Console.WriteLine(line);
+                float dt = next - sigma;
+                for (long k = 0; k < x.Length; k++) x[k] += advance[k] * dt;
+            }
+        }
+        if (runtime != null && preloadSeconds > 0) Console.WriteLine($"runtime preload {preloadSeconds:F2}s");
+    }
+    finally
+    {
+        runtime?.Dispose();
     }
 }
 byte[] latent = Bytes(x);
@@ -156,7 +230,7 @@ var result = new
     textSeconds, textReused = textDir != null, denoiseSeconds = total.Elapsed.TotalSeconds,
     nativeLibrary = native, nativeSha256 = File.Exists(native) ? Sha(File.ReadAllBytes(native)) : null,
     models = models.Location, modelsSha256 = Sha(File.ReadAllBytes(models.Location)),
-    stepsRecorded = stepRecords, latentSha256 = Sha(latent),
+    stepsRecorded = stepRecords, latentSha256 = Sha(latent), engine, rounds, comparisons,
 };
 File.WriteAllText(Path.Combine(outDir, "result.json"), JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }) + "\n");
 Console.WriteLine($"latent {Sha(latent)}");
