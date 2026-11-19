@@ -683,8 +683,8 @@ long 128K–256K contexts where the KV cache dominates memory.
 
 `f16` stays the default on `--backend cuda`. `q8_0` holds about twice the context in the same
 device memory, but on an RTX PRO 4500 Blackwell (sm_120) its kernels are bound by their arithmetic,
-not by memory traffic: with Qwen3.8-27B NVFP4 a verify step took the same time as with `f16`, and a
-fresh prefill took 1-5% longer, more for longer prompts (issue #376's reproducer, 6.6K-130K tokens). Its
+not by memory traffic: with Qwen3.8-27B NVFP4 a verify step took the same time as with `f16` (6.6K-69K
+tokens), and a fresh prefill took 1-5% longer, more for longer prompts (6.6K-130K tokens; issue #376's reproducer). Its
 perplexity stayed within 0.16% of `f16` on Qwen3.5-0.8B and Ministral 3 3B (8K-96K tokens) and within 0.3% on
 Qwen3.8-27B with Q6_K weights (8K-16K). Qwen3.8-27B NVFP4 runs its prompt rows on 4-bit activations, which amplify any
 change of attention arithmetic: there `q8_0` moved a few long code windows' perplexity a lot, in both directions (as the
