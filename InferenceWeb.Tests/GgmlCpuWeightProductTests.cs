@@ -322,6 +322,17 @@ public sealed class GgmlCpuWeightProductTests
     /// concurrent greedy replies equal one-at-a-time ones on those files. (The K-quants' GEMM sums a row in another order
     /// than their GEMV, so theirs depend on the batch, as on llama.cpp; padding their rows to the GEMM halved decode speed.)
     /// A drift guard on the ggml kernels these files rely on.
+    /// <para>
+    /// Weights are repacked only where <see cref="GgmlBasicOps.CpuRepacksWeights"/> says so: by default on ARM64 alone
+    /// (TS_GGML_CPU_REPACK). Elsewhere, x86_64 included, they keep their GGUF layout and this test exercises ggml-cpu's
+    /// plain kernels instead: a one-row product runs the type's vec_dot, and a product of two rows or more runs llamafile's
+    /// sgemm where it has the type (llamafile_sgemm declines below two rows). Q4_0 and Q8_0 still give every row its own
+    /// bits there (their AVX2 vec_dot keeps one accumulator, as tinyBLAS does), and MXFP4 runs its vec_dot at every width
+    /// (sgemm has no MXFP4 case). IQ4_NL does not: ggml_vec_dot_iq4_nl_q8_0's AVX2 body sums even and odd blocks in two
+    /// accumulators while tinyBLAS_Q0_AVX&lt;block_iq4_nl&gt; keeps one, so a plain IQ4_NL row's bits depend on whether it
+    /// is alone. IQ4_NL is therefore checked only where weights are repacked (x86_64 with TS_GGML_CPU_REPACK=1 checks it
+    /// and passes); no in-process switch turns repacking on, so on x86_64 by default it is skipped.
+    /// </para>
     /// </summary>
     [GgmlFact(BackendType.GgmlCpu)]
     public void RepackedNonKQuantProductsGiveEveryRowItsOwnBits()
@@ -330,6 +341,10 @@ public sealed class GgmlCpuWeightProductTests
         {
             var rng = new Random(17);
             var differing = new List<string>();
+            bool repacked = GgmlBasicOps.CpuRepacksWeights();
+            _output.WriteLine(repacked
+                ? "weights repacked: IQ4_NL checked"
+                : "weights in their GGUF layout (ggml-cpu's plain kernels): IQ4_NL not checked");
             foreach (int type in new[] { 2, 8, 20, 39 })   // Q4_0, Q8_0, IQ4_NL, MXFP4
             {
                 using var native = new Native();
@@ -337,6 +352,8 @@ public sealed class GgmlCpuWeightProductTests
                 IntPtr w = native.Copy(bytes);
                 const int most = 13;
                 float[] x = Activations(most, rng);
+                // Skipped after its data is drawn, so the types after it see the same random data either way.
+                if (type == 20 && !repacked) continue;
                 var alone = new float[most][];
                 for (int j = 0; j < most; j++)
                     alone[j] = Run(type, w, bytes.Length, native.Copy(x.AsSpan(j * K, K).ToArray()), 1, new[] { (0, M) }, null, native)[0];
