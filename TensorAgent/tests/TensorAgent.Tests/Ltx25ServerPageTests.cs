@@ -45,6 +45,7 @@ public sealed class Ltx25ServerPageTests
             function videoImageConditions(){return null;}
             function cancelCurrentGeneration(){}
             function setSendButtonState(){}
+            function primeSpeechPlayback(){}
             async function drainChatSubmissions(){queuedChatMessages.forEach(function(entry){built.push(entry.message);});queuedChatMessages=[];}
             function ensureCurrentGeneration(){}
             async function fetch(url,options){calls.push({url:url,payload:JSON.parse(options.body)});throw new Error('captured');}
