@@ -244,6 +244,16 @@ plus prompt/KV reuse when reported and a stopped/truncated marker when applicabl
 Those statistics are saved with the conversation and return when it is reopened;
 image/video turns do not show the placeholder zero-token counters.
 
+**Spoken replies.** With a model that speaks loaded (LFM3-Omni and its projector, which carries
+the speech decoder), the composer shows a **Speak replies** switch and, when the model has more
+than one, a voice picker. A reply sent with it on is spoken while it is written: the page plays the
+speech chunks as they arrive (the audio starts from the tap that sends, as WebKit requires) and
+**Stop speaking** silences it; the finished reply keeps a player and **Save audio**, which goes
+through the app's save picker like a picture's **Download**. The WAV is saved with the conversation
+and plays again when it is reopened, and the next turn carries the reply back by its id, so the
+host reuses its cached prompt. A spoken reply runs without reasoning, tools or skills, and says so
+under the answer. See [API_EXAMPLES.md → Spoken replies](../TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni).
+
 What is shared is the API, not the document. The routes under the page —
 `/api/chat`, `/api/models`, `/api/sessions`, `/api/upload`, `/api/skills`,
 `/api/image-edit`, `/api/video-generate` — are bound to the same
@@ -2296,6 +2306,11 @@ checked and these were not:
 - **The native picker's own file names.** `UploadNaming` is tested against the shapes
   iOS produces (a stem with no extension, no content type, HEIC and MP4 bytes behind
   the same absent name), but the picker itself has only been run by hand.
+- **Spoken replies in the app.** The page's switch, live playback, player, Save link and the
+  recorded transcript are tested in JavaScriptCore with a fake AudioContext and on the host
+  (`SpokenReplyPageTests`, `SpokenReplyRecordingTests`); the same `/api/chat` route was run against
+  LFM3-Omni on TensorSharp.Server. Playback inside the app's WKWebView, the iOS save picker, the
+  Mac app's and Windows' save dialogs for a WAV were not run.
 - **Pictures on a phone.** The page makes and edits pictures through `/api/chat` with
   Qwen-Image 2.1, which needs the 24 GB memory tier and was measured in the Mac app;
   no image has been generated on iOS. `/api/image-edit` remains bound to the same

@@ -135,11 +135,14 @@ public sealed class ConversationRecorder
     /// <param name="stats">The model's terminal counters, when supplied by a text turn.</param>
     /// <param name="image">What the picture was made from, or the readings an image turn offered
     /// instead of making one (see <see cref="ImageTurnRecord"/>).</param>
+    /// <param name="spoken">A spoken reply's id, WAV and length (its <c>done</c> frame); its
+    /// <c>audioUrl</c> is kept without a clip.</param>
     public void Complete(
         string sessionId, string content, string? thinking = null,
         IReadOnlyList<StoredArtifact>? artifacts = null, string? imageUrl = null,
         string? videoUrl = null, string? audioUrl = null, StoredTurnStats? stats = null,
-        ImageTurnRecord? image = null, IReadOnlyList<JsonElement>? knowledgeSources = null)
+        ImageTurnRecord? image = null, IReadOnlyList<JsonElement>? knowledgeSources = null,
+        SpokenReplyRecord? spoken = null)
     {
         // Image/video completion frames carry zero-token placeholder counters. Keep
         // actual LLM counters when a text turn also produced media through a tool.
@@ -175,6 +178,9 @@ public sealed class ConversationRecorder
                 VideoUrl = string.IsNullOrEmpty(videoUrl) ? null : videoUrl,
                 AudioUrl = string.IsNullOrEmpty(videoUrl) || string.IsNullOrEmpty(audioUrl) ? null : audioUrl,
             };
+            // A spoken reply: its WAV is the player and the download a reopened chat shows, and
+            // its id is what lets the next turn reuse the cached prompt across it.
+            spoken?.ApplyTo(answer);
             image?.ApplyTo(answer);
             conversation.Messages.Add(answer);
             _store.Save(conversation);

@@ -23,7 +23,7 @@ namespace TensorAgent.Maui.Services;
 /// </summary>
 internal static class FilePresenter
 {
-    /// <summary>Save a copy of a generated image to the location the user chooses.</summary>
+    /// <summary>Save a copy of a generated file (a picture, a spoken reply) to the location the user chooses.</summary>
     public static async Task<string?> SaveAsync(string fullPath)
     {
         if (string.IsNullOrEmpty(fullPath) || !File.Exists(fullPath))

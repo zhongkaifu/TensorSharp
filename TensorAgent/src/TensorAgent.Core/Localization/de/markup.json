@@ -11,6 +11,8 @@
   "markup.composer.placeholder": "Nachricht… oder zum Sprechen gedrückt halten",
   "markup.composer.holdToTalk": "Zum Sprechen gedrückt halten",
   "markup.composer.send": "Senden",
+  "markup.composer.speakReplies": "Antworten vorlesen",
+  "markup.composer.voice": "Stimme",
   "markup.attach.title": "Zu dieser Nachricht hinzufügen",
   "markup.attach.photo": "Foto",
   "markup.attach.camera": "Kamera",

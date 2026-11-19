@@ -11,6 +11,8 @@
   "markup.composer.placeholder": "메시지… 또는 길게 눌러 말하기",
   "markup.composer.holdToTalk": "길게 눌러 말하기",
   "markup.composer.send": "보내기",
+  "markup.composer.speakReplies": "답변 읽어 주기",
+  "markup.composer.voice": "목소리",
   "markup.attach.title": "이 메시지에 추가",
   "markup.attach.photo": "사진",
   "markup.attach.camera": "카메라",

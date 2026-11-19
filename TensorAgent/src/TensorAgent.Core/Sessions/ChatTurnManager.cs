@@ -377,6 +377,7 @@ public sealed class ChatTurnManager : IDisposable
         string? imageUrl = null, videoUrl = null, audioUrl = null;
         ImageTurnRecord? image = null;
         StoredTurnStats? stats = null;
+        SpokenReplyRecord? spoken = null;
         ChatTurnState state;
 
         try
@@ -392,7 +393,7 @@ public sealed class ChatTurnManager : IDisposable
                 if (turn.Token.IsCancellationRequested)
                     continue;
                 turn.Append(frame, content, MaxBufferedFrames, knowledgeSources);
-                ReadInto(frame, content, thinking, artifacts, artifactUrls, ref sessionId, ref imageUrl, ref videoUrl, ref audioUrl, ref image, ref stats, knowledgeSources);
+                ReadInto(frame, content, thinking, artifacts, artifactUrls, ref sessionId, ref imageUrl, ref videoUrl, ref audioUrl, ref image, ref stats, knowledgeSources, ref spoken);
             }
             state = turn.Token.IsCancellationRequested ? ChatTurnState.Cancelled : ChatTurnState.Completed;
         }
@@ -444,7 +445,8 @@ public sealed class ChatTurnManager : IDisposable
                     audioUrl,
                     stats,
                     image,
-                    knowledgeSources);
+                    knowledgeSources,
+                    spoken);
             }
             catch (Exception) { /* a lost transcript must not be a crash on a background thread */ }
         }
@@ -478,7 +480,8 @@ public sealed class ChatTurnManager : IDisposable
         ref string? audioUrl,
         ref ImageTurnRecord? image,
         ref StoredTurnStats? stats,
-        List<JsonElement> knowledgeSources)
+        List<JsonElement> knowledgeSources,
+        ref SpokenReplyRecord? spoken)
     {
         try
         {
@@ -489,7 +492,11 @@ public sealed class ChatTurnManager : IDisposable
                 return;
             Hosting.WebUiRoutes.CollectKnowledgeSources(root, knowledgeSources);
             if (root.TryGetProperty("done", out JsonElement done) && done.ValueKind == JsonValueKind.True)
+            {
                 stats = StoredTurnStats.FromDoneFrame(root);
+                // A spoken reply's id, WAV and length ride on the same frame.
+                spoken = SpokenReplyRecord.FromDoneFrame(root);
+            }
             if (root.TryGetProperty("token", out JsonElement token) && token.GetString() is { } piece)
                 content.Append(piece);
             else if (root.TryGetProperty("replace", out JsonElement replace) && replace.GetString() is { } whole)
@@ -505,6 +512,7 @@ public sealed class ChatTurnManager : IDisposable
             {
                 thinking.Clear();
                 stats = null;
+                spoken = null;
             }
 
             // A tool's ordinary `files` field is provisional: a guarded workflow can
