@@ -18,7 +18,8 @@ namespace TensorSharp.Server
     ///
     /// Isolation invariants:
     ///   1. A session's <see cref="Transcripts"/> are only visible to code that holds a
-    ///      reference to this session, and a recorded turn is spliced into a later
+    ///      reference to this session or to another session bound to the same saved
+    ///      conversation (<see cref="BindConversation(string, ChatSession)"/>), and a recorded turn is spliced into a later
     ///      request only when that request's history reproduces the turn's preceding
     ///      history AND the content the server emitted for it (see
     ///      <see cref="ConversationTranscriptStore"/>). A session shared by unrelated
@@ -27,7 +28,9 @@ namespace TensorSharp.Server
     ///   2. No session is "active" in the model. Per-request KV blocks, prefix reuse, and
     ///      cleanup live inside Runtime/Scheduling; the session only names the cache
     ///      scope its requests run in (<see cref="ResolveCacheScope"/>).
-    ///   3. <see cref="Dispose"/> clears all in-memory history held by the session.
+    ///   3. <see cref="Dispose"/> clears all in-memory history held by the session (a
+    ///      transcript store it shares with another session of the same saved conversation
+    ///      stays with that session).
     /// </summary>
     public sealed class ChatSession : IDisposable
     {
@@ -36,9 +39,15 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// The raw output tokens of the assistant turns generated in this session, one
-        /// record per turn keyed by the conversation history that preceded it.
+        /// record per turn keyed by the conversation history that preceded it. Sessions bound
+        /// to one saved conversation share it (<see cref="BindConversation(string, ChatSession)"/>). Read and
+        /// replaced under <see cref="HistoryLock"/>.
         /// </summary>
-        internal ConversationTranscriptStore Transcripts { get; }
+        internal ConversationTranscriptStore Transcripts { get; private set; }
+
+        // Another session of the same conversation holds this store too: a reset or dispose
+        // drops this session's reference rather than clearing records that session still needs.
+        private bool _transcriptsShared;
 
         /// <summary>Dedicated Web UI requests wait for prior cancellation and recording.</summary>
         internal TensorSharp.Chat.WebUiTurnCoordinator WebUiTurns { get; } = new();
@@ -87,9 +96,7 @@ namespace TensorSharp.Server
             SharedAcrossConversations = sharedAcrossConversations;
             // A shared session holds many conversations; a Web UI chat holds one, but a
             // record for every turn of it. Both are bounded by raw tokens held.
-            Transcripts = sharedAcrossConversations
-                ? new ConversationTranscriptStore(maxChains: 4096, maxTokens: 8_000_000)
-                : new ConversationTranscriptStore(maxChains: 2048, maxTokens: 4_000_000);
+            Transcripts = NewTranscriptStore(sharedAcrossConversations);
             CreatedAt = DateTime.UtcNow;
             LastUsedAt = CreatedAt;
         }
@@ -132,10 +139,69 @@ namespace TensorSharp.Server
         /// conversation's own retained state and re-prefilled everything past the system
         /// prompt. The key must identify a conversation of one user; null unbinds.
         /// </summary>
-        internal void BindConversation(string conversationKey)
+        internal void BindConversation(string conversationKey) => BindConversation(conversationKey, sameConversation: null);
+
+        /// <summary>
+        /// <see cref="BindConversation(string)"/>, continuing the transcripts of
+        /// <paramref name="sameConversation"/>, another live session already bound to that
+        /// conversation. A reopened chat sends the history its earlier session generated, and
+        /// only that session's records turn its assistant messages back into the tokens the
+        /// conversation's cached state holds: in a store of its own they rendered through the
+        /// template, which on Qwen 3.5 re-renders a past reply without its empty thinking block,
+        /// so the prompt left the cache at the first reply and the reopened chat prefilled
+        /// everything after it again although it ran in the conversation's own scope.
+        /// </summary>
+        internal void BindConversation(string conversationKey, ChatSession sameConversation)
         {
+            string key = string.IsNullOrEmpty(conversationKey) ? null : conversationKey;
+            ConversationTranscriptStore shared = null;
+            if (key != null && sameConversation != null && !ReferenceEquals(sameConversation, this)
+                && !sameConversation.SharedAcrossConversations && !SharedAcrossConversations)
+            {
+                // One lock at a time: two sessions of a conversation bound together never wait on each other.
+                lock (sameConversation.HistoryLock)
+                {
+                    if (!sameConversation.IsDisposed && string.Equals(sameConversation._conversationKey, key, StringComparison.Ordinal))
+                    {
+                        sameConversation._transcriptsShared = true;
+                        shared = sameConversation.Transcripts;
+                    }
+                }
+            }
             lock (HistoryLock)
-                _conversationKey = string.IsNullOrEmpty(conversationKey) ? null : conversationKey;
+            {
+                _conversationKey = key;
+                if (shared != null && !ReferenceEquals(shared, Transcripts))
+                {
+                    Transcripts = shared;
+                    _transcriptsShared = true;
+                }
+            }
+        }
+
+        /// <summary>The saved conversation this session is bound to, or null.</summary>
+        internal string ConversationKey
+        {
+            get { lock (HistoryLock) return _conversationKey; }
+        }
+
+        private static ConversationTranscriptStore NewTranscriptStore(bool sharedAcrossConversations)
+            => sharedAcrossConversations
+                ? new ConversationTranscriptStore(maxChains: 4096, maxTokens: 8_000_000)
+                : new ConversationTranscriptStore(maxChains: 2048, maxTokens: 4_000_000);
+
+        // Forget this session's records: its own store is cleared, a shared one is left to the sessions still using it.
+        private void ForgetTranscripts()
+        {
+            if (_transcriptsShared)
+            {
+                Transcripts = NewTranscriptStore(SharedAcrossConversations);
+                _transcriptsShared = false;
+            }
+            else
+            {
+                Transcripts.Clear();
+            }
         }
 
         private static string HashScope(string value)
@@ -146,7 +212,7 @@ namespace TensorSharp.Server
         /// Callers hold <see cref="HistoryLock"/>.</summary>
         internal void ResetConversation()
         {
-            Transcripts.Clear();
+            ForgetTranscripts();
             ConversationEpoch++;
         }
 
@@ -159,7 +225,8 @@ namespace TensorSharp.Server
             if (IsDisposed)
                 return;
             IsDisposed = true;
-            Transcripts.Clear();
+            lock (HistoryLock)
+                ForgetTranscripts();
         }
     }
 }

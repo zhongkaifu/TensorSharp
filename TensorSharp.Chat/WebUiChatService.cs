@@ -286,8 +286,10 @@ namespace TensorSharp.Chat
         /// <paramref name="conversationKey"/>, so every session opened for that
         /// conversation continues its cached prompt state (one cache scope per
         /// conversation instead of per session). For a host that owns conversation
-        /// identity and serves one user, such as TensorAgent. Returns false for an
-        /// unknown session or the shared default session.
+        /// identity and serves one user, such as TensorAgent. The session continues the
+        /// transcripts of a live session already bound to that conversation (the chat as it was
+        /// before it was reopened), so the history it is sent renders as the tokens that state
+        /// holds. Returns false for an unknown session or the shared default session.
         /// </summary>
         public bool BindSessionConversation(string sessionId, string conversationKey)
         {
@@ -297,7 +299,21 @@ namespace TensorSharp.Chat
             ChatSession session = _sessions.GetSession(sessionId);
             if (session == null || session.SharedAcrossConversations)
                 return false;
-            session.BindConversation(conversationKey);
+            ChatSession sameConversation = null;
+            if (!string.IsNullOrEmpty(conversationKey))
+            {
+                foreach (string id in _sessions.SessionIds)
+                {
+                    if (string.Equals(id, sessionId, StringComparison.Ordinal)) continue;
+                    if (_sessions.GetSession(id) is { SharedAcrossConversations: false, IsDisposed: false } other
+                        && string.Equals(other.ConversationKey, conversationKey, StringComparison.Ordinal))
+                    {
+                        sameConversation = other;
+                        break;
+                    }
+                }
+            }
+            session.BindConversation(conversationKey, sameConversation);
             return true;
         }
 
