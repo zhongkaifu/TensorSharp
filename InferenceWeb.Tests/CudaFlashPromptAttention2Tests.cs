@@ -5,25 +5,35 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.IO;
 using System.Linq;
 using TensorSharp;
 using TensorSharp.Cuda;
+using TensorSharp.Models;
 using Xunit;
 using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// The prompt kernels with F32 accumulation (ts_flash_prompt2_*, CudaFlashPrefillKernels.LaunchPromptAttention): against a
-/// double-precision host reference over the same F16 cache they are closer than the 16-bit-run prompt kernels
-/// (ts_flash_prompt_*, LaunchAttention's prompt) on Gaussian, peaked and outlier-channel data, with a floor, fresh causal
-/// chunks, few rows over a long window, and the last wave's tiles split over their keys.
+/// The prompt kernels with F32 accumulation (ts_flash_prompt2_*, CudaFlashPrefillKernels.LaunchPromptAttention), the CUDA executor's
+/// 16-bit prompt attention from flash prefill v13 on where the tensor cores accumulate F32 at full rate: against a double-precision
+/// host reference over the same F16 cache they are closer than the 16-bit-run prompt kernels they replace (ts_flash_prompt_*,
+/// LaunchAttention's prompt) on Gaussian, peaked and outlier-channel data, with a floor, fresh causal chunks, few rows over a long
+/// window, and the last wave's tiles split over their keys; the executor takes them for a prompt chunk by default there and the
+/// 16-bit-run ones under its seam.
 /// </summary>
-public sealed class CudaFlashPromptAttention2Tests
+public sealed class CudaFlashPromptAttention2Tests : IDisposable
 {
     private readonly ITestOutputHelper _output;
+    private readonly string _dir = Directory.CreateTempSubdirectory("prompt-attn2").FullName;
 
     public CudaFlashPromptAttention2Tests(ITestOutputHelper output) => _output = output;
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+    }
 
     private static IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
 
@@ -141,5 +151,45 @@ public sealed class CudaFlashPromptAttention2Tests
             $"{flash.F32AccumulationRate:F2} of the F16 rate here");
         Assert.True(relNew <= relLegacy, $"relative RMS {relNew:E3} above the 16-bit-run kernel's {relLegacy:E3}");
         Assert.True(relNew <= 1e-3, $"relative RMS {relNew:E3}");
+    }
+
+    /// <summary>The executor's prompt chunks: by default the kernels with F32 accumulation where the tensor cores accumulate F32 at
+    /// full rate (a 1,300-token prompt's last-row logits near the 16-bit-run kernels', not their bits; elsewhere their bits), the
+    /// 16-bit-run kernels under CudaGraphExecutor.PromptAttentionLegacyForTests (their bits, run after run).</summary>
+    [CudaFact]
+    public void TheExecutorsPromptChunksTakeThemUnlessTheSeamAsksForThe16BitRunKernel()
+    {
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        string trunk = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "trunk.gguf"));
+        int[] tokens = Enumerable.Range(0, 1300).Select(i => 3 + (i * 37 + i / 7) % 250).ToArray();
+        using var model = new Qwen35RuntimeModel(trunk, BackendType.Cuda);
+        var executor = Assert.IsType<CudaGraphExecutor>(model.GraphExecutorForTests);
+        float[] Run(bool legacy)
+        {
+            executor.PromptAttentionLegacyForTests = legacy;
+            model.ResetKVCache();
+            return (float[])model.ForwardPrompt(tokens).Clone();
+        }
+        CudaFlashPrefillKernels flash = ((CudaAllocator)model.DirectAllocatorForTelemetry).FlashPrefillKernels;
+        float[] fresh = Run(false), legacyA = Run(true), legacyB = Run(true), again = Run(false);
+        _output.WriteLine($"F32 accumulation at {flash.F32AccumulationRate:F2} of the F16-accumulation rate: prompt kernels with F32 " +
+            $"accumulation {(flash.PromptAccumulatesInF32 ? "on" : "off")}");
+        Assert.True(fresh.AsSpan().SequenceEqual(again), "two default runs differ");
+        Assert.True(legacyA.AsSpan().SequenceEqual(legacyB), "two runs on the 16-bit-run kernels differ");
+        if (!flash.PromptAccumulatesInF32)
+        {
+            Assert.True(fresh.AsSpan().SequenceEqual(legacyA), "a part without full-rate F32 accumulation left the 16-bit-run kernels");
+            return;
+        }
+        Assert.False(fresh.AsSpan().SequenceEqual(legacyA), "the default run gave the 16-bit-run kernels' bits: the seam changes nothing");
+        double diff = 0, norm = 0;
+        for (int i = 0; i < fresh.Length; i++)
+        {
+            diff += ((double)fresh[i] - legacyA[i]) * ((double)fresh[i] - legacyA[i]);
+            norm += (double)legacyA[i] * legacyA[i];
+        }
+        double rel = Math.Sqrt(diff / Math.Max(norm, 1e-30));
+        _output.WriteLine($"1,300-token prompt: last-row logits rel L2 {rel:E3} between the default and the 16-bit-run prompt kernels");
+        Assert.True(rel <= 1e-2, $"last-row logits rel L2 {rel:E3} between the default and the 16-bit-run prompt kernels");
     }
 }

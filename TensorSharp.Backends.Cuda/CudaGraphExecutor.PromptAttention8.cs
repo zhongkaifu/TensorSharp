@@ -32,6 +32,12 @@ namespace TensorSharp.Cuda
 
         private bool PromptAttention8Enabled => PromptAttention8ForTests ?? PromptAttention8Default;
 
+        /// <summary>Tests, A/B runs and the eng probes: a prompt chunk's 16-bit attention runs the 16-bit-run prompt kernels
+        /// (ts_flash_prompt_*: each 16-dim step of Q K^T and each 32-key run of P V rounded to F16 before an F32 add, the
+        /// default until flash prefill v13, and still where CudaFlashPrefillKernels.PromptAccumulatesInF32 is false) instead of
+        /// the ones with F32 accumulation (CudaFlashPrefillKernels.LaunchPromptAttention).</summary>
+        internal bool PromptAttentionLegacyForTests { get; set; }
+
         /// <summary>Prompt chunks' attention ops run in 8 bits, and those whose band found no device room (tests, the probe).</summary>
         internal long PromptAttention8Launches { get; private set; }
         internal long PromptAttention8BandRefusals { get; private set; }
@@ -135,11 +141,24 @@ namespace TensorSharp.Cuda
         {
             var cuda = (CudaAllocator)Allocator;
             using var reference = new Tensor(Allocator, DType.Float32, nq, heads, d);
-            using Tensor partial = splits > 1
-                ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
-            Tensor[] written = partial == null ? new[] { reference } : new[] { reference, partial };
-            Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor,
-                heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(reference), stream, prompt: true));
+            if (PromptAttentionLegacyForTests || !flash.PromptAccumulatesInF32)
+            {
+                using Tensor partial = splits > 1
+                    ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
+                Tensor[] written = partial == null ? new[] { reference } : new[] { reference, partial };
+                Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor,
+                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(reference), stream, prompt: true));
+            }
+            else
+            {
+                // The executor's 16-bit prompt attention, on its own grid.
+                var plan = flash.PromptPlan(nq * (heads / kvHeads), kvHeads, Math.Max(1, len - nq + 1 - floor));
+                long floats = CudaFlashPrefillKernels.PromptPartialFloats(nq * (heads / kvHeads), kvHeads, d, plan);
+                using Tensor tail = floats > 0 ? new Tensor(Allocator, DType.Float32, floats) : null;
+                Launch(new[] { qc, kc, vc }, tail == null ? new[] { reference } : new[] { reference, tail }, (_, stream) =>
+                    flash.LaunchPromptAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor, heads, kvHeads, d, scale, plan,
+                        tail == null ? IntPtr.Zero : Ptr(tail), Ptr(reference), stream));
+            }
             cuda.Stream.Synchronize();
             int n = checked(nq * heads * d);
             float[] a = attended.GetElementsAsFloat(n), b = reference.GetElementsAsFloat(n);
