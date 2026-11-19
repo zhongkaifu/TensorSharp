@@ -23,6 +23,7 @@ namespace InferenceWeb.Tests;
 /// leading NaN is the host scan's pick, a later one never is) and rows of quantized logits, where ties are common. Runs on
 /// the pinned GGML backend (TS_TEST_GGML_BACKEND), whatever its executor declares.
 /// </summary>
+[Collection(GgmlGreedyFullRowsCollection.Name)]
 public sealed class GgmlGreedyHeadTests
 {
     private readonly ITestOutputHelper _output;
@@ -56,6 +57,15 @@ public sealed class GgmlGreedyHeadTests
         int ties = 0;
         foreach (float x in v) if (x == max) ties++;
         return v.Length > 8 && ties >= 8;
+    }
+
+    /// <summary>Whether the head reads a masked row in full: a NaN or an infinity among its raw logits, or eight or more of
+    /// the masked row's logits equal to its largest.</summary>
+    private static bool MaskedReadsInFull(float[] raw, float[] masked)
+    {
+        if (raw.Any(x => !float.IsFinite(x))) return true;
+        float max = masked.Max();
+        return masked.Length > 8 && masked.Count(x => x == max) >= 8;
     }
 
     private static List<(string Name, float[] Row)> Rows(int vocab)
@@ -131,7 +141,8 @@ public sealed class GgmlGreedyHeadTests
     /// <summary>A greedy head with a suppression mask (<see cref="GraphCapabilities.GreedyIdSuppression"/>): the ids are the
     /// host argmax after TokenSampler sets the suppressed logits to -inf - a suppressed largest logit, suppressed ties, a NaN
     /// or +inf at a suppressed id (the row read in full, the mask assigned as the host assigns it), a row whose kept logits
-    /// are all -inf.</summary>
+    /// are all -inf - and only the rows the candidates cannot decide are read in full (the mask's -inf does not make a row
+    /// of finite logits one).</summary>
     [Theory]
     [InlineData(3000)]
     [InlineData(128000)]
@@ -176,15 +187,21 @@ public sealed class GgmlGreedyHeadTests
             int maskLeaf = g.Leaf(GraphLeafRole.State, GraphFormat.F32, new long[] { vocab }, maskPin.AddrOfPinnedObject(), mask.LongLength * 4);
             g.Output(g.Op(GraphOp.Cont, stackalloc[] { g.Op(GraphOp.TopK, stackalloc[] { input, maskLeaf }, stackalloc long[] { 1, 1 }) }), n);
             using IGraphPlan plan = GgmlGraphExecutor.For(backend).Compile(g.ToProgram(replayable: true, reorder: false));
+            long full = GgmlGraph.GreedyFullRows;
             Assert.True(plan.Run(new[] { input }, new[] { pin.AddrOfPinnedObject() }, new[] { logits.LongLength * 4 }), plan.LastError);
+            long readInFull = GgmlGraph.GreedyFullRows - full;
+            int expectedFull = 0;
             for (int r = 0; r < n; r++)
             {
                 float[] masked = (float[])rows[r].Row.Clone();
                 foreach (int id in suppressed) masked[id] = float.NegativeInfinity;
                 int expected = HostArgmax(masked);
+                if (MaskedReadsInFull(rows[r].Row, masked)) expectedFull++;
                 Assert.True(expected == (int)plan.Outputs[0][r],
                     $"{backend} vocab {vocab}, row {r} ({rows[r].Name}): id {plan.Outputs[0][r]}, the host's argmax over the masked row {expected}");
             }
+            Assert.Equal(expectedFull, readInFull);
+            _output.WriteLine($"{backend} vocab {vocab} masked: {n} rows, {readInFull} read in full");
         }
         finally
         {
@@ -240,6 +257,14 @@ public sealed class GgmlGreedyHeadTests
     }
 }
 
+/// <summary>The tests that count the greedy heads' rows read in full (<see cref="GgmlGraph.GreedyFullRows"/>, a process-wide
+/// counter): run alone.</summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class GgmlGreedyFullRowsCollection
+{
+    public const string Name = "GGML greedy full-row reads";
+}
+
 /// <summary>Runs only where the pinned GGML executor picks greedy ids on the device (TS_TEST_GGML_BACKEND=cuda or vulkan).</summary>
 public sealed class GgmlDeviceGreedyFactAttribute : FactAttribute
 {
@@ -253,8 +278,10 @@ public sealed class GgmlDeviceGreedyFactAttribute : FactAttribute
 /// <summary>
 /// The shared runtime's greedy steps with suppressed tokens (LFM3-Omni's reply-token policy) on a GGML executor that picks
 /// on the device: three sequences decoding together pick what TokenSampler picks from their logits with the same tokens
-/// suppressed, step after step (the suppressed set holds the tokens the unsuppressed stream picks most).
+/// suppressed, step after step (the suppressed set holds the tokens the unsuppressed stream picks most), and their rows of
+/// finite logits take the device's pick (none is read in full).
 /// </summary>
+[Collection(GgmlGreedyFullRowsCollection.Name)]
 public sealed class GgmlSuppressedGreedyStepTests : IDisposable
 {
     private readonly string _dir = System.IO.Directory.CreateTempSubdirectory("greedy-suppressed").FullName;
@@ -310,7 +337,9 @@ public sealed class GgmlSuppressedGreedyStepTests : IDisposable
         int[][] plain = Run(path, Array.Empty<int>(), device: false);
         int[] frequent = plain.SelectMany(t => t).GroupBy(t => t).OrderByDescending(g => g.Count()).Take(3).Select(g => g.Key).ToArray();
         int[][] host = Run(path, frequent, device: false);
+        long full = GgmlGraph.GreedyFullRows;
         int[][] onDevice = Run(path, frequent, device: true);
+        Assert.Equal(0, GgmlGraph.GreedyFullRows - full);
         Assert.Equal(host.Length, onDevice.Length);
         for (int i = 0; i < host.Length; i++) Assert.Equal(host[i], onDevice[i]);
         Assert.DoesNotContain(onDevice.SelectMany(t => t), t => frequent.Contains(t));

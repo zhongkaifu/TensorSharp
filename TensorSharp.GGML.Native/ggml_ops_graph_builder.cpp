@@ -158,7 +158,7 @@ namespace
         ggml_tensor* mask = nullptr;     // [vocab] F32, -0 kept / -inf suppressed, added before the pick (null: none)
         ggml_tensor* ids = nullptr;      // [k, rows] I32: ggml_top_k (in no particular order)
         ggml_tensor* values = nullptr;   // [1, k, rows] F32: the logits at those ids
-        ggml_tensor* sums = nullptr;     // [1, rows] F32: each row's sum (finite iff every logit is)
+        ggml_tensor* sums = nullptr;     // [1, rows] F32: each row's raw sum (finite iff every logit is)
         ggml_tensor* result = nullptr;   // the node the program reads (its output takes the ids below instead)
         std::int64_t vocab = 0, rows = 0;
         int k = 0;
@@ -704,9 +704,9 @@ namespace
         h.rows = x->ne[1];
         h.k = static_cast<int>(std::min<std::int64_t>(kGreedyCandidates, h.vocab));
         h.logits = x;
-        // Suppressed tokens: the mask's -inf added (its -0 adds nothing, signed zeros included). A suppressed NaN or +inf
-        // becomes a NaN, so its row's sum is not finite and the row is read in full, where the mask is applied as the host
-        // applies it (assigned).
+        // Suppressed tokens: the mask's -inf added (its -0 adds nothing, signed zeros included). The row's sum is the raw
+        // logits' (the masked row always holds the mask's -inf), so a NaN or an infinity anywhere, a suppressed one
+        // included, reads the row in full, where the mask is applied as the host applies it (assigned).
         ggml_tensor* picked = x;
         if (mask != nullptr)
         {
@@ -717,7 +717,7 @@ namespace
         }
         h.ids = ggml_top_k(g->ctx, picked, h.k);
         h.values = ggml_get_rows(g->ctx, ggml_reshape_3d(g->ctx, picked, 1, h.vocab, h.rows), h.ids);
-        h.sums = ggml_sum_rows(g->ctx, picked);
+        h.sums = ggml_sum_rows(g->ctx, x);
         h.result = ggml_view_2d(g->ctx, h.ids, 1, h.rows, h.ids->nb[1], 0);
         g->greedy.push_back(std::move(h));
         return g->greedy.back().result;
