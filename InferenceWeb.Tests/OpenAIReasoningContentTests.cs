@@ -1,28 +1,62 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
+
 using System.Text.Json;
 using TensorSharp.Server.ResponseSerializers;
 
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// The non-streaming chat completion carries the reasoning as <c>reasoning_content</c>, the field
-/// its streaming deltas use and OpenAI-compatible clients read (found by eng/lfm3/e2e: a client of
-/// LFM3 with thinking on got the reasoning only under <c>thinking</c>).
+/// The OpenAI chat route names the reasoning the same way whether or not the reply is
+/// streamed: <c>reasoning_content</c>, which OpenAI-compatible clients read from a
+/// complete message as well as from deltas. A non-streamed reply also keeps
+/// <c>thinking</c>, its earlier name.
 /// </summary>
 public class OpenAIReasoningContentTests
 {
-    [Fact]
-    public void NonStreamingMessage_CarriesReasoningContentLikeTheStream()
+    private static JsonElement Message(string? thinking)
     {
-        JsonElement message = JsonSerializer.SerializeToElement(OpenAIResponseFactory.Completion("id", "m",
-            OpenAIResponseFactory.ParsedAssistantMessage("391", "17*23 = 340 + 51", null), "stop", 10, 5, 0))
-            .GetProperty("choices")[0].GetProperty("message");
-        Assert.Equal("391", message.GetProperty("content").GetString());
-        Assert.Equal("17*23 = 340 + 51", message.GetProperty("reasoning_content").GetString());
-        // The earlier spelling stays for clients that read it.
-        Assert.Equal("17*23 = 340 + 51", message.GetProperty("thinking").GetString());
+        object completion = OpenAIResponseFactory.Completion("chatcmpl-test", "probe.gguf",
+            OpenAIResponseFactory.ParsedAssistantMessage("42", thinking, null), "stop", 10, 2, 0);
+        // The route serializes the completion with IgnoreNulls (OpenAIChatAdapter).
+        using JsonDocument doc = JsonDocument.Parse(JsonSerializer.Serialize(completion, JsonOptions.IgnoreNulls));
+        return doc.RootElement.GetProperty("choices")[0].GetProperty("message").Clone();
+    }
 
-        JsonElement delta = JsonSerializer.SerializeToElement(OpenAIResponseFactory.ReasoningContentChunk("id", "m", "17*23"))
-            .GetProperty("choices")[0].GetProperty("delta");
-        Assert.Equal("17*23", delta.GetProperty("reasoning_content").GetString());
+    [Fact]
+    public void ANonStreamedReplyCarriesTheReasoningAsReasoningContent()
+    {
+        JsonElement message = Message("Six times seven.");
+
+        Assert.Equal("42", message.GetProperty("content").GetString());
+        Assert.Equal("Six times seven.", message.GetProperty("reasoning_content").GetString());
+        Assert.Equal("Six times seven.", message.GetProperty("thinking").GetString());
+    }
+
+    [Fact]
+    public void AReplyWithoutReasoningCarriesNeitherField()
+    {
+        JsonElement message = Message(null);
+
+        Assert.False(message.TryGetProperty("reasoning_content", out _));
+        Assert.False(message.TryGetProperty("thinking", out _));
+    }
+
+    [Fact]
+    public void StreamedAndNonStreamedRepliesUseTheSameFieldName()
+    {
+        object chunk = OpenAIResponseFactory.ReasoningContentChunk("chatcmpl-test", "probe.gguf", "Six times seven.");
+        using JsonDocument doc = JsonDocument.Parse(JsonSerializer.Serialize(chunk, JsonOptions.IgnoreNulls));
+        JsonElement delta = doc.RootElement.GetProperty("choices")[0].GetProperty("delta");
+
+        Assert.Equal(delta.GetProperty("reasoning_content").GetString(),
+            Message("Six times seven.").GetProperty("reasoning_content").GetString());
     }
 }

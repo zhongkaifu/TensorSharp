@@ -174,12 +174,10 @@ internal static class OpenAIResponseFactory
             usage = BuildUsage(promptTokens, evalTokens, kvCacheReusedTokens),
         };
 
-    // The reasoning goes out as `reasoning_content`, the field the streaming deltas
-    // (ReasoningContentChunk) already use and the one OpenAI-compatible clients of
-    // llama.cpp, vLLM, SGLang and DeepSeek read; API_EXAMPLES documents it for both
-    // shapes. A client reading only `reasoning_content` saw no reasoning in a
-    // non-streaming reply. `thinking` (this server's earlier spelling, still read by
-    // older probes) carries the same text.
+    // A non-streamed reply carries the reasoning as `reasoning_content`, the field the streamed
+    // deltas above use and that OpenAI-compatible clients (and llama.cpp, vLLM) read from a
+    // complete message. `thinking` is the same text under the name this route used before,
+    // kept for clients that already read it. Both are omitted when there is no reasoning.
     public static object ParsedAssistantMessage(
         string content,
         string? thinking,
@@ -216,7 +214,7 @@ internal static class OpenAIResponseFactory
         {
             id = $"call_{Guid.NewGuid():N}"[..24],
             type = "function",
-            function = new { name = tc.Name, arguments = ToolCallArgumentsJson.Serialize(tc.Arguments) },
+            function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) },
         }).ToArray();
     }
 
@@ -233,7 +231,7 @@ internal static class OpenAIResponseFactory
             index = tc.Index,
             id = $"call_{Guid.NewGuid():N}"[..24],
             type = "function",
-            function = new { name = tc.Name, arguments = ToolCallArgumentsJson.Serialize(tc.Arguments) },
+            function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) },
         }).ToArray();
     }
 
