@@ -5,6 +5,7 @@
 //       --model <denoiser.gguf|.safetensors> --te <qwen3vl...gguf> --vae <minimax_h3_image_vae_fp16.safetensors> \
 //       --prompts <prompts.json> --jobs id[,id...] [--size N] --out <dir> [--label name]
 //       [--legacy-release-te] [--legacy-vae-batch N]
+//       [--lora <plug-in .json | weights> [--lora-scale S] [--lora-config C] ...] [--dump-cond <dir>]
 //
 // runtime: the production load (ModelBase.Create, the registry's MiniMax-H3-Image family on the diffusion runtime).
 // legacy:  the test seam MiniMaxH3ImageModel (one native graph a step, the native batched VAE decode); --legacy-release-te
@@ -16,6 +17,10 @@
 // holds per job the phases' seconds (text, steps, denoise, decode, total), the decode's tiles, the PNG's SHA-256, the
 // device memory peak over the job and over each phase (sampled every 50 ms: CUDA's used bytes, Metal's allocated size),
 // the residency plan (runtime), and the load and process figures. Device memory is the device's whole use, so run alone.
+// --lora (runtime only, repeatable, the hosts' spelling): the plug-ins applied through ILoraPluginHost.SetLoras after the load
+// (stage S7); each job then records its recipe (steps, sigmas, heads). --dump-cond <dir>: before the jobs, each job's text
+// conditioning (a separate encoder, released after) as <dir>/<id>.hidden.f32 ([rows][width] float32) and <id>.json (rows,
+// width, modality tags, seed, size), the inputs a diffusers reference denoises from (eng/validation/MiniMaxH3ImageLoraRows).
 using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
@@ -53,6 +58,9 @@ string label = Value("--label") ?? engine;
 bool releaseTe = Flag("--legacy-release-te");
 int vaeBatch = int.Parse(Value("--legacy-vae-batch") ?? "0", CultureInfo.InvariantCulture);
 if (engine == "runtime" && (releaseTe || vaeBatch > 0)) throw new ArgumentException("--legacy-* options are the legacy engine's");
+List<LoraSpec> loraSpecs = LoraCliFlags.Parse(args);
+if (engine == "legacy" && loraSpecs.Count > 0) throw new ArgumentException("--lora is the runtime engine's (the legacy model takes none)");
+string? dumpCond = Value("--dump-cond");
 Directory.CreateDirectory(outDir);
 string resultPath = Path.Combine(outDir, label + ".json");
 if (File.Exists(resultPath)) throw new InvalidOperationException($"{resultPath} already exists");
@@ -114,6 +122,7 @@ var result = new JsonObject
     ["legacy_release_te"] = releaseTe,
     ["legacy_vae_batch"] = vaeBatch,
     ["env_int8"] = Environment.GetEnvironmentVariable("TS_H3_INT8_MATMUL") ?? "",
+    ["loras"] = LoraCliFlags.Describe(loraSpecs),
     ["load_start"] = Load(),
     ["started_utc"] = DateTime.UtcNow.ToString("O"),
 };
@@ -174,6 +183,125 @@ if (Value("--vae-latent") is { } latentPath)
     return 0;
 }
 
+// ---- --lora-rows <out.json>: the plug-ins' updates as the backend applies them, for an independent merge
+if (Value("--lora-rows") is { } rowsOut)
+{
+    int[] blocks = (Value("--rows-blocks") ?? "0,25,49").Split(',').Select(v => int.Parse(v, CultureInfo.InvariantCulture)).ToArray();
+    int tokens = int.Parse(Value("--rows-tokens") ?? "1024", CultureInfo.InvariantCulture);
+    const int Kept = 8;
+    using var file = new MiniMaxH3WeightFile(model);
+    MiniMaxH3Config cfg = MiniMaxH3Config.Detect(file.Tensors);
+    var sw = Stopwatch.StartNew();
+    using var set = MiniMaxH3ImageLoraSet.Load(LoraCliFlags.Resolve(loraSpecs), cfg, backend);
+    double loadSeconds = sw.Elapsed.TotalSeconds;
+    var executor = GgmlGraphExecutor.For(backend switch
+    {
+        BackendType.GgmlMetal => GgmlBackendType.Metal,
+        BackendType.GgmlCuda => GgmlBackendType.Cuda,
+        _ => GgmlBackendType.Cpu,
+    });
+    // x[t][i]: a 32-bit LCG (exact in any language) mapped to [-1, 1): eng/validation/MiniMaxH3ImageLoraRows/lora_rows.py draws the same.
+    static float[] Activations(long input, int count, uint seed)
+    {
+        var x = new float[input * count];
+        uint state = seed;
+        for (long k = 0; k < x.LongLength; k++)
+        {
+            state = unchecked(state * 1664525u + 1013904223u);
+            x[k] = (float)((state >> 8) / 16777216.0 * 2.0 - 1.0);
+        }
+        return x;
+    }
+    var outputs = new JsonArray();
+    var projections = new[]
+    {
+        (Name: "attn.qkv_proj", P: MiniMaxH3ImageLoraSet.Projection.Qkv),
+        (Name: "attn.out_proj", P: MiniMaxH3ImageLoraSet.Projection.Out),
+        (Name: "mlp.fc1", P: MiniMaxH3ImageLoraSet.Projection.Fc1),
+        (Name: "mlp.fc2", P: MiniMaxH3ImageLoraSet.Projection.Fc2),
+    };
+    foreach (var (refiner, block) in blocks.Select(b => (false, b)).Concat(new[] { (true, 0) }))
+        foreach (var (pname, projection) in projections)
+        {
+            var factors = set.Get(refiner, block, projection);
+            if (factors == null) continue;
+            string tensor = cfg.Prefix + (refiner ? "token_refiner.blocks." : "blocks.") + block + "." + pname + ".weight";
+            GgufTensorInfo info = file.Tensors[tensor];
+            if (!file.TryGetTensorDataPointer(info, out IntPtr wPtr)) throw new InvalidOperationException("cannot map " + tensor);
+            long input = (long)info.Shape[0], output = (long)info.Shape[1];
+            long wBytes = input / GgufFile.GetBlockSize(info.Type) * GgufFile.GetTypeSize(info.Type) * output;
+            uint seed = (uint)(1000 * block + 10 * (int)projection + (refiner ? 7 : 0));
+            float[] x = Activations(input, tokens, seed);
+            float[] Run(bool adapted)
+            {
+                using var e = new TensorSharp.Models.Graph.GraphEmitter(executor, record: true);
+                var b = e.Builder;
+                e.MarkWideTokenProducts();
+                int xi = e.InputF32(x, input, tokens);
+                int w = e.HostWeight((int)info.Type, stackalloc long[] { input, output }, wPtr, wBytes);
+                int y;
+                if (adapted)
+                {
+                    var parts = factors.Parts.Select(p => new TensorSharp.Graph.GraphDitRegions.LoraPart(p.Slot,
+                        e.HostWeight(p.Format, new[] { p.In, (long)p.Rank }, p.Down, p.DownBytes),
+                        e.HostWeight(p.Format, new[] { (long)p.Rank, p.Out }, p.Up, p.UpBytes))).ToArray();
+                    y = TensorSharp.Graph.GraphDitRegions.LoraLinear(b, xi, w, parts, output, factors.SlotRows, tokens);
+                }
+                else y = b.Op(TensorSharp.Graph.GraphOp.MulMat, w, xi);
+                e.Output(y, output * tokens);
+                using var plan = e.Compile(replayable: false);
+                if (!e.Run(plan)) throw new InvalidOperationException("the LoraLinear program failed: " + plan.LastError);
+                var kept = new float[output * Kept];
+                Array.Copy(plan.Outputs[0], kept, kept.Length);
+                return kept;
+            }
+            float[] y1 = Run(true), y0 = Run(false);
+            string B64(float[] v) { var raw = new byte[v.Length * 4]; Buffer.BlockCopy(v, 0, raw, 0, raw.Length); return Convert.ToBase64String(raw); }
+            outputs.Add(new JsonObject
+            {
+                ["refiner"] = refiner, ["block"] = block, ["projection"] = pname, ["tensor"] = tensor, ["weight_type"] = info.Type.ToString(),
+                ["in"] = input, ["out"] = output, ["tokens"] = tokens, ["kept_tokens"] = Kept, ["x_seed"] = seed,
+                ["slot_rows"] = factors.SlotRows,
+                ["parts"] = new JsonArray(factors.Parts.Select(p => (JsonNode)new JsonObject { ["slot"] = p.Slot, ["rank"] = p.Rank, ["format"] = p.Format }).ToArray()),
+                ["y"] = B64(y1), ["y_base"] = B64(y0),
+            });
+            Console.WriteLine($"[h3img-ab] lora-rows {(refiner ? "refiner " : "")}block {block} {pname}: {factors.Parts.Length} part(s), rank {string.Join("/", factors.Parts.Select(p => p.Rank))}");
+        }
+    result["lora_rows"] = outputs;
+    result["lora_load_seconds"] = loadSeconds;
+    result["lora_summary"] = set.Summary;
+    result["lora_factor_bytes"] = set.FactorBytes;
+    stop.Cancel();
+    sampler.Join();
+    File.WriteAllText(rowsOut, result.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
+    GgmlBasicOps.Shutdown();
+    return 0;
+}
+
+// ---- --dump-cond: the jobs' text conditioning from their own encoder, released before the model loads
+if (dumpCond != null)
+{
+    Directory.CreateDirectory(dumpCond);
+    using var encoder = new MiniMaxH3ImageConditioner(te, backend);
+    foreach (string id in jobs)
+    {
+        JsonNode p = prompts.FirstOrDefault(x => (string?)x!["id"] == id) ?? throw new ArgumentException($"no prompt '{id}'");
+        var cond = encoder.Encode((string)p["prompt"]!, Array.Empty<TensorSharp.Models.SharedDiffusion.PresentedImage>(), CancellationToken.None);
+        byte[] raw = new byte[cond.Hidden.Length * sizeof(float)];
+        Buffer.BlockCopy(cond.Hidden, 0, raw, 0, raw.Length);
+        File.WriteAllBytes(Path.Combine(dumpCond, id + ".hidden.f32"), raw);
+        int w0 = size > 0 ? size : (int)p["width"]!, h0 = size > 0 ? size : (int)p["height"]!;
+        File.WriteAllText(Path.Combine(dumpCond, id + ".json"), new JsonObject
+        {
+            ["id"] = id, ["rows"] = cond.Rows, ["width"] = cond.Width, ["seed"] = (long)p["seed"]!, ["image_width"] = w0, ["image_height"] = h0,
+            ["prompt"] = (string)p["prompt"]!,
+            ["modalities"] = cond.Modalities == null ? null : new JsonArray(cond.Modalities.Select(m => (JsonNode)m).ToArray()),
+            ["hidden_sha256"] = Convert.ToHexStringLower(SHA256.HashData(raw)),
+        }.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        Console.WriteLine($"[h3img-ab] conditioning {id}: {cond.Rows} rows x {cond.Width}");
+    }
+}
+
 // ---- load
 double loadStart = clock.Elapsed.TotalSeconds;
 IImageGenerationModel image;
@@ -188,6 +316,14 @@ if (engine == "runtime")
         ?? throw new InvalidOperationException($"the registry built {loaded.GetType().Name}, not the runtime's MiniMax-H3-Image model");
     runtime.ProgressObserver = p => { lock (phases) phases.Add((p.Phase, clock.Elapsed.TotalSeconds)); };
     image = runtime;
+    if (loraSpecs.Count > 0)
+    {
+        double loraStart = clock.Elapsed.TotalSeconds;
+        runtime.SetLoras(loraSpecs);
+        result["lora_load_seconds"] = clock.Elapsed.TotalSeconds - loraStart;
+        result["lora_factor_bytes"] = runtime.Loras?.FactorBytes ?? 0;
+        result["lora_summary"] = runtime.Loras?.Summary;
+    }
 }
 else
 {
@@ -247,6 +383,15 @@ for (int n = 0; n < jobs.Length; n++)
             tiles = runtime.LastTileCount;
             native = runtime.LastDecodeNativeSeconds;
             job["residency"] = runtime.LastResult.Residency?.Describe();
+            var recipe = runtime.LastResult.Recipe;
+            job["recipe"] = new JsonObject
+            {
+                ["steps"] = recipe.Steps,
+                ["sigmas"] = new JsonArray(recipe.Sigmas.Select(x => (JsonNode)x).ToArray()),
+                ["heads"] = recipe.Recipe.Heads.ToString(),
+                ["describe"] = recipe.Recipe.Describe(recipe.Steps),
+                ["adapters"] = new JsonArray(recipe.Adapters.Select(a => (JsonNode)a).ToArray()),
+            };
             job["text_tokens"] = runtime.LastTextTokens;
             // Per phase: from the phase's entry to the next one's (the run's end for the last).
             var marks = new List<(DiffusionPhase, double)>();
