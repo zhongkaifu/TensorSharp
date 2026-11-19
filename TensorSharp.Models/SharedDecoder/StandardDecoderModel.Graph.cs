@@ -855,9 +855,7 @@ namespace TensorSharp.Models
             c.InputLeaves += inputs;
             c.InputBytes += inputBytes;
             c.RunTicks += ticks;
-            if (plan is not IGraphTensorOutputs { KeepTensors: true } && plan.Outputs is { } outputs)
-                foreach (float[] o in outputs)
-                    if (o != null) c.OutputBytes += (long)o.Length * sizeof(float);
+            if (plan is not IGraphTensorOutputs { KeepTensors: true }) c.OutputBytes += OutputBytes(plan);
             if (plan is IGraphPlanCensus { Census: { } p })
             {
                 c.CensusRuns++;
@@ -868,6 +866,16 @@ namespace TensorSharp.Models
                 c.LeafDownloads += p.LeafDownloads;
                 c.LeafDownloadBytes += p.LeafDownloadBytes;
             }
+        }
+
+        /// <summary>The bytes of <paramref name="plan"/>'s results a run reads back to the host (its output arrays).</summary>
+        private static long OutputBytes(IGraphPlan plan)
+        {
+            long bytes = 0;
+            if (plan.Outputs is { } outputs)
+                foreach (float[] o in outputs)
+                    if (o != null) bytes += (long)o.Length * sizeof(float);
+            return bytes;
         }
 
         /// <summary>
@@ -943,6 +951,9 @@ namespace TensorSharp.Models
                     r.CaptureOutputs = new Tensor[cached.Outputs.Length];
                     for (int o = 0; o < r.CaptureOutputs.Length; o++) r.CaptureOutputs[o] = keep.TakeOutput(o);
                     keep.KeepTensors = false;
+                    // The recording run kept its results on the device, so its census run counted none: they are read back
+                    // below, as a replay's are.
+                    Census.OutputBytes += OutputBytes(cached.Plan);
                 }
                 else
                 {

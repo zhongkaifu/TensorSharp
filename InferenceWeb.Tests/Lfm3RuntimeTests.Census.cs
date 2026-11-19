@@ -6,7 +6,8 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
 // The steps' census (StandardDecoderModel.Census, IGraphPlanCensus; eng/lfm3/Lfm3Probe batch) counts what batched decode steps
-// move and launch: one run a step, its input leaves, the logits it reads back, the executor's nodes and kernels.
+// move and launch: one run a step, its input leaves, the logits it reads back, the executor's nodes and kernels - on direct CUDA
+// whether the step was traced, recorded or replayed.
 using TensorSharp;
 using TensorSharp.Runtime.Scheduling;
 
@@ -21,10 +22,21 @@ public sealed partial class Lfm3RuntimeTests
     [InlineData("managed")]
     [InlineData("ggml")]
     public void BatchedDecodeStepsCountTheirRunsInputsResultsAndKernels(string lane)
+        => AssertStepCensus(lane == "ggml" ? TestGates.PinnedGgmlBackend : BackendType.Cpu, Fixture("dense"), recorder: false);
+
+    /// <summary>Direct CUDA records an advanced decode step and replays the recording (F16 caches and 128-wide heads, so the
+    /// sliding layers' bands are read on the device and every step can record): the three-sequence cell is measured from its
+    /// first step, so it holds a traced run, the recording run and replays, and each counts as one run that reads back each
+    /// sequence's logits once - the recording run's results included, which it keeps on the device until the step copies
+    /// them out as a replay's.</summary>
+    [CudaFact]
+    public void DirectCudaRecordedDecodeStepsCountInTheCensus()
+        => AssertStepCensus(BackendType.Cuda, Fixture("dense128"), recorder: true);
+
+    private void AssertStepCensus(BackendType backend, string fixture, bool recorder)
     {
-        BackendType backend = lane == "ggml" ? TestGates.PinnedGgmlBackend : BackendType.Cpu;
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, true);
-        using Lfm3RuntimeModel model = Create(Fixture("dense"), backend: backend);
+        using Lfm3RuntimeModel model = Create(fixture, backend: backend);
         var unified = (IUnifiedBatchModel)model;
         string[] ids = { "a", "b", "c" };
         var next = new int[ids.Length];
@@ -39,10 +51,10 @@ public sealed partial class Lfm3RuntimeTests
             lengths[s] = prompt.Length;
         }
 
-        (StandardDecoderModel.StepCensus Delta, int Steps) Decode(int sequences, int steps)
+        (StandardDecoderModel.StepCensus Delta, int Recordings, int Replays) Decode(int sequences, int steps)
         {
             StandardDecoderModel.StepCensus before = model.Census.Clone();
-            int runs = model.GraphRuns;
+            int runs = model.GraphRuns, recordings = model.DecodeRecordings, replays = model.RecordedDecodeReplays;
             for (int t = 0; t < steps; t++)
             {
                 var logits = new float[sequences][];
@@ -64,18 +76,27 @@ public sealed partial class Lfm3RuntimeTests
                 Nodes = after.Nodes - before.Nodes, Kernels = after.Kernels - before.Kernels,
                 LeafUploads = after.LeafUploads - before.LeafUploads, LeafUploadBytes = after.LeafUploadBytes - before.LeafUploadBytes,
                 LeafDownloads = after.LeafDownloads - before.LeafDownloads, LeafDownloadBytes = after.LeafDownloadBytes - before.LeafDownloadBytes,
-            }, steps);
+            }, model.DecodeRecordings - recordings, model.RecordedDecodeReplays - replays);
         }
 
         const int Steps = 6;
-        // Warm: each shape's first steps build its graph (and a recorder's first run records it).
+        // Warm: each shape's first steps build its graph (and a recorder's first run records it). With a recorder the
+        // three-sequence cell is measured cold instead: its trace, its recording and its replays are all counted.
         Decode(1, 2);
-        Decode(3, 2);
-        (StandardDecoderModel.StepCensus one, _) = Decode(1, Steps);
-        (StandardDecoderModel.StepCensus three, _) = Decode(3, Steps);
+        if (!recorder) Decode(3, 2);
+        (StandardDecoderModel.StepCensus one, int oneRecordings, int oneReplays) = Decode(1, Steps);
+        (StandardDecoderModel.StepCensus three, int threeRecordings, int threeReplays) = Decode(3, Steps);
         _output.WriteLine($"{backend}: one sequence {one.InputLeaves / Steps} inputs, {one.InputBytes / Steps} B, {one.Kernels / Steps} kernels of " +
-            $"{one.Nodes / Steps} nodes, {one.LeafUploads / Steps} leaves uploaded; three {three.InputLeaves / Steps} inputs, " +
-            $"{three.InputBytes / Steps} B, {three.Kernels / Steps} kernels of {three.Nodes / Steps} nodes, {three.LeafUploads / Steps} leaves uploaded");
+            $"{one.Nodes / Steps} nodes, {one.LeafUploads / Steps} leaves uploaded, {oneRecordings} recordings, {oneReplays} replays; three " +
+            $"{three.InputLeaves / Steps} inputs, {three.InputBytes / Steps} B, {three.Kernels / Steps} kernels of {three.Nodes / Steps} nodes, " +
+            $"{three.LeafUploads / Steps} leaves uploaded, {threeRecordings} recordings, {threeReplays} replays");
+        if (recorder)
+        {
+            // The census hooks of TryRunRecorded ran: the cold cell recorded and replayed after it, the warm cell replayed.
+            Assert.True(threeRecordings >= 1, $"{threeRecordings} recordings of the three sequences' step");
+            Assert.True(threeReplays >= 1, $"{threeReplays} replays of the three sequences' recording");
+            Assert.True(oneReplays >= 1, $"{oneReplays} replays of the lone sequence's recording");
+        }
         foreach ((StandardDecoderModel.StepCensus c, int sequences) in new[] { (one, 1), (three, 3) })
         {
             Assert.Equal(Steps, c.Runs);
