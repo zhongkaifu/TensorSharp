@@ -257,10 +257,10 @@ namespace TensorSharp.Server
         /// </summary>
         private static void ValidateModelFiles(string modelPath, string mmProjPath)
         {
-            if (!TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageModel.IsImageDenoiserSafetensors(modelPath))
+            if (TensorSharp.Models.Architecture.ModelArchitectureRegistry.ResolveSafetensors(modelPath) == null)
             {
-                // (A MiniMax-H3-Image safetensors denoiser has no GGUF header; its own header
-                // was just parsed by the check above.)
+                // (A safetensors model file a family claims, such as MiniMax-H3-Image's denoiser, has no GGUF
+                // header; its own header was just parsed by the family's detector.)
                 using var gguf = new GgufFile(modelPath);
                 gguf.ThrowIfTruncated();
             }

@@ -29,7 +29,7 @@ public sealed class ServingContractConformanceTests
     {
         "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-glimmer", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
-        "diffusion-gemma", "qwen_image", "wan", "ltx-2.5", "minimax-h3", "minimax-h3-image",
+        "diffusion-gemma", "qwen_image", "wan", "ltx-2.5", "minimax-h3",
         // Audio pipelines (speech recognition, speech synthesis, music): like the image and video
         // families they generate media rather than decode steps, so the decoder runtime does not apply.
         "whisper", "kokoro", "ace-step-1.5",
@@ -216,6 +216,35 @@ public sealed class ServingContractConformanceTests
         {
             Assert.True(ModelArchitectureRegistry.TryGet(id, out var arch), $"'{id}' is not registered; drop it from the legacy list.");
             Assert.Equal(ServingImplementation.Bespoke, arch.Serving.Implementation);
+        }
+    }
+
+    /// <summary>
+    /// The families on the shared diffusion runtime (TensorSharp.Models.SharedDiffusion). Each is proven by its own suites
+    /// against the implementation it replaced (MiniMax-H3-Image: MiniMaxH3ImageDenoiserTests, MiniMaxH3ImageVaeCodecTests
+    /// and MiniMaxH3ImageSwitchTests against the legacy model's denoiser and decoder). A family moved there leaves
+    /// <see cref="LegacyBespokeFamilies"/> and joins this list.
+    /// </summary>
+    internal static readonly HashSet<string> DiffusionRuntimeFamilies = new(StringComparer.Ordinal) { "minimax-h3-image" };
+
+    [Fact]
+    public void TheDiffusionRuntimeFamiliesAreExactlyTheKnownOnes()
+    {
+        var declared = BuiltInArchitectures.Descriptors
+            .Where(a => a.Serving.Implementation == ServingImplementation.SharedDiffusionRuntime)
+            .Select(a => a.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.True(declared.SetEquals(DiffusionRuntimeFamilies),
+            "Families on the shared diffusion runtime: " + string.Join(", ", declared.OrderBy(x => x, StringComparer.Ordinal)) +
+            "; known: " + string.Join(", ", DiffusionRuntimeFamilies.OrderBy(x => x, StringComparer.Ordinal)) + ".");
+        foreach (string id in DiffusionRuntimeFamilies)
+        {
+            Assert.True(ModelArchitectureRegistry.TryGet(id, out var arch));
+            ServingContract expected = ServingContract.SharedDiffusionRuntime(arch.Serving.Backends);
+            Assert.False(arch.Serving.Autoregressive);
+            Assert.Equal(SupportKind.NotApplicable, arch.Serving.ContinuousBatching.Kind);
+            Assert.Equal(expected.ContinuousBatching.Reason, arch.Serving.ContinuousBatching.Reason);
+            Assert.Equal(expected.ExpertOffload.Kind, arch.Serving.ExpertOffload.Kind);
         }
     }
 

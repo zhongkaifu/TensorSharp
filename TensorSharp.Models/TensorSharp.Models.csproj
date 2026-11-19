@@ -31,6 +31,7 @@
     <InternalsVisibleTo Include="QwenImageStagesBench" />
     <InternalsVisibleTo Include="QwenImageMaskBench" />
     <InternalsVisibleTo Include="LongContextQualityProbe" />
+    <InternalsVisibleTo Include="MiniMaxH3ImageAB" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />

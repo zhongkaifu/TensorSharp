@@ -78,6 +78,10 @@ namespace TensorSharp.Models.MiniMaxH3
         public MiniMaxH3TextEncoderConfig Config { get; }
         public BpeTokenizer Tokenizer { get; }
 
+        /// <summary>Bytes the trunk's weights take on the device once an encode has bound them: every layer's projections
+        /// and F32 vectors. The embedding table is read on the host, and the vision tower has its own.</summary>
+        public long DeviceWeightBytes { get; private set; }
+
         public MiniMaxH3TextEncoder(string ggufPath, string tokenizerDir = null)
             : this(ggufPath, tokenizerDir, BackendType.GgmlCuda, null) { }
 
@@ -168,6 +172,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 throw new InvalidOperationException($"could not map '{weight}'.");
             long bytes = ByteSizeOf(info);
             _bound.Add(ptr);
+            DeviceWeightBytes += bytes;
             return new H3Lin
             {
                 W = ptr,
@@ -207,6 +212,7 @@ namespace TensorSharp.Models.MiniMaxH3
             _pins.Add(h);
             IntPtr addr = h.AddrOfPinnedObject();
             _bound.Add(addr);
+            DeviceWeightBytes += info.NumElements * sizeof(float);
             return addr;
         }
 
@@ -689,6 +695,16 @@ namespace TensorSharp.Models.MiniMaxH3
             // Kept because it is the right tool when device memory, not time, is the
             // binding constraint - a smaller card, or another process needing the VRAM.
             return layers;
+        }
+
+        /// <summary>Hand every device copy of the trunk's weights back (a diffusion pipeline's phase residency: the
+        /// denoiser needs the room). The weights stay mapped and pinned, so the next <see cref="Encode(IReadOnlyList{int}, int)"/>
+        /// uploads them from memory again; its result is the same.</summary>
+        public void ReleaseDeviceResidency()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            foreach (IntPtr ptr in _bound)
+                if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
         }
 
         /// <summary>Drop the device-resident copies of one layer group's weights. The host

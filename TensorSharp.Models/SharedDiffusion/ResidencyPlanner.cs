@@ -40,7 +40,8 @@ namespace TensorSharp.Models.SharedDiffusion
         }
 
         /// <summary>Device bytes the components may use (free bytes less headroom, plus what they hold now), or null when
-        /// the backend reports none (CPU, Metal's shared memory): everything stays resident.</summary>
+        /// the backend reports none (the CPU backends): everything stays resident. On Metal the budget is the recommended
+        /// working set, a hard ceiling on unified memory.</summary>
         public long? Budget { get; }
 
         /// <summary>The largest device use the plan reaches.</summary>

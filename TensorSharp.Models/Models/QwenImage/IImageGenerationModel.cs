@@ -12,7 +12,7 @@ namespace TensorSharp.Models.QwenImage
     /// A text-to-image (and optionally image-edit) model, as the image routes and the CLI
     /// drive it: a prompt and <see cref="QwenImageParams"/> in, an <see cref="RgbImage"/> out.
     /// Qwen-Image-2.1 (<see cref="QwenImageModel"/>) and MiniMax-H3-Image
-    /// (<c>MiniMaxH3ImageModel</c>) implement it; settings a model does not take (a negative
+    /// (<c>MiniMaxH3ImageDiffusionModel</c>, on the shared diffusion runtime) implement it; settings a model does not take (a negative
     /// prompt, CFG above 1, a mask) are refused by that model rather than ignored.
     /// </summary>
     public interface IImageGenerationModel

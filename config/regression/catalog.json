@@ -334,9 +334,9 @@
         "image_generation"
       ],
       "layout": "dense",
-      "notes": "Single device, ggml backends only. The MiniMax-H3 DiT without its audio stream; six distilled steps, guidance fixed at 1. Shares the Qwen3-VL-32B text encoder file with minimax-h3-fl2va.",
+      "notes": "Single device, ggml backends only. On the shared diffusion runtime. The MiniMax-H3 DiT without its audio stream; six distilled steps, guidance fixed at 1. Shares the Qwen3-VL-32B text encoder file with minimax-h3-fl2va.",
       "source_evidence": [
-        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3ImageArchitecture.cs",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
         "docs/models/minimax-h3-image.md"
       ],
       "configuration_status": "configured",
@@ -2497,7 +2497,7 @@
       ],
       "source_evidence": [
         "config/minimax-h3-image.json",
-        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3ImageArchitecture.cs",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
         "docs/models/minimax-h3-image.md"
       ],
       "layout": "dense",

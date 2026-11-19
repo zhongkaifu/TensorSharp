@@ -257,6 +257,9 @@ namespace TensorSharp.Models.MiniMaxH3
         private static readonly int MaxBatch = int.TryParse(
             Environment.GetEnvironmentVariable("TS_H3_IMAGE_VAE_BATCH"), out int b) && b > 0 ? b : 64;
 
+        /// <summary>A test seam: tiles a call takes at most in place of <see cref="MaxBatch"/> (0 keeps it).</summary>
+        internal int BatchOverride { get; set; }
+
         /// <summary><paramref name="count"/> tiles through the decoder in one call: each
         /// [h*w][24] raw (denormalized) latent tokens, one after another, to ImageNet-normalized
         /// pixels [3][h*16][w*16] per tile.</summary>
@@ -373,9 +376,10 @@ namespace TensorSharp.Models.MiniMaxH3
                 // so they go to the decoder together, MaxBatch at a time.
                 int zwRow = xLen[0] / Downsample;
                 var rowTiles = new float[xIdx.Length][];
-                for (int first = 0; first < xIdx.Length; first += MaxBatch)
+                int maxBatch = BatchOverride > 0 ? BatchOverride : MaxBatch;
+                for (int first = 0; first < xIdx.Length; first += maxBatch)
                 {
-                    int count = Math.Min(MaxBatch, xIdx.Length - first);
+                    int count = Math.Min(maxBatch, xIdx.Length - first);
                     long per = (long)zh * zwRow * LatentChannels;
                     var batchLatent = new float[per * count];
                     for (int t = 0; t < count; t++)
