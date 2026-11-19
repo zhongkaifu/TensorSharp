@@ -47,6 +47,16 @@ namespace TensorSharp.Graph
         /// partial, which no other node reads. The ranks' programs run in lockstep (see <see cref="IGraphCollective"/>), so
         /// every rank reaches its reduce before any rank reads the total.</summary>
         AllReduce = 57,
+        /// <summary>A 2-D convolution with zero padding (ggml_conv_2d): srcs the kernel [KW, KH, IC, OC] (F32 or F16) and x
+        /// [W, H, IC, N] (F32). Ip: stride0, stride1, padding0, padding1, dilation0, dilation1 (axis 0 is the width). Result
+        /// [OW, OH, OC, N] (F32), OW = (W + 2 p0 - d0 (KW - 1) - 1) / s0 + 1 (OH alike). With an F16 kernel x is read at F16
+        /// (ggml's im2col columns for it), with an F32 kernel at F32.</summary>
+        Conv2d = 58,
+        /// <summary>Reflect padding along ne0 (ggml_pad_reflect_1d): srcs x (F32, contiguous). Ip: p0 (before), p1 (after),
+        /// each less than ne0. Result [p0 + ne0 + p1, ne1, ne2, ne3]: column p0 + i is x's column i, column p0 - j (1 &lt;= j &lt;=
+        /// p0) is x's column j and column p0 + ne0 - 1 + j (1 &lt;= j &lt;= p1) is x's column ne0 - 1 - j (the edge not
+        /// repeated). Padding of two axes is two passes, the second over a transpose.</summary>
+        PadReflect1d = 59,
     }
 
     /// <summary>
@@ -143,8 +153,9 @@ namespace TensorSharp.Graph
         /// w [d]. Fp: eps. Result: [d, heads, rows].</summary>
         GatedRmsNorm = 2,
         /// <summary>A SwiGLU feed-forward: down · (silu(gate · x) * (up · x)). Inputs: x [n, rows], then the
-        /// quantized weights: gate_up (gate rows then up rows) and down, or (Ip[0] = 1) gate, up and down.
-        /// Result: [n, rows].</summary>
+        /// weights: gate_up (gate rows then up rows) and down, or (Ip[0] = 1) gate, up and down. With Ip[1] = 1 the
+        /// projections have biases, which follow the weights in the same order (gate_up's [2 ff] and down's [n], or
+        /// gate's, up's and down's): down · (silu(gate · x + b_gate) * (up · x + b_up)) + b_down. Result: [n, rows].</summary>
         SwigluFfn = 3,
         /// <summary>The routed experts of a softmax-gated MoE layer: the top-K experts of each row by its router
         /// logits, their softmax weights renormalized over the K (Ip[1] = 1) or as they are (Ip[1] = 0), and the
@@ -241,6 +252,40 @@ namespace TensorSharp.Graph
         /// conv projection of the sublayer's input) and the base kernel [hidden, width, 2]. Ip: width, group, groups, side,
         /// stride. Result: [hidden, rows].</summary>
         DFlashConv = 17,
+        /// <summary>A diffusion transformer's adaLN modulation of a packed sequence: each row RMS-normed and times the norm
+        /// weight, then n + n * scale + shift, where scale and shift are columns of the modulation matrix picked by the row's
+        /// segment. Inputs: x [hidden, rows] (F32, rows contiguous), the norm weight [hidden], mods [hidden, columns] (F32,
+        /// contiguous: column c is one modulation vector) and the segment table [3, segments] (I32: start, end, column base
+        /// of each run of rows, sorted, contiguous and covering [0, rows); an input fixed for a request). Ip: the shift and
+        /// scale offsets from a segment's column base. Fp: eps. Result: [hidden, rows]. The ops (<see
+        /// cref="GraphDitRegions.AdaLnModulate"/>) norm the whole sequence once, then modulate and concatenate it segment
+        /// by segment.</summary>
+        AdaLnModulate = 18,
+        /// <summary>A diffusion transformer's gated residual over a packed sequence: base + (delta + (mm + bias)) * gate,
+        /// the gate a column of the modulation matrix picked by the row's segment. Inputs: base and mm [hidden, rows] (F32,
+        /// rows contiguous; mm a projection's product), then the bias [hidden] (Ip[1] = 1) and the delta [hidden, rows] (Ip[2]
+        /// = 1, a LoRA update the projection's kernel did not take), mods [hidden, columns] and the segment table [3,
+        /// segments] (as <see cref="AdaLnModulate"/>'s). Ip: the gate's offset from a segment's column base, bias, delta.
+        /// Result: [hidden, rows].</summary>
+        GatedResidual = 19,
+        /// <summary>Attention's q/k prep with a rotary table: each head of q and k RMS-normed (times its weight where Ip[1]
+        /// says so), then x * cos + rotate_half(x) * sinSigned over its first rot dims, the rest passed through. The table
+        /// holds a row's angles for the two halves of the rotated dims (any positions: fractional, several axes) and the
+        /// sine's sign is on the table: sinSigned = [-sin(first half), sin(second half)], so the half-swapped head [x2, x1]
+        /// times it is rotate_half(x) * sin. Inputs: q and k [D, heads, rows] (F32, D contiguous; views of a projection),
+        /// then q's and k's norm weights [D] (as Ip[1]'s bits 0 and 1 say), cos and sinSigned [rot, rows], and with Ip[2] = 1
+        /// v [D, heads, rows]. Ip: rot (even, at most D), norm weights (bit 0 q, bit 1 k), attend. Fp: eps, then with
+        /// attend the attention's scale and V's power-of-two scale. Results: the rotated q and k [D, heads, rows]; with
+        /// attend the region goes on through the unmasked attention that reads them, and its result is that attention
+        /// [D * heads, rows]: softmax(scale q k^T) v per head with K and V at F16, V divided by its scale before and the
+        /// result multiplied by it after (<see cref="GraphDitRegions.TableRopeQkNorm"/>).</summary>
+        TableRopeQkNorm = 20,
+        /// <summary>A projection with unmerged low-rank updates: w · x plus up_i · (down_i · x) on the rows of each part's slot.
+        /// Inputs: x [in, rows] (F32), the weight w [in, out], then each part's down [in, rank] and up [rank, slot rows]
+        /// (F16 or F32, the adapter's scale folded into up), in slot order. Ip: the slots that carry a part (bit s: rows
+        /// [s * slot rows, (s + 1) * slot rows) of the output, at most three slots), the slot rows (0: out, one slot). Result
+        /// [out, rows] (no bias).</summary>
+        LoraLinear = 21,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
@@ -270,7 +315,7 @@ namespace TensorSharp.Graph
     public sealed class GraphProgram
     {
         internal GraphProgram(GraphNode[] entries, int nodeCount, long[] outputFloats, bool replayable, bool reorder,
-            int[]? tensorParallelRanks, (ulong, ulong) signature)
+            int[]? tensorParallelRanks, (ulong, ulong) signature, bool wideTokenProducts = false)
         {
             Entries = entries;
             NodeCount = nodeCount;
@@ -279,6 +324,7 @@ namespace TensorSharp.Graph
             Reorder = reorder;
             TensorParallelRanks = tensorParallelRanks;
             Signature = signature;
+            WideTokenProducts = wideTokenProducts;
         }
 
         public IReadOnlyList<GraphNode> Entries { get; }
@@ -293,6 +339,13 @@ namespace TensorSharp.Graph
         public int[]? TensorParallelRanks { get; }
         /// <summary>A hash of everything that shapes the program (not its per-run input values).</summary>
         public (ulong, ulong) Signature { get; }
+        /// <summary>The program's products have thousands of rows (a diffusion denoiser's step over a whole image): an
+        /// executor may run its weight products on wide-GEMM routes it keeps for that, serve regions it fuses only at that
+        /// width, and drop a power-of-two scale pair around a product such a route takes, which keeps F32's exponent range
+        /// (<see cref="GraphProgramBuilder.MarkWideTokenProducts"/>). The GGML executor's on ggml_cuda: cuBLAS BF16 or int8
+        /// products, cuDNN attention, and the diffusion-transformer regions as its fused nodes; elsewhere it changes
+        /// nothing.</summary>
+        public bool WideTokenProducts { get; }
     }
 
     /// <summary>
@@ -306,8 +359,24 @@ namespace TensorSharp.Graph
         private ulong _h1 = 14695981039346656037UL, _h2 = 0x9E3779B97F4A7C15UL;
         private ulong _s1 = 14695981039346656037UL, _s2 = 0x9E3779B97F4A7C15UL;
         private bool _signatureOnly;
+        private bool _wideTokenProducts;
 
         public GraphProgramBuilder(bool record) => _entries = record ? new List<GraphNode>() : null;
+
+        /// <summary>The program will carry <see cref="GraphProgram.WideTokenProducts"/>. Part of the signature (also of a hash-only
+        /// trace, so a plan looked up by it is a program that has the attribute); before any entry, so an executor that
+        /// lowers as entries arrive knows it from the start.</summary>
+        public void MarkWideTokenProducts()
+        {
+            if (NodeCount != 0 || _outputs.Count != 0)
+                throw new InvalidOperationException("WideTokenProducts is a program attribute: mark it before the first entry.");
+            if (_wideTokenProducts) return;
+            _wideTokenProducts = true;
+            Mix(9);
+        }
+
+        /// <summary>Whether <see cref="MarkWideTokenProducts"/> was called.</summary>
+        public bool WideTokenProducts => _wideTokenProducts;
 
         public bool Recording => _entries != null;
 
@@ -432,7 +501,8 @@ namespace TensorSharp.Graph
         public GraphProgram ToProgram(bool replayable, bool reorder, int[]? tensorParallelRanks = null)
         {
             if (_entries == null) throw new InvalidOperationException("A hash-only trace has no program.");
-            return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature);
+            return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature,
+                _wideTokenProducts);
         }
     }
 }

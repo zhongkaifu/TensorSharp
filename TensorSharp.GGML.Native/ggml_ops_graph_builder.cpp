@@ -117,6 +117,8 @@ namespace
         OP_LIGHTNING_INDEXER = 55, // srcs: q [d, heads, T], k [d, 1, n_kv], weights [heads, T], mask [n_kv, T] (F16)
         OP_TOP_K_MASK = 56,     // srcs: mask [n_kv, T], top_k [n_top, T], then (ip[0..2] flags) score, blocks, extra
         OP_ALLREDUCE = 57,      // srcs: a tensor-parallel partial; summed in place across the ranks (TSGgml_GraphRunRanked)
+        OP_CONV_2D = 58,        // srcs: kernel [KW, KH, IC, OC] (F32/F16), x [W, H, IC, N]; ip: s0, s1, p0, p1, d0, d1 (ggml_conv_2d)
+        OP_PAD_REFLECT_1D = 59, // srcs: x (F32, contiguous); ip: p0, p1
     };
 
     struct Leaf
@@ -399,6 +401,8 @@ namespace
         int serving = -1;
         std::vector<char> skipped;
         std::shared_ptr<DeviceIo> io;
+        // The program's products have thousands of rows (GraphProgram.WideTokenProducts). Set before the first node.
+        bool wide_token_products = false;
         // The residual versions bound to a hyper-connection scatter region (IO_HC_RES0 / IO_HC_RES1), and the region the
         // newest one lives in (-1: none yet).
         std::map<const ggml_tensor*, int> hc_res_role;
@@ -777,6 +781,34 @@ namespace
             return ggml_pad(ctx, src(0), static_cast<int>(ipar(0, 0)), static_cast<int>(ipar(1, 0)),
                             static_cast<int>(ipar(2, 0)), static_cast<int>(ipar(3, 0)));
         case OP_MEAN: need(1); return ggml_mean(ctx, src(0));
+        case OP_CONV_2D:
+        {
+            // ggml_conv_2d's im2col and one product (the lowering MiniMax-H3's VAE encoder graph uses), with the columns at
+            // the kernel's precision: F16 for an F16 kernel (as ggml_conv_2d makes them), F32 otherwise (ggml_conv_2d
+            // narrows an F32 kernel's columns to F16 too; the op's x is read at F32 there).
+            need(2);
+            ggml_tensor* kernel = src(0);
+            ggml_tensor* x = src(1);
+            ggml_tensor* cols = ggml_im2col(ctx, kernel, x, static_cast<int>(ipar(0, 1)), static_cast<int>(ipar(1, 1)),
+                                            static_cast<int>(ipar(2, 0)), static_cast<int>(ipar(3, 0)), static_cast<int>(ipar(4, 1)),
+                                            static_cast<int>(ipar(5, 1)), true,
+                                            kernel->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32);   // [IC KH KW, OW, OH, N]
+            ggml_tensor* y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, cols, cols->ne[0], cols->ne[3] * cols->ne[2] * cols->ne[1]),
+                                          ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]));
+            y = ggml_reshape_4d(ctx, y, cols->ne[1], cols->ne[2], cols->ne[3], kernel->ne[3]);   // [OW, OH, N, OC]
+            return ggml_cont(ctx, ggml_permute(ctx, y, 0, 1, 3, 2));                             // [OW, OH, OC, N]
+        }
+        case OP_PAD_REFLECT_1D:
+        {
+            need(1);
+            ggml_tensor* x = src(0);
+            if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx, x, GGML_TYPE_F32);
+            else if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+            const int p0 = static_cast<int>(ipar(0, 0)), p1 = static_cast<int>(ipar(1, 0));
+            if (p0 < 0 || p1 < 0 || p0 >= x->ne[0] || p1 >= x->ne[0])
+                throw std::runtime_error("graph builder: reflect padding needs each side shorter than the row");
+            return ggml_pad_reflect_1d(ctx, x, p0, p1);
+        }
         case OP_ADD_ID: need(3); return ggml_add_id(ctx, src(0), src(1), src(2));
         case OP_ARGMAX: need(1); return ggml_argmax(ctx, src(0));
         case OP_SWIGLU: need(1); return ggml_swiglu(ctx, src(0));
@@ -1460,6 +1492,19 @@ TSG_EXPORT int TSGgml_GraphEffect(void* handle, int node)
         set_last_error(ex.what());
         return 0;
     }
+}
+
+// The program's products have thousands of rows (GraphProgram.WideTokenProducts), set before its first node.
+TSG_EXPORT int TSGgml_GraphWideTokenProducts(void* handle, int on)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    if (g == nullptr || g->built || !g->nodes.empty())
+    {
+        set_last_error("graph builder: WideTokenProducts is set on a graph before its first node.");
+        return 0;
+    }
+    g->wide_token_products = on != 0;
+    return 1;
 }
 
 // Run the graph: build and bind it on the first run, then upload this run's inputs (and the

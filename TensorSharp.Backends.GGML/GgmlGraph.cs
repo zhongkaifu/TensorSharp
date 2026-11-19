@@ -35,6 +35,10 @@ namespace TensorSharp.GGML
         MoeHostExperts = 54, LightningIndexer = 55, TopKMask = 56,
         /// <summary>A tensor-parallel partial, summed in place across the ranks of <see cref="GgmlGraph.RunRanked"/>.</summary>
         AllReduce = 57,
+        /// <summary>ggml_conv_2d: kernel [KW, KH, IC, OC], x [W, H, IC, N]; ip s0, s1, p0, p1, d0, d1.</summary>
+        Conv2d = 58,
+        /// <summary>ggml_pad_reflect_1d: x; ip p0, p1.</summary>
+        PadReflect1d = 59,
     }
 
     /// <summary>ggml tensor types used by graph leaves (ggml.h's enum ggml_type).</summary>
@@ -88,6 +92,15 @@ namespace TensorSharp.GGML
         }
 
         public bool IsBuilt { get; private set; }
+
+        /// <summary>The program's products have thousands of rows (<see cref="TensorSharp.Graph.GraphProgram.WideTokenProducts"/>):
+        /// on ggml_cuda the run takes the DiT offload's wide routes and the diffusion-transformer regions are served as its
+        /// fused nodes. Before the first node.</summary>
+        public void MarkWideTokenProducts()
+        {
+            if (GgmlNative.TSGgml_GraphWideTokenProducts(Handle, 1) == 0)
+                throw new InvalidOperationException("ggml graph WideTokenProducts failed: " + GgmlBasicOps.LastNativeError());
+        }
 
         /// <summary>Nodes emitted so far.</summary>
         public int NodeCount { get; private set; }
@@ -314,5 +327,9 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static unsafe partial int TSGgml_GraphFusedEnd(IntPtr graph, int* results, int nresults);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial int TSGgml_GraphWideTokenProducts(IntPtr graph, int on);
     }
 }
