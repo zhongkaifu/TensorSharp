@@ -19,9 +19,11 @@ namespace TensorSharp.Cuda
     {
         /// <summary>Whether marked prompt chunks attend in 8 bits where the image carries the kernels: no (the 16-bit kernels,
         /// bit for bit as before). Its pre-registered quality gates (design t2-attn8 sec. 12.3) failed on Qwen3.8-27B NVFP4
-        /// (2026-11-18, RTX PRO 4500): a few long C# code windows moved more than they allow (with q8 activations on the prompt
-        /// rows of both arms, +0.8% PPL at 64K keys and +18% on a 96K window), although ggml_cuda's own arithmetic moved the
-        /// same windows further; prose and long-context retrieval did not move.</summary>
+        /// (2026-11-18, RTX PRO 4500), on a few long C# code windows. With q8 activations on the prompt rows of both arms, the
+        /// prompt rows moved +0.8% PPL at 64K keys and +18% on a 96K window; ggml_cuda with q8 activations
+        /// (GGML_CUDA_MMQ_PREC=q8, not its default) moved those two windows further. As served (W4A4 prompt rows), the decode
+        /// rows after a code prompt moved +0.8% to +6.4% PPL at 8K-64K keys and +94% on the 96K window; ggml_cuda as served
+        /// moved them +1.5% at 8K, -0.4% at 64K and -22% at 96K. Prose and long-context retrieval did not move.</summary>
         private const bool PromptAttention8Default = false;
 
         /// <summary>Tests and the eng probe: null keeps the default; true asks for the 8-bit prompt attention wherever it runs,
