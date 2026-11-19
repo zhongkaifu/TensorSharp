@@ -481,6 +481,7 @@ namespace tsg
             if (x == nullptr) continue;
             if (node->op == GGML_OP_MUL_MAT) rows = std::max<std::int64_t>(rows, x->ne[1] * x->ne[2] * x->ne[3]);
             else if (node->op == GGML_OP_MUL_MAT_ID) rows = std::max<std::int64_t>(rows, x->ne[2] * x->ne[3]);
+            else if (node->op == GGML_OP_CUSTOM) rows = std::max<std::int64_t>(rows, cpu_weight_product_rows(node));
         }
         if (rows > 0) cpu_pools_select(backend, rows);
     }

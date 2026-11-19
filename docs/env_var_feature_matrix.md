@@ -595,7 +595,9 @@ Macs, the iOS simulator and, through `GGML_CPU_ARM_ARCH`, the iOS device slice; 
 ggml's own product) run TensorSharp's GEMM with ggml's own NVFP4 arithmetic: the activations are ggml-cpu's Q8_0 rows and every output has the bits ggml's
 one-row product gives it, while each weight block is decoded once for every four rows instead of once a row (LFM3-1.7B
 NVFP4 on an M5 Pro: 128-token prompts 382 -> 972 tok/s, 512-token prompts 612 -> 1,038 tok/s, against Accelerate's
-`sgemm` over the dequantized weight, which took prompts from 256 rows before).
+`sgemm` over the dequantized weight, which took prompts from 256 rows before). The per-op ggml computes outside the graph
+runtime (the per-op paths' linear layers and fused quantized ops) take the same products, so a per-op path and a graph
+multiply a weight the same way.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|

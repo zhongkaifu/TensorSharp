@@ -23,6 +23,7 @@
 //     accumulators summed as vaddvq_f32 sums them): the same bits as ggml's product, faster.
 
 #include "ggml_ops_cpu_graph.h"
+#include "ggml-impl.h"   // ggml_custom_op_params: which custom op a node runs (cpu_weight_product_rows)
 
 #include <algorithm>
 #include <cstdint>
@@ -418,5 +419,21 @@ namespace tsg
         }
 #endif
         return nullptr;
+    }
+
+    std::int64_t cpu_weight_product_rows(const ggml_tensor* node)
+    {
+        if (node == nullptr || node->op != GGML_OP_CUSTOM || node->src[1] == nullptr) return 0;
+        ggml_custom_op_params p;
+        std::memcpy(&p, node->op_params, sizeof(p));
+        const ggml_tensor* x = node->src[1];
+        if (p.fun == bf16_rows_product) return x->ne[1] * x->ne[2];
+#if defined(TSG_GGML_USE_ACCELERATE)
+        if (p.fun == sgemm_op) return x->ne[1] * x->ne[2];
+#endif
+#if defined(TSG_CPU_NVFP4_SDOT)
+        if (p.fun == nvfp4_gemm_op) return x->ne[1];   // ggml's Q8_0 activation rows, one a row of the product
+#endif
+        return 0;
     }
 }

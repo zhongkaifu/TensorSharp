@@ -54,8 +54,13 @@ namespace tsg
     /// over the graph's thread pool, ggml_ops_cpu_products.cpp), or null to keep ggml's MUL_MAT. ARM64: BF16 weights
     /// (ggml-cpu's BF16 dot is scalar there) at any width, through Accelerate's sgemm at prompt width on Apple, over F32
     /// activations unrounded; NVFP4 weights from two activation rows, as a GEMM over ggml's own Q8_0 activation rows that
-    /// gives every row the bits ggml's product gives it. w a 2-D weight or a row block of one.
+    /// gives every row the bits ggml's product gives it. w a 2-D weight or a row block of one. The graph builder's weight
+    /// products and the per-op ones (tsg::weight_mul_mat) both take it, so the two paths run one product per weight.
     ggml_tensor* cpu_weight_product(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x);
+
+    /// The activation rows `node` reads when it is the product node of a cpu_weight_product (0 for any other node), so a
+    /// per-op graph's pool is chosen from it as from a MUL_MAT (cpu_pools_select_for).
+    std::int64_t cpu_weight_product_rows(const ggml_tensor* node);
 
     /// Creates the CPU backend's thread pools (the prompt pool always; a decode pool when its width differs) and sets
     /// the prompt pool; the pools are appended to `owned` (freed at shutdown).
@@ -68,9 +73,10 @@ namespace tsg
     void cpu_pools_select(ggml_backend_t backend, std::int64_t product_rows);
 
     /// A compute outside the graph runtime (a per-op graph through tsg::compute_graph): the pool for the most activation
-    /// rows any of its products (MUL_MAT, MUL_MAT_ID) reads, as cpu_pools_select; a graph without products keeps the pool
-    /// it finds, so the small per-op graphs between decode steps never pause the decode pool. A no-op inside the graph
-    /// runtime's own computes (CpuGraphRuntimeScope), which selected their pool from their weight products.
+    /// rows any of its products (MUL_MAT, MUL_MAT_ID, cpu_weight_product's) reads, as cpu_pools_select; a graph without
+    /// products keeps the pool it finds, so the small per-op graphs between decode steps never pause the decode pool. A
+    /// no-op inside the graph runtime's own computes (CpuGraphRuntimeScope), which selected their pool from their weight
+    /// products.
     void cpu_pools_select_for(ggml_backend_t backend, const ggml_cgraph* graph);
 
     /// Marks this thread's computes as the graph runtime's for its lifetime (see cpu_pools_select_for).

@@ -21,7 +21,7 @@ namespace InferenceWeb.Tests;
 /// The ggml-cpu side of the generic graph (ggml_ops_cpu_graph.cpp, ggml_ops_cpu_products.cpp): weights only products read
 /// run from ggml-cpu's repacked layouts (CPU_REPACK), every other reader keeps the plain bytes, and the weights ggml-cpu has
 /// no fast product for on ARM64 (BF16 at every width, sgemm at prompt width on Apple; NVFP4 from two rows) run TensorSharp's
-/// products.
+/// products, in graphs and per-op products alike.
 /// </summary>
 public sealed class GgmlCpuWeightProductTests
 {
@@ -288,6 +288,39 @@ public sealed class GgmlCpuWeightProductTests
     }
 
     /// <summary>
+    /// A per-op product of a quantized weight (GgmlBasicOps.AddmmQuant: what the per-op paths' LinearForward runs, such as
+    /// the per-op DFlash drafter's head) is the graph's product of that weight, bit for bit: BF16 at every width (ARM64:
+    /// TensorSharp's NEON rows and, on Apple, sgemm from 64 rows, over unrounded activations), NVFP4 at one row (ggml's dot)
+    /// and from two (TensorSharp's GEMM). Where ggml-cpu keeps these products, both paths run its MUL_MAT. (Weights that
+    /// ggml-cpu repacks on ARM64 are another matter: a graph reads the repacked copy, a per-op product the plain bytes, and
+    /// the two layouts sum in other orders; see <see cref="RepackedAndPlainLayoutsComputeTheSameProducts"/>.)
+    /// </summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void PerOpProductsAreTheGraphsProducts()
+    {
+        WithCpuBackend(() =>
+        {
+            var rng = new Random(23);
+            var allocator = new GgmlAllocator(new GgmlContext([0], GgmlBackendType.Cpu), 0);
+            foreach ((int type, int[] widths) in new[] { (30, new[] { 1, 3, 4, 7, 63, 64, 65 }), (40, new[] { 1, 2, 5, 256 }) })
+                foreach (int n in widths)
+                {
+                    using var native = new Native();
+                    byte[] bytes = RandomWeight(type, rng);
+                    IntPtr w = native.Copy(bytes);
+                    float[] x = Activations(n, rng);
+                    float[] graph = Run(type, w, bytes.Length, native.Copy(x), n, new[] { (0, M) }, null, native)[0];
+                    using var input = new Tensor(allocator, DType.Float32, n, K);
+                    using var result = new Tensor(allocator, DType.Float32, n, M);
+                    input.SetElementsAsFloat(x);
+                    GgmlBasicOps.AddmmQuant(result, input, w, type, K, M, bytes.Length);
+                    float[] perOp = result.GetElementsAsFloat(n * M);
+                    Assert.True(SameBits(perOp, 0, graph, 0, n * M), $"type {type} rows {n}: the per-op product differs from the graph's");
+                }
+        });
+    }
+
+    /// <summary>
     /// NVFP4 products of two rows and more run TensorSharp's GEMM over ggml's own Q8_0 activation rows with
     /// ggml_vec_dot_nvfp4_q8_0's arithmetic: every row of a wide product has the bits ggml-cpu's product gives that row
     /// alone (a one-row product is ggml's dot), for the whole weight and for a row block.
@@ -411,6 +444,26 @@ public sealed class GgmlCpuWeightProductTests
                 Ops.Add(a, a, a);
             }
             Assert.Equal(decode, GgmlBasicOps.CpuPoolThreads());
+
+            // Per-op products of the weights TensorSharp multiplies itself on ARM64 (BF16 at every width, NVFP4 from two
+            // rows: custom nodes in the per-op graph, not MUL_MAT) take the pool for their width too.
+            foreach (int type in new[] { 30, 40 })
+            {
+                byte[] qb = RandomWeight(type, rng);
+                IntPtr qw = native.Copy(qb);
+                int QuantPerOp(int rows)
+                {
+                    using var x = new Tensor(allocator, DType.Float32, rows, K);
+                    using var y = new Tensor(allocator, DType.Float32, rows, M);
+                    x.SetElementsAsFloat(Activations(rows, rng));
+                    GgmlBasicOps.AddmmQuant(y, x, qw, type, K, M, qb.Length);
+                    return GgmlBasicOps.CpuPoolThreads();
+                }
+                Assert.Equal(prompt, QuantPerOp(8));
+                Assert.Equal(decode, QuantPerOp(2));
+                Assert.Equal(prompt, QuantPerOp(5));
+                Assert.Equal(decode, QuantPerOp(1));
+            }
         });
     }
 }

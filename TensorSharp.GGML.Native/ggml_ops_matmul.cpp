@@ -585,7 +585,7 @@ namespace {
 
         ggml_tensor* mm_tensor = spark_float32
             ? tsg_matmul_f32(context.value, m2_binding.tensor, m1_binding.tensor)
-            : tsg::bonsai_mul_mat(context.value, m2_binding.tensor, m1_binding.tensor, m2_quant.data);
+            : tsg::weight_mul_mat(context.value, m2_binding.tensor, m1_binding.tensor, m2_quant.data);
         if (mm_tensor == nullptr)
         {
             set_last_error("Failed to create ggml matmul node for addmm_quant.");

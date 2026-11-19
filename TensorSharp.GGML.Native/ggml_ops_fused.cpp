@@ -176,7 +176,7 @@ int fused_rms_norm_matmul_quant_f32_impl(
         ? ggml_reshape_2d(context.value, scaled, in_dim, 1)
         : scaled;
 
-    ggml_tensor* mm = tsg::bonsai_mul_mat(context.value, m2_binding.tensor, scaled_2d, m2_quant.data);
+    ggml_tensor* mm = tsg::weight_mul_mat(context.value, m2_binding.tensor, scaled_2d, m2_quant.data);
     ggml_tensor* output_tensor = ggml_cpy(context.value, mm, result_binding.tensor);
     ggml_set_output(output_tensor);
 
@@ -390,7 +390,7 @@ int fused_matmul_quant_add_f32_impl(
         ? ggml_reshape_2d(context.value, contiguous_input, in_dim, 1)
         : contiguous_input;
 
-    ggml_tensor* mm = tsg::bonsai_mul_mat(context.value, m2_binding.tensor, input_2d, m2_quant.data);
+    ggml_tensor* mm = tsg::weight_mul_mat(context.value, m2_binding.tensor, input_2d, m2_quant.data);
     ggml_tensor* mm_flat = ggml_reshape_1d(context.value, mm, static_cast<int64_t>(rows) * out_dim);
     ggml_tensor* res_flat = ggml_reshape_1d(context.value, contiguous_residual, static_cast<int64_t>(rows) * out_dim);
     ggml_tensor* added = ggml_add(context.value, res_flat, mm_flat);
@@ -730,7 +730,7 @@ static int fused_ffn_swiglu_quant_f32_slab(
         : scaled;
 
     // gate_up = scaled @ gate_up_W^T -> ggml semantics: ne0=gate_up_out, ne1=rows
-    ggml_tensor* gate_up_mm = tsg::bonsai_mul_mat(context.value, gate_up_binding_w.tensor, scaled_2d, gate_up_quant.data);
+    ggml_tensor* gate_up_mm = tsg::weight_mul_mat(context.value, gate_up_binding_w.tensor, scaled_2d, gate_up_quant.data);
 
     const std::size_t gu_row_bytes = static_cast<std::size_t>(gate_up_out) * sizeof(float);
     const std::size_t half_bytes = static_cast<std::size_t>(half_dim) * sizeof(float);
@@ -753,7 +753,7 @@ static int fused_ffn_swiglu_quant_f32_slab(
         ? ggml_reshape_2d(context.value, swiglu, half_dim, 1)
         : swiglu;
 
-    ggml_tensor* down_mm = tsg::bonsai_mul_mat(context.value, down_binding_w.tensor, swiglu_2d, down_quant.data);
+    ggml_tensor* down_mm = tsg::weight_mul_mat(context.value, down_binding_w.tensor, swiglu_2d, down_quant.data);
 
     ggml_tensor* down_flat = ggml_reshape_1d(context.value, down_mm, static_cast<int64_t>(rows) * hidden);
     ggml_tensor* res_flat = ggml_reshape_1d(context.value, contiguous_residual, static_cast<int64_t>(rows) * hidden);
@@ -1149,7 +1149,7 @@ int fused_ffn_act_project_quant_f32_impl(
         ? ggml_reshape_2d(context.value, scaled, hidden, 1)
         : scaled;
 
-    ggml_tensor* gate_up_mm = tsg::bonsai_mul_mat(context.value, gate_up_binding_w.tensor, scaled_2d, gate_up_quant.data);
+    ggml_tensor* gate_up_mm = tsg::weight_mul_mat(context.value, gate_up_binding_w.tensor, scaled_2d, gate_up_quant.data);
 
     const std::size_t gu_row_bytes = static_cast<std::size_t>(gate_up_out) * sizeof(float);
     const std::size_t half_bytes = static_cast<std::size_t>(half_dim) * sizeof(float);
@@ -1168,7 +1168,7 @@ int fused_ffn_act_project_quant_f32_impl(
         ? ggml_reshape_2d(context.value, glu, half_dim, 1)
         : glu;
 
-    ggml_tensor* down_mm = tsg::bonsai_mul_mat(context.value, down_binding_w.tensor, glu_2d, down_quant.data);
+    ggml_tensor* down_mm = tsg::weight_mul_mat(context.value, down_binding_w.tensor, glu_2d, down_quant.data);
 
     ggml_tensor* down_flat = ggml_reshape_1d(context.value, down_mm, static_cast<int64_t>(rows) * hidden);
     ggml_tensor* output_node = ggml_cpy(context.value, down_flat, output_binding.tensor);
@@ -2626,7 +2626,7 @@ int fused_outproj_ffn_quant_f32_impl(
 
     // Phase 1: output projection + residual
     ggml_tensor* inp_2d = (rows == 1) ? ggml_reshape_2d(ctx, cont_input, input_desc.dim1, 1) : cont_input;
-    ggml_tensor* out_mm = tsg::bonsai_mul_mat(ctx, out_w, inp_2d, out_proj_quant.data);
+    ggml_tensor* out_mm = tsg::weight_mul_mat(ctx, out_w, inp_2d, out_proj_quant.data);
     ggml_tensor* out_flat = ggml_reshape_1d(ctx, out_mm, static_cast<int64_t>(rows) * hidden);
     ggml_tensor* res_flat1 = ggml_reshape_1d(ctx, cont_res, static_cast<int64_t>(rows) * hidden);
     ggml_tensor* res_plus_out = ggml_add(ctx, res_flat1, out_flat);
@@ -2637,7 +2637,7 @@ int fused_outproj_ffn_quant_f32_impl(
     ggml_tensor* scaled = ggml_mul(ctx, normed, norm_w);
     ggml_tensor* scaled_2d = (rows == 1) ? ggml_reshape_2d(ctx, scaled, hidden, 1) : scaled;
 
-    ggml_tensor* gu_mm = tsg::bonsai_mul_mat(ctx, gu_w, scaled_2d, gate_up_quant.data);
+    ggml_tensor* gu_mm = tsg::weight_mul_mat(ctx, gu_w, scaled_2d, gate_up_quant.data);
     std::size_t gu_row_bytes = static_cast<std::size_t>(gate_up_out) * sizeof(float);
     std::size_t half_bytes = static_cast<std::size_t>(half_dim) * sizeof(float);
     // One GLU node straight off the strided halves (see the note in
@@ -2647,7 +2647,7 @@ int fused_outproj_ffn_quant_f32_impl(
     ggml_tensor* up_v   = ggml_view_2d(ctx, gu_mm, half_dim, rows, gu_row_bytes, half_bytes);
     ggml_tensor* swiglu = ggml_swiglu_split(ctx, gate_v, up_v);
     ggml_tensor* swiglu_2d = (rows == 1) ? ggml_reshape_2d(ctx, swiglu, half_dim, 1) : swiglu;
-    ggml_tensor* dn_mm = tsg::bonsai_mul_mat(ctx, dn_w, swiglu_2d, down_quant.data);
+    ggml_tensor* dn_mm = tsg::weight_mul_mat(ctx, dn_w, swiglu_2d, down_quant.data);
 
     ggml_tensor* dn_flat = ggml_reshape_1d(ctx, dn_mm, static_cast<int64_t>(rows) * hidden);
     ggml_tensor* res_flat2 = ggml_reshape_1d(ctx, res_2d, static_cast<int64_t>(rows) * hidden);
@@ -2799,7 +2799,7 @@ int fused_outproj_norm_router_quant_f32_impl(
 
     // Phase 1: output projection + residual
     ggml_tensor* inp_2d = (rows == 1) ? ggml_reshape_2d(ctx, cont_input, input_desc.dim1, 1) : cont_input;
-    ggml_tensor* out_mm = tsg::bonsai_mul_mat(ctx, out_w, inp_2d, out_proj_quant.data);
+    ggml_tensor* out_mm = tsg::weight_mul_mat(ctx, out_w, inp_2d, out_proj_quant.data);
     ggml_tensor* out_flat = ggml_reshape_1d(ctx, out_mm, (int64_t)rows * hidden);
     ggml_tensor* res_flat = ggml_reshape_1d(ctx, cont_res, (int64_t)rows * hidden);
     ggml_tensor* res_updated = ggml_add(ctx, res_flat, out_flat);
