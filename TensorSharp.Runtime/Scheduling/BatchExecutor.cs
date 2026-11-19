@@ -2554,6 +2554,10 @@ namespace TensorSharp.Runtime.Scheduling
             // decoders' draws ("sample") and the forward ("issue", bucketed by the rows it ran).
             long sampleTicks = 0;
             int decoders = 0;
+            // Decode rows that draw from their logits on the host take their draws in parallel first (the device's greedy
+            // ids leave none in a plain greedy step; a step with a prompt chunk, or sampled requests, scanned 128,000 logits
+            // a row one row after another on this thread: 64 rows, ~8 ms of an LFM3-1.7B step).
+            Dictionary<SequenceState, (int Token, Exception? Error)>? draws = DrawHostRowsInParallel(prepared, handled, ref sampleTicks);
             foreach (var work in prepared)
             {
                 var seq = work.Sequence;
@@ -2601,7 +2605,16 @@ namespace TensorSharp.Runtime.Scheduling
                     else
                     {
                         long drawn = Stopwatch.GetTimestamp();
-                        int token = TakePendingOrSample(seq);
+                        int token;
+                        if (draws != null && draws.TryGetValue(seq, out var draw))
+                        {
+                            // TakePendingOrSample's sampling path: a stale device id is dropped.
+                            seq.PendingDeviceToken = null;
+                            if (draw.Error != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(draw.Error).Throw();
+                            token = draw.Token;
+                        }
+                        else
+                            token = TakePendingOrSample(seq);
                         sampleTicks += Stopwatch.GetTimestamp() - drawn;
                         decoders++;
                         seq.AppendOutputToken(token);
@@ -2688,6 +2701,50 @@ namespace TensorSharp.Runtime.Scheduling
                 foreach (var item in batch)
                     FailUnified(item.Work.Sequence, ex, results);
             }
+        }
+
+        /// <summary>
+        /// The draws of a unified step's decode rows that <see cref="TakePendingOrSample"/> would take from their host logits
+        /// (no early first token, no device id for this position, the first-token dump not armed), in parallel when there are
+        /// <see cref="ParallelSamplingMinRows"/> or more: each row's own sampler, as TakePendingOrSample calls it (a forced
+        /// thinking end first, else a draw from the logits), so every row draws what it drew one after another. Null where
+        /// the rows draw in the loop as before (fewer rows, or <see cref="ParallelSampling"/> off).
+        /// </summary>
+        private static Dictionary<SequenceState, (int Token, Exception? Error)>? DrawHostRowsInParallel(List<ScheduledSequenceWork> prepared,
+            HashSet<string>? handled, ref long sampleTicks)
+        {
+            if (!ParallelSampling || FirstTokenLogitsDump.IsArmed) return null;
+            List<SequenceState>? rows = null;
+            foreach (var work in prepared)
+            {
+                var seq = work.Sequence;
+                if (work.IsPrefill || seq.StepDriver != null || (handled != null && handled.Contains(seq.RequestId)) || seq.LastLogits == null
+                    || (seq.EarlyFirstToken >= 0 && seq.OutputTokens.Count == 0)
+                    || (seq.PendingDeviceToken.HasValue && seq.PendingDevicePosition == seq.NumComputedTokens))
+                    continue;
+                (rows ??= new List<SequenceState>()).Add(seq);
+            }
+            if (rows == null || rows.Count < ParallelSamplingMinRows) return null;
+            long started = Stopwatch.GetTimestamp();
+            var drawn = new (int Token, Exception? Error)[rows.Count];
+            Parallel.For(0, rows.Count, i =>
+            {
+                SequenceState seq = rows[i];
+                try
+                {
+                    drawn[i] = (seq.GetOrCreateSampler().TryGetForcedThinkingToken(seq.OutputTokens, out int thinkingEnd)
+                        ? thinkingEnd : SampleFromLogits(seq), null);
+                }
+                catch (Exception ex)
+                {
+                    drawn[i] = (0, ex);
+                }
+            });
+            Interlocked.Increment(ref ParallelSampledSteps);
+            sampleTicks += Stopwatch.GetTimestamp() - started;
+            var draws = new Dictionary<SequenceState, (int Token, Exception? Error)>(rows.Count, ReferenceEqualityComparer.Instance);
+            for (int i = 0; i < rows.Count; i++) draws[rows[i]] = drawn[i];
+            return draws;
         }
 
         /// <summary>
