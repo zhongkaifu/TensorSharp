@@ -46,9 +46,10 @@ namespace TensorSharp.Models
         internal int[] DeviceRoomStages { get; } = new int[7];
 
         /// <summary>Tests: room for <paramref name="bytes"/> of recorded steps beside the running requests, as a step that could
-        /// not record asks for it (<see cref="RecordingRoomBytes"/>), at a size the test chooses.</summary>
-        internal bool EnsureRecordingRoomForTests(long bytes)
-            => EnsureDeviceRoom(bytes, RunningSlots(), RoomUse.Recording, mayEvict: true, "recorded steps (test)");
+        /// not record asks for it (<see cref="RecordingRoomBytes"/>), at a size the test chooses; with <paramref name="mayEvict"/>
+        /// false, as a check that releases no conversation asks.</summary>
+        internal bool EnsureRecordingRoomForTests(long bytes, bool mayEvict = true)
+            => EnsureDeviceRoom(bytes, RunningSlots(), RoomUse.Recording, mayEvict, "recorded steps (test)");
 
         /// <summary>New requests refused because their slot does not fit the device alone (tests check the route).</summary>
         internal int SlotRefusals { get; private set; }
@@ -255,8 +256,9 @@ namespace TensorSharp.Models
                 // conversation, and is worth a reused turn's drafts (on a 32 GB RTX PRO 4500 at 131K context, rings given back
                 // ahead of the conversations - every idle one at each new long prompt, or the few that covered a small
                 // shortfall - left the next reused turn of a conversation the prefix cache still kept drafting without its own:
-                // 53-58% acceptance against 98%).
-                if (free < need)
+                // 53-58% acceptance against 98%). Only where conversations may go (mayEvict): a check that releases none (a
+                // slot's roomier target, SlotTarget) keeps them too.
+                if (free < need && mayEvict)
                     free = ReleaseRingsForRoom(need - free, free, use);
 
                 // 6. The cached graphs and every recording (a prompt step only).

@@ -197,7 +197,8 @@ public sealed class DraftContextContinuationTests : IDisposable
     /// Device memory short: a conversation the prefix cache keeps goes before any kept ring, even where the rings would cover
     /// the shortfall (an 81 MB ring is little room beside a conversation and worth its next turn's drafts: given back first, on
     /// a 32 GB RTX PRO 4500 at 131K context, they left reused turns of kept conversations drafting without their context).
-    /// With no conversation left, only the least recently kept rings the room needs go.
+    /// With no conversation left, only the least recently kept rings the room needs go. A check that may release no
+    /// conversation (a slot's roomier target) gives no ring back either.
     /// </summary>
     [Fact]
     public void AConversationGoesBeforeAnyKeptRing()
@@ -221,6 +222,13 @@ public sealed class DraftContextContinuationTests : IDisposable
         long ringBytes = 2L * model.DFlashSettings.NumLayers * model.DFlashSettings.NumKVHeads * model.DFlashRingRowsForTests
             * model.DFlashSettings.HeadDim * sizeof(float) + model.DFlashSettings.FeatureSize * sizeof(float);
         const long gb = 1L << 30;
+
+        // A check that may release no conversation keeps the rings too (a slot's roomier target asks so): no room, nothing gone.
+        model.DeviceRoomForTests = () => (model.RetainedPayloadKeys.Count == 0 ? 3 * ringBytes : 0, 64 * gb);
+        Assert.False(model.EnsureRecordingRoomForTests(ringBytes, mayEvict: false));
+        Assert.Equal(new[] { "conv" }, model.RetainedPayloadKeys);
+        Assert.Equal(3, model.DFlashRingCountForTests);
+        Assert.Equal(0, model.DeviceRoomStages[4]);
 
         // One ring's worth short, two kept rings to give: the conversation goes and makes the room, the rings stay.
         model.DeviceRoomForTests = () => (model.RetainedPayloadKeys.Count == 0 ? 3 * ringBytes : 0, 64 * gb);
