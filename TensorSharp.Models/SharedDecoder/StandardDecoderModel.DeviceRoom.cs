@@ -475,7 +475,8 @@ namespace TensorSharp.Models
         /// <param name="required">The cells the request's first step needs (its prompt, its first token and the verify window);
         /// where slots are sized to the device's room (<see cref="SizesSlotsToRoom"/>) the slot is <see cref="SlotTarget"/>'s:
         /// the class of the reservation with headroom where memory allows, else the largest that fits, and only for the required
-        /// cells are finished conversations released.</param>
+        /// cells are finished conversations released (the room the released ones leave past them is then taken, up to the
+        /// class, so the conversation's next turn does not grow the slot in its prompt step).</param>
         private Slot NewSlotWithRoom(string requestId, int reserve, int required)
         {
             int capacity = NewSlotCapacity(reserve);
@@ -489,7 +490,7 @@ namespace TensorSharp.Models
                 if (roomy > 0) return Logged(FreshSlot(Math.Max(roomy, least)));
                 if (_slotPool?.Exists(p => p.Capacity >= least) == true) return Logged(NewSlot(least));
                 if (ReclaimRetainedSlot(least, roomShort: true) is { } taken) return Logged(taken);
-                int tight = TightSlotTarget(least, keep, "a new request's slot", 0);
+                int tight = TightSlotTarget(least, reserve, keep, "a new request's slot", 0);
                 if (tight > 0) return Logged(FreshSlot(Math.Max(tight, least)));
                 capacity = least;
 

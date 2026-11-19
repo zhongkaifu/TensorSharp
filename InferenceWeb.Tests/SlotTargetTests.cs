@@ -142,6 +142,46 @@ public sealed class SlotTargetTests : IDisposable
         Assert.Equal(new[] { ("old", InvalidationReason.NativeSlotReclaimed) }, sink.Reports);
     }
 
+    /// <summary>A new request whose slot needs a finished conversation released takes the room the released one leaves past
+    /// its required cells, up to its reservation's class, nothing more released, as a copy or a growth does: made at the
+    /// required cells, its conversation's next turn grew the slot a tensor at a time to that turn's reservation inside the
+    /// turn's prompt step (Qwen3.8-27B on an RTX PRO 4500, one server serving 8K to 69K turns: 47,104 -> 56,320 cells at 47K
+    /// and 69,632 -> 81,920 at 69K, 85-97 ms of the next turn's first token).</summary>
+    [Fact]
+    public void ANewRequestsSlotTakesTheRoomTheConversationsReleasedForItLeave()
+    {
+        var sink = new RecordingPayloadSink();
+        using Qwen35RuntimeModel model = Create(() => 32 * GB, sink);
+        var unified = (IUnifiedBatchModel)model;
+        foreach (string key in new[] { "old", "older" })
+        {
+            Assert.Equal(0, unified.EnsureSequenceSlot(key, 64));
+            // Shorter than the new request's first step below, so neither conversation's slot is taken over for it: its room
+            // is made by releasing the oldest.
+            Assert.True(model.SlotCapacityForTests(key) < 5000);
+            Assert.True(unified.TryForwardUnified(new[] { key }, new[] { _prompt }, new[] { 0 }, new float[1][]));
+            Assert.True(model.RetainSequenceCacheAs(key, key));
+        }
+        long tight = model.SlotRoomNeedForTests(256) - 1, after = model.SlotRoomNeedForTests(9000);
+        model.DeviceRoomForTests = () => (model.RetainedPayloadKeys.Count < 2 ? after : tight, 32 * GB);
+
+        Assert.Equal(0, unified.EnsureSequenceSlot("turn1", 8000, 5000));
+        int fit = LargestFitting(model, after, model.SlotCapacityClass(8000 + 1024));
+        Assert.Equal(8192, fit);
+        Assert.Equal(fit, model.SlotCapacityForTests("turn1"));
+        Assert.Equal(new[] { ("old", InvalidationReason.NativeSlotReclaimed) }, sink.Reports);
+
+        // The conversation's next turn, its reservation within that room, runs in the slot its first turn donated.
+        Assert.True(unified.TryForwardUnified(new[] { "turn1" }, new[] { _prompt }, new[] { 0 }, new float[1][]));
+        object caches = model.SlotCachesForTests("turn1");
+        Assert.True(model.RetainSequenceCacheAs("turn1", "conversation"));
+        Assert.True(model.TryRebindRetainedCache("conversation", "turn2"));
+        Assert.Equal(_prompt.Length, unified.EnsureSequenceSlot("turn2", 8100, _prompt.Length + 40));
+        Assert.Same(caches, model.SlotCachesForTests("turn2"));
+        Assert.Equal(0, model.RollingGrowths);
+        Assert.Single(sink.Reports);
+    }
+
     /// <summary>A new request's slot is its reservation's class where memory allows, else the largest that fits, and the request
     /// runs in it: its reservation is fitted once, and the steps after its first do not ask the device again while the slot
     /// holds what they need.</summary>
