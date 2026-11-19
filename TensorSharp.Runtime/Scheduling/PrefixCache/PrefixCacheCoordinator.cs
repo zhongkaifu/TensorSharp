@@ -421,7 +421,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                     if (!donate && !ReserveClone(payload.Key, length, reservation)) return false;
                     var materialize = new MaterializeRequest(donate ? MaterializeOp.Donate : MaterializeOp.Clone,
                         payload.Key, sequence.RequestId, payload.Footprint.Tokens, length, reservation,
-                        ConsumableSharers(payload.Key, sequence));
+                        ConsumableSharers(payload.Key, sequence), EndsPrompt: length == sequence.PromptTokens.Count);
                     if (!_cacheModel.TryMaterialize(materialize))
                     {
                         LastDeclineReason = $"the model declined to {(donate ? "donate" : "clone")} the {length}-token end state";

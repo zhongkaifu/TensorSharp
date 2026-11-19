@@ -27,11 +27,13 @@ public enum InvalidationReason : byte { ModelBudgetEviction, NativeSlotReclaimed
 /// is an optional, already fitted reservation for a clone, not its valid token count; the model never
 /// truncates a payload in <see cref="IPrefixCacheModel.TryMaterialize"/> (P7). <see cref="Consumable"/> names the
 /// payloads of <see cref="IPrefixCacheModel.RowSharers"/> the request may use up (its own conversation's, none of them
-/// locked or being donated); null: none.
+/// locked or being donated); null: none. <see cref="EndsPrompt"/>: the request's prompt ends at <see cref="TargetTokens"/>
+/// (a retry of the payload's prompt: what it writes past it is its answer, not a prompt of its own).
 /// </summary>
 public readonly record struct MaterializeRequest(
     MaterializeOp Op, string PayloadKey, string TargetRequestId,
-    int PayloadTokens, int TargetTokens, int RequiredContextTokens = 0, IReadOnlyList<string>? Consumable = null);
+    int PayloadTokens, int TargetTokens, int RequiredContextTokens = 0, IReadOnlyList<string>? Consumable = null,
+    bool EndsPrompt = false);
 
 /// <summary>Where a model reports the payloads it still evicts itself (DEC-23).</summary>
 public interface IPrefixPayloadSink

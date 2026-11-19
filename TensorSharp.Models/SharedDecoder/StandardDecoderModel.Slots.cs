@@ -54,6 +54,11 @@ namespace TensorSharp.Models
             /// slot's arrays, whose rows below <see cref="Length"/> that slot never writes again while this lasts; its
             /// <see cref="Recurrent"/> states are its own. Retained only: it never runs a request, and is never pooled.</summary>
             public bool SharesRows;
+            /// <summary>A shared-row checkpoint whose rows past it another request has written since it was captured: one that
+            /// took them over with a prompt of its own past the checkpoint (a branch), or continued the end state over them (its
+            /// conversation's next turn). Those rows may still be continued, so an adopter of the checkpoint copies it instead
+            /// of taking them over (StandardDecoderModel.RowShares.cs).</summary>
+            public bool RowsPastTaken;
         }
 
         private static long s_retainSerial;

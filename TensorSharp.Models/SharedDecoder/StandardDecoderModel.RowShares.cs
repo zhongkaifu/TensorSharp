@@ -28,7 +28,8 @@ namespace TensorSharp.Models
     /// or disposed only after its rows go to the longest checkpoint (<see cref="HandOverRows"/>), and a copy or growth of the
     /// owner takes its checkpoints along (<see cref="RepointDependents"/>).</item>
     /// <item>Only a same-conversation adopter steals, and only payloads the prefix cache lets it consume
-    /// (<see cref="MaterializeRequest.Consumable"/>); otherwise the checkpoint is copied as before.</item>
+    /// (<see cref="MaterializeRequest.Consumable"/>), and only rows past the checkpoint no other branch of the conversation
+    /// may still continue (<see cref="Slot.RowsPastTaken"/>); otherwise the checkpoint is copied as before.</item>
     /// </list>
     /// </summary>
     public abstract partial class StandardDecoderModel
@@ -435,7 +436,9 @@ namespace TensorSharp.Models
 
         IReadOnlyList<string> IPrefixCacheModel.RowSharers(string payloadKey)
         {
-            if (!TryGetRetained(payloadKey, out Slot checkpoint) || !checkpoint.SharesRows) return Array.Empty<string>();
+            // A checkpoint whose rows past it another branch wrote is copied: adopting it uses up nothing.
+            if (!TryGetRetained(payloadKey, out Slot checkpoint) || !checkpoint.SharesRows || checkpoint.RowsPastTaken)
+                return Array.Empty<string>();
             var (ownerKey, _) = RetainedOwner(checkpoint.K);
             return ownerKey == null ? null : StolenKeys(checkpoint, ownerKey);
         }
@@ -469,9 +472,23 @@ namespace TensorSharp.Models
                     || !CanMaterialize(request.PayloadKey, request.PayloadTokens, request.TargetTokens))
                     return false;
                 return MaterializeShared(request.PayloadKey, slot, request.TargetRequestId, request.Op == MaterializeOp.Donate,
-                    request.TargetTokens == slot.Length ? request.Consumable : null, request.RequiredContextTokens);
+                    request.TargetTokens == slot.Length ? request.Consumable : null, request.RequiredContextTokens, request.EndsPrompt);
             }
-            return HolderPrefixCacheAdapter.TryMaterialize(this, request);
+            if (!HolderPrefixCacheAdapter.TryMaterialize(this, request)) return false;
+            // An end state donated to its conversation's next turn: the rows past its checkpoints are that turn's from now on,
+            // and a later adopter of one of them (a retry of an earlier turn) copies it rather than take the turn's rows over.
+            if (request.Op == MaterializeOp.Donate && TryGetSlot(request.TargetRequestId, out Slot taken)) NoteRowsPastTaken(taken.K, null, false);
+            return true;
+        }
+
+        /// <summary>A request took <paramref name="k"/>'s rows over at a checkpoint's length or past it: every checkpoint over them
+        /// is marked <see cref="Slot.RowsPastTaken"/>, except <paramref name="retried"/> where <paramref name="endsPrompt"/> (a
+        /// retry of its prompt writes only its answer past it, which the next retry may take over again).</summary>
+        private void NoteRowsPastTaken(Tensor[][] k, Slot retried, bool endsPrompt)
+        {
+            if (k == null || _rowShares == null || !_rowShares.TryGetValue(k, out List<Slot> dependents)) return;
+            foreach (Slot d in dependents)
+                if (!ReferenceEquals(d, retried) || !endsPrompt) d.RowsPastTaken = true;
         }
 
         /// <summary>
@@ -483,21 +500,23 @@ namespace TensorSharp.Models
         /// A donated checkpoint is used up; a cloned one stays over the rows.
         /// </summary>
         private bool MaterializeShared(string payloadKey, Slot checkpoint, string requestId, bool donate,
-            IReadOnlyList<string> consumable, int requiredContextTokens)
+            IReadOnlyList<string> consumable, int requiredContextTokens, bool endsPrompt = false)
         {
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_slots.ContainsKey(requestId) || string.Equals(_activeKey, requestId, StringComparison.Ordinal)) return false;
             var (ownerKey, owner) = RetainedOwner(checkpoint.K);
             List<string> stolen = owner == null ? null : StolenKeys(checkpoint, ownerKey);
-            if (stolen != null && consumable != null && stolen.TrueForAll(key => consumable.Contains(key)))
+            if (stolen != null && !checkpoint.RowsPastTaken && consumable != null && stolen.TrueForAll(key => consumable.Contains(key)))
             {
-                Steal(checkpoint, ownerKey, owner, requestId);
+                Steal(checkpoint, ownerKey, owner, requestId, endsPrompt);
                 if (donate) ConsumeCheckpoint(payloadKey, checkpoint);
                 return true;
             }
             int capacity = Math.Max(checkpoint.Length, requiredContextTokens);
             ShareDebug($"{requestId} copies checkpoint {payloadKey} of {checkpoint.Length:N0} rows (" +
-                (owner == null ? "a request runs on its rows" : $"{stolen.Count - (consumable?.Count(stolen.Contains) ?? 0)} of {stolen.Count} payloads not its to use up") + ")");
+                (owner == null ? "a request runs on its rows"
+                    : checkpoint.RowsPastTaken ? "another branch of its conversation wrote the rows past it"
+                    : $"{stolen.Count - (consumable?.Count(stolen.Contains) ?? 0)} of {stolen.Count} payloads not its to use up") + ")");
             if (!RoomForSlotCopy(checkpoint, capacity, mayEvict: true, needed: true, "a clone of a cached prefix", out int copyCapacity))
             {
                 _lastMaterializeWantedRoom = true;
@@ -510,7 +529,7 @@ namespace TensorSharp.Models
 
         /// <summary>The request takes <paramref name="owner"/>'s slot at <paramref name="checkpoint"/>'s state (see
         /// <see cref="MaterializeShared"/>).</summary>
-        private void Steal(Slot checkpoint, string ownerKey, Slot owner, string requestId)
+        private void Steal(Slot checkpoint, string ownerKey, Slot owner, string requestId, bool endsPrompt)
         {
             _slotMutationDepth++;
             try
@@ -538,6 +557,9 @@ namespace TensorSharp.Models
                 owner.VerifyRows = 0;
                 owner.Spare = false;
                 _slots[requestId] = owner;
+                // The rows past the checkpoints that stay over the slot are this request's now: a branch with a prompt of its
+                // own past the checkpoint may continue them, a retry of the checkpoint's prompt writes only its answer there.
+                NoteRowsPastTaken(checkpoint.K, checkpoint, endsPrompt);
                 RowSteals++;
                 ShareDebug($"{requestId} took over {ownerKey}'s slot of {owner.Capacity:N0} cells at its checkpoint's {checkpoint.Length:N0} rows " +
                     $"(no copy; {used.Count} payload{(used.Count == 1 ? "" : "s")} used up)");

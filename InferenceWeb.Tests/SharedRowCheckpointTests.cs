@@ -172,8 +172,8 @@ public sealed class SharedRowCheckpointTests : IDisposable
         return sum;
     }
 
-    private static MaterializeRequest Clone(string payload, string target, IReadOnlyList<string> consumable)
-        => new(MaterializeOp.Clone, payload, target, Prompt.Length, Prompt.Length, 0, consumable);
+    private static MaterializeRequest Clone(string payload, string target, IReadOnlyList<string> consumable, bool endsPrompt = false)
+        => new(MaterializeOp.Clone, payload, target, Prompt.Length, Prompt.Length, 0, consumable, endsPrompt);
 
     public enum Fate { Steal, StealTwice, Copy, Evicted, Released, Grown, GrownRolling }
 
@@ -209,9 +209,13 @@ public sealed class SharedRowCheckpointTests : IDisposable
                 IReadOnlyList<string> sharers = cache.RowSharers("cp");
                 Assert.Equal(new[] { "E" }, sharers);
                 int copies = model.SlotCopies;
-                Assert.True(cache.TryMaterialize(Clone("cp", "b", sharers)));
+                // A retry of the checkpoint's prompt (what it writes past it is its answer) where the next adopter takes the
+                // slot over again; otherwise a branch with a prompt of its own past the checkpoint, whose rows an adopter
+                // copies.
+                Assert.True(cache.TryMaterialize(Clone("cp", "b", sharers, endsPrompt: fate == Fate.StealTwice)));
                 Assert.Equal(1, model.RowSteals);
                 Assert.Equal(copies, model.SlotCopies);   // nothing copied
+                if (fate != Fate.StealTwice) Assert.Empty(cache.RowSharers("cp"));
                 Assert.Same(rows, model.SlotCachesForTests("b"));
                 Assert.Contains(("E", InvalidationReason.TrimmedByModel), sink.Reports);
                 Assert.True(model.RetainedSharesRowsForTests("cp"));   // the checkpoint stays, now over the adopter's rows
