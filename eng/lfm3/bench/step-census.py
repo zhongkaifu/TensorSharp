@@ -143,7 +143,11 @@ def census(path, steps, top):
 # Weight products (and their activation quantization): their count a step does not depend on N, their time grows with
 # the rows. Everything else is classified by its count: per-sequence when it gains at least one launch for every two
 # added sequences, fixed otherwise.
-PRODUCT = re.compile(r"mul_mat|gemm|gemv|mmq|mmvq|mmvf|cutlass|xmma|splitK|quantize_q8_1|quantize_mmq|matvec|cublas|s16816|s1688|_tn_|_nt_|^Kernel2$", re.I)
+# ggml-cuda: mul_mat_* / MMQ / MMVQ and cuBLAS (ampere_*gemm*, splitKreduce, Kernel2); TensorSharp's direct CUDA executor:
+# the dense decode kernels (ts_dsv4_gemv*, ts_dsv4_dense_fast*), the weight dequantization and activation conversions in
+# front of cuBLAS (ts_dequant_weight_*, ts_convert_f32_*), the q8_1 activation quantization.
+PRODUCT = re.compile(r"mul_mat|gemm|gemv|mmq|mmvq|mmvf|cutlass|xmma|splitK|quantize_q8_1|quantize_mmq|matvec|cublas|s16816|s1688"
+                     r"|_tn_|_nt_|^Kernel2$|dense_fast|dequant_weight|convert_f32_(f16|bf16)", re.I)
 
 
 def growth(base, top, product=PRODUCT):
@@ -169,6 +173,11 @@ def growth(base, top, product=PRODUCT):
         p = r["probe"]
         if "host_ms" in p and "run_ms" in p:
             host, run = float(p["host_ms"]), float(p["run_ms"])
+            # A recorded replay (direct CUDA) returns from the executor's run before the device finishes; its wait lands in
+            # the result read-back outside the run, so the run is shorter than the device's work: host and in-run idle
+            # are then one figure (step - busy), reported on the in-run row with host = 0.
+            if run < 0.9 * r["gpu_busy_ms"]:
+                return host + run, host + run - r["gpu_busy_ms"], 0.0, "plain mean; recorded replays: host and idle not separable"
             return host + run, run - r["gpu_busy_ms"], host, "plain mean"
         return r["step_ms_traced"], r["gpu_idle_ms"], 0.0, "traced"
     s0, idle0, host0, src = split(base)
