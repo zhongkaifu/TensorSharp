@@ -123,6 +123,8 @@ public class ContentContractTests
         // ---- The Responses API's response id: a bearer key to the stored response. ----
         new("TensorSharp.Server/ProtocolAdapters/OpenAIResponsesAdapter.cs", "store ? LogContent.Of(requestId) : requestId", null,
             "marked as content whenever the response is stored under the id (store defaults to true)"),
+        new("TensorSharp.Server/ProtocolAdapters/OpenAIResponsesAdapter.Speech.cs", "store ? LogContent.Of(requestId) : requestId",
+            "/v1/responses spoken reply", "a spoken reply's response id: marked as content whenever the response is stored under the id"),
         new("TensorSharp.Server/ProtocolAdapters/OpenAIResponsesAdapter.cs", "requestId", "/v1/responses rejected",
             "a rejected request: nothing is stored under the id"),
         new("TensorSharp.Server/ProtocolAdapters/OpenAIResponsesAdapter.cs", "requestId", "/v1/responses text.format invalid",
