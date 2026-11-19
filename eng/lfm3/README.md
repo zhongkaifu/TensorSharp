@@ -45,11 +45,23 @@ in the ignored `artifacts/lfm3/`.
     runs' and the sampling's shares. `--ps` prints the busiest processes before each cell (with the load average
     each cell records); `--profile-range` marks each cell's timed steps for nsys (`bench/step-census.sh`). The counters
     are the runtime's `StandardDecoderModel.Census` (internal, beside `GraphBuilds`) and the plans'
-    `IGraphPlanCensus` (ggml: `TSGgml_GraphCensus`).
+    `IGraphPlanCensus` (ggml: `TSGgml_GraphCensus`). The ggml census counts graph nodes that are not views, so it
+    reads about 25% above the kernels nsys sees on ggml-cuda (its fusions); `bench/step-census.sh` gives the traced count.
 - `prompt-parity.py` compares the `chat` ids with llama-server's (`/apply-template` + `/tokenize`) and Hugging Face's
   (`apply_chat_template`, run with a Python that has transformers) for the same requests: `requests` writes GSM8K
   requests as `e2e/gsm8k.py` sends them, `llama` / `hf` render them, `diff` reports identical requests and the first
   differing token of each that is not (exit 1).
+- `BatchDigest MODEL BACKEND [--sequences N,...] [--prompt P] [--steps T]` (`dotnet build eng/lfm3/BatchDigest -c
+  Release`) proves a commit of the batched-serving stages bit-identical: it drives any shared-runtime family (LFM3,
+  Qwen3.5, Hunyuan dense, Mistral3) through `IUnifiedBatchModel` as the server does - for each N (default 1,3,16),
+  each sequence's prompt alone, T batched decode steps fed their host argmax, and halfway through one sequence leaves
+  while a new one joins with its prompt in the same step as the others' decode rows - then, after every logits cell,
+  each cell's prompts and schedule again through device greedy ids where the model has them (an id cell's tokens equal
+  its logits cell's exactly when every device id is the host argmax), and prints an FNV-1a digest of every logit bit
+  per step (`STEP`), per cell (`CELL`, with the steps' graph runs, builds, recordings and recorded replays) and overall
+  (`ALL`). It uses only public API (the counters by reflection), so the same file builds at the stage's parent commit:
+  build it in both trees and compare the `STEP` and `CELL` lines of the two outputs (the cells' counters cut off, and
+  only the `logits` cells where one build has device ids and the other has not) per model and backend.
 
 - `gpu-matrix.sh OUT MODELS_DIR CASES_DIR CORPUS [MODEL ...]` runs the text comparison on a Linux GPU machine (CUDA and
   Vulkan): builds `llamacpp-forced` against llama.cpp's `build-cuda/` and `build-vk/` trees (`LLAMA`), records llama.cpp's
