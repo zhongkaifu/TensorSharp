@@ -19,10 +19,14 @@ head per step of the checkpoint's own sigma grid, and there is no negative promp
 It works from about 4 MP to 20 MP and is best around 16 MP (4096x4096, 4736x3552,
 5024x3360, 5472x3072, 6272x2688).
 
-TensorSharp runs text to image through `MiniMaxH3ImageModel` on the ggml backends.
-It has been run on `ggml_cuda` (an H100, below); `ggml_metal` and `ggml_cpu` take the
-same native graphs but have not been run with it yet. Editing with reference images
-(`<Picture 1>` ...) is not implemented yet.
+TensorSharp runs text to image on its shared diffusion runtime
+(`TensorSharp.Models.SharedDiffusion`: the MiniMax-H3-Image family, its text encoder,
+denoiser and VAE decoder, run phase by phase by one pipeline) on `ggml_cuda`,
+`ggml_metal` and `ggml_cpu`, end to end. It has been run with real weights on
+`ggml_cuda` (an H100 and an A40) and on `ggml_metal` (an M5 Pro); `ggml_cpu` runs the
+same programs (validated on small synthetic checkpoints; with real weights it takes tens
+of minutes a picture). Editing with reference images (`<Picture 1>` ...) is not
+implemented yet.
 
 | Component | File | Source |
 |---|---|---|
@@ -77,9 +81,13 @@ Request settings:
 
 ## How it runs
 
+- **Phases.** Each picture runs three phases: the text (the encoder), the denoise (six
+  steps of the DiT) and the decode (the VAE). The pipeline keeps every component on the
+  device between phases and between pictures when they fit, and otherwise releases one
+  between phases ([Memory](#memory)).
 - **Prompt.** Raw prompt tokens, no chat template, through the MiniMax-H3 Qwen3-VL
-  trunk; the conditioning is the layer-50 hidden state. The encoder stays resident
-  between images.
+  trunk (the native encoder MiniMax-H3 video uses); the conditioning is the layer-50
+  hidden state.
 - **Packed sequence.** `[text | target image]` with the H3 3-axis RoPE: text token i
   at (i, 0, 0), the image's 2x2 patches one step later on the time axis over the
   aspect-normalized spatial grid. Text and image run at timestep t = 1 - sigma, with
@@ -89,15 +97,104 @@ Request settings:
   sigmas in float32 (1, 0.96765, 0.88771, 0.75, 0.53364, 0.23261, 0 at six steps).
 - **PDD heads.** `final_layer.video_out` stacks six heads; the step from grid point
   k to k+1 predicts with head 0 plus head k (head 0 alone for the first step). The
-  combined head is built once per interval and bound like any other weight.
-- **DiT.** The H3 native graph (`TSGgml_MiniMaxH3DitForward`) with no audio stream,
-  cuDNN attention and the fused modulation and residual stages.
-- **VAE.** The H3 video VAE's native ViT decode with the image decoder's geometry
-  (24 blocks of 1024, 16 heads, RoPE over (h, w) on half of each head, 16x16 RGB
-  patches), on 256-pixel tiles overlapping by at least 64 pixels and blended into
-  the canvas exactly as ComfyUI's `MiniMaxH3ImageVAE` does.
+  combined head is built once per interval and passed to the step as an input, so the
+  six steps share one compiled step.
+- **DiT.** One graph program a step: the token refiner, the 50 blocks and the final
+  layer, with no audio stream. On `ggml_cuda` the modulations, gated residuals,
+  attention (cuDNN) and the BF16 SwiGLU-in-GEMM run as fused stages and the wide
+  products on cuBLAS (or int8); elsewhere the same program runs ggml's own kernels.
+  The program is the graph MiniMax-H3's native DiT builds, node for node, so the
+  velocities are the same bit for bit.
+- **VAE.** The image decoder (24 blocks of 1024, 16 heads, RoPE over (h, w) on half of
+  each head, 16x16 RGB patches) on 256-pixel tiles overlapping by at least 64 pixels,
+  blended into the canvas exactly as ComfyUI's `MiniMaxH3ImageVAE` does. A row of tiles
+  (up to 64) is one graph program; on `ggml_cuda` its attention is one cuDNN call over
+  the whole row. Any row decodes on every backend: the decoder graph is sized from the
+  program, where the earlier native decode aborted on `ggml_metal` and `ggml_cpu` past
+  four tiles a call (`GGML_ASSERT(cgraph->n_nodes < cgraph->size)`, which every
+  2048x2048 or larger picture hit). `TS_H3_IMAGE_VAE_BATCH` was that decoder's
+  workaround and is no longer read.
+
+## Memory
+
+The pipeline plans each picture against the device's budget: on `ggml_cuda` the free
+VRAM less a headroom (1/16 of the card, at least 512 MiB); on `ggml_metal` the GPU's
+recommended working set less what is allocated, less the same headroom (on unified
+memory a command buffer past the working set fails). When the text encoder, the
+denoiser, the VAE and their working memory fit, everything stays resident between
+phases and between pictures. Otherwise a component the next phase does not use is
+released before it: its device copies are dropped and its weights stay mapped on the
+host, so a later phase uploads them again from memory or the page cache. `ggml_cpu`
+keeps everything. The decision is printed once per size, for example:
+
+```
+[diffusion-residency] 2048x2048, 0 reference(s): before Denoise: release the conditioner (peak 24.7 GB, budget 37.7 GB)
+```
+
+Measured (the device's peak use over a picture, CUDA context included; on Metal the GPU's allocated size and the
+system's wired memory):
+
+| Device | DiT | Size | Plan | Peak |
+|---|---|---|---|---:|
+| A40 46 GB | Q4_K_M | 2048x2048 | everything resident | 30.0 GiB |
+| A40 46 GB | Q4_K_M | 4096x4096 | everything resident | 33.9 GiB |
+| A40 46 GB | bf16 | 2048x2048 | the text encoder released before the denoise (15.6 GB back in 0.8 s) | 39.9 GiB |
+| A40 46 GB | bf16 | 4096x4096 | that, and the DiT's workspace released before the decode | 42.6 GiB |
+| M5 Pro 48 GB | Q8_0 | 2048x2048 | the text encoder released before the denoise; from the second picture on also the DiT before the text | 24.3 GiB allocated, 29.9 GB wired |
+| M5 Pro 48 GB | Q4_K_M | 512x512 | everything resident | 33.1 GB wired |
+
+Without these releases bf16 does not fit the A40 beside the text encoder (about 60 GB),
+and Q8_0 does not fit the 48 GB Mac: with the text encoder kept, the earlier path was
+stopped by the wired-memory watchdog at 43.5 GB wired while it loaded the DiT. With
+bf16 on the A40 each later picture uploads the text encoder and the DiT again (about 4 s
+and 15 s from disk on that VM, whose page cache cannot hold both). bf16 does not fit a
+48 GB Mac at all (40.2 GB of weights against a 40.2 GB working set): use Q8_0 there. An
+H100-class card keeps everything, bf16 at 16 MP included.
 
 ## Performance
+
+### A40 and M5 Pro
+
+One A40 46 GB (`ggml_cuda`, sm_86, a shared VM) and one M5 Pro 48 GB (`ggml_metal`),
+the prompts of the validation set (40 to 160 tokens), six steps. Text is the encode; a
+step is the median of steps 2 to 6; the picture is the whole request. The first picture
+of a process reads the files cold (on the A40 they were evicted from the page cache first)
+and includes the uploads; later pictures are warm.
+
+| A40, 2048x2048 | Text | Per step | Decode | Picture |
+|---|---:|---:|---:|---:|
+| Q4_K_M, first picture | 3.25 s | 2.23 s | 1.22 s | 21.0 s |
+| Q4_K_M, later pictures | 0.08 s | 2.24 s | 0.69 s | 14.3 s |
+| Q4_K_M, `TS_H3_INT8_MATMUL=1`, later pictures | 0.08 s | 1.88 s | 0.68 s | 12.1 s |
+| bf16, first picture (the text encoder released before the denoise) | 3.07 s | 1.92 s | 1.20 s | 29.7 s |
+| bf16, later pictures (both reloaded from disk each time) | 4.27 s | 1.91 s | 0.73 s | 34.2 s |
+
+| A40, 4096x4096 | Text | Per step | Decode | Picture |
+|---|---:|---:|---:|---:|
+| Q4_K_M, first picture | 3.25 s | 11.42 s | 2.91 s | 77.8 s |
+| Q4_K_M, later pictures | 0.07 s | 11.47 s | 2.40 s | 71.5 s |
+| Q4_K_M, `TS_H3_INT8_MATMUL=1`, later pictures | 0.07 s | 9.96 s | 2.48 s | 62.5 s |
+| bf16, first picture | 3.36 s | 10.36 s | 3.09 s | 82.6 s |
+
+| M5 Pro, 2048x2048 | Text | Per step | Decode | Picture |
+|---|---:|---:|---:|---:|
+| Q8_0, first picture | 1.71 s | 12.82 s | 3.45 s | 82.6 s |
+| Q8_0, later pictures | 1.70 s | 12.67 s | 2.72 s | 81.1 s |
+
+On the same machines, against the earlier native path in alternating processes, no
+phase took more than 1.4% longer and most took the same or less (the decode up to 13%
+less; the first picture's text 11 to 37% less, because the encoder's file is now mapped
+before that phase starts), the peak device memory was within 0.5% (1.3% lower for bf16
+at 16 MP), and
+every picture was identical, bit for bit: 8 prompts each for Q4_K_M, Q4_K_M with int8
+products and bf16 at 2048x2048 on the A40 and for Q8_0 on the M5 Pro, 2 prompts for
+Q4_K_M and int8 at 4096x4096, 1 for bf16 at 4096x4096. On the M5 Pro the earlier path
+needed its text encoder released and its decoder held to 4 tiles a call to run at all.
+
+### H100
+
+The H100 numbers below were measured on the earlier native path; the runtime runs the
+same graphs (above).
 
 One H100 NVL 94 GB (`ggml_cuda`, sm_90), warm (models resident, second image of a
 size), the same prompt (156 tokens) and seeds, six steps. ComfyUI is 0.45.0 running
@@ -135,10 +232,10 @@ and 9.5 s with bf16 at 4 MP, against 55.1 s for ComfyUI's first job.
 - **Attention.** cuDNN's SDPA runs the 56 x 128 attention over 16,540 tokens in 18 ms
   a block (21 ms with its prep and widening), the rate PyTorch's cuDNN backend reaches
   on the same GPU (its FlashAttention-2 took 30 ms); it is about half of a 16 MP step.
-- **VAE.** The decoder runs a row of 256-pixel tiles in one native call
-  (`TSGgml_MiniMaxH3VitDecodeBatch`), and the row's attention in one cuDNN call over a
-  batch of sequences rather than one call and one concat per tile: 0.7 s of native
-  time at 16 MP, where per-tile attention took 1.29 s and per-tile calls 1.84 s.
+- **VAE.** The decoder runs a row of 256-pixel tiles in one program, and the row's
+  attention in one cuDNN call over a batch of sequences rather than one call and one
+  concat per tile: 0.7 s of decoder time at 16 MP, where per-tile attention took 1.29 s
+  and per-tile calls 1.84 s.
 - **PNG.** PNGs are written by the managed codec on every media provider: the Up
   filter, and bands of about 1 MiB of rows deflated at zlib level 4 in parallel (each
   band its own IDAT chunk, the pigz construction). The encode of a 16 MP picture

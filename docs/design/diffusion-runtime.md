@@ -1,6 +1,7 @@
 # Diffusion runtime: MiniMax-H3-Image on the unified runtime, with editing and LoRA
 
-Status: design, not implemented. Written 2026-11-19 on `feature/h3-image-unified` (cut from
+Status: stages S1-S4 implemented (MiniMax-H3-Image text to image runs on the runtime; the legacy model is a test
+seam until S10); S5-S11 are design. Written 2026-11-19 on `feature/h3-image-unified` (cut from
 `origin/main` ec702639). ggml is upstream `cd6d2b75`, unchanged (AGENTS.md). No MiniMax-H3
 weights were downloaded or run for this document: every statement about TensorSharp is from
 the code, and every statement about upstream is from the sources listed in

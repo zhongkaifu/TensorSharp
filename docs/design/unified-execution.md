@@ -960,7 +960,17 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
   `TSGgml_GraphRun` runs the graph through `tsg::dit_offload_compute` (cuDNN attention, the fused nodes, the
   cuBLAS BF16 / int8 wide products). A served modulation or residual reads its segment table on the host, refilled
   every run. Programs without the attribute and the other backends run the regions' ops (`GraphDitRegions`, the
-  H3 graph's unfused sequence). See [diffusion-runtime.md](diffusion-runtime.md).
+  H3 graph's unfused sequence). Past `tsg_h3_fused_max_segments()` modulation segments no modulation or residual
+  is served, and then (as the native DiT builds the block unfused) no BF16 `SwigluFfn` in that graph either. See
+  [diffusion-runtime.md](diffusion-runtime.md).
+* **ViT decoder regions (CUDA):** `VitAttention` (a ViT's self-attention over equal-length sequences packed along
+  the rows, from the normed input: the interleaved qkv product and its bias, per sequence the gainless q/k norms,
+  the table RoPE and the attention) and `ScaledResidual` (`base + (W act(x) + b) * scale`, a projection or a
+  SwiGLU FFN) are MiniMax-H3-Image's VAE decoder. ggml_cuda serves them in any program as `h3_vit_decode`'s fused
+  nodes: the F16 products on cuBLAS, one cuDNN attention over a row of tiles with the bias in its prep, the scaled
+  residuals (these only where cuDNN takes the attention: the native decoder fuses a block whole or not at all).
+  Elsewhere their ops are the decoder's unfused graph, and its native graph is sized from the program, so any
+  number of tiles decodes on ggml_metal and ggml_cpu.
 * **DiT attention on every GGML backend:** `DitAttention` (the unmasked attention of a packed sequence, nested in
   `TableRopeQkNorm`'s attend form and used alone by a token refiner) is *lowered*, not served: the builder
   builds MiniMax-H3's own attention nodes from the region's inputs (`ggml_h3_attention.h`'s `h3_attend`, shared
@@ -971,7 +981,8 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
 * **Weight preload:** `IGraphExecutor.Preload(weights)` makes a component's weights resident before its first
   program binds them. On GGML it is `TSGgml_GraphPreloadWeights`: MiniMax-H3's uploader (`ggml_h3_upload.h`:
   direct reads from a registered file mapping, else prefaulted parallel copies) into the device copies a weight
-  leaf of the same host bytes binds. MiniMax-H3-Image's denoiser calls it once before its first step.
+  leaf of the same host bytes binds. MiniMax-H3-Image's denoiser and VAE decoder call it once before their first
+  program.
 * **Copies run when forced:** a `Cpy` runs when an effect, an alias or a reader asks for it, as ggml
   schedules it. A streamed step used to run each copy as it was emitted, so an alias's fallback copy ran
   ahead of the alias the executor could have honoured.
