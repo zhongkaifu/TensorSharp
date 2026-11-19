@@ -1511,6 +1511,87 @@ __device__ __forceinline__ void ts_dsv4_gemv_block_rows(
     }
 }
 
+// ts_dsv4_gemv_block_rows<MAXR, true> over OUTS outputs a block: each output's sum is that kernel's bit for bit (thread t
+// sums elements t, t + T, ... of the row in order with the same expression, the warps' sums are added in warp order), and a
+// thread's activation float4s serve all OUTS outputs. Each output's rows are reduced across the warp by one reduce-scatter
+// (ts_dsv4_rows_reduce_scatter: every add the butterfly's own, so each row's sum is ts_dsv4_warp_sum's bits) instead of a
+// warp sum a row - 16 rows took 80 shuffles an output a warp, a reduce-scatter 16. A block an output with a
+// warp sum a row held a 16-sequence LFM3-1.7B BF16 decode step's products at 19.8 ms on an A40 (B0 census), the weights'
+// reads ~4.6 ms of it.
+template <int MAXR, int OUTS>
+__device__ __forceinline__ void ts_dsv4_gemv_block_bf16_outs(
+    const float* __restrict__ x, const unsigned short* __restrict__ w, float* __restrict__ y, const int inDim, const int outDim,
+    const int rows)
+{
+    const int o0 = blockIdx.x * OUTS;
+    const int n4 = inDim / 4;
+    float acc[OUTS][MAXR];
+#pragma unroll
+    for (int u = 0; u < OUTS; ++u)
+#pragma unroll
+        for (int r = 0; r < MAXR; ++r)
+            acc[u][r] = 0.0f;
+    for (int i = threadIdx.x; i < n4; i += TS_DSV4_GEMV_BLOCK_T)
+    {
+        float4 b[OUTS];
+#pragma unroll
+        for (int u = 0; u < OUTS; ++u)
+        {
+            const int o = min(o0 + u, outDim - 1);
+            const uint2 p = ((const uint2*)(w + (size_t)o * inDim))[i];
+            b[u].x = __uint_as_float(p.x << 16);
+            b[u].y = __uint_as_float(p.x & 0xffff0000u);
+            b[u].z = __uint_as_float(p.y << 16);
+            b[u].w = __uint_as_float(p.y & 0xffff0000u);
+        }
+#pragma unroll
+        for (int r = 0; r < MAXR; ++r)
+        {
+            if (r >= rows)
+                break;
+            const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
+#pragma unroll
+            for (int u = 0; u < OUTS; ++u)
+                acc[u][r] += a.x * b[u].x + a.y * b[u].y + a.z * b[u].z + a.w * b[u].w;
+        }
+    }
+    __shared__ float part[TS_DSV4_GEMV_BLOCK_T / 32][OUTS][MAXR];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+#pragma unroll
+    for (int u = 0; u < OUTS; ++u)
+    {
+        int hr;
+        const float hv = ts_dsv4_rows_reduce_scatter<MAXR>(acc[u], lane, &hr);
+        if (lane == __ffs(__match_any_sync(0xffffffffu, hr)) - 1)
+            part[warp][u][hr] = hv;
+    }
+    __syncthreads();
+    if (threadIdx.x < OUTS * MAXR)
+    {
+        const int u = threadIdx.x / MAXR, r = threadIdx.x % MAXR;
+        if (r < rows && o0 + u < outDim)
+        {
+            float s = 0.0f;
+#pragma unroll
+            for (int k = 0; k < TS_DSV4_GEMV_BLOCK_T / 32; ++k)
+                s += part[k][u][r];
+            y[(size_t)r * outDim + o0 + u] = s;
+        }
+    }
+}
+
+#define TS_DSV4_GEMV_BLOCK_OUTS(R, O)                                                                                  \
+    extern "C" __global__ void __launch_bounds__(TS_DSV4_GEMV_BLOCK_T) ts_dsv4_gemv_block_bf16_##R##_x##O##_rs_f32(    \
+        const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)                            \
+    { TS_PDL_ENTRY(); ts_dsv4_gemv_block_bf16_outs<R, O>(x, w, y, inDim, outDim, rows); }
+// The forms GemvBf16 takes (A40, graph-captured us a call, block-per-output / this; 2048 -> 8192, 8192 -> 2048, 2048 ->
+// 2050): 16 rows 193.9 / 114.5, 216.8 / 180.2, 53.7 / 33.0 over 2 outputs; 8 rows 76.7 / 62.1, 113.1 / 102.3, 23.1 / 21.1
+// over 4. A warp sum a row over 4 or 8 outputs gained at most 17% (157.7 at 16 rows), one output with a reduce-scatter
+// 30% (135.7).
+TS_DSV4_GEMV_BLOCK_OUTS(8, 4)
+TS_DSV4_GEMV_BLOCK_OUTS(16, 2)
+#undef TS_DSV4_GEMV_BLOCK_OUTS
+
 #define TS_DSV4_GEMV_BLOCK(R)                                                                                          \
     extern "C" __global__ void __launch_bounds__(TS_DSV4_GEMV_BLOCK_T) ts_dsv4_gemv_block_##R##_f32(                   \
         const float* x, const float* w, float* y, int inDim, int outDim, int rows)                                     \

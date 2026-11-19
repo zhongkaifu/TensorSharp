@@ -10,6 +10,7 @@
 // tensorsharp_dsv4_kernels.ptx). One instance per device; the module is
 // loaded against whichever context is current at construction time.
 using System;
+using System.Collections.Generic;
 using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
@@ -143,6 +144,10 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] gemvWarpBf16;
         // The block-per-output GEMV, F32 and BF16 weights (null on a module without it).
         private readonly IntPtr[] gemvBlock, gemvBlockBf16;
+        // The BF16 block GEMV over several outputs a block, the same bits (ts_dsv4_gemv_block_bf16_outs), by name
+        // ("8_x4_rs": up to 8 rows over 4 outputs a block, rows reduced by one reduce-scatter); empty on a module without
+        // them.
+        private readonly Dictionary<string, IntPtr> gemvBf16Outs = new();
         // TS_DSV4_GEMV_BLOCK=0: wide outputs keep a warp each (the sums' order differs).
         private static readonly bool _gemvBlockEnv = Environment.GetEnvironmentVariable("TS_DSV4_GEMV_BLOCK") != "0";
 
@@ -222,6 +227,11 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500)
             {
                 gemvBlock = gemvBlockBf16 = null;
+            }
+            foreach (string name in GemvBf16OutputVariants)
+            {
+                try { gemvBf16Outs[name] = module.GetFunction($"ts_dsv4_gemv_block_bf16_{name}_f32"); }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { }
             }
             gemvCombine = module.GetFunction("ts_dsv4_gemv_combine_f32");
             hcRms = module.GetFunction("ts_dsv4_hc_rms_f32");
@@ -1376,9 +1386,37 @@ namespace TensorSharp.Cuda
             int w3 = inDim, w4 = outDim, w5 = rows;
             void** wargs = stackalloc void*[] { &w0, &w1, &w2, &w3, &w4, &w5 };
             if (gemvBlockBf16 != null && _gemvBlockEnv)
-                Launch(gemvBlockBf16[RowBoundIndex(rows)], (uint)outDim, 1, 1, GemvBlockThreads, 0, stream, wargs);
+            {
+                // Five rows or more: several outputs a block, the block-per-output kernel's bits (one activation read serves
+                // them all).
+                (IntPtr outs, int count) = rows > 4 ? GemvBf16Outputs(rows) : (IntPtr.Zero, 0);
+                if (outs != IntPtr.Zero)
+                    Launch(outs, (uint)((outDim + count - 1) / count), 1, 1, GemvBlockThreads, 0, stream, wargs);
+                else
+                    Launch(gemvBlockBf16[RowBoundIndex(rows)], (uint)outDim, 1, 1, GemvBlockThreads, 0, stream, wargs);
+            }
             else
                 Launch(gemvWarpBf16[RowBoundIndex(rows)], (uint)((outDim + 3) / 4), 1, 1, 128, 0, stream, wargs);
+        }
+
+        /// <summary>The several-outputs forms of the BF16 block GEMV, by kernel name between "ts_dsv4_gemv_block_bf16_" and
+        /// "_f32": rows bound, outputs a block, the rows reduced by a reduce-scatter.</summary>
+        internal static readonly string[] GemvBf16OutputVariants = { "8_x4_rs", "16_x2_rs" };
+
+        /// <summary>The forms <see cref="GemvBf16"/> takes for 5 to 8 and for 9 to 16 rows.</summary>
+        private static readonly (string Rows8, string Rows16) GemvBf16Default = ("8_x4_rs", "16_x2_rs");
+
+        /// <summary>Tests: the forms <see cref="GemvBf16"/> takes for 5 to 8 and 9 to 16 rows (variant names, null for the
+        /// block-per-output kernel); null for the default.</summary>
+        internal (string Rows8, string Rows16)? GemvBf16VariantForTests { get; set; }
+
+        private (IntPtr Kernel, int Outputs) GemvBf16Outputs(int rows)
+        {
+            (string rows8, string rows16) = GemvBf16VariantForTests ?? GemvBf16Default;
+            string name = rows <= 8 ? rows8 : rows16;
+            if (name == null || !gemvBf16Outs.TryGetValue(name, out IntPtr fn)) return (IntPtr.Zero, 0);
+            int x = name.IndexOf("_x", StringComparison.Ordinal) + 2, end = name.IndexOf('_', x);
+            return (fn, int.Parse(end < 0 ? name[x..] : name[x..end]));
         }
 
         public void Gemv(IntPtr x, IntPtr w, IntPtr y, int inDim, int outDim, int rows, IntPtr stream, IntPtr scratch,
