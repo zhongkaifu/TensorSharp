@@ -17,7 +17,8 @@ MiniMaxH3ImageAB --parity-dump directory and compares:
                augmentation) and the target's noise, in diffusers' draw order, from diffusers' own moments
   layout       build_image_packed_sequence's positions (float32) and tags against TensorSharp's
   step         (--transformer DIR) the first step's velocity of the official bf16 transformer_diffusers, its blocks
-               streamed to the GPU one at a time, given TensorSharp's conditioning, reference rows and target noise
+               streamed to the GPU one at a time, given TensorSharp's conditioning, reference rows and target noise;
+               with --pruned FILE also in float32 (TF32 off), with the official and with the pruned checkpoint's AdaLN
 
     python -I diffusers_parity.py --dump DIR --official /root/models/h3img/official \
         --comfy-vae minimax_h3_image_vae_fp16.safetensors [--transformer DIR/transformer_diffusers] --out report.json
@@ -90,6 +91,8 @@ def main():
     ap.add_argument("--official", required=True)
     ap.add_argument("--comfy-vae")
     ap.add_argument("--transformer")
+    ap.add_argument("--pruned", help="Comfy-Org's pruned bf16 DiT (its curve-table AdaLN): with --transformer, the step "
+                                     "also runs in float32 with the official and with the pruned modulation")
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -291,10 +294,11 @@ def step_parity(args, req, dump, pos, tok, img_idx, txt_idx, nref, device):
     for name, child in model.named_children():
         if name != "transformer_blocks":
             materialize(name + ".", child)
-    for i, block in enumerate(model.transformer_blocks):
-        prefix = f"transformer_blocks.{i}."
-        block.register_forward_pre_hook(lambda m, a, p=prefix: materialize(p, m))
-        block.register_forward_hook(lambda m, a, o, p=prefix: release(p, m))
+    if not args.pruned:
+        for i, block in enumerate(model.transformer_blocks):
+            prefix = f"transformer_blocks.{i}."
+            block.register_forward_pre_hook(lambda m, a, p=prefix: materialize(p, m))
+            block.register_forward_hook(lambda m, a, o, p=prefix: release(p, m))
     # Buffers the checkpoint does not hold (the rope's frequencies) keep the module's own values, on the device.
     for name, buf in list(model.named_buffers()):
         if buf.is_meta:
@@ -311,6 +315,9 @@ def step_parity(args, req, dump, pos, tok, img_idx, txt_idx, nref, device):
     row[img_idx[:nref]] = 0.999
     uniq, inv = torch.unique(row, sorted=True, return_inverse=True)
     import time
+    if args.pruned:
+        return step_variants(args, dump, model, materialize, release, hidden, image_rows, uniq, inv, tok, pos, img_idx,
+                             txt_idx, nref, device)
     t0 = time.time()
     with torch.no_grad():
         out = model(hidden_states=image_rows, encoder_hidden_states=hidden.to(torch.bfloat16), timestep=uniq.to(device),
@@ -323,6 +330,104 @@ def step_parity(args, req, dump, pos, tok, img_idx, txt_idx, nref, device):
     s_neg = stats(-v, ts)
     return {"seconds": seconds, "ts_vs_diffusers": s, "ts_vs_negated_diffusers_cosine": s_neg["cosine"],
             "unique_timesteps": uniq.tolist()}
+
+
+def step_variants(args, dump, model, materialize, release, hidden, image_rows, uniq, inv, tok, pos, img_idx, txt_idx, nref,
+                  device):
+    """The first step three ways in one pass over the streamed blocks (each block read once): as released (bf16,
+    the module's own forward order), in float32 (TF32 off) with the official modulation, and in float32 with the
+    pruned checkpoint's modulation (its 1025-entry curve table, interpolated as TensorSharp does, through the
+    rank-8 adaln_proj). Separates the reference's own bf16 rounding and the pruned AdaLN from TensorSharp's arithmetic."""
+    import copy
+    import time
+    import torch.nn.functional as F
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    pr = safe_open(args.pruned, "pt", device="cpu")
+    table = pr.get_tensor("adaln_t_table").float()                      # [1025, 8]
+    grid = table.shape[0]
+
+    def curve(t):
+        p = min(max(float(t), 0.0), 1.0) * (grid - 1)
+        lo = min(max(int(np.floor(p)), 0), grid - 2)
+        f = p - lo
+        return table[lo] * (1.0 - f) + table[lo + 1] * f
+
+    temb8 = torch.stack([curve(t) for t in uniq.tolist()]).to(device)  # [T, 8]
+
+    def pruned_linear(prefix):
+        return (pr.get_tensor(prefix + "adaln_proj.linear.weight").float().to(device),
+                pr.get_tensor(prefix + "adaln_proj.linear.bias").float().to(device))
+
+    ts = f32(os.path.join(dump, "velocity.f32"), (-1, 96))
+    dev = lambda x: x.to(device)
+    ti, tags, positions, ii, xi = dev(inv), dev(tok), dev(pos.to(torch.float32)), dev(img_idx), dev(txt_idx)
+    t0 = time.time()
+    mods = []
+    with torch.no_grad():
+        rotary = model.rope(positions)
+        adaln_indices = ti * 3 + tags
+        bf = lambda m: next(m.parameters()).dtype
+
+        def embed(ctx_embedder, refiner, dtype):
+            image = model.proj_in(image_rows.to(bf(model.proj_in)))
+            text = refiner(ctx_embedder(hidden.to(dtype)))
+            h = text.new_zeros((1, positions.shape[0], text.shape[-1]))
+            h = h.index_copy(1, xi, text)
+            return h.index_copy(1, ii, image.to(text.dtype))
+
+        temb = model.time_embedder(model.time_proj(dev(uniq)).to(bf(model.time_embedder)))
+        ctx32, ref32 = copy.deepcopy(model.context_embedder).float(), copy.deepcopy(model.token_refiner).float()
+        norm32 = copy.deepcopy(model.norm_out).float()
+        h_rel = embed(model.context_embedder, model.token_refiner, bf(model.context_embedder))
+        h_f32 = embed(ctx32, ref32, torch.float32)
+        h_pr = h_f32.clone()
+        temb32 = temb.float()
+        for i, block in enumerate(model.transformer_blocks):
+            prefix = f"transformer_blocks.{i}."
+            materialize(prefix, block)
+            h_rel = block(h_rel, temb, adaln_indices, rotary)
+            block.float()
+            h_f32 = block(h_f32, temb32, adaln_indices, rotary)
+            w, b = pruned_linear(f"blocks.{i}.")
+            official = torch.cat(block.adaln_proj(temb32), dim=-1)
+            pruned = F.linear(temb8, w, b).view(-1, 6 * block.adaln_proj.hidden_size)
+            pruned_chunks = pruned.chunk(6, dim=-1)
+            mods.append(stats(official.cpu().numpy(), torch.cat(pruned_chunks, dim=-1).cpu().numpy())["rel_l2"])
+            block.adaln_proj.forward = lambda e, c=pruned_chunks: c
+            h_pr = block(h_pr, temb32, adaln_indices, rotary)
+            del block.adaln_proj.forward
+            release(prefix, block)
+            del w, b, official, pruned, pruned_chunks
+            print(f"[step] block {i} modulation rel_l2 {mods[-1]:.3e}", flush=True)
+
+        head = model.pdd_proj_out[0]
+        rel = head(model.norm_out(h_rel, temb, ti).to(bf(head))).index_select(1, ii)
+        f32v = head(norm32(h_f32, temb32, ti).to(bf(head))).index_select(1, ii)
+        fw, fb = (pr.get_tensor("final_layer.adaln_proj.linear.weight").float().to(device),
+                  pr.get_tensor("final_layer.adaln_proj.linear.bias").float().to(device))
+        shift, scale = F.linear(temb8, fw, fb).chunk(2, dim=-1)
+        official_final = torch.cat(norm32.linear(F.silu(temb32)).chunk(2, dim=-1), dim=-1)
+        final_mod = stats(official_final.cpu().numpy(), torch.cat([shift, scale], dim=-1).cpu().numpy())
+        hp = norm32.norm(h_pr) * (1.0 + scale.index_select(0, ti)) + shift.index_select(0, ti)
+        prv = head(hp.to(bf(head))).index_select(1, ii)
+    seconds = time.time() - t0
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    vel = {}
+    for name, o in (("released_bf16", rel), ("float32", f32v), ("float32_pruned_adaln", prv)):
+        vel[name] = -o[0, nref:].float().cpu().numpy()      # diffusers' transformer returns the negated velocity
+        np.save(os.path.join(out_dir, f"step-{name}.npy"), vel[name])
+    return {
+        "seconds": seconds,
+        "sign": "TensorSharp's velocity is the negation of the transformer's output; compared after negating",
+        "ts_vs": {k: stats(v, ts) for k, v in vel.items()},
+        "released_bf16_vs_float32": stats(vel["float32"], vel["released_bf16"]),
+        "float32_pruned_vs_float32": stats(vel["float32"], vel["float32_pruned_adaln"]),
+        "modulation_rel_l2": {"blocks_max": max(mods), "blocks_mean": float(np.mean(mods)), "blocks": mods,
+                              "final": final_mod["rel_l2"]},
+        "unique_timesteps": uniq.tolist(),
+    }
 
 
 if __name__ == "__main__":
