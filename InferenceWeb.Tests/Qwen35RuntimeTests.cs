@@ -2172,8 +2172,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
     /// <summary>The same over a q8_0 cache (an explicit <c>--kv-cache-dtype q8_0</c>: the CUDA executor's _q8 flash kernels and
     /// q8_0 row writes, the verify windows' rows the decode rows' bits): the plain greedy streams. Every model of both runs held
     /// the q8_0 cache, ran graphs, and sent no attention to the generic or tiled path
-    /// (<see cref="CudaQ8KvAttentionRoutesTests.AssertFlashKernelsOnly"/>).</summary>
-    [CudaTheory]
+    /// (<see cref="CudaQ8KvAttentionRoutesTests.AssertFlashKernelsOnly"/>). Skips where the flash kernels have no sm_80 bodies: the
+    /// executor then takes no q8_0 cache and the model runs no graphs, so no verify window is batched.</summary>
+    [CudaTheory(TensorCoreModule = "tensorsharp_flash_prefill")]
     [InlineData("dense", SpeculatorRegistry.NGram)]
     [InlineData("dense-nextn", SpeculatorRegistry.DraftHead)]
     public async Task EngineSpeculationOnDirectCudaMatchesPlainOverAQ8Cache(string variant, string speculator)

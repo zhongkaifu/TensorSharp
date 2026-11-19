@@ -18,10 +18,13 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// A q8_0 K/V cache on direct CUDA (<c>--kv-cache-dtype q8_0</c>) keeps every attention of the families whose routes are the plain
 /// attention and row writes on the CUDA executor's flash kernels: prompt chunks, short prompt tails (the window rows) and decode
-/// rows run as whole-forward graphs over the q8_0 rows, and none of them takes the generic or tiled path. That path widens the
-/// window to F32 and warns once (<see cref="CudaGraphExecutor.Q8GenericAttentions"/> counts it): the output stays right, so before
-/// this test a regression there showed only as the stderr line and as speed. Verify windows over a q8_0 cache are
-/// <see cref="Qwen35RuntimeTests.EngineSpeculationOnDirectCudaMatchesPlainOverAQ8Cache"/>'s, which asserts the same.
+/// rows each run as a whole-forward graph over the q8_0 rows (Qwen 3.5 dense's decode steps recorded on the device), and none
+/// of them takes the generic or tiled path. That path widens the window to F32 and warns once
+/// (<see cref="CudaGraphExecutor.Q8GenericAttentions"/> counts it): the output stays right, so before this test a regression there
+/// showed only as the stderr line and as speed. Verify windows over a q8_0 cache are
+/// <see cref="Qwen35RuntimeTests.EngineSpeculationOnDirectCudaMatchesPlainOverAQ8Cache"/>'s, which asserts the same. The executor
+/// takes a q8_0 cache only where its flash kernels have their sm_80 bodies (an nvcc build for an sm_80+ GPU), so elsewhere these
+/// tests skip, as the kernels' own tests do.
 /// </summary>
 public sealed class CudaQ8KvAttentionRoutesTests : IDisposable
 {
@@ -56,23 +59,37 @@ public sealed class CudaQ8KvAttentionRoutesTests : IDisposable
         _ => throw new ArgumentOutOfRangeException(nameof(family)),
     };
 
-    [CudaTheory]
-    [InlineData("qwen35")]
-    [InlineData("qwen35moe")]
-    [InlineData("mistral3")]
-    [InlineData("hunyuan")]
-    public void EveryAttentionOverAQ8CacheRunsOnTheFlashKernels(string family)
+    /// <param name="recordsDecode">Whether the fixture's decode steps record on the device (the Qwen 3.5 line advances them): their
+    /// attention then runs from a recording, reading its length on the device. The synthetic MoE's decode steps run unrecorded
+    /// with an F16 cache as well (0 recordings either way on an RTX PRO 4500), so only the dense fixture asserts it.</param>
+    [CudaTheory(TensorCoreModule = "tensorsharp_flash_prefill")]
+    [InlineData("qwen35", true)]
+    [InlineData("qwen35moe", false)]
+    [InlineData("mistral3", false)]
+    [InlineData("hunyuan", false)]
+    public void EveryAttentionOverAQ8CacheRunsOnTheFlashKernels(string family, bool recordsDecode)
     {
         string path = Write(family);
         using IDisposable kv = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0);
         using var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda);
         Q8Watch watch = Watch(model);
-        // 300 prompt rows (the prompt kernel), a 4-row prompt tail (the window rows), then decode rows (recorded after their first).
+        // 300 prompt rows (the prompt kernel), a 4-row prompt tail (the window rows), then 24 decode rows: each a graph (a step the
+        // lowering rejects runs per op without a word, and the executor's counter never sees its attention).
+        int before = model.GraphRuns;
         model.ForwardPrompt(Enumerable.Range(0, 300).Select(i => 3 + (i * 37) % 200).ToArray());
+        int prompt = model.GraphRuns - before;
         model.ForwardPrompt(new[] { 7, 11, 13, 17 });
+        int tail = model.GraphRuns - before - prompt;
         for (int t = 0; t < 24; t++)
             model.Forward(new[] { 5 + (t * 13) % 190 });
+        int decode = model.GraphRuns - before - prompt - tail;
+        _output.WriteLine($"{family}: graph runs {prompt} prompt, {tail} tail, {decode} decode; {model.DecodeRecordings} decode recordings");
         AssertFlashKernelsOnly(watch, family, _output);
+        Assert.True(prompt >= 1, $"{family}: the 300-row prompt ran no graph");
+        Assert.Equal(1, tail);
+        Assert.Equal(24, decode);
+        if (recordsDecode)
+            Assert.True(model.DecodeRecordings > 0, $"{family}: no decode step was recorded over the q8_0 cache");
     }
 
     /// <summary>What <see cref="AssertFlashKernelsOnly"/> reads of a model, taken where it is created: its graph executor (a disposed
