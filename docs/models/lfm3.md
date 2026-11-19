@@ -33,8 +33,8 @@ items below and under [Benchmarking](#benchmarking)):
 | MLX (M5 Pro) | Omni image and audio replies token-identical in 18 of 19 cases | prompts 1.12x at 512 tokens, decode 0.87x | - |
 | ggml_cpu (M5 Pro) | at the CPU lanes' 8-bit-activation floor (1.03-1.16x llama.cpp's own kernel variants' distance); GSM8K 79.0% against 81.0% (p = 0.50) | decode 0.97-1.14x (BF16 3.9x), prompts 0.95-1.00x (NVFP4 1.9-2.6x) | one stream: first token 0.95x the time, decode 0.96x; four streams 1.17x llama-server's aggregate; against vLLM's CPU backend (fp16): first token 0.30x the time, decode 5.6x, four streams 3.5x (medians; 2 of the 5 one-stream rounds ran 8-10x slower, see [Current limits](#current-limits)) |
 | cpu, managed (M5 Pro) | 1.17-1.37x that floor; GSM8K 80.0% (p = 0.82) | decode 0.78-0.95x (BF16 3.7x), prompts 0.86-0.92x (NVFP4 1.6-2.2x, BF16 0.44x) | one stream: decode 0.83x, first token at parity; four streams 1.06x |
-| ggml_cuda (A40; RTX PRO 4500) | perplexity within 0.4% (A40) and 0.13% (sm_120; NVFP4's W4A4 prompts +0.4% against llama.cpp's W4A4) | A40 0.99-1.17x (NVFP4 prompts 0.89-0.91x); sm_120 0.92-1.01x (NVFP4 prompts 0.86-0.90x) | A40, BF16: faster than vLLM and SGLang at one request (6.7 against 7.3 / 7.2 ms a token), behind from 4 requests (51 against 11.0 ms at 64); Q4_K_M ahead of llama-server at 1-16 requests |
-| cuda, direct (A40; RTX PRO 4500) | as ggml_cuda (NVFP4's W4A4 prompts +0.7% on sm_120) | prompts 0.58-0.95x, decode 0.78-0.95x; QAD-Q4_0 decode 0.56-0.61x (A40) | A40, BF16: one request 7.0 ms a token (vLLM 7.3), behind from 4 requests (68 against 11.0 ms at 64) |
+| ggml_cuda (A40; RTX PRO 4500) | perplexity within 0.4% (A40) and 0.13% (sm_120; NVFP4's W4A4 prompts +0.4% against llama.cpp's W4A4) | A40 0.99-1.17x (NVFP4 prompts 0.89-0.91x); sm_120 0.92-1.01x (NVFP4 prompts 0.86-0.90x) | A40, BF16: faster than vLLM and SGLang at one request (6.5 against 7.3 / 7.2 ms a token), at parity at 4 (7.6 against 7.6), behind at 16 / 64 (11.0 / 26.6 against 8.1 / 11.0 ms); Q4_K_M ahead of llama-server at 1-16 requests |
+| cuda, direct (A40; RTX PRO 4500) | as ggml_cuda (NVFP4's W4A4 prompts +0.7% on sm_120) | prompts 0.58-0.95x, decode 0.78-0.95x; QAD-Q4_0 decode 0.56-0.61x (A40) | A40, BF16: one request 7.0 ms a token (vLLM 7.3), behind from 4 requests (21.5 / 40.3 against 8.1 / 11.0 ms at 16 / 64) |
 | ggml_vulkan (A40; RTX PRO 4500) | A40: 0-1 top-1 differences in 320 rows; sm_120: NVFP4 perplexity 26.51, as llama.cpp CUDA's q8 route | A40: 0.80-0.98x on the quantized files, BF16 0.92-1.01x, NVFP4 0.89-1.08x | not measured |
 
 Details (llama.cpp reference `d3c3e242c`):
@@ -114,10 +114,14 @@ Details (llama.cpp reference `d3c3e242c`):
   caching off; BF16 against vLLM 0.34 and SGLang, whose short convolution takes its torch fallback on
   this GPU):** one request at a time, ggml_cuda decodes faster (6.7 ms a token against 7.3 and 7.2)
   and a 128-token prompt's first token comes sooner (26 ms against 56 and 43), but a 4K-token prompt's
-  comes later (275 ms against 204 and 192). Under concurrency the server falls behind: 9.4 / 17.4 /
-  51 ms a token at 4 / 16 / 64 requests against vLLM's 7.6 / 8.1 / 11.0, about a fifth of its output
-  at 64 (1,203 against 5,506 tokens/s), because a batched step still runs each sequence's attention
-  and short convolution as ops of its own. The server holds 4-6 GB of GPU memory (ggml_cuda) where
+  comes later (275 ms against 204 and 192). Under concurrency the server falls behind from 16 requests:
+  7.6 / 11.0 / 26.6 ms a token at 4 / 16 / 64 requests against vLLM's 7.6 / 8.1 / 11.0, 42% of its
+  output at 64 (2,314 against 5,495 tokens/s; 2026-11-19, two rounds, after the device's greedy ids, one
+  upload of a step's inputs, the short convolutions' products over the step's rows and balanced joins: 9.2
+  / 16.8 / 49.6 ms before), because a batched step still runs each sequence's attention and short convolution
+  as ops of its own. Direct cuda: 9.1 / 21.5 / 40.3 ms (28.9 / 67.3 at 16 / 64 before its batched steps
+  recorded past 16 sequences and its BF16 products of 5-16 rows reduced each output in one
+  reduce-scatter). The server holds 4-6 GB of GPU memory (ggml_cuda) where
   vLLM and SGLang reserve about 40 GB. Against llama-server on Q4_K_M (CUDA build, as many slots as
   requests) both TensorSharp lanes decode faster at 1, 4 and 16 concurrent requests (ggml_cuda 3.0 /
   5.8 / 14.1 ms a token against 3.8 / 7.0 / 20.1).
@@ -699,16 +703,17 @@ results). In the same session ggml_metal ran Q4_K_M pp512 / tg128 at 6,041 / 191
 - Speech output has no realtime endpoint (`/v1/realtime`), and a text turn after a spoken one
   re-prefills from the system prompt, which names the voice only on spoken turns (see
   [Speech output](#speech-output)).
-- Many concurrent requests decode slower than vLLM and SGLang (A40: 17.4 / 51 ms a token at 16 / 64
-  requests against vLLM's 8.1 / 11.0): a batched step runs each sequence's attention and short
-  convolution as ops of its own (about 128 kernels a sequence on ggml_cuda), and is traced again whenever
-  a request joins or leaves. A design for grouped steps is drafted, not built: decode and verify rows
-  grouped by row count, the short convolutions' windows in one pool per layer, row-list attention
-  (upstream `ggml_flash_attn_ext_rows`) on the ggml lanes and a per-step sequence table on direct CUDA,
-  so a batched graph depends on its group shapes only and its recording outlives requests. Its first
-  stages are bit-identical; the attention stage changes arithmetic on the ggml lanes and will be a
-  labelled default change. Its estimate (not measured): 7-8 / 8.5-10.5 ms a token at 16 / 64 requests
-  on the A40. One request at a time is unchanged by it.
+- Many concurrent requests decode slower than vLLM and SGLang (A40: 11.0 / 26.6 ms a token at 16 / 64
+  requests on ggml_cuda, 21.5 / 40.3 on direct cuda, against vLLM's 8.1 / 11.0): a batched step runs each
+  sequence's attention, K/V writes and short-convolution window as ops of its own, and is traced again
+  whenever a request joins or leaves. The grouped-steps design's first, bit-identical stages are in (the
+  device's greedy ids on ggml-cuda and ggml-vulkan, a step's inputs uploaded in one copy, the short
+  convolutions' products over the step's rows, balanced joins, direct-CUDA recordings of up to 256
+  sequences, row-invariant BF16 products of 5-16 rows 1.1-1.75x as fast); the short convolutions'
+  windows in one pool per layer and row-list attention (upstream `ggml_flash_attn_ext_rows`) on the ggml
+  lanes, a per-step sequence table on direct CUDA, are not built. On direct CUDA, 17-32 rows still take
+  two 16-row products per weight (a 32-sequence step is slower than a 64-sequence one, which takes
+  cuBLAS). One request at a time is unchanged.
 - NVFP4 on a Blackwell GPU (sm_100 / sm_120) runs its prompt products as W4A4, the activations quantized to
   NVFP4 too, as llama.cpp's CUDA build does by default: perplexity +3.3% (ggml_cuda) and +3.6% (direct cuda)
   against q8 activations, for prompts 1.5x faster. Only ggml_cuda can take q8 activations (ggml's own
