@@ -140,8 +140,15 @@ namespace TensorSharp.Cuda
         public bool PromptAccumulatesInF32 { get; }
 
         /// <summary>The tensor cores' F16 rate with F32 accumulation over their rate with F16 accumulation, timed once when the
-        /// module loads (ts_flash_prefill_mma_rate, the faster of three runs each, alternating); 0 where it cannot run.</summary>
+        /// module loads (ts_flash_prefill_mma_rate, the faster of three runs each, alternating); 0 where it cannot run: a module
+        /// from before the probe, or a probe that fails (no device room for its 4-byte sink, a failed event or launch). The
+        /// probe only describes the device, so its failure never refuses the module (<see cref="CudaPrefillModule"/>'s
+        /// TryCreate refuses one whose constructor throws: every flash kernel would go with it).</summary>
         public double F32AccumulationRate { get; }
+
+        /// <summary>Tests: the result code of the rate probe's sink allocation in place of cuMemAlloc's (for example 2,
+        /// CUDA_ERROR_OUT_OF_MEMORY: a full device), for every module loaded while it is set.</summary>
+        internal static Func<int> RateProbeSinkAllocationForTests { get; set; }
 
         /// <summary><see cref="F32AccumulationRate"/> of the current context's device. Requires the module's context to be
         /// current; synchronous (about a millisecond).</summary>
@@ -150,10 +157,10 @@ namespace TensorSharp.Cuda
             IntPtr fn;
             try { fn = module.GetFunction("ts_flash_prefill_mma_rate"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { return 0; } // CUDA_ERROR_NOT_FOUND: a module from before it
-            CudaDriverApi.cuMemAlloc(out IntPtr sink, new UIntPtr(sizeof(float))).ThrowOnError();
-            IntPtr start = IntPtr.Zero, end = IntPtr.Zero;
+            IntPtr sink = IntPtr.Zero, start = IntPtr.Zero, end = IntPtr.Zero;
             try
             {
+                (RateProbeSinkAllocationForTests?.Invoke() ?? CudaDriverApi.cuMemAlloc(out sink, new UIntPtr(sizeof(float)))).ThrowOnError();
                 CudaDriverApi.cuEventCreate(out start, 0).ThrowOnError();
                 CudaDriverApi.cuEventCreate(out end, 0).ThrowOnError();
                 float best16 = float.MaxValue, best32 = float.MaxValue;
@@ -174,11 +181,15 @@ namespace TensorSharp.Cuda
                     }
                 return best32 > 0 ? best16 / best32 : 0;
             }
+            catch (CudaException)
+            {
+                return 0;
+            }
             finally
             {
                 if (start != IntPtr.Zero) CudaDriverApi.cuEventDestroy(start);
                 if (end != IntPtr.Zero) CudaDriverApi.cuEventDestroy(end);
-                CudaDriverApi.cuMemFree(sink);
+                if (sink != IntPtr.Zero) CudaDriverApi.cuMemFree(sink);
             }
         }
 
