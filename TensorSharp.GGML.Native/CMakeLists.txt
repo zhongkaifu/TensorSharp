@@ -329,6 +329,8 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_fused.cpp
     ggml_ops_transformer.cpp
     ggml_ops_graph_builder.cpp
+    ggml_ops_cpu_graph.cpp
+    ggml_ops_cpu_products.cpp
     ggml_ops_transformer_prefill.cpp
     ggml_ops_gptoss_decode.cpp
     ggml_ops_gptoss_batched.cpp
@@ -635,6 +637,15 @@ if (APPLE AND GGML_ACCELERATE)
             ACCELERATE_NEW_LAPACK ACCELERATE_LAPACK_ILP64)
         target_link_libraries(GgmlOps PRIVATE ${TSG_EMBEDDING_ACCELERATE_FRAMEWORK})
     endif()
+endif()
+
+# ggml_ops_cpu_products.cpp holds kernels ggml-cpu's thread pool runs (GGML_OP_CUSTOM nodes), and its NVFP4 GEMM needs the
+# dot-product instructions at compile time. Where a build names ggml-cpu's ARM architecture (GGML_CPU_ARM_ARCH with
+# GGML_NATIVE off: the iOS slices, armv8.2-a+dotprod+fp16) the file is compiled for it too: an iOS device target's default
+# CPU (apple-a7) has no dot product, so that slice left NVFP4 products on ggml's row-at-a-time kernel while ggml-cpu itself
+# runs the dot-product code. Elsewhere the compiler's default target decides (Apple silicon Macs and the simulator: apple-m1).
+if (GGML_CPU_ARM_ARCH AND NOT GGML_NATIVE AND NOT MSVC)
+    set_property(SOURCE ggml_ops_cpu_products.cpp APPEND PROPERTY COMPILE_OPTIONS "-march=${GGML_CPU_ARM_ARCH}")
 endif()
 
 if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)

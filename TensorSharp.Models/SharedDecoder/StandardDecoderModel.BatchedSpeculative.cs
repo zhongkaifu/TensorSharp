@@ -201,7 +201,7 @@ namespace TensorSharp.Models
             {
                 LastRowLogits = false,
                 AllRowLogits = true,
-                GreedyIds = idsOut != null && GraphExecutor.Capabilities.GreedyIdOutputs,
+                GreedyIds = idsOut != null && GraphGreedyIds,
                 CaptureLayers = dflash && featuresOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
                 CaptureFinal = !dflash && featuresOut != null,
                 RecurrentSnapshots = _anyRecurrent && window > 1,

@@ -168,11 +168,15 @@ namespace TensorSharp.Runtime
                 TextFilePaths = msg.TextFilePaths != null ? new List<string>(msg.TextFilePaths) : null,
                 TextFileNames = msg.TextFileNames != null ? new List<string>(msg.TextFileNames) : null,
                 HasFileBackedTextAttachments = msg.HasFileBackedTextAttachments,
+                AttachmentPaths = msg.AttachmentPaths != null ? new List<string>(msg.AttachmentPaths) : null,
+                AttachmentNames = msg.AttachmentNames != null ? new List<string>(msg.AttachmentNames) : null,
                 IsVideo = msg.IsVideo,
+                VideoFilePaths = msg.VideoFilePaths != null ? new List<string>(msg.VideoFilePaths) : null,
                 ToolCalls = msg.ToolCalls != null ? new List<ToolCall>(msg.ToolCalls) : null,
                 ToolCallId = msg.ToolCallId,
                 Thinking = msg.Thinking,
                 RawOutputTokens = msg.RawOutputTokens != null ? new List<int>(msg.RawOutputTokens) : null,
+                SpeechFrames = msg.SpeechFrames,
                 RawPromptTrailingWhitespace = msg.RawPromptTrailingWhitespace,
                 CacheControl = msg.CacheControl != null
                     ? new CacheControlMarker { Type = msg.CacheControl.Type }

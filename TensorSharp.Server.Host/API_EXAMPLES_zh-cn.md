@@ -770,6 +770,36 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 并各自带上以秒为单位的源时间，所以这是抽帧而不是时序编码器。远程 HTTP URL 不会被拉取，
 请发送 data URI。带音频的部分以 HTTP 400 拒绝，而不是被丢弃。
 
+### Chat Completions + 图像、视频与音频（LFM3-Omni）
+
+带投影器（`--mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf`）的 LFM3-Omni-2B 可以在一条消息中接收图像、音频与视频。
+`video_url` 片段会被保存并由模型自己读取：每秒 2 帧（最多 384 帧）并带上音轨，与 llama.cpp 和 Hugging Face
+的读取方式相同，因此 `fps` / `max_frames` 不起作用，宿主也不抽帧。没有投影器（或使用 LFM3-1.7B）时，
+所有媒体片段都以 HTTP 400 拒绝。
+
+```bash
+VID_B64=$(base64 < clip.mp4 | tr -d '\n')
+WAV_B64=$(base64 < question.wav | tr -d '\n')
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"LFM3-Omni-2B-Q4_K_M.gguf\",
+    \"messages\": [
+      {\"role\": \"system\", \"content\": \"Answer questions about the video using what you see and hear.\"},
+      {\"role\": \"user\", \"content\": [
+        {\"type\": \"video_url\", \"video_url\": {\"url\": \"data:video/mp4;base64,$VID_B64\"}},
+        {\"type\": \"input_audio\", \"input_audio\": {\"data\": \"$WAV_B64\", \"format\": \"wav\"}},
+        {\"type\": \"text\", \"text\": \"回答音频里关于这段视频的问题。\"}
+      ]}
+    ],
+    \"temperature\": 0,
+    \"max_tokens\": 200
+  }"
+```
+
+模型看到的一条消息中，媒体在文本之前：先静态图，再视频，然后是音频。语音识别请使用系统提示 `Perform ASR in English.`
+（或其他语言），并只发送音频。见[模型卡](../docs/models/lfm3_zh-cn.md#媒体输入)。
+
 ### Chat Completions + 工具调用
 
 ```bash
@@ -953,6 +983,12 @@ curl -X POST http://localhost:5000/v1/responses \
 `TS_RESPONSES_STORE_REDIS_URL` 则改存 Redis。每个请求都是自包含的：`previous_response_id`
 会以 HTTP 400 拒绝，请在 `input` 中带上之前的轮次。`text.format` 不能与 `reasoning` 或
 `tools` 同时使用（HTTP 400）。
+
+消息项同样接受媒体内容片段：`{"type": "input_image", "image_url": "data:image/...;base64,..."}`、
+`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`，以及对接受 Chat Completions
+`video_url` 的模型族（DeepSeek V4.1、Qwen 3.8 Flash Next、LFM3-Omni）使用
+`{"type": "input_video", "input_video": {"url": "data:video/mp4;base64,...", "fps": 1, "max_frames": 16}}`——
+即 embeddings API 的 `input_video` 片段，并带有 `video_url` 的可选抽帧字段。其他模型族以 HTTP 400 拒绝 `input_video`。
 
 ### 子智能体（`multi_agent`）
 
@@ -1165,7 +1201,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`，以及[技能](#技能apiskills)一节介绍的 `skills` 块。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"ltx-2.5"`、`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsKeyframeConditioning`、`defaultPreviewFrames`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`、[技能](#技能apiskills)一节介绍的 `skills` 块，以及 `speechOutput`（`available`、`voices`、`reason`：`/api/chat` 能否给出语音回复，见[语音回复](#语音回复speechlfm3-omni)）。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"ltx-2.5"`、`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsKeyframeConditioning`、`defaultPreviewFrames`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
 
 ---
 
@@ -1237,6 +1273,8 @@ curl -N -X POST http://localhost:5000/api/chat \
 | `tool_progress`、`tool`、`text`、`seconds`、`detail`、`agents` | 进程内技能/代码/子智能体调用正在写出或运行时 | 短暂的实时活动：阶段为 `writing`、`running` 或 `finished`；内置 Web UI 只保留有界的当前尾部，并在 `finished` 时清除。`wait_agent` 处于 `running` 时，`agents` 是本请求中所有子智能体的快照（`agent_id`、`parent_id`、`task`、`agent_type`、`status`、`tool`、`tool_status`、`detail`、`result`、`error`），其他情况下为 `null` |
 | `skill_step`、`agent_id`、`skill`、`detail`、`ok`、`round`、`files` | 每次进程内技能、代码或子智能体工具调用完成后 | 工具、目标与结果的完成元数据；`agent_id` 指明发起调用的智能体（主对话为 `/root`）；生成的制品以可选的 `{name, bytes, url}` 条目出现在 `files` 中 |
 | `artifact_verified`、`files` | 路由式交付工作流（例如 PowerPoint 请求）证明其产出时，仅一次 | 通过宿主结构校验的那一个交付物，以单个 `{name, bytes, url}` 条目给出；这类请求的 `skill_step.files` 保持为空，临时文件因此永远不会被提供下载 |
+| `audio`、`sampleRate` | 语音回复（`speech`，见下文），按生成顺序夹在 `token` 帧之间 | base64 编码的 PCM16 小端单声道音频，每帧 80 ms 语音（结尾为编解码器的尾音），采样率为 `sampleRate` Hz |
+| `notice`、`code`、`without` | 语音回复舍弃了请求所要求的功能时，在最前面发送一次；或在音频无法写入时于 `done` 之前发送 | `code` 为 `speech_direct`：该回复不使用 `without` 中列出的功能（`reasoning`、`tools`、`skills`、`knowledge`）；为 `speech_not_saved`：没有生成 WAV，因此没有 `audioUrl`。`notice` 是英文说明句 |
 | `done`、`tokenCount`、`elapsed`、`tokPerSec`、`aborted`、`truncated`、`error`、`sessionId`、`promptTokens`、`kvReusedTokens`、`kvReusePercent` | 末尾帧 | 终态汇总：`tokenCount` 计入本轮生成的全部 token（推理、工具调用与回答，跨所有轮次），`elapsed` 是本轮的墙钟秒数（含工具运行时间），`tokPerSec` 是解码速度；`truncated` 为 true 表示回答因 max-tokens 预算用尽而中断（用户中止用 `aborted` 表示） |
 
 末尾帧示例：
@@ -1285,6 +1323,57 @@ OpenAI 的 `usage.prompt_tokens_details.cached_tokens` 含义一致 —— 都�
 少 prompt token 复用了已缓存的 KV 状态（对应会话的上一轮，或多个会话共享的
 system/工具前缀）。
 
+### 语音回复（`speech`，LFM3-Omni）
+
+能说话的模型（加载了 mmproj 的 LFM3-Omni，语音解码器就在 mmproj 中）可以一边写回复一边把它说出来。
+`/api/models` 会报告当前加载的模型是否支持：
+
+```json
+"speechOutput": { "available": true, "voices": ["female", "male"], "reason": null }
+```
+
+`voices` 中第一个是默认声音；`available` 为 false 时 `reason` 说明原因（模型没有语音输出，或 LFM3-Omni
+未加载其 mmproj）。用 `speech` 请求语音回复：`true`（默认声音），或 `{"voice": "...", "language": "..."}`
+（两者均可省略；`language` 是 `en`、`fr` 这样的语言代码，会写入系统提示中的那一行）。
+
+```bash
+curl -N -X POST http://localhost:5000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sessionId": "a3b1c2...",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "speech": {"voice": "female"}
+  }'
+```
+
+回复为文字与语音交错（文字即语音的转写），并关闭思考。转写通过普通的 `token` 帧到达，语音通过夹在其间的
+`audio` 帧到达；`done` 帧额外带有 `audioId`、`audioUrl`（整段回复写成 `/uploads/` 下的 24 kHz 单声道 16 位
+WAV，按说出的时间命名）和 `audioSeconds`：
+
+```
+data: {"token":"The capital "}
+data: {"audio":"AAAAQADA/38...","sampleRate":24000}
+data: {"token":"of France is Paris."}
+data: {"audio":"...","sampleRate":24000}
+data: {"done":true,"tokenCount":41,"elapsed":2.9,"tokPerSec":19.3,"aborted":false,"truncated":false,"error":null,"sessionId":"a3b...","promptTokens":44,"kvReusedTokens":0,"kvReusePercent":0.0,"audioId":"audio_5f0c...","audioUrl":"/uploads/speech-20261119-101500-5f0c1a2b3c4d4e5f8a9b0c1d2e3f4a5b.wav","audioSeconds":3.36}
+```
+
+语音轮次是一次生成，而不是工具循环：技能、工具、知识库检索和推理都不会运行；请求如果要求了其中任何一项，
+回复开始前会收到一个 `notice` 帧说明这一点（`code` 为 `speech_direct`，`without` 列出被舍弃的项）。
+不能说话的模型会以 HTTP 400 拒绝 `speech` 并给出原因（`{"code": "speech_unavailable", "error": "..."}`）；
+模型没有的声音、以及既不是 `true` 也不是只含 `voice` / `language` 的对象的 `speech`，同样被拒绝。
+被停止的回复不会写入 WAV，也没有 `audioId`。
+
+请把回复连同其 `audioId` 保留在历史中（以及 `audioUrl`，内置页面用它显示播放器和下载链接）：在 assistant 消息上
+发回 `{"role": "assistant", "content": "<转写>", "audioId": "audio_5f0c..."}`，该轮会按模型生成时的样子拼接回去
+（它的 token，以及每个语音帧对应的行），使提示与缓存中保存的内容完全一致。语音轮次在内存中保留一小时，
+且只对生成它的那次模型加载有效；更早或未知的 id、或文字与转写不同的消息，都按其文字渲染，服务日志会提示一次。
+语音轮次的系统提示中写明了声音，因此下一轮同样是语音回复时才能复用缓存的提示。
+
+内置 Web UI 只在 `speechOutput.available` 时显示 **Speak replies** 开关（以及声音选择）；它会在 `audio` 帧到达时
+立即播放，回复完成后在气泡中留下 `<audio>` 播放器和 **Download audio** 链接。TensorAgent 的聊天界面同样如此，
+其 **保存音频** 通过应用的保存对话框完成。
+
 ### 文件上传（`/api/upload`）—— 图像、视频、音频、文本、PDF
 
 ```bash
@@ -1294,8 +1383,9 @@ curl -X POST http://localhost:5000/api/upload -F "file=@report.pdf"
 
 每个响应都携带 `ok, file, url, mediaType, fileName`；媒体类型按文件扩展名分类
 （image / video / audio / pdf / text）。客户端随后在下一次 `/api/chat` 请求中
-引用服务端返回的 `file` 文件名 —— 图像通过 `imagePaths`，抽取出的视频帧通过
-`isVideo: true` + `imagePaths`，音频通过 `audioPaths`，文本内容则把返回的
+引用服务端返回的 `file` 文件名 —— 图像通过 `imagePaths`，视频通过 `isVideo: true` +
+`imagePaths` 中抽取出的帧 + `videoFilePaths` 中的视频文件本身（自行读取视频的模型族 LFM3-Omni
+会对其抽帧并听取音轨，其他模型族使用抽出的帧），音频通过 `audioPaths`，文本内容则把返回的
 `textContent` 内联进消息。
 
 **PDF 文档**采用两段式处理：
@@ -1847,6 +1937,7 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 | `frequency_penalty` | float       | 0       | 频率惩罚                            |
 | `seed`              | int         | -1      | 随机种子                            |
 | `stop`              | string/array| null    | 停止序列                            |
+| `ignore_eos`        | bool        | false   | 非标准（与 vLLM / SGLang / llama.cpp 拼写相同）：遇到结束 token 也继续生成，直到 `max_tokens`，用于定长基准测试。该请求的重复保护也随之关闭，只有 token 上限和请求自己的 `stop` 字符串会结束它；结束 token 计入 `usage.completion_tokens`，其标记文本不进入回复。必须是布尔值（否则返回 HTTP 400） |
 | `response_format`   | object      | null    | `text`、`json_object` 或 `json_schema` |
 | `think`             | bool        | false   | 非标准扩展：启用思维链 / 推理解析（以 `reasoning_content` 返回 / 流式输出） |
 | `chat_template_kwargs` | object  | null    | llama.cpp / vLLM / SGLang 的约定。只读取 `enable_thinking`（bool），与 `think` 是同一个开关；`think` 与 `enable_thinking` 不一致时返回 HTTP 400。其他键被忽略，服务端对每个键记录一次日志 |
@@ -1854,10 +1945,15 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 | `tool_choice`       | string/object | `auto` | Chat Completions：`auto`、`none`（不提供任何工具，包括内置技能、代码与子智能体工具）、`required`，或 `{"type": "function", "function": {"name": ...}}`；后两者须指向客户端声明的 `tools`（否则返回 HTTP 400），且只有 DeepSeek V4.1 会用工具调用语法强制执行，其他模型族接受该值但仍可能不调用工具直接作答 |
 | `parallel_tool_calls` | bool      | null    | Chat Completions：必须是布尔值（否则返回 HTTP 400）；只有 DeepSeek V4.1 会遵循 `false`（其工具调用语法只允许一次调用），其他模型族接受但忽略 |
 
-`top_k`、`min_p`、`repeat_penalty` / `repetition_penalty` 与 `repeat_last_n` 不属于 OpenAI
+`top_k`、`min_p`、`repeat_penalty` / `repetition_penalty`、`repeat_last_n` 与 `ignore_eos` 不属于 OpenAI
 规范；服务端按 llama.cpp 与 vLLM 的做法从顶层读取它们，因此 OpenAI 形态的客户端可以通过
 `extra_body` 传入。`/v1/responses` 读取相同的采样字段，只是用 `max_output_tokens` 代替
 `max_tokens`。上文的 `--sampling-precedence` 规则对所有接口都适用。
+
+重复、出现与频率惩罚只回看最近 `repeat_last_n` 个**生成的** token。各引擎在这一点上不同：
+llama-server 还会计入提示词最后 `repeat_last_n` 个 token（它先把提示词送入采样器），vLLM 与
+Hugging Face `generate` 对全部提示词和输出 token 施加惩罚且不设窗口，SGLang 则对全部输出 token
+施加。要与其他引擎比对输出，请使用 `repeat_penalty` 1.0（并采用贪心解码），与随附的回归配置相同。
 
 ---
 

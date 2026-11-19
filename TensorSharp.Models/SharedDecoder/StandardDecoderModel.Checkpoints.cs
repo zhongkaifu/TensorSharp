@@ -30,7 +30,11 @@ namespace TensorSharp.Models
         /// <summary>The format a checkpoint file is written in: where the model keeps extra key caches (their rows
         /// follow the recurrent states) 5, so a file without them, with 3's one-key QSA rows or with 4's PLE state before
         /// it kept its cells' rotary positions, is not read as one.</summary>
-        private int CheckpointFormat => _extraCacheLayer.Length > 0 ? 5 : CheckpointVersion;
+        private int CheckpointFormat => _extraCacheLayer.Length > 0 ? 5 : HasRingCaches ? 6 : CheckpointVersion;
+
+        /// <summary>Sliding-window layers keep rings (format 6: each cache's rows as its cells hold them, a ring past its first
+        /// lap whole, in place of the position-addressed block).</summary>
+        private bool HasRingCaches => _maxSequenceStepRows != int.MaxValue;
 
         public bool SupportsPrefixCheckpoints => SupportsPerSequenceFusedForward && RecurrentStatesCopy;
 
@@ -315,12 +319,14 @@ namespace TensorSharp.Models
 
                 void CopyRows(Tensor from, Tensor to)
                 {
+                    // Each cache by its own cells: a sliding-window ring past its first lap moves whole, cells in place.
                     int heads = (int)from.Sizes[0], dim = (int)from.Sizes[2];
+                    long fromCells = from.Sizes[1], toCells = to.Sizes[1], n = Math.Min(rows, fromCells);
                     long rowBytes = RowBytes(kvType, dim);
-                    int src = g.Op(GraphOp.View, stackalloc[] { Leaf(from, kvType, dim, source.Capacity, heads) },
-                        stackalloc long[] { 3, dim, rows, heads, 1, rowBytes, rowBytes * source.Capacity, 0, 0 });
-                    int dst = g.Op(GraphOp.View, stackalloc[] { Leaf(to, kvType, dim, target.Capacity, heads) },
-                        stackalloc long[] { 3, dim, rows, heads, 1, rowBytes, rowBytes * target.Capacity, 0, 0 });
+                    int src = g.Op(GraphOp.View, stackalloc[] { Leaf(from, kvType, dim, fromCells, heads) },
+                        stackalloc long[] { 3, dim, n, heads, 1, rowBytes, rowBytes * fromCells, 0, 0 });
+                    int dst = g.Op(GraphOp.View, stackalloc[] { Leaf(to, kvType, dim, toCells, heads) },
+                        stackalloc long[] { 3, dim, n, heads, 1, rowBytes, rowBytes * toCells, 0, 0 });
                     g.Effect(g.Op(GraphOp.Cpy, src, dst));
                     copies++;
                 }
@@ -381,8 +387,10 @@ namespace TensorSharp.Models
                 for (int r = 0; r < from[l].Length; r++)
                 {
                     if (from[l][r] == null) continue;   // a rank that does not run this entry (a draft layer off rank 0)
-                    CopyCacheRows(from[l][r], to[l][r], rows);
-                    if (inPlace) UploadCacheRows(to[l][r], rows);
+                    // A ring past its first lap moves whole, its cells in place.
+                    int n = (int)Math.Min(rows, from[l][r].Sizes[1]);
+                    CopyCacheRows(from[l][r], to[l][r], n);
+                    if (inPlace) UploadCacheRows(to[l][r], n);
                     else InvalidateTensorDeviceCache(to[l][r]);
                 }
             }
@@ -410,8 +418,13 @@ namespace TensorSharp.Models
         private long CloneBytes(Slot slot, int targetTokens)
         {
             long bytes = 0;
-            foreach (Tensor t in AllCacheTensors(slot.K).Concat(AllCacheTensors(slot.V)))
-                bytes += t.Storage.ByteLength / Math.Max(1, t.Sizes[1]) * Math.Max(targetTokens, slot.Length);
+            int tokens = Math.Max(targetTokens, slot.Length);
+            // Each entry's cells for the clone: a sliding-window ring holds at most its own.
+            foreach (Tensor[][] caches in new[] { slot.K, slot.V })
+                for (int e = 0; caches != null && e < caches.Length; e++)
+                    if (caches[e] != null)
+                        foreach (Tensor t in caches[e])
+                            if (t != null) bytes += t.Storage.ByteLength / Math.Max(1, t.Sizes[1]) * CacheCells(e, tokens);
             foreach (Tensor t in CheckpointStateTensors(slot)) bytes += t.ElementCount() * t.ElementType.Size();
             return bytes;
         }
@@ -429,11 +442,23 @@ namespace TensorSharp.Models
             writer.Write(CheckpointNamespace);
             writer.Write(slot.Length);
             writer.Write(slot.RopeDelta);
-            var block = new byte[ComputeBlockBytes(slot, slot.Length)];
-            if (!KvBlockTransfer.Extract(_allocator, FlatCaches(slot.K), FlatCaches(slot.V), slot.Length, 0, slot.Length, block))
-                return false;
-            writer.Write(block.Length);
-            writer.Write(block);
+            if (HasRingCaches)
+            {
+                foreach (Tensor t in FlatCaches(slot.K).Concat(FlatCaches(slot.V)))
+                {
+                    byte[] rows = CacheHeadRows(t, (int)Math.Min(slot.Length, t.Sizes[1]));
+                    writer.Write(rows.Length);
+                    writer.Write(rows);
+                }
+            }
+            else
+            {
+                var block = new byte[ComputeBlockBytes(slot, slot.Length)];
+                if (!KvBlockTransfer.Extract(_allocator, FlatCaches(slot.K), FlatCaches(slot.V), slot.Length, 0, slot.Length, block))
+                    return false;
+                writer.Write(block.Length);
+                writer.Write(block);
+            }
             foreach (Tensor t in CheckpointStateTensors(slot))
             {
                 byte[] bytes = StateBytes(t);
@@ -465,6 +490,33 @@ namespace TensorSharp.Models
             return bytes;
         }
 
+        /// <summary>Bytes of rows [0, <paramref name="rows"/>) of every head of a [heads, cells, dim] cache.</summary>
+        private long CacheHeadRowBytes(Tensor cache, int rows) => cache.Storage.ByteLength / cache.Sizes[1] * rows;
+
+        /// <summary>Rows [0, <paramref name="rows"/>) of every head of a cache, head after head, as stored.</summary>
+        private unsafe byte[] CacheHeadRows(Tensor cache, int rows)
+        {
+            long heads = cache.Sizes[0], headBytes = cache.Storage.ByteLength / heads, rowBytes = headBytes / cache.Sizes[1];
+            var bytes = new byte[CacheHeadRowBytes(cache, rows)];
+            cache.Storage.EnsureHostReadable();
+            byte* src = (byte*)TensorComputePrimitives.GetStoragePointer(cache);
+            fixed (byte* dst = bytes)
+                for (long h = 0; h < heads; h++)
+                    Buffer.MemoryCopy(src + h * headBytes, dst + h * rows * rowBytes, rows * rowBytes, rows * rowBytes);
+            return bytes;
+        }
+
+        /// <summary>The inverse of <see cref="CacheHeadRows"/>.</summary>
+        private unsafe void WriteCacheHeadRows(Tensor cache, byte[] bytes, int rows)
+        {
+            long heads = cache.Sizes[0], headBytes = cache.Storage.ByteLength / heads, rowBytes = headBytes / cache.Sizes[1];
+            byte* dst = (byte*)TensorComputePrimitives.GetStoragePointer(cache);
+            fixed (byte* src = bytes)
+                for (long h = 0; h < heads; h++)
+                    Buffer.MemoryCopy(src + h * rows * rowBytes, dst + h * headBytes, rows * rowBytes, rows * rowBytes);
+            InvalidateTensorDeviceCache(cache);
+        }
+
         private unsafe void WriteCacheRowBytes(Tensor cache, byte[] bytes)
         {
             fixed (byte* src = bytes)
@@ -489,14 +541,29 @@ namespace TensorSharp.Models
                 int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, length));
                 slot = new Slot { Capacity = capacity, Length = 0, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
                 (slot.K, slot.V) = AllocateCaches(capacity);
-                int blockBytes = reader.ReadInt32();
-                if (blockBytes != ComputeBlockBytes(slot, length)) { DisposeSlot(slot); return false; }
-                byte[] block = reader.ReadBytes(blockBytes);
-                if (block.Length != blockBytes
-                    || !KvBlockTransfer.Inject(_allocator, FlatCaches(slot.K), FlatCaches(slot.V), 0, 0, length, block))
+                if (HasRingCaches)
                 {
-                    DisposeSlot(slot);
-                    return false;
+                    foreach (Tensor t in FlatCaches(slot.K).Concat(FlatCaches(slot.V)))
+                    {
+                        int rows = (int)Math.Min(length, t.Sizes[1]);
+                        int bytes = reader.ReadInt32();
+                        if (bytes != CacheHeadRowBytes(t, rows)) { DisposeSlot(slot); return false; }
+                        byte[] data = reader.ReadBytes(bytes);
+                        if (data.Length != bytes) { DisposeSlot(slot); return false; }
+                        WriteCacheHeadRows(t, data, rows);
+                    }
+                }
+                else
+                {
+                    int blockBytes = reader.ReadInt32();
+                    if (blockBytes != ComputeBlockBytes(slot, length)) { DisposeSlot(slot); return false; }
+                    byte[] block = reader.ReadBytes(blockBytes);
+                    if (block.Length != blockBytes
+                        || !KvBlockTransfer.Inject(_allocator, FlatCaches(slot.K), FlatCaches(slot.V), 0, 0, length, block))
+                    {
+                        DisposeSlot(slot);
+                        return false;
+                    }
                 }
                 foreach (Tensor t in AllCacheTensors(slot.K).Concat(AllCacheTensors(slot.V))) InvalidateTensorDeviceCache(t);
                 foreach (Tensor t in CheckpointStateTensors(slot))

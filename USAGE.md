@@ -55,8 +55,8 @@ for setup, extraction limits, citations and complete-original access.
 | GGML Metal | `--backend ggml_metal` | Apple Silicon (the server's default on macOS; the CLI defaults to `ggml_cpu` everywhere) | GPU-accelerated via Apple Metal. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
 | GGML CUDA | `--backend ggml_cuda` | NVIDIA inference through ggml | GPU-accelerated via GGML CUDA on Windows or Linux. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
 | GGML Vulkan | `--backend ggml_vulkan` | Vendor-neutral GPU inference through ggml | GPU-accelerated via GGML Vulkan on Windows or Linux — runs on AMD, Intel, and NVIDIA GPUs with a Vulkan 1.3 driver, using cooperative-matrix shaders (KHR coopmat / NV coopmat2) where the driver supports them. Weights are device-resident like GGML CUDA and the same fused whole-model decode/prefill graphs are used. Enabled automatically at native build time when the machine has a Vulkan runtime (loader installed); the build downloads a portable Vulkan toolchain (headers, glslc, SPIRV-Headers, and on Windows a loader import lib) via `eng/fetch-vulkan-toolchain.ps1` / `eng/fetch-vulkan-toolchain.sh` when no Vulkan SDK or distro dev packages are installed. Opt out with `--no-vulkan` (or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`). |
-| GGML CPU | `--backend ggml_cpu` | Native CPU kernels | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
-| Pure C# CPU | `--backend cpu` | Portability and debugging | Portable CPU inference: the model compute loads no native library (desktop image file I/O still goes through Magick.NET, and the server probes the GGML / CUDA backends at startup). The managed matmuls run on a persistent spin-then-park worker pool sized at half the usable cores by default (`TS_CPU_THREADS` and the other `TS_CPU_*` knobs below), and on the direct video networks (Wan, MiniMax-H3) a quantized weight is multiplied straight out of its GGUF storage type instead of being expanded to F32 at load. DeepSeek V4.1 Flash, like DeepSeek V4 Flash below, runs a whole-model executor of its own here — the 100% pure-C# `DeepSeek4CpuExecutor`, a correctness and portability path rather than a serving one, whose compute width comes from `TS_DSV4_THREADS` (every processor by default on this backend) instead of `TS_CPU_THREADS`. |
+| GGML CPU | `--backend ggml_cpu` | Native CPU kernels | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file, except on ARM64: there, quantized weights that only matrix products read are copied once into ggml-cpu's repacked layouts (resident memory about the size of those weights; roughly twice the prompt speed). `TS_GGML_CPU_REPACK=0` keeps them zero-copy (see the [environment variable matrix](docs/env_var_feature_matrix.md#out-of-matrix-ggml-cpu-backend-knobs)). |
+| Pure C# CPU | `--backend cpu` | Portability and debugging | Portable CPU inference: the model compute loads no native library (desktop image file I/O still goes through Magick.NET, and the server probes the GGML / CUDA backends at startup). The managed matmuls run on a persistent spin-then-park worker pool sized at half the usable cores by default, every core on Apple silicon (`TS_CPU_THREADS` and the other `TS_CPU_*` knobs below), and on the direct video networks (Wan, MiniMax-H3) a quantized weight is multiplied straight out of its GGUF storage type instead of being expanded to F32 at load. DeepSeek V4.1 Flash, like DeepSeek V4 Flash below, runs a whole-model executor of its own here — the 100% pure-C# `DeepSeek4CpuExecutor`, a correctness and portability path rather than a serving one, whose compute width comes from `TS_DSV4_THREADS` (every processor by default on this backend) instead of `TS_CPU_THREADS`. |
 
 **Embedding encoders use separate executors.** On `cpu` they own compact quantized arrays and a per-model worker pool, configured by `--embedding-threads` (default four). Native embedding backends may copy or repack weights. See [embedding storage and threading](docs/embeddings.md#library-api-and-implementation) for the details of this execution path.
 
@@ -207,6 +207,15 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --video clip
 
 # Audio inference (Gemma 4)
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --audio speech.wav --backend ggml_metal
+
+# Speech output (LFM3-Omni with its mmproj; see "Speech output (LFM3-Omni)" below).
+# --tts speaks --prompt with the GGUF's "tts" template (as llama-tts does) and writes --output;
+# --speech-out speaks a chat reply too (--speech-mode interleaved|audio, --voice female|male,
+# --language, --seed, --speech-temperature).
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf \
+    --backend ggml_metal --tts --prompt "Hello there, nice to meet you." --voice male --language en --output hello.wav
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf \
+    --backend ggml_metal --input question.txt --speech-out reply.wav --speech-mode interleaved --voice female
 
 # PDF document input: born-digital PDFs are text-extracted and inlined into the
 # prompt; scanned PDFs become page images and need a vision model (--mmproj or a
@@ -402,7 +411,7 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 
 | Option | Description |
 |---|---|
-| `--kv-cache-dtype <type>` | KV cache precision: `f32`, `f16`, `q8_0`, or `q4_0` (default: auto — the backend/model pick; env `KV_CACHE_DTYPE`). Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) run on the GGML backends' flash path; on `--backend cuda`, `q8_0` runs on the CUDA executor's own flash kernels for every family on the shared decoder runtime (Qwen 3.5/3.6/3.8, Mistral 3, Hunyuan Dense; decode, verify windows and prompt chunks read about half the bytes of `f16`; a route they do not take warns once and runs the generic attention), while `q4_0` keeps the model off whole-forward graphs there (Qwen3.8 Flash Next runs only as graphs, so over `q4_0`, or over `q8_0` with its QSA layers, its first step fails: keep `f16` for it); DeepSeek V4 / V4.1 refuse them at load (their executors keep F16 caches read by their own kernels) and report `f16` for an explicit `f32`. |
+| `--kv-cache-dtype <type>` | KV cache precision: `f32`, `f16`, `q8_0`, or `q4_0` (default: auto — the backend/model pick; env `KV_CACHE_DTYPE`). Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) run on the GGML backends' flash path; on `--backend cuda`, `q8_0` runs on the CUDA executor's own flash kernels for every family on the shared decoder runtime (Qwen 3.5/3.6/3.8, Mistral 3, Hunyuan Dense; decode, verify windows and prompt chunks read about half the bytes of `f16`; a route they do not take warns once and runs the generic attention; LFM3, whose sliding-window layers' band and ring routes take F16 caches only there, runs `q8_0` off whole-forward graphs), while `q4_0` keeps the model off whole-forward graphs there (Qwen3.8 Flash Next runs only as graphs, so over `q4_0`, or over `q8_0` with its QSA layers, its first step fails: keep `f16` for it); DeepSeek V4 / V4.1 refuse them at load (their executors keep F16 caches read by their own kernels) and report `f16` for an explicit `f32`. |
 | `--interactive` / `-i` / `--chat` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--no-prefix-cache` | Disable runtime prefix reuse (it sets `TS_SCHED_PREFIX_CACHE=0`) and interactive system/tool prompt warmup. Radix caching is enabled by default for normal CLI generation, including single-shot, interactive, JSONL, and skill/tool requests. The CLI's cache lives in memory only, so every new process starts cold. Unrelated to `--warmup-runs`, which warms compute kernels. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
@@ -878,7 +887,9 @@ of quietly losing a setting.
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
 `top_p`, `top_k`, `min_p`, `repeat_penalty`, `repeat_last_n`, `presence_penalty`,
 `frequency_penalty`, `seed`, `stop`/`stop_sequences`) fill in every parameter
-you did **not** configure above. For a parameter you *did* configure, the
+you did **not** configure above. The OpenAI endpoints also take `ignore_eos`
+(fixed-length benchmarks: generate through end-of-sequence tokens until `max_tokens`;
+see the [API reference](TensorSharp.Server.Host/API_EXAMPLES.md#4-sampling-options)). For a parameter you *did* configure, the
 default `--sampling-precedence config` keeps your value and ignores the
 request's — many chat clients hardcode `temperature`/`top_p` into every call
 with no way for the end user to change them, so an unconfigured server-side
@@ -2333,7 +2344,8 @@ full checkpoint here; its compute width comes from `TS_DSV4_THREADS`, not
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Worker-pool width (managed matmuls, Core CPU kernels, DiffusionGemma / Qwen-Image kernels) | every core up to 8 CPUs; half above that, never below 8 | `TS_CPU_THREADS=N` | — |
+| Worker-pool width (managed matmuls, Core CPU kernels, DiffusionGemma / Qwen-Image kernels) | every core up to 8 CPUs; half above that, never below 8; every core on Apple silicon (no SMT) | `TS_CPU_THREADS=N` | — |
+| Worker-pool width on decode-sized steps (a step whose weight products read at most 4 activation rows: one sequence's token, or a few sequences' tokens in one step) | on a Mac with performance and efficiency cores (`hw.perflevel0` / `hw.perflevel1`) every core but two, never fewer than the performance cores (16 on an M5 Pro); elsewhere the pool's width; `TS_CPU_THREADS` set alone sets both widths | `TS_CPU_DECODE_THREADS=N` — the workers past it park until a wider step, so the process's other threads (a server's request and streaming threads) find a free core instead of taking one from a pool worker in the middle of a job; outputs do not change. A value above the pool's width counts as the pool's width; no effect under `TS_CPU_POOL=0` (no pool) | — |
 | Worker pool at all | ON | `TS_CPU_POOL=0` reverts to ThreadPool `Parallel.For` for every managed kernel that forks — the quantized matmuls, the Core CPU kernels, the DiffusionGemma / Qwen-Image-2.1 transformer kernels and the Qwen-Image VAE, text encoder and vision tower (the VAE caps it at `TS_CPU_GEMM_THREADS`) — for hosts that cannot afford spinning threads and for A/B runs in one binary; results do not change. The Direct video networks' row loops keep the pool | — |
 | Spin iterations before a worker parks | `4096` | `TS_CPU_SPIN=N` — parking is the expensive part at this width, so the default spins long enough that the steady state never parks | — |
 | Work-item sizing for a managed matmul | `131072` weight bytes per item, at most `4` items per worker | `TS_CPU_TASK_BYTES`, `TS_CPU_TASKS_PER_WORKER` — sized from the work rather than the thread count | — |
@@ -2443,7 +2455,7 @@ with `--sampling-precedence request` (see [Web Application](#web-application)).
 | Jev endpoint limits (`POST /v1/systemone`) | 8 MiB body, 64-token canvas, 32 admitted requests | `TS_JEV_MAX_BODY_MB`, `TS_JEV_MAX_CANVAS`, `TS_JEV_MAX_PENDING` |
 | Text-LoRA adapter directory (startup load + `POST /v1/loras`, at most 32 adapters) | unset: no adapters, `POST /v1/loras` answers 403 | `TS_LORAS_DIR` (`--loras-dir`, which wins) |
 | Text and born-digital PDF uploads | Full extracted content; the final rendered prompt must fit the loaded model context | — |
-| Video-frame extraction | 1 fps (time-based, no cap). An OpenAI `video_url` part (DeepSeek V4.1, Qwen 3.8 Flash Next) may set its own `fps` / `max_frames` and caps at 16 frames when `VIDEO_MAX_FRAMES` is unset; Qwen 3.8 merges the sampled frames in pairs with Qwen-VL temporal coordinates (see [its card](docs/models/qwen38-flash-next.md#video-input)) | `VIDEO_SAMPLE_FPS`, `VIDEO_MAX_FRAMES` |
+| Video-frame extraction | 1 fps (time-based, no cap). An OpenAI `video_url` part (DeepSeek V4.1, Qwen 3.8 Flash Next) may set its own `fps` / `max_frames` and caps at 16 frames when `VIDEO_MAX_FRAMES` is unset; Qwen 3.8 merges the sampled frames in pairs with Qwen-VL temporal coordinates (see [its card](docs/models/qwen38-flash-next.md#video-input)). LFM3-Omni reads the clip itself (`--video`, `video_url`, the Web UI's `videoFilePaths`): 2 fps with its soundtrack, whatever these settings say (see [its card](docs/models/lfm3.md#media-input)) | `VIDEO_SAMPLE_FPS`, `VIDEO_MAX_FRAMES` |
 | DiffusionGemma Web UI denoising | 48 steps, max batch 2 | `DIFFUSION_STEPS`, `DIFFUSION_MAX_BATCH` |
 
 #### Logging (server + CLI)
@@ -3025,6 +3037,39 @@ phases, Studio jobs, model loads and the logs of one request.
   CLI, never writes it anywhere, and queries the resource until the rows arrive
   ([how to run them](eng/telemetry/README.md)). Both write their evidence to the git-ignored
   `docs/validation/`.
+
+## Speech output (LFM3-Omni)
+
+LFM3-Omni speaks when its mmproj is loaded (`--mmproj mmproj-LFM3-Omni-2B-*.gguf`: the `a.gen.*` depthformer
+and LiquidCodec decoder). A spoken reply runs on the same continuous-batching engine as text: each 80 ms frame
+is a decode step whose input is the previous frame's embedding row and whose output is the LM's final hidden
+row (no LM head when no request of the step needs logits), so speech and text requests batch together.
+
+| Surface | What it does |
+|---|---|
+| CLI `--tts` | Speak `--prompt` with the GGUF's `tts` template; write `--output` (WAV, 24 kHz mono 16-bit). A chat model that speaks synthesizes only with `--tts`. |
+| CLI `--speech-out FILE` | Speak a single-prompt chat reply too; `--speech-mode interleaved` (default: 6 text tokens, then 12 frames, ...; the text is the transcript) or `audio`. |
+| CLI `--speech-temperature T` | The speech codes' temperature (default the mmproj's, 0.4); text keeps `--temperature`. |
+| CLI `--voice female\|male`, `--language CODE`, `--seed N` | The voice and language named in the system prompt; the speech sampler's seed. |
+| `POST /v1/audio/speech` | `input`, `voice` (`female`/`male`; anything else, OpenAI's default `alloy` included, is a 400 listing the voices), `language`, `response_format` `wav`/`pcm`/`pcm16`, `stream: true` (chunked; a WAV stream starts with an unknown-length header) or `stream_format: "audio"`/`"sse"`, `seed`, `temperature`, `max_frames`. `speed` other than 1 is a 400. |
+| `POST /v1/chat/completions`, `POST /v1/responses` | `"modalities": ["text","audio"]` (interleaved: the text is the transcript; the conversational mode) or `["audio"]` (speech only, opened with `<|audio_start|>`: LFM3-Omni then reads the user's message aloud rather than answering, as in llama.cpp), with `"audio": {"voice": "female", "format": "wav"\|"pcm16"}` (TensorSharp also reads `language`, `seed`, `temperature` there). Non-streaming: `message.audio = {id, expires_at, data, transcript}`; streaming (pcm16 only): `delta.audio` `id`, then `transcript` and `data` pieces in order, then `expires_at`. Sending the reply back as `{"role":"assistant","audio":{"id":...}}` renders it as its transcript for an hour. |
+| `GET /v1/models` | A model that speaks lists `"capabilities": ["chat","audio_output"]` and its voices. |
+| `POST /api/chat` (the Web UI, TensorAgent) | `"speech": true` or `{"voice": ..., "language": ...}`: an interleaved reply with thinking off, its transcript in `token` frames and its speech in `audio` frames (base64 PCM16 at `sampleRate`) between them, and a `done` frame with `audioId`, `audioUrl` (the whole reply's WAV under `/uploads/`) and `audioSeconds`. Skills, tools and knowledge lookups do not run in a spoken turn (a `notice` frame says so). `GET /api/models` reports `speechOutput: {available, voices, reason}`; the pages show a **Speak replies** switch only when it is available, play the reply as it arrives, and keep a player and a download. See [API_EXAMPLES.md → Spoken replies](TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni). |
+
+Text replies of LFM3-Omni never sample the media placeholders, and a text-only reply never opens speech
+(`<|audio_start|>`, `<|mixed_start|>` are banned), as the model card's `generate` does. A spoken assistant turn
+sent back by its id (`audio.id` on `/v1/chat/completions`, `audioId` on `/api/chat`, kept for an hour) is spliced as
+generation decoded it, and a spoken reply's end state is retained with each run of its frames keyed by its codes,
+so the next spoken turn reuses the cached prompt through it. An unknown id renders as its transcript. See
+[docs/models/lfm3.md](docs/models/lfm3.md#speech-output).
+
+```bash
+curl http://localhost:5000/v1/audio/speech -H "content-type: application/json" \
+  -d '{"model":"LFM3-Omni-2B-Q4_K_M","input":"Hello there.","voice":"female","seed":1234}' -o hello.wav
+curl http://localhost:5000/v1/chat/completions -H "content-type: application/json" \
+  -d '{"model":"LFM3-Omni-2B-Q4_K_M","messages":[{"role":"user","content":"What is the capital of France?"}],
+       "modalities":["text","audio"],"audio":{"voice":"female","format":"wav"}}'
+```
 
 ## HTTP APIs
 

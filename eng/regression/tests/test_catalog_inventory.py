@@ -75,7 +75,8 @@ class CatalogInventoryTests(unittest.TestCase):
         additions = ["bonsai-2-27b-ptq1", "nemotron-h-8b", "nemotron-h-47b",
                      "nemotron-3-nano-omni-30b-a3b", "nemotron-3.5-lightning-30b-a3b",
                      "mistral-small-3.1-24b", "hunyuan-hy-mt2-1.8b", "deepseek-v4-flash-0731",
-                     "deepseek-v4.1-flash", "glm-5.2", "glm-5.3", "glm-5.3-flash", "qwen3.8-27b"]
+                     "deepseek-v4.1-flash", "glm-5.2", "glm-5.3", "glm-5.3-flash", "qwen3.8-27b",
+                     "lfm3-1.7b", "lfm3-omni-2b"]
         source = "\n".join(path.read_text(encoding="utf-8") for path in
                            (REPO / "TensorAgent/src/TensorAgent.Core/Catalog").glob("ModelCatalog*.cs"))
         source += (REPO / "config/agent-qwen3.8-27b.json").read_text(encoding="utf-8")

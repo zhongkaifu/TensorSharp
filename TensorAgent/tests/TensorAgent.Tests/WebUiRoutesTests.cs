@@ -464,7 +464,7 @@ public sealed class WebUiRoutesTests : IDisposable
             {
                 "Gemma4", "Qwen35", "Bonsai", "Qwen38", "MuseGlimmer", "Qwen38FlashNext", "QwenImage", "MiniMaxH3",
                 "Ltx25", "Qwen36", "GptOss", "Nemotron", "Mistral3", "HunyuanDense", "DeepSeek4", "DeepSeek41", "Glm5",
-                "DiffusionGemma", "Wan",
+                "DiffusionGemma", "Wan", "Lfm3",
             }),
             string.Join(", ", families));
         Assert.True(kinds.SetEquals(new[] { "Dense", "MixtureOfExperts", "Diffusion" }), string.Join(", ", kinds));

@@ -15,8 +15,18 @@ namespace TensorSharp.Graph
     {
         /// <summary>Its kernels read row-contiguous strided views directly (no contiguous copies needed).</summary>
         public bool StridedViews { get; init; }
+        /// <summary>A prompt chunk's packed projection is one product whose row blocks its element-wise ops read where they lie
+        /// (strided views, no copies), as decode rows' is; otherwise a chunk takes each block as its own product, so each is
+        /// contiguous.</summary>
+        public bool PackedProductBlocks { get; init; }
         /// <summary>An op may write its result in place inside a state leaf (<see cref="GraphNodeKind.Alias"/>).</summary>
         public bool InPlaceStateAlias { get; init; }
+        /// <summary>A sliding-window attention over a capacity window or a ring (<see cref="GraphOp.FlashAttnExt"/> ip[3]: its band)
+        /// reads its mask on the device as the selection it is, every run: the band's floor moves with each position, so a
+        /// recorded decode step replays the band of the position it runs at (a mask classified from its host values would
+        /// replay the recorded position's floor). Only for windows this executor attends that way
+        /// (<see cref="IGraphExecutor.AttendsCapacityWindows"/>).</summary>
+        public bool BandMasksOnDevice { get; init; }
 
         /// <summary>A verify window's recurrence writes only its rows' outputs and saves its scan inputs (a gated delta rule
         /// with destination leaf 6), the live state read and left as it was: the commit steps the kept rows on it again, in
@@ -37,6 +47,11 @@ namespace TensorSharp.Graph
         public bool TensorParallel { get; init; }
         /// <summary>Prompt chunks write K/V by row index (no copy into a strided cache view).</summary>
         public bool IndexedCacheWrites { get; init; }
+        /// <summary>A prompt chunk that attends its own fresh K/V rows takes them as the permuted views of its projections: it
+        /// writes them into the caches by index from those views, and its attention (and the concatenation with the cached
+        /// prefix) reads them where they lie, instead of contiguous copies of every chunk's K and V first. For executors whose
+        /// set_rows, concat and flash attention read rows at any strides (ggml-cpu).</summary>
+        public bool FreshRowViews { get; init; }
         /// <summary>A prompt chunk over an F16 or block-quantized K/V cache is written by row index and attends the
         /// cache's window padded to <see cref="DecodeWindowRows"/>, as decode does, instead of its own fresh F32 rows:
         /// the device's fast attention needs reduced-precision K/V in whole windows. An F32 cache keeps the fresh rows
@@ -67,8 +82,15 @@ namespace TensorSharp.Graph
         /// CPU), so a host copy of them moves nothing across.</summary>
         public bool SeparateDeviceCopies { get; init; }
         /// <summary>A program may end in each row's greedy token (a top-1 over the logits, a tie to the lower id), read
-        /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits.</summary>
+        /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits. The head is
+        /// <see cref="GraphOp.TopK"/> with Ip { 1, 1 } (k 1, greedy) read through a <see cref="GraphOp.Cont"/> as one float a
+        /// row; an executor lowers it to whatever gives exactly those ids (GGML: each row's top candidates on the device,
+        /// the lowest id of the largest taken on the host, a row whose candidates all tie read in full).</summary>
         public bool GreedyIdOutputs { get; init; }
+        /// <summary>A greedy head (<see cref="GreedyIdOutputs"/>) may take a second source, an F32 [vocab] mask of -0 (kept) and
+        /// -inf (suppressed) added to every row before the pick: the ids are then the host argmax over the logits with the
+        /// suppressed tokens' set to -inf, as TokenSampler sets them.</summary>
+        public bool GreedyIdSuppression { get; init; }
         /// <summary>An F16 causal mask input may arrive as its pattern (a <see cref="CausalMaskInput"/> as the input's handle,
         /// no host bytes): the executor classifies it from the pattern and makes its values only for an op that reads them.
         /// The shared runtime gives prompt chunks' masks so (more rows than a verify window: never replayed, advanced or
@@ -131,6 +153,12 @@ namespace TensorSharp.Graph
         /// of <see cref="GraphCapabilities.DecodeWindowRows"/>-row buckets around that length computes, bit for bit - so one
         /// recorded step of a width serves every position of its slot. False where a window's width shapes the arithmetic.</summary>
         bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
+
+        /// <summary>A scope in which a one-shot step's run hands the host nothing back returns with its device work queued, so
+        /// the host traces and builds the next step while the device runs this one (a prompt's steps of one sequence, as
+        /// llama.cpp's scheduler overlaps a prompt's ubatches): the work is waited for before anything reads, releases or
+        /// rewrites what it touches, and when the scope ends. Null where every run completes before it returns.</summary>
+        IDisposable OverlapSteps() => null;
 
         /// <summary>Whether a model's whole-forward graphs may hold their K/V caches in <paramref name="kvFormat"/> (a
         /// <see cref="GraphFormat"/>) with <paramref name="keyDim"/>-wide keys and <paramref name="valueDim"/>-wide values: F32 and
@@ -236,6 +264,21 @@ namespace TensorSharp.Graph
 
         /// <summary>Output <paramref name="index"/> of the last run (the caller owns it).</summary>
         Tensor TakeOutput(int index);
+    }
+
+    /// <summary>
+    /// What one run of a plan evaluates and moves, for censuses of steps (eng/lfm3/Lfm3Probe batch): the executor's nodes, those
+    /// that run a kernel (not a view, reshape, permute or transpose), and the leaves besides the inputs that every run copies to
+    /// the device and back (ggml: states and weights placed in the graph's compute memory) with their bytes.
+    /// </summary>
+    public readonly record struct GraphPlanCensus(long Nodes, long Kernels, long LeafUploads, long LeafUploadBytes, long LeafDownloads,
+        long LeafDownloadBytes);
+
+    /// <summary>A plan that reports its <see cref="GraphPlanCensus"/>. Read only by censuses: nothing the runtime decides.</summary>
+    public interface IGraphPlanCensus
+    {
+        /// <summary>One run's census, or null where the plan does not know it yet (a graph built on its first run).</summary>
+        GraphPlanCensus? Census { get; }
     }
 
     /// <summary>Executor plugins, by the allocator type of the backend they serve.</summary>

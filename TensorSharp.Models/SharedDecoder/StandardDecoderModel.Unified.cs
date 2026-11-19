@@ -242,10 +242,52 @@ namespace TensorSharp.Models
             return true;
         }
 
-        /// <summary>On executors that return integer outputs (the CUDA executor), a greedy step's head ends in a top-1 over each
-        /// sequence's last row, read back as an id: a plain decode step had read back Qwen3.8's 248,320 logits (1 MB) and
-        /// scanned them on the host.</summary>
-        public bool SupportsUnifiedGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true && !_rankGraphs && _mesh.Stages == 1;
+        /// <summary>Decode rows whose input is an embedding row and steps that return the last rows' final hidden rows serve
+        /// wherever slot steps do (graphs on every executor, and the per-op layers).</summary>
+        public bool SupportsUnifiedRowIO => SupportsUnifiedBatching;
+
+        public bool TryForwardUnifiedRows(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts,
+            float[][] inputRows, bool[] wantLogits, float[][] lastRowLogits, float[][] lastHidden)
+        {
+            int n = requestIds.Count;
+            if (inputRows == null || wantLogits == null || lastHidden == null || inputRows.Length != n || wantLogits.Length != n || lastHidden.Length != n)
+                throw new ArgumentException("one input row, logits flag and hidden buffer a request");
+            for (int s = 0; s < n; s++)
+                if (lastHidden[s] != null && lastHidden[s].Length < Config.HiddenSize)
+                    throw new ArgumentException($"a hidden buffer of {lastHidden[s].Length} values, the model's rows {Config.HiddenSize}", nameof(lastHidden));
+            var rowIO = new SlotRowIO
+            {
+                InputRows = Array.Exists(inputRows, r => r != null) ? inputRows : null,
+                Logits = Array.Exists(wantLogits, w => w),
+                Hidden = Array.Exists(lastHidden, h => h != null) ? lastHidden : null,
+            };
+            if (!TryForwardSlots(requestIds, tokens, starts, lastRowLogits, null, rowIO)) return false;
+            ReplenishSpareSlot(tokens);
+            return true;
+        }
+
+        /// <summary>Set while <see cref="ForwardUnifiedMediaRows"/> runs: the prompt forward also writes its last final hidden
+        /// row here.</summary>
+        private float[] _promptHiddenOut;
+
+        public float[] ForwardUnifiedMediaRows(string requestId, int[] tokens, int start, float[] lastHidden)
+        {
+            ArgumentNullException.ThrowIfNull(lastHidden);
+            if (lastHidden.Length < Config.HiddenSize)
+                throw new ArgumentException($"a hidden buffer of {lastHidden.Length} values, the model's rows {Config.HiddenSize}", nameof(lastHidden));
+            _promptHiddenOut = lastHidden;
+            try { return ForwardUnifiedMedia(requestId, tokens, start); }
+            finally { _promptHiddenOut = null; }
+        }
+
+        /// <summary>On executors that return greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>: the CUDA executor, GGML
+        /// on discrete GPUs), a greedy step's head ends in a top-1 over each sequence's last row, read back as an id: a plain
+        /// decode step had read back Qwen3.8's 248,320 logits (1 MB) and scanned them on the host.</summary>
+        public bool SupportsUnifiedGreedyIds => GraphGreedyIds && !_rankGraphs && _mesh.Stages == 1;
+
+        /// <summary>This model's graphs may end in greedy ids (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdOutputs"/>) - except
+        /// tensor-parallel graphs on ggml's meta device, whose head reads its logits.</summary>
+        private bool GraphGreedyIds => GraphExecutor?.Capabilities.GreedyIdOutputs == true && _graphTpRanks == null;
 
         public bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens)
         {
@@ -268,7 +310,11 @@ namespace TensorSharp.Models
                     nextTokens[s] = (int)row[0];   // the id as its F32 value (exact below 2^24)
                     continue;
                 }
-                // A step that ran off the graphs read the logits back: the first largest, as the device picks.
+                // A step that ran off the graphs read the logits back: the first largest, as the device picks (over the
+                // suppressed tokens' -inf, as TokenSampler sets them).
+                if (_greedySuppressed is { } suppression)
+                    foreach (int id in suppression.Ids)
+                        if ((uint)id < (uint)row.Length) row[id] = float.NegativeInfinity;
                 int best = 0;
                 for (int v = 1; v < row.Length; v++)
                     if (row[v] > row[best]) best = v;
@@ -277,8 +323,56 @@ namespace TensorSharp.Models
             return true;
         }
 
-        /// <summary>Set while <see cref="TryForwardUnifiedGreedy"/> runs: the graph steps' last-row heads end in a top-1.</summary>
+        /// <summary>Set while <see cref="TryForwardUnifiedGreedy(IReadOnlyList{string}, IReadOnlyList{int[]}, int[], int[])"/> runs: the graph steps' last-row heads end in a top-1.</summary>
         private bool _greedyLastRows;
+
+        /// <summary>Executors whose greedy heads take a suppression mask (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdSuppression"/>)
+        /// pick for samplers that suppress tokens (LFM3-Omni's text replies never draw its media placeholders) on the device too.</summary>
+        public bool SupportsUnifiedGreedySuppression => SupportsUnifiedGreedyIds && GraphExecutor.Capabilities.GreedyIdSuppression;
+
+        public bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens,
+            IReadOnlyList<int> suppressed)
+        {
+            if (suppressed is not { Count: > 0 }) return TryForwardUnifiedGreedy(requestIds, tokens, starts, nextTokens);
+            if (!SupportsUnifiedGreedySuppression) return false;
+            _greedySuppressed = SuppressionMask(suppressed);
+            try { return TryForwardUnifiedGreedy(requestIds, tokens, starts, nextTokens); }
+            finally { _greedySuppressed = null; }
+        }
+
+        /// <summary>The suppressed tokens of the greedy step running (<see cref="TryForwardUnifiedGreedy(IReadOnlyList{string}, IReadOnlyList{int[]}, int[], int[], IReadOnlyList{int})"/>)
+        /// and their mask (F32 [vocab]: -inf at a suppressed id, -0 elsewhere, which adds nothing); null otherwise.</summary>
+        private GreedySuppression _greedySuppressed;
+
+        private GreedySuppression _suppressionMask;
+
+        private sealed class GreedySuppression
+        {
+            public int[] Ids;
+            /// <summary>The mask's values, a constant input of the step (uploaded with its other inputs).</summary>
+            public float[] Mask;
+            /// <summary>The ids' digest: a plan's signature names the mask it was traced with.</summary>
+            public string Key;
+        }
+
+        /// <summary>The mask of <paramref name="suppressed"/>, one kept for the model (a reply-token policy suppresses the same
+        /// tokens in every request), made again when another set comes.</summary>
+        private GreedySuppression SuppressionMask(IReadOnlyList<int> suppressed)
+        {
+            if (_suppressionMask is { } kept && kept.Ids.AsSpan().SequenceEqual(suppressed is int[] a ? a : System.Linq.Enumerable.ToArray(suppressed)))
+                return kept;
+            int vocab = Config.VocabSize;
+            var values = new float[vocab];
+            Array.Fill(values, -0.0f);
+            int[] ids = System.Linq.Enumerable.ToArray(suppressed);
+            ulong h = 14695981039346656037UL;
+            foreach (int id in ids)
+            {
+                if ((uint)id < (uint)vocab) values[id] = float.NegativeInfinity;
+                h = (h ^ (uint)id) * 1099511628211UL;
+            }
+            return _suppressionMask = new GreedySuppression { Ids = ids, Mask = values, Key = h.ToString("X16") };
+        }
 
         public float[] ForwardUnifiedMedia(string requestId, int[] tokens, int start)
         {

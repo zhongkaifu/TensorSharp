@@ -47,6 +47,18 @@ namespace TensorSharp.Graph
         /// partial, which no other node reads. The ranks' programs run in lockstep (see <see cref="IGraphCollective"/>), so
         /// every rank reaches its reduce before any rank reads the total.</summary>
         AllReduce = 57,
+        /// <summary>A depthwise 2-D convolution over rows of channels (ggml_conv_2d_dw_direct's arithmetic, in the layout the
+        /// IR's token rows already have): srcs x [C, W, H, N] (channels innermost) and the kernel [KW, KH, 1, C] (ggml's
+        /// depthwise kernel layout, F32). Ip: stride0, stride1, pad0, pad1, dilation0, dilation1 (index 0 along W, 1 along H;
+        /// zero padding on both sides). Result [C, OW, OH, N] with OW = (W + 2 pad0 - dilation0 (KW - 1) - 1) / stride0 + 1
+        /// (OH likewise): output (c, ow, oh, n) is the sum over the kernel taps, ky outer and kx inner, of
+        /// kernel[kx, ky, 0, c] * x[c, ow stride0 + kx dilation0 - pad0, oh stride1 + ky dilation1 - pad1, n], taps that fall
+        /// outside x contributing nothing.</summary>
+        DepthwiseConv2d = 70,
+        /// <summary>GELU in its exact form, 0.5 x (1 + erf(x / sqrt 2)) (ggml_gelu_erf; <see cref="Gelu"/> is ggml_gelu's tanh
+        /// approximation). Executors without an erf kernel evaluate erf with Abramowitz and Stegun's 7.1.26 (|error| below
+        /// 1.5e-7), as ggml-metal does.</summary>
+        GeluErf = 71,
     }
 
     /// <summary>
@@ -80,8 +92,11 @@ namespace TensorSharp.Graph
 
     /// <summary>
     /// <see cref="GraphOp.FlashAttnExt"/>'s ip[2]: what its query rows are, as the model that emitted them says. The op's ip:
-    /// [0] ggml's accumulation precision, [1] the most keys a mask row leaves finite (0: unknown), [2] one of these. An
-    /// unmarked op carries at most two ip, so its program keeps the bytes and signature it had.
+    /// [0] ggml's accumulation precision, [1] the most keys a mask row leaves finite (0: unknown), [2] one of these, and
+    /// [3] a sliding window's band where the executor reads band masks on the device
+    /// (<see cref="GraphCapabilities.BandMasksOnDevice"/>; such an op's [2] is <see cref="Unsaid"/>: its rows are decode rows or
+    /// a verify window). An op that is neither marked nor banded carries at most two ip, so its program keeps the bytes and
+    /// signature it had.
     /// </summary>
     public static class GraphAttentionRows
     {

@@ -89,6 +89,7 @@ public static class ModelBrowser
         CatalogFamily.DiffusionGemma => ("diffusiongemma", "DiffusionGemma"),
         CatalogFamily.Wan => ("wan", "Wan"),
         CatalogFamily.Ltx25 => ("ltx", "LTX"),
+        CatalogFamily.Lfm3 => ("lfm", "LFM"),
         _ => (family.ToString().ToLowerInvariant(), family.ToString()),
     };
 

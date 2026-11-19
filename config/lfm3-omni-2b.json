@@ -1,0 +1,48 @@
+{
+  // Liquid LFM3-Omni-2B (Q4_K_M) with its multimodal projector (Q8_0): the LFM3 text
+  // decoder plus one mmproj holding the image/video tower (lfm3vl), the audio encoder
+  // (lfm3a) and the speech generator (lfm3a_gen). Same files as the TensorAgent catalog
+  // entry lfm3-omni-2b-q4km (TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Lfm3.cs).
+  // Pinned to LiquidAI/LFM3-Omni-2B-GGUF@d508b88f08a5b4286f2d2805a6a8d69a0ff44c72; each SHA-256
+  // is the file's LFS object id at that commit. LFM3-Omni-2B-Q4_K_M.gguf: 1099630080 bytes;
+  // mmproj-LFM3-Omni-2B-Q8_0.gguf: 506842528 bytes.
+  // License: LFM Open License v1.0 (lfm1.0).
+  // Run with:
+  //   TensorSharp.Cli         --config config/lfm3-omni-2b.json --image photo.png --input prompt.txt
+  //   TensorSharp.Server.Host --config config/lfm3-omni-2b.json
+  // Omni is not a reasoning model (its template defaults enable_thinking to false). Text
+  // chat works without the projector; image, video and audio input need it, and so do spoken
+  // replies (/v1/audio/speech, and chat completions or Responses asking for audio; see
+  // docs/models/lfm3.md#speech-output). The GGUF declares a 128,000-token window;
+  // MAX_CONTEXT (environment) bounds it.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/lfm3"
+  },
+  "backend": "ggml_metal",
+  "max-tokens": 4096,
+
+  // Greedy, as the publisher's generation_config.json (do_sample false,
+  // repetition_penalty 1.0) and the GGUF's general.sampling.* say for text output.
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+
+  "model": {
+    "path": "${root}/LFM3-Omni-2B-Q4_K_M.gguf",
+    "urls": [
+      "https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/d508b88f08a5b4286f2d2805a6a8d69a0ff44c72/LFM3-Omni-2B-Q4_K_M.gguf"
+    ],
+    "sha256": "9f8d30e9d4fd7a9349d586e077988229b3ca0a0e4ad730897563d1eccc9893e2"
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-LFM3-Omni-2B-Q8_0.gguf",
+    "urls": [
+      "https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/d508b88f08a5b4286f2d2805a6a8d69a0ff44c72/mmproj-LFM3-Omni-2B-Q8_0.gguf"
+    ],
+    "sha256": "8a25f9d1931244429de404fccacfb7fb933970a36aa5688d2f5069f29c6b27b1",
+    "optional": true
+  }
+}

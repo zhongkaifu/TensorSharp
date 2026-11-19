@@ -103,8 +103,9 @@ public sealed class StepCausalMaskTests : IDisposable
     /// <summary>
     /// On the managed CPU executor with prompt chunks' masks forced to arrive as their pattern: a 2048-row chunk (its mask
     /// past the row-parallel fill), a step of the next 52 rows with another request's 100-row prompt, then both decoding.
-    /// The executor's attention reads every prompt mask's values, which the interpreter makes from the pattern: the logits
-    /// are the host masks' bits, and every structural mask bound was made once.
+    /// The executor's attention reads a prompt mask's values, which the interpreter makes from the pattern, except where its
+    /// tiled host attention (ARM64: HostFlashAttention) reads a causal chunk's pattern alone, as the CUDA kernels do: the
+    /// logits are the host masks' bits, and every structural mask bound was made at most once (each one, off ARM64).
     /// </summary>
     [Fact]
     public void StructuralMasksOnTheManagedCpuAnswerAsHostMasks()
@@ -115,7 +116,8 @@ public sealed class StepCausalMaskTests : IDisposable
         var pattern = RunPromptChunks(() => new Qwen35RuntimeModel(path, BackendType.Cpu, 1, null, 1), structural: true);
         Assert.Equal(0, host.Bound);
         Assert.True(pattern.Bound >= 3, $"{pattern.Bound} structural masks bound");   // a's two chunks and b's prompt
-        Assert.Equal(pattern.Bound, pattern.Materialized);
+        if (HostFlashAttention.Supported) Assert.InRange(pattern.Materialized, 0, pattern.Bound);
+        else Assert.Equal(pattern.Bound, pattern.Materialized);
         Assert.Equal(host.MaskInputs, pattern.MaskInputs);
         AssertSameLogits(host.Logits, pattern.Logits, "managed cpu");
     }

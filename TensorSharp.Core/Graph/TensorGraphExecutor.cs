@@ -23,7 +23,7 @@ namespace TensorSharp.Graph
     /// overrides the kernels it has its own implementation of (quantized products, attention,
     /// the recurrences).
     /// </summary>
-    public abstract class TensorGraphExecutor : IStreamingGraphExecutor
+    public abstract partial class TensorGraphExecutor : IStreamingGraphExecutor
     {
         /// <inheritdoc cref="IGraphExecutor.Drafting"/>
         public bool Drafting { get; set; }
@@ -69,6 +69,11 @@ namespace TensorSharp.Graph
         /// <paramref name="src"/> ([.., count, ne0], F32) with a backend kernel; false to use copies.</summary>
         protected virtual bool TryWriteRows(Tensor dst, Tensor src, int first, int count) => false;
 
+        /// <summary>Write rows (<paramref name="first"/> + i) mod cells of <paramref name="dst"/> (along ne1) from
+        /// <paramref name="src"/> ([.., count, ne0], F32): a ring's write that passes its last cell (a sliding-window layer's
+        /// ring cache, a block drafter's K/V ring) in one backend kernel; false to copy each run of cells.</summary>
+        protected virtual bool TryWriteRingRows(Tensor dst, Tensor src, int first, int count) => false;
+
         /// <summary>The backend's element-wise kernels read strided views (no contiguous copy first).</summary>
         protected virtual bool KernelsReadStridedViews => false;
 
@@ -92,6 +97,8 @@ namespace TensorSharp.Graph
             GraphOp.RopeExt, GraphOp.RopeMulti, GraphOp.FlashAttnExt, GraphOp.SoftMaxExt, GraphOp.TopK, GraphOp.SumRows,
             GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow, GraphOp.Sqr, GraphOp.Sqrt, GraphOp.Clamp,
             GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce, GraphOp.MoeHostExperts,
+            // Non-decoder networks (TensorGraphExecutor.Network.cs).
+            GraphOp.Norm, GraphOp.GeluErf, GraphOp.DepthwiseConv2d,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -213,12 +220,7 @@ namespace TensorSharp.Graph
                 owned.Add(scores);
                 Ops.AddmmBatch(scores, 0, scores, scale, q, kt);
                 if (mask != null)
-                {
-                    Tensor m = Contig(F32(mask, owned), owned);
-                    using Tensor m3 = m.View(1, nq, nkv);
-                    using Tensor me = m3.Expand(heads, nq, nkv);
-                    Ops.Add(scores, scores, me);
-                }
+                    AddAttentionMask(scores, Contig(F32(mask, owned), owned));
                 Ops.Softmax(scores, scores);
                 var result = new Tensor(Allocator, DType.Float32, heads, nq, dv);
                 Ops.AddmmBatch(result, 0, result, 1.0f, scores, vh);
@@ -228,6 +230,15 @@ namespace TensorSharp.Graph
             {
                 foreach (Tensor t in owned) t.Dispose();
             }
+        }
+
+        /// <summary><see cref="Attention"/>'s additive mask (contiguous, nq x nkv values) on every head's scores
+        /// [heads, nq, nkv] (contiguous). Default: one add of the mask expanded over the heads.</summary>
+        protected virtual void AddAttentionMask(Tensor scores, Tensor mask)
+        {
+            using Tensor m3 = mask.View(1, scores.Sizes[1], scores.Sizes[2]);
+            using Tensor me = m3.Expand(scores.Sizes);
+            Ops.Add(scores, scores, me);
         }
 
         /// <summary>ggml's flash attention: q [heads, nq, d], k/v [kvHeads, nkv, d] (views), the mask [nq, nkv]
@@ -1117,7 +1128,7 @@ namespace TensorSharp.Graph
 
         /// <summary>A compiled program: validated once, and run by replaying its entries into a session
         /// (nodes nothing reaches are skipped).</summary>
-        private sealed class Plan : IGraphPlan, IGraphTensorOutputs
+        private sealed class Plan : IGraphPlan, IGraphTensorOutputs, IGraphPlanCensus
         {
             public bool KeepTensors { get; set; }
             private Tensor[] _kept;
@@ -1179,20 +1190,31 @@ namespace TensorSharp.Graph
                     }
                 }
                 _dead = new bool[n];
+                long ops = 0, kernels = 0;
                 for (int i = 0; i < n; i++)
                 {
                     _dead[i] = !live[i];
                     if (!live[i]) continue;
                     GraphNode node = nodes[i];
+                    if (node.Kind == GraphNodeKind.Op)
+                    {
+                        ops++;
+                        if (node.Op is not (GraphOp.Reshape or GraphOp.View or GraphOp.Permute or GraphOp.Transpose)) kernels++;
+                    }
                     if (node.Kind == GraphNodeKind.Op && !s_ops.Contains(node.Op))
                         throw new NotSupportedException($"{executor.GetType().Name} has no kernel for {node.Op}");
                     if (node.Kind == GraphNodeKind.Leaf && node.Role != GraphLeafRole.Input && node.Handle is not (Tensor or IGraphWeight))
                         throw new NotSupportedException($"{executor.GetType().Name}: leaf {i} ({node.Role}) carries no tensor or weight");
                 }
                 Outputs = program.OutputFloats.Select(f => new float[f]).ToArray();
+                Census = new GraphPlanCensus(ops, kernels, 0, 0, 0, 0);
             }
 
             public float[][] Outputs { get; }
+
+            /// <summary>The ops a run evaluates (those no output, effect or alias reaches are skipped); every leaf is a tensor
+            /// where the ops run, so no run copies one.</summary>
+            public GraphPlanCensus? Census { get; }
 
             public string LastError { get; private set; }
 
@@ -1666,6 +1688,9 @@ namespace TensorSharp.Graph
                     return V(Ops.SiLUMul(null, In(gate, run), In(up, run)));
                 }
                 case GraphOp.RmsNorm: return V(RowNorm(T(0), Fp(0, 1e-6f), run));
+                case GraphOp.Norm: return V(LayerNormRows(T(0), Fp(0, 1e-6f), run));
+                case GraphOp.GeluErf: return V(GeluErf(In(T(0), run)));
+                case GraphOp.DepthwiseConv2d: return V(DepthwiseConv2dNode(T(0), T(1), n, run));
                 case GraphOp.L2Norm:
                 {
                     // x / max(|x|, eps) as an unweighted RMS norm: 1 / sqrt(sum / n + eps^2 / n) / sqrt(n).
@@ -1771,15 +1796,21 @@ namespace TensorSharp.Graph
                         long keys = m.HostSizes != null ? m.HostSizes[^1] : Ne(m.Tensor)[0];
                         if (keys != nkv) throw new NotSupportedException("a mask wider than the keys");
                         int maskNode = n.Srcs[3];
+                        // A sliding window's band (ip[3]; see GraphAttentionRows) where this executor reads it on the device: the
+                        // mask is the selection it is, read at every run (a recorded step replays each position's band), at most
+                        // `band` keys a row. ip[2] is the rows' kind (GraphAttentionRows), never a band.
+                        int band = Capabilities.BandMasksOnDevice ? (int)Ip(3, 0) : 0;
                         if (!run.Masks.TryGetValue((maskNode, nq), out mask))
                         {
                             Func<Tensor> make = () => Mask(Device(values, maskNode, run), nq, run);
                             // A structural mask is classified from its pattern: the fields a scan of its values finds.
-                            run.Masks[(maskNode, nq)] = mask = m.CausalMask is { } causal
-                                ? Classified(causal.Classify(nq, keys), make)
-                                : Classify(make, m.Floats, nq, keys);
+                            run.Masks[(maskNode, nq)] = mask = band > 0
+                                ? new AttentionMask(MaskPattern.Explicit, 0, make) { KvMax = band }
+                                : m.CausalMask is { } causal
+                                    ? Classified(causal.Classify(nq, keys), make)
+                                    : Classify(make, m.Floats, nq, keys);
                         }
-                        if (Ip(1, 0) > 0) mask.KvMax = (int)Ip(1, 0);
+                        if (band <= 0 && Ip(1, 0) > 0) mask.KvMax = (int)Ip(1, 0);
                     }
                     bool promptChunk = Ip(2, GraphAttentionRows.Unsaid) == GraphAttentionRows.PromptChunk;
                     if (promptChunk) PromptChunkAttentions++;
@@ -2330,9 +2361,17 @@ namespace TensorSharp.Graph
             for (int i = 0; i < count; i++)
                 if (rows[i] < 0 || rows[i] >= d4.Sizes[2])
                     throw new InvalidOperationException($"set_rows index {rows[i]} outside {d4.Sizes[2]} rows");
-            bool run1 = true;
-            for (int i = 1; i < count; i++) run1 &= rows[i] == rows[0] + i;
+            bool run1 = true, ring = true;
+            long cells = d4.Sizes[2];
+            for (int i = 1; i < count; i++)
+            {
+                run1 &= rows[i] == rows[0] + i;
+                ring &= rows[i] == (rows[0] + i) % cells;
+            }
             if (run1 && TryWriteRows(dst, s4, rows[0], count)) return dst;
+            // A ring's write past its last cell: one kernel where the backend has one. Its runs copied apart converted F32 rows
+            // into an F16 ring through the generic copy, which direct CUDA has no strided converting kernel for.
+            if (!run1 && ring && TryWriteRingRows(dst, s4, rows[0], count)) return dst;
             // Each run of consecutive rows in one copy: a ring's write that wraps (a block drafter's prompt inject, 1,569 rows
             // into a 2,080-row ring) is two, where a copy a row took 6 ms a layer on CUDA.
             for (int i = 0; i < count;)
@@ -2513,6 +2552,9 @@ namespace TensorSharp.Graph
             // Read on the host only where the host needs them (multi-axis rows, or no device positions): a recorded step's
             // varying positions are never read back.
             int[] pos = multi || !BroadcastsPositionsOnDevice || positions.Tensor == null ? Ints(positions) : null;
+            // A vision tower's 2-D rotary (ggml's VISION mode) rotates pairs (i, i + n_dims) over the whole head, sections
+            // reading different axes: never the NeoX shortcut below, and not the interleaved host loop after it.
+            if (multi && mode == RopeTypeVision) return RopeVision(x, pos, n, run);
             // Multi-axis rotary whose axes all carry the same position (every text token) is NeoX rotary at
             // that position: the device kernel, not the host loop below (which reads and writes the rows).
             if (multi && extFactor == 0f && pos.Length >= 3 * tokens && SameAxes(pos, tokens, n.Ip.Length > 6 && n.Ip[6] > 0 ? 4 : 3))

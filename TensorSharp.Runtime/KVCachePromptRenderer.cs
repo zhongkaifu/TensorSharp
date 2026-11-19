@@ -827,10 +827,16 @@ namespace TensorSharp.Runtime
                     ImageTimestamps = msg.ImageTimestamps,
                     AudioPaths = msg.AudioPaths,
                     IsVideo = msg.IsVideo,
+                    // What LFM3's media layout reads besides the lists above (Lfm3MediaLayout):
+                    // the expander sees the original message, so the render must see the same.
+                    VideoFilePaths = msg.VideoFilePaths,
+                    AttachmentPaths = msg.AttachmentPaths,
+                    AttachmentNames = msg.AttachmentNames,
                     // Kept for the Jinja context's narrowly scoped Gemma 4 replay.
                     RawOutputTokens = msg.RawOutputTokens,
                     RawPromptTrailingWhitespace = msg.RawPromptTrailingWhitespace,
                     RawGenerationSuffix = msg.RawGenerationSuffix,
+                    SpeechFrames = msg.SpeechFrames,
                     RawToolCallReplayPlaceholder = rawToolCallReplayPlaceholder,
                 });
             }

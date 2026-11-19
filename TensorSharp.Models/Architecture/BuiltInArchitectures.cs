@@ -43,6 +43,7 @@ namespace TensorSharp.Models.Architecture
             NemotronArchitecture.Descriptor,
             Mistral3Architecture.Descriptor,
             HunyuanDenseArchitecture.Descriptor,
+            Lfm3Architecture.Descriptor,
             MuseGlimmerArchitecture.Descriptor,
             MuseSparkArchitecture.Descriptor,
             DeepSeek4Architecture.Descriptor,

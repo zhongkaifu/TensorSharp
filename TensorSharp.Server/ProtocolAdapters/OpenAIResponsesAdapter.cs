@@ -37,7 +37,7 @@ namespace TensorSharp.Server.ProtocolAdapters;
 /// share one temporary request workspace, which is deleted before this method
 /// returns and never becomes cross-request state.
 /// </summary>
-public sealed class OpenAIResponsesAdapter
+public sealed partial class OpenAIResponsesAdapter
 {
     private readonly ModelService _svc;
     private readonly KnowledgeStore? _knowledge;
@@ -139,7 +139,23 @@ public sealed class OpenAIResponsesAdapter
         // hard-coded 200 that silently ignored the operator's config.
         int maxOutputTokens = _options.ResolveMaxTokens(requestedOutputTokens);
 
+        if (!SamplingConfigParser.TryValidateIgnoreEos(body, out string ignoreEosError))
+        {
+            logger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/responses rejected: {Error} (model={Model})", ignoreEosError, modelName);
+            await WriteErrorAsync(ctx, 400, ignoreEosError).ConfigureAwait(false);
+            return;
+        }
         var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
+        // A spoken response (modalities with "audio"), as /v1/chat/completions takes it.
+        SpeechReplyRequest speech = SpeechReplyRequest.Parse(body, stream, out string speechError);
+        speechError ??= speech?.Refusal(_svc.SpeechOutputModel, _svc.Architecture);
+        if (speechError != null)
+        {
+            logger.LogWarning(LogEventIds.HttpRequestRejected, "/v1/responses rejected: {Error} (model={Model})", speechError, modelName);
+            await WriteErrorAsync(ctx, 400, speechError).ConfigureAwait(false);
+            return;
+        }
         var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens,
             reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);
         if (knowledge == null) return;
@@ -184,6 +200,24 @@ public sealed class OpenAIResponsesAdapter
         }
         samplingConfig.ReasoningEffort = reasoningEffort;
         var requestedSkills = SkillSelectionParser.Parse(body);
+        if (speech != null)
+        {
+            string conflict = tools is { Count: > 0 } ? "tools"
+                : body.TryGetProperty("text", out var textFormat) && textFormat.ValueKind == JsonValueKind.Object && textFormat.TryGetProperty("format", out _) ? "text.format"
+                : enableThinking ? "reasoning"
+                : requestedSkills is { Count: > 0 } ? "skills"
+                : knowledge.Enabled ? "knowledge retrieval"
+                : null;
+            if (conflict != null)
+            {
+                await WriteErrorAsync(ctx, 400, $"A spoken response (modalities with \"audio\") is not combined with {conflict}: ask for modalities [\"text\"] for that.")
+                    .ConfigureAwait(false);
+                return;
+            }
+            await SpeechResponseAsync(ctx, OpenAIResponsesFactory.NewResponseId(), modelName!, instructions, maxOutputTokens, messages,
+                samplingConfig, speech, stream, store, logger).ConfigureAwait(false);
+            return;
+        }
 
         string requestId = OpenAIResponsesFactory.NewResponseId();
         // gen_ai.response.id on the HTTP server span (see OpenAIChatAdapter for why there) —
@@ -236,6 +270,13 @@ public sealed class OpenAIResponsesAdapter
             workspace: workspaceLease?.Workspace, logger: logger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does. A whole
+        // reply: a round cut short reads as its stream would, as the adapter's own parse does.
+        if (skillPlan != null)
+        {
+            skillPlan.ClientStreamsAppendOnly = stream;
+            skillPlan.ClientReadsWholeReply = !stream;
+        }
 
         knowledge.Plan = skillPlan;
 
@@ -376,7 +417,7 @@ public sealed class OpenAIResponsesAdapter
         }
 
         var collector = new ChatStreamCollector();
-        int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
+        int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0, reasoningTokens = 0;
         string? pipelineFinishReason = null;
 
         await foreach (var update
@@ -392,6 +433,7 @@ public sealed class OpenAIResponsesAdapter
                 promptTokens = update.PromptTokens;
                 evalTokens = update.EvalTokens;
                 kvReusedTokens = update.KvCacheReusedTokens;
+                reasoningTokens = update.ReasoningTokens;
                 pipelineFinishReason = update.FinishReason;
             }
         }
@@ -418,7 +460,8 @@ public sealed class OpenAIResponsesAdapter
         }
         else if (useParser || collector.IsParsed)
         {
-            var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools);
+            var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools,
+                FinishReasonMapper.IsTruncated(pipelineFinishReason));
 
             if (!string.IsNullOrEmpty(parsed.Content))
                 output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), knowledge.Normalize(parsed.Content), itemStatus));
@@ -436,7 +479,7 @@ public sealed class OpenAIResponsesAdapter
         var response = knowledge.WithSources(OpenAIResponsesFactory.Response(
             requestId, _svc.LoadedModelName, status, instructions, maxOutputTokens, output,
             store, samplingConfig, promptTokens, evalTokens, kvReusedTokens,
-            incompleteReason: incompleteReason));
+            incompleteReason: incompleteReason, reasoningTokens: reasoningTokens));
 
         string json = JsonSerializer.Serialize(response, JsonOptions.IgnoreNulls);
         if (store)
@@ -488,6 +531,8 @@ public sealed class OpenAIResponsesAdapter
         {
             parser = OutputParserFactory.Create(_svc.Architecture);
             parser.Init(enableThinking, tools);
+            // Output deltas cannot be taken back (IOutputParser.StreamWithoutHolding).
+            parser.StreamWithoutHolding();
         }
 
         var buffer = bufferForStructured ? new StringBuilder() : null;
@@ -495,7 +540,7 @@ public sealed class OpenAIResponsesAdapter
         var messageText = new StringBuilder();
         var toolCalls = new List<ToolCall>();
         int outputIndex = 0;
-        int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
+        int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0, reasoningTokens = 0;
         string? pipelineFinishReason = null;
         // Set when the skills loop hands over already-separated pieces (see
         // SkillChatLoop). `parser` is bypassed for those, so it must not be flushed
@@ -579,6 +624,7 @@ public sealed class OpenAIResponsesAdapter
             promptTokens = update.PromptTokens;
             evalTokens = update.EvalTokens;
             kvReusedTokens = update.KvCacheReusedTokens;
+            reasoningTokens = update.ReasoningTokens;
             pipelineFinishReason = update.FinishReason;
         }
 
@@ -650,7 +696,7 @@ public sealed class OpenAIResponsesAdapter
         var response = knowledge.WithSources(OpenAIResponsesFactory.Response(
             requestId, _svc.LoadedModelName, status, instructions, maxOutputTokens, output,
             store, samplingConfig, promptTokens, evalTokens, kvReusedTokens,
-            incompleteReason: incompleteReason));
+            incompleteReason: incompleteReason, reasoningTokens: reasoningTokens));
 
         if (store)
             _store.Store(new StoredResponse { Id = requestId, Json = JsonSerializer.Serialize(response, JsonOptions.IgnoreNulls) });

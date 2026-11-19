@@ -16,7 +16,9 @@ namespace InferenceWeb.Tests;
 /// verify of 2, 4, 5 or 6 drafts) now runs the kernel of its own width instead of the next power of two's. A row's arithmetic
 /// does not depend on the width, so each width must answer bit for bit as the padded dispatch did, and as the row's own
 /// one-row decode step. Flash Next's dense projections: IQ4_XS 2560 -> 10240 (qkv), Q4_K 2560 -> 6144 (gate), Q5_K
-/// 6144 -> 2560 (ssm_out), Q8_0 10240 -> 320 (the hyper-connection down copies), Q3_K 2560 -> 512 (k), Q2_0 2560 -> 12288 (q).
+/// 6144 -> 2560 (ssm_out), Q8_0 10240 -> 320 (the hyper-connection down copies), Q3_K 2560 -> 512 (k), Q2_0 2560 -> 12288 (q);
+/// LFM3-1.7B's Q4_K 2048 -> 15360 (gate/up) and Q6_K 2048 -> 16384. The one-row step of a one-warp output wide enough takes
+/// two output rows a warp, so the comparison with it also holds that kernel to the one-row warp's sums.
 /// </summary>
 public sealed class Dsv4DenseFastWidthTests
 {
@@ -46,6 +48,10 @@ public sealed class Dsv4DenseFastWidthTests
     [InlineData((int)GgmlTensorType.Q8_0, 10240, 320)]
     [InlineData((int)GgmlTensorType.Q3_K, 2560, 512)]
     [InlineData(Q2_0, 2560, 12288)]
+    // LFM3-1.7B's fused gate/up and a Q6_K head slice: one-warp outputs whose decode row takes two output rows a warp
+    // (Dsv4Kernels.DenseQ81Rows' ts_dsv4_dense_fast_r1_w1_p2_f32), which must give each row the one-row warp's sum.
+    [InlineData((int)GgmlTensorType.Q4_K, 2048, 15360)]
+    [InlineData((int)GgmlTensorType.Q6_K, 2048, 16384)]
     public void EveryWindowWidth_AnswersAsThePaddedDispatchAndTheOneRowStep(int type, int inDim, int outDim)
     {
         using var allocator = new CudaAllocator(0);

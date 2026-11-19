@@ -379,6 +379,16 @@ namespace TensorSharp.Runtime
         public bool CapsVideoFrames { get; init; }
 
         /// <summary>
+        /// True when this family's model reads a video FILE itself - its own frame sampling and
+        /// the clip's soundtrack (LFM3-Omni, <see cref="Lfm3MediaLayout"/>) - so an OpenAI
+        /// <c>video_url</c> or Responses <c>input_video</c> part is saved and named in
+        /// <see cref="ChatMessage.VideoFilePaths"/> without the host sampling frames from it:
+        /// those frames would be decoded and written only to be ignored. Such a video is not
+        /// in <see cref="ChatMessage.ImagePaths"/>, so a message's still images precede it.
+        /// </summary>
+        public bool ReadsVideoFiles { get; init; }
+
+        /// <summary>
         /// False when this family's renderer never puts TOOL DECLARATIONS in the
         /// prompt, so a tool offered to it can never be called.
         ///

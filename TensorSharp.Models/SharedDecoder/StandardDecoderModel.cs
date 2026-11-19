@@ -168,8 +168,10 @@ namespace TensorSharp.Models
                 if (draft && rank > 0) return null;
                 IAllocator alloc = _mesh.Allocator(CacheStage(entry), rank);
                 int kvHeads = draft ? Config.NumKVHeads : _localKvHeads;
-                t = value ? new Tensor(alloc, dtype, kvHeads, capacity, _valueDim)
-                          : new Tensor(alloc, dtype, kvHeads, capacity, _keyDim);
+                // A sliding-window layer's ring holds at most its cells (StandardDecoderModel.SlidingRings.cs).
+                int cells = CacheCells(entry, capacity);
+                t = value ? new Tensor(alloc, dtype, kvHeads, cells, _valueDim)
+                          : new Tensor(alloc, dtype, kvHeads, cells, _keyDim);
             }
             ZeroCacheRows(t, zeroFrom);
             return t;
@@ -241,6 +243,40 @@ namespace TensorSharp.Models
         protected virtual System.Collections.Generic.IEnumerable<string> ReplicatedLayerWeights(int layer)
             => Array.Empty<string>();
 
+        /// <summary>
+        /// The sliding attention window of an attention layer: a query at position p attends the keys at positions
+        /// (p - window, p] (llama.cpp's LLAMA_SWA_TYPE_STANDARD: a key is masked when p_query - p_key &gt;= window); 0 for
+        /// full causal attention (the default). The layer keeps a ring of the window plus a prompt step's rows
+        /// (StandardDecoderModel.SlidingRings.cs): linear until a slot's positions reach it, where each step reads only the cells
+        /// its rows' windows reach (the graph path's cache window starts below the first row's window, or masks the band over a
+        /// capacity window; the per-op path's kernels start there), then the whole ring under the mask of the positions its
+        /// cells hold.
+        /// </summary>
+        protected virtual int SlidingWindow(int layer) => 0;
+
+        /// <summary>
+        /// The per-op counterpart of <see cref="EmitAttentionOutput"/>: what a family applies to the attention result
+        /// <paramref name="attn"/> [tokens, LocalHeads * ValueDim] of <paramref name="scope"/>'s rank before the output
+        /// projection, given the layer's normed input <paramref name="input"/> [tokens, hidden]. Returns the result (it may be
+        /// <paramref name="attn"/> changed in place, or a new tensor, the caller then disposing <paramref name="attn"/>).
+        /// Default: nothing.
+        /// </summary>
+        protected virtual Tensor GateAttentionOutput(RankScope scope, int layer, Tensor input, Tensor attn) => attn;
+
+        /// <summary>A family's extra per-head weights of an attention layer whose output rows follow the query heads (a head-wise
+        /// output gate's projection, one row per head): under tensor parallelism they shard by contiguous head blocks as the
+        /// query does, so each rank reads its own heads' rows. Default: none.</summary>
+        protected virtual System.Collections.Generic.IEnumerable<string> HeadParallelLayerWeights(int layer)
+            => Array.Empty<string>();
+
+        /// <summary>The weight of a norm the token mixer's output takes before it joins the residual stream (a "sandwich" block:
+        /// LFM2/LFM3's post_attention_norm), or null (the default). Both paths apply it after a tensor-parallel reduce.</summary>
+        protected virtual string MixerPostNormWeight(int layer) => null;
+
+        /// <summary>The weight of a norm the feed-forward's output takes before it joins the residual stream (LFM2/LFM3's
+        /// post_ffw_norm), or null (the default). The per-op path then runs the feed-forward without its fused residual.</summary>
+        protected virtual string FfnPostNormWeight(int layer) => null;
+
         // ---------------------------------------------------------------- geometry
 
         protected int KeyDim => _keyDim;
@@ -265,6 +301,9 @@ namespace TensorSharp.Models
 
         /// <summary>The ggml type a loaded quantized weight is held in (-1: not a quantized weight).</summary>
         internal int QuantizedWeightTypeForTests(string name) => _quantWeights.TryGetValue(name, out QuantizedWeight w) ? w.GgmlType : -1;
+
+        /// <summary>The per-tensor output scale of a loaded quantized weight (an NVFP4 .scale sidecar; 1 without one).</summary>
+        internal float QuantizedWeightScaleForTests(string name) => _quantWeights.TryGetValue(name, out QuantizedWeight w) ? w.Scale : float.NaN;
 
         /// <summary>Placement summary, e.g. "2 whole-layer stages x tensor parallel 2 = 4 devices".</summary>
         public string PlacementDescription => _mesh?.Describe() ?? "not initialized";
@@ -425,6 +464,21 @@ namespace TensorSharp.Models
         /// layers read more than the embedding (Flash Next's per-layer n-gram rows).</summary>
         protected int[] StepTokens { get; private set; }
 
+        /// <summary>A plain prompt's steps of one sequence overlap on the device (<see cref="IGraphExecutor.OverlapSteps"/>): each
+        /// step's run returns with its work queued while the host embeds, traces and builds the next. Off by default: a family
+        /// opts in once its prompt path between steps is known to read nothing back from the device unwaited (every host read,
+        /// buffer release and upload waits for the queued work first).</summary>
+        protected virtual bool OverlapsPromptSteps => false;
+
+        /// <summary>Tests: prompt steps run one after another even where the family overlaps them.</summary>
+        internal bool PromptOverlapDisabledForTests { get; set; }
+
+        private bool OverlapPromptSteps => OverlapsPromptSteps && !PromptOverlapDisabledForTests;
+
+        /// <summary>A family whose prompt steps overlap (<see cref="OverlapsPromptSteps"/>) embeds them on the host on ggml-cuda
+        /// and ggml-vulkan too: the device lookup was a graph of its own whose download waited for the step before it.</summary>
+        protected override bool EmbedsPromptRowsOnHost => OverlapsPromptSteps && _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
+
         private Tensor EmbedStep(int[] tokens)
         {
             StepTokens = tokens;
@@ -496,6 +550,7 @@ namespace TensorSharp.Models
             _maxContextLength = maxContext;
             _cacheCapacity = initial;
             InitExtraCaches();
+            InitRingCaches();
             (_cacheK, _cacheV) = AllocateCaches(initial);
             _cacheSeqLen = 0;
         }
@@ -528,10 +583,12 @@ namespace TensorSharp.Models
 
         private Tensor Grow(Tensor old, Tensor grown)
         {
-            if (_cacheSeqLen > 0)
+            // A ring past its first lap moves whole (its cells keep their positions: both have the ring's cells).
+            int rows = (int)Math.Min(_cacheSeqLen, old.Sizes[1]);
+            if (rows > 0)
             {
-                using Tensor src = old.Narrow(1, 0, _cacheSeqLen);
-                using Tensor dst = grown.Narrow(1, 0, _cacheSeqLen);
+                using Tensor src = old.Narrow(1, 0, rows);
+                using Tensor dst = grown.Narrow(1, 0, rows);
                 Ops.Copy(dst, src);
             }
             InvalidateTensorDeviceCache(old);
@@ -563,8 +620,9 @@ namespace TensorSharp.Models
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
-            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t);
-            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t);
+            // Rows past the length are masked out of every read: the device copies stay (no re-upload on the next step).
+            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t, keepDeviceCopy: true);
+            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t, keepDeviceCopy: true);
             ResetRecurrentPrimary();
             // Rows past the length are dead and the states were rewritten on the host.
             _cacheDeviceDirty = false;
@@ -585,6 +643,9 @@ namespace TensorSharp.Models
                         $"{Config.Architecture} has recurrent layers: its cache truncates only to its length or to zero, not {tokenCount}.");
                 ResetRecurrentPrimary();
             }
+            if (!RingsKeepTruncation(_cacheSeqLen, tokenCount))
+                throw new NotSupportedException(
+                    $"{Config.Architecture}: its sliding-window rings overwrote positions a {tokenCount}-token history reads (length {_cacheSeqLen}).");
             base.TruncateKVCacheCore(tokenCount);
             foreach (Tensor t in AllCacheTensors(_cacheK)) InvalidateTensorDeviceCache(t);
             foreach (Tensor t in AllCacheTensors(_cacheV)) InvalidateTensorDeviceCache(t);
@@ -595,7 +656,9 @@ namespace TensorSharp.Models
         // snapshot restores exactly what a fresh prefill writes. The fingerprint carries the
         // mesh shape: a TP=2 snapshot holds half-head rows and must never reach a TP=1 cache.
 
-        public override bool SupportsKVStateSnapshot => LayerSplitGroup == null && _cacheK != null && !_anyRecurrent;
+        // Ring caches (sliding-window layers past their first lap) are not position-addressed pages.
+        public override bool SupportsKVStateSnapshot => LayerSplitGroup == null && _cacheK != null && !_anyRecurrent
+            && !HasRingCaches;
 
         public override string KVStateFingerprint =>
             $"{Config.Architecture}|decoder|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}" +
@@ -652,10 +715,24 @@ namespace TensorSharp.Models
                 if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
                     return ForwardCore(tokens);
                 int last = tokens.Length - 1;
-                for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+                // The chunks' steps overlap on the device across chunk boundaries too (InRingSteps' scopes nest in this one).
+                IDisposable overlap = null;
+                if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null)
                 {
-                    int len = Math.Min(PrefillChunkTokens, last - pos);
-                    RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+                    EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
+                    overlap = GraphExecutor.OverlapSteps();
+                }
+                try
+                {
+                    for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+                    {
+                        int len = Math.Min(PrefillChunkTokens, last - pos);
+                        RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+                    }
+                }
+                finally
+                {
+                    overlap?.Dispose();
                 }
                 return ForwardCore(new[] { tokens[last] });
             }
@@ -670,7 +747,9 @@ namespace TensorSharp.Models
             ArgumentNullException.ThrowIfNull(tokens);
             if (tokens.Length == 0) throw new ArgumentException("A forward needs at least one token.", nameof(tokens));
             if (LayerSplitGroup?.NodeCount > 1)
-                return ForwardDistributedPipeline(tokens);
+                return tokens.Length > _maxSequenceStepRows
+                    ? InRingSteps(tokens, true, (piece, _) => ForwardDistributedPipeline(piece))
+                    : ForwardDistributedPipeline(tokens);
             _logitsBuffer = RunSequence(tokens, wantLogits: true);
             _forwardCount++;
             return _logitsBuffer;
@@ -678,6 +757,8 @@ namespace TensorSharp.Models
 
         private float[] RunSequence(int[] tokens, bool wantLogits)
         {
+            if (tokens.Length > _maxSequenceStepRows)
+                return InRingSteps(tokens, wantLogits, RunSequence, overlapSteps: true);
             SettlePendingVerify();
             int seqLen = tokens.Length;
             int start = _cacheSeqLen;
@@ -705,8 +786,10 @@ namespace TensorSharp.Models
                 _draftCarry = active.DraftCarry;
 
                 float[][] graphLogits = null;
+                // A driven request's media prompt also returns its last final hidden row (ForwardUnifiedMediaRows).
+                float[][] lastHidden = wantLogits && _promptHiddenOut != null ? new[] { _promptHiddenOut } : null;
                 if (RunFollowingDFlash(ref dflash, plan => TryRunGraph(hidden, new[] { active }, new[] { 0 }, new[] { seqLen }, new[] { start },
-                        wantLogits, out graphLogits, positions.Table, follow, draftRows, plan, prompt: ForwardIsPrompt || _promptScope)))
+                        wantLogits, out graphLogits, lastHidden, positions.Table, follow, draftRows, plan, prompt: ForwardIsPrompt || _promptScope)))
                 {
                     hidden.Dispose();
                     _cacheDeviceDirty = true;
@@ -725,7 +808,7 @@ namespace TensorSharp.Models
                 hidden = RunLayers(hidden, positions, batch: null);
                 float[] logits = null;
                 if (wantLogits)
-                    logits = ProjectRows(hidden, new[] { seqLen - 1 });
+                    logits = ProjectRows(hidden, new[] { seqLen - 1 }, wantLogits: true, lastHidden);
                 hidden.Dispose();
                 _cacheSeqLen += seqLen;
                 return logits;
@@ -870,7 +953,12 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Final norm and LM head for <paramref name="rows"/> of <paramref name="hidden"/>.</summary>
-        private float[] ProjectRows(Tensor hidden, int[] rows)
+        private float[] ProjectRows(Tensor hidden, int[] rows) => ProjectRows(hidden, rows, wantLogits: true, lastHidden: null);
+
+        /// <summary>The final norm of <paramref name="rows"/> of <paramref name="hidden"/>, then the head (with
+        /// <paramref name="wantLogits"/>; null without); row i's normed values go to <paramref name="lastHidden"/>[i] where it
+        /// is set (a step driver's input).</summary>
+        private float[] ProjectRows(Tensor hidden, int[] rows, bool wantLogits, float[][] lastHidden)
         {
             Tensor normed = RMSNormOp(hidden, "output_norm.weight");
             Tensor selected;
@@ -893,6 +981,19 @@ namespace TensorSharp.Models
                 for (int i = 0; i < rows.Length; i++)
                     Array.Copy(all, (long)rows[i] * dim, packed, (long)i * dim, dim);
                 selected = CreateFloatTensor(packed, rows.Length, dim);
+            }
+
+            if (lastHidden != null && Array.Exists(lastHidden, h => h != null))
+            {
+                int dim = Config.HiddenSize;
+                float[] values = selected.GetElementsAsFloat(rows.Length * dim);
+                for (int i = 0; i < rows.Length; i++)
+                    if (lastHidden[i] != null) Array.Copy(values, (long)i * dim, lastHidden[i], 0, dim);
+            }
+            if (!wantLogits)
+            {
+                selected.Dispose();
+                return null;
             }
 
             long t0 = Stopwatch.GetTimestamp();
@@ -922,6 +1023,14 @@ namespace TensorSharp.Models
                 : RMSNormOp(hidden, p + "attn_norm.weight");
             Tensor attn = Mixer(scope, normed, layer, positions, batch);
             normed.Dispose();
+            // A sandwich block norms the mixer's output before the residual add (the fused add + norm below then adds it).
+            if (MixerPostNormWeight(layer) is { } mixPost)
+            {
+                Tensor post = RMSNormOp(attn, mixPost);
+                attn.Dispose();
+                attn = post;
+            }
+            string ffnPost = FfnPostNormWeight(layer);
 
             // MLX: (hidden += attn; normed2 = rmsnorm(hidden)) in one dispatch.
             Tensor normed2 = null;
@@ -935,23 +1044,36 @@ namespace TensorSharp.Models
                     normed2 = null;
                 }
             }
+            Tensor ffn = null;
             if (normed2 == null)
             {
                 Ops.Add(hidden, hidden, attn);
                 attn.Dispose();
-                // GGML: norm + gate/up + SiLU*mul + down + residual in one graph.
-                if (_gateUpFused[layer] &&
+                // GGML: norm + gate/up + SiLU*mul + down + residual in one graph; with a post-norm on the feed-forward's
+                // output, the same graph without the residual (the norm and the add follow on its small result).
+                if (_gateUpFused[layer] && ffnPost == null &&
                     TryFusedDenseSwiGLUFFNInto(hidden, ffnNormName, p + "ffn_gate_up.weight", p + "ffn_down.weight"))
                     return hidden;
-                normed2 = RMSNormOp(hidden, ffnNormName);
+                if (_gateUpFused[layer] && ffnPost != null && scope.Degree == 1)
+                    ffn = TryFusedDenseFFNProject(hidden, ffnNormName, p + "ffn_gate_up.weight", p + "ffn_down.weight", actType: 0);
+                if (ffn == null) normed2 = RMSNormOp(hidden, ffnNormName);
             }
             else
             {
                 attn.Dispose();
             }
 
-            Tensor ffn = Ffn(scope, normed2, layer);
-            normed2.Dispose();
+            if (ffn == null)
+            {
+                ffn = Ffn(scope, normed2, layer);
+                normed2.Dispose();
+            }
+            if (ffnPost != null)
+            {
+                Tensor post = RMSNormOp(ffn, ffnPost);
+                ffn.Dispose();
+                ffn = post;
+            }
             Ops.Add(hidden, hidden, ffn);
             ffn.Dispose();
             return hidden;
@@ -976,14 +1098,22 @@ namespace TensorSharp.Models
                 partial[r] = Mixer(scope, normed, layer, positions, batch);
             });
             _mesh.AllReduce(stage, partial);
+            Tensor mixPost = MixerPostNormWeight(layer) is { } mixPostName ? _weights[mixPostName] : null;
             _mesh.RunPerRank(stage, r =>
             {
+                if (mixPost != null)
+                {
+                    Tensor normed = Ops.RMSNorm(null, partial[r], Replica(mixPost, stage, r), null, Config.Eps);
+                    partial[r].Dispose();
+                    partial[r] = normed;
+                }
                 Ops.Add(hidden[r], hidden[r], partial[r]);
                 partial[r].Dispose();
                 partial[r] = null;
             });
 
             Tensor ffnNorm = _weights[FfnNormWeight(layer)];
+            Tensor ffnPost = FfnPostNormWeight(layer) is { } ffnPostName ? _weights[ffnPostName] : null;
             if (_moeLayer[layer])
             {
                 // Routing is identical on every rank (replicated input and router): decide it
@@ -1009,6 +1139,12 @@ namespace TensorSharp.Models
             _mesh.AllReduce(stage, partial);
             _mesh.RunPerRank(stage, r =>
             {
+                if (ffnPost != null)
+                {
+                    Tensor normed = Ops.RMSNorm(null, partial[r], Replica(ffnPost, stage, r), null, Config.Eps);
+                    partial[r].Dispose();
+                    partial[r] = normed;
+                }
                 Ops.Add(hidden[r], hidden[r], partial[r]);
                 partial[r].Dispose();
             });
@@ -1071,18 +1207,27 @@ namespace TensorSharp.Models
 
             long t0 = Stopwatch.GetTimestamp();
             Tensor cacheK = _cacheK[layer][scope.Rank], cacheV = _cacheV[layer][scope.Rank];
+            int band = SlidingWindow(layer);
             Tensor attn = batch != null
                 ? SlotAttention(scope, layer, q, k, v, batch)
+                : RingWrapped(layer, positions.Start, tokens)
+                    ? RingAttention(scope, cacheK, cacheV, RingOf(layer), q, k, v, positions.Start, tokens, band)
                 : decode
-                    ? DecodeAttention(scope, cacheK, cacheV, _cacheCapacity, q, k, v, positions.Start)
+                    ? DecodeAttention(scope, cacheK, cacheV, (int)cacheK.Sizes[1], q, k, v, positions.Start, band)
                     : AttendsWindowOnHost(cacheK, tokens)
-                        ? WindowAttention(scope, cacheK, cacheV, q, k, v, positions.Start, tokens)
-                        : PrefillAttention(scope, cacheK, cacheV, q, k, v, positions.Start, tokens);
+                        ? WindowAttention(scope, cacheK, cacheV, q, k, v, positions.Start, tokens, band)
+                        : PrefillAttention(scope, cacheK, cacheV, q, k, v, positions.Start, tokens, band);
             _attnTicks += Stopwatch.GetTimestamp() - t0;
             if (gate != null)
             {
                 Ops.SigmoidMul(attn, attn, gate);
                 gate.Dispose();
+            }
+            Tensor gated = GateAttentionOutput(scope, layer, input, attn);
+            if (!ReferenceEquals(gated, attn))
+            {
+                attn.Dispose();
+                attn = gated;
             }
 
             Tensor output = Linear(scope, attn, p + "attn_output.weight");
@@ -1108,17 +1253,24 @@ namespace TensorSharp.Models
         }
 
         /// <summary>MLX's fused SDPA over the cache rows [0, <paramref name="kvLen"/>) for the last
-        /// <paramref name="rows"/> query rows (causal), reading the cache in place.</summary>
-        private bool MlxCachedAttention(RankScope scope, Tensor result, Tensor q, Tensor cacheK, Tensor cacheV, int rows, int kvLen, float scale)
+        /// <paramref name="rows"/> query rows (causal, within <paramref name="band"/> keys of each row when it is positive),
+        /// reading the cache in place.</summary>
+        private bool MlxCachedAttention(RankScope scope, Tensor result, Tensor q, Tensor cacheK, Tensor cacheV, int rows, int kvLen, float scale,
+            int band = 0)
             => _backend == BackendType.Mlx && scope.Degree == 1 && _keyDim == _valueDim && q.IsContiguous()
                && MlxFusedOps.TryCachedAttention(result, q, cacheK, cacheV, scope.LocalHeads, scope.LocalKvHeads, _keyDim, rows, kvLen, scale,
-                   kvFloor: _attentionFloor);
+                   slidingWindow: band, kvFloor: _attentionFloor);
 
         /// <summary>Cache rows below this are not attended by the per-op path (a draft layer that resumed
         /// after a gap); 0 for the trunk.</summary>
         private int _attentionFloor;
 
-        private Tensor DecodeAttention(RankScope scope, Tensor cacheK, Tensor cacheV, int capacity, Tensor q, Tensor k, Tensor v, int start)
+        /// <summary>A decode row at <paramref name="start"/> attends keys [first, start] (<paramref name="band"/>: its
+        /// sliding window, 0 for none).</summary>
+        private static int DecodeFirstKey(int start, int band) => band > 0 ? Math.Max(0, start + 1 - band) : 0;
+
+        private Tensor DecodeAttention(RankScope scope, Tensor cacheK, Tensor cacheV, int capacity, Tensor q, Tensor k, Tensor v, int start,
+            int band = 0)
         {
             int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
             float scale = 1.0f / MathF.Sqrt(_keyDim);
@@ -1126,22 +1278,60 @@ namespace TensorSharp.Models
             k.Dispose();
             v.Dispose();
 
+            int first = DecodeFirstKey(start, band), keys = start + 1 - first;
             var result = new Tensor(scope.Allocator, DType.Float32, 1, heads * _valueDim);
             // MLX keeps K/V on the device and runs its fused SDPA over a strided view of the
             // cache's live rows (mlx-lm's update_and_fetch + scaled_dot_product_attention); the
             // host path would copy the whole cache back every token.
-            bool done = MlxCachedAttention(scope, result, q, cacheK, cacheV, 1, start + 1, scale)
+            bool done = MlxCachedAttention(scope, result, q, cacheK, cacheV, 1, start + 1, scale, band)
                 || (_backend == BackendType.Mlx && scope.Degree == 1 && MlxFusedOps.TryDecodeAttention(
-                    result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, capacity, false, scale));
+                    result, q, cacheK, cacheV, heads, kvHeads, _keyDim, first, keys, capacity, false, scale));
             // Direct CUDA: GQA decode attention on the device over the head-first cache in place.
             // The host path below copies the whole cache to the host every layer.
             if (!done && _backend == BackendType.Cuda)
                 done = TensorSharp.Cuda.CudaFusedOps.TryGqaDecodeAttention(
-                    result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, (int)cacheK.Sizes[1], false, scale);
+                    result, q, cacheK, cacheV, heads, kvHeads, _keyDim, first, keys, (int)cacheK.Sizes[1], false, scale);
+            if (!done && first > 0 && (cacheK.ElementType == DType.Float32 || cacheK.ElementType == DType.Float16) && cacheK.ElementType == cacheV.ElementType)
+                done = WindowDecodeOnHost(q, cacheK, cacheV, result, heads, kvHeads, first, keys, scale);
+            if (!done && first > 0)
+            {
+                // A block-quantized cache: its live rows widened, then the window's keys from there.
+                using Tensor kF32 = ExpandKVHeadsBlockQuant(cacheK, 1, start + 1);
+                using Tensor vF32 = ExpandKVHeadsBlockQuant(cacheV, 1, start + 1);
+                done = WindowDecodeOnHost(q, kF32, vF32, result, heads, kvHeads, first, keys, scale);
+            }
             if (!done)
                 AttentionDecodePureCS(q, cacheK, cacheV, result, heads, kvHeads, _keyDim, start + 1, scale);
             q.Dispose();
             return result;
+        }
+
+        /// <summary>One decode row's attention over keys [<paramref name="first"/>, first + <paramref name="keys"/>) of a head-first
+        /// F32 or F16 cache, in place on the host (the cache's base offset by the first key; rows keep the cache's stride).</summary>
+        private unsafe bool WindowDecodeOnHost(Tensor q, Tensor cacheK, Tensor cacheV, Tensor result, int heads, int kvHeads, int first, int keys,
+            float scale)
+        {
+            if (_keyDim != _valueDim || cacheK.ElementType != cacheV.ElementType) return false;
+            Tensor query = q.IsContiguous() ? q : Ops.NewContiguous(q);
+            try
+            {
+                int capacity = (int)cacheK.Sizes[1];
+                long skip = (long)first * _keyDim;
+                if (cacheK.ElementType == DType.Float16)
+                    AttentionDecodeGroupedF16(GetFloatPtr(query), GetHalfPtrForRead(cacheK) + skip, GetHalfPtrForRead(cacheV) + skip,
+                        GetFloatPtr(result), heads, kvHeads, _keyDim, capacity, keys, scale);
+                else if (cacheK.ElementType == DType.Float32)
+                    AttentionDecodeGrouped(GetFloatPtr(query), GetFloatPtrForRead(cacheK) + skip, GetFloatPtrForRead(cacheV) + skip,
+                        GetFloatPtr(result), heads, kvHeads, _keyDim, capacity, keys, scale, Environment.ProcessorCount);
+                else
+                    return false;
+                HostWritten(result);
+                return true;
+            }
+            finally
+            {
+                if (!ReferenceEquals(query, q)) query.Dispose();
+            }
         }
 
         /// <summary>Rows a verify window (or a draft layer's floored step) attends with in place on the host.</summary>
@@ -1160,7 +1350,8 @@ namespace TensorSharp.Models
 
         /// <summary>The rows' K/V into the cache, then each row's attention over keys [floor, start + row + 1) in place,
         /// by the decode kernels (the floor offsets the cache's base; rows keep the cache's stride).</summary>
-        private unsafe Tensor WindowAttention(RankScope scope, Tensor cacheK, Tensor cacheV, Tensor q, Tensor k, Tensor v, int start, int tokens)
+        private unsafe Tensor WindowAttention(RankScope scope, Tensor cacheK, Tensor cacheV, Tensor q, Tensor k, Tensor v, int start, int tokens,
+            int band = 0)
         {
             int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
             float scale = 1.0f / MathF.Sqrt(_keyDim);
@@ -1171,12 +1362,14 @@ namespace TensorSharp.Models
             Tensor query = q.IsContiguous() ? q : Ops.NewContiguous(q);
             if (!ReferenceEquals(query, q)) q.Dispose();
             var result = new Tensor(scope.Allocator, DType.Float32, tokens, heads * _valueDim);
-            int floor = Math.Min(_attentionFloor, start);
             int capacity = (int)cacheK.Sizes[1];
-            long qRow = (long)heads * _keyDim, rRow = (long)heads * _valueDim, skip = (long)floor * _keyDim;
+            long qRow = (long)heads * _keyDim, rRow = (long)heads * _valueDim;
             float* qp = GetFloatPtr(query), rp = GetFloatPtr(result);
             for (int r = 0; r < tokens; r++)
             {
+                // Each row's first key: the draft floor, or where its sliding window starts.
+                int floor = Math.Max(Math.Min(_attentionFloor, start), DecodeFirstKey(start + r, band));
+                long skip = (long)floor * _keyDim;
                 int keys = start + r + 1 - floor;
                 if (cacheK.ElementType == DType.Float16)
                     AttentionDecodeGroupedF16(qp + r * qRow, GetHalfPtrForRead(cacheK) + skip, GetHalfPtrForRead(cacheV) + skip, rp + r * rRow,
@@ -1189,7 +1382,8 @@ namespace TensorSharp.Models
             return result;
         }
 
-        private Tensor PrefillAttention(RankScope scope, Tensor cacheK, Tensor cacheV, Tensor q, Tensor k, Tensor v, int start, int tokens)
+        private Tensor PrefillAttention(RankScope scope, Tensor cacheK, Tensor cacheV, Tensor q, Tensor k, Tensor v, int start, int tokens,
+            int band = 0)
         {
             int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
             int total = start + tokens;
@@ -1206,7 +1400,7 @@ namespace TensorSharp.Models
 
             // MLX: the chunk's rows are in the cache; one fused SDPA over its live rows.
             var fused = new Tensor(scope.Allocator, DType.Float32, tokens, heads * _valueDim);
-            if (MlxCachedAttention(scope, fused, q, cacheK, cacheV, tokens, total, scale))
+            if (MlxCachedAttention(scope, fused, q, cacheK, cacheV, tokens, total, scale, band))
             {
                 q.Dispose();
                 return fused;
@@ -1235,11 +1429,20 @@ namespace TensorSharp.Models
             if (IsGgmlBackend)
             {
                 GgmlBasicOps.AttentionSoftmaxWithSinks(scores, sinks: null, numHeads: heads, seqLen: tokens,
-                    kvLen: total, maskStartPos: start, slidingWindow: 0, scale: 1.0f);
+                    kvLen: total, maskStartPos: start, slidingWindow: band, scale: 1.0f);
             }
             else
             {
                 Ops.AddCausalMask(scores, tokens, start, float.NegativeInfinity);
+                // A sliding window closes each row's keys before (position - band, ...].
+                for (int row = 0; band > 0 && row < tokens; row++)
+                {
+                    int closed = Math.Min(total, DecodeFirstKey(start + row, band));
+                    if (closed <= 0) continue;
+                    using Tensor rowScores = scores.Narrow(1, row, 1);
+                    using Tensor below = rowScores.Narrow(2, 0, closed);
+                    Ops.Fill(below, float.NegativeInfinity);
+                }
                 Ops.Softmax(scores, scores);
             }
 
@@ -1415,7 +1618,8 @@ namespace TensorSharp.Models
             {
                 if (!OwnsLayer(l)) continue;
                 int stage = _mesh.StageOf(l);
-                var names = new[] { $"blk.{l}.attn_norm.weight", FfnNormWeight(l) }.Concat(ReplicatedLayerWeights(l));
+                var names = new[] { $"blk.{l}.attn_norm.weight", FfnNormWeight(l), MixerPostNormWeight(l), FfnPostNormWeight(l) }
+                    .Where(name => name != null).Concat(ReplicatedLayerWeights(l));
                 foreach (string name in names)
                 {
                     if (!_weights.TryGetValue(name, out Tensor w)) continue;
@@ -1442,6 +1646,7 @@ namespace TensorSharp.Models
             _cacheK = _cacheV = null;
             _draftCarry?.Dispose();
             _draftCarry = null;
+            _suppressionMask = null;
             foreach (Tensor copy in _replicas.Values) copy.Dispose();
             _replicas.Clear();
             DisposeSlots();

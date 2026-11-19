@@ -111,6 +111,19 @@ public sealed partial class OpenAIChatAdapter
                     })
                     .ToList(),
             }];
+        // A model that speaks (its speech decoder loaded) says so: the chat modalities it serves and its voices.
+        if (data.Count > 0 && _svc.SpeechOutputModel is { HasSpeechOutput: true } speaker)
+        {
+            data[0]["capabilities"] = new[] { "chat", "audio_output" };
+            data[0]["audio"] = new
+            {
+                voices = speaker.SpeechVoices,
+                sample_rate = speaker.SpeechSampleRate,
+                modalities = new[] { new[] { "text" }, new[] { "text", "audio" }, new[] { "audio" } },
+                formats = new[] { "wav", "pcm16" },
+                speech_route = "/v1/audio/speech",
+            };
+        }
         return Results.Json(new { @object = "list", data });
     }
 
@@ -145,15 +158,37 @@ public sealed partial class OpenAIChatAdapter
         // operator's configuration entirely).
         int maxTokens = _options.ResolveMaxTokens(
             SamplingConfigParser.ReadRequestedMaxTokens(body, "max_tokens", "max_completion_tokens"));
+        if (!SamplingConfigParser.TryValidateIgnoreEos(body, out string ignoreEosError))
+        {
+            openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/chat/completions rejected: {Error} (model={Model})", ignoreEosError, modelName);
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = ignoreEosError, type = "invalid_request_error" } }).ConfigureAwait(false);
+            return;
+        }
         var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
+        // A spoken reply (modalities with "audio"): settled before anything else is prepared.
+        SpeechReplyRequest speech = SpeechReplyRequest.Parse(body, stream, out string speechError);
+        speechError ??= speech?.Refusal(_svc.SpeechOutputModel, _svc.Architecture);
+        if (speechError != null)
+        {
+            openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/chat/completions rejected: {Error} (model={Model})", speechError, modelName);
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = speechError, type = "invalid_request_error" } }).ConfigureAwait(false);
+            return;
+        }
         var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens,
             reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);
         if (knowledge == null) return;
         List<ChatMessage> messages;
         try
         {
+            // An assistant turn may be an earlier spoken reply sent back by its audio id: it is spliced back as generation
+            // decoded it (its tokens, its frames' rows), or rendered as its transcript where that is not known.
             messages = ChatMessageParser.ParseOpenAI(messagesEl, _uploads, openaiLogger, _svc.Architecture,
-                _svc.IsAudioEncoderLoaded);
+                _svc.IsAudioEncoderLoaded, SpeechReplies.TranscriptOf,
+                id => SpeechReplies.TryGet(id, out var e) ? e.Turn : null);
         }
         catch (UploadLimitExceededException ex)
         {
@@ -204,6 +239,25 @@ public sealed partial class OpenAIChatAdapter
         }
         WarnIgnoredTemplateKwargsOnce(openaiLogger, ignoredKwargs);
         var requestedSkills = SkillSelectionParser.Parse(body);
+
+        // A spoken reply is a conversational answer: the protocol features that shape text are not combined with it.
+        if (speech != null)
+        {
+            string conflict = openaiTools is { Count: > 0 } ? "tools"
+                : body.TryGetProperty("response_format", out var rf) && rf.ValueKind != JsonValueKind.Null ? "response_format"
+                : openaiThink ? "thinking (think / enable_thinking)"
+                : requestedSkills is { Count: > 0 } ? "skills"
+                : knowledge.Enabled ? "knowledge retrieval"
+                : null;
+            if (conflict != null)
+            {
+                string message = $"A spoken reply (modalities with \"audio\") is not combined with {conflict}: ask for modalities [\"text\"] for that.";
+                openaiLogger.LogWarning(LogEventIds.HttpRequestRejected, "/v1/chat/completions rejected: {Error} (id={ChatcmplId})", message, requestId);
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsJsonAsync(new { error = new { message, type = "invalid_request_error" } }).ConfigureAwait(false);
+                return;
+            }
+        }
 
         // A block-diffusion model has no tool-call loop: nothing could feed a result
         // back into a denoising turn, and it used to answer a "required" call with
@@ -286,6 +340,13 @@ public sealed partial class OpenAIChatAdapter
             workspace: workspaceLease?.Workspace, logger: openaiLogger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does. A whole
+        // reply: a round cut short reads as its stream would, as the adapter's own parse does.
+        if (skillPlan != null)
+        {
+            skillPlan.ClientStreamsAppendOnly = stream;
+            skillPlan.ClientReadsWholeReply = !stream;
+        }
 
         knowledge.Plan = skillPlan;
 
@@ -316,6 +377,8 @@ public sealed partial class OpenAIChatAdapter
                 toolGrammar = PrepareDeepSeek41ToolGrammar(body, openaiTools, effectiveTools, responseFormat);
             else if (IsMiniMaxM3(_svc.Architecture))
                 toolGrammar = PrepareMiniMaxM3ToolGrammar(body, openaiTools, responseFormat);
+            else if (UsesQwenXmlToolGrammar(_svc.Architecture))
+                toolGrammar = PrepareQwenXmlToolGrammar(body, openaiTools, responseFormat);
         }
         catch (Exception ex) when (ex is NotSupportedException or JsonException or ArgumentException)
         {
@@ -370,6 +433,14 @@ public sealed partial class OpenAIChatAdapter
             if (lora != null)
                 openaiLogger.LogInformation(LogEventIds.ChatStarted,
                     "/v1/chat/completions lora: id={ChatcmplId} adapter={Adapter}", requestId, lora.Id);
+        }
+
+        if (speech != null)
+        {
+            // Spoken: the client's messages as they are (no skill tools or instructions), on the engine as a driven request.
+            await SpeechCompletionAsync(ctx, requestId, modelName!, messages, maxTokens, samplingConfig, speech, stream, lora, openaiLogger)
+                .ConfigureAwait(false);
+            return;
         }
 
         inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,
@@ -649,6 +720,8 @@ public sealed partial class OpenAIChatAdapter
         {
             parser = OutputParserFactory.Create(_svc.Architecture);
             parser.Init(openaiThink, openaiTools);
+            // Deltas cannot be taken back: a family that streams a possibly-reasoning reply as generated does so here.
+            parser.StreamWithoutHolding();
         }
 
         // json_object streams incrementally: strip code fences / leading prose /
@@ -929,7 +1002,8 @@ public sealed partial class OpenAIChatAdapter
             // message frame around it holds text (and braces) that are not the
             // structured output, exactly as the streaming path strips them first.
             string structuredText = useParser || collector.IsParsed
-                ? collector.Resolve(_svc.Architecture, openaiThink, openaiTools).Content ?? ""
+                ? collector.Resolve(_svc.Architecture, openaiThink, openaiTools,
+                    FinishReasonMapper.IsTruncated(pipelineFinishReason)).Content ?? ""
                 : rawOutput;
             var normalized = StructuredOutputValidator.NormalizeOutput(structuredText, responseFormat);
             if (!normalized.IsValid)
@@ -951,9 +1025,15 @@ public sealed partial class OpenAIChatAdapter
         }
         else if (useParser || collector.IsParsed)
         {
-            var parsed = collector.Resolve(_svc.Architecture, openaiThink, openaiTools);
+            // A reply cut short reads as its stream did (ChatStreamCollector.ParseWhole).
+            var parsed = collector.Resolve(_svc.Architecture, openaiThink, openaiTools,
+                FinishReasonMapper.IsTruncated(pipelineFinishReason));
 
-            string? thinkingOut = openaiThink && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
+            // Whatever the parser separated as reasoning goes out as reasoning, as the stream
+            // sends it, with thinking off too: a model that reasons although the prompt closed
+            // the block (LFM3, Nemotron-H Reasoning-128K) often states its result there, and
+            // a reply cut by max_tokens in the answer that follows otherwise lost it entirely.
+            string? thinkingOut = !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
             responseMessage = OpenAIResponseFactory.ParsedAssistantMessage(knowledge.Normalize(parsed.Content), thinkingOut, parsed.ToolCalls);
 
             sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;

@@ -96,6 +96,7 @@ public class ContentContractTests
         new(null, "promptLimit", null, "token limit"),
         new(null, "inputTokens.Count", null, "token count"),
         new(null, "promptTokensCached[i]", null, "token count per benchmark turn (int[])"),
+        new(null, "terminal.PromptTokens", null, "token count (ChatStreamUpdate.PromptTokens is an int)"),
 
         // ---- Model, draft-model, projector and LoRA file names: operator configuration
         //      (the command line, TS_LORAS, the model directory), not a client's content. ----
@@ -123,6 +124,8 @@ public class ContentContractTests
         // ---- The Responses API's response id: a bearer key to the stored response. ----
         new("TensorSharp.Server/ProtocolAdapters/OpenAIResponsesAdapter.cs", "store ? LogContent.Of(requestId) : requestId", null,
             "marked as content whenever the response is stored under the id (store defaults to true)"),
+        new("TensorSharp.Server/ProtocolAdapters/OpenAIResponsesAdapter.Speech.cs", "store ? LogContent.Of(requestId) : requestId",
+            "/v1/responses spoken reply", "a spoken reply's response id: marked as content whenever the response is stored under the id"),
         new("TensorSharp.Server/ProtocolAdapters/OpenAIResponsesAdapter.cs", "requestId", "/v1/responses rejected",
             "a rejected request: nothing is stored under the id"),
         new("TensorSharp.Server/ProtocolAdapters/OpenAIResponsesAdapter.cs", "requestId", "/v1/responses text.format invalid",

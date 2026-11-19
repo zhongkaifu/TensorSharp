@@ -1178,12 +1178,19 @@ namespace TensorSharp.Runtime
         }
 
         /// <summary>The <c>tojson</c> filter's text: Python <c>json.dumps</c> spacing
-        /// (", " and ": "), which is what a GGUF template prints for a tool.</summary>
+        /// (", " and ": "), which is what a GGUF template prints for a tool.
+        /// Strings are quoted as HF's chat-template <c>tojson</c> quotes them
+        /// (<c>json.dumps(..., ensure_ascii=False)</c>) and llama.cpp's Jinja engine
+        /// prints them: only <c>"</c>, <c>\</c> and control characters are escaped.
+        /// System.Text.Json's default encoder also escaped quotes, <c>&lt; &gt; &amp; ' +</c>
+        /// and every non-ASCII character (<c>"</c>, <c>—</c>), so a tool whose
+        /// description held any of them reached the model spelled differently from what
+        /// it was trained on and from every other engine's prompt.</summary>
         internal static string ToJson(object? val)
         {
             if (val == null) return "null";
             if (val is bool b) return b ? "true" : "false";
-            if (val is string s) return System.Text.Json.JsonSerializer.Serialize(s);
+            if (val is string s) return PythonJsonString(s);
             if (val is byte or sbyte or short or ushort or int or uint or long or ulong
                 or float or double or decimal or System.Numerics.BigInteger)
                 return ((IFormattable)val).ToString(null, CultureInfo.InvariantCulture);
@@ -1210,14 +1217,43 @@ namespace TensorSharp.Runtime
                 {
                     if (!first) sb.Append(", ");
                     first = false;
-                    sb.Append(System.Text.Json.JsonSerializer.Serialize(kv.Key));
+                    sb.Append(PythonJsonString(kv.Key));
                     sb.Append(": ");
                     sb.Append(ToJson(kv.Value));
                 }
                 sb.Append('}');
                 return sb.ToString();
             }
-            return System.Text.Json.JsonSerializer.Serialize(val.ToString());
+            return PythonJsonString(val.ToString() ?? string.Empty);
+        }
+
+        /// <summary>A JSON string literal as Python's <c>json.dumps(s, ensure_ascii=False)</c>
+        /// writes it.</summary>
+        internal static string PythonJsonString(string text)
+        {
+            var sb = new StringBuilder(text.Length + 2);
+            sb.Append('"');
+            foreach (char c in text)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    default:
+                        if (c < 0x20)
+                            sb.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+                        else
+                            sb.Append(c);
+                        break;
+                }
+            }
+            sb.Append('"');
+            return sb.ToString();
         }
 
         private static bool Truthy(object? val)

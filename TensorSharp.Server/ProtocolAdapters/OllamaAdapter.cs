@@ -415,6 +415,13 @@ public sealed class OllamaAdapter
             workspace: workspaceLease?.Workspace, logger: ollamaLogger,
             multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
             clientRunsToolLoop: clientRunsToolLoop);
+        // An append-only stream: the loop's parsers stream as the adapter's own parser does. A whole
+        // reply: a round cut short reads as its stream would, as the adapter's own parse does.
+        if (skillPlan != null)
+        {
+            skillPlan.ClientStreamsAppendOnly = stream;
+            skillPlan.ClientReadsWholeReply = !stream;
+        }
 
         knowledge.Plan = skillPlan;
 
@@ -485,6 +492,8 @@ public sealed class OllamaAdapter
 
         var parser = OutputParserFactory.Create(_svc.Architecture);
         parser.Init(enableThinking, tools);
+        // NDJSON lines cannot be taken back (IOutputParser.StreamWithoutHolding).
+        parser.StreamWithoutHolding();
         bool useParser = enableThinking || (tools != null && tools.Count > 0)
             || OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate);
         List<ToolCall>? collectedToolCalls = null;
@@ -662,8 +671,11 @@ public sealed class OllamaAdapter
 
         if (useParser || collector.IsParsed)
         {
-            var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools);
-            string? thinkingOut = enableThinking && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
+            var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools,
+                FinishReasonMapper.IsTruncated(pipelineFinishReason));
+            // As the stream does, and as the OpenAI adapter does: reasoning the parser separated
+            // with thinking off is the model's (see OpenAIChatAdapter), not dropped.
+            string? thinkingOut = !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
             finalMessage = OllamaResponseFactory.ChatNonStreamingMessage(knowledge.Normalize(parsed.Content), thinkingOut, parsed.ToolCalls);
             sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;
         }

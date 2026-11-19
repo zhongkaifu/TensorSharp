@@ -27,6 +27,8 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Nemotron 3.5 | DSpark 投机 drafter——**不会使用** | [magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark-GGUF](https://huggingface.co/magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark-GGUF)（官方 DSpark 模块的 llama.cpp DFlash 导出版）。TensorSharp 在 Nemotron-H 上拒绝投机解码，`--draft-model` 不会挂载它：主干的 verify 与 decode 内核结果不一致，投机输出会与普通解码不同（见 [speculative_decoding.md](docs/speculative_decoding.md#nemotron-h-refuses-speculation)） |
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF)，Pixtral 投影器 `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` |
 | Hunyuan Dense | 腾讯稠密 Hunyuan 检查点（`hunyuan-dense`） | 任何 `general.architecture` 为 `hunyuan-dense` 的 GGUF 均可加载，例如 Hy-MT2 系列（参考对话模板取自 `tencent/Hy-MT2-1.8B`）。仅文本（多 GPU 由共享解码运行时提供），没有投影器也没有草稿模型。见 [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
+| LFM3 | LFM3-1.7B（短卷积 + 注意力混合；推理、工具调用） | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/tree/cd0c74c575b5c416f3011b5b4c298077f26ca8c2)，版本 `cd0c74c5` —— `LFM3-1.7B-Q4_K_M.gguf`（1.10 GB，即 [`config/lfm3-1.7b.json`](config/lfm3-1.7b.json) 的文件）；另有 Q5_K_M、Q6_K、Q8_0、BF16、F16、量化感知的 `QAD-Q4_0` 与 `NVFP4`（仅 FFN 权重，用于 Blackwell：[`config/lfm3-1.7b-nvfp4.json`](config/lfm3-1.7b-nvfp4.json)；其 FP4 张量核路径已在 sm_120 GPU 上运行）。`general.architecture` = `lfm3`；没有投影器，没有草稿模型。见 [lfm3](docs/models/lfm3_zh-cn.md) |
+| LFM3 | LFM3-Omni-2B（图像、视频、音频输入） | [LiquidAI/LFM3-Omni-2B-GGUF](https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/tree/d508b88f08a5b4286f2d2805a6a8d69a0ff44c72)，版本 `d508b88f` —— `LFM3-Omni-2B-Q4_K_M.gguf`（1.10 GB）+ `mmproj-LFM3-Omni-2B-Q8_0.gguf`（507 MB），即 [`config/lfm3-omni-2b.json`](config/lfm3-omni-2b.json) 的文件。一个 mmproj 同时包含视觉编码器、音频编码器与语音生成器（语音回复：TTS 与聊天 `modalities` 中的 audio）。没有它也能进行文本对话。`general.architecture` 与 1.7B 相同，为 `lfm3` |
 | Muse-Glimmer | Muse-Glimmer-30B（稠密，支持图像） | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)，如 `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` 或 `Muse-Glimmer-30B-Q8_0.gguf`；`general.architecture` 为 `muse-glimmer` / `muse_glimmer`。图像输入需同仓库的 `mmproj-Muse-Glimmer-30B-Q8_0.gguf`：传 `--image` 时 CLI 会在模型旁边找到它，服务端则需用 `--mmproj` 指定。可选提速产物：同仓库的 DFlash 分块 draft `dflash-kquant.gguf`，或更新的 DFlash2 draft [z-lab/Muse-Glimmer-30B-DFlash2-GGUF](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2-GGUF)（16 GB 显卡上优先选 `-Q4_K_M`，见 [speculative_decoding.md](docs/speculative_decoding.md#what-to-expect) 中关于 draft 大小的说明），用 `--draft-model` 加载即可无损推测解码——不要传任何采样参数，它只在纯贪心下生效 |
 | Muse Spark | Muse-Spark-Open-816B-A42B（816B-A42B MoE，支持图像） | [unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF)：每个量化档一个子目录，各为一组分片：`UD-IQ3_XXS/` 为 8 个分片、317 GiB（即实测所用的量化），`UD-Q3_K_XL/` 为 10 个分片、374 GiB，`UD-Q4_K_XL/` 为 12 个分片。同一量化档的所有分片需放在同一目录，`--model` 指向其中任意一片即可；后续分片只含切分元数据，不能单独作为模型加载。`general.architecture` 为 `muse-spark` / `muse_spark`。图像输入需用 `--mmproj` 指定仓库根目录下的 `mmproj-Q8_0.gguf`（2.2 GB）；Muse-Glimmer-30B 的投影器输出宽度不同，会被拒绝。实测配置为十张 46 GB A40，全部专家都放在显存中（见下方运行示例）。没有草稿器：投机解码只能用无权重的 n-gram |
 | MiniMax-M3.1 | MiniMax-M3.1-Flash（428B-A23B MoE，支持图像，`minimax-m3`） | [unsloth/MiniMax-M3.1-Flash-GGUF](https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF)：`UD-Q4_K_XL/` 为 7 个分片，共 249,402,105,310 字节（232.3 GiB）；`--model` 指向 `-00001-of-00007` 分片。该仓库标注为仍在制作中，尚未发布 mmproj 与 DSpark 草稿器：两者都需用 [unslothai/llama.cpp PR #320](https://github.com/unslothai/llama.cpp/pull/320)（`minimax-m31` @ `ef8f94cc`）的转换器从 [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) 转换，只需配置 / 分词器文件、第 13 与 48 个 safetensors 分片（视觉塔）以及 `dspark/`，得到 `mmproj-MiniMax-M3.1-Flash-BF16.gguf`（1.74 GB，`--mmproj`）与 `MiniMax-M3.1-Flash-DSpark-BF16.gguf`（3.93 GB，`--draft-model`）；步骤见[模型卡片](docs/models/minimax-m3_zh-cn.md#生成视觉投影器与-dspark-草稿器)。仅在 `ggml_cuda` 上运行，并且需要显式的 `--layer-split N` 或 `--tp N`（实测配置为八张 46 GB A40） |
@@ -298,6 +300,18 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
 ```
 
 没有投影器，没有草稿模型；多余的 GPU 会闲置，启动时会明确提示而不是悄悄占用。
+
+**LFM3 / LFM3-Omni**（Liquid 的短卷积 + 注意力混合模型；[LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF)、[LiquidAI/LFM3-Omni-2B-GGUF](https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF)）：
+
+```bash
+hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q4_K_M.gguf --revision cd0c74c575b5c416f3011b5b4c298077f26ca8c2 --local-dir models/lfm3
+hf download LiquidAI/LFM3-Omni-2B-GGUF LFM3-Omni-2B-Q4_K_M.gguf mmproj-LFM3-Omni-2B-Q8_0.gguf --revision d508b88f08a5b4286f2d2805a6a8d69a0ff44c72 --local-dir models/lfm3
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/lfm3/LFM3-1.7B-Q4_K_M.gguf --think --input prompt.txt --backend ggml_metal
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/lfm3-omni-2b.json
+```
+
+配置文件会自行下载同样固定版本的文件。1.7B 需要请求才会推理（`--think`、`"think": true`）；TensorSharp 的请求默认关闭思考。哪些部分已验证见 [lfm3](docs/models/lfm3_zh-cn.md)。
 
 **Mistral 3**（文本 + 图像）：
 

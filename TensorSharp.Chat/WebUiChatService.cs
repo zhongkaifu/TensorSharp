@@ -31,6 +31,7 @@ using TensorSharp.Server.Hosting;
 using TensorSharp.Server.ProtocolAdapters;
 using TensorSharp.Server.RequestParsers;
 using TensorSharp.Server.ResponseSerializers;
+using TensorSharp.Server.Responses;
 using TensorSharp.Server.Skills;
 
 namespace TensorSharp.Chat
@@ -399,7 +400,8 @@ namespace TensorSharp.Chat
                     route = "/v1/audio/transcriptions",
                     languages = asr.Languages,
                 },
-                TensorSharp.Models.Audio.ISpeechSynthesisModel tts => new
+                // A language model that speaks (LFM3-Omni) is a speech model only with its speech decoder loaded.
+                TensorSharp.Models.Audio.ISpeechSynthesisModel { SpeechSynthesisAvailable: true } tts => new
                 {
                     kind = "speech",
                     family = tts.SpeechModelFamily,
@@ -447,6 +449,10 @@ namespace TensorSharp.Chat
                 defaultMaxTokens = _options.DefaultMaxTokens,
                 video,
                 audio,
+                // Whether a chat reply can be spoken (/api/chat's `speech`): the pages offer the
+                // option only when `available`, and `reason` says why not (a model that does not
+                // speak, or LFM3-Omni without the projector that carries its speech decoder).
+                speechOutput = SpeechOutputCapability(),
                 // Null when this build serves no skills at all, so the UI can hide the
                 // whole control by testing one field rather than discovering it after a
                 // failed /api/skills fetch. An older UI ignores the extra member.
@@ -459,6 +465,22 @@ namespace TensorSharp.Chat
                         count = _skills.Skills.Count,
                     }
                     : null,
+            };
+        }
+
+        /// <summary><c>/api/models</c>' <c>speechOutput</c>: <c>{ available, voices, reason }</c> for the loaded model
+        /// (voices with the default first; reason null when available).</summary>
+        internal object SpeechOutputCapability()
+        {
+            TensorSharp.Models.Audio.ISpeechOutputModel speaker = _svc.IsLoaded ? _svc.SpeechOutputModel : null;
+            string reason = _svc.IsLoaded
+                ? WebUiSpeechRequest.UnavailableReason(speaker, _svc.Architecture)
+                : "No model loaded";
+            return new
+            {
+                available = reason == null,
+                voices = reason == null ? speaker.SpeechVoices : (IReadOnlyList<string>)Array.Empty<string>(),
+                reason,
             };
         }
 
@@ -2988,6 +3010,22 @@ namespace TensorSharp.Chat
             if (body.TryGetProperty("studio", out _) && (LoadedModelMakesVideo || LoadedModelMakesImages || _svc.IsDiffusionModel))
                 throw new WebUiRequestRejectedException(400, new { error = "Studio conversation requires a text planning model. Select a chat model explicitly; the video model remains a generation model." });
 
+            // A spoken reply (`speech`), settled before anything is prepared: a model that
+            // cannot speak is refused with its own reason, never answered in text instead.
+            WebUiSpeechRequest speech = WebUiSpeechRequest.Parse(body, out string speechError);
+            if (speechError != null)
+            {
+                webUiLogger.LogWarning(LogEventIds.HttpRequestRejected, "/api/chat rejected: {Reason}", speechError);
+                throw new WebUiRequestRejectedException(400, new { error = speechError });
+            }
+            if (speech?.Refusal(_svc.SpeechOutputModel, _svc.Architecture) is { } speechRefusal)
+            {
+                webUiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                    "/api/chat rejected: spoken reply unavailable: {Reason} (model={Model})",
+                    speechRefusal, _svc.LoadedModelName ?? "(none)");
+                throw new WebUiRequestRejectedException(400, new { code = "speech_unavailable", error = speechRefusal });
+            }
+
             var messagesEl = body.GetProperty("messages");
             int maxTokens = _options.ResolveMaxTokens(
                 SamplingConfigParser.ReadRequestedMaxTokens(body, "maxTokens", "max_tokens"));
@@ -3005,6 +3043,8 @@ namespace TensorSharp.Chat
                 uiTools = ToolFunctionParser.ParseOllama(body);
 
             var messages = ChatMessageParser.ParseWebUi(messagesEl);
+            // An earlier spoken reply sent back with its audioId renders as generation decoded it.
+            SpliceSpokenTurns(messagesEl, messages, webUiLogger);
             KnowledgeToolScope knowledge = KnowledgeRequestContext.Parse(body, Knowledge, _svc.ContextTokens,
                 _svc.CreateKnowledgeReranker());
             string audioInputError = ChatGenerationPipeline.UnsupportedAudioInputError(_svc.Architecture, messages,
@@ -3092,6 +3132,47 @@ namespace TensorSharp.Chat
                 messages = await KnowledgeRequestContext.PrepareAsync(messages, knowledge, toolsAvailable: false, cancellationToken);
                 OnChatRequest?.Invoke(chatSession.Id, body);
                 await foreach (object frame in ChatStreamDiffusionAsync(chatSession, messages, maxTokens, uiThink, webUiLogger, cancellationToken, samplingConfig, knowledge))
+                    yield return frame;
+                yield break;
+            }
+
+            // A spoken reply is one driven generation (text and speech frames), never a tool
+            // loop: no skill plan, no staged files, no knowledge retrieval, thinking off. What
+            // the request would otherwise have had is named once in the turn's notice frame.
+            if (speech != null)
+            {
+                if (hasImageInputs && !visionReady)
+                    RejectImageInput(webUiLogger, acceptsProjector);
+                try
+                {
+                    messages = ChatHistoryPreparer.RestoreUnstagedFileBackedCsvAttachments(messages);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    webUiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                        "/api/chat could not read a file-backed CSV: {Error}", LogContent.Of(ex.Message));
+                    throw new WebUiRequestRejectedException(400, new
+                    {
+                        error = "The attached CSV could not be read from upload storage. Upload it again and retry.",
+                    });
+                }
+                // The reply's WAV goes to the uploads like a generated picture: a full directory
+                // fails now, not after the reply was spoken.
+                if (!_uploads.HasQuotaHeadroom(out string speechQuotaError))
+                {
+                    webUiLogger.LogWarning(LogEventIds.UploadRejected,
+                        "/api/chat spoken reply refused: {Error}", speechQuotaError);
+                    throw new WebUiRequestRejectedException(507, new { error = speechQuotaError });
+                }
+                IReadOnlyList<string> without = WebUiSpeechRequest.Without(
+                    think: uiThink,
+                    tools: uiTools is { Count: > 0 } || _codeRunner != null,
+                    skills: requestedSkills is { Count: > 0 }
+                        || (_options.SkillsEnabled && requestedDiscovery != false && _skills.Skills.Count > 0),
+                    knowledge: knowledge != null);
+                OnChatRequest?.Invoke(chatSession.Id, body);
+                await foreach (object frame in ChatStreamSpokenAsync(chatSession, messages, maxTokens, samplingConfig, speech,
+                    without, webUiLogger, cancellationToken))
                     yield return frame;
                 yield break;
             }
@@ -3606,6 +3687,197 @@ namespace TensorSharp.Chat
             {
                 yield return frame;
             }
+        }
+
+        // ---- Spoken replies (LFM3-Omni) -------------------------------------------
+
+        /// <summary>The web chat's spoken replies by audio id (a spoken turn's <c>done.audioId</c>): what splices a spoken
+        /// turn sent back on its assistant message (<see cref="SpliceSpokenTurns"/>). In memory, an hour each.</summary>
+        internal SpeechReplyStore SpeechReplies { get; } = new();
+
+        private int _unknownSpokenTurnWarned;
+
+        /// <summary>What a finished spoken turn reports on its <c>done</c> frame: its audio id, and the WAV of its speech
+        /// under the uploads (null when the reply had no speech or its file could not be written).</summary>
+        internal sealed record SpokenReplyAudio(string AudioId, string Url, double? Seconds);
+
+        /// <summary>
+        /// Splice every assistant message that carries an <c>audioId</c> of this service's spoken replies as generation
+        /// decoded it (its tokens, one placeholder a speech frame with that frame's row: <see cref="SpokenTurnRecord"/>),
+        /// so the prompt holds exactly the sequence the cache holds and the next turn reuses its prefix. A message whose
+        /// text is not the reply's transcript renders as its text. An id this process does not know (an hour old, from
+        /// before a restart, from another model load) renders as its transcript too, and the log says so once.
+        /// </summary>
+        internal void SpliceSpokenTurns(JsonElement messagesEl, List<ChatMessage> messages, ILogger logger)
+        {
+            if (messagesEl.ValueKind != JsonValueKind.Array || messages == null) return;
+            long epoch = _svc.LifecycleService.LoadEpoch;
+            int index = 0;
+            foreach (JsonElement element in messagesEl.EnumerateArray())
+            {
+                if (index >= messages.Count) break;
+                ChatMessage message = messages[index++];
+                if (message?.Role != "assistant" || element.ValueKind != JsonValueKind.Object
+                    || !element.TryGetProperty("audioId", out JsonElement idElement) || idElement.ValueKind != JsonValueKind.String
+                    || idElement.GetString() is not { Length: > 0 } id)
+                    continue;
+                if (!SpeechReplies.TryGet(id, out SpeechReplyStore.Entry entry) || entry.Turn == null || entry.Epoch != epoch)
+                {
+                    if (Interlocked.Exchange(ref _unknownSpokenTurnWarned, 1) == 0)
+                        logger.LogWarning(LogEventIds.KvCacheReusePlan,
+                            "spoken turn {AudioId} is not known to this process (a spoken turn is kept for {Hours} h, in memory, "
+                            + "for the model load that made it): it renders as its transcript, so a later turn does not reuse "
+                            + "the prompt cache past it. Said once; later ones are logged at debug.",
+                            id, SpeechReplyStore.Lifetime.TotalHours);
+                    else
+                        logger.LogDebug(LogEventIds.KvCacheReusePlan, "spoken turn {AudioId} unknown: renders as its transcript", id);
+                    continue;
+                }
+                if (!string.Equals(entry.Transcript, message.Content, StringComparison.Ordinal))
+                {
+                    logger.LogInformation(LogEventIds.KvCacheReusePlan,
+                        "spoken turn {AudioId} came back with other text than it spoke: it renders as that text", id);
+                    continue;
+                }
+                entry.Turn.ApplyTo(message);
+            }
+        }
+
+        /// <summary>
+        /// A spoken reply as Web UI frames: the transcript through the ordinary answer frames (so the text renders as any
+        /// reply's), <c>{"audio": base64 PCM16, "sampleRate": N}</c> frames between them in the order generation made the
+        /// speech, and a <c>done</c> frame (<see cref="WebUiSseEvents.DoneSpoken"/>) with the reply's audio id and the whole
+        /// reply written as a WAV under the uploads. A <c>notice</c> frame first says what the turn runs without.
+        /// </summary>
+        private async IAsyncEnumerable<object> ChatStreamSpokenAsync(
+            ChatSession chatSession, List<ChatMessage> messages, int maxTokens, SamplingConfig samplingConfig,
+            WebUiSpeechRequest speech, IReadOnlyList<string> without, ILogger webUiLogger,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            if (without.Count > 0)
+                yield return WebUiSseEvents.Notice("speech_direct", WebUiSpeechRequest.NoticeText(without), without);
+
+            var sw = Stopwatch.StartNew();
+            TensorSharp.Models.Audio.ISpeechOutputModel speaker = _svc.SpeechOutputModel;
+            TensorSharp.Models.Audio.SpeechReplyOptions options = speech.OptionsFor(speaker);
+            bool aborted = false;
+            string inferenceError = null;
+            int tokenCount = 0;
+            ChatStreamUpdate terminal = default;
+            var visibleAnswer = new StringBuilder();
+            var pcm = new List<float>();
+            int sampleRate = 0;
+            webUiLogger.LogInformation(LogEventIds.ChatStarted,
+                "/api/chat spoken reply: session={SessionId} voice={Voice} language={Language}",
+                chatSession.Id, options.Voice ?? "(default)", options.Language ?? "(none)");
+
+            IAsyncEnumerator<ChatStreamUpdate> stream = _svc
+                .ChatStreamWithSpeechAsync(chatSession, messages, maxTokens, cancellationToken, samplingConfig,
+                    enableThinking: false, options)
+                .GetAsyncEnumerator(cancellationToken);
+            try
+            {
+                while (true)
+                {
+                    ChatStreamUpdate update;
+                    try
+                    {
+                        if (!await stream.MoveNextAsync())
+                            break;
+                        update = stream.Current;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        aborted = true;
+                        webUiLogger.LogWarning(LogEventIds.ChatAborted,
+                            "Web UI spoken reply aborted by client (sessionId={SessionId}, partialPieces={Pieces})",
+                            chatSession.Id, tokenCount);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        webUiLogger.LogError(LogEventIds.ChatFailed, ex,
+                            "Web UI spoken reply failed (sessionId={SessionId}, partialPieces={Pieces})", chatSession.Id, tokenCount);
+                        inferenceError = ex.Message;
+                        break;
+                    }
+
+                    if (update.Done)
+                    {
+                        terminal = update;
+                        continue;
+                    }
+                    if (update.Audio is { Length: > 0 } samples)
+                    {
+                        sampleRate = update.AudioSampleRate;
+                        pcm.AddRange(samples);
+                        yield return WebUiSseEvents.Audio(TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Pcm16(samples), sampleRate);
+                    }
+                    if (!string.IsNullOrEmpty(update.Piece))
+                    {
+                        tokenCount++;
+                        foreach (object frame in AnswerFrames(visibleAnswer, update.Piece, null, null))
+                            yield return frame;
+                    }
+                }
+            }
+            finally
+            {
+                await stream.DisposeAsync();
+            }
+
+            var notices = new List<object>();
+            SpokenReplyAudio spoken = null;
+            if (!aborted && inferenceError == null)
+            {
+                string url = null;
+                double? seconds = null;
+                if (pcm.Count > 0)
+                {
+                    if (sampleRate <= 0)
+                        sampleRate = terminal.AudioSampleRate > 0 ? terminal.AudioSampleRate : speaker?.SpeechSampleRate ?? 24000;
+                    // Named by when it was spoken (the name a download keeps), and unguessable like
+                    // every generated upload: the name is all that guards an /uploads URL.
+                    string name = $"speech-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.wav";
+                    string path = Path.Combine(_options.UploadDirectory, name);
+                    try
+                    {
+                        Directory.CreateDirectory(_options.UploadDirectory);
+                        File.WriteAllBytes(path, TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Wav(pcm.ToArray(), sampleRate));
+                        _uploads.RecordFile(path);
+                        url = BuildUploadUrl(name);
+                        seconds = Math.Round(pcm.Count / (double)sampleRate, 3);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        webUiLogger.LogWarning(LogEventIds.UploadRejected,
+                            "/api/chat spoken reply's audio could not be written: {Error}", LogContent.Of(ex.Message));
+                        notices.Add(WebUiSseEvents.Notice("speech_not_saved",
+                            "The reply's audio could not be saved, so it cannot be replayed: " + ex.Message));
+                    }
+                }
+                spoken = new SpokenReplyAudio(SpeechReplyStore.NewId(), url, seconds);
+            }
+
+            // Materialized first: the stored transcript is the answer as the page ends up holding it.
+            List<object> finalFrames = FinalFrames(null, aborted, inferenceError, chatSession, sw, tokenCount,
+                terminal.PromptTokens, terminal.KvCacheReusedTokens,
+                FinishReasonMapper.IsTruncated(terminal.FinishReason), visibleAnswer, terminal.FinishReason,
+                terminal.RepetitionExplained, terminal.EvalTokens, terminal.EvalNs, knowledge: null, spoken: spoken).ToList();
+            if (spoken != null)
+            {
+                SpeechReplies.Add(visibleAnswer.ToString(), terminal.SpeechFrames, spoken.AudioId, terminal.SpokenTurn,
+                    _svc.LifecycleService.LoadEpoch);
+                webUiLogger.LogInformation(LogEventIds.ChatCompleted,
+                    "/api/chat spoken reply done: session={SessionId} audio={AudioId} frames={Frames} seconds={Seconds} "
+                    + "transcriptChars={Chars} promptTokens={Prompt} kvReused={Reused} finish={Finish}",
+                    chatSession.Id, spoken.AudioId, terminal.SpeechFrames?.Count ?? 0, spoken.Seconds ?? 0,
+                    visibleAnswer.Length, terminal.PromptTokens, terminal.KvCacheReusedTokens, terminal.FinishReason ?? "(none)");
+            }
+            foreach (object notice in notices)
+                yield return notice;
+            foreach (object frame in finalFrames)
+                yield return frame;
         }
 
         // ---- Chat for DiffusionGemma: live denoising preview -------------------
@@ -4153,7 +4425,8 @@ namespace TensorSharp.Chat
             IOutputParser uiParser, bool aborted, string inferenceError,
             ChatSession chatSession, Stopwatch sw, int tokenCount, int turnPromptTokens, int turnKvReusedTokens,
             bool truncated, StringBuilder visibleAnswer, string finishReason = null,
-            bool repetitionExplained = false, long evalTokens = 0, long evalNs = 0, KnowledgeToolScope knowledge = null)
+            bool repetitionExplained = false, long evalTokens = 0, long evalNs = 0, KnowledgeToolScope knowledge = null,
+            SpokenReplyAudio spoken = null)
         {
             if (uiParser != null && !aborted)
             {
@@ -4217,9 +4490,15 @@ namespace TensorSharp.Chat
             // protocols still call it a length stop (FinishReasonMapper.IsTruncated), which
             // is what stops a client dispatching a half-written tool call; the chip is a
             // sentence shown to a person and it would be a false one.
+            bool truncatedChip = truncated && !FinishReasonMapper.IsRepetition(finishReason);
+            if (spoken != null)
+            {
+                yield return WebUiSseEvents.DoneSpoken(generated, sw.Elapsed.TotalSeconds, tokPerSec, aborted, inferenceError,
+                    chatSession.Id, turnPromptTokens, turnKvReusedTokens, truncatedChip, spoken.AudioId, spoken.Url, spoken.Seconds);
+                yield break;
+            }
             yield return WebUiSseEvents.Done(generated, sw.Elapsed.TotalSeconds, tokPerSec, aborted, inferenceError, chatSession.Id,
-                turnPromptTokens, turnKvReusedTokens,
-                truncated && !FinishReasonMapper.IsRepetition(finishReason));
+                turnPromptTokens, turnKvReusedTokens, truncatedChip);
         }
 
         internal static List<ChatMessage> PrepareKnowledgeThinkingRetry(List<ChatMessage> originalMessages,

@@ -367,6 +367,11 @@ namespace TensorSharp.Models
             byte* weightBase = (byte*)weights.ToPointer();
             int dop = ResolveDop(options);
 
+            // ARM64 BF16: Dot4's arithmetic for every row, widened in registers (ManagedQuantGemm.ArmBf16.cs).
+            if (isa != QGemmIsa.PerRow && TryBf16Arm(ggmlType, weightBase, rowBytes, inDim, outDim,
+                    input, inputRowStride, rowCount, output, outputRowStride, options))
+                return;
+
             // Register-blocked float GEMM over a dequantized weight panel (see
             // ManagedQuantGemm.Float.cs). DequantMatMulColumns below remains the
             // path of hosts without AVX2.
@@ -484,6 +489,73 @@ namespace TensorSharp.Models
             => long.TryParse(Environment.GetEnvironmentVariable(name), out long v) && v > 0
                 ? v
                 : fallback;
+
+        /// <summary>
+        /// ARM64 products split their columns into shrinking blocks (<see cref="GuidedBounds"/>) instead of equal ones: a
+        /// decode row's matvec (<see cref="DecodeColumnBounds"/>) and the multi-row GEMMs (<see cref="GemmGroupBounds"/>).
+        /// Equal blocks, a few a thread, made a job on cores of unequal speed (Apple's 6 + 12) last as long as its slowest
+        /// core's last block. Which thread computes a column changes, not how, so the results are the same bits. Elsewhere
+        /// (x86, not measured) the equal blocks stay.
+        /// </summary>
+        private static readonly bool GuidedSplits =
+            CpuWorkers.PoolEnabled && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
+
+        /// <summary>Smallest decode block: 16 KB of weight rows (a few microseconds of reading).</summary>
+        private const int DecodeBlockMinBytes = 16 * 1024;
+
+        /// <summary>
+        /// Guided self-scheduling: bounds [0, b1, ..., <paramref name="units"/>] of blocks that each take a 1 / (2 x
+        /// <paramref name="threads"/>) share of the units not yet handed out, at least <paramref name="minUnits"/> (the last
+        /// block may be smaller), so the blocks shrink as the work runs out. The pool claims blocks in index order, so the
+        /// large ones go first and the faster cores take the small ones at the end.
+        /// </summary>
+        internal static int[] GuidedBounds(int units, int minUnits, int threads)
+        {
+            minUnits = Math.Max(1, minUnits);
+            long divisor = 2L * Math.Max(1, threads);
+            var bounds = new System.Collections.Generic.List<int> { 0 };
+            int at = 0;
+            while (at < units)
+            {
+                long size = Math.Max(minUnits, (units - at + divisor - 1) / divisor);
+                at = (int)Math.Min(units, at + size);
+                bounds.Add(at);
+            }
+            return bounds.ToArray();
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int OutDim, int RowBytes, int Threads), int[]> s_decodeBounds = new();
+
+        /// <summary>
+        /// Column block boundaries [0, b1, ..., outDim] for a decode-sized product on <paramref name="threads"/> threads:
+        /// <see cref="GuidedBounds"/> over four-column groups (the four-row matvec's), each block at least
+        /// <see cref="DecodeBlockMinBytes"/> of weights. Their weights are 2-18 MB (LFM3-1.7B's out_proj to its fused
+        /// gate|up), which the equal split cut into as few as 18 blocks, one a thread. LFM3-1.7B Q4_K_M on an M5 Pro,
+        /// 16-thread decode with the submitter polling (<see cref="CpuWorkerPool"/>), tg128 at depth 0 / 1,024: 142.5 /
+        /// 130.6 tok/s with the equal blocks, 143.6 / 134.1 with these (4 interleaved rounds). Cached per shape and width.
+        /// </summary>
+        internal static int[] DecodeColumnBounds(int outDim, int rowBytes, int threads)
+            => s_decodeBounds.GetOrAdd((outDim, rowBytes, Math.Max(1, threads)), static key =>
+            {
+                int groups = (key.OutDim + 3) / 4;
+                int minGroups = (int)Math.Max(1, ((long)DecodeBlockMinBytes + 4L * key.RowBytes - 1) / Math.Max(1, 4L * key.RowBytes));
+                int[] bounds = GuidedBounds(groups, minGroups, key.Threads);
+                for (int i = 0; i < bounds.Length; i++) bounds[i] = Math.Min(key.OutDim, bounds[i] * 4);
+                return bounds;
+            });
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int Groups, int MinGroups, int Threads), int[]> s_gemmBounds = new();
+
+        /// <summary>
+        /// Four-column-group block boundaries for a multi-row ARM64 product (<see cref="TryQGemmArm"/>, <see cref="TryBf16Arm"/>)
+        /// on the shared pool's active threads: <see cref="GuidedBounds"/> with blocks no smaller than the equal split's task
+        /// size floor (<paramref name="minGroups"/>). The equal split handed out four blocks a thread; at a 128-token prompt
+        /// some 17 % of the submitting thread's time waited in the pool's join for the last of them (a sample profile of
+        /// LFM3-1.7B Q4_K_M, M5 Pro). Cached per group count, floor and width.
+        /// </summary>
+        private static int[] GemmGroupBounds(int groups, int minGroups, int threads)
+            => s_gemmBounds.GetOrAdd((groups, Math.Clamp(minGroups, 1, Math.Max(1, groups)), Math.Max(1, threads)),
+                static key => GuidedBounds(key.Groups, key.MinGroups, key.Threads));
 
         /// <summary>Columns per parallel task: enough weight bytes per task to
         /// amortize the dispatch, and never more tasks than workers.</summary>
@@ -875,6 +947,17 @@ namespace TensorSharp.Models
                 return true;
             }
 
+            // ARM64: the multi-row GEMM, bit-identical to the per-row dots below (ManagedQuantGemm.Arm.cs).
+            if (rowCount >= ArmGemmMinRows && isa != QGemmIsa.PerRow &&
+                TryQGemmArm(ggmlType, weights, (int)ne0, (int)ne1, input, inputRowStride, rowCount,
+                    output, outputRowStride, options))
+            {
+                if (QGemmVerify)
+                    VerifyQGemmAgainstPerRow("arm-gemm", ggmlType, weights, (int)ne0, (int)ne1, input, inputRowStride,
+                        rowCount, output, outputRowStride, floatPanel: false);
+                return true;
+            }
+
             long totalActivationBytes = (long)rowCount * activationRowBytes;
             if (totalActivationBytes > int.MaxValue)
                 return false;
@@ -931,7 +1014,21 @@ namespace TensorSharp.Models
                         byte* weightPtr = (byte*)weightAddress;
                         float* outputPtr = (float*)outputAddress;
 
-                        for (int col = startCol; col < endCol; col++)
+                        int col = startCol;
+                        if (rowCount == 1 && HasDot4Rows(type) && (weightRowBytes <= Dot4RowsMaxRowBytes || type == GgmlTensorType.NVFP4))
+                        {
+                            // A decode row against four weight rows at a time (ManagedQuantizedOps.Arm.cs): each the per-row bits.
+                            // Short rows only (four adjacent rows read as one stream; four long rows apart read slower than one
+                            // row after another, CpuQuantBench shapes: -5 to -13 % at K = 7680), NVFP4 at every length (+9-22 %).
+                            for (; col + 4 <= endCol; col += 4)
+                            {
+                                byte* w = weightPtr + (long)col * weightRowBytes;
+                                Vector128<float> r4 = DotQuantized4Rows(type, w, w + weightRowBytes, w + 2L * weightRowBytes,
+                                    w + 3L * weightRowBytes, activationPtr, inDim);
+                                r4.Store(outputPtr + col);
+                            }
+                        }
+                        for (; col < endCol; col++)
                         {
                             byte* weightRow = weightPtr + (long)col * weightRowBytes;
                             for (int row = 0; row < rowCount; row++)
@@ -949,10 +1046,18 @@ namespace TensorSharp.Models
                         // Blocked ranges: per-column tasks make the scheduler
                         // overhead comparable to the ~0.5-2us dot itself and cap
                         // scaling at a handful of cores.
-                        int colBlock = ParallelColumnBlock(outDim, weightRowBytes, rowCount, dop);
-                        int nBlocks = (outDim + colBlock - 1) / colBlock;
-                        RunParallelBlocks(nBlocks, options, b =>
-                            ComputeColumnRange(b * colBlock, Math.Min(outDim, b * colBlock + colBlock)));
+                        if (GuidedSplits && rowCount <= CpuWorkerPool.DecodeRows && options == null)
+                        {
+                            int[] bounds = DecodeColumnBounds(outDim, weightRowBytes, CpuWorkerPool.Shared.ActiveThreads);
+                            RunParallelBlocks(bounds.Length - 1, options, b => ComputeColumnRange(bounds[b], bounds[b + 1]));
+                        }
+                        else
+                        {
+                            int colBlock = ParallelColumnBlock(outDim, weightRowBytes, rowCount, dop);
+                            int nBlocks = (outDim + colBlock - 1) / colBlock;
+                            RunParallelBlocks(nBlocks, options, b =>
+                                ComputeColumnRange(b * colBlock, Math.Min(outDim, b * colBlock + colBlock)));
+                        }
                     }
                     else
                     {
@@ -1285,6 +1390,16 @@ namespace TensorSharp.Models
                 {
                     Vector256<int> wide = Avx2.ConvertToVector256Int32(Vector128.Load((ushort*)(src + i * 2)));
                     Avx2.ShiftLeftLogical(wide, 16).AsSingle().Store(dst + i);
+                }
+            }
+            else if (AdvSimd.Arm64.IsSupported)
+            {
+                // bf16 in the high half of each fp32: interleave with zeros.
+                for (; i <= numElements - 8; i += 8)
+                {
+                    Vector128<ushort> v = AdvSimd.LoadVector128((ushort*)(src + i * 2));
+                    AdvSimd.Store(dst + i, AdvSimd.Arm64.ZipLow(Vector128<ushort>.Zero, v).AsSingle());
+                    AdvSimd.Store(dst + i + 4, AdvSimd.Arm64.ZipHigh(Vector128<ushort>.Zero, v).AsSingle());
                 }
             }
             for (; i < numElements; i++)
@@ -2291,7 +2406,13 @@ namespace TensorSharp.Models
                 return VecDotQ4_0Q8_0Avx512Wide(q4, q8, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ4_0Q8_0Avx2(q4, q8, blockCount);
+            if (ArmDotSupported)
+                return VecDotQ4_0Q8_0Neon(q4, q8, blockCount);
+            return VecDotQ4_0Q8_0Scalar(q4, q8, blockCount);
+        }
 
+        private static unsafe float VecDotQ4_0Q8_0Scalar(byte* q4, byte* q8, int blockCount)
+        {
             float sum = 0.0f;
             for (int block = 0; block < blockCount; block++)
             {
@@ -2634,9 +2755,13 @@ namespace TensorSharp.Models
                 return VecDotQ8_0Q8_0Avx512(q8w, q8x, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ8_0Q8_0Avx2(q8w, q8x, blockCount);
-            if (Dp.IsSupported && AdvSimd.Arm64.IsSupported)
-                return VecDotQ8_0Q8_0Arm(q8w, q8x, blockCount);
+            if (ArmDotSupported)
+                return VecDotQ8_0Q8_0Neon(q8w, q8x, blockCount);
+            return VecDotQ8_0Q8_0Scalar(q8w, q8x, blockCount);
+        }
 
+        private static unsafe float VecDotQ8_0Q8_0Scalar(byte* q8w, byte* q8x, int blockCount)
+        {
             float sum = 0.0f;
             for (int block = 0; block < blockCount; block++)
             {
@@ -2653,26 +2778,6 @@ namespace TensorSharp.Models
                 sum += dw * dx * isum;
             }
 
-            return sum;
-        }
-
-        private static unsafe float VecDotQ8_0Q8_0Arm(byte* q8w, byte* q8x, int blockCount)
-        {
-            float sum = 0;
-            for (int block = 0; block < blockCount; ++block)
-            {
-                byte* wb = q8w + block * Q8_0BlockBytes;
-                byte* xb = q8x + block * Q8_0BlockBytes;
-                var partial = Dp.DotProduct(Vector128<int>.Zero,
-                    Unsafe.ReadUnaligned<Vector128<sbyte>>(wb + 2),
-                    Unsafe.ReadUnaligned<Vector128<sbyte>>(xb + 2));
-                partial = Dp.DotProduct(partial,
-                    Unsafe.ReadUnaligned<Vector128<sbyte>>(wb + 18),
-                    Unsafe.ReadUnaligned<Vector128<sbyte>>(xb + 18));
-                int dot = AdvSimd.Arm64.AddAcross(partial).GetElement(0);
-                // Preserve the scalar block reduction order and GGUF half scales.
-                sum += HalfToSingle(ReadUInt16(wb)) * HalfToSingle(ReadUInt16(xb)) * dot;
-            }
             return sum;
         }
 
@@ -2904,6 +3009,8 @@ namespace TensorSharp.Models
         {
             if (Avx2.IsSupported)
                 return VecDotQ4_KQ8_KAvx2(q4k, q8k, superBlockCount);
+            if (ArmDotSupported)
+                return VecDotQ4_KQ8_KNeon(q4k, q8k, superBlockCount);
 
             return VecDotQ4_KQ8_KScalar(q4k, q8k, superBlockCount);
         }
@@ -3125,6 +3232,8 @@ namespace TensorSharp.Models
                 return VecDotQ6_KQ8_KAvx2(q6k, q8k, superBlockCount);
             if (Ssse3.IsSupported)
                 return VecDotQ6_KQ8_KSse(q6k, q8k, superBlockCount);
+            if (ArmDotSupported)
+                return VecDotQ6_KQ8_KNeon(q6k, q8k, superBlockCount);
 
             return VecDotQ6_KQ8_KScalar(q6k, q8k, superBlockCount);
         }
@@ -3782,7 +3891,13 @@ namespace TensorSharp.Models
         {
             if (Avx2.IsSupported)
                 return VecDotNvfp4Q8_0Avx2(nv, q8, blockCount);
+            if (ArmDotSupported)
+                return VecDotNvfp4Q8_0Neon(nv, q8, blockCount);
+            return VecDotNvfp4Q8_0Scalar(nv, q8, blockCount);
+        }
 
+        private static unsafe float VecDotNvfp4Q8_0Scalar(byte* nv, byte* q8, int blockCount)
+        {
             float sum = 0.0f;
             for (int block = 0; block < blockCount; block++)
             {

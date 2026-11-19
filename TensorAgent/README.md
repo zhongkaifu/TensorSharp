@@ -53,7 +53,7 @@ Knowledge, response steering, LTX 2.5 and native skill discovery describe curren
 source after the `v2026.10.10` tag; use a source build or a package that contains
 those changes.
 
-**Model and validation scope.** The 38 catalog entries start at the 12 GB system
+**Model and validation scope.** The 41 catalog entries start at the 12 GB system
 RAM tier, with larger models requiring higher tiers. Qwen3.8 Flash Next has an
 experimental UD-IQ1_M entry from 32 GB and a UD-Q2_K_XL entry from 48 GB,
 both with SSD-backed weights and optional vision and draft companions. LTX 2.5
@@ -244,6 +244,16 @@ plus prompt/KV reuse when reported and a stopped/truncated marker when applicabl
 Those statistics are saved with the conversation and return when it is reopened;
 image/video turns do not show the placeholder zero-token counters.
 
+**Spoken replies.** With a model that speaks loaded (LFM3-Omni and its projector, which carries
+the speech decoder), the composer shows a **Speak replies** switch and, when the model has more
+than one, a voice picker. A reply sent with it on is spoken while it is written: the page plays the
+speech chunks as they arrive (the audio starts from the tap that sends, as WebKit requires) and
+**Stop speaking** silences it; the finished reply keeps a player and **Save audio**, which goes
+through the app's save picker like a picture's **Download**. The WAV is saved with the conversation
+and plays again when it is reopened, and the next turn carries the reply back by its id, so the
+host reuses its cached prompt. A spoken reply runs without reasoning, tools or skills, and says so
+under the answer. See [API_EXAMPLES.md → Spoken replies](../TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni).
+
 What is shared is the API, not the document. The routes under the page —
 `/api/chat`, `/api/models`, `/api/sessions`, `/api/upload`, `/api/skills`,
 `/api/image-edit`, `/api/video-generate` — are bound to the same
@@ -301,6 +311,8 @@ See [The desktop's larger models](#the-desktops-larger-models) for the historica
 | Gemma 4 E4B (IQ4_XS) | text, image, audio, video | download: 4,715,416,704-byte main GGUF + 559,874,816-byte projector; 98,653,280-byte draft optional | 12 GB | `unsloth/gemma-4-E4B-it-GGUF` + `ggml-org/gemma-4-E4B-it-GGUF` (projector and draft) |
 | Bonsai 2 27B (PTQ1_0) | text; image with optional projector | download: 5,946,648,928-byte main GGUF; 629,246,976-byte projector optional | 16 GB | `prism-ml/Ternary-Bonsai-2-27B-gguf` |
 | Qwen3.5 9B (IQ4_XS) | text; image and video with optional projector | download: 5,168,653,536-byte main GGUF; 918,166,080-byte projector optional | 12 GB | `unsloth/Qwen3.5-9B-GGUF` |
+| LFM3 1.7B (Q4_K_M), experimental | text, thinking, tool calls | download: 1,099,627,808-byte main GGUF (the file of [`lfm3-1.7b.json`](../config/lfm3-1.7b.json)) | 12 GB | `LiquidAI/LFM3-1.7B-GGUF` |
+| LFM3-Omni 2B (Q4_K_M), experimental | text, image, video, audio in (no spoken replies yet) | download: 1,099,630,080-byte main GGUF + 506,842,528-byte projector (the files of [`lfm3-omni-2b.json`](../config/lfm3-omni-2b.json)) | 12 GB | `LiquidAI/LFM3-Omni-2B-GGUF` |
 | Qwen3.8 27B (UD-IQ3_XXS) | text; image and video with optional projector | download: 10,934,860,704-byte main GGUF; 931,146,432-byte BF16 projector and 1,143,006,816-byte DFlash2 Q4_K_M drafter optional (the files of [`qwen3.8-27b-metal-dflash2.json`](../config/qwen3.8-27b-metal-dflash2.json)) | 32 GB | `unsloth/Qwen3.8-27B-GGUF` + `z-lab/Qwen3.8-27B-DFlash2-GGUF` |
 | Muse-Glimmer 30B (UD-Q4_K_XL) | text; image with optional projector | download: 15,878,222,368-byte main GGUF; 2,051,685,088-byte projector optional | 32 GB | `unsloth/Muse-Glimmer-30B-GGUF` |
 | Qwen3.8 Flash Next (UD-Q2_K_XL) | text; images/video with optional projector | download: three shards of 10,946,624, 49,979,779,296 and 28,878,402,944 bytes (78.9 GB); 907,542,944-byte projector and 2,786,568,256-byte shared MTP head optional | 48 GB | `unsloth/Qwen3.8-Flash-Next-GGUF` |
@@ -2294,6 +2306,11 @@ checked and these were not:
 - **The native picker's own file names.** `UploadNaming` is tested against the shapes
   iOS produces (a stem with no extension, no content type, HEIC and MP4 bytes behind
   the same absent name), but the picker itself has only been run by hand.
+- **Spoken replies in the app.** The page's switch, live playback, player, Save link and the
+  recorded transcript are tested in JavaScriptCore with a fake AudioContext and on the host
+  (`SpokenReplyPageTests`, `SpokenReplyRecordingTests`); the same `/api/chat` route was run against
+  LFM3-Omni on TensorSharp.Server. Playback inside the app's WKWebView, the iOS save picker, the
+  Mac app's and Windows' save dialogs for a WAV were not run.
 - **Pictures on a phone.** The page makes and edits pictures through `/api/chat` with
   Qwen-Image 2.1, which needs the 24 GB memory tier and was measured in the Mac app;
   no image has been generated on iOS. `/api/image-edit` remains bound to the same

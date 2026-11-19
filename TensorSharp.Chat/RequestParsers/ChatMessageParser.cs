@@ -52,6 +52,9 @@ namespace TensorSharp.Server.RequestParsers
 
                 msg.ImagePaths = StringList(msgEl, "imagePaths");
                 msg.AudioPaths = StringList(msgEl, "audioPaths");
+                // The clips themselves (imagePaths carries the frames the upload extracted): a
+                // family that samples video itself reads these (ChatMessage.VideoFilePaths).
+                msg.VideoFilePaths = StringList(msgEl, "videoFilePaths");
 
                 // Text uploads usually inline their content into msg.Content. Large CSV
                 // tables use the explicit fileBacked attachment marker instead; either
@@ -180,6 +183,7 @@ namespace TensorSharp.Server.RequestParsers
             {
                 string error = ResolvePathList(msg?.ImagePaths, uploadRoot)
                     ?? ResolvePathList(msg?.AudioPaths, uploadRoot)
+                    ?? ResolvePathList(msg?.VideoFilePaths, uploadRoot)
                     ?? ResolvePathList(msg?.TextFilePaths, uploadRoot)
                     ?? ResolvePathList(msg?.AttachmentPaths, uploadRoot);
                 if (error != null)
@@ -244,6 +248,18 @@ namespace TensorSharp.Server.RequestParsers
         /// </summary>
         public static List<ChatMessage> ParseOpenAI(JsonElement messagesEl, UploadStoragePolicy uploads, ILogger logger = null,
             string architecture = null, bool audioEncoderLoaded = false)
+            => ParseOpenAI(messagesEl, uploads, logger, architecture, audioEncoderLoaded, assistantAudio: null);
+
+        /// <summary>
+        /// <see cref="ParseOpenAI(JsonElement, UploadStoragePolicy, ILogger, string, bool)"/> where an assistant message may
+        /// carry an earlier spoken reply as OpenAI's <c>audio: {"id": ...}</c> (content null): <paramref name="assistantAudio"/>
+        /// gives that reply's transcript, which the turn renders as. An id it does not know (null) is a
+        /// <see cref="JsonException"/> (an HTTP 400). Where <paramref name="assistantAudioTurn"/> knows the reply as generation
+        /// decoded it, the turn is spliced back as that (its tokens, its frames' rows) instead (<see cref="SpokenTurnRecord"/>).
+        /// </summary>
+        public static List<ChatMessage> ParseOpenAI(JsonElement messagesEl, UploadStoragePolicy uploads, ILogger logger,
+            string architecture, bool audioEncoderLoaded, Func<string, string> assistantAudio,
+            Func<string, SpokenTurnRecord> assistantAudioTurn = null)
         {
             // Scan the complete request before writing any uploads: an image
             // preceding unsupported audio or an invalid image must not leave
@@ -333,9 +349,10 @@ namespace TensorSharp.Server.RequestParsers
                             }
                             else if (type == "video_url" && part.TryGetProperty("video_url", out var videoUrl))
                             {
-                                if (ChatProtocolRegistry.For(architecture)?.CapsVideoFrames != true)
+                                ChatProtocol protocol = ChatProtocolRegistry.For(architecture);
+                                if (protocol?.CapsVideoFrames != true)
                                     throw new JsonException("video_url frame sampling is not supported by this model's chat protocol.");
-                                AppendSampledVideo(msg, videoUrl, uploads);
+                                AppendSampledVideo(msg, videoUrl, uploads, sampleFrames: !protocol.ReadsVideoFiles);
                             }
                             else if (type == "input_audio" && part.TryGetProperty("input_audio", out var audioEl))
                             {
@@ -364,7 +381,7 @@ namespace TensorSharp.Server.RequestParsers
                         }
 
                         msg.Content = string.Join("\n", textParts);
-                        if (msg.ImagePaths.Count == 0) msg.ImagePaths = null;
+                        if (msg.ImagePaths.Count == 0) { msg.ImagePaths = null; msg.ImageTimestamps = null; }
                         if (msg.AudioPaths.Count == 0) msg.AudioPaths = null;
                     }
                 }
@@ -374,6 +391,17 @@ namespace TensorSharp.Server.RequestParsers
                 AppendMessageLevelAudios(msgEl, msg, uploads);
 
                 ReadOpenAIHistory(msgEl, msg);
+
+                // An earlier spoken reply (OpenAI's assistant audio.id): its transcript renders the turn.
+                if (msg.Role == "assistant" && string.IsNullOrEmpty(msg.Content)
+                    && msgEl.TryGetProperty("audio", out JsonElement audioRef) && audioRef.ValueKind == JsonValueKind.Object
+                    && audioRef.TryGetProperty("id", out JsonElement audioId) && audioId.ValueKind == JsonValueKind.String)
+                {
+                    string transcript = assistantAudio?.Invoke(audioId.GetString());
+                    msg.Content = transcript ?? throw new JsonException(
+                        $"assistant audio '{audioId.GetString()}' is not known here (an unknown or expired id): send the reply's transcript as its content instead.");
+                    assistantAudioTurn?.Invoke(audioId.GetString())?.ApplyTo(msg);
+                }
 
                 messages.Add(msg);
             }
@@ -464,7 +492,10 @@ namespace TensorSharp.Server.RequestParsers
         /// Parse the Responses API <c>input</c> field, which is either a plain
         /// string (shorthand for a single user turn) or an array of message
         /// items: <c>{role, content: string | [{type:"input_text"|"output_text", text} |
-        /// {type:"input_image", image_url}]}</c>. An optional <c>instructions</c>
+        /// {type:"input_image", image_url} | {type:"input_audio", input_audio} |
+        /// {type:"input_video", input_video: {url, fps?, max_frames?}}]}</c> (<c>input_video</c> only for a
+        /// protocol that samples video, <see cref="ChatProtocol.CapsVideoFrames"/>, as the chat
+        /// endpoint's <c>video_url</c>). An optional <c>instructions</c>
         /// string is prepended as a system message, matching how the real API
         /// folds it into the model's system prompt.
         /// </summary>
@@ -584,6 +615,13 @@ namespace TensorSharp.Server.RequestParsers
                             if (audioPath != null)
                                 msg.AudioPaths.Add(audioPath);
                         }
+                        else if (partType == "input_video")
+                        {
+                            ChatProtocol protocol = ChatProtocolRegistry.For(architecture);
+                            if (protocol?.CapsVideoFrames != true)
+                                throw new JsonException("input_video is not supported by this model's chat protocol.");
+                            AppendResponsesVideo(msg, part, uploads, sampleFrames: !protocol.ReadsVideoFiles);
+                        }
                         else if (partType == "input_image")
                         {
                             string url = part.TryGetProperty("image_url", out var u)
@@ -596,6 +634,8 @@ namespace TensorSharp.Server.RequestParsers
                             {
                                 string b64 = url.Substring(commaIdx + 1);
                                 msg.ImagePaths.Add(WriteBase64Image(b64, uploads));
+                                // A still beside an input_video's timed frames keeps no time.
+                                msg.ImageTimestamps?.Add(null);
                             }
                             else if (!string.IsNullOrEmpty(url))
                             {
@@ -607,7 +647,7 @@ namespace TensorSharp.Server.RequestParsers
                     }
 
                     msg.Content = string.Join("\n", textParts);
-                    if (msg.ImagePaths.Count == 0) msg.ImagePaths = null;
+                    if (msg.ImagePaths.Count == 0) { msg.ImagePaths = null; msg.ImageTimestamps = null; }
                     if (msg.AudioPaths.Count == 0) msg.AudioPaths = null;
                 }
 
@@ -777,32 +817,82 @@ namespace TensorSharp.Server.RequestParsers
             return slash >= 0 ? mime.Substring(slash + 1) : mime;
         }
 
-        private static string AudioExtension(string format, byte[] data)
+        /// <summary>
+        /// The extension an audio upload is stored with, which picks its decoder: WAV, MP3 and Ogg Vorbis read by the managed
+        /// decoders, every other container (FLAC, M4A / MP4, raw AAC, WebM, Ogg Opus, AIFF, CAF) by the platform decoder
+        /// (ffmpeg on desktop hosts). The declared format (OpenAI's <c>format</c>, a data URI's MIME subtype) first, else
+        /// the bytes' signature, else MP3 (bare MPEG frames have none). A FLAC or M4A clip used to be stored as .mp3 and
+        /// read by the MP3 decoder, which made a fraction of a second of noise of it.
+        /// </summary>
+        internal static string AudioExtension(string format, byte[] data)
         {
             switch ((format ?? string.Empty).Trim().TrimStart('.').ToLowerInvariant())
             {
                 case "wav":
                 case "wave":
                 case "x-wav":
+                case "vnd.wave":
                 case "pcm":
                     return ".wav";
                 case "mp3":
                 case "mpeg":
                 case "mpga":
+                case "mpeg3":
+                case "x-mpeg-3":
                     return ".mp3";
                 case "ogg":
                 case "oga":
                 case "vorbis":
-                    return ".ogg";
+                    return IsOggOpus(data) ? ".opus" : ".ogg";
+                case "opus":
+                    return ".opus";
+                case "flac":
+                case "x-flac":
+                    return ".flac";
+                case "m4a":
+                case "x-m4a":
+                case "mp4":
+                case "mp4a-latm":
+                    return ".m4a";
+                case "aac":
+                case "aacp":
+                case "x-aac":
+                    return ".aac";
+                case "webm":
+                    return ".webm";
+                case "aiff":
+                case "x-aiff":
+                case "aif":
+                    return ".aiff";
+                case "caf":
+                case "x-caf":
+                    return ".caf";
             }
 
-            if (data.Length >= 12 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F'
-                && data[8] == 'W' && data[9] == 'A' && data[10] == 'V' && data[11] == 'E')
+            ReadOnlySpan<byte> d = data;
+            if (d.Length >= 12 && d[..4].SequenceEqual("RIFF"u8) && d.Slice(8, 4).SequenceEqual("WAVE"u8))
                 return ".wav";
-            if (data.Length >= 4 && data[0] == 'O' && data[1] == 'g' && data[2] == 'g' && data[3] == 'S')
-                return ".ogg";
+            if (d.Length >= 4 && d[..4].SequenceEqual("OggS"u8))
+                return IsOggOpus(data) ? ".opus" : ".ogg";
+            if (d.Length >= 4 && d[..4].SequenceEqual("fLaC"u8))
+                return ".flac";
+            if (d.Length >= 12 && d.Slice(4, 4).SequenceEqual("ftyp"u8))
+                return ".m4a";
+            if (d.Length >= 4 && d[0] == 0x1A && d[1] == 0x45 && d[2] == 0xDF && d[3] == 0xA3)
+                return ".webm";
+            if (d.Length >= 12 && d[..4].SequenceEqual("FORM"u8) && (d.Slice(8, 4).SequenceEqual("AIFF"u8) || d.Slice(8, 4).SequenceEqual("AIFC"u8)))
+                return ".aiff";
+            if (d.Length >= 4 && d[..4].SequenceEqual("caff"u8))
+                return ".caf";
+            // ADTS (raw AAC) frames: a 12-bit sync and the layer bits 00 (MPEG audio frames have a non-zero layer).
+            if (d.Length >= 2 && d[0] == 0xFF && (d[1] & 0xF6) == 0xF0)
+                return ".aac";
             return ".mp3";                 // ID3-tagged or bare MPEG frames
         }
+
+        /// <summary>An Ogg stream whose first packet is an Opus header (the managed Ogg reader decodes Vorbis only).</summary>
+        private static bool IsOggOpus(byte[] data)
+            => data.AsSpan(0, Math.Min(data.Length, 128)).IndexOf("OpusHead"u8) >= 0;
 
         /// <summary>
         /// Read a message-level <c>"audios"</c> array of base64 clips (optionally

@@ -64,8 +64,10 @@ namespace TensorSharp.Models
 
         /// <summary>A family whose steps write a slot's rows below its length with other bytes opts out: its checkpoints copy.
         /// (Qwen3.8's QSA rewrites the last whole block's pooled key below the length with the same bytes, a function of rows
-        /// that do not change.)</summary>
-        protected virtual bool CheckpointRowsAppendOnly => true;
+        /// that do not change.) A model with sliding-window ring caches (StandardDecoderModel.SlidingRings.cs) never shares: a
+        /// ring's cell p mod R holds position p, so the slot's next rows, written at or past every checkpoint's length, still
+        /// overwrite the cells of the positions a checkpoint's window reads.</summary>
+        protected virtual bool CheckpointRowsAppendOnly => !HasRingCaches;
 
         private bool _lastMaterializeWantedRoom;
 

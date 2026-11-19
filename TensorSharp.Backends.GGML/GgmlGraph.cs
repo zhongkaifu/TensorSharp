@@ -35,6 +35,10 @@ namespace TensorSharp.GGML
         MoeHostExperts = 54, LightningIndexer = 55, TopKMask = 56,
         /// <summary>A tensor-parallel partial, summed in place across the ranks of <see cref="GgmlGraph.RunRanked"/>.</summary>
         AllReduce = 57,
+        /// <summary>A depthwise 2-D convolution of rows of channels (GraphOp.DepthwiseConv2d).</summary>
+        DepthwiseConv2d = 70,
+        /// <summary>The exact GELU, 0.5 x (1 + erf(x / sqrt 2)) (ggml_gelu_erf).</summary>
+        GeluErf = 71,
     }
 
     /// <summary>ggml tensor types used by graph leaves (ggml.h's enum ggml_type).</summary>
@@ -231,8 +235,34 @@ namespace TensorSharp.GGML
             }
         }
 
+        /// <summary>Greedy-head rows (<see cref="GgmlGraphOp.TopK"/> with ip[1] = 1) whose id the host took from their full
+        /// logits since the process started: every candidate tied, or the row held a NaN or an infinity. For tests.</summary>
+        public static long GreedyFullRows => GgmlNative.TSGgml_GreedyFullRows();
+
         /// <summary>Whether a STATE leaf lives in device memory that outlives the run.</summary>
         public bool IsResident(int leaf) => GgmlNative.TSGgml_GraphLeafIsResident(Handle, leaf) != 0;
+
+        private static bool s_noCensus;
+
+        /// <summary>What one run of the built graph evaluates and moves (TSGgml_GraphCensus): its ggml nodes, those that run a
+        /// kernel, the leaves every run uploads besides its inputs and their bytes, and the state leaves it downloads and their
+        /// bytes. Null before the graph is built (on its first run) or with a native library that has no census.</summary>
+        public unsafe long[] Census()
+        {
+            if (_handle == IntPtr.Zero || !IsBuilt || s_noCensus) return null;
+            long* values = stackalloc long[6];
+            try
+            {
+                return GgmlNative.TSGgml_GraphCensus(_handle, values, 6) == 6
+                    ? new[] { values[0], values[1], values[2], values[3], values[4], values[5] }
+                    : null;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                s_noCensus = true;
+                return null;
+            }
+        }
 
         private IntPtr Handle => _handle != IntPtr.Zero ? _handle : throw new ObjectDisposedException(nameof(GgmlGraph));
 
@@ -296,12 +326,24 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial void TSGgml_GraphOverlapSteps(int open);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static unsafe partial int TSGgml_GraphRunRanked(IntPtr* graphs, int nranks, IntPtr* inputs, IntPtr* data, IntPtr* bytes,
             int* ninputs, int exactF32);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial int TSGgml_GraphLeafIsResident(IntPtr graph, int node);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static unsafe partial int TSGgml_GraphCensus(IntPtr graph, long* values, int count);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial long TSGgml_GreedyFullRows();
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

@@ -12,11 +12,15 @@
          and the workstation collector's pauses sat inside decode cycles (Qwen3.8 Flash Next ISTA + MTP on an A40: 0.67-0.71 s
          of pauses a run against 0.31-0.38 s, short-prompt decode +4.5%). -->
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <!-- Methods compiled fully optimized at their first call, not first at tier 0: a request's first decode steps trace and
-         record each step shape through code that had not been promoted yet (Qwen3.8 Flash Next ISTA + MTP on an A40: the
-         first request's eight trunk recordings 260-305 ms against 175-188 ms, short-prompt decode 100-104 tok/s against
-         111-113; model load 27-31 s either way). -->
-    <TieredCompilation>false</TieredCompilation>
+    <!-- TensorSharp's methods compiled fully optimized at their first call, not first at tier 0: a request's first decode
+         steps trace and record each step shape through code that had not been promoted yet (Qwen3.8 Flash Next ISTA + MTP
+         on an A40, the CLI with tiering off: the first request's eight trunk recordings 260-305 ms against 175-188 ms,
+         short-prompt decode 100-104 tok/s against 111-113; model load 27-31 s either way). Tiering itself stays on, so the
+         framework's precompiled (ReadyToRun) methods that run hot are recompiled for this CPU: with it off they ran
+         precompiled for good, and the BCL's vector exp behind every SiLU and softmax of the managed CPU lane took a
+         function call per lane (LFM3-1.7B Q4_K_M, M5 Pro, the server at one stream: 78.0 -> 96.9 tok/s decode, 686 -> 618 ms
+         time to first token for 512 tokens; the same bits). -->
+    <TieredCompilationQuickJit>false</TieredCompilationQuickJit>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />

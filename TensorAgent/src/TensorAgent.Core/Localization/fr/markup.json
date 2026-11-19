@@ -11,6 +11,8 @@
   "markup.composer.placeholder": "Message… ou maintenez pour parler",
   "markup.composer.holdToTalk": "Maintenir pour parler",
   "markup.composer.send": "Envoyer",
+  "markup.composer.speakReplies": "Réponses parlées",
+  "markup.composer.voice": "Voix",
   "markup.attach.title": "Ajouter à ce message",
   "markup.attach.photo": "Photo",
   "markup.attach.camera": "Caméra",

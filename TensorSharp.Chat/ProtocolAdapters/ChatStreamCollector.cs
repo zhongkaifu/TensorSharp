@@ -80,9 +80,14 @@ namespace TensorSharp.Server.ProtocolAdapters
         /// <summary>
         /// Produce the finished answer, parsing the raw text with
         /// <paramref name="architecture"/>'s parser unless the stream was already parsed
-        /// for us.
+        /// for us (the skills loop decides a round cut short itself:
+        /// <c>SkillRequestPlan.ClientReadsWholeReply</c>).
         /// </summary>
-        public ParsedOutput Resolve(string architecture, bool enableThinking, List<ToolFunction>? tools)
+        /// <param name="replyWasCut">The reply stopped short of its end
+        /// (<see cref="FinishReasonMapper.IsTruncated"/>): it is parsed as its API stream
+        /// would have been (<see cref="ParseWhole"/>).</param>
+        public ParsedOutput Resolve(string architecture, bool enableThinking, List<ToolFunction>? tools,
+            bool replyWasCut = false)
         {
             if (IsParsed)
             {
@@ -94,10 +99,29 @@ namespace TensorSharp.Server.ProtocolAdapters
                 };
             }
 
+            return ParseWhole(architecture, _raw.ToString(), enableThinking, tools, _generationSuffix, replyWasCut);
+        }
+
+        /// <summary>
+        /// One whole reply through <paramref name="architecture"/>'s parser, primed with the
+        /// prompt's tail. <paramref name="asStreamed"/> parses it as an append-only API stream
+        /// of it does (<see cref="IOutputParser.StreamWithoutHolding"/>): for a family that
+        /// streams a thinking-off reply as generated (LFM3) the text before a stray
+        /// <c>&lt;/think&gt;</c> then stays in the content, as llama.cpp, vLLM and SGLang return
+        /// it. A whole API reply is parsed so when it was cut short, where the answer after
+        /// the close is incomplete and the reasoning before it is the most complete text the
+        /// client gets; a reply the model finished keeps its reasoning apart. Every other
+        /// family parses the same either way.
+        /// </summary>
+        internal static ParsedOutput ParseWhole(string architecture, string rawText, bool enableThinking,
+            List<ToolFunction>? tools, string? generationSuffix, bool asStreamed)
+        {
             var parser = OutputParserFactory.Create(architecture);
             parser.Init(enableThinking, tools);
-            parser.SetGenerationPromptSuffix(_generationSuffix);
-            return parser.Add(_raw.ToString(), true);
+            if (asStreamed)
+                parser.StreamWithoutHolding();
+            parser.SetGenerationPromptSuffix(generationSuffix);
+            return parser.Add(rawText ?? string.Empty, true);
         }
 
         /// <summary>

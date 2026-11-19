@@ -231,7 +231,10 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     const size_t input_offset = 0;
     const size_t output_offset = align(size_t(selected_rows) * sizeof(int32_t));
     const size_t bounds_offset = output_offset * 2;
-    const size_t quant_offset = bounds_offset + align(size_t(w->ne[2] + 1) * sizeof(int32_t));
+    // ggml's ids helper writes MMQ tile specs (one per J columns, plus one per expert); the strips read the bounds instead.
+    const size_t tile_spec_offset = bounds_offset + align(size_t(w->ne[2] + 1) * sizeof(int32_t));
+    const size_t tile_specs = size_t((selected_rows + width - 1) / width) + size_t(w->ne[2]);
+    const size_t quant_offset = tile_spec_offset + align(tile_specs * sizeof(ggml_cuda_mm_id_tile_spec));
     // MMQ loads a complete J tile even when the final sorted expert slice
     // has fewer columns. Reserve upstream's tail padding outside the fixup
     // scratch so these loads neither overrun nor race with partial writes.
@@ -262,8 +265,12 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     auto * output_ids = reinterpret_cast<int32_t *>(scratch + output_offset);
     auto * bounds = reinterpret_cast<int32_t *>(scratch + bounds_offset);
     const bool dedup = x->ne[1] == 1 && used > 1;
-    ggml_cuda_launch_mm_ids_helper(static_cast<const int32_t *>(ids->data), input_ids, output_ids, bounds,
-        w->ne[2], tokens, used, x->ne[1], ids->nb[1] / sizeof(int32_t), x->nb[2] / x->nb[1], dedup, state->stream);
+    auto * tile_spec = reinterpret_cast<ggml_cuda_mm_id_tile_spec *>(scratch + tile_spec_offset);
+    ggml_cuda_launch_mm_ids_helper(static_cast<const int32_t *>(ids->data), input_ids, output_ids, tile_spec,
+        w->ne[2], tokens, used, x->ne[1], width, ids->nb[1] / sizeof(int32_t), x->nb[2] / x->nb[1], dedup, state->stream);
+    CUDA_CHECK(cudaGetLastError());
+    quant_strip_expert_bounds<<<1, 256, size_t(w->ne[2]) * sizeof(int), state->stream>>>(static_cast<const int32_t *>(ids->data),
+        bounds, int(w->ne[2]), tokens, used, int(ids->nb[1] / sizeof(int32_t)));
     CUDA_CHECK(cudaGetLastError());
     if (dedup)
         quantize_scatter_mmq_q8_1_cuda(static_cast<const float *>(x->data), input_ids, scratch + quant_offset,

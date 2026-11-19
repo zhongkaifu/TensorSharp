@@ -37,6 +37,11 @@ namespace TensorSharp.Cuda
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
             WindowStateInPlace = true, WindowRegionsReadPackedRows = true, SlotBoundRecordings = true,
             HostExperts = true, RecordsHostExperts = true, RegionsAtAnyWidth = true, GreedyIdOutputs = true,
+            // A sliding-window layer's decode rows and verify windows list their band's cells on the device
+            // (TrySparseDecodeAttention, the window rows' selection): their steps record past the window, where a band
+            // classified on the host had kept every later step unrecorded (LFM3-1.7B Q4_K_M on an A40, interleaved: decode
+            // at 4K 183.3 -> 241.0 tok/s, at 16K 182.1 -> 224.5).
+            BandMasksOnDevice = true,
             StructuralCausalMasks = true,
         };
 
@@ -238,16 +243,28 @@ namespace TensorSharp.Cuda
                && result.StorageOffset * result.ElementType.Size() == leaf.StorageOffset * leaf.ElementType.Size() + offsetBytes;
 
         /// <summary>A prompt chunk's or a decode row's K/V rows into the head-first cache (F32 or F16) with the
-        /// per-op path's kernel.</summary>
+        /// per-op path's kernel. A recorded step's write reads its first row from the step's parameters (the position) on
+        /// every replay: it is taken modulo the cache's cells, which a ring needs (a sliding-window layer's 768 cells, its
+        /// decode rows recorded past the first lap) and a linear cache never reaches.</summary>
         protected override bool TryWriteRows(Tensor dst, Tensor src, int first, int count)
+            => WriteRows(dst, src, first, count, circular: CudaDecodeDynParams.IsActive((CudaAllocator)Allocator));
+
+        /// <summary>A ring's rows past its last cell (a sliding-window layer's ring cache: an F16 one had no copy that converts
+        /// a strided run) in the same kernel, its cells taken modulo the ring.</summary>
+        protected override bool TryWriteRingRows(Tensor dst, Tensor src, int first, int count) => WriteRows(dst, src, first, count, circular: true);
+
+        private bool WriteRows(Tensor dst, Tensor src, int first, int count, bool circular)
         {
             if (dst.DimensionCount is < 2 or > 3 || !dst.IsContiguous()) return false;
+            // q8_0 rows are never taken modulo the cells: a run past the last cell is declined (copied a run at a time), and a
+            // family with sliding-window rings keeps q8_0 off this executor's graphs (StandardDecoderModel.AttentionRoutesTakeQuantizedKv).
             if (dst.ElementType == DType.Q8_0) return TryWriteQ8Rows(dst, src, null, first, count);
             using Tensor cache = HeadFirst(dst);
-            using Tensor rows = src.View(src.Sizes[^3], src.Sizes[^2], src.Sizes[^1]);
-            Tensor contiguous = rows.IsContiguous() ? rows.CopyRef() : Ops.NewContiguous(rows);
-            using (contiguous)
-                return CudaFusedOps.TryCopyHeadFirstToCache(cache, contiguous, first, count, (int)cache.Sizes[1], false);
+            // A chunk's rows may come as their permuted view (the graph no longer copies K and V before an indexed write): the
+            // cache-write kernel reads [heads, rows, d] packed, so such rows are packed here first (the copy the graph made).
+            using Tensor contiguous = src.IsContiguous() ? src.CopyRef() : Ops.NewContiguous(src);
+            using Tensor rows = contiguous.View(src.Sizes[^3], src.Sizes[^2], src.Sizes[^1]);
+            return CudaFusedOps.TryCopyHeadFirstToCache(cache, rows, first, count, (int)cache.Sizes[1], circular);
         }
 
         /// <summary>A head-first cache or window [heads, cells, dim] as the kernels take it: a single head's binds as
@@ -259,6 +276,17 @@ namespace TensorSharp.Cuda
         /// Qwen3.8-27B; its 4K prompt 4-11% faster on an RTX PRO 6000 slice, the same tokens). Decode-size steps keep the
         /// copies (their own measured speed).</summary>
         protected override bool ProductRowBlocksAsViews(long rows) => rows > DenseDecodeRows;
+
+        /// <summary>The generic attention's mask as one row added to every head's scores (the scores [heads, nq * nkv], the
+        /// mask their row): the mask expanded over the heads has no kernel here and went through the element-by-element host
+        /// fallback (a 64-request LFM3 burst's chunks over a sliding window's cells). The same sums.</summary>
+        protected override void AddAttentionMask(Tensor scores, Tensor mask)
+        {
+            using Tensor rows = scores.View(scores.Sizes[0], scores.Sizes[1] * scores.Sizes[2]);
+            using Tensor row = mask.View(scores.Sizes[1] * scores.Sizes[2]);
+            if (!CudaKernelOps.TryBinaryRowBroadcast(rows, rows, row, CudaBinaryOp.Add))
+                base.AddAttentionMask(scores, mask);
+        }
 
         /// <summary>
         /// Attention over cache windows with the per-op path's kernels: a decode row runs the GQA decode kernel

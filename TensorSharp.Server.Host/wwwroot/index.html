@@ -384,6 +384,53 @@ button.primary:hover { background: var(--accent-hover); }
   margin-top: 6px;
 }
 
+/* A spoken reply (LFM3-Omni): heard while it is generated, then a player and a
+   download for the whole of it. Outside .bubble-text, which is re-rendered. */
+.speech-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.speech-voice {
+  background: var(--surface2);
+  color: var(--text2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 1px 4px;
+}
+.spoken-reply {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.spoken-reply audio {
+  height: 32px;
+  max-width: 100%;
+}
+.spoken-reply-download {
+  color: var(--accent);
+  font-size: 12px;
+}
+.spoken-reply-live {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+  padding: 2px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.spoken-reply-live:hover { color: var(--text); border-color: var(--accent); }
+.turn-notice {
+  font-size: 11px;
+  color: var(--text2);
+  font-style: italic;
+  margin-top: 6px;
+}
+
 #input-area {
   padding: 16px var(--layout-gutter);
   background: var(--surface);
@@ -1312,6 +1359,14 @@ button.primary:hover { background: var(--accent-hover); }
         <span class="toggle-track"></span>
         <span>Reasoning</span>
       </label>
+      <span class="speech-controls">
+        <label class="reasoning-toggle" id="speech-toggle-label" style="display:none" title="Speak the model's replies aloud as they are generated (reasoning and tools are off for a spoken reply)">
+          <input type="checkbox" id="speech-toggle" onchange="onSpeechToggle()">
+          <span class="toggle-track"></span>
+          <span>Speak replies</span>
+        </label>
+        <select id="speech-voice" class="speech-voice" style="display:none" title="Voice of spoken replies" aria-label="Voice of spoken replies"></select>
+      </span>
       <button type="button" class="model-value skills-pill" id="skills-pill" style="display:none" onclick="openSkillsModal()" title="Agent Skills the model can use">&#x1F9E9; Skills</button>
     </div>
     <div class="input-row">
@@ -1377,6 +1432,9 @@ const VIDEO_ARCHITECTURES = new Set(['wan', 'wan2.1', 'wan2.2', 'minimax-h3', 'l
 // skills support at all. Every read is guarded, so an older server degrades to
 // "no Skills control" rather than to a broken page.
 let currentSkillsCaps = null;
+// What /api/models says about spoken replies ({ available, voices, reason }), or null.
+// The "Speak replies" toggle is shown only while the loaded model can speak.
+let currentSpeechCaps = null;
 // Skill names sent with the next chat request.
 let selectedSkills = [];
 // Last /api/skills payload. The modal's inline handlers address rows by index into
@@ -1488,6 +1546,8 @@ async function fetchServerState() {
     // Nullable on purpose: a server without the feature omits the block entirely.
     currentSkillsCaps = (data && typeof data.skills === 'object' && data.skills) ? data.skills : null;
     updateSkillsControl();
+    currentSpeechCaps = (data && data.speechOutput && data.speechOutput.available === true) ? data.speechOutput : null;
+    updateSpeechControl();
     renderEmptyState();
     await createSession();
     return data;
@@ -2966,6 +3026,8 @@ async function sendMessage() {
     return;
   }
 
+  // Inside the click: the only moment a browser lets a spoken reply start playing.
+  primeSpeechPlayback();
   const userContent = text || describeAttachments();
   const msg = { role: 'user', content: userContent };
 
@@ -3583,6 +3645,38 @@ async function requestAssistantResponse() {
   const bubbleText = assistDiv.querySelector('.bubble-text');
   const statsDiv = assistDiv.querySelector('.stats');
 
+  // A spoken reply: heard while it is generated (where the browser can play it), and
+  // kept as a player and a download once it is done.
+  const spokenTurn = speechRequested() && !(currentArchitecture === 'qwen_image' || currentArchitecture === 'qwen-image')
+    && !VIDEO_ARCHITECTURES.has(currentArchitecture);
+  const speechBubble = assistDiv.querySelector('.bubble');
+  let spokenReply = null;
+  let liveSpeech = null;
+  const liveSpeechButton = () => {
+    let box = speechBubble.querySelector('.spoken-reply');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'spoken-reply';
+      speechBubble.insertBefore(box, statsDiv);
+    }
+    let button = box.querySelector('.spoken-reply-live');
+    if (!button) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'spoken-reply-live';
+      button.textContent = '\u25A0 Stop speaking';
+      button.title = 'Stop playing this reply (the text goes on)';
+      button.onclick = () => { if (liveSpeech) liveSpeech.stop(); };
+      box.appendChild(button);
+    }
+    return button;
+  };
+  if (spokenTurn && speechAudioContext) {
+    // One reply speaks at a time: a newer one silences what is left of the one before it.
+    if (activeLiveSpeech) activeLiveSpeech.stop();
+    liveSpeech = activeLiveSpeech = createLiveSpeech(speechAudioContext, playing => { liveSpeechButton().hidden = !playing; });
+  }
+
   let fullText = '';
   let fullThinking = '';
   // Tokens arrive faster than frames, so the answer is re-rendered at most once a
@@ -3640,6 +3734,7 @@ async function requestAssistantResponse() {
       chatPayload.newChat = true;
       needsCacheReset = false;
     }
+    if (spokenTurn) chatPayload.speech = speechRequestField();
 
     let res = await fetch('/api/chat', {
       method: 'POST',
@@ -3744,6 +3839,12 @@ async function requestAssistantResponse() {
               data.tool_calls.map(c => c && c.name).filter(Boolean));
             scrollChatToBottom();
           }
+          if (data.notice) {
+            appendTurnNotice(speechBubble, data.notice);
+          }
+          if (data.audio) {
+            if (liveSpeech) liveSpeech.push(data.audio, data.sampleRate);
+          }
           if (data.token) {
             fullText += data.token;
             renderLiveAnswer();
@@ -3794,7 +3895,16 @@ async function requestAssistantResponse() {
               // because the model was done. Say so, otherwise an answer that
               // ends mid-word just looks like the model broke.
               if (data.truncated) stats += ' \u00B7 truncated (max tokens reached)';
+              if (typeof data.audioSeconds === 'number') stats += ` \u00B7 spoken ${data.audioSeconds.toFixed(1)}s`;
               statsDiv.textContent = stats;
+              if (data.audioId) {
+                spokenReply = { audioId: data.audioId };
+                if (data.audioUrl) {
+                  spokenReply.audioUrl = data.audioUrl;
+                  spokenReply.audioSeconds = data.audioSeconds;
+                  appendSpokenReply(speechBubble, spokenReply);
+                }
+              }
             }
           }
         } catch {}
@@ -3802,6 +3912,7 @@ async function requestAssistantResponse() {
     }
   } catch (e) {
     if (e.name === 'AbortError' || generation.controller.signal.aborted) {
+      if (liveSpeech) liveSpeech.stop();
       statsDiv.textContent = generation.cancelReason === 'steered' ? 'Steered by new prompt' : 'Stopped by user';
       if (!fullText && !fullThinking) {
         bubbleText.textContent = generation.cancelReason === 'steered' ? 'Interrupted by new prompt.' : 'Response stopped.';
@@ -3820,6 +3931,9 @@ async function requestAssistantResponse() {
     if ((fullText || fullThinking) && sameChat) {
       const assistantMessage = { role: 'assistant', content: fullText };
       if (fullThinking) assistantMessage.thinking = fullThinking;
+      // Sent back with the history: audioId splices the spoken turn as it was generated
+      // (the next turn reuses its prefix), audioUrl keeps its player and download.
+      if (spokenReply) Object.assign(assistantMessage, spokenReply);
       chatHistory.push(assistantMessage);
 
       const assistIdx = chatHistory.length - 1;
@@ -4016,6 +4130,170 @@ function addAssistantBubble() {
   chatContainer.appendChild(div);
   scrollChatToBottom();
   return div;
+}
+
+// ---- Spoken replies --------------------------------------------------------
+//
+// A model that speaks (LFM3-Omni with its projector) streams its reply as text and
+// as 80 ms PCM16 chunks in the order it makes them. The chunks are played as they
+// arrive through one AudioContext, created and resumed from the toggle or the Send
+// click (browsers start audio only from a user gesture); the finished reply is a WAV
+// under /uploads that the bubble keeps as a player and a download, also once the
+// chat history carries it back (audioUrl / audioSeconds / audioId on the message).
+
+function updateSpeechControl() {
+  const label = document.getElementById('speech-toggle-label');
+  const toggle = document.getElementById('speech-toggle');
+  const voice = document.getElementById('speech-voice');
+  if (!currentSpeechCaps) {
+    label.style.display = 'none';
+    voice.style.display = 'none';
+    toggle.checked = false;
+    return;
+  }
+  label.style.display = '';
+  const voices = Array.isArray(currentSpeechCaps.voices) ? currentSpeechCaps.voices : [];
+  const keep = voice.value;
+  voice.innerHTML = '';
+  voices.forEach(name => {
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+    voice.appendChild(option);
+  });
+  if (keep && voices.includes(keep)) voice.value = keep;
+  voice.style.display = toggle.checked && voices.length > 1 ? '' : 'none';
+}
+
+function speechRequested() {
+  return !!currentSpeechCaps && document.getElementById('speech-toggle').checked;
+}
+
+/** The request's `speech`: true, or the voice picked when the model has several. */
+function speechRequestField() {
+  const voice = document.getElementById('speech-voice');
+  const voices = currentSpeechCaps && Array.isArray(currentSpeechCaps.voices) ? currentSpeechCaps.voices : [];
+  return voice.value && voices.length > 1 ? { voice: voice.value } : true;
+}
+
+let speechAudioContext = null;
+let activeLiveSpeech = null;
+
+/** Create or resume the AudioContext inside a user gesture, so live chunks may play. */
+function primeSpeechPlayback() {
+  if (!speechRequested()) return null;
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (!Context) return null;
+  try {
+    if (!speechAudioContext || speechAudioContext.state === 'closed') speechAudioContext = new Context();
+    // 'suspended', or WebKit's 'interrupted' after the tab was in the background.
+    if (speechAudioContext.state !== 'running') speechAudioContext.resume();
+  } catch (e) {
+    console.warn('Spoken replies cannot play live in this browser:', e);
+    speechAudioContext = null;
+  }
+  return speechAudioContext;
+}
+
+function onSpeechToggle() {
+  primeSpeechPlayback();
+  updateSpeechControl();
+}
+
+/** Base64 PCM16 little-endian mono to float samples. */
+function pcm16ToFloats(base64) {
+  const bytes = atob(base64);
+  const count = bytes.length >> 1;
+  const samples = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    let v = bytes.charCodeAt(2 * i) | (bytes.charCodeAt(2 * i + 1) << 8);
+    if (v >= 0x8000) v -= 0x10000;
+    samples[i] = v / 32768;
+  }
+  return samples;
+}
+
+/**
+ * Plays one reply's chunks back to back as they arrive. Each chunk is scheduled
+ * right after the previous one (or a short lead from now when playback has caught
+ * up with generation), so the reply is heard as one stream. stop() silences what is
+ * scheduled and drops what comes after.
+ */
+function createLiveSpeech(context, onState) {
+  const sources = new Set();
+  let nextAt = 0;
+  let stopped = false;
+  return {
+    get stopped() { return stopped; },
+    push(base64, sampleRate) {
+      if (stopped || !context || !base64 || !(sampleRate > 0)) return;
+      const samples = pcm16ToFloats(base64);
+      if (!samples.length) return;
+      const buffer = context.createBuffer(1, samples.length, sampleRate);
+      buffer.getChannelData(0).set(samples);
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(context.destination);
+      nextAt = Math.max(nextAt, context.currentTime + 0.05);
+      source.start(nextAt);
+      nextAt += buffer.duration;
+      sources.add(source);
+      source.onended = () => {
+        sources.delete(source);
+        if (sources.size === 0) onState(false);
+      };
+      onState(true);
+    },
+    stop() {
+      stopped = true;
+      sources.forEach(source => { try { source.stop(); } catch {} });
+      sources.clear();
+      onState(false);
+    }
+  };
+}
+
+/** The download's name: the server names a reply's WAV by when it was spoken. */
+function spokenReplyFileName(url) {
+  const name = String(url || '').split('/').pop() || 'reply.wav';
+  try { return decodeURIComponent(name); } catch { return name; }
+}
+
+/** The player and download of a finished spoken reply, under the reply's text. */
+function appendSpokenReply(bubble, message) {
+  if (!bubble || !message || !message.audioUrl) return null;
+  let box = bubble.querySelector('.spoken-reply');
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'spoken-reply';
+    const stats = bubble.querySelector('.stats');
+    bubble.insertBefore(box, stats || null);
+  }
+  box.querySelectorAll('audio, .spoken-reply-download').forEach(node => node.remove());
+  const audio = document.createElement('audio');
+  audio.controls = true;
+  audio.preload = 'metadata';
+  audio.src = message.audioUrl;
+  box.appendChild(audio);
+  const download = document.createElement('a');
+  download.className = 'spoken-reply-download';
+  download.href = message.audioUrl;
+  download.setAttribute('download', spokenReplyFileName(message.audioUrl));
+  const seconds = typeof message.audioSeconds === 'number' && isFinite(message.audioSeconds)
+    ? ` (${message.audioSeconds.toFixed(1)} s)` : '';
+  download.textContent = '\u2B07 Download audio' + seconds;
+  box.appendChild(download);
+  return box;
+}
+
+/** A sentence the server said about this turn (e.g. what a spoken reply runs without). */
+function appendTurnNotice(bubble, text) {
+  if (!bubble || !text) return;
+  const note = document.createElement('div');
+  note.className = 'turn-notice';
+  note.textContent = text;
+  const stats = bubble.querySelector('.stats');
+  bubble.insertBefore(note, stats || null);
 }
 
 function toggleThinking(header) {

@@ -11,6 +11,8 @@
   "markup.composer.placeholder": "輸入訊息…或按住說話",
   "markup.composer.holdToTalk": "按住說話",
   "markup.composer.send": "傳送",
+  "markup.composer.speakReplies": "朗讀回覆",
+  "markup.composer.voice": "聲音",
   "markup.attach.title": "新增到此訊息",
   "markup.attach.photo": "照片",
   "markup.attach.camera": "相機",

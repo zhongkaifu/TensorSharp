@@ -7,6 +7,7 @@
 using System;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 
 using TensorSharp.Cpu;
 using TensorSharp.Graph;
@@ -17,7 +18,7 @@ namespace TensorSharp.Models.Graph
     /// The managed CPU backend's executor plugin: programs run node by node on host tensors, quantized
     /// products through the managed GEMM kernels (the reference every other executor is checked against).
     /// </summary>
-    public sealed class ManagedGraphExecutor : TensorGraphExecutor
+    public sealed partial class ManagedGraphExecutor : TensorGraphExecutor
     {
         [ModuleInitializer]
         internal static unsafe void Register()
@@ -42,6 +43,32 @@ namespace TensorSharp.Models.Graph
         }
 
         public ManagedGraphExecutor(IAllocator allocator) : base(allocator) { }
+
+        // Whether this run (one step) has set the worker pool's width yet: its first weight product does (decode-sized
+        // steps run narrower, see CpuWorkerPool.SelectWidthForStep). A step without weight products keeps the width it finds.
+        private bool _stepWidthSet;
+
+        protected override void BeginRun()
+        {
+            base.BeginRun();
+            _stepWidthSet = false;
+        }
+
+        /// <summary>The step's first weight product picks the worker pool's width for the rest of the step (and after it,
+        /// until a step picks again): a later product of other rows in the same step - an expert's few routed rows, the pruned
+        /// last layer's output rows - does not switch it.</summary>
+        private void SetStepWidth(long rows)
+        {
+            if (_stepWidthSet) return;
+            _stepWidthSet = true;
+            CpuWorkerPool.SelectWidthForStep(rows);
+        }
+
+        protected override void DenseProduct(Tensor result, Tensor rows, Tensor weight)
+        {
+            SetStepWidth(rows.Sizes[0]);
+            base.DenseProduct(result, rows, weight);
+        }
 
         /// <summary>The base executor's capabilities, and a decode row's recurrence updates the slot's state in place (see
         /// <see cref="GatedDeltaNet"/>); decode steps replay their program a position on over windows padded to
@@ -282,8 +309,10 @@ namespace TensorSharp.Models.Graph
         /// <summary>
         /// One query row over F32 or F16 keys it sees all of (no mask, or causal to the last key): the grouped decode kernel the
         /// per-op layers use (<see cref="ModelBase.AttentionDecodeGrouped"/>: each KV head's keys read once for its query
-        /// group, SIMD dots, the sequence split over cores with an online softmax), reading the cache window in place. Other
-        /// shapes take the interpreter's attention.
+        /// group, SIMD dots, the sequence split over cores with an online softmax), reading the cache window in place. On ARM64
+        /// also a row that sees one run of keys past a floor (a sliding-window layer past its window: the per-op path's
+        /// WindowDecodeOnHost does the same), and every other shape - prompt chunks, verify windows, a ring's wrapped band -
+        /// through <see cref="HostFlashAttention"/>. The rest take the interpreter's attention.
         /// </summary>
         protected override unsafe Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
             CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
@@ -293,27 +322,197 @@ namespace TensorSharp.Models.Graph
             bool trimmed = mask.Pattern == MaskPattern.Explicit && mask.Trimmed != MaskPattern.Explicit && mask.Keys > 0;
             MaskPattern pattern = trimmed ? mask.Trimmed : mask.Pattern;
             int floor = trimmed ? mask.TrimmedFloor : mask.Floor;
-            bool open = floor == 0 && (pattern == MaskPattern.None || (pattern == MaskPattern.Causal && q.Sizes[1] == 1));
             bool half = k.ElementType == DType.Float16 && v.ElementType == DType.Float16;
-            if (q.Sizes[1] != 1 || !open || v.Sizes[2] != d || k.Sizes[2] != d || kvHeads == 0 || heads % kvHeads != 0
-                || q.ElementType != DType.Float32 || !(half || (k.ElementType == DType.Float32 && v.ElementType == DType.Float32))
-                || k.Strides[2] != 1 || k.Strides[1] != d || v.Strides[2] != 1 || v.Strides[1] != d
-                || k.Strides[0] != v.Strides[0] || k.Strides[0] % d != 0 || v.Sizes[1] != keys)
+            bool layout =v.Sizes[2] == d && k.Sizes[2] == d && kvHeads > 0 && heads % kvHeads == 0
+                && q.ElementType == DType.Float32 && (half || (k.ElementType == DType.Float32 && v.ElementType == DType.Float32))
+                && k.Strides[2] == 1 && k.Strides[1] == d && v.Strides[2] == 1 && v.Strides[1] == d
+                && k.Strides[0] == v.Strides[0] && k.Strides[0] % d == 0 && v.Sizes[1] == keys;
+            // One row over the run of keys [floor, end): the decode kernel (past a floor on ARM64 only).
+            bool run = q.Sizes[1] == 1 && (pattern == MaskPattern.None || pattern == MaskPattern.Causal)
+                && (floor == 0 || HostFlashAttention.Supported);
+            if (layout && !run && HostFlashAttention.Supported)
+            {
+                // A few rows (a decode step of several sequences, a verify window): each row whose keys are one run takes the
+                // decode kernel over that run, as it would alone, so its result does not depend on what else the step carried.
+                if (q.Sizes[1] <= HostWindowRows
+                    && TryRowsAsDecodes(q, k, v, mask, scale, trimmed, pattern, floor, half, out Tensor rows))
+                    return rows;
+                if (TryHostFlashAttention(q, k, v, mask, scale, trimmed, pattern, floor, half, out Tensor tiled))
+                    return tiled;
+            }
+            if (!run || !layout)
                 return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             if (trimmed) keys = mask.Keys;
+            else if (floor > 0 && mask.Keys > 0) keys = Math.Min(keys, mask.Keys);
+            if (floor >= keys)
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             Tensor packed = q.IsContiguous() ? null : Ops.NewContiguous(q);
             try
             {
                 var result = new Tensor(Allocator, DType.Float32, 1, heads, d);
                 int stride = checked((int)(k.Strides[0] / d));
                 float* qp = TensorComputePrimitives.GetFloatPointer(packed ?? q), rp = TensorComputePrimitives.GetFloatPointer(result);
+                long skip = (long)floor * d;
                 if (half)
-                    ModelBase.AttentionDecodeGroupedF16(qp, TensorComputePrimitives.GetHalfPointer(k), TensorComputePrimitives.GetHalfPointer(v),
-                        rp, (int)heads, (int)kvHeads, (int)d, stride, checked((int)keys), scale);
+                    ModelBase.AttentionDecodeGroupedF16(qp, TensorComputePrimitives.GetHalfPointer(k) + skip, TensorComputePrimitives.GetHalfPointer(v) + skip,
+                        rp, (int)heads, (int)kvHeads, (int)d, stride, checked((int)(keys - floor)), scale);
                 else
-                    ModelBase.AttentionDecodeGrouped(qp, TensorComputePrimitives.GetFloatPointer(k), TensorComputePrimitives.GetFloatPointer(v),
-                        rp, (int)heads, (int)kvHeads, (int)d, stride, checked((int)keys), scale, Environment.ProcessorCount);
+                    ModelBase.AttentionDecodeGrouped(qp, TensorComputePrimitives.GetFloatPointer(k) + skip, TensorComputePrimitives.GetFloatPointer(v) + skip,
+                        rp, (int)heads, (int)kvHeads, (int)d, stride, checked((int)(keys - floor)), scale, Environment.ProcessorCount);
                 return result;
+            }
+            finally
+            {
+                packed?.Dispose();
+            }
+        }
+
+        /// <summary>Rows of an attention node from which <see cref="HostFlashAttention"/> takes over from row-by-row decodes.</summary>
+        private const int HostWindowRows = 16;
+
+        /// <summary>
+        /// Each row of a few-row node through the decode kernel over its own run of keys - [floor, its causal end) for a
+        /// causal or open mask, the visible span of its row of an explicit mask when that span is one run of zeros (a row
+        /// with a wrapped band goes through <see cref="HostFlashAttention"/> alone, as it would in a step of its own). False
+        /// when the mask cannot be read.
+        /// </summary>
+        private unsafe bool TryRowsAsDecodes(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale, bool trimmed,
+            MaskPattern pattern, int floor, bool half, out Tensor result)
+        {
+            result = null;
+            int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2], kvHeads = (int)k.Sizes[0], nkv = (int)k.Sizes[1];
+            int valid = mask.Keys >= 0 ? Math.Min(mask.Keys, nkv) : nkv;
+            Tensor m = null;
+            if (pattern == MaskPattern.Explicit)
+            {
+                if (!mask.HasTensor) return false;
+                m = mask.Tensor;
+                if (m == null || m.DimensionCount != 2 || m.Sizes[0] != nq || m.Sizes[1] < valid || m.Strides[1] != 1
+                    || !(m.ElementType == DType.Float32 || m.ElementType == DType.Float16))
+                    return false;
+            }
+            var output = new Tensor(Allocator, DType.Float32, nq, heads, d);
+            float* qp = TensorComputePrimitives.GetFloatPointer(q), op = TensorComputePrimitives.GetFloatPointer(output);
+            long qHead = q.Strides[0], qRow = q.Strides[1];
+            int stride = checked((int)(k.Strides[0] / d));
+            float[] rowQ = new float[heads * d];
+            fixed (float* rq = rowQ)
+            {
+                for (int r = 0; r < nq; r++)
+                {
+                    int first, end;
+                    if (m == null)
+                    {
+                        first = floor;
+                        end = pattern == MaskPattern.Causal ? Math.Clamp(valid - nq + r + 1, floor, valid) : valid;
+                    }
+                    else if (!VisibleRun(m, r, valid, out first, out end))
+                    {
+                        // A row whose keys are not one run: the tiled kernel on that row alone.
+                        using Tensor qr = q.Narrow(1, r, 1);
+                        using Tensor mr = m.Narrow(0, r, 1);
+                        if (!TryOneRowTiled(qr, k, v, mr, scale, valid, half, op + (long)r * heads * d))
+                        {
+                            output.Dispose();
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (end <= first)
+                    {
+                        output.Dispose();
+                        return false;
+                    }
+                    for (int h = 0; h < heads; h++)
+                        Buffer.MemoryCopy(qp + h * qHead + r * qRow, rq + (long)h * d, d * sizeof(float), d * sizeof(float));
+                    long skip = (long)first * d;
+                    float* rp = op + (long)r * heads * d;
+                    if (half)
+                        ModelBase.AttentionDecodeGroupedF16(rq, TensorComputePrimitives.GetHalfPointer(k) + skip, TensorComputePrimitives.GetHalfPointer(v) + skip,
+                            rp, heads, kvHeads, d, stride, end - first, scale);
+                    else
+                        ModelBase.AttentionDecodeGrouped(rq, TensorComputePrimitives.GetFloatPointer(k) + skip, TensorComputePrimitives.GetFloatPointer(v) + skip,
+                            rp, heads, kvHeads, d, stride, end - first, scale, Environment.ProcessorCount);
+                }
+            }
+            result = output;
+            return true;
+        }
+
+        /// <summary>The keys row <paramref name="r"/> of an explicit mask sees, when they are one run [first, end) of zeros
+        /// with -inf everywhere else in [0, valid).</summary>
+        private static unsafe bool VisibleRun(Tensor m, int r, int valid, out int first, out int end)
+        {
+            first = end = 0;
+            bool halfMask = m.ElementType == DType.Float16;
+            byte* row = (byte*)(halfMask ? (void*)TensorComputePrimitives.GetHalfPointer(m) : TensorComputePrimitives.GetFloatPointer(m))
+                + (long)r * m.Strides[0] * (halfMask ? 2 : 4);
+            float At(int j) => halfMask ? (float)BitConverter.UInt16BitsToHalf(((ushort*)row)[j]) : ((float*)row)[j];
+            int j0 = 0;
+            while (j0 < valid && float.IsNegativeInfinity(At(j0))) j0++;
+            int j1 = j0;
+            while (j1 < valid && At(j1) == 0f) j1++;
+            for (int j = j1; j < valid; j++)
+                if (!float.IsNegativeInfinity(At(j))) return false;
+            first = j0;
+            end = j1;
+            return end > first;
+        }
+
+        /// <summary>One row through <see cref="HostFlashAttention"/> with its additive mask row, into [heads, d] at
+        /// <paramref name="dst"/>.</summary>
+        private unsafe bool TryOneRowTiled(Tensor qr, Tensor k, Tensor v, Tensor mr, float scale, int valid, bool half, float* dst)
+        {
+            int heads = (int)qr.Sizes[0], d = (int)qr.Sizes[2], kvHeads = (int)k.Sizes[0];
+            using Tensor packed = Ops.NewContiguous(qr);
+            void* kp = half ? TensorComputePrimitives.GetHalfPointer(k) : TensorComputePrimitives.GetFloatPointer(k);
+            void* vp = half ? TensorComputePrimitives.GetHalfPointer(v) : TensorComputePrimitives.GetFloatPointer(v);
+            void* mp = mr.ElementType == DType.Float16 ? TensorComputePrimitives.GetHalfPointer(mr) : TensorComputePrimitives.GetFloatPointer(mr);
+            HostFlashAttention.Run(TensorComputePrimitives.GetFloatPointer(packed), d, kp, vp, k.Strides[0], half, heads, kvHeads, 1, d, scale,
+                HostFlashAttention.MaskKind.Additive, 0, valid, mp, mr.Strides[0], mr.ElementType == DType.Float16, dst);
+            return true;
+        }
+
+        /// <summary>
+        /// Every other attention node on ARM64 - prompt chunks, verify windows, and decode rows whose mask has a floor or a band
+        /// (sliding-window layers past their window, ring caches) - through <see cref="HostFlashAttention"/>: tiled over the
+        /// cache in place with an online softmax, where the interpreter's attention widens the K/V to F32, repeats them per
+        /// query head and materializes [heads, rows, keys] scores. False (the interpreter runs) for a mask it cannot read.
+        /// </summary>
+        private unsafe bool TryHostFlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale, bool trimmed,
+            MaskPattern pattern, int floor, bool half, out Tensor result)
+        {
+            result = null;
+            int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2], kvHeads = (int)k.Sizes[0], nkv = (int)k.Sizes[1];
+            int valid = mask.Keys >= 0 ? Math.Min(mask.Keys, nkv) : nkv;
+            HostFlashAttention.MaskKind kind;
+            Tensor m = null;
+            if (pattern == MaskPattern.None) kind = HostFlashAttention.MaskKind.None;
+            else if (pattern == MaskPattern.Causal) kind = HostFlashAttention.MaskKind.Causal;
+            else
+            {
+                if (!mask.HasTensor) return false;
+                m = mask.Tensor;
+                if (m == null || m.DimensionCount != 2 || m.Sizes[0] != nq || m.Sizes[1] < valid || m.Strides[1] != 1
+                    || !(m.ElementType == DType.Float32 || m.ElementType == DType.Float16))
+                    return false;
+                kind = HostFlashAttention.MaskKind.Additive;
+                floor = 0;
+            }
+            if (!trimmed && pattern != MaskPattern.Explicit && mask.Keys < 0) valid = nkv;
+            Tensor packed = q.IsContiguous() ? null : Ops.NewContiguous(q);
+            try
+            {
+                var output = new Tensor(Allocator, DType.Float32, nq, heads, d);
+                void* kp = half ? TensorComputePrimitives.GetHalfPointer(k) : TensorComputePrimitives.GetFloatPointer(k);
+                void* vp = half ? TensorComputePrimitives.GetHalfPointer(v) : TensorComputePrimitives.GetFloatPointer(v);
+                void* mp = m == null ? null
+                    : m.ElementType == DType.Float16 ? TensorComputePrimitives.GetHalfPointer(m) : TensorComputePrimitives.GetFloatPointer(m);
+                HostFlashAttention.Run(TensorComputePrimitives.GetFloatPointer(packed ?? q), (long)nq * d, kp, vp, k.Strides[0], half,
+                    heads, kvHeads, nq, d, scale, kind, floor, valid, mp, m?.Strides[0] ?? 0, m?.ElementType == DType.Float16,
+                    TensorComputePrimitives.GetFloatPointer(output));
+                result = output;
+                return true;
             }
             finally
             {
@@ -377,10 +576,85 @@ namespace TensorSharp.Models.Graph
 
             long rows = ns * channels;
             if (rows * nt * width >= ParallelRecurrenceWork * 4)
-                System.Threading.Tasks.Parallel.For(0L, rows, Channel);
+            {
+                // On the worker pool (whose threads would otherwise spin through a ThreadPool loop), channels in chunks.
+                long perChunk = Math.Max(1, (ParallelRecurrenceWork * 4) / Math.Max(1, nt * width));
+                int chunks = (int)((rows + perChunk - 1) / perChunk);
+                CpuParallel.For(chunks, c =>
+                {
+                    long i1 = Math.Min(rows, (c + 1) * perChunk);
+                    for (long i = c * perChunk; i < i1; i++) Channel(i);
+                });
+            }
             else
                 for (long i = 0; i < rows; i++) Channel(i);
             return result;
+        }
+
+        /// <summary>Elements a parallel chunk of a broadcast binary op takes.</summary>
+        private const long BroadcastChunkElements = 1 << 15;
+
+        /// <summary>
+        /// A binary op whose b repeats over a (the attention output gate per head, the short convolutions' gates), F32 and
+        /// contiguous: one pass over the rows on the worker pool, b read in place - where the interpreter's expanded view ran
+        /// TensorApplyCPU's generic strided loop on one thread (12 % of an LFM3 prompt step on the managed lane). Each element
+        /// is the same single IEEE operation (a op b), so the result is the same bits.
+        /// </summary>
+        protected override unsafe bool TryBinaryBroadcast(GraphOp kind, Tensor result, Tensor a, Tensor b, long[] na, long[] nb)
+        {
+            if (kind is not (GraphOp.Add or GraphOp.Sub or GraphOp.Mul or GraphOp.Div)) return false;
+            if (result.ElementType != DType.Float32 || a.ElementType != DType.Float32 || b.ElementType != DType.Float32
+                || !result.IsContiguous() || !a.IsContiguous() || !b.IsContiguous() || na.Length != 4 || nb.Length != 4)
+                return false;
+            long n0 = na[0], n1 = na[1], n2 = na[2], rows = na[1] * na[2] * na[3];
+            long b1 = nb[0], b2 = nb[0] * nb[1], b3 = nb[0] * nb[1] * nb[2];   // b's strides in its own shape
+            bool inner = nb[0] == n0;                                           // b varies along the row
+            long ra = (long)TensorComputePrimitives.GetFloatPointer(result), aa = (long)TensorComputePrimitives.GetFloatPointer(a);
+            long ba = (long)TensorComputePrimitives.GetFloatPointer(b);
+            long rowsPerChunk = Math.Max(1, BroadcastChunkElements / Math.Max(1, n0));
+            int chunks = (int)Math.Min(int.MaxValue, (rows + rowsPerChunk - 1) / rowsPerChunk);
+
+            void Chunk(int c)
+            {
+                long r0 = c * rowsPerChunk, r1 = Math.Min(rows, r0 + rowsPerChunk);
+                for (long row = r0; row < r1; row++)
+                {
+                    long i1 = row % n1, i2 = row / n1 % n2, i3 = row / (n1 * n2);
+                    long boff = (nb[1] == 1 ? 0 : i1 * b1) + (nb[2] == 1 ? 0 : i2 * b2) + (nb[3] == 1 ? 0 : i3 * b3);
+                    float* r = (float*)ra + row * n0, x = (float*)aa + row * n0, y = (float*)ba + boff;
+                    if (inner) BinaryRow(kind, r, x, y, n0);
+                    else BinaryRowScalar(kind, r, x, *y, n0);
+                }
+            }
+
+            if (chunks > 1) CpuParallel.For(chunks, Chunk);
+            else Chunk(0);
+            return true;
+        }
+
+        private static unsafe void BinaryRow(GraphOp kind, float* r, float* x, float* y, long n)
+        {
+            long i = 0;
+            for (; i + 4 <= n; i += 4)
+            {
+                Vector128<float> u = Vector128.Load(x + i), w = Vector128.Load(y + i);
+                Vector128.Store(kind switch { GraphOp.Add => u + w, GraphOp.Sub => u - w, GraphOp.Mul => u * w, _ => u / w }, r + i);
+            }
+            for (; i < n; i++)
+                r[i] = kind switch { GraphOp.Add => x[i] + y[i], GraphOp.Sub => x[i] - y[i], GraphOp.Mul => x[i] * y[i], _ => x[i] / y[i] };
+        }
+
+        private static unsafe void BinaryRowScalar(GraphOp kind, float* r, float* x, float y, long n)
+        {
+            Vector128<float> w = Vector128.Create(y);
+            long i = 0;
+            for (; i + 4 <= n; i += 4)
+            {
+                Vector128<float> u = Vector128.Load(x + i);
+                Vector128.Store(kind switch { GraphOp.Add => u + w, GraphOp.Sub => u - w, GraphOp.Mul => u * w, _ => u / w }, r + i);
+            }
+            for (; i < n; i++)
+                r[i] = kind switch { GraphOp.Add => x[i] + y, GraphOp.Sub => x[i] - y, GraphOp.Mul => x[i] * y, _ => x[i] / y };
         }
 
         protected override unsafe Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
@@ -388,6 +662,7 @@ namespace TensorSharp.Models.Graph
             if (weight.Data == IntPtr.Zero)
                 throw new InvalidOperationException("a quantized weight's host bytes were released");
             int rows = (int)x.Sizes[0];
+            SetStepWidth(rows);
             var result = new Tensor(Allocator, DType.Float32, rows, weight.Ne1);
             ManagedQuantizedOps.AddmmQuantizedToFloat32(weight.Format, weight.Data, weight.Ne0, weight.Ne1,
                 TensorComputePrimitives.GetFloatPointer(x), (int)weight.Ne0, rows,

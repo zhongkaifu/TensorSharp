@@ -13,7 +13,7 @@ using TensorSharp.Runtime;
 if (args.Length < 3)
 {
     Console.Error.WriteLine("Usage: ForcedLogitProbe MODEL OUTPUT_DIR (BACKEND | --backend BACKEND) [--reference REFERENCE_DIR] [--steps N] [--cases cases.json] [--run-id ID] [--disk-headroom-gib N]");
-    Console.Error.WriteLine("  BACKEND: ggml_cuda | ggml_cpu | ggml_metal | cuda (direct CUDA) | cpu (managed)");
+    Console.Error.WriteLine("  BACKEND: ggml_cuda | ggml_vulkan | ggml_cpu | ggml_metal | cuda (direct CUDA) | cpu (managed) | mlx");
     Console.Error.WriteLine("  Without --reference the run is greedy (its tokens become the reference's forced tokens) and");
     Console.Error.WriteLine("  metrics.json records each case's generated ids and text. metrics.json carries complete=false");
     Console.Error.WriteLine("  until every case has finished; exit 0 = finished within the tight gate, 1 = finished outside it,");
@@ -28,9 +28,9 @@ string modelPath = args[0], directory = Path.GetFullPath(args[1]);
 string backendName = Option("--backend") ?? args[2];
 BackendType backend = backendName switch
 {
-    "ggml_cuda" => BackendType.GgmlCuda, "ggml_cpu" => BackendType.GgmlCpu,
-    "ggml_metal" => BackendType.GgmlMetal, "cuda" => BackendType.Cuda, "cpu" => BackendType.Cpu,
-    _ => throw new ArgumentException("Unknown backend " + backendName + " (ggml_cuda, ggml_cpu, ggml_metal, cuda, cpu)")
+    "ggml_cuda" => BackendType.GgmlCuda, "ggml_vulkan" => BackendType.GgmlVulkan, "ggml_cpu" => BackendType.GgmlCpu,
+    "ggml_metal" => BackendType.GgmlMetal, "cuda" => BackendType.Cuda, "cpu" => BackendType.Cpu, "mlx" => BackendType.Mlx,
+    _ => throw new ArgumentException("Unknown backend " + backendName + " (ggml_cuda, ggml_vulkan, ggml_cpu, ggml_metal, cuda, cpu, mlx)")
 };
 string? Option(string name)
 {

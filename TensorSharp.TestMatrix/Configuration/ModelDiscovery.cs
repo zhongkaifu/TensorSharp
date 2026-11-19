@@ -131,6 +131,8 @@ public static class ModelDiscovery
             "qwen35" or "qwen36" => new[] { "qwen" },
             "nemotron" => new[] { "nemotron" },
             "muse-glimmer" => new[] { "muse-glimmer", "muse_glimmer" },
+            // Only Omni takes LFM3's projector; LFM3-1.7B ("lfm3") pairs with none.
+            "lfm3-omni" => new[] { "lfm3-omni" },
             // Unknown or text-only family: never attach a projector on a guess.
             _ => Array.Empty<string>(),
         };
@@ -197,6 +199,16 @@ public static class ModelDiscovery
             return new FamilyGuess(baseName.ToLowerInvariant(), "mistral3", baseName,
                 SupportsImage: true, SupportsAudio: false, SupportsVideo: false,
                 SupportsTools: false, SupportsThinking: false);
+        }
+        // Liquid LFM3 (text, reasoning) / LFM3-Omni (image, video, audio in; no reasoning).
+        // Both are general.architecture "lfm3"; the families differ here only so the
+        // Omni projector is never paired with the text model.
+        if (lower.Contains("lfm3"))
+        {
+            bool omni = lower.Contains("omni");
+            return new FamilyGuess(baseName.ToLowerInvariant(), omni ? "lfm3-omni" : "lfm3", baseName,
+                SupportsImage: omni, SupportsAudio: omni, SupportsVideo: omni,
+                SupportsTools: true, SupportsThinking: !omni);
         }
         // Qwen 3.5 / 3.6 family
         if (lower.Contains("qwen3.5") || lower.Contains("qwen3.6")

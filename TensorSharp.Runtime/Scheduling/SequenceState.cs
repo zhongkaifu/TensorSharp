@@ -209,9 +209,24 @@ namespace TensorSharp.Runtime.Scheduling
         internal TokenSampler GetOrCreateSampler()
         {
             if (CachedSampler == null)
-                CachedSampler = new TokenSampler(SamplingConfig);
+                CachedSampler = new TokenSampler(SamplingConfig) { SuppressedTokens = SuppressedTokens };
             return CachedSampler;
         }
+
+        /// <summary>Tokens this request's sampler never draws (their logits are -inf before every other stage), set by the
+        /// engine at submission from the model's <see cref="IReplyTokenPolicy"/>; null for none.</summary>
+        public IReadOnlyList<int>? SuppressedTokens { get; internal set; }
+
+        /// <summary>
+        /// The driver of a request whose decode slots are not all text tokens (speech output): the engine asks it for each
+        /// slot's input (a drawn token or an embedding row) and gives it the last forward's logits or final hidden row, as it
+        /// asks (<see cref="ISequenceStepDriver"/>). Null for an ordinary request. The creator disposes it after the request.
+        /// </summary>
+        public ISequenceStepDriver? StepDriver { get; init; }
+
+        /// <summary>The final hidden row (after the final norm) of the most recent forward's last row, when the request's
+        /// <see cref="StepDriver"/> asked for it; null otherwise.</summary>
+        public float[]? LastHidden { get; internal set; }
 
         /// <summary>Sticky reference the caller can use to associate a session,
         /// HTTP request, or telemetry context with this sequence.</summary>

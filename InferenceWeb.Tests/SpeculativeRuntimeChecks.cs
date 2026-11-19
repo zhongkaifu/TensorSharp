@@ -446,8 +446,124 @@ internal static class SpeculativeRuntimeChecks
         }
     }
 
+    /// <summary>
+    /// <c>ignore_eos</c> requests speculating together run through end-of-sequence draws exactly as plain decoding does: an
+    /// EOS anchor or accepted draft of one lane is verified like any token, the lanes end at their length limit, and no
+    /// co-batched request fails. The batched verify used to end a lane at an EOS without forwarding it, which left that lane
+    /// no logits for its next step; the step's failure then failed every request it held. Served with
+    /// <paramref name="speculation"/> (n-gram: whatever it drafts) and with a drafter that proposes each request's known
+    /// continuation (every other window wrong at its third draft), so EOS drafts are accepted and rejected too.
+    /// <paramref name="createWithEos"/> creates the model with the given end-of-sequence id (its weights independent of
+    /// it): the token both plain streams draw most often becomes the EOS, so the lanes meet it as anchors and as drafts.
+    /// </summary>
+    public static async Task AssertIgnoreEosSpeculationMatchesPlain(Func<int, ModelBase> createWithEos, int defaultEos,
+        SpeculationOptions speculation, string label, int maxNew = 32)
+    {
+        int[][] prompts = EnginePrompts.Take(2).ToArray();
+        static SamplingConfig IgnoreEos()
+        {
+            // As the request parser sets it: only the length limit ends such a request.
+            SamplingConfig sampling = SamplingConfig.Greedy;
+            sampling.IgnoreEos = true;
+            sampling.StopRepetition = false;
+            return sampling;
+        }
+        int[][] probe = await ServeAsync(() => createWithEos(defaultEos), prompts, null, maxNew, verifySteps: null,
+            sampling: IgnoreEos);
+        int eos = probe[0].Intersect(probe[1])
+            .OrderByDescending(t => probe[0].Count(x => x == t) + probe[1].Count(x => x == t)).ThenBy(t => t)
+            .DefaultIfEmpty(-1).First();
+        Assert.True(eos >= 0, $"{label}: the two plain streams share no token to make the EOS");
+        ModelBase create() => createWithEos(eos);
+
+        int[][] full = prompts.Select((p, r) => p.Concat(probe[r]).ToArray()).ToArray();
+        string oracle = "ignore-eos-oracle-" + Guid.NewGuid().ToString("N");
+        SpeculatorRegistry.Register(oracle, (_, _) => new ContinuationSpeculator(full), requiresDraftHead: false);
+        var drafters = new[]
+        {
+            (Name: speculation.SpeculatorName, Options: speculation),
+            (Name: "known continuation", Options: new SpeculationOptions { Enabled = true, SpeculatorName = oracle, MaxDraftTokens = 3, MinDraftProb = 0 }),
+        };
+        foreach (int concurrent in new[] { prompts.Length, 1 })
+        {
+            int[][] chosen = prompts.Take(concurrent).ToArray();
+            int[][] plain = await ServeAsync(create, chosen, null, maxNew, verifySteps: null, sampling: IgnoreEos);
+            foreach (var drafter in drafters)
+            {
+                int verified = 0;
+                var done = new List<InferenceCompletion>();
+                var served = new List<SequenceState>();
+                int[][] drafted = await ServeAsync(create, chosen, drafter.Options, maxNew, steps => verified = steps, served,
+                    sampling: IgnoreEos, completions: done);
+                for (int r = 0; r < chosen.Length; r++)
+                {
+                    string streams = $"{label} {drafter.Name} x{concurrent}: request {r} gave [{string.Join(",", drafted[r])}], plain [{string.Join(",", plain[r])}]";
+                    Assert.True(plain[r].Length == maxNew && plain[r].Contains(eos), $"{streams}: the plain stream draws no EOS ({eos})");
+                    Assert.True(plain[r].SequenceEqual(drafted[r]), streams);
+                    Assert.Equal(SequenceStatus.FinishedLengthCapped, done[r].Status);
+                    Assert.Equal(maxNew, done[r].OutputTokenCount);
+                }
+                Assert.True(verified > 0, $"{label} {drafter.Name} x{concurrent}: no batched verify ran");
+                if (drafter.Options.SpeculatorName == oracle)
+                {
+                    // The known continuation's windows hold EOS tokens: accepted ones, and so a verify forwarded past them.
+                    long accepted = served.Sum(s => s.SpecStats?.TokensAccepted ?? 0);
+                    long rejected = served.Sum(s => (s.SpecStats?.TokensDrafted ?? 0) - (s.SpecStats?.TokensAccepted ?? 0));
+                    Assert.True(accepted >= maxNew / 2 && rejected > 0,
+                        $"{label} {drafter.Name} x{concurrent}: {accepted} drafts accepted, {rejected} rejected");
+                }
+            }
+        }
+    }
+
+    /// <summary>Drafts the known continuation of whichever request's tokens it has committed (as the engine arms one drafter
+    /// per request), wrong at the third draft of every other window.</summary>
+    private sealed class ContinuationSpeculator : ISpeculator
+    {
+        private readonly int[][] _sequences;
+        private readonly List<int> _committed = new();
+        private int _calls;
+
+        public ContinuationSpeculator(int[][] sequences) => _sequences = sequences;
+
+        public string Name => "known-continuation";
+        public int MaxDraftTokens => 3;
+        public float MinDraftProb { get; set; }
+        public float DefaultMinDraftProb => 0f;
+        public bool NeedsHiddenState => false;
+        public bool HandlesOwnPrefill => false;
+
+        public int Propose(in DraftContext ctx, List<int> draftOut)
+        {
+            int position = ctx.Position, last = ctx.LastToken;
+            int[]? sequence = _sequences.FirstOrDefault(q => q.Length > position && q[position] == last
+                && _committed.Count >= position && q.AsSpan(0, position).SequenceEqual(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_committed)[..position]));
+            if (sequence == null)
+                return 0;
+            int count = Math.Min(ctx.MaxTokens, sequence.Length - position - 1);
+            for (int i = 0; i < count; i++)
+                draftOut.Add(sequence[position + 1 + i]);
+            if (_calls++ % 2 == 1 && draftOut.Count >= 3)
+                draftOut[2] = sequence[position + 3] == 0 ? 1 : 0;
+            return draftOut.Count;
+        }
+
+        public void Commit(int[] tokens, float[]? hRows, int startPos)
+        {
+            if (_committed.Count > startPos)
+                _committed.RemoveRange(startPos, _committed.Count - startPos);
+            while (_committed.Count < startPos)
+                _committed.Add(-1);
+            _committed.AddRange(tokens);
+        }
+
+        public void Reset() => _committed.Clear();
+        public void Dispose() { }
+    }
+
     private static async Task<int[][]> ServeAsync(Func<ModelBase> create, int[][] prompts, SpeculationOptions speculation,
-        int maxNew, Action<int> verifySteps, List<SequenceState> served = null, Action<StandardDecoderModel> inspect = null)
+        int maxNew, Action<int> verifySteps, List<SequenceState> served = null, Action<StandardDecoderModel> inspect = null,
+        Func<SamplingConfig> sampling = null, List<InferenceCompletion> completions = null)
     {
         using ModelBase model = create();
         var cfg = new SchedulerConfig
@@ -467,18 +583,21 @@ internal static class SpeculativeRuntimeChecks
         var gate = new ComputeGate();
         gate.Close();
         engine.ComputeGate = gate;
-        var sequences = prompts.Select((p, i) => new SequenceState($"req{i}", p, maxNew, cfg.BlockSize, SamplingConfig.Greedy)).ToList();
+        var sequences = prompts.Select((p, i) => new SequenceState($"req{i}", p, maxNew, cfg.BlockSize,
+            sampling?.Invoke() ?? SamplingConfig.Greedy)).ToList();
         served?.AddRange(sequences);
         var handles = sequences.Select(s => engine.SubmitRequest(s)).ToList();
         gate.Open();
-        int[][] outputs = await Task.WhenAll(handles.Select(async h =>
+        var finished = new InferenceCompletion[handles.Count];
+        int[][] outputs = await Task.WhenAll(handles.Select(async (h, i) =>
         {
             var tokens = new List<int>();
             await foreach (int t in h.Tokens.ReadAllAsync())
                 tokens.Add(t);
-            await h.Completion;
+            finished[i] = await h.Completion;
             return tokens.ToArray();
         })).WaitAsync(TimeSpan.FromMinutes(3));
+        completions?.AddRange(finished);
         verifySteps?.Invoke(((StandardDecoderModel)model).BatchedSpecVerifySteps);
         inspect?.Invoke((StandardDecoderModel)model);
         return outputs;

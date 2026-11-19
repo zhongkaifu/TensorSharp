@@ -2548,12 +2548,16 @@ namespace TensorSharp.Runtime.Scheduling
             List<SequenceStepResult> results)
         {
             HashSet<string>? handled = skip;
-            var batch = new List<(ScheduledSequenceWork Work, int[] Tokens, int Start, int Sampled, SpecSeqContext? Drafter)>(prepared.Count);
+            var batch = new List<(ScheduledSequenceWork Work, int[] Tokens, int Start, int Sampled, SpecSeqContext? Drafter, float[]? Row)>(prepared.Count);
             var injector = _model.MultimodalInjector;
             // The step's host phases (tensorsharp.engine.step.phase.duration), as the batched decode records them: the
             // decoders' draws ("sample") and the forward ("issue", bucketed by the rows it ran).
             long sampleTicks = 0;
             int decoders = 0;
+            // Decode rows that draw from their logits on the host take their draws in parallel first (the device's greedy
+            // ids leave none in a plain greedy step; a step with a prompt chunk, or sampled requests, scanned 128,000 logits
+            // a row one row after another on this thread: 64 rows, ~8 ms of an LFM3-1.7B step).
+            Dictionary<SequenceState, (int Token, Exception? Error)>? draws = DrawHostRowsInParallel(prepared, handled, ref sampleTicks);
             foreach (var work in prepared)
             {
                 var seq = work.Sequence;
@@ -2568,20 +2572,53 @@ namespace TensorSharp.Runtime.Scheduling
                         {
                             injector.QueuePromptEmbeddingsForSlice(start, chunk.Length, seq.RequestId);
                             long started = Stopwatch.GetTimestamp();
-                            float[] logits = model.ForwardUnifiedMedia(seq.RequestId, chunk, start);
+                            // A driven request's prompt ends here and its first slot is made from the final hidden row.
+                            float[]? hidden = seq.StepDriver is { NextNeedsHidden: true } && start + chunk.Length == seq.PromptTokens.Count
+                                ? HiddenBuffer(seq) : null;
+                            float[] logits = hidden != null
+                                ? model.ForwardUnifiedMediaRows(seq.RequestId, chunk, start, hidden)
+                                : model.ForwardUnifiedMedia(seq.RequestId, chunk, start);
+                            if (seq.StepDriver != null) seq.LastHidden = hidden;
                             CompleteUnified(seq, chunk.Length, -1, logits, Stopwatch.GetTimestamp() - started, results);
                             continue;
                         }
-                        batch.Add((work, chunk, start, -1, PromptConditionedDrafter(seq, start)));
+                        batch.Add((work, chunk, start, -1, seq.StepDriver == null ? PromptConditionedDrafter(seq, start) : null, null));
+                    }
+                    else if (seq.StepDriver is { } driver)
+                    {
+                        // The driver picks the slot: a drawn text token, an embedding row (a speech frame), or the end.
+                        long drawn = Stopwatch.GetTimestamp();
+                        DriverSlot slot = driver.Next(seq.LastLogits, seq.LastHidden, () => TakePendingOrSample(seq));
+                        sampleTicks += Stopwatch.GetTimestamp() - drawn;
+                        decoders++;
+                        if (slot.IsStop)
+                        {
+                            results.Add(new SequenceStepResult { Sequence = seq, DriverStopReason = slot.StopReason });
+                            continue;
+                        }
+                        if (slot.Row != null && slot.Row.Length != _model.Config.HiddenSize)
+                            throw new InvalidOperationException(
+                                $"{seq.RequestId}: its driver's embedding row has {slot.Row.Length} values, the model's rows {_model.Config.HiddenSize}.");
+                        seq.AppendOutputToken(slot.Token);
+                        batch.Add((work, new[] { slot.Token }, start, slot.Token, null, slot.Row));
                     }
                     else
                     {
                         long drawn = Stopwatch.GetTimestamp();
-                        int token = TakePendingOrSample(seq);
+                        int token;
+                        if (draws != null && draws.TryGetValue(seq, out var draw))
+                        {
+                            // TakePendingOrSample's sampling path: a stale device id is dropped.
+                            seq.PendingDeviceToken = null;
+                            if (draw.Error != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(draw.Error).Throw();
+                            token = draw.Token;
+                        }
+                        else
+                            token = TakePendingOrSample(seq);
                         sampleTicks += Stopwatch.GetTimestamp() - drawn;
                         decoders++;
                         seq.AppendOutputToken(token);
-                        batch.Add((work, new[] { token }, start, token, null));
+                        batch.Add((work, new[] { token }, start, token, null, null));
                     }
                 }
                 catch (Exception ex)
@@ -2617,15 +2654,27 @@ namespace TensorSharp.Runtime.Scheduling
             try
             {
                 long started = Stopwatch.GetTimestamp();
+                // Requests whose slots a driver chooses (speech output) run with row input and output, every request of
+                // the step in the same forward.
+                if (batch.Exists(item => item.Work.Sequence.StepDriver != null))
+                {
+                    ForwardDrivenUnifiedWork(model, batch.ConvertAll(item => (item.Work.Sequence, item.Tokens, item.Start, item.Sampled, item.Row)),
+                        ids, tokens, starts, stepRows, started, results);
+                    return;
+                }
                 // Every request decodes, draws greedily and nothing reads its logits: the model picks the next tokens where the
                 // logits are and the next step takes them from the stash (as the batched fused decode's device-sampled path
                 // does). A prompt's last chunk reads its logits: its draw is the first token, which a first-token constraint
                 // may narrow.
+                // Requests whose samplers suppress tokens (a reply-token policy: LFM3-Omni's media placeholders) take the
+                // device's pick too where the model suppresses them there, when every request suppresses the same tokens.
+                IReadOnlyList<int>? suppressed = null;
                 if (features == null && model.SupportsUnifiedGreedyIds && !FirstTokenLogitsDump.IsArmed
-                    && batch.TrueForAll(item => item.Sampled >= 0 && item.Work.Sequence.GetOrCreateSampler().IsPlainGreedyArgmax))
+                    && batch.TrueForAll(item => item.Sampled >= 0 && GreedyOnDevice(item.Work.Sequence.GetOrCreateSampler(), model, ref suppressed)))
                 {
                     var next = new int[batch.Count];
-                    if (model.TryForwardUnifiedGreedy(ids, tokens, starts, next))
+                    if (suppressed is { Count: > 0 } ? model.TryForwardUnifiedGreedy(ids, tokens, starts, next, suppressed)
+                        : model.TryForwardUnifiedGreedy(ids, tokens, starts, next))
                     {
                         RecordStepPhase(s_phaseIssue, started, stepRows);
                         long ticks = (Stopwatch.GetTimestamp() - started) / batch.Count;
@@ -2656,6 +2705,116 @@ namespace TensorSharp.Runtime.Scheduling
                 foreach (var item in batch)
                     FailUnified(item.Work.Sequence, ex, results);
             }
+        }
+
+        /// <summary>Whether a request drawing with <paramref name="sampler"/> may take the device's greedy pick in a step whose
+        /// requests so far suppress <paramref name="suppressed"/> (null: none seen yet; set to the first request's): a plain
+        /// argmax, or one over suppressed tokens the model suppresses on the device, the same for every request.</summary>
+        private static bool GreedyOnDevice(TokenSampler sampler, IUnifiedBatchModel model, ref IReadOnlyList<int>? suppressed)
+        {
+            if (!sampler.IsGreedyArgmaxOverSuppressed) return false;
+            IReadOnlyList<int> own = sampler.SuppressedTokens ?? Array.Empty<int>();
+            if (own.Count > 0 && !model.SupportsUnifiedGreedySuppression) return false;
+            if (suppressed == null)
+            {
+                suppressed = own;
+                return true;
+            }
+            return ReferenceEquals(suppressed, own) || suppressed.SequenceEqual(own);
+        }
+
+        /// <summary>
+        /// The draws of a unified step's decode rows that <see cref="TakePendingOrSample"/> would take from their host logits
+        /// (no early first token, no device id for this position, the first-token dump not armed), in parallel when there are
+        /// <see cref="ParallelSamplingMinRows"/> or more: each row's own sampler, as TakePendingOrSample calls it (a forced
+        /// thinking end first, else a draw from the logits), so every row draws what it drew one after another. Null where
+        /// the rows draw in the loop as before (fewer rows, or <see cref="ParallelSampling"/> off).
+        /// </summary>
+        private static Dictionary<SequenceState, (int Token, Exception? Error)>? DrawHostRowsInParallel(List<ScheduledSequenceWork> prepared,
+            HashSet<string>? handled, ref long sampleTicks)
+        {
+            if (!ParallelSampling || FirstTokenLogitsDump.IsArmed) return null;
+            List<SequenceState>? rows = null;
+            foreach (var work in prepared)
+            {
+                var seq = work.Sequence;
+                if (work.IsPrefill || seq.StepDriver != null || (handled != null && handled.Contains(seq.RequestId)) || seq.LastLogits == null
+                    || (seq.EarlyFirstToken >= 0 && seq.OutputTokens.Count == 0)
+                    || (seq.PendingDeviceToken.HasValue && seq.PendingDevicePosition == seq.NumComputedTokens))
+                    continue;
+                (rows ??= new List<SequenceState>()).Add(seq);
+            }
+            if (rows == null || rows.Count < ParallelSamplingMinRows) return null;
+            long started = Stopwatch.GetTimestamp();
+            var drawn = new (int Token, Exception? Error)[rows.Count];
+            Parallel.For(0, rows.Count, i =>
+            {
+                SequenceState seq = rows[i];
+                try
+                {
+                    drawn[i] = (seq.GetOrCreateSampler().TryGetForcedThinkingToken(seq.OutputTokens, out int thinkingEnd)
+                        ? thinkingEnd : SampleFromLogits(seq), null);
+                }
+                catch (Exception ex)
+                {
+                    drawn[i] = (0, ex);
+                }
+            });
+            Interlocked.Increment(ref ParallelSampledSteps);
+            sampleTicks += Stopwatch.GetTimestamp() - started;
+            var draws = new Dictionary<SequenceState, (int Token, Exception? Error)>(rows.Count, ReferenceEqualityComparer.Instance);
+            for (int i = 0; i < rows.Count; i++) draws[rows[i]] = drawn[i];
+            return draws;
+        }
+
+        /// <summary>
+        /// A unified forward whose batch holds requests driven by an <see cref="ISequenceStepDriver"/>: each driven request's
+        /// decode row may be an embedding row, and its forward returns what its driver's next slot needs (the logits, the
+        /// final hidden row, or both) - only for the chunk that ends its prompt, or a decode row. The LM head runs when any
+        /// request of the step wants logits. Throws (failing the step's requests) when the model has no row I/O.
+        /// </summary>
+        private void ForwardDrivenUnifiedWork(IUnifiedBatchModel model, List<(SequenceState Seq, int[] Tokens, int Start, int Sampled, float[]? Row)> batch,
+            string[] ids, int[][] tokens, int[] starts, int stepRows, long started, List<SequenceStepResult> results)
+        {
+            if (!model.SupportsUnifiedRowIO)
+                throw new NotSupportedException($"{_model.Config?.Architecture ?? "The model"} has no decode steps with row input and output.");
+            int n = batch.Count;
+            var rows = new float[]?[n];
+            var wantLogits = new bool[n];
+            var hidden = new float[]?[n];
+            var lastLogits = new float[n][];
+            for (int i = 0; i < n; i++)
+            {
+                var (seq, chunk, start, sampled, row) = batch[i];
+                rows[i] = row;
+                if (seq.StepDriver is not { } driver)
+                {
+                    wantLogits[i] = true;
+                    continue;
+                }
+                // The forward that ends the prompt, or a decode row: the driver's next slot reads its outputs.
+                bool ends = sampled >= 0 || start + chunk.Length == seq.PromptTokens.Count;
+                wantLogits[i] = ends && driver.NextNeedsLogits;
+                hidden[i] = ends && driver.NextNeedsHidden ? HiddenBuffer(seq) : null;
+            }
+            if (!model.TryForwardUnifiedRows(ids, tokens, starts, rows, wantLogits, lastLogits, hidden))
+                throw new InvalidOperationException("the model declined a unified step whose slots it had prepared");
+            RecordStepPhase(s_phaseIssue, started, stepRows);
+            long ticksPerSequence = (Stopwatch.GetTimestamp() - started) / n;
+            if (n >= 2) ReportBatchedFusedDecodeSuccess(n);
+            for (int i = 0; i < n; i++)
+            {
+                var seq = batch[i].Seq;
+                if (seq.StepDriver != null) seq.LastHidden = hidden[i];
+                CompleteUnified(seq, tokens[i].Length, batch[i].Sampled, wantLogits[i] ? lastLogits[i] : null, ticksPerSequence, results);
+            }
+        }
+
+        /// <summary>The buffer a driven request's final hidden row is written to (one per request, reused).</summary>
+        private float[] HiddenBuffer(SequenceState seq)
+        {
+            int width = _model.Config.HiddenSize;
+            return seq.LastHidden is { } buffer && buffer.Length == width ? buffer : new float[width];
         }
 
         /// <summary>The speculative context of a request whose prompt chunk at <paramref name="start"/> should feed its
@@ -2710,7 +2869,7 @@ namespace TensorSharp.Runtime.Scheduling
             foreach (var work in prepared)
             {
                 var seq = work.Sequence;
-                if (!work.IsPrefill && seq.NumComputedTokens > 0 && CanSpeculate(seq)
+                if (!work.IsPrefill && seq.NumComputedTokens > 0 && CanSpeculate(seq) && seq.StepDriver == null
                     && !_fusedSpecDeclined.Contains(seq.RequestId))
                     (speculating ??= new List<ScheduledSequenceWork>()).Add(work);
             }
@@ -3128,7 +3287,7 @@ namespace TensorSharp.Runtime.Scheduling
             // and the trunk agrees with it. The window therefore does not start at a
             // stop token, and the accept loop ends at the first stop it draws.
             bool stopRepetition = _scheduler.Config.StopRepetition && (seq.SamplingConfig?.StopRepetition ?? true);
-            bool IsStop(int token) => _model.Tokenizer != null && _model.Tokenizer.IsEos(token);
+            bool IsStop(int token) => EndsSequence(_model.Tokenizer, seq, token);
             if (IsStop(sampledToken))
                 kMax = 0;
             // The sampled token can itself complete a repetition loop. The engine then
@@ -3472,6 +3631,13 @@ namespace TensorSharp.Runtime.Scheduling
 
         private long _batchedSpecSteps;
 
+        /// <summary>Whether <paramref name="token"/> ends <paramref name="seq"/>: an end-of-sequence token of the
+        /// model's tokenizer, unless the request ignores them (<see cref="SamplingConfig.IgnoreEos"/>: a fixed-length
+        /// request forwards such a token like any other and runs to its length limit). The engine's stop check and
+        /// both speculative paths ask this one rule, so a lane is never ended where the engine continues it.</summary>
+        internal static bool EndsSequence(ITokenizer? tokenizer, SequenceState seq, int token)
+            => tokenizer != null && tokenizer.IsEos(token) && seq.SamplingConfig?.IgnoreEos != true;
+
         /// <summary>The clock a speculative step's phases are timed with (<see cref="Stopwatch.GetTimestamp"/>; tests
         /// script it). The speculative executions this executor arms read the same one.</summary>
         internal Func<long> Timestamp { get; set; } = Stopwatch.GetTimestamp;
@@ -3550,7 +3716,11 @@ namespace TensorSharp.Runtime.Scheduling
             var drafts = new List<int>[n];
             var kMaxes = new int[n];
             bool stopRepetition = _scheduler.Config.StopRepetition;
-            bool IsStop(int token) => _model.Tokenizer != null && _model.Tokenizer.IsEos(token);
+            // Per sequence: an end-of-sequence token ends only a request that does not
+            // ignore them. An ignore_eos lane's EOS anchor is verified like any token
+            // (emitted without a forward, it left the lane with no logits for its next
+            // step, and that step's failure failed every co-batched request).
+            bool IsStop(SequenceState seq, int token) => EndsSequence(_model.Tokenizer, seq, token);
             // The verify-drawn token when one is pending, else the stash or a sample;
             // nothing is consumed until the verify has succeeded. A lane whose anchor
             // ends it (a stop token, or the last token its budget allows) emits it
@@ -3561,7 +3731,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 var seq = decodeWork[i].Sequence;
                 peeked[i] = ctxs[i].PendingNextToken >= 0 ? PendingVerifyDraw(seq, ctxs[i].PendingNextToken) : PeekPendingOrSample(seq);
-                if (IsStop(peeked[i]) || seq.OutputTokens.Count + 1 >= seq.MaxNewTokens)
+                if (IsStop(seq, peeked[i]) || seq.OutputTokens.Count + 1 >= seq.MaxNewTokens)
                     (ending ??= new()).Add((seq, ctxs[i], peeked[i]));
             }
             if (ending != null)
@@ -3607,7 +3777,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int kMax = Math.Min(window - 1, Math.Min(
                     seq.MaxNewTokens - seq.OutputTokens.Count - 1,
                     seq.BlockTable.FreeSlotsInCurrentBlocks - 1));
-                if (IsStop(anchors[i]))
+                if (IsStop(seq, anchors[i]))
                     kMax = 0;
                 if (kMax > 0 && stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true))
                 {
@@ -3760,7 +3930,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 var seq = decodeWork[i].Sequence;
                 bool seqStopRepetition = stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true);
-                bool stopped = IsStop(anchors[i]);
+                bool stopped = IsStop(seq, anchors[i]);
                 var acc = new List<int>();
                 int m = 0;
                 // A row is drawn once: a sampled row advances the sequence's sampler.
@@ -3785,7 +3955,7 @@ namespace TensorSharp.Runtime.Scheduling
                     seq.AppendOutputToken(d);
                     acc.Add(d);
                     m++;
-                    if (IsStop(d) || (seqStopRepetition
+                    if (IsStop(seq, d) || (seqStopRepetition
                             && RepetitionGuard.IsLooping(seq.OutputTokens, seq.OutputTokens.Count, out _, out _)))
                         stopped = true;
                     else
@@ -4576,7 +4746,8 @@ namespace TensorSharp.Runtime.Scheduling
         internal static bool TryDrawEarlyFirstToken(SequenceState seq, out int token)
         {
             token = -1;
-            if (seq.OutputTokens.Count != 0 || seq.EarlyFirstToken >= 0 || seq.NumUncomputedTokens != 0)
+            // A driven request's first slot is its driver's (it may be an embedding row, not a token).
+            if (seq.OutputTokens.Count != 0 || seq.EarlyFirstToken >= 0 || seq.NumUncomputedTokens != 0 || seq.StepDriver != null)
                 return false;
             bool device = seq.PendingDeviceToken.HasValue && seq.PendingDevicePosition == seq.NumComputedTokens;
             if (seq.LastLogits == null && !device)
@@ -5065,7 +5236,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// Nothing was forwarded; the scheduler re-queues the request instead of failing it.</summary>
         public bool SlotUnavailable { get; init; }
 
-        public bool IsNoOp => TokensForwarded == 0 && Error == null;
+        /// <summary>The request's <see cref="ISequenceStepDriver"/> ended it before its next slot (nothing was forwarded):
+        /// the finish reason.</summary>
+        public string? DriverStopReason { get; init; }
+
+        public bool IsNoOp => TokensForwarded == 0 && Error == null && DriverStopReason == null;
 
         public static SequenceStepResult NoOp(SequenceState s) => new()
         {
