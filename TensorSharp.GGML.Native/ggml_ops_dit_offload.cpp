@@ -174,6 +174,16 @@ bool h3_q4k_gemm_takes(const ggml_tensor* w, const ggml_tensor* x)
            x->type == GGML_TYPE_F32 && x->ne[1] >= h3_cublas_min_rows() && x->ne[2] == 1 && x->ne[3] == 1;
 }
 
+extern "C" bool tsg_cuda_lora_gemm_supported(void);
+
+bool h3_lora_kcat_takes(const ggml_tensor* w, const ggml_tensor* x)
+{
+    const bool blocked = (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q6_K) && w->ne[0] % 256 == 0;
+    return h3_cublas_matmul_enabled() && !h3_f32_products_enabled() && tsg_cuda_lora_gemm_supported() &&
+           (blocked || w->type == GGML_TYPE_BF16) && ggml_is_contiguous(w) && w->ne[2] == 1 && w->ne[3] == 1 &&
+           x->type == GGML_TYPE_F32 && x->ne[1] >= h3_cublas_min_rows() && x->ne[2] == 1 && x->ne[3] == 1;
+}
+
 namespace
 {
 // A wide product of a BF16 weight (MiniMax-H3-Image's DiT, read from its BF16 release)
@@ -243,8 +253,8 @@ ggml_tensor* h3_fused_node(ggml_context* ctx, std::int64_t ne0, std::int64_t ne1
     ggml_tensor* node = ggml_custom_4d(ctx, GGML_TYPE_F32, ne0, ne1, 1, 1, args, n, h3_fused_unreachable, 1, nullptr);
     std::memcpy(reinterpret_cast<char*>(node->op_params) + kH3FusedParamsOffset, &p, sizeof(p));
     // The node profiler splits GGML_OP_CUSTOM by name: the stage and, for a GEMM, its width.
-    static const char* const names[] = { "", "attention", "modulate", "residual", "gemm", "f16gemm", "scaled-residual" };
-    if (p.kind == H3_FUSED_LORA_GEMM || p.kind == H3_FUSED_F16_GEMM)
+    static const char* const names[] = { "", "attention", "modulate", "residual", "gemm", "f16gemm", "scaled-residual", "lora-gemm" };
+    if (p.kind == H3_FUSED_LORA_GEMM || p.kind == H3_FUSED_F16_GEMM || p.kind == H3_FUSED_LORA_KCAT)
         ggml_format_name(node, "%s %lldx%lld%s",
                          p.kind == H3_FUSED_F16_GEMM && srcs[0]->type == GGML_TYPE_BF16 ? "bf16gemm" : names[p.kind],
                          static_cast<long long>(srcs[0]->ne[0]),
@@ -290,6 +300,10 @@ extern "C" bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_
                                             int64_t T, float* dst, int64_t dst_ld, int nparts, const void* const* downs,
                                             const void* const* ups, const int64_t* ranks, const int64_t* outs,
                                             const int64_t* offsets, int factor_f32, int x_swiglu, int flags);
+extern "C" bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
+                                        int64_t T, float* dst, int64_t dst_ld, int nparts, const void* const* downs,
+                                        const void* const* ups, const int64_t* ranks, const int64_t* outs,
+                                        const int64_t* offsets, int factor_f32, int x_swiglu);
 // A product an int8 GEMM left as int32 sums for its one reader (tsg_cuda_int8_scale.h).
 extern "C" bool tsg_cuda_int8_pending(const void* data, const uint32_t** rowpeak, const uint32_t** tokpeak, int64_t* rows,
                                       int64_t* ld);
@@ -437,6 +451,7 @@ bool h3_fused_run(ggml_tensor* node, const std::unordered_set<const ggml_tensor*
 #endif
         return ok;   // synchronized inside
     }
+    case H3_FUSED_LORA_KCAT:
     case H3_FUSED_LORA_GEMM:
     {
         const ggml_tensor* w = node->src[0];
@@ -455,6 +470,10 @@ bool h3_fused_run(ggml_tensor* node, const std::unordered_set<const ggml_tensor*
             n++;
         }
         const bool f32 = n > 0 && node->src[2]->type == GGML_TYPE_F32;
+        if (p.kind == H3_FUSED_LORA_KCAT)
+            return tsg_cuda_lora_gemm_bf16(static_cast<int>(w->type), w->data, w->ne[0], w->ne[1], f(x), h3_rows(x), x->ne[1],
+                                           static_cast<float*>(node->data), node->ne[0], n, downs, ups, ranks, outs, offsets,
+                                           f32 ? 1 : 0, p.f0 != 0.0f ? 1 : 0);   // synchronized inside
         // 2: the weight's int8 rows may be kept; it and its factors stay bound until the
         // pipeline releases the scratch.
         return tsg_cuda_q4k_lora_gemm_bf16(w->data, w->ne[0], w->ne[1], f(x), h3_rows(x), x->ne[1],

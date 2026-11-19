@@ -60,6 +60,10 @@ namespace tsg
 //                       up to three equal row slots carry a part, b = slot rows,
 //                       f0 = 1 when x is fc1's [gate | value] and the GEMM reads its
 //                       SwiGLU
+//   H3_FUSED_LORA_KCAT  w (Q4_K, Q6_K or BF16), x, then (down, up) per LoRA part -> W x plus each part's
+//                       up (down x) on its rows, unmerged, on cuBLAS BF16 (tsg_cuda_lora_gemm_bf16): a
+//                       dequantized W takes the update in its GEMM ([W | up] [x ; down x]), a BF16 W's
+//                       parts expand into dst; a, b and f0 as H3_FUSED_LORA_GEMM's
 //   H3_FUSED_F16_GEMM   w (F16), x, x bias (nullable) -> W act(x) on cuBLAS, act being
 //                       x + bias or, with f0 = 1, SwiGLU(x + bias) (the video VAE); a BF16
 //                       w, no bias, is a BF16 DiT's fc2 over fc1's [gate | value]
@@ -70,7 +74,8 @@ namespace tsg
 // TS_H3_FUSED=0 builds the unfused graph.
 // ---------------------------------------------------------------------------
 enum H3FusedKind : std::int32_t { H3_FUSED_NONE = 0, H3_FUSED_ATTENTION = 1, H3_FUSED_MODULATE = 2, H3_FUSED_RESIDUAL = 3,
-                                   H3_FUSED_LORA_GEMM = 4, H3_FUSED_F16_GEMM = 5, H3_FUSED_SCALED_RESIDUAL = 6 };
+                                   H3_FUSED_LORA_GEMM = 4, H3_FUSED_F16_GEMM = 5, H3_FUSED_SCALED_RESIDUAL = 6,
+                                   H3_FUSED_LORA_KCAT = 7 };
 
 struct H3FusedParams
 {
@@ -108,6 +113,11 @@ std::int64_t h3_cublas_min_rows();
 
 // Whether a DiT projection being built will run on cuBLAS BF16 (it then needs no q8_1 overflow guard).
 bool h3_q4k_gemm_takes(const ggml_tensor* w, const ggml_tensor* x);
+
+// Whether a projection with LoRA parts runs them unmerged in its cuBLAS BF16 GEMM (H3_FUSED_LORA_KCAT): a Q4_K, Q6_K or
+// BF16 w on the BF16 route (sm_80+, TS_H3_CUBLAS_MATMUL not 0, at least h3_cublas_min_rows rows, not TS_H3_CUDA_F32_PRODUCTS)
+// while the int8 and FP8 DiT routes are off (they merge the update into the weight rows they keep).
+bool h3_lora_kcat_takes(const ggml_tensor* w, const ggml_tensor* x);
 
 // The products of `graph` an int8 GEMM may leave as int32 sums for their one fused reader.
 std::unordered_set<const ggml_tensor*> h3_deferrable(ggml_cgraph* graph);
