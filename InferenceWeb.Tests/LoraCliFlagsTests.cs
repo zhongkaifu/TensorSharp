@@ -189,7 +189,8 @@ public sealed class LoraCliFlagsTests : IDisposable
         Assert.Equal("TS_LORAS", LoraCliFlags.EnvironmentVariable);
         Assert.Equal("qwen-image-2.1-lora", LoraCliFlags.QwenImagePluginType);
         Assert.Equal("minimax-h3-lora", LoraCliFlags.MiniMaxH3PluginType);
-        Assert.Equal(new[] { "qwen-image-2.1-lora", "minimax-h3-lora" }, LoraCliFlags.PluginTypes);
+        Assert.Equal("minimax-h3-image-lora", LoraCliFlags.MiniMaxH3ImagePluginType);
+        Assert.Equal(new[] { "qwen-image-2.1-lora", "minimax-h3-lora", "minimax-h3-image-lora" }, LoraCliFlags.PluginTypes);
     }
 
     // ---- the TS_LORAS environment channel ------------------------------------------------

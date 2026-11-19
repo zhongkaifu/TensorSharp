@@ -220,7 +220,7 @@ namespace TensorSharp.Models.MiniMaxH3
 
         /// <summary>The <c>"weights"</c> entry: a path, or a download object whose
         /// <c>path</c> names a <c>.safetensors</c> file literally.</summary>
-        private static void CheckWeightsEntry(JsonElement weights, string path)
+        internal static void CheckWeightsEntry(JsonElement weights, string path)
         {
             string key;
             string raw;
@@ -269,7 +269,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 throw Invalid(path, key, $"must name a .safetensors file, not '{fileName}'");
         }
 
-        private static void CheckKeys(JsonElement obj, string path, string prefix, string[] allowed)
+        internal static void CheckKeys(JsonElement obj, string path, string prefix, string[] allowed, string type = Type)
         {
             var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var property in obj.EnumerateObject())
@@ -279,18 +279,18 @@ namespace TensorSharp.Models.MiniMaxH3
                     throw new InvalidDataException($"{path}: \"{key}\" appears twice.");
                 if (prefix.Length == 0 && property.Name == "config")
                     throw new InvalidDataException(
-                        $"{path}: \"config\" is not a {Type} key; a MiniMax-H3 plug-in is its own config and forwards none.");
+                        $"{path}: \"config\" is not a {type} key; a MiniMax-H3 plug-in is its own config and forwards none.");
                 if (Array.IndexOf(allowed, property.Name) < 0)
                     throw new InvalidDataException(
-                        $"{path}: unknown key \"{key}\"; {(prefix.Length == 0 ? $"a {Type} config" : $"\"{prefix.TrimEnd('.')}\"")} " +
+                        $"{path}: unknown key \"{key}\"; {(prefix.Length == 0 ? $"a {type} config" : $"\"{prefix.TrimEnd('.')}\"")} " +
                         $"takes {string.Join(", ", allowed)}.");
             }
         }
 
-        private static JsonElement Required(JsonElement obj, string path, string name, string key) =>
+        internal static JsonElement Required(JsonElement obj, string path, string name, string key) =>
             obj.TryGetProperty(name, out var value) ? value : throw new InvalidDataException($"{path}: \"{key}\" is required.");
 
-        private static string RequiredString(JsonElement obj, string path, string name, string key)
+        internal static string RequiredString(JsonElement obj, string path, string name, string key)
         {
             var value = Required(obj, path, name, key);
             if (value.ValueKind != JsonValueKind.String)
@@ -301,7 +301,7 @@ namespace TensorSharp.Models.MiniMaxH3
             return text;
         }
 
-        private static float FiniteNumber(JsonElement value, string path, string key)
+        internal static float FiniteNumber(JsonElement value, string path, string key)
         {
             if (value.ValueKind != JsonValueKind.Number)
                 throw Invalid(path, key, $"must be a number, not {value.GetRawText()}");
@@ -310,7 +310,7 @@ namespace TensorSharp.Models.MiniMaxH3
             return (float)d;
         }
 
-        private static InvalidDataException Invalid(string path, string key, string problem) =>
+        internal static InvalidDataException Invalid(string path, string key, string problem) =>
             new($"{path}: \"{key}\" {problem}.");
 
         internal static string Num(float value) => value.ToString(CultureInfo.InvariantCulture);
