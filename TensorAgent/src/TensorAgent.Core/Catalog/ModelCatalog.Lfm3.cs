@@ -71,11 +71,11 @@ public static partial class ModelCatalog
                 "https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/d508b88f08a5b4286f2d2805a6a8d69a0ff44c72/mmproj-LFM3-Omni-2B-Q8_0.gguf",
                 506_842_528, "8a25f9d1931244429de404fccacfb7fb933970a36aa5688d2f5069f29c6b27b1"),
         },
-        // Input only here. The server and CLI speak through the projector's speech decoder
-        // (docs/models/lfm3.md#speech-output), but the app has no player for spoken replies,
-        // and AudioOutput means "a video generator whose clips have sound" to the Models page
-        // (ModelBrowser.Capabilities: it also drops the "chat" keyword). A distinct speech
-        // capability belongs with the app's speech playback.
+        // Spoken replies come from the projector's speech decoder (docs/models/lfm3.md#speech-output):
+        // the chat page offers its Speak replies switch when the loaded model reports speechOutput.
+        // The entry still lists input modalities only, because AudioOutput means "a video generator
+        // whose clips have sound" to the Models page (ModelBrowser.Capabilities: it also drops the
+        // "chat" keyword). A distinct speech capability would be a separate Models page change.
         Modalities = CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio,
         MinDeviceMemoryGB = 12,
         // A video costs up to 12,288 tokens (two frames per pair, frames at 2 fps), an

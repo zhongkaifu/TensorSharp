@@ -52,7 +52,7 @@
   "catalog.extended.mistral.notes": "Pixtral 視覺投影器可選下載。此實作支援聊天和影像，不支援思考模式或工具呼叫。 目錄中繼資料已核實，尚未驗證 TensorAgent 中的推論執行。",
   "catalog.extended.hunyuan.notes": "採用 hunyuan-dense 架構的騰訊翻譯模型。僅支援文字和單裝置執行，不支援思考模式或工具呼叫。 目錄中繼資料已核實，尚未驗證 TensorAgent 中的推論執行。",
   "catalog.lfm3.notes": "Liquid 的短卷積與注意力混合模型，支援思考模式和工具呼叫，僅支援文字。 目錄中繼資料已核實，尚未驗證 TensorAgent 中的推論執行。",
-  "catalog.lfm3Omni.notes": "Liquid 的全模態模型：輸入影像、影片和音訊，輸出文字，沒有思考模式。必需的投影器還包含語音生成器，但暫不支援語音回覆。 目錄中繼資料已核實，尚未驗證 TensorAgent 中的推論執行。",
+  "catalog.lfm3Omni.notes": "Liquid 的全模態模型：輸入影像、影片和音訊，輸出文字，沒有思考模式。必需的投影器還包含語音生成器：開啟「朗讀回覆」即可邊生成邊收聽回覆，並可反覆回放和儲存音訊。 目錄中繼資料已核實，尚未驗證 TensorAgent 中的推論執行。",
   "catalog.extended.deepseek4.notes": "必須下載全部三個分片。相符的 0731 DSpark 草稿模型可選下載，在 CUDA 上使用貪婪取樣執行。需要工作站級記憶體。 目錄中繼資料已核實，尚未驗證 TensorAgent 中的推論執行。",
   "catalog.extended.deepseek41.notes": "修復版包含十個分片及內建 Engram。正式執行使用 CUDA，CPU 路徑用於可攜性驗證。視覺與 DSpark 需使用 TensorSharp 工具轉換；已發布的 clip/dflash 配套檔案不相容。 目錄中繼資料已核實，尚未驗證 TensorAgent 中的推論執行。",
   "catalog.extended.glm.notes": "僅支援文字，必須下載全部分片。內建 NextN，無需另行下載草稿。GLM 5.3 的 NextN 需單裝置或分層執行；應用程式預設使用 n-gram 推測解碼。 目錄中繼資料已核實，尚未驗證 TensorAgent 中的推論執行。",
