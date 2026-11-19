@@ -173,7 +173,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/ge
 ThreadPool，因此一个占满每个核的池会把它自己正在等的那部分工作饿死。122 线程时这表现为
 **预填充**回退（13.5，而关闭线程池时为 21.7 / 21.0），而解码仍然优于关闭线程池的基线
 （4.8，而基线为 2.0 / 2.4）。61 宽的默认值其实就是整体最好的一行：它在两个维度上都优于
-122 宽那一行；相对 48 宽那一行，它让出一点 prefill，换来相当或更好的 decode。可用 `TS_CPU_THREADS`、`TS_CPU_POOL`、`TS_CPU_SPIN`、
+122 宽那一行；相对 48 宽那一行，它让出一点 prefill，换来相当或更好的 decode。可用 `TS_CPU_THREADS`、`TS_CPU_DECODE_THREADS`（解码规模步上的宽度）、`TS_CPU_POOL`、`TS_CPU_SPIN`、
 `TS_CPU_TASK_BYTES` 与 `TS_CPU_TASKS_PER_WORKER` 调节（见
 [环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md)）。
 

@@ -177,7 +177,8 @@ starves the work it is waiting on. At 122 threads that shows up as a PREFILL
 regression (13.5 against 21.7 / 21.0 with the pool off) while decode still beats
 the pool-off baseline (4.8 against 2.0 / 2.4). The 61-wide default is simply the
 best row overall: it beats the 122-wide one on both axes, and gives up a little
-prefill against the 48-wide one for equal-or-better decode. Tune with `TS_CPU_THREADS`, `TS_CPU_POOL`,
+prefill against the 48-wide one for equal-or-better decode. Tune with `TS_CPU_THREADS`,
+`TS_CPU_DECODE_THREADS` (the width on decode-sized steps), `TS_CPU_POOL`,
 `TS_CPU_SPIN`, `TS_CPU_TASK_BYTES` and `TS_CPU_TASKS_PER_WORKER`
 ([env var matrix](docs/env_var_feature_matrix.md)).
 
