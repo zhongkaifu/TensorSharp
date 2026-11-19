@@ -284,38 +284,76 @@ namespace TensorSharp.Models
                 proj = step.MatMul(inProj, normed);   // [3 * channels, rows]
             }
             long packed = 3 * width * f;
+            // Several sequences take b * x and c * conv over the step's rows at once (element-wise: the same products as a
+            // sequence's own), and their convolutions are joined before the gate rather than their outputs after it: two
+            // products a layer where there were two a sequence (the B0 census: 1,560 of a 64-sequence LFM3-1.7B step's
+            // ggml-cuda kernels), and on executors that copy strided operands three copies a layer, not three a sequence.
+            // A lone sequence's step emits what it did.
+            bool hoisted = step.Sequences > 1 && !LegacyBatchedJoinForTests;
+            int bxRows = -1, cRows = -1;
+            if (hoisted)
+            {
+                int bRows, xRows;
+                if (split)
+                {
+                    bRows = bAll;
+                    cRows = cAll;
+                    xRows = xAll;
+                }
+                else
+                {
+                    bRows = step.View2(proj, width, step.Rows, packed, 0);
+                    cRows = step.View2(proj, width, step.Rows, packed, width * f);
+                    xRows = step.View2(proj, width, step.Rows, packed, 2 * width * f);
+                    if (!packedBlocks)
+                    {
+                        bRows = step.Cont(bRows);
+                        cRows = step.Cont(cRows);
+                        xRows = step.Cont(xRows);
+                    }
+                }
+                bxRows = step.Op(GraphOp.Mul, bRows, xRows);                                                          // [C, rows]
+            }
             int output = -1;
+            var convs = hoisted ? new List<int>(step.Sequences) : null;
             for (int s = 0; s < step.Sequences; s++)
             {
                 int count = step.Counts[s];
                 long first = step.First[s];
-                int b, c, x;
-                if (split)
+                int bx, c = -1;
+                if (hoisted)
                 {
-                    bool one = step.Sequences == 1;
-                    b = one ? bAll : step.View2(bAll, width, count, width * f, first * width * f);
-                    c = one ? cAll : step.View2(cAll, width, count, width * f, first * width * f);
-                    x = one ? xAll : step.View2(xAll, width, count, width * f, first * width * f);
+                    bx = step.View2(bxRows, width, count, width * f, first * width * f);                                // [C, count]
                 }
                 else
                 {
-                    b = step.View2(proj, width, count, packed, first * packed);
-                    c = step.View2(proj, width, count, packed, first * packed + width * f);
-                    x = step.View2(proj, width, count, packed, first * packed + 2 * width * f);
-                    if (!packedBlocks)
+                    int b, x;
+                    if (split)
                     {
-                        b = step.Cont(b);
-                        c = step.Cont(c);
-                        x = step.Cont(x);
+                        bool one = step.Sequences == 1;
+                        b = one ? bAll : step.View2(bAll, width, count, width * f, first * width * f);
+                        c = one ? cAll : step.View2(cAll, width, count, width * f, first * width * f);
+                        x = one ? xAll : step.View2(xAll, width, count, width * f, first * width * f);
                     }
+                    else
+                    {
+                        b = step.View2(proj, width, count, packed, first * packed);
+                        c = step.View2(proj, width, count, packed, first * packed + width * f);
+                        x = step.View2(proj, width, count, packed, first * packed + 2 * width * f);
+                        if (!packedBlocks)
+                        {
+                            b = step.Cont(b);
+                            c = step.Cont(c);
+                            x = step.Cont(x);
+                        }
+                    }
+                    bx = step.Op(GraphOp.Mul, b, x);                                                                   // [C, count]
                 }
                 var state = (ShortConvState)step.SequenceState(s, layer);
                 int window = step.State(state.Conv, GraphFormat.F32, convRows, channels);
                 // ggml_concat writes a contiguous result, so it reads the transposed products directly.
-                int bx = step.Op(GraphOp.Mul, b, x);                                                                   // [C, count]
                 int convIn = step.Op(GraphOp.Concat, stackalloc[] { window, step.Transpose(bx) }, stackalloc long[] { 0 });   // [R + count, C]
                 int conv = step.Op(GraphOp.SsmConv, convIn, kernel);                                                   // [C, count]
-                int y = step.Op(GraphOp.Mul, c, conv);
                 long pitch = (convRows + count) * f;
                 if (step.RecurrentSnapshots && count > 1)
                 {
@@ -330,8 +368,15 @@ namespace TensorSharp.Models
                     // convIn is a fresh contiguous [R + count, C]: its last R columns are the new window.
                     step.Effect(step.Op(GraphOp.Cpy, step.View2(convIn, convRows, channels, pitch, count * f), window));
                 }
+                if (hoisted)
+                {
+                    convs.Add(conv);
+                    continue;
+                }
+                int y = step.Op(GraphOp.Mul, c, conv);
                 output = output < 0 ? y : step.Op(GraphOp.Concat, stackalloc[] { output, y }, stackalloc long[] { 1 });
             }
+            if (hoisted) output = step.Op(GraphOp.Mul, cRows, JoinSequenceRows(step, convs));                         // [C, rows]
             return step.MatMul(outProj, output);
         }
 

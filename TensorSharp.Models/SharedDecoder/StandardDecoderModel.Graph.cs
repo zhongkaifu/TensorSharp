@@ -2468,6 +2468,8 @@ namespace TensorSharp.Models
             int n = step.Sequences;
             int band = SlidingWindow(layer);
             int attn = -1;
+            // Several sequences' outputs, joined after the loop (JoinSequenceRows).
+            var parts = n > 1 && !LegacyBatchedJoinForTests ? new List<int>(n) : null;
             for (int s = 0; s < n; s++)
             {
                 int count = step.Counts[s], start = step.Starts[s];
@@ -2621,8 +2623,10 @@ namespace TensorSharp.Models
                         promptChunk: promptChunk);
                 }
                 int part = step.Reshape(fa, heads * dv, count);
-                attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
+                if (parts != null) parts.Add(part);
+                else attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
             }
+            if (parts != null) attn = JoinSequenceRows(step, parts);
 
             if (gate >= 0)
             {
