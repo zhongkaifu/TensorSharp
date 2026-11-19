@@ -27,7 +27,7 @@ using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.MiniMaxH3Image
 {
-    public sealed class MiniMaxH3ImageDiffusionModel : ModelBase, IImageGenerationModel
+    public sealed partial class MiniMaxH3ImageDiffusionModel : ModelBase, IImageGenerationModel
     {
         public const string ArchitectureId = MiniMaxH3ImageFamily.ArchitectureId;
 
@@ -95,6 +95,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 },
             };
             _pipeline = new DiffusionPipeline(_family, load);
+            ApplyInheritedLoras();
         }
 
         public MiniMaxH3Config DitConfig { get; }
@@ -165,7 +166,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
             lock (_generationLock)
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(MiniMaxH3ImageDiffusionModel));
-                DiffusionResult result = _pipeline.Run(request, CancellationToken.None);
+                // The plug-ins in force now (SetLoras swaps them under this lock).
+                DiffusionResult result = _pipeline.Run(request.WithAdapters(_adapters), CancellationToken.None);
                 DiffusionTimings t = result.Timings;
                 int steps = result.Recipe.Steps;
                 LastResult = result;
@@ -197,6 +199,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             lock (_generationLock)
             {
                 _pipeline.Dispose();
+                DisposeLoras();
                 base.Dispose();
             }
         }

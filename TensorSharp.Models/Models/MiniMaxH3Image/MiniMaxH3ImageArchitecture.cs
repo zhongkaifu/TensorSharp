@@ -21,6 +21,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
             DisplayName = "MiniMax-H3-Image",
             Aliases = new[] { MiniMaxH3ImageFamily.ArchitectureId, "minimax_h3_image" },
             Factory = c => new MiniMaxH3ImageDiffusionModel(c.GgufPath, c.Backend),
+            // Style adapters (any number, bare weights too) and one speed adapter (config/lora/minimax-h3-image-*.json).
+            LoraPluginType = Runtime.LoraCliFlags.MiniMaxH3ImagePluginType,
             DetectFromTensors = LooksLikeDenoiser,
             // The Comfy-Org release: the denoiser in its original tensor names, read from the header alone.
             DetectSafetensors = file => file != null && MiniMaxH3ImageFamily.IsDenoiser(file.Tensors.Keys),

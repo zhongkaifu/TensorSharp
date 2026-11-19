@@ -132,7 +132,7 @@ public sealed class MiniMaxH3TurboHostTests : IDisposable
         string model = LoraHostFixtures.WriteTextModel(_dir);
 
         AssertRefusedBeforeAnyDownload(() => Apply(new[] { "--model", model, "--lora", manifest }, 0, model),
-            "--lora applies to Qwen-Image-2.1 and MiniMax-H3 (FL2VA) models only; 'Qwen3.5-9B-Q8_0.gguf' (qwen35) " +
+            "--lora applies to Qwen-Image-2.1, MiniMax-H3 (FL2VA) and MiniMax-H3-Image models only; 'Qwen3.5-9B-Q8_0.gguf' (qwen35) " +
             "does not take LoRA plug-ins.");
     }
 

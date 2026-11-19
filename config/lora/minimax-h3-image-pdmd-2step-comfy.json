@@ -1,0 +1,35 @@
+{
+  // pDMD 2-NFE, the ComfyUI-native conversion (akhaliq/minimax-h3-image-pdmd-2step, minimax_h3_pdmd_2nfe_comfyui.safetensors,
+  // by Iwannapose): the same pDMD 2-step adapter as pdmd2026's diffusers release, with q, k and v fused as one
+  // block-diagonal qkv_proj term (alpha 384 at rank 384: scale 1), fc1's halves in the checkpoint's [gate; value] order.
+  //
+  //   TensorSharp.Cli --config config/minimax-h3-image.json \
+  //       --lora config/lora/minimax-h3-image-pdmd-2step-comfy.json --prompt "..." --output out.png
+  //
+  // Contract: the card's ComfyUI recipe on Comfy-Org's checkpoint: euler, the "simple" scheduler over shift 12, 2 steps
+  // (the sigmas [1, 12/13, 0]), and ComfyUI's grid-interval heads (the grid points nearest each step's ends, the base
+  // checkpoint's own rule); no guidance; generated at the asked size (the card renders 2-16 MP).
+  // Locked as config/lora/minimax-h3-image-pdmd-2step.json is. One speed adapter at a time.
+  // Licence: the card says apache-2.0; the adapter is a derivative of MiniMax-H3-Image, whose Community License applies.
+  "type": "minimax-h3-image-lora",
+  "name": "pDMD 2-step (ComfyUI conversion)",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/minimax-h3-image/loras"
+  },
+  "weights": {
+    "path": "${root}/minimax_h3_pdmd_2nfe_comfyui.safetensors",
+    "urls": [
+      "https://huggingface.co/akhaliq/minimax-h3-image-pdmd-2step/resolve/ef1e3b9a237fc7a57ba4d07174ecca397d695d8a/minimax_h3_pdmd_2nfe_comfyui.safetensors"
+    ],
+    "sha256": "5feaeef13df31f98f36364a95e7ce9e8ff0afd71570d1c53d7c3be599e3a0f22"
+  },
+  "key_format": "comfy",
+  "scale": 1.0,
+  "sampling": {
+    "steps": 2,
+    "sigmas": [1.0, 0.9230769230769231, 0.0],
+    "heads": "grid-interval",
+    "cfg": 1.0,
+    "min_generation_area": 1024
+  }
+}

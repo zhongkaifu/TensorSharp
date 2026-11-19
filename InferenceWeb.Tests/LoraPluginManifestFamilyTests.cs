@@ -3,6 +3,7 @@
 using System.Text.Json;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Models.MiniMaxH3;
+using TensorSharp.Models.MiniMaxH3Image;
 using TensorSharp.Models.QwenImage;
 
 namespace InferenceWeb.Tests;
@@ -20,7 +21,12 @@ public sealed class LoraPluginManifestFamilyTests
     {
         ("qwen-image-2.1-", LoraCliFlags.QwenImagePluginType),
         ("minimax-h3-", LoraCliFlags.MiniMaxH3PluginType),
+        ("minimax-h3-image-", LoraCliFlags.MiniMaxH3ImagePluginType),
     };
+
+    /// <summary>The family whose prefix is the longest one the file name starts with (minimax-h3-image- before minimax-h3-).</summary>
+    private static (string Prefix, string Type) FamilyOf(string name) =>
+        Families.Where(f => name.StartsWith(f.Prefix, StringComparison.Ordinal)).OrderByDescending(f => f.Prefix.Length).First();
 
     private static readonly JsonDocumentOptions CommentedJson = new()
     {
@@ -52,7 +58,8 @@ public sealed class LoraPluginManifestFamilyTests
         foreach (string file in ShippedManifests())
         {
             string name = Path.GetFileName(file);
-            var family = Assert.Single(Families, f => name.StartsWith(f.Prefix, StringComparison.Ordinal));
+            Assert.Contains(Families, f => name.StartsWith(f.Prefix, StringComparison.Ordinal));
+            var family = FamilyOf(name);
             Assert.True(family.Type == DeclaredType(file), $"{name} declares \"{DeclaredType(file)}\", not \"{family.Type}\".");
             Assert.Equal(family.Type, LoraCliFlags.DeclaredPluginType(new LoraSpec(file)));
         }
@@ -65,7 +72,7 @@ public sealed class LoraPluginManifestFamilyTests
             Families.Select(f => f.Type).OrderBy(t => t, StringComparer.Ordinal));
         string[] files = ShippedManifests();
         foreach (var (prefix, type) in Families)
-            Assert.Contains(files, f => Path.GetFileName(f).StartsWith(prefix, StringComparison.Ordinal) && DeclaredType(f) == type);
+            Assert.Contains(files, f => FamilyOf(Path.GetFileName(f)).Prefix == prefix && DeclaredType(f) == type);
     }
 
     [Fact]
@@ -77,6 +84,11 @@ public sealed class LoraPluginManifestFamilyTests
             if (type == LoraCliFlags.QwenImagePluginType)
             {
                 Assert.Equal("TensorSharp LoRA config", QwenImage21LoraConfig.Load(file).Format);
+            }
+            else if (type == LoraCliFlags.MiniMaxH3ImagePluginType)
+            {
+                var config = MiniMaxH3ImageLoraConfig.Load(file);
+                Assert.EndsWith(".safetensors", config.WeightsFileName, StringComparison.Ordinal);
             }
             else
             {
@@ -98,5 +110,7 @@ public sealed class LoraPluginManifestFamilyTests
         Assert.Equal(LoraCliFlags.QwenImagePluginType, ModelArchitectureRegistry.All.Single(a => a.Id == "qwen_image").LoraPluginType);
         Assert.Equal(LoraCliFlags.MiniMaxH3PluginType,
             ModelArchitectureRegistry.All.Single(a => a.Id == MiniMaxH3Model.ArchitectureId).LoraPluginType);
+        Assert.Equal(LoraCliFlags.MiniMaxH3ImagePluginType,
+            ModelArchitectureRegistry.All.Single(a => a.Id == MiniMaxH3ImageFamily.ArchitectureId).LoraPluginType);
     }
 }
