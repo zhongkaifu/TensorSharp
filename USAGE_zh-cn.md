@@ -183,6 +183,12 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
 
+# MiniMax-H3-Image：不带 --image 时生成图像（默认 2048x2048、6 步）；带 --image 时用最多 16 张参考图
+# 编辑，提示词按命令行顺序称它们为 <Picture 1>、<Picture 2>……。见 docs/models/minimax-h3-image_zh-cn.md#图像编辑。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --image cabin.png --image mug.png --width 2048 --height 2048 --diffusion-seed 7 \
+    --prompt "Put the black mug from <Picture 2> on the table in front of the cabin in <Picture 1>." --output mug.png
+
 # Qwen-Image-2.1-Turbo：蒸馏为 8 步的版本，VAE、文本编码器与 mmproj 相同。配置文件声明了
 # 检查点（--qwen-image-variant turbo），因此按 Turbo 公布的 8 步调度、CFG 1 采样。
 # 见 docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo。
@@ -452,7 +458,7 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-2.1 则是 FlowMatch-Euler 步数——省略时自动选择（40，或 `--lora` 插件采样配方中的步数；Qwen-Image-2.1-Turbo 为 8，也只接受 8）。MiniMax-H3 默认 20；加载 [Turbo 插件](#minimax-h3-turbo-插件)时只跑插件的 8 或 4 步，其他值在启动时被拒绝。 LTX 2.5 只接受 8 步（另加 3 步精修），CFG 固定为 1。 |
 | `--diffusion-seed <N>` | 扩散路径的噪声种子：DiffusionGemma 的确定性采样器与 Qwen-Image-2.1（默认：0），以及视频生成（Wan、MiniMax-H3）——视频不传时每次运行都会取一个新的随机种子。决定一段视频长什么样的是这个种子，`--seed` 是文本采样种子，对它没有影响。Qwen-Image-2.1 的图像由种子和尺寸决定；编辑的噪声还取决于 `--image` 传入的图片，因此用画出某张图的种子去编辑它，不会从它自己的噪声重新开始（[种子与编辑](docs/models/qwenimage21_zh-cn.md#种子与编辑)）。 |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
-| `--image <path>` | Qwen-Image-2.1 编辑用的输入图像（也是多模态聊天的图像输入）；重复该参数可传入多张参考图。每个 `--image` 都是一张参考图，按命令行顺序在提示词之前标记为 `<image1>`、`<image2>`……，提示词可以用这些标记指代图片。不带 `--image` 时，Qwen-Image-2.1 DiT 改为根据提示词生成图像。 |
+| `--image <path>` | 图像编辑用的输入图像（也是多模态聊天的图像输入）；重复该参数可传入多张参考图。每个 `--image` 都是一张参考图，按命令行顺序排列，提示词按模型自己的方式指代它们：Qwen-Image-2.1 在提示词之前将其标记为 `<image1>`、`<image2>`……；MiniMax-H3-Image（最多 16 张）称之为 `<Picture 1>`、`<Picture 2>`……。不带 `--image` 时，两个模型都改为根据提示词生成图像。 |
 | `--mask <path>` | Qwen-Image-2.1 掩码，尺寸须与第一张输入图完全一致。需要 `--image`；其他图片仍作为参考。保留源图尺寸及未选中的已解码 RGBA 像素。见[掩码图像编辑](#掩码图像编辑)。 |
 | `--mask-mode <mode>` / `--mask-invert` | `grayscale`（默认）：白色编辑、黑色保护、灰色混合。`alpha`：透明编辑、不透明保护。`--mask-invert` 反转选区。 |
 | `--mask-feather <pixels>` | 按源图像素向内柔化边缘；范围 0–1024，默认 0。 |
