@@ -268,6 +268,9 @@ namespace TensorSharp.Models
             /// <summary>Every row's greedy token (the largest logit, a tie to the lower id) in place of its logits: a greedy
             /// verify reads back an id a row, where it had read the whole vocabulary's logits and scanned them on the host.</summary>
             public bool GreedyIds { get; init; }
+            /// <summary>With <see cref="GreedyIds"/>, tokens never picked (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdSuppression"/>):
+            /// the head adds their mask before the pick. Null for none.</summary>
+            public GreedySuppression Suppression { get; init; }
             /// <summary>Layers whose INPUT residual [hidden, rows] is returned (a drafter's features).</summary>
             public int[] CaptureLayers { get; init; } = Array.Empty<int>();
             /// <summary>Capture only the step's last this-many rows (0: every row): a block drafter's context holds only
@@ -299,7 +302,7 @@ namespace TensorSharp.Models
             /// <summary>What the request changes in the emitted program (a streamed step's template key).</summary>
             public string Shape =>
                 $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}:{CaptureTail}"
-                + (GreedyIds ? ":g" : "") + (LastRowHidden ? ":h" : "")
+                + (GreedyIds ? ":g" : "") + (Suppression != null ? ":s" + Suppression.Key : "") + (LastRowHidden ? ":h" : "")
                 + (FollowDraft == DraftFollow.None ? "" : $":f{(int)FollowDraft}{(DraftRows != null ? "e" : "")}")
                 + (FollowDFlash == null ? "" : $":df{FollowDFlash.Key}")
                 + (PromptChunks ? ":p" : "");
@@ -307,8 +310,8 @@ namespace TensorSharp.Models
             /// <summary>This request with the DFlash rings' follow <paramref name="plan"/> (null: none).</summary>
             public GraphRequest WithDFlashFollow(DFlashFollowPlan plan) => new()
             {
-                LastRowLogits = LastRowLogits, AllRowLogits = AllRowLogits, GreedyIds = GreedyIds, CaptureLayers = CaptureLayers,
-                CaptureTail = CaptureTail, CaptureFinal = CaptureFinal, LastRowHidden = LastRowHidden, RecurrentSnapshots = RecurrentSnapshots,
+                LastRowLogits = LastRowLogits, AllRowLogits = AllRowLogits, GreedyIds = GreedyIds, Suppression = Suppression,
+                CaptureLayers = CaptureLayers, CaptureTail = CaptureTail, CaptureFinal = CaptureFinal, LastRowHidden = LastRowHidden, RecurrentSnapshots = RecurrentSnapshots,
                 PositionTable = PositionTable, FollowDraft = FollowDraft, DraftRows = DraftRows, FollowDFlash = plan,
                 PromptChunks = PromptChunks,
             };
@@ -1232,7 +1235,8 @@ namespace TensorSharp.Models
             bool wantHidden = lastHidden != null && Array.Exists(lastHidden, h => h != null);
             var request = new GraphRequest
             {
-                LastRowLogits = wantLogits, GreedyIds = greedy, PositionTable = positionTable, FollowDraft = follow, DraftRows = draftRows,
+                LastRowLogits = wantLogits, GreedyIds = greedy, Suppression = greedy ? _greedySuppressed : null, PositionTable = positionTable,
+                FollowDraft = follow, DraftRows = draftRows,
                 FollowDFlash = dflash, LastRowHidden = wantHidden, PromptChunks = MarksPromptChunks(prompt, counts),
             };
             if (!TryRunGraphStep(hidden, slots, first, counts, starts, request, out GraphResult result))
@@ -1809,7 +1813,7 @@ namespace TensorSharp.Models
             {
                 int logits = step.MatMul(headName, final);
                 outputs.Logits = request.GreedyIds
-                    ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1, 1 })), rows)
+                    ? step.Output(step.Op(GraphOp.Cont, GreedyHead(step, logits, request)), rows)
                     : step.Output(logits, (long)Config.VocabSize * rows);
             }
             else if (request.LastRowLogits || request.LastRowHidden)
@@ -1830,10 +1834,17 @@ namespace TensorSharp.Models
                 if (!request.LastRowLogits) return;
                 int logits = step.MatMul(headName, selected);
                 outputs.Logits = request.GreedyIds
-                    ? step.Output(step.Op(GraphOp.Cont, step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1, 1 })), n)
+                    ? step.Output(step.Op(GraphOp.Cont, GreedyHead(step, logits, request)), n)
                     : step.Output(logits, (long)Config.VocabSize * n);
             }
         }
+
+        /// <summary>A greedy head over <paramref name="logits"/> [vocab, rows] (<see cref="GraphCapabilities.GreedyIdOutputs"/>):
+        /// TopK with Ip { 1, 1 }, over the request's suppression mask where it has one.</summary>
+        private int GreedyHead(GraphStep step, int logits, GraphRequest request)
+            => request.Suppression is { } suppression
+                ? step.Op(GraphOp.TopK, stackalloc[] { logits, step.ConstantInputF32(suppression.Mask, Config.VocabSize) }, stackalloc long[] { 1, 1 })
+                : step.Op(GraphOp.TopK, stackalloc[] { logits }, stackalloc long[] { 1, 1 });
 
         /// <summary>
         /// One step's layers over a tensor-parallel group, as each rank's program (see <see cref="TryRunRankedGraphStep"/>):

@@ -2666,11 +2666,15 @@ namespace TensorSharp.Runtime.Scheduling
                 // logits are and the next step takes them from the stash (as the batched fused decode's device-sampled path
                 // does). A prompt's last chunk reads its logits: its draw is the first token, which a first-token constraint
                 // may narrow.
+                // Requests whose samplers suppress tokens (a reply-token policy: LFM3-Omni's media placeholders) take the
+                // device's pick too where the model suppresses them there, when every request suppresses the same tokens.
+                IReadOnlyList<int>? suppressed = null;
                 if (features == null && model.SupportsUnifiedGreedyIds && !FirstTokenLogitsDump.IsArmed
-                    && batch.TrueForAll(item => item.Sampled >= 0 && item.Work.Sequence.GetOrCreateSampler().IsPlainGreedyArgmax))
+                    && batch.TrueForAll(item => item.Sampled >= 0 && GreedyOnDevice(item.Work.Sequence.GetOrCreateSampler(), model, ref suppressed)))
                 {
                     var next = new int[batch.Count];
-                    if (model.TryForwardUnifiedGreedy(ids, tokens, starts, next))
+                    if (suppressed is { Count: > 0 } ? model.TryForwardUnifiedGreedy(ids, tokens, starts, next, suppressed)
+                        : model.TryForwardUnifiedGreedy(ids, tokens, starts, next))
                     {
                         RecordStepPhase(s_phaseIssue, started, stepRows);
                         long ticks = (Stopwatch.GetTimestamp() - started) / batch.Count;
@@ -2701,6 +2705,22 @@ namespace TensorSharp.Runtime.Scheduling
                 foreach (var item in batch)
                     FailUnified(item.Work.Sequence, ex, results);
             }
+        }
+
+        /// <summary>Whether a request drawing with <paramref name="sampler"/> may take the device's greedy pick in a step whose
+        /// requests so far suppress <paramref name="suppressed"/> (null: none seen yet; set to the first request's): a plain
+        /// argmax, or one over suppressed tokens the model suppresses on the device, the same for every request.</summary>
+        private static bool GreedyOnDevice(TokenSampler sampler, IUnifiedBatchModel model, ref IReadOnlyList<int>? suppressed)
+        {
+            if (!sampler.IsGreedyArgmaxOverSuppressed) return false;
+            IReadOnlyList<int> own = sampler.SuppressedTokens ?? Array.Empty<int>();
+            if (own.Count > 0 && !model.SupportsUnifiedGreedySuppression) return false;
+            if (suppressed == null)
+            {
+                suppressed = own;
+                return true;
+            }
+            return ReferenceEquals(suppressed, own) || suppressed.SequenceEqual(own);
         }
 
         /// <summary>

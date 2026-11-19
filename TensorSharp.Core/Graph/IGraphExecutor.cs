@@ -87,6 +87,10 @@ namespace TensorSharp.Graph
         /// row; an executor lowers it to whatever gives exactly those ids (GGML: each row's top candidates on the device,
         /// the lowest id of the largest taken on the host, a row whose candidates all tie read in full).</summary>
         public bool GreedyIdOutputs { get; init; }
+        /// <summary>A greedy head (<see cref="GreedyIdOutputs"/>) may take a second source, an F32 [vocab] mask of -0 (kept) and
+        /// -inf (suppressed) added to every row before the pick: the ids are then the host argmax over the logits with the
+        /// suppressed tokens' set to -inf, as TokenSampler sets them.</summary>
+        public bool GreedyIdSuppression { get; init; }
         /// <summary>An F16 causal mask input may arrive as its pattern (a <see cref="CausalMaskInput"/> as the input's handle,
         /// no host bytes): the executor classifies it from the pattern and makes its values only for an op that reads them.
         /// The shared runtime gives prompt chunks' masks so (more rows than a verify window: never replayed, advanced or

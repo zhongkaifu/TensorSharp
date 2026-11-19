@@ -81,6 +81,8 @@ namespace TensorSharp.GGML
                 // and scanned 8.2 M floats on the engine thread (B0 census, A40). Metal and the CPU read their logits in
                 // place, where the host's scan stays.
                 GreedyIdOutputs = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
+                // Suppressed tokens (a reply-token policy) as a mask the greedy head adds (GreedyHead).
+                GreedyIdSuppression = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
             };
         }
 

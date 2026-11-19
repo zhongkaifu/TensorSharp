@@ -50,6 +50,17 @@ namespace TensorSharp.Runtime.Scheduling
         /// logits are not read back. Declines as <see cref="TryForwardUnified"/> does.</summary>
         bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens) => false;
 
+        /// <summary>Whether <see cref="TryForwardUnifiedGreedy(IReadOnlyList{string}, IReadOnlyList{int[]}, int[], int[], IReadOnlyList{int})"/>
+        /// takes suppressed tokens (a reply-token policy's) on the device.</summary>
+        bool SupportsUnifiedGreedySuppression => false;
+
+        /// <summary><see cref="TryForwardUnifiedGreedy(IReadOnlyList{string}, IReadOnlyList{int[]}, int[], int[])"/> with every
+        /// request's <paramref name="suppressed"/> tokens never picked (their logits -inf, as TokenSampler sets them). A model
+        /// without <see cref="SupportsUnifiedGreedySuppression"/> declines any.</summary>
+        bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens,
+            IReadOnlyList<int> suppressed)
+            => suppressed is not { Count: > 0 } && TryForwardUnifiedGreedy(requestIds, tokens, starts, nextTokens);
+
         /// <summary>Whether <see cref="TryForwardUnifiedRows"/> serves (requests driven by an
         /// <see cref="ISequenceStepDriver"/> need it).</summary>
         bool SupportsUnifiedRowIO => false;

@@ -72,8 +72,13 @@ namespace TensorSharp.Runtime
         /// forced-token override before consuming a device-side argmax, so
         /// ordinary greedy decoding need not materialize host logits.</summary>
         internal bool IsPlainGreedyArgmax =>
+            IsGreedyArgmaxOverSuppressed && SuppressedTokens is not { Count: > 0 };
+
+        /// <summary><see cref="IsPlainGreedyArgmax"/> but for <see cref="SuppressedTokens"/>: a first-max argmax over the
+        /// raw logits with the suppressed tokens' set to -inf (a device pick that suppresses the same tokens may serve).</summary>
+        internal bool IsGreedyArgmaxOverSuppressed =>
             _config.Temperature <= 0f && _config.Grammar == null && !HasPenalties()
-            && _config.ThinkingBudget?.SuppressUnopenedEnd != true && SuppressedTokens is not { Count: > 0 };
+            && _config.ThinkingBudget?.SuppressUnopenedEnd != true;
 
         /// <summary>Tokens never drawn: their logits are set to -inf before every other stage (a model's
         /// <c>IReplyTokenPolicy</c>: media placeholders, speech switches). Null or empty for none. A sampler with some is not

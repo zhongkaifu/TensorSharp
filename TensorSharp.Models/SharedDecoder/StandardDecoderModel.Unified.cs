@@ -310,7 +310,11 @@ namespace TensorSharp.Models
                     nextTokens[s] = (int)row[0];   // the id as its F32 value (exact below 2^24)
                     continue;
                 }
-                // A step that ran off the graphs read the logits back: the first largest, as the device picks.
+                // A step that ran off the graphs read the logits back: the first largest, as the device picks (over the
+                // suppressed tokens' -inf, as TokenSampler sets them).
+                if (_greedySuppressed is { } suppression)
+                    foreach (int id in suppression.Ids)
+                        if ((uint)id < (uint)row.Length) row[id] = float.NegativeInfinity;
                 int best = 0;
                 for (int v = 1; v < row.Length; v++)
                     if (row[v] > row[best]) best = v;
@@ -319,8 +323,56 @@ namespace TensorSharp.Models
             return true;
         }
 
-        /// <summary>Set while <see cref="TryForwardUnifiedGreedy"/> runs: the graph steps' last-row heads end in a top-1.</summary>
+        /// <summary>Set while <see cref="TryForwardUnifiedGreedy(IReadOnlyList{string}, IReadOnlyList{int[]}, int[], int[])"/> runs: the graph steps' last-row heads end in a top-1.</summary>
         private bool _greedyLastRows;
+
+        /// <summary>Executors whose greedy heads take a suppression mask (<see cref="TensorSharp.Graph.GraphCapabilities.GreedyIdSuppression"/>)
+        /// pick for samplers that suppress tokens (LFM3-Omni's text replies never draw its media placeholders) on the device too.</summary>
+        public bool SupportsUnifiedGreedySuppression => SupportsUnifiedGreedyIds && GraphExecutor.Capabilities.GreedyIdSuppression;
+
+        public bool TryForwardUnifiedGreedy(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, int[] nextTokens,
+            IReadOnlyList<int> suppressed)
+        {
+            if (suppressed is not { Count: > 0 }) return TryForwardUnifiedGreedy(requestIds, tokens, starts, nextTokens);
+            if (!SupportsUnifiedGreedySuppression) return false;
+            _greedySuppressed = SuppressionMask(suppressed);
+            try { return TryForwardUnifiedGreedy(requestIds, tokens, starts, nextTokens); }
+            finally { _greedySuppressed = null; }
+        }
+
+        /// <summary>The suppressed tokens of the greedy step running (<see cref="TryForwardUnifiedGreedy(IReadOnlyList{string}, IReadOnlyList{int[]}, int[], int[], IReadOnlyList{int})"/>)
+        /// and their mask (F32 [vocab]: -inf at a suppressed id, -0 elsewhere, which adds nothing); null otherwise.</summary>
+        private GreedySuppression _greedySuppressed;
+
+        private GreedySuppression _suppressionMask;
+
+        private sealed class GreedySuppression
+        {
+            public int[] Ids;
+            /// <summary>The mask's values, a constant input of the step (uploaded with its other inputs).</summary>
+            public float[] Mask;
+            /// <summary>The ids' digest: a plan's signature names the mask it was traced with.</summary>
+            public string Key;
+        }
+
+        /// <summary>The mask of <paramref name="suppressed"/>, one kept for the model (a reply-token policy suppresses the same
+        /// tokens in every request), made again when another set comes.</summary>
+        private GreedySuppression SuppressionMask(IReadOnlyList<int> suppressed)
+        {
+            if (_suppressionMask is { } kept && kept.Ids.AsSpan().SequenceEqual(suppressed is int[] a ? a : System.Linq.Enumerable.ToArray(suppressed)))
+                return kept;
+            int vocab = Config.VocabSize;
+            var values = new float[vocab];
+            Array.Fill(values, -0.0f);
+            int[] ids = System.Linq.Enumerable.ToArray(suppressed);
+            ulong h = 14695981039346656037UL;
+            foreach (int id in ids)
+            {
+                if ((uint)id < (uint)vocab) values[id] = float.NegativeInfinity;
+                h = (h ^ (uint)id) * 1099511628211UL;
+            }
+            return _suppressionMask = new GreedySuppression { Ids = ids, Mask = values, Key = h.ToString("X16") };
+        }
 
         public float[] ForwardUnifiedMedia(string requestId, int[] tokens, int start)
         {

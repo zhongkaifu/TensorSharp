@@ -155,6 +155,7 @@ namespace
     struct GreedyHead
     {
         ggml_tensor* logits = nullptr;   // [vocab, rows] F32: kept to the end of the run for a row's full read
+        ggml_tensor* mask = nullptr;     // [vocab] F32, -0 kept / -inf suppressed, added before the pick (null: none)
         ggml_tensor* ids = nullptr;      // [k, rows] I32: ggml_top_k (in no particular order)
         ggml_tensor* values = nullptr;   // [1, k, rows] F32: the logits at those ids
         ggml_tensor* sums = nullptr;     // [1, rows] F32: each row's sum (finite iff every logit is)
@@ -163,7 +164,7 @@ namespace
         int k = 0;
         float* out = nullptr;            // the output's host floats: one id a row
         std::vector<std::int32_t> host_ids;
-        std::vector<float> host_values, host_sums, row;
+        std::vector<float> host_values, host_sums, row, host_mask;
     };
 
     // Rows whose greedy id was read from their full logits (a tie of every candidate, or a NaN or infinity), for tests.
@@ -691,7 +692,7 @@ namespace
 
     // A greedy head over x [vocab, rows] F32 (see GreedyHead): the candidates' ids and logits and each row's sum, kept for
     // the run's end; the program's node is a view of the ids (its output receives the resolved ids instead of its bytes).
-    ggml_tensor* greedy_head(TsgGraph* g, ggml_tensor* x)
+    ggml_tensor* greedy_head(TsgGraph* g, ggml_tensor* x, ggml_tensor* mask)
     {
         if (g->tp != nullptr) throw std::runtime_error("graph builder: a greedy head runs on one device's graph");
         if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] < 1)
@@ -703,9 +704,20 @@ namespace
         h.rows = x->ne[1];
         h.k = static_cast<int>(std::min<std::int64_t>(kGreedyCandidates, h.vocab));
         h.logits = x;
-        h.ids = ggml_top_k(g->ctx, x, h.k);
-        h.values = ggml_get_rows(g->ctx, ggml_reshape_3d(g->ctx, x, 1, h.vocab, h.rows), h.ids);
-        h.sums = ggml_sum_rows(g->ctx, x);
+        // Suppressed tokens: the mask's -inf added (its -0 adds nothing, signed zeros included). A suppressed NaN or +inf
+        // becomes a NaN, so its row's sum is not finite and the row is read in full, where the mask is applied as the host
+        // applies it (assigned).
+        ggml_tensor* picked = x;
+        if (mask != nullptr)
+        {
+            if (mask->type != GGML_TYPE_F32 || ggml_nelements(mask) != h.vocab || !ggml_is_contiguous(mask))
+                throw std::runtime_error("graph builder: a greedy head's mask is F32 [vocab]");
+            h.mask = mask;
+            picked = ggml_add(g->ctx, x, ggml_reshape_2d(g->ctx, mask, h.vocab, 1));
+        }
+        h.ids = ggml_top_k(g->ctx, picked, h.k);
+        h.values = ggml_get_rows(g->ctx, ggml_reshape_3d(g->ctx, picked, 1, h.vocab, h.rows), h.ids);
+        h.sums = ggml_sum_rows(g->ctx, picked);
         h.result = ggml_view_2d(g->ctx, h.ids, 1, h.rows, h.ids->nb[1], 0);
         g->greedy.push_back(std::move(h));
         return g->greedy.back().result;
@@ -740,6 +752,7 @@ namespace
         for (GreedyHead& h : g->greedy)
         {
             if (h.out == nullptr) continue;
+            h.host_mask.clear();   // this run's mask (an input), read only for a row read in full
             const std::size_t k = static_cast<std::size_t>(h.k), rows = static_cast<std::size_t>(h.rows);
             if (download)
             {
@@ -771,6 +784,17 @@ namespace
                     h.row.resize(static_cast<std::size_t>(h.vocab));
                     ggml_backend_tensor_get(h.logits, h.row.data(), r * static_cast<std::size_t>(h.vocab) * sizeof(float),
                                             static_cast<std::size_t>(h.vocab) * sizeof(float));
+                    if (h.mask != nullptr)
+                    {
+                        // TokenSampler's suppression: the suppressed logits set to -inf.
+                        if (h.host_mask.empty())
+                        {
+                            h.host_mask.resize(static_cast<std::size_t>(h.vocab));
+                            ggml_backend_tensor_get(h.mask, h.host_mask.data(), 0, h.host_mask.size() * sizeof(float));
+                        }
+                        for (std::size_t i = 0; i < h.row.size(); i++)
+                            if (h.host_mask[i] == -INFINITY) h.row[i] = -INFINITY;
+                    }
                     id = host_row_argmax(h.row.data(), h.vocab);
                     g_greedy_full_rows.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -925,7 +949,7 @@ namespace
         // ip[1] = 1: a greedy head (GreedyHead), its ids read back as F32 values.
         case OP_TOP_K:
             need(1);
-            if (ipar(1, 0) == 1) return greedy_head(g, src(0));
+            if (ipar(1, 0) == 1) return greedy_head(g, src(0), ns > 1 ? src(1) : nullptr);
             return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
         case OP_SUM_ROWS: need(1); return ggml_sum_rows(ctx, src(0));
         case OP_LIGHTNING_INDEXER:
@@ -1513,6 +1537,7 @@ namespace
         for (GreedyHead& h : g->greedy)
         {
             for (ggml_tensor* t : { h.logits, h.ids, h.values, h.sums }) ggml_set_output(t);
+            if (h.mask != nullptr) ggml_set_output(h.mask);
             h.host_ids.assign(static_cast<std::size_t>(h.k * h.rows), 0);
             h.host_values.assign(static_cast<std::size_t>(h.k * h.rows), 0.0f);
             h.host_sums.assign(static_cast<std::size_t>(h.rows), 0.0f);

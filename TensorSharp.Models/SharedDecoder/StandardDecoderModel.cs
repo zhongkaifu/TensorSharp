@@ -1646,6 +1646,7 @@ namespace TensorSharp.Models
             _cacheK = _cacheV = null;
             _draftCarry?.Dispose();
             _draftCarry = null;
+            _suppressionMask = null;
             foreach (Tensor copy in _replicas.Values) copy.Dispose();
             _replicas.Clear();
             DisposeSlots();
