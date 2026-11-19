@@ -199,10 +199,11 @@ public sealed class ServingContractConformanceTests
     {
         foreach (var arch in BuiltInArchitectures.Descriptors)
         {
-            if (arch.Serving.Implementation == ServingImplementation.SharedRuntime) continue;
+            if (arch.Serving.Implementation is ServingImplementation.SharedRuntime or ServingImplementation.SharedDiffusionRuntime) continue;
             Assert.True(LegacyBespokeFamilies.Contains(arch.Id),
-                $"'{arch.Id}' implements its own serving mechanisms. New families must be built on the shared " +
-                "decoder runtime (StandardDecoderModel) and declare ServingContract.SharedRuntime(...).");
+                $"'{arch.Id}' implements its own serving mechanisms. New families must be built on a shared runtime: the " +
+                "decoder runtime (StandardDecoderModel, ServingContract.SharedRuntime(...)) or, for a diffusion family, the " +
+                "diffusion runtime (TensorSharp.Models.SharedDiffusion, ServingContract.SharedDiffusionRuntime(...)).");
         }
     }
 

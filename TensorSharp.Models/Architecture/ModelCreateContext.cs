@@ -41,8 +41,14 @@ namespace TensorSharp.Models.Architecture
         /// <summary>Compute backend the model must build itself on.</summary>
         public BackendType Backend { get; }
 
-        /// <summary>Open GGUF used for architecture detection. Do not retain or dispose.</summary>
+        /// <summary>Open GGUF used for architecture detection. Do not retain or dispose. Null for a model file
+        /// detected as safetensors (<see cref="SafetensorsProbe"/>).</summary>
         public GgufFile Probe { get; }
+
+        /// <summary>The open safetensors header a <see cref="ModelArchitectureDescriptor.DetectSafetensors"/> claimed, when
+        /// the model file is safetensors; null otherwise. Owned by the loader like <see cref="Probe"/>: read it, do not
+        /// retain or dispose it.</summary>
+        public SafetensorsFile SafetensorsProbe { get; init; }
 
         /// <summary>Tensor-parallel degree AFTER the multi-GPU gate has run: 1 unless
         /// the architecture actually shards weights.</summary>
@@ -62,6 +68,6 @@ namespace TensorSharp.Models.Architecture
 
         /// <summary>Rebuild with a different tensor-parallel / layer-split resolution.</summary>
         public ModelCreateContext With(int tpDegree, ITensorParallelGroup tpGroup, int layerSplitDegree)
-            => new(GgufPath, Backend, Probe, tpDegree, tpGroup, DraftModelPath, layerSplitDegree);
+            => new(GgufPath, Backend, Probe, tpDegree, tpGroup, DraftModelPath, layerSplitDegree) { SafetensorsProbe = SafetensorsProbe };
     }
 }

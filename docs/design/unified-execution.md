@@ -227,6 +227,7 @@ classDiagram
         <<enumeration>>
         SharedRuntime
         Bespoke
+        SharedDiffusionRuntime
     }
     class IBatchedPagedModel {
         <<interface>>
@@ -427,7 +428,11 @@ driven by it, so a declared gap is also the operator-facing refusal message.
    easy way out) and when a listed gap has been closed but not removed (so the list always
    matches reality).
 3. **New families use the shared runtime:** any architecture id not in the legacy (bespoke) list
-   must declare `Implementation = SharedRuntime`; the test fails otherwise.
+   must declare `Implementation = SharedRuntime`, or, for a diffusion family,
+   `Implementation = SharedDiffusionRuntime` (`ServingContract.SharedDiffusionRuntime(...)`: the generic
+   diffusion runtime of [diffusion-runtime.md](diffusion-runtime.md), where continuous batching does not
+   apply and tensor parallelism is the runtime's per-rank emission of a shardable denoiser); the test fails
+   otherwise.
 4. **Proof per claim:** `SharedRuntimeConformanceTests` runs every shared-runtime family through
    prefill, decode, truncate-and-refill and reset under TP 2, layer split 2 and 4, and hybrid
    2×2 and 2×3 on simulated devices (`SimulatedDeviceGroup`), comparing logits with one device
