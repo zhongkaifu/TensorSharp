@@ -1490,8 +1490,13 @@ whether the loaded model can:
 `voices` lists the default first; `reason` says why not when `available` is
 false (a model without speech output, or LFM3-Omni loaded without its mmproj).
 Ask for a spoken reply with `speech`: `true` (the default voice), or
-`{"voice": "...", "language": "..."}` (both optional; `language` is a code such
-as `en` or `fr` that the system line names).
+`{"voice": "...", "language": "..."}` (both optional; `language` is the speech's
+language code, such as `en`, `zh` or `fr`; without it, the language the user's
+last message is written in by its script, Latin letters meaning English).
+LFM3-Omni's interleaved speech is English only, so a reply in any other language
+is generated as an ordinary text reply and each sentence is spoken by its TTS as
+soon as it is complete (the frames below look the same; markdown, emoji and code
+are not read aloud).
 
 ```bash
 curl -N -X POST http://localhost:5000/api/chat \

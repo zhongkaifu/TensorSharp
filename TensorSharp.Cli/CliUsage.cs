@@ -328,8 +328,9 @@ namespace TensorSharp.Cli
                 new OptionHelp("--speech-mode <interleaved|audio>",
                     "How a --speech-out reply speaks: interleaved = text and speech in turns (6 text tokens, then " +
                     "12 frames of 80 ms; the text is the transcript; the system prompt gets \"Respond with " +
-                    "interleaved text and audio.\"), audio = speech only (no transcript). Needs --speech-out. " +
-                    "Default: interleaved.",
+                    "interleaved text and audio.\"), audio = speech only (no transcript). LFM3-Omni speaks both in " +
+                    "English only: a reply in another language (--language) is its text reply spoken by its TTS. " +
+                    "Needs --speech-out. Default: interleaved.",
                     "--speech-out reply.wav --speech-mode audio"),
                 new OptionHelp("--speech-temperature <t>",
                     "Temperature of the speech codes of --tts or --speech-out (0 = argmax). The text slots keep " +
@@ -343,8 +344,11 @@ namespace TensorSharp.Cli
                     "--voice male"),
                 new OptionHelp("--language <code>",
                     "Language of the speech (--tts, --speech-out) or of the audio to transcribe (Whisper). LFM3-Omni " +
-                    "speaks ar, da, de, el, en (en-us), en-gb, es, fi, fr, he, it, ja, ko, nl, pl, pt, sv, tr, zh. " +
-                    "Default: en for LFM3-Omni's TTS; detected for Whisper.",
+                    "speaks ar, da, de, el, en (en-us), en-gb, es, fi, fr, he, it, ja, ko, nl, pl, pt, sv, tr, zh; its " +
+                    "interleaved and audio modes speak English only, so a --speech-out reply in another language is " +
+                    "generated as text and spoken sentence by sentence by its TTS. Default for LFM3-Omni: the language " +
+                    "the text is written in (Chinese characters zh, kana ja, Hangul ko, Arabic, Hebrew, Greek; Latin " +
+                    "letters en); detected for Whisper.",
                     "--language zh"),
             }),
             ("Compute backend and GPUs", new[]

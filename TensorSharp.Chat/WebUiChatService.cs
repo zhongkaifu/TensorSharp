@@ -3721,7 +3721,15 @@ namespace TensorSharp.Chat
                     || !element.TryGetProperty("audioId", out JsonElement idElement) || idElement.ValueKind != JsonValueKind.String
                     || idElement.GetString() is not { Length: > 0 } id)
                     continue;
-                if (!SpeechReplies.TryGet(id, out SpeechReplyStore.Entry entry) || entry.Turn == null || entry.Epoch != epoch)
+                bool known = SpeechReplies.TryGet(id, out SpeechReplyStore.Entry entry) && entry.Epoch == epoch;
+                if (known && entry.Turn == null)
+                {
+                    // A reply spoken from its text (SpeechReplyPath.Synthesized) is a text turn: it renders as its text, which
+                    // the session's transcript store matches to the tokens it generated.
+                    logger.LogDebug(LogEventIds.KvCacheReusePlan, "spoken turn {AudioId} was spoken from its text: renders as it", id);
+                    continue;
+                }
+                if (!known)
                 {
                     if (Interlocked.Exchange(ref _unknownSpokenTurnWarned, 1) == 0)
                         logger.LogWarning(LogEventIds.KvCacheReusePlan,

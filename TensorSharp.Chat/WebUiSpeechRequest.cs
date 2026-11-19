@@ -20,7 +20,9 @@ namespace TensorSharp.Chat
     /// A spoken web chat reply: <c>/api/chat</c>'s <c>speech</c>, <c>true</c> or <c>{"voice": ..., "language": ...}</c>
     /// (both optional). The reply interleaves text and speech (the text is the speech's transcript) with thinking off; the
     /// voice defaults to the model's first one (<see cref="ISpeechOutputModel.SpeechVoices"/>), which the system line then
-    /// names, as <c>/api/models</c>' <c>speechOutput.voices</c> lists them.
+    /// names, as <c>/api/models</c>' <c>speechOutput.voices</c> lists them. The language defaults to the one the user's
+    /// message is written in; one the model's speech modes do not speak is spoken from the text reply by its TTS
+    /// (<see cref="SpeechReplyPath.Synthesized"/>).
     /// </summary>
     internal sealed class WebUiSpeechRequest
     {

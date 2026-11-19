@@ -491,6 +491,26 @@ OpenAI's default `alloy` included, is a 400 that lists them. A spoken chat reply
 prompt gets llama.cpp's realtime line ("Speak in English using a female voice.") and, for
 interleaved replies, the card's "Respond with interleaved text and audio.".
 
+**Languages.** LFM3-Omni's interleaved and audio modes speak English only (as LFM3-Audio's
+card says of its voice chat): a Chinese reply in either is read with English sounds whatever
+the system prompt says, and the card's interleaved prompt alone makes the model answer a
+Chinese question in English (measurements below). Its TTS prompt speaks all 19 speech
+languages. So a spoken reply's language is the request's (`speech.language` on `/api/chat`,
+`audio.language` on chat completions and Responses, CLI `--language`), else the one the
+user's latest message is written in, by its script (Chinese characters `zh`, kana `ja`, Hangul
+`ko`, Arabic, Hebrew, Greek; Latin letters leave it to the default, English). An English reply
+speaks in the reply itself as above. A reply in any other language is generated as an
+ordinary text reply (no speech line in its system prompt: the reply a text request gets), and
+each sentence is spoken by the TTS prompt in that sentence's language as soon as it is
+complete, on the engine beside the text still being generated
+(`TensorSharp.Models.Audio.SpeechReplyPath.Synthesized`). The text is the speech's transcript;
+markdown markers, emoji and fenced code are not read aloud, and the first piece ends at a
+comma once it has 8 characters so the speech starts early. TTS without a language
+(`/v1/audio/speech`, `--tts`) speaks the language its text is written in (American English,
+the template's default, for Latin letters), and Chinese text reaches the TTS prompt with its
+numerals read out (`2024年10月1日` as `二零二四年十月一日`, `199元` as `一百九十九元`), which
+the model otherwise says as noise.
+
 Text replies of LFM3-Omni never draw the media placeholders (`<|audio|>`, `<|audio_out|>`,
 `<|image|>`, `<|video|>`), and a text-only reply never opens speech (`<|audio_start|>`,
 `<|mixed_start|>` banned), as HF's `generate` does; llama.cpp suppresses neither in plain
@@ -510,12 +530,29 @@ greedy pick is not used for LFM3-Omni's text replies.)
   of 25 exact) against llama-tts 1.38% (22 of 25).
 - Interleaved replies: the ASR of each English reply's speech equals its transcript (6 of 6,
   0% WER), as for llama.cpp's realtime path driven the same way (`eng/lfm3/speech-chat-ref.cpp`).
-  Chinese interleaved speech is not intelligible in either engine (a model limit; Chinese TTS
-  is).
+  Chinese interleaved speech is English-sounding in either engine (a model limit; Chinese TTS
+  is fine), hence the Languages rule above.
+- Chinese replies (2026-11-19, Q4_K_M + Q8_0 mmproj, ggml-metal; `eng/lfm3/speech-lang-eval.py`
+  and `speech-whisper.py`, Whisper medium as the independent judge): llama.cpp's realtime path
+  under six system prompts (none, the card's, "Speak in Chinese ...", "Perform TTS in Chinese ...",
+  a Chinese instruction, the voice line) gave 1 of 23 Chinese-text replies that Whisper hears as
+  Chinese, and with the card's prompt alone it answered Chinese questions in English (5 of 5).
+  Through `/api/chat` as the web chat sends it, 12 Chinese prompts x 2 voices: before, interleaved,
+  1 of 24 heard as Chinese (CER of the speech against its transcript 102%); spoken from the text
+  reply, 24 of 24 (CER 10.7%, median 3.8%; LFM3's own ASR 18.3%); chat completions 12 of 12 (8.3%),
+  with `audio.language: "zh"` 12 of 12 (8.8%, 0 of 12 before). The spoken reply's text is the
+  text reply (24 of 24), which equals llama-server's greedy reply for 20 of 24; prompt tokens equal
+  llama-server's and HF's for 39 of 39 requests. English replies are unchanged (12 of 12, WER 0-0.4%).
+  First audio of a Chinese reply 136 ms median (196 ms p90) against 66 ms for an English one;
+  real-time factor 9.2x. TTS of 12 Chinese texts x 2 voices x 3 seeds without a language: CER
+  18.6% before ("American English", 70 of 72 heard as Chinese), 5.0% now (72 of 72; texts with
+  numerals 39.0% -> 2.0%).
 - Speech-only replies (`modalities ["audio"]`, which opens `<|audio_start|>` as llama.cpp's
   realtime AUDIO mode does): LFM3-Omni reads the user's message aloud instead of answering it,
   in TensorSharp and llama.cpp alike (8 of 8 questions, ASR = the question), and without a
-  voice line its speech is unintelligible. For spoken answers ask for `["text","audio"]`.
+  voice line its speech is unintelligible. For spoken answers in English ask for
+  `["text","audio"]`; a reply in another language is spoken from its text (see Languages), in
+  either modality.
 - A text request served while a TTS reply speaks keeps its greedy reply; the engine's TTS
   equals the standalone synthesis bit for bit.
 - Speed (streaming `/v1/audio/speech`, one client against TensorSharp and llama-server, requests
@@ -540,7 +577,9 @@ whole reply. Checked on LFM3-Omni Q8_0 + Q8_0 mmproj (ggml-metal server, web cha
 turn 2 reused 84 of its 111 prompt tokens (all of turn 1: prompt, `<|mixed_start|>` and the 40 slots it
 computed), turn 3 156 of 179, and turn 3 answered from the spoken turns ("I named Paris first."). The
 spoken system prompt names the voice and asks for interleaved replies, so a text turn after a spoken one
-(or the reverse) differs from the system message on and re-prefills.
+(or the reverse) differs from the system message on and re-prefills. A reply spoken from its text (a language
+other than English) adds nothing to the system prompt: it is kept and reused as the text turn it is, by either
+kind of next turn.
 
 Limits: no `/v1/realtime`. On CUDA the speech output is checked by an ASR round trip (no word errors),
 not bit for bit against llama-tts.

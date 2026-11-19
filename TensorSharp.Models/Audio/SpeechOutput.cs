@@ -31,6 +31,18 @@ namespace TensorSharp.Models.Audio
         Interleaved,
     }
 
+    /// <summary>How a conversation's spoken reply in a language is made (<see cref="ISpeechOutputModel.SpeechReplyPathFor"/>).</summary>
+    public enum SpeechReplyPath
+    {
+        /// <summary>The model speaks in the reply itself: its speech modes (<see cref="SpeechReplyMode.Audio"/>,
+        /// <see cref="SpeechReplyMode.Interleaved"/>) speak the language.</summary>
+        Direct,
+
+        /// <summary>The reply is generated as text, and each sentence is spoken by the model's TTS prompt as it completes:
+        /// the model's speech modes do not speak the language, its TTS does (LFM3-Omni's speak English only).</summary>
+        Synthesized,
+    }
+
     /// <summary>How one reply speaks.</summary>
     public sealed class SpeechReplyOptions
     {
@@ -86,6 +98,17 @@ namespace TensorSharp.Models.Audio
 
         /// <summary>The token appended to a conversation's generation prompt to force <paramref name="mode"/>, or -1 (none).</summary>
         int SpeechOpeningToken(SpeechReplyMode mode);
+
+        /// <summary>
+        /// The language (a code) to speak <paramref name="text"/> in: <paramref name="preferred"/> where the text's script
+        /// suits it, else the language the text's script names (Chinese characters: <c>zh</c>, kana: <c>ja</c>, ...), else
+        /// <paramref name="preferred"/>; null when neither says (the model's default). A host asks it for a reply whose request
+        /// names no language (of the user's message) and for each piece of a synthesized reply.
+        /// </summary>
+        string SpeechLanguageOf(string text, string preferred) => preferred;
+
+        /// <summary>How a conversation's reply in <paramref name="language"/> (null: the model's default) speaks.</summary>
+        SpeechReplyPath SpeechReplyPathFor(string language) => SpeechReplyPath.Direct;
 
         /// <summary>A driver for one reply whose prompt is <paramref name="promptTokens"/> (its last token picks the starting
         /// mode). The caller disposes it after the request.</summary>

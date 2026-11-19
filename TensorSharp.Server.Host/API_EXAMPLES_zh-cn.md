@@ -1334,7 +1334,9 @@ system/工具前缀）。
 
 `voices` 中第一个是默认声音；`available` 为 false 时 `reason` 说明原因（模型没有语音输出，或 LFM3-Omni
 未加载其 mmproj）。用 `speech` 请求语音回复：`true`（默认声音），或 `{"voice": "...", "language": "..."}`
-（两者均可省略；`language` 是 `en`、`fr` 这样的语言代码，会写入系统提示中的那一行）。
+（两者均可省略；`language` 是语音的语言代码，如 `en`、`zh`、`fr`；省略时取用户最后一条消息按文字判断出的语言，拉丁字母
+即英语）。LFM3-Omni 的交错语音只会说英语，因此其他语言的回复按普通文本回复生成，每句话一完成就由其 TTS 说出（下面的帧
+形式相同；markdown、表情符号与代码不会朗读）。
 
 ```bash
 curl -N -X POST http://localhost:5000/api/chat \

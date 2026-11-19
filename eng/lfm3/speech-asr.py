@@ -64,7 +64,7 @@ def edit_distance(a, b):
 def transcribe(llama_bin, lm, mmproj, wav, lang):
     system = "Perform ASR in %s." % LANGUAGES.get(lang, "English")
     out = subprocess.run([os.path.join(llama_bin, "llama-mtmd-cli"), "-m", lm, "--mmproj", mmproj, "--audio", wav, "-sys", system,
-                          "-p", "<__media__>", "--temp", "0", "-n", "256", "-ngl", "99"],
+                          "-p", "<__media__>", "--temp", "0", "-n", "1024", "-ngl", "99"],
                          capture_output=True, text=True, timeout=600)
     text = out.stdout
     marker = text.rfind("<think></think>")

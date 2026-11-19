@@ -252,7 +252,9 @@ speech chunks as they arrive (the audio starts from the tap that sends, as WebKi
 through the app's save picker like a picture's **Download**. The WAV is saved with the conversation
 and plays again when it is reopened, and the next turn carries the reply back by its id, so the
 host reuses its cached prompt. A spoken reply runs without reasoning, tools or skills, and says so
-under the answer. See [API_EXAMPLES.md → Spoken replies](../TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni).
+under the answer. It speaks the language the message is written in: LFM3-Omni's interleaved speech
+is English only, so a reply to a message in Chinese (or Japanese, Korean, ...) is the ordinary text
+reply, each sentence spoken by the model's TTS as it completes. See [API_EXAMPLES.md → Spoken replies](../TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni).
 
 What is shared is the API, not the document. The routes under the page —
 `/api/chat`, `/api/models`, `/api/sessions`, `/api/upload`, `/api/skills`,

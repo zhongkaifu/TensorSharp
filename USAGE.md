@@ -3050,11 +3050,21 @@ row (no LM head when no request of the step needs logits), so speech and text re
 | CLI `--tts` | Speak `--prompt` with the GGUF's `tts` template; write `--output` (WAV, 24 kHz mono 16-bit). A chat model that speaks synthesizes only with `--tts`. |
 | CLI `--speech-out FILE` | Speak a single-prompt chat reply too; `--speech-mode interleaved` (default: 6 text tokens, then 12 frames, ...; the text is the transcript) or `audio`. |
 | CLI `--speech-temperature T` | The speech codes' temperature (default the mmproj's, 0.4); text keeps `--temperature`. |
-| CLI `--voice female\|male`, `--language CODE`, `--seed N` | The voice and language named in the system prompt; the speech sampler's seed. |
-| `POST /v1/audio/speech` | `input`, `voice` (`female`/`male`; anything else, OpenAI's default `alloy` included, is a 400 listing the voices), `language`, `response_format` `wav`/`pcm`/`pcm16`, `stream: true` (chunked; a WAV stream starts with an unknown-length header) or `stream_format: "audio"`/`"sse"`, `seed`, `temperature`, `max_frames`. `speed` other than 1 is a 400. |
+| CLI `--voice female\|male`, `--language CODE`, `--seed N` | The voice and language named in the system prompt (default language: the one the text is written in, see below); the speech sampler's seed. |
+| `POST /v1/audio/speech` | `input`, `voice` (`female`/`male`; anything else, OpenAI's default `alloy` included, is a 400 listing the voices), `language` (default: the language `input` is written in), `response_format` `wav`/`pcm`/`pcm16`, `stream: true` (chunked; a WAV stream starts with an unknown-length header) or `stream_format: "audio"`/`"sse"`, `seed`, `temperature`, `max_frames`. `speed` other than 1 is a 400. |
 | `POST /v1/chat/completions`, `POST /v1/responses` | `"modalities": ["text","audio"]` (interleaved: the text is the transcript; the conversational mode) or `["audio"]` (speech only, opened with `<|audio_start|>`: LFM3-Omni then reads the user's message aloud rather than answering, as in llama.cpp), with `"audio": {"voice": "female", "format": "wav"\|"pcm16"}` (TensorSharp also reads `language`, `seed`, `temperature` there). Non-streaming: `message.audio = {id, expires_at, data, transcript}`; streaming (pcm16 only): `delta.audio` `id`, then `transcript` and `data` pieces in order, then `expires_at`. Sending the reply back as `{"role":"assistant","audio":{"id":...}}` renders it as its transcript for an hour. |
 | `GET /v1/models` | A model that speaks lists `"capabilities": ["chat","audio_output"]` and its voices. |
 | `POST /api/chat` (the Web UI, TensorAgent) | `"speech": true` or `{"voice": ..., "language": ...}`: an interleaved reply with thinking off, its transcript in `token` frames and its speech in `audio` frames (base64 PCM16 at `sampleRate`) between them, and a `done` frame with `audioId`, `audioUrl` (the whole reply's WAV under `/uploads/`) and `audioSeconds`. Skills, tools and knowledge lookups do not run in a spoken turn (a `notice` frame says so). `GET /api/models` reports `speechOutput: {available, voices, reason}`; the pages show a **Speak replies** switch only when it is available, play the reply as it arrives, and keep a player and a download. See [API_EXAMPLES.md → Spoken replies](TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni). |
+
+**Languages.** LFM3-Omni's interleaved and audio modes speak English only; its TTS speaks all of ar, da, de, el,
+en (en-us, en-gb), es, fi, fr, he, it, ja, ko, nl, pl, pt, sv, tr and zh. A spoken reply's language is the request's
+`language` (`speech.language`, `audio.language`, `--language`), else the one the user's latest message is written in
+(Chinese characters zh, kana ja, Hangul ko, Arabic, Hebrew, Greek; Latin letters: English). An English reply speaks
+in the reply itself; a reply in any other language is generated as an ordinary text reply and each sentence is
+spoken by the TTS prompt as soon as it is complete, while the rest is still being generated (markdown, emoji and code
+are not read aloud). Name `language` for a Latin-script language other than English (`fr`, `de`, `es`, ...) or for a
+spoken question. TTS without a language speaks the language its text is written in, and reads the numerals of Chinese
+text out (`2024年10月1日` as 二零二四年十月一日).
 
 Text replies of LFM3-Omni never sample the media placeholders, and a text-only reply never opens speech
 (`<|audio_start|>`, `<|mixed_start|>` are banned), as the model card's `generate` does. A spoken assistant turn

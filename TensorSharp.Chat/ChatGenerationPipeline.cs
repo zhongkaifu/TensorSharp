@@ -314,7 +314,7 @@ namespace TensorSharp.Server
         public string? OperationName { get; set; } = TelemetryAttributes.OperationChat;
     }
 
-    internal sealed class ChatGenerationPipeline : IDisposable
+    internal sealed partial class ChatGenerationPipeline : IDisposable
     {
         private readonly ModelLifecycleService _lifecycle;
         private readonly InferenceEngineHost _engineHost;
