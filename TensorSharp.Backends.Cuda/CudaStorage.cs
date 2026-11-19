@@ -577,6 +577,33 @@ namespace TensorSharp.Cuda
             throw new NotSupportedException("CUDA storage currently supports TensorSharp Float32/Float64/Int32/UInt8 host access.");
         }
 
+        /// <summary>The elements written to the host mirror and, on the allocator's stream after its earlier work, to the device
+        /// copy, when both copies are current: the storage stays current, so its next device use uploads nothing. Otherwise
+        /// (a pending host write or device write, or no mirror yet) as <see cref="SetElementsAsFloat"/>.</summary>
+        public override void PatchElementsAsFloat(long index, float[] value)
+        {
+            if (value == null)
+                throw new ArgumentNullException(nameof(value));
+            if (ElementType != DType.Float32)
+                throw new NotSupportedException("Element type " + ElementType + " not supported");
+            ValidateElementRange(index, value.Length);
+            lock (sync)
+            {
+                if (hostDirty || deviceDirty || hostBuffer == IntPtr.Zero || value.Length == 0)
+                {
+                    SetElementsAsFloat(index, value);
+                    return;
+                }
+                IntPtr host = HostPtrAtElementUnchecked(index);
+                value.AsSpan().CopyTo(new Span<float>(host.ToPointer(), value.Length));
+                CudaGraphCapture.OnCapturedHostUpload(AllocatorImpl, (long)value.Length * sizeof(float));
+                AllocatorImpl.Context.MakeCurrent();
+                // From the mirror, which keeps these bytes until a later write of the same elements (a later copy then).
+                CudaDriverApi.cuMemcpyHtoDAsync(DevicePtrAtElement(index), host, new UIntPtr((ulong)value.Length * sizeof(float)),
+                    AllocatorImpl.Stream.Handle).ThrowOnError();
+            }
+        }
+
         public override void CopyToStorage(long storageIndex, IntPtr src, long byteCount)
         {
             if (src == IntPtr.Zero && byteCount > 0)

@@ -128,6 +128,41 @@ public class CudaBackendTests
         Assert.True(storage.IsHostDirty);
     }
 
+    [CudaFact]
+    public void CudaStorage_PatchedElements_ReachBothCopiesWithoutQueueingAWholeUpload()
+    {
+        // A recorded verify step's decode mask opens a few cells a row: patched on both copies, the storage stays current
+        // (no whole upload before the launch), and the device reads the patched values in order with earlier work.
+        using var allocator = new CudaAllocator();
+        using var tensor = new Tensor(allocator, DType.Float32, 4, 8);
+        var storage = (CudaStorage)tensor.Storage;
+        FillSequential(tensor, scale: 1f, offset: 0f);
+        storage.EnsureDeviceCurrent();
+        Assert.False(storage.IsHostDirty);
+
+        storage.PatchElementsAsFloat(9, new[] { -1f, -2f, -3f });
+        Assert.False(storage.IsHostDirty);                 // nothing queued
+        using (var doubled = new Tensor(allocator, DType.Float32, 4, 8))
+        {
+            Ops.Mul(doubled, tensor, 2f);                  // a device read
+            float[] device = doubled.GetElementsAsFloat(32);
+            for (int i = 0; i < 32; i++)
+                Assert.Equal(2f * (i is >= 9 and <= 11 ? -(i - 8) : i), device[i]);
+        }
+        Assert.Equal(-2f, tensor.GetElementsAsFloat(32)[10]);   // the host mirror holds them too
+
+        // A pending host write: the patch joins it and the whole mirror goes up before the next device use.
+        tensor.SetElementsAsFloat(new[] { 7f }, 0, 0);
+        Assert.True(storage.IsHostDirty);
+        storage.PatchElementsAsFloat(20, new[] { 5f });
+        Assert.True(storage.IsHostDirty);
+        Ops.Mul(tensor, tensor, 1f);
+        float[] after = tensor.GetElementsAsFloat(32);
+        Assert.Equal(7f, after[0]);
+        Assert.Equal(5f, after[20]);
+        Assert.Equal(-1f, after[9]);
+    }
+
     [CudaTheory]
     // (rows, wide, narrow) — narrow < wide forces a strided source row pitch, so
     // NewContiguous hits the 2D strided-copy kernel (ts_copy2d_bytes) rather than
