@@ -522,6 +522,23 @@ public sealed class DiffusionPipelineTests
     }
 
     [Fact]
+    public void AFullMaskIsAnUnmaskedEditReturnedOnTheSourceCanvas()
+    {
+        var family = new FakeFamily();
+        RgbImage source = Picture(32, 16, (x, y) => (x + y) / 48f);
+        var reference = new[] { new DiffusionReference(source) };
+        using (var pipeline = Pipeline(family))
+            pipeline.Run(new DiffusionRequest { Seed = 3, References = reference, Mask = new EditMaskOptions { Mask = Picture(32, 16, (_, _) => 1f) } });
+        float[] masked = family.Vae.LastDecoded.Data;
+        // No source encode beyond the reference's own and no reinjection: the same latent as the unmasked edit.
+        Assert.Single(family.Events, e => e.StartsWith("encode"));
+        var plain = new FakeFamily();
+        using (var pipeline = Pipeline(plain))
+            pipeline.Run(new DiffusionRequest { Seed = 3, References = reference });
+        Assert.Equal(Bits(plain.Vae.LastDecoded.Data), Bits(masked));
+    }
+
+    [Fact]
     public void AMaskWithoutAPictureIsRefused()
     {
         using var pipeline = Pipeline(new FakeFamily());
