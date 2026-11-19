@@ -25,7 +25,7 @@ namespace TensorSharp.Models
     /// process does not burn cores, and the park happens under the same lock the
     /// submitter pulses so a wakeup can never be missed.
     /// </summary>
-    internal sealed class CpuWorkerPool : IDisposable
+    internal sealed partial class CpuWorkerPool : IDisposable
     {
         private static readonly Lazy<CpuWorkerPool> SharedPool = new(() => new CpuWorkerPool(DefaultThreadCount()));
         public static CpuWorkerPool Shared => SharedPool.Value;
@@ -48,6 +48,16 @@ namespace TensorSharp.Models
         // glue and the pre-existing per-model loops. ThreadCount is still why the
         // pool deliberately does NOT take every core (see DefaultThreadCountFor).
         private static readonly int SpinsBeforePark = EnvInt("TS_CPU_SPIN", 4096);
+
+        /// <summary>
+        /// Completion polls a submitter takes, a pause instruction apart, before <see cref="SpinWait"/>'s yields: after its
+        /// own blocks the submitter waits for the other threads' last ones, and a job of a decode step lasts tens of
+        /// microseconds. SpinWait yields the thread from its eleventh round on (a <c>swtch_pri</c> system call on macOS),
+        /// which on its own measured 30-40 % of a decoding submitter's samples, and returns well after the job is done; 2,000
+        /// polls is some 0.1 ms, past which a long job's wait yields as before. LFM3-1.7B Q4_K_M on an M5 Pro, 16-thread
+        /// decode, tg128 at depth 0 / 1,024: 138.9 / 128.2 tok/s yielding at once, 142.5 / 130.6 polling (4 interleaved rounds).
+        /// </summary>
+        private const int JoinPolls = 2000;
 
         /// <summary>
         /// Stack reserved for each worker. Smaller than a ThreadPool thread's, and running out of
@@ -94,14 +104,22 @@ namespace TensorSharp.Models
         private Exception _error;
         private volatile bool _shutdown;
 
+        // The workers that take a job's blocks: worker i does while i < _activeWorkers (the submitter always does). A
+        // worker past them that sees a job parks on _narrowLock until the width grows (SetActiveThreads), so a narrowed
+        // pool leaves its cores to other threads - a server's - instead of spinning on them.
+        private int _activeWorkers;
+        private readonly object _narrowLock = new object();
+
         internal CpuWorkerPool(int totalThreads)
         {
             if (totalThreads < 1 || totalThreads > 512) throw new ArgumentOutOfRangeException(nameof(totalThreads));
             _workers = Math.Max(0, totalThreads - 1);
+            _activeWorkers = _workers;
             _threads = new Thread[_workers];
             for (int i = 0; i < _workers; i++)
             {
-                var t = new Thread(WorkerLoop, WorkerStackBytes)
+                int index = i;
+                var t = new Thread(() => WorkerLoop(index), WorkerStackBytes)
                 {
                     IsBackground = true,
                     Name = "ts-cpu-" + i,
@@ -112,6 +130,7 @@ namespace TensorSharp.Models
                 {
                     _shutdown = true;
                     lock (_sleepLock) Monitor.PulseAll(_sleepLock);
+                    lock (_narrowLock) Monitor.PulseAll(_narrowLock);
                     for (int started = 0; started < i; ++started) _threads[started].Join();
                     throw;
                 }
@@ -156,8 +175,97 @@ namespace TensorSharp.Models
         internal static int DefaultThreadCountFor(int processors, bool oneThreadPerCore = false)
             => processors <= 8 || oneThreadPerCore ? Math.Max(1, processors) : Math.Max(8, processors / 2);
 
-        /// <summary>Threads that will run a job, including the submitting one.</summary>
+        /// <summary>Rows of a step's weight products up to which the step is decode-sized (one sequence's token, or a few
+        /// sequences' tokens in one step), as ggml_cpu splits its prompt and decode pools.</summary>
+        internal const int DecodeRows = 4;
+
+        private static readonly Lazy<int> DecodeThreadsValue = new(() =>
+        {
+            int pool = Shared.ThreadCount;
+            int.TryParse(Environment.GetEnvironmentVariable("TS_CPU_DECODE_THREADS"), out int forced);
+            bool poolForced = int.TryParse(Environment.GetEnvironmentVariable("TS_CPU_THREADS"), out int n) && n > 0;
+            (int perf, int eff) = HybridMacCores();
+            return DecodeThreadCountFor(pool, forced, poolForced, perf, eff);
+        });
+
+        /// <summary>Width of the shared pool on decode-sized steps (<see cref="DecodeThreadCountFor"/>).</summary>
+        internal static int DecodeThreads => DecodeThreadsValue.Value;
+
+        /// <summary>
+        /// The shared pool's width on decode-sized steps: <paramref name="forced"/> (TS_CPU_DECODE_THREADS) when set, else the
+        /// pool's width when TS_CPU_THREADS sets it (as <c>llama-bench -t</c> sets both counts), else on a Mac with
+        /// performance and efficiency cores (<c>hw.perflevel0</c> / <c>hw.perflevel1</c>) every core but two, never fewer
+        /// than the performance cores, else the pool's width. A decode step is a few hundred small jobs whose last block
+        /// ends each one, so a pool worker on every core loses a core to every other runnable thread of the process at
+        /// every join - a server's request, streaming and scheduling threads.
+        /// </summary>
+        internal static int DecodeThreadCountFor(int poolThreads, int forced, bool poolForced, int perfCores, int effCores)
+        {
+            if (forced > 0) return Math.Min(forced, poolThreads);
+            if (poolForced) return poolThreads;
+            if (perfCores > 0 && effCores > 0) return Math.Clamp(poolThreads - 2, Math.Min(perfCores, poolThreads), poolThreads);
+            return poolThreads;
+        }
+
+        /// <summary>Performance and efficiency core counts of a Mac (macOS or Mac Catalyst), (0, 0) elsewhere or when
+        /// the system does not report them.</summary>
+        private static (int Perf, int Eff) HybridMacCores()
+        {
+            if (!(OperatingSystem.IsMacOS() || OperatingSystem.IsMacCatalyst())) return (0, 0);
+            try { return (SysctlInt("hw.perflevel0.physicalcpu"), SysctlInt("hw.perflevel1.physicalcpu")); }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException) { return (0, 0); }
+        }
+
+        private static unsafe int SysctlInt(string name)
+        {
+            int value = 0;
+            nuint length = sizeof(int);
+            return sysctlbyname(name, &value, &length, null, 0) == 0 ? value : 0;
+        }
+
+        [System.Runtime.InteropServices.LibraryImport("libc", EntryPoint = "sysctlbyname",
+            StringMarshalling = System.Runtime.InteropServices.StringMarshalling.Utf8)]
+        private static unsafe partial int sysctlbyname(string name, void* value, nuint* length, void* newValue, nuint newLength);
+
+        /// <summary>
+        /// Run the shared pool at its decode width (<see cref="DecodeThreads"/>) or its full width from the next job on: an
+        /// executor calls it once a step, at the step's first weight product (<paramref name="productRows"/> rows, decode-sized
+        /// up to <see cref="DecodeRows"/>). Nothing under TS_CPU_POOL=0 (no pool to narrow).
+        /// </summary>
+        internal static void SelectWidthForStep(long productRows)
+        {
+            if (!CpuWorkers.PoolEnabled) return;
+            CpuWorkerPool pool = Shared;
+            pool.SetActiveThreads(productRows <= DecodeRows ? DecodeThreads : pool.ThreadCount);
+        }
+
+        /// <summary>Threads the pool has, the submitting one included: what kernels size their task splits from. A
+        /// narrowed pool (<see cref="ActiveThreads"/>) keeps this figure. The ARM64 products' shrinking column blocks
+        /// (ManagedQuantizedOps.GuidedBounds) follow <see cref="ActiveThreads"/> instead; they move only which thread
+        /// computes a column, never how, so no result depends on the width a step runs at.</summary>
         public int ThreadCount => _workers + 1;
+
+        /// <summary>Threads that run a job's blocks now, the submitting one included (<see cref="SetActiveThreads"/>).</summary>
+        public int ActiveThreads => Volatile.Read(ref _activeWorkers) + 1;
+
+        /// <summary>
+        /// Run the following jobs on <paramref name="threads"/> threads (the submitting one included; clamped to
+        /// [1, <see cref="ThreadCount"/>]). The workers past the width park as soon as they see a job and stay parked until
+        /// a wider setting wakes them, so their cores are free for other threads; a worker that is mid-block finishes it.
+        /// The pool runs the blocks it is given at any width - only which threads claim them changes; a kernel that sizes
+        /// its blocks from <see cref="ActiveThreads"/> keeps each output's arithmetic independent of its block. Meant
+        /// to change at step boundaries (a decode step narrower than a prompt step), not per job: widening wakes parked
+        /// threads through the kernel.
+        /// </summary>
+        public void SetActiveThreads(int threads)
+        {
+            int workers = Math.Clamp(threads, 1, _workers + 1) - 1;
+            int previous = Interlocked.Exchange(ref _activeWorkers, workers);
+            if (workers > previous)
+            {
+                lock (_narrowLock) Monitor.PulseAll(_narrowLock);
+            }
+        }
 
         /// <summary>
         /// Run <paramref name="body"/> for every block index in [0, blockCount)
@@ -171,7 +279,7 @@ namespace TensorSharp.Models
             // Nested calls, and a job already in flight, both run inline: this is
             // a flat one-job-at-a-time pool, and recursing into it would either
             // deadlock or oversubscribe.
-            if (blockCount == 1 || _workers == 0 || _inJob || !Monitor.TryEnter(_submitLock))
+            if (blockCount == 1 || Volatile.Read(ref _activeWorkers) == 0 || _inJob || !Monitor.TryEnter(_submitLock))
             {
                 bool wasInJob = _inJob;
                 _inJob = true;
@@ -208,6 +316,7 @@ namespace TensorSharp.Models
 
                 RunBlocks(body, start, end);
 
+                for (int poll = 0; poll < JoinPolls && Volatile.Read(ref _done) != end; poll++) Thread.SpinWait(1);
                 var spin = new SpinWait();
                 while (Volatile.Read(ref _done) != end) spin.SpinOnce(-1);
 
@@ -259,6 +368,7 @@ namespace TensorSharp.Models
                 if (_shutdown) return;
                 _shutdown = true;
                 lock (_sleepLock) Monitor.PulseAll(_sleepLock);
+                lock (_narrowLock) Monitor.PulseAll(_narrowLock);
                 foreach (var thread in _threads) thread.Join();
             }
         }
@@ -334,7 +444,7 @@ namespace TensorSharp.Models
             }
         }
 
-        private void WorkerLoop()
+        private void WorkerLoop(int index)
         {
             // No generation seen yet: a worker that starts while a job is in flight joins it.
             long seen = -1;
@@ -347,7 +457,26 @@ namespace TensorSharp.Models
                 if (gen != seen)
                 {
                     seen = gen;
-                    if (TryReadJob(out Action<int> body, out long start, out long end))
+                    // Past the active width (SetActiveThreads): park until the width grows. The job is read FIRST and the
+                    // width after it: the submitter writes the width before it publishes a job (an interlocked write, then
+                    // the job's sequence increments, full fences), so a worker that read a job published after a narrowing
+                    // reads the narrowing too and leaves that job's blocks to the others. (Read before the job, the width
+                    // could predate a narrowing whose job was published after the generation this worker saw: one job's
+                    // blocks then went to a parked-to-be worker.)
+                    bool haveJob = TryReadJob(out Action<int> body, out long start, out long end);
+                    if (index >= Volatile.Read(ref _activeWorkers))
+                    {
+                        body = null;   // a parked worker holds no job's delegate (or what it captured)
+                        lock (_narrowLock)
+                        {
+                            while (index >= Volatile.Read(ref _activeWorkers) && !_shutdown)
+                                Monitor.Wait(_narrowLock);
+                        }
+                        seen = -1;   // join whatever job is in flight when it wakes
+                        spins = 0;
+                        continue;
+                    }
+                    if (haveJob)
                         RunBlocks(body, start, end);
                     spins = 0;
                     continue;

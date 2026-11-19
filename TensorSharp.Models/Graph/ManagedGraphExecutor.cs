@@ -44,6 +44,32 @@ namespace TensorSharp.Models.Graph
 
         public ManagedGraphExecutor(IAllocator allocator) : base(allocator) { }
 
+        // Whether this run (one step) has set the worker pool's width yet: its first weight product does (decode-sized
+        // steps run narrower, see CpuWorkerPool.SelectWidthForStep). A step without weight products keeps the width it finds.
+        private bool _stepWidthSet;
+
+        protected override void BeginRun()
+        {
+            base.BeginRun();
+            _stepWidthSet = false;
+        }
+
+        /// <summary>The step's first weight product picks the worker pool's width for the rest of the step (and after it,
+        /// until a step picks again): a later product of other rows in the same step - an expert's few routed rows, the pruned
+        /// last layer's output rows - does not switch it.</summary>
+        private void SetStepWidth(long rows)
+        {
+            if (_stepWidthSet) return;
+            _stepWidthSet = true;
+            CpuWorkerPool.SelectWidthForStep(rows);
+        }
+
+        protected override void DenseProduct(Tensor result, Tensor rows, Tensor weight)
+        {
+            SetStepWidth(rows.Sizes[0]);
+            base.DenseProduct(result, rows, weight);
+        }
+
         /// <summary>The base executor's capabilities, and a decode row's recurrence updates the slot's state in place (see
         /// <see cref="GatedDeltaNet"/>); decode steps replay their program a position on over windows padded to
         /// <see cref="DecodeWindowRows"/> rows, whose unwritten keys the attention stops before (see <see cref="FlashAttention"/>).</summary>
@@ -628,6 +654,7 @@ namespace TensorSharp.Models.Graph
             if (weight.Data == IntPtr.Zero)
                 throw new InvalidOperationException("a quantized weight's host bytes were released");
             int rows = (int)x.Sizes[0];
+            SetStepWidth(rows);
             var result = new Tensor(Allocator, DType.Float32, rows, weight.Ne1);
             ManagedQuantizedOps.AddmmQuantizedToFloat32(weight.Format, weight.Data, weight.Ne0, weight.Ne1,
                 TensorComputePrimitives.GetFloatPointer(x), (int)weight.Ne0, rows,

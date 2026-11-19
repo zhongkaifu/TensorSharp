@@ -164,6 +164,18 @@ namespace TensorSharp.Models
                     long colBlocks = Math.Clamp((wantTasks + rowBlocks - 1) / rowBlocks, 1, groups);
                     int groupsPerBlock = (int)((groups + colBlocks - 1) / colBlocks);
                     int colBlockCount = (groups + groupsPerBlock - 1) / groupsPerBlock;
+                    // On the shared pool, shrinking column blocks (GemmGroupBounds) no smaller than the equal split's
+                    // floor: the larger of a task's MACs and weight bytes reaching QGemmWantTasks' sizes. Row tiles still
+                    // start at the row block's first row and columns at their group's, so no output's arithmetic moves.
+                    int[] groupBounds = null;
+                    if (GuidedSplits && options == null && colBlockCount > 1 && dop > 1)
+                    {
+                        long tileMacs = 4L * Math.Min(rowCount, rowsPerBlock) * inDim;
+                        long perTaskBytes = Math.Max(MinBytesPerParallelTaskFloor, MinBytesPerParallelTask / Math.Clamp(rowCount, 1, 8));
+                        long minGroups = Math.Min((QGemmMinTaskMacs + tileMacs - 1) / tileMacs, (perTaskBytes + 4L * rowBytes - 1) / (4L * rowBytes));
+                        groupBounds = GemmGroupBounds(groups, (int)Math.Clamp(minGroups, 1, groups), CpuWorkerPool.Shared.ActiveThreads);
+                        colBlockCount = groupBounds.Length - 1;
+                    }
 
                     nint w = weights, a = (nint)act, o = (nint)output;
                     int outStride = outputRowStride;
@@ -171,7 +183,9 @@ namespace TensorSharp.Models
                     void RunTask(int t)
                     {
                         int cb = t % colBlockCount, rb = t / colBlockCount;
-                        int g0 = cb * groupsPerBlock, g1 = Math.Min(groups, g0 + groupsPerBlock);
+                        int g0, g1;
+                        if (groupBounds != null) { g0 = groupBounds[cb]; g1 = groupBounds[cb + 1]; }
+                        else { g0 = cb * groupsPerBlock; g1 = Math.Min(groups, g0 + groupsPerBlock); }
                         int r0 = rb * rowsPerBlock, r1 = Math.Min(rowCount, r0 + rowsPerBlock);
                         byte* scratch = ArmGemmScratch(scratchBytes);
                         for (int g = g0; g < g1; g++)

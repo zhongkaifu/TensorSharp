@@ -490,6 +490,73 @@ namespace TensorSharp.Models
                 ? v
                 : fallback;
 
+        /// <summary>
+        /// ARM64 products split their columns into shrinking blocks (<see cref="GuidedBounds"/>) instead of equal ones: a
+        /// decode row's matvec (<see cref="DecodeColumnBounds"/>) and the multi-row GEMMs (<see cref="GemmGroupBounds"/>).
+        /// Equal blocks, a few a thread, made a job on cores of unequal speed (Apple's 6 + 12) last as long as its slowest
+        /// core's last block. Which thread computes a column changes, not how, so the results are the same bits. Elsewhere
+        /// (x86, not measured) the equal blocks stay.
+        /// </summary>
+        private static readonly bool GuidedSplits =
+            CpuWorkers.PoolEnabled && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
+
+        /// <summary>Smallest decode block: 16 KB of weight rows (a few microseconds of reading).</summary>
+        private const int DecodeBlockMinBytes = 16 * 1024;
+
+        /// <summary>
+        /// Guided self-scheduling: bounds [0, b1, ..., <paramref name="units"/>] of blocks that each take a 1 / (2 x
+        /// <paramref name="threads"/>) share of the units not yet handed out, at least <paramref name="minUnits"/> (the last
+        /// block may be smaller), so the blocks shrink as the work runs out. The pool claims blocks in index order, so the
+        /// large ones go first and the faster cores take the small ones at the end.
+        /// </summary>
+        internal static int[] GuidedBounds(int units, int minUnits, int threads)
+        {
+            minUnits = Math.Max(1, minUnits);
+            long divisor = 2L * Math.Max(1, threads);
+            var bounds = new System.Collections.Generic.List<int> { 0 };
+            int at = 0;
+            while (at < units)
+            {
+                long size = Math.Max(minUnits, (units - at + divisor - 1) / divisor);
+                at = (int)Math.Min(units, at + size);
+                bounds.Add(at);
+            }
+            return bounds.ToArray();
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int OutDim, int RowBytes, int Threads), int[]> s_decodeBounds = new();
+
+        /// <summary>
+        /// Column block boundaries [0, b1, ..., outDim] for a decode-sized product on <paramref name="threads"/> threads:
+        /// <see cref="GuidedBounds"/> over four-column groups (the four-row matvec's), each block at least
+        /// <see cref="DecodeBlockMinBytes"/> of weights. Their weights are 2-18 MB (LFM3-1.7B's out_proj to its fused
+        /// gate|up), which the equal split cut into as few as 18 blocks, one a thread. LFM3-1.7B Q4_K_M on an M5 Pro,
+        /// 16-thread decode with the submitter polling (<see cref="CpuWorkerPool"/>), tg128 at depth 0 / 1,024: 142.5 /
+        /// 130.6 tok/s with the equal blocks, 143.6 / 134.1 with these (4 interleaved rounds). Cached per shape and width.
+        /// </summary>
+        internal static int[] DecodeColumnBounds(int outDim, int rowBytes, int threads)
+            => s_decodeBounds.GetOrAdd((outDim, rowBytes, Math.Max(1, threads)), static key =>
+            {
+                int groups = (key.OutDim + 3) / 4;
+                int minGroups = (int)Math.Max(1, ((long)DecodeBlockMinBytes + 4L * key.RowBytes - 1) / Math.Max(1, 4L * key.RowBytes));
+                int[] bounds = GuidedBounds(groups, minGroups, key.Threads);
+                for (int i = 0; i < bounds.Length; i++) bounds[i] = Math.Min(key.OutDim, bounds[i] * 4);
+                return bounds;
+            });
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int Groups, int MinGroups, int Threads), int[]> s_gemmBounds = new();
+
+        /// <summary>
+        /// Four-column-group block boundaries for a multi-row ARM64 product (<see cref="TryQGemmArm"/>, <see cref="TryBf16Arm"/>)
+        /// on the shared pool's active threads: <see cref="GuidedBounds"/> with blocks no smaller than the equal split's task
+        /// size floor (<paramref name="minGroups"/>). The equal split handed out four blocks a thread; at a 128-token prompt
+        /// some 17 % of the submitting thread's time waited in the pool's join for the last of them (a sample profile of
+        /// LFM3-1.7B Q4_K_M, M5 Pro). Cached per group count, floor and width.
+        /// </summary>
+        private static int[] GemmGroupBounds(int groups, int minGroups, int threads)
+            => s_gemmBounds.GetOrAdd((groups, Math.Clamp(minGroups, 1, Math.Max(1, groups)), Math.Max(1, threads)),
+                static key => GuidedBounds(key.Groups, key.MinGroups, key.Threads));
+
         /// <summary>Columns per parallel task: enough weight bytes per task to
         /// amortize the dispatch, and never more tasks than workers.</summary>
         private static int ParallelColumnBlock(long outDim, long rowBytes, int rowCount, int dop)
@@ -979,10 +1046,18 @@ namespace TensorSharp.Models
                         // Blocked ranges: per-column tasks make the scheduler
                         // overhead comparable to the ~0.5-2us dot itself and cap
                         // scaling at a handful of cores.
-                        int colBlock = ParallelColumnBlock(outDim, weightRowBytes, rowCount, dop);
-                        int nBlocks = (outDim + colBlock - 1) / colBlock;
-                        RunParallelBlocks(nBlocks, options, b =>
-                            ComputeColumnRange(b * colBlock, Math.Min(outDim, b * colBlock + colBlock)));
+                        if (GuidedSplits && rowCount <= CpuWorkerPool.DecodeRows && options == null)
+                        {
+                            int[] bounds = DecodeColumnBounds(outDim, weightRowBytes, CpuWorkerPool.Shared.ActiveThreads);
+                            RunParallelBlocks(bounds.Length - 1, options, b => ComputeColumnRange(bounds[b], bounds[b + 1]));
+                        }
+                        else
+                        {
+                            int colBlock = ParallelColumnBlock(outDim, weightRowBytes, rowCount, dop);
+                            int nBlocks = (outDim + colBlock - 1) / colBlock;
+                            RunParallelBlocks(nBlocks, options, b =>
+                                ComputeColumnRange(b * colBlock, Math.Min(outDim, b * colBlock + colBlock)));
+                        }
                     }
                     else
                     {

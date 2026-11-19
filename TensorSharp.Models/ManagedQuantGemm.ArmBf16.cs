@@ -71,6 +71,16 @@ namespace TensorSharp.Models
             int colBlock = ParallelColumnBlock(outDim, rowBytes, rowCount, dop);
             int groupsPerBlock = Math.Max(1, (colBlock + 3) / 4);
             int blocks = (groups + groupsPerBlock - 1) / groupsPerBlock;
+            if (GuidedSplits && options == null && blocks > 1)
+            {
+                // Shrinking blocks on the shared pool (GemmGroupBounds), none smaller than the equal split's weight-byte
+                // floor; a group's tiles do not depend on its block, so the bits do not either.
+                long perTaskBytes = Math.Max(MinBytesPerParallelTaskFloor, MinBytesPerParallelTask / Math.Clamp(rowCount, 1, 8));
+                int minGroups = (int)Math.Clamp((perTaskBytes + 4 * rowBytes - 1) / (4 * rowBytes), 1, groups);
+                int[] bounds = GemmGroupBounds(groups, minGroups, CpuWorkerPool.Shared.ActiveThreads);
+                RunParallelBlocks(bounds.Length - 1, options, b => RunGroups(bounds[b], bounds[b + 1]));
+                return true;
+            }
             RunParallelBlocks(blocks, options, b => RunGroups(b * groupsPerBlock, Math.Min(groups, (b + 1) * groupsPerBlock)));
             return true;
         }

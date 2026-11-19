@@ -2064,6 +2064,7 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
 | 工作线程池宽度（托管 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image 内核） | 8 核及以下取全部核心；8 核以上取一半，且不低于 8；Apple 芯片（无 SMT）取全部核心 | `TS_CPU_THREADS=N` | — |
+| 解码规模步上的工作线程池宽度（权重乘积最多读 4 行激活的步：一条序列的一个 token，或一步里几条序列的 token） | 有性能核与能效核的 Mac（`hw.perflevel0` / `hw.perflevel1`）上取全部核心减二，且不少于性能核数（M5 Pro 上为 16）；其他平台取线程池宽度；只设置 `TS_CPU_THREADS` 时两个宽度都取它 | `TS_CPU_DECODE_THREADS=N` —— 超出这个宽度的工作线程挂起，直到较宽的步到来，这样进程里的其他线程（服务器的请求线程与流式输出线程）能找到空闲核心，而不必在任务进行中抢走某个池内线程的核心；输出不变 | — |
 | 是否启用工作线程池 | 启用 | `TS_CPU_POOL=0` 让所有分派并行任务的托管内核——量化 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的 VAE、文本编码器与视觉塔（VAE 的宽度上限为 `TS_CPU_GEMM_THREADS`）——回退到 ThreadPool 的 `Parallel.For`，用于负担不起自旋线程的主机，也便于在同一个二进制里做 A/B；结果不变。Direct 视频网络的行循环仍在线程池上 | — |
 | 工作线程挂起前的自旋次数 | `4096` | `TS_CPU_SPIN=N` —— 在这个宽度下挂起才是最贵的部分，所以默认自旋次数足够多，使稳态下根本不会挂起 | — |
 | 单次托管矩阵乘的任务切分 | 每个工作项 `131072` 字节权重，每个线程最多 `4` 个工作项 | `TS_CPU_TASK_BYTES`、`TS_CPU_TASKS_PER_WORKER` —— 按**工作量**而不是线程数来切 | — |
