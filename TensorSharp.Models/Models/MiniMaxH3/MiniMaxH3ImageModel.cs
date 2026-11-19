@@ -23,6 +23,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.MiniMaxH3
