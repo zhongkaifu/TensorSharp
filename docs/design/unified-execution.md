@@ -948,6 +948,14 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
   prompt, M5 Pro: 7.3-7.5 s before, 5.79-5.85 s after, `Qwen4ExpModel` 5.69-5.83 s (same text as before);
   Qwen3.5-0.8B perplexity 19.8009 for both paths, Qwen3.6-35B-A3B Q4_K_M 1,825 tokens 1.03 s against
   1.05 s.
+* **Diffusion-transformer regions on GGML (CUDA):** `AdaLnModulate`, `GatedResidual`, `TableRopeQkNorm` (the
+  form that goes on through its attention), `LoraLinear` and a BF16/F16 `SwigluFfn` are served *inside* the
+  graph in a program marked `WideTokenProducts`: the region becomes the DiT offload's `GGML_OP_CUSTOM` node
+  (`ggml_ops_dit_offload.h`, the nodes MiniMax-H3's native DiT builds), in the graph allocator's memory, and
+  `TSGgml_GraphRun` runs the graph through `tsg::dit_offload_compute` (cuDNN attention, the fused nodes, the
+  cuBLAS BF16 / int8 wide products). A served modulation or residual reads its segment table on the host, refilled
+  every run. Programs without the attribute and the other backends run the regions' ops (`GraphDitRegions`, the
+  H3 graph's unfused sequence). See [diffusion-runtime.md](diffusion-runtime.md).
 * **Copies run when forced:** a `Cpy` runs when an effect, an alias or a reader asks for it, as ggml
   schedules it. A streamed step used to run each copy as it was emitted, so an alias's fallback copy ran
   ahead of the alias the executor could have honoured.
