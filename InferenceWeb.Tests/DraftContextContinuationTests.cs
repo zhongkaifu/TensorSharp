@@ -248,6 +248,56 @@ public sealed class DraftContextContinuationTests : IDisposable
         Assert.Equal((0, prompt.Length), model.DFlashRingRunForTests("k0"));
     }
 
+    /// <summary>
+    /// Making room releases conversations and then kept rings only where the two together reach the need (issue #376's
+    /// review: the room check that releases no conversation where releasing them all could not make the room, merged with the
+    /// rings given back after the conversations). Short of more than both free, nothing goes - neither the conversation nor
+    /// the rings and their contexts; short of what both free together, both go and the room is made, where counting the
+    /// conversation alone had kept it and given the rings back for nothing.
+    /// </summary>
+    [Fact]
+    public void ConversationsAndKeptRingsGoOnlyWhereTogetherTheyMakeTheRoom()
+    {
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        var (target, draft) = Fixtures();
+        using var model = new Qwen35RuntimeModel(target, BackendType.Cpu, 1, null, 1, draft);
+        var states = (IPerRequestDraftState)model;
+        var unified = (IUnifiedBatchModel)model;
+        int[] prompt = Enumerable.Range(0, 20).Select(i => 41 + (i * 5) % 19).ToArray();
+        // k0 on the model's own ring, k1 and k2 on pooled ones (the two a room check may give back), kept in that order.
+        for (int r = 0; r < 3; r++)
+            Prefill(model, $"k{r}", prompt, speculates: true);
+        for (int r = 0; r < 3; r++)
+            Assert.Equal(prompt.Length, states.KeepDraftState($"k{r}"));
+        unified.EnsureSequenceSlot("conv", prompt.Length + 32);
+        Assert.True(unified.TryForwardUnified(new[] { "conv" }, new[] { prompt }, new[] { 0 }, new float[1][]));
+        Assert.True(model.RetainSequenceCacheAs("conv", "conv"));
+        Assert.Equal(3, model.DFlashRingCountForTests);
+        long ringBytes = 2L * model.DFlashSettings.NumLayers * model.DFlashSettings.NumKVHeads * model.DFlashRingRowsForTests
+            * model.DFlashSettings.HeadDim * sizeof(float) + model.DFlashSettings.FeatureSize * sizeof(float);
+        const long gb = 1L << 30;
+        // The conversation frees a ring's worth, each ring given back its own.
+        model.RetainedPayloadBytesForTests = _ => ringBytes;
+        model.DeviceRoomForTests = () =>
+            (((model.RetainedPayloadKeys.Count == 0 ? 1 : 0) + 3 - model.DFlashRingCountForTests) * ringBytes, 64 * gb);
+
+        // Four rings' worth short, three in reach: nothing goes.
+        Assert.False(model.EnsureRecordingRoomForTests(4 * ringBytes));
+        Assert.Equal(new[] { "conv" }, model.RetainedPayloadKeys);
+        Assert.Equal(3, model.DFlashRingCountForTests);
+        Assert.Equal(0, model.DeviceRoomStages[4]);
+        Assert.Equal(0, model.DeviceRoomStages[5]);
+        Assert.Equal(1, model.DeviceRoomReleasesSkipped);
+
+        // Three rings' worth short: the conversation and both idle rings go, and the room is made.
+        Assert.True(model.EnsureRecordingRoomForTests(3 * ringBytes));
+        Assert.Empty(model.RetainedPayloadKeys);
+        Assert.Equal(1, model.DFlashRingCountForTests);
+        Assert.Equal(1, model.DeviceRoomStages[5]);
+        Assert.Equal(1, model.DeviceRoomStages[4]);
+        Assert.Equal((0, prompt.Length), model.DFlashRingRunForTests("k0"));
+    }
+
     // ---------------------------------------------------------------- the engine
 
     /// <summary>

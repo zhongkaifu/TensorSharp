@@ -233,13 +233,15 @@ namespace TensorSharp.Models
                     if (buffers) DeviceRoomStages[4]++;
                 }
 
-                // 5. The conversations the prefix cache keeps, the oldest first, where releasing them all could make the room:
-                // short of it they went for nothing (a request beside running ones waits anyway, a lone one runs on its floor,
-                // which RoomUse.SlotFloor then asks for alone). A prompt step still releases them: the cached graphs follow.
+                // 5. The conversations the prefix cache keeps, the oldest first, where releasing them all and then the drafter
+                // rings 5b gives back could make the room: short of it they went for nothing (a request beside running ones waits
+                // anyway, a lone one runs on its floor, which RoomUse.SlotFloor then asks for alone), and so did the rings and
+                // their contexts. A prompt step still releases them: the cached graphs follow.
                 int released = 0;
                 long releasedBytes = 0;
-                if (free < need && mayEvict && _retainedSlots is { Count: > 0 }
-                    && use != RoomUse.PromptStep && !ReleasesCanReach(need - free, keep))
+                bool reachable = free >= need || !mayEvict || use == RoomUse.PromptStep
+                    || ReleasesCanReach(need - free, keep, IdleDFlashRingBytes);
+                if (!reachable)
                     DeviceRoomReleasesSkipped++;
                 else if (free < need && mayEvict && _retainedSlots is { Count: > 0 })
                 {
@@ -271,8 +273,8 @@ namespace TensorSharp.Models
                 // ahead of the conversations - every idle one at each new long prompt, or the few that covered a small
                 // shortfall - left the next reused turn of a conversation the prefix cache still kept drafting without its own:
                 // 53-58% acceptance against 98%). Only where conversations may go (mayEvict): a check that releases none (a
-                // slot's roomier target, SlotTarget) keeps them too.
-                if (free < need && mayEvict)
+                // slot's roomier target, SlotTarget) keeps them too, and so does one whose room no release reaches (stage 5).
+                if (free < need && mayEvict && reachable)
                     free = ReleaseRingsForRoom(need - free, free, use);
 
                 // 6. The cached graphs and every recording (a prompt step only).
@@ -328,21 +330,21 @@ namespace TensorSharp.Models
             return total <= 0 || free >= RoomNeed(bytes, total, RoomUse.Slot);
         }
 
-        /// <summary>Calls whose room releasing every finished conversation could not have made, which then released none
-        /// (tests).</summary>
+        /// <summary>Calls whose room releasing every finished conversation and kept drafter ring could not have made, which
+        /// then released none (tests).</summary>
         internal int DeviceRoomReleasesSkipped { get; private set; }
 
         /// <summary>Tests: the bytes releasing a retained payload frees, by its key, where the device is a stand-in
         /// (<see cref="DeviceRoomForTests"/>); without it a stand-in's releases are taken to reach any need.</summary>
         internal Func<string, long> RetainedPayloadBytesForTests { get; set; }
 
-        /// <summary>Whether releasing every finished conversation outside <paramref name="keep"/> frees
-        /// <paramref name="shortBy"/> bytes: a conversation's caches and states, a shared checkpoint's states (the rows it shares
-        /// go with their holder).</summary>
-        private bool ReleasesCanReach(long shortBy, ReadOnlySpan<Slot> keep)
+        /// <summary>Whether releasing every finished conversation outside <paramref name="keep"/>, then <paramref name="ringBytes"/>
+        /// of kept drafter rings, frees <paramref name="shortBy"/> bytes: a conversation's caches and states, a shared
+        /// checkpoint's states (the rows it shares go with their holder).</summary>
+        private bool ReleasesCanReach(long shortBy, ReadOnlySpan<Slot> keep, long ringBytes)
         {
             if (DeviceRoomForTests != null && RetainedPayloadBytesForTests == null) return true;
-            long bytes = 0;
+            long bytes = ringBytes;
             foreach (var (key, slot) in _retainedSlots)
                 if (slot.K != null && !Holds(keep, slot))
                     bytes += RetainedPayloadBytesForTests?.Invoke(key)

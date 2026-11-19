@@ -406,6 +406,20 @@ namespace TensorSharp.Models
         private long DFlashRingBytes => _dflash == null ? 0
             : 2L * _dflash.NumLayers * _dflash.NumKVHeads * _dflashRingRows * _dflash.HeadDim * sizeof(float) + (long)_dflash.FeatureSize * sizeof(float);
 
+        /// <summary>The device bytes <see cref="ReleaseIdleDFlashRings"/> gives back at most: the pooled rings no request holds
+        /// (the model's own and the bound one stay).</summary>
+        private protected long IdleDFlashRingBytes
+        {
+            get
+            {
+                long bytes = 0;
+                if (_dflashRingPool != null)
+                    foreach (DFlashRing ring in _dflashRingPool)
+                        if (ring.Owner == null && !ReferenceEquals(ring, _dflashActiveRing)) bytes += DFlashRingBytes;
+                return bytes;
+            }
+        }
+
         /// <summary>
         /// Gives back pooled rings no request holds, the least recently used first, until <paramref name="bytes"/> are freed
         /// (all of them by default): the contexts they keep go with them (a later turn of those conversations drafts without
