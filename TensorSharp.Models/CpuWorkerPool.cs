@@ -240,8 +240,9 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Threads the pool has, the submitting one included: what kernels size their task splits from. A
-        /// narrowed pool (<see cref="ActiveThreads"/>) keeps this figure, so no split - and no result - depends on the
-        /// width a step runs at.</summary>
+        /// narrowed pool (<see cref="ActiveThreads"/>) keeps this figure. The ARM64 products' shrinking column blocks
+        /// (ManagedQuantizedOps.GuidedBounds) follow <see cref="ActiveThreads"/> instead; they move only which thread
+        /// computes a column, never how, so no result depends on the width a step runs at.</summary>
         public int ThreadCount => _workers + 1;
 
         /// <summary>Threads that run a job's blocks now, the submitting one included (<see cref="SetActiveThreads"/>).</summary>
@@ -251,7 +252,8 @@ namespace TensorSharp.Models
         /// Run the following jobs on <paramref name="threads"/> threads (the submitting one included; clamped to
         /// [1, <see cref="ThreadCount"/>]). The workers past the width park as soon as they see a job and stay parked until
         /// a wider setting wakes them, so their cores are free for other threads; a worker that is mid-block finishes it.
-        /// The blocks a job runs, and so its results, do not depend on the width - only which threads claim them. Meant
+        /// The pool runs the blocks it is given at any width - only which threads claim them changes; a kernel that sizes
+        /// its blocks from <see cref="ActiveThreads"/> keeps each output's arithmetic independent of its block. Meant
         /// to change at step boundaries (a decode step narrower than a prompt step), not per job: widening wakes parked
         /// threads through the kernel.
         /// </summary>
@@ -455,11 +457,16 @@ namespace TensorSharp.Models
                 if (gen != seen)
                 {
                     seen = gen;
-                    // Past the active width (SetActiveThreads): park until the width grows. The submitter writes the width
-                    // before it publishes a job (the generation's increment is a full fence), so a worker that sees a job
-                    // published after a narrowing sees the narrowing too and leaves that job's blocks to the others.
+                    // Past the active width (SetActiveThreads): park until the width grows. The job is read FIRST and the
+                    // width after it: the submitter writes the width before it publishes a job (an interlocked write, then
+                    // the job's sequence increments, full fences), so a worker that read a job published after a narrowing
+                    // reads the narrowing too and leaves that job's blocks to the others. (Read before the job, the width
+                    // could predate a narrowing whose job was published after the generation this worker saw: one job's
+                    // blocks then went to a parked-to-be worker.)
+                    bool haveJob = TryReadJob(out Action<int> body, out long start, out long end);
                     if (index >= Volatile.Read(ref _activeWorkers))
                     {
+                        body = null;   // a parked worker holds no job's delegate (or what it captured)
                         lock (_narrowLock)
                         {
                             while (index >= Volatile.Read(ref _activeWorkers) && !_shutdown)
@@ -469,7 +476,7 @@ namespace TensorSharp.Models
                         spins = 0;
                         continue;
                     }
-                    if (TryReadJob(out Action<int> body, out long start, out long end))
+                    if (haveJob)
                         RunBlocks(body, start, end);
                     spins = 0;
                     continue;
