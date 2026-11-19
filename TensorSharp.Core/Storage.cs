@@ -96,6 +96,14 @@ namespace TensorSharp
         public abstract void SetElementAsFloat(long index, float value);
         public abstract void SetElementsAsFloat(long index, float[] value);
 
+        /// <summary>
+        /// <see cref="SetElementsAsFloat"/> for a few elements of a storage the device does not write: a device-backed storage
+        /// may write them to its host mirror and its device copy both, where the whole mirror would otherwise go up before the
+        /// next device use. A recorded verify step's decode mask opened a cell a row and uploaded all 8 x 57,344 cells of a
+        /// 47K-token Qwen3.8 slot's window before every launch. Default: <see cref="SetElementsAsFloat"/>.
+        /// </summary>
+        public virtual void PatchElementsAsFloat(long index, float[] value) => SetElementsAsFloat(index, value);
+
         public abstract void SetElementsAsHalf(long index, half[] value);
 
         public abstract void CopyToStorage(long storageIndex, IntPtr src, long byteCount);

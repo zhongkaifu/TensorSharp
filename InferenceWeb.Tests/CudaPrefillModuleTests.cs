@@ -265,4 +265,36 @@ public sealed class CudaPrefillModuleTests
             Assert.NotNull(probeless.StaleReason);
         }
     }
+
+    /// <summary>
+    /// The flash prefill module's F32-accumulation rate probe only describes the device: where it cannot run (here its 4-byte
+    /// sink finds no room, CUDA_ERROR_OUT_OF_MEMORY) the module still loads, current, with a rate of 0 and so the 16-bit-run
+    /// prompt kernels' choice. Before, the probe's exception left the constructor and TryCreate refused the whole module,
+    /// every flash kernel with it. Without the fault the probe measures a rate wherever the image's sm_80 bodies run.
+    /// </summary>
+    [CudaFact]
+    public void FlashPrefillModuleLoads_WhenItsRateProbeCannotRun()
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        CudaFlashPrefillKernels.RateProbeSinkAllocationForTests = () => 2;
+        try
+        {
+            Assert.True(CudaFlashPrefillKernels.TryCreate(out var kernels, out string reason), reason);
+            using (kernels)
+            {
+                Assert.True(kernels.IsCurrent, kernels.StaleReason);
+                Assert.Equal(0, kernels.F32AccumulationRate);
+                Assert.False(kernels.PromptAccumulatesInF32);
+            }
+        }
+        finally
+        {
+            CudaFlashPrefillKernels.RateProbeSinkAllocationForTests = null;
+        }
+        Assert.True(CudaFlashPrefillKernels.TryCreate(out var measured, out string measuredReason), measuredReason);
+        using (measured)
+            if (measured.ArchGuardedKernelsUsable)
+                Assert.True(measured.F32AccumulationRate > 0, $"rate {measured.F32AccumulationRate}");
+    }
 }

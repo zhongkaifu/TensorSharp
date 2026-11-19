@@ -3842,8 +3842,9 @@ namespace TensorSharp.Models
             /// <summary>
             /// A decode mask's values as F32 in its recording's stable tensor: whole when the tensor is new to this step, then only
             /// the cells its rows opened since its last binding (the tensor's host copy holds the rest: nothing writes it on the
-            /// device). A window as wide as its slot had been converted whole at every step: a 4-row window of a 16K-cell slot
-            /// 64K values, where a decode step opens one cell a row.
+            /// device), patched on both copies where the storage can (<see cref="Storage.PatchElementsAsFloat"/>), so the launch
+            /// uploads only them. A window as wide as its slot had been converted whole at every step: a 4-row window of a
+            /// 16K-cell slot 64K values, where a decode step opens one cell a row.
             /// </summary>
             private void BindDecodeMask(int input, in InputMeta m, ushort[] half, Tensor stable)
             {
@@ -3857,7 +3858,7 @@ namespace TensorSharp.Models
                         int lo = Math.Max(floor, Math.Min(m.Window, bound.Start + q + 1)), hi = Math.Min(m.Window, m.Start + q + 1);
                         if (hi <= lo) continue;
                         if (!_zeroRuns.TryGetValue(hi - lo, out float[] zeros)) _zeroRuns[hi - lo] = zeros = new float[hi - lo];
-                        stable.Storage.SetElementsAsFloat(stable.StorageOffset + (long)q * m.Window + lo, zeros);
+                        stable.Storage.PatchElementsAsFloat(stable.StorageOffset + (long)q * m.Window + lo, zeros);
                     }
                 }
                 else

@@ -64,6 +64,23 @@ namespace TensorSharp
             return (ushort*)GetStoragePointer(tensor);
         }
 
+        /// <summary><see cref="GetFloatPointer"/> for a caller that writes every element of the tensor's storage and reads
+        /// none (<see cref="Storage.PtrAtElementForOverwrite"/>): a device-backed storage does not first read its device copy
+        /// back (a fresh CUDA tensor's checkout had copied its uninitialized device bytes to the host and waited for the stream
+        /// to drain).</summary>
+        public static float* GetFloatPointerForOverwrite(Tensor tensor)
+        {
+            if (tensor == null)
+                throw new ArgumentNullException(nameof(tensor));
+            if (tensor.ElementType != DType.Float32)
+                throw new NotSupportedException($"Requires a Float32 tensor, but found {tensor.ElementType}");
+            if (tensor.StorageOffset != 0 || tensor.ElementCount() != tensor.Storage.ElementCount)
+                throw new ArgumentException("An overwrite checkout covers the whole storage.", nameof(tensor));
+
+            tensor.Storage.EnsureHostReadable();
+            return (float*)tensor.Storage.PtrAtElementForOverwrite(0);
+        }
+
         /// <summary><see cref="GetFloatPointer"/> for a caller that only reads through the
         /// pointer (<see cref="Storage.PtrAtElementForRead"/>): a device-backed storage is not
         /// marked for re-upload. Never write through it.</summary>

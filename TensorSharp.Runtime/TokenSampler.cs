@@ -23,6 +23,7 @@ namespace TensorSharp.Runtime
         private readonly Random _rng;
         private readonly bool _vectorizeArgmax;
         private float[]? _scoreBuffer;
+        private float[]? _rowBuffer;
         private int[]? _indexBuffer;
         // Reused top-k heap. Sized k (typically 20-40), so this is only about
         // dropping one small allocation per sampled token, but the sampler runs
@@ -80,9 +81,34 @@ namespace TensorSharp.Runtime
         public IReadOnlyList<int>? SuppressedTokens { get; init; }
 
         public int Sample(float[] logits, IList<int>? generatedTokenIds = null)
-            => CloseInsteadOfStop(generatedTokenIds, Draw(logits, generatedTokenIds));
+        {
+            // The length is read first, so a null array fails as it always has.
+            var row = new Span<float>(logits, 0, logits.Length);
+            return CloseInsteadOfStop(generatedTokenIds, Draw(row, logits, generatedTokenIds));
+        }
 
-        private int Draw(float[] logits, IList<int>? generatedTokenIds)
+        /// <summary>
+        /// <see cref="Sample"/> of one row of a larger buffer, drawn where it lies: the draw may write the row (a masked
+        /// token, as <see cref="Sample"/> writes its array), so the caller hands over a row nothing reads afterwards. The
+        /// same draw as <see cref="Sample"/> over a copy of the row: a batched verify's rows each went through a
+        /// vocab-sized copy (248,320 floats of Qwen3.8) before their draw. A grammar's mask takes an array, so a sampler with
+        /// a live grammar draws from a copy.
+        /// </summary>
+        internal int SampleRow(Span<float> logits, IList<int>? generatedTokenIds)
+        {
+            var grammar = _config.Grammar;
+            if (grammar != null && !grammar.IsDead)
+            {
+                float[] row = _rowBuffer != null && _rowBuffer.Length == logits.Length ? _rowBuffer : (_rowBuffer = new float[logits.Length]);
+                logits.CopyTo(row);
+                return Sample(row, generatedTokenIds);
+            }
+            return CloseInsteadOfStop(generatedTokenIds, Draw(logits, null, generatedTokenIds));
+        }
+
+        /// <summary>The draw over <paramref name="logits"/>; <paramref name="array"/> is the same floats as an array (null
+        /// for a row of a larger buffer, never with a live grammar).</summary>
+        private int Draw(Span<float> logits, float[]? array, IList<int>? generatedTokenIds)
         {
             int vocabSize = logits.Length;
 
@@ -114,7 +140,8 @@ namespace TensorSharp.Runtime
             var grammar = _config.Grammar;
             if (grammar != null && !grammar.IsDead)
             {
-                grammar.ApplyMask(logits, allowEos: grammar.IsComplete);
+                grammar.ApplyMask(array ?? throw new InvalidOperationException("A grammar masks an array of logits."),
+                    allowEos: grammar.IsComplete);
             }
 
             // First-token constraint (structured output): pick the most probable
@@ -155,7 +182,7 @@ namespace TensorSharp.Runtime
             float[] scores = _scoreBuffer != null && _scoreBuffer.Length == vocabSize
                 ? _scoreBuffer
                 : (_scoreBuffer = new float[vocabSize]);
-            Array.Copy(logits, scores, vocabSize);
+            logits.CopyTo(scores);
 
             ApplyPenalties(scores, generatedTokenIds);
 
@@ -331,7 +358,7 @@ namespace TensorSharp.Runtime
         /// and memcpy. Only called when <see cref="HasPenalties"/> and there is
         /// generation history.
         /// </summary>
-        private int ArgmaxWithPenaltiesInPlace(float[] logits, IList<int> generatedTokenIds)
+        private int ArgmaxWithPenaltiesInPlace(Span<float> logits, IList<int> generatedTokenIds)
         {
             // llama.cpp bounds penalty history (64 tokens by default). Reuse a
             // sampler-owned count map so long generations stay O(last_n) and do
@@ -589,17 +616,36 @@ namespace TensorSharp.Runtime
                 ? _heapBuffer
                 : (_heapBuffer = new int[k]);
             int count = 0;
-            for (int i = 0; i < n; i++)
+            int next = 0;
+            for (; next < n && count < k; next++)
             {
-                if (count < k)
+                heap[count++] = next;
+                if (count == k)
+                    for (int j = (k >> 1) - 1; j >= 0; j--) SiftDown(heap, scores, j, k);
+            }
+            // A later token enters only above the root's score: every id in the heap is lower, so an equal score loses its
+            // tie (and a NaN on either side compares false, as Weaker's does). A block with no score above the root's is
+            // passed over whole; any other block takes the scalar test token by token, the root moving as tokens enter.
+            if (count == k && Vector.IsHardwareAccelerated)
+            {
+                int width = Vector<float>.Count;
+                for (; next <= n - width; next += width)
                 {
-                    heap[count++] = i;
-                    if (count == k)
-                        for (int j = (k >> 1) - 1; j >= 0; j--) SiftDown(heap, scores, j, k);
+                    if (!Vector.GreaterThanAny(new Vector<float>(scores, next), new Vector<float>(scores[heap[0]])))
+                        continue;
+                    for (int t = next; t < next + width; t++)
+                        if (Weaker(scores, heap[0], t))
+                        {
+                            heap[0] = t;
+                            SiftDown(heap, scores, 0, k);
+                        }
                 }
-                else if (Weaker(scores, heap[0], i))
+            }
+            for (; next < n; next++)
+            {
+                if (Weaker(scores, heap[0], next))
                 {
-                    heap[0] = i;
+                    heap[0] = next;
                     SiftDown(heap, scores, 0, k);
                 }
             }
@@ -743,7 +789,7 @@ namespace TensorSharp.Runtime
             return candidates[candidates.Length - 1];
         }
 
-        private static int Argmax(float[] values)
+        private static int Argmax(ReadOnlySpan<float> values)
         {
             // Preserve the original empty-array exception and leading-NaN rule.
             // Never use ISA-dependent floating Max NaN/tie semantics: only the
@@ -759,7 +805,7 @@ namespace TensorSharp.Runtime
             int i = 0;
             for (; i <= values.Length - width; i += width)
             {
-                var current = new Vector<float>(values, i);
+                var current = new Vector<float>(values.Slice(i));
                 maxima = Vector.ConditionalSelect(Vector.GreaterThan(current, maxima), current, maxima);
             }
             float maximum = first;
@@ -777,7 +823,7 @@ namespace TensorSharp.Runtime
             var target = new Vector<float>(maximum);
             i = 0;
             for (; i <= values.Length - width; i += width)
-                if (Vector.EqualsAny(new Vector<float>(values, i), target))
+                if (Vector.EqualsAny(new Vector<float>(values.Slice(i)), target))
                     for (int lane = 0; lane < width; lane++)
                         if (values[i + lane] == maximum)
                             return i + lane;
@@ -787,9 +833,9 @@ namespace TensorSharp.Runtime
             return 0; // The non-NaN first element guarantees a match.
         }
 
-        private int SelectArgmax(float[] values) => _vectorizeArgmax ? Argmax(values) : ArgmaxScalar(values);
+        private int SelectArgmax(ReadOnlySpan<float> values) => _vectorizeArgmax ? Argmax(values) : ArgmaxScalar(values);
 
-        private static int ArgmaxScalar(float[] values)
+        private static int ArgmaxScalar(ReadOnlySpan<float> values)
         {
             int best = 0;
             float bestVal = values[0];

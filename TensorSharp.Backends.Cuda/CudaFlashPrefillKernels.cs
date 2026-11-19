@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 12;
+        public const int CurrentVersion = 13;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
@@ -28,6 +28,8 @@ namespace TensorSharp.Cuda
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
         private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _window128, _window256, _combine, _windowCombine;
         private readonly IntPtr _prompt128, _prompt256;
+        // The prompt kernels with F32 accumulation (ts_flash_prompt2_*) and their tail combine.
+        private readonly IntPtr _prompt2_128, _prompt2_256, _prompt2Q8128, _prompt2Q8256, _prompt2Combine;
         private readonly IntPtr _band256, _attn8_256;
         private readonly int _smem128, _smem256;
         // The same kernels over a q8_0 cache (ts_flash_*_q8_d*), and their shared memory (raw rows and one F16 tile pair).
@@ -105,9 +107,20 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8128).ThrowOnError();
             foreach (IntPtr fn in new[] { _attnQ8256, _rowsQ8256, _windowQ8256, _promptQ8256 })
                 CudaDriverApi.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8256).ThrowOnError();
+            _prompt2_128 = module.GetFunction("ts_flash_prompt2_f16_d128");
+            _prompt2_256 = module.GetFunction("ts_flash_prompt2_f16_d256");
+            _prompt2Q8128 = module.GetFunction("ts_flash_prompt2_q8_d128");
+            _prompt2Q8256 = module.GetFunction("ts_flash_prompt2_q8_d256");
+            _prompt2Combine = module.GetFunction("ts_flash_prompt2_combine_f32");
+            CudaDriverApi.cuFuncSetAttribute(_prompt2_128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem128).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_prompt2_256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem256).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_prompt2Q8128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8128).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(_prompt2Q8256, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smemQ8256).ThrowOnError();
             CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
             CudaDriverApi.cuDeviceGetAttribute(out int sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
             MultiprocessorCount = sms;
+            F32AccumulationRate = MeasureF32AccumulationRate(module, sms);
+            PromptAccumulatesInF32 = F32AccumulationRate >= 0.75;
             // The 8-bit prompt attention: only an sm_120a / sm_121a image carries its block-scaled E4M3 MMA.
             Attn8Code = ReadAttn8Caps(module);
             if (Attn8Code)
@@ -118,6 +131,67 @@ namespace TensorSharp.Cuda
         }
 
         public int MultiprocessorCount { get; }
+
+        /// <summary>Whether a prompt chunk's 16-bit attention takes <see cref="LaunchPromptAttention"/> (F32 accumulation) rather
+        /// than <see cref="LaunchAttention"/>'s 16-bit-run prompt kernels: where the tensor cores accumulate in F32 at no less than
+        /// three quarters of their F16-accumulation rate (<see cref="F32AccumulationRate"/>). Workstation and datacenter parts run
+        /// both at one rate (RTX PRO 4500 Blackwell: 1.00); GeForce parts run F32 accumulation at half rate, where the F32
+        /// kernels' tensor time alone would exceed the 16-bit-run kernels' whole time.</summary>
+        public bool PromptAccumulatesInF32 { get; }
+
+        /// <summary>The tensor cores' F16 rate with F32 accumulation over their rate with F16 accumulation, timed once when the
+        /// module loads (ts_flash_prefill_mma_rate, the faster of three runs each, alternating); 0 where it cannot run: a module
+        /// from before the probe, or a probe that fails (no device room for its 4-byte sink, a failed event or launch). The
+        /// probe only describes the device, so its failure never refuses the module (<see cref="CudaPrefillModule"/>'s
+        /// TryCreate refuses one whose constructor throws: every flash kernel would go with it).</summary>
+        public double F32AccumulationRate { get; }
+
+        /// <summary>Tests: the result code of the rate probe's sink allocation in place of cuMemAlloc's (for example 2,
+        /// CUDA_ERROR_OUT_OF_MEMORY: a full device), for every module loaded while it is set.</summary>
+        internal static Func<int> RateProbeSinkAllocationForTests { get; set; }
+
+        /// <summary><see cref="F32AccumulationRate"/> of the current context's device. Requires the module's context to be
+        /// current; synchronous (about a millisecond).</summary>
+        private static unsafe double MeasureF32AccumulationRate(CudaModule module, int sms)
+        {
+            IntPtr fn;
+            try { fn = module.GetFunction("ts_flash_prefill_mma_rate"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { return 0; } // CUDA_ERROR_NOT_FOUND: a module from before it
+            IntPtr sink = IntPtr.Zero, start = IntPtr.Zero, end = IntPtr.Zero;
+            try
+            {
+                (RateProbeSinkAllocationForTests?.Invoke() ?? CudaDriverApi.cuMemAlloc(out sink, new UIntPtr(sizeof(float)))).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out start, 0).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out end, 0).ThrowOnError();
+                float best16 = float.MaxValue, best32 = float.MaxValue;
+                int a0 = 0, a1 = 1024;
+                IntPtr a2 = sink;
+                void** args = stackalloc void*[] { &a0, &a1, &a2 };
+                for (int run = 0; run < 4; run++)
+                    for (int f32 = 0; f32 < 2; f32++)
+                    {
+                        a0 = f32;
+                        CudaDriverApi.cuEventRecord(start, IntPtr.Zero).ThrowOnError();
+                        CudaDriverApi.cuLaunchKernel(fn, (uint)(4 * sms), 1, 1, 128, 1, 1, 0, IntPtr.Zero, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+                        CudaDriverApi.cuEventRecord(end, IntPtr.Zero).ThrowOnError();
+                        CudaDriverApi.cuEventSynchronize(end).ThrowOnError();
+                        CudaDriverApi.cuEventElapsedTime(out float ms, start, end).ThrowOnError();
+                        if (run == 0) continue;   // the first of each warms the clocks
+                        if (f32 == 0) best16 = Math.Min(best16, ms); else best32 = Math.Min(best32, ms);
+                    }
+                return best32 > 0 ? best16 / best32 : 0;
+            }
+            catch (CudaException)
+            {
+                return 0;
+            }
+            finally
+            {
+                if (start != IntPtr.Zero) CudaDriverApi.cuEventDestroy(start);
+                if (end != IntPtr.Zero) CudaDriverApi.cuEventDestroy(end);
+                if (sink != IntPtr.Zero) CudaDriverApi.cuMemFree(sink);
+            }
+        }
 
         /// <summary>Whether the loaded image carries the 8-bit prompt attention (ts_flash_prefill_attn8_caps: an sm_120a /
         /// sm_121a image). False on the committed baseline, a plain compute_12x PTX and every other architecture.</summary>
@@ -228,6 +302,108 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuLaunchKernel(fn, tiles * (uint)splits, (uint)kvHeads, 1, 256, 1, 1, (uint)smem, stream, (IntPtr)args,
                 IntPtr.Zero).ThrowOnError();
             if (splits > 1) LaunchCombine(partial, splits, headDim, output, nq * heads, dyn, lenBias, windowKeys, bucket, rows, kvHeads, stream);
+        }
+
+        /// <summary>The grid of <see cref="LaunchPromptAttention"/> for <paramref name="rows"/> query rows (query heads x positions)
+        /// of each of <paramref name="kvHeads"/> KV heads whose rows see at least <paramref name="keys"/> keys: its
+        /// <see cref="BlockRows"/>-row tiles (all KV heads') fill whole waves of the device a block each, and the last, part-filled
+        /// wave's tiles split over their keys into <c>TailSplits</c> blocks each when that ends the launch sooner (each split at
+        /// least four key tiles, at most three waves of split blocks). A split count s turns the tail's t tiles into x = t s / SMs
+        /// waves of 1/s of a block's time, costed (floor(x) + p(frac(x))) / s plus 2% of a block's time for each extra split (its
+        /// Q load, partial write and combine), where a wave filled to f costs p(f) = max(0.8, sqrt(f)) of a full one: its blocks
+        /// start as earlier ones end, and the device clocks up to a quarter higher under its power cap while SMs idle (an RTX PRO
+        /// 4500 sweep, 300 to 2,048 rows over 30K to 100K keys, interleaved). A launch of fewer row tiles than the device has
+        /// multiprocessors (a short chunk, few KV heads) splits them until their blocks fill one wave, up to
+        /// <see cref="MaxPromptTailSplits"/>: there each block's time falls with its share of the keys, which the wave cost's floor
+        /// and per-split cost do not see. <c>TailSplits</c> 1: no split.</summary>
+        public (int FullTiles, int TailSplits) PromptPlan(int rows, int kvHeads, int keys) => PromptPlan(rows, kvHeads, keys, MultiprocessorCount);
+
+        internal static (int FullTiles, int TailSplits) PromptPlan(int rows, int kvHeads, int keys, int sms)
+        {
+            int total = (rows + BlockRows - 1) / BlockRows * kvHeads, tail = total % sms;
+            if (tail == 0) return (total, 1);
+            static double Cost(int tail, int s, int sms)
+            {
+                double x = (double)tail * s / sms, whole = Math.Floor(x), f = x - whole;
+                return (whole + (f > 0 ? Math.Max(0.8, Math.Sqrt(f)) : 0)) / s + PromptSplitCost * (s - 1);
+            }
+            int best = 1;
+            double bestCost = Cost(tail, 1, sms);
+            for (int s = 2; s <= CostedPromptTailSplits && keys / s >= 4 * TileKeys && tail * s <= 3 * sms; s++)
+            {
+                double cost = Cost(tail, s, sms);
+                if (cost < bestCost - 1e-9) (best, bestCost) = (s, cost);
+            }
+            // Fewer row tiles than multiprocessors: as many splits as fill one wave. The costed plan had stopped at 6 there:
+            // Qwen3.8-27B's 24/4 heads, 17 rows over 100K keys (4 tiles), took 1.58x the 16-bit-run launch's time, 20 splits
+            // 0.81x; 8/2 heads of 256 (2 tiles) 3.28x, 41 splits 0.82x (RTX PRO 4500). With whole waves before the tail, filling
+            // its wave gained nothing (0.98-1.01x), so those plans stay the costed ones.
+            if (total < sms)
+            {
+                int fill = Math.Min(Math.Min(sms / total, MaxPromptTailSplits), keys / (4 * TileKeys));
+                if (fill > best) best = fill;
+            }
+            return best == 1 ? (total, 1) : (total - tail, best);
+        }
+
+        /// <summary>The most splits a tail tile of <see cref="PromptPlan"/> takes (a launch of fewer row tiles than multiprocessors
+        /// splits until it fills a wave); the cost model weighs up to <see cref="CostedPromptTailSplits"/>, with the cost of each
+        /// split's own work in block times (its Q load, partial write and combine).</summary>
+        public const int MaxPromptTailSplits = 64;
+        private const int CostedPromptTailSplits = 16;
+        private const double PromptSplitCost = 0.02;
+
+        /// <summary>Whether <paramref name="plan"/> is a grid <see cref="LaunchPromptAttention"/> can run for <paramref name="rows"/>
+        /// rows of each of <paramref name="kvHeads"/> KV heads: every row tile a block (<c>TailSplits</c> 1, <c>FullTiles</c> all of
+        /// them), or some tail tiles split at least twice. A plan of one split with tail tiles would have those blocks write partials
+        /// no combine merges (their rows never written, through a null partial pointer), and one of several splits with no tail tile
+        /// a combine of no blocks.</summary>
+        internal static bool IsPromptPlanOf(int rows, int kvHeads, (int FullTiles, int TailSplits) plan)
+        {
+            long total = (long)(rows + BlockRows - 1) / BlockRows * kvHeads;
+            return plan.FullTiles >= 0 && plan.TailSplits >= 1
+                && (plan.TailSplits == 1 ? plan.FullTiles == total : plan.FullTiles < total);
+        }
+
+        /// <summary>Floats of the partials a <see cref="PromptPlan"/> grid's tail tiles write: <see cref="BlockRows"/> rows of
+        /// headDim + 2 (acc, max, sum) per tail tile and split; 0 without a split.</summary>
+        public static long PromptPartialFloats(int rows, int kvHeads, int headDim, (int FullTiles, int TailSplits) plan)
+        {
+            long total = (long)(rows + BlockRows - 1) / BlockRows * kvHeads;
+            return plan.TailSplits <= 1 ? 0 : (total - plan.FullTiles) * BlockRows * plan.TailSplits * (headDim + 2);
+        }
+
+        /// <summary>
+        /// A prompt chunk's rows on the prompt kernels with F32 accumulation (ts_flash_prompt2_*): the causal attention of
+        /// q [heads][nq][d] F32 over keys 0..len-1 of the head-first F16 (or, <paramref name="q8"/>, q8_0) caches k, v
+        /// [kvHeads][cap][d]: query t sees keys [floor, len - nq + t]; out [nq][heads][d] F32. <paramref name="plan"/> is
+        /// <see cref="PromptPlan"/>(nq * heads / kvHeads, kvHeads, keys), and with a tail split the tail tiles write
+        /// <paramref name="partial"/> (<see cref="PromptPartialFloats"/>) that a combine pass merges into out. Every product
+        /// accumulates in F32 inside the tensor cores, each 32-key tile's P V flushed into F32 accumulators in one rounding, the
+        /// softmax in F32 over F16-rounded probabilities: the same inputs as <see cref="LaunchAttention"/>'s prompt kernels, a
+        /// smaller error against an exact reference, other bits (the module's header and section).
+        /// </summary>
+        public unsafe void LaunchPromptAttention(IntPtr q, IntPtr k, IntPtr v, int cap, int nq, int len, int floor, int heads,
+            int kvHeads, int headDim, float scale, (int FullTiles, int TailSplits) plan, IntPtr partial, IntPtr output, IntPtr stream,
+            bool q8 = false)
+        {
+            int rows = nq * (heads / kvHeads), total = (rows + BlockRows - 1) / BlockRows * kvHeads;
+            if (!IsPromptPlanOf(rows, kvHeads, plan) || (plan.TailSplits > 1 && partial == IntPtr.Zero))
+                throw new ArgumentOutOfRangeException(nameof(plan), $"a plan of {plan.FullTiles} full tiles and {plan.TailSplits} splits for {total} tiles");
+            IntPtr a0 = q, a1 = k, a2 = v, a12 = partial, a13 = output;
+            int a3 = cap, a4 = nq, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = plan.FullTiles, a11 = plan.TailSplits;
+            float a9 = scale;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
+            var (fn, smem) = q8 ? (headDim == 128 ? (_prompt2Q8128, _smemQ8128) : (_prompt2Q8256, _smemQ8256))
+                : headDim == 128 ? (_prompt2_128, _smem128) : (_prompt2_256, _smem256);
+            uint blocks = (uint)(plan.FullTiles + (total - plan.FullTiles) * plan.TailSplits);
+            CudaDriverApi.cuLaunchKernel(fn, blocks, 1, 1, 256, 1, 1, (uint)smem, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            if (plan.TailSplits <= 1) return;
+            IntPtr c0 = partial, c7 = output;
+            int c1 = nq, c2 = heads, c3 = kvHeads, c4 = plan.FullTiles, c5 = plan.TailSplits, c6 = headDim;
+            void** cargs = stackalloc void*[] { &c0, &c1, &c2, &c3, &c4, &c5, &c6, &c7 };
+            CudaDriverApi.cuLaunchKernel(_prompt2Combine, (uint)((total - plan.FullTiles) * BlockRows), 1, 1, (uint)headDim, 1, 1, 0, stream,
+                (IntPtr)cargs, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>

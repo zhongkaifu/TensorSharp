@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 35
+#define TS_GRAPH_KERNELS_VERSION 36
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -263,6 +263,113 @@ __device__ __forceinline__ void ts_graph_gdn_rows4(
     }
 }
 
+// ts_graph_gdn_rows4 for a scan that writes its rows' outputs alone (no state before it saved, no state after it: a verify
+// window, its inputs saved for the commit's re-step), each token's inputs read a token ahead: token t + 1's loads go out
+// before token t's warp sums, which they do not wait on. Only the loads move: every value and every operation of a state
+// element is ts_graph_gdn_rows4's, in its order (the outputs and saved inputs are its bits). The window had waited on each
+// token's loads behind the last token's sums: 1.40 against 0.77 ms for Qwen3.8-27B's 48 layers of an 8-row verify window on
+// an RTX PRO 4500.
+template <bool KDA>
+__device__ __forceinline__ void ts_graph_gdn_rows4_scan(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int S, int h, int hk, int n_t, int n_s, float* __restrict__ in_save, int save_rows, int seq, int head, int r0, int lane)
+{
+    const int kh = head % hk;
+    if (seq >= n_s || r0 >= S)
+        return;
+
+    const int per = S >> 5;   // elements of a row a lane keeps (<= 8)
+    float st[4][8];
+    const float* s_in = state + ((size_t)(seq * h + head) * S + r0) * S;
+#pragma unroll
+    for (int r = 0; r < 4; r++)
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            st[r][j] = (j < per && r0 + r < S) ? s_in[(size_t)r * S + lane + 32 * j] : 0.0f;
+
+    const float scale = rsqrtf((float)S);
+    float nk[8], nq[8], ng[KDA ? 8 : 1], nv[4], nb = 0.0f;
+    auto load = [&](int t) {
+        const size_t qk_off = ((size_t)(seq * n_t + t) * hk + kh) * S;
+        const size_t v_off = ((size_t)(seq * n_t + t) * h + head) * S;
+        const size_t gb = (size_t)(seq * n_t + t) * h + head;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            if (j >= per) break;
+            const int i = lane + 32 * j;
+            nk[j] = k[qk_off + i];
+            nq[j] = q[qk_off + i];
+            if (KDA) ng[KDA ? j : 0] = g[gb * S + i];
+        }
+        if (!KDA) ng[0] = g[gb];
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+            nv[r] = r0 + r < S ? v[v_off + r0 + r] : 0.0f;
+        nb = beta[gb];
+    };
+    if (n_t > 0)
+        load(0);
+    for (int t = 0; t < n_t; t++)
+    {
+        const size_t v_off = ((size_t)(seq * n_t + t) * h + head) * S;
+        float kk[8], qq[8], e[8], vt[4];
+        const float eg = KDA ? 0.0f : expf(ng[0]);
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            if (j >= per) break;
+            kk[j] = nk[j];
+            qq[j] = nq[j];
+            e[j] = KDA ? expf(ng[KDA ? j : 0]) : eg;
+        }
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+            vt[r] = nv[r];
+        const float b = nb;
+        if (t + 1 < n_t)
+            load(t + 1);
+        float kv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                if (j >= per) break;
+                st[r][j] *= e[j];
+                kv[r] += st[r][j] * kk[j];
+            }
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+            kv[r] = ts_graph_warp_sum(kv[r]);
+        float y[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            const float delta = (r0 + r < S ? vt[r] - kv[r] : 0.0f) * b;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                if (j >= per) break;
+                st[r][j] += kk[j] * delta;
+                y[r] += st[r][j] * qq[j];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+            y[r] = ts_graph_warp_sum(y[r]);
+        if (lane == 0)
+        {
+#pragma unroll
+            for (int r = 0; r < 4; r++)
+                if (r0 + r < S) out[v_off + r0 + r] = y[r] * scale;
+        }
+        if (in_save != nullptr)
+            ts_graph_gdn_save_token(in_save, save_rows, q, k, v, g, beta, S, h, hk, KDA ? 1 : 0, t, head, r0, 4, r0 == 0, lane);
+    }
+}
+
 extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ g, const float* __restrict__ beta, const float* state,
@@ -270,6 +377,27 @@ extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
     float* __restrict__ in_save, int save_rows)
 {
     ts_graph_gdn_rows4(q, k, v, g, beta, state, out, S, h, hk, n_t, n_s, slots, kda, saved, in_save, save_rows,
+        blockIdx.x / h, blockIdx.x % h, (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4, threadIdx.x & 31);
+}
+
+// ts_graph_gated_delta_net_rows4_f32 for a scan of the rows' outputs alone (slots 0, no saved state: a verify window), on
+// ts_graph_gdn_rows4_scan, its scalar-gate and per-key-gate bodies kernels of their own (a kernel holds the registers of its
+// largest path). The same operands and launch.
+extern "C" __global__ void ts_graph_gated_delta_net_scan4_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int S, int h, int hk, int n_t, int n_s, float* __restrict__ in_save, int save_rows)
+{
+    ts_graph_gdn_rows4_scan<false>(q, k, v, g, beta, state, out, S, h, hk, n_t, n_s, in_save, save_rows,
+        blockIdx.x / h, blockIdx.x % h, (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4, threadIdx.x & 31);
+}
+
+extern "C" __global__ void ts_graph_gated_delta_net_scan4_kda_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* state,
+    float* out, int S, int h, int hk, int n_t, int n_s, float* __restrict__ in_save, int save_rows)
+{
+    ts_graph_gdn_rows4_scan<true>(q, k, v, g, beta, state, out, S, h, hk, n_t, n_s, in_save, save_rows,
         blockIdx.x / h, blockIdx.x % h, (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4, threadIdx.x & 31);
 }
 

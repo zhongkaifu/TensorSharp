@@ -654,6 +654,23 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
             int[] tokens, float[] logits, float[] features) => false;
+
+        /// <summary>
+        /// <see cref="TryBatchedSpecVerifyLogits(IReadOnlyList{string}, int[], int, int[], float[], float[])"/> whose rows
+        /// may stay where the model holds them: <paramref name="logits"/> starts with the window's rows
+        /// ([sequences * window * vocab]) and holds them until the model's next forward, and the caller may write them (each
+        /// row is drawn once). A model without such a buffer copies them into <paramref name="scratch"/>, made
+        /// <paramref name="scratchLength"/> floats long when it is shorter. A Qwen3.8-27B verify's rows are 8 x 248,320
+        /// floats: copying them into the caller's array took about as long as their transfer from the device.
+        /// </summary>
+        bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
+            int[] tokens, float[] features, ref float[]? scratch, long scratchLength, out float[] logits)
+        {
+            if (scratch == null || scratch.LongLength < scratchLength)
+                scratch = new float[scratchLength];
+            logits = scratch;
+            return TryBatchedSpecVerifyLogits(requestIds, positions, window, tokens, scratch, features);
+        }
     }
 
     /// <summary>

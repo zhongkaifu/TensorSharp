@@ -113,12 +113,18 @@ namespace TensorSharp.Models
             int[] tokens, int[] drawn, float[] features)
         {
             // Each row's greedy token, taken on the device (an id a row read back).
-            return TryVerifySlots(requestIds, positions, window, tokens, null, features, drawn);
+            return TryVerifySlots(requestIds, positions, window, tokens, null, features, out _, drawn);
         }
 
         public bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
             int[] tokens, float[] logits, float[] features)
-            => TryVerifySlots(requestIds, positions, window, tokens, logits, features);
+            => TryVerifySlots(requestIds, positions, window, tokens, logits, features, out _);
+
+        /// <summary>The rows stay in the verify graph's output, which the graph's next run rewrites (the model-owned buffer
+        /// contract): the caller draws from them before anything runs the graph again.</summary>
+        public bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
+            int[] tokens, float[] features, ref float[] scratch, long scratchLength, out float[] logits)
+            => TryVerifySlots(requestIds, positions, window, tokens, null, features, out logits);
 
         /// <summary>
         /// <see cref="TryVerifySlotsOnce"/>, retried once after the cached graphs and kept arenas are freed when the
@@ -127,19 +133,19 @@ namespace TensorSharp.Models
         /// Qwen3.8-27B DFlash2 streams on a 24 GB GPU, where Qwen35Model serves them).
         /// </summary>
         private bool TryVerifySlots(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
-            float[] logitsOut, float[] featuresOut, int[] idsOut = null)
+            float[] logitsOut, float[] featuresOut, out float[] held, int[] idsOut = null)
         {
             try
             {
-                if (!TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, idsOut)) return false;
+                if (!TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, out held, idsOut)) return false;
                 ReplenishSpareSlot();
                 return true;
             }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {
                 FreeGraphMemory();
-                try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, idsOut); }
-                catch (InvalidOperationException again) when (IsGraphAllocationFailure(again)) { return false; }
+                try { return TryVerifySlotsOnce(requestIds, positions, window, tokens, logitsOut, featuresOut, out held, idsOut); }
+                catch (InvalidOperationException again) when (IsGraphAllocationFailure(again)) { held = null; return false; }
             }
         }
 
@@ -148,10 +154,12 @@ namespace TensorSharp.Models
 
         /// <summary>One forward of every sequence's window on its own slot: all rows' logits (or with
         /// <paramref name="idsOut"/> each row's greedy token), the drafter's feature rows, and on a hybrid stack the recurrent
-        /// state after each row (settled by the commit).</summary>
+        /// state after each row (settled by the commit). Without <paramref name="logitsOut"/> or <paramref name="idsOut"/>,
+        /// <paramref name="held"/> is the graph's own output array, rows first.</summary>
         private bool TryVerifySlotsOnce(IReadOnlyList<string> requestIds, int[] positions, int window, int[] tokens,
-            float[] logitsOut, float[] featuresOut, int[] idsOut = null)
+            float[] logitsOut, float[] featuresOut, out float[] held, int[] idsOut = null)
         {
+            held = null;
             int n = requestIds.Count;
             if (n == 0 || window < 1 || window > SmallChunkRows || tokens.Length < n * window || positions.Length != n
                 || _slots == null || HasPendingMedia || _pendingPositionTable != null || GraphUnsupportedReason() != null)
@@ -233,8 +241,10 @@ namespace TensorSharp.Models
                     idsOut[row] = best;
                 }
             }
-            else
+            else if (logitsOut != null)
                 Array.Copy(result.Logits, 0, logitsOut, 0, Math.Min((long)rows * Config.VocabSize, logitsOut.LongLength));
+            else
+                held = result.Logits;
             WriteSpecFeatures(featuresOut, rows, result.Captures, result.Final);
             BatchedSpecVerifySteps++;
             return true;
