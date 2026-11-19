@@ -837,8 +837,9 @@ decode 完全一致。
 > `--kv-cache-dtype` 指定其他类型。在 CUDA 执行器上，QSA 层的索引键、QSA 选择和稀疏注意力只读取 F16 缓存，而 qwen4exp 只能以整图
 > 前向运行（没有逐算子路径），因此运行时无法在 `--backend cuda` 上以 `q8_0` 缓存运行 Flash Next：显式指定
 > `--kv-cache-dtype q8_0` 时模型可以加载，但第一步会失败并报告 `qwen4exp runs only as graphs on the shared runtime, which this
-> step cannot use (KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor).`。在 `--backend cuda` 上运行
-> Flash Next 时请保持 `f16`。
+> step cannot use (KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor).`。该执行器的整图完全不接受 `q4_0`
+> 缓存，因此 `q4_0` 也会同样失败（`KV dtype Q4_0 on this backend's executor`）。在 `--backend cuda` 上运行 Flash Next 时请保持
+> `f16`。
 
 同一会话，RTX 5090，`Q2_0`，`TS_Q4E_HC_Q8=1`，MTP（Q2_0 草稿专家），`TS_MOE_TIER_ADAPT=1`，131K 上下文：
 

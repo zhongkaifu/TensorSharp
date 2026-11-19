@@ -346,27 +346,30 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     }
 
     /// <summary>
-    /// An explicit q8_0 cache on direct CUDA (docs/models/qwen38-flash-next.md, "Q8_0 KV cache on the direct engine"). The QSA
-    /// layers' indexer keys, selection and sparse attention read F16 caches only on the CUDA executor, and qwen4exp runs only as
-    /// whole-forward graphs (no per-op path), so a model with QSA layers fails its first step, naming the cache, rather than
-    /// running a path nobody measured. Without QSA layers the plain attention takes the q8_0 cache on the executor's flash
-    /// kernels: every step a graph, none on the generic path.
+    /// A block-quantized cache on direct CUDA (docs/models/qwen38-flash-next.md, "Q8_0 KV cache on the direct engine"; USAGE.md's
+    /// <c>--kv-cache-dtype</c>). The QSA layers' indexer keys, selection and sparse attention read F16 caches only on the CUDA
+    /// executor, its graphs take no q4_0 cache at all, and qwen4exp runs only as whole-forward graphs (no per-op path), so a
+    /// model with QSA layers over q8_0, and any over q4_0, fails its first step, naming the cache, rather than running a path
+    /// nobody measured. Without QSA layers the plain attention takes a q8_0 cache on the executor's flash kernels: every step a
+    /// graph, none on the generic path.
     /// </summary>
     [CudaTheory(TensorCoreModule = "tensorsharp_flash_prefill")]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void AQ8CacheOnDirectCudaRunsOnlyWithoutQsaLayers(bool qsa)
+    [InlineData("q8_0", true, "KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor")]
+    [InlineData("q8_0", false, null)]
+    [InlineData("q4_0", false, "KV dtype Q4_0 on this backend's executor")]
+    public void ABlockCacheOnDirectCudaRunsOnlyAsQ8WithoutQsaLayers(string kvDtype, bool qsa, string refusal)
     {
-        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0);
+        Assert.True(KvCacheDtypeConfig.TryParse(kvDtype, out KvCacheDtype kv));
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(kv);
         string path = Fixture(qsa);
         using var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda);
         model.ResetKVCache();
-        Assert.Equal(KvCacheDtype.Q8_0, model.KvCacheDtype);
-        if (qsa)
+        Assert.Equal(kv, model.KvCacheDtype);
+        if (refusal != null)
         {
             var refused = Assert.Throws<NotSupportedException>(() => model.ForwardRefill(Prompt));
             Assert.Contains("runs only as graphs", refused.Message);
-            Assert.Contains("KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor", refused.Message);
+            Assert.Contains(refusal, refused.Message);
             Assert.Equal(0, model.GraphRuns);
             return;
         }
