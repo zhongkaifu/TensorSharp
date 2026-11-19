@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 35;
+        public const int CurrentVersion = 36;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32, _dflashConv;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gatedDeltaNetScan4, _gatedDeltaNetScan4Kda, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32, _dflashConv;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -33,6 +33,8 @@ namespace TensorSharp.Cuda
             if (!IsCurrent) return;
             _gatedDeltaNet = module.GetFunction("ts_graph_gated_delta_net_f32");
             _gatedDeltaNetRows4 = module.GetFunction("ts_graph_gated_delta_net_rows4_f32");
+            _gatedDeltaNetScan4 = module.GetFunction("ts_graph_gated_delta_net_scan4_f32");
+            _gatedDeltaNetScan4Kda = module.GetFunction("ts_graph_gated_delta_net_scan4_kda_f32");
             _gdnCommit = module.GetFunction("ts_graph_gdn_commit_f32");
             _softplus = module.GetFunction("ts_graph_softplus_f32");
             _sqrt = module.GetFunction("ts_graph_sqrt_f32");
@@ -338,12 +340,22 @@ namespace TensorSharp.Cuda
         /// once for four rows); the same results. With <paramref name="saved"/> ([heads, s, s], one sequence) the state before
         /// the rows is written there as it is read; with <paramref name="inputs"/> (<see cref="GatedDeltaNetInputFloats"/>) the
         /// rows' q, k, v, gates and betas in planar regions of <paramref name="inputRows"/> tokens, for a later re-step. The
-        /// state may be the output's state part (one slot, one sequence).</summary>
+        /// state may be the output's state part (one slot, one sequence). A scan of the rows' outputs alone (no slot, no saved
+        /// state: a verify window) runs ts_graph_gated_delta_net_scan4_f32, which reads each token's inputs a token ahead (the
+        /// same bits).</summary>
         public void LaunchGatedDeltaNetRows4(IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr beta, IntPtr state, IntPtr output,
             int s, int heads, int keyHeads, int tokens, int sequences, int slots, bool perKeyDecay, IntPtr stream, IntPtr saved = default,
             IntPtr inputs = default, int inputRows = 0)
         {
             int kda = perKeyDecay ? 1 : 0;
+            if (slots == 0 && saved == IntPtr.Zero)
+            {
+                void** sargs = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences,
+                    &inputs, &inputRows };
+                CudaDriverApi.cuLaunchKernel(perKeyDecay ? _gatedDeltaNetScan4Kda : _gatedDeltaNetScan4, (uint)(sequences * heads),
+                    (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream, (IntPtr)sargs, IntPtr.Zero).ThrowOnError();
+                return;
+            }
             void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda,
                 &saved, &inputs, &inputRows };
             CudaDriverApi.cuLaunchKernel(_gatedDeltaNetRows4, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,

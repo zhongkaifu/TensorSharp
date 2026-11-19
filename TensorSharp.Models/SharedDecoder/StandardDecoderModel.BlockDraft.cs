@@ -176,11 +176,13 @@ namespace TensorSharp.Models
             // The ring keeps the last ringRows positions: older rows would be overwritten in place.
             int keep = Math.Min(n, DFlashRingRows), skip = n - keep, first = startPos + skip;
             // The rows go straight into the step's input tensor, as DFlashEncode copies them: a 1024-row prompt chunk of
-            // Muse-Glimmer's 33280-float feature rows is 130 MB, so no intermediate array.
+            // Muse-Glimmer's 33280-float feature rows is 130 MB, so no intermediate array. They fill the whole fresh tensor, so
+            // its checkout reads nothing back: a read-write checkout of a fresh CUDA tensor had copied its device bytes to the
+            // host after the stream drained, every verify step's catch-up (800 KB of Qwen3.8-27B's 8 rows behind the commit).
             long offset = (long)(rowOffset + skip) * feat, bytes = (long)keep * feat * sizeof(float);
             var features = new Tensor(_allocator, DType.Float32, keep, feat);
             fixed (float* src = &hRows[offset])
-                Buffer.MemoryCopy(src, GetFloatPtr(features), bytes, bytes);
+                Buffer.MemoryCopy(src, GetFloatPtrForOverwrite(features), bytes, bytes);
             InvalidateTensorDeviceCache(features);
             CachedGraph graph = null;
             bool owned = false;

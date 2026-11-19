@@ -93,7 +93,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # The environment-independent test step runs the suite serially (its test time adds up to its
+    # wall time): about 13 minutes on an M5 Pro, and 2-2.5x that on these runners, so 30 minutes
+    # cancelled main's runs from 636fdb9f on. 60 leaves room for the suite to grow.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

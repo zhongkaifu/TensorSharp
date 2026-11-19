@@ -2605,6 +2605,11 @@ namespace TensorSharp.Models
         protected static unsafe float* GetFloatPtr(Tensor t) =>
             TensorComputePrimitives.GetFloatPointer(t);
 
+        /// <summary>Host pointer for a caller that writes every element of a tensor that owns its whole storage (a fresh
+        /// input) and reads none: a device-backed storage does not read its device copy back first.</summary>
+        protected static unsafe float* GetFloatPtrForOverwrite(Tensor t) =>
+            TensorComputePrimitives.GetFloatPointerForOverwrite(t);
+
         /// <summary>Host pointer for READING a tensor (a K/V cache in host decode attention): a
         /// direct-CUDA storage is not marked for re-upload, so the next K/V append does not copy
         /// the whole cache back to the device. Never write through it.</summary>
