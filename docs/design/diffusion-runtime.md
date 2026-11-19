@@ -1,7 +1,8 @@
 # Diffusion runtime: MiniMax-H3-Image on the unified runtime, with editing and LoRA
 
-Status: stages S1-S4 implemented (MiniMax-H3-Image text to image runs on the runtime; the legacy model is a test
-seam until S10); S5-S11 are design. Written 2026-11-19 on `feature/h3-image-unified` (cut from
+Status: stages S1-S5 implemented (MiniMax-H3-Image text to image and unmasked editing run on the runtime; the
+legacy model is a test seam until S10); S6-S11 are design. Corrections made while implementing S5 are marked
+"(S5)" below. Written 2026-11-19 on `feature/h3-image-unified` (cut from
 `origin/main` ec702639). ggml is upstream `cd6d2b75`, unchanged (AGENTS.md). No MiniMax-H3
 weights were downloaded or run for this document: every statement about TensorSharp is from
 the code, and every statement about upstream is from the sources listed in
@@ -483,11 +484,16 @@ noted where it differs.
    * The **VAE copy** is bounded to 1024-2048 (`reference_min/max_short_edge`).
    * The **vision copy** is bounded to exactly 1024 (`vision_min = vision_max = 1024`). After
      that, the Qwen3-VL processor's own smart resize applies (`MiniMaxH3VisionEncoder` has the
-     same rule: multiples of 32, pixel bounds).
+     same rule: multiples of 32, pixel bounds). (S5: the processor's own resize, needed only
+     when a 1024 short edge keeps a long side that is not a multiple of 32, is the fast processor's
+     bicubic; TensorSharp uses Pillow's BICUBIC for it.)
    * References are **never** resized to the output size. ComfyUI does the same
      (`IMAGE_REF_SHORT_EDGE = 1024`, `IMAGE_REF_VAE_MAX_SHORT_EDGE = 2048`) and resizes with
      Lanczos through 8 bits. diffusers uses `VaeImageProcessor.resize`. TensorSharp's
-     `ImageIO.Resize` must use the same filter, checked by a test.
+     `ImageIO.Resize` must use the same filter, checked by a test. (S5: `ImageIO.Resize` is
+     ImageMagick's Lanczos on desktop and stays so for the other models; the H3-Image references
+     use `ManagedResampler.ResizePillow`, which is Pillow's, byte for byte, including Pillow 13's
+     pass order: the vertical pass first when the height shrinks by more than twice the width.)
 3. **Vision path (text encoder).** The presentation is, for each reference i, the label
    `"Picture {i}: "` (**no angle brackets**, unlike H3 video's `"<Picture i>: "`; ComfyUI's
    `picture_label="Picture %d: "` agrees), then `<|vision_start|>`, one `<|image_pad|>` per
@@ -495,19 +501,32 @@ noted where it differs.
    template and no special tokens. The prompt and each label are truncated to 4,096 tokens. The
    vision tower's output replaces the pads, and the DeepStack taps are injected after layers 0-2.
    That is exactly what `MiniMaxH3Pipeline.BuildReferencePrompt` and `MiniMaxH3TextEncoder.Encode`
-   do for Ref2VA, except for the label. The conditioning is the layer-50 hidden state of every
+   do for Ref2VA, except for the label. (S5: the label, each picture's block and the prompt are
+   tokenized separately and cut at 4,096 tokens each, as diffusers does, so the H3-Image
+   conditioner builds the token ids itself and reuses the encoder and its vision tower. Sixteen
+   1024-px pictures make about 17,000 text rows, whose materialized attention scores would be
+   70 GB: the native trunk gained an opt-in causal flash attention, used for picture sequences
+   only, so text to image and H3 video keep their graph.) The conditioning is the layer-50 hidden state of every
    row. **Token tags:** label and prompt rows are text (1); every row of a vision block,
    including its start and end markers, is image (0). That matches `MiniMaxH3ImageLayout`'s
    `textTokenModalities` comment.
 4. **VAE path.** Crop the pixels to a multiple of 16, then normalize with ImageNet statistics
    (`(x/255 - [0.485,0.456,0.406]) / [0.229,0.224,0.225]`). Encode with **tiling** (256-px tiles,
    overlap at least 64, the same `_split_tiles` as the decoder; the **moments** are blended with
-   `_stitch_tiles`, a linear ramp against the already-blended neighbour, then cropped). Sample
+   `_stitch_tiles`, a linear ramp against each **raw** neighbour (the tile above, then the tile to
+   the left, both as encoded, not as blended), then cropped). (S5: this said "the already-blended
+   neighbour"; diffusers' `_stitch_tiles` and ComfyUI's `tiled_encode` both blend raw tiles. Only
+   ComfyUI's *decode* blends against already-blended neighbours, which the runtime's decoder keeps.) Sample
    the **posterior**: `mean + exp(0.5 * clamp(logvar, -30, 20)) * eps`. Round to float16 and
    back. Crop the latent to whole 2x2 patches. Normalize with `latents_mean/std` (the same
    constants as `MiniMaxH3ImageVae.ReleaseLatentsMean/Std`). Then **augment**: `0.999 * z + 0.001 * eps2`
    (`scheduler.scale_noise` at `reference_noise_aug = 0.999`). The augmented reference rows are
    fixed for the whole loop; only the target rows are updated.
+   (S5: the encoder runs on the runtime as one GraphProgram a tile: `GraphOp.Conv2d` with F32
+   kernels and F32 im2col columns (the file's F16 weights widened on the host; diffusers keeps
+   the encoder in float32), `GraphOp.PadReflect1d` for the width and row views concatenated for
+   the height. The posterior's `exp` is .NET's against CUDA's in diffusers, a last-bit
+   difference the float16 round trip removes.)
    * The VAE file TensorSharp already downloads (`minimax_h3_image_vae_fp16.safetensors`) holds
      the encoder (read from its header: `encoder.conv_in`, `encoder.down.N.block.N.*`,
      `encoder.down.N.downsample.conv`, `encoder.norm_out`, `encoder.conv_out`, `quant_conv`
@@ -536,7 +555,11 @@ noted where it differs.
   mirrors (decision D1). `TorchCpuRandn` becomes a **stateful** stream: the same MT19937 and
   Box-Muller blocks of 16, with the state carried across calls, which is how successive
   `torch.randn(..., generator=g)` calls behave. Text-to-image is unchanged: one draw from a
-  fresh generator, as today.
+  fresh generator, as today. (S5: the generator's words and the order of draws are exact. The
+  float values of Box-Muller are not bit for bit with PyTorch's x86 AVX2 build, whose log and
+  sin/cos are avx_mathfun's approximations: against diffusers' functions, 385 of 576 noise
+  values were identical and the rest within 1e-6; the posterior samples, rounded to float16,
+  were identical.)
 * **Schedule.** diffusers steps on the exact grid (`sample_sigmas`, rounded through float32
   `1 - sigma`) and uses head i at step i. ComfyUI's "simple" schedule lands within 0.001 of the
   grid and picks the nearest grid interval. TensorSharp today follows ComfyUI. The design keeps
@@ -560,6 +583,10 @@ noted where it differs.
   4. a **generation floor** of 4 MP: smaller requests sample at the floor and are resized down
      with Lanczos (upstream behaviour; decision D3). A speed adapter's contract may lower the
      floor (§5.4). Above 20 MP the request is refused, because the model's range is 4-20 MP.
+     (S5: applied to edits only. Applying it to text to image would change every text-to-image
+     picture below 4 MP, which this series promised not to change; that is the user's call, D3.
+     Without a size or an area, the CLI's edit uses `<Picture 1>`'s VAE copy size; the server's
+     requests always carry the 2048x2048 default area.)
 
 ### 4.5 Masked edits (TensorSharp's own method; upstream has none)
 
