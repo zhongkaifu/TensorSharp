@@ -141,6 +141,53 @@ public sealed class BatchedDecodeRecordingTests : IDisposable
         return (rows, model.WindowAdvances - advances, model.DecodeRecordings - recordings);
     }
 
+    /// <summary>A step of more sequences than the 16 a recording had held (24 here, a third of them joining late) records once
+    /// a slot set and gives the unrecorded steps' bits: the blocks past the 16th are each sequence's own, and a replay uploads
+    /// as many as it records.</summary>
+    [CudaFact]
+    public void StepsOfMoreThanSixteenSequencesRecordAndAnswerAsUnrecorded()
+    {
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        string path = new Qwen35DenseSyntheticModelBuilder { Layers = 4, UntiedOutput = true }.Write(Path.Combine(_dir, "q35-dense-wide.gguf"));
+        (List<float[]> Rows, int Recordings, int Replays) Wide(bool record)
+        {
+            using Qwen35RuntimeModel model = Create(path, "qwen35");
+            model.DecodeCaptureDisabled = !record;
+            var unified = Assert.IsAssignableFrom<IUnifiedBatchModel>(model);
+            const int n = 24, early = 16, steps = 12;
+            string[] ids = Enumerable.Range(0, n).Select(i => $"w{i}").ToArray();
+            var starts = new int[n];
+            for (int r = 0; r < n; r++)
+            {
+                unified.EnsureSequenceSlot(ids[r], 512);
+                int[] prompt = Enumerable.Range(0, 20 + 7 * r).Select(i => 5 + (i * 13 + r * 7) % 240).ToArray();
+                var one = new float[1][];
+                Assert.True(unified.TryForwardUnified(new[] { ids[r] }, new[] { prompt }, new[] { 0 }, one));
+                starts[r] = prompt.Length;
+            }
+            int recordings = model.DecodeRecordings, replays = model.RecordedDecodeReplays;
+            var rows = new List<float[]>();
+            foreach (int members in new[] { early, n })
+                for (int step = 0; step < steps; step++)
+                {
+                    var at = new int[members];
+                    var tokens = new int[members][];
+                    for (int r = 0; r < members; r++) { at[r] = starts[r]; tokens[r] = new[] { Token(r, step) }; }
+                    var logits = new float[members][];
+                    Assert.True(unified.TryForwardUnified(ids.Take(members).ToArray(), tokens, at, logits));
+                    for (int r = 0; r < members; r++) { rows.Add((float[])logits[r].Clone()); starts[r]++; }
+                }
+            return (rows, model.DecodeRecordings - recordings, model.RecordedDecodeReplays - replays);
+        }
+        var recorded = Wide(record: true);
+        var unrecorded = Wide(record: false);
+        _output.WriteLine($"{recorded.Recordings} recordings, {recorded.Replays} replays recorded; {unrecorded.Recordings} unrecorded");
+        Assert.Equal(2, recorded.Recordings);   // the 16-sequence set and the 24-sequence set
+        Assert.Equal(0, unrecorded.Recordings);
+        Assert.True(recorded.Replays >= 12, $"{recorded.Replays} recorded replays: the steps did not replay");
+        AssertSameBits(unrecorded.Rows, recorded.Rows, "recorded past 16 sequences");
+    }
+
     /// <summary>A batched recording's launches find their sequence's blocks by the caches they name: each sequence's run of
     /// blocks (its verify rows' after its own), and a launch naming no sequence aborts the recording rather than read
     /// another's length.</summary>

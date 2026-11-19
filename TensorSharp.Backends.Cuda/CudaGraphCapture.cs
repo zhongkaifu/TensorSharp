@@ -234,13 +234,18 @@ namespace TensorSharp.Cuda
         /// <summary>The rows of a verify window that can read their own lengths (<see cref="WindowRow"/>).</summary>
         public const int WindowRowBlocks = 8;
 
-        /// <summary>The sequences a recorded step may batch, each with its own length and write row.</summary>
-        public const int MaxSequences = 16;
+        /// <summary>The sequences a recorded step may batch, each with its own length and write row. Steps of more ran every
+        /// step unrecorded: 8,310 launches a step from the host for 64 LFM3-1.7B sequences, 59 ms against 31 of device work
+        /// (B0 census, A40), where a recording replays in one launch. The block is 36 KB; a step uploads its sequences'
+        /// blocks only (<see cref="EnqueueUpload"/>).</summary>
+        public const int MaxSequences = 256;
 
         // A batched step's: the storages its sequences' launchers name them by (each sequence's caches), while it is
         // recorded. Null for a lone sequence's.
         private Dictionary<Storage, int> sequenceOf;
         private int sequences = 1;
+        // The sequences whose blocks the last Write set (a lone step's one): the blocks EnqueueUpload copies.
+        private int writtenSequences = 1;
 
         private readonly CudaAllocator allocator;
         private IntPtr devicePtr;
@@ -345,7 +350,10 @@ namespace TensorSharp.Cuda
         /// <summary>Writes this token's values into the pinned host block. Must
         /// run before Replay (and before EndCaptureAndLaunch when capturing).</summary>
         public unsafe void Write(int attendLen, int kvWritePos, int convWriteIdx, int ropePos)
-            => WriteSequence((int*)hostPtr, attendLen, kvWritePos, convWriteIdx, ropePos);
+        {
+            writtenSequences = 1;
+            WriteSequence((int*)hostPtr, attendLen, kvWritePos, convWriteIdx, ropePos);
+        }
 
         /// <summary>A batched step's values, sequence s's attention length and cache write row its own blocks'
         /// (<see cref="Write(int, int, int, int)"/>'s for each).</summary>
@@ -353,6 +361,7 @@ namespace TensorSharp.Cuda
         {
             if (attendLengths.Length < 1 || attendLengths.Length > MaxSequences || kvWritePositions.Length != attendLengths.Length)
                 throw new ArgumentOutOfRangeException(nameof(attendLengths), attendLengths.Length, $"1 to {MaxSequences} sequences, a write row each");
+            writtenSequences = attendLengths.Length;
             for (int s = 0; s < attendLengths.Length; s++)
                 WriteSequence((int*)hostPtr + s * BlocksPerSequence * SlotCount, attendLengths[s], kvWritePositions[s], 0, 0);
         }
@@ -375,11 +384,13 @@ namespace TensorSharp.Cuda
 
         /// <summary>Enqueues the pinned-host -> device upload on the allocator
         /// stream. Called once INSIDE the capture region so the copy becomes the
-        /// graph's leading node.</summary>
+        /// graph's leading node. It copies the blocks of the sequences the last Write set (a recording's sequences are its
+        /// own: every replay writes as many), not the whole block.</summary>
         public void EnqueueUpload()
         {
             allocator.Context.MakeCurrent();
-            CudaDriverApi.cuMemcpyHtoDAsync(devicePtr, hostPtr, (UIntPtr)ByteCount, allocator.Stream.Handle)
+            int bytes = Math.Max(1, writtenSequences) * BlocksPerSequence * SlotCount * sizeof(int);
+            CudaDriverApi.cuMemcpyHtoDAsync(devicePtr, hostPtr, (UIntPtr)bytes, allocator.Stream.Handle)
                 .ThrowOnError();
         }
 
