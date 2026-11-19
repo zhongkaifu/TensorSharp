@@ -43,6 +43,11 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
 
         /// <summary>Over a thousand rows, where ggml_cuda's wide routes take the products (cuBLAS BF16, h3_q4k_gemm_takes).</summary>
         public static readonly Request Wide = new(64, 64, 21);
+
+        /// <summary>Wide, with text tags alternating row by row and a reference: more modulation segments than the fused
+        /// kernels take (tsg_h3_fused_max_segments, 8), so the native DiT builds every block unfused, its BF16
+        /// SwiGLU-in-GEMM included.</summary>
+        public static readonly Request ManySegments = new(64, 64, 12, Enumerable.Range(0, 12).Select(i => i % 2).ToArray(), new[] { (8, 8) });
     }
 
     private static float[] Random(Random rng, long n, float scale = 1f)
@@ -191,6 +196,34 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
     [InlineData(Q4_K)]
     public void WideStepsMatchTheLegacyDenoiserBitForBitOnGgmlMetal(int format)
         => VerifyBitExact(BackendType.GgmlMetal, format, Request.Wide, share: true);
+
+    /// <summary>Past the fused kernels' segment count ggml_cuda serves no modulation or gated residual, and then (as the native
+    /// DiT does) no BF16 SwiGLU-in-GEMM either: fc1, the SwiGLU and fc2 run as the region's ops on the wide routes.</summary>
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(BF16)]
+    [InlineData(Q4_K)]
+    public void ManySegmentStepsMatchTheLegacyDenoiserBitForBitOnGgmlCuda(int format)
+        => VerifyBitExact(BackendType.GgmlCuda, format, Request.ManySegments, share: true);
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(BF16)]
+    public void ManySegmentStepsMatchTheLegacyDenoiserBitForBitOnGgmlCpu(int format)
+        => VerifyBitExact(BackendType.GgmlCpu, format, Request.ManySegments, share: true);
+
+    [Fact]
+    public void TheManySegmentRequestHasMoreSegmentsThanTheFusedKernelsTake()
+    {
+        using var fx = new MiniMaxH3ImageFixture(BF16);
+        var family = MiniMaxH3ImageFamily.ForDenoiser(fx.DitPath);
+        Request rq = Request.ManySegments;
+        var text = new ConditioningSet(new float[rq.TextRows * MiniMaxH3ImageFixture.TextDim], rq.TextRows, MiniMaxH3ImageFixture.TextDim, rq.Modalities);
+        var shape = new LatentShape(MiniMaxH3ImageFixture.Channels, 1, 8, 8);
+        var references = new[] { new LatentRef(0, shape, family.ToRows(new LatentTensor(shape, new float[shape.Count]))) };
+        var target = new LatentShape(MiniMaxH3ImageFixture.Channels, 1, rq.LatentHeight, rq.LatentWidth);
+        DiffusionLayout layout = family.Pack(text, references, target, new StepState(0, 6, 1f, 0.9f, 0, 1));
+        Assert.True(layout.Segments.Count > 8, $"{layout.Segments.Count} segments");
+        Assert.True(layout.Rows >= 1024, $"{layout.Rows} rows");
+    }
 
     /// <summary>The managed executor runs the same program through the regions' reference ops (its own products and
     /// attention): against the legacy denoiser on the process's GGML backend, every step within a bound about five times

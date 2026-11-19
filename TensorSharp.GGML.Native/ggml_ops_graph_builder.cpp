@@ -437,6 +437,10 @@ namespace
         // offload's wide routes and it may serve the DiT regions in the graph. Set before the first node.
         bool wide_token_products = false;
         int dit_regions = 0;                                     // regions served as DiT offload nodes
+        // A modulation or gated residual of this graph ran its ops because its segment table is not one the fused kernels
+        // take (more than tsg_h3_fused_max_segments(), or not on the host): MiniMax-H3's native DiT then builds the whole
+        // block unfused, its BF16 SwiGLU-in-GEMM included, so a BF16 SwigluFfn is not served either.
+        bool modulations_unserved = false;
         // The key-padding masks of the graph's lowered DiT attentions (h3_attend on ggml-metal), one per sequence length.
         tsg::H3FlashMasks flash_masks;
         std::vector<std::unique_ptr<HostSegments>> host_segments;
@@ -1080,7 +1084,11 @@ namespace
             const std::int64_t hidden = x->ne[0], rows = x->ne[1];
             if (!dit_rows(x) || !dit_rows(mods) || mods->ne[0] != hidden || !dit_vector(w, hidden) || ip[0] < 0 || ip[1] < 0) return false;
             HostSegments* segs = host_segment_table(g, in[3], rows, mods->ne[1], std::max(ip[0], ip[1]));
-            if (segs == nullptr) return false;
+            if (segs == nullptr)
+            {
+                g->modulations_unserved = true;
+                return false;
+            }
             p.kind = tsg::H3_FUSED_MODULATE;
             p.a = static_cast<std::int32_t>(ip[0]);
             p.b = static_cast<std::int32_t>(ip[1]);
@@ -1109,7 +1117,11 @@ namespace
                 || (delta != nullptr && (!dit_rows(delta) || delta->ne[0] != hidden || delta->ne[1] != rows)))
                 return false;
             HostSegments* segs = host_segment_table(g, table, rows, mods->ne[1], ip[0]);
-            if (segs == nullptr) return false;
+            if (segs == nullptr)
+            {
+                g->modulations_unserved = true;
+                return false;
+            }
             p.kind = tsg::H3_FUSED_RESIDUAL;
             p.a = static_cast<std::int32_t>(ip[0]);
             p.segments = segs->segs.data();
@@ -1224,8 +1236,11 @@ namespace
             narrow.f0 = 1.0f;   // fc2 reads SwiGLU(fc1's [gate | value]) as it narrows its input
             if (gu->type == GGML_TYPE_BF16)
             {
-                // A BF16 DiT's fc1 on the wide route, then fc2 on tsg_cuda_bf16_gemm (cuBLAS BF16 or int8).
-                if (!tsg::h3_cublas_matmul_enabled() || tsg::h3_f32_products_enabled() || x->ne[1] < tsg::h3_cublas_min_rows()) return false;
+                // A BF16 DiT's fc1 on the wide route, then fc2 on tsg_cuda_bf16_gemm (cuBLAS BF16 or int8). Not where the
+                // graph's modulations run their ops: the native DiT fuses the block's SwiGLU only with its modulations.
+                if (g->modulations_unserved || !tsg::h3_cublas_matmul_enabled() || tsg::h3_f32_products_enabled()
+                    || x->ne[1] < tsg::h3_cublas_min_rows())
+                    return false;
                 ggml_tensor* gv = ggml_mul_mat(ctx, gu, x);
                 if (b1 != nullptr) gv = ggml_add(ctx, gv, b1);
                 mm = tsg::h3_fused_node(ctx, down->ne[1], gv->ne[1], { down, gv, nullptr }, narrow);
