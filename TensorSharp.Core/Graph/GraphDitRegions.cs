@@ -291,6 +291,99 @@ namespace TensorSharp.Graph
             return Concat(g, rotated, View3(g, x, d - rot, heads, rows, nb1, nb2, rot * F), 0);
         }
 
+        /// <summary>
+        /// <see cref="GraphFusion.VitAttention"/> over <paramref name="x"/> [dim, sequences * seq] (dim = heads * d): the
+        /// interleaved qkv product of <paramref name="weight"/> (plus <paramref name="bias"/>, -1: none), then for each
+        /// sequence its q, k and v views, q and k RMS-normed without a gain and rotated by the shared tables [rot, seq], the
+        /// attention (<see cref="TableRopeQkNormAttention"/>), and the sequences concatenated, as MiniMax-H3's ViT decoder
+        /// builds them (h3_vit_decode without its fused nodes). V's scale is <see cref="FlashVScale"/> of <paramref name="seq"/>.
+        /// </summary>
+        public static int VitAttention(GraphProgramBuilder g, int x, int weight, int bias, int cos, int sinSigned, long d, long heads,
+            long seq, int sequences, int rot, float eps, float scale)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+            if (sequences < 1) throw new ArgumentOutOfRangeException(nameof(sequences), "at least one sequence");
+            if (seq < 1) throw new ArgumentOutOfRangeException(nameof(seq), "a sequence has at least one row");
+            float vScale = FlashVScale(seq);
+            Span<int> inputs = stackalloc int[5];
+            int n = 0;
+            inputs[n++] = x;
+            inputs[n++] = weight;
+            if (bias >= 0) inputs[n++] = bias;
+            inputs[n++] = cos;
+            inputs[n++] = sinSigned;
+            g.BeginFused(GraphFusion.VitAttention, inputs[..n], stackalloc long[] { heads, rot, sequences, bias >= 0 ? 1 : 0 },
+                stackalloc[] { eps, scale, vScale });
+            int qkv = MulMat(g, weight, x);
+            if (bias >= 0) qkv = g.Op(GraphOp.Add, qkv, bias);
+            // Per head interleaved: head h holds [q | k | v] at [h * 3d, (h + 1) * 3d) of a row; a sequence starts seq rows on.
+            long headStride = 3 * d * F, row = 3 * d * heads * F;
+            int merged = -1;
+            for (int s = 0; s < sequences; s++)
+            {
+                long at = s * seq * row;
+                int q = View3(g, qkv, d, heads, seq, headStride, row, at);
+                int k = View3(g, qkv, d, heads, seq, headStride, row, at + d * F);
+                int v = View3(g, qkv, d, heads, seq, headStride, row, at + 2 * d * F);
+                int one = TableRopeQkNormAttention(g, q, k, v, -1, -1, cos, sinSigned, d, heads, seq, rot, eps, scale, vScale);
+                merged = merged < 0 ? one : Concat(g, merged, one, 1);
+            }
+            g.EndFused(stackalloc[] { merged });
+            return merged;
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.ScaledResidual"/>'s projection form: base + (w · x + bias) * scale (bias and scale -1:
+        /// none), the add, scale and residual in the order MiniMax-H3's ViT decoder builds them.
+        /// </summary>
+        public static int ScaledResidual(GraphProgramBuilder g, int baseNode, int x, int weight, int bias, int scale)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+            Span<int> inputs = stackalloc int[5];
+            int n = 0;
+            inputs[n++] = baseNode;
+            inputs[n++] = x;
+            inputs[n++] = weight;
+            if (bias >= 0) inputs[n++] = bias;
+            if (scale >= 0) inputs[n++] = scale;
+            g.BeginFused(GraphFusion.ScaledResidual, inputs[..n], stackalloc long[] { 0, (bias >= 0 ? 1 : 0) | (scale >= 0 ? 2 : 0) });
+            int y = MulMat(g, weight, x);
+            if (bias >= 0) y = g.Op(GraphOp.Add, y, bias);
+            int result = g.Op(GraphOp.Add, baseNode, scale >= 0 ? g.Op(GraphOp.Mul, y, scale) : y);
+            g.EndFused(stackalloc[] { result });
+            return result;
+        }
+
+        /// <summary>
+        /// <see cref="GraphFusion.ScaledResidual"/>'s SwiGLU form: base + (w2 · swiglu(w1 · x + b1) + b2) * scale, w1 the
+        /// gate|up weight (gate rows first). The biases come together or not at all (-1); scale -1: none.
+        /// </summary>
+        public static int ScaledSwigluResidual(GraphProgramBuilder g, int baseNode, int x, int gateUp, int gateUpBias, int down,
+            int downBias, int scale)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+            if ((gateUpBias >= 0) != (downBias >= 0))
+                throw new ArgumentException("the SwiGLU form takes both biases or neither");
+            bool biased = gateUpBias >= 0;
+            Span<int> inputs = stackalloc int[7];
+            int n = 0;
+            inputs[n++] = baseNode;
+            inputs[n++] = x;
+            inputs[n++] = gateUp;
+            if (biased) inputs[n++] = gateUpBias;
+            inputs[n++] = down;
+            if (biased) inputs[n++] = downBias;
+            if (scale >= 0) inputs[n++] = scale;
+            g.BeginFused(GraphFusion.ScaledResidual, inputs[..n], stackalloc long[] { 1, (biased ? 1 : 0) | (scale >= 0 ? 2 : 0) });
+            int gv = MulMat(g, gateUp, x);
+            if (biased) gv = g.Op(GraphOp.Add, gv, gateUpBias);
+            int y = MulMat(g, down, g.Op(GraphOp.Swiglu, gv));
+            if (biased) y = g.Op(GraphOp.Add, y, downBias);
+            int result = g.Op(GraphOp.Add, baseNode, scale >= 0 ? g.Op(GraphOp.Mul, y, scale) : y);
+            g.EndFused(stackalloc[] { result });
+            return result;
+        }
+
         /// <summary>One low-rank update of a <see cref="GraphFusion.LoraLinear"/>: its slot (rows [slot * slotRows, + slotRows)
         /// of the output) and its factors down [in, rank] and up [rank, slotRows].</summary>
         public readonly record struct LoraPart(int Slot, int Down, int Up);

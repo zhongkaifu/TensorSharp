@@ -294,6 +294,26 @@ namespace TensorSharp.Graph
         /// (ggml_h3_attention.h: on ggml-metal's tensor API the keys padded to 64 and the queries chunked, which the ops cannot
         /// say), and <see cref="TableRopeQkNorm"/>'s attend form holds it.</summary>
         DitAttention = 22,
+        /// <summary>A ViT's self-attention over equal-length sequences packed along the rows (a batch of image tiles), from
+        /// the block's normed input: qkv = w · x (+ b), each head's q, k and v interleaved (head h's three at rows [3D·h,
+        /// 3D·(h+1)) of a qkv row); then per sequence q and k RMS-normed per head without a gain and rotated over their first
+        /// rot dims by the tables [rot, seq] every sequence shares, and the unmasked attention per head (a nested <see
+        /// cref="TableRopeQkNorm"/> attend form); the sequences' results concatenated. Inputs: x [dim, rows] (F32, rows =
+        /// sequences · seq), w [dim, 3·dim], the bias [3·dim] where Ip[3] says, cos and sinSigned [rot, seq]. Ip: heads, rot,
+        /// sequences, bias. Fp: eps, the attention's scale, V's power-of-two scale. Result: [dim, rows]. The ops (<see
+        /// cref="GraphDitRegions.VitAttention"/>) are the unfused graph of MiniMax-H3's ViT decoder (h3_vit_decode); ggml_cuda
+        /// serves it as that decoder's fused nodes: the product on cuBLAS F16 and one cuDNN attention over the whole batch,
+        /// with the bias added in its prep.</summary>
+        VitAttention = 23,
+        /// <summary>A residual branch closed by its last projection, bias and per-channel layer scale: base + (W · act(x) + b)
+        /// * scale. Ip[0] is the form: 0 a projection (inputs base [hidden, rows], x [in, rows], w [in, hidden], then b
+        /// [hidden] and scale [hidden] as Ip[1] says; act is the identity); 1 a SwiGLU FFN (inputs base, x, the gate|up
+        /// weight w1 [in, 2·ffn], its bias b1 [2·ffn], the down weight w2 [ffn, hidden], its bias b2 [hidden], then scale:
+        /// act(x) = swiglu(w1 · x + b1), W = w2, b = b2). Ip[1]: bit 0 the biases, bit 1 the scale. Result: [hidden, rows].
+        /// The ops (<see cref="GraphDitRegions.ScaledResidual"/>) are MiniMax-H3's ViT decoder's unfused residuals; ggml_cuda
+        /// serves the F16 form as its fused ones (the products on cuBLAS F16, the SwiGLU and b1 in the down product's input,
+        /// the bias and scale in H3_FUSED_SCALED_RESIDUAL).</summary>
+        ScaledResidual = 24,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
