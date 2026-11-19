@@ -15,9 +15,7 @@ pre-registered gates, and estimates GPU time. Everything it writes goes under ig
 - **Arms that differ in an in-process seam run in one process.** `--arms f16,8bit` sets the CUDA executor's
   `PromptAttention8ForTests` per arm, case by case, with `ResetKVCache()` before each.
   - `default` keeps the build's own choice. `f16` keeps the 16-bit prompt kernel. `8bit` asks for the 8-bit prompt
-    attention. `f16legacy` runs the 16-bit-run prompt kernels the executor ran before flash prefill v13 (each 16-dim step of
-    Q K^T and each 32-key run of P V rounded to F16; `PromptAttentionLegacyForTests`): `--arms new=default,old=f16legacy`
-    compares the default 16-bit prompt attention, F32 accumulation, with them.
+    attention.
   - An `8bit` arm is refused where the image has no 8-bit kernels. The arm would otherwise silently run the 16-bit
     kernel.
   - Names are free: `--arms ref=f16,cand=8bit`.

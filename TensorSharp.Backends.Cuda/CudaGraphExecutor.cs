@@ -361,26 +361,12 @@ namespace TensorSharp.Cuda
                 // recorded decode row does: the splits then follow the bucket window its length falls in (the launch holds its
                 // whole window's).
                 IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr((CudaAllocator)Allocator, kc.Storage);
-                // Rows past a verify window's are a prompt chunk's (never recorded): the prompt kernels with F32 accumulation
-                // (CudaFlashPrefillKernels.LaunchPromptAttention) where the tensor cores accumulate F32 at full rate, else (a
-                // GeForce part) or under the test seam the 16-bit-run ones below.
-                if (nq > WidestVerifyWindow && dyn == IntPtr.Zero && flash.PromptAccumulatesInF32 && !PromptAttentionLegacyForTests)
-                {
-                    var plan = flash.PromptPlan(nq * (heads / kvHeads), kvHeads, Math.Max(1, len - nq + 1 - floor));
-                    long partialFloats = CudaFlashPrefillKernels.PromptPartialFloats(nq * (heads / kvHeads), kvHeads, d, plan);
-                    using Tensor tailPartial = partialFloats > 0 ? new Tensor(Allocator, DType.Float32, partialFloats) : null;
-                    Tensor[] promptWritten = tailPartial == null ? new[] { attended } : new[] { attended, tailPartial };
-                    Launch(new[] { qc, kc, vc }, promptWritten, (_, stream) => flash.LaunchPromptAttention(Ptr(qc), CachePtr(kc), CachePtr(vc), cap,
-                        nq, len, floor, heads, kvHeads, d, scale, plan, tailPartial == null ? IntPtr.Zero : Ptr(tailPartial), Ptr(attended), stream,
-                        q8: q8Rows));
-                    return attended;
-                }
                 int windowKeys = (int)k.Sizes[^2];
                 int splits = flash.Splits(nq * (heads / kvHeads), kvHeads, dyn != IntPtr.Zero ? windowKeys : len);
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
-                // Rows past a verify window's here: the 16-bit-run prompt kernels (CudaFlashPrefillKernels.LaunchAttention's prompt).
+                // Rows past a verify window's are a prompt chunk's: the prompt kernels (CudaFlashPrefillKernels.LaunchAttention).
                 Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), CachePtr(kc), CachePtr(vc), cap, nq, len, floor,
                     heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn,
                     windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0, prompt: nq > WidestVerifyWindow, q8: q8Rows));

@@ -8,8 +8,7 @@
 // ---------------------------------------------------------------------------
 // Tensor-core flash prefill attention: GQA groups folded into the query tile, F16 K/V tiles in
 // shared memory, online softmax, causal masking with a floor, split-KV for long contexts
-// (ts_flash_prefill_f16_d<hd>, CudaGraphExecutor's attention for decode rows and verify windows; its prompt rows take
-// ts_flash_prompt2_*, the section at the end of the module, with F32 accumulation).
+// (ts_flash_prefill_f16_d<hd>, CudaGraphExecutor's attention for prompt rows).
 //
 // The committed compute_75 PTX in native/ptx is what every build without nvcc loads, so it is a
 // tracked artifact that must be refreshed with the source (DEVELOPMENT.md). The probe
@@ -63,9 +62,8 @@ extern "C" __global__ void ts_flash_prefill_caps(int* out)
 }
 
 // ---------------------------------------------------------------------------
-// Attention over a head-first F16 cache (CudaGraphExecutor's attention for decode rows and verify windows, and through flash
-// prefill v12 for prompt rows, which ts_flash_prompt2_* now take): the direct-CUDA Qwen3.5 engine's prefill attention
-// (ts_q35_attn_pipe) on the graph op's operands.
+// Prompt attention over a head-first F16 cache (CudaGraphExecutor's attention for prompt rows): the direct-CUDA
+// Qwen3.5 engine's prefill attention (ts_q35_attn_pipe) on the graph op's operands.
 //   q     [heads][nq][HD] F32 (the query heads of a KV head are its G = heads / nKv consecutive heads)
 //   k, v  [nKv][cap][HD] F16 (the cache; keys 0..len-1 are the window)
 //   out   [nq][heads][HD] F32
@@ -681,10 +679,9 @@ __device__ __forceinline__ void ts_fp_attn(
 TS_FP_ATTN(ts_flash_prefill_f16_d128, 128, half, false)
 TS_FP_ATTN(ts_flash_prefill_f16_d256, 256, half, false)
 
-// A prompt chunk's rows (CudaGraphExecutor's attention past a verify window's rows through flash prefill v12, now under its
-// PromptAttentionLegacyForTests seam): ts_flash_prefill_f16_d<hd>'s operands and launch, scheduled for the causal triangle
-// (ts_fp_attn's PROMPT: each row's arithmetic theirs, bit for bit). Qwen3.8-27B on an RTX PRO 4000: a 16K prompt 4.08 s
-// against 4.23 s with the plain launch, the same perplexity to the last digit.
+// A prompt chunk's rows (CudaGraphExecutor's attention past a verify window's rows): ts_flash_prefill_f16_d<hd>'s operands and
+// launch, scheduled for the causal triangle (ts_fp_attn's PROMPT: each row's arithmetic theirs, bit for bit). Qwen3.8-27B on an
+// RTX PRO 4000: a 16K prompt 4.08 s against 4.23 s with the plain launch, the same perplexity to the last digit.
 #define TS_FP_PROMPT(NAME, HD, T, Q8) \
     extern "C" __global__ void __launch_bounds__(256) NAME( \
         const float* __restrict__ q, const T* __restrict__ kc, const T* __restrict__ vc, int cap, int nq, int len, \
@@ -1268,7 +1265,7 @@ TS_FP_ATTN_WINDOW(ts_flash_decode_window_q8_d128, 128, uint8_t, true)
 TS_FP_ATTN_WINDOW(ts_flash_decode_window_q8_d256, 256, uint8_t, true)
 
 // ---------------------------------------------------------------------------
-// Prompt attention with F32 accumulation (ts_flash_prompt2_*), CudaGraphExecutor's attention for a prompt chunk's rows: the
+// Prompt attention with F32 accumulation (ts_flash_prompt2_*), for a prompt chunk's rows: the
 // operands of ts_flash_prompt_f16_d<hd> (q [heads][nq][HD] F32, the head-first caches, out [nq][heads][HD] F32, query t
 // seeing keys [floor, len - nq + t]), the same GQA-packed 128-row tiles of 8 warps x 16 rows and 32-key K and V tiles in two
 // cp.async stages, with every tensor-core product accumulated in F32 inside the MMA:
