@@ -47,6 +47,14 @@ namespace TensorSharp.Models
         /// process's available memory past its working set and a reserve, and page
         /// counts are the block pool's business. -1 when unknown.
         /// </summary>
+        /// <remarks>
+        /// The device classes stay -1 on direct CUDA (<see cref="BackendType.Cuda"/>; GpuMemoryBudget does not cover it), on
+        /// purpose: the prefix tree fixes its byte caps from this spare once, when the engine starts (a single payload past half
+        /// of it cannot survive publication, PrefixTree.ResolveOptionCaps), and on a 24 GB card that is about 2 GB, so the only
+        /// 47K-token conversation (3.3 GB of Qwen3.8-27B K/V) would be evicted at every publish. There the model bounds the
+        /// device itself, from measured memory: the deficit below its headroom, which the tree evicts by
+        /// (QueryHostMemoryDeficitBytes), and the room each slot allocation makes (StandardDecoderModel.EnsureDeviceRoom).
+        /// </remarks>
         protected long QueryPrefixCacheSpareBytes(ResourceClass cls)
         {
             switch (cls)
@@ -90,9 +98,14 @@ namespace TensorSharp.Models
         /// </summary>
         public long QueryHostMemoryDeficitBytes()
         {
-            long host = OperatingSystem.IsMacOS() && UnifiedMemorySpareBytes() is long spare && spare < 0 ? -spare : 0;
+            long? spare = HostMemorySpareForTests != null ? HostMemorySpareForTests() : OperatingSystem.IsMacOS() ? UnifiedMemorySpareBytes() : null;
+            long host = spare is long s && s < 0 ? -s : 0;
             return Math.Max(host, DeviceMemoryDeficitBytes());
         }
+
+        /// <summary>Tests stand in for the host's spare memory (<see cref="UnifiedMemorySpareBytes"/>; null: not measured), so
+        /// what a test's prefix cache keeps does not depend on what else the machine runs.</summary>
+        internal Func<long?> HostMemorySpareForTests { get; set; }
 
         /// <summary>
         /// Bytes the device is short of room for one more request's state beside a headroom, which the prefix

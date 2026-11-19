@@ -467,6 +467,42 @@ slot). A request of a scoped conversation that finished on the primary (N=1) cac
 is kept the same way when a fused step takes the model over, so a conversation does
 not lose its state because another chat arrived between two of its turns.
 
+On `--backend cuda` with one GPU, the shared decoder runtime (every family on it: Qwen
+3.5/3.6/3.8, Qwen 3.8 Flash Next, Mistral 3, Hunyuan Dense) accounts its device
+memory itself, counting the large blocks the CUDA allocator caches as free (it gives
+them back on demand). A finished request's slot is retained as it is (donated, no
+copy): the conversation's next turn runs on it and replays the decode steps and
+verify windows its earlier turn recorded. Only a short slot (up to 512 MiB of K/V) is
+copied, into a pooled slot that already holds it, so the next request of another
+conversation runs on the finished request's slot and its recordings. Before it
+allocates a request's slot, copies one (a prompt-end checkpoint, a clone at admission)
+or runs a lone prompt's step, it makes room in a fixed order, the cheapest loss first:
+the pool's spare slots, then parked decode recordings, then the small verify-window
+buffers retained slots keep (where they alone cover the shortfall; that conversation's
+next turn records its windows again), then the finished conversations the prefix cache
+keeps, oldest first, and for a prompt step the cached graphs last. A conversation released
+this way prefills its next turn again, and one stderr line says how many went and
+for what. A new request whose slot does not fit waits while other requests run;
+alone, it is refused with the numbers before any of its prompt runs, instead of
+failing part way with CUDA error 2. The prefix cache also evicts its oldest payloads
+whenever free memory falls below the device's headroom (the larger of 1 GB and 1/32
+of the device), and the CUDA allocator asks the model to release finished
+conversations before its last resort (a full GC and a drain of every cached block).
+
+There a request's slot is sized to the device's room, not held at its reservation
+(prompt + max_new_tokens + verify window). It is made at the reservation's capacity
+class with an eighth more (classes are whole 1,024s up to 4,096 cells, then 1.25, 1.5,
+1.75 and 2 times a power of two) where that fits without releasing a finished
+conversation, else at the largest whole 1,024 that fits; finished conversations are
+released only for the cells the step needs (the prompt and its first token). A slot
+that needs more grows one cache tensor at a time, so a growth needs the added cells
+and one tensor beside the slot, not a second copy of it, and a conversation's next
+turn usually fits the class its slot already has. A spare slot is no larger than the
+largest short slot a request ran in (one whose copy is retained, up to 512 MiB of K/V),
+so long conversations leave no multi-gigabyte spares, and a finished request's slot is
+pooled only while the device keeps as much again free beside its headroom and a prompt
+step. A request's tokens do not depend on the capacity its slot gets.
+
 ### Prompt reuse across requests: conversation scopes and media identity
 
 Every cross-request reuse - the live primary cache, retained end states, the
@@ -596,7 +632,7 @@ request reused nothing, the first specific reason a source declined.
 | `TS_RETAINED_FUSED_CACHE_MAX` | the running-request limit, at least `4` | How many finished conversations' end states stay retained for their next turn, on models that advertise retained holders: Gemma 4 K/V, Qwen 3.5/3.6/3.8 attention K/V plus GDN recurrent state, Qwen 3.8 Flash Next's per-sequence holder, DeepSeek V4.1's native slot, and GLM 5.x's donated native slot. Each pins the model's complete per-request continuation state. Unset, it follows `TS_SCHED_MAX_RUNNING_SEQS`, so every request that runs in parallel keeps its own; `0` turns retention off. |
 | `TS_PREFIX_CHECKPOINTS_MAX` | `4` | How many checkpoints of the model's complete state at the end of the shared prompt prefix (the boundaries the chat layer marks on the request) the Radix tree keeps; each new chat starts from a clone of one. Applies on models that can copy their state (Gemma 4 on the GGML backends; Qwen 3.5/3.6/3.8 and Qwen 3.8 Flash Next on the shared decoder runtime wherever their slots' recurrent state can be copied, not a multi-node pipeline). A prompt publishes one per declared boundary (the end of the system instructions and the end of the shared prefix), so 4 covers a host that warms both thinking modes; `0` turns checkpoints off. |
 | `TS_MM_EMBEDDING_CACHE_MB` | 1/64 of host memory, 512-4096 MB | Byte budget of the vision/audio embedding cache, which is keyed by media content (SHA-256); least-recently-used entries no prepared prompt references are evicted past it. |
-| `TS_KV_INITIAL_TOKENS` | `0` | Tokens of K/V a cache is given when created, before any request declares a budget; `0` keeps the engine policy (the whole window when `MAX_CONTEXT` is explicit). The cache still grows on demand. |
+| `TS_KV_INITIAL_TOKENS` | `0` | Tokens of K/V a cache is given when created, before any request declares a budget; `0` keeps the engine policy (the whole window when `MAX_CONTEXT` is explicit). On `--backend cuda` the shared decoder runtime serves every request in a slot of its own, so with `0` its primary cache starts at a fresh slot (1,024 cells) whatever `MAX_CONTEXT` says, and `MAX_CONTEXT` only bounds the window. The cache still grows on demand. |
 | `TS_KV_GENERATION_RESERVE_MAX` | `0` | Cap on the generation share of a request's up-front K/V reservation (prompt + max_new_tokens); `0` = uncapped. Past the cap the cache grows on demand. |
 | `TS_KV_HOLDER_POOL_MAX` | `64` | How many released per-request holders a model may park for reuse; each costs its whole K/V allocation while parked. |
 | `TS_SPEC` | `0` | `1` enables speculative decoding for solo sequences (`--spec`). |
@@ -638,9 +674,22 @@ Request KV state is owned by `InferenceEngine`. The KV cache can be stored at re
 `--kv-cache-dtype <f32|f16|q8_0|q4_0>` (or the `KV_CACHE_DTYPE` env var) on
 both the CLI and the server. The default is chosen automatically per model
 (`f16` when the model's weights are below F32, `f32` otherwise); the block-quantized tiers
-(`q8_0`, `q4_0`) require the native GGML flash-attention path, and `q4_0`
-(~1/7 of f32) targets very long 128K–256K contexts where the KV cache
-dominates memory.
+(`q8_0`, `q4_0`) run on the GGML backends' flash-attention path, and `q8_0` also
+on `--backend cuda`, whose executor's flash kernels read it directly for every
+family on the shared decoder runtime (Qwen 3.5/3.6/3.8, Mistral 3, Hunyuan Dense;
+about half the bytes of `f16` a step; its slots, copies and growth halve too), while `q4_0`
+keeps a model off whole-forward graphs there. `q4_0` (~1/7 of f32) targets very
+long 128K–256K contexts where the KV cache dominates memory.
+
+`f16` stays the default on `--backend cuda`. `q8_0` holds about twice the context in the same
+device memory, but on an RTX PRO 4500 Blackwell (sm_120) its kernels are bound by their arithmetic,
+not by memory traffic: with Qwen3.8-27B NVFP4 a verify step took the same time as with `f16` (6.6K-69K
+tokens), and a fresh prefill took 1-5% longer, more for longer prompts (6.6K-130K tokens; issue #376's reproducer). Its
+perplexity stayed within 0.16% of `f16` on Qwen3.5-0.8B and Ministral 3 3B (8K-96K tokens) and within 0.3% on
+Qwen3.8-27B with Q6_K weights (8K-16K). Qwen3.8-27B NVFP4 runs its prompt rows on 4-bit activations, which amplify any
+change of attention arithmetic: there `q8_0` moved a few long code windows' perplexity a lot, in both directions (as the
+8-bit prompt attention does), and lost the document order in 1 of 18 retrieval prompts (8K-128K) that `f16` answered.
+Choose `q8_0` on `--backend cuda` when a long context does not fit at `f16`.
 
 ## Remaining Work
 

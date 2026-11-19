@@ -24,12 +24,20 @@ namespace TensorSharp.Runtime.Scheduling
         /// Returns the tokens the slot holds.</summary>
         int EnsureSequenceSlot(string requestId, int reserveTokens);
 
+        /// <summary><see cref="EnsureSequenceSlot(string, int)"/> where the step needs only <paramref name="requiredTokens"/>
+        /// (its prompt, its first token and a verify window's slack): a model that sizes slots to the device's memory may hold
+        /// less than the reservation and grow the slot when a later step needs it. Others hold the reservation.</summary>
+        int EnsureSequenceSlot(string requestId, int reserveTokens, int requiredTokens) => EnsureSequenceSlot(requestId, reserveTokens);
+
         /// <summary>One forward: request s's <paramref name="tokens"/>[s] at positions <paramref name="starts"/>[s]
         /// onward, every request's rows together; <paramref name="lastRowLogits"/>[s] its last row's logits. Declines
         /// (false, nothing written) when a request's slot does not continue at its start.
         /// <paramref name="features"/>[s], when given for request s (a buffer of c x the drafter's feature width, c no
         /// more than its rows), receives the drafter features of its LAST c rows (a prompt-conditioned drafter's prefill
-        /// needs only the rows its context holds); it is set to null when this forward could not capture them.</summary>
+        /// needs only the rows its context holds); it is set to null when this forward could not capture them.
+        /// A request's tokens are its prompt chunk or its one decode token: a model may attend a prompt chunk with
+        /// arithmetic decode rows do not share (a plain and a speculating request prefill through it alike). A caller
+        /// forwarding generated tokens as a chunk (a re-forward, a verify) must use another entry.</summary>
         bool TryForwardUnified(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, float[][] lastRowLogits,
             float[][]? features = null);
 

@@ -39,11 +39,23 @@ namespace TensorSharp.Runtime.Speculative
         public double AcceptanceRate => TokensDrafted > 0 ? (double)TokensAccepted / TokensDrafted : 0;
 
         // Wall-clock phase breakdown (Stopwatch ticks) so a slow speculative
-        // request can be attributed: drafting, trunk verify forwards,
-        // recurrent-state snapshots, rollback re-forwards, drafter catch-up
-        // replays, and plain (non-drafting) steps.
+        // request can be attributed. Each phase is counted once:
+        //   draft     the drafter proposing (a step whose draft proposed nothing included);
+        //   verify    the trunk forward over a window and its readback, and nothing else
+        //             (a step that verifies several sequences: this one's share of it);
+        //   commit    a verify step's row draws, acceptance and the trunk's commit of the
+        //             kept rows (a recurrent trunk's replay of them; shared steps: a share);
+        //   snapshot  the recurrent-state snapshot before a solo verify;
+        //   rollback  the re-forward of the kept rows where the trunk could not keep the
+        //             verify's own;
+        //   catch-up  handing a verify step's kept tokens to the drafter;
+        //   plain     steps that verified no draft: their forward and catch-up (a shared
+        //             step's whole share: its forward, its draws and its catch-up).
+        // The shared step's verify had included its draft (counted in draft as well), and no
+        // step counted its commit: the issue #376 log read 98.7 ms a verify step.
         internal long DraftTicks;
         internal long VerifyTicks;
+        internal long CommitTicks;
         internal long SnapshotTicks;
         internal long RollbackTicks;
         internal long CatchUpTicks;
@@ -51,10 +63,14 @@ namespace TensorSharp.Runtime.Speculative
 
         public double DraftMs => TicksToMs(DraftTicks);
         public double VerifyMs => TicksToMs(VerifyTicks);
+        public double CommitMs => TicksToMs(CommitTicks);
         public double SnapshotMs => TicksToMs(SnapshotTicks);
         public double RollbackMs => TicksToMs(RollbackTicks);
         public double CatchUpMs => TicksToMs(CatchUpTicks);
         public double PlainMs => TicksToMs(PlainTicks);
+
+        /// <summary>A phase's total, in ms, per verify step (0 before the first): what one verify step spent in it.</summary>
+        public double PerVerifyStep(double totalMs) => VerifySteps > 0 ? totalMs / VerifySteps : 0;
 
         private static double TicksToMs(long ticks)
             => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -63,7 +79,7 @@ namespace TensorSharp.Runtime.Speculative
         {
             TokensDrafted = TokensAccepted = VerifySteps = PlainSteps = RollbackSteps = ParkedSteps = 0;
             PlainMsPerToken = SpecMsPerToken = 0;
-            DraftTicks = VerifyTicks = SnapshotTicks = RollbackTicks = CatchUpTicks = PlainTicks = 0;
+            DraftTicks = VerifyTicks = CommitTicks = SnapshotTicks = RollbackTicks = CatchUpTicks = PlainTicks = 0;
         }
     }
 

@@ -937,7 +937,8 @@ public partial class SpeculativeExecutionTests
 
     private static SequenceState RunEngineRequest(FakeSpeculativeModel model, int promptLen, int maxNewTokens,
         bool specEnabled, bool enablePrefixCaching = false, int soloPrefillChunk = 0, string speculator = null,
-        Action beforeDispose = null, IRequestAdapter adapter = null, SamplingConfig sampling = null)
+        Action beforeDispose = null, IRequestAdapter adapter = null, SamplingConfig sampling = null,
+        Microsoft.Extensions.Logging.ILogger logger = null)
     {
         var cfg = new SchedulerConfig
         {
@@ -957,7 +958,7 @@ public partial class SpeculativeExecutionTests
                 MinDraftProb = speculator == SpeculatorRegistry.NGram ? null : 0.5f,
             },
         };
-        using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+        using var engine = new InferenceEngine(model, cfg, logger ?? NullLogger.Instance);
 
         var greedy = new SamplingConfig
         {
@@ -1328,8 +1329,22 @@ public partial class SpeculativeExecutionTests
         Assert.True(decoder.TokensDrafted > 0);
     }
 
-    private sealed class FakeSpeculativeModel : ISpeculativeModel, IPageOnlyPrefixCacheModel, IAdapterAwareModel
+    private class FakeSpeculativeModel : ISpeculativeModel, IPageOnlyPrefixCacheModel, IAdapterAwareModel
     {
+        // ---- simulated time: each call advances Clock by its phase's cost (SpeculativeStatsPhaseTests) ----
+        public SimulatedClock Clock { get; set; }
+        public long VerifyCost { get; set; }     // a forward of several rows with every row's logits
+        public long ForwardCost { get; set; }    // any other forward (a plain step, a rollback's re-forward)
+        public long DraftCost { get; set; }
+        public long SnapshotCost { get; set; }
+        public long AcceptCost { get; set; }     // SpecOnVerifyAccepted
+        public long RestoreCost { get; set; }
+        public long RewindCost { get; set; }
+        public long CatchUpCost { get; set; }    // DraftCatchUp: the drafter taking committed tokens
+        public bool PersistsAcceptedKv { get; set; }
+        public bool SpecVerifyPersistsAcceptedKv => PersistsAcceptedKv;
+        public void SpecOnVerifyAccepted(int acceptedRows, int verifyRows) => Clock?.Advance(AcceptCost);
+
         // ---- IAdapterAwareModel: a LoRA request's steps select their adapter here ----
         private readonly HashSet<IRequestAdapter> _boundAdapters = new(ReferenceEqualityComparer.Instance);
         public IRequestAdapter StepAdapter { get; private set; }
@@ -1494,6 +1509,7 @@ public partial class SpeculativeExecutionTests
 
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            Clock?.Advance(allLogitsRows && tokens.Length > 1 ? VerifyCost : ForwardCost);
             LinearSpecForwardCalls++;
             if (allLogitsRows && tokens.Length > 1) FullVerifyCalls++;
             (Injector as FakeInjector)?.ConsumeSlice(_trunk.Count, tokens.Length);
@@ -1503,6 +1519,7 @@ public partial class SpeculativeExecutionTests
         public bool TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
         {
             if (!EnableGreedyVerify) return false;
+            Clock?.Advance(VerifyCost);
             GreedyVerifyCalls++;
             if (ThrowGreedyVerify) throw new InvalidOperationException("injected verify failure");
             var logits = new float[tokens.Length * VocabSize];
@@ -1544,8 +1561,12 @@ public partial class SpeculativeExecutionTests
             }
         }
 
+        public int DraftStepCalls { get; private set; }
+
         public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
+            DraftStepCalls++;
+            Clock?.Advance(DraftCost);
             // The hidden chained into a draft at position pos must be the
             // hidden of the token at pos-1 (encoded as pos; zeros before the
             // first prompt token).
@@ -1596,6 +1617,7 @@ public partial class SpeculativeExecutionTests
 
         public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
+            Clock?.Advance(CatchUpCost);
             if (hRows != null && tokens.Length > 0)
                 FirstHiddenCatchUpPosition = Math.Min(FirstHiddenCatchUpPosition, startPos);
             if (hRows == null)
@@ -1622,12 +1644,14 @@ public partial class SpeculativeExecutionTests
 
         public void SpecSnapshotRecurrentState()
         {
+            Clock?.Advance(SnapshotCost);
             SnapshotCalls++;
             _recurrentSnapshot = _recurrentState;
         }
 
         public void SpecRestoreRecurrentState()
         {
+            Clock?.Advance(RestoreCost);
             RestoreCalls++;
             if (_recurrentSnapshot < 0)
                 ProtocolViolations.Add("restore without snapshot");
@@ -1636,6 +1660,7 @@ public partial class SpeculativeExecutionTests
 
         public void SpecRewindCache(int length)
         {
+            Clock?.Advance(RewindCost);
             if (length < 0 || length > _trunk.Count)
             {
                 ProtocolViolations.Add($"rewind to {length} outside [0, {_trunk.Count}]");

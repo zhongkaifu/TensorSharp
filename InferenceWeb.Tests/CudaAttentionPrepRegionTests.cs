@@ -49,7 +49,7 @@ public sealed class CudaAttentionPrepRegionTests
 
     /// <summary>A layer's shape: head width, query and KV heads, a packed q|gate|k|v projection, F16 caches, the rotary, and
     /// whether the region lets the queries go out head by head.</summary>
-    private sealed record Layout(int D, int Heads, int KvHeads, bool Packed, bool F16, Rotary Rope, bool HeadMajor, int Capacity)
+    private sealed record Layout(int D, int Heads, int KvHeads, bool Packed, bool F16, Rotary Rope, bool HeadMajor, int Capacity, bool Q8 = false)
     {
         /// <summary>The projection's floats a row: the gated queries (each head's q then its gate), and when packed the keys and
         /// values after them.</summary>
@@ -66,15 +66,29 @@ public sealed class CudaAttentionPrepRegionTests
     [InlineData(128, 8, 2, true, false, true, true, true)]      // packed, F32 caches, YaRN, head by head
     public void PrepRegionWritesTheQueriesAndCacheBytesItsOpsWrite(int d, int heads, int kvHeads, bool packed, bool f16, bool yarn,
         bool headMajor, bool prompt)
+        => AssertPrepRegion(new Layout(d, heads, kvHeads, packed, f16, yarn ? Yarn : NeoX, headMajor, prompt ? 4096 : 64), prompt);
+
+    /// <summary>The same over q8_0 caches: the region's kernel quantizes each rotated key and each value row as the ops' row writes
+    /// do (ggml's quantize_row_q8_0 over the same F32 values), so the caches hold the same bytes.</summary>
+    [CudaTheory]
+    [InlineData(256, 4, 2, false, false, false, false)]   // Qwen3.8 Flash Next's layout, decode rows and windows
+    [InlineData(256, 24, 4, false, false, true, true)]    // Qwen3.8-27B's prompt chunks, the queries head by head
+    [InlineData(128, 8, 2, true, true, false, true)]      // packed, YaRN, 128-wide rows
+    [InlineData(512, 4, 2, false, false, false, false)]
+    public void PrepRegionWritesTheQ8CacheBytesItsOpsWrite(int d, int heads, int kvHeads, bool packed, bool yarn, bool headMajor, bool prompt)
+        => AssertPrepRegion(new Layout(d, heads, kvHeads, packed, false, yarn ? Yarn : NeoX, headMajor, prompt ? 4096 : 64, Q8: true), prompt);
+
+    private static void AssertPrepRegion(Layout layout, bool prompt)
     {
-        var layout = new Layout(d, heads, kvHeads, packed, f16, yarn ? Yarn : NeoX, headMajor, prompt ? 4096 : 64);
+        int d = layout.D, heads = layout.Heads, kvHeads = layout.KvHeads;
+        bool packed = layout.Packed, f16 = layout.F16, headMajor = layout.HeadMajor;
         (int Start, int Count)[] steps = prompt ? PromptSteps : DecodeSteps;
         using var allocator = new CudaAllocator();
         allocator.Context.MakeCurrent();
         Assert.True(CudaGraphKernels.TryCreate(out CudaGraphKernels kernels, out string reason), reason);
         using (kernels)
         {
-            var rng = new Random(d * 7 + heads + (packed ? 1 : 0) + (f16 ? 2 : 0) + (prompt ? 5 : 0));
+            var rng = new Random(d * 7 + heads + (packed ? 1 : 0) + (f16 ? 2 : 0) + (prompt ? 5 : 0) + (layout.Q8 ? 11 : 0));
             float[] F(int n, double lo, double hi)
             {
                 var a = new float[n];
@@ -100,6 +114,13 @@ public sealed class CudaAttentionPrepRegionTests
                 float[] got = Run(regionExecutor, regionK, regionV, qNorm, kNorm, layout, projection, keys, values, first, count, region: true);
                 string rows = $"rows {first}..{first + count - 1}";
                 AssertSameBits(want, got, $"{rows}: query value", d);
+                if (layout.Q8)
+                {
+                    allocator.Stream.Synchronize();
+                    AssertSameBytes(Q8Reference.Download(opsK), Q8Reference.Download(regionK), $"after {rows}: K cache", d);
+                    AssertSameBytes(Q8Reference.Download(opsV), Q8Reference.Download(regionV), $"after {rows}: V cache", d);
+                    continue;
+                }
                 AssertSameBits(Floats(allocator, kernels, opsK), Floats(allocator, kernels, regionK), $"after {rows}: K cache value", d);
                 AssertSameBits(Floats(allocator, kernels, opsV), Floats(allocator, kernels, regionV), $"after {rows}: V cache value", d);
             }
@@ -107,6 +128,16 @@ public sealed class CudaAttentionPrepRegionTests
             Assert.Equal(steps.Length, regionExecutor.AttentionPrepRegions);
             Assert.Equal(headMajor ? steps.Count(s => s.Count > CudaDecodeDynParams.WindowRowBlocks) : 0, regionExecutor.HeadMajorQueryPreps);
         }
+    }
+
+    private static void AssertSameBytes(byte[] want, byte[] got, string what, int d)
+    {
+        Assert.Equal(want.Length, got.Length);
+        long rowBytes = Q8Reference.Bytes(d);
+        for (int i = 0; i < want.Length; i++)
+            if (want[i] != got[i])
+                Assert.Fail($"{what} byte {i} (row {i / rowBytes}, block {i % rowBytes / Q8Reference.BlockBytes}) is {got[i]:x2} from the region's " +
+                    $"kernel, {want[i]:x2} from its ops");
     }
 
     private static void AssertSameBits(float[] want, float[] got, string what, int d)
@@ -117,9 +148,10 @@ public sealed class CudaAttentionPrepRegionTests
                 Assert.Fail($"{what} {i} (row {i / d}, column {i % d}) is {got[i]:R} from the region's kernel, {want[i]:R} from its ops");
     }
 
-    /// <summary>A head-first cache [kvHeads, capacity, d] holding <paramref name="values"/> (F16 or F32).</summary>
+    /// <summary>A head-first cache [kvHeads, capacity, d] holding <paramref name="values"/> (F16 or F32; q8_0 blocks of them).</summary>
     private static Tensor Cache(CudaAllocator allocator, CudaGraphKernels kernels, float[] values, Layout layout)
     {
+        if (layout.Q8) return Q8Reference.Upload(allocator, Q8Reference.Quantize(values), layout.KvHeads, layout.Capacity, layout.D);
         var f32 = Tensor.FromArray(allocator, values);
         if (!layout.F16)
         {
@@ -158,7 +190,7 @@ public sealed class CudaAttentionPrepRegionTests
         int d = layout.D, heads = layout.Heads, kvHeads = layout.KvHeads, capacity = layout.Capacity;
         bool packed = layout.Packed, f16 = layout.F16;
         Rotary rope = layout.Rope;
-        int width = layout.Width, cacheType = f16 ? GraphFormat.F16 : GraphFormat.F32;
+        int width = layout.Width, cacheType = layout.Q8 ? GraphFormat.Q8_0 : f16 ? GraphFormat.F16 : GraphFormat.F32;
         long qWidth = 2L * heads * d, kDim = (long)kvHeads * d;
         int[] positions = Enumerable.Range(start + RopeDelta, count).ToArray();
         long[] rows = Enumerable.Range(start, count).Select(r => (long)r).ToArray();
@@ -170,9 +202,9 @@ public sealed class CudaAttentionPrepRegionTests
         int qNormNode = g.Leaf(GraphLeafRole.Weight, GraphFormat.F32, new long[] { d }, IntPtr.Zero, d * f, handle: qNorm);
         int kNormNode = g.Leaf(GraphLeafRole.Weight, GraphFormat.F32, new long[] { d }, IntPtr.Zero, d * f, handle: kNorm);
         int kCacheNode = g.Leaf(GraphLeafRole.State, cacheType, new long[] { d, capacity, kvHeads }, GraphIdentity.Of(kCache.Storage),
-            kCache.ElementCount() * (f16 ? 2 : 4), handle: kCache);
+            kCache.Storage.ByteLength, handle: kCache);
         int vCacheNode = g.Leaf(GraphLeafRole.State, cacheType, new long[] { d, capacity, kvHeads }, GraphIdentity.Of(vCache.Storage),
-            vCache.ElementCount() * (f16 ? 2 : 4), handle: vCache);
+            vCache.Storage.ByteLength, handle: vCache);
         int posNode = g.Leaf(GraphLeafRole.Input, GraphFormat.I32, new long[] { count }, IntPtr.Zero, count * 4L);
         int rowsNode = g.Leaf(GraphLeafRole.Input, GraphFormat.I64, new long[] { count, 1 }, IntPtr.Zero, count * 8L);
 

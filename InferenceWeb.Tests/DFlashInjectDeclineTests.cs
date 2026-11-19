@@ -137,7 +137,8 @@ public class DFlashInjectDeclineTests
         typeof(ModelBase).GetField("_dflashActiveRing", Instance)!.SetValue(model, modelRing);
         typeof(ModelBase).GetField("_dflashRingPool", Instance)!.SetValue(model, pool);
 
-        object chosen = typeof(ModelBase).GetMethod("FindOrAssignDFlashRing", Instance)!.Invoke(model, new object[] { "new" })!;
+        // (A request that speculates: it may take a running request's ring.)
+        object chosen = typeof(ModelBase).GetMethod("FindOrAssignDFlashRing", Instance)!.Invoke(model, new object[] { "new", true })!;
 
         Assert.Same(oldest, chosen);
         Assert.Equal("new", RingType.GetField("Owner")!.GetValue(chosen));

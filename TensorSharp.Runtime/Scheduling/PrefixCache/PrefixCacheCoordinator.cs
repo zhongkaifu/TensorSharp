@@ -420,11 +420,14 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                             _model.MaxContextLength, ExecutionOptions.FromEnvironment().KvGenerationReserveMax));
                     if (!donate && !ReserveClone(payload.Key, length, reservation)) return false;
                     var materialize = new MaterializeRequest(donate ? MaterializeOp.Donate : MaterializeOp.Clone,
-                        payload.Key, sequence.RequestId, payload.Footprint.Tokens, length, reservation);
+                        payload.Key, sequence.RequestId, payload.Footprint.Tokens, length, reservation,
+                        ConsumableSharers(payload.Key, sequence), EndsPrompt: length == sequence.PromptTokens.Count);
                     if (!_cacheModel.TryMaterialize(materialize))
                     {
                         LastDeclineReason = $"the model declined to {(donate ? "donate" : "clone")} the {length}-token end state";
-                        LastAdoptDeclinedByModel = !donate;
+                        // A donation the model declined for want of memory waits too (a checkpoint over rows another
+                        // request holds, which only a copy serves).
+                        LastAdoptDeclinedByModel = !donate || _cacheModel.LastMaterializeWantedRoom;
                         return false;
                     }
                     // The clone already took this request's fitted reservation.
@@ -455,6 +458,25 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             finally { if (!transferred) _pool.Free(blocks); }
         }
         finally { _tree.Release(ref receipt); Drain(); }
+    }
+
+    /// <summary>
+    /// Of the payloads adopting <paramref name="payloadKey"/> would use up (<see cref="IPrefixCacheModel.RowSharers"/>: a
+    /// shared checkpoint's rows held by its conversation's end state), those the request may consume: in its own
+    /// conversation's scope (never another's, nor a public prefix), not locked by a running request, pinned or being
+    /// donated. Null when there are none: the model then copies the checkpoint instead of taking the rows over.
+    /// </summary>
+    private IReadOnlyList<string>? ConsumableSharers(string payloadKey, SequenceState sequence)
+    {
+        if (_cacheModel.RowSharers(payloadKey) is not { Count: > 0 } sharers) return null;
+        int scope = GetScope(sequence);
+        if (scope == 0) return null;
+        List<string>? consumable = null;
+        foreach (string key in sharers)
+            if (_tree.TryGetNodeByKey(key, out RadixNode node) && node.ScopeIx == scope && node.LockRef == 0
+                && node.StateLockRef == 0 && node.PinRef == 0 && !node.IsDonationPending)
+                (consumable ??= new List<string>()).Add(key);
+        return consumable;
     }
 
     private bool ReserveClone(string key, int tokens, int requiredContextTokens)
@@ -631,9 +653,12 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         PayloadFootprint footprint;
         try
         {
-            bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
+            // An automatic checkpoint may share the request's rows (states only); a public or explicit one is exported
+            // to a file or kept past its request whole, so it keeps its own.
+            bool shareRows = !publicBoundary && !explicitBoundary;
+            bool captured = _cacheModel.TryCaptureCheckpoint(sequence.RequestId, key, shareRows, out footprint);
             if (!captured && ReleaseOldestScopedPayload())
-                captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
+                captured = _cacheModel.TryCaptureCheckpoint(sequence.RequestId, key, shareRows, out footprint);
             if (!captured) return;
             published = Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy, promptLogits);
         }
@@ -699,6 +724,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             && _model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(sequence.RequestId)
             && ReleaseOldestScopedPayload())
             captured = _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
+        // A model may keep a copy of the request's holder (the CUDA executor's short slots): the log says which.
+        bool copied = captured && _cacheModel is IPrefixCacheModelDiagnostics { LastRetentionCopied: true };
         PayloadOrigin origin = PayloadOrigin.Donation;
         bool conversionFailed = false;
         if (!captured && RetentionEnabled && primary && _tree.Caps.AdoptPrimaryOnDisplacement)
@@ -711,7 +738,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         }
         if (ReleaseDebug)
             _logger.LogInformation("[prefix-retain] {EngineRequestId} length={Length} primary={Primary} captured={Captured} origin={Origin}",
-                sequence.RequestId, length, primary, captured, origin);
+                sequence.RequestId, length, primary, captured, copied ? "Copy" : origin.ToString());
         if (captured)
         {
             bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin);

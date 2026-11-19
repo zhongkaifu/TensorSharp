@@ -104,6 +104,104 @@ namespace InferenceWeb.Tests
             }
         }
 
+        private static readonly Lazy<(int Cc, int ImageArch, bool Current, bool FromFatbin, bool Attn8, string Error)> FlashPrefillImage = new(() =>
+        {
+            try
+            {
+                var device = TensorSharp.Cuda.CudaDevice.GetDevice(0);
+                int cc = device.ComputeCapabilityMajor * 10 + device.ComputeCapabilityMinor;
+                using var context = TensorSharp.Cuda.CudaContext.Create(0);
+                context.MakeCurrent();
+                using var kernels = TensorSharp.Cuda.CudaFlashPrefillKernels.Create();
+                return (cc, kernels.ImageArch, kernels.IsCurrent, kernels.FromFatbin, kernels.Runs8BitPrompt(256), null);
+            }
+            catch (Exception ex)
+            {
+                return (0, 0, false, false, false, $"{ex.GetType().Name}: {ex.Message}");
+            }
+        });
+
+        /// <summary>
+        /// Skip reason for a test that launches the 8-bit prompt attention (tensorsharp_flash_prefill's
+        /// ts_flash_prompt_i8e4_d256), or null when the module this process loads carries it on GPU 0: an sm_120a /
+        /// sm_121a image on an RTX Blackwell GPU. Everywhere else its kernels trap and the executor never takes them.
+        /// </summary>
+        public static string PromptAttention8Skip
+        {
+            get
+            {
+                if (CudaSkip != null) return CudaSkip;
+                var image = FlashPrefillImage.Value;
+                if (image.Error != null) return $"Requires a loadable tensorsharp_flash_prefill module on GPU 0 ({image.Error}).";
+                return image.Attn8 ? null
+                    : $"Requires the 8-bit prompt attention (an sm_120a / sm_121a tensorsharp_flash_prefill image on an RTX Blackwell GPU): " +
+                      $"GPU 0 is sm_{image.Cc}, the loaded image is arch {image.ImageArch} (current: {image.Current}), and its attn8 probe reports 0.";
+            }
+        }
+
+        /// <summary>Skip reason for a test about an RTX Blackwell build (GPU 0 of CC 12.x running the fatbin's sm_12Xa code of
+        /// tensorsharp_flash_prefill), or null on one.</summary>
+        public static string RtxBlackwellImageSkip
+        {
+            get
+            {
+                if (CudaSkip != null) return CudaSkip;
+                var image = FlashPrefillImage.Value;
+                if (image.Error != null) return $"Requires a loadable tensorsharp_flash_prefill module on GPU 0 ({image.Error}).";
+                return RtxBlackwellImageSkipFor(image.Cc, image.ImageArch, image.Current, image.FromFatbin);
+            }
+        }
+
+        /// <summary>
+        /// <see cref="RtxBlackwellImageSkip"/> for GPU 0 of compute capability <paramref name="cc"/> (major x 10 + minor) and a
+        /// loaded image of <paramref name="imageArch"/> (its __CUDA_ARCH__ / 10): null only when the image is current and is
+        /// the fatbin's code for exactly this GPU's arch, which the build compiles for the arch-specific sm_12Xa target. The
+        /// arch number alone cannot tell: a PTX file (CudaEmitFatbin=false) or the fatbin's own compute_120 PTX that a
+        /// different 12.x GPU JITs (an RTX 50xx build copied to a GB10) read 120 as sm_120a code does, and carry no 'a' code.
+        /// </summary>
+        internal static string RtxBlackwellImageSkipFor(int cc, int imageArch, bool current, bool fromFatbin)
+        {
+            if (cc / 10 != 12) return $"Requires an RTX Blackwell GPU (CC 12.x); GPU 0 is sm_{cc}.";
+            if (!current) return $"Requires a current tensorsharp_flash_prefill image for this build (the loaded one is stale, arch {imageArch}).";
+            if (!fromFatbin || imageArch != cc)
+                return $"Requires the build's fatbin with sm_{cc}a code for this GPU: the loaded tensorsharp_flash_prefill image is " +
+                       $"{(fromFatbin ? "the fatbin's" : "a PTX file's")} arch {imageArch} code (a PTX-only build, a fatbin without {cc} in " +
+                       "CudaFatbinArchitectures, or one built for another 12.x GPU carries no sm_12Xa code).";
+            return null;
+        }
+
+        private static readonly Lazy<string> Fp4TensorCoresRefusal = new(() =>
+        {
+            try
+            {
+                using var context = TensorSharp.Cuda.CudaContext.Create(0);
+                context.MakeCurrent();
+                if (!TensorSharp.Cuda.CudaFp4Kernels.TryCreate(out TensorSharp.Cuda.CudaFp4Kernels kernels, out string reason))
+                    return reason;
+                kernels.Dispose();
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return $"{ex.GetType().Name}: {ex.Message}";
+            }
+        });
+
+        /// <summary>
+        /// Skip reason for a test that launches the FP4 tensor-core products (tensorsharp_fp4_kernels' W4A4 GEMMs, the planar NVFP4
+        /// matvec), or null when the module this process loads carries them on GPU 0: a current sm_120a / sm_121a image. Everywhere
+        /// else <c>CudaAllocator.Fp4Kernels</c> is null, NVFP4 weights stay ggml blocks and none of those routes exists.
+        /// </summary>
+        public static string Fp4TensorCoresSkip
+        {
+            get
+            {
+                if (CudaSkip != null) return CudaSkip;
+                string refusal = Fp4TensorCoresRefusal.Value;
+                return refusal == null ? null : $"Requires the FP4 tensor-core products of tensorsharp_fp4_kernels on GPU 0: {refusal.TrimEnd('.')}.";
+            }
+        }
+
         public static string MlxSkip =>
             MlxAvailable.Value ? null : "Requires the MLX native backend.";
 
@@ -358,6 +456,30 @@ namespace InferenceWeb.Tests
             set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
         }
         private BackendType _ggmlBackend;
+
+        /// <summary>The test launches the 8-bit prompt attention; skips where the loaded image has none (<see cref="TestGates.PromptAttention8Skip"/>).</summary>
+        public bool PromptAttention8
+        {
+            get => _promptAttention8;
+            set { _promptAttention8 = value; if (value) Skip ??= TestGates.PromptAttention8Skip; }
+        }
+        private bool _promptAttention8;
+
+        /// <summary>The test is about an RTX Blackwell build; skips elsewhere (<see cref="TestGates.RtxBlackwellImageSkip"/>).</summary>
+        public bool RtxBlackwellImage
+        {
+            get => _rtxBlackwellImage;
+            set { _rtxBlackwellImage = value; if (value) Skip ??= TestGates.RtxBlackwellImageSkip; }
+        }
+        private bool _rtxBlackwellImage;
+
+        /// <summary>The test launches the FP4 tensor-core products; skips where the loaded image has none (<see cref="TestGates.Fp4TensorCoresSkip"/>).</summary>
+        public bool Fp4TensorCores
+        {
+            get => _fp4TensorCores;
+            set { _fp4TensorCores = value; if (value) Skip ??= TestGates.Fp4TensorCoresSkip; }
+        }
+        private bool _fp4TensorCores;
     }
 
     /// <summary>
@@ -431,6 +553,14 @@ namespace InferenceWeb.Tests
             set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
         }
         private BackendType _ggmlBackend;
+
+        /// <summary>The test launches the 8-bit prompt attention; skips where the loaded image has none (<see cref="TestGates.PromptAttention8Skip"/>).</summary>
+        public bool PromptAttention8
+        {
+            get => _promptAttention8;
+            set { _promptAttention8 = value; if (value) Skip ??= TestGates.PromptAttention8Skip; }
+        }
+        private bool _promptAttention8;
     }
 
     /// <summary>

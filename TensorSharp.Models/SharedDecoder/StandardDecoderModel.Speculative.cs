@@ -79,8 +79,9 @@ namespace TensorSharp.Models
         /// <summary>
         /// A family moved buffers a cached graph binds. Plans keyed by identity never bind the moved ones again and stay for
         /// the steps that bind what did not move: a Qwen3.8 Flash Next request's first verify window grew 35 layers' verify
-        /// buffers, and each had dropped every plan and recording of every slot. Steps kept to advance see the move through
-        /// RecurrentState.BindingChanges. An executor that binds host addresses drops every graph.
+        /// buffers, and each had dropped every plan and recording of every slot. Steps kept to advance see the move through the
+        /// binding versions of their states (RecurrentState.NoteBindingsChanged). An executor that binds host addresses drops
+        /// every graph.
         /// </summary>
         protected void NoteGraphBindingsChanged()
         {
@@ -186,6 +187,17 @@ namespace TensorSharp.Models
         /// <summary>The per-token draft head's confidence gate; NaN keeps the speculator's default.</summary>
         public virtual float SpecPreferredDraftGate => float.NaN;
 
+        /// <summary>A prompt chunk through <see cref="SpecForward"/> (a speculating request's prefill,
+        /// <see cref="TensorSharp.Runtime.Speculative.SpeculativeExecution.PrefillStep"/>): its attention is marked as a prompt
+        /// chunk's, as a plain request's prefill of the same chunk is.</summary>
+        public void SpecForwardPrompt(int[] tokens, float[] hAllOut, float[] logitsOut)
+        {
+            bool outer = _promptScope;
+            _promptScope = true;
+            try { SpecForward(tokens, hAllOut, logitsOut, allLogitsRows: false); }
+            finally { _promptScope = outer; }
+        }
+
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             ArgumentNullException.ThrowIfNull(tokens);
@@ -197,6 +209,7 @@ namespace TensorSharp.Models
             SettlePendingVerify();
             int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
             EnsureCacheCapacity(checked(start + rows));
+            PrepareWrite(_cacheK, start);
             bool dflash = HasDFlash;
             // A buffer smaller than every row's DFlash features takes the last row's: the step returns only that row.
             bool lastFeatureRow = dflash && hAllOut != null && hAllOut.LongLength < (long)rows * DFlashSettings.FeatureSize;
@@ -210,6 +223,7 @@ namespace TensorSharp.Models
                 CaptureTail = lastFeatureRow ? 1 : 0,
                 CaptureFinal = !dflash && hAllOut != null,
                 RecurrentSnapshots = _anyRecurrent && rows > 1 && rows <= SmallChunkRows,
+                PromptChunks = MarksPromptChunks(_promptScope && !allLogitsRows, new[] { rows }),
             };
             if (GraphUnsupportedReason() != null)
             {
@@ -233,7 +247,7 @@ namespace TensorSharp.Models
                 {
                     PositionTable = request.PositionTable, AllRowLogits = request.AllRowLogits, LastRowLogits = request.LastRowLogits,
                     CaptureLayers = request.CaptureLayers, CaptureTail = request.CaptureTail, CaptureFinal = request.CaptureFinal,
-                    RecurrentSnapshots = request.RecurrentSnapshots,
+                    RecurrentSnapshots = request.RecurrentSnapshots, PromptChunks = request.PromptChunks,
                     FollowDraft = follow, DraftRows = PrepareDraftFollow(active, tokens, media),
                 };
                 _draftCarry = active.DraftCarry;
@@ -504,9 +518,18 @@ namespace TensorSharp.Models
                 foreach (string key in keys)
                 {
                     // A device with no room for the second slot (EnsureDeviceRoomForSlot) keeps the first warm: refused
-                    // here, the exception ended the load.
+                    // here, the exception ended the load. On a device this model manages (NewSlotWithRoom) the first one
+                    // is refused like a lone request where it does not fit beside the headroom and a prompt step: the
+                    // warm-up then keeps none, and the requests are refused (or run) by their own slots' room.
+                    int refusals = SlotRefusals;
                     try { EnsureSequenceSlot(key, FreshSlotTokens); }
                     catch (SequenceSlotUnavailableException) { break; }
+                    catch (InvalidOperationException) when (SlotRefusals > refusals)
+                    {
+                        Console.Error.WriteLine($"[{Config.Architecture}] the device has no room for the warm-up's pooled slot beside "
+                            + "its headroom and a prompt step: none is kept, and the first request allocates its own slot.");
+                        break;
+                    }
                     TryForwardUnified(new[] { key }, new[] { new[] { safeToken } }, new[] { 0 }, logits);
                 }
             }

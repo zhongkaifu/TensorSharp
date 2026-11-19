@@ -16,6 +16,9 @@ namespace TensorSharp.Cuda
         // transient tensors. See CudaDeviceMemoryPool for the design.
         private readonly CudaDeviceMemoryPool pool;
 
+        // TENSORSHARP_CUDA_POOL_MIN_FREE_MB: the free memory the pool keeps beside what it caches (see the constructor).
+        private readonly long freeReserveBytes;
+
         public CudaAllocator(int deviceId = 0)
         {
             CudaBackend.Register();
@@ -56,13 +59,15 @@ namespace TensorSharp.Cuda
             // Default: a quarter of the device's memory, at least 1 GB. A graph executor's prompt step allocates each
             // op's activations as it runs (a 3.6K-token step of Qwen3.8-27B holds 0.5 GB gate|up products); past the
             // budget every one went back to the driver through a synchronizing cuMemFree (2,863 a prompt, 0.55 s of a
-            // 2.3 s prefill on an RTX PRO 4500). An allocation that finds the device full drains the cache first.
+            // 2.3 s prefill on an RTX PRO 4500). An allocation that finds the device full gives back the cached blocks it
+            // needs, the least recently used size first (DeviceMemoryReclaimLadder).
             context.MakeCurrent();
             long deviceBytes = CudaDriverApi.cuMemGetInfo(out UIntPtr _, out UIntPtr totalBytes) == 0 ? (long)totalBytes.ToUInt64() : 0;
             long largeCachedBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_LARGE_MB", Math.Max(1024L, deviceBytes / 4 / (1024L * 1024L)))
                 * 1024L * 1024L;
 
             Context = context;
+            freeReserveBytes = minFreeReserveBytes;
             _stream = stream;
             Blas = blas;
             Kernels = kernels;
@@ -76,7 +81,62 @@ namespace TensorSharp.Cuda
                 backingFree: FreeDeviceMemory,
                 largeCachedBytesCap: largeCachedBytes,
                 queryFreeBytes: QueryFreeDeviceBytes,
-                minFreeReserveBytes: minFreeReserveBytes);
+                minFreeReserveBytes: minFreeReserveBytes,
+                mayRelievePressure: () => CudaGraphCapture.MayFreeCachedBlocksUnasked(this));
+
+            ladder = new DeviceMemoryReclaimLadder(
+                TryAllocateDevice,
+                () => Stream.Synchronize(),
+                bytes => pool.TrimLarge(bytes),
+                pool.DrainSmall,
+                () => RegisteredReclaimers,
+                () => CudaGraphCapture.IsCapturing(this),
+                CollectAndDrain,
+                ReportOnce.FullDrain,
+                deviceId,
+                VramLogEnabled ? line => Console.WriteLine($"{line}; {GetStats()}") : null,
+                minFreeReserveBytes);
+        }
+
+        // What an allocation does when the device is full (see DeviceMemoryReclaimLadder).
+        private readonly DeviceMemoryReclaimLadder ladder;
+
+        // Copy-on-write: the ladder reads it without a lock.
+        private IDeviceMemoryReclaimer[] reclaimers = Array.Empty<IDeviceMemoryReclaimer>();
+        private readonly object reclaimerSync = new();
+
+        /// <summary>The reclaimers an allocation that finds the device full asks, in the order they are asked.</summary>
+        internal IReadOnlyList<IDeviceMemoryReclaimer> RegisteredReclaimers => Volatile.Read(ref reclaimers);
+
+        /// <summary>Ask <paramref name="reclaimer"/> for device memory when an allocation here finds the device full, after
+        /// the cached blocks went back and before the last resort (a full GC and a drain of every cached block). Once per
+        /// reclaimer; asked in the order registered.</summary>
+        public void RegisterReclaimer(IDeviceMemoryReclaimer reclaimer)
+        {
+            ArgumentNullException.ThrowIfNull(reclaimer);
+            lock (reclaimerSync)
+            {
+                if (Array.IndexOf(reclaimers, reclaimer) >= 0) return;
+                var next = new IDeviceMemoryReclaimer[reclaimers.Length + 1];
+                reclaimers.CopyTo(next, 0);
+                next[^1] = reclaimer;
+                Volatile.Write(ref reclaimers, next);
+            }
+        }
+
+        /// <summary>Stop asking <paramref name="reclaimer"/> (it is detached or disposed).</summary>
+        public void UnregisterReclaimer(IDeviceMemoryReclaimer reclaimer)
+        {
+            if (reclaimer == null) return;
+            lock (reclaimerSync)
+            {
+                int at = Array.IndexOf(reclaimers, reclaimer);
+                if (at < 0) return;
+                var next = new IDeviceMemoryReclaimer[reclaimers.Length - 1];
+                Array.Copy(reclaimers, 0, next, 0, at);
+                Array.Copy(reclaimers, at + 1, next, at, reclaimers.Length - at - 1);
+                Volatile.Write(ref reclaimers, next);
+            }
         }
 
         public BlasEnum BlasEnum => BlasEnum.CUDA;
@@ -155,23 +215,48 @@ namespace TensorSharp.Cuda
         private CudaSsmPrefillKernels ssmPrefillKernels;
         private CudaFlashPrefillKernels flashPrefillKernels;
         private int fp4State, ssmPrefillState, flashPrefillState;   // 0: not loaded yet, 1: loaded, 2: unavailable
+        private string fp4Refusal, ssmPrefillRefusal, flashPrefillRefusal;
 
         /// <summary>The FP4 tensor-core products for this device (tensorsharp_fp4_kernels), loaded on first use; null
-        /// where the image has no tensor-core code for this GPU or is missing.</summary>
-        internal CudaFp4Kernels Fp4Kernels => LoadOnce(ref fp4Kernels, ref fp4State, CudaFp4Kernels.TryCreate);
+        /// where the image has no tensor-core code for this GPU or is missing. Its refusal is reported where an NVFP4
+        /// weight needs it (<see cref="WarnNvfp4WithoutFp4Kernels"/>): every prompt step's add-norm asks for it too.</summary>
+        internal CudaFp4Kernels Fp4Kernels => LoadOnce(ref fp4Kernels, ref fp4State, ref fp4Refusal, CudaFp4Kernels.TryCreate, null, null);
+
+        /// <summary>An NVFP4 weight is being made resident: warn once, with the reason, when the FP4 kernels are refused
+        /// here and its products therefore run without them.</summary>
+        internal void WarnNvfp4WithoutFp4Kernels()
+        {
+            if (Fp4Kernels == null)
+                CudaModuleRefusals.Process.Warn(CudaModuleRefusals.ModuleName(CudaFp4Kernels.PtxFileName), DeviceId, fp4Refusal,
+                    CudaModuleRefusals.Fp4Consequence);
+        }
 
         /// <summary>Rows an NVFP4 product takes on the q8 matvec (row-invariant) before the FP4 GEMMs: up to
         /// <see cref="CudaFp4Kernels.GemvMaxRows"/>, <see cref="CudaFp4Kernels.MultiSequenceGemvRows"/> while a step of
-        /// several sequences runs (CudaGraphExecutor.StepSequences).</summary>
-        internal int Nvfp4MatvecRows { get; set; } = CudaFp4Kernels.GemvMaxRows;
+        /// several sequences runs (CudaGraphExecutor.StepSequences); every row count under
+        /// <see cref="AllNvfp4RowsOnMatvecForTests"/>.</summary>
+        internal int Nvfp4MatvecRows
+        {
+            get => AllNvfp4RowsOnMatvecForTests ? int.MaxValue : nvfp4MatvecRows;
+            set => nvfp4MatvecRows = value;
+        }
+
+        private int nvfp4MatvecRows = CudaFp4Kernels.GemvMaxRows;
+
+        /// <summary>Test seam, never set by the product: every NVFP4 product runs on the q8 matvec (<see cref="CudaFp4Kernels.GemvMaxRows"/>
+        /// rows a call), so prompt rows keep q8 activations as decode rows do instead of NVFP4 ones on the FP4 GEMMs. It measures what
+        /// the prompt path's NVFP4 activations cost (eng/LongContextQualityProbe's q8act arm).</summary>
+        internal bool AllNvfp4RowsOnMatvecForTests { get; set; }
 
         /// <summary>The recurrent-layer prefill kernels for this device (tensorsharp_ssm_prefill), loaded on first use;
         /// null where the module is missing or stale.</summary>
-        internal CudaSsmPrefillKernels SsmPrefillKernels => LoadOnce(ref ssmPrefillKernels, ref ssmPrefillState, CudaSsmPrefillKernels.TryCreate);
+        internal CudaSsmPrefillKernels SsmPrefillKernels => LoadOnce(ref ssmPrefillKernels, ref ssmPrefillState, ref ssmPrefillRefusal,
+            CudaSsmPrefillKernels.TryCreate, CudaSsmPrefillKernels.PtxFileName, CudaModuleRefusals.SsmPrefillConsequence);
 
         /// <summary>The flash prefill attention kernels for this device (tensorsharp_flash_prefill), loaded on first use;
         /// null where the module is missing or stale.</summary>
-        internal CudaFlashPrefillKernels FlashPrefillKernels => LoadOnce(ref flashPrefillKernels, ref flashPrefillState, CudaFlashPrefillKernels.TryCreate);
+        internal CudaFlashPrefillKernels FlashPrefillKernels => LoadOnce(ref flashPrefillKernels, ref flashPrefillState, ref flashPrefillRefusal,
+            CudaFlashPrefillKernels.TryCreate, CudaFlashPrefillKernels.PtxFileName, CudaModuleRefusals.FlashPrefillConsequence);
 
         /// <summary>Raised before a recorded step is launched (or recorded): host threads its kernels wait on spin up.</summary>
         internal event Action RecordedStepLaunching;
@@ -192,20 +277,17 @@ namespace TensorSharp.Cuda
             lock (ownedResources) ownedResources.Add(resource);
         }
 
-        private delegate bool ModuleFactory<T>(out T module, out string reason);
+        /// <summary>A module loaded on first use (<see cref="CudaModuleRefusals.LoadOnce"/>); a refusal is warned about once,
+        /// naming <paramref name="consequence"/>, unless that is null (the caller reports it where it matters).</summary>
+        private T LoadOnce<T>(ref T module, ref int state, ref string refusal, CudaModuleFactory<T> create, string ptxFileName,
+            string consequence) where T : class
+            => Volatile.Read(ref state) != 0 ? module : LoadFirst(ref module, ref state, ref refusal, create, ptxFileName, consequence);
 
-        private T LoadOnce<T>(ref T module, ref int state, ModuleFactory<T> create) where T : class
-        {
-            if (Volatile.Read(ref state) != 0) return module;
-            lock (this)
-            {
-                if (state != 0) return module;
-                Context.MakeCurrent();
-                bool loaded = create(out module, out _);
-                Volatile.Write(ref state, loaded ? 1 : 2);
-                return module;
-            }
-        }
+        private T LoadFirst<T>(ref T module, ref int state, ref string refusal, CudaModuleFactory<T> create, string ptxFileName,
+            string consequence) where T : class
+            => CudaModuleRefusals.LoadOnce(this, ref module, ref state, ref refusal, Context.MakeCurrent, create,
+                consequence == null ? null : reason => CudaModuleRefusals.Process.Warn(CudaModuleRefusals.ModuleName(ptxFileName),
+                    DeviceId, reason, consequence));
 
         public Storage Allocate(DType elementType, long elementCount)
         {
@@ -280,24 +362,45 @@ namespace TensorSharp.Cuda
             return pool.TrySteal(ptr, allocationBytes);
         }
 
+        private const int OutOfMemoryStatus = 2; // CUDA_ERROR_OUT_OF_MEMORY
+
+        /// <summary>The pool's backing allocation: a device block, climbing the reclaim ladder when the device is full.</summary>
         private IntPtr AllocateDeviceMemory(long allocationBytes)
+        {
+            IntPtr ptr = ladder.Allocate(allocationBytes);
+            if (ptr == IntPtr.Zero) OutOfMemoryStatus.ThrowOnError();
+            return ptr;
+        }
+
+        /// <summary>A device block outside the pool (a kernel's own scratch), made room for as a pool allocation is when the
+        /// device is full. Not while a graph is captured here: the ladder's synchronize would abort the capture.</summary>
+        internal IntPtr AllocateUnpooled(long bytes)
+        {
+            ThrowIfDisposed();
+            return AllocateDeviceMemory(bytes);
+        }
+
+        /// <summary>One cuMemAlloc: the block, or zero when the device is out of memory (other failures throw).</summary>
+        private IntPtr TryAllocateDevice(long allocationBytes)
         {
             Context.MakeCurrent();
             int rc = CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)allocationBytes));
-            if (rc == 2 /* CUDA_ERROR_OUT_OF_MEMORY */)
-            {
-                // Storages whose last reference is an unreachable-but-unfinalized
-                // tensor (view chains) only release on collection; reclaim them and
-                // the pool's cached blocks before giving up.
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                GC.Collect();
-                Stream.Synchronize();
-                pool.DrainAndFree();
-                rc = CudaDriverApi.cuMemAlloc(out ptr, new UIntPtr((ulong)allocationBytes));
-            }
+            if (rc == OutOfMemoryStatus) return IntPtr.Zero;
             rc.ThrowOnError();
             return ptr;
+        }
+
+        /// <summary>The ladder's last resort, the old out-of-memory path: storages whose last reference is an
+        /// unreachable-but-unfinalized tensor (view chains) only release on collection; collect them, then drain every
+        /// cached block.</summary>
+        private void CollectAndDrain()
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Context.MakeCurrent();
+            Stream.Synchronize();
+            pool.DrainAndFree();
         }
 
         private void FreeDeviceMemory(IntPtr ptr)
@@ -339,13 +442,26 @@ namespace TensorSharp.Cuda
             return ((long)free.ToUInt64(), (long)total.ToUInt64());
         }
 
-        /// <summary>Free device memory, with the blocks the pool caches for reuse counted as free, and the total.</summary>
+        /// <summary>Whether a rent of <paramref name="requestedBytes"/> would reuse a block the pool caches (no driver
+        /// allocation, so no out-of-memory reclaim).</summary>
+        internal bool HasCachedBlock(long requestedBytes) => pool.HasCachedBlock(requestedBytes);
+
+        /// <summary>The driver's free device memory in bytes (the pool's cached blocks not counted); 0 when the query fails.</summary>
+        internal long FreeDeviceBytes()
+        {
+            Context.MakeCurrent();
+            return CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr _) == 0 ? (long)free.ToUInt64() : 0;
+        }
+
+        /// <summary>Free device memory, with the large blocks the pool caches counted as free (an allocation that needs the
+        /// room gives them back, <see cref="ReclaimableBytes"/>), and the total. The shards' small cached blocks are not
+        /// counted: they go back only once the large ones did not make room.</summary>
         public bool TryGetDeviceMemory(out long freeBytes, out long totalBytes)
         {
             try
             {
                 (freeBytes, totalBytes) = GetMemoryInfo();
-                freeBytes += pool.GetStats().CachedBytes;
+                freeBytes += pool.LargeCachedBytes;
                 return totalBytes > 0;
             }
             catch (CudaException)
@@ -407,16 +523,108 @@ namespace TensorSharp.Cuda
             if (!VramLogEnabled)
                 return;
             (long free, long total) = GetMemoryInfo();
-            long cached = pool.GetStats().CachedBytes;
+            CudaAllocatorStats stats = GetStats();
             Console.WriteLine(
                 $"[vram] {label}: free={free / (1024 * 1024)} MB used={(total - free) / (1024 * 1024)} MB " +
-                $"pool_cached={cached / (1024 * 1024)} MB");
+                $"pool_cached={stats.CachedBytes / (1024 * 1024)} MB (large={stats.LargeCachedBytes / (1024 * 1024)} MB) " +
+                $"cuMemAlloc={stats.CuMemAllocCount} cuMemFree={stats.CuMemFreeCount} largeTrimFrees={stats.LargeTrimFrees} " +
+                $"oomTrims={stats.OomTrims} oomReclaims={stats.OomReclaims} fullDrains={stats.FullDrains}");
         }
 
         /// <summary>
         /// Snapshot of allocator pool counters for diagnostics / load testing.
         /// </summary>
-        public CudaAllocatorStats GetStats() => pool.GetStats();
+        public CudaAllocatorStats GetStats()
+            => pool.GetStats().WithReclaims(ladder.OomTrims, ladder.OomReclaims, ladder.FullDrains);
+
+        /// <summary>Bytes of the large blocks the pool caches: an allocation that finds the device full gives them back
+        /// first (<see cref="TrimLargeCache"/>), so they count as free room.</summary>
+        public long ReclaimableBytes => pool.LargeCachedBytes;
+
+        /// <summary>The pool's pressure relief as a return under the free-memory reserve runs it, on this thread (tests: the
+        /// device need not be full); the bytes freed.</summary>
+        internal long RelievePressureForTests(long bytes) => pool.RelievePressure(bytes, keepBlockBytes: 0);
+
+        /// <summary>
+        /// Give cached large blocks back to the driver, the least recently used size first, until <paramref name="bytes"/> are
+        /// freed or none is left, never one of <paramref name="keepBlockBytes"/> (the size an allocation about to be made
+        /// rents); returns the bytes freed. Synchronizes this thread's stream first, so not while a graph is captured here. For callers that
+        /// need room outside the pool (a staging arena, a recording): unlike <see cref="TrimPool"/> it keeps every block it
+        /// does not need to free, and the small ones.
+        /// </summary>
+        public long TrimLargeCache(long bytes, long keepBlockBytes = 0)
+        {
+            ThrowIfDisposed();
+            if (bytes <= 0 || pool.LargeCachedBytes == 0) return 0;
+            Context.MakeCurrent();
+            Stream.Synchronize();
+            return pool.TrimLarge(bytes, keepBlockBytes);
+        }
+
+        /// <summary>
+        /// Give back cached large blocks, the least recently used size first, so that an allocation of <paramref name="bytes"/>
+        /// about to be made (a model's slot, a prompt step) finds them at the driver beside the pool's free-memory reserve and
+        /// the ladder's slack, instead of failing a cuMemAlloc and climbing the ladder once for each of its tensors; never a block
+        /// of <paramref name="keepBlockBytes"/> (the size its tensors rent, which cached blocks of serve). Nothing while a graph is
+        /// captured here. Synchronizes this thread's stream when it frees. Returns the bytes freed.
+        /// </summary>
+        /// <param name="driverFreeBytes">The driver's free bytes when the caller just read them (<see cref="TryGetDeviceMemory"/>
+        /// less <see cref="ReclaimableBytes"/>), or a negative value to read them here.</param>
+        public long TrimForAllocation(long bytes, long keepBlockBytes = 0, long driverFreeBytes = -1)
+        {
+            ThrowIfDisposed();
+            if (bytes <= 0 || pool.LargeCachedBytes == 0 || CudaGraphCapture.IsCapturing(this)) return 0;
+            long free = driverFreeBytes >= 0 ? driverFreeBytes : GetMemoryInfo().freeBytes;
+            long shortfall = DeviceMemoryReclaimLadder.TrimTarget(bytes, freeReserveBytes) - free;
+            return shortfall > 0 ? TrimLargeCache(shortfall, keepBlockBytes) : 0;
+        }
+
+        /// <summary>The block the pool hands out for an allocation of <paramref name="bytes"/>: a cached block of this size
+        /// serves it.</summary>
+        public long AllocationBlockBytes(long bytes) => CudaDeviceMemoryPool.RoundAllocationSize(Math.Max(bytes, 1));
+
+        /// <summary>Whether a CUDA graph is being captured on this allocator: a holder that gives memory back on its own waits
+        /// (a captured graph may come to own blocks the pool caches).</summary>
+        public bool CapturesGraph => CudaGraphCapture.IsCapturing(this);
+
+        private int integrated = -1;
+
+        /// <summary>
+        /// Diagnostic (TS_CUDA_LOG_VRAM=1): what a model's device-room accounting reads (the driver's free memory and the
+        /// cached large blocks it counts as free), with whether the GPU is integrated and the host's MemAvailable: on a unified
+        /// device (GB10) cuMemGetInfo may or may not count the host's reclaimable page cache, which decides how eagerly the
+        /// prefix cache gives conversations up.
+        /// </summary>
+        public void LogDeviceRoom(string label)
+        {
+            if (!VramLogEnabled) return;
+            try
+            {
+                (long free, long total) = GetMemoryInfo();
+                if (integrated < 0)
+                    integrated = CudaDriverApi.cuDeviceGet(out int device, DeviceId) == 0
+                        && CudaDriverApi.cuDeviceGetAttribute(out int value, 18 /* CU_DEVICE_ATTRIBUTE_INTEGRATED */, device) == 0
+                        ? value : 0;
+                Console.WriteLine($"[vram] {label}: GPU {DeviceId} cuMemGetInfo free={free >> 20} MiB of {total >> 20} MiB, "
+                    + $"large cached={pool.LargeCachedBytes >> 20} MiB, integrated={integrated}, host MemAvailable={HostMemAvailable()}");
+            }
+            catch (Exception)
+            {
+                // Diagnostics must never break inference.
+            }
+
+            static string HostMemAvailable()
+            {
+                if (!OperatingSystem.IsLinux()) return "n/a";
+                foreach (string line in System.IO.File.ReadLines("/proc/meminfo"))
+                    if (line.StartsWith("MemAvailable:", StringComparison.Ordinal))
+                    {
+                        string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        return parts.Length >= 2 && long.TryParse(parts[1], out long kb) ? $"{kb >> 10} MiB" : "n/a";
+                    }
+                return "n/a";
+            }
+        }
 
         public void Synchronize()
         {
@@ -428,7 +636,8 @@ namespace TensorSharp.Cuda
         /// pipeline stage boundaries where the next stage's working set has a
         /// different shape profile (e.g. a diffusion denoise handing over to a
         /// video VAE): live allocations are untouched, but the caller must ensure
-        /// no concurrent Rent/Return on this allocator.</summary>
+        /// no concurrent Rent/Return on this allocator. A caller that only needs
+        /// room uses <see cref="TrimLargeCache"/>.</summary>
         public void TrimPool()
         {
             ThrowIfDisposed();
@@ -493,8 +702,18 @@ namespace TensorSharp.Cuda
             long peakCachedBytes,
             long maxCachedBytes,
             long maxCachedBlockBytes,
-            int shardCount)
+            int shardCount,
+            long largeCachedBytes = 0,
+            long largeTrimFrees = 0,
+            long oomTrims = 0,
+            long oomReclaims = 0,
+            long fullDrains = 0)
         {
+            LargeCachedBytes = largeCachedBytes;
+            LargeTrimFrees = largeTrimFrees;
+            OomTrims = oomTrims;
+            OomReclaims = oomReclaims;
+            FullDrains = fullDrains;
             PoolEnabled = poolEnabled;
             PoolHitCount = poolHitCount;
             PoolMissCount = poolMissCount;
@@ -516,11 +735,33 @@ namespace TensorSharp.Cuda
         /// <summary>Rent calls that fell through to a backing allocation.</summary>
         public long PoolMissCount { get; }
 
-        /// <summary>Total cuMemAlloc driver calls issued (== <see cref="PoolMissCount"/>).</summary>
+        /// <summary>Total cuMemAlloc driver calls issued for rents (== <see cref="PoolMissCount"/>, small and large).</summary>
         public long CuMemAllocCount { get; }
 
-        /// <summary>Total cuMemFree driver calls issued.</summary>
+        /// <summary>Total cuMemFree driver calls the pool issued: returns past the cache, trims and drains.</summary>
         public long CuMemFreeCount { get; }
+
+        /// <summary>Bytes of the large (2 MiB and up) blocks cached, part of <see cref="CachedBytes"/>.</summary>
+        public long LargeCachedBytes { get; }
+
+        /// <summary>Cached large blocks given back to the driver to make room (trims, not drains).</summary>
+        public long LargeTrimFrees { get; }
+
+        /// <summary>Allocations that found the device full and succeeded once cached blocks went back.</summary>
+        public long OomTrims { get; }
+
+        /// <summary>Allocations that found the device full and succeeded once a registered reclaimer released memory.</summary>
+        public long OomReclaims { get; }
+
+        /// <summary>Allocations that found the device full and reached the last resort: a full GC and a drain of every
+        /// cached block.</summary>
+        public long FullDrains { get; }
+
+        /// <summary>These counters with the allocator's out-of-memory outcomes.</summary>
+        internal CudaAllocatorStats WithReclaims(long oomTrims, long oomReclaims, long fullDrains)
+            => new(PoolEnabled, PoolHitCount, PoolMissCount, CuMemAllocCount, CuMemFreeCount, ReturnedToPoolCount, CachedBytes,
+                PeakCachedBytes, MaxCachedBytes, MaxCachedBlockBytes, ShardCount, LargeCachedBytes, LargeTrimFrees, oomTrims,
+                oomReclaims, fullDrains);
 
         /// <summary>Return calls that parked a block back into the pool.</summary>
         public long ReturnedToPoolCount { get; }
@@ -546,7 +787,8 @@ namespace TensorSharp.Cuda
         {
             return $"CudaAllocatorStats(shards={ShardCount}, hits={PoolHitCount}, misses={PoolMissCount}, hitRatio={PoolHitRatio:P1}, " +
                    $"cuMemAlloc={CuMemAllocCount}, cuMemFree={CuMemFreeCount}, returnedToPool={ReturnedToPoolCount}, " +
-                   $"cachedBytes={CachedBytes}, peakCachedBytes={PeakCachedBytes})";
+                   $"cachedBytes={CachedBytes}, largeCachedBytes={LargeCachedBytes}, peakCachedBytes={PeakCachedBytes}, " +
+                   $"largeTrimFrees={LargeTrimFrees}, oomTrims={OomTrims}, oomReclaims={OomReclaims}, fullDrains={FullDrains})";
         }
     }
 }

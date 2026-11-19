@@ -177,8 +177,9 @@ public static class Program
             int start = 0;
             if (prefill && first > 1)
             {
-                // Positions [0, first-1) are context only: their logits are never read.
-                model.Forward(ids.GetRange(baseIdx, first - 1).ToArray());
+                // Positions [0, first-1) are context only: their logits are never read. A prompt chunk, as served
+                // (a model may attend prompt chunks with their own kernels).
+                model.ForwardPrompt(ids.GetRange(baseIdx, first - 1).ToArray());
                 start = first - 1;
             }
             for (int i = start; i < nCtx - 1; i++)

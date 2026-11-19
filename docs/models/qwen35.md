@@ -48,6 +48,31 @@ name their projector `mmproj-F16.gguf`, so they must not share a directory):
 > and are ignored at inference). On sm_120 GPUs prefill uses ggml-cuda's
 > native block-scaled FP4 tensor-core path.
 
+> **NVFP4 prompt rows are W4A4.** On the FP4 tensor cores a product of more
+> rows than the 8-bit matvec takes quantizes its activations to NVFP4 as well:
+> on `--backend cuda` (an sm_120a / sm_121a build) more than 16 rows, or more
+> than 8 in a step of several sequences; on ggml-cuda on Blackwell more than 8
+> rows. A prompt chunk is such a product. A decode step keeps 8-bit
+> activations, and so does a verify window within those limits. Prompt rows therefore
+> predict worse than decode rows: on 8K windows of Qwen3.8-27B NVFP4 the prompt
+> rows' mean NLL is 0.12 nats above the decode rows' on the same tokens for
+> English prose (top-1 agreement 85%) and 0.005 for C# code. With 8-bit
+> activations on the prompt rows, or with the Q6_K file, the two paths agree
+> within 0.002. `--backend ggml_cuda` (+0.13 / +0.01), llama.cpp
+> (`llama-perplexity` 7.36 at `-ub 512` against 6.65 at `-ub 8`, Q6_K 5.60 at
+> both) and the removed direct engine show the same gap. A request feels it in
+> its first generated token, which comes from a prompt row, and slightly in its
+> first few dozen decode rows. Running the prompt's last token as a one-row step
+> of its own (the removed engine did) recovers only part of it: on 256 prose
+> targets that row's distribution is about 40% closer (KL) to the 8-bit path's
+> than the prompt row's, and most of the cost stays in the context the prompt
+> rows built. The cost comes from the W4A4 kernels these prompt paths run, not
+> from the NVFP4 weights alone: the same prompt rows with 8-bit activations show
+> no gap. Prefer `Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf` from the same repo (22.858
+> GB) where prompt-side precision matters more than prefill speed. Measured with
+> `eng/LongContextQualityProbe` (`--arms default,q8act`) on an RTX PRO 4500,
+> 2026-11.
+
 The conversion cards identify the corresponding official Qwen repositories as
 their base models; those upstream cards declare Apache-2.0.
 
@@ -673,7 +698,11 @@ Plain decode is 46.8 ms a token on MLX against 48.4 on ggml_metal. Decode after 
 - **Full-attention layers**: a K/V cache per slot, `[kv_heads, capacity, head_dim]`, in the
   `--kv-cache-dtype` type (`f32`, `f16`, `q8_0`, `q4_0`). A slot starts small and grows on demand
   up to the context length; idle retained slots give their device copies back before a step would
-  run out of device memory.
+  run out of device memory. On `--backend cuda` the cache is `f16` (for weights below F32) unless
+  `--kv-cache-dtype` names another. `q8_0` about halves it (34 of every 64 bytes): Qwen3.8-27B NVFP4 with its DFlash2 drafter
+  serves a whole 130K-token agent turn on a 32 GB card with `q8_0`; its fresh 130K-token prefill
+  takes 5% longer than at `f16`, and its verify steps take as long as at `f16` up to 69K tokens
+  (RTX PRO 4500 Blackwell; see `docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`).
 - **Recurrent layers**: the conv window `(conv_kernel - 1) x qkv_dim` and the delta state
   `[v_heads, head_v_dim, head_k_dim]` per slot. A recurrent state cannot rewind, so a slot truncates
   only to its length or to zero.

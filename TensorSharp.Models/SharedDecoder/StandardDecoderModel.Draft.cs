@@ -123,6 +123,7 @@ namespace TensorSharp.Models
         /// through the per-op layer, its attention floored at the rows it replayed.</summary>
         private void RunDraftLayerPerOp(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
         {
+            PrepareWrite(_cacheK, startPos);
             int rows = tokens.Length, hiddenSize = Config.HiddenSize, n = Config.NumLayers;
             _forwardSw.Start();
             Tensor x = null;
@@ -357,7 +358,7 @@ namespace TensorSharp.Models
             }
             for (int s = 0; s < lanes; s++)
             {
-                EnsureSlotCapacity(slots[s], reach[s]);
+                EnsureSlotCapacity(slots[s], reach[s], wanted: WantedCells(requestIds[s], reach[s]));
                 slots[s].DraftFollowed = -1;   // the layer's rows from here on are the speculator's, as a single chain's
             }
 
@@ -565,34 +566,60 @@ namespace TensorSharp.Models
                 _followPlainPrompt = true;
                 _followPlainPromptEnd = promptEnd;
             }
-            else (_followPromptRequests ??= new Dictionary<string, int>(StringComparer.Ordinal))[requestId] = promptEnd;
+            else (_followPromptRequests ??= new Dictionary<string, (int, bool)>(StringComparer.Ordinal))[requestId] = (promptEnd, false);
+        }
+
+        /// <summary>
+        /// A prompt chunk of a request that does not speculate: where the trunk's steps write a DFlash ring
+        /// (<see cref="DFlashSelfCatchUp"/>), the chunk's rows the ring holds at the prompt's end go into the request's ring,
+        /// one no running request holds (a request that speculates keeps its own), so a later turn that reuses this prompt's
+        /// cache continues on its context (ModelBase.ContinueDFlashRing). The ring takes a prompt's last ring-length rows
+        /// whatever the prompt's length: the encoder and the draft layers' K/V projections over them, beside the trunk's
+        /// forward. The MTP draft layer, whose context is every row of the prompt in the request's own slot, is not
+        /// fed so (a layer of the trunk's over the whole prompt).
+        /// </summary>
+        public void FollowUnspeculatedPrompt(string requestId, int promptEnd)
+        {
+            if (requestId == null || !DFlashSelfCatchUp) return;
+            _followPromptRequests ??= new Dictionary<string, (int, bool)>(StringComparer.Ordinal);
+            // A request registered to speculate for this chunk keeps that registration.
+            if (_followPromptRequests.TryGetValue(requestId, out var registered) && !registered.Aside) return;
+            _followPromptRequests[requestId] = (promptEnd, true);
         }
 
         /// <summary>Each request's registered prompt end (<see cref="FollowPlainPrompt(string, int)"/>; -1 unknown), the
-        /// registrations taken, or <see cref="DFlashNoFollow"/> for a request that registered none; null when none did.</summary>
-        private int[] TakeFollowedPrompts(IReadOnlyList<string> requestIds)
+        /// registrations taken, or <see cref="DFlashNoFollow"/> for a request that registered none; null when none did.
+        /// <paramref name="aside"/> marks the requests that registered without speculating
+        /// (<see cref="FollowUnspeculatedPrompt"/>), null when none did.</summary>
+        private int[] TakeFollowedPrompts(IReadOnlyList<string> requestIds, out bool[] aside)
         {
+            aside = null;
             if (_followPromptRequests == null || _followPromptRequests.Count == 0) return null;
             int[] ends = null;
             for (int s = 0; s < requestIds.Count; s++)
             {
-                if (!_followPromptRequests.Remove(requestIds[s], out int end)) continue;
+                if (!_followPromptRequests.Remove(requestIds[s], out var registered)) continue;
                 if (ends == null)
                 {
                     ends = new int[requestIds.Count];
                     Array.Fill(ends, DFlashNoFollow);
                 }
-                ends[s] = end;
+                ends[s] = registered.End;
+                if (registered.Aside) (aside ??= new bool[requestIds.Count])[s] = true;
             }
             return ends;
         }
 
         /// <summary>Put back registrations <see cref="TakeFollowedPrompts"/> took for a step that did not run.</summary>
-        private void RestoreFollowedPrompts(IReadOnlyList<string> requestIds, int[] promptEnds)
+        private void RestoreFollowedPrompts(IReadOnlyList<string> requestIds, int[] promptEnds, bool[] aside)
         {
             if (promptEnds == null) return;
             for (int s = 0; s < requestIds.Count; s++)
-                if (promptEnds[s] != DFlashNoFollow) FollowPlainPrompt(requestIds[s], promptEnds[s]);
+            {
+                if (promptEnds[s] == DFlashNoFollow) continue;
+                if (aside != null && aside[s]) FollowUnspeculatedPrompt(requestIds[s], promptEnds[s]);
+                else FollowPlainPrompt(requestIds[s], promptEnds[s]);
+            }
         }
 
         /// <summary>How a step of the active cache takes the draft layer along (<see cref="EmitDraftFollow"/>).</summary>
@@ -600,7 +627,8 @@ namespace TensorSharp.Models
 
         private bool _followPlainPrompt;   // the primary cache's next plain prompt chunk is a speculating request's
         private int _followPlainPromptEnd = -1;   // that prompt's end (-1: unknown)
-        private Dictionary<string, int> _followPromptRequests;   // per-request slots whose next prompt chunk is, and its end
+        // Per-request slots whose next prompt chunk is followed: its prompt's end, and whether the request does not speculate.
+        private Dictionary<string, (int End, bool Aside)> _followPromptRequests;
         private int _draftFollowed = -1;   // the active cache's Slot.DraftFollowed
         private Tensor _draftCarry;        // the active cache's Slot.DraftCarry
 

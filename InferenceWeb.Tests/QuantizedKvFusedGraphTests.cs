@@ -99,7 +99,8 @@ public class QuantizedKvFusedGraphTests
     ///
     /// <para>
     /// TS_KVQ_MODEL=&lt;gguf&gt; selects the weights, TS_KVQ_BACKEND the backend
-    /// (default: the process's pinned GGML backend, TS_TEST_GGML_BACKEND). Skipped when unset.
+    /// (default: the process's pinned GGML backend, TS_TEST_GGML_BACKEND; <c>direct_cuda</c> is TensorSharp's own CUDA
+    /// backend, whose graphs take q8_0 alone of the block tiers). Skipped when unset.
     /// </para>
     /// </summary>
     [ModelFact("TS_KVQ_MODEL")]
@@ -117,6 +118,7 @@ public class QuantizedKvFusedGraphTests
             "ggml_metal" or "metal" => BackendType.GgmlMetal,
             "ggml_cuda" or "cuda" => BackendType.GgmlCuda,
             "ggml_cpu" or "cpu" => BackendType.GgmlCpu,
+            "direct_cuda" => BackendType.Cuda,
             _ => TestGates.PinnedGgmlBackend,
         };
         const int steps = 12;
@@ -142,7 +144,9 @@ public class QuantizedKvFusedGraphTests
             }
             _output.WriteLine($"[kv-quant] arch={arch} backend={backend} f16={string.Join(",", reference)}");
 
-            foreach (KvCacheDtype tier in new[] { KvCacheDtype.Q8_0, KvCacheDtype.Q4_0 })
+            // Direct CUDA's executor takes q8_0 caches in its flash kernels and no q4_0 (that tier keeps a model off its graphs).
+            KvCacheDtype[] tiers = backend == BackendType.Cuda ? new[] { KvCacheDtype.Q8_0 } : new[] { KvCacheDtype.Q8_0, KvCacheDtype.Q4_0 };
+            foreach (KvCacheDtype tier in tiers)
             {
                 int[] got = GreedyContinuation(modelPath, backend, tier, steps, out _);
                 _output.WriteLine($"[kv-quant] {tier.ToShortString()}={string.Join(",", got)}");

@@ -101,6 +101,236 @@ public sealed class GraphBlockDraftTests : IDisposable
         Assert.True(executor.RingAttentions > 0, $"{family} {variant}: no draft attention ran on the ring kernel");
     }
 
+    /// <summary>
+    /// A later request's drafts on the model's ring at positions behind the earlier request's last ones (another, shorter
+    /// conversation), after another state's buffers changed in between (a new request's first verify window grows its own):
+    /// the steps kept over the ring move there (no trace, no build, and where the executor records its steps, no new
+    /// recording), and every block drafts bit for bit what steps traced at each call draft, the ring's rows too.
+    /// </summary>
+    [Theory]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequest(string variant) => RingStepsMoveBehind(BackendType.Cpu, variant);
+
+    /// <summary>The same on direct CUDA, whose kept steps replay their recordings: a recorded step moved behind its last
+    /// position answers as the eager steps of a model that traces every call.</summary>
+    [CudaTheory]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequestOnDirectCuda(string variant) => RingStepsMoveBehind(BackendType.Cuda, variant);
+
+    /// <summary>The same on the GGML builders, whose plans replay too (GraphCapabilities.Replays): their kept ring steps move
+    /// behind as well, with the inputs rewritten on the host.</summary>
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequestOnGgmlCpu(string variant) => RingStepsMoveBehind(BackendType.GgmlCpu, variant);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequestOnMetal(string variant) => RingStepsMoveBehind(BackendType.GgmlMetal, variant);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void RingStepsMoveBehindForALaterRequestOnGgmlCuda(string variant) => RingStepsMoveBehind(BackendType.GgmlCuda, variant);
+
+    private void RingStepsMoveBehind(BackendType backend, string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var (target, draft) = Fixtures(variant);
+        // (ggml_metal keeps DFlash2 on its fused selector tail unless a test asks for the graph programs.)
+        using var kept = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { GraphBlockDraftOnMetalForTests = true };
+        using var traced = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft)
+            { DecodeAdvanceDisabled = true, GraphBlockDraftOnMetalForTests = true };
+        string label = $"{backend} {variant}";
+        int recorded = 0, built = 0, moved = 0;
+        // The first request runs past position 40; the second starts again at 9, after another state's buffers changed.
+        List<string> mismatches = DraftBitwise(kept, traced, new[] { 21, 9 },
+            beforeRequest: request =>
+            {
+                if (request == 1) Interlocked.Increment(ref StandardDecoderModel.RecurrentState.BindingChanges);
+            },
+            afterPrompt: request =>
+            {
+                // (The prompt's rows reach the ring in one program of their width; the server's prompt step writes them itself.)
+                if (request == 1) (recorded, built, moved) = (kept.DecodeRecordings, kept.GraphBuilds, kept.DraftRebases);
+            });
+        _output.WriteLine($"{label}: {kept.DraftRebases - moved} steps moved behind in the second request, {kept.DraftAdvances} advanced " +
+            $"in all; {kept.GraphBuilds - built} builds and {kept.DecodeRecordings - recorded} recordings in the second request");
+        Assert.True(mismatches.Count == 0, $"{label}: {string.Join("; ", mismatches.Take(12))}");
+        Assert.Null(kept.GraphBlockDraftDeclineReason);
+        Assert.Null(traced.GraphBlockDraftDeclineReason);
+        Assert.True(kept.DraftRebases > moved, $"{label}: no kept step moved behind for the second request");
+        Assert.Equal(built, kept.GraphBuilds);
+        Assert.Equal(recorded, kept.DecodeRecordings);
+        Assert.Equal(0, traced.DraftAdvances);
+        Assert.Equal(0, traced.DraftRebases);
+    }
+
+    /// <summary>
+    /// A block step over a ring whose recording failed to launch (the device out of memory) runs unrecorded for the rest of
+    /// that request, and records again once the ring changes hands: the next request's blocks launch their recording. Kept
+    /// across requests (the steps over a ring move behind for the next request), the failed step had stayed unrecorded for
+    /// the life of the process. Every block drafts bit for bit what steps traced at each call draft.
+    /// </summary>
+    [CudaTheory]
+    [InlineData("dflash")]
+    [InlineData("dflash2")]
+    public void ARingStepWhoseLaunchFailedRecordsAgainForTheRingsNextOwnerOnDirectCuda(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var (target, draft) = Fixtures(variant);
+        using var kept = new Qwen35RuntimeModel(target, BackendType.Cuda, 1, null, 1, draft);
+        using var traced = new Qwen35RuntimeModel(target, BackendType.Cuda, 1, null, 1, draft) { DecodeAdvanceDisabled = true };
+        string label = $"cuda {variant}";
+        // The block's recorded launches each request makes, the first one after the prompt of request 0 failing.
+        var launches = new int[2];
+        int request = 0, fail = 0;
+        kept.RecordedLaunchFailsForTests = shape =>
+        {
+            // (A block's kept step is keyed by its width too: "draft-dflash-block|w5|".)
+            if (!shape.Contains("dflash-block", StringComparison.Ordinal)) return false;
+            launches[request]++;
+            return Interlocked.Exchange(ref fail, 0) == 1;
+        };
+        var models = new IPerRequestDraftState[] { kept, traced };
+        List<string> mismatches = DraftBitwise(kept, traced, new[] { 21, 9 },
+            beforeRequest: r =>
+            {
+                request = r;
+                // Each request on its own ring: the first request's is given back, and the second takes it anew.
+                foreach (var model in models)
+                {
+                    if (r > 0) model.ReleaseDraftState($"req{r - 1}");
+                    model.BindDraftState($"req{r}");
+                }
+            },
+            afterPrompt: r =>
+            {
+                if (r == 0) fail = 1;
+            });
+        _output.WriteLine($"{label}: the block's recorded launches {launches[0]} in the first request (its first one failed), " +
+            $"{launches[1]} in the second; {kept.DecodeRecordings} recordings in all");
+        Assert.True(mismatches.Count == 0, $"{label}: {string.Join("; ", mismatches.Take(12))}");
+        Assert.Null(kept.GraphBlockDraftDeclineReason);
+        Assert.Equal(0, fail);
+        Assert.Equal(1, launches[0]);
+        Assert.True(launches[1] > 0, $"{label}: the block stayed unrecorded for the ring's next owner");
+    }
+
+    /// <summary>
+    /// DFlash2's convolutions as a region (GraphFusion.DFlashConv) draft bit for bit what their ops draft alone, over 2, 3 and
+    /// 4 taps (a block as wide as its taps too: the drafter refuses a wider convolution): on direct CUDA the region's kernel
+    /// (ts_graph_dflash_conv_f32) serves them,
+    /// elsewhere (the managed CPU here) the region's ops run as they did.
+    /// </summary>
+    [Theory]
+    [InlineData("dflash2")]
+    [InlineData("dflash2-k4b5")]
+    [InlineData("dflash2-k2b2")]
+    [InlineData("dflash2-k4b16")]
+    public void DFlashConvRegionDraftsAsItsOps(string variant) => ConvRegionDraftsAsItsOps(BackendType.Cpu, variant);
+
+    [CudaTheory]
+    [InlineData("dflash2")]
+    [InlineData("dflash2-k3b5")]
+    [InlineData("dflash2-k4b5")]
+    [InlineData("dflash2-k4b4")]
+    // The narrowest block, Qwen3.8-27B DFlash2's 8 rows (--spec-draft 7) and the widest replayed block (SmallChunkRows).
+    [InlineData("dflash2-k2b2")]
+    [InlineData("dflash2-k4b8")]
+    [InlineData("dflash2-k4b16")]
+    public void DFlashConvRegionDraftsAsItsOpsOnDirectCuda(string variant) => ConvRegionDraftsAsItsOps(BackendType.Cuda, variant);
+
+    private void ConvRegionDraftsAsItsOps(BackendType backend, string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var (target, draft) = Fixtures(variant);
+        using var region = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft);
+        using var ops = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { DFlashConvRegionsDisabledForTests = true };
+        string label = $"{backend} {variant}";
+        Assert.True(region.DFlashSettings.HasConv, $"{label}: the drafter has no convolution");
+        List<string> mismatches = DraftBitwise(region, ops, new[] { 21, 9 });
+        Assert.True(mismatches.Count == 0, $"{label}: {string.Join("; ", mismatches.Take(12))}");
+        Assert.Null(region.GraphBlockDraftDeclineReason);
+        Assert.Null(ops.GraphBlockDraftDeclineReason);
+        Assert.True(region.GraphBlockDrafts > 0, $"{label}: no block ran as a graph");
+        if (region.GraphExecutorForTests is TensorSharp.Cuda.CudaGraphExecutor cuda)
+        {
+            var opsExecutor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(ops.GraphExecutorForTests);
+            _output.WriteLine($"{label}: {cuda.DFlashConvRegions} convolutions on the region's kernel");
+            Assert.True(cuda.DFlashConvRegions > 0, $"{label}: no convolution ran on the region's kernel");
+            Assert.Equal(0, opsExecutor.DFlashConvRegions);
+        }
+    }
+
+    /// <summary>
+    /// Drafts through two models' graph drafters from the same synthetic feature rows: per request (one a prompt length in
+    /// <paramref name="prompts"/>, each on the model's ring from position 0) the prompt's rows, then draft / commit cycles
+    /// whose accept counts walk 0 .. gamma three times (every catch-up width runs, and advances, in each request); every
+    /// block's ids and confidences and every draft layer's ring rows are compared bit for bit. Returns the mismatches.
+    /// </summary>
+    private static List<string> DraftBitwise(StandardDecoderModel a, StandardDecoderModel b, int[] prompts,
+        Action<int> beforeRequest = null, Action<int> afterPrompt = null)
+    {
+        var heads = new IDraftHead[] { a, b };
+        var spec = (ISpeculativeModel)a;
+        int feat = spec.SpecFeatureSize, gamma = spec.DraftBlockSize, vocab = a.Config.VocabSize;
+        var rng = new Random(376);
+        float[] Features(int count)
+        {
+            var values = new float[count];
+            for (int i = 0; i < count; i++) values[i] = (float)(rng.NextDouble() * 2 - 1);
+            return values;
+        }
+        var mismatches = new List<string>();
+        for (int request = 0; request < prompts.Length; request++)
+        {
+            beforeRequest?.Invoke(request);
+            int promptLength = prompts[request];
+            int[] prompt = Enumerable.Range(0, promptLength).Select(i => 40 + (i * 7 + request) % 23).ToArray();
+            float[] rows = Features(promptLength * feat);
+            Array.Clear(rows, 0, feat);   // the token before the prompt has no features
+            foreach (IDraftHead head in heads) head.DraftCatchUp(prompt, rows, 0);
+            afterPrompt?.Invoke(request);
+            int position = promptLength, last = prompt[^1];
+            float[] pending = Features(feat);
+            for (int cycle = 0; cycle < 3 * (gamma + 1); cycle++)
+            {
+                var ids = new int[2][];
+                var conf = new float[2][];
+                for (int m = 0; m < 2; m++)
+                {
+                    ids[m] = new int[gamma];
+                    conf[m] = new float[gamma];
+                    Assert.Equal(gamma, heads[m].DraftBlock(last, pending, position, ids[m], conf[m]));
+                }
+                for (int e = 0; e < gamma; e++)
+                    if (ids[0][e] != ids[1][e] || BitConverter.SingleToInt32Bits(conf[0][e]) != BitConverter.SingleToInt32Bits(conf[1][e]))
+                        mismatches.Add($"request {request} position {position} slot {e}: {ids[0][e]} ({conf[0][e]:R}) against " +
+                            $"{ids[1][e]} ({conf[1][e]:R})");
+                for (int layer = 0; layer < a.DFlashSettings.NumLayers; layer++)
+                {
+                    var (ak, av) = a.DFlashRingContextForTests(layer, out int aFirst);
+                    var (bk, bv) = b.DFlashRingContextForTests(layer, out int bFirst);
+                    if (aFirst != bFirst || !ak.AsSpan().SequenceEqual(bk) || !av.AsSpan().SequenceEqual(bv))
+                        mismatches.Add($"request {request} position {position}: layer {layer}'s ring rows differ");
+                }
+                int accepted = cycle % (gamma + 1);
+                int[] window = new[] { last }.Concat(ids[0].Take(accepted)).ToArray();
+                float[] catchUp = Features((accepted + 1) * feat);
+                Array.Copy(pending, catchUp, feat);
+                foreach (IDraftHead head in heads) head.DraftCatchUp(window, catchUp, position);
+                pending = Features(feat);
+                last = (ids[0][Math.Min(accepted, gamma - 1)] + cycle) % vocab;
+                position += accepted + 1;
+            }
+        }
+        return mismatches;
+    }
+
     /// <summary>The same on ggml_cuda, where the old path is the fused native drafter.</summary>
     [GgmlTheory(BackendType.GgmlCuda)]
     [InlineData("dflash")]
@@ -789,6 +1019,10 @@ public sealed class GraphBlockDraftTests : IDisposable
                 codebookType: SyntheticGguf.GgmlType.Q8_0),
             "dflash2-kquant" => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: 5, hidden: hidden, layers: 2, slidingWindow: 16,
                 dflash2: true, kQuantProjections: true),
+            // dflash2-k{taps}b{block}: DFlash2 with a convolution of that many taps over blocks of that width.
+            _ when variant.StartsWith("dflash2-k", StringComparison.Ordinal) && variant.IndexOf('b', 9) is int at and > 9
+                => Qwen4ExpSyntheticModelBuilder.WriteDFlash(path, blockSize: int.Parse(variant[(at + 1)..]), hidden: hidden, layers: 2,
+                    slidingWindow: 16, dflash2: true, convTaps: int.Parse(variant[9..at])),
             _ => throw new ArgumentOutOfRangeException(nameof(variant)),
         };
         return (target, draft);

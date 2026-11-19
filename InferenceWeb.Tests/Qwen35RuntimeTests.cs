@@ -1487,9 +1487,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
 
     /// <summary>
     /// On direct CUDA, whose recorded steps bind a slot's buffers, the prefix cache's retention of a finished request
-    /// (<see cref="TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel.TryCaptureDonate"/>) copies its slot: the slot
-    /// returns to the pool and the next request replays the parked recordings on it, none moved to a new slot, and the kept
-    /// copy continues as the request did, bit for bit.
+    /// (<see cref="TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel.TryCaptureDonate"/>) copies a short slot into a
+    /// pooled one (a spare made beside its recorded decode steps): the slot returns to the pool and the next request replays
+    /// the parked recordings on it, none moved to a new slot, and the kept copy continues as the request did, bit for bit.
     /// </summary>
     [CudaFact]
     public void FinishedRequestsAreRetainedAsCopiesOnDirectCuda()
@@ -1516,6 +1516,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
 
         var (token, kept) = Decode("a", 40);
+        Assert.True(model.SlotPoolForTests.Pooled > 0, "no spare slot was made beside the recorded decode steps");
         Assert.True(cache.TryCaptureDonate("a", "kept", kept, out _));
         Assert.Equal(1, model.RetainedByCopy);
         Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { new[] { token } }, new[] { kept }, logits));
@@ -1534,9 +1535,13 @@ public sealed class Qwen35RuntimeTests : IDisposable
             $"the kept copy continues {RelL2(logits[0], expected):E2} (relative L2) from the request it copied");
     }
 
-    /// <summary>On direct CUDA, where the device has no room for a fresh slot, a new request takes the oldest retained slot (its
-    /// payload reclaimed) rather than allocating: it replays the recordings the finished request parked there, and answers as
-    /// that request did.</summary>
+    /// <summary>On direct CUDA, where the device has no room for a fresh slot, a new request takes the oldest retained slot that
+    /// holds it (its payload reclaimed) rather than allocating, and answers as the finished request did. The device is full as
+    /// the model reads it (DeviceRoomForTests, what making room measures; its answer is final) and as the takeover's own check
+    /// reads it (SlotDeviceMemoryForTests). Making room gave up the parked recordings first (the cheapest loss), the finished
+    /// request's among them, so the new request records its steps again: before, this test's device had room by the model's
+    /// own reading and was full only by the takeover's, which took the slot with its recordings, a state no real device
+    /// reaches.</summary>
     [CudaFact]
     public void ANewRequestReclaimsARetainedSlotWhenTheDeviceIsFullOnDirectCuda()
     {
@@ -1562,12 +1567,11 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
         List<float[]> first = Request("a");
         Assert.True(model.RetainSequenceCacheAs("a", "kept"));
+        model.DeviceRoomForTests = () => (0, 1L << 34);
         model.SlotDeviceMemoryForTests = _ => (0, 1L << 34);
-        int adopted = model.RecordingsAdopted;
         List<float[]> second = Request("b");
         Assert.Equal(1, model.RetainedSlotsReclaimed);
         Assert.False(model.TryRebindRetainedCache("kept", "c"));
-        Assert.True(model.RecordingsAdopted > adopted, "the new request recorded its steps again on a new slot");
         for (int i = 0; i < first.Count; i++)
             Assert.True(first[i].AsSpan().SequenceEqual(second[i]), $"row {i} differs on the reclaimed slot");
     }
@@ -1717,7 +1721,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
             model.OnSequenceReleased("big");
             // The conversation's next turn adopts the retained slot.
             Assert.True(model.TryRebindRetainedCache("conversation", "turn2"));
-            Assert.Equal(prompt.Length, unified.EnsureSequenceSlot("turn2", 1500));   // past a new slot (512 cells, 1,024 on CUDA)
+            // Past the adopted slot: 512 cells on the managed executor; on direct CUDA, where slots are sized to the device's
+            // room, its capacity class with headroom (2,048 cells).
+            Assert.Equal(prompt.Length, unified.EnsureSequenceSlot("turn2", 3000));
             Assert.True(unified.TryForwardUnified(new[] { "turn2" }, new[] { new[] { 11, 12 } }, new[] { prompt.Length }, logits));
             moves = model.PooledSlotMoves;
             return (float[])logits[0].Clone();
@@ -2162,6 +2168,31 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("dense-nextn", SpeculatorRegistry.DraftHead)]
     public Task EngineSpeculationOnDirectCudaMatchesPlain(string variant, string speculator)
         => EngineSpeculationMatchesPlain(variant, speculator, BackendType.Cuda);
+
+    /// <summary>The same over a q8_0 cache (an explicit <c>--kv-cache-dtype q8_0</c>: the CUDA executor's _q8 flash kernels and
+    /// q8_0 row writes, the verify windows' rows the decode rows' bits): the plain greedy streams. Every model of both runs held
+    /// the q8_0 cache, ran graphs, and sent no attention to the generic or tiled path
+    /// (<see cref="CudaQ8KvAttentionRoutesTests.AssertFlashKernelsOnly"/>). Skips where the flash kernels have no sm_80 bodies: the
+    /// executor then takes no q8_0 cache and the model runs no graphs, so no verify window is batched.</summary>
+    [CudaTheory(TensorCoreModule = "tensorsharp_flash_prefill")]
+    [InlineData("dense", SpeculatorRegistry.NGram)]
+    [InlineData("dense-nextn", SpeculatorRegistry.DraftHead)]
+    public async Task EngineSpeculationOnDirectCudaMatchesPlainOverAQ8Cache(string variant, string speculator)
+    {
+        using IDisposable kv = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0);
+        string path = Fixture(variant);
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = speculator, MaxDraftTokens = 3, MinDraftProb = 0 };
+        var models = new List<CudaQ8KvAttentionRoutesTests.Q8Watch>();
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() =>
+        {
+            Qwen35RuntimeModel model = Create(path, backend: BackendType.Cuda);
+            lock (models) models.Add(CudaQ8KvAttentionRoutesTests.Watch(model));
+            return model;
+        }, options, $"qwen35 {variant} {speculator} Cuda q8_0");
+        Assert.NotEmpty(models);
+        foreach (CudaQ8KvAttentionRoutesTests.Q8Watch model in models)
+            CudaQ8KvAttentionRoutesTests.AssertFlashKernelsOnly(model, $"qwen35 {variant} {speculator}", _output);
+    }
 
     /// <summary>A batched verify whose graph finds no device memory for its compute buffer is retried once after the
     /// cached graphs are freed, and declined (the step decodes plainly) when it fails again: the requests get the plain

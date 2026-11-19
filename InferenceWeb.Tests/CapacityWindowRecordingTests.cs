@@ -38,11 +38,12 @@ public sealed class CapacityWindowRecordingTests : IDisposable
     private sealed record Trace(List<float[]> Rows, int DecodeRecordings, int WindowRecordings, int Builds, int Replays);
 
     [CudaTheory]
-    [InlineData("qwen35")]
-    [InlineData("qwen4exp")]
-    public void ARequestRecordsEachWidthOnceAndAnswersAsBucketWindows(string family)
+    [InlineData("qwen35", "f16")]
+    [InlineData("qwen4exp", "f16")]
+    [InlineData("qwen35", "q8_0")]   // the _q8 flash kernels: capacity windows recorded and replayed over a q8_0 cache
+    public void ARequestRecordsEachWidthOnceAndAnswersAsBucketWindows(string family, string kv)
     {
-        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(kv == "q8_0" ? KvCacheDtype.Q8_0 : KvCacheDtype.F16);
         string path = family == "qwen35"
             ? new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "q35-dense.gguf"))
             : Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e.gguf"), indexerTopK: 8, qsa: true);

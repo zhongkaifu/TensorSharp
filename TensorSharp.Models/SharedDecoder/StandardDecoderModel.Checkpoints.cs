@@ -61,6 +61,7 @@ namespace TensorSharp.Models
             if (_retainedSlots.ContainsKey(key)) return false;
             Slot active = SnapshotActive();
             if (active.K == null || active.Length <= 0) return false;
+            if (!RoomForSlotCopy(active, active.Length, mayEvict: true, needed: false, "a shared-prefix checkpoint")) return false;
             _retainedSlots.Add(key, Retained(CopySlot(active, active.Length)));
             return true;
         }
@@ -72,15 +73,26 @@ namespace TensorSharp.Models
         {
             if (_retainedSlots == null || string.IsNullOrEmpty(retainedKey) || string.IsNullOrEmpty(newRequestId)) return false;
             if (!_retainedSlots.TryGetValue(retainedKey, out Slot source) || source.K == null) return false;
+            // A checkpoint over another slot's rows: copied, as here, through the shared-row path (which also takes the
+            // rows' holder over where the prefix cache lets the request consume it).
+            if (source.SharesRows)
+                return MaterializeShared(retainedKey, source, newRequestId, donate: false, consumable: null, requiredContextTokens);
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_slots.ContainsKey(newRequestId) || string.Equals(_activeKey, newRequestId, StringComparison.Ordinal)) return false;
-            _slots.Add(newRequestId, CopySlot(source, Math.Max(source.Length, requiredContextTokens)));
+            // On a device this model manages the copy's room is made first (never from the source); declined, the request
+            // prefills its prompt instead of running out of memory part way through the copy.
+            int capacity = Math.Max(source.Length, requiredContextTokens);
+            if (!RoomForSlotCopy(source, capacity, mayEvict: true, needed: true, "a clone of a cached prefix", out int copyCapacity)) return false;
+            _slots.Add(newRequestId, CopySlot(source, copyCapacity));
             return true;
         }
 
         /// <summary>The retained slot can be copied (<see cref="CopySlot"/> reads its bytes wherever they are current).</summary>
         public bool SettleForCopy(string payloadKey)
             => _retainedSlots != null && payloadKey != null && _retainedSlots.ContainsKey(payloadKey);
+
+        /// <summary>Slot copies (<see cref="CopySlot"/>: checkpoints, clones, retained copies, moves; tests count them).</summary>
+        internal int SlotCopies { get; private set; }
 
         /// <summary>Slots grown on the device (<see cref="TryGrowSlotOnDevice"/>); tests check the path was taken.</summary>
         internal int DeviceSlotGrowths { get; private set; }
@@ -156,6 +168,14 @@ namespace TensorSharp.Models
         /// where they are) before a spare.</param>
         private Slot CopySlot(Slot source, int capacityTokens, bool runSlotFirst = false)
         {
+            SlotCopies++;
+            _slotMutationDepth++;
+            try { return CopySlotCore(source, capacityTokens, runSlotFirst); }
+            finally { _slotMutationDepth--; }
+        }
+
+        private Slot CopySlotCore(Slot source, int capacityTokens, bool runSlotFirst)
+        {
             int capacity = AlignedSlotCapacity(Math.Max(FreshSlotTokens, capacityTokens));
             // A pooled slot's caches and states are overwritten whole and keep their device copies (cached graphs
             // bind them), so the host route writes them in place.
@@ -164,7 +184,8 @@ namespace TensorSharp.Models
             if (slot == null)
             {
                 slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
-                (slot.K, slot.V) = AllocateCaches(capacity);
+                // The copy writes rows [0, length): where slots are sized to the device's room only the rows past them are zeroed.
+                (slot.K, slot.V) = AllocateCaches(capacity, SizesSlotsToRoom ? source.Length : 0);
             }
             slot.Length = source.Length;
             slot.DraftStart = source.DraftStart;
@@ -339,9 +360,11 @@ namespace TensorSharp.Models
             ForgetGraphsOfGrowing(slot);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+            Tensor[][] oldK = slot.K;
             slot.K = k;
             slot.V = v;
             slot.Capacity = capacity;
+            RepointDependents(oldK, slot);
             // The rows are on the device only: the host bytes of the new caches are not written.
             slot.DeviceDirty = true;
             DeviceSlotGrowths++;

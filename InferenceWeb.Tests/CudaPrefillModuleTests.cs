@@ -101,13 +101,90 @@ public sealed class CudaPrefillModuleTests
         // The committed PTX must report the same number. CI has no GPU (the CudaTheory below never
         // runs there), so read the literal the probe stores first, at offset 0 of its output
         // (the arch follows at +4):  mov.u32 %rA, <version>;  st.global.u32 [%rdB], %rA;
-        // A PR that bumps the source and C# constants but not the PTX fails here on every machine.
-        var store = Regex.Matches(File.ReadAllText(CommittedPtx(module)),
+        // A PR that bumps the source and C# constants but not the PTX fails here on every machine. Read in the probe's
+        // own body: another probe of the module (the flash module's attn8 caps) stores at offset 0 too.
+        var store = Regex.Matches(EntryBody(File.ReadAllText(CommittedPtx(module)), CapsKernel(module)),
             @"mov\.u32\s+(%r\d+),\s*(\d+);\s+st\.global\.u32\s+\[%rd\d+\],\s*\1;");
         Assert.True(store.Count == 1, $"tensorsharp_{module}.ptx: expected one version store at offset 0, found {store.Count}; update this pattern if the probe changed");
         Assert.True(int.Parse(store[0].Groups[2].Value) == ExpectedVersion(module),
             $"the committed tensorsharp_{module}.ptx reports version {store[0].Groups[2].Value} but {macro} is {ExpectedVersion(module)}: " +
             "refresh the committed PTX with the source (nvcc 13.0.88, DEVELOPMENT.md).");
+    }
+
+    /// <summary>The q8_0 flash kernels' raw-tile ring: the stage count the source compiles (TS_FP_Q8_STAGES, which sizes their
+    /// TsFpAttnSmemQ8) is the one the launchers size their dynamic shared memory by (CudaFlashPrefillKernels.Q8Stages), and the
+    /// module header's description of the _q8 pipeline names that constant (it had described the F16 kernels' two stages).</summary>
+    [Fact]
+    public void Q8StageCount_MatchesTheLaunchers()
+    {
+        string text = File.ReadAllText(Source("flash_prefill"));
+        var define = Regex.Match(text, @"(?m)^[ \t]*#[ \t]*define[ \t]+TS_FP_Q8_STAGES[ \t]+(\d+)\b");
+        Assert.True(define.Success, "tensorsharp_flash_prefill.cu defines no TS_FP_Q8_STAGES.");
+        Assert.True(int.Parse(define.Groups[1].Value) == CudaFlashPrefillKernels.Q8Stages,
+            $"TS_FP_Q8_STAGES is {define.Groups[1].Value} in the source but CudaFlashPrefillKernels.Q8Stages is " +
+            $"{CudaFlashPrefillKernels.Q8Stages}: the launchers would size the _q8 kernels' shared memory for another ring.");
+        int q8 = text.IndexOf("// The _q8 kernels take a q8_0 cache", StringComparison.Ordinal);
+        Assert.True(q8 >= 0, "the module header no longer describes the _q8 kernels");
+        int end = text.IndexOf("// ----", q8, StringComparison.Ordinal);
+        Assert.Contains("TS_FP_Q8_STAGES", end < 0 ? text[q8..] : text[q8..end]);
+    }
+
+    /// <summary>The PTX text of entry <paramref name="name"/>: from its .entry line to the next entry's .globl marker.</summary>
+    private static string EntryBody(string ptx, string name)
+    {
+        var entry = Regex.Match(ptx, @"(?m)^\.visible \.entry " + Regex.Escape(name) + @"\(");
+        Assert.True(entry.Success, $"no .entry {name} in the PTX");
+        int end = ptx.IndexOf("// .globl", entry.Index, StringComparison.Ordinal);
+        return end < 0 ? ptx[entry.Index..] : ptx[entry.Index..end];
+    }
+
+    /// <summary>The committed compute_75 baseline carries the 8-bit prompt attention's probe, which reports 0 there (it has
+    /// no block-scaled E4M3 MMA); the launchers never take the kernels on it.</summary>
+    [CudaFact]
+    public void Attn8Probe_IsZeroOnTheCommittedBaseline()
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        using var module = CudaModule.LoadFromBytes(File.ReadAllBytes(CommittedPtx("flash_prefill")));
+        Assert.False(CudaFlashPrefillKernels.ReadAttn8Caps(module));
+        using var kernels = CudaFlashPrefillKernels.FromModule(CudaModule.LoadFromBytes(File.ReadAllBytes(CommittedPtx("flash_prefill"))));
+        Assert.False(kernels.FromFatbin, "a module loaded from PTX bytes reported a fatbin");
+        Assert.False(kernels.Attn8Code);
+        Assert.False(kernels.Runs8BitPrompt(256));
+    }
+
+    /// <summary>On an RTX Blackwell GPU (CC 12.x) whose build loaded the fatbin's sm_12Xa code, the image carries the 8-bit
+    /// prompt attention (skipped, with the reason, anywhere else).</summary>
+    [CudaFact(RtxBlackwellImage = true)]
+    public void Attn8Probe_IsOneOnAnRtxBlackwellBuild()
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        using var kernels = CudaFlashPrefillKernels.Create();
+        Assert.True(kernels.FromFatbin);
+        Assert.True(kernels.Attn8Code, "an sm_12Xa image loaded on a CC 12.x GPU must carry the 8-bit prompt attention");
+        Assert.True(kernels.Runs8BitPrompt(256));
+        Assert.False(kernels.Runs8BitPrompt(128));
+    }
+
+    /// <summary>
+    /// The RTX Blackwell build gate admits only the fatbin's code for exactly this GPU's arch (sm_120a on CC 12.0, sm_121a on
+    /// CC 12.1). Images that read the same arch number with no 'a' code skip with the reason instead of failing
+    /// <see cref="Attn8Probe_IsOneOnAnRtxBlackwellBuild"/>: a PTX-only build (CudaEmitFatbin=false: the compute_120 PTX, arch
+    /// 120 on an RTX PRO 4500, failed there before the gate checked this), an RTX 50xx fatbin on a GB10 (its compute_120 PTX
+    /// JIT'd), a fatbin without the GPU's arch, the committed baseline.
+    /// </summary>
+    [Fact]
+    public void RtxBlackwellGate_AdmitsOnlyTheFatbinsCodeForThisGpu()
+    {
+        Assert.Null(TestGates.RtxBlackwellImageSkipFor(120, 120, current: true, fromFatbin: true));
+        Assert.Null(TestGates.RtxBlackwellImageSkipFor(121, 121, current: true, fromFatbin: true));
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(120, 120, current: true, fromFatbin: false));   // a PTX-only build
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(121, 120, current: true, fromFatbin: true));    // an RTX 50xx fatbin on a GB10
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(120, 90, current: true, fromFatbin: true));     // a fatbin without 120
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(120, 75, current: true, fromFatbin: false));    // the committed baseline
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(120, 120, current: false, fromFatbin: true));   // a stale image
+        Assert.NotNull(TestGates.RtxBlackwellImageSkipFor(100, 100, current: true, fromFatbin: true));    // datacenter Blackwell
     }
 
     /// <summary>The committed compute_75 baseline JITs here, and its probe reports the version the

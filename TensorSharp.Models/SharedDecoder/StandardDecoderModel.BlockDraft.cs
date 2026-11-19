@@ -43,6 +43,10 @@ namespace TensorSharp.Models
         /// DFlash2 selector tail).</summary>
         internal bool GraphBlockDraftOnMetalForTests { get; set; }
 
+        /// <summary>Tests: DFlash2's convolutions are emitted as their ops alone, not as a region an executor may serve with
+        /// its kernel (<see cref="GraphFusion.DFlashConv"/>).</summary>
+        internal bool DFlashConvRegionsDisabledForTests { get; set; }
+
         /// <summary>Blocks and ring injects the graph programs served (tests check the lowering ran).</summary>
         internal int GraphBlockDrafts { get; private set; }
 
@@ -136,9 +140,22 @@ namespace TensorSharp.Models
                 k[l] = new[] { ringK[l] };
                 v[l] = new[] { ringV[l] };
             }
-            slot = new Slot { K = k, V = v, Capacity = DFlashRingRows };
+            slot = new Slot { K = k, V = v, Capacity = DFlashRingRows, DraftRing = true };
             _dflashRingSlots[ringK] = slot;
             return slot;
+        }
+
+        private protected override void OnDFlashRingOwnerChanged(Tensor[] ringK)
+        {
+            if (_dflashRingSlots != null && _dflashRingSlots.TryGetValue(ringK, out Slot slot)) slot.DraftRingOwners++;
+        }
+
+        /// <summary>A pooled ring given back (ModelBase.ReleaseIdleDFlashRings): the steps, recordings and graphs over it go,
+        /// as a disposed slot's do.</summary>
+        private protected override void OnDFlashRingDisposing(Tensor[] ringK)
+        {
+            if (_dflashRingSlots == null || !_dflashRingSlots.Remove(ringK, out Slot slot)) return;
+            ForgetGraphsOf(slot);
         }
 
         /// <summary>The drafter's rotary: NeoX over the whole head at its own base (llama.cpp maps LLM_ARCH_DFLASH to
@@ -331,8 +348,10 @@ namespace TensorSharp.Models
         /// the next draft would have injected). A chunk starting right past that one-row hole writes a zero row there, as
         /// the speculative context's catch-up did (its carry is zeros when a request arms after a reused prefix), so the
         /// ring keeps the turn before as context instead of restarting at the hole.
+        /// <para>A sequence marked in <paramref name="aside"/> does not speculate (<see cref="FollowUnspeculatedPrompt"/>): it
+        /// takes a ring only where no running request loses its own.</para>
         /// </summary>
-        private DFlashFollowPlan PlanDFlashFollow(string[] requests, int[] starts, int[] counts, int[] promptEnds)
+        private DFlashFollowPlan PlanDFlashFollow(string[] requests, int[] starts, int[] counts, int[] promptEnds, bool[] aside = null)
         {
             if (!DFlashSelfCatchUp) return null;
             int n = counts.Length, ringRows = DFlashRingRows;
@@ -348,7 +367,7 @@ namespace TensorSharp.Models
                 int end = starts[s] + counts[s], first = Math.Max(starts[s], end - ringRows);
                 if (promptEnds[s] > 0) first = Math.Max(first, promptEnds[s] - ringRows);
                 if (first >= end) continue;
-                (Tensor[] k, Tensor[] v, int filled, Tensor ringCarry) = DFlashRingOf(requests[s]);
+                (Tensor[] k, Tensor[] v, int filled, Tensor ringCarry) = DFlashRingOf(requests[s], mayTake: aside == null || !aside[s]);
                 // Two sequences on one ring (more speculating requests than rings): the later one's prompt is not kept.
                 bool shared = false;
                 for (int o = 0; o < s; o++) shared |= ReferenceEquals(ringK[o], k);
@@ -629,7 +648,9 @@ namespace TensorSharp.Models
         /// is (base[side][t][c] + taps[r][side][t][c / group]) times x[r - t][c], nothing for r &lt; t (the filter never reaches
         /// across the block). <paramref name="taps"/> is the conv projection [2 * taps * groups, b] of the sublayer's input;
         /// side 0 filters the input, side 1 the sublayer's output. Each tap is the product of the shifted rows with the
-        /// per-channel base and with the per-group delta (each broadcast), the shift a concatenation behind zeros.
+        /// per-channel base and with the per-group delta (each broadcast), the shift a concatenation behind zeros. The ops are
+        /// a region (<see cref="GraphFusion.DFlashConv"/>): an executor with its kernel computes them in one dispatch, with
+        /// their roundings (about ten small kernels a convolution, twenty convolutions a Qwen3.8-27B DFlash2 block).
         /// </summary>
         private int EmitDFlashConv(GraphStep step, int x, int taps, string baseName, int side, int b, int zeros)
         {
@@ -638,6 +659,9 @@ namespace TensorSharp.Models
             long stride = cfg.ConvProjOutSize, half = (long)width * groups;
             const long f = sizeof(float);
             int baseKernel = step.Weight(baseName);   // [hidden, taps, 2]
+            bool region = !DFlashConvRegionsDisabledForTests;
+            if (region)
+                step.BeginFused(GraphFusion.DFlashConv, stackalloc[] { x, taps, baseKernel }, stackalloc long[] { width, group, groups, side, stride });
             int result = -1;
             for (int t = 0; t < width && t < b; t++)
             {
@@ -651,6 +675,7 @@ namespace TensorSharp.Models
                     term = step.Op(GraphOp.Concat, stackalloc[] { step.View2(zeros, hidden, t, hidden * f, 0), term }, stackalloc long[] { 1 });
                 result = result < 0 ? term : step.Op(GraphOp.Add, result, term);
             }
+            if (region) step.EndFused(stackalloc[] { result });
             return result;
         }
 

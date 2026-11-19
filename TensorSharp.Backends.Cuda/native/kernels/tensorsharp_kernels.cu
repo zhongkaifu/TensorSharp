@@ -3604,6 +3604,20 @@ extern "C" __global__ void ts_gqa_decode_attention_f16(
 #define TS_GQA_DECODE_GROUP4_HEAD_DIM 512
 #define TS_GQA_DECODE_GROUP4_HEADS 4
 
+// The partitioned group-4 decode kernels below size their key partitions from the LIVE length, never from the cache's
+// capacity: max(base, ceil(len / 64)) rounded up to 32, so a row's partitions - and so its rounding - are the same in a
+// cache of any capacity, recorded or not (the host's CudaKernelOps.GqaLivePartitionSize is the same rule). At most
+// TS_GQA_LIVE_PARTITIONS partitions follow from it; a recorded launch's grid holds that many (fewer for a small cache) and
+// the ones past the live length write empty (sum 0) rows ts_gqa_decode_attention_partition_reduce_f32 skips.
+#define TS_GQA_LIVE_PARTITIONS 64
+
+__device__ __forceinline__ int ts_gqa_live_partition_size(int len, int base)
+{
+    int size = (len + TS_GQA_LIVE_PARTITIONS - 1) / TS_GQA_LIVE_PARTITIONS;
+    size = size > base ? size : base;
+    return (size + 31) & ~31;
+}
+
 // Gemma 4 local/global attention has four query heads for each KV head. The
 // generic decode kernel launches one CTA per query head, so it reads every K/V
 // row four times and maps one thread to an entire d=256/d=512 QK dot product
@@ -3843,7 +3857,8 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d512_f16(
     float scale,
     int num_partitions,
     int partition_size,
-    const int* dyn)
+    const int* dyn,
+    int live_partition_base)
 {
     TS_PDL_ENTRY();
     const int kv_head = blockIdx.x;
@@ -3854,24 +3869,30 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d512_f16(
         attend_len = dyn[TS_DYN_ATTEND_LEN];
     attend_len = max(0, min(attend_len, cache_size - attend_start));
 
-    const int part_start = partition * partition_size;
+    // partition_size is the shared-memory stride (the largest partition the launch holds room for); with a base, the
+    // keys a partition takes follow from the live length (ts_gqa_live_partition_size), not from the cache's capacity.
+    const int score_stride = partition_size;
+    const int part_size = live_partition_base > 0
+        ? ts_gqa_live_partition_size(attend_len, live_partition_base)
+        : partition_size;
+    const int part_start = partition * part_size;
     int part_len = attend_len - part_start;
-    if (part_len > partition_size)
-        part_len = partition_size;
+    if (part_len > part_size)
+        part_len = part_size;
     if (part_len < 0)
         part_len = 0;
 
     extern __shared__ float workspace[];
     float* scores = workspace;
     float* query_shared =
-        scores + TS_GQA_DECODE_GROUP4_HEADS * partition_size;
+        scores + TS_GQA_DECODE_GROUP4_HEADS * score_stride;
     __shared__ float shared_max[TS_GQA_DECODE_GROUP4_HEADS];
     __shared__ float shared_sum[TS_GQA_DECODE_GROUP4_HEADS];
 
     ts_gqa_decode_group4_scores_f16(
         query, key_cache, kv_head, cache_size,
         attend_start + part_start, part_len, scale,
-        TS_GQA_DECODE_GROUP4_HEAD_DIM, partition_size,
+        TS_GQA_DECODE_GROUP4_HEAD_DIM, score_stride,
         scores, query_shared, shared_max, shared_sum);
 
     const int q_head_base = kv_head * TS_GQA_DECODE_GROUP4_HEADS;
@@ -3900,10 +3921,10 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d512_f16(
             float vv = __half2float(value_cache[
                 ((size_t)kv_head * cache_size + attend_start + part_start + i) *
                     TS_GQA_DECODE_GROUP4_HEAD_DIM + d]);
-            acc0 = fmaf(scores[0 * partition_size + i], vv, acc0);
-            acc1 = fmaf(scores[1 * partition_size + i], vv, acc1);
-            acc2 = fmaf(scores[2 * partition_size + i], vv, acc2);
-            acc3 = fmaf(scores[3 * partition_size + i], vv, acc3);
+            acc0 = fmaf(scores[0 * score_stride + i], vv, acc0);
+            acc1 = fmaf(scores[1 * score_stride + i], vv, acc1);
+            acc2 = fmaf(scores[2 * score_stride + i], vv, acc2);
+            acc3 = fmaf(scores[3 * score_stride + i], vv, acc3);
         }
         partial[
             ((size_t)(q_head_base + 0) * num_partitions + partition) *
@@ -3943,7 +3964,8 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d256_f16(
     int has_sinks,
     int num_partitions,
     int partition_size,
-    const int* dyn)
+    const int* dyn,
+    int live_partition_base)
 {
     TS_PDL_ENTRY();
     const int kv_head = blockIdx.x;
@@ -3955,17 +3977,22 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d256_f16(
     attend_len = max(0, min(attend_len, cache_size));
 
     const int head_dim = 256;
-    const int part_start = partition * partition_size;
+    // As the d=512 kernel above: partition_size is the shared-memory stride, the live length sizes the partitions.
+    const int score_stride = partition_size;
+    const int part_size = live_partition_base > 0
+        ? ts_gqa_live_partition_size(attend_len, live_partition_base)
+        : partition_size;
+    const int part_start = partition * part_size;
     int part_len = attend_len - part_start;
-    if (part_len > partition_size)
-        part_len = partition_size;
+    if (part_len > part_size)
+        part_len = part_size;
     if (part_len < 0)
         part_len = 0;
 
     extern __shared__ float workspace[];
     float* scores = workspace;
     float* query_shared =
-        scores + TS_GQA_DECODE_GROUP4_HEADS * partition_size;
+        scores + TS_GQA_DECODE_GROUP4_HEADS * score_stride;
     __shared__ float shared_max[TS_GQA_DECODE_GROUP4_HEADS];
     __shared__ float shared_sum[TS_GQA_DECODE_GROUP4_HEADS];
     __shared__ float sink_scale[TS_GQA_DECODE_GROUP4_HEADS];
@@ -3973,7 +4000,7 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d256_f16(
     ts_gqa_decode_group4_scores_f16(
         query, key_cache, kv_head, cache_size,
         part_start, part_len, scale,
-        head_dim, partition_size,
+        head_dim, score_stride,
         scores, query_shared, shared_max, shared_sum);
 
     const int q_head_base = kv_head * TS_GQA_DECODE_GROUP4_HEADS;
@@ -4020,10 +4047,10 @@ extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d256_f16(
             float vv = __half2float(value_cache[
                 ((size_t)kv_head * cache_size + part_start + i) *
                     head_dim + d]);
-            acc0 = fmaf(scores[0 * partition_size + i], vv, acc0);
-            acc1 = fmaf(scores[1 * partition_size + i], vv, acc1);
-            acc2 = fmaf(scores[2 * partition_size + i], vv, acc2);
-            acc3 = fmaf(scores[3 * partition_size + i], vv, acc3);
+            acc0 = fmaf(scores[0 * score_stride + i], vv, acc0);
+            acc1 = fmaf(scores[1 * score_stride + i], vv, acc1);
+            acc2 = fmaf(scores[2 * score_stride + i], vv, acc2);
+            acc3 = fmaf(scores[3 * score_stride + i], vv, acc3);
         }
         partial[
             ((size_t)(q_head_base + 0) * num_partitions + partition) *
@@ -8896,3 +8923,8 @@ extern "C" __global__ void ts_silu_mul_clamp_quantize_q8_1_f32(
 #include "tensorsharp_minimax_h3_quant_f32.cuh"
 
 #include "tensorsharp_gemma4_vision.cuh"
+
+// Marker: the partitioned group-4 decode kernels take live_partition_base (a module without it sizes a recorded launch's
+// partitions from the capacity its launcher passes). At the end of the file, so adding it renumbered no other entry.
+extern "C" __global__ void ts_caps_gqa_live_partitions() {
+    TS_PDL_ENTRY();}

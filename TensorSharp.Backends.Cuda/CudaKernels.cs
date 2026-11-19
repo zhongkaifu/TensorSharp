@@ -393,6 +393,8 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
             try { module.GetFunction("ts_caps_moe_dp4a_iq_q2_0"); MoeDp4aIqQ2_0 = true; }
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
+            try { module.GetFunction("ts_caps_gqa_live_partitions"); GqaLivePartitions = true; }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
             dequantWeightQ80F16 = module.GetFunction("ts_dequant_weight_q8_0_f16");
             convertF32F16 = module.GetFunction("ts_convert_f32_f16");
             convertF32Bf16 = module.GetFunction("ts_convert_f32_bf16");
@@ -714,6 +716,11 @@ namespace TensorSharp.Cuda
         /// <summary>Whether the MoE dp4a kernels take IQ2_XS, IQ3_XXS, IQ4_NL and Q2_0 experts (the module carries its
         /// marker).</summary>
         public bool MoeDp4aIqQ2_0 { get; }
+
+        /// <summary>Whether the partitioned group-4 decode attention kernels size their partitions from the live length when
+        /// given a base (the module carries its marker). A module without it partitions a recorded launch by the room its
+        /// launcher passes, which follows the cache's capacity.</summary>
+        public bool GqaLivePartitions { get; }
 
         /// <summary>The SM architecture the code the driver loaded for this module was compiled
         /// for (0 = unknown; see <see cref="CudaModule.CompiledArchOf"/>).</summary>
@@ -1781,7 +1788,8 @@ namespace TensorSharp.Cuda
             int numPartitions,
             int partitionSize,
             IntPtr stream,
-            IntPtr dynParams = default)
+            IntPtr dynParams = default,
+            int livePartitionBase = 0)
         {
             IntPtr queryArg = query;
             IntPtr keyCacheArg = keyCache;
@@ -1795,11 +1803,12 @@ namespace TensorSharp.Cuda
             int numPartitionsArg = numPartitions;
             int partitionSizeArg = partitionSize;
             IntPtr dynArg = dynParams;
+            int livePartitionBaseArg = livePartitionBase;
             void** args = stackalloc void*[]
             {
                 &queryArg, &keyCacheArg, &valueCacheArg, &partialArg,
                 &numKVHeadsArg, &attendStartArg, &attendLenArg, &cacheSizeArg,
-                &scaleArg, &numPartitionsArg, &partitionSizeArg, &dynArg
+                &scaleArg, &numPartitionsArg, &partitionSizeArg, &dynArg, &livePartitionBaseArg
             };
             uint sharedBytes = checked((uint)(
                 (4L * partitionSize + 4L * 512) * sizeof(float)));
@@ -1820,7 +1829,12 @@ namespace TensorSharp.Cuda
         /// <see cref="LaunchGqaDecodeAttentionGroup4D256F16"/>: splits the physical
         /// ring across gridDim.y partitions so a 2-KV-head model no longer runs its
         /// whole decode window on two CTAs. Pair with
-        /// <see cref="LaunchGqaDecodeAttentionPartitionReduceF32"/>.</summary>
+        /// <see cref="LaunchGqaDecodeAttentionPartitionReduceF32"/>. With a
+        /// <paramref name="livePartitionBase"/> the kernel sizes the partitions from the
+        /// live length (<see cref="CudaKernelOps.GqaLivePartitionSize"/>) and
+        /// <paramref name="partitionSize"/> is only the shared-memory room, which must hold
+        /// the largest such partition the launch may see. The d=512 launcher above takes
+        /// the same pair.</summary>
         public void LaunchGqaDecodeAttentionPartitionGroup4D256F16(
             IntPtr query,
             IntPtr keyCache,
@@ -1835,7 +1849,8 @@ namespace TensorSharp.Cuda
             int numPartitions,
             int partitionSize,
             IntPtr stream,
-            IntPtr dynParams = default)
+            IntPtr dynParams = default,
+            int livePartitionBase = 0)
         {
             IntPtr queryArg = query;
             IntPtr keyCacheArg = keyCache;
@@ -1850,11 +1865,12 @@ namespace TensorSharp.Cuda
             int numPartitionsArg = numPartitions;
             int partitionSizeArg = partitionSize;
             IntPtr dynArg = dynParams;
+            int livePartitionBaseArg = livePartitionBase;
             void** args = stackalloc void*[]
             {
                 &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &partialArg,
                 &numKVHeadsArg, &attendLenArg, &cacheSizeArg,
-                &scaleArg, &hasSinksArg, &numPartitionsArg, &partitionSizeArg, &dynArg
+                &scaleArg, &hasSinksArg, &numPartitionsArg, &partitionSizeArg, &dynArg, &livePartitionBaseArg
             };
             uint sharedBytes = checked((uint)(
                 (4L * partitionSize + 4L * 256) * sizeof(float)));

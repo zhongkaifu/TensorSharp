@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <float.h>
 
-#define TS_GRAPH_KERNELS_VERSION 33
+#define TS_GRAPH_KERNELS_VERSION 35
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -1957,6 +1957,36 @@ extern "C" __global__ void ts_graph_sigmoid_gate_f32(const float* __restrict__ a
         ts_graph_quantize_q8_1(o, outq + i / 32, (int)(i & 31));
 }
 
+// GraphFusion.DFlashConv: DFlash2's grouped dynamic convolution of a block's rows (StandardDecoderModel.BlockDraft.cs,
+// EmitDFlashConv), the region's ops' values bit for bit: tap t's term at row r >= t is x[r - t][c] * base[side][t][c] plus
+// x[r - t][c] * taps[r][side * width * groups + t * groups + c / group] (each product rounded, as the ops' two broadcast
+// products and their sum), tap 0's term starts the sum and each later tap's is added in order, zero on the rows before it
+// (the ops' concatenation behind zeros: an added +0 turns a -0 sum into +0, as there). x [rows][hidden], taps [rows][stride]
+// and base [2][width][hidden] contiguous; out [rows][hidden]. Launch: grid ceil(rows * hidden / 256), block 256.
+extern "C" __global__ void ts_graph_dflash_conv_f32(const float* __restrict__ x, const float* __restrict__ taps,
+    const float* __restrict__ base, float* __restrict__ out, int rows, int hidden, int width, int group, int groups, int side,
+    long long stride)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * hidden)
+        return;
+    const int r = (int)(i / hidden), c = (int)(i - (long long)r * hidden), g = c / group;
+    const int n = min(width, rows);
+    const float* delta = taps + (long long)r * stride + (long long)side * width * groups + g;
+    float acc = 0.0f;
+    for (int t = 0; t < n; ++t)
+    {
+        float term = 0.0f;
+        if (r >= t)
+        {
+            const float xv = x[(long long)(r - t) * hidden + c];
+            term = __fadd_rn(__fmul_rn(xv, base[((long long)side * width + t) * hidden + c]), __fmul_rn(xv, delta[(long long)t * groups]));
+        }
+        acc = t == 0 ? term : __fadd_rn(acc, term);
+    }
+    out[i] = acc;
+}
+
 // The residual add and the next block's input norm in one pass: sum = a + b, normed = sum * rsqrt(mean(sum^2) + eps) * w
 // over rows of cols (ggml_rms_norm(ggml_add(a, b)) * w). b null: the sum is a (a residual add's norm whose sum was already
 // made: the same reduction, so the same bits); sum null: not written. Launch: grid rows, block 512.
@@ -2857,13 +2887,47 @@ extern "C" __global__ void __launch_bounds__(256) ts_graph_qsa_store_pool_f32(
 
 #define TS_GRAPH_ATTN_PREP_WARPS 8
 
+// The KV cache formats ts_graph_attn_prep_f32 writes (cacheFormat): F32, F16, and ggml's q8_0 rows.
+#define TS_GRAPH_CACHE_F32 0
+#define TS_GRAPH_CACHE_F16 1
+#define TS_GRAPH_CACHE_Q8_0 2
+
+// ggml's quantize_row_q8_0 (quantize_row_q8_0_ref, and ggml-cuda's quantize_f32_q8_0_block) for one block of 32 values, a value
+// a lane of the warp: amax of the block's |x| (a warp max: exact in any order), d = amax / 127, id = d ? 1 / d : 0, code =
+// roundf(x * id) (half away from zero), into the block's 34 bytes at `block` (2-byte aligned): d as F16 (round to nearest
+// even), then the 32 int8 codes. Every q8_0 cache write calls it (ts_q8_0_store_row_warp), so a row's bytes are a function of its
+// values alone, whichever kernel writes it.
+__device__ __forceinline__ void ts_q8_0_store_block_warp(float x, uint8_t* __restrict__ block)
+{
+    float amax = fabsf(x);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o));
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    const int lane = threadIdx.x & 31;
+    block[2 + lane] = (uint8_t)(int8_t)roundf(x * id);
+    if (lane == 0)
+        *reinterpret_cast<__half*>(block) = __float2half_rn(d);
+}
+
+// A row of `width` values (a multiple of 32) as q8_0 blocks at dst (width / 32 * 34 bytes), by one warp.
+__device__ __forceinline__ void ts_q8_0_store_row_warp(const float* __restrict__ row, uint8_t* __restrict__ dst, int width)
+{
+    const int lane = threadIdx.x & 31;
+    for (int b = 0; b < width / 32; ++b)
+        ts_q8_0_store_block_warp(row[b * 32 + lane], dst + b * 34);
+}
+
 // A value of unit (t, h) into its place: a query head's row of the output, or a KV head's key at `at` of the head-first
-// cache, rounded to F16 as the ops' row writes round it (an F16 cache) or stored as it is (F32).
-__device__ __forceinline__ void ts_graph_attn_prep_store(bool isQ, float* __restrict__ qDst, void* __restrict__ kCache, int f16Cache,
-    size_t at, int col, float value)
+// cache, rounded to F16 as the ops' row writes round it (an F16 cache) or stored as it is (F32); a q8_0 cache's key goes back
+// into the warp's row `buf`, which is quantized whole once it is rotated.
+__device__ __forceinline__ void ts_graph_attn_prep_store(bool isQ, float* __restrict__ qDst, void* __restrict__ kCache, int cacheFormat,
+    size_t at, int col, float value, float* buf)
 {
     if (isQ) qDst[col] = value;
-    else if (f16Cache) ((__half*)kCache)[at + col] = __float2half_rn(value);
+    else if (cacheFormat == TS_GRAPH_CACHE_Q8_0) buf[col] = value;
+    else if (cacheFormat == TS_GRAPH_CACHE_F16) ((__half*)kCache)[at + col] = __float2half_rn(value);
     else ((float*)kCache)[at + col] = value;
 }
 
@@ -2877,13 +2941,14 @@ __device__ __forceinline__ void ts_graph_attn_prep_store(bool isQ, float* __rest
 // second tree from lanes 0..7 (the others 0) - the same additions in the same order. A query head goes to out (rows outRow,
 // heads outHead floats apart: rows of heads, or heads of rows where the attention takes them so); a key head and a value head
 // go to the head-first caches [kvHeads][cap][d] and [kvHeads][cap][dv] at the row's KV index cells[t] (skipped outside the
-// cache, as ts_graph_set_rows_f32 skips it), rounded with __float2half_rn as the ops' row writes round them (F16 caches) or
-// stored as they are (F32). The positions and KV indices are read on the device, so a recorded step replays. Launch: grid
-// ceil(rows * (heads + 2 kvHeads) / 8), block 256, 8 * d floats of dynamic shared memory (a warp's row).
+// cache, as ts_graph_set_rows_f32 skips it), rounded with __float2half_rn as the ops' row writes round them (cacheFormat F16),
+// stored as they are (F32), or quantized as ggml's q8_0 rows by ts_q8_0_store_row_warp (Q8_0: ts_graph_set_rows_q8_0's bytes for
+// the same values; d and dv multiples of 32). The positions and KV indices are read on the device, so a recorded step replays.
+// Launch: grid ceil(rows * (heads + 2 kvHeads) / 8), block 256, 8 * d floats of dynamic shared memory (a warp's row).
 extern "C" __global__ void __launch_bounds__(TS_GRAPH_ATTN_PREP_WARPS * 32) ts_graph_attn_prep_f32(
     const float* __restrict__ q, long long qRow, long long qHead, const float* __restrict__ k, long long kRow, long long kHead,
     const float* __restrict__ v, long long vRow, long long vHead, const float* __restrict__ qNorm, const float* __restrict__ kNorm,
-    float* __restrict__ out, long long outRow, long long outHead, void* __restrict__ kCache, void* __restrict__ vCache, int f16Cache,
+    float* __restrict__ out, long long outRow, long long outHead, void* __restrict__ kCache, void* __restrict__ vCache, int cacheFormat,
     int cap, const int* __restrict__ pos, const int* __restrict__ cells, int rows, int heads, int kvHeads, int d, int dv, float eps,
     int rope_dim, int mode, int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast,
     float beta_slow)
@@ -2905,10 +2970,15 @@ extern "C" __global__ void __launch_bounds__(TS_GRAPH_ATTN_PREP_WARPS * 32) ts_g
     {
         const float* src = v + t * vRow + (long long)kvh * vHead;
         const size_t at = ((size_t)kvh * cap + cell) * dv;
+        if (cacheFormat == TS_GRAPH_CACHE_Q8_0)
+        {
+            ts_q8_0_store_row_warp(src, (uint8_t*)vCache + ((size_t)kvh * cap + cell) * (size_t)(dv / 32 * 34), dv);
+            return;
+        }
         for (int i = lane; i < dv; i += 32)
         {
             const float val = src[i];
-            if (f16Cache) ((__half*)vCache)[at + i] = __float2half_rn(val);
+            if (cacheFormat == TS_GRAPH_CACHE_F16) ((__half*)vCache)[at + i] = __float2half_rn(val);
             else ((float*)vCache)[at + i] = val;
         }
         return;
@@ -2990,11 +3060,17 @@ extern "C" __global__ void __launch_bounds__(TS_GRAPH_ATTN_PREP_WARPS * 32) ts_g
         float right = buf[right_index];
         float out_left = left * c - right * s;
         float out_right = right * c + left * s;
-        ts_graph_attn_prep_store(isQ, qDst, kCache, f16Cache, at, left_index, out_left);
-        ts_graph_attn_prep_store(isQ, qDst, kCache, f16Cache, at, right_index, out_right);
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, left_index, out_left, buf);
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, right_index, out_right, buf);
     }
     for (int col = pair_count * 2 + lane; col < d; col += 32)
-        ts_graph_attn_prep_store(isQ, qDst, kCache, f16Cache, at, col, buf[col]);
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, col, buf[col], buf);
+    if (!isQ && cacheFormat == TS_GRAPH_CACHE_Q8_0)
+    {
+        // The rotated key, every lane's columns written back to the row: quantized whole.
+        __syncwarp();
+        ts_q8_0_store_row_warp(buf, (uint8_t*)kCache + ((size_t)kvh * cap + cell) * (size_t)(d / 32 * 34), d);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3238,5 +3314,49 @@ extern "C" __global__ void ts_graph_ring_attn_combine_f32(const float* __restric
             den = fmaf(ps[d + 1], w, den);
         }
         out[base * d + x] = den > 0.0f ? num / den : 0.0f;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// q8_0 KV caches (ggml's block_q8_0 rows: per 32 values an F16 scale d, then 32 int8 codes). Last in the module, so the kernels
+// above keep their committed PTX.
+// ---------------------------------------------------------------------------
+
+// ggml_set_rows into a q8_0 cache, and the F32 -> q8_0 copy of rows: head h's row ids[i] (first + i without ids; with dyn, a
+// recorded step's dynamic block, first is re-read there on every replay - dyn[1], the KV write position, as
+// ts_copy_head_first_to_cache_f16 reads it) of dst (rows dstRowBytes apart, heads dstHeadBytes apart, dstRows of them) takes src
+// row i of head h (F32, width values, rows srcRow and heads srcHead floats apart), quantized by ts_q8_0_store_row_warp's blocks -
+// the prep region's bytes for the same values; an index outside [0, dstRows) writes nothing. width a multiple of 32. Launch:
+// grid (count, heads), block 32 * warps (a warp a block of the row at a time).
+extern "C" __global__ void ts_graph_set_rows_q8_0(const float* __restrict__ src, long long srcRow, long long srcHead,
+    const int* __restrict__ ids, int first, const int* __restrict__ dyn, uint8_t* __restrict__ dst, long long dstRowBytes,
+    long long dstHeadBytes, int dstRows, int width)
+{
+    const int i = blockIdx.x, h = blockIdx.y;
+    const int row = ids != nullptr ? ids[i] : (dyn != nullptr ? dyn[1] : first) + i;
+    if (row < 0 || row >= dstRows)
+        return;
+    const float* s = src + (long long)h * srcHead + (long long)i * srcRow;
+    uint8_t* o = dst + (long long)h * dstHeadBytes + (long long)row * dstRowBytes;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    for (int b = warp; b < width / 32; b += warps)
+        ts_q8_0_store_block_warp(s[b * 32 + lane], o + b * 34);
+}
+
+// q8_0 rows as F32: head h's rows [0, rows) of src (rowBytes apart, heads headBytes apart) into dst [heads][rows][width], each
+// value RN_F16(code * d) widened - the value the flash kernels' tiles hold (ts_fp_q8_block_to_h), so the generic attention over a
+// q8_0 cache reads the flash kernels' values. Launch: grid (rows, heads), block 256.
+extern "C" __global__ void ts_graph_q8_0_to_f32(const uint8_t* __restrict__ src, long long rowBytes, long long headBytes,
+    float* __restrict__ dst, int rows, int width)
+{
+    const int r = blockIdx.x, h = blockIdx.y;
+    const uint8_t* s = src + (long long)h * headBytes + (long long)r * rowBytes;
+    float* o = dst + ((long long)h * rows + r) * width;
+    for (int c = threadIdx.x; c < width; c += blockDim.x)
+    {
+        const uint8_t* blk = s + (c >> 5) * 34;
+        const __half d = *reinterpret_cast<const __half*>(blk);
+        const int code = (int8_t)blk[2 + (c & 31)];
+        o[c] = __half2float(__hmul(__int2half_rn(code), d));
     }
 }
