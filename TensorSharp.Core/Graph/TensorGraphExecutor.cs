@@ -133,6 +133,11 @@ namespace TensorSharp.Graph
         /// <inheritdoc cref="IGraphExecutor.AttendsCapacityWindows"/>
         public virtual bool AttendsCapacityWindows(int headDim, int kvFormat) => false;
 
+        /// <inheritdoc cref="IGraphExecutor.TakesKvCacheFormat"/>
+        public virtual bool TakesKvCacheFormat(int kvFormat, int keyDim, int valueDim)
+            => kvFormat is GraphFormat.F32 or GraphFormat.F16
+               || (kvFormat is GraphFormat.Q8_0 or GraphFormat.Q4_0 && Capabilities.QuantizedKvCache);
+
         // ================================================================ kernels a backend provides
 
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>
@@ -237,9 +242,12 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>ggml's flash attention: q [heads, nq, d], k/v [kvHeads, nkv, d] (views), the mask [nq, nkv]
-        /// with its pattern; returns ggml's layout [nq, heads, dv]. Default: <see cref="Attention"/>, permuted.</summary>
+        /// with its pattern; returns ggml's layout [nq, heads, dv]. Default: <see cref="Attention"/>, permuted.
+        /// <paramref name="promptChunk"/>: the op says its rows are one sequence's prompt chunk
+        /// (<see cref="GraphAttentionRows.PromptChunk"/>), which an executor may attend with arithmetic decode rows do not
+        /// share; the default ignores it.</summary>
         protected virtual Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
-            CacheWindow kWindow, CacheWindow vWindow)
+            CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
             using Tensor a = Attention(q, k, v, mask.Pattern == MaskPattern.None && mask.Floor == 0 ? null : mask.Tensor, scale);
             using Tensor p = a.Permute(1, 0, 2);
@@ -348,6 +356,9 @@ namespace TensorSharp.Graph
             public float[] Floats { get; init; }
             /// <summary>Sizes of a host-only input (no tensor until an op reads it).</summary>
             public long[] HostSizes { get; init; }
+            /// <summary>A causal mask input given as its pattern (<see cref="GraphCapabilities.StructuralCausalMasks"/>): it is
+            /// classified from it, and its values are made only for an op that reads the tensor.</summary>
+            public CausalMaskInput CausalMask { get; init; }
             /// <summary>For a cache window (KvWindow): the cache it views and its first row.</summary>
             public CacheWindow Window { get; init; }
             /// <summary>The tensor's memory is laid out unlike ggml's node (a strided view where ggml has a
@@ -471,6 +482,40 @@ namespace TensorSharp.Graph
                 return new AttentionMask(MaskPattern.Explicit, 0, mask, (int)valid, pattern, trimmedFloor);
             return new AttentionMask(pattern, trimmedFloor, mask, (int)valid, pattern, trimmedFloor);
         }
+
+        /// <summary>A structural mask's classification (<see cref="CausalMaskInput.Classify"/>: the fields
+        /// <see cref="Classify"/> finds in its values), the values made by <paramref name="mask"/> only for an op that reads
+        /// the tensor.</summary>
+        private static AttentionMask Classified(MaskClassification c, Func<Tensor> mask)
+            => new(Pattern(c.Pattern), c.Floor, mask, c.Keys, Pattern(c.Trimmed), c.TrimmedFloor);
+
+        private static MaskPattern Pattern(CausalMaskPattern pattern) => pattern switch
+        {
+            CausalMaskPattern.None => MaskPattern.None,
+            CausalMaskPattern.Causal => MaskPattern.Causal,
+            _ => MaskPattern.Explicit,
+        };
+
+        private static CausalMaskPattern Pattern(MaskPattern pattern) => pattern switch
+        {
+            MaskPattern.None => CausalMaskPattern.None,
+            MaskPattern.Causal => CausalMaskPattern.Causal,
+            _ => CausalMaskPattern.Explicit,
+        };
+
+        /// <summary>Tests: what <see cref="Classify"/> finds in a mask's host values (row-major [rows, keys]).</summary>
+        internal static MaskClassification ClassifyForTests(float[] host, long rows, long keys)
+        {
+            AttentionMask m = Classify(() => null, host, rows, keys);
+            return new MaskClassification(Pattern(m.Pattern), m.Floor, m.Keys, Pattern(m.Trimmed), m.TrimmedFloor);
+        }
+
+        /// <summary>Causal mask inputs bound as their pattern (<see cref="GraphCapabilities.StructuralCausalMasks"/>).</summary>
+        internal long StructuralMasksBound { get; private set; }
+
+        /// <summary>Of <see cref="StructuralMasksBound"/>, the masks an op read the values of (made on the host and uploaded):
+        /// none where every reader is a kernel that runs the pattern.</summary>
+        internal long StructuralMasksMaterialized { get; private set; }
 
         protected sealed class RunState
         {
@@ -789,7 +834,8 @@ namespace TensorSharp.Graph
             {
                 if (_state[node] != Pending) return;
                 var input = new Dictionary<int, (IntPtr, long, object)> { [node] = (data, bytes, handle) };
-                Attribute(() => Set(node, _x.BindLeaf(node, _nodes[node], input, Run), fresh: handle == null));
+                // A host input's value is the session's own (a structural mask's, once made, too).
+                Attribute(() => Set(node, _x.BindLeaf(node, _nodes[node], input, Run), fresh: handle is null or CausalMaskInput));
             }
 
             public long[] OutputFloats => _outputFloats.ToArray();
@@ -1291,6 +1337,11 @@ namespace TensorSharp.Graph
         internal long AliasesInPlace { get; private set; }
         internal long AliasCopies { get; private set; }
 
+        /// <summary>Attention ops run whose rows their program marks as a prompt chunk (<see cref="GraphAttentionRows.PromptChunk"/>),
+        /// and the other attention ops of more than one query row (tests).</summary>
+        internal long PromptChunkAttentions { get; private set; }
+        internal long OtherMultiRowAttentions { get; private set; }
+
         /// <summary>Whether this executor's ops may write their results where an alias names (<see cref="AliasDestination"/>): the
         /// session then binds the alias's leaf before the op runs.</summary>
         protected virtual bool TakesAliasDestinations => false;
@@ -1364,6 +1415,18 @@ namespace TensorSharp.Graph
             if (inputs == null || !inputs.TryGetValue(index, out var input))
                 throw new InvalidOperationException($"input node {index} was not given a value");
             (IntPtr data, long bytes, object handle) = input;
+            if (handle is CausalMaskInput causal)
+            {
+                // The pattern alone: FlashAttnExt classifies it, Device makes its values for an op that reads them.
+                long[] ne = leaf.Ne;
+                bool shaped = leaf.Format == GraphFormat.F16 && ne.Length >= 2 && ne[0] == causal.Width && ne[1] == causal.Count;
+                for (int i = 2; i < ne.Length; i++) shaped &= ne[i] == 1;
+                if (!shaped)
+                    throw new InvalidOperationException($"input node {index}: a causal mask of {causal.Width} keys and {causal.Count} rows bound to a leaf of "
+                        + $"type {leaf.Format} [{string.Join(", ", leaf.Ne)}]");
+                StructuralMasksBound++;
+                return new Value { HostSizes = Sizes(leaf.Ne), CausalMask = causal };
+            }
             if (handle is Tensor given)
                 return new Value { Tensor = Shaped(given, leaf.Ne, run) };
             if (handle is StableInput stable)
@@ -1540,6 +1603,16 @@ namespace TensorSharp.Graph
             if (read && PendingWrites && v.Tensor != null) BeforeRead(v.Tensor);
             if (v.Tensor != null || v.HostSizes == null) return v.Tensor;
             var t = run.KeepLasting(new Tensor(Allocator, DType.Float32, v.HostSizes));
+            if (v.CausalMask is { } causal)
+            {
+                // A structural mask an op reads: the values the host array held, widened (every value written).
+                float[] made = GC.AllocateUninitializedArray<float>(checked((int)causal.Values));
+                causal.FillF32(made);
+                t.SetElementsAsFloat(made);
+                StructuralMasksMaterialized++;
+                values[node] = new Value { Tensor = t, CausalMask = causal };
+                return t;
+            }
             t.SetElementsAsFloat(v.Floats);
             values[node] = new Value { Tensor = t, Floats = v.Floats };
             return t;
@@ -1712,16 +1785,26 @@ namespace TensorSharp.Graph
                         long keys = m.HostSizes != null ? m.HostSizes[^1] : Ne(m.Tensor)[0];
                         if (keys != nkv) throw new NotSupportedException("a mask wider than the keys");
                         int maskNode = n.Srcs[3];
-                        // A sliding window's band (ip[2]) where this executor reads it on the device: the mask is the selection
-                        // it is, read at every run (a recorded step replays each position's band), at most `band` keys a row.
-                        int band = Capabilities.BandMasksOnDevice ? (int)Ip(2, 0) : 0;
+                        // A sliding window's band (ip[3]; see GraphAttentionRows) where this executor reads it on the device: the
+                        // mask is the selection it is, read at every run (a recorded step replays each position's band), at most
+                        // `band` keys a row. ip[2] is the rows' kind (GraphAttentionRows), never a band.
+                        int band = Capabilities.BandMasksOnDevice ? (int)Ip(3, 0) : 0;
                         if (!run.Masks.TryGetValue((maskNode, nq), out mask))
+                        {
+                            Func<Tensor> make = () => Mask(Device(values, maskNode, run), nq, run);
+                            // A structural mask is classified from its pattern: the fields a scan of its values finds.
                             run.Masks[(maskNode, nq)] = mask = band > 0
-                                ? new AttentionMask(MaskPattern.Explicit, 0, () => Mask(Device(values, maskNode, run), nq, run)) { KvMax = band }
-                                : Classify(() => Mask(Device(values, maskNode, run), nq, run), m.Floats, nq, keys);
+                                ? new AttentionMask(MaskPattern.Explicit, 0, make) { KvMax = band }
+                                : m.CausalMask is { } causal
+                                    ? Classified(causal.Classify(nq, keys), make)
+                                    : Classify(make, m.Floats, nq, keys);
+                        }
                         if (band <= 0 && Ip(1, 0) > 0) mask.KvMax = (int)Ip(1, 0);
                     }
-                    return V(FlashAttention(q, k, v, mask, Fp(0, 1f), values[n.Srcs[1]].Window, values[n.Srcs[2]].Window));
+                    bool promptChunk = Ip(2, GraphAttentionRows.Unsaid) == GraphAttentionRows.PromptChunk;
+                    if (promptChunk) PromptChunkAttentions++;
+                    else if (nq > 1) OtherMultiRowAttentions++;
+                    return V(FlashAttention(q, k, v, mask, Fp(0, 1f), values[n.Srcs[1]].Window, values[n.Srcs[2]].Window, promptChunk));
                 }
                 case GraphOp.SoftMaxExt:
                 {

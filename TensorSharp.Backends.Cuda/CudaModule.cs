@@ -100,6 +100,7 @@ namespace TensorSharp.Cuda
                 try
                 {
                     CudaModule loaded = LoadImage(fatbin, ParsePtxTargetArch(bytes));
+                    loaded.FromFatbin = true;
                     if (identify)
                         loaded.ImageSha256 = Sha256(fatbin);
                     return loaded;
@@ -119,6 +120,11 @@ namespace TensorSharp.Cuda
         /// <summary>The SHA-256 (hex) of the image this module was loaded from, when the loader was asked to
         /// identify it; null otherwise.</summary>
         public string ImageSha256 { get; private set; }
+
+        /// <summary>Whether the driver loaded this module from the build's fatbin (the SASS it chose there, or the fatbin's own
+        /// PTX), not from a PTX file. Code compiled for an arch-specific target (sm_120a, sm_121a) reaches a GPU only this way:
+        /// a PTX file carries the plain compute_12x target.</summary>
+        public bool FromFatbin { get; private set; }
 
         private static string Sha256(byte[] image)
             => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(image));

@@ -140,11 +140,33 @@ Which algorithms survive a gap is now the algorithm's own call —
 `ISpeculator.CanArmAfterPrefixReuse`, default `false`. `BlockDraftSpeculator` and
 `NGramSpeculator` opt in: n-gram mines the emitted token history, which is complete
 whatever the KV cache did, and a block drafter reads its own sliding KV ring, which
-refills from the freshly forwarded suffix and from every committed token, so an
-adopted prefix costs it a shorter drafting context for a block or two and nothing
-after that. Every draft is still verified by the trunk either way, so a stale
-speculator can only cost throughput, never a wrong token. Measured in the server
-chat path: 1.02x → 1.85x.
+refills from the freshly forwarded suffix and from every committed token. Every draft
+is still verified by the trunk either way, so a stale speculator can only cost
+throughput, never a wrong token. Measured in the server chat path: 1.02x → 1.85x.
+
+The ring is the context of a sequence, not of the request that wrote it
+(`IPerRequestDraftState.KeepDraftState` / `ContinueDraftState`). A finished request's
+ring keeps its rows, and the runtime hands it to the next request whose tokens begin
+with the ones it covers (matched as the prefix cache matches them: media spans, cache
+scopes), over the positions that request reuses. A prompt read by a request that does
+not speculate (one token to emit) still writes its ring where the trunk keeps the ring
+in step itself (`IDraftHead.FollowUnspeculatedPrompt`: the prompt's last ring-length
+rows, never a speculating request's ring). So a turn that reuses its conversation's
+whole prompt drafts over the conversation from its first step. Before, such a turn
+drafted over whatever ring the last speculating request had left - another
+conversation's rows at the positions the two shared: Qwen3.8-27B NVFP4 with DFlash2 on
+direct CUDA accepted 51-60% of its drafts in issue #376's long agent turns, against
+93-98% for the deleted direct engine, whose ring lived in the sequence's slot. A ring
+taken anew starts empty. A request takes the context it continues as it adopts the
+cached prefix, before that prefix's copy or its slot asks the device for room. On one
+direct-CUDA device (`--backend cuda`, whose room the model makes itself), a ring is made
+to keep a context beside the kept ones where the device has room for it, and a device
+short of memory gives kept rings back only after the conversations the prefix cache
+keeps (an 81 MB ring is little room beside a conversation, and worth a reused turn's
+drafts), the least recently kept first. Every other backend has no way to give a ring
+back, so there a new request takes the context kept the longest ago instead, and a model
+holds no more rings than requests held at once: conversations served one after another
+share one ring, and only the most recent one's next turn finds its context.
 
 A per-token head can opt in too, through its weights adapter:
 `IDraftHead.DraftHeadResumesAfterGap`. Stateful heads without a suffix restart
@@ -339,6 +361,35 @@ its own default rather than sharing one: `0.15` for a per-token head (top-1
 probability over its top-10 logits), `0.35` for a block drafter (the CUMULATIVE
 prefix probability, so the same number is far stricter), `0` for n-gram (where it
 scales the required match length instead).
+
+### The per-request stats line
+
+A request that speculated logs one line when it finishes:
+
+```
+Speculative decoding stats for chat-…: drafted=175 accepted=165 acceptance=94 % verifySteps=26 plainSteps=0 rollbacks=3
+  | phaseMs draft=103 verify=749 commit=21 snapshot=0 rollback=0 catchUp=2 plain=0
+  | perVerifyMs draft=4.0 verify=28.8 commit=0.8 catchUp=0.1 | governor plain=… spec=… wins=0 losses=0 parked=0
+```
+
+`phaseMs` are the request's wall-clock totals by phase, each counted once:
+
+| Phase | What it holds |
+| --- | --- |
+| `draft` | the drafter proposing, including steps whose draft proposed nothing |
+| `verify` | the trunk forward over the window and its readback, nothing else; where one forward verifies several requests (the unified runtime's batched step, which serves a lone request too), this request's share of it |
+| `commit` | drawing the window's rows, accepting the drafts and the trunk's commit of the kept rows (a recurrent trunk's replay of them, or keeping the verify's own rows); a share on a batched step |
+| `snapshot` | the recurrent-state snapshot before a solo verify |
+| `rollback` | the re-forward of the kept rows where the trunk could not keep the verify's own |
+| `catchUp` | handing a verify step's kept tokens to the drafter |
+| `plain` | steps that verified no draft: their forward and the drafter's catch-up; on a batched step, the request's share of the forward and of the draws, and its catch-up |
+
+`perVerifyMs` divides `draft`, `verify`, `commit` and `catchUp` by `verifySteps`: what one
+verify step spent in each. `draft` also holds the drafts that proposed nothing (their steps
+ran plain), so its per-step figure is drafting's whole cost per verify step. Until 2026-11 the batched step timed its verify from the start
+of the step, so `verify` held the draft as well (also counted under `draft`), and nothing
+counted the commit; per-step figures read off older logs overstate the verify by the
+draft. `TS_BATCHED_SPEC_LOG=1` prints the same phases for every batched step.
 
 ## DFlash and DFlash2
 

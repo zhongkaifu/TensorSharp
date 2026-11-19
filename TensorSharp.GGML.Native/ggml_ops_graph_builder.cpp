@@ -96,7 +96,7 @@ namespace
         OP_CPY = 33,            // copy a into b; the result views b
         OP_SET_ROWS = 34,       // srcs: dst, src, row ids; the result views dst
         OP_ROPE_EXT = 35,       // srcs: x, positions, [freq factors]; ip: n_dims, mode, n_ctx_orig; fp: base, freq_scale, ext, attn, beta_fast, beta_slow
-        OP_FLASH_ATTN_EXT = 36, // srcs: q, k, v, [mask]; fp: scale, max_bias, softcap; ip: [acc precision]
+        OP_FLASH_ATTN_EXT = 36, // srcs: q, k, v, [mask], [sinks]; fp: scale, max_bias, softcap; ip: [acc precision, n_kv max, rows kind, sliding-window band (GraphAttentionRows: hints for TensorSharp executors, ignored here)]
         OP_SOFT_MAX_EXT = 37,   // srcs: x, [mask]; fp: scale, max_bias
         OP_ARGSORT = 38,        // ip: order (0 asc, 1 desc)
         OP_TOP_K = 39,          // ip: k

@@ -29,6 +29,9 @@ public sealed class DenseDecoderSyntheticModelBuilder
 
     /// <summary>general.architecture, and the prefix of every hyperparameter key.</summary>
     public string Architecture { get; init; } = "llama";
+
+    /// <summary>The context_length the file declares (the model's window where MAX_CONTEXT does not set one).</summary>
+    public int ContextLength { get; init; } = 4096;
     public string MetadataPrefix { get; init; }
     public string PreTokenizer { get; init; } = "tekken";
     public bool IncludeMistralControlTokens { get; init; } = true;
@@ -172,7 +175,7 @@ public sealed class DenseDecoderSyntheticModelBuilder
         {
             ("general.architecture", Str(Architecture)),
             ($"{a}.block_count", U32(checked((uint)LayerCount))),
-            ($"{a}.context_length", U32(4096)),
+            ($"{a}.context_length", U32((uint)ContextLength)),
             ($"{a}.embedding_length", U32(Hidden)),
             ($"{a}.feed_forward_length", U32(FfnLength)),
             ($"{a}.attention.head_count", U32(NumHeads)),

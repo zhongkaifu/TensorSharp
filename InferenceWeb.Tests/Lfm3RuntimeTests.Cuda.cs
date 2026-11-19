@@ -77,6 +77,21 @@ public sealed partial class Lfm3RuntimeTests
     [CudaFact]
     public void GraphAndPerOpStepsShareTheStateOnDirectCuda() => AssertGraphAndPerOpShareTheState(BackendType.Cuda);
 
+    /// <summary>An explicit q8_0 K/V cache on direct CUDA: a stack with sliding-window layers keeps it off the graphs (their
+    /// bands are selections the executor reads only over F16 caches, and its q8_0 row writes are not taken modulo a ring's
+    /// cells), and runs the per-op path; a stack without them runs q8_0 as graphs on the flash kernels.</summary>
+    [CudaFact(TensorCoreModule = "tensorsharp_flash_prefill")]
+    public void DirectCudaKeepsQ8KvOffTheGraphsOfAStackWithSlidingWindows()
+    {
+        using IDisposable q8 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0);
+        string sliding = new Lfm3SyntheticModelBuilder { HeadDimension = 128 }.Write(Path.Combine(_dir, "lfm3-q8-sliding.gguf"));
+        using (Lfm3RuntimeModel model = Create(sliding, backend: BackendType.Cuda))
+            Assert.Equal($"KV dtype Q8_0 with {model.Config.Architecture}'s attention routes on this backend's executor", model.GraphRefusalForTests);
+        string full = new Lfm3SyntheticModelBuilder { Layout = "cfcfcf", HeadDimension = 128 }.Write(Path.Combine(_dir, "lfm3-q8-full.gguf"));
+        using (Lfm3RuntimeModel model = Create(full, backend: BackendType.Cuda))
+            Assert.Null(model.GraphRefusalForTests);
+    }
+
     // ---------------------------------------------------------------- the sliding window
 
     [CudaTheory]

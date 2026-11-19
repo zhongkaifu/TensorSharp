@@ -49,3 +49,4 @@ using System.Runtime.InteropServices;
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("TensorSharp.Models")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("InferenceWeb.Tests")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("CpuFloatBench")]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("LongContextQualityProbe")]

@@ -148,7 +148,9 @@ namespace TensorSharp.Models
 
         /// <summary>Entry <paramref name="entry"/>'s cache tensor for one rank at <paramref name="capacity"/> cells (null where
         /// it has none: a recurrent layer, another node's layer, an extra cache's value side).</summary>
-        private Tensor NewCacheTensor(int entry, int rank, int capacity, bool value)
+        /// <param name="zeroFrom">The first row the new tensor's zero fill covers: a copy writes the rows before it (a grown or
+        /// copied slot's), so only the rows past them are filled (<see cref="ZeroCacheRows"/>).</param>
+        private Tensor NewCacheTensor(int entry, int rank, int capacity, bool value, int zeroFrom = 0)
         {
             DType dtype = _kvCacheDtype.ToDType();
             Tensor t;
@@ -171,8 +173,35 @@ namespace TensorSharp.Models
                 t = value ? new Tensor(alloc, dtype, kvHeads, cells, _valueDim)
                           : new Tensor(alloc, dtype, kvHeads, cells, _keyDim);
             }
-            InitializeCacheTensor(t);
+            ZeroCacheRows(t, zeroFrom);
             return t;
+        }
+
+        /// <summary>
+        /// A new cache tensor's allocation-time zero (<see cref="ModelBase.InitializeCacheTensor"/>: a padded window reads cells
+        /// no row has written, which must be finite), from row <paramref name="from"/> of each head on: the rows before it are
+        /// the ones a copy into the tensor writes next (a grown slot's, a copied one's). Filled whole, a 47K-token slot's growth
+        /// or copy zeroed gigabytes it then overwrote. Nothing where the allocation is zero already, or on MLX.
+        /// </summary>
+        private void ZeroCacheRows(Tensor t, int from)
+        {
+            if (t == null || _backend == BackendType.Mlx || t.Storage.TakeAllocationZeroGuarantee()) return;
+            long heads = t.Sizes[0], cells = t.Sizes[1];
+            if (from <= 0)
+            {
+                Ops.Fill(t, 0f);
+                CacheZeroFillBytes += t.Storage.ByteLength;
+                return;
+            }
+            if (from >= cells) return;
+            // A head's rows past `from` are contiguous: one fill each (a block-quantized row is whole blocks).
+            for (long h = 0; h < heads; h++)
+            {
+                using Tensor head = t.Narrow(0, h, 1);
+                using Tensor tail = head.Narrow(1, from, cells - from);
+                Ops.Fill(tail, 0f);
+            }
+            CacheZeroFillBytes += t.Storage.ByteLength / cells * (cells - from);
         }
 
         /// <summary>The extra key cache of <paramref name="layer"/> in <paramref name="k"/> (a slot's K array), or null.</summary>
@@ -407,7 +436,7 @@ namespace TensorSharp.Models
                 PrepareResidency();
 
                 int maxContext = ResolveConfiguredContextLength();
-                int initial = ResolveInitialCacheAllocationLength(maxContext);
+                int initial = PrimaryCacheAllocationLength(InitialCacheLengthForTests.Value ?? ResolveInitialCacheAllocationLength(maxContext), maxContext);
                 if (initial < maxContext)
                     Console.WriteLine($"Initial {_backend} KV cache allocation: {initial} tokens (grows on demand up to {maxContext}).");
                 InitCaches(initial, maxContext);
@@ -492,6 +521,30 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- KV caches
 
+        /// <summary>Tests: what <see cref="ModelBase.ResolveInitialCacheAllocationLength(int, int)"/> answers for the models
+        /// constructed on this flow (it reads MAX_CONTEXT from the environment, which tests do not set: an explicit window
+        /// answers the whole window).</summary>
+        internal static readonly System.Threading.AsyncLocal<int?> InitialCacheLengthForTests = new();
+
+        /// <summary>
+        /// The primary cache's cells at load. Where recorded steps bind slots (<see cref="SlotBoundPolicies"/>, the CUDA executor)
+        /// a unified model serves every request in a slot of its own (<see cref="EnsureSequenceSlot"/>), and the primary serves
+        /// only the warm-up and the paths outside the scheduler, growing on demand (<see cref="EnsureCacheCapacity"/>): it starts
+        /// at a fresh slot's size, and MAX_CONTEXT bounds the window without committing it. Allocated at an explicit 131,072-token
+        /// window, Qwen3.8-27B's primary held 8.5 GB no request used (26,297 against 19,769 MiB at 32,768 tokens), and a 24 or
+        /// 32 GB card then had no room for a 47K-token request's slot (CUDA error 2, HTTP 500; issue #376). An explicit
+        /// TS_KV_INITIAL_TOKENS still sizes it (<paramref name="initial"/> already holds it).
+        /// </summary>
+        private int PrimaryCacheAllocationLength(int initial, int maxContext)
+        {
+            if (!SlotBoundPolicies || LayerSplitGroup != null || TensorSharp.Runtime.Scheduling.ExecutionOptions.FromEnvironment().KvInitialTokens > 0)
+                return initial;
+            return Math.Max(1, Math.Min(maxContext, FreshSlotTokens));
+        }
+
+        /// <summary>The primary cache's cells, whichever cache is active (tests).</summary>
+        internal int PrimaryCacheCapacityForTests => _activeKey == null ? _cacheCapacity : _primary?.Capacity ?? 0;
+
         private void InitCaches(int initial, int maxContext)
         {
             _maxContextLength = maxContext;
@@ -524,6 +577,7 @@ namespace TensorSharp.Models
                 }
             }
             _cacheCapacity = capacity;
+            NoteShareCapacity(_cacheK, capacity);   // the arrays are the same objects, their tensors larger
             Console.WriteLine($"Expanded {Config.Architecture} attention cache to {capacity} tokens.");
         }
 
@@ -555,6 +609,7 @@ namespace TensorSharp.Models
 
         protected override void ResetKVCacheCore()
         {
+            PrepareWrite(_cacheK, 0);   // every row is rewritten: the checkpoints over them go first
             _verifyRows = 0;   // the state is reset; nothing to settle
             DropReplaysOf(_cacheK, _recurrentPrimary);
             _draftStart = 0;
@@ -576,6 +631,8 @@ namespace TensorSharp.Models
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
+            // The checkpoints past the new length go first: the rows from it on are written again.
+            PrepareWrite(_cacheK, tokenCount);
             SyncActiveToHost();
             ClearGraphCache();
             if (tokenCount < _draftFollowed) _draftFollowed = -1;   // the rows the draft layer followed are rewritten
@@ -647,32 +704,42 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardRefillCore(int[] tokens)
         {
-            // Long prompts run in chunks so the per-layer score tensor stays bounded
-            // (~heads x chunk x context). Media carry positions within one forward, and a
-            // multi-node pipeline follows the serialized protocol, so neither is chunked.
-            if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
-                return ForwardCore(tokens);
-            int last = tokens.Length - 1;
-            // The chunks' steps overlap on the device across chunk boundaries too (InRingSteps' scopes nest in this one).
-            IDisposable overlap = null;
-            if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null)
-            {
-                EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
-                overlap = GraphExecutor.OverlapSteps();
-            }
+            // A refill forwards prompt tokens: its chunks attend as prompt chunks (GraphRequest.PromptChunks).
+            bool outer = _promptScope;
+            _promptScope = true;
             try
             {
-                for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+                // Long prompts run in chunks so the per-layer score tensor stays bounded
+                // (~heads x chunk x context). Media carry positions within one forward, and a
+                // multi-node pipeline follows the serialized protocol, so neither is chunked.
+                if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
+                    return ForwardCore(tokens);
+                int last = tokens.Length - 1;
+                // The chunks' steps overlap on the device across chunk boundaries too (InRingSteps' scopes nest in this one).
+                IDisposable overlap = null;
+                if (OverlapPromptSteps && !_followPlainPrompt && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null)
                 {
-                    int len = Math.Min(PrefillChunkTokens, last - pos);
-                    RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+                    EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
+                    overlap = GraphExecutor.OverlapSteps();
                 }
+                try
+                {
+                    for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+                    {
+                        int len = Math.Min(PrefillChunkTokens, last - pos);
+                        RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+                    }
+                }
+                finally
+                {
+                    overlap?.Dispose();
+                }
+                return ForwardCore(new[] { tokens[last] });
             }
             finally
             {
-                overlap?.Dispose();
+                _promptScope = outer;
             }
-            return ForwardCore(new[] { tokens[last] });
         }
 
         protected override float[] ForwardCore(int[] tokens)
@@ -696,6 +763,7 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int start = _cacheSeqLen;
             EnsureCacheCapacity(checked(start + seqLen));
+            PrepareWrite(_cacheK, start);
             _forwardSw.Start();
             try
             {
@@ -721,7 +789,7 @@ namespace TensorSharp.Models
                 // A driven request's media prompt also returns its last final hidden row (ForwardUnifiedMediaRows).
                 float[][] lastHidden = wantLogits && _promptHiddenOut != null ? new[] { _promptHiddenOut } : null;
                 if (RunFollowingDFlash(ref dflash, plan => TryRunGraph(hidden, new[] { active }, new[] { 0 }, new[] { seqLen }, new[] { start },
-                        wantLogits, out graphLogits, lastHidden, positions.Table, follow, draftRows, plan)))
+                        wantLogits, out graphLogits, lastHidden, positions.Table, follow, draftRows, plan, prompt: ForwardIsPrompt || _promptScope)))
                 {
                     hidden.Dispose();
                     _cacheDeviceDirty = true;
@@ -744,6 +812,55 @@ namespace TensorSharp.Models
                 hidden.Dispose();
                 _cacheSeqLen += seqLen;
                 return logits;
+            }
+            finally
+            {
+                EnterStage(0);
+                _forwardSw.Stop();
+            }
+        }
+
+        /// <summary>
+        /// Tests and the eng quality probe (eng/LongContextQualityProbe): <paramref name="tokens"/> as one prompt chunk of the
+        /// active sequence, its attention marked as the prompt entry points mark theirs (<see cref="GraphRequest.PromptChunks"/>,
+        /// more than <see cref="SmallChunkRows"/> rows), returning every row's logits (row i's at <c>i * VocabSize</c>): the
+        /// prompt path's next-token predictions, to score a text by. The chunk advances the sequence as a prompt chunk does;
+        /// only the projection of every row differs from <see cref="RunSequence"/>'s graph step. One device, graphs only.
+        /// </summary>
+        internal float[] ForwardPromptRowsForTests(int[] tokens)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (tokens.Length == 0) throw new ArgumentException("A forward needs at least one token.", nameof(tokens));
+            if (IsMultiNodePipeline || _rankGraphs || _pendingMedia.Count > 0)
+                throw new NotSupportedException("Scored prompt chunks run on one device, without media.");
+            if (GraphUnsupportedReason() is { } reason)
+                throw new NotSupportedException($"{Config.Architecture}: scored prompt chunks run as graphs, which this model cannot use ({reason}).");
+            SettlePendingVerify();
+            int rows = tokens.Length, start = _cacheSeqLen;
+            EnsureCacheCapacity(checked(start + rows));
+            _forwardSw.Start();
+            try
+            {
+                TokenPositions positions = BeginRotaryPositions(start, rows);
+                EnterStage(0);
+                var request = new GraphRequest
+                {
+                    PositionTable = positions.Table, AllRowLogits = true, PromptChunks = MarksPromptChunks(true, new[] { rows }),
+                };
+                Tensor hidden = EmbedStep(tokens);
+                GraphResult result;
+                try
+                {
+                    if (!TryRunGraphStep(hidden, new[] { SnapshotActive() }, new[] { 0 }, new[] { rows }, new[] { start }, request, out result))
+                        throw new NotSupportedException($"{Config.Architecture}: this scored prompt chunk did not run as a graph.");
+                }
+                finally
+                {
+                    hidden.Dispose();
+                }
+                _cacheDeviceDirty = true;
+                _cacheSeqLen += rows;
+                return result.Logits;
             }
             finally
             {
@@ -1520,6 +1637,7 @@ namespace TensorSharp.Models
 
         private void ReleaseDecoderResources()
         {
+            UnregisterDeviceRoomReclaimer();
             StopHostWarm();
             foreach (RankExpertStack stack in _rankStacks.Values) stack.Stack.Dispose();
             _rankStacks.Clear();

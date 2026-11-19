@@ -1377,17 +1377,22 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         /// <summary>Log cumulative NextN/MTP speculative-decoding counters when
-        /// a request that ran speculatively finishes.</summary>
+        /// a request that ran speculatively finishes: the phases' totals and, per
+        /// verify step, what drafting, the verify forward, the commit and the
+        /// drafter's catch-up each took (<see cref="SpeculationStats"/> says what
+        /// each phase holds).</summary>
         private void LogSpeculationStatsIfAny(SequenceState seq)
         {
             var st = seq.SpecStats;
             if (st == null || (st.VerifySteps + st.PlainSteps) == 0)
                 return;
             _logger.LogInformation(
-                "Speculative decoding stats for {EngineRequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0} | governor plain={GovPlain:F1}ms/tok spec={GovSpec:F1}ms/tok wins={GovWins} losses={GovLosses} parked={GovParked}",
+                "Speculative decoding stats for {EngineRequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} commit={CommitMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0} | perVerifyMs draft={DraftPerVerify:F1} verify={VerifyPerVerify:F1} commit={CommitPerVerify:F1} catchUp={CatchUpPerVerify:F1} | governor plain={GovPlain:F1}ms/tok spec={GovSpec:F1}ms/tok wins={GovWins} losses={GovLosses} parked={GovParked}",
                 seq.RequestId, st.TokensDrafted, st.TokensAccepted, st.AcceptanceRate,
                 st.VerifySteps, st.PlainSteps, st.RollbackSteps,
-                st.DraftMs, st.VerifyMs, st.SnapshotMs, st.RollbackMs, st.CatchUpMs, st.PlainMs,
+                st.DraftMs, st.VerifyMs, st.CommitMs, st.SnapshotMs, st.RollbackMs, st.CatchUpMs, st.PlainMs,
+                st.PerVerifyStep(st.DraftMs), st.PerVerifyStep(st.VerifyMs), st.PerVerifyStep(st.CommitMs),
+                st.PerVerifyStep(st.CatchUpMs),
                 st.PlainMsPerToken, st.SpecMsPerToken, st.GovernorWins, st.GovernorLosses, st.GovernorParkedSteps);
         }
 

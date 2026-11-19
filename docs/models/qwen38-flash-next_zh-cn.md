@@ -828,10 +828,18 @@ Metal 的专家分层位于统一内存中，按其预读窗口工作，因此�
 
 #### 直接引擎上的 Q8_0 KV 缓存，2026-11-08
 
-`--backend cuda` 默认使用 `q8_0` KV 缓存，除非 `--kv-cache-dtype` 指定其他类型（`f16` 保持 F16）：12 个注意力层的 K、V 以 int8 编码保存，每 32 个值一个 F16 缩放（ggml 的 Q8_0
+在直接引擎上，`--backend cuda` 默认使用 `q8_0` KV 缓存，除非 `--kv-cache-dtype` 指定其他类型（`f16` 保持 F16）：12 个注意力层的 K、V 以 int8 编码保存，每 32 个值一个 F16 缩放（ggml 的 Q8_0
 算法；编码与缩放分开存放，一个 lane 一次读入自己的 8 个编码），字节数是 F16 缓存的一半，规划器把省下的显存交给专家槽位。`q4_0` 会在
 stderr 上说明后改用 F16。与 F16 缓存相比，合成测试模型的 logits 相对变化 3.7e-3 到 4.8e-3；Q8_0 缓存上的验证窗口与同一缓存上的普通
 decode 完全一致。
+
+> 这个引擎已随 #371 删除，它的 `q8_0` 默认值也随之取消。现在承载 `--backend cuda` 的运行时为 Flash Next 保留 F16 缓存，除非
+> `--kv-cache-dtype` 指定其他类型。在 CUDA 执行器上，QSA 层的索引键、QSA 选择和稀疏注意力只读取 F16 缓存，而 qwen4exp 只能以整图
+> 前向运行（没有逐算子路径），因此运行时无法在 `--backend cuda` 上以 `q8_0` 缓存运行 Flash Next：显式指定
+> `--kv-cache-dtype q8_0` 时模型可以加载，但第一步会失败并报告 `qwen4exp runs only as graphs on the shared runtime, which this
+> step cannot use (KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor).`。该执行器的整图完全不接受 `q4_0`
+> 缓存，因此 `q4_0` 也会同样失败（`KV dtype Q4_0 on this backend's executor`）。在 `--backend cuda` 上运行 Flash Next 时请保持
+> `f16`。
 
 同一会话，RTX 5090，`Q2_0`，`TS_Q4E_HC_Q8=1`，MTP（Q2_0 草稿专家），`TS_MOE_TIER_ADAPT=1`，131K 上下文：
 

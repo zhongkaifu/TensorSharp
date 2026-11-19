@@ -90,6 +90,26 @@ namespace TensorSharp.Graph
         public const int F32 = 0, F16 = 1, Q4_0 = 2, Q8_0 = 8, I32 = 26, I64 = 27, BF16 = 30;
     }
 
+    /// <summary>
+    /// <see cref="GraphOp.FlashAttnExt"/>'s ip[2]: what its query rows are, as the model that emitted them says. The op's ip:
+    /// [0] ggml's accumulation precision, [1] the most keys a mask row leaves finite (0: unknown), [2] one of these, and
+    /// [3] a sliding window's band where the executor reads band masks on the device
+    /// (<see cref="GraphCapabilities.BandMasksOnDevice"/>; such an op's [2] is <see cref="Unsaid"/>: its rows are decode rows or
+    /// a verify window). An op that is neither marked nor banded carries at most two ip, so its program keeps the bytes and
+    /// signature it had.
+    /// </summary>
+    public static class GraphAttentionRows
+    {
+        /// <summary>Not said (decode rows, a verify window, a drafter's rows): an executor keeps the arithmetic decode rows
+        /// share.</summary>
+        public const long Unsaid = 0;
+
+        /// <summary>One sequence's prompt chunk: prompt tokens a plain and a speculating request forward through the same
+        /// chunks, never a verify window's or a drafter's rows. An executor may attend them with arithmetic decode rows do not
+        /// share (the CUDA executor's 8-bit prompt attention).</summary>
+        public const long PromptChunk = 1;
+    }
+
     /// <summary>A weight held in a quantized block layout (GGUF's formats): what a backend needs to
     /// run a product with it (its resident copy is found by <see cref="CacheKey"/>).</summary>
     public interface IGraphWeight
@@ -229,6 +249,13 @@ namespace TensorSharp.Graph
         /// executor may then lay it out head by head). Fp: the norms' eps, the rotary's base, frequency scale, extrapolation factor,
         /// attention factor, beta fast and beta slow. Result: the rotated queries [d, heads, rows].</summary>
         AttentionPrep = 16,
+        /// <summary>DFlash2's grouped dynamic convolution of a block's rows: out[r][c] = sum over taps t &lt;= r of
+        /// x[r - t][c] * base[side][t][c] + x[r - t][c] * taps[r][side * width * groups + t * groups + c / group], each product
+        /// rounded on its own, each tap's two products added, and the taps added in order (tap 0's term, then the result plus
+        /// each later tap's: zero on the rows before that tap reaches). Inputs: x [hidden, rows], taps [stride, rows] (the
+        /// conv projection of the sublayer's input) and the base kernel [hidden, width, 2]. Ip: width, group, groups, side,
+        /// stride. Result: [hidden, rows].</summary>
+        DFlashConv = 17,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

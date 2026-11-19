@@ -44,6 +44,24 @@
 > 输出上（`.input_scale` 是校准元数据，推理时忽略）。在 sm_120 GPU 上，
 > prefill 走 ggml-cuda 的原生 block-scaled FP4 tensor-core 路径。
 
+> **NVFP4 的 prompt 行是 W4A4。** 在 FP4 张量核上，行数超过 8-bit matvec 所能处理的
+> 乘积会把激活也量化为 NVFP4：`--backend cuda`（sm_120a / sm_121a 构建）是超过 16
+> 行，多个序列共用的步是超过 8 行；Blackwell 上的 ggml-cuda 是超过 8 行。prompt
+> 分块就是这样的乘积。decode 步保留 8-bit 激活，不超过上述行数的验证窗口也保留。因此 prompt
+> 行的预测比 decode 行差：Qwen3.8-27B NVFP4 的 8K 窗口上，同一批 token 的 prompt
+> 行平均 NLL 比 decode 行高 0.12 nats（英文散文，top-1 一致率 85%），C# 代码高
+> 0.005。prompt 行改用 8-bit 激活，或改用 Q6_K 文件，两条路径相差在 0.002 以内。
+> `--backend ggml_cuda`（+0.13 / +0.01）、llama.cpp（`llama-perplexity` 在 `-ub 512`
+> 下 7.36，`-ub 8` 下 6.65；Q6_K 两者都是 5.60）以及已移除的直连引擎都有同样的差距。
+> 请求在第一个生成 token（它来自 prompt 行）上受影响，其后几十个 decode 行略受影响。
+> 把 prompt 的最后一个 token 单独作为一行步运行（已移除的引擎即如此）只能挽回一部分：
+> 在 256 个散文目标上，该行分布与 8-bit 路径分布的 KL 比 prompt 行低约 40%，大部分代价
+> 仍在 prompt 行建立的上下文里。
+> 代价来自这些 prompt 路径所用的 W4A4 kernel，而不只是 NVFP4 权重本身：同样的 prompt
+> 行改用 8-bit 激活就没有差距。prompt 侧精度比 prefill 速度更重要时，请选用同一仓库的
+> `Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf`（22.858 GB）。测量工具为
+> `eng/LongContextQualityProbe`（`--arms default,q8act`），RTX PRO 4500，2026-11。
+
 转换模型卡将对应的 Qwen 官方仓库标记为基础模型；这些上游模型卡声明 Apache-2.0。
 
 ```bash
@@ -501,7 +519,7 @@ M5 Pro（48 GB）实测：Qwen3.8-27B GGUF，DFlash2 Q4_K_M 草稿模型（`--sp
 
 ## 10. 内存与 KV cache 策略
 
-- **全注意力层**：每个槽位一份 K/V cache，`[kv_heads, capacity, head_dim]`，类型由 `--kv-cache-dtype` 决定（`f32`、`f16`、`q8_0`、`q4_0`）。槽位从小容量开始，按需增长到上下文长度；在一步即将耗尽显存前，空闲的保留槽位会先交还其设备副本。
+- **全注意力层**：每个槽位一份 K/V cache，`[kv_heads, capacity, head_dim]`，类型由 `--kv-cache-dtype` 决定（`f32`、`f16`、`q8_0`、`q4_0`）。槽位从小容量开始，按需增长到上下文长度；在一步即将耗尽显存前，空闲的保留槽位会先交还其设备副本。在 `--backend cuda` 上，cache 为 `f16`（权重低于 F32 时），除非 `--kv-cache-dtype` 指定其他类型。`q8_0` 让它约减半（每 64 字节只需 34 字节）：Qwen3.8-27B NVFP4 加 DFlash2 草稿器在 32 GB 显卡上用 `q8_0` 能完整服务一轮 130K token 的智能体对话；130K token 的全新预填充比 `f16` 慢 5%，69K token 以内验证步耗时与 `f16` 相同（RTX PRO 4500 Blackwell；见 `docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md`）。
 - **递归层**：每个槽位保存卷积窗口 `(conv_kernel - 1) x qkv_dim` 与 delta 状态 `[v_heads, head_v_dim, head_k_dim]`。递归状态无法回退，因此槽位只能截断到自身长度或清零。
 - **文件映射权重**：后端能直接读取时（GGML CUDA、Metal、CPU、集成 GPU），量化张量绑定 GGUF 映射而不复制。
 

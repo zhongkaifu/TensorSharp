@@ -310,6 +310,8 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
     }
 
     public int Layers { get; init; } = 4;
+    /// <summary>qwen35.context_length (the model's window where MAX_CONTEXT does not set one).</summary>
+    public int ContextLength { get; init; } = 4096;
     public int Ff { get; init; } = 448;      // 3584 / 8: not a multiple of 128 or 256
     public GgmlType WeightType { get; init; } = GgmlType.BF16;
     /// <summary>Scale of the token embedding, which is also the output head (tied).</summary>
@@ -333,7 +335,7 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
             new Str { Key = "general.architecture", V = a },
             new U32 { Key = $"{a}.block_count", V = (uint)(Layers + (NextN ? 1 : 0)) },
             new U32 { Key = $"{a}.nextn_predict_layers", V = NextN ? 1u : 0u },
-            new U32 { Key = $"{a}.context_length", V = 4096 },
+            new U32 { Key = $"{a}.context_length", V = (uint)ContextLength },
             new U32 { Key = $"{a}.embedding_length", V = (uint)Width },
             new U32 { Key = $"{a}.feed_forward_length", V = (uint)Ff },
             new U32 { Key = $"{a}.attention.head_count", V = NumHeads },

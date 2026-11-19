@@ -346,6 +346,45 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
     }
 
     /// <summary>
+    /// A block-quantized cache on direct CUDA (docs/models/qwen38-flash-next.md, "Q8_0 KV cache on the direct engine"; USAGE.md's
+    /// <c>--kv-cache-dtype</c>). The QSA layers' indexer keys, selection and sparse attention read F16 caches only on the CUDA
+    /// executor, its graphs take no q4_0 cache at all, and qwen4exp runs only as whole-forward graphs (no per-op path), so a
+    /// model with QSA layers over q8_0, and any over q4_0, fails its first step, naming the cache, rather than running a path
+    /// nobody measured. Without QSA layers the plain attention takes a q8_0 cache on the executor's flash kernels: every step a
+    /// graph, none on the generic path.
+    /// </summary>
+    [CudaTheory(TensorCoreModule = "tensorsharp_flash_prefill")]
+    [InlineData("q8_0", true, "KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor")]
+    [InlineData("q8_0", false, null)]
+    [InlineData("q4_0", false, "KV dtype Q4_0 on this backend's executor")]
+    public void ABlockCacheOnDirectCudaRunsOnlyAsQ8WithoutQsaLayers(string kvDtype, bool qsa, string refusal)
+    {
+        Assert.True(KvCacheDtypeConfig.TryParse(kvDtype, out KvCacheDtype kv));
+        using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(kv);
+        string path = Fixture(qsa);
+        using var model = new Qwen4ExpRuntimeModel(path, BackendType.Cuda);
+        model.ResetKVCache();
+        Assert.Equal(kv, model.KvCacheDtype);
+        if (refusal != null)
+        {
+            var refused = Assert.Throws<NotSupportedException>(() => model.ForwardRefill(Prompt));
+            Assert.Contains("runs only as graphs", refused.Message);
+            Assert.Contains(refusal, refused.Message);
+            Assert.Equal(0, model.GraphRuns);
+            return;
+        }
+        model.ForwardRefill(Prompt);
+        int prompt = model.GraphRuns;
+        foreach (int token in Decode)
+            model.Forward(new[] { token });
+        var executor = Assert.IsType<TensorSharp.Cuda.CudaGraphExecutor>(model.GraphExecutorForTests);
+        Assert.Null(model.GraphRefusalForTests);
+        Assert.True(prompt >= 1, "the prompt ran no graph");
+        Assert.Equal(Decode.Length, model.GraphRuns - prompt);
+        Assert.Equal(0, executor.Q8GenericAttentions);
+    }
+
+    /// <summary>
     /// Every step's indexer keys on direct CUDA as one kernel (GraphFusion.QsaKeys: each row's raw key written, a block its
     /// rows complete pooled with the ops' sum, norm and rotary) against their ops, the attention region on in both runs: the
     /// kernel leaves the cache the ops' bytes, so every row - the 40-row prompt's included, and the decode steps after it

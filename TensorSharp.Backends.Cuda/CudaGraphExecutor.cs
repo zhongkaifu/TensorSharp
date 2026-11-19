@@ -28,8 +28,11 @@ namespace TensorSharp.Cuda
         /// <summary>The base executor's capabilities, and a decode row's recurrence updates its state in place (see
         /// <see cref="GatedDeltaNet"/>); decode steps replay their program a position on over windows padded to 256 rows,
         /// whose unwritten keys the attention stops before (<see cref="FlashAttention"/>), and record as one CUDA graph
-        /// (<see cref="OpenDecodeCapture"/>).</summary>
-        public override GraphCapabilities Capabilities { get; } = new()
+        /// (<see cref="OpenDecodeCapture"/>). A prompt chunk's causal mask arrives as its pattern
+        /// (<see cref="GraphCapabilities.StructuralCausalMasks"/>): the prompt kernels read only its keys and floor.</summary>
+        public override GraphCapabilities Capabilities => StructuralMasksForTests ? s_capabilities : s_hostMaskCapabilities;
+
+        private static readonly GraphCapabilities s_capabilities = new()
         {
             StridedViews = true, DecodeWindowRows = 256, Replays = true, IndexedCacheWrites = true, InPlaceStateAlias = true,
             WindowStateInPlace = true, WindowRegionsReadPackedRows = true, SlotBoundRecordings = true,
@@ -39,7 +42,13 @@ namespace TensorSharp.Cuda
             // classified on the host had kept every later step unrecorded (LFM3-1.7B Q4_K_M on an A40, interleaved: decode
             // at 4K 183.3 -> 241.0 tok/s, at 16K 182.1 -> 224.5).
             BandMasksOnDevice = true,
+            StructuralCausalMasks = true,
         };
+
+        private static readonly GraphCapabilities s_hostMaskCapabilities = s_capabilities with { StructuralCausalMasks = false };
+
+        /// <summary>Tests: false gives prompt chunks' causal masks as host values, as before they arrived as their pattern.</summary>
+        internal bool StructuralMasksForTests { get; set; } = true;
 
         /// <summary>A recorded decode step reads its rotary positions from the device.</summary>
         protected override bool BroadcastsPositionsOnDevice => true;
@@ -65,7 +74,7 @@ namespace TensorSharp.Cuda
         private int DecodeWindowBucket => Capabilities.DecodeWindowRows;
 
         /// <summary>
-        /// An F16 cache's decode rows and verify windows on the flash kernels attend the written keys alone (the length read on
+        /// An F16 or q8_0 cache's decode rows and verify windows on the flash kernels attend the written keys alone (the length read on
         /// the device when recorded), and split them as the bucket window around their length does
         /// (<see cref="CudaFlashPrefillKernels.BucketKeys"/>, on the device for a recorded step); a QSA region scores and selects
         /// only the blocks a row sees: a window padded to the slot's capacity computes what the bucket window computes, bit for
@@ -74,7 +83,18 @@ namespace TensorSharp.Cuda
         /// tok/s, whose graphs read the length on the device and never record again).
         /// </summary>
         public override bool AttendsCapacityWindows(int headDim, int kvFormat)
-            => kvFormat == GraphFormat.F16 && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && flash.RunsAttention(headDim);
+            => ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash
+               && (kvFormat == GraphFormat.F16 ? flash.RunsAttention(headDim) : kvFormat == GraphFormat.Q8_0 && flash.RunsAttentionQ8(headDim));
+
+        /// <summary>
+        /// F32 and F16 caches, and q8_0 caches whose attention the flash kernels run (128 or 256 values a head, K as wide as V, the
+        /// sm_80 _q8 kernels loaded) and whose rows this executor's kernels write (the prep region, set_rows and the row copies,
+        /// with ggml's quantize_row_q8_0): a q8_0 cache reads half an F16 cache's bytes a step. Q4_0 stays off the graphs.
+        /// </summary>
+        public override bool TakesKvCacheFormat(int kvFormat, int keyDim, int valueDim)
+            => kvFormat == GraphFormat.Q8_0
+                ? keyDim == valueDim && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && flash.RunsAttentionQ8(keyDim) && Kernels != null
+                : base.TakesKvCacheFormat(kvFormat, keyDim, valueDim);
 
         public IDecodeCapture OpenDecodeCapture()
             => Allocator is CudaAllocator cuda ? new RuntimeDecodeCapture(cuda) : null;
@@ -176,9 +196,10 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>An F16 / F32 copy that converts (the CUDA copy op copies one type only): the source made contiguous in
-        /// its own type first where it is a strided view.</summary>
+        /// its own type first where it is a strided view; F32 rows into a q8_0 cache's rows (<see cref="TryRowsToQ8"/>).</summary>
         private bool TryConvert(Tensor dst, Tensor src)
         {
+            if (dst.ElementType == DType.Q8_0 && src.ElementType == DType.Float32) return TryRowsToQ8(dst, src);
             bool toHalf = dst.ElementType == DType.Float16 && src.ElementType == DType.Float32;
             if (!(toHalf || (dst.ElementType == DType.Float32 && src.ElementType == DType.Float16)) || Kernels == null
                 || dst.Storage is not CudaStorage || src.Storage is not CudaStorage || !dst.IsContiguous()
@@ -232,9 +253,12 @@ namespace TensorSharp.Cuda
         /// a strided run) in the same kernel, its cells taken modulo the ring.</summary>
         protected override bool TryWriteRingRows(Tensor dst, Tensor src, int first, int count) => WriteRows(dst, src, first, count, circular: true);
 
-        private static bool WriteRows(Tensor dst, Tensor src, int first, int count, bool circular)
+        private bool WriteRows(Tensor dst, Tensor src, int first, int count, bool circular)
         {
             if (dst.DimensionCount is < 2 or > 3 || !dst.IsContiguous()) return false;
+            // q8_0 rows are never taken modulo the cells: a run past the last cell is declined (copied a run at a time), and a
+            // family with sliding-window rings keeps q8_0 off this executor's graphs (StandardDecoderModel.AttentionRoutesTakeQuantizedKv).
+            if (dst.ElementType == DType.Q8_0) return TryWriteQ8Rows(dst, src, null, first, count);
             using Tensor cache = HeadFirst(dst);
             // A chunk's rows may come as their permuted view (the graph no longer copies K and V before an indexed write): the
             // cache-write kernel reads [heads, rows, d] packed, so such rows are packed here first (the copy the graph made).
@@ -271,7 +295,7 @@ namespace TensorSharp.Cuda
         /// explicit mask, an operand that is not a cache window) takes the generic path.
         /// </summary>
         protected override Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
-            CacheWindow kWindow, CacheWindow vWindow)
+            CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
             // Rows over K and V that are tensors, not cache windows (a block drafter's ring), with a mask tensor: its values, whatever
             // pattern an eager run reads in them (a recorded run cannot read them; the eager run had then taken the generic path,
@@ -298,7 +322,8 @@ namespace TensorSharp.Cuda
                 || q.DimensionCount != 3 || k.DimensionCount is < 2 or > 3 || v.DimensionCount is < 2 or > 3
                 || kWindow.Cache.DimensionCount is < 2 or > 3 || vWindow.Cache.DimensionCount is < 2 or > 3
                 || k.Sizes[^1] != v.Sizes[^1])
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return GenericAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk,
+                    mask.Pattern == MaskPattern.Explicit && !trimmed ? "a selection's mask on a decode row" : "operands the flash kernels do not take");
             int heads = (int)q.Sizes[0], nq = (int)q.Sizes[1], d = (int)q.Sizes[2];
             // A single KV head's window and cache bind without their head extent.
             int kvHeads = k.DimensionCount == 3 ? (int)k.Sizes[0] : 1;
@@ -306,13 +331,12 @@ namespace TensorSharp.Cuda
             using Tensor kc = HeadFirst(kWindow.Cache), vc = HeadFirst(vWindow.Cache);
             int cap = (int)kc.Sizes[1];
             using Tensor qc = q.IsContiguous() ? q.CopyRef() : Ops.NewContiguous(q);
-            // A decode row over an F16 cache: the flash kernel split over the keys (the length read on the device when the
+            // A decode row over an F16 or q8_0 cache: the flash kernel split over the keys (the length read on the device when the
             // step is recorded), where the GQA decode kernels took one block a head over the whole window (200 us a layer
             // at 4K keys on Qwen3.8-27B).
-            if (nq == 1 && kWindow.Start == 0 && vWindow.Start == 0 && heads % kvHeads == 0
-                && kc.ElementType == DType.Float16 && vc.ElementType == DType.Float16 && kc.Sizes[^1] == d && vc.Sizes[^1] == d
+            if (nq == 1 && kWindow.Start == 0 && vWindow.Start == 0 && heads % kvHeads == 0 && FlashCaches(kc, vc, d, out bool q8Row)
                 && (trimmed ? mask.Trimmed : mask.Pattern) is MaskPattern.Causal or MaskPattern.None
-                && ((CudaAllocator)Allocator).FlashPrefillKernels is { } decodeFlash && decodeFlash.RunsAttention(d))
+                && ((CudaAllocator)Allocator).FlashPrefillKernels is { } decodeFlash && (q8Row ? decodeFlash.RunsAttentionQ8(d) : decodeFlash.RunsAttention(d)))
             {
                 var cudaAllocator = (CudaAllocator)Allocator;
                 IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(cudaAllocator, kc.Storage);
@@ -331,9 +355,9 @@ namespace TensorSharp.Cuda
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(1, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
-                Launch(new[] { qc, kc, vc }, written, (_, stream) => decodeFlash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, 1, len, floor,
-                    heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn,
-                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0));
+                Launch(new[] { qc, kc, vc }, written, (_, stream) => decodeFlash.LaunchAttention(Ptr(qc), CachePtr(kc), CachePtr(vc), cap, 1, len,
+                    floor, heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn,
+                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0, q8: q8Row));
                 return attended;
             }
             if (nq == 1)
@@ -346,16 +370,20 @@ namespace TensorSharp.Cuda
                     using (result) return result.View(1, heads, d);
                 }
                 result.Dispose();
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return GenericAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk, "a decode row the flash kernels decline");
             }
             if (kWindow.Start != 0 || vWindow.Start != 0 || heads % kvHeads != 0)
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
-            // Causal rows over an F16 cache: the tensor-core flash attention (K and V tiles streamed once per block of
+                return GenericAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk, "a window that does not start at the cache's first row");
+            // Causal rows over an F16 or q8_0 cache: the tensor-core flash attention (K and V tiles streamed once per block of
             // 128 query rows, split over the keys when the rows are few), not the scores of every query and key.
-            if (kc.ElementType == DType.Float16 && vc.ElementType == DType.Float16 && kc.Sizes[^1] == d && vc.Sizes[^1] == d
-                && (trimmed ? mask.Trimmed : mask.Pattern) == MaskPattern.Causal
-                && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && flash.RunsAttention(d))
+            if (FlashCaches(kc, vc, d, out bool q8Rows) && (trimmed ? mask.Trimmed : mask.Pattern) == MaskPattern.Causal
+                && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && (q8Rows ? flash.RunsAttentionQ8(d) : flash.RunsAttention(d)))
             {
+                // A marked prompt chunk's rows may attend in 8 bits (TryPromptAttention8); else, and for every other row, the
+                // 16-bit kernels below.
+                if (promptChunk && nq > WidestVerifyWindow && !q8Rows
+                    && TryPromptAttention8(qc, kc, vc, cap, nq, len, floor, heads, kvHeads, d, scale, flash, out Tensor attended8))
+                    return attended8;
                 var attended = new Tensor(Allocator, DType.Float32, nq, heads, d);
                 // A recorded verify window reads its length on the device (the window's rows the last nq of it), as a
                 // recorded decode row does: the splits then follow the bucket window its length falls in (the launch holds its
@@ -367,9 +395,9 @@ namespace TensorSharp.Cuda
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { attended } : new[] { attended, partial };
                 // Rows past a verify window's are a prompt chunk's: the prompt kernels (CudaFlashPrefillKernels.LaunchAttention).
-                Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor,
+                Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), CachePtr(kc), CachePtr(vc), cap, nq, len, floor,
                     heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(attended), stream, dyn,
-                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0, prompt: nq > WidestVerifyWindow));
+                    windowKeys: windowKeys, bucket: dyn != IntPtr.Zero ? DecodeWindowBucket : 0, prompt: nq > WidestVerifyWindow, q8: q8Rows));
                 return attended;
             }
             // A recorded verify window replays at later positions, where the written length this classification read (the
@@ -379,7 +407,7 @@ namespace TensorSharp.Cuda
             if (trimmed && nq > 1 && mask.HasTensor && CudaDecodeDynParams.IsActive((CudaAllocator)Allocator))
             {
                 Tensor whole = mask.Tensor;
-                return FlashAttention(q, k, v, new AttentionMask(MaskPattern.Explicit, 0, () => whole), scale, kWindow, vWindow);
+                return FlashAttention(q, k, v, new AttentionMask(MaskPattern.Explicit, 0, () => whole), scale, kWindow, vWindow, promptChunk);
             }
             int group = heads / kvHeads;
             // K and V once as F32 [kvHeads, len, d] (the cache may hold F16); the query heads of a group share
@@ -387,12 +415,16 @@ namespace TensorSharp.Cuda
             // per KV head (no per-head copies of the cache).
             using var kx = new Tensor(Allocator, DType.Float32, kvHeads, len, d);
             using var vx = new Tensor(Allocator, DType.Float32, kvHeads, len, d);
-            if (!CudaFusedOps.TryExpandKvHeads(kx, kc, 1, len) || !CudaFusedOps.TryExpandKvHeads(vx, vc, 1, len))
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+            // A q8_0 cache's rows as the flash kernels' values (the tiled products here are its generic attention).
+            bool q8Cache = kc.ElementType == DType.Q8_0 || vc.ElementType == DType.Q8_0;
+            if (q8Cache) WarnQ8Generic(explicitRows ? "prompt or verify rows under an explicit mask" : "rows the flash kernels decline");
+            if (q8Cache ? !TryQ8RowsToF32(kx, kc, len) || !TryQ8RowsToF32(vx, vc, len)
+                : !CudaFusedOps.TryExpandKvHeads(kx, kc, 1, len) || !CudaFusedOps.TryExpandKvHeads(vx, vc, 1, len))
+                return GenericAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk, "a cache window the tiled path cannot widen");
             using Tensor kt = kx.Transpose(1, 2);
             using Tensor maskTensor = explicitRows ? Contiguous2(mask.Tensor, nq, len) : null;
             if (explicitRows && maskTensor == null)
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return GenericAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk, "a mask that is not an F32 device tensor");
             var output = new Tensor(Allocator, DType.Float32, nq, heads, d);
             // Query tiles keep the scores [heads, tile, len] within ScoreBudgetBytes at any context length.
             int tile = (int)Math.Clamp(ScoreBudgetBytes / ((long)heads * len * sizeof(float)), 1, nq);
@@ -574,7 +606,7 @@ namespace TensorSharp.Cuda
                     CudaDecodeDynParams.WindowRow(fewer);
                     try
                     {
-                        using Tensor one = FlashAttention(q1, k, v, rowMask, scale, kWindow, vWindow);
+                        using Tensor one = FlashAttention(q1, k, v, rowMask, scale, kWindow, vWindow, promptChunk: false);
                         using Tensor target = output.Narrow(0, r, 1);
                         using Tensor source = one.View(1, heads, d);
                         Ops.Copy(target, source);
@@ -597,7 +629,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>
         /// A verify window's rows on the flash kernel's row grid, where each row would run the flash kernel as a decode row
-        /// (an F16 cache window; a selection's rows listed on the device): one launch, each row the one-row launch's
+        /// (an F16 or q8_0 cache window; a selection's rows listed on the device): one launch, each row the one-row launch's
         /// arithmetic (its length, its key splits, its cells). One launch a row and a copy each had cost a 4-row window of
         /// Qwen3.8 Flash Next 0.9 ms against the engine's 0.2 (A40).
         /// </summary>
@@ -611,7 +643,7 @@ namespace TensorSharp.Cuda
             int nkv = (int)k.Sizes[^2];
             if (cuda.FlashPrefillKernels is not { } flash || !flash.RunsAttention(d) || (selection && Kernels == null)) return false;
             using Tensor kc = HeadFirst(kWindow.Cache), vc = HeadFirst(vWindow.Cache);
-            if (kc.ElementType != DType.Float16 || vc.ElementType != DType.Float16 || kc.Sizes[^1] != d || vc.Sizes[^1] != d) return false;
+            if (!FlashCaches(kc, vc, d, out bool q8) || (q8 && !flash.RunsAttentionQ8(d))) return false;
             using Tensor rows = selection ? Contiguous2(whole, nq, nkv) : null;
             if (selection && rows == null) return false;
             int cap = (int)kc.Sizes[1];
@@ -634,11 +666,11 @@ namespace TensorSharp.Cuda
                 ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
             Tensor[] written = partial == null ? new[] { output } : new[] { output, partial };
             Tensor[] read = selection ? new[] { qc, kc, vc, cells, count, rows } : new[] { qc, kc, vc };
-            Launch(read, written, (_, stream) => flash.LaunchDecodeRows(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq,
+            Launch(read, written, (_, stream) => flash.LaunchDecodeRows(Ptr(qc), CachePtr(kc), CachePtr(vc), cap, nq,
                 selection ? nkv : keys, selection ? 0 : floor, heads, kvHeads, d, scale, splits,
                 partial == null ? IntPtr.Zero : Ptr(partial), Ptr(output), stream, dyn,
                 selection ? Ptr(cells) : IntPtr.Zero, selection ? Ptr(count) : IntPtr.Zero, selection ? Ptr(rows) : IntPtr.Zero, nkv,
-                windowKeys: nkv, bucket: selection ? 0 : DecodeWindowBucket));
+                windowKeys: nkv, bucket: selection ? 0 : DecodeWindowBucket, q8: q8));
             attended = output;
             return true;
         }
@@ -776,9 +808,16 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>ggml_set_rows with the rows on the device (a recorded step's varying input): one block of F32 or F16
-        /// rows written there.</summary>
+        /// rows written there; a q8_0 cache's rows quantized there (<see cref="TryWriteQ8Rows"/>).</summary>
         protected override bool TrySetRowsOnDevice(Tensor dst, Tensor src, Tensor ids)
         {
+            if (dst.ElementType == DType.Q8_0)
+            {
+                if (ids.Storage is not CudaStorage || ids.ElementType != DType.Int32 || !ids.IsContiguous() || !dst.IsContiguous()) return false;
+                long[] nq = Ne(dst), nr = Ne(src);
+                if (nq[3] != 1 || nr[3] != 1 || nr[2] != nq[2] || nr[0] != nq[0] || ids.ElementCount() < nr[1] || nr[1] > int.MaxValue) return false;
+                return TryWriteQ8Rows(dst, src, ids, 0, (int)nr[1]);
+            }
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || ids.Storage is not CudaStorage || ids.ElementType != DType.Int32 || !ids.IsContiguous()
                 || dst.Storage is not CudaStorage || dst.ElementType is not (DType.Float32 or DType.Float16) || dst.Strides[^1] != 1
@@ -802,6 +841,149 @@ namespace TensorSharp.Cuda
                         (int)ns[0], pitch, (int)nd[1], half, stream);
             });
             return true;
+        }
+
+        /// <summary>A cache tensor's device address: a q8_0 cache's element offset as the bytes of its 32-value blocks (34 each).</summary>
+        private static IntPtr CachePtr(Tensor t)
+        {
+            if (t.ElementType != DType.Q8_0) return Ptr(t);
+            if (t.StorageOffset % 32 != 0)
+                throw new InvalidOperationException($"a q8_0 cache view at element {t.StorageOffset}, inside a 32-value block");
+            return ((CudaStorage)t.Storage).DevicePtrAtElement(0) + (nint)(t.StorageOffset / 32 * 34);
+        }
+
+        /// <summary>Bytes of a q8_0 row of <paramref name="width"/> values.</summary>
+        private static long Q8RowBytes(long width) => width / 32 * 34;
+
+        /// <summary>K and V caches the flash kernels read: both F16, or both q8_0 (<paramref name="q8"/>: whole 32-value blocks, each
+        /// head's rows in one run), with rows of <paramref name="d"/> values.</summary>
+        private static bool FlashCaches(Tensor kc, Tensor vc, int d, out bool q8)
+        {
+            q8 = kc.ElementType == DType.Q8_0;
+            if (kc.ElementType != vc.ElementType || kc.Sizes[^1] != d || vc.Sizes[^1] != d) return false;
+            if (kc.ElementType == DType.Float16) return true;
+            return q8 && d % 32 == 0 && kc.IsContiguous() && vc.IsContiguous() && kc.StorageOffset % 32 == 0 && vc.StorageOffset % 32 == 0;
+        }
+
+        /// <summary>
+        /// F32 rows into a q8_0 cache [heads, cap, d] (or one head's [cap, d]) with ggml's quantize_row_q8_0
+        /// (ts_graph_set_rows_q8_0, the prep region's bytes for the same values): src [heads, count, d] (its trailing extents; made
+        /// contiguous) row i to cache row <paramref name="ids"/>[i] on the device, or <paramref name="first"/> + i without ids - a
+        /// recorded step's first row re-read from the cache's dynamic block on every replay (CudaDecodeDynParams), as the F16 and
+        /// F32 appends re-read it: baked at the capture, every replay at a later position rewrote the capture's rows (a speculating
+        /// request's verify windows then read keys its decode rows never had, and parted from plain greedy decoding).
+        /// </summary>
+        private bool TryWriteQ8Rows(Tensor dst, Tensor src, Tensor ids, int first, int count)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || count < 1 || dst.Storage is not CudaStorage || src.Storage is not CudaStorage || src.ElementType != DType.Float32
+                || dst.DimensionCount is < 2 or > 3 || !dst.IsContiguous() || dst.StorageOffset % 32 != 0 || src.DimensionCount < 2)
+                return false;
+            using Tensor cache = HeadFirst(dst);
+            long heads = cache.Sizes[0], cap = cache.Sizes[1], width = cache.Sizes[2];
+            long srcHeads = src.DimensionCount >= 3 ? src.Sizes[^3] : 1;
+            for (int i = 0; i < src.DimensionCount - 3; i++)
+                if (src.Sizes[i] != 1) return false;
+            if (width % 32 != 0 || srcHeads != heads || src.Sizes[^2] != count || src.Sizes[^1] != width || cap > int.MaxValue
+                || heads > ushort.MaxValue || (ids == null && (first < 0 || first + (long)count > cap)))
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            var cacheStorage = (CudaStorage)cache.Storage;
+            // The rows are written in place, every other row kept: rows a host path wrote and has not uploaded yet must reach the
+            // device first, and that upload is never recorded (as the F16 append).
+            if (cacheStorage.IsHostDirty && CudaGraphCapture.IsCapturing(cuda))
+                throw new CudaGraphCaptureAbortedException("q8_0 KV cache append with host rows not yet on the device.");
+            using Tensor whole = src.IsContiguous() ? src.CopyRef() : Ops.NewContiguous(src);
+            using Tensor packed = whole.View(heads, count, width);
+            long rowBytes = Q8RowBytes(width);
+            Tensor[] read = ids == null ? new[] { packed } : new[] { packed, ids };
+            IntPtr dyn = ids == null ? CudaDecodeDynParams.GetActiveDevicePtr(cuda, cacheStorage) : IntPtr.Zero;
+            Launch(read, cache, (k, stream) => k.LaunchSetRowsQ8(Ptr(packed), width, count * width, ids == null ? IntPtr.Zero : Ptr(ids), first,
+                CachePtr(cache), rowBytes, cap * rowBytes, (int)cap, (int)width, count, (int)heads, stream, dyn));
+            return true;
+        }
+
+        /// <summary>A copy of F32 rows into a q8_0 view of a cache ([heads,] rows, d with whole blocks: a head-first cache's rows
+        /// narrowed): each row quantized as <see cref="TryWriteQ8Rows"/> quantizes it.</summary>
+        private bool TryRowsToQ8(Tensor dst, Tensor src)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || dst.Storage is not CudaStorage || src.Storage is not CudaStorage || dst.ElementCount() != src.ElementCount()
+                || !dst.Sizes.SequenceEqual(src.Sizes))
+                return false;
+            int nd = dst.DimensionCount;
+            int lead = 0;
+            while (nd - lead > 3 && dst.Sizes[lead] == 1) lead++;
+            if (nd - lead is < 2 or > 3 || dst.Strides[nd - 1] != 1) return false;
+            long width = dst.Sizes[nd - 1], count = dst.Sizes[nd - 2], heads = nd - lead == 3 ? dst.Sizes[nd - 3] : 1;
+            long rowStride = dst.Strides[nd - 2], headStride = nd - lead == 3 ? dst.Strides[nd - 3] : 0;
+            if (width % 32 != 0 || rowStride % 32 != 0 || headStride % 32 != 0 || dst.StorageOffset % 32 != 0 || count < 1 || count > int.MaxValue
+                || heads > ushort.MaxValue)
+                return false;
+            using Tensor whole = src.IsContiguous() ? src.CopyRef() : Ops.NewContiguous(src);
+            using Tensor packed = whole.View(heads, count, width);
+            Launch(new[] { packed }, dst, (k, stream) => k.LaunchSetRowsQ8(Ptr(packed), width, count * width, IntPtr.Zero, 0, CachePtr(dst),
+                Q8RowBytes(rowStride), Q8RowBytes(headStride), (int)count, (int)width, (int)count, (int)heads, stream));
+            return true;
+        }
+
+        /// <summary>Rows [0, <paramref name="rows"/>) of each head of a q8_0 cache [heads, cap, d] as F32 [heads, rows, d] in
+        /// <paramref name="result"/>: the flash kernels' values (RN_F16(code * d)).</summary>
+        private bool TryQ8RowsToF32(Tensor result, Tensor cache, int rows)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || cache.ElementType != DType.Q8_0 || cache.DimensionCount != 3 || !cache.IsContiguous() || cache.StorageOffset % 32 != 0
+                || result.ElementType != DType.Float32 || !result.IsContiguous() || rows < 1 || rows > cache.Sizes[1]
+                || result.ElementCount() != cache.Sizes[0] * rows * cache.Sizes[2] || cache.Sizes[2] % 32 != 0 || cache.Sizes[0] > ushort.MaxValue)
+                return false;
+            long rowBytes = Q8RowBytes(cache.Sizes[2]);
+            Launch(new[] { cache }, result, (k, stream) => k.LaunchQ8ToF32(CachePtr(cache), rowBytes, cache.Sizes[1] * rowBytes, Ptr(result), rows,
+                (int)cache.Sizes[0], (int)cache.Sizes[2], stream));
+            return true;
+        }
+
+        /// <summary>The generic attention (the base executor's), over F32 copies of a q8_0 cache window's rows (the flash kernels'
+        /// values) where K or V is one, warned once: the routes the flash kernels do not take (a selection's mask on a decode row,
+        /// operands they do not read).</summary>
+        private Tensor GenericAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale, CacheWindow kWindow, CacheWindow vWindow,
+            bool promptChunk, string reason)
+        {
+            if (k.ElementType != DType.Q8_0 && v.ElementType != DType.Q8_0)
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
+            WarnQ8Generic(reason);
+            using Tensor kf = Q8WindowAsF32(k, kWindow), vf = Q8WindowAsF32(v, vWindow);
+            return base.FlashAttention(q, kf, vf, mask, scale, null, null, promptChunk);
+        }
+
+        /// <summary>A q8_0 cache window's rows (a KvWindow of a head-first cache) as F32 of its extents.</summary>
+        private Tensor Q8WindowAsF32(Tensor view, CacheWindow window)
+        {
+            if (view.ElementType != DType.Q8_0) return view.CopyRef();
+            if (window == null)
+                throw new NotSupportedException("attention over a q8_0 K/V operand that is not a cache window");
+            using Tensor cache = HeadFirst(window.Cache);
+            long heads = view.DimensionCount == 3 ? view.Sizes[0] : 1, rows = view.Sizes[^2], width = view.Sizes[^1];
+            if (Kernels == null || cache.Sizes[0] != heads || cache.Sizes[2] != width || window.Start + rows > cache.Sizes[1] || width % 32 != 0
+                || !cache.IsContiguous() || rows > int.MaxValue)
+                throw new NotSupportedException($"attention over a q8_0 cache window of {heads} x {rows} x {width} values");
+            var result = new Tensor(Allocator, DType.Float32, view.Sizes);
+            long rowBytes = Q8RowBytes(width);
+            Launch(new[] { cache }, result, (k, stream) => k.LaunchQ8ToF32(CachePtr(cache) + (nint)(window.Start * rowBytes), rowBytes,
+                cache.Sizes[1] * rowBytes, Ptr(result), (int)rows, (int)heads, (int)width, stream));
+            return result;
+        }
+
+        private static int _q8GenericWarned;
+
+        /// <summary>Attentions over a q8_0 cache that took the generic or tiled path (tests).</summary>
+        internal long Q8GenericAttentions { get; private set; }
+
+        private void WarnQ8Generic(string reason)
+        {
+            Q8GenericAttentions++;
+            if (System.Threading.Interlocked.Exchange(ref _q8GenericWarned, 1) == 0)
+                Console.Error.WriteLine($"[cuda] attention over a q8_0 KV cache took the generic path ({reason}): several times slower than its " +
+                    "flash kernels; --kv-cache-dtype f16 keeps the flash path");
         }
 
         /// <summary>Rows of a quantized weight by device ids (a block drafter's selector codebooks): the quantized gather kernel,
@@ -1157,8 +1339,9 @@ namespace TensorSharp.Cuda
         /// copies and cache writes took ~28 ms (with the layers' other norms and copies) where the engine's kernel took 10.6. Where
         /// the region says only the attention reads the queries (Ip[7]), a prompt chunk's go out head-first, as the attention's
         /// [heads, rows, d] view of them: the flash attention then reads them in place, where it copied the permuted rows first.
-        /// The positions and KV indices are read on the device, so a recorded step replays. Declined (the ops run) unless the
-        /// caches are F16 or F32 and head-first, the projections' heads contiguous and the norm weights plain F32 vectors.
+        /// The positions and KV indices are read on the device, so a recorded step replays. A q8_0 cache's rows are quantized as the
+        /// row writes quantize them (ggml's quantize_row_q8_0 over the same values: the same bytes). Declined (the ops run) unless the
+        /// caches are F16, F32 or q8_0 and head-first, the projections' heads contiguous and the norm weights plain F32 vectors.
         /// </summary>
         private bool TryAttentionPrep(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
         {
@@ -1180,12 +1363,18 @@ namespace TensorSharp.Cuda
                 return false;
             using Tensor kc = HeadFirst(inputs[5]), vc = HeadFirst(inputs[6]);
             if (kc.Storage is not CudaStorage || vc.Storage is not CudaStorage || kc.ElementType != vc.ElementType
-                || kc.ElementType is not (DType.Float16 or DType.Float32) || !kc.IsContiguous() || !vc.IsContiguous() || kc.DimensionCount != 3
+                || kc.ElementType is not (DType.Float16 or DType.Float32 or DType.Q8_0) || !kc.IsContiguous() || !vc.IsContiguous() || kc.DimensionCount != 3
                 || vc.DimensionCount != 3 || kc.Sizes[0] != kvHeads || vc.Sizes[0] != kvHeads || kc.Sizes[2] != d || vc.Sizes[2] != dv
-                || kc.Sizes[1] != vc.Sizes[1] || kc.Sizes[1] > int.MaxValue)
+                || kc.Sizes[1] != vc.Sizes[1] || kc.Sizes[1] > int.MaxValue
+                || (kc.ElementType == DType.Q8_0 && (d % 32 != 0 || dv % 32 != 0 || kc.StorageOffset % 32 != 0 || vc.StorageOffset % 32 != 0)))
                 return false;
             int cap = (int)kc.Sizes[1], n = (int)count;
-            bool f16 = kc.ElementType == DType.Float16;
+            int cacheFormat = kc.ElementType switch
+            {
+                DType.Float16 => CudaGraphKernels.CacheF16,
+                DType.Q8_0 => CudaGraphKernels.CacheQ8_0,
+                _ => CudaGraphKernels.CacheF32,
+            };
             // Rows past a verify window's (the flash attention copies their permuted queries contiguous) go out head-first where
             // only the attention reads them; decode rows and windows keep rows of heads, which their kernels read.
             bool headMajor = ip.Length > 7 && ip[7] != 0 && count > CudaDecodeDynParams.WindowRowBlocks && heads > 1;
@@ -1205,7 +1394,7 @@ namespace TensorSharp.Cuda
                 (outRow, outHead) = ((long)heads * d, d);
             }
             Launch(new[] { q, k, v, qNorm, kNorm, positions, rows }, new[] { output, kc, vc }, (kn, stream) => kn.LaunchAttentionPrep(Ptr(q), qRow, qHead,
-                Ptr(k), kRow, kHead, Ptr(v), vRow, vHead, Ptr(qNorm), Ptr(kNorm), Ptr(output), outRow, outHead, Ptr(kc), Ptr(vc), f16, cap,
+                Ptr(k), kRow, kHead, Ptr(v), vRow, vHead, Ptr(qNorm), Ptr(kNorm), Ptr(output), outRow, outHead, CachePtr(kc), CachePtr(vc), cacheFormat, cap,
                 Ptr(positions), Ptr(rows), n, heads, kvHeads, d, dv, fp[0], (int)ip[4], (int)ip[5], (int)ip[6], fp[1], fp[2], fp[3], fp[4], fp[5],
                 fp[6], stream));
             results[0] = output;
@@ -1478,7 +1667,7 @@ namespace TensorSharp.Cuda
                 or GraphFusion.MoeSelect or GraphFusion.SigmoidGate or GraphFusion.SharedExpertGate => Kernels != null,
             GraphFusion.RoutedExperts or GraphFusion.SwigluFfn => ((CudaAllocator)Allocator).Kernels != null,
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
-            GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep => Kernels != null,
+            GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep or GraphFusion.DFlashConv => Kernels != null,
             _ => false,
         };
 
@@ -1497,6 +1686,7 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.QsaKeys) return TryQsaKeys(inputs, ip, fp, results);
             if (kind == GraphFusion.DeltaNetCommit) return TryDeltaNetCommit(inputs, ip, results);
             if (kind == GraphFusion.AttentionPrep) return TryAttentionPrep(inputs, ip, fp, results);
+            if (kind == GraphFusion.DFlashConv) return TryDFlashConv(inputs, ip, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
                 return false;
@@ -1781,6 +1971,37 @@ namespace TensorSharp.Cuda
         /// inputs.</summary>
         protected override bool RegionReadsStridedInputs(GraphFusion kind)
             => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate or GraphFusion.AttentionPrep;
+
+        /// <summary>
+        /// DFlash2's grouped dynamic convolution (<see cref="GraphFusion.DFlashConv"/>) in one launch (ts_graph_dflash_conv_f32)
+        /// with its ops' roundings: about ten elementwise, copy and concatenation kernels a convolution otherwise, twenty
+        /// convolutions a Qwen3.8-27B DFlash2 block. Declined (the ops run) unless the operands are contiguous F32 on the device
+        /// and their extents agree with the region's.
+        /// </summary>
+        private bool TryDFlashConv(Tensor[] inputs, long[] ip, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || inputs.Length != 3 || ip == null || ip.Length < 5) return false;
+            Tensor x = inputs[0], taps = inputs[1], kernel = inputs[2];
+            if (Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32 || !t.IsContiguous()))
+                return false;
+            int width = (int)ip[0], group = (int)ip[1], groups = (int)ip[2], side = (int)ip[3];
+            long stride = ip[4];
+            long hidden = (long)group * groups, rows = x.ElementCount() / Math.Max(1, hidden);
+            if (width < 1 || group < 1 || groups < 1 || side is not (0 or 1) || hidden > int.MaxValue || rows < 1 || rows > int.MaxValue
+                || x.ElementCount() != rows * hidden || taps.ElementCount() != rows * stride || stride < 2L * width * groups
+                || kernel.ElementCount() != 2L * width * hidden)
+                return false;
+            var result = new Tensor(Allocator, DType.Float32, rows, hidden);
+            Launch(inputs, result, (k, stream) => k.LaunchDFlashConv(Ptr(x), Ptr(taps), Ptr(kernel), Ptr(result), (int)rows, (int)hidden, width,
+                group, groups, side, stride, stream));
+            results[0] = result;
+            DFlashConvRegions++;
+            return true;
+        }
+
+        /// <summary>DFlash2 convolutions <see cref="TryDFlashConv"/> ran (tests check the kernel served them).</summary>
+        internal long DFlashConvRegions { get; private set; }
 
         /// <summary>
         /// A gated attention output (<see cref="GraphFusion.SigmoidGate"/>), attn * sigmoid(gate), in one pass with the gate
@@ -2645,11 +2866,13 @@ namespace TensorSharp.Cuda
                 _stagingBytes = 0;
             }
             CudaDriverApi.cuMemGetInfo(out UIntPtr free, out _).ThrowOnError();
-            if ((long)free.ToUInt64() - StagingFreeFloorBytes < Math.Min(need, StagingArenaCapBytes))
+            long shortfall = Math.Min(need, StagingArenaCapBytes) - ((long)free.ToUInt64() - StagingFreeFloorBytes);
+            if (shortfall > 0)
             {
-                // The memory pool keeps the blocks earlier steps returned: release them before settling for a smaller
-                // arena (a capped arena runs a long chunk's staged experts one at a time).
-                cuda.TrimPool();
+                // The memory pool keeps the blocks earlier steps returned: release what the arena lacks, the least
+                // recently used first, before settling for a smaller arena (a capped arena runs a long chunk's staged
+                // experts one at a time). The blocks the steps rent again stay cached.
+                cuda.TrimLargeCache(shortfall);
                 cuda.Context.MakeCurrent();
                 CudaDriverApi.cuMemGetInfo(out free, out _).ThrowOnError();
             }

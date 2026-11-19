@@ -96,6 +96,17 @@ namespace TensorSharp.Models
             if (requestId != null) _followPromptRequests?.Remove(requestId);
         }
 
+        /// <summary>The request's DFlash ring keeps its sequence's context (ModelBase.KeepDFlashRing). The draft layer's rows
+        /// live in the request's slot, which the prefix cache keeps or the release disposes.</summary>
+        public int KeepDraftState(string requestId)
+        {
+            if (requestId != null) _followPromptRequests?.Remove(requestId);
+            return KeepDFlashRing(requestId);
+        }
+
+        public bool ContinueDraftState(string requestId, string keptRequestId, int tokens)
+            => ContinueDFlashRing(requestId, keptRequestId, tokens);
+
         public bool SupportsBatchedSpecLogits => true;
 
         public bool TryBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int window,
@@ -160,7 +171,10 @@ namespace TensorSharp.Models
                 counts[s] = window;
             }
             for (int s = 0; s < n; s++)
-                EnsureSlotCapacity(slots[s], checked(positions[s] + window));
+            {
+                int required = checked(positions[s] + window);
+                EnsureSlotCapacity(slots[s], required, wanted: WantedCells(requestIds[s], required));
+            }
             if (InjectedVerifyAllocationFailures > 0)
             {
                 InjectedVerifyAllocationFailures--;
@@ -242,6 +256,8 @@ namespace TensorSharp.Models
                 CaptureLayers = dflash ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
                 CaptureFinal = !dflash,
                 CaptureTail = tail,
+                // A unified step: prompt chunks and decode tokens, as the plain unified step marks them.
+                PromptChunks = MarksPromptChunks(true, counts),
             };
             if (!TryRunGraphStep(hidden, slots, first, counts, (int[])starts.Clone(), request, out GraphResult result))
                 return false;

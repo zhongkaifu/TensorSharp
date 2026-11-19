@@ -43,6 +43,22 @@ namespace TensorSharp.Models
             public bool Spare;                     // made ahead of a request (no recordings bind it yet), see ReplenishSpareSlot
             public Tensor DraftCarry;              // the trunk's last followed row's stream (the next followed row's input)
             public long RetainedAt;                // when it entered the retained set (the oldest goes first under pressure)
+            /// <summary>A block drafter's KV ring as a slot (StandardDecoderModel.BlockDraft.cs): no request owns it, it holds no
+            /// recurrent state, and its steps' inputs are functions of their positions alone, so a step kept over it may run at
+            /// any position (<see cref="GraphStep.TryRebase"/>).</summary>
+            public bool DraftRing;
+            /// <summary>For a <see cref="DraftRing"/>: how often the ring changed hands (a request took it, or continued the
+            /// context it kept); a recording of a step over it that failed for one owner is tried again for the next.</summary>
+            public int DraftRingOwners;
+            /// <summary>A shared-row checkpoint (StandardDecoderModel.RowShares.cs): <see cref="K"/> and <see cref="V"/> are another
+            /// slot's arrays, whose rows below <see cref="Length"/> that slot never writes again while this lasts; its
+            /// <see cref="Recurrent"/> states are its own. Retained only: it never runs a request, and is never pooled.</summary>
+            public bool SharesRows;
+            /// <summary>A shared-row checkpoint whose rows past it another request has written since it was captured: one that
+            /// took them over with a prompt of its own past the checkpoint (a branch), or continued the end state over them (its
+            /// conversation's next turn). Those rows may still be continued, so an adopter of the checkpoint copies it instead
+            /// of taking them over (StandardDecoderModel.RowShares.cs).</summary>
+            public bool RowsPastTaken;
         }
 
         private static long s_retainSerial;
@@ -70,6 +86,18 @@ namespace TensorSharp.Models
         /// </summary>
         private int FreshSlotTokens => GraphExecutor?.Capabilities.SlotBoundRecordings == true ? ReservationStepTokens : 512;
 
+        /// <summary>Slot policies of executors whose recorded steps bind a slot's buffers (the CUDA executor,
+        /// <see cref="TensorSharp.Graph.GraphCapabilities.SlotBoundRecordings"/>): a unified model's primary cache starts at a
+        /// fresh slot's size whatever the window (<see cref="PrimaryCacheAllocationLength"/>).</summary>
+        private bool SlotBoundPolicies => GraphExecutor?.Capabilities.SlotBoundRecordings == true || SlotBoundPoliciesForTests;
+
+        /// <summary>Tests run the slot-bound policies on another executor (the managed CPU one). Initialized from
+        /// <see cref="SlotBoundPoliciesOnFlowForTests"/>, so a decision the constructor makes (the primary's size) follows it.</summary>
+        internal bool SlotBoundPoliciesForTests { get; set; } = SlotBoundPoliciesOnFlowForTests.Value;
+
+        /// <summary>Tests: the models constructed on this flow take the slot-bound policies from their construction on.</summary>
+        internal static readonly System.Threading.AsyncLocal<bool> SlotBoundPoliciesOnFlowForTests = new();
+
         /// <summary>Cells a grown slot keeps past what it needs (see <see cref="EnsureSlotCapacity"/>).</summary>
         private const int SlotGrowthHeadroomTokens = 4096;
 
@@ -86,6 +114,171 @@ namespace TensorSharp.Models
 
         private int AlignedSlotCapacity(long cells)
             => (int)Math.Min(_maxContextLength, (Math.Max(1, cells) + SlotCapacityAlignment - 1) / SlotCapacityAlignment * SlotCapacityAlignment);
+
+        /// <summary>Slots sized to the device's room (<see cref="SlotTarget"/>: capacity classes with headroom where memory allows,
+        /// the largest capacity that fits, reservations fitted to memory, growth a tensor at a time, small spares, pooling only
+        /// with room): the slot-bound policies on a device this model accounts (<see cref="DeviceRoomManaged"/>). Elsewhere slots
+        /// hold their reservations, rounded, as before.</summary>
+        private bool SizesSlotsToRoom => SlotBoundPolicies && DeviceRoomManaged;
+
+        /// <summary>Whole 1,024s up to 4,096 cells, and four capacities an octave above (1.25, 1.5, 1.75 and 2 x a power of
+        /// two), up to the context limit: the capacity a slot that must hold <paramref name="cells"/> is made or grown to where
+        /// memory allows. A conversation's slots then come in few sizes (one per +12.5-25% of context), so its next turns fit
+        /// the slot it had, and the pool's cached blocks of a size serve the next slot of the class.</summary>
+        internal int SlotCapacityClass(long cells) => SlotCapacityClass(cells, _maxContextLength);
+
+        /// <inheritdoc cref="SlotCapacityClass(long)"/>
+        internal static int SlotCapacityClass(long cells, int maxContextLength)
+        {
+            long c = Math.Max(1, cells), capacity;
+            if (c <= 4096)
+                capacity = (c + 1023) / 1024 * 1024;
+            else
+            {
+                long p = 4096;
+                while (p * 2 < c) p *= 2;   // p < c <= 2p
+                long q = p / 4;
+                capacity = c <= p + q ? p + q : c <= p + 2 * q ? p + 2 * q : c <= p + 3 * q ? p + 3 * q : 2 * p;
+            }
+            return (int)Math.Min(maxContextLength, capacity);
+        }
+
+        /// <summary>The capacity <paramref name="required"/> cells round to where no class with headroom fits: whole 1,024s,
+        /// as a reservation was rounded.</summary>
+        private int ReservationCapacity(long required)
+            => AlignedSlotCapacity((Math.Max(1, required) + ReservationStepTokens - 1) / ReservationStepTokens * ReservationStepTokens);
+
+        /// <summary>
+        /// The capacity a slot that must hold <paramref name="required"/> cells, and would like <paramref name="wanted"/>
+        /// (its request's reservation: prompt and generation budget), is made, copied or grown to on a device this model accounts
+        /// (<see cref="SizesSlotsToRoom"/>), its room made by <see cref="EnsureDeviceRoom"/>; the first candidate that gets room:
+        /// <list type="number">
+        /// <item>the class of <paramref name="wanted"/> and an eighth more (at least 1,024 cells), from pooled slots, parked
+        /// recordings and retained window buffers only: headroom never releases a conversation;</item>
+        /// <item>the largest whole 1,024 at least <paramref name="required"/> that fits the room those stages reached, else the
+        /// required cells rounded to 1,024, then to 256, where those stages make room for them;</item>
+        /// <item>with <paramref name="mayEvict"/>, the required cells rounded to 1,024, releasing finished conversations, the
+        /// oldest first, then the required cells rounded to 256; a conversation goes whole, so the room it leaves past those cells
+        /// is then taken as candidates 1 and 2 take room (up to the class, releasing nothing more).</item>
+        /// </list>
+        /// 0 where none gets room. A growth (<paramref name="heldCapacity"/>, the slot's cells now) needs the added cells and one
+        /// of its tensors, not a second slot (<see cref="GrowSlotRolling"/>). A row's arithmetic does not depend on the capacity
+        /// its slot gets: decode and verify rows split their keys by their length on every path (the flash kernels by their
+        /// bucket, the GQA decode partitions by their live length), so a request's tokens are the same in a slot of any size.
+        /// </summary>
+        private int SlotTarget(int required, int wanted, ReadOnlySpan<Slot> keep, string what, int heldCapacity = 0, bool mayEvict = true,
+            bool headroom = true)
+        {
+            int roomy = RoomySlotTarget(required, wanted, keep, what, heldCapacity, headroom);
+            if (roomy > 0 || !mayEvict) return roomy;
+            return TightSlotTarget(required, wanted, keep, what, heldCapacity, headroom);
+        }
+
+        /// <summary>Candidates 1 and 2 of <see cref="SlotTarget"/> (no conversation released); 0 where neither fits.</summary>
+        private int RoomySlotTarget(int required, int wanted, ReadOnlySpan<Slot> keep, string what, int heldCapacity, bool headroom = true)
+        {
+            int floor = AlignedSlotCapacity(required);
+            long w = Math.Max(required, wanted);
+            int target = Math.Max(floor, headroom ? SlotCapacityClass(w + Math.Max(1024, w / 8)) : ReservationCapacity(w));
+            if (target <= heldCapacity) return heldCapacity;
+            if (EnsureDeviceRoom(SlotTargetBytes(target, heldCapacity), keep, RoomUse.Slot, mayEvict: false, what, out long room,
+                    CacheBlockBytes(target)))
+                return target;
+            // The largest whole 1,024 the room reached holds, from the bytes a cell and a slot take (no probing).
+            long perCell = CacheBytesPerCell();
+            if (perCell <= 0 || room == long.MaxValue) return 0;
+            long total = DeviceMemory().Total;
+            long avail = room - RoomNeed(0, total, RoomUse.Slot) - (heldCapacity > 0 ? CacheTensorBytes(target) : SlotBytesEstimate(0));
+            long cells = (heldCapacity > 0 ? heldCapacity : 0) + Math.Max(0, avail) / perCell;
+            int fit = (int)Math.Min(target - 1, cells / ReservationStepTokens * ReservationStepTokens);
+            int least = ReservationCapacity(required);
+            if (fit >= least && fit > heldCapacity
+                && EnsureDeviceRoom(SlotTargetBytes(fit, heldCapacity), keep, RoomUse.Slot, mayEvict: false, what, CacheBlockBytes(fit)))
+                return fit;
+            // The required cells rounded to 1,024, then to 256 (a conversation is worth more than the slack), each asked of the
+            // stages that release no conversation: the room they reached was measured for the class's need, and the retained
+            // window buffers (stage 4) are given up only where they cover a need's shortfall.
+            foreach (int capacity in floor < least ? new[] { least, floor } : new[] { least })
+                if (capacity > heldCapacity && capacity < target
+                    && EnsureDeviceRoom(SlotTargetBytes(capacity, heldCapacity), keep, RoomUse.Slot, mayEvict: false, what, CacheBlockBytes(capacity)))
+                    return capacity;
+            return 0;
+        }
+
+        /// <summary>Candidate 3 of <see cref="SlotTarget"/>, and a new request's slot where no pooled or retained slot serves it
+        /// (<see cref="NewSlotWithRoom"/>): the required cells rounded to 1,024, then to 256, finished conversations released for
+        /// them, then, with <paramref name="takeRoom"/>, the room the released ones leave past those cells taken as candidates 1
+        /// and 2 take room (up to the class of <paramref name="wanted"/> and an eighth, releasing nothing more); 0 where neither
+        /// gets room.</summary>
+        private int TightSlotTarget(int required, int wanted, ReadOnlySpan<Slot> keep, string what, int heldCapacity, bool headroom = true,
+            bool takeRoom = true)
+        {
+            foreach (int capacity in new[] { ReservationCapacity(required), AlignedSlotCapacity(required) })
+            {
+                if (capacity <= heldCapacity) return heldCapacity;
+                if (EnsureDeviceRoom(SlotTargetBytes(capacity, heldCapacity), keep, RoomUse.Slot, mayEvict: true, what, CacheBlockBytes(capacity)))
+                    // A conversation goes whole: the room it leaves past the required cells, taken now. Left free, the request's
+                    // reservation took it at its next step, or its conversation's next turn at that turn's first, by growing the
+                    // slot a tensor at a time inside the step (Qwen3.8-27B on an RTX PRO 4500: a 47K clone made at 48,128 cells,
+                    // then grown to 56,320 in its first decode step, 107 ms; a new 69K request's slot made at 69,632 cells, then
+                    // grown to 81,920 in its next turn's 1,044-row prompt step, 613-616 ms against 510-511 ms).
+                    return takeRoom ? Math.Max(capacity, RoomySlotTarget(capacity, wanted, keep, what, heldCapacity, headroom)) : capacity;
+            }
+            return 0;
+        }
+
+        /// <summary>The bytes a slot of <paramref name="capacity"/> cells takes beyond what it holds: a fresh one's
+        /// (<see cref="SlotBytesEstimate"/>), or for a slot of <paramref name="heldCapacity"/> cells grown a tensor at a time the
+        /// added cells and the largest of its new tensors.</summary>
+        private long SlotTargetBytes(int capacity, int heldCapacity)
+            => heldCapacity <= 0 ? SlotBytesEstimate(capacity) : CacheBytesPerCell() * (capacity - heldCapacity) + CacheTensorBytes(capacity);
+
+        /// <summary>The largest of a slot's cache tensors at <paramref name="capacity"/> cells (0 where unknown).</summary>
+        private long CacheTensorBytes(int capacity)
+        {
+            Tensor[][] k = _activeKey == null ? _cacheK : _primary?.K;
+            Tensor[][] v = _activeKey == null ? _cacheV : _primary?.V;
+            int cells = _activeKey == null ? _cacheCapacity : _primary?.Capacity ?? 0;
+            if (cells <= 0) return 0;
+            long largest = 0;
+            foreach (Tensor t in AllCacheTensors(k).Concat(AllCacheTensors(v)))
+                largest = Math.Max(largest, t.Storage.ByteLength / cells * capacity);
+            return largest;
+        }
+
+        /// <summary>A request's reservation as its slot was fitted to it (<see cref="EnsureSequenceSlot(string, int, int)"/>), the
+        /// most its later steps grow the slot towards; keyed by request id (slot objects are re-minted).</summary>
+        private Dictionary<string, int> _fittedReservations;
+
+        /// <summary>What a step of <paramref name="requestId"/> that needs <paramref name="required"/> cells would like its slot to
+        /// hold: its fitted reservation where it has one.</summary>
+        private int WantedCells(string requestId, int required)
+            => requestId != null && _fittedReservations != null && _fittedReservations.TryGetValue(requestId, out int reserve)
+                ? Math.Max(required, reserve) : required;
+
+        /// <summary>Tests: <see cref="SlotTarget"/> for a slot beside the running ones.</summary>
+        internal int SlotTargetForTests(int required, int wanted) => SlotTarget(required, wanted, RunningSlots(), "a slot (test)");
+
+        /// <summary>Tests: the free bytes a fresh slot of <paramref name="capacity"/> cells wants (its bytes beside the headroom
+        /// and a prompt step's or recordings' room).</summary>
+        internal long SlotRoomNeedForTests(int capacity)
+            => RoomNeed(SlotBytesEstimate(capacity), DeviceMemory(fresh: true).Total, RoomUse.Slot);
+
+        /// <summary>Tests: the cells a request's slot holds (null where it has none).</summary>
+        internal int? SlotCapacityForTests(string requestId) => TryGetSlot(requestId, out Slot slot) ? slot.Capacity : null;
+
+        /// <summary>Tests: the bytes a cell of a slot's caches takes (every entry's K and V).</summary>
+        internal long CacheBytesPerCellForTests => CacheBytesPerCell();
+
+        /// <summary>Tests: the capacities of the pooled slots.</summary>
+        internal int[] PooledCapacitiesForTests => _slotPool?.Select(p => p.Capacity).ToArray() ?? Array.Empty<int>();
+
+        /// <summary>Tests: how many cache tensors a rolling growth allocates before the next allocation fails (null: none fails).</summary>
+        internal int? RollingGrowthFailAfterForTests { get; set; }
+
+        /// <summary>Bytes of cache rows zero-filled when slots were made or grown (tests: a growth zeroes only the rows past the
+        /// slot's length).</summary>
+        internal long CacheZeroFillBytes { get; private set; }
 
         private Dictionary<string, Slot> _slots;            // requests with their own slot
         private Dictionary<string, Slot> _retainedSlots;    // finished requests kept for a continuation
@@ -347,8 +540,17 @@ namespace TensorSharp.Models
 
         /// <summary>The prefix cache evicts finished requests' slots before a new request needs their room: what the device
         /// lacks for one more fresh slot (<see cref="ModelBase.QueryHostMemoryDeficitBytes"/>).</summary>
+        /// <remarks>On a device this model manages (<see cref="DeviceRoomManaged"/>, one direct-CUDA device), what the device
+        /// lacks of its headroom alone: at admission the incoming request may adopt the very payload a slot's room would evict
+        /// (a conversation's next turn takes its finished slot), so a slot's or a prompt step's room is made when it is
+        /// allocated (<see cref="EnsureDeviceRoom"/>), which knows what to keep.</remarks>
         protected override long DeviceMemoryDeficitBytes()
-            => AdmitsSlotsByDeviceMemory ? DeviceDeficit(SlotDeviceBytes(FreshSlotTokens)) : 0;
+        {
+            if (AdmitsSlotsByDeviceMemory) return DeviceDeficit(SlotDeviceBytes(FreshSlotTokens));
+            if (!DeviceRoomManaged) return 0;
+            var (free, total) = DeviceMemory();
+            return total <= 0 ? 0 : Math.Max(0, DeviceHeadroom(total) - free);
+        }
 
         /// <summary><see cref="DeviceMemoryDeficitBytes"/> alone (tests).</summary>
         internal long DeviceSlotDeficitBytes => DeviceMemoryDeficitBytes();
@@ -469,63 +671,121 @@ namespace TensorSharp.Models
 
         /// <summary>A slot's caches at <paramref name="capacity"/> cells: K and V per layer and rank, then the extra key
         /// caches (K only).</summary>
-        private (Tensor[][] K, Tensor[][] V) AllocateCaches(int capacity)
+        /// <param name="zeroFrom">The rows a copy writes next (<see cref="ZeroCacheRows"/>): only the rows past them are zeroed.</param>
+        private (Tensor[][] K, Tensor[][] V) AllocateCaches(int capacity, int zeroFrom = 0)
         {
             var k = new Tensor[CacheEntries][];
             var v = new Tensor[CacheEntries][];
-            for (int e = 0; e < CacheEntries; e++) AllocateCacheEntry(k, v, e, capacity);
+            NoteDeviceMemoryChanged();
+            for (int e = 0; e < CacheEntries; e++) AllocateCacheEntry(k, v, e, capacity, zeroFrom);
             return (k, v);
         }
 
         /// <summary>Cache entry <paramref name="e"/>'s K (and V, for a layer's) at <paramref name="capacity"/> cells, every
         /// rank's, into <paramref name="k"/> and <paramref name="v"/>; nothing for an entry this node does not hold.</summary>
-        private void AllocateCacheEntry(Tensor[][] k, Tensor[][] v, int e, int capacity)
+        private void AllocateCacheEntry(Tensor[][] k, Tensor[][] v, int e, int capacity, int zeroFrom = 0)
         {
-            Tensor first = NewCacheTensor(e, 0, capacity, value: false);
+            Tensor first = NewCacheTensor(e, 0, capacity, value: false, zeroFrom);
             if (first == null) return;
             k[e] = new Tensor[_mesh.TensorParallel];
             k[e][0] = first;
-            for (int r = 1; r < _mesh.TensorParallel; r++) k[e][r] = NewCacheTensor(e, r, capacity, value: false);
+            for (int r = 1; r < _mesh.TensorParallel; r++) k[e][r] = NewCacheTensor(e, r, capacity, value: false, zeroFrom);
             if (e >= TotalLayers) return;
             v[e] = new Tensor[_mesh.TensorParallel];
-            for (int r = 0; r < _mesh.TensorParallel; r++) v[e][r] = NewCacheTensor(e, r, capacity, value: true);
+            for (int r = 0; r < _mesh.TensorParallel; r++) v[e][r] = NewCacheTensor(e, r, capacity, value: true, zeroFrom);
         }
 
         private void DisposeSlot(Slot slot)
         {
             if (slot == null) return;
+            _spareStatesRefused = false;
+            // A checkpoint frees its own parts only; a slot whose rows checkpoints share hands them to the longest.
+            if (slot.SharesRows)
+            {
+                DisposeDependent(slot);
+                return;
+            }
+            if (HasDependents(slot))
+            {
+                HandOverRows(slot);
+                return;
+            }
             _idleSpareRefused = false;
-            ForgetGraphsOf(slot);
-            foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-            foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-            slot.K = slot.V = null;
-            DisposeStates(slot.Recurrent);
-            slot.Recurrent = null;
-            slot.DraftCarry?.Dispose();
-            slot.DraftCarry = null;
+            _slotMutationDepth++;
+            try
+            {
+                ForgetGraphsOf(slot);
+                foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                slot.K = slot.V = null;
+                DisposeStates(slot.Recurrent);
+                slot.Recurrent = null;
+                slot.DraftCarry?.Dispose();
+                slot.DraftCarry = null;
+            }
+            finally
+            {
+                _slotMutationDepth--;
+                NoteDeviceMemoryChanged();
+            }
         }
 
         private void RecycleSlot(Slot slot)
         {
             if (slot?.K == null) return;
+            // Never pooled: a checkpoint's rows are another slot's, and a slot whose rows checkpoints share hands them over.
+            if (InAnyShare(slot))
+            {
+                DisposeSlot(slot);
+                return;
+            }
             _slotPool ??= new List<Slot>(SlotPoolMax);
-            if (_slotPool.Count < Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax))
+            if (_slotPool.Count < Math.Min(SlotPoolMax, ExecutionOptions.FromEnvironment().KvHolderPoolMax) && RoomToPool(slot))
                 _slotPool.Add(slot);
             else
                 DisposeSlot(slot);
+        }
+
+        /// <summary>Where slots are sized to the device's room (<see cref="SizesSlotsToRoom"/>), a finished request's slot is
+        /// pooled only while the device keeps as much again free beside its headroom and a prompt's step: a pooled slot belongs to
+        /// no conversation, and kept on a device near full it is the first thing the next allocation frees.</summary>
+        private bool RoomToPool(Slot slot)
+        {
+            if (!SizesSlotsToRoom) return true;
+            var (free, total) = DeviceMemory();
+            return total <= 0 || free >= SlotStorageBytes(slot) + DeviceHeadroom(total) + PromptStepBytes;
         }
 
         /// <summary>
         /// Grow a slot's caches to hold <paramref name="required"/> tokens, keeping its rows. A request's
         /// <paramref name="reservation"/> (its prompt and whole generation) is held as asked, rounded up to
         /// <see cref="ReservationStepTokens"/>; growth past what was reserved doubles, by no more than
-        /// <see cref="SlotGrowthHeadroomTokens"/>.
+        /// <see cref="SlotGrowthHeadroomTokens"/>. Where slots are sized to the device's room (<see cref="SizesSlotsToRoom"/>)
+        /// the slot grows to <see cref="SlotTarget"/>'s capacity for <paramref name="required"/> cells and the
+        /// <paramref name="wanted"/> ones (its request's reservation), a tensor at a time (<see cref="GrowSlotRolling"/>).
         /// </summary>
-        private void EnsureSlotCapacity(Slot slot, int required, bool reservation = false)
+        private void EnsureSlotCapacity(Slot slot, int required, bool reservation = false, int wanted = 0)
         {
             if (required <= slot.Capacity) return;
             if (required > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {required} exceeds configured max context {_maxContextLength}.");
+            if (SizesSlotsToRoom)
+            {
+                Slot[] keep = RunningSlots(slot);
+                int target = SlotTarget(required, Math.Max(required, wanted), keep, "a slot's growth", heldCapacity: slot.Capacity);
+                if (target < required)
+                {
+                    // As a growth always could: the required cells where they fit beside the headroom and the narrowest prompt
+                    // step (finished conversations released only for that, where releasing them reaches it), else the failure
+                    // with what holds the device.
+                    target = AlignedSlotCapacity(required);
+                    if (!EnsureDeviceRoom(SlotTargetBytes(target, slot.Capacity), keep, RoomUse.SlotFloor, mayEvict: true,
+                            "a slot's growth", CacheBlockBytes(target)))
+                        throw GrowthExhausted(slot, target, keep);
+                }
+                GrowSlotRolling(slot, target);
+                return;
+            }
             int capacity;
             if (reservation)
             {
@@ -544,20 +804,134 @@ namespace TensorSharp.Models
                 capacity = AlignedSlotCapacity(Math.Min(capacity, (long)required + SlotGrowthHeadroomTokens));
             }
             if (TryGrowSlotOnDevice(slot, capacity)) return;
-            SyncToHost(slot);
-            (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
-            // Only this slot's graphs bound the caches it gives up: every other request's steps and recordings stay. Clearing
-            // the whole cache when a pooled 512-cell slot grew for a 4K prompt had every slot's decode trace and record again
-            // (Qwen3.8 Flash Next on an A40: five graphs and two parked recordings, 2,200 allocations and a 109 ms recording).
-            ForgetGraphsOfGrowing(slot);
-            CopyRows(slot.K, k, slot.Length);
-            CopyRows(slot.V, v, slot.Length);
-            foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-            foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-            slot.K = k;
-            slot.V = v;
-            slot.Capacity = capacity;
+            // On a device this model manages the grown caches' room is made first, or the growth fails with what holds the
+            // device: running out part way left a request failed with CUDA error 2 (issue #376).
+            if (DeviceRoomManaged) EnsureRoomToGrow(slot, capacity);
+            _slotMutationDepth++;
+            try
+            {
+                SyncToHost(slot);
+                (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
+                // Only this slot's graphs bound the caches it gives up: every other request's steps and recordings stay. Clearing
+                // the whole cache when a pooled 512-cell slot grew for a 4K prompt had every slot's decode trace and record again
+                // (Qwen3.8 Flash Next on an A40: five graphs and two parked recordings, 2,200 allocations and a 109 ms recording).
+                ForgetGraphsOfGrowing(slot);
+                CopyRows(slot.K, k, slot.Length);
+                CopyRows(slot.V, v, slot.Length);
+                foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                Tensor[][] oldK = slot.K;
+                slot.K = k;
+                slot.V = v;
+                slot.Capacity = capacity;
+                RepointDependents(oldK, slot);   // the grown caches hold every row the checkpoints share
+            }
+            finally
+            {
+                _slotMutationDepth--;
+            }
         }
+
+        /// <summary>
+        /// Grow <paramref name="slot"/>'s caches to <paramref name="capacity"/> cells one tensor at a time: each entry's new tensor
+        /// (zeroed only past the slot's length), its rows copied, the old one freed and its block handed back to the driver when
+        /// the next would not fit. The device holds the added cells and one tensor more at the peak, not a second slot: a
+        /// 130K-token Qwen3.8-27B slot (9.3 GB) needed 9.2 GB beside it to grow by 1,024 cells, where it needs about 0.4 GB
+        /// (issue #376). An allocation that fails part way fails the request with what holds the device; the slot, its caches of
+        /// two capacities, is disposed, so none of it runs.
+        /// </summary>
+        private void GrowSlotRolling(Slot slot, int capacity)
+        {
+            if (capacity <= slot.Capacity) return;
+            _slotMutationDepth++;
+            var cuda = DeviceRoomForTests == null ? _allocator as TensorSharp.Cuda.CudaAllocator : null;
+            Tensor[][] k = new Tensor[CacheEntries][], v = new Tensor[CacheEntries][];
+            Tensor[][] oldK = slot.K;
+            int made = 0;
+            try
+            {
+                SyncToHost(slot);
+                // Only this slot's graphs bound the caches it gives up, and they go now: a recording keeps the tensors it
+                // writes alive (CudaGraphCapture's KeepAlive), so disposed later, beside the next recorded step
+                // (ForgetGraphsOfGrowing), every old tensor stayed allocated through the growth, which then needed a second
+                // slot's memory, not the added cells and one tensor its room was made for (Qwen3.8-27B, three 47K
+                // conversations at once on an RTX PRO 4500: a growth from 48,128 to 55,296 cells ran out of memory after 29
+                // of its 34 tensors, HTTP 500).
+                ForgetGraphsOf(slot);
+                NoteDeviceMemoryChanged();
+                long driverFree = cuda == null ? long.MaxValue : cuda.GetMemoryInfo().freeBytes;
+                int rows = slot.Length;
+                for (int e = 0; e < CacheEntries; e++)
+                {
+                    if (slot.K?[e] == null) continue;
+                    k[e] = new Tensor[slot.K[e].Length];
+                    if (slot.V?[e] != null) v[e] = new Tensor[slot.V[e].Length];
+                    for (int r = 0; r < slot.K[e].Length; r++)
+                    {
+                        if (slot.K[e][r] != null) k[e][r] = Replace(slot.K[e], r, e, value: false);
+                        if (slot.V?[e]?[r] != null) v[e][r] = Replace(slot.V[e], r, e, value: true);
+                    }
+                }
+                (_allocator as TensorSharp.Cuda.CudaAllocator)?.LogDeviceRoom(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"{Config.Architecture} a slot of {rows:N0} rows grown a tensor at a time from {slot.Capacity:N0} to {capacity:N0} cells"));
+                slot.K = k;
+                slot.V = v;
+                slot.Capacity = capacity;
+                RepointDependents(oldK, slot);   // the grown caches hold every row the checkpoints share
+                RollingGrowths++;
+
+                Tensor Replace(Tensor[] old, int r, int e, bool value)
+                {
+                    // A sliding-window layer's ring holds at most its cells on both sides (CacheCells), and one past its first
+                    // lap moves whole: its cells keep their positions (CopyRows, Grow).
+                    long bytes = old[r].Storage.ByteLength / Math.Max(1, old[r].Sizes[1]) * CacheCells(e, capacity);
+                    int moved = (int)Math.Min(rows, old[r].Sizes[1]);
+                    if (cuda != null)
+                        driverFree += cuda.TrimForAllocation(bytes, cuda.AllocationBlockBytes(bytes), Math.Max(0, driverFree));
+                    if (RollingGrowthFailAfterForTests is int failAfter && made >= failAfter)
+                        throw new InvalidOperationException($"{Config.Architecture}: injected allocation failure during a slot's growth (test)");
+                    Tensor grown = NewCacheTensor(e, r, capacity, value, zeroFrom: moved);
+                    made++;
+                    if (cuda != null) driverFree -= cuda.AllocationBlockBytes(bytes);
+                    if (moved > 0)
+                    {
+                        using Tensor src = old[r].Narrow(1, 0, moved);
+                        using Tensor dst = grown.Narrow(1, 0, moved);
+                        Ops.Copy(dst, src);
+                    }
+                    InvalidateTensorDeviceCache(old[r]);
+                    old[r].Dispose();
+                    old[r] = null;
+                    return grown;
+                }
+            }
+            catch (Exception ex)
+            {
+                // Caches of two capacities never run: everything the slot held goes, and the request fails.
+                foreach (Tensor t in AllCacheTensors(k).Concat(AllCacheTensors(v)).Concat(AllCacheTensors(slot.K)).Concat(AllCacheTensors(slot.V)).ToList())
+                {
+                    InvalidateTensorDeviceCache(t);
+                    t.Dispose();
+                }
+                slot.K = slot.V = null;
+                DisposeStates(slot.Recurrent);
+                slot.Recurrent = null;
+                slot.DraftCarry?.Dispose();
+                slot.DraftCarry = null;
+                InvalidateDependents(oldK, Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed);   // their rows went too
+                throw new InvalidOperationException(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"{Config.Architecture}: growing a slot from {slot.Capacity:N0} to {capacity:N0} cells failed after {made} of its " +
+                    $"cache tensors ({ex.Message}); the request's slot was released."), ex);
+            }
+            finally
+            {
+                _slotMutationDepth--;
+                NoteDeviceMemoryChanged();
+            }
+        }
+
+        /// <summary>Slots grown a tensor at a time (<see cref="GrowSlotRolling"/>; tests check the route).</summary>
+        internal int RollingGrowths { get; private set; }
 
         private static void CopyRows(Tensor[][] from, Tensor[][] to, int rows)
         {
@@ -628,6 +1002,7 @@ namespace TensorSharp.Models
                 }
             }
             _slots.Remove(requestId);
+            _fittedReservations?.Remove(requestId);
             RecycleSlot(slot);
         }
 
@@ -655,6 +1030,7 @@ namespace TensorSharp.Models
             }
             _retainedSlots.Add(key, Retained(slot));
             _slots.Remove(requestId);
+            _fittedReservations?.Remove(requestId);
             return true;
         }
 
@@ -662,6 +1038,8 @@ namespace TensorSharp.Models
         {
             if (_retainedSlots == null || string.IsNullOrEmpty(retainedKey) || string.IsNullOrEmpty(newRequestId)) return false;
             if (!_retainedSlots.TryGetValue(retainedKey, out Slot slot) || slot.K == null) return false;
+            // A checkpoint over another slot's rows is never rebound: it is copied (nothing here may use up its rows' holder).
+            if (slot.SharesRows) return MaterializeShared(retainedKey, slot, newRequestId, donate: true, consumable: null, 0);
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_slots.ContainsKey(newRequestId) || string.Equals(_activeKey, newRequestId, StringComparison.Ordinal)) return false;
             _slots.Add(newRequestId, slot);
@@ -688,6 +1066,12 @@ namespace TensorSharp.Models
 
         private void DisposeSlots()
         {
+            DisposeSpareCheckpointStates();
+            // The checkpoints' own parts first, so every slot then frees its rows once.
+            if (_rowShares != null)
+                foreach (List<Slot> dependents in _rowShares.Values.ToList())
+                    foreach (Slot d in dependents.ToList()) DisposeDependent(d);
+            _rowShares = null;
             if (_activeKey != null)
             {
                 // The active fields are the bound slot: the primary is parked.
@@ -705,6 +1089,7 @@ namespace TensorSharp.Models
             DisposeSlot(_spareBuild);
             _spareBuild = null;
             _slots = _retainedSlots = null;
+            _fittedReservations = null;
             ClearGraphCache();
             _slotPool = null;
         }
@@ -754,6 +1139,9 @@ namespace TensorSharp.Models
         private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
             float[][] features = null, SlotRowIO rowIO = null)
         {
+            NoteEngineThread();
+            ForgetDeferredGraphs();
+            if (SlotInvariantChecksForTests) CheckSlotShareInvariants();
             if (_maxSequenceStepRows != int.MaxValue && chunks.Any(c => c != null && c.Length > _maxSequenceStepRows))
                 return TryForwardSlotsInRingSteps(requestIds, chunks, starts, outLogits, features, rowIO);
             try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features, rowIO); }
@@ -949,7 +1337,11 @@ namespace TensorSharp.Models
                 rows += counts[s];
             }
             for (int s = 0; s < n; s++)
-                EnsureSlotCapacity(slots[s], checked(starts[s] + counts[s]));
+            {
+                int required = checked(starts[s] + counts[s]);
+                EnsureSlotCapacity(slots[s], required, wanted: WantedCells(requestIds[s], required));
+            }
+            PrepareWrites(slots, starts);   // the graph step's RunTraced does it too; the per-op layers below need it here
             if (n > 1 && InjectedForwardAllocationFailures > 0)
             {
                 InjectedForwardAllocationFailures--;
@@ -976,21 +1368,23 @@ namespace TensorSharp.Models
 
             Tensor embedded = null;
             int[] promptEnds = null;
+            bool[] aside = null;
             try
             {
                 embedded = EmbedStep(flatTokens);
                 InjectRows(embedded, rowIO, lastRows);
                 bool capture = rowIO == null && features != null && Array.Exists(features, f => f != null);
                 // A lone speculating request's prompt chunk hands the draft layer its rows, and every speculating request's
-                // chunk its DFlash ring's (FollowPlainPrompt).
-                promptEnds = capture ? null : TakeFollowedPrompts(requestIds);
-                DraftFollow follow = n == 1 && promptEnds != null && promptEnds[0] != DFlashNoFollow
+                // chunk its DFlash ring's (FollowPlainPrompt); a request that does not speculate, its ring's where one is free
+                // (FollowUnspeculatedPrompt).
+                promptEnds = capture ? null : TakeFollowedPrompts(requestIds, out aside);
+                DraftFollow follow = n == 1 && promptEnds != null && promptEnds[0] != DFlashNoFollow && aside?[0] != true
                     ? PlanDraftFollow(slots[0], starts[0], null) : DraftFollow.None;
                 float[] draftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], chunks[0], media: false) : null;
-                DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds);
+                DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds, aside);
                 if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
                     : RunFollowingDFlash(ref dflash, plan => TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(),
-                          wantLogits: rowIO?.Logits ?? true, out float[][] graphLogits, rowIO?.Hidden, follow: follow, draftRows: draftRows, dflash: plan)
+                          wantLogits: rowIO?.Logits ?? true, out float[][] graphLogits, rowIO?.Hidden, follow: follow, draftRows: draftRows, dflash: plan, prompt: true)
                           && CopyLogits(graphLogits, outLogits)))
                 {
                     BatchedForwardCount++;
@@ -1010,7 +1404,7 @@ namespace TensorSharp.Models
             catch
             {
                 // A step that found no device memory is retried (TryForwardSlots): the chunks still follow there.
-                RestoreFollowedPrompts(requestIds, promptEnds);
+                RestoreFollowedPrompts(requestIds, promptEnds, aside);
                 throw;
             }
             finally

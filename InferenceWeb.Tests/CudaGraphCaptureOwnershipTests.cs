@@ -103,4 +103,52 @@ public sealed class CudaGraphCaptureOwnershipTests
         Assert.Equal(Enumerable.Range(0, n).Select(i => 3f * i).ToArray(), y.GetElementsAsFloat(n));
         Assert.All(other.GetElementsAsFloat(n), v => Assert.Equal(-1f, v));
     }
+
+    /// <summary>
+    /// A block the capture's work returned stays in the pool from the capture's end until the graph takes it. The pool's
+    /// pressure relief (a return under the free-memory reserve, on any thread: the GC finalizer's too) gives cached blocks
+    /// back to the driver unasked; run in that window it freed the graph's scratch, the graph found it neither in the pool
+    /// nor rented and claimed a freed address, which the driver then handed to the next allocation the replays wrote into.
+    /// The relief runs here on the test's thread, as another thread's would, once the capture has ended.
+    /// </summary>
+    [CudaFact]
+    public void APressureReliefAsTheCaptureEnds_LeavesTheGraphItsBlocks()
+    {
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        const int n = 1 << 20;   // 4 MiB: the pool's large blocks, which the relief gives back
+        using Tensor x = Tensor.FromArray(allocator, Enumerable.Range(0, n).Select(i => (float)(i % 1000)).ToArray());
+        using Tensor y = new Tensor(allocator, DType.Float32, n), input = new Tensor(allocator, DType.Float32, n);
+        foreach (Tensor t in new[] { x, y, input }) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+        using var graphs = new CudaPrefillGraphCache(allocator);
+        long Base(Tensor t) => ((CudaStorage)t.Storage).DeviceBuffer.ToInt64();
+        long relievedInTheWindow = -1;
+        graphs.CaptureEndedForTests = () => relievedInTheWindow = allocator.RelievePressureForTests(1L << 40);
+
+        Assert.True(graphs.BeginCapture("step"));
+        long scratchBase;
+        using (var scratch = new Tensor(allocator, DType.Float32, n))
+        {
+            scratchBase = Base(scratch);
+            Ops.Add(scratch, x, x);
+            Ops.Add(y, scratch, x);
+        }
+        Assert.True(graphs.EndCaptureAndLaunch("step", input, new[] { y }));
+        allocator.Stream.Synchronize();
+
+        Assert.Equal(0, relievedInTheWindow);
+        using var other = new Tensor(allocator, DType.Float32, n);
+        Assert.NotEqual(scratchBase, Base(other));
+        Ops.Fill(other, -1f);
+        Ops.Fill(y, 0f);
+        graphs.Replay("step");
+        allocator.Stream.Synchronize();
+        ((CudaStorage)y.Storage).MarkDeviceModified();
+        Assert.Equal(Enumerable.Range(0, n).Select(i => 3f * (i % 1000)).ToArray(), y.GetElementsAsFloat(n));
+        Assert.All(other.GetElementsAsFloat(n), v => Assert.Equal(-1f, v));
+
+        // Once the graph holds its blocks the relief runs again.
+        new Tensor(allocator, DType.Float32, n).Dispose();
+        Assert.True(allocator.RelievePressureForTests(4L << 20) >= 4L << 20);
+    }
 }

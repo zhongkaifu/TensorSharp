@@ -73,14 +73,19 @@ namespace TensorSharp.Models
                 return true;
             }
 
-            protected internal override void ReleaseSpecBuffers()
+            /// <summary>A verify window leaves the window as it was and writes only <see cref="ConvHistory"/> (channels x a few
+            /// columns), so with <paramref name="keepInPlaceBuffers"/> it stays and the windows recorded over it replay when the
+            /// slot runs again (as the gated delta net's conv history does); otherwise it goes.</summary>
+            protected internal override void ReleaseSpecBuffers(bool keepInPlaceBuffers)
             {
-                if (ConvHistory == null) return;
+                if (keepInPlaceBuffers || ConvHistory == null) return;
                 NoteBindingsChanged();
                 Free(ConvHistory);
                 ConvHistory = null;
                 SnapshotCapacity = 0;
             }
+
+            protected internal override long SpecBufferBytes => ConvHistory?.Storage.ByteLength ?? 0;
 
             protected internal override long StateBytes => Conv.Storage.ByteLength + (ConvHistory?.Storage.ByteLength ?? 0);
 

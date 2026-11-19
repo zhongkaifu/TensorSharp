@@ -266,6 +266,16 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         void SpecForward(int[] tokens, float[]? hAllOut, float[] logitsOut, bool allLogitsRows);
 
+        /// <summary>
+        /// <see cref="SpecForward"/> of a prompt chunk (the last row's logits): the speculative prefill
+        /// (<see cref="SpeculativeExecution.PrefillStep"/>). A model may attend a prompt chunk with arithmetic decode
+        /// rows and verify windows do not share, as long as a plain request's prefill of the same chunk does too
+        /// (the speculative contract compares the two); a verify, a re-forward of kept rows and a plain step stay on
+        /// <see cref="SpecForward"/>.
+        /// </summary>
+        void SpecForwardPrompt(int[] tokens, float[]? hAllOut, float[] logitsOut)
+            => SpecForward(tokens, hAllOut, logitsOut, allLogitsRows: false);
+
         /// <summary>Optional verify with the same state/hidden-row semantics as
         /// <see cref="SpecForward"/>, returning each raw row's first-max token instead
         /// of host logits. Only a caller whose sampler is plain greedy may use it;
@@ -405,6 +415,17 @@ namespace TensorSharp.Runtime.Speculative
         void FollowPlainPrompt(string? requestId, int promptEnd) => FollowPlainPrompt(requestId);
 
         /// <summary>
+        /// A prompt chunk of a request that does not speculate (one token to emit, or speculation declined for it), read on
+        /// the plain path: a head that keeps itself in step with the trunk (<see cref="DraftSelfCatchUp"/>) and whose context
+        /// outlives the request (<see cref="IPerRequestDraftState.KeepDraftState"/>) takes the chunk's rows as the trunk
+        /// forwards them, over the request's own drafter state where one is free (a speculating request never loses its
+        /// own), so that a later turn reusing this prompt's cache drafts over the conversation instead of over nothing. A
+        /// head does so only where its context costs a bounded share of the forward (a block drafter's ring takes a prompt's
+        /// last <see cref="DraftContextRows"/> rows). Called before each such chunk; default: nothing.
+        /// </summary>
+        void FollowUnspeculatedPrompt(string requestId, int promptEnd) { }
+
+        /// <summary>
         /// The trunk's features of the row before <paramref name="position"/> (the carry a draft there chains from, as the
         /// speculator's catch-up pairs them) when the head took that row as the trunk forwarded it (<see cref="DraftSelfCatchUp"/>:
         /// the last row of a prompt read on the plain path) and nothing it holds was written since: copied into
@@ -495,6 +516,11 @@ namespace TensorSharp.Runtime.Speculative
     /// A drafter that keeps one state per request (a DFlash ring is the context of ONE sequence). Concurrent
     /// requests that speculate - in a batched verify, or taking turns at solo speculative steps - each bind their own
     /// before drafting, so one request's drafts never read another's context.
+    ///
+    /// The state is the context of a sequence, which outlives the request that wrote it: a finished request's state is
+    /// kept (<see cref="KeepDraftState"/>) and a later request whose tokens begin with the ones it covers continues it
+    /// (<see cref="ContinueDraftState"/>) - the next turn of a conversation, over the cache it reuses. The runtime matches
+    /// the tokens (and media, and cache scopes) as its prefix reuse does; the drafter keeps the state.
     /// </summary>
     public interface IPerRequestDraftState
     {
@@ -504,6 +530,26 @@ namespace TensorSharp.Runtime.Speculative
 
         /// <summary>Return <paramref name="requestId"/>'s drafter state.</summary>
         void ReleaseDraftState(string requestId);
+
+        /// <summary>
+        /// <paramref name="requestId"/> is over: keep its drafter state as the context of its sequence's first positions,
+        /// for a later request that continues the sequence (<see cref="ContinueDraftState"/>), until the drafter needs the
+        /// storage for another request (the oldest kept first). Returns how many of the sequence's first positions the state
+        /// covers, or 0 when it keeps none (the state is released as <see cref="ReleaseDraftState"/> releases it).
+        /// </summary>
+        int KeepDraftState(string requestId)
+        {
+            ReleaseDraftState(requestId);
+            return 0;
+        }
+
+        /// <summary>
+        /// <paramref name="requestId"/>, which has no drafter state yet, continues the state kept for
+        /// <paramref name="keptRequestId"/> as the context of its own first <paramref name="tokens"/> positions: the two
+        /// sequences hold the same tokens there. The state's rows past them are not context. False when that state is no
+        /// longer kept (the request then gets a fresh one).
+        /// </summary>
+        bool ContinueDraftState(string requestId, string keptRequestId, int tokens) => false;
     }
 
     /// <summary>

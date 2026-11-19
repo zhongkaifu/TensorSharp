@@ -21,7 +21,7 @@ namespace TensorSharp.Graph
         public bool PackedProductBlocks { get; init; }
         /// <summary>An op may write its result in place inside a state leaf (<see cref="GraphNodeKind.Alias"/>).</summary>
         public bool InPlaceStateAlias { get; init; }
-        /// <summary>A sliding-window attention over a capacity window or a ring (<see cref="GraphOp.FlashAttnExt"/> ip[2]: its band)
+        /// <summary>A sliding-window attention over a capacity window or a ring (<see cref="GraphOp.FlashAttnExt"/> ip[3]: its band)
         /// reads its mask on the device as the selection it is, every run: the band's floor moves with each position, so a
         /// recorded decode step replays the band of the position it runs at (a mask classified from its host values would
         /// replay the recorded position's floor). Only for windows this executor attends that way
@@ -84,6 +84,11 @@ namespace TensorSharp.Graph
         /// <summary>A program may end in each row's greedy token (a top-1 over the logits, a tie to the lower id), read
         /// back as its F32 value: a greedy verify then reads an id a row instead of the vocabulary's logits.</summary>
         public bool GreedyIdOutputs { get; init; }
+        /// <summary>An F16 causal mask input may arrive as its pattern (a <see cref="CausalMaskInput"/> as the input's handle,
+        /// no host bytes): the executor classifies it from the pattern and makes its values only for an op that reads them.
+        /// The shared runtime gives prompt chunks' masks so (more rows than a verify window: never replayed, advanced or
+        /// recorded); decode rows and verify windows keep their host values, which their advances move on.</summary>
+        public bool StructuralCausalMasks { get; init; }
     }
 
     /// <summary>A stable identity for a storage object, for program signatures of executors that bind
@@ -147,6 +152,15 @@ namespace TensorSharp.Graph
         /// llama.cpp's scheduler overlaps a prompt's ubatches): the work is waited for before anything reads, releases or
         /// rewrites what it touches, and when the scope ends. Null where every run completes before it returns.</summary>
         IDisposable OverlapSteps() => null;
+
+        /// <summary>Whether a model's whole-forward graphs may hold their K/V caches in <paramref name="kvFormat"/> (a
+        /// <see cref="GraphFormat"/>) with <paramref name="keyDim"/>-wide keys and <paramref name="valueDim"/>-wide values: F32 and
+        /// F16 always, the block-quantized Q8_0 and Q4_0 where every view and write addresses their blocks
+        /// (<see cref="GraphCapabilities.QuantizedKvCache"/>). An executor whose attention kernels and row writes read and write a
+        /// block format without the generic views of it (direct CUDA's q8_0) says so here.</summary>
+        bool TakesKvCacheFormat(int kvFormat, int keyDim, int valueDim)
+            => kvFormat is GraphFormat.F32 or GraphFormat.F16
+               || (kvFormat is GraphFormat.Q8_0 or GraphFormat.Q4_0 && Capabilities.QuantizedKvCache);
 
         /// <summary>Host work to run while the device runs the next recorded step: after its launch, before anything waits for
         /// its outputs (a recorded step leaves the host idle for its whole run). False where the executor runs no recorded

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
@@ -71,6 +72,53 @@ namespace TensorSharp.Cuda
         {
             CaptureContext ctx = active;
             return ctx != null && ReferenceEquals(ctx.Allocator, allocator);
+        }
+
+        // Allocators a just-ended capture is settling on (CudaPrefillGraphCache.EndCaptureAndLaunch, from before the capture
+        // ends until its graph has taken the pool blocks its kernels used), with how many; under Sync.
+        private static readonly Dictionary<CudaAllocator, int> settling = new Dictionary<CudaAllocator, int>();
+        private static int settlingCount;
+
+        /// <summary>A capture on <paramref name="allocator"/> is about to end, and its graph will take the blocks its work
+        /// returned to the pool: until <see cref="EndSettling"/> those blocks are in the pool, untracked once the capture has
+        /// ended, and nothing may give them back to the driver unasked.</summary>
+        internal static void BeginSettling(CudaAllocator allocator)
+        {
+            lock (Sync)
+            {
+                settling[allocator] = settling.TryGetValue(allocator, out int n) ? n + 1 : 1;
+                settlingCount++;
+            }
+        }
+
+        /// <summary>The graph of the capture <see cref="BeginSettling"/> marked holds its blocks (or there is no graph).</summary>
+        internal static void EndSettling(CudaAllocator allocator)
+        {
+            lock (Sync)
+            {
+                if (!settling.TryGetValue(allocator, out int n))
+                    return;
+                if (n <= 1) settling.Remove(allocator);
+                else settling[allocator] = n - 1;
+                settlingCount--;
+            }
+        }
+
+        /// <summary>
+        /// Whether <paramref name="allocator"/>'s pool may give cached blocks back to the driver that nobody asked it to free
+        /// (the pressure valve's relief, which runs on whichever thread returns a block, the GC finalizer's included): not
+        /// while a capture runs on it, and not while a capture that just ended is settling. A relief in that window freed a
+        /// block the capture's work had returned to the pool; the graph then found it neither in the pool nor rented, claimed
+        /// a freed address, and its launch wrote through it (CUDA error 700).
+        /// </summary>
+        internal static bool MayFreeCachedBlocksUnasked(CudaAllocator allocator)
+        {
+            if (IsCapturing(allocator))
+                return false;
+            if (Volatile.Read(ref settlingCount) == 0)
+                return true;
+            lock (Sync)
+                return !settling.ContainsKey(allocator);
         }
 
         internal static void OnRent(CudaAllocator allocator, IntPtr ptr, long bytes)
@@ -443,6 +491,11 @@ namespace TensorSharp.Cuda
         /// relocation (CudaGraphRelocation) reads.</summary>
         public bool KeepTemplates { get; set; }
 
+        /// <summary>Tests: runs in <see cref="EndCaptureAndLaunch(string, Tensor, IEnumerable{Tensor}, int)"/> once the
+        /// capture has ended and before the graph takes the pool blocks its kernels used (where another thread's return
+        /// may run meanwhile).</summary>
+        internal Action CaptureEndedForTests { get; set; }
+
         /// <summary>The instantiated graph of <paramref name="key"/> and its template (zero without <see cref="KeepTemplates"/>).</summary>
         internal bool TryGetGraphs(string key, out IntPtr exec, out IntPtr template)
         {
@@ -570,12 +623,29 @@ namespace TensorSharp.Cuda
             if (captureContext == null || !string.Equals(captureKey, key, StringComparison.Ordinal))
                 return false;
 
+            // The blocks the capture's work returned stay in the pool until the graph takes them below, untracked once the
+            // capture has ended: until then the pool gives no cached block back to the driver unasked (another thread's
+            // return under the free-memory reserve would otherwise free one the graph writes through).
+            CudaGraphCapture.BeginSettling(allocator);
+            try
+            {
+                return EndSettlingCaptureAndLaunch(key, pinnedHidden, keepAlive, maxAttendLen);
+            }
+            finally
+            {
+                CudaGraphCapture.EndSettling(allocator);
+            }
+        }
+
+        private bool EndSettlingCaptureAndLaunch(string key, Tensor pinnedHidden, IEnumerable<Tensor> keepAlive, int maxAttendLen)
+        {
             CudaGraphCapture.CaptureContext ctx = captureContext;
             allocator.Context.MakeCurrent();
             int rc = CudaDriverApi.cuStreamEndCapture(allocator.Stream.Handle, out IntPtr graph);
             CudaGraphCapture.End(ctx);
             captureContext = null;
             captureKey = null;
+            CaptureEndedForTests?.Invoke();
 
             if (rc != 0 || graph == IntPtr.Zero)
             {

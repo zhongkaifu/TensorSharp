@@ -469,12 +469,12 @@ namespace TensorSharp.MLX
         /// of the view), any other mask as an array. The output [1, heads, nq, dv] is transposed to
         /// ggml's [nq, heads, dv].</summary>
         protected override Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
-            CacheWindow kWindow, CacheWindow vWindow)
+            CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
             if (!(q.Storage is MlxStorage && k.Storage is MlxStorage && v.Storage is MlxStorage)
                 || k.ElementType != v.ElementType || q.ElementType != DType.Float32
                 || (k.ElementType != DType.Float32 && k.ElementType != DType.Float16))
-                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow);
+                return base.FlashAttention(q, k, v, mask, scale, kWindow, vWindow, promptChunk);
             long heads = q.Sizes[0], nq = q.Sizes[1], dv = v.Sizes[2];
             int floor = mask.Floor;
             using Tensor kv = floor > 0 ? k.Narrow(1, floor, k.Sizes[1] - floor) : null;

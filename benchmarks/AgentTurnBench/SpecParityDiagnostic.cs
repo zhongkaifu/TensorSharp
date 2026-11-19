@@ -362,6 +362,11 @@ internal static class SpecParityDiagnostic
             if (allLogitsRows) onVerify(tokens.Length);
             _inner.Forward(tokens, hidden, logits, allLogitsRows);
         }
+        public void ForwardPrompt(int[] tokens, float[] hidden, float[] logits)
+        {
+            operations.Add(new TraceOp("prompt", model.CacheSeqLen, tokens, false));
+            _inner.ForwardPrompt(tokens, hidden, logits);
+        }
         public void ForwardPlain(int token, float[] logits, bool parked)
         {
             operations.Add(new TraceOp(parked ? "plain-parked" : "plain", model.CacheSeqLen, new[] { token }, false));

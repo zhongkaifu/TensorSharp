@@ -28,6 +28,12 @@ namespace TensorSharp.Runtime.Speculative
         /// by <c>tokens.Length</c>.</summary>
         void Forward(int[] tokens, float[]? hAllOut, float[] logitsOut, bool allLogitsRows);
 
+        /// <summary><see cref="Forward"/> of a prompt chunk (the last row's logits), through
+        /// <see cref="ISpeculativeTarget.SpecForwardPrompt"/>: the prefill's entry, which a model may attend as a prompt chunk
+        /// (as a plain request's prefill does).</summary>
+        void ForwardPrompt(int[] tokens, float[]? hAllOut, float[] logitsOut)
+            => Forward(tokens, hAllOut, logitsOut, allLogitsRows: false);
+
         /// <summary>Optional plain-greedy verify, with the same state effects as
         /// <see cref="Forward"/>. False means nothing was forwarded or written.</summary>
         bool TryForwardGreedyVerify(int[] tokens, float[]? hAllOut, int[] drawnOut) => false;
@@ -96,6 +102,9 @@ namespace TensorSharp.Runtime.Speculative
 
         public void Forward(int[] tokens, float[]? hAllOut, float[] logitsOut, bool allLogitsRows)
             => _model.SpecForward(tokens, hAllOut, logitsOut, allLogitsRows);
+
+        public void ForwardPrompt(int[] tokens, float[]? hAllOut, float[] logitsOut)
+            => _model.SpecForwardPrompt(tokens, hAllOut, logitsOut);
 
         public bool TryForwardGreedyVerify(int[] tokens, float[]? hAllOut, int[] drawnOut)
             => _model.TrySpecForwardGreedyVerify(tokens, hAllOut, drawnOut);

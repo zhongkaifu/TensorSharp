@@ -25,11 +25,15 @@ public enum InvalidationReason : byte { ModelBudgetEviction, NativeSlotReclaimed
 /// One materialization. <see cref="TargetTokens"/> below <see cref="PayloadTokens"/> means the
 /// caller truncates at the first bind (the executor's pending truncation). RequiredContextTokens
 /// is an optional, already fitted reservation for a clone, not its valid token count; the model never
-/// truncates a payload in <see cref="IPrefixCacheModel.TryMaterialize"/> (P7).
+/// truncates a payload in <see cref="IPrefixCacheModel.TryMaterialize"/> (P7). <see cref="Consumable"/> names the
+/// payloads of <see cref="IPrefixCacheModel.RowSharers"/> the request may use up (its own conversation's, none of them
+/// locked or being donated); null: none. <see cref="EndsPrompt"/>: the request's prompt ends at <see cref="TargetTokens"/>
+/// (a retry of the payload's prompt: what it writes past it is its answer, not a prompt of its own).
 /// </summary>
 public readonly record struct MaterializeRequest(
     MaterializeOp Op, string PayloadKey, string TargetRequestId,
-    int PayloadTokens, int TargetTokens, int RequiredContextTokens = 0);
+    int PayloadTokens, int TargetTokens, int RequiredContextTokens = 0, IReadOnlyList<string>? Consumable = null,
+    bool EndsPrompt = false);
 
 /// <summary>Where a model reports the payloads it still evicts itself (DEC-23).</summary>
 public interface IPrefixPayloadSink
@@ -76,6 +80,25 @@ public interface IPrefixCacheModel
     /// model that keeps every request in a slot of its own): a prompt's end checkpoint may then wait for the step
     /// after the prompt's, its first token going out first.</summary>
     bool CapturesUnboundRequests => false;
+
+    /// <summary>A checkpoint of the request's cache at its current length, as <see cref="TryCaptureCopy"/>. With
+    /// <paramref name="mayShareRows"/> (an automatic checkpoint, never exported to a file) the model may keep only what the
+    /// request's later steps change (its recurrent states) and share the cache rows below the length with the request,
+    /// which never writes them again while the checkpoint lasts; a write below them invalidates the checkpoint
+    /// (reported through the sink), never changes it. A copy by default.</summary>
+    bool TryCaptureCheckpoint(string requestId, string payloadKey, bool mayShareRows, out PayloadFootprint footprint)
+        => TryCaptureCopy(requestId, payloadKey, out footprint);
+
+    /// <summary>Side-effect free. The cached payloads a request that adopts <paramref name="payloadKey"/> in place of their
+    /// holder would use up (<see cref="TryCaptureCheckpoint"/>'s shared rows: the holder's end state and the longer
+    /// checkpoints over them), so the coordinator can say which of them are the request's to consume
+    /// (<see cref="MaterializeRequest.Consumable"/>); empty when adopting it uses up nothing, null when the rows' holder runs a
+    /// request. Empty by default.</summary>
+    IReadOnlyList<string>? RowSharers(string payloadKey) => Array.Empty<string>();
+
+    /// <summary>The last <see cref="TryMaterialize"/> declined for want of device memory (the request should wait for a
+    /// running one rather than prefill what it would have adopted). False by default.</summary>
+    bool LastMaterializeWantedRoom => false;
 
     /// <summary>Move a finished or preempted request's private holder (or native slot) under
     /// <paramref name="payloadKey"/>. A <paramref name="length"/> below the holder's length
@@ -209,4 +232,7 @@ public interface IPrefixCacheModelDiagnostics
     int PrimaryCacheLength { get; }
     /// <summary>Decode-graph resets issued since load (<c>ModelBase.DecodeGraphResets</c>).</summary>
     long DecodeGraphResets { get; }
+    /// <summary>The last <see cref="IPrefixCacheModel.TryCaptureDonate"/> kept a copy of the request's holder rather than
+    /// the holder itself (the retention log names it); false after one that donated or failed. False by default.</summary>
+    bool LastRetentionCopied => false;
 }

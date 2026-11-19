@@ -82,6 +82,12 @@ namespace TensorSharp.Models
         /// cell].</summary>
         protected override int ExtraKeyCacheWidth(int layer) => QsaRatio(layer) > 0 ? 2 * Qsa.Dim : 0;
 
+        /// <summary>QSA layers read their indexer cache (in the KV dtype) through views and gathers and select their cells with
+        /// masks and kernels of their own (F16 only on direct CUDA): a model with any keeps a block-quantized cache off an
+        /// executor that takes one only in its plain attention.</summary>
+        protected override bool AttentionRoutesTakeQuantizedKv
+            => !(_anyQsa ??= Enumerable.Range(0, Config.NumLayers).Any(l => QsaRatio(l) > 0));
+
         /// <summary>The cache of <paramref name="layer"/> for sequence <paramref name="s"/>, [2d, capacity]: the step's
         /// rank's copy (every rank keeps the whole indexer cache and selects the same blocks).</summary>
         private int QsaCache(GraphStep step, int layer, int s)

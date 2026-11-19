@@ -303,9 +303,21 @@ namespace TensorSharp.Models
 
             /// <summary>A retained slot drops its verify buffers: [rows | states] for up to SnapshotCapacity rows is
             /// several GB on a 27B DFlash2 slot, which the prefix cache's budget did not see (a 24 GB A5000 ran out of
-            /// memory on the fourth request).</summary>
-            protected internal override void ReleaseSpecBuffers()
+            /// memory on the fourth request). With <paramref name="keepInPlaceBuffers"/> that buffer alone goes, which a window
+            /// updating the state in place never allocates (<see cref="WindowInPlace"/>): the conv history and the saved
+            /// inputs stay, and the windows recorded over them replay when the slot runs again. Freed, a conversation's next
+            /// turn on its retained slot traced and recorded its verify windows again (Qwen3.8-27B DFlash2, issue #376), and
+            /// the change of bindings dropped the kept steps of the requests still running.</summary>
+            protected internal override void ReleaseSpecBuffers(bool keepInPlaceBuffers)
             {
+                if (keepInPlaceBuffers)
+                {
+                    if (Verify == null) return;
+                    NoteBindingsChanged();
+                    Free(Verify);
+                    Verify = null;
+                    return;
+                }
                 if (Verify != null || ConvHistory != null || SavedInputs != null) NoteBindingsChanged();
                 Free(Verify);
                 Free(ConvHistory);
@@ -320,6 +332,9 @@ namespace TensorSharp.Models
                 => Conv.Storage.ByteLength + Backing.Storage.ByteLength
                    + (Verify?.Storage.ByteLength ?? 0) + (ConvHistory?.Storage.ByteLength ?? 0)
                    + (SavedInputs?.Storage.ByteLength ?? 0);
+
+            protected internal override long SpecBufferBytes
+                => (Verify?.Storage.ByteLength ?? 0) + (ConvHistory?.Storage.ByteLength ?? 0) + (SavedInputs?.Storage.ByteLength ?? 0);
 
             /// <summary>Room for a <paramref name="rows"/>-row verify; true when the buffers moved.</summary>
             public virtual bool EnsureSpecBuffers(int rows)

@@ -67,10 +67,12 @@ internal static class SpeculativeRuntimeChecks
 
     /// <summary>Greedy speculation through the model's block drafter (DFlash) emits exactly the plain greedy
     /// tokens: the prompt and every verify feed the drafter's feature rows, and its blocks are verified.</summary>
+    /// <param name="prompt">The prompt (a short default): a long one is prefilled in one chunk by both arms (the plain one's
+    /// refill and the speculative decoder's), so the two attend its rows alike.</param>
     public static void AssertBlockDraftMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0,
-        Func<ModelBase> reference = null)
+        Func<ModelBase> reference = null, int[] prompt = null)
     {
-        int[] prompt = Enumerable.Range(0, 21).Select(i => 40 + (i * 7) % 23).ToArray();
+        prompt ??= Enumerable.Range(0, 21).Select(i => 40 + (i * 7) % 23).ToArray();
         List<Greedy> plain = PlainGreedy(reference ?? create, prompt, maxNew);
 
         using ModelBase target = create();
@@ -79,7 +81,7 @@ internal static class SpeculativeRuntimeChecks
         Assert.Equal(DraftHeadKind.Block, spec.DraftHeadKind);
         // Gate 0 and no cost governor: every step drafts the whole block, whatever the (random) drafter's confidence.
         var speculator = new BlockDraftSpeculator(spec, spec.DraftBlockSize, spec.DraftBlockSize) { MinDraftProb = 0 };
-        var decoder = new SpeculativeDecoder(spec, speculator) { AdaptiveSpeculation = false };
+        var decoder = new SpeculativeDecoder(spec, speculator) { AdaptiveSpeculation = false, PrefillChunkSize = prompt.Length };
         List<int> drafted = decoder.GenerateGreedy(prompt, maxNew);
         AssertSameStream(plain, drafted, tieTolerance, label);
         Assert.Equal(maxNew, drafted.Count);

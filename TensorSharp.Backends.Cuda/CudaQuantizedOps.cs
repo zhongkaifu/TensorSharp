@@ -201,9 +201,6 @@ namespace TensorSharp.Cuda
         private static readonly ScratchPool Fp4PartialScratch = new ScratchPool();
         private static readonly ScratchPool Fp4CounterScratch = new ScratchPool();
 
-        /// <summary>CUDA_ERROR_OUT_OF_MEMORY.</summary>
-        private const int OutOfMemoryStatus = 2;
-
         private static IntPtr EnsureScratch(ScratchPool pool, CudaAllocator allocator, long bytes)
         {
             lock (Sync)
@@ -219,16 +216,15 @@ namespace TensorSharp.Cuda
                     ? 0
                     : scratch.Bytes * 2;
                 long alloc = Math.Max(bytes, Math.Max(64 * 1024L, doubled));
-                int status = CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)alloc));
                 // The allocator's pool keeps returned blocks for reuse, which this direct allocation cannot use: out of memory,
-                // they go back to the driver first (outside a recording, which must not synchronize). A 4K prompt of
-                // Qwen3.8-27B NVFP4 with the DFlash2 drafter on a 24 GB RTX PRO 4000 failed here with the pool holding them.
-                if (status == OutOfMemoryStatus && !CudaGraphCapture.IsCapturing(allocator))
-                {
-                    allocator.TrimPool();
-                    status = CudaDriverApi.cuMemAlloc(out ptr, new UIntPtr((ulong)alloc));
-                }
-                status.ThrowOnError();
+                // they go back to the driver first, the least recently used first and only as many as it needs, as for a pool allocation
+                // (outside a recording, which must not synchronize). A 4K prompt of Qwen3.8-27B NVFP4 with the DFlash2
+                // drafter on a 24 GB RTX PRO 4000 failed here with the pool holding them.
+                IntPtr ptr;
+                if (CudaGraphCapture.IsCapturing(allocator))
+                    CudaDriverApi.cuMemAlloc(out ptr, new UIntPtr((ulong)alloc)).ThrowOnError();
+                else
+                    ptr = allocator.AllocateUnpooled(alloc);
 
                 if (scratch == null)
                 {
@@ -909,8 +905,13 @@ namespace TensorSharp.Cuda
             IntPtr stream = allocator.Stream.Handle;
             if (rows <= allocator.Nvfp4MatvecRows)
             {
-                IntPtr scratch = EnsureQ81Scratch(allocator, CudaFp4Kernels.GemvScratchBytes(rows, inDim));
-                fp4.Gemv(planes, outDim, inDim, inputPtr, rows, scratch, resultPtr, stream);
+                // More rows than one call takes reach here only under CudaAllocator.AllNvfp4RowsOnMatvecForTests: they run in
+                // slices, each row computing as a one-row call's.
+                int slice = Math.Min(rows, CudaFp4Kernels.GemvMaxRows);
+                IntPtr scratch = EnsureQ81Scratch(allocator, CudaFp4Kernels.GemvScratchBytes(slice, inDim));
+                for (int first = 0; first < rows; first += slice)
+                    fp4.Gemv(planes, outDim, inDim, inputPtr + (nint)((long)first * inDim * sizeof(float)), Math.Min(slice, rows - first), scratch,
+                        resultPtr + (nint)((long)first * outDim * sizeof(float)), stream);
                 return;
             }
             var (codes, scales, rowScale) = Fp4Activations(allocator, rows, inDim);
@@ -1019,6 +1020,7 @@ namespace TensorSharp.Cuda
             if (ggmlType != 40 || !CudaKernelOps.TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols)
                 || !CudaKernelOps.TryGetContiguousRows(input, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputRows, out int inputCols)
                 || rows != inputRows || 2L * cols != ne1 || inputCols != ne0 || rows < CudaFp4Kernels.TmaMinRows
+                || rows <= resultStorage.AllocatorImpl.Nvfp4MatvecRows
                 || result.ElementType != DType.Float32 || input.ElementType != DType.Float32)
                 return false;
             CudaAllocator allocator = resultStorage.AllocatorImpl;
@@ -1622,6 +1624,10 @@ namespace TensorSharp.Cuda
                 {
                     RepackNvfp4(allocator, fp4, devicePtr, rawBytes, checked((int)ne1), checked((int)ne0));
                     layout = Nvfp4PlanarType;
+                }
+                else if (ggmlType == 40 && CudaFp4Kernels.TakesWidth(ne0))
+                {
+                    allocator.WarnNvfp4WithoutFp4Kernels();
                 }
                 var entry = new DeviceWeight
                 {
