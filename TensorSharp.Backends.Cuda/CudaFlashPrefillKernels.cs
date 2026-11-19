@@ -328,6 +328,18 @@ namespace TensorSharp.Cuda
         public const int MaxPromptTailSplits = 16;
         private const double PromptSplitCost = 0.02;
 
+        /// <summary>Whether <paramref name="plan"/> is a grid <see cref="LaunchPromptAttention"/> can run for <paramref name="rows"/>
+        /// rows of each of <paramref name="kvHeads"/> KV heads: every row tile a block (<c>TailSplits</c> 1, <c>FullTiles</c> all of
+        /// them), or some tail tiles split at least twice. A plan of one split with tail tiles would have those blocks write partials
+        /// no combine merges (their rows never written, through a null partial pointer), and one of several splits with no tail tile
+        /// a combine of no blocks.</summary>
+        internal static bool IsPromptPlanOf(int rows, int kvHeads, (int FullTiles, int TailSplits) plan)
+        {
+            long total = (long)(rows + BlockRows - 1) / BlockRows * kvHeads;
+            return plan.FullTiles >= 0 && plan.TailSplits >= 1
+                && (plan.TailSplits == 1 ? plan.FullTiles == total : plan.FullTiles < total);
+        }
+
         /// <summary>Floats of the partials a <see cref="PromptPlan"/> grid's tail tiles write: <see cref="BlockRows"/> rows of
         /// headDim + 2 (acc, max, sum) per tail tile and split; 0 without a split.</summary>
         public static long PromptPartialFloats(int rows, int kvHeads, int headDim, (int FullTiles, int TailSplits) plan)
@@ -351,7 +363,7 @@ namespace TensorSharp.Cuda
             bool q8 = false)
         {
             int rows = nq * (heads / kvHeads), total = (rows + BlockRows - 1) / BlockRows * kvHeads;
-            if (plan.FullTiles > total || plan.TailSplits < 1 || (plan.TailSplits > 1 && partial == IntPtr.Zero))
+            if (!IsPromptPlanOf(rows, kvHeads, plan) || (plan.TailSplits > 1 && partial == IntPtr.Zero))
                 throw new ArgumentOutOfRangeException(nameof(plan), $"a plan of {plan.FullTiles} full tiles and {plan.TailSplits} splits for {total} tiles");
             IntPtr a0 = q, a1 = k, a2 = v, a12 = partial, a13 = output;
             int a3 = cap, a4 = nq, a5 = len, a6 = floor, a7 = heads, a8 = kvHeads, a10 = plan.FullTiles, a11 = plan.TailSplits;

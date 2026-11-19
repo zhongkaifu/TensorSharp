@@ -40,6 +40,35 @@ public sealed class CudaFlashPromptAttention2Tests : IDisposable
     private static double Gaussian(Random rng) => Math.Sqrt(-2 * Math.Log(1 - rng.NextDouble())) * Math.Cos(2 * Math.PI * rng.NextDouble());
 
     /// <summary>
+    /// The grids LaunchPromptAttention runs (no device): every PromptPlan is one, and so is a hand-made plan that splits some tail
+    /// tiles; a plan of one split that still leaves tail tiles (their blocks would write partials no combine merges, through a null
+    /// partial pointer, and leave their rows unwritten), one of several splits with no tail tile (a combine of no blocks), and
+    /// negative or zero counts are refused.
+    /// </summary>
+    [Fact]
+    public void LaunchesOnlyPlansWhoseTailTilesTheCombineMerges()
+    {
+        foreach (int sms in new[] { 23, 82, 188 })
+            foreach (int kvHeads in new[] { 1, 2, 4, 8 })
+                foreach (int keys in new[] { 1, 200, 4080, 100_000 })
+                    for (int rows = 1; rows <= 4200; rows += rows < 300 ? 7 : 97)
+                    {
+                        var plan = CudaFlashPrefillKernels.PromptPlan(rows, kvHeads, keys, sms);
+                        Assert.True(CudaFlashPrefillKernels.IsPromptPlanOf(rows, kvHeads, plan), $"{rows} rows, {kvHeads} KV heads, {keys} keys, {sms} SMs: {plan}");
+                    }
+        // 300 rows of 4 KV heads: 3 row tiles a head, 12 in all.
+        Assert.True(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (12, 1)));
+        Assert.True(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (0, 7)));
+        Assert.True(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (11, 5)));
+        Assert.False(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (11, 1)));
+        Assert.False(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (0, 1)));
+        Assert.False(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (12, 2)));
+        Assert.False(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (13, 1)));
+        Assert.False(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (-1, 2)));
+        Assert.False(CudaFlashPrefillKernels.IsPromptPlanOf(300, 4, (12, 0)));
+    }
+
+    /// <summary>
     /// "gauss": q, K, V standard normal; "peaked": q four times wider (a sharp softmax); "outlier": a K channel in 64 twenty times
     /// wider, a V channel in 64 offset by 30 (the accumulators' magnitude far past each tile's product), q's matching channel a
     /// quarter. K and V are values an F16 cache holds exactly. <paramref name="sms"/> &gt; 0 plans the grid as on a device of that
