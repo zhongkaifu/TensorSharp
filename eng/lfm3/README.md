@@ -87,7 +87,8 @@ output).
   `Lfm3SpeechIntegrationRealModelTests` (hidden.f32, codes.txt, llama-tts.wav).
 - `speech-chat-ref.cpp`: llama.cpp's speech pipeline continuing a conversation (its realtime server's path: the turn as
   text, `n_past > 0`, out_mode MIXED or AUDIO, greedy text slots with the pipeline's logit bias) for each question of a
-  TSV; each reply's WAV and transcript. Build it like `speech-ref.cpp` (see its header).
+  TSV; each reply's WAV and transcript. Build it like `speech-ref.cpp` (see its header). A fifth TSV column replaces the
+  system prompt verbatim (`-`: none), to try system prompts against the reference.
 - `speech-asr.py LLAMA_BIN LM MMPROJ MANIFEST.tsv OUT.json`: round-trip intelligibility. LFM3-Omni's own ASR
   (`llama-mtmd-cli`, "Perform ASR in <Language>.", greedy) transcribes each WAV, scored against the text spoken (WER, or
   CER for Chinese/Japanese/Korean; case, punctuation and English numbers normalized).
@@ -96,6 +97,17 @@ output).
   the speech says what the transcript says.
 - `speech-bench.py OUT.json REPEATS NAME=URL ...`: streaming `/v1/audio/speech` from several servers in turn (TensorSharp,
   llama-server) with one client: time to the first audio byte, total time, real-time factor.
+- `speech-lang-eval.py URL OUT_DIR webchat|chat|audio|speech|text`: spoken replies in Chinese (12 prompts: everyday
+  questions, a story, numbers and dates, Chinese with English terms) and English (6) through each surface as its client
+  sends it (`/api/chat` with `speech` as the Web UI does, streamed chat completions with `modalities`, `/v1/audio/speech`
+  over fixed texts, or the text reply alone), both voices; `--language` / `--language-code X` name the language, else
+  the request names none. Each reply's WAV, `replies.json` (transcript, first text and first audio, total time, real-time
+  factor, tokens) and a `manifest.tsv` for the scorers.
+- `speech-whisper.py MANIFEST.tsv OUT.json`: the independent check (faster-whisper, `medium` by default, in a venv of
+  its own; see its header): Whisper's language ID of each WAV and its transcript in the expected language, scored
+  against the text spoken (CER for Chinese with simplified characters and numerals read out on both sides, WER
+  otherwise).
+- `speech-webchat-check.py --lang zh` runs its three-turn spoken session in Chinese.
 
 ## End-to-end suite (`e2e/`)
 

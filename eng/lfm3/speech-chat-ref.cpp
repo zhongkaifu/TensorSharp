@@ -12,9 +12,10 @@
 //       -Wl,-rpath,$LLAMA/build/bin -o artifacts/lfm3/speech-chat-ref
 // Run:
 //   speech-chat-ref LM MMPROJ QUESTIONS.tsv OUT_DIR [mixed|audio] [SEED]
-// QUESTIONS.tsv lines: id <TAB> language <TAB> voice <TAB> question. The system prompt is the one TensorSharp sends:
+// QUESTIONS.tsv lines: id <TAB> language <TAB> voice <TAB> question [<TAB> system prompt]. The default system prompt is
 // llama.cpp's realtime speech line ("Speak in <Language> using a <voice> voice."), then for MIXED the model card's
-// "Respond with interleaved text and audio.". OUT_DIR gets <id>.wav, and replies.tsv (id, transcript, frames, ms).
+// "Respond with interleaved text and audio."; a fifth column replaces it verbatim ("-": no system turn). OUT_DIR gets
+// <id>.wav, and replies.tsv (id, transcript, frames, ms).
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -90,8 +91,10 @@ int main(int argc, char ** argv) {
         const std::string & id = cols[0], & lang = cols[1], & voice = cols[2], & question = cols[3];
         std::string system = "Speak in " + (names.count(lang) ? names.at(lang) : lang) + " using a " + voice + " voice.";
         if (mode == "mixed") system += " Respond with interleaved text and audio.";
-        const std::string turn = "<|im_start|>system\n" + system + "<|im_end|>\n<|im_start|>user\n" + question +
-                                 "<|im_end|>\n<|im_start|>assistant\n<think></think>";
+        // A fifth column replaces the system prompt verbatim ("-": no system turn).
+        if (cols.size() > 4 && !cols[4].empty()) system = cols[4];
+        const std::string turn = (system == "-" ? std::string() : "<|im_start|>system\n" + system + "<|im_end|>\n") +
+                                 "<|im_start|>user\n" + question + "<|im_end|>\n<|im_start|>assistant\n<think></think>";
 
         // A conversation of one token (BOS) so far: the pipeline continues it with the turn and the mode's token.
         llama_memory_clear(llama_get_memory(lctx), true);

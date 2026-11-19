@@ -13,7 +13,7 @@ and is as long as the audio frames, and what each later turn reused (kvReusedTok
 spoken turns back by their audioId. A last text turn shows the reuse when the next turn is not spoken. Writes a JSON
 report (and the WAVs) to --output, which must be under the ignored artifacts/ or docs/validation/.
 
-  python3 eng/lfm3/speech-webchat-check.py --url http://127.0.0.1:18765 --output artifacts/lfm3-speech-webchat
+  python3 eng/lfm3/speech-webchat-check.py --url http://127.0.0.1:18765 --output artifacts/lfm3-speech-webchat [--lang zh]
 """
 import argparse
 import base64
@@ -24,11 +24,19 @@ import subprocess
 import sys
 import urllib.request
 
-QUESTIONS = [
-    "What is the capital of France? Answer in one short sentence.",
-    "And what is the capital of Germany? Answer in one short sentence.",
-    "Which of the two cities did you name first?",
-]
+QUESTIONS = {
+    "en": [
+        "What is the capital of France? Answer in one short sentence.",
+        "And what is the capital of Germany? Answer in one short sentence.",
+        "Which of the two cities did you name first?",
+    ],
+    # Chinese: LFM3-Omni speaks these replies from their text (its interleaved mode speaks English only).
+    "zh": [
+        "法国的首都是哪里？请用一句话回答。",
+        "那德国的首都呢？请用一句话回答。",
+        "你先说的是哪个城市？",
+    ],
+}
 
 
 def request(url, body=None, method=None):
@@ -64,6 +72,7 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--voice", default=None)
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--lang", default="en", choices=sorted(QUESTIONS), help="the questions' language")
     args = parser.parse_args()
     out = os.path.abspath(args.output)
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -85,8 +94,9 @@ def main():
     session = json.load(request(base + "/api/sessions", {}))["sessionId"]
     history = []
     speech = {"voice": args.voice} if args.voice else True
-    for index, question in enumerate(QUESTIONS + ["Thanks! (text turn)"]):
-        spoken = index < len(QUESTIONS)
+    questions = QUESTIONS[args.lang]
+    for index, question in enumerate(questions + ["Thanks! (text turn)"]):
+        spoken = index < len(questions)
         history.append({"role": "user", "content": question})
         body = {"sessionId": session, "messages": history, "maxTokens": args.max_tokens}
         if spoken:
@@ -146,7 +156,7 @@ def main():
             index + 1, "spoken" if spoken else "text", turn.get("promptTokens"), turn.get("kvReusedTokens"),
             turn.get("audioSeconds"), text[:80]), flush=True)
 
-    for index, turn in enumerate(report["turns"][1:len(QUESTIONS)], start=1):
+    for index, turn in enumerate(report["turns"][1:len(questions)], start=1):
         if not turn.get("kvReusedTokens"):
             failures.append("spoken turn %d reused no cached prompt tokens" % (index + 1))
 
