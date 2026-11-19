@@ -318,8 +318,10 @@ rebuilding the graph every call and 21.3 with the replay path (+9%).
 
 llama.cpp run with `--device none -ngl 0` (with a Metal build, `-ngl 0` alone
 still op-offloads batch≥32 matmuls to the GPU). llama.cpp defaults to P-cores
-only (`-t 6` on this machine); TensorSharp's ggml CPU backend now defaults to
-**all physical cores** (18 here) because this workload scales with the E-cores
+only (`-t 6` on this machine); TensorSharp's ggml CPU backend defaulted to
+**all physical cores** (18 here) when this was measured (it now leaves one core of a
+hybrid Apple CPU to the host on prompt steps and two on decode steps: see the
+[env var matrix](../env_var_feature_matrix.md)) because this workload scales with the E-cores
 — llama.cpp itself moves from 3.69 to 7.87 tg when handed `-t 18`, while its
 prompt throughput *drops* with E-cores and ours rises.
 
@@ -752,4 +754,4 @@ layer's per-rank caches), so multi-turn reuse there works as it does on one GPU.
 | `TS_MUSE_GLIMMER_SWA_ROWS` | Override the SWA ring size in rows (diagnostics) |
 | `TS_DFLASH_PREFILL_CHUNK` | Tokens per **trunk** forward while a DFlash prefill catches the drafter up (default 1024) |
 | `TS_KV_FATTN_COPY` | `0` = never materialize a padded KV window (reproduces the ggml-cuda flash-attention **vec** fault); `force` = always materialize it |
-| `TS_GGML_CPU_THREADS` | Thread count for the shared ggml CPU backend (default: all physical cores) |
+| `TS_GGML_CPU_THREADS` | Thread count of the shared ggml CPU backend's prompt pool, and of its decode pool too when set alone (default: all physical cores, all but one on an Apple CPU with performance and efficiency cores; decode steps there run on all but two, `TS_GGML_CPU_DECODE_THREADS`: see the [env var matrix](../env_var_feature_matrix.md)) |

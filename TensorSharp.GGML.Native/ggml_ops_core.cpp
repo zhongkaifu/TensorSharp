@@ -625,8 +625,8 @@ namespace tsg
                 set_last_error("ggml-cpu backend initialization failed.");
                 return backend;
             }
-            // The prompt and decode thread pools (ggml_ops_cpu_graph.cpp): every physical core for prompt steps,
-            // fewer for decode steps on a hybrid Apple CPU; TS_GGML_CPU_THREADS / TS_GGML_CPU_DECODE_THREADS override.
+            // The prompt and decode pools (ggml_ops_cpu_graph.cpp): every physical core for prompts (one fewer on a hybrid
+            // Apple CPU), two fewer for decode there; TS_GGML_CPU_THREADS / TS_GGML_CPU_DECODE_THREADS override.
             cpu_pools_create(backend, g_cpu_pools);
             return backend;
         }

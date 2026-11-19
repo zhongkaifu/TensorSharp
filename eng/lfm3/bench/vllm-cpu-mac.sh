@@ -49,8 +49,8 @@
 #   VLLM_BENCH_DTYPE [float16]  (the vLLM server in `correct`)
 #   SWEEP_ARM [vllm-fp16fix]  SWEEP_THREADS [6 12 18]  SWEEP_EXTRA [vllm-bf16fix vllm-fp32fix]  VLLM_THREADS [sweep]
 #   TS_GGML_T [0] TS_CPU_T [0] LLAMA_T [16] LLAMA_TB [18]  threads. 0 keeps TensorSharp's own defaults, which already
-#                 split prompts from decode (ggml_cpu: prompts on every physical core, decode on every physical core but
-#                 two on a hybrid Mac; the managed cpu lane: every core); N pins every step of the lane to N
+#                 split prompts from decode (ggml_cpu on a hybrid Mac: prompts on every physical core but one, decode on
+#                 every physical core but two; the managed cpu lane: every core, decode-sized steps every core but two); N pins every step of the lane to N
 #                 (TS_GGML_CPU_THREADS / TS_CPU_THREADS, as ts-bench.sh --threads does). llama.cpp takes -t and -tb: on
 #                 a 6P+12E M5 Pro it decodes best at 16 and prompts best at 18 (bench/run-matrix.sh cpu)
 #   REQUESTS [1:4,4:8]  requests per cell by concurrency
