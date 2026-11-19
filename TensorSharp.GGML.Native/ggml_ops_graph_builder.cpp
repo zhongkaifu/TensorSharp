@@ -402,6 +402,12 @@ namespace
         std::vector<Leaf> leaves;
         std::vector<Output> outputs;
         std::vector<GreedyHead> greedy;
+        // Discrete GPUs: the inputs every run uploads, in one device buffer of the graph's own (pack_run_inputs), and the
+        // pinned host block a run fills and sends in one copy; by tensor, each input's offset in both.
+        std::unordered_map<const ggml_tensor*, std::size_t> packed;
+        ggml_tensor* packed_span = nullptr;   // I8 over the whole device buffer
+        std::uint8_t* packed_stage = nullptr;
+        std::vector<std::uint8_t> packed_stage_pageable;   // where the device has no pinned host buffers
         std::vector<ggml_tensor*> effects;
         std::vector<BufferHandle> ephemeral;
         struct Alias { ggml_tensor* node; ggml_tensor* base; std::size_t offset; ggml_tensor* fallback; };
@@ -1301,6 +1307,62 @@ namespace
     }
 
     // Bind the leaves, then let the graph's own allocator place every other tensor.
+    // A graph that replays on a discrete GPU (CUDA, Vulkan) keeps the inputs every run uploads (INPUT leaves in compute
+    // memory that the graph reads) in one device buffer of its own, outside the allocator, and each run copies their host
+    // bytes into one pinned block and sends it in one copy (upload_run_inputs): each input had been its own synchronous
+    // copy, 515 of them, each waited on with the device idle, in a 64-sequence LFM3-1.7B decode step (B0 census, A40). The
+    // device bytes are the same. One-shot graphs (prompt chunks: a few inputs) keep the allocator's memory.
+    void pack_run_inputs(TsgGraph* g)
+    {
+        if (g->tp != nullptr || !g->replayable || (g_backend_type != BACKEND_TYPE_CUDA && g_backend_type != BACKEND_TYPE_VULKAN))
+            return;
+        std::unordered_map<const ggml_tensor*, bool> read;
+        for (int i = 0; i < g->graph->n_leafs; i++) read[g->graph->leafs[i]] = true;
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(graph_backend(g));
+        const std::size_t align = std::max<std::size_t>(ggml_backend_buft_get_alignment(buft), 16);
+        std::vector<std::pair<ggml_tensor*, std::size_t>> placed;
+        std::size_t total = 0;
+        for (const Leaf& leaf : g->leaves)
+        {
+            ggml_tensor* t = leaf.tensor;
+            if (leaf.role != LEAF_INPUT || !leaf.uploaded || leaf.host_only || t->buffer != nullptr || t->data != nullptr
+                || t->view_src != nullptr || read.count(t) == 0)
+                continue;
+            total = (total + align - 1) / align * align;
+            placed.emplace_back(t, total);
+            total += ggml_backend_buft_get_alloc_size(buft, t);
+        }
+        if (placed.size() < 2) return;
+        total = (total + align - 1) / align * align;
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
+        if (buf == nullptr) return;   // the allocator's memory, as before
+        g->ephemeral.emplace_back(buf);
+        char* base = static_cast<char*>(ggml_backend_buffer_get_base(buf));
+        g->packed_span = ggml_new_tensor_1d(g->ctx, GGML_TYPE_I8, static_cast<std::int64_t>(total));
+        if (g->packed_span == nullptr || ggml_backend_tensor_alloc(buf, g->packed_span, base) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("graph builder: binding the packed inputs failed");
+        for (const auto& [t, offset] : placed)
+        {
+            if (ggml_backend_tensor_alloc(buf, t, base + offset) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("graph builder: binding a packed input failed");
+            g->packed[t] = offset;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(graph_backend(g));
+        ggml_backend_buffer_type_t host = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        ggml_backend_buffer_t stage = host != nullptr ? ggml_backend_buft_alloc_buffer(host, total) : nullptr;
+        if (stage != nullptr)
+        {
+            g->ephemeral.emplace_back(stage);
+            g->packed_stage = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(stage));
+            std::memset(g->packed_stage, 0, total);
+        }
+        else
+        {
+            g->packed_stage_pageable.assign(total, 0);
+            g->packed_stage = g->packed_stage_pageable.data();
+        }
+    }
+
     bool build(TsgGraph* g)
     {
         g->graph = ggml_new_graph_custom(g->ctx, graph_slots(g->max_nodes), false);
@@ -1473,6 +1535,7 @@ namespace
         (void) fallbacks;
         if (!g->host_moe.empty() && !tsg::host_moe_build_segment_ends(g->graph, g->host_moe, g->seg_end, "graph builder"))
             return false;
+        pack_run_inputs(g);
 
         // A one-shot graph borrows the backend's persistent, reused compute allocator (the
         // memory the fused graphs share, grown on demand); a graph that will be replayed keeps
@@ -1726,18 +1789,36 @@ namespace
     // Leaves living in compute memory are uploaded every run, weights included: the allocator may reuse an input's
     // memory after its last use within the graph. A leaf nothing in the graph reads (the trace may emit more than the
     // outputs and effects need) has no memory. Then the step's inputs.
+    // A packed input's bytes go to the graph's pinned block (pack_run_inputs), sent after the others in one copy.
     void upload_run_inputs(TsgGraph* g, const int* inputs, void* const* input_data, const std::int64_t* input_bytes, int ninputs)
     {
+        auto stage = [g](const ggml_tensor* t) -> std::uint8_t*
+        {
+            if (g->packed.empty()) return nullptr;
+            auto it = g->packed.find(t);
+            return it == g->packed.end() ? nullptr : g->packed_stage + it->second;
+        };
         for (const Leaf& leaf : g->leaves)
             if (leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
-                ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
+            {
+                if (std::uint8_t* at = stage(leaf.tensor)) std::memcpy(at, resolve_upload_source(leaf.data), leaf.bytes);
+                else ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
+            }
         for (int i = 0; i < ninputs; i++)
         {
             ggml_tensor* t = node_at(g, inputs[i]);
             const std::size_t n = std::min(static_cast<std::size_t>(input_bytes[i]), ggml_nbytes(t));
-            if (input_data[i] != nullptr && n > 0 && t->buffer != nullptr)
-                ggml_backend_tensor_set(t, input_data[i], 0, n);
+            if (input_data[i] == nullptr || n == 0 || t->buffer == nullptr) continue;
+            if (std::uint8_t* at = stage(t)) std::memcpy(at, input_data[i], n);
+            else ggml_backend_tensor_set(t, input_data[i], 0, n);
         }
+        if (g->packed_span == nullptr) return;
+        // On CUDA the copy is queued on the stream the graph runs on, ahead of it; the block is written again only at a
+        // later run, after this one's end synchronized the device (a graph that replays always does).
+        if (g_backend_type == BACKEND_TYPE_CUDA && g->packed_stage_pageable.empty())
+            ggml_backend_tensor_set_async(graph_backend(g), g->packed_span, g->packed_stage, 0, ggml_nbytes(g->packed_span));
+        else
+            ggml_backend_tensor_set(g->packed_span, g->packed_stage, 0, ggml_nbytes(g->packed_span));
     }
 }
 
