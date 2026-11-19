@@ -163,7 +163,8 @@ public sealed class MiniMaxH3ImageResidencyTests
     }
 
     /// <summary>Q4_K_M keeps everything on the A40 at both sizes (as the legacy model did); Q8_0 does at 4 MP, and at 16 MP
-    /// its step's 6.7 GB beside 37.5 GB of weights passes the budget's headroom, so the text encoder goes there.</summary>
+    /// its step's 6.7 GB beside 38.3 GB of weights still fits the denoise, but not the decode beside it: the step's plan
+    /// goes before the decode (only compute buffers are lost; every weight stays).</summary>
     [Theory]
     [InlineData(2048)]
     [InlineData(4096)]
@@ -172,7 +173,7 @@ public sealed class MiniMaxH3ImageResidencyTests
         Assert.True(Plan(DitQ4, side, fused: true, quantized: true, A40).KeepsAll);
         ResidencyPlan q8 = Plan(DitQ8, side, fused: true, quantized: true, A40);
         if (side == 2048) Assert.True(q8.KeepsAll, q8.Describe());
-        else Assert.Equal("Denoise:Conditioner", Releases(q8));
+        else Assert.Equal("Decode:Denoiser workspace", Releases(q8));
     }
 
     /// <summary>An H100-class card holds everything, bf16 at 16 MP included: no release, as the legacy model ran there.</summary>
