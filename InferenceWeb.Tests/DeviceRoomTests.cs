@@ -155,6 +155,73 @@ public sealed class DeviceRoomTests : IDisposable
         Assert.Equal(1, model.SlotRefusals);
     }
 
+    /// <summary>Where releasing every finished conversation the prefix cache keeps would not make a slot's room, none is
+    /// released: a new request beside a running one waits with them all kept, and a checkpoint is declined with them all kept
+    /// (they had all been released first, their next turns prefilling again for nothing).</summary>
+    [Fact]
+    public void ARequestOrACheckpointWhoseRoomReleasingConversationsCannotMakeReleasesNone()
+    {
+        using Qwen35RuntimeModel model = Create();
+        var sink = new RecordingPayloadSink();
+        var cache = (IPrefixCacheModel)model;
+        cache.AttachPrefixCache(sink);
+        Prompt(model, "run");
+        foreach (string key in new[] { "k0", "k1" })
+        {
+            Prompt(model, key);
+            Assert.True(model.RetainSequenceCacheAs(key, key));
+        }
+        // Each conversation frees a quarter of a GB: with both released the device holds 1 GB free, short of a 2,048-cell
+        // slot beside the 1 GB headroom and a request's recordings.
+        model.RetainedPayloadBytesForTests = _ => GB / 4;
+        model.DeviceRoomForTests = () => (GB / 2 + (2 - model.RetainedPayloadKeys.Count) * GB / 4, 16 * GB);
+
+        Assert.Throws<SequenceSlotUnavailableException>(() => ((IUnifiedBatchModel)model).EnsureSequenceSlot("second", 2048));
+        Assert.Equal(1, model.SlotWaits);
+        Assert.False(cache.TryCaptureCopy("run", "checkpoint", out _));
+        Assert.Equal(1, model.CheckpointsDeclinedForRoom);
+
+        Assert.Empty(sink.Reports);
+        Assert.Equal(new[] { "k0", "k1" }, model.RetainedPayloadKeys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Equal(0, model.DeviceRoomStages[5]);
+        Assert.True(model.DeviceRoomReleasesSkipped >= 2, $"{model.DeviceRoomReleasesSkipped} calls skipped releasing");
+        Continue(model, "run");
+    }
+
+    /// <summary>Alone, a request whose whole room (beside the headroom and a request's recordings) no release reaches runs at its
+    /// floor (beside the headroom and the narrowest prompt step), and only the conversations that floor needs are released, the
+    /// oldest first (every one had gone first, then the floor was checked); where not even the floor is in reach it is refused
+    /// with every conversation kept.</summary>
+    [Fact]
+    public void ALoneRequestReleasesConversationsOnlyForItsFloor()
+    {
+        using Qwen35RuntimeModel model = Create();
+        var sink = new RecordingPayloadSink();
+        model.AttachPrefixCache(sink);
+        foreach (string key in new[] { "k0", "k1" })
+        {
+            Prompt(model, key);
+            Assert.True(model.RetainSequenceCacheAs(key, key));
+        }
+        model.RetainedPayloadBytesForTests = _ => 2 * GB / 5;
+        model.DeviceRoomForTests = () => (GB + (2 - model.RetainedPayloadKeys.Count) * 2 * GB / 5, 16 * GB);
+
+        Assert.Equal(0, ((IUnifiedBatchModel)model).EnsureSequenceSlot("lone", 2048));
+        Assert.Equal(new[] { ("k0", InvalidationReason.NativeSlotReclaimed) }, sink.Reports);
+        Assert.Equal(new[] { "k1" }, model.RetainedPayloadKeys);
+        Assert.Equal(0, model.SlotRefusals);
+        Assert.True(((IUnifiedBatchModel)model).TryForwardUnified(new[] { "lone" }, new[] { _prompt }, new[] { 0 }, new float[1][]));
+        Assert.True(model.RetainSequenceCacheAs("lone", "k2"));
+
+        // Out of reach even at its floor: refused, with every conversation kept.
+        model.RetainedPayloadBytesForTests = _ => 0;
+        model.DeviceRoomForTests = () => (GB / 2, 16 * GB);
+        var refused = Assert.Throws<InvalidOperationException>(() => ((IUnifiedBatchModel)model).EnsureSequenceSlot("huge", 2048));
+        Assert.Contains("even with every finished conversation released", refused.Message);
+        Assert.Equal(new[] { "k1", "k2" }, model.RetainedPayloadKeys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Single(sink.Reports);
+    }
+
     /// <summary>The prefix cache is shown what the device lacks of its headroom (the larger of 1 GB and 1/32 of it), and
     /// nothing while the device holds it.</summary>
     [Fact]

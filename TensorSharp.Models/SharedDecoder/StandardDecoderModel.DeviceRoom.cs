@@ -66,6 +66,9 @@ namespace TensorSharp.Models
             PromptStep,
             /// <summary>Recorded steps (<see cref="RecordingRoomBytes"/>); the parked recordings are not given up for them.</summary>
             Recording,
+            /// <summary>A slot at its floor: beside the headroom and the narrowest prompt step only (a lone request's slot, a
+            /// running one's growth, an adopted copy, where their whole room could not be made).</summary>
+            SlotFloor,
         }
 
         // ---------------------------------------------------------------- the device
@@ -108,7 +111,7 @@ namespace TensorSharp.Models
         private long RoomFree(RoomUse use)
         {
             long device = DeviceMemory(fresh: true).Free;
-            return use != RoomUse.Slot && PromptFreeBytesForTests is { } prompt ? prompt() : device;
+            return use is RoomUse.PromptStep or RoomUse.Recording && PromptFreeBytesForTests is { } prompt ? prompt() : device;
         }
 
         /// <summary>The narrowest lone-prompt step on direct CUDA (256 rows and its scratch), which a prompt narrows to when
@@ -122,16 +125,12 @@ namespace TensorSharp.Models
         /// against more than that would split prompts where it did not, which changes their arithmetic).
         /// </summary>
         private long RoomNeed(long bytes, long total, RoomUse use)
-            => use == RoomUse.Slot ? bytes + DeviceHeadroom(total) + Math.Max(PromptStepBytes, RecordingRoomBytes) : bytes;
-
-        /// <summary>Whether <paramref name="bytes"/> fit beside the headroom and the narrowest prompt step: a slot that does
-        /// runs its request (narrower prompt steps, decode steps that record only where they find room), one that does not
-        /// would fail part way with the device out of memory.</summary>
-        private bool FitsBesideHeadroom(long bytes)
-        {
-            var (free, total) = DeviceMemory(fresh: true);
-            return total <= 0 || free >= bytes + DeviceHeadroom(total) + NarrowestPromptStepBytes;
-        }
+            => use switch
+            {
+                RoomUse.Slot => bytes + DeviceHeadroom(total) + Math.Max(PromptStepBytes, RecordingRoomBytes),
+                RoomUse.SlotFloor => bytes + DeviceHeadroom(total) + NarrowestPromptStepBytes,
+                _ => bytes,
+            };
 
         // ---------------------------------------------------------------- making room
 
@@ -225,10 +224,15 @@ namespace TensorSharp.Models
                     if (buffers) DeviceRoomStages[4]++;
                 }
 
-                // 5. The conversations the prefix cache keeps, the oldest first.
+                // 5. The conversations the prefix cache keeps, the oldest first, where releasing them all could make the room:
+                // short of it they went for nothing (a request beside running ones waits anyway, a lone one runs on its floor,
+                // which RoomUse.SlotFloor then asks for alone). A prompt step still releases them: the cached graphs follow.
                 int released = 0;
                 long releasedBytes = 0;
-                if (free < need && mayEvict && _retainedSlots is { Count: > 0 })
+                if (free < need && mayEvict && _retainedSlots is { Count: > 0 }
+                    && use != RoomUse.PromptStep && !ReleasesCanReach(need - free, keep))
+                    DeviceRoomReleasesSkipped++;
+                else if (free < need && mayEvict && _retainedSlots is { Count: > 0 })
                 {
                     foreach (var (key, slot) in _retainedSlots.OrderBy(kv => kv.Value.RetainedAt).ToList())
                     {
@@ -312,6 +316,26 @@ namespace TensorSharp.Models
             if (!DeviceRoomManaged) return false;
             var (free, total) = DeviceMemory();
             return total <= 0 || free >= RoomNeed(bytes, total, RoomUse.Slot);
+        }
+
+        /// <summary>Calls whose room releasing every finished conversation could not have made, which then released none
+        /// (tests).</summary>
+        internal int DeviceRoomReleasesSkipped { get; private set; }
+
+        /// <summary>Tests: the bytes releasing a retained payload frees, by its key, where the device is a stand-in
+        /// (<see cref="DeviceRoomForTests"/>); without it a stand-in's releases are taken to reach any need.</summary>
+        internal Func<string, long> RetainedPayloadBytesForTests { get; set; }
+
+        /// <summary>Whether releasing every finished conversation outside <paramref name="keep"/> frees
+        /// <paramref name="shortBy"/> bytes (their caches and states).</summary>
+        private bool ReleasesCanReach(long shortBy, ReadOnlySpan<Slot> keep)
+        {
+            if (DeviceRoomForTests != null && RetainedPayloadBytesForTests == null) return true;
+            long bytes = 0;
+            foreach (var (key, slot) in _retainedSlots)
+                if (slot.K != null && !Holds(keep, slot))
+                    bytes += RetainedPayloadBytesForTests?.Invoke(key) ?? SlotStorageBytes(slot);
+            return bytes >= shortBy;
         }
 
         /// <summary>Whether <paramref name="keep"/> holds <paramref name="slot"/> or a slot over its caches.</summary>
@@ -474,6 +498,7 @@ namespace TensorSharp.Models
                 return NewSlot(reserve);
             if (keep.Length > 0)
             {
+                // Waits with every finished conversation kept: releasing them did not reach the room (EnsureDeviceRoom).
                 SlotWaits++;
                 var (free, total) = DeviceMemory(fresh: true);
                 throw new SequenceSlotUnavailableException(string.Create(CultureInfo.InvariantCulture,
@@ -481,7 +506,9 @@ namespace TensorSharp.Models
                     $"{Mib(RoomNeed(bytes, total, RoomUse.Slot) - free)} MiB short beside the headroom and a prompt step's or recordings' room); " +
                     $"{requestId} waits for one of the {keep.Length} running requests to finish."));
             }
-            if (FitsBesideHeadroom(bytes))
+            // Alone: the slot's floor (beside the headroom and the narrowest prompt step), finished conversations released, the
+            // oldest first, only as far as it needs.
+            if (EnsureDeviceRoom(bytes, keep, RoomUse.SlotFloor, mayEvict: true, "a new request's slot", block))
                 return SizesSlotsToRoom ? FreshSlot(capacity) : NewSlot(reserve);
             SlotRefusals++;
             throw SlotRefusal(requestId, capacity, bytes);
@@ -508,8 +535,8 @@ namespace TensorSharp.Models
             return new InvalidOperationException(string.Create(CultureInfo.InvariantCulture,
                 $"{Config.Architecture}: {requestId} needs a slot of {capacity:N0} cells (its prompt, its generation budget and the " +
                 $"verify window): {kv / 1e9:F2} GB of K/V and {states / 1e9:F2} GB of states, and the device holds {room / 1e9:F2} GB " +
-                $"beside the weights, its {headroom / 1e9:F2} GB headroom and a prompt step, with no finished conversation left to " +
-                $"release. A shorter prompt or a smaller max_tokens fits; the request was refused before any of it ran."));
+                $"beside the weights, its {headroom / 1e9:F2} GB headroom and a prompt step, even with every finished conversation " +
+                $"released. A shorter prompt or a smaller max_tokens fits; the request was refused before any of it ran."));
         }
 
         /// <summary>
@@ -522,7 +549,7 @@ namespace TensorSharp.Models
             long bytes = CacheBytesPerCell() * capacity;
             Slot[] keep = RunningSlots(slot);
             if (EnsureDeviceRoom(bytes, keep, RoomUse.Slot, mayEvict: true, "a slot's growth", CacheBlockBytes(capacity))
-                || FitsBesideHeadroom(bytes))
+                || EnsureDeviceRoom(bytes, keep, RoomUse.SlotFloor, mayEvict: true, "a slot's growth", CacheBlockBytes(capacity)))
                 return;
             throw GrowthExhausted(slot, capacity, keep, bytes);
         }
@@ -573,10 +600,10 @@ namespace TensorSharp.Models
                     copyCapacity = target;
                     return true;
                 }
-                return FitsBesideHeadroom(bytes);
+                return EnsureDeviceRoom(bytes, RunningSlots(source), RoomUse.SlotFloor, mayEvict, what, CacheBlockBytes(capacity));
             }
             return EnsureDeviceRoom(bytes, RunningSlots(source), RoomUse.Slot, mayEvict, what, CacheBlockBytes(capacity))
-                || (needed && FitsBesideHeadroom(bytes));
+                || (needed && EnsureDeviceRoom(bytes, RunningSlots(source), RoomUse.SlotFloor, mayEvict, what, CacheBlockBytes(capacity)));
         }
 
         // ---------------------------------------------------------------- the allocator's reclaimer

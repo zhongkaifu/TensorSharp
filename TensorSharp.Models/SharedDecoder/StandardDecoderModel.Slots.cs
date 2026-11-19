@@ -740,9 +740,11 @@ namespace TensorSharp.Models
                 if (target < required)
                 {
                     // As a growth always could: the required cells where they fit beside the headroom and the narrowest prompt
-                    // step, else the failure with what holds the device.
+                    // step (finished conversations released only for that, where releasing them reaches it), else the failure
+                    // with what holds the device.
                     target = AlignedSlotCapacity(required);
-                    if (!FitsBesideHeadroom(SlotTargetBytes(target, slot.Capacity)))
+                    if (!EnsureDeviceRoom(SlotTargetBytes(target, slot.Capacity), keep, RoomUse.SlotFloor, mayEvict: true,
+                            "a slot's growth", CacheBlockBytes(target)))
                         throw GrowthExhausted(slot, target, keep);
                 }
                 GrowSlotRolling(slot, target);
