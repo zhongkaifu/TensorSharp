@@ -142,8 +142,8 @@ public sealed class SlotTargetTests : IDisposable
         Assert.Equal(new[] { ("old", InvalidationReason.NativeSlotReclaimed) }, sink.Reports);
     }
 
-    /// <summary>A new request whose slot needs a finished conversation released takes the room the released one leaves past
-    /// its required cells, up to its reservation's class, nothing more released, as a copy or a growth does: made at the
+    /// <summary>A lone new request whose slot needs a finished conversation released takes the room the released one leaves
+    /// past its required cells, up to its reservation's class, nothing more released, as a copy or a growth does: made at the
     /// required cells, its conversation's next turn grew the slot a tensor at a time to that turn's reservation inside the
     /// turn's prompt step (Qwen3.8-27B on an RTX PRO 4500, one server serving 8K to 69K turns: 47,104 -> 56,320 cells at 47K
     /// and 69,632 -> 81,920 at 69K, 85-97 ms of the next turn's first token).</summary>
@@ -180,6 +180,38 @@ public sealed class SlotTargetTests : IDisposable
         Assert.Same(caches, model.SlotCachesForTests("turn2"));
         Assert.Equal(0, model.RollingGrowths);
         Assert.Single(sink.Reports);
+    }
+
+    /// <summary>Beside a running request, a new request whose slot needs a finished conversation released gets its required
+    /// cells only: the room the released one leaves stays free for the next request's slot. Taken up to the class, three 47K
+    /// conversations at once (Qwen3.8-27B on an RTX PRO 4500, 1-token first turns) kept 57,344-cell slots for 47,039 reserved,
+    /// and the second turns' new slots released the conversations whose turns came next: no second or third turn reused its
+    /// prompt (one of each had), 123 s against 98 s for the three turns.</summary>
+    [Fact]
+    public void BesideARunningRequest_ANewRequestsSlotLeavesTheRoomTheConversationsReleasedForItFree()
+    {
+        var sink = new RecordingPayloadSink();
+        using Qwen35RuntimeModel model = Create(() => 32 * GB, sink);
+        var unified = (IUnifiedBatchModel)model;
+        foreach (string key in new[] { "old", "older" })
+        {
+            Assert.Equal(0, unified.EnsureSequenceSlot(key, 64));
+            Assert.True(model.SlotCapacityForTests(key) < 5000);
+            Assert.True(unified.TryForwardUnified(new[] { key }, new[] { _prompt }, new[] { 0 }, new float[1][]));
+            Assert.True(model.RetainSequenceCacheAs(key, key));
+        }
+        Assert.Equal(0, unified.EnsureSequenceSlot("running", 64));
+        Assert.True(unified.TryForwardUnified(new[] { "running" }, new[] { _prompt }, new[] { 0 }, new float[1][]));
+        int? running = model.SlotCapacityForTests("running");
+        Assert.NotNull(running);
+        long tight = model.SlotRoomNeedForTests(256) - 1, after = model.SlotRoomNeedForTests(9000);
+        model.DeviceRoomForTests = () => (model.RetainedPayloadKeys.Count < 2 ? after : tight, 32 * GB);
+
+        // The device and conversations the lone request above gets 8,192 cells from.
+        Assert.Equal(0, unified.EnsureSequenceSlot("turn1", 8000, 5000));
+        Assert.Equal(5120, model.SlotCapacityForTests("turn1"));
+        Assert.Equal(new[] { ("old", InvalidationReason.NativeSlotReclaimed) }, sink.Reports);
+        Assert.Equal(running, model.SlotCapacityForTests("running"));
     }
 
     /// <summary>A new request's slot is its reservation's class where memory allows, else the largest that fits, and the request

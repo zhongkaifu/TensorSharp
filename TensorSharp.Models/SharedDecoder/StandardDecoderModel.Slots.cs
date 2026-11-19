@@ -207,9 +207,11 @@ namespace TensorSharp.Models
 
         /// <summary>Candidate 3 of <see cref="SlotTarget"/>, and a new request's slot where no pooled or retained slot serves it
         /// (<see cref="NewSlotWithRoom"/>): the required cells rounded to 1,024, then to 256, finished conversations released for
-        /// them, then the room the released ones leave past those cells taken as candidates 1 and 2 take room (up to the class of
-        /// <paramref name="wanted"/> and an eighth, releasing nothing more); 0 where neither gets room.</summary>
-        private int TightSlotTarget(int required, int wanted, ReadOnlySpan<Slot> keep, string what, int heldCapacity, bool headroom = true)
+        /// them, then, with <paramref name="takeRoom"/>, the room the released ones leave past those cells taken as candidates 1
+        /// and 2 take room (up to the class of <paramref name="wanted"/> and an eighth, releasing nothing more); 0 where neither
+        /// gets room.</summary>
+        private int TightSlotTarget(int required, int wanted, ReadOnlySpan<Slot> keep, string what, int heldCapacity, bool headroom = true,
+            bool takeRoom = true)
         {
             foreach (int capacity in new[] { ReservationCapacity(required), AlignedSlotCapacity(required) })
             {
@@ -220,7 +222,7 @@ namespace TensorSharp.Models
                     // slot a tensor at a time inside the step (Qwen3.8-27B on an RTX PRO 4500: a 47K clone made at 48,128 cells,
                     // then grown to 56,320 in its first decode step, 107 ms; a new 69K request's slot made at 69,632 cells, then
                     // grown to 81,920 in its next turn's 1,044-row prompt step, 613-616 ms against 510-511 ms).
-                    return Math.Max(capacity, RoomySlotTarget(capacity, wanted, keep, what, heldCapacity, headroom));
+                    return takeRoom ? Math.Max(capacity, RoomySlotTarget(capacity, wanted, keep, what, heldCapacity, headroom)) : capacity;
             }
             return 0;
         }
