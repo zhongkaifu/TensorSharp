@@ -91,7 +91,8 @@ namespace TensorSharp.Graph
             GraphOp.View, GraphOp.Permute, GraphOp.Transpose, GraphOp.Cont, GraphOp.Cast, GraphOp.Cpy, GraphOp.SetRows,
             GraphOp.RopeExt, GraphOp.RopeMulti, GraphOp.FlashAttnExt, GraphOp.SoftMaxExt, GraphOp.TopK, GraphOp.SumRows,
             GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow, GraphOp.Sqr, GraphOp.Sqrt, GraphOp.Clamp,
-            GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce, GraphOp.MoeHostExperts,
+            GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce, GraphOp.MoeHostExperts, GraphOp.Conv2d,
+            GraphOp.PadReflect1d,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -1711,8 +1712,16 @@ namespace TensorSharp.Graph
                 case GraphOp.Cont: return V(Contiguous(T(0)));
                 case GraphOp.Cast:
                 {
-                    if (Ip(0, GraphFormat.F32) != GraphFormat.F32) throw new NotSupportedException($"cast to format {Ip(0, 0)}");
+                    long format = Ip(0, GraphFormat.F32);
                     Tensor x = T(0);
+                    if (format == GraphFormat.F16)
+                    {
+                        // F16 values (an attention's K and V as ggml casts them): the readers widen them where they need F32.
+                        var half = new Tensor(Allocator, DType.Float16, x.Sizes);
+                        CopyInto(half, x);
+                        return V(half);
+                    }
+                    if (format != GraphFormat.F32) throw new NotSupportedException($"cast to format {format}");
                     return x.ElementType == DType.Float32 ? V(Contiguous(x)) : new Value { Tensor = F32(x, run.Owned) };
                 }
                 case GraphOp.Cpy:
@@ -1727,6 +1736,9 @@ namespace TensorSharp.Graph
                         ? V(QuantizedRows(table, values[n.Srcs[0]].FirstRow, values[n.Srcs[1]], run))
                         : V(GetRows(T(0), values[n.Srcs[1]], run));
                 case GraphOp.Concat: return V(Concat(T(0), T(1), (int)Ip(0, 0), run));
+                case GraphOp.Conv2d:
+                    return V(Conv2d(T(0), T(1), (int)Ip(0, 1), (int)Ip(1, 1), (int)Ip(2, 0), (int)Ip(3, 0), (int)Ip(4, 1), (int)Ip(5, 1), run));
+                case GraphOp.PadReflect1d: return V(PadReflect1d(Contig(T(0), run), (int)Ip(0, 0), (int)Ip(1, 0)));
                 case GraphOp.KvWindow:
                     return new Value { Tensor = run.Keep(KvWindow(T(0), n.Ip)), Window = new CacheWindow(T(0), n.Ip[3] % n.Ip[1]) };
                 case GraphOp.RopeExt:
@@ -1858,6 +1870,90 @@ namespace TensorSharp.Graph
         /// <summary>ggml_sum_rows over a contiguous tensor: the sums of its innermost rows (executors with a kernel
         /// override it).</summary>
         protected virtual Tensor SumRows(Tensor x) => Ops.Sum(null, x, x.DimensionCount - 1);
+
+        /// <summary>
+        /// <see cref="GraphOp.Conv2d"/> (ggml_conv_2d): <paramref name="kernel"/> ggml [KW, KH, IC, OC] (sizes [OC, IC, KH, KW], F32
+        /// or F16) over <paramref name="x"/> ggml [W, H, IC, N] with zero padding, as an im2col and one product: a column per
+        /// output pixel holds its KW x KH taps of every input channel (one strided copy per tap), times the kernel's rows. An
+        /// F16 kernel reads x at F16, as ggml's im2col does. Returns ggml [OW, OH, OC, N] (sizes [N, OC, OH, OW]). A backend
+        /// with a convolution kernel overrides it.
+        /// </summary>
+        protected virtual Tensor Conv2d(Tensor kernel, Tensor x, int s0, int s1, int p0, int p1, int d0, int d1, RunState run)
+        {
+            long[] kn = Ne(kernel), xn = Ne(x);
+            long kw = kn[0], kh = kn[1], ic = kn[2], oc = kn[3];
+            long w = xn[0], h = xn[1], n = xn[3];
+            if (xn[2] != ic) throw new NotSupportedException($"a convolution of {ic} input channels over {xn[2]}");
+            if (s0 < 1 || s1 < 1 || d0 < 1 || d1 < 1 || p0 < 0 || p1 < 0)
+                throw new NotSupportedException("a convolution's strides and dilations are positive, its padding not negative");
+            long ow = (w + 2 * p0 - d0 * (kw - 1) - 1) / s0 + 1, oh = (h + 2 * p1 - d1 * (kh - 1) - 1) / s1 + 1;
+            if (ow <= 0 || oh <= 0) throw new NotSupportedException("a convolution with no output pixels");
+            Tensor x4 = Contig(As4(x, run), run);
+            if (x4.ElementType != DType.Float32) x4 = F32(x4, run.Owned);
+            if (kernel.ElementType == DType.Float16)
+            {
+                using var half = new Tensor(Allocator, DType.Float16, x4.Sizes);
+                CopyInto(half, x4);
+                x4 = run.Keep(new Tensor(Allocator, DType.Float32, x4.Sizes));
+                CopyInto(x4, half);
+            }
+            // The zero-padded input [N, IC, H + 2 p1, W + 2 p0].
+            long ph = h + 2 * p1, pw = w + 2 * p0;
+            Tensor padded = x4;
+            if (p0 > 0 || p1 > 0)
+            {
+                padded = run.Keep(new Tensor(Allocator, DType.Float32, n, ic, ph, pw));
+                Ops.Fill(padded, 0f);
+                using Tensor rows = padded.Narrow(2, p1, h);
+                using Tensor inner = rows.Narrow(3, p0, w);
+                CopyInto(inner, x4);
+            }
+            // The columns [N, OH, OW, IC, KH, KW]: tap (i, j) of channel c at output pixel (y, x) is padded[c, y s1 + i d1, x s0 + j d0].
+            long taps = ic * kh * kw;
+            Tensor cols = run.Keep(new Tensor(Allocator, DType.Float32, n * oh * ow, taps));
+            ReadOnlySpan<long> ps = padded.Strides;
+            for (long i = 0; i < kh; i++)
+                for (long j = 0; j < kw; j++)
+                {
+                    using var src = new Tensor(new[] { n, ic, oh, ow }, new[] { ps[0], ps[1], ps[2] * s1, ps[3] * s0 }, padded.Storage,
+                        padded.StorageOffset + i * d1 * ps[2] + j * d0 * ps[3]);
+                    using var dst = new Tensor(new[] { n, ic, oh, ow }, new[] { oh * ow * taps, kh * kw, ow * taps, taps }, cols.Storage,
+                        cols.StorageOffset + i * kw + j);
+                    CopyInto(dst, src);
+                }
+            Tensor k32 = Contig(kernel, run);
+            if (k32.ElementType != DType.Float32) k32 = F32(k32, run.Owned);
+            using Tensor weight = k32.View(oc, taps);
+            using var product = new Tensor(Allocator, DType.Float32, n * oh * ow, oc);
+            DenseProduct(product, cols, weight);
+            using Tensor pixels = product.View(n, oh, ow, oc);
+            using Tensor channelsFirst = pixels.Permute(0, 3, 1, 2);
+            return Ops.NewContiguous(channelsFirst);
+        }
+
+        /// <summary><see cref="GraphOp.PadReflect1d"/> (ggml_pad_reflect_1d) over a contiguous <paramref name="x"/>: the innermost
+        /// axis padded by <paramref name="p0"/> columns before and <paramref name="p1"/> after, mirrored about the edge columns
+        /// (which are not repeated), one column copy each.</summary>
+        protected virtual Tensor PadReflect1d(Tensor x, int p0, int p1)
+        {
+            int last = x.DimensionCount - 1;
+            long width = x.Sizes[last];
+            if (p0 < 0 || p1 < 0 || p0 >= width || p1 >= width)
+                throw new NotSupportedException($"reflect padding of {p0} and {p1} columns needs a row wider than both ({width})");
+            long[] sizes = x.Sizes.ToArray();
+            sizes[last] = width + p0 + p1;
+            var result = new Tensor(Allocator, x.ElementType, sizes);
+            void Column(long to, long from)
+            {
+                using Tensor d = result.Narrow(last, to, 1);
+                using Tensor s = x.Narrow(last, from, 1);
+                CopyInto(d, s);
+            }
+            using (Tensor middle = result.Narrow(last, p0, width)) CopyInto(middle, x);
+            for (int j = 1; j <= p0; j++) Column(p0 - j, j);
+            for (int j = 1; j <= p1; j++) Column(p0 + width - 1 + j, width - 1 - j);
+            return result;
+        }
 
         /// <summary><paramref name="result"/> [n, m] = <paramref name="rows"/> [n, k] times the F32 <paramref name="weight"/>
         /// [m, k] transposed (contiguous operands): an unquantized weight's product. A backend with a faster kernel for some

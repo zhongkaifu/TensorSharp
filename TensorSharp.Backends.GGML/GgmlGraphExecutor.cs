@@ -77,8 +77,10 @@ namespace TensorSharp.GGML
                 : new GgmlGraph(maxNodes, program.Replayable, program.Reorder && Capabilities.ConcurrencyReorder);
             var outputs = new List<float[]>();
             var pins = new List<GCHandle>();
+            int served = 0;
             try
             {
+                if (program.WideTokenProducts) g.MarkWideTokenProducts();
                 foreach (GraphNode n in program.Entries)
                 {
                     switch (n.Kind)
@@ -91,8 +93,9 @@ namespace TensorSharp.GGML
                         case GraphNodeKind.Effect: g.Effect(n.Node); break;
                         case GraphNodeKind.Alias: g.Alias(n.Node, n.Srcs[0], n.Bytes, n.Srcs[1]); break;
                         // A region the backend has a kernel for (Metal's prompt-width delta-net layers) runs as one
-                        // device operation between graph segments; any other builds its ops.
-                        case GraphNodeKind.Fused: g.FusedBegin(n.Node, n.Srcs, n.Ip, n.Fp); break;
+                        // device operation between graph segments, a diffusion-transformer region of a wide program on
+                        // CUDA as the DiT offload's nodes inside the graph; any other builds its ops.
+                        case GraphNodeKind.Fused: if (g.FusedBegin(n.Node, n.Srcs, n.Ip, n.Fp)) served++; break;
                         case GraphNodeKind.FusedEnd: g.FusedEnd(n.Srcs); break;
                         case GraphNodeKind.Output:
                             var values = new float[n.Bytes];
@@ -103,7 +106,7 @@ namespace TensorSharp.GGML
                             break;
                     }
                 }
-                return new Plan(g, outputs.ToArray(), pins.ToArray());
+                return new Plan(g, outputs.ToArray(), pins.ToArray(), served);
             }
             catch
             {
@@ -142,6 +145,11 @@ namespace TensorSharp.GGML
             return ok;
         }
 
+        /// <summary>How many of <paramref name="plan"/>'s fused regions a device kernel computes instead of their ops (served
+        /// when compiled; a region nested in a served one is part of it).</summary>
+        public static int ServedRegions(IGraphPlan plan)
+            => plan is Plan p ? p.ServedRegions : throw new ArgumentException("not a ggml graph plan", nameof(plan));
+
         public void SyncToHost(IntPtr data, long bytes) => GgmlBasicOps.SyncHostBuffer(data, bytes);
 
         public void Invalidate(IntPtr data) => GgmlBasicOps.InvalidateHostBuffer(data);
@@ -151,12 +159,15 @@ namespace TensorSharp.GGML
             private readonly GgmlGraph _graph;
             private readonly GCHandle[] _pins;
 
-            public Plan(GgmlGraph graph, float[][] outputs, GCHandle[] pins)
+            public Plan(GgmlGraph graph, float[][] outputs, GCHandle[] pins, int servedRegions)
             {
                 _graph = graph;
                 Outputs = outputs;
                 _pins = pins;
+                ServedRegions = servedRegions;
             }
+
+            public int ServedRegions { get; }
 
             public float[][] Outputs { get; }
 
