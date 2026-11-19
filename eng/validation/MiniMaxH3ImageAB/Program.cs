@@ -193,6 +193,30 @@ if (Value("--parity-dump") is { } dumpDir)
     return 0;
 }
 
+// ---- --vae-dump <dir>: the VAE encoder alone on the first job's references
+if (Value("--vae-dump") is { } vaeDumpDir)
+{
+    JsonNode first = prompts.FirstOrDefault(x => (string?)x!["id"] == jobs[0]) ?? throw new ArgumentException($"no prompt '{jobs[0]}'");
+    result["vae_dump"] = ParityDump.VaeDump(backend, vae, first, Path.GetDirectoryName(Path.GetFullPath(Required("--prompts")))!, Path.GetFullPath(vaeDumpDir));
+    stop.Cancel();
+    sampler.Join();
+    Save();
+    GgmlBasicOps.Shutdown();
+    return 0;
+}
+
+// ---- --te-flash-check: the text encoder's flash attention against its materialized scores on the first job
+if (Flag("--te-flash-check"))
+{
+    JsonNode first = prompts.FirstOrDefault(x => (string?)x!["id"] == jobs[0]) ?? throw new ArgumentException($"no prompt '{jobs[0]}'");
+    result["te_flash_check"] = ParityDump.FlashCheck(backend, te, first, Path.GetDirectoryName(Path.GetFullPath(Required("--prompts")))!);
+    stop.Cancel();
+    sampler.Join();
+    Save();
+    GgmlBasicOps.Shutdown();
+    return 0;
+}
+
 // ---- load
 double loadStart = clock.Elapsed.TotalSeconds;
 IImageGenerationModel image;

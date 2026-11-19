@@ -149,7 +149,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 cancellationToken.ThrowIfCancellationRequested();
                 // The vision rows make the sequence thousands of tokens long, where the trunk's materialized scores
                 // ([seq, seq, heads] F32) would not fit; its causal flash attention does not keep them.
-                float[] hidden = _encoder.Encode(ids, images, flashAttention: true);
+                float[] hidden = _encoder.Encode(ids, images, flashAttention: FlashAttentionForPictures);
                 LastTokens = ids.Count;
                 LastPresentation = (ids.ToArray(), tags.ToArray());
                 return new ConditioningSet(hidden, ids.Count, _encoder.Config.Hidden, tags.ToArray())
@@ -199,6 +199,10 @@ namespace TensorSharp.Models.MiniMaxH3Image
             if (ids.Count != 1) throw new InvalidOperationException($"The MiniMax-H3 tokenizer has no {marker} token.");
             return ids[0];
         }
+
+        /// <summary>Whether an edit's sequence runs the trunk's flash attention (a measurement seam: off materializes the
+        /// scores, which only short sequences afford).</summary>
+        internal bool FlashAttentionForPictures { get; set; } = true;
 
         /// <summary>The token ids and tags of the last edit's presentation (a parity seam).</summary>
         internal (int[] Ids, int[] Tags) LastPresentation { get; private set; }

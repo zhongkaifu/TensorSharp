@@ -60,6 +60,74 @@ internal static class ParityDump
         return family.Info;
     }
 
+    /// <summary>The text encoder's two attentions on one edit's presentation: the causal flash attention edits run and the
+    /// materialized scores (affordable for a short sequence), compared row by row.</summary>
+    public static JsonObject FlashCheck(BackendType backend, string te, JsonNode job, string baseDir)
+    {
+        var family = new MiniMaxH3ImageFamily(TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageSampling.ReleaseSigmas);
+        var load = new DiffusionLoad { Backend = backend, Files = new Dictionary<string, string> { [DiffusionLoad.TextEncoder] = te } };
+        using var conditioner = (MiniMaxH3ImageConditioner)family.CreateConditioner(load);
+        string[] paths = ((JsonArray)job["images"]!).Select(x => Path.Combine(baseDir, (string)x!)).ToArray();
+        var pictures = paths.Select((p, i) => family.References.ForVision(ImageIO.Load(p, preserveAlpha: true), i)).ToArray();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        float[] flash = conditioner.Encode((string)job["prompt"]!, pictures, CancellationToken.None).Hidden;
+        double flashSeconds = clock.Elapsed.TotalSeconds;
+        conditioner.FlashAttentionForPictures = false;
+        clock.Restart();
+        float[] plain = conditioner.Encode((string)job["prompt"]!, pictures, CancellationToken.None).Hidden;
+        double plainSeconds = clock.Elapsed.TotalSeconds;
+        double dot = 0, a2 = 0, b2 = 0, d2 = 0, maxAbs = 0;
+        for (long i = 0; i < flash.LongLength; i++)
+        {
+            dot += (double)flash[i] * plain[i]; a2 += (double)flash[i] * flash[i]; b2 += (double)plain[i] * plain[i];
+            double d = flash[i] - plain[i]; d2 += d * d; maxAbs = Math.Max(maxAbs, Math.Abs(d));
+        }
+        int rows = flash.Length / 5120;
+        double worstRow = 1;
+        for (int r = 0; r < rows; r++)
+        {
+            double rd = 0, ra = 0, rb = 0;
+            for (int c = 0; c < 5120; c++) { long i = (long)r * 5120 + c; rd += (double)flash[i] * plain[i]; ra += (double)flash[i] * flash[i]; rb += (double)plain[i] * plain[i]; }
+            worstRow = Math.Min(worstRow, rd / Math.Sqrt(ra * rb + 1e-30));
+        }
+        var o = new JsonObject
+        {
+            ["rows"] = rows, ["cosine"] = dot / Math.Sqrt(a2 * b2), ["worst_row_cosine"] = worstRow,
+            ["rel_l2"] = Math.Sqrt(d2 / b2), ["max_abs"] = maxAbs, ["flash_seconds"] = flashSeconds, ["materialized_seconds"] = plainSeconds,
+        };
+        Console.WriteLine($"[h3img-ab] te flash check: {o.ToJsonString()}");
+        return o;
+    }
+
+    /// <summary>The VAE encoder alone on the first job's references (their VAE copies and posteriors), for
+    /// eng/validation/MiniMaxH3ImageEdit/vae_moments_parity.py.</summary>
+    public static JsonObject VaeDump(BackendType backend, string vae, JsonNode job, string baseDir, string dir)
+    {
+        Directory.CreateDirectory(dir);
+        var family = new MiniMaxH3ImageFamily(TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageSampling.ReleaseSigmas);
+        using var codec = new MiniMaxH3ImageVaeCodec(vae, backend);
+        var info = new JsonObject();
+        string[] paths = ((JsonArray)job["images"]!).Select(x => Path.Combine(baseDir, (string)x!)).ToArray();
+        for (int k = 0; k < paths.Length; k++)
+        {
+            RgbImage copy = family.References.ForVae(ImageIO.Load(paths[k], preserveAlpha: true), k);
+            File.WriteAllBytes(Path.Combine(dir, $"vae-copy-{k}.png"), ImageIO.EncodePng(copy));
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            LatentPosterior p = codec.Encode(copy, CancellationToken.None);
+            double seconds = clock.Elapsed.TotalSeconds;
+            Write(Path.Combine(dir, $"moments-{k}.f32"), p.Mean.Concat(p.LogVariance).ToArray());
+            info[$"moments_{k}"] = new JsonObject
+            {
+                ["copy"] = $"{copy.Width}x{copy.Height}", ["latent"] = $"{p.Shape.Height}x{p.Shape.Width}",
+                ["tiles"] = codec.LastEncodeTiles, ["seconds"] = seconds, ["native_seconds"] = codec.LastEncodeNativeSeconds,
+            };
+        }
+        info["images"] = new JsonArray(paths.Select(x => (JsonNode)x).ToArray());
+        File.WriteAllText(Path.Combine(dir, "vae.json"), info.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        Console.WriteLine($"[h3img-ab] vae dump: {info.ToJsonString()}");
+        return info;
+    }
+
     private static void Write(string path, float[] values)
     {
         var bytes = new byte[values.LongLength * 4];
