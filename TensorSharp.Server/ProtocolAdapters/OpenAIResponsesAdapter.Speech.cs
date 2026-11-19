@@ -109,7 +109,9 @@ public sealed partial class OpenAIResponsesAdapter
             await updates.DisposeAsync().ConfigureAwait(false);
         }
         if (rate == 0) rate = terminal.AudioSampleRate > 0 ? terminal.AudioSampleRate : 24000;
-        SpeechReplyStore.Entry entry = OpenAIChatAdapter.SpeechReplies.Add(transcript.ToString(), terminal.SpeechFrames, audioId);
+        // With the turn as generation decoded it, as the chat route keeps its replies: sent back by its id, it splices.
+        SpeechReplyStore.Entry entry = OpenAIChatAdapter.SpeechReplies.Add(transcript.ToString(), terminal.SpeechFrames, audioId,
+            terminal.SpokenTurn);
         long expiresAt = entry.ExpiresAt.ToUnixTimeSeconds();
         bool cut = terminal.FinishReason is "max_tokens";
         string status = cut ? "incomplete" : "completed";

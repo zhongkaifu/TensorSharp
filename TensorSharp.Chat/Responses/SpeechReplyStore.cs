@@ -11,10 +11,12 @@ using System.Collections.Generic;
 namespace TensorSharp.Server.Responses;
 
 /// <summary>
-/// The spoken replies this server sent (OpenAI's <c>message.audio.id</c>), kept for an hour (<c>expires_at</c>) so a client
-/// that sends one back in a later request's history (<c>{"role":"assistant","audio":{"id":...}}</c>) gets that turn
-/// rendered: spliced back as generation decoded it (its tokens, each frame's row from its codes) where the turn is known,
-/// else as its transcript. In memory, per process.
+/// The spoken replies this server sent (OpenAI's <c>message.audio.id</c>, the web chat's <c>audioId</c>), kept for an hour
+/// (<c>expires_at</c>) so a client that sends one back in a later request's history
+/// (<c>{"role":"assistant","audio":{"id":...}}</c>, or the web chat's <c>{"role":"assistant","audioId":...}</c>) gets that
+/// turn rendered: spliced back as generation decoded it (its tokens, each frame's row from its codes) where the turn is
+/// known, else as its transcript. In memory, per process. It lives beside the chat service rather than the HTTP server
+/// because the web chat it also serves runs inside TensorAgent too.
 /// </summary>
 public sealed class SpeechReplyStore
 {
@@ -28,15 +30,18 @@ public sealed class SpeechReplyStore
 
     /// <param name="Turn">The reply as generation decoded it (its tokens and every decoded frame's codes), which a later
     /// turn splices back with the frames' rows; null where it is not known (the turn then renders as its transcript).</param>
+    /// <param name="Epoch">The model load that generated it (<c>ModelLifecycleService.LoadEpoch</c>), for a caller that
+    /// splices only under the same load: token ids are the vocabulary of the model that drew them. 0 when not tracked.</param>
     public sealed record Entry(string Id, string Transcript, IReadOnlyList<int[]> Frames, DateTimeOffset ExpiresAt,
-        TensorSharp.Runtime.SpokenTurnRecord Turn = null);
+        TensorSharp.Runtime.SpokenTurnRecord Turn = null, long Epoch = 0);
 
     /// <summary>Keep a reply; returns its entry (id and expiry).</summary>
-    public Entry Add(string transcript, IReadOnlyList<int[]> frames, string id = null, TensorSharp.Runtime.SpokenTurnRecord turn = null)
+    public Entry Add(string transcript, IReadOnlyList<int[]> frames, string id = null, TensorSharp.Runtime.SpokenTurnRecord turn = null,
+        long epoch = 0)
     {
         Purge();
         var entry = new Entry(id ?? NewId(), transcript ?? string.Empty, frames ?? Array.Empty<int[]>(),
-            DateTimeOffset.UtcNow + Lifetime, turn);
+            DateTimeOffset.UtcNow + Lifetime, turn, epoch);
         _entries[entry.Id] = entry;
         return entry;
     }

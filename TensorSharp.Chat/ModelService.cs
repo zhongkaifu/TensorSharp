@@ -741,10 +741,29 @@ namespace TensorSharp.Server
                 bool enableThinking,
                 TensorSharp.Models.Audio.SpeechReplyOptions speech,
                 TextLoraAdapter? lora = null)
+            => ChatStreamWithSpeechAsync(_intrinsicSession, history, maxTokens, cancellationToken, samplingConfig,
+                enableThinking, speech, lora);
+
+        /// <summary>
+        /// A spoken reply on <paramref name="session"/> (a web chat session: its cache scope and its transcript), as the
+        /// stateless overload gives the protocols without sessions. No tools: a driven request is one generation, never a
+        /// tool loop.
+        /// </summary>
+        internal virtual IAsyncEnumerable<ChatStreamUpdate>
+            ChatStreamWithSpeechAsync(
+                ChatSession session,
+                List<ChatMessage> history,
+                int maxTokens,
+                CancellationToken cancellationToken,
+                SamplingConfig? samplingConfig,
+                bool enableThinking,
+                TensorSharp.Models.Audio.SpeechReplyOptions speech,
+                TextLoraAdapter? lora = null)
         {
+            ArgumentNullException.ThrowIfNull(session);
             ArgumentNullException.ThrowIfNull(speech);
             return _generation.ChatStreamWithMetricsAsync(
-                _intrinsicSession, history, maxTokens, cancellationToken, samplingConfig, null, enableThinking,
+                session, history, maxTokens, cancellationToken, samplingConfig, null, enableThinking,
                 new ChatTurnContext { Speech = speech, Adapter = lora });
         }
 

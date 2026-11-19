@@ -140,6 +140,65 @@ namespace TensorSharp.Server.ResponseSerializers
             }).ToArray(),
         };
 
+        /// <summary>
+        /// A spoken reply's speech, in the order generation made it between the transcript's <c>token</c> frames: base64
+        /// PCM16 little-endian mono (one 80 ms speech frame, or the codec's tail at the end) at <paramref name="sampleRate"/>.
+        /// </summary>
+        public static object Audio(byte[] pcm16, int sampleRate) => new
+        {
+            audio = System.Convert.ToBase64String(pcm16),
+            sampleRate,
+        };
+
+        /// <summary>
+        /// Something the turn did differently from what the request asked, said once in the turn rather than silently:
+        /// <paramref name="code"/> for a page that words it itself, <paramref name="notice"/> for one that shows the
+        /// server's sentence. <c>speech_direct</c>: a spoken reply runs without <paramref name="without"/> (reasoning,
+        /// tools, skills, knowledge). <c>speech_not_saved</c>: the reply's audio could not be written.
+        /// </summary>
+        public static object Notice(string code, string notice, IReadOnlyList<string> without = null) => new
+        {
+            notice,
+            code,
+            without,
+        };
+
+        /// <summary>
+        /// <see cref="Done"/> for a spoken reply: the same counters, and <paramref name="audioId"/> (sent back on the
+        /// assistant message as <c>audioId</c>, it splices the turn as generation decoded it, so the next turn reuses its
+        /// prefix), and when the reply had speech the whole of it as a WAV under the uploads (<paramref name="audioUrl"/>,
+        /// <paramref name="audioSeconds"/> long).
+        /// </summary>
+        public static object DoneSpoken(
+            int tokenCount,
+            double elapsedSeconds,
+            double tokPerSec,
+            bool aborted,
+            string error,
+            string sessionId,
+            int promptTokens,
+            int kvCacheReusedTokens,
+            bool truncated,
+            string audioId,
+            string audioUrl,
+            double? audioSeconds) => new
+        {
+            done = true,
+            tokenCount,
+            elapsed = elapsedSeconds,
+            tokPerSec,
+            aborted,
+            truncated,
+            error,
+            sessionId,
+            promptTokens,
+            kvReusedTokens = kvCacheReusedTokens,
+            kvReusePercent = promptTokens > 0 ? 100.0 * kvCacheReusedTokens / promptTokens : 0.0,
+            audioId,
+            audioUrl,
+            audioSeconds,
+        };
+
         public static object Done(
             int tokenCount,
             double elapsedSeconds,
