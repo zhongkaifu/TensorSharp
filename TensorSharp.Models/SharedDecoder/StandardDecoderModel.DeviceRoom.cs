@@ -143,12 +143,11 @@ namespace TensorSharp.Models
         /// <item>pooled slots, the largest first (they belong to no conversation);</item>
         /// <item>parked recordings that bind none of <paramref name="keep"/> (a later step records again), not for recordings;</item>
         /// <item>the window buffers the conversations the prefix cache keeps hold (<see cref="Retained"/>), the oldest first, never
-        /// one of <paramref name="keep"/> (the next verify on such a slot allocates them again and records its windows anew);
-        /// then the drafter rings no request holds, with the contexts they keep for finished requests' next turns
-        /// (ModelBase.ReleaseIdleDFlashRings), the least recently used first - each only where they cover the shortfall;</item>
+        /// one of <paramref name="keep"/> (the next verify on such a slot allocates them again and records its windows anew);</item>
         /// <item>with <paramref name="mayEvict"/>, the conversations the prefix cache keeps, the oldest first, each reported to
         /// it as reclaimed (their next turns prefill again), never one of <paramref name="keep"/>; then, still short, the drafter
-        /// rings stage 4 left;</item>
+        /// rings no request holds, with the contexts they keep for finished requests' next turns
+        /// (ModelBase.ReleaseIdleDFlashRings), the least recently kept first (counted as stage 4);</item>
         /// <item>for a prompt step, the cached graphs and every recording, which had been the first reaction.</item>
         /// </list>
         /// <paramref name="keep"/> holds the slots a step or a copy is about to use. False when even these made no room. One
@@ -225,14 +224,6 @@ namespace TensorSharp.Models
                     if (buffers) DeviceRoomStages[4]++;
                 }
 
-                // 4. Then the drafter rings finished requests keep for their conversations' next turns (a turn whose ring went
-                // drafts without its context until its rows come back), with the graphs over them, the least recently used first
-                // and only where they cover the shortfall: short of it, conversations go next, and the contexts would be lost for
-                // nothing (on a 32 GB RTX PRO 4500 at 131K context every new long prompt ran short by a gigabyte or more, and
-                // giving back every idle 81 MB ring each time left the next conversation's reused turn drafting without its own).
-                if (free < need && IdleDFlashRingBytes() >= need - free)
-                    free = ReleaseRingsForRoom(need - free, free, use);
-
                 // 5. The conversations the prefix cache keeps, the oldest first.
                 int released = 0;
                 long releasedBytes = 0;
@@ -258,7 +249,13 @@ namespace TensorSharp.Models
                     }
                 }
 
-                // 5b. Still short: the drafter rings stage 4 left.
+                // 5b. Still short: the drafter rings finished requests keep for their conversations' next turns (a turn whose
+                // ring went drafts without its context until its rows come back), with the graphs over them, the least recently
+                // kept first and only as many as needed. They go after the conversations: an 81 MB ring is little room beside a
+                // conversation, and is worth a reused turn's drafts (on a 32 GB RTX PRO 4500 at 131K context, rings given back
+                // ahead of the conversations - every idle one at each new long prompt, or the few that covered a small
+                // shortfall - left the next reused turn of a conversation the prefix cache still kept drafting without its own:
+                // 53-58% acceptance against 98%).
                 if (free < need)
                     free = ReleaseRingsForRoom(need - free, free, use);
 

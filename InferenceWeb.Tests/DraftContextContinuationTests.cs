@@ -161,11 +161,11 @@ public sealed class DraftContextContinuationTests : IDisposable
     }
 
     /// <summary>
-    /// Device memory short by no more than the kept rings hold: the rings finished requests keep go (with their contexts)
-    /// before a conversation the prefix cache keeps, and the running requests' rings stay.
+    /// Device memory short with no conversation the prefix cache keeps left to release: the rings finished requests keep go
+    /// (with their contexts), as many as the room needs, and the running requests' rings stay.
     /// </summary>
     [Fact]
-    public void KeptRingsThatCoverTheShortfallGoBeforeRetainedConversations()
+    public void KeptRingsGoWhenNoConversationIsLeftToRelease()
     {
         using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
         var (target, draft) = Fixtures();
@@ -194,12 +194,13 @@ public sealed class DraftContextContinuationTests : IDisposable
     }
 
     /// <summary>
-    /// Device memory short by more than the kept rings hold: they stay while a conversation the prefix cache keeps goes (an 81
-    /// MB ring beside a gigabyte conversation: given back first, the contexts were lost for nothing, and a 32 GB RTX PRO 4500
-    /// at 131K context ran that short at every long prompt). Short by less, only the least recently kept rings needed go.
+    /// Device memory short: a conversation the prefix cache keeps goes before any kept ring, even where the rings would cover
+    /// the shortfall (an 81 MB ring is little room beside a conversation and worth its next turn's drafts: given back first, on
+    /// a 32 GB RTX PRO 4500 at 131K context, they left reused turns of kept conversations drafting without their context).
+    /// With no conversation left, only the least recently kept rings the room needs go.
     /// </summary>
     [Fact]
-    public void KeptRingsShortOfTheShortfallStayWhileAConversationGoes()
+    public void AConversationGoesBeforeAnyKeptRing()
     {
         using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
         var (target, draft) = Fixtures();
@@ -221,15 +222,15 @@ public sealed class DraftContextContinuationTests : IDisposable
             * model.DFlashSettings.HeadDim * sizeof(float) + model.DFlashSettings.FeatureSize * sizeof(float);
         const long gb = 1L << 30;
 
-        // Three rings' worth short, two kept rings to give: the conversation goes and makes the room, the rings stay.
+        // One ring's worth short, two kept rings to give: the conversation goes and makes the room, the rings stay.
         model.DeviceRoomForTests = () => (model.RetainedPayloadKeys.Count == 0 ? 3 * ringBytes : 0, 64 * gb);
-        Assert.True(model.EnsureRecordingRoomForTests(3 * ringBytes));
+        Assert.True(model.EnsureRecordingRoomForTests(ringBytes));
         Assert.Empty(model.RetainedPayloadKeys);
         Assert.Equal(3, model.DFlashRingCountForTests);
         Assert.Equal(0, model.DeviceRoomStages[4]);
         Assert.Equal(1, model.DeviceRoomStages[5]);
 
-        // One ring's worth short: the ring kept the longest ago goes (k1's), k2's stays.
+        // One ring's worth short and no conversation left: the ring kept the longest ago goes (k1's), k2's stays.
         model.DeviceRoomForTests = () => ((3 - model.DFlashRingCountForTests) * ringBytes, 64 * gb);
         Assert.True(model.EnsureRecordingRoomForTests(ringBytes));
         Assert.Equal(2, model.DFlashRingCountForTests);
