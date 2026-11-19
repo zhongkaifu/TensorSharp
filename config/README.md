@@ -55,6 +55,21 @@ repeatable options — `--stop`, `--skill`, `--lora`,
 command line's after them instead, and a download entry under one of them still
 runs.
 
+An off switch and the options that only mean something with that feature on
+follow the same rule, although they are different options. For Agent Skills
+that is `no-skills` against `--skills-dir`, `--skill`, `--skills-allow-exec`
+and `--skills-allow-network`: whichever side the command
+line (else the later file) sets wins, and the other side's file entries are
+dropped with a notice such as
+
+```text
+[config] --skills-dir is set on the command line, so --no-skills from 'qwen3.8-27b-metal-dflash2.json' is ignored.
+```
+
+So `--skills-dir` turns skills on for a preset that has them off, and
+`--no-skills` turns them off for an agent preset. Both sides in one source (on
+the command line, or in one file) is refused at startup.
+
 ## File format
 
 The file is a JSON object whose keys are the same long option names each host
