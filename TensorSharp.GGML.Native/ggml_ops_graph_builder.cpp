@@ -1170,8 +1170,9 @@ namespace
         case FUSED_LORA_LINEAR:
         {
             // x, the weight, then (down, up) per part; ip the slots with a part, the slot rows (0: the weight's). The parts
-            // run unmerged in the weight's cuBLAS BF16 GEMM (H3_FUSED_LORA_KCAT: Q4_K, Q6_K or BF16) or, where the int8 or
-            // FP8 DiT routes are on, merged into a Q4_K weight's rows (H3_FUSED_LORA_GEMM); otherwise the ops run.
+            // run unmerged in the weight's cuBLAS BF16 GEMM (H3_FUSED_LORA_KCAT: Q4_K, Q6_K or BF16); otherwise the region's
+            // ops run (also unmerged). S1's merged node (H3_FUSED_LORA_GEMM: the update added to the dequantized weight
+            // before its BF16 or int8 rounding, which a distillation delta does not survive) is not used for a region.
             if (ns < 2 || (ns - 2) % 2 != 0 || nip < 2) return false;
             ggml_tensor *x = in[0], *w = in[1];
             const int parts = (ns - 2) / 2;
@@ -1179,8 +1180,7 @@ namespace
             int slots = 0;
             for (int b = 0; b < 3; b++) slots += (mask >> b) & 1;
             if (parts > 3 || mask < 0 || mask >= 8 || slots != parts) return false;
-            const bool kcat = parts > 0 && tsg::h3_lora_kcat_takes(w, x);
-            if ((!kcat && !tsg::h3_q4k_gemm_takes(w, x)) || !ggml_is_contiguous(w) || x->nb[0] != sizeof(float) ||
+            if (parts == 0 || !tsg::h3_lora_kcat_takes(w, x) || !ggml_is_contiguous(w) || x->nb[0] != sizeof(float) ||
                 w->ne[2] != 1 || w->ne[3] != 1)
                 return false;
             const ggml_type type = parts > 0 ? in[2]->type : GGML_TYPE_COUNT;
@@ -1214,7 +1214,7 @@ namespace
             }
             std::vector<ggml_tensor*> srcs{ w, xin };
             for (int i = 2; i < ns; i++) srcs.push_back(in[static_cast<std::size_t>(i)]);
-            p.kind = kcat ? tsg::H3_FUSED_LORA_KCAT : tsg::H3_FUSED_LORA_GEMM;
+            p.kind = tsg::H3_FUSED_LORA_KCAT;
             p.a = static_cast<std::int32_t>(mask);
             p.b = static_cast<std::int32_t>(slotRows);
             p.f0 = swiglu ? 1.0f : 0.0f;

@@ -5,7 +5,8 @@
 
 TensorSharp side: MiniMaxH3ImageAB --lora-rows <rows.json> runs each updated projection of some blocks as the backend
 applies it (a LoraLinear region over the packed factors) on activations drawn from a 32-bit LCG, and records y = W x +
-update and y_base = W x for the first tokens.
+update, y_twin (the same region with zero up factors, so the same kernels) and y_base = W x by a plain MulMat for the
+first tokens.
 
 This side reads the same LoRA file *independently of TensorSharp's loader* (its safetensors header and only the tensors
 and rows it needs, by HTTP range requests or from a local file), maps the names to checkpoint rows by the published
@@ -15,8 +16,8 @@ conversions, not by TensorSharp's code:
     ff.net.0.proj is [value; gate], so checkpoint row j is ff.net.0.proj row (j + ffn) mod 2 ffn; alpha from the metadata;
   * ComfyUI native / kohya: the checkpoint's names and rows as stored, alpha from each module's .alpha (else the rank),
 and computes delta = scale * B[rows] (A x) and y = W[rows] x + delta in float64, W dequantized here from the local base
-checkpoint (GGUF Q8_0 / F16 / BF16 / F32, or the safetensors release). It reports the relative errors of TensorSharp's
-update (y - y_base) and of its y.
+checkpoint (GGUF Q8_0 / Q4_K / Q6_K / F16 / BF16 / F32, or the safetensors release). It reports the relative errors of
+TensorSharp's update (y - y_twin) and of its y against the merge, and of the plain MulMat against W x ("base alone").
 
   python3 -I lora_rows.py --rows rows.json --lora <url|path> --model <dit.gguf|.safetensors> [--scale 1] [--out report.json]
 """
@@ -105,7 +106,52 @@ class Safetensors:
 
 # ---- the base checkpoint's rows -------------------------------------------------------------------------------------
 
-GGML_TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1, 2)}
+GGML_TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 12: ("Q4_K", 256, 144), 14: ("Q6_K", 256, 210),
+              30: ("BF16", 1, 2)}
+
+
+def dequant_q4k(raw):
+    """ggml's dequantize_row_q4_K, float64."""
+    b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 144)
+    d = b[:, 0:2].copy().view(np.float16).astype(np.float64)[:, 0]
+    dmin = b[:, 2:4].copy().view(np.float16).astype(np.float64)[:, 0]
+    sc = b[:, 4:16].astype(np.int64)
+    qs = b[:, 16:].astype(np.int64)
+    out = np.empty((b.shape[0], 256))
+    for j in range(8):
+        if j < 4:
+            s, m = sc[:, j] & 63, sc[:, j + 4] & 63
+        else:
+            s = (sc[:, j + 4] & 0xF) | ((sc[:, j - 4] >> 6) << 4)
+            m = (sc[:, j + 4] >> 4) | ((sc[:, j] >> 6) << 4)
+        chunk, high = j // 2, j % 2
+        q = qs[:, chunk * 32:(chunk + 1) * 32]
+        q = (q >> 4) if high else (q & 0xF)
+        out[:, chunk * 64 + high * 32: chunk * 64 + high * 32 + 32] = (d * s)[:, None] * q - (dmin * m)[:, None]
+    return out.reshape(-1)
+
+
+def dequant_q6k(raw):
+    """ggml's dequantize_row_q6_K, float64."""
+    b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 210)
+    ql, qh = b[:, :128].astype(np.int64), b[:, 128:192].astype(np.int64)
+    sc = b[:, 192:208].copy().view(np.int8).astype(np.float64)
+    d = b[:, 208:210].copy().view(np.float16).astype(np.float64)[:, 0]
+    out = np.empty((b.shape[0], 256))
+    for half in range(2):
+        L, H, S = ql[:, 64 * half:64 * half + 64], qh[:, 32 * half:32 * half + 32], sc[:, 8 * half:8 * half + 8]
+        for l in range(32):
+            is_ = l // 16
+            q1 = ((L[:, l] & 0xF) | (((H[:, l] >> 0) & 3) << 4)) - 32
+            q2 = ((L[:, l + 32] & 0xF) | (((H[:, l] >> 2) & 3) << 4)) - 32
+            q3 = ((L[:, l] >> 4) | (((H[:, l] >> 4) & 3) << 4)) - 32
+            q4 = ((L[:, l + 32] >> 4) | (((H[:, l] >> 6) & 3) << 4)) - 32
+            base = 128 * half + l
+            out[:, base] = d * S[:, is_] * q1
+            out[:, base + 32] = d * S[:, is_ + 2] * q2
+            out[:, base + 64] = d * S[:, is_ + 4] * q3
+            out[:, base + 96] = d * S[:, is_ + 6] * q4
+    return out.reshape(-1)
 
 
 class Gguf:
@@ -156,7 +202,11 @@ class Gguf:
         for r in rows:
             self.f.seek(self.data + off + r * row_bytes)
             raw = self.f.read(row_bytes)
-            if kind == "Q8_0":
+            if kind == "Q4_K":
+                out.append(dequant_q4k(raw))
+            elif kind == "Q6_K":
+                out.append(dequant_q6k(raw))
+            elif kind == "Q8_0":
                 blocks = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 34)
                 d = blocks[:, :2].copy().view(np.float16).astype(np.float64)
                 q = blocks[:, 2:].copy().view(np.int8).astype(np.float64)
@@ -307,7 +357,10 @@ def main():
         y_ref = x @ W.T + delta
         y = b64(e["y"]).reshape(kept, out)[:, rows]
         y0 = b64(e["y_base"]).reshape(kept, out)[:, rows]
-        dts = y - y0
+        # The update the backend applied: y minus the same LoraLinear run with zero up factors when the harness wrote
+        # it (the same kernels, so the base's own rounding cancels), else minus the plain MulMat.
+        twin = b64(e["y_twin"]).reshape(kept, out)[:, rows] if "y_twin" in e else y0
+        dts = y - twin
         dmax = float(np.max(np.abs(delta)))
         derr = float(np.max(np.abs(dts - delta))) / dmax if dmax > 0 else float("nan")
         dl2 = float(np.linalg.norm(dts - delta) / np.linalg.norm(delta)) if dmax > 0 else float("nan")

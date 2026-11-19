@@ -1626,9 +1626,11 @@ bool tsg_cuda_lora_gemm_supported(void)
 // the R columns after them. A dequantized W is laid out the same way, [W | up] with each part's up in its columns on its
 // slot's rows and zeros elsewhere, so one GEMM of depth K + R computes the product and the update together: the [N, T]
 // update is never written, read or added, and no [N, K] merged weight is formed (tsg_cuda_q4k_lora_gemm_bf16's route). A
-// BF16 W is not copied: its product runs as is and each part's expand accumulates into its rows of dst (beta 1). The
-// factors and the shrink are BF16 here (the base operands' type); their rounding is far below the base product's own
-// BF16 rounding of the activations. Synchronizes the default stream.
+// BF16 W is copied into those rows when that moves fewer bytes than the alternative, its product as it is with each
+// part's expand accumulated into its rows of dst (beta 1): the copy reads W and writes it once (about 4 N K bytes), the
+// accumulation reads and writes dst (8 N T), so the copy wins below K = 2 T (qkv, out and fc1 at 4 MP; fc2 and smaller
+// pictures accumulate). The factors and the shrink are BF16 here (the base operands' type); their rounding is far below
+// the base product's own BF16 rounding of the activations. Synchronizes the default stream.
 bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, const float* x, int64_t x_row_stride, int64_t T,
                              float* dst, int64_t dst_ld, int nparts, const void* const* downs, const void* const* ups,
                              const int64_t* ranks, const int64_t* outs, const int64_t* offsets, int factor_f32, int x_swiglu)
@@ -1653,13 +1655,15 @@ bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, con
     int64_t upElems = 0;
     for (int p = 0; p < nparts; p++) upElems += outs[p] * ranks[p];
     const bool quantized = wtype != 30;
+    // A BF16 weight goes through the K + R rows too when copying it there is cheaper than accumulating into dst.
+    const bool concat = quantized || K < 2 * T;
     // Scratch: the weight rows [N, ld] (quantized), the activations [T, ld], the downs [R, K] and the ups, BF16; the shrink
     // [R, T]; the parts' table.
-    const std::size_t wNeed = quantized ? (std::size_t) N * ld * sizeof(__nv_bfloat16) : 0;
+    const std::size_t wNeed = concat ? (std::size_t) N * ld * sizeof(__nv_bfloat16) : 0;
     const std::size_t xNeed = (std::size_t) T * ld * sizeof(__nv_bfloat16);
     const std::size_t dNeed = ((std::size_t) R * K + (std::size_t) upElems + (std::size_t) R * T) * sizeof(__nv_bfloat16) +
                               (std::size_t) 5 * 3 * sizeof(long long) + 256;
-    if ((quantized && ensure(s.w, s.wBytes, wNeed) == nullptr) || ensure(s.x, s.xBytes, xNeed) == nullptr ||
+    if ((concat && ensure(s.w, s.wBytes, wNeed) == nullptr) || ensure(s.x, s.xBytes, xNeed) == nullptr ||
         ensure(s.d, s.dBytes, dNeed) == nullptr)
         return false;
     auto* wb = static_cast<__nv_bfloat16*>(s.w);
@@ -1709,13 +1713,16 @@ bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, con
         return false;
     lap("shrink");
 
-    if (quantized)
+    if (concat)
     {
         const long long blocksPerRow = K / 256, blocks = (long long) N * blocksPerRow;
         if (wtype == 12)
             dequant_q4k_bf16_ld<<<(unsigned int) blocks, 128>>>(static_cast<const BlockQ4K*>(w), wb, blocks, blocksPerRow, ld);
-        else
+        else if (wtype == 14)
             dequant_q6k_bf16_ld<<<(unsigned int) blocks, 64>>>(static_cast<const uint8_t*>(w), wb, blocks, blocksPerRow, ld);
+        else if (cudaMemcpy2DAsync(wb, (std::size_t) ld * sizeof(__nv_bfloat16), w, (std::size_t) K * sizeof(__nv_bfloat16),
+                                   (std::size_t) K * sizeof(__nv_bfloat16), (std::size_t) N, cudaMemcpyDeviceToDevice, nullptr) != cudaSuccess)
+            return false;
         if (cudaMemcpyAsync(meta, hostMeta, sizeof(long long) * 5 * nparts, cudaMemcpyHostToDevice, nullptr) != cudaSuccess)
             return false;
         lora_ext_bf16<<<grid_for(R * N), 256>>>(wb, ld, K, R, N, ub, meta, nparts);

@@ -232,7 +232,18 @@ if (Value("--lora-rows") is { } rowsOut)
             long wBytes = input / GgufFile.GetBlockSize(info.Type) * GgufFile.GetTypeSize(info.Type) * output;
             uint seed = (uint)(1000 * block + 10 * (int)projection + (refiner ? 7 : 0));
             float[] x = Activations(input, tokens, seed);
-            float[] Run(bool adapted)
+            // The update is y - y_twin, where the twin runs the same LoraLinear with zero up factors: the same kernels
+            // and the same base arithmetic, so a backend whose adapted path computes W x differently from a plain
+            // MulMat (ggml_cuda's K-concat GEMM on Q6_K weights, for one) does not put that difference in the update.
+            var zeroBlocks = factors.Parts.Select(p =>
+            {
+                IntPtr raw = System.Runtime.InteropServices.Marshal.AllocHGlobal((nint)(p.UpBytes + 4096));
+                for (long k = 0; k < p.UpBytes + 4096; k += 1 << 20)
+                    System.Runtime.InteropServices.Marshal.Copy(new byte[Math.Min(1 << 20, p.UpBytes + 4096 - k)], 0, raw + (nint)k, (int)Math.Min(1 << 20, p.UpBytes + 4096 - k));
+                return raw;
+            }).ToArray();
+            IntPtr[] zeroUps = zeroBlocks.Select(raw => (IntPtr)(((long)raw + 4095) & ~4095L)).ToArray();
+            float[] Run(bool adapted, bool zeroUp = false)
             {
                 using var e = new TensorSharp.Models.Graph.GraphEmitter(executor, record: true);
                 var b = e.Builder;
@@ -242,9 +253,9 @@ if (Value("--lora-rows") is { } rowsOut)
                 int y;
                 if (adapted)
                 {
-                    var parts = factors.Parts.Select(p => new TensorSharp.Graph.GraphDitRegions.LoraPart(p.Slot,
+                    var parts = factors.Parts.Select((p, k) => new TensorSharp.Graph.GraphDitRegions.LoraPart(p.Slot,
                         e.HostWeight(p.Format, new[] { p.In, (long)p.Rank }, p.Down, p.DownBytes),
-                        e.HostWeight(p.Format, new[] { (long)p.Rank, p.Out }, p.Up, p.UpBytes))).ToArray();
+                        e.HostWeight(p.Format, new[] { (long)p.Rank, p.Out }, zeroUp ? zeroUps[k] : p.Up, p.UpBytes))).ToArray();
                     y = TensorSharp.Graph.GraphDitRegions.LoraLinear(b, xi, w, parts, output, factors.SlotRows, tokens);
                 }
                 else y = b.Op(TensorSharp.Graph.GraphOp.MulMat, w, xi);
@@ -255,7 +266,9 @@ if (Value("--lora-rows") is { } rowsOut)
                 Array.Copy(plan.Outputs[0], kept, kept.Length);
                 return kept;
             }
-            float[] y1 = Run(true), y0 = Run(false);
+            float[] y1 = Run(true), y0 = Run(false), yTwin = Run(true, zeroUp: true);
+            foreach (IntPtr raw in zeroBlocks)
+                System.Runtime.InteropServices.Marshal.FreeHGlobal(raw);
             string B64(float[] v) { var raw = new byte[v.Length * 4]; Buffer.BlockCopy(v, 0, raw, 0, raw.Length); return Convert.ToBase64String(raw); }
             outputs.Add(new JsonObject
             {
@@ -263,7 +276,7 @@ if (Value("--lora-rows") is { } rowsOut)
                 ["in"] = input, ["out"] = output, ["tokens"] = tokens, ["kept_tokens"] = Kept, ["x_seed"] = seed,
                 ["slot_rows"] = factors.SlotRows,
                 ["parts"] = new JsonArray(factors.Parts.Select(p => (JsonNode)new JsonObject { ["slot"] = p.Slot, ["rank"] = p.Rank, ["format"] = p.Format }).ToArray()),
-                ["y"] = B64(y1), ["y_base"] = B64(y0),
+                ["y"] = B64(y1), ["y_base"] = B64(y0), ["y_twin"] = B64(yTwin),
             });
             Console.WriteLine($"[h3img-ab] lora-rows {(refiner ? "refiner " : "")}block {block} {pname}: {factors.Parts.Length} part(s), rank {string.Join("/", factors.Parts.Select(p => p.Rank))}");
         }

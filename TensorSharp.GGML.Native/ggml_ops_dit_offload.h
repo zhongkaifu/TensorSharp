@@ -116,7 +116,7 @@ bool h3_q4k_gemm_takes(const ggml_tensor* w, const ggml_tensor* x);
 
 // Whether a projection with LoRA parts runs them unmerged in its cuBLAS BF16 GEMM (H3_FUSED_LORA_KCAT): a Q4_K, Q6_K or
 // BF16 w on the BF16 route (sm_80+, TS_H3_CUBLAS_MATMUL not 0, at least h3_cublas_min_rows rows, not TS_H3_CUDA_F32_PRODUCTS)
-// while the int8 and FP8 DiT routes are off (they merge the update into the weight rows they keep).
+// while the int8 and FP8 DiT routes are off (a LoraLinear then runs its unmerged ops beside those routes' base products).
 bool h3_lora_kcat_takes(const ggml_tensor* w, const ggml_tensor* x);
 
 // The products of `graph` an int8 GEMM may leave as int32 sums for their one fused reader.
