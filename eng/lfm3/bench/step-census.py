@@ -132,11 +132,57 @@ def census(path, steps, top):
         {"name": n[:80], "per_step": per(c), "ms_per_step": per(ms)}
         for n, (c, ms) in sorted(by_kernel.items(), key=lambda kv: -kv[1][1])[:top]
     ]
+    r["by_kernel"] = {n: [per(c), per(ms)] for n, (c, ms) in by_kernel.items()}
     r["top_api"] = [
         {"name": n, "per_step": per(c), "ms_per_step": per(ms)}
         for n, (c, ms) in sorted(api.items(), key=lambda kv: -kv[1][1])[:top]
     ]
     return r
+
+
+# Weight products (and their activation quantization): their count a step does not depend on N, their time grows with
+# the rows. Everything else is classified by its count: per-sequence when it gains at least one launch for every two
+# added sequences, fixed otherwise.
+PRODUCT = re.compile(r"mul_mat|gemm|gemv|mmq|mmvq|mmvf|cutlass|xmma|splitK|quantize_q8_1|quantize_mmq|matvec|cublas|s16816|s1688|_tn_|_nt_|^Kernel2$", re.I)
+
+
+def growth(base, top, product=PRODUCT):
+    """TPOT growth from `base` (N=b) to `top` (N=t) split by where it went. With the plain run's CENSUS line (host_ms =
+    the step outside the executor's run, run_ms = inside it; both means) the mean step splits exactly into: GPU busy
+    (traced; per-sequence kernels, weight products, fixed kernels, copies), the GPU's idle time inside the executor's
+    run (run_ms - traced busy: launches, the syncs of input uploads, host work between graphs) and the host's time
+    outside the run (inputs, plan advance, results copied into managed arrays). Without it: the traced step."""
+    b, t = base["sequences"], top["sequences"]
+    dn = t - b
+    names = set(base["by_kernel"]) | set(top["by_kernel"])
+    cls = {"per_sequence": [0.0, 0.0], "products": [0.0, 0.0], "fixed": [0.0, 0.0]}
+    rows = []
+    for n in names:
+        c0, m0 = base["by_kernel"].get(n, [0.0, 0.0])
+        c1, m1 = top["by_kernel"].get(n, [0.0, 0.0])
+        k = "products" if product.search(n) else "per_sequence" if (c1 - c0) >= 0.5 * dn else "fixed"
+        cls[k][0] += c1 - c0
+        cls[k][1] += m1 - m0
+        rows.append((m1 - m0, c1 - c0, k, n))
+
+    def split(r):
+        p = r["probe"]
+        if "host_ms" in p and "run_ms" in p:
+            host, run = float(p["host_ms"]), float(p["run_ms"])
+            return host + run, run - r["gpu_busy_ms"], host, "plain mean"
+        return r["step_ms_traced"], r["gpu_idle_ms"], 0.0, "traced"
+    s0, idle0, host0, src = split(base)
+    s1, idle1, host1, _ = split(top)
+    copies = {k: top.get(f"{k}_ms", 0.0) - base.get(f"{k}_ms", 0.0) for k in ("h2d", "d2h", "d2d")}
+    return {
+        "from": b, "to": t, "step_from": s0, "step_to": s1, "d_step": s1 - s0, "step_source": src,
+        "d_busy": top["gpu_busy_ms"] - base["gpu_busy_ms"],
+        "run_idle_from": idle0, "run_idle_to": idle1, "d_run_idle": idle1 - idle0,
+        "host_from": host0, "host_to": host1, "d_host": host1 - host0,
+        "classes": {k: {"d_kernels": v[0], "d_ms": v[1]} for k, v in cls.items()},
+        "copies": copies,
+        "top_growth": [{"name": n[:80], "class": k, "d_count": dc, "d_ms": dm} for dm, dc, k, n in sorted(rows, reverse=True)[:15]],
+    }
 
 
 def plain_census(path):
@@ -211,6 +257,28 @@ def main():
               f"launch API {(t['api_launches'] - base['api_launches']) / dn:.1f}, syncs {(t['api_syncs'] - base['api_syncs']) / dn:.2f}, "
               f"H2D copies {(t.get('h2d_copies', 0) - base.get('h2d_copies', 0)) / dn:.2f}, GPU busy {(t['gpu_busy_ms'] - base['gpu_busy_ms']) / dn:.3f} ms, "
               f"GPU idle {(t['gpu_idle_ms'] - base['gpu_idle_ms']) / dn:.3f} ms")
+    if base:
+        attributions = [growth(base, r) for r in good if r["sequences"] > 4]
+        for g in attributions:
+            d = g["d_step"]
+            share = lambda v: f"{100.0 * v / d:.0f} %" if d > 0 else "-"
+            c = g["classes"]
+            print(f"\nGrowth N={g['from']} -> {g['to']}: step {g['step_from']:.2f} -> {g['step_to']:.2f} ms (+{d:.2f}; {g['step_source']}), "
+                  f"GPU busy +{g['d_busy']:.2f}, GPU idle inside the run {g['run_idle_from']:.2f} -> {g['run_idle_to']:.2f} ms, "
+                  f"host outside the run {g['host_from']:.2f} -> {g['host_to']:.2f} ms")
+            print("| where | +kernels a step | +ms a step | share of the step's growth |")
+            print("|---|---|---|---|")
+            for k in ("per_sequence", "products", "fixed"):
+                print(f"| {k} kernels | {c[k]['d_kernels']:.1f} | {c[k]['d_ms']:.3f} | {share(c[k]['d_ms'])} |")
+            for k, v in g["copies"].items():
+                print(f"| {k} copies | | {v:.3f} | {share(v)} |")
+            print(f"| GPU idle inside the executor's run (launches, upload syncs) | | {g['d_run_idle']:.3f} | {share(g['d_run_idle'])} |")
+            print(f"| host outside the executor's run (inputs, advance, results) | | {g['d_host']:.3f} | {share(g['d_host'])} |")
+            print("largest growth by kernel: " + "; ".join(f"{x['name'][:48]} ({x['class']}) {x['d_count']:+.0f} x, {x['d_ms']:+.3f} ms"
+                                                        for x in g["top_growth"][:8]))
+        if a.json:
+            with open(a.json, "w") as f:
+                json.dump({"reports": rows, "growth": attributions}, f, indent=1)
     for r in good:
         print(f"\nN={r['sequences']} busiest kernels a step:")
         for k in r["top_kernels"]:

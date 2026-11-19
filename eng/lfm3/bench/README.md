@@ -141,10 +141,17 @@ lanes a CPU-only tree: `build-cpu` with Accelerate BLAS, llama.cpp's default CPU
   steps captured (`--profile-range` marks them through the CUDA profiler API), exported to SQLite and reduced per
   step: kernels and the share launched inside CUDA graphs, GPU busy time and the idle gaps where the device waits for
   the host, kernel / graph launch, memcpy and synchronize API calls, H2D / D2H copies and bytes, the busiest kernels and
-  API calls, and the growth per added sequence from N = 4. Knobs in the header (`PROMPT`, `WARM`, `STEPS`, `REPS`,
+  API calls, and the growth per added sequence from N = 4. From N = 4 to each larger traced N it splits the mean step's
+  growth exactly: GPU busy by kernel class (per-sequence kernels, whose launches grow with N; weight products and their
+  activation quantization; fixed kernels) and by copy kind (H2D, D2H, D2D), the GPU's idle time inside the executor's
+  run (the plain run's `run_ms` minus the traced busy time: launches, the synchronizations of input uploads) and the
+  host's time outside it (`host_ms`: inputs, plan advance, results copied into managed arrays), with the kernels that
+  grew most. Knobs in the header (`PROMPT`, `WARM`, `STEPS`, `REPS`,
   `GREEDY`, `GRAPH_TRACE`, `NSYS=none` for the plain runs only, `WRAP` for a lock prefix such as `/root/gpu-lo.sh
-  flock /root/build.lock`). Results under `artifacts/lfm3/batch/census-<backend>-<stamp>/` (`census.md`, `census.json`,
-  `conditions.txt` with `uptime` per cell). Traced times carry nsys's per-kernel overhead: read times from the plain
+  flock /root/build.lock`). Results under `artifacts/lfm3/batch/census-<backend>-<stamp>/` (`census.md` and
+  `census.json` from the traced reports, `census-plain.md` with every plain run's `CENSUS` line, `conditions.txt` with
+  `uptime` per cell); several calls may share one `OUT` (plain-only sizes with `NSYS=none`, then traced ones), and an
+  exported tree without `.git` is fine. Traced times carry nsys's per-kernel overhead: read times from the plain
   rows and counts from the traced ones. On the Mac lanes the probe's own census is the whole tool:
   `dotnet Lfm3Probe.dll batch MODEL ggml_metal --sequences 1,2,4,8,16 --ps`.
 - `metal-op-histogram.py LOG [--start REGEX]`: Metal dispatches per graph from a `GGML_METAL_GRAPH_DEBUG=1` log

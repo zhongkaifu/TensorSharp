@@ -15,6 +15,7 @@
 #   NSYS     nsys binary (default nsys on PATH, else /usr/local/bin/nsys); NSYS=none skips the traced runs
 #   WRAP     a command prefix for every probe run (a lock: WRAP="/root/gpu-lo.sh flock /root/build.lock")
 #   PROBE    Lfm3Probe.dll (default this checkout's Release build); MAX_CONTEXT and the KV dtype as for any probe run
+# Several calls may share one OUT (e.g. plain-only sizes with NSYS=none, then traced sizes): conditions.txt is appended to.
 # Build first (Release): TENSORSHARP_GGML_NO_UPDATE=1 dotnet build eng/lfm3/Lfm3Probe -c Release. The GPU must be idle.
 # The traced step times include nsys's per-kernel overhead: read times from the plain rows, counts from the traced ones.
 set -euo pipefail
@@ -39,11 +40,12 @@ mkdir -p "$out"
 if command -v nvidia-smi > /dev/null && [[ -n $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null) ]]; then
   echo "the GPU is busy:" >&2; nvidia-smi --query-compute-apps=pid,name --format=csv,noheader >&2; exit 3
 fi
-{ uptime; nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || true
-  git -C "$root" log --oneline -1; git -C "$root/ExternalProjects/ggml" log --format='ggml %H' -1 2>/dev/null || true
+{ echo "== start $(date -u +%FT%TZ)"; uptime; nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null || true
+  git -C "$root" log --oneline -1 2>/dev/null || echo "commit: $root is not a git checkout (an exported tree)"
+  git -C "$root/ExternalProjects/ggml" log --format='ggml %H' -1 2>/dev/null || true
   [[ $nsys != none ]] && "$nsys" --version 2>/dev/null || true
   echo "model=$model backend=$backend sizes=$sizes PROMPT=$PROMPT WARM=$WARM STEPS=$STEPS REPS=$REPS PLAIN_REPS=$PLAIN_REPS GREEDY=${GREEDY:-} GRAPH_TRACE=$GRAPH_TRACE"
-  echo "env: MAX_CONTEXT=${MAX_CONTEXT:-} TS_KV_CACHE_DTYPE=${TS_KV_CACHE_DTYPE:-}"; } > "$out/conditions.txt"
+  echo "env: MAX_CONTEXT=${MAX_CONTEXT:-} TS_KV_CACHE_DTYPE=${TS_KV_CACHE_DTYPE:-}"; } >> "$out/conditions.txt"
 echo "results: $out" >&2
 common=(batch "$model" "$backend" --prompt "$PROMPT" --warm "$WARM" --steps "$STEPS" ${GREEDY:+--greedy})
 for n in $sizes; do
@@ -61,8 +63,9 @@ for n in $sizes; do
   "$nsys" export --type sqlite --force-overwrite true -o "$out/n$n.sqlite" "$out/n$n.nsys-rep" > /dev/null
 done
 { echo "== end $(date +%T)"; uptime; } >> "$out/conditions.txt"
+# census.md: the traced reports (with the plain runs' CENSUS lines joined); census-plain.md: every plain run's CENSUS line
+# (a plain-only call into an OUT that already holds traced reports leaves census.md as it is).
+grep -h '^CENSUS' "$out"/n*.plain.txt | sort -t= -k2 -n | tee "$out/census-plain.md" || true
 if [[ $nsys != none ]] && compgen -G "$out/n*.sqlite" > /dev/null; then
   python3 "$here/step-census.py" --steps $((STEPS * REPS)) --json "$out/census.json" "$out"/n*.sqlite | tee "$out/census.md"
-else
-  grep -h '^CENSUS' "$out"/n*.plain.txt | tee "$out/census.md"
 fi
