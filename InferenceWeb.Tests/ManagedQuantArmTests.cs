@@ -266,8 +266,13 @@ public class ManagedQuantArmTests
         Assert.Same(b, ManagedQuantizedOps.DecodeColumnBounds(outDim, rowBytes, threads));
     }
 
-    /// <summary>BF16 products on ARM64 against DequantMatMulColumns (what they replace), bit for bit: row groups of
-    /// four, leftover rows, K with and without 4- and 8-value tails, column counts that leave a partial group.</summary>
+    /// <summary>BF16 products on ARM64 give every row DequantMatMulColumns' bits for a row of a full group of four (Dot4's
+    /// arithmetic) wherever it sits, bit for bit: the whole product, and each row in a call of its own, against
+    /// DequantMatMulColumns over a group of four copies of that row. Row groups of four, leftover rows, K with and without
+    /// 4- and 8-value tails, column counts that leave a partial group. A row's bits so do not depend on which other rows
+    /// share its product (a slot batch's rows, a MoE expert's gathered rows: Qwen35RuntimeTests.SlotBatchesMatchEachSequenceAlone).
+    /// DequantMatMulColumns itself gives a row past the last full group Dot's arithmetic instead, so over the rows as given
+    /// it is not the reference.</summary>
     [ArmDotTheory]
     [InlineData(1, 2048, 37)]
     [InlineData(3, 64, 5)]
@@ -278,7 +283,7 @@ public class ManagedQuantArmTests
     [InlineData(31, 2048, 70)]
     [InlineData(64, 2048, 256)]
     [InlineData(70, 7680, 130)]
-    public unsafe void Bf16Products_AreBitIdenticalToDequantMatMulColumns(int rows, int k, int n)
+    public unsafe void Bf16Products_GiveEveryRowItsFourRowGroupBits(int rows, int k, int n)
     {
         var rng = new Random(rows * 1000 + k + n);
         ushort[] w = new ushort[(long)n * k];
@@ -287,23 +292,39 @@ public class ManagedQuantArmTests
         int inStride = k + 3, outStride = n + 2;
         float[] x = new float[rows * inStride];
         for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
-        float[] expected = new float[rows * outStride], actual = new float[rows * outStride];
+        float[] expected = new float[rows * outStride], actual = new float[rows * outStride], alone = new float[rows * outStride];
+        float[] group = new float[4 * inStride], groupOut = new float[4 * outStride];
         float[] scratch = new float[k];
         fixed (ushort* wp = w)
         fixed (float* xp = x)
-        fixed (float* e = expected)
         fixed (float* a = actual)
+        fixed (float* l = alone)
+        fixed (float* g = group)
+        fixed (float* go = groupOut)
         fixed (float* s = scratch)
         {
-            ManagedQuantizedOps.DequantMatMulColumns((int)GgmlTensorType.BF16, (byte*)wp, 2L * k, k, n, xp, inStride, rows,
-                e, outStride, 0, n, s);
+            for (int r = 0; r < rows; r++)
+            {
+                // Four copies of row r: DequantMatMulColumns runs them as one group (Dot4), each copy with row r's bits.
+                for (int c = 0; c < 4; c++) Array.Copy(x, r * inStride, group, c * inStride, inStride);
+                ManagedQuantizedOps.DequantMatMulColumns((int)GgmlTensorType.BF16, (byte*)wp, 2L * k, k, n, g, inStride, 4,
+                    go, outStride, 0, n, s);
+                Array.Copy(groupOut, 0, expected, r * outStride, outStride);
+                ManagedQuantizedOps.AddmmQuantizedToFloat32((int)GgmlTensorType.BF16, (IntPtr)wp, k, n, xp + (long)r * inStride, inStride, 1,
+                    l + (long)r * outStride, outStride, null, ManagedQuantizedOps.QGemmIsa.Auto);
+            }
             ManagedQuantizedOps.AddmmQuantizedToFloat32((int)GgmlTensorType.BF16, (IntPtr)wp, k, n, xp, inStride, rows,
                 a, outStride, null, ManagedQuantizedOps.QGemmIsa.Auto);
         }
         for (int r = 0; r < rows; r++)
             for (int c = 0; c < n; c++)
-                Assert.True(BitConverter.SingleToInt32Bits(expected[r * outStride + c]) == BitConverter.SingleToInt32Bits(actual[r * outStride + c]),
+            {
+                int want = BitConverter.SingleToInt32Bits(expected[r * outStride + c]);
+                Assert.True(want == BitConverter.SingleToInt32Bits(actual[r * outStride + c]),
                     $"BF16 rows={rows} K={k} N={n} [{r},{c}]: {expected[r * outStride + c]:R} vs {actual[r * outStride + c]:R}");
+                Assert.True(want == BitConverter.SingleToInt32Bits(alone[r * outStride + c]),
+                    $"BF16 rows={rows} K={k} N={n} [{r},{c}] alone: {expected[r * outStride + c]:R} vs {alone[r * outStride + c]:R}");
+            }
     }
 
     /// <summary>The four-row decode matvec (Q4_K, Q6_K, Q4_0, Q8_0, NVFP4) against the per-row dot, lane by lane, bit for bit.</summary>

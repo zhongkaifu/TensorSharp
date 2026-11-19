@@ -367,7 +367,7 @@ namespace TensorSharp.Models
             byte* weightBase = (byte*)weights.ToPointer();
             int dop = ResolveDop(options);
 
-            // ARM64 BF16: DequantMatMulColumns' arithmetic, widened in registers (ManagedQuantGemm.ArmBf16.cs).
+            // ARM64 BF16: Dot4's arithmetic for every row, widened in registers (ManagedQuantGemm.ArmBf16.cs).
             if (isa != QGemmIsa.PerRow && TryBf16Arm(ggmlType, weightBase, rowBytes, inDim, outDim,
                     input, inputRowStride, rowCount, output, outputRowStride, options))
                 return;

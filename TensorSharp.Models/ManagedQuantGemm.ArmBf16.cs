@@ -23,16 +23,23 @@ namespace TensorSharp.Models
     // DequantMatMulColumns: each weight row widened into an F32 scratch, then
     // dotted with the activation rows four at a time (TensorComputePrimitives.Dot4,
     // one accumulator a row) and the leftover rows one at a time (Dot, two
-    // accumulators). These kernels compute exactly that - the same widening (a
-    // BF16 value is the top half of its F32), the same multiplies and adds in the
-    // same order per output, the same Vector.Sum reduction and scalar tail - with
-    // the widening done in registers and a register tile of four rows by four
-    // columns, so the scratch round trip and the re-read of the weight row per
-    // four rows are gone. The bits do not change (ManagedQuantArmTests).
+    // accumulators), so there a row's bits depend on whether it sits in a group
+    // of four - on how many rows share the product and where it sits among them.
+    // These kernels give EVERY row Dot4's arithmetic (the bits DequantMatMulColumns
+    // gives a row of a full group): the same widening (a BF16 value is the top
+    // half of its F32), one vector accumulator a (row, column) over the 4-value
+    // chunks in order, the same Vector.Sum reduction and scalar tail, with the
+    // widening done in registers - a register tile of four rows by four columns
+    // (the scratch round trip and the re-read of the weight row per four rows are
+    // gone), and the rows past the last full tile one at a time over four columns.
+    // So a row batched with other requests' rows (a slot batch, a MoE expert's
+    // gathered rows, a prompt's tail) gets the bits it gets alone
+    // (ManagedQuantArmTests, Qwen35RuntimeTests.SlotBatchesMatchEachSequenceAlone).
     // ------------------------------------------------------------------
     internal static partial class ManagedQuantizedOps
     {
-        /// <summary>DequantMatMulColumns' result for BF16 weights on ARM64 (see above); false elsewhere.</summary>
+        /// <summary>BF16 weights on ARM64, every row with Dot4's arithmetic (DequantMatMulColumns' bits for a row of a full
+        /// group of four) whatever rows share the call (see above); false elsewhere.</summary>
         internal static unsafe bool TryBf16Arm(
             int ggmlType, byte* weights, long rowBytes, int inDim, int outDim,
             float* input, int inputRowStride, int rowCount, float* output, int outputRowStride, ParallelOptions options)
@@ -143,23 +150,13 @@ namespace TensorSharp.Models
             if (cols > 3) o[3] = s3;
         }
 
-        /// <summary>Dot's arithmetic for one activation row against four BF16 weight rows: two accumulators over
-        /// alternating 4-value chunks, their sum, a last single chunk, Vector.Sum, then the scalar tail.</summary>
+        /// <summary>Dot4's arithmetic (as <see cref="Bf16Tile4x4"/>) for one activation row against four BF16 weight rows: per
+        /// column one vector accumulator over the 4-value chunks, Vector.Sum, then the scalar tail.</summary>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private static unsafe void Bf16Row1x4(ushort* w0, ushort* w1, ushort* w2, ushort* w3, float* x, int n, float* o, int cols)
         {
-            Vector128<float> e0 = default, e1 = default, e2 = default, e3 = default;
-            Vector128<float> f0 = default, f1 = default, f2 = default, f3 = default;
+            Vector128<float> a0 = default, a1 = default, a2 = default, a3 = default;
             int i = 0;
-            for (; i <= n - 8; i += 8)
-            {
-                Vector128<float> xa = AdvSimd.LoadVector128(x + i), xb = AdvSimd.LoadVector128(x + i + 4);
-                e0 += xa * LoadBf16x4(w0 + i); f0 += xb * LoadBf16x4(w0 + i + 4);
-                e1 += xa * LoadBf16x4(w1 + i); f1 += xb * LoadBf16x4(w1 + i + 4);
-                e2 += xa * LoadBf16x4(w2 + i); f2 += xb * LoadBf16x4(w2 + i + 4);
-                e3 += xa * LoadBf16x4(w3 + i); f3 += xb * LoadBf16x4(w3 + i + 4);
-            }
-            Vector128<float> a0 = e0 + f0, a1 = e1 + f1, a2 = e2 + f2, a3 = e3 + f3;
             for (; i <= n - 4; i += 4)
             {
                 Vector128<float> xa = AdvSimd.LoadVector128(x + i);
