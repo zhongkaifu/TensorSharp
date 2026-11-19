@@ -157,12 +157,16 @@ drafted over whatever ring the last speculating request had left - another
 conversation's rows at the positions the two shared: Qwen3.8-27B NVFP4 with DFlash2 on
 direct CUDA accepted 51-60% of its drafts in issue #376's long agent turns, against
 93-98% for the deleted direct engine, whose ring lived in the sequence's slot. A ring
-taken anew starts empty; rings kept for finished requests are made only where the
-device has room for them. A request takes the context it continues as it adopts the
-cached prefix, before that prefix's copy or its slot asks the device for room. A device
+taken anew starts empty. A request takes the context it continues as it adopts the
+cached prefix, before that prefix's copy or its slot asks the device for room. On one
+direct-CUDA device (`--backend cuda`, whose room the model makes itself), a ring is made
+to keep a context beside the kept ones where the device has room for it, and a device
 short of memory gives kept rings back only after the conversations the prefix cache
 keeps (an 81 MB ring is little room beside a conversation, and worth a reused turn's
-drafts), the least recently kept first.
+drafts), the least recently kept first. Every other backend has no way to give a ring
+back, so there a new request takes the context kept the longest ago instead, and a model
+holds no more rings than requests held at once: conversations served one after another
+share one ring, and only the most recent one's next turn finds its context.
 
 A per-token head can opt in too, through its weights adapter:
 `IDraftHead.DraftHeadResumesAfterGap`. Stateful heads without a suffix restart

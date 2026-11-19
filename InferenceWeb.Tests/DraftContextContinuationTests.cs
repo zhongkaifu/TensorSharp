@@ -352,10 +352,52 @@ public sealed class DraftContextContinuationTests : IDisposable
     }
 
     /// <summary>
+    /// A model that gives no kept ring back when memory runs short (every device but one direct-CUDA device, whose room the
+    /// model makes: EnsureDeviceRoom) makes no ring to keep a context beside the kept ones: a request takes the context kept
+    /// the longest ago, so conversations served one after another hold one ring between them, as they did before contexts
+    /// were kept, and a conversation's next turns still continue its own context. Made beside them, every distinct
+    /// conversation had kept a ring of its own up to the pool's nine (85 MB each for Qwen3.8-27B's DFlash2) for the life of
+    /// the process on ggml_cuda, ggml_metal, ggml_vulkan, MLX and the CPUs, where nothing gives a ring back.
+    /// </summary>
+    [Fact]
+    public async Task KeptContextsAddNoRingWhereNothingGivesThemBack()
+    {
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        var (target, draft) = Fixtures();
+        int[][] turns = Conversation(0);
+        int[] plain = (await ServeConversation(target, draft, BackendType.Cpu, speculate: false, turns)).Outputs[2];
+
+        using var model = new Qwen35RuntimeModel(target, BackendType.Cpu, 1, null, 1, draft);
+        model.HostMemorySpareForTests = () => null;   // the machine's other programs do not evict its conversations
+        using var engine = new InferenceEngine(model, Config(speculate: true), NullLogger.Instance);
+        // Two other conversations, one after the other: one speculates, one does not (its prompt still feeds a ring).
+        await Serve(engine, "c1t0", Conversation(1)[0], CMaxNew).WaitAsync(TimeSpan.FromMinutes(3));
+        await Serve(engine, "c2t0", Conversation(2)[0], 1).WaitAsync(TimeSpan.FromMinutes(3));
+        Assert.Equal(1, model.DFlashRingCountForTests);
+        var served = new List<(int[] Tokens, InferenceCompletion Completion, SequenceState Seq)>();
+        for (int t = 0; t < turns.Length; t++)
+            served.Add(await Serve(engine, $"c0t{t}", turns[t], t == 2 ? CMaxNew : 1).WaitAsync(TimeSpan.FromMinutes(3)));
+        var (tokens, completion, seq) = served[2];
+        _output.WriteLine($"C reused {completion.PrefixCacheReusedTokens} of {turns[2].Length}, drafted {seq.SpecStats?.TokensDrafted} " +
+            $"accepted {seq.SpecStats?.TokensAccepted}, continued {engine.ExecutorForTests.DraftContextsContinued}, " +
+            $"{model.DFlashRingCountForTests} rings, kept run {model.DFlashRingRunForTests(seq.RequestId)}");
+        Assert.Equal(1, model.DFlashRingCountForTests);
+        Assert.Equal(turns[2].Length, completion.PrefixCacheReusedTokens);
+        Assert.Equal(plain, tokens);
+        // B continued A's context, and C B's.
+        Assert.Equal(2, engine.ExecutorForTests.DraftContextsContinued);
+        Assert.True(seq.SpecStats is { TokensDrafted: > 0 }, "C did not draft");
+        var run = model.DFlashRingRunForTests(seq.RequestId);
+        Assert.True(run is { } r && r.Filled > turns[2].Length && r.ValidFrom == Math.Max(0, r.Filled - model.DFlashRingRowsForTests)
+            && r.ValidFrom < turns[2].Length - 1, $"C's ring holds {run}");
+    }
+
+    /// <summary>
     /// Another conversation speculates between a conversation's last prompt and its reused turn (A0, B0, X1, C0, X1 a fresh
     /// prompt of another conversation that decodes with speculation), yet C0 drafts over its own conversation, exactly as when
     /// it runs alone (the ring C0 leaves holds the same rows, bit for bit), and every stream is plain decoding's. Before, a lone
-    /// ring went to whichever request came next with its rows: C0 drafted over X1's rows at the positions the two shared.
+    /// ring went to whichever request came next with its rows: C0 drafted over X1's rows at the positions the two shared. On a
+    /// device whose room the model makes (<see cref="ManagesItsDevice"/>): X1 gets a ring beside the kept context only there.
     /// </summary>
     [Fact]
     public async Task AnotherConversationInBetweenLeavesATurnItsContext()
@@ -370,6 +412,7 @@ public sealed class DraftContextContinuationTests : IDisposable
 
         using var model = new Qwen35RuntimeModel(target, BackendType.Cpu, 1, null, 1, draft);
         model.HostMemorySpareForTests = () => null;   // the machine's other programs do not evict its conversations
+        ManagesItsDevice(model);
         using var engine = new InferenceEngine(model, Config(speculate: true), NullLogger.Instance);
         var outputs = new Dictionary<string, (int[] Tokens, int Reused)>();
         foreach (var (id, prompt, maxNew) in new[] { ("c0t0", conversation[0], 1), ("c0t1", conversation[1], 1), ("c1t2", other, CMaxNew),
@@ -394,7 +437,9 @@ public sealed class DraftContextContinuationTests : IDisposable
     /// <summary>
     /// Two conversations' turns interleaved (A0, A1, B0, B1, C1, C0), each turn continuing its conversation with the token
     /// the turn before drew (as a chat's history holds the answer): both keep their contexts in rings of their own, each C
-    /// leaves the ring it leaves when its conversation runs alone, bit for bit, and every stream is plain decoding's.
+    /// leaves the ring it leaves when its conversation runs alone, bit for bit, and every stream is plain decoding's. On a
+    /// device whose room the model makes (<see cref="ManagesItsDevice"/>): the second conversation gets a ring beside the
+    /// first's kept context only there.
     /// </summary>
     [Fact]
     public async Task InterleavedConversationsEachKeepTheirContext()
@@ -406,11 +451,11 @@ public sealed class DraftContextContinuationTests : IDisposable
         for (int c = 0; c < 2; c++)
         {
             plain[c] = (await ServeChat(target, draft, speculate: false, new[] { (c, 0), (c, 1), (c, 2) })).Outputs[(c, 2)];
-            var run = await ServeChat(target, draft, speculate: true, new[] { (c, 0), (c, 1), (c, 2) });
+            var run = await ServeChat(target, draft, speculate: true, new[] { (c, 0), (c, 1), (c, 2) }, managed: true);
             Assert.Equal(2, run.Continued);
             alone[c] = (run.Outputs[(c, 2)], run.Rings[c]);
         }
-        var both = await ServeChat(target, draft, speculate: true, new[] { (0, 0), (1, 0), (0, 1), (1, 1), (1, 2), (0, 2) }, _output);
+        var both = await ServeChat(target, draft, speculate: true, new[] { (0, 0), (1, 0), (0, 1), (1, 1), (1, 2), (0, 2) }, managed: true, _output);
         Assert.Equal(4, both.Continued);
         Assert.Equal(2, both.RingCount);
         for (int c = 0; c < 2; c++)
@@ -427,12 +472,14 @@ public sealed class DraftContextContinuationTests : IDisposable
     /// <summary>Conversations' turns in <paramref name="order"/> on one engine: turn 0 a 40-token prompt and one token, turn 1
     /// that prompt, its token and 20 more, one token, turn 2 turn 1's prompt and its token, <see cref="CMaxNew"/> tokens
     /// (with speculation where on). Each turn's tokens, the contexts continued, the rings, and the rings the conversations'
-    /// last turns kept.</summary>
+    /// last turns kept. <paramref name="managed"/>: on a device whose room the model makes (<see cref="ManagesItsDevice"/>).</summary>
     private static async Task<(Dictionary<(int, int), int[]> Outputs, int Continued, int RingCount, Dictionary<int, float[][]> Rings)> ServeChat(
-        string target, string draft, bool speculate, (int Conversation, int Turn)[] order, Xunit.Abstractions.ITestOutputHelper output = null)
+        string target, string draft, bool speculate, (int Conversation, int Turn)[] order, bool managed = false,
+        Xunit.Abstractions.ITestOutputHelper output = null)
     {
         using var model = new Qwen35RuntimeModel(target, BackendType.Cpu, 1, null, 1, draft);
         model.HostMemorySpareForTests = () => null;   // the machine's other programs do not evict its conversations
+        if (managed) ManagesItsDevice(model);
         using var engine = new InferenceEngine(model, Config(speculate), NullLogger.Instance);
         var outputs = new Dictionary<(int, int), int[]>();
         var prompts = new Dictionary<(int, int), int[]>();
@@ -560,11 +607,13 @@ public sealed class DraftContextContinuationTests : IDisposable
         return (outputs, engine.ExecutorForTests.DraftContextsContinued);
     }
 
-    /// <summary>A conversation served alone, turn by turn; C's stream and the ring C kept.</summary>
+    /// <summary>A conversation served alone, turn by turn, on a device whose room the model makes; C's stream and the ring C
+    /// kept.</summary>
     private static async Task<(int[] Tokens, float[][] Ring)> ServeAndKeep(string target, string draft, int c, int[][] turns)
     {
         using var model = new Qwen35RuntimeModel(target, BackendType.Cpu, 1, null, 1, draft);
         model.HostMemorySpareForTests = () => null;   // the machine's other programs do not evict its conversations
+        ManagesItsDevice(model);
         using var engine = new InferenceEngine(model, Config(speculate: true), NullLogger.Instance);
         int[] tokens = null;
         for (int t = 0; t < 3; t++)
@@ -574,6 +623,15 @@ public sealed class DraftContextContinuationTests : IDisposable
         }
         Assert.Equal(2, engine.ExecutorForTests.DraftContextsContinued);
         return (tokens, KeptRing(model, $"c{c}t2"));
+    }
+
+    /// <summary>The model makes its device's room itself, as on one direct-CUDA device (StandardDecoderModel.EnsureDeviceRoom):
+    /// a stand-in device of 64 GB, all of it free. Only such a model gives kept rings back when short, so only it makes a
+    /// ring to keep a context beside the kept ones (RoomForDFlashRing).</summary>
+    private static void ManagesItsDevice(StandardDecoderModel model)
+    {
+        const long gb = 1L << 30;
+        model.DeviceRoomForTests = () => (64 * gb, 64 * gb);
     }
 
     /// <summary>The context rows (K, then V, per draft layer) of the ring kept for <paramref name="requestId"/>.</summary>

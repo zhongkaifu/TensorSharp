@@ -299,19 +299,19 @@ namespace TensorSharp.Models
             return Math.Max(RoomFree(use), free + ringBytes);
         }
 
-        /// <summary>A drafter ring made to keep a finished request's context takes only room a slot would leave (its headroom
-        /// and a prompt step's or recordings' room) on a device this model manages, or one ggml_cuda or Metal device; anywhere
-        /// else the pool's bound alone limits it.</summary>
+        /// <summary>
+        /// A drafter ring made to keep a finished request's context beside the kept ones: only on a device this model manages,
+        /// which gives kept rings back when it runs short (<see cref="EnsureDeviceRoom"/>, after the conversations), and only
+        /// within the room a slot would leave (its headroom and a prompt step's or recordings' room). Anywhere else nothing
+        /// gives a ring back (not the prefix cache's eviction, not a slot's admission on ggml_cuda or Metal), so a request takes
+        /// the context kept the longest ago instead: made beside them, every distinct conversation had kept a ring of its own,
+        /// up to the pool's nine (85 MB each for Qwen3.8-27B's DFlash2), for the life of the process.
+        /// </summary>
         private protected override bool RoomForDFlashRing(long bytes)
         {
-            if (DeviceRoomManaged)
-            {
-                var (free, total) = DeviceMemory();
-                return total <= 0 || free >= RoomNeed(bytes, total, RoomUse.Slot);
-            }
-            if (AdmitsSlotsByDeviceMemory && DeviceMemoryProbe() is { } memory)
-                return memory.Free >= bytes + DeviceHeadroom(memory.Total);
-            return true;
+            if (!DeviceRoomManaged) return false;
+            var (free, total) = DeviceMemory();
+            return total <= 0 || free >= RoomNeed(bytes, total, RoomUse.Slot);
         }
 
         /// <summary>Whether <paramref name="keep"/> holds <paramref name="slot"/> or a slot over its caches.</summary>

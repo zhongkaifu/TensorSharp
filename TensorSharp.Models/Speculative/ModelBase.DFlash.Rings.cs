@@ -21,10 +21,12 @@ namespace TensorSharp.Models
     /// take turns speculating overwrite each other's rows at colliding slots, and a
     /// batched verify that drafts for several sequences in one step cannot share it
     /// at all. Each request therefore binds a ring of its own: one no request holds and
-    /// that keeps no context (the model's own first), else a new pooled one, else the
-    /// context kept the longest ago, and only for a request that speculates, the least
-    /// recently used running request's. A ring a request takes anew restarts its valid
-    /// run: nothing another sequence wrote is read as context.
+    /// that keeps no context (the model's own first), else a new pooled one (beside kept
+    /// contexts only where the model gives kept rings back when short:
+    /// <see cref="RoomForDFlashRing"/>), else the context kept the longest ago, and only for
+    /// a request that speculates, the least recently used running request's. A ring a
+    /// request takes anew restarts its valid run: nothing another sequence wrote is read as
+    /// context.
     ///
     /// The context belongs to its sequence, not to the request that wrote it: a finished
     /// request's ring keeps its rows (<see cref="KeepDFlashRing"/>), and the runtime hands
@@ -326,7 +328,8 @@ namespace TensorSharp.Models
                     chosen = ring;
                     break;
                 }
-            // A new ring, while the pool may grow: beside the contexts finished requests keep, only where the device has room.
+            // A new ring, while the pool may grow: beside the contexts finished requests keep, only where the model gives kept
+            // rings back when short and the device has room (RoomForDFlashRing).
             if (chosen == null && (_dflashRingPool?.Count ?? 0) < MaxDFlashRequestRings
                 && (!AnyKeptDFlashRing() || RoomForDFlashRing(DFlashRingBytes)))
             {
@@ -390,9 +393,11 @@ namespace TensorSharp.Models
         /// state over a ring hears of it (StandardDecoderModel: a recording that failed for the last owner is tried again).</summary>
         private protected virtual void OnDFlashRingOwnerChanged(Tensor[] ringK) { }
 
-        /// <summary>Whether the device has room for <paramref name="bytes"/> of another ring beside what it keeps free: a ring is
-        /// made to keep a finished request's context only then (a model that manages its device says; elsewhere yes).</summary>
-        private protected virtual bool RoomForDFlashRing(long bytes) => true;
+        /// <summary>Whether another ring of <paramref name="bytes"/> may be made beside the contexts finished requests keep: only
+        /// where the model gives kept rings back when its device runs short (<see cref="ReleaseIdleDFlashRings"/>) and the device
+        /// has room for it (a model that manages its device says; elsewhere no: a request then takes the context kept the
+        /// longest ago, and the pool grows only with the requests that hold rings at once, as before contexts were kept).</summary>
+        private protected virtual bool RoomForDFlashRing(long bytes) => false;
 
         /// <summary>A pooled ring is given up: a model whose steps bind rings forgets those over it.</summary>
         private protected virtual void OnDFlashRingDisposing(Tensor[] ringK) { }
