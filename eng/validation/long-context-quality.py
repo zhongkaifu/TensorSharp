@@ -591,13 +591,18 @@ class Report:
         self.summary["gates_result"] = [{"gate": n, "result": s, "detail": d} for n, s, d in self.verdicts]
         return "\n".join(self.lines) + "\n"
 
+    def graded_records(self, arm):
+        """The arm's records this report grades: every record, or under --kinds those of the cases it kept (the header's counts
+        and the evidence never speak for a kind the report does not grade)."""
+        return [r for cid, r in arm["records"].items() if not self.kinds or cid in self.cases]
+
     def header(self):
         self.out("# Long-context quality: reference vs candidate")
         self.out()
         for role, arm in (("reference", self.ref), ("candidate", self.cand)):
             run = arm["runs"][-1] if arm["runs"] else {}
             kinds = {}
-            for r in arm["records"].values():
+            for r in self.graded_records(arm):
                 kinds.setdefault(r.get("status"), 0)
                 kinds[r.get("status")] += 1
             setting = next((a for a in run.get('arms', []) if a['name'] == arm['arm']), None)
@@ -811,14 +816,20 @@ class Report:
         self.out("## Arms' evidence")
         self.out()
         for role, arm in (("reference", self.ref), ("candidate", self.cand)):
-            recs = [r for r in arm["records"].values() if r.get("status") == "ok"]
+            graded = self.graded_records(arm)
+            recs = [r for r in graded if r.get("status") == "ok"]
             launches = sum(r.get("attn8_launches", 0) for r in recs)
             refusals = sum(r.get("attn8_band_refusals", 0) for r in recs)
             marked = sum(r.get("marked_prompt_attentions", 0) for r in recs)
-            skipped = [r for r in arm["records"].values() if r.get("status") != "ok"]
+            skipped = [r for r in graded if r.get("status") != "ok"]
             self.out(f"- {role}: 8-bit prompt-attention launches {launches}, band refusals {refusals}"
                      f"{' (those chunks ran the 16-bit kernel)' if refusals else ''}, marked prompt-chunk attentions {marked}; "
                      f"not ok: {len(skipped)}")
+            # A case whose band was refused ran partly on the 16-bit kernel: named, so its deltas are read as such.
+            for r in recs:
+                if r.get("attn8_band_refusals", 0):
+                    self.out(f"  - `{r['case']}`: {r['attn8_band_refusals']} band refusal(s) beside {r.get('attn8_launches', 0)} "
+                             "8-bit launch(es)")
             for r in skipped:
                 self.out(f"  - `{r['case']}`: {r.get('status')}: {r.get('reason') or r.get('error')}")
         self.out()

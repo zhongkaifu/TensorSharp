@@ -186,6 +186,30 @@ class ReportOnSyntheticRuns(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 tool.main(args + ["--kinds", "perplexity"])
 
+    def test_kinds_scope_the_evidence_and_name_each_refused_case(self):
+        # Under --kinds the header's record counts and the arms' evidence are the graded cases' alone: a band refusal of a ppl
+        # case is not evidence in a report over the served kinds (it read 608 refusals from ungraded 96K ppl cases into a
+        # continue-only report), and a report that grades it names the case.
+        with tempfile.TemporaryDirectory() as d:
+            run, cases = self.runs(d)
+            rows = [json.loads(line) for line in run.read_text().splitlines()]
+            for r in rows:
+                if r.get("type") == "record" and r["arm"] == "8bit" and r["kind"] == "ppl":
+                    r["attn8_band_refusals"] = 2
+            self.write(d, "run.jsonl", rows)
+            args = ["report", "--ref", f"{run}:f16", "--cand", f"{run}:8bit", "--cases", str(cases), "--gates", "t2-attn8"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(0, tool.main(args + ["--kinds", "greedy,retrieval,gsm8k"]))
+                self.assertEqual(0, tool.main(args + ["--kinds", "ppl"]))
+            served, ppl = out.getvalue().split("# Long-context quality")[1:]
+            self.assertIn("8-bit prompt-attention launches 0, band refusals 0,", served)
+            self.assertNotIn("ppl/prose/8k/w0", served)
+            self.assertEqual(2, served.count("records ok 3;"))
+            self.assertIn("band refusals 2 (those chunks ran the 16-bit kernel)", ppl)
+            self.assertIn("`ppl/prose/8k/w0`: 2 band refusal(s) beside 3 8-bit launch(es)", ppl)
+            self.assertEqual(2, ppl.count("records ok 1;"))
+
     def test_a_floor_arm_is_tabled_without_gates(self):
         with tempfile.TemporaryDirectory() as d:
             run, cases = self.runs(d, cand_nll_shift=0.01, greedy_cut=2)
