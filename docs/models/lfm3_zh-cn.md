@@ -12,7 +12,7 @@ Liquid AI 的 LFM3 检查点声明 `general.architecture = lfm3`：**LFM3-1.7B**
 | 模型类 | 共享解码运行时上的 `Lfm3RuntimeModel`（`TensorSharp.Models/Models/Lfm3/`） |
 | 聊天协议 | [`ChatProtocolRegistry`](../../TensorSharp.Runtime/ChatProtocolRegistry.cs) 中的 `lfm3`，后备渲染器 [`ChatTemplate.Lfm3.cs`](../../TensorSharp.Runtime/ChatTemplate.Lfm3.cs) |
 | 参考模板 | GGUF 的 `tokenizer.chat_template`（与 `LiquidAI/LFM3-1.7B` / `LFM3-Omni-2B` 的 `chat_template.jinja` 逐字节相同） |
-| 模态 | 1.7B：文本。Omni：图像、视频、音频输入（需投影器），文本输出 |
+| 模态 | 1.7B：文本。Omni：图像、视频、音频输入（需投影器），文本与语音输出（[语音输出](#语音输出)） |
 | 思考 | 1.7B：支持（`<think>`，默认值见[推理](#推理)）。Omni：不支持 |
 | 工具调用 | 支持：Qwen3-Coder XML（`<tool_call><function=…><parameter=…>`） |
 | 现成配置 | [`config/lfm3-1.7b.json`](../../config/lfm3-1.7b.json)、[`config/lfm3-1.7b-nvfp4.json`](../../config/lfm3-1.7b-nvfp4.json)、[`config/lfm3-omni-2b.json`](../../config/lfm3-omni-2b.json) |
@@ -28,11 +28,11 @@ LFM3-1.7B 在 2026-11-18 的状态（合并 think、线程池与 ggml_cpu 第二
 |---|---|---|---|
 | ggml_metal（M5 Pro） | teacher-forcing 相对 L2 中位数 3-4e-4，320 行中没有 top-1 差异（Q4_K_M、Q8_0、BF16）；GSM8K 相同（81.5%） | 提示 0.97-1.03 倍，解码 1.01-1.02 倍 | 2K token 以内首 token 与 llama-server 相差不超过 5%，16K-32K 时晚 3-5% |
 | MLX（M5 Pro） | Omni 图像与音频回复 19 例中 18 例逐 token 相同 | 512 token 提示 1.12 倍，解码 0.87 倍 | - |
-| ggml_cpu（M5 Pro） | 处于 CPU 路径的 8 位激活下限（为 llama.cpp 自身内核变体之间距离的 1.03-1.16 倍）；GSM8K 79.0% 对 81.0%（p = 0.50） | 解码 0.97-1.14 倍（BF16 3.9 倍），提示 0.95-1.00 倍（NVFP4 1.9-2.6 倍） | 单路：首 token 耗时 0.95 倍，解码 0.96 倍；4 路总吞吐为 llama-server 的 1.17 倍；对比 vLLM 的 CPU 后端（fp16）：首 token 耗时 0.30 倍，解码快 5.6 倍，4 路吞吐 3.5 倍 |
-| cpu，托管（M5 Pro） | 该下限的 1.17-1.37 倍；GSM8K 80.0%（p = 0.82） | 解码 0.78-0.95 倍（BF16 3.7 倍），提示 0.86-0.92 倍（NVFP4 1.6-2.2 倍） | 单路：解码 0.83 倍，首 token 持平；4 路 1.06 倍 |
-| ggml_cuda（A40；RTX PRO 4500） | 困惑度相差在 0.4%（A40）与 0.13%（sm_120）以内 | A40 0.99-1.17 倍；sm_120 0.92-1.00 倍（NVFP4 提示 0.86-0.90 倍） | A40、BF16：单个请求时快于 vLLM 与 SGLang（每 token 6.7 对 7.3 / 7.2 ms），4 个请求起落后（64 个时 51 对 11.0 ms）；Q4_K_M 在 1-16 个请求时领先 llama-server |
-| cuda，直连（A40；RTX PRO 4500） | 与 ggml_cuda 相同 | 提示 0.58-0.85 倍，解码 0.78-0.91 倍 | A40、BF16：单个请求每 token 7.0 ms（vLLM 7.3），4 个请求起落后（64 个时 68 对 11.0 ms） |
-| ggml_vulkan（A40；RTX PRO 4500） | 320 行中 0-1 个 top-1 差异 | A40：量化文件 0.80-0.96 倍，BF16 与 NVFP4 持平 | 未测量 |
+| ggml_cpu（M5 Pro） | 处于 CPU 路径的 8 位激活下限（为 llama.cpp 自身内核变体之间距离的 1.03-1.16 倍）；GSM8K 79.0% 对 81.0%（p = 0.50） | 解码 0.97-1.14 倍（BF16 3.9 倍），提示 0.95-1.00 倍（NVFP4 1.9-2.6 倍） | 单路：首 token 耗时 0.95 倍，解码 0.96 倍；4 路总吞吐为 llama-server 的 1.17 倍；对比 vLLM 的 CPU 后端（fp16）：首 token 耗时 0.30 倍，解码快 5.6 倍，4 路吞吐 3.5 倍（中位数；5 轮单路中有 2 轮慢了 8-10 倍，见[当前限制](#当前限制)） |
+| cpu，托管（M5 Pro） | 该下限的 1.17-1.37 倍；GSM8K 80.0%（p = 0.82） | 解码 0.78-0.95 倍（BF16 3.7 倍），提示 0.86-0.92 倍（NVFP4 1.6-2.2 倍，BF16 0.44 倍） | 单路：解码 0.83 倍，首 token 持平；4 路 1.06 倍 |
+| ggml_cuda（A40；RTX PRO 4500） | 困惑度相差在 0.4%（A40）与 0.13%（sm_120；NVFP4 的 W4A4 提示对 llama.cpp 的 W4A4 为 +0.4%）以内 | A40 0.99-1.17 倍（NVFP4 提示 0.89-0.91 倍）；sm_120 0.92-1.01 倍（NVFP4 提示 0.86-0.90 倍） | A40、BF16：单个请求时快于 vLLM 与 SGLang（每 token 6.7 对 7.3 / 7.2 ms），4 个请求起落后（64 个时 51 对 11.0 ms）；Q4_K_M 在 1-16 个请求时领先 llama-server |
+| cuda，直连（A40；RTX PRO 4500） | 与 ggml_cuda 相同（sm_120 上 NVFP4 的 W4A4 提示为 +0.7%） | 提示 0.58-0.95 倍，解码 0.78-0.95 倍；QAD-Q4_0 解码 0.56-0.61 倍（A40） | A40、BF16：单个请求每 token 7.0 ms（vLLM 7.3），4 个请求起落后（64 个时 68 对 11.0 ms） |
+| ggml_vulkan（A40；RTX PRO 4500） | A40：320 行中 0-1 个 top-1 差异；sm_120：NVFP4 困惑度 26.51，与 llama.cpp CUDA 的 q8 路径相同 | A40：量化文件 0.80-0.98 倍，BF16 0.92-1.01 倍，NVFP4 0.89-1.08 倍 | 未测量 |
 
 细节（llama.cpp 参考版本 `d3c3e242c`）：
 
@@ -145,7 +145,7 @@ LFM3-1.7B 在 2026-11-18 的状态（合并 think、线程池与 ggml_cpu 第二
   llama.cpp 为 4.2 倍；托管 CPU 的语音为 5.1 倍实时，llama-server 为 4.1 倍（首段音频 70 对 112 ms），其音频编码器耗时为
   llama.cpp 的 1.0-1.25 倍；BF16 提示为 llama.cpp Accelerate 构建的 1.03-1.26 倍（ggml_cpu）与 0.44 倍（托管）。与 vLLM 0.34 的 CPU 后端相比（fp16，带其 macOS short-conv 变通，18 线程；它在这里没有量化 CPU 路径；所有引擎使用同一客户端，
   均不施加重复惩罚，ISL 512 / OSL 128，`eng/lfm3/bench/vllm-cpu-mac.sh`）：单个请求时 ggml_cpu 在 Q4_K_M 上首 token 0.59 s 对
-  1.98 s，解码每 token 6.8 对 38.1 ms（5 轮中位数；llama-server 为 0.61 s 与 6.6 ms，托管 CPU 为 0.61 s 与 7.5 ms）；4 个并发时
+  1.98 s，解码每 token 6.8 对 38.1 ms（5 轮中位数，其中 2 轮慢了 8-10 倍：见[当前限制](#当前限制)；llama-server 为 0.61 s 与 6.6 ms，托管 CPU 为 0.61 s 与 7.5 ms）；4 个并发时
   输出 126 token/s，vLLM 为 36（llama-server 112，托管 CPU 114）。BF16 上 ggml_cpu 解码每 token 18.3 ms，vLLM 为 38.1 ms，但在
   这一测量批次中，所测的每个构建首 token 都要 2.1-6.0 s（见[当前限制](#当前限制)）。
   相关开关见[环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的-ggml-cpu-后端开关)。

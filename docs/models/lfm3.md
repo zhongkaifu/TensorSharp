@@ -14,7 +14,7 @@ GGUF's own template tells them apart.
 | Model class | `Lfm3RuntimeModel` on the shared decoder runtime (`TensorSharp.Models/Models/Lfm3/`) |
 | Chat protocol | `lfm3` in [`ChatProtocolRegistry`](../../TensorSharp.Runtime/ChatProtocolRegistry.cs), fallback renderer [`ChatTemplate.Lfm3.cs`](../../TensorSharp.Runtime/ChatTemplate.Lfm3.cs) |
 | Reference template | the GGUF `tokenizer.chat_template` (byte-identical to `LiquidAI/LFM3-1.7B` / `LFM3-Omni-2B` `chat_template.jinja`) |
-| Modalities | 1.7B: text. Omni: image, video and audio in (with the projector); text out |
+| Modalities | 1.7B: text. Omni: image, video and audio in (with the projector); text and speech out ([Speech output](#speech-output)) |
 | Thinking | 1.7B: yes (`<think>`; see [the default](#reasoning)). Omni: no |
 | Tool calling | Yes: Qwen3-Coder XML (`<tool_call><function=…><parameter=…>`) |
 | Ready-made configs | [`config/lfm3-1.7b.json`](../../config/lfm3-1.7b.json), [`config/lfm3-1.7b-nvfp4.json`](../../config/lfm3-1.7b-nvfp4.json), [`config/lfm3-omni-2b.json`](../../config/lfm3-omni-2b.json) |
@@ -31,11 +31,11 @@ items below and under [Benchmarking](#benchmarking)):
 |---|---|---|---|
 | ggml_metal (M5 Pro) | teacher-forced median relative L2 3-4e-4, no top-1 difference in 320 rows (Q4_K_M, Q8_0, BF16); GSM8K equal (81.5%) | prompts 0.97-1.03x, decode 1.01-1.02x | first token within 5% of llama-server's up to 2K tokens, 3-5% later at 16K-32K |
 | MLX (M5 Pro) | Omni image and audio replies token-identical in 18 of 19 cases | prompts 1.12x at 512 tokens, decode 0.87x | - |
-| ggml_cpu (M5 Pro) | at the CPU lanes' 8-bit-activation floor (1.03-1.16x llama.cpp's own kernel variants' distance); GSM8K 79.0% against 81.0% (p = 0.50) | decode 0.97-1.14x (BF16 3.9x), prompts 0.95-1.00x (NVFP4 1.9-2.6x) | one stream: first token 0.95x the time, decode 0.96x; four streams 1.17x llama-server's aggregate; against vLLM's CPU backend (fp16): first token 0.30x the time, decode 5.6x, four streams 3.5x |
-| cpu, managed (M5 Pro) | 1.17-1.37x that floor; GSM8K 80.0% (p = 0.82) | decode 0.78-0.95x (BF16 3.7x), prompts 0.86-0.92x (NVFP4 1.6-2.2x) | one stream: decode 0.83x, first token at parity; four streams 1.06x |
-| ggml_cuda (A40; RTX PRO 4500) | perplexity within 0.4% (A40) and 0.13% (sm_120) | A40 0.99-1.17x; sm_120 0.92-1.00x (NVFP4 prompts 0.86-0.90x) | A40, BF16: faster than vLLM and SGLang at one request (6.7 against 7.3 / 7.2 ms a token), behind from 4 requests (51 against 11.0 ms at 64); Q4_K_M ahead of llama-server at 1-16 requests |
-| cuda, direct (A40; RTX PRO 4500) | as ggml_cuda | prompts 0.58-0.85x, decode 0.78-0.91x | A40, BF16: one request 7.0 ms a token (vLLM 7.3), behind from 4 requests (68 against 11.0 ms at 64) |
-| ggml_vulkan (A40; RTX PRO 4500) | 0-1 top-1 differences in 320 rows | A40: 0.80-0.96x on the quantized files, BF16 and NVFP4 at parity | not measured |
+| ggml_cpu (M5 Pro) | at the CPU lanes' 8-bit-activation floor (1.03-1.16x llama.cpp's own kernel variants' distance); GSM8K 79.0% against 81.0% (p = 0.50) | decode 0.97-1.14x (BF16 3.9x), prompts 0.95-1.00x (NVFP4 1.9-2.6x) | one stream: first token 0.95x the time, decode 0.96x; four streams 1.17x llama-server's aggregate; against vLLM's CPU backend (fp16): first token 0.30x the time, decode 5.6x, four streams 3.5x (medians; 2 of the 5 one-stream rounds ran 8-10x slower, see [Current limits](#current-limits)) |
+| cpu, managed (M5 Pro) | 1.17-1.37x that floor; GSM8K 80.0% (p = 0.82) | decode 0.78-0.95x (BF16 3.7x), prompts 0.86-0.92x (NVFP4 1.6-2.2x, BF16 0.44x) | one stream: decode 0.83x, first token at parity; four streams 1.06x |
+| ggml_cuda (A40; RTX PRO 4500) | perplexity within 0.4% (A40) and 0.13% (sm_120; NVFP4's W4A4 prompts +0.4% against llama.cpp's W4A4) | A40 0.99-1.17x (NVFP4 prompts 0.89-0.91x); sm_120 0.92-1.01x (NVFP4 prompts 0.86-0.90x) | A40, BF16: faster than vLLM and SGLang at one request (6.7 against 7.3 / 7.2 ms a token), behind from 4 requests (51 against 11.0 ms at 64); Q4_K_M ahead of llama-server at 1-16 requests |
+| cuda, direct (A40; RTX PRO 4500) | as ggml_cuda (NVFP4's W4A4 prompts +0.7% on sm_120) | prompts 0.58-0.95x, decode 0.78-0.95x; QAD-Q4_0 decode 0.56-0.61x (A40) | A40, BF16: one request 7.0 ms a token (vLLM 7.3), behind from 4 requests (68 against 11.0 ms at 64) |
+| ggml_vulkan (A40; RTX PRO 4500) | A40: 0-1 top-1 differences in 320 rows; sm_120: NVFP4 perplexity 26.51, as llama.cpp CUDA's q8 route | A40: 0.80-0.98x on the quantized files, BF16 0.92-1.01x, NVFP4 0.89-1.08x | not measured |
 
 Details (llama.cpp reference `d3c3e242c`):
 
@@ -212,7 +212,7 @@ Details (llama.cpp reference `d3c3e242c`):
   workaround, 18 threads; it has no quantized CPU path here) with one client for every engine and no
   repetition penalty anywhere (ISL 512 / OSL 128, `eng/lfm3/bench/vllm-cpu-mac.sh`): one request at a time
   ggml_cpu on Q4_K_M answers in 0.59 s against 1.98 s and decodes at 6.8 against 38.1 ms a token (median of
-  5 rounds; llama-server 0.61 s and 6.6 ms, the managed CPU 0.61 s and 7.5 ms), and four at a time it
+  5 rounds, 2 of which ran 8-10x slower: see [Current limits](#current-limits); llama-server 0.61 s and 6.6 ms, the managed CPU 0.61 s and 7.5 ms), and four at a time it
   delivers 126 tokens/s against vLLM's 36 (llama-server 112, the managed CPU 114). On BF16 ggml_cpu decodes
   at 18.3 ms a token against vLLM's 38.1, but its first token took 2.1-6.0 s this session on every build
   tested (see [Current limits](#current-limits)). The knobs

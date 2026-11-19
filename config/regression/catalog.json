@@ -605,7 +605,7 @@
         "audio"
       ],
       "layout": "dense",
-      "notes": "Liquid LFM3 (1.7B) and LFM3-Omni (2B) share general.architecture lfm3: 13 short-conv + 11 GQA attention layers (5 sliding-window). The text decoder runs on the shared runtime (sliding-window attention, head-wise gates, sandwich norms, short convolutions) and matches llama.cpp; the chat protocol (GGUF template, reasoning, Qwen3-Coder XML tools, Omni media placeholders) matches llama.cpp's renders. Image/video/audio in and speech out need the Omni projector. ggml_cuda, direct CUDA and ggml_vulkan were checked against llama.cpp on an NVIDIA A40; the NVFP4 config's FP4 tensor-core route (Blackwell) has not run.",
+      "notes": "Liquid LFM3 (1.7B) and LFM3-Omni (2B) share general.architecture lfm3: 13 short-conv + 11 GQA attention layers (5 sliding-window). The text decoder runs on the shared runtime (sliding-window attention, head-wise gates, sandwich norms, short convolutions) and matches llama.cpp; the chat protocol (GGUF template, reasoning, Qwen3-Coder XML tools, Omni media placeholders) matches llama.cpp's renders. Image/video/audio in and speech out need the Omni projector. ggml_cuda, direct CUDA and ggml_vulkan were checked against llama.cpp on an NVIDIA A40; the NVFP4 config's FP4 tensor-core route (Blackwell) ran on an RTX PRO 4500 (sm_120).",
       "source_evidence": [
         "TensorSharp.Models/Models/Lfm3/Lfm3Architecture.cs",
         "TensorSharp.Models/Models/Lfm3/Lfm3RuntimeModel.cs",

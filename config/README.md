@@ -296,7 +296,7 @@ TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 | [`gemma-4-26b-a4b.json`](gemma-4-26b-a4b.json) | Gemma-4 26B-A4B (MoE) + vision + MTP draft | Multimodal MoE LLM |
 | [`gpt-oss-20b.json`](gpt-oss-20b.json) | gpt-oss-20b (Q8_0) | Text reasoning LLM |
 | [`lfm3-1.7b.json`](lfm3-1.7b.json) | Liquid LFM3-1.7B (Q4_K_M) | Text LLM with reasoning and tool calls, the model card's sampling; pass `--think` for the card's default reasoning mode ([model card](../docs/models/lfm3.md)) |
-| [`lfm3-1.7b-nvfp4.json`](lfm3-1.7b-nvfp4.json) | Liquid LFM3-1.7B (NVFP4 FFN weights) | Text LLM for NVIDIA Blackwell (`cuda`); not yet run on a GPU |
+| [`lfm3-1.7b-nvfp4.json`](lfm3-1.7b-nvfp4.json) | Liquid LFM3-1.7B (NVFP4 FFN weights) | Text LLM for NVIDIA Blackwell (`cuda`); its FP4 tensor-core route ran on an RTX PRO 4500 (sm_120) |
 | [`lfm3-omni-2b.json`](lfm3-omni-2b.json) | Liquid LFM3-Omni-2B (Q4_K_M) + projector (Q8_0) | Multimodal LLM: image, video and audio in, text out; greedy |
 | [`jev-diffusiongemma-q4.json`](jev-diffusiongemma-q4.json) | DiffusionGemma 26B-A4B (Q4_K_M) + vision | [Jev typed decisions](../docs/models/jev.md) over text, images, documents, sampled video and configured ASR transcripts, native `/v1/systemone` server |
 | [`diffusiongemma-26b-a4b-q4.json`](diffusiongemma-26b-a4b-q4.json) | DiffusionGemma 26B-A4B (Q4_K_M) | Text diffusion + image input (CLI/server); auto-downloads the vision shard |
