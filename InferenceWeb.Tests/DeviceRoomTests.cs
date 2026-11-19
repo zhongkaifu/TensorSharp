@@ -14,9 +14,11 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 using InferenceWeb.Tests.PrefixCache.Fakes;
 using TensorSharp;
+using TensorSharp.Cuda.Interop;
 using TensorSharp.Models;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
+using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
@@ -419,14 +421,54 @@ public sealed class DeviceFillingCollection
 [Collection(DeviceFillingCollection.Name)]
 public sealed class DeviceRoomReclaimerCudaTests : IDisposable
 {
+    private const long MiB = 1L << 20;
+    private const int OutOfMemory = 2;   // CUDA_ERROR_OUT_OF_MEMORY
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-device-room-cuda-" + Guid.NewGuid().ToString("N"));
     private readonly int[] _prompt = Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray();
+    private readonly ITestOutputHelper _output;
 
-    public DeviceRoomReclaimerCudaTests() => Directory.CreateDirectory(_dir);
+    public DeviceRoomReclaimerCudaTests(ITestOutputHelper output)
+    {
+        _output = output;
+        Directory.CreateDirectory(_dir);
+    }
 
     public void Dispose()
     {
         try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+    }
+
+    /// <summary>One device block straight from the driver (outside the allocator's pool and its ladder), or zero when the driver
+    /// refuses it for want of memory.</summary>
+    private static IntPtr TryTake(TensorSharp.Cuda.CudaAllocator cuda, long bytes)
+    {
+        cuda.Context.MakeCurrent();
+        int rc = CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)bytes));
+        if (rc == OutOfMemory) return IntPtr.Zero;
+        rc.ThrowOnError();
+        return ptr;
+    }
+
+    private static void Give(TensorSharp.Cuda.CudaAllocator cuda, IntPtr ptr)
+    {
+        cuda.Context.MakeCurrent();
+        CudaDriverApi.cuMemFree(ptr);
+    }
+
+    /// <summary>Take blocks from the driver until it refuses one of 1 MiB: 256 MiB ones until it refuses those, then halves; again
+    /// while a pass still took something (room a refusal let go is taken too). The bytes taken.</summary>
+    private static long FillDevice(TensorSharp.Cuda.CudaAllocator cuda, List<IntPtr> blocks)
+    {
+        long taken = 0, pass = 1;
+        for (int passes = 0; pass > 0 && passes < 4; passes++)
+        {
+            pass = 0;
+            for (long piece = 256 * MiB; piece >= MiB; piece /= 2)
+                for (IntPtr ptr; (ptr = TryTake(cuda, piece)) != IntPtr.Zero; pass += piece)
+                    blocks.Add(ptr);
+            taken += pass;
+        }
+        return taken;
     }
 
     private void Prompt(Qwen35RuntimeModel model, string id)
@@ -475,20 +517,33 @@ public sealed class DeviceRoomReclaimerCudaTests : IDisposable
         var cuda = (TensorSharp.Cuda.CudaAllocator)model.Mesh.Allocator(0, 0);
         Assert.Contains(cuda.RegisteredReclaimers, r => r.GetType().Name == "DeviceRoomReclaimer");
         cuda.TrimPool();
-        var ballast = new List<Tensor>();
+        var ballast = new List<IntPtr>();
+        IntPtr margin = IntPtr.Zero;
         try
         {
-            // Fill the device to within 16 MiB of full, in 256 MiB pieces and then smaller ones, with the reclaimer away (a
-            // piece that found no room must not release the conversations).
+            // Fill the device with the reclaimer away (a block that found no room must not release the conversations), by the
+            // driver's own allocations until it refuses 1 MiB, and give back a 16 MiB margin taken first: the room left is the
+            // margin and less than 1 MiB. Not to a cuMemGetInfo reading: once other tests had run in the process, the driver
+            // handed out tens of MiB more than its free reading showed (a 48 MiB cuMemAlloc succeeded with 16 MiB read free), so
+            // a fill to that reading left the request room and no rung ran.
             model.DetachPrefixCache();
             Assert.DoesNotContain(cuda.RegisteredReclaimers, r => r.GetType().Name == "DeviceRoomReclaimer");
-            for (long piece = 256L << 20; piece >= 1L << 20; piece /= 2)
-                while (cuda.GetMemoryInfo().freeBytes > piece + (16L << 20))
-                    ballast.Add(new Tensor(cuda, DType.UInt8, piece));
+            long readFree = cuda.GetMemoryInfo().freeBytes;
+            margin = TryTake(cuda, 16 * MiB);
+            Assert.NotEqual(IntPtr.Zero, margin);
+            long filled = FillDevice(cuda, ballast);
+            long readFull = cuda.GetMemoryInfo().freeBytes;
+            Give(cuda, margin);
+            margin = IntPtr.Zero;
+            _output.WriteLine($"cuMemGetInfo read {readFree / MiB} MiB free; the driver then handed out {16 + filled / MiB} MiB, "
+                + $"and read {readFull / MiB} MiB free once it refused 1 MiB");
+            long asked = 48 * MiB;   // past the room left and the pool's cache (trimmed), within what the conversations hold
+            IntPtr room = TryTake(cuda, asked);
+            if (room != IntPtr.Zero) Give(cuda, room);
+            Assert.True(room == IntPtr.Zero, "the filled device still had room for the allocation");
             model.AttachPrefixCache(sink);
             Assert.Equal(keys, model.RetainedPayloadKeys.OrderBy(k => k, StringComparer.Ordinal));
             TensorSharp.Cuda.CudaAllocatorStats before = cuda.GetStats();
-            long asked = 48L << 20;   // past the free memory and the pool's cache, within what the conversations hold
             using (var tensor = new Tensor(cuda, DType.UInt8, asked))
             {
                 TensorSharp.Cuda.CudaAllocatorStats after = cuda.GetStats();
@@ -501,7 +556,8 @@ public sealed class DeviceRoomReclaimerCudaTests : IDisposable
         }
         finally
         {
-            foreach (Tensor t in ballast) t.Dispose();
+            if (margin != IntPtr.Zero) Give(cuda, margin);
+            foreach (IntPtr ptr in ballast) Give(cuda, ptr);
         }
         Continue(model, "run");
     }
