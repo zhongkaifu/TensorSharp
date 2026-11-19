@@ -64,6 +64,10 @@ namespace TensorSharp.Models.Graph
         /// <summary>Mix a value that shapes the program but no leaf or op carries into its signature.</summary>
         public void Mix(long value) => _b.Mix(value);
 
+        /// <summary>The builder the trace records on, for helpers that emit onto a builder (the diffusion-transformer
+        /// regions, <see cref="GraphDitRegions"/>); what they record is part of this trace.</summary>
+        public GraphProgramBuilder Builder => _b;
+
         // ---- ops
 
         public int Op(GraphOp op, int a) => Op(op, stackalloc[] { a });
@@ -152,6 +156,17 @@ namespace TensorSharp.Models.Graph
         {
             int node = Leaf(GraphLeafRole.Input, GraphFormat.I32, stackalloc long[] { count }, IntPtr.Zero, 0);
             RecordInput(node, Pin(values), count * sizeof(int), null, values);
+            return node;
+        }
+
+        /// <summary>I32 values [<paramref name="ne0"/>, <paramref name="ne1"/>] read from <paramref name="values"/> every run (a
+        /// segment table: <see cref="GraphDitRegions.SegmentTable"/>).</summary>
+        public int InputI32(int[] values, long ne0, long ne1)
+        {
+            ArgumentNullException.ThrowIfNull(values);
+            if (values.LongLength != ne0 * ne1) throw new ArgumentException($"[{ne0}, {ne1}] I32 values need {ne0 * ne1} ints, not {values.LongLength}");
+            int node = Leaf(GraphLeafRole.Input, GraphFormat.I32, stackalloc long[] { ne0, ne1 }, IntPtr.Zero, 0);
+            RecordInput(node, Pin(values), values.LongLength * sizeof(int), null, values);
             return node;
         }
 

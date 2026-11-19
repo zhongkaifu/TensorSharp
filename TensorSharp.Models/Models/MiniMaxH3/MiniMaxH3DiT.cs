@@ -71,6 +71,10 @@ namespace TensorSharp.Models.MiniMaxH3
 
         public MiniMaxH3Config Config { get; }
 
+        /// <summary>The file mapping the weights are bound from (a diffusion-runtime denoiser over the same mapping shares
+        /// their device copies: MiniMaxH3ImageDenoiser's test seam).</summary>
+        internal MiniMaxH3WeightFile WeightFile => _weights;
+
         public MiniMaxH3DiT(string ggufPath) : this(ggufPath, BackendType.GgmlCuda, null) { }
 
         /// <param name="ggufPath">The denoiser: a GGUF, or for MiniMax-H3-Image also the

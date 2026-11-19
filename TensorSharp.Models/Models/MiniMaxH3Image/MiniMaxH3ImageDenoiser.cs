@@ -1,0 +1,550 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// MiniMax-H3-Image's denoiser on the diffusion runtime: one step is one GraphProgram (the token refiner, the 50 blocks
+// and the final layer with the step's PDD head), emitted through GraphEmitter with the diffusion-transformer regions and
+// run by the backend's graph executor. The program is the graph TSGgml_MiniMaxH3DitForward builds, node for node, so a
+// backend that lowers it as the native graph does computes the same velocity bit for bit (see the emission below).
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Threading;
+using TensorSharp.Cpu;
+using TensorSharp.GGML;
+using TensorSharp.Graph;
+using TensorSharp.Models.Graph;
+using TensorSharp.Models.MiniMaxH3;
+using TensorSharp.Models.SharedDiffusion;
+using TensorSharp.Runtime;
+
+namespace TensorSharp.Models.MiniMaxH3Image
+{
+    /// <summary>
+    /// The MiniMax-H3-Image DiT as an <see cref="IDenoiser"/>. Making one maps the file and reads its small tensors on the
+    /// host; its first step makes the weights resident (<see cref="Preload"/>, MiniMax-H3's uploader on the GGML backends)
+    /// and compiles the step's program, which every later step of the same geometry replays with new inputs.
+    /// </summary>
+    public sealed class MiniMaxH3ImageDenoiser : IDenoiser
+    {
+        /// <summary>MiniMax-H3's q8_1 overflow guard around a product of a block-quantized weight (h3_mm's kH3MmScale).</summary>
+        internal const float GuardScale = 1024f;
+
+        private readonly MiniMaxH3ImageWeights _w;
+        private readonly IGraphExecutor _executor;
+        private readonly IAllocator _tensorAllocator;   // tensor executors bind weights as objects: their F32 vectors live here
+        private readonly Dictionary<MiniMaxH3ImageWeight, Tensor> _tensors = new();
+        private readonly object _gate = new();
+        private readonly Dictionary<(int, int), (float[] Weight, float[] Bias)> _heads = new();
+        private float[] _headGrid;
+        private (float[] Positions, float[] Cos, float[] Sin) _rope;
+        private IGraphPlan _plan;
+        private (ulong, ulong) _planSignature;
+        private bool _preloaded;
+        private bool _disposed;
+
+        /// <summary>The denoiser in <paramref name="path"/> (a GGUF, or the safetensors release in its original names) on
+        /// <paramref name="backend"/>: a GGML backend (its graph executor) or <see cref="BackendType.Cpu"/> (the managed
+        /// executor).</summary>
+        public MiniMaxH3ImageDenoiser(string path, BackendType backend)
+            : this(new MiniMaxH3WeightFile(path ?? throw new ArgumentNullException(nameof(path))), ownsFile: true, backend, null, null)
+        {
+        }
+
+        /// <param name="executor">The executor the steps run on; null resolves it from <paramref name="backend"/>.</param>
+        /// <param name="tensorAllocator">Where a tensor executor's F32 vectors live (null: the managed CPU's).</param>
+        internal MiniMaxH3ImageDenoiser(MiniMaxH3WeightFile file, bool ownsFile, BackendType backend, IGraphExecutor executor,
+            IAllocator tensorAllocator)
+        {
+            try
+            {
+                Backend = backend;
+                _w = new MiniMaxH3ImageWeights(file, ownsFile, backend);
+            }
+            catch
+            {
+                if (ownsFile) file?.Dispose();
+                throw;
+            }
+            try
+            {
+                (_executor, _tensorAllocator) = executor != null
+                    ? (executor, executor.Capabilities.BindsHostPointers ? null : tensorAllocator ?? throw new ArgumentNullException(nameof(tensorAllocator)))
+                    : Resolve(backend);
+            }
+            catch
+            {
+                _w.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>A denoiser over <paramref name="legacy"/>'s file mapping (a test seam: the two bind the same host bytes,
+        /// so they share every weight's device copy and a comparison holds the weights once).</summary>
+        internal static MiniMaxH3ImageDenoiser SharingLegacyWeights(MiniMaxH3DiT legacy, BackendType backend)
+        {
+            ArgumentNullException.ThrowIfNull(legacy);
+            return new MiniMaxH3ImageDenoiser(legacy.WeightFile, ownsFile: false, backend, null, null);
+        }
+
+        private static (IGraphExecutor, IAllocator) Resolve(BackendType backend) => backend switch
+        {
+            BackendType.GgmlCuda => (GgmlGraphExecutor.For(GgmlBackendType.Cuda), null),
+            BackendType.GgmlMetal => (GgmlGraphExecutor.For(GgmlBackendType.Metal), null),
+            BackendType.GgmlCpu => (GgmlGraphExecutor.For(GgmlBackendType.Cpu), null),
+            BackendType.Cpu => ManagedExecutor(),
+            _ => throw new NotSupportedException(
+                $"MiniMax-H3-Image's denoiser runs on ggml_cuda, ggml_metal, ggml_cpu or the managed cpu backend, not {backend}."),
+        };
+
+        private static (IGraphExecutor, IAllocator) ManagedExecutor()
+        {
+            var allocator = new CpuAllocator(BlasEnum.DotNet);
+            return (new ManagedGraphExecutor(allocator), allocator);
+        }
+
+        public BackendType Backend { get; }
+
+        public MiniMaxH3Config Config => _w.Config;
+
+        /// <summary>The executor the steps run on.</summary>
+        internal IGraphExecutor Executor => _executor;
+
+        /// <summary>The plan the last step ran (a test seam: its served and lowered regions).</summary>
+        internal IGraphPlan LastPlan => _plan;
+
+        /// <summary>Steps that compiled their program (the rest replayed the cached plan).</summary>
+        internal int Compiles { get; private set; }
+
+        public DenoiserCaps Caps { get; } = new();
+
+        public long WeightBytes => _w.Bytes;
+
+        /// <summary>The step's activations at <paramref name="workload"/>: an estimate of the compute buffer's high water (the
+        /// fc1 product and its SwiGLU live with the residual, the qkv product, K and V at F16 and the attention output),
+        /// not a measurement.</summary>
+        public long WorkingBytes(DiffusionWorkload workload)
+        {
+            MiniMaxH3Config c = _w.Config;
+            long rows = (long)(workload.Target.Height / 2) * (workload.Target.Width / 2);
+            if (workload.References != null)
+                foreach (LatentShape r in workload.References) rows += (long)(r.Height / 2) * (r.Width / 2);
+            rows += Math.Max(1, (workload.Prompt?.Length ?? 0) / 3);   // about three characters a token; small beside the image
+            long perRow = 4L * (3L * c.FfnHiddenSize + 3L * c.AttentionInnerDim + 4L * c.HiddenSize) + 2L * 2 * c.AttentionInnerDim;
+            return rows * perRow;
+        }
+
+        /// <summary>Make the weights resident now (MiniMax-H3's uploader on the GGML backends: direct reads from the file
+        /// where the device allows, else parallel copies out of the mapping); the first step does it otherwise. Returns how
+        /// many weights were copied.</summary>
+        public int Preload()
+        {
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                return PreloadLocked();
+            }
+        }
+
+        private int PreloadLocked()
+        {
+            if (_preloaded) return 0;
+            int copied = _executor.Capabilities.BindsHostPointers
+                ? _executor.Preload(new List<IGraphWeight>(_w.All), "minimax-h3-image/denoiser")
+                : 0;
+            _preloaded = true;
+            return copied;
+        }
+
+        public StepOutput Step(DenoiseStepInputs inputs, AdapterSet adapters, CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(inputs);
+            if (adapters is { IsEmpty: false })
+                throw new NotSupportedException("MiniMax-H3-Image's denoiser takes no LoRA adapters yet.");
+            cancellationToken.ThrowIfCancellationRequested();
+            var layout = inputs.Layout.FamilyLayout as MiniMaxH3PackedLayout
+                ?? throw new ArgumentException("the layout was not packed by MiniMax-H3-Image's family", nameof(inputs));
+            ConditioningSet text = inputs.Conditioning;
+            float[] references = null;
+            int referenceRows = 0;
+            if (inputs.References is { Count: > 0 })
+            {
+                long values = 0;
+                foreach (LatentRef r in inputs.References) values += r.Rows.LongLength;
+                references = new float[values];
+                long at = 0;
+                foreach (LatentRef r in inputs.References)
+                {
+                    Array.Copy(r.Rows, 0, references, at, r.Rows.LongLength);
+                    at += r.Rows.LongLength;
+                }
+                referenceRows = checked((int)(values / _w.Config.VideoPatchDim));
+            }
+            int imageRows = checked((int)(inputs.Latent.LongLength / _w.Config.VideoPatchDim));
+            float[] velocity = Forward(inputs.Latent, imageRows, text.Hidden, text.Rows, layout, inputs.Recipe.Grid,
+                inputs.Step.HeadStart, inputs.Step.HeadStop, references, referenceRows);
+            return new StepOutput(velocity);
+        }
+
+        /// <summary>
+        /// One step, as <see cref="MiniMaxH3DiT"/>'s ForwardImage takes it: [text | references | target] through the trunk,
+        /// the target's velocity out of the PDD head for grid intervals [<paramref name="headStart"/>,
+        /// <paramref name="headStop"/>), negated so that <c>x += v * (next - sigma)</c> is the Euler step. The result is the
+        /// plan's output buffer, valid until the next step.
+        /// </summary>
+        internal float[] Forward(float[] imageTokens, int imageCount, float[] textHidden, int textCount, MiniMaxH3PackedLayout layout,
+            float[] grid, int headStart, int headStop, float[] referenceTokens = null, int referenceCount = 0)
+        {
+            ArgumentNullException.ThrowIfNull(imageTokens);
+            ArgumentNullException.ThrowIfNull(layout);
+            ArgumentNullException.ThrowIfNull(grid);
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                MiniMaxH3Config c = _w.Config;
+                if ((long)imageCount * c.VideoPatchDim != imageTokens.LongLength)
+                    throw new ArgumentException($"{imageCount} image tokens hold {(long)imageCount * c.VideoPatchDim} values, not {imageTokens.LongLength}.");
+                if (referenceCount > 0 && (referenceTokens is null || referenceTokens.LongLength != (long)referenceCount * c.VideoPatchDim))
+                    throw new ArgumentException("the reference tokens do not hold referenceCount patches.");
+                if (textCount > 0 && (textHidden is null || textHidden.LongLength != (long)textCount * c.TextDim))
+                    throw new ArgumentException($"{textCount} text rows of {c.TextDim} need {(long)textCount * c.TextDim} values.");
+                if (layout.VideoSpan.End - layout.VideoSpan.Start != imageCount || layout.TokenCount != textCount + referenceCount + imageCount)
+                    throw new ArgumentException("the layout does not pack these text, reference and image rows.");
+
+                var step = new StepValues
+                {
+                    Video = referenceCount > 0 ? Concat(referenceTokens, imageTokens) : imageTokens,
+                    ImageCount = imageCount,
+                    ReferenceCount = referenceCount,
+                    Text = textCount > 0 ? textHidden : null,
+                    TextCount = textCount,
+                    Layout = layout,
+                    Segments = Segments(layout),
+                    TimeEmbed = TimeEmbedding(layout.Timesteps),
+                    Head = Head(grid, headStart, headStop),
+                };
+                (step.Cos, step.Sin) = Rope(layout.Positions);
+                PreloadLocked();
+
+                // The program's signature first (a hash-only trace, whose inputs this step runs with); a geometry the cached
+                // plan was not compiled for records the program and compiles it, after the old plan's memory is released.
+                using (var trace = new GraphEmitter(_executor, record: false))
+                {
+                    Emit(trace, step);
+                    if (_plan == null || _planSignature != trace.Signature)
+                    {
+                        _plan?.Dispose();
+                        _plan = null;
+                        using var recorded = new GraphEmitter(_executor, record: true);
+                        Emit(recorded, step);
+                        _plan = recorded.Compile(replayable: true);
+                        _planSignature = recorded.Signature;
+                        Compiles++;
+                    }
+                    if (!trace.Run(_plan))
+                        throw new InvalidOperationException("MiniMax-H3-Image denoiser step failed: " + _plan.LastError);
+                }
+                return _plan.Outputs[0];
+            }
+        }
+
+        private static float[] Concat(float[] a, float[] b)
+        {
+            var r = new float[a.LongLength + b.LongLength];
+            Array.Copy(a, r, a.LongLength);
+            Array.Copy(b, 0, r, a.LongLength, b.LongLength);
+            return r;
+        }
+
+        // ---- the step's host values
+
+        /// <summary>The layout's modulation spans as the regions' segments: a row timestep * 3 + modality maps to column
+        /// base timestep * 18 + modality * 6 of the block projection viewed as [hidden, 18 * timesteps] (ForwardImage's).</summary>
+        private static GraphSegment[] Segments(MiniMaxH3PackedLayout layout)
+        {
+            var segments = new GraphSegment[layout.ModulationSpans.Count];
+            for (int i = 0; i < segments.Length; i++)
+            {
+                MiniMaxH3ModulationSpan span = layout.ModulationSpans[i];
+                int ts = span.Row / MiniMaxH3Modality.Count, modality = span.Row % MiniMaxH3Modality.Count;
+                segments[i] = new GraphSegment(span.Start, span.End,
+                    ts * (MiniMaxH3Modality.VectorsPerRow * MiniMaxH3Modality.Count) + modality * MiniMaxH3Modality.VectorsPerRow);
+            }
+            return segments;
+        }
+
+        /// <summary>The AdaLN curve table interpolated at each timestep (MiniMaxH3DiT.TimeEmbedding).</summary>
+        internal float[] TimeEmbedding(IReadOnlyList<float> timesteps)
+        {
+            int dim = _w.Config.TimeEmbedDim, grid = _w.Config.AdaLnCurveGrid;
+            float[] table = _w.CurveTable;
+            var outp = new float[(long)dim * timesteps.Count];
+            for (int t = 0; t < timesteps.Count; t++)
+            {
+                var (lo, hi, frac) = MiniMaxH3Layout.CurveIndex(timesteps[t], grid);
+                long dst = (long)t * dim;
+                for (int c = 0; c < dim; c++)
+                {
+                    float a = table[(long)lo * dim + c];
+                    float b = table[(long)hi * dim + c];
+                    outp[dst + c] = a + (b - a) * frac;
+                }
+            }
+            return outp;
+        }
+
+        /// <summary>The 3-axis partial-RoPE tables of the layout's float positions (MiniMaxH3DiT.BuildRope), kept for the
+        /// request: the positions are the same every step.</summary>
+        internal (float[] Cos, float[] Sin) Rope(float[] positions)
+        {
+            ArgumentNullException.ThrowIfNull(positions);
+            if (_rope.Positions != null && MemoryMarshal.AsBytes(positions.AsSpan()).SequenceEqual(MemoryMarshal.AsBytes(_rope.Positions.AsSpan())))
+                return (_rope.Cos, _rope.Sin);
+            int nf = _w.Config.RopeInvFreqLength;
+            int rot = _w.Config.RopeRotaryDim;
+            int half = rot / 2;
+            int tokens = positions.Length / 3;
+            float[] invFreq = _w.InvFreq;
+            var cos = new float[(long)rot * tokens];
+            var sin = new float[(long)rot * tokens];
+            for (int t = 0; t < tokens; t++)
+            {
+                long b = (long)t * rot;
+                for (int axis = 0; axis < 3; axis++)
+                {
+                    float pos = positions[t * 3 + axis];
+                    for (int k = 0; k < nf; k++)
+                    {
+                        double a = (double)pos * invFreq[k];
+                        int j = axis * nf + k;
+                        float c = (float)Math.Cos(a), s = (float)Math.Sin(a);
+                        cos[b + j] = c; cos[b + j + half] = c;
+                        sin[b + j] = s; sin[b + j + half] = s;
+                    }
+                }
+            }
+            _rope = ((float[])positions.Clone(), cos, sin);
+            return (cos, sin);
+        }
+
+        /// <summary>The PDD head of grid intervals [start, stop) (<see cref="MiniMaxH3ImageSampling.CombineHead"/>), combined
+        /// once per interval: [hidden, patch] and [patch] F32, bound as the step's inputs.</summary>
+        private (float[] Weight, float[] Bias) Head(float[] grid, int start, int stop)
+        {
+            if (_headGrid == null || !grid.AsSpan().SequenceEqual(_headGrid))
+            {
+                _heads.Clear();
+                _headGrid = (float[])grid.Clone();
+            }
+            if (_heads.TryGetValue((start, stop), out var head)) return head;
+            head = MiniMaxH3ImageSampling.CombineHead(_w.PddWeight, _w.PddBias, _w.Config.VideoPatchDim, _w.Config.HiddenSize, _headGrid,
+                start, stop);
+            _heads[(start, stop)] = head;
+            return head;
+        }
+
+        // ---- emission
+
+        private sealed class StepValues
+        {
+            public float[] Video;          // [patch, references + image] (references first: they share the patch projection)
+            public int ImageCount, ReferenceCount;
+            public float[] Text;           // [textDim, textCount] or null
+            public int TextCount;
+            public MiniMaxH3PackedLayout Layout;
+            public GraphSegment[] Segments;
+            public float[] TimeEmbed;      // [timeEmbedDim, timesteps]
+            public float[] Cos, Sin;       // [rot, tokens]
+            public (float[] Weight, float[] Bias) Head;
+        }
+
+        /// <summary>
+        /// The step's program, in the order and with the operands of TSGgml_MiniMaxH3DitForward's graph (ggml_ops_minimax_h3.cpp,
+        /// audio_count 0): the q8_1 guard around every block-quantized product but the AdaLN projections' (h3_mm), the token
+        /// refiner unmodulated and without RoPE, each block's modulations, attention, gated residuals and SwiGLU as the
+        /// diffusion-transformer regions (whose ops are that graph's unfused nodes, and which ggml_cuda serves as its fused
+        /// nodes in a WideTokenProducts program), the final layer's per-timestep shift and scale, the head, and the negation.
+        /// The per-step values (latent, time embedding, head) are inputs; the segment table, positions and text are fixed for
+        /// a request, so a geometry's steps share one plan.
+        /// </summary>
+        private void Emit(GraphEmitter e, StepValues s)
+        {
+            MiniMaxH3Config c = _w.Config;
+            GraphProgramBuilder b = e.Builder;
+            int hidden = c.HiddenSize, heads = c.NumAttentionHeads, hd = c.AttentionHeadDim, inner = c.AttentionInnerDim;
+            int rot = c.RopeRotaryDim, ntok = s.Layout.TokenCount, nts = s.Layout.Timesteps.Length;
+            float eps = c.NormEps;
+            float scale = 1f / MathF.Sqrt(hd);
+            var quantized = new HashSet<int>();
+            var leaves = new Dictionary<MiniMaxH3ImageWeight, int>();
+
+            int Leaf(MiniMaxH3ImageWeight w)
+            {
+                if (w == null) return -1;
+                if (leaves.TryGetValue(w, out int node)) return node;
+                ReadOnlySpan<long> ne = w.Vector ? stackalloc long[] { w.Ne0 } : stackalloc long[] { w.Ne0, w.Ne1 };
+                node = _tensorAllocator == null
+                    ? e.HostWeight(w.Format, ne, w.Data, w.Bytes)
+                    : e.HostWeight(w.Format, ne, GraphIdentity.Of(w), w.Bytes, Handle(w));
+                leaves[w] = node;
+                if (w.Quantized) quantized.Add(node);
+                return node;
+            }
+            int Scale(int x, float f) => b.Op(GraphOp.Scale, stackalloc[] { x }, default, stackalloc[] { f });
+            // h3_mm: a block-quantized weight's product takes the q8_1 guard (on ggml_cuda's wide routes, which need none, the
+            // executor drops the pair where cuBLAS takes the product: GraphProgram.WideTokenProducts).
+            int Product(GraphProgramBuilder g, int w, int x) => quantized.Contains(w)
+                ? Scale(g.Op(GraphOp.MulMat, w, Scale(x, 1f / GuardScale)), GuardScale)
+                : g.Op(GraphOp.MulMat, w, x);
+            int Linear(MiniMaxH3ImageLinear l, int x, bool guard = true)
+            {
+                int w = Leaf(l.Weight);
+                int o = guard ? Product(b, w, x) : b.Op(GraphOp.MulMat, w, x);
+                return l.Bias != null ? b.Op(GraphOp.Add, o, Leaf(l.Bias)) : o;
+            }
+            int Norm(int x, MiniMaxH3ImageWeight w) => b.Op(GraphOp.Mul, b.Op(GraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps }), Leaf(w));
+            // q, k and v of a stacked [q | k | v] product: [hd, heads, rows] views, rows a product row apart.
+            int Third(int qkv, int i, int rows) => b.Op(GraphOp.View, stackalloc[] { qkv },
+                stackalloc long[] { 3, hd, heads, rows, 1, hd * 4L, 3L * inner * 4, 0, (long)i * inner * 4 });
+            int Rows(int x, long width, int start, int count) => b.Op(GraphOp.View, stackalloc[] { x },
+                stackalloc long[] { 2, width, count, 1, 1, width * 4, 0, 0, (long)start * width * 4 });
+
+            e.MarkWideTokenProducts();
+
+            // ---- inputs
+            int vin = e.InputF32(s.Video, c.VideoPatchDim, s.ReferenceCount + s.ImageCount);
+            int temb = e.InputF32(s.TimeEmbed, c.TimeEmbedDim, nts);
+            // A projection of the time embedding viewed as [hidden, columns]: the modulation matrix.
+            int Modulations(MiniMaxH3ImageLinear l, long columns) => b.Op(GraphOp.Reshape, stackalloc[] { Linear(l, temb, guard: false) },
+                stackalloc long[] { hidden, columns });
+            int cosT = e.InputF32(s.Cos, rot, ntok);
+            int sinT = e.InputF32(s.Sin, rot, ntok);
+            int sinS = GraphDitRegions.SignedSine(b, sinT, rot, ntok);
+            int tin = s.TextCount > 0 ? e.InputF32(s.Text, c.TextDim, s.TextCount) : -1;
+            GraphDitRegions.CheckSegments(s.Segments, ntok, 18L * nts, 5);
+            int table = e.InputI32(GraphDitRegions.SegmentTable(s.Segments), 3, s.Segments.Length);
+
+            // ---- text: project, then refine (no modulation, no RoPE; its attention is the native graph's h3_attend)
+            int x = -1;
+            if (tin >= 0)
+            {
+                int ctx = Linear(_w.ConditionProj, tin);
+                foreach (MiniMaxH3ImageBlock r in _w.Refiner)
+                {
+                    int n1 = Norm(ctx, r.Norm1);
+                    int qkv = Linear(r.Qkv, n1);
+                    int q = Third(qkv, 0, s.TextCount), k = Third(qkv, 1, s.TextCount), v = Third(qkv, 2, s.TextCount);
+                    q = r.QNorm != null ? Norm(q, r.QNorm) : b.Op(GraphOp.Cont, q);
+                    k = r.KNorm != null ? Norm(k, r.KNorm) : b.Op(GraphOp.Cont, k);
+                    int merged = GraphDitRegions.Attention(b, q, k, v, hd, heads, s.TextCount, scale, GraphDitRegions.FlashVScale(s.TextCount));
+                    ctx = b.Op(GraphOp.Add, ctx, Linear(r.Out, merged));
+                    int n2 = Norm(ctx, r.Norm2);
+                    int gv = Linear(r.Fc1, n2);
+                    ctx = b.Op(GraphOp.Add, ctx, Linear(r.Fc2, b.Op(GraphOp.Swiglu, gv)));
+                }
+                if (_w.RefinerFinalNorm != null) ctx = Norm(ctx, _w.RefinerFinalNorm);
+                x = ctx;
+            }
+
+            // ---- patchify the references and the target with one projection, then pack [text | references | target]
+            int allVideo = Linear(_w.VideoPatch, vin);
+            if (s.ReferenceCount > 0)
+            {
+                int condTok = Rows(allVideo, hidden, 0, s.ReferenceCount);
+                x = x < 0 ? condTok : b.Op(GraphOp.Concat, stackalloc[] { x, condTok }, stackalloc long[] { 1 });
+                int videoTok = Rows(allVideo, hidden, s.ReferenceCount, s.ImageCount);
+                x = b.Op(GraphOp.Concat, stackalloc[] { x, videoTok }, stackalloc long[] { 1 });
+            }
+            else x = x < 0 ? allVideo : b.Op(GraphOp.Concat, stackalloc[] { x, allVideo }, stackalloc long[] { 1 });
+
+            // ---- the blocks
+            float vScale = GraphDitRegions.FlashVScale(ntok);
+            foreach (MiniMaxH3ImageBlock blk in _w.Blocks)
+            {
+                // The curve-table variant feeds the interpolated embedding straight in (no SiLU), and takes no guard.
+                int mods = Modulations(blk.AdaLn, 18L * nts);
+                int h = GraphDitRegions.AdaLnModulate(b, x, Leaf(blk.Norm1), mods, table, s.Segments, hidden, 0, 1, eps);
+                int qkv = Product(b, Leaf(blk.Qkv.Weight), h);
+                int merged = GraphDitRegions.TableRopeQkNormAttention(b, Third(qkv, 0, ntok), Third(qkv, 1, ntok), Third(qkv, 2, ntok),
+                    Leaf(blk.QNorm), Leaf(blk.KNorm), cosT, sinS, hd, heads, ntok, rot, eps, scale, vScale);
+                int attn = Product(b, Leaf(blk.Out.Weight), merged);
+                x = GraphDitRegions.GatedResidual(b, x, attn, -1, -1, mods, table, s.Segments, hidden, 2);
+                h = GraphDitRegions.AdaLnModulate(b, x, Leaf(blk.Norm2), mods, table, s.Segments, hidden, 3, 4, eps);
+                int m = GraphDitRegions.SwigluFfn(b, h, Leaf(blk.Fc1.Weight), Leaf(blk.Fc2.Weight), -1, -1, Product);
+                x = GraphDitRegions.GatedResidual(b, x, m, -1, -1, mods, table, s.Segments, hidden, 5);
+            }
+
+            // ---- final layer: shift and scale by TIMESTEP row (timestep * 2), the head, and the velocity's sign
+            int fmods = Modulations(_w.FinalAdaLn, 2L * nts);
+            int col = s.Layout.VideoSpan.Row * 2;
+            int part = Norm(Rows(x, hidden, s.Layout.VideoSpan.Start, s.ImageCount), _w.FinalNorm);
+            int sh = Rows(fmods, hidden, col, 1);
+            int sc = Rows(fmods, hidden, col + 1, 1);
+            part = b.Op(GraphOp.Add, b.Op(GraphOp.Add, part, b.Op(GraphOp.Mul, part, sc)), sh);
+            int headW = e.InputF32(s.Head.Weight, hidden, c.VideoPatchDim);
+            int headB = e.InputF32(s.Head.Bias, c.VideoPatchDim);
+            int velocity = Scale(b.Op(GraphOp.Add, b.Op(GraphOp.MulMat, headW, part), headB), -1f);
+            e.Output(velocity, (long)c.VideoPatchDim * s.ImageCount);
+        }
+
+        /// <summary>A tensor executor's object for a weight leaf: an F32 vector as a tensor, a projection as itself.</summary>
+        private object Handle(MiniMaxH3ImageWeight w)
+        {
+            if (!w.Vector) return w;
+            if (!_tensors.TryGetValue(w, out Tensor t))
+            {
+                var values = new float[w.Ne0];
+                Marshal.Copy(w.Data, values, 0, values.Length);
+                t = new Tensor(_tensorAllocator, DType.Float32, w.Ne0);
+                t.SetElementsAsFloat(values);
+                _tensors[w] = t;
+            }
+            return t;
+        }
+
+        // ---- residency
+
+        public void ReleaseWorkspace()
+        {
+            lock (_gate)
+            {
+                _plan?.Dispose();
+                _plan = null;
+            }
+        }
+
+        /// <summary>Drops the weights' device copies (and the plan, which binds them); the mapping stays, so the next step
+        /// uploads them from memory again.</summary>
+        public void ReleaseDevice()
+        {
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _plan?.Dispose();
+                _plan = null;
+                foreach (MiniMaxH3ImageWeight w in _w.All) _executor.Invalidate(w.Data);
+                _preloaded = false;
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _plan?.Dispose();
+                _plan = null;
+                // The pinned vectors are this denoiser's own; a borrowed mapping's projections are its owner's to release.
+                foreach (MiniMaxH3ImageWeight w in _w.All)
+                    if (w.Vector || _w.OwnsFile) _executor.Invalidate(w.Data);
+                foreach (Tensor t in _tensors.Values) t.Dispose();
+                _tensors.Clear();
+                _w.Dispose();
+            }
+        }
+    }
+}
