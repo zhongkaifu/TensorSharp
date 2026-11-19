@@ -2495,7 +2495,7 @@ load here" from "this is a bug":
 |---|---|---|
 | `0` | Success: the run finished, `--help` / `--list-skills` printed, or the server shut down cleanly. | — |
 | `1` | Configuration error: a removed flag, an unknown flag on the server (the CLI ignores flags it does not know), a bad value, a switch given a value (`--think=on`) or a value option with nothing after it, an unreadable `--config` file. On the CLI also a prompt that leaves no room for a reply in the model's context window (`MAX_CONTEXT`), including one an Agent Skills round grew past it; a reply that merely runs into the window ends there instead, as a length stop. | `Configuration error: <what is wrong>` |
-| `2` | Model load refused. | Exactly one line, the last one: `error: model load refused: <reason>` |
+| `2` | Model load refused; on the CLI also a one-shot request the loaded model refused before running it (an image whose phases need more device memory than the device has free). | Exactly one line, the last one: `error: model load refused: <reason>`, or `error: request refused: <reason>` for a request |
 | anything else | Not a refusal: a bug or a crash. An unhandled .NET exception prints its stack trace and, on Linux and macOS, exits `134` (SIGABRT); a process the OS killed reports its signal (`137` for an out-of-memory kill). | The stack trace. Report it. |
 
 **What counts as a refused load** (code `2`) is a decision the loader made on
@@ -2519,6 +2519,8 @@ and keeps its stack trace. One exception: the DeepSeek V4/V4.1 and GLM native
 whole-model loaders report every load they abandon as a refusal, including a
 weight or cache allocation that failed on a device, with their `[dsv4]`/`[glm]`
 line as the reason.
+
+**A refused request** (code `2`, CLI only) is a request the loaded model declined before running any of it, with the sizes in the reason: an image whose most demanding phase needs more device memory than the device has free even with every other component released (MiniMax-H3-Image at 4096x4096 with the Q5_K_M DiT on a 20 GB card, any size with Q8_0 there). On a running server the same refusal answers `507` with `{ "error": "<reason>" }` and the model stays loaded for the next request. A request that still runs out of device memory while it runs is not a refusal: an allocation the backend reports fails the request (a stack trace on the CLI, `500` on the server), and one that fails inside a ggml-cuda kernel ends the process (`134`).
 
 Before exiting with `2` the server releases what the refused load left behind
 (the model service and the ggml backend) and never opens its port. A refusal's

@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.SharedDiffusion
@@ -45,6 +46,8 @@ namespace TensorSharp.Models.SharedDiffusion
         private readonly object _gate = new();
         private readonly HashSet<DiffusionComponent> _resident = new();
         private readonly Dictionary<DiffusionComponent, long> _workspaces = new();
+        // The component of the phase running now (null between phases).
+        private DiffusionComponent? _running;
         private IConditioner _conditioner;
         private IVaeCodec _vae;
         private IDenoiser _denoiser;
@@ -63,7 +66,8 @@ namespace TensorSharp.Models.SharedDiffusion
             family.DefaultRecipe.Validate();
             BackendType backend = load.Backend;
             _planner = planner ?? new ResidencyPlanner(
-                () => GpuMemoryBudget.TryGetReservationSpareBytes(backend, out long spare) ? spare : null, _log);
+                () => GpuMemoryBudget.TryGetReservationSpareBytes(backend, out long spare) ? spare : null, _log,
+                () => GpuMemoryBudget.TryGetReservationFreeBytes(backend, out long free) ? free : null);
         }
 
         public IDiffusionFamily Family => _family;
@@ -78,7 +82,9 @@ namespace TensorSharp.Models.SharedDiffusion
         /// Run one request. <paramref name="cancellationToken"/> is checked between phases, between steps and (by the
         /// codec) between VAE tile rows; <paramref name="betweenSteps"/> runs before every step after the first (a
         /// queue's checkpoint, which may give the model to waiting compute work). A cancelled or failed run releases
-        /// the components' activations and keeps their weights resident.
+        /// the components' activations and keeps their weights resident, except the weights of the phase that failed
+        /// (see <see cref="ReleaseFailedPhase"/>). A request the device cannot hold is refused before any phase runs
+        /// (<see cref="RequestRefusedException"/>, <see cref="ResidencyPlan.Refused"/>).
         /// </summary>
         public DiffusionResult Run(DiffusionRequest request, CancellationToken cancellationToken = default, Action betweenSteps = null)
         {
@@ -104,10 +110,15 @@ namespace TensorSharp.Models.SharedDiffusion
                 {
                     return Execute(request, job, total, cancellationToken, betweenSteps);
                 }
-                catch
+                catch (Exception error)
                 {
+                    if (error is not OperationCanceledException) ReleaseFailedPhase();
                     ReleaseWorkspaces();
                     throw;
+                }
+                finally
+                {
+                    _running = null;
                 }
             }
         }
@@ -116,6 +127,8 @@ namespace TensorSharp.Models.SharedDiffusion
         {
             IReferencePolicy policy = _family.References;
             ResidencyPlan plan = PlanResidency(job);
+            if (plan.Refused)
+                throw new RequestRefusedException(Refusal(job, plan));
             INoiseSource noise = _family.Noise(request.Seed);
             var clock = Stopwatch.StartNew();
 
@@ -385,6 +398,32 @@ namespace TensorSharp.Models.SharedDiffusion
             return _planner.Plan(job.Demands, weights, _resident.ToArray(), new Dictionary<DiffusionComponent, long>(_workspaces), geometryClass);
         }
 
+        /// <summary>The one-line reason a request the device cannot hold is refused (see <see cref="ResidencyPlan.Refused"/>).</summary>
+        private string Refusal(Prepared job, ResidencyPlan plan)
+        {
+            static string Gb(long bytes) => (bytes / 1e9).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " GB";
+            string phase = plan.Limiting.Phase switch
+            {
+                DiffusionPhase.Condition => "text encoding",
+                DiffusionPhase.EncodeReferences => "reference encoding",
+                DiffusionPhase.Denoise => "denoise",
+                DiffusionPhase.Decode => "VAE decode",
+                _ => plan.Limiting.Phase.ToString().ToLowerInvariant(),
+            };
+            string component = plan.Limiting.Component switch
+            {
+                DiffusionComponent.Conditioner => "text encoder",
+                DiffusionComponent.Denoiser => "denoiser",
+                DiffusionComponent.Vae => "VAE",
+                _ => plan.Limiting.Component.ToString().ToLowerInvariant(),
+            };
+            var (w, h) = job.Canvas.Sampling;
+            return $"{_family.DisplayName} cannot run {w}x{h} on this device: its {phase} alone needs {Gb(plan.MinimumPeak)} " +
+                   $"(the {component}'s {Gb(plan.LimitingWeights)} of weights and {Gb(plan.Limiting.WorkingBytes)} of working memory), " +
+                   $"more than the {Gb(plan.Capacity ?? 0)} of device memory free for it. Use a smaller size or a smaller " +
+                   "quantization, or free the device.";
+        }
+
         /// <summary>Make the plan's releases before <paramref name="phase"/>; <paramref name="component"/> is resident from
         /// here on (its first use uploads it, whether or not the phase finishes).</summary>
         private void EnterPhase(DiffusionRequest request, DiffusionPhase phase, DiffusionComponent component, ResidencyPlan plan)
@@ -401,12 +440,34 @@ namespace TensorSharp.Models.SharedDiffusion
                 _resident.Remove(release.Component);
             }
             _resident.Add(component);
+            _running = component;
             Report(request, new DiffusionProgress(phase));
+        }
+
+        /// <summary>
+        /// A phase failed (a device allocation that failed while its component's weights were being bound or uploaded, a
+        /// backend error): which of that component's device copies exist is no longer known, so the plan must not count its
+        /// weights as held, or the next request is planned against memory it does not have and fails as well (measured on
+        /// the RTX A4500: after the text encoder's upload failed for another process's allocation, the next request kept
+        /// "everything resident" against a budget inflated by its 15.5 GB). Its copies are released (the weights stay
+        /// mapped; the next request uploads them again) and it is no longer resident.
+        /// </summary>
+        private void ReleaseFailedPhase()
+        {
+            if (_running is not DiffusionComponent failed) return;
+            _running = null;
+            try { Created(failed)?.ReleaseDevice(); }
+            catch (Exception error) { _log($"  [diffusion] releasing the {failed.ToString().ToLowerInvariant()} after its phase failed: {error.Message}"); }
+            _resident.Remove(failed);
+            _workspaces.Remove(failed);
         }
 
         /// <summary>The phase finished: its component keeps its workspace (cached plans) for the next request.</summary>
         private void LeavePhase(DiffusionComponent component, long workingBytes)
-            => _workspaces[component] = Math.Max(_workspaces.GetValueOrDefault(component), workingBytes);
+        {
+            _workspaces[component] = Math.Max(_workspaces.GetValueOrDefault(component), workingBytes);
+            _running = null;
+        }
 
         private void ReleaseWorkspaces()
         {

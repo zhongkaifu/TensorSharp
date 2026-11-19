@@ -2439,6 +2439,18 @@ namespace TensorSharp.Cli
                 sw.Stop();
                 TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, output);
             }
+            catch (RequestRefusedException ex)
+            {
+                // The model declined the request before running it (the device cannot hold its phases): the operator's to
+                // act on, like a refused load, so one error line and exit code 2 rather than a stack trace.
+                // The stack trace stays available at --log-level debug, as for a refused load.
+                image.MarkFailed(ex);
+                _log.LogError(LogEventIds.CliFailed, "Request refused: {Reason}", ex.Message);
+                _log.LogDebug(LogEventIds.CliFailed, ex, "Request refused");
+                Console.Error.WriteLine(RequestRefusedException.FormatErrorLine(ex.Message));
+                Environment.ExitCode = HostExitCodes.RequestRefused;
+                return;
+            }
             catch (Exception ex)
             {
                 image.MarkFailed(ex);

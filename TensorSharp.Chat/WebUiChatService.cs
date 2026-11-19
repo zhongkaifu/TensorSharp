@@ -1792,6 +1792,13 @@ namespace TensorSharp.Chat
                 logger.LogError(LogEventIds.ChatFailed, ex, "Image request failed");
                 throw new WebUiRequestRejectedException(500, new { error = ex.Message });
             }
+            catch (RequestRefusedException ex)
+            {
+                // Refused before any phase ran: the device cannot hold the request (a smaller size or quantization can be
+                // served). 507, the server's own capacity, with the reason; the model stays loaded and serves the next one.
+                logger.LogWarning(LogEventIds.UploadReceived, "Image request refused: {Reason}", ex.Message);
+                throw new WebUiRequestRejectedException(507, new { error = ex.Message });
+            }
             finally
             {
                 // The awaited worker has left the model (a cancelled request that never

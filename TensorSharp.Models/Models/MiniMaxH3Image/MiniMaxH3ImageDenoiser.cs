@@ -119,10 +119,18 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// (<see cref="WorkingBytesFor"/>), from the packed sequence's rows.</summary>
         public long WorkingBytes(DiffusionWorkload workload)
         {
-            bool quantized = false;
-            foreach (MiniMaxH3ImageWeight w in _w.All) quantized |= w.Quantized;
-            return WorkingBytesFor(_w.Config, RowsOf(workload), fused: Backend == BackendType.GgmlCuda, quantized);
+            bool quantized = false, bf16Route = false;
+            foreach (MiniMaxH3ImageWeight w in _w.All)
+            {
+                quantized |= w.Quantized;
+                bf16Route |= w.Format == GgmlQ4K;
+            }
+            return WorkingBytesFor(_w.Config, RowsOf(workload), fused: Backend == BackendType.GgmlCuda, quantized, bf16Route);
         }
+
+        /// <summary>GGML_TYPE_Q4_K: the block type the CUDA step's wide products take to cuBLAS BF16 (ggml_ops_dit_offload.cpp,
+        /// h3_q4k_matmul_wants); every other block type runs on ggml's MMQ.</summary>
+        private const int GgmlQ4K = 12;
 
         /// <summary>The packed sequence's rows for <paramref name="workload"/>: the target's and the references' 2x2 patches and
         /// about a token every three characters of the prompt (small beside the image).</summary>
@@ -142,20 +150,24 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <item>ggml_cuda's fused step (<paramref name="fused"/>): fc1's [gate | value] product beside the residual stream,
         /// the qkv product, the hidden copies and K and V at F16; the SwiGLU is in fc2's narrowing. 315 KB a row: bf16 at
         /// 2048x2048 measured 1.13 GB (272 KB a row), and at 4096x4096 4.9 GB (300 KB a row). Block-quantized projections add
-        /// the cuBLAS route's BF16 copies of the activations (57 KB a row), and of the largest weight with its workspace
-        /// (Q4_K_M measured 1.75 GB at 2048x2048 and 5.92 GB at 4096x4096: 2.09 and 6.67 GB estimated).</item>
+        /// 384 MiB (the largest weight's BF16 copy with its workspace, or MMQ's quantized activations), and where a Q4_K
+        /// projection takes the cuBLAS BF16 route (<paramref name="bf16Route"/>) the BF16 copies of the activations too (57 KB
+        /// a row). Q4_K_M measured 1.75 GB at 2048x2048 and 5.92 GB at 4096x4096 (2.09 and 6.67 GB estimated); on the RTX
+        /// A4500 the files with Q4_K projections measured 1.06-1.08x under the estimate up to 4480x4480, while Q6_K, all of it
+        /// on MMQ, measured 2.98, 3.33 and 3.82 GB at 2880, 3072 and 3328 (3.12, 3.47 and 3.97 GB estimated without the copies;
+        /// 3.59, 4.01 and 4.60 with them).</item>
         /// <item>The unfused step (ggml_metal, ggml_cpu, the managed executor): the SwiGLU's own output, the q/k norms, RoPE
         /// and padded attention copies and the modulated rows as separate F32 tensors. 745 KB a row: Q8_0 on ggml_metal
         /// measured 2.95 GB at 2048x2048 (710 KB a row) and Q4_K_M 0.23 GB at 512x512 (770 KB a row, with the fixed part).</item>
         /// </list>
         /// </summary>
-        internal static long WorkingBytesFor(MiniMaxH3Config c, long rows, bool fused, bool quantized)
+        internal static long WorkingBytesFor(MiniMaxH3Config c, long rows, bool fused, bool quantized, bool bf16Route = true)
         {
             ArgumentNullException.ThrowIfNull(c);
             long ffn = c.FfnHiddenSize, inner = c.AttentionInnerDim, hidden = c.HiddenSize;
             if (fused)
                 return (quantized ? 512L : 128L) * 1024 * 1024
-                    + rows * (4L * (2 * ffn + 3 * inner + 4 * hidden) + 4L * inner + (quantized ? 4L * ffn : 0));
+                    + rows * (4L * (2 * ffn + 3 * inner + 4 * hidden) + 4L * inner + (quantized && bf16Route ? 4L * ffn : 0));
             return 64L * 1024 * 1024 + rows * 4L * (4 * ffn + 12 * inner + 8 * hidden);
         }
 
