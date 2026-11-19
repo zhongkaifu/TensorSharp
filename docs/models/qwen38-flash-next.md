@@ -1213,10 +1213,11 @@ verify window over the Q8_0 cache answered exactly as a plain decode on that cac
 
 > That engine was removed with #371, and its `q8_0` default with it. The runtime that serves `--backend cuda` now keeps
 > an F16 cache for Flash Next unless `--kv-cache-dtype` names another. On the CUDA executor the QSA layers' indexer keys,
-> QSA selection and sparse attention read F16 caches only, so an explicit `--kv-cache-dtype q8_0` takes a model with QSA
-> layers off whole-forward graphs: it runs per-op, and its first step prints
-> `qwen4exp: per-op execution (KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor)`. That path
-> has not been measured on a GPU; keep `f16` for Flash Next on `--backend cuda`.
+> QSA selection and sparse attention read F16 caches only, and qwen4exp runs only as whole-forward graphs (it has no
+> per-op path), so the runtime cannot serve Flash Next over a `q8_0` cache on `--backend cuda`: with an explicit
+> `--kv-cache-dtype q8_0` the model loads, and its first step fails with `qwen4exp runs only as graphs on the shared
+> runtime, which this step cannot use (KV dtype Q8_0 with qwen4exp's attention routes on this backend's executor).` Keep
+> `f16` for Flash Next on `--backend cuda`.
 
 Same session, RTX 5090, `Q2_0`, `TS_Q4E_HC_Q8=1`, MTP with Q2_0 draft experts, `TS_MOE_TIER_ADAPT=1`, 131K context:
 
