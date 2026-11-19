@@ -189,7 +189,8 @@ namespace TensorSharp.Models
             // (llama.cpp tokenizes common_chat_get_tts_prompt's text so).
             var ids = new List<int>();
             if (Tokenizer.BosTokenId >= 0) ids.Add(Tokenizer.BosTokenId);
-            ids.AddRange(Tokenizer.Encode(Lfm3SpeechPrompt.Tts(text, language, voice, bosToken: "", think: true), addSpecial: false));
+            ids.AddRange(Tokenizer.Encode(Lfm3SpeechPrompt.Tts(Lfm3SpeechPrompt.SpokenForm(text, language), language, voice, bosToken: "",
+                think: true), addSpecial: false));
             return ids;
         }
 
