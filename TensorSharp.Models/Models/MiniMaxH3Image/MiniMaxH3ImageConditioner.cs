@@ -52,17 +52,21 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         public long WeightBytes => _encoder.DeviceWeightBytes;
 
+        /// <summary>The trunk's compute memory for <paramref name="workload"/>'s prompt (<see cref="WorkingBytesFor"/>).</summary>
+        public long WorkingBytes(DiffusionWorkload workload) => WorkingBytesFor(_encoder.Config, workload.Prompt);
+
         /// <summary>
-        /// The trunk's compute memory for <paramref name="workload"/>'s prompt: a fixed part (the graph's buffers, the RoPE
-        /// tables) and per token the hidden state's copies, the q/k/v rows and the MLP's gate and up rows in F32 (about three
-        /// characters a token, as the denoiser estimates; prompts are a few hundred tokens at most).
+        /// The trunk's compute memory for <paramref name="prompt"/>: a fixed part (the graph's buffers and the backend's
+        /// handles beside the weights: 615 MiB measured on ggml_cuda for a 59-token prompt, much less on ggml_metal) and per
+        /// token the hidden state's copies, the q/k/v rows and the MLP's gate and up rows in F32 (about three characters a
+        /// token; prompts are a few hundred tokens at most).
         /// </summary>
-        public long WorkingBytes(DiffusionWorkload workload)
+        internal static long WorkingBytesFor(MiniMaxH3TextEncoderConfig c, string prompt)
         {
-            MiniMaxH3TextEncoderConfig c = _encoder.Config;
-            long tokens = Math.Max(16, (workload.Prompt?.Length ?? 0) / 3 + 16);
+            ArgumentNullException.ThrowIfNull(c);
+            long tokens = Math.Max(16, (prompt?.Length ?? 0) / 3 + 16);
             long perToken = 4L * (6L * c.Hidden + 2L * c.Heads * c.HeadDim + 2L * c.KvHeads * c.HeadDim + 3L * c.Intermediate);
-            return 256L * 1024 * 1024 + tokens * perToken;
+            return 640L * 1024 * 1024 + tokens * perToken;
         }
 
         public ConditioningSet Encode(string prompt, IReadOnlyList<PresentedImage> pictures, CancellationToken cancellationToken)

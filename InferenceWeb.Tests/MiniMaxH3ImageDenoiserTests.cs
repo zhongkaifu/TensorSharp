@@ -365,7 +365,12 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         var small = new DiffusionWorkload(new LatentShape(24, 1, 8, 8), Array.Empty<LatentShape>(), "a");
         var large = new DiffusionWorkload(new LatentShape(24, 1, 64, 64), Array.Empty<LatentShape>(), "a");
         Assert.True(runtime.WorkingBytes(small) > 0);
-        Assert.True(runtime.WorkingBytes(large) > 50 * runtime.WorkingBytes(small));
+        // A fixed part, then the same bytes a row (2x2 patches and a token every three characters of the prompt).
+        Assert.Equal(64 * 64 / 4 + 1, MiniMaxH3ImageDenoiser.RowsOf(large));
+        Assert.Equal(MiniMaxH3ImageDenoiser.WorkingBytesFor(runtime.Config, 1025, TestGates.PinnedGgmlBackend == BackendType.GgmlCuda, quantized: true),
+            runtime.WorkingBytes(large));
+        long perRow = (runtime.WorkingBytes(large) - runtime.WorkingBytes(small)) / (1025 - 17);
+        Assert.True(perRow > 0 && runtime.WorkingBytes(small) > 17 * perRow);
     }
 
     // ================================================================ the family

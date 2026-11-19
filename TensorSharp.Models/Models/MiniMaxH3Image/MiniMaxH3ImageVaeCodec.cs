@@ -252,12 +252,16 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// most <see cref="MaxBatch"/>) times a tile's activations, calibrated on ggml_cuda and ggml_metal (the fc1 output
         /// and its SwiGLU beside the residual stream and the qkv product, all F32).
         /// </summary>
-        public long WorkingBytes(DiffusionWorkload workload)
+        public long WorkingBytes(DiffusionWorkload workload) => WorkingBytesFor(Dim, FfnInner, workload.Target.Width * Downsample);
+
+        /// <summary>The decoder's compute memory for a canvas <paramref name="width"/> pixels wide (one program's row of tiles,
+        /// at most <see cref="MaxBatch"/>): 263 MiB for the release decoder's row of 11 tiles, where ggml_cuda measured
+        /// 123 MiB and ggml_metal 167 MiB.</summary>
+        internal static long WorkingBytesFor(int dim, int ffnInner, int width)
         {
-            int width = workload.Target.Width * Downsample;
             int batch = Math.Min(MaxBatch, SplitTiles(width).Start.Length);
             long tokens = (long)(TileSize / Downsample) * (TileSize / Downsample) + NumRegisterTokens + 1;
-            long perToken = 4L * (2L * FfnInner + FfnInner + 3L * Dim + 3L * Dim);
+            long perToken = 4L * (2L * ffnInner + ffnInner + 3L * dim + 3L * dim);
             return 64L * 1024 * 1024 + batch * tokens * perToken;
         }
 
