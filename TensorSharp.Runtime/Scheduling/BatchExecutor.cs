@@ -3706,12 +3706,12 @@ namespace TensorSharp.Runtime.Scheduling
             var drawn = new int[n * window];
             long drafted = Timestamp();
             int vocab = _model.Config.VocabSize;
+            // The rows' logits, where the model holds them when it can (each row is drawn once, in place).
+            float[]? rowLogits = null;
             if (sampledVerify)
             {
-                long logitsNeeded = (long)n * window * vocab;
-                if (_batchedSpecLogits == null || _batchedSpecLogits.LongLength < logitsNeeded)
-                    _batchedSpecLogits = new float[logitsNeeded];
-                if (!batched.TryBatchedSpecVerifyLogits(requestIds, positions, window, tokens, _batchedSpecLogits, _batchedSpecFeatures))
+                if (!batched.TryBatchedSpecVerifyLogits(requestIds, positions, window, tokens, _batchedSpecFeatures,
+                        ref _batchedSpecLogits, (long)n * window * vocab, out rowLogits))
                     return false;
             }
             else if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, _batchedSpecFeatures))
@@ -3753,8 +3753,6 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 seq.AppendOutputToken(anchors[i]);
             }
-            if (sampledVerify && (_batchedSpecRows == null || _batchedSpecRows.Length < n))
-                Array.Resize(ref _batchedSpecRows, n);
             // Each sequence's drafts against its own rows. A sequence's acceptance touches only its own state (output,
             // sampler, grammar), so sequences that sample draw in parallel: a sampled row is a copy, penalties and a
             // top-k pass over the whole vocabulary, and four sequences' rows one after another held the GPU idle.
@@ -3770,11 +3768,11 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     if (!sampledVerify)
                         return RowDraw(seq, drawn[i * window + row]);
-                    float[] buf = _batchedSpecRows![i] is { } b && b.Length == vocab ? b : (_batchedSpecRows[i] = new float[vocab]);
-                    Array.Copy(_batchedSpecLogits!, ((long)i * window + row) * vocab, buf, 0, vocab);
+                    // The row in place: the draw may write it (a masked token), and nothing reads it after.
+                    var buf = new Span<float>(rowLogits!, checked((int)(((long)i * window + row) * vocab)), vocab);
                     var sampler = seq.GetOrCreateSampler();
                     if (!sampler.IsPlainGreedyArgmax)
-                        return sampler.Sample(buf, seq.OutputTokens);
+                        return sampler.SampleRow(buf, seq.OutputTokens);
                     int best = 0;
                     for (int v = 1; v < vocab; v++)
                         if (buf[v] > buf[best]) best = v;
@@ -3955,9 +3953,8 @@ namespace TensorSharp.Runtime.Scheduling
             Environment.GetEnvironmentVariable("TS_BATCHED_SPEC_LOG") == "1";
 
         private float[]? _batchedSpecFeatures;
-        // A sampled batched verify's rows' logits, and per sequence the row handed to its sampler.
+        // A sampled batched verify's rows' logits, when the model does not hold them itself.
         private float[]? _batchedSpecLogits;
-        private float[]?[]? _batchedSpecRows;
 
         // The verify window a step falls back to when every gated draft fits it.
         private const int NarrowBatchedWindow = 4;
