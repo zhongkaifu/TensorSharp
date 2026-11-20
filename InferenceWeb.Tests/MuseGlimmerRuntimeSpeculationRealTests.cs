@@ -86,10 +86,20 @@ public sealed class MuseGlimmerRuntimeSpeculationRealTests(ITestOutputHelper out
         var margins = new List<string>();
         var failures = new List<string>();
         int agree = 0;
+        string first = "";
         for (int i = d; i < drafted.Length; i++)
         {
             double[] lp = MuseGlimmerParity.LogSoftmax(logits, vocab);
             int best = MuseGlimmerParity.ArgMax(logits, vocab);
+            if (i == d && d < plain.Length)
+            {
+                // The divergence itself: plain greedy's token against DFlash's under the plain model over their common prefix
+                // (prefilled in one forward, which rounds apart from the decode that chose plain's token: either may lead).
+                double split = lp[plain[d]] - lp[drafted[d]];
+                first = $"; at {d} plain's {plain[d]} ({MuseGlimmerParity.Decode(model, plain[d])}) against dflash's {drafted[d]} " +
+                    $"({MuseGlimmerParity.Decode(model, drafted[d])}): {split:F4} nat";
+                if (Math.Abs(split) >= NearTieNats) failures.Add($"the divergence at {d}: {split:F4} nat");
+            }
             if (best == drafted[i]) agree++;
             else
             {
@@ -101,7 +111,7 @@ public sealed class MuseGlimmerRuntimeSpeculationRealTests(ITestOutputHelper out
             }
             if (i + 1 < drafted.Length) logits = model.Forward(new[] { drafted[i] });
         }
-        string line = $"{name}: parts from plain at token {d} of {n}; teacher-forced past it the plain model agrees at {agree} of " +
+        string line = $"{name}: parts from plain at token {d} of {n}{first}; teacher-forced from it the plain model agrees at {agree} of " +
             $"{drafted.Length - d} tokens; near-ties {string.Join("; ", margins)}";
         Assert.True(failures.Count == 0, $"{line}\n  NOT near-ties: {string.Join("; ", failures)}");
         return line;
