@@ -31,3 +31,21 @@ regeneration reproduces them. Regenerate (about 90 s on an M5 Pro, peak 16 GB wi
 python3 eng/validation/muse-glimmer-llamacpp-goldens.py --llama-cpp ~/work/llama.cpp-lfm3 \
     --model Muse-Glimmer-30B-UD-IQ2_XXS.gguf --draft dflash-kquant.gguf
 ```
+
+## Frozen legacy outputs
+
+Stage S0 of the unified-runtime migration (`docs/design/muse-glimmer-unified.md`)
+froze the legacy model's (`MuseGlimmerModel`) outputs before any stage changed shared
+code, so the runtime family can be held to them after the legacy code is deleted.
+
+* `LegacyGoldens/<lane>.json` (`MuseGlimmerGoldens.cs`, `MuseGlimmerFrozenLegacyTests`):
+  the logits of every forward of seven scripted cases (a long prefill, prompt steps,
+  the ring wrapping, the full layers' cache growing, a rewind; an untied and a tied
+  head) on two synthetic fixtures, per lane (cpu, ggml_cpu, ggml_metal, mlx on the M5 Pro).
+* `LegacyReal/<lane>.json` (`MuseGlimmerLegacyRealTests.cs`): on the real IQ2_XXS weights
+  (ggml_metal and mlx on the M5 Pro), the greedy continuations of the goldens' prompts with
+  each position's top four log-probabilities, and the teacher-forced perplexity of
+  `benchmarks/engine_comparison/assets/prefill_corpus.txt`.
+
+The writers are Bench tests that run only when `TS_TEST_FREEZE_MUSE_GLIMMER_GOLDENS` or
+`TS_TEST_FREEZE_MUSE_GLIMMER_REAL` names the directory to write into.
