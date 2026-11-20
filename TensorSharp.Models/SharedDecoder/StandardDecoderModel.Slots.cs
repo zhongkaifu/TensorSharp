@@ -1004,6 +1004,7 @@ namespace TensorSharp.Models
             _slots.Remove(requestId);
             _fittedReservations?.Remove(requestId);
             RecycleSlot(slot);
+            LogDeviceHoldings($"{requestId} released");
         }
 
         public bool RetainSequenceCache(string requestId) => RetainSequenceCacheAs(requestId, requestId);

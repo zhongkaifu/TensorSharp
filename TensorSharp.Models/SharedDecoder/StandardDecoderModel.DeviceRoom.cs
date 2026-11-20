@@ -304,6 +304,67 @@ namespace TensorSharp.Models
 
         private static long Mib(long bytes) => Math.Max(0, bytes) >> 20;
 
+        /// <summary>
+        /// Diagnostic (TS_CUDA_LOG_VRAM=1): what this model holds on its device, by kind - the running requests' slots, the
+        /// conversations the prefix cache keeps (a shared checkpoint's states apart from whole slots), pooled and spare slots,
+        /// spare checkpoint states, parked recordings, drafter rings - beside the allocator's cached blocks and the device
+        /// reading (issue #383: account for what the shared runtime holds that the direct engine did not).
+        /// </summary>
+        private void LogDeviceHoldings(string label)
+        {
+            if (_allocator is not TensorSharp.Cuda.CudaAllocator cuda || !cuda.LogsVram) return;
+            try
+            {
+                var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+                string Group(IEnumerable<Slot> slots, out long total)
+                {
+                    total = 0;
+                    var parts = new List<string>();
+                    int states = 0;
+                    long stateBytes = 0;
+                    foreach (Slot slot in slots)
+                    {
+                        if (slot == null || (slot.K == null && slot.Recurrent == null)) continue;
+                        if (slot.SharesRows || slot.K == null)
+                        {
+                            if (slot.Recurrent != null && seen.Add(slot.Recurrent)) { states++; stateBytes += RecurrentStateBytes(slot); }
+                            continue;
+                        }
+                        if (!seen.Add(slot.K)) continue;
+                        long bytes = SlotStorageBytes(slot);
+                        total += bytes;
+                        parts.Add(string.Create(CultureInfo.InvariantCulture, $"{slot.Capacity}c/{slot.Length}r {Mib(bytes)}"));
+                    }
+                    total += stateBytes;
+                    string ckpt = states > 0 ? string.Create(CultureInfo.InvariantCulture, $" +{states} ckpt states {Mib(stateBytes)}") : "";
+                    return string.Create(CultureInfo.InvariantCulture, $"{parts.Count} [{string.Join(", ", parts)}]{ckpt} = {Mib(total)} MiB");
+                }
+                Slot primary = _activeKey == null ? SnapshotActiveFields() : _primary;
+                string running = Group((_slots?.Values ?? Enumerable.Empty<Slot>()).Append(_activeKey != null ? SnapshotActiveFields() : null), out long runningBytes);
+                string retained = Group(_retainedSlots?.Values ?? Enumerable.Empty<Slot>(), out long retainedBytes);
+                string pooled = Group(_slotPool ?? Enumerable.Empty<Slot>(), out long pooledBytes);
+                string prim = Group(new[] { primary }, out long primaryBytes);
+                long spareStates = 0;
+                if (_spareCheckpointStates != null)
+                    foreach (RecurrentState[] layer in _spareCheckpointStates)
+                        if (layer != null)
+                            foreach (RecurrentState state in layer)
+                                if (state != null) spareStates += state.StateBytes;
+                var (rings, ringBytes) = DFlashRingHoldings;
+                TensorSharp.Cuda.CudaAllocatorStats stats = cuda.GetStats();
+                long held = runningBytes + retainedBytes + pooledBytes + primaryBytes + spareStates + ringBytes;
+                Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"[vram-hold] {Config.Architecture} {label}: running {running}; retained {retained}; pooled {pooled}; primary {prim}; " +
+                    $"spare ckpt states {Mib(spareStates)} MiB; parked recordings {_parkedRecordings.Count}; rings {rings} = {Mib(ringBytes)} MiB; " +
+                    $"model holds {Mib(held)} MiB; pool cached large {Mib(stats.LargeCachedBytes)} small {Mib(stats.CachedBytes - stats.LargeCachedBytes)} MiB; " +
+                    $"device free={Mib(cuda.GetMemoryInfo().freeBytes)} of {Mib(cuda.GetMemoryInfo().totalBytes)} MiB"));
+            }
+            catch (Exception)
+            {
+                // Diagnostics must never break inference.
+            }
+        }
+
         /// <summary>Gives back idle drafter rings for <paramref name="shortBy"/> bytes of room (ModelBase.ReleaseIdleDFlashRings,
         /// counted as stage 4) and returns the free bytes after them.</summary>
         private long ReleaseRingsForRoom(long shortBy, long free, RoomUse use)
@@ -505,6 +566,7 @@ namespace TensorSharp.Models
                 {
                     (_allocator as TensorSharp.Cuda.CudaAllocator)?.LogDeviceRoom(string.Create(CultureInfo.InvariantCulture,
                         $"{Config.Architecture} {requestId}'s slot: {slot.Capacity:N0} cells (reserved {reserve:N0}, required {required:N0})"));
+                    LogDeviceHoldings($"{requestId}'s new slot");
                     return slot;
                 }
             }

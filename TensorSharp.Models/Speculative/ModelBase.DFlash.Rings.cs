@@ -406,6 +406,16 @@ namespace TensorSharp.Models
         private long DFlashRingBytes => _dflash == null ? 0
             : 2L * _dflash.NumLayers * _dflash.NumKVHeads * _dflashRingRows * _dflash.HeadDim * sizeof(float) + (long)_dflash.FeatureSize * sizeof(float);
 
+        /// <summary>The drafter rings on the device (the model's own and the pooled ones) and their bytes (diagnostics).</summary>
+        private protected (int Rings, long Bytes) DFlashRingHoldings
+        {
+            get
+            {
+                int rings = (_dflashModelRing != null || _hasDFlash ? 1 : 0) + (_dflashRingPool?.Count ?? 0);
+                return (rings, rings * DFlashRingBytes);
+            }
+        }
+
         /// <summary>The device bytes <see cref="ReleaseIdleDFlashRings"/> gives back at most: the pooled rings no request holds
         /// (the model's own and the bound one stay).</summary>
         private protected long IdleDFlashRingBytes

@@ -516,6 +516,9 @@ namespace TensorSharp.Cuda
         internal static readonly bool VramLogEnabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_LOG_VRAM"), "1", StringComparison.Ordinal);
 
+        /// <summary>Whether TS_CUDA_LOG_VRAM=1 diagnostics are on (models add their own lines beside the allocator's).</summary>
+        public bool LogsVram => VramLogEnabled;
+
         /// <summary>Diagnostic (TS_CUDA_LOG_VRAM=1): prints free/used dedicated VRAM
         /// plus the pool's currently-cached idle bytes at <paramref name="label"/>.</summary>
         public void LogVram(string label)
