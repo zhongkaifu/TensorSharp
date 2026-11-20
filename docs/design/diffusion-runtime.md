@@ -1,11 +1,12 @@
 # Diffusion runtime: MiniMax-H3-Image on the unified runtime, with editing and LoRA
 
-Status: stages S1-S5 and S7 implemented (MiniMax-H3-Image text to image and unmasked editing run on the runtime,
-with LoRA plug-ins; the legacy model is a test seam until S10); S6 and S8-S11 are design. Corrections made while
-implementing S5 are marked "(S5)" below. Written 2026-11-19 on `feature/h3-image-unified` (cut from
-`origin/main` ec702639). ggml is upstream `cd6d2b75`, unchanged (AGENTS.md). No MiniMax-H3
-weights were downloaded or run for this document: every statement about TensorSharp is from
-the code, and every statement about upstream is from the sources listed in
+Status: stages S1-S8 and S10 implemented. MiniMax-H3-Image (text to image, editing with up to 16 references, masked
+edits, multi-turn, LoRA plug-ins) runs only on the diffusion runtime; the legacy model was deleted in S10, after its
+outputs were frozen as golden fixtures (see "S10, as built" under section 1.6). S9 (tensor parallelism) and S11 (the
+conditioner on the shared decoder runtime) are design. Corrections made while implementing are marked "(S5)", "(S6)" and
+so on below. Written 2026-11-19 on `feature/h3-image-unified` (cut from `origin/main` ec702639) at ggml `cd6d2b75`; since
+the merge of `origin/main` 19bfb073 (S10) the series builds against main's and CI's pin, ggml `d9fe7bff`, unchanged
+(AGENTS.md). Every statement about upstream is from the sources listed in
 [Appendix A](#appendix-a-upstream-sources-read), at the revisions given there.
 
 This document covers four pieces of work:
@@ -171,6 +172,23 @@ pieces above, `tsg_cuda_h3_fused.cu`, and every `TS_H3_*` switch listed in §1.5
 `TS_H3_IMAGE_VAE_BATCH`. The BF16 cuBLAS route and the BF16 SwiGLU-in-GEMM fusion are not
 deleted. They **move** into the shared DiT offload module (§2.4) that the new runtime and the
 legacy video graph both call.
+
+**S10, as built.** Deleted: `MiniMaxH3ImageModel`, `MiniMaxH3ImageVae`, the runtime's legacy-denoiser seam
+(`MiniMaxH3ImageLegacyDenoiser`, `SharingLegacyWeights`), `ForwardImage`/`PddHead`/the head bank in `MiniMaxH3DiT` (which
+now refuses an image denoiser by name), `IsMiniMaxH3Image`, `TSGgml_MiniMaxH3VitDecodeBatch` with its bindings and its
+`GgmlExportedSymbols.targets` entry, the `audio_count == 0` branch of `TSGgml_MiniMaxH3DitForward` (a step needs its audio
+tokens; the video graph is unchanged node for node), `eng/validation/MiniMaxH3ImageStepProbe` and `MiniMaxH3ImageAB`'s
+legacy engine. `MiniMaxH3ImageSampling` and `MiniMaxH3ImageLayout` moved into the family. Kept, against the list above:
+`PddSteps` and `TryFindPrefix(requireAudio: false)` (the family's detector reads them) and `MiniMaxH3WeightFile`'s
+safetensors branch (the runtime reads the bf16 release through it; a family-neutral source would change no behaviour).
+`TS_H3_IMAGE_VAE_BATCH` is refused by name. D4: `--diffusion-products bf16|int8|int8-all` (config key
+`diffusion-products`, published as `TS_DIFFUSION_PRODUCTS` for the native products, as `--prompt-attention` publishes
+`TS_PROMPT_ATTENTION`); `int8-all` is added to D4's two values so MiniMax-H3 video keeps `TS_H3_INT8_MATMUL=all`, its
+measured best; `TS_H3_INT8_MATMUL` is refused by name. Golden fixtures: the legacy outputs on the synthetic fixtures,
+per lane (ggml_cpu on the M5 Pro and an x64 EPYC, ggml_metal on the M5 Pro, ggml_cuda on the RTX PRO 4500), in
+`InferenceWeb.Tests/Fixtures/MiniMaxH3Image/LegacyGoldens/`, held byte for byte where the runtime gave the legacy bytes when
+they were frozen (every lane but ARM64 ggml_cpu, where the runtime since the merge takes main's repacked and BF16
+products) and within the bound elsewhere (`MiniMaxH3ImageFrozenLegacyTests`).
 
 ---
 
@@ -1064,7 +1082,7 @@ names its gates. Estimates are agent-days including GPU runs.
 | **S7** LoRA | the three grammars (extended `MiniMaxH3LoraKeys`, which H3 video also gets), unmerged `LoraLinear` binding, several style adapters plus one speed contract (sigmas, heads, floor), the `minimax-h3-image-lora` type, `config/lora/minimax-h3-image-*.json`, `ILoraPluginHost` | `MiniMaxH3LoraKeys.cs`, family folder, `TensorSharp.Runtime/LoraSpec.cs`, `config/lora/*` | grammar and refusal tests (generated tiny files); row parity against an independent merge for linoyts, akhaliq-comfy, Realem and domokun (header plus rows only); pDMD versus diffusers at the same seed on **H100** (review); unmerged overhead <= 5% per step at rank 128 | 6 |
 | **S8** Catalogs, configs, docs | TensorAgent `ModelCatalog` entry (Q4_K_M, optional Q8_0), `CatalogFamily.MiniMaxH3Image`, licence strings (en, zh-Hans, ja), `LoraCatalog` pDMD entry; `config/minimax-h3-image-q8.json`; `docs/models/minimax-h3-image*.md`, `USAGE*`, the env-var matrix, the regression catalog, ComfyUI profiles | TensorAgent `Catalog/*`, `Localization/*`, `config/*`, `docs/*` | catalog tests (sizes, sha256, licences), `ModelCatalogTests`; a TensorAgent download-and-run on the **PRO 4500** (Q4_K_M) | 2 |
 | **S9** (optional) DiT tensor parallelism | per-rank emission of the denoiser, exact F32 all-reduce, the ServingContract `TensorParallel` gap closed for ggml_cuda | family folder | **2x A40** bf16 at 4096^2: velocity versus one GPU within the floor; timings recorded | 5 |
-| **S10** Legacy deletion | delete the §1.6 deletable list; retire `TS_H3_IMAGE_VAE_BATCH` (and `TS_H3_INT8_MATMUL` per D4) through the removed-names registry (a hard error naming the replacement); golden fixtures frozen before deletion; docs | `MiniMaxH3/*Image*`, `MiniMaxH3DiT.cs`, `MiniMaxH3Config.cs`, `MiniMaxH3WeightFile.cs`, `ggml_ops_minimax_h3.cpp`, `GgmlNative.cs`, `examples/comfyui/profiles/*` | the whole suite; H3 video regression (DitProbe bit-exact, Turbo LoRA tests); a final **H100** smoke run of T2I and edit | 2 |
+| **S10** Legacy deletion (done: "S10, as built", §1.6) | delete the §1.6 deletable list; retire `TS_H3_IMAGE_VAE_BATCH` (and `TS_H3_INT8_MATMUL` per D4) through the removed-names registry (a hard error naming the replacement); golden fixtures frozen before deletion; docs | `MiniMaxH3/*Image*`, `MiniMaxH3DiT.cs`, `MiniMaxH3Config.cs`, `MiniMaxH3WeightFile.cs`, `ggml_ops_minimax_h3.cpp`, `GgmlNative.cs`, `examples/comfyui/profiles/*` | the whole suite; H3 video regression (DitProbe bit-exact, Turbo LoRA tests); a final **H100** smoke run of T2I and edit | 2 |
 | **S11** (later, with H3 video) | the conditioner and vision tower on the shared decoder runtime (prefill to the layer-50 hidden state, DeepStack injection) | `SharedDecoder/*` | text-phase <= legacy x 1.02; hidden-state parity | 5+ |
 
 Order: S1 -> S2 -> S3 -> S4 (text-to-image parity, production switched) -> S5 -> S6 (editing)
@@ -1080,7 +1098,7 @@ S4, S5 and S7. The total is about 43 agent-days, plus 5 for S9.
 | D1 | Which upstream defines an edit's noise and seed streams: diffusers (MiniMax's pipeline; SGLang mirrors its API) or ComfyUI (fixed seed 42 for the posterior, references restart the seed) | **diffusers**. Same seed plus same inputs gives MiniMax's own stream; ComfyUI is reviewed visually |
 | D2 | Text-to-image schedule: keep ComfyUI's "simple over the grid" (today's) or switch to the exact grid (diffusers) | **keep today's** (the bit-exact no-regression gate); revisit separately |
 | D3 | Adopt upstream's 4 MP generation floor (smaller requests sample larger and are resized down) | **adopt**, model-declared, no new flag; the pDMD contract lowers it to the asked size (1024 px; S7); TensorAgent turns use the model's area |
-| D4 | int8 products (`TS_H3_INT8_MATMUL`, 17% faster at 16 MP, 17.5-19.8 dB from bf16) | **keep as an option**, one spelling for H3 image and video: config key `diffusion-products` (`bf16` default, `int8`), the CLI `--diffusion-products`; retire `TS_H3_INT8_MATMUL` with a hard error |
+| D4 | int8 products (`TS_H3_INT8_MATMUL`, 17% faster at 16 MP, 17.5-19.8 dB from bf16) | **keep as an option**, one spelling for H3 image and video: config key `diffusion-products` (`bf16` default, `int8`), the CLI `--diffusion-products`; retire `TS_H3_INT8_MATMUL` with a hard error. (S10: done, with `int8-all` added for the video VAE's int8 products) |
 | D5 | When legacy goes: in the switching change (S4, the unified-execution policy) or after editing and LoRA (S10) | **S10**, with legacy reachable only through a test seam after S4 (no user switch), because legacy is the text-to-image oracle while S5-S7 change shared code |
 | D6 | Text encoder and vision tower: wrap the native ones (shared with H3 video) now, or migrate them in this series | **wrap now**; migrate with H3 video (S11) |
 | D7 | Catalog LoRAs | TensorAgent: **linoyts pDMD 2-step only**. Configs: linoyts, akhaliq-comfy, Realem. Exclude NSFW (Tadness x2, training-assistant), training adapters (Fizgig), experiments (t8star/Resize8004, SimpleTuner), mirrors and waryusya |

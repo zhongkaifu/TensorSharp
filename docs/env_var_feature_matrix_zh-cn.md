@@ -260,15 +260,15 @@ TestMatrix 配置中 sweep。
 
 ## 矩阵外的 MiniMax-H3-Image 开关
 
-MiniMax-H3-Image 运行在共享扩散运行时上，其驻留计划、VAE 程序和拒绝逻辑都不需要变量。下面是它仍会读取的
-变量，以及一个已不再读取的变量；均未注册到 `EnvVarMatrix.All`。实测数据见[模型指南](models/minimax-h3-image_zh-cn.md)。
+MiniMax-H3-Image 运行在共享扩散运行时上，其驻留计划、VAE 程序和拒绝逻辑都不需要变量。下面是它会读取的
+变量，以及两个已移除的变量；均未注册到 `EnvVarMatrix.All`。实测数据见[模型指南](models/minimax-h3-image_zh-cn.md)。
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描值 | 默认扫描 |
 |---|---|---|---|---|---|
 | `TS_VIDEO_TEXT_ENCODER` / `TS_VIDEO_VAE` / `TS_VIDEO_TOKENIZER` | MiniMax-H3-Image（以及 MiniMax-H3） | 文本编码器 GGUF、图像 VAE，以及存放 `vocab.json`、`merges.txt` 和 `tokenizer_config.json` 的文件夹，与 `--video-text-encoder`、`--video-vae` 的设置相同；TensorAgent 根据其目录条目发布这些变量 | 按文件名在去噪器旁（及其上一级文件夹）查找 | 未注册 | 否 |
-| `TS_H3_INT8_MATMUL` | `ggml_cuda` 上走 cuBLAS 的 MiniMax-H3-Image 与 MiniMax-H3 DiT 乘法（BF16 权重，以及走同一路径的 Q4_K 投影） | `1` 在每次调用时把每个权重行和每个 token 舍入为 int8，并在 int8 张量核上相乘：H100 上 16 MP 快 17%（bf16），A40 上 Q4_K_M 每步少 13-16%，与 bf16 图片相差 17.5-19.8 dB | 未设置（使用权重自身的乘法） | 未注册 | 否 |
+| `TS_DIFFUSION_PRODUCTS` | `ggml_cuda` 上走 cuBLAS 的扩散模型宽矩阵乘：MiniMax-H3-Image 与 MiniMax-H3 的 DiT（BF16 权重，以及走同一路径的 Q4_K 投影）、VAE 解码器的 F16 投影、Qwen-Image 2.1 的 Q4_K 乘法 | 由 `--diffusion-products`（配置键 `diffusion-products`）设置、原生乘法读取。`int8` 在每次调用时把 DiT 的每个权重行和每个 token 舍入为 int8，并在 int8 张量核上相乘：H100 上 16 MP 快 17%（bf16），A40 上 Q4_K_M 每步少 13-16%，与 bf16 图片相差 17.5-19.8 dB；`int8-all` 对 VAE 解码器的 F16 投影也这样做。未知取值在加载模型前即报配置错误。它取代 **`TS_H3_INT8_MATMUL`**，后者已移除（阶段 S10，决策 D4）：设置了它两个主机都会拒绝启动并给出该选项（`1` 即 `int8`，`all` 即 `int8-all`；单独的 `vae` 没有替代） | `bf16`（未设置：使用权重自身的乘法） | 未注册 | 否 |
 | `TS_H3_TE_GROUP` | MiniMax-H3 文本编码器主干（两个模型） | `N` 每次运行 N 层主干，并丢弃每组的设备副本（条件结果逐位一致）。MiniMax-H3-Image 在 20 GB 显卡上已不再需要它：流水线会在去噪前释放整个编码器 | 关闭（一次调用） | 未注册 | 否 |
-| `TS_H3_IMAGE_VAE_BATCH` | 仅早先的原生 MiniMax-H3-Image 解码器 | **生产路径已不再读取**（运行时的 VAE 程序自行确定图的大小，每次一行、最多 64 个图块）。只有迁移中保留作测试基准的旧解码器（以及 `eng/validation/MiniMaxH3ImageAB --legacy-vae-batch`）读取；该名称会随那部分代码一起停用，之后设置它会报错并给出替代方案 | 每次调用 64 个图块 | 未注册 | 否 |
+| `TS_H3_IMAGE_VAE_BATCH` | 已移除（阶段 S10） | 早先原生 MiniMax-H3-Image 解码器每次调用的图块数；解码器与该变量已随旧模型一起删除（运行时的 VAE 程序自行确定图的大小，每次一行、最多 64 个图块）。设置了它两个主机都会拒绝启动（`RemovedCliFlags`） | - | 未注册 | 否 |
 
 ## 矩阵外的投机解码变量
 

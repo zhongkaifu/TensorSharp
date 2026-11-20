@@ -62,7 +62,7 @@ TensorSharp.Server.Host --config config/minimax-h3-image.json
 `/v1/images/edits`（MiniMax 官方的 `examples/t2i.py` 与 `examples/edit.py` 无需修改即可使用，见
 [API 示例](../../TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md)）。ComfyUI 节点包为 **TensorSharp Image** 节点提供启动配置
 `minimax-h3-image`（`examples/comfyui/profiles/`），以及使用 int8 投影的
-`minimax-h3-image-int8`（`TS_H3_INT8_MATMUL=1`，见[性能](#性能)）。
+`minimax-h3-image-int8`（`--diffusion-products int8`，见[性能](#性能)）。
 
 请求参数：
 
@@ -250,7 +250,18 @@ TensorAgent 的聊天（其 `/api/chat` 轮次）会把每条消息与之前的�
   这一行的注意力是一次覆盖整行的 cuDNN 调用。任何一行在所有后端上都能解码：解码器的计算图按程序
   的节点数分配，而先前的原生解码在 `ggml_metal` 与 `ggml_cpu` 上每次调用超过 4 个瓦片就会中止
   （`GGML_ASSERT(cgraph->n_nodes < cgraph->size)`，2048x2048 及以上的图都会触发）。
-  `TS_H3_IMAGE_VAE_BATCH` 是那个解码器的变通办法，现已不再读取。
+  `TS_H3_IMAGE_VAE_BATCH` 是那个解码器的变通办法，已随它一起移除（阶段 S10）；设置了它，主机会拒绝启动。
+- **唯一路径。** 运行时是 MiniMax-H3-Image 的唯一路径：先前的原生模型（`MiniMaxH3ImageModel`、它的解码器
+  以及每步一个计算图的 DiT 前向）在阶段 S10 删除之前一直是测试的参照。它在合成测试数据上的输出已按后端冻结
+  （`InferenceWeb.Tests/Fixtures/MiniMaxH3Image/LegacyGoldens/`），运行时以此为准：在 `ggml_metal`（M5 Pro）与
+  `ggml_cuda`（RTX PRO 4500）上逐字节一致，其他环境在舍入误差范围内。在 ARM64 的 `ggml_cpu` 上，运行时采用 main
+  引入的 CPU 乘法（为 i8mm 与点积内核重排的权重、以未舍入激活计算的 BF16 乘法），先前的模型没有采用：在测试数据上
+  与其相差至多最大值的 2.5e-3（Q4_K），属舍入差异。
+- **乘法精度。** `--diffusion-products bf16|int8|int8-all`（配置键 `diffusion-products`；CLI 与服务器）选择
+  `ggml_cuda` 上宽矩阵乘的算术：`bf16`（默认）按原样运行（BF16 与 Q4_K 走 cuBLAS BF16，其他量化走 ggml 内核）；
+  `int8` 让 DiT 的投影在 int8 Tensor Core 上运行（见下文）；`int8-all` 再加上 VAE 解码器的 F16 投影。它取代
+  `TS_H3_INT8_MATMUL`（`1` 即 `int8`，`all` 即 `int8-all`），主机现在会按名称拒绝该旧变量。其他后端照旧按原样运行，
+  主机会提示一次。
 
 ## 内存
 
@@ -377,7 +388,7 @@ GEMM 内完成更新：`[W | up] · [x ; down x]`，深度 K + R（BF16 权重�
 |---|---:|---:|---:|---:|
 | Q4_K_M，第一张 | 3.25 s | 2.23 s | 1.22 s | 21.0 s |
 | Q4_K_M，后续 | 0.08 s | 2.24 s | 0.69 s | 14.3 s |
-| Q4_K_M，`TS_H3_INT8_MATMUL=1`，后续 | 0.08 s | 1.88 s | 0.68 s | 12.1 s |
+| Q4_K_M，`--diffusion-products int8`，后续 | 0.08 s | 1.88 s | 0.68 s | 12.1 s |
 | Q8_0，第一张（早先的原生路径，释放文本编码器；运行时生成的图片相同） | 3.6-4.0 s | 2.39 s | 1.18-1.21 s | 24.1-24.8 s |
 | bf16，第一张（去噪前释放文本编码器） | 3.07 s | 1.92 s | 1.20 s | 29.7 s |
 | bf16，后续（每次都从磁盘重新加载两者） | 4.27 s | 1.91 s | 0.73 s | 34.2 s |
@@ -386,7 +397,7 @@ GEMM 内完成更新：`[W | up] · [x ; down x]`，深度 K + R（BF16 权重�
 |---|---:|---:|---:|---:|
 | Q4_K_M，第一张 | 3.25 s | 11.42 s | 2.91 s | 77.8 s |
 | Q4_K_M，后续 | 0.07 s | 11.47 s | 2.40 s | 71.5 s |
-| Q4_K_M，`TS_H3_INT8_MATMUL=1`，后续 | 0.07 s | 9.96 s | 2.48 s | 62.5 s |
+| Q4_K_M，`--diffusion-products int8`，后续 | 0.07 s | 9.96 s | 2.48 s | 62.5 s |
 | bf16，第一张 | 3.36 s | 10.36 s | 3.09 s | 82.6 s |
 
 | M5 Pro，2048x2048 | 文本 | 每步 | 解码 | 整张图 |
@@ -467,13 +478,13 @@ TensorSharp 读取 bf16 DiT 与 Q4_K_M 编码器。ComfyUI 的采样时间取自
 |---|---:|---:|---:|---:|
 | ComfyUI 模板 | | 2.6 s（0.43 s/步） | | 3.97 s |
 | TensorSharp，bf16 投影 | 0.10 s | 3.09 s（0.51 s/步） | 0.28 s（121 个瓦片） | 4.38 s |
-| TensorSharp，`TS_H3_INT8_MATMUL=1`（`minimax-h3-image-int8`） | 0.09 s | 2.55 s（0.43 s/步） | 0.27 s | 3.88 s |
+| TensorSharp，`--diffusion-products int8`（`minimax-h3-image-int8`） | 0.09 s | 2.55 s（0.43 s/步） | 0.27 s | 3.88 s |
 
 | 4096x4096（16 MP） | 文本 | 去噪，6 步 | VAE 解码 | ComfyUI 任务 |
 |---|---:|---:|---:|---:|
 | ComfyUI 模板 | | 14.7 s（2.45 s/步） | | 19.9 s |
 | TensorSharp，bf16 投影 | 0.09 s | 15.8 s（2.63 s/步） | 0.95 s（441 个瓦片） | 19.6 s |
-| TensorSharp，`TS_H3_INT8_MATMUL=1`（`minimax-h3-image-int8`） | 0.09 s | 13.1 s（2.18 s/步） | 0.9 s | 16.9 s |
+| TensorSharp，`--diffusion-products int8`（`minimax-h3-image-int8`） | 0.09 s | 13.1 s（2.18 s/步） | 0.9 s | 16.9 s |
 
 “任务”指经由 TensorSharp Image 节点的整个 ComfyUI prompt：TensorSharp 的生成及其 PNG 编码
 （4 MP 时不到 0.1 s，16 MP 时 0.1 至 0.4 s）、节点的下载与解码，以及 ComfyUI 的 SaveImage
@@ -481,7 +492,8 @@ TensorSharp 读取 bf16 DiT 与 Q4_K_M 编码器。ComfyUI 的采样时间取自
 时 int8 为 9.1 s、bf16 为 9.5 s，ComfyUI 的第一个任务为 55.1 s。
 
 - **投影。** BF16 DiT 的宽矩阵乘（qkv、out、fc1、fc2）以原样权重在 cuBLAS 上运行；
-  `TS_H3_INT8_MATMUL=1` 每次调用时把每一行权重和每个 token 舍入为 int8，在 int8 Tensor Core 上相乘，
+  `--diffusion-products int8`（阶段 S10 改名之前以 `TS_H3_INT8_MATMUL=1` 测得，同一路径）每次调用时把每一行权重和
+  每个 token 舍入为 int8，在 int8 Tensor Core 上相乘，
   与 ComfyUI INT8 检查点属同一精度档次。它是可选项，因为会改变图像：与同一种子的 bf16 图像相比，
   PSNR 为 17.5 至 19.8 dB（构图相同，细节不同）。fc2 直接读取 fc1 的 [gate | value] 输出，在收窄
   （或舍入）输入时完成 SwiGLU，省去了 SwiGLU 对 [14336, token 数] 张量的单独一遍（16 MP 时每块 1.5 ms）。
@@ -520,7 +532,10 @@ TensorAgent 应用在模型页的 MiniMax H3 下列出两个条目：
 - **不标记为实验性。** 它们相对 bf16 DiT 的画质已经实测（见[量化版本](#量化版本)），并写在每个条目的说明里：
   Q4_K_M 是四档中差距最大的一档，可能多出零散的文字；Q8_0 最接近。
 - **图片与插件。** 每轮请求模型自己的 2048x2048 面积（见[多轮对话](#多轮对话)）。LoRA 面板为两个条目提供一个插件：
-  pDMD 2-step（linoyts @c07d96e5，社区许可）；启用后一张图只需 2 步，该轮请求它蒸馏时的 1024x1024。其余
+  pDMD 2-step（linoyts @c07d96e5，社区许可）；启用后一张图只需 2 步，该轮请求它蒸馏时的 1024x1024。它是同一许可下的
+  模型衍生物，只有在接受该许可之后才会下载：为任一条目接受过当前文本（即该条目自身下载时询问的那次）即可覆盖它；没有
+  接受记录时，下载在获取任何内容之前就被拒绝（`POST /api/agent/loras/{id}/download` 返回 `409`，带 `licenseRequired`、
+  需要为之接受的条目及其条款；拒绝该条目的许可会撤销这一覆盖）。其余
   MiniMax-H3-Image 插件配置（akhaliq 的 ComfyUI 转换版、Seedreamstyle 风格插件）仅供 CLI 与服务端使用（决策 D7）。
 - **许可接受。** MiniMax-H3-Image 的许可限制了谁可以在哪里使用它，因此在条目第一次下载之前，模型页会显示其
   条款：界面语言的摘要（不包括美国、欧盟、英国和大韩民国的地域限制；年收入超过 100 万美元或提供托管服务时须

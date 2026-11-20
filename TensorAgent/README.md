@@ -1720,7 +1720,11 @@ entry and per license revision (the SHA-256 of that text), so another entry, or 
 ships a new text, asks again. The gate is in the store and the download manager, not the page:
 a resume, the debug download hook and `POST /api/agent/catalog/{id}/download` (which answers
 `409` with the terms; the answer goes to `POST /api/agent/catalog/{id}/license`) are refused the
-same way. Entries without terms are unaffected. See
+same way. Entries without terms are unaffected. A LoRA plug-in under its base model's license
+(`CatalogLora.LicenseTerms`; today the MiniMax-H3-Image pDMD plug-in) downloads only once that
+license is accepted: an acceptance of the same revision for an entry it applies to covers it, and
+without one its download (the store, the host, `POST /api/agent/loras/{id}/download`, which
+answers `409` with the base entry's terms) is refused before anything is fetched. See
 [the MiniMax-H3-Image guide](../docs/models/minimax-h3-image.md#tensoragent).
 
 An entry published as several shards of one model (Qwen3.8 Flash Next's three gguf-split

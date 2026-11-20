@@ -72,7 +72,7 @@ The server serves it on the image routes (`/api/image-generate`, `/api/image-edi
 The ComfyUI node pack has a
 launch profile for it, `minimax-h3-image` (`examples/comfyui/profiles/`), for the
 **TensorSharp Image** node, and `minimax-h3-image-int8` with int8 projections
-(`TS_H3_INT8_MATMUL=1`, [Performance](#performance)).
+(`--diffusion-products int8`, [Performance](#performance)).
 
 Request settings:
 
@@ -324,7 +324,23 @@ selection and words). In TensorAgent:
   program, where the earlier native decode aborted on `ggml_metal` and `ggml_cpu` past
   four tiles a call (`GGML_ASSERT(cgraph->n_nodes < cgraph->size)`, which every
   2048x2048 or larger picture hit). `TS_H3_IMAGE_VAE_BATCH` was that decoder's
-  workaround and is no longer read.
+  workaround; it went with it (stage S10), and a host refuses to start with it set.
+- **One path.** The runtime is the only MiniMax-H3-Image path: the earlier native model
+  (`MiniMaxH3ImageModel`, its decoder and its one-graph-a-step DiT forward) was the tests'
+  oracle until stage S10 deleted it. Its outputs on the synthetic fixtures are frozen per
+  backend (`InferenceWeb.Tests/Fixtures/MiniMaxH3Image/LegacyGoldens/`) and the runtime is
+  held to them: byte for byte on `ggml_metal` (M5 Pro) and `ggml_cuda` (RTX PRO 4500), within
+  rounding elsewhere. On ARM64 `ggml_cpu` the runtime takes the CPU products main adopted
+  (weights repacked for the i8mm and dot-product kernels, BF16 products over unrounded
+  activations), which the earlier model did not: up to 2.5e-3 of the largest value from it
+  on the fixtures (Q4_K), a rounding difference.
+- **Products.** `--diffusion-products bf16|int8|int8-all` (the config key
+  `diffusion-products`; the CLI and the server) chooses the wide products' arithmetic on
+  `ggml_cuda`: `bf16`, the default, runs them as stored (BF16 and Q4_K on cuBLAS BF16, other
+  quantizations on ggml's kernels); `int8` puts the DiT's on int8 tensor cores (below);
+  `int8-all` adds the VAE decoder's F16 projections. It replaces `TS_H3_INT8_MATMUL` (`1` is
+  `int8`, `all` is `int8-all`), which a host now refuses by name. Other backends run the
+  products as stored, as before, and the host says so once.
 
 ## Memory
 
@@ -484,7 +500,7 @@ and includes the uploads; later pictures are warm.
 |---|---:|---:|---:|---:|
 | Q4_K_M, first picture | 3.25 s | 2.23 s | 1.22 s | 21.0 s |
 | Q4_K_M, later pictures | 0.08 s | 2.24 s | 0.69 s | 14.3 s |
-| Q4_K_M, `TS_H3_INT8_MATMUL=1`, later pictures | 0.08 s | 1.88 s | 0.68 s | 12.1 s |
+| Q4_K_M, `--diffusion-products int8`, later pictures | 0.08 s | 1.88 s | 0.68 s | 12.1 s |
 | Q8_0, first picture (earlier native path, the text encoder released; the runtime's pictures are the same) | 3.6-4.0 s | 2.39 s | 1.18-1.21 s | 24.1-24.8 s |
 | bf16, first picture (the text encoder released before the denoise) | 3.07 s | 1.92 s | 1.20 s | 29.7 s |
 | bf16, later pictures (both reloaded from disk each time) | 4.27 s | 1.91 s | 0.73 s | 34.2 s |
@@ -493,7 +509,7 @@ and includes the uploads; later pictures are warm.
 |---|---:|---:|---:|---:|
 | Q4_K_M, first picture | 3.25 s | 11.42 s | 2.91 s | 77.8 s |
 | Q4_K_M, later pictures | 0.07 s | 11.47 s | 2.40 s | 71.5 s |
-| Q4_K_M, `TS_H3_INT8_MATMUL=1`, later pictures | 0.07 s | 9.96 s | 2.48 s | 62.5 s |
+| Q4_K_M, `--diffusion-products int8`, later pictures | 0.07 s | 9.96 s | 2.48 s | 62.5 s |
 | bf16, first picture | 3.36 s | 10.36 s | 3.09 s | 82.6 s |
 
 | M5 Pro, 2048x2048 | Text | Per step | Decode | Picture |
@@ -587,13 +603,13 @@ encoder. ComfyUI's sampling time is its progress bar; TensorSharp's phases are t
 |---|---:|---:|---:|---:|
 | ComfyUI template | | 2.6 s (0.43 s/step) | | 3.97 s |
 | TensorSharp, bf16 projections | 0.10 s | 3.09 s (0.51 s/step) | 0.28 s (121 tiles) | 4.38 s |
-| TensorSharp, `TS_H3_INT8_MATMUL=1` (`minimax-h3-image-int8`) | 0.09 s | 2.55 s (0.43 s/step) | 0.27 s | 3.88 s |
+| TensorSharp, `--diffusion-products int8` (`minimax-h3-image-int8`) | 0.09 s | 2.55 s (0.43 s/step) | 0.27 s | 3.88 s |
 
 | 4096x4096 (16 MP) | Text | Denoise, 6 steps | VAE decode | ComfyUI job |
 |---|---:|---:|---:|---:|
 | ComfyUI template | | 14.7 s (2.45 s/step) | | 19.9 s |
 | TensorSharp, bf16 projections | 0.09 s | 15.8 s (2.63 s/step) | 0.95 s (441 tiles) | 19.6 s |
-| TensorSharp, `TS_H3_INT8_MATMUL=1` (`minimax-h3-image-int8`) | 0.09 s | 13.1 s (2.18 s/step) | 0.9 s | 16.9 s |
+| TensorSharp, `--diffusion-products int8` (`minimax-h3-image-int8`) | 0.09 s | 13.1 s (2.18 s/step) | 0.9 s | 16.9 s |
 
 The job is the ComfyUI prompt through the TensorSharp Image node: TensorSharp's picture
 plus its PNG (under 0.1 s at 4 MP, 0.1 to 0.4 s at 16 MP), the node's download and
@@ -602,7 +618,8 @@ decode, and ComfyUI's SaveImage, which a ComfyUI-only job pays as well (2.0 s fo
 and 9.5 s with bf16 at 4 MP, against 55.1 s for ComfyUI's first job.
 
 - **Projections.** A BF16 DiT's wide products (qkv, out, fc1, fc2) run on cuBLAS with
-  the weight as stored; `TS_H3_INT8_MATMUL=1` rounds each weight row and each token
+  the weight as stored; `--diffusion-products int8` (measured as `TS_H3_INT8_MATMUL=1`, the
+  same route, before stage S10 renamed it) rounds each weight row and each token
   to int8 per call and multiplies on int8 tensor cores, the precision class of
   ComfyUI's INT8 checkpoint. It is opt-in because it changes the picture: against
   the bf16 picture of the same seed it measured 17.5 to 19.8 dB PSNR (same
@@ -658,7 +675,11 @@ an edit that names them `<Picture 1>`, `<Picture 2>`, ... in order, as for Qwen-
   can add stray lettering; Q8_0 is the closest.
 - **Pictures and the plug-in.** A turn asks for the model's own 2048x2048 area ([Multi-turn](#multi-turn)). The LoRA
   sheet offers one plug-in for both entries, pDMD 2-step (linoyts @c07d96e5, under the Community License): with it a
-  picture takes 2 steps and the turn asks for 1024x1024, the size it was distilled at. The other MiniMax-H3-Image
+  picture takes 2 steps and the turn asks for 1024x1024, the size it was distilled at. It is a Model Derivative under
+  the same license, so it downloads only once that license is accepted: an acceptance of the current text for either
+  entry covers it (the one their own download asked for), and without one its download is refused before anything is
+  fetched (`POST /api/agent/loras/{id}/download` answers `409` with `licenseRequired`, the entry to accept it for and
+  its terms; a decline of that entry withdraws the cover). The other MiniMax-H3-Image
   plug-in configs (akhaliq's ComfyUI conversion, the Seedreamstyle adapter) are for the CLI and server only (decision
   D7).
 - **License acceptance.** MiniMax-H3-Image's license limits where and by whom it may be used, so
