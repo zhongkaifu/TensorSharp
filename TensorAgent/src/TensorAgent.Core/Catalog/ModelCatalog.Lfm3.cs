@@ -83,8 +83,10 @@ public static partial class ModelCatalog
         ContextLength = 32768,
         KvBytesPerToken = Lfm3KvBytesPerToken,
         KvCacheDtype = "f16",
-        // Greedy with no repetition penalty, the publisher's generation_config for text.
-        Sampling = new CatalogSampling(0.0f, 1, 1.0f, 0.0f) { RepetitionPenalty = 1.0f },
+        // The LFM3 card's general preset, as for the text entry (config/lfm3-omni-2b.json says why):
+        // the Omni card's greedy decoding with no penalty made the 2B model repeat a sentence over
+        // and over in 9-12% of this app's chats (eng/lfm3/loop). The penalty is the engine's 1.1.
+        Sampling = new CatalogSampling(0.1f, 50, 1.0f, 0.0f),
         SupportsThinking = false,
         Experimental = true,
         License = Lfm3License,

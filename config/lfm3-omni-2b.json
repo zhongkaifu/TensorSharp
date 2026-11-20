@@ -22,13 +22,21 @@
   "backend": "ggml_metal",
   "max-tokens": 4096,
 
-  // Greedy, as the publisher's generation_config.json (do_sample false,
-  // repetition_penalty 1.0) and the GGUF's general.sampling.* say for text output.
-  "temperature": 0,
-  "top-k": 1,
+  // Text replies: the LFM3 card's general-purpose preset (the LFM3-1.7B card, same LFM3
+  // backbone): temperature 0.1, top_k 50, repetition_penalty 1.1 over the whole output, with
+  // HF's top_p 1.0 and no min_p. The Omni card and generation_config.json say greedy with no
+  // penalty, but decoded that way the 2B model repeats a sentence, a table row or a stanza
+  // over and over: on eng/lfm3/loop's 50 en/zh chats 3% of replies under vLLM BF16, 7-10%
+  // under llama.cpp Q4_K_M, 7-9% here (the engines agree), and 12-16% with the server's
+  // skills on. With this preset 0-3% of the plain replies looped, and GSM8K, IFEval and ASR
+  // held (docs/models/lfm3.md#sampling). Speech keeps its own sampling (the mmproj's:
+  // temperature 0.4, penalty 1.2 over 64 frames).
+  "temperature": 0.1,
+  "top-k": 50,
   "top-p": 1,
   "min-p": 0,
-  "repeat-penalty": 1,
+  "repeat-penalty": 1.1,
+  "repeat-last-n": -1,
 
   "model": {
     "path": "${root}/LFM3-Omni-2B-Q4_K_M.gguf",
