@@ -123,9 +123,7 @@ public sealed record CatalogSampling(float Temperature, int TopK, float TopP, fl
 {
     /// <summary>
     /// The card's repetition penalty, or null for the engine's default (1.1, which coding
-    /// turns lower to 1.0). Stated where the card disagrees with that default: LFM3-Omni
-    /// decodes greedily with no penalty, and a penalty on greedy transcription would
-    /// rewrite repeated words.
+    /// turns lower to 1.0). Stated where the card disagrees with that default.
     /// </summary>
     public float? RepetitionPenalty { get; init; }
 }

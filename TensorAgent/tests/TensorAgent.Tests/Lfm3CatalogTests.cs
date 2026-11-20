@@ -48,12 +48,13 @@ public sealed class Lfm3CatalogTests
         Assert.False(model.Modalities.HasFlag(CatalogModalities.AudioOutput));
         Assert.False(model.IsVideoGenerator);
         Assert.False(model.SupportsThinking);
-        // Greedy with no repetition penalty, as the publisher's generation_config says.
-        Assert.Equal(new CatalogSampling(0.0f, 1, 1.0f, 0.0f) { RepetitionPenalty = 1.0f }, model.Sampling);
+        // The LFM3 card's general preset, as the text entry: greedy decoding without a penalty
+        // (the Omni card's) made replies repeat a sentence over and over (eng/lfm3/loop).
+        Assert.Equal(new CatalogSampling(0.1f, 50, 1.0f, 0.0f), model.Sampling);
         var defaults = AgentAppHost.SamplingDefaultsFor(model).Values;
-        Assert.Equal(0.0f, defaults.Temperature);
-        Assert.Equal(1, defaults.TopK);
-        Assert.Equal(1.0f, defaults.RepetitionPenalty);
+        Assert.Equal(0.1f, defaults.Temperature);
+        Assert.Equal(50, defaults.TopK);
+        Assert.Equal(1.1f, defaults.RepetitionPenalty);
     }
 
     [Theory]

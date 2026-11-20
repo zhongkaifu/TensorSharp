@@ -557,6 +557,29 @@ namespace TensorSharp.AgentHost.Skills
             return SkillToolResult.Success(sb.ToString());
         }
 
+        /// <summary>
+        /// What a <see cref="ReadToolName"/> call reads, as a key: the resolved skill, the path as
+        /// <see cref="ExecuteRead"/> resolves it (SKILL.md when none is named, the skill's own prefix
+        /// dropped) and the byte offset. Null for any other call, or a read naming no skill this
+        /// conversation has. A skill's files do not change while a turn runs, so two calls with
+        /// the same key return the same text: the chat loop answers a repeat from the first result
+        /// instead of sending the file again (Claude Code's "unchanged since last read").
+        /// </summary>
+        public static string? RepeatableReadKey(ToolCall? call, SkillToolContext? context)
+        {
+            if (call == null || context == null || !string.Equals(call.Name, ReadToolName, StringComparison.Ordinal))
+                return null;
+            string? skillName = ReadString(call, "skill");
+            if (string.IsNullOrWhiteSpace(skillName) || !context.TryResolve(skillName, out Skill? skill, out _))
+                return null;
+            string? path = ReadString(call, "path") ?? ReadString(call, "file") ?? ReadString(call, "resource");
+            if (string.IsNullOrWhiteSpace(path))
+                path = SkillManifestParser.SkillFileName;
+            path = StripSkillPrefix(path!, skill!.Id);
+            long offset = ReadInt64(call, "offset") ?? 0;
+            return skill.Id + "\n" + path + "\n" + offset.ToString(CultureInfo.InvariantCulture);
+        }
+
         private static SkillToolResult ExecuteRead(ToolCall call, SkillToolContext context)
         {
             string? skillName = ReadString(call, "skill");

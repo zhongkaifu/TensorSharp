@@ -96,6 +96,17 @@ namespace TensorSharp.Server.Skills
         /// </summary>
         public List<SkillToolInvocation> Invocations { get; } = new();
 
+        /// <summary>
+        /// The calls of this turn whose repeat cannot return anything new (<see cref="SkillChatLoop.RepeatKey"/>): the
+        /// skill files read, and the coordination calls that failed their checks. A plan lives for one turn; the next
+        /// turn's history no longer holds the tool results, so it starts over.
+        /// </summary>
+        internal Dictionary<string, RepeatedToolCall> TurnCalls { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>The model made such a call again after being told it was a repeat: it is stuck, and the loop stops
+        /// answering tools for this turn.</summary>
+        internal bool StuckRepeating { get; set; }
+
         internal MultiAgentOptions? MultiAgent { get; private set; }
         internal MultiAgentSession? Agents { get; set; }
 
@@ -833,5 +844,16 @@ namespace TensorSharp.Server.Skills
         /// merge into the leading system message, and both leave their input alone.
         /// </summary>
         public List<ChatMessage> Apply(List<ChatMessage> messages) => SkillPrompt.Apply(messages, Prompt);
+    }
+
+    /// <summary>A call of this turn whose repeat cannot return anything new, and how often the model asked for it again.</summary>
+    internal sealed class RepeatedToolCall
+    {
+        public string Tool { get; init; }
+        public string SkillId { get; init; }
+        public string Path { get; init; }
+        /// <summary>The error the call returned, or null for a skill file that was read.</summary>
+        public string Error { get; init; }
+        public int AskedAgain { get; set; }
     }
 }

@@ -340,7 +340,9 @@ GGUF). `RenderLfm3` reproduces the same text for a GGUF without a template.
   reasoning is; a client's next request may send back either form, and both continue
   the conversation's KV cache. A block the model opens itself is capped like Gemma 4's
   unrequested channel (closed at a line break, after at most 64 tokens).
-- LFM3-Omni does not reason: with thinking on it closes the block at once.
+- LFM3-Omni does not reason (its card: `enable_thinking=True` is not supported): with
+  thinking on it closes the block at once, in 58 of 58 replies of the loop study, so the
+  Web UI's thinking switch changes nothing for it (loops 8 against 9 of 58, greedy).
 
 ### Tool calls
 
@@ -450,10 +452,33 @@ holds the vision tower (`lfm3vl`) and the audio tower (`lfm3a`), both loaded fro
 | Model | Card / GGUF `general.sampling` | Configs |
 |---|---|---|
 | LFM3-1.7B | temperature 0.1, top_k 50, repetition_penalty 1.1 (math/STEM: temperature 1.0, top_p 0.95, top_k 20) | the card's general preset, top-p 1, min-p 0, `repeat-last-n -1` |
-| LFM3-Omni-2B | greedy, repetition_penalty 1.0 | temperature 0, top-k 1, repeat-penalty 1 |
+| LFM3-Omni-2B | greedy, repetition_penalty 1.0 | the LFM3 card's general preset, as the 1.7B: temperature 0.1, top-k 50, top-p 1, min-p 0, repeat-penalty 1.1, `repeat-last-n -1` |
 
 The server ignores `general.sampling`, so the configs pin these values (the CLI reads
-it for chat). TensorSharp's repetition penalty looks back over the last
+it for chat). TensorAgent's catalog entries send the same values, with the engine's
+64-token penalty window.
+
+**Why LFM3-Omni is not decoded greedily.** Decoded as its card says (greedy, no penalty;
+llama.cpp takes that from `general.sampling`, vLLM from `generation_config.json`), the 2B
+model repeats a sentence, a table row or a stanza until max_tokens ends the reply. On the
+50 English and Chinese chats of `eng/lfm3/loop` (58 replies: answers, lists, code,
+stories, summaries, multi-turn, image and audio input; 2026-11-20) the share of replies
+that loop is 3% on vLLM BF16, 7% on llama.cpp Q4_K_M (Metal) and 7-10% (CUDA), and 7%
+(ggml_metal) and 9% (ggml_cuda) on TensorSharp Q4_K_M with the agent features off; on
+Metal 45 of TensorSharp's 58 greedy replies are llama.cpp's text exactly, so this is the
+model, not the engine. With the server's skills on, as the Web UI, the OpenAI endpoint and
+TensorAgent run by default, 9-16% looped: greedy decoding also repeated the same tool
+call round after round (see [Agent Skills](../agent_skills.md) for the repeat guard). With
+the LFM3 preset the same chats loop in 0-3% of plain replies, and with the repeat guard
+too in 0-3% on the Web UI and OpenAI endpoints (ggml_metal and ggml_cuda) and 2-6% in
+TensorAgent. Quality holds: GSM8K
+(first 200, thinking off) 75.5% greedy against 76.0% (llama.cpp greedy 76.0%; vLLM BF16
+78.0% greedy, 79.0% with the preset), the 33-prompt instruction set 31 of 33 either way,
+and ASR word error rate 1.5% either way on 8 clips, one of which repeats words on purpose
+("no, no, no"). Decoding speed is unchanged (ggml_metal 182-194 tokens/s before and
+after, ggml_cuda 411-444 before and 422-444 after).
+Spoken replies keep the projector's own speech sampling (temperature 0.4, penalty 1.2
+over 64 frames); their text is the reply the preset wrote. TensorSharp's repetition penalty looks back over the last
 `repeat_last_n` **generated** tokens; llama-server also counts the prompt's last
 `repeat_last_n` tokens, vLLM and HF the whole prompt and output, and SGLang the whole
 output. `repeat-last-n -1` matches SGLang; compare with other engines at repeat penalty

@@ -224,7 +224,8 @@ GGUF 模板按原样渲染：TensorSharp 的 Jinja 引擎把 `{% generation %}` 
     客户端，循环的每一轮都等到该轮结束后再输出。
   因此模型已写完的非流式回复与其流式回复在推理所在位置上仍可能不同；客户端在下一次请求中发回其中任一种形式，都能延续
   该对话的 KV 缓存。模型自己打开的推理块像 Gemma 4 的未请求通道一样被限制（最多 64 个 token，在换行处关闭）。
-- LFM3-Omni 不做推理：开启思考时它会立即关闭推理块。
+- LFM3-Omni 不做推理（其模型卡：不支持 `enable_thinking=True`）：开启思考时它会立即关闭推理块，循环研究中 58 条回复无一例外，
+  因此 Web UI 的思考开关对它没有影响（贪心时循环 8 条对 9 条，共 58 条）。
 
 ### 工具调用
 
@@ -294,9 +295,22 @@ LFM3-Omni 在多模态展开器运行之前的占位符约定（同一条消息�
 | 模型 | 模型卡 / GGUF `general.sampling` | 配置 |
 |---|---|---|
 | LFM3-1.7B | temperature 0.1、top_k 50、repetition_penalty 1.1（数学/理工：temperature 1.0、top_p 0.95、top_k 20） | 模型卡通用预设，top-p 1、min-p 0、`repeat-last-n -1` |
-| LFM3-Omni-2B | 贪心，repetition_penalty 1.0 | temperature 0、top-k 1、repeat-penalty 1 |
+| LFM3-Omni-2B | 贪心，repetition_penalty 1.0 | 与 1.7B 相同的 LFM3 模型卡通用预设：temperature 0.1、top-k 50、top-p 1、min-p 0、repeat-penalty 1.1、`repeat-last-n -1` |
 
-服务端不读取 `general.sampling`，因此配置文件固定了这些值（CLI 在对话时会读取它）。TensorSharp 的重复惩罚只回看最近
+服务端不读取 `general.sampling`，因此配置文件固定了这些值（CLI 在对话时会读取它）。TensorAgent 的模型目录条目发送相同的值，
+惩罚窗口用引擎默认的 64 个 token。
+
+**为什么 LFM3-Omni 不用贪心解码。** 按其模型卡解码（贪心、无惩罚；llama.cpp 从 `general.sampling`、vLLM 从
+`generation_config.json` 取得这一设置）时，这个 2B 模型会反复输出同一句话、同一行表格或同一段诗，直到 max_tokens 截断回复。
+在 `eng/lfm3/loop` 的 50 段中英文对话上（58 条回复：问答、列表、代码、故事、摘要、多轮、图像与音频输入；2026-11-20），出现循环
+的回复比例为：vLLM BF16 3%，llama.cpp Q4_K_M 7%（Metal）与 7-10%（CUDA），关闭智能体功能时 TensorSharp Q4_K_M 7%（ggml_metal）
+与 9%（ggml_cuda）；在 Metal 上 TensorSharp 的 58 条贪心回复中有 45 条与 llama.cpp 逐字相同，因此这是模型本身的行为，而非引擎
+问题。开启服务端技能时（Web UI、OpenAI 端点与 TensorAgent 的默认情况），循环比例为 9-16%：贪心解码还会一轮接一轮重复同一个
+工具调用（重复调用的处理见 [Agent Skills（英文）](../agent_skills.md)）。改用 LFM3 预设后，同样的对话在不开智能体时只有 0-3%
+的回复循环；再加上重复调用防护，Web UI 与 OpenAI 端点（ggml_metal 与 ggml_cuda）为 0-3%，TensorAgent 为 2-6%。质量不变：GSM8K（前 200 题，关闭思考）贪心 75.5%、预设 76.0%（llama.cpp 贪心 76.0%；vLLM BF16 贪心 78.0%、预设
+79.0%），33 条指令遵循题两者都是 31 题通过，8 段语音（其中一段故意重复词语，如 "no, no, no"）的 ASR 词错误率两者都是 1.5%。
+解码速度不变（ggml_metal 修改前后均为 182-194 tokens/s，ggml_cuda 修改前 411-444、修改后 422-444）。语音回复仍使用投影器自带的语音采样（temperature 0.4，最近 64 帧
+上的惩罚 1.2），其文字就是按该预设生成的回复。TensorSharp 的重复惩罚只回看最近
 `repeat_last_n` 个**生成的** token；llama-server 还计入提示词最后 `repeat_last_n` 个 token，vLLM 与 HF 计入整个提示词和输出，
 SGLang 计入全部输出。`repeat-last-n -1` 与 SGLang 一致；与其他引擎比较时请使用 repeat penalty 1.0 并贪心解码。
 

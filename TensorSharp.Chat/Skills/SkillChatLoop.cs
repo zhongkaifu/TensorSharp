@@ -505,12 +505,20 @@ namespace TensorSharp.Server.Skills
                         break;
                     }
                 }
+                // Told once that the file it asked for again had not changed, the model asked again: it is
+                // stuck re-reading. More rounds would only repeat the same sentence and the same call (to the
+                // round cap), so the final round answers from what it has read.
+                if (plan.StuckRepeating)
+                    break;
             }
 
             // Out of rounds. Tell the model so, in the conversation, and let it answer
             // from what it has — the alternative is returning a bare tool call to a
             // client that cannot service it, which shows the user nothing at all.
-            if (!knowledgeSynthesis)
+            if (plan.StuckRepeating)
+                logger?.LogWarning(LogEventIds.SkillLoopCapped,
+                    "skills.loop.repeating rounds={Rounds} skills={Skills}", roundsRun, plan.DescribeSelection());
+            else if (!knowledgeSynthesis)
                 logger?.LogWarning(LogEventIds.SkillLoopCapped,
                     "skills.loop.capped rounds={Rounds} skills={Skills}", maxRounds, plan.DescribeSelection());
 
@@ -522,7 +530,7 @@ namespace TensorSharp.Server.Skills
             if (plan.ToolContext.Knowledge != null)
                 working = KnowledgeTools.BuildSynthesisMessages(working, plan.ToolContext.Knowledge, retrieval, guardCompletion);
             else
-                working.Add(BuildResult(plan,
+                working.Add(BuildResult(plan, plan.StuckRepeating ? StuckRepeatingNotice :
                     "Error: the limit on tool calls for this turn has been reached. Answer now using what you have "
                     + "already read, and say which part you could not check."));
 
@@ -999,6 +1007,7 @@ namespace TensorSharp.Server.Skills
                 // deletion until the worker's finally has run.
                 IDisposable workspaceOperation = null;
                 Task<SkillToolResult> execution;
+                string repeatKey = RepeatKey(call, plan);
                 if (TryBuildRoutedPrerequisiteFailure(
                     call, plan.CompletionRequirement, out SkillToolResult prerequisiteFailure))
                 {
@@ -1006,6 +1015,17 @@ namespace TensorSharp.Server.Skills
                     // recorded, shown in the trace, and fed back to the model. The
                     // bundled script itself is deliberately never entered.
                     execution = Task.FromResult(prerequisiteFailure);
+                }
+                else if (repeatKey != null && plan.TurnCalls.TryGetValue(repeatKey, out RepeatedToolCall earlier))
+                {
+                    // Its result is already in this turn's conversation and would not change. Answering it
+                    // again is what kept a small model repeating itself: LFM3-Omni-2B read the same SKILL.md
+                    // (or retried the same refused spawn_agent) round after round, restating the same sentence
+                    // each time, until the round cap (eng/lfm3/loop). Claude Code answers a repeated Read so.
+                    earlier.AskedAgain++;
+                    if (earlier.AskedAgain >= 2)
+                        plan.StuckRepeating = true;
+                    execution = Task.FromResult(RepeatedCallResult(earlier));
                 }
                 else
                 {
@@ -1055,6 +1075,15 @@ namespace TensorSharp.Server.Skills
                         seconds: executionClock.Elapsed.TotalSeconds, detail: callDetail);
                 }
                 SkillToolResult result = await execution.ConfigureAwait(false);
+                if (repeatKey != null && !plan.TurnCalls.ContainsKey(repeatKey)
+                    && (repeatKey.StartsWith(FailedCallRepeatPrefix, StringComparison.Ordinal) ? !result.Ok : result.Ok))
+                {
+                    plan.TurnCalls[repeatKey] = new RepeatedToolCall
+                    {
+                        Tool = call.Name, SkillId = result.SkillId, Path = result.ResourcePath,
+                        Error = result.Ok ? null : result.Content,
+                    };
+                }
 
                 // A run shorter than one heartbeat never hit the loop above; its output
                 // still deserves to reach the screen before "finished".
@@ -1647,6 +1676,65 @@ namespace TensorSharp.Server.Skills
         /// drops <c>role: "tool"</c> messages outright, so on that family the result is
         /// fed back as a user turn instead of vanishing from the prompt.
         /// </summary>
+        private const string ReadRepeatPrefix = "read\n";
+        private const string ListRepeatPrefix = "list\n";
+        private const string FailedCallRepeatPrefix = "call\n";
+
+        /// <summary>
+        /// The key of a call whose repeat in the same turn cannot return anything new, or null: a skill file read
+        /// (<see cref="SkillTools.RepeatableReadKey"/>: the files do not change while a turn runs), the skill list while
+        /// the reachable skills are the same (an install in the turn changes the key), or a coordination call
+        /// (<c>spawn_agent</c>, <c>send_input</c>, <c>close_agent</c>, <c>list_agents</c>) with the same arguments, which
+        /// fails its checks the same way each time. <c>wait_agent</c> is a poll and code tools change the workspace, so a
+        /// repeat of either may legitimately differ.
+        /// </summary>
+        internal static string RepeatKey(ToolCall call, SkillRequestPlan plan)
+        {
+            if (SkillTools.RepeatableReadKey(call, plan.ToolContext) is { } read)
+                return ReadRepeatPrefix + read;
+            if (call != null && call.Name == SkillTools.ListToolName && plan.ToolContext != null)
+                return ListRepeatPrefix + string.Join("\n", plan.ToolContext.Reachable.Select(skill => skill.Id));
+            if (call == null || !MultiAgentTools.IsTool(call.Name) || call.Name == MultiAgentTools.Wait)
+                return null;
+            var sorted = new SortedDictionary<string, object>(StringComparer.Ordinal);
+            if (call.Arguments != null)
+                foreach (KeyValuePair<string, object> argument in call.Arguments)
+                    sorted[argument.Key] = argument.Value;
+            return FailedCallRepeatPrefix + call.Name + "\n" + JsonSerializer.Serialize(sorted);
+        }
+
+        /// <summary>
+        /// The answer to a call repeated in the same turn (<see cref="RepeatKey"/>): nothing is run or sent again, and
+        /// the model is told the earlier result stands. Recorded like the call, so the trace shows the step.
+        /// </summary>
+        internal static SkillToolResult RepeatedCallResult(RepeatedToolCall earlier)
+        {
+            if (earlier.Error == null && earlier.Tool == SkillTools.ListToolName)
+            {
+                return new SkillToolResult(true,
+                    "The skill list has not changed since you listed it earlier in this turn: that result is still in the "
+                    + "conversation above and still current, so use it rather than listing again. Carry on with the "
+                    + "user's request now.", null, null);
+            }
+            if (earlier.Error == null)
+            {
+                return new SkillToolResult(true,
+                    $"{earlier.SkillId}/{earlier.Path} has not changed since you read it earlier in this turn: that result "
+                    + "is still in the conversation above and still current, so use it rather than reading the file "
+                    + "again. Carry on with the user's request now.", earlier.SkillId, earlier.Path);
+            }
+            return new SkillToolResult(false,
+                $"Error: this exact {earlier.Tool} call already failed earlier in this turn, and it would fail the same "
+                + $"way again, so it was not run: {earlier.Error} Do not repeat it; carry on with the user's request "
+                + "without it.", null, null);
+        }
+
+        /// <summary>What the final round is told when the model repeated such a call after being told it was a repeat.</summary>
+        internal const string StuckRepeatingNotice =
+            "Error: you repeated a tool call that cannot return anything new, after being told so, so no more tool "
+            + "calls will be answered in this turn. Answer the user now using what you already have, and say which "
+            + "part you could not check.";
+
         private static ChatMessage BuildResult(SkillRequestPlan plan, string content, string tool = null)
         {
             if (tool == null)
