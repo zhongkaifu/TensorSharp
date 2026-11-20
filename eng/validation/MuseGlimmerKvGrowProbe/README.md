@@ -20,6 +20,12 @@ $P --model $M --prompt-file long.txt --steps 500 --teacher ref.json --out cand.j
 python3 eng/validation/MuseGlimmerKvGrowProbe/compare.py ref.json cand.json --logits ref.f16 cand.f16 --mark 2048
 ```
 
+**Do not build the probe into another app's output folder on its own.** Its dependencies are older than the CLI's (it
+resolves Microsoft.Extensions.Logging.Abstractions 6.0, the CLI 10.0), so `dotnet build eng/validation/MuseGlimmerKvGrowProbe
+-o TensorSharp.Cli/bin` copies the 6.0 assembly over the CLI's, and the shipped CLI then dies at startup with "Could not
+load file or assembly 'Microsoft.Extensions.Logging.Abstractions, Version=10.0.0.0'" (exit 134). Stage S6 hit this on the
+GPU box. Build the probe into its own folder, as above, or rebuild `TensorSharp.Cli` after it into the same folder.
+
 Options: `--backend` (default `ggml_metal`), `--system-file`, `--prompt-file` (rendered
 as a user message through the GGUF chat template), `--steps`, `--teacher <report>`,
 `--logits-out` (fp16 logits of every step), `--tp N`, `--layer-split N` (whole layers over N GPUs; the
