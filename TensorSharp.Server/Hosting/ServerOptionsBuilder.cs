@@ -723,6 +723,44 @@ public static class ServerOptionsBuilder
         return applied;
     }
 
+    /// <summary>
+    /// Translate <c>--prompt-attention &lt;f16|f32acc|int8&gt;</c> into <c>TS_PROMPT_ATTENTION</c>, which the CUDA executor
+    /// reads when it is made (<see cref="TensorSharp.Graph.PromptAttentionConfig"/>): the arithmetic of a prompt chunk's
+    /// attention on <c>--backend cuda</c>. The flag wins over the variable; a variable already set to an unknown value is
+    /// refused here, before a model loads, as the flag's would be. Returns true when the flag was present.
+    /// </summary>
+    public static bool ApplyPromptAttentionCliFlag(string[] args)
+    {
+        TensorSharp.Graph.PromptAttentionPath? chosen = ReadPromptAttentionCliFlag(args,
+            Environment.GetEnvironmentVariable(TensorSharp.Graph.PromptAttentionConfig.EnvironmentVariable));
+        if (chosen is not { } path) return false;
+        Environment.SetEnvironmentVariable(TensorSharp.Graph.PromptAttentionConfig.EnvironmentVariable,
+            TensorSharp.Graph.PromptAttentionConfig.Name(path));
+        return true;
+    }
+
+    /// <summary>The path <c>--prompt-attention</c> chooses in <paramref name="args"/> (the last occurrence), or null when the
+    /// flag is absent, checking <paramref name="inherited"/> (the variable's value) then. Throws
+    /// <see cref="ArgumentException"/> for an unknown value of either.</summary>
+    internal static TensorSharp.Graph.PromptAttentionPath? ReadPromptAttentionCliFlag(string[]? args, string? inherited)
+    {
+        TensorSharp.Graph.PromptAttentionPath? chosen = null;
+        // Last one wins (see ApplyKvCacheDtypeCliFlag).
+        for (int i = 0; args != null && i < args.Length; i++)
+        {
+            if (TryReadOption(args, ref i, TensorSharp.Graph.PromptAttentionConfig.Flag, out string? value))
+            {
+                if (!TensorSharp.Graph.PromptAttentionConfig.TryParse(value, out var path))
+                    throw new ArgumentException(TensorSharp.Graph.PromptAttentionConfig.InvalidValueMessage(
+                        TensorSharp.Graph.PromptAttentionConfig.Flag, value ?? string.Empty));
+                chosen = path;
+            }
+        }
+        if (chosen == null)
+            TensorSharp.Graph.PromptAttentionConfig.FromValue(inherited);   // throws for an unknown inherited value
+        return chosen;
+    }
+
     /// <summary>Apply the shared, validated tensor-parallel or layer-split configuration.</summary>
     public static bool ApplyTensorParallelCliFlags(string[] args)
     {
@@ -1439,6 +1477,11 @@ public static class ServerOptionsBuilder
             {
                 continue;
             }
+            // --prompt-attention is consumed by ApplyPromptAttentionCliFlag(args) in an earlier pass.
+            if (TryReadOption(args, ref i, TensorSharp.Graph.PromptAttentionConfig.Flag, out _))
+            {
+                continue;
+            }
             // Collect at option boundaries after other options have consumed
             // their operands; --stop "--layer-split=2" is literal stop text.
             if (TensorSharp.Distributed.ModelParallelismOptions.TryCollect(args, ref i, parallelismArgs))
@@ -1581,6 +1624,7 @@ public static class ServerOptionsBuilder
             "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae", "--video-upscaler", "--video-diffusion-vae",
             "--video-width", "--video-height", "--video-steps", "--video-mode",
             "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",
+            TensorSharp.Graph.PromptAttentionConfig.Flag,
             "--tp", "--tp-node-id", "--tp-peers",
             "--upload-max-mb", "--upload-quota-mb", "--upload-ttl-hours",
             SkillHostOptions.RootsFlag, SkillHostOptions.SelectFlag, SkillHostOptions.ListFlag,

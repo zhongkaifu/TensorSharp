@@ -17,16 +17,16 @@ using TensorSharp.Runtime;
 
 namespace LongContextQualityProbe;
 
-/// <summary>One arm of a run: a name the records carry, the prompt attention it runs (default, f16, 8bit) and whether every NVFP4
+/// <summary>One arm of a run: a name the records carry, the prompt attention it runs (default, f16, f32acc, 8bit) and whether every NVFP4
 /// product runs on the q8 matvec (<paramref name="Q8Act"/>: prompt rows keep the decode rows' q8 activations).</summary>
 internal sealed record Arm(string Name, string PromptAttention, bool Q8Act = false)
 {
-    public static readonly string[] Settings = { "default", "f16", "8bit" };
+    public static readonly string[] Settings = { "default", "f16", "f32acc", "8bit" };
 
     private const string Q8ActSuffix = "+q8act";
 
-    /// <summary>"8bit", "f16", "default", "q8act" (the build's prompt attention with q8 activations), a prompt attention with
-    /// "+q8act" ("8bit+q8act", "f16+q8act"), or "name=setting".</summary>
+    /// <summary>"8bit", "f32acc", "f16", "default", "q8act" (the build's prompt attention with q8 activations), a prompt
+    /// attention with "+q8act" ("8bit+q8act", "f16+q8act"), or "name=setting".</summary>
     public static Arm Parse(string spec)
     {
         int eq = spec.IndexOf('=');
@@ -43,7 +43,7 @@ internal sealed record Arm(string Name, string PromptAttention, bool Q8Act = fal
     public string Setting => !Q8Act ? PromptAttention : PromptAttention == "default" ? "q8act" : PromptAttention + Q8ActSuffix;
 }
 
-internal readonly record struct Counters(long Attn8Launches, long Attn8BandRefusals, long MarkedAttentions);
+internal readonly record struct Counters(long Attn8Launches, long Attn8BandRefusals, long MarkedAttentions, long F32AccLaunches = 0);
 
 internal sealed class ModelHandle
 {
@@ -78,10 +78,19 @@ internal sealed class ModelHandle
         if (arm.Setting != "default" && (Cuda == null || CudaAllocator == null))
             throw new InvalidOperationException($"arm {arm.Name}: the {arm.Setting} setting is a seam of the CUDA executor (--backend cuda)");
         if (CudaAllocator != null) CudaAllocator.AllNvfp4RowsOnMatvecForTests = arm.Q8Act;
-        if (Cuda != null) Cuda.PromptAttention8ForTests = arm.PromptAttention switch { "f16" => false, "8bit" => true, _ => null };
+        if (Cuda != null)
+        {
+            // The executor's --prompt-attention path (PromptAttentionPath), case by case; "default" keeps the process's own.
+            Cuda.PromptAttentionForTests = arm.PromptAttention switch
+            {
+                "f16" => PromptAttentionPath.F16, "f32acc" => PromptAttentionPath.F32Acc, "8bit" => PromptAttentionPath.Int8, _ => null,
+            };
+            Cuda.PromptAttention8ForTests = null;
+        }
     }
 
-    public Counters Snapshot() => new(Cuda?.PromptAttention8Launches ?? 0, Cuda?.PromptAttention8BandRefusals ?? 0, Graph?.PromptChunkAttentions ?? 0);
+    public Counters Snapshot() => new(Cuda?.PromptAttention8Launches ?? 0, Cuda?.PromptAttention8BandRefusals ?? 0, Graph?.PromptChunkAttentions ?? 0,
+        Cuda?.PromptAttentionF32AccLaunches ?? 0);
 
     public long FreeDeviceBytes() => CudaAllocator?.FreeDeviceBytes() ?? -1;
 
