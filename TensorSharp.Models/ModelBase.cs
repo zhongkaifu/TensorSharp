@@ -2344,7 +2344,11 @@ namespace TensorSharp.Models
         }
 
 
-        protected Tensor RMSNormOp(Tensor input, string weightName)
+        protected Tensor RMSNormOp(Tensor input, string weightName) => RMSNormOp(input, weightName, Config.Eps);
+
+        /// <summary><see cref="RMSNormOp(Tensor, string)"/> with an epsilon of its own (a norm whose epsilon is not the model's,
+        /// such as Muse-Glimmer's 1e-8 post norms).</summary>
+        protected Tensor RMSNormOp(Tensor input, string weightName, float eps)
         {
             long t0 = Stopwatch.GetTimestamp();
             var alpha = _weights[weightName];
@@ -2355,7 +2359,7 @@ namespace TensorSharp.Models
             Tensor input2d = input.Sizes.Length != 2 ? input.View(rows, dim) : null;
             Tensor src = input2d ?? input;
 
-            Tensor result = Ops.RMSNorm(null, src, alpha, null, Config.Eps);
+            Tensor result = Ops.RMSNorm(null, src, alpha, null, eps);
 
             input2d?.Dispose();
             _normTicks += Stopwatch.GetTimestamp() - t0;

@@ -1814,7 +1814,7 @@ namespace TensorSharp.Models
                 int logits = step.MatMul(headName, final);
                 outputs.Logits = request.GreedyIds
                     ? step.Output(step.Op(GraphOp.Cont, GreedyHead(step, logits, request)), rows)
-                    : step.Output(logits, (long)Config.VocabSize * rows);
+                    : step.Output(EmitLogitTransform(step, logits), (long)Config.VocabSize * rows);
             }
             else if (request.LastRowLogits || request.LastRowHidden)
             {
@@ -1835,8 +1835,25 @@ namespace TensorSharp.Models
                 int logits = step.MatMul(headName, selected);
                 outputs.Logits = request.GreedyIds
                     ? step.Output(step.Op(GraphOp.Cont, GreedyHead(step, logits, request)), n)
-                    : step.Output(logits, (long)Config.VocabSize * n);
+                    : step.Output(EmitLogitTransform(step, logits), (long)Config.VocabSize * n);
             }
+        }
+
+        /// <summary>The head's logit transform over <paramref name="logits"/> (<see cref="LogitScale"/>, then
+        /// <see cref="FinalLogitSoftcap"/>): a scale, then a scale by 1/cap, tanh and a scale by cap, the nodes llama.cpp's graphs
+        /// and the legacy Muse-Glimmer head emit. No nodes for a family without one. A greedy head (<see cref="GreedyHead"/>)
+        /// takes the raw logits: the transform keeps their order.</summary>
+        private int EmitLogitTransform(GraphStep step, int logits)
+        {
+            float scale = LogitScale, cap = FinalLogitSoftcap;
+            if (scale > 0f && scale != 1f)
+                logits = step.Op(GraphOp.Scale, stackalloc[] { logits }, default, stackalloc[] { scale });
+            if (cap > 0f)
+            {
+                logits = step.Op(GraphOp.Scale, stackalloc[] { logits }, default, stackalloc[] { 1f / cap });
+                logits = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Tanh, logits) }, default, stackalloc[] { cap });
+            }
+            return logits;
         }
 
         /// <summary>A greedy head over <paramref name="logits"/> [vocab, rows] (<see cref="GraphCapabilities.GreedyIdOutputs"/>):
@@ -1934,7 +1951,7 @@ namespace TensorSharp.Models
                     : step.Op(GraphOp.GetRows, final, step.ConstantInputI32((int[])last.Clone(), n));
                 if (r == 0 && request.LastRowHidden)
                     outputs.LastHiddenAt = 1 + step.Output(n == 1 && rows > 1 ? step.Op(GraphOp.Cont, selected) : selected, (long)hiddenSize * n);
-                outputs.RankLogits[r] = step.Output(step.MatMul(VocabHeadName, selected), (long)_vocabHeadRows[r] * n);
+                outputs.RankLogits[r] = step.Output(EmitLogitTransform(step, step.MatMul(VocabHeadName, selected)), (long)_vocabHeadRows[r] * n);
             }
         }
 
@@ -2314,7 +2331,8 @@ namespace TensorSharp.Models
         /// hidden size where a family keeps hyper-connections).</summary>
         protected virtual int StreamWidth => Config.HiddenSize;
 
-        /// <summary>The residual stream entering the stack from the embedded rows [hidden, rows].</summary>
+        /// <summary>The residual stream entering the stack from the embedded rows [hidden, rows] (media rows already injected).
+        /// A family that changes it declares the per-op twin too (<see cref="ApplyStreamInput"/>).</summary>
         protected virtual int EmitStreamInput(GraphStep step, int embedded) => embedded;
 
         /// <summary>A block's input [hidden, rows] from the stream; <paramref name="context"/> carries what the
@@ -2326,13 +2344,15 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The stream after a block's output [hidden, rows] joins it. Default: the residual add, after the block's
-        /// post-norm where the family has one (<see cref="MixerPostNormWeight"/>, <see cref="FfnPostNormWeight"/>). The normed
+        /// post-norm where the family has one (<see cref="MixerPostNormWeight"/>, <see cref="FfnPostNormWeight"/>, at
+        /// <see cref="PostNormEps"/>). The normed
         /// output is the add's first operand: ggml-metal fuses RMS_NORM + MUL + ADD only when each fused node's first source is
         /// the previous node (llama.cpp's LFM3 graph swapped its adds for that, e574a17b0).</summary>
         protected virtual int EmitBlockOutput(GraphStep step, int layer, int stream, BlockSite site, int context, int output)
         {
             string post = site == BlockSite.Mixer ? MixerPostNormWeight(layer) : FfnPostNormWeight(layer);
-            return post == null ? step.Op(GraphOp.Add, stream, output) : step.Op(GraphOp.Add, step.RmsNorm(output, post), stream);
+            return post == null ? step.Op(GraphOp.Add, stream, output)
+                : step.Op(GraphOp.Add, step.RmsNorm(output, step.Weight(post), PostNormEps(layer, site)), stream);
         }
 
         /// <summary>The head's input [hidden, rows] from the stream. Default: the output norm.</summary>
