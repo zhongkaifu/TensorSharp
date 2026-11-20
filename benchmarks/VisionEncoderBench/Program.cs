@@ -59,6 +59,7 @@ if (!File.Exists(image)) { Console.WriteLine($"[vbench] missing image: {image}")
 //   cpu        (default) GGML CPU allocator      — the ggml_cpu backend
 //   ggml_metal           GGML Metal allocator     — the ggml_metal backend
 //   ggml_cuda            GGML CUDA allocator     — the ggml_cuda backend
+//   ggml_vulkan          GGML Vulkan allocator   — the ggml_vulkan backend
 //   cuda                 direct CudaAllocator    — TensorSharp's own CUDA backend
 //   mlx                  MlxAllocator            — the mlx backend
 //   managed              CpuAllocator            — the managed cpu backend
@@ -94,8 +95,9 @@ else
         "cpu" or "ggml_cpu" or "ggmlcpu" => GgmlBackendType.Cpu,
         "ggml_metal" or "ggmlmetal" or "metal" => GgmlBackendType.Metal,
         "ggml_cuda" or "ggmlcuda" => GgmlBackendType.Cuda,
+        "ggml_vulkan" or "ggmlvulkan" => GgmlBackendType.Vulkan,
         _ => throw new ArgumentException(
-            $"Unknown TS_VBENCH_BACKEND '{backendName}'. Expected cpu, ggml_metal, ggml_cuda, or cuda."),
+            $"Unknown TS_VBENCH_BACKEND '{backendName}'. Expected cpu, ggml_metal, ggml_cuda, ggml_vulkan, cuda, mlx or managed."),
     };
     Console.WriteLine($"[vbench] ggml backend = {ggmlBackend}");
     context = new GgmlContext(new[] { 0 }, ggmlBackend);
@@ -104,6 +106,7 @@ else
     {
         GgmlBackendType.Metal => BackendType.GgmlMetal,
         GgmlBackendType.Cuda => BackendType.GgmlCuda,
+        GgmlBackendType.Vulkan => BackendType.GgmlVulkan,
         _ => BackendType.GgmlCpu,
     };
 }
