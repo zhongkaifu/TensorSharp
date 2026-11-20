@@ -222,6 +222,29 @@ public sealed class MiniMaxH3ImageResidencyTests
         Assert.False(Plan(DitBf16, 2048, fused: false, quantized: false, M5Pro).Fits);
     }
 
+    /// <summary>
+    /// A 32 GB Mac, the tier the TensorAgent app offers the Q4_K_M entry from. Metal's recommended working set there is two
+    /// thirds of the memory: 22,906.5 MB, as ggml-metal reports it on 32 GB Apple Silicon (an assumption: no 32 GB Mac was
+    /// measured). Q4_K_M runs at 1024x1024 (the app's picture today) and 2048x2048 with the text encoder released before
+    /// the denoise; Q8_0's denoise alone at 2048x2048 needs more than the working set, which is why the app offers it from
+    /// 48 GB.
+    /// </summary>
+    [Fact]
+    public void AThirtyTwoGbMacRunsQ4KmWithTheTextEncoderReleasedAndRefusesQ8At2048()
+    {
+        const long mac32Free = 22_906_500_000L;
+        long budget = mac32Free - Math.Max(512 * MiB, mac32Free / 16);
+        foreach (int side in new[] { 1024, 2048 })
+        {
+            ResidencyPlan q4 = Plan(DitQ4, side, fused: false, quantized: true, budget, capacity: mac32Free);
+            Assert.False(q4.Refused, $"Q4_K_M {side}: {q4.Describe()}");
+            Assert.StartsWith("Denoise:Conditioner", Releases(q4));
+        }
+        ResidencyPlan q8 = Plan(DitQ8, 2048, fused: false, quantized: true, budget, capacity: mac32Free);
+        Assert.True(q8.Refused, q8.Describe());
+        Assert.Equal(DiffusionPhase.Denoise, q8.Limiting.Phase);
+    }
+
     // ---- the refusal (ResidencyPlan.Refused): a request whose most demanding phase alone cannot fit the device
 
     /// <summary>Every request run on the RTX A4500 with the release files (09bd25fd, ggml_cuda, defaults, the portrait prompt):
