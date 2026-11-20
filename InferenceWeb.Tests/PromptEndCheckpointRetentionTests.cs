@@ -8,9 +8,12 @@
 // Issue #383, problem 2: issue #376's long-turn reproducer on the CUDA executor. A is a prompt with one token to generate, B is
 // A's transcript (A's reply rendered back verbatim) plus a user turn, again with one token, and C is B's prompt again. C has to
 // resume B's whole prompt, never fall back to A's checkpoint and prefill B's turn again (969 tokens at 6.6K-69K on the
-// reporter's machine, with a copy of A's checkpoint as device memory was fullest): B's turn was shorter than
-// SchedulerConfig.PromptTailCheckpointMinTokens and its reply is rendered back verbatim, which skipped B's prompt-end
-// checkpoint; where that checkpoint shares the request's rows (a fixed set of recurrent states) it is always taken.
+// reporter's machine, with a copy of A's checkpoint as device memory was fullest), however B ended:
+//  - B's turn was shorter than SchedulerConfig.PromptTailCheckpointMinTokens and its reply is rendered back verbatim, which
+//    skipped B's prompt-end checkpoint; where that checkpoint shares the request's rows (a fixed set of recurrent states) it is
+//    always taken;
+//  - B left before its next step (aborted after its first token went out), which dropped the checkpoint that waits for that
+//    step; B's end state is then that state and keeps the prompt's last logits.
 // Each C answers as a fresh run of its prompt does. The managed CPU executor runs the CUDA executor's slot-bound policies
 // through the model's seam (SlotBoundPoliciesForTests), with the share invariants checked before every step.
 using Microsoft.Extensions.Logging.Abstractions;
@@ -128,5 +131,55 @@ public sealed class PromptEndCheckpointRetentionTests : IDisposable
         else
             Assert.Equal(a.Length, reusedC);   // A's prompt-end checkpoint: B's 61 tokens are prefilled again
         Assert.Equal(await Cold(c, 8), answer);
+    }
+
+    /// <summary>
+    /// B leaves right after its prompt, before the step that would forward its first token (aborted once that token went out: a
+    /// client gone, a stop of the chat layer's own). Its prompt-end checkpoint waits for that step, which never comes; B's
+    /// retained end state is the same state, and keeps the prompt's last logits, so C resumes B's whole prompt with nothing to
+    /// prefill and answers as a fresh run does.
+    /// </summary>
+    [Fact]
+    public async Task ARequestThatLeavesBeforeItsNextStepLeavesItsPromptEndForARetry()
+    {
+        int[] a = Tokens(300, 1);
+        using StandardDecoderModel model = Create(slotBound: true);
+        int[] b, answer;
+        int reusedC;
+        using (InferenceEngine engine = Engine(model))
+        {
+            int[] first = await Serve(engine, Turn("A", a, 1, replyRenderedBack: false));
+            b = a.Concat(first).Concat(Tokens(60, 2)).ToArray();
+
+            // Hold the engine after the step that finishes B's prompt: B's next step cannot run before B is aborted.
+            var gate = new ComputeGate();
+            engine.ScheduledForTests = output =>
+            {
+                foreach (var work in output.ScheduledWork)
+                    if (work.Sequence.RequestId == "B" && work.IsPrefill
+                        && work.StartPosition + work.NumScheduledTokens == work.Sequence.PromptTokens.Count)
+                        gate.Close();
+            };
+            engine.ComputeGate = gate;
+            var turnB = Turn("B", b, 4, replyRenderedBack: false);
+            var handle = engine.SubmitRequest(turnB);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            Assert.True(await handle.Tokens.WaitToReadAsync(timeout.Token), "B streamed no first token");
+            Assert.False(gate.IsOpen);
+            engine.Abort("B");
+            engine.ScheduledForTests = null;
+            gate.Open();
+            await handle.Completion.WaitAsync(TimeSpan.FromMinutes(2));
+            await engine.WhenStepSettledAsync().WaitAsync(TimeSpan.FromMinutes(1));
+            Assert.Equal(b.Length, turnB.NumComputedTokens);   // it forwarded nothing past its prompt
+
+            var turnC = Turn("C", b, 8, replyRenderedBack: false);
+            answer = await Serve(engine, turnC);
+            reusedC = turnC.PrefixCacheReusedTokens;
+        }
+        _output.WriteLine($"C reused {reusedC}/{b.Length}; shared checkpoints {model.SharedCheckpoints}, steals {model.RowSteals}, copies {model.SlotCopies}");
+        Assert.Equal(b.Length, reusedC);
+        Assert.Equal(await Cold(b, 8), answer);
+        model.CheckSlotShareInvariants();
     }
 }

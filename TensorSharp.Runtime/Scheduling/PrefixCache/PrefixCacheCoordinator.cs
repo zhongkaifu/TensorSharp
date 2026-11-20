@@ -643,8 +643,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     /// a checkpoint copies the request's slot (its caches' rows and its recurrent states), which on Qwen3.8-27B took 12-13 ms
     /// of a short prompt's time to first token and 25-35 ms of a 4K one's, where the copy needs only the state the prompt
     /// left - still the slot's until the request's next step. Called before every step's work, under the step's GPU lock;
-    /// a request that has moved on since gets none. A request that leaves before its next step drops its own
-    /// (<see cref="DropPending"/>): retained whole, its slot holds the same state; released, it has none to keep.
+    /// a request that has moved on since gets none. A request that leaves cleanly before its next step (aborted after its
+    /// first token went out: a client gone, a stop of the chat layer's own) still leaves that state: its retained end state
+    /// is it and keeps the prompt's logits, or the checkpoint is taken as it leaves (<see cref="RetainFinished"/>). One that
+    /// fails or is preempted drops it (<see cref="DropPending"/>).
     /// </summary>
     internal void CapturePending()
     {
@@ -656,11 +658,26 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                 CaptureAt(sequence, length, publicBoundary: false, explicitBoundary: false, automaticBoundary: true, logits);
     }
 
-    /// <summary>Forget <paramref name="sequence"/>'s waiting prompt-end checkpoint (it leaves the scheduler: the release runs
-    /// outside the steps' GPU lock, where a slot copy must not).</summary>
+    /// <summary>Forget <paramref name="sequence"/>'s waiting prompt-end checkpoint (it leaves the scheduler with no state to
+    /// keep: failed, preempted, or already handled by <see cref="RetainFinished"/>).</summary>
     private void DropPending(SequenceState sequence)
     {
         if (_pendingPromptEnds.Count > 0) _pendingPromptEnds.RemoveAll(p => ReferenceEquals(p.Sequence, sequence));
+    }
+
+    /// <summary>Removes and returns <paramref name="sequence"/>'s waiting prompt-end checkpoint when its state is still the
+    /// one the prompt left (nothing was forwarded since), else forgets it and returns null.</summary>
+    private (int Length, float[]? Logits)? TakePending(SequenceState sequence)
+    {
+        (int Length, float[]? Logits)? found = null;
+        for (int i = _pendingPromptEnds.Count - 1; i >= 0; i--)
+        {
+            var (pendingSequence, length, logits) = _pendingPromptEnds[i];
+            if (!ReferenceEquals(pendingSequence, sequence)) continue;
+            _pendingPromptEnds.RemoveAt(i);
+            if (sequence.NumComputedTokens == length) found = (length, logits);
+        }
+        return found;
     }
 
     /// <param name="deferPromptEnd">The sequence's state is its own slot's (not the executor's live primary cache, whose
@@ -751,8 +768,30 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
 
     internal bool RetainFinished(SequenceState sequence, bool primary)
     {
-        DropPending(sequence);
+        // A prompt-end checkpoint still waiting for the request's next step (CapturePending): the request leaves right after
+        // its prompt, so the state it leaves is the prompt's end. Its end state keeps the prompt's logits, so the same prompt
+        // sent again resumes there with nothing to prefill; where no end state is retained, the checkpoint is taken now (the
+        // releases run under the steps' GPU lock and the request's slot is still its own).
+        (int Length, float[]? Logits)? promptEnd = TakePending(sequence);
         Drain();
+        bool retained = RetainEndState(sequence, primary, promptEnd?.Logits, out bool served);
+        if (promptEnd is { } pending && !served && !primary && _requests.ContainsKey(sequence))
+        {
+            if (ReleaseDebug)
+                _logger.LogInformation("[prefix-retain] {EngineRequestId} left before its next step: its prompt-end checkpoint of {Length} is taken now",
+                    sequence.RequestId, pending.Length);
+            CaptureAt(sequence, pending.Length, publicBoundary: false, explicitBoundary: false, automaticBoundary: true, pending.Logits);
+        }
+        return retained;
+    }
+
+    /// <param name="promptLogits">The prompt's last logits, for an end state at the prompt's very end (the request forwarded
+    /// nothing past it); null otherwise.</param>
+    /// <param name="served">An end state now sits where the request ended: retained, registered as the primary, or there
+    /// already.</param>
+    private bool RetainEndState(SequenceState sequence, bool primary, float[]? promptLogits, out bool served)
+    {
+        served = false;
         int length = Math.Min(sequence.NumComputedTokens, sequence.NumTotalTokens);
         if (length < _tree.Caps.MinRetainTokens || sequence.CacheBreakpoints is not null) return false;
         KeyRope key = GetKey(sequence);
@@ -761,20 +800,27 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         if (length > key.Length) return false;
         RadixNode node = _tree.Insert(key, length, GetScope(sequence), sequence.SharedPrefixTokens,
             NodeFlags.None, GetSpans(sequence));
-        if (node.EndState is not null) return false;
+        if (node.EndState is not null)
+        {
+            served = true;
+            return false;
+        }
         string payloadKey = _tree.MintKey();
         if (primary && _tree.Caps.DeferPrimaryConversion)
         {
             if (ReleaseDebug)
                 _logger.LogInformation("[prefix-retain] {EngineRequestId} length={Length} registered as the primary", sequence.RequestId, length);
             RegisterPrimary(node, payloadKey, length);
+            served = node.EndState is not null;
             return false; // The live primary still belongs to the executor, not a retained holder.
         }
         // As in CaptureCheckpoint: an eviction below this payload-less node would return it to the pool.
         LockReceipt guard = _tree.AcquirePath(node);
         try
         {
-            return RetainFinishedLocked(sequence, primary, node, payloadKey, length);
+            bool retained = RetainFinishedLocked(sequence, primary, node, payloadKey, length, promptLogits);
+            served = retained || node.EndState is not null;
+            return retained;
         }
         finally
         {
@@ -782,7 +828,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         }
     }
 
-    private bool RetainFinishedLocked(SequenceState sequence, bool primary, RadixNode node, string payloadKey, int length)
+    private bool RetainFinishedLocked(SequenceState sequence, bool primary, RadixNode node, string payloadKey, int length,
+        float[]? promptLogits)
     {
         bool captured = RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
             && _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
@@ -803,11 +850,15 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             conversionFailed = !captured;
         }
         if (ReleaseDebug)
-            _logger.LogInformation("[prefix-retain] {EngineRequestId} length={Length} primary={Primary} captured={Captured} origin={Origin}",
-                sequence.RequestId, length, primary, captured, copied ? "Copy" : origin.ToString());
+        {
+            // Whether the end state keeps the last row's logits (it ends where its request's input did): a fixed phrase.
+            string keepsLogits = promptLogits is null ? "" : " (the input's end, with its last logits)";
+            _logger.LogInformation("[prefix-retain] {EngineRequestId} length={Length} primary={Primary} captured={Captured} origin={Origin}{Logits}",
+                sequence.RequestId, length, primary, captured, copied ? "Copy" : origin.ToString(), keepsLogits);
+        }
         if (captured)
         {
-            bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin);
+            bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin, promptLogits);
             Trim();
             return published;
         }
