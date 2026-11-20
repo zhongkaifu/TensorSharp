@@ -101,6 +101,29 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         return loop;
     }
 
+    /// <summary>Since main's ggml_cpu products (merged at 19bfb073: weights repacked for the i8mm/dotprod kernels on ARM64,
+    /// BF16 products over unrounded activations, the step's thread pool) reach the runtime's graphs and not the legacy native
+    /// graph, ggml_cpu is held to the bound instead of the bytes; ggml_metal and ggml_cuda stay byte for byte.</summary>
+    private void AssertBitExactOn(BackendType backend, Loop loop, string what, double bound = 1e-2)
+    {
+        if (backend != BackendType.GgmlCpu)
+        {
+            AssertBitExact(loop, what);
+            return;
+        }
+        double worst = 0;
+        for (int i = 0; i < loop.Legacy.Count; i++)
+        {
+            float[] want = loop.Legacy[i], got = loop.Runtime[i];
+            Assert.Equal(want.Length, got.Length);
+            double scale = want.Max(v => Math.Abs((double)v)), err = 0;
+            for (int k = 0; k < want.Length; k++) err = Math.Max(err, Math.Abs((double)want[k] - got[k]));
+            worst = Math.Max(worst, err / scale);
+        }
+        output.WriteLine($"{what}: runtime within {worst:E3} of the largest legacy value (ggml_cpu: main's products)");
+        Assert.True(worst <= bound, $"{what}: {worst:E3} of the largest legacy value exceeds {bound:E1}");
+    }
+
     private void AssertBitExact(Loop loop, string what)
     {
         for (int i = 0; i < loop.Legacy.Count; i++)
@@ -139,7 +162,7 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
             : new MiniMaxH3ImageDenoiser(fx.DitPath, backend);
         Loop loop = Run(family, legacy, runtime, rq);
         string what = $"{backend} {MiniMaxH3ImageFixture.Name(format)} {rq.LatentHeight}x{rq.LatentWidth}";
-        AssertBitExact(loop, what);
+        AssertBitExactOn(backend, loop, what);
         // One program for the request's six steps (the head, latent and time embedding are its inputs).
         Assert.Equal(1, runtime.Compiles);
         int served = GgmlGraphExecutor.ServedRegions(runtime.LastPlan), lowered = GgmlGraphExecutor.LoweredRegions(runtime.LastPlan);
@@ -288,7 +311,7 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         Loop again = Run(family, legacy, runtime, small, steps: 3);
         Assert.Equal(3, runtime.Compiles);
         for (int i = 0; i < first.Runtime.Count; i++) Assert.Equal(first.Runtime[i], again.Runtime[i]);
-        AssertBitExact(again, $"{backend} after a released workspace");
+        AssertBitExactOn(backend, again, $"{backend} after a released workspace");
         // Released device copies are uploaded again from the mapping by the next step.
         runtime.ReleaseDevice();
         Loop resident = Run(family, legacy, runtime, small, steps: 3);

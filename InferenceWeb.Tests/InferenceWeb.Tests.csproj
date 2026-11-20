@@ -47,6 +47,7 @@
     <EmbeddedResource Include="Fixtures/MiniMaxH3Image/pillow-resize.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxH3Image/diffusers-edit-golden.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxH3Image/vae-encoder-oracle.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3Image/LegacyGoldens/*.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxM3/chat_reference.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxM3/tokenizer_reference.json" />
     <EmbeddedResource Include="Fixtures/Lfm3/*" />
