@@ -251,10 +251,13 @@ speech chunks as they arrive (the audio starts from the tap that sends, as WebKi
 **Stop speaking** silences it; the finished reply keeps a player and **Save audio**, which goes
 through the app's save picker like a picture's **Download**. The WAV is saved with the conversation
 and plays again when it is reopened, and the next turn carries the reply back by its id, so the
-host reuses its cached prompt. A spoken reply runs without reasoning, tools or skills, and says so
-under the answer. It speaks the language the message is written in: LFM3-Omni's interleaved speech
-is English only, so a reply to a message in Chinese (or Japanese, Korean, ...) is the ordinary text
-reply, each sentence spoken by the model's TTS as it completes. See [API_EXAMPLES.md → Spoken replies](../TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni).
+host reuses its cached prompt. A spoken turn is the turn the app runs without the switch: reasoning,
+skills, the on-device code tools (Python, files in the conversation's workspace) and every tool
+round run as usual, and the model's TTS speaks the answer text of each round as it is written (the
+text before a tool call while the tool runs); reasoning, tool calls, tool output, code blocks and
+tables are not read aloud. If the speech stops, the answer still completes and a note under it says
+so. It speaks the language the message is written in. A spoken turn's prompt is the text turn's, so
+switching Speak replies on or off in a conversation keeps reusing its cached prompt. See [API_EXAMPLES.md → Spoken replies](../TensorSharp.Server.Host/API_EXAMPLES.md#spoken-replies-speech-lfm3-omni).
 
 What is shared is the API, not the document. The routes under the page —
 `/api/chat`, `/api/models`, `/api/sessions`, `/api/upload`, `/api/skills`,

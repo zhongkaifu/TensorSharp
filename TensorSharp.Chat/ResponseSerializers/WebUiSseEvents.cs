@@ -153,14 +153,15 @@ namespace TensorSharp.Server.ResponseSerializers
         /// <summary>
         /// Something the turn did differently from what the request asked, said once in the turn rather than silently:
         /// <paramref name="code"/> for a page that words it itself, <paramref name="notice"/> for one that shows the
-        /// server's sentence. <c>speech_direct</c>: a spoken reply runs without <paramref name="without"/> (reasoning,
-        /// tools, skills, knowledge). <c>speech_not_saved</c>: the reply's audio could not be written.
+        /// server's sentence. <c>speech_failed</c>: a spoken turn's speech stopped (the engine's reason; the text turn is
+        /// whole). <c>speech_not_saved</c>: the reply's audio could not be written.
         /// </summary>
-        public static object Notice(string code, string notice, IReadOnlyList<string> without = null) => new
+        public static object Notice(string code, string notice, string detail = null) => new
         {
             notice,
             code,
-            without,
+            // The reason alone (speech_failed: the engine's error), for a page that words the notice itself.
+            detail,
         };
 
         /// <summary>

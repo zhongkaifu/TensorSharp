@@ -25,11 +25,12 @@ namespace InferenceWeb.Tests;
 
 /// <summary>
 /// Spoken web chat replies (<c>/api/chat</c> with <c>speech</c>) without a model: a service whose loaded model is a
-/// probe, whose speaker stands for LFM3-Omni and whose spoken stream yields three text pieces with an 80 ms chunk after
-/// each, then a terminal update carrying the turn as generation decoded it. Checked: the frames in order (transcript
-/// through the ordinary token frames, audio frames between them), the done frame's audio id and WAV (written, valid,
-/// the whole reply), the request the engine was given, what a spoken turn says it runs without, the refusals, and the
-/// next turn's splice of the spoken turn by its audio id (what lets it reuse the prompt prefix).
+/// probe, whose speaker stands for LFM3-Omni, whose text turn yields three pieces of one sentence and whose TTS yields
+/// three 80 ms chunks a piece. A web chat turn is its text turn with its answer spoken. Checked: the frames in order,
+/// the done frame's audio id and WAV (written, valid, the whole reply), the generation call (the text turn's, with no
+/// speech line), the voice and language the TTS is given, the refusals, and the next turn rendering the spoken turn as
+/// its text. Spoken turns that run reasoning, tools or skills, and the prompt prefix across spoken and text turns:
+/// <see cref="WebUiSpokenAgentTurnTests"/>.
 /// </summary>
 public sealed class WebUiSpokenReplyTests : IDisposable
 {
@@ -74,34 +75,57 @@ public sealed class WebUiSpokenReplyTests : IDisposable
     internal static readonly SpokenTurnRecord Turn = new(new[] { 241, 60, 243, 61, 243 }, FrameCodes, "", "<think></think>");
     private static readonly string[] Words = { "Hello", ", Anna", "!" };
 
+    /// <summary>
+    /// The text turn (three pieces of "Hello, Anna!", then its terminal update) and the TTS (three 80 ms chunks a
+    /// piece). <see cref="ChatStreamWithSpeechAsync"/> (a driven spoken reply) is never what a web chat turn runs.
+    /// </summary>
     private sealed class SpeakingService : ModelService
     {
         public SpeakingService() : base(NullLogger<ModelService>.Instance, (path, _, _, _) => new ProbeModel(path)) { }
 
         public ISpeechOutputModel Speaker { get; init; } = new Speaker();
         public string Arch { get; init; } = "lfm3";
-        /// <summary>Throw a cancellation after this many chunks (-1: never).</summary>
+        /// <summary>Throw a cancellation after this many text pieces (-1: never).</summary>
         public int CancelAfter { get; init; } = -1;
-        public List<(ChatSession Session, List<ChatMessage> History, SpeechReplyOptions Speech, bool Think)> Calls { get; } = new();
+        public List<(ChatSession Session, List<ChatMessage> History, bool Think)> Calls { get; } = new();
+        public List<(string Text, SpeechSynthesisOptions Options)> Spoken { get; } = new();
+        public int DrivenReplies;
         public override string Architecture => Arch;
         public override ISpeechOutputModel SpeechOutputModel => Speaker;
 
-        internal override async IAsyncEnumerable<ChatStreamUpdate> ChatStreamWithSpeechAsync(ChatSession session,
+        internal override async IAsyncEnumerable<ChatStreamUpdate> ChatStreamWithSkillsAsync(ChatSession session,
             List<ChatMessage> history, int maxTokens, [EnumeratorCancellation] CancellationToken cancellationToken,
-            SamplingConfig samplingConfig, bool enableThinking, SpeechReplyOptions speech, TensorSharp.Models.Lora.TextLoraAdapter lora = null)
+            SamplingConfig samplingConfig, List<ToolFunction> tools, bool enableThinking, TensorSharp.Server.Skills.SkillRequestPlan skills,
+            Microsoft.Extensions.Logging.ILogger logger = null, int? thinkingTokenLimit = null, TensorSharp.Models.Lora.TextLoraAdapter lora = null)
         {
-            Calls.Add((session, history, speech, enableThinking));
+            Calls.Add((session, history, enableThinking));
             for (int c = 0; c < 3; c++)
             {
                 await Task.Yield();
-                yield return ChatStreamUpdate.Text(Words[c]);
                 if (c == CancelAfter) throw new OperationCanceledException();
+                yield return ChatStreamUpdate.Text(Words[c]);
+            }
+            yield return new ChatStreamUpdate("", true, 40, 9, 31, 0, 0, 1_000_000, "eos");
+        }
+
+        internal override async IAsyncEnumerable<ChatStreamUpdate> SpeechSynthesisStreamAsync(string text, SpeechSynthesisOptions options,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            lock (Spoken) Spoken.Add((text, options));
+            for (int c = 0; c < 3; c++)
+            {
+                await Task.Yield();
                 yield return ChatStreamUpdate.AudioChunk(SpeechEndpointTests.Chunk(c), 24000);
             }
-            yield return new ChatStreamUpdate("", true, 40, 9, 31, 0, 0, 1_000_000, "eos")
-            {
-                SpeechFrames = FrameCodes, AudioSampleRate = 24000, SpokenTurn = Turn,
-            };
+            yield return new ChatStreamUpdate("", true, 3, 3, 0, 0, 0, 0, "eos") { SpeechFrames = FrameCodes, AudioSampleRate = 24000 };
+        }
+
+        internal override IAsyncEnumerable<ChatStreamUpdate> ChatStreamWithSpeechAsync(ChatSession session,
+            List<ChatMessage> history, int maxTokens, CancellationToken cancellationToken,
+            SamplingConfig samplingConfig, bool enableThinking, SpeechReplyOptions speech, TensorSharp.Models.Lora.TextLoraAdapter lora = null)
+        {
+            DrivenReplies++;
+            throw new InvalidOperationException("a web chat turn is its text turn, spoken");
         }
     }
 
@@ -124,7 +148,9 @@ public sealed class WebUiSpokenReplyTests : IDisposable
             defaultVideoFrames: 0, defaultVideoFps: 0, defaultVideoWidth: 0, defaultVideoHeight: 0, defaultVideoSteps: 0,
             defaultVideoMode: null, uploadDirectory: Uploads, logDirectory: Path.Combine(_root, "logs"),
             fileLoggingEnabled: false, samplingDefaults: null, skillsEnabled: skills, skillsAllowScripts: false,
-            skillsSandbox: SkillSandboxMode.Required, skillsAllowNetwork: false);
+            skillsSandbox: SkillSandboxMode.Required, skillsAllowNetwork: false,
+            // A host that offers no delegation: a plain spoken turn here needs nothing agentic, so it is one driven reply.
+            multiAgent: new TensorSharp.AgentHost.Agents.MultiAgentOptions { Enabled = false });
         var chat = new WebUiChatService(model, sessions, options, new UploadStoragePolicy(Uploads),
             new SkillRegistry(new SkillRegistryOptions { Roots = [] }), codeRunner: null, workspaces: null,
             codeArtifacts: null, NullLoggerFactory.Instance);
@@ -152,7 +178,7 @@ public sealed class WebUiSpokenReplyTests : IDisposable
     // ------------------------------------------------------------------------------------------------ frames
 
     [Fact]
-    public async Task ASpokenTurnStreamsItsTranscriptAndAudioInOrderThenItsWav()
+    public async Task ASpokenTurnStreamsItsTextThenItsSpeechThenItsWav()
     {
         var model = new SpeakingService();
         var (chat, session) = Build(model);
@@ -162,12 +188,12 @@ public sealed class WebUiSpokenReplyTests : IDisposable
             sessionId = session.Id, messages = FirstTurn(), speech = true,
         }));
 
-        // token, audio, token, audio, token, audio, done: the order generation made them.
+        // token x3 (the text turn's), audio x3 (the one sentence, spoken once complete), done.
         Assert.Equal(7, frames.Count);
         for (int c = 0; c < 3; c++)
         {
-            Assert.Equal(Words[c], Text(frames[2 * c], "token"));
-            JsonElement audio = frames[2 * c + 1];
+            Assert.Equal(Words[c], Text(frames[c], "token"));
+            JsonElement audio = frames[3 + c];
             Assert.Equal(Lfm3SpeechAudio.Pcm16(SpeechEndpointTests.Chunk(c)), Convert.FromBase64String(Text(audio, "audio")));
             Assert.Equal(24000, audio.GetProperty("sampleRate").GetInt32());
         }
@@ -196,18 +222,20 @@ public sealed class WebUiSpokenReplyTests : IDisposable
         Assert.Equal(16, BinaryPrimitives.ReadInt16LittleEndian(wav.AsSpan(34)));      // PCM16
         Assert.Equal(all.Length * 2, BinaryPrimitives.ReadInt32LittleEndian(wav.AsSpan(40)));
 
-        // The engine ran one interleaved spoken reply on the request's session, thinking off, in the model's first voice.
+        // The text turn of the request, as a text turn's: its session, thinking off, the history as sent (no speech line
+        // anywhere), and no driven reply; the TTS spoke its sentence in the model's first voice.
         var call = Assert.Single(model.Calls);
         Assert.Same(session, call.Session);
         Assert.False(call.Think);
-        Assert.Equal(SpeechReplyMode.Interleaved, call.Speech.Mode);
-        Assert.Equal("female", call.Speech.Voice);
-        Assert.False(call.Speech.Synthesis);
         Assert.Equal("Say hello to Anna.", Assert.Single(call.History).Content);
+        Assert.Equal(0, model.DrivenReplies);
+        var said = Assert.Single(model.Spoken);
+        Assert.Equal("Hello, Anna!", said.Text);
+        Assert.Equal("female", said.Options.Voice);
     }
 
     [Fact]
-    public async Task TheVoiceAndLanguageAskedForReachTheReply()
+    public async Task TheVoiceAndLanguageAskedForReachTheSpeech()
     {
         var model = new SpeakingService();
         var (chat, session) = Build(model);
@@ -215,30 +243,10 @@ public sealed class WebUiSpokenReplyTests : IDisposable
         {
             sessionId = session.Id, messages = FirstTurn(), speech = new { voice = "Male", language = "fr" },
         }));
-        var call = Assert.Single(model.Calls);
-        Assert.Equal("Male", call.Speech.Voice);
-        Assert.Equal("fr", call.Speech.Language);
-    }
-
-    [Fact]
-    public async Task ASpokenTurnSaysOnceWhatItRunsWithoutAndRunsWithoutIt()
-    {
-        var model = new SpeakingService();
-        var (chat, session) = Build(model);
-        List<JsonElement> frames = await Frames(chat, Body(new
-        {
-            sessionId = session.Id, messages = FirstTurn(), speech = true, think = true,
-            tools = new[] { new { type = "function", function = new { name = "get_weather", description = "weather", parameters = new { type = "object" } } } },
-        }));
-
-        JsonElement notice = Assert.Single(frames, f => f.TryGetProperty("notice", out _));
-        Assert.Equal(notice.ToString(), frames[0].ToString());
-        Assert.Equal("speech_direct", Text(notice, "code"));
-        Assert.Equal(new[] { "reasoning", "tools" }, notice.GetProperty("without").EnumerateArray().Select(e => e.GetString()));
-        Assert.Equal("This reply is spoken, so it runs without reasoning or tools.", Text(notice, "notice"));
-        // Thinking off, and no tool round: the spoken stream is the only generation.
-        Assert.False(Assert.Single(model.Calls).Think);
-        Assert.DoesNotContain(frames, f => f.TryGetProperty("tool_calls", out _));
+        var said = Assert.Single(model.Spoken);
+        Assert.Equal("Male", said.Options.Voice);
+        Assert.Equal("fr", said.Options.Language);
+        Assert.Single(model.Calls);
     }
 
     [Fact]
@@ -261,9 +269,9 @@ public sealed class WebUiSpokenReplyTests : IDisposable
     }
 
     [Fact]
-    public async Task AStoppedSpokenTurnWritesNoWavAndKeepsNoTurn()
+    public async Task AStoppedSpokenTurnWritesNoWavAndHasNoAudioId()
     {
-        var model = new SpeakingService { CancelAfter = 1 };
+        var model = new SpeakingService { CancelAfter = 2 };
         var (chat, session) = Build(model);
         List<JsonElement> frames = await Frames(chat, Body(new { sessionId = session.Id, messages = FirstTurn(), speech = true }));
 
@@ -272,8 +280,8 @@ public sealed class WebUiSpokenReplyTests : IDisposable
         Assert.False(done.TryGetProperty("audioId", out _));
         Assert.False(done.TryGetProperty("audioUrl", out _));
         Assert.Empty(Directory.EnumerateFiles(Uploads, "speech-*.wav"));
-        // What was spoken before the stop was still streamed.
-        Assert.Equal(1, frames.Count(f => f.TryGetProperty("audio", out _)));
+        // The text shown before the stop was not a whole sentence, so nothing was spoken.
+        Assert.Empty(model.Spoken);
     }
 
     // ------------------------------------------------------------------------------------------------ refusals
@@ -317,7 +325,7 @@ public sealed class WebUiSpokenReplyTests : IDisposable
     // ------------------------------------------------------------------------------------------------ next turn
 
     [Fact]
-    public async Task TheNextTurnSplicesTheSpokenTurnByItsAudioIdSoItsPrefixIsReused()
+    public async Task TheNextTurnRendersTheSpokenTurnAsItsText()
     {
         var model = new SpeakingService();
         var (chat, session) = Build(model);
@@ -336,15 +344,12 @@ public sealed class WebUiSpokenReplyTests : IDisposable
             },
         }));
 
+        // A text turn's history: the reply as its text, which the session's transcript store matches to its tokens.
         List<ChatMessage> second = model.Calls[1].History;
         Assert.Equal(3, second.Count);
-        // Spliced as generation decoded it: its tokens (one placeholder a frame) and each frame's codes.
-        Assert.Equal(Turn.Tokens, second[1].RawOutputTokens);
-        Assert.Same(FrameCodes, second[1].SpeechFrames);
-        Assert.Equal("<think></think>", second[1].RawGenerationSuffix);
-        Assert.Equal("", second[1].RawPromptTrailingWhitespace);
         Assert.Equal("Hello, Anna!", second[1].Content);
-        Assert.Null(second[0].RawOutputTokens);
+        Assert.Null(second[1].RawOutputTokens);
+        Assert.Null(second[1].SpeechFrames);
     }
 
     [Fact]

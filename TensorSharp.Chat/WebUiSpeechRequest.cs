@@ -18,11 +18,11 @@ namespace TensorSharp.Chat
 {
     /// <summary>
     /// A spoken web chat reply: <c>/api/chat</c>'s <c>speech</c>, <c>true</c> or <c>{"voice": ..., "language": ...}</c>
-    /// (both optional). The reply interleaves text and speech (the text is the speech's transcript) with thinking off; the
-    /// voice defaults to the model's first one (<see cref="ISpeechOutputModel.SpeechVoices"/>), which the system line then
-    /// names, as <c>/api/models</c>' <c>speechOutput.voices</c> lists them. The language defaults to the one the user's
-    /// message is written in; one the model's speech modes do not speak is spoken from the text reply by its TTS
-    /// (<see cref="SpeechReplyPath.Synthesized"/>).
+    /// (both optional). A spoken turn is the same request's text turn (reasoning, skills, tools, knowledge, every round,
+    /// the same prompt) with its answer spoken as it is written, by the model's TTS prompt, in every language
+    /// (<see cref="WebUiSpokenTurn"/>). The voice defaults to the model's first one
+    /// (<see cref="ISpeechOutputModel.SpeechVoices"/>), as <c>/api/models</c>' <c>speechOutput.voices</c> lists them. The
+    /// language defaults to the one the user's message is written in.
     /// </summary>
     internal sealed class WebUiSpeechRequest
     {
@@ -108,8 +108,7 @@ namespace TensorSharp.Chat
             return null;
         }
 
-        /// <summary>The engine's options for this reply: interleaved text and speech, in the asked voice or the model's
-        /// first one (so the system line always names a voice).</summary>
+        /// <summary>This reply's speech options: the asked voice or the model's first one, the asked language.</summary>
         public SpeechReplyOptions OptionsFor(ISpeechOutputModel speaker) => new()
         {
             Mode = SpeechReplyMode.Interleaved,
@@ -117,35 +116,5 @@ namespace TensorSharp.Chat
             Language = Language,
             Synthesis = false,
         };
-
-        /// <summary>
-        /// What a spoken turn does not run that this request would otherwise have had: <c>reasoning</c> (<c>think</c>),
-        /// <c>tools</c> (the client's, or the host's code execution), <c>skills</c> (named, or the catalog the host
-        /// discovers from) and <c>knowledge</c> (collections). A spoken reply is one driven generation, never a tool loop;
-        /// the turn says so in a <c>notice</c> frame instead of dropping them silently.
-        /// </summary>
-        public static IReadOnlyList<string> Without(bool think, bool tools, bool skills, bool knowledge)
-        {
-            var without = new List<string>(4);
-            if (think) without.Add("reasoning");
-            if (tools) without.Add("tools");
-            if (skills) without.Add("skills");
-            if (knowledge) without.Add("knowledge");
-            return without;
-        }
-
-        /// <summary>The notice's sentence for <paramref name="without"/> ("This reply is spoken, so it runs without
-        /// reasoning, tools or skills.").</summary>
-        public static string NoticeText(IReadOnlyList<string> without)
-        {
-            string[] names = without.Select(w => w == "knowledge" ? "knowledge lookups" : w).ToArray();
-            string list = names.Length switch
-            {
-                0 => string.Empty,
-                1 => names[0],
-                _ => string.Join(", ", names.Take(names.Length - 1)) + " or " + names[^1],
-            };
-            return "This reply is spoken, so it runs without " + list + ".";
-        }
     }
 }

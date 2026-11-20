@@ -58,7 +58,7 @@
   "page.speech.save": "Save audio",
   "page.speech.saveWithLength": "Save audio ({seconds} s)",
   "page.speech.saveFailed": "Could not save the audio: {error}",
-  "page.speech.direct": "This reply is spoken, so it runs without reasoning, tools or skills.",
+  "page.speech.failed": "The reply's speech stopped, so only part of it was spoken: {error}",
   "page.speech.notSaved": "The reply's audio could not be saved, so it cannot be played again.",
   "page.image.generatedAlt": "generated image",
   "page.image.compareOriginal": "Compare original",

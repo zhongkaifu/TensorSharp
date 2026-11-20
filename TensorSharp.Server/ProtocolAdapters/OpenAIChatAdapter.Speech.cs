@@ -5,9 +5,11 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Spoken chat replies (OpenAI's audio output): `modalities` ["text","audio"] (interleaved text and speech, the text being
-// the speech's transcript) or ["audio"] (speech only), with `audio` {voice, format}. The reply runs on the engine as a
-// driven request (TensorSharp.Models.Audio.ISpeechOutputModel), batched with every other request.
+// Spoken chat replies (OpenAI's audio output): `modalities` ["text","audio"] or ["audio"], with `audio` {voice, format}.
+// A request whose text completion would be a plain English reply runs as one driven request of text and speech
+// (TensorSharp.Models.Audio.ISpeechOutputModel), batched with every other request; every other one (tools, reasoning,
+// skills, knowledge, another language) is the text completion with its content spoken by the model's TTS
+// (SpokenCompletion).
 
 using System;
 using System.Collections.Generic;
@@ -19,6 +21,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Models.Audio;
 using TensorSharp.Server.Hosting;
+using TensorSharp.Server.Skills;
 using TensorSharp.Server.Responses;
 using TensorSharp.Server.ResponseSerializers;
 using TensorSharp.Server.StreamingWriters;
@@ -258,6 +261,160 @@ public sealed partial class OpenAIChatAdapter
         ctx.Response.ContentType = "application/json; charset=utf-8";
         await ctx.Response.WriteAsync(JsonSerializer.Serialize(OpenAIResponseFactory.Completion(requestId, _svc.LoadedModelName, message,
             finish, terminal.PromptTokens, terminal.EvalTokens, terminal.KvCacheReusedTokens))).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether a spoken completion is one driven generation of text and speech (<see cref="SpeechCompletionAsync"/>)
+    /// rather than the request's text completion with its content spoken (<see cref="SpokenCompletion"/>): only when the
+    /// text completion would be a plain reply (no reasoning, no tool of the client's or the host's, no skill, no
+    /// knowledge) and the model speaks the reply's language in the reply itself.
+    /// </summary>
+    private bool SpeaksInItsReply(SpeechReplyRequest speech, List<ChatMessage> messages, bool think,
+        IReadOnlyList<ToolFunction>? tools, SkillRequestPlan? plan, bool knowledge)
+    {
+        if (think || tools is { Count: > 0 } || plan is { IsEmpty: false } || knowledge) return false;
+        return ChatGenerationPipeline.SpokenReplyRoute(_svc.SpeechOutputModel, speech.Options, messages, out _) == SpeechReplyPath.Direct;
+    }
+
+    /// <summary>
+    /// The speech of a spoken chat completion that is the request's text completion (its reasoning, tool calls, skills,
+    /// every round of the host's loop): the content is spoken by the model's TTS prompt as it is written
+    /// (<see cref="ReplySpeaker"/>), never the reasoning or a tool call. Streamed, the content goes out as
+    /// <c>delta.audio.transcript</c> and the speech as <c>delta.audio.data</c> (pcm16) between it, as a driven spoken
+    /// reply's does, and tool calls and reasoning as a text completion's; whole, <c>message.audio</c> holds the speech of
+    /// the content (absent when there is none, e.g. a reply that is only tool calls) beside the reply's tool calls.
+    /// </summary>
+    private sealed class SpokenCompletion : IDisposable
+    {
+        private readonly OpenAIChatAdapter _adapter;
+        private readonly HttpContext _ctx;
+        private readonly string _requestId;
+        private readonly bool _stream;
+        private readonly SpeechReplyRequest _speech;
+
+        public SpokenCompletion(OpenAIChatAdapter adapter, HttpContext ctx, string requestId, SpeechReplyRequest speech,
+            List<ChatMessage> messages, bool stream)
+        {
+            _adapter = adapter;
+            _ctx = ctx;
+            _requestId = requestId;
+            _speech = speech;
+            _stream = stream;
+            ISpeechOutputModel speaker = adapter._svc.SpeechOutputModel;
+            Language = ChatGenerationPipeline.SpokenReplyLanguage(speaker, speech.Options, messages);
+            string language = Language;
+            Speaker = new ReplySpeaker((piece, index, ct) => adapter._svc.SpeechSynthesisStreamAsync(piece, new SpeechSynthesisOptions
+            {
+                Voice = speech.Voice,
+                Language = speaker.SpeechLanguageOf(piece, language),
+                Seed = speech.Seed is uint seed ? unchecked(seed + (uint)index) : null,
+                Temperature = speech.Temperature,
+            }, ct), new SpeechTextSegmenter(), ctx.RequestAborted);
+        }
+
+        public ReplySpeaker Speaker { get; }
+        public string Language { get; }
+        public string AudioId { get; } = SpeechReplyStore.NewId();
+        public StringBuilder Transcript { get; } = new();
+        public List<float> Pcm { get; } = new();
+        public int SampleRate { get; private set; }
+
+        /// <summary>The first chunk: the reply's audio id, with its role.</summary>
+        public Task StartAsync() => SseWriter.WriteEventAsync(_ctx.Response,
+            _adapter.AudioChunk(_requestId, new { id = AudioId }, role: "assistant"), _ctx.RequestAborted);
+
+        /// <summary>Content: spoken, and streamed as the transcript.</summary>
+        public Task SayAsync(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return Task.CompletedTask;
+            Transcript.Append(content);
+            Speaker.Say(content);
+            return _stream
+                ? SseWriter.WriteEventAsync(_ctx.Response, _adapter.AudioChunk(_requestId, new { transcript = content }), _ctx.RequestAborted)
+                : Task.CompletedTask;
+        }
+
+        /// <summary>The round's content has ended (a tool call follows).</summary>
+        public void EndOfRound() => Speaker.Pause();
+
+        /// <summary>The speech made so far: streamed, or kept for the whole reply.</summary>
+        public async Task PumpAsync()
+        {
+            while (Speaker.Audio.TryRead(out ChatStreamUpdate update))
+            {
+                if (update.Audio is not { Length: > 0 } samples) continue;
+                if (update.AudioSampleRate > 0) SampleRate = update.AudioSampleRate;
+                if (_stream)
+                    await SseWriter.WriteEventAsync(_ctx.Response, _adapter.AudioChunk(_requestId,
+                        new { data = Convert.ToBase64String(TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Pcm16(samples)) }),
+                        _ctx.RequestAborted).ConfigureAwait(false);
+                else
+                    Pcm.AddRange(samples);
+            }
+        }
+
+        /// <summary><paramref name="updates"/>' next update, streaming the speech while it is on its way.</summary>
+        public async Task<bool> NextAsync(IAsyncEnumerator<ChatStreamUpdate> updates)
+        {
+            await PumpAsync().ConfigureAwait(false);
+            Task<bool> next = updates.MoveNextAsync().AsTask();
+            try
+            {
+                while (!next.IsCompleted)
+                {
+                    Task audio = Speaker.WhenAudioOrEnd();
+                    if (audio.IsCompleted && Speaker.Audio.Completion.IsCompleted)
+                    {
+                        await Task.WhenAny(next).ConfigureAwait(false);
+                        break;
+                    }
+                    await Task.WhenAny(next, audio).ConfigureAwait(false);
+                    await PumpAsync().ConfigureAwait(false);
+                }
+            }
+            catch
+            {
+                // A write failed (the client went away): the enumerator is disposed next, which only a finished pull allows.
+                try { await next.ConfigureAwait(false); } catch { /* reported by the caller's own cancellation */ }
+                throw;
+            }
+            return await next.ConfigureAwait(false);
+        }
+
+        /// <summary>The text is done: the rest is spoken (streamed), then the reply is kept by its audio id (a text
+        /// turn: sent back, it renders as its transcript). A speech failure is logged; the text completion stands.</summary>
+        public async Task<SpeechReplyStore.Entry> FinishAsync(ILogger logger)
+        {
+            Speaker.Complete();
+            while (true)
+            {
+                await PumpAsync().ConfigureAwait(false);
+                if (Speaker.Completion.IsCompleted) break;
+                await Task.WhenAny(Speaker.Completion, Speaker.WhenAudioOrEnd()).ConfigureAwait(false);
+            }
+            await PumpAsync().ConfigureAwait(false);
+            if (Speaker.Completion.IsFaulted)
+                logger.LogWarning(LogEventIds.ChatFailed, "/v1/chat/completions spoken reply's speech failed (id={ChatcmplId}): {Error}",
+                    _requestId, Speaker.Completion.Exception?.GetBaseException().Message);
+            if (SampleRate == 0) SampleRate = Speaker.SampleRate > 0 ? Speaker.SampleRate : 24000;
+            SpeechReplyStore.Entry entry = SpeechReplies.Add(Transcript.ToString(), Speaker.Frames, AudioId);
+            logger.LogInformation(LogEventIds.ChatCompleted,
+                "/v1/chat/completions spoken reply from its text: id={ChatcmplId} audio={AudioId} language={Language} pieces={Pieces} " +
+                "audioSeconds={Seconds:F2} firstAudioMs={FirstAudioMs:F0}", _requestId, AudioId, Language ?? "(default)", Speaker.Pieces,
+                Speaker.Samples / (double)Math.Max(1, SampleRate), Speaker.FirstAudioMs);
+            return entry;
+        }
+
+        /// <summary>The whole reply's <c>message.audio</c>, or null when nothing was spoken.</summary>
+        public object WholeAudio(SpeechReplyStore.Entry entry)
+        {
+            if (Transcript.Length == 0) return null;
+            float[] all = Pcm.ToArray();
+            byte[] data = _speech.Format == "wav" ? TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Wav(all, SampleRate) : TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Pcm16(all);
+            return new { id = AudioId, expires_at = entry.ExpiresAt.ToUnixTimeSeconds(), data = Convert.ToBase64String(data), transcript = Transcript.ToString() };
+        }
+
+        public void Dispose() => Speaker.Dispose();
     }
 
     /// <summary>A streamed chunk whose delta carries <c>audio</c> (OpenAI's audio deltas).</summary>

@@ -58,7 +58,7 @@
   "page.speech.save": "儲存音訊",
   "page.speech.saveWithLength": "儲存音訊（{seconds} 秒）",
   "page.speech.saveFailed": "無法儲存音訊：{error}",
-  "page.speech.direct": "此回覆以語音進行，因此不會使用推理、工具或技能。",
+  "page.speech.failed": "回覆的朗讀中斷了，只朗讀了一部分：{error}",
   "page.speech.notSaved": "無法儲存回覆的音訊，因此無法再次播放。",
   "page.image.generatedAlt": "生成的影像",
   "page.image.compareOriginal": "對比原圖",

@@ -96,7 +96,7 @@ public class ContentContractTests
         new(null, "promptLimit", null, "token limit"),
         new(null, "inputTokens.Count", null, "token count"),
         new(null, "promptTokensCached[i]", null, "token count per benchmark turn (int[])"),
-        new(null, "terminal.PromptTokens", null, "token count (ChatStreamUpdate.PromptTokens is an int)"),
+        new("TensorSharp.Chat/WebUiChatService.cs", "turnPromptTokens", "spoken turn done", "token count (an int)"),
 
         // ---- Model, draft-model, projector and LoRA file names: operator configuration
         //      (the command line, TS_LORAS, the model directory), not a client's content. ----

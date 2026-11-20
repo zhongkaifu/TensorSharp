@@ -22,6 +22,7 @@ using TensorSharp.Knowledge;
 using TensorSharp.Server.Knowledge;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.RequestParsers;
+using TensorSharp.Server.Responses;
 using TensorSharp.Server.ResponseSerializers;
 using TensorSharp.Server.Skills;
 using TensorSharp.Server.StreamingWriters;
@@ -240,14 +241,11 @@ public sealed partial class OpenAIChatAdapter
         WarnIgnoredTemplateKwargsOnce(openaiLogger, ignoredKwargs);
         var requestedSkills = SkillSelectionParser.Parse(body);
 
-        // A spoken reply is a conversational answer: the protocol features that shape text are not combined with it.
+        // A spoken reply runs what the text completion runs (tools, reasoning, skills, knowledge) and speaks its content;
+        // a structured reply (JSON) is not something to say.
         if (speech != null)
         {
-            string conflict = openaiTools is { Count: > 0 } ? "tools"
-                : body.TryGetProperty("response_format", out var rf) && rf.ValueKind != JsonValueKind.Null ? "response_format"
-                : openaiThink ? "thinking (think / enable_thinking)"
-                : requestedSkills is { Count: > 0 } ? "skills"
-                : knowledge.Enabled ? "knowledge retrieval"
+            string conflict = body.TryGetProperty("response_format", out var rf) && rf.ValueKind != JsonValueKind.Null ? "response_format"
                 : null;
             if (conflict != null)
             {
@@ -435,9 +433,9 @@ public sealed partial class OpenAIChatAdapter
                     "/v1/chat/completions lora: id={ChatcmplId} adapter={Adapter}", requestId, lora.Id);
         }
 
-        if (speech != null)
+        if (speech != null && SpeaksInItsReply(speech, messages, openaiThink, effectiveTools, skillPlan, knowledge.Enabled))
         {
-            // Spoken: the client's messages as they are (no skill tools or instructions), on the engine as a driven request.
+            // A plain English reply: the client's messages as they are, on the engine as one driven request of text and speech.
             await SpeechCompletionAsync(ctx, requestId, modelName!, messages, maxTokens, samplingConfig, speech, stream, lora, openaiLogger)
                 .ConfigureAwait(false);
             return;
@@ -447,15 +445,19 @@ public sealed partial class OpenAIChatAdapter
             completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxTokens, effectiveTools, openaiThink)).ConfigureAwait(false);
         if (inferenceMessages == null) return;
 
+        // Every other spoken reply is this text completion with its content spoken as it is written.
+        using SpokenCompletion? spoken = speech == null ? null : new SpokenCompletion(this, ctx, requestId, speech, messages, stream);
         if (stream)
         {
             await StreamCompletionAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
-                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge, lora).ConfigureAwait(false);
+                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge, lora,
+                spoken).ConfigureAwait(false);
         }
         else
         {
             await CompleteSyncAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
-                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge, lora).ConfigureAwait(false);
+                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge, lora,
+                spoken).ConfigureAwait(false);
         }
     }
 
@@ -663,7 +665,8 @@ public sealed partial class OpenAIChatAdapter
         ILogger skillLogger,
         TensorSharp.Runtime.Grammar.IToolCallGrammar? toolGrammar,
         KnowledgeProtocolRequest knowledge,
-        TextLoraAdapter? lora)
+        TextLoraAdapter? lora,
+        SpokenCompletion? spoken = null)
     {
         // Only the strict json_schema path must buffer the whole response so it
         // can be schema-normalized before anything is sent to the client. Plain
@@ -706,9 +709,12 @@ public sealed partial class OpenAIChatAdapter
         Task EmitContentAsync(string content)
         {
             if (knowledgeAnswer != null) { knowledgeAnswer.Append(content); return Task.CompletedTask; }
+            // A spoken reply's content is its transcript, spoken as it streams.
+            if (spoken != null) return spoken.SayAsync(content);
             return SseWriter.WriteEventAsync(ctx.Response,
                 OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, content), ctx.RequestAborted);
         }
+        if (spoken != null) await spoken.StartAsync().ConfigureAwait(false);
 
         IOutputParser? parser = null;
         bool sawToolCall = false;
@@ -732,13 +738,18 @@ public sealed partial class OpenAIChatAdapter
             && responseFormat.Kind == StructuredOutputKind.JsonObject)
             ? new StreamingJsonObjectFilter() : null;
 
-        await foreach (var update in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxTokens,
-            ctx.RequestAborted, samplingConfig, openaiTools, openaiThink, skillPlan, skillLogger, lora).ConfigureAwait(false))
+        // Pulled by hand: a spoken reply streams its speech while the next update is on its way (a tool's run).
+        await using IAsyncEnumerator<ChatStreamUpdate> updates = _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxTokens,
+            ctx.RequestAborted, samplingConfig, openaiTools, openaiThink, skillPlan, skillLogger, lora).GetAsyncEnumerator(ctx.RequestAborted);
+        while (spoken != null ? await spoken.NextAsync(updates).ConfigureAwait(false) : await updates.MoveNextAsync().ConfigureAwait(false))
         {
+            ChatStreamUpdate update = updates.Current;
             knowledge.Observe(update);
             string piece = update.Piece;
             if (!update.Done)
             {
+                if (update.ToolProgressPhase != null || update.ParsedToolCalls is { Count: > 0 })
+                    spoken?.EndOfRound();
                 // Text a parser holds sends nothing for as long as it is held.
                 await SseWriter.KeepAliveIfIdleAsync(ctx.Response, KeepAliveInterval, ctx.RequestAborted).ConfigureAwait(false);
                 if (update.RawGenerationSuffix != null)
@@ -789,6 +800,7 @@ public sealed partial class OpenAIChatAdapter
                     if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
                     {
                         sawToolCall = true;
+                        spoken?.EndOfRound();
                         await SseWriter.WriteEventAsync(ctx.Response,
                             OpenAIResponseFactory.ToolCallsChunk(requestId, _svc.LoadedModelName, parsed.ToolCalls),
                             ctx.RequestAborted).ConfigureAwait(false);
@@ -865,9 +877,18 @@ public sealed partial class OpenAIChatAdapter
             }
             if (knowledgeAnswer != null && knowledgeAnswer.Length > 0)
             {
-                await SseWriter.WriteEventAsync(ctx.Response,
-                    OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName,
-                        knowledge.Normalize(knowledgeAnswer.ToString(), structured: responseFormat != null)),
+                string answer = knowledge.Normalize(knowledgeAnswer.ToString(), structured: responseFormat != null);
+                if (spoken != null)
+                    await spoken.SayAsync(answer).ConfigureAwait(false);
+                else
+                    await SseWriter.WriteEventAsync(ctx.Response,
+                        OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, answer),
+                        ctx.RequestAborted).ConfigureAwait(false);
+            }
+            if (spoken != null)
+            {
+                SpeechReplyStore.Entry entry = await spoken.FinishAsync(skillLogger).ConfigureAwait(false);
+                await SseWriter.WriteEventAsync(ctx.Response, AudioChunk(requestId, new { expires_at = entry.ExpiresAt.ToUnixTimeSeconds() }),
                     ctx.RequestAborted).ConfigureAwait(false);
             }
             await SseWriter.WriteEventAsync(ctx.Response,
@@ -879,6 +900,15 @@ public sealed partial class OpenAIChatAdapter
             await SseWriter.WriteDoneSentinelAsync(ctx.Response, ctx.RequestAborted).ConfigureAwait(false);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>A whole spoken reply's content spoken (after the text is complete): its <c>message.audio</c>, or null when
+    /// it has no content.</summary>
+    private static async Task<object?> SpeakWholeAsync(SpokenCompletion spoken, string content, ILogger logger)
+    {
+        await spoken.SayAsync(content).ConfigureAwait(false);
+        SpeechReplyStore.Entry entry = await spoken.FinishAsync(logger).ConfigureAwait(false);
+        return spoken.WholeAudio(entry);
     }
 
     private async Task<bool> FlushStructuredCompletionAsync(
@@ -955,7 +985,8 @@ public sealed partial class OpenAIChatAdapter
         ILogger skillLogger,
         Runtime.Grammar.IToolCallGrammar? toolGrammar,
         KnowledgeProtocolRequest knowledge,
-        TextLoraAdapter? lora)
+        TextLoraAdapter? lora,
+        SpokenCompletion? spoken = null)
     {
         if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
                 _options.StartupModelPath, _options.StartupMmProjPath, _options.DefaultBackend, out string loadError))
@@ -1034,13 +1065,19 @@ public sealed partial class OpenAIChatAdapter
             // the block (LFM3, Nemotron-H Reasoning-128K) often states its result there, and
             // a reply cut by max_tokens in the answer that follows otherwise lost it entirely.
             string? thinkingOut = !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
-            responseMessage = OpenAIResponseFactory.ParsedAssistantMessage(knowledge.Normalize(parsed.Content), thinkingOut, parsed.ToolCalls);
+            string content = knowledge.Normalize(parsed.Content);
+            responseMessage = spoken != null
+                ? OpenAIResponseFactory.SpokenAssistantMessage(thinkingOut, parsed.ToolCalls, await SpeakWholeAsync(spoken, content, skillLogger).ConfigureAwait(false))
+                : OpenAIResponseFactory.ParsedAssistantMessage(content, thinkingOut, parsed.ToolCalls);
 
             sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;
         }
         else
         {
-            responseMessage = OpenAIResponseFactory.PlainAssistantMessage(knowledge.Normalize(rawOutput));
+            string content = knowledge.Normalize(rawOutput);
+            responseMessage = spoken != null
+                ? OpenAIResponseFactory.SpokenAssistantMessage(null, null, await SpeakWholeAsync(spoken, content, skillLogger).ConfigureAwait(false))
+                : OpenAIResponseFactory.PlainAssistantMessage(content);
         }
 
         ctx.Response.ContentType = "application/json; charset=utf-8";

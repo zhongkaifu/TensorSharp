@@ -142,59 +142,31 @@ namespace TensorSharp.Server
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             CancellationToken token = linked.Token;
             var output = Channel.CreateUnbounded<ChatStreamUpdate>(new UnboundedChannelOptions { SingleReader = true });
-            var pieces = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+            using var speaker = new ReplySpeaker(speak, segmenter, token);
             ChatStreamUpdate terminal = default;
             bool sawTerminal = false;
 
             Task text = Task.Run(async () =>
             {
-                try
+                await foreach (ChatStreamUpdate update in textReply(token).WithCancellation(token).ConfigureAwait(false))
                 {
-                    await foreach (ChatStreamUpdate update in textReply(token).WithCancellation(token).ConfigureAwait(false))
+                    if (update.Done)
                     {
-                        if (update.Done)
-                        {
-                            terminal = update;
-                            sawTerminal = true;
-                            continue;
-                        }
-                        output.Writer.TryWrite(update);
-                        if (!string.IsNullOrEmpty(update.Piece))
-                            foreach (string piece in segmenter.Append(update.Piece))
-                                pieces.Writer.TryWrite(piece);
+                        terminal = update;
+                        sawTerminal = true;
+                        continue;
                     }
-                    foreach (string piece in segmenter.Flush())
-                        pieces.Writer.TryWrite(piece);
+                    output.Writer.TryWrite(update);
+                    speaker.Say(update.Piece);
                 }
-                finally
-                {
-                    pieces.Writer.TryComplete();
-                }
+                speaker.Complete();
             }, CancellationToken.None);
 
             Task speech = Task.Run(async () =>
             {
-                int index = 0;
-                await foreach (string piece in pieces.Reader.ReadAllAsync(token).ConfigureAwait(false))
-                {
-                    await foreach (ChatStreamUpdate update in speak(piece, index, token).WithCancellation(token).ConfigureAwait(false))
-                    {
-                        if (update.Done)
-                        {
-                            if (update.SpeechFrames != null) stats.Frames.AddRange(update.SpeechFrames);
-                            if (update.AudioSampleRate > 0) stats.SampleRate = update.AudioSampleRate;
-                            continue;
-                        }
-                        if (update.Audio is { Length: > 0 } samples)
-                        {
-                            if (stats.FirstAudioMs < 0) stats.FirstAudioMs = clock.Elapsed.TotalMilliseconds;
-                            stats.Samples += samples.Length;
-                            if (update.AudioSampleRate > 0) stats.SampleRate = update.AudioSampleRate;
-                        }
-                        output.Writer.TryWrite(update);
-                    }
-                    stats.Pieces = ++index;
-                }
+                await foreach (ChatStreamUpdate update in speaker.Audio.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
+                    output.Writer.TryWrite(update);
+                await speaker.Completion.ConfigureAwait(false);
             }, CancellationToken.None);
 
             // Either side's failure stops the other; the stream ends when both have.
@@ -227,6 +199,11 @@ namespace TensorSharp.Server
             await speech.ConfigureAwait(false);
             if (!sawTerminal)
                 throw new InvalidOperationException("the text reply ended without its terminal update");
+            stats.Pieces = speaker.Pieces;
+            stats.Samples = speaker.Samples;
+            stats.SampleRate = speaker.SampleRate;
+            stats.FirstAudioMs = speaker.FirstAudioMs;
+            stats.Frames.AddRange(speaker.Frames);
             yield return terminal with
             {
                 TotalNs = (long)(clock.Elapsed.TotalSeconds * 1_000_000_000L),

@@ -58,7 +58,7 @@
   "page.speech.save": "Enregistrer l’audio",
   "page.speech.saveWithLength": "Enregistrer l’audio ({seconds} s)",
   "page.speech.saveFailed": "Impossible d’enregistrer l’audio : {error}",
-  "page.speech.direct": "Cette réponse est parlée : elle s’exécute donc sans raisonnement, outils ni compétences.",
+  "page.speech.failed": "La lecture de la réponse s’est arrêtée ; seule une partie a été dite : {error}",
   "page.speech.notSaved": "L’audio de la réponse n’a pas pu être enregistré ; il ne peut donc pas être réécouté.",
   "page.image.generatedAlt": "image générée",
   "page.image.compareOriginal": "Comparer à l’original",

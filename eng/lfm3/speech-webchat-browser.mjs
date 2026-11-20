@@ -13,7 +13,9 @@
 // sends the first back with its audioId. Screenshots and a JSON report go to --output (under artifacts/ or
 // docs/validation/).
 //
-//   node eng/lfm3/speech-webchat-browser.mjs --url http://127.0.0.1:18765 --output artifacts/lfm3-speech-webchat/browser
+//   node eng/lfm3/speech-webchat-browser.mjs --url http://127.0.0.1:18765 --output artifacts/lfm3-speech-webchat/browser \
+//     [--first "Use Python to compute 37 times 43."] [--second "Now write it into answer.txt."]
+// --first / --second replace the two questions (e.g. turns that run the host's code tools, on a server with --code-exec).
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -86,7 +88,7 @@ async function scenario() {
   await evaluate(`(() => { const t = document.getElementById('speech-toggle'); t.checked = true; t.dispatchEvent(new Event('change')); return true; })()`);
   await shot('01-switch-on');
 
-  await send('What is the capital of France? Answer in one short sentence.');
+  await send(args.first || 'What is the capital of France? Answer in one short sentence.');
   await until(`window.__speech.started > 0`, 'the first audio chunk to be scheduled', 120000);
   const live = await evaluate(`({ started: window.__speech.started, stop: !!document.querySelector('.spoken-reply-live') })`);
   step('audio chunks play as they arrive', live);
@@ -101,6 +103,8 @@ async function scenario() {
       download: link.getAttribute('download'), label: link.textContent, header, bytes: bytes.length,
       chunks: window.__speech.started, rates: Array.from(new Set(window.__speech.rates)),
       history: chatHistory.map(m => ({ role: m.role, audioId: m.audioId || null, audioUrl: m.audioUrl || null })),
+      answer: document.querySelector('.message.assistant .bubble-text').textContent.slice(0, 400),
+      notes: Array.from(document.querySelectorAll('.message.assistant .turn-notice, .message.assistant .turn-note')).map(n => n.textContent),
       stats: document.querySelector('.message.assistant .stats').textContent };
   })()`);
   if (!(finished.duration > 0) || finished.header !== 'RIFF/WAVE' || !finished.download)
@@ -112,11 +116,12 @@ async function scenario() {
   let sent = null;
   await cdp('Network.enable');
   const requestSeen = new Promise(resolve => { onRequest = resolve; });
-  await send('And what is the capital of Germany? Answer in one short sentence.');
+  await send(args.second || 'And what is the capital of Germany? Answer in one short sentence.');
   sent = await Promise.race([requestSeen, new Promise(r => setTimeout(() => r(null), 30000))]);
   await until(`document.querySelectorAll('.message.assistant .spoken-reply audio[src]').length >= 2 && !isGenerating`, 'the second spoken reply', 180000);
   const second = await evaluate(`({ stats: Array.from(document.querySelectorAll('.message.assistant .stats')).map(s => s.textContent),
-    players: document.querySelectorAll('.message.assistant .spoken-reply audio').length })`);
+    players: document.querySelectorAll('.message.assistant .spoken-reply audio').length,
+    answers: Array.from(document.querySelectorAll('.message.assistant .bubble-text')).map(b => b.textContent.slice(0, 300)) })`);
   const body = sent && JSON.parse(sent);
   const back = body && body.messages && body.messages[1];
   if (!back || !back.audioId) throw new Error('The second request did not carry the first reply\'s audioId: ' + sent);

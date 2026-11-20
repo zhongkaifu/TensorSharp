@@ -58,7 +58,7 @@
   "page.speech.save": "Audio sichern",
   "page.speech.saveWithLength": "Audio sichern ({seconds} s)",
   "page.speech.saveFailed": "Das Audio konnte nicht gesichert werden: {error}",
-  "page.speech.direct": "Diese Antwort wird gesprochen und läuft daher ohne Nachdenken, Werkzeuge oder Skills.",
+  "page.speech.failed": "Das Vorlesen der Antwort wurde abgebrochen, daher wurde nur ein Teil gesprochen: {error}",
   "page.speech.notSaved": "Das Audio der Antwort konnte nicht gespeichert werden und lässt sich daher nicht erneut abspielen.",
   "page.image.generatedAlt": "generiertes Bild",
   "page.image.compareOriginal": "Mit Original vergleichen",
