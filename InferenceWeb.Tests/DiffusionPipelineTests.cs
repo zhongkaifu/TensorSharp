@@ -67,8 +67,16 @@ public sealed class DiffusionPipelineTests
         public DenoiserCaps Caps { get; } = new();
         public List<StepState> Steps { get; } = new();
 
+        /// <summary>Thrown by the next step (once): a backend failure inside the denoise.</summary>
+        public Exception FailNext { get; set; }
+
         public StepOutput Step(DenoiseStepInputs inputs, AdapterSet adapters, CancellationToken ct)
         {
+            if (FailNext is Exception failure)
+            {
+                FailNext = null;
+                throw failure;
+            }
             family.Events.Add($"step {inputs.Step.Index}");
             Steps.Add(inputs.Step);
             // Its own buffer, rewritten by every call, as a graph plan's outputs are.
@@ -634,6 +642,77 @@ public sealed class DiffusionPipelineTests
             "[diffusion-residency] 32x16, 0 reference(s): before Denoise: release the conditioner",
             "[diffusion-residency] 32x16, 0 reference(s): before Condition: release the denoiser; before Denoise: release the conditioner",
         }, log.Where(l => l.StartsWith("[diffusion-residency]")).Select(l => l[..l.IndexOf(" (peak", StringComparison.Ordinal)]));
+    }
+
+    [Fact]
+    public void APhaseThatFailsIsNoLongerCountedAsResident()
+    {
+        // A device failure inside the denoise (on the RTX A4500: a compute allocation another process's memory made fail).
+        // Which of the denoiser's device copies exist is no longer known: they are released and the next plan does not count
+        // them as held, so it is not made against memory the device does not have. A cancelled run keeps its weights.
+        // A device that holds everything, so no plan releases anything: a release seen here is the failure's.
+        var family = new FakeFamily();
+        using var pipeline = Pipeline(family, spare: 100);
+        pipeline.Run(new DiffusionRequest { Prompt = "first" });
+        Assert.True(pipeline.IsResident(DiffusionComponent.Denoiser));
+        Assert.DoesNotContain(family.Events, e => e.StartsWith("release") && !e.EndsWith("workspace"));
+
+        family.Denoiser.FailNext = new InvalidOperationException("graph builder: failed to allocate the graph's compute memory.");
+        family.Events.Clear();
+        Assert.Throws<InvalidOperationException>(() => pipeline.Run(new DiffusionRequest { Prompt = "fails" }));
+        Assert.Equal(new[] { "release denoiser" }, family.Events.Where(e => e.StartsWith("release") && !e.EndsWith("workspace")));
+        Assert.False(pipeline.IsResident(DiffusionComponent.Denoiser));
+        Assert.True(pipeline.IsResident(DiffusionComponent.Conditioner));
+        Assert.True(pipeline.IsResident(DiffusionComponent.Vae));
+
+        family.Events.Clear();
+        using var cancel = new CancellationTokenSource();
+        Assert.ThrowsAny<OperationCanceledException>(() =>
+            pipeline.Run(new DiffusionRequest { Prompt = "cancelled" }, cancel.Token, betweenSteps: cancel.Cancel));
+        Assert.Contains("step 0", family.Events);
+        Assert.DoesNotContain("release denoiser", family.Events);
+        Assert.True(pipeline.IsResident(DiffusionComponent.Denoiser));
+    }
+
+    [Fact]
+    public void ARequestWhosePhaseCannotFitTheFreeDeviceMemoryIsRefusedBeforeAnyPhaseRuns()
+    {
+        // The DiT's 40 and its step's 3 on a device with 42 free: no release makes the denoise fit (on ggml-cuda the run
+        // would end inside a kernel), so nothing is uploaded or run.
+        var family = new FakeFamily();
+        var log = new List<string>();
+        var planner = new ResidencyPlanner(() => 40, log.Add, freeBytes: () => 42);
+        using var pipeline = new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlCuda }, planner, log.Add);
+        var error = Assert.Throws<RequestRefusedException>(() => pipeline.Run(new DiffusionRequest { Prompt = "big" }));
+        Assert.Contains("cannot run 32x16 on this device: its denoise alone needs", error.Message);
+        Assert.DoesNotContain(family.Events, e => e.StartsWith("condition") || e.StartsWith("step") || e.StartsWith("decode"));
+        Assert.False(pipeline.IsResident(DiffusionComponent.Conditioner));
+        Assert.False(pipeline.IsResident(DiffusionComponent.Denoiser));
+        Assert.Contains(log, l => l.StartsWith("[diffusion-residency]") && l.Contains("refused: Denoise needs"));
+    }
+
+    [Fact]
+    public void APlanOverItsBudgetIsNotRefusedWhileThePhaseFitsTheFreeMemory()
+    {
+        // The budget keeps headroom (40 of 46 free); the denoise needs 43: over the budget, within the device. Such a run
+        // fits (bf16 at 4096x4096 on the A40: 42.6 GiB peak with the plan over its budget), so it runs.
+        var family = new FakeFamily();
+        var planner = new ResidencyPlanner(() => 40, _ => { }, freeBytes: () => 46);
+        using var pipeline = new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlCuda }, planner, _ => { });
+        DiffusionResult result = pipeline.Run(new DiffusionRequest { Prompt = "edge" });
+        Assert.False(result.Residency.Fits);
+        Assert.False(result.Residency.Refused);
+        Assert.Contains("step 0", family.Events);
+    }
+
+    [Fact]
+    public void WithoutAFreeMemoryReadingNothingIsRefused()
+    {
+        var family = new FakeFamily();
+        using var pipeline = Pipeline(family, spare: 10);
+        DiffusionResult result = pipeline.Run(new DiffusionRequest());
+        Assert.Null(result.Residency.Capacity);
+        Assert.False(result.Residency.Refused);
     }
 
     [Fact]

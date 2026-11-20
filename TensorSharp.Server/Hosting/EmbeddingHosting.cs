@@ -103,6 +103,7 @@ public static class EmbeddingHosting
     /// </summary>
     internal static bool IsGenerationPath(PathString path) => path.Value?.TrimEnd('/').ToLowerInvariant() is
         "/v1/chat/completions" or "/v1/responses" or "/v1/systemone" or "/v1/videos/generations" or "/v1/loras"
+        or "/v1/images/generations" or "/v1/images/edits"
         or "/api/generate" or "/api/chat" or "/api/chat/ollama" or "/api/models/load"
         or "/api/image-generate" or "/api/image-generate/stream"
         or "/api/image-edit" or "/api/image-edit/stream"

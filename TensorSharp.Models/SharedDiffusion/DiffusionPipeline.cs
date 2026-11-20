@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.SharedDiffusion
@@ -45,6 +46,8 @@ namespace TensorSharp.Models.SharedDiffusion
         private readonly object _gate = new();
         private readonly HashSet<DiffusionComponent> _resident = new();
         private readonly Dictionary<DiffusionComponent, long> _workspaces = new();
+        // The component of the phase running now (null between phases).
+        private DiffusionComponent? _running;
         private IConditioner _conditioner;
         private IVaeCodec _vae;
         private IDenoiser _denoiser;
@@ -63,7 +66,8 @@ namespace TensorSharp.Models.SharedDiffusion
             family.DefaultRecipe.Validate();
             BackendType backend = load.Backend;
             _planner = planner ?? new ResidencyPlanner(
-                () => GpuMemoryBudget.TryGetReservationSpareBytes(backend, out long spare) ? spare : null, _log);
+                () => GpuMemoryBudget.TryGetReservationSpareBytes(backend, out long spare) ? spare : null, _log,
+                () => GpuMemoryBudget.TryGetReservationFreeBytes(backend, out long free) ? free : null);
         }
 
         public IDiffusionFamily Family => _family;
@@ -78,7 +82,9 @@ namespace TensorSharp.Models.SharedDiffusion
         /// Run one request. <paramref name="cancellationToken"/> is checked between phases, between steps and (by the
         /// codec) between VAE tile rows; <paramref name="betweenSteps"/> runs before every step after the first (a
         /// queue's checkpoint, which may give the model to waiting compute work). A cancelled or failed run releases
-        /// the components' activations and keeps their weights resident.
+        /// the components' activations and keeps their weights resident, except the weights of the phase that failed
+        /// (see <see cref="ReleaseFailedPhase"/>). A request the device cannot hold is refused before any phase runs
+        /// (<see cref="RequestRefusedException"/>, <see cref="ResidencyPlan.Refused"/>).
         /// </summary>
         public DiffusionResult Run(DiffusionRequest request, CancellationToken cancellationToken = default, Action betweenSteps = null)
         {
@@ -104,10 +110,15 @@ namespace TensorSharp.Models.SharedDiffusion
                 {
                     return Execute(request, job, total, cancellationToken, betweenSteps);
                 }
-                catch
+                catch (Exception error)
                 {
+                    if (error is not OperationCanceledException) ReleaseFailedPhase();
                     ReleaseWorkspaces();
                     throw;
+                }
+                finally
+                {
+                    _running = null;
                 }
             }
         }
@@ -116,14 +127,15 @@ namespace TensorSharp.Models.SharedDiffusion
         {
             IReferencePolicy policy = _family.References;
             ResidencyPlan plan = PlanResidency(job);
+            if (plan.Refused)
+                throw new RequestRefusedException(Refusal(job, plan));
             INoiseSource noise = _family.Noise(request.Seed);
             var clock = Stopwatch.StartNew();
 
             // ---- Condition: text, and the references' vision copies.
             EnterPhase(request, DiffusionPhase.Condition, DiffusionComponent.Conditioner, plan);
             IConditioner conditioner = Conditioner;
-            var pictures = new PresentedImage[job.Inputs.Length];
-            for (int i = 0; i < pictures.Length; i++) pictures[i] = policy.ForVision(job.Inputs[i], i);
+            PresentedImage[] pictures = job.Pictures;
             ConditioningSet positive = conditioner.Encode(request.Prompt ?? string.Empty, pictures, ct);
             ConditioningSet negative = job.Guided ? conditioner.Encode(request.NegativePrompt ?? string.Empty, pictures, ct) : null;
             LeavePhase(DiffusionComponent.Conditioner, job.Demand(DiffusionPhase.Condition));
@@ -222,7 +234,7 @@ namespace TensorSharp.Models.SharedDiffusion
             Report(request, new DiffusionProgress(DiffusionPhase.Composite));
             RgbImage output = job.Mask != null ? job.Mask.Composite(image)
                 : image.Width == job.Canvas.Output.Width && image.Height == job.Canvas.Output.Height ? image
-                : ImageIO.Resize(image, job.Canvas.Output.Width, job.Canvas.Output.Height);
+                : _family.ResizeOutput(image, job.Canvas.Output.Width, job.Canvas.Output.Height);
             double compositeSeconds = clock.Elapsed.TotalSeconds;
 
             var timings = new DiffusionTimings
@@ -295,6 +307,7 @@ namespace TensorSharp.Models.SharedDiffusion
             public EditMask Mask;
             public RgbImage[] Inputs;
             public RgbImage[] VaeCopies;
+            public PresentedImage[] Pictures = Array.Empty<PresentedImage>();
             public bool EncodesReferences;
             public List<PhaseDemand> Demands;
 
@@ -353,22 +366,60 @@ namespace TensorSharp.Models.SharedDiffusion
             // A selection's canvas (or crop) is the first picture the encoders see; the others keep their own.
             if (mask != null) job.Inputs[0] = mask.Reference;
             job.Target = geometry.LatentOf(job.Canvas.Sampling.Width, job.Canvas.Sampling.Height);
+            // Both copies of every reference are made (and a bad one refused) before any component runs: the vision copy
+            // the conditioner reads, and the VAE copy the encoder reads.
             job.VaeCopies = new RgbImage[job.Inputs.Length];
-            for (int i = 0; i < job.Inputs.Length; i++) job.VaeCopies[i] = _family.References.ForVae(job.Inputs[i], i);
+            job.Pictures = new PresentedImage[job.Inputs.Length];
+            for (int i = 0; i < job.Inputs.Length; i++)
+            {
+                job.Pictures[i] = _family.References.ForVision(job.Inputs[i], i);
+                job.VaeCopies[i] = _family.References.ForVae(job.Inputs[i], i);
+            }
             job.EncodesReferences = job.Inputs.Length > 0 || mask is { IsFull: false };
 
             var workload = new DiffusionWorkload(job.Target,
                 job.VaeCopies.Select(c => new LatentShape(geometry.LatentChannels, 1, c.Height / geometry.VaeFactor, c.Width / geometry.VaeFactor)).ToArray(),
-                r.Prompt ?? string.Empty);
-            job.Demands = new List<PhaseDemand> { new(DiffusionPhase.Condition, DiffusionComponent.Conditioner, Conditioner.WorkingBytes(workload)) };
-            if (job.EncodesReferences) job.Demands.Add(new(DiffusionPhase.EncodeReferences, DiffusionComponent.Vae, Vae.WorkingBytes(workload)));
-            job.Demands.Add(new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, Denoiser.WorkingBytes(workload)));
-            job.Demands.Add(new(DiffusionPhase.Decode, DiffusionComponent.Vae, Vae.WorkingBytes(workload)));
+                r.Prompt ?? string.Empty) { Pictures = job.Pictures };
+            job.Demands = new List<PhaseDemand> { new(DiffusionPhase.Condition, DiffusionComponent.Conditioner, Conditioner.WorkingBytes(workload, DiffusionPhase.Condition)) };
+            if (job.EncodesReferences)
+                job.Demands.Add(new(DiffusionPhase.EncodeReferences, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.EncodeReferences)));
+            job.Demands.Add(new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, Denoiser.WorkingBytes(workload, DiffusionPhase.Denoise)));
+            job.Demands.Add(new(DiffusionPhase.Decode, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.Decode)));
+            if (job.Inputs.Length > 0) RefuseOverTheRowBudget(job, workload);
             _log($"{name}: {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height}" +
                  (job.Canvas.Output != job.Canvas.Sampling ? $" (returned at {job.Canvas.Output.Width}x{job.Canvas.Output.Height})" : "") +
                  $", {recipe.Describe(steps)}, seed {r.Seed}, {job.Inputs.Length} reference(s)" +
                  (mask != null ? ", masked" : "") + (adapters.IsEmpty ? "" : $", adapters {string.Join(", ", adapters.Adapters.Select(a => a.Name))}"));
             return job;
+        }
+
+        /// <summary>
+        /// An edit whose conditioning or denoising phase alone needs more device memory than the device has (its component's
+        /// weights beside the phase's working memory, against the planner's budget) is refused before anything runs, naming
+        /// its rows: references add rows to both phases, and fewer or smaller ones are the remedy (decision D11). Text to
+        /// image is never refused here; a device with no budget (the CPU backends) refuses nothing.
+        /// </summary>
+        private void RefuseOverTheRowBudget(Prepared job, DiffusionWorkload workload)
+        {
+            long held = _resident.Sum(c => Created(c)?.WeightBytes ?? 0) + _workspaces.Values.Sum();
+            if (_planner.Budget(held) is not long budget) return;
+            DiffusionGeometry g = _family.Geometry;
+            long Rows(LatentShape s) => (long)(s.Height / g.Patch) * (s.Width / g.Patch);
+            long targetRows = Rows(job.Target), referenceRows = workload.References.Sum(Rows);
+            foreach ((DiffusionPhase phase, IResidentComponent component, string what) in new (DiffusionPhase, IResidentComponent, string)[]
+                     {
+                         (DiffusionPhase.Condition, Conditioner, "the text and vision encoding"),
+                         (DiffusionPhase.Denoise, Denoiser, "a denoising step"),
+                     })
+            {
+                long need = component.WeightBytes + job.Demand(phase);
+                if (need <= budget) continue;
+                throw new ArgumentException(
+                    $"{_family.DisplayName}: this edit is too large for the device. Its {job.Inputs.Length} reference image(s) add " +
+                    $"{referenceRows:N0} rows to the {targetRows:N0} rows of the {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height} " +
+                    $"picture (and their vision tokens to the prompt), and {what} would need about {need / 1e9:F1} GB of the " +
+                    $"{budget / 1e9:F1} GB the device has. Use fewer or smaller reference images, or a smaller size.");
+            }
         }
 
         // ---- residency
@@ -383,6 +434,32 @@ namespace TensorSharp.Models.SharedDiffusion
             };
             string geometryClass = $"{job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height}, {job.Inputs.Length} reference(s)";
             return _planner.Plan(job.Demands, weights, _resident.ToArray(), new Dictionary<DiffusionComponent, long>(_workspaces), geometryClass);
+        }
+
+        /// <summary>The one-line reason a request the device cannot hold is refused (see <see cref="ResidencyPlan.Refused"/>).</summary>
+        private string Refusal(Prepared job, ResidencyPlan plan)
+        {
+            static string Gb(long bytes) => (bytes / 1e9).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " GB";
+            string phase = plan.Limiting.Phase switch
+            {
+                DiffusionPhase.Condition => "text encoding",
+                DiffusionPhase.EncodeReferences => "reference encoding",
+                DiffusionPhase.Denoise => "denoise",
+                DiffusionPhase.Decode => "VAE decode",
+                _ => plan.Limiting.Phase.ToString().ToLowerInvariant(),
+            };
+            string component = plan.Limiting.Component switch
+            {
+                DiffusionComponent.Conditioner => "text encoder",
+                DiffusionComponent.Denoiser => "denoiser",
+                DiffusionComponent.Vae => "VAE",
+                _ => plan.Limiting.Component.ToString().ToLowerInvariant(),
+            };
+            var (w, h) = job.Canvas.Sampling;
+            return $"{_family.DisplayName} cannot run {w}x{h} on this device: its {phase} alone needs {Gb(plan.MinimumPeak)} " +
+                   $"(the {component}'s {Gb(plan.LimitingWeights)} of weights and {Gb(plan.Limiting.WorkingBytes)} of working memory), " +
+                   $"more than the {Gb(plan.Capacity ?? 0)} of device memory free for it. Use a smaller size or a smaller " +
+                   "quantization, or free the device.";
         }
 
         /// <summary>Make the plan's releases before <paramref name="phase"/>; <paramref name="component"/> is resident from
@@ -401,12 +478,34 @@ namespace TensorSharp.Models.SharedDiffusion
                 _resident.Remove(release.Component);
             }
             _resident.Add(component);
+            _running = component;
             Report(request, new DiffusionProgress(phase));
+        }
+
+        /// <summary>
+        /// A phase failed (a device allocation that failed while its component's weights were being bound or uploaded, a
+        /// backend error): which of that component's device copies exist is no longer known, so the plan must not count its
+        /// weights as held, or the next request is planned against memory it does not have and fails as well (measured on
+        /// the RTX A4500: after the text encoder's upload failed for another process's allocation, the next request kept
+        /// "everything resident" against a budget inflated by its 15.5 GB). Its copies are released (the weights stay
+        /// mapped; the next request uploads them again) and it is no longer resident.
+        /// </summary>
+        private void ReleaseFailedPhase()
+        {
+            if (_running is not DiffusionComponent failed) return;
+            _running = null;
+            try { Created(failed)?.ReleaseDevice(); }
+            catch (Exception error) { _log($"  [diffusion] releasing the {failed.ToString().ToLowerInvariant()} after its phase failed: {error.Message}"); }
+            _resident.Remove(failed);
+            _workspaces.Remove(failed);
         }
 
         /// <summary>The phase finished: its component keeps its workspace (cached plans) for the next request.</summary>
         private void LeavePhase(DiffusionComponent component, long workingBytes)
-            => _workspaces[component] = Math.Max(_workspaces.GetValueOrDefault(component), workingBytes);
+        {
+            _workspaces[component] = Math.Max(_workspaces.GetValueOrDefault(component), workingBytes);
+            _running = null;
+        }
 
         private void ReleaseWorkspaces()
         {

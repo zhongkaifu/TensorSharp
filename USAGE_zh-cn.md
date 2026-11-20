@@ -183,6 +183,12 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
 
+# MiniMax-H3-Image：不带 --image 时生成图像（默认 2048x2048、6 步）；带 --image 时用最多 16 张参考图
+# 编辑，提示词按命令行顺序称它们为 <Picture 1>、<Picture 2>……。见 docs/models/minimax-h3-image_zh-cn.md#图像编辑。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --image cabin.png --image mug.png --width 2048 --height 2048 --diffusion-seed 7 \
+    --prompt "Put the black mug from <Picture 2> on the table in front of the cabin in <Picture 1>." --output mug.png
+
 # Qwen-Image-2.1-Turbo：蒸馏为 8 步的版本，VAE、文本编码器与 mmproj 相同。配置文件声明了
 # 检查点（--qwen-image-variant turbo），因此按 Turbo 公布的 8 步调度、CFG 1 采样。
 # 见 docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo。
@@ -452,7 +458,7 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-2.1 则是 FlowMatch-Euler 步数——省略时自动选择（40，或 `--lora` 插件采样配方中的步数；Qwen-Image-2.1-Turbo 为 8，也只接受 8）。MiniMax-H3 默认 20；加载 [Turbo 插件](#minimax-h3-turbo-插件)时只跑插件的 8 或 4 步，其他值在启动时被拒绝。 LTX 2.5 只接受 8 步（另加 3 步精修），CFG 固定为 1。 |
 | `--diffusion-seed <N>` | 扩散路径的噪声种子：DiffusionGemma 的确定性采样器与 Qwen-Image-2.1（默认：0），以及视频生成（Wan、MiniMax-H3）——视频不传时每次运行都会取一个新的随机种子。决定一段视频长什么样的是这个种子，`--seed` 是文本采样种子，对它没有影响。Qwen-Image-2.1 的图像由种子和尺寸决定；编辑的噪声还取决于 `--image` 传入的图片，因此用画出某张图的种子去编辑它，不会从它自己的噪声重新开始（[种子与编辑](docs/models/qwenimage21_zh-cn.md#种子与编辑)）。 |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
-| `--image <path>` | Qwen-Image-2.1 编辑用的输入图像（也是多模态聊天的图像输入）；重复该参数可传入多张参考图。每个 `--image` 都是一张参考图，按命令行顺序在提示词之前标记为 `<image1>`、`<image2>`……，提示词可以用这些标记指代图片。不带 `--image` 时，Qwen-Image-2.1 DiT 改为根据提示词生成图像。 |
+| `--image <path>` | 图像编辑用的输入图像（也是多模态聊天的图像输入）；重复该参数可传入多张参考图。每个 `--image` 都是一张参考图，按命令行顺序排列，提示词按模型自己的方式指代它们：Qwen-Image-2.1 在提示词之前将其标记为 `<image1>`、`<image2>`……；MiniMax-H3-Image（最多 16 张）称之为 `<Picture 1>`、`<Picture 2>`……。不带 `--image` 时，两个模型都改为根据提示词生成图像。 |
 | `--mask <path>` | Qwen-Image-2.1 掩码，尺寸须与第一张输入图完全一致。需要 `--image`；其他图片仍作为参考。保留源图尺寸及未选中的已解码 RGBA 像素。见[掩码图像编辑](#掩码图像编辑)。 |
 | `--mask-mode <mode>` / `--mask-invert` | `grayscale`（默认）：白色编辑、黑色保护、灰色混合。`alpha`：透明编辑、不透明保护。`--mask-invert` 反转选区。 |
 | `--mask-feather <pixels>` | 按源图像素向内柔化边缘；范围 0–1024，默认 0。 |
@@ -2262,7 +2268,7 @@ CLI 没有子智能体。参见 [Web 应用](#web-应用)一节中的子智能�
 |---|---|---|
 | `0` | 成功：运行结束、`--help` / `--list-skills` 已打印，或服务端正常关闭。 | — |
 | `1` | 配置错误：已移除的参数、服务端上的未知参数（CLI 会忽略它不认识的参数）、非法取值、带了值的开关（`--think=on`）或后面没有值的取值参数、无法读取的 `--config` 文件。CLI 上还包括提示词在模型上下文窗口（`MAX_CONTEXT`）中已不给回复留任何空间的情况（包括 Agent Skills 某一轮让提示词超出窗口）；回复只是写到窗口末尾时则在那里结束，按长度截断处理。 | `Configuration error: <错误说明>` |
-| `2` | 模型加载被拒绝。 | 恰好一行，且是最后一行：`error: model load refused: <原因>` |
+| `2` | 模型加载被拒绝；CLI 上也包括已加载的模型在运行前拒绝的单次请求（各阶段所需显存超过设备空闲显存的图像请求）。 | 恰好一行，且是最后一行：`error: model load refused: <原因>`，请求被拒绝时为 `error: request refused: <原因>` |
 | 其他任何值 | 不是拒绝，而是 bug 或崩溃。未处理的 .NET 异常会打印堆栈，并在 Linux 和 macOS 上以 `134`（SIGABRT）退出；被操作系统杀掉的进程返回对应信号（内存不足被杀为 `137`）。 | 堆栈信息，请提交问题报告。 |
 
 **什么算"加载被拒绝"**（退出码 `2`）：加载器有意做出的、给出可操作原因的决定——显存不足以容纳
@@ -2274,6 +2280,8 @@ KV 缓存类型（例如 DeepSeek V4.1 上的 `KV_CACHE_DTYPE=q8_0`）、模型�
 错误行会重复原因，单独读也能看懂。加载过程中其他任何失败——`NullReferenceException`、CUDA 错误、
 内存不足导致的中止——都不算拒绝，会保留堆栈信息。唯一的例外：DeepSeek V4/V4.1 与 GLM 的原生整模型加载器
 放弃的每一次加载都按拒绝报告，包括在设备上分配权重或缓存失败，原因即它们的 `[dsv4]`/`[glm]` 那一行。
+
+**请求被拒绝**（退出码 `2`，仅 CLI）：已加载的模型在运行任何部分之前拒绝的请求，原因中给出各项大小——即使释放其他所有组件，图像请求最耗显存的阶段所需仍超过设备的空闲显存（例如 20 GB 显卡上 Q5_K_M DiT 的 MiniMax-H3-Image 4096x4096，或该卡上任意尺寸的 Q8_0）。运行中的服务端对同样的拒绝返回 `507` 与 `{ "error": "<原因>" }`，模型保持加载，继续处理下一个请求。运行过程中仍耗尽显存的请求不算拒绝：后端报告的分配失败会使该请求失败（CLI 上打印堆栈，服务端返回 `500`），而在 ggml-cuda 内核内部失败的分配会结束进程（`134`）。
 
 以 `2` 退出之前，服务端会先释放被拒绝的加载留下的资源（模型服务与 ggml 后端），并且不会打开端口。
 拒绝的堆栈本来就是噪音，所以只在 Debug 级别记录：`TENSORSHARP_LOG_LEVEL=Debug`（两个宿主都适用）

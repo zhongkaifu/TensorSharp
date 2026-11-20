@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.SharedDiffusion
 {
@@ -59,6 +60,10 @@ namespace TensorSharp.Models.SharedDiffusion
         /// <summary>A mask's per-cell weights (<see cref="EditMask.LatentWeights"/>, row-major [H, W]) in the token rows'
         /// layout: the weights and how many contiguous row values each covers (1: one weight a value).</summary>
         (float[] Weights, int ValuesPerWeight) MaskRows(float[] cellWeights, LatentShape shape);
+
+        /// <summary>The decode resized to the size the request returns (a generation floor, a kept source size): the
+        /// family's upstream filter. The default is <see cref="ImageIO.Resize"/>.</summary>
+        RgbImage ResizeOutput(RgbImage image, int width, int height) => ImageIO.Resize(image, width, height);
     }
 
     /// <summary>
@@ -75,6 +80,10 @@ namespace TensorSharp.Models.SharedDiffusion
 
         /// <summary>Device bytes the component's activations and compute buffers take for <paramref name="workload"/>.</summary>
         long WorkingBytes(DiffusionWorkload workload);
+
+        /// <summary>The working memory of <paramref name="phase"/>, for a component that runs in more than one (the VAE
+        /// encodes references and decodes the result). The default is <see cref="WorkingBytes(DiffusionWorkload)"/>.</summary>
+        long WorkingBytes(DiffusionWorkload workload, DiffusionPhase phase) => WorkingBytes(workload);
 
         /// <summary>Drop the weights' device copies (<c>IGraphExecutor.Invalidate</c> on their leaves).</summary>
         void ReleaseDevice();

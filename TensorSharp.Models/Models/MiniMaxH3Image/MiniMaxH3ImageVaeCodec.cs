@@ -5,7 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// MiniMax-H3-Image's VAE decoder on the diffusion runtime (minimax_h3_image_vae_fp16.safetensors): the latent is cut into
+// MiniMax-H3-Image's VAE on the diffusion runtime (minimax_h3_image_vae_fp16.safetensors). Its encoder (editing's references)
+// is MiniMaxH3ImageVaeCodec.Encoder.cs. The decoder: the latent is cut into
 // ComfyUI's 256-pixel tiles, each row of tiles goes through the 2-D ViT decoder as one GraphProgram (the tiles packed along
 // the rows, each with its own register and zero tokens), and the decoded tiles are blended into the canvas row by row. The
 // program is the graph h3_vit_decode builds, node for node: ggml_cuda serves its regions as that graph's fused nodes (F16
@@ -24,14 +25,16 @@ using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling.Diffusion;
 
 namespace TensorSharp.Models.MiniMaxH3Image
 {
     /// <summary>
-    /// The MiniMax-H3-Image VAE as an <see cref="IVaeCodec"/> (decode only: encoding a reference is editing, stage S5).
-    /// Making one maps the file and reads its small tensors on the host; its first decode makes the weights resident.
+    /// The MiniMax-H3-Image VAE as an <see cref="IVaeCodec"/>: the tiled encoder of edits' references and the tiled decoder.
+    /// Making one maps the file and reads the decoder's small tensors on the host; its first decode makes the decoder's weights
+    /// resident. The encoder's weights are made on the host when an edit first needs them (<see cref="EnsureEncoder"/>).
     /// </summary>
-    public sealed class MiniMaxH3ImageVaeCodec : IVaeCodec
+    public sealed partial class MiniMaxH3ImageVaeCodec : IVaeCodec
     {
         public const int LatentChannels = 24;
         public const int Downsample = 16;
@@ -237,11 +240,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         // ---- IResidentComponent
 
+        /// <summary>The decoder's weights, and the encoder's once an edit has made them.</summary>
         public long WeightBytes
         {
             get
             {
-                long total = 0;
+                long total = EncoderWeightBytes;
                 foreach (MiniMaxH3ImageWeight w in _all) total += w.Bytes;
                 return total;
             }
@@ -253,6 +257,16 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// and its SwiGLU beside the residual stream and the qkv product, all F32).
         /// </summary>
         public long WorkingBytes(DiffusionWorkload workload) => WorkingBytesFor(Dim, FfnInner, workload.Target.Width * Downsample);
+
+        /// <summary>The decode's working memory (<see cref="WorkingBytes(DiffusionWorkload)"/>), or for
+        /// <see cref="DiffusionPhase.EncodeReferences"/> one encoder tile's (<see cref="EncodeWorkingBytesFor"/>); sizing an
+        /// encode makes the encoder's weights on the host, so <see cref="WeightBytes"/> counts them from then on.</summary>
+        public long WorkingBytes(DiffusionWorkload workload, DiffusionPhase phase)
+        {
+            if (phase != DiffusionPhase.EncodeReferences) return WorkingBytes(workload);
+            EnsureEncoder();
+            return EncodeWorkingBytesFor(EncoderChannels);
+        }
 
         /// <summary>The decoder's compute memory for a canvas <paramref name="width"/> pixels wide (one program's row of tiles,
         /// at most <see cref="MaxBatch"/>): 263 MiB for the release decoder's row of 11 tiles, where ggml_cuda measured
@@ -267,7 +281,11 @@ namespace TensorSharp.Models.MiniMaxH3Image
 
         public void ReleaseWorkspace()
         {
-            lock (_gate) DisposePlans();
+            lock (_gate)
+            {
+                DisposePlans();
+                DisposeEncoderPlans();
+            }
         }
 
         /// <summary>Drops the weights' device copies (and the plans, which bind them); the mapping stays.</summary>
@@ -277,7 +295,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
             {
                 if (_disposed) return;
                 DisposePlans();
+                DisposeEncoderPlans();
                 foreach (MiniMaxH3ImageWeight w in _all) _executor.Invalidate(w.Data);
+                foreach (MiniMaxH3ImageWeight w in _encAll) _executor.Invalidate(w.Data);
                 _preloaded = false;
             }
         }
@@ -309,9 +329,6 @@ namespace TensorSharp.Models.MiniMaxH3Image
         }
 
         // ---- IVaeCodec
-
-        public LatentPosterior Encode(RgbImage image, CancellationToken cancellationToken) =>
-            throw new NotSupportedException("MiniMax-H3-Image's VAE encoder (editing) arrives with stage S5.");
 
         public RgbImage Decode(LatentTensor latent, CancellationToken cancellationToken)
         {
@@ -741,7 +758,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 if (_disposed) return;
                 _disposed = true;
                 DisposePlans();
+                DisposeEncoderPlans();
                 foreach (MiniMaxH3ImageWeight w in _all) _executor.Invalidate(w.Data);
+                foreach (MiniMaxH3ImageWeight w in _encAll) _executor.Invalidate(w.Data);
                 DisposeHost();
             }
         }

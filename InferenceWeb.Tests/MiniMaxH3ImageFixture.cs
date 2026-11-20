@@ -66,7 +66,7 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
         try { Directory.Delete(Dir, recursive: true); } catch { /* best effort */ }
     }
 
-    private sealed record T(string Name, long[] Shape, int Type, float[] Data);
+    internal sealed record T(string Name, long[] Shape, int Type, float[] Data);
 
     private static List<T> Edited(List<T> tensors, Func<string, float[], float[]> edit) =>
         edit == null ? tensors : tensors.Select(t => t with { Data = edit(t.Name, (float[])t.Data.Clone()) ?? t.Data }).ToList();
@@ -121,7 +121,7 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
         return tensors;
     }
 
-    private static byte[] Encode(T t)
+    internal static byte[] Encode(T t)
     {
         long n = t.Data.LongLength;
         switch (t.Type)
@@ -186,7 +186,7 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
     }
 
     /// <summary>A GGUF v3 without metadata, 32-byte aligned.</summary>
-    private static void Write(string path, IReadOnlyList<T> tensors)
+    internal static void Write(string path, IReadOnlyList<T> tensors)
     {
         static long Align(long value) => (value + 31) / 32 * 32;
         byte[][] data = tensors.Select(Encode).ToArray();

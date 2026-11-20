@@ -340,6 +340,82 @@ public sealed class WebUiAdapter
         if (ok) await WriteFramesAsync(ctx, _service.ImageGenerateStreamAsync(body, ct), ct).ConfigureAwait(false);
     }
 
+    // ---- OpenAI image routes (any image model) ------------------------------
+
+    /// <summary>
+    /// <c>POST /v1/images/generations</c> — JSON <c>{ prompt, size?: "2048x2048", seed?, n?, response_format?: "url" |
+    /// "b64_json", num_inference_steps?, guidance_scale?, negative_prompt? }</c> (<see cref="OpenAIImageRequest"/>), as
+    /// SGLang serves it for MiniMax-H3-Image; answers <c>{ created, data: [{ url } | { b64_json }], output_format, size }</c>.
+    /// The picture is made by the loaded image model through the same queue and checks as <c>/api/image-generate</c>.
+    /// </summary>
+    public async Task<IResult> OpenAIImageGenerationsAsync(HttpRequest req)
+    {
+        try
+        {
+            _service.EnsureImageGenerationAvailable();
+            using var body = await JsonDocument.ParseAsync(req.Body, cancellationToken: req.HttpContext.RequestAborted).ConfigureAwait(false);
+            OpenAIImageRequest request = OpenAIImageRequest.FromJson(body.RootElement);
+            return await RunOpenAIImagesAsync(request, Array.Empty<byte[]>(), null, req.HttpContext.RequestAborted).ConfigureAwait(false);
+        }
+        catch (WebUiRequestRejectedException ex) { return OpenAIError(ex.StatusCode, ex.Message); }
+        catch (JsonException ex) { return OpenAIError(400, "Bad request: " + ex.Message); }
+    }
+
+    /// <summary>
+    /// <c>POST /v1/images/edits</c> — multipart: <c>image</c> parts (repeated; their order is <c>&lt;Picture 1&gt;</c>,
+    /// <c>&lt;Picture 2&gt;</c>, ...), an optional <c>mask</c> part, and the fields of <see cref="OpenAIImageRequest"/>, as
+    /// SGLang serves it (MiniMax's examples/edit.py). Answers as <see cref="OpenAIImageGenerationsAsync"/>; the edit runs
+    /// through the same queue and checks as <c>/api/image-edit</c>.
+    /// </summary>
+    public async Task<IResult> OpenAIImageEditsAsync(HttpRequest req)
+    {
+        try
+        {
+            // Refused before the body is read, as /api/image-edit is: a wrong model costs no upload.
+            _service.EnsureImageEditAvailable();
+            if (!req.HasFormContentType)
+                return OpenAIError(400, "/v1/images/edits takes multipart/form-data with one or more image parts.");
+            var form = await req.ReadFormAsync(req.HttpContext.RequestAborted).ConfigureAwait(false);
+            OpenAIImageRequest request = OpenAIImageRequest.FromForm(form);
+            var (files, maskFile) = OpenAIImageRequest.FilesOf(form, _uploads.MaxFileBytes);
+            var images = new List<byte[]>(files.Count);
+            foreach (IFormFile file in files)
+                images.Add(await ReadImagePartAsync(file, req.HttpContext.RequestAborted).ConfigureAwait(false));
+            byte[] mask = maskFile == null ? null : await ReadImagePartAsync(maskFile, req.HttpContext.RequestAborted).ConfigureAwait(false);
+            return await RunOpenAIImagesAsync(request, images, mask, req.HttpContext.RequestAborted).ConfigureAwait(false);
+        }
+        catch (WebUiRequestRejectedException ex) { return OpenAIError(ex.StatusCode, ex.Message); }
+        catch (InvalidDataException) { return OpenAIError(400, "Invalid multipart form data or upload exceeds the request size limit."); }
+        catch (BadHttpRequestException ex) { return OpenAIError(ex.StatusCode, "Invalid image edit request."); }
+    }
+
+    /// <summary>The request's <see cref="OpenAIImageRequest.Count"/> pictures, one after another (picture i at seed + i).</summary>
+    private async Task<IResult> RunOpenAIImagesAsync(OpenAIImageRequest request, IReadOnlyList<byte[]> images, byte[] mask, CancellationToken ct)
+    {
+        var data = new List<object>(request.Count);
+        string size = null;
+        for (int i = 0; i < request.Count; i++)
+        {
+            WebUiChatService.ImageRequestResult result =
+                await _service.OpenAIImageAsync(request.ParametersFor(i), images, mask, ct).ConfigureAwait(false);
+            size = $"{result.Width}x{result.Height}";
+            data.Add(request.Base64
+                ? new { b64_json = Convert.ToBase64String(await File.ReadAllBytesAsync(result.OutputPath, ct).ConfigureAwait(false)) }
+                : new { url = result.Url });
+        }
+        return Results.Json(new
+        {
+            created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            data,
+            output_format = "png",
+            size,
+        });
+    }
+
+    private static IResult OpenAIError(int status, string message) =>
+        Results.Json(new { error = new { message, type = status >= 500 && status != 507 ? "server_error" : "invalid_request_error" } },
+            statusCode: status);
+
     // ---- Text-to-video (Wan) ---------------------------------------------
 
     /// <summary>

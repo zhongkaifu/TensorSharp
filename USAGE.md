@@ -228,6 +228,13 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
 
+# MiniMax-H3-Image: no --image generates an image (2048x2048 by default, 6 steps); --image
+# edits with up to 16 reference pictures, which the prompt names <Picture 1>, <Picture 2>, ...
+# in command-line order. See docs/models/minimax-h3-image.md#editing.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --image cabin.png --image mug.png --width 2048 --height 2048 --diffusion-seed 7 \
+    --prompt "Put the black mug from <Picture 2> on the table in front of the cabin in <Picture 1>." --output mug.png
+
 # Qwen-Image-2.1-Turbo: the 8-step distillation, with the same VAE, text encoder and mmproj.
 # The config declares the checkpoint (--qwen-image-variant turbo), so it samples Turbo's
 # published 8-step schedule at CFG 1. See docs/models/qwenimage21.md#qwen-image-21-turbo.
@@ -519,7 +526,7 @@ script gets that error instead of watching a setting be ignored.
 | `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40, or the step count of a `--lora` plug-in's sampling recipe; Qwen-Image-2.1-Turbo runs 8, the only count it takes). MiniMax-H3 defaults to 20; under a [Turbo plug-in](#minimax-h3-turbo-plug-ins) it samples exactly the plug-in's 8 or 4 steps, and any other value is refused at startup. LTX 2.5 accepts only 8 (plus 3 refinement steps); CFG is fixed at 1. |
 | `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler and Qwen-Image-2.1 (default: 0), and video generation (LTX 2.5, Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. A Qwen-Image-2.1 picture depends on the seed and its size; an edit's noise also depends on its `--image` pictures, so editing a picture at the seed it was drawn with does not restart from its own noise ([seeds and edits](docs/models/qwenimage21.md#seeds-and-edits)). |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
-| `--image <path>` | Input image for Qwen-Image-2.1 editing (also the image input for multimodal chat); repeat it for multiple references. Every `--image` is a reference, tagged `<image1>`, `<image2>`, … in command-line order ahead of the prompt, so the prompt can name a picture by its tag. Without `--image`, a Qwen-Image-2.1 DiT generates an image from the prompt instead. |
+| `--image <path>` | Input image for image editing (also the image input for multimodal chat); repeat it for multiple references. Every `--image` is a reference, in command-line order, and the prompt names the pictures the way the model does: Qwen-Image-2.1 tags them `<image1>`, `<image2>`, … ahead of the prompt; MiniMax-H3-Image (up to 16) calls them `<Picture 1>`, `<Picture 2>`, … Without `--image`, either model generates an image from the prompt instead. |
 | `--mask <path>` | Qwen-Image-2.1 mask at the first input image's exact dimensions. Requires `--image`; additional images remain references. Preserves source dimensions and unselected decoded RGBA pixels. See [Masked image editing](#masked-image-editing). |
 | `--mask-mode <mode>` / `--mask-invert` | `grayscale` (default): white edits, black protects and gray blends. `alpha`: transparent edits, opaque protects. `--mask-invert` reverses the selection. |
 | `--mask-feather <pixels>` | Soften the mask inward in source pixels; range 0–1024, default 0. |
@@ -2555,7 +2562,7 @@ load here" from "this is a bug":
 |---|---|---|
 | `0` | Success: the run finished, `--help` / `--list-skills` printed, or the server shut down cleanly. | — |
 | `1` | Configuration error: a removed flag, an unknown flag on the server (the CLI ignores flags it does not know), a bad value, a switch given a value (`--think=on`) or a value option with nothing after it, an unreadable `--config` file. On the CLI also a prompt that leaves no room for a reply in the model's context window (`MAX_CONTEXT`), including one an Agent Skills round grew past it; a reply that merely runs into the window ends there instead, as a length stop. | `Configuration error: <what is wrong>` |
-| `2` | Model load refused. | Exactly one line, the last one: `error: model load refused: <reason>` |
+| `2` | Model load refused; on the CLI also a one-shot request the loaded model refused before running it (an image whose phases need more device memory than the device has free). | Exactly one line, the last one: `error: model load refused: <reason>`, or `error: request refused: <reason>` for a request |
 | anything else | Not a refusal: a bug or a crash. An unhandled .NET exception prints its stack trace and, on Linux and macOS, exits `134` (SIGABRT); a process the OS killed reports its signal (`137` for an out-of-memory kill). | The stack trace. Report it. |
 
 **What counts as a refused load** (code `2`) is a decision the loader made on
@@ -2579,6 +2586,8 @@ and keeps its stack trace. One exception: the DeepSeek V4/V4.1 and GLM native
 whole-model loaders report every load they abandon as a refusal, including a
 weight or cache allocation that failed on a device, with their `[dsv4]`/`[glm]`
 line as the reason.
+
+**A refused request** (code `2`, CLI only) is a request the loaded model declined before running any of it, with the sizes in the reason: an image whose most demanding phase needs more device memory than the device has free even with every other component released (MiniMax-H3-Image at 4096x4096 with the Q5_K_M DiT on a 20 GB card, any size with Q8_0 there). On a running server the same refusal answers `507` with `{ "error": "<reason>" }` and the model stays loaded for the next request. A request that still runs out of device memory while it runs is not a refusal: an allocation the backend reports fails the request (a stack trace on the CLI, `500` on the server), and one that fails inside a ggml-cuda kernel ends the process (`134`).
 
 Before exiting with `2` the server releases what the refused load left behind
 (the model service and the ggml backend) and never opens its port. A refusal's

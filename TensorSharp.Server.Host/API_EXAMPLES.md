@@ -5,7 +5,7 @@
 TensorSharp.Server.Host provides three API styles, a Jev-compatible decision endpoint, and a few utility endpoints:
 
 - **Ollama-compatible** (`/api/generate`, `/api/chat/ollama`, `/api/tags`, `/api/show`, `/api/embed`)
-- **OpenAI-compatible** (`/v1/chat/completions`, `/v1/responses`, `GET /v1/responses/{id}`, `/v1/models`, `/v1/embeddings`, `/v1/videos/generations`, `/v1/skills`)
+- **OpenAI-compatible** (`/v1/chat/completions`, `/v1/responses`, `GET /v1/responses/{id}`, `/v1/models`, `/v1/embeddings`, `/v1/images/generations`, `/v1/images/edits`, `/v1/videos/generations`, `/v1/skills`)
 - **Jev-compatible** typed decisions (`/v1/systemone`, DiffusionGemma only)
 - **Web UI** (`/api/chat`, `/api/sessions`, `/api/models`, `/api/models/load`, `/api/upload`, `/api/skills`, `/api/image-edit`, `/api/image-edit/stream`, `/api/image-generate`, `/api/image-generate/stream`, `/api/video-generate`, `/api/video-generate/stream`)
 - **Utilities** (`/api/version`, `/api/queue/status`, `/health`)
@@ -15,7 +15,7 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 
 ## Embedding APIs
 
-Start an embedding service with `--model encoder.gguf --embeddings` and pure C# `cpu` or native `ggml_cpu` / `ggml_metal` / `ggml_cuda`. Each process keeps one encoder resident; run chat and embeddings separately. Snowflake Arctic Embed L v2.0 and MiniLM GGUFs are supported, and model metadata endpoints advertise the `embedding` capability. While `--embeddings` is set, a `POST` to a generation route (`/v1/chat/completions`, `/v1/responses`, `/v1/systemone`, `/v1/videos/generations`, `/api/generate`, `/api/chat`, `/api/chat/ollama`, `/api/models/load`, and `/api/image-generate`, `/api/image-edit` and `/api/video-generate` with their `/stream` forms) is answered with HTTP 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.`
+Start an embedding service with `--model encoder.gguf --embeddings` and pure C# `cpu` or native `ggml_cpu` / `ggml_metal` / `ggml_cuda`. Each process keeps one encoder resident; run chat and embeddings separately. Snowflake Arctic Embed L v2.0 and MiniLM GGUFs are supported, and model metadata endpoints advertise the `embedding` capability. While `--embeddings` is set, a `POST` to a generation route (`/v1/chat/completions`, `/v1/responses`, `/v1/systemone`, `/v1/images/generations`, `/v1/images/edits`, `/v1/videos/generations`, `/api/generate`, `/api/chat`, `/api/chat/ollama`, `/api/models/load`, and `/api/image-generate`, `/api/image-edit` and `/api/video-generate` with their `/stream` forms) is answered with HTTP 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.`
 
 ```bash
 curl http://127.0.0.1:5000/v1/embeddings -H 'Content-Type: application/json' \
@@ -109,7 +109,7 @@ imports, collection rename, filters and safe previews.
 | Generation modes | Autoregressive models stream appended token chunks. DiffusionGemma returns final text on append-only compatibility endpoints and exposes live whole-message denoising previews on Web UI `/api/chat`. |
 | Sessions | Web UI uses per-tab chat sessions. Ollama/OpenAI compatibility endpoints retain their existing default-session inference behavior, but code-execution workspaces never span HTTP requests. |
 | Uploads | `/api/upload` accepts image / video / audio / text / **PDF** files; born-digital PDFs return extracted text, scanned PDFs return page images for vision-capable models (`TS_PDF_MAX_PAGES` caps pages read) |
-| Image generation and editing | Qwen-Image-2.1 (`qwen_image`) is served through `/api/image-generate`, `/api/image-edit` and their `/stream` variants, not the chat endpoints |
+| Image generation and editing | Qwen-Image-2.1 (`qwen_image`) and MiniMax-H3-Image (`minimax-h3-image`) are served through `/api/image-generate`, `/api/image-edit`, their `/stream` variants and the OpenAI-shaped `/v1/images/generations` and `/v1/images/edits`, not the chat endpoints |
 | Video generation | Any video-generation model — MiniMax-H3 (`minimax-h3`), Wan 2.1 / 2.2 (`wan`) — is served through `/api/video-generate`, `/api/video-generate/stream` and `/v1/videos/generations`; MiniMax-H3 returns a 32 kHz stereo `.wav` sidecar alongside the MP4, and `/api/models` advertises what conditioning the loaded checkpoint takes |
 | Agent Skills | Skill directories: the `skills` folder beside the binary (where skills uploaded through `POST /api/skills` are installed; scanned first, so its skills win a name clash), then `--skills-dir` (by default, every existing `.agents/skills` from the working directory up to the Git root, nearest first), listed at `/v1/skills` and `/api/skills` and installable as a `.zip` through `POST /api/skills`. Selected per request with `"skills": [...]` on every chat endpoint. On families with both declaration and output-parser support, including Qwen 3.8 Flash Next (`qwen4exp`), the model's own skill calls are answered inside the server, so clients receive a finished completion. Families without usable tool support receive selected skill instructions inline instead. `skills_run` is off unless the server starts with `--skills-allow-exec`. |
 | Agentic code execution | `--code-exec` adds the in-process `shell`, `read_file`, `write_file`, and `apply_patch` tools on tool-capable model families. Web UI keeps one workspace per chat session; each OpenAI/Ollama HTTP request gets a private workspace across its internal rounds and the server deletes it after the response. Network and package installation are separate, off-by-default permissions. |
@@ -1695,8 +1695,71 @@ Per-step events look like
 (the `image` preview snapshot appears on throttled steps, up to 8 per edit),
 followed by a final
 `{"done": true, "url": "/uploads/edit-<guid>.png", "width": ..., "height": ..., "elapsedSeconds": ...}`.
-Requests against a model that is not Qwen-Image-2.1 return 400; concurrent
-edits are serialized by a process-wide lock.
+Requests against a model that does not edit images return 400. Picture requests
+(generation and editing, every route) wait their turn in one queue and run one at a
+time, in the order they arrived; a request whose client goes away while it waits
+leaves the queue without running.
+
+### MiniMax-H3-Image editing
+
+With `--config config/minimax-h3-image.json` the same routes edit with MiniMax-H3-Image:
+up to 16 reference pictures, which the prompt names `<Picture 1>`, `<Picture 2>`, ... in
+the order the request lists them (`imagePaths`, or the multipart `image` parts). See the
+[MiniMax-H3-Image guide](../docs/models/minimax-h3-image.md#editing) for what each
+picture becomes and the measured costs.
+
+```bash
+curl -X POST http://localhost:5000/api/image-edit \
+  -F "image=@cabin.png" -F "image=@mug.png" \
+  -F "prompt=Put the black mug from <Picture 2> on the table in front of the cabin in <Picture 1>." \
+  -F "width=2048" -F "height=2048" -F "seed=7"
+```
+
+- Six steps at guidance 1, as for text to image: a `cfg` above 1 or a `negativePrompt` is
+  refused, and so is a mask (masked edits are not implemented yet).
+- Size: `width`/`height` (multiples of 32, at most 20 megapixels), or `keepSourceSize`
+  (`<Picture 1>`'s exact size), or `<Picture 1>`'s aspect ratio at `targetArea` (the
+  default 2048×2048 area). A size under 2048×2048 is sampled on a 2048×2048-area canvas of
+  the same aspect and resized back, as MiniMax's pipeline does.
+- `seed` draws, from one CPU torch generator in MiniMax's order, each reference's VAE
+  sample, then the picture's noise, then each reference's noise.
+- Refused before anything runs, with the reason: more than 16 references, a reference with
+  a side under 32 pixels, and an edit whose references make its sequence too long for the
+  device's memory (the message names the rows and suggests fewer or smaller references).
+
+### OpenAI image routes (`/v1/images/generations`, `/v1/images/edits`)
+
+The loaded image model (MiniMax-H3-Image or Qwen-Image-2.1) also answers the OpenAI image
+routes in the shapes SGLang serves them, so MiniMax's own `examples/t2i.py` and
+`examples/edit.py` work unchanged against `--url http://localhost:5000`.
+
+```bash
+curl --fail-with-body http://localhost:5000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A red paper lantern in a snowy courtyard","size":"2048x2048","seed":7,"response_format":"b64_json"}'
+
+curl --fail-with-body http://localhost:5000/v1/images/edits \
+  -F "image=@reference1.png" -F "image=@reference2.png" \
+  -F "prompt=Hang <Picture 2> on the wall behind the hosts of <Picture 1>." \
+  -F "size=2048x2048" -F "seed=1234" -F "response_format=b64_json"
+```
+
+| Field | Meaning |
+|---|---|
+| `prompt` | required |
+| `size` | `WIDTHxHEIGHT` (multiples of 32) or `auto`; omitted is the image routes' automatic size |
+| `seed` | integer; picture *i* of `n` uses `seed + i` |
+| `n` | 1 to 10 pictures, made one after another |
+| `response_format` | `url` (default: a `/uploads/...` link) or `b64_json` |
+| `output_format` | `png` only |
+| `num_inference_steps`, `guidance_scale`, `negative_prompt` | the image routes' `steps`, `cfg` and `negativePrompt`, checked by the model alike |
+| `image` (edits, repeated; `image[]` too) | the references, in `<Picture n>` order |
+| `mask` (edits) | one mask file, for a model that takes masks |
+
+Other fields SGLang clients send (`model`, `generator_device`, `quality`, `user`, ...) are
+accepted and ignored. The answer is `{"created": ..., "data": [{"b64_json": "..."} | {"url":
+"..."}], "output_format": "png", "size": "WxH"}`; errors use OpenAI's envelope
+(`{"error": {"message": ..., "type": "invalid_request_error"}}`).
 
 ### Qwen-Image-2.1 LoRA plug-ins
 

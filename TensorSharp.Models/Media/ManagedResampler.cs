@@ -30,6 +30,7 @@ namespace TensorSharp.Models.Media
     {
         private const int PrecisionBits = 32 - 8 - 2;   // 22
         private const double FilterSupport = 3.0;        // Lanczos-3
+        private const double BicubicSupport = 2.0;       // Pillow's BICUBIC (a = -0.5)
 
         private static double Sinc(double v)
         {
@@ -46,12 +47,22 @@ namespace TensorSharp.Models.Media
             return 0.0;
         }
 
+        // Pillow's bicubic_filter (src/libImaging/Resample.c), a = -0.5.
+        private static double Bicubic(double x)
+        {
+            const double a = -0.5;
+            if (x < 0.0) x = -x;
+            if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+            if (x < 2.0) return (((x - 5) * x + 8) * x - 4) * a;
+            return 0.0;
+        }
+
         /// <summary>
         /// Precompute the filter coefficients for one dimension. Returns the kernel
         /// size; bounds[xx*2+0] is the first contributing input index and
         /// bounds[xx*2+1] the contributing count for output pixel xx.
         /// </summary>
-        private static int PrecomputeWeights(int inSize, int outSize, out int[] bounds, out int[] weights)
+        private static int PrecomputeWeights(int inSize, int outSize, out int[] bounds, out int[] weights, bool bicubic = false)
         {
             if (inSize <= 0 || outSize <= 0)
                 throw new ArgumentException("PrecomputeWeights requires positive sizes");
@@ -61,7 +72,7 @@ namespace TensorSharp.Models.Media
             if (filterScale < 1.0)
                 filterScale = 1.0;
 
-            double support = FilterSupport * filterScale;
+            double support = (bicubic ? BicubicSupport : FilterSupport) * filterScale;
             int ksize = (int)Math.Ceiling(support) * 2 + 1;
 
             double[] pre = new double[(long)outSize * ksize];
@@ -86,7 +97,8 @@ namespace TensorSharp.Models.Media
                 int x;
                 for (x = 0; x < xmax; x++)
                 {
-                    double w = Lanczos3((x + xmin - center + 0.5) * ss);
+                    double t = (x + xmin - center + 0.5) * ss;
+                    double w = bicubic ? Bicubic(t) : Lanczos3(t);
                     pre[(long)xx * ksize + x] = w;
                     ww += w;
                 }
@@ -199,7 +211,19 @@ namespace TensorSharp.Models.Media
         /// Two-pass separable Lanczos-3 resize over a packed RGB u8 buffer.
         /// Mirrors img_tool::resize_pillow's need_horizontal / need_vertical logic.
         /// </summary>
-        internal static byte[] ResizeLanczosPillow(byte[] src, int srcW, int srcH, int dstW, int dstH)
+        internal static byte[] ResizeLanczosPillow(byte[] src, int srcW, int srcH, int dstW, int dstH) =>
+            ResizePillow(src, srcW, srcH, dstW, dstH, bicubic: false, pillowPassOrder: false);
+
+        /// <summary>
+        /// Pillow's <c>Image.resize</c> of an 8-bit RGB image with LANCZOS (<paramref name="bicubic"/> false) or BICUBIC,
+        /// byte for byte: the same two separable passes, coefficients and fixed-point rounding as
+        /// <see cref="ResizeLanczosPillow"/>, with Pillow's bicubic kernel (a = -0.5, support 2) for the second. With
+        /// <paramref name="pillowPassOrder"/> the passes run in the order Pillow 13 runs them (ImagingResampleInner: the
+        /// vertical pass first when the height shrinks by more than twice what the width does, else the horizontal pass
+        /// first); without it the horizontal pass always runs first, as llama.cpp's resize_pillow (which Muse-Glimmer
+        /// matches) does.
+        /// </summary>
+        internal static byte[] ResizePillow(byte[] src, int srcW, int srcH, int dstW, int dstH, bool bicubic, bool pillowPassOrder = true)
         {
             if (dstW <= 0 || dstH <= 0)
                 throw new ArgumentException($"Invalid target size {dstW}x{dstH}");
@@ -209,21 +233,27 @@ namespace TensorSharp.Models.Media
 
             if (needHorizontal && needVertical)
             {
-                int kH = PrecomputeWeights(srcW, dstW, out int[] bH, out int[] wH);
-                int kV = PrecomputeWeights(srcH, dstH, out int[] bV, out int[] wV);
+                int kH = PrecomputeWeights(srcW, dstW, out int[] bH, out int[] wH, bicubic);
+                int kV = PrecomputeWeights(srcH, dstH, out int[] bV, out int[] wV, bicubic);
+                bool horizontalFirst = !pillowPassOrder || !(srcH - dstH > 0 && srcH - dstH > (long)(srcW - dstW) * 2);
+                if (!horizontalFirst)
+                {
+                    byte[] rows = ResampleVertical(src, srcW, srcH, dstH, kV, bV, wV);
+                    return ResampleHorizontal(rows, srcW, dstH, dstW, kH, bH, wH);
+                }
                 byte[] temp = ResampleHorizontal(src, srcW, srcH, dstW, kH, bH, wH);
                 return ResampleVertical(temp, dstW, srcH, dstH, kV, bV, wV);
             }
 
             if (needHorizontal)
             {
-                int kH = PrecomputeWeights(srcW, dstW, out int[] bH, out int[] wH);
+                int kH = PrecomputeWeights(srcW, dstW, out int[] bH, out int[] wH, bicubic);
                 return ResampleHorizontal(src, srcW, srcH, dstW, kH, bH, wH);
             }
 
             if (needVertical)
             {
-                int kV = PrecomputeWeights(srcH, dstH, out int[] bV, out int[] wV);
+                int kV = PrecomputeWeights(srcH, dstH, out int[] bV, out int[] wV, bicubic);
                 return ResampleVertical(src, srcW, srcH, dstH, kV, bV, wV);
             }
 

@@ -1153,12 +1153,12 @@ namespace TensorSharp.Cli
                     audioPath, outputFile, diffusionStepsSet ? diffusionSteps : 0, diffusionSeedSet ? diffusionSeed : 0))
                 return;
 
-            // Qwen-Image-2.1: prompt -> generated image, or prompt + input image(s) -> edited
-            // image (no autoregressive path). Repeat --image for multi-image edits (e.g.
-            // --image model.png --image dress.png); the first image drives the output
-            // geometry, and each is tagged <image1>, <image2>, ... ahead of the prompt in
-            // command-line order, so the prompt can refer to them by those tags.
-            // MiniMax-H3-Image takes the same route for text to image.
+            // Image models (Qwen-Image-2.1, MiniMax-H3-Image): prompt -> generated image, or
+            // prompt + input image(s) -> edited image (no autoregressive path). Repeat --image
+            // for multi-image edits (e.g. --image model.png --image dress.png); the first image
+            // drives the output geometry, and the prompt names the images the way the model
+            // does, in command-line order: <image1>, <image2>, ... for Qwen-Image-2.1,
+            // <Picture 1>, <Picture 2>, ... (up to 16) for MiniMax-H3-Image.
             if (model is TensorSharp.Models.QwenImage.IImageGenerationModel imageModel)
             {
                 string prompt = editPrompt
@@ -2438,6 +2438,18 @@ namespace TensorSharp.Cli
                 output = inputs.Count == 0 ? imageModel.GenerateImage(prompt, p) : imageModel.EditImage(prompt, inputs, p);
                 sw.Stop();
                 TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, output);
+            }
+            catch (RequestRefusedException ex)
+            {
+                // The model declined the request before running it (the device cannot hold its phases): the operator's to
+                // act on, like a refused load, so one error line and exit code 2 rather than a stack trace.
+                // The stack trace stays available at --log-level debug, as for a refused load.
+                image.MarkFailed(ex);
+                _log.LogError(LogEventIds.CliFailed, "Request refused: {Reason}", ex.Message);
+                _log.LogDebug(LogEventIds.CliFailed, ex, "Request refused");
+                Console.Error.WriteLine(RequestRefusedException.FormatErrorLine(ex.Message));
+                Environment.ExitCode = HostExitCodes.RequestRefused;
+                return;
             }
             catch (Exception ex)
             {

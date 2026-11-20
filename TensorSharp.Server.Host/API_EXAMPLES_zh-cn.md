@@ -5,7 +5,7 @@
 TensorSharp.Server.Host 提供三种 API 风格、一个兼容 Jev 的判定端点以及若干工具型接口：
 
 - **兼容 Ollama**（`/api/generate`、`/api/chat/ollama`、`/api/tags`、`/api/show`、`/api/embed`）
-- **兼容 OpenAI**（`/v1/chat/completions`、`/v1/responses`、`GET /v1/responses/{id}`、`/v1/models`、`/v1/embeddings`、`/v1/videos/generations`、`/v1/skills`）
+- **兼容 OpenAI**（`/v1/chat/completions`、`/v1/responses`、`GET /v1/responses/{id}`、`/v1/models`、`/v1/embeddings`、`/v1/images/generations`、`/v1/images/edits`、`/v1/videos/generations`、`/v1/skills`）
 - **兼容 Jev** 的类型化判定（`/v1/systemone`，仅限 DiffusionGemma）
 - **Web UI**（`/api/chat`、`/api/sessions`、`/api/models`、`/api/models/load`、`/api/upload`、`/api/skills`、`/api/image-edit`、`/api/image-edit/stream`、`/api/image-generate`、`/api/image-generate/stream`、`/api/video-generate`、`/api/video-generate/stream`）
 - **工具型接口**（`/api/version`、`/api/queue/status`、`/health`）
@@ -15,7 +15,7 @@ TensorSharp.Server.Host 提供三种 API 风格、一个兼容 Jev 的判定端�
 
 ## 嵌入 API
 
-使用 `--model encoder.gguf --embeddings` 启动嵌入服务，后端选择纯 C# `cpu` 或原生 `ggml_cpu` / `ggml_metal` / `ggml_cuda`。一个进程常驻一个编码器；聊天与嵌入分别运行。支持 Snowflake Arctic Embed L v2.0 与 MiniLM GGUF，模型信息接口报告 `embedding` 能力。启用 `--embeddings` 时，发往生成类路由（`/v1/chat/completions`、`/v1/responses`、`/v1/systemone`、`/v1/videos/generations`、`/api/generate`、`/api/chat`、`/api/chat/ollama`、`/api/models/load`，以及 `/api/image-generate`、`/api/image-edit`、`/api/video-generate` 与它们的 `/stream` 形式）的 `POST` 请求会收到 HTTP 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.`
+使用 `--model encoder.gguf --embeddings` 启动嵌入服务，后端选择纯 C# `cpu` 或原生 `ggml_cpu` / `ggml_metal` / `ggml_cuda`。一个进程常驻一个编码器；聊天与嵌入分别运行。支持 Snowflake Arctic Embed L v2.0 与 MiniLM GGUF，模型信息接口报告 `embedding` 能力。启用 `--embeddings` 时，发往生成类路由（`/v1/chat/completions`、`/v1/responses`、`/v1/systemone`、`/v1/images/generations`、`/v1/images/edits`、`/v1/videos/generations`、`/api/generate`、`/api/chat`、`/api/chat/ollama`、`/api/models/load`，以及 `/api/image-generate`、`/api/image-edit`、`/api/video-generate` 与它们的 `/stream` 形式）的 `POST` 请求会收到 HTTP 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.`
 
 ```bash
 curl http://127.0.0.1:5000/v1/embeddings -H 'Content-Type: application/json' \
@@ -78,7 +78,7 @@ OpenAI / Ollama 响应附加 `knowledge_sources`、`knowledge_citation_repairs`�
 | 生成模式 | 自回归模型流式追加 token chunk。DiffusionGemma 在 append-only 兼容端点返回最终文本，在 Web UI `/api/chat` 上提供整条消息替换式实时去噪预览。 |
 | 会话 | Web UI 使用每个浏览器 tab 独立聊天会话。Ollama/OpenAI 兼容端点保留现有的默认推理会话行为，但代码执行工作区绝不会跨 HTTP 请求延续。 |
 | 上传 | `/api/upload` 接受图像 / 视频 / 音频 / 文本 / **PDF** 文件；原生数字 PDF 返回抽取出的文本，扫描版 PDF 在加载了具备视觉能力的模型时返回逐页图像（`TS_PDF_MAX_PAGES` 限制读取页数） |
-| 图像生成与编辑 | Qwen-Image-2.1（`qwen_image`）通过 `/api/image-generate`、`/api/image-edit` 及其 `/stream` 变体提供服务，而不是聊天端点 |
+| 图像生成与编辑 | Qwen-Image-2.1（`qwen_image`）与 MiniMax-H3-Image（`minimax-h3-image`）通过 `/api/image-generate`、`/api/image-edit`、它们的 `/stream` 变体以及 OpenAI 形式的 `/v1/images/generations` 与 `/v1/images/edits` 提供服务，而不是聊天端点 |
 | 视频生成 | 任何视频生成模型 —— MiniMax-H3（`minimax-h3`）、Wan 2.1 / 2.2（`wan`）—— 都通过 `/api/video-generate`、`/api/video-generate/stream` 与 `/v1/videos/generations` 提供服务；MiniMax-H3 在 MP4 之外还会返回一个 32 kHz 立体声 `.wav` 旁挂文件，`/api/models` 会告知当前加载的检查点接受哪些条件输入 |
 | Agent Skills | 技能目录：首先是二进制文件旁的 `skills` 目录（通过 `POST /api/skills` 上传的技能安装在此处；最先扫描，因此同名时其中的技能优先），然后是 `--skills-dir`（默认为从工作目录向上直到 Git 根目录的每个已存在的 `.agents/skills`，由近及远），在 `/v1/skills` 与 `/api/skills` 列出，也可通过 `POST /api/skills` 以 `.zip` 安装。所有聊天端点都可用 `"skills": [...]` 按请求选中。对同时支持工具声明与输出解析的模型族（包括 Qwen 3.8 Flash Next，`qwen4exp`），模型自己的技能调用在服务端内部应答，因此客户端拿到完整回复；不支持完整工具闭环的模型族则以内联方式获得选中技能说明。`skills_run` 只有在服务启动时传入 `--skills-allow-exec` 才可用。 |
 | Agent 式代码执行 | `--code-exec` 会为支持工具调用的模型族加入进程内执行的 `shell`、`read_file`、`write_file` 与 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI/Ollama HTTP 请求在内部轮次间使用私有工作区，响应结束后由服务删除。联网与安装软件包是相互独立且默认关闭的权限。 |
@@ -1508,7 +1508,61 @@ curl -N -X POST http://localhost:5000/api/image-edit/stream \
 `{"imageEdit": true, "step": 2, "total": 40, "image": "data:image/png;base64,...", "width": ..., "height": ...}`
 （`image` 预览快照只在节流后的步骤上出现，每次编辑最多 8 张），最后是一条
 `{"done": true, "url": "/uploads/edit-<guid>.png", "width": ..., "height": ..., "elapsedSeconds": ...}`。
-对非 Qwen-Image-2.1 模型发起的请求返回 400；并发编辑由进程级锁串行执行。
+对不支持图像编辑的模型发起的请求返回 400。所有图像请求（生成与编辑，任何路由）在同一个队列中按到达顺序逐个执行；
+排队期间客户端断开的请求会直接离开队列，不会执行。
+
+### MiniMax-H3-Image 图像编辑
+
+使用 `--config config/minimax-h3-image.json` 时，同样的路由用 MiniMax-H3-Image 编辑图像：最多 16 张参考图，
+提示词按请求中的顺序（`imagePaths`，或 multipart 的各个 `image` 部分）称它们为 `<Picture 1>`、`<Picture 2>`……。
+每张参考图如何被使用以及实测开销见 [MiniMax-H3-Image 指南](../docs/models/minimax-h3-image_zh-cn.md#图像编辑)。
+
+```bash
+curl -X POST http://localhost:5000/api/image-edit \
+  -F "image=@cabin.png" -F "image=@mug.png" \
+  -F "prompt=Put the black mug from <Picture 2> on the table in front of the cabin in <Picture 1>." \
+  -F "width=2048" -F "height=2048" -F "seed=7"
+```
+
+- 与文生图相同，固定 6 步、引导系数 1：`cfg` 大于 1、`negativePrompt` 以及遮罩都会被拒绝（遮罩编辑尚未实现）。
+- 尺寸：`width`/`height`（32 的倍数，最多 2000 万像素），或 `keepSourceSize`（`<Picture 1>` 的精确尺寸），
+  或按 `<Picture 1>` 的宽高比取 `targetArea` 面积（默认 2048×2048 的面积）。小于 2048×2048 的尺寸会像 MiniMax
+  官方流程那样，先在同宽高比、2048×2048 面积的画布上采样，再缩放回请求的尺寸。
+- `seed` 按 MiniMax 的顺序从同一个 CPU torch 生成器依次抽取：每张参考图的 VAE 采样、目标图的噪声、每张参考图的噪声。
+- 以下请求在任何计算之前即被拒绝并说明原因：超过 16 张参考图、参考图某边小于 32 像素、参考图使序列超出设备显存
+  （消息会给出行数并建议减少参考图数量或缩小参考图）。
+
+### OpenAI 图像路由（`/v1/images/generations`、`/v1/images/edits`）
+
+当前加载的图像模型（MiniMax-H3-Image 或 Qwen-Image-2.1）也以 SGLang 提供的格式响应 OpenAI 图像路由，因此 MiniMax
+官方的 `examples/t2i.py` 与 `examples/edit.py` 无需修改即可配合 `--url http://localhost:5000` 使用。
+
+```bash
+curl --fail-with-body http://localhost:5000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A red paper lantern in a snowy courtyard","size":"2048x2048","seed":7,"response_format":"b64_json"}'
+
+curl --fail-with-body http://localhost:5000/v1/images/edits \
+  -F "image=@reference1.png" -F "image=@reference2.png" \
+  -F "prompt=Hang <Picture 2> on the wall behind the hosts of <Picture 1>." \
+  -F "size=2048x2048" -F "seed=1234" -F "response_format=b64_json"
+```
+
+| 字段 | 含义 |
+|---|---|
+| `prompt` | 必填 |
+| `size` | `宽x高`（32 的倍数）或 `auto`；省略时使用图像路由的自动尺寸 |
+| `seed` | 整数；`n` 张中的第 *i* 张使用 `seed + i` |
+| `n` | 1 到 10 张，逐张生成 |
+| `response_format` | `url`（默认，一个 `/uploads/...` 链接）或 `b64_json` |
+| `output_format` | 仅 `png` |
+| `num_inference_steps`、`guidance_scale`、`negative_prompt` | 即图像路由的 `steps`、`cfg` 与 `negativePrompt`，由模型同样校验 |
+| `image`（编辑，可重复；也接受 `image[]`） | 参考图，按 `<Picture n>` 顺序 |
+| `mask`（编辑） | 一个遮罩文件，供支持遮罩的模型使用 |
+
+SGLang 客户端发送的其他字段（`model`、`generator_device`、`quality`、`user` 等）会被接受并忽略。返回
+`{"created": ..., "data": [{"b64_json": "..."} | {"url": "..."}], "output_format": "png", "size": "WxH"}`；
+错误使用 OpenAI 的格式（`{"error": {"message": ..., "type": "invalid_request_error"}}`）。
 
 ### Qwen-Image-2.1 LoRA 插件
 

@@ -274,10 +274,10 @@ namespace TensorSharp.Cli
             ("Multimodal input (vision / audio / video models)", new[]
             {
                 new OptionHelp("--image <file>",
-                    "Image input for a vision model (PNG/JPEG/...). Repeatable: for Qwen-Image-2.1 editing every " +
-                    "--image is a reference picture, handed to the text encoder in command-line order and tagged " +
-                    "<image1>, <image2>, ... ahead of the prompt, so the prompt can name a picture by its tag. " +
-                    "Default: none.",
+                    "Image input for a vision model (PNG/JPEG/...). Repeatable: for image editing every --image is a " +
+                    "reference picture, in command-line order, and the prompt names the pictures the way the model " +
+                    "does: Qwen-Image-2.1 tags them <image1>, <image2>, ... ahead of the prompt; MiniMax-H3-Image (up " +
+                    "to 16) calls them <Picture 1>, <Picture 2>, ... Default: none.",
                     "--image photo.jpg"),
                 new OptionHelp("--audio <file>",
                     "Audio input for an audio-capable model (e.g. Gemma 4). Default: none.",
@@ -608,8 +608,8 @@ namespace TensorSharp.Cli
             ("Image generation and editing (DiffusionGemma / Qwen-Image models)", new[]
             {
                 new OptionHelp("--prompt <text>",
-                    "Image description for Qwen-Image-2.1; --image selects editing (alternative to --input). " +
-                    "Repeat --image for multiple references. Default: empty.",
+                    "Image description for Qwen-Image-2.1 or MiniMax-H3-Image; --image selects editing (alternative to " +
+                    "--input). Repeat --image for multiple references. Default: empty.",
                     "--prompt \"Make the sky look like sunset\""),
                 new OptionHelp("--cfg <f>",
                     "Classifier-free guidance scale. Default: 1.0 for Qwen-Image-2.1 (one prediction per step; " +
@@ -671,9 +671,10 @@ namespace TensorSharp.Cli
                     "Context around the selected crop, in source pixels (0-16384). Default: 64.",
                     "--mask-crop-padding 96"),
                 new OptionHelp("--keep-source-size",
-                    "Qwen-Image-2.1 edit: return the first --image's exact width and height, so an edit of an edit keeps " +
-                    "its size. Sampling uses about the image's own area, at least 1 megapixel and at most the automatic " +
-                    "area, at about its aspect ratio, and the result is resized to the source. Cannot be combined with --width/--height. Masked " +
+                    "Qwen-Image-2.1 or MiniMax-H3-Image edit: return the first --image's exact width and height, so an edit of an edit keeps " +
+                    "its size. Sampling uses about the image's own area at about its aspect ratio (Qwen-Image-2.1: at least " +
+                    "1 megapixel and at most the automatic area; MiniMax-H3-Image: at least 2048x2048 and at most 20 " +
+                    "megapixels), and the result is resized to the source. Cannot be combined with --width/--height. Masked " +
                     "edits keep the source size without it. Default: off (the automatic size).",
                     "--image photo.png --keep-source-size"),
                 new OptionHelp("--lora <path>",
