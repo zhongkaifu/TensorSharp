@@ -211,7 +211,7 @@ namespace TensorSharp.Models.SharedDiffusion
         public RgbImage Composite(RgbImage generated)
         {
             ArgumentNullException.ThrowIfNull(generated);
-            generated = ImageIO.Resize(generated, Width, Height);
+            generated = QwenImage.ImageIO.Resize(generated, Width, Height);
             var result = (float[])Source.Pixels.Clone();
             var alpha = Source.Alpha == null ? null : (float[])Source.Alpha.Clone();
             if (alpha == null && generated.Alpha != null)

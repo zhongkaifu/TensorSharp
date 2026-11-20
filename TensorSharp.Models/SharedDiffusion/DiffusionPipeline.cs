@@ -166,7 +166,7 @@ namespace TensorSharp.Models.SharedDiffusion
                     var (w, h) = job.Canvas.Sampling;
                     LatentPosterior source = first != null && job.VaeCopies[0].Width == w && job.VaeCopies[0].Height == h
                         ? first
-                        : vae.Encode(ImageIO.Resize(job.Mask.Reference, w, h), ct);
+                        : vae.Encode(QwenImage.ImageIO.Resize(job.Mask.Reference, w, h), ct);
                     if (source.Shape != job.Target)
                         throw new InvalidOperationException($"The mask's source encodes to {source.Shape}, not the target's {job.Target}.");
                     sourceRows = _family.ToRows(new LatentTensor(job.Target, source.Mean));

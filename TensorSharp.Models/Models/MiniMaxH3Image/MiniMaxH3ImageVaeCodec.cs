@@ -352,7 +352,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             int longer = Math.Max(full.Width, full.Height);
             if (maxSide <= 0 || longer <= maxSide) return full;
             double f = (double)maxSide / longer;
-            return ImageIO.Resize(full, Math.Max(1, (int)Math.Round(full.Width * f)), Math.Max(1, (int)Math.Round(full.Height * f)));
+            return QwenImage.ImageIO.Resize(full, Math.Max(1, (int)Math.Round(full.Width * f)), Math.Max(1, (int)Math.Round(full.Height * f)));
         }
 
         /// <summary>

@@ -62,8 +62,8 @@ namespace TensorSharp.Models.SharedDiffusion
         (float[] Weights, int ValuesPerWeight) MaskRows(float[] cellWeights, LatentShape shape);
 
         /// <summary>The decode resized to the size the request returns (a generation floor, a kept source size): the
-        /// family's upstream filter. The default is <see cref="ImageIO.Resize"/>.</summary>
-        RgbImage ResizeOutput(RgbImage image, int width, int height) => ImageIO.Resize(image, width, height);
+        /// family's upstream filter. The default is <see cref="QwenImage.ImageIO.Resize"/>.</summary>
+        RgbImage ResizeOutput(RgbImage image, int width, int height) => QwenImage.ImageIO.Resize(image, width, height);
     }
 
     /// <summary>

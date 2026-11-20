@@ -122,7 +122,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public static RgbImage PillowResize(RgbImage image, int width, int height, bool bicubic = false)
         {
             ArgumentNullException.ThrowIfNull(image);
-            byte[] rgb = ImageIO.ToRgb8(image);
+            byte[] rgb = QwenImage.ImageIO.ToRgb8(image);
             byte[] resized = width == image.Width && height == image.Height
                 ? rgb
                 : ManagedResampler.ResizePillow(rgb, image.Width, image.Height, width, height, bicubic);
