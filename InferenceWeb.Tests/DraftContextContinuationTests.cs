@@ -626,8 +626,10 @@ public sealed class DraftContextContinuationTests : IDisposable
         BlockSize = 16,
         EnablePrefixCaching = true,
         StopRepetition = false,
+        // The drafts these tests compare must not hang on the cost governor's timing of the machine's steps.
         Speculation = speculate
-            ? new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.Block, MaxDraftTokens = 3, MinDraftProb = 0 }
+            ? new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.Block, MaxDraftTokens = 3, MinDraftProb = 0,
+                GovernorDisabledForTests = true }
             : new SpeculationOptions { Enabled = false },
     };
 

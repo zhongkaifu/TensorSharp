@@ -574,7 +574,8 @@ internal static class SpeculativeRuntimeChecks
             NumBlocks = 64,
             BlockSize = 16,
             EnablePrefixCaching = false,
-            Speculation = speculation ?? new SpeculationOptions { Enabled = false },
+            // The streams and drafts these checks compare must not hang on the cost governor's timing of the machine's steps.
+            Speculation = speculation is null ? new SpeculationOptions { Enabled = false } : speculation with { GovernorDisabledForTests = true },
         };
         using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
         // Every request is admitted before the first step: submitted one by one, the engine sometimes took the first prompt
