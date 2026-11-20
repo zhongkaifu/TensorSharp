@@ -551,16 +551,15 @@ if (gpuDeviceFlagApplied)
         Environment.GetEnvironmentVariable(GgmlBasicOps.VulkanDeviceEnvVar));
 }
 
-if (TensorSharp.Graph.PromptAttentionConfig.FromEnvironment() is var configuredAttention
-    && configuredAttention != TensorSharp.Graph.PromptAttentionConfig.Default)
+if (TensorSharp.Graph.PromptAttentionConfig.FromEnvironment() is { } configuredAttention)
 {
     // An option's name and one of its three fixed values, never request content.
     string attentionSource = promptAttentionFlagApplied
         ? "CLI (" + TensorSharp.Graph.PromptAttentionConfig.Flag + ")" : TensorSharp.Graph.PromptAttentionConfig.EnvironmentVariable;
     string attentionPath = TensorSharp.Graph.PromptAttentionConfig.Name(configuredAttention);
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "Prompt attention configured via {Source}: {AttentionPath} (applies to prompt chunks on --backend cuda; the default is f16)",
-        attentionSource, attentionPath);
+        "Prompt attention configured via {Source}: {AttentionPath} (applies to prompt chunks on --backend cuda; the default is " +
+        "int8 where it runs, f16 elsewhere)", attentionSource, attentionPath);
 }
 
 if (tensorParallelFlagsApplied)

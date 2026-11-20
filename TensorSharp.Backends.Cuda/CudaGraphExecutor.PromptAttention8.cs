@@ -19,26 +19,30 @@ namespace TensorSharp.Cuda
     public sealed partial class CudaGraphExecutor
     {
         /// <summary>The prompt attention a prompt chunk's rows run unless the operator chooses another
-        /// (<see cref="PromptAttentionConfig"/>: <c>--prompt-attention</c>, <c>TS_PROMPT_ATTENTION</c>): the 16-bit-run kernels.
-        /// Both faster paths failed their pre-registered quality gates (design t2-attn8 sec. 12.3) on Qwen3.8-27B NVFP4 (RTX PRO
-        /// 4500), on a few long C# code windows. The 8-bit path (2026-11-18): with q8 activations on the prompt rows of both arms,
-        /// the prompt rows moved +0.8% PPL at 64K keys and +18% on a 96K window; ggml_cuda with q8 activations
-        /// (GGML_CUDA_MMQ_PREC=q8, not its default) moved those two windows further. As served (W4A4 prompt rows), the decode
-        /// rows after a code prompt moved +0.8% to +6.4% PPL at 8K-64K keys and +94% on the 96K window; ggml_cuda as served
-        /// moved them +1.5% at 8K, -0.4% at 64K and -22% at 96K. Prose and long-context retrieval did not move. F32 accumulation
-        /// (2026-11-19, e3d5ddd3): continue code 8K-96K +0.41% to +84.6%, ppl with q8 activations code 32K-96K +1.4% to +19%,
-        /// greedy 3 of 21 divergences at top-2 gaps of 1.8-4.9 logits.</summary>
+        /// (<see cref="PromptAttentionConfig"/>: <c>--prompt-attention</c>, <c>TS_PROMPT_ATTENTION</c>): the 8-bit path where it
+        /// runs, the 16-bit-run kernels (<see cref="PromptAttentionConfig.Fallback"/>) elsewhere. The user chose int8 as the
+        /// default (issue #383, 2026-11-20), accepting the pre-registered quality gates (design t2-attn8 sec. 12.3) it failed on
+        /// Qwen3.8-27B NVFP4 (RTX PRO 4500), on a few long C# code windows (2026-11-18): with q8 activations on the prompt rows
+        /// of both arms, the prompt rows moved +0.8% PPL at 64K keys and +18% on a 96K window; as served (W4A4 prompt rows), the
+        /// decode rows after a code prompt moved +0.8% to +6.4% PPL at 8K-64K keys and +94% on the 96K window, where ggml_cuda as
+        /// served moved them +1.5% at 8K, -0.4% at 64K and -22% at 96K. Prose and long-context retrieval did not move. On that
+        /// card a fresh 47K-69K prompt then prefills 18-22% faster than on the 16-bit-run kernels, as fast as the direct
+        /// engine of 038fb303. <c>--prompt-attention f16</c> restores the 16-bit-run kernels, bit for bit.</summary>
         private const PromptAttentionPath PromptAttentionDefault = PromptAttentionConfig.Default;
 
-        /// <summary>The operator's choice when the executor was made (<see cref="PromptAttentionConfig.FromEnvironment"/>; an
-        /// unknown value refuses the executor rather than run another path).</summary>
-        private readonly PromptAttentionPath _promptAttentionConfigured = PromptAttentionConfig.FromEnvironment();
+        /// <summary>The operator's choice when the executor was made (<see cref="PromptAttentionConfig.FromEnvironment"/>; null:
+        /// nothing chosen; an unknown value refuses the executor rather than run another path).</summary>
+        private readonly PromptAttentionPath? _promptAttentionConfigured = PromptAttentionConfig.FromEnvironment();
 
         /// <summary>Tests and the eng probe: a path in place of the configured one (null keeps it).</summary>
         internal PromptAttentionPath? PromptAttentionForTests { get; set; }
 
-        /// <summary>The prompt attention this executor's prompt chunks run.</summary>
-        internal PromptAttentionPath PromptAttention => PromptAttentionForTests ?? _promptAttentionConfigured;
+        /// <summary>The path chosen for this executor (the seam, else the operator's), or null when nothing was.</summary>
+        private PromptAttentionPath? PromptAttentionChosen => PromptAttentionForTests ?? _promptAttentionConfigured;
+
+        /// <summary>The prompt attention this executor's prompt chunks ask for: the chosen path, else the default (int8, which
+        /// runs f16 where the 8-bit path cannot).</summary>
+        internal PromptAttentionPath PromptAttention => PromptAttentionChosen ?? PromptAttentionDefault;
 
         /// <summary>Tests and the eng probe: null keeps the chosen path; true asks for the 8-bit prompt attention wherever it
         /// runs, false keeps a 16-bit kernel.</summary>
@@ -46,32 +50,39 @@ namespace TensorSharp.Cuda
 
         private bool PromptAttention8Enabled => PromptAttention8ForTests ?? PromptAttention == PromptAttentionPath.Int8;
 
+        /// <summary>The 8-bit path was asked for explicitly (<c>--prompt-attention int8</c> or a seam), so a chunk it cannot take
+        /// is reported; as the default, its fallback to f16 is the default too and says nothing.</summary>
+        private bool PromptAttention8Explicit => PromptAttention8ForTests == true || PromptAttentionChosen == PromptAttentionPath.Int8;
+
         /// <summary>Prompt chunks' attention ops on the kernels with F32 accumulation (tests, the probe).</summary>
         internal long PromptAttentionF32AccLaunches { get; private set; }
 
         private static int s_promptAttentionNoted;
         private static int s_attn8DeclinedWarned;
 
-        /// <summary>Once a process: which prompt attention was chosen and what it runs on this device, the first time a prompt
-        /// chunk takes a path other than the default.</summary>
-        private static void NotePromptAttentionOnce(PromptAttentionPath path, CudaFlashPrefillKernels flash)
+        /// <summary>Once a process: which prompt attention the first prompt chunk on a path other than f16 took and what it runs
+        /// on this device.</summary>
+        private void NotePromptAttentionOnce(PromptAttentionPath path, CudaFlashPrefillKernels flash)
         {
-            if (path == PromptAttentionDefault || Interlocked.Exchange(ref s_promptAttentionNoted, 1) != 0) return;
+            if (Interlocked.Exchange(ref s_promptAttentionNoted, 1) != 0) return;
             string detail = path == PromptAttentionPath.F32Acc
                 ? $"F32 accumulation runs at {flash.F32AccumulationRate:F2} of the F16-accumulation tensor rate here" +
                   (flash.PromptAccumulatesInF32 ? "" : ", so it may be slower than f16 on this device")
-                : "8-bit Q K^T and E4M3 P V for 256-wide heads over long windows";
+                : "8-bit Q K^T and E4M3 P V for 256-wide heads over windows of 1,024 keys or more";
+            string source = PromptAttentionChosen == null
+                ? "the default where it runs"
+                : $"{PromptAttentionConfig.Flag} / {PromptAttentionConfig.EnvironmentVariable}";
             Console.Error.WriteLine(
-                $"[cuda] prompt attention: {PromptAttentionConfig.Name(path)} ({PromptAttentionConfig.Flag} / " +
-                $"{PromptAttentionConfig.EnvironmentVariable}; {detail}). Not the default: it failed issue #376's quality gates on " +
-                "long code windows. Decode rows, verify windows and drafts keep the 16-bit kernels.");
+                $"[cuda] prompt attention: {PromptAttentionConfig.Name(path)} ({source}; {detail}). It moves a few long C# code " +
+                $"windows (issue #376's quality gates); {PromptAttentionConfig.Flag} f16 keeps the 16-bit kernels. Decode rows, " +
+                "verify windows and drafts keep the 16-bit kernels.");
         }
 
-        /// <summary>Once a process: the 8-bit prompt attention was chosen but cannot run here, so prompt chunks attend on the
-        /// 16-bit kernel.</summary>
-        private static void WarnAttn8DeclinedOnce(string why)
+        /// <summary>Once a process: the 8-bit prompt attention was chosen explicitly but cannot run here, so prompt chunks attend
+        /// on the 16-bit kernel. Nothing for the default: there f16 is the default.</summary>
+        private void WarnAttn8DeclinedOnce(string why)
         {
-            if (Interlocked.Exchange(ref s_attn8DeclinedWarned, 1) == 0)
+            if (PromptAttention8Explicit && Interlocked.Exchange(ref s_attn8DeclinedWarned, 1) == 0)
                 Console.Error.WriteLine(
                     $"WARNING: [cuda] {PromptAttentionConfig.Flag} int8 was chosen, but {why}: prompt chunks attend on the 16-bit " +
                     "kernel (f16) instead. Reported once.");

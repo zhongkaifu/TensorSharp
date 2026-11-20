@@ -205,7 +205,9 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
     {
         ["gptoss"] = new() { [17] = 0.031, [97] = 0.047, [160] = 0.028, [257] = 0.067, [513] = 0.048, [1100] = 0.030 },
         ["qwen35moe"] = new() { [17] = 0.068, [97] = 0.049, [160] = 0.13, [257] = 0.098, [513] = 0.092, [1100] = 0.062 },
-        ["qwen35"] = new() { [17] = 0.0034, [97] = 0.0029, [160] = 0.0025, [257] = 0.0022, [513] = 0.0026, [1100] = 0.0021 },
+        // 1100: past 1,024 keys and 128 rows, so the default prompt attention runs the 8-bit path (issue #383): A 3.03e-3 on
+        // sm_120 (the 16-bit-run kernels, --prompt-attention f16: 1.4e-3; a part without the 8-bit kernels runs those).
+        ["qwen35"] = new() { [17] = 0.0034, [97] = 0.0029, [160] = 0.0025, [257] = 0.0022, [513] = 0.0026, [1100] = 0.0046 },
         // 257: prompt salt 1 (PrefillSalt); A 6.2e-3, floor 3.6e-3.
         ["gemma4moe"] = new() { [17] = 0.0077, [97] = 0.0078, [160] = 0.0086, [257] = 0.0093, [513] = 0.0072, [1100] = 0.0075 },
         ["gemma4moe_global"] = new() { [17] = 0.0083, [97] = 0.0074, [160] = 0.0088, [257] = 0.0075, [513] = 0.0078, [1100] = 0.0069 },

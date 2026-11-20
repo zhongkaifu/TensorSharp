@@ -6,8 +6,9 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
 // Issue #383, problem 3: the prompt attention of --backend cuda is a setting, one spelling on the CLI, the server and in a
-// --config file (--prompt-attention f16|f32acc|int8) and in the environment (TS_PROMPT_ATTENTION), with the default f16. An
-// unknown value is refused, never run as another path. Nothing here sets the process environment: the server's reading of the
+// --config file (--prompt-attention f16|f32acc|int8) and in the environment (TS_PROMPT_ATTENTION). An
+// unknown value is refused, never run as another path. With nothing chosen the executor runs int8 where it can and f16
+// elsewhere (the user's decision on the default). Nothing here sets the process environment: the server's reading of the
 // flag and of an inherited variable is a pure function (ServerOptionsBuilder.ReadPromptAttentionCliFlag).
 using TensorSharp.Graph;
 using TensorSharp.Runtime;
@@ -53,14 +54,17 @@ public sealed class PromptAttentionSettingTests : IDisposable
         Assert.Contains("f16, f32acc, int8", refused.Message);
     }
 
+    /// <summary>Nothing chosen reads as no choice, so the executor can tell its default (int8 where it runs, f16 elsewhere,
+    /// silently) from an explicit choice (an explicit int8 that cannot run is reported).</summary>
     [Theory]
     [InlineData(null)]
     [InlineData("")]
     [InlineData("  ")]
-    public void NothingChosenIsTheDefaultF16(string? value)
+    public void NothingChosenIsNoChoice_TheDefaultIsInt8WithF16AsItsFallback(string? value)
     {
-        Assert.Equal(PromptAttentionPath.F16, PromptAttentionConfig.Default);
-        Assert.Equal(PromptAttentionPath.F16, PromptAttentionConfig.FromValue(value!));
+        Assert.Null(PromptAttentionConfig.FromValue(value!));
+        Assert.Equal(PromptAttentionPath.Int8, PromptAttentionConfig.Default);
+        Assert.Equal(PromptAttentionPath.F16, PromptAttentionConfig.Fallback);
     }
 
     [Fact]
