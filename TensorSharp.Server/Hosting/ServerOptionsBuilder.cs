@@ -761,6 +761,42 @@ public static class ServerOptionsBuilder
         return chosen;
     }
 
+    /// <summary>
+    /// Translate <c>--diffusion-products &lt;bf16|int8|int8-all&gt;</c> into <c>TS_DIFFUSION_PRODUCTS</c>, which the native CUDA
+    /// products read (<see cref="TensorSharp.Graph.DiffusionProductsConfig"/>). The flag wins over the variable; a variable
+    /// already set to an unknown value is refused here, before a model loads. Returns true when the flag was present.
+    /// </summary>
+    public static bool ApplyDiffusionProductsCliFlag(string[] args)
+    {
+        TensorSharp.Graph.DiffusionProductsPath? chosen = ReadDiffusionProductsCliFlag(args,
+            Environment.GetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable));
+        if (chosen is not { } path) return false;
+        Environment.SetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable,
+            TensorSharp.Graph.DiffusionProductsConfig.Name(path));
+        return true;
+    }
+
+    /// <summary>The products <c>--diffusion-products</c> chooses in <paramref name="args"/> (the last occurrence), or null when
+    /// the flag is absent, checking <paramref name="inherited"/> (the variable's value) then. Throws
+    /// <see cref="ArgumentException"/> for an unknown value of either.</summary>
+    internal static TensorSharp.Graph.DiffusionProductsPath? ReadDiffusionProductsCliFlag(string[]? args, string? inherited)
+    {
+        TensorSharp.Graph.DiffusionProductsPath? chosen = null;
+        for (int i = 0; args != null && i < args.Length; i++)
+        {
+            if (TryReadOption(args, ref i, TensorSharp.Graph.DiffusionProductsConfig.Flag, out string? value))
+            {
+                if (!TensorSharp.Graph.DiffusionProductsConfig.TryParse(value, out var path))
+                    throw new ArgumentException(TensorSharp.Graph.DiffusionProductsConfig.InvalidValueMessage(
+                        TensorSharp.Graph.DiffusionProductsConfig.Flag, value ?? string.Empty));
+                chosen = path;
+            }
+        }
+        if (chosen == null)
+            TensorSharp.Graph.DiffusionProductsConfig.FromValue(inherited);   // throws for an unknown inherited value
+        return chosen;
+    }
+
     /// <summary>Apply the shared, validated tensor-parallel or layer-split configuration.</summary>
     public static bool ApplyTensorParallelCliFlags(string[] args)
     {
@@ -1482,6 +1518,11 @@ public static class ServerOptionsBuilder
             {
                 continue;
             }
+            // --diffusion-products is consumed by ApplyDiffusionProductsCliFlag(args) in an earlier pass.
+            if (TryReadOption(args, ref i, TensorSharp.Graph.DiffusionProductsConfig.Flag, out _))
+            {
+                continue;
+            }
             // Collect at option boundaries after other options have consumed
             // their operands; --stop "--layer-split=2" is literal stop text.
             if (TensorSharp.Distributed.ModelParallelismOptions.TryCollect(args, ref i, parallelismArgs))
@@ -1624,7 +1665,7 @@ public static class ServerOptionsBuilder
             "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae", "--video-upscaler", "--video-diffusion-vae",
             "--video-width", "--video-height", "--video-steps", "--video-mode",
             "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",
-            TensorSharp.Graph.PromptAttentionConfig.Flag,
+            TensorSharp.Graph.PromptAttentionConfig.Flag, TensorSharp.Graph.DiffusionProductsConfig.Flag,
             "--tp", "--tp-node-id", "--tp-peers",
             "--upload-max-mb", "--upload-quota-mb", "--upload-ttl-hours",
             SkillHostOptions.RootsFlag, SkillHostOptions.SelectFlag, SkillHostOptions.ListFlag,

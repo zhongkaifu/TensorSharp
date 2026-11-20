@@ -27,7 +27,7 @@
 // significant bits, and on this model's projections the product came out 27 to 37 dB
 // (31 on average) above its own rounding error. See fp8_gemm.
 //
-// TS_H3_INT8_MATMUL=1 multiplies 8-bit integers through cuBLASLt instead, which a GPU
+// --diffusion-products int8 multiplies 8-bit integers through cuBLASLt instead, which a GPU
 // without FP8 kernels (sm_80: A100, RTX 30) has tensor cores for as well: each weight
 // row and each token's activations are rounded to int8 against their own peak, the
 // product accumulates exactly in int32, and one pass scales it back to F32. It is
@@ -385,7 +385,7 @@ __global__ void encode_f16_e4m3(const __half* __restrict__ w, uint8_t* __restric
     raise_peak(peak, top);
 }
 
-// ---- INT8 (TS_H3_INT8_MATMUL) ----
+// ---- INT8 (--diffusion-products int8, TS_DIFFUSION_PRODUCTS) ----
 
 // v, already scaled so that the operand's peak is 127, rounded to int8.
 __device__ __forceinline__ int8_t i8_rn(float v)
@@ -901,19 +901,32 @@ bool fp8_gemm(GemmState& s, const void* w_q4k, const float* delta, int64_t K, in
     return ok;
 }
 
+// Case-insensitive ASCII equality (the hosts publish the lower-case spelling; a variable set by hand may not be).
+bool strcasecmp_ascii(const char* a, const char* b)
+{
+    for (; *a != '\0' && *b != '\0'; ++a, ++b)
+    {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char) (x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char) (y - 'A' + 'a');
+        if (x != y) return false;
+    }
+    return *a == *b;
+}
+
 // The device memory int8_kept leaves free.
 constexpr std::size_t kKeepReserve = (std::size_t) 8 << 30;
 
-// TS_H3_INT8_MATMUL: 1 for the DiT's projections on int8 tensor cores, vae for the
-// video VAE's, all for both (as TS_H3_FP8_MATMUL).
+// TS_DIFFUSION_PRODUCTS (the hosts' --diffusion-products, DiffusionProductsConfig): int8 for the DiT's
+// projections on int8 tensor cores, int8-all for those and the VAE decoders' F16 ones; bf16 (or
+// unset) for neither. The hosts refuse any other value before a model loads.
 int int8_use()
 {
     static const int use = [] {
-        const char* v = std::getenv("TS_H3_INT8_MATMUL");
+        const char* v = std::getenv("TS_DIFFUSION_PRODUCTS");
         if (v == nullptr) return 0;
-        if (std::strcmp(v, "1") == 0) return (int) FP8_DIT;
-        if (std::strcmp(v, "vae") == 0) return (int) FP8_VAE;
-        if (std::strcmp(v, "all") == 0) return FP8_DIT | FP8_VAE;
+        if (strcasecmp_ascii(v, "int8")) return (int) FP8_DIT;
+        if (strcasecmp_ascii(v, "int8-all")) return FP8_DIT | FP8_VAE;
         return 0;
     }();
     return use;
@@ -1555,7 +1568,7 @@ bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const 
 // dst[n, t] = sum_k W[n, k] * act(x)[t, k] for a contiguous BF16 W of N rows by K (a
 // DiT read from a BF16 release, MiniMax-H3-Image's): act is x or, with x_swiglu,
 // SwiGLU of x's [gate | value] rows. The weight goes to cuBLAS as it is, the
-// activations narrowed to BF16, F32 accumulation and result; TS_H3_INT8_MATMUL=1 takes
+// activations narrowed to BF16, F32 accumulation and result; --diffusion-products int8 takes
 // the int8 route instead (int8_bf16_gemm). Synchronizes the default stream.
 bool tsg_cuda_bf16_gemm(const void* w_bf16, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
                         int x_swiglu, int64_t T, float* dst, int64_t dst_ld)
@@ -1604,7 +1617,7 @@ bool tsg_cuda_bf16_gemm(const void* w_bf16, int64_t K, int64_t N, const float* x
 }
 
 // Whether tsg_cuda_lora_gemm_bf16 serves LoRA updates: the BF16 cuBLAS route, on sm_80 or newer, and not the int8 or FP8
-// DiT routes (TS_H3_INT8_MATMUL / TS_H3_FP8_MATMUL), which merge the update into their own weight rows
+// DiT routes (--diffusion-products int8 / TS_H3_FP8_MATMUL), which merge the update into their own weight rows
 // (tsg_cuda_q4k_lora_gemm_bf16) and keep them between steps.
 bool tsg_cuda_lora_gemm_supported(void)
 {

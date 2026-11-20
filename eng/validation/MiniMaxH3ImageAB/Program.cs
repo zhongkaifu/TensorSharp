@@ -66,6 +66,17 @@ Directory.CreateDirectory(outDir);
 string resultPath = Path.Combine(outDir, label + ".json");
 if (File.Exists(resultPath)) throw new InvalidOperationException($"{resultPath} already exists");
 
+// A removed variable (TS_H3_INT8_MATMUL, TS_H3_IMAGE_VAE_BATCH ...) is refused as the hosts refuse it; --diffusion-products
+// is the hosts' option (design D4), published as the variable the native products read.
+TensorSharp.Runtime.RemovedCliFlags.RejectRemovedEnvironment();
+if (Value(TensorSharp.Graph.DiffusionProductsConfig.Flag) is { } productsValue)
+{
+    if (!TensorSharp.Graph.DiffusionProductsConfig.TryParse(productsValue, out var products))
+        throw new ArgumentException(TensorSharp.Graph.DiffusionProductsConfig.InvalidValueMessage(TensorSharp.Graph.DiffusionProductsConfig.Flag, productsValue));
+    Environment.SetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable, TensorSharp.Graph.DiffusionProductsConfig.Name(products));
+}
+TensorSharp.Graph.DiffusionProductsConfig.FromEnvironment();   // an unknown inherited value is refused before the load
+
 // The companions (as --video-text-encoder / --video-vae set them), and the process's one GGML backend, pinned first.
 Environment.SetEnvironmentVariable("TS_VIDEO_TEXT_ENCODER", te);
 Environment.SetEnvironmentVariable("TS_VIDEO_VAE", vae);
@@ -120,7 +131,7 @@ var result = new JsonObject
     ["model"] = model,
     ["te"] = te,
     ["vae"] = vae,
-    ["env_int8"] = Environment.GetEnvironmentVariable("TS_H3_INT8_MATMUL") ?? "",
+    ["diffusion_products"] = Environment.GetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable) ?? "",
     ["loras"] = LoraCliFlags.Describe(loraSpecs),
     ["load_start"] = Load(),
     ["started_utc"] = DateTime.UtcNow.ToString("O"),

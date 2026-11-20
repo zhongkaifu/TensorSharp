@@ -689,6 +689,17 @@ namespace TensorSharp.Cli
                                 TensorSharp.Graph.PromptAttentionConfig.Name(promptAttention));
                             break;
                         }
+                    case TensorSharp.Graph.DiffusionProductsConfig.Flag:
+                        {
+                            // Read by the native CUDA products, as the server's ApplyDiffusionProductsCliFlag.
+                            string productsStr = args[++i];
+                            if (!TensorSharp.Graph.DiffusionProductsConfig.TryParse(productsStr, out var products))
+                                throw new ArgumentException(TensorSharp.Graph.DiffusionProductsConfig.InvalidValueMessage(
+                                    TensorSharp.Graph.DiffusionProductsConfig.Flag, productsStr));
+                            Environment.SetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable,
+                                TensorSharp.Graph.DiffusionProductsConfig.Name(products));
+                            break;
+                        }
                     case "--kv-cache-dtype":
                         {
                             string kvDtypeStr = args[++i];
@@ -760,6 +771,19 @@ namespace TensorSharp.Cli
             // An unknown TS_PROMPT_ATTENTION (--prompt-attention above sets a known one) is refused before a model loads,
             // as the server refuses it, rather than when the CUDA executor reads it.
             try { TensorSharp.Graph.PromptAttentionConfig.FromEnvironment(); }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine("Configuration error: " + ex.Message);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+            // Likewise TS_DIFFUSION_PRODUCTS (--diffusion-products), and an int8 route asked of a backend without one.
+            try
+            {
+                string ignored = TensorSharp.Graph.DiffusionProductsConfig.IgnoredOn(
+                    TensorSharp.Graph.DiffusionProductsConfig.FromEnvironment(), backendStr);
+                if (ignored != null) Console.Error.WriteLine(ignored);
+            }
             catch (ArgumentException ex)
             {
                 Console.Error.WriteLine("Configuration error: " + ex.Message);

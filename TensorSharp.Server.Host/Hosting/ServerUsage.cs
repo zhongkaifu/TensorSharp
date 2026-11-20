@@ -282,6 +282,17 @@ namespace TensorSharp.Server.Host.Hosting
                     "(an already-set value is used when the flag is absent).",
                     TensorSharp.Graph.PromptAttentionConfig.Flag + " f16"),
             }),
+            ("Diffusion products (--backend ggml_cuda)", new[]
+            {
+                new OptionHelp(TensorSharp.Graph.DiffusionProductsConfig.Flag + " <p>",
+                    "Arithmetic of a diffusion model's wide weight products on --backend ggml_cuda (MiniMax-H3-Image, " +
+                    "MiniMax-H3 video, Qwen-Image 2.1): bf16 (the default: the products as stored, BF16 and Q4_K on cuBLAS " +
+                    "BF16), int8 (the DiT's projections on int8 tensor cores, each weight row and token rounded to 8 bits: " +
+                    "faster, and it changes the picture) or int8-all (int8 plus the VAE decoders' F16 projections). Other " +
+                    "backends run the products as stored. Config key diffusion-products; sets TS_DIFFUSION_PRODUCTS (an " +
+                    "already-set value is used when the flag is absent). Replaces TS_H3_INT8_MATMUL.",
+                    TensorSharp.Graph.DiffusionProductsConfig.Flag + " int8"),
+            }),
             ("Responses API store", new[]
             {
                 new OptionHelp("--redis-url <url>",

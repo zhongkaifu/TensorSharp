@@ -188,7 +188,7 @@ namespace
 {
 // A wide product of a BF16 weight (MiniMax-H3-Image's DiT, read from its BF16 release)
 // on cuBLAS: the weight as it is, the activations narrowed to BF16, F32 accumulation;
-// with TS_H3_INT8_MATMUL=1 on int8 tensor cores, as for Q4_K (tsg_cuda_bf16_gemm). Only
+// with --diffusion-products int8 on int8 tensor cores, as for Q4_K (tsg_cuda_bf16_gemm). Only
 // bound weights: a computed left operand stays ggml's.
 bool h3_bf16_matmul_wants(const ggml_tensor* node)
 {
@@ -485,7 +485,7 @@ bool h3_fused_run(ggml_tensor* node, const std::unordered_set<const ggml_tensor*
         const ggml_tensor* w = node->src[0];
         const ggml_tensor* x = node->src[1];
         // A BF16 weight is the DiT's fc2 reading fc1's [gate | value] (no x bias): the
-        // BF16 cuBLAS route or, with TS_H3_INT8_MATMUL, the int8 one, as h3_bf16_matmul_run.
+        // BF16 cuBLAS route or, with --diffusion-products int8, the int8 one, as h3_bf16_matmul_run.
         if (w->type == GGML_TYPE_BF16)
             return node->src[2] == nullptr &&
                    tsg_cuda_bf16_gemm(w->data, w->ne[0], w->ne[1], f(x), h3_rows(x), p.f0 != 0.0f ? 1 : 0, x->ne[1],
