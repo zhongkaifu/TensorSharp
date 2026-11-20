@@ -379,8 +379,8 @@ namespace TensorSharp.Cuda
             if (FlashCaches(kc, vc, d, out bool q8Rows) && (trimmed ? mask.Trimmed : mask.Pattern) == MaskPattern.Causal
                 && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && (q8Rows ? flash.RunsAttentionQ8(d) : flash.RunsAttention(d)))
             {
-                // A marked prompt chunk's rows may attend in 8 bits (TryPromptAttention8, --prompt-attention int8); else, and for
-                // every other row, the 16-bit kernels below.
+                // A marked prompt chunk's rows attend in 8 bits where they can (TryPromptAttention8: the default, or
+                // --prompt-attention int8); else, and for every other row, the 16-bit kernels below.
                 if (promptChunk && nq > WidestVerifyWindow && q8Rows && PromptAttention8Enabled)
                     WarnAttn8DeclinedOnce("the K/V cache is q8_0 (the 8-bit kernels read an F16 cache)");
                 if (promptChunk && nq > WidestVerifyWindow && !q8Rows

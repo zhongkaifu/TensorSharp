@@ -447,7 +447,7 @@ static int Usage(string error)
     Console.Error.WriteLine("         [--arms f16,8bit | name=setting,...] [--kv-cache-dtype f16|q8_0] [--reference RUN.jsonl:ARM]");
     Console.Error.WriteLine("         [--kinds ppl,continue,greedy,chat,layers] [--groups retrieval,gsm8k,humaneval] [--ids REGEX]");
     Console.Error.WriteLine("         [--max-tokens N] [--prefill-chunk 2048] [--score-chunk 512] [--topk 32] [--label TEXT] [--resume]");
-    Console.Error.WriteLine("Arm settings: default (the process's --prompt-attention), f16 (the 16-bit prompt kernel), f32acc (the prompt");
+    Console.Error.WriteLine("Arm settings: default (the process's --prompt-attention: int8 where it runs unless set), f16 (the 16-bit prompt kernel), f32acc (the prompt");
     Console.Error.WriteLine("  kernels with F32 accumulation), 8bit (the 8-bit prompt attention),");
     Console.Error.WriteLine("  q8act (the build's prompt attention; every NVFP4 product on the q8 matvec, so prompt rows keep q8 activations),");
     Console.Error.WriteLine("  f16+q8act / 8bit+q8act (that prompt attention with q8 activations).");
