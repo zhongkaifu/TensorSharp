@@ -163,6 +163,10 @@ internal static class MiniMaxH3ImageGoldens
 
     internal static IReadOnlyCollection<string> Lanes => s_lanes.Value.Keys;
 
+    /// <summary>Whether any lane froze <paramref name="caseName"/> from the fixture bytes <paramref name="fixtureSha256"/>.</summary>
+    internal static bool Froze(string caseName, string fixtureSha256) =>
+        s_lanes.Value.Values.Any(cases => cases.TryGetValue(caseName, out Case c) && c.FixtureSha256 == fixtureSha256);
+
     /// <summary>The frozen case for this lane; when this lane was never frozen, one frozen from the same fixture bytes (the
     /// synthetic Q4_K fixture quantizes to other bytes on x64 than on ARM64): the same backend's, on this runtime identifier
     /// first, else the reference lane's (ggml_cpu on the Mac that froze them), else any lane's. Null when none exists.</summary>

@@ -35,7 +35,10 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
     /// shapes; F32, F16 or BF16 projections only), as Comfy-Org ships the bf16 denoiser.</param>
     /// <param name="edit">Changes a tensor's values (row-major, ne0 fastest) before they are written: a test merges a LoRA
     /// delta into a projection this way, for a reference denoiser. Null writes the seed's values.</param>
-    internal MiniMaxH3ImageFixture(int projections, int seed = 2051, bool safetensors = false, Func<string, float[], float[]> edit = null)
+    /// <param name="pinnedQ4K">Take the Q4_K projections' bytes from <see cref="MiniMaxH3ImagePinnedQ4K"/> (the reference lane's
+    /// machine's quantization) instead of this machine's ggml, whose rounding differs with the CPU and the build.</param>
+    internal MiniMaxH3ImageFixture(int projections, int seed = 2051, bool safetensors = false, Func<string, float[], float[]> edit = null,
+        bool pinnedQ4K = false)
     {
         Projections = projections;
         Dir = Path.Combine(Path.GetTempPath(), "ts-h3img-" + Guid.NewGuid().ToString("N"));
@@ -49,7 +52,7 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
         else
         {
             DitPath = System.IO.Path.Combine(Dir, $"minimax_h3_image_tiny-{Name(projections)}.gguf");
-            Write(DitPath, Edited(Tensors(projections, seed), edit));
+            Write(DitPath, Edited(Tensors(projections, seed), edit), pinnedQ4K ? MiniMaxH3ImagePinnedQ4K.Encode : null);
         }
     }
 
@@ -76,7 +79,7 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
     internal static Dictionary<string, float[]> Values(int projections, int seed = 2051) =>
         Tensors(projections, seed).ToDictionary(t => t.Name, t => t.Data);
 
-    private static List<T> Tensors(int projections, int seed)
+    internal static List<T> Tensors(int projections, int seed)
     {
         var rng = new Random(seed);
         var tensors = new List<T>();
@@ -186,10 +189,10 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
     }
 
     /// <summary>A GGUF v3 without metadata, 32-byte aligned.</summary>
-    internal static void Write(string path, IReadOnlyList<T> tensors)
+    internal static void Write(string path, IReadOnlyList<T> tensors, Func<T, byte[]> encode = null)
     {
         static long Align(long value) => (value + 31) / 32 * 32;
-        byte[][] data = tensors.Select(Encode).ToArray();
+        byte[][] data = tensors.Select(encode ?? Encode).ToArray();
         using var stream = File.Create(path);
         using var writer = new BinaryWriter(stream, Encoding.UTF8);
         writer.Write(0x46554747u); writer.Write(3u); writer.Write((ulong)tensors.Count); writer.Write(0UL);

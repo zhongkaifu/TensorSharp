@@ -53,12 +53,23 @@ public sealed class MiniMaxH3ImageFrozenLegacyTests(ITestOutputHelper output)
     private void VerifyDenoiser(BackendType backend, string request, int format)
     {
         Pin(backend);
-        using var fx = new MiniMaxH3ImageFixture(format);
+        string caseName = MiniMaxH3ImageGoldens.DenoiserCase(request, format);
+        using var live = new MiniMaxH3ImageFixture(format);
+        string sha = MiniMaxH3ImageGoldens.FileSha(live.DitPath);
+        // ggml's Q4_K quantizer rounds otherwise on a CPU or build no lane was frozen on: rebuild the fixture from the
+        // reference lane's machine's bytes, and hold the runtime to that lane's outputs within the bound.
+        using var pinned = format == Q4_K && !MiniMaxH3ImageGoldens.Froze(caseName, sha)
+            ? new MiniMaxH3ImageFixture(format, pinnedQ4K: true) : null;
+        if (pinned != null)
+        {
+            output.WriteLine($"{caseName}: this machine quantizes the fixture to {sha}, which no lane froze; using the pinned Q4_K bytes");
+            sha = MiniMaxH3ImageGoldens.FileSha(pinned.DitPath);
+        }
+        MiniMaxH3ImageFixture fx = pinned ?? live;
         var family = MiniMaxH3ImageFamily.ForDenoiser(fx.DitPath);
         using var runtime = new MiniMaxH3ImageDenoiser(fx.DitPath, backend);
         var (steps, _) = MiniMaxH3ImageGoldens.Run(family, runtime, MiniMaxH3ImageGoldens.Named(request));
-        MiniMaxH3ImageGoldens.Check(MiniMaxH3ImageGoldens.DenoiserCase(request, format), MiniMaxH3ImageGoldens.LaneKey(backend),
-            MiniMaxH3ImageGoldens.FileSha(fx.DitPath), steps, Bound(format), output.WriteLine);
+        MiniMaxH3ImageGoldens.Check(caseName, MiniMaxH3ImageGoldens.LaneKey(backend), sha, steps, Bound(format), output.WriteLine);
         // One program for the request's six steps (the head, latent and time embedding are its inputs).
         Assert.Equal(1, runtime.Compiles);
     }
