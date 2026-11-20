@@ -533,13 +533,15 @@ namespace TensorSharp.Models
         /// at a fresh slot's size, and MAX_CONTEXT bounds the window without committing it. Allocated at an explicit 131,072-token
         /// window, Qwen3.8-27B's primary held 8.5 GB no request used (26,297 against 19,769 MiB at 32,768 tokens), and a 24 or
         /// 32 GB card then had no room for a 47K-token request's slot (CUDA error 2, HTTP 500; issue #376). An explicit
-        /// TS_KV_INITIAL_TOKENS still sizes it (<paramref name="initial"/> already holds it).
+        /// TS_KV_INITIAL_TOKENS (<paramref name="initial"/> holds it) bounds it but never makes it larger than a fresh slot: the
+        /// issue #383 configuration's TS_KV_INITIAL_TOKENS=8192 held an 8,192-cell primary (730 MiB of Qwen3.8-27B's F16 K/V
+        /// and states) no request ran in.
         /// </summary>
         private int PrimaryCacheAllocationLength(int initial, int maxContext)
         {
-            if (!SlotBoundPolicies || LayerSplitGroup != null || TensorSharp.Runtime.Scheduling.ExecutionOptions.FromEnvironment().KvInitialTokens > 0)
+            if (!SlotBoundPolicies || LayerSplitGroup != null)
                 return initial;
-            return Math.Max(1, Math.Min(maxContext, FreshSlotTokens));
+            return Math.Max(1, Math.Min(Math.Min(maxContext, FreshSlotTokens), initial));
         }
 
         /// <summary>The primary cache's cells, whichever cache is active (tests).</summary>
