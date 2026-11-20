@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.Linq;
 using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Models.MiniMaxH3Image;
+using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime.Scheduling.Diffusion;
 using Xunit;
@@ -98,7 +99,50 @@ public sealed class MiniMaxH3ImageResidencyTests
         new object[] { "A4500 Q6_K 2880 denoise", 2843L, DenoiserWorking(2880, fused: true, quantized: true, bf16Route: false) },
         new object[] { "A4500 Q6_K 3072 denoise", 3175L, DenoiserWorking(3072, fused: true, quantized: true, bf16Route: false) },
         new object[] { "A4500 Q6_K 3328 denoise", 3643L, DenoiserWorking(3328, fused: true, quantized: true, bf16Route: false) },
+        // ggml_cuda, A40 (stage S5, c011de25): bf16 with 4 references, the conditioner and the VAE released before the denoise,
+        // so the DiT alone is resident: 44,879,249,408 bytes peak less the context and the DiT's 40,233,055,464.
+        new object[] { "A40 bf16 2048 edit, 4 references, denoise", 4160L, EditDenoiserWorking(4, fused: true, quantized: false) },
     };
+
+    /// <summary>A 1024x1024 reference's vision copy (its size is all the estimate reads).</summary>
+    private static readonly RgbImage VisionCopy = new(1024, 1024, new float[1024 * 1024 * 3]);
+
+    /// <summary>The refs4 prompt of S5's edits (276 characters).</summary>
+    private static readonly string EditPrompt = new('x', 276);
+
+    /// <summary>An edit at 2048x2048 with <paramref name="references"/> 1024x1024 pictures (1,024 VAE rows and 1,024 merged
+    /// vision tokens each), as stage S5 measured them.</summary>
+    private static DiffusionWorkload EditWorkload(int references, string prompt = null) =>
+        new(new LatentShape(24, 1, 128, 128), Enumerable.Repeat(new LatentShape(24, 1, 64, 64), references).ToArray(), prompt ?? EditPrompt)
+        {
+            Pictures = Enumerable.Range(0, references).Select(i => new PresentedImage(VisionCopy, i)).ToArray(),
+        };
+
+    private static long EditDenoiserWorking(int references, bool fused, bool quantized, bool bf16Route = true, string prompt = null) =>
+        MiniMaxH3ImageDenoiser.WorkingBytesFor(Dit, MiniMaxH3ImageDenoiser.RowsOf(EditWorkload(references, prompt)), fused, quantized,
+            bf16Route, edit: true);
+
+    /// <summary>
+    /// Stage S5's A40 Q4_K_M edit with 16 references: everything stayed resident, its plan said a 44.2 GB peak and its decode
+    /// peaked at 45,611,155,456 bytes less the 271 MiB context (45.33 GB), 1.1 GB over. The edit term the denoiser's estimate
+    /// gained raises that plan by what it adds to the step (the DiT's workspace is held through the decode), which covers
+    /// the measured peak; and the estimate with it stays the text-to-image formula for a request with no references.
+    /// </summary>
+    [Fact]
+    public void TheEditTermCoversTheSixteenReferencePeakAndLeavesTextToImageAlone()
+    {
+        const long planPeak = 44_150_000_000L, measured = 45_611_155_456L - 271 * MiB;
+        const string refs16Prompt = "A white museum wall with sixteen framed pictures hung in a neat 4 by 4 grid, shown straight on. " +
+            "From the top left, row by row, the frames hold <Picture 1>, <Picture 2>, <Picture 3>, <Picture 4>, <Picture 5>, " +
+            "<Picture 6>, <Picture 7>, <Picture 8>, <Picture 9>, <Picture 10>, <Picture 11>, <Picture 12>, <Picture 13>, " +
+            "<Picture 14>, <Picture 15>, <Picture 16>, each picture complete inside its own thin black frame.";
+        long rows = MiniMaxH3ImageDenoiser.RowsOf(EditWorkload(16, refs16Prompt));
+        long added = MiniMaxH3ImageDenoiser.WorkingBytesFor(Dit, rows, fused: true, quantized: true, edit: true)
+                     - MiniMaxH3ImageDenoiser.WorkingBytesFor(Dit, rows, fused: true, quantized: true);
+        Assert.True(planPeak + added >= measured, $"plan {planPeak / 1e9:F2} + {added / 1e9:F2} GB < measured {measured / 1e9:F2} GB");
+        Assert.Equal(DenoiserWorking(2048, fused: true, quantized: true),
+            MiniMaxH3ImageDenoiser.WorkingBytesFor(Dit, MiniMaxH3ImageDenoiser.RowsOf(Workload(2048)), fused: true, quantized: true, edit: false));
+    }
 
     /// <summary>An estimate never falls short of what was measured (the plan would then overcommit the device), and stays
     /// within 2.5x of it (so a device that holds everything is not told otherwise).</summary>
