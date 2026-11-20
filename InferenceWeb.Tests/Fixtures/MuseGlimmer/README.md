@@ -42,8 +42,11 @@ bounds (`MuseGlimmerParity.GoldenSet`):
 * ggml_metal and MLX use the Metal set above;
 * ggml_cuda uses `cuda/`;
 * ggml_vulkan uses `vulkan/`;
-* direct CUDA, the managed backend and ggml_cpu take the set their first positions measure
-  closest to (`MuseGlimmerGoldenSetAffinityTests`).
+* direct CUDA uses the Metal set, which it measures closest to (`MuseGlimmerGoldenSetAffinityTests`:
+  0.05 nats, against 0.25 for Vulkan's and 0.75 for CUDA's);
+* the managed backend and ggml_cpu measure 1.6-1.9 nats from every set. They take Metal's by
+  default and do not meet the first-position bound. llama.cpp's own CPU build is 0.72-1.45
+  nats from Metal's set too, and its greedy continuations leave Metal's on all six prompts.
 
 Both sets were made on 2026-11-20 with the same llama.cpp commit d3c3e242c, the same
 prompts and the same generator, on an RTX PRO 4500 Blackwell (sm_120, driver 595.112.07,

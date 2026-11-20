@@ -79,9 +79,18 @@ internal static class MuseGlimmerParity
     internal static readonly IReadOnlyList<string> GoldenSets = new[] { "metal", "cuda", "vulkan" };
 
     /// <summary>
-    /// The golden set a backend is held to: ggml_metal and MLX Metal's, ggml_cuda CUDA's, ggml_vulkan Vulkan's. The backends
-    /// llama.cpp has no build of here take the set their first-position log-probabilities are measured closest to
-    /// (<see cref="MuseGlimmerGoldenSetAffinityTests"/>): direct CUDA, the managed backend and ggml_cpu.
+    /// The golden set a backend is held to: ggml_metal and MLX Metal's, ggml_cuda CUDA's, ggml_vulkan Vulkan's. The others were
+    /// measured (<see cref="MuseGlimmerGoldenSetAffinityTests"/>; RTX PRO 4500 Blackwell box, the mean over the five short prompts
+    /// of the first position's worst top-10 difference, against Metal's, CUDA's and Vulkan's sets):
+    /// <list type="bullet">
+    /// <item>direct CUDA: 0.045 / 0.752 / 0.247 (legacy), 0.054 / 0.749 / 0.246 (runtime). It is Metal's: its float
+    /// activations round like Metal's and MLX's.</item>
+    /// <item>the managed backend: 1.59 / 1.71 / 1.61 (legacy), 1.92 / 2.18 / 1.89 (runtime); ggml_cpu (x64): 1.86 / 2.04 / 1.86 and
+    /// 1.84 / 2.22 / 1.77. No set is near (the CPU products quantize their activations), so these take Metal's by default and
+    /// do not meet the first-position bound against any set (ggml_cpu: 626/640 and 630/640 teacher-forced). llama.cpp's own
+    /// CPU build (d3c3e242c, not committed) is 0.72-1.45 nats from Metal's set too, and its greedy continuations leave Metal's
+    /// on all six prompts.</item>
+    /// </list>
     /// </summary>
     internal static string GoldenSet(BackendType backend) => backend switch
     {
@@ -616,10 +625,10 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
 /// <summary>
 /// Which llama.cpp golden set a lane's arithmetic is closest to: on the backend the parity tests run on, the first generated
 /// position's top-10 log-probabilities of every golden prompt against every set (<see cref="MuseGlimmerParity.GoldenSets"/>),
-/// for the legacy model and the runtime family. On the backends assigned by this measurement (the ones llama.cpp has no build of
-/// here: direct CUDA, the managed backend, ggml_cpu) the assigned set (<see cref="MuseGlimmerParity.GoldenSet"/>) must be the
-/// closest one (the mean over the prompts of the per-prompt worst difference); ggml_metal, MLX, ggml_cuda and ggml_vulkan are
-/// held to their own backend's set by definition, and the numbers are only printed.
+/// for the legacy model and the runtime family. On direct CUDA, assigned by this measurement, the assigned set
+/// (<see cref="MuseGlimmerParity.GoldenSet"/>) must be the closest one (the mean over the prompts of the per-prompt worst
+/// difference). ggml_metal, MLX, ggml_cuda and ggml_vulkan are held to their own backend's set by definition, and the
+/// managed backend and ggml_cpu are far from every set (GoldenSet's notes), so for them the numbers are only printed.
 /// </summary>
 [Trait("Category", "Bench")]
 public sealed class MuseGlimmerGoldenSetAffinityTests(ITestOutputHelper output)
@@ -664,7 +673,7 @@ public sealed class MuseGlimmerGoldenSetAffinityTests(ITestOutputHelper output)
         string closest = means.OrderBy(kv => kv.Value).First().Key, assigned = MuseGlimmerParity.GoldenSet(backend);
         output.WriteLine($"{backend} {(runtime ? "runtime" : "legacy")}: mean " + string.Join(", ", means.Select(kv => $"{kv.Key} {kv.Value:F4}")) +
             $"; closest {closest}, assigned {assigned}");
-        if (backend is BackendType.Cuda or BackendType.Cpu or BackendType.GgmlCpu)
+        if (backend is BackendType.Cuda)
             Assert.Equal(closest, assigned);
     }
 }
