@@ -1402,6 +1402,85 @@ namespace
         return results[0] != nullptr;
     }
 
+    // A LoraLinear region on ggml_metal (a WideTokenProducts program) whose update costs less inside the base product
+    // than beside it: y = [W | U] . [x ; D x], one GEMM of depth K + R. D [K, R] is the parts' downs side by side along
+    // the rank; U [R, N] holds each slot's up in its part's rank columns of the slot's rows (zeros elsewhere), in the
+    // weight's type. W itself is only read: it is concatenated with U each step, never changed or merged, and the update
+    // stays U (D x), its terms summed after the weight's own. ggml-metal has no product that accumulates into a result,
+    // so beside the base the update's expand writes an [N, rows] F32 delta the add reads again with the product (16 bytes
+    // an element, plus the slots' concatenation for a stacked qkv); inside, the weight is copied once and the activations
+    // once with the shrink. The region takes whichever moves fewer bytes, an extension's zero blocks counted as products
+    // at about 25 multiply-adds a byte (the M5 Pro's GEMM rate over its memory bandwidth). A Q8_0, F16 or F32 weight
+    // (ggml-metal concatenates those). A Q8_0 U rounds the update by Q8_0's step, a few 1e-3 of the update and so far
+    // below the product's own rounding of its F16 activations. False: the region's ops run.
+    bool try_lower_lora_linear(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip,
+                               std::vector<ggml_tensor*>& results)
+    {
+#if defined(TSG_GGML_USE_METAL)
+        if (kind != FUSED_LORA_LINEAR || g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL || !g->wide_token_products)
+            return false;
+        if (ns < 4 || (ns - 2) % 2 != 0 || nip < 2) return false;
+        ggml_tensor* x = node_at(g, s[0]);
+        ggml_tensor* w = node_at(g, s[1]);
+        const int parts = (ns - 2) / 2;
+        const std::int64_t K = w->ne[0], N = w->ne[1], T = x->ne[1];
+        const std::int64_t mask = ip[0], slotRows = ip[1] > 0 ? ip[1] : N;
+        if (slotRows <= 0 || N % slotRows != 0 || N / slotRows > 3) return false;
+        const int slots = static_cast<int>(N / slotRows);
+        // Every slot has its part (a stacked qkv whose adapter leaves a third alone keeps its ops).
+        if (parts != slots || mask != (1LL << slots) - 1) return false;
+        if (w->type != GGML_TYPE_Q8_0 && w->type != GGML_TYPE_F16 && w->type != GGML_TYPE_F32) return false;
+        if (!ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1 || K % 32 != 0) return false;
+        if (x->type != GGML_TYPE_F32 || x->ne[0] != K || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float)) return false;
+        std::vector<ggml_tensor*> downs, ups;
+        std::int64_t R = 0;
+        for (int i = 0; i < parts; i++)
+        {
+            ggml_tensor* down = node_at(g, s[2 + 2 * i]);
+            ggml_tensor* up = node_at(g, s[3 + 2 * i]);
+            if ((down->type != GGML_TYPE_F16 && down->type != GGML_TYPE_F32) || up->type != down->type
+                || (i > 0 && down->type != downs[0]->type) || !ggml_is_contiguous(down) || !ggml_is_contiguous(up)
+                || down->ne[0] != K || up->ne[0] != down->ne[1] || up->ne[1] != slotRows || down->ne[2] != 1 || up->ne[2] != 1)
+                return false;
+            R += down->ne[1];
+            downs.push_back(down);
+            ups.push_back(up);
+        }
+        if (R % 32 != 0) return false;
+        const double wb = static_cast<double>(ggml_type_size(w->type)) / ggml_blck_size(w->type);
+        // Beside: the expand's write, the add's two reads and write; the slots' concatenation (2 k slots of rows read and
+        // written for k = 2 .. slots). Inside: W read and written with U, the GEMM's extra read of U; the activations and
+        // the shrink read and written once; U built from the ups (cast, placed, quantized); the zero blocks' products.
+        const double beside = 16.0 * N * T + 8.0 * slotRows * T * (slots * (slots + 1) / 2 - 1);
+        const double inside = 2.0 * wb * K * N + 2.0 * wb * R * N + 8.0 * (K + R) * T + 20.0 * R * N
+                              + static_cast<double>(slots - 1) * R / slots * N * T / 25.0;
+        if (inside >= beside) return false;
+        ggml_context* ctx = g->ctx;
+        ggml_tensor* D = downs[0];
+        for (int i = 1; i < parts; i++) D = ggml_concat(ctx, D, downs[static_cast<std::size_t>(i)], 1);
+        ggml_tensor* U = nullptr;
+        std::int64_t at = 0;
+        for (int i = 0; i < parts; i++)
+        {
+            ggml_tensor* u = ups[static_cast<std::size_t>(i)];
+            const std::int64_t r = u->ne[0];
+            if (u->type != GGML_TYPE_F32) u = ggml_cast(ctx, u, GGML_TYPE_F32);
+            if (parts > 1) u = ggml_pad_ext(ctx, u, static_cast<int>(at), static_cast<int>(R - at - r), 0, 0, 0, 0, 0, 0);
+            at += r;
+            U = U == nullptr ? u : ggml_concat(ctx, U, u, 1);
+        }
+        if (w->type != GGML_TYPE_F32) U = ggml_cpy(ctx, U, ggml_new_tensor_2d(ctx, w->type, R, N));
+        ggml_tensor* shrunk = ggml_mul_mat(ctx, D, x);   // [R, T]
+        ggml_mul_mat_set_prec(shrunk, GGML_PREC_F32);
+        ggml_tensor* y = ggml_mul_mat(ctx, ggml_concat(ctx, w, U, 0), ggml_concat(ctx, x, shrunk, 0));
+        results = { y };
+        return true;
+#else
+        (void)g; (void)kind; (void)s; (void)ns; (void)ip; (void)nip; (void)results;
+        return false;
+#endif
+    }
+
     // Whether this graph's backend runs region `kind` over these operands as one device operation; if so, records
     // the region (its ops are then skipped until its end).
     bool try_serve_region(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
@@ -2342,7 +2421,7 @@ TSG_EXPORT int TSGgml_GraphFusedBegin(void* handle, int kind, const int* srcs, i
         }
 #endif
         std::vector<ggml_tensor*> lowered;
-        if (try_lower_dit_attention(g, kind, srcs, nsrc, fp, nfp, lowered))
+        if (try_lower_dit_attention(g, kind, srcs, nsrc, fp, nfp, lowered) || try_lower_lora_linear(g, kind, srcs, nsrc, ip, nip, lowered))
         {
             DeviceRegion r;
             r.kind = kind;
