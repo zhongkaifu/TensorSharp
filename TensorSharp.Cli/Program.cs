@@ -691,12 +691,13 @@ namespace TensorSharp.Cli
                         }
                     case TensorSharp.Graph.DiffusionProductsConfig.Flag:
                         {
-                            // Read by the native CUDA products, as the server's ApplyDiffusionProductsCliFlag.
+                            // Read by the native CUDA products (getenv), as the server's ApplyDiffusionProductsCliFlag: published
+                            // in the C runtime's table too, which Environment.SetEnvironmentVariable does not reach on Unix.
                             string productsStr = args[++i];
                             if (!TensorSharp.Graph.DiffusionProductsConfig.TryParse(productsStr, out var products))
                                 throw new ArgumentException(TensorSharp.Graph.DiffusionProductsConfig.InvalidValueMessage(
                                     TensorSharp.Graph.DiffusionProductsConfig.Flag, productsStr));
-                            Environment.SetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable,
+                            TensorSharp.Runtime.NativeEnvironment.Set(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable,
                                 TensorSharp.Graph.DiffusionProductsConfig.Name(products));
                             break;
                         }

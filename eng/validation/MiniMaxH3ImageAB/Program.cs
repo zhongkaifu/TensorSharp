@@ -73,7 +73,8 @@ if (Value(TensorSharp.Graph.DiffusionProductsConfig.Flag) is { } productsValue)
 {
     if (!TensorSharp.Graph.DiffusionProductsConfig.TryParse(productsValue, out var products))
         throw new ArgumentException(TensorSharp.Graph.DiffusionProductsConfig.InvalidValueMessage(TensorSharp.Graph.DiffusionProductsConfig.Flag, productsValue));
-    Environment.SetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable, TensorSharp.Graph.DiffusionProductsConfig.Name(products));
+    // The native products read it with getenv (NativeEnvironment: the C runtime's table too).
+    TensorSharp.Runtime.NativeEnvironment.Set(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable, TensorSharp.Graph.DiffusionProductsConfig.Name(products));
 }
 TensorSharp.Graph.DiffusionProductsConfig.FromEnvironment();   // an unknown inherited value is refused before the load
 

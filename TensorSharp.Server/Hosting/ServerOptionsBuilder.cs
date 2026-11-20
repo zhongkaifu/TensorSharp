@@ -771,7 +771,9 @@ public static class ServerOptionsBuilder
         TensorSharp.Graph.DiffusionProductsPath? chosen = ReadDiffusionProductsCliFlag(args,
             Environment.GetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable));
         if (chosen is not { } path) return false;
-        Environment.SetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable,
+        // The native products read it with getenv: publish it in the C runtime's table too (NativeEnvironment), which
+        // Environment.SetEnvironmentVariable does not reach on Unix.
+        TensorSharp.Runtime.NativeEnvironment.Set(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable,
             TensorSharp.Graph.DiffusionProductsConfig.Name(path));
         return true;
     }

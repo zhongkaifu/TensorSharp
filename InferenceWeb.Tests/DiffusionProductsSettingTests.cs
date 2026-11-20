@@ -133,6 +133,28 @@ public sealed class DiffusionProductsSettingTests : IDisposable
         Assert.Contains("ggml_cuda", warning);
     }
 
+    /// <summary>The native products read the variable with getenv, which on Unix never sees
+    /// Environment.SetEnvironmentVariable: every place that publishes it goes through NativeEnvironment (the C runtime's
+    /// table too). A flag published the other way ran bf16 silently (found by the S10 CUDA smoke).</summary>
+    [Fact]
+    public void EveryPublisherSetsTheVariableWhereTheNativeProductsReadIt()
+    {
+        string root = AppContext.BaseDirectory;
+        while (root != null && !File.Exists(Path.Combine(root, "TensorSharp.slnx"))) root = Path.GetDirectoryName(root)!;
+        Assert.NotNull(root);
+        foreach (string file in new[]
+        {
+            Path.Combine(root, "TensorSharp.Cli", "Program.cs"),
+            Path.Combine(root, "TensorSharp.Server", "Hosting", "ServerOptionsBuilder.cs"),
+            Path.Combine(root, "eng", "validation", "MiniMaxH3ImageAB", "Program.cs"),
+        })
+        {
+            string text = File.ReadAllText(file);
+            Assert.Contains("NativeEnvironment.Set(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable", text);
+            Assert.DoesNotContain("SetEnvironmentVariable(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable", text);
+        }
+    }
+
     /// <summary>The variable it replaces is refused by name, and the refusal names the option and its values for the old
     /// variable's <c>1</c> and <c>all</c>.</summary>
     [Fact]
