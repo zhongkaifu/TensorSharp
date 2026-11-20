@@ -356,8 +356,9 @@ namespace TensorSharp.Models
                 Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
                     $"[vram-hold] {Config.Architecture} {label}: running {running}; retained {retained}; pooled {pooled}; primary {prim}; " +
                     $"spare ckpt states {Mib(spareStates)} MiB; parked recordings {_parkedRecordings.Count}; rings {rings} = {Mib(ringBytes)} MiB; " +
-                    $"model holds {Mib(held)} MiB; pool cached large {Mib(stats.LargeCachedBytes)} small {Mib(stats.CachedBytes - stats.LargeCachedBytes)} MiB; " +
-                    $"device free={Mib(cuda.GetMemoryInfo().freeBytes)} of {Mib(cuda.GetMemoryInfo().totalBytes)} MiB"));
+                    $"model holds {Mib(held)} MiB; recordings own {Mib(cuda.RecordingBytes)} MiB; pool live {Mib(cuda.LiveBytes)} MiB, " +
+                    $"cached large {Mib(stats.LargeCachedBytes)} ({cuda.DescribeLargeCache()}) small {Mib(stats.CachedBytes - stats.LargeCachedBytes)} MiB; " +
+                    $"{cuda.MemoryView.Describe()}"));
             }
             catch (Exception)
             {

@@ -418,9 +418,12 @@ namespace TensorSharp.Models
                 footprint = MeasureEndState(payloadKey);
                 RetainedByCopy++;
                 LastRetentionCopied = true;
+                LogDeviceHoldings($"{requestId} retained as a copy");
                 return true;
             }
-            return HolderPrefixCacheAdapter.TryCaptureDonate(this, requestId, payloadKey, length, out footprint);
+            bool donated = HolderPrefixCacheAdapter.TryCaptureDonate(this, requestId, payloadKey, length, out footprint);
+            LogDeviceHoldings($"{requestId} {(donated ? "retained" : "not retained")}");
+            return donated;
         }
 
         /// <summary>Finished requests retained as a copy of their slot (tests check the route engaged).</summary>

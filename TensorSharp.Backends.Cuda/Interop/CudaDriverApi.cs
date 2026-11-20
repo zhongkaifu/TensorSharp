@@ -33,6 +33,14 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName)]
         public static partial int cuDeviceGetAttribute(out int value, int attribute, int device);
 
+        /// <summary>The device's 16-byte UUID (NVML names the same GPU "GPU-" + its hex).</summary>
+        [LibraryImport(LibName, EntryPoint = "cuDeviceGetUuid_v2")]
+        public static partial int cuDeviceGetUuid(byte[] uuid, int device);
+
+        /// <summary>The device's PCI bus id ("0000:01:00.0"), NUL-terminated in <paramref name="pciBusId"/>.</summary>
+        [LibraryImport(LibName)]
+        public static partial int cuDeviceGetPCIBusId(byte[] pciBusId, int len, int device);
+
         [LibraryImport(LibName)]
         public static partial int cuCtxGetDevice(out int device);
 

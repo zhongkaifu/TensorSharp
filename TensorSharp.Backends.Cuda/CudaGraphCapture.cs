@@ -718,6 +718,9 @@ namespace TensorSharp.Cuda
                         keep.Add(t.CopyRef());
             }
 
+            long ownedBytes = 0;
+            foreach ((IntPtr _, long b) in owned) ownedBytes += b;
+            allocator.NoteRecordingBytes(ownedBytes);
             entries[key] = new Entry
             {
                 Exec = exec,
@@ -806,8 +809,13 @@ namespace TensorSharp.Cuda
             entry.InputHidden.Dispose();
             foreach (IntPtr ptr in entry.Claimed)
                 allocator.Unclaim(ptr);
+            long ownedBytes = 0;
             foreach ((IntPtr ptr, long bytes) in entry.OwnedBlocks)
+            {
+                ownedBytes += bytes;
                 allocator.ReturnDeviceMemory(ptr, bytes);
+            }
+            allocator.NoteRecordingBytes(-ownedBytes);
             foreach (IntPtr host in entry.OwnedHostBuffers)
                 CudaStorage.FreeDonatedHostBuffer(host);
             if (Log)

@@ -2865,8 +2865,8 @@ namespace TensorSharp.Cuda
                 _stagingArena = IntPtr.Zero;
                 _stagingBytes = 0;
             }
-            CudaDriverApi.cuMemGetInfo(out UIntPtr free, out _).ThrowOnError();
-            long shortfall = Math.Min(need, StagingArenaCapBytes) - ((long)free.ToUInt64() - StagingFreeFloorBytes);
+            long free = cuda.FreeDeviceBytes();   // dedicated memory (DeviceMemoryView), not WDDM shared memory
+            long shortfall = Math.Min(need, StagingArenaCapBytes) - (free - StagingFreeFloorBytes);
             if (shortfall > 0)
             {
                 // The memory pool keeps the blocks earlier steps returned: release what the arena lacks, the least
@@ -2874,9 +2874,9 @@ namespace TensorSharp.Cuda
                 // experts one at a time). The blocks the steps rent again stay cached.
                 cuda.TrimLargeCache(shortfall);
                 cuda.Context.MakeCurrent();
-                CudaDriverApi.cuMemGetInfo(out free, out _).ThrowOnError();
+                free = cuda.FreeDeviceBytes();
             }
-            long room = Math.Min(StagingArenaCapBytes, (long)free.ToUInt64() - StagingFreeFloorBytes);
+            long room = Math.Min(StagingArenaCapBytes, free - StagingFreeFloorBytes);
             if (ShortChunkArenaSlotsForTests > 0) room = Math.Min(room, ShortChunkArenaSlotsForTests * perExpert);
             long bytes = Math.Min(need, room) / perExpert * perExpert;
             if (bytes < perExpert) return false;

@@ -74,11 +74,16 @@ namespace TensorSharp.Cuda
         /// caching them (TENSORSHARP_CUDA_POOL_MIN_FREE_MB): a trim leaves at least this much beside the allocation. One that
         /// left the device below it turned every later return into a synchronizing cuMemFree and every rent of that size into
         /// a cuMemAlloc (about 1,100 such frees within two seconds of a 24K-token prompt on an RTX PRO 4500).</param>
+        /// <param name="budgetShortfall">Where an allocation past the device's dedicated memory or budget succeeds instead of
+        /// failing (WDDM spills it to system memory; DeviceMemoryView.AllocationsMaySpill): the bytes an allocation of the
+        /// given size would pass it by, with <paramref name="freeReserveBytes"/> kept free (0: it fits). Null elsewhere: there a
+        /// full device fails the allocation and the ladder climbs from that.</param>
         internal DeviceMemoryReclaimLadder(Func<long, IntPtr> tryAllocate, Action synchronize, Func<long, long> trimLarge,
             Func<long> drainSmall, Func<IReadOnlyList<IDeviceMemoryReclaimer>> reclaimers, Func<bool> capturing,
             Action collectAndDrain, ReportOnce fullDrainReport, int deviceId, Action<string> trace = null,
-            long freeReserveBytes = 0)
+            long freeReserveBytes = 0, Func<long, long> budgetShortfall = null)
         {
+            _budgetShortfall = budgetShortfall;
             _trace = trace;
             _freeReserveBytes = Math.Max(0, freeReserveBytes);
             _tryAllocate = tryAllocate ?? throw new ArgumentNullException(nameof(tryAllocate));
@@ -102,11 +107,118 @@ namespace TensorSharp.Cuda
         internal long FullDrains => Interlocked.Read(ref _fullDrains);
 
         /// <summary>The allocation of <paramref name="bytes"/>, climbing the ladder when the device is full;
-        /// <see cref="IntPtr.Zero"/> when even the last resort made no room.</summary>
+        /// <see cref="IntPtr.Zero"/> when even the last resort made no room. Where an allocation past dedicated memory would
+        /// succeed (<c>budgetShortfall</c>), the cheap rungs give memory back first (<see cref="KeepWithinBudget"/>).</summary>
         internal IntPtr Allocate(long bytes)
         {
+            if (_budgetShortfall != null) KeepWithinBudget(bytes);
             IntPtr ptr = _tryAllocate(bytes);
             return ptr != IntPtr.Zero ? ptr : Climb(bytes);
+        }
+
+        private readonly Func<long, long> _budgetShortfall;
+        private long _budgetTrims, _budgetReclaims, _budgetPasses;
+
+        // Guard climbs to skip after one that freed nothing (nothing cached, no holder gave anything): an allocation past the
+        // budget is then placed anyway, and asking again at once would only synchronize the stream for nothing.
+        private int _budgetSkip;
+        private const int BudgetSkipAfterBarren = 32;
+
+        /// <summary>Allocations that would have passed dedicated memory and fit once cached blocks went back (rungs 1-2).</summary>
+        internal long BudgetTrims => Interlocked.Read(ref _budgetTrims);
+
+        /// <summary>Allocations that would have passed dedicated memory and fit once a reclaimer released memory (rung 3).</summary>
+        internal long BudgetReclaims => Interlocked.Read(ref _budgetReclaims);
+
+        /// <summary>Allocations placed past dedicated memory (or the budget): nothing left to give back made room.</summary>
+        internal long BudgetPasses => Interlocked.Read(ref _budgetPasses);
+
+        /// <summary>
+        /// Before an allocation that would pass the device's dedicated memory (or budget) less the free reserve, where such an
+        /// allocation succeeds instead of failing (issue #383: WDDM placed it in shared system memory, so no out-of-memory error
+        /// ever started the climb and every room check passed with dedicated memory full): rungs 1-3, each only while still
+        /// short - the cached large blocks the work stopped using, the shards' small blocks, then what registered holders give
+        /// up - and no last resort (the allocation then goes ahead; on a real out-of-memory error <see cref="Climb"/> runs as
+        /// before). Not while a graph is captured (the synchronize would abort it) nor inside another climb on this thread.
+        /// </summary>
+        private void KeepWithinBudget(long bytes)
+        {
+            long shortBy = _budgetShortfall(bytes);
+            if (shortBy <= 0) return;
+            if (_budgetSkip > 0)
+            {
+                _budgetSkip--;
+                Interlocked.Increment(ref _budgetPasses);
+                return;
+            }
+            if (t_climbs > 0 || _capturing())
+            {
+                Interlocked.Increment(ref _budgetPasses);
+                return;
+            }
+            t_climbs++;
+            long start = Stopwatch.GetTimestamp();
+            long trimmed = 0, drained = 0, released = 0;
+            int rung = 0;
+            bool made = false;
+            try
+            {
+                rung = 1;
+                _synchronize();
+                trimmed = _trimLarge(shortBy + TrimSlackBytes);
+                if (trimmed > 0 && (shortBy = _budgetShortfall(bytes)) <= 0)
+                {
+                    Interlocked.Increment(ref _budgetTrims);
+                    made = true;
+                    return;
+                }
+                rung = 2;
+                drained = _drainSmall();
+                if (drained > 0 && (shortBy = _budgetShortfall(bytes)) <= 0)
+                {
+                    Interlocked.Increment(ref _budgetTrims);
+                    made = true;
+                    return;
+                }
+                if (_reclaimers() is { Count: > 0 } reclaimers)
+                {
+                    rung = 3;
+                    foreach (IDeviceMemoryReclaimer reclaimer in reclaimers)
+                    {
+                        long got = reclaimer.Reclaim(shortBy);
+                        if (got > 0) released += got;
+                        _synchronize();
+                        long again = _trimLarge(shortBy + TrimSlackBytes);
+                        trimmed += again;
+                        if ((got > 0 || again > 0) && (shortBy = _budgetShortfall(bytes)) <= 0)
+                        {
+                            Interlocked.Increment(ref _budgetReclaims);
+                            made = true;
+                            return;
+                        }
+                    }
+                }
+                Interlocked.Increment(ref _budgetPasses);
+                if (trimmed == 0 && drained == 0 && released == 0) _budgetSkip = BudgetSkipAfterBarren;
+            }
+            finally
+            {
+                t_climbs--;
+                if (_trace != null)
+                {
+                    try
+                    {
+                        _trace($"[vram] GPU {_deviceId}: {Mib(bytes)} MiB would pass dedicated memory; rung {rung}"
+                            + (made ? " kept it within" : $" left it {Mib(Math.Max(0, shortBy))} MiB past")
+                            + $" (trimmed {Mib(trimmed)} MiB of large blocks, {Mib(drained)} MiB of small blocks"
+                            + $", holders released {Mib(released)} MiB) in {Ms(start):F1} ms");
+                    }
+                    catch (Exception)
+                    {
+                        // Diagnostics must never break inference.
+                    }
+                }
+            }
         }
 
         private IntPtr Climb(long bytes)
