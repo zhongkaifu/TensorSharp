@@ -27,6 +27,15 @@ namespace TensorSharp.Server.RequestParsers
     /// precedence rule the client cannot see.
     /// </para>
     /// <para>
+    /// A request that sends neither asks to think when it names a reasoning level other
+    /// than <c>none</c> (<c>reasoning_effort</c>, see <see cref="ReasoningEffortParser"/>):
+    /// that is how OpenAI's reasoning models read the field, and what OpenAI SDK clients
+    /// send for it. Microsoft.Extensions.AI's <c>ChatOptions.Reasoning</c> sends
+    /// <c>reasoning_effort</c> alone, and its thinking was off here (issue #386). An explicit
+    /// switch is the more specific instruction, so it decides when both are sent:
+    /// <c>"think": false</c> with <c>"reasoning_effort": "high"</c> does not think.
+    /// </para>
+    /// <para>
     /// The other <c>chat_template_kwargs</c> keys are not passed to the template: the
     /// prompt has to be the same for every renderer and for the shared-prefix cache, and
     /// a key only one template reads would split both. They are returned in
@@ -40,14 +49,24 @@ namespace TensorSharp.Server.RequestParsers
         public const string EnableThinkingKwarg = "enable_thinking";
 
         /// <summary>
-        /// Resolve the switch. Absent everywhere is "off", the endpoint's default.
-        /// Returns false with <paramref name="error"/> set for a value of the wrong type
-        /// or two values that disagree; the caller answers that with HTTP 400.
+        /// Resolve the switch: <c>think</c> or <c>chat_template_kwargs.enable_thinking</c>,
+        /// else on when the request names a reasoning level other than <c>none</c>, else
+        /// "off", the endpoint's default. Returns false with <paramref name="error"/> set for
+        /// a value of the wrong type or two values that disagree; the caller answers that
+        /// with HTTP 400.
         /// </summary>
         public static bool TryParse(JsonElement body, out bool think, out IReadOnlyList<string> ignoredKwargs,
             out string? error)
+            => TryParse(body, out think, out _, out ignoredKwargs, out error);
+
+        /// <inheritdoc cref="TryParse(JsonElement, out bool, out IReadOnlyList{string}, out string?)"/>
+        /// <param name="fromReasoningEffort">True when no switch was sent and
+        /// <paramref name="think"/> is on because the request names a reasoning level.</param>
+        public static bool TryParse(JsonElement body, out bool think, out bool fromReasoningEffort,
+            out IReadOnlyList<string> ignoredKwargs, out string? error)
         {
             think = false;
+            fromReasoningEffort = false;
             ignoredKwargs = Array.Empty<string>();
             error = null;
             if (body.ValueKind != JsonValueKind.Object)
@@ -84,7 +103,9 @@ namespace TensorSharp.Server.RequestParsers
                 return false;
             }
 
-            think = thinkField ?? enableThinking ?? false;
+            bool? requested = thinkField ?? enableThinking;
+            fromReasoningEffort = requested == null && ReasoningEffortParser.AsksToReason(body);
+            think = requested ?? fromReasoningEffort;
             return true;
         }
 

@@ -191,7 +191,10 @@ public sealed partial class OpenAIResponsesAdapter
                 .ConfigureAwait(false);
             return;
         }
-        bool enableThinking = body.TryGetProperty("reasoning", out var reasoningEl) && reasoningEl.ValueKind == JsonValueKind.Object;
+        // A `reasoning` object asks for thinking, except at OpenAI's "none" level, which asks
+        // not to reason (Microsoft.Extensions.AI sends ReasoningEffort.None so).
+        bool enableThinking = body.TryGetProperty("reasoning", out var reasoningEl) && reasoningEl.ValueKind == JsonValueKind.Object
+            && !ReasoningEffortParser.AsksNotToReason(body);
         // `reasoning.effort` is the Responses API spelling of reasoning_effort.
         if (!ReasoningEffortParser.TryParse(body, out string? reasoningEffort, out string? reasoningEffortError))
         {
@@ -463,6 +466,11 @@ public sealed partial class OpenAIResponsesAdapter
             var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools,
                 FinishReasonMapper.IsTruncated(pipelineFinishReason));
 
+            // The reasoning the parser separated goes first, as its own item (with thinking
+            // off too, as Chat Completions returns a thinking-off reply's stray reasoning).
+            if (!string.IsNullOrEmpty(parsed.Thinking))
+                output.Add(OpenAIResponsesFactory.ReasoningItem(OpenAIResponsesFactory.NewReasoningItemId(), parsed.Thinking, itemStatus));
+
             if (!string.IsNullOrEmpty(parsed.Content))
                 output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), knowledge.Normalize(parsed.Content), itemStatus));
 
@@ -537,7 +545,17 @@ public sealed partial class OpenAIResponsesAdapter
 
         var buffer = bufferForStructured ? new StringBuilder() : null;
         string? messageItemId = null;
+        int messageIndex = -1;
         var messageText = new StringBuilder();
+        // The open reasoning item: opened by a reasoning piece, closed by the next answer
+        // piece (or the end), as OpenAI streams a reasoning item before the message it led
+        // to. Reasoning after the answer has started (a later round of a tool loop) opens
+        // another one at the next output_index.
+        string? reasoningItemId = null;
+        int reasoningIndex = -1;
+        var reasoningText = new StringBuilder();
+        // Items closed before the end, by output_index; the response lists every item so.
+        var closedItems = new SortedList<int, object>();
         var toolCalls = new List<ToolCall>();
         int outputIndex = 0;
         int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0, reasoningTokens = 0;
@@ -558,18 +576,58 @@ public sealed partial class OpenAIResponsesAdapter
                 return;
             }
 
+            await CloseReasoningAsync().ConfigureAwait(false);
             if (messageItemId == null)
             {
                 messageItemId = OpenAIResponsesFactory.NewMessageItemId();
+                messageIndex = outputIndex++;
                 await SseWriter.WriteNamedEventAsync(ctx.Response, "response.output_item.added",
-                    OpenAIResponsesFactory.OutputItemAdded(outputIndex, OpenAIResponsesFactory.OutputMessageItem(messageItemId, "")), ctx.RequestAborted).ConfigureAwait(false);
+                    OpenAIResponsesFactory.OutputItemAdded(messageIndex, OpenAIResponsesFactory.OutputMessageItem(messageItemId, "")), ctx.RequestAborted).ConfigureAwait(false);
                 await SseWriter.WriteNamedEventAsync(ctx.Response, "response.content_part.added",
-                    OpenAIResponsesFactory.ContentPartAdded(messageItemId, outputIndex, 0), ctx.RequestAborted).ConfigureAwait(false);
+                    OpenAIResponsesFactory.ContentPartAdded(messageItemId, messageIndex, 0), ctx.RequestAborted).ConfigureAwait(false);
             }
 
             messageText.Append(chunk);
             await SseWriter.WriteNamedEventAsync(ctx.Response, "response.output_text.delta",
-                OpenAIResponsesFactory.OutputTextDelta(messageItemId, outputIndex, 0, chunk), ctx.RequestAborted).ConfigureAwait(false);
+                OpenAIResponsesFactory.OutputTextDelta(messageItemId, messageIndex, 0, chunk), ctx.RequestAborted).ConfigureAwait(false);
+        }
+
+        // Reasoning streams as it is separated, as Chat Completions streams reasoning_content.
+        async Task EmitReasoningAsync(string? chunk)
+        {
+            if (string.IsNullOrEmpty(chunk))
+                return;
+            if (reasoningItemId == null)
+            {
+                reasoningItemId = OpenAIResponsesFactory.NewReasoningItemId();
+                reasoningIndex = outputIndex++;
+                await SseWriter.WriteNamedEventAsync(ctx.Response, "response.output_item.added",
+                    OpenAIResponsesFactory.OutputItemAdded(reasoningIndex,
+                        OpenAIResponsesFactory.ReasoningItem(reasoningItemId, "", "in_progress")), ctx.RequestAborted).ConfigureAwait(false);
+                await SseWriter.WriteNamedEventAsync(ctx.Response, "response.reasoning_summary_part.added",
+                    OpenAIResponsesFactory.ReasoningSummaryPartAdded(reasoningItemId, reasoningIndex, 0), ctx.RequestAborted).ConfigureAwait(false);
+            }
+
+            reasoningText.Append(chunk);
+            await SseWriter.WriteNamedEventAsync(ctx.Response, "response.reasoning_summary_text.delta",
+                OpenAIResponsesFactory.ReasoningSummaryTextDelta(reasoningItemId, reasoningIndex, 0, chunk), ctx.RequestAborted).ConfigureAwait(false);
+        }
+
+        async Task CloseReasoningAsync(string status = "completed")
+        {
+            if (reasoningItemId == null)
+                return;
+            string text = reasoningText.ToString();
+            await SseWriter.WriteNamedEventAsync(ctx.Response, "response.reasoning_summary_text.done",
+                OpenAIResponsesFactory.ReasoningSummaryTextDone(reasoningItemId, reasoningIndex, 0, text), ctx.RequestAborted).ConfigureAwait(false);
+            await SseWriter.WriteNamedEventAsync(ctx.Response, "response.reasoning_summary_part.done",
+                OpenAIResponsesFactory.ReasoningSummaryPartDone(reasoningItemId, reasoningIndex, 0, text), ctx.RequestAborted).ConfigureAwait(false);
+            object item = OpenAIResponsesFactory.ReasoningItem(reasoningItemId, text, status);
+            await SseWriter.WriteNamedEventAsync(ctx.Response, "response.output_item.done",
+                OpenAIResponsesFactory.OutputItemDone(reasoningIndex, item), ctx.RequestAborted).ConfigureAwait(false);
+            closedItems.Add(reasoningIndex, item);
+            reasoningItemId = null;
+            reasoningText.Clear();
         }
 
         await foreach (var update
@@ -589,16 +647,18 @@ public sealed partial class OpenAIResponsesAdapter
                 if (update.IsParsed)
                 {
                     // Pre-separated by the skills loop: the tool markup our parser
-                    // would look for is already gone. (Reasoning is dropped here for
-                    // the same reason the parsed branch below drops it — this API
-                    // surfaces no reasoning item.)
+                    // would look for is already gone, and the reasoning arrives on its
+                    // own field.
                     sawParsedUpdate = true;
                     if (update.ParsedToolCalls is { Count: > 0 })
                         toolCalls.AddRange(update.ParsedToolCalls);
                     if (bufferForStructured)
                         buffer!.Append(update.Piece);
                     else
+                    {
+                        await EmitReasoningAsync(update.ThinkingPiece).ConfigureAwait(false);
                         await EmitDeltaAsync(update.Piece).ConfigureAwait(false);
+                    }
                     continue;
                 }
 
@@ -613,6 +673,7 @@ public sealed partial class OpenAIResponsesAdapter
                     var parsed = parser.Add(update.Piece, false);
                     if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
                         toolCalls = [.. parsed.ToolCalls];
+                    await EmitReasoningAsync(parsed.Thinking).ConfigureAwait(false);
                     await EmitDeltaAsync(parsed.Content).ConfigureAwait(false);
                     continue;
                 }
@@ -661,25 +722,29 @@ public sealed partial class OpenAIResponsesAdapter
             var finalParsed = parser.Add("", true);
             if (finalParsed.ToolCalls != null && finalParsed.ToolCalls.Count > 0)
                 toolCalls = [.. finalParsed.ToolCalls];
+            await EmitReasoningAsync(finalParsed.Thinking).ConfigureAwait(false);
             await EmitDeltaAsync(finalParsed.Content).ConfigureAwait(false);
         }
 
         if (knowledgeAnswer != null)
             await EmitDeltaAsync(knowledge.Normalize(knowledgeAnswer.ToString(), structured: responseFormat != null), flushKnowledge: true).ConfigureAwait(false);
 
+        // Reasoning still open at the end was cut short with the response when it is incomplete.
+        await CloseReasoningAsync(itemStatus).ConfigureAwait(false);
+
         if (messageItemId != null)
         {
             await SseWriter.WriteNamedEventAsync(ctx.Response, "response.output_text.done",
-                OpenAIResponsesFactory.OutputTextDone(messageItemId, outputIndex, 0, messageText.ToString()), ctx.RequestAborted).ConfigureAwait(false);
+                OpenAIResponsesFactory.OutputTextDone(messageItemId, messageIndex, 0, messageText.ToString()), ctx.RequestAborted).ConfigureAwait(false);
             await SseWriter.WriteNamedEventAsync(ctx.Response, "response.content_part.done",
-                OpenAIResponsesFactory.ContentPartDone(messageItemId, outputIndex, 0, messageText.ToString()), ctx.RequestAborted).ConfigureAwait(false);
+                OpenAIResponsesFactory.ContentPartDone(messageItemId, messageIndex, 0, messageText.ToString()), ctx.RequestAborted).ConfigureAwait(false);
 
             var finishedItem = OpenAIResponsesFactory.OutputMessageItem(messageItemId, messageText.ToString(), itemStatus);
             await SseWriter.WriteNamedEventAsync(ctx.Response, "response.output_item.done",
-                OpenAIResponsesFactory.OutputItemDone(outputIndex, finishedItem), ctx.RequestAborted).ConfigureAwait(false);
-            output.Add(finishedItem);
-            outputIndex++;
+                OpenAIResponsesFactory.OutputItemDone(messageIndex, finishedItem), ctx.RequestAborted).ConfigureAwait(false);
+            closedItems.Add(messageIndex, finishedItem);
         }
+        output.AddRange(closedItems.Values);
 
         foreach (var call in toolCalls)
         {

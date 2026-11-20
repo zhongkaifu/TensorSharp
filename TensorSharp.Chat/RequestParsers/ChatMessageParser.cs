@@ -12,6 +12,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Server.Hosting;
@@ -558,19 +559,32 @@ namespace TensorSharp.Server.RequestParsers
             if (inputEl.ValueKind != JsonValueKind.Array)
                 return messages;
 
+            // A reasoning item a client sends back (the one a response returned before its
+            // message) is that assistant message's reasoning, as reasoning_content is on a
+            // Chat Completions history message. Held until the message it precedes.
+            string pendingReasoning = null;
             foreach (var itemEl in inputEl.EnumerateArray())
             {
                 // Only message-shaped items are supported; other item types
-                // (function_call, function_call_output, reasoning, ...) are
-                // ignored for this MVP surface - counted so the drop is
-                // reported below rather than happening in silence.
+                // (function_call, function_call_output, ...) are ignored for this
+                // MVP surface - counted so the drop is reported below rather than
+                // happening in silence. A reasoning item no assistant message follows
+                // is counted the same way.
                 string itemType = itemEl.TryGetProperty("type", out var t) ? t.GetString() : "message";
+                if (itemType == "reasoning")
+                {
+                    if (pendingReasoning != null)
+                        CountSkipped(ref skippedItems, itemType);
+                    pendingReasoning = ResponsesReasoningText(itemEl);
+                    continue;
+                }
                 if (itemType != "message")
                 {
-                    skippedItems ??= new Dictionary<string, int>(StringComparer.Ordinal);
-                    string key = itemType ?? "(none)";
-                    skippedItems.TryGetValue(key, out int seen);
-                    skippedItems[key] = seen + 1;
+                    // The reasoning of a round this surface does not take (a function call's).
+                    if (pendingReasoning != null)
+                        CountSkipped(ref skippedItems, "reasoning");
+                    pendingReasoning = null;
+                    CountSkipped(ref skippedItems, itemType);
                     continue;
                 }
 
@@ -578,6 +592,14 @@ namespace TensorSharp.Server.RequestParsers
                 {
                     Role = itemEl.TryGetProperty("role", out var r) ? r.GetString() : "user",
                 };
+                if (pendingReasoning != null)
+                {
+                    if (msg.Role == "assistant")
+                        msg.Thinking = pendingReasoning.Length > 0 ? pendingReasoning : null;
+                    else
+                        CountSkipped(ref skippedItems, "reasoning");
+                    pendingReasoning = null;
+                }
 
                 if (CacheControlParser.TryParse(itemEl, out var itemMarker))
                     msg.CacheControl = itemMarker;
@@ -665,6 +687,8 @@ namespace TensorSharp.Server.RequestParsers
                 messages.Add(msg);
             }
 
+            if (pendingReasoning != null)
+                CountSkipped(ref skippedItems, "reasoning");
             if (skippedItems != null)
             {
                 logger?.LogWarning(LogEventIds.RequestContentDropped,
@@ -681,6 +705,39 @@ namespace TensorSharp.Server.RequestParsers
                     droppedImages);
             }
             return messages;
+        }
+
+        private static void CountSkipped(ref Dictionary<string, int> skippedItems, string itemType)
+        {
+            skippedItems ??= new Dictionary<string, int>(StringComparer.Ordinal);
+            string key = itemType ?? "(none)";
+            skippedItems.TryGetValue(key, out int seen);
+            skippedItems[key] = seen + 1;
+        }
+
+        /// <summary>
+        /// The text of a Responses <c>reasoning</c> item: its <c>summary_text</c> parts (what
+        /// this server and OpenAI's API return, and what Microsoft.Extensions.AI sends back),
+        /// else its <c>reasoning_text</c> content parts (other servers' raw reasoning).
+        /// Empty when it has neither, as an item that carries only encrypted content does.
+        /// </summary>
+        private static string ResponsesReasoningText(JsonElement item)
+        {
+            static string Join(JsonElement item, string field, string partType)
+            {
+                if (!item.TryGetProperty(field, out JsonElement parts) || parts.ValueKind != JsonValueKind.Array)
+                    return "";
+                var sb = new StringBuilder();
+                foreach (JsonElement part in parts.EnumerateArray())
+                    if (part.ValueKind == JsonValueKind.Object
+                        && part.TryGetProperty("type", out JsonElement type) && type.ValueKind == JsonValueKind.String
+                        && type.GetString() == partType
+                        && part.TryGetProperty("text", out JsonElement text) && text.ValueKind == JsonValueKind.String)
+                        sb.Append(text.GetString());
+                return sb.ToString();
+            }
+            string summary = Join(item, "summary", "summary_text");
+            return summary.Length > 0 ? summary : Join(item, "content", "reasoning_text");
         }
 
         /// <summary>

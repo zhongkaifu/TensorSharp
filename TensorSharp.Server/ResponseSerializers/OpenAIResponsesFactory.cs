@@ -15,7 +15,7 @@ namespace TensorSharp.Server.ResponseSerializers;
 /// Builders for the OpenAI-compatible Responses API surface
 /// (<c>POST /v1/responses</c>). Separate from <see cref="OpenAIResponseFactory"/>
 /// because the wire shape is materially different: output is a typed item
-/// list (<c>message</c>/<c>function_call</c>) instead of <c>choices</c>, and
+/// list (<c>reasoning</c>/<c>message</c>/<c>function_call</c>) instead of <c>choices</c>, and
 /// streaming emits named semantic events instead of per-token chunks.
 /// </summary>
 internal static class OpenAIResponsesFactory
@@ -25,6 +25,8 @@ internal static class OpenAIResponsesFactory
     public static string NewMessageItemId() => $"msg_{Guid.NewGuid():N}";
 
     public static string NewFunctionCallItemId() => $"fc_{Guid.NewGuid():N}";
+
+    public static string NewReasoningItemId() => $"rs_{Guid.NewGuid():N}";
 
     public static string NewCallId() => $"call_{Guid.NewGuid():N}"[..24];
 
@@ -44,6 +46,25 @@ internal static class OpenAIResponsesFactory
         {
             new { type = "output_text", text = text ?? "", annotations = Array.Empty<object>() },
         },
+    };
+
+    /// <summary>
+    /// The model's reasoning as a <c>reasoning</c> output item. The whole reasoning is its one
+    /// <c>summary_text</c> part: there is no separate summary, and <c>summary</c> is the field
+    /// OpenAI's own API fills and its SDKs read (Microsoft.Extensions.AI's Responses client
+    /// turns it into <c>TextReasoningContent</c>; it does not read <c>content</c>). The item
+    /// goes before the message it led to, as OpenAI orders them. An empty
+    /// <paramref name="text"/> is the item as <c>response.output_item.added</c> announces it,
+    /// with no summary part yet.
+    /// </summary>
+    public static object ReasoningItem(string itemId, string text, string status = "completed") => new
+    {
+        id = itemId,
+        type = "reasoning",
+        status,
+        summary = string.IsNullOrEmpty(text)
+            ? Array.Empty<object>()
+            : new object[] { new { type = "summary_text", text } },
     };
 
     public static object FunctionCallItem(string itemId, string callId, ToolCall toolCall) => new
@@ -162,6 +183,45 @@ internal static class OpenAIResponsesFactory
         part = new { type = "output_text", text, annotations = Array.Empty<object>() },
     };
 
+    // The reasoning item streams as its one summary part: part added, text deltas, text
+    // done, part done (OpenAI's event sequence for a reasoning summary).
+
+    public static object ReasoningSummaryPartAdded(string itemId, int outputIndex, int summaryIndex) => new
+    {
+        type = "response.reasoning_summary_part.added",
+        item_id = itemId,
+        output_index = outputIndex,
+        summary_index = summaryIndex,
+        part = new { type = "summary_text", text = "" },
+    };
+
+    public static object ReasoningSummaryTextDelta(string itemId, int outputIndex, int summaryIndex, string delta) => new
+    {
+        type = "response.reasoning_summary_text.delta",
+        item_id = itemId,
+        output_index = outputIndex,
+        summary_index = summaryIndex,
+        delta,
+    };
+
+    public static object ReasoningSummaryTextDone(string itemId, int outputIndex, int summaryIndex, string text) => new
+    {
+        type = "response.reasoning_summary_text.done",
+        item_id = itemId,
+        output_index = outputIndex,
+        summary_index = summaryIndex,
+        text,
+    };
+
+    public static object ReasoningSummaryPartDone(string itemId, int outputIndex, int summaryIndex, string text) => new
+    {
+        type = "response.reasoning_summary_part.done",
+        item_id = itemId,
+        output_index = outputIndex,
+        summary_index = summaryIndex,
+        part = new { type = "summary_text", text },
+    };
+
     public static object OutputItemDone(int outputIndex, object item) => new
     {
         type = "response.output_item.done",
@@ -193,7 +253,7 @@ internal static class OpenAIResponsesFactory
     private static long UnixNow() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
     // reasoning_tokens: the generated tokens that were reasoning (ChatStreamUpdate.ReasoningTokens), counted with the
-    // output tokens as OpenAI counts them; the response carries no reasoning item.
+    // output tokens as OpenAI counts them; the text itself is the response's reasoning item.
     private static object BuildUsage(int promptTokens, int evalTokens, int kvCacheReusedTokens, int reasoningTokens) => new
     {
         input_tokens = promptTokens,

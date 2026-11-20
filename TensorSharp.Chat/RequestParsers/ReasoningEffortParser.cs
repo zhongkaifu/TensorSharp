@@ -30,6 +30,11 @@ namespace TensorSharp.Server.RequestParsers
     /// <c>think</c> leaves the family's default (<c>medium</c>). Every surface applies
     /// the same rule so a chat warmed through one surface is reused by the others.
     /// </para>
+    /// <para>
+    /// A named level also says whether to think (<see cref="AsksToReason"/>,
+    /// <see cref="AsksNotToReason"/>): <see cref="ThinkingSwitchParser"/> and the
+    /// Responses route read it when the request sends no thinking switch of its own.
+    /// </para>
     /// </summary>
     internal static class ReasoningEffortParser
     {
@@ -94,5 +99,40 @@ namespace TensorSharp.Server.RequestParsers
             effort = ReasoningEffort.ForRequest(level, ThinkingSwitchParser.ExplicitlyOff(body));
             return true;
         }
+
+        /// <summary>
+        /// The level the request names, trimmed and as sent (before the aliases above):
+        /// <c>reasoning_effort</c>, else <c>reasoning.effort</c>, read in the same order as
+        /// <see cref="TryParse"/>. Null when it names none. A value of the wrong type is
+        /// null here; <see cref="TryParse"/> answers it with HTTP 400.
+        /// </summary>
+        public static string? RequestedLevel(JsonElement body)
+        {
+            if (body.ValueKind != JsonValueKind.Object)
+                return null;
+            JsonElement value;
+            if (!body.TryGetProperty("reasoning_effort", out value)
+                && !(body.TryGetProperty("reasoning", out JsonElement reasoning)
+                     && reasoning.ValueKind == JsonValueKind.Object
+                     && reasoning.TryGetProperty("effort", out value)))
+                return null;
+            string? raw = value.ValueKind == JsonValueKind.String ? value.GetString()?.Trim() : null;
+            return string.IsNullOrEmpty(raw) ? null : raw;
+        }
+
+        /// <summary>
+        /// True when the request names a reasoning level other than <c>none</c>: it asks
+        /// the model to reason, as OpenAI's reasoning models read the field (where
+        /// <c>none</c> is "no reasoning"). Microsoft.Extensions.AI sends
+        /// <c>ChatOptions.Reasoning.Effort</c> this way, with no thinking switch beside it.
+        /// </summary>
+        public static bool AsksToReason(JsonElement body)
+            => RequestedLevel(body) is string level && !IsNone(level);
+
+        /// <summary>True when the request names OpenAI's <c>none</c> level: do not reason.</summary>
+        public static bool AsksNotToReason(JsonElement body)
+            => RequestedLevel(body) is string level && IsNone(level);
+
+        private static bool IsNone(string level) => string.Equals(level, "none", StringComparison.OrdinalIgnoreCase);
     }
 }

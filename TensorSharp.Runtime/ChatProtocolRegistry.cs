@@ -200,6 +200,13 @@ namespace TensorSharp.Runtime
                 // ended a turn whose reasoning reached the budget with an EMPTY answer.
                 ThinkingBudgetEndToken = "</think>",
                 ThinkingBudgetClosingText = HandOverToAnswer,
+                // The Qwen3.8-27B GGUF template reads reasoning_effort: with thinking on,
+                // xhigh (the default, and high) and low each put a paragraph at the head of
+                // the system block, and medium puts none. So the level is part of the prompt,
+                // and of the shared prefix a checkpoint is measured against. Templates that
+                // do not read it (Qwen 3.5 / 3.6, the Qwen3.8-9B distill) render the same
+                // either way.
+                RendersReasoningEffort = true,
             });
 
             // Qwen3.8 Flash Next uses ChatML reasoning and the Qwen XML-style
@@ -220,6 +227,8 @@ namespace TensorSharp.Runtime
                 // As for qwen35: the budget closes the block instead of ending the turn empty.
                 ThinkingBudgetEndToken = "</think>",
                 ThinkingBudgetClosingText = HandOverToAnswer,
+                // The published template renders reasoning_effort as Qwen3.8-27B's does (see qwen35).
+                RendersReasoningEffort = true,
                 AppendMediaPlaceholders = AppendQwenVisionPads,
                 // A `video_url` part is sampled into timed frames (fps / max_frames
                 // in the part, VIDEO_SAMPLE_FPS / VIDEO_MAX_FRAMES defaults), each a

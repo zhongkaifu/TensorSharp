@@ -14,6 +14,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -228,9 +229,9 @@ public sealed partial class OpenAIChatAdapter
         if (toolsDisabled)
             openaiTools = null;
         // `think`, or llama.cpp/vLLM's `chat_template_kwargs.enable_thinking` (see
-        // ThinkingSwitchParser for why they must agree).
-        if (!ThinkingSwitchParser.TryParse(body, out bool openaiThink, out IReadOnlyList<string> ignoredKwargs,
-                out string? thinkError))
+        // ThinkingSwitchParser for why they must agree), else a named reasoning_effort.
+        if (!ThinkingSwitchParser.TryParse(body, out bool openaiThink, out bool thinkFromReasoningEffort,
+                out IReadOnlyList<string> ignoredKwargs, out string? thinkError))
         {
             openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
                 "/v1/chat/completions rejected: {Error} (id={ChatcmplId})", thinkError, requestId);
@@ -313,6 +314,15 @@ public sealed partial class OpenAIChatAdapter
             ctx.Response.StatusCode = 400;
             await ctx.Response.WriteAsJsonAsync(new { error = new { message = responseFormatError, type = "invalid_request_error" } }).ConfigureAwait(false);
             return;
+        }
+
+        // Thinking that only a reasoning_effort asked for gives way to response_format on a
+        // family whose reasoning cannot come before the JSON grammar: the request was valid
+        // (and answered) before reasoning_effort turned thinking on, so it is not refused now.
+        if (responseFormat != null && thinkFromReasoningEffort && !HasDelayedThinkingGrammar(_svc.Architecture))
+        {
+            openaiThink = false;
+            WarnEffortYieldsToResponseFormatOnce(openaiLogger, _svc.Architecture);
         }
 
         // The compatibility check sees the CLIENT's tools, never the built-in skill
@@ -486,6 +496,27 @@ public sealed partial class OpenAIChatAdapter
         }
     }
 
+    private static int s_effortYieldsToResponseFormatReported;
+
+    /// <summary>
+    /// Say once that a reasoning_effort did not turn thinking on because response_format
+    /// needs the JSON grammar from the first token on this family, instead of dropping the
+    /// reasoning in silence. <c>"think": true</c> with response_format is still HTTP 400 here.
+    /// </summary>
+    private static void WarnEffortYieldsToResponseFormatOnce(ILogger logger, string architecture)
+    {
+        if (Interlocked.Exchange(ref s_effortYieldsToResponseFormatReported, 1) != 0)
+            return;
+        logger.LogWarning(LogEventIds.RequestContentDropped,
+            "/v1/chat/completions: reasoning_effort with response_format runs with thinking off on {Architecture}: " +
+            "its JSON grammar applies from the first token, so the reply has no reasoning. Reported once.",
+            architecture);
+    }
+
+    /// <summary>True when the family declares where reasoning ends, so a JSON grammar can wait for it.</summary>
+    private static bool HasDelayedThinkingGrammar(string architecture)
+        => !string.IsNullOrEmpty(ChatProtocolRegistry.For(architecture)?.ThinkingGrammarActivationTrigger);
+
     private static async Task<bool> ValidateStructuredOutputCompatibilityAsync(
         HttpContext ctx,
         StructuredOutputFormat responseFormat,
@@ -493,8 +524,7 @@ public sealed partial class OpenAIChatAdapter
         List<ToolFunction>? openaiTools,
         string architecture)
     {
-        bool delayedThinkingGrammar = !string.IsNullOrEmpty(
-            ChatProtocolRegistry.For(architecture)?.ThinkingGrammarActivationTrigger);
+        bool delayedThinkingGrammar = HasDelayedThinkingGrammar(architecture);
         if (openaiThink && !delayedThinkingGrammar)
         {
             ctx.Response.StatusCode = 400;
