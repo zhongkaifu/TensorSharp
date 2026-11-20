@@ -2671,17 +2671,30 @@ LiquidCodec 解码器）后即可说话。语音回复与文本运行在同一�
 | CLI `--speech-temperature T` | 语音编码的温度（默认取 mmproj 的 0.4）；文本仍用 `--temperature`。 |
 | CLI `--voice female\|male`、`--language CODE`、`--seed N` | 写入系统提示的音色与语言（语言默认为文本所用的语言，见下文）；语音采样器的种子。 |
 | `POST /v1/audio/speech` | `input`、`voice`（`female`/`male`；其他值，包括 OpenAI 默认的 `alloy`，返回 400 并列出可用音色）、`language`（默认为 `input` 所用的语言）、`response_format` `wav`/`pcm`/`pcm16`、`stream: true`（分块；WAV 流以未知长度头开头）或 `stream_format: "audio"`/`"sse"`、`seed`、`temperature`、`max_frames`。`speed` 不为 1 时返回 400。 |
-| `POST /v1/chat/completions`、`POST /v1/responses` | `"modalities": ["text","audio"]`（交错：文本即转写；对话模式）或 `["audio"]`（纯语音，以 `<|audio_start|>` 开始：LFM3-Omni 会朗读用户的消息而不是回答，与 llama.cpp 相同），配合 `"audio": {"voice": "female", "format": "wav"\|"pcm16"}`（TensorSharp 还读取其中的 `language`、`seed`、`temperature`）。非流式：`message.audio = {id, expires_at, data, transcript}`；流式（仅 pcm16）：`delta.audio` 先发 `id`，再按顺序发 `transcript` 与 `data` 片段，最后是 `expires_at`。一小时内把回复以 `{"role":"assistant","audio":{"id":...}}` 发回，会按其转写渲染。 |
+| `POST /v1/chat/completions`、`POST /v1/responses` | `"modalities": ["text","audio"]`（交错：文本即转写；对话模式）或 `["audio"]`（纯语音，以 `<|audio_start|>` 开始：LFM3-Omni 会朗读用户的消息而不是回答，与 llama.cpp 相同），配合 `"audio": {"voice": "female", "format": "wav"\|"pcm16"}`（TensorSharp 还读取其中的 `language`、`seed`、`temperature`）。非流式：`message.audio = {id, expires_at, data, transcript}`；流式（仅 pcm16）：`delta.audio` 先发 `id`，再按顺序发 `transcript` 与 `data` 片段，最后是 `expires_at`。一小时内把回复以 `{"role":"assistant","audio":{"id":...}}` 发回，会按其转写渲染。在 chat completions 上，语音请求可以带 `tools`、推理（`think`）、技能和知识库：它就是该请求的文本补全，并把其内容说出来（见下文“语音轮次就是文本轮次”）；带 `tool_calls` 的回复照常返回工具调用，有内容时再附上内容的 `message.audio`。音频与 `response_format` 同用会返回 400。Responses 的音频请求仍拒绝 `tools`、推理、技能与知识库（400）。 |
 | `GET /v1/models` | 会说话的模型列出 `"capabilities": ["chat","audio_output"]` 及其音色。 |
-| `POST /api/chat`（Web UI、TensorAgent） | `"speech": true` 或 `{"voice": ..., "language": ...}`：交错回复并关闭思考，转写在 `token` 帧中，语音在夹于其间的 `audio` 帧中（base64 PCM16，采样率为 `sampleRate`），`done` 帧带有 `audioId`、`audioUrl`（整段回复的 WAV，位于 `/uploads/`）和 `audioSeconds`。语音轮次中技能、工具和知识库检索都不会运行（会有一个 `notice` 帧说明）。`GET /api/models` 报告 `speechOutput: {available, voices, reason}`；页面只在其可用时显示 **Speak replies** 开关，边生成边播放，并保留播放器与下载链接。见 [API_EXAMPLES_zh-cn.md → 语音回复](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#语音回复speechlfm3-omni)。 |
+| `POST /api/chat`（Web UI、TensorAgent） | `"speech": true` 或 `{"voice": ..., "language": ...}`：该请求不带语音时的轮次照常运行（推理、技能、工具、代码执行、知识库、子代理以及每一轮，帧也相同），其回答边写边说，语音在夹于其他帧之间的 `audio` 帧中（base64 PCM16，采样率为 `sampleRate`），`done` 帧带有 `audioId`、`audioUrl`（整个轮次的 WAV，位于 `/uploads/`）和 `audioSeconds`。`GET /api/models` 报告 `speechOutput: {available, voices, reason}`；页面只在其可用时显示 **Speak replies** 开关，边生成边播放，并保留播放器与下载链接。见 [API_EXAMPLES_zh-cn.md → 语音回复](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#语音回复speechlfm3-omni)。 |
 
 **语言。** LFM3-Omni 的交错模式与纯语音模式只会说英语；它的 TTS 能说 ar、da、de、el、en（en-us、en-gb）、es、fi、fr、
 he、it、ja、ko、nl、pl、pt、sv、tr 与 zh。语音回复的语言取请求中的 `language`（`speech.language`、`audio.language`、
 `--language`），否则取用户最近一条消息所用的语言（按文字判断：汉字为 zh，假名为 ja，谚文为 ko，以及阿拉伯文、希伯来文、
-希腊文；拉丁字母则用默认的英语）。英文回复在回复本身中说出；其他语言的回复按普通文本回复生成，每句话一完成就由 TTS
-提示说出，同时其余文本仍在生成（markdown、表情符号与代码不会朗读）。拉丁字母书写的非英语语言（`fr`、`de`、`es` 等）
+希腊文；拉丁字母则用默认的英语）。Web 聊天的回复，以及除普通英文 chat completions 之外的所有回复，都按普通文本回复生成，
+每句话一完成就由 TTS 提示说出，同时其余文本仍在生成（markdown、表情符号与代码不会朗读）。拉丁字母书写的非英语语言（`fr`、`de`、`es` 等）
 或语音提问时请指定 `language`。未指定语言的 TTS 说文本所用的语言，并把中文文本中的数字读出来（`2024年10月1日` 读作
 二零二四年十月一日）。
+
+**语音轮次就是文本轮次。** 在 `/api/chat` 与 `/v1/chat/completions` 上，语音请求运行的内容与不带语音的同一请求完全相同：
+推理（`think`）、指定的技能以及主机可供发现的技能目录、客户端的工具、主机的代码工具（`--code-exec`：`shell`、`read_file`、
+`write_file`、`apply_patch`）、知识库、子代理，以及工具循环的每一轮，帧也相同。模型的 TTS 提示在同一引擎上与生成并行，
+逐句说出每一轮边写边出的回答文本：工具调用之前的文字在调用开始时就说出（因此工具运行时语音仍在继续），推理、工具调用与
+工具结果从不朗读。不朗读的内容：代码块、表格行、表情符号与 markdown 标记、主机写在回答中的说明（`_(...)_`）、40 个字符
+及以上的行内代码；URL 读作其主机名（`docs.python.org`），三段及以上的路径读作最后一段（`/Users/me/out/result.csv` 读作
+`result.csv`）。该轮次保留一个涵盖其全部语音的 WAV 与 `audioId`，下一轮像文本轮次一样复用其前缀（包括工具轮）。语音失败时
+文本轮次照常完成，并以一个 `notice` 帧（`code` 为 `speech_failed`）说明。在 `/api/chat` 上，每个语音轮次（任何语言）都由
+文本说出，因此其提示就是文本轮次的提示（系统提示中没有语音说明），在对话中途打开或关闭 **Speak replies** 仍能复用已缓存的
+前缀。在 `/v1/chat/completions` 上，若文本补全是普通的英文回复（无推理、无客户端或主机的工具、无技能、无知识库），仍是一次
+交错生成文本与语音的驱动生成（首段音频只需几十毫秒）；主机的技能目录、`--code-exec` 与子代理（默认开启）会让每个补全都带
+工具，此时同样由文本说出。
 
 LFM3-Omni 的文本回复永不采样媒体占位符，纯文本回复也不会开启语音（禁止 `<|audio_start|>`、`<|mixed_start|>`），
 与模型卡中 `generate` 的做法一致。按其 id 送回的语音助手回合（`/v1/chat/completions` 上的 `audio.id`，`/api/chat` 上的

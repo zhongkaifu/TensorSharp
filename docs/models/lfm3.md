@@ -511,6 +511,22 @@ the template's default, for Latin letters), and Chinese text reaches the TTS pro
 numerals read out (`2024年10月1日` as `二零二四年十月一日`, `199元` as `一百九十九元`), which
 the model otherwise says as noise.
 
+**Spoken turns are text turns.** On `/api/chat` (the web UI's and TensorAgent's **Speak replies**)
+every spoken turn, in every language, is the request's text turn - reasoning, named skills and the
+catalog, the client's tools, the host's code tools, knowledge, sub-agents, every round of the tool
+loop, with the same frames - and its answer is spoken as it is written (`WebUiSpokenTurn`, over
+`ReplySpeaker`): each round's answer text goes through `SpeechTextSegmenter`, and each piece is a TTS
+request on the engine beside the generation, spoken in order. The text before a tool call is spoken
+when the call begins, so the speech goes on while the tool runs; reasoning, tool calls and tool
+results are never spoken, nor are fenced code, table rows, emoji, markdown markers, a host note in the
+answer (`_(...)_`) or an inline code span of 40 characters or more; a URL is said as its host, a path
+of three or more parts as its last name. The turn keeps one WAV and audio id for everything it
+spoke. Its prompt is the text turn's (no speech line), so a conversation that switches speech on and
+off reuses its cached prefix on every turn; an interleaved reply put "Speak using a female voice.
+Respond with interleaved text and audio." in the system prompt, which forked the two modes from the
+first tokens. `/v1/chat/completions` does the same for a spoken request with tools, reasoning, skills
+or knowledge (or any language but English); a plain English one is still one interleaved generation.
+
 Text replies of LFM3-Omni never draw the media placeholders (`<|audio|>`, `<|audio_out|>`,
 `<|image|>`, `<|video|>`), and a text-only reply never opens speech (`<|audio_start|>`,
 `<|mixed_start|>` banned), as HF's `generate` does; llama.cpp suppresses neither in plain
@@ -547,6 +563,15 @@ greedy pick is not used for LFM3-Omni's text replies.)
   real-time factor 9.2x. TTS of 12 Chinese texts x 2 voices x 3 seeds without a language: CER
   18.6% before ("American English", 70 of 72 heard as Chinese), 5.0% now (72 of 72; texts with
   numerals 39.0% -> 2.0%).
+- Spoken turns that run tools (2026-11-19, Q4_K_M + Q8_0 mmproj, ggml-metal, `/api/chat` as the web chat
+  sends it, greedy, `eng/lfm3/speech-agent-e2e.py`): 16 turns in English and Chinese (reasoning, a named skill,
+  code the host runs, a file created and edited, a three-turn session) with speech on and off: the text, the tool
+  steps and the token counts match in 14 of 16; the other two are greedy near-ties that a rerun did not reproduce
+  and that unrelated TTS requests beside a text turn flip too (engine batch composition). The first answer token is
+  as fast as without speech; the first audio comes 0.12-0.49 s after the request. Conversations that switch speech
+  on and off reuse every previous prompt and reply. English replies on a host without tools, interleaved before and
+  spoken from the text now: first audio 65-70 -> 139-154 ms, the male voice 182 -> 115 Hz (the interleaved mode
+  speaks one voice whatever it is asked), the text is the typed turn's (6 of 6, 0 of 6 before).
 - Speech-only replies (`modalities ["audio"]`, which opens `<|audio_start|>` as llama.cpp's
   realtime AUDIO mode does): LFM3-Omni reads the user's message aloud instead of answering it,
   in TensorSharp and llama.cpp alike (8 of 8 questions, ASR = the question), and without a
@@ -739,9 +764,10 @@ results). In the same session ggml_metal ran Q4_K_M pp512 / tg128 at 6,041 / 191
 
 ## Current limits
 
-- Speech output has no realtime endpoint (`/v1/realtime`), and a text turn after a spoken one
-  re-prefills from the system prompt, which names the voice only on spoken turns (see
-  [Speech output](#speech-output)).
+- Speech output has no realtime endpoint (`/v1/realtime`). On `/v1/chat/completions` and
+  `/v1/responses`, a text turn after an interleaved spoken one re-prefills from the system prompt,
+  which names the voice only on interleaved turns; the web chat speaks every turn from its text and
+  does not (see [Speech output](#speech-output)).
 - Many concurrent requests decode slower than vLLM and SGLang (A40: 11.0 / 26.6 ms a token at 16 / 64
   requests on ggml_cuda, 21.5 / 40.3 on direct cuda, against vLLM's 8.1 / 11.0): a batched step runs each
   sequence's attention, K/V writes and short-convolution window as ops of its own, and is traced again

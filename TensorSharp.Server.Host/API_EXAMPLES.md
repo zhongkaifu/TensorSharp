@@ -1425,8 +1425,8 @@ Event shapes:
 | `tool_progress`, `tool`, `text`, `seconds`, `detail`, `agents` | while an in-process skill/code/agent call is being written or run | transient live activity: phase is `writing`, `running`, or `finished`; the bundled Web UI keeps only a bounded current tail and clears it on `finished`. While `wait_agent` is `running`, `agents` is a snapshot of every sub-agent in the request (`agent_id`, `parent_id`, `task`, `agent_type`, `status`, `tool`, `tool_status`, `detail`, `result`, `error`); otherwise it is `null` |
 | `skill_step`, `agent_id`, `skill`, `detail`, `ok`, `round`, `files` | after each in-process skill, code or agent tool call finishes | completion metadata for the tool, target and result; `agent_id` names the agent that made the call (`/root` for the main conversation); produced artifacts appear as optional `{name, bytes, url}` entries in `files` |
 | `artifact_verified`, `files` | once, when a routed deliverable workflow (such as a PowerPoint request) proves its output | the one deliverable that passed the host's structural checks, as a single `{name, bytes, url}` entry; `skill_step.files` stays empty on those requests so provisional files are never offered |
-| `audio`, `sampleRate` | a spoken reply (`speech`, below), between its `token` frames in the order generated | base64 PCM16 little-endian mono, one 80 ms speech frame (or the codec's tail at the end) at `sampleRate` Hz |
-| `notice`, `code`, `without` | once, first, on a spoken reply that drops what the request asked for; or before `done` when its audio could not be written | `code` `speech_direct`: the reply runs without `without` (`reasoning`, `tools`, `skills`, `knowledge`); `speech_not_saved`: no WAV, so no `audioUrl`. `notice` is the English sentence |
+| `audio`, `sampleRate` | a spoken reply (`speech`, below), between the turn's other frames as the speech is made (during a tool's run too) | base64 PCM16 little-endian mono, one 80 ms speech frame (or the codec's tail at the end) at `sampleRate` Hz |
+| `notice`, `code`, `detail` | before `done`, when a spoken turn's speech stopped or its audio could not be written | `code` `speech_failed`: the speech stopped (`detail` is the reason; the text turn is whole, and what was spoken is kept); `speech_not_saved`: no WAV, so no `audioUrl`. `notice` is the English sentence |
 | `done`, `tokenCount`, `elapsed`, `tokPerSec`, `aborted`, `truncated`, `error`, `sessionId`, `promptTokens`, `kvReusedTokens`, `kvReusePercent` | last frame | terminal summary: `tokenCount` counts every token the turn generated (reasoning, tool calls and answer, across all rounds), `elapsed` is the turn's wall-clock seconds including tool runs, and `tokPerSec` is the decode speed; `truncated` is true when the max-tokens budget ended the answer (not the user; `aborted` covers that) |
 
 Sample terminal frame:
@@ -1493,10 +1493,18 @@ Ask for a spoken reply with `speech`: `true` (the default voice), or
 `{"voice": "...", "language": "..."}` (both optional; `language` is the speech's
 language code, such as `en`, `zh` or `fr`; without it, the language the user's
 last message is written in by its script, Latin letters meaning English).
-LFM3-Omni's interleaved speech is English only, so a reply in any other language
-is generated as an ordinary text reply and each sentence is spoken by its TTS as
-soon as it is complete (the frames below look the same; markdown, emoji and code
-are not read aloud).
+A spoken turn is the request's text turn: whatever the same request runs
+without `speech` (reasoning with `think`, `skills` and the catalog, the host's
+code tools, `tools`, knowledge, sub-agents, every round of the tool loop) it
+runs, with the same frames, and the model's TTS speaks the answer text of each
+round, sentence by sentence, as it is written (the text before a tool call when
+the call begins). Reasoning, tool calls and tool results are never spoken, nor
+are fenced code, table rows, emoji, markdown markers, a host note in the answer
+(`_(...)_`) or an inline code span of 40 characters or more; a URL is said as
+its host, a path of three or more parts as its last name. Every spoken turn,
+in every language, is spoken from its text this way, so its prompt is the text
+turn's (no speech line in the system prompt) and a conversation that switches
+speech on and off keeps reusing its cached prefix.
 
 ```bash
 curl -N -X POST http://localhost:5000/api/chat \
@@ -1508,11 +1516,11 @@ curl -N -X POST http://localhost:5000/api/chat \
   }'
 ```
 
-The reply interleaves text and speech, the text being the speech's
-transcript, with thinking off. The transcript arrives in the ordinary `token`
-frames and the speech in `audio` frames between them; the `done` frame adds
-`audioId`, `audioUrl` (the whole reply as a 24 kHz mono 16-bit WAV under
-`/uploads/`, named by when it was spoken) and `audioSeconds`:
+The answer arrives in the ordinary `token` frames (and `thinking`,
+`tool_progress`, `skill_step` frames as in a text turn) and the speech in
+`audio` frames between them; the `done` frame adds `audioId`, `audioUrl` (the
+whole turn's speech as a 24 kHz mono 16-bit WAV under `/uploads/`, named by when
+it was spoken) and `audioSeconds`:
 
 ```
 data: {"token":"The capital "}
@@ -1522,24 +1530,22 @@ data: {"audio":"...","sampleRate":24000}
 data: {"done":true,"tokenCount":41,"elapsed":2.9,"tokPerSec":19.3,"aborted":false,"truncated":false,"error":null,"sessionId":"a3b...","promptTokens":44,"kvReusedTokens":0,"kvReusePercent":0.0,"audioId":"audio_5f0c...","audioUrl":"/uploads/speech-20261119-101500-5f0c1a2b3c4d4e5f8a9b0c1d2e3f4a5b.wav","audioSeconds":3.36}
 ```
 
-A spoken turn is one generation, not a tool loop: skills, tools, knowledge
-lookups and reasoning do not run in it, and a request that asked for any of
-them gets one `notice` frame saying so (`code` `speech_direct`, `without`
-naming them) before the reply. A model that cannot speak refuses `speech` with
-HTTP 400 and its reason (`{"code": "speech_unavailable", "error": "..."}`); so
-does a voice the model does not have, and a `speech` that is not `true` or an
-object of `voice` / `language`. A stopped reply writes no WAV and has no
-`audioId`.
+If the speech fails, the text turn still completes and one `notice` frame
+before `done` says so (`code` `speech_failed`, `detail` the reason). A model
+that cannot speak refuses `speech` with HTTP 400 and its reason
+(`{"code": "speech_unavailable", "error": "..."}`); so does a voice the model
+does not have, and a `speech` that is not `true` or an object of `voice` /
+`language`. A stopped reply (Stop, or a new prompt that replaces it, during a
+tool round too) stops its speech, writes no WAV and has no `audioId`.
 
 Keep the reply in the history with its `audioId` (and `audioUrl`, which the
 bundled pages use to show a player and a download): sent back on the assistant
 message, `{"role": "assistant", "content": "<transcript>", "audioId": "audio_5f0c..."}`
-splices the turn as the model generated it (its tokens, and each speech frame's
-row), so the prompt holds exactly what the cache holds. A spoken turn is kept
-for an hour in memory, for the model load that made it; an older or unknown id,
-or a message whose text is not the transcript, renders as its text, and the
-server log says so once. The spoken turn's system prompt names the voice, so the
-next turn reuses the cached prompt when it is spoken too.
+renders the turn as its text, which the session matches to the tokens it
+generated, tool rounds included, as for a text turn, so the next turn (spoken or
+not) reuses the cached prompt through it. A spoken turn is kept for an hour in
+memory, for the model load that made it; an unknown id renders as its text too,
+and the server log says so once.
 
 The bundled Web UI shows a **Speak replies** switch (and a voice picker) only
 when `speechOutput.available`; it plays the `audio` frames as they arrive, and
