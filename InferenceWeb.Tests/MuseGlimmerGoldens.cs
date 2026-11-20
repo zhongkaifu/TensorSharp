@@ -290,7 +290,13 @@ internal static class MuseGlimmerGoldens
         return Convert.ToHexStringLower(SHA256.HashData(bytes));
     }
 
-    internal static string FileSha(string path) => Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(path)));
+    /// <summary>A file's SHA-256, read as a stream: the real-weight writers hash GGUFs of 10 GB and more, past the 2 GB that
+    /// <see cref="File.ReadAllBytes"/> can return.</summary>
+    internal static string FileSha(string path)
+    {
+        using FileStream stream = File.OpenRead(path);
+        return Convert.ToHexStringLower(SHA256.HashData(stream));
+    }
 
     // ---------------------------------------------------------------- the store
 
