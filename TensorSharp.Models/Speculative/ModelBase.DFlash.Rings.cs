@@ -329,9 +329,13 @@ namespace TensorSharp.Models
                     break;
                 }
             // A new ring, while the pool may grow: beside the contexts finished requests keep, only where the model gives kept
-            // rings back when short and the device has room (RoomForDFlashRing).
+            // rings back when short and the device has room (RoomForDFlashRing), and while fewer contexts are kept than the
+            // model keeps finished sequences a request could continue (KeptContextsWorthARing): a ring kept for a
+            // conversation whose cached prefix is gone is never continued. On Qwen3.8-27B DFlash2 the long-turn reproducer of
+            // issue #383 had grown the pool to nine 81 MiB rings, most of them for the server's warm-up chats and for
+            // conversations the prefix cache had evicted, beside two retained conversations.
             if (chosen == null && (_dflashRingPool?.Count ?? 0) < MaxDFlashRequestRings
-                && (!AnyKeptDFlashRing() || RoomForDFlashRing(DFlashRingBytes)))
+                && (!AnyKeptDFlashRing() || (KeptDFlashRingCount() < KeptContextsWorthARing && RoomForDFlashRing(DFlashRingBytes))))
             {
                 chosen = AllocateDFlashRing();
                 (_dflashRingPool ??= new List<DFlashRing>()).Add(chosen);
@@ -370,6 +374,20 @@ namespace TensorSharp.Models
                 ring.CarryEnd = -1;
             }
             OnDFlashRingOwnerChanged(ring.K);
+        }
+
+        /// <summary>Finished sequences the model keeps that a later request could continue (the prefix cache's retained
+        /// conversations and checkpoints): kept drafter contexts past this many are not worth a new ring. Unbounded where the
+        /// model does not say.</summary>
+        private protected virtual int KeptContextsWorthARing => int.MaxValue;
+
+        private int KeptDFlashRingCount()
+        {
+            int kept = 0;
+            foreach (DFlashRing ring in AllDFlashRings())
+                if (ring.Owner == null && ring.KeptFor != null)
+                    kept++;
+            return kept;
         }
 
         private bool AnyKeptDFlashRing()

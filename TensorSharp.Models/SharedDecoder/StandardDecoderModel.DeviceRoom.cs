@@ -392,6 +392,10 @@ namespace TensorSharp.Models
             return total <= 0 || free >= RoomNeed(bytes, total, RoomUse.Slot);
         }
 
+        /// <summary>The conversations and checkpoints the prefix cache keeps: a drafter ring is made for no more kept contexts
+        /// than these (ModelBase.KeptContextsWorthARing).</summary>
+        private protected override int KeptContextsWorthARing => _retainedSlots?.Count ?? 0;
+
         /// <summary>Calls whose room releasing every finished conversation and kept drafter ring could not have made, which
         /// then released none (tests).</summary>
         internal int DeviceRoomReleasesSkipped { get; private set; }
