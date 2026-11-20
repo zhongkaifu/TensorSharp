@@ -1165,7 +1165,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`，以及[技能](#技能apiskills)一节介绍的 `skills` 块。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"ltx-2.5"`、`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsKeyframeConditioning`、`defaultPreviewFrames`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`，以及[技能](#技能apiskills)一节介绍的 `skills` 块。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"ltx-2.5"`、`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsKeyframeConditioning`、`defaultPreviewFrames`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。同样，当承载模型生成图片时还会返回一个 `image` 对象 —— `family`（`"qwen_image"`、`"minimax-h3-image"`）、`supportsEdit`、`supportsMask`，以及 `minimumArea`（模型按训练方式出图的最小面积，没有则为 0；MiniMax-H3-Image 为 4,194,304）—— 其他模型下为 `null`；Web UI 与 TensorAgent 的页面据此识别图像模型。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
 
 ---
 
@@ -1524,13 +1524,26 @@ curl -X POST http://localhost:5000/api/image-edit \
   -F "width=2048" -F "height=2048" -F "seed=7"
 ```
 
-- 与文生图相同，固定 6 步、引导系数 1：`cfg` 大于 1、`negativePrompt` 以及遮罩都会被拒绝（遮罩编辑尚未实现）。
+- 与文生图相同，固定 6 步、引导系数 1：`cfg` 大于 1 与 `negativePrompt` 会被拒绝。
 - 尺寸：`width`/`height`（32 的倍数，最多 2000 万像素），或 `keepSourceSize`（`<Picture 1>` 的精确尺寸），
   或按 `<Picture 1>` 的宽高比取 `targetArea` 面积（默认 2048×2048 的面积）。小于 2048×2048 的尺寸会像 MiniMax
   官方流程那样，先在同宽高比、2048×2048 面积的画布上采样，再缩放回请求的尺寸。
 - `seed` 按 MiniMax 的顺序从同一个 CPU torch 生成器依次抽取：每张参考图的 VAE 采样、目标图的噪声、每张参考图的噪声。
-- 以下请求在任何计算之前即被拒绝并说明原因：超过 16 张参考图、参考图某边小于 32 像素、参考图使序列超出设备显存
-  （消息会给出行数并建议减少参考图数量或缩小参考图）。
+- 以下请求在任何计算之前即被拒绝并说明原因：超过 16 张参考图、参考图某边小于 32 像素（400），以及参考图使文本编码
+  或去噪一步所需显存超过设备空闲显存的编辑（507，与设备容纳不下的任何请求相同；消息会给出行数并建议减少参考图数量或缩小参考图）。
+
+遮罩把编辑限定在 `<Picture 1>` 的一个选区内，字段与 Qwen-Image 相同（来自 `/api/upload` 的 `maskPath`、`maskMode`
+`grayscale`|`alpha`、`maskInvert`、`maskFeather`、`maskCrop`、`maskCropPadding`；multipart 路由上为 `mask` 文件）。
+每个未选中的像素都原样返回 `<Picture 1>` 自己的字节，结果保持其尺寸；其他图片仍是参考图
+（[原理](../docs/models/minimax-h3-image_zh-cn.md#遮罩编辑)）：
+
+```bash
+curl -N -X POST http://localhost:5000/api/image-edit/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"imagePaths": ["<shop.png from /api/upload>", "<lamp.png from /api/upload>"],
+       "maskPath": "<selection.png from /api/upload>", "maskFeather": 8, "keepSourceSize": true,
+       "prompt": "Hang the brass lamp from <Picture 2> above the door of <Picture 1>, inside the selected area.", "seed": 42}'
+```
 
 ### OpenAI 图像路由（`/v1/images/generations`、`/v1/images/edits`）
 
@@ -1558,7 +1571,7 @@ curl --fail-with-body http://localhost:5000/v1/images/edits \
 | `output_format` | 仅 `png` |
 | `num_inference_steps`、`guidance_scale`、`negative_prompt` | 即图像路由的 `steps`、`cfg` 与 `negativePrompt`，由模型同样校验 |
 | `image`（编辑，可重复；也接受 `image[]`） | 参考图，按 `<Picture n>` 顺序 |
-| `mask`（编辑） | 一个遮罩文件，供支持遮罩的模型使用 |
+| `mask`（编辑） | `<Picture 1>` 的一个遮罩文件，供支持遮罩的模型使用；按 OpenAI 的约定，透明像素被编辑（没有透明像素的遮罩按灰度读取：白色编辑、黑色保留） |
 
 SGLang 客户端发送的其他字段（`model`、`generator_device`、`quality`、`user` 等）会被接受并忽略。返回
 `{"created": ..., "data": [{"b64_json": "..."} | {"url": "..."}], "output_format": "png", "size": "WxH"}`；

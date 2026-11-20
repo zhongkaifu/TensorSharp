@@ -527,11 +527,11 @@ script gets that error instead of watching a setting be ignored.
 | `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler and Qwen-Image-2.1 (default: 0), and video generation (LTX 2.5, Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. A Qwen-Image-2.1 picture depends on the seed and its size; an edit's noise also depends on its `--image` pictures, so editing a picture at the seed it was drawn with does not restart from its own noise ([seeds and edits](docs/models/qwenimage21.md#seeds-and-edits)). |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
 | `--image <path>` | Input image for image editing (also the image input for multimodal chat); repeat it for multiple references. Every `--image` is a reference, in command-line order, and the prompt names the pictures the way the model does: Qwen-Image-2.1 tags them `<image1>`, `<image2>`, … ahead of the prompt; MiniMax-H3-Image (up to 16) calls them `<Picture 1>`, `<Picture 2>`, … Without `--image`, either model generates an image from the prompt instead. |
-| `--mask <path>` | Qwen-Image-2.1 mask at the first input image's exact dimensions. Requires `--image`; additional images remain references. Preserves source dimensions and unselected decoded RGBA pixels. See [Masked image editing](#masked-image-editing). |
+| `--mask <path>` | Mask for a Qwen-Image-2.1 or MiniMax-H3-Image edit, at the first input image's exact dimensions (MiniMax-H3-Image's `<Picture 1>`). Requires `--image`; additional images remain references. Preserves source dimensions and unselected decoded RGBA pixels. See [Masked image editing](#masked-image-editing). |
 | `--mask-mode <mode>` / `--mask-invert` | `grayscale` (default): white edits, black protects and gray blends. `alpha`: transparent edits, opaque protects. `--mask-invert` reverses the selection. |
 | `--mask-feather <pixels>` | Soften the mask inward in source pixels; range 0–1024, default 0. |
 | `--mask-crop` / `--mask-crop-padding <pixels>` | Process the selection with surrounding context, then composite onto the original canvas. Padding is in source pixels; range 0–16384, default 64. Mask settings without `--mask` are rejected. |
-| `--keep-source-size` | Qwen-Image-2.1 edit: return the first `--image`'s exact width and height, so an edit of an edit keeps its size. Sampling uses about the image's own area, at least 1 megapixel and at most the automatic area, at about its aspect ratio (the 32-pixel grid rounds both), and the result is resized to the source. Requires `--image`; cannot be combined with `--width`/`--height`. Masked edits keep the source size without it. The server takes it as the per-request field `keepSourceSize`. See [Keeping the source size](#keeping-the-source-size). |
+| `--keep-source-size` | Qwen-Image-2.1 or MiniMax-H3-Image edit: return the first `--image`'s exact width and height, so an edit of an edit keeps its size. Sampling uses about the image's own area (Qwen-Image-2.1: at least 1 megapixel and at most the automatic area; MiniMax-H3-Image: at least 2048×2048 and at most 20 megapixels), at about its aspect ratio (the 32-pixel grid rounds both), and the result is resized to the source. Requires `--image`; cannot be combined with `--width`/`--height`. Masked edits keep the source size without it. The server takes it as the per-request field `keepSourceSize`. See [Keeping the source size](#keeping-the-source-size). |
 | `--prompt <text>` | Qwen-Image-2.1 generation prompt or edit instruction (falls back to `--input` file contents if omitted). |
 | `--output <path>` | Qwen-Image-2.1 output PNG path (default: `generated.png` for generation, `edited.png` for editing). |
 | `--cfg <F>` | Qwen-Image-2.1 true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 1.0 for Qwen-Image-2.1 (one transformer prediction per step), or the CFG of a `--lora` plug-in's sampling recipe; a value above 1 adds the negative pass. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. On MiniMax-H3 the only accepted value is `1.0` (its default): the checkpoint ships CFG-distilled and anything higher is refused up front rather than run and degraded. `TensorSharp.Server.Host` has no `--cfg` at all — a request body can still carry `cfg`. |
@@ -1050,8 +1050,8 @@ the rest. Either way `--stop` sequences pinned on the server stay in force under
 
 ## Masked image editing
 
-Qwen-Image-2.1 edits a selected region while preserving the source dimensions and
-all unselected decoded RGBA pixels. The first image is the target; other images
+Qwen-Image-2.1 and MiniMax-H3-Image edit a selected region while preserving the source
+dimensions and all unselected decoded RGBA pixels. The first image is the target; other images
 remain references. For example:
 
 ```bash
@@ -1064,9 +1064,12 @@ The server's `/api/image-edit` and `/api/image-edit/stream` accept `maskPath`,
 `maskMode`, `maskInvert`, `maskFeather`, `maskCrop` and `maskCropPadding` in JSON.
 The non-streaming `/api/image-edit` also accepts a `mask` file and the same settings
 in multipart form data. Upload files used
-by JSON requests through `/api/upload` first. A mask requires Qwen-Image-2.1,
-an input image and matching source dimensions. See the [mask guide](docs/models/qwenimage21.md#precise-local-editing-with-a-mask)
-for selection semantics, sampling geometry, API examples and validation coverage.
+by JSON requests through `/api/upload` first. A mask requires an image model that takes
+masks (Qwen-Image-2.1 or MiniMax-H3-Image), an input image and matching source dimensions.
+See the [Qwen-Image-2.1 mask guide](docs/models/qwenimage21.md#precise-local-editing-with-a-mask)
+for selection semantics, sampling geometry, API examples and validation coverage, and
+[MiniMax-H3-Image's masked edits](docs/models/minimax-h3-image.md#masked-edits) for its
+sampling canvas (the 2048×2048 floor) and multi-reference edits.
 
 ### Keeping the source size
 
@@ -3039,7 +3042,7 @@ phases, Studio jobs, model loads and the logs of one request.
 
 `TensorSharp.Server.Host` exposes three API styles — Ollama-compatible, OpenAI-compatible, and the Web UI's own SSE routes — plus the Jev typed-decision endpoint `POST /v1/systemone` for DiffusionGemma. See [API_EXAMPLES.md](TensorSharp.Server.Host/API_EXAMPLES.md) for full documentation with curl and Python examples.
 
-On TensorSharp.Server.Host, image and video models use dedicated media routes. Qwen-Image-2.1 answers `POST /api/image-generate` (text to image) and `POST /api/image-edit` (prompt, reference images and an optional mask), each with a `/stream` SSE variant that reports denoising progress; there is no `/v1/images/*` route. Video models use the routes described in [Video generation with audio (MiniMax-H3)](#video-generation-with-audio-minimax-h3). TensorAgent's own host routes media requests through its `/api/chat` turn manager to share the composer and saved conversations with text turns.
+On TensorSharp.Server.Host, image and video models use dedicated media routes. Qwen-Image-2.1 and MiniMax-H3-Image answer `POST /api/image-generate` (text to image) and `POST /api/image-edit` (prompt, reference images and an optional mask), each with a `/stream` SSE variant that reports denoising progress, and the OpenAI-shaped `POST /v1/images/generations` and `POST /v1/images/edits`. Video models use the routes described in [Video generation with audio (MiniMax-H3)](#video-generation-with-audio-minimax-h3). TensorAgent's own host routes media requests through its `/api/chat` turn manager to share the composer and saved conversations with text turns.
 
 **Ollama-compatible API:**
 

@@ -1296,7 +1296,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, and the `skills` block described under [Skills](#skills-apiskills). When the hosted model generates video it also returns a `video` object — `family` (`"ltx-2.5"`, `"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsKeyframeConditioning`, `defaultPreviewFrames`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, and the `skills` block described under [Skills](#skills-apiskills). When the hosted model generates video it also returns a `video` object — `family` (`"ltx-2.5"`, `"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsKeyframeConditioning`, `defaultPreviewFrames`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. Likewise an `image` object when it makes pictures — `family` (`"qwen_image"`, `"minimax-h3-image"`), `supportsEdit`, `supportsMask`, and `minimumArea` (the smallest output area it makes pictures at as trained, 0 for none; 4,194,304 for MiniMax-H3-Image) — and `null` otherwise; the Web UI and TensorAgent's page know an image model by it. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
 
 ---
 
@@ -1716,7 +1716,7 @@ curl -X POST http://localhost:5000/api/image-edit \
 ```
 
 - Six steps at guidance 1, as for text to image: a `cfg` above 1 or a `negativePrompt` is
-  refused, and so is a mask (masked edits are not implemented yet).
+  refused.
 - Size: `width`/`height` (multiples of 32, at most 20 megapixels), or `keepSourceSize`
   (`<Picture 1>`'s exact size), or `<Picture 1>`'s aspect ratio at `targetArea` (the
   default 2048×2048 area). A size under 2048×2048 is sampled on a 2048×2048-area canvas of
@@ -1724,8 +1724,23 @@ curl -X POST http://localhost:5000/api/image-edit \
 - `seed` draws, from one CPU torch generator in MiniMax's order, each reference's VAE
   sample, then the picture's noise, then each reference's noise.
 - Refused before anything runs, with the reason: more than 16 references, a reference with
-  a side under 32 pixels, and an edit whose references make its sequence too long for the
-  device's memory (the message names the rows and suggests fewer or smaller references).
+  a side under 32 pixels (400), and an edit whose references make its text encoding or a
+  denoising step need more than the device's free memory (507, as any request the device
+  cannot hold; the message names the rows and suggests fewer or smaller references).
+
+A mask limits the edit to a selection of `<Picture 1>`, with the same fields as Qwen-Image's
+(`maskPath` from `/api/upload`, `maskMode` `grayscale`|`alpha`, `maskInvert`, `maskFeather`,
+`maskCrop`, `maskCropPadding`; or a `mask` file on the multipart route). Every unselected
+pixel comes back as `<Picture 1>`'s own bytes and the result has its size; the other
+pictures stay references ([how it works](../docs/models/minimax-h3-image.md#masked-edits)):
+
+```bash
+curl -N -X POST http://localhost:5000/api/image-edit/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"imagePaths": ["<shop.png from /api/upload>", "<lamp.png from /api/upload>"],
+       "maskPath": "<selection.png from /api/upload>", "maskFeather": 8, "keepSourceSize": true,
+       "prompt": "Hang the brass lamp from <Picture 2> above the door of <Picture 1>, inside the selected area.", "seed": 42}'
+```
 
 ### OpenAI image routes (`/v1/images/generations`, `/v1/images/edits`)
 
@@ -1754,7 +1769,7 @@ curl --fail-with-body http://localhost:5000/v1/images/edits \
 | `output_format` | `png` only |
 | `num_inference_steps`, `guidance_scale`, `negative_prompt` | the image routes' `steps`, `cfg` and `negativePrompt`, checked by the model alike |
 | `image` (edits, repeated; `image[]` too) | the references, in `<Picture n>` order |
-| `mask` (edits) | one mask file, for a model that takes masks |
+| `mask` (edits) | one mask file for `<Picture 1>`, for a model that takes masks; OpenAI's convention, transparent pixels are edited (a mask with no transparent pixel is read as grayscale: white edits, black keeps) |
 
 Other fields SGLang clients send (`model`, `generator_device`, `quality`, `user`, ...) are
 accepted and ignored. The answer is `{"created": ..., "data": [{"b64_json": "..."} | {"url":
