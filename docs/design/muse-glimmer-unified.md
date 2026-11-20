@@ -6,8 +6,9 @@ test seam; [§5.1](#51-s2-the-text-decoder-status)), stage S3's Mac part (servin
 checkpoints, checkpoint files, concurrency, the probe on the runtime; [§5.2](#52-s3-serving-status)), stage S4's Mac
 part (the vision tower as graph programs, shared with Muse Spark, and images on the runtime;
 [§5.3](#53-s4-vision-status)) and stage S5's Mac part (DFlash and n-gram through the shared speculation layer, the Metal
-defaults, G11; [§5.4](#54-s5-speculation-status)) are implemented. S0's CUDA part is done (its frozen lanes are fixtures);
-S2's, S3's, S4's and S5's CUDA parts wait for the GPU VM. Written
+defaults, G11; [§5.4](#54-s5-speculation-status)) are implemented, and so is stage S6 (multi-GPU: `--tp 2` on ggml_cuda
+and ggml_vulkan, `--layer-split 2`, DFlash declined under `--tp`; [§5.5](#55-s6-multi-gpu-status)). S0's CUDA part is done
+(its frozen lanes are fixtures); S2's, S3's, S4's and S5's CUDA parts wait for the GPU VM. Written
 2026-11-20 on `feature/muse-glimmer-unified`, cut from `origin/main` 2d759459. ggml is upstream
 d9fe7bff, unchanged (AGENTS.md), built with `TENSORSHARP_GGML_NO_UPDATE=1`. Every statement about
 TensorSharp comes from the code at 2d759459. The numbers in [§4.1](#41-legacy-baseline-measured)
@@ -112,7 +113,7 @@ From `docs/models/muse-glimmer.md` §1 and the code (`MuseGlimmerModel.cs`, `ggm
 | Backend | Forward | SWA ring | Decode graph | Prefill | TP | DFlash |
 |---|---|---|---|---|---|---|
 | `ggml_cuda` | fused whole-model graph | 4352 rows, read whole | persistent, CUDA-graph captured; padded window copied only where ggml-cuda would pick the FA VEC kernel (`kv_window_needs_cuda_flash_attn_copy`) | 2048-row chunks, masks filled on the device | `--tp 2`, per-rank fused graphs, **no ring** (uniform caches) | fused inject + block, captured |
-| `ggml_vulkan` | fused | 4352, read whole | persistent | 2048 chunks | `--tp 2` (never measured) | fused |
+| `ggml_vulkan` | fused | 4352, read whole | persistent | 2048 chunks | `--tp 2` (first measured in S6, [§5.5](#55-s6-multi-gpu-status)) | fused |
 | `ggml_metal` | fused, in-graph embedding | 4352; reads the moving span until it wraps, the whole ring after | persistent replay, `graph_optimize` on persist builds only | 2048 chunks, host masks (parallel span fills) | no (one device) | fused, queue drained before reading ids |
 | `ggml_cpu` | fused, in-graph embedding | **none**: uniform caches (ggml-cpu FA evaluates every masked column) | persistent | 2048 chunks | no | fused |
 | `mlx` | per-op, lazy flush every 4 layers (`TS_MLX_EVAL_EVERY_N_LAYERS`), KV materialized every 16 writes | none | `--benchmark`: pipelined greedy (one MLX graph a token, device argmax and embedding); real generation: per-op | per-op, banded device mask (`TryPrefillAttentionBanded`) | no | per-op drafter |
@@ -274,13 +275,13 @@ ggml change.
 | G3 | **Per-op stream input**: the graph has `EmitStreamInput`; the per-op path (multi-node stages, declined executors) has no twin for the weightless input RMSNorm. | per-op `ApplyStreamInput` hook, in place on the embedded rows after media injection, before the first layer (`RunLayers`, a multi-node stage's first layer) (done in S1, D6) | Gemma 4 (`sqrt(n_embd)` scale) | S1 |
 | G4 | **Ring geometry per family / backend.** The runtime's ring is W + 512 = 2560 cells and caps prompt steps at 512 rows a sequence. Legacy prefills 2048-row chunks over a 4352-row ring. A 30B dense model's prompt GEMMs may run slower at 512 rows, so measure it. The evidence so far says no: llama.cpp prefills in 512-row ubatches by default and measured pp4096 381.4 against legacy's 382.6 on this Mac (§4.1). ggml_cpu: legacy keeps uniform caches because ggml-cpu's FA scores every masked column; the runtime rings there. | `RingStepRows` as a family/backend choice set by measurement; a CPU policy (linear caches where whole-ring reads cost more) | every SWA family (LFM3, Gemma 4) | S7 (D1) |
 | G5 | **In-graph token embedding.** The runtime embeds on the host and uploads F32 rows (54 MB per 2048-row chunk). Legacy gathers the quantized table in-graph on Metal and CPU. Measure first; implement as `GetRows` over the quantized table leaf where the executor binds it zero-copy. | `StandardDecoderModel.Graph.cs`, GGML builder | every family | S7 |
-| G6 | **ggml_vulkan tensor parallelism.** `GgmlGraphExecutor` declares `TensorParallel` only for CUDA, so `--tp` on Vulkan falls to the runtime's per-op TP. Legacy Glimmer runs fused per-rank graphs on Vulkan through the same native driver (`TSGgml_TensorParallelExecutePlans`). | `GgmlGraphExecutor` capability + Vulkan collective | every family on Vulkan | S6 (D4) |
+| G6 | **(Done in S6, D4, [§5.5](#55-s6-multi-gpu-status): `RunsRanks` takes ggml_vulkan, whose partials the native driver sums through host staging.)** **ggml_vulkan tensor parallelism.** `GgmlGraphExecutor` declares `TensorParallel` only for CUDA, so `--tp` on Vulkan falls to the runtime's per-op TP. Legacy Glimmer runs fused per-rank graphs on Vulkan through the same native driver (`TSGgml_TensorParallelExecutePlans`). | `GgmlGraphExecutor` capability + Vulkan collective | every family on Vulkan | S6 (D4) |
 | G7 | **(Done in S4, [§5.3](#53-s4-vision-status).)** **The vision tower as a program.** The pieces exist (`Norm` + bias, `GeluErf`, `FlashAttnExt`, `Permute`), but 2D NORM RoPE over the two half-heads does not. llama.cpp (`clip.cpp` `build_rope_2d`, called by `tools/mtmd/models/muse-glimmer.cpp`) rotates the first 48 dims at the column position, then the next 48 at the row position through `ggml_rope_set_offset`, which the pinned ggml has. The IR's `RopeExt` gets a dims-offset parameter (lowered to that call on GGML; the tensor executors honour it), or the tower rotates two half-head views and concatenates them. Window attention can run as `FlashAttnExt` per window over contiguous row ranges (the permutation makes them contiguous) or with one block-diagonal mask. Verify both on every executor. Also needed: a tower interface the injector takes, shared by Glimmer and Muse Spark. **Built:** both rotaries ran on managed, ggml_cpu, ggml_metal and MLX: the same rows on the first three, the offset 1.6% faster on ggml_metal and 6.7e-3 off on MLX (its tensor-executor emulation), and it needed a new IR parameter, so the half-head views are kept (no shared change); windows run one attention each (the mask was not needed). | `MuseGlimmerVisionTower` (new, on `NetworkGraph`), `ModelMultimodalInjector` | Muse Spark | S4 |
 | G8 | **MLX pipelined greedy decode.** Legacy's `--benchmark` decode on MLX keeps argmax and the next embedding on the device. The runtime's MLX decode reads logits back. Port it only if the runtime's MLX real generation trails legacy: `GreedyIdOutputs` on `MlxGraphExecutor` plus a device-side embedding of the chosen id. | `MlxGraphExecutor`, the runtime's decode loop | every family on MLX | S7 (D7) |
 | G9 | **The probe on the runtime.** `MuseGlimmerKvGrowProbe` reads legacy fields (`_kvCacheCapacity`, `_kvSwaRows`) for its report. Read the runtime's ring cells and slot capacity through internal accessors, and add a scenario for slot growth and checkpoint restore. **Done in S3** ([§5.2](#52-s3-serving-status)): the runtime's active-cache and slot capacities and ring cells through internal accessors; `checkpoint`, `slot-growth`, and `snapshot` as the runtime restores a prefix (a checkpoint file); every restore and rewind also mid-decode | `eng/validation/MuseGlimmerKvGrowProbe` | - | S3 |
 | G10 | **The CUDA FA-VEC hazard.** Legacy materializes the padded K/V window on CUDA where ggml-cuda would pick its VEC kernel, which misread a truncated-prefix view (all query heads of a KV head got the same wrong vector; Ada+ one-row decode under 8192 rows). **Closed in S2, no change.** (1) The premise was wrong: the runtime's builder lowers `GraphOp.KvWindow` through `view_kv_cache_window`, which applies `kv_window_needs_cuda_flash_attn_copy` itself; the runtime passes the query rows and the GQA ratio (`ip[6]`, `ip[7]`), so it has always carried legacy's guard. (2) At d9fe7bff the hazard is gone on Blackwell (RTX PRO 4500, sm_120): the real-weight probe with the guard off (`TS_KV_FATTN_COPY=0`, 52 window copies fewer by a gdb count) gave byte-identical fp16 logits over 500 decode steps at 4352-4864-row windows, and the synthetic legacy freeze (head 64, GQA 2) was byte-identical too. Ada (sm_89) was not run. The guard stays (TensorSharp-owned, about 0.8% of decode there, within noise); dropping it is an S7 measurement | `ggml_ops_transformer_common.h` (already) | every family on ggml_cuda | S2 (closed) |
 | G11 | **DFlash prompt catch-up width.** Legacy catches the drafter up in 1024-row trunk forwards (`TS_DFLASH_PREFILL_CHUNK`). The runtime follows the prompt in ring steps (512). Measure the DFlash prefill cost. **Closed in S5, no change** ([§5.4](#54-s5-speculation-status)): the drafter adds 4.9-5.1% to the runtime's TTFT after 0.5K-2.6K prompts and 0.5% after 16K, legacy 6.2-7.6% and 3.8%. The measurement found that a chunk past one ring step reached the drafter as its first step only (fixed, 754b5813) | `StandardDecoderModel.BlockDraft.cs` | Qwen 3.8 | S5 (closed) |
-| G12 | **Rings under TP with one KV head per rank.** Legacy turned the ring off under `--tp` because ggml-cuda answered "17 plus 25" with fluent nonsense on a whole-ring read when a rank held one KV head (ne[2] == 1). The runtime's per-rank graphs ring by default. Gate it. If it fails, either find the kernel cause and avoid that shape in TensorSharp code, or use linear caches under TP for single-KV-head ranks (costs ~2.5 GB of KV at 64K). | `StandardDecoderModel.Placement/SlidingRings.cs` | any family with 1 KV head per rank | S6 |
+| G12 | **(Closed in S6 with no change, [§5.5](#55-s6-multi-gpu-status): the rings stay on under `--tp 2`; a 16K prompt that laps them six times gives the one-GPU text.)** **Rings under TP with one KV head per rank.** Legacy turned the ring off under `--tp` because ggml-cuda answered "17 plus 25" with fluent nonsense on a whole-ring read when a rank held one KV head (ne[2] == 1). The runtime's per-rank graphs ring by default. Gate it. If it fails, either find the kernel cause and avoid that shape in TensorSharp code, or use linear caches under TP for single-KV-head ranks (costs ~2.5 GB of KV at 64K). | `StandardDecoderModel.Placement/SlidingRings.cs` | any family with 1 KV head per rank | S6 |
 
 ### 2.3 Shared speculation
 
@@ -301,7 +302,8 @@ runtime's generic layer. Glimmer adds no drafter code.
 * **New for Glimmer**: n-gram speculation without a drafter, DFlash with continuous batching
   (legacy has none), and DFlash across a layer split (the driver stage drafts).
 * **Under `--tp`**: the runtime's graph drafter runs on one device (`GraphBlockDraftRefusal`).
-  Legacy declines DFlash under TP. Keeping that decline is the parity choice (D5), declared by the family in S5.
+  Legacy declines DFlash under TP. Keeping that decline is the parity choice (D5), declared by the family in S5 and
+  checked through the real server and CLI in S6: the server refuses `--draft-model` as legacy's does.
 
 ### 2.4 Shared multimodal
 
@@ -587,7 +589,7 @@ Estimates are agent-days, including GPU runs.
 | **S3** Serving (Mac part done, [§5.2](#52-s3-serving-status)) | the unified step: slots, rings, prefix cache, checkpoints, checkpoint files, concurrency; the probe on the runtime | family folder; runtime fixes as found | §4.6 (every mark, every scenario, ggml_metal + MLX + ggml_cuda); §4.7; c4 concurrency 4/4 identical to sequential | Mac; 1 GPU | 4 |
 | **S4** Vision (Mac part done, [§5.3](#53-s4-vision-status)) | `MuseGlimmerVisionTower` on `NetworkGraph` (G7), a tower interface used by Glimmer and Muse Spark, the injector re-typed, `QueueMedia`, reuse across image spans | `MuseGlimmerVisionTower.cs`, `.Multimodal.cs`, `ModelMultimodalInjector.cs`, `MuseSparkModel.Vision.cs` | §4.5 on ggml_metal, MLX, ggml_cuda; Muse Spark synthetic vision tests | Mac; 1 GPU | 5 |
 | **S5** Speculation (Mac part done, [§5.4](#54-s5-speculation-status)) | DFlash through the shared block drafter (graph programs; fused/per-op below), n-gram, defaults by measurement (`--spec-draft`, gate), G11 | family folder (declarations only), `StandardDecoderModel.BlockDraft.cs` if G11 needs it | §4.4 on ggml_metal and ggml_cuda; MLX lossless | Mac; 1 GPU | 3 |
-| **S6** Multi-GPU | `--tp 2` on per-rank graphs (ggml_cuda; Vulkan per D4), G12, `--layer-split 2` and hybrid (new), DFlash under TP per D5 | family folder, `GgmlGraphExecutor.cs` (D4), `StandardDecoderModel.Placement.cs` (G12) | TP greedy vs one GPU (legacy tracked 468/500 characters before a paraphrase); TP decode and prefill vs legacy TP (docs: 63.2 tok/s, pp512 1569 on 2x PRO 4000, IQ2_XXS); grow and snapshot under TP (never run for legacy); layer split == one GPU | 2 GPUs in one box | 4 |
+| **S6** Multi-GPU (done, [§5.5](#55-s6-multi-gpu-status)) | `--tp 2` on per-rank graphs (ggml_cuda; Vulkan per D4), G12, `--layer-split 2` and hybrid (new), DFlash under TP per D5 | family folder, `GgmlGraphExecutor.cs` (D4), `StandardDecoderModel.Placement.cs` (G12) | TP greedy vs one GPU (legacy tracked 468/500 characters before a paraphrase); TP decode and prefill vs legacy TP (docs: 63.2 tok/s, pp512 1569 on 2x PRO 4000, IQ2_XXS); grow and snapshot under TP (never run for legacy); layer split == one GPU | 2 GPUs in one box | 4 |
 | **S7** Performance | G4 (prompt step width, CPU ring policy), G5 (in-graph embedding), concurrency reorder, `PrunesLastLayerRows`, `KeepsGateUpApart` by measurement, G8 only if MLX trails | runtime + family folder | §4.3 on every backend (Mac: ggml_metal, MLX, ggml_cpu; VM: ggml_cuda, ggml_vulkan, direct CUDA) | Mac; 1 GPU | 5 |
 | **S8** Switch | the descriptor builds `MuseGlimmerRuntimeModel` with `ServingContract.SharedRuntime(false)`; usage pages (n-gram, batching, layer split), the docs, `config/muse-glimmer-30b.json` (+ drafter pin), regression pins (IQ2_XXS, drafter), TensorAgent catalog re-measured; legacy only through the oracle seam | `MuseGlimmerArchitecture.cs`, `CliUsage.cs`, `ServerUsage.cs`, docs, configs, `TensorAgent.Core/Catalog` | §4.8 on the Mac (Web UI, OpenAI, CLI, TensorAgent app) and the VM; `ServingContractConformanceTests`; both directions of the usage drift tests | Mac; 1 GPU | 3 |
 | **S9** Deletion | delete §1.3's legacy files, native exports, `GgmlExportedSymbols.targets` entries, the `ggml_ops_core.cpp` hooks, MLX helpers with no other caller, legacy-only tests (their outputs frozen first); retire §1.9's names through the removed-names registry (hard errors naming the replacement); docs, website, search indexes, zh-cn | §1.3, `RemovedCliFlags.cs`, docs | whole suites on both Mac lanes and the CPU lane, the CUDA VM suite; a final real-weights smoke (text, image, DFlash, multi-turn) on Metal and CUDA | Mac; 1 GPU | 2 |
@@ -854,6 +856,92 @@ tokens each (`artifacts/glimmer-s5/prompts/mix5.jsonl`); "16K": 16.2K tokens of 
 | Memory (peak wired, mix5) | runtime DFlash 15.9-16.1 GB, legacy DFlash 21.4-25.1; plain 14.0 / 17.9 |
 | No regression elsewhere | **passed**. The S3 regression filter plus the speculation classes (SpeculativeExecution, SpeculatorRegistry, SpeculativeGreedyVerify, BatchedVerifyHeldLogits, BatchedDecodeRecording, DistributedSpeculation, BlockDraftCausalWidth, SpeculativeDraftHeadLoader, ExecutionPlanner, DraftContextContinuation; the S3 set already holds Qwen 3.5, Qwen 3.8 with DFlash/DSpine, LFM3, GraphBlockDraft) on both Mac lanes, 01896b87's shared code against the final tree: cpu 1943 -> 1950, metal 1955 -> 1962, 0 failed. Every pre-existing outcome unchanged but three that now pass: the two ring-step follow tests (754b5813) and `TheParityBoundIsLegacysOwnSpread` (the coordinator's 29fa6649); the additions are the new tests and the coordinator's fixture rows. Two `DraftContextContinuationTests` failed under the governor (a third request inside a park) and take `GovernorDisabledForTests` now. `RuntimeFamilyDigestTests` byte-identical to S3's (42 lines a lane). After the window change (a0197dc6, 6851774b) again: cpu 1953, metal 1965, 0 failed, the additions the three registry rows |
 
+### 5.5 S6, multi-GPU: status
+
+**Done** (2026-11-20, ggml d9fe7bff unchanged before and after every build). The box: 2x RTX PRO 4500 Blackwell Server
+Edition (sm_120, 32 GB each, PCIe, topology SYS, peer copies checked numerically both ways), driver 595.112.07, CUDA 13.2,
+NCCL 2.32.6, Vulkan loader 1.3.275. Weights UD-Q4_K_XL and UD-IQ2_XXS (unsloth @ faa5b025, sha256 checked); for other
+families Qwen3.5-0.8B Q8_0, LFM3-1.7B Q4_K_M and Qwen3.5-9B Q4_K_M. One model process on the GPUs at a time, the model's
+pages evicted before every load arm. Logs are in the VM's ignored `artifacts/glimmer-tp/`.
+
+* **Legacy's `--tp 2` baseline** (S0 never ran it), one GPU -> `--tp 2`:
+
+  | | Q4_K_XL ggml_cuda | IQ2_XXS ggml_cuda | IQ2_XXS ggml_vulkan |
+  |---|---|---|---|
+  | prefill 512 / 4K / 16K (tok/s) | 1697/1817/1743 -> 2479/2839/2704 | 1546/1626/1569 -> 2309/2590/2474 | 1296/1272/1169 -> 1977/2242/1892 |
+  | decode at 512 / 4K / 16K | 42.3/41.4/38.3 -> 68.6/66.6/44.2 | 50.0/48.6/44.7 -> 80.6/77.3/44.3 | 35.7/35.4/31.7 -> 52.5/51.9/32.0 |
+  | perplexity | 3.6063 -> 3.6050 | 4.1724 -> 4.1695 | 4.1695 -> 4.1700 |
+  | p_4k, 500 steps teacher-forced to one GPU | cos 0.999853, 3 flips, KL 1.71e-3 | cos 0.99973, 6 flips (one 0.84-nat swing), KL 1.47e-3 | cos 0.999938, 0 flips, KL 1.9e-4 |
+
+  Legacy keeps uniform caches under `--tp`, so its 16K decode falls back to the one-GPU rate. Grow and snapshot under TP
+  (never run before) give its own TP bytes when the cut is on its 2048-row chunks; the unaligned snapshot at 2560 flips
+  near-ties (S0's chunk-shape effect).
+* **The family needed no tensor-parallel change.** §2.5 holds as built: per-rank graphs, the rings on (2560 cells, one KV
+  head a rank), both all-reduces on the raw `attn_output` / `ffn_down` products before the 1e-8 post norms
+  (`EmitRankedStep` reduces the block's partial, then `EmitBlockOutput` norms it); images under `--tp 2` get the one-GPU
+  answers.
+* **G12 is closed with no change.** A 16,195-token prompt laps the rings about six times and reads them whole with one KV
+  head a rank; its 512-token greedy answer is the one-GPU text byte for byte on both quants and both GPU backends, and
+  "17 plus 25" is 42. The rings stay on under `--tp`, so the runtime's 16K decode under `--tp 2` is 1.35-1.39x legacy's.
+* **D5 is in.** The family attaches no drafter on a tensor-parallel trunk (before, it drafted under `--tp 2`). The server
+  exits 2 with legacy's stderr line for line, one `error: model load refused` line last; the CLI warns, decodes without
+  the drafter and answers 42.
+* **D4 is in, as a DEFAULT CHANGE.** `GgmlGraphExecutor.RunsRanks` takes ggml_vulkan as well as ggml_cuda: the native
+  driver (`tsg::tp_execute_plans`) already runs the ranks' plans together there, and ggml-vulkan's collective
+  (`ggml-vulkan-comm`: each partial through an imported host buffer, its peers adding it from there) sums them, legacy's
+  Vulkan transport.
+  Before, `--tp` on Vulkan fell to the per-op tensor-parallel path: Glimmer decoded at 2.9 tok/s (legacy Vulkan TP 52.5).
+  Every runtime family with ranked lowering moves with it: Qwen3.5-0.8B's Vulkan `--tp 2` decode went from 9.5 to 194.9
+  tok/s and LFM3-1.7B's from 6.5 to 243.6, each with the per-op path's greedy text byte for byte.
+* **The whole LM head under per-rank TP (a DEFAULT CHANGE, every family).** Rank 0 kept the whole `output.weight` resident
+  beside the vocabulary-split slices, +430 MiB a GPU at short context against legacy. With the split on and no draft
+  layer, the whole head now stays on the host and its readers (the all-row logits of speculative verify steps, a draft
+  model's head, the per-op path) bind it on rank 0 when they first run. Rank 0 holds 1052 MB less for Glimmer IQ2_XXS (882
+  for Q4_K_XL, 796 for Qwen3.5-9B); every output is byte-identical (greedy and n-gram texts, teacher-forced logits); with
+  n-gram speculation the head comes back on the first verify step, so the peak is the old one there.
+* **`--layer-split 2`** (new for Glimmer): byte-identical to one GPU (the 500-step teacher-forced and free-running fp16
+  logits, and the perplexity, on both quants).
+* **Hybrid TP x PP was not run**: two stages of two ranks need four devices. The hosts refuse `--tp 2 --layer-split 2` at
+  load (exit 2, one line) because the descriptor's serving contract is still legacy's until S8 (D11). The simulated-device
+  tests (`PlacementsOnSimulatedDevicesGiveTheOneDeviceLogits`, tp 2 x 2 stages) stand for it.
+* **Prompt steps where the ranks' sums cross the host (a DEFAULT CHANGE, every family).** Each prompt step pays a host
+  round trip for each of its two all-reduces a layer where they go through host memory, so 512-row steps cross four times
+  as often as legacy's 2048-row chunks: Vulkan `--tp 2` prefill was 0.83x legacy at 4K and 0.89x at 16K. The placement now
+  chooses the step: `IRankedGraphExecutor.RanksSumOnHost` (ggml-vulkan's collective, or no collective that passed its
+  probe), recorded by the mesh, and `StandardDecoderModel.RingStepRowsForPlacement`, the step width's seam for D1 / G4:
+  2048 rows there (rings of W + 2048 cells), 512 everywhere else (one device, layer split, ggml-cuda with NCCL or peers,
+  the tensor executors). Glimmer's Vulkan `--tp 2` prefill is now 0.991x / 0.995x / 1.045x legacy at 512 / 4K / 16K, decode
+  unchanged, 341-419 MiB a GPU more for the rings (still under legacy); greedy texts unchanged, and every other path's
+  logits byte-identical. LFM3-1.7B's Vulkan `--tp 2` answers are byte-identical too.
+* **For S7:**
+  * The step-width seam above (`RingStepRowsForPlacement`) is where a measured per-backend width (Metal, MLX, ggml_cpu)
+    goes; it changes no path off `--tp` today.
+  * Serving on ggml_cuda is not shape-invariant (not a TP fault: one GPU shows it, and legacy where it batches nothing).
+    A c4 step batches the four sequences' rows, and ggml-cuda rounds a 4-row step differently from a 1-row step, so three
+    of four first answers leave their solo answer at a near-tie paraphrase (characters 153-468), under `--tp 2` and on one
+    GPU alike; ggml_metal and MLX give 12/12 (§5.2), and legacy 12/12 only by serializing the requests (2.5x the wall time
+    under TP). A reused turn against a re-prefill differs the same way, for legacy too. §4.3's "4/4 identical" (and S3's
+    re-prefill replays) hold on Metal and MLX only; on ggml_cuda they need a near-tie-aware form, as the speculation gates
+    have.
+
+| Gate | Result |
+|---|---|
+| ggml_cuda `--tp 2` vs one GPU, p_4k teacher-forced (cos min / flips / KL mean) | **accepted** as legacy's noise class: Q4_K_XL 0.999848 / 5 / 2.23e-3 (legacy 0.999853 / 3 / 1.71e-3), IQ2_XXS 0.999677 / 7 / 8.0e-4 (legacy 0.99973 / 6 / 1.47e-3); every flip at a one-GPU top-two gap of 0.29 nat or less. Summing every partial exactly in F32 (`GGML_CUDA_ALLREDUCE=internal`, `GGML_CUDA_AR_BF16_THRESHOLD=0`; NCCL carries sums of 32,768+ floats in BF16), the runtime is no worse than legacy: Q4 3 flips, KL 1.64e-3 (legacy 3, 1.80e-3); IQ2 5 flips at gaps of 0.161 nat or less, KL 7.4e-4 (legacy 3 at 0.226 or less, 8.8e-4). The rest is the row-parallel products' split sums, in both families |
+| ggml_cuda perplexity, one GPU -> `--tp 2` | **passed**: 3.6043 -> 3.6060 (+0.05%), 4.1718 -> 4.1695 (-0.06%) |
+| G12: 16K-prompt greedy and "17 plus 25" under `--tp 2` | **passed** on ggml_cuda (both quants) and ggml_vulkan: identical to one GPU; 42 |
+| ggml_cuda speed, ABBA in one binary, runtime / legacy `--tp 2` | **passed**: prefill 1.25 / 1.07 / 1.04 (Q4_K_XL, 512 / 4K / 16K), 1.18 / 1.00 / 1.01 (IQ2_XXS); decode 1.03 / 1.02 / 1.37 and 1.05 / 1.04 / 1.39 |
+| Peak VRAM per GPU vs legacy `--tp 2` | **passed** after the head change: at 512, IQ2_XXS 5658 + 5661 MiB against legacy's 6286 + 5227, Q4_K_XL 8250 + 8237 against 8722 + 7835 (the larger GPU 5-10% lower, totals 0.4-1.7% lower; the slices balance the head over both GPUs). Before it, +4.7% and +7.5%. At 16K 5-7% lower (the rings) |
+| ggml_vulkan `--tp 2` vs one GPU (strict: cos >= 0.9999, no flip above 0.15 nat) | **passed**: IQ2_XXS cos 0.999930, one flip at a 0.008-nat tie, KL 1.94e-4 (legacy's own pair 0.999938, none, 1.90e-4); perplexity 4.1695 -> 4.1700, as legacy's. With 2048-row steps under `--tp`: cos 0.999933, one flip at 0.056 nat, KL 2.49e-4 against one GPU's 512-row steps (1.80e-4 against one GPU at 2048 rows) |
+| ggml_vulkan speed vs legacy Vulkan `--tp 2` (within 3%) | **passed** with the host-staged step rule: prefill 0.991 / 0.995 / 1.045 at 512 / 4K / 16K, decode 1.08 / 1.04 / 1.43 (ABBA). With 512-row steps it had failed at 4K and 16K (0.83, 0.89) |
+| `--layer-split 2` vs one GPU | **passed**: byte-identical logits and perplexity, both quants |
+| Serving under `--tp 2` (IQ2_XXS, the real server): multi-turn reuse | **passed** for the reuse: every later turn reuses its previous transcript whole on OpenAI and the Web UI (waste 0 or -1), as legacy's. A reused last turn's reply is not a fresh re-prefill's on ggml_cuda (`--replay`: runtime `--tp 2` 0 of 2 identical; the controls, runtime on one GPU and legacy `--tp 2`, 1 of 2 each), each a near-tie paraphrase from ggml-cuda's shape-dependent rounding, the c4 class below |
+| Serving under `--tp 2`: c4 vs sequential | **failed** (3 of 4 conversations leave their sequential answer in turn 1), **as on one ggml_cuda GPU** (the same 3 of 4): a ggml_cuda property of batched serving, not of `--tp` (above, S7) |
+| Images under `--tp 2` | **passed**: the four gate images answered as llama.cpp and legacy answer them (7319, Red, OCEAN, 3), on ggml_cuda and ggml_vulkan |
+| DFlash under `--tp` (D5) | **passed**: declined as legacy declines it |
+| Synthetic two-GPU tests, cuda and vulkan pins | **passed.** New: `PlacementsOnTwoGgml{Cuda,Vulkan}GpusGiveTheOneGpuLogits` (decode, ring-wrap, tied ring-wrap): tp 2 within 5.2e-3 (cuda) and 2.2e-3 (vulkan) of one GPU against legacy's own `--tp 2` spread of 4.6e-3 and 3.0e-3 on the same cases (the bound is 1.5x legacy's); two stages give the one-GPU bytes. The Qwen 3.5 and SharedRuntime Vulkan rank-graph rows pass; the GGML rank-graph rows also run speculation with the head on the host |
+| No regression elsewhere | **passed.** The runtime families' test classes (Qwen 3.5, Qwen 3.8, LFM3, SharedRuntime, Glimmer, block drafts, TP gates) on both pins, test by test against the base commit: 0 changed outcomes (the 5 failures on the cuda pin and 3 on the vulkan pin fail at the base too). On the Mac, S4's regression filter on the cpu and metal lanes keeps every outcome, and `RuntimeFamilyDigestTests` is byte-identical |
+| Hybrid TP x PP | **not run** (needs four devices) |
+
 ---
 
 ## 6. Decisions for the user
@@ -863,8 +951,8 @@ tokens each (`artifacts/glimmer-s5/prompts/mix5.jsonl`); "16K": 16.2K tokens of 
 | D1 | Prompt step width with rings: the runtime's 512 rows (2560-cell rings, llama.cpp's ubatch) or legacy's 2048 rows (4352 cells) | **Measure in S7, then choose per backend.** Keep 512 unless Glimmer's prefill is more than 2% slower than legacy on a backend. In that case the family declares 2048-row steps through a family hook (no new flag), in a DEFAULT CHANGE commit, since the step width changes the attention windows' arithmetic. On Metal, llama.cpp's 512-row ubatches already match legacy (pp4096 381.4 vs 382.6), and 512 halves the SWA KV (2560 vs 4352 cells) |
 | D2 | When legacy goes: in the switching change, or a stage after it | **S9, after the S8 switch.** Between them legacy is reachable only through the oracle test seam (no user switch), because it is the reference while S4-S7 change shared code (the H3-Image precedent) |
 | D3 | The vision tower: port it to a graph program (shared with Muse Spark), or wrap the per-op tower | **Port it (done in S4).** That deletes `ggml_ops_muse_glimmer_vision.cpp`, gives the tower every executor (MLX, direct CUDA, managed), and moves Muse Spark in the same stage under its tests |
-| D4 | `--tp` on ggml_vulkan: the runtime's ranked graphs are CUDA-only | **Enable ranked graphs on Vulkan (G6)** if a 2-GPU box can run Vulkan (A40s or A5000s can). Otherwise refuse `--tp` on ggml_vulkan with a message naming ggml_cuda. The refusal removes a legacy capability that was never measured, so the user decides |
-| D5 | DFlash under `--tp`: legacy declines it | **Keep the decline** in this series (parity). Drafting on rank 0 over per-rank verify graphs is a follow-up |
+| D4 | `--tp` on ggml_vulkan: the runtime's ranked graphs are CUDA-only | **Done in S6 as a DEFAULT CHANGE** ([§5.5](#55-s6-multi-gpu-status)): ranked graphs on Vulkan, measured on 2x RTX PRO 4500. The recommendation was: **Enable ranked graphs on Vulkan (G6)** if a 2-GPU box can run Vulkan (A40s or A5000s can). Otherwise refuse `--tp` on ggml_vulkan with a message naming ggml_cuda. The refusal removes a legacy capability that was never measured, so the user decides |
+| D5 | DFlash under `--tp`: legacy declines it | **Keep the decline** in this series (parity; done in S6, [§5.5](#55-s6-multi-gpu-status)). Drafting on rank 0 over per-rank verify graphs is a follow-up |
 | D6 | The per-op hooks (G3), or `RequiresGraphs => true` | **The hooks** (about half a day). Every SharedRuntime mechanism then holds, multi-node stages included, and Gemma 4 reuses them |
 | D7 | MLX pipelined greedy decode (`.MlxDecode.cs`, CLI `--benchmark` only) | **Delete it with legacy** if the runtime's MLX real-generation decode is at least legacy's. CLI `--benchmark` on MLX then measures the path serving uses. Port device argmax into `MlxGraphExecutor` (G8) only if the gate fails |
 | D8 | Retired names: `TS_MUSE_GLIMMER_PREFILL_CHUNK`, `_SWA_RING`, `_SWA_ROWS`, `_LAYER_TRACE` (+ `_POS`, `_N`, `_DIR`), `_VENC_TRACE`, `_MLX_STAGE_PROFILE`, `TS_MLX_KV_MATERIALIZE_INTERVAL` | **Retire all of them through the removed-names registry** (a hard error naming the replacement). The two traces are observers, a kept class, but nothing would implement them. Point them at the probe and `TS_GGML_NODE_PROFILE` rather than port a Glimmer-only trace |
@@ -913,8 +1001,8 @@ tokens each (`artifacts/glimmer-s5/prompts/mix5.jsonl`); "16K": 16.2K tokens of 
   in mask shapes and possibly in the gate/up split. IQ2_XXS leaves near-ties of 0.009 nat at long
   context (docs §4), so greedy text comparisons are noisy. The teacher-forced perplexity and
   near-tie checks are the primary quality gates; synthetic digests are the exactness gates.
-* **G12** may force linear caches under `--tp 2`, which costs KV memory legacy also pays (legacy
-  rings are off under TP).
+* **G12** (closed in S6): the rings stay on under `--tp 2`, read whole with one KV head a rank, and give the one-GPU
+  text; no linear caches were needed.
 * **G10** (closed in S2): the runtime's builder applies legacy's guard (`view_kv_cache_window`), and at d9fe7bff the
   hazard is gone on Blackwell. Ada was not run, and a ggml bump could bring the fault back; the guard covers both.
 * **MLX memory**: the 48 GB Mac panicked at 49.1 GB wired under MLX (memory

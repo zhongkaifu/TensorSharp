@@ -33,6 +33,26 @@ namespace TensorSharp.Models
         /// <summary>The most rows of one sequence a step writes into a ring (beyond the window): llama.cpp's default ubatch.</summary>
         internal const int RingStepRows = 512;
 
+        /// <summary>
+        /// The ring step where the placement's per-rank sums cross the host (<see cref="RankSumsCrossHost"/>): each prompt step
+        /// pays a host round trip for each of its reductions, so a 2048-row step (legacy's prompt chunk, and the runtime's
+        /// <c>TS_PREFILL_CHUNK</c> default where no ring caps the step) crosses a quarter as often as a 512-row one. Measured
+        /// on 2x RTX PRO 4500, Muse-Glimmer UD-IQ2_XXS, ggml-vulkan <c>--tp 2</c>: prefill 0.82x / 0.88x legacy's at 4K / 16K
+        /// with 512-row steps, 1.00x / 1.03x with 2048, decode unchanged.
+        /// </summary>
+        internal const int HostStagedRingStepRows = 2048;
+
+        /// <summary>
+        /// The rows of one sequence a step writes into a ring for this placement; the rings hold the window plus that many
+        /// cells (aligned). <see cref="RingStepRows"/>, but <see cref="HostStagedRingStepRows"/> when per-rank graphs sum
+        /// their partials through the host. The placement-chosen seam for the step width (design D1 / G4): a family or
+        /// backend that measures another width declares it here. <see cref="RingGeometryForTests"/> overrides it.
+        /// </summary>
+        protected virtual int RingStepRowsForPlacement => _rankSumsCrossHost ? HostStagedRingStepRows : RingStepRows;
+
+        /// <summary>The rows a step writes into a ring, as the rings were built (tests, probes).</summary>
+        internal int RingStepRowsInUse { get; private set; } = RingStepRows;
+
         /// <summary>Ring capacities are multiples of this (ggml-cuda groups a KV head's queries only over 256-multiple K; Metal's
         /// 64-cell decode windows divide it).</summary>
         internal const int RingAlignment = 256;
@@ -101,7 +121,8 @@ namespace TensorSharp.Models
 
         private void InitRingCaches()
         {
-            (int stepRows, int alignment) = RingGeometryForTests.Value ?? (RingStepRows, RingAlignment);
+            (int stepRows, int alignment) = RingGeometryForTests.Value ?? (RingStepRowsForPlacement, RingAlignment);
+            RingStepRowsInUse = stepRows;
             _ringCells = new int[TotalLayers];
             _maxSequenceStepRows = int.MaxValue;
             int window = 0, rings = 0, cells = 0;
@@ -120,7 +141,8 @@ namespace TensorSharp.Models
                 rings++;
             }
             if (rings > 0)
-                Console.WriteLine($"  Sliding-window caches: {rings} layers keep rings of {cells} cells (window {window} + {stepRows} rows a step); " +
+                Console.WriteLine($"  Sliding-window caches: {rings} layers keep rings of {cells} cells (window {window} + {stepRows} rows a step" +
+                    (RingGeometryForTests.Value == null && _rankSumsCrossHost ? ", wide: the ranks' sums cross the host" : "") + "); " +
                     $"prompt steps carry at most {Math.Min(_maxSequenceStepRows, stepRows)} rows a sequence.");
             if (_maxSequenceStepRows != int.MaxValue) _maxSequenceStepRows = Math.Min(_maxSequenceStepRows, stepRows);
         }

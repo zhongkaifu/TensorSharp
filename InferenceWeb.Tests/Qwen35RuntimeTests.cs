@@ -410,14 +410,24 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("dense", KvCacheDtype.F16)]
     [InlineData("dense-tied", KvCacheDtype.F16)]
     [InlineData("moe-tp", KvCacheDtype.F32)]
-    public void GgmlCudaRankGraphsMatchOneDevice(string variant, KvCacheDtype kv)
+    public void GgmlCudaRankGraphsMatchOneDevice(string variant, KvCacheDtype kv) => GgmlRankGraphsMatchOneDevice(BackendType.GgmlCuda, variant, kv);
+
+    /// <summary>The same over two ggml_vulkan GPUs, whose partials sum through host staging (no device collective).</summary>
+    [GgmlTheory(BackendType.GgmlVulkan, Devices = 2)]
+    [InlineData("dense", KvCacheDtype.F32)]
+    [InlineData("dense", KvCacheDtype.F16)]
+    [InlineData("dense-tied", KvCacheDtype.F16)]
+    [InlineData("moe-tp", KvCacheDtype.F32)]
+    public void GgmlVulkanRankGraphsMatchOneDevice(string variant, KvCacheDtype kv) => GgmlRankGraphsMatchOneDevice(BackendType.GgmlVulkan, variant, kv);
+
+    private void GgmlRankGraphsMatchOneDevice(BackendType backend, string variant, KvCacheDtype kv)
     {
         KvCacheDtypeConfig.RestoreForTests(kv, true);
         string path = Fixture(variant);
         List<float[]> reference;
-        using (var single = Create(path, backend: BackendType.GgmlCuda))
+        using (var single = Create(path, backend: backend))
             reference = Script(single);
-        using var placed = new Qwen35RuntimeModel(path, BackendType.GgmlCuda, 2, null, 1);
+        using var placed = new Qwen35RuntimeModel(path, backend, 2, null, 1);
         Assert.Equal(2, placed.Mesh.TensorParallel);
         List<float[]> actual = Script(placed);
         Assert.True(placed.GraphRuns > 0 && placed.GraphReplays > 0, $"{variant}: the per-rank graphs did not run and replay");
