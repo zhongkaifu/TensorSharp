@@ -1,0 +1,76 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using TensorSharp.Graph;
+
+namespace TensorSharp.Models
+{
+    /// <summary>
+    /// Muse-Glimmer in whole-forward graphs, node for node as legacy's fused graph (TSGgml_MuseGlimmerModelForward) emits each
+    /// layer: the weightless input RMSNorm, per-head Q/K RMSNorm then the NORM rotary on the sliding-window layers, the
+    /// elementwise output gate from the attention input, and the runtime's sliding-window attention, sandwich norms (at
+    /// <see cref="MuseGlimmerRuntimeModel.PostNormEpsilon"/>), SwiGLU feed-forward and logit transform. Every per-position
+    /// input is a standard one (positions, write rows, decode and sliding-window masks), so decode steps advance in place.
+    /// The measured choices below start at LFM3's (the closest family: sliding-window rings, sandwich norms, QK norms);
+    /// stage S7 measures each on Muse-Glimmer.
+    /// </summary>
+    internal sealed partial class MuseGlimmerRuntimeModel
+    {
+        /// <summary>The NORM rotary of the sliding-window layers; the full layers emit none (<see cref="EmitQueryKey"/>).</summary>
+        protected override RotarySpec GraphRotary => _rope;
+
+        /// <summary>Decode steps (the replayable graphs) run under ggml-metal's concurrency reorder, as legacy's persistent
+        /// decode graph did (graph_optimize on its persist builds only) and as LFM3 measured faster.</summary>
+        protected override bool GraphConcurrencyReorder => true;
+
+        /// <summary>A prompt step's last layer runs its feed-forward on the rows the head reads only, as llama.cpp's graph does
+        /// (LFM3's measurement; S7 measures it here).</summary>
+        protected override bool PrunesLastLayerRows => true;
+
+        /// <summary>LFM3's rule: ggml-cuda keeps same-type Q8_0 and Q4_K gate/up apart (one MMQ/MMVQ with the GLU in its
+        /// write-back), ggml-cpu keeps the types it repacks apart; everything else (the IQ2_S pairs of the UD files on Metal and
+        /// MLX) stays fused as legacy runs it. S7 measures it on Muse-Glimmer's quants.</summary>
+        protected override bool KeepsGateUpApart(int gateType, int upType)
+            => (_backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */)
+               || (_backend == BackendType.GgmlCpu && gateType == upType && CpuRepacks(gateType));
+
+        /// <summary>The types ggml-cpu repacks (ggml_ops_cpu_graph.cpp repackable_type), when this build and machine repack.</summary>
+        private static bool CpuRepacks(int ggmlType)
+            => ggmlType is 2 /* Q4_0 */ or 8 /* Q8_0 */ or 12 /* Q4_K */ or 13 /* Q5_K */ or 14 /* Q6_K */ or 20 /* IQ4_NL */ or 39 /* MXFP4 */
+               && TensorSharp.GGML.GgmlBasicOps.CpuRepacksWeights();
+
+        /// <summary>A plain prompt's steps overlap on the device: no recurrent state, and the caches stay on the device between
+        /// steps, so nothing between them reads the device back.</summary>
+        protected override bool OverlapsPromptSteps => true;
+
+        /// <summary>On ggml-vulkan a prompt chunk attends the padded F16 cache window, as decode rows do (LFM3's measurement;
+        /// validated for Muse-Glimmer on the VM in S2's CUDA part).</summary>
+        protected override bool PadsPromptWindowsOnVulkan => true;
+
+        /// <summary>Attention follows positions through the step's standard inputs, its sliding-window masks included, and the
+        /// emission has no side effects of its own.</summary>
+        protected override bool DecodeStepsAdvance => true;
+
+        /// <summary>The weightless input RMSNorm over the embedded rows [hidden, rows] (media rows already injected).</summary>
+        protected override int EmitStreamInput(GraphStep step, int embedded)
+            => step.Op(GraphOp.RmsNorm, stackalloc[] { embedded }, default, stackalloc[] { Config.Eps });
+
+        /// <summary>Per-head Q/K RMSNorm, then the NORM rotary on the sliding-window layers only.</summary>
+        protected override void EmitQueryKey(GraphStep step, int layer, ref int q, ref int k)
+        {
+            q = step.RmsNorm(q, LayerName(layer, "attn_q_norm.weight"));
+            k = step.RmsNorm(k, LayerName(layer, "attn_k_norm.weight"));
+            if (!_isSwa[layer]) return;
+            q = step.Rope(q, _rope);
+            k = step.Rope(k, _rope);
+        }
+
+        /// <summary>attn [dv * heads, rows] times sigmoid(attn_gate · x) [q_dim, rows], elementwise (the rank's heads' rows under
+        /// tensor parallelism: attn_gate shards by head blocks).</summary>
+        protected override int EmitAttentionOutput(GraphStep step, int layer, int x, int attn)
+            => step.Op(GraphOp.Mul, attn, step.Op(GraphOp.Sigmoid, step.MatMul(LayerName(layer, "attn_gate.weight"), x)));
+    }
+}

@@ -206,6 +206,90 @@ public sealed class MuseGlimmerLegacyRealTests(ITestOutputHelper output)
     }
 }
 
+/// <summary>
+/// The unified-runtime family (<see cref="MuseGlimmerRuntimeModel"/>, through its test seam) on the real weights against the
+/// legacy outputs frozen on the same lane (<see cref="MuseGlimmerLegacyReal"/>), with docs/design/muse-glimmer-unified.md
+/// section 4.2's gates: each greedy continuation is legacy's token for token, or it first leaves legacy's at a near-tie (the
+/// token it takes is in legacy's top four there, less than <see cref="NearTieNats"/> below legacy's choice); the corpus's
+/// teacher-forced perplexity is legacy's within <see cref="PerplexityBound"/> relative and its top-1 agreement within
+/// <see cref="Top1Bound"/>. A move past <see cref="InvestigateBound"/> is printed for investigation (legacy's own two Mac
+/// backends are 0.006% apart).
+/// </summary>
+public sealed class MuseGlimmerRuntimeRealTests(ITestOutputHelper output)
+{
+    internal const double NearTieNats = 0.05;
+    internal const double PerplexityBound = 3e-3;
+    internal const double InvestigateBound = 5e-4;
+    internal const double Top1Bound = 0.005;
+
+    private static MuseGlimmerLegacyReal.Lane Frozen(BackendType backend)
+    {
+        var frozen = MuseGlimmerLegacyReal.Find(MuseGlimmerGoldens.LaneKey(backend));
+        Assert.True(frozen != null, $"no real-weight legacy outputs frozen on {MuseGlimmerGoldens.LaneKey(backend)} (lanes: {string.Join("; ", MuseGlimmerLegacyReal.Lanes)})");
+        return frozen;
+    }
+
+    [MuseGlimmerModelFact]
+    public void RuntimeGreedyContinuationsAreLegacysOrLeaveThemAtANearTie()
+    {
+        BackendType backend = MuseGlimmerParity.Backend();
+        var frozen = Frozen(backend);
+        using ModelBase model = MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend);
+        var prompts = MuseGlimmerLegacyReal.Prompts().ToList();
+        Assert.Equal(prompts.Count, frozen.Continuations.Count);
+        var failures = new List<string>();
+        int identical = 0;
+        double worstPrefixDelta = 0;
+        for (int r = 0; r < prompts.Count; r++)
+        {
+            var want = frozen.Continuations[r];
+            Assert.Equal(want.PromptSha256, MuseGlimmerLegacyReal.PromptSha(prompts[r].PromptTokens));
+            var got = MuseGlimmerLegacyReal.Continue(model, prompts[r]);
+            int first = Enumerable.Range(0, want.Tokens.Length).FirstOrDefault(i => want.Tokens[i] != got.Tokens[i], -1);
+            int prefix = first < 0 ? want.Tokens.Length : first;
+            for (int i = 0; i < prefix; i++)
+                worstPrefixDelta = Math.Max(worstPrefixDelta, Math.Abs(want.Top[i][0].Logprob - got.Top[i][0].Logprob));
+            if (first < 0)
+            {
+                identical++;
+                output.WriteLine($"[SAME  ] {want.Name}: {want.Tokens.Length} tokens, legacy's");
+                continue;
+            }
+            var legacyTop = want.Top[first];
+            double legacyMargin = legacyTop.Length > 1 ? legacyTop[0].Logprob - legacyTop[1].Logprob : double.PositiveInfinity;
+            int ours = got.Tokens[first];
+            double? legacyGap = legacyTop.Where(t => t.Id == ours).Select(t => (double?)(legacyTop[0].Logprob - t.Logprob)).FirstOrDefault();
+            string text = model.Tokenizer.Decode(got.Tokens.ToList()).Replace('\n', ' ');
+            string what = $"{want.Name} @{first}: legacy {want.Tokens[first]} '{MuseGlimmerParity.Decode(model, want.Tokens[first])}', " +
+                $"ours {ours} '{MuseGlimmerParity.Decode(model, ours)}'; legacy's top-2 margin {legacyMargin:F4}, legacy's gap to ours " +
+                (legacyGap is { } g ? g.ToString("F4") : "(not in its top 4)");
+            output.WriteLine($"[DIFF  ] {what}\n          ours: {(text.Length > 400 ? text[..400] + "..." : text)}");
+            if (legacyGap is not { } gap || gap >= NearTieNats)
+                failures.Add(what);
+        }
+        output.WriteLine($"{identical}/{prompts.Count} continuations identical to legacy's; worst |dlogprob| of legacy's token over the shared " +
+            $"prefixes {worstPrefixDelta:F4}");
+        Assert.True(failures.Count == 0, "continuations that leave legacy's at a position that is not a near-tie:\n" + string.Join("\n", failures));
+    }
+
+    [MuseGlimmerModelFact]
+    public void RuntimePerplexityIsLegacys()
+    {
+        BackendType backend = MuseGlimmerParity.Backend();
+        var frozen = Frozen(backend);
+        using ModelBase model = MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend);
+        var got = MuseGlimmerLegacyReal.ScoreCorpus(model);
+        double rel = got.Value / frozen.Nll.Value - 1, top1 = got.Top1Agreement - frozen.Nll.Top1Agreement;
+        output.WriteLine($"perplexity {got.Value:F6} (legacy {frozen.Nll.Value:F6}, {rel:+0.0000%;-0.0000%}), mean NLL {got.MeanNll:F6} " +
+            $"(legacy {frozen.Nll.MeanNll:F6}), top-1 {got.Top1Agreement:P2} (legacy {frozen.Nll.Top1Agreement:P2}) over {got.Scored} tokens" +
+            (Math.Abs(rel) > InvestigateBound ? $"; moved more than {InvestigateBound:P2}: investigate" : ""));
+        Assert.Equal(frozen.Nll.TextSha256, got.TextSha256);
+        Assert.Equal(frozen.Nll.Scored, got.Scored);
+        Assert.True(Math.Abs(rel) <= PerplexityBound, $"perplexity {got.Value:F5} vs legacy {frozen.Nll.Value:F5} ({rel:P3})");
+        Assert.True(Math.Abs(top1) <= Top1Bound, $"top-1 agreement {got.Top1Agreement:P2} vs legacy {frozen.Nll.Top1Agreement:P2}");
+    }
+}
+
 /// <summary>Writes Fixtures/MuseGlimmer/LegacyReal/&lt;lane&gt;.json (<see cref="MuseGlimmerLegacyReal"/>) on the backend the parity
 /// tests run on, into the directory TS_TEST_FREEZE_MUSE_GLIMMER_REAL names. Needs the weights (TS_TEST_MODEL_DIR).</summary>
 [Trait("Category", "Bench")]

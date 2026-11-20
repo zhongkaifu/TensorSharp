@@ -11,6 +11,16 @@ namespace TensorSharp.Models
     /// <summary>Muse-Glimmer architecture plug-in.</summary>
     internal static class MuseGlimmerArchitecture
     {
+        /// <summary>
+        /// The test seam of the unified-runtime family (<see cref="MuseGlimmerRuntimeModel"/>) before the switch: tests, the
+        /// KV-grow probe and benchmarks build it here from a GGUF, while <see cref="Descriptor"/>'s factory builds the legacy
+        /// <see cref="MuseGlimmerModel"/> until stage S8 of docs/design/muse-glimmer-unified.md, which points the factory here.
+        /// No option, switch or environment variable reaches it.
+        /// </summary>
+        internal static ModelBase CreateRuntimeModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            int layerSplitDegree = 1, string draftModelPath = null)
+            => new MuseGlimmerRuntimeModel(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath);
+
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
             Id = "muse-glimmer",

@@ -263,10 +263,14 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     /// three times the legacy model's worst on ggml_metal and MLX).</summary>
     private const double FirstPositionLogprobBound = 0.15;
 
-    private static ModelBase Load(string draft = null)
+    /// <summary>The model the descriptor builds (the legacy one until stage S8), or with <paramref name="runtime"/> the
+    /// unified-runtime family through its test seam.</summary>
+    private static ModelBase Load(string draft = null, bool runtime = false)
     {
         BackendType backend = MuseGlimmerParity.Backend();
-        var model = ModelBase.Create(MuseGlimmerParity.FindModel(), backend, draftModelPath: draft);
+        var model = runtime
+            ? MuseGlimmerArchitecture.CreateRuntimeModel(MuseGlimmerParity.FindModel(), backend, draftModelPath: draft)
+            : ModelBase.Create(MuseGlimmerParity.FindModel(), backend, draftModelPath: draft);
         Assert.Equal("muse-glimmer", model.Config.Architecture);
         return model;
     }
@@ -346,9 +350,27 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
         CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text_long.json"));
     }
 
+    /// <summary><see cref="TeacherForcedContinuationsMatchLlamaCpp"/> on the unified-runtime family (stage S2 of
+    /// docs/design/muse-glimmer-unified.md), held to the same gates.</summary>
+    [MuseGlimmerModelFact]
+    public void RuntimeTeacherForcedContinuationsMatchLlamaCpp()
+    {
+        using var model = Load(runtime: true);
+        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text.json"));
+    }
+
+    /// <summary><see cref="LongContextMatchesLlamaCpp"/> on the unified-runtime family: the 4,664-token prompt wraps its
+    /// 2,560-cell rings in 512-row steps before the first generated token.</summary>
+    [MuseGlimmerModelFact]
+    public void RuntimeLongContextMatchesLlamaCpp()
+    {
+        using var model = Load(runtime: true);
+        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text_long.json"));
+    }
+
     private void CheckAgainstLlamaCpp(ModelBase model, MuseGlimmerParity.GoldenFile file)
     {
-        output.WriteLine($"backend {MuseGlimmerParity.Backend()}; llama.cpp {file.LlamaCppCommit}; model sha256 {file.ModelSha256}");
+        output.WriteLine($"backend {MuseGlimmerParity.Backend()}; model {model.GetType().Name}; llama.cpp {file.LlamaCppCommit}; model sha256 {file.ModelSha256}");
         int total = 0, agree = 0;
         double worstOurGap = 0, worstReferenceGap = 0, worstFirst = 0;
         var failures = new List<string>();
