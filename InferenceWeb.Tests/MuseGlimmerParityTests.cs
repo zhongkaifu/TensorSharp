@@ -11,7 +11,10 @@
 // chat prompts and of a 4,664-token prompt, with the top log-probabilities of every generated token, made by
 // eng/validation/muse-glimmer-llamacpp-goldens.py from Muse-Glimmer-30B-UD-IQ2_XXS. The model is fed the RECORDED prompt
 // token ids and then teacher-forced through llama.cpp's continuation, so every generated position is compared and the
-// forward pass is compared apart from the tokenizer, which has its own test.
+// forward pass is compared apart from the tokenizer, which has its own test. There is one set of goldens per ggml backend
+// llama.cpp was built for (Metal, CUDA, Vulkan: the same prompts, llama.cpp commit and generator), and each lane is held to
+// the set of its own ggml backend (MuseGlimmerParity.GoldenSet), because the backends' rounding alone moves the first
+// generated position's log-probabilities by more than the bound at IQ2_XXS.
 //
 // Inputs (read, never set):
 //   TS_TEST_MODEL_DIR          directory holding Muse-Glimmer-30B-UD-IQ2_XXS.gguf (and dflash*.gguf for the DFlash test)
@@ -63,17 +66,54 @@ internal static class MuseGlimmerParity
 
     internal sealed record Golden(string Name, string Prompt, int[] PromptTokens, int[] Generated, Step[] Steps);
 
-    internal sealed record GoldenFile(string LlamaCppCommit, string ModelSha256, IReadOnlyList<Golden> Records);
+    internal sealed record GoldenFile(string LlamaCppCommit, string ModelSha256, IReadOnlyList<Golden> Records, string Backend);
+
+    /// <summary>
+    /// The llama.cpp golden sets, one per ggml backend llama.cpp d3c3e242c was built for, from the same prompts and the same
+    /// generator (eng/validation/muse-glimmer-llamacpp-goldens.py): Fixtures/MuseGlimmer/LlamaCpp/ is Metal's (M5 Pro),
+    /// LlamaCpp/cuda/ CUDA's and LlamaCpp/vulkan/ Vulkan's (an RTX PRO 4500 Blackwell, sm_120). Only the backend's rounding
+    /// differs between them, and at IQ2_XXS that moves the first generated position's log-probabilities by up to 1.7 nats
+    /// between llama.cpp's own Metal and CUDA builds, so each lane is held to the set of its own ggml backend
+    /// (<see cref="GoldenSet"/>), at the same bounds.
+    /// </summary>
+    internal static readonly IReadOnlyList<string> GoldenSets = new[] { "metal", "cuda", "vulkan" };
+
+    /// <summary>
+    /// The golden set a backend is held to: ggml_metal and MLX Metal's, ggml_cuda CUDA's, ggml_vulkan Vulkan's. The others were
+    /// measured (<see cref="MuseGlimmerGoldenSetAffinityTests"/>; RTX PRO 4500 Blackwell box, the mean over the five short prompts
+    /// of the first position's worst top-10 difference, against Metal's, CUDA's and Vulkan's sets):
+    /// <list type="bullet">
+    /// <item>direct CUDA: 0.045 / 0.752 / 0.247 (legacy), 0.054 / 0.749 / 0.246 (runtime). It is Metal's: its float
+    /// activations round like Metal's and MLX's.</item>
+    /// <item>the managed backend: 1.59 / 1.71 / 1.61 (legacy), 1.92 / 2.18 / 1.89 (runtime); ggml_cpu (x64): 1.86 / 2.04 / 1.86 and
+    /// 1.84 / 2.22 / 1.77. No set is near (the CPU products quantize their activations), so these take Metal's by default and
+    /// do not meet the first-position bound against any set (ggml_cpu: 626/640 and 630/640 teacher-forced). llama.cpp's own
+    /// CPU build (d3c3e242c, not committed) is 0.72-1.45 nats from Metal's set too, and its greedy continuations leave Metal's
+    /// on all six prompts.</item>
+    /// </list>
+    /// </summary>
+    internal static string GoldenSet(BackendType backend) => backend switch
+    {
+        BackendType.GgmlCuda => "cuda",
+        BackendType.GgmlVulkan => "vulkan",
+        _ => "metal",
+    };
 
     private static readonly Dictionary<string, GoldenFile> s_files = new(StringComparer.Ordinal);
 
-    internal static GoldenFile Load(string name)
+    /// <summary>A file of the Metal set. Its prompts (and their tokens) are every set's.</summary>
+    internal static GoldenFile Load(string name) => Load(name, "metal");
+
+    /// <summary>A file of the golden set <paramref name="set"/> (<see cref="GoldenSets"/>).</summary>
+    internal static GoldenFile Load(string name, string set)
     {
+        string key = set + "/" + name;
         lock (s_files)
         {
-            if (s_files.TryGetValue(name, out GoldenFile cached)) return cached;
-            using Stream s = typeof(MuseGlimmerParity).Assembly.GetManifestResourceStream(ResourcePrefix + name)
-                ?? throw new FileNotFoundException($"golden {name} is not embedded (Fixtures/MuseGlimmer/LlamaCpp)");
+            if (s_files.TryGetValue(key, out GoldenFile cached)) return cached;
+            string resource = ResourcePrefix + (set == "metal" ? "" : set + ".") + name;
+            using Stream s = typeof(MuseGlimmerParity).Assembly.GetManifestResourceStream(resource)
+                ?? throw new FileNotFoundException($"golden {key} is not embedded (Fixtures/MuseGlimmer/LlamaCpp)");
             using JsonDocument doc = JsonDocument.Parse(s);
             JsonElement root = doc.RootElement;
             var records = new List<Golden>();
@@ -87,9 +127,12 @@ internal static class MuseGlimmerParity
                     r.GetProperty("prompt_tokens").EnumerateArray().Select(e => e.GetInt32()).ToArray(),
                     r.GetProperty("generated_tokens").EnumerateArray().Select(e => e.GetInt32()).ToArray(), steps));
             }
-            var file = new GoldenFile(root.GetProperty("llama_cpp").GetProperty("commit").GetString(),
-                root.GetProperty("model").GetProperty("sha256").GetString(), records);
-            s_files[name] = file;
+            JsonElement llama = root.GetProperty("llama_cpp");
+            // The Metal set predates the generator's --backend and carries no label.
+            string backend = llama.TryGetProperty("backend", out JsonElement b) ? b.GetString() : "metal";
+            var file = new GoldenFile(llama.GetProperty("commit").GetString(), root.GetProperty("model").GetProperty("sha256").GetString(),
+                records, backend);
+            s_files[key] = file;
             return file;
         }
     }
@@ -266,6 +309,15 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     /// three times the legacy model's worst on ggml_metal and MLX).</summary>
     private const double FirstPositionLogprobBound = 0.15;
 
+    /// <summary>The bound on plain greedy's top-2 margin (its two best log-probabilities) at a position where the DFlash path's
+    /// token may differ from plain greedy's: the verify forwards score several rows at once, and a ggml backend whose
+    /// batched products round differently from its one-row ones (ggml_cuda, direct CUDA) flips such near-ties, as llama.cpp's
+    /// own CUDA DFlash does on these prompts.</summary>
+    internal const double DFlashNearTieNats = 0.15;
+
+    /// <summary>The golden set this lane is held to (<see cref="MuseGlimmerParity.GoldenSet"/>).</summary>
+    private static string LaneSet => MuseGlimmerParity.GoldenSet(MuseGlimmerParity.Backend());
+
     /// <summary>The model the descriptor builds (the legacy one until stage S8), or with <paramref name="runtime"/> the
     /// unified-runtime family through its test seam.</summary>
     private static ModelBase Load(string draft = null, bool runtime = false)
@@ -278,37 +330,65 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
         return model;
     }
 
-    /// <summary>The goldens themselves (no weights): one record per prompt with a step for every generated token, llama.cpp's
-    /// greedy token at the top of its own distribution, a long prompt past twice the window and legacy's 4352-row ring, and
-    /// llama.cpp's DFlash path reproducing its plain continuation token for token.</summary>
+    /// <summary>The goldens themselves (no weights), every set: one record per prompt with a step for every generated token,
+    /// llama.cpp's greedy token at the top of its own distribution, a long prompt past twice the window and legacy's 4352-row
+    /// ring, the same prompts and prompt tokens and the same llama.cpp commit and model in every set, and llama.cpp's DFlash
+    /// path reproducing its plain continuation, or leaving it first where the plain one's top-2 margin is a near-tie
+    /// (<see cref="DFlashNearTieNats"/>; Metal's DFlash is identical on all five prompts).</summary>
     [Fact]
     public void GoldensAreWellFormed()
     {
-        var text = MuseGlimmerParity.Load("ref_text.json");
-        var longText = MuseGlimmerParity.Load("ref_text_long.json");
-        var dflash = MuseGlimmerParity.Load("ref_text_dflash.json");
-        Assert.Equal(5, text.Records.Count);
-        Assert.Single(longText.Records);
-        foreach (var golden in text.Records.Concat(longText.Records))
+        var metal = MuseGlimmerParity.Load("ref_text.json");
+        var metalLong = MuseGlimmerParity.Load("ref_text_long.json");
+        foreach (string set in MuseGlimmerParity.GoldenSets)
         {
-            Assert.Equal(128, golden.Generated.Length);
-            Assert.Equal(golden.Generated.Length, golden.Steps.Length);
-            for (int i = 0; i < golden.Steps.Length; i++)
+            var text = MuseGlimmerParity.Load("ref_text.json", set);
+            var longText = MuseGlimmerParity.Load("ref_text_long.json", set);
+            var dflash = MuseGlimmerParity.Load("ref_text_dflash.json", set);
+            Assert.Equal(set, text.Backend);
+            Assert.Equal(set, longText.Backend);
+            Assert.Equal(5, text.Records.Count);
+            Assert.Single(longText.Records);
+            foreach (var golden in text.Records.Concat(longText.Records))
             {
-                Assert.Equal(golden.Generated[i], golden.Steps[i].Top[0].Id);
-                Assert.Equal(i == 0 ? 10 : 4, golden.Steps[i].Top.Length);
+                Assert.Equal(128, golden.Generated.Length);
+                Assert.Equal(golden.Generated.Length, golden.Steps.Length);
+                for (int i = 0; i < golden.Steps.Length; i++)
+                {
+                    Assert.Equal(golden.Generated[i], golden.Steps[i].Top[0].Id);
+                    Assert.Equal(i == 0 ? 10 : 4, golden.Steps[i].Top.Length);
+                }
+            }
+            Assert.True(longText.Records[0].PromptTokens.Length > 4352,
+                $"the long golden has {longText.Records[0].PromptTokens.Length} prompt tokens; it must pass legacy's 4352-row ring");
+            Assert.Equal(metal.Records.Select(r => r.Name), text.Records.Select(r => r.Name));
+            for (int i = 0; i < text.Records.Count; i++)
+                Assert.Equal(metal.Records[i].PromptTokens, text.Records[i].PromptTokens);
+            Assert.Equal(metalLong.Records[0].PromptTokens, longText.Records[0].PromptTokens);
+            Assert.Equal(metal.LlamaCppCommit, text.LlamaCppCommit);
+            Assert.Equal(metal.ModelSha256, text.ModelSha256);
+            Assert.Equal(text.LlamaCppCommit, longText.LlamaCppCommit);
+            Assert.Equal(text.ModelSha256, dflash.ModelSha256);
+            Assert.Equal(text.Records.Select(r => r.Name), dflash.Records.Select(r => r.Name));
+            for (int i = 0; i < text.Records.Count; i++)
+            {
+                var plain = text.Records[i];
+                Assert.Equal(plain.PromptTokens, dflash.Records[i].PromptTokens);
+                int[] d = dflash.Records[i].Generated;
+                int k = Enumerable.Range(0, plain.Generated.Length).FirstOrDefault(j => d[j] != plain.Generated[j], -1);
+                if (k < 0)
+                {
+                    output.WriteLine($"[{set}] dflash {plain.Name}: identical to plain");
+                    continue;
+                }
+                var top = plain.Steps[k].Top;
+                double margin = top[0].Logprob - top[1].Logprob;
+                output.WriteLine($"[{set}] dflash {plain.Name}: leaves plain at @{k} (plain {plain.Generated[k]}, dflash {d[k]}" +
+                    $"{(top[1].Id == d[k] ? ", plain's second" : "")}); plain's top-2 margin {margin:F4} nat");
+                Assert.True(margin < DFlashNearTieNats,
+                    $"{set}: llama.cpp's DFlash leaves its plain {plain.Name} at @{k}, where plain's top-2 margin is {margin:F4} nat");
             }
         }
-        Assert.True(longText.Records[0].PromptTokens.Length > 4352,
-            $"the long golden has {longText.Records[0].PromptTokens.Length} prompt tokens; it must pass legacy's 4352-row ring");
-        Assert.Equal(text.Records.Select(r => r.Name), dflash.Records.Select(r => r.Name));
-        for (int i = 0; i < text.Records.Count; i++)
-        {
-            Assert.Equal(text.Records[i].PromptTokens, dflash.Records[i].PromptTokens);
-            Assert.Equal(text.Records[i].Generated, dflash.Records[i].Generated);
-        }
-        Assert.Equal(text.LlamaCppCommit, longText.LlamaCppCommit);
-        Assert.Equal(text.ModelSha256, dflash.ModelSha256);
     }
 
     /// <summary>Our tokenizer reproduces llama.cpp's tokenization of every golden prompt (the GGUF's metadata only: no
@@ -341,7 +421,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     public void TeacherForcedContinuationsMatchLlamaCpp()
     {
         using var model = Load();
-        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text.json"));
+        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text.json", LaneSet));
     }
 
     /// <summary>The same over the 4,664-token prompt: the sliding window (2048), the full layers' cache growth and legacy's
@@ -350,7 +430,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     public void LongContextMatchesLlamaCpp()
     {
         using var model = Load();
-        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text_long.json"));
+        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text_long.json", LaneSet));
     }
 
     /// <summary><see cref="TeacherForcedContinuationsMatchLlamaCpp"/> on the unified-runtime family (stage S2 of
@@ -359,7 +439,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     public void RuntimeTeacherForcedContinuationsMatchLlamaCpp()
     {
         using var model = Load(runtime: true);
-        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text.json"));
+        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text.json", LaneSet));
     }
 
     /// <summary><see cref="LongContextMatchesLlamaCpp"/> on the unified-runtime family: the 4,664-token prompt wraps its
@@ -368,12 +448,13 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     public void RuntimeLongContextMatchesLlamaCpp()
     {
         using var model = Load(runtime: true);
-        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text_long.json"));
+        CheckAgainstLlamaCpp(model, MuseGlimmerParity.Load("ref_text_long.json", LaneSet));
     }
 
     private void CheckAgainstLlamaCpp(ModelBase model, MuseGlimmerParity.GoldenFile file)
     {
-        output.WriteLine($"backend {MuseGlimmerParity.Backend()}; model {model.GetType().Name}; llama.cpp {file.LlamaCppCommit}; model sha256 {file.ModelSha256}");
+        output.WriteLine($"backend {MuseGlimmerParity.Backend()}; model {model.GetType().Name}; llama.cpp {file.LlamaCppCommit} " +
+            $"({file.Backend} goldens); model sha256 {file.ModelSha256}");
         int total = 0, agree = 0;
         double worstOurGap = 0, worstReferenceGap = 0, worstFirst = 0;
         var failures = new List<string>();
@@ -410,43 +491,86 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     }
 
     /// <summary>
-    /// DFlash is lossless speculative decoding: every drafted token is verified by the target, so the greedy output must be
-    /// the plain greedy output token for token. (llama.cpp's own DFlash path reproduces its plain continuations on these
-    /// prompts: <see cref="GoldensAreWellFormed"/>.)
+    /// DFlash is lossless speculative decoding: every drafted token is verified by the target, so its greedy output is the
+    /// plain greedy output, except where the verify forward's rounding (several rows at once) flips a near-tie the one-row
+    /// decode resolved the other way. So the DFlash output must equal plain greedy's, or leave it only where plain greedy's
+    /// top-2 margin is below <see cref="DFlashNearTieNats"/>; past each such position both are resumed from plain greedy's
+    /// prefix (teacher-forced: plain's token is fed), and must agree again, to the end of the continuation. A resumed run
+    /// prefills that prefix in one forward, which rounds its rows differently from the one-row decode that produced them, so
+    /// the plain reference past a divergence is plain greedy resumed from the same prefix the same way (the drafted model's
+    /// own plain forwards), not the first run's tail. Every divergence is printed with its margin. (llama.cpp's own DFlash:
+    /// <see cref="GoldensAreWellFormed"/>.)
     /// </summary>
     [MuseGlimmerModelFact(NeedsDraft = true)]
     public void DFlashDraftingIsLossless()
     {
         var records = MuseGlimmerParity.Load("ref_text.json").Records;
-        var plain = new List<int[]>();
+        var plain = new List<MuseGlimmerLegacyReal.Continuation>();
         using (var model = Load())
             foreach (var golden in records)
-                plain.Add(MuseGlimmerParity.GreedyContinue(model, golden.PromptTokens, golden.Generated.Length));
+                plain.Add(MuseGlimmerLegacyReal.Continue(model, golden));
 
         using var drafted = Load(MuseGlimmerParity.FindDraft());
         var spec = drafted as ISpeculativeModel;
         Assert.NotNull(spec);
         Assert.True(spec.HasDraftHead, "the DFlash drafter did not arm (HasDraftHead is false)");
         var decoder = new SpeculativeDecoder(spec, spec.DraftBlockSize);
-        int mismatches = 0;
+        // GenerateGreedy starts the statistics over on every call: sum them per call.
+        long totalDrafted = 0, accepted = 0, verifies = 0, plains = 0;
+        int identical = 0, divergences = 0;
+        double worstMargin = 0;
+        var failures = new List<string>();
         for (int r = 0; r < records.Count; r++)
         {
             var golden = records[r];
-            drafted.ResetKVCache();
-            int[] produced = decoder.GenerateGreedy(golden.PromptTokens, golden.Generated.Length).Take(golden.Generated.Length).ToArray();
-            int prefix = Enumerable.Range(0, golden.Generated.Length).FirstOrDefault(i => plain[r][i] != golden.Generated[i], golden.Generated.Length);
-            if (produced.SequenceEqual(plain[r]))
-                output.WriteLine($"[MATCH ] {golden.Name}: {produced.Length} tokens, the plain greedy ones (llama.cpp's for the first {prefix})");
-            else
+            int[] want = (int[])plain[r].Tokens.Clone();
+            var tops = ((int Id, double Logprob)[][])plain[r].Top.Clone();
+            int n = want.Length, start = 0;
+            var notes = new List<string>();
+            while (start < n)
             {
-                mismatches++;
-                output.WriteLine($"[DIFF  ] {golden.Name}\n          plain : {string.Join(",", plain[r])}\n          dflash: {string.Join(",", produced)}");
+                int[] prompt = golden.PromptTokens.Concat(want.Take(start)).ToArray();
+                if (start > 0)
+                {
+                    // The plain reference from here: greedy resumed from the same prefix, prefilled the same way.
+                    var resumed = MuseGlimmerLegacyReal.Continue(drafted, golden with { PromptTokens = prompt, Generated = new int[n - start] });
+                    resumed.Tokens.CopyTo(want, start);
+                    resumed.Top.CopyTo(tops, start);
+                }
+                int[] got = decoder.GenerateGreedy(prompt, n - start).Take(n - start).ToArray();
+                totalDrafted += decoder.TokensDrafted; accepted += decoder.TokensAccepted;
+                verifies += decoder.VerifySteps; plains += decoder.PlainSteps;
+                int j = Enumerable.Range(0, n - start).FirstOrDefault(i => i >= got.Length || got[i] != want[start + i], -1);
+                if (j < 0) break;
+                int k = start + j;
+                var top = tops[k];
+                double margin = top[0].Logprob - top[1].Logprob;
+                int theirs = j < got.Length ? got[j] : -1;
+                int rank = Array.FindIndex(top, t => t.Id == theirs);
+                string where = rank >= 0 ? $" (plain's #{rank + 1}, {top[0].Logprob - top[rank].Logprob:F4} nat below its #1)" : " (not in plain's top 4)";
+                string what = $"{golden.Name} @{k}{(start > 0 ? " (resumed at " + start + ")" : "")}: plain {want[k]} '{MuseGlimmerParity.Decode(drafted, want[k])}', dflash {theirs} " +
+                    $"'{(theirs >= 0 ? MuseGlimmerParity.Decode(drafted, theirs) : "(none)")}'{where}; plain's top-2 margin {margin:F4} nat";
+                notes.Add(what);
+                divergences++;
+                worstMargin = Math.Max(worstMargin, margin);
+                if (margin >= DFlashNearTieNats)
+                    failures.Add(what);
+                start = k + 1;
             }
+            if (notes.Count == 0)
+            {
+                identical++;
+                output.WriteLine($"[MATCH ] {golden.Name}: {n} tokens, the plain greedy ones");
+            }
+            else
+                output.WriteLine($"[NEAR  ] {golden.Name}: {notes.Count} divergence(s), each resumed from plain's prefix:\n          " +
+                    string.Join("\n          ", notes));
         }
-        output.WriteLine($"DFlash acceptance {decoder.AcceptanceRate:P1} ({decoder.TokensAccepted}/{decoder.TokensDrafted} drafted tokens over " +
-            $"{decoder.VerifySteps} verify steps, {decoder.PlainSteps} plain steps)");
-        Assert.True(mismatches == 0, $"DFlash changed the greedy output of {mismatches} prompts; it must be lossless.");
-        Assert.True(decoder.TokensDrafted > 0, "DFlash never drafted a token: the drafter is not running.");
+        output.WriteLine($"{identical}/{records.Count} identical to plain greedy; {divergences} divergence(s), the widest at a plain top-2 " +
+            $"margin of {worstMargin:F4} nat (bound {DFlashNearTieNats}); DFlash acceptance {(totalDrafted > 0 ? (double)accepted / totalDrafted : 0):P1} " +
+            $"({accepted}/{totalDrafted} drafted tokens over {verifies} verify steps, {plains} plain steps)");
+        Assert.True(failures.Count == 0, "DFlash left plain greedy where plain's choice was not a near-tie:\n" + string.Join("\n", failures));
+        Assert.True(totalDrafted > 0, "DFlash never drafted a token: the drafter is not running.");
     }
 
     /// <summary>
@@ -495,5 +619,61 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
 
         // Tall and thin: the chosen grid must stay at least 1 token on each axis.
         Assert.Equal(1, proc.ComputeTokenCount(20, 20));
+    }
+}
+
+/// <summary>
+/// Which llama.cpp golden set a lane's arithmetic is closest to: on the backend the parity tests run on, the first generated
+/// position's top-10 log-probabilities of every golden prompt against every set (<see cref="MuseGlimmerParity.GoldenSets"/>),
+/// for the legacy model and the runtime family. On direct CUDA, assigned by this measurement, the assigned set
+/// (<see cref="MuseGlimmerParity.GoldenSet"/>) must be the closest one (the mean over the prompts of the per-prompt worst
+/// difference). ggml_metal, MLX, ggml_cuda and ggml_vulkan are held to their own backend's set by definition, and the
+/// managed backend and ggml_cpu are far from every set (GoldenSet's notes), so for them the numbers are only printed.
+/// </summary>
+[Trait("Category", "Bench")]
+public sealed class MuseGlimmerGoldenSetAffinityTests(ITestOutputHelper output)
+{
+    [MuseGlimmerModelFact]
+    public void LegacyShortPromptsAreClosestToTheirLanesSet() => Measure(runtime: false, "ref_text.json");
+
+    [MuseGlimmerModelFact]
+    public void LegacyLongPromptIsClosestToItsLanesSet() => Measure(runtime: false, "ref_text_long.json");
+
+    [MuseGlimmerModelFact]
+    public void RuntimeShortPromptsAreClosestToTheirLanesSet() => Measure(runtime: true, "ref_text.json");
+
+    [MuseGlimmerModelFact]
+    public void RuntimeLongPromptIsClosestToItsLanesSet() => Measure(runtime: true, "ref_text_long.json");
+
+    private void Measure(bool runtime, string name)
+    {
+        BackendType backend = MuseGlimmerParity.Backend();
+        string path = MuseGlimmerParity.FindModel();
+        using ModelBase model = runtime ? MuseGlimmerArchitecture.CreateRuntimeModel(path, backend) : ModelBase.Create(path, backend);
+        var sets = MuseGlimmerParity.GoldenSets.ToDictionary(s => s, s => MuseGlimmerParity.Load(name, s));
+        var sums = MuseGlimmerParity.GoldenSets.ToDictionary(s => s, _ => 0.0);
+        var records = sets["metal"].Records;
+        for (int i = 0; i < records.Count; i++)
+        {
+            model.ResetKVCache();
+            float[] logits = model.Forward(records[i].PromptTokens);
+            double[] lp = MuseGlimmerParity.LogSoftmax(logits, Math.Min(model.Config.VocabSize, logits.Length));
+            var cells = new List<string>();
+            foreach (string set in MuseGlimmerParity.GoldenSets)
+            {
+                var g = sets[set].Records[i];
+                Assert.Equal(records[i].PromptTokens, g.PromptTokens);
+                double worst = g.Steps[0].Top.Max(t => Math.Abs(lp[t.Id] - t.Logprob));
+                sums[set] += worst;
+                cells.Add($"{set} {worst:F4}");
+            }
+            output.WriteLine($"{records[i].Name}: first-position top-10 |dlogprob| vs " + string.Join(", ", cells));
+        }
+        var means = sums.ToDictionary(kv => kv.Key, kv => kv.Value / records.Count);
+        string closest = means.OrderBy(kv => kv.Value).First().Key, assigned = MuseGlimmerParity.GoldenSet(backend);
+        output.WriteLine($"{backend} {(runtime ? "runtime" : "legacy")}: mean " + string.Join(", ", means.Select(kv => $"{kv.Key} {kv.Value:F4}")) +
+            $"; closest {closest}, assigned {assigned}");
+        if (backend is BackendType.Cuda)
+            Assert.Equal(closest, assigned);
     }
 }

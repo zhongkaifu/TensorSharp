@@ -31,6 +31,7 @@
     <EmbeddedResource Include="Fixtures/Knowledge/manifest.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/LlamaCpp/*.json" />
+    <EmbeddedResource Include="Fixtures/MuseGlimmer/LlamaCpp/*/*.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/LegacyGoldens/*.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/LegacyReal/*.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/Vision/*.json" />

@@ -152,6 +152,9 @@ namespace
     // finite; the host scan's NaN rule picks by position): such a row reads its logits and is scanned as the host scans.
     constexpr int kGreedyCandidates = 8;
 
+    // OP_TOP_K with k = 1 over rows wider than this takes ggml_argmax (see the lowering): a vocabulary, not a router.
+    constexpr std::int64_t kTopOneArgmaxColumns = 4096;
+
     struct GreedyHead
     {
         ggml_tensor* logits = nullptr;   // [vocab, rows] F32: kept to the end of the run for a row's full read
@@ -948,9 +951,19 @@ namespace
         // to the host seams' route-tail skip, and argsort + view is the chain ggml-metal's top-k MoE fusion matches.
         // ip[1] = 1: a greedy head (GreedyHead), its ids read back as F32 values.
         case OP_TOP_K:
+        {
             need(1);
             if (ipar(1, 0) == 1) return greedy_head(g, src(0), ns > 1 ? src(1) : nullptr);
-            return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
+            ggml_tensor* x = src(0);
+            const int k = static_cast<int>(ipar(0, 1));
+            // One pick over a wide row (a block drafter's draft over the vocabulary): the row's argmax is the descending
+            // argsort's first column, without sorting the row (the CUDA executor's TopK takes the same pick for k = 1 on a row
+            // this wide). Narrow rows (routers) keep the argsort chain the MoE fusions match.
+            if (k == 1 && x->ne[0] > kTopOneArgmaxColumns && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x)
+                && x->ne[2] == 1 && x->ne[3] == 1)
+                return ggml_reshape_2d(ctx, ggml_argmax(ctx, x), 1, x->ne[1]);
+            return ggml_argsort_top_k(ctx, x, k);
+        }
         case OP_SUM_ROWS: need(1); return ggml_sum_rows(ctx, src(0));
         case OP_LIGHTNING_INDEXER:
         {

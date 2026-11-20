@@ -3,11 +3,12 @@
 Status: design, plus the legacy baseline measured on the Mac. Stage S0's Mac part (the llama.cpp goldens and the frozen
 legacy outputs), stage S1 (the runtime hooks G1-G3), stage S2's Mac part (the text decoder on the runtime, behind its
 test seam; [§5.1](#51-s2-the-text-decoder-status)), stage S3's Mac part (serving: slots, rings, prefix cache,
-checkpoints, checkpoint files, concurrency, the probe on the runtime; [§5.2](#52-s3-serving-status)) and stage S4's Mac
+checkpoints, checkpoint files, concurrency, the probe on the runtime; [§5.2](#52-s3-serving-status)), stage S4's Mac
 part (the vision tower as graph programs, shared with Muse Spark, and images on the runtime;
-[§5.3](#53-s4-vision-status)) are implemented, and so is stage S6 (multi-GPU: `--tp 2` on ggml_cuda and ggml_vulkan,
-`--layer-split 2`, DFlash declined under `--tp`; [§5.5](#55-s6-multi-gpu-status)). S0's CUDA part is done (its frozen
-lanes are fixtures); S2's, S3's and S4's CUDA parts wait for the GPU VM. Written
+[§5.3](#53-s4-vision-status)) and stage S5's Mac part (DFlash and n-gram through the shared speculation layer, the Metal
+defaults, G11; [§5.4](#54-s5-speculation-status)) are implemented, and so is stage S6 (multi-GPU: `--tp 2` on ggml_cuda
+and ggml_vulkan, `--layer-split 2`, DFlash declined under `--tp`; [§5.5](#55-s6-multi-gpu-status)). S0's CUDA part is done
+(its frozen lanes are fixtures); S2's, S3's, S4's and S5's CUDA parts wait for the GPU VM. Written
 2026-11-20 on `feature/muse-glimmer-unified`, cut from `origin/main` 2d759459. ggml is upstream
 d9fe7bff, unchanged (AGENTS.md), built with `TENSORSHARP_GGML_NO_UPDATE=1`. Every statement about
 TensorSharp comes from the code at 2d759459. The numbers in [§4.1](#41-legacy-baseline-measured)
@@ -279,7 +280,7 @@ ggml change.
 | G8 | **MLX pipelined greedy decode.** Legacy's `--benchmark` decode on MLX keeps argmax and the next embedding on the device. The runtime's MLX decode reads logits back. Port it only if the runtime's MLX real generation trails legacy: `GreedyIdOutputs` on `MlxGraphExecutor` plus a device-side embedding of the chosen id. | `MlxGraphExecutor`, the runtime's decode loop | every family on MLX | S7 (D7) |
 | G9 | **The probe on the runtime.** `MuseGlimmerKvGrowProbe` reads legacy fields (`_kvCacheCapacity`, `_kvSwaRows`) for its report. Read the runtime's ring cells and slot capacity through internal accessors, and add a scenario for slot growth and checkpoint restore. **Done in S3** ([§5.2](#52-s3-serving-status)): the runtime's active-cache and slot capacities and ring cells through internal accessors; `checkpoint`, `slot-growth`, and `snapshot` as the runtime restores a prefix (a checkpoint file); every restore and rewind also mid-decode | `eng/validation/MuseGlimmerKvGrowProbe` | - | S3 |
 | G10 | **The CUDA FA-VEC hazard.** Legacy materializes the padded K/V window on CUDA where ggml-cuda would pick its VEC kernel, which misread a truncated-prefix view (all query heads of a KV head got the same wrong vector; Ada+ one-row decode under 8192 rows). **Closed in S2, no change.** (1) The premise was wrong: the runtime's builder lowers `GraphOp.KvWindow` through `view_kv_cache_window`, which applies `kv_window_needs_cuda_flash_attn_copy` itself; the runtime passes the query rows and the GQA ratio (`ip[6]`, `ip[7]`), so it has always carried legacy's guard. (2) At d9fe7bff the hazard is gone on Blackwell (RTX PRO 4500, sm_120): the real-weight probe with the guard off (`TS_KV_FATTN_COPY=0`, 52 window copies fewer by a gdb count) gave byte-identical fp16 logits over 500 decode steps at 4352-4864-row windows, and the synthetic legacy freeze (head 64, GQA 2) was byte-identical too. Ada (sm_89) was not run. The guard stays (TensorSharp-owned, about 0.8% of decode there, within noise); dropping it is an S7 measurement | `ggml_ops_transformer_common.h` (already) | every family on ggml_cuda | S2 (closed) |
-| G11 | **DFlash prompt catch-up width.** Legacy catches the drafter up in 1024-row trunk forwards (`TS_DFLASH_PREFILL_CHUNK`). The runtime follows the prompt in ring steps (512). Measure the DFlash prefill cost. | `StandardDecoderModel.BlockDraft.cs` | Qwen 3.8 | S5 |
+| G11 | **DFlash prompt catch-up width.** Legacy catches the drafter up in 1024-row trunk forwards (`TS_DFLASH_PREFILL_CHUNK`). The runtime follows the prompt in ring steps (512). Measure the DFlash prefill cost. **Closed in S5, no change** ([§5.4](#54-s5-speculation-status)): the drafter adds 4.9-5.1% to the runtime's TTFT after 0.5K-2.6K prompts and 0.5% after 16K, legacy 6.2-7.6% and 3.8%. The measurement found that a chunk past one ring step reached the drafter as its first step only (fixed, 754b5813) | `StandardDecoderModel.BlockDraft.cs` | Qwen 3.8 | S5 (closed) |
 | G12 | **(Closed in S6 with no change, [§5.5](#55-s6-multi-gpu-status): the rings stay on under `--tp 2`; a 16K prompt that laps them six times gives the one-GPU text.)** **Rings under TP with one KV head per rank.** Legacy turned the ring off under `--tp` because ggml-cuda answered "17 plus 25" with fluent nonsense on a whole-ring read when a rank held one KV head (ne[2] == 1). The runtime's per-rank graphs ring by default. Gate it. If it fails, either find the kernel cause and avoid that shape in TensorSharp code, or use linear caches under TP for single-KV-head ranks (costs ~2.5 GB of KV at 64K). | `StandardDecoderModel.Placement/SlidingRings.cs` | any family with 1 KV head per rank | S6 |
 
 ### 2.3 Shared speculation
@@ -296,12 +297,13 @@ runtime's generic layer. Glimmer adds no drafter code.
   R >= W + rows - 1. Glimmer has no recurrent state.
 * **Defaults**: `--spec-draft` 15 (the docs) against the runtime's per-family preferences
   (`SpecPreferredDraftWindow`, `SpecPreferredBlockGate`). Pick the defaults by measurement on CUDA
-  and Metal (S5), as Qwen 3.8's catalog tuning did.
+  and Metal (S5), as Qwen 3.8's catalog tuning did. **Done for ggml_metal in S5** (7 drafts, no gate;
+  [§5.4](#54-s5-speculation-status)); CUDA keeps the speculator's defaults until the VM measures them.
 * **New for Glimmer**: n-gram speculation without a drafter, DFlash with continuous batching
   (legacy has none), and DFlash across a layer split (the driver stage drafts).
 * **Under `--tp`**: the runtime's graph drafter runs on one device (`GraphBlockDraftRefusal`).
-  Legacy declines DFlash under TP. Keeping that decline is the parity choice (D5, done in S6: the family attaches no
-  drafter on a tensor-parallel trunk, so the server refuses `--draft-model` as legacy's does).
+  Legacy declines DFlash under TP. Keeping that decline is the parity choice (D5), declared by the family in S5 and
+  checked through the real server and CLI in S6: the server refuses `--draft-model` as legacy's does.
 
 ### 2.4 Shared multimodal
 
@@ -586,7 +588,7 @@ Estimates are agent-days, including GPU runs.
 | **S2** Text decoder (Mac part done, [§5.1](#51-s2-the-text-decoder-status)) | `MuseGlimmerRuntimeModel` (+ `.Graph.cs`), one device, every executor, behind a test seam (the descriptor still builds legacy); G10 checked | family folder, `ggml_ops_graph_builder.cpp` only if G10 holds | §4.2 synthetic parity on every executor; real weights greedy + perplexity on ggml_metal and MLX (Mac), ggml_cuda, ggml_vulkan and direct CUDA (VM, UD-Q4_K_XL and IQ2_XXS) | Mac; 1 GPU (Ada or Blackwell) | 4 |
 | **S3** Serving (Mac part done, [§5.2](#52-s3-serving-status)) | the unified step: slots, rings, prefix cache, checkpoints, checkpoint files, concurrency; the probe on the runtime | family folder; runtime fixes as found | §4.6 (every mark, every scenario, ggml_metal + MLX + ggml_cuda); §4.7; c4 concurrency 4/4 identical to sequential | Mac; 1 GPU | 4 |
 | **S4** Vision (Mac part done, [§5.3](#53-s4-vision-status)) | `MuseGlimmerVisionTower` on `NetworkGraph` (G7), a tower interface used by Glimmer and Muse Spark, the injector re-typed, `QueueMedia`, reuse across image spans | `MuseGlimmerVisionTower.cs`, `.Multimodal.cs`, `ModelMultimodalInjector.cs`, `MuseSparkModel.Vision.cs` | §4.5 on ggml_metal, MLX, ggml_cuda; Muse Spark synthetic vision tests | Mac; 1 GPU | 5 |
-| **S5** Speculation | DFlash through the shared block drafter (graph programs; fused/per-op below), n-gram, defaults by measurement (`--spec-draft`, gate), G11 | family folder (declarations only), `StandardDecoderModel.BlockDraft.cs` if G11 needs it | §4.4 on ggml_metal and ggml_cuda; MLX lossless | Mac; 1 GPU | 3 |
+| **S5** Speculation (Mac part done, [§5.4](#54-s5-speculation-status)) | DFlash through the shared block drafter (graph programs; fused/per-op below), n-gram, defaults by measurement (`--spec-draft`, gate), G11 | family folder (declarations only), `StandardDecoderModel.BlockDraft.cs` if G11 needs it | §4.4 on ggml_metal and ggml_cuda; MLX lossless | Mac; 1 GPU | 3 |
 | **S6** Multi-GPU (done, [§5.5](#55-s6-multi-gpu-status)) | `--tp 2` on per-rank graphs (ggml_cuda; Vulkan per D4), G12, `--layer-split 2` and hybrid (new), DFlash under TP per D5 | family folder, `GgmlGraphExecutor.cs` (D4), `StandardDecoderModel.Placement.cs` (G12) | TP greedy vs one GPU (legacy tracked 468/500 characters before a paraphrase); TP decode and prefill vs legacy TP (docs: 63.2 tok/s, pp512 1569 on 2x PRO 4000, IQ2_XXS); grow and snapshot under TP (never run for legacy); layer split == one GPU | 2 GPUs in one box | 4 |
 | **S7** Performance | G4 (prompt step width, CPU ring policy), G5 (in-graph embedding), concurrency reorder, `PrunesLastLayerRows`, `KeepsGateUpApart` by measurement, G8 only if MLX trails | runtime + family folder | §4.3 on every backend (Mac: ggml_metal, MLX, ggml_cpu; VM: ggml_cuda, ggml_vulkan, direct CUDA) | Mac; 1 GPU | 5 |
 | **S8** Switch | the descriptor builds `MuseGlimmerRuntimeModel` with `ServingContract.SharedRuntime(false)`; usage pages (n-gram, batching, layer split), the docs, `config/muse-glimmer-30b.json` (+ drafter pin), regression pins (IQ2_XXS, drafter), TensorAgent catalog re-measured; legacy only through the oracle seam | `MuseGlimmerArchitecture.cs`, `CliUsage.cs`, `ServerUsage.cs`, docs, configs, `TensorAgent.Core/Catalog` | §4.8 on the Mac (Web UI, OpenAI, CLI, TensorAgent app) and the VM; `ServingContractConformanceTests`; both directions of the usage drift tests | Mac; 1 GPU | 3 |
@@ -783,6 +785,76 @@ the VM.
 | Encode time (VisionEncoderBench, ABBA, one process an arm, medians of 5) | ggml_metal: 0.11-0.14x legacy (448 x 448: 306 vs 2213 ms); MLX: 0.41-0.55x (337 vs 612 ms) |
 | Follow-up exactness (`MuseGlimmerImageFollowUpExactnessTests`, synthetic) | **passed** on managed, ggml_cpu, ggml_metal, MLX: the engine reuses all 996 tokens turn 1 left past the rings, stops at another image's span; logits 1.2-1.8x a text control (bound 4x) |
 | No regression elsewhere | **passed**. The S2 regression set plus the Muse Spark, multimodal-injector, media, NetworkGraph, Gemma 4 vision and reflection-list classes, on both Mac lanes: every pre-existing test's outcome unchanged (cpu 2305 -> 2357, metal 2314 -> 2366; 0 failed), the additions the new tests. `RuntimeFamilyDigestTests` byte-identical on both lanes. No shared runtime, executor or native code changed |
+
+### 5.4 S5, speculation: status
+
+**The Mac part is done** (2026-11-20, M5 Pro, ggml d9fe7bff unchanged; on the vision branch merged at 01896b87). The CUDA
+part (ggml_cuda and direct CUDA, UD-Q4_K_XL and IQ2_XXS) waits for the VM: `glimmer/cuda-vm/s5-cuda.sh` (`build`, `synth`,
+`regr`, `lossless`, `speed`, `lite`, `long`, `ngram`), which also picks the CUDA defaults.
+
+* **The family adds no drafter code.** DFlash runs on the runtime's block drafter (its inject and block graph programs on
+  every executor that runs them; the fused and per-op paths below), n-gram on the runtime's weight-free speculator, the
+  verify on the batched verify over slots, under the runtime's cost governor. Its declarations:
+  * D5: under `--tp` the drafter is declined, as legacy declines it (the model loads without it; the host's attach refuses
+    it as the model's own decline, so the server exits 2 and the CLI warns). n-gram stays available there. A whole-layer
+    split drafts (staged programs; per op the runtime speculates on one device only and says so).
+  * Defaults by measurement (`SpecPreferredDraftWindow`, `SpecPreferredBlockGate`; no new flag, an explicit `--spec-draft` /
+    `--spec-pmin` wins): ggml_metal 7 drafts for the drafter and n-gram drafts alike (its 9-row verify costs 135-147 ms
+    against 80 at 8), MLX the drafter's whole block (15 drafts: its verify costs the same up to 16 rows) and n-gram the
+    speculator's 8, no confidence gate for the drafter on either. Elsewhere the speculator's defaults (8 drafts, the block
+    gate 0.35) until the VM measures them (`s5-cuda.sh speed` sweeps 3/5/7/15 drafts x gates 0/0.35).
+* **Five shared changes, all found by the speed gate** (DFlash lost to legacy after long prompts and on its draft, to plain
+  decoding on prose, and on MLX to everything; MLX could not ask for more than 8 drafts):
+  * *A prompt chunk past a ring step reaches its request's drafter whole* (754b5813). A ring family forwards a chunk
+    longer than 512 rows as rounds of a step; the follow registration the first round took left the later rounds' rows
+    out of the DFlash ring, and no carry was held at the prompt's end. Glimmer's prompts past 512 tokens drafted from their
+    first 512 rows: 302 drafts kept after a 520-token prompt (24.3 tok/s) where legacy kept 409 (46.7). Families without
+    rings take no rounds.
+  * *DEFAULT CHANGE: the cost governor judges a lone request's unified step* (12b11994). The runtime families speculate on
+    the unified step's batched path for one request as for several, and it never consulted the governor (only the solo
+    `DecodeStep`, which they do not take, did). A step serving one sequence is now governed as the solo step is: a
+    declined step verifies its anchor alone, so the drafter's ring stays in step. Steps of several sequences stay
+    ungoverned. Glimmer's essay: 21.6 tok/s governed, 20.9 ungoverned, 21.9 plain. Qwen3.8-27B with DFlash2 (drafting wins
+    on all five prompts): 35.7 against 36.1 (-1.1%, at most -2.2%: the calibration steps), plain 21.2.
+  * *DEFAULT CHANGE: a one-pick top-k over a row wider than 4096 lowers to `ggml_argmax`* (20c5407c, the GGML graph builder).
+    The plain DFlash block's top-1 over the 202,048-token vocabulary was a full argsort of every row: a block 29.3 ms, legacy's
+    fused drafter 25.4; with the argmax 24.8. Five prompts 34.1 -> 35.0 tok/s, 16K 24.4 -> 25.2. Routers and greedy heads keep
+    their lowering; the CUDA executor already took this pick.
+  * *The tensor executors' host top-k selects a row's few picks in one pass* (f3fd6d9d, `TensorGraphExecutor.TopK`: the
+    managed CPU's and MLX's). It sorted every row whole with a comparer: on MLX a block took 274-412 ms (15 rows of 202,048)
+    and the governor parked the drafter (18.0 tok/s against 21.1 plain); with the selection 23-34 ms, the same picks in the
+    same order.
+  * *A trunk's preferred draft window replaces the speculator's default, wider as well as narrower* (a0197dc6,
+    `SpeculatorRegistry.ResolveDraftWindow`). Every other family prefers 8 or less, so none changes.
+* **G11 (the drafter's prompt catch-up width): no change.** The runtime follows the prompt inside the trunk's own 512-row
+  steps (the encoder and the draft layers' K/V over the rows the ring keeps at the prompt's end), where legacy catches up
+  in 1024-row trunk forwards whose features cross the host. The drafter adds 4.9-5.1% to the runtime's TTFT after 0.5K and
+  2.6K prompts and 0.5% after 16K (the ring keeps a prompt's last 2,080 rows only), against legacy's 7.6%, 6.2% and 3.8%:
+  the runtime's DFlash TTFT is 3-4% below legacy's.
+* **Found on the way (not S5's).** `MuseGlimmerRuntimeTests.TheParityBoundIsLegacysOwnSpread` failed at 01896b87: with the
+  CUDA box's frozen lanes among the fixtures, legacy's spread between lanes is 3.29e-3 (cuda vs ggml_vulkan), past the 2e-3
+  bound. The coordinator's 29fa6649 (the bound with the GPU box's lanes, 4e-3) applied onto this branch during S5 fixes it.
+
+All runs: UD-IQ2_XXS + `dflash-kquant.gguf`, greedy, one process an arm under the Mac lock and memguard (43 GB), the same
+build for both families. "mix5": an essay (93 tokens), a code module, a list, a 520-token and a 2.6K-token rewrite, 512
+tokens each (`artifacts/glimmer-s5/prompts/mix5.jsonl`); "16K": 16.2K tokens of the corpus and a rewrite, 512 tokens.
+
+| Gate (Mac) | Result |
+|---|---|
+| Lossless, mix5 and 16K (texts, CLI) | **passed**. At the family's defaults every text equals plain greedy's except the essay, which leaves plain at one token (character 2230, "mechanically tabulate" for "automate") wherever an 8-row verify covers it: legacy at the same settings and n-gram drafts flip it too, and governed runs that park past it do not (a 0.0084-nat tie: the real-weight test on MLX below). After 16K the runtime's DFlash text is plain's; legacy's DFlash leaves its own plain at character 99 ("\n" for "\n\n") |
+| Lossless, real-weight test (`MuseGlimmerRuntimeSpeculationRealTests`, the engine as served: the five golden prompts and the 4.7K one x 128 tokens at the defaults and ungated at 15 drafts, one at a time and all six at once; the three chat prompts x 512) | ggml_metal: **passed**, 3/3 tests. Every stream equals plain greedy's token for token: the six golden prompts (5 x 128, the 4.7K one x 128) at the defaults (drafted 2,369, kept 1,060) and ungated at 15 drafts (3,167, 1,049), one at a time and all six at once; the three chat prompts x 512 at 7 drafts (4,580, 1,823), one at a time and together. No divergence, so no near-tie to resume past. MLX: **passed**, 3/3: haiku leaves plain at token 96 ("lit" against " lit", -0.0077 nat: the plain model over the common prefix prefers DFlash's), the essay at 437 (" automate" against " mechanically", -0.0084 nat: the CLI's near-tie), and the essay served beside the others at 373 (0.0115 nat); past each the plain model picks every later DFlash token but one 0.0115-nat tie; the other streams identical, alone and together |
+| Speed against plain and legacy, mix5 (decode tok/s: essay / code / list / 0.5K / 2.6K, all) | plain: runtime 21.9 / 21.9 / 21.9 / 21.7 / 21.3, **21.7**; legacy 21.8 / 21.8 / 21.8 / 21.6 / 21.2, 21.7. DFlash, runtime at its defaults: 21.5 / 48.0 / 33.8 / 61.9 / 33.8, **35.0** (1.61x plain); legacy at its default (8 drafts, gate 0.35) 20.7 / 37.5 / 29.2 / 46.7 / 31.3, 30.7; legacy at the runtime's settings (7, no gate) 20.4 / 43.2 / 31.5 / 59.4 / 32.5, 32.9; legacy `--spec-draft 15` 20.7 / 39.1 / 29.0 / 59.5 / 32.0, 31.8. **passed**: the runtime's DFlash is at least legacy's on every prompt, at both families' defaults and at equal settings; the essay (drafts lose) is 0.98x plain governed (parked 64 steps), 0.95x ungoverned |
+| Speed after 16K (512 tokens) | plain 20.2 both; DFlash runtime **25.2** (1.25x), legacy 24.9. **passed** |
+| Acceptance (accepted drafts per verify step, the gate's ratio confounded by drafts per step) | equal settings (7, no gate): runtime 1.39 / 4.19 / 2.62 / 5.76 / 2.85 against legacy 1.15 / 3.77 / 2.45 / 5.76 / 2.77; accepted / drafted 20-84% against 20-87%: within 2 points on the essay and the code, 3.7-5.8 points lower on the list and the rewrites, where the runtime drafts more a step (6.9 against 5.7 on the essay) and keeps as many or more. **passed** on drafts kept a step |
+| G11 TTFT (ms; plain -> DFlash) | runtime: 0.5K 1581 -> 1662 (+5.1%), 2.6K 5509 -> 5780 (+4.9%), 16K 44389 -> 44619 (+0.5%); legacy: 1601 -> 1722 (+7.6%), 5659 -> 6013 (+6.2%), 44777 -> 46470 (+3.8%). **passed**, no change: the runtime's DFlash TTFT is 3-4% below legacy's |
+| Governor (the drafted path never slower than plain by default) | DFlash: the essay 21.5-21.6 tok/s governed against 21.9 plain (0.98-0.99x), every other prompt 1.25-2.85x. n-gram: see below. **passed** within the §4.4 5% |
+| n-gram (new; quote-back, a code edit, the essay, the code module) | ggml_metal at the family's 7 drafts: **93.0 / 54.2 / 21.5 / 22.9** tok/s against plain 21.7 / 21.7 / 21.8 / 21.8 (4.3x and 2.5x where the answer quotes its prompt; 0.99x and 1.05x on free text); at the speculator's 8 (a 9-row verify, 135-147 ms) 59.5 / 37.0 / 20.7 / 20.9, ungoverned 59.9 / 36.7 / 19.1 / 18.6. MLX at 8 drafts (its 9-row verify 80 ms): 105.0 / 58.5 / 21.1 / 22.6 against 21.0 / 21.2 / 21.4 / 21.4. Every text plain greedy's but the essay's near-tie token on MLX and at 8 drafts on ggml_metal. **passed** (lossless; no legacy gate: legacy has no n-gram) |
+| DFlash with continuous batching | synthetic (managed, ggml_cpu, ggml_metal, MLX): one request and three at once through the engine equal plain's streams, the batched verify ran. Real weights (ggml_metal): the six golden prompts at once and the three chat prompts at once, each stream identical to its sequential DFlash run and to plain greedy. **passed** |
+| DFlash across a layer split | synthetic, two stages on simulated devices (staged programs): plain greedy's stream; per op the runtime refuses speculation off one device ("runs on one device"). **passed** |
+| D5, the drafter under `--tp` | synthetic: declined at load (tp 2 on simulated devices), n-gram available; the host's attach refuses it as the model's own (the shared loader's test). **passed**; the real server's exit 2 needs two GPUs (S6), **not run** |
+| MLX | DFlash (the runtime's graph drafter; legacy's per-op one), mix5: plain runtime 21.4 / 21.3 / 21.3 / 21.0 / 20.7, **21.1**, legacy 20.6 / 20.6 / 20.7 / 20.2 / 19.5, 20.3. Runtime at its defaults (15 drafts, no gate) 22.6 / 65.0 / 35.7 / 97.3 / 36.6, **39.7** (1.88x plain; 8 drafts ungated 37.0, 7 ungated 35.0, 3 ungated 26.5, the speculator's 8 at the gate 33.4); legacy at its default 19.1 / 43.1 / 30.8 / 57.5 / 31.2, 31.7. **passed**: above legacy on every prompt, and the essay above plain. Before the top-k fix the runtime's MLX blocks took 274-412 ms and it decoded 18.0-18.1 tok/s (0.85x plain). Lossless: every text plain's but the essay's 0.008-nat tie, which MLX's plain greedy and legacy's plain greedy decide apart too. Memory: peak wired 20.3 GB with DFlash, 16.9 plain (legacy 19.7 / 18.0) |
+| Memory (peak wired, mix5) | runtime DFlash 15.9-16.1 GB, legacy DFlash 21.4-25.1; plain 14.0 / 17.9 |
+| No regression elsewhere | **passed**. The S3 regression filter plus the speculation classes (SpeculativeExecution, SpeculatorRegistry, SpeculativeGreedyVerify, BatchedVerifyHeldLogits, BatchedDecodeRecording, DistributedSpeculation, BlockDraftCausalWidth, SpeculativeDraftHeadLoader, ExecutionPlanner, DraftContextContinuation; the S3 set already holds Qwen 3.5, Qwen 3.8 with DFlash/DSpine, LFM3, GraphBlockDraft) on both Mac lanes, 01896b87's shared code against the final tree: cpu 1943 -> 1950, metal 1955 -> 1962, 0 failed. Every pre-existing outcome unchanged but three that now pass: the two ring-step follow tests (754b5813) and `TheParityBoundIsLegacysOwnSpread` (the coordinator's 29fa6649); the additions are the new tests and the coordinator's fixture rows. Two `DraftContextContinuationTests` failed under the governor (a third request inside a park) and take `GovernorDisabledForTests` now. `RuntimeFamilyDigestTests` byte-identical to S3's (42 lines a lane). After the window change (a0197dc6, 6851774b) again: cpu 1953, metal 1965, 0 failed, the additions the three registry rows |
 
 ### 5.5 S6, multi-GPU: status
 

@@ -22,7 +22,7 @@ model's sha256.
 |---|---|
 | `ref_text.json` | five chat prompts (English prose, the Chinese prompt that looped in September 2026, code, arithmetic, verse): the prompt text, llama.cpp's prompt tokens, its 128-token greedy continuation, and each generated token's top log-probabilities (10 at the first position, 4 after) |
 | `ref_text_long.json` | a 4,664-token prompt (more than twice the 2048-token window and past legacy's 4352-row ring) and its continuation, as above |
-| `ref_text_dflash.json` | the five prompts through llama.cpp's DFlash path (`dflash-kquant.gguf`, `--spec-draft-n-max 15`): every continuation is its plain one |
+| `ref_text_dflash.json` | the five prompts through llama.cpp's DFlash path (`dflash-kquant.gguf`, `--spec-draft-n-max 15`): every continuation is its plain one (Metal) |
 
 The prompts are rendered by the template's rules without its date line, so a
 regeneration reproduces them. Regenerate (about 90 s on an M5 Pro, peak 16 GB wired):
@@ -30,6 +30,43 @@ regeneration reproduces them. Regenerate (about 90 s on an M5 Pro, peak 16 GB wi
 ```bash
 python3 eng/validation/muse-glimmer-llamacpp-goldens.py --llama-cpp ~/work/llama.cpp-lfm3 \
     --model Muse-Glimmer-30B-UD-IQ2_XXS.gguf --draft dflash-kquant.gguf
+```
+
+### One set per ggml backend (`LlamaCpp/cuda/`, `LlamaCpp/vulkan/`)
+
+The ggml backends round differently. At IQ2_XXS, llama.cpp's own CUDA build is 0.39-1.72
+nats from its Metal build at the first generated position (top-10 log-probabilities), and
+its greedy continuations leave Metal's at four of the six prompts. That is past the parity
+tests' 0.15-nat bound, so each lane is held to the set of its own ggml backend, at the same
+bounds (`MuseGlimmerParity.GoldenSet`):
+* ggml_metal and MLX use the Metal set above;
+* ggml_cuda uses `cuda/`;
+* ggml_vulkan uses `vulkan/`;
+* direct CUDA uses the Metal set, which it measures closest to (`MuseGlimmerGoldenSetAffinityTests`:
+  0.05 nats, against 0.25 for Vulkan's and 0.75 for CUDA's);
+* the managed backend and ggml_cpu measure 1.6-1.9 nats from every set. They take Metal's by
+  default and do not meet the first-position bound. llama.cpp's own CPU build is 0.72-1.45
+  nats from Metal's set too, and its greedy continuations leave Metal's on all six prompts.
+
+Both sets were made on 2026-11-20 with the same llama.cpp commit d3c3e242c, the same
+prompts and the same generator, on an RTX PRO 4500 Blackwell (sm_120, driver 595.112.07,
+CUDA 13.2). The builds:
+* `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`;
+* `-DGGML_VULKAN=ON` (NVIDIA's Vulkan driver).
+
+Each file records the backend under `llama_cpp.backend`. A second CUDA run reproduced
+`cuda/` exactly.
+
+| Set | vs Metal, first-position top-10 | Continuations equal to Metal's | DFlash equal to plain |
+|---|---|---|---|
+| `cuda/` | 0.39-1.72 nats | 2 of 6 (the others leave at 44-109) | 2 of 5: refrigerator, train and haiku leave plain, each first where plain's top-2 margin is a near-tie |
+| `vulkan/` | 0.07-0.31 nats | 6 of 6 | 5 of 5 |
+
+```bash
+python3 eng/validation/muse-glimmer-llamacpp-goldens.py --llama-cpp ~/llama.cpp --build-dir build --backend cuda \
+    --model Muse-Glimmer-30B-UD-IQ2_XXS.gguf --draft dflash-kquant.gguf --out InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/cuda
+python3 eng/validation/muse-glimmer-llamacpp-goldens.py --llama-cpp ~/llama.cpp --build-dir build-vk --backend vulkan \
+    --model Muse-Glimmer-30B-UD-IQ2_XXS.gguf --draft dflash-kquant.gguf --out InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/vulkan
 ```
 
 ## Frozen legacy outputs

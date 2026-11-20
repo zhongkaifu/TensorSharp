@@ -1204,12 +1204,27 @@ namespace TensorSharp.Models
                     "which its sliding-window ring caches take in steps.");
             int step = _maxSequenceStepRows, n = requestIds.Count, rounds = 0;
             for (int s = 0; s < n; s++) rounds = Math.Max(rounds, ((chunks[s]?.Length ?? 0) + step - 1) / step);
+            // A chunk whose rows its request's drafter follows (FollowPlainPrompt, FollowUnspeculatedPrompt) is followed in every
+            // round: registered once for the chunk, the registration the first round took left the later rounds' rows out of
+            // the drafter, so a Muse-Glimmer prompt past 512 rows reached its DFlash ring as its first 512 (the prompt's tail
+            // missing, no carry held): 302 drafts kept after a 520-token prompt where legacy, from the same text, kept 409.
+            int[] followedEnds = TakeFollowedPrompts(requestIds, out bool[] followedAside);
+            void FollowRound(List<int> owners)
+            {
+                if (followedEnds == null) return;
+                foreach (int s in owners)
+                {
+                    if (followedEnds[s] == DFlashNoFollow) continue;
+                    if (followedAside != null && followedAside[s]) FollowUnspeculatedPrompt(requestIds[s], followedEnds[s]);
+                    else FollowPlainPrompt(requestIds[s], followedEnds[s]);
+                }
+            }
             // Plain prompts' rounds overlap on the device (IGraphExecutor.OverlapSteps): a round that ends no request's chunk runs
             // no head and hands the host nothing, so its run returns with its work queued while the next round is embedded,
             // traced and built. The slots hold their whole chunks first, so no round grows them.
             IDisposable overlap = null;
             if (OverlapPromptSteps && rounds > 1 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null
-                && (_followPromptRequests == null || !requestIds.Any(_followPromptRequests.ContainsKey)) && _slots != null
+                && followedEnds == null && _slots != null
                 && requestIds.All(id => _slots.ContainsKey(id)))
             {
                 for (int s = 0; s < n; s++)
@@ -1250,6 +1265,7 @@ namespace TensorSharp.Models
                             Hidden = rowIO.Hidden == null ? null : hidden.ToArray(),
                         };
                     var logits = new float[ids.Count][];
+                    FollowRound(owners);
                     if (!TryForwardSlots(ids, parts, partStarts.ToArray(), logits, null, roundRowIO))
                     {
                         if (round == 0) return false;
@@ -1262,6 +1278,11 @@ namespace TensorSharp.Models
             finally
             {
                 overlap?.Dispose();
+                // A request with no rows in this step keeps its registration for its next chunk.
+                var idle = new List<int>();
+                for (int s = 0; s < n; s++)
+                    if ((chunks[s]?.Length ?? 0) == 0) idle.Add(s);
+                FollowRound(idle);
             }
             return true;
         }

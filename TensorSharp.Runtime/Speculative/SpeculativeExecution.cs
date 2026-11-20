@@ -724,8 +724,9 @@ namespace TensorSharp.Runtime.Speculative
         /// The caller binds this sequence's drafter state first. Returns the number of
         /// drafts in <paramref name="draftsOut"/>; 0 (no carry yet, no room) means the
         /// sequence rides the verify with its anchor alone. The cost governor is not
-        /// consulted: beside other sequences a window costs a few columns of a shared
-        /// sweep, and the plain alternative is a step of the same sweep.
+        /// consulted here: beside other sequences a window costs a few columns of a shared
+        /// sweep, and the plain alternative is a step of the same sweep. A step that serves
+        /// the sequence alone asks it first (<see cref="BeginSoloBatchStep"/>).
         /// </summary>
         public int ProposeForBatch(int lastToken, int position, int kMax, List<int> draftsOut,
             Action<float[], IReadOnlyList<int>>? adjustDraftLogits = null)
@@ -736,6 +737,7 @@ namespace TensorSharp.Runtime.Speculative
             kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
             if (kMax <= 0 || !EnsureCarry(position))
                 return 0;
+            _batchStepDrafted = true;
             long t0 = Timestamp();
             _speculator.Propose(
                 new DraftContext
@@ -754,6 +756,34 @@ namespace TensorSharp.Runtime.Speculative
             Stats.DraftTicks += Timestamp() - t0;
             return draftsOut.Count;
         }
+
+        /// <summary>
+        /// A batched step that serves this sequence alone is its solo decode step, and the cost governor judges it as it
+        /// judges <see cref="DecodeStep"/>: whether this step may draft (a declined step rides the verify with its anchor
+        /// alone, which keeps the drafter's state in step: the plain step the governor measures as its baseline, as a parked
+        /// solo step runs one-row <see cref="ISpeculativeTarget.SpecForward"/>). Pair with <see cref="EndSoloBatchStep"/>.
+        /// Ungoverned, a lone request on the unified step drafted every step whatever the drafts cost: Muse-Glimmer-30B's DFlash
+        /// on an M5 Pro decoded an essay at 20.9 tok/s against 21.9 plain (governed 21.6), where its legacy model's governed solo
+        /// step parked. Where drafting wins, the governor's calibration steps cost 1-2% (Qwen3.8-27B with DFlash2: 35.7 against
+        /// 36.1 tok/s over five prompts). Several sequences' steps stay ungoverned (<see cref="ProposeForBatch"/>).
+        /// </summary>
+        public bool BeginSoloBatchStep()
+        {
+            _batchStepDrafted = false;
+            bool allows = Governor.AllowsSpeculation();
+            if (!allows && Governor.IsParked)
+                Stats.ParkedSteps++;
+            return allows;
+        }
+
+        /// <summary>The solo batched step <see cref="BeginSoloBatchStep"/> began has emitted <paramref name="tokensEmitted"/>
+        /// tokens in <paramref name="elapsedTicks"/>: a speculative sample when the drafter ran (whatever it proposed, as
+        /// <see cref="DecodeStep"/> counts a draft under the gate), a plain one otherwise.</summary>
+        public void EndSoloBatchStep(int tokensEmitted, long elapsedTicks)
+            => RecordStepTicks(_batchStepDrafted, tokensEmitted, elapsedTicks);
+
+        // Whether this step's drafter ran (ProposeForBatch, AcceptBatchDraft, AcceptBatchChain): a solo step's governor sample.
+        private bool _batchStepDrafted;
 
         /// <summary>True when this execution's drafts can come from a block drafted for
         /// several sequences in one pass (<see cref="IBatchedSpeculativeTarget.TryDraftBatch"/>).</summary>
@@ -782,6 +812,7 @@ namespace TensorSharp.Runtime.Speculative
             ArgumentNullException.ThrowIfNull(draftsOut);
             draftsOut.Clear();
             Stats.DraftTicks += draftTicks;
+            _batchStepDrafted = true;
             if (_speculator is not BlockDraftSpeculator block)
                 return 0;
             return block.SelectDrafts(blockTokens, blockConf, Math.Min(blockTokens.Length, blockConf.Length), maxTokens, draftsOut);
@@ -819,6 +850,7 @@ namespace TensorSharp.Runtime.Speculative
             ArgumentNullException.ThrowIfNull(draftsOut);
             draftsOut.Clear();
             Stats.DraftTicks += draftTicks;
+            _batchStepDrafted = true;
             if (_speculator is not DraftHeadSpeculator head)
                 return 0;
             int count = head.AcceptChain(ids, probs, steps, draftsOut);
@@ -914,8 +946,11 @@ namespace TensorSharp.Runtime.Speculative
         private readonly int _governorWinsAtStart, _governorLossesAtStart, _governorParkedAtStart;
 
         private void RecordStep(bool speculated, int tokensEmitted, long tStep0)
+            => RecordStepTicks(speculated, tokensEmitted, Timestamp() - tStep0);
+
+        private void RecordStepTicks(bool speculated, int tokensEmitted, long elapsedTicks)
         {
-            Governor.Record(speculated, tokensEmitted, Timestamp() - tStep0);
+            Governor.Record(speculated, tokensEmitted, elapsedTicks);
             Stats.PlainMsPerToken = Governor.PlainMsPerToken;
             Stats.SpecMsPerToken = Governor.SpecMsPerToken;
             Stats.GovernorWins = Governor.Wins - _governorWinsAtStart;

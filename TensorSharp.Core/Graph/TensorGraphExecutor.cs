@@ -2529,15 +2529,51 @@ namespace TensorSharp.Graph
             long cols = x.Sizes[^1], rows = x.ElementCount() / cols;
             float[] v = x.GetElementsAsFloat((int)x.ElementCount());
             var picked = new int[rows * k];
-            var order = new int[cols];
+            TopKRows(v, rows, cols, k, picked);
+            return new Value { Tensor = IntTensor(picked, Sizes(stackalloc long[] { k, rows }), run), Ints = picked };
+        }
+
+        /// <summary>Picks up to which a row is selected in one pass rather than sorted whole.</summary>
+        internal const int TopKSelectionMax = 32;
+
+        /// <summary>
+        /// Each row's <paramref name="k"/> largest values' columns into <paramref name="picked"/> [rows, k], largest first, a tie to
+        /// the lower column (float.CompareTo's order: a NaN below every number). Up to <see cref="TopKSelectionMax"/> picks a row is
+        /// one pass keeping the picks in order, the same columns a whole sort gives: the MLX executor's plain DFlash drafts (one pick
+        /// over a 202,048-token vocabulary, 15 rows a block) sorted each row with a comparer, about 300 ms a block on an M5 Pro.
+        /// </summary>
+        internal static void TopKRows(float[] v, long rows, long cols, int k, int[] picked)
+        {
+            if (k > TopKSelectionMax)
+            {
+                var order = new int[cols];
+                for (long r = 0; r < rows; r++)
+                {
+                    for (int c = 0; c < cols; c++) order[c] = c;
+                    long b = r * cols;
+                    Array.Sort(order, (i, j) => v[b + j].CompareTo(v[b + i]) is var cmp && cmp != 0 ? cmp : i.CompareTo(j));
+                    Array.Copy(order, 0, picked, r * k, k);
+                }
+                return;
+            }
             for (long r = 0; r < rows; r++)
             {
-                for (int c = 0; c < cols; c++) order[c] = c;
-                long b = r * cols;
-                Array.Sort(order, (i, j) => v[b + j].CompareTo(v[b + i]) is var cmp && cmp != 0 ? cmp : i.CompareTo(j));
-                Array.Copy(order, 0, picked, r * k, k);
+                long b = r * cols, at = r * k;
+                int held = 0;
+                for (int c = 0; c < cols; c++)
+                {
+                    float value = v[b + c];
+                    // A later column ranks above a kept one only by a larger value (ties keep the lower column).
+                    if (held == k && value.CompareTo(v[b + picked[at + k - 1]]) <= 0) continue;
+                    int i = held < k ? held++ : k - 1;
+                    while (i > 0 && value.CompareTo(v[b + picked[at + i - 1]]) > 0)
+                    {
+                        picked[at + i] = picked[at + i - 1];
+                        i--;
+                    }
+                    picked[at + i] = c;
+                }
             }
-            return new Value { Tensor = IntTensor(picked, Sizes(stackalloc long[] { k, rows }), run), Ints = picked };
         }
 
         /// <summary>ggml's rotary over x [d, heads, tokens] at positions [tokens] (multi-axis: [4 * tokens],

@@ -77,6 +77,14 @@ public sealed class MuseGlimmerFrozenLegacyTests(ITestOutputHelper output) : IDi
     [MemberData(nameof(CaseNames))]
     public void LegacyOnGgmlMetalReproducesItsFrozenLogits(string caseName) => Verify(BackendType.GgmlMetal, caseName);
 
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [MemberData(nameof(CaseNames))]
+    public void LegacyOnGgmlCudaReproducesItsFrozenLogits(string caseName) => Verify(BackendType.GgmlCuda, caseName);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [MemberData(nameof(CaseNames))]
+    public void LegacyOnGgmlVulkanReproducesItsFrozenLogits(string caseName) => Verify(BackendType.GgmlVulkan, caseName);
+
     [MlxTheory]
     [MemberData(nameof(CaseNames))]
     public void LegacyOnMlxReproducesItsFrozenLogits(string caseName) => Verify(BackendType.Mlx, caseName);
