@@ -195,12 +195,14 @@ internal static class MuseGlimmerParity
 
     /// <summary>
     /// Prefill <paramref name="golden"/>'s prompt tokens and feed its generated tokens one at a time, recording each
-    /// position's comparison (<paramref name="firstLogProbs"/> gets our log-probabilities at the first position).
+    /// position's comparison (<paramref name="firstLogProbs"/> gets our log-probabilities at the first position);
+    /// <paramref name="beforePrompt"/> runs on the reset model before the prompt (an image's rows queued).
     /// </summary>
-    internal static List<Position> TeacherForce(ModelBase model, Golden golden, out double[] firstLogProbs)
+    internal static List<Position> TeacherForce(ModelBase model, Golden golden, out double[] firstLogProbs, Action<ModelBase> beforePrompt = null)
     {
         int vocab = model.Config.VocabSize;
         model.ResetKVCache();
+        beforePrompt?.Invoke(model);
         float[] logits = model.Forward(golden.PromptTokens);
         var positions = new List<Position>(golden.Generated.Length);
         firstLogProbs = null;
@@ -219,9 +221,10 @@ internal static class MuseGlimmerParity
         return positions;
     }
 
-    internal static int[] GreedyContinue(ModelBase model, int[] promptTokens, int count)
+    internal static int[] GreedyContinue(ModelBase model, int[] promptTokens, int count, Action<ModelBase> beforePrompt = null)
     {
         model.ResetKVCache();
+        beforePrompt?.Invoke(model);
         var produced = new int[count];
         float[] logits = model.Forward(promptTokens);
         for (int i = 0; i < count; i++)
