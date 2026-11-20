@@ -122,6 +122,49 @@ public class NGramSpeculativeDecodeTests
         Assert.Empty(model.ProtocolViolations);
     }
 
+    /// <summary>
+    /// On the batched solo step (<see cref="SpeculativeExecution.BeginSoloBatchStep"/>), a step whose n-gram lookup finds
+    /// nothing is a plain governor sample, and a step that drafts is a speculative one. The matchless step paid for no head
+    /// and verifies its anchor alone, which on the unified trunk is the plain decode step. Counted as speculative, such steps
+    /// diluted every probe of free prose toward plain cost and won it: Muse-Glimmer-30B's n-gram took 36 verify windows over a
+    /// 512-token answer and ran 5% under plain on ggml_cuda.
+    /// </summary>
+    [Fact]
+    public void ABatchedSoloStepWhoseLookupFindsNothingIsAPlainSampleAndADraftingOneASpeculativeOne()
+    {
+        var model = new PeriodicTrunk(period: 0);
+        using var exec = new SpeculativeExecution(model, new NGramSpeculator(8));
+        // Distinct tokens: no suffix of any length has occurred before.
+        var committed = Enumerable.Range(10, 12).ToList();
+        exec.SeedCommitted(committed.ToArray());
+        var drafts = new List<int>();
+        for (int i = 0; i < 4; i++)
+        {
+            int anchor = 40 + i, position = committed.Count;
+            Assert.True(exec.BeginSoloBatchStep());
+            Assert.Equal(0, exec.ProposeForBatch(anchor, position, 4, drafts));
+            exec.CommitBatch(anchor, position, drafts, 0, null, 0, verifyTicks: 1_000);
+            exec.EndSoloBatchStep(1, 1_000);
+            committed.Add(anchor);
+        }
+        Assert.True(exec.Governor.PlainMsPerToken > 0, "the matchless steps were not plain samples");
+        Assert.Equal(0, exec.Governor.SpecMsPerToken);
+
+        // Now the stream repeats 40, 41, 42, 43: from 41 on each suffix occurred before, the lookup drafts, and the step is a
+        // speculative sample (the first one is not measured).
+        for (int anchor = 40; anchor <= 43; anchor++)
+        {
+            int position = committed.Count;
+            Assert.True(exec.BeginSoloBatchStep());
+            int proposed = exec.ProposeForBatch(anchor, position, 4, drafts);
+            Assert.True(anchor == 40 ? proposed == 0 : proposed > 0, $"anchor {anchor}: {proposed} drafts");
+            exec.CommitBatch(anchor, position, drafts, 0, null, 0, verifyTicks: 4_000);
+            exec.EndSoloBatchStep(1, 4_000);
+            committed.Add(anchor);
+        }
+        Assert.True(exec.Governor.SpecMsPerToken > 0, "the drafting steps were not speculative samples");
+    }
+
     [Fact]
     public void ZeroVerificationCapacityDeclinesRegistryAndDirectExecutionRunsPlainly()
     {

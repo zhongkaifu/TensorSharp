@@ -740,7 +740,6 @@ namespace TensorSharp.Runtime.Speculative
             kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
             if (kMax <= 0 || !EnsureCarry(position))
                 return 0;
-            _batchStepDrafted = true;
             long t0 = Timestamp();
             _speculator.Propose(
                 new DraftContext
@@ -757,6 +756,13 @@ namespace TensorSharp.Runtime.Speculative
                     $"The {_speculator.Name} speculator proposed {draftsOut.Count} tokens "
                     + $"for a verification window limited to {kMax} drafts.");
             Stats.DraftTicks += Timestamp() - t0;
+            // The solo step's governor sample is speculative when the step paid for speculation: a learned drafter ran its
+            // head, or there are drafts to verify. A weight-free drafter's matchless lookup paid nothing, and the step then
+            // runs the batched verify with its anchor alone, which on the unified trunk is the plain decode step itself
+            // (Muse-Glimmer-30B on ggml_cuda: 16.07 ms against plain decoding's 16.18). Counted as speculative, those steps
+            // diluted every probe of free prose toward plain cost and won it: n-gram took 36 verify windows over a 512-token
+            // answer (3% accepted, 8 wins and 8 losses) and ran 5% under plain.
+            _batchStepDrafted = draftsOut.Count > 0 || NeedsHidden;
             return draftsOut.Count;
         }
 
