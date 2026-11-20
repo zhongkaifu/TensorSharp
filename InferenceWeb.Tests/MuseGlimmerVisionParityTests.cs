@@ -46,6 +46,11 @@ public sealed class MuseGlimmerVisionFactAttribute : FactAttribute, ITraitAttrib
 /// greedy continuations of nine image prompts with every token's top log-probabilities, made by
 /// eng/validation/muse-glimmer-llamacpp-vision-goldens.py), teacher-forced through the legacy model with its tower and the
 /// unified-runtime family with the graph tower; and the graph tower's rows against the legacy tower's on the real mmproj.
+/// As the text parity tests (<see cref="MuseGlimmerParityTests"/>), each lane is held to the argmax agreement with its own ggml
+/// backend's llama.cpp set (<see cref="MuseGlimmerParity.GoldenSet"/>: LlamaCpp/ for Metal, LlamaCpp/cuda/, LlamaCpp/vulkan/),
+/// and its first generated position is checked against llama.cpp only on the float-activation lanes
+/// (<see cref="MuseGlimmerParityTests.FirstPositionRuleOf"/>: ggml_metal, MLX, direct CUDA); elsewhere it is logged, as no
+/// frozen legacy image lane exists to hold it to.
 /// </summary>
 public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
 {
@@ -81,27 +86,45 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
 
     internal sealed record Record(string Name, string Prompt, string Image, int PromptN, int[] Generated, MuseGlimmerParity.Step[] Steps);
 
-    internal sealed record File(string LlamaCppCommit, string ModelFile, string MmprojFile, IReadOnlyList<Record> Records);
+    internal sealed record File(string LlamaCppCommit, string ModelFile, string MmprojFile, IReadOnlyList<Record> Records, string Backend,
+        IReadOnlyList<string> ImageSha256);
 
-    private static readonly Lazy<File> s_file = new(() =>
+    private static readonly Dictionary<string, File> s_files = new(StringComparer.Ordinal);
+
+    /// <summary>The image goldens of set <paramref name="set"/> (<see cref="MuseGlimmerParity.GoldenSets"/>; a set made before the
+    /// provenance named its backend is Metal's).</summary>
+    internal static File GoldensOf(string set)
     {
-        using Stream s = typeof(MuseGlimmerVisionParityTests).Assembly.GetManifestResourceStream(MuseGlimmerParity.ResourcePrefix + Golden)
-            ?? throw new FileNotFoundException($"golden {Golden} is not embedded (Fixtures/MuseGlimmer/LlamaCpp)");
-        using JsonDocument doc = JsonDocument.Parse(s);
-        JsonElement root = doc.RootElement;
-        var records = new List<Record>();
-        foreach (JsonElement r in root.GetProperty("records").EnumerateArray())
+        lock (s_files)
         {
-            var steps = r.GetProperty("steps").EnumerateArray().Select(x => new MuseGlimmerParity.Step(x.GetProperty("logprob").GetDouble(),
-                x.GetProperty("top").EnumerateArray().Select(t => (t[0].GetInt32(), t[1].GetDouble())).ToArray())).ToArray();
-            records.Add(new Record(r.GetProperty("name").GetString(), r.GetProperty("prompt").GetString(), r.GetProperty("image").GetString(),
-                r.GetProperty("prompt_n").GetInt32(), r.GetProperty("generated_tokens").EnumerateArray().Select(e => e.GetInt32()).ToArray(), steps));
+            if (s_files.TryGetValue(set, out File cached)) return cached;
+            string resource = MuseGlimmerParity.ResourcePrefix + (set == "metal" ? "" : set + ".") + Golden;
+            using Stream s = typeof(MuseGlimmerVisionParityTests).Assembly.GetManifestResourceStream(resource)
+                ?? throw new FileNotFoundException($"golden {set}/{Golden} is not embedded (Fixtures/MuseGlimmer/LlamaCpp)");
+            using JsonDocument doc = JsonDocument.Parse(s);
+            JsonElement root = doc.RootElement;
+            var records = new List<Record>();
+            var shas = new List<string>();
+            foreach (JsonElement r in root.GetProperty("records").EnumerateArray())
+            {
+                var steps = r.GetProperty("steps").EnumerateArray().Select(x => new MuseGlimmerParity.Step(x.GetProperty("logprob").GetDouble(),
+                    x.GetProperty("top").EnumerateArray().Select(t => (t[0].GetInt32(), t[1].GetDouble())).ToArray())).ToArray();
+                records.Add(new Record(r.GetProperty("name").GetString(), r.GetProperty("prompt").GetString(), r.GetProperty("image").GetString(),
+                    r.GetProperty("prompt_n").GetInt32(), r.GetProperty("generated_tokens").EnumerateArray().Select(e => e.GetInt32()).ToArray(), steps));
+                shas.Add(r.GetProperty("image_sha256").GetString());
+            }
+            JsonElement llama = root.GetProperty("llama_cpp");
+            string backend = llama.TryGetProperty("backend", out JsonElement b) ? b.GetString() : "metal";
+            return s_files[set] = new File(llama.GetProperty("commit").GetString(), root.GetProperty("model").GetProperty("file").GetString(),
+                root.GetProperty("mmproj").GetProperty("file").GetString(), records, backend, shas);
         }
-        return new File(root.GetProperty("llama_cpp").GetProperty("commit").GetString(), root.GetProperty("model").GetProperty("file").GetString(),
-            root.GetProperty("mmproj").GetProperty("file").GetString(), records);
-    });
+    }
 
-    internal static File Goldens => s_file.Value;
+    /// <summary>The Metal set: its prompts, images and mmproj are every set's.</summary>
+    internal static File Goldens => GoldensOf("metal");
+
+    /// <summary>The set the lane under test is held to.</summary>
+    private static File LaneGoldens => GoldensOf(MuseGlimmerParity.GoldenSet(MuseGlimmerParity.Backend()));
 
     /// <summary>The position table's side in patches (sqrt of v.position_embd.weight's rows: 32).</summary>
     private static int TableSide => s_tableSide.Value;
@@ -174,15 +197,48 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         CheckAgainstLlamaCpp(model);
     }
 
+    /// <summary>The goldens themselves (no weights), every set: the Metal set's prompts, images and prompt lengths, the same
+    /// llama.cpp commit, model and mmproj, each backend's own label, and a step with ten log-probabilities at the first generated
+    /// position and four after it for every generated token, llama.cpp's greedy token at the top.</summary>
+    [Fact]
+    public void ImageGoldensAreWellFormed()
+    {
+        File metal = Goldens;
+        foreach (string set in MuseGlimmerParity.GoldenSets)
+        {
+            File file = GoldensOf(set);
+            Assert.Equal(set, file.Backend);
+            Assert.Equal(metal.LlamaCppCommit, file.LlamaCppCommit);
+            Assert.Equal(metal.ModelFile, file.ModelFile);
+            Assert.Equal(metal.MmprojFile, file.MmprojFile);
+            Assert.Equal(metal.Records.Select(r => (r.Name, r.Prompt, r.Image, r.PromptN)), file.Records.Select(r => (r.Name, r.Prompt, r.Image, r.PromptN)));
+            Assert.Equal(metal.ImageSha256, file.ImageSha256);
+            foreach (Record r in file.Records)
+            {
+                Assert.True(r.Generated.Length > 0, $"{set}/{r.Name}: nothing generated");
+                Assert.Equal(r.Generated.Length, r.Steps.Length);
+                for (int i = 0; i < r.Steps.Length; i++)
+                {
+                    Assert.Equal(r.Generated[i], r.Steps[i].Top[0].Id);
+                    Assert.Equal(i == 0 ? 10 : 4, r.Steps[i].Top.Length);
+                }
+            }
+        }
+    }
+
     private void CheckAgainstLlamaCpp(ModelBase model)
     {
         IMuseGlimmerVisionTower tower = TowerOf(model);
-        output.WriteLine($"backend {MuseGlimmerParity.Backend()}; model {model.GetType().Name}; tower {tower.GetType().Name}; llama.cpp {Goldens.LlamaCppCommit}");
+        BackendType backend = MuseGlimmerParity.Backend();
+        File goldens = LaneGoldens;
+        bool holdFirst = MuseGlimmerParityTests.FirstPositionRuleOf(backend) == MuseGlimmerParityTests.FirstPositionRule.AgainstLlamaCpp;
+        output.WriteLine($"backend {backend}; model {model.GetType().Name}; tower {tower.GetType().Name}; llama.cpp {goldens.LlamaCppCommit} " +
+            $"({goldens.Backend} goldens); first position {(holdFirst ? "against llama.cpp" : "logged")}");
         int patch = model.Tokenizer.LookupToken("<|patch|>"), start = model.Tokenizer.LookupToken("<|image_start|>"), end = model.Tokenizer.LookupToken("<|image_end|>");
         int total = 0, agree = 0;
         double worstFirst = 0;
         var failures = new List<string>();
-        foreach (Record r in Goldens.Records)
+        foreach (Record r in goldens.Records)
         {
             var (pixels, w, h) = tower.ImageProcessor.ProcessImage(RepoPath(r.Image));
             var sw = Stopwatch.StartNew();
@@ -208,7 +264,7 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
             double firstErr = r.Steps[0].Top.Max(t => Math.Abs(first[t.Id] - t.Logprob));
             worstFirst = Math.Max(worstFirst, firstErr);
             bool pastTheTable = w / tower.ImageProcessor.PatchSize > TableSide || h / tower.ImageProcessor.PatchSize > TableSide;
-            double firstBound = MuseGlimmerParity.Backend() == BackendType.Mlx ? FirstPositionLogprobBoundMlx
+            double firstBound = backend == BackendType.Mlx ? FirstPositionLogprobBoundMlx
                 : pastTheTable ? FirstPositionLogprobBoundPastTheTable : FirstPositionLogprobBound;
             string text = model.Tokenizer.Decode(greedy.TakeWhile(t => !model.Tokenizer.IsEos(t)).ToList());
             string reference = model.Tokenizer.Decode(r.Generated.ToList());
@@ -218,8 +274,10 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
             output.WriteLine($"  llama.cpp: {reference.Replace("\n", "\\n")}");
             if (pastTheTable)
                 output.WriteLine($"  (a side of more than {TableSide} patches: llama.cpp clamps the position table's edges where the reference zero-pads; bound {firstBound})");
-            if (firstErr > firstBound)
+            if (firstErr > firstBound && holdFirst)
                 failures.Add($"{r.Name}: first-position log-probabilities differ by {firstErr:F4} (bound {firstBound})");
+            else if (firstErr > firstBound)
+                output.WriteLine($"  (logged, not held on {backend}: first-position log-probabilities {firstErr:F4} from llama.cpp's, past {firstBound})");
             foreach (var p in positions.Where(p => !p.Agrees))
             {
                 string what = $"{r.Name} @{p.Index}: llama.cpp {p.Reference} '{MuseGlimmerParity.Decode(model, p.Reference)}', ours {p.Ours} " +

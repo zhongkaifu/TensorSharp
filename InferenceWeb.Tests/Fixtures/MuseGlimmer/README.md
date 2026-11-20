@@ -69,6 +69,36 @@ python3 eng/validation/muse-glimmer-llamacpp-goldens.py --llama-cpp ~/llama.cpp 
     --model Muse-Glimmer-30B-UD-IQ2_XXS.gguf --draft dflash-kquant.gguf --out InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/vulkan
 ```
 
+### Image goldens (`ref_vision.json`, one set per backend)
+
+`MuseGlimmerVisionParityTests` teacher-forces llama.cpp's greedy continuations of nine image prompts through both
+families: the four `eng/minimax-m3-bench-media` questions, descriptions of two of those pictures and of the wide synthetic
+picture in `Vision/`, and a left/right and a top/bottom question about the two synthetic pictures there. They were made with the Q8_0 mmproj by
+`eng/validation/muse-glimmer-llamacpp-vision-goldens.py`, llama.cpp d3c3e242c, on 2026-11-20. As for text, there is one
+set per backend, and each lane takes its own (`MuseGlimmerParity.GoldenSet`):
+* `ref_vision.json`: Metal (M5 Pro);
+* `cuda/ref_vision.json` and `vulkan/ref_vision.json`: the RTX PRO 4500 Blackwell builds above. A second CUDA run
+  reproduced `cuda/` exactly, timings aside.
+
+Only the float-activation lanes (ggml_metal, MLX, direct CUDA) are held to their set's first position
+(`MuseGlimmerParityTests.FirstPositionRuleOf`); ggml_cuda, ggml_vulkan and the CPU lanes log it.
+
+| Set | vs Metal, first-position top-10 | Continuations equal to Metal's |
+|---|---|---|
+| `cuda/` | 0.09-1.01 nats | 6 of 9 (the three descriptions leave at 14, 22 and 32) |
+| `vulkan/` | 0.03-0.22 nats | 6 of 9 (they leave at 4, 50 and 50) |
+
+Every short answer is the same in the three sets: 7319, Red, OCEAN, 3, Left, bottom.
+
+```bash
+python3 eng/validation/muse-glimmer-llamacpp-vision-goldens.py --llama-cpp ~/llama.cpp --build-dir build --backend cuda \
+    --model Muse-Glimmer-30B-UD-IQ2_XXS.gguf --mmproj mmproj-Muse-Glimmer-30B-Q8_0.gguf \
+    --out InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/cuda
+python3 eng/validation/muse-glimmer-llamacpp-vision-goldens.py --llama-cpp ~/llama.cpp --build-dir build-vk --backend vulkan \
+    --model Muse-Glimmer-30B-UD-IQ2_XXS.gguf --mmproj mmproj-Muse-Glimmer-30B-Q8_0.gguf \
+    --out InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/vulkan
+```
+
 ## Frozen legacy outputs
 
 Stage S0 of the unified-runtime migration (`docs/design/muse-glimmer-unified.md`)
