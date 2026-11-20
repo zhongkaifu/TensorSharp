@@ -43,9 +43,11 @@ public sealed class MuseGlimmerVisionTowerTests(ITestOutputHelper output) : IDis
 
     /// <summary>
     /// The bound over the Q8_0-product fixture (the real mmproj's format), which checks that the tower reads block weights on
-    /// every executor: the executors whose Q8_0 products quantize their activations (ggml-cpu, the managed executor's integer
-    /// dot) leave 2.2e-2 between legacy's own runs on this fixture's random weights (legacy managed, which multiplies F32
-    /// copies, against legacy ggml_cpu) and 3.0e-2 between the towers on ggml_cpu; a wrong block layout or orientation is O(1).
+    /// every executor, against legacy on the managed backend (which multiplies F32 copies of the weights): the executors whose
+    /// Q8_0 products quantize their activations (ggml-cpu, ggml-cuda, the managed executor's integer dot) leave 2.2e-2 between
+    /// legacy's own runs on this fixture's random weights (legacy managed against legacy ggml_cpu), and the tower is within
+    /// 2.1e-2 of managed legacy on ggml_cuda and ggml_vulkan, 3.0e-2 of legacy on ggml_cpu; a wrong block layout or
+    /// orientation is O(1).
     /// </summary>
     internal const double Q8ProductBound = 5e-2;
 
@@ -206,22 +208,37 @@ public sealed class MuseGlimmerVisionTowerTests(ITestOutputHelper output) : IDis
         Assert.True(worstF32Kv <= ParityBound, $"{backend}: with F32 keys and values {worstF32Kv:E3} from the legacy tower");
     }
 
-    /// <summary>The Q8_0-product fixture (the real mmproj's format) on <paramref name="backend"/>: within
-    /// <see cref="Q8ProductBound"/> of legacy.</summary>
+    /// <summary>
+    /// The Q8_0-product fixture (the real mmproj's format) on <paramref name="backend"/>: within <see cref="Q8ProductBound"/> of
+    /// legacy on the managed backend. Legacy's own tower on the backend is measured against the same reference and logged, not
+    /// held: on ggml_cuda and ggml_vulkan its ggml tower is O(1) off on this fixture's non-square grids (0.44-1.11 on an RTX PRO
+    /// 4500 Blackwell, where the graph tower is within 2.1e-2), a defect of the legacy tower, which stage S9 deletes. On direct
+    /// CUDA the tower multiplies F32 copies of the weights' values (<see cref="TensorSharp.Graph.GraphProgram.FloatProducts"/>),
+    /// managed legacy's arithmetic, so it is held to <see cref="ParityBound"/> there (6.4e-7 measured).
+    /// </summary>
     private void VerifyQ8(BackendType backend)
     {
+        using var managed = new Lane(BackendType.Cpu);
         using var lane = new Lane(backend);
         using MuseGlimmerVisionTower tower = Tower(lane, Mmproj);
-        double worst = 0;
+        double worst = 0, worstLegacy = 0;
         uint seed = 1;
         foreach (var grid in Grids)
         {
             var (w, h, px) = Image(grid, seed++);
-            var d = Distance(Legacy(lane, Mmproj, px, w, h), tower.EncodeToHost(px, w, h, out _));
+            float[] reference = Legacy(managed, Mmproj, px, w, h);
+            var d = Distance(reference, tower.EncodeToHost(px, w, h, out _));
+            var l = Distance(reference, Legacy(lane, Mmproj, px, w, h));
+            output.WriteLine($"  grid {grid.W}x{grid.H}: tower {Math.Max(d.RelL2, d.RelMax):E2}, legacy on {backend} {Math.Max(l.RelL2, l.RelMax):E2} " +
+                "from legacy on the managed backend");
             worst = Math.Max(worst, Math.Max(d.RelL2, d.RelMax));
+            worstLegacy = Math.Max(worstLegacy, Math.Max(l.RelL2, l.RelMax));
         }
-        output.WriteLine($"Q8_0 products on {backend}: worst {worst:E3} from the legacy tower (bound {Q8ProductBound:E1})");
-        Assert.True(worst <= Q8ProductBound, $"{backend}: with Q8_0 products {worst:E3} from the legacy tower");
+        output.WriteLine($"Q8_0 products on {backend}: worst {worst:E3} from the managed legacy tower (bound " +
+            $"{(backend == BackendType.Cuda ? ParityBound : Q8ProductBound):E1}); " +
+            $"legacy's own tower there {worstLegacy:E3} (logged)");
+        double bound = backend == BackendType.Cuda ? ParityBound : Q8ProductBound;
+        Assert.True(worst <= bound, $"{backend}: with Q8_0 products {worst:E3} from the managed legacy tower (bound {bound:E1})");
     }
 
     [Fact]
