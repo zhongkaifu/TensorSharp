@@ -19,7 +19,10 @@ namespace TensorAgent.Core.Catalog;
 /// speed plug-in first, then the others in the order they were turned on.</param>
 /// <param name="Names">Their display names, in the same order.</param>
 /// <param name="SatOut">Why chosen plug-ins are not applied to this picture or clip, or null.</param>
-public sealed record LoraPlan(IReadOnlyList<LoraSpec> Specs, IReadOnlyList<string> Names, string? SatOut = null)
+/// <param name="MinGenerationArea">The applied speed plug-in's own generation floor
+/// (<see cref="CatalogLora.MinGenerationArea"/>), or null for the model's.</param>
+public sealed record LoraPlan(IReadOnlyList<LoraSpec> Specs, IReadOnlyList<string> Names, string? SatOut = null,
+    long? MinGenerationArea = null)
 {
     public static LoraPlan None { get; } = new(Array.Empty<LoraSpec>(), Array.Empty<string>());
 }
@@ -182,7 +185,8 @@ public static class LoraSelection
         return new LoraPlan(
             ordered.Select(c => store.SpecFor(c.Lora, StrengthOf(c))).ToArray(),
             ordered.Select(c => c.Lora.DisplayName).ToArray(),
-            why);
+            why,
+            ordered.FirstOrDefault(c => c.Lora.Kind == LoraKind.Speed).Lora?.MinGenerationArea);
     }
 
     /// <summary>

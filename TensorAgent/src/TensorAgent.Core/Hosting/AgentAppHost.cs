@@ -3274,7 +3274,7 @@ public sealed class AgentAppHost : IDisposable
                     plan.Names.Count == 0 ? "none" : string.Join(", ", plan.Names),
                     plan.SatOut is null ? "" : $" ({plan.SatOut})");
             }
-            return ImageTurns.Preparation.Ready(plan.Specs, plan.Names);
+            return ImageTurns.Preparation.Ready(plan.Specs, plan.Names, plan.MinGenerationArea);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
         {

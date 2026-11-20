@@ -299,6 +299,7 @@ namespace TensorSharp.Models.QwenImage
 
         /// <inheritdoc/>
         public bool SupportsImageEdit => true;
+        public bool SupportsEditMask => true;
 
         public RgbImage GenerateImage(string prompt, QwenImageParams p = null)
         {

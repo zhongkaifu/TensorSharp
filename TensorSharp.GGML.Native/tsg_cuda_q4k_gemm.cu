@@ -144,6 +144,33 @@ __global__ void dequant_q6k_bf16(const uint8_t* __restrict__ w, __nv_bfloat16* _
     y[96] = __float2bfloat16_rn(d * sc[is + 6] * q4);
 }
 
+// dequant_q6k_bf16 into rows of ld (>= K): block blk of row blk / blocksPerRow.
+__global__ void dequant_q6k_bf16_ld(const uint8_t* __restrict__ w, __nv_bfloat16* __restrict__ out, long long blocks,
+                                    long long blocksPerRow, long long ld)
+{
+    const long long blk = blockIdx.x;
+    if (blk >= blocks) return;
+    const uint8_t* __restrict__ b = w + blk * kQ6KBytes;
+    const int half = threadIdx.x >> 5;
+    const int l = threadIdx.x & 31;
+    const uint8_t* ql = b + 64 * half;
+    const uint8_t* qh = b + kQ6KHigh + 32 * half;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(b + kQ6KScales) + 8 * half;
+    const float d = __half2float(__ushort_as_half((unsigned short) (b[kQ6KD] | (b[kQ6KD + 1] << 8))));
+    const int is = l >> 4;
+    const int h = qh[l];
+    const int q1 = (int) ((ql[l] & 0xF) | ((h & 3) << 4)) - 32;
+    const int q2 = (int) ((ql[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) - 32;
+    const int q3 = (int) ((ql[l] >> 4) | (((h >> 4) & 3) << 4)) - 32;
+    const int q4 = (int) ((ql[l + 32] >> 4) | (((h >> 6) & 3) << 4)) - 32;
+    const long long row = blk / blocksPerRow, k = (blk - row * blocksPerRow) * 256;
+    __nv_bfloat16* __restrict__ y = out + row * ld + k + 128 * half + l;
+    y[0] = __float2bfloat16_rn(d * sc[is] * q1);
+    y[32] = __float2bfloat16_rn(d * sc[is + 2] * q2);
+    y[64] = __float2bfloat16_rn(d * sc[is + 4] * q3);
+    y[96] = __float2bfloat16_rn(d * sc[is + 6] * q4);
+}
+
 __global__ void narrow_rows_bf16(const float* __restrict__ x, long long row_stride, __nv_bfloat16* __restrict__ out,
                                  long long cols, long long rows)
 {
@@ -169,6 +196,76 @@ __global__ void narrow_swiglu_bf16(const float* __restrict__ gv, long long row_s
         const float g = gv[r * row_stride + c];
         const float v = gv[r * row_stride + cols + c];
         out[i] = __float2bfloat16_rn((g / (1.0f + expf(-g))) * v);
+    }
+}
+
+// ---- the unmerged LoRA route (tsg_cuda_lora_gemm_bf16): rows of `ld` elements, the first `cols` the base operand's ----
+
+// Q4_K rows dequantized to BF16 at a row stride of ld (>= K): the K-concatenated weight [W | up] keeps W's row first.
+__global__ void dequant_q4k_bf16_ld(const BlockQ4K* __restrict__ w, __nv_bfloat16* __restrict__ out, long long blocks,
+                                    long long blocksPerRow, long long ld)
+{
+    const long long blk = blockIdx.x;
+    if (blk >= blocks) return;
+    long long at;
+    float lo, hi;
+    q4k_pair(w, nullptr, blk, threadIdx.x, at, lo, hi);
+    const long long row = blk / blocksPerRow, k = at - row * blocksPerRow * 256;
+    out[row * ld + k] = __float2bfloat16_rn(lo);
+    out[row * ld + k + 32] = __float2bfloat16_rn(hi);
+}
+
+// One element a thread: x (or SwiGLU of its [gate | value] rows) narrowed to BF16 into rows of ld.
+__global__ void narrow_rows_bf16_ld(const float* __restrict__ x, long long row_stride, int swiglu,
+                                    __nv_bfloat16* __restrict__ out, long long ld, long long cols, long long rows)
+{
+    const long long n = cols * rows;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x)
+    {
+        const long long r = i / cols, c = i - r * cols;
+        float v;
+        if (swiglu)
+        {
+            const float g = x[r * row_stride + c];
+            v = (g / (1.0f + expf(-g))) * x[r * row_stride + cols + c];
+        }
+        else
+            v = x[r * row_stride + c];
+        out[r * ld + c] = __float2bfloat16_rn(v);
+    }
+}
+
+// An F16 or F32 matrix of rows x cols (row-major, `src_ld` apart) to BF16 at `dst` (rows `dst_ld` apart).
+__global__ void factor_bf16(const void* __restrict__ src, int f32, long long src_ld, __nv_bfloat16* __restrict__ dst,
+                            long long dst_ld, long long cols, long long rows)
+{
+    const long long n = cols * rows;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x)
+    {
+        const long long r = i / cols, c = i - r * cols;
+        const float v = f32 ? static_cast<const float*>(src)[r * src_ld + c]
+                            : __half2float(static_cast<const __half*>(src)[r * src_ld + c]);
+        dst[r * dst_ld + c] = __float2bfloat16_rn(v);
+    }
+}
+
+// The extension columns [K, K + R) of every weight row: part p's up row where the row is in p's slot, else 0.
+__global__ void lora_ext_bf16(__nv_bfloat16* __restrict__ wb, long long ld, long long K, long long R, long long N,
+                              const __nv_bfloat16* __restrict__ ups, const long long* __restrict__ meta, int nparts)
+{
+    // meta per part: row offset, rows, column offset (in [0, R)), rank, the part's first up element in `ups`.
+    const long long n = R * N;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x)
+    {
+        const long long row = i / R, c = i - row * R;
+        float v = 0.0f;
+        for (int p = 0; p < nparts; p++)
+        {
+            const long long* m = meta + 5 * p;
+            if (c >= m[2] && c < m[2] + m[3] && row >= m[0] && row < m[0] + m[1])
+                v = __bfloat162float(ups[m[4] + (row - m[0]) * m[3] + (c - m[2])]);
+        }
+        wb[row * ld + K + c] = __float2bfloat16_rn(v);
     }
 }
 
@@ -1501,6 +1598,156 @@ bool tsg_cuda_bf16_gemm(const void* w_bf16, int64_t K, int64_t N, const float* x
                                            dst, CUDA_R_32F, (int) dst_ld,
                                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (st != CUBLAS_STATUS_SUCCESS) return false;
+    const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
+    lap("multiply");
+    return ok;
+}
+
+// Whether tsg_cuda_lora_gemm_bf16 serves LoRA updates: the BF16 cuBLAS route, on sm_80 or newer, and not the int8 or FP8
+// DiT routes (TS_H3_INT8_MATMUL / TS_H3_FP8_MATMUL), which merge the update into their own weight rows
+// (tsg_cuda_q4k_lora_gemm_bf16) and keep them between steps.
+bool tsg_cuda_lora_gemm_supported(void)
+{
+    if (!tsg_cuda_q4k_gemm_supported()) return false;
+#if defined(TSG_CUDA_FP8_GEMM)
+    if ((int8_use() & FP8_DIT) != 0 || (fp8_use() & FP8_DIT) != 0) return false;
+#endif
+    return true;
+}
+
+// The unmerged LoRA update on the BF16 cuBLAS route, in the base product's GEMM:
+//   dst[n, t] = sum_k W[n, k] act(x)[t, k] + sum_p up_p[n - off_p] . (down_p act(x)[t])
+// for a contiguous W of N rows by K: Q4_K (12) or Q6_K (14), dequantized per call as tsg_cuda_q4k_gemm_bf16 does, or BF16
+// (30), read as it is. act is x or, with x_swiglu, SwiGLU of x's [gate | value] rows. Part p: down_p [ranks[p], K] and up_p
+// [outs[p], ranks[p]] row-major (ggml [K, rank] and [rank, out]), F16 (F32 with factor_f32), updating rows
+// [offsets[p], offsets[p] + outs[p]).
+//
+// The activations are narrowed once into rows of K + R (R the parts' ranks) and the shrink s = down act(x) lands, BF16, in
+// the R columns after them. A dequantized W is laid out the same way, [W | up] with each part's up in its columns on its
+// slot's rows and zeros elsewhere, so one GEMM of depth K + R computes the product and the update together: the [N, T]
+// update is never written, read or added, and no [N, K] merged weight is formed (tsg_cuda_q4k_lora_gemm_bf16's route). A
+// BF16 W is copied into those rows when that moves fewer bytes than the alternative, its product as it is with each
+// part's expand accumulated into its rows of dst (beta 1): the copy reads W and writes it once (about 4 N K bytes), the
+// accumulation reads and writes dst (8 N T), so the copy wins below K = 2 T (qkv, out and fc1 at 4 MP; fc2 and smaller
+// pictures accumulate). The factors and the shrink are BF16 here (the base operands' type); their rounding is far below
+// the base product's own BF16 rounding of the activations. Synchronizes the default stream.
+bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, const float* x, int64_t x_row_stride, int64_t T,
+                             float* dst, int64_t dst_ld, int nparts, const void* const* downs, const void* const* ups,
+                             const int64_t* ranks, const int64_t* outs, const int64_t* offsets, int factor_f32, int x_swiglu)
+{
+    if (K <= 0 || N <= 0 || T <= 0 || nparts <= 0 || nparts > 3) return false;
+    if ((wtype == 12 || wtype == 14) && K % 256 != 0) return false;
+    if (wtype != 12 && wtype != 14 && wtype != 30) return false;
+    int64_t R = 0;
+    for (int p = 0; p < nparts; p++)
+    {
+        if (ranks[p] <= 0 || outs[p] <= 0 || offsets[p] < 0 || offsets[p] + outs[p] > N) return false;
+        R += ranks[p];
+    }
+    if (R % 8 != 0) return false;   // BF16 tensor-core rows: the set pads ranks to 16
+    GemmState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (!ensure_handle(s)) return false;
+#if defined(TSG_CUDA_FP8_GEMM)
+    if (auto it = s.pending.find(x); it != s.pending.end() && !int8_settle(s, x)) return false;
+#endif
+    const int64_t ld = K + R;
+    int64_t upElems = 0;
+    for (int p = 0; p < nparts; p++) upElems += outs[p] * ranks[p];
+    const bool quantized = wtype != 30;
+    // A BF16 weight goes through the K + R rows too when copying it there is cheaper than accumulating into dst.
+    const bool concat = quantized || K < 2 * T;
+    // Scratch: the weight rows [N, ld] (quantized), the activations [T, ld], the downs [R, K] and the ups, BF16; the shrink
+    // [R, T]; the parts' table.
+    const std::size_t wNeed = concat ? (std::size_t) N * ld * sizeof(__nv_bfloat16) : 0;
+    const std::size_t xNeed = (std::size_t) T * ld * sizeof(__nv_bfloat16);
+    const std::size_t dNeed = ((std::size_t) R * K + (std::size_t) upElems + (std::size_t) R * T) * sizeof(__nv_bfloat16) +
+                              (std::size_t) 5 * 3 * sizeof(long long) + 256;
+    if ((concat && ensure(s.w, s.wBytes, wNeed) == nullptr) || ensure(s.x, s.xBytes, xNeed) == nullptr ||
+        ensure(s.d, s.dBytes, dNeed) == nullptr)
+        return false;
+    auto* wb = static_cast<__nv_bfloat16*>(s.w);
+    auto* xb = static_cast<__nv_bfloat16*>(s.x);
+    auto* db = static_cast<__nv_bfloat16*>(s.d);
+    __nv_bfloat16* ub = db + (std::size_t) R * K;
+    __nv_bfloat16* sb = ub + upElems;
+    auto* meta = reinterpret_cast<long long*>(
+        (reinterpret_cast<std::uintptr_t>(sb + (std::size_t) R * T) + 255) / 256 * 256);
+
+    tsg_stage::Clock clock;
+    auto lap = [&](const char* what) {
+        if (!tsg_stage::enabled()) return;
+        char stage[64];
+        std::snprintf(stage, sizeof(stage), "lora-gemm %s %lldx%lld%s %s", wtype == 30 ? "bf16" : wtype == 14 ? "q6k" : "q4k",
+                      (long long) K, (long long) N, x_swiglu ? " swiglu" : "", what);
+        clock.lap(stage);
+    };
+
+    // The factors as BF16: the downs stacked [R, K], each up [out_p, rank_p].
+    long long hostMeta[15];
+    int64_t col = 0, upAt = 0;
+    for (int p = 0; p < nparts; p++)
+    {
+        factor_bf16<<<grid_for(ranks[p] * K), 256>>>(downs[p], factor_f32, K, db + col * K, K, K, ranks[p]);
+        factor_bf16<<<grid_for(outs[p] * ranks[p]), 256>>>(ups[p], factor_f32, ranks[p], ub + upAt, ranks[p], ranks[p], outs[p]);
+        hostMeta[5 * p + 0] = offsets[p];
+        hostMeta[5 * p + 1] = outs[p];
+        hostMeta[5 * p + 2] = col;
+        hostMeta[5 * p + 3] = ranks[p];
+        hostMeta[5 * p + 4] = upAt;
+        col += ranks[p];
+        upAt += outs[p] * ranks[p];
+    }
+    // The activations into rows of ld, then the shrink into the extension columns.
+    narrow_rows_bf16_ld<<<grid_for((long long) T * K), 256>>>(x, x_row_stride, x_swiglu, xb, ld, K, T);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    const float one = 1.0f, zero = 0.0f;
+    // Column-major: s' (R x T, ld R) = down'^T (R x K) * act' (K x T, ld ld).
+    if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) R, (int) T, (int) K, &one,
+                     db, CUDA_R_16BF, (int) K, xb, CUDA_R_16BF, (int) ld, &zero,
+                     sb, CUDA_R_16BF, (int) R, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        return false;
+    // s into the activation rows' extension columns.
+    if (cudaMemcpy2DAsync(xb + K, (std::size_t) ld * sizeof(__nv_bfloat16), sb, (std::size_t) R * sizeof(__nv_bfloat16),
+                          (std::size_t) R * sizeof(__nv_bfloat16), (std::size_t) T, cudaMemcpyDeviceToDevice, nullptr) != cudaSuccess)
+        return false;
+    lap("shrink");
+
+    if (concat)
+    {
+        const long long blocksPerRow = K / 256, blocks = (long long) N * blocksPerRow;
+        if (wtype == 12)
+            dequant_q4k_bf16_ld<<<(unsigned int) blocks, 128>>>(static_cast<const BlockQ4K*>(w), wb, blocks, blocksPerRow, ld);
+        else if (wtype == 14)
+            dequant_q6k_bf16_ld<<<(unsigned int) blocks, 64>>>(static_cast<const uint8_t*>(w), wb, blocks, blocksPerRow, ld);
+        else if (cudaMemcpy2DAsync(wb, (std::size_t) ld * sizeof(__nv_bfloat16), w, (std::size_t) K * sizeof(__nv_bfloat16),
+                                   (std::size_t) K * sizeof(__nv_bfloat16), (std::size_t) N, cudaMemcpyDeviceToDevice, nullptr) != cudaSuccess)
+            return false;
+        if (cudaMemcpyAsync(meta, hostMeta, sizeof(long long) * 5 * nparts, cudaMemcpyHostToDevice, nullptr) != cudaSuccess)
+            return false;
+        lora_ext_bf16<<<grid_for(R * N), 256>>>(wb, ld, K, R, N, ub, meta, nparts);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        lap("dequant");
+        // Column-major: dst (N x T, ld dst_ld) = [W | up]^T' (ld x N)^T * [act | s]' (ld x T).
+        if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) ld, &one,
+                         wb, CUDA_R_16BF, (int) ld, xb, CUDA_R_16BF, (int) ld, &zero,
+                         dst, CUDA_R_32F, (int) dst_ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            return false;
+    }
+    else
+    {
+        // The BF16 weight as it is, then each part's expand into its rows (beta 1).
+        if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one,
+                         w, CUDA_R_16BF, (int) K, xb, CUDA_R_16BF, (int) ld, &zero,
+                         dst, CUDA_R_32F, (int) dst_ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            return false;
+        for (int p = 0; p < nparts; p++)
+            if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) outs[p], (int) T, (int) ranks[p], &one,
+                             ub + hostMeta[5 * p + 4], CUDA_R_16BF, (int) ranks[p],
+                             xb + K + hostMeta[5 * p + 2], CUDA_R_16BF, (int) ld, &one,
+                             dst + offsets[p], CUDA_R_32F, (int) dst_ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+                return false;
+    }
     const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
     lap("multiply");
     return ok;

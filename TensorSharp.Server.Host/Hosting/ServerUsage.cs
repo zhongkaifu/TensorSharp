@@ -357,7 +357,7 @@ namespace TensorSharp.Server.Host.Hosting
                     "loads without it, with a warning.",
                     "--qwen-image-variant turbo"),
             }),
-            ("LoRA plug-ins (Qwen-Image-2.1, MiniMax-H3 FL2VA)", new[]
+            ("LoRA plug-ins (Qwen-Image-2.1, MiniMax-H3 FL2VA, MiniMax-H3-Image)", new[]
             {
                 new OptionHelp("--lora <path>",
                     "LoRA plug-in for the hosted Qwen-Image-2.1 or MiniMax-H3 (FL2VA) model: a TensorSharp plug-in config " +
@@ -367,7 +367,13 @@ namespace TensorSharp.Server.Host.Hosting
                     "config only: the LightX2V Turbo step-distillation plug-ins config/lora/minimax-h3-fl2v-turbo-8step.json " +
                     "(8 steps) and config/lora/minimax-h3-fl2v-turbo-4step.json (4 steps), which lock --video-steps and a " +
                     "request's \"steps\", \"flowShift\", \"sampler\" and \"cfg\" to their recipe (unset or equal is accepted; " +
-                    "anything else is refused) and are refused on the Ref2VA checkpoint. Applied unmerged on top of the " +
+                    "anything else is refused) and are refused on the Ref2VA checkpoint. MiniMax-H3-Image takes " +
+                    "minimax-h3-image-lora configs and bare LoRA .safetensors (diffusers PEFT, ComfyUI or kohya names), " +
+                    "repeatable as style adapters each at its own --lora-scale, plus at most one speed adapter: the pDMD plug-ins " +
+                    "config/lora/minimax-h3-image-pdmd-2step.json (2 steps) and config/lora/minimax-h3-image-pdmd-2step-comfy.json " +
+                    "(2 steps), which lock a request's \"steps\" and \"cfg\" the same way; the style plug-in " +
+                    "config/lora/minimax-h3-image-seedreamstyle.json fixes nothing. A request's \"loras\" list swaps them per " +
+                    "picture. Applied unmerged on top of the " +
                     "quantized transformer, so small distillation deltas are kept exactly. A plug-in the startup model does " +
                     "not take is refused at startup, before the plug-in downloads; when a --config still has to download the " +
                     "model, the model's family is checked right after that download (a contradicting --video-steps is refused " +

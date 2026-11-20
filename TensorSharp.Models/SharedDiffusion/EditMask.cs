@@ -208,10 +208,15 @@ namespace TensorSharp.Models.SharedDiffusion
 
         /// <summary>The decoded picture resized to the selection and blended into the source canvas: weight-0 pixels
         /// are the source's samples exactly (alpha included), weight-1 pixels the generated ones.</summary>
-        public RgbImage Composite(RgbImage generated)
+        public RgbImage Composite(RgbImage generated) => Composite(generated, null);
+
+        /// <summary><see cref="Composite(RgbImage)"/> with the decode resized to the selection by <paramref name="resize"/>
+        /// (a family's own filter; null is <see cref="ImageIO.Resize"/>). The weight-0 pixels never pass through it.</summary>
+        public RgbImage Composite(RgbImage generated, Func<RgbImage, int, int, RgbImage> resize)
         {
             ArgumentNullException.ThrowIfNull(generated);
-            generated = QwenImage.ImageIO.Resize(generated, Width, Height);
+            if (generated.Width != Width || generated.Height != Height)
+                generated = resize != null ? resize(generated, Width, Height) : QwenImage.ImageIO.Resize(generated, Width, Height);
             var result = (float[])Source.Pixels.Clone();
             var alpha = Source.Alpha == null ? null : (float[])Source.Alpha.Clone();
             if (alpha == null && generated.Alpha != null)

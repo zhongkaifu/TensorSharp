@@ -33,7 +33,9 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
 
     /// <param name="safetensors">Write the release's form instead (a .safetensors file in the original names, torch-order
     /// shapes; F32, F16 or BF16 projections only), as Comfy-Org ships the bf16 denoiser.</param>
-    internal MiniMaxH3ImageFixture(int projections, int seed = 2051, bool safetensors = false)
+    /// <param name="edit">Changes a tensor's values (row-major, ne0 fastest) before they are written: a test merges a LoRA
+    /// delta into a projection this way, for a reference denoiser. Null writes the seed's values.</param>
+    internal MiniMaxH3ImageFixture(int projections, int seed = 2051, bool safetensors = false, Func<string, float[], float[]> edit = null)
     {
         Projections = projections;
         Dir = Path.Combine(Path.GetTempPath(), "ts-h3img-" + Guid.NewGuid().ToString("N"));
@@ -42,12 +44,12 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
         {
             if (projections is not (F32 or F16 or BF16)) throw new ArgumentException("safetensors holds F32, F16 or BF16 tensors");
             DitPath = System.IO.Path.Combine(Dir, $"minimax_h3_image_tiny-{Name(projections)}.safetensors");
-            WriteSafetensors(DitPath, Tensors(projections, seed));
+            WriteSafetensors(DitPath, Edited(Tensors(projections, seed), edit));
         }
         else
         {
             DitPath = System.IO.Path.Combine(Dir, $"minimax_h3_image_tiny-{Name(projections)}.gguf");
-            Write(DitPath, Tensors(projections, seed));
+            Write(DitPath, Edited(Tensors(projections, seed), edit));
         }
     }
 
@@ -65,6 +67,14 @@ internal sealed class MiniMaxH3ImageFixture : IDisposable
     }
 
     internal sealed record T(string Name, long[] Shape, int Type, float[] Data);
+
+    private static List<T> Edited(List<T> tensors, Func<string, float[], float[]> edit) =>
+        edit == null ? tensors : tensors.Select(t => t with { Data = edit(t.Name, (float[])t.Data.Clone()) ?? t.Data }).ToList();
+
+    /// <summary>The seed's value of every tensor (row-major, ne0 fastest), by name: what an unedited fixture holds before its
+    /// projections are rounded to their format.</summary>
+    internal static Dictionary<string, float[]> Values(int projections, int seed = 2051) =>
+        Tensors(projections, seed).ToDictionary(t => t.Name, t => t.Data);
 
     private static List<T> Tensors(int projections, int seed)
     {

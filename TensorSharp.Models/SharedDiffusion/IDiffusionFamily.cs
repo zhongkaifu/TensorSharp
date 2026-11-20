@@ -61,8 +61,9 @@ namespace TensorSharp.Models.SharedDiffusion
         /// layout: the weights and how many contiguous row values each covers (1: one weight a value).</summary>
         (float[] Weights, int ValuesPerWeight) MaskRows(float[] cellWeights, LatentShape shape);
 
-        /// <summary>The decode resized to the size the request returns (a generation floor, a kept source size): the
-        /// family's upstream filter. The default is <see cref="QwenImage.ImageIO.Resize"/>.</summary>
+        /// <summary>The family's upstream resize filter: the decode to the size the request returns (a generation floor, a
+        /// kept source size, a masked edit's selection), and a masked edit's source to the sampling canvas when it is
+        /// encoded on its own. The default is <see cref="QwenImage.ImageIO.Resize"/>.</summary>
         RgbImage ResizeOutput(RgbImage image, int width, int height) => QwenImage.ImageIO.Resize(image, width, height);
     }
 
@@ -138,5 +139,11 @@ namespace TensorSharp.Models.SharedDiffusion
 
         /// <summary>Augment a reference's rows in place, drawing from <paramref name="noise"/> (after the target noise).</summary>
         void Augment(LatentRef reference, INoiseSource noise);
+
+        /// <summary>A masked edit's source latent (docs/design/diffusion-runtime.md section 4.5): the posterior's mean in the
+        /// space the denoiser works in, so that the kept cells end on it exactly. A family whose VAE hands back normalized
+        /// moments needs nothing more (the default); one that normalizes its references' samples itself (MiniMax-H3-Image's
+        /// latent statistics) normalizes the mean the same way.</summary>
+        LatentTensor SourceLatent(LatentPosterior posterior) => new(posterior.Shape, posterior.Mean);
     }
 }

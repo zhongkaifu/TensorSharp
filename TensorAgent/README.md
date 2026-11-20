@@ -447,7 +447,7 @@ the editor asks for a full-resolution source.
 button above the message box opens its compatible adapters in one tap. The model details
 sheet keeps the same shortcut; both hide when the loaded model has no supported LoRAs.
 The existing side menu is unchanged. Search filters the list locally, and the composer
-shows the selected adapters. The catalog contains fourteen Qwen-Image LoRAs and two MiniMax-H3 Turbo plug-ins. Each is pinned to a commit and a SHA-256 in `LoraCatalog` and downloaded on its
+shows the selected adapters. The catalog contains fourteen Qwen-Image LoRAs, two MiniMax-H3 Turbo plug-ins and MiniMax-H3-Image's pDMD 2-step (linoyts; pictures and edits in 2 steps at about 1 MP, the area a turn then asks for; the engine's other MiniMax-H3-Image configs, akhaliq's ComfyUI conversion and a style adapter, are for the CLI and server only, decision D7). Each is pinned to a commit and a SHA-256 in `LoraCatalog` and downloaded on its
 own, 80-680 MB (1.38 GB for MiniMax-H3's), into `Library/Caches/TensorAgent/loras/<id>/`. A switch turns one on, a
 slider sets the strength of a style or an edit (10-150%), and Remove deletes the files and
 turns it off. Speed plug-ins (Viggle Turbo, 6 steps; Pruna 8-Step; Pruna 5-Step; Fun-Acc

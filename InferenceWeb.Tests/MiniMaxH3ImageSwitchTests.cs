@@ -102,12 +102,13 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
             runtime.EditImage("x", new[] { picture }, new QwenImageParams { CfgScale = 2 })).Message);
         Assert.Contains("negative prompt", Assert.Throws<ArgumentException>(() =>
             runtime.EditImage("x", new[] { picture }, new QwenImageParams { NegativePrompt = "no" })).Message);
-        Assert.Contains("edit mask", Assert.Throws<ArgumentException>(() =>
-            runtime.EditImage("x", new[] { picture }, new QwenImageParams { Mask = picture })).Message);
+        // A mask is taken (stage S6); one that is not <Picture 1>'s size is refused before any component is made.
+        Assert.Contains("same width and height", Assert.Throws<ArgumentException>(() =>
+            runtime.EditImage("x", new[] { picture }, new QwenImageParams { Mask = new RgbImage(32, 32, new float[32 * 32 * 3]) })).Message);
         // The legacy refusals, in the legacy order, before any component is made.
         Assert.Contains("cfg must be 1", Assert.Throws<ArgumentException>(() => runtime.GenerateImage("x", new QwenImageParams { CfgScale = 2 })).Message);
         Assert.Contains("negative prompt", Assert.Throws<ArgumentException>(() => runtime.GenerateImage("x", new QwenImageParams { NegativePrompt = "no" })).Message);
-        Assert.Contains("no mask", Assert.Throws<ArgumentException>(() =>
+        Assert.Contains("requires a first reference image", Assert.Throws<ArgumentException>(() =>
             runtime.GenerateImage("x", new QwenImageParams { Mask = new RgbImage(1, 1, new float[3]) })).Message);
     }
 

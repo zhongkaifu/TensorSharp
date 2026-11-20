@@ -99,8 +99,18 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public IDenoiser CreateDenoiser(DiffusionLoad load)
         {
             ArgumentNullException.ThrowIfNull(load);
-            return new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend);
+            return Denoiser = new MiniMaxH3ImageDenoiser(load.File(DiffusionLoad.Denoiser), load.Backend)
+            {
+                AdapterBytes = () => Lora?.FactorBytes ?? 0,
+            };
         }
+
+        /// <summary>The denoiser this family made last (the model releases its LoRA binding before replacing a set).</summary>
+        internal MiniMaxH3ImageDenoiser Denoiser { get; private set; }
+
+        /// <summary>The LoRA set the model's requests run with (null: none), whose factors residency counts with the denoiser's
+        /// weights.</summary>
+        internal MiniMaxH3ImageLoraSet Lora { get; set; }
 
         public IVaeCodec CreateVae(DiffusionLoad load)
         {
@@ -139,16 +149,22 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// Text to image: <see cref="DiffusionCanvas.TextToImage"/>, unchanged. An edit (docs/design/diffusion-runtime.md section
         /// 4.4): an explicit width and height win (multiples of 32, at most <see cref="MaxEditArea"/>); keepSourceSize returns
         /// <c>&lt;Picture 1&gt;</c>'s exact size; otherwise <c>&lt;Picture 1&gt;</c>'s aspect at the request's target area, or
-        /// without one its VAE copy's size (a 1024-2048 short edge). Below <see cref="MinGenerationArea"/> the picture samples
-        /// on diffusers' larger canvas (get_image_canvas_size) and is resized back.
+        /// without one its VAE copy's size (a 1024-2048 short edge). Below <see cref="MinGenerationArea"/> (or a speed adapter's
+        /// own floor, <see cref="SamplingContract.MinGenerationArea"/>) the picture samples on diffusers' larger canvas
+        /// (get_image_canvas_size) and is resized back.
+        /// <para>A masked edit (section 4.5) returns its source canvas: the same rules give the whole picture's canvas, the
+        /// selection's crop (or the whole picture) samples at that canvas's density (<see cref="EditMask.SamplingDimensions"/>),
+        /// and the floor (the family's or the speed adapter's) and the 20 MP ceiling then apply to what it samples, at the
+        /// crop's aspect.</para>
         /// </summary>
         public DiffusionCanvas ResolveCanvas(DiffusionRequest request, EditMask mask)
         {
             ArgumentNullException.ThrowIfNull(request);
-            if (mask != null)
-                throw new ArgumentException($"{DisplayName} does not take an edit mask yet; send the edit without one.");
             if (request.References is not { Count: > 0 })
+            {
+                if (mask != null) throw new ArgumentException("A mask requires a first reference image to edit.");
                 return DiffusionCanvas.TextToImage(request, Geometry, DisplayName);
+            }
             RgbImage first = request.References[0].Image;
             int multiple = Geometry.SizeMultiple, width = request.Width, height = request.Height;
             if ((width > 0) != (height > 0))
@@ -176,7 +192,25 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 width = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vw, multiple));
                 height = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vh, multiple));
             }
-            var sampling = EditCanvas(width, height, multiple);
+            // A speed adapter's contract may lower the floor (pDMD's 1024 px: an edit samples at the asked size, as the
+            // adapter's diffusers pipeline does); otherwise the family's 4 MP floor. Masked or not.
+            long floor = request.Adapters?.Contract is { MinGenerationArea: > 0 } contract ? contract.MinGenerationArea : MinGenerationArea;
+            if (mask != null)
+            {
+                var (cw, ch) = mask.SamplingDimensions(width, height, multiple);
+                var selection = EditCanvas(cw, ch, multiple, floor);
+                if ((long)selection.Width * selection.Height > MaxEditArea)
+                {
+                    if (request.Width > 0)
+                        throw new ArgumentException(
+                            $"{DisplayName} edits at most {MaxEditArea / 1e6:F1} MP ({selection.Width}x{selection.Height} asked for the selection); ask for a smaller size.");
+                    double f = Math.Sqrt(MaxEditArea / ((double)selection.Width * selection.Height));
+                    selection = (Math.Max(multiple, (int)Math.Floor(selection.Width * f / multiple) * multiple),
+                                 Math.Max(multiple, (int)Math.Floor(selection.Height * f / multiple) * multiple));
+                }
+                return new DiffusionCanvas(selection, (mask.Source.Width, mask.Source.Height));
+            }
+            var sampling = EditCanvas(width, height, multiple, floor);
             if ((long)sampling.Width * sampling.Height > MaxEditArea)
             {
                 if (!request.KeepSourceSize)
@@ -190,11 +224,12 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return new DiffusionCanvas(sampling, (width, height));
         }
 
-        /// <summary>diffusers' get_image_canvas_size: a picture below <see cref="MinGenerationArea"/> is scaled up by
-        /// <c>sqrt(min / area)</c>; either way both sides round to <paramref name="multiple"/>.</summary>
-        public static (int Width, int Height) EditCanvas(int width, int height, int multiple = MiniMaxH3ImageDiffusionModel.SizeMultiple)
+        /// <summary>diffusers' get_image_canvas_size: a picture below <paramref name="floor"/> (0: <see cref="MinGenerationArea"/>)
+        /// is scaled up by <c>sqrt(floor / area)</c>; either way both sides round to <paramref name="multiple"/>.</summary>
+        public static (int Width, int Height) EditCanvas(int width, int height, int multiple = MiniMaxH3ImageDiffusionModel.SizeMultiple,
+            long floor = 0)
         {
-            double scale = Math.Max(1.0, Math.Sqrt(MinGenerationArea / ((double)width * height)));
+            double scale = Math.Max(1.0, Math.Sqrt((floor > 0 ? floor : MinGenerationArea) / ((double)width * height)));
             return (Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(width * scale, multiple)),
                     Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(height * scale, multiple)));
         }

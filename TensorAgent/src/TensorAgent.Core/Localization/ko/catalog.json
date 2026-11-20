@@ -50,6 +50,7 @@
   "catalog.lora.animeConsistency.purpose": "첨부 이미지를 새로운 자세, 시점, 표정으로 편집할 때 애니메이션 캐릭터의 일관성을 유지합니다. 실험적 기능입니다.",
   "catalog.lora.minimaxH3Turbo8Step.purpose": "증류된 스케줄로 20단계 대신 8단계만에 동영상을 생성합니다. 첫 프레임과 마지막 프레임을 쓰는 체크포인트용으로 768p에서 학습되었습니다.",
   "catalog.lora.minimaxH3Turbo4Step.purpose": "20단계 대신 4단계만에 동영상을 생성합니다. 첫 프레임과 마지막 프레임을 쓰는 체크포인트용으로 768p에서 학습되었습니다. 스케줄은 추정한 것으로, 배포자가 이 버전의 스케줄을 밝히지 않았습니다.",
+  "catalog.lora.minimaxH3ImagePdmd2Step.purpose": "이미지 생성과 편집을 6단계 대신 2단계로 처리합니다. 증류된 스케줄을 따라 약 1 MP(요청한 크기, 플러그인이 없으면 모델은 최소 2048 x 2048로 생성)로 만듭니다. 길고 자세한 프롬프트에서 가장 잘 작동합니다. 모델과 마찬가지로 MiniMax-H3-Image 라이선스가 적용됩니다.",
   "catalog.extended.gemmaLarge.notes": "시각 기능과 해당 MTP 초안 헤드는 선택적으로 다운로드할 수 있습니다. Gemma DSpark/DFlash 초안은 지원되지 않습니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
   "catalog.extended.qwen35Large.notes": "선택적 시각 프로젝터를 제공하는 하이브리드 전문가 혼합 모델입니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
   "catalog.extended.qwen36Large.notes": "시각 기능은 선택 사항입니다. 내장 NextN 헤드는 추가 다운로드가 필요하지 않으며 앱의 기본 추측 디코딩은 n-gram 방식입니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",

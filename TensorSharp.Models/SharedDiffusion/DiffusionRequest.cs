@@ -53,7 +53,18 @@ namespace TensorSharp.Models.SharedDiffusion
         /// <summary>The negative branch's prompt (guided families); whitespace is no negative prompt.</summary>
         public string NegativePrompt { get; init; }
 
-        public AdapterSet Adapters { get; init; } = AdapterSet.Empty;
+        public AdapterSet Adapters { get => _adapters; init => _adapters = value ?? AdapterSet.Empty; }
+        private AdapterSet _adapters = AdapterSet.Empty;
+
+        /// <summary>This request with <paramref name="adapters"/> instead of its own (a shallow copy): a model that swaps its
+        /// plug-ins between requests binds the set in force when the request runs.</summary>
+        public DiffusionRequest WithAdapters(AdapterSet adapters)
+        {
+            if (ReferenceEquals(adapters ?? AdapterSet.Empty, _adapters)) return this;
+            var copy = (DiffusionRequest)MemberwiseClone();
+            copy._adapters = adapters ?? AdapterSet.Empty;
+            return copy;
+        }
 
         /// <summary>Decoded previews to emit across the loop (0: progress only).</summary>
         public int PreviewCount { get; init; }

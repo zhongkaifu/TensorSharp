@@ -116,6 +116,42 @@ public sealed partial class WebUiPageTests
         Assert.Empty(Strings(result, "errors"));
     }
 
+    /// <summary>
+    /// MiniMax-H3-Image, an image model the page knows only by the host's image block (its
+    /// architecture is not Qwen-Image's): the composer is a picture's, the first photo's selection
+    /// and both photos go out on /api/chat as one masked edit with a reference, and the picture
+    /// that comes back is shown.
+    /// </summary>
+    [WebJavaScriptFact]
+    public void AnImageModelKnownByTheHostsImageBlockSendsASelectionWithAReference()
+    {
+        JsonElement result = Run("""
+            R['/api/models'] = { loaded: 'minimax_h3_image_pruned-Q8_0.gguf', architecture: 'minimax-h3-image',
+              image: { family: 'minimax-h3-image', supportsEdit: true, supportsMask: true, minimumArea: 4194304 } };
+            R['/api/chat'] = { __sse: [{ image_plan: 'edit', image_sources: ['/uploads/source.png', '/uploads/mug.png'] },
+              { imageUrl: '/uploads/result.png', imagePlan: 'edit', imageSources: ['source.png', 'mug.png'] }, { done: true, sessionId: 's1' }] };
+            """, """
+            window.TensorAgent.addAttachment({ ok: true, file: 'source.png', mediaType: 'image', maskPath: 'mask.png' });
+            window.TensorAgent.addAttachment({ ok: true, file: 'mug.png', mediaType: 'image' });
+            __page.byId['text'].value = 'put the mug from <Picture 2> on the table, in the selected area';
+            var hint = __page.byId['text'].placeholder;
+            __page.byId['send'].dispatch('click');
+            return settle(30).then(function () { return {
+              hint: hint, sent: __page.requests('/api/chat'),
+              media: __page.transcript().slice(-1)[0].media, errors: __page.errorNotices()
+            }; });
+            """);
+        Assert.Contains("Describe a picture", result.GetProperty("hint").GetString());
+        JsonElement message = Assert.Single(result.GetProperty("sent").EnumerateArray()).GetProperty("body").GetProperty("messages")[0];
+        Assert.Equal("mask.png", message.GetProperty("maskPath").GetString());
+        Assert.Equal(new[] { "source.png", "mug.png" }, Strings(message, "stillImagePaths"));
+        // The picture, and under it the plan's thumbnail of the picture it changed.
+        JsonElement[] pictures = result.GetProperty("media").EnumerateArray().Where(m => m.GetProperty("tag").GetString() == "IMG").ToArray();
+        Assert.Equal("/uploads/result.png", pictures[0].GetProperty("src").GetString());
+        Assert.Contains(pictures, m => m.GetProperty("src").GetString() == "/uploads/source.png");
+        Assert.Empty(Strings(result, "errors"));
+    }
+
     private const string MaskImageModel = """
         R['/api/models'] = { loaded: 'qwen-image.gguf', architecture: 'qwen_image', visionReady: true };
         R['/api/upload'] = { ok: true, file: 'selection.png', mediaType: 'image' };

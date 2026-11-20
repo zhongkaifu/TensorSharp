@@ -1,0 +1,39 @@
+{
+  // pDMD 2-step (linoyts/MiniMax-H3-Image-pDMD-2steps): a step-distillation LoRA for MiniMax-H3-Image (text to image and
+  // reference editing), 2 transformer passes instead of the base model's 6, applied unmerged to the 50 DiT blocks and the
+  // 2 token-refiner blocks (diffusers PEFT names, rank 128, alpha 128 in the file's metadata: scale 1).
+  //
+  //   TensorSharp.Cli --config config/minimax-h3-image.json \
+  //       --lora config/lora/minimax-h3-image-pdmd-2step.json --prompt "..." --output out.png
+  //
+  //   TensorSharp.Server.Host --config config/minimax-h3-image.json --lora config/lora/minimax-h3-image-pdmd-2step.json
+  //
+  // Contract (the model card): 2 steps on sample_sigmas [1, 12/13, 0] (a shift-12 midpoint), the transformer's output
+  // heads in order (head i at step i: "by-step"), no guidance, and diffusers' min_generation_area 1024: generate at the
+  // asked size (trained around 1 MP: 1024x1024, 768x1344, 1344x768). Long prompts work best (it was trained on
+  // MiniMax-H3-Image-PE rewrites).
+  // Locked: --diffusion-steps and --cfg on the CLI, "steps" and "cfg" in a request may be left unset or repeat the values
+  // above; anything else is refused, never overridden. Strength 1 (the distillation's).
+  // Licence: MiniMax-H3-Image Community License Agreement (a Model Derivative of MiniMax-H3-Image).
+  "type": "minimax-h3-image-lora",
+  "name": "pDMD 2-step (linoyts)",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/minimax-h3-image/loras"
+  },
+  "weights": {
+    "path": "${root}/pytorch_lora_weights.safetensors",
+    "urls": [
+      "https://huggingface.co/linoyts/MiniMax-H3-Image-pDMD-2steps/resolve/c07d96e5635311ed007d44654c2f98cc8d6e0a1e/pytorch_lora_weights.safetensors"
+    ],
+    "sha256": "c0a88d9c1de401e50894424a6b9a73e46b4f0d977e181e48642fdcfe98ede435"
+  },
+  "key_format": "diffusers",
+  "scale": 1.0,
+  "sampling": {
+    "steps": 2,
+    "sigmas": [1.0, 0.9230769230769231, 0.0],
+    "heads": "by-step",
+    "cfg": 1.0,
+    "min_generation_area": 1024
+  }
+}

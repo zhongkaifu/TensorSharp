@@ -388,7 +388,13 @@ public sealed class MiniMaxH3LoraParityTests : IDisposable
             // `moved`: its direction is off by up to about floor / moved, so its cosine falls short of 1 by up to
             // about (floor / moved)^2 / 2. The bound is that, doubled, from this run's own floor; measured 1 - cos
             // was 0.23-0.47 (floor / moved)^2 across these cases.
-            double bound = (floor / moved) * (floor / moved);
+            // The update has a floor of its own the base step does not show: the packed factors are F16 on ggml_cuda
+            // and ggml-cuda rounds the activations of an F16 product to F16, so the update is off by about 2 u (u =
+            // 2^-11, F16's unit roundoff) and its cosine short of 1 by about (2 u)^2 / 2 whatever the base floor. Where
+            // the base products are F32-exact (sm_86: floor 8.1e-6, against 6.1e-4 where cuBLAS runs TF32) that term
+            // dominates: the "all" case measured 1 - cos 3.1e-7 there against (floor / moved)^2 = 4.5e-10. So the
+            // bound is the larger of the two, the F16 term doubled: (2 u)^2 = 2^-20 = 9.5e-7.
+            double bound = Math.Max((floor / moved) * (floor / moved), Math.Pow(2, -20));
             Assert.True(rel <= 2e-3, $"{id}: {backend} ({attention}, TF32) vs direct CPU rel {rel:E3} > 2e-3 (no-plug-in floor {floor:E3})");
             Assert.True(1 - cosine <= bound,
                 $"{id}: {backend} ({attention}, TF32) update 1 - cosine {1 - cosine:E3} > (floor / moved)^2 = {bound:E3}");

@@ -12,6 +12,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 
 namespace TensorSharp.Runtime
@@ -127,8 +128,12 @@ namespace TensorSharp.Runtime
         /// checkpoint partition and the sampling contract of a step-distillation adapter.</summary>
         public const string MiniMaxH3PluginType = "minimax-h3-lora";
 
+        /// <summary>The <c>"type"</c> of a MiniMax-H3-Image LoRA plug-in config: a style adapter, or a step-distillation
+        /// adapter whose <c>"sampling"</c> fixes its steps, sigmas, head policy, guidance and generation floor.</summary>
+        public const string MiniMaxH3ImagePluginType = "minimax-h3-image-lora";
+
         /// <summary>Every TensorSharp plug-in config type, one per model family that takes LoRA plug-ins.</summary>
-        public static readonly IReadOnlyList<string> PluginTypes = new[] { QwenImagePluginType, MiniMaxH3PluginType };
+        public static readonly IReadOnlyList<string> PluginTypes = new[] { QwenImagePluginType, MiniMaxH3PluginType, MiniMaxH3ImagePluginType };
 
         /// <summary>
         /// The TensorSharp plug-in config that <paramref name="spec"/> is selected by:
@@ -245,12 +250,13 @@ namespace TensorSharp.Runtime
             return null;
         }
 
-        /// <summary>A MiniMax-H3 plug-in is its own config; it never forwards a third-party one.</summary>
+        /// <summary>A MiniMax-H3 or MiniMax-H3-Image plug-in is its own config; it never forwards a third-party one.</summary>
         private static void RefuseForwardingH3(JsonElement root, string manifest)
         {
-            if (PluginTypeOf(root) == MiniMaxH3PluginType && root.TryGetProperty("config", out _))
+            string type = PluginTypeOf(root);
+            if (type is MiniMaxH3PluginType or MiniMaxH3ImagePluginType && root.TryGetProperty("config", out _))
                 throw new ArgumentException(
-                    $"{manifest}: a {MiniMaxH3PluginType} plug-in cannot forward a \"config\"; its own file is the config.");
+                    $"{manifest}: a {type} plug-in cannot forward a \"config\"; its own file is the config.");
         }
 
         /// <summary>A plug-in's own strength, when it states one.</summary>
@@ -293,7 +299,7 @@ namespace TensorSharp.Runtime
                 if (!isPlugin)
                     throw new ArgumentException(
                         $"{LoraFlag} {manifest}: a .json LoRA must be a TensorSharp plug-in config " +
-                        $"(\"type\": \"{QwenImagePluginType}\" or \"{MiniMaxH3PluginType}\"). " +
+                        $"(\"type\": {string.Join(", ", PluginTypes.Select(t => $"\"{t}\""))}). " +
                         $"Pass the weights (.safetensors) with {LoraFlag} and a third-party config with {ConfigFlag}.");
                 if (spec.ConfigPath != null)
                     throw new ArgumentException($"{LoraFlag} {manifest} is a plug-in config already; drop the {ConfigFlag} after it.");

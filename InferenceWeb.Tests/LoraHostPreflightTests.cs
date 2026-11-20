@@ -206,7 +206,7 @@ public sealed class LoraHostPreflightTests : IDisposable
     public void ModelWithoutPlugins_RefusesEveryPlugin()
     {
         string text = Text();
-        string expected = $"--lora applies to Qwen-Image-2.1 and MiniMax-H3 (FL2VA) models only; '{TextModel}' (qwen35) does not take LoRA plug-ins.";
+        string expected = $"--lora applies to Qwen-Image-2.1, MiniMax-H3 (FL2VA) and MiniMax-H3-Image models only; '{TextModel}' (qwen35) does not take LoRA plug-ins.";
 
         Assert.Equal(expected, Assert.Throws<ArgumentException>(() => Check(Specs(new LoraSpec(Manifest8())), text)).Message);
         Assert.Equal(expected, Assert.Throws<ArgumentException>(() => Check(Specs(new LoraSpec(Touch("w.safetensors"))), text)).Message);

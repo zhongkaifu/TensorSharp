@@ -19,7 +19,7 @@ namespace InferenceWeb.Tests;
 
 /// <summary>
 /// On ggml_cuda a program marked WideTokenProducts serves the diffusion-transformer regions as the DiT offload's fused nodes
-/// (ggml_ops_dit_offload.h: tsg_h3_modulate, tsg_h3_gated_residual, tsg_cudnn_h3_attention, the Q4_K LoRA GEMM, the BF16/F16
+/// (ggml_ops_dit_offload.h: tsg_h3_modulate, tsg_h3_gated_residual, tsg_cudnn_h3_attention, the unmerged LoRA GEMM, the BF16/F16
 /// GEMM with the SwiGLU in its narrowing) and runs its wide products on cuBLAS. Each region here, at the widths those routes
 /// take (a thousand rows and more), is served (the plan says how many regions were), and its result matches both an
 /// independent double-precision oracle and the same program's reference ops (no attribute: nothing served, ggml's kernels).
@@ -27,7 +27,7 @@ namespace InferenceWeb.Tests;
 /// </summary>
 public sealed class GraphDitServedRegionTests(ITestOutputHelper output)
 {
-    private const int Q4_K = 12;   // ggml_type
+    private const int Q4_K = 12, Q6_K = 14;   // ggml_type
 
     private sealed class Program : IDisposable
     {
@@ -177,6 +177,49 @@ public sealed class GraphDitServedRegionTests(ITestOutputHelper output)
         return (bytes, values);
     }
 
+    /// <summary>Random Q6_K blocks for a [inRows, outRows] weight (ggml's block_q6_K: 128 bytes of low nibbles, 64 of high
+    /// bit pairs, 16 int8 scales, half d) and their values, as ggml's dequantize_row_q6_K reads them.</summary>
+    private static (byte[] Bytes, float[] Values) Q6K(Random rng, int inRows, int outRows)
+    {
+        const int Qk = 256, Block = 210;
+        int blocks = inRows / Qk * outRows;
+        var bytes = new byte[blocks * Block];
+        var values = new float[inRows * outRows];
+        for (int b = 0; b < blocks; b++)
+        {
+            int at = b * Block;
+            for (int i = 0; i < 192; i++) bytes[at + i] = (byte)rng.Next(256);
+            for (int i = 0; i < 16; i++) bytes[at + 192 + i] = (byte)(sbyte)rng.Next(-64, 64);
+            Half d = (Half)(0.0001f + 0.0001f * (float)rng.NextDouble());
+            BitConverter.TryWriteBytes(bytes.AsSpan(at + 208), BitConverter.HalfToUInt16Bits(d));
+            int y = b * Qk, ql = at, qh = at + 128, sc = at + 192;
+            for (int n = 0; n < Qk; n += 128, y += 128, ql += 64, qh += 32, sc += 8)
+                for (int l = 0; l < 32; l++)
+                {
+                    int i = l / 16;
+                    int q1 = ((bytes[ql + l] & 0xF) | ((bytes[qh + l] & 3) << 4)) - 32;
+                    int q2 = ((bytes[ql + l + 32] & 0xF) | (((bytes[qh + l] >> 2) & 3) << 4)) - 32;
+                    int q3 = ((bytes[ql + l] >> 4) | (((bytes[qh + l] >> 4) & 3) << 4)) - 32;
+                    int q4 = ((bytes[ql + l + 32] >> 4) | (((bytes[qh + l] >> 6) & 3) << 4)) - 32;
+                    values[y + l] = (float)d * (sbyte)bytes[sc + i] * q1;
+                    values[y + l + 32] = (float)d * (sbyte)bytes[sc + i + 2] * q2;
+                    values[y + l + 64] = (float)d * (sbyte)bytes[sc + i + 4] * q3;
+                    values[y + l + 96] = (float)d * (sbyte)bytes[sc + i + 6] * q4;
+                }
+        }
+        return (bytes, values);
+    }
+
+    /// <summary>A random BF16 [inRows, outRows] weight's bytes and values.</summary>
+    private static (byte[] Bytes, float[] Values) Bf16Weight(Random rng, int inRows, int outRows)
+    {
+        float[] values = Random(rng, (long)inRows * outRows, 0.05f).Select(Bf16).ToArray();
+        var bytes = new byte[values.Length * 2];
+        for (int i = 0; i < values.Length; i++)
+            BitConverter.TryWriteBytes(bytes.AsSpan(2 * i), (ushort)(BitConverter.SingleToUInt32Bits(values[i]) >> 16));
+        return (bytes, values);
+    }
+
     // ================================================================ regions
 
     private static readonly GraphSegment[] Segments = { new(0, 120, 0), new(120, 1000, 6), new(1000, 1100, 12) };
@@ -308,16 +351,25 @@ public sealed class GraphDitServedRegionTests(ITestOutputHelper output)
     }
 
     [GgmlTheory(BackendType.GgmlCuda)]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void LoraLinearOnAQ4KWeightIsServedAndMatches(bool swigluInput)
+    [InlineData(Q4_K, false, 256)]
+    [InlineData(Q4_K, true, 256)]
+    [InlineData(Q6_K, false, 256)]
+    [InlineData(Q6_K, true, 256)]
+    [InlineData(GraphFormat.BF16, false, 256)]    // K < 2 T: the BF16 weight copied into the K + R rows
+    [InlineData(GraphFormat.BF16, true, 2304)]    // K >= 2 T: its product as it is, the expands accumulated into dst
+    public void LoraLinearIsServedUnmergedAndMatches(int weightType, bool swigluInput, int inRows)
     {
         // qkv-like: three 128-row slots, a part on each (F16 factors); or fc2-like over fc1's SwiGLU, one slot.
         const int rows = 1100, rank = 16;
-        int inRows = 256, outRows = swigluInput ? 256 : 384, slot = swigluInput ? 0 : 128;
+        int outRows = swigluInput ? 256 : 384, slot = swigluInput ? 0 : 128;
         int slotRows = slot > 0 ? slot : outRows, slots = outRows / slotRows;
-        var rng = new Random(swigluInput ? 3402 : 3401);
-        var (wq, wv) = Q4K(rng, inRows, outRows);
+        var rng = new Random((swigluInput ? 3402 : 3401) + 10 * weightType + inRows);
+        var (wq, wv) = weightType switch
+        {
+            Q4_K => Q4K(rng, inRows, outRows),
+            Q6_K => Q6K(rng, inRows, outRows),
+            _ => Bf16Weight(rng, inRows, outRows),
+        };
         float[] gv = Random(rng, 2 * inRows * rows, 2f);   // fc1's [gate | value] when swigluInput, else x itself
         float[] x = swigluInput ? new float[inRows * rows] : gv.Take(inRows * rows).ToArray();
         if (swigluInput)
@@ -338,10 +390,10 @@ public sealed class GraphDitServedRegionTests(ITestOutputHelper output)
             for (int r = 0; r < rows; r++)
                 for (int o = 0; o < slotRows; o++) want[(long)r * outRows + s * slotRows + o] += delta[(long)r * slotRows + o];
         }
-        Verify($"LoraLinear swiglu={swigluInput}", p =>
+        Verify($"LoraLinear type={weightType} swiglu={swigluInput} K={inRows}", p =>
         {
             int xn = swigluInput ? p.G.Op(GraphOp.Swiglu, p.Input(gv, 2 * inRows, rows)) : p.Input(x, inRows, rows);
-            int w = p.Weight(Q4_K, wq, wq.Length, inRows, outRows);
+            int w = p.Weight(weightType, wq, wq.Length, inRows, outRows);
             var parts = new List<GraphDitRegions.LoraPart>();
             for (int s = 0; s < slots; s++)
             {

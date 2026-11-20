@@ -144,6 +144,10 @@ public static partial class ImageTurns
         string Kind, string Reason, IReadOnlyList<string> Sources, string Prompt, long Seed,
         IReadOnlyDictionary<string, JsonElement> Mask, IReadOnlyList<ImageOption>? Choices = null)
     {
+        /// <summary>The output area the turn asks for (<see cref="TurnArea"/>): <see cref="DefaultTargetArea"/>, or the
+        /// loaded model's own floor where it is larger.</summary>
+        public long Area { get; init; } = DefaultTargetArea;
+
         /// <summary>Whether the image service edits (sources or a selection) rather than draws.</summary>
         public bool Editing => Sources.Count > 0 || Mask.Count > 0;
 
@@ -172,7 +176,7 @@ public static partial class ImageTurns
                     payload["imagePaths"] = Sources;
                     payload["keepSourceSize"] = true;
                 }
-                payload["targetArea"] = DefaultTargetArea;
+                payload["targetArea"] = Area;
                 foreach ((string name, JsonElement value) in Mask)
                     payload[name] = value;
                 if (Kind == "again" || Seed != 0)
@@ -299,12 +303,18 @@ public static partial class ImageTurns
         ArgumentNullException.ThrowIfNull(planner);
         ImageMessage newest = conversation.Newest;
 
+        IReadOnlyList<Picture> pictures = conversation.Pictures;
+
         // (a) Photos or a selection on the message are what it edits: the first photo is the
-        // source, later ones are references, and the selection applies to the first.
+        // source, later ones are references, and the selection applies to the first. When the
+        // user said the message changes a picture already in the chat (the reading they chose,
+        // imageIntent "edit" naming it), that picture is the source and every photo attached is
+        // a reference after it: [picture, ...attached], in the order the prompt names them
+        // (<Picture 1> is the picture changed; the selection is its).
+        if (newest.Photos.Count > 0 && ChangedWithPhotos(newest, pictures) is { } changed)
+            return ImagePlan.Edit(new[] { changed.Name }.Concat(newest.Photos).ToArray(), newest.Text, newest.Mask, "asked");
         if (newest.Photos.Count > 0 || newest.Mask.Count > 0)
             return ImagePlan.Edit(newest.Photos, newest.Text, newest.Mask, "attached");
-
-        IReadOnlyList<Picture> pictures = conversation.Pictures;
 
         // (b) The user said which reading they meant, with a button that sent the message again.
         if (newest.Intent is { } intent)
@@ -349,6 +359,19 @@ public static partial class ImageTurns
             "again" => ImagePlan.Again(pictures.Last(p => p.Name == options.First(o => o.Intent == "again").Source), "model"),
             _ => ImagePlan.New(newest.Text, "model"),
         };
+    }
+
+    /// <summary>
+    /// The picture of the chat a message with photos attached was said to change (imageIntent
+    /// "edit" with imageSource naming it), or null: no reading chosen, another one, a picture
+    /// no longer in the chat, or one of the message's own photos (which (a) edits as it is).
+    /// </summary>
+    private static Picture? ChangedWithPhotos(ImageMessage newest, IReadOnlyList<Picture> pictures)
+    {
+        if (newest.Intent != "edit" || newest.Source is not { } source
+            || newest.Photos.Any(photo => UploadName(photo) == source))
+            return null;
+        return pictures.LastOrDefault(p => p.Name == source);
     }
 
     /// <summary>

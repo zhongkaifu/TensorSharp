@@ -164,6 +164,50 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         Assert.Equal(((1024, 1024), (1024, 1024)), (t2i.Sampling, t2i.Output));
     }
 
+    /// <summary>A speed adapter's contract sets the edit's generation floor (pDMD's 1024 px: the asked size, as its diffusers
+    /// pipeline samples); a style adapter, or a contract without one, keeps the family's 4 MP floor. Text to image is
+    /// unchanged either way.</summary>
+    [Fact]
+    public void ASpeedContractsFloorSetsTheEditCanvas()
+    {
+        var family = new MiniMaxH3ImageFamily(Grid);
+        DiffusionReference[] one = { new(Picture(640, 480)) };
+        AdapterSet With(long floor) => new(new[]
+        {
+            new DiffusionAdapter
+            {
+                Name = "speed", Payload = new object(),
+                Contract = new SamplingContract { Name = "speed", Sigmas = new[] { 1f, 12f / 13f, 0f }, Heads = HeadPolicy.ByStep, MinGenerationArea = floor },
+            },
+        });
+        DiffusionCanvas pdmd = family.ResolveCanvas(new DiffusionRequest { References = one, Width = 1024, Height = 1024, Adapters = With(1024) }, null);
+        Assert.Equal(((1024, 1024), (1024, 1024)), (pdmd.Sampling, pdmd.Output));
+        DiffusionCanvas copy = family.ResolveCanvas(new DiffusionRequest { References = one, Adapters = With(1024) }, null);
+        Assert.Equal(((1376, 1024), (1376, 1024)), (copy.Sampling, copy.Output));
+        DiffusionCanvas family0 = family.ResolveCanvas(new DiffusionRequest { References = one, Width = 1024, Height = 1024, Adapters = With(0) }, null);
+        Assert.Equal(((2048, 2048), (1024, 1024)), (family0.Sampling, family0.Output));
+        var style = new AdapterSet(new[] { new DiffusionAdapter { Name = "style", Payload = new object() } });
+        DiffusionCanvas styled = family.ResolveCanvas(new DiffusionRequest { References = one, Width = 1024, Height = 1024, Adapters = style }, null);
+        Assert.Equal(((2048, 2048), (1024, 1024)), (styled.Sampling, styled.Output));
+        DiffusionCanvas t2i = family.ResolveCanvas(new DiffusionRequest { Width = 1024, Height = 1024, Adapters = With(1024) }, null);
+        Assert.Equal(((1024, 1024), (1024, 1024)), (t2i.Sampling, t2i.Output));
+        // A masked edit's selection samples at the contract's floor too (S6's masks with S7's pDMD): a 1024 x 1024 picture
+        // whole, and a 384 x 384 crop of a 2048 x 2048 one at its density, no longer raised to 4 MP.
+        RgbImage square = Picture(1024, 1024), big = Picture(2048, 2048);
+        var whole = new EditMaskOptions { Mask = RectangleMask(1024, 1024, 10, 10, 200, 200) };
+        DiffusionCanvas masked = family.ResolveCanvas(new DiffusionRequest
+        {
+            References = new[] { new DiffusionReference(square) }, Mask = whole, Adapters = With(1024),
+        }, EditMask.Create(whole, square));
+        Assert.Equal(new DiffusionCanvas((1024, 1024), (1024, 1024)), masked);
+        var cropped = new EditMaskOptions { Mask = RectangleMask(2048, 2048, 512, 512, 744, 768), MaskCrop = true, MaskCropPadding = 64 };
+        DiffusionCanvas crop = family.ResolveCanvas(new DiffusionRequest
+        {
+            References = new[] { new DiffusionReference(big) }, Mask = cropped, Adapters = With(1024),
+        }, EditMask.Create(cropped, big));
+        Assert.Equal(new DiffusionCanvas((384, 384), (2048, 2048)), crop);
+    }
+
     // ---- layout
 
     /// <summary>The packed layout of text, references and target against diffusers' build_image_packed_sequence: every
@@ -314,25 +358,230 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
     }
 
     /// <summary>The row budget: an edit whose denoising step (its weights beside the step's working memory for the
-    /// references' rows) is over the device's budget is refused with its rows named; the same text to image is not.</summary>
+    /// references' rows) does not fit the device's free memory is refused before it runs, with its rows named, by the same
+    /// test (and the same exception) that refuses any request the device cannot hold; the same text to image is not.</summary>
     [Fact]
     public void EditsOverTheRowBudgetAreRefusedAndTextToImageIsNot()
     {
         var family = new StubbedFamily(new MiniMaxH3ImageFamily(Grid)) { DenoiserWeights = 8L << 30, BytesPerRow = 512 * 1024 };
         using var pipeline = new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlCuda },
-            new ResidencyPlanner(() => 12L << 30, _ => { }), _ => { });
+            new ResidencyPlanner(() => 10L << 30, _ => { }, freeBytes: () => 11L << 30), _ => { });
         DiffusionReference[] refs = Enumerable.Range(0, 4).Select(i => new DiffusionReference(Picture(64, 64, i))).ToArray();
-        string message = Assert.Throws<ArgumentException>(() => pipeline.Run(new DiffusionRequest
+        string message = Assert.Throws<RequestRefusedException>(() => pipeline.Run(new DiffusionRequest
         {
             Prompt = "x", References = refs, Width = 2048, Height = 2048,
         })).Message;
         output.WriteLine(message);
         Assert.Contains("too large for the device", message);
         Assert.Contains("4,096 rows", message);      // 4 references at 1024x1024: 1,024 rows each
+        Assert.Contains("a denoising step would need about", message);
         Assert.Contains("fewer or smaller reference images", message);
         Assert.Equal(0, family.Steps);
         pipeline.Run(new DiffusionRequest { Prompt = "x", Width = 2048, Height = 2048 });
         Assert.Equal(6, family.Steps);
+    }
+
+    /// <summary>The row budget and the device check are one test: an edit over the plan's budget (its headroom) but within
+    /// the free memory runs, as a text to image does (bf16 at 4096x4096 ran on the A40 with its plan over the budget).</summary>
+    [Fact]
+    public void AnEditOverTheBudgetButWithinTheFreeMemoryRuns()
+    {
+        var family = new StubbedFamily(new MiniMaxH3ImageFamily(Grid)) { DenoiserWeights = 8L << 30, BytesPerRow = 512 * 1024 };
+        using var pipeline = new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlCuda },
+            new ResidencyPlanner(() => 12L << 30, _ => { }, freeBytes: () => 16L << 30), _ => { });
+        DiffusionReference[] refs = Enumerable.Range(0, 4).Select(i => new DiffusionReference(Picture(64, 64, i))).ToArray();
+        pipeline.Run(new DiffusionRequest { Prompt = "x", References = refs, Width = 2048, Height = 2048 });
+        Assert.Equal(6, family.Steps);
+    }
+
+    // ---- masked edits (docs/design/diffusion-runtime.md section 4.5)
+
+    /// <summary>A decoded PNG's exact bytes: an RGBA picture of random samples, some fully transparent with RGB under them.</summary>
+    private static (RgbImage Image, byte[] Png) RandomRgba(int width, int height, int seed)
+    {
+        var rng = new Random(seed);
+        var px = new float[(long)width * height * 3];
+        var alpha = new float[(long)width * height];
+        for (long i = 0; i < px.LongLength; i++) px[i] = rng.Next(256) / 255f;
+        for (long i = 0; i < alpha.LongLength; i++) alpha[i] = (i % 7 == 0 ? 0 : rng.Next(256)) / 255f;
+        byte[] png = ImageIO.EncodePng(new RgbImage(width, height, px, alpha));
+        return (ImageIO.Decode(png, preserveAlpha: true), png);
+    }
+
+    /// <summary>A decoded picture's bytes, RGBA (alpha 255 when it has none).</summary>
+    private static byte[] Rgba8(RgbImage image)
+    {
+        byte[] rgb = ImageIO.ToRgb8(image);
+        var rgba = new byte[(long)image.Width * image.Height * 4];
+        for (long i = 0; i < (long)image.Width * image.Height; i++)
+        {
+            rgba[i * 4] = rgb[i * 3]; rgba[i * 4 + 1] = rgb[i * 3 + 1]; rgba[i * 4 + 2] = rgb[i * 3 + 2];
+            rgba[i * 4 + 3] = image.Alpha == null ? (byte)255 : (byte)MathF.Round(image.Alpha[i] * 255f);
+        }
+        return rgba;
+    }
+
+    /// <summary>A grayscale mask: a white rectangle, a gray ramp of <paramref name="ramp"/> pixels after it, black elsewhere.</summary>
+    private static RgbImage RectangleMask(int width, int height, int x0, int y0, int x1, int y1, int ramp = 24)
+    {
+        var px = new float[(long)width * height * 3];
+        for (int y = y0; y < y1; y++)
+            for (int x = x0; x < Math.Min(width, x1 + ramp); x++)
+            {
+                float v = x < x1 ? 1f : (byte)(255 - (x - x1) * 10) / 255f;
+                for (int c = 0; c < 3; c++) px[((long)y * width + x) * 3 + c] = v;
+            }
+        return new RgbImage(width, height, px);
+    }
+
+    /// <summary>
+    /// The composite's gate: through the real pipeline (MiniMax-H3-Image's family, canvas, latent mask, reinjection and
+    /// composite; stub components), every pixel the mask gives weight 0 comes back as the source PNG's exact bytes, its
+    /// alpha (and the RGB under a transparent pixel) included, at the source's size, whatever the mask's mode, inversion,
+    /// feather and crop; the selection is the decode's. Weight 0 is read off the mask file here independently: black for a
+    /// grayscale mask, white once inverted, opaque for an alpha mask (feathering only lowers weights inward).
+    /// </summary>
+    [Theory]
+    [InlineData("grayscale", false, 0, false)]
+    [InlineData("grayscale", true, 0, false)]
+    [InlineData("grayscale", false, 12, false)]
+    [InlineData("grayscale", false, 0, true)]
+    [InlineData("alpha", false, 4, true)]
+    public void AMaskedEditKeepsEveryUnselectedPixelsBytes(string mode, bool invert, int feather, bool crop)
+    {
+        const int W = 1000, H = 750;
+        var (source, png) = RandomRgba(W, H, 17);
+        RgbImage mask = RectangleMask(W, H, 300, 200, 640, 520);
+        if (mode == "alpha")
+        {
+            var alpha = new float[W * H];
+            for (int i = 0; i < alpha.Length; i++) alpha[i] = 1f - mask.Pixels[i * 3];
+            mask = new RgbImage(W, H, new float[W * H * 3], alpha);
+        }
+        var family = new StubbedFamily(new MiniMaxH3ImageFamily(Grid));
+        using var pipeline = new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlCpu },
+            new ResidencyPlanner(() => null, _ => { }), _ => { });
+        DiffusionResult result = pipeline.Run(new DiffusionRequest
+        {
+            Prompt = "rewrite the sign",
+            References = new[] { new DiffusionReference(source), new DiffusionReference(Picture(512, 512, 3)) },
+            Mask = new EditMaskOptions
+            {
+                Mask = mask, MaskMode = mode == "alpha" ? EditMaskMode.Alpha : EditMaskMode.Grayscale,
+                MaskInvert = invert, MaskFeather = feather, MaskCrop = crop, MaskCropPadding = 48,
+            },
+            KeepSourceSize = true,
+            Seed = 5,
+        });
+        Assert.Equal(6, family.Steps);
+        Assert.Equal((W, H), (result.Image.Width, result.Image.Height));
+
+        byte[] want = Rgba8(ImageIO.Decode(png, preserveAlpha: true));
+        byte[] got = Rgba8(ImageIO.Decode(ImageIO.EncodePng(result.Image), preserveAlpha: true));
+        int kept = 0, differ = 0, selectedChanged = 0;
+        for (int i = 0; i < W * H; i++)
+        {
+            bool selected = mode == "alpha" ? mask.Alpha[i] < 1f : mask.Pixels[i * 3] > 0f;
+            if (invert) selected = mode == "alpha" ? mask.Alpha[i] > 0f : mask.Pixels[i * 3] < 1f;
+            bool same = got.AsSpan(i * 4, 4).SequenceEqual(want.AsSpan(i * 4, 4));
+            if (!selected) { kept++; if (!same) differ++; }
+            else if (!same) selectedChanged++;
+        }
+        output.WriteLine($"{mode} invert={invert} feather={feather} crop={crop}: {kept} kept pixels, {differ} differ; " +
+                         $"{selectedChanged} selected pixels changed; sampled {result.Recipe.Canvas.Sampling}");
+        Assert.True(kept > 0);
+        Assert.Equal(0, differ);
+        Assert.True(selectedChanged > 0);
+    }
+
+    /// <summary>
+    /// The latent side of a masked edit: the kept cells (a 16x16 cell of weight 0 everywhere; max-pooled, so a cell with any
+    /// selected pixel is edited) end exactly on the source's posterior mean, normalized as the references' rows are (F16, then
+    /// the VAE's latents_mean/std); the selected cells are the sampler's (here the initial noise, the stub predicting zero
+    /// velocity). The source is encoded once more at the sampling canvas when its reference copy is another size.
+    /// </summary>
+    [Fact]
+    public void TheKeptLatentCellsEndOnTheSourcesNormalizedMean()
+    {
+        const int W = 1024, H = 1024;
+        RgbImage source = Picture(W, H, 9);
+        RgbImage mask = RectangleMask(W, H, 256, 256, 513, 512, ramp: 0);  // x 512 is one pixel into the next cell column
+        var inner = new MiniMaxH3ImageFamily(Grid);
+        var canvas = new LatentShape(24, 1, 128, 128);              // the 4 MP floor: 2048x2048
+        var mean = new float[canvas.Count];
+        for (int i = 0; i < mean.Length; i++) mean[i] = MathF.Sin(i * 0.37f) * 3f;
+        var referencePosterior = new LatentPosterior(new LatentShape(24, 1, 64, 64), new float[24 * 64 * 64], new float[24 * 64 * 64]);
+        var family = new StubbedFamily(inner) { Posteriors = new[] { referencePosterior, new LatentPosterior(canvas, mean, new float[mean.Length]) } };
+        using var pipeline = new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlCpu },
+            new ResidencyPlanner(() => null, _ => { }), _ => { });
+        DiffusionResult result = pipeline.Run(new DiffusionRequest
+        {
+            Prompt = "x", References = new[] { new DiffusionReference(source) }, Mask = new EditMaskOptions { Mask = mask }, Seed = 3,
+        });
+        Assert.Equal(((2048, 2048), (1024, 1024)), (result.Recipe.Canvas.Sampling, result.Recipe.Canvas.Output));
+        Assert.Equal(new[] { (1024, 1024), (2048, 2048) }, family.Encoded);
+
+        float[] expected = inner.References.SourceLatent(new LatentPosterior(canvas, mean, new float[mean.Length])).Data;
+        // The pipeline draws the reference's posterior sample first, then the target noise.
+        var stream = new TorchCpuRandn(3);
+        stream.Next(referencePosterior.Shape.Count);
+        float[] noise = stream.Next(canvas.Count);
+        LatentTensor decoded = family.Decoded;
+        Assert.Equal(canvas, decoded.Shape);
+        int keptCells = 0, editedCells = 0;
+        for (int y = 0; y < 128; y++)
+            for (int x = 0; x < 128; x++)
+            {
+                // The 8x8 source pixels of the 1024x1024 mask a latent cell of the 2048 canvas covers; any selected one edits it.
+                bool edited = x * 8 + 8 > 256 && x * 8 < 513 && y * 8 + 8 > 256 && y * 8 < 512;
+                for (int c = 0; c < 24; c++)
+                {
+                    long at = ((long)c * 128 + y) * 128 + x;
+                    if (edited) Assert.Equal(noise[at], decoded.Data[at]);
+                    else Assert.Equal(expected[at], decoded.Data[at]);
+                }
+                if (edited) editedCells++; else keptCells++;
+            }
+        output.WriteLine($"{keptCells} kept cells on the source, {editedCells} edited cells the sampler's");
+        Assert.True(editedCells > 0 && keptCells > 0);
+    }
+
+    /// <summary>
+    /// A masked edit's canvas (MiniMaxH3ImageFamily.ResolveCanvas): it returns the source's own size whatever it samples;
+    /// the whole picture samples as an unmasked edit's canvas would, the selection's crop at that canvas's density, both
+    /// with the 4 MP floor at their own aspect; a crop asked for explicitly over 20 MP is refused, a mask with no picture
+    /// to edit too.
+    /// </summary>
+    [Fact]
+    public void AMaskedEditSamplesItsSelectionAndReturnsItsSource()
+    {
+        var family = new MiniMaxH3ImageFamily(Grid);
+        DiffusionCanvas Canvas(RgbImage picture, EditMaskOptions o, int w = 0, int h = 0, bool keep = false) =>
+            family.ResolveCanvas(new DiffusionRequest
+            {
+                References = new[] { new DiffusionReference(picture) }, Width = w, Height = h, KeepSourceSize = keep, Mask = o,
+            }, EditMask.Create(o, picture));
+        RgbImage square = Picture(1024, 1024), photo = Picture(1000, 750), big = Picture(2048, 2048);
+        EditMaskOptions Whole(RgbImage p) => new() { Mask = RectangleMask(p.Width, p.Height, 10, 10, 200, 200) };
+        EditMaskOptions Cropped(RgbImage p) => new() { Mask = RectangleMask(p.Width, p.Height, 512, 512, 744, 768), MaskCrop = true, MaskCropPadding = 64 };
+
+        Assert.Equal(new DiffusionCanvas((2048, 2048), (1024, 1024)), Canvas(square, Whole(square)));
+        Assert.Equal(new DiffusionCanvas((2368, 1760), (1000, 750)), Canvas(photo, Whole(photo), keep: true));
+        Assert.Equal(new DiffusionCanvas((2048, 2048), (1024, 1024)), Canvas(square, Whole(square), 2048, 2048));
+        // The crop is 384 x 384 source pixels (the rectangle and its gray ramp, 64 of context each side), 384 x 384 at the
+        // whole picture's 2048 x 2048 density, then the floor at its square aspect.
+        EditMask crop = EditMask.Create(Cropped(big), big);
+        Assert.Equal((384, 384), (crop.Width, crop.Height));
+        Assert.Equal(new DiffusionCanvas((2048, 2048), (2048, 2048)), Canvas(big, Cropped(big)));
+        // A wide crop of a 1000 x 750 photo samples at the floor at its own aspect.
+        EditMask wide = EditMask.Create(new EditMaskOptions { Mask = RectangleMask(1000, 750, 100, 300, 900, 420, ramp: 0), MaskCrop = true, MaskCropPadding = 0 }, photo);
+        DiffusionCanvas wideCanvas = family.ResolveCanvas(new DiffusionRequest { References = new[] { new DiffusionReference(photo) }, KeepSourceSize = true }, wide);
+        Assert.Equal((1000, 750), wideCanvas.Output);
+        Assert.Equal(MiniMaxH3ImageFamily.EditCanvas(800, 128), wideCanvas.Sampling);
+        // An explicit size is the whole picture's: its crop at 28672 x 28672 would sample 5376 x 5376.
+        Assert.Contains("at most 21.0 MP", Assert.Throws<ArgumentException>(() => Canvas(big, Cropped(big), 4096 * 7, 4096 * 7)).Message);
+        Assert.Contains("requires a first reference image", Assert.Throws<ArgumentException>(() => family.ResolveCanvas(
+            new DiffusionRequest(), EditMask.Create(Whole(square), square))).Message);
     }
 
     // ---- presentation
@@ -531,6 +780,8 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
         public (float[] Latent, float[][] References)? FirstStepValue;
         public (float[] Latent, float[][] References) FirstStep => FirstStepValue ?? default;
         public int Steps;
+        public LatentTensor Decoded;
+        public List<(int Width, int Height)> Encoded { get; } = new();
         private int _encodes;
 
         public string Id => inner.Id;
@@ -585,11 +836,17 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
 
         private sealed class Vae(StubbedFamily f) : Component, IVaeCodec
         {
-            public LatentPosterior Encode(RgbImage image, CancellationToken ct) =>
-                f.Posteriors?[f._encodes++] ?? new LatentPosterior(new LatentShape(24, 1, image.Height / 16, image.Width / 16),
+            public LatentPosterior Encode(RgbImage image, CancellationToken ct)
+            {
+                f.Encoded.Add((image.Width, image.Height));
+                return f.Posteriors?[f._encodes++] ?? new LatentPosterior(new LatentShape(24, 1, image.Height / 16, image.Width / 16),
                     new float[24L * (image.Height / 16) * (image.Width / 16)], new float[24L * (image.Height / 16) * (image.Width / 16)]);
-            public RgbImage Decode(LatentTensor latent, CancellationToken ct) =>
-                new(latent.Shape.Width * 16, latent.Shape.Height * 16, new float[(long)latent.Shape.Width * 16 * latent.Shape.Height * 16 * 3]);
+            }
+            public RgbImage Decode(LatentTensor latent, CancellationToken ct)
+            {
+                f.Decoded = latent;
+                return new(latent.Shape.Width * 16, latent.Shape.Height * 16, new float[(long)latent.Shape.Width * 16 * latent.Shape.Height * 16 * 3]);
+            }
             public RgbImage Preview(LatentTensor latent, int maxSide) => Decode(latent, CancellationToken.None);
         }
     }

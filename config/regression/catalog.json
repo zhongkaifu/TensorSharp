@@ -342,6 +342,9 @@
       ],
       "configuration_status": "configured",
       "presets": [
+        "lora-minimax-h3-image-pdmd-2step",
+        "lora-minimax-h3-image-pdmd-2step-comfy",
+        "lora-minimax-h3-image-seedreamstyle",
         "minimax-h3-image",
         "minimax-h3-image-q4km",
         "minimax-h3-image-q5km",
@@ -1986,6 +1989,87 @@
       "layout": "dense",
       "requires_configs": [
         "config/minimax-h3-fl2va.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-minimax-h3-image-pdmd-2step",
+      "config": "config/lora/minimax-h3-image-pdmd-2step.json",
+      "kind": "plugin",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/minimax-h3-image-pdmd-2step.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/minimax-h3-image.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-minimax-h3-image-pdmd-2step-comfy",
+      "config": "config/lora/minimax-h3-image-pdmd-2step-comfy.json",
+      "kind": "plugin",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/minimax-h3-image-pdmd-2step-comfy.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/minimax-h3-image.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-minimax-h3-image-seedreamstyle",
+      "config": "config/lora/minimax-h3-image-seedreamstyle.json",
+      "kind": "plugin",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/minimax-h3-image-seedreamstyle.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/minimax-h3-image.json"
       ],
       "status": "configured"
     },

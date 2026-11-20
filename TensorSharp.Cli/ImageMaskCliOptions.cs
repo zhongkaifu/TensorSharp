@@ -63,10 +63,10 @@ internal sealed class ImageMaskCliOptions
         if (!File.Exists(Path)) throw new ArgumentException($"Mask file not found: {Path}");
     }
 
-    internal void ValidateModel(bool isQwenImage)
+    internal void ValidateModel(bool takesMasks)
     {
-        if (_configured && !isQwenImage)
-            throw new ArgumentException("--mask requires a Qwen-Image-2.1 model.");
+        if (_configured && !takesMasks)
+            throw new ArgumentException("--mask requires an image model that takes edit masks (Qwen-Image-2.1, MiniMax-H3-Image).");
     }
 
     internal void Apply(QwenImageParams parameters)

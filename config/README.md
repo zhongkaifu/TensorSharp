@@ -244,6 +244,7 @@ be reported separately from the ordinary text/image-to-video path.
 | [`qwen-image-2.1-turbo.json`](qwen-image-2.1-turbo.json) | Qwen-Image-2.1-Turbo AD-Q4_K + the same VAE, Qwen3-VL-8B and projector | Text-to-image and editing in 8 steps; declares `"qwen-image-variant": "turbo"`; the companions keep their publishers' file names, so a base-model config pointed at the same folder and names downloads them once for both |
 | [`lora/qwen-image-2.1-*.json`](lora/) | Fourteen Qwen-Image-2.1 LoRA plug-ins (each downloads its weights; Fun-Acc also its `pdd_config.json`) | `--lora` plug-ins for Qwen-Image-2.1; Film Stills, Grainscape, Casual Phone Photo and Voxel Style also work with the official 8-step Turbo checkpoint; see [below](#qwen-image-21-lora-plug-ins-lora) |
 | [`lora/minimax-h3-fl2v-turbo-*.json`](lora/) | Two MiniMax-H3 FL2VA LoRA plug-ins (each downloads its 1.38 GB of weights) | `--lora` step-distillation plug-ins for the FL2VA checkpoint: LightX2V Turbo, 8 or 4 steps on a locked recipe; see [below](#minimax-h3-turbo-plug-ins) |
+| [`lora/minimax-h3-image-*.json`](lora/) | Three MiniMax-H3-Image LoRA plug-ins: two pDMD 2-step speed adapters, one style adapter | `--lora` plug-ins for `minimax-h3-image.json`; see [below](#minimax-h3-image-lora-plug-ins) |
 | [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA + Ref2VA denoisers, shared Qwen3-VL-32B + video/audio VAEs and tokenizer (~46 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, first/last frame and reference mode |
 | [`minimax-h3-image.json`](minimax-h3-image.json), [`-q8`](minimax-h3-image-q8.json), [`-q5km`](minimax-h3-image-q5km.json), [`-q4km`](minimax-h3-image-q4km.json) | MiniMax-H3-Image: the bf16 (40.2 GB), Q8_0 (22.0 GB), Q5_K_M (14.6 GB) or Q4_K_M (12.7 GB) DiT + MiniMax-H3's Qwen3-VL-32B and tokenizer + the image VAE (one copy for all four and for `minimax-h3-fl2va.json`'s encoder) | Text to image up to ~16 MP and editing with up to 16 pictures in 6 steps; bf16 for 46 GB and up, Q8_0 for 46-48 GB GPUs and 48 GB Macs, Q5_K_M for 20-24 GB GPUs, Q4_K_M for 20 GB at 16-20 MP and 32 GB Macs; see [below](#image-generation-minimax-h3-image) |
 | [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~12.9 GB) | Video only, 4-step distilled, text- **and** image-to-video |
@@ -440,8 +441,9 @@ interchangeable with the dedicated LTX text encoder, which embeds its tokenizer.
 
 The files in [`lora/`](lora/) are **not** host configs: they are LoRA plug-ins that
 you add to a run with `--lora`, on either host. The fourteen `qwen-image-2.1-*` files
-are for Qwen-Image-2.1, and the two `minimax-h3-fl2v-turbo-*` files are for the
-MiniMax-H3 FL2VA checkpoint ([below](#minimax-h3-turbo-plug-ins)). A plug-in the
+are for Qwen-Image-2.1, the two `minimax-h3-fl2v-turbo-*` files are for the
+MiniMax-H3 FL2VA checkpoint ([below](#minimax-h3-turbo-plug-ins)), and the three
+`minimax-h3-image-*` files for MiniMax-H3-Image ([below](#minimax-h3-image-lora-plug-ins)). A plug-in the
 startup model does not take is refused at startup, before the plug-in downloads; a model
 a `--config` still has to download is checked for its family right after that download.
 
@@ -542,6 +544,27 @@ Notes:
   `key_format`, `alpha`, `scale`, `sampling`): an unknown key, the Ref2VA partition,
   or another schedule, sampler, audio shift or CFG is refused. See
   [the MiniMax-H3 card](../docs/models/minimax-h3.md#turbo-plug-ins).
+
+### MiniMax-H3-Image LoRA plug-ins
+
+The three `minimax-h3-image-*` files (`"type": "minimax-h3-image-lora"`) download their
+weights on first use, pinned and SHA-256-checked, to
+`$TENSORSHARP_MODELS/minimax-h3-image/loras`:
+
+| File | Plug-in |
+|------|---------|
+| [`minimax-h3-image-pdmd-2step.json`](lora/minimax-h3-image-pdmd-2step.json) | pDMD 2-step (linoyts @c07d96e5, diffusers names, rank 128): 2 steps on `[1, 12/13, 0]`, `by-step` heads, CFG 1, generated at the asked size. Community License |
+| [`minimax-h3-image-pdmd-2step-comfy.json`](lora/minimax-h3-image-pdmd-2step-comfy.json) | pDMD 2-NFE, the ComfyUI-native conversion (akhaliq @ef1e3b9a, fused qkv, rank 384 on qkv): the same sigmas, `grid-interval` heads as ComfyUI samples it. A different training from linoyts'; on the official stack its pictures carry a fine mesh pattern, so it is mainly the ComfyUI-format reference (prefer the file above for pictures) |
+| [`minimax-h3-image-seedreamstyle.json`](lora/minimax-h3-image-seedreamstyle.json) | Seedreamstyle 6K (Nebsh @5e1b48cd, kohya names, rank 16): a photographic style adapter; start the prompt with `seedreamstyle.`. Community License |
+
+The keys: `type`, `name`, `variables`, `weights` (`path`, `urls`, `sha256`), `key_format`
+(`auto`, `diffusers`, `comfy` or `kohya`), `alpha`, `scale` and, for a speed adapter,
+`sampling` (`steps`, `sigmas` (steps + 1, ending in 0), `heads` (`grid-interval` or
+`by-step`), `cfg` (1), `min_generation_area` (pixels, 1024 to 4096²: the asked size at
+1024)). Any number of style adapters stack, each at its own strength, with at most one
+speed adapter, whose sampling is locked as above. A bare `.safetensors` is taken as a
+style adapter. See [the MiniMax-H3-Image card](../docs/models/minimax-h3-image.md#lora-plug-ins).
+
 - **Do not name a plug-in with a relative `"lora"` string in a preset.** A string
   value is passed to `--lora` as written, so a relative path resolves against the
   working directory, not against the preset's folder the way its file entries do:

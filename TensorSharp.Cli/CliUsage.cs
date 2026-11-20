@@ -653,7 +653,9 @@ namespace TensorSharp.Cli
                     "another model.",
                     "--qwen-image-variant turbo"),
                 new OptionHelp("--mask <file>",
-                    "Qwen-Image-2.1 local edit mask, matching the first --image dimensions. Unselected pixels and output size are preserved. Default: none.",
+                    "Local edit mask for Qwen-Image-2.1 or MiniMax-H3-Image, matching the first --image's dimensions (MiniMax-H3-Image's " +
+                    "<Picture 1>; later images stay references). Unselected pixels keep their exact bytes and the output keeps the " +
+                    "first image's size. Default: none.",
                     "--image photo.png --mask selection.png"),
                 new OptionHelp("--mask-mode <mode>",
                     "Mask convention: grayscale (default, white edits and black preserves) or alpha (transparent edits and opaque preserves).",
@@ -685,7 +687,12 @@ namespace TensorSharp.Cli
                     "LightX2V Turbo step-distillation plug-ins config/lora/minimax-h3-fl2v-turbo-8step.json (8 steps) and " +
                     "config/lora/minimax-h3-fl2v-turbo-4step.json (4 steps), which lock --diffusion-steps, --flow-shift, " +
                     "--sampler and --cfg to their recipe (unset or equal is accepted; anything else is refused) and are refused " +
-                    "on the Ref2VA checkpoint. Applied unmerged on top of the quantized transformer, so small distillation " +
+                    "on the Ref2VA checkpoint. MiniMax-H3-Image takes minimax-h3-image-lora configs and bare LoRA .safetensors " +
+                    "(diffusers PEFT, ComfyUI or kohya names), repeatable as style adapters each at its own --lora-scale, plus at " +
+                    "most one speed adapter: the pDMD plug-ins config/lora/minimax-h3-image-pdmd-2step.json (2 steps) and " +
+                    "config/lora/minimax-h3-image-pdmd-2step-comfy.json (2 steps), which lock --diffusion-steps and --cfg the same " +
+                    "way; the style plug-in config/lora/minimax-h3-image-seedreamstyle.json fixes nothing. Applied unmerged on top " +
+                    "of the quantized transformer, so small distillation " +
                     "deltas are kept exactly. A plug-in the model does not take is refused at startup, before the plug-in " +
                     "downloads; when a --config still has to download the model, the model's family is checked right after " +
                     "that download (a contradicting sampling flag is refused before it). Default: none.",

@@ -195,6 +195,26 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return new LatentRef(index, cropped, _toRows(new LatentTensor(cropped, z)));
         }
 
+        /// <summary>A masked edit's source latent: the posterior's mean through the references' own steps (F16, then the
+        /// latent statistics), without a sample, so the blend does not depend on the noise stream.</summary>
+        public LatentTensor SourceLatent(LatentPosterior posterior)
+        {
+            ArgumentNullException.ThrowIfNull(posterior);
+            LatentShape s = posterior.Shape;
+            if (s.Channels != Channels || s.Frames != 1)
+                throw new ArgumentException($"MiniMax-H3-Image posteriors are [{Channels}, 1, H, W], not {s}.");
+            var (mean, std) = _latentStatistics();
+            long plane = (long)s.Height * s.Width;
+            var z = new float[s.Count];
+            for (int c = 0; c < Channels; c++)
+                for (long i = 0; i < plane; i++)
+                {
+                    float v = (float)(System.Half)posterior.Mean[c * plane + i];
+                    z[c * plane + i] = (v - mean[c]) / std[c];
+                }
+            return new LatentTensor(s, z);
+        }
+
         /// <summary>scale_noise at t = 0.999 in float32 (<c>t * z + (1 - t) * eps</c>, the timestep a float32 tensor), with eps
         /// the next of the stream over the reference's own latent.</summary>
         public void Augment(LatentRef reference, INoiseSource noise)
