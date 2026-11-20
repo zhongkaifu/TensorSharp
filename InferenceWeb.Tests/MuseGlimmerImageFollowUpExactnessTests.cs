@@ -13,7 +13,8 @@
 //     the whole previous turn, and its greedy tokens are a cold engine's; a conversation with another image reuses at
 //     most the text before that image's span and answers as a cold engine does. Two lengths: turn 1 inside the
 //     runtime's 768-cell rings (window 64 plus a 512-row step, aligned to 256), and past them, where the rings have
-//     wrapped before the image.
+//     wrapped before the image. Where a backend's prompt chunks round apart from a whole prompt's, a stream may leave the
+//     cold one only at a near-tie of the cold run (NearTie, MuseGlimmerRuntimeServingTests' rule).
 //  B. The model directly, where logits are observable: a turn built by prefilling turn 1 (its image rows queued),
 //     DECODING the reply and prefilling the follow-up, against a cold prefill of the whole turn 2 with the same rows -
 //     the logits of the first token and of each following greedy step. A text-only control (the same tokens, no image
@@ -45,6 +46,18 @@ public sealed class MuseGlimmerImageFollowUpExactnessTests(ITestOutputHelper out
     private const double RoundingFloor = 1e-5;
 
     private const int NewTokens = 12;
+
+    /// <summary>
+    /// The relative top-two margin (a share of the largest logit) at or under which a cold run's greedy step is a near-tie that
+    /// a reused stream may resolve the other way, on every backend but the managed one (whose prompt chunks are a whole
+    /// prompt's bits): MuseGlimmerRuntimeServingTests' rule for streams whose prompts ran in other chunks. ggml_cuda's prompt
+    /// products and attention pick their kernels by the chunk's rows, so a prompt resumed after 288 reused tokens rounds apart
+    /// from a whole one. Measured on an RTX PRO 4500 Blackwell (model-direct, the "within the rings" prompt): 1.6e-3 of the
+    /// largest logit with the image's rows in the resumed chunk, 1.9e-3 with text there instead, 0 on the managed backend;
+    /// ggml_vulkan 2.1e-3 and 1.9e-3. The other image's first greedy step is a 1.0e-3 tie (tokens 243 and 76) on this
+    /// fixture, which ggml_cuda's resumed chunk resolves the other way.
+    /// </summary>
+    private const double NearTie = 1e-2;
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-mg-followup-" + Guid.NewGuid().ToString("N"));
 
@@ -167,6 +180,11 @@ public sealed class MuseGlimmerImageFollowUpExactnessTests(ITestOutputHelper out
     [InlineData(true)]
     public Task TheEngineReusesPastTheImageOnGgmlCuda(bool longTurn) => EngineReuse(BackendType.GgmlCuda, longTurn);
 
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task TheEngineReusesPastTheImageOnGgmlVulkan(bool longTurn) => EngineReuse(BackendType.GgmlVulkan, longTurn);
+
     [MlxTheory]
     [InlineData(false)]
     [InlineData(true)]
@@ -187,20 +205,20 @@ public sealed class MuseGlimmerImageFollowUpExactnessTests(ITestOutputHelper out
             NumBlocks = 64, BlockSize = 256, EnablePrefixCaching = true, DecodeQuantumTokens = 256,
         };
 
-        async Task<(int Reused, List<int> Output, int ImageStart, int ImageEnd, int Prompt)> Generate(InferenceEngine engine,
+        async Task<(int Reused, List<int> Output, int ImageStart, int ImageEnd, List<int> Prompt)> Generate(InferenceEngine engine,
             List<int> tokens, List<ChatMessage> history, string id)
         {
             var (expanded, spans) = Prepare(model, history, tokens, id);
             try
             {
-                var seq = new SequenceState(id, expanded, NewTokens, 256, SamplingConfig.Greedy, mediaSpans: spans, cacheScope: "mg-followup");
+                var seq = new SequenceState(id, new List<int>(expanded), NewTokens, 256, SamplingConfig.Greedy, mediaSpans: spans, cacheScope: "mg-followup");
                 var handle = engine.SubmitRequest(seq);
                 var produced = new List<int>();
                 await foreach (int t in handle.Tokens.ReadAllAsync())
                     produced.Add(t);
                 var completion = await handle.Completion;
                 PromptMediaSpan image = Assert.Single(spans);
-                return (completion.PrefixCacheReusedTokens, produced, image.Start, image.End, expanded.Count);
+                return (completion.PrefixCacheReusedTokens, produced, image.Start, image.End, expanded);
             }
             finally
             {
@@ -210,16 +228,16 @@ public sealed class MuseGlimmerImageFollowUpExactnessTests(ITestOutputHelper out
 
         var a1 = Turn1(model, longTurn, imageA);
         var b1 = Turn1(model, longTurn, imageB);
-        List<int> outA1, outA2, outB1;
+        List<int> outA1, outA2, outB1, promptA2, promptB1;
         int reusedA2, reusedB1, imageStart, imageEnd, promptA1;
         using (var engine = new InferenceEngine(model, config, NullLogger.Instance))
         {
             var r1 = await Generate(engine, a1.Tokens, a1.History, "a1");
-            (outA1, imageStart, imageEnd, promptA1) = (r1.Output, r1.ImageStart, r1.ImageEnd, r1.Prompt);
+            (outA1, imageStart, imageEnd, promptA1) = (r1.Output, r1.ImageStart, r1.ImageEnd, r1.Prompt.Count);
             var r2 = await Generate(engine, Turn2(model, a1.Tokens, outA1), a1.History, "a2");
-            (reusedA2, outA2) = (r2.Reused, r2.Output);
+            (reusedA2, outA2, promptA2) = (r2.Reused, r2.Output, r2.Prompt);
             var r3 = await Generate(engine, b1.Tokens, b1.History, "b1");
-            (reusedB1, outB1) = (r3.Reused, r3.Output);
+            (reusedB1, outB1, promptB1) = (r3.Reused, r3.Output, r3.Prompt);
         }
         output.WriteLine($"[{backend}, {(longTurn ? "past the rings" : "within the rings")}] image span [{imageStart}, {imageEnd}); " +
             $"turn 1: {promptA1} prompt + {outA1.Count} generated; turn 2 reused {reusedA2}; another image reused {reusedB1}");
@@ -238,8 +256,49 @@ public sealed class MuseGlimmerImageFollowUpExactnessTests(ITestOutputHelper out
         Assert.True(reusedA2 >= promptA1 + outA1.Count - 2,
             $"the follow-up reused {reusedA2} of the {promptA1 + outA1.Count - 1} tokens turn 1 left");
         Assert.True(reusedB1 <= imageStart, $"another image reused {reusedB1} tokens, past its span's start {imageStart}");
-        Assert.Equal(coldA2, outA2);
-        Assert.Equal(coldB1, outB1);
+        AssertSameStream(backend, coldA2, outA2, promptA2, imageStart + 1, imageA, "the follow-up");
+        AssertSameStream(backend, coldB1, outB1, promptB1, imageStart + 1, imageB, "another image");
+    }
+
+    /// <summary>The reused stream is the cold engine's, or (on every backend but the managed one) leaves it only where the
+    /// cold run's greedy step is a near-tie (<see cref="NearTie"/>), read on a fresh model from one forward of the whole
+    /// prompt with the image's rows.</summary>
+    private void AssertSameStream(BackendType backend, List<int> cold, List<int> reused, List<int> prompt, int rowsAt, string image, string what)
+    {
+        int at = Enumerable.Range(0, Math.Min(cold.Count, reused.Count)).FirstOrDefault(t => cold[t] != reused[t], -1);
+        if (at < 0 && cold.Count == reused.Count) return;
+        Assert.True(at >= 0 && backend != BackendType.Cpu,
+            $"{what}: the stream {string.Join(",", reused)} differs from a cold engine's {string.Join(",", cold)}");
+        double margin = ColdMargin(backend, prompt, rowsAt, image, cold, at);
+        output.WriteLine($"  {what}: leaves the cold stream at token {at} ({reused[at]} for {cold[at]}), where the cold run's top-two " +
+            $"margin is {margin:E2} of the largest logit (near-tie bound {NearTie:E0})");
+        Assert.True(margin <= NearTie, $"{what}: the stream leaves a cold engine's at token {at} ({reused[at]} for {cold[at]}), " +
+            $"where the cold run's top-two margin is {margin:E2} of the largest logit, past the near-tie bound {NearTie:E0}");
+    }
+
+    /// <summary>The relative top-two margin of the cold run's greedy step <paramref name="at"/>: a fresh model's forward of the
+    /// whole <paramref name="prompt"/> with the image's rows at <paramref name="rowsAt"/>, then a token of
+    /// <paramref name="cold"/> a step.</summary>
+    private double ColdMargin(BackendType backend, List<int> prompt, int rowsAt, string image, List<int> cold, int at)
+    {
+        using StandardDecoderModel model = Load(backend);
+        var tower = ((MuseGlimmerRuntimeModel)model).VisionTower;
+        var px = tower.ImageProcessor.ProcessImage(image);
+        float[] rows = tower.EncodeToHost(px.pixels, px.width, px.height, out int count);
+        var t = new Tensor(tower.Weights.Allocator, DType.Float32, count, model.Config.HiddenSize);
+        t.SetElementsAsFloat(rows);
+        model.ResetKVCache();
+        ((IVisionCapableModel)model).SetVisionEmbeddings(t, rowsAt);
+        float[] logits = model.Forward(prompt.ToArray());
+        for (int i = 0; i < at; i++) logits = model.Forward(new[] { cold[i] });
+        float first = float.NegativeInfinity, second = float.NegativeInfinity, scale = 0;
+        for (int v = 0; v < model.Config.VocabSize; v++)
+        {
+            scale = Math.Max(scale, Math.Abs(logits[v]));
+            if (logits[v] > first) { second = first; first = logits[v]; }
+            else if (logits[v] > second) second = logits[v];
+        }
+        return (first - second) / Math.Max(scale, 1e-30f);
     }
 
     // ================================================================ B. the model, logits
@@ -268,6 +327,10 @@ public sealed class MuseGlimmerImageFollowUpExactnessTests(ITestOutputHelper out
     [GgmlTheory(BackendType.GgmlCuda)]
     [MemberData(nameof(LengthsAndPaths))]
     public void AFollowUpAfterAnImageIsAColdPrefillsOnGgmlCuda(bool longTurn, string path) => Direct(BackendType.GgmlCuda, longTurn, path);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [MemberData(nameof(LengthsAndPaths))]
+    public void AFollowUpAfterAnImageIsAColdPrefillsOnGgmlVulkan(bool longTurn, string path) => Direct(BackendType.GgmlVulkan, longTurn, path);
 
     [MlxTheory]
     [MemberData(nameof(LengthsAndPaths))]
