@@ -182,7 +182,9 @@ Qwen-Image path uses, and the flags and fields are the same:
 - **With pDMD.** Masks and the pDMD plug-in compose: its two steps reset the kept cells
   after each step like the six do, and the composite is the same, so the kept pixels are
   still the source's own bytes; the selection samples at the plug-in's floor (the asked
-  size). MASKED_PDMD_CHECK
+  size). Checked on the M5 Pro (Q8_0, the mug replaced by a
+  glass teapot, a box mask): 2,960,883 kept pixels, none differing; 34.9 s a step against
+  the six-step masked edit's 33.6 s, the edit in 99 s.
 
 The cost is the unmasked edit's, plus the extra VAE encode when `<Picture 1>`'s reference
 copy is not the sampling canvas (a 2048x2048 picture's is; a 1024x1024 one's is not). The
