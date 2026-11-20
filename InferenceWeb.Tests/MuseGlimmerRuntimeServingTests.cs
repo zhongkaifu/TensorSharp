@@ -7,8 +7,8 @@
 //
 // Muse-Glimmer serving on the shared runtime (stage S3 of docs/design/muse-glimmer-unified.md): the unified step's per-request
 // slots, the sliding-window rings, the prefix cache, checkpoints and checkpoint files, continuous batching and the caches'
-// growth, on the runtime family (MuseGlimmerArchitecture.CreateRuntimeModel) and every executor this machine has (managed,
-// the pinned GGML backend, MLX). The fixture is the untied one of the frozen legacy goldens with a window of 8 keys, and the
+// growth, on the runtime family (MuseGlimmerArchitecture.CreateRuntimeModel) and every executor the machine has (managed,
+// the pinned GGML backend, MLX, direct CUDA). The fixture is the untied one of the frozen legacy goldens with a window of 8 keys, and the
 // rings are the tests' small geometry (RingGeometryForTests: 8 rows a step, so 16 cells), so every script laps its rings
 // several times: the legacy bug class (docs §4.6, memory muse-glimmer-kv-grow-loop) lived where a cache grew, a ring wrapped
 // or a snapshot was taken past either.
@@ -53,6 +53,7 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
         "managed" => BackendType.Cpu,
         "ggml" => TestGates.PinnedGgmlBackend,
         "mlx" => BackendType.Mlx,
+        "cuda" => BackendType.Cuda,
         _ => throw new ArgumentOutOfRangeException(nameof(executor)),
     };
 
@@ -117,6 +118,10 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
     [MlxFact]
     public void SlotBatchesOverRingsMatchEachSequenceAloneOnMlx() => CompareSlotBatches(BackendType.Mlx, 1, 1);
 
+    /// <summary>Direct CUDA (the CUDA executor: slots sized to the device's room, recorded decode steps).</summary>
+    [CudaFact]
+    public void SlotBatchesOverRingsMatchEachSequenceAloneOnDirectCuda() => CompareSlotBatches(BackendType.Cuda, 1, 1);
+
     private void CompareSlotBatches(BackendType backend, int tp, int stages)
     {
         using var rings = SmallRings();
@@ -136,6 +141,9 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
 
     [MlxFact]
     public Task ConcurrentRequestsOverRingsMatchSequentialOnesOnMlx() => AssertConcurrentMatchesSequential(BackendType.Mlx);
+
+    [CudaFact]
+    public Task ConcurrentRequestsOverRingsMatchSequentialOnesOnDirectCuda() => AssertConcurrentMatchesSequential(BackendType.Cuda);
 
     private async Task AssertConcurrentMatchesSequential(BackendType backend)
     {
@@ -250,6 +258,9 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
     [MlxFact]
     public void CheckpointsOfWrappedRingsContinueExactlyOnMlx() => AssertCheckpoints(BackendType.Mlx, deviceCopies: false);
 
+    [CudaFact]
+    public void CheckpointsOfWrappedRingsContinueExactlyOnDirectCuda() => AssertCheckpoints(BackendType.Cuda, deviceCopies: false);
+
     private void AssertCheckpoints(BackendType backend, bool deviceCopies)
     {
         using var rings = SmallRings();
@@ -273,6 +284,9 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
 
     [MlxFact]
     public Task FollowUpTurnsReuseTheirConversationAndAnswerLikeAColdRunOnMlx() => AssertMultiTurn(BackendType.Mlx);
+
+    [CudaFact]
+    public Task FollowUpTurnsReuseTheirConversationAndAnswerLikeAColdRunOnDirectCuda() => AssertMultiTurn(BackendType.Cuda);
 
     private async Task AssertMultiTurn(BackendType backend)
     {
@@ -326,9 +340,15 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
     [InlineData("managed", 12)]
     [InlineData("ggml", 5)]
     [InlineData("ggml", 12)]
-    public async Task EditedFollowUpsRewindWithinTheRingsOrReprefill(string executor, int edited)
+    public Task EditedFollowUpsRewindWithinTheRingsOrReprefill(string executor, int edited) => AssertEditedFollowUp(BackendOf(executor), edited);
+
+    [CudaTheory]
+    [InlineData(5)]
+    [InlineData(12)]
+    public Task EditedFollowUpsRewindWithinTheRingsOrReprefillOnDirectCuda(int edited) => AssertEditedFollowUp(BackendType.Cuda, edited);
+
+    private async Task AssertEditedFollowUp(BackendType backend, int edited)
     {
-        BackendType backend = BackendOf(executor);
         using var rings = SmallRings();
         using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
         string path = Fixture();
@@ -432,6 +452,9 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
     [MlxFact]
     public void CachesGrowingMidSequenceGiveThePresizedLogitsOnMlx() => AssertGrowthIsExact(BackendType.Mlx);
 
+    [CudaFact]
+    public void CachesGrowingMidSequenceGiveThePresizedLogitsOnDirectCuda() => AssertGrowthIsExact(BackendType.Cuda);
+
     private void AssertGrowthIsExact(BackendType backend)
     {
         using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
@@ -495,9 +518,13 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
     [Theory]
     [InlineData("managed")]
     [InlineData("ggml")]
-    public void RingsRewindOnlyWhereTheyKeepTheWindow(string executor)
+    public void RingsRewindOnlyWhereTheyKeepTheWindow(string executor) => AssertRewinds(BackendOf(executor));
+
+    [CudaFact]
+    public void RingsRewindOnlyWhereTheyKeepTheWindowOnDirectCuda() => AssertRewinds(BackendType.Cuda);
+
+    private void AssertRewinds(BackendType backend)
     {
-        BackendType backend = BackendOf(executor);
         using var rings = SmallRings();
         using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
         string path = Fixture();
