@@ -19,6 +19,14 @@ strftime_now when the renderer defines it), so a regeneration produces the same 
         --draft ~/work/models/muse-glimmer-30b/dflash-kquant.gguf \
         --out InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp
 
+One set per llama.cpp backend, because the ggml backends round differently (the parity tests compare each lane with the
+set of its own ggml backend): the Metal set above is in LlamaCpp/, the CUDA and Vulkan sets in LlamaCpp/cuda/ and
+LlamaCpp/vulkan/. --build-dir names the llama.cpp build directory (default build) and --backend the label written into
+the provenance (default metal):
+
+    python3 eng/validation/muse-glimmer-llamacpp-goldens.py --llama-cpp ~/llama.cpp --build-dir build-vk --backend vulkan \
+        --model .../Muse-Glimmer-30B-UD-IQ2_XXS.gguf --draft .../dflash-kquant.gguf --out InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/vulkan
+
 Only the standard library is used. Run it under the Mac job lock and memguard like any real-weight run.
 """
 import argparse
@@ -213,9 +221,11 @@ def main():
     ap.add_argument("--out", default=os.path.join(REPO, "InferenceWeb.Tests", "Fixtures", "MuseGlimmer", "LlamaCpp"))
     ap.add_argument("--log-dir", default=os.path.join(REPO, "artifacts", "glimmer-goldens"))
     ap.add_argument("--port", type=int, default=8899)
+    ap.add_argument("--build-dir", default="build", help="llama.cpp build directory under --llama-cpp (default build)")
+    ap.add_argument("--backend", default="metal", help="the llama.cpp build's ggml backend, recorded in the provenance (default metal)")
     a = ap.parse_args()
 
-    binary = os.path.join(a.llama_cpp, "build", "bin", "llama-server")
+    binary = os.path.join(a.llama_cpp, a.build_dir, "bin", "llama-server")
     commit = subprocess.check_output(["git", "-C", a.llama_cpp, "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", a.llama_cpp, "status", "--porcelain", "--untracked-files=no"], text=True).strip()
     version = subprocess.run([binary, "--version"], capture_output=True, text=True).stderr.strip().splitlines()
@@ -224,7 +234,7 @@ def main():
 
     base_args = ["-m", a.model, "-c", "8192", "-ngl", "99", "-fa", "on", "-np", "1", "--no-webui"]
     provenance = {
-        "llama_cpp": {"commit": commit, "dirty": bool(dirty), "version": version,
+        "llama_cpp": {"commit": commit, "dirty": bool(dirty), "version": version, "backend": a.backend,
                       "server_args": portable(base_args[2:])},
         "model": {"file": os.path.basename(a.model), "sha256": known_sha(a.model),
                   "source": "unsloth/Muse-Glimmer-30B-GGUF@faa5b025c584459c13febfa5c59883516710ae39"},
