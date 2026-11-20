@@ -194,6 +194,68 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
         Assert.True(relL2 <= MuseGlimmerRuntimeTests.ParityBound && relMax <= MuseGlimmerRuntimeTests.ParityBound, $"relL2 {relL2:E2}, max {relMax:E2}");
     }
 
+    /// <summary>
+    /// A speculating request's prompt chunk longer than a ring step (24 rows over the tests' 8-row steps: three rounds) reaches
+    /// its DFlash ring whole, as the same prompt in chunks of one step each does: every round's rows (the ring's frontier is the
+    /// prompt's end, its rows the same) and the prompt's last feature row held as the first draft's carry. The registration the
+    /// first round took had left the later rounds' rows out (the 30B's prompts past 512 rows lost their tail).
+    /// </summary>
+    [Theory]
+    [InlineData("managed")]
+    [InlineData("ggml")]
+    public void APromptChunkPastARingStepReachesTheDrafterWhole(string executor)
+    {
+        BackendType backend = BackendOf(executor);
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        var (target, draft) = Files();
+        int[] prompt = LongPrompt[..24];
+        StandardDecoderModel.RingGeometryForTests.Value = (8, 8);
+        try
+        {
+            (int, int)? run(StandardDecoderModel model, string id) => model.DFlashRingRunForTests(id) is { } r ? (r.ValidFrom, r.Filled) : null;
+            using StandardDecoderModel whole = Create(target, backend, draft);
+            using StandardDecoderModel stepped = Create(target, backend, draft);
+            Assert.Equal(8, whole.MaxSequenceStepRows);
+            var logits = new float[1][];
+            whole.EnsureSequenceSlot("whole", prompt.Length + 1);
+            whole.FollowPlainPrompt("whole", prompt.Length);
+            Assert.True(whole.TryForwardUnified(new[] { "whole" }, new[] { prompt }, new[] { 0 }, logits));
+            stepped.EnsureSequenceSlot("stepped", prompt.Length + 1);
+            for (int at = 0; at < prompt.Length; at += 8)
+            {
+                stepped.FollowPlainPrompt("stepped", prompt.Length);
+                Assert.True(stepped.TryForwardUnified(new[] { "stepped" }, new[] { prompt[at..(at + 8)] }, new[] { at }, logits));
+            }
+            Assert.Equal(((int, int)?)(0, prompt.Length), run(stepped, "stepped"));
+            Assert.Equal(((int, int)?)(0, prompt.Length), run(whole, "whole"));
+            int feat = ((ISpeculativeModel)whole).SpecFeatureSize;
+            var carry = new float[2][];
+            for (int i = 0; i < 2; i++)
+            {
+                StandardDecoderModel model = i == 0 ? whole : stepped;
+                string id = i == 0 ? "whole" : "stepped";
+                model.BindDraftState(id);
+                carry[i] = new float[feat];
+                Assert.True(((IDraftHead)model).TryTakeHeldCarry(prompt.Length, carry[i]), $"{id}: no carry held after the prompt");
+            }
+            double worst = MuseGlimmerGoldens.Distance(carry[1], carry[0]).RelL2;
+            for (int layer = 0; layer < whole.DFlashSettings.NumLayers; layer++)
+            {
+                var (wk, wv) = whole.DFlashRingContextForTests("whole", layer, out int wFirst);
+                var (sk, sv) = stepped.DFlashRingContextForTests("stepped", layer, out int sFirst);
+                Assert.Equal(sFirst, wFirst);
+                Assert.Equal(sk.Length, wk.Length);
+                worst = Math.Max(worst, Math.Max(MuseGlimmerGoldens.Distance(sk, wk).RelL2, MuseGlimmerGoldens.Distance(sv, wv).RelL2));
+            }
+            output.WriteLine($"{backend}: the ring holds 0..{prompt.Length}; ring rows and carry within {worst:E2} of the stepped prompt's");
+            Assert.True(worst <= 1e-5, $"{backend}: {worst:E2} apart");
+        }
+        finally
+        {
+            StandardDecoderModel.RingGeometryForTests.Value = null;
+        }
+    }
+
     // ---------------------------------------------------------------- through the engine: one request and several at once
 
     /// <summary>
