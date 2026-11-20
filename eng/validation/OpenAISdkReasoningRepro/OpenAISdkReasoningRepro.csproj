@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Issue #386: does a .NET client on the official OpenAI SDK + Microsoft.Extensions.AI +
+       Microsoft.Agents.AI receive the model's reasoning as TextReasoningContent? References
+       NuGet packages only (nuget.org, see NuGet.config); nothing from this repository. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <!-- OPENAI001: the Responses client is marked experimental. MAAI001: the agent extension
+         that turns stored output off is too. SCME0001: the request object's JSON patch, which
+         the issue-think scenario uses to send a field of the server's own. -->
+    <NoWarn>$(NoWarn);OPENAI001;MAAI001;SCME0001</NoWarn>
+  </PropertyGroup>
+  <PropertyGroup>
+    <!-- Microsoft.Extensions.AI.OpenAI 11.0.0 and Microsoft.Agents.AI.OpenAI 1.28.0 are built
+         against OpenAI 2.14.0. OpenAI 2.15.0 changed ResponsesClient.CreateResponseStreamingAsync's
+         return type (AsyncCollectionResult to Task<AsyncStreamingResult>), so with 2.15.0 every
+         streamed Responses call through Microsoft.Extensions.AI throws MissingMethodException;
+         Chat Completions is unaffected. -p:OpenAIVersion=2.15.0 builds against the newest. -->
+    <OpenAIVersion Condition="'$(OpenAIVersion)' == ''">2.14.0</OpenAIVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The newest versions nuget.org serves on 2026-11-19 (OpenAI: see above). -->
+    <PackageReference Include="OpenAI" Version="$(OpenAIVersion)" />
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="11.0.0" />
+    <PackageReference Include="Microsoft.Agents.AI.OpenAI" Version="1.28.0" />
+  </ItemGroup>
+</Project>
