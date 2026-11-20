@@ -183,6 +183,10 @@ namespace TensorSharp.AgentHost.Skills
         /// <exception cref="ArgumentException">
         /// A flag is missing its value, or a value is not usable. Thrown at startup so a
         /// mistyped path fails before a model is loaded rather than on the first request.
+        /// Also thrown for <see cref="DisableFlag"/> beside one of <see cref="EnablingFlags"/>:
+        /// skills off would make that option do nothing, and which one the operator meant
+        /// is not ours to guess. (A <c>--config</c> file's entries already lose to the other
+        /// side on the command line; ConfigFileArgs.FeatureSwitches.)
         /// </exception>
         public static SkillHostOptions Parse(IReadOnlyList<string>? args)
         {
@@ -190,9 +194,21 @@ namespace TensorSharp.AgentHost.Skills
             if (args == null)
                 return options;
 
+            string? enabling = null;
             for (int i = 0; i < args.Count; i++)
             {
                 string arg = args[i] ?? string.Empty;
+                if (enabling == null)
+                {
+                    foreach (string flag in EnablingFlags)
+                    {
+                        if (Matches(arg, flag) || arg.StartsWith(flag + "=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            enabling = flag;
+                            break;
+                        }
+                    }
+                }
 
                 if (Matches(arg, DisableFlag)) { options.Enabled = false; continue; }
                 if (Matches(arg, ListFlag)) { options.ListOnly = true; continue; }
@@ -229,8 +245,25 @@ namespace TensorSharp.AgentHost.Skills
                 }
             }
 
+            if (!options.Enabled && enabling != null)
+            {
+                throw new ArgumentException(
+                    $"{DisableFlag} turns Agent Skills off, so {enabling} would do nothing: pass one of them, not both.");
+            }
+
             return options;
         }
+
+        /// <summary>
+        /// The options that only mean something with skills on, so that naming one beside
+        /// <see cref="DisableFlag"/> in the same source is refused rather than silently ignored.
+        /// <see cref="ListFlag"/> is not one: beside <see cref="DisableFlag"/> it reports that
+        /// skills are off, which is the question it was asked.
+        /// </summary>
+        public static readonly IReadOnlyList<string> EnablingFlags = new[]
+        {
+            RootsFlag, SelectFlag, AllowScriptsFlag, AllowNetworkFlag,
+        };
 
         /// <summary>
         /// Layer environment variables under whatever the command line supplied, then

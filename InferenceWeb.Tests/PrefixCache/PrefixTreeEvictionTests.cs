@@ -433,6 +433,35 @@ public class PrefixTreeEvictionTests
     }
 
     [Fact]
+    public void CountSubCap_EvictsAnotherScopesSupersededStateBeforeAnIdleScopesNewest()
+    {
+        // Four Web UI conversations in step, three of them in tool loops: each round of a loop leaves a state its next
+        // round extends (an earlier end state, a prompt-tail checkpoint), and the scoped count went over its cap while the
+        // fourth conversation sat between turns. The victim was the oldest scoped state of any tier, which was that
+        // conversation's only resumable one: its next turn reused the shared prefix alone (Qwen3.5-0.8B, ggml_metal and
+        // ggml_cuda, 3456 of 3721 prompt tokens). A state its own conversation has extended goes first.
+        PrefixTree t = Tk.Tree(Tk.Caps(pages: PageSupport.None), scopedMax: 3);
+        int idle = Tk.Scope(t), looping = Tk.Scope(t);
+        RadixNode waiting = Tk.Put(t, Tk.Key(t, Tk.Seq(500, 40)), 30, idle, host: 1);   // the oldest scoped state
+        KeyRope loop = Tk.Key(t, Tk.Seq(1, 80));
+        RadixNode round1 = Tk.Put(t, loop, 20, looping, host: 1);
+        RadixNode round2 = Tk.Put(t, loop, 40, looping, host: 1);
+        RadixNode round3 = Tk.Put(t, loop, 60, looping, host: 1);
+        Assert.Equal(EvictionTier.ScopeNewest, t.TierOf(waiting));
+        Assert.Equal(EvictionTier.Ordinary, t.TierOf(round1));
+        Assert.Equal(EvictionTier.ScopeNewest, t.TierOf(round3));
+
+        Assert.True(t.EnforceCountSubCaps());
+
+        Assert.Equal(3, t.ScopedEndStateCount);
+        Assert.NotNull(waiting.EndState);
+        Assert.Null(round1.EndState);                                // the oldest the looping conversation has extended
+        Assert.NotNull(round2.EndState);
+        Assert.NotNull(round3.EndState);
+        Tk.Valid(t);
+    }
+
+    [Fact]
     public void PreemptHold_KeepsANodeInTierScopeNewest()
     {
         // Review addition: a node inserted by OnPreempted while its request waits is tier ScopeNewest (§5.11),

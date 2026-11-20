@@ -357,6 +357,13 @@ public sealed class OllamaAdapter
             await ctx.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
             return;
         }
+        catch (JsonException ex)
+        {
+            // A malformed history tool call (no function name, arguments that are not an object).
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
+            return;
+        }
         var ollamaTools = ToolFunctionParser.ParseOllama(body);
         bool toolsDisabled = body.TryGetProperty("tool_choice", out var toolChoice)
             && toolChoice.ValueKind == JsonValueKind.String && toolChoice.GetString() == "none";

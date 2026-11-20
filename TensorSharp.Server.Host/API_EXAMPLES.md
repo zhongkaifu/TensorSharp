@@ -543,7 +543,7 @@ The response shape (when the model decides to call the tool):
 }
 ```
 
-Continue the conversation by appending the assistant tool call and a `role: "tool"` message containing the function result, then call `/api/chat/ollama` again.
+Continue the conversation by appending the assistant tool call and a `role: "tool"` message containing the function result, then call `/api/chat/ollama` again. Send the assistant message back as it came, with its `tool_calls` (and `thinking`, when there was any): the server renders the call into the prompt, and the request continues the conversation's cached prefix.
 
 Only the parameters listed in `required` are declared as required to the model. A tool that sends no `required` list declares none of its parameters as required (JSON-schema renderers write `"required": []`), so every one of its parameters stays optional.
 

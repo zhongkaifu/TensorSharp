@@ -120,6 +120,29 @@ namespace TensorSharp.Runtime
             "--image", "--ref-image", "--ref-video", "--ref-audio", "--ref-video-audio",
         };
 
+        // A switch that turns a feature off, and the options that only mean something with that feature on. The two
+        // sides are different options, so "the command line wins" alone never reached them: a preset's
+        // "no-skills": true beside --skills-dir on the command line kept skills off without a word. Here the
+        // winning source (the command line, else the later file) decides the feature, and the other side's file
+        // entries are dropped and reported like any overridden entry. Within one source both sides is a mistake
+        // the option reader refuses (SkillHostOptions.Parse). The names are SkillHostOptions' flags, in
+        // TensorSharp.AgentHost, which this assembly does not reference; ConfigFileArgsTests keeps them in step.
+        internal static readonly IReadOnlyDictionary<string, string[]> FeatureSwitches =
+            new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["--no-skills"] = new[] { "--skills-dir", "--skill", "--skills-allow-exec", "--skills-allow-network" },
+            };
+
+        // The other side of a feature switch: for its off switch, the options that need it on; for one of those, the off switch.
+        private static IEnumerable<string> OppositesOf(string flag)
+        {
+            if (FeatureSwitches.TryGetValue(flag, out string[]? enablers))
+                return enablers;
+            return FeatureSwitches
+                .Where(entry => entry.Value.Contains(flag, StringComparer.OrdinalIgnoreCase))
+                .Select(entry => entry.Key);
+        }
+
         private static readonly JsonDocumentOptions ParseOptions = new JsonDocumentOptions
         {
             AllowTrailingCommas = true,
@@ -237,7 +260,7 @@ namespace TensorSharp.Runtime
                         Preview = true,
                     };
                     for (int f = 0; f < files.Count; f++)
-                        preview.AddFileOptions(files[f].FullPath, OptionsSetBy(files[f]));
+                        preview.AddFileOptions(files[f].FullPath, OptionsSetBy(files[f]), FlagsSetBy(files[f]));
                     var previewTokens = new List<string>(args.Length);
                     for (int f = 0; f < files.Count; f++)
                         ExpandFile(files[f], f, previewTokens, preview);
@@ -247,7 +270,7 @@ namespace TensorSharp.Runtime
 
                 var context = new ExpandContext(log ?? TextWriter.Null, interactiveProgress, CommandLineOptions(passThrough));
                 for (int f = 0; f < files.Count; f++)
-                    context.AddFileOptions(files[f].FullPath, OptionsSetBy(files[f]));
+                    context.AddFileOptions(files[f].FullPath, OptionsSetBy(files[f]), FlagsSetBy(files[f]));
 
                 var merged = new List<string>(args.Length);
                 for (int f = 0; f < files.Count; f++)
@@ -359,6 +382,18 @@ namespace TensorSharp.Runtime
             return options;
         }
 
+        /// <summary>Every option a file sets, accumulating ones included (a feature switch's other side may be one).</summary>
+        private static HashSet<string> FlagsSetBy(LoadedConfig file)
+        {
+            var options = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (JsonProperty property in file.Document.RootElement.EnumerateObject())
+            {
+                if (!ReservedKeys.Contains(property.Name) && EmitsTokens(property.Value))
+                    options.Add(NormalizeFlag(file.FullPath, property.Name));
+            }
+            return options;
+        }
+
         // A false/null switch or an empty array contributes no tokens, so it neither sets
         // an option nor is worth a line when it is dropped.
         private static bool EmitsTokens(JsonElement value) => value.ValueKind switch
@@ -390,8 +425,10 @@ namespace TensorSharp.Runtime
             // Option -> the spelling the command line used. Null outside Expand
             // (ResolveFileEntry resolves one entry and overrides nothing).
             private readonly Dictionary<string, string>? _commandLineOptions;
-            // Per file, in --config order: the path and the replacing options it sets.
-            private readonly List<(string Path, HashSet<string> Options)> _files = new();
+            // Per file, in --config order: the path, the replacing options it sets, and every option it sets.
+            private readonly List<(string Path, HashSet<string> Options, HashSet<string> All)> _files = new();
+            // Option -> what beat its entries from the other side of a feature switch (FeatureSwitches).
+            private readonly Dictionary<string, string> _switchedBy = new(StringComparer.OrdinalIgnoreCase);
             // Option -> the entries dropped for it, in the order they were met.
             private readonly Dictionary<string, List<(string Path, bool Download)>> _dropped =
                 new(StringComparer.OrdinalIgnoreCase);
@@ -414,7 +451,7 @@ namespace TensorSharp.Runtime
             /// <summary>The full paths the real pass would download, in the order met (preview only).</summary>
             public List<string> Pending { get; } = new();
 
-            public void AddFileOptions(string path, HashSet<string> options) => _files.Add((path, options));
+            public void AddFileOptions(string path, HashSet<string> options, HashSet<string> all) => _files.Add((path, options, all));
 
             /// <summary>
             /// True when the entry for <paramref name="flag"/> in file <paramref name="fileIndex"/>
@@ -423,9 +460,37 @@ namespace TensorSharp.Runtime
             /// another value wins anyway, and resolving the entry could download a file
             /// nothing will load.
             /// </summary>
-            public bool IsOverridden(string flag, int fileIndex)
+            public bool IsOverridden(string flag, int fileIndex) => IsOverridden(flag, fileIndex, out _);
+
+            /// <summary>
+            /// <see cref="IsOverridden(string, int)"/>, also true when the winning source sets the other side of a
+            /// feature switch (<see cref="FeatureSwitches"/>); <paramref name="switchedBy"/> then says what it set, where.
+            /// </summary>
+            public bool IsOverridden(string flag, int fileIndex, out string? switchedBy)
             {
-                if (_commandLineOptions == null || AccumulatingFlags.Contains(flag))
+                switchedBy = null;
+                if (_commandLineOptions == null)
+                    return false;
+                foreach (string opposite in OppositesOf(flag))
+                {
+                    if (_commandLineOptions.TryGetValue(opposite, out string? typed))
+                    {
+                        switchedBy = typed + " is set on the command line";
+                        return true;
+                    }
+                }
+                for (int f = _files.Count - 1; f > fileIndex; f--)
+                {
+                    foreach (string opposite in OppositesOf(flag))
+                    {
+                        if (_files[f].All.Contains(opposite))
+                        {
+                            switchedBy = $"the later '{Path.GetFileName(_files[f].Path)}' sets {opposite}";
+                            return true;
+                        }
+                    }
+                }
+                if (AccumulatingFlags.Contains(flag))
                     return false;
                 if (_commandLineOptions.ContainsKey(flag))
                     return true;
@@ -438,10 +503,12 @@ namespace TensorSharp.Runtime
             }
 
             /// <summary>Remember a dropped entry for <see cref="ReportOverrides"/>.</summary>
-            public void RecordOverride(string configPath, string flag, JsonElement value)
+            public void RecordOverride(string configPath, string flag, JsonElement value, string? switchedBy = null)
             {
                 if (!EmitsTokens(value))
                     return;
+                if (switchedBy != null)
+                    _switchedBy.TryAdd(flag, switchedBy);
                 if (!_dropped.TryGetValue(flag, out var entries))
                 {
                     entries = new List<(string Path, bool Download)>();
@@ -469,7 +536,12 @@ namespace TensorSharp.Runtime
                             : $"; the download entry in {Quoted(downloads)} is skipped, so nothing is fetched for it";
                     string valueFrom = entries.Count == 1 ? "the value from " + losers + " is" : "the values from " + losers + " are";
 
-                    if (_commandLineOptions != null && _commandLineOptions.TryGetValue(option, out string? typed))
+                    if (_switchedBy.TryGetValue(option, out string? switchedBy))
+                    {
+                        string from = entries.Count == 1 ? losers : "each of " + losers;
+                        Log.WriteLine($"[config] {switchedBy}, so {option.ToLowerInvariant()} from {from} is ignored{skipped}.");
+                    }
+                    else if (_commandLineOptions != null && _commandLineOptions.TryGetValue(option, out string? typed))
                     {
                         Log.WriteLine(
                             $"[config] {typed} is set on the command line, so {valueFrom} ignored and the " +
@@ -588,9 +660,9 @@ namespace TensorSharp.Runtime
             // the entry out -- and above all do not resolve it: a download spec would fetch
             // a file nothing loads (--mmproj none beside a config that names a
             // multi-gigabyte vision shard).
-            if (context.IsOverridden(flag, fileIndex))
+            if (context.IsOverridden(flag, fileIndex, out string? switchedBy))
             {
-                context.RecordOverride(configPath, flag, value);
+                context.RecordOverride(configPath, flag, value, switchedBy);
                 return;
             }
 

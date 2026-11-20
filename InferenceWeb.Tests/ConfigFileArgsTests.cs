@@ -579,6 +579,110 @@ public class ConfigFileArgsTests : IDisposable
         Assert.Contains("nothing is fetched", log, StringComparison.Ordinal);
     }
 
+    // ---- feature switches: an off switch and the options that need the feature on -------------
+    // They are different options, so "the command line wins" alone never reached them: a preset's
+    // "no-skills": true beside --skills-dir on the command line kept skills off without a word
+    // (qwen3.8-27b-metal-dflash2.json did that to every Server.Host started with skills).
+
+    [Theory]
+    [InlineData("--skills-dir")]
+    [InlineData("--skills-allow-exec")]
+    [InlineData("--skill")]
+    public void Expand_CommandLineSkillOption_BeatsAConfigsNoSkills(string option)
+    {
+        string cfg = WriteConfig("""
+        { "model": "m.gguf", "no-skills": true, "temperature": 0 }
+        """, "preset.json");
+        string[] commandLine = option == "--skills-allow-exec" ? new[] { option } : new[] { option, "skills" };
+
+        var sink = new StringWriter();
+        string[] result = ConfigFileArgs.Expand(
+            new[] { "--config", cfg }.Concat(commandLine).ToArray(), sink, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--model", "m.gguf", "--temperature", "0" }.Concat(commandLine).ToArray(), result);
+        Assert.Contains($"[config] {option} is set on the command line, so --no-skills from 'preset.json' is ignored.",
+            sink.ToString(), StringComparison.Ordinal);
+        Assert.True(SkillHostOptions.Parse(result).Enabled);
+    }
+
+    [Fact]
+    public void Expand_CommandLineNoSkills_BeatsAConfigsSkillOptions()
+    {
+        // The agent preset names a skills folder and lets scripts run; --no-skills on the command line is the
+        // benchmark run of the same preset, and must not be refused as a contradiction.
+        string cfg = WriteConfig("""
+        { "model": "m.gguf", "skills-dir": "skills", "skills-allow-exec": true, "skills-max-rounds": 32, "skill": ["docs"] }
+        """, "agent.json");
+
+        var sink = new StringWriter();
+        string[] result = ConfigFileArgs.Expand(new[] { "--config", cfg, "--no-skills" }, sink, interactiveProgress: false);
+
+        // --skills-max-rounds is not one of the enabling options (it also bounds code-execution rounds), so it stays.
+        Assert.Equal(new[] { "--model", "m.gguf", "--skills-max-rounds", "32", "--no-skills" }, result);
+        string log = sink.ToString();
+        Assert.Contains("[config] --no-skills is set on the command line, so --skills-dir from 'agent.json' is ignored.", log, StringComparison.Ordinal);
+        Assert.Contains("[config] --no-skills is set on the command line, so --skills-allow-exec from 'agent.json' is ignored.", log, StringComparison.Ordinal);
+        Assert.Contains("[config] --no-skills is set on the command line, so --skill from 'agent.json' is ignored.", log, StringComparison.Ordinal);
+        Assert.False(SkillHostOptions.Parse(result).Enabled);
+    }
+
+    [Fact]
+    public void Expand_LaterConfigsSkillsDir_BeatsAnEarlierConfigsNoSkills()
+    {
+        string bench = WriteConfig("""{ "model": "m.gguf", "no-skills": true }""", "bench.json");
+        string local = WriteConfig("""{ "skills-dir": "skills" }""", "local.json");
+
+        var sink = new StringWriter();
+        string[] result = ConfigFileArgs.Expand(new[] { "--config", bench, "--config", local }, sink, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--model", "m.gguf", "--skills-dir", "skills" }, result);
+        Assert.Contains("[config] the later 'local.json' sets --skills-dir, so --no-skills from 'bench.json' is ignored.",
+            sink.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Expand_OneConfigWithBothSidesOfTheSkillsSwitch_IsRefusedByTheOptionReader()
+    {
+        string cfg = WriteConfig("""{ "model": "m.gguf", "no-skills": true, "skills-dir": "skills" }""");
+
+        string[] result = ConfigFileArgs.Expand(new[] { "--config", cfg }, TextWriter.Null, interactiveProgress: false);
+
+        var ex = Assert.Throws<ArgumentException>(() => SkillHostOptions.Parse(result));
+        Assert.Equal("--no-skills turns Agent Skills off, so --skills-dir would do nothing: pass one of them, not both.", ex.Message);
+    }
+
+    [Fact]
+    public void FeatureSwitches_NameTheSkillHostOptionsFlags()
+    {
+        // ConfigFileArgs (TensorSharp.Runtime) cannot reference SkillHostOptions (TensorSharp.AgentHost), so it spells
+        // the flags itself; this keeps the two lists one list.
+        Assert.Equal(new[] { SkillHostOptions.DisableFlag }, ConfigFileArgs.FeatureSwitches.Keys.ToArray());
+        Assert.Equal(SkillHostOptions.EnablingFlags, ConfigFileArgs.FeatureSwitches[SkillHostOptions.DisableFlag]);
+    }
+
+    [Theory]
+    [InlineData("qwen3.8-27b-metal-dflash2.json")]
+    [InlineData("qwen3.8-27b-cuda-dflash2.json")]
+    public void ShippedDFlash2Presets_LeaveSkillsOn(string preset)
+    {
+        // The two fastest Qwen3.8-27B presets once carried "no-skills": true from their benchmark runs, so a server
+        // started from them had no skills whatever else it was told.
+        string path = Path.Combine(RepoRoot(), "config", preset);
+        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(path),
+            new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true });
+        Assert.False(doc.RootElement.TryGetProperty("no-skills", out _), $"{preset} turns Agent Skills off");
+    }
+
+    private static string RepoRoot()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
+        {
+            if (Directory.Exists(Path.Combine(dir.FullName, "config")) && File.Exists(Path.Combine(dir.FullName, "TensorSharp.slnx")))
+                return dir.FullName;
+        }
+        throw new InvalidOperationException("repository root not found above " + AppContext.BaseDirectory);
+    }
+
     [Fact]
     public void Expand_OverriddenEntry_IsNeverResolved()
     {

@@ -499,7 +499,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 }
 ```
 
-继续会话时，把 assistant 的 tool call 与一条 `role: "tool"` 的消息（包含函数返回结果）追加到 messages，再次请求 `/api/chat/ollama` 即可。
+继续会话时，把 assistant 的 tool call 与一条 `role: "tool"` 的消息（包含函数返回结果）追加到 messages，再次请求 `/api/chat/ollama` 即可。assistant 消息按收到时的样子原样发回，带上其 `tool_calls`（若有 `thinking` 也一并带上）：服务端会把这次调用渲染进 prompt，请求也会接着复用该会话已缓存的前缀。
 
 只有 `required` 中列出的参数才会以必填形式声明给模型。没有发送 `required` 列表的工具不会把任何参数声明为必填（以 JSON schema 渲染的模板写为 `"required": []`），其所有参数都保持可选。
 
