@@ -28,8 +28,26 @@ as a user message through the GGUF chat template), `--steps`, `--teacher <report
 |---|---|
 | `decode` | Prefill the prompt in one `Forward`, then decode. |
 | `split` | Prefill `--split` tokens, then the rest in a second `Forward` (a grow inside the prefill). |
-| `snapshot` | Prefill, extract 256-token KV blocks covering `--split` tokens, scramble and reset the cache, inject them, forward the rest (what a pooled radix hit does). |
-| `truncate` | Prefill, rewind to `--split`, forward the rest (what a live-cache rewind does). |
+| `snapshot` | Legacy: prefill, extract 256-token KV blocks covering `--split` tokens, scramble and reset the cache, inject them, forward the rest (what a pooled radix hit does). Runtime (no block snapshots where layers ring): checkpoint the cache at `--split`, write the checkpoint file, release the cache and the checkpoint, forward other rows over it, read the file back and clone it into a new request's slot, continue there (what a restarted server's persisted prefix does). |
+| `truncate` | Prefill, rewind to `--split`, forward the rest (what a live-cache rewind does). A rewind the runtime's rings refuse (they overwrote rows the next row reads) is recorded, and the history re-prefilled, as the server's turn does. |
+| `checkpoint` | Runtime: checkpoint the cache at `--split`, move the source on with other rows, clone the checkpoint into a new request's slot and continue there (a shared-prefix or prompt-end checkpoint). |
+| `slot-growth` | Runtime: one request's slot reserved for its prompt and first token, stepped through the unified batch entry as the engine serves it; the steps grow it as the decode outgrows it. |
+
+With `--split` at or past the prompt's end (teacher-forced runs), `truncate`, `checkpoint`
+and `snapshot` act in the decode, when the cache holds `--split` positions: a decode-time
+`truncate` forwards the next `--rewind` (16) teacher tokens, rewinds to `--split` and lets the
+decode forward them again; `checkpoint` and `snapshot` restore mid-generation. The report's
+`Events` list each action, refusal and capacity change, and every step records its cache's
+`Capacity` (the runtime's active cache or the stepped slot, read through its internal
+accessors; legacy's full-attention capacity) and `RingCells`/`SwaRows` the sliding-window
+cells (the runtime's rings, legacy's ring rows).
+
+`--logits-ref <f16>` (and `--logits-ref2`) take another run's `--logits-out` for the same
+prompt and teacher and record each step's cosine against it (`Steps[].Cos`, `Cos2`), so a
+long run needs no logits file of its own; `compare.py` reads them (`--cos-field Cos2`) when
+no `--logits` pair is given, and `--margins` prints the top-two gaps at every argmax
+difference (the near-tie evidence). `--nll-text` takes any scenario, its `--split` inside
+or past the prefix.
 
 `--nll-text <file>` scores a fixed raw text instead (no chat template, the tokenizer's
 special prefix only): the first `--nll-prefix` tokens (default 64) are prefilled in one
