@@ -715,6 +715,7 @@ namespace TensorSharp.Runtime.Speculative
                 NextToken = nextToken,
                 NextLogits = nextLogits,
                 UsedSpeculation = true,
+                VerifiedWindow = batch,
             };
         }
 

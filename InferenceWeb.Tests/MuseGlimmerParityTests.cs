@@ -566,6 +566,11 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     /// the plain reference past a divergence is plain greedy resumed from the same prefix the same way (the drafted model's
     /// own plain forwards), not the first run's tail. Every divergence is printed with its margin. (llama.cpp's own DFlash:
     /// <see cref="GoldensAreWellFormed"/>.)
+    /// <para>A divergence over the line still passes when the target's own logits at that position, over the verify window the
+    /// decoder actually verified, prefer DFlash's token. The window is the decoder's own (<see cref="VerifyWindowLog"/>):
+    /// the same tokens in the same number of rows, resumed at the window's first token. That proves the acceptance exact
+    /// against the target's verify products, where the backend's verify rows round apart from its one-row decode (ggml_cuda's
+    /// do). A lane whose verify rows are its one-row decode's bits never reaches that branch.</para>
     /// </summary>
     [MuseGlimmerModelFact(NeedsDraft = true)]
     public void DFlashDraftingIsLossless()
@@ -581,6 +586,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
         Assert.NotNull(spec);
         Assert.True(spec.HasDraftHead, "the DFlash drafter did not arm (HasDraftHead is false)");
         var decoder = new SpeculativeDecoder(spec, spec.DraftBlockSize);
+        var windows = new VerifyWindowLog(decoder);
         // GenerateGreedy starts the statistics over on every call: sum them per call.
         long totalDrafted = 0, accepted = 0, verifies = 0, plains = 0;
         int identical = 0, divergences = 0;
@@ -603,6 +609,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
                     resumed.Tokens.CopyTo(want, start);
                     resumed.Top.CopyTo(tops, start);
                 }
+                windows.Clear();
                 int[] got = decoder.GenerateGreedy(prompt, n - start).Take(n - start).ToArray();
                 totalDrafted += decoder.TokensDrafted; accepted += decoder.TokensAccepted;
                 verifies += decoder.VerifySteps; plains += decoder.PlainSteps;
@@ -616,11 +623,27 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
                 string where = rank >= 0 ? $" (plain's #{rank + 1}, {top[0].Logprob - top[rank].Logprob:F4} nat below its #1)" : " (not in plain's top 4)";
                 string what = $"{golden.Name} @{k}{(start > 0 ? " (resumed at " + start + ")" : "")}: plain {want[k]} '{MuseGlimmerParity.Decode(drafted, want[k])}', dflash {theirs} " +
                     $"'{(theirs >= 0 ? MuseGlimmerParity.Decode(drafted, theirs) : "(none)")}'{where}; plain's top-2 margin {margin:F4} nat";
-                notes.Add(what);
                 divergences++;
                 worstMargin = Math.Max(worstMargin, margin);
                 if (margin >= DFlashNearTieNats)
-                    failures.Add(what);
+                {
+                    // Over the line: the target's own logits over the window that verified the token.
+                    VerifyWindowLog.Window? window = theirs >= 0 ? windows.Drawing(prompt.Length + j) : null;
+                    if (window is { } w)
+                    {
+                        int anchor = w.Start - prompt.Length;
+                        Assert.Equal(got[anchor], w.Tokens[0]);
+                        double[] lp = VerifyWindowLog.Recompute(drafted, prompt.Concat(got.Take(anchor)).ToArray(), w, prompt.Length + j);
+                        int best = Array.IndexOf(lp, lp.Max());
+                        what += $"; over its verify window ({w.Tokens.Length} rows from @{start + anchor}, row {prompt.Length + j - w.Start - 1}) " +
+                            $"the target takes {best}: dflash's {lp[theirs]:F4}, plain's {lp[want[k]]:F4}";
+                        if (best != theirs)
+                            failures.Add(what);
+                    }
+                    else
+                        failures.Add(what + " (no verify window drew it)");
+                }
+                notes.Add(what);
                 start = k + 1;
             }
             if (notes.Count == 0)
