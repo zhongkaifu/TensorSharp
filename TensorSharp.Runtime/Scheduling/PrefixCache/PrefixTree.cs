@@ -1654,7 +1654,8 @@ internal sealed class PrefixTree
 
     private static readonly bool s_capDebug = Environment.GetEnvironmentVariable("TS_PREFIX_RELEASE_DEBUG") == "1";
 
-    /// <summary>Count sub-caps (DEC-20): scoped end states, public end states, native slots. Oldest first, ceiling ScopeNewest.</summary>
+    /// <summary>Count sub-caps (DEC-20): scoped end states, public end states, native slots. Tier by tier, oldest first
+    /// within a tier, ceiling ScopeNewest (<see cref="EnforceCount"/>).</summary>
     internal bool EnforceCountSubCaps(RadixNode? requestedPublicState = null)
     {
         bool ok = true;
@@ -1704,12 +1705,20 @@ internal sealed class PrefixTree
         return victim;
     }
 
+    /// <summary>
+    /// Evicts end states of <paramref name="category"/> while <paramref name="exceeded"/>: tier by tier up to ScopeNewest, as
+    /// <see cref="Evict"/> goes, and within a tier the oldest across both lists. A conversation's newest state is what its next
+    /// turn continues; a state it has since extended (an earlier round of a tool loop, a prompt-tail checkpoint below its end
+    /// state) only serves a regenerate. The oldest across every tier evicted an idle conversation's only resumable state while
+    /// the other conversations' superseded rounds stayed: four Qwen3.5 Web UI sessions in step, three of them in tool loops,
+    /// and the fourth's next turn reused 3456 of its 3721 prompt tokens instead of 3691.
+    /// </summary>
     private bool EnforceCount(Func<bool> exceeded, Func<RadixNode, bool> category)
     {
         while (exceeded())
         {
             RadixNode? victim = null;
-            for (int t = 0; t <= (int)EvictionTier.ScopeNewest; t++)
+            for (int t = 0; t <= (int)EvictionTier.ScopeNewest && victim is null; t++)
             {
                 for (int k = 1; k <= 2; k++)
                 {

@@ -236,6 +236,17 @@ namespace TensorSharp.Server.RequestParsers
                     }
                 }
 
+                // An Ollama client sends its history back as it got it: an assistant turn's
+                // tool_calls (arguments as an object) and thinking, a tool result's tool_call_id.
+                // Dropped, a tool round rendered as an assistant message without its call: the model
+                // never saw what it had called, and the turn matched no recorded transcript, so every
+                // request after a tool call lost its conversation's cache and re-prefilled everything
+                // after the shared prefix.
+                ReadOpenAIHistory(msgEl, msg);
+                if (msg.Role == "assistant" && msgEl.TryGetProperty("thinking", out var thinking)
+                    && thinking.ValueKind == JsonValueKind.String)
+                    msg.Thinking = thinking.GetString();
+
                 messages.Add(msg);
             }
             return messages;
