@@ -1196,8 +1196,17 @@ public class ManagedQuantizedOpsTests
     /// <summary>
     /// The batched row helper must not repeatedly sweep the activation matrix
     /// for each quantization block. Compare with dequantizing the full row once.
+    /// <para>
+    /// A benchmark, not a correctness test: it compares two wall-clock times, which
+    /// a shared CI runner does not hold steady (6.71 ms against 4.46 ms failed PR
+    /// #387's ubuntu-latest job, where the code under test had not changed). So it
+    /// runs with the other <c>Category=Bench</c> tests, outside the CI filter. The
+    /// batched row's answers are checked against the scalar reference by
+    /// <see cref="BatchedQ2KRowMatchesScalarReferenceWithOffsetsAndStrides"/>.
+    /// </para>
     /// </summary>
     [Fact]
+    [Trait("Category", "Bench")]
     public void Q2KMatmul_BatchedRowIsNotSlowerThanDequantizing()
     {
         // DotRowBatchToFloat32 dots ONE weight row against `batch` activation
