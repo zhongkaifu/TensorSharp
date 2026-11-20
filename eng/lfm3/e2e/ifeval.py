@@ -134,12 +134,16 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--max-tokens", type=int, default=1024)
+    ap.add_argument("--sampling", default="greedy",
+                    help="greedy (the default), server (send no sampling fields: the server's defaults), "
+                         "or a JSON object of request fields")
     args = ap.parse_args()
     cl = Client(args.url)
+    sampling = GREEDY if args.sampling == "greedy" else None if args.sampling == "server" else json.loads(args.sampling)
     n = k = 0
     with open(args.out, "w", encoding="utf-8") as f:
         for cid, prompt, checks in CASES:
-            res = cl.chat([{"role": "user", "content": prompt}], thinking=args.think, sampling=GREEDY,
+            res = cl.chat([{"role": "user", "content": prompt}], thinking=args.think, sampling=sampling,
                           max_tokens=args.max_tokens if not args.think else max(4096, args.max_tokens))
             text = res["content"]
             results = []

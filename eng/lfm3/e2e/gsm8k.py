@@ -59,9 +59,13 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--max-tokens", type=int, default=1024)
+    ap.add_argument("--sampling", default="greedy",
+                    help="greedy (the default), server (send no sampling fields: the server's defaults), "
+                         "or a JSON object of request fields")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     cl = Client(args.url)
+    sampling = GREEDY if args.sampling == "greedy" else None if args.sampling == "server" else json.loads(args.sampling)
     rows = [json.loads(l) for l in open(args.data, encoding="utf-8") if l.strip()][args.offset:args.offset + args.n]
     done = {}
     if os.path.exists(args.out):
@@ -75,7 +79,7 @@ def main():
                 continue
             expected = normalize(row["answer"].split("####")[-1])
             res = cl.chat([{"role": "user", "content": PROMPT.format(question=row["question"])}],
-                          thinking=args.think, sampling=GREEDY, max_tokens=args.max_tokens)
+                          thinking=args.think, sampling=sampling, max_tokens=args.max_tokens)
             reply = res["content"]
             # Thinking off, the whole generated text is scored, so two engines that generate the
             # same tokens score alike whether or not their parser moved stray reasoning (text
