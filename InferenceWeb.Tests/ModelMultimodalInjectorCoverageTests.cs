@@ -127,5 +127,10 @@ public class ModelMultimodalInjectorCoverageTests
             "MuseGlimmerModel does not declare IVisionCapableModel, so its images are silently dropped.");
         Assert.True(PromptExpander.IsAssignableFrom(typeof(MuseGlimmerModel)),
             "MuseGlimmerModel does not declare its prompt expansion, so its image tokens never expand.");
+        // The unified-runtime family (stage S4 of docs/design/muse-glimmer-unified.md) carries the same contract.
+        Assert.True(typeof(IVisionCapableModel).IsAssignableFrom(typeof(MuseGlimmerRuntimeModel)),
+            "MuseGlimmerRuntimeModel does not declare IVisionCapableModel, so its images are silently dropped.");
+        Assert.True(PromptExpander.IsAssignableFrom(typeof(MuseGlimmerRuntimeModel)),
+            "MuseGlimmerRuntimeModel does not declare its prompt expansion, so its image tokens never expand.");
     }
 }

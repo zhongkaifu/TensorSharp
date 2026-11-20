@@ -196,6 +196,7 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            DisposeVisionTower();
             foreach (Tensor t in _inputNormOnes.Values) t.Dispose();
             _inputNormOnes.Clear();
             base.Dispose();

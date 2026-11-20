@@ -63,7 +63,14 @@ public sealed class MuseGlimmerSyntheticModelBuilder
     /// <summary>The range of attn_output.weight's and ffn_down.weight's values: the block outputs the post norms take.</summary>
     public float BlockOutputScale { get; init; } = 0.08f;
 
-    public int VocabSize => ByteTokens;
+    /// <summary>Three control tokens after the byte tokens, as the 30B's vocabulary has them: <c>&lt;|patch|&gt;</c> (the
+    /// template's image placeholder), <c>&lt;|image_start|&gt;</c> and <c>&lt;|image_end|&gt;</c> (the span the injector
+    /// expands it to).</summary>
+    public bool ImageTokens { get; init; }
+
+    internal static readonly string[] ImageTokenNames = { "<|patch|>", "<|image_start|>", "<|image_end|>" };
+
+    public int VocabSize => ByteTokens + (ImageTokens ? ImageTokenNames.Length : 0);
 
     public string Write(string path)
     {
@@ -152,6 +159,14 @@ public sealed class MuseGlimmerSyntheticModelBuilder
         foreach (int cp in ByteToUnicode()) tokens.Add(char.ConvertFromUtf32(cp));
         var types = new List<int>();
         for (int i = 0; i < ByteTokens; i++) types.Add(1);
+        if (ImageTokens)
+        {
+            foreach (string name in ImageTokenNames)
+            {
+                tokens.Add(name);
+                types.Add(3);
+            }
+        }
 
         kv.Add(("tokenizer.ggml.model", Str("gpt2")));
         kv.Add(("tokenizer.ggml.pre", Str("llama4")));
