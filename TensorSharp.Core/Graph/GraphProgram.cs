@@ -285,7 +285,7 @@ namespace TensorSharp.Graph
     public sealed class GraphProgram
     {
         internal GraphProgram(GraphNode[] entries, int nodeCount, long[] outputFloats, bool replayable, bool reorder,
-            int[]? tensorParallelRanks, (ulong, ulong) signature)
+            int[]? tensorParallelRanks, (ulong, ulong) signature, bool floatProducts = false)
         {
             Entries = entries;
             NodeCount = nodeCount;
@@ -294,6 +294,7 @@ namespace TensorSharp.Graph
             Reorder = reorder;
             TensorParallelRanks = tensorParallelRanks;
             Signature = signature;
+            FloatProducts = floatProducts;
         }
 
         public IReadOnlyList<GraphNode> Entries { get; }
@@ -308,6 +309,14 @@ namespace TensorSharp.Graph
         public int[]? TensorParallelRanks { get; }
         /// <summary>A hash of everything that shapes the program (not its per-run input values).</summary>
         public (ulong, ulong) Signature { get; }
+        /// <summary>
+        /// The products of block-format weights keep their activations in F32 (<see cref="GraphProgramBuilder.FloatProducts"/>):
+        /// an executor whose own kernels for them would round the activations first (the direct CUDA executor's int8 tensor-core
+        /// products quantize them to q8_1, its prompt-size F16 GEMM to half) multiplies an F32 copy of the weight's values
+        /// instead. A network's choice, for one held to an F32 oracle; the decoder's steps leave it off. Executors whose
+        /// products already read F32 activations, or that have no other kernel, run as before.
+        /// </summary>
+        public bool FloatProducts { get; }
     }
 
     /// <summary>
@@ -444,10 +453,26 @@ namespace TensorSharp.Graph
             return _outputs.Count - 1;
         }
 
+        /// <summary>The program's block-format products keep their activations in F32 (<see cref="GraphProgram.FloatProducts"/>).
+        /// Set it before the first entry: it is part of the signature.</summary>
+        public bool FloatProducts
+        {
+            get => _floatProducts;
+            set
+            {
+                if (NodeCount != 0) throw new InvalidOperationException("FloatProducts is set before the program's first entry.");
+                if (value && !_floatProducts) Mix(0x464C5450);   // "FLTP"
+                _floatProducts = value;
+            }
+        }
+
+        private bool _floatProducts;
+
         public GraphProgram ToProgram(bool replayable, bool reorder, int[]? tensorParallelRanks = null)
         {
             if (_entries == null) throw new InvalidOperationException("A hash-only trace has no program.");
-            return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature);
+            return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature,
+                _floatProducts);
         }
     }
 }

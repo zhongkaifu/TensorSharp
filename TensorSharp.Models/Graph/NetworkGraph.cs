@@ -98,6 +98,29 @@ namespace TensorSharp.Models.Graph
         /// </summary>
         public bool AttentionByProducts { get; set; }
 
+        /// <summary>
+        /// The network's block-format products keep their activations in F32 (<see cref="GraphProgram.FloatProducts"/>): on an
+        /// executor whose products would round them (direct CUDA's int8 and F16 kernels) the weight's values are multiplied in
+        /// F32. Default off; a network held to an F32 oracle sets it before its first run.
+        /// </summary>
+        public bool FloatProducts
+        {
+            get => _floatProducts;
+            set
+            {
+                lock (_sync)
+                {
+                    if (_floatProducts == value) return;
+                    _floatProducts = value;
+                    foreach (IGraphPlan plan in _plans.Values) plan.Dispose();
+                    _plans.Clear();
+                    _lru.Clear();
+                }
+            }
+        }
+
+        private bool _floatProducts;
+
         /// <summary>Programs compiled (cache misses).</summary>
         public int Builds { get; private set; }
 

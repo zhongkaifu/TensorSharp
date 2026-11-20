@@ -113,8 +113,11 @@ namespace TensorSharp.Models
                     || n == "mm.0.weight" || n == "mm.1.weight" || n == "mm.2.weight");
                 ValidateWeights();
                 // One program a geometry (and a part of a split one): a cached GGML program keeps its own compute memory,
-                // which grows with the image, so few are kept.
-                Graph = new NetworkGraph(Weights, executor, "muse-glimmer vision tower") { MaxCachedPlans = MaxParts };
+                // which grows with the image, so few are kept. The products keep their activations in F32 where the executor
+                // would round them (direct CUDA, whose float-activation lane is held to llama.cpp's Metal goldens and to the
+                // per-op tower's F32 products): its int8 and F16 products left the rows at cosine 0.9975 (worst row 0.94) on a
+                // 448 x 168 image, the F32 copies at 1.0000000. GGML, MLX and the managed executor run their products as before.
+                Graph = new NetworkGraph(Weights, executor, "muse-glimmer vision tower") { MaxCachedPlans = MaxParts, FloatProducts = true };
                 _materializesAttention = Graph.Executor is TensorGraphExecutor && Graph.Executor is not MlxGraphExecutor;
                 // GGML's rotary kernels read a strided half-head view where it lies; the tensor executors' do not (MLX's
                 // fast rope takes contiguous rows and turns a strided view element by element on the host: 8 s for a

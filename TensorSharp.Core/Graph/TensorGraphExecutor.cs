@@ -143,6 +143,11 @@ namespace TensorSharp.Graph
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>
         protected abstract Tensor QuantizedMatMul(IGraphWeight weight, Tensor x);
 
+        /// <summary>While a compiled program runs: its block-format products keep their activations in F32
+        /// (<see cref="GraphProgram.FloatProducts"/>). An executor whose products would round them reads it in
+        /// <see cref="QuantizedMatMul"/>.</summary>
+        protected bool FloatProducts { get; private set; }
+
         /// <summary>The managed product of a weight's host blocks with host rows (x [rows, Ne0] -> [rows, Ne1]),
         /// registered by the assembly that holds the managed kernels. A backend without a kernel for a weight's
         /// format runs it through here, as its per-op path does.</summary>
@@ -1231,6 +1236,8 @@ namespace TensorSharp.Graph
                 return _x.OnBackendThread(() =>
                 {
                     var session = new Session(_x, _dead, _x.LivenessOf(_program));
+                    bool floatProducts = _x.FloatProducts;
+                    _x.FloatProducts = _program.FloatProducts;
                     try
                     {
                         int node = 0;
@@ -1259,6 +1266,7 @@ namespace TensorSharp.Graph
                     }
                     finally
                     {
+                        _x.FloatProducts = floatProducts;
                         session.Dispose();
                     }
                 });

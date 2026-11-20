@@ -4027,10 +4027,42 @@ namespace TensorSharp.Cuda
         /// rows run on them in pieces of that many.</summary>
         private const int DecodeOnceRows = 8, DenseDecodeRows = 32;
 
+        /// <summary>
+        /// A program whose products keep their activations in F32 (<see cref="TensorGraphExecutor.FloatProducts"/>, a vision tower
+        /// held to its F32 oracle): a q8_0 weight's values as F32 (code * d, ggml's dequantize_row_q8_0) times the F32 rows on
+        /// cuBLAS in F32, the arithmetic of a per-op tower that dequantized its weights at load. The weight stays resident in
+        /// q8_0; its F32 copy lives for the call. The executor's own products quantize the activations to q8_1 (the int8
+        /// tensor-core GEMM, up to 512 rows) or round them to half (the F16 GEMM past that): over the 50 layers of the
+        /// Muse-Glimmer tower that left its rows at cosine 0.9975 (worst row 0.94) from the F32 per-op tower's on a 448 x 168
+        /// image and 0.9999-0.99999 on 448 x 448 and larger ones; with the F32 copies, cosine 1.0000000 on all nine images
+        /// (relative L2 1e-5 to 3e-5), in 0.1-0.35x the per-op tower's time (RTX PRO 4500 Blackwell).
+        /// </summary>
+        private Tensor FloatQ8Product(IGraphWeight weight, Tensor x)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            long rows = x.Sizes[0], inDim = weight.Ne0, outDim = weight.Ne1;
+            if (Kernels == null || weight.Format != GraphFormat.Q8_0 || weight.Ne2 > 1 || inDim % 32 != 0 || inDim > int.MaxValue
+                || outDim > int.MaxValue || rows < 1 || rows > int.MaxValue || weight.Bytes != outDim * (inDim / 32) * 34
+                || x.Storage is not CudaStorage || x.ElementType != DType.Float32 || !x.IsContiguous() || x.ElementCount() != rows * inDim
+                || weight.CacheKey == IntPtr.Zero || CudaGraphCapture.IsCapturing(cuda)
+                || !CudaQuantizedOps.TryEnsureResident(cuda, weight.CacheKey, weight.Data, weight.Format, inDim, outDim, weight.Bytes, out _, out _)
+                || !CudaQuantizedOps.TryGetResidentDevicePtr(cuda, weight.CacheKey, out IntPtr wPtr, out int type) || type != GraphFormat.Q8_0)
+                return null;
+            using var values = new Tensor(Allocator, DType.Float32, outDim, inDim);
+            var product = new Tensor(Allocator, DType.Float32, rows, outDim);
+            Launch(new[] { x, values }, product, (k, stream) =>
+            {
+                k.LaunchQ8WeightToF32(wPtr, Ptr(values), outDim * (inDim / 32), stream);
+                CudaQuantizedOps.RunF32Gemm(cuda, Ptr(values), Ptr(x), Ptr(product), (int)inDim, (int)outDim, (int)rows);
+            });
+            return product;
+        }
+
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
             if (_deferredNorms.Count > 0 && DeferredNormProduct(weight, x) is { } normedProduct) return normedProduct;
             ReadNow(x);
+            if (FloatProducts && FloatQ8Product(weight, x) is { } floatProduct) return floatProduct;
             var cuda = (CudaAllocator)Allocator;
             long rows = x.Sizes[0], inDim = weight.Ne0, outDim = weight.Ne1;
             // A decode-size product chooses its kernel by the weight's resident copy: made resident first, so a weight's first
