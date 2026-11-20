@@ -163,19 +163,22 @@ internal static class MiniMaxH3ImageGoldens
 
     internal static IReadOnlyCollection<string> Lanes => s_lanes.Value.Keys;
 
-    /// <summary>The frozen case for this lane, or (when this lane was never frozen) the same backend's on another lane, else
-    /// the reference lane's (ggml_cpu on the Mac that froze them); null when none exists.</summary>
-    internal static Case Find(string caseName, string lane)
+    /// <summary>The frozen case for this lane; when this lane was never frozen, one frozen from the same fixture bytes (the
+    /// synthetic Q4_K fixture quantizes to other bytes on x64 than on ARM64): the same backend's, on this runtime identifier
+    /// first, else the reference lane's (ggml_cpu on the Mac that froze them), else any lane's. Null when none exists.</summary>
+    internal static Case Find(string caseName, string lane, string fixtureSha256 = null)
     {
         var all = s_lanes.Value;
         if (all.TryGetValue(lane, out var mine) && mine.TryGetValue(caseName, out Case exact)) return exact;
         string[] parts = lane.Split('|');
-        // The same backend's, on this runtime identifier first.
-        foreach (var (key, cases) in all.OrderBy(kv => kv.Key.Split('|').ElementAtOrDefault(1) == parts.ElementAtOrDefault(1) ? 0 : 1)
-                     .ThenBy(kv => kv.Key, StringComparer.Ordinal))
-            if (key.Split('|')[0] == parts[0] && cases.TryGetValue(caseName, out Case same)) return same;
-        foreach (var (key, cases) in all.OrderBy(kv => kv.Key, StringComparer.Ordinal))
-            if (key.StartsWith("ggml_cpu|osx-arm64|", StringComparison.Ordinal) && cases.TryGetValue(caseName, out Case reference)) return reference;
+        int Rank(string key)
+        {
+            string[] k = key.Split('|');
+            if (k[0] == parts[0]) return k.ElementAtOrDefault(1) == parts.ElementAtOrDefault(1) ? 0 : 1;
+            return key.StartsWith("ggml_cpu|osx-arm64|", StringComparison.Ordinal) ? 2 : 3;
+        }
+        foreach (var (key, cases) in all.OrderBy(kv => Rank(kv.Key)).ThenBy(kv => kv.Key, StringComparer.Ordinal))
+            if (cases.TryGetValue(caseName, out Case c) && (fixtureSha256 == null || c.FixtureSha256 == fixtureSha256)) return c;
         return null;
     }
 
@@ -185,7 +188,7 @@ internal static class MiniMaxH3ImageGoldens
     /// largest sampled difference over the output's largest magnitude, and the sample's relative L2). Returns what was checked.
     /// </summary>
     internal static string Check(string caseName, string lane, string fixtureSha256, IReadOnlyList<float[]> got, double bound,
-        Action<string> log) => CheckAgainst(Find(caseName, lane), caseName, lane, fixtureSha256, got, bound, log);
+        Action<string> log) => CheckAgainst(Find(caseName, lane, fixtureSha256) ?? Find(caseName, lane), caseName, lane, fixtureSha256, got, bound, log);
 
     /// <summary><see cref="Check"/> against a given frozen case (bytes only when it was frozen on <paramref name="lane"/>).</summary>
     internal static string CheckAgainst(Case frozen, string caseName, string lane, string fixtureSha256, IReadOnlyList<float[]> got,

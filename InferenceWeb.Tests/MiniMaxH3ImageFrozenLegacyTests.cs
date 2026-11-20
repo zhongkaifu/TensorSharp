@@ -29,9 +29,11 @@ public sealed class MiniMaxH3ImageFrozenLegacyTests(ITestOutputHelper output)
     private const int F32 = MiniMaxH3ImageFixture.F32, BF16 = MiniMaxH3ImageFixture.BF16, Q8_0 = MiniMaxH3ImageFixture.Q8_0,
         Q4_K = MiniMaxH3ImageFixture.Q4_K;
 
-    /// <summary>Off the lane a case was frozen on, the bound on its largest sampled difference over the largest legacy value:
-    /// five times the largest difference measured between lanes and between the runtime and legacy where they differ (the
-    /// report of stage S10), by the projections' format.</summary>
+    /// <summary>Off the lane a case was frozen on, the bound on its largest sampled difference over the largest legacy value,
+    /// by the projections' format. Measured at the freeze (ggml d9fe7bff): between the four lanes' legacy outputs (ggml_cpu
+    /// on the M5 Pro and on an x64 EPYC, ggml_metal on the M5 Pro, ggml_cuda on the RTX PRO 4500) at most 5.8e-4 (F32),
+    /// 6.1e-4 (BF16), 1.5e-3 (Q8_0), 2.6e-3 (Q4_K); the runtime against legacy on ARM64 ggml_cpu (main's products) at most
+    /// 5.2e-5, 5.5e-4, 1.6e-3, 2.5e-3. The bound is about twice their sum or more.</summary>
     private static double Bound(int format) => format is Q8_0 or Q4_K ? 1e-2 : 3e-3;
 
     private static void Pin(BackendType backend) => GgmlBasicOps.EnsureBackendAvailable(backend switch
@@ -120,7 +122,7 @@ public sealed class MiniMaxH3ImageFrozenLegacyTests(ITestOutputHelper output)
         // Against the process's GGML lane's frozen steps (or the nearest lane's), never byte for byte: the managed products
         // are not ggml's.
         string caseName = MiniMaxH3ImageGoldens.DenoiserCase("WithReferences", format);
-        MiniMaxH3ImageGoldens.Case frozen = MiniMaxH3ImageGoldens.Find(caseName, MiniMaxH3ImageGoldens.LaneKey(ggml));
+        MiniMaxH3ImageGoldens.Case frozen = MiniMaxH3ImageGoldens.Find(caseName, MiniMaxH3ImageGoldens.LaneKey(ggml), MiniMaxH3ImageGoldens.FileSha(fx.DitPath));
         MiniMaxH3ImageGoldens.CheckAgainst(frozen, caseName, "managed", MiniMaxH3ImageGoldens.FileSha(fx.DitPath), steps, bound, output.WriteLine);
         Assert.Equal(1, managed.Compiles);
     }
@@ -150,14 +152,18 @@ public sealed class MiniMaxH3ImageFrozenLegacyTests(ITestOutputHelper output)
         string[] decoder = MiniMaxH3ImageGoldens.VaeCases.Select(c => c.Name).ToArray();
         Assert.Contains(MiniMaxH3ImageGoldens.Lanes, l => l.StartsWith("ggml_cpu|osx-arm64|", StringComparison.Ordinal));
         Assert.Contains(MiniMaxH3ImageGoldens.Lanes, l => l.StartsWith("ggml_metal|", StringComparison.Ordinal));
-        var fixtureOf = new Dictionary<string, string>();
+        Assert.Contains(MiniMaxH3ImageGoldens.Lanes, l => l.StartsWith("ggml_cuda|", StringComparison.Ordinal));
+        // A case's fixture bytes are one per runtime identifier's architecture (the Q4_K quantizer's floats round otherwise
+        // on x64 than on ARM64).
+        var fixtureOf = new Dictionary<(string, string), string>();
         foreach (string lane in MiniMaxH3ImageGoldens.Lanes.Where(l => l.StartsWith("ggml_", StringComparison.Ordinal)))
             foreach (string name in denoiser.Concat(decoder))
             {
                 MiniMaxH3ImageGoldens.Case c = MiniMaxH3ImageGoldens.Find(name, lane);
                 Assert.True(c != null && c.Lane == lane, $"{lane} has no {name}");
-                if (fixtureOf.TryGetValue(name, out string sha)) Assert.Equal(sha, c.FixtureSha256);
-                else fixtureOf[name] = c.FixtureSha256;
+                string arch = lane.Split('|')[1].Split('-').Last();
+                if (fixtureOf.TryGetValue((name, arch), out string sha)) Assert.Equal(sha, c.FixtureSha256);
+                else fixtureOf[(name, arch)] = c.FixtureSha256;
             }
     }
 }
