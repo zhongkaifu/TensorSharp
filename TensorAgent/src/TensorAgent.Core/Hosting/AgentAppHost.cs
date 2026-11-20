@@ -149,7 +149,7 @@ public sealed class AgentAppHost : IDisposable
         // transfer must not end because the user went back to the chat. See
         // ModelDownloadManager.
         Downloads = new ModelDownloadManager(Models, _loggerFactory.CreateLogger("TensorAgent.Downloads"));
-        Loras = new LoraStore(Paths.LorasDirectory);
+        Loras = new LoraStore(Paths.LorasDirectory) { Licenses = Licenses };
         Conversations = new ConversationStore(paths.ConversationsDirectory);
         Catalog = ModelCatalog.ForDevice(paths.DeviceMemoryGB);
 
@@ -3293,10 +3293,13 @@ public sealed class AgentAppHost : IDisposable
     /// <summary>The key a LoRA plug-in's download has in <see cref="Downloads"/>.</summary>
     public static string LoraDownloadKey(CatalogLora lora) => "lora:" + lora.Id;
 
-    /// <summary>Start the download of a plug-in's files, or rejoin the one running.</summary>
+    /// <summary>Start the download of a plug-in's files, or rejoin the one running. A plug-in under its base model's
+    /// license whose terms are not accepted is refused here, synchronously, before a job is made.</summary>
+    /// <exception cref="LoraLicenseAcceptanceRequiredException">The base model's terms are not accepted.</exception>
     public ModelDownloadStatus StartLoraDownload(CatalogLora lora)
     {
         ArgumentNullException.ThrowIfNull(lora);
+        Loras.EnsureLicenseAccepted(lora);
         return Downloads.Start(LoraDownloadKey(lora), (progress, ct) => Loras.DownloadAsync(lora, progress, ct));
     }
 

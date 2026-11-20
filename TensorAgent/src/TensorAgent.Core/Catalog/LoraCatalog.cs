@@ -57,6 +57,14 @@ public sealed record CatalogLora
     /// (MiniMax-H3-Image's Q8_0 takes pDMD).
     /// </summary>
     public IReadOnlyList<string> AlsoFor { get; init; } = Array.Empty<string>();
+    /// <summary>
+    /// The terms its download needs accepted: those of the entries it applies to, when the plug-in is a Model
+    /// Derivative under their license (MiniMax-H3-Image's pDMD, under the MiniMax-H3-Image Community License). An
+    /// acceptance of the same revision recorded for one of those entries covers it (the user accepted that text when
+    /// the base model downloaded); none on record, its download is refused until the base entry's terms are accepted.
+    /// Null for plug-ins under their own open license.
+    /// </summary>
+    public CatalogLicenseTerms? LicenseTerms { get; init; }
     public required LoraKind Kind { get; init; }
     /// <summary>The adapter weights (always first) and any file the engine reads beside them.</summary>
     public required IReadOnlyList<LoraFile> Files { get; init; }
@@ -471,6 +479,7 @@ public static class LoraCatalog
             DisplayName = "pDMD 2-Step",
             BaseModelId = MiniMaxH3Image,
             AlsoFor = new[] { MiniMaxH3ImageQ8 },
+            LicenseTerms = ModelCatalog.MiniMaxH3ImageTerms,
             Kind = LoraKind.Speed,
             Steps = 2,
             RecipeConfig = "minimax-h3-image-pdmd-2step.json",

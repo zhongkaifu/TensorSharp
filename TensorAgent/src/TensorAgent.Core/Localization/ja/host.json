@@ -77,6 +77,7 @@
   "host.video.ingredientsUnavailable": "Ingredientsの人物・物体参照にはIC-LoRAチェックポイントが必要です。LTX 2.5 Distilledでは画像キーフレームを使用してください。",
   "host.video.invalidFrames": "LTXのフレーム数は正の8n+1にしてください。",
   "host.license.required": "{model} は、ライセンス条件（{license}）に同意した後でなければダウンロードされません。",
+  "host.license.loraRequired": "{lora} は {model} の派生物で、同じライセンス（{license}）が適用されます。{model} についてこのライセンスに同意した後（モデル画面）でダウンロードされます。",
   "host.license.changed": "{model} のライセンス条件が変更されました。もう一度読んで、現在の版に同意してください。",
   "host.license.notRequired": "{model} には同意が必要なライセンス条件はありません。"
 }

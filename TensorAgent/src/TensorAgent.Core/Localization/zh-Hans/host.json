@@ -77,6 +77,7 @@
   "host.video.ingredientsUnavailable": "Ingredients 身份参考需要 IC-LoRA 检查点；LTX 2.5 Distilled 请使用图像关键帧。",
   "host.video.invalidFrames": "LTX视频帧数必须为正数并符合8n+1。",
   "host.license.required": "须先接受 {model} 的许可条款（{license}）才能下载。",
+  "host.license.loraRequired": "{lora} 是 {model} 的衍生物，适用同一许可（{license}）：须先为 {model} 接受该许可（在“模型”页面）才能下载。",
   "host.license.changed": "{model} 的许可条款已更改。请重新阅读并接受当前版本。",
   "host.license.notRequired": "{model} 没有需要接受的许可条款。"
 }

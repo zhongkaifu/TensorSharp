@@ -322,6 +322,100 @@ public sealed class LicenseAcceptanceTests : IDisposable
         Assert.Equal(DownloadState.Completed, (await WaitForEnd(downloads, model.Id)).State);
     }
 
+    // ---- a LoRA plug-in under its base model's license ------------------------------------------------------
+
+    private static CatalogLora Pdmd => LoraCatalog.Find("minimax-h3-image-pdmd-2step")!;
+
+    /// <summary>The pDMD plug-in with one file <paramref name="server"/> serves, and the given terms.</summary>
+    private static CatalogLora Plugin(RangeServer server, CatalogLicenseTerms? terms) => Pdmd with
+    {
+        Id = "gated-plug-in",
+        LicenseTerms = terms,
+        Files = new[]
+        {
+            new LoraFile("weights.safetensors", server.Url, server.Body.Length, Convert.ToHexStringLower(SHA256.HashData(server.Body))),
+        },
+    };
+
+    private LoraStore Loras(string name, LicenseAcceptanceStore? licenses) =>
+        new(Path.Combine(_root, name)) { Licenses = licenses };
+
+    /// <summary>The pDMD plug-in is a Model Derivative of MiniMax-H3-Image under its Community License: it carries the base
+    /// entries' terms (the same text and revision), and no other plug-in carries any.</summary>
+    [Fact]
+    public void ThePdmdPlugInCarriesItsBaseEntriesTermsAndNoOtherPlugInAsks()
+    {
+        Assert.Same(Terms, Pdmd.LicenseTerms);
+        Assert.Equal(new[] { "minimax-h3-image-q4km", "minimax-h3-image-q8-0" },
+            LicenseAcceptanceStore.BaseEntries(Pdmd, ModelCatalog.BuiltIn).Select(m => m.Id).ToArray());
+        Assert.All(LoraCatalog.BuiltIn.Where(l => l.Id != Pdmd.Id), l => Assert.Null(l.LicenseTerms));
+        var store = new LoraStore(Path.Combine(_root, "plain"));
+        Assert.All(LoraCatalog.BuiltIn.Where(l => l.Id != Pdmd.Id), l => Assert.False(store.NeedsLicenseAcceptance(l)));
+    }
+
+    /// <summary>Nothing of the plug-in is fetched until its base model's terms are accepted; an acceptance recorded for any
+    /// entry it applies to (here the Q8_0 entry it is AlsoFor) covers it, as it covers the base model's own download.</summary>
+    [Fact]
+    public async Task APlugInUnderItsBaseModelsLicenseFetchesNothingUntilABaseEntryAcceptedThatRevision()
+    {
+        using var server = new RangeServer(Body(64 * 1024));
+        LicenseAcceptanceStore acceptances = Acceptances();
+        LoraStore store = Loras("lora-gate", acceptances);
+        CatalogLora plugin = Plugin(server, Terms);
+
+        Assert.True(store.NeedsLicenseAcceptance(plugin));
+        var refused = await Assert.ThrowsAsync<LoraLicenseAcceptanceRequiredException>(
+            () => store.DownloadAsync(plugin, null, CancellationToken.None));
+        Assert.Same(plugin, refused.Lora);
+        Assert.Equal("minimax-h3-image-q4km", refused.Model?.Id);
+        Assert.Equal(Loc.T("host.license.loraRequired", ("lora", plugin.DisplayName), ("license", Terms.Title),
+            ("model", refused.Model!.DisplayName)), refused.Message);
+        Assert.Equal(0, server.Requests);
+        Assert.False(Directory.Exists(store.DirectoryFor(plugin)));
+
+        acceptances.Accept(ModelCatalog.Find("minimax-h3-image-q8-0")!, Terms.Revision);
+        Assert.False(store.NeedsLicenseAcceptance(plugin));
+        await store.DownloadAsync(plugin, null, CancellationToken.None);
+        Assert.Equal(InstallState.Installed, store.StateOf(plugin));
+    }
+
+    /// <summary>A decline of the base entry's terms withdraws the cover, and an acceptance of another revision never gives it:
+    /// a plug-in whose terms are not the ones a base entry accepted (a changed text) asks again.</summary>
+    [Fact]
+    public async Task ADeclineOrAnotherRevisionOfTheBaseTermsDoesNotCoverThePlugIn()
+    {
+        using var server = new RangeServer(Body(32 * 1024));
+        LicenseAcceptanceStore acceptances = Acceptances();
+        LoraStore store = Loras("lora-revision", acceptances);
+        acceptances.Accept(H3Image, Terms.Revision);
+        CatalogLora changed = Plugin(server, Terms with { Revision = new string('0', 64) });
+        Assert.True(store.NeedsLicenseAcceptance(changed));
+        await Assert.ThrowsAsync<LoraLicenseAcceptanceRequiredException>(() => store.DownloadAsync(changed, null, CancellationToken.None));
+        Assert.Equal(0, server.Requests);
+
+        CatalogLora plugin = Plugin(server, Terms);
+        Assert.False(store.NeedsLicenseAcceptance(plugin));
+        Assert.True(acceptances.Decline(H3Image));
+        Assert.True(store.NeedsLicenseAcceptance(plugin));
+        await Assert.ThrowsAsync<LoraLicenseAcceptanceRequiredException>(() => store.DownloadAsync(plugin, null, CancellationToken.None));
+        Assert.Equal(0, server.Requests);
+    }
+
+    /// <summary>A store nobody gave the user's answers never downloads a gated plug-in (fail closed); a plug-in under its own
+    /// license downloads as before.</summary>
+    [Fact]
+    public async Task AStoreThatKeepsNoAnswersNeverDownloadsAGatedPlugInAndEveryOtherAsBefore()
+    {
+        using var server = new RangeServer(Body(32 * 1024));
+        LoraStore store = Loras("lora-none", licenses: null);
+        await Assert.ThrowsAsync<LoraLicenseAcceptanceRequiredException>(
+            () => store.DownloadAsync(Plugin(server, Terms), null, CancellationToken.None));
+        Assert.Equal(0, server.Requests);
+        CatalogLora open = Plugin(server, terms: null);
+        await store.DownloadAsync(open, null, CancellationToken.None);
+        Assert.Equal(InstallState.Installed, store.StateOf(open));
+    }
+
     // ---- the desktop host's routes ------------------------------------------------------------------------
 
     private (HttpClient Client, ModelStore Store, ModelDownloadManager Downloads) Host(

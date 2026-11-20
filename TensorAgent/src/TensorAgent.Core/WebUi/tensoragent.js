@@ -3560,10 +3560,11 @@
     loraError('');
     return fetch('/api/agent/loras/' + encodeURIComponent(l.id) + '/download', { method: 'POST' })
       .then(function (r) {
+        // A refusal says why (a plug-in under its base model's license, not yet accepted: 409).
+        if (!r.ok) return loraJson(r);
         // The download belongs to the app, not to this request: the stream is only a
         // window on it, so the page closes it and follows the job through the list.
         if (r.body && r.body.cancel) r.body.cancel().catch(function () {});
-        if (!r.ok) throw new Error('HTTP ' + r.status);
         return loadLoras();
       })
       .catch(function (e) { loraError(t('page.lora.downloadFailed', { error: (e && e.message) || e })); });

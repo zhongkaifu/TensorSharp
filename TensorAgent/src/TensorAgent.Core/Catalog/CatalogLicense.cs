@@ -100,6 +100,25 @@ public sealed class LicenseAcceptanceRequiredException : InvalidOperationExcepti
     public CatalogModel Model { get; }
 }
 
+/// <summary>A download of a LoRA plug-in under its base model's license, refused before anything is fetched: the base
+/// entry's terms (<see cref="Model"/>, the first entry it applies to with them) have not been accepted.</summary>
+public sealed class LoraLicenseAcceptanceRequiredException : InvalidOperationException
+{
+    public LoraLicenseAcceptanceRequiredException(CatalogLora lora, CatalogModel? model)
+        : base(Loc.T("host.license.loraRequired", ("lora", lora.DisplayName), ("license", lora.LicenseTerms!.Title),
+            ("model", model?.DisplayName ?? lora.BaseModelId)))
+    {
+        Lora = lora;
+        Model = model;
+    }
+
+    /// <summary>The plug-in whose download was refused.</summary>
+    public CatalogLora Lora { get; }
+
+    /// <summary>The entry whose terms accepting covers it (null when the catalog holds none).</summary>
+    public CatalogModel? Model { get; }
+}
+
 /// <summary>
 /// The license acceptances this installation has recorded, one file in the app's data folder (not its cache:
 /// what the user agreed to is not something a cache purge may forget).
@@ -143,6 +162,27 @@ public sealed class LicenseAcceptanceStore
         lock (_lock)
             return Load().Any(a => Matches(a, model) && string.Equals(a.Revision, terms.Revision, StringComparison.Ordinal));
     }
+
+    /// <summary>
+    /// Whether <paramref name="lora"/> may download: it declares no terms, or their current revision was accepted for
+    /// one of the <paramref name="catalog"/> entries it applies to that carry the same terms (<see cref="CatalogLora.LicenseTerms"/>).
+    /// </summary>
+    public bool IsAccepted(CatalogLora lora, IEnumerable<CatalogModel> catalog)
+    {
+        ArgumentNullException.ThrowIfNull(lora);
+        ArgumentNullException.ThrowIfNull(catalog);
+        if (lora.LicenseTerms is not { } terms)
+            return true;
+        return BaseEntries(lora, catalog).Any(IsAccepted);
+    }
+
+    /// <summary>The entries <paramref name="lora"/> applies to whose terms are its own (same license, same revision): the
+    /// ones whose acceptance covers it.</summary>
+    public static IEnumerable<CatalogModel> BaseEntries(CatalogLora lora, IEnumerable<CatalogModel> catalog) =>
+        lora.LicenseTerms is not { } terms ? Enumerable.Empty<CatalogModel>()
+            : catalog.Where(m => lora.AppliesTo(m.Id) && m.LicenseTerms is { } t
+                                 && string.Equals(t.Id, terms.Id, StringComparison.Ordinal)
+                                 && string.Equals(t.Revision, terms.Revision, StringComparison.Ordinal));
 
     /// <summary>Whether this entry's license was accepted at some revision other than the current one: the
     /// terms have changed since, which is worth saying when they are shown again.</summary>

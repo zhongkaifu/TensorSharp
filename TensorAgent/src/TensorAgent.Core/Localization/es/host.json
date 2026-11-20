@@ -77,6 +77,7 @@
   "host.video.ingredientsUnavailable": "Las referencias de identidad Ingredients requieren un checkpoint IC-LoRA; use imágenes clave con LTX 2.5 Distilled.",
   "host.video.invalidFrames": "La cantidad de fotogramas LTX debe ser positiva y seguir la regla 8n+1.",
   "host.license.required": "{model} solo se descarga después de que aceptes sus condiciones de licencia ({license}).",
+  "host.license.loraRequired": "{lora} es un derivado de {model} con la misma licencia ({license}): se descarga después de que aceptes esa licencia para {model} (en la página Modelos).",
   "host.license.changed": "Las condiciones de licencia de {model} han cambiado. Vuelve a leerlas y acepta la versión actual.",
   "host.license.notRequired": "{model} no tiene condiciones de licencia que aceptar."
 }
