@@ -3646,6 +3646,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// sequence's window in one trunk forward).</summary>
         internal long BatchedSpeculativeSteps => _batchedSpecSteps;
 
+        /// <summary>Tests: each batched verify as the trunk ran it. The arguments are the requests, the positions of their
+        /// windows' first tokens, the window's rows, the windows' tokens (request i's from i * window, padded with its last
+        /// draft), and the rows each kept (its window's first token and its accepted drafts).</summary>
+        internal Action<string[], int[], int, int[], int[]>? SpecVerifyObserverForTests { get; set; }
+
         /// <summary>
         /// One speculative step for SEVERAL decoding sequences on their per-request
         /// holders: each drafts a window with its own drafter state, the trunk
@@ -3988,6 +3993,8 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             batched.CommitBatchedSpecVerify(requestIds, positions, kept);
+            SpecVerifyObserverForTests?.Invoke((string[])requestIds.Clone(), (int[])positions.Clone(), window, (int[])tokens.Clone(),
+                (int[])kept.Clone());
             long committed = Timestamp();
             // The anchors' and rows' draws, the acceptance and the trunk's commit of the kept rows.
             long commitTicks = committed - verified;
