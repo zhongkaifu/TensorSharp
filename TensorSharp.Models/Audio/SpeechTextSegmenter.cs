@@ -17,8 +17,8 @@ namespace TensorSharp.Models.Audio
     /// after a letter, each followed by whitespace), at a line's end, or, in a run longer than <see cref="MaxChars"/>
     /// without one, at its last comma or space. The first piece also ends at a comma once it has
     /// <see cref="FirstPieceMinChars"/> characters, so the speech starts before a long first sentence is complete. Each piece is the speakable text of the markdown the reply writes
-    /// (<see cref="Speakable"/>): markers, emoji and fenced code are not read aloud; a piece with nothing left to say is
-    /// dropped.
+    /// (<see cref="Speakable"/>): markers, emoji, fenced code and table rows are not read aloud, a long path or a URL is
+    /// said by its last name or its host, a long inline code span not at all; a piece with nothing left to say is dropped.
     /// </summary>
     public sealed class SpeechTextSegmenter
     {
@@ -60,12 +60,37 @@ namespace TensorSharp.Models.Audio
             return pieces;
         }
 
-        /// <summary>The rest, at the end of the reply.</summary>
+        /// <summary>The rest, at the end of the reply or of a round of it (a tool call follows the text so far): what is
+        /// pending is spoken now, and the text after it starts a new line.</summary>
         public IReadOnlyList<string> Flush()
         {
             var pieces = new List<string>();
             Drain(pieces, final: true);
+            _atLineStart = true;
+            _inCode = false;
             return pieces;
+        }
+
+        /// <summary>
+        /// Take back <paramref name="text"/>, the end of what was appended (a reply's text that turned out to be reasoning):
+        /// where it is still waiting to be spoken it is dropped and true is returned; where some of it was already handed out
+        /// as a piece, everything still waiting is dropped (the rest of a piece that is gone means nothing) and false is
+        /// returned.
+        /// </summary>
+        public bool Retract(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return true;
+            string waiting = _pending.ToString() + _line.ToString();
+            if (waiting.EndsWith(text, StringComparison.Ordinal))
+            {
+                int fromLine = Math.Min(text.Length, _line.Length);
+                _line.Length -= fromLine;
+                _pending.Length -= text.Length - fromLine;
+                return true;
+            }
+            _pending.Clear();
+            _line.Clear();
+            return false;
         }
 
         private void Drain(List<string> pieces, bool final)
@@ -86,6 +111,12 @@ namespace TensorSharp.Models.Audio
                         continue;
                     }
                     if (_inCode) continue;
+                    // A table row is data, not a sentence: reading it cell by cell says nothing a listener can follow.
+                    if (lineStart && IsTableRow(line))
+                    {
+                        Cut(pieces, lineEnded: true);
+                        continue;
+                    }
                     _pending.Append(line);
                     Cut(pieces, lineEnded: true);
                     continue;
@@ -96,14 +127,15 @@ namespace TensorSharp.Models.Audio
                     if (final) _line.Clear();
                     break;
                 }
-                // A line that may still turn out to be a code fence waits for its end.
+                // A line that may still turn out to be a code fence or a table row waits for its end.
                 if (_atLineStart && !final)
                 {
                     string head = _line.ToString().TrimStart();
-                    if (head.Length == 0 || "```".StartsWith(head, StringComparison.Ordinal) || head.StartsWith("```", StringComparison.Ordinal))
+                    if (head.Length == 0 || "```".StartsWith(head, StringComparison.Ordinal) || head.StartsWith("```", StringComparison.Ordinal)
+                        || IsTableRow(head))
                         break;
                 }
-                if (_atLineStart && final && _line.ToString().TrimStart().StartsWith("```", StringComparison.Ordinal))
+                if (_atLineStart && final && (_line.ToString().TrimStart().StartsWith("```", StringComparison.Ordinal) || IsTableRow(_line.ToString())))
                 {
                     _line.Clear();
                     break;
@@ -193,6 +225,9 @@ namespace TensorSharp.Models.Audio
             return max;
         }
 
+        /// <summary>A markdown table row: a line that starts with a pipe.</summary>
+        private static bool IsTableRow(string line) => line.TrimStart().StartsWith("|", StringComparison.Ordinal);
+
         private static int IndexOf(StringBuilder sb, char c)
         {
             for (int i = 0; i < sb.Length; i++)
@@ -200,17 +235,41 @@ namespace TensorSharp.Models.Audio
             return -1;
         }
 
+        /// <summary>A path's last name (<c>/a/b/c.txt</c>, <c>src/app/main.py</c>: <c>c.txt</c>, <c>main.py</c>). Only what reads
+        /// as a path: rooted (<c>/</c>, <c>\</c>, <c>~</c>, <c>.</c>, a drive) or ending in a file name with an extension; a run
+        /// of words with slashes (<c>TCP/IP/UDP</c>) or numbers (<c>1/2/3</c>) is said as it is.</summary>
+        private static string LastName(string path)
+        {
+            string trimmed = path.TrimEnd('/', '\\');
+            int cut = trimmed.LastIndexOfAny(new[] { '/', '\\' });
+            if (cut < 0) return path;
+            string last = trimmed.Substring(cut + 1);
+            bool rooted = path[0] is '/' or '\\' or '~' or '.' || (path.Length > 1 && path[1] == ':');
+            if (!rooted && !FileExtension.IsMatch(last.TrimEnd('.'))) return path;
+            return last;
+        }
+
         private static readonly Regex Image = new(@"!\[([^\]]*)\]\([^)]*\)", RegexOptions.Compiled);
         private static readonly Regex Link = new(@"\[([^\]]+)\]\([^)]*\)", RegexOptions.Compiled);
         private static readonly Regex LineMarkers = new(@"^\s*(?:#{1,6}\s+|>\s*|[-*+•]\s+)+", RegexOptions.Compiled);
         private static readonly Regex Rule = new(@"^\s*(?:[-*_=]\s*){3,}$|^\s*\|?(?:\s*:?-{2,}:?\s*\|)+\s*:?-*:?\s*\|?\s*$", RegexOptions.Compiled);
         private static readonly Regex Emphasis = new(@"\*{1,3}|_{2,3}|~~|`+", RegexOptions.Compiled);
+        private static readonly Regex CodeSpan = new(@"`+([^`]+)`+", RegexOptions.Compiled);
+        private static readonly Regex Url = new(@"(?<![A-Za-z0-9])(?:https?|ftp)://(?:www\.)?([A-Za-z0-9.-]*[A-Za-z0-9])[!-~-[)\]>]]*(?<![.,;:!?'""])", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex PathLike = new(@"(?<![\w./\\])(?:[A-Za-z]:|~|\.{1,2})?[/\\]?[A-Za-z0-9_.@+-]+(?:[/\\][A-Za-z0-9_.@+-]+){2,}[/\\]?", RegexOptions.Compiled);
+        private static readonly Regex FileExtension = new(@"\.[A-Za-z][A-Za-z0-9]{0,7}$", RegexOptions.Compiled);
+
+        /// <summary>An inline code span this long or longer is not read (a command, an expression, JSON).</summary>
+        public const int LongCodeSpanChars = 40;
         private static readonly Regex Spaces = new(@"\s+", RegexOptions.Compiled);
 
         /// <summary>
         /// What speech says of a piece of a markdown reply: headings', quotes' and bullets' markers, emphasis (* ** __ ~~),
         /// backticks, table pipes, rules, links' targets and emoji (symbols of Unicode categories So / Sk with their
-        /// joiners and variation selectors) are dropped; whitespace is collapsed. Empty when no letter or digit is left.
+        /// joiners and variation selectors) are dropped; a URL is said as its host (<c>docs.python.org</c>), a path of three
+        /// or more parts as its last one (<c>/Users/me/out/result.csv</c> as <c>result.csv</c>), an inline code span of
+        /// <see cref="LongCodeSpanChars"/> characters or more not at all; whitespace is collapsed. Empty when no letter or
+        /// digit is left.
         /// </summary>
         public static string Speakable(string text)
         {
@@ -218,6 +277,14 @@ namespace TensorSharp.Models.Audio
             if (Rule.IsMatch(text)) return string.Empty;
             string t = Image.Replace(text, "$1");
             t = Link.Replace(t, "$1");
+            t = Url.Replace(t, m => m.Groups[1].Value);
+            t = CodeSpan.Replace(t, m =>
+            {
+                string code = m.Groups[1].Value.Trim();
+                if (PathLike.Match(code) is { Success: true } path && path.Length == code.Length) return LastName(code);
+                return code.Length >= LongCodeSpanChars ? string.Empty : code;
+            });
+            t = PathLike.Replace(t, m => LastName(m.Value));
             t = LineMarkers.Replace(t, "");
             t = Emphasis.Replace(t, "");
             t = t.Replace('|', ' ');

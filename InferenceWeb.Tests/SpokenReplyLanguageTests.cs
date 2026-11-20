@@ -92,8 +92,58 @@ public sealed class SpokenReplyLanguageTests
     public void MarkdownIsSpokenAsItsText()
     {
         string reply = "以下是三种健康的早餐：\n\n1. **燕麦粥**：富含纤维 🥣\n- *希腊酸奶*配水果\n## 小结\n> 详见[指南](https://example.com)。\n---\n| 早餐 | 热量 |\n|---|---|\n";
-        Assert.Equal(new[] { "以下是三种健康的早餐：", "1. 燕麦粥：富含纤维", "希腊酸奶配水果", "小结", "详见指南。", "早餐 热量" },
+        // The table is not read (a reply's table is data, not sentences).
+        Assert.Equal(new[] { "以下是三种健康的早餐：", "1. 燕麦粥：富含纤维", "希腊酸奶配水果", "小结", "详见指南。" },
             Segment(reply, 2));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(5)]
+    public void TablesAreNotReadAndTheTextAroundThemIs(int chunk)
+    {
+        Assert.Equal(new[] { "Here are the results:", "Both pass." },
+            Segment("Here are the results:\n\n| test | time |\n|---|---|\n| a | 1 s |\n| b | 2 s |\n\nBoth pass.", chunk));
+    }
+
+    [Theory]
+    // A path is said by its last name, a URL by its host, a long inline code span not at all.
+    [InlineData("Saved to /Users/me/work/out/result.csv.", "Saved to result.csv.")]
+    [InlineData("Edit src/app/main.py, then run it.", "Edit main.py, then run it.")]
+    [InlineData("Wrote `C:\\work\\out\\data.json` for you.", "Wrote data.json for you.")]
+    [InlineData("See https://docs.python.org/3/library/math.html.", "See docs.python.org.")]
+    [InlineData("详见https://www.example.com/a/b。", "详见example.com。")]
+    [InlineData("Run `python3 -c \"import math; print(math.factorial(20))\"` to check.", "Run to check.")]
+    [InlineData("Use `pip` here.", "Use pip here.")]
+    // Not paths: words with slashes, numbers, a short path.
+    [InlineData("TCP/IP/UDP and 1/2/3 and a/b.", "TCP/IP/UDP and 1/2/3 and a/b.")]
+    [InlineData("北京/上海/广州都有。", "北京/上海/广州都有。")]
+    public void PathsUrlsAndCodeAreSaidShortly(string text, string spoken)
+        => Assert.Equal(spoken, SpeechTextSegmenter.Speakable(text));
+
+    [Fact]
+    public void TextTakenBackIsNotSpokenWhileItWaits()
+    {
+        var segmenter = new SpeechTextSegmenter();
+        Assert.Equal(new[] { "Okay." }, segmenter.Append("Okay. Hmm, so the"));
+        Assert.True(segmenter.Retract("Hmm, so the"));
+        Assert.Empty(segmenter.Flush());
+        // Taken back after part of it was spoken: what still waits is dropped.
+        Assert.Equal(new[] { "First one." }, segmenter.Append("First one. second"));
+        Assert.False(segmenter.Retract("one. second"));
+        Assert.Empty(segmenter.Flush());
+    }
+
+    [Fact]
+    public void ARoundsEndSpeaksWhatWaitsAndTheNextRoundStartsALine()
+    {
+        var segmenter = new SpeechTextSegmenter();
+        Assert.Empty(segmenter.Append("Let me run that"));
+        Assert.Equal(new[] { "Let me run that" }, segmenter.Flush());
+        // The next round's table is a table although the previous round's text did not end its line.
+        Assert.Empty(segmenter.Append("| a | b |\n"));
+        Assert.Equal(new[] { "It is 42." }, segmenter.Append("It is 42.\n"));
     }
 
     [Fact]
