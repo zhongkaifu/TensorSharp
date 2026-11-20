@@ -230,6 +230,24 @@ public sealed class MuseGlimmerRuntimeTests(ITestOutputHelper output) : IDisposa
         Assert.Contains("2 KV heads", e.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>DFlash under --tp stays declined (design D5, as legacy declines it): on one device the drafter attaches, on a
+    /// tensor-parallel trunk nothing attaches, so the shared loader refuses an explicit --draft-model there (the server exits 2
+    /// with one line: SpeculativeDraftHeadLoaderTests.TryAttachConfiguredDraftHead_DeclinesADFlashDrafterUnderTensorParallelism).</summary>
+    [Fact]
+    public void ADFlashDrafterIsDeclinedUnderTensorParallelism()
+    {
+        Directory.CreateDirectory(_dir);
+        string path = MuseGlimmerGoldens.WriteFixture("untied", _dir);
+        string draft = Qwen4ExpSyntheticModelBuilder.WriteDFlash(Path.Combine(_dir, "dflash.gguf"), blockSize: 4,
+            hidden: MuseGlimmerSyntheticModelBuilder.Hidden, slidingWindow: 16);
+        using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        using (ModelBase one = MuseGlimmerArchitecture.CreateRuntimeModel(path, BackendType.Cpu, draftModelPath: draft))
+            Assert.True(one.HasDFlash);
+        using ModelBase tp = MuseGlimmerArchitecture.CreateRuntimeModel(path, BackendType.Cpu, 2, new SimulatedDeviceGroup(2), draftModelPath: draft);
+        Assert.False(tp.HasDFlash);
+        Assert.True(tp.TensorParallelActive);
+    }
+
     /// <summary>Until the switch (stage S8) the descriptor still builds the legacy model: the runtime family is the test seam's.</summary>
     [Fact]
     public void TheDescriptorStillBuildsTheLegacyModel()

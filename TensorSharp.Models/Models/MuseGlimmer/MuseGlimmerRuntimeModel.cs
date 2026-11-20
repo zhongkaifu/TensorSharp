@@ -102,7 +102,14 @@ namespace TensorSharp.Models
                 Dispose();
                 throw;
             }
-            AttachDraftModel(draftModelPath);
+            // DFlash under --tp stays declined, as legacy declines it (docs/design/muse-glimmer-unified.md D5): the drafter
+            // borrows the trunk's token embedding and LM head, which tensor parallelism shards, and the runtime's graph drafter
+            // runs on one device. With nothing attached, the shared loader refuses an explicit --draft-model on a tensor-parallel
+            // trunk (SpeculativeDraftHeadLoader): the server exits 2 with one line, the CLI warns and decodes without it.
+            if (IsTensorParallel && !string.IsNullOrEmpty(draftModelPath))
+                Console.WriteLine("  DFlash speculative decoding is not supported under tensor parallelism; ignoring the drafter.");
+            else
+                AttachDraftModel(draftModelPath);
         }
 
         /// <summary>
