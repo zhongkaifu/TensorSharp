@@ -163,6 +163,11 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         for (int i = 0; i < single.Count; i++)
             // ggml's kernels split each row-parallel product differently per rank (1.5e-4 / 2.2e-4 measured on 2x A40).
             Assert.True(RelL2(actual[i], single[i]) <= 1e-3, $"{family} tp2 rank graphs row {i}: relL2 {RelL2(actual[i], single[i]):E2}");
+        // Each rank scores its slice of the untied head, and the whole head stays on the host: a verify step's all-row logits
+        // bind it on rank 0 when they first run, and speculation on these graphs still emits plain greedy's tokens.
+        Assert.True(sdm.HeadSplitByVocabulary && sdm.WholeHeadStaysOnHost, $"{family}: the head is not split by vocabulary with the whole head on the host");
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => CreateGgmlTensorParallel(family, path, backend), $"{family} tp2 rank graphs on {backend}",
+            tieTolerance: 1e-2);
     }
 
     /// <summary>Speculation on per-rank graphs over two simulated devices matches plain greedy decoding.</summary>
