@@ -51,6 +51,12 @@ namespace TensorSharp.Models
         /// (<see cref="Telemetry.GpuMemoryTelemetry"/>), which pick their device query by its
         /// type. Null on a model built without its constructor (a test fake).</summary>
         internal IAllocator DirectAllocatorForTelemetry => _allocator;
+
+        /// <summary>A scope in which the large blocks this thread frees on a direct-CUDA device go back to the driver, not the
+        /// allocator's cache (<see cref="TensorSharp.Cuda.CudaAllocator.ReturningToDriver"/>): a disposed slot's caches and
+        /// states, a drafter ring given up. Null (no scope) elsewhere.</summary>
+        private protected IDisposable ReturningToDriver()
+            => _allocator is TensorSharp.Cuda.CudaAllocator cuda ? cuda.ReturningToDriver() : null;
         protected readonly BackendType _backend;
 
         protected readonly Dictionary<string, Tensor> _weights = new();

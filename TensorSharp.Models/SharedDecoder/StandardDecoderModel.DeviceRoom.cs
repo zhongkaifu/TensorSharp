@@ -849,6 +849,7 @@ namespace TensorSharp.Models
         /// bind them at the model's next entry. The bytes freed.</summary>
         private long DisposeSlotLater(Slot slot)
         {
+            using IDisposable toDriver = ReturningToDriver();
             if (slot.SharesRows)
             {
                 // A checkpoint: its states only (its rows are its holder's).

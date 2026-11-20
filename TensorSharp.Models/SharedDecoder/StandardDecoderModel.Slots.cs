@@ -712,6 +712,7 @@ namespace TensorSharp.Models
             }
             _idleSpareRefused = false;
             _slotMutationDepth++;
+            using IDisposable toDriver = ReturningToDriver();
             try
             {
                 ForgetGraphsOf(slot);
@@ -818,8 +819,11 @@ namespace TensorSharp.Models
                 ForgetGraphsOfGrowing(slot);
                 CopyRows(slot.K, k, slot.Length);
                 CopyRows(slot.V, v, slot.Length);
-                foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-                foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                using (ReturningToDriver())
+                {
+                    foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                    foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                }
                 Tensor[][] oldK = slot.K;
                 slot.K = k;
                 slot.V = v;
@@ -900,7 +904,7 @@ namespace TensorSharp.Models
                         Ops.Copy(dst, src);
                     }
                     InvalidateTensorDeviceCache(old[r]);
-                    old[r].Dispose();
+                    using (ReturningToDriver()) old[r].Dispose();   // no slot of the old capacity is coming
                     old[r] = null;
                     return grown;
                 }

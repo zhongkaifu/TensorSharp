@@ -448,6 +448,7 @@ namespace TensorSharp.Models
                     idle.Add(ring);
             idle.Sort((a, b) => a.LastUsed.CompareTo(b.LastUsed));
             long freed = 0;
+            using IDisposable toDriver = ReturningToDriver();
             foreach (DFlashRing ring in idle)
             {
                 if (freed >= bytes)
