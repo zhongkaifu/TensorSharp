@@ -1121,9 +1121,9 @@ namespace TensorSharp.Cli
                     string.IsNullOrEmpty(shipped) ? "the built-in renderer (the GGUF ships no template)" : $"the GGUF's template ({shipped.Length} chars)",
                     model.Config.Architecture ?? "unknown");
             }
-            imageMask.ValidateModel(model is TensorSharp.Models.QwenImage.QwenImageModel);
-            if (keepSourceSize && model is not TensorSharp.Models.QwenImage.QwenImageModel)
-                throw new ArgumentException("--keep-source-size requires a Qwen-Image-2.1 model.");
+            imageMask.ValidateModel(model is TensorSharp.Models.QwenImage.IImageGenerationModel { SupportsEditMask: true });
+            if (keepSourceSize && model is not TensorSharp.Models.QwenImage.IImageGenerationModel { SupportsImageEdit: true })
+                throw new ArgumentException("--keep-source-size requires an image model that edits (Qwen-Image-2.1, MiniMax-H3-Image).");
 
             // Speculator weights that ship as their own file (Gemma 4's
             // gemma4-assistant draft head, named with --draft-model) attach

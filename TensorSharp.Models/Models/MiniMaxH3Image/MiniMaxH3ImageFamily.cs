@@ -141,14 +141,18 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <c>&lt;Picture 1&gt;</c>'s exact size; otherwise <c>&lt;Picture 1&gt;</c>'s aspect at the request's target area, or
         /// without one its VAE copy's size (a 1024-2048 short edge). Below <see cref="MinGenerationArea"/> the picture samples
         /// on diffusers' larger canvas (get_image_canvas_size) and is resized back.
+        /// <para>A masked edit (section 4.5) returns its source canvas: the same rules give the whole picture's canvas, the
+        /// selection's crop (or the whole picture) samples at that canvas's density (<see cref="EditMask.SamplingDimensions"/>),
+        /// and the floor and the 20 MP ceiling then apply to what it samples, at the crop's aspect.</para>
         /// </summary>
         public DiffusionCanvas ResolveCanvas(DiffusionRequest request, EditMask mask)
         {
             ArgumentNullException.ThrowIfNull(request);
-            if (mask != null)
-                throw new ArgumentException($"{DisplayName} does not take an edit mask yet; send the edit without one.");
             if (request.References is not { Count: > 0 })
+            {
+                if (mask != null) throw new ArgumentException("A mask requires a first reference image to edit.");
                 return DiffusionCanvas.TextToImage(request, Geometry, DisplayName);
+            }
             RgbImage first = request.References[0].Image;
             int multiple = Geometry.SizeMultiple, width = request.Width, height = request.Height;
             if ((width > 0) != (height > 0))
@@ -175,6 +179,21 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 var (vw, vh) = MiniMaxH3ImageReferences.VaeCopySize(first.Width, first.Height);
                 width = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vw, multiple));
                 height = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vh, multiple));
+            }
+            if (mask != null)
+            {
+                var (cw, ch) = mask.SamplingDimensions(width, height, multiple);
+                var selection = EditCanvas(cw, ch, multiple);
+                if ((long)selection.Width * selection.Height > MaxEditArea)
+                {
+                    if (request.Width > 0)
+                        throw new ArgumentException(
+                            $"{DisplayName} edits at most {MaxEditArea / 1e6:F1} MP ({selection.Width}x{selection.Height} asked for the selection); ask for a smaller size.");
+                    double f = Math.Sqrt(MaxEditArea / ((double)selection.Width * selection.Height));
+                    selection = (Math.Max(multiple, (int)Math.Floor(selection.Width * f / multiple) * multiple),
+                                 Math.Max(multiple, (int)Math.Floor(selection.Height * f / multiple) * multiple));
+                }
+                return new DiffusionCanvas(selection, (mask.Source.Width, mask.Source.Height));
             }
             var sampling = EditCanvas(width, height, multiple);
             if ((long)sampling.Width * sampling.Height > MaxEditArea)

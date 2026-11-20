@@ -130,6 +130,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
         // ---- IImageGenerationModel ----
         string IImageGenerationModel.ImageModelFamily => ArchitectureId;
         public bool SupportsImageEdit => true;
+        public bool SupportsEditMask => true;
+        public long MinimumGenerationArea => MiniMaxH3ImageFamily.MinGenerationArea;
 
         /// <summary>
         /// One edit of up to 16 reference pictures, which the prompt names <c>&lt;Picture 1&gt;</c>, <c>&lt;Picture 2&gt;</c>, ...
@@ -138,7 +140,13 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// 32), <c>&lt;Picture 1&gt;</c>'s with keepSourceSize, or <c>&lt;Picture 1&gt;</c>'s aspect at the target area; below
         /// 2048 x 2048 it samples larger and is resized back. A seed draws the references' posterior samples, then the
         /// target's noise, then the references' augmentation, from one CPU torch generator (diffusers' order). Guidance is
-        /// 1, there is no negative prompt, and masks are not taken yet.
+        /// 1 and there is no negative prompt.
+        /// <para>A mask (<see cref="QwenImageParams.Mask"/>, <c>&lt;Picture 1&gt;</c>'s exact size, with its mode, invert,
+        /// feather and crop) limits the edit to its selection, TensorSharp's own method (docs/design/diffusion-runtime.md
+        /// section 4.5; upstream has none): the kept latent cells are re-noised from the picture's own latent after every
+        /// step and end on it, and the result is <c>&lt;Picture 1&gt;</c>'s canvas with every unselected pixel its own
+        /// bytes. <c>&lt;Picture 1&gt;</c> (or the selection's crop) is still a reference, so the model sees what it blends
+        /// with; the other pictures stay references.</para>
         /// </summary>
         public RgbImage EditImage(string prompt, IReadOnlyList<RgbImage> inputs, QwenImageParams p)
         {
@@ -166,10 +174,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 throw new ArgumentException("MiniMax-H3-Image is guidance-distilled: cfg must be 1 (or left unset).");
             if (!string.IsNullOrWhiteSpace(p.NegativePrompt))
                 throw new ArgumentException("MiniMax-H3-Image takes no negative prompt.");
-            if (p.Mask != null)
-                throw new ArgumentException(references.Count == 0
-                    ? "MiniMax-H3-Image takes no mask."
-                    : "MiniMax-H3-Image does not take an edit mask yet; send the edit without one.");
+            if (p.Mask != null && references.Count == 0)
+                throw new ArgumentException("A mask requires a first reference image to edit.");
             if (references.Count == 0 && p.KeepSourceSize)
                 throw new ArgumentException("keepSourceSize needs a reference image.");
             Action<int, int, RgbImage> onStep = p.OnStep;
@@ -182,6 +188,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 Height = p.Height,
                 TargetArea = p.TargetArea,
                 KeepSourceSize = p.KeepSourceSize,
+                Mask = references.Count == 0 ? null : QwenImageEditMask.Options(p),
                 Seed = p.Seed,
                 Steps = p.Steps,
                 Cfg = p.CfgScale,

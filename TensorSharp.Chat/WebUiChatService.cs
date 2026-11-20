@@ -1621,6 +1621,7 @@ namespace TensorSharp.Chat
                 {
                     if (generate) throw new WebUiRequestRejectedException(400, new { error = "A mask requires an input image." });
                     p.Mask = DecodeRequestImage(mask, "mask");
+                    p.MaskMode = OpenAIMaskMode(p.Mask);
                 }
                 return await RunImageEditAsync(model, prompt, p, generate ? new List<byte[]>() : images.ToList(), logger, generate,
                     null, image, cancellationToken);
@@ -1914,6 +1915,19 @@ namespace TensorSharp.Chat
             if (info.Length == 0 || info.Length > _uploads.MaxFileBytes)
                 throw new WebUiRequestRejectedException(400, new { error = "Mask is empty or exceeds the upload size limit." });
             p.Mask = DecodeRequestImage(await File.ReadAllBytesAsync(full, ct), "mask");
+        }
+
+        /// <summary>
+        /// How <c>/v1/images/edits</c> reads its <c>mask</c>: OpenAI's convention, where the fully transparent pixels are the
+        /// ones edited (alpha mode), for a mask with any pixel that is not opaque; a mask with no alpha, or an opaque one,
+        /// is read as the image routes' default, white edits and black keeps (grayscale).
+        /// </summary>
+        internal static TensorSharp.Models.QwenImage.QwenImageMaskMode OpenAIMaskMode(TensorSharp.Models.QwenImage.RgbImage mask)
+        {
+            ArgumentNullException.ThrowIfNull(mask);
+            return mask.Alpha != null && Array.Exists(mask.Alpha, a => a < 1f)
+                ? TensorSharp.Models.QwenImage.QwenImageMaskMode.Alpha
+                : TensorSharp.Models.QwenImage.QwenImageMaskMode.Grayscale;
         }
 
         private static TensorSharp.Models.QwenImage.RgbImage DecodeRequestImage(byte[] bytes, string field)

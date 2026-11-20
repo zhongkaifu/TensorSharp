@@ -166,10 +166,10 @@ namespace TensorSharp.Models.SharedDiffusion
                     var (w, h) = job.Canvas.Sampling;
                     LatentPosterior source = first != null && job.VaeCopies[0].Width == w && job.VaeCopies[0].Height == h
                         ? first
-                        : vae.Encode(ImageIO.Resize(job.Mask.Reference, w, h), ct);
+                        : vae.Encode(_family.ResizeOutput(job.Mask.Reference, w, h), ct);
                     if (source.Shape != job.Target)
                         throw new InvalidOperationException($"The mask's source encodes to {source.Shape}, not the target's {job.Target}.");
-                    sourceRows = _family.ToRows(new LatentTensor(job.Target, source.Mean));
+                    sourceRows = _family.ToRows(policy.SourceLatent(source));
                     (maskWeights, maskValues) = _family.MaskRows(job.Mask.LatentWeights(job.Target.Width, job.Target.Height), job.Target);
                 }
                 LeavePhase(DiffusionComponent.Vae, job.Demand(DiffusionPhase.EncodeReferences));
@@ -232,7 +232,7 @@ namespace TensorSharp.Models.SharedDiffusion
             // ---- Composite: the requested size, a masked edit's source canvas.
             clock.Restart();
             Report(request, new DiffusionProgress(DiffusionPhase.Composite));
-            RgbImage output = job.Mask != null ? job.Mask.Composite(image)
+            RgbImage output = job.Mask != null ? job.Mask.Composite(image, _family.ResizeOutput)
                 : image.Width == job.Canvas.Output.Width && image.Height == job.Canvas.Output.Height ? image
                 : _family.ResizeOutput(image, job.Canvas.Output.Width, job.Canvas.Output.Height);
             double compositeSeconds = clock.Elapsed.TotalSeconds;

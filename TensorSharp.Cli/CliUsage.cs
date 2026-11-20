@@ -653,7 +653,9 @@ namespace TensorSharp.Cli
                     "another model.",
                     "--qwen-image-variant turbo"),
                 new OptionHelp("--mask <file>",
-                    "Qwen-Image-2.1 local edit mask, matching the first --image dimensions. Unselected pixels and output size are preserved. Default: none.",
+                    "Local edit mask for Qwen-Image-2.1 or MiniMax-H3-Image, matching the first --image's dimensions (MiniMax-H3-Image's " +
+                    "<Picture 1>; later images stay references). Unselected pixels keep their exact bytes and the output keeps the " +
+                    "first image's size. Default: none.",
                     "--image photo.png --mask selection.png"),
                 new OptionHelp("--mask-mode <mode>",
                     "Mask convention: grayscale (default, white edits and black preserves) or alpha (transparent edits and opaque preserves).",
