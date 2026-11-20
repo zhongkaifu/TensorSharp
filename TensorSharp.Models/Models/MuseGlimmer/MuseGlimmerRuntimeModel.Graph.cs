@@ -34,8 +34,18 @@ namespace TensorSharp.Models
         /// write-back), ggml-cpu keeps the types it repacks apart; everything else (the IQ2_S pairs of the UD files on Metal and
         /// MLX) stays fused as legacy runs it. S7 measures it on Muse-Glimmer's quants.</summary>
         protected override bool KeepsGateUpApart(int gateType, int upType)
-            => (_backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */)
-               || (_backend == BackendType.GgmlCpu && gateType == upType && CpuRepacks(gateType));
+            => _gateUpApart is bool apart
+                ? apart && gateType == upType
+                : (_backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */)
+                  || (_backend == BackendType.GgmlCpu && gateType == upType && CpuRepacks(gateType));
+
+        /// <summary>Benchmarks (eng/validation/MuseGlimmerKvGrowProbe <c>--gate-up</c>): every same-type gate/up pair kept apart
+        /// (true) or fused (false) in place of <see cref="KeepsGateUpApart"/>'s rule, so both arms of that measurement run in one
+        /// binary. Set before the model is constructed; no option, switch or environment variable reaches it.</summary>
+        internal static readonly System.Threading.AsyncLocal<bool?> GateUpApartForTests = new();
+
+        // Read before the base constructor runs (field initializers do), as the weights are fused inside it.
+        private readonly bool? _gateUpApart = GateUpApartForTests.Value;
 
         /// <summary>The types ggml-cpu repacks (ggml_ops_cpu_graph.cpp repackable_type), when this build and machine repack.</summary>
         private static bool CpuRepacks(int ggmlType)

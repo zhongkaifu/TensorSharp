@@ -53,6 +53,19 @@ string family = Option("--family", "legacy");
 int benchPrefill = int.Parse(Option("--bench-prefill", "512"));
 int benchDecode = int.Parse(Option("--bench-decode", "128"));
 int benchRuns = int.Parse(Option("--bench-runs", "2"));
+// The runtime family's measured settings, for A/Bs in one binary (docs/design/muse-glimmer-unified.md stage S7); each is set
+// through the model's internal test seams before (or right after) it is constructed:
+//   --ring-step-rows N|linear  the rows a prompt step writes into a sliding-window ring (rings of align256(window + N) cells;
+//                              default 512), or linear caches for the sliding-window layers (no rings, unbounded steps);
+//   --gate-up apart|fused      every same-type ffn_gate/ffn_up pair kept apart or fused, in place of the family's rule;
+//   --no-prune                 a prompt step's last layer runs its feed-forward over every row (PrunesLastLayerRows off).
+// The concurrency reorder of the decode graphs is ggml-metal's own A/B switch, TS_METAL_GRAPH_OPTIMIZE=0.
+string? ringStepRows = Option("--ring-step-rows", null);
+string? gateUp = Option("--gate-up", null);
+bool noPrune = args.Contains("--no-prune");
+// --bench-refill: the bench prompt goes through ForwardRefill (the server's long-prompt entry: chunks of TS_PREFILL_CHUNK rows,
+// logits for the last token only) instead of one Forward, so a linear-cache arm steps the prompt as a ring arm does.
+bool benchRefill = args.Contains("--bench-refill");
 
 string[] scenarios = { "decode", "split", "snapshot", "truncate", "checkpoint", "slot-growth", "bench" };
 if (!scenarios.Contains(scenario))
@@ -61,6 +74,19 @@ if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
     throw new ArgumentException("Pass --model <Muse-Glimmer gguf> (or set TS_TEST_MUSE_GLIMMER_MODEL).");
 if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out BackendType backend))
     throw new ArgumentException($"Unknown backend '{backendName}'.");
+
+if (family != "runtime" && (ringStepRows != null || gateUp != null || noPrune))
+    throw new ArgumentException("--ring-step-rows, --gate-up and --no-prune set the runtime family's choices: pass --family runtime.");
+if (ringStepRows != null)
+    StandardDecoderModel.RingGeometryForTests.Value =
+        (ringStepRows == "linear" ? 1 << 24 : int.Parse(ringStepRows), StandardDecoderModel.RingAlignment);
+if (gateUp != null)
+    MuseGlimmerRuntimeModel.GateUpApartForTests.Value = gateUp switch
+    {
+        "apart" => true,
+        "fused" => false,
+        _ => throw new ArgumentException($"--gate-up {gateUp}: use apart or fused."),
+    };
 
 var load = Stopwatch.StartNew();
 // Released explicitly (and the backend shut down) at the end: ggml-metal asserts at
@@ -76,6 +102,7 @@ if (model.Config.Architecture != "muse-glimmer")
     throw new InvalidOperationException($"Expected a muse-glimmer model, got {model.Config.Architecture}.");
 var runtime = model as StandardDecoderModel;
 var slots = model as IBatchedPagedModel;
+if (noPrune) runtime!.LastLayerPruningDisabledForTests = true;
 Console.WriteLine($"[probe] family={family} ({model.GetType().Name}), loaded in {loadMs:F0} ms");
 if (runtime == null && scenario is "checkpoint" or "slot-growth")
     throw new ArgumentException($"--scenario {scenario} runs on the runtime family (per-request slots and checkpoints): pass --family runtime.");
@@ -350,11 +377,16 @@ void RunBench()
     for (int run = 0; run < benchRuns; run++)
     {
         model.ResetKVCache();
+        // The host's token embedding (the runtime's lookup and upload of each step's rows; legacy gathers in its graph on Metal
+        // and the CPU, so it counts little or nothing there): ModelBase's own embedding clock, read around each phase.
+        SetField(model, "_embTicks", 0L);
         var sw = Stopwatch.StartNew();
-        float[] logits = model.Forward(ids);
+        float[] logits = benchRefill ? model.ForwardRefill(ids) : model.Forward(ids);
         double prefillMs = sw.Elapsed.TotalMilliseconds;
+        double prefillEmbedMs = Field<long>(model, "_embTicks") * 1000.0 / Stopwatch.Frequency;
         int next = TopK(logits, Math.Min(vocab, logits.Length), 1)[0].Id;
         var produced = new int[benchDecode];
+        SetField(model, "_embTicks", 0L);
         sw.Restart();
         for (int i = 0; i < benchDecode; i++)
         {
@@ -363,13 +395,18 @@ void RunBench()
             next = TopK(logits, Math.Min(vocab, logits.Length), 1)[0].Id;
         }
         double decodeMs = sw.Elapsed.TotalMilliseconds;
+        double decodeEmbedMs = Field<long>(model, "_embTicks") * 1000.0 / Stopwatch.Frequency;
         double pp = benchPrefill / (prefillMs / 1000.0), tg = benchDecode > 0 ? benchDecode / (decodeMs / 1000.0) : 0;
         bestPp = Math.Max(bestPp, pp);
         bestTg = Math.Max(bestTg, tg);
         firstTokens ??= produced;
-        Console.WriteLine($"[probe] bench run {run + 1}/{benchRuns}: prefill {benchPrefill} tokens in {prefillMs:F0} ms ({pp:F1} tok/s); " +
-            $"decode {benchDecode} tokens in {decodeMs:F0} ms ({tg:F2} tok/s)");
-        runs.Add(new { PrefillMilliseconds = prefillMs, PrefillTokensPerSecond = pp, DecodeMilliseconds = decodeMs, DecodeTokensPerSecond = tg });
+        Console.WriteLine($"[probe] bench run {run + 1}/{benchRuns}: prefill {benchPrefill} tokens in {prefillMs:F0} ms ({pp:F1} tok/s; host embedding " +
+            $"{prefillEmbedMs:F1} ms); decode {benchDecode} tokens in {decodeMs:F0} ms ({tg:F2} tok/s; host embedding {decodeEmbedMs:F2} ms)");
+        runs.Add(new
+        {
+            PrefillMilliseconds = prefillMs, PrefillTokensPerSecond = pp, DecodeMilliseconds = decodeMs, DecodeTokensPerSecond = tg,
+            PrefillEmbeddingMilliseconds = prefillEmbedMs, DecodeEmbeddingMilliseconds = decodeEmbedMs,
+        });
     }
     Console.WriteLine($"[probe] bench best: pp{benchPrefill} {bestPp:F1} tok/s, tg{benchDecode} {bestTg:F2} tok/s ({family}, {backend})");
     Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
@@ -377,6 +414,14 @@ void RunBench()
     {
         Scenario = "bench", Family = family, ModelClass = model.GetType().Name, Backend = backend.ToString(), Model = Path.GetFullPath(modelPath),
         KvCacheDtype = model.KvCacheDtype.ToString(), ModelLoadMilliseconds = loadMs, PrefillTokens = benchPrefill, DecodeTokens = benchDecode,
+        Settings = new
+        {
+            RingCells = RingCells(), MaxSequenceStepRows = runtime?.MaxSequenceStepRows, RingStepRows = ringStepRows, GateUp = gateUp,
+            GateUpFusedLayers = (Field<bool[]>(model, "_gateUpFused") ?? Array.Empty<bool>()).Count(f => f),
+            PrunesLastLayer = runtime != null ? !noPrune : (bool?)null, BenchRefill = benchRefill,
+            TS_METAL_GRAPH_OPTIMIZE = Environment.GetEnvironmentVariable("TS_METAL_GRAPH_OPTIMIZE"),
+            TS_PREFILL_CHUNK = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK"),
+        },
         BestPrefillTokensPerSecond = bestPp, BestDecodeTokensPerSecond = bestTg, Runs = runs, FirstRunDecodeTokens = firstTokens,
     }));
 }
@@ -514,6 +559,15 @@ static T Field<T>(object target, string name)
         if (field != null) return (T)field.GetValue(target)!;
     }
     return default!;
+}
+
+static void SetField(object target, string name, object value)
+{
+    for (var type = target.GetType(); type != null; type = type.BaseType)
+    {
+        var field = type.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        if (field != null) { field.SetValue(target, value); return; }
+    }
 }
 
 static void Require(bool condition, string message)

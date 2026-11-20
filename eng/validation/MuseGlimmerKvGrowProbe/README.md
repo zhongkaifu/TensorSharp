@@ -80,6 +80,21 @@ $P --model $M --backend ggml_metal --family runtime --scenario bench --bench-pre
 Useful A/B knobs (read at model construction): `MAX_CONTEXT`, `TS_KV_INITIAL_TOKENS`,
 `TS_MUSE_GLIMMER_SWA_RING=0` (uniform caches).
 
+The runtime family's measured settings (stage S7 of the design) take an arm each, through the model's internal test seams,
+so both sides of an A/B run in one binary:
+
+| Option | Arm |
+|---|---|
+| `--ring-step-rows N` | the rows a prompt step writes into a sliding-window ring: rings of align256(window + N) cells and steps of at most N rows (the runtime's 512 by default; legacy's chunks are 2048 rows over 4352-row rings) |
+| `--ring-step-rows linear` | linear caches on the sliding-window layers (no rings); with `--bench-refill` and `TS_PREFILL_CHUNK=512` the prompt still runs in 512-row steps |
+| `--gate-up apart\|fused` | every same-type `ffn_gate`/`ffn_up` pair kept apart or fused, in place of the family's per-backend rule |
+| `--no-prune` | a prompt step's last layer runs its feed-forward over every row (`PrunesLastLayerRows` off) |
+| `--bench-refill` | the bench prompt goes through `ForwardRefill` (chunks of `TS_PREFILL_CHUNK` rows, the last token's logits only) instead of one `Forward` |
+| `TS_METAL_GRAPH_OPTIMIZE=0` (environment) | ggml-metal's concurrency reorder off (the runtime reorders its decode graphs; legacy its persistent decode graph) |
+
+The bench report records each run's host embedding time (`PrefillEmbeddingMilliseconds`, `DecodeEmbeddingMilliseconds`: the
+runtime looks a step's rows up on the host and uploads them) and the settings it ran with (`Settings`).
+
 `compare.py` prints argmax agreement and (with `--logits`) cosine similarity before and
 after each `--mark` position and exits 1 on any argmax difference or a cosine below
 `--min-cos`. `webui_chat_e2e.py` drives a running `TensorSharp.Server.Host` through the
