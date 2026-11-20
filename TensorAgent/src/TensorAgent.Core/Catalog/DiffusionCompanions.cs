@@ -51,6 +51,11 @@ public static class DiffusionCompanions
         // A folder, not a file: MiniMaxH3TextEncoder reads vocab.json, merges.txt and
         // tokenizer_config.json from it.
         (CatalogFamily.MiniMaxH3, CatalogFileRole.Tokenizer, "TS_VIDEO_TOKENIZER"),
+        // MiniMax-H3-Image reads the same three (MiniMaxH3ImageDiffusionModel, MiniMaxH3TextEncoder): its text
+        // encoder and tokenizer are MiniMax-H3's, and its image VAE takes the companion VAE's variable.
+        (CatalogFamily.MiniMaxH3Image, CatalogFileRole.TextEncoder, "TS_VIDEO_TEXT_ENCODER"),
+        (CatalogFamily.MiniMaxH3Image, CatalogFileRole.Vae, "TS_VIDEO_VAE"),
+        (CatalogFamily.MiniMaxH3Image, CatalogFileRole.Tokenizer, "TS_VIDEO_TOKENIZER"),
         (CatalogFamily.Wan, CatalogFileRole.TextEncoder, "TS_VIDEO_TEXT_ENCODER"),
         (CatalogFamily.Wan, CatalogFileRole.Vae, "TS_VIDEO_VAE"),
         (CatalogFamily.Wan, CatalogFileRole.SecondaryWeights, "TS_VIDEO_DIT2"),
@@ -71,20 +76,12 @@ public static class DiffusionCompanions
     /// <param name="store">Where this installation keeps its models.</param>
     public static IReadOnlyDictionary<string, string> Publish(CatalogModel? model, ModelStore store)
     {
-        ArgumentNullException.ThrowIfNull(store);
-
         var published = new Dictionary<string, string>(StringComparer.Ordinal);
-        // Several families share the video variables. Resolve the selected family first,
-        // then write each variable once so another family's row cannot clear its path.
-        foreach (var group in Published.GroupBy(p => p.Variable))
+        foreach ((string variable, string? path) in Resolve(model, store))
         {
-            string? path = null;
-            if (model is not null)
-                foreach (var entry in group.Where(p => p.Family == model.Family))
-                    path = PathOf(model, entry.Role, store);
-            Environment.SetEnvironmentVariable(group.Key, path);
+            Environment.SetEnvironmentVariable(variable, path);
             if (path is not null)
-                published[group.Key] = path;
+                published[variable] = path;
         }
         // Which checkpoint a Qwen-Image entry's weights are (CatalogModel.ImageVariant): the
         // GGUF cannot say, and without it the engine guesses from the file name. Written for
@@ -94,6 +91,27 @@ public static class DiffusionCompanions
         if (variant is not null)
             published[QwenImageVariantFlag.EnvironmentVariable] = variant;
         return published;
+    }
+
+    /// <summary>
+    /// What <see cref="Publish"/> writes, without writing it: every companion variable, to the installed path
+    /// <paramref name="model"/>'s family reads from it, or to null where it has none (the variable is cleared).
+    /// </summary>
+    public static IReadOnlyDictionary<string, string?> Resolve(CatalogModel? model, ModelStore store)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        var resolved = new Dictionary<string, string?>(StringComparer.Ordinal);
+        // Several families share the video variables. Resolve the selected family first,
+        // then write each variable once so another family's row cannot clear its path.
+        foreach (var group in Published.GroupBy(p => p.Variable))
+        {
+            string? path = null;
+            if (model is not null)
+                foreach (var entry in group.Where(p => p.Family == model.Family))
+                    path = PathOf(model, entry.Role, store);
+            resolved[group.Key] = path;
+        }
+        return resolved;
     }
 
     private static string? PathOf(CatalogModel model, CatalogFileRole role, ModelStore store)

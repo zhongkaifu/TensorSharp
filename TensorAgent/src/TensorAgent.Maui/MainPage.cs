@@ -531,7 +531,16 @@ public sealed class MainPage : ContentPage
                 + (status.Error is { Length: > 0 } error ? " · " + error : string.Empty));
         };
 
-        _host.App.Downloads.Start(model, Core.Downloads.ModelDownloadManager.OptionalRolesFor(false));
+        try
+        {
+            _host.App.Downloads.Start(model, Core.Downloads.ModelDownloadManager.OptionalRolesFor(false));
+        }
+        catch (Core.Catalog.LicenseAcceptanceRequiredException ex)
+        {
+            // This hook never answers a license for the user: accept it on the Models page first.
+            Console.WriteLine($"TensorAgent: download FAIL {ex.Message}");
+            return;
+        }
         Console.WriteLine($"TensorAgent: download started {model.Id}, stopping after {seconds}s");
         _ = Task.Run(async () =>
         {

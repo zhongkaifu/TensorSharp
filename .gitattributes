@@ -12,3 +12,6 @@ Dockerfile* text eol=lf
 # PDF fixtures are hash-pinned embedded resources, even when their bytes look
 # like text. core.autocrlf must not rewrite their streams or xref offsets.
 InferenceWeb.Tests/Fixtures/Knowledge/*.pdf -text
+# Third-party license texts the app ships verbatim: the catalog pins each by the SHA-256
+# of its bytes (CatalogLicenseTerms.Revision), so no checkout may rewrite their line endings.
+TensorAgent/src/TensorAgent.Core/Catalog/Licenses/*.txt -text

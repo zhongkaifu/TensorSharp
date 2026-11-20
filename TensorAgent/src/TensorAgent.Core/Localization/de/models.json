@@ -90,5 +90,13 @@
   "models.alert.delete.message": "{model} von diesem Gerät entfernen? Es kann erneut heruntergeladen werden.",
   "models.alert.delete.messageLocal": "{model} von diesem Gerät entfernen? Zum Wiederherstellen musst du die ursprüngliche lokale GGUF-Datei erneut auswählen.",
   "models.alert.delete.confirm": "Löschen",
-  "models.action.unavailable": "Nicht verfügbar"
+  "models.action.unavailable": "Nicht verfügbar",
+  "models.license.title": "Lizenzbedingungen",
+  "models.license.intro": "{model} steht unter der {license}. Lies die Bedingungen unten: Der Download beginnt nur, wenn du sie akzeptierst.",
+  "models.license.changed": "Die Bedingungen haben sich geändert, seit du sie zuletzt akzeptiert hast.",
+  "models.license.summary": "Zusammenfassung",
+  "models.license.fullText": "Vollständiger Lizenztext (Englisch, wie veröffentlicht)",
+  "models.license.open": "Lizenz auf Hugging Face öffnen",
+  "models.license.accept": "Akzeptieren und herunterladen",
+  "models.license.decline": "Ablehnen"
 }

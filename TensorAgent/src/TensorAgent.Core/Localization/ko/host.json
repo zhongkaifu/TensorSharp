@@ -75,5 +75,8 @@
   "host.engine.unknown": "알 수 없음",
   "host.video.keyframesUnavailable": "이 동영상 모델은 임의 프레임 위치의 이미지 키프레임을 지원하지 않습니다.",
   "host.video.ingredientsUnavailable": "Ingredients 인물·사물 참조에는 IC-LoRA 체크포인트가 필요합니다. LTX 2.5 Distilled에서는 이미지 키프레임을 사용하세요.",
-  "host.video.invalidFrames": "LTX 프레임 수는 양수이며 8n+1 형식이어야 합니다."
+  "host.video.invalidFrames": "LTX 프레임 수는 양수이며 8n+1 형식이어야 합니다.",
+  "host.license.required": "{model}은(는) 라이선스 조건({license})에 동의해야 다운로드됩니다.",
+  "host.license.changed": "{model}의 라이선스 조건이 변경되었습니다. 다시 읽고 현재 버전에 동의하세요.",
+  "host.license.notRequired": "{model}에는 동의할 라이선스 조건이 없습니다."
 }

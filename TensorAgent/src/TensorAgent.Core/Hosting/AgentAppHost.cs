@@ -125,7 +125,10 @@ public sealed class AgentAppHost : IDisposable
         // native screens and the page -- is in the language the user gets.
         Localization.Loc.Apply(settings);
 
-        Models = new ModelStore(paths.ResolveModelsDirectory(settings));
+        // What the user agreed to before a download that asks (CatalogModel.LicenseTerms), kept with the app's
+        // data rather than beside the models: a purge of the model cache must not forget it.
+        Licenses = new LicenseAcceptanceStore(paths.LicenseAcceptancesFile);
+        Models = new ModelStore(paths.ResolveModelsDirectory(settings)) { Licenses = Licenses };
         // Weights whose catalog entry is gone -- the previous quantization of an entry
         // that now points at a different file. Nothing else can reach them: the Models
         // list is built from the catalog, so a directory no entry claims has no row and
@@ -452,6 +455,8 @@ public sealed class AgentAppHost : IDisposable
     public AgentPaths Paths { get; }
     public SettingsStore Settings { get; }
     public ModelStore Models { get; }
+    /// <summary>The license terms the user accepted, per entry and revision (see <see cref="CatalogLicenseTerms"/>).</summary>
+    public LicenseAcceptanceStore Licenses { get; }
     /// <summary>Every model download this launch started, independent of any screen.</summary>
     public ModelDownloadManager Downloads { get; }
     /// <summary>The LoRA plug-ins on this device (<see cref="LoraCatalog"/>).</summary>
@@ -3542,6 +3547,8 @@ public sealed record AgentPaths(string DataRoot, string CacheRoot)
     /// <summary>The App Group inbox shared with the iOS extension, or empty.</summary>
     public string SharedInboxDirectory { get; init; } = string.Empty;
     public string SettingsFile => Path.Combine(DataRoot, "settings.json");
+    /// <summary>The license terms the user accepted before a download (<see cref="LicenseAcceptanceStore"/>).</summary>
+    public string LicenseAcceptancesFile => Path.Combine(DataRoot, "license-acceptances.json");
 
     public void EnsureCreated()
     {

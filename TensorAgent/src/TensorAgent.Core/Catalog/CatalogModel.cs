@@ -97,6 +97,9 @@ public enum CatalogFamily
     // Append new families: the numeric values are part of persisted catalog data.
     Gemma4, Qwen35, Qwen36, Qwen38, QwenImage, GptOss, Bonsai, MuseGlimmer, MiniMaxH3, Qwen38FlashNext,
     DeepSeek4, DeepSeek41, Glm5, Nemotron, Mistral3, HunyuanDense, DiffusionGemma, Wan, Ltx25,
+    /// <summary>MiniMax-H3-Image: pictures and edits from MiniMax-H3's DiT without its audio stream.
+    /// A family of its own, not <see cref="MiniMaxH3"/>: it makes pictures, not clips, and reads another VAE.</summary>
+    MiniMaxH3Image,
 }
 
 /// <summary>Dense or mixture-of-experts.</summary>
@@ -261,6 +264,12 @@ public sealed record CatalogModel
     public string? Notes { get => CatalogText.Read(_notes); init => _notes = value; }
     public required string License { get => CatalogText.Read(_license); init => _license = value; }
     /// <summary>
+    /// Terms that must be accepted before this entry's first download, or null for an entry whose license
+    /// asks nothing of the app beyond naming it (every entry but MiniMax-H3-Image's). See
+    /// <see cref="CatalogLicenseTerms"/> and <see cref="LicenseAcceptanceStore"/>.
+    /// </summary>
+    public CatalogLicenseTerms? LicenseTerms { get; init; }
+    /// <summary>
     /// Bytes of the weights the engine reads from the SSD on demand instead of holding them
     /// resident: zero for every entry whose weights a token reads in full. Qwen3.8 Flash Next
     /// declares its n-gram table (a token reads 16 of its 320 M rows) and the routed experts
@@ -281,7 +290,7 @@ public sealed record CatalogModel
     public long TotalBytesWithOptional => Files.Sum(f => f.Bytes);
     public CatalogFile Weights => Files.First(f => f.Role == CatalogFileRole.Weights);
     public CatalogFile? Projector => Files.FirstOrDefault(f => f.Role == CatalogFileRole.Projector);
-    public bool IsImageGenerator => Family == CatalogFamily.QwenImage;
+    public bool IsImageGenerator => Family is CatalogFamily.QwenImage or CatalogFamily.MiniMaxH3Image;
 
     /// <summary>
     /// For a Qwen-Image entry, which 2.1 checkpoint its weights are. The GGUFs name at most their

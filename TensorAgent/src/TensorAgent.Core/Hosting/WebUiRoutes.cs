@@ -510,6 +510,19 @@ public static partial class WebUiRoutes
                 }, 409));
             }
 
+            // An entry whose license must be accepted first (CatalogModel.LicenseTerms) answers with its terms
+            // instead of starting: the caller shows them and posts the answer to .../license, then asks again.
+            if (models.NeedsLicenseAcceptance(model))
+            {
+                return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new
+                {
+                    error = Loc.T("host.license.required", ("model", model.DisplayName), ("license", model.LicenseTerms!.Title)),
+                    licenseRequired = true,
+                    id = model.Id,
+                    license = DescribeTerms(model, models),
+                }, 409));
+            }
+
             IReadOnlyCollection<CatalogFileRole>? optional = OptionalRoles(settings);
             if (downloads is null)
             {
@@ -522,6 +535,63 @@ public static partial class WebUiRoutes
             downloads.Start(model, optional);
             return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Sse(
                 WatchFrames(downloads, model.Id, ct), request.Cancellation));
+        });
+
+        // The terms of an entry that asks for them before its download, with the full text, verbatim.
+        server.MapGet("/api/agent/catalog/{id}/license", (request, _) =>
+        {
+            CatalogModel? model = Find(request.RouteValues["id"]);
+            if (model is null)
+                return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new { error = Loc.T("host.models.notFound") }, 404));
+            if (model.LicenseTerms is not { } terms)
+            {
+                return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new
+                {
+                    error = Loc.T("host.license.notRequired", ("model", model.DisplayName)),
+                }, 404));
+            }
+            return Ok(new { id = model.Id, license = DescribeTerms(model, models), text = terms.ReadText() });
+        });
+
+        // The user's answer to those terms: { "revision": "<the revision shown>", "accept": true|false }. An
+        // acceptance is recorded for that entry and revision only, and refused when the revision is not the
+        // current one (the terms changed under the screen that showed them). A decline withdraws any acceptance
+        // of the current revision and stops the entry's running download, so the next one asks again.
+        server.MapPost("/api/agent/catalog/{id}/license", async (request, ct) =>
+        {
+            CatalogModel? model = Find(request.RouteValues["id"]);
+            if (model is null)
+                return LoopbackResponse.Json(new { error = Loc.T("host.models.notFound") }, 404);
+            if (model.LicenseTerms is null)
+                return LoopbackResponse.Json(new { error = Loc.T("host.license.notRequired", ("model", model.DisplayName)) }, 404);
+            LicenseAcceptanceStore licenses = models.Licenses
+                ?? throw new InvalidOperationException("This host keeps no license acceptances.");
+            JsonElement body = await request.ReadJsonAsync(ct);
+            bool accept = body.ValueKind == JsonValueKind.Object
+                && body.TryGetProperty("accept", out JsonElement acceptValue) && acceptValue.ValueKind == JsonValueKind.True;
+            if (!accept)
+            {
+                licenses.Decline(model);
+                bool cancelled = downloads?.Cancel(model.Id) ?? false;
+                return LoopbackResponse.Json(new { id = model.Id, accepted = false, cancelled, license = DescribeTerms(model, models) });
+            }
+            string? revision = body.TryGetProperty("revision", out JsonElement revisionValue) && revisionValue.ValueKind == JsonValueKind.String
+                ? revisionValue.GetString() : null;
+            if (!string.Equals(revision, model.LicenseTerms.Revision, StringComparison.Ordinal))
+            {
+                return LoopbackResponse.Json(new
+                {
+                    error = Loc.T("host.license.changed", ("model", model.DisplayName)),
+                    id = model.Id,
+                    license = DescribeTerms(model, models),
+                }, 409);
+            }
+            LicenseAcceptance accepted = licenses.Accept(model, revision!);
+            return LoopbackResponse.Json(new
+            {
+                id = model.Id, accepted = true, revision = accepted.Revision, acceptedAt = accepted.AcceptedAt,
+                license = DescribeTerms(model, models),
+            });
         });
 
         // Stopping is now something a caller has to ASK for, which is the other half of
@@ -772,6 +842,19 @@ public static partial class WebUiRoutes
         }
     }
 
+    /// <summary>An entry's license terms as the routes report them, or null when it declares none.</summary>
+    private static object? DescribeTerms(CatalogModel model, ModelStore store) => model.LicenseTerms is not { } terms ? null : new
+    {
+        id = terms.Id,
+        revision = terms.Revision,
+        title = terms.Title,
+        summary = terms.Summary,
+        url = terms.Url,
+        accepted = store.Licenses?.IsAccepted(model) ?? false,
+        // Accepted at an earlier revision: the terms changed since, which the screen that asks again says.
+        changedSinceAccepted = store.Licenses?.AcceptedAnEarlierRevision(model) ?? false,
+    };
+
     private static object Frame(ModelDownloadProgress value) => new
     {
         file = value.FileName,
@@ -846,6 +929,9 @@ public static partial class WebUiRoutes
         quantization = model.Quantization,
         notes = model.Notes,
         license = model.License,
+        // Null for an entry that asks nothing before it downloads; otherwise its terms and whether the user
+        // has accepted their current revision.
+        licenseTerms = DescribeTerms(model, store),
         // The window a load on THIS device gets when the user has not chosen one: a
         // desktop's is larger than the phone's (EngineMemoryPolicy.DefaultContextLength).
         contextLength = EngineMemoryPolicy.DefaultContextLength(model, device),

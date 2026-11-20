@@ -75,5 +75,8 @@
   "host.engine.unknown": "unbekannt",
   "host.video.keyframesUnavailable": "Dieses Videomodell unterstützt keine Bildvorlagen an beliebigen Zeitpunkten.",
   "host.video.ingredientsUnavailable": "Ingredients-Identitätsreferenzen benötigen einen IC-LoRA-Checkpoint; nutzen Sie Bildvorlagen mit LTX 2.5 Distilled.",
-  "host.video.invalidFrames": "Die LTX-Cliplänge muss positiv sein und dem Bildraster 8n+1 entsprechen."
+  "host.video.invalidFrames": "Die LTX-Cliplänge muss positiv sein und dem Bildraster 8n+1 entsprechen.",
+  "host.license.required": "{model} wird erst heruntergeladen, wenn du seine Lizenzbedingungen akzeptierst ({license}).",
+  "host.license.changed": "Die Lizenzbedingungen von {model} haben sich geändert. Lies sie erneut und akzeptiere die aktuelle Fassung.",
+  "host.license.notRequired": "Für {model} sind keine Lizenzbedingungen zu akzeptieren."
 }
