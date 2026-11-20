@@ -651,13 +651,9 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Bilinearly resize the learned [posGrid * posGrid, hidden] position table
-        /// to the image's patch grid, emitting the rows in sparse-window order.
-        ///
-        /// Ported from ggml_compute_forward_upscale_f32's GGML_SCALE_MODE_BILINEAR
-        /// branch (no antialias, no align-corners flag), which uses half-pixel
-        /// centres: sf = out / in, src = (dst + 0.5) / sf - 0.5, floor, clamp BOTH
-        /// neighbours to [0, in - 1] and only THEN take the fraction against the
-        /// clamped low index (clamped again to [0, 1]).
+        /// to the image's patch grid, emitting the rows in sparse-window order: the
+        /// table read transposed to the grid, as the model was trained
+        /// (<see cref="MuseGlimmerVisionGrid.ResamplePositionTable"/>).
         /// </summary>
         private unsafe Tensor GetOrCreatePositionEmbedding(Geometry geo)
         {
@@ -665,81 +661,10 @@ namespace TensorSharp.Models
             if (_positionEmbeddingCache.TryGetValue(key, out var cached))
                 return cached;
 
-            int numTokens = geo.NumTokens;
-            int hiddenSize = _hiddenSize;
-            int side = _posGridPerSide;
-            int gridW = geo.GridW;
-
-            cached = new Tensor(_allocator, DType.Float32, numTokens, hiddenSize);
+            cached = new Tensor(_allocator, DType.Float32, geo.NumTokens, _hiddenSize);
             float* tablePtr = GetFloatPtr(_weights[PositionEmbedName]);
-
-            float sfx = (float)geo.GridW / side;
-            float sfy = (float)geo.GridH / side;
-            int vLen = Vector<float>.Count;
-
             using (var staging = new HostStaging(this, cached, _cudaDirect))
-            {
-                float* dstPtr = staging.Ptr;
-                fixed (int* orderSrc = geo.SpPerm)
-                {
-                    long tableL = (long)tablePtr;
-                    long dstL = (long)dstPtr;
-                    long orderL = (long)orderSrc;
-
-                    Parallel.For(0, numTokens, i =>
-                    {
-                        float* table = (float*)tableL;
-                        float* dstRow = (float*)dstL + (long)i * hiddenSize;
-                        int* order = (int*)orderL;
-
-                        int raster = order[i];
-                        int gy = raster / gridW;
-                        int gx = raster - gy * gridW;
-
-                        float xf = ((float)gx + 0.5f) / sfx - 0.5f;
-                        int x0 = (int)MathF.Floor(xf);
-                        int x1 = x0 + 1;
-                        x0 = Math.Max(0, Math.Min(x0, side - 1));
-                        x1 = Math.Max(0, Math.Min(x1, side - 1));
-                        float dx = Math.Clamp(xf - x0, 0f, 1f);
-
-                        float yf = ((float)gy + 0.5f) / sfy - 0.5f;
-                        int y0 = (int)MathF.Floor(yf);
-                        int y1 = y0 + 1;
-                        y0 = Math.Max(0, Math.Min(y0, side - 1));
-                        y1 = Math.Max(0, Math.Min(y1, side - 1));
-                        float dy = Math.Clamp(yf - y0, 0f, 1f);
-
-                        float w00 = (1f - dx) * (1f - dy);
-                        float w10 = dx * (1f - dy);
-                        float w01 = (1f - dx) * dy;
-                        float w11 = dx * dy;
-
-                        float* p00 = table + (long)(y0 * side + x0) * hiddenSize;
-                        float* p10 = table + (long)(y0 * side + x1) * hiddenSize;
-                        float* p01 = table + (long)(y1 * side + x0) * hiddenSize;
-                        float* p11 = table + (long)(y1 * side + x1) * hiddenSize;
-
-                        var v00 = new Vector<float>(w00);
-                        var v10 = new Vector<float>(w10);
-                        var v01 = new Vector<float>(w01);
-                        var v11 = new Vector<float>(w11);
-
-                        int d = 0;
-                        for (; d <= hiddenSize - vLen; d += vLen)
-                        {
-                            var a = TensorComputePrimitives.LoadVector(p00 + d);
-                            var b = TensorComputePrimitives.LoadVector(p10 + d);
-                            var c = TensorComputePrimitives.LoadVector(p01 + d);
-                            var e = TensorComputePrimitives.LoadVector(p11 + d);
-                            TensorComputePrimitives.StoreVector(dstRow + d,
-                                a * v00 + b * v10 + c * v01 + e * v11);
-                        }
-                        for (; d < hiddenSize; d++)
-                            dstRow[d] = w00 * p00[d] + w10 * p10[d] + w01 * p01[d] + w11 * p11[d];
-                    });
-                }
-            }
+                MuseGlimmerVisionGrid.ResamplePositionTable(tablePtr, _posGridPerSide, _hiddenSize, geo.GridW, geo.GridH, geo.SpPerm, staging.Ptr);
 
             _positionEmbeddingCache[key] = cached;
             return cached;

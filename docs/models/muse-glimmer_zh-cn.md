@@ -86,6 +86,12 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   平局时偏向更多 token，上限 4096 个合并 token），然后用与 Pillow 兼容的
   **Lanczos-3** 滤波把图像缩放到 `grid * 28` 像素，并用 mmproj 的
   `image_mean` / `image_std`（0.5 / 0.5）归一化。
+* **位置网格按转置读取。** 可学习的 32x32 位置表先以交换后的两轴做双线性重采样
+  （半像素中心），再按光栅顺序读取：`gridW x gridH` 网格中的 patch `t` 取表的第
+  `t / gridH` 行（该轴拉伸到 `gridW`）、第 `t % gridH` 列。模型就是这样训练的
+  （参考实现把 `meshgrid(..., indexing="xy")` 传给 `grid_sample`）；HF transformers
+  （#50847）和 llama.cpp（#32433，自 d3c3e242c 起）都这样读取。正方形网格不受影响；
+  不转置的读法在其他所有网格上都是错的。
 * **稀疏窗口注意力。** patch 被重排进 32x32 的窗口（窗口边长为
   `sqrt(position_embd_rows)`），边缘窗口裁剪。满足 `(il + 1) % 4 == 0` 或
   `il == n_layer - 1` 的层做全局注意力，其余层只在窗口内注意。由于该重排让掩码

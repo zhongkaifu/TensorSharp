@@ -109,6 +109,13 @@ approximation), learned 32x32 position embedding.
   merged tokens), then the image is resized to `grid * 28` px with a
   Pillow-compatible **Lanczos-3** filter and normalized with the mmproj's
   `image_mean` / `image_std` (0.5 / 0.5).
+* **Position grid read transposed.** The learned 32x32 table is bilinearly
+  resampled (half-pixel centres) to the grid with its axes swapped, then read in
+  raster order: patch `t` of a `gridW x gridH` grid takes the table's row
+  `t / gridH` (that axis stretched over `gridW`) and column `t % gridH`. The model
+  was trained so (the reference feeds `grid_sample` a `meshgrid(..., indexing="xy")`);
+  HF transformers (#50847) and llama.cpp (#32433, since d3c3e242c) read it this way.
+  Square grids are unaffected; the untransposed order is wrong on every other grid.
 * **Sparse window attention.** Patches are permuted into 32x32 windows (the
   window side is `sqrt(position_embd_rows)`), edge windows clipped. Layers where
   `(il + 1) % 4 == 0` or `il == n_layer - 1` attend globally; the rest attend
