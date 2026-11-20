@@ -45,6 +45,10 @@ public sealed class MiniMaxH3ImageResidencyTests
     /// <summary>MiniMaxH3ImageDenoiser.WeightBytes of the bf16 safetensors and the unsloth Q8_0 and Q4_K_M GGUFs.</summary>
     private const long DitBf16 = 40_233_055_464, DitQ8 = 22_025_181_184, DitQ4 = 12_719_540_224;
 
+    /// <summary>The same for the unsloth Q3_K_M, UD-Q4_K_XL, Q5_K_M and Q6_K GGUFs (each file's tensor bytes plus the vectors'
+    /// F32 widening, the offset that gives Q4_K_M's and Q8_0's figures above).</summary>
+    private const long DitQ3 = 10_420_676_608, DitUd = 13_605_849_088, DitQ5 = 14_597_527_552, DitQ6 = 16_594_130_944;
+
     /// <summary>MiniMaxH3ImageVaeCodec.WeightBytes of minimax_h3_image_vae_fp16.safetensors (the decoder only).</summary>
     private const long VaeBytes = 808_632_544;
 
@@ -60,8 +64,8 @@ public sealed class MiniMaxH3ImageResidencyTests
     private static DiffusionWorkload Workload(int side) =>
         new(new LatentShape(24, 1, side / 16, side / 16), Array.Empty<LatentShape>(), Portrait);
 
-    private static long DenoiserWorking(int side, bool fused, bool quantized) =>
-        MiniMaxH3ImageDenoiser.WorkingBytesFor(Dit, MiniMaxH3ImageDenoiser.RowsOf(Workload(side)), fused, quantized);
+    private static long DenoiserWorking(int side, bool fused, bool quantized, bool bf16Route = true) =>
+        MiniMaxH3ImageDenoiser.WorkingBytesFor(Dit, MiniMaxH3ImageDenoiser.RowsOf(Workload(side)), fused, quantized, bf16Route);
 
     private static long ConditionerWorking => MiniMaxH3ImageConditioner.WorkingBytesFor(TextEncoder, Portrait);
 
@@ -84,6 +88,16 @@ public sealed class MiniMaxH3ImageResidencyTests
                 "A red paper lantern glowing in a snowy courtyard at dusk, a wooden sign that reads \"冬至\", and above the door a painted shop banner that reads \"WINTER SOLSTICE TEA HOUSE\"")),
             fused: false, quantized: true) },
         new object[] { "M5 Pro Q8_0 2048 decode", 167L, VaeWorking(2048) },
+        // ggml_cuda, RTX A4500 20 GB (09bd25fd, defaults): the denoise's peak per nvidia-smi less the context (191 MiB) and the
+        // DiT. Files with Q4_K projections take their cuBLAS BF16 route; Q6_K is all MMQ (no BF16 activation copies).
+        new object[] { "A4500 Q4_K_M 4096 denoise", 5984L, DenoiserWorking(4096, fused: true, quantized: true) },
+        new object[] { "A4500 Q4_K_M 4480 denoise", 7028L, DenoiserWorking(4480, fused: true, quantized: true) },
+        new object[] { "A4500 Q3_K_M 4480 denoise", 6964L, DenoiserWorking(4480, fused: true, quantized: true) },
+        new object[] { "A4500 UD-Q4_K_XL 4096 denoise", 5918L, DenoiserWorking(4096, fused: true, quantized: true) },
+        new object[] { "A4500 Q5_K_M 3840 denoise", 5313L, DenoiserWorking(3840, fused: true, quantized: true) },
+        new object[] { "A4500 Q6_K 2880 denoise", 2843L, DenoiserWorking(2880, fused: true, quantized: true, bf16Route: false) },
+        new object[] { "A4500 Q6_K 3072 denoise", 3175L, DenoiserWorking(3072, fused: true, quantized: true, bf16Route: false) },
+        new object[] { "A4500 Q6_K 3328 denoise", 3643L, DenoiserWorking(3328, fused: true, quantized: true, bf16Route: false) },
     };
 
     /// <summary>An estimate never falls short of what was measured (the plan would then overcommit the device), and stays
@@ -110,13 +124,22 @@ public sealed class MiniMaxH3ImageResidencyTests
     /// <summary>The 48 GB M5 Pro's Metal recommended working set (40,200.90 MB), nothing allocated yet.</summary>
     private static readonly long M5Pro = 40_200_900_000L - Math.Max(512 * MiB, 40_200_900_000L / 16);
 
+    /// <summary>The RTX A4500 20 GB (ggml reports 20,044 MiB; the CUDA context 191 MiB).</summary>
+    private static readonly long A4500 = CudaBudget(20044, 191);
+
+    // ---- what each device can give a phase at most (free bytes with no headroom): the refusal's capacity
+
+    private static readonly long A40Free = (46068 - 271) * MiB, H100Free = (95830 - 271) * MiB, A4500Free = (20044 - 191) * MiB;
+    private const long M5ProFree = 40_200_900_000L;
+
     private static ResidencyPlan Plan(long ditBytes, int side, bool fused, bool quantized, long budget,
-        IReadOnlyCollection<DiffusionComponent> resident = null, IReadOnlyDictionary<DiffusionComponent, long> workspaces = null)
+        IReadOnlyCollection<DiffusionComponent> resident = null, IReadOnlyDictionary<DiffusionComponent, long> workspaces = null,
+        long? capacity = null, bool bf16Route = true)
     {
         var phases = new List<PhaseDemand>
         {
             new(DiffusionPhase.Condition, DiffusionComponent.Conditioner, ConditionerWorking),
-            new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, DenoiserWorking(side, fused, quantized)),
+            new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, DenoiserWorking(side, fused, quantized, bf16Route)),
             new(DiffusionPhase.Decode, DiffusionComponent.Vae, VaeWorking(side)),
         };
         var weights = new Dictionary<DiffusionComponent, long>
@@ -126,7 +149,7 @@ public sealed class MiniMaxH3ImageResidencyTests
             [DiffusionComponent.Vae] = VaeBytes,
         };
         return ResidencyPlanner.Decide(phases, weights, resident ?? Array.Empty<DiffusionComponent>(),
-            workspaces ?? new Dictionary<DiffusionComponent, long>(), budget);
+            workspaces ?? new Dictionary<DiffusionComponent, long>(), budget, capacity);
     }
 
     private static string Releases(ResidencyPlan plan) =>
@@ -171,7 +194,8 @@ public sealed class MiniMaxH3ImageResidencyTests
     public void QuantizedDitsOnTheA40KeepEverythingResidentWhereTheyFit(int side)
     {
         Assert.True(Plan(DitQ4, side, fused: true, quantized: true, A40).KeepsAll);
-        ResidencyPlan q8 = Plan(DitQ8, side, fused: true, quantized: true, A40);
+        // Q8_0 has no Q4_K projection: its products run on MMQ, without the cuBLAS route's BF16 copies.
+        ResidencyPlan q8 = Plan(DitQ8, side, fused: true, quantized: true, A40, bf16Route: false);
         if (side == 2048) Assert.True(q8.KeepsAll, q8.Describe());
         else Assert.Equal("Decode:Denoiser workspace", Releases(q8));
     }
@@ -196,5 +220,56 @@ public sealed class MiniMaxH3ImageResidencyTests
         Assert.Equal("Denoise:Conditioner", Releases(Plan(DitQ4, 4096, fused: false, quantized: true, M5Pro)));
         // bf16's weights alone exceed the working set: the plan says so (the run is left to the device).
         Assert.False(Plan(DitBf16, 2048, fused: false, quantized: false, M5Pro).Fits);
+    }
+
+    // ---- the refusal (ResidencyPlan.Refused): a request whose most demanding phase alone cannot fit the device
+
+    /// <summary>Every request run on the RTX A4500 with the release files (09bd25fd, ggml_cuda, defaults, the portrait prompt):
+    /// those that produced their picture and those that failed inside the denoise (ggml-cuda's MMQ out of memory, which ends the
+    /// process, or a compute allocation that failed). The refusal must refuse exactly the failures: every picture that was made
+    /// stays allowed (the closest 0.22 GB under the free memory) and every failure is refused (the closest 0.30 GB over).</summary>
+    public static IEnumerable<object[]> A4500Runs() => new[]
+    {
+        // file, DiT bytes, side, Q4_K on cuBLAS BF16, made its picture (peak MiB)
+        new object[] { "Q3_K_M", DitQ3, 4480, true, true },          // 17,093 MiB
+        new object[] { "Q4_K_M", DitQ4, 4096, true, true },          // 18,305 MiB
+        new object[] { "Q4_K_M", DitQ4, 4480, true, true },          // 19,349 MiB (the plan was over its budget)
+        new object[] { "UD-Q4_K_XL", DitUd, 3584, true, true },      // 17,847 MiB
+        new object[] { "UD-Q4_K_XL", DitUd, 4096, true, true },      // 19,085 MiB
+        new object[] { "UD-Q4_K_XL", DitUd, 4480, true, false },     // MMQ out of memory in the first step
+        new object[] { "Q5_K_M", DitQ5, 3584, true, true },          // 18,827 MiB
+        new object[] { "Q5_K_M", DitQ5, 3840, true, true },          // 19,425 MiB
+        new object[] { "Q5_K_M", DitQ5, 4096, true, false },         // MMQ out of memory in the first step
+        new object[] { "Q6_K", DitQ6, 2880, false, true },           // 18,859 MiB
+        new object[] { "Q6_K", DitQ6, 3072, false, true },           // 19,191 MiB
+        new object[] { "Q6_K", DitQ6, 3328, false, true },           // 19,659 MiB
+        new object[] { "Q6_K", DitQ6, 3584, false, false },          // out of memory in the first step
+        new object[] { "Q8_0", DitQ8, 2048, false, false },          // the DiT alone does not fit: the compute allocation failed
+    };
+
+    [Theory]
+    [MemberData(nameof(A4500Runs))]
+    public void OnTheA4500ExactlyTheRequestsThatFailedAreRefused(string file, long ditBytes, int side, bool bf16Route, bool ran)
+    {
+        ResidencyPlan plan = Plan(ditBytes, side, fused: true, quantized: true, A4500, capacity: A4500Free, bf16Route: bf16Route);
+        Assert.True(plan.Refused == !ran, $"{file} at {side}: {plan.Describe()} (minimum peak {plan.MinimumPeak / 1e9:F2} GB)");
+        if (!ran) Assert.Equal(DiffusionPhase.Denoise, plan.Limiting.Phase);
+    }
+
+    /// <summary>The validated runs elsewhere are never refused: bf16 on the A40 at both sizes (4096x4096 ran at 42.6 GiB with its
+    /// plan over the budget), the quantized DiTs on the A40, an H100 with everything, and Q8_0 on the 48 GB Mac. bf16 on that
+    /// Mac is (its 40.2 GB of weights alone are the whole working set).</summary>
+    [Fact]
+    public void TheValidatedRunsAreNotRefused()
+    {
+        foreach (int side in new[] { 2048, 4096 })
+        {
+            Assert.False(Plan(DitBf16, side, fused: true, quantized: false, A40, capacity: A40Free).Refused, $"A40 bf16 {side}");
+            Assert.False(Plan(DitQ4, side, fused: true, quantized: true, A40, capacity: A40Free).Refused, $"A40 Q4_K_M {side}");
+            Assert.False(Plan(DitQ8, side, fused: true, quantized: true, A40, capacity: A40Free, bf16Route: false).Refused, $"A40 Q8_0 {side}");
+            Assert.False(Plan(DitBf16, side, fused: true, quantized: false, H100, capacity: H100Free).Refused, $"H100 bf16 {side}");
+        }
+        Assert.False(Plan(DitQ8, 2048, fused: false, quantized: true, M5Pro, capacity: M5ProFree).Refused);
+        Assert.True(Plan(DitBf16, 2048, fused: false, quantized: false, M5Pro, capacity: M5ProFree).Refused);
     }
 }

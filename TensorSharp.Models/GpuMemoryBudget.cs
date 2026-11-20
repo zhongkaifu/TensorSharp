@@ -100,6 +100,22 @@ namespace TensorSharp.Models
         internal static bool TryGetReservationSpareBytes(BackendType backend, out long spareBytes)
             => TryGetSpareBytes(AppliesToReservations(backend), out spareBytes);
 
+        /// <summary>
+        /// The device's free bytes with no headroom set aside, on the backends <see cref="AppliesToReservations"/> covers: the
+        /// most one phase of a request can have, which the diffusion runtime refuses a request past (its residency plan
+        /// already keeps the headroom where it can). False when the backend has no device budget or the query fails.
+        /// </summary>
+        internal static bool TryGetReservationFreeBytes(BackendType backend, out long freeBytes)
+        {
+            freeBytes = 0;
+            if (!AppliesToReservations(backend))
+                return false;
+            if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long totalBytes) || totalBytes <= 0)
+                return false;
+            freeBytes = Math.Max(0, free);
+            return true;
+        }
+
         private static bool TryGetSpareBytes(bool backendApplies, out long spareBytes)
         {
             spareBytes = 0;

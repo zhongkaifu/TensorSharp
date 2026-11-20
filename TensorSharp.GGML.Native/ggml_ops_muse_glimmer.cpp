@@ -1064,6 +1064,7 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
 
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
@@ -1074,7 +1075,7 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
                 bool needs_upload = false;
                 if (try_bind_cached_tensor(g_backend, dev, t, data, bytes, needs_upload, usage))
                 {
-                    if (needs_upload) upload_list.push_back({ t, data, bytes });
+                    if (needs_upload) { upload_list.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
             }
@@ -1183,6 +1184,7 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
 
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
 
         if (embed_in_graph)
             ggml_backend_tensor_set(token_ids_t, token_ids, 0,

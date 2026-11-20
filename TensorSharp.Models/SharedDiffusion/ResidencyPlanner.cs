@@ -30,13 +30,17 @@ namespace TensorSharp.Models.SharedDiffusion
     /// </summary>
     public sealed class ResidencyPlan
     {
-        internal ResidencyPlan(long? budget, long peak, bool keepsAll, bool fits, IReadOnlyList<ResidencyRelease> releases)
+        internal ResidencyPlan(long? budget, long peak, bool keepsAll, bool fits, IReadOnlyList<ResidencyRelease> releases,
+            long? capacity = null, PhaseDemand limiting = default, long limitingWeights = 0)
         {
             Budget = budget;
             Peak = peak;
             KeepsAll = keepsAll;
             Fits = fits;
             Releases = releases;
+            Capacity = capacity;
+            Limiting = limiting;
+            LimitingWeights = limitingWeights;
         }
 
         /// <summary>Device bytes the components may use (free bytes less headroom, plus what they hold now), or null when
@@ -51,6 +55,30 @@ namespace TensorSharp.Models.SharedDiffusion
         public bool Fits { get; }
         public IReadOnlyList<ResidencyRelease> Releases { get; }
 
+        /// <summary>The most the device can give the components: its free bytes with no headroom, plus what they hold now;
+        /// null where the backend reports no device memory (nothing is refused there).</summary>
+        public long? Capacity { get; }
+
+        /// <summary>The phase that needs the most with every other component released: its own component's weights and its
+        /// working memory (<see cref="MinimumPeak"/>). No plan can go below it.</summary>
+        public PhaseDemand Limiting { get; }
+
+        /// <summary>The weights of <see cref="Limiting"/>'s component.</summary>
+        public long LimitingWeights { get; }
+
+        /// <summary>The smallest peak any plan can reach: <see cref="Limiting"/>'s weights and working memory.</summary>
+        public long MinimumPeak => LimitingWeights + Limiting.WorkingBytes;
+
+        /// <summary>
+        /// True when the request cannot run on this device at all: even with every other component released, its most
+        /// demanding phase needs more than <see cref="Capacity"/> by more than <see cref="ResidencyPlanner.RefusalAllowanceBytes"/>.
+        /// The run would fail inside the phase (on ggml-cuda, an allocation that fails inside a kernel ends the process), so
+        /// the pipeline refuses it before any phase runs. Short of that the plan's own headroom is not a reason to refuse: a
+        /// phase may use part of the headroom (bf16 at 4096x4096 on the 46 GB A40 ran at 42.6 GiB with the plan over its
+        /// budget).
+        /// </summary>
+        public bool Refused => Capacity is long capacity && MinimumPeak > capacity + ResidencyPlanner.RefusalAllowanceBytes;
+
         /// <summary>The releases to make before <paramref name="phase"/>, in order.</summary>
         public IEnumerable<ResidencyRelease> Before(DiffusionPhase phase) => Releases.Where(r => r.Before == phase);
 
@@ -61,7 +89,8 @@ namespace TensorSharp.Models.SharedDiffusion
             if (KeepsAll) return $"keep every component resident (peak {Gb(Peak)}, budget {budget})";
             string releases = Releases.Count == 0 ? "no releases" : string.Join("; ", Releases.Select(r =>
                 $"before {r.Before}: release the {r.Component.ToString().ToLowerInvariant()}{(r.Weights ? "" : "'s workspace")}"));
-            return $"{releases} (peak {Gb(Peak)}, budget {budget}{(Fits ? "" : "; a phase alone exceeds the budget")})";
+            string capacity = Refused ? $"; refused: {Limiting.Phase} needs {Gb(MinimumPeak)}, the device has {Gb(Capacity.Value)}" : "";
+            return $"{releases} (peak {Gb(Peak)}, budget {budget}{(Fits ? "" : "; a phase alone exceeds the budget")}{capacity})";
         }
 
         private static string Gb(long bytes) => (bytes / 1e9).ToString("0.0", CultureInfo.InvariantCulture) + " GB";
@@ -78,16 +107,31 @@ namespace TensorSharp.Models.SharedDiffusion
     /// </summary>
     public sealed class ResidencyPlanner
     {
+        /// <summary>
+        /// How far a phase's estimated need may exceed the device's free memory before the request is refused. The
+        /// working-memory estimates are calibrated to cover the measured peaks (MiniMaxH3ImageResidencyTests: 1.0-1.3x),
+        /// and on the RTX A4500 every MiniMax-H3-Image request whose estimate stayed within the free memory ran (up to 0.22 GB
+        /// under it) while every one past it failed inside the phase (from 0.29 GB over): no allowance is needed beyond the
+        /// estimates' own (MiniMaxH3ImageResidencyTests).
+        /// </summary>
+        public const long RefusalAllowanceBytes = 0;
+
         private readonly Func<long?> _spareBytes;
+        private readonly Func<long?> _freeBytes;
         private readonly Action<string> _log;
         private readonly HashSet<string> _logged = new(StringComparer.Ordinal);
+        private long _capacitySeen;
 
         /// <param name="spareBytes">Free device bytes less the headroom reserve, or null when the backend has no device
         /// budget (GpuMemoryBudget.TryGetSpareBytes). Read once a request.</param>
         /// <param name="log">Where each new decision is written once (null: the console).</param>
-        public ResidencyPlanner(Func<long?> spareBytes, Action<string> log = null)
+        /// <param name="freeBytes">Free device bytes with no headroom (the most a phase can have), or null when unknown:
+        /// a request whose most demanding phase alone needs more is refused (<see cref="ResidencyPlan.Refused"/>). Null
+        /// (the default) refuses nothing.</param>
+        public ResidencyPlanner(Func<long?> spareBytes, Action<string> log = null, Func<long?> freeBytes = null)
         {
             _spareBytes = spareBytes ?? throw new ArgumentNullException(nameof(spareBytes));
+            _freeBytes = freeBytes;
             _log = log ?? Console.WriteLine;
         }
 
@@ -104,25 +148,40 @@ namespace TensorSharp.Models.SharedDiffusion
             long? spare = _spareBytes();
             long held = resident.Sum(c => weights.GetValueOrDefault(c)) + residentWorkspaces.Values.Sum();
             long? budget = spare is long s ? s + held : null;
-            ResidencyPlan plan = Decide(phases, weights, resident, residentWorkspaces, budget);
+            long? free = _freeBytes?.Invoke();
+            long? capacity = free is long f ? f + held : null;
+            // The backend keeps the memory pools a finished phase grew (ggml-cuda's do not shrink), so after a large request
+            // the device reads less free than this pipeline can still use: the largest capacity this planner has seen bounds
+            // the refusal. (A later allocation by another process is then not refused for: the run decides, as without it.)
+            if (capacity is long c)
+                lock (_logged)
+                {
+                    _capacitySeen = Math.Max(_capacitySeen, c);
+                    capacity = _capacitySeen;
+                }
+            ResidencyPlan plan = Decide(phases, weights, resident, residentWorkspaces, budget, capacity);
             // Once per geometry class and decision (not per budget: free memory moves between requests).
-            string decision = plan.KeepsAll ? "all" : string.Join(";", plan.Releases);
+            string decision = (plan.KeepsAll ? "all" : string.Join(";", plan.Releases)) + (plan.Refused ? ";refused" : "");
             lock (_logged)
                 if (_logged.Add(geometryClass + "\n" + decision))
                     _log($"[diffusion-residency] {geometryClass}: {plan.Describe()}");
             return plan;
         }
 
-        /// <summary>The decision itself, for a known <paramref name="budget"/> (null: keep everything).</summary>
+        /// <summary>The decision itself, for a known <paramref name="budget"/> (null: keep everything) and the device's
+        /// <paramref name="capacity"/> (free bytes with no headroom plus what the components hold; null: refuse nothing).</summary>
         public static ResidencyPlan Decide(IReadOnlyList<PhaseDemand> phases, IReadOnlyDictionary<DiffusionComponent, long> weights,
             IReadOnlyCollection<DiffusionComponent> resident, IReadOnlyDictionary<DiffusionComponent, long> residentWorkspaces,
-            long? budget)
+            long? budget, long? capacity = null)
         {
             ArgumentNullException.ThrowIfNull(phases);
             ArgumentNullException.ThrowIfNull(weights);
             resident ??= Array.Empty<DiffusionComponent>();
             residentWorkspaces ??= new Dictionary<DiffusionComponent, long>();
             long W(DiffusionComponent c) => weights.GetValueOrDefault(c);
+            // The phase no plan can make smaller: its own component's weights and working memory, nothing else resident.
+            PhaseDemand limiting = phases.Count == 0 ? default : phases.MaxBy(p => W(p.Component) + p.WorkingBytes);
+            long limitingWeights = phases.Count == 0 ? 0 : W(limiting.Component);
 
             // Everything this request uses, plus what is resident anyway, with the largest working set beside it.
             var all = new HashSet<DiffusionComponent>(resident);
@@ -134,7 +193,7 @@ namespace TensorSharp.Models.SharedDiffusion
             long everything = all.Sum(W) + workspaces.Values.Sum();
             if (budget is not long limit || everything <= limit)
                 return new ResidencyPlan(budget, Math.Max(everything, all.Sum(W) + working), keepsAll: true, fits: true,
-                    Array.Empty<ResidencyRelease>());
+                    Array.Empty<ResidencyRelease>(), capacity, limiting, limitingWeights);
 
             var held = new HashSet<DiffusionComponent>(resident);
             var heldWork = new Dictionary<DiffusionComponent, long>(residentWorkspaces);
@@ -179,7 +238,7 @@ namespace TensorSharp.Models.SharedDiffusion
                 held.Add(phase.Component);
                 heldWork[phase.Component] = Math.Max(heldWork.GetValueOrDefault(phase.Component), phase.WorkingBytes);
             }
-            return new ResidencyPlan(budget, peak, keepsAll: false, fits, releases);
+            return new ResidencyPlan(budget, peak, keepsAll: false, fits, releases, capacity, limiting, limitingWeights);
         }
     }
 }

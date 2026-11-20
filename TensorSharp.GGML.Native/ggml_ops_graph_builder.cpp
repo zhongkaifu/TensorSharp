@@ -2074,6 +2074,8 @@ TSG_EXPORT int TSGgml_GraphPreloadWeights(const TSGgmlPreloadWeight* items, int 
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct Binding { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<Binding> uploads;
+        // Device copies bound below and not yet written: invalidated if anything throws before the upload.
+        tsg::PendingDeviceCopies pending;
         for (int i = 0; i < count; i++)
         {
             const TSGgmlPreloadWeight& w = items[i];
@@ -2086,10 +2088,11 @@ TSG_EXPORT int TSGgml_GraphPreloadWeights(const TSGgmlPreloadWeight* items, int 
                 throw std::runtime_error("graph builder: preload weight " + std::to_string(i) + " has fewer host bytes than its tensor");
             bool needs = false;
             if (!try_bind_cached_tensor(g_backend, dev, t, w.data, bytes, needs, GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) continue;
-            if (needs) uploads.push_back({ t, w.data, bytes });
+            if (needs) { uploads.push_back({ t, w.data, bytes }); pending.add(w.data); }
         }
         host_read_barrier();
         tsg::h3_upload_weights(tag != nullptr ? tag : "graph builder/preload", uploads);
+        pending.commit();
 #if defined(TSG_GGML_USE_CUDA)
         // The int8 and FP8 routes keep what they derive from a weight by its device address (as a graph's fresh weights do).
         for (const Binding& u : uploads)

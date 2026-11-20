@@ -142,6 +142,9 @@ system's wired memory):
 | A40 46 GB | bf16 | 4096x4096 | that, and the DiT's workspace released before the decode | 42.6 GiB |
 | M5 Pro 48 GB | Q8_0 | 2048x2048 | the text encoder released before the denoise; from the second picture on also the DiT before the text | 24.3 GiB allocated, 29.9 GB wired |
 | M5 Pro 48 GB | Q4_K_M | 512x512 | everything resident | 33.1 GB wired |
+| RTX A4500 20 GB | Q4_K_M | 2048x2048 | the text encoder released before the denoise | 15.2 GiB |
+| RTX A4500 20 GB | Q4_K_M | 4480x4480 | that, and the DiT's workspace released before the decode | 18.9 GiB |
+| RTX A4500 20 GB | Q6_K | 3328x3328 | the same | 19.2 GiB |
 
 Without these releases bf16 does not fit the A40 beside the text encoder (about 60 GB),
 and Q8_0 does not fit the 48 GB Mac: with the text encoder kept, the earlier path was
@@ -150,6 +153,18 @@ bf16 on the A40 each later picture uploads the text encoder and the DiT again (a
 and 15 s from disk on that VM, whose page cache cannot hold both). bf16 does not fit a
 48 GB Mac at all (40.2 GB of weights against a 40.2 GB working set): use Q8_0 there. An
 H100-class card keeps everything, bf16 at 16 MP included.
+
+A picture the device cannot hold is refused before any phase runs: when its most
+demanding phase needs more than the device has free even with every other component
+released (that component's weights and its working memory), the CLI exits `2` with
+`error: request refused: <reason>` and the server answers `507`, and the model stays
+loaded for the next picture. A phase that runs out of memory inside a ggml-cuda kernel
+would end the process instead. On the RTX A4500 (20 GiB, of which 20.8 GB is free after the CUDA context) the largest square
+sizes that run are 4480x4480 (the model's limit) for Q3_K_M and Q4_K_M, 4096x4096 for
+UD-Q4_K_XL, 3840x3840 for Q5_K_M and 3328x3328 for Q6_K; the next sizes measured past
+those (UD-Q4_K_XL 4480, Q5_K_M 4096, Q6_K 3584) failed inside the denoise before the
+refusal and are refused now. Q8_0 is refused at every size there: its DiT alone is
+22.0 GB.
 
 ## Performance
 

@@ -710,6 +710,7 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* d; std::size_t b; };
         std::vector<HostBinding> uploads;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephem;
 
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cache,
@@ -721,7 +722,7 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
                 bool needs = false;
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs, usage)) {
                     if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS) {
-                        if (needs) uploads.push_back({t, data, bytes});
+                        if (needs) { uploads.push_back({t, data, bytes}); pending.add(data); }
                         return;
                     }
                     invalidate_cached_buffer(data);
@@ -817,6 +818,7 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
 
         for (auto& u : uploads)
             ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+        pending.commit();
 
         ggml_backend_tensor_set(hidden_t, hidden_data, 0,
             static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float));
@@ -1404,6 +1406,7 @@ TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* d; std::size_t b; };
         std::vector<HostBinding> uploads;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephem;
 
         auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cache,
@@ -1415,7 +1418,7 @@ TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
                 bool needs = false;
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs, usage)) {
                     if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS) {
-                        if (needs) uploads.push_back({t, data, bytes});
+                        if (needs) { uploads.push_back({t, data, bytes}); pending.add(data); }
                         return;
                     }
                     invalidate_cached_buffer(data);
@@ -1464,6 +1467,7 @@ TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
 
         for (auto& u : uploads)
             ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+        pending.commit();
 
         ggml_backend_tensor_set(hidden_t, hidden_data, 0,
             static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float));
