@@ -887,7 +887,9 @@ pages evicted before every load arm. Logs are in the VM's ignored `artifacts/gli
   exits 2 with legacy's stderr line for line, one `error: model load refused` line last; the CLI warns, decodes without
   the drafter and answers 42.
 * **D4 is in, as a DEFAULT CHANGE.** `GgmlGraphExecutor.RunsRanks` takes ggml_vulkan as well as ggml_cuda: the native
-  driver (`tsg::tp_execute_plans`) already sums the ranks' partials through host staging there, legacy's Vulkan transport.
+  driver (`tsg::tp_execute_plans`) already runs the ranks' plans together there, and ggml-vulkan's collective
+  (`ggml-vulkan-comm`: each partial through an imported host buffer, its peers adding it from there) sums them, legacy's
+  Vulkan transport.
   Before, `--tp` on Vulkan fell to the per-op tensor-parallel path: Glimmer decoded at 2.9 tok/s (legacy Vulkan TP 52.5).
   Every runtime family with ranked lowering moves with it: Qwen3.5-0.8B's Vulkan `--tp 2` decode went from 9.5 to 194.9
   tok/s and LFM3-1.7B's from 6.5 to 243.6, each with the per-op path's greedy text byte for byte.
@@ -902,11 +904,18 @@ pages evicted before every load arm. Logs are in the VM's ignored `artifacts/gli
 * **Hybrid TP x PP was not run**: two stages of two ranks need four devices. The hosts refuse `--tp 2 --layer-split 2` at
   load (exit 2, one line) because the descriptor's serving contract is still legacy's until S8 (D11). The simulated-device
   tests (`PlacementsOnSimulatedDevicesGiveTheOneDeviceLogits`, tp 2 x 2 stages) stand for it.
+* **Prompt steps where the ranks' sums cross the host (a DEFAULT CHANGE, every family).** Each prompt step pays a host
+  round trip for each of its two all-reduces a layer where they go through host memory, so 512-row steps cross four times
+  as often as legacy's 2048-row chunks: Vulkan `--tp 2` prefill was 0.83x legacy at 4K and 0.89x at 16K. The placement now
+  chooses the step: `IRankedGraphExecutor.RanksSumOnHost` (ggml-vulkan's collective, or no collective that passed its
+  probe), recorded by the mesh, and `StandardDecoderModel.RingStepRowsForPlacement`, the step width's seam for D1 / G4:
+  2048 rows there (rings of W + 2048 cells), 512 everywhere else (one device, layer split, ggml-cuda with NCCL or peers,
+  the tensor executors). Glimmer's Vulkan `--tp 2` prefill is now 0.991x / 0.995x / 1.045x legacy at 512 / 4K / 16K, decode
+  unchanged, 341-419 MiB a GPU more for the rings (still under legacy); greedy texts unchanged, and every other path's
+  logits byte-identical. LFM3-1.7B's Vulkan `--tp 2` answers are byte-identical too.
 * **For S7:**
-  * The prompt step width on ggml_vulkan under `--tp` (D1 / G4). Each prompt step's two all-reduces a layer cross the host
-    there, and 512-row steps cross four times as often as legacy's 2048-row chunks: Vulkan `--tp 2` prefill is 0.83x
-    legacy at 4K and 0.88x at 16K. At 2048 rows (the probe's `--ring-step-rows 2048`) it is 1.00x and 1.03x, decode
-    unchanged, 341-378 MiB a GPU more for the rings. D1's rule (a family hook, as a DEFAULT CHANGE, past 2% slower) applies.
+  * The step-width seam above (`RingStepRowsForPlacement`) is where a measured per-backend width (Metal, MLX, ggml_cpu)
+    goes; it changes no path off `--tp` today.
   * Serving on ggml_cuda is not shape-invariant (not a TP fault: one GPU shows it, and legacy where it batches nothing).
     A c4 step batches the four sequences' rows, and ggml-cuda rounds a 4-row step differently from a 1-row step, so three
     of four first answers leave their solo answer at a near-tie paraphrase (characters 153-468), under `--tp 2` and on one
@@ -922,8 +931,8 @@ pages evicted before every load arm. Logs are in the VM's ignored `artifacts/gli
 | G12: 16K-prompt greedy and "17 plus 25" under `--tp 2` | **passed** on ggml_cuda (both quants) and ggml_vulkan: identical to one GPU; 42 |
 | ggml_cuda speed, ABBA in one binary, runtime / legacy `--tp 2` | **passed**: prefill 1.25 / 1.07 / 1.04 (Q4_K_XL, 512 / 4K / 16K), 1.18 / 1.00 / 1.01 (IQ2_XXS); decode 1.03 / 1.02 / 1.37 and 1.05 / 1.04 / 1.39 |
 | Peak VRAM per GPU vs legacy `--tp 2` | **passed** after the head change: at 512, IQ2_XXS 5658 + 5661 MiB against legacy's 6286 + 5227, Q4_K_XL 8250 + 8237 against 8722 + 7835 (the larger GPU 5-10% lower, totals 0.4-1.7% lower; the slices balance the head over both GPUs). Before it, +4.7% and +7.5%. At 16K 5-7% lower (the rings) |
-| ggml_vulkan `--tp 2` vs one GPU (strict: cos >= 0.9999, no flip above 0.15 nat) | **passed**: IQ2_XXS cos 0.999930, one flip at a 0.008-nat tie, KL 1.94e-4 (legacy's own pair 0.999938, none, 1.90e-4); perplexity 4.1695 -> 4.1700, as legacy's |
-| ggml_vulkan speed vs legacy Vulkan `--tp 2` (within 3%) | decode **passed** (1.06 / 1.04 / 1.35); prefill passed at 512 (0.99), **failed at 4K and 16K (0.83, 0.89), explained** by the step width (above, S7) |
+| ggml_vulkan `--tp 2` vs one GPU (strict: cos >= 0.9999, no flip above 0.15 nat) | **passed**: IQ2_XXS cos 0.999930, one flip at a 0.008-nat tie, KL 1.94e-4 (legacy's own pair 0.999938, none, 1.90e-4); perplexity 4.1695 -> 4.1700, as legacy's. With 2048-row steps under `--tp`: cos 0.999933, one flip at 0.056 nat, KL 2.49e-4 against one GPU's 512-row steps (1.80e-4 against one GPU at 2048 rows) |
+| ggml_vulkan speed vs legacy Vulkan `--tp 2` (within 3%) | **passed** with the host-staged step rule: prefill 0.991 / 0.995 / 1.045 at 512 / 4K / 16K, decode 1.08 / 1.04 / 1.43 (ABBA). With 512-row steps it had failed at 4K and 16K (0.83, 0.89) |
 | `--layer-split 2` vs one GPU | **passed**: byte-identical logits and perplexity, both quants |
 | Serving under `--tp 2` (IQ2_XXS, the real server): multi-turn reuse | **passed** for the reuse: every later turn reuses its previous transcript whole on OpenAI and the Web UI (waste 0 or -1), as legacy's. A reused last turn's reply is not a fresh re-prefill's on ggml_cuda (`--replay`: runtime `--tp 2` 0 of 2 identical; the controls, runtime on one GPU and legacy `--tp 2`, 1 of 2 each), each a near-tie paraphrase from ggml-cuda's shape-dependent rounding, the c4 class below |
 | Serving under `--tp 2`: c4 vs sequential | **failed** (3 of 4 conversations leave their sequential answer in turn 1), **as on one ggml_cuda GPU** (the same 3 of 4): a ggml_cuda property of batched serving, not of `--tp` (above, S7) |
