@@ -60,14 +60,27 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
         _ => throw new ArgumentOutOfRangeException(nameof(executor)),
     };
 
-    /// <summary>Where a verify window's rows and a lone decode row take other products (ggml's CPU F16 dot products, ggml-cuda,
-    /// MLX's batched kernels), a stream may part from plain greedy's only at a near-tie: plain's top two logits within this
-    /// share. The managed CPU, ggml_metal and the CUDA executor give a row its bits whatever the rows beside it.</summary>
+    /// <summary>Where a verify window's rows and a lone decode row take other products, a DFlash stream may part from plain
+    /// greedy's only at a near-tie: plain's top two logits within this share. That covers ggml's CPU F16 dot products,
+    /// ggml-cuda, MLX's batched kernels, and the CUDA executor. The CUDA executor sends this fixture's F16 weights to cuBLAS
+    /// at every row count, and its rows round one way for one row and another for two or more. On an RTX PRO 4500 a verify
+    /// window's rows are 3-8e-4 of the largest logit from the same rows decoded alone. Every width from 2 to 8 gives the
+    /// same row, and a one-row window gives the decode step's bits. Plain greedy's token 7 here is a 9.3e-5 tie on that
+    /// executor.
+    /// The exact rule stays on two backends:
+    /// <list type="bullet">
+    /// <item>ggml_metal, whose kernels are row-shape invariant.</item>
+    /// <item>The managed CPU. A window's rows are the decode step's bits up to four rows there, and within 1e-6 of the
+    /// largest logit past that.</item>
+    /// </list></summary>
     private static double TieTolerance(BackendType backend)
-        => backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.Mlx ? 1e-2 : 0;
+        => backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.Mlx or BackendType.Cuda
+            ? 1e-2 : 0;
 
-    /// <summary>The engine's near-tie bound (a share of the largest logit) for the same backends.</summary>
-    private static double EngineNearTie(BackendType backend) => TieTolerance(backend) > 0 ? 5e-3 : 0;
+    /// <summary>The engine's near-tie bound (a share of the largest logit), for the GGML backends and MLX. The engine tests on
+    /// the CUDA executor still ask for plain decoding's stream token for token.</summary>
+    private static double EngineNearTie(BackendType backend)
+        => backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.Mlx ? 5e-3 : 0;
 
     private static readonly int[] LongPrompt = Enumerable.Range(0, 40).Select(i => 40 + (i * 7) % 23).ToArray();
 
@@ -76,7 +89,15 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
     /// <summary>
     /// Greedy DFlash on the runtime family (the drafter's graph programs where the executor runs them, its per-op path
     /// elsewhere) emits plain greedy decoding's stream: a 40-token prompt (five windows), then 48 tokens drafted and verified a
-    /// whole block at a time, so the drafter's 32-row ring wraps and its window slides.
+    /// whole block at a time, so the drafter's 32-row ring wraps and its window slides. This is the real-weight gate's rule
+    /// (MuseGlimmerParityTests.DFlashDraftingIsLossless), with the near-tie as a share of the largest logit
+    /// (<see cref="TieTolerance"/>):
+    /// <list type="bullet">
+    /// <item>The DFlash stream is plain greedy's.</item>
+    /// <item>Or it first leaves plain greedy where plain's top two are a near-tie, by taking plain's runner-up there.</item>
+    /// <item>Then it agrees again under teacher forcing. Resumed from the prompt and plain's tokens through that position, it
+    /// is plain's continuation, or it leaves it again only at another such near-tie.</item>
+    /// </list>
     /// </summary>
     [Theory]
     [InlineData("managed")]
@@ -91,14 +112,65 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
 
     private void AssertDFlashMatchesPlainGreedy(BackendType backend)
     {
+        const int maxNew = 48;
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         var (target, draft) = Files();
-        StandardDecoderModel last = null;
-        SpeculativeRuntimeChecks.AssertBlockDraftMatchesPlainGreedy(() => last = Create(target, backend, draft), $"muse-glimmer {backend} dflash",
-            maxNew: 48, tieTolerance: TieTolerance(backend), prompt: LongPrompt);
-        output.WriteLine($"{backend}: {last.GraphBlockDrafts} blocks and {last.GraphDFlashInjects} injects as programs; " +
-            $"declined: {last.GraphBlockDraftDeclineReason ?? "no"}");
-        Assert.Null(last.GraphBlockDraftDeclineReason);
+        double tolerance = TieTolerance(backend);
+        string label = $"muse-glimmer {backend} dflash";
+
+        // Plain greedy, one row a step: each token with its runner-up and their relative margin.
+        var plain = new List<(int Token, int RunnerUp, double Margin)>();
+        using (StandardDecoderModel model = Create(target, backend, draft))
+        {
+            float[] logits = model.ForwardRefill(LongPrompt);
+            for (int i = 0; i < maxNew; i++)
+            {
+                int best = ArgMax(logits), second = -1;
+                for (int v = 0; v < logits.Length; v++)
+                    if (v != best && (second < 0 || logits[v] > logits[second])) second = v;
+                plain.Add((best, second, (logits[best] - logits[second]) / Math.Max(Math.Abs(logits[best]), 1e-6)));
+                logits = model.Forward(new[] { best });
+            }
+        }
+
+        // DFlash from the prompt, then (past each parting) from the prompt and plain's tokens through the parting.
+        var partings = new List<string>();
+        int from = 0, blocks = 0, injects = 0;
+        long verifySteps = 0, drafted = 0;
+        string declined = null;
+        while (from < maxNew)
+        {
+            int[] prompt = LongPrompt.Concat(plain.Take(from).Select(p => p.Token)).ToArray();
+            using StandardDecoderModel model = Create(target, backend, draft);
+            var spec = Assert.IsAssignableFrom<ISpeculativeModel>(model);
+            Assert.Null(spec.SpeculationRefusal);
+            Assert.Equal(DraftHeadKind.Block, spec.DraftHeadKind);
+            // Gate 0 and no cost governor: every step drafts the whole block, whatever the (random) drafter's confidence.
+            var speculator = new BlockDraftSpeculator(spec, spec.DraftBlockSize, spec.DraftBlockSize) { MinDraftProb = 0 };
+            var decoder = new SpeculativeDecoder(spec, speculator) { AdaptiveSpeculation = false, PrefillChunkSize = prompt.Length };
+            List<int> stream = decoder.GenerateGreedy(prompt, maxNew - from);
+            Assert.Equal(maxNew - from, stream.Count);
+            verifySteps += decoder.VerifySteps;
+            drafted += decoder.TokensDrafted;
+            blocks += model.GraphBlockDrafts;
+            injects += model.GraphDFlashInjects;
+            declined ??= model.GraphBlockDraftDeclineReason;
+            int d = 0;
+            while (d < stream.Count && stream[d] == plain[from + d].Token) d++;
+            if (d == stream.Count) break;
+            var at = plain[from + d];
+            Assert.True(tolerance > 0 && at.Margin <= tolerance && stream[d] == at.RunnerUp,
+                $"{label}: token {from + d} is {stream[d]}, plain greedy {at.Token} (runner-up {at.RunnerUp}, relative margin " +
+                $"{at.Margin:E2}{(from > 0 ? $"; resumed at {from}" : "")})");
+            partings.Add($"token {from + d}: {stream[d]} for plain's {at.Token} (relative margin {at.Margin:E2})");
+            from += d + 1;
+        }
+        Assert.True(verifySteps > 0, $"{label}: no verify ran");
+        Assert.True(drafted > 0, $"{label}: the drafter drafted nothing");
+        output.WriteLine($"{backend}: {(partings.Count == 0 ? "plain greedy's stream" : $"{partings.Count} parting(s) at near-ties, " +
+            $"each agreeing again under teacher forcing: {string.Join("; ", partings)}")}; {blocks} blocks and {injects} injects " +
+            $"as programs; declined: {declined ?? "no"}");
+        Assert.Null(declined);
     }
 
     /// <summary>
