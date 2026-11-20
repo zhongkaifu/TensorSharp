@@ -52,6 +52,7 @@
       <tr><td><code>--gpu-device &lt;N&gt;</code></td><td><code>ggml_vulkan</code> 在多 GPU 主机上使用的 Vulkan 设备索引（默认 0；环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）。</td></tr>
       <tr><td><code>--list-gpus</code></td><td>列出可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>、<code>f16</code>、<code>q8_0</code>、<code>q4_0</code>（默认按后端/模型自动选择；<code>q4_0</code> 约为 f32 的 1/7；量化档位需原生 GGML flash-attention 路径）。</td></tr>
+      <tr><td><code>--prompt-attention &lt;path&gt;</code></td><td><code>--backend cuda</code> 上 prompt 分块的注意力：<code>f16</code>（默认）、<code>f32acc</code>（F32 累加；在工作站与数据中心 GPU 上更快）或 <code>int8</code>（8 位，需 <code>sm_120a</code> / <code>sm_121a</code> 构建）。更快的路径未通过长代码窗口上的长上下文质量门槛，因此需显式开启；decode、验证与草稿行保持 16 位内核（环境变量 <code>TS_PROMPT_ATTENTION</code>）。</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code> / <code>--chat</code></td><td>启动交互式 REPL。</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>设定系统提示。</td></tr>
       <tr><td><code>--think</code></td><td>启用思考 / 推理模式。</td></tr>

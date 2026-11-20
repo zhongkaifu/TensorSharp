@@ -136,7 +136,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// prompt with media, a family that forwards more than one tail token) it stops prefill
         /// one token short of the prompt end instead, an extra single-row forward (18.7 ms on
         /// Qwen3.8-27B / RTX 5090). Either is paid on every request it is taken for; a shorter
-        /// unprotected tail is cheaper to prefill again on the rare exact retry. Default 1024; 0
+        /// unprotected tail is cheaper to prefill again on the rare exact retry. Not where the
+        /// checkpoint at the prompt's end shares the request's cache rows (the CUDA executor:
+        /// <see cref="PrefixCache.IPrefixCacheModel.CheckpointsShareRows"/>), which copies only a
+        /// fixed set of recurrent states and takes every such checkpoint. Default 1024; 0
         /// takes one on every prompt. Env: <c>TS_SCHED_PROMPT_TAIL_CHECKPOINT_MIN</c>.</summary>
         public int PromptTailCheckpointMinTokens { get; init; } = 1024;
 

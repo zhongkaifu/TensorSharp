@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Threading;
+using TensorSharp.Graph;
 
 namespace TensorSharp.Cuda
 {
@@ -17,20 +18,64 @@ namespace TensorSharp.Cuda
     /// </summary>
     public sealed partial class CudaGraphExecutor
     {
-        /// <summary>Whether marked prompt chunks attend in 8 bits where the image carries the kernels: no (the 16-bit kernels,
-        /// bit for bit as before). Its pre-registered quality gates (design t2-attn8 sec. 12.3) failed on Qwen3.8-27B NVFP4
-        /// (2026-11-18, RTX PRO 4500), on a few long C# code windows. With q8 activations on the prompt rows of both arms, the
-        /// prompt rows moved +0.8% PPL at 64K keys and +18% on a 96K window; ggml_cuda with q8 activations
+        /// <summary>The prompt attention a prompt chunk's rows run unless the operator chooses another
+        /// (<see cref="PromptAttentionConfig"/>: <c>--prompt-attention</c>, <c>TS_PROMPT_ATTENTION</c>): the 16-bit-run kernels.
+        /// Both faster paths failed their pre-registered quality gates (design t2-attn8 sec. 12.3) on Qwen3.8-27B NVFP4 (RTX PRO
+        /// 4500), on a few long C# code windows. The 8-bit path (2026-11-18): with q8 activations on the prompt rows of both arms,
+        /// the prompt rows moved +0.8% PPL at 64K keys and +18% on a 96K window; ggml_cuda with q8 activations
         /// (GGML_CUDA_MMQ_PREC=q8, not its default) moved those two windows further. As served (W4A4 prompt rows), the decode
         /// rows after a code prompt moved +0.8% to +6.4% PPL at 8K-64K keys and +94% on the 96K window; ggml_cuda as served
-        /// moved them +1.5% at 8K, -0.4% at 64K and -22% at 96K. Prose and long-context retrieval did not move.</summary>
-        private const bool PromptAttention8Default = false;
+        /// moved them +1.5% at 8K, -0.4% at 64K and -22% at 96K. Prose and long-context retrieval did not move. F32 accumulation
+        /// (2026-11-19, e3d5ddd3): continue code 8K-96K +0.41% to +84.6%, ppl with q8 activations code 32K-96K +1.4% to +19%,
+        /// greedy 3 of 21 divergences at top-2 gaps of 1.8-4.9 logits.</summary>
+        private const PromptAttentionPath PromptAttentionDefault = PromptAttentionConfig.Default;
 
-        /// <summary>Tests and the eng probe: null keeps the default; true asks for the 8-bit prompt attention wherever it runs,
-        /// false keeps the 16-bit kernel.</summary>
+        /// <summary>The operator's choice when the executor was made (<see cref="PromptAttentionConfig.FromEnvironment"/>; an
+        /// unknown value refuses the executor rather than run another path).</summary>
+        private readonly PromptAttentionPath _promptAttentionConfigured = PromptAttentionConfig.FromEnvironment();
+
+        /// <summary>Tests and the eng probe: a path in place of the configured one (null keeps it).</summary>
+        internal PromptAttentionPath? PromptAttentionForTests { get; set; }
+
+        /// <summary>The prompt attention this executor's prompt chunks run.</summary>
+        internal PromptAttentionPath PromptAttention => PromptAttentionForTests ?? _promptAttentionConfigured;
+
+        /// <summary>Tests and the eng probe: null keeps the chosen path; true asks for the 8-bit prompt attention wherever it
+        /// runs, false keeps a 16-bit kernel.</summary>
         internal bool? PromptAttention8ForTests { get; set; }
 
-        private bool PromptAttention8Enabled => PromptAttention8ForTests ?? PromptAttention8Default;
+        private bool PromptAttention8Enabled => PromptAttention8ForTests ?? PromptAttention == PromptAttentionPath.Int8;
+
+        /// <summary>Prompt chunks' attention ops on the kernels with F32 accumulation (tests, the probe).</summary>
+        internal long PromptAttentionF32AccLaunches { get; private set; }
+
+        private static int s_promptAttentionNoted;
+        private static int s_attn8DeclinedWarned;
+
+        /// <summary>Once a process: which prompt attention was chosen and what it runs on this device, the first time a prompt
+        /// chunk takes a path other than the default.</summary>
+        private static void NotePromptAttentionOnce(PromptAttentionPath path, CudaFlashPrefillKernels flash)
+        {
+            if (path == PromptAttentionDefault || Interlocked.Exchange(ref s_promptAttentionNoted, 1) != 0) return;
+            string detail = path == PromptAttentionPath.F32Acc
+                ? $"F32 accumulation runs at {flash.F32AccumulationRate:F2} of the F16-accumulation tensor rate here" +
+                  (flash.PromptAccumulatesInF32 ? "" : ", so it may be slower than f16 on this device")
+                : "8-bit Q K^T and E4M3 P V for 256-wide heads over long windows";
+            Console.Error.WriteLine(
+                $"[cuda] prompt attention: {PromptAttentionConfig.Name(path)} ({PromptAttentionConfig.Flag} / " +
+                $"{PromptAttentionConfig.EnvironmentVariable}; {detail}). Not the default: it failed issue #376's quality gates on " +
+                "long code windows. Decode rows, verify windows and drafts keep the 16-bit kernels.");
+        }
+
+        /// <summary>Once a process: the 8-bit prompt attention was chosen but cannot run here, so prompt chunks attend on the
+        /// 16-bit kernel.</summary>
+        private static void WarnAttn8DeclinedOnce(string why)
+        {
+            if (Interlocked.Exchange(ref s_attn8DeclinedWarned, 1) == 0)
+                Console.Error.WriteLine(
+                    $"WARNING: [cuda] {PromptAttentionConfig.Flag} int8 was chosen, but {why}: prompt chunks attend on the 16-bit " +
+                    "kernel (f16) instead. Reported once.");
+        }
 
         /// <summary>Prompt chunks' attention ops run in 8 bits, and those whose band found no device room (tests, the probe).</summary>
         internal long PromptAttention8Launches { get; private set; }
@@ -63,13 +108,24 @@ namespace TensorSharp.Cuda
             int d, float scale, CudaFlashPrefillKernels flash, out Tensor attended)
         {
             attended = null;
-            if (!PromptAttention8Enabled || d != CudaFlashPrefillKernels.Attn8HeadDim || len < CudaFlashPrefillKernels.Attn8MinKeys
-                || nq < CudaFlashPrefillKernels.Attn8MinRows || floor < 0 || floor >= len)
+            if (!PromptAttention8Enabled) return false;
+            if (d != CudaFlashPrefillKernels.Attn8HeadDim)
+            {
+                WarnAttn8DeclinedOnce($"the model's attention heads are {d} wide (the 8-bit kernels take {CudaFlashPrefillKernels.Attn8HeadDim})");
+                return false;
+            }
+            // Short windows and chunks keep the 16-bit kernel by design: the band costs more than it saves there.
+            if (len < CudaFlashPrefillKernels.Attn8MinKeys || nq < CudaFlashPrefillKernels.Attn8MinRows || floor < 0 || floor >= len)
                 return false;
             var cuda = (CudaAllocator)Allocator;
             // A prompt chunk never records (only decode-size steps do); the check keeps that structural.
-            if (CudaDecodeDynParams.IsActive(cuda) || CudaGraphCapture.IsCapturing(cuda) || !flash.Runs8BitPrompt(d))
+            if (CudaDecodeDynParams.IsActive(cuda) || CudaGraphCapture.IsCapturing(cuda))
                 return false;
+            if (!flash.Runs8BitPrompt(d))
+            {
+                WarnAttn8DeclinedOnce("the loaded CUDA image does not carry the 8-bit kernels (an sm_120a or sm_121a build does)");
+                return false;
+            }
             int bandKeys = CudaFlashPrefillKernels.Attn8BandKeys(len);
             long bandBytes = CudaFlashPrefillKernels.Attn8BandBytes(bandKeys, kvHeads);
             if (!BandHasRoom(cuda, bandBytes))
@@ -92,6 +148,7 @@ namespace TensorSharp.Cuda
             Launch(new[] { qc, kc, vc }, written, (_, stream) => flash.LaunchPromptAttention8(Ptr(qc), Ptr(kc), Ptr(vc), cap, nq, len, floor,
                 heads, kvHeads, scale, splits, Ptr(band), bandKeys, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(output), stream));
             PromptAttention8Launches++;
+            NotePromptAttentionOnce(PromptAttentionPath.Int8, flash);
             if (PromptAttention8CheckForTests is { } check)
                 CheckPromptAttention8(check, qc, kc, vc, cap, nq, len, floor, heads, kvHeads, d, scale, splits, flash, attended);
             return true;

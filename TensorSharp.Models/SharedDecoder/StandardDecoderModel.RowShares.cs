@@ -97,6 +97,11 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- capture
 
+        /// <summary>Requests run in slots of their own and an automatic checkpoint shares its request's rows: the conditions
+        /// <see cref="IPrefixCacheModel.TryCaptureCheckpoint"/> shares them on.</summary>
+        bool IPrefixCacheModel.CheckpointsShareRows => _slots != null && SlotBoundPolicies && CheckpointRowsAppendOnly
+            && !SharedRowsDisabledForTests && SupportsPrefixCheckpoints;
+
         bool IPrefixCacheModel.TryCaptureCheckpoint(string requestId, string payloadKey, bool mayShareRows, out PayloadFootprint footprint)
         {
             if (!mayShareRows || !SlotBoundPolicies || !CheckpointRowsAppendOnly || SharedRowsDisabledForTests || !SupportsPrefixCheckpoints

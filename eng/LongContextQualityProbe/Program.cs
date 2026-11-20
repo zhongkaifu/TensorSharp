@@ -124,7 +124,7 @@ using ModelBase model = loaded;
 loadTimer.Stop();
 var m = new ModelHandle(model);
 if (arms.Any(a => a.Setting != "default") && m.Cuda == null)
-    return Usage("arms f16 / 8bit / q8act set seams of the CUDA executor: --backend cuda with a shared-decoder model");
+    return Usage("arms f16 / f32acc / 8bit / q8act set seams of the CUDA executor: --backend cuda with a shared-decoder model");
 if (arms.Any(a => a.PromptAttention == "8bit") && !m.Runs8BitPrompt)
     return Usage("an 8bit arm needs a CUDA image with the 8-bit prompt attention (an sm_120a / sm_121a build on its GPU); this one has none, " +
         "so the arm would run the 16-bit kernel");
@@ -202,6 +202,7 @@ foreach (Case c in selected)
             rec["attn8_launches"] = after.Attn8Launches - before.Attn8Launches;
             rec["attn8_band_refusals"] = after.Attn8BandRefusals - before.Attn8BandRefusals;
             rec["marked_prompt_attentions"] = after.MarkedAttentions - before.MarkedAttentions;
+            rec["f32acc_launches"] = after.F32AccLaunches - before.F32AccLaunches;
             rec["free_device_mb"] = Mb(m.FreeDeviceBytes());
             rec["wall_s"] = Math.Round(wall.Elapsed.TotalSeconds, 3);
             Console.WriteLine($"[{index}/{selected.Count}] {c.Id} {arm.Name}: {summary}, 8-bit launches {rec["attn8_launches"]}" +
@@ -446,7 +447,8 @@ static int Usage(string error)
     Console.Error.WriteLine("         [--arms f16,8bit | name=setting,...] [--kv-cache-dtype f16|q8_0] [--reference RUN.jsonl:ARM]");
     Console.Error.WriteLine("         [--kinds ppl,continue,greedy,chat,layers] [--groups retrieval,gsm8k,humaneval] [--ids REGEX]");
     Console.Error.WriteLine("         [--max-tokens N] [--prefill-chunk 2048] [--score-chunk 512] [--topk 32] [--label TEXT] [--resume]");
-    Console.Error.WriteLine("Arm settings: default (the build's own), f16 (the 16-bit prompt kernel), 8bit (the 8-bit prompt attention),");
+    Console.Error.WriteLine("Arm settings: default (the process's --prompt-attention), f16 (the 16-bit prompt kernel), f32acc (the prompt");
+    Console.Error.WriteLine("  kernels with F32 accumulation), 8bit (the 8-bit prompt attention),");
     Console.Error.WriteLine("  q8act (the build's prompt attention; every NVFP4 product on the q8 matvec, so prompt rows keep q8 activations),");
     Console.Error.WriteLine("  f16+q8act / 8bit+q8act (that prompt attention with q8 activations).");
     return 2;
