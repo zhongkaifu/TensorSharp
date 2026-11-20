@@ -165,13 +165,24 @@ namespace TensorSharp.Models
         /// <item>MLX: the drafter's whole block (15 drafts), whose verify costs 79-88 ms at any width up to 16 rows: 39.8 tok/s
         /// in all against 37.0 at 8 drafts and 35.0 at 7 (all ungated), 33.4 at the speculator's 8 with the gate, plain 21.1,
         /// legacy's DFlash 31.7. n-gram keeps the speculator's 8 there (31.7 tok/s in all against 30.8 at 7).</item>
+        /// <item>ggml_cuda: the drafter's whole block (15 drafts) at the block gate 0.35 (RTX PRO 4500, sm_120; governed):
+        /// <list type="bullet">
+        /// <item>UD-IQ2_XXS: 127.1 tok/s in all against 121.0 at the speculator's 8 (plain 61.0, legacy's DFlash 88.0).</item>
+        /// <item>UD-Q4_K_XL: 146.4 against 130.5 (plain 47.5, legacy 94.0).</item>
+        /// <item>At or above the 8-draft default on every prompt but one, IQ2's essay (-0.9%).</item>
+        /// <item>The gate keeps it: without it 15 drafts is +18% on Q4 but -6% on IQ2, whose essay falls to plain.</item>
+        /// <item>The verify costs 22.8 / 27.8 / 37.0 / 31.0 ms at 4 / 6 / 8 / 16 rows on IQ2 (8 rows is the dearest shape there:
+        /// 7 drafts ungated is the worst arm, 86.5), and 21.8-24.9 ms at 4-16 rows on Q4.</item>
+        /// </list></item>
+        /// <item>Direct CUDA: the same, not worse there. UD-IQ2_XXS runs at 21.8 tok/s against 20.6-20.8 at 8 drafts (plain
+        /// 21.0); its IQ verify rows cost 124-348 ms against a 47-ms plain step, so the drafter barely pays.</item>
         /// </list>
         /// Elsewhere the speculator's default (8) until measured there.
         /// </summary>
         public override int SpecPreferredDraftWindow => _backend switch
         {
             BackendType.GgmlMetal => 7,
-            BackendType.Mlx when HasDFlash => DFlashSettings.MaxDraftTokens,
+            BackendType.Mlx or BackendType.GgmlCuda or BackendType.Cuda when HasDFlash => DFlashSettings.MaxDraftTokens,
             _ => base.SpecPreferredDraftWindow,
         };
 
