@@ -657,6 +657,14 @@ namespace TensorSharp.Models.Graph
                 r[i] = kind switch { GraphOp.Add => x[i] + y, GraphOp.Sub => x[i] - y, GraphOp.Mul => x[i] * y, _ => x[i] / y };
         }
 
+        /// <summary>
+        /// x [rows, Ne0] times the weight's rows. A program whose products keep their activations in F32
+        /// (<see cref="TensorGraphExecutor.FloatProducts"/>: the F32 reference tower of the Muse-Glimmer vision tests) multiplies
+        /// the weight's values (ggml's dequantization; code * d in F32 for q8_0) as F32 rows, the arithmetic of a per-op path that
+        /// dequantized its weights at load, at about 2.2x the time. The managed kernels' own q8_0 product is an integer dot over
+        /// quantized activations: 2.2e-2 from F32 copies over the Muse-Glimmer tower's synthetic Q8_0 fixture, 1 - cosine 9e-4 on
+        /// the real mmproj's rows.
+        /// </summary>
         protected override unsafe Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
             if (weight.Data == IntPtr.Zero)
@@ -664,6 +672,14 @@ namespace TensorSharp.Models.Graph
             int rows = (int)x.Sizes[0];
             SetStepWidth(rows);
             var result = new Tensor(Allocator, DType.Float32, rows, weight.Ne1);
+            if (FloatProducts && weight.Ne2 <= 1)
+            {
+                using var values = new Tensor(Allocator, DType.Float32, weight.Ne1, weight.Ne0);
+                NativeDequant.DequantizeToFloat32Native(weight.Format, weight.Data, (IntPtr)TensorComputePrimitives.GetFloatPointer(values),
+                    weight.Ne0 * weight.Ne1);
+                DenseProduct(result, x, values);
+                return result;
+            }
             ManagedQuantizedOps.AddmmQuantizedToFloat32(weight.Format, weight.Data, weight.Ne0, weight.Ne1,
                 TensorComputePrimitives.GetFloatPointer(x), (int)weight.Ne0, rows,
                 TensorComputePrimitives.GetFloatPointer(result), (int)weight.Ne1);

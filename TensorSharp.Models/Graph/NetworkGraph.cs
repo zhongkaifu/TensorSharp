@@ -100,8 +100,8 @@ namespace TensorSharp.Models.Graph
 
         /// <summary>
         /// The network's block-format products keep their activations in F32 (<see cref="GraphProgram.FloatProducts"/>): on an
-        /// executor whose products would round them (direct CUDA's int8 and F16 kernels) the weight's values are multiplied in
-        /// F32. Default off; a network held to an F32 oracle sets it before its first run.
+        /// executor whose products would round them (direct CUDA's int8 and F16 kernels, the managed executor's integer dot) the
+        /// weight's values are multiplied in F32. Default off; a network held to an F32 oracle sets it before its first run.
         /// </summary>
         public bool FloatProducts
         {

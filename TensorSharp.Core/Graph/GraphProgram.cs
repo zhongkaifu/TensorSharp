@@ -311,10 +311,10 @@ namespace TensorSharp.Graph
         public (ulong, ulong) Signature { get; }
         /// <summary>
         /// The products of block-format weights keep their activations in F32 (<see cref="GraphProgramBuilder.FloatProducts"/>):
-        /// an executor whose own kernels for them would round the activations first (the direct CUDA executor's int8 tensor-core
-        /// products quantize them to q8_1, its prompt-size F16 GEMM to half) multiplies an F32 copy of the weight's values
-        /// instead. A network's choice, for one held to an F32 oracle; the decoder's steps leave it off. Executors whose
-        /// products already read F32 activations, or that have no other kernel, run as before.
+        /// an executor whose own kernels for them would round the activations first multiplies an F32 copy of the weight's
+        /// values instead. The direct CUDA executor's int8 tensor-core products quantize them to q8_1, and its prompt-size F16
+        /// GEMM rounds them to half. The managed executor's q8_0 product is an integer dot. A network's choice, for one held to
+        /// an F32 oracle; the decoder's steps leave it off. The GGML builders and MLX run as before.
         /// </summary>
         public bool FloatProducts { get; }
     }
