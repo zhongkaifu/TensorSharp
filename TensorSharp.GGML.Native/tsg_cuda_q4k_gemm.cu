@@ -1626,11 +1626,11 @@ bool tsg_cuda_lora_gemm_supported(void)
 // the R columns after them. A dequantized W is laid out the same way, [W | up] with each part's up in its columns on its
 // slot's rows and zeros elsewhere, so one GEMM of depth K + R computes the product and the update together: the [N, T]
 // update is never written, read or added, and no [N, K] merged weight is formed (tsg_cuda_q4k_lora_gemm_bf16's route). A
-// BF16 W is not copied (that would read and write the whole weight each call, the dequantization's traffic a quantized
-// weight has anyway): each part's expand writes its rows of dst first (beta 0; rows of a slot without a part are zeroed),
-// then W's product adds itself (beta 1), so the update's only traffic is its [N, T] F32 write, and the base GEMM reads dst
-// back in its epilogue under its own compute. The factors and the shrink are BF16 here (the base operands' type); their
-// rounding is far below the base product's own BF16 rounding of the activations. Synchronizes the default stream.
+// BF16 W is copied into those rows when that moves fewer bytes than the alternative, its product as it is with each
+// part's expand accumulated into its rows of dst (beta 1): the copy reads W and writes it once (about 4 N K bytes), the
+// accumulation reads and writes dst (8 N T), so the copy wins below K = 2 T (qkv, out and fc1 at 4 MP; fc2 and smaller
+// pictures accumulate). The factors and the shrink are BF16 here (the base operands' type); their rounding is far below
+// the base product's own BF16 rounding of the activations. Synchronizes the default stream.
 bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, const float* x, int64_t x_row_stride, int64_t T,
                              float* dst, int64_t dst_ld, int nparts, const void* const* downs, const void* const* ups,
                              const int64_t* ranks, const int64_t* outs, const int64_t* offsets, int factor_f32, int x_swiglu)
@@ -1655,7 +1655,8 @@ bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, con
     int64_t upElems = 0;
     for (int p = 0; p < nparts; p++) upElems += outs[p] * ranks[p];
     const bool quantized = wtype != 30;
-    const bool concat = quantized;   // a BF16 weight's product runs as it is, after the expands (below)
+    // A BF16 weight goes through the K + R rows too when copying it there is cheaper than accumulating into dst.
+    const bool concat = quantized || K < 2 * T;
     // Scratch: the weight rows [N, ld] (quantized), the activations [T, ld], the downs [R, K] and the ups, BF16; the shrink
     // [R, T]; the parts' table.
     const std::size_t wNeed = concat ? (std::size_t) N * ld * sizeof(__nv_bfloat16) : 0;
@@ -1735,29 +1736,17 @@ bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, con
     }
     else
     {
-        // Each part's expand into its rows (beta 0), the rows no part covers zeroed, then the BF16 weight as it is (beta 1).
-        int64_t covered = 0;
-        for (int p = 0; p < nparts; p++)
-        {
-            if (offsets[p] > covered
-                && cudaMemset2DAsync(dst + covered, (std::size_t) dst_ld * sizeof(float), 0, (std::size_t) (offsets[p] - covered) * sizeof(float),
-                                     (std::size_t) T, nullptr) != cudaSuccess)
-                return false;
-            if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) outs[p], (int) T, (int) ranks[p], &one,
-                             ub + hostMeta[5 * p + 4], CUDA_R_16BF, (int) ranks[p],
-                             xb + K + hostMeta[5 * p + 2], CUDA_R_16BF, (int) ld, &zero,
-                             dst + offsets[p], CUDA_R_32F, (int) dst_ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
-                return false;
-            covered = offsets[p] + outs[p];
-        }
-        if (covered < N
-            && cudaMemset2DAsync(dst + covered, (std::size_t) dst_ld * sizeof(float), 0, (std::size_t) (N - covered) * sizeof(float),
-                                 (std::size_t) T, nullptr) != cudaSuccess)
-            return false;
+        // The BF16 weight as it is, then each part's expand into its rows (beta 1).
         if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one,
-                         w, CUDA_R_16BF, (int) K, xb, CUDA_R_16BF, (int) ld, &one,
+                         w, CUDA_R_16BF, (int) K, xb, CUDA_R_16BF, (int) ld, &zero,
                          dst, CUDA_R_32F, (int) dst_ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             return false;
+        for (int p = 0; p < nparts; p++)
+            if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) outs[p], (int) T, (int) ranks[p], &one,
+                             ub + hostMeta[5 * p + 4], CUDA_R_16BF, (int) ranks[p],
+                             xb + K + hostMeta[5 * p + 2], CUDA_R_16BF, (int) ld, &one,
+                             dst + offsets[p], CUDA_R_32F, (int) dst_ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+                return false;
     }
     const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
     lap("multiply");
