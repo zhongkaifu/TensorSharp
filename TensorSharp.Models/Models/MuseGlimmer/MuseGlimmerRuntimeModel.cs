@@ -102,7 +102,14 @@ namespace TensorSharp.Models
                 Dispose();
                 throw;
             }
-            AttachDraftModel(draftModelPath);
+            // Legacy's decline under --tp (design D5): the drafter borrows the head and embedding the ranks shard. The host's
+            // attach then refuses it as the model's own decline (SpeculativeDraftHeadLoader: the server exits 2, the CLI warns).
+            // A whole-layer split drafts (its last stage holds the head).
+            bool tensorParallel = tpDegree > 1 || (tpGroup is not ILayerSplitGroup && GlobalTpDegree > 1);
+            if (tensorParallel && !string.IsNullOrWhiteSpace(draftModelPath))
+                Console.WriteLine("  DFlash speculative decoding is not supported under tensor parallelism; ignoring the drafter.");
+            else
+                AttachDraftModel(draftModelPath);
         }
 
         /// <summary>
