@@ -12,7 +12,11 @@
 //          DiT does not fit beside it), --legacy-vae-batch caps its tiles a decode call (TS_H3_IMAGE_VAE_BATCH; its graph
 //          overflows past 4 on ggml_metal and ggml_cpu).
 // The jobs run in order in this one process (the first is the cold first job, the rest warm); prompts.json is a list of
-// {id, prompt, seed, width, height}; --size overrides the size. Each job writes <out>/<label>-<n>-<id>.png; <out>/<label>.json
+// {id, prompt, seed, width, height[, images: [paths], keepSourceSize]}; a job with images is an edit (EditImage; the paths
+// are relative to prompts.json, in <Picture n> order; width and height 0 are the automatic size); --size overrides the
+// size. --parity-dump <dir> runs the first job only, through the production pipeline with its components recorded, up to
+// its first step (ParityDump.cs: the copies, posteriors, conditioning, rows, layout and the step's velocity, for
+// eng/validation/MiniMaxH3ImageEdit/diffusers_parity.py). Each job writes <out>/<label>-<n>-<id>.png; <out>/<label>.json
 // holds per job the phases' seconds (text, steps, denoise, decode, total), the decode's tiles, the PNG's SHA-256, the
 // device memory peak over the job and over each phase (sampled every 50 ms: CUDA's used bytes, Metal's allocated size),
 // the residency plan (runtime), and the load and process figures. Device memory is the device's whole use, so run alone.
@@ -174,6 +178,49 @@ if (Value("--vae-latent") is { } latentPath)
     return 0;
 }
 
+// ---- --parity-dump: the first job up to its first step, recorded
+if (Value("--parity-dump") is { } dumpDir)
+{
+    if (engine != "runtime") throw new ArgumentException("--parity-dump records the runtime");
+    JsonNode first = prompts.FirstOrDefault(x => (string?)x!["id"] == jobs[0]) ?? throw new ArgumentException($"no prompt '{jobs[0]}'");
+    string baseDir = Path.GetDirectoryName(Path.GetFullPath(Required("--prompts")))!;
+    var dumpResult = ParityDump.Run(backend, model, te, vae, first, baseDir, size, Path.GetFullPath(dumpDir));
+    result["parity_dump"] = dumpResult;
+    stop.Cancel();
+    sampler.Join();
+    Save();
+    GgmlBasicOps.Shutdown();
+    return 0;
+}
+
+// ---- --vae-dump <dir>: the VAE encoder alone on the first job's references
+if (Value("--vae-dump") is { } vaeDumpDir)
+{
+    JsonNode first = prompts.FirstOrDefault(x => (string?)x!["id"] == jobs[0]) ?? throw new ArgumentException($"no prompt '{jobs[0]}'");
+    result["vae_dump"] = ParityDump.VaeDump(backend, vae, first, Path.GetDirectoryName(Path.GetFullPath(Required("--prompts")))!, Path.GetFullPath(vaeDumpDir));
+    stop.Cancel();
+    sampler.Join();
+    Save();
+    GgmlBasicOps.Shutdown();
+    return 0;
+}
+
+// ---- --te-attention-check [--te-chunk N[,N...]]: the text encoder's query-block attention (each size, or the
+// conditioner's choice) and its flash attention against the whole materialized scores, on the first job
+if (Flag("--te-attention-check"))
+{
+    JsonNode first = prompts.FirstOrDefault(x => (string?)x!["id"] == jobs[0]) ?? throw new ArgumentException($"no prompt '{jobs[0]}'");
+    int[] chunks = Value("--te-chunk") is { } c
+        ? c.Split(',').Select(x => int.Parse(x, System.Globalization.CultureInfo.InvariantCulture)).Where(x => x > 0).ToArray()
+        : Array.Empty<int>();
+    result["te_attention_check"] = ParityDump.AttentionCheck(backend, te, first, Path.GetDirectoryName(Path.GetFullPath(Required("--prompts")))!, chunks);
+    stop.Cancel();
+    sampler.Join();
+    Save();
+    GgmlBasicOps.Shutdown();
+    return 0;
+}
+
 // ---- load
 double loadStart = clock.Elapsed.TotalSeconds;
 IImageGenerationModel image;
@@ -206,6 +253,10 @@ for (int n = 0; n < jobs.Length; n++)
     JsonNode p = prompts.FirstOrDefault(x => (string?)x!["id"] == id) ?? throw new ArgumentException($"no prompt '{id}'");
     int w = size > 0 ? size : (int)p["width"]!, h = size > 0 ? size : (int)p["height"]!;
     long seed = (long)p["seed"]!;
+    string promptsDir = Path.GetDirectoryName(Path.GetFullPath(Required("--prompts")))!;
+    List<RgbImage> inputs = p["images"] is JsonArray imgs
+        ? imgs.Select(x => ImageIO.Load(Path.Combine(promptsDir, (string)x!), preserveAlpha: true)).ToList()
+        : new List<RgbImage>();
     var stepTimes = new List<double>();
     double last = 0;
     var parameters = new QwenImageParams
@@ -213,6 +264,7 @@ for (int n = 0; n < jobs.Length; n++)
         Width = w,
         Height = h,
         Seed = seed,
+        KeepSourceSize = (bool?)p["keepSourceSize"] ?? false,
         OnStep = (step, total, _) =>
         {
             double now = clock.Elapsed.TotalSeconds;
@@ -224,10 +276,16 @@ for (int n = 0; n < jobs.Length; n++)
     string load0 = Load();
     double start = clock.Elapsed.TotalSeconds;
     last = start;
-    var job = new JsonObject { ["n"] = n + 1, ["id"] = id, ["seed"] = seed, ["width"] = w, ["height"] = h, ["load_before"] = load0 };
+    var job = new JsonObject
+    {
+        ["n"] = n + 1, ["id"] = id, ["seed"] = seed, ["width"] = w, ["height"] = h, ["load_before"] = load0,
+        ["references"] = new JsonArray(inputs.Select(i => (JsonNode)$"{i.Width}x{i.Height}").ToArray()),
+    };
     try
     {
-        RgbImage picture = image.GenerateImage((string)p["prompt"]!, parameters);
+        RgbImage picture = inputs.Count > 0
+            ? image.EditImage((string)p["prompt"]!, inputs, parameters)
+            : image.GenerateImage((string)p["prompt"]!, parameters);
         double end = clock.Elapsed.TotalSeconds;
         string png = Path.Combine(outDir, $"{label}-{n + 1}-{id}.png");
         byte[] bytes = ImageIO.EncodePng(picture);
@@ -250,8 +308,14 @@ for (int n = 0; n < jobs.Length; n++)
             job["text_tokens"] = runtime.LastTextTokens;
             // Per phase: from the phase's entry to the next one's (the run's end for the last).
             var marks = new List<(DiffusionPhase, double)>();
-            lock (phases) marks.AddRange(phases.Where(x => x.Phase is DiffusionPhase.Condition or DiffusionPhase.Denoise or DiffusionPhase.Decode or DiffusionPhase.Composite)
+            lock (phases) marks.AddRange(phases.Where(x => x.Phase is DiffusionPhase.Condition or DiffusionPhase.EncodeReferences
+                    or DiffusionPhase.Denoise or DiffusionPhase.Decode or DiffusionPhase.Composite)
                 .GroupBy(x => x.Phase).Select(g => (g.Key, g.First().T)));
+            job["vision_seconds"] = t.Vision;
+            job["vae_encode_seconds"] = t.VaeEncode;
+            job["vae_encode_tiles"] = runtime.LastEncodeTiles;
+            job["output_size"] = $"{picture.Width}x{picture.Height}";
+            job["sampling_size"] = $"{runtime.LastResult.Recipe.Canvas.Sampling.Width}x{runtime.LastResult.Recipe.Canvas.Sampling.Height}";
             var peaks = new JsonObject();
             for (int i = 0; i < marks.Count; i++)
                 peaks[marks[i].Item1.ToString()] = PeakBetween(marks[i].Item2, i + 1 < marks.Count ? marks[i + 1].Item2 : end);
@@ -287,7 +351,7 @@ for (int n = 0; n < jobs.Length; n++)
         job["decode_native_seconds"] = native;
         job["peak_device_bytes"] = PeakBetween(start, end);
         job["rc"] = 0;
-        Console.WriteLine($"[h3img-ab] {label} job {n + 1} {id} {w}x{h}: text {text:F2}s denoise {denoise:F2}s decode {decode:F2}s " +
+        Console.WriteLine($"[h3img-ab] {label} job {n + 1} {id} {w}x{h} refs {inputs.Count}: text {text:F2}s denoise {denoise:F2}s decode {decode:F2}s " +
                           $"total {total:F2}s peak {PeakBetween(start, end) / 1e9:F2} GB sha {job["png_sha256"]}");
     }
     catch (Exception e)

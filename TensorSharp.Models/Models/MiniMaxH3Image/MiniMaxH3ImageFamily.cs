@@ -8,8 +8,9 @@
 // MiniMax-H3-Image as a family of the shared diffusion runtime (docs/design/diffusion-runtime.md section 3.2): its
 // geometry, its recipe (ComfyUI's "simple" schedule over the checkpoint's PDD grid, the grid interval's head), the CPU
 // torch noise, the packed layout of MiniMaxH3ImageLayout and the 2x2-patch token rows MiniMaxH3ImageModel denoises on.
-// Its components are the MiniMax-H3 text encoder (MiniMaxH3ImageConditioner), the DiT (MiniMaxH3ImageDenoiser) and the
-// image VAE's decoder (MiniMaxH3ImageVaeCodec), all on the runtime; editing is stage S5's.
+// Its components are the MiniMax-H3 text encoder with its vision tower (MiniMaxH3ImageConditioner), the DiT
+// (MiniMaxH3ImageDenoiser) and the image VAE (MiniMaxH3ImageVaeCodec), all on the runtime. An edit's references follow
+// MiniMaxH3ImageReferences; its canvas follows diffusers' MiniMax-H3-Image (ResolveCanvas).
 using System;
 using System.Collections.Generic;
 using TensorSharp.Models.MiniMaxH3;
@@ -38,7 +39,21 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 Heads = HeadPolicy.GridInterval,
             };
             DefaultRecipe.Validate();
+            References = new MiniMaxH3ImageReferences(
+                () => Vae != null ? (Vae.LatentsMean, Vae.LatentsStd)
+                    : (MiniMaxH3ImageVaeCodec.ReleaseLatentsMean, MiniMaxH3ImageVaeCodec.ReleaseLatentsStd),
+                ToRows);
         }
+
+        /// <summary>The most reference pictures an edit takes (MiniMax's README: up to 16).</summary>
+        public const int MaxReferences = 16;
+
+        /// <summary>diffusers' min_generation_area: an edit smaller than 2048 x 2048 samples on a larger canvas of the same
+        /// aspect and is resized back (decision D3; text to image keeps its own size, as before).</summary>
+        public const long MinGenerationArea = 2048L * 2048;
+
+        /// <summary>The largest area an edit may ask for: the model's 4-20 MP range (4096 x 5120).</summary>
+        public const long MaxEditArea = 4096L * 5120;
 
         /// <summary>The family of the denoiser in <paramref name="path"/>: its grid from the safetensors metadata, or the
         /// release grid for a file without it (MiniMaxH3ImageModel's rule).</summary>
@@ -62,6 +77,9 @@ namespace TensorSharp.Models.MiniMaxH3Image
             SizeMultiple = MiniMaxH3ImageDiffusionModel.SizeMultiple,
             DefaultWidth = MiniMaxH3ImageDiffusionModel.DefaultSize,
             DefaultHeight = MiniMaxH3ImageDiffusionModel.DefaultSize,
+            MinGenerationArea = MinGenerationArea,
+            MaxArea = MaxEditArea,
+            MaxReferences = MaxReferences,
         };
 
         public DiffusionGuidance Guidance => DiffusionGuidance.None;
@@ -70,7 +88,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>The PDD grid the recipe samples over.</summary>
         public IReadOnlyList<float> Grid => _grid;
 
-        public IReferencePolicy References { get; } = new NoReferences();
+        public IReferencePolicy References { get; }
 
         public IConditioner CreateConditioner(DiffusionLoad load)
         {
@@ -117,13 +135,74 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <summary>torch.randn on the CPU generator, as ComfyUI draws MiniMax-H3-Image's initial latent.</summary>
         public INoiseSource Noise(long seed) => new TorchCpuRandn(unchecked((ulong)seed));
 
+        /// <summary>
+        /// Text to image: <see cref="DiffusionCanvas.TextToImage"/>, unchanged. An edit (docs/design/diffusion-runtime.md section
+        /// 4.4): an explicit width and height win (multiples of 32, at most <see cref="MaxEditArea"/>); keepSourceSize returns
+        /// <c>&lt;Picture 1&gt;</c>'s exact size; otherwise <c>&lt;Picture 1&gt;</c>'s aspect at the request's target area, or
+        /// without one its VAE copy's size (a 1024-2048 short edge). Below <see cref="MinGenerationArea"/> the picture samples
+        /// on diffusers' larger canvas (get_image_canvas_size) and is resized back.
+        /// </summary>
         public DiffusionCanvas ResolveCanvas(DiffusionRequest request, EditMask mask)
         {
             ArgumentNullException.ThrowIfNull(request);
-            if (mask != null || request.References is { Count: > 0 })
-                throw new ArgumentException($"{DisplayName} does not edit images on the diffusion runtime yet; drop the reference images and the mask.");
-            return DiffusionCanvas.TextToImage(request, Geometry, DisplayName);
+            if (mask != null)
+                throw new ArgumentException($"{DisplayName} does not take an edit mask yet; send the edit without one.");
+            if (request.References is not { Count: > 0 })
+                return DiffusionCanvas.TextToImage(request, Geometry, DisplayName);
+            RgbImage first = request.References[0].Image;
+            int multiple = Geometry.SizeMultiple, width = request.Width, height = request.Height;
+            if ((width > 0) != (height > 0))
+                throw new ArgumentException($"{DisplayName} needs both width and height, or neither.");
+            if (request.KeepSourceSize && width > 0)
+                throw new ArgumentException("keepSourceSize returns the first image's own size; it cannot be combined with a width and height.");
+            if (width > 0)
+            {
+                if (width % multiple != 0 || height % multiple != 0)
+                    throw new ArgumentException($"{DisplayName} sizes are multiples of {multiple}; got {width}x{height}.");
+            }
+            else if (request.KeepSourceSize)
+            {
+                (width, height) = (first.Width, first.Height);
+            }
+            else if (request.TargetArea > 0)
+            {
+                double aspect = (double)first.Width / first.Height;
+                width = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(Math.Sqrt(request.TargetArea * aspect), multiple));
+                height = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(Math.Sqrt(request.TargetArea / aspect), multiple));
+            }
+            else
+            {
+                var (vw, vh) = MiniMaxH3ImageReferences.VaeCopySize(first.Width, first.Height);
+                width = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vw, multiple));
+                height = Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(vh, multiple));
+            }
+            var sampling = EditCanvas(width, height, multiple);
+            if ((long)sampling.Width * sampling.Height > MaxEditArea)
+            {
+                if (!request.KeepSourceSize)
+                    throw new ArgumentException(
+                        $"{DisplayName} edits at most {MaxEditArea / 1e6:F1} MP ({width}x{height} asked); ask for a smaller size.");
+                // A large source keeps its size and samples at the largest canvas of its aspect.
+                double f = Math.Sqrt(MaxEditArea / ((double)width * height));
+                sampling = (Math.Max(multiple, (int)Math.Floor(width * f / multiple) * multiple),
+                            Math.Max(multiple, (int)Math.Floor(height * f / multiple) * multiple));
+            }
+            return new DiffusionCanvas(sampling, (width, height));
         }
+
+        /// <summary>diffusers' get_image_canvas_size: a picture below <see cref="MinGenerationArea"/> is scaled up by
+        /// <c>sqrt(min / area)</c>; either way both sides round to <paramref name="multiple"/>.</summary>
+        public static (int Width, int Height) EditCanvas(int width, int height, int multiple = MiniMaxH3ImageDiffusionModel.SizeMultiple)
+        {
+            double scale = Math.Max(1.0, Math.Sqrt(MinGenerationArea / ((double)width * height)));
+            return (Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(width * scale, multiple)),
+                    Math.Max(multiple, MiniMaxH3ImageReferences.RoundToMultiple(height * scale, multiple)));
+        }
+
+        /// <summary>A decode resized to the returned size with Pillow's Lanczos on 8 bits, as diffusers' decode step resizes
+        /// it (VaeImageProcessor.resize).</summary>
+        public RgbImage ResizeOutput(RgbImage image, int width, int height) =>
+            MiniMaxH3ImageReferences.PillowResize(image, width, height);
 
         /// <summary>[text | references | target] (<see cref="MiniMaxH3ImageLayout.Build"/>), carried as the denoiser's
         /// <see cref="DiffusionLayout.FamilyLayout"/>.</summary>
@@ -211,16 +290,6 @@ namespace TensorSharp.Models.MiniMaxH3Image
             if (s.Channels != Channels || s.Frames != 1 || s.Height <= 0 || s.Width <= 0 || s.Height % Patch != 0 || s.Width % Patch != 0)
                 throw new ArgumentException($"MiniMax-H3-Image latents are [{Channels}, 1, H, W] with even H and W, not {s}.");
             return s;
-        }
-
-        /// <summary>Editing (reference pictures) is stage S5's.</summary>
-        private sealed class NoReferences : IReferencePolicy
-        {
-            private static NotSupportedException Refused() => new("MiniMax-H3-Image does not edit images on the diffusion runtime yet.");
-            public PresentedImage ForVision(RgbImage image, int index) => throw Refused();
-            public RgbImage ForVae(RgbImage image, int index) => throw Refused();
-            public LatentRef FromPosterior(LatentPosterior posterior, int index, INoiseSource noise) => throw Refused();
-            public void Augment(LatentRef reference, INoiseSource noise) => throw Refused();
         }
     }
 }

@@ -273,6 +273,11 @@ namespace TensorSharp.Models.SharedDiffusion
                 : throw new InvalidOperationException($"The diffusion load has no {role} file.");
     }
 
-    /// <summary>The request a component sizes its working memory for.</summary>
-    public readonly record struct DiffusionWorkload(LatentShape Target, IReadOnlyList<LatentShape> References, string Prompt);
+    /// <summary>The request a component sizes its working memory for: the target's and the references' latents, the
+    /// prompt, and the references as the conditioner sees them (<see cref="Pictures"/>, empty without references).</summary>
+    public readonly record struct DiffusionWorkload(LatentShape Target, IReadOnlyList<LatentShape> References, string Prompt)
+    {
+        /// <summary>The references' vision copies (<see cref="IReferencePolicy.ForVision"/>), in order.</summary>
+        public IReadOnlyList<PresentedImage> Pictures { get; init; } = Array.Empty<PresentedImage>();
+    }
 }

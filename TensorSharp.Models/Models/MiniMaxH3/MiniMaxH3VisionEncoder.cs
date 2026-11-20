@@ -466,6 +466,41 @@ namespace TensorSharp.Models.MiniMaxH3
             };
         }
 
+        /// <summary>Bytes the tower's weights take on the device once an encode has bound them (every pinned or mapped
+        /// tensor it binds).</summary>
+        public long DeviceWeightBytes
+        {
+            get
+            {
+                long total = (long)(_patchEmbed.Ne0 * _patchEmbed.Ne1 * ElementBytes(_patchEmbed.Type));
+                foreach (H3VisBlockW b in _blocks)
+                    total += LinBytes(b.Qkv) + LinBytes(b.Proj) + LinBytes(b.Fc1) + LinBytes(b.Fc2) + 4L * Dim * 4;
+                foreach (H3VisMerger m in _mergers)
+                    total += LinBytes(m.Fc1) + LinBytes(m.Fc2);
+                return total;
+            }
+        }
+
+        private static long LinBytes(H3Lin l) => (long)(l.Ne0 * l.Ne1 * ElementBytes(l.Type)) + (l.B != IntPtr.Zero ? 4L * l.Ne1 : 0);
+
+        // Bytes an element of a ggml type takes, averaged over its blocks (the tower's weights are F32, F16 or BF16; a
+        // quantized one counts at about a byte).
+        private static double ElementBytes(int type) => (GgmlTensorType)type switch
+        {
+            GgmlTensorType.F32 => 4,
+            GgmlTensorType.F16 or GgmlTensorType.BF16 => 2,
+            _ => 1,
+        };
+
+        /// <summary>Hand the tower's device copies back (a diffusion pipeline's phase residency); the weights stay pinned and
+        /// mapped, so the next encode uploads them from memory.</summary>
+        public void ReleaseDeviceResidency()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            foreach (IntPtr ptr in _bound)
+                if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
+        }
+
         public void Dispose()
         {
             if (_disposed) return;

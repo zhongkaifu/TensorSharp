@@ -569,6 +569,16 @@ struct TSGgmlMiniMaxH3TextEncodeDesc
     std::int32_t causal;     // 1 = causal mask
     float eps;
     std::int32_t num_deepstack;
+    // 1 = the causal attention through ggml_flash_attn_ext (F16 K/V with h3_attend's power-of-two V pre-scale, an F16
+    // causal mask) instead of the materialized [seq, seq, heads] F32 scores. 0 builds the graph this function has always
+    // built. ggml-cuda's tensor-core kernel sums V in half precision (fattn-mma-f16.cuh's half2 VKQ tiles): the trunk's
+    // output moved by rel. L2 0.09 from its F32 scores at 1,076 rows on an A40. query_chunk keeps the F32 scores.
+    std::int32_t flash_attention;
+    // > 0 (and below seq, flash_attention 0) = the materialized attention a block of query_chunk query rows at a time,
+    // each against only the keys it can see: the same F32 scores, softmax and products as the whole [seq, seq, heads]
+    // tensor, in [keys, query_chunk, heads] pieces. MiniMax-H3-Image's edits ask for it: their pictures' vision rows make
+    // sequences whose whole scores would not fit (16 pictures, ~17K rows: 70 GB).
+    std::int32_t query_chunk;
 };
 
 TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d)
@@ -590,8 +600,15 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         { set_last_error("MiniMaxH3TextEncode: bad head geometry."); return 0; }
         const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
+        const bool flash = d->flash_attention != 0;
+        // Query blocks of the materialized attention (query_chunk): each block's rows see keys [0, end of the block).
+        const int chunk = !flash && d->query_chunk > 0 && d->query_chunk < seq ? d->query_chunk : 0;
+        const int chunks = chunk > 0 ? (seq + chunk - 1) / chunk : 0;
+        const std::size_t chunkNodes = static_cast<std::size_t>(nl) * chunks * 16;
+
         PooledContextHandle context;
-        if (!context.init(32ull * 1024 * 1024))
+        if (!context.init(32ull * 1024 * 1024 + (chunkNodes + chunks) * ggml_tensor_overhead() +
+                          (chunks > 0 ? ggml_graph_overhead_custom(static_cast<std::size_t>(nl) * 104 + 2048 + chunkNodes, false) : 0)))
         { set_last_error("MiniMaxH3TextEncode: ctx alloc failed."); return 0; }
         ggml_context* ctx = context.value;
 
@@ -654,7 +671,32 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         // sweep and fall back to the per-op path.
         ggml_tensor* causalMask = nullptr;
         std::vector<float> causalMaskData;
-        if (d->causal != 0)
+        std::vector<ggml_fp16_t> causalMaskF16;
+        // A query block's mask: F16 [keys, rows] (0 and -inf, exact in F16), one per block, shared by every layer.
+        struct ChunkMask { int start, rows, keys; ggml_tensor* mask; std::vector<ggml_fp16_t> data; };
+        std::vector<ChunkMask> chunkMasks;
+        if (chunks > 0)
+        {
+            const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+            chunkMasks.resize(static_cast<std::size_t>(chunks));
+            for (int c = 0; c < chunks; c++)
+            {
+                ChunkMask& m = chunkMasks[static_cast<std::size_t>(c)];
+                m.start = c * chunk;
+                m.rows = std::min(chunk, seq - m.start);
+                m.keys = d->causal != 0 ? m.start + m.rows : seq;
+                m.mask = nullptr;
+                if (d->causal == 0) continue;
+                m.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m.keys, m.rows);
+                ggml_set_input(m.mask);
+                m.data.assign(static_cast<std::size_t>(m.keys) * m.rows, zero);
+                for (int r = 0; r < m.rows; r++)
+                    std::fill(m.data.begin() + static_cast<std::size_t>(r) * m.keys + m.start + r + 1,
+                              m.data.begin() + static_cast<std::size_t>(r + 1) * m.keys, neg_inf);
+            }
+        }
+        else if (d->causal != 0 && !flash)
         {
             causalMask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
             ggml_set_input(causalMask);
@@ -664,6 +706,20 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
                 for (int k = q + 1; k < seq; k++)
                     causalMaskData[static_cast<std::size_t>(q) * seq + k] = neg_inf;
         }
+        else if (d->causal != 0)
+        {
+            // ggml_flash_attn_ext's mask: F16 [n_kv, n_q], contiguous.
+            causalMask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, seq, seq);
+            ggml_set_input(causalMask);
+            const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+            causalMaskF16.assign(static_cast<std::size_t>(seq) * seq, zero);
+            for (int q = 0; q < seq; q++)
+                std::fill(causalMaskF16.begin() + static_cast<std::size_t>(q) * seq + q + 1,
+                          causalMaskF16.begin() + static_cast<std::size_t>(q + 1) * seq, neg_inf);
+        }
+        // The flash path's V pre-scale: the CUDA kernel's FP16 numerator sums over up to `seq` keys (h3_flash_v_scale).
+        const float flashVScale = flash ? h3_flash_v_scale(seq) : 1.0f;
 
         // Qwen3-VL injects the vision tower's DeepStack taps into the first layers.
         const int nds = d->deepstack != nullptr ? d->num_deepstack : 0;
@@ -701,13 +757,62 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
             k = h3_vit_rope(ctx, k, cosf, sinS, hd, kvh, seq, hd);
 
             ggml_tensor* qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-            ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-            ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp);              // GQA broadcasts kv heads
-            ggml_tensor* probs = ggml_soft_max_ext(ctx, kq, causalMask, scale, 0.0f);
-            ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
-            ggml_tensor* kqv = ggml_mul_mat(ctx, vt, probs);
-            ggml_tensor* merged = ggml_reshape_2d(ctx,
-                ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), heads * hd, seq);
+            ggml_tensor* merged = nullptr;
+            if (flash)
+            {
+                // [hd, seq, heads] queries, F16 [hd, seq, kv_heads] keys and values (GQA broadcasts the kv heads); the
+                // result is [hd, heads, seq].
+                ggml_tensor* kf = ggml_cast(ctx, ggml_permute(ctx, k, 0, 2, 1, 3), GGML_TYPE_F16);
+                ggml_tensor* vp = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+                ggml_tensor* vf = ggml_cast(ctx, flashVScale == 1.0f ? vp : ggml_scale(ctx, vp, 1.0f / flashVScale), GGML_TYPE_F16);
+                ggml_tensor* out = ggml_flash_attn_ext(ctx, qp, kf, vf, causalMask, scale, 0.0f, 0.0f);
+                ggml_prec_set_acc(out, GGML_PREC_F32);
+                merged = ggml_reshape_2d(ctx, ggml_cont(ctx, out), heads * hd, seq);
+                if (flashVScale != 1.0f) merged = ggml_scale(ctx, merged, flashVScale);
+            }
+            else if (chunks > 0)
+            {
+                // The materialized attention a query block at a time, each block's rows against the keys they can
+                // see, merged back in row order by a balanced concat.
+                ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));   // [hd, seq, kv_heads]
+                ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));   // [seq, hd, kv_heads]
+                std::vector<ggml_tensor*> parts;
+                parts.reserve(static_cast<std::size_t>(chunks));
+                for (const ChunkMask& m : chunkMasks)
+                {
+                    ggml_tensor* qc = ggml_cont(ctx, ggml_view_3d(ctx, qp, hd, m.rows, heads, qp->nb[1], qp->nb[2],
+                                                                  static_cast<std::size_t>(m.start) * qp->nb[1]));
+                    ggml_tensor* kc = m.keys == seq ? kp
+                        : ggml_cont(ctx, ggml_view_3d(ctx, kp, hd, m.keys, kvh, kp->nb[1], kp->nb[2], 0));
+                    ggml_tensor* vc = m.keys == seq ? vt
+                        : ggml_cont(ctx, ggml_view_3d(ctx, vt, m.keys, hd, kvh, vt->nb[1], vt->nb[2], 0));
+                    ggml_tensor* kq = ggml_mul_mat(ctx, kc, qc);                         // [keys, rows, heads]
+                    ggml_tensor* probs = ggml_soft_max_ext(ctx, kq, m.mask, scale, 0.0f);
+                    ggml_tensor* kqv = ggml_mul_mat(ctx, vc, probs);                     // [hd, rows, heads]
+                    parts.push_back(ggml_reshape_2d(ctx,
+                        ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), heads * hd, m.rows));
+                }
+                while (parts.size() > 1)
+                {
+                    std::vector<ggml_tensor*> next;
+                    next.reserve((parts.size() + 1) / 2);
+                    for (std::size_t i = 0; i + 1 < parts.size(); i += 2)
+                        next.push_back(ggml_concat(ctx, parts[i], parts[i + 1], 1));
+                    if (parts.size() % 2 != 0) next.push_back(parts.back());
+                    parts.swap(next);
+                }
+                merged = parts[0];
+            }
+            else
+            {
+                ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+                ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp);              // GQA broadcasts kv heads
+                ggml_tensor* probs = ggml_soft_max_ext(ctx, kq, causalMask, scale, 0.0f);
+                ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
+                ggml_tensor* kqv = ggml_mul_mat(ctx, vt, probs);
+                merged = ggml_reshape_2d(ctx,
+                    ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), heads * hd, seq);
+            }
             h = ggml_add(ctx, h, lin(ow, merged, ob, /*guard*/ true));
 
             // ---- SwiGLU ----
@@ -732,7 +837,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         ggml_tensor* copied = ggml_cpy(ctx, h, outT);
         ggml_set_output(copied);
 
-        const std::size_t nodes = static_cast<std::size_t>(nl) * 104 + 2048;
+        const std::size_t nodes = static_cast<std::size_t>(nl) * 104 + 2048 + chunkNodes;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, nodes, false);
         if (graph == nullptr)
         { set_last_error("MiniMaxH3TextEncode: graph alloc failed."); return 0; }
@@ -761,8 +866,13 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
             ggml_backend_tensor_set(deepstack, d->deepstack, 0, ggml_nbytes(deepstack));
         ggml_backend_tensor_set(cosf, d->cosf, 0, static_cast<std::size_t>(hd) * seq * f);
         ggml_backend_tensor_set(sinf, d->sinf, 0, static_cast<std::size_t>(hd) * seq * f);
-        if (causalMask)
+        if (causalMask && !flash)
             ggml_backend_tensor_set(causalMask, causalMaskData.data(), 0, causalMaskData.size() * f);
+        else if (causalMask)
+            ggml_backend_tensor_set(causalMask, causalMaskF16.data(), 0, causalMaskF16.size() * sizeof(ggml_fp16_t));
+        for (const ChunkMask& m : chunkMasks)
+            if (m.mask != nullptr)
+                ggml_backend_tensor_set(m.mask, m.data.data(), 0, m.data.size() * sizeof(ggml_fp16_t));
 
         if (h3_compute(g_backend, graph, "minimax-h3/text-encode") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3TextEncode: graph compute failed."); return 0; }

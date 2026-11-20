@@ -440,20 +440,26 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
     /// <summary>Editing is stage S5's: the family refuses references; its components need their files (a load without
     /// them names the missing role).</summary>
     [Fact]
-    public void TheFamilyRefusesEditsAndComponentsWithoutTheirFiles()
+    public void TheFamilyRefusesMasksAndComponentsWithoutTheirFiles()
     {
         var family = new MiniMaxH3ImageFamily(MiniMaxH3ImageSampling.ReleaseSigmas);
         var image = new TensorSharp.Models.QwenImage.RgbImage(32, 32, new float[32 * 32 * 3]);
-        Assert.Throws<ArgumentException>(() => family.ResolveCanvas(new DiffusionRequest
+        // Edits are taken (MiniMaxH3ImageEditTests); masked edits are not yet.
+        Assert.Equal(new DiffusionCanvas((2048, 2048), (1024, 1024)), family.ResolveCanvas(new DiffusionRequest
         {
             Prompt = "x",
             References = new[] { new DiffusionReference(image) },
         }, null));
+        Assert.Contains("mask", Assert.Throws<ArgumentException>(() => family.ResolveCanvas(new DiffusionRequest
+        {
+            Prompt = "x",
+            References = new[] { new DiffusionReference(image) },
+        }, EditMask.Create(new EditMaskOptions { Mask = image }, image))).Message);
         Assert.Equal(DiffusionCanvas.Of(2048, 2048), family.ResolveCanvas(new DiffusionRequest { Prompt = "x" }, null));
         Assert.Equal(DiffusionCanvas.Of(1024, 512), family.ResolveCanvas(new DiffusionRequest { Prompt = "x", Width = 1024, Height = 512 }, null));
         var load = new DiffusionLoad { Backend = TestGates.PinnedGgmlBackend };
         Assert.Contains("text-encoder", Assert.Throws<InvalidOperationException>(() => family.CreateConditioner(load)).Message);
         Assert.Contains("vae", Assert.Throws<InvalidOperationException>(() => family.CreateVae(load)).Message);
-        Assert.Throws<NotSupportedException>(() => family.References.ForVae(image, 0));
+        Assert.Equal((1024, 1024), (family.References.ForVae(image, 0).Width, family.References.ForVae(image, 0).Height));
     }
 }

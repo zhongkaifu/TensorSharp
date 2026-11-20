@@ -10,7 +10,7 @@
 >
 > TensorSharp is an independent inference engine. Its technical compatibility with MiniMax-H3-Image does **not** grant a license, waive restrictions, or imply authorization or endorsement by MiniMax. **You are solely responsible for determining whether your intended use is permitted and for all risks, consequences, claims, penalties, damages, and other liabilities arising from your use or noncompliance. To the fullest extent permitted by applicable law, TensorSharp, its authors, contributors, and maintainers disclaim any responsibility or liability for your use of MiniMax-H3-Image, its outputs, or any violation of its license or applicable law.** This notice does not override the MiniMax license or limit liability where such limitation is prohibited by law.
 
-MiniMax-H3-Image is MiniMax's text-to-image model built from the MiniMax-H3 video
+MiniMax-H3-Image is MiniMax's text-to-image and image-editing model built from the MiniMax-H3 video
 model: the same 33B single-stream DiT (50 blocks, hidden 5376, 56 heads of 128) with
 its audio stream removed, the same Qwen3-VL-32B text encoder (layer-50 hidden
 states), and a new image VAE whose 2-D ViT decoder reads the H3 latent space. It is
@@ -19,14 +19,13 @@ head per step of the checkpoint's own sigma grid, and there is no negative promp
 It works from about 4 MP to 20 MP and is best around 16 MP (4096x4096, 4736x3552,
 5024x3360, 5472x3072, 6272x2688).
 
-TensorSharp runs text to image on its shared diffusion runtime
-(`TensorSharp.Models.SharedDiffusion`: the MiniMax-H3-Image family, its text encoder,
-denoiser and VAE decoder, run phase by phase by one pipeline) on `ggml_cuda`,
-`ggml_metal` and `ggml_cpu`, end to end. It has been run with real weights on
-`ggml_cuda` (an H100 and an A40) and on `ggml_metal` (an M5 Pro); `ggml_cpu` runs the
-same programs (validated on small synthetic checkpoints; with real weights it takes tens
-of minutes a picture). Editing with reference images (`<Picture 1>` ...) is not
-implemented yet.
+TensorSharp runs text to image and editing (up to 16 reference pictures, [Editing](#editing))
+on its shared diffusion runtime (`TensorSharp.Models.SharedDiffusion`: the MiniMax-H3-Image
+family, its text encoder with the vision tower, denoiser and VAE encoder and decoder, run
+phase by phase by one pipeline) on `ggml_cuda`, `ggml_metal` and `ggml_cpu`, end to end. It
+has been run with real weights on `ggml_cuda` (an H100 and an A40) and on `ggml_metal` (an
+M5 Pro); `ggml_cpu` runs the same programs (validated on small synthetic checkpoints; with
+real weights it takes tens of minutes a picture). Masked edits are not implemented yet.
 
 | Component | File | Source |
 |---|---|---|
@@ -61,8 +60,11 @@ downloads, so the two configurations share it. The text encoder and VAE are foun
 beside the denoiser or passed with the MiniMax-H3 companion flags,
 `--video-text-encoder` and `--video-vae` (`TS_VIDEO_TEXT_ENCODER`, `TS_VIDEO_VAE`).
 
-The server serves it on the image routes (`/api/image-generate`,
-`/api/image-generate/stream`) like Qwen-Image-2.1, and the ComfyUI node pack has a
+The server serves it on the image routes (`/api/image-generate`, `/api/image-edit` and their
+`/stream` forms) like Qwen-Image-2.1, and on the OpenAI-shaped `/v1/images/generations` and
+`/v1/images/edits` in the shapes SGLang serves (MiniMax's `examples/t2i.py` and
+`examples/edit.py` work unchanged against them; [API examples](../../TensorSharp.Server.Host/API_EXAMPLES.md#openai-image-routes-v1imagesgenerations-v1imagesedits)).
+The ComfyUI node pack has a
 launch profile for it, `minimax-h3-image` (`examples/comfyui/profiles/`), for the
 **TensorSharp Image** node, and `minimax-h3-image-int8` with int8 projections
 (`TS_H3_INT8_MATMUL=1`, [Performance](#performance)).
@@ -78,6 +80,60 @@ Request settings:
 - **Seed**: the initial latent is drawn exactly as ComfyUI's KSampler draws it
   (CPU `torch.randn` with `torch.manual_seed(seed)`), so the same seed starts from
   the same latent in both.
+
+## Editing
+
+```bash
+TensorSharp.Cli --config config/minimax-h3-image.json \
+  --image studio.png --image poster.png --width 2048 --height 2048 --diffusion-seed 1234 \
+  --prompt "Hang <Picture 2> as a framed print on the wall behind the two hosts of <Picture 1>." \
+  --output edit.png
+```
+
+An edit takes up to 16 reference pictures (`--image`, repeated; `imagePaths` or the
+`image` parts on the server). The prompt names them `<Picture 1>`, `<Picture 2>`, ... in the
+order they are given, and is used verbatim. TensorSharp follows MiniMax's own pipeline as
+diffusers implements it (main d5df05ed), which conditions on every picture twice:
+
+- **Copies.** Each picture is read upright (EXIF orientation applied) as RGB. A side
+  under 32 pixels is refused. The *VAE copy* keeps the picture when its short edge is
+  1024 to 2048 pixels, otherwise it is scaled to the nearer bound with both sides rounded
+  to 32; the *vision copy* is scaled to a short edge of exactly 1024 and then fitted by the
+  Qwen3-VL processor's rule (sides multiples of 32). Both use Pillow's Lanczos on 8 bits
+  (the processor's own step uses Pillow's bicubic), byte for byte. References are never
+  resized to the output.
+- **Text encoder.** For each picture the label `Picture i: `, then its vision block
+  (`<|vision_start|>`, one `<|image_pad|>` per merged 32x32 patch, `<|vision_end|>`),
+  then the prompt; label and prompt rows are tagged text, the vision blocks image. The
+  vision tower's output replaces the pads and its DeepStack taps join after the first
+  three layers. A 1024x1024 vision copy is 1,024 rows, so many pictures make a long
+  sequence; past about 2,000 rows the trunk computes its attention scores a block of
+  query rows at a time (the same scores, in pieces of at most 1 GiB).
+- **VAE encoder.** The VAE copy (cropped to whole 16-pixel cells) goes through the image
+  VAE's encoder (the H3 causal 3-D CNN at one frame) in 256-pixel tiles overlapping by at
+  least 64; the tiles' moments are blended as diffusers blends them and form the
+  posterior. A sample of it (rounded to float16, cropped to whole 2x2 patches, normalized)
+  is the reference's latent, noised to t = 0.999 and held there for every step.
+- **Packed sequence.** `[text | references | target]`: reference k is one step of the time
+  axis after the text with its own aspect-normalized grid, the target after the last
+  reference. Text and target run at t = 1 - sigma, the references at 0.999.
+- **Seed.** One CPU torch generator per request draws, in MiniMax's order, each
+  reference's posterior sample, then the target's noise, then each reference's noise. An
+  edit therefore never restarts from its source picture's noise.
+- **Size.** `--width`/`--height` (multiples of 32, at most 20 MP); `--keep-source-size`
+  returns `<Picture 1>`'s exact size; otherwise `<Picture 1>`'s aspect at the request's
+  area (the server's 2048x2048 default), or on the CLI its VAE copy's size. An edit below
+  2048x2048 samples on a larger canvas of the same aspect (diffusers'
+  `min_generation_area`) and is resized back with Lanczos. Text to image keeps its own
+  size (no floor).
+- **Refusals.** `cfg` above 1, a negative prompt, a mask, more than 16 references, a side
+  under 32 pixels, and an edit whose references make its sequence longer than the
+  device's memory holds (the message names the rows; fewer or smaller references fit).
+
+Each reference costs rows twice: about 1,024 text rows for its vision block and, in the
+DiT, (VAE copy / 32)² rows (1,024 for a 1024x1024 copy, 4,096 for 2048x2048). Sixteen
+1024x1024 references beside a 2048x2048 target are about 37,000 DiT rows, nine times a
+text-to-image step's; attention grows with the square.
 
 ## How it runs
 
@@ -206,6 +262,53 @@ products and bf16 at 2048x2048 on the A40 and for Q8_0 on the M5 Pro, 2 prompts 
 Q4_K_M and int8 at 4096x4096, 1 for bf16 at 4096x4096. On the M5 Pro the earlier path
 needed its text encoder released and its decoder held to 4 tiles a call to run at all.
 
+### Editing
+
+One A40 46 GB (`ggml_cuda`) and one M5 Pro 48 GB (`ggml_metal`, Q8_0), 2048x2048 edits, six steps, one process an edit
+with its files read cold (evicted from the page cache first on the A40), so these are first-edit numbers. Text is the
+encode without the vision tower; vision is the tower over every picture; VAE encode is every reference's tiles; a step
+is the median of steps 2 to 6. The 1, 4 and 16 references are 1024x1024 pictures (1,024 DiT rows and about 1,024 text
+rows each); the text edit has one 2048x2048 reference (4,096 rows), the composition two (or two 1024x1024 ones), and
+MiniMax's example is `examples/edit.py`'s picture and prompt at 2048x2048.
+
+| A40, Q4_K_M | Rows (text + references + target) | Text | Vision | VAE encode | Per step | Decode | Edit | Peak |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 reference | 1,076 + 1,024 + 4,096 | 3.19 s | 1.12 s | 0.93 s (25 tiles) | 3.44 s | 1.15 s | 33.0 s | 32.8 GiB |
+| 4 references | 4,189 + 4,096 + 4,096 | 8.47 s | 1.98 s | 2.63 s (100) | 9.35 s | 1.13 s | 74.2 s | 36.1 GiB |
+| 16 references | 16,635 + 16,384 + 4,096 | 38.88 s | 6.15 s | 9.91 s (400) | 49.15 s | 1.54 s | 356.3 s | 42.5 GiB |
+| text edit (1 at 2048x2048) | 1,091 + 4,096 + 4,096 | 4.07 s | 0.93 s | 3.05 s (121) | 5.48 s | 1.24 s | 46.0 s | 33.7 GiB |
+| composition (2 at 2048x2048) | 2,125 + 8,192 + 4,096 | 5.44 s | 1.53 s | 6.60 s (242) | 9.62 s | 1.19 s | 76.3 s | 36.1 GiB |
+| composition (2 at 1024x1024) | 2,125 + 2,048 + 4,096 | 5.63 s | 1.30 s | 1.38 s (50) | 4.87 s | 1.15 s | 42.5 s | 34.3 GiB |
+| MiniMax's example (1 at 1024x1024) | 1,459 + 1,024 + 4,096 | 4.82 s | 0.98 s | 0.80 s (25) | 3.70 s | 1.09 s | 33.6 s | 33.2 GiB |
+
+| A40, bf16 | Rows | Text | Vision | VAE encode | Per step | Decode | Edit | Peak |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 reference | 1,076 + 1,024 + 4,096 | 4.43 s | 1.03 s | 0.75 s (25) | 3.01 s | 1.19 s | 41.1 s | 41.0 GiB |
+| 4 references | 4,189 + 4,096 + 4,096 | 8.37 s | 2.20 s | 2.77 s (100) | 8.64 s | 1.36 s | 83.2 s | 41.8 GiB |
+| 16 references | 16,635 + 16,384 + 4,096 | refused before it runs: a step needs about 52.1 GB of the 44.4 GB budget | | | | | | |
+| text edit (1 at 2048x2048) | 1,091 + 4,096 + 4,096 | 4.64 s | 0.94 s | 3.14 s (121) | 4.89 s | 1.14 s | 55.0 s | 40.4 GiB |
+| composition (2 at 2048x2048) | 2,125 + 8,192 + 4,096 | refused before it runs: a step needs about 44.9 GB of the 44.4 GB budget | | | | | | |
+| composition (2 at 1024x1024) | 2,125 + 2,048 + 4,096 | 5.94 s | 1.32 s | 1.37 s (50) | 4.29 s | 1.17 s | 51.4 s | 41.1 GiB |
+| MiniMax's example (1 at 1024x1024) | 1,459 + 1,024 + 4,096 | 4.96 s | 1.05 s | 0.76 s (25) | 3.20 s | 1.21 s | 42.2 s | 41.1 GiB |
+
+bf16's first step includes the 40 GB DiT's upload (the text encoder is released before it, as for text to image), which
+the edit times include. A text-to-image step at 2048x2048 is 2.2 s (Q4_K_M) and 1.9 s (bf16) on the same card
+([above](#a40-and-m5-pro)); a step's cost grows with the rows, and attention with their square. Sixteen 1024x1024
+references keep everything resident on the A40 with Q4_K_M (the planner drops only the text encoder's workspace before
+the denoise); with bf16 the same edit is refused before it runs, by the row budget, with the message naming its rows,
+as is a composition of two 2048x2048 references (two 1024x1024 ones fit). The text encoder materializes an edit's
+attention scores a block of query rows at a time once they pass 1 GiB (about 2,000 rows): 1,001 rows a block at four
+references, 252 at sixteen.
+
+| M5 Pro, Q8_0 | Rows | Text | Vision | VAE encode | Per step | Decode | Edit | Peak (allocated) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 reference | 1,076 + 1,024 + 4,096 | 3.59 s | 1.01 s | 3.54 s (25) | 19.98 s | 3.74 s | 134.3 s | 28.3 GB |
+| 4 references | 4,189 + 4,096 + 4,096 | 19.63 s | 3.91 s | 14.11 s (100) | 51.55 s | 3.83 s | 352.4 s | 33.0 GB |
+| 16 references | 16,635 + 16,384 + 4,096 | refused before it runs: a step needs about 49.8 GB of the 37.7 GB budget | | | | | | |
+| text edit (1 at 2048x2048) | 1,091 + 4,096 + 4,096 | 5.18 s | 1.25 s | 16.91 s (121) | 33.77 s | 3.81 s | 231.0 s | 30.7 GB |
+| composition (2 at 2048x2048) | 2,125 + 8,192 + 4,096 | 10.60 s | 2.15 s | 33.90 s (242) | 62.57 s | 3.78 s | 427.4 s | 34.5 GB |
+| MiniMax's example (1 at 1024x1024) | 1,459 + 1,024 + 4,096 | 7.77 s | 1.25 s | 3.52 s (25) | 21.47 s | 3.81 s | 146.3 s | 28.4 GB |
+
 ### H100
 
 The H100 numbers below were measured on the earlier native path; the runtime runs the
@@ -270,8 +373,7 @@ and 9.5 s with bf16 at 4 MP, against 55.1 s for ComfyUI's first job.
 
 ## Not implemented
 
-- Editing and reference images (the VAE encoder path and the `Picture n:` vision
-  blocks).
+- Masked edits (inpainting) and the multi-turn planner for this model.
 - The prompt expander (MiniMaxAI/MiniMax-H3-Image-PE). ComfyUI's text-to-image
   template leaves it off by default.
 - The `mlx`, `cuda` and `cpu` (pure C#) backends.
