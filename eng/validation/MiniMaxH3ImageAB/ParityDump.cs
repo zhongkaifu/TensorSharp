@@ -60,43 +60,66 @@ internal static class ParityDump
         return family.Info;
     }
 
-    /// <summary>The text encoder's two attentions on one edit's presentation: the causal flash attention edits run and the
-    /// materialized scores (affordable for a short sequence), compared row by row.</summary>
-    public static JsonObject FlashCheck(BackendType backend, string te, JsonNode job, string baseDir)
+    /// <summary>The text encoder's attentions on one edit's presentation, each against the whole materialized [seq, seq,
+    /// heads] scores (affordable for a short sequence): the query blocks edits use (<paramref name="chunk"/> rows, or the
+    /// conditioner's own choice when 0) and ggml's flash attention, row by row; the whole scores run twice and the second
+    /// run is the one timed.</summary>
+    public static JsonObject AttentionCheck(BackendType backend, string te, JsonNode job, string baseDir, int chunk)
     {
         var family = new MiniMaxH3ImageFamily(TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageSampling.ReleaseSigmas);
         var load = new DiffusionLoad { Backend = backend, Files = new Dictionary<string, string> { [DiffusionLoad.TextEncoder] = te } };
         using var conditioner = (MiniMaxH3ImageConditioner)family.CreateConditioner(load);
         string[] paths = ((JsonArray)job["images"]!).Select(x => Path.Combine(baseDir, (string)x!)).ToArray();
         var pictures = paths.Select((p, i) => family.References.ForVision(ImageIO.Load(p, preserveAlpha: true), i)).ToArray();
-        var clock = System.Diagnostics.Stopwatch.StartNew();
-        float[] flash = conditioner.Encode((string)job["prompt"]!, pictures, CancellationToken.None).Hidden;
-        double flashSeconds = clock.Elapsed.TotalSeconds;
-        conditioner.FlashAttentionForPictures = false;
-        clock.Restart();
-        float[] plain = conditioner.Encode((string)job["prompt"]!, pictures, CancellationToken.None).Hidden;
-        double plainSeconds = clock.Elapsed.TotalSeconds;
-        double dot = 0, a2 = 0, b2 = 0, d2 = 0, maxAbs = 0;
-        for (long i = 0; i < flash.LongLength; i++)
+        string prompt = (string)job["prompt"]!;
+        (float[] Hidden, double Seconds) Run(bool flash, int? queryChunk)
         {
-            dot += (double)flash[i] * plain[i]; a2 += (double)flash[i] * flash[i]; b2 += (double)plain[i] * plain[i];
-            double d = flash[i] - plain[i]; d2 += d * d; maxAbs = Math.Max(maxAbs, Math.Abs(d));
+            conditioner.FlashAttentionForPictures = flash;
+            conditioner.QueryChunkForPictures = queryChunk;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            float[] h = conditioner.Encode(prompt, pictures, CancellationToken.None).Hidden;
+            return (h, clock.Elapsed.TotalSeconds);
         }
-        int rows = flash.Length / 5120;
+        Run(false, 0);
+        var whole = Run(false, 0);
+        var chunked = Run(false, chunk > 0 ? chunk : null);
+        var flash = Run(true, null);
+        var o = new JsonObject
+        {
+            ["rows"] = whole.Hidden.Length / 5120, ["whole_seconds"] = whole.Seconds,
+            ["chunk"] = chunk > 0 ? chunk : MiniMaxH3ImageConditioner.QueryChunkFor(whole.Hidden.Length / 5120, 64),
+            ["chunked"] = Compare(chunked.Hidden, whole.Hidden, chunked.Seconds),
+            ["flash"] = Compare(flash.Hidden, whole.Hidden, flash.Seconds),
+        };
+        Console.WriteLine($"[h3img-ab] te attention check: {o.ToJsonString()}");
+        return o;
+    }
+
+    private static JsonObject Compare(float[] got, float[] want, double seconds)
+    {
+        double dot = 0, a2 = 0, b2 = 0, d2 = 0, maxAbs = 0;
+        long exact = 0;
+        for (long i = 0; i < got.LongLength; i++)
+        {
+            dot += (double)got[i] * want[i]; a2 += (double)got[i] * got[i]; b2 += (double)want[i] * want[i];
+            double d = got[i] - want[i]; d2 += d * d; maxAbs = Math.Max(maxAbs, Math.Abs(d));
+            if (BitConverter.SingleToInt32Bits(got[i]) == BitConverter.SingleToInt32Bits(want[i])) exact++;
+        }
+        int rows = got.Length / 5120;
         double worstRow = 1;
+        int worst = 0;
         for (int r = 0; r < rows; r++)
         {
             double rd = 0, ra = 0, rb = 0;
-            for (int c = 0; c < 5120; c++) { long i = (long)r * 5120 + c; rd += (double)flash[i] * plain[i]; ra += (double)flash[i] * flash[i]; rb += (double)plain[i] * plain[i]; }
-            worstRow = Math.Min(worstRow, rd / Math.Sqrt(ra * rb + 1e-30));
+            for (int c = 0; c < 5120; c++) { long i = (long)r * 5120 + c; rd += (double)got[i] * want[i]; ra += (double)got[i] * got[i]; rb += (double)want[i] * want[i]; }
+            double cos = rd / Math.Sqrt(ra * rb + 1e-30);
+            if (cos < worstRow) { worstRow = cos; worst = r; }
         }
-        var o = new JsonObject
+        return new JsonObject
         {
-            ["rows"] = rows, ["cosine"] = dot / Math.Sqrt(a2 * b2), ["worst_row_cosine"] = worstRow,
-            ["rel_l2"] = Math.Sqrt(d2 / b2), ["max_abs"] = maxAbs, ["flash_seconds"] = flashSeconds, ["materialized_seconds"] = plainSeconds,
+            ["cosine"] = dot / Math.Sqrt(a2 * b2), ["worst_row_cosine"] = worstRow, ["worst_row"] = worst,
+            ["rel_l2"] = Math.Sqrt(d2 / b2), ["max_abs"] = maxAbs, ["bit_exact"] = exact, ["seconds"] = seconds,
         };
-        Console.WriteLine($"[h3img-ab] te flash check: {o.ToJsonString()}");
-        return o;
     }
 
     /// <summary>The VAE encoder alone on the first job's references (their VAE copies and posteriors), for

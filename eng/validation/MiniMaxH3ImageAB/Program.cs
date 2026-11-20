@@ -205,11 +205,13 @@ if (Value("--vae-dump") is { } vaeDumpDir)
     return 0;
 }
 
-// ---- --te-flash-check: the text encoder's flash attention against its materialized scores on the first job
-if (Flag("--te-flash-check"))
+// ---- --te-attention-check [--te-chunk N]: the text encoder's query-block attention and its flash attention against the
+// whole materialized scores, on the first job
+if (Flag("--te-attention-check"))
 {
     JsonNode first = prompts.FirstOrDefault(x => (string?)x!["id"] == jobs[0]) ?? throw new ArgumentException($"no prompt '{jobs[0]}'");
-    result["te_flash_check"] = ParityDump.FlashCheck(backend, te, first, Path.GetDirectoryName(Path.GetFullPath(Required("--prompts")))!);
+    int chunk = Value("--te-chunk") is { } c ? int.Parse(c, System.Globalization.CultureInfo.InvariantCulture) : 0;
+    result["te_attention_check"] = ParityDump.AttentionCheck(backend, te, first, Path.GetDirectoryName(Path.GetFullPath(Required("--prompts")))!, chunk);
     stop.Cancel();
     sampler.Join();
     Save();
