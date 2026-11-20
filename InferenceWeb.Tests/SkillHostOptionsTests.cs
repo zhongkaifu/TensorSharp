@@ -75,6 +75,33 @@ public class SkillHostOptionsTests : IDisposable
 
     // ---- parsing -----------------------------------------------------------
 
+    [Theory]
+    [InlineData("--skills-dir", "skills")]
+    [InlineData("--skills-dir=skills", null)]
+    [InlineData("--skill", "docs")]
+    [InlineData("--skills-allow-exec", null)]
+    [InlineData("--skills-allow-network", null)]
+    public void Parse_NoSkillsBesideAnOptionThatNeedsSkills_IsRefused(string option, string value)
+    {
+        string[] args = value == null ? new[] { "--no-skills", option } : new[] { option, value, "--no-skills" };
+        string named = option.Split('=')[0];
+
+        var ex = Assert.Throws<ArgumentException>(() => SkillHostOptions.Parse(args));
+
+        Assert.Equal($"--no-skills turns Agent Skills off, so {named} would do nothing: pass one of them, not both.", ex.Message);
+    }
+
+    [Fact]
+    public void Parse_NoSkillsBesideOptionsThatDoNotNeedSkills_IsAccepted()
+    {
+        // --skills-max-rounds also bounds code-execution rounds; the sandbox and discovery settings are inert.
+        SkillHostOptions options = SkillHostOptions.Parse(
+            new[] { "--no-skills", "--skills-max-rounds", "32", "--skills-sandbox", "required", "--skills-no-discovery" });
+
+        Assert.False(options.Enabled);
+        Assert.Equal(32, options.MaxRounds);
+    }
+
     [Fact]
     public void Parse_TheSelectFlagIsRepeatable()
     {
@@ -112,15 +139,19 @@ public class SkillHostOptionsTests : IDisposable
     [Fact]
     public void Parse_TheFourBareSwitches_AreRead()
     {
+        // --skills-allow-exec beside --no-skills is refused (Parse_NoSkillsBesideAnOptionThatNeedsSkills_IsRefused),
+        // so the four switches are read in two runs.
         SkillHostOptions options = SkillHostOptions.Parse(new[]
         {
-            "--no-skills", "--list-skills", "--skills-no-discovery", "--skills-allow-exec",
+            "--no-skills", "--list-skills", "--skills-no-discovery",
         });
+        SkillHostOptions scripts = SkillHostOptions.Parse(new[] { "--skills-allow-exec" });
 
         Assert.False(options.Enabled);
         Assert.True(options.ListOnly);
         Assert.False(options.Discovery);
-        Assert.True(options.AllowScripts);
+        Assert.True(scripts.AllowScripts);
+        Assert.True(scripts.Enabled);
     }
 
     [Fact]

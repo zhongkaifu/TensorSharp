@@ -52,7 +52,10 @@
   "max-tokens": 1024,
   "temperature": 0,
   "repeat-penalty": 1,
-  "no-skills": true,
+
+  // Agent Skills stay on, as on any server: point --skills-dir at a skills folder (TensorAgent/skills in this checkout)
+  // to offer them; speculative decoding runs in the skill and tool rounds too. Pass --no-skills on the command line for
+  // benchmark runs (the numbers above were measured without them).
 
   "environment": {
     // The measured setup. The model declares 262,144 tokens; a larger window costs KV memory beside the 12 GB of

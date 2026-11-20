@@ -49,9 +49,12 @@
 
   "max-tokens": 1024,
   "temperature": 0,
-  "repeat-penalty": 1,
-  "no-skills": true
+  "repeat-penalty": 1
 
+  // Agent Skills stay on, as on any server: point --skills-dir at a skills folder (TensorAgent/skills
+  // in this checkout) to offer them; speculative decoding runs in the skill and tool rounds too. Pass
+  // --no-skills on the command line for benchmark runs (the numbers above were measured without them).
+  //
   // Not set, deliberately:
   //   "kv-cache-dtype": "q8_0" -- the same speed per step at these lengths, and half the KV
   //     memory; worth it for long contexts, where Metal charges the KV twice (host + mirror).
