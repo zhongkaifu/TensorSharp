@@ -364,10 +364,11 @@ public sealed class CatalogTests
         // as the pipeline plans them (LargestGpuPhaseOnAMac): for Q4_K_M the text encoder (18.22 GB + 0.64 GB; the
         // pipeline releases it before the denoise wherever the GPU's working set cannot hold both), for Q8_0 the
         // denoise at 2048x2048 (22.03 GB + 3.09 GB measured on Metal by stage S4). Footprints: Q4_K_M measured
-        // 2026-11-19 through AgentAppHost (eng/validation/TensorAgentHost, CoreCLR, /usr/bin/time -l) over a
-        // 1024x1024 picture from /api/chat, every component resident on the 48 GB Mac (33.1 GB wired at the peak);
-        // Q8_0 the CLI's peak footprint over a 2048x2048 picture on the same Mac (the bf16 verification's run m3).
-        ["minimax-h3-image-q4km"] = (18.86, 1.24, "a 1024x1024 picture through AgentAppHost's /api/chat, phys_footprint_peak"),
+        // 2026-11-19 through AgentAppHost (eng/validation/TensorAgentHost, CoreCLR, /usr/bin/time -l) over three turns
+        // of /api/chat, a 2048x2048 picture, a pDMD picture and a masked pDMD edit (the edit's reference copies are the
+        // peak), every component resident on the 48 GB Mac (39.2 GB wired at the peak); Q8_0 the CLI's peak footprint
+        // over a 2048x2048 picture on the same Mac (the bf16 verification's run m3).
+        ["minimax-h3-image-q4km"] = (18.86, 4.38, "a 2048x2048 picture, a pDMD picture and a masked pDMD edit through AgentAppHost's /api/chat, phys_footprint_peak"),
         ["minimax-h3-image-q8-0"] = (25.12, 1.43, "a 2048x2048 picture in the CLI, peak footprint"),
         // Measured 2026-10-01 in the Debug Mac app: the files are what stays resident (the dense
         // half and the 15 layers' experts the engine keeps on the GPU); the rest is read from the

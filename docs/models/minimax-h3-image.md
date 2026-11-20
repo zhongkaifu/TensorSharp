@@ -501,10 +501,11 @@ and includes the uploads; later pictures are warm.
 | Q8_0, first picture | 1.71 s | 12.82 s | 3.45 s | 82.6 s |
 | Q8_0, later pictures | 1.70 s | 12.67 s | 2.72 s | 81.1 s |
 
-On the same Mac the TensorAgent host (`eng/validation/TensorAgentHost`, the app's `AgentAppHost`) made a
-1024x1024 picture from a chat message with the Q4_K_M entry, every component resident (33.1 GB wired at the
-peak, the process's peak footprint 1.24 GB): text 2.46 s, 2.97 s a step (5.33 s for the first, which uploads
-the DiT), decode 0.69 s, 23.6 s in all.
+On the same Mac the TensorAgent host (`eng/validation/TensorAgentHost`, the app's `AgentAppHost`) with the Q4_K_M
+entry, every component resident, made from chat messages: a 2048x2048 picture (the app's turn area) in 89.1 s (text
+3.08 s, 13.64 s a step, decode 3.93 s); with the pDMD plug-in on, a 1024x1024 picture in 7.8 s (2 steps of 3.47 s)
+and a masked edit of it in 30.6 s (2 steps of 10.6 s; every unselected pixel kept). Peak 39.2 GB wired, the
+process's peak footprint 4.38 GB.
 
 On the same machines, against the earlier native path in alternating processes, no
 phase took more than 1.4% longer and most took the same or less (the decode up to 13%
