@@ -33,6 +33,10 @@ real weights it takes tens of minutes a picture). Masked edits are not implement
 | Text encoder (shared with MiniMax-H3) | `qwen3vl_32b_minimax_h3-Q4_K_M.gguf`, 16.97 GiB, with `vocab.json`, `merges.txt`, `tokenizer_config.json` | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF), [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor) |
 | Image VAE | `minimax_h3_image_vae_fp16.safetensors`, 1.17 GB | [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image/tree/main/vae) |
 
+Smaller denoisers, Unsloth's GGUFs of the same pruned DiT, run with the same text encoder and
+VAE: [Quantizations](#quantizations) has their measured quality and speed and the config for
+each, and the TensorAgent app lists two of them ([TensorAgent](#tensoragent)).
+
 The denoiser is read from the safetensors file directly, in its original tensor
 names: there is no GGUF to make. A GGUF holding the same tensors (for a smaller
 quantization) loads as well; it is recognised by its tensors (the H3 DiT with no
@@ -80,6 +84,66 @@ Request settings:
 - **Seed**: the initial latent is drawn exactly as ComfyUI's KSampler draws it
   (CPU `torch.randn` with `torch.manual_seed(seed)`), so the same seed starts from
   the same latent in both.
+
+## Quantizations
+
+[unsloth/MiniMax-H3-Image-GGUF](https://huggingface.co/unsloth/MiniMax-H3-Image-GGUF/tree/0d25c7349e007529691bbc0f4426b579fce7de01)
+(at `0d25c734`) quantizes Comfy-Org's pruned DiT; a GGUF loads as the bf16 file does, beside the
+same text encoder and VAE. Four DiTs have a config, each pinned by revision and SHA-256 and sharing
+the other files (same paths):
+
+| DiT | File, bytes | Config | Runs on (measured) |
+|---|---|---|---|
+| bf16 | `minimax_h3_image_pruned_bf16.safetensors`, 40,234,657,162 | [`minimax-h3-image.json`](../../config/minimax-h3-image.json) | A40 46 GB to 4096x4096, H100; not a 48 GB Mac |
+| Q8_0 | `minimax_h3_image_pruned-Q8_0.gguf`, 22,026,760,928 | [`minimax-h3-image-q8.json`](../../config/minimax-h3-image-q8.json) | A40 46 GB, M5 Pro 48 GB; refused on 20 GB |
+| Q5_K_M | `minimax_h3_image_pruned-Q5_K_M.gguf`, 14,599,107,296 | [`minimax-h3-image-q5km.json`](../../config/minimax-h3-image-q5km.json) | RTX A4500 20 GB to 3840x3840 |
+| Q4_K_M | `minimax_h3_image_pruned-Q4_K_M.gguf`, 12,721,119,968 | [`minimax-h3-image-q4km.json`](../../config/minimax-h3-image-q4km.json) | RTX A4500 20 GB to 4480x4480, A40, M5 Pro |
+
+**Quality.** The same prompt, seed and size (2048x2048, six steps) against the bf16 DiT: four
+prompts (a portrait, a sign and banner with Chinese and English text, a landscape, a watercolour
+illustration), PSNR of the 8-bit RGB picture and SSIM.
+
+| DiT | RTX A4500 (`ggml_cuda`) against bf16 on `ggml_cpu`, mean of four | A40 (`ggml_cuda`) against bf16 on the A40: portrait / text / landscape / illustration |
+|---|---|---|
+| Q8_0 | does not fit 20 GB | 27.7 / 22.9 / 28.4 / 17.6 dB |
+| Q6_K | 21.84 dB / 0.840 | |
+| Q5_K_M | 21.81 dB / 0.835 | |
+| UD-Q4_K_XL | 19.65 dB / 0.791 | |
+| Q4_K_M | 17.29 dB / 0.725 | 18.9 / 16.2 / 21.6 / 13.3 dB |
+| Q3_K_M | 17.06 dB / 0.703 | |
+
+A six-step distilled sampler turns a small difference in a step into a moved composition, so even
+the best quantizations sit at 17-28 dB: Q8_0 against bf16 on the same CPU backend is 26.7 dB, and
+the same Q6_K weights on CUDA against CPU are 29.3 dB. Differences of 1-2 dB between the top
+quantizations are within that; the 4-5 dB down to Q4_K_M and Q3_K_M are not. Every picture is
+coherent and follows its prompt. Q8_0 keeps bf16's composition in all four; Q5_K_M and Q6_K are
+near copies of the portrait and write the banner cleanly; Q4_K_M changes faces and objects and, in
+the text prompt, adds a second sign of garbled lettering; Q3_K_M shrinks the banner and adds a
+garbled line.
+
+**Speed and memory on 20 GB.** One RTX A4500 (`ggml_cuda`, sm_86), 2048x2048, six steps, the
+runtime's defaults (the text encoder is released before the denoise there). A step is the median of
+steps 2 to 6 over three fresh processes; the CLI picture is the whole process; the warm picture is
+a server's second and third request (each re-uploads the DiT, which cannot stay beside the
+encoder); the peak is the process's, CUDA context included.
+
+| DiT | Per step | CLI picture | Warm server picture | Peak | Largest square that runs |
+|---|---:|---:|---:|---:|---|
+| Q3_K_M | 3.68 s | 30.4 s | 29.5 s (a noisy spell on the shared host) | 15.2 GiB | 4480x4480 |
+| Q4_K_M | 3.32 s | 28.6 s | 24.8 s | 15.2 GiB | 4480x4480 (18.9 GiB) |
+| UD-Q4_K_XL | 3.66 s | 31.5 s | 26.4 s | 15.6 GiB | 4096x4096 |
+| Q5_K_M | 3.88 s | 32.0 s | 27.6 s | 16.6 GiB | 3840x3840 (19.0 GiB) |
+| Q6_K | 4.22 s | 34.5 s | 30.2 s | 17.4 GiB | 3328x3328 (19.2 GiB) |
+| Q8_0 | refused | | | | none: its DiT alone is 22.0 GB |
+
+Every picture was the same, bit for bit, as the earlier native path's at the same seed, and a size
+the card cannot hold is refused before any phase runs ([Memory](#memory)). The A40 and M5 Pro
+timings are under [Performance](#performance).
+
+**Which one.** 20-24 GB GPU: Q5_K_M (the closest that fits, clean text), or Q4_K_M for 16-20 MP
+output. 32 GB Mac: Q4_K_M (the text encoder's phase, 18.9 GB with its working memory, is the
+largest; Q8_0's denoise is past a 32 GB Mac's GPU working set). 46-48 GB GPU or 48 GB Mac: Q8_0.
+80 GB and up: bf16.
 
 ## Editing
 
@@ -237,6 +301,7 @@ and includes the uploads; later pictures are warm.
 | Q4_K_M, first picture | 3.25 s | 2.23 s | 1.22 s | 21.0 s |
 | Q4_K_M, later pictures | 0.08 s | 2.24 s | 0.69 s | 14.3 s |
 | Q4_K_M, `TS_H3_INT8_MATMUL=1`, later pictures | 0.08 s | 1.88 s | 0.68 s | 12.1 s |
+| Q8_0, first picture (earlier native path, the text encoder released; the runtime's pictures are the same) | 3.6-4.0 s | 2.39 s | 1.18-1.21 s | 24.1-24.8 s |
 | bf16, first picture (the text encoder released before the denoise) | 3.07 s | 1.92 s | 1.20 s | 29.7 s |
 | bf16, later pictures (both reloaded from disk each time) | 4.27 s | 1.91 s | 0.73 s | 34.2 s |
 
@@ -251,6 +316,11 @@ and includes the uploads; later pictures are warm.
 |---|---:|---:|---:|---:|
 | Q8_0, first picture | 1.71 s | 12.82 s | 3.45 s | 82.6 s |
 | Q8_0, later pictures | 1.70 s | 12.67 s | 2.72 s | 81.1 s |
+
+On the same Mac the TensorAgent host (`eng/validation/TensorAgentHost`, the app's `AgentAppHost`) made a
+1024x1024 picture from a chat message with the Q4_K_M entry, every component resident (33.1 GB wired at the
+peak, the process's peak footprint 1.24 GB): text 2.46 s, 2.97 s a step (5.33 s for the first, which uploads
+the DiT), decode 0.69 s, 23.6 s in all.
 
 On the same machines, against the earlier native path in alternating processes, no
 phase took more than 1.4% longer and most took the same or less (the decode up to 13%
@@ -370,6 +440,53 @@ and 9.5 s with bf16 at 4 MP, against 55.1 s for ComfyUI's first job.
   a few levels (9 to 12 dB PSNR between the engines; at 4 MP the composition can
   differ). Prompt adherence and the rendered text (a calendar reading "十一月 11")
   held in both.
+
+## TensorAgent
+
+The TensorAgent app lists two entries, under MiniMax H3 on its Models page:
+
+| Entry | DiT | Download | Offered from |
+|---|---|---|---|
+| `minimax-h3-image-q4km` | Q4_K_M | 12,721,119,968-byte DiT + 18,218,065,024-byte text encoder + 1,168,505,312-byte VAE + `vocab.json`, `merges.txt`, `tokenizer_config.json` (4.46 MB); 32.1 GB | 32 GB of system memory |
+| `minimax-h3-image-q8-0` | Q8_0 | 22,026,760,928-byte DiT + the same companions; 41.4 GB | 48 GB |
+
+The files are those of `minimax-h3-image-q4km.json` and `minimax-h3-image-q8.json`, at the same
+pinned revisions and SHA-256. The text encoder and tokenizer files are the MiniMax-H3 video entry's,
+byte for byte: an installation that has one entry links them from it instead of downloading 18.2 GB
+again. With the model loaded, a message is a description of a picture, or, with photos attached,
+an edit that names them `<Picture 1>`, `<Picture 2>`, ... in order, as for Qwen-Image 2.1.
+
+- **Tiers.** Q4_K_M's largest phase is the text encoder's (18.2 GB of weights and 0.6 GB of working
+  memory); the pipeline releases it before the denoise wherever the GPU's working set cannot hold
+  both, as on a 32 GB Mac (about 22.9 GB). Q8_0's denoise needs 22.0 GB of weights and 3.1 GB of
+  working memory at 2048x2048, past that working set, so it starts at 48 GB (measured on an M5 Pro
+  48 GB: 29.9 GB wired).
+- **Not marked experimental.** Their quality against the bf16 DiT is measured
+  ([Quantizations](#quantizations)) and stated on each row: Q4_K_M is the furthest of the four and
+  can add stray lettering; Q8_0 is the closest.
+- **License acceptance.** MiniMax-H3-Image's license limits where and by whom it may be used, so
+  before an entry's first download the Models page shows its terms: a summary in the interface
+  language (the territory exclusion of the United States, the European Union, the United Kingdom
+  and the Republic of Korea; MiniMax's written authorization past USD 1 million of annual revenue or
+  for a hosted service; "MiniMax-H3-Image" shown in a commercial product; the use restrictions; a
+  copy of the license and a NOTICE file with a redistribution; Hong Kong law), then the license
+  text itself, verbatim, and a link to it on Hugging Face. **Accept and download** starts the
+  download; **Decline**, or closing the page, starts nothing.
+  - The answer is kept in `license-acceptances.json` in the app's data folder (not its cache), per
+    entry and per license revision: the SHA-256 of the text the app ships
+    (`0ec3bb5e...`, MiniMaxAI/MiniMax-H3-Image at `8ced6006`; Unsloth's repository carries the
+    version before MiniMax's 2026-11-11 change, which differs in the authorization link only).
+    Each entry asks for itself; a catalog that ships a new text asks again and says the terms
+    changed; a decline withdraws an acceptance of the current text.
+  - The download manager refuses an entry whose terms are not accepted, whoever starts it: the
+    Models page's buttons, a resume when the app comes back, the desktop host's HTTP route.
+    There, `POST /api/agent/catalog/{id}/download` answers `409` with `licenseRequired` and the
+    terms, `GET /api/agent/catalog/{id}/license` returns them with the text, and
+    `POST /api/agent/catalog/{id}/license` with `{"revision": "...", "accept": true}` records an
+    acceptance (`409` when the revision is not the current one) and `"accept": false` a decline
+    (which also stops the entry's running download). `/api/agent/catalog` describes each entry's
+    `licenseTerms` (null for every entry that asks nothing).
+  - Every other entry downloads as before, with no question.
 
 ## Not implemented
 

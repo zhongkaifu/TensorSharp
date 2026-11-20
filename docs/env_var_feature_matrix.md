@@ -284,6 +284,20 @@ GGML-only switches (`TS_QWEN21_GRAPH_REUSE`, `TS_QWEN21_FLASH`,
 `TS_QWEN21_PAD_MASK`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no
 effect there.
 
+## Out-of-Matrix MiniMax-H3-Image Knobs
+
+MiniMax-H3-Image runs on the shared diffusion runtime, whose residency plan, VAE program and
+refusals need no variable. These are the names it still reads, and one it no longer does; none is
+registered in `EnvVarMatrix.All`. The [model guide](models/minimax-h3-image.md) has the
+measurements.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_VIDEO_TEXT_ENCODER` / `TS_VIDEO_VAE` / `TS_VIDEO_TOKENIZER` | MiniMax-H3-Image (and MiniMax-H3) | The text encoder GGUF, the image VAE, and the folder holding `vocab.json`, `merges.txt` and `tokenizer_config.json`, as `--video-text-encoder` and `--video-vae` set them; TensorAgent publishes them from its catalog entry | found beside the denoiser (and its parent folder) by file name | not registered | no |
+| `TS_H3_INT8_MATMUL` | MiniMax-H3-Image and MiniMax-H3 DiT products on `ggml_cuda` that run on cuBLAS (BF16 weights, and Q4_K projections, which take that route) | `1` rounds each weight row and token to int8 per call and multiplies on int8 tensor cores: 17% faster at 16 MP on an H100 (bf16), 13-16% less per step on an A40 (Q4_K_M), 17.5-19.8 dB from the bf16 picture | unset (the weights' own products) | not registered | no |
+| `TS_H3_TE_GROUP` | the MiniMax-H3 text encoder trunk (both models) | `N` runs the trunk N layers at a time and drops each group's device copies (bit-identical conditioning). MiniMax-H3-Image no longer needs it on a 20 GB card: the pipeline releases the whole encoder before the denoise | off (one call) | not registered | no |
+| `TS_H3_IMAGE_VAE_BATCH` | the earlier native MiniMax-H3-Image decoder only | **No longer read by the production path** (since the runtime's VAE program sizes its own graph, one row of up to 64 tiles). Read only by the legacy decoder that the migration keeps as a test oracle (and `eng/validation/MiniMaxH3ImageAB --legacy-vae-batch`); its name is retired with that code, after which setting it is an error naming the replacement | 64 tiles a call | not registered | no |
+
 ## Out-of-Matrix Speculative-Decoding Knobs
 
 These gate the optional speculative decode path in `TensorSharp.Cli` and

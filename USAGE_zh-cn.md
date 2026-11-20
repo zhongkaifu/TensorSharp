@@ -185,6 +185,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 
 # MiniMax-H3-Image：不带 --image 时生成图像（默认 2048x2048、6 步）；带 --image 时用最多 16 张参考图
 # 编辑，提示词按命令行顺序称它们为 <Picture 1>、<Picture 2>……。见 docs/models/minimax-h3-image_zh-cn.md#图像编辑。
+# 该配置使用 bf16 DiT；minimax-h3-image-q8.json、-q5km.json 与 -q4km.json 换成量化 DiT，分别适用于
+# 46-48 GB、20-24 GB 与 20 GB 显卡（见 docs/models/minimax-h3-image_zh-cn.md#量化版本）。
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
     --image cabin.png --image mug.png --width 2048 --height 2048 --diffusion-seed 7 \
     --prompt "Put the black mug from <Picture 2> on the table in front of the cabin in <Picture 1>." --output mug.png

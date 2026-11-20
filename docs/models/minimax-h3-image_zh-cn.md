@@ -29,6 +29,9 @@ TensorSharp 在其共享扩散运行时（`TensorSharp.Models.SharedDiffusion`�
 | 文本编码器（与 MiniMax-H3 共用） | `qwen3vl_32b_minimax_h3-Q4_K_M.gguf`，16.97 GiB，以及 `vocab.json`、`merges.txt`、`tokenizer_config.json` | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)、[MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor) |
 | 图像 VAE | `minimax_h3_image_vae_fp16.safetensors`，1.17 GB | [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image/tree/main/vae) |
 
+更小的去噪器（Unsloth 对同一裁剪 DiT 制作的 GGUF）搭配同一个文本编码器和 VAE 运行：各自的实测画质、速度
+和配置见[量化版本](#量化版本)，TensorAgent 应用列出了其中两个（见 [TensorAgent](#tensoragent)）。
+
 去噪器直接从 safetensors 文件按原始张量名读取，无需转换为 GGUF。包含相同张量的
 GGUF（用于更小的量化）同样可以加载，依据张量识别（没有 `audio_patch_proj` 的 H3 DiT）。
 这也包括 ComfyUI-GGUF 转换工具生成的 GGUF，例如
@@ -68,6 +71,58 @@ TensorSharp.Server.Host --config config/minimax-h3-image.json
 - **Guidance**：固定为 1。`cfg` 大于 1 或负面提示词会被拒绝。
 - **种子**：初始潜变量按 ComfyUI KSampler 的方式生成（CPU `torch.randn`，
   `torch.manual_seed(seed)`），因此相同种子在两者中从相同的潜变量出发。
+
+## 量化版本
+
+[unsloth/MiniMax-H3-Image-GGUF](https://huggingface.co/unsloth/MiniMax-H3-Image-GGUF/tree/0d25c7349e007529691bbc0f4426b579fce7de01)
+（`0d25c734`）对 Comfy-Org 裁剪后的 DiT 做了量化；GGUF 与 bf16 文件的加载方式相同，搭配同一个文本编码器
+和 VAE。下列四种 DiT 各有一个配置，均固定版本与 SHA-256，其余文件共用（路径相同）：
+
+| DiT | 文件，字节数 | 配置 | 实测可运行于 |
+|---|---|---|---|
+| bf16 | `minimax_h3_image_pruned_bf16.safetensors`，40,234,657,162 | [`minimax-h3-image.json`](../../config/minimax-h3-image.json) | A40 46 GB（至 4096x4096）、H100；48 GB Mac 不行 |
+| Q8_0 | `minimax_h3_image_pruned-Q8_0.gguf`，22,026,760,928 | [`minimax-h3-image-q8.json`](../../config/minimax-h3-image-q8.json) | A40 46 GB、M5 Pro 48 GB；20 GB 显卡上被拒绝 |
+| Q5_K_M | `minimax_h3_image_pruned-Q5_K_M.gguf`，14,599,107,296 | [`minimax-h3-image-q5km.json`](../../config/minimax-h3-image-q5km.json) | RTX A4500 20 GB（至 3840x3840） |
+| Q4_K_M | `minimax_h3_image_pruned-Q4_K_M.gguf`，12,721,119,968 | [`minimax-h3-image-q4km.json`](../../config/minimax-h3-image-q4km.json) | RTX A4500 20 GB（至 4480x4480）、A40、M5 Pro |
+
+**画质。** 相同提示词、种子和尺寸（2048x2048、6 步）下与 bf16 DiT 对比：四个提示词（人像、带中英文
+文字的招牌与横幅、风景、水彩插画），8 位 RGB 图片的 PSNR 与 SSIM。
+
+| DiT | RTX A4500（`ggml_cuda`）对 `ggml_cpu` 上的 bf16，四个提示词的平均 | A40（`ggml_cuda`）对 A40 上的 bf16：人像 / 文字 / 风景 / 插画 |
+|---|---|---|
+| Q8_0 | 放不进 20 GB | 27.7 / 22.9 / 28.4 / 17.6 dB |
+| Q6_K | 21.84 dB / 0.840 | |
+| Q5_K_M | 21.81 dB / 0.835 | |
+| UD-Q4_K_XL | 19.65 dB / 0.791 | |
+| Q4_K_M | 17.29 dB / 0.725 | 18.9 / 16.2 / 21.6 / 13.3 dB |
+| Q3_K_M | 17.06 dB / 0.703 | |
+
+6 步蒸馏采样器会把单步里的微小差异放大成构图的移动，所以即使是最好的量化也只在 17-28 dB：同一 CPU
+后端上 Q8_0 对 bf16 为 26.7 dB，同一份 Q6_K 权重在 CUDA 与 CPU 之间也只有 29.3 dB。前几档量化之间
+1-2 dB 的差异在此范围之内；降到 Q4_K_M 和 Q3_K_M 的 4-5 dB 则不是。所有图片都连贯且符合提示词。Q8_0
+在四张图上都保持了 bf16 的构图；Q5_K_M 和 Q6_K 的人像几乎与 bf16 相同，横幅文字干净；Q4_K_M 会改变
+面孔和物体，并在文字提示词中多出一块文字错乱的招牌；Q3_K_M 把横幅缩小，并多出一行错乱的文字。
+
+**20 GB 显卡上的速度与内存。** 一张 RTX A4500（`ggml_cuda`，sm_86），2048x2048，6 步，运行时默认设置
+（在这张卡上去噪前会释放文本编码器）。每步为三个全新进程中第 2-6 步的中位数；CLI 一张图为整个进程的时间；
+服务端热态一张图为第二、三个请求（每次都要重新上传 DiT，它放不进文本编码器旁边）；峰值为整个进程的峰值，
+含 CUDA 上下文。
+
+| DiT | 每步 | CLI 一张图 | 服务端热态一张图 | 峰值 | 可运行的最大正方形 |
+|---|---:|---:|---:|---:|---|
+| Q3_K_M | 3.68 s | 30.4 s | 29.5 s（共享主机负载偏高时） | 15.2 GiB | 4480x4480 |
+| Q4_K_M | 3.32 s | 28.6 s | 24.8 s | 15.2 GiB | 4480x4480（18.9 GiB） |
+| UD-Q4_K_XL | 3.66 s | 31.5 s | 26.4 s | 15.6 GiB | 4096x4096 |
+| Q5_K_M | 3.88 s | 32.0 s | 27.6 s | 16.6 GiB | 3840x3840（19.0 GiB） |
+| Q6_K | 4.22 s | 34.5 s | 30.2 s | 17.4 GiB | 3328x3328（19.2 GiB） |
+| Q8_0 | 被拒绝 | | | | 无：仅 DiT 就有 22.0 GB |
+
+相同种子下每张图都与早先的原生路径逐位一致；显卡放不下的尺寸会在任何阶段运行之前被拒绝（见[内存](#内存)）。
+A40 和 M5 Pro 的耗时见[性能](#性能)。
+
+**如何选择。** 20-24 GB 显卡：Q5_K_M（放得下的最接近 bf16 的一档，文字干净），需要 16-20 MP 输出时用
+Q4_K_M。32 GB Mac：Q4_K_M（最大的阶段是文本编码器，连同工作内存 18.9 GB；Q8_0 的去噪超出 32 GB Mac
+的 GPU 工作集）。46-48 GB 显卡或 48 GB Mac：Q8_0。80 GB 及以上：bf16。
 
 ## 图像编辑
 
@@ -189,6 +244,7 @@ UD-Q4_K_XL 为 4096x4096，Q5_K_M 为 3840x3840，Q6_K 为 3328x3328；超出这
 | Q4_K_M，第一张 | 3.25 s | 2.23 s | 1.22 s | 21.0 s |
 | Q4_K_M，后续 | 0.08 s | 2.24 s | 0.69 s | 14.3 s |
 | Q4_K_M，`TS_H3_INT8_MATMUL=1`，后续 | 0.08 s | 1.88 s | 0.68 s | 12.1 s |
+| Q8_0，第一张（早先的原生路径，释放文本编码器；运行时生成的图片相同） | 3.6-4.0 s | 2.39 s | 1.18-1.21 s | 24.1-24.8 s |
 | bf16，第一张（去噪前释放文本编码器） | 3.07 s | 1.92 s | 1.20 s | 29.7 s |
 | bf16，后续（每次都从磁盘重新加载两者） | 4.27 s | 1.91 s | 0.73 s | 34.2 s |
 
@@ -203,6 +259,10 @@ UD-Q4_K_XL 为 4096x4096，Q5_K_M 为 3840x3840，Q6_K 为 3328x3328；超出这
 |---|---:|---:|---:|---:|
 | Q8_0，第一张 | 1.71 s | 12.82 s | 3.45 s | 82.6 s |
 | Q8_0，后续 | 1.70 s | 12.67 s | 2.72 s | 81.1 s |
+
+在同一台 Mac 上，TensorAgent 宿主（`eng/validation/TensorAgentHost`，即应用的 `AgentAppHost`）用 Q4_K_M 条目
+根据一条聊天消息生成了一张 1024x1024 的图片，所有组件都保持驻留（峰值 33.1 GB wired，进程峰值 footprint
+1.24 GB）：文本 2.46 s，每步 2.97 s（第一步上传 DiT，为 5.33 s），解码 0.69 s，共 23.6 s。
 
 在相同机器上与先前的原生路径交替进程对比：没有任何阶段慢超过 1.4%，多数持平或更快（解码最多快 13%；
 第一张图的文本阶段快 11% 至 37%，因为编码器文件现在在该阶段开始前就已映射），设备峰值内存相差不超过
@@ -299,6 +359,42 @@ TensorSharp 读取 bf16 DiT 与 Q4_K_M 编码器。ComfyUI 的采样时间取自
   逐像素并不一致：Q4_K_M 编码器对 INT8、bf16 或逐次 int8 对 ComfyUI 的 INT8 权重与内核，这些差异
   在 6 步蒸馏采样中被放大（两个引擎之间 PSNR 为 9 至 12 dB；4 MP 时构图可能不同）。两者都遵循了
   提示词，并正确写出了日历上的“十一月 11”。
+
+## TensorAgent
+
+TensorAgent 应用在模型页的 MiniMax H3 下列出两个条目：
+
+| 条目 | DiT | 下载 | 起始内存档 |
+|---|---|---|---|
+| `minimax-h3-image-q4km` | Q4_K_M | 12,721,119,968 字节的 DiT + 18,218,065,024 字节的文本编码器 + 1,168,505,312 字节的 VAE + `vocab.json`、`merges.txt`、`tokenizer_config.json`（4.46 MB）；共 32.1 GB | 32 GB 系统内存 |
+| `minimax-h3-image-q8-0` | Q8_0 | 22,026,760,928 字节的 DiT + 同样的配套文件；共 41.4 GB | 48 GB |
+
+这些文件就是 `minimax-h3-image-q4km.json` 与 `minimax-h3-image-q8.json` 的文件，版本与 SHA-256 相同。
+文本编码器和分词器文件与 MiniMax-H3 视频条目的逐字节相同：已装有其中一个条目时，另一个直接链接这些文件，
+不会再下载 18.2 GB。加载模型后，一条消息就是对图片的描述；附上照片时则是编辑，提示词按顺序称它们为
+`<Picture 1>`、`<Picture 2>`……，与 Qwen-Image 2.1 相同。
+
+- **内存档。** Q4_K_M 最大的阶段是文本编码器（18.2 GB 权重和 0.6 GB 工作内存）；当 GPU 工作集放不下两者时
+  （例如 32 GB Mac 约 22.9 GB），流水线会在去噪前释放它。Q8_0 的去噪在 2048x2048 时需要 22.0 GB 权重和
+  3.1 GB 工作内存，超出这个工作集，因此从 48 GB 起提供（在 48 GB 的 M5 Pro 上实测 29.9 GB wired）。
+- **不标记为实验性。** 它们相对 bf16 DiT 的画质已经实测（见[量化版本](#量化版本)），并写在每个条目的说明里：
+  Q4_K_M 是四档中差距最大的一档，可能多出零散的文字；Q8_0 最接近。
+- **许可接受。** MiniMax-H3-Image 的许可限制了谁可以在哪里使用它，因此在条目第一次下载之前，模型页会显示其
+  条款：界面语言的摘要（不包括美国、欧盟、英国和大韩民国的地域限制；年收入超过 100 万美元或提供托管服务时须
+  获得 MiniMax 的书面授权；商业产品须显示“MiniMax-H3-Image”；使用限制；转交时须附许可副本和 NOTICE 文件；
+  适用香港法律），然后是许可原文（逐字照录）以及 Hugging Face 上的链接。**接受并下载**才会开始下载；
+  **拒绝**或关闭页面则什么也不会开始。
+  - 选择保存在应用数据文件夹（不是缓存）中的 `license-acceptances.json`，按条目和许可版本分别记录：版本是
+    应用随附文本的 SHA-256（`0ec3bb5e...`，即 MiniMaxAI/MiniMax-H3-Image 的 `8ced6006`；Unsloth 仓库里是
+    MiniMax 在 2026-11-11 修改之前的版本，仅授权链接不同）。每个条目各自询问；目录随附新文本时会再次询问，
+    并说明条款已更改；拒绝会撤回对当前文本的接受。
+  - 无论由谁发起，下载管理器都会拒绝条款未被接受的条目：模型页的按钮、应用回到前台时的续传、桌面宿主的 HTTP
+    路由。在桌面宿主上，`POST /api/agent/catalog/{id}/download` 返回 `409`，带 `licenseRequired` 和条款；
+    `GET /api/agent/catalog/{id}/license` 返回条款及原文；`POST /api/agent/catalog/{id}/license` 带
+    `{"revision": "...", "accept": true}` 记录接受（版本不是当前版本时返回 `409`），带 `"accept": false`
+    记录拒绝（同时停止该条目正在进行的下载）。`/api/agent/catalog` 为每个条目给出 `licenseTerms`（不需要
+    接受的条目为 null）。
+  - 其他所有条目照旧下载，不会询问。
 
 ## 尚未实现
 

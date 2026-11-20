@@ -230,7 +230,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 
 # MiniMax-H3-Image: no --image generates an image (2048x2048 by default, 6 steps); --image
 # edits with up to 16 reference pictures, which the prompt names <Picture 1>, <Picture 2>, ...
-# in command-line order. See docs/models/minimax-h3-image.md#editing.
+# in command-line order. See docs/models/minimax-h3-image.md#editing. The config is the bf16 DiT;
+# minimax-h3-image-q8.json, -q5km.json and -q4km.json are the same with a quantized DiT for
+# 46-48 GB, 20-24 GB and 20 GB GPUs (docs/models/minimax-h3-image.md#quantizations).
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
     --image cabin.png --image mug.png --width 2048 --height 2048 --diffusion-seed 7 \
     --prompt "Put the black mug from <Picture 2> on the table in front of the cabin in <Picture 1>." --output mug.png

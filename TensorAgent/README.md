@@ -280,8 +280,15 @@ Qwen3.8 27B and Muse-Glimmer 30B are models a phone could run only at one or two
 offered at three and four bits where the memory exists; Qwen-Image 2.1 makes and edits pictures, and
 Qwen-Image 2.1 Turbo, the same model distilled to 8 steps, does it in about a fifth of the
 time, its transformer at four bits or, closer to full precision, eight (with the same 4-bit
-text encoder either way); and the single MiniMax-H3 entry carries both denoisers
-and makes short videos with their own soundtrack. Video Studio switches between first/last-frame and reference modes without
+text encoder either way); the single MiniMax-H3 entry carries both denoisers
+and makes short videos with their own soundtrack; and MiniMax-H3-Image, its DiT without the
+audio stream, makes and edits pictures in six steps with the same text encoder (shared on
+disk), at four bits from 32 GB or eight from 48 GB. Its license excludes the United States,
+the European Union, the United Kingdom and the Republic of Korea and asks for MiniMax's
+authorization past USD 1 million of revenue or for a hosted service, so the Models page shows
+its terms, summarized in the interface language and in full, and downloads it only after the
+user accepts them; the acceptance is kept per entry and license revision, and a changed
+license asks again ([the model guide](../docs/models/minimax-h3-image.md#tensoragent)). Video Studio switches between first/last-frame and reference modes without
 reloading the shared model. **LTX 2.5 Distilled** adds text/image-to-video with
 48 kHz stereo audio, first/last frames and multiple image keyframes; its experimental
 48 GB entry includes the custom Gemma 4 prompt encoder and two-stage upscale recipe.
@@ -309,6 +316,8 @@ See [The desktop's larger models](#the-desktops-larger-models) for the historica
 | Qwen-Image 2.1 Turbo (Q5_K_S) | text or a photo in, a picture out, in 8 steps | download: 4,501,948,224-byte DiT, plus the same three companions as Qwen-Image 2.1 (6.9 GB), linked from it when installed | 24 GB | `unsloth/Qwen-Image-2.1-Turbo-GGUF` + the Qwen-Image 2.1 companions |
 | Qwen-Image 2.1 Turbo (Q8_0) | text or a photo in, a picture out, in 8 steps | download: 7,640,860,480-byte DiT, plus the same three companions | 32 GB | `unsloth/Qwen-Image-2.1-Turbo-GGUF` + the Qwen-Image 2.1 companions |
 | MiniMax-H3 (Q4_K) | text, first/last-frame photos, or up to nine reference photos/recordings; attached videos continue from their last frame; a video with soundtrack out | download: both denoisers (11,420,663,904 and 11,381,096,544 bytes) + shared Qwen3-VL-32B text encoder, video/audio VAEs and three tokenizer files (24.0 GB); 8 files total, about 46.8 GB | 32 GB | `unsloth/MiniMax-H3-GGUF` + `MiniMaxAI/MiniMax-H3` (tokenizer files) |
+| MiniMax-H3-Image (Q4_K_M) | text, or up to 16 photos and what to do with them, in; a picture out, in 6 steps | download: 12,721,119,968-byte DiT + 1,168,505,312-byte image VAE + MiniMax-H3's Qwen3-VL-32B text encoder and three tokenizer files (18.2 GB, linked from the MiniMax-H3 entry when installed); about 32.1 GB. **Its license terms are shown and must be accepted before the download** | 32 GB | `unsloth/MiniMax-H3-Image-GGUF` + `Comfy-Org/MiniMax-H3-Image` (VAE) + the MiniMax-H3 companions |
+| MiniMax-H3-Image (Q8_0) | the same, the DiT closest to full precision | download: 22,026,760,928-byte DiT + the same companions; about 41.4 GB. License accepted before the download, as above | 48 GB | the same |
 | LTX 2.5 Distilled (UD-Q4_K_XL + BF16) | text or image keyframes in; video with 48 kHz stereo audio out | five pinned files, 43,077,008,276 bytes (43.08 GB): distilled denoiser, custom Gemma 4 12B prompt encoder, video/audio VAEs and x2 latent upscaler; ungated downloads | 48 GB, experimental | `unsloth/LTX-2.5-GGUF` |
 
 Additional entries in [ModelCatalog.Extended.cs](src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs)
@@ -372,8 +381,9 @@ or a different search is shown. A hidden download finishing does not interrupt b
 The list includes every entry, but only one that fits the device's memory tier
 can be loaded: an entry that needs more is shown greyed, marked "Too big" with both
 numbers, rather than hidden. Bonsai 2 27B needs the 16 GB tier, Qwen-Image 2.1 and its
-4-bit Turbo the 24 GB tier, Qwen3.8 27B, Muse-Glimmer 30B, the 8-bit Turbo, both MiniMax-H3
-entries and Qwen3.8 Flash Next UD-IQ1_M the 32 GB tier, and Flash Next UD-Q2_K_XL the 48 GB tier. Larger entries
+4-bit Turbo the 24 GB tier, Qwen3.8 27B, Muse-Glimmer 30B, the 8-bit Turbo, MiniMax-H3, the 4-bit
+MiniMax-H3-Image and Qwen3.8 Flash Next UD-IQ1_M the 32 GB tier, and Flash Next UD-Q2_K_XL and the
+8-bit MiniMax-H3-Image the 48 GB tier. Larger entries
 use workstation tiers up to 512 GB; the card shows the requirement. Eligibility uses system RAM on both Mac and Windows;
 it does not certify every backend or device at that tier. For an installed model
 whose optional projector is missing, **Add vision** downloads just the projector.
@@ -1534,7 +1544,8 @@ TensorAgent/
   skills/           17 source packs (15 bundled on iOS), plus static runtime verdicts and provenance
   python-runtime/   staged CPython (not in git; produced by prepare-python.sh)
   src/TensorAgent.Core/
-    Catalog/        the model list, the store, install state
+    Catalog/        the model list, the store, install state, license terms and their acceptances
+                    (Licenses/: the license texts the app shows verbatim)
     Downloads/      resumable, verified downloads, and the manager that owns them
     Sessions/       conversations, and the recorder that keeps them in step with the page
     Settings/       the two sandbox switches and the rest
@@ -1554,7 +1565,7 @@ TensorAgent/
                     iOS share sheet, NSItemProvider readers, Safari preprocessing
   src/TensorAgent.Maui/
     MainPage        the WebView, the attachment row, dictation
-    Pages/          models, chats, settings, about
+    Pages/          models (and the license terms asked before a download), chats, settings, about
     Hosting/        where the files live on this device; the engine and media probes
     Services/Apple/ device memory, Quick Look and dictation, for iOS and the Mac app
     Platforms/iOS/  app and scene lifecycle, background downloads and generation,
@@ -1680,6 +1691,20 @@ SHA-256) is hard-linked from there rather than downloaded, before the first tran
 starts, and the Models page counts only what will be fetched. The MiniMax-H3 entry
 downloads both denoisers and six shared companion files once; its alternate denoiser
 stays available for mode switching without a second model entry.
+
+**A license that must be accepted is asked for before the download, every time it changes.**
+An entry whose license limits where and by whom it may be used declares its terms in the
+catalog (`CatalogModel.LicenseTerms`; today only the two MiniMax-H3-Image entries). Before its
+first download the Models page shows them -- a summary in the interface language, the license
+text verbatim (shipped with the app, so it is readable before anything is fetched) and a link to
+it -- and starts the download only on **Accept and download**; **Decline** or closing the page
+starts nothing. The answer is kept in `license-acceptances.json` in the app's data folder, per
+entry and per license revision (the SHA-256 of that text), so another entry, or a catalog that
+ships a new text, asks again. The gate is in the store and the download manager, not the page:
+a resume, the debug download hook and `POST /api/agent/catalog/{id}/download` (which answers
+`409` with the terms; the answer goes to `POST /api/agent/catalog/{id}/license`) are refused the
+same way. Entries without terms are unaffected. See
+[the MiniMax-H3-Image guide](../docs/models/minimax-h3-image.md#tensoragent).
 
 An entry published as several shards of one model (Qwen3.8 Flash Next's three gguf-split
 files) counts as installed only when every shard is complete. The app refuses to load one

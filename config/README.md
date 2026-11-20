@@ -245,6 +245,7 @@ be reported separately from the ordinary text/image-to-video path.
 | [`lora/qwen-image-2.1-*.json`](lora/) | Fourteen Qwen-Image-2.1 LoRA plug-ins (each downloads its weights; Fun-Acc also its `pdd_config.json`) | `--lora` plug-ins for Qwen-Image-2.1; Film Stills, Grainscape, Casual Phone Photo and Voxel Style also work with the official 8-step Turbo checkpoint; see [below](#qwen-image-21-lora-plug-ins-lora) |
 | [`lora/minimax-h3-fl2v-turbo-*.json`](lora/) | Two MiniMax-H3 FL2VA LoRA plug-ins (each downloads its 1.38 GB of weights) | `--lora` step-distillation plug-ins for the FL2VA checkpoint: LightX2V Turbo, 8 or 4 steps on a locked recipe; see [below](#minimax-h3-turbo-plug-ins) |
 | [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA + Ref2VA denoisers, shared Qwen3-VL-32B + video/audio VAEs and tokenizer (~46 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, first/last frame and reference mode |
+| [`minimax-h3-image.json`](minimax-h3-image.json), [`-q8`](minimax-h3-image-q8.json), [`-q5km`](minimax-h3-image-q5km.json), [`-q4km`](minimax-h3-image-q4km.json) | MiniMax-H3-Image: the bf16 (40.2 GB), Q8_0 (22.0 GB), Q5_K_M (14.6 GB) or Q4_K_M (12.7 GB) DiT + MiniMax-H3's Qwen3-VL-32B and tokenizer + the image VAE (one copy for all four and for `minimax-h3-fl2va.json`'s encoder) | Text to image up to ~16 MP and editing with up to 16 pictures in 6 steps; bf16 for 46 GB and up, Q8_0 for 46-48 GB GPUs and 48 GB Macs, Q5_K_M for 20-24 GB GPUs, Q4_K_M for 20 GB at 16-20 MP and 32 GB Macs; see [below](#image-generation-minimax-h3-image) |
 | [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~12.9 GB) | Video only, 4-step distilled, text- **and** image-to-video |
 | [`wan-video-ti2v-5b.json`](wan-video-ti2v-5b.json) | Wan 2.2 TI2V-5B: DiT + video VAE + UMT5 (~12.9 GB) | Video only, undistilled 50-step reference recipe |
 | [`wan-video-i2v-a14b.json`](wan-video-i2v-a14b.json) | Wan 2.2 I2V-A14B: **two** expert DiTs + Wan 2.1 VAE + UMT5 (~25.6 GB) | Image-to-video, two-expert schedule |
@@ -548,6 +549,31 @@ Notes:
   in `config/`. Pass `--lora` on the command line, as above, or write the entry as an
   object, `"lora": { "path": "lora/minimax-h3-fl2v-turbo-8step.json" }`, which resolves
   against the preset's folder. This holds for every plug-in in `lora/`.
+
+## Image generation (MiniMax-H3-Image)
+
+Four configs, one per DiT, with the same text encoder, tokenizer files and image VAE at the same
+paths, so switching between them downloads only the DiT. All four default to `ggml_cuda`; pass
+`--backend ggml_metal` on a Mac. Measured at 2048x2048, six steps (the
+[model guide](../docs/models/minimax-h3-image.md#quantizations) has the full tables):
+
+| Config | DiT | Device it is for | Measured | Against the bf16 DiT |
+|---|---|---|---|---|
+| [`minimax-h3-image.json`](minimax-h3-image.json) | bf16, 40.2 GB | 46 GB and up | A40: 1.90 s a step, 39.9 GiB peak (42.6 GiB at 4096x4096) | the reference |
+| [`minimax-h3-image-q8.json`](minimax-h3-image-q8.json) | Q8_0, 22.0 GB | 46-48 GB GPU, 48 GB Mac | A40: 2.39 s a step, 23.2 GiB peak; M5 Pro: 12.7 s a step, 29.9 GB wired | 22.9-28.4 dB (17.6 on an illustration) |
+| [`minimax-h3-image-q5km.json`](minimax-h3-image-q5km.json) | Q5_K_M, 14.6 GB | 20-24 GB GPU | RTX A4500: 3.88 s a step, 16.6 GiB peak, up to 3840x3840 | 21.8 dB mean |
+| [`minimax-h3-image-q4km.json`](minimax-h3-image-q4km.json) | Q4_K_M, 12.7 GB | 20 GB GPU for 16-20 MP, 32 GB Mac | RTX A4500: 3.32 s a step, 15.2 GiB peak, up to 4480x4480 | 17.3 dB mean; can add stray lettering |
+
+```bash
+TensorSharp.Cli --config config/minimax-h3-image-q5km.json --prompt "..." --output out.png
+TensorSharp.Cli --config config/minimax-h3-image-q8.json --backend ggml_metal \
+  --image a.png --image b.png --prompt "Put the mug of <Picture 2> on the table of <Picture 1>." --output edit.png
+```
+
+A size the device cannot hold is refused before any phase runs (CLI exit `2`, server `507`).
+The model's license (the MiniMax-H3-Image Community License Agreement) excludes the United
+States, the European Union, the United Kingdom and the Republic of Korea; read
+[the model guide](../docs/models/minimax-h3-image.md#license-and-legal-disclaimer) first.
 
 ## Agent configs
 
