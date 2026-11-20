@@ -31,6 +31,21 @@ as a user message through the GGUF chat template), `--steps`, `--teacher <report
 | `snapshot` | Prefill, extract 256-token KV blocks covering `--split` tokens, scramble and reset the cache, inject them, forward the rest (what a pooled radix hit does). |
 | `truncate` | Prefill, rewind to `--split`, forward the rest (what a live-cache rewind does). |
 
+`--nll-text <file>` scores a fixed raw text instead (no chat template, the tokenizer's
+special prefix only): the first `--nll-prefix` tokens (default 64) are prefilled in one
+`Forward`, and every later token is teacher-forced through one-row forwards, so the run
+crosses the same cache grows a generation does. The report's `Nll` object and the last
+console line give the mean NLL, the perplexity and the top-1 agreement over the scored
+tokens (`--steps` caps them; default all). The unified-runtime migration
+(`docs/design/muse-glimmer-unified.md`) scores
+`benchmarks/engine_comparison/assets/prefill_corpus.txt` this way, on the legacy model and
+on the runtime alike:
+
+```bash
+$P --model $M --backend ggml_metal --nll-text benchmarks/engine_comparison/assets/prefill_corpus.txt \
+   --out artifacts/muse-glimmer-kv-grow/nll-metal.json
+```
+
 Useful A/B knobs (read at model construction): `MAX_CONTEXT`, `TS_KV_INITIAL_TOKENS`,
 `TS_MUSE_GLIMMER_SWA_RING=0` (uniform caches).
 

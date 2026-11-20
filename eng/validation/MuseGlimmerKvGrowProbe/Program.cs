@@ -26,7 +26,12 @@ string? promptFile = Option("--prompt-file", null);
 string? systemFile = Option("--system-file", null);
 string? teacherFile = Option("--teacher", null);
 string? logitsOut = Option("--logits-out", null);
-int steps = int.Parse(Option("--steps", "64"));
+// --nll-text: teacher-force a fixed raw text (no chat template) and report its perplexity. The first
+// --nll-prefix tokens are prefilled in one forward; every later token is scored from the logits of the
+// one-row forward before it (the decode path), so a run crosses the same cache grows a generation does.
+string? nllText = Option("--nll-text", null);
+int nllPrefix = int.Parse(Option("--nll-prefix", "64"));
+int steps = int.Parse(Option("--steps", nllText != null ? "0" : "64"));
 int split = int.Parse(Option("--split", "0"));
 int topK = int.Parse(Option("--topk", "8"));
 int tp = int.Parse(Option("--tp", "1"));
@@ -45,16 +50,30 @@ if (model.Config.Architecture != "muse-glimmer")
     throw new InvalidOperationException($"Expected a muse-glimmer model, got {model.Config.Architecture}.");
 
 // ---- prompt ------------------------------------------------------------------
-string userText = promptFile != null ? File.ReadAllText(promptFile) : "请详细介绍最终幻想7";
-var messages = new List<ChatMessage>();
-if (systemFile != null)
-    messages.Add(new ChatMessage { Role = "system", Content = File.ReadAllText(systemFile) });
-messages.Add(new ChatMessage { Role = "user", Content = userText });
-string rendered = ChatTemplate.RenderFromGgufTemplate(model.Config.ChatTemplate, messages,
-    addGenerationPrompt: true, architecture: model.Config.Architecture);
-int[] prompt = model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
-
+int[] prompt;
 int[]? teacher = null;
+if (nllText != null)
+{
+    Require(teacherFile == null && promptFile == null && systemFile == null && scenario == "decode",
+        "--nll-text scores its own text: it takes no --teacher, --prompt-file or --system-file, and runs the decode scenario.");
+    int[] all = model.Tokenizer.Encode(File.ReadAllText(nllText), addSpecial: true).ToArray();
+    Require(nllPrefix >= 1 && nllPrefix < all.Length, $"--nll-prefix must be inside the text's {all.Length} tokens.");
+    prompt = all[..nllPrefix];
+    teacher = all[nllPrefix..];
+    steps = steps <= 0 ? teacher.Length : Math.Min(steps, teacher.Length);
+}
+else
+{
+    string userText = promptFile != null ? File.ReadAllText(promptFile) : "请详细介绍最终幻想7";
+    var messages = new List<ChatMessage>();
+    if (systemFile != null)
+        messages.Add(new ChatMessage { Role = "system", Content = File.ReadAllText(systemFile) });
+    messages.Add(new ChatMessage { Role = "user", Content = userText });
+    string rendered = ChatTemplate.RenderFromGgufTemplate(model.Config.ChatTemplate, messages,
+        addGenerationPrompt: true, architecture: model.Config.Architecture);
+    prompt = model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
+}
+
 if (teacherFile != null)
 {
     using var doc = JsonDocument.Parse(File.ReadAllText(teacherFile));
@@ -132,12 +151,14 @@ double prefillMs = prefill.Elapsed.TotalMilliseconds;
 var records = new List<StepRecord>(steps);
 FileStream? logitsStream = logitsOut != null ? File.Create(logitsOut) : null;
 int vocab = model.Config.VocabSize;
+double nllSum = 0;
 var decode = Stopwatch.StartNew();
 for (int i = 0; i < steps; i++)
 {
     int position = model.CacheSeqLen;      // the position the next token will occupy
     var top = TopK(logits, Math.Min(vocab, logits.Length), topK);
     int chosen = teacher != null ? teacher[i] : top[0].Id;
+    if (nllText != null) nllSum -= LogSoftmaxAt(logits, Math.Min(vocab, logits.Length), chosen);
     records.Add(new StepRecord(i, position, top[0].Id, chosen, top, Field<int>(model, "_kvCacheCapacity")));
     if (logitsStream != null) WriteHalf(logitsStream, logits, vocab);
     if (i + 1 < steps)
@@ -147,6 +168,15 @@ double decodeMs = decode.Elapsed.TotalMilliseconds;
 logitsStream?.Dispose();
 
 string text = model.Tokenizer.Decode(records.Select(r => r.Chosen).ToList());
+object? nll = nllText == null ? null : new
+{
+    Text = Path.GetFullPath(nllText),
+    Prefix = nllPrefix,
+    ScoredTokens = steps,
+    MeanNll = steps > 0 ? nllSum / steps : double.NaN,
+    Perplexity = steps > 0 ? Math.Exp(nllSum / steps) : double.NaN,
+    Top1Agreement = steps > 0 ? records.Count(r => r.Argmax == r.Chosen) / (double)steps : double.NaN,
+};
 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
 File.WriteAllText(output, JsonSerializer.Serialize(new
 {
@@ -170,11 +200,15 @@ File.WriteAllText(output, JsonSerializer.Serialize(new
     DecodeTokensPerSecond = steps > 1 ? (steps - 1) / (decodeMs / 1000.0) : 0,
     Split = split,
     Events = events,
+    Nll = nll,
     PromptTokens = prompt,
     GeneratedText = text,
     Steps = records,
 }, new JsonSerializerOptions { WriteIndented = false }));
 Console.WriteLine($"[probe] prefill {prefillMs:F0} ms, decode {steps} steps in {decodeMs:F0} ms; wrote {output}");
+if (nllText != null && steps > 0)
+    Console.WriteLine($"[probe] nll: {steps} tokens after a {nllPrefix}-token prefix, mean NLL {nllSum / steps:F5}, " +
+        $"perplexity {Math.Exp(nllSum / steps):F4}, top-1 agreement {records.Count(r => r.Argmax == r.Chosen) / (double)steps:P2}");
 Console.WriteLine($"[probe] text: {Truncate(text.Replace('\n', ' '), 400)}");
 model.Dispose();
 if (backend is BackendType.GgmlMetal or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlCpu)
@@ -208,6 +242,16 @@ static List<TopEntry> TopK(float[] values, int n, int k)
         if (best.Count > k) best.RemoveAt(best.Count - 1);
     }
     return best;
+}
+
+// log softmax(values[0..n))[id], in double.
+static double LogSoftmaxAt(float[] values, int n, int id)
+{
+    double max = double.NegativeInfinity;
+    for (int i = 0; i < n; i++) if (values[i] > max) max = values[i];
+    double sum = 0;
+    for (int i = 0; i < n; i++) sum += Math.Exp(values[i] - max);
+    return values[id] - max - Math.Log(sum);
 }
 
 static void WriteHalf(Stream stream, float[] values, int n)
