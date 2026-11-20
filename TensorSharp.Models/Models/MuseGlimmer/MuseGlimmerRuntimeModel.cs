@@ -154,27 +154,33 @@ namespace TensorSharp.Models
         protected override float FinalLogitSoftcap => _softcap;
 
         /// <summary>
-        /// The default draft window on ggml_metal and MLX: 7 drafts (an 8-row verify), for the DFlash drafter and n-gram drafts alike (the
-        /// window is the trunk's verify economics). Measured on an M5 Pro (UD-IQ2_XXS, the 1.63 GB dflash-kquant drafter, greedy,
-        /// five prompts x 512 tokens): a verify costs 76-80 ms at any width from 4 to 8 rows (past one row the IQ2/IQ3 products
-        /// take the matrix kernel), 135-147 ms at 9 (n-gram's default 8 drafts) and 152-160 ms at 16, against 46 ms for a plain
-        /// step, and a block 25-29 ms whatever its width: the drafts an 8-row verify carries are nearly free, wider ones dear. With
-        /// the cost governor: 7 drafts 34.1 tok/s in all (35.0 with the GGML builder's argmax top-1), 5 drafts 31.6, 7 at the block
-        /// default's gate 32.8, against 21.7 plain (legacy at its own default 30.7); ungoverned, before the prompt-follow fix, 3 / 5 / 7 / 15 drafts 24.8 / 27.3 / 27.9 /
-        /// 17.3. MLX the same: a verify 80-91 ms from 4 to 8 rows, a block 23-34 ms; 7 drafts without the gate 34.9 tok/s in all,
-        /// the speculator's 8 at the gate 33.4, 3 without it 26.5, against 21.1 plain. Elsewhere the speculator's default (8) until
-        /// measured there (docs/design/muse-glimmer-unified.md §5.4).
+        /// The default draft window, by the trunk's verify economics. Measured on an M5 Pro (UD-IQ2_XXS, the 1.63 GB dflash-kquant
+        /// drafter, greedy, five prompts x 512 tokens; docs/design/muse-glimmer-unified.md §5.4):
+        /// <list type="bullet">
+        /// <item>ggml_metal: 7 drafts (an 8-row verify), for the drafter and n-gram drafts alike. A verify costs 76-80 ms from 4 to 8
+        /// rows (past one row the IQ2/IQ3 products take the matrix kernel), 135-147 ms at 9 and 152-160 ms at 16, a plain step
+        /// 46 ms, a block 25-29 ms at any width. With the governor 7 drafts 34.1 tok/s in all (35.0 with the GGML builder's argmax
+        /// top-1), 5 drafts 31.6, 7 at the block gate 0.35 32.8, plain 21.7, legacy at its default 30.7; ungoverned, before the
+        /// prompt-follow fix, 3 / 5 / 7 / 15 drafts 24.8 / 27.3 / 27.9 / 17.3. n-gram at 7 drafts 31.6 against 27.5 at 8.</item>
+        /// <item>MLX: the drafter's whole block (15 drafts), whose verify costs 79-88 ms at any width up to 16 rows: 39.8 tok/s
+        /// in all against 37.0 at 8 drafts and 35.0 at 7 (all ungated), 33.4 at the speculator's 8 with the gate, plain 21.1,
+        /// legacy's DFlash 31.7. n-gram keeps the speculator's 8 there (31.7 tok/s in all against 30.8 at 7).</item>
+        /// </list>
+        /// Elsewhere the speculator's default (8) until measured there.
         /// </summary>
-        public override int SpecPreferredDraftWindow => DraftsWideOnThisBackend ? 7 : base.SpecPreferredDraftWindow;
+        public override int SpecPreferredDraftWindow => _backend switch
+        {
+            BackendType.GgmlMetal => 7,
+            BackendType.Mlx when HasDFlash => DFlashSettings.MaxDraftTokens,
+            _ => base.SpecPreferredDraftWindow,
+        };
 
         /// <summary>No confidence gate for the drafter on ggml_metal and MLX, where a verify row is nearly free (see
-        /// <see cref="SpecPreferredDraftWindow"/>): 7 drafts without it 34.1 / 34.9 tok/s, with the block default's 0.35 32.8 on
-        /// ggml_metal, lower on every prompt. The cost governor parks the drafter where its drafts lose (prose on ggml_metal: 21.6
-        /// tok/s against 21.9 plain).</summary>
-        public override float SpecPreferredBlockGate => HasDFlash && DraftsWideOnThisBackend ? 0f : base.SpecPreferredBlockGate;
-
-        /// <summary>The backends whose verify costs about the same at 2-8 rows here (measured: ggml_metal and MLX on an M5 Pro).</summary>
-        private bool DraftsWideOnThisBackend => _backend is BackendType.GgmlMetal or BackendType.Mlx;
+        /// <see cref="SpecPreferredDraftWindow"/>): on ggml_metal 7 drafts without it 34.1 tok/s, with the block default's 0.35
+        /// 32.8, lower on every prompt; on MLX 8 drafts without it 37.0, with it 33.4. The cost governor parks the drafter where
+        /// its drafts lose (prose on ggml_metal: 21.6 tok/s against 21.9 plain).</summary>
+        public override float SpecPreferredBlockGate => HasDFlash && _backend is BackendType.GgmlMetal or BackendType.Mlx
+            ? 0f : base.SpecPreferredBlockGate;
 
         protected override string FingerprintExtras =>
             string.Create(CultureInfo.InvariantCulture,
