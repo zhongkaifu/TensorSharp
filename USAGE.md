@@ -170,8 +170,8 @@ directory also holds presets for chat models (`gemma-4-*`, `qwen3.5-9b-*`,
 `qwen3.6-*`, `gpt-oss-20b`), agent hosting (`agent-*`), embedding services
 (`embedding-*`), DiffusionGemma and Jev (`diffusiongemma-*`,
 `jev-diffusiongemma-q4`) and video (`minimax-h3-*`, `wan-video-*`), and
-[`config/lora/`](config/lora/) holds fourteen Qwen-Image-2.1 LoRA plug-ins and two
-MiniMax-H3 Turbo plug-ins. See
+[`config/lora/`](config/lora/) holds fourteen Qwen-Image-2.1 LoRA plug-ins, two
+MiniMax-H3 Turbo plug-ins and three MiniMax-H3-Image plug-ins. See
 [`config/README.md`](config/README.md) for the full reference.
 
 ## Console Application
@@ -532,8 +532,8 @@ script gets that error instead of watching a setting be ignored.
 | `--qwen-image-vl <path>` | Override the resolved Qwen3-VL-8B text-encoder GGUF (default: a `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_TE`. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen3-VL-8B mmproj (vision grounding for edits) GGUF (default: a matching `mmproj` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_MMPROJ`. |
 | `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds. The GGUFs name at most their architecture and Turbo has the base checkpoint's tensors, so the host declares it: `turbo` samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1, refuses other step counts and refuses step-distillation `--lora` plug-ins. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so; any other is `base`. Refused with any other model. Env: `TS_QWEN_IMAGE_VARIANT`. See [Qwen-Image-2.1-Turbo](docs/models/qwenimage21.md#qwen-image-21-turbo). |
-| `--lora <path>` | LoRA plug-in for Qwen-Image-2.1 or MiniMax-H3 (FL2VA). Qwen-Image-2.1: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)); repeat to stack LoRAs. MiniMax-H3: one `minimax-h3-lora` config only, `config/lora/minimax-h3-fl2v-turbo-8step.json` or `-4step.json`, which locks `--diffusion-steps`, `--flow-shift`, `--sampler` and `--cfg` to its recipe and is refused on the Ref2VA checkpoint. Applied unmerged on top of the quantized transformer. A plug-in the model does not take is refused at startup, before the plug-in downloads; when a `--config` still has to download the model, the model's family is checked right after that download (a contradicting sampling flag is refused before it). Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins) and [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins). |
-| `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. MiniMax-H3 refuses a negative strength: its Turbo schedule is distilled at 1, and 0 keeps the adapter's terms with zero up factors. |
+| `--lora <path>` | LoRA plug-in for Qwen-Image-2.1, MiniMax-H3 (FL2VA) or MiniMax-H3-Image. Qwen-Image-2.1: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)); repeat to stack LoRAs. MiniMax-H3: one `minimax-h3-lora` config only, `config/lora/minimax-h3-fl2v-turbo-8step.json` or `-4step.json`, which locks `--diffusion-steps`, `--flow-shift`, `--sampler` and `--cfg` to its recipe and is refused on the Ref2VA checkpoint. MiniMax-H3-Image: `minimax-h3-image-lora` configs or bare `.safetensors` (diffusers PEFT, ComfyUI or kohya names), repeatable as style adapters, plus at most one speed adapter such as `config/lora/minimax-h3-image-pdmd-2step.json`, which locks `--diffusion-steps` and `--cfg`. Applied unmerged on top of the quantized transformer. A plug-in the model does not take is refused at startup, before the plug-in downloads; when a `--config` still has to download the model, the model's family is checked right after that download (a contradicting sampling flag is refused before it). Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins), [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins) and [MiniMax-H3-Image LoRA plug-ins](#minimax-h3-image-lora-plug-ins). |
+| `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. MiniMax-H3 and MiniMax-H3-Image refuse a negative strength: a speed schedule is distilled at 1, and 0 keeps the adapter's terms with zero up factors. |
 | `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config, a PEFT `adapter_config.json` or a VideoX-Fun `pdd_config.json`. A MiniMax-H3 plug-in config here must name the preceding `--lora`'s weights file in its `"weights"` entry, and its recipe stays locked. Default: none (a PDD bundle's `pdd_config.json`, and a PEFT `adapter_config.json` beside `adapter_model.safetensors`, are found next to the weights). |
 | `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--penalty-last-n` | **Removed and rejected at startup, including as a config-file key** (exit code 1, `Configuration error: --penalty-last-n was removed: …`). It was the CLI-only name of the repeat-penalty window: use `--repeat-last-n <N>`, the spelling both hosts and the `repeat_last_n` request field use. |
@@ -841,7 +841,7 @@ of quietly losing a setting.
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | Override the Qwen-Image-2.1 companions the server otherwise finds next to the DiT GGUF: the VAE, the Qwen3-VL-8B text encoder and its vision projector (needed for editing). Checked at startup. Env: `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ`. |
 | `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds, same spelling and meaning as on the CLI: `turbo` samples Turbo's 8-step schedule at CFG 1 by default (a request's `steps` may only be 8) and refuses step-distillation `--lora` plug-ins. Applies to every Qwen-Image model the server loads; another model loads without it and the server logs a warning, as for a `--lora` plug-in that a model loaded after startup does not take. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so. Checked at startup. Env: `TS_QWEN_IMAGE_VARIANT`. |
 | `--width <px>` / `--height <px>` | Default Qwen-Image-2.1 output size for an image request that names neither a size nor an area (the Web UI sends none); a request that sets its own width/height or target area keeps its own geometry. The default needs both values. A side that is not a multiple of 32 is rounded down to one (never below 32) with a one-time `[qwen-image] WARNING`; with only one side given, or an unparsable or negative value, the default is ignored with a one-time warning and the automatic size (a 2048×2048 area; 1024×1024 on the `cpu` backend) stays. A Qwen-Image server also warns at startup in either case; nothing is refused. A width/height set in the request itself must still be a positive multiple of 32. Env: `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`. They are also aliases of `--video-width` / `--video-height`. LTX 2.5 video defaults to 1024×1024 output with both sides positive multiples of 64; see its two-stage recipe below. |
-| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | LoRA plug-ins for the hosted Qwen-Image-2.1 or MiniMax-H3 (FL2VA) model, same spelling and binding rules as on the CLI (repeat `--lora` to stack Qwen-Image-2.1 plug-ins; scale and config bind to the preceding `--lora`). The files are checked at startup, and a plug-in the startup model does not take is refused there, before the plug-in downloads (a model a `--config` still has to download is checked right after that download); a model loaded later runs without plug-ins it does not take and logs a warning naming them. The startup log lists the set (`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`). On Qwen-Image-2.1 the set applies to every image request, and a request's `steps` / `cfg` still override a plug-in's sampling recipe. A MiniMax-H3 Turbo plug-in applies to every clip and locks `--video-steps` and a request's `steps`, `flowShift` and `sampler` to its recipe. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins) and [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins). |
+| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | LoRA plug-ins for the hosted Qwen-Image-2.1, MiniMax-H3 (FL2VA) or MiniMax-H3-Image model, same spelling and binding rules as on the CLI (repeat `--lora` to stack Qwen-Image-2.1 plug-ins; scale and config bind to the preceding `--lora`). The files are checked at startup, and a plug-in the startup model does not take is refused there, before the plug-in downloads (a model a `--config` still has to download is checked right after that download); a model loaded later runs without plug-ins it does not take and logs a warning naming them. The startup log lists the set (`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`). On Qwen-Image-2.1 the set applies to every image request, and a request's `steps` / `cfg` still override a plug-in's sampling recipe. A MiniMax-H3 Turbo plug-in applies to every clip and locks `--video-steps` and a request's `steps`, `flowShift` and `sampler` to its recipe. On MiniMax-H3-Image the set applies to every picture, a speed adapter locks a request's `steps` and `cfg`, and a request's `loras` list replaces the set before its picture runs. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins), [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins) and [MiniMax-H3-Image LoRA plug-ins](#minimax-h3-image-lora-plug-ins). |
 | `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--loras-dir <dir>` | Directory of text-model LoRA adapters, chosen per request with `"lora"` on `/v1/chat/completions` and `/v1/responses` (only `nemotron_h`, `mistral3` and `hunyuan-dense` on a single device apply them; anything else is a 400). An adapter is a llama.cpp GGUF adapter (`.gguf`, from `convert_lora_to_gguf.py`) or a `.safetensors` file whose tensors are named `<tensor>.lora_a` / `<tensor>.lora_b` after the base GGUF's tensors; a PEFT adapter as trained (`base_model.model...lora_A.weight` names) is refused with a pointer to that converter. Every adapter at the top level is loaded at startup, after the model, under its file name without the extension; one that does not load is logged with the reason and skipped. `POST /v1/loras` may load more, but only files inside this directory, named relative to it (an absolute path only when it is inside), and at most 32 adapters are held at once (409 beyond that). **Without it, `POST /v1/loras` answers 403**: earlier builds loaded any path the server could read. Keep the directory writable only by the operator. Not with `--embeddings`. Env: `TS_LORAS_DIR` (the flag wins). See [API_EXAMPLES](TensorSharp.Server.Host/API_EXAMPLES.md#text-model-lora-adapters-lora-v1loras). |
 | `--temperature <f>` | Sampling temperature (`0` = greedy) |
@@ -1280,6 +1280,66 @@ Where these differ from the Qwen-Image-2.1 plug-ins above:
 
 The [MiniMax-H3 card](docs/models/minimax-h3.md#turbo-plug-ins) covers the sigma
 grids, how the adapter is applied, the backends and what has been validated.
+
+### MiniMax-H3-Image LoRA plug-ins
+
+MiniMax-H3-Image takes LoRA adapters of its own type, `minimax-h3-image-lora`: any
+number of **style** adapters, each at its own strength, and at most one **speed**
+(step-distillation) adapter, whose config fixes the sampling. They are applied unmerged
+on top of the denoiser as it is stored (bf16, Q8_0 or Q4_K_M), on `ggml_cuda`,
+`ggml_metal` and `ggml_cpu`.
+
+```bash
+# pDMD: 2 transformer passes instead of 6 (the plug-in's recipe replaces the defaults)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-pdmd-2step.json \
+    --prompt "..." --width 2048 --height 2048 --output fast.png
+
+# A style adapter from config/lora/, and any LoRA file at a chosen strength, stacked
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-seedreamstyle.json \
+    --lora ./loras/my-style.safetensors --lora-scale 0.8 \
+    --prompt "seedreamstyle. A portrait of ..." --output styled.png
+
+# The server applies its startup set to every picture
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-pdmd-2step.json
+```
+
+| Plug-in | What it is |
+|---|---|
+| `minimax-h3-image-pdmd-2step.json` | pDMD 2-step (linoyts/MiniMax-H3-Image-pDMD-2steps): speed adapter, 2 steps on the sigmas `[1, 12/13, 0]`, the output heads in step order (`by-step`), guidance 1, generated at the asked size; trained around 1 MP. MiniMax-H3-Image Community License |
+| `minimax-h3-image-pdmd-2step-comfy.json` | pDMD 2-NFE, the ComfyUI-native conversion (akhaliq/minimax-h3-image-pdmd-2step): a different pDMD training from linoyts'; the same sigmas with ComfyUI's grid-interval heads. Its pictures carry a fine mesh pattern on the official stack: prefer the plug-in above |
+| `minimax-h3-image-seedreamstyle.json` | Seedreamstyle 6K (Nebsh/Seedreamstyle-H3-6K): a photographic style adapter (kohya names, rank 16); start the prompt with `seedreamstyle.`. MiniMax-H3-Image Community License |
+
+- **Files.** A plug-in config (`--lora config.json`, or `--lora <weights> --lora-config
+  <config>` when the config names those weights) or a bare `.safetensors` (a style
+  adapter at `--lora-scale`, default 1). The names may be diffusers PEFT
+  (`[transformer.]transformer_blocks.N.attn.to_q.lora_A.weight`), ComfyUI's native ones
+  (`diffusion_model.blocks.N.attn.qkv_proj.lora_A.weight`, `lora_down` / `lora_up`,
+  optional `.alpha`) or kohya's (`lora_unet_blocks_N_attn_qkv_proj.lora_down.weight`);
+  a file that mixes them is refused. Every tensor must be used: a name the model has no
+  place for fails the load with its reason (an AdaLN parameter, a DoRA magnitude, a
+  block out of range), all of a file's problems in one message.
+- **Alpha.** diffusers: the file's metadata (`alpha`, `lora_alpha` or PEFT's
+  `lora_adapter_metadata`), else the config's `"alpha"`, else the rank. ComfyUI and
+  kohya: each module's `.alpha` tensor, else the config's, else the rank (ComfyUI's rule).
+  A config alpha the file contradicts is refused.
+- **The speed contract is locked.** `--diffusion-steps` and `--cfg` (CLI) and a
+  request's `steps` and `cfg` may be unset or equal the plug-in's; anything else is
+  refused, never overridden (the CLI at startup, before anything downloads; a request
+  with a 400). A second speed adapter is refused.
+- **Strength.** `--lora-scale` (else the config's `"scale"`, else 1) multiplies alpha /
+  rank; it must be ≥ 0. A speed adapter at another strength than 1 logs that its
+  schedule was distilled at 1.
+- **Switching.** The server's startup set applies to every picture (it has no
+  per-request selection). A host that passes a picture its own plug-in set (the chat
+  service's `loras` list, which TensorAgent fills from its saved choices; its catalog
+  has no MiniMax-H3-Image entries yet) replaces the set before the picture runs, and
+  the previous set's factors and compiled steps are dropped first.
+
+The [MiniMax-H3-Image card](docs/models/minimax-h3-image.md#lora-plug-ins) covers how the
+updates are applied, the backends, the validation and the cost per step.
 
 ## Video generation with audio (LTX 2.5 Distilled)
 

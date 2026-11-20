@@ -42,6 +42,9 @@ def main():
     ap.add_argument("--lora", help="diffusers PEFT LoRA file (fused per block); omit for the base model")
     ap.add_argument("--lora-scale", type=float, default=1.0)
     ap.add_argument("--sigmas", default="1,0.9230769230769231,0")
+    ap.add_argument("--no-keep", dest="keep", action="store_false",
+                    help="read the blocks again each step instead of keeping them fused in host memory (66 GB; more "
+                         "than a 50 GB container holds)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -56,7 +59,9 @@ def main():
     # The noise exactly as prepare_latents draws it (a CPU generator, float32).
     gen = torch.Generator("cpu").manual_seed(seed)
     latents = randn_tensor((1, 24, 1, lh, lw), generator=gen, device=torch.device("cpu"), dtype=torch.float32)
-    rows = patchify_video_latents(latents, PATCH)[0]          # [tokens, 96]
+    rows = patchify_video_latents(latents, PATCH)             # [tokens, 96] (batch 1: the rows of its one picture)
+    if rows.shape != ((lh // 2) * (lw // 2), 96):
+        raise ValueError(f"patchified rows {tuple(rows.shape)}, expected {((lh // 2) * (lw // 2), 96)}")
 
     # ---- the transformer, streamed block by block, with the LoRA fused into each block as it loads
     tdir = a.transformer
@@ -114,11 +119,17 @@ def main():
                 return value.to(device) + (a.lora_scale * delta).to(value.dtype)
         return value
 
+    kept = {}   # each block's fused tensors in host memory after the first step reads them (66 GB for the bf16 release)
+
     def materialize(prefix, module):
         for n, _ in list(module.named_parameters(recurse=True)) + list(module.named_buffers(recurse=True)):
             key = prefix + n
             if key in index:
-                value = fuse(key, tensor(key))
+                value = kept.get(key)
+                if value is None:
+                    value = fuse(key, tensor(key))
+                    if a.keep:
+                        kept[key] = value.to("cpu")
                 set_module_tensor_to_device(model, key, device, value=value, dtype=value.dtype)
 
     def release(prefix, module):

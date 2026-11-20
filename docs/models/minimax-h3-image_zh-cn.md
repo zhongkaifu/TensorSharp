@@ -124,6 +124,79 @@ TensorSharp.Server.Host --config config/minimax-h3-image.json
 bf16 在 48 GB 的 Mac 上完全放不下（40.2 GB 权重对 40.2 GB 工作集）：请在那里使用 Q8_0。H100 级别的
 显卡可保留全部组件，16 MP 的 bf16 也不例外。
 
+## LoRA 插件
+
+MiniMax-H3-Image 通过各宿主的 `--lora`、`--lora-scale` 与 `--lora-config`（用法见
+[USAGE](../../USAGE_zh-cn.md#minimax-h3-image-lora-插件)）以及 `TS_LORAS` 接受
+`minimax-h3-image-lora` 类型的 LoRA 适配器：任意数量的风格适配器（各有自己的强度），外加至多一个
+加速适配器，其配置固定采样方式。
+
+| 插件 | 来源 | 类型 | 命名 | 秩 / alpha |
+|---|---|---|---|---|
+| [`minimax-h3-image-pdmd-2step.json`](../../config/lora/minimax-h3-image-pdmd-2step.json) | linoyts/MiniMax-H3-Image-pDMD-2steps @c07d96e5 | 加速：在 `[1, 12/13, 0]` 上 2 步，`by-step` 输出头 | diffusers PEFT | 128 / 128 |
+| [`minimax-h3-image-pdmd-2step-comfy.json`](../../config/lora/minimax-h3-image-pdmd-2step-comfy.json) | akhaliq/minimax-h3-image-pdmd-2step @ef1e3b9a（ComfyUI 转换版） | 加速：同样的 sigma，`grid-interval` 输出头 | ComfyUI 原生，块对角融合 qkv | qkv 为 384 / 384，其余 128 / 128 |
+| [`minimax-h3-image-seedreamstyle.json`](../../config/lora/minimax-h3-image-seedreamstyle.json) | Nebsh/Seedreamstyle-H3-6K @5e1b48cd | 风格（触发词 `seedreamstyle.`） | kohya | 16 / 16 |
+
+两个 pDMD 文件是两次不同的训练：linoyts 的与 akhaliq（pdmd2026）的因子互不相关。三种命名格式之一的
+裸 `.safetensors` 按风格适配器处理。
+
+**更新的应用方式。** 不合并：在适配器所指的投影上计算 `y = W x + up (down x)`，基础权重保持原样存储。
+diffusers 的 `to_q`、`to_k`、`to_v` 落在 `attn.qkv_proj` 堆叠的三等分上，其 `ff.net.0.proj` 的 `lora_B`
+两半从 `[value; gate]` 交换为检查点的 `[gate; value]`；ComfyUI 与 kohya 的命名就是检查点本身的布局
+（块对角的融合 qkv 项会精确拆分到三等分上）。强度 × alpha / rank 以 F32 折入 `up`；每个秩分量平衡后
+以 F16 存储（`ggml_cpu` 上为 F32）。同一投影上的多个适配器沿秩拼接，因此无论有几个，每个槽只做一次
+收缩与一次扩张。在 `ggml_cuda` 上，宽乘积（Q4_K、Q6_K 或 BF16 权重，1,024 行及以上）在自己的 cuBLAS
+GEMM 内完成更新：`[W | up] · [x ; down x]`，深度 K + R（BF16 权重在 K < 2 × 行数时复制进这些行，
+否则各部分的扩张累加到它的乘积上）。在 `ggml_metal` 上，Q8_0、F16 或 F32 权重的宽乘积用 ggml 自己的算子
+以同样的形式构建（每步把权重与 up 拼接，权重本身不被修改），前提是这样搬运的字节比在乘积旁边加上更新更少：
+4 MP 时为 qkv、out 与 fc1，fc2 不在此列。其他情况在 ggml 上运行该区域的乘积与加法。请求换用另一组适配器时，会先丢弃上一组的已编译步骤与设备副本。
+
+**pDMD 的输出头。** by-step 输出头在第 1 步使用 head 0，第 2 步使用 head 0 加 head 1：TensorSharp 在单个
+网格区间 `[i, i + 1)` 上组合出的输出头与 diffusers 的 `pdd_proj_out[i]`（MiniMaxAI 的
+`pdd_fused_heads.safetensors`）一致，相对误差 3.8e-10，六个头、每一行都检查过。
+
+**验证**（`eng/validation/MiniMaxH3ImageLoraRows`、`eng/validation/MiniMaxH3ImageAB`）：
+
+- *与独立合并逐行比对。* pDMD（linoyts）、akhaliq 的 pDMD（diffusers 与 ComfyUI 两个文件）、
+  Seedreamstyle（kohya）、waryusya（ComfyUI 命名，无 alpha）与 domokun（ComfyUI，带 `.alpha` 的融合 qkv）：
+  第 0、25、49 块及精炼器第 0 块中适配器涉及的每个投影都按后端的实际方式运行，并在抽样行上与 NumPy 的
+  `(W + scale · B A) x` 比较；适配器通过 HTTP 范围请求从 Hub 读取，按已发布的转换规则映射，而不是用
+  TensorSharp 的代码。`y` 的相对误差在 A40 的 Q4_K_M 上为 3.6e-3，bf16 上为 2.1e-3，M5 Pro 的 Q8_0
+  （`ggml_metal`，在乘积旁边时为 1,024 行，在乘积内时为 4,096 行）上为 6.4e-4，即基础乘积自身的舍入；
+  单看更新（同一区域用全零 up 运行后相减）分别为 5.8e-3、5.7e-3，以及在乘积旁边 1.3e-3、在乘积内 5.4e-3
+  （其 up 舍入为 Q8_0）。akhaliq 的两个文件给出逐位相同的更新，NumPy 与
+  TensorSharp 中都是如此。
+- *没有适配器就没有变化。* 2048x2048 的肖像与支持 LoRA 之前逐位相同：A40 上的 Q4_K_M 与 bf16、M5 Pro
+  上的 Q8_0。
+- *每步开销*（2048x2048，热图片中除每张图片第一步之外所有步的中位数；A40 上 bf16 图片的第一步会重新
+  上传权重）：
+
+  | 每步，2048x2048 | 无适配器 | pDMD（rank 128） | Seedreamstyle（rank 16） |
+  |---|---:|---:|---:|
+  | A40，Q4_K_M | 2.188 s | 2.087 s（−4.6%） | 2.045 s（−6.5%） |
+  | A40，bf16 | 1.907 s | 2.104 s（+10.3%） | 2.062 s（+8.1%） |
+  | M5 Pro，Q8_0 | 12.53 s | 12.94 s（+3.3%） | 12.65 s（+0.9%） |
+
+  在 Q4_K_M 上，带适配器的一步比不带的更快：K 拼接 GEMM 同时把 Q4_K_M 文件中保留为 Q6_K 的投影（一半块的
+  qkv 与 fc2）放到 cuBLAS BF16 上，而普通路径用 ggml 自己的内核运行它们；同一路径上 rank 128 比 rank 16
+  多 2.1%。在 bf16 上开销几乎与秩无关：它来自每次把权重复制进 K + R 行（每个投影 4 × K × N 字节，每步约
+  71 GB），量化权重的反量化本来就要付出这笔开销。把复制放到第二个流上、以及先写扩张再以 beta 1 加上乘积，
+  两种做法都更慢（pDMD 分别为 2.149 s 与 2.166 s）；要消除它，需要一个从各自指针读取更新列的 GEMM。
+  在 M5 Pro 上，乘积旁边的算子让 pDMD 多花 10.8%、Seedreamstyle 多花 8.2%；把更新放进乘积内后，两者同时使用
+  多花 5.7%。
+- *pDMD 端到端。* A40 Q4_K_M 上一张热的 2048x2048 图片用时 5.1 s，对比 14.1 s（2.8×），进程的第一张图片
+  13.0 s 对比 21.0 s；bf16 上 24.5 s 对比 34.4 s（1.4×：46 GB 的 A40 每张图片都会重新上传 bf16 权重）；
+  M5 Pro 上 30.8 s 对比 79.8 s（2.6×）。
+- *图片。* 验证集的 8 个提示词，2048x2048，pDMD 分别在 A40（Q4_K_M、bf16）与 M5 Pro（Q8_0）上，与 6 步
+  图片对比：主体与构图相同，清晰干净；小字受损（茶馆的英文招牌变成乱码，而「冬至」与时刻表保持正确），
+  少数细节在 6 步图片正确的地方出错（产品图的杯子多了一个把手，野餐桌下的狗变模糊）。diffusers 自己的流水线（`diffusers_pdmd.py`：
+  官方 bf16 transformer 并把 LoRA 融合进权重，输入 TensorSharp 的文本嵌入、相同的种子与噪声）画出同一张肖像，
+  姿势、帽子与窗户都相同，细节有差别：与 TensorSharp 的 bf16 图片 PSNR 为 17.2 dB，而 6 步图片与它相差 14.0 dB。
+  ComfyUI 转换版本（akhaliq，pdmd2026 的训练）主体画得不错，但会在皮肤与平坦区域
+  叠上一层细密的网纹：无论用它随附的网格区间输出头还是 by-step 输出头都如此（两者都在 M5 Pro 上试过）；它自己卡片上的
+  图片出自 Pruna 的 P-H3-Image（4B 文本编码器），而不是官方模型。它的更新与其 diffusers 版本逐位相同，因此这是该适配器
+  在这套模型上的表现，而不是加载问题。生成图片请使用 `minimax-h3-image-pdmd-2step.json`。
+
 ## 性能
 
 ### A40 与 M5 Pro
@@ -207,6 +280,8 @@ TensorSharp 读取 bf16 DiT 与 Q4_K_M 编码器。ComfyUI 的采样时间取自
 
 ## 尚未实现
 
+- LoRA 合并（更新始终以不合并方式运行）、DoRA、LoCon、LoHa 与 LoKr 适配器，以及 PEFT 配置中按模块的
+  alpha 或秩模式。
 - 编辑与参考图（VAE 编码器路径以及 `Picture n:` 视觉块）。
 - 提示词扩写器（MiniMaxAI/MiniMax-H3-Image-PE）。ComfyUI 的文生图模板默认不启用它。
 - `mlx`、`cuda` 与 `cpu`（纯 C#）后端。

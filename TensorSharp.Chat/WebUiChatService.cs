@@ -1729,7 +1729,7 @@ namespace TensorSharp.Chat
         private sealed class LoraApplyException(string message, Exception inner) : InvalidOperationException(message, inner);
 
         /// <summary><see cref="ApplyLoras"/> for a picture: a model that takes no plug-ins
-        /// (MiniMax-H3-Image) refuses a non-empty set rather than making the picture without it.</summary>
+        /// refuses a non-empty set rather than making the picture without it.</summary>
         private static void ApplyImageLoras(
             TensorSharp.Models.QwenImage.IImageGenerationModel model, IReadOnlyList<LoraSpec> loras, ILogger logger)
         {

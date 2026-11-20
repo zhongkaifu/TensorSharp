@@ -151,6 +151,99 @@ and 15 s from disk on that VM, whose page cache cannot hold both). bf16 does not
 48 GB Mac at all (40.2 GB of weights against a 40.2 GB working set): use Q8_0 there. An
 H100-class card keeps everything, bf16 at 16 MP included.
 
+## LoRA plug-ins
+
+MiniMax-H3-Image takes LoRA adapters of type `minimax-h3-image-lora` through the hosts'
+`--lora`, `--lora-scale` and `--lora-config` (usage: [USAGE](../../USAGE.md#minimax-h3-image-lora-plug-ins))
+and `TS_LORAS`: any number of style adapters, each at its own strength, and at most one speed adapter, whose config fixes
+the sampling.
+
+| Plug-in | Source | Kind | Names | Rank / alpha |
+|---|---|---|---|---|
+| [`minimax-h3-image-pdmd-2step.json`](../../config/lora/minimax-h3-image-pdmd-2step.json) | linoyts/MiniMax-H3-Image-pDMD-2steps @c07d96e5 | speed: 2 steps on `[1, 12/13, 0]`, `by-step` heads | diffusers PEFT | 128 / 128 |
+| [`minimax-h3-image-pdmd-2step-comfy.json`](../../config/lora/minimax-h3-image-pdmd-2step-comfy.json) | akhaliq/minimax-h3-image-pdmd-2step @ef1e3b9a (the ComfyUI conversion) | speed: the same sigmas, `grid-interval` heads | ComfyUI native, block-diagonal fused qkv | 384 / 384 on qkv, 128 / 128 |
+| [`minimax-h3-image-seedreamstyle.json`](../../config/lora/minimax-h3-image-seedreamstyle.json) | Nebsh/Seedreamstyle-H3-6K @5e1b48cd | style (`seedreamstyle.` trigger) | kohya | 16 / 16 |
+
+The two pDMD files are two trainings, not one: linoyts' and akhaliq's (pdmd2026's) factors
+are uncorrelated. A bare `.safetensors` in any of the three grammars is a style adapter.
+
+**How an update is applied.** Unmerged: `y = W x + up (down x)` on the projection the
+adapter names, the base weights as stored. diffusers' `to_q`, `to_k`, `to_v` land on the
+stacked thirds of `attn.qkv_proj`, its `ff.net.0.proj` with the two halves of `lora_B`
+swapped from `[value; gate]` into the checkpoint's `[gate; value]`; ComfyUI and kohya names
+are the checkpoint's own layout (a block-diagonal fused qkv term splits exactly into its
+thirds). Strength × alpha / rank is folded into `up` in F32; each rank component is balanced
+and stored as F16 (F32 on `ggml_cpu`). Several adapters on one projection are concatenated
+along the rank, so a projection runs one shrink and one expand a slot however many there are.
+On `ggml_cuda` a wide product (Q4_K, Q6_K or BF16 weight, 1,024 rows or more) takes its update
+inside its own cuBLAS GEMM, `[W | up] · [x ; down x]` K + R deep (a BF16 weight is copied
+into those rows below K = 2 × rows; above, its parts' expands accumulate into its product).
+On `ggml_metal` a wide product over a Q8_0, F16 or F32 weight is built the same way from
+ggml's own operations (the weight concatenated with the ups each step, never changed) where
+that moves fewer bytes than adding the update beside it: qkv, out and fc1 at 4 MP, not fc2.
+Elsewhere the region's products and adds run on ggml.
+A request with other adapters than the last drops the last set's compiled steps and device
+copies first.
+
+**pDMD's heads.** By-step heads run head 0 for step 1 and head 0 plus head 1 for step 2:
+TensorSharp's combined head over one grid interval `[i, i + 1)` equals diffusers'
+`pdd_proj_out[i]` (MiniMaxAI's `pdd_fused_heads.safetensors`) to 3.8e-10 relative, all six
+heads, every row.
+
+**Validation** (`eng/validation/MiniMaxH3ImageLoraRows`, `eng/validation/MiniMaxH3ImageAB`):
+
+- *Rows against an independent merge.* pDMD (linoyts), akhaliq's pDMD in both its diffusers
+  and ComfyUI files, Seedreamstyle (kohya), waryusya (ComfyUI names, no alpha) and domokun
+  (ComfyUI, fused qkv with `.alpha`): every projection an adapter touches in blocks 0, 25
+  and 49 and the refiner's block 0 ran as the backend runs it and was compared on sampled
+  rows with NumPy's `(W + scale · B A) x`, the adapter read from the Hub by HTTP range
+  requests and mapped by the published conversions, not by TensorSharp's code. `y` agrees to
+  3.6e-3 relative on the A40's Q4_K_M, 2.1e-3 on bf16 and 6.4e-4 on the M5 Pro's Q8_0
+  (`ggml_metal`, beside the product at 1,024 rows and inside it at 4,096), the base product's
+  own rounding; the update alone (the same region run with zero ups subtracted) to 5.8e-3,
+  5.7e-3, and 1.3e-3 beside and 5.4e-3 inside the product (its ups rounded to Q8_0). akhaliq's two
+  files give the same update to the last bit, in NumPy and in TensorSharp.
+- *No adapter, no change.* The 2048x2048 portrait is bit-identical to the one before LoRA
+  support: Q4_K_M and bf16 on the A40, Q8_0 on the M5 Pro.
+- *Cost of a step* at 2048x2048, the median over warm pictures of every step but each
+  picture's first (on the A40 a bf16 picture's first step re-uploads the weights):
+
+  | Step, 2048x2048 | No adapter | pDMD (rank 128) | Seedreamstyle (rank 16) |
+  |---|---:|---:|---:|
+  | A40, Q4_K_M | 2.188 s | 2.087 s (−4.6%) | 2.045 s (−6.5%) |
+  | A40, bf16 | 1.907 s | 2.104 s (+10.3%) | 2.062 s (+8.1%) |
+  | M5 Pro, Q8_0 | 12.53 s | 12.94 s (+3.3%) | 12.65 s (+0.9%) |
+
+  On Q4_K_M a step with an adapter is faster than one without: the K-concat GEMM also
+  takes the projections a Q4_K_M file keeps at Q6_K (qkv and fc2 of half the blocks) onto
+  cuBLAS BF16, where the plain path runs them on ggml's own kernels; rank 128 costs 2.1% more than
+  rank 16 on the same route. On bf16 the cost hardly depends on the rank: it is the copy
+  of each weight into the K + R rows (4 × K × N bytes a projection, about 71 GB a step),
+  which a quantized weight's dequantization pays anyway. Running the copy on a second
+  stream and adding the expands before the product with beta 1 were both slower (2.149 s
+  and 2.166 s for pDMD); a GEMM that reads the update's columns from their own pointer is
+  what would remove it. On the M5 Pro the ops beside the product cost pDMD 10.8% and
+  Seedreamstyle 8.2%; with the update inside the product the two together cost 5.7%.
+- *pDMD end to end.* On the A40 Q4_K_M a warm 2048x2048 picture takes 5.1 s against 14.1 s
+  (2.8×), the first picture of a process 13.0 s against 21.0 s; on bf16 24.5 s against
+  34.4 s (1.4×: the 46 GB A40 re-uploads the bf16 weights in every picture); on the M5 Pro
+  30.8 s against 79.8 s (2.6×).
+- *Pictures.* The 8 prompts of the validation set at 2048x2048, pDMD on the A40 (Q4_K_M,
+  bf16) and the M5 Pro (Q8_0), against the 6-step pictures: the same subjects and
+  compositions, sharp and clean; small type suffers (the tea house's English sign is
+  garbled while 冬至 and the departure board hold), and a few details go wrong where the
+  6-step picture is right (the product mug gets a second handle, the dog under the picnic
+  table blurs). diffusers' own pipeline (`diffusers_pdmd.py`: the official bf16
+  transformer with the LoRA fused into its weights, fed TensorSharp's text embeddings, the
+  same seed and noise) draws the same portrait, the same pose, hat and window, with fine
+  detail apart: 17.2 dB PSNR against TensorSharp's bf16 picture, where the 6-step picture
+  is 14.0 dB away. The ComfyUI conversion (akhaliq, pdmd2026's training) draws its
+  subjects well but lays a fine mesh pattern over skin and flat areas, with by-step heads
+  as well as the grid-interval heads it ships with (both tried on the M5 Pro); its own
+  card's pictures came from Pruna's P-H3-Image stack (a 4B text encoder), not the official
+  one. Its update matches its diffusers twin bit for bit, so this is the adapter on this
+  stack, not its loading. For pictures use `minimax-h3-image-pdmd-2step.json`.
+
 ## Performance
 
 ### A40 and M5 Pro
@@ -255,6 +348,8 @@ and 9.5 s with bf16 at 4 MP, against 55.1 s for ComfyUI's first job.
 
 ## Not implemented
 
+- LoRA merging (the updates always run unmerged), DoRA, LoCon, LoHa and LoKr adapters,
+  and a per-module alpha or rank pattern in a PEFT config.
 - Editing and reference images (the VAE encoder path and the `Picture n:` vision
   blocks).
 - The prompt expander (MiniMaxAI/MiniMax-H3-Image-PE). ComfyUI's text-to-image

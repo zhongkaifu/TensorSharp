@@ -129,7 +129,7 @@ entry is skipped, so nothing is fetched for it.`。`--config` 可重复出现以
 因此在全新机器上也能直接运行。该目录还提供聊天模型（`gemma-4-*`、`qwen3.5-9b-*`、`qwen3.6-*`、
 `gpt-oss-20b`）、智能体托管（`agent-*`）、嵌入服务（`embedding-*`）、DiffusionGemma 与 Jev
 （`diffusiongemma-*`、`jev-diffusiongemma-q4`）以及视频（`minimax-h3-*`、`wan-video-*`）的预设，
-[`config/lora/`](config/lora/) 中则有十四个 Qwen-Image-2.1 LoRA 插件和两个 MiniMax-H3 Turbo 插件。完整说明见
+[`config/lora/`](config/lora/) 中则有十四个 Qwen-Image-2.1 LoRA 插件、两个 MiniMax-H3 Turbo 插件和三个 MiniMax-H3-Image 插件。完整说明见
 [`config/README.md`](config/README.md)。
 
 ## 控制台应用
@@ -465,8 +465,8 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--qwen-image-vl <path>` | 覆盖解析到的 Qwen3-VL-8B 文本编码器 GGUF（默认：DiT 旁的 `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF）。环境变量：`TS_QWEN_IMAGE_TE`。 |
 | `--qwen-image-mmproj <path>` | 覆盖解析到的 Qwen3-VL-8B mmproj（编辑时的视觉接地）GGUF（默认：DiT 旁匹配的 `mmproj` GGUF）。环境变量：`TS_QWEN_IMAGE_MMPROJ`。 |
 | `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点。GGUF 至多标注架构，Turbo 的张量又与基础检查点相同，所以由宿主声明：`turbo` 按 Qwen-Image-2.1-Turbo 公布的 8 步调度、CFG 1 采样，拒绝其他步数，也拒绝步数蒸馏 `--lora` 插件。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定；其他文件为 `base`。用于其他模型时被拒绝。环境变量：`TS_QWEN_IMAGE_VARIANT`。见 [Qwen-Image-2.1-Turbo](docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo)。 |
-| `--lora <path>` | Qwen-Image-2.1 或 MiniMax-H3（FL2VA）的 LoRA 插件。Qwen-Image-2.1：LoRA `.safetensors` 文件，或 TensorSharp 插件配置 `.json`（见 [`config/lora/`](config/lora/)）；重复该参数可叠加多个 LoRA。MiniMax-H3：只接受一个 `minimax-h3-lora` 配置，即 `config/lora/minimax-h3-fl2v-turbo-8step.json` 或 `-4step.json`，它把 `--diffusion-steps`、`--flow-shift`、`--sampler` 与 `--cfg` 锁定为其配方，并在 Ref2VA 检查点上被拒绝。以不合并的方式叠加在量化 Transformer 之上。模型不接受的插件会在启动时、插件下载之前被拒绝；若 `--config` 仍需下载模型，模型家族会在该下载完成后立即检查（冲突的采样参数在下载之前就被拒绝）。默认：无。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)与 [MiniMax-H3 Turbo 插件](#minimax-h3-turbo-插件)。 |
-| `--lora-scale <f>` | 前一个 `--lora` 的强度（乘以 alpha / rank）。默认：插件配置中的 `"scale"`，否则为 `1.0`。MiniMax-H3 拒绝负强度：其 Turbo 调度在强度 1 下蒸馏，0 则保留适配器各项而上投影因子为零。 |
+| `--lora <path>` | Qwen-Image-2.1、MiniMax-H3（FL2VA）或 MiniMax-H3-Image 的 LoRA 插件。Qwen-Image-2.1：LoRA `.safetensors` 文件，或 TensorSharp 插件配置 `.json`（见 [`config/lora/`](config/lora/)）；重复该参数可叠加多个 LoRA。MiniMax-H3：只接受一个 `minimax-h3-lora` 配置，即 `config/lora/minimax-h3-fl2v-turbo-8step.json` 或 `-4step.json`，它把 `--diffusion-steps`、`--flow-shift`、`--sampler` 与 `--cfg` 锁定为其配方，并在 Ref2VA 检查点上被拒绝。MiniMax-H3-Image：`minimax-h3-image-lora` 配置或裸 `.safetensors`（diffusers PEFT、ComfyUI 或 kohya 命名），可重复作为风格适配器，外加至多一个加速适配器（如 `config/lora/minimax-h3-image-pdmd-2step.json`），它锁定 `--diffusion-steps` 与 `--cfg`。以不合并的方式叠加在量化 Transformer 之上。模型不接受的插件会在启动时、插件下载之前被拒绝；若 `--config` 仍需下载模型，模型家族会在该下载完成后立即检查（冲突的采样参数在下载之前就被拒绝）。默认：无。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)、[MiniMax-H3 Turbo 插件](#minimax-h3-turbo-插件)与 [MiniMax-H3-Image LoRA 插件](#minimax-h3-image-lora-插件)。 |
+| `--lora-scale <f>` | 前一个 `--lora` 的强度（乘以 alpha / rank）。默认：插件配置中的 `"scale"`，否则为 `1.0`。MiniMax-H3 与 MiniMax-H3-Image 拒绝负强度：加速调度在强度 1 下蒸馏，0 则保留适配器各项而上投影因子为零。 |
 | `--lora-config <path>` | 前一个 `--lora` 的伴随配置：TensorSharp LoRA 配置、PEFT `adapter_config.json` 或 VideoX-Fun `pdd_config.json`。放在这里的 MiniMax-H3 插件配置必须在其 `"weights"` 中写明前一个 `--lora` 的权重文件，其配方仍然锁定。默认：无（PDD 包的 `pdd_config.json`，以及与 `adapter_model.safetensors` 同目录的 PEFT `adapter_config.json`，会在权重旁自动找到）。 |
 | `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
 | `--penalty-last-n` | **已移除，启动时（包括作为配置文件键时）直接拒绝**（退出码 1，`Configuration error: --penalty-last-n was removed: …`）。它是 CLI 独有的重复惩罚窗口名：请改用 `--repeat-last-n <N>`，即两个宿主与请求字段 `repeat_last_n` 共用的拼写。 |
@@ -756,7 +756,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | 覆盖服务端原本在 DiT GGUF 旁找到的 Qwen-Image-2.1 伴随文件：VAE、Qwen3-VL-8B 文本编码器及其视觉投影器（编辑时需要）。启动时检查。环境变量：`TS_QWEN_IMAGE_VAE`、`TS_QWEN_IMAGE_TE`、`TS_QWEN_IMAGE_MMPROJ`。 |
 | `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点，拼写与含义同 CLI：`turbo` 默认按 Turbo 的 8 步调度、CFG 1 采样（请求的 `steps` 只能是 8），并拒绝步数蒸馏 `--lora` 插件。作用于服务端加载的每个 Qwen-Image 模型；其他模型照常加载、不使用它，服务端会记录一条警告，与启动后加载的模型遇到它不接受的 `--lora` 插件时相同。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定。启动时检查。环境变量：`TS_QWEN_IMAGE_VARIANT`。 |
 | `--width <px>` / `--height <px>` | 图像请求既未指定尺寸也未指定面积时（Web UI 从不指定）Qwen-Image-2.1 的默认输出尺寸；请求自己设置了宽高或目标面积时保留它自己的几何设置。默认尺寸需要两个值都给出。不是 32 倍数的边会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING`；只给出一边、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸（2048×2048 面积；`cpu` 后端上为 1024×1024）。Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝启动。请求本身设置的宽高仍必须是 32 的正整数倍。环境变量：`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`。它们同时也是 `--video-width` / `--video-height` 的别名。 LTX 2.5 视频默认输出 1024×1024，宽高必须为 64 的正整数倍；见下文两阶段配方。 |
-| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | 所承载的 Qwen-Image-2.1 或 MiniMax-H3（FL2VA）模型的 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 `--lora` 可叠加 Qwen-Image-2.1 插件；强度与配置绑定到前一个 `--lora`）。文件在启动时检查，启动模型不接受的插件会在启动时、插件下载之前被拒绝（`--config` 仍需下载的模型在该下载完成后立即检查）；之后加载的模型不使用它不接受的插件，并记录一条写明这些插件的警告。启动日志列出这组插件（`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`）。在 Qwen-Image-2.1 上这组插件作用于每个图像请求，请求中的 `steps` / `cfg` 仍会覆盖插件的采样配方。MiniMax-H3 Turbo 插件作用于每段片段，并把 `--video-steps` 以及请求的 `steps`、`flowShift`、`sampler` 锁定为其配方。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)与 [MiniMax-H3 Turbo 插件](#minimax-h3-turbo-插件)。 |
+| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | 所承载的 Qwen-Image-2.1、MiniMax-H3（FL2VA）或 MiniMax-H3-Image 模型的 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 `--lora` 可叠加 Qwen-Image-2.1 插件；强度与配置绑定到前一个 `--lora`）。文件在启动时检查，启动模型不接受的插件会在启动时、插件下载之前被拒绝（`--config` 仍需下载的模型在该下载完成后立即检查）；之后加载的模型不使用它不接受的插件，并记录一条写明这些插件的警告。启动日志列出这组插件（`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`）。在 Qwen-Image-2.1 上这组插件作用于每个图像请求，请求中的 `steps` / `cfg` 仍会覆盖插件的采样配方。MiniMax-H3 Turbo 插件作用于每段片段，并把 `--video-steps` 以及请求的 `steps`、`flowShift`、`sampler` 锁定为其配方。在 MiniMax-H3-Image 上这组插件作用于每张图片，加速适配器锁定请求的 `steps` 与 `cfg`，请求中的 `loras` 列表会在其图片运行前替换这组插件。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)、[MiniMax-H3 Turbo 插件](#minimax-h3-turbo-插件)与 [MiniMax-H3-Image LoRA 插件](#minimax-h3-image-lora-插件)。 |
 | `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
 | `--loras-dir <dir>` | 文本模型 LoRA 适配器目录；在 `/v1/chat/completions` 与 `/v1/responses` 上用 `"lora"` 按请求选择（只有单设备上的 `nemotron_h`、`mistral3` 与 `hunyuan-dense` 会应用；其他情况返回 400）。适配器是 llama.cpp 的 GGUF 适配器（`.gguf`，由 `convert_lora_to_gguf.py` 生成），或张量按基础 GGUF 张量名命名为 `<tensor>.lora_a` / `<tensor>.lora_b` 的 `.safetensors` 文件；训练得到的 PEFT 适配器（`base_model.model...lora_A.weight` 命名）会被拒绝，并提示使用该转换器。顶层的每个适配器都会在启动时、模型加载之后，以去掉扩展名的文件名为名称加载；加载失败的会连同原因记入日志并被跳过。`POST /v1/loras` 可以再加载，但只能是该目录内、以相对路径给出的文件（绝对路径只有位于目录内时才接受），同时最多 32 个适配器（超出返回 409）。**未配置时 `POST /v1/loras` 返回 403**：旧版本会加载服务进程可读的任意路径。该目录应只允许运维者写入。不能与 `--embeddings` 同用。环境变量：`TS_LORAS_DIR`（命令行参数优先）。见 [API_EXAMPLES](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#文本模型-lora-适配器lorav1loras)。 |
 | `--temperature <f>` | 采样温度（`0` = 贪心） |
@@ -1149,6 +1149,56 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/m
 
 sigma 网格、适配器的应用方式、后端与验证情况见
 [MiniMax-H3 卡片](docs/models/minimax-h3_zh-cn.md#turbo-插件)。
+
+### MiniMax-H3-Image LoRA 插件
+
+MiniMax-H3-Image 接受自己类型的 LoRA 适配器 `minimax-h3-image-lora`：任意数量的**风格**适配器（各自
+有自己的强度），外加至多一个**加速**（步数蒸馏）适配器，其配置固定采样方式。它们以不合并的方式叠加在
+按原样存储的去噪器（bf16、Q8_0 或 Q4_K_M）之上，支持 `ggml_cuda`、`ggml_metal` 与 `ggml_cpu`。
+
+```bash
+# pDMD：2 次 Transformer 前向代替 6 次（插件的配方取代默认值）
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-pdmd-2step.json \
+    --prompt "..." --width 2048 --height 2048 --output fast.png
+
+# config/lora/ 中的风格适配器，与任意 LoRA 文件按指定强度叠加
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-seedreamstyle.json \
+    --lora ./loras/my-style.safetensors --lora-scale 0.8 \
+    --prompt "seedreamstyle. A portrait of ..." --output styled.png
+
+# 服务器把启动时的插件组用于每张图片
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-pdmd-2step.json
+```
+
+| 插件 | 说明 |
+|---|---|
+| `minimax-h3-image-pdmd-2step.json` | pDMD 2 步（linoyts/MiniMax-H3-Image-pDMD-2steps）：加速适配器，在 sigma `[1, 12/13, 0]` 上采样 2 步，按步序使用输出头（`by-step`），引导 1，按请求的尺寸生成；约在 1 MP 下训练。MiniMax-H3-Image 社区许可证 |
+| `minimax-h3-image-pdmd-2step-comfy.json` | pDMD 2-NFE 的 ComfyUI 原生格式转换版（akhaliq/minimax-h3-image-pdmd-2step）：与 linoyts 的不是同一次训练；同样的 sigma，使用 ComfyUI 的网格区间输出头。在官方模型上它的图片带有细密网纹，生成图片请优先使用上一个插件 |
+| `minimax-h3-image-seedreamstyle.json` | Seedreamstyle 6K（Nebsh/Seedreamstyle-H3-6K）：摄影风格适配器（kohya 命名，秩 16）；提示词以 `seedreamstyle.` 开头。MiniMax-H3-Image 社区许可证 |
+
+- **文件。** 插件配置（`--lora config.json`，或在配置指向该权重时用 `--lora <权重> --lora-config <配置>`），
+  或裸 `.safetensors`（风格适配器，强度为 `--lora-scale`，默认 1）。张量名可以是 diffusers PEFT
+  （`[transformer.]transformer_blocks.N.attn.to_q.lora_A.weight`）、ComfyUI 原生
+  （`diffusion_model.blocks.N.attn.qkv_proj.lora_A.weight`、`lora_down` / `lora_up`、可选 `.alpha`）或 kohya
+  （`lora_unet_blocks_N_attn_qkv_proj.lora_down.weight`）格式；混用多种格式的文件会被拒绝。每个张量都必须被
+  使用：模型没有对应位置的名字会让加载失败并说明原因（AdaLN 参数、DoRA 幅值、超出范围的块），一个文件的
+  全部问题在同一条消息中列出。
+- **Alpha。** diffusers：文件元数据（`alpha`、`lora_alpha` 或 PEFT 的 `lora_adapter_metadata`），否则取配置的
+  `"alpha"`，否则取秩。ComfyUI 与 kohya：每个模块的 `.alpha` 张量，否则取配置的值，否则取秩（ComfyUI 的规则）。
+  与文件矛盾的配置 alpha 会被拒绝。
+- **加速约定被锁定。** CLI 的 `--diffusion-steps` 与 `--cfg`，以及请求中的 `steps` 与 `cfg`，可以不设或等于插件的
+  值；其他值一律拒绝，从不覆盖（CLI 在启动时、下载任何内容之前；请求返回 400）。第二个加速适配器会被拒绝。
+- **强度。** `--lora-scale`（否则取配置的 `"scale"`，否则为 1）乘以 alpha / rank，必须 ≥ 0。加速适配器的强度
+  不为 1 时，日志会说明其调度是在强度 1 下蒸馏的。
+- **切换。** 服务器启动时的插件组作用于每张图片（服务器不提供按请求选择）。为某张图片传入自己插件组的宿主
+  （聊天服务的 `loras` 列表，TensorAgent 用其已保存的选择填充；它的目录里还没有 MiniMax-H3-Image 条目）
+  会在该图片运行前替换插件组，先前插件组的因子与已编译的步骤会先被丢弃。
+
+更新的应用方式、后端、验证与每步开销见
+[MiniMax-H3-Image 卡片](docs/models/minimax-h3-image_zh-cn.md#lora-插件)。
 
 ## 音视频生成（LTX 2.5 Distilled）
 

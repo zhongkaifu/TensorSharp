@@ -1,7 +1,7 @@
 # Diffusion runtime: MiniMax-H3-Image on the unified runtime, with editing and LoRA
 
-Status: stages S1-S4 implemented (MiniMax-H3-Image text to image runs on the runtime; the legacy model is a test
-seam until S10); S5-S11 are design. Written 2026-11-19 on `feature/h3-image-unified` (cut from
+Status: stages S1-S4 and S7 implemented (MiniMax-H3-Image text to image runs on the runtime, with LoRA plug-ins; the
+legacy model is a test seam until S10); S5, S6 and S8-S11 are design. Written 2026-11-19 on `feature/h3-image-unified` (cut from
 `origin/main` ec702639). ggml is upstream `cd6d2b75`, unchanged (AGENTS.md). No MiniMax-H3
 weights were downloaded or run for this document: every statement about TensorSharp is from
 the code, and every statement about upstream is from the sources listed in
@@ -427,13 +427,29 @@ H100 it is slower than one GPU. This is stage S9, optional.
 
 ### 3.7 LoRA application
 
-LoRA is unmerged, always (§5.4). The runtime's `Linear(x, w)` emits `LoraLinear` when the
-projection has bound parts. Several adapters on one projection are concatenated along the rank
-(Qwen's packing), so there is one shrink per input. q, k and v share one stacked down factor
-(H3's native packing). Strength x alpha / rank is folded into `up` in F32, then
-component-balanced and stored as F16 unless it would overflow (the `MiniMaxH3LoraSet` rules,
-F32 on `ggml_cpu`, ranks padded to 64 on Metal and 16 elsewhere). An adapter change invalidates
-only the factor leaves (`InvalidateDeviceCopies`), not the base weights.
+LoRA is unmerged, always (§5.3). The denoiser emits `LoraLinear` when the projection has bound
+parts (`MiniMaxH3ImageLoraSet`). Several adapters on one projection are concatenated along the
+rank (Qwen's packing), so there is one shrink and one expand per slot. q, k and v are the qkv
+projection's three slots (one down each; a fused ComfyUI/kohya qkv term whose up is
+block-diagonal is split into its thirds exactly, a dense one stays one slot over all of qkv).
+Strength x alpha / rank is folded into `up` in F32, then component-balanced and stored as F16
+unless it would overflow (F32 on `ggml_cpu` and the managed executor, ranks padded to 64 on
+Metal and 16 elsewhere, none on the managed executor). A plan binds one set (its generation is
+in the signature); a set change drops the plan and the old set's factor copies, never the base
+weights. On `ggml_cuda` in a wide program a `LoraLinear` over a Q4_K, Q6_K or BF16 weight is
+served as one node (`H3_FUSED_LORA_KCAT`, `tsg_cuda_lora_gemm_bf16`): a dequantized weight takes
+the update inside its own GEMM as `[W | up] [x ; down x]` (K + R deep); a BF16 weight is copied
+into those rows below K = 2 x rows, and above that its parts expand into the product (beta 1).
+S1's merged node (the update added to the dequantized rows before their BF16 or int8 rounding)
+is not used: where the K-concat route declines (the int8 and FP8 routes, F32 products) the
+region's ops run. On `ggml_metal` in a wide program a `LoraLinear` over a Q8_0, F16 or F32
+weight is lowered to the same form from stock ggml ops (`try_lower_lora_linear`: the weight
+concatenated with the parts' block-diagonal ups each run, the activations with the shrink, one
+product) where that moves fewer bytes than the ops beside the product: ggml-metal has no
+product that accumulates into its result, so beside it the expand writes an [out, rows] F32
+delta that the add reads again (16 bytes an element, plus the slots' concatenation of a stacked
+qkv). At 4 MP that is qkv, out and fc1; fc2 (its input 2.7 times its output) keeps its ops.
+Elsewhere the region's ops run (shrink, expand and an add per slot).
 
 ### 3.8 Cancellation, progress and previews
 
@@ -640,10 +656,11 @@ HTTP range requests (no weights downloaded).
 
 | Repo @ revision | What it does | File, format, keys | Rank / alpha | Licence | Catalog? |
 |---|---|---|---|---|---|
-| **linoyts/MiniMax-H3-Image-pDMD-2steps** @c07d96e5 | 2-step pDMD distillation (teacher: the base 6-step sampler), T2I **and editing**, trained about 1 MP | `pytorch_lora_weights.safetensors`, 1,383,680,256 B, sha `c0a88d9c...`; **diffusers PEFT** `transformer.transformer_blocks.N.attn.to_{q,k,v}`, `to_out.0`, `ff.net.0.proj` (`[value; gate]`), `ff.net.2`, plus `token_refiner.refiner_blocks.N.*`; 624 tensors | 128 / 128 (metadata `alpha`, `rank`) | MiniMax-H3-Image Community License | **yes, Speed**. Recipe: 2 steps, `sample_sigmas = [1, 12/13, 0]`, **heads in order** (head 0, then head 1), `min_generation_area = 1024` (generate at the asked size, about 1 MP) |
+| **linoyts/MiniMax-H3-Image-pDMD-2steps** @c07d96e5 | 2-step pDMD distillation (teacher: the base 6-step sampler), T2I **and editing**, trained about 1 MP | `pytorch_lora_weights.safetensors`, 1,383,680,256 B, sha `c0a88d9c...`; **diffusers PEFT** `transformer.transformer_blocks.N.attn.to_{q,k,v}`, `to_out.0`, `ff.net.0.proj` (`[value; gate]`), `ff.net.2`, plus `token_refiner.refiner_blocks.N.*`; 624 tensors | 128 / 128 (metadata `alpha`, `rank`) | MiniMax-H3-Image Community License | **yes, Speed**. Recipe: 2 steps, `sample_sigmas = [1, 12/13, 0]`, **heads in order** (head 0, then head 1), `min_generation_area = 1024` (pixels: diffusers' smallest floor, i.e. generate at the asked size; the adapter was trained about 1 MP). **Not the same weights as akhaliq's** (S7: every one of the 624 tensors differs and the factors are uncorrelated, e.g. block 10's `to_out.0` B A differs by 142% relative L2): a separate training |
 | **akhaliq/minimax-h3-image-pdmd-2step** @ef1e3b9a | the pDMD 2-NFE LoRA from pdmd2026 ("byte-identical to the upstream pDMD release"); its grids were rendered in **P-H3-Image's stack** (Pruna's 4B text encoder), and the ComfyUI recipe on Comfy-Org's checkpoint is shift 12, "simple", 2 steps (the same sigmas `[1, 12/13, 0]`), with ComfyUI's grid-interval heads | `lora_model_0.safetensors` (diffusers PEFT, 1,383,680,648 B, sha `3179e630...`; a different file from linoyts'), `minimax_h3_pdmd_2nfe_comfyui.safetensors` (**ComfyUI native**, fused `qkv_proj` block-diagonal B, `alpha x 3`, fc1 halves swapped back to `[gate; value]`, 1,956,194,168 B, sha `5feaeef1...`), a 40.2 GB pre-merged checkpoint | 128 / 128 (comfy: qkv 384 / 384) | card says apache-2.0; it is a derivative of a Community-License model | config only (second speed recipe, decision D7) |
 | Kevin67456/minimax-h3-image-pdmd-2step @3f0ef8f3 | mirror of akhaliq | same | same | same | no (duplicate) |
-| hugmynugs/RealemV2-H3 @6a24162e | style ("Realem" trigger; card sample "Neon street"), ai-toolkit 0.13.25, step 1500 | `Realem-MinimaxH3_000001500.safetensors`, 155,110,352 B, sha `1f7e11fc...`; **ComfyUI native** `diffusion_model.blocks.N.attn.qkv_proj.lora_A/B` (one shared rank over fused qkv), `out_proj`, `mlp.fc1`, `mlp.fc2`, refiner blocks; no alpha tensors | 16 / none (scale 1, as ComfyUI) | none stated | config only (decision D7); a format fixture |
+| hugmynugs/RealemV2-H3 @6a24162e | style ("Realem" trigger; card sample "Neon street"), ai-toolkit 0.13.25, step 1500 | `Realem-MinimaxH3_000001500.safetensors`, 155,110,352 B, sha `1f7e11fc...`; **ComfyUI native** `diffusion_model.blocks.N.attn.qkv_proj.lora_A/B` (one shared rank over fused qkv), `out_proj`, `mlp.fc1`, `mlp.fc2`, refiner blocks; no alpha tensors | 16 / none (scale 1, as ComfyUI) | none stated | **gone** (S7, 2026-11-19 21:30 UTC: the repository answers 401 and has left the adapter listing), so no config; waryusya (same format) is its row-parity fixture |
+| Nebsh/Seedreamstyle-H3-6K @5e1b48cd (listed after the design) | photographic style ("seedreamstyle." trigger), 6,000 steps, about 1 MP | `Seedreamstyle_H3_Resume_6K.safetensors`, 149,194,304 B, sha `3e1d306c...`; **kohya** `lora_unet_blocks_N_{attn_qkv_proj,attn_out_proj,mlp_fc1,mlp_fc2}.lora_down/up` with `.alpha`, trunk only, dense qkv; 600 tensors | 16 / 16 (`.alpha`) | MiniMax-H3-Image Community License | **config** (`minimax-h3-image-seedreamstyle.json`, S7): the style adapter Realem was to be |
 | waryusya/waryusya_MiniMaxH3 @4ab9f672 | character or style ("waryusya" trigger), ai-toolkit via Civitai, 59 images at **512x512**, 10 epoch files | ComfyUI native (as Realem), 310 MB each | 32 / 32 (`ss_network_alpha`) | apache-2.0 (card) | no: unknown subject, 512 px training far below the model's 4-16 MP range |
 | SimpleTuner/minimax-h3-image-domokun-2048 @57214626 | test LoRA (the Domo-kun character), 500 steps, attention only | `pytorch_lora_weights.safetensors`, 310,155,360 B, sha `3fd1899c...`; **ComfyUI native with `.alpha` tensors**, fused qkv with rank 96 (3 x 32) | 32 (qkv 96) / per-module tensors | Community License | no (experiment, trademark character); **test fixture candidate** |
 | SimpleTuner/minimax-h3-image-domokun-4096, -2048-4096, -LoRA-experiments | training logs, no weights | — | — | Community License | no |
@@ -692,7 +709,8 @@ Takeaways:
   refuse a mix), `diffusers`, `comfy` or `kohya`. `heads` is `grid-interval` (the base default,
   ComfyUI's) or `by-step` (diffusers': head i at step i). The schema is written so it can become
   the generic diffusion-runtime LoRA schema when another family migrates.
-* **Key grammar** (shared with H3 video; `MiniMaxH3LoraKeys` is extended, not forked):
+* **Key grammar** (`MiniMaxH3LoraKeys` is extended, not forked: `ResolveAny` reads the three grammars; H3
+  video keeps `Resolve`, its diffusers-only grammar, so its Turbo configs and refusals are unchanged):
 
   | Grammar | Scope | Target | fc1 | Alpha |
   |---|---|---|---|---|
@@ -700,13 +718,28 @@ Takeaways:
   | comfy | `diffusion_model.blocks.N`, `diffusion_model.token_refiner.blocks.N` | `attn.qkv_proj` (whole rows), `attn.out_proj`, `mlp.fc1`, `mlp.fc2` | as stored | `.alpha` tensor, else the config, else rank (ComfyUI: no alpha means scale 1) |
   | kohya | `lora_unet_blocks_N_*`, `lora_unet_token_refiner_blocks_N_*` | as comfy | as stored | `.alpha` tensor |
 
-  Every tensor is used or the load fails naming it, as now. A block-diagonal fused qkv (rank
-  3r) applies as one factor pair, because the product equals the block-diagonal form.
+  Every tensor is used or the load fails naming it, as now, all of a file's problems in one message, a
+  mix of grammars and a `key_format` the names contradict included. A fused qkv term is split into its
+  three slots by the up factor's nonzero columns (exact; a block-diagonal ComfyUI conversion gives
+  each third its own rank r), or kept as one slot when every component reaches all three thirds.
+  Bare weights (no config) are taken as a style adapter. Alpha in diffusers files also comes from
+  PEFT's `lora_adapter_metadata` (a per-module `alpha_pattern`/`rank_pattern`, rsLoRA or DoRA is
+  refused); a config alpha the file contradicts is refused.
 * **Running.** Always unmerged, through `LoraLinear` (§3.7). Merging is not offered. On a Q4_K
   or Q8_0 base it loses most of a distillation delta (Qwen's measurement). On the bf16
   safetensors it would need either a second 40 GB copy or writes into a read-only mapping.
-  Unmerged BF16 costs `2 * rank * (in + out)` FLOPs a row, which is about 3% of fc1 at rank 128.
-  The S7 gate measures it.
+  Unmerged costs `2 * rank * (in + out)` FLOPs a row (about 3.5% of a block's products at rank
+  128), but run as separate products an update is memory-bound: the expand writes an [out, rows]
+  F32 delta that the add reads again with the product, 16 bytes an element. S1's served Q4_K node
+  merged the update into the dequantized weight per call instead, writing and reading an [out, in]
+  F32 delta (rows-independent, cheap at video lengths; pDMD measured +17.2% a 4 MP Q4_K_M step on the A40 with it).
+  S7's served node puts the update inside the base GEMM (§3.7), and ggml_metal's lowering does
+  the same from stock ops. Measured at 2048x2048 (a step, against no adapter): A40 Q4_K_M
+  pDMD −4.6% and Seedreamstyle −6.5% (the K-concat route also takes Q4_K_M's Q6_K
+  projections off ggml's own kernels), A40 bf16 +10.3% and +8.1% (the weight's copy into the K + R rows,
+  rank-independent; over the 5% budget: removing it needs a GEMM that reads the update's
+  columns from their own pointer), M5 Pro Q8_0 +3.3% and +0.9% with the Metal lowering (ops beside the product: +10.8% and
+  +8.2%).
 * **Several adapters.** Any number of style adapters, each with its own strength, plus **at
   most one speed adapter** (one schedule). The engine refuses two speed adapters, the same rule
   as `LoraKind.Speed` and `TwoPluginsRefusal`.
@@ -715,8 +748,13 @@ Takeaways:
   overridden (`MiniMaxH3SamplingRecipe.Validate/CheckHost` semantics). With pDMD the 2-step
   sigmas `[1, 12/13, 0]` and heads `by-step` select PDD head 0 for step 1 and head 0 + offset 1
   for step 2. `CombineHead` over the single interval `[i, i+1)` gives head 0 + head i, which
-  should equal diffusers' fused `pdd_proj_out[i]` (`pdd_fused_heads.safetensors`). A parity test
-  checks that against the official file's header and rows before the contract is trusted.
+  equals diffusers' fused `pdd_proj_out[i]` (`pdd_fused_heads.safetensors`): S7 checked all six
+  heads against the official file, every row, at 3.8e-10 relative (weights) and 3.2e-9 (biases),
+  where block i alone is 100% off (`eng/validation/MiniMaxH3ImageLoraRows/pdd_heads.py`). The
+  generation floor `min_generation_area` is in pixels as diffusers' (1024 to 4096^2, 1024 being
+  the asked size); S4's text-to-image samples at the asked size already, so the contract's floor
+  takes effect when the family adopts its 4 MP floor (D3, with editing): a family floor applies
+  `SamplingContract.MinGenerationArea` when it is set.
 * **Hosts.** `--lora`, `--lora-scale` and `--lora-config` (CLI and server), `TS_LORAS`, the
   request's LoRA list (`ImageEditAsync(..., IReadOnlyList<LoraSpec> loras)`) and
   `ILoraPluginHost.SetLoras`. All of these exist; the new family implements `ILoraPluginHost`.
@@ -784,7 +822,8 @@ is added: multi-turn is a chat surface.
     quality of Q4_K_M versus bf16 has been measured (§7.3).
 * **LoraCatalog**: `minimax-h3-image-pdmd-2step` (linoyts@c07d96e5), `Kind = Speed`,
   `Steps = 2`, `RecipeConfig = "minimax-h3-image-pdmd-2step.json"`, licence = the Community
-  License. Nothing NSFW, no training adapter, no experiment (§5.1).
+  License. Nothing NSFW, no training adapter, no experiment (§5.1). It lands with the ModelCatalog
+  entry (S7 added the plug-in and its host routes; TensorAgent had no MiniMax-H3-Image entry yet).
 * **ImageTurns**: the multi-reference rule of §4.6 (generic). For H3-Image the turn area is the
   model's floor (2048^2) instead of `DefaultTargetArea` (1024^2). To fix that, the page reads
   the model's declared default area instead of a constant, and the pDMD contract lowers it to
@@ -800,7 +839,8 @@ is added: multi-turn is a chat surface.
   0.923076923, 0], heads "by-step", cfg 1, min_generation_area 1024}`).
 * `config/lora/minimax-h3-image-pdmd-2step-comfy.json` (akhaliq's ComfyUI file; `heads
   "grid-interval"`).
-* `config/lora/minimax-h3-image-realem.json` (style; `licence: none stated` in its comment).
+* `config/lora/minimax-h3-image-seedreamstyle.json` (style, kohya names; Realem's repository was
+  gone by S7, §5.1).
 * `config/regression/catalog.json`: modalities `image_generation` plus `image_edit`, and the
   presets.
 

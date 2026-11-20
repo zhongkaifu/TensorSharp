@@ -11,6 +11,8 @@
   // checkpoint's own rule); no guidance; generated at the asked size (the card renders 2-16 MP).
   // Locked as config/lora/minimax-h3-image-pdmd-2step.json is. One speed adapter at a time.
   // Licence: the card says apache-2.0; the adapter is a derivative of MiniMax-H3-Image, whose Community License applies.
+  // Pictures (S7): a fine mesh pattern over skin and flat areas on the official stack, with by-step heads as well; the
+  // card's own pictures came from Pruna's P-H3-Image stack. For pictures use minimax-h3-image-pdmd-2step.json.
   "type": "minimax-h3-image-lora",
   "name": "pDMD 2-step (ComfyUI conversion)",
   "variables": {
