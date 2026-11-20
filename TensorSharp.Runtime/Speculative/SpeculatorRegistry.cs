@@ -223,7 +223,9 @@ namespace TensorSharp.Runtime.Speculative
 
         /// <summary>
         /// The window to draft with: what the operator asked for, or - when they
-        /// asked for nothing - narrowed to what the trunk prefers. See
+        /// asked for nothing - what the trunk prefers, narrower or wider than the
+        /// shared default (a programmatic cap set without the explicit flag still
+        /// caps it, as <see cref="ResolveNGramDraftWindow"/> keeps it). See
         /// <see cref="ISpeculativeTarget.SpecPreferredDraftWindow"/> for why the
         /// preference belongs to the target model and not to the algorithm.
         /// </summary>
@@ -232,7 +234,9 @@ namespace TensorSharp.Runtime.Speculative
             int window = Math.Max(1, options.MaxDraftTokens);
             int preferred = target.SpecPreferredDraftWindow;
             if (!options.MaxDraftTokensExplicit && preferred > 0)
-                window = Math.Min(window, preferred);
+                window = options.MaxDraftTokens == SpeculationOptions.DefaultMaxDraftTokens
+                    ? Math.Min(preferred, SpeculationOptions.MaxAllowedDraftTokens)
+                    : Math.Min(window, preferred);
             return Math.Min(window, target.SpecMaxDraftTokens);
         }
 

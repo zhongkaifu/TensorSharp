@@ -127,7 +127,8 @@ namespace TensorSharp.Runtime.Speculative
 
         /// <summary>
         /// Draft window this trunk would rather have by DEFAULT, or 0 for "no
-        /// preference". It narrows the default only; an explicit
+        /// preference". It replaces the default, narrower or wider (Muse-Glimmer's
+        /// MLX verify costs the same at 2 and 16 rows); an explicit
         /// <c>--spec-draft</c> overrides it within <see cref="SpecMaxDraftTokens"/>.
         ///
         /// This exists because the cost of a wide window is a property of the

@@ -75,6 +75,9 @@ public class SpeculatorRegistryTests
     [InlineData(2, 8, false, 2)]  // Metal IQ4 targets prefer a three-row verify
     [InlineData(2, 8, true, 8)]    // the IQ4 preference must not override an explicit window
     [InlineData(0, 8, false, 8)]   // no preference: the default stands
+    [InlineData(15, 8, false, 15)] // a trunk whose verify costs the same at any width widens the default
+    [InlineData(15, 8, true, 8)]   // but not an explicit window
+    [InlineData(15, 5, false, 5)]  // nor a programmatic cap set without the explicit flag
     public void NGram_TakesTheTrunksPreferredWindowLikeEveryOtherAlgorithm(
         int preferred, int requested, bool explicitRequest, int expected)
     {
