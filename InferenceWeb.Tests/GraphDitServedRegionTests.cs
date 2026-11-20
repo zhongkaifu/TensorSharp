@@ -356,14 +356,12 @@ public sealed class GraphDitServedRegionTests(ITestOutputHelper output)
     [InlineData(Q6_K, false, 256)]
     [InlineData(Q6_K, true, 256)]
     [InlineData(GraphFormat.BF16, false, 256)]    // K < 2 T: the BF16 weight copied into the K + R rows
-    [InlineData(GraphFormat.BF16, false, 256, 8448)]   // the same in four row chunks, each GEMM after its chunk's copy
     [InlineData(GraphFormat.BF16, true, 2304)]    // K >= 2 T: its product as it is, the expands accumulated into dst
-    public void LoraLinearIsServedUnmergedAndMatches(int weightType, bool swigluInput, int inRows, int wideOut = 0)
+    public void LoraLinearIsServedUnmergedAndMatches(int weightType, bool swigluInput, int inRows)
     {
-        // qkv-like: three slots (128 rows, or a third of wideOut), a part on each (F16 factors); or fc2-like over fc1's
-        // SwiGLU, one slot.
+        // qkv-like: three 128-row slots, a part on each (F16 factors); or fc2-like over fc1's SwiGLU, one slot.
         const int rows = 1100, rank = 16;
-        int outRows = swigluInput ? 256 : wideOut > 0 ? wideOut : 384, slot = swigluInput ? 0 : outRows / 3;
+        int outRows = swigluInput ? 256 : 384, slot = swigluInput ? 0 : 128;
         int slotRows = slot > 0 ? slot : outRows, slots = outRows / slotRows;
         var rng = new Random((swigluInput ? 3402 : 3401) + 10 * weightType + inRows);
         var (wq, wv) = weightType switch
@@ -392,7 +390,7 @@ public sealed class GraphDitServedRegionTests(ITestOutputHelper output)
             for (int r = 0; r < rows; r++)
                 for (int o = 0; o < slotRows; o++) want[(long)r * outRows + s * slotRows + o] += delta[(long)r * slotRows + o];
         }
-        Verify($"LoraLinear type={weightType} swiglu={swigluInput} K={inRows} N={outRows}", p =>
+        Verify($"LoraLinear type={weightType} swiglu={swigluInput} K={inRows}", p =>
         {
             int xn = swigluInput ? p.G.Op(GraphOp.Swiglu, p.Input(gv, 2 * inRows, rows)) : p.Input(x, inRows, rows);
             int w = p.Weight(weightType, wq, wq.Length, inRows, outRows);

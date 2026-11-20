@@ -48,7 +48,6 @@
 #include "tsg_cuda_stage_profile.h"
 #include "tsg_cuda_int8_scale.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -617,10 +616,6 @@ struct GemmState
     void* w = nullptr; std::size_t wBytes = 0;
     void* x = nullptr; std::size_t xBytes = 0;
     void* d = nullptr; std::size_t dBytes = 0;     // F32 LoRA delta
-    // tsg_cuda_lora_gemm_bf16's copy of a BF16 weight, in row chunks on its own stream under the chunks' GEMMs.
-    cudaStream_t copy = nullptr;
-    cudaEvent_t entered = nullptr, copied[4] = {};
-    bool copyProbed = false, copyUsable = false;
 #if defined(TSG_CUDA_FP8_GEMM)
     cublasLtHandle_t lt = nullptr;
     bool ltProbed = false;
@@ -661,18 +656,6 @@ bool ensure_handle(GemmState& s)
     // The legacy default stream; the caller orders it against ggml's stream.
     if (cublasSetStream(s.handle, nullptr) != CUBLAS_STATUS_SUCCESS) return s.usable = false;
     return s.usable = true;
-}
-
-// The non-blocking copy stream and its events (tsg_cuda_lora_gemm_bf16), made once; false: copy on the default stream.
-bool copy_stream(GemmState& s)
-{
-    if (s.copyProbed) return s.copyUsable;
-    s.copyProbed = true;
-    if (cudaStreamCreateWithFlags(&s.copy, cudaStreamNonBlocking) != cudaSuccess) return s.copyUsable = false;
-    if (cudaEventCreateWithFlags(&s.entered, cudaEventDisableTiming) != cudaSuccess) return s.copyUsable = false;
-    for (cudaEvent_t& e : s.copied)
-        if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return s.copyUsable = false;
-    return s.copyUsable = true;
 }
 
 int grid_for(long long n)
@@ -1691,29 +1674,6 @@ bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, con
     auto* meta = reinterpret_cast<long long*>(
         (reinterpret_cast<std::uintptr_t>(sb + (std::size_t) R * T) + 255) / 256 * 256);
 
-    // A BF16 weight's copy into the rows goes on its own stream from the start, in up to four row chunks, so it runs
-    // under the factors, the shrink and the earlier chunks' GEMMs (a copy is memory-bound, a GEMM at these widths
-    // compute-bound) and each chunk's GEMM waits only for its own rows.
-    const bool overlap = concat && !quantized && copy_stream(s);
-    const int chunks = !concat || quantized ? 1 : N >= 4 * 2048 ? 4 : N >= 2 * 2048 ? 2 : 1;
-    const int64_t chunkRows = (N + chunks - 1) / chunks;
-    if (concat && !quantized)
-    {
-        cudaStream_t cs = overlap ? s.copy : nullptr;
-        if (overlap && (cudaEventRecord(s.entered, nullptr) != cudaSuccess || cudaStreamWaitEvent(cs, s.entered, 0) != cudaSuccess))
-            return false;
-        for (int c = 0; c < chunks; c++)
-        {
-            const int64_t r0 = c * chunkRows, n = std::min<int64_t>(chunkRows, N - r0);
-            if (n <= 0) break;
-            if (cudaMemcpy2DAsync(wb + r0 * ld, (std::size_t) ld * sizeof(__nv_bfloat16),
-                                  static_cast<const __nv_bfloat16*>(w) + r0 * K, (std::size_t) K * sizeof(__nv_bfloat16),
-                                  (std::size_t) K * sizeof(__nv_bfloat16), (std::size_t) n, cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
-                return false;
-            if (overlap && cudaEventRecord(s.copied[c], cs) != cudaSuccess) return false;
-        }
-    }
-
     tsg_stage::Clock clock;
     auto lap = [&](const char* what) {
         if (!tsg_stage::enabled()) return;
@@ -1760,24 +1720,19 @@ bool tsg_cuda_lora_gemm_bf16(int wtype, const void* w, int64_t K, int64_t N, con
             dequant_q4k_bf16_ld<<<(unsigned int) blocks, 128>>>(static_cast<const BlockQ4K*>(w), wb, blocks, blocksPerRow, ld);
         else if (wtype == 14)
             dequant_q6k_bf16_ld<<<(unsigned int) blocks, 64>>>(static_cast<const uint8_t*>(w), wb, blocks, blocksPerRow, ld);
-        // (a BF16 weight's rows are being copied since the start; the up columns are disjoint bytes of the same rows)
+        else if (cudaMemcpy2DAsync(wb, (std::size_t) ld * sizeof(__nv_bfloat16), w, (std::size_t) K * sizeof(__nv_bfloat16),
+                                   (std::size_t) K * sizeof(__nv_bfloat16), (std::size_t) N, cudaMemcpyDeviceToDevice, nullptr) != cudaSuccess)
+            return false;
         if (cudaMemcpyAsync(meta, hostMeta, sizeof(long long) * 5 * nparts, cudaMemcpyHostToDevice, nullptr) != cudaSuccess)
             return false;
         lora_ext_bf16<<<grid_for(R * N), 256>>>(wb, ld, K, R, N, ub, meta, nparts);
         if (cudaGetLastError() != cudaSuccess) return false;
         lap("dequant");
-        // Column-major: dst (N x T, ld dst_ld) = [W | up]^T' (ld x N)^T * [act | s]' (ld x T), a chunk of rows at a time
-        // when the rows are copied in chunks.
-        for (int c = 0; c < chunks; c++)
-        {
-            const int64_t r0 = c * chunkRows, n = std::min<int64_t>(chunkRows, N - r0);
-            if (n <= 0) break;
-            if (overlap && cudaStreamWaitEvent(nullptr, s.copied[c], 0) != cudaSuccess) return false;
-            if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) n, (int) T, (int) ld, &one,
-                             wb + r0 * ld, CUDA_R_16BF, (int) ld, xb, CUDA_R_16BF, (int) ld, &zero,
-                             dst + r0, CUDA_R_32F, (int) dst_ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
-                return false;
-        }
+        // Column-major: dst (N x T, ld dst_ld) = [W | up]^T' (ld x N)^T * [act | s]' (ld x T).
+        if (cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) ld, &one,
+                         wb, CUDA_R_16BF, (int) ld, xb, CUDA_R_16BF, (int) ld, &zero,
+                         dst, CUDA_R_32F, (int) dst_ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            return false;
     }
     else
     {
