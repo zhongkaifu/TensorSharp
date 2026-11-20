@@ -12,9 +12,10 @@
 //          DiT does not fit beside it), --legacy-vae-batch caps its tiles a decode call (TS_H3_IMAGE_VAE_BATCH; its graph
 //          overflows past 4 on ggml_metal and ggml_cpu).
 // The jobs run in order in this one process (the first is the cold first job, the rest warm); prompts.json is a list of
-// {id, prompt, seed, width, height[, images: [paths], keepSourceSize]}; a job with images is an edit (EditImage; the paths
-// are relative to prompts.json, in <Picture n> order; width and height 0 are the automatic size); --size overrides the
-// size. --parity-dump <dir> runs the first job only, through the production pipeline with its components recorded, up to
+// {id, prompt, seed, width, height[, images: [paths], keepSourceSize, mask: path, maskMode: grayscale|alpha, maskInvert,
+// maskFeather, maskCrop, maskCropPadding]}; a job with images is an edit (EditImage; the paths are relative to
+// prompts.json, in <Picture n> order; width and height 0 are the automatic size; a mask belongs to <Picture 1>, as the
+// image routes' fields); --size overrides the size. --parity-dump <dir> runs the first job only, through the production pipeline with its components recorded, up to
 // its first step (ParityDump.cs: the copies, posteriors, conditioning, rows, layout and the step's velocity, for
 // eng/validation/MiniMaxH3ImageEdit/diffusers_parity.py). Each job writes <out>/<label>-<n>-<id>.png; <out>/<label>.json
 // holds per job the phases' seconds (text, steps, denoise, decode, total), the decode's tiles, the PNG's SHA-256, the
@@ -265,6 +266,12 @@ for (int n = 0; n < jobs.Length; n++)
         Height = h,
         Seed = seed,
         KeepSourceSize = (bool?)p["keepSourceSize"] ?? false,
+        Mask = p["mask"] is { } maskPath ? ImageIO.Load(Path.Combine(promptsDir, (string)maskPath!), preserveAlpha: true) : null,
+        MaskMode = (string?)p["maskMode"] == "alpha" ? QwenImageMaskMode.Alpha : QwenImageMaskMode.Grayscale,
+        MaskInvert = (bool?)p["maskInvert"] ?? false,
+        MaskFeather = (int?)p["maskFeather"] ?? 0,
+        MaskCrop = (bool?)p["maskCrop"] ?? false,
+        MaskCropPadding = (int?)p["maskCropPadding"] ?? 64,
         OnStep = (step, total, _) =>
         {
             double now = clock.Elapsed.TotalSeconds;
@@ -281,6 +288,9 @@ for (int n = 0; n < jobs.Length; n++)
         ["n"] = n + 1, ["id"] = id, ["seed"] = seed, ["width"] = w, ["height"] = h, ["load_before"] = load0,
         ["references"] = new JsonArray(inputs.Select(i => (JsonNode)$"{i.Width}x{i.Height}").ToArray()),
     };
+    if (parameters.Mask != null)
+        job["mask"] = $"{(string)p["mask"]!} ({parameters.MaskMode}{(parameters.MaskInvert ? ", inverted" : "")}, feather {parameters.MaskFeather}" +
+                      $"{(parameters.MaskCrop ? $", crop + {parameters.MaskCropPadding}" : "")})";
     try
     {
         RgbImage picture = inputs.Count > 0
