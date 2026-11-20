@@ -442,7 +442,11 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
     /// rows, 512 -> 1024 on a decode step, then to 4096 in a prefill that also laps the window's ring, 768 cells at the default
     /// geometry), then decodes on the wrapped rings: every forward gives exactly the logits of a cache that never grew, as the
     /// legacy probe's grow fix demanded (MuseGlimmerKvGrowTests). The same plan through a request's slot (the unified step),
-    /// the slot reserved for 1 token and grown by the steps, gives a presized slot's logits.
+    /// the slot reserved for 1 token and grown by the steps, gives a presized slot's logits. On an executor whose recorded steps
+    /// bind their slots (the CUDA executor) a unified model's primary starts at a fresh slot's size whatever is asked
+    /// (<c>PrimaryCacheAllocationLength</c>: 1024 cells there), so no primary holds the whole plan from the start: there the
+    /// primary grown from 256 cells is held to one that starts at that fresh-slot size and grows at other points (two growth
+    /// histories), and the slot half, whose reservation is not capped, is unchanged.
     /// </summary>
     [Theory]
     [InlineData("managed")]
@@ -471,7 +475,8 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
             try
             {
                 using StandardDecoderModel model = Create(path, backend);
-                Assert.Equal(initial, model.PrimaryCacheCapacityForTests);
+                // The CUDA executor's slot-bound recordings cap a primary at a fresh slot (ReservationStepTokens, 1024 cells).
+                Assert.Equal(backend == BackendType.Cuda ? Math.Min(initial, 1024) : initial, model.PrimaryCacheCapacityForTests);
                 var rows = plan.Select(s => (float[])model.Forward(tokens[s.From..s.To]).Clone()).ToList();
                 Assert.True(model.RingCellsForTests(0) > 0 && model.RingCellsForTests(0) < 2450, "the window's ring must wrap");
                 output.WriteLine($"{backend} primary from {initial} cells: {model.PrimaryCacheCapacityForTests} cells at the end, rings of {model.RingCellsForTests(0)}");
