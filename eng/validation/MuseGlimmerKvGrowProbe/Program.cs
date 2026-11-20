@@ -35,6 +35,14 @@ int steps = int.Parse(Option("--steps", nllText != null ? "0" : "64"));
 int split = int.Parse(Option("--split", "0"));
 int topK = int.Parse(Option("--topk", "8"));
 int tp = int.Parse(Option("--tp", "1"));
+// --family: "legacy" builds what the descriptor builds (MuseGlimmerModel until the switch, docs/design/muse-glimmer-unified.md
+// stage S8); "runtime" builds the unified-runtime family through its test seam (MuseGlimmerArchitecture.CreateRuntimeModel).
+string family = Option("--family", "legacy");
+// --scenario bench: the CLI's --benchmark (greedy, end to end) on either family in this binary: a prompt of
+// --bench-prefill tokens cycling 17 ids, then --bench-decode greedy one-row forwards, --bench-runs times.
+int benchPrefill = int.Parse(Option("--bench-prefill", "512"));
+int benchDecode = int.Parse(Option("--bench-decode", "128"));
+int benchRuns = int.Parse(Option("--bench-runs", "2"));
 
 if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
     throw new ArgumentException("Pass --model <Muse-Glimmer gguf> (or set TS_TEST_MUSE_GLIMMER_MODEL).");
@@ -44,10 +52,25 @@ if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out
 var load = Stopwatch.StartNew();
 // Released explicitly (and the backend shut down) at the end: ggml-metal asserts at
 // process exit if any buffer is still registered, as the server's ProcessExit hook knows.
-var model = ModelBase.Create(modelPath, backend, tpDegree: tp);
+var model = family switch
+{
+    "legacy" => ModelBase.Create(modelPath, backend, tpDegree: tp),
+    "runtime" => MuseGlimmerArchitecture.CreateRuntimeModel(modelPath, backend, tpDegree: tp),
+    _ => throw new ArgumentException($"--family {family}: use legacy or runtime."),
+};
 double loadMs = load.Elapsed.TotalMilliseconds;
 if (model.Config.Architecture != "muse-glimmer")
     throw new InvalidOperationException($"Expected a muse-glimmer model, got {model.Config.Architecture}.");
+Console.WriteLine($"[probe] family={family} ({model.GetType().Name}), loaded in {loadMs:F0} ms");
+
+if (scenario == "bench")
+{
+    RunBench();
+    model.Dispose();
+    if (backend is BackendType.GgmlMetal or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlCpu)
+        TensorSharp.GGML.GgmlBasicOps.Shutdown();
+    return;
+}
 
 // ---- prompt ------------------------------------------------------------------
 int[] prompt;
@@ -85,7 +108,7 @@ if (teacherFile != null)
     steps = Math.Min(steps, teacher.Length);
 }
 
-Console.WriteLine($"[probe] scenario={scenario} backend={backend} tp={tp} prompt={prompt.Length} tokens steps={steps} split={split} " +
+Console.WriteLine($"[probe] scenario={scenario} family={family} backend={backend} tp={tp} prompt={prompt.Length} tokens steps={steps} split={split} " +
     $"capacity={Field<int>(model, "_kvCacheCapacity")} swaRows={Field<int>(model, "_kvSwaRows")}");
 
 // ---- prefill -----------------------------------------------------------------
@@ -181,6 +204,8 @@ Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
 File.WriteAllText(output, JsonSerializer.Serialize(new
 {
     Scenario = scenario,
+    Family = family,
+    ModelClass = model.GetType().Name,
     Backend = backend.ToString(),
     TensorParallel = tp,
     Model = Path.GetFullPath(modelPath),
@@ -213,6 +238,50 @@ Console.WriteLine($"[probe] text: {Truncate(text.Replace('\n', ' '), 400)}");
 model.Dispose();
 if (backend is BackendType.GgmlMetal or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlCpu)
     TensorSharp.GGML.GgmlBasicOps.Shutdown();
+
+// The CLI's RunBenchmark, greedy end to end: the prefill's argmax seeds the decode; each decode step is a one-row forward
+// and its argmax; the decode clock covers both, as the CLI's does.
+void RunBench()
+{
+    int vocab = model.Config.VocabSize;
+    int span = Math.Max(1, Math.Min(17, vocab)), basis = Math.Max(0, Math.Min(100, vocab - span));
+    int[] ids = Enumerable.Range(0, benchPrefill).Select(i => basis + i % span).ToArray();
+    var runs = new List<object>();
+    double bestPp = 0, bestTg = 0;
+    int[]? firstTokens = null;
+    for (int run = 0; run < benchRuns; run++)
+    {
+        model.ResetKVCache();
+        var sw = Stopwatch.StartNew();
+        float[] logits = model.Forward(ids);
+        double prefillMs = sw.Elapsed.TotalMilliseconds;
+        int next = TopK(logits, Math.Min(vocab, logits.Length), 1)[0].Id;
+        var produced = new int[benchDecode];
+        sw.Restart();
+        for (int i = 0; i < benchDecode; i++)
+        {
+            logits = model.Forward(new[] { next });
+            produced[i] = next;
+            next = TopK(logits, Math.Min(vocab, logits.Length), 1)[0].Id;
+        }
+        double decodeMs = sw.Elapsed.TotalMilliseconds;
+        double pp = benchPrefill / (prefillMs / 1000.0), tg = benchDecode > 0 ? benchDecode / (decodeMs / 1000.0) : 0;
+        bestPp = Math.Max(bestPp, pp);
+        bestTg = Math.Max(bestTg, tg);
+        firstTokens ??= produced;
+        Console.WriteLine($"[probe] bench run {run + 1}/{benchRuns}: prefill {benchPrefill} tokens in {prefillMs:F0} ms ({pp:F1} tok/s); " +
+            $"decode {benchDecode} tokens in {decodeMs:F0} ms ({tg:F2} tok/s)");
+        runs.Add(new { PrefillMilliseconds = prefillMs, PrefillTokensPerSecond = pp, DecodeMilliseconds = decodeMs, DecodeTokensPerSecond = tg });
+    }
+    Console.WriteLine($"[probe] bench best: pp{benchPrefill} {bestPp:F1} tok/s, tg{benchDecode} {bestTg:F2} tok/s ({family}, {backend})");
+    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
+    File.WriteAllText(output, JsonSerializer.Serialize(new
+    {
+        Scenario = "bench", Family = family, ModelClass = model.GetType().Name, Backend = backend.ToString(), Model = Path.GetFullPath(modelPath),
+        KvCacheDtype = model.KvCacheDtype.ToString(), ModelLoadMilliseconds = loadMs, PrefillTokens = benchPrefill, DecodeTokens = benchDecode,
+        BestPrefillTokensPerSecond = bestPp, BestDecodeTokensPerSecond = bestTg, Runs = runs, FirstRunDecodeTokens = firstTokens,
+    }));
+}
 
 static T Field<T>(object target, string name)
 {

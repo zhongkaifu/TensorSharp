@@ -46,6 +46,19 @@ $P --model $M --backend ggml_metal --nll-text benchmarks/engine_comparison/asset
    --out artifacts/muse-glimmer-kv-grow/nll-metal.json
 ```
 
+`--family legacy|runtime` picks the model: `legacy` (the default) builds what the
+descriptor builds (`ModelBase.Create`: the legacy `MuseGlimmerModel` until stage S8 of
+`docs/design/muse-glimmer-unified.md`), `runtime` the unified-runtime family through its
+test seam (`MuseGlimmerArchitecture.CreateRuntimeModel`), so both arms of an A/B run in
+one binary. `--scenario bench` times the CLI's `--benchmark` procedure (greedy, end to
+end) on either: a prompt of `--bench-prefill` tokens (default 512) cycling 17 ids in one
+`Forward`, then `--bench-decode` (128) greedy one-row forwards, `--bench-runs` (2) times;
+the report has every run's prefill and decode rates and the best of each.
+
+```bash
+$P --model $M --backend ggml_metal --family runtime --scenario bench --bench-prefill 4096 --out bench-rt.json
+```
+
 Useful A/B knobs (read at model construction): `MAX_CONTEXT`, `TS_KV_INITIAL_TOKENS`,
 `TS_MUSE_GLIMMER_SWA_RING=0` (uniform caches).
 
