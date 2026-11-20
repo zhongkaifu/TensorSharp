@@ -23,7 +23,8 @@ python3 eng/validation/MuseGlimmerKvGrowProbe/compare.py ref.json cand.json --lo
 Options: `--backend` (default `ggml_metal`), `--system-file`, `--prompt-file` (rendered
 as a user message through the GGUF chat template), `--steps`, `--teacher <report>`,
 `--logits-out` (fp16 logits of every step), `--tp N`, `--layer-split N` (whole layers over N GPUs; the
-runtime family, legacy refuses it), and `--scenario`:
+runtime family, legacy refuses it), `--ring-step-rows N` (the runtime family: rings of window + N cells and prompt steps of
+up to N rows, in place of 512; a diagnostic for the step width), and `--scenario`:
 
 | Scenario | What it does |
 |---|---|

@@ -47,6 +47,9 @@ int topK = int.Parse(Option("--topk", "8"));
 int tp = int.Parse(Option("--tp", "1"));
 // --layer-split N: whole layers over N GPUs (the runtime family; legacy refuses it, as its serving contract says).
 int layerSplit = int.Parse(Option("--layer-split", "1"));
+// --ring-step-rows N (the runtime family; a diagnostic): rings of window + N cells and prompt steps of up to N rows a sequence,
+// in place of the runtime's 512 (StandardDecoderModel.RingStepRows), so the step width (design D1 / G4) can be measured.
+int ringStepRows = int.Parse(Option("--ring-step-rows", "0"));
 // --family: "legacy" builds what the descriptor builds (MuseGlimmerModel until the switch, docs/design/muse-glimmer-unified.md
 // stage S8); "runtime" builds the unified-runtime family through its test seam (MuseGlimmerArchitecture.CreateRuntimeModel).
 string family = Option("--family", "legacy");
@@ -63,6 +66,12 @@ if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
     throw new ArgumentException("Pass --model <Muse-Glimmer gguf> (or set TS_TEST_MUSE_GLIMMER_MODEL).");
 if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out BackendType backend))
     throw new ArgumentException($"Unknown backend '{backendName}'.");
+
+if (ringStepRows > 0)
+{
+    Require(family == "runtime", "--ring-step-rows sets the runtime family's rings: pass --family runtime.");
+    StandardDecoderModel.RingGeometryForTests.Value = (ringStepRows, StandardDecoderModel.RingAlignment);
+}
 
 var load = Stopwatch.StartNew();
 // Released explicitly (and the backend shut down) at the end: ggml-metal asserts at
