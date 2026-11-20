@@ -67,6 +67,10 @@ public static partial class ModelCatalog
     // Qwen-Image 2.1's own license (Qwen/Qwen-Image-2.1, and the GGUF and VAE repackagings
     // of it): research and evaluation only. Its Qwen3-VL text encoder is Apache-2.0.
     private const string QwenImageLicense = "catalog.license.qwenImage";
+    // MiniMax-H3-Image's own license (its Comfy-Org and Unsloth repackagings carry the same text), which the
+    // entries declare as terms to accept before their first download (CatalogLicenseTerms): the user decided on
+    // 2026-11-19 to list the model with its terms shown and accepted at download (decision D9).
+    private const string MiniMaxH3ImageLicense = "catalog.license.minimaxH3Image";
 
     private static string Hf(string repo, string file) => $"https://huggingface.co/{repo}/resolve/main/{file}";
 
@@ -547,6 +551,33 @@ public static partial class ModelCatalog
                 11_381_096_544, "2fa5840021cf6967843eaeefde9aaa277e540de02986d5ee3d5b0e6a7a8c9dec"),
             modalities: CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio,
             notes: "catalog.model.minimaxH3.notes"),
+        // MiniMax-H3-Image: Unsloth's GGUFs of Comfy-Org's pruned DiT, Comfy-Org's image VAE, and the MiniMax-H3
+        // entry's text encoder and tokenizer files, byte for byte (an installation that has either links them
+        // from there). Read from the Hugging Face tree API on 2026-11-19 (LFS object ids at the pinned commits),
+        // equal to config/minimax-h3-image*.json and to the copies the validation runs downloaded.
+        // Q4_K_M: the 32 GB tier. Its largest phase is the text encoder's (18.2 GB of weights and 0.6 GB of
+        // working memory), and the pipeline releases it before the denoise wherever the GPU's working set cannot
+        // hold both (a 32 GB Mac's is about 22.9 GB). Quality against the bf16 DiT is measured
+        // (docs/models/minimax-h3-image.md#quantizations): the furthest of the quantizations, 17.3 dB mean PSNR.
+        MiniMaxH3Image(
+            id: "minimax-h3-image-q4km",
+            weights: new CatalogFile(CatalogFileRole.Weights, "minimax_h3_image_pruned-Q4_K_M.gguf",
+                MiniMaxH3ImageGgufUrl("minimax_h3_image_pruned-Q4_K_M.gguf"),
+                12_721_119_968, "ef784687ff25a974191d00f941388060ef971286fbd2e98b2769fa78c8d599a8"),
+            quantization: "catalog.model.minimaxH3ImageQ4km.quantization",
+            minDeviceMemoryGB: 32,
+            notes: "catalog.model.minimaxH3ImageQ4km.notes"),
+        // Q8_0: the closest to the bf16 DiT (22.9-28.4 dB on the photographic prompts), measured on a 48 GB M5 Pro
+        // at 29.9 GB wired for a 2048x2048 picture. Its denoise alone (22.0 GB of weights and 3.1 GB of working
+        // memory at 2048x2048) is past a 32 GB Mac's GPU working set, so it starts at 48 GB.
+        MiniMaxH3Image(
+            id: "minimax-h3-image-q8-0",
+            weights: new CatalogFile(CatalogFileRole.Weights, "minimax_h3_image_pruned-Q8_0.gguf",
+                MiniMaxH3ImageGgufUrl("minimax_h3_image_pruned-Q8_0.gguf"),
+                22_026_760_928, "ff5ed88d968e9fc3c3352101592ba83f963879ae3118ce9ab9eb7946aad70255"),
+            quantization: "catalog.model.minimaxH3ImageQ8.quantization",
+            minDeviceMemoryGB: 48,
+            notes: "catalog.model.minimaxH3ImageQ8.notes"),
         Ltx25Distilled(),
     }.Concat(ExtendedModels()).ToArray();
 
@@ -611,6 +642,96 @@ public static partial class ModelCatalog
         "https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2-GGUF/resolve/4f5a39be8f0a9e9a573ac9824251830a8f4096d9/Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf",
         362_124_704, "2f174e593998c77df0eb7ca13961915a26f25f7944d784a1838e1856e857ff0d", Optional: true);
 
+    // The files MiniMax-H3 and MiniMax-H3-Image share: the Qwen3-VL-32B text encoder (truncated to the 50 layers
+    // H3 reads, and carrying the Qwen3-VL vision tower that presents a photo to the prompt) and the loose tokenizer
+    // files its GGUF does not carry. One definition, so every entry lists the same bytes and an installation with
+    // one entry links the others' copies (ModelStore.SharedCopy) instead of fetching 18.2 GB again. Pinned at
+    // unsloth/MiniMax-H3-GGUF d629413c and MiniMaxAI/MiniMax-H3 42ed227e, the revisions the configs download.
+    private const string MiniMaxH3GgufCommit = "d629413c2e5b51b38c453668b75ca3b06ca92703";
+    private const string MiniMaxH3ProcessorCommit = "42ed227ee7df40d41602854ae760620d6eb651fe";
+
+    private static CatalogFile MiniMaxH3TextEncoder() => new(CatalogFileRole.TextEncoder, "qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+        $"https://huggingface.co/unsloth/MiniMax-H3-GGUF/resolve/{MiniMaxH3GgufCommit}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+        18_218_065_024, "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc");
+
+    // The text encoder's GGUF carries no tokenizer. tokenizer_config.json is the only place its vision markers are
+    // defined; without it a photo cannot be placed in the prompt (MiniMaxH3Pipeline.RequireVisionTokens).
+    private static CatalogFile[] MiniMaxH3Tokenizer() =>
+    [
+        new(CatalogFileRole.Tokenizer, "vocab.json", MiniMaxH3ProcessorUrl("vocab.json"),
+            2_776_833, "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"),
+        new(CatalogFileRole.Tokenizer, "merges.txt", MiniMaxH3ProcessorUrl("merges.txt"),
+            1_671_839, "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"),
+        new(CatalogFileRole.Tokenizer, "tokenizer_config.json", MiniMaxH3ProcessorUrl("tokenizer_config.json"),
+            11_003, "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68"),
+    ];
+
+    private static string MiniMaxH3ProcessorUrl(string file) =>
+        $"https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/{MiniMaxH3ProcessorCommit}/processor/{file}";
+
+    private static string MiniMaxH3ImageGgufUrl(string file) =>
+        $"https://huggingface.co/unsloth/MiniMax-H3-Image-GGUF/resolve/0d25c7349e007529691bbc0f4426b579fce7de01/{file}";
+
+    /// <summary>
+    /// The terms of MiniMax-H3-Image's license (MiniMaxAI/MiniMax-H3-Image @8ced6006, whose LICENSE was last
+    /// changed on 2026-11-11), accepted before an entry's first download. The revision is the SHA-256 of the text
+    /// the app ships (<c>Catalog/Licenses/</c>); Unsloth's GGUF repository carries the version before that change,
+    /// which differs in the authorization link only, and is not what the app shows.
+    /// </summary>
+    /// <remarks>Read through a holder class: <see cref="BuiltIn"/>'s initializer reads it, and a static field of this
+    /// class declared below that initializer would still be null then.</remarks>
+    internal static CatalogLicenseTerms MiniMaxH3ImageTerms => MiniMaxH3ImageLicenseTerms.Terms;
+
+    private static class MiniMaxH3ImageLicenseTerms
+    {
+        internal static readonly CatalogLicenseTerms Terms = new()
+        {
+            Id = "minimax-h3-image-community-license",
+            Revision = "0ec3bb5e6d9e885fa2aaf15e84689e50fd51f42b53fa24d3a64ed9d8c76d423b",
+            Title = MiniMaxH3ImageLicense,
+            Summary = "catalog.terms.minimaxH3Image.summary",
+            Url = "https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/8ced60068623def5b74b4d10558117cb61d6482d/LICENSE",
+            TextResource = "minimax-h3-image-community-license.txt",
+        };
+    }
+
+    /// <summary>
+    /// A MiniMax-H3-Image entry: one of Unsloth's GGUFs of the pruned DiT, the image VAE, and the text encoder and
+    /// tokenizer files the MiniMax-H3 entry has too. Pictures from a description, and edits of up to 16 attached
+    /// photos (<c>&lt;Picture n&gt;</c> in the prompt names them in order); made through ImageTurns, as
+    /// Qwen-Image's are.
+    /// </summary>
+    private static CatalogModel MiniMaxH3Image(
+        string id, CatalogFile weights, string quantization, int minDeviceMemoryGB, string notes) => new()
+    {
+        Id = id,
+        DisplayName = "MiniMax-H3-Image",
+        Family = CatalogFamily.MiniMaxH3Image,
+        Kind = CatalogArchitectureKind.Diffusion,
+        Parameters = "catalog.model.minimaxH3Image.parameters",
+        Quantization = quantization,
+        Files =
+        [
+            weights,
+            MiniMaxH3TextEncoder(),
+            new CatalogFile(CatalogFileRole.Vae, "minimax_h3_image_vae_fp16.safetensors",
+                "https://huggingface.co/Comfy-Org/MiniMax-H3-Image/resolve/0bb149f51e3156ed4b90dd45d5620346bfe1df8f/vae/minimax_h3_image_vae_fp16.safetensors",
+                1_168_505_312, "d80e9c2e5cfc9844869961ff5a58c9a9e52182df6bfb30b26018dd7f348721af"),
+            .. MiniMaxH3Tokenizer(),
+        ],
+        // A photo is what an edit starts from (the text encoder's vision tower presents it), not something to
+        // describe in words.
+        Modalities = CatalogModalities.Image | CatalogModalities.ImageOutput,
+        MinDeviceMemoryGB = minDeviceMemoryGB,
+        // A diffusion model holds no KV cache; the picture's size and steps are chosen per request (ImageTurns).
+        ContextLength = 0,
+        KvCacheDtype = "f16",
+        Sampling = new CatalogSampling(1.0f, 0, 1.0f, 0.0f),
+        License = MiniMaxH3ImageLicense,
+        LicenseTerms = MiniMaxH3ImageTerms,
+        Notes = notes,
+    };
+
     /// <summary>
     /// A MiniMax-H3 entry: its primary FL2VA denoiser, the companion Ref2VA denoiser, and
     /// the files they share. Video Studio switches denoisers per shot while keeping the
@@ -626,15 +747,11 @@ public static partial class ModelCatalog
         Kind = CatalogArchitectureKind.Diffusion,
         Parameters = "catalog.model.minimaxH3.parameters",
         Quantization = "catalog.model.minimaxH3.quantization",
-        Files = new[]
-        {
+        Files =
+        [
             denoiser,
             referenceDenoiser,
-            // Truncated to the 50 layers H3 reads, and carrying the Qwen3-VL vision tower that
-            // presents a photo to the prompt.
-            new CatalogFile(CatalogFileRole.TextEncoder, "qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
-                Hf("unsloth/MiniMax-H3-GGUF", "qwen3vl_32b_minimax_h3-Q4_K_M.gguf"),
-                18_218_065_024, "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc"),
+            MiniMaxH3TextEncoder(),
             new CatalogFile(CatalogFileRole.Vae, "minimax_h3_video_vae_fp16.safetensors",
                 Hf("unsloth/MiniMax-H3-GGUF", "vae/minimax_h3_video_vae_fp16.safetensors"),
                 5_207_808_496, "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522"),
@@ -643,19 +760,8 @@ public static partial class ModelCatalog
             new CatalogFile(CatalogFileRole.AudioVae, "minimax_h3_audio_vae_fp32.safetensors",
                 Hf("unsloth/MiniMax-H3-GGUF", "vae/minimax_h3_audio_vae_fp32.safetensors"),
                 605_254_808, "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"),
-            // The text encoder's GGUF carries no tokenizer. tokenizer_config.json is the only
-            // place its vision markers are defined; without it a photo cannot be placed in the
-            // prompt (MiniMaxH3Pipeline.RequireVisionTokens).
-            new CatalogFile(CatalogFileRole.Tokenizer, "vocab.json",
-                Hf("MiniMaxAI/MiniMax-H3", "processor/vocab.json"),
-                2_776_833, "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"),
-            new CatalogFile(CatalogFileRole.Tokenizer, "merges.txt",
-                Hf("MiniMaxAI/MiniMax-H3", "processor/merges.txt"),
-                1_671_839, "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"),
-            new CatalogFile(CatalogFileRole.Tokenizer, "tokenizer_config.json",
-                Hf("MiniMaxAI/MiniMax-H3", "processor/tokenizer_config.json"),
-                11_003, "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68"),
-        },
+            .. MiniMaxH3Tokenizer(),
+        ],
         Modalities = modalities | CatalogModalities.VideoOutput | CatalogModalities.AudioOutput,
         MinDeviceMemoryGB = 32,
         // A diffusion model holds no KV cache; the clip's size and length are chosen per

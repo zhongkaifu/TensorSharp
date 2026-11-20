@@ -42,6 +42,14 @@ public static class OpenAIEndpoints
         endpoints.MapPost("/v1/videos/generations",
             (HttpRequest req, WebUiAdapter adapter) => adapter.OpenAIVideoGenerationsAsync(req))
             .DisableRequestTimeout();
+        // Text to image and image editing with the loaded image model (MiniMax-H3-Image, Qwen-Image-2.1), in the shapes
+        // SGLang serves: JSON generations, multipart edits whose image parts are <Picture 1>, <Picture 2>, ... in order.
+        endpoints.MapPost("/v1/images/generations",
+            (HttpRequest req, WebUiAdapter adapter) => adapter.OpenAIImageGenerationsAsync(req))
+            .DisableRequestTimeout();
+        endpoints.MapPost("/v1/images/edits",
+            (HttpRequest req, WebUiAdapter adapter) => adapter.OpenAIImageEditsAsync(req))
+            .DisableRequestTimeout();
         return endpoints;
     }
 }

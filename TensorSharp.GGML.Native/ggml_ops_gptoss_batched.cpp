@@ -652,6 +652,7 @@ static int gob_decode_batched_window(
     ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
     struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
     std::vector<HostBinding> upload_list;
+    tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
     std::vector<BufferHandle> ephemeral_bufs;
 
     auto bind_or_mark = [&](ggml_tensor* tgt, void* data, std::size_t bytes, bool cacheable,
@@ -662,7 +663,7 @@ static int gob_decode_batched_window(
             bool needs_upload = false;
             if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
             {
-                if (needs_upload) upload_list.push_back({tgt, data, bytes});
+                if (needs_upload) { upload_list.push_back({tgt, data, bytes}); pending.add(data); }
                 return;
             }
         }
@@ -759,6 +760,7 @@ static int gob_decode_batched_window(
     host_read_barrier();
     for (auto& u : upload_list)
         ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+    pending.commit();
 
     ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * n_seqs * sizeof(float));
     ggml_backend_tensor_set(pos_tensor, positions, 0, static_cast<std::size_t>(n_seqs) * sizeof(std::int32_t));
@@ -1157,6 +1159,7 @@ static int gob_decode_batched_arena(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
 
         auto bind_or_mark = [&](ggml_tensor* tgt, void* data, std::size_t bytes) {
             if (tgt == nullptr || data == nullptr) return;
@@ -1166,7 +1169,7 @@ static int gob_decode_batched_arena(
                 if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload,
                                            GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
                 {
-                    if (needs_upload) upload_list.push_back({tgt, data, bytes});
+                    if (needs_upload) { upload_list.push_back({tgt, data, bytes}); pending.add(data); }
                     return;
                 }
                 ggml_backend_buffer_t buf = nullptr;
@@ -1227,6 +1230,7 @@ static int gob_decode_batched_arena(
         host_read_barrier();
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
 
         e.hidden_stage.assign(static_cast<std::size_t>(H) * n_slots, 0.0f);
         e.pos_stage.assign(n_slots, 0);

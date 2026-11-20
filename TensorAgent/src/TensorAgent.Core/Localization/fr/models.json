@@ -90,5 +90,13 @@
   "models.alert.delete.message": "Supprimer {model} de cet appareil ? Vous pourrez le télécharger à nouveau.",
   "models.alert.delete.messageLocal": "Supprimer {model} de cet appareil ? Vous devrez sélectionner à nouveau le GGUF local d’origine pour le restaurer.",
   "models.alert.delete.confirm": "Supprimer",
-  "models.action.unavailable": "Indisponible"
+  "models.action.unavailable": "Indisponible",
+  "models.license.title": "Conditions de licence",
+  "models.license.intro": "{model} est distribué sous la {license}. Lisez les conditions ci-dessous : le téléchargement ne commence que si vous les acceptez.",
+  "models.license.changed": "Les conditions ont changé depuis votre dernière acceptation.",
+  "models.license.summary": "Résumé",
+  "models.license.fullText": "Texte intégral de la licence (en anglais, tel que publié)",
+  "models.license.open": "Ouvrir la licence sur Hugging Face",
+  "models.license.accept": "Accepter et télécharger",
+  "models.license.decline": "Refuser"
 }

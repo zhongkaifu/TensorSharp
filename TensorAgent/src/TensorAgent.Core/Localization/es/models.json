@@ -90,5 +90,13 @@
   "models.alert.delete.message": "¿Eliminar {model} de este dispositivo? Se puede volver a descargar.",
   "models.alert.delete.messageLocal": "¿Eliminar {model} de este dispositivo? Para restaurarlo tendrás que elegir de nuevo el GGUF local original.",
   "models.alert.delete.confirm": "Eliminar",
-  "models.action.unavailable": "No disponible"
+  "models.action.unavailable": "No disponible",
+  "models.license.title": "Condiciones de licencia",
+  "models.license.intro": "{model} se distribuye bajo la {license}. Lee las condiciones de abajo: la descarga solo empieza si las aceptas.",
+  "models.license.changed": "Las condiciones han cambiado desde la última vez que las aceptaste.",
+  "models.license.summary": "Resumen",
+  "models.license.fullText": "Texto completo de la licencia (en inglés, tal como se publicó)",
+  "models.license.open": "Abrir la licencia en Hugging Face",
+  "models.license.accept": "Aceptar y descargar",
+  "models.license.decline": "Rechazar"
 }

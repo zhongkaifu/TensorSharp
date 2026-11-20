@@ -90,5 +90,13 @@
   "models.alert.delete.message": "要从此设备移除 {model} 吗？以后可以重新下载。",
   "models.alert.delete.messageLocal": "要从此设备移除 {model} 吗？恢复时需要再次选择原始本地 GGUF 文件。",
   "models.alert.delete.confirm": "删除",
-  "models.action.unavailable": "暂不可用"
+  "models.action.unavailable": "暂不可用",
+  "models.license.title": "许可条款",
+  "models.license.intro": "{model} 依据{license}提供。请阅读以下条款：只有接受后才会开始下载。",
+  "models.license.changed": "自你上次接受以来，条款已有更改。",
+  "models.license.summary": "摘要",
+  "models.license.fullText": "许可全文（英文，按发布原文）",
+  "models.license.open": "在 Hugging Face 上打开许可",
+  "models.license.accept": "接受并下载",
+  "models.license.decline": "拒绝"
 }

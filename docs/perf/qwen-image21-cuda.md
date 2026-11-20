@@ -120,7 +120,7 @@ Measured on an A100 80 GB (Linux, sm_80 build), `qwen_image_2.1_Q4_K_M.gguf`,
 | + Q4_K projections on cuBLAS BF16 | 0.62 s | 17.1 s | 19.1 s |
 | + Q6_K projections on cuBLAS BF16 | 0.58 s | 16.2 s | 18.1 s |
 | + attention on cuDNN SDPA (the default) | 0.47 s | 14.0 s | 15.9 s |
-| + `TS_H3_INT8_MATMUL=1` (opt-in) | 0.44 s | 12.7 s | 14.6 s |
+| + `--diffusion-products int8` (opt-in; measured as `TS_H3_INT8_MATMUL=1`) | 0.44 s | 12.7 s | 14.6 s |
 
 With `TS_GGML_NODE_PROFILE=shapes`, a step's attention went from 188 ms to 68 ms and
 its 32 Q6_K products from 66 ms to 25 ms; the Q4_K products are 268 ms of the remaining

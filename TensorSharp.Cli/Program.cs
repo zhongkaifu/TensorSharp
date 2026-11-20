@@ -689,6 +689,18 @@ namespace TensorSharp.Cli
                                 TensorSharp.Graph.PromptAttentionConfig.Name(promptAttention));
                             break;
                         }
+                    case TensorSharp.Graph.DiffusionProductsConfig.Flag:
+                        {
+                            // Read by the native CUDA products (getenv), as the server's ApplyDiffusionProductsCliFlag: published
+                            // in the C runtime's table too, which Environment.SetEnvironmentVariable does not reach on Unix.
+                            string productsStr = args[++i];
+                            if (!TensorSharp.Graph.DiffusionProductsConfig.TryParse(productsStr, out var products))
+                                throw new ArgumentException(TensorSharp.Graph.DiffusionProductsConfig.InvalidValueMessage(
+                                    TensorSharp.Graph.DiffusionProductsConfig.Flag, productsStr));
+                            TensorSharp.Runtime.NativeEnvironment.Set(TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable,
+                                TensorSharp.Graph.DiffusionProductsConfig.Name(products));
+                            break;
+                        }
                     case "--kv-cache-dtype":
                         {
                             string kvDtypeStr = args[++i];
@@ -760,6 +772,19 @@ namespace TensorSharp.Cli
             // An unknown TS_PROMPT_ATTENTION (--prompt-attention above sets a known one) is refused before a model loads,
             // as the server refuses it, rather than when the CUDA executor reads it.
             try { TensorSharp.Graph.PromptAttentionConfig.FromEnvironment(); }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine("Configuration error: " + ex.Message);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+            // Likewise TS_DIFFUSION_PRODUCTS (--diffusion-products), and an int8 route asked of a backend without one.
+            try
+            {
+                string ignored = TensorSharp.Graph.DiffusionProductsConfig.IgnoredOn(
+                    TensorSharp.Graph.DiffusionProductsConfig.FromEnvironment(), backendStr);
+                if (ignored != null) Console.Error.WriteLine(ignored);
+            }
             catch (ArgumentException ex)
             {
                 Console.Error.WriteLine("Configuration error: " + ex.Message);
@@ -1146,9 +1171,9 @@ namespace TensorSharp.Cli
                     string.IsNullOrEmpty(shipped) ? "the built-in renderer (the GGUF ships no template)" : $"the GGUF's template ({shipped.Length} chars)",
                     model.Config.Architecture ?? "unknown");
             }
-            imageMask.ValidateModel(model is TensorSharp.Models.QwenImage.QwenImageModel);
-            if (keepSourceSize && model is not TensorSharp.Models.QwenImage.QwenImageModel)
-                throw new ArgumentException("--keep-source-size requires a Qwen-Image-2.1 model.");
+            imageMask.ValidateModel(model is TensorSharp.Models.QwenImage.IImageGenerationModel { SupportsEditMask: true });
+            if (keepSourceSize && model is not TensorSharp.Models.QwenImage.IImageGenerationModel { SupportsImageEdit: true })
+                throw new ArgumentException("--keep-source-size requires an image model that edits (Qwen-Image-2.1, MiniMax-H3-Image).");
 
             // Speculator weights that ship as their own file (Gemma 4's
             // gemma4-assistant draft head, named with --draft-model) attach
@@ -1204,12 +1229,12 @@ namespace TensorSharp.Cli
             }
 
 
-            // Qwen-Image-2.1: prompt -> generated image, or prompt + input image(s) -> edited
-            // image (no autoregressive path). Repeat --image for multi-image edits (e.g.
-            // --image model.png --image dress.png); the first image drives the output
-            // geometry, and each is tagged <image1>, <image2>, ... ahead of the prompt in
-            // command-line order, so the prompt can refer to them by those tags.
-            // MiniMax-H3-Image takes the same route for text to image.
+            // Image models (Qwen-Image-2.1, MiniMax-H3-Image): prompt -> generated image, or
+            // prompt + input image(s) -> edited image (no autoregressive path). Repeat --image
+            // for multi-image edits (e.g. --image model.png --image dress.png); the first image
+            // drives the output geometry, and the prompt names the images the way the model
+            // does, in command-line order: <image1>, <image2>, ... for Qwen-Image-2.1,
+            // <Picture 1>, <Picture 2>, ... (up to 16) for MiniMax-H3-Image.
             if (model is TensorSharp.Models.QwenImage.IImageGenerationModel imageModel)
             {
                 string prompt = editPrompt
@@ -2536,6 +2561,18 @@ namespace TensorSharp.Cli
                 output = inputs.Count == 0 ? imageModel.GenerateImage(prompt, p) : imageModel.EditImage(prompt, inputs, p);
                 sw.Stop();
                 TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, output);
+            }
+            catch (RequestRefusedException ex)
+            {
+                // The model declined the request before running it (the device cannot hold its phases): the operator's to
+                // act on, like a refused load, so one error line and exit code 2 rather than a stack trace.
+                // The stack trace stays available at --log-level debug, as for a refused load.
+                image.MarkFailed(ex);
+                _log.LogError(LogEventIds.CliFailed, "Request refused: {Reason}", ex.Message);
+                _log.LogDebug(LogEventIds.CliFailed, ex, "Request refused");
+                Console.Error.WriteLine(RequestRefusedException.FormatErrorLine(ex.Message));
+                Environment.ExitCode = HostExitCodes.RequestRefused;
+                return;
             }
             catch (Exception ex)
             {

@@ -742,7 +742,7 @@ void upload_inputs(ForwardGraph& entry, const TSGQi21Desc& d) {
 // its product. The graph and its allocation stay ggml's; graph_compute_offload runs these
 // MUL_MAT nodes into their own buffers. TS_QWEN21_CUBLAS_MATMUL=0 keeps them on MMQ;
 // TS_QWEN21_CUBLAS_MIN_ROWS (default 256) is the token threshold. The Q4_K ones follow
-// TS_H3_INT8_MATMUL and TS_H3_FP8_MATMUL too (tsg_cuda_q4k_gemm.cu).
+// --diffusion-products int8 (TS_DIFFUSION_PRODUCTS) and TS_H3_FP8_MATMUL too (tsg_cuda_q4k_gemm.cu).
 //
 // The unmasked attentions (the image segments) run on cuDNN's fused SDPA where ggml_cuda
 // has cuDNN, again as H3's: several times the rate of ggml-cuda's flash-attention kernel

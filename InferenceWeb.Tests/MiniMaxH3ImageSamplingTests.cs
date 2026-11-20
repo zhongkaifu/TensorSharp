@@ -12,6 +12,8 @@
 using System;
 using System.Linq;
 using TensorSharp.Models.MiniMaxH3;
+using TensorSharp.Models.MiniMaxH3Image;
+using TensorSharp.Models.SharedDiffusion;
 using Xunit;
 
 namespace InferenceWeb.Tests
@@ -111,7 +113,7 @@ namespace InferenceWeb.Tests
         [InlineData(4096, 21)]
         public void SplitTiles_CoversTheCanvasLikeComfy(int length, int tiles)
         {
-            var (start, len, overlap) = MiniMaxH3ImageVae.SplitTiles(length);
+            var (start, len, overlap) = MiniMaxH3ImageVaeCodec.SplitTiles(length);
             Assert.Equal(tiles, start.Length);
             Assert.Equal(length, start[^1] + len[^1]);
             Assert.All(overlap, o => Assert.True(o >= 64 && o % 16 == 0));

@@ -142,6 +142,12 @@ namespace TensorSharp.Graph
         /// a weight's device cache key is made on first use by the executors that key on it).</summary>
         bool MarkDrafterWeight(IGraphWeight weight) => false;
 
+        /// <summary>Make <paramref name="weights"/> resident on the device now, through the backend's bulk uploader, so the first
+        /// program that binds them (as weight leaves of the same host bytes) uploads nothing: a component's load (a diffusion
+        /// denoiser's weights before its first step). Returns how many were copied now; 0 where the executor binds weights as
+        /// its programs reach them (it keeps no device copies, or reads host memory in place).</summary>
+        int Preload(IReadOnlyList<IGraphWeight> weights, string tag) => 0;
+
         /// <summary>Run <paramref name="weight"/>'s product over zero rows once for each count in <paramref name="rows"/>, the
         /// results discarded, so whatever a product of that many rows loads at its first launch (a library's kernels the driver
         /// loads lazily) is loaded before a request's step runs it. False where the executor does nothing.</summary>

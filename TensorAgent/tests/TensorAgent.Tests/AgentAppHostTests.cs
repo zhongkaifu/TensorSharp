@@ -303,6 +303,37 @@ public sealed class AgentAppHostTests : IDisposable
         }
     }
 
+    /// <summary>The pDMD plug-in (under MiniMax-H3-Image's Community License) is refused by the route before any job while
+    /// the base model's terms are not accepted, with those terms to show; accepting them for the base entry (its own license
+    /// route) covers the plug-in. Nothing is downloaded here.</summary>
+    [Fact]
+    public async Task ThePdmdPlugInDownloadsOnlyAfterItsBaseModelsLicenseIsAccepted()
+    {
+        AgentPaths paths = Paths with { DeviceMemoryGB = 48 };
+        _host = new AgentAppHost(paths);
+        _host.Start();
+        _client = new HttpClient { BaseAddress = new Uri(_host.Server.BaseUrl) };
+        _client.DefaultRequestHeaders.Add("Cookie", $"{Core.Hosting.LoopbackServer.TokenCookie}={_host.Server.Token}");
+        CatalogLora pdmd = LoraCatalog.Find("minimax-h3-image-pdmd-2step")!;
+
+        HttpResponseMessage refused = await _client.PostAsync($"/api/agent/loras/{pdmd.Id}/download", null);
+        Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+        JsonElement body = await refused.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.True(body.GetProperty("licenseRequired").GetBoolean());
+        Assert.Equal(pdmd.Id, body.GetProperty("id").GetString());
+        Assert.Equal("minimax-h3-image-q4km", body.GetProperty("model").GetString());
+        Assert.Equal(ModelCatalog.MiniMaxH3ImageTerms.Revision, body.GetProperty("license").GetProperty("revision").GetString());
+        Assert.Contains("pDMD 2-Step", body.GetProperty("error").GetString());
+        Assert.Null(_host.Downloads.StatusOf(AgentAppHost.LoraDownloadKey(pdmd)));
+        Assert.Throws<LoraLicenseAcceptanceRequiredException>(() => _host.StartLoraDownload(pdmd));
+        Assert.Null(_host.Downloads.StatusOf(AgentAppHost.LoraDownloadKey(pdmd)));
+
+        HttpResponseMessage accepted = await _client.PostAsJsonAsync("/api/agent/catalog/minimax-h3-image-q4km/license",
+            new { revision = ModelCatalog.MiniMaxH3ImageTerms.Revision, accept = true });
+        Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        Assert.False(_host.Loras.NeedsLicenseAcceptance(pdmd));
+    }
+
     [Fact]
     public async Task TheLoraSheetListsThePlugInsAndSavesOnlyAChoiceThatCanBeHonoured()
     {

@@ -54,8 +54,8 @@ public sealed class LoraCatalogTests : IDisposable
             Assert.True(ids.Add(lora.Id), $"duplicate id {lora.Id}");
             Assert.Matches("^[a-z0-9.-]+$", lora.Id);
             CatalogModel? model = ModelCatalog.Find(lora.BaseModelId);
-            Assert.True(model is { Family: CatalogFamily.QwenImage or CatalogFamily.MiniMaxH3 },
-                $"{lora.Id}: the base model must be a Qwen-Image or MiniMax-H3 entry");
+            Assert.True(model is { Family: CatalogFamily.QwenImage or CatalogFamily.MiniMaxH3 or CatalogFamily.MiniMaxH3Image },
+                $"{lora.Id}: the base model must be a Qwen-Image, MiniMax-H3 or MiniMax-H3-Image entry");
             Assert.NotEmpty(lora.DisplayName);
             Assert.NotEmpty(lora.Purpose);
             Assert.NotEmpty(lora.License);
@@ -98,20 +98,43 @@ public sealed class LoraCatalogTests : IDisposable
     /// the CLI and server read <c>config/lora/</c>, and a plug-in that answered differently in
     /// the app would be a second, unvalidated recipe. Both directions are checked.
     /// </summary>
+    /// <summary>
+    /// The engine's plug-in configs the app deliberately does not offer, and why. Every other config in
+    /// <c>config/lora/</c> is a catalog entry; a new config has to be added to one list or the other.
+    /// MiniMax-H3-Image follows decision D7 (2026-11-19): the app offers the linoyts pDMD 2-step speed plug-in only.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string> ConfigsTheAppDoesNotOffer = new Dictionary<string, string>
+    {
+        ["minimax-h3-image-pdmd-2step-comfy"] =
+            "akhaliq's ComfyUI-format conversion of a different pDMD training: on the official stack its pictures carry a fine " +
+            "mesh pattern, and the app's speed plug-in is linoyts' (minimax-h3-image-pdmd-2step); kept for ComfyUI parity on the CLI and server",
+        ["minimax-h3-image-seedreamstyle"] =
+            "a style adapter the CLI and server validated (row parity, a perf arm) but D7 leaves out of the app, which offers pDMD only",
+    };
+
     [Fact]
-    public void EachPlugInIsTheEnginesOwnConfigAndEveryConfigIsOffered()
+    public void EachPlugInIsTheEnginesOwnConfigAndEveryConfigIsOfferedOrListedAsNot()
     {
         string[] configs = Directory.GetFiles(Path.Combine(RepoRoot(), "config", "lora"), "*.json")
             .Select(Path.GetFileNameWithoutExtension).OrderBy(id => id, StringComparer.Ordinal).ToArray()!;
-        Assert.Equal(configs, LoraCatalog.BuiltIn.Select(l => l.Id).OrderBy(id => id, StringComparer.Ordinal));
+        Assert.All(ConfigsTheAppDoesNotOffer, p =>
+        {
+            Assert.Contains(p.Key, configs);
+            Assert.Null(LoraCatalog.Find(p.Key));
+            Assert.False(string.IsNullOrWhiteSpace(p.Value));
+        });
+        Assert.Equal(configs.Except(ConfigsTheAppDoesNotOffer.Keys), LoraCatalog.BuiltIn.Select(l => l.Id).OrderBy(id => id, StringComparer.Ordinal));
 
         foreach (CatalogLora lora in LoraCatalog.BuiltIn)
         {
             using JsonDocument document = JsonDocument.Parse(File.ReadAllText(EngineConfigPath(lora.Id)), Jsonc);
             JsonElement root = document.RootElement;
-            Assert.Equal(ModelCatalog.Find(lora.BaseModelId)!.Family == CatalogFamily.MiniMaxH3
-                    ? LoraCliFlags.MiniMaxH3PluginType
-                    : LoraCliFlags.QwenImagePluginType,
+            Assert.Equal(ModelCatalog.Find(lora.BaseModelId)!.Family switch
+                {
+                    CatalogFamily.MiniMaxH3 => LoraCliFlags.MiniMaxH3PluginType,
+                    CatalogFamily.MiniMaxH3Image => LoraCliFlags.MiniMaxH3ImagePluginType,
+                    _ => LoraCliFlags.QwenImagePluginType,
+                },
                 root.GetProperty("type").GetString());
 
             JsonElement weights = root.GetProperty("weights");
@@ -129,6 +152,9 @@ public sealed class LoraCatalogTests : IDisposable
             {
                 Assert.Equal(lora.Id + ".json", lora.RecipeConfig);
                 Assert.Equal(sampling.GetProperty("steps").GetInt32(), lora.Steps);
+                // A floor of its own is the config's, the same number.
+                Assert.Equal(sampling.TryGetProperty("min_generation_area", out JsonElement floor) ? floor.GetInt64() : null,
+                    lora.MinGenerationArea);
                 // What the engine is handed is the repository's file itself, byte for byte.
                 Assert.Equal(File.ReadAllText(EngineConfigPath(lora.Id)), LoraCatalog.RecipeText(lora));
             }
@@ -144,10 +170,13 @@ public sealed class LoraCatalogTests : IDisposable
     [Fact]
     public void ThePlugInsAreOfferedOnlyWhereTheirModelIs()
     {
-        Assert.All(LoraCatalog.BuiltIn, l => Assert.Contains(l.BaseModelId, new[] { LoraCatalog.QwenImage, LoraCatalog.MiniMaxH3Keyframes }));
+        Assert.All(LoraCatalog.BuiltIn, l => Assert.Contains(l.BaseModelId,
+            new[] { LoraCatalog.QwenImage, LoraCatalog.MiniMaxH3Keyframes, LoraCatalog.MiniMaxH3Image }));
         Assert.Equal(14, LoraCatalog.For(LoraCatalog.QwenImage).Count);
         Assert.Equal(new[] { H3Turbo8, H3Turbo4 }, LoraCatalog.For(LoraCatalog.MiniMaxH3Keyframes).Select(l => l.Id));
-        Assert.Equal(LoraCatalog.BuiltIn.Count, LoraCatalog.For(LoraCatalog.QwenImage).Count + LoraCatalog.For(LoraCatalog.MiniMaxH3Keyframes).Count);
+        Assert.Equal(new[] { Pdmd }, LoraCatalog.For(LoraCatalog.MiniMaxH3Image).Select(l => l.Id));
+        Assert.Equal(LoraCatalog.BuiltIn.Count, LoraCatalog.For(LoraCatalog.QwenImage).Count
+            + LoraCatalog.For(LoraCatalog.MiniMaxH3Keyframes).Count + LoraCatalog.For(LoraCatalog.MiniMaxH3Image).Count);
         Assert.Empty(LoraCatalog.For("gemma-4-e2b-q8"));
         // No phone or tablet reaches the image or video models' tiers, so none is offered a plug-in.
         Assert.DoesNotContain(ModelCatalog.ForDevice(16), m => m.Id == LoraCatalog.QwenImage);
@@ -169,8 +198,9 @@ public sealed class LoraCatalogTests : IDisposable
         Assert.Equal(turbos, LoraCatalog.QwenImageTurbo);
         foreach (CatalogLora lora in LoraCatalog.BuiltIn)
         {
+            // Another quantization of the same MiniMax-H3-Image checkpoint is the one other entry a plug-in names.
             foreach (string id in lora.AlsoFor)
-                Assert.Contains(id, turbos);
+                Assert.Contains(id, lora.BaseModelId == LoraCatalog.MiniMaxH3Image ? new[] { LoraCatalog.MiniMaxH3ImageQ8 } : turbos);
             if (lora.Kind == LoraKind.Speed || lora.NeedsModelSteps)
                 Assert.All(turbos, id => Assert.False(lora.AppliesTo(id), $"{lora.Id} must not apply to {id}"));
         }
@@ -269,6 +299,57 @@ public sealed class LoraCatalogTests : IDisposable
     // ---- MiniMax-H3 Turbo ----------------------------------------------------------------
 
     private const string H3Turbo8 = "minimax-h3-fl2v-turbo-8step";
+    private const string Pdmd = "minimax-h3-image-pdmd-2step";
+
+    /// <summary>
+    /// MiniMax-H3-Image's one plug-in in the app (decision D7): linoyts' pDMD 2-step, pinned to the file the engine's
+    /// config names, offered on both MiniMax-H3-Image entries and nowhere else, carrying the config's floor so a picture
+    /// made with it asks for the 1 MP it was distilled at rather than the model's 2048 x 2048.
+    /// </summary>
+    [Fact]
+    public void ThePdmdPlugInIsPinnedOfferedOnBothMiniMaxH3ImageEntriesAndLowersTheTurnArea()
+    {
+        CatalogLora lora = LoraCatalog.Find(Pdmd)!;
+        Assert.Equal(LoraCatalog.MiniMaxH3Image, lora.BaseModelId);
+        Assert.Equal(new[] { LoraCatalog.MiniMaxH3ImageQ8 }, lora.AlsoFor);
+        Assert.Equal(LoraKind.Speed, lora.Kind);
+        Assert.Equal(2, lora.Steps);
+        Assert.False(lora.StrengthAdjustable);
+        Assert.Equal("MiniMax-H3-Image Community License", lora.License);
+        LoraFile weights = Assert.Single(lora.Files);
+        Assert.Equal("pytorch_lora_weights.safetensors", weights.FileName);
+        Assert.Equal(1_383_680_256, weights.Bytes);
+        Assert.Equal("c0a88d9c1de401e50894424a6b9a73e46b4f0d977e181e48642fdcfe98ede435", weights.Sha256);
+        Assert.Equal("https://huggingface.co/linoyts/MiniMax-H3-Image-pDMD-2steps/resolve/c07d96e5635311ed007d44654c2f98cc8d6e0a1e/pytorch_lora_weights.safetensors",
+            weights.Url);
+
+        var config = TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageLoraConfig.Load(EngineConfigPath(Pdmd));
+        Assert.Equal(weights.FileName, config.WeightsFileName);
+        Assert.Equal(2, config.Contract.Steps);
+        Assert.Equal(config.Contract.MinGenerationArea, lora.MinGenerationArea);
+
+        foreach (CatalogModel model in ModelCatalog.BuiltIn)
+        {
+            bool h3Image = model.Family == CatalogFamily.MiniMaxH3Image;
+            Assert.Equal(h3Image, lora.AppliesTo(model.Id));
+            // The sheet lists a loaded image or video model's own plug-ins; with a chat model it lists every offered one.
+            if (model.IsImageGenerator || model.IsVideoGenerator)
+                Assert.Equal(h3Image, LoraCatalog.Offered(model, ModelCatalog.BuiltIn).Any(l => l.Id == Pdmd));
+        }
+
+        LoraStore store = StoreWith(Pdmd);
+        foreach (string id in new[] { LoraCatalog.MiniMaxH3Image, LoraCatalog.MiniMaxH3ImageQ8 })
+        {
+            LoraPlan plan = LoraSelection.Plan(new[] { new ImageLoraChoice(Pdmd, 1f) }, id, store, editing: false, out string? error)!;
+            Assert.Null(error);
+            Assert.Equal(new[] { "pDMD 2-Step" }, plan.Names);
+            Assert.Equal(1024, plan.MinGenerationArea);
+            Assert.Equal(TensorAgent.Core.Hosting.ImageTurns.DefaultTargetArea, TensorAgent.Core.Hosting.ImageTurns.TurnArea(plan.MinGenerationArea!.Value));
+        }
+        // Without it the turn keeps the model's floor; other plug-ins declare none.
+        Assert.Null(LoraSelection.Plan(Array.Empty<ImageLoraChoice>(), LoraCatalog.MiniMaxH3Image, store, editing: false, out _)!.MinGenerationArea);
+        Assert.All(LoraCatalog.BuiltIn.Where(l => l.Id != Pdmd), l => Assert.Null(l.MinGenerationArea));
+    }
     private const string H3Turbo4 = "minimax-h3-fl2v-turbo-4step";
     private const string RetiredH3ReferencesEntry = "minimax-h3-ref2va-q4k";
 

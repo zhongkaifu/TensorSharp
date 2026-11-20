@@ -11,6 +11,7 @@ using System.Runtime.InteropServices;
 using TensorSharp.GGML;
 
 using TensorSharp.Graph;
+using TensorSharp.Models.Graph;
 
 namespace TensorSharp.Models
 {
@@ -2869,18 +2870,15 @@ namespace TensorSharp.Models
         /// carries a signature over everything that shapes the graph - ops, parameters, extents and
         /// the bound host pointers - and is built natively only when no cached graph has that
         /// signature. Per-run inputs (activations, positions, masks, write indices) are not part
-        /// of the signature; their values ride the run.
+        /// of the signature; their values ride the run. The family-neutral emission (ops, views,
+        /// regions, plain inputs, runs) is the shared <see cref="GraphEmitter"/>'s; a step adds the
+        /// model's weights, slots, caches, positions and masks, and advancing a decode step.
         /// </summary>
-        protected sealed class GraphStep : IDisposable
+        protected sealed class GraphStep : GraphEmitter
         {
             private readonly StandardDecoderModel _m;
-            private readonly GraphProgramBuilder _b;
             private readonly Dictionary<string, int> _weights = new(StringComparer.Ordinal);
             private readonly Dictionary<Tensor, int> _states = new(ReferenceEqualityComparer.Instance);
-            private readonly List<GCHandle> _pins = new();
-            private readonly List<int> _inputs = new();
-            private readonly List<IntPtr> _inputData = new();
-            private readonly List<long> _inputBytes = new();
             // Causal masks by what fills them: every attention layer reads its sequence's. A step of several sequences had kept
             // one mask, which each sequence's evicted, so every layer emitted every sequence's again (a 2048-row chunk's 67M
             // values at 32K keys built 16 times in a step that carried other requests' decode rows).
@@ -2889,17 +2887,16 @@ namespace TensorSharp.Models
             // A chunk's write rows by (start, count): a step writes every sequence's chunk by index on executors that take
             // indexed cache writes at any width, and start * 64 + count had named (0, 2048) and (31, 64) alike.
             private readonly Dictionary<(int Start, int Count, int Sequence, int Ring), int> _writeIndex = new();
-            private readonly HashSet<int> _strided = new();   // nodes whose layout is not contiguous
 
             private readonly bool _record;
 
             internal GraphStep(StandardDecoderModel model, int rows, Slot[] slots, int[] first, int[] counts, int[] starts,
                 bool decode, bool snapshots, bool record)
+                : base(record)
             {
                 RecurrentSnapshots = snapshots;
                 _m = model;
                 _record = record;
-                _b = new GraphProgramBuilder(record);
                 Rows = rows;
                 Slots = slots;
                 First = first;
@@ -2949,50 +2946,19 @@ namespace TensorSharp.Models
             /// <summary>The positions' values (row order).</summary>
             public int[] PositionValues { get; private set; }
             internal bool Rejected { get; private set; }
-            internal (ulong, ulong) Signature => _b.Signature;
 
-            /// <summary>The signature without the state leaves' identities (<see cref="StateLeaves"/>).</summary>
-            internal (ulong, ulong) StructuralSignature => _b.StructuralSignature;
-
-            /// <summary>The state leaves the step binds, in the order its plan binds them.</summary>
+            /// <summary>The state leaves the step binds, in the order its plan binds them (<see cref="GraphEmitter.StructuralSignature"/>
+            /// leaves their identities out).</summary>
             internal IReadOnlyList<Tensor> StateLeaves => _stateOrder;
             private readonly List<Tensor> _stateOrder = new();
 
             // ---- tracing
 
-            private void Mix(long value) => _b.Mix(value);
+            /// <summary>The model's executor, read where a leaf's binding depends on it (a layer split's stage sets it).</summary>
+            protected override IGraphExecutor Executor => _m.GraphExecutor;
 
             private int Leaf(GraphLeafRole role, int type, ReadOnlySpan<long> ne, IntPtr data, long bytes, LeafSplit split = null, object handle = null)
                 => _b.Leaf(role, type, ne, data, bytes, split == null ? null : new GraphSplit(split.Axis, split.Ne, split.Nr), handle);
-
-            public int Op(GraphOp op, int a) => Op(op, stackalloc[] { a });
-            public int Op(GraphOp op, int a, int b) => Op(op, stackalloc[] { a, b });
-            public int Op(GraphOp op, int a, int b, int c) => Op(op, stackalloc[] { a, b, c });
-
-            public int Op(GraphOp op, ReadOnlySpan<int> srcs, ReadOnlySpan<long> ip = default, ReadOnlySpan<float> fp = default)
-                => _b.Op(op, srcs, ip, fp);
-
-            /// <summary>Run <paramref name="node"/> for its side effect (a cache or state write).</summary>
-            public void Effect(int node) => _b.Effect(node);
-
-            /// <summary>A layer's output: a point where a lazily building executor may start running.</summary>
-            public void Boundary(int node) => _b.Boundary(node);
-
-            /// <summary>The ops up to <see cref="EndFused"/> are a region of <paramref name="kind"/> (see
-            /// <see cref="GraphFusion"/>): an executor with its kernel computes the results in one dispatch.</summary>
-            public void BeginFused(GraphFusion kind, ReadOnlySpan<int> inputs, ReadOnlySpan<long> ip = default, ReadOnlySpan<float> fp = default)
-                => _b.BeginFused(kind, inputs, ip, fp);
-
-            public void EndFused(ReadOnlySpan<int> results) => _b.EndFused(results);
-
-            /// <summary>Write <paramref name="node"/>'s result in place inside the state leaf
-            /// <paramref name="baseLeaf"/> at <paramref name="offset"/> bytes; where the base is not
-            /// resident, the <paramref name="fallback"/> copy runs instead (see GgmlGraph.Alias).</summary>
-            public void Alias(int node, int baseLeaf, long offset, int fallback) => _b.Alias(node, baseLeaf, offset, fallback);
-
-            /// <summary>A step result: <paramref name="floats"/> F32 values of <paramref name="node"/>;
-            /// returns its index among the step's results.</summary>
-            internal int Output(int node, long floats) => _b.Output(node, floats);
 
             /// <summary>Output <paramref name="output"/> holds layer <paramref name="layer"/>'s top-K expert ids (I32).</summary>
             internal void RecordRoutes(int output, int layer) => (_routes ??= new()).Add((output, layer));
@@ -3065,7 +3031,7 @@ namespace TensorSharp.Models
             }
 
             /// <summary>An F32 tensor the family prepared (device constants, norms) as a read-only leaf.</summary>
-            public int TensorWeight(Tensor t, params long[] ne)
+            public override int TensorWeight(Tensor t, params long[] ne)
             {
                 // An executor that binds tensors by object reads them on the rank's device; GGML binds host bytes and keeps
                 // each rank's device copy itself, so any rank may read any tensor.
@@ -3100,36 +3066,16 @@ namespace TensorSharp.Models
             private int TensorLeaf(GraphLeafRole role, Tensor t, int type, ReadOnlySpan<long> ne, LeafSplit split = null)
                 => Leaf(role, type, ne, LeafIdentity(t), t.Storage.ByteLength, split, t);
 
-            /// <summary>A tensor leaf's bytes for an executor that binds host memory, else a stable identity
-            /// (a device storage's host pointer would sync it every step).</summary>
-            private IntPtr LeafIdentity(Tensor t) => _m.GraphExecutor.Capabilities.BindsHostPointers
-                ? TensorComputePrimitives.GetStoragePointer(t)
-                : GraphIdentity.Of(t.Storage, t.StorageOffset);
-
-            private static long[] Extents(Tensor t)
-            {
-                var ne = new long[t.DimensionCount];
-                for (int i = 0; i < ne.Length; i++) ne[i] = t.Sizes[t.DimensionCount - 1 - i];
-                return ne;
-            }
-
             // ---- per-run inputs
 
-            /// <summary>An F32 activation [cols, rows] read from a host tensor every run.</summary>
-            internal int Input(Tensor t, long cols, long rows) => Input(t, cols, rows, InputKind.Opaque);
-
             /// <summary>The step's embedded (or a stage's incoming) rows: the one tensor input an advanced step swaps.</summary>
-            internal int HiddenInput(Tensor t, long cols, long rows) => Input(t, cols, rows, InputKind.Hidden);
-
-            private int Input(Tensor t, long cols, long rows, InputKind kind)
+            internal int HiddenInput(Tensor t, long cols, long rows)
             {
                 int node = Leaf(GraphLeafRole.Input, GraphFormat.F32, stackalloc long[] { cols, rows }, IntPtr.Zero, 0);
                 IntPtr data = _m.GraphExecutor.Capabilities.BindsHostPointers ? TensorComputePrimitives.GetStoragePointer(t) : IntPtr.Zero;
-                AddInput(node, data, cols * rows * sizeof(float), t, kind);
+                AddInput(node, data, cols * rows * sizeof(float), t, InputKind.Hidden);
                 return node;
             }
-
-            public int InputI32(int[] values, long count) => InputI32(values, count, InputKind.Opaque);
 
             /// <summary>I32 values that stay what they are while the rows' positions move (the rows each sequence's
             /// logits come from).</summary>
@@ -3141,8 +3087,6 @@ namespace TensorSharp.Models
                 AddInput(node, Pin(values), count * sizeof(int), kind: kind, values: values);
                 return node;
             }
-
-            public int InputF32(float[] values, params long[] ne) => InputF32(values, InputKind.Opaque, ne);
 
             /// <summary>F32 values that stay what they are while the rows' positions move.</summary>
             internal int ConstantInputF32(float[] values, params long[] ne) => InputF32(values, InputKind.Constant, ne);
@@ -3375,19 +3319,6 @@ namespace TensorSharp.Models
                 return node;
             }
 
-            private IntPtr Pin(Array values)
-            {
-                GCHandle handle = GCHandle.Alloc(values, GCHandleType.Pinned);
-                _pins.Add(handle);
-                return handle.AddrOfPinnedObject();
-            }
-
-            /// <summary>The program <see cref="Build"/> recorded.</summary>
-            internal GraphProgram Program { get; private set; }
-
-            /// <summary>A streaming executor's sink: entries and input values go there as they are emitted.</summary>
-            internal IGraphSink Sink { get => _b.Sink; init => _b.Sink = value; }
-
             /// <summary>A causal mask (<see cref="CausalMaskInput"/>'s values) for rows continuing at <paramref name="from"/>, moved on to
             /// <paramref name="to"/>: the cells each row opens since cleared, the rest as they are (the same values a fill at
             /// <paramref name="to"/> writes). A decode window as wide as its slot had been filled whole at every step.</summary>
@@ -3453,15 +3384,14 @@ namespace TensorSharp.Models
             private void AddInput(int node, IntPtr data, long bytes, object handle = null, InputKind kind = InputKind.Opaque,
                 Array values = null, int window = 0, int start = 0, int count = 0, int sequence = -1, int offset = 0, int band = 0, int ring = 0)
             {
-                _b.Sink?.InputData(node, data, bytes, handle);
-                _inputs.Add(node);
-                _inputData.Add(data);
-                _inputBytes.Add(bytes);
-                _inputHandles.Add(handle);
+                AppendInput(node, data, bytes, handle);
                 _inputMeta.Add(new InputMeta(kind, values, window, start, count, Sequence: sequence, Offset: offset, Band: band, Ring: ring));
             }
 
-            private readonly List<object> _inputHandles = new();
+            /// <summary>The emitter's plain inputs (<see cref="GraphEmitter.InputF32"/>, <see cref="GraphEmitter.InputI32"/>,
+            /// ...) are opaque to an advance: the family rewrites them or the step is not advanced.</summary>
+            protected override void RecordInput(int node, IntPtr data, long bytes, object handle, Array values)
+                => AddInput(node, data, bytes, handle, InputKind.Opaque, values);
 
             // ---- advancing a decode step
 
@@ -3648,16 +3578,8 @@ namespace TensorSharp.Models
 
             // ---- composites
 
-            /// <summary>rms_norm(x) * weight.</summary>
+            /// <summary>rms_norm(x) * weight, at the model's epsilon.</summary>
             public int RmsNorm(int x, string weight) => RmsNorm(x, Weight(weight), _m.Config.Eps);
-
-            public int RmsNorm(int x, int weight, float eps)
-                => Op(GraphOp.Mul, Op(GraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps }), weight);
-
-            /// <summary>rms_norm(x, eps / n) / sqrt(n) over ne0: the L2 normalization ggml's GDN path uses.</summary>
-            public int L2Norm(int x, long n, float eps)
-                => Op(GraphOp.Scale, stackalloc[] { Op(GraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps / n }) },
-                    default, stackalloc[] { 1.0f / MathF.Sqrt(n) });
 
             /// <summary>weight · x, with a quantized weight's per-tensor scale applied.</summary>
             public int MatMul(string weight, int x)
@@ -3698,16 +3620,6 @@ namespace TensorSharp.Models
                 return y;
             }
 
-            public int Reshape(int x, params long[] ne) => Op(GraphOp.Reshape, stackalloc[] { x }, ne);
-
-            /// <summary>An F16 input [ne...] read from <paramref name="values"/> every run (a family's mask).</summary>
-            internal int InputF16(ushort[] values, params long[] ne)
-            {
-                int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, ne, IntPtr.Zero, 0);
-                AddInput(node, Pin(values), values.LongLength * sizeof(ushort), values: values);
-                return node;
-            }
-
             /// <summary>Rotary over x [d, heads, n] at <paramref name="positions"/> (I32 [n]) rather than the step's rows'
             /// positions (keys pooled at their blocks' first cells).</summary>
             internal int RopeAt(int x, RotarySpec spec, int positions)
@@ -3719,52 +3631,6 @@ namespace TensorSharp.Models
             internal int SequencePositions(int s)
                 => Sequences == 1 ? Positions
                     : Op(GraphOp.View, stackalloc[] { Positions }, stackalloc long[] { 1, Counts[s], 1, 1, 1, Counts[s] * 4L, 0, 0, First[s] * 4L });
-
-            /// <summary>A view of an F32 node; recorded as strided unless its rows are packed.</summary>
-            public int View2(int x, long ne0, long ne1, long nb1, long offset)
-            {
-                int node = Op(GraphOp.View, stackalloc[] { x }, stackalloc long[] { 2, ne0, ne1, 1, 1, nb1, 0, 0, offset });
-                if (ne1 > 1 && nb1 != ne0 * 4) _strided.Add(node);
-                return node;
-            }
-
-            public int View4(int x, long ne0, long ne1, long ne2, long ne3, long nb1, long nb2, long nb3, long offset)
-            {
-                int node = Op(GraphOp.View, stackalloc[] { x }, stackalloc long[] { 4, ne0, ne1, ne2, ne3, nb1, nb2, nb3, offset });
-                if ((ne1 > 1 && nb1 != ne0 * 4) || (ne2 > 1 && nb2 != ne0 * ne1 * 4) || (ne3 > 1 && nb3 != ne0 * ne1 * ne2 * 4))
-                    _strided.Add(node);
-                return node;
-            }
-
-            /// <summary>The backend's norms, unary ops and recurrent kernels read row-contiguous strided
-            /// views (ggml-metal, ggml-cuda); elsewhere a strided input is copied contiguous first.</summary>
-            public bool StridedInputs => _m.GraphExecutor.Capabilities.StridedViews;
-
-            public int View3(int x, long ne0, long ne1, long ne2, long nb1, long nb2, long offset)
-            {
-                int node = Op(GraphOp.View, stackalloc[] { x }, stackalloc long[] { 3, ne0, ne1, ne2, 1, nb1, nb2, 0, offset });
-                if ((ne1 > 1 && nb1 != ne0 * 4) || (ne2 > 1 && nb2 != ne0 * ne1 * 4)) _strided.Add(node);
-                return node;
-            }
-
-            /// <summary>Permute axes (strided).</summary>
-            public int Permute(int x, long a0, long a1, long a2, long a3)
-            {
-                int node = Op(GraphOp.Permute, stackalloc[] { x }, stackalloc long[] { a0, a1, a2, a3 });
-                _strided.Add(node);
-                return node;
-            }
-
-            public int Transpose(int x)
-            {
-                int node = Op(GraphOp.Transpose, x);
-                _strided.Add(node);
-                return node;
-            }
-
-            /// <summary>A contiguous copy of <paramref name="x"/>, or <paramref name="x"/> itself when it
-            /// already is contiguous (every op result is; views, permutes and transposes may not be).</summary>
-            public int Cont(int x) => _strided.Contains(x) ? Op(GraphOp.Cont, x) : x;
 
             /// <summary>Rotary at the step's positions; with a position table the family's multi-axis
             /// rotary (ggml's interleaved M-RoPE over its sections), which equals the scalar one for text.</summary>
@@ -3780,26 +3646,13 @@ namespace TensorSharp.Models
                     stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
             }
 
-            /// <summary>Flash attention of q [d, rows, heads] over k/v [d, kv, kv_heads]: [dv, heads, rows].</summary>
-            /// <summary>Flash attention; <paramref name="kvMax"/> &gt; 0 bounds the finite entries of every mask row, which
-            /// lets a backend attend only those (ggml_flash_attn_ext_set_n_kv_max). <paramref name="promptChunk"/>: the rows are one
-            /// sequence's prompt chunk (<see cref="GraphAttentionRows.PromptChunk"/>), set only by <see cref="EmitAttention"/> under
-            /// <see cref="PromptChunks"/>.</summary>
-            /// <param name="band">A sliding-window layer's window (ip[3]; ip[2] is then the rows' kind, see
-            /// <see cref="GraphAttentionRows"/>) where the executor reads such masks on the device
-            /// (<see cref="GraphCapabilities.BandMasksOnDevice"/>; <see cref="DeviceBandMasks"/>), 0 elsewhere.</param>
-            public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0, bool promptChunk = false, int band = 0)
+            /// <summary>Every attention op a traced step emits adds its ip to <see cref="AttentionIpForTests"/> when set
+            /// (<see cref="GraphEmitter.FlashAttention"/>; the decoder marks prompt chunks under <see cref="PromptChunks"/>); one
+            /// with a device band marks the step's <see cref="DeviceBandMasks"/>.</summary>
+            protected override void ObserveAttention(ReadOnlySpan<long> ip, int band)
             {
-                Span<int> srcs = stackalloc[] { q, k, v, mask };
-                // ip[2] only on a prompt chunk's op or a device band's (GraphAttentionRows), ip[3] only on a device band's: every
-                // other op keeps the ip, bytes and signature it had.
-                long rows = promptChunk ? GraphAttentionRows.PromptChunk : GraphAttentionRows.Unsaid;
-                ReadOnlySpan<long> ip = band > 0 ? stackalloc long[] { 10 /* F32 accumulation */, Math.Max(kvMax, 0), rows, band }
-                    : promptChunk ? stackalloc long[] { 10, Math.Max(kvMax, 0), rows }
-                    : kvMax > 0 ? stackalloc long[] { 10, kvMax } : stackalloc long[] { 10 };
                 if (band > 0) DeviceBandMasks = true;
                 _m.AttentionIpForTests?.Add(ip.ToArray());
-                return Op(GraphOp.FlashAttnExt, mask >= 0 ? srcs : srcs[..3], ip, stackalloc[] { scale, 0f, 0f });
             }
 
             /// <summary>The step's sliding-window attentions read their masks on the device (their band passed to the executor,
@@ -3840,14 +3693,11 @@ namespace TensorSharp.Models
                 return new CachedGraph { Plan = executor.CompileForRank(program, device) };
             }
 
-            /// <summary>This step's per-run inputs, for a run of several ranks' plans together.</summary>
-            internal GraphRunInputs RunInputs() => new(_inputs.ToArray(), _inputData.ToArray(), _inputBytes.ToArray());
-
-            internal bool Run(IGraphPlan plan)
+            /// <summary>Run <paramref name="plan"/> on this step's inputs, counted in the <see cref="StepCensus"/>.</summary>
+            public override bool Run(IGraphPlan plan)
             {
                 long started = System.Diagnostics.Stopwatch.GetTimestamp();
-                bool ran = plan.Run(CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData),
-                    CollectionsMarshal.AsSpan(_inputBytes), CollectionsMarshal.AsSpan(_inputHandles));
+                bool ran = base.Run(plan);
                 CountRun(plan, System.Diagnostics.Stopwatch.GetTimestamp() - started);
                 return ran;
             }
@@ -3971,12 +3821,6 @@ namespace TensorSharp.Models
                 if (_unstable == null) return;
                 for (int j = 0; j < _unstable.Length; j++) _inputHandles[j] = _unstable[j];
                 _unstable = null;
-            }
-
-            public void Dispose()
-            {
-                foreach (GCHandle pin in _pins) pin.Free();
-                _pins.Clear();
             }
         }
     }

@@ -90,5 +90,13 @@
   "models.alert.delete.message": "이 기기에서 {model}을(를) 삭제할까요? 다시 다운로드할 수 있습니다.",
   "models.alert.delete.messageLocal": "이 기기에서 {model}을(를) 삭제할까요? 복원하려면 원래의 로컬 GGUF를 다시 선택해야 합니다.",
   "models.alert.delete.confirm": "삭제",
-  "models.action.unavailable": "사용 불가"
+  "models.action.unavailable": "사용 불가",
+  "models.license.title": "라이선스 조건",
+  "models.license.intro": "{model}은(는) {license}에 따라 제공됩니다. 아래 조건을 읽어 보세요. 동의해야만 다운로드가 시작됩니다.",
+  "models.license.changed": "마지막으로 동의한 이후 조건이 변경되었습니다.",
+  "models.license.summary": "요약",
+  "models.license.fullText": "라이선스 전문(영어, 게시된 그대로)",
+  "models.license.open": "Hugging Face에서 라이선스 열기",
+  "models.license.accept": "동의하고 다운로드",
+  "models.license.decline": "거절"
 }

@@ -779,6 +779,12 @@ public struct H3TextEncodeArgs
     public int Causal;
     public float Eps;
     public int NumDeepstack;
+    /// <summary>1: the causal attention through ggml_flash_attn_ext (F16 K/V, an F16 causal mask) instead of the
+    /// materialized [seq, seq, heads] scores. ggml-cuda's kernel sums V in half precision, so long sequences drift.</summary>
+    public int FlashAttention;
+    /// <summary>&gt; 0: the materialized attention this many query rows at a time, each block against the keys it sees (the
+    /// same F32 scores in [keys, rows, heads] pieces; MiniMax-H3-Image's edits, whose pictures make long sequences).</summary>
+    public int QueryChunk;
 }
 
 /// <summary>One run of conditioning tokens and the projection it goes through:
@@ -3198,21 +3204,6 @@ internal enum GgmlIndexReductionOp
             int r = TSGgml_MiniMaxH3VideoVaeDecode(in desc);
             if (r == 0)
                 Console.Error.WriteLine($"[h3-video-vae FAIL] {GetLastErrorMessage("(no native error)")}");
-            return r != 0;
-        }
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_MiniMaxH3VitDecodeBatch(in H3VideoVaeDecodeArgs desc, int batch);
-
-        /// <summary>The H3 ViT decode over <paramref name="batch"/> independent sequences of
-        /// <c>desc.Tokens</c> tokens each, held one after another in the latent and output
-        /// buffers (the rope tables are one sequence's): MiniMax-H3-Image's VAE tiles.</summary>
-        public static bool TryMiniMaxH3VitDecodeBatch(in H3VideoVaeDecodeArgs desc, int batch)
-        {
-            int r = TSGgml_MiniMaxH3VitDecodeBatch(in desc, batch);
-            if (r == 0)
-                Console.Error.WriteLine($"[h3-image-vae FAIL] {GetLastErrorMessage("(no native error)")}");
             return r != 0;
         }
 

@@ -75,5 +75,9 @@
   "host.engine.unknown": "unknown",
   "host.video.keyframesUnavailable": "This video model does not accept image keyframes at arbitrary frame positions.",
   "host.video.ingredientsUnavailable": "Ingredients identity references require an IC-LoRA checkpoint; choose image keyframes with LTX 2.5 Distilled.",
-  "host.video.invalidFrames": "LTX clip length must be positive and follow the 8n+1 frame grid."
+  "host.video.invalidFrames": "LTX clip length must be positive and follow the 8n+1 frame grid.",
+  "host.license.required": "{model} downloads only after you accept its license terms ({license}).",
+  "host.license.loraRequired": "{lora} is a derivative of {model} under the same license ({license}): it downloads after you accept that license for {model} (on the Models page).",
+  "host.license.changed": "The license terms of {model} have changed. Read them again and accept the current version.",
+  "host.license.notRequired": "{model} has no license terms to accept."
 }

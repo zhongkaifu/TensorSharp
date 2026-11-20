@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Threading;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.QwenImage
@@ -274,7 +275,7 @@ namespace TensorSharp.Models.QwenImage
             /// canvas or crop in place of the first.</summary>
             internal RgbImage[] Inputs { get; }
 
-            internal QwenImageEditMask Mask { get; }
+            internal EditMask Mask { get; }
 
             internal ((int Width, int Height) Sampling, (int Width, int Height) Output) Geometry { get; }
 
@@ -441,11 +442,11 @@ namespace TensorSharp.Models.QwenImage
         /// Where a request samples and the size it returns. Unmasked, the output is the sampled
         /// image itself, or with <see cref="QwenImageParams.KeepSourceSize"/> the first reference's
         /// exact size (<see cref="KeptSourceSampling"/>). Masked, the output is the source canvas,
-        /// which <see cref="QwenImageEditMask.Composite"/> restores whatever the sampling size
+        /// which <see cref="EditMask.Composite"/> restores whatever the sampling size
         /// (the crop's share of the canvas's), so keeping the source size changes nothing there.
         /// </summary>
         internal static ((int Width, int Height) Sampling, (int Width, int Height) Output) ResolveGeometry(
-            QwenImageParams p, RgbImage reference, QwenImageEditMask mask, BackendType? backend = null)
+            QwenImageParams p, RgbImage reference, EditMask mask, BackendType? backend = null)
         {
             var kept = KeptSourceSize(p, reference);
             if (mask != null)
@@ -508,7 +509,7 @@ namespace TensorSharp.Models.QwenImage
         /// instance, when the sampling size already is the output size, so nothing changes for a
         /// request that does not keep its source size.
         /// </summary>
-        internal static RgbImage FinishOutput(RgbImage decoded, QwenImageEditMask mask, (int Width, int Height) output)
+        internal static RgbImage FinishOutput(RgbImage decoded, EditMask mask, (int Width, int Height) output)
         {
             if (mask != null) return mask.Composite(decoded);
             return decoded.Width == output.Width && decoded.Height == output.Height

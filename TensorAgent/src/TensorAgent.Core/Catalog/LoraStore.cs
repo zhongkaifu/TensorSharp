@@ -36,6 +36,31 @@ public sealed class LoraStore
         _downloader = downloader ?? new ResumableDownloader();
     }
 
+    /// <summary>
+    /// The license acceptances a download of a plug-in with <see cref="CatalogLora.LicenseTerms"/> is checked against
+    /// (<see cref="DownloadAsync"/>), with the catalog entries whose acceptance covers it (<see cref="Catalog"/>). Null
+    /// keeps none: such a plug-in then never downloads (fail closed). Plug-ins without terms are unaffected.
+    /// </summary>
+    public LicenseAcceptanceStore? Licenses { get; init; }
+
+    /// <summary>The entries a plug-in's base-model acceptance is looked up among; <see cref="ModelCatalog.BuiltIn"/> by default.</summary>
+    public IReadOnlyList<CatalogModel> Catalog { get; init; } = ModelCatalog.BuiltIn;
+
+    /// <summary>Whether <paramref name="lora"/> declares terms that no acceptance of its base entries covers yet.</summary>
+    public bool NeedsLicenseAcceptance(CatalogLora lora)
+    {
+        ArgumentNullException.ThrowIfNull(lora);
+        return lora.LicenseTerms is not null && !(Licenses?.IsAccepted(lora, Catalog) ?? false);
+    }
+
+    /// <summary>Refuse, before anything is fetched, a plug-in download whose base entry's terms are not accepted.</summary>
+    /// <exception cref="LoraLicenseAcceptanceRequiredException">They are not.</exception>
+    public void EnsureLicenseAccepted(CatalogLora lora)
+    {
+        if (NeedsLicenseAcceptance(lora))
+            throw new LoraLicenseAcceptanceRequiredException(lora, LicenseAcceptanceStore.BaseEntries(lora, Catalog).FirstOrDefault());
+    }
+
     public string DirectoryFor(CatalogLora lora) => Path.Combine(Root, lora.Id);
 
     public string PathFor(CatalogLora lora, LoraFile file) => Path.Combine(DirectoryFor(lora), file.FileName);
@@ -69,10 +94,13 @@ public sealed class LoraStore
     /// <summary>
     /// Download every file that is not complete, one after another, each verified against its
     /// SHA-256 before it is renamed into place. A <c>.part</c> left by an earlier attempt is resumed.
+    /// A plug-in under its base model's license downloads only once that license is accepted
+    /// (<see cref="EnsureLicenseAccepted"/>), before anything is fetched.
     /// </summary>
     public async Task DownloadAsync(CatalogLora lora, IProgress<ModelDownloadProgress>? progress, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(lora);
+        EnsureLicenseAccepted(lora);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {

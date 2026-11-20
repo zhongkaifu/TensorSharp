@@ -29,6 +29,9 @@
 #include "ggml_ops_graph_optimize.h"
 #include "ggml_ops_transformer_common.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_dit_offload.h"
+#include "ggml_h3_attention.h"
+#include "ggml_h3_upload.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -119,6 +122,8 @@ namespace
         OP_LIGHTNING_INDEXER = 55, // srcs: q [d, heads, T], k [d, 1, n_kv], weights [heads, T], mask [n_kv, T] (F16)
         OP_TOP_K_MASK = 56,     // srcs: mask [n_kv, T], top_k [n_top, T], then (ip[0..2] flags) score, blocks, extra
         OP_ALLREDUCE = 57,      // srcs: a tensor-parallel partial; summed in place across the ranks (TSGgml_GraphRunRanked)
+        OP_CONV_2D = 58,        // srcs: kernel [KW, KH, IC, OC] (F32/F16), x [W, H, IC, N]; ip: s0, s1, p0, p1, d0, d1 (ggml_conv_2d)
+        OP_PAD_REFLECT_1D = 59, // srcs: x (F32, contiguous); ip: p0, p1
         OP_DEPTHWISE_CONV_2D = 70, // srcs: x [C, W, H, N] (channels innermost), kernel [KW, KH, 1, C]; ip: s0, s1, p0, p1, d0, d1
         OP_GELU_ERF = 71,       // 0.5 x (1 + erf(x / sqrt 2))
     };
@@ -301,6 +306,20 @@ namespace
         FUSED_HC_READ = 6,            // GraphFusion.HcRead
         FUSED_HC_SCATTER = 7,         // GraphFusion.HcScatter
         FUSED_HC_MIX = 8,             // GraphFusion.HcMix
+        // The diffusion-transformer kinds, served on ggml_cuda inside the graph (try_serve_in_graph): the DiT offload's
+        // GGML_OP_CUSTOM nodes (ggml_ops_dit_offload.h) the run executes, in the graph allocator's memory.
+        FUSED_SWIGLU_FFN = 3,         // GraphFusion.SwigluFfn (gate|up weight, BF16 or F16)
+        FUSED_ADALN_MODULATE = 18,    // GraphFusion.AdaLnModulate
+        FUSED_GATED_RESIDUAL = 19,    // GraphFusion.GatedResidual
+        FUSED_TABLE_ROPE_QK_NORM = 20,// GraphFusion.TableRopeQkNorm (with its attention)
+        FUSED_LORA_LINEAR = 21,       // GraphFusion.LoraLinear (Q4_K weight)
+        // MiniMax-H3's ViT decoder (the image VAE), served on ggml_cuda in any program (h3_vit_decode's fused nodes): the
+        // F16 products on cuBLAS, one cuDNN attention over a batch of tiles, the scaled residuals.
+        FUSED_VIT_ATTENTION = 23,     // GraphFusion.VitAttention
+        FUSED_SCALED_RESIDUAL = 24,   // GraphFusion.ScaledResidual (F16 weights)
+        // Lowered on every backend (try_lower_dit_attention): MiniMax-H3's own attention nodes (h3_attend), in place of the
+        // region's ops; inside a served TableRopeQkNorm it is part of that region.
+        FUSED_DIT_ATTENTION = 22,     // GraphFusion.DitAttention
         SELECTED_ATTENTION = 100,     // a prompt chunk's flash attention under a selection's mask (no region: the op)
     };
 
@@ -344,6 +363,9 @@ namespace
         // graph op produced it, -1 when an earlier scatter's output already lives there) and the one it writes.
         int res_role = -1, out_role = -1;
         bool bind_inject = false;   // a scatter's inject a graph op produced (no served read wrote it)
+        // Served inside the graph: its results are the DiT offload's nodes, built when the region opened (no device
+        // operation between segments, no IO buffer).
+        bool in_graph = false;
     };
 
     // The IO buffer's roles: each operand a kind's operation keeps there, one region per role (every region of the
@@ -386,6 +408,18 @@ namespace
             return {};
         }
     }
+
+    // A segment table a served DiT region reads on the host (the fused kernels take the segments by value): the I32 [3, n]
+    // leaf's values as TSGH3DitSegment rows {start, end, column, 0}, at a stable address the nodes' parameters point at,
+    // refilled from the leaf's input every run (a weight leaf's at build) and checked against the region's sequence.
+    struct HostSegments
+    {
+        const ggml_tensor* leaf = nullptr;
+        std::int64_t rows = 0, columns = 0;
+        std::int64_t max_offset = 0;
+        std::vector<std::int32_t> segs;   // 4 a segment; sized once, never reallocated
+        bool filled = false;
+    };
 
     struct TsgGraph
     {
@@ -438,6 +472,17 @@ namespace
         int serving = -1;
         std::vector<char> skipped;
         std::shared_ptr<DeviceIo> io;
+        // The program's products have thousands of rows (GraphProgram.WideTokenProducts): on ggml_cuda its run takes the DiT
+        // offload's wide routes and it may serve the DiT regions in the graph. Set before the first node.
+        bool wide_token_products = false;
+        int dit_regions = 0;                                     // regions served as DiT offload nodes
+        // A modulation or gated residual of this graph ran its ops because its segment table is not one the fused kernels
+        // take (more than tsg_h3_fused_max_segments(), or not on the host): MiniMax-H3's native DiT then builds the whole
+        // block unfused, its BF16 SwiGLU-in-GEMM included, so a BF16 SwigluFfn is not served either.
+        bool modulations_unserved = false;
+        // The key-padding masks of the graph's lowered DiT attentions (h3_attend on ggml-metal), one per sequence length.
+        tsg::H3FlashMasks flash_masks;
+        std::vector<std::unique_ptr<HostSegments>> host_segments;
         // The residual versions bound to a hyper-connection scatter region (IO_HC_RES0 / IO_HC_RES1), and the region the
         // newest one lives in (-1: none yet).
         std::map<const ggml_tensor*, int> hc_res_role;
@@ -660,6 +705,32 @@ namespace
         return ggml_add(ctx, summed, ggml_cast(ctx, mask, GGML_TYPE_F32));
     }
 
+    // A wide program's power-of-two guard around a product its run takes on cuBLAS BF16 (scale x by 1/s, product, scale
+    // by s: the q8_1 overflow guard a quantized product on ggml's kernels needs, MiniMax-H3's h3_mm): the product of x
+    // itself, which is what the guarded one computes there exactly (BF16 keeps F32's exponent range, so the scales only
+    // move exponents) without the two full-tensor passes. Null where the pattern or the route does not apply.
+    ggml_tensor* unguarded_wide_product(TsgGraph* g, ggml_tensor* product, float s)
+    {
+#if defined(TSG_GGML_USE_CUDA)
+        if (!g->wide_token_products || g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA) return nullptr;
+        if (product == nullptr || product->op != GGML_OP_MUL_MAT || !(s > 0.0f) || !std::isfinite(s)) return nullptr;
+        int exponent = 0;
+        if (std::frexp(s, &exponent) != 0.5f) return nullptr;   // a power of two
+        ggml_tensor* w = product->src[0];
+        ggml_tensor* xs = product->src[1];
+        if (w == nullptr || xs == nullptr || xs->op != GGML_OP_SCALE || xs->src[0] == nullptr) return nullptr;
+        float params[2] = { 0.0f, 0.0f };   // ggml_scale: scale, bias
+        std::memcpy(params, xs->op_params, sizeof(params));
+        if (params[1] != 0.0f || params[0] * s != 1.0f) return nullptr;
+        ggml_tensor* x = xs->src[0];
+        if (!tsg::h3_q4k_gemm_takes(w, x) || !ggml_is_contiguous(w) || x->nb[0] != sizeof(float)) return nullptr;
+        return ggml_mul_mat(g->ctx, w, x);
+#else
+        (void) g; (void) product; (void) s;
+        return nullptr;
+#endif
+    }
+
     // A depthwise 2-D convolution of rows of channels x [C, W, H, N] (the IR's token layout) with ggml's depthwise kernel
     // [KW, KH, 1, C]: ggml_conv_2d_dw_direct on x viewed channels-innermost (CWHN: a permute, no copy) with the kernel laid
     // out channels-innermost too (a copy of KW * KH * C values, which ggml-cpu's and ggml-cuda's CWHN kernels index that
@@ -825,7 +896,10 @@ namespace
             if (g_backend_type == BACKEND_TYPE_VULKAN && s[0] == s[1]) return ggml_sqr(ctx, src(0));
             return ggml_mul(ctx, src(0), src(1));
         case OP_DIV: need(2); return ggml_div(ctx, src(0), src(1));
-        case OP_SCALE: need(1); return ggml_scale(ctx, src(0), fpar(0, 1.0f));
+        case OP_SCALE:
+            need(1);
+            if (ggml_tensor* product = unguarded_wide_product(g, src(0), fpar(0, 1.0f))) return product;
+            return ggml_scale(ctx, src(0), fpar(0, 1.0f));
         case OP_SCALE_BIAS: need(1); return ggml_scale_bias(ctx, src(0), fpar(0, 1.0f), fpar(1, 0.0f));
         case OP_RMS_NORM: need(1); return ggml_rms_norm(ctx, src(0), fpar(0, 1e-6f));
         case OP_NORM: need(1); return ggml_norm(ctx, src(0), fpar(0, 1e-6f));
@@ -981,6 +1055,34 @@ namespace
             return ggml_pad(ctx, src(0), static_cast<int>(ipar(0, 0)), static_cast<int>(ipar(1, 0)),
                             static_cast<int>(ipar(2, 0)), static_cast<int>(ipar(3, 0)));
         case OP_MEAN: need(1); return ggml_mean(ctx, src(0));
+        case OP_CONV_2D:
+        {
+            // ggml_conv_2d's im2col and one product (the lowering MiniMax-H3's VAE encoder graph uses), with the columns at
+            // the kernel's precision: F16 for an F16 kernel (as ggml_conv_2d makes them), F32 otherwise (ggml_conv_2d
+            // narrows an F32 kernel's columns to F16 too; the op's x is read at F32 there).
+            need(2);
+            ggml_tensor* kernel = src(0);
+            ggml_tensor* x = src(1);
+            ggml_tensor* cols = ggml_im2col(ctx, kernel, x, static_cast<int>(ipar(0, 1)), static_cast<int>(ipar(1, 1)),
+                                            static_cast<int>(ipar(2, 0)), static_cast<int>(ipar(3, 0)), static_cast<int>(ipar(4, 1)),
+                                            static_cast<int>(ipar(5, 1)), true,
+                                            kernel->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32);   // [IC KH KW, OW, OH, N]
+            ggml_tensor* y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, cols, cols->ne[0], cols->ne[3] * cols->ne[2] * cols->ne[1]),
+                                          ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]));
+            y = ggml_reshape_4d(ctx, y, cols->ne[1], cols->ne[2], cols->ne[3], kernel->ne[3]);   // [OW, OH, N, OC]
+            return ggml_cont(ctx, ggml_permute(ctx, y, 0, 1, 3, 2));                             // [OW, OH, OC, N]
+        }
+        case OP_PAD_REFLECT_1D:
+        {
+            need(1);
+            ggml_tensor* x = src(0);
+            if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx, x, GGML_TYPE_F32);
+            else if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+            const int p0 = static_cast<int>(ipar(0, 0)), p1 = static_cast<int>(ipar(1, 0));
+            if (p0 < 0 || p1 < 0 || p0 >= x->ne[0] || p1 >= x->ne[0])
+                throw std::runtime_error("graph builder: reflect padding needs each side shorter than the row");
+            return ggml_pad_reflect_1d(ctx, x, p0, p1);
+        }
         case OP_ADD_ID: need(3); return ggml_add_id(ctx, src(0), src(1), src(2));
         case OP_ARGMAX: need(1); return ggml_argmax(ctx, src(0));
         case OP_SWIGLU: need(1); return ggml_swiglu(ctx, src(0));
@@ -1070,6 +1172,522 @@ namespace
 #else
         (void) g; (void) q; (void) k; (void) v; (void) mask; (void) scale; (void) width;
         return nullptr;
+#endif
+    }
+
+    // A served DiT region's segment table: its values checked (sorted, contiguous, covering the region's rows, each
+    // column base plus the region's largest offset inside the modulation matrix) into the rows the kernels read.
+    bool fill_segments(HostSegments& h, const void* data, std::size_t bytes, std::string& why)
+    {
+        const std::size_t n = h.segs.size() / 4;
+        if (data == nullptr || bytes < n * 3 * sizeof(std::int32_t))
+        {
+            why = "the segment table input has " + std::to_string(bytes) + " bytes for " + std::to_string(n) + " segments";
+            return false;
+        }
+        const auto* v = static_cast<const std::int32_t*>(data);
+        std::int64_t next = 0;
+        // Checked whole before any row is written: a table refused keeps no half of it for a later run.
+        h.filled = false;
+        for (std::size_t i = 0; i < n; i++)
+        {
+            const std::int32_t start = v[3 * i], end = v[3 * i + 1], col = v[3 * i + 2];
+            if (start != next || end < start)
+            {
+                why = "segment " + std::to_string(i) + " [" + std::to_string(start) + ", " + std::to_string(end)
+                      + ") does not continue at row " + std::to_string(next);
+                return false;
+            }
+            if (col < 0 || col + h.max_offset >= h.columns)
+            {
+                why = "segment " + std::to_string(i) + "'s column base " + std::to_string(col) + " + "
+                      + std::to_string(h.max_offset) + " is outside " + std::to_string(h.columns) + " columns";
+                return false;
+            }
+            next = end;
+        }
+        if (next != h.rows)
+        {
+            why = "the segments cover " + std::to_string(next) + " rows of " + std::to_string(h.rows);
+            return false;
+        }
+        for (std::size_t i = 0; i < n; i++)
+        {
+            h.segs[4 * i] = v[3 * i];
+            h.segs[4 * i + 1] = v[3 * i + 1];
+            h.segs[4 * i + 2] = v[3 * i + 2];
+            h.segs[4 * i + 3] = 0;
+        }
+        h.filled = true;
+        return true;
+    }
+
+#if defined(TSG_GGML_USE_CUDA)
+    // F32 rows a fused DiT kernel reads in place: 2-D, elements contiguous, rows a whole number of floats apart.
+    bool dit_rows(const ggml_tensor* t)
+    {
+        return t != nullptr && t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->nb[1] % sizeof(float) == 0
+            && t->ne[2] == 1 && t->ne[3] == 1;
+    }
+
+    bool dit_vector(const ggml_tensor* t, std::int64_t n)
+    {
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n;
+    }
+
+    // The host rows of a served region's segment table: the leaf (an input, or a weight with host bytes) holding I32 [3, n]
+    // with n within what the kernels take. Null where the table cannot be read on the host.
+    HostSegments* host_segment_table(TsgGraph* g, ggml_tensor* table, std::int64_t rows, std::int64_t columns, std::int64_t max_offset)
+    {
+        Leaf* leaf = leaf_of(g, table);
+        if (leaf == nullptr || leaf->role == LEAF_STATE || table->type != GGML_TYPE_I32 || table->ne[0] != 3 || table->ne[2] != 1
+            || table->ne[3] != 1)
+            return nullptr;
+        const std::int64_t n = table->ne[1];
+        if (n < 1 || n > tsg_h3_fused_max_segments() || max_offset < 0) return nullptr;
+        // Every block's regions read the step's one table: one set of host rows a (table, sequence, matrix) they share.
+        for (const auto& known : g->host_segments)
+            if (known->leaf == table && known->rows == rows && known->columns == columns && known->max_offset == max_offset)
+                return known.get();
+        auto h = std::make_unique<HostSegments>();
+        h->leaf = table;
+        h->rows = rows;
+        h->columns = columns;
+        h->max_offset = max_offset;
+        h->segs.assign(static_cast<std::size_t>(4 * n), 0);
+        if (leaf->role == LEAF_WEIGHT)
+        {
+            std::string why;
+            if (!fill_segments(*h, leaf->data, leaf->bytes, why)) return nullptr;   // the ops then compute the region
+        }
+        g->host_segments.push_back(std::move(h));
+        return g->host_segments.back().get();
+    }
+
+    // GraphFusion's diffusion-transformer kinds served inside the graph on ggml_cuda, in a program marked WideTokenProducts:
+    // the region becomes the DiT offload's GGML_OP_CUSTOM node(s) (tsg::h3_fused_node, the nodes MiniMax-H3's native DiT
+    // builds), made from the region's inputs now, in the graph allocator's memory; its ops are numbered and not built, and
+    // TSGgml_GraphRun runs the graph through tsg::dit_offload_compute. False (the ops are built) where the operands, the
+    // device or a switch (TS_H3_FUSED, TS_H3_CUDNN_ATTENTION, TS_H3_CUBLAS_MATMUL) say otherwise.
+    bool try_serve_in_graph(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp,
+                            std::vector<ggml_tensor*>& results)
+    {
+        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_CUDA || !tsg::h3_fused_enabled()) return false;
+        // The ViT decoder's kinds are MiniMax-H3's alone, so they need no program attribute to keep other programs as they
+        // were; the DiT's need WideTokenProducts.
+        const bool vit = kind == FUSED_VIT_ATTENTION || kind == FUSED_SCALED_RESIDUAL;
+        if (!vit && !g->wide_token_products) return false;
+        if (!vit && kind != FUSED_SWIGLU_FFN && kind != FUSED_ADALN_MODULATE && kind != FUSED_GATED_RESIDUAL
+            && kind != FUSED_TABLE_ROPE_QK_NORM && kind != FUSED_LORA_LINEAR)
+            return false;
+        std::vector<ggml_tensor*> in(static_cast<std::size_t>(ns));
+        for (int i = 0; i < ns; i++) in[static_cast<std::size_t>(i)] = node_at(g, s[i]);
+        ggml_context* ctx = g->ctx;
+        tsg::H3FusedParams p{};
+        switch (kind)
+        {
+        case FUSED_ADALN_MODULATE:
+        {
+            // x, the norm weight, mods, the segment table; ip shift, scale; fp eps.
+            if (ns != 4 || nip < 2 || nfp < 1) return false;
+            ggml_tensor *x = in[0], *w = in[1], *mods = in[2];
+            const std::int64_t hidden = x->ne[0], rows = x->ne[1];
+            if (!dit_rows(x) || !dit_rows(mods) || mods->ne[0] != hidden || !dit_vector(w, hidden) || ip[0] < 0 || ip[1] < 0) return false;
+            HostSegments* segs = host_segment_table(g, in[3], rows, mods->ne[1], std::max(ip[0], ip[1]));
+            if (segs == nullptr)
+            {
+                g->modulations_unserved = true;
+                return false;
+            }
+            p.kind = tsg::H3_FUSED_MODULATE;
+            p.a = static_cast<std::int32_t>(ip[0]);
+            p.b = static_cast<std::int32_t>(ip[1]);
+            p.f0 = fp[0];
+            p.segments = segs->segs.data();
+            p.nseg = static_cast<std::int32_t>(segs->segs.size() / 4);
+            results = { tsg::h3_fused_node(ctx, hidden, rows, { x, w, mods }, p) };
+            return true;
+        }
+        case FUSED_GATED_RESIDUAL:
+        {
+            // base, mm, [bias], [delta], mods, the segment table; ip gate, bias, delta.
+            const bool hasBias = nip > 1 && ip[1] != 0, hasDelta = nip > 2 && ip[2] != 0;
+            if (nip < 1 || ns != 4 + (hasBias ? 1 : 0) + (hasDelta ? 1 : 0) || ip[0] < 0) return false;
+            int at = 0;
+            ggml_tensor* base = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* mm = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* bias = hasBias ? in[static_cast<std::size_t>(at++)] : nullptr;
+            ggml_tensor* delta = hasDelta ? in[static_cast<std::size_t>(at++)] : nullptr;
+            ggml_tensor* mods = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* table = in[static_cast<std::size_t>(at++)];
+            const std::int64_t hidden = base->ne[0], rows = base->ne[1];
+            if (!dit_rows(base) || !dit_rows(mm) || mm->ne[0] != hidden || mm->ne[1] != rows || !dit_rows(mods) || mods->ne[0] != hidden)
+                return false;
+            if ((bias != nullptr && !dit_vector(bias, hidden))
+                || (delta != nullptr && (!dit_rows(delta) || delta->ne[0] != hidden || delta->ne[1] != rows)))
+                return false;
+            HostSegments* segs = host_segment_table(g, table, rows, mods->ne[1], ip[0]);
+            if (segs == nullptr)
+            {
+                g->modulations_unserved = true;
+                return false;
+            }
+            p.kind = tsg::H3_FUSED_RESIDUAL;
+            p.a = static_cast<std::int32_t>(ip[0]);
+            p.segments = segs->segs.data();
+            p.nseg = static_cast<std::int32_t>(segs->segs.size() / 4);
+            results = { tsg::h3_fused_node(ctx, hidden, rows, { base, mm, bias, delta, mods }, p) };
+            return true;
+        }
+        case FUSED_TABLE_ROPE_QK_NORM:
+        {
+#if defined(TSG_HAVE_CUDNN)
+            // q, k, [q norm], [k norm], cos, signed sin, v; ip rot, norms, attend; fp eps, scale, V scale. The form with its
+            // attention only: tsg_cudnn_h3_attention narrows the rotated q and k straight to F16 for cuDNN.
+            if (nip < 3 || ip[2] != 1 || nfp < 3) return false;
+            const bool qw = (ip[1] & 1) != 0, kw = (ip[1] & 2) != 0;
+            if (ns != 5 + (qw ? 1 : 0) + (kw ? 1 : 0)) return false;
+            int at = 0;
+            ggml_tensor* q = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* k = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* qn = qw ? in[static_cast<std::size_t>(at++)] : nullptr;
+            ggml_tensor* kn = kw ? in[static_cast<std::size_t>(at++)] : nullptr;
+            ggml_tensor* cosT = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* sinT = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* v = in[static_cast<std::size_t>(at++)];
+            const std::int64_t D = q->ne[0], H = q->ne[1], S = q->ne[2], rot = ip[0];
+            for (const ggml_tensor* t : { q, k, v })
+                if (t->type != GGML_TYPE_F32 || t->ne[0] != D || t->ne[1] != H || t->ne[2] != S || t->ne[3] != 1
+                    || t->nb[0] != sizeof(float) || t->nb[1] % sizeof(float) != 0 || t->nb[2] % sizeof(float) != 0)
+                    return false;
+            if ((D != 64 && D != 128) || rot <= 0 || rot % 2 != 0 || rot > D || S > INT32_MAX || !(fp[2] > 0.0f)) return false;
+            for (const ggml_tensor* t : { cosT, sinT })
+                if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != rot || t->ne[1] != S || t->ne[2] != 1 || t->ne[3] != 1)
+                    return false;
+            if ((qn != nullptr && !dit_vector(qn, D)) || (kn != nullptr && !dit_vector(kn, D))) return false;
+            if (!tsg::h3_cudnn_attention_enabled() || !tsg_cudnn_sdpa_prepare(H, S, D)) return false;
+            p.kind = tsg::H3_FUSED_ATTENTION;
+            p.a = static_cast<std::int32_t>(rot);
+            p.f0 = fp[0];
+            p.f1 = fp[2];
+            p.f2 = fp[1];
+            results = { tsg::h3_fused_node(ctx, D * H, S, { q, k, v, qn, kn, cosT, sinT }, p) };
+            return true;
+#else
+            return false;
+#endif
+        }
+        case FUSED_LORA_LINEAR:
+        {
+            // x, the weight, then (down, up) per part; ip the slots with a part, the slot rows (0: the weight's). The parts
+            // run unmerged in the weight's cuBLAS BF16 GEMM (H3_FUSED_LORA_KCAT: Q4_K, Q6_K or BF16); otherwise the region's
+            // ops run (also unmerged). S1's merged node (H3_FUSED_LORA_GEMM: the update added to the dequantized weight
+            // before its BF16 or int8 rounding, which a distillation delta does not survive) is not used for a region.
+            if (ns < 2 || (ns - 2) % 2 != 0 || nip < 2) return false;
+            ggml_tensor *x = in[0], *w = in[1];
+            const int parts = (ns - 2) / 2;
+            const std::int64_t mask = ip[0], slotRows = ip[1] > 0 ? ip[1] : w->ne[1];
+            int slots = 0;
+            for (int b = 0; b < 3; b++) slots += (mask >> b) & 1;
+            if (parts > 3 || mask < 0 || mask >= 8 || slots != parts) return false;
+            if (parts == 0 || !tsg::h3_lora_kcat_takes(w, x) || !ggml_is_contiguous(w) || x->nb[0] != sizeof(float) ||
+                w->ne[2] != 1 || w->ne[3] != 1)
+                return false;
+            const ggml_type type = parts > 0 ? in[2]->type : GGML_TYPE_COUNT;
+            if (type != GGML_TYPE_F16 && type != GGML_TYPE_F32) return false;
+            int slot = 0;
+            for (int i = 0; i < parts; i++)
+            {
+                while (slot < 3 && (mask & (1LL << slot)) == 0) slot++;
+                ggml_tensor *down = in[static_cast<std::size_t>(2 + 2 * i)], *up = in[static_cast<std::size_t>(3 + 2 * i)];
+                if (down->type != type || up->type != type || !ggml_is_contiguous(down) || !ggml_is_contiguous(up)
+                    || down->ne[0] != w->ne[0] || up->ne[0] != down->ne[1] || up->ne[1] != slotRows
+                    || static_cast<std::int64_t>(slot + 1) * slotRows > w->ne[1])
+                    return false;
+                slot++;
+            }
+            // fc2 over fc1's fused SwiGLU reads fc1's [gate | value] and applies the SwiGLU as it narrows (as the H3 graph's
+            // loraGemm does): the GLU node and its F32 result leave the graph.
+            ggml_tensor* xin = x;
+            bool swiglu = false;
+            if (x->op == GGML_OP_GLU && ggml_get_glu_op(x) == GGML_GLU_OP_SWIGLU && x->src[1] == nullptr)
+            {
+                std::int32_t swapped = 0;
+                std::memcpy(&swapped, reinterpret_cast<const char*>(x->op_params) + sizeof(std::int32_t), sizeof(swapped));
+                const ggml_tensor* gv = x->src[0];
+                if (swapped == 0 && gv != nullptr && gv->type == GGML_TYPE_F32 && gv->nb[0] == sizeof(float)
+                    && gv->ne[0] == 2 * x->ne[0] && gv->ne[1] == x->ne[1] && gv->ne[2] == 1 && gv->ne[3] == 1)
+                {
+                    xin = x->src[0];
+                    swiglu = true;
+                }
+            }
+            std::vector<ggml_tensor*> srcs{ w, xin };
+            for (int i = 2; i < ns; i++) srcs.push_back(in[static_cast<std::size_t>(i)]);
+            p.kind = tsg::H3_FUSED_LORA_KCAT;
+            p.a = static_cast<std::int32_t>(mask);
+            p.b = static_cast<std::int32_t>(slotRows);
+            p.f0 = swiglu ? 1.0f : 0.0f;
+            results = { tsg::h3_fused_node(ctx, w->ne[1], x->ne[1], srcs, p) };
+            return true;
+        }
+        case FUSED_SWIGLU_FFN:
+        {
+            // x, gate_up, down[, gate_up's bias, down's bias]; ip split (not served), biased.
+            if (nip > 0 && ip[0] == 1) return false;
+            const bool biased = nip > 1 && ip[1] != 0;
+            if (ns != (biased ? 5 : 3)) return false;
+            ggml_tensor *x = in[0], *gu = in[1], *down = in[2];
+            ggml_tensor* b1 = biased ? in[3] : nullptr;
+            ggml_tensor* b2 = biased ? in[4] : nullptr;
+            if (!dit_rows(x) || gu->ne[0] != x->ne[0] || gu->ne[1] != 2 * down->ne[0] || !ggml_is_contiguous(gu)
+                || !ggml_is_contiguous(down) || gu->ne[2] != 1 || down->ne[2] != 1 || gu->type != down->type)
+                return false;
+            if (biased && (!dit_vector(b1, gu->ne[1]) || !dit_vector(b2, down->ne[1]))) return false;
+            ggml_tensor* mm = nullptr;
+            tsg::H3FusedParams narrow{};
+            narrow.kind = tsg::H3_FUSED_F16_GEMM;
+            narrow.f0 = 1.0f;   // fc2 reads SwiGLU(fc1's [gate | value]) as it narrows its input
+            if (gu->type == GGML_TYPE_BF16)
+            {
+                // A BF16 DiT's fc1 on the wide route, then fc2 on tsg_cuda_bf16_gemm (cuBLAS BF16 or int8). Not where the
+                // graph's modulations run their ops: the native DiT fuses the block's SwiGLU only with its modulations.
+                if (g->modulations_unserved || !tsg::h3_cublas_matmul_enabled() || tsg::h3_f32_products_enabled()
+                    || x->ne[1] < tsg::h3_cublas_min_rows())
+                    return false;
+                ggml_tensor* gv = ggml_mul_mat(ctx, gu, x);
+                if (b1 != nullptr) gv = ggml_add(ctx, gv, b1);
+                mm = tsg::h3_fused_node(ctx, down->ne[1], gv->ne[1], { down, gv, nullptr }, narrow);
+            }
+            else if (gu->type == GGML_TYPE_F16)
+            {
+                // F16 weights (the video VAE's) on cuBLAS F16: fc1 without its bias, which fc2's narrowing adds.
+                tsg::H3FusedParams plain{};
+                plain.kind = tsg::H3_FUSED_F16_GEMM;
+                ggml_tensor* gv = tsg::h3_fused_node(ctx, gu->ne[1], x->ne[1], { gu, x, nullptr }, plain);
+                mm = tsg::h3_fused_node(ctx, down->ne[1], gv->ne[1], { down, gv, b1 }, narrow);
+            }
+            else
+                return false;
+            if (b2 != nullptr) mm = ggml_add(ctx, mm, b2);
+            results = { mm };
+            return true;
+        }
+        case FUSED_VIT_ATTENTION:
+        {
+#if defined(TSG_HAVE_CUDNN)
+            // x, w, [bias], cos, signed sin; ip heads, rot, sequences, bias; fp eps, scale, V scale. h3_vit_decode's fused
+            // attention: the interleaved qkv product on cuBLAS F16 without its bias, then one cuDNN attention node over the
+            // whole batch where an engine takes the batched layout (else one a sequence, concatenated), the bias added in
+            // its prep (k and v d and 2d after q, heads 3d apart).
+            if (nip < 4 || nfp < 3) return false;
+            const bool hasBias = ip[3] != 0;
+            if (ns != 4 + (hasBias ? 1 : 0)) return false;
+            int at = 0;
+            ggml_tensor* x = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* w = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* bias = hasBias ? in[static_cast<std::size_t>(at++)] : nullptr;
+            ggml_tensor* cosT = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* sinT = in[static_cast<std::size_t>(at++)];
+            const std::int64_t heads = ip[0], rot = ip[1], sequences = ip[2];
+            const std::int64_t dim = x->ne[0], rows = x->ne[1];
+            if (heads <= 0 || dim % heads != 0 || sequences <= 0 || rows % sequences != 0) return false;
+            const std::int64_t D = dim / heads, S = rows / sequences;
+            if (!dit_rows(x) || w->type != GGML_TYPE_F16 || !ggml_is_contiguous(w) || w->ne[0] != dim || w->ne[1] != 3 * dim
+                || w->ne[2] != 1 || w->ne[3] != 1)
+                return false;
+            if (bias != nullptr && !dit_vector(bias, 3 * dim)) return false;
+            if ((D != 64 && D != 128) || rot <= 0 || rot % 2 != 0 || rot > D || S > INT32_MAX || !(fp[1] > 0.0f)) return false;
+            for (const ggml_tensor* t : { cosT, sinT })
+                if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != rot || t->ne[1] != S || t->ne[2] != 1 || t->ne[3] != 1)
+                    return false;
+            if (fp[2] != tsg::h3_flash_v_scale(static_cast<int>(S))) return false;
+            if (!tsg::h3_cudnn_attention_enabled() || !tsg_cudnn_sdpa_prepare(heads, S, D)) return false;
+            tsg::H3FusedParams plain{};
+            plain.kind = tsg::H3_FUSED_F16_GEMM;
+            ggml_tensor* qkv = tsg::h3_fused_node(ctx, w->ne[1], x->ne[1], { w, x, nullptr }, plain);   // [3 * dim, rows], no bias
+            p.kind = tsg::H3_FUSED_ATTENTION;
+            p.a = static_cast<std::int32_t>(rot);
+            p.b = static_cast<std::int32_t>(3 * D);
+            p.c = static_cast<std::int32_t>(D);
+            p.f0 = fp[0];
+            p.f1 = fp[2];
+            p.f2 = fp[1];
+            const std::size_t f = sizeof(float), hs = static_cast<std::size_t>(3 * D) * f;
+            ggml_tensor* merged = nullptr;
+            if (sequences > 1 && tsg_cudnn_sdpa_prepare_batched(heads, S, D, sequences))
+            {
+                // q, k and v of every sequence as one view each: the node reads the batch from q's length over the tables'.
+                auto whole = [&](int i) {
+                    return ggml_view_3d(ctx, qkv, D, heads, rows, hs, qkv->nb[1], static_cast<std::size_t>(i) * D * f);
+                };
+                merged = tsg::h3_fused_node(ctx, D * heads, rows, { whole(0), whole(1), whole(2), nullptr, nullptr, cosT, sinT, bias }, p);
+            }
+            else
+                for (std::int64_t b = 0; b < sequences; b++)
+                {
+                    auto part = [&](int i) {
+                        return ggml_view_3d(ctx, qkv, D, heads, S, hs, qkv->nb[1],
+                                            static_cast<std::size_t>(i) * D * f + static_cast<std::size_t>(b * S) * qkv->nb[1]);
+                    };
+                    ggml_tensor* one = tsg::h3_fused_node(ctx, D * heads, S, { part(0), part(1), part(2), nullptr, nullptr, cosT, sinT, bias }, p);
+                    merged = merged == nullptr ? one : ggml_concat(ctx, merged, one, 1);
+                }
+            results = { merged };
+            return true;
+#else
+            return false;
+#endif
+        }
+        case FUSED_SCALED_RESIDUAL:
+        {
+            // Form 0: base, x, w, [bias], [scale]; form 1: base, x, w1, [b1], w2, [b2], [scale]; ip form, bits (1 biases, 2
+            // scale). h3_vit_decode's fused residuals, F16 weights on cuBLAS F16: form 1 narrows fc1's [gate | value] with its
+            // bias and SwiGLU into fc2's input. MiniMax-H3's decoder fuses a block whole or not at all, and only where cuDNN
+            // takes its attention, so these do too.
+            if (nip < 2 || ip[0] < 0 || ip[0] > 1) return false;
+            if (!tsg::h3_cudnn_attention_enabled()) return false;
+            const bool swiglu = ip[0] == 1, biased = (ip[1] & 1) != 0, scaled = (ip[1] & 2) != 0;
+            if (ns != (swiglu ? 4 + (biased ? 2 : 0) : 3 + (biased ? 1 : 0)) + (scaled ? 1 : 0)) return false;
+            int at = 0;
+            ggml_tensor* base = in[static_cast<std::size_t>(at++)];
+            ggml_tensor* x = in[static_cast<std::size_t>(at++)];
+            const std::int64_t hidden = base->ne[0], rows = base->ne[1];
+            if (!dit_rows(base) || !dit_rows(x) || x->ne[1] != rows) return false;
+            auto f16 = [](const ggml_tensor* w) {
+                return w->type == GGML_TYPE_F16 && ggml_is_contiguous(w) && w->ne[2] == 1 && w->ne[3] == 1;
+            };
+            ggml_tensor* w1 = in[static_cast<std::size_t>(at++)];            // form 0: the projection
+            ggml_tensor* b1 = swiglu && biased ? in[static_cast<std::size_t>(at++)] : nullptr;
+            ggml_tensor* w2 = swiglu ? in[static_cast<std::size_t>(at++)] : nullptr;
+            ggml_tensor* bias = biased ? in[static_cast<std::size_t>(at++)] : nullptr;
+            ggml_tensor* scale = scaled ? in[static_cast<std::size_t>(at++)] : nullptr;
+            if (!f16(w1) || w1->ne[0] != x->ne[0]) return false;
+            if (!swiglu && w1->ne[1] != hidden) return false;
+            if (swiglu && (!f16(w2) || w1->ne[1] != 2 * w2->ne[0] || w2->ne[1] != hidden)) return false;
+            if ((b1 != nullptr && !dit_vector(b1, w1->ne[1])) || (bias != nullptr && !dit_vector(bias, hidden))
+                || (scale != nullptr && !dit_vector(scale, hidden)))
+                return false;
+            tsg::H3FusedParams plain{};
+            plain.kind = tsg::H3_FUSED_F16_GEMM;
+            ggml_tensor* mm = tsg::h3_fused_node(ctx, w1->ne[1], x->ne[1], { w1, x, nullptr }, plain);   // form 1: [2 * ffn, rows]
+            if (swiglu)
+            {
+                tsg::H3FusedParams narrow{};
+                narrow.kind = tsg::H3_FUSED_F16_GEMM;
+                narrow.f0 = 1.0f;
+                mm = tsg::h3_fused_node(ctx, w2->ne[1], mm->ne[1], { w2, mm, b1 }, narrow);
+            }
+            p.kind = tsg::H3_FUSED_SCALED_RESIDUAL;
+            results = { tsg::h3_fused_node(ctx, hidden, rows, { base, mm, bias, scale }, p) };
+            return true;
+        }
+        default:
+            return false;
+        }
+    }
+#endif
+
+    // GraphFusion.DitAttention lowered on any backend (no tensor parallelism) as MiniMax-H3's native DiT graphs build it:
+    // tsg::h3_attend, with the keys padded to 64 and the queries chunked on ggml-metal's tensor API (the per-graph mask
+    // shared) and ggml's flash kernel or the explicit softmax elsewhere, exactly the nodes the region's ops build there.
+    // The region's ops are numbered and not built. False (the ops are built) where the operands or the V scale are not
+    // what h3_attend takes.
+    bool try_lower_dit_attention(TsgGraph* g, int kind, const int* s, int ns, const float* fp, int nfp,
+                                 std::vector<ggml_tensor*>& results)
+    {
+        if (kind != FUSED_DIT_ATTENTION || g->tp != nullptr || ns != 3 || nfp < 2) return false;
+        ggml_tensor* q = node_at(g, s[0]);
+        ggml_tensor* k = node_at(g, s[1]);
+        ggml_tensor* v = node_at(g, s[2]);
+        const std::int64_t D = q->ne[0], H = q->ne[1], S = q->ne[2];
+        for (const ggml_tensor* t : { q, k, v })
+            if (t->type != GGML_TYPE_F32 || t->ne[0] != D || t->ne[1] != H || t->ne[2] != S || t->ne[3] != 1 || t->nb[0] != sizeof(float))
+                return false;
+        if (D > INT32_MAX || H > INT32_MAX || S > INT32_MAX || S < 1) return false;
+        // h3_attend derives V's power-of-two scale from the sequence; a region that asks for another runs its ops.
+        if (fp[1] != tsg::h3_flash_v_scale(static_cast<int>(S))) return false;
+        results = { tsg::h3_attend(g->ctx, graph_backend(g), q, k, v, static_cast<int>(D), static_cast<int>(H), static_cast<int>(S),
+                                   fp[0], /*allowFlash*/ true, &g->flash_masks) };
+        return results[0] != nullptr;
+    }
+
+    // A LoraLinear region on ggml_metal (a WideTokenProducts program) whose update costs less inside the base product
+    // than beside it: y = [W | U] . [x ; D x], one GEMM of depth K + R. D [K, R] is the parts' downs side by side along
+    // the rank; U [R, N] holds each slot's up in its part's rank columns of the slot's rows (zeros elsewhere), in the
+    // weight's type. W itself is only read: it is concatenated with U each step, never changed or merged, and the update
+    // stays U (D x), its terms summed after the weight's own. ggml-metal has no product that accumulates into a result,
+    // so beside the base the update's expand writes an [N, rows] F32 delta the add reads again with the product (16 bytes
+    // an element, plus the slots' concatenation for a stacked qkv); inside, the weight is copied once and the activations
+    // once with the shrink. The region takes whichever moves fewer bytes, an extension's zero blocks counted as products
+    // at about 25 multiply-adds a byte (the M5 Pro's GEMM rate over its memory bandwidth). A Q8_0, F16 or F32 weight
+    // (ggml-metal concatenates those). A Q8_0 U rounds the update by Q8_0's step, a few 1e-3 of the update and so far
+    // below the product's own rounding of its F16 activations. False: the region's ops run.
+    bool try_lower_lora_linear(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip,
+                               std::vector<ggml_tensor*>& results)
+    {
+#if defined(TSG_GGML_USE_METAL)
+        if (kind != FUSED_LORA_LINEAR || g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL || !g->wide_token_products)
+            return false;
+        if (ns < 4 || (ns - 2) % 2 != 0 || nip < 2) return false;
+        ggml_tensor* x = node_at(g, s[0]);
+        ggml_tensor* w = node_at(g, s[1]);
+        const int parts = (ns - 2) / 2;
+        const std::int64_t K = w->ne[0], N = w->ne[1], T = x->ne[1];
+        const std::int64_t mask = ip[0], slotRows = ip[1] > 0 ? ip[1] : N;
+        if (slotRows <= 0 || N % slotRows != 0 || N / slotRows > 3) return false;
+        const int slots = static_cast<int>(N / slotRows);
+        // Every slot has its part (a stacked qkv whose adapter leaves a third alone keeps its ops).
+        if (parts != slots || mask != (1LL << slots) - 1) return false;
+        if (w->type != GGML_TYPE_Q8_0 && w->type != GGML_TYPE_F16 && w->type != GGML_TYPE_F32) return false;
+        if (!ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1 || K % 32 != 0) return false;
+        if (x->type != GGML_TYPE_F32 || x->ne[0] != K || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float)) return false;
+        std::vector<ggml_tensor*> downs, ups;
+        std::int64_t R = 0;
+        for (int i = 0; i < parts; i++)
+        {
+            ggml_tensor* down = node_at(g, s[2 + 2 * i]);
+            ggml_tensor* up = node_at(g, s[3 + 2 * i]);
+            if ((down->type != GGML_TYPE_F16 && down->type != GGML_TYPE_F32) || up->type != down->type
+                || (i > 0 && down->type != downs[0]->type) || !ggml_is_contiguous(down) || !ggml_is_contiguous(up)
+                || down->ne[0] != K || up->ne[0] != down->ne[1] || up->ne[1] != slotRows || down->ne[2] != 1 || up->ne[2] != 1)
+                return false;
+            R += down->ne[1];
+            downs.push_back(down);
+            ups.push_back(up);
+        }
+        if (R % 32 != 0) return false;
+        const double wb = static_cast<double>(ggml_type_size(w->type)) / ggml_blck_size(w->type);
+        // Beside: the expand's write, the add's two reads and write; the slots' concatenation (2 k slots of rows read and
+        // written for k = 2 .. slots). Inside: W read and written with U, the GEMM's extra read of U; the activations and
+        // the shrink read and written once; U built from the ups (cast, placed, quantized); the zero blocks' products.
+        const double beside = 16.0 * N * T + 8.0 * slotRows * T * (slots * (slots + 1) / 2 - 1);
+        const double inside = 2.0 * wb * K * N + 2.0 * wb * R * N + 8.0 * (K + R) * T + 20.0 * R * N
+                              + static_cast<double>(slots - 1) * R / slots * N * T / 25.0;
+        if (inside >= beside) return false;
+        ggml_context* ctx = g->ctx;
+        ggml_tensor* D = downs[0];
+        for (int i = 1; i < parts; i++) D = ggml_concat(ctx, D, downs[static_cast<std::size_t>(i)], 1);
+        ggml_tensor* U = nullptr;
+        std::int64_t at = 0;
+        for (int i = 0; i < parts; i++)
+        {
+            ggml_tensor* u = ups[static_cast<std::size_t>(i)];
+            const std::int64_t r = u->ne[0];
+            if (u->type != GGML_TYPE_F32) u = ggml_cast(ctx, u, GGML_TYPE_F32);
+            if (parts > 1) u = ggml_pad_ext(ctx, u, static_cast<int>(at), static_cast<int>(R - at - r), 0, 0, 0, 0, 0, 0);
+            at += r;
+            U = U == nullptr ? u : ggml_concat(ctx, U, u, 1);
+        }
+        if (w->type != GGML_TYPE_F32) U = ggml_cpy(ctx, U, ggml_new_tensor_2d(ctx, w->type, R, N));
+        ggml_tensor* shrunk = ggml_mul_mat(ctx, D, x);   // [R, T]
+        ggml_prec_set_acc(shrunk, GGML_PREC_F32);
+        ggml_tensor* y = ggml_mul_mat(ctx, ggml_concat(ctx, w, U, 0), ggml_concat(ctx, x, shrunk, 0));
+        results = { y };
+        return true;
+#else
+        (void)g; (void)kind; (void)s; (void)ns; (void)ip; (void)nip; (void)results;
+        return false;
 #endif
     }
 
@@ -1184,6 +1802,21 @@ namespace
     // The served region's end: its results are the device operation's outputs, which the next segment reads.
     void finish_region(TsgGraph* g, const int* results, int nresults)
     {
+        if (DeviceRegion& served = g->regions[static_cast<std::size_t>(g->serving)]; served.in_graph)
+        {
+            // Served inside the graph: the nodes made when it opened are its results.
+            if (nresults != static_cast<int>(served.results.size()))
+                throw std::runtime_error("graph builder: a served region closes with " + std::to_string(nresults) + " results, its kind has "
+                                         + std::to_string(served.results.size()));
+            for (int i = 0; i < nresults; i++)
+            {
+                if (results[i] < 0 || results[i] >= static_cast<int>(g->nodes.size()))
+                    throw std::runtime_error("graph builder: a fused region's result is not a node");
+                g->nodes[static_cast<std::size_t>(results[i])] = served.results[static_cast<std::size_t>(i)];
+                g->skipped[static_cast<std::size_t>(results[i])] = 0;
+            }
+            return;
+        }
 #if defined(TSG_GGML_USE_METAL)
         DeviceRegion& r = g->regions[static_cast<std::size_t>(g->serving)];
         const std::int64_t T = r.in[0]->ne[1];
@@ -1284,6 +1917,7 @@ namespace
             off[role] = bytes;
             bytes += size[role];
         }
+        if (bytes == 0) return;   // regions served inside the graph only
         g->io = device_io(graph_backend(g), bytes);
         auto* base = static_cast<char*>(ggml_backend_buffer_get_base(g->io->buf));
         for (const DeviceRegion& r : g->regions)
@@ -1479,6 +2113,7 @@ namespace
                     offset += (ggml_backend_buft_get_alloc_size(buft, t) + align - 1) / align * align;
                 }
         }
+        bool fresh_weights = false;   // a weight got a new device copy
         if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU) bind_cpu_weights(g);
         for (Leaf& leaf : g->leaves)
         {
@@ -1514,6 +2149,7 @@ namespace
                         host_read_barrier();
                         ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
                     }
+                    fresh_weights |= needs_upload && leaf.bytes >= 4096;
                     leaf.uploaded = false;
                     continue;
                 }
@@ -1533,6 +2169,17 @@ namespace
             if (leaf.role == LEAF_STATE) ggml_set_output(leaf.tensor);
         }
         for (const Output& o : g->outputs) ggml_set_output(o.tensor);
+#if defined(TSG_GGML_USE_CUDA)
+        // The DiT offload's int8 and FP8 routes keep what they derive from a weight by its device address (as MiniMax-H3's
+        // graphs do after their uploads): a new device copy may sit where another weight's was.
+        if (fresh_weights && g->tp == nullptr && (g->dit_regions > 0 || g->wide_token_products) && g_backend_type == BACKEND_TYPE_CUDA)
+        {
+            tsg_cuda_q4k_gemm_forget_weights();
+            tsg_cuda_f16_gemm_forget_weights();
+        }
+#else
+        (void) fresh_weights;
+#endif
         // Kept to the run's end: the candidates the host reads, and the logits a tied or non-finite row is read from.
         for (GreedyHead& h : g->greedy)
         {
@@ -1805,6 +2452,94 @@ TSG_EXPORT int TSGgml_GraphEffect(void* handle, int node)
     }
 }
 
+// The program's products have thousands of rows (GraphProgram.WideTokenProducts), set before its first node: on ggml_cuda the
+// run takes the DiT offload's wide routes (cuBLAS BF16 / int8 products, cuDNN attention) and GraphFusion's diffusion-
+// transformer regions are served as the offload's fused nodes; other backends build and run the graph as before.
+TSG_EXPORT int TSGgml_GraphWideTokenProducts(void* handle, int on)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    if (g == nullptr || g->built || !g->nodes.empty())
+    {
+        set_last_error("graph builder: WideTokenProducts is set on a graph before its first node.");
+        return 0;
+    }
+    g->wide_token_products = on != 0;
+    return 1;
+}
+
+// One weight TSGgml_GraphPreloadWeights makes resident: its host bytes (the key of its device copy, as a graph's WEIGHT
+// leaf binds it), their count, the ggml type and the extents.
+struct TSGgmlPreloadWeight
+{
+    void* data;
+    std::int64_t bytes;
+    std::int32_t type;
+    std::int32_t nd;
+    std::int64_t ne[4];
+};
+static_assert(sizeof(TSGgmlPreloadWeight) == 56, "TSGgmlPreloadWeight must match the managed layout");
+
+// Make `count` weights resident on the active device before a graph binds them, through MiniMax-H3's weight uploader
+// (ggml_h3_upload.h: direct reads from a registered file mapping, else prefaulted parallel copies), into the device copies
+// a WEIGHT leaf of the same host bytes binds (try_bind_cached_tensor), so the first graph that reads them uploads nothing.
+// A weight the device cache does not take (a zero-copy host wrap) is left to the graph's binding. `uploaded` (nullable)
+// receives how many were copied now. 1 on success, 0 with the error set.
+TSG_EXPORT int TSGgml_GraphPreloadWeights(const TSGgmlPreloadWeight* items, int count, const char* tag, int* uploaded)
+{
+    try
+    {
+        if (uploaded != nullptr) *uploaded = 0;
+        if (count < 0 || (count > 0 && items == nullptr)) throw std::runtime_error("graph builder: bad weight preload list");
+        if (!ensure_backend()) return 0;
+        if (count == 0) { clear_last_error(); return 1; }
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead() * static_cast<std::size_t>(count) + 1024;
+        params.no_alloc = true;
+        ContextHandle ctx(ggml_init(params));
+        if (ctx.value == nullptr) throw std::runtime_error("graph builder: the weight preload's context could not be made");
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct Binding { ggml_tensor* t; void* data; std::size_t bytes; };
+        std::vector<Binding> uploads;
+        // Device copies bound below and not yet written: invalidated if anything throws before the upload.
+        tsg::PendingDeviceCopies pending;
+        for (int i = 0; i < count; i++)
+        {
+            const TSGgmlPreloadWeight& w = items[i];
+            if (w.data == nullptr || w.nd < 1 || w.nd > 4 || w.type < 0 || w.type >= GGML_TYPE_COUNT)
+                throw std::runtime_error("graph builder: preload weight " + std::to_string(i) + " is not a weight");
+            ggml_tensor* t = ggml_new_tensor(ctx.value, static_cast<ggml_type>(w.type), w.nd, w.ne);
+            if (t == nullptr) throw std::runtime_error("graph builder: preload weight " + std::to_string(i) + " could not be made");
+            const std::size_t bytes = ggml_nbytes(t);
+            if (w.bytes < 0 || static_cast<std::size_t>(w.bytes) < bytes)
+                throw std::runtime_error("graph builder: preload weight " + std::to_string(i) + " has fewer host bytes than its tensor");
+            bool needs = false;
+            if (!try_bind_cached_tensor(g_backend, dev, t, w.data, bytes, needs, GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) continue;
+            if (needs) { uploads.push_back({ t, w.data, bytes }); pending.add(w.data); }
+        }
+        host_read_barrier();
+        tsg::h3_upload_weights(tag != nullptr ? tag : "graph builder/preload", uploads);
+        pending.commit();
+#if defined(TSG_GGML_USE_CUDA)
+        // The int8 and FP8 routes keep what they derive from a weight by its device address (as a graph's fresh weights do).
+        for (const Binding& u : uploads)
+            if (u.bytes >= 4096)
+            {
+                tsg_cuda_q4k_gemm_forget_weights();
+                tsg_cuda_f16_gemm_forget_weights();
+                break;
+            }
+#endif
+        if (uploaded != nullptr) *uploaded = static_cast<int>(uploads.size());
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+}
+
 // Run the graph: build and bind it on the first run, then upload this run's inputs (and the
 // leaves living in compute memory), compute, download the outputs and write back any STATE
 // leaf that lives in compute memory. `inputs`/`input_data`/`input_bytes` name per-run values
@@ -1836,6 +2571,25 @@ namespace
             if (input_data[i] == nullptr || n == 0 || t->buffer == nullptr) continue;
             if (std::uint8_t* at = stage(t)) std::memcpy(at, input_data[i], n);
             else ggml_backend_tensor_set(t, input_data[i], 0, n);
+        }
+        // The segment tables served regions read on the host: this run's values (a weight's were read at build).
+        for (const auto& h : g->host_segments)
+        {
+            const Leaf* leaf = nullptr;
+            for (const Leaf& l : g->leaves)
+                if (l.tensor == h->leaf) leaf = &l;
+            if (leaf == nullptr || leaf->role != LEAF_INPUT) continue;
+            bool given = false;
+            for (int i = 0; i < ninputs && !given; i++)
+            {
+                if (g->nodes[static_cast<std::size_t>(inputs[i])] != h->leaf) continue;
+                std::string why;
+                if (!fill_segments(*h, input_data[i], static_cast<std::size_t>(input_bytes[i]), why))
+                    throw std::runtime_error("graph builder: a served region's segment table is not one it can run: " + why);
+                given = true;
+            }
+            if (!given && !h->filled)
+                throw std::runtime_error("graph builder: a served region's segment table input was not given");
         }
         if (g->packed_span == nullptr) return;
         // On CUDA the copy is queued on the stream the graph runs on, ahead of it; the block is written again only at a
@@ -1900,6 +2654,11 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         // scheduler does): a synchronous compute followed by a download is a second command-buffer
         // round trip per step. The run is complete when this returns.
         ggml_status status = GGML_STATUS_SUCCESS;
+        if (!g->host_moe.empty() && g->dit_regions > 0)
+        {
+            set_last_error("graph builder: a graph with host-expert pauses runs no DiT offload nodes.");
+            return 0;
+        }
         if (!g->host_moe.empty())
         {
             // Accelerator segments and host-expert pauses in turn (the outputs are read below).
@@ -1908,6 +2667,15 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
                 sync_backend(graph_backend(g));
                 return 0;
             }
+        }
+        else if (g->tp == nullptr && (g->dit_regions > 0 || (g->wide_token_products && g_backend_type == BACKEND_TYPE_CUDA)))
+        {
+            // The DiT offload: its fused nodes, cuDNN attention and (wide programs) the cuBLAS/int8 products, between ggml
+            // segments; profiled under TS_GGML_NODE_PROFILE as the H3 graphs are. Synchronous.
+            const std::uint64_t errors_before = g_ggml_error_count.load(std::memory_order_acquire);
+            status = tsg::dit_offload_compute(graph_backend(g), g->graph, "graph builder dit", g->wide_token_products);
+            if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before)
+                g_backend_compute_failed.store(true, std::memory_order_release);
         }
         else if (graph_node_profile_enabled())
         {
@@ -1989,9 +2757,9 @@ TSG_EXPORT int TSGgml_GraphRunRanked(void* const* handles, int nranks, const int
         for (int r = 0; r < nranks; r++)
         {
             auto* g = static_cast<TsgGraph*>(handles[r]);
-            if (g == nullptr || g->rank != r || g->tp != nullptr || !g->host_moe.empty())
+            if (g == nullptr || g->rank != r || g->tp != nullptr || !g->host_moe.empty() || g->dit_regions > 0)
             {
-                set_last_error("graph builder: a ranked run takes rank r's own graph, without host experts, for every rank r.");
+                set_last_error("graph builder: a ranked run takes rank r's own graph, without host experts or DiT offload nodes, for every rank r.");
                 return 0;
             }
             ScopedRank scope(g->rank);
@@ -2045,8 +2813,9 @@ extern "C" void TSGgml_GraphReleaseDeviceIo()
 }
 
 // A fused region of GraphFusion `kind` over `srcs` begins: 1 when a device operation computes it (its ops, effects and
-// aliases up to the matching TSGgml_GraphFusedEnd are then numbered but not built), 0 when its ops are built. A region
-// nested in a served one is part of it.
+// aliases up to the matching TSGgml_GraphFusedEnd are then numbered but not built), 2 when the backend lowers it to graph
+// nodes of its own (GraphFusion.DitAttention: the ops are numbered but not built either), 0 when its ops are built. A
+// region nested in a served one is part of it.
 TSG_EXPORT int TSGgml_GraphFusedBegin(void* handle, int kind, const int* srcs, int nsrc,
                                       const std::int64_t* ip, int nip, const float* fp, int nfp)
 {
@@ -2058,6 +2827,33 @@ TSG_EXPORT int TSGgml_GraphFusedBegin(void* handle, int kind, const int* srcs, i
         {
             g->open_regions.push_back(-1);
             return 0;
+        }
+#if defined(TSG_GGML_USE_CUDA)
+        std::vector<ggml_tensor*> in_graph;
+        if (try_serve_in_graph(g, kind, srcs, nsrc, ip, nip, fp, nfp, in_graph))
+        {
+            DeviceRegion r;
+            r.kind = kind;
+            r.in_graph = true;
+            r.results = std::move(in_graph);
+            g->regions.push_back(std::move(r));
+            g->dit_regions++;
+            g->open_regions.push_back(static_cast<int>(g->regions.size()) - 1);
+            g->serving = g->open_regions.back();
+            return 1;
+        }
+#endif
+        std::vector<ggml_tensor*> lowered;
+        if (try_lower_dit_attention(g, kind, srcs, nsrc, fp, nfp, lowered) || try_lower_lora_linear(g, kind, srcs, nsrc, ip, nip, lowered))
+        {
+            DeviceRegion r;
+            r.kind = kind;
+            r.in_graph = true;
+            r.results = std::move(lowered);
+            g->regions.push_back(std::move(r));
+            g->open_regions.push_back(static_cast<int>(g->regions.size()) - 1);
+            g->serving = g->open_regions.back();
+            return 2;
         }
         const bool served = try_serve_region(g, kind, srcs, nsrc, ip, nip, fp, nfp);
         g->open_regions.push_back(served ? static_cast<int>(g->regions.size()) - 1 : -1);

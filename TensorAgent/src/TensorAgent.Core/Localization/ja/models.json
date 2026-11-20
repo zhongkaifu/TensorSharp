@@ -90,5 +90,13 @@
   "models.alert.delete.message": "{model} をこのデバイスから削除しますか？再度ダウンロードできます。",
   "models.alert.delete.messageLocal": "{model} をこのデバイスから削除しますか？復元するには、元のローカル GGUF をもう一度選ぶ必要があります。",
   "models.alert.delete.confirm": "削除",
-  "models.action.unavailable": "利用不可"
+  "models.action.unavailable": "利用不可",
+  "models.license.title": "ライセンス条件",
+  "models.license.intro": "{model} は {license} の下で提供されています。以下の条件をお読みください。同意した場合にのみダウンロードが始まります。",
+  "models.license.changed": "前回同意したときから条件が変更されています。",
+  "models.license.summary": "要約",
+  "models.license.fullText": "ライセンス全文（英語、公開されたままの文面）",
+  "models.license.open": "Hugging Face でライセンスを開く",
+  "models.license.accept": "同意してダウンロード",
+  "models.license.decline": "同意しない"
 }

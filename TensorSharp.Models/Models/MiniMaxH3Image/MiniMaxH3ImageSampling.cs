@@ -6,8 +6,8 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
 // MiniMax-H3-Image sampling: the PDD (progressive distillation) step grid, the
-// schedule ComfyUI's template samples on it, the head each step uses, and the
-// initial noise.
+// schedule ComfyUI's template samples on it and the head each step uses. The
+// initial noise is the diffusion runtime's TorchCpuRandn (SharedDiffusion).
 //
 // The checkpoint is distilled to six Euler steps with guidance 1 on its own sigma
 // grid (the "pdd_sigmas" of its config), and its final layer carries one output
@@ -17,7 +17,9 @@ using System;
 using System.Collections.Generic;
 using System.Text.Json;
 
-namespace TensorSharp.Models.MiniMaxH3
+using TensorSharp.Models.MiniMaxH3;
+
+namespace TensorSharp.Models.MiniMaxH3Image
 {
     internal static class MiniMaxH3ImageSampling
     {
@@ -140,86 +142,6 @@ namespace TensorSharp.Models.MiniMaxH3
                 for (int r = 0; r < rows; r++) b[r] += w * bias[(long)k * rows + r];
             }
             return (weight, b);
-        }
-    }
-
-    /// <summary>
-    /// <c>torch.randn</c> on the CPU generator for a float32 tensor: a 32-bit Mersenne
-    /// Twister seeded with <c>torch.manual_seed</c>, 24-bit uniforms, and the Box-Muller
-    /// transform over blocks of 16 (pairs j and j+8), the last block redrawn when the
-    /// count is not a multiple of 16. This is the noise ComfyUI's KSampler starts from
-    /// (comfy.sample.prepare_noise), so a TensorSharp image at the same seed starts from
-    /// the same latent. PyTorch's AVX2 build evaluates log/sin/cos with SLEEF's 1-ULP
-    /// functions, so a value can differ from this in the last bit.
-    /// </summary>
-    internal static class TorchCpuRandn
-    {
-        public static float[] Normal(long count, ulong seed)
-        {
-            if (count < 16)
-                throw new ArgumentOutOfRangeException(nameof(count), "only the vectorized (16 or more values) path is reproduced.");
-            var mt = new Mt19937((uint)seed);
-            var data = new float[count];
-            for (long i = 0; i < count; i++) data[i] = Uniform(mt);
-            for (long i = 0; i + 16 <= count; i += 16) Fill16(data, i);
-            if (count % 16 != 0)
-            {
-                long last = count - 16;
-                for (int j = 0; j < 16; j++) data[last + j] = Uniform(mt);
-                Fill16(data, last);
-            }
-            return data;
-        }
-
-        private static float Uniform(Mt19937 mt) => (mt.Next() & 0xFFFFFFu) * (1.0f / 16777216f);
-
-        private static void Fill16(float[] d, long o)
-        {
-            for (int j = 0; j < 8; j++)
-            {
-                float u1 = 1f - d[o + j];
-                float u2 = d[o + j + 8];
-                float radius = MathF.Sqrt(-2f * MathF.Log(u1));
-                float theta = (float)(2.0 * Math.PI * u2);
-                d[o + j] = radius * MathF.Cos(theta);
-                d[o + j + 8] = radius * MathF.Sin(theta);
-            }
-        }
-
-        private sealed class Mt19937
-        {
-            private readonly uint[] _state = new uint[624];
-            private int _index = 624;
-
-            public Mt19937(uint seed)
-            {
-                _state[0] = seed;
-                for (int i = 1; i < 624; i++)
-                    _state[i] = unchecked(1812433253u * (_state[i - 1] ^ (_state[i - 1] >> 30)) + (uint)i);
-            }
-
-            public uint Next()
-            {
-                if (_index >= 624) Twist();
-                uint y = _state[_index++];
-                y ^= y >> 11;
-                y ^= (y << 7) & 0x9D2C5680u;
-                y ^= (y << 15) & 0xEFC60000u;
-                y ^= y >> 18;
-                return y;
-            }
-
-            private void Twist()
-            {
-                for (int i = 0; i < 624; i++)
-                {
-                    uint y = (_state[i] & 0x80000000u) | (_state[(i + 1) % 624] & 0x7FFFFFFFu);
-                    uint v = _state[(i + 397) % 624] ^ (y >> 1);
-                    if ((y & 1u) != 0) v ^= 0x9908B0DFu;
-                    _state[i] = v;
-                }
-                _index = 0;
-            }
         }
     }
 }

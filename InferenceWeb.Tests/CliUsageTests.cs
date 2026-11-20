@@ -162,9 +162,27 @@ public class CliUsageTests
     {
         string root = LoraHostFixtures.RepoRoot();
         var plugins = Directory.GetFiles(Path.Combine(root, "config", "lora"), "minimax-h3-*.json")
+            .Where(p => LoraCliFlags.DeclaredPluginType(new LoraSpec(p)) == LoraCliFlags.MiniMaxH3PluginType)
             .ToDictionary(p => "config/lora/" + Path.GetFileName(p), MiniMaxH3LoraConfig.Load);
         Assert.NotEmpty(plugins);
         return plugins;
+    }
+
+    /// <summary>The shipped MiniMax-H3-Image plug-in configs, by their repository-relative path.</summary>
+    internal static Dictionary<string, TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageLoraConfig> ShippedH3ImagePlugins()
+    {
+        string root = LoraHostFixtures.RepoRoot();
+        var plugins = Directory.GetFiles(Path.Combine(root, "config", "lora"), "minimax-h3-image-*.json")
+            .ToDictionary(p => "config/lora/" + Path.GetFileName(p), TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageLoraConfig.Load);
+        Assert.NotEmpty(plugins);
+        return plugins;
+    }
+
+    /// <summary>Every shipped MiniMax-H3-Image plug-in is named, a speed adapter with its step count.</summary>
+    internal static void AssertNamesEveryShippedH3ImagePlugin(string text)
+    {
+        foreach (var (path, plugin) in ShippedH3ImagePlugins())
+            Assert.Contains(plugin.Contract != null ? $"{path} ({plugin.Contract.Steps} steps)" : path, text, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -181,13 +199,14 @@ public class CliUsageTests
         Assert.Contains("checked right after that download", lora, StringComparison.Ordinal);
         Assert.DoesNotContain("before anything downloads", lora, StringComparison.Ordinal);
         // Every plug-in it names is shipped, and the step count beside it is the plug-in's own.
-        var named = System.Text.RegularExpressions.Regex.Matches(lora, @"config/lora/minimax-h3-[\w.\-]+\.json")
+        var named = System.Text.RegularExpressions.Regex.Matches(lora, @"config/lora/minimax-h3-fl2v-[\w.\-]+\.json")
             .Select(m => m.Value).ToHashSet(StringComparer.Ordinal);
         Assert.Equal(plugins.Keys.OrderBy(k => k, StringComparer.Ordinal), named.OrderBy(k => k, StringComparer.Ordinal));
         foreach (var (path, plugin) in plugins)
             Assert.Contains($"{path} ({plugin.Recipe.Steps} steps)", lora, StringComparison.Ordinal);
         foreach (string locked in new[] { "--diffusion-steps", "--flow-shift", "--sampler", "--cfg" })
             Assert.Contains(locked, lora, StringComparison.Ordinal);
+        AssertNamesEveryShippedH3ImagePlugin(lora);
     }
 
     [Fact]

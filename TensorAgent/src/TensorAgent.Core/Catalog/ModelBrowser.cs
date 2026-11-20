@@ -80,7 +80,7 @@ public static class ModelBrowser
         CatalogFamily.GptOss => ("gpt-oss", "GPT-OSS"),
         CatalogFamily.Bonsai => ("bonsai", "Bonsai"),
         CatalogFamily.MuseGlimmer => ("muse-glimmer", "Muse-Glimmer"),
-        CatalogFamily.MiniMaxH3 => ("minimax-h3", "MiniMax H3"),
+        CatalogFamily.MiniMaxH3 or CatalogFamily.MiniMaxH3Image => ("minimax-h3", "MiniMax H3"),
         CatalogFamily.DeepSeek4 or CatalogFamily.DeepSeek41 => ("deepseek", "DeepSeek"),
         CatalogFamily.Glm5 => ("glm", "GLM"),
         CatalogFamily.Nemotron => ("nemotron", "Nemotron"),

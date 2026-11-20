@@ -170,8 +170,8 @@ directory also holds presets for chat models (`gemma-4-*`, `qwen3.5-9b-*`,
 `qwen3.6-*`, `gpt-oss-20b`), agent hosting (`agent-*`), embedding services
 (`embedding-*`), DiffusionGemma and Jev (`diffusiongemma-*`,
 `jev-diffusiongemma-q4`) and video (`minimax-h3-*`, `wan-video-*`), and
-[`config/lora/`](config/lora/) holds fourteen Qwen-Image-2.1 LoRA plug-ins and two
-MiniMax-H3 Turbo plug-ins. See
+[`config/lora/`](config/lora/) holds fourteen Qwen-Image-2.1 LoRA plug-ins, two
+MiniMax-H3 Turbo plug-ins and three MiniMax-H3-Image plug-ins. See
 [`config/README.md`](config/README.md) for the full reference.
 
 ## Console Application
@@ -236,6 +236,15 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
     --prompt "A small orange cat beside a blue ceramic vase, soft daylight" --output generated.png
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
+
+# MiniMax-H3-Image: no --image generates an image (2048x2048 by default, 6 steps); --image
+# edits with up to 16 reference pictures, which the prompt names <Picture 1>, <Picture 2>, ...
+# in command-line order. See docs/models/minimax-h3-image.md#editing. The config is the bf16 DiT;
+# minimax-h3-image-q8.json, -q5km.json and -q4km.json are the same with a quantized DiT for
+# 46-48 GB, 20-24 GB and 20 GB GPUs (docs/models/minimax-h3-image.md#quantizations).
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --image cabin.png --image mug.png --width 2048 --height 2048 --diffusion-seed 7 \
+    --prompt "Put the black mug from <Picture 2> on the table in front of the cabin in <Picture 1>." --output mug.png
 
 # Qwen-Image-2.1-Turbo: the 8-step distillation, with the same VAE, text encoder and mmproj.
 # The config declares the checkpoint (--qwen-image-variant turbo), so it samples Turbo's
@@ -413,6 +422,7 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 |---|---|
 | `--kv-cache-dtype <type>` | KV cache precision: `f32`, `f16`, `q8_0`, or `q4_0` (default: auto — the backend/model pick; env `KV_CACHE_DTYPE`). Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) run on the GGML backends' flash path; on `--backend cuda`, `q8_0` runs on the CUDA executor's own flash kernels for every family on the shared decoder runtime (Qwen 3.5/3.6/3.8, Mistral 3, Hunyuan Dense; decode, verify windows and prompt chunks read about half the bytes of `f16`; a route they do not take warns once and runs the generic attention; LFM3, whose sliding-window layers' band and ring routes take F16 caches only there, runs `q8_0` off whole-forward graphs), while `q4_0` keeps the model off whole-forward graphs there (Qwen3.8 Flash Next runs only as graphs, so over `q4_0`, or over `q8_0` with its QSA layers, its first step fails: keep `f16` for it); DeepSeek V4 / V4.1 refuse them at load (their executors keep F16 caches read by their own kernels) and report `f16` for an explicit `f32`. |
 | `--prompt-attention <path>` | Arithmetic of a prompt chunk's attention on `--backend cuda` (the CUDA executor). Default: `int8` where it can run, `f16` elsewhere. `int8` runs Q K^T on the INT8 tensor cores and P V on the E4M3 ones, for 256-wide heads over an F16 cache and windows of at least 1,024 keys, in an `sm_120a` / `sm_121a` build; elsewhere (other GPUs, a `q8_0` cache, other head widths) the default runs `f16` without a word, and only an explicit `--prompt-attention int8` warns once. `f16` runs the 16-bit-run prompt kernels, bit for bit the default before issue #383: choose it to keep the earlier numbers. `f32acc` accumulates every tensor-core product in F32 (faster than `f16` on workstation and datacenter GPUs, slower on GeForce parts, which the first use reports). `int8` and `f32acc` failed issue #376's long-context quality gates on a few long code windows (prose and retrieval did not move); `int8` became the default by the maintainer's decision. Decode rows, verify windows and drafts always keep the 16-bit kernels. Env: `TS_PROMPT_ATTENTION` (the flag wins). |
+| `--diffusion-products <p>` | Arithmetic of a diffusion model's wide weight products on `--backend ggml_cuda` (MiniMax-H3-Image, MiniMax-H3 video, Qwen-Image 2.1): `bf16` (the default: as stored, BF16 and Q4_K on cuBLAS BF16), `int8` (the DiT's projections on int8 tensor cores, each weight row and token rounded to 8 bits: faster, and it changes the picture) or `int8-all` (`int8` plus the VAE decoders' F16 projections). Other backends run the products as stored (a warning says so). Config key `diffusion-products`; sets `TS_DIFFUSION_PRODUCTS`. Replaces `TS_H3_INT8_MATMUL` (`1` = `int8`, `all` = `int8-all`), which both hosts now refuse. |
 | `--interactive` / `-i` / `--chat` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--no-prefix-cache` | Disable runtime prefix reuse (it sets `TS_SCHED_PREFIX_CACHE=0`) and interactive system/tool prompt warmup. Radix caching is enabled by default for normal CLI generation, including single-shot, interactive, JSONL, and skill/tool requests. The CLI's cache lives in memory only, so every new process starts cold. Unrelated to `--warmup-runs`, which warms compute kernels. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
@@ -529,12 +539,12 @@ script gets that error instead of watching a setting be ignored.
 | `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40, or the step count of a `--lora` plug-in's sampling recipe; Qwen-Image-2.1-Turbo runs 8, the only count it takes). MiniMax-H3 defaults to 20; under a [Turbo plug-in](#minimax-h3-turbo-plug-ins) it samples exactly the plug-in's 8 or 4 steps, and any other value is refused at startup. LTX 2.5 accepts only 8 (plus 3 refinement steps); CFG is fixed at 1. |
 | `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler and Qwen-Image-2.1 (default: 0), and video generation (LTX 2.5, Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. A Qwen-Image-2.1 picture depends on the seed and its size; an edit's noise also depends on its `--image` pictures, so editing a picture at the seed it was drawn with does not restart from its own noise ([seeds and edits](docs/models/qwenimage21.md#seeds-and-edits)). |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
-| `--image <path>` | Input image for Qwen-Image-2.1 editing (also the image input for multimodal chat); repeat it for multiple references. Every `--image` is a reference, tagged `<image1>`, `<image2>`, … in command-line order ahead of the prompt, so the prompt can name a picture by its tag. Without `--image`, a Qwen-Image-2.1 DiT generates an image from the prompt instead. |
-| `--mask <path>` | Qwen-Image-2.1 mask at the first input image's exact dimensions. Requires `--image`; additional images remain references. Preserves source dimensions and unselected decoded RGBA pixels. See [Masked image editing](#masked-image-editing). |
+| `--image <path>` | Input image for image editing (also the image input for multimodal chat); repeat it for multiple references. Every `--image` is a reference, in command-line order, and the prompt names the pictures the way the model does: Qwen-Image-2.1 tags them `<image1>`, `<image2>`, … ahead of the prompt; MiniMax-H3-Image (up to 16) calls them `<Picture 1>`, `<Picture 2>`, … Without `--image`, either model generates an image from the prompt instead. |
+| `--mask <path>` | Mask for a Qwen-Image-2.1 or MiniMax-H3-Image edit, at the first input image's exact dimensions (MiniMax-H3-Image's `<Picture 1>`). Requires `--image`; additional images remain references. Preserves source dimensions and unselected decoded RGBA pixels. See [Masked image editing](#masked-image-editing). |
 | `--mask-mode <mode>` / `--mask-invert` | `grayscale` (default): white edits, black protects and gray blends. `alpha`: transparent edits, opaque protects. `--mask-invert` reverses the selection. |
 | `--mask-feather <pixels>` | Soften the mask inward in source pixels; range 0–1024, default 0. |
 | `--mask-crop` / `--mask-crop-padding <pixels>` | Process the selection with surrounding context, then composite onto the original canvas. Padding is in source pixels; range 0–16384, default 64. Mask settings without `--mask` are rejected. |
-| `--keep-source-size` | Qwen-Image-2.1 edit: return the first `--image`'s exact width and height, so an edit of an edit keeps its size. Sampling uses about the image's own area, at least 1 megapixel and at most the automatic area, at about its aspect ratio (the 32-pixel grid rounds both), and the result is resized to the source. Requires `--image`; cannot be combined with `--width`/`--height`. Masked edits keep the source size without it. The server takes it as the per-request field `keepSourceSize`. See [Keeping the source size](#keeping-the-source-size). |
+| `--keep-source-size` | Qwen-Image-2.1 or MiniMax-H3-Image edit: return the first `--image`'s exact width and height, so an edit of an edit keeps its size. Sampling uses about the image's own area (Qwen-Image-2.1: at least 1 megapixel and at most the automatic area; MiniMax-H3-Image: at least 2048×2048 and at most 20 megapixels), at about its aspect ratio (the 32-pixel grid rounds both), and the result is resized to the source. Requires `--image`; cannot be combined with `--width`/`--height`. Masked edits keep the source size without it. The server takes it as the per-request field `keepSourceSize`. See [Keeping the source size](#keeping-the-source-size). |
 | `--prompt <text>` | Qwen-Image-2.1 generation prompt or edit instruction (falls back to `--input` file contents if omitted). |
 | `--output <path>` | Qwen-Image-2.1 output PNG path (default: `generated.png` for generation, `edited.png` for editing). |
 | `--cfg <F>` | Qwen-Image-2.1 true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 1.0 for Qwen-Image-2.1 (one transformer prediction per step), or the CFG of a `--lora` plug-in's sampling recipe; a value above 1 adds the negative pass. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. On MiniMax-H3 the only accepted value is `1.0` (its default): the checkpoint ships CFG-distilled and anything higher is refused up front rather than run and degraded. `TensorSharp.Server.Host` has no `--cfg` at all — a request body can still carry `cfg`. |
@@ -542,8 +552,8 @@ script gets that error instead of watching a setting be ignored.
 | `--qwen-image-vl <path>` | Override the resolved Qwen3-VL-8B text-encoder GGUF (default: a `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_TE`. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen3-VL-8B mmproj (vision grounding for edits) GGUF (default: a matching `mmproj` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_MMPROJ`. |
 | `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds. The GGUFs name at most their architecture and Turbo has the base checkpoint's tensors, so the host declares it: `turbo` samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1, refuses other step counts and refuses step-distillation `--lora` plug-ins. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so; any other is `base`. Refused with any other model. Env: `TS_QWEN_IMAGE_VARIANT`. See [Qwen-Image-2.1-Turbo](docs/models/qwenimage21.md#qwen-image-21-turbo). |
-| `--lora <path>` | LoRA plug-in for Qwen-Image-2.1 or MiniMax-H3 (FL2VA). Qwen-Image-2.1: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)); repeat to stack LoRAs. MiniMax-H3: one `minimax-h3-lora` config only, `config/lora/minimax-h3-fl2v-turbo-8step.json` or `-4step.json`, which locks `--diffusion-steps`, `--flow-shift`, `--sampler` and `--cfg` to its recipe and is refused on the Ref2VA checkpoint. Applied unmerged on top of the quantized transformer. A plug-in the model does not take is refused at startup, before the plug-in downloads; when a `--config` still has to download the model, the model's family is checked right after that download (a contradicting sampling flag is refused before it). Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins) and [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins). |
-| `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. MiniMax-H3 refuses a negative strength: its Turbo schedule is distilled at 1, and 0 keeps the adapter's terms with zero up factors. |
+| `--lora <path>` | LoRA plug-in for Qwen-Image-2.1, MiniMax-H3 (FL2VA) or MiniMax-H3-Image. Qwen-Image-2.1: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)); repeat to stack LoRAs. MiniMax-H3: one `minimax-h3-lora` config only, `config/lora/minimax-h3-fl2v-turbo-8step.json` or `-4step.json`, which locks `--diffusion-steps`, `--flow-shift`, `--sampler` and `--cfg` to its recipe and is refused on the Ref2VA checkpoint. MiniMax-H3-Image: `minimax-h3-image-lora` configs or bare `.safetensors` (diffusers PEFT, ComfyUI or kohya names), repeatable as style adapters, plus at most one speed adapter such as `config/lora/minimax-h3-image-pdmd-2step.json`, which locks `--diffusion-steps` and `--cfg`. Applied unmerged on top of the quantized transformer. A plug-in the model does not take is refused at startup, before the plug-in downloads; when a `--config` still has to download the model, the model's family is checked right after that download (a contradicting sampling flag is refused before it). Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins), [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins) and [MiniMax-H3-Image LoRA plug-ins](#minimax-h3-image-lora-plug-ins). |
+| `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. MiniMax-H3 and MiniMax-H3-Image refuse a negative strength: a speed schedule is distilled at 1, and 0 keeps the adapter's terms with zero up factors. |
 | `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config, a PEFT `adapter_config.json` or a VideoX-Fun `pdd_config.json`. A MiniMax-H3 plug-in config here must name the preceding `--lora`'s weights file in its `"weights"` entry, and its recipe stays locked. Default: none (a PDD bundle's `pdd_config.json`, and a PEFT `adapter_config.json` beside `adapter_model.safetensors`, are found next to the weights). |
 | `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--penalty-last-n` | **Removed and rejected at startup, including as a config-file key** (exit code 1, `Configuration error: --penalty-last-n was removed: …`). It was the CLI-only name of the repeat-penalty window: use `--repeat-last-n <N>`, the spelling both hosts and the `repeat_last_n` request field use. |
@@ -851,7 +861,7 @@ of quietly losing a setting.
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | Override the Qwen-Image-2.1 companions the server otherwise finds next to the DiT GGUF: the VAE, the Qwen3-VL-8B text encoder and its vision projector (needed for editing). Checked at startup. Env: `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ`. |
 | `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds, same spelling and meaning as on the CLI: `turbo` samples Turbo's 8-step schedule at CFG 1 by default (a request's `steps` may only be 8) and refuses step-distillation `--lora` plug-ins. Applies to every Qwen-Image model the server loads; another model loads without it and the server logs a warning, as for a `--lora` plug-in that a model loaded after startup does not take. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so. Checked at startup. Env: `TS_QWEN_IMAGE_VARIANT`. |
 | `--width <px>` / `--height <px>` | Default Qwen-Image-2.1 output size for an image request that names neither a size nor an area (the Web UI sends none); a request that sets its own width/height or target area keeps its own geometry. The default needs both values. A side that is not a multiple of 32 is rounded down to one (never below 32) with a one-time `[qwen-image] WARNING`; with only one side given, or an unparsable or negative value, the default is ignored with a one-time warning and the automatic size (a 2048×2048 area; 1024×1024 on the `cpu` backend) stays. A Qwen-Image server also warns at startup in either case; nothing is refused. A width/height set in the request itself must still be a positive multiple of 32. Env: `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`. They are also aliases of `--video-width` / `--video-height`. LTX 2.5 video defaults to 1024×1024 output with both sides positive multiples of 64; see its two-stage recipe below. |
-| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | LoRA plug-ins for the hosted Qwen-Image-2.1 or MiniMax-H3 (FL2VA) model, same spelling and binding rules as on the CLI (repeat `--lora` to stack Qwen-Image-2.1 plug-ins; scale and config bind to the preceding `--lora`). The files are checked at startup, and a plug-in the startup model does not take is refused there, before the plug-in downloads (a model a `--config` still has to download is checked right after that download); a model loaded later runs without plug-ins it does not take and logs a warning naming them. The startup log lists the set (`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`). On Qwen-Image-2.1 the set applies to every image request, and a request's `steps` / `cfg` still override a plug-in's sampling recipe. A MiniMax-H3 Turbo plug-in applies to every clip and locks `--video-steps` and a request's `steps`, `flowShift` and `sampler` to its recipe. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins) and [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins). |
+| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | LoRA plug-ins for the hosted Qwen-Image-2.1, MiniMax-H3 (FL2VA) or MiniMax-H3-Image model, same spelling and binding rules as on the CLI (repeat `--lora` to stack Qwen-Image-2.1 plug-ins; scale and config bind to the preceding `--lora`). The files are checked at startup, and a plug-in the startup model does not take is refused there, before the plug-in downloads (a model a `--config` still has to download is checked right after that download); a model loaded later runs without plug-ins it does not take and logs a warning naming them. The startup log lists the set (`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`). On Qwen-Image-2.1 the set applies to every image request, and a request's `steps` / `cfg` still override a plug-in's sampling recipe. A MiniMax-H3 Turbo plug-in applies to every clip and locks `--video-steps` and a request's `steps`, `flowShift` and `sampler` to its recipe. On MiniMax-H3-Image the set applies to every picture, a speed adapter locks a request's `steps` and `cfg`, and a request's `loras` list replaces the set before its picture runs. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins), [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins) and [MiniMax-H3-Image LoRA plug-ins](#minimax-h3-image-lora-plug-ins). |
 | `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--loras-dir <dir>` | Directory of text-model LoRA adapters, chosen per request with `"lora"` on `/v1/chat/completions` and `/v1/responses` (only `nemotron_h`, `mistral3` and `hunyuan-dense` on a single device apply them; anything else is a 400). An adapter is a llama.cpp GGUF adapter (`.gguf`, from `convert_lora_to_gguf.py`) or a `.safetensors` file whose tensors are named `<tensor>.lora_a` / `<tensor>.lora_b` after the base GGUF's tensors; a PEFT adapter as trained (`base_model.model...lora_A.weight` names) is refused with a pointer to that converter. Every adapter at the top level is loaded at startup, after the model, under its file name without the extension; one that does not load is logged with the reason and skipped. `POST /v1/loras` may load more, but only files inside this directory, named relative to it (an absolute path only when it is inside), and at most 32 adapters are held at once (409 beyond that). **Without it, `POST /v1/loras` answers 403**: earlier builds loaded any path the server could read. Keep the directory writable only by the operator. Not with `--embeddings`. Env: `TS_LORAS_DIR` (the flag wins). See [API_EXAMPLES](TensorSharp.Server.Host/API_EXAMPLES.md#text-model-lora-adapters-lora-v1loras). |
 | `--temperature <f>` | Sampling temperature (`0` = greedy) |
@@ -870,6 +880,7 @@ of quietly losing a setting.
 | `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: half the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota), capped at 64, on hosts with more than 8; all but one with 3 to 8; one with 2 or fewer (DeepSeek V4 / V4.1 and GLM-5.x on their native executors use every usable CPU once experts are offloaded, and GLM-5.x also on a GPU-less run). The server needs the other half for Kestrel, the scheduler and the accelerator submission threads; sizing this near the quota collapses throughput rather than degrading (20.7 tok/s at 64 threads vs 8.2 at 71 on a 95-CPU quota). Env: `TS_CPU_MOE_THREADS`. |
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--prompt-attention <path>` | Arithmetic of a prompt chunk's attention on `--backend cuda`: `int8` (the default where it runs; `f16` elsewhere), `f16` (the earlier default's kernels, bit for bit) or `f32acc` (see the CLI table above for what each runs and where). `int8` moves a few long code windows of issue #376's quality gates; `--prompt-attention f16` keeps the earlier numbers. Decode, verify and draft rows keep the 16-bit kernels. An unknown value is refused at startup. Env: `TS_PROMPT_ATTENTION` (the flag wins). |
+| `--diffusion-products <p>` | Arithmetic of a diffusion model's wide weight products on `--backend ggml_cuda` (MiniMax-H3-Image, MiniMax-H3 video, Qwen-Image 2.1): `bf16` (the default: as stored, BF16 and Q4_K on cuBLAS BF16), `int8` (the DiT's projections on int8 tensor cores, each weight row and token rounded to 8 bits: faster, and it changes the picture) or `int8-all` (`int8` plus the VAE decoders' F16 projections). Other backends run the products as stored (a warning says so). Config key `diffusion-products`; sets `TS_DIFFUSION_PRODUCTS`. Replaces `TS_H3_INT8_MATMUL` (`1` = `int8`, `all` = `int8-all`), which both hosts now refuse. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. The former second spellings `--paged-batching` / `--no-paged-batching` are removed and refused at startup on both hosts, also as config keys. |
 | `--no-webui` | Do not serve the bundled web UI or prefill its shared skills/tool prompt at startup; `GET /` answers the plain liveness text instead. Every HTTP API endpoint, `/uploads` included, stays up. Model kernel warmup and API prefix caching remain enabled. Env: `TS_NO_WEBUI` |
 | `--upload-max-mb <N>` | Per-file cap on client-originated writes: multipart `/api/upload` files and base64 attachments decoded out of chat or Jev requests (default: `500`). The request-body limit of `POST /api/upload` follows the cap and never drops below 500 MB, so raising the cap is how a larger file gets in: upload it there and reference it by path. Every other route keeps the 500 MB request-body limit, and a base64 file grows by about a third on the wire, so an attachment inside a JSON request tops out near 375 MB whatever the cap. Env: `TS_UPLOAD_MAX_MB`. |
@@ -1057,8 +1068,8 @@ the rest. Either way `--stop` sequences pinned on the server stay in force under
 
 ## Masked image editing
 
-Qwen-Image-2.1 edits a selected region while preserving the source dimensions and
-all unselected decoded RGBA pixels. The first image is the target; other images
+Qwen-Image-2.1 and MiniMax-H3-Image edit a selected region while preserving the source
+dimensions and all unselected decoded RGBA pixels. The first image is the target; other images
 remain references. For example:
 
 ```bash
@@ -1071,9 +1082,12 @@ The server's `/api/image-edit` and `/api/image-edit/stream` accept `maskPath`,
 `maskMode`, `maskInvert`, `maskFeather`, `maskCrop` and `maskCropPadding` in JSON.
 The non-streaming `/api/image-edit` also accepts a `mask` file and the same settings
 in multipart form data. Upload files used
-by JSON requests through `/api/upload` first. A mask requires Qwen-Image-2.1,
-an input image and matching source dimensions. See the [mask guide](docs/models/qwenimage21.md#precise-local-editing-with-a-mask)
-for selection semantics, sampling geometry, API examples and validation coverage.
+by JSON requests through `/api/upload` first. A mask requires an image model that takes
+masks (Qwen-Image-2.1 or MiniMax-H3-Image), an input image and matching source dimensions.
+See the [Qwen-Image-2.1 mask guide](docs/models/qwenimage21.md#precise-local-editing-with-a-mask)
+for selection semantics, sampling geometry, API examples and validation coverage, and
+[MiniMax-H3-Image's masked edits](docs/models/minimax-h3-image.md#masked-edits) for its
+sampling canvas (the 2048×2048 floor) and multi-reference edits.
 
 ### Keeping the source size
 
@@ -1294,6 +1308,66 @@ Where these differ from the Qwen-Image-2.1 plug-ins above:
 
 The [MiniMax-H3 card](docs/models/minimax-h3.md#turbo-plug-ins) covers the sigma
 grids, how the adapter is applied, the backends and what has been validated.
+
+### MiniMax-H3-Image LoRA plug-ins
+
+MiniMax-H3-Image takes LoRA adapters of its own type, `minimax-h3-image-lora`: any
+number of **style** adapters, each at its own strength, and at most one **speed**
+(step-distillation) adapter, whose config fixes the sampling. They are applied unmerged
+on top of the denoiser as it is stored (bf16, Q8_0 or Q4_K_M), on `ggml_cuda`,
+`ggml_metal` and `ggml_cpu`.
+
+```bash
+# pDMD: 2 transformer passes instead of 6 (the plug-in's recipe replaces the defaults)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-pdmd-2step.json \
+    --prompt "..." --width 2048 --height 2048 --output fast.png
+
+# A style adapter from config/lora/, and any LoRA file at a chosen strength, stacked
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-seedreamstyle.json \
+    --lora ./loras/my-style.safetensors --lora-scale 0.8 \
+    --prompt "seedreamstyle. A portrait of ..." --output styled.png
+
+# The server applies its startup set to every picture
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-image.json \
+    --lora config/lora/minimax-h3-image-pdmd-2step.json
+```
+
+| Plug-in | What it is |
+|---|---|
+| `minimax-h3-image-pdmd-2step.json` | pDMD 2-step (linoyts/MiniMax-H3-Image-pDMD-2steps): speed adapter, 2 steps on the sigmas `[1, 12/13, 0]`, the output heads in step order (`by-step`), guidance 1, generated at the asked size; trained around 1 MP. MiniMax-H3-Image Community License |
+| `minimax-h3-image-pdmd-2step-comfy.json` | pDMD 2-NFE, the ComfyUI-native conversion (akhaliq/minimax-h3-image-pdmd-2step): a different pDMD training from linoyts'; the same sigmas with ComfyUI's grid-interval heads. Its pictures carry a fine mesh pattern on the official stack: prefer the plug-in above |
+| `minimax-h3-image-seedreamstyle.json` | Seedreamstyle 6K (Nebsh/Seedreamstyle-H3-6K): a photographic style adapter (kohya names, rank 16); start the prompt with `seedreamstyle.`. MiniMax-H3-Image Community License |
+
+- **Files.** A plug-in config (`--lora config.json`, or `--lora <weights> --lora-config
+  <config>` when the config names those weights) or a bare `.safetensors` (a style
+  adapter at `--lora-scale`, default 1). The names may be diffusers PEFT
+  (`[transformer.]transformer_blocks.N.attn.to_q.lora_A.weight`), ComfyUI's native ones
+  (`diffusion_model.blocks.N.attn.qkv_proj.lora_A.weight`, `lora_down` / `lora_up`,
+  optional `.alpha`) or kohya's (`lora_unet_blocks_N_attn_qkv_proj.lora_down.weight`);
+  a file that mixes them is refused. Every tensor must be used: a name the model has no
+  place for fails the load with its reason (an AdaLN parameter, a DoRA magnitude, a
+  block out of range), all of a file's problems in one message.
+- **Alpha.** diffusers: the file's metadata (`alpha`, `lora_alpha` or PEFT's
+  `lora_adapter_metadata`), else the config's `"alpha"`, else the rank. ComfyUI and
+  kohya: each module's `.alpha` tensor, else the config's, else the rank (ComfyUI's rule).
+  A config alpha the file contradicts is refused.
+- **The speed contract is locked.** `--diffusion-steps` and `--cfg` (CLI) and a
+  request's `steps` and `cfg` may be unset or equal the plug-in's; anything else is
+  refused, never overridden (the CLI at startup, before anything downloads; a request
+  with a 400). A second speed adapter is refused.
+- **Strength.** `--lora-scale` (else the config's `"scale"`, else 1) multiplies alpha /
+  rank; it must be ≥ 0. A speed adapter at another strength than 1 logs that its
+  schedule was distilled at 1.
+- **Switching.** The server's startup set applies to every picture (it has no
+  per-request selection). A host that passes a picture its own plug-in set (the chat
+  service's `loras` list, which TensorAgent fills from its saved choices; its catalog
+  has no MiniMax-H3-Image entries yet) replaces the set before the picture runs, and
+  the previous set's factors and compiled steps are dropped first.
+
+The [MiniMax-H3-Image card](docs/models/minimax-h3-image.md#lora-plug-ins) covers how the
+updates are applied, the backends, the validation and the cost per step.
 
 ## Video generation with audio (LTX 2.5 Distilled)
 
@@ -2510,7 +2584,7 @@ load here" from "this is a bug":
 |---|---|---|
 | `0` | Success: the run finished, `--help` / `--list-skills` printed, or the server shut down cleanly. | — |
 | `1` | Configuration error: a removed flag, an unknown flag on the server (the CLI ignores flags it does not know), a bad value, a switch given a value (`--think=on`) or a value option with nothing after it, an unreadable `--config` file. On the CLI also a prompt that leaves no room for a reply in the model's context window (`MAX_CONTEXT`), including one an Agent Skills round grew past it; a reply that merely runs into the window ends there instead, as a length stop. | `Configuration error: <what is wrong>` |
-| `2` | Model load refused. | Exactly one line, the last one: `error: model load refused: <reason>` |
+| `2` | Model load refused; on the CLI also a one-shot request the loaded model refused before running it (an image whose phases need more device memory than the device has free). | Exactly one line, the last one: `error: model load refused: <reason>`, or `error: request refused: <reason>` for a request |
 | anything else | Not a refusal: a bug or a crash. An unhandled .NET exception prints its stack trace and, on Linux and macOS, exits `134` (SIGABRT); a process the OS killed reports its signal (`137` for an out-of-memory kill). | The stack trace. Report it. |
 
 **What counts as a refused load** (code `2`) is a decision the loader made on
@@ -2534,6 +2608,8 @@ and keeps its stack trace. One exception: the DeepSeek V4/V4.1 and GLM native
 whole-model loaders report every load they abandon as a refusal, including a
 weight or cache allocation that failed on a device, with their `[dsv4]`/`[glm]`
 line as the reason.
+
+**A refused request** (code `2`, CLI only) is a request the loaded model declined before running any of it, with the sizes in the reason: an image whose most demanding phase needs more device memory than the device has free even with every other component released (MiniMax-H3-Image at 4096x4096 with the Q5_K_M DiT on a 20 GB card, any size with Q8_0 there). On a running server the same refusal answers `507` with `{ "error": "<reason>" }` and the model stays loaded for the next request. A request that still runs out of device memory while it runs is not a refusal: an allocation the backend reports fails the request (a stack trace on the CLI, `500` on the server), and one that fails inside a ggml-cuda kernel ends the process (`134`).
 
 Before exiting with `2` the server releases what the refused load left behind
 (the model service and the ggml backend) and never opens its port. A refusal's
@@ -3108,7 +3184,7 @@ curl http://localhost:5000/v1/chat/completions -H "content-type: application/jso
 
 `TensorSharp.Server.Host` exposes three API styles — Ollama-compatible, OpenAI-compatible, and the Web UI's own SSE routes — plus the Jev typed-decision endpoint `POST /v1/systemone` for DiffusionGemma. See [API_EXAMPLES.md](TensorSharp.Server.Host/API_EXAMPLES.md) for full documentation with curl and Python examples.
 
-On TensorSharp.Server.Host, image and video models use dedicated media routes. Qwen-Image-2.1 answers `POST /api/image-generate` (text to image) and `POST /api/image-edit` (prompt, reference images and an optional mask), each with a `/stream` SSE variant that reports denoising progress; there is no `/v1/images/*` route. Video models use the routes described in [Video generation with audio (MiniMax-H3)](#video-generation-with-audio-minimax-h3). TensorAgent's own host routes media requests through its `/api/chat` turn manager to share the composer and saved conversations with text turns.
+On TensorSharp.Server.Host, image and video models use dedicated media routes. Qwen-Image-2.1 and MiniMax-H3-Image answer `POST /api/image-generate` (text to image) and `POST /api/image-edit` (prompt, reference images and an optional mask), each with a `/stream` SSE variant that reports denoising progress, and the OpenAI-shaped `POST /v1/images/generations` and `POST /v1/images/edits`. Video models use the routes described in [Video generation with audio (MiniMax-H3)](#video-generation-with-audio-minimax-h3). TensorAgent's own host routes media requests through its `/api/chat` turn manager to share the composer and saved conversations with text turns.
 
 **Ollama-compatible API:**
 

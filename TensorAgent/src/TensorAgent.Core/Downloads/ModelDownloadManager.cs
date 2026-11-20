@@ -187,10 +187,15 @@ public sealed class ModelDownloadManager : IDisposable
     /// that is what "resume" means here, and it resumes from the part file.
     /// </para>
     /// </summary>
+    /// <exception cref="LicenseAcceptanceRequiredException">The entry declares license terms that have not
+    /// been accepted (<see cref="ModelStore.NeedsLicenseAcceptance"/>): ask, record the answer, then start.</exception>
     public ModelDownloadStatus Start(CatalogModel model, IReadOnlyCollection<CatalogFileRole>? optionalRoles = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         if (!model.IsAvailable) throw new NotSupportedException(model.UnavailableReason);
+        // Refused here, not only by the store: a caller that did not ask for the terms gets the answer now,
+        // instead of a job that fails a moment later.
+        _store.EnsureLicenseAccepted(model);
         return StartJob(model.Id, optionalRoles,
             (progress, ct, roles) => _store.DownloadAsync(model, progress, ct, roles));
     }
@@ -278,6 +283,9 @@ public sealed class ModelDownloadManager : IDisposable
                 if (find(job.Status.ModelId) is not { } model)
                     continue;
                 if (!model.IsAvailable)
+                    continue;
+                // Accepted when it started; withdrawn since (a decline), it waits for the user to ask again.
+                if (_store.NeedsLicenseAcceptance(model))
                     continue;
                 _log.LogInformation("resuming the interrupted download of {Model}", model.Id);
                 // Preserve the transfer the user actually requested. In particular, an

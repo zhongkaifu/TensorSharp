@@ -180,6 +180,22 @@ namespace TensorSharp.Models
                     MiniMaxH3LoraConfig.CheckHostSettings(h3Specs, r.ModelPath, r.Sampling);
             }
 
+            // 6. The MiniMax-H3-Image plug-ins the model will take: one speed adapter at most, each config's weights tie and
+            //    strength, and the CLI's step and guidance flags against the speed adapter's contract (a server request names
+            //    its own, checked per request).
+            if (arch == null || arch.LoraPluginType == LoraCliFlags.MiniMaxH3ImagePluginType)
+            {
+                var (specs, types) = flagSpecs.Count > 0 ? (flagSpecs, flagTypes) : (envSpecs, envTypes);
+                var imageSpecs = specs
+                    .Where((_, i) => types[i].Known && (types[i].Type == LoraCliFlags.MiniMaxH3ImagePluginType ||
+                                                        (arch != null && types[i].Type == null)))
+                    .ToList();
+                if (imageSpecs.Count > 0)
+                    TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageLoraConfig.CheckHostSettings(imageSpecs,
+                        r.Host == LoraHost.Cli ? r.Sampling.Steps : 0, r.Sampling.StepsFlag,
+                        r.Host == LoraHost.Cli ? r.Sampling.Cfg : 0f, r.Sampling.CfgFlag);
+            }
+
             return new LoraHostVerdict(arch, warnings);
         }
 
@@ -233,7 +249,7 @@ namespace TensorSharp.Models
             $"{LoraCliFlags.EnvironmentVariable} names LoRA plug-ins ({names}), but {model} ({arch}) takes none; it runs without them.";
 
         internal static string NoPluginsRefusal(string model, string arch) =>
-            $"{LoraCliFlags.LoraFlag} applies to Qwen-Image-2.1 and MiniMax-H3 (FL2VA) models only; " +
+            $"{LoraCliFlags.LoraFlag} applies to Qwen-Image-2.1, MiniMax-H3 (FL2VA) and MiniMax-H3-Image models only; " +
             $"'{model}' ({arch}) does not take LoRA plug-ins.";
 
         // ---- helpers ----------------------------------------------------------------------------
@@ -270,10 +286,10 @@ namespace TensorSharp.Models
         }
 
         /// <summary>True when <paramref name="arch"/>'s model applies a plug-in that declares
-        /// <paramref name="declared"/>: its own type, and for Qwen-Image-2.1 bare weights too.</summary>
+        /// <paramref name="declared"/>: its own type, and for Qwen-Image-2.1 and MiniMax-H3-Image bare weights too.</summary>
         private static bool Takes(ModelArchitectureDescriptor arch, string? declared) =>
             declared == arch.LoraPluginType ||
-            (declared == null && arch.LoraPluginType == LoraCliFlags.QwenImagePluginType);
+            (declared == null && arch.LoraPluginType is LoraCliFlags.QwenImagePluginType or LoraCliFlags.MiniMaxH3ImagePluginType);
 
         private static ModelArchitectureDescriptor? Probe(string? modelPath)
         {
@@ -281,6 +297,9 @@ namespace TensorSharp.Models
                 return null;
             try
             {
+                // A safetensors release (MiniMax-H3-Image's bf16 denoiser) is claimed by its family from the header.
+                if (modelPath.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
+                    return ModelArchitectureRegistry.ResolveSafetensors(modelPath);
                 using var probe = new GgufFile(modelPath);
                 return ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
             }

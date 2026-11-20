@@ -316,7 +316,8 @@ namespace
             ggml_tensor* tensor,
             std::vector<WeightUploadInfo>& uploads,
             std::vector<BufferHandle>& ephem_buffers,
-            bool stream_only = false)
+            bool stream_only = false,
+            PendingDeviceCopies* pending = nullptr)
         {
             if (tensor == nullptr || host_data == nullptr || bytes == 0)
                 return false;
@@ -347,6 +348,7 @@ namespace
                         if (needs_upload)
                         {
                             uploads.push_back({tensor, host_data, bytes, true});
+                            if (pending != nullptr) pending->add(host_data);
                         }
                         return true;
                     }
@@ -1799,6 +1801,7 @@ namespace
         // stable.
         std::vector<BufferHandle> ephem_buffers;
         std::vector<WeightUploadInfo> uploads;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         bool hidden_in_zero_copy = false;
         bool hidden_out_zero_copy = false;
         // The output buffer in residual mode is the residual_in_out pointer;
@@ -1888,16 +1891,16 @@ namespace
         {
         bind_readonly_weight_3d(ctx, g_backend, dev, gate_data,
             static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers,
-            stream_experts);
+            stream_experts, &pending);
         if (!fused_gate_up && !single_projection_activation)
         {
             bind_readonly_weight_3d(ctx, g_backend, dev, up_data,
                 static_cast<std::size_t>(up_total_bytes), up_w, uploads, ephem_buffers,
-                stream_experts);
+                stream_experts, &pending);
         }
         bind_readonly_weight_3d(ctx, g_backend, dev, down_data,
             static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers,
-            stream_experts);
+            stream_experts, &pending);
         }
 
         // Allocate any tensors not bound above (hidden in/out fallback, ids,
@@ -1969,6 +1972,7 @@ namespace
                 ggml_backend_tensor_set(u.tensor, u.host_data, 0, u.bytes);
             }
         }
+        pending.commit();
 
         if (!hidden_in_zero_copy)
         {

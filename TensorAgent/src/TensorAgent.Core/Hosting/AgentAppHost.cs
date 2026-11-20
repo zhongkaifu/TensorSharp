@@ -125,7 +125,10 @@ public sealed class AgentAppHost : IDisposable
         // native screens and the page -- is in the language the user gets.
         Localization.Loc.Apply(settings);
 
-        Models = new ModelStore(paths.ResolveModelsDirectory(settings));
+        // What the user agreed to before a download that asks (CatalogModel.LicenseTerms), kept with the app's
+        // data rather than beside the models: a purge of the model cache must not forget it.
+        Licenses = new LicenseAcceptanceStore(paths.LicenseAcceptancesFile);
+        Models = new ModelStore(paths.ResolveModelsDirectory(settings)) { Licenses = Licenses };
         // Weights whose catalog entry is gone -- the previous quantization of an entry
         // that now points at a different file. Nothing else can reach them: the Models
         // list is built from the catalog, so a directory no entry claims has no row and
@@ -146,7 +149,7 @@ public sealed class AgentAppHost : IDisposable
         // transfer must not end because the user went back to the chat. See
         // ModelDownloadManager.
         Downloads = new ModelDownloadManager(Models, _loggerFactory.CreateLogger("TensorAgent.Downloads"));
-        Loras = new LoraStore(Paths.LorasDirectory);
+        Loras = new LoraStore(Paths.LorasDirectory) { Licenses = Licenses };
         Conversations = new ConversationStore(paths.ConversationsDirectory);
         Catalog = ModelCatalog.ForDevice(paths.DeviceMemoryGB);
 
@@ -452,6 +455,8 @@ public sealed class AgentAppHost : IDisposable
     public AgentPaths Paths { get; }
     public SettingsStore Settings { get; }
     public ModelStore Models { get; }
+    /// <summary>The license terms the user accepted, per entry and revision (see <see cref="CatalogLicenseTerms"/>).</summary>
+    public LicenseAcceptanceStore Licenses { get; }
     /// <summary>Every model download this launch started, independent of any screen.</summary>
     public ModelDownloadManager Downloads { get; }
     /// <summary>The LoRA plug-ins on this device (<see cref="LoraCatalog"/>).</summary>
@@ -3275,7 +3280,7 @@ public sealed class AgentAppHost : IDisposable
                     plan.Names.Count == 0 ? "none" : string.Join(", ", plan.Names),
                     plan.SatOut is null ? "" : $" ({plan.SatOut})");
             }
-            return ImageTurns.Preparation.Ready(plan.Specs, plan.Names);
+            return ImageTurns.Preparation.Ready(plan.Specs, plan.Names, plan.MinGenerationArea);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
@@ -3288,10 +3293,13 @@ public sealed class AgentAppHost : IDisposable
     /// <summary>The key a LoRA plug-in's download has in <see cref="Downloads"/>.</summary>
     public static string LoraDownloadKey(CatalogLora lora) => "lora:" + lora.Id;
 
-    /// <summary>Start the download of a plug-in's files, or rejoin the one running.</summary>
+    /// <summary>Start the download of a plug-in's files, or rejoin the one running. A plug-in under its base model's
+    /// license whose terms are not accepted is refused here, synchronously, before a job is made.</summary>
+    /// <exception cref="LoraLicenseAcceptanceRequiredException">The base model's terms are not accepted.</exception>
     public ModelDownloadStatus StartLoraDownload(CatalogLora lora)
     {
         ArgumentNullException.ThrowIfNull(lora);
+        Loras.EnsureLicenseAccepted(lora);
         return Downloads.Start(LoraDownloadKey(lora), (progress, ct) => Loras.DownloadAsync(lora, progress, ct));
     }
 
@@ -3548,6 +3556,8 @@ public sealed record AgentPaths(string DataRoot, string CacheRoot)
     /// <summary>The App Group inbox shared with the iOS extension, or empty.</summary>
     public string SharedInboxDirectory { get; init; } = string.Empty;
     public string SettingsFile => Path.Combine(DataRoot, "settings.json");
+    /// <summary>The license terms the user accepted before a download (<see cref="LicenseAcceptanceStore"/>).</summary>
+    public string LicenseAcceptancesFile => Path.Combine(DataRoot, "license-acceptances.json");
 
     public void EnsureCreated()
     {

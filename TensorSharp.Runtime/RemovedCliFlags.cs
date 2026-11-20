@@ -118,6 +118,14 @@ namespace TensorSharp.Runtime
             ("TS_WAN_VAE", "every video model reads TS_VIDEO_VAE (--video-vae)."),
             ("TS_WAN_TE", "every video model reads TS_VIDEO_TEXT_ENCODER (--video-text-encoder)."),
             ("TS_WAN_DIT2", "every video model reads TS_VIDEO_DIT2 (--video-dit2)."),
+            ("TS_H3_IMAGE_VAE_BATCH",
+                "MiniMax-H3-Image's VAE decoder sizes its own programs (a row of tiles, at most 64); the native decoder whose "
+                + "tiles a call it capped was removed with the legacy model."),
+            // A diffusion model's int8 products are an option (design D4), one spelling for MiniMax-H3-Image and video.
+            ("TS_H3_INT8_MATMUL",
+                "a diffusion model's int8 products on ggml_cuda are the option --diffusion-products (the config key "
+                + "diffusion-products): --diffusion-products int8 for the DiT's projections (the variable's 1), int8-all "
+                + "with the VAE decoders' too (its all); the VAE's alone (its vae) has no replacement."),
             ("DIFFUSION_CPU_LEGACY", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_MOE", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_PROJ", DiffusionCpuLegacyRemoved),

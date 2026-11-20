@@ -3970,6 +3970,7 @@ static int fused_glm_vision_encoder_f32_impl(
     ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
     struct HostBinding { ggml_tensor* tensor; const void* data; std::size_t bytes; };
     std::vector<HostBinding> upload_list;
+    tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
     auto bind_w = [&](ggml_tensor* t, const void* data, std::size_t bytes) {
         if (t == nullptr || data == nullptr) return;
         if (bytes >= 4096 && dev != nullptr)
@@ -3979,7 +3980,7 @@ static int fused_glm_vision_encoder_f32_impl(
             {
                 if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                 {
-                    if (need) upload_list.push_back({ t, data, bytes });
+                    if (need) { upload_list.push_back({ t, data, bytes }); pending.add(data); }
                     return;
                 }
                 invalidate_cached_buffer(const_cast<void*>(data));
@@ -4051,6 +4052,7 @@ static int fused_glm_vision_encoder_f32_impl(
         upload_binding(hidden_binding, hidden_desc.data, hidden_binding.raw_bytes);
     for (auto& u : upload_list)
         ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+    pending.commit();
     ggml_backend_tensor_set(cos_t, cos_table, 0, cos_sin_elems * sizeof(float));
     ggml_backend_tensor_set(sin_t, sin_table, 0, cos_sin_elems * sizeof(float));
 

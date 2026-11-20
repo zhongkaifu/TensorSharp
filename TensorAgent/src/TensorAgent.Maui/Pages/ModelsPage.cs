@@ -673,7 +673,33 @@ public sealed class ModelsPage : ContentPage
             return;
         }
 
+        if (!await LicenseAcceptedAsync(row.Model))
+            return;
         Download(row);
+    }
+
+    /// <summary>
+    /// For an entry whose license must be accepted before it downloads (<see cref="CatalogModel.LicenseTerms"/>),
+    /// show the terms and record the answer; true when the download may start. Every other entry answers true
+    /// at once, as before. A decline is recorded too (it withdraws an acceptance of these terms) and starts
+    /// nothing. The download manager refuses an unaccepted entry whoever starts it, so this is where the user is
+    /// asked, not the only check.
+    /// </summary>
+    private async Task<bool> LicenseAcceptedAsync(CatalogModel model)
+    {
+        if (!_app.Models.NeedsLicenseAcceptance(model))
+            return true;
+        bool accepted = await LicensePage.AskAsync(Navigation, model, _app.Licenses.AcceptedAnEarlierRevision(model));
+        if (!accepted)
+        {
+            _app.Licenses.Decline(model);
+            Console.WriteLine($"TensorAgent: license declined for {model.Id}; nothing downloaded");
+            return false;
+        }
+        CatalogLicenseTerms terms = model.LicenseTerms!;
+        _app.Licenses.Accept(model, terms.Revision);
+        Console.WriteLine($"TensorAgent: license {terms.Id} {terms.Revision[..12]} accepted for {model.Id}");
+        return true;
     }
 
     /// <summary>
@@ -729,6 +755,8 @@ public sealed class ModelsPage : ContentPage
             return;
         }
 
+        if (!await LicenseAcceptedAsync(row.Model))
+            return;
         row.BeginVisionDownload();
         _app.Downloads.Start(row.Model, new[] { CatalogFileRole.Projector });
     }
@@ -754,6 +782,8 @@ public sealed class ModelsPage : ContentPage
             return;
         }
 
+        if (!await LicenseAcceptedAsync(row.Model))
+            return;
         row.BeginDownload();
         _app.Downloads.Start(row.Model, new[] { CatalogFileRole.Draft });
     }
@@ -777,6 +807,8 @@ public sealed class ModelsPage : ContentPage
             return;
         }
 
+        if (!await LicenseAcceptedAsync(row.Model))
+            return;
         row.BeginDownload();
         _app.Downloads.Start(row.Model, new[] { CatalogFileRole.IngredientsLora });
     }

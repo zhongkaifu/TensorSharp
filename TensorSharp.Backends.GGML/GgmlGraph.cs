@@ -35,6 +35,10 @@ namespace TensorSharp.GGML
         MoeHostExperts = 54, LightningIndexer = 55, TopKMask = 56,
         /// <summary>A tensor-parallel partial, summed in place across the ranks of <see cref="GgmlGraph.RunRanked"/>.</summary>
         AllReduce = 57,
+        /// <summary>ggml_conv_2d: kernel [KW, KH, IC, OC], x [W, H, IC, N]; ip s0, s1, p0, p1, d0, d1.</summary>
+        Conv2d = 58,
+        /// <summary>ggml_pad_reflect_1d: x; ip p0, p1.</summary>
+        PadReflect1d = 59,
         /// <summary>A depthwise 2-D convolution of rows of channels (GraphOp.DepthwiseConv2d).</summary>
         DepthwiseConv2d = 70,
         /// <summary>The exact GELU, 0.5 x (1 + erf(x / sqrt 2)) (ggml_gelu_erf).</summary>
@@ -93,6 +97,15 @@ namespace TensorSharp.GGML
 
         public bool IsBuilt { get; private set; }
 
+        /// <summary>The program's products have thousands of rows (<see cref="TensorSharp.Graph.GraphProgram.WideTokenProducts"/>):
+        /// on ggml_cuda the run takes the DiT offload's wide routes and the diffusion-transformer regions are served as its
+        /// fused nodes. Before the first node.</summary>
+        public void MarkWideTokenProducts()
+        {
+            if (GgmlNative.TSGgml_GraphWideTokenProducts(Handle, 1) == 0)
+                throw new InvalidOperationException("ggml graph WideTokenProducts failed: " + GgmlBasicOps.LastNativeError());
+        }
+
         /// <summary>Nodes emitted so far.</summary>
         public int NodeCount { get; private set; }
 
@@ -118,7 +131,13 @@ namespace TensorSharp.GGML
 
         /// <summary>A fused region of <paramref name="kind"/> (GraphFusion) begins: true when a device operation computes
         /// it (its ops up to <see cref="FusedEnd"/> are numbered but not built).</summary>
-        public unsafe bool FusedBegin(int kind, ReadOnlySpan<int> srcs, ReadOnlySpan<long> ip, ReadOnlySpan<float> fp)
+        public bool FusedBegin(int kind, ReadOnlySpan<int> srcs, ReadOnlySpan<long> ip, ReadOnlySpan<float> fp)
+            => FusedBegin(kind, srcs, ip, fp, out _);
+
+        /// <summary>As <see cref="FusedBegin(int, ReadOnlySpan{int}, ReadOnlySpan{long}, ReadOnlySpan{float})"/>;
+        /// <paramref name="lowered"/> is true when the backend builds the region as graph nodes of its own instead of its ops
+        /// (GraphFusion.DitAttention: MiniMax-H3's attention nodes), which no device operation serves.</summary>
+        public unsafe bool FusedBegin(int kind, ReadOnlySpan<int> srcs, ReadOnlySpan<long> ip, ReadOnlySpan<float> fp, out bool lowered)
         {
             fixed (int* ps = srcs)
             fixed (long* pi = ip)
@@ -126,6 +145,7 @@ namespace TensorSharp.GGML
             {
                 int served = GgmlNative.TSGgml_GraphFusedBegin(Handle, kind, ps, srcs.Length, pi, ip.Length, pf, fp.Length);
                 if (served < 0) throw new InvalidOperationException("ggml graph fused region failed: " + GgmlBasicOps.LastNativeError());
+                lowered = served == 2;
                 return served == 1;
             }
         }
@@ -356,5 +376,25 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static unsafe partial int TSGgml_GraphFusedEnd(IntPtr graph, int* results, int nresults);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial int TSGgml_GraphWideTokenProducts(IntPtr graph, int on);
+
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static unsafe partial int TSGgml_GraphPreloadWeights(GgmlPreloadWeight* items, int count, string tag, int* uploaded);
+    }
+
+    /// <summary>One weight of TSGgml_GraphPreloadWeights (ggml_ops_graph_builder.cpp's TSGgmlPreloadWeight): its host bytes,
+    /// their count, the ggml type and up to four extents.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct GgmlPreloadWeight
+    {
+        public IntPtr Data;
+        public long Bytes;
+        public int Type;
+        public int Nd;
+        public fixed long Ne[4];
     }
 }

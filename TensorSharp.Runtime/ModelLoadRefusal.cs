@@ -41,6 +41,25 @@ namespace TensorSharp.Runtime
     }
 
     /// <summary>
+    /// A request a loaded model declined on purpose before running it, with a reason the caller can act on: an image
+    /// request whose phases need more device memory than the device has free (the diffusion runtime's residency plan).
+    /// Like <see cref="ModelLoadRefusedException"/> it is a decision, not a bug: the CLI prints one error line and exits
+    /// with <see cref="HostExitCodes.RequestRefused"/>, the server answers with the reason (HTTP 507), without a stack
+    /// trace.
+    /// </summary>
+    public sealed class RequestRefusedException : InvalidOperationException
+    {
+        public RequestRefusedException(string message)
+            : base(message)
+        {
+        }
+
+        /// <summary>The one line the CLI prints to stderr before exiting with <see cref="HostExitCodes.RequestRefused"/>.</summary>
+        public static string FormatErrorLine(string reason)
+            => "error: request refused: " + ModelLoadRefusal.ToSingleLine(reason);
+    }
+
+    /// <summary>
     /// Process exit codes shared by <c>TensorSharp.Server</c> and <c>TensorSharp.Cli</c>.
     /// Documented in USAGE.md ("Exit codes"); scripts depend on these numbers, so they
     /// never change meaning.
@@ -58,6 +77,12 @@ namespace TensorSharp.Runtime
         /// The reason is the last line on stderr.
         /// </summary>
         public const int ModelLoadRefused = 2;
+
+        /// <summary>
+        /// The CLI's one-shot request was refused before it ran (<see cref="RequestRefusedException"/>): the same code as a
+        /// refused load, since the model cannot do that run on this machine; the reason is the last line on stderr.
+        /// </summary>
+        public const int RequestRefused = ModelLoadRefused;
     }
 
     /// <summary>
