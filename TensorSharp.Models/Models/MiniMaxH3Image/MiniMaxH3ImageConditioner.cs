@@ -225,7 +225,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         }
 
         /// <summary>Whether an edit's sequence runs the trunk's flash attention instead (a measurement seam; ggml-cuda's
-        /// flash kernel sums V in half precision, rel. L2 0.09-0.21 from the F32 scores at 1-4K rows).</summary>
+        /// flash kernel sums V in half precision: rel. L2 0.09 from the whole F32 scores at 1,076 rows on an A40).</summary>
         internal bool FlashAttentionForPictures { get; set; }
 
         /// <summary>The query block an edit's attention uses instead of <see cref="QueryChunkFor"/> (a measurement seam; 0 is

@@ -508,10 +508,17 @@ noted where it differs.
    70 GB: the native trunk gained an opt-in query-block attention, used for picture sequences
    only, so text to image and H3 video keep their graph. Past 1 GiB of scores it materializes
    them a block of query rows at a time, each block against only the keys it can see: the same
-   F32 scores and softmax, in `[keys, rows, heads]` pieces. A first cut used
-   `ggml_flash_attn_ext`, but ggml-cuda's tensor-core kernel sums V in half precision
-   (`fattn-mma-f16.cuh`'s half2 VKQ tiles), which moved the layer-50 state off the F32 scores
-   by rel. L2 0.09 at 1,076 rows and 0.21 at 4,182 on the A40.) The conditioning is the layer-50 hidden state of every
+   F32 scores and softmax, in `[keys, rows, heads]` pieces; at one picture (1,076 rows, whole
+   scores) the graph is text to image's, and 256-row blocks reproduce it bit for bit on the A40.
+   A first cut used `ggml_flash_attn_ext`, but ggml-cuda's tensor-core kernel sums V in half
+   precision (`fattn-mma-f16.cuh`'s half2 VKQ tiles): rel. L2 0.09 from the whole scores at
+   1,076 rows. Past a few thousand rows nothing is a reference, though: with the Q4_K_M encoder
+   on ggml_cuda, block sizes that differ only in their GEMMs' TF32 rounding already disagree by
+   rel. L2 0.03-0.34 at 4,182 rows, so on that backend the layer-50 state of a long picture
+   sequence is only determined to that precision. On ggml_metal the same variants agree to
+   2-4e-3 (flash 2.2e-3, 1,002-row blocks 3.8e-3 from the whole scores), which points at
+   ggml-cuda's quantized products and their 8-bit activations, against rows whose activations
+   reach the thousands, as the amplifier (not yet confirmed).) The conditioning is the layer-50 hidden state of every
    row. **Token tags:** label and prompt rows are text (1); every row of a vision block,
    including its start and end markers, is image (0). That matches `MiniMaxH3ImageLayout`'s
    `textTokenModalities` comment.

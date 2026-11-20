@@ -568,9 +568,8 @@ struct TSGgmlMiniMaxH3TextEncodeDesc
     std::int32_t num_deepstack;
     // 1 = the causal attention through ggml_flash_attn_ext (F16 K/V with h3_attend's power-of-two V pre-scale, an F16
     // causal mask) instead of the materialized [seq, seq, heads] F32 scores. 0 builds the graph this function has always
-    // built. ggml-cuda's tensor-core kernel sums V in half precision (fattn-mma-f16.cuh's half2 VKQ tiles), which over
-    // thousands of keys moves the trunk's output well past its F32 scores (rel. L2 0.09 at 1,076 rows, 0.21 at 4,182);
-    // query_chunk is the exact alternative.
+    // built. ggml-cuda's tensor-core kernel sums V in half precision (fattn-mma-f16.cuh's half2 VKQ tiles): the trunk's
+    // output moved by rel. L2 0.09 from its F32 scores at 1,076 rows on an A40. query_chunk keeps the F32 scores.
     std::int32_t flash_attention;
     // > 0 (and below seq, flash_attention 0) = the materialized attention a block of query_chunk query rows at a time,
     // each against only the keys it can see: the same F32 scores, softmax and products as the whole [seq, seq, heads]
