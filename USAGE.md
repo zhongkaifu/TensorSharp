@@ -3171,7 +3171,9 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 # Responses API. "input" is a string or an item array, "instructions" the system
 # text, "max_output_tokens" the limit; the completed response is stored (unless
 # "store": false) and GET /v1/responses/{id} returns it. Each request stands alone:
-# previous_response_id is rejected with 400.
+# previous_response_id is rejected with 400. "reasoning": {"effort": "high"} turns
+# thinking on ("none" keeps it off), and the reasoning is a "reasoning" output item
+# before the message.
 curl -X POST http://localhost:5000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "input": "Name three prime numbers.", "max_output_tokens": 128}'
@@ -3192,10 +3194,23 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 # the only lever over how long it reasons. An explicit "think": false with no
 # reasoning_effort renders at "low". GLM-5.3-Flash also renders this field:
 # "low" / "high" select Low / High; omitted or "medium" select Max.
-# Other families accept the field and ignore it.
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-oss-20b-Q8_0.gguf", "messages": [{"role": "user", "content": "What is 17 + 25?"}], "reasoning_effort": "low", "max_tokens": 256}'
+
+# Thinking on a hybrid model (Qwen 3.5 / 3.6 / 3.8, Gemma 4, ...). Thinking is off
+# unless the request asks: "think": true, "chat_template_kwargs": {"enable_thinking": true},
+# or a reasoning_effort other than "none" (what the OpenAI SDKs and
+# Microsoft.Extensions.AI's ChatOptions.Reasoning send). "none" keeps it off, and an
+# explicit think / enable_thinking decides when both are sent. The Qwen3.8-27B and
+# Qwen3.8 Flash Next GGUF templates render the level too: "low" asks for brief
+# thinking, "medium" adds nothing, and "high" or no level asks for careful thinking.
+# The reasoning comes back as message.reasoning_content, or as delta.reasoning_content
+# chunks when streaming; /v1/responses returns it as a "reasoning" output item. See
+# "Chat Completions with reasoning (thinking)" in API_EXAMPLES.md.
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3.8-9B-Q6_K", "messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": "high", "max_tokens": 4096}'
 
 # Structured outputs (OpenAI response_format)
 #

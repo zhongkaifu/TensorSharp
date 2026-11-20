@@ -641,6 +641,60 @@ data: [DONE]
 `/v1/responses` 发送同样的注释，`/api/chat/ollama` 发送 message 为空的分块
 （`"message":{"role":"assistant","content":""}`，`"done":false`）。
 
+### Chat Completions + 推理（思维链）
+
+能思考的模型（Qwen 3.5 / 3.6 / 3.8、Gemma 4、Nemotron-H、DeepSeek V4.1 等）默认关闭思考作答，
+除非请求要求开启。以下任一方式即可开启：
+
+- `"think": true`（TensorSharp 与 Ollama 的字段）；
+- `"chat_template_kwargs": {"enable_thinking": true}`（llama.cpp、vLLM 与 SGLang 读取的字段）；
+- `"reasoning_effort"` 取 `"none"` 以外的级别。OpenAI SDK 为推理模型发送的正是这个字段，
+  Microsoft.Extensions.AI 的 `ChatOptions.Reasoning` 也是如此（见下文 .NET 一节）。`"none"` 表示不思考。
+
+请求同时发送 `think` 或 `enable_thinking` 时，以该开关为准：`"think": false, "reasoning_effort": "high"`
+不会思考。会渲染级别的模板（GPT-OSS、GLM-5.3-Flash，以及 Qwen3.8-27B 与 Qwen3.8 Flash Next 的 GGUF 模板）
+收到的级别为 `low`、`medium` 或 `high`；`minimal` 按 `low`、`xhigh` 按 `high` 处理。没有级别的模板
+（Qwen 3.5 / 3.6、Qwen3.8-9B 蒸馏版）上，`none` 以外的各级别思考方式相同。
+
+```bash
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.8-9B-Q6_K",
+    "messages": [{"role": "user", "content": "What is 17 * 23?"}],
+    "reasoning_effort": "high",
+    "max_tokens": 4096
+  }'
+```
+
+推理内容与答案分开返回，绝不混入 `content`。非流式回复放在 `message.reasoning_content` 中，
+`message.thinking` 是同一段文本（该路由最早使用的字段名）：
+
+```json
+"message": {
+  "role": "assistant",
+  "content": "17 × 23 = 391.",
+  "reasoning_content": "17 × 20 = 340 and 17 × 3 = 51, so 340 + 51 = 391.",
+  "thinking": "17 × 20 = 340 and 17 × 3 = 51, so 340 + 51 = 391."
+}
+```
+
+流式回复在 `delta.content` 分块之前以 `delta.reasoning_content` 分块发送：
+
+```
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"reasoning_content":"17 × 20 = 340"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"17 × 23 = 391."},"finish_reason":null}]}
+```
+
+llama.cpp 服务端、vLLM 与 DeepSeek API 返回的也是这些字段；OpenAI .NET 技术栈
+（Microsoft.Extensions.AI.OpenAI 10.4.0 及以后）把它们转换为 `TextReasoningContent`。
+之前轮次的推理内容以助手消息上的 `reasoning_content` 发回，模板会把它渲染到模型训练时看到它的位置。
+
+在 JSON 语法从第一个 token 起生效的模型族上（即结构化输出说明中未列出的模型族），
+`response_format` 与 `reasoning_effort` 同时出现时关闭思考运行，服务端记录一次日志；
+这些模型族上 `"think": true` 与 `response_format` 同时出现仍返回 HTTP 400。
+
 ### Chat Completions + JSON 模式
 
 ```bash
@@ -857,7 +911,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 
 - **除非请求要求，否则不加服务端工具。** 不加入技能目录、技能工具、`--code-exec` 工具与子智能体工具。`"skills": ["pdf"]` 提供所点名的技能（不公布目录中的其他技能），`"skills_discovery": true` 提供目录；在 `--code-exec` 下两者都会带上代码工具。`"multi_agent": true` 在服务端允许时提供委派。没有这条规则时，pi 的每一轮都带着服务端的技能目录和另外七个工具：同一句 "hello" 的提示从 3,798 个 token 涨到 6,843 个；让 4B 模型读一个文件时，它先调用了八次 `skills_list`，最后回答看不到该文件（issue #285）。
 - **`developer` 即 `system`。** 对配置了 `"reasoning": true` 的模型，pi 用 `developer` 消息发送指令。只认识 `system` 的模板（例如 Qwen 3.5 的模板）以前会不报错地丢掉这条消息；现在它按 system 消息渲染，与 llama.cpp 一致。GPT-OSS（Harmony）、DeepSeek V4/V4.1、MiniMax-M3、GLM-5.x 与 Gemma 4 保留各自对该角色的处理。
-- **思考。** `"think": true` 与 `"chat_template_kwargs": {"enable_thinking": true}` 是同一个开关；pi 的 `qwen-chat-template` 思考格式发送后者。`reasoning_effort` 也接受 OpenAI 的 `none`、`minimal` 与 `xhigh`。
+- **思考。** `"think": true` 与 `"chat_template_kwargs": {"enable_thinking": true}` 是同一个开关；pi 的 `qwen-chat-template` 思考格式发送后者。两者都未发送时，`none` 以外的 `reasoning_effort` 开启思考，因此配置了 `"reasoning": true` 而没有 `thinkingFormat` 的 pi 模型（它会发送 `reasoning_effort`）会思考。`reasoning_effort` 也接受 OpenAI 的 `none`、`minimal` 与 `xhigh`。
 - **用量就是实际提示。** 中间没有服务端的内部轮次，`prompt_tokens` 就是客户端所发提示的大小；pi 把这个数当作上下文占用。
 
 服务端以 `MAX_CONTEXT=16384 ... --max-tokens 8192` 启动时，pi 的 `models.json`（`~/.pi/agent/models.json`）：
@@ -930,8 +984,8 @@ print(response.choices[0].message.content)
 ### Responses API（`/v1/responses`）
 
 `POST /v1/responses` 接受 OpenAI Responses 形式：`input`（字符串或输入项数组），以及可选的
-`instructions`、`max_output_tokens`、`stream`、`store`、`reasoning`（任意对象即开启思维链；
-`reasoning.effort` 作为推理强度读取）、`tools`，并以 `text.format` 代替 `response_format`。
+`instructions`、`max_output_tokens`、`stream`、`store`、`reasoning`（对象即开启思维链，
+`{"effort": "none"}` 除外；`reasoning.effort` 作为推理强度读取）、`tools`，并以 `text.format` 代替 `response_format`。
 采样字段与 Chat Completions 的顶层字段相同，`skills`、`skills_discovery` 与 `multi_agent`
 字段在这里同样可用。
 
@@ -977,6 +1031,25 @@ curl -X POST http://localhost:5000/v1/responses \
 带类型的 SSE 事件（`response.created`、`response.output_item.added`、
 `response.output_text.delta`……`response.completed`，失败时为 `response.failed`）。
 
+开启思考时，`output` 以一个 `reasoning` 项开头，其 `summary` 以一个 `summary_text` 片段承载模型的
+完整推理内容。没有另外的精简摘要：`summary` 是 OpenAI API 填写、其 SDK 读取的字段。
+
+```json
+"output": [
+  {"id": "rs_...", "type": "reasoning", "status": "completed",
+   "summary": [{"type": "summary_text", "text": "17 × 20 = 340 and 17 × 3 = 51 ..."}]},
+  {"id": "msg_...", "type": "message", "status": "completed", "role": "assistant",
+   "content": [{"type": "output_text", "text": "17 × 23 = 391.", "annotations": []}]}
+]
+```
+
+流式时先发送推理项，与 OpenAI 流式发送推理摘要的方式相同：`response.output_item.added`（`reasoning` 项）、
+`response.reasoning_summary_part.added`、每段一个 `response.reasoning_summary_text.delta`、
+`response.reasoning_summary_text.done`、`response.reasoning_summary_part.done` 与 `response.output_item.done`；
+消息项随后位于下一个 `output_index`。`usage.output_tokens_details.reasoning_tokens` 统计推理 token。
+在 `input` 中放在助手消息之前发回的 `reasoning` 项即该消息的推理内容，与 Chat Completions 上的
+`reasoning_content` 相同；读取其 `summary_text` 片段，没有摘要时读取 `reasoning_text` 内容片段。
+
 除非请求发送 `"store": false`，完成的响应都会被保存，可通过 `GET /v1/responses/{id}` 再次
 获取（响应已不在存储中时返回 404）。存储默认在内存中，受 `TS_RESPONSES_STORE_TTL_MINUTES`（默认 60）与
 `TS_RESPONSES_STORE_MAX_ENTRIES`（默认 1000）限制；服务启动时传入 `--redis-url` 或设置
@@ -989,6 +1062,89 @@ curl -X POST http://localhost:5000/v1/responses \
 `video_url` 的模型族（DeepSeek V4.1、Qwen 3.8 Flash Next、LFM3-Omni）使用
 `{"type": "input_video", "input_video": {"url": "data:video/mp4;base64,...", "fps": 1, "max_frames": 16}}`——
 即 embeddings API 的 `input_video` 片段，并带有 `video_url` 的可选抽帧字段。其他模型族以 HTTP 400 拒绝 `input_video`。
+
+### .NET：OpenAI SDK、Microsoft.Extensions.AI 与 Agent Framework
+
+官方 `OpenAI` 包、`Microsoft.Extensions.AI.OpenAI`（MEAI）与 `Microsoft.Agents.AI.OpenAI`
+（Microsoft Agent Framework）只需改用本服务的地址即可使用。`ChatOptions.Reasoning` 请求思考，
+推理内容以 `TextReasoningContent` 返回，与答案的 `TextContent` 分开。在 `ChatClient`
+（Chat Completions）上，MEAI 把级别作为 `reasoning_effort` 发送并读取 `reasoning_content`；在
+`ResponsesClient`（Responses API）上发送 `reasoning.effort` 并读取推理项。两种客户端、流式与非流式、
+智能体与 `IChatClient` 均可：
+
+```csharp
+// dotnet add package OpenAI
+// dotnet add package Microsoft.Extensions.AI.OpenAI
+// dotnet add package Microsoft.Agents.AI.OpenAI
+using System.ClientModel;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
+using OpenAI;
+using OpenAI.Chat;
+
+var options = new OpenAIClientOptions { Endpoint = new Uri("http://localhost:5000/v1") };
+var client = new ChatClient("Qwen3.8-9B-Q6_K", new ApiKeyCredential("not-needed"), options);
+
+var agentOptions = new ChatClientAgentOptions
+{
+    Name = "LeadAgent",
+    ChatOptions = new ChatOptions
+    {
+        Instructions = "你是一个助手",
+        // 以 reasoning_effort "high" 发送：开启思考。ReasoningEffort.None 关闭思考。
+        Reasoning = new() { Effort = ReasoningEffort.High },
+    },
+};
+AIAgent agent = client.AsAIAgent(agentOptions);
+
+await foreach (AgentResponseUpdate update in agent.RunStreamingAsync("c#写一个计算当前月天数的方法"))
+{
+    foreach (AIContent content in update.Contents)
+    {
+        switch (content)
+        {
+            case TextReasoningContent reasoning:
+                Console.ForegroundColor = ConsoleColor.Blue;
+                Console.Write(reasoning.Text);
+                Console.ResetColor();
+                break;
+            case TextContent text:
+                Console.Write(text.Text);
+                break;
+        }
+    }
+}
+```
+
+`client.AsIChatClient()` 的 `GetStreamingResponseAsync` 与 `GetResponseAsync` 得到相同的内容
+（非流式的 `ChatResponse` 在文本旁带一个 `TextReasoningContent`）。Responses API 的用法相同：
+
+```csharp
+using OpenAI.Responses;
+
+#pragma warning disable OPENAI001 // Responses 客户端标记为实验性
+ResponsesClient responses = new OpenAIClient(new ApiKeyCredential("not-needed"), options).GetResponsesClient();
+AIAgent agent = responses.AsAIAgent(agentOptions, model: "Qwen3.8-9B-Q6_K");   // 或 responses.AsIChatClient("Qwen3.8-9B-Q6_K")
+```
+
+通过 Microsoft.Extensions.AI.OpenAI 11.0.0 进行的流式 Responses 调用需要它编译时所用的 `OpenAI`
+包版本 2.14.0。OpenAI 2.15.0 改变了 `ResponsesClient.CreateResponseStreamingAsync` 的返回类型，
+因此使用 2.15.0 时 MEAI 的流式 Responses 调用在发出请求前就会抛出 `MissingMethodException`。
+这是客户端包的问题，与服务端无关；Chat Completions 在两个版本下都可用。
+
+本服务在 Responses 请求之间不保存对话（`previous_response_id` 返回 HTTP 400）。`ResponsesClient`
+上的智能体会话在开启存储输出时以 `previous_response_id` 继续第二轮，因此多轮会话请关闭存储输出，
+每轮都会发送完整历史：
+
+```csharp
+#pragma warning disable MAAI001
+IChatClient chat = responses.AsIChatClientWithStoredOutputDisabled("Qwen3.8-9B-Q6_K");
+AIAgent agent = new ChatClientAgent(chat, agentOptions);
+```
+
+`ChatClient` 上的会话无需任何设置：Chat Completions 每次都发送历史。
+[`eng/validation/OpenAISdkReasoningRepro`](../eng/validation/OpenAISdkReasoningRepro/Program.cs)
+会对服务端逐一运行上述各条路径，并报告每条路径收到的内容。
 
 ### 子智能体（`multi_agent`）
 
@@ -1943,9 +2099,9 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 | `stop`              | string/array| null    | 停止序列                            |
 | `ignore_eos`        | bool        | false   | 非标准（与 vLLM / SGLang / llama.cpp 拼写相同）：遇到结束 token 也继续生成，直到 `max_tokens`，用于定长基准测试。该请求的重复保护也随之关闭，只有 token 上限和请求自己的 `stop` 字符串会结束它；结束 token 计入 `usage.completion_tokens`，其标记文本不进入回复。必须是布尔值（否则返回 HTTP 400） |
 | `response_format`   | object      | null    | `text`、`json_object` 或 `json_schema` |
-| `think`             | bool        | false   | 非标准扩展：启用思维链 / 推理解析（以 `reasoning_content` 返回 / 流式输出） |
+| `think`             | bool        | false   | 非标准扩展：开启思考，推理内容以 `reasoning_content` 返回 / 流式输出。未发送时，`none` 以外的 `reasoning_effort` 也会开启思考 |
 | `chat_template_kwargs` | object  | null    | llama.cpp / vLLM / SGLang 的约定。只读取 `enable_thinking`（bool），与 `think` 是同一个开关；`think` 与 `enable_thinking` 不一致时返回 HTTP 400。其他键被忽略，服务端对每个键记录一次日志 |
-| `reasoning_effort`  | string      | null    | `low`、`medium` 或 `high`；OpenAI 的 `none` 与 `minimal` 按 `low`、`xhigh` 按 `high` 处理。只有带强度行的模型族（GPT-OSS、GLM-5.3-Flash）会渲染，其他模型族忽略；其他取值返回 HTTP 400。在 GPT-OSS 上，`"think": false`（或 `enable_thinking: false`）且未指定强度时按 `low` 处理 |
+| `reasoning_effort`  | string      | null    | `low`、`medium` 或 `high`；OpenAI 的 `none` 与 `minimal` 按 `low`、`xhigh` 按 `high` 处理。未发送 `think` / `enable_thinking` 时，`none` 以外的级别开启思考，`none` 保持关闭。只有带强度行的模板（GPT-OSS、GLM-5.3-Flash、Qwen3.8-27B 与 Qwen3.8 Flash Next 的 GGUF）会渲染级别，其他模型族忽略级别；其他取值返回 HTTP 400。在 GPT-OSS 上，`"think": false`（或 `enable_thinking: false`）且未指定强度时按 `low` 处理 |
 | `tool_choice`       | string/object | `auto` | Chat Completions：`auto`、`none`（不提供任何工具，包括内置技能、代码与子智能体工具）、`required`，或 `{"type": "function", "function": {"name": ...}}`；后两者须指向客户端声明的 `tools`（否则返回 HTTP 400），且只有 DeepSeek V4.1 会用工具调用语法强制执行，其他模型族接受该值但仍可能不调用工具直接作答 |
 | `parallel_tool_calls` | bool      | null    | Chat Completions：必须是布尔值（否则返回 HTTP 400）；只有 DeepSeek V4.1 会遵循 `false`（其工具调用语法只允许一次调用），其他模型族接受但忽略 |
 

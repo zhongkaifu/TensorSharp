@@ -694,6 +694,65 @@ idle timeout does not cut it. SSE clients skip it:
 `/v1/responses` sends the same comment, and `/api/chat/ollama` sends a chunk
 with an empty message (`"message":{"role":"assistant","content":""}`, `"done":false`).
 
+### Chat Completions with reasoning (thinking)
+
+A model that can think (Qwen 3.5 / 3.6 / 3.8, Gemma 4, Nemotron-H, DeepSeek V4.1, ...)
+answers with thinking off unless the request asks for it. Any one of these asks:
+
+- `"think": true` (TensorSharp's and Ollama's field);
+- `"chat_template_kwargs": {"enable_thinking": true}` (what llama.cpp, vLLM and SGLang read);
+- `"reasoning_effort"` with a level other than `"none"`. This is the field the OpenAI SDKs
+  send for a reasoning model, Microsoft.Extensions.AI's `ChatOptions.Reasoning` among them
+  (see [.NET](#net-openai-sdk-microsoftextensionsai-and-agent-framework)). `"none"` asks not to think.
+
+When a request sends `think` or `enable_thinking` too, that switch decides:
+`"think": false, "reasoning_effort": "high"` does not think. Templates that render the level
+(GPT-OSS, GLM-5.3-Flash, and the Qwen3.8-27B and Qwen3.8 Flash Next GGUF templates) receive
+it as `low`, `medium` or `high`; `minimal` reads as `low` and `xhigh` as `high`. On a template
+without a level (Qwen 3.5 / 3.6, the Qwen3.8-9B distill), every level but `none` thinks the same.
+
+```bash
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.8-9B-Q6_K",
+    "messages": [{"role": "user", "content": "What is 17 * 23?"}],
+    "reasoning_effort": "high",
+    "max_tokens": 4096
+  }'
+```
+
+The reasoning comes back beside the answer, never inside `content`. A non-streamed reply
+carries it as `message.reasoning_content`, and as `message.thinking`, the same text under
+the name this route used first:
+
+```json
+"message": {
+  "role": "assistant",
+  "content": "17 × 23 = 391.",
+  "reasoning_content": "17 × 20 = 340 and 17 × 3 = 51, so 340 + 51 = 391.",
+  "thinking": "17 × 20 = 340 and 17 × 3 = 51, so 340 + 51 = 391."
+}
+```
+
+A stream sends it as `delta.reasoning_content` chunks before the `delta.content` chunks:
+
+```
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"reasoning_content":"17 × 20 = 340"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"17 × 23 = 391."},"finish_reason":null}]}
+```
+
+These are the fields llama.cpp's server, vLLM and DeepSeek's API return, and the ones the
+OpenAI .NET stack (Microsoft.Extensions.AI.OpenAI 10.4.0 and later) turns into
+`TextReasoningContent`. Send an earlier turn's reasoning back as `reasoning_content` on its
+assistant message; the template renders it where the model was trained to see it.
+
+On a family whose JSON grammar starts at the first token (any family not listed in the
+`response_format` note under [Using `openai` Python SDK with structured outputs](#using-openai-python-sdk-with-structured-outputs)),
+`response_format` with `reasoning_effort` runs with thinking off, and the server logs that
+once. `"think": true` with `response_format` is HTTP 400 there, as before.
+
 ### Chat Completions with JSON mode
 
 ```bash
@@ -932,7 +991,10 @@ and tool results. Such a request is rendered with the client's tools only:
   V4/V4.1, MiniMax-M3, GLM-5.x and Gemma 4 keep their own handling of the role.
 - **Thinking.** `"think": true` and `"chat_template_kwargs": {"enable_thinking": true}`
   are the same switch. pi sends the second in its `qwen-chat-template` thinking
-  format. `reasoning_effort` accepts OpenAI's `none`, `minimal` and `xhigh` too.
+  format. Without either, a `reasoning_effort` other than `none` turns thinking on (see
+  [Chat Completions with reasoning](#chat-completions-with-reasoning-thinking)), so a pi model
+  configured with `"reasoning": true` and no `thinkingFormat`, which sends `reasoning_effort`,
+  thinks. `reasoning_effort` accepts OpenAI's `none`, `minimal` and `xhigh` too.
 - **Usage is the real prompt.** With no server-side rounds in between,
   `prompt_tokens` is the size of the prompt the client sent. pi uses that number as
   its context occupancy.
@@ -1027,8 +1089,9 @@ are in [Agent Skills in TensorSharp](../docs/agent_skills.md).
 
 `POST /v1/responses` takes the OpenAI Responses shape: `input` (a string or an
 array of input items), optional `instructions`, `max_output_tokens`, `stream`,
-`store`, `reasoning` (any object enables thinking; `reasoning.effort` is read as
-the reasoning effort), `tools`, and `text.format` in place of `response_format`.
+`store`, `reasoning` (an object turns thinking on, except `{"effort": "none"}`;
+`reasoning.effort` is read as the reasoning effort), `tools`, and `text.format` in place
+of `response_format`.
 The sampling fields are the same top-level fields as Chat Completions, and the
 `skills`, `skills_discovery` and `multi_agent` fields work here too.
 
@@ -1074,6 +1137,28 @@ A reply cut off by the token budget has `status: "incomplete"` and
 server sends typed SSE events (`response.created`, `response.output_item.added`,
 `response.output_text.delta`, … `response.completed`, or `response.failed`).
 
+With thinking on, `output` starts with a `reasoning` item. Its `summary` holds the model's
+whole reasoning as one `summary_text` part. There is no shorter summary: `summary` is the
+field OpenAI's API fills and its SDKs read.
+
+```json
+"output": [
+  {"id": "rs_...", "type": "reasoning", "status": "completed",
+   "summary": [{"type": "summary_text", "text": "17 × 20 = 340 and 17 × 3 = 51 ..."}]},
+  {"id": "msg_...", "type": "message", "status": "completed", "role": "assistant",
+   "content": [{"type": "output_text", "text": "17 × 23 = 391.", "annotations": []}]}
+]
+```
+
+A stream sends the reasoning item first, the way OpenAI streams a reasoning summary:
+`response.output_item.added` (a `reasoning` item), `response.reasoning_summary_part.added`,
+one `response.reasoning_summary_text.delta` per piece, `response.reasoning_summary_text.done`,
+`response.reasoning_summary_part.done` and `response.output_item.done`. The message item
+follows at the next `output_index`. `usage.output_tokens_details.reasoning_tokens` counts the
+reasoning tokens. A `reasoning` item sent back in `input` before its assistant message is
+that message's reasoning, as `reasoning_content` is on Chat Completions. Its `summary_text`
+parts are read, or its `reasoning_text` content parts when it has no summary.
+
 Unless the request sends `"store": false`, the finished response is kept and can
 be fetched again with `GET /v1/responses/{id}` (404 once it is gone). The store
 is in memory, bounded by `TS_RESPONSES_STORE_TTL_MINUTES` (default 60) and
@@ -1090,6 +1175,94 @@ V4.1, Qwen 3.8 Flash Next, LFM3-Omni), `{"type": "input_video", "input_video": {
 "data:video/mp4;base64,...", "fps": 1, "max_frames": 16}}` — the embeddings API's
 `input_video` part, with `video_url`'s optional sampling fields. Other families refuse
 `input_video` with HTTP 400.
+
+### .NET: OpenAI SDK, Microsoft.Extensions.AI and Agent Framework
+
+The official `OpenAI` package, `Microsoft.Extensions.AI.OpenAI` (MEAI) and
+`Microsoft.Agents.AI.OpenAI` (Microsoft Agent Framework) work against this server with
+only the endpoint changed. `ChatOptions.Reasoning` asks for thinking, and the reasoning
+arrives as `TextReasoningContent`, separate from the answer's `TextContent`. On a
+`ChatClient` (Chat Completions) MEAI sends the level as `reasoning_effort` and reads
+`reasoning_content`; on a `ResponsesClient` (Responses API) it sends `reasoning.effort`
+and reads the reasoning item. Both clients, streamed or not, as an agent or as an
+`IChatClient`:
+
+```csharp
+// dotnet add package OpenAI
+// dotnet add package Microsoft.Extensions.AI.OpenAI
+// dotnet add package Microsoft.Agents.AI.OpenAI
+using System.ClientModel;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
+using OpenAI;
+using OpenAI.Chat;
+
+var options = new OpenAIClientOptions { Endpoint = new Uri("http://localhost:5000/v1") };
+var client = new ChatClient("Qwen3.8-9B-Q6_K", new ApiKeyCredential("not-needed"), options);
+
+var agentOptions = new ChatClientAgentOptions
+{
+    Name = "LeadAgent",
+    ChatOptions = new ChatOptions
+    {
+        Instructions = "You are a helpful assistant.",
+        // Sent as reasoning_effort "high": thinking on. ReasoningEffort.None turns it off.
+        Reasoning = new() { Effort = ReasoningEffort.High },
+    },
+};
+AIAgent agent = client.AsAIAgent(agentOptions);
+
+await foreach (AgentResponseUpdate update in agent.RunStreamingAsync("Write a C# method that returns the number of days in the current month."))
+{
+    foreach (AIContent content in update.Contents)
+    {
+        switch (content)
+        {
+            case TextReasoningContent reasoning:
+                Console.ForegroundColor = ConsoleColor.Blue;
+                Console.Write(reasoning.Text);
+                Console.ResetColor();
+                break;
+            case TextContent text:
+                Console.Write(text.Text);
+                break;
+        }
+    }
+}
+```
+
+`client.AsIChatClient()` gives the same contents from `GetStreamingResponseAsync` and
+`GetResponseAsync` (a non-streamed `ChatResponse` holds one `TextReasoningContent` beside
+the text). The Responses API works the same way:
+
+```csharp
+using OpenAI.Responses;
+
+#pragma warning disable OPENAI001 // the Responses client is marked experimental
+ResponsesClient responses = new OpenAIClient(new ApiKeyCredential("not-needed"), options).GetResponsesClient();
+AIAgent agent = responses.AsAIAgent(agentOptions, model: "Qwen3.8-9B-Q6_K");   // or responses.AsIChatClient("Qwen3.8-9B-Q6_K")
+```
+
+Streamed Responses calls through Microsoft.Extensions.AI.OpenAI 11.0.0 need the `OpenAI`
+package it was built against, 2.14.0. OpenAI 2.15.0 changed the return type of
+`ResponsesClient.CreateResponseStreamingAsync`, so with 2.15.0 MEAI's streamed Responses
+calls throw `MissingMethodException` before any request is sent. This is in the client
+packages, not the server. Chat Completions works with both versions.
+
+This server keeps no conversation between Responses requests (`previous_response_id` is
+HTTP 400). An agent session on a `ResponsesClient` continues its second turn with
+`previous_response_id` while stored output is on, so for a session of several turns turn it
+off, and each turn sends its history:
+
+```csharp
+#pragma warning disable MAAI001
+IChatClient chat = responses.AsIChatClientWithStoredOutputDisabled("Qwen3.8-9B-Q6_K");
+AIAgent agent = new ChatClientAgent(chat, agentOptions);
+```
+
+A session on a `ChatClient` needs nothing: Chat Completions always sends the history.
+[`eng/validation/OpenAISdkReasoningRepro`](../eng/validation/OpenAISdkReasoningRepro/Program.cs)
+runs every one of these paths against a server and reports what each received.
 
 ### Sub-agents (`multi_agent`)
 
@@ -2207,9 +2380,9 @@ the request.
 | `stop`              | string/array| null    | Stop sequences                     |
 | `ignore_eos`        | bool        | false   | Non-standard (vLLM / SGLang / llama.cpp spelling): keep generating through end-of-sequence tokens until `max_tokens`, for fixed-length benchmarks. The repetition guard is off for the request too, so only the token limit and the request's own `stop` strings end it; the EOS tokens count in `usage.completion_tokens` and their marker text is left out of the reply. Must be a boolean (HTTP 400 otherwise) |
 | `response_format`   | object      | null    | `text`, `json_object`, or `json_schema` |
-| `think`             | bool        | false   | Non-standard extension: enables thinking/reasoning parsing (returned/streamed as `reasoning_content`) |
+| `think`             | bool        | false   | Non-standard extension: turns thinking on; the reasoning is returned and streamed as `reasoning_content`. Absent, a `reasoning_effort` other than `none` turns it on |
 | `chat_template_kwargs` | object  | null    | llama.cpp / vLLM / SGLang convention. Only `enable_thinking` (bool) is read, as the same switch as `think`; a request whose `think` and `enable_thinking` disagree is HTTP 400. Other keys are ignored, and the server logs that once per key |
-| `reasoning_effort`  | string      | null    | `low`, `medium` or `high`; OpenAI's `none` and `minimal` read as `low` and `xhigh` as `high`. Rendered only by families with an effort line (GPT-OSS, GLM-5.3-Flash); other families ignore it; any other value is HTTP 400. On GPT-OSS, `"think": false` (or `enable_thinking: false`) with no effort means `low` |
+| `reasoning_effort`  | string      | null    | `low`, `medium` or `high`; OpenAI's `none` and `minimal` read as `low` and `xhigh` as `high`. Without `think` / `enable_thinking`, any level but `none` turns thinking on and `none` leaves it off. Rendered only by templates with an effort line (GPT-OSS, GLM-5.3-Flash, Qwen3.8-27B and Qwen3.8 Flash Next GGUFs); other families ignore the level; any other value is HTTP 400. On GPT-OSS, `"think": false` (or `enable_thinking: false`) with no effort means `low` |
 | `tool_choice`       | string/object | `auto` | Chat Completions: `auto`, `none` (offers no tools, including the built-in skill, code and sub-agent tools), `required`, or `{"type": "function", "function": {"name": ...}}`; the last two must name client-declared `tools` (HTTP 400 otherwise). Only DeepSeek V4.1 enforces them with a tool-call grammar; other families accept them but can still answer without calling the tool |
 | `parallel_tool_calls` | bool      | null    | Chat Completions: must be a boolean (HTTP 400 otherwise). Only DeepSeek V4.1 honors `false` (its tool grammar then allows a single call); other families accept and ignore it |
 

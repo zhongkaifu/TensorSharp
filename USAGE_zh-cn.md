@@ -2779,6 +2779,8 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 # Responses API。"input" 是字符串或条目数组，"instructions" 是系统文本，
 # "max_output_tokens" 是长度上限；完成的响应会被存储（除非 "store": false），
 # GET /v1/responses/{id} 可取回它。每个请求相互独立：previous_response_id 会被以 400 拒绝。
+# "reasoning": {"effort": "high"} 开启思考（"none" 保持关闭），推理内容是消息之前的
+# "reasoning" 输出项。
 curl -X POST http://localhost:5000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "input": "说出三个质数。", "max_output_tokens": 128}'
@@ -2798,10 +2800,22 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 # 的 "Reasoning:" system 行，这是控制推理长度的唯一开关。显式 "think": false 且
 # 未指定 reasoning_effort 时按 "low" 渲染。GLM-5.3-Flash 也会渲染此字段：
 # "low" / "high" 对应 Low / High；省略或 "medium" 对应 Max。
-# 其他模型系列接受该字段但忽略它。
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-oss-20b-Q8_0.gguf", "messages": [{"role": "user", "content": "What is 17 + 25?"}], "reasoning_effort": "low", "max_tokens": 256}'
+
+# 混合思考模型（Qwen 3.5 / 3.6 / 3.8、Gemma 4 等）上的思考。除非请求要求，思考默认关闭：
+# "think": true、"chat_template_kwargs": {"enable_thinking": true}，或 "none" 以外的
+# reasoning_effort（OpenAI SDK 与 Microsoft.Extensions.AI 的 ChatOptions.Reasoning 发送的字段）。
+# "none" 保持关闭；同时发送时以显式的 think / enable_thinking 为准。Qwen3.8-27B 与
+# Qwen3.8 Flash Next 的 GGUF 模板也会渲染级别："low" 要求简短思考，"medium" 不加内容，
+# "high" 或未指定级别要求仔细思考。
+# 推理内容以 message.reasoning_content 返回，流式时为 delta.reasoning_content 分块；
+# /v1/responses 以 "reasoning" 输出项返回。详见 API_EXAMPLES_zh-cn.md 的
+# "Chat Completions + 推理（思维链）"。
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3.8-9B-Q6_K", "messages": [{"role": "user", "content": "What is 17 * 23?"}], "reasoning_effort": "high", "max_tokens": 4096}'
 
 # 结构化输出（OpenAI response_format）
 #
