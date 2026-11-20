@@ -610,21 +610,41 @@ namespace TensorSharp.Models
         /// steps rent again stay cached. Each prompt's last step is narrower than the others, and its activations are sizes no
         /// other step rents: kept, they piled up in the cache to its budget, a quarter of the device (Qwen3.8-27B on an RTX PRO
         /// 4500 after 6.6K, 24K, 47K and 69K-token prompts: 2-3.5 GB in 40-odd sizes, beside the conversations), and on WDDM
-        /// that pushed the next conversation's slot into shared system memory (issue #383). The device is idle, so the frees
-        /// cost the requests nothing. On a device this model manages only.
+        /// that pushed the next conversation's slot into shared system memory (issue #383). The device is idle, and the frees go
+        /// a slice at a time, so a request that arrives waits for one slice at most. On a device this model manages only.
         /// </summary>
-        private void TrimCacheWhenIdle()
+        /// <returns>True while blocks are left to give back (the next idle slice goes on): a slice frees for at most
+        /// <see cref="SpareSliceTicks"/>, since each cuMemFree synchronizes (about 0.7 ms on an RTX PRO 4500) and a request
+        /// that arrives meanwhile waits for the slice. Freed in one go, 270 blocks held the next request's admission 186 ms.</returns>
+        private bool TrimCacheWhenIdle()
         {
-            if (!_trimCacheWhenIdle) return;
-            _trimCacheWhenIdle = false;
-            if (!DeviceRoomManaged || DeviceRoomForTests != null || _allocator is not TensorSharp.Cuda.CudaAllocator cuda) return;
+            if (!_trimCacheWhenIdle) return false;
+            if (!DeviceRoomManaged || DeviceRoomForTests != null || _allocator is not TensorSharp.Cuda.CudaAllocator cuda)
+            {
+                _trimCacheWhenIdle = false;
+                return false;
+            }
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
             long over = cuda.ReclaimableBytes - PromptStepBytes;
-            if (over > 0 && cuda.TrimLargeCache(over) > 0)
+            bool freed = false;
+            while (over > 0 && System.Diagnostics.Stopwatch.GetTimestamp() - start < SpareSliceTicks)
+            {
+                long got = cuda.TrimLargeCache(Math.Min(over, IdleTrimChunkBytes));
+                if (got <= 0) break;
+                freed = true;
+                over -= got;
+            }
+            if (freed)
             {
                 IdleCacheTrims++;
                 NoteDeviceMemoryChanged();
             }
+            if (over <= 0 || !freed) _trimCacheWhenIdle = false;
+            return _trimCacheWhenIdle;
         }
+
+        /// <summary>What one call of an idle trim asks the allocator for (a few blocks: each is a synchronizing cuMemFree).</summary>
+        private const long IdleTrimChunkBytes = 64L << 20;
 
         /// <inheritdoc cref="ReplenishSpareSlot(IReadOnlyList{int[]})"/>
         private void ReplenishSpareSlot()
@@ -745,7 +765,7 @@ namespace TensorSharp.Models
         {
             if (GraphExecutor is not { Capabilities.SlotBoundRecordings: true } || _slotStateBytes < 0 || !SupportsUnifiedBatching)
                 return false;
-            TrimCacheWhenIdle();
+            if (TrimCacheWhenIdle()) return true;
             // A shared checkpoint's states first (StandardDecoderModel.RowShares.cs): the next prompt's end takes them. Not held
             // back by a spare slot's slice waiting for a recorded step: a request's last decode step queues one, and the
             // next request's prompt end came with no states made.
