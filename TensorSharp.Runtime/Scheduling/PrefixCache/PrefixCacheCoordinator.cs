@@ -596,7 +596,14 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         // no reasoning is stripped from history), so its short unprotected tail takes no
         // checkpoint; a reasoning reply's next turn diverges right here and keeps it, and
         // media prompts keep theirs (their spans are the expensive part to recompute).
-        if (sequence.MediaSpans.Count == 0 && sequence.PromptTailCheckpointOptional)
+        // Where the checkpoint at the prompt's end shares the request's rows (CheckpointsShareRows)
+        // it costs neither: it keeps a fixed set of recurrent states, after the first token
+        // (CapturesUnboundRequests). Skipped there, a retry or a branch inside the reply prefilled
+        // the tail again over the whole context and copied the older checkpoint's rows, which the
+        // next turn had written past: issue #383's one-token turn B left C 969 tokens to prefill
+        // at 6.6K-69K, and a copy of a 47K-69K checkpoint when device memory was fullest.
+        if (sequence.MediaSpans.Count == 0 && sequence.PromptTailCheckpointOptional
+            && !(length == sequence.PromptTokens.Count && _cacheModel.CheckpointsShareRows))
         {
             int covered = Math.Max(sequence.SharedPrefixTokens, sequence.PrefixCacheReusedTokens);
             if (length - covered < _promptTailCheckpointMinTokens)
