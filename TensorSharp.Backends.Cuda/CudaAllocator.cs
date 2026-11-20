@@ -61,8 +61,15 @@ namespace TensorSharp.Cuda
             // dedicated) and its free only this process's allocations (issue #383).
             Context = context;
             context.MakeCurrent();
-            memoryView = new DeviceMemoryView(ReadDriverMemory, NvmlDedicatedMemoryProbe.Create(deviceId),
-                DeviceMemoryView.BudgetFromEnvironment(), driverMaySpill: OperatingSystem.IsWindows());
+            IDedicatedMemoryProbe nvml = NvmlDedicatedMemoryProbe.Create(deviceId);
+            long budget = DeviceMemoryView.BudgetFromEnvironment();
+            memoryView = new DeviceMemoryView(ReadDriverMemory, nvml, budget, driverMaySpill: OperatingSystem.IsWindows());
+            if (nvml == null && budget == 0 && OperatingSystem.IsWindows())
+                ReportOnce.NoDedicatedReading.Report(() =>
+                    $"WARNING: [cuda] GPU {deviceId}: NVML (nvml.dll) did not report this device, so room checks read cuMemGetInfo alone, "
+                    + "whose total on Windows counts shared system memory and whose free counts only this process: allocations can "
+                    + "spill into shared memory before any room check fails. Set TENSORSHARP_CUDA_DEVICE_BUDGET_MB a little under the "
+                    + "device's dedicated memory. Reported once.");
 
             // Default: a quarter of the device's memory, at least 1 GB. A graph executor's prompt step allocates each
             // op's activations as it runs (a 3.6K-token step of Qwen3.8-27B holds 0.5 GB gate|up products); past the

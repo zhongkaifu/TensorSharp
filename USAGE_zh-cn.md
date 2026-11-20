@@ -839,7 +839,8 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 |---|---|
 | `BACKEND` | 未传 `--backend` 时使用的默认计算后端（`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan`；默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `MAX_TOKENS` | 未传 `--max-tokens` 时的最大生成长度：请求未携带上限时用它填充，请求要求更多时按它截断（默认：`20000`，该默认值只填充、不截断） |
-| `MAX_CONTEXT` | 要分配的上下文窗口，覆盖 GGUF 自报的长度。设了它就是**硬上限**：缓存加一整个 `n_ubatch` 的计算图装得下就照办，装不下就带着具体数字拒绝加载。不设时，自报长度只是**上界**——权重加载完之后运行时会去问各设备实际还剩多少显存，按能装下的大小定上下文，并把选中的值打印出来。GLM-5.2 自报 1,048,576 token（约 93 GiB 的 KV）；在 3x RTX PRO 6000 上按层切分选到 342,272，`--tp 3` 选到 91,136，`--n-cpu-moe 30` 选到 646,400。在 `--backend cuda` 上，共享解码运行时（其上的每个模型族：Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next、Mistral 3、Hunyuan Dense）加载时不分配窗口：每个请求都在按它自己大小创建的 slot 里运行，所以 `MAX_CONTEXT` 是单个请求能达到的最长上下文；除非设置了 `TS_KV_INITIAL_TOKENS`，主缓存从 1,024 个单元起步 |
+| `MAX_CONTEXT` | 要分配的上下文窗口，覆盖 GGUF 自报的长度。设了它就是**硬上限**：缓存加一整个 `n_ubatch` 的计算图装得下就照办，装不下就带着具体数字拒绝加载。不设时，自报长度只是**上界**——权重加载完之后运行时会去问各设备实际还剩多少显存，按能装下的大小定上下文，并把选中的值打印出来。GLM-5.2 自报 1,048,576 token（约 93 GiB 的 KV）；在 3x RTX PRO 6000 上按层切分选到 342,272，`--tp 3` 选到 91,136，`--n-cpu-moe 30` 选到 646,400。在 `--backend cuda` 上，共享解码运行时（其上的每个模型族：Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next、Mistral 3、Hunyuan Dense）加载时不分配窗口：每个请求都在按它自己大小创建的 slot 里运行，所以 `MAX_CONTEXT` 是单个请求能达到的最长上下文；主缓存从 1,024 个单元起步（`TS_KV_INITIAL_TOKENS` 只能让它更小，不能更大） |
+| `TENSORSHARP_CUDA_DEVICE_BUDGET_MB` | `--backend cuda`：容量检查与分配器可使用的显存（MB）。未设置时读取独占显存：NVML（存在时才加载）约束 cuMemGetInfo——在 Windows（WDDM）上后者的总量包含共享系统内存，空闲量只计本进程；在 Windows 上，会超出独占显存的分配会先交还缓存块和已结束的会话，而不是溢出到共享内存。在 Linux 上，除非设置了该值，这一保护不启用。缺少 NVML 或 GPU 与其他进程共用时，可设为略低于独占显存。详见[环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md)。 |
 | `VIDEO_SAMPLE_FPS` | 输入视频作为多模态提示词时每秒抽取的帧数；基于时间的抽帧（默认：`1`）。它与视频生成的输出参数 `--fps` 无关 |
 | `VIDEO_MAX_FRAMES` | 输入视频作为多模态提示词时抽取帧数的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制）。它与视频生成的输出参数 `--video-frames` 无关 |
 | `PORT` / `HOST` | 未传 `--port` / `--host` 时的监听端口与绑定网卡（默认：`5000`、`0.0.0.0`） |

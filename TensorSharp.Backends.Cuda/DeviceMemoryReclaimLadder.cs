@@ -78,12 +78,15 @@ namespace TensorSharp.Cuda
         /// failing (WDDM spills it to system memory; DeviceMemoryView.AllocationsMaySpill): the bytes an allocation of the
         /// given size would pass it by, with <paramref name="freeReserveBytes"/> kept free (0: it fits). Null elsewhere: there a
         /// full device fails the allocation and the ladder climbs from that.</param>
+        /// <param name="budgetPassReport">Where the warning of an allocation placed past it goes, once (default: standard error,
+        /// once per process).</param>
         internal DeviceMemoryReclaimLadder(Func<long, IntPtr> tryAllocate, Action synchronize, Func<long, long> trimLarge,
             Func<long> drainSmall, Func<IReadOnlyList<IDeviceMemoryReclaimer>> reclaimers, Func<bool> capturing,
             Action collectAndDrain, ReportOnce fullDrainReport, int deviceId, Action<string> trace = null,
-            long freeReserveBytes = 0, Func<long, long> budgetShortfall = null)
+            long freeReserveBytes = 0, Func<long, long> budgetShortfall = null, ReportOnce budgetPassReport = null)
         {
             _budgetShortfall = budgetShortfall;
+            _budgetPassReport = budgetPassReport ?? ReportOnce.BudgetPass;
             _trace = trace;
             _freeReserveBytes = Math.Max(0, freeReserveBytes);
             _tryAllocate = tryAllocate ?? throw new ArgumentNullException(nameof(tryAllocate));
@@ -124,6 +127,23 @@ namespace TensorSharp.Cuda
         private int _budgetSkip;
         private const int BudgetSkipAfterBarren = 32;
 
+        /// <summary>An allocation goes ahead past dedicated memory (or the budget): counted, and warned about once, since on WDDM
+        /// it lands in shared system memory and runs at its speed (never silently).</summary>
+        private void PassBudget(long bytes, long shortBy)
+        {
+            Interlocked.Increment(ref _budgetPasses);
+            _budgetPassReport.Report(() => BudgetPassWarning(_deviceId, bytes, shortBy));
+        }
+
+        private readonly ReportOnce _budgetPassReport;
+
+        /// <summary>The once-per-process warning of an allocation placed past dedicated memory.</summary>
+        internal static string BudgetPassWarning(int deviceId, long bytes, long shortBy)
+            => $"WARNING: [cuda] GPU {deviceId}: a {Mib(bytes)} MiB allocation passes the device's dedicated memory (or "
+               + $"TENSORSHARP_CUDA_DEVICE_BUDGET_MB) by {Mib(shortBy)} MiB with nothing left to give back (no cached block, no "
+               + "finished conversation): on Windows the driver places it in shared system memory, which is far slower. A shorter "
+               + "context, q8_0 K/V or fewer concurrent requests fit. Reported once.";
+
         /// <summary>Allocations that would have passed dedicated memory and fit once cached blocks went back (rungs 1-2).</summary>
         internal long BudgetTrims => Interlocked.Read(ref _budgetTrims);
 
@@ -148,12 +168,12 @@ namespace TensorSharp.Cuda
             if (_budgetSkip > 0)
             {
                 _budgetSkip--;
-                Interlocked.Increment(ref _budgetPasses);
+                PassBudget(bytes, shortBy);
                 return;
             }
             if (t_climbs > 0 || _capturing())
             {
-                Interlocked.Increment(ref _budgetPasses);
+                PassBudget(bytes, shortBy);
                 return;
             }
             t_climbs++;
@@ -198,7 +218,7 @@ namespace TensorSharp.Cuda
                         }
                     }
                 }
-                Interlocked.Increment(ref _budgetPasses);
+                PassBudget(bytes, shortBy);
                 if (trimmed == 0 && drained == 0 && released == 0) _budgetSkip = BudgetSkipAfterBarren;
             }
             finally
@@ -333,6 +353,12 @@ namespace TensorSharp.Cuda
     {
         /// <summary>The allocators' last-resort warning, on standard error.</summary>
         internal static ReportOnce FullDrain { get; } = new(line => Console.Error.WriteLine(line));
+
+        /// <summary>The budget guard's warning (an allocation placed past dedicated memory), on standard error.</summary>
+        internal static ReportOnce BudgetPass { get; } = new(line => Console.Error.WriteLine(line));
+
+        /// <summary>The warning of a Windows device NVML does not report (room checks read cuMemGetInfo alone).</summary>
+        internal static ReportOnce NoDedicatedReading { get; } = new(line => Console.Error.WriteLine(line));
 
         private readonly Action<string> _write;
         private int _reported;

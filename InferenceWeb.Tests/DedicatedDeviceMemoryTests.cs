@@ -165,6 +165,7 @@ public class DedicatedDeviceMemoryTests
         public readonly List<string> Events = new();
         public readonly List<IDeviceMemoryReclaimer> Reclaimers = new();
         public readonly List<string> Trace = new();
+        public readonly List<string> Warnings = new();
         public bool Capturing;
         public readonly CudaDeviceMemoryPool Pool;
         public readonly DeviceMemoryReclaimLadder Ladder;
@@ -187,7 +188,8 @@ public class DedicatedDeviceMemoryTests
                 deviceId: 0,
                 Trace.Add,
                 reserve,
-                bytes => Math.Max(0, Used + bytes + Reserve - Dedicated));
+                bytes => Math.Max(0, Used + bytes + Reserve - Dedicated),
+                new ReportOnce(Warnings.Add));
         }
 
         private long Log(string what, long bytes)
@@ -301,11 +303,13 @@ public class DedicatedDeviceMemoryTests
         Assert.Equal(new[] { "sync", "trim 0", "drain-small 0", "alloc 1024 past" }, rig.Events);
         Assert.Equal(1, rig.Ladder.BudgetPasses);
         Assert.Equal(0, rig.Ladder.FullDrains);
+        Assert.StartsWith("WARNING: [cuda] GPU 0: a 1024 MiB allocation passes the device's dedicated memory", Assert.Single(rig.Warnings));
 
         rig.Events.Clear();
         rig.Rent(GiB);
         Assert.Equal(new[] { "alloc 1024 past" }, rig.Events);   // no synchronize for nothing
         Assert.Equal(2, rig.Ladder.BudgetPasses);
+        Assert.Single(rig.Warnings);                             // once
         GC.KeepAlive(live);
     }
 
