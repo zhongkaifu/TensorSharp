@@ -208,6 +208,77 @@ public sealed class MuseGlimmerRuntimeServingTests(ITestOutputHelper output) : I
         }
     }
 
+    /// <summary>
+    /// A request's row in a batched step is computed from that request alone. Four sequences of equal length and different
+    /// tokens decode together, teacher-forced past their prompts and lapping the 16-cell rings. The first one's logits at every
+    /// step, its prompt's last row included, equal bit for bit its logits beside three copies of itself. The same holds two at
+    /// a time.
+    /// <para>This is the concurrency gate where a backend's batched rows round apart from lone ones: a step's shape may move a
+    /// row's bits, but what the other rows hold may not. On ggml_cuda, 2- and 4-row steps moved a real conversation's top two
+    /// by 0.75 nat, so no near-tie bound against sequential decoding separates a leak from rounding there. A leak between
+    /// sequences (a slot, ring, mask or batched-attention row of one request read by another) fails this on every
+    /// executor.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("managed")]
+    [InlineData("ggml")]
+    public void ABatchedRowIsTheSameBesideCopiesOfItselfAsBesideOtherRequests(string executor)
+        => AssertRowsIndependentOfCompanions(BackendOf(executor));
+
+    [MlxFact]
+    public void ABatchedRowIsTheSameBesideCopiesOfItselfAsBesideOtherRequestsOnMlx() => AssertRowsIndependentOfCompanions(BackendType.Mlx);
+
+    [CudaFact]
+    public void ABatchedRowIsTheSameBesideCopiesOfItselfAsBesideOtherRequestsOnDirectCuda()
+        => AssertRowsIndependentOfCompanions(BackendType.Cuda);
+
+    private void AssertRowsIndependentOfCompanions(BackendType backend)
+    {
+        using var rings = SmallRings();
+        using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        string path = Fixture();
+        // Prompts of one length (so every run's steps have one shape) past a ring, and decode tokens past another lap.
+        const int promptLength = 21, steps = 20;
+        int[] Script(int seed, int length) => Enumerable.Range(0, length).Select(i => 40 + (i * (7 + 2 * seed) + 11 * seed) % 150).ToArray();
+        int[][] prompts = Enumerable.Range(0, 4).Select(r => Script(r, promptLength)).ToArray();
+        int[][] fed = Enumerable.Range(0, 4).Select(r => Script(r + 4, steps)).ToArray();
+        using StandardDecoderModel model = Create(path, backend);
+        int run = 0;
+        // The first member's logits at the prompt's last row and after every fed token, the members decoding in lockstep.
+        float[][] Decode(int[] members)
+        {
+            run++;
+            string[] ids = members.Select((_, i) => $"run{run}-{i}").ToArray();
+            foreach (string id in ids) model.EnsureSequenceSlot(id, promptLength + steps + 1);
+            var logits = new float[members.Length][];
+            var rows = new List<float[]>();
+            Assert.True(model.TryForwardUnified(ids, members.Select(m => prompts[m]).ToArray(), new int[members.Length], logits));
+            rows.Add((float[])logits[0].Clone());
+            for (int k = 0; k < steps; k++)
+            {
+                Assert.True(model.TryForwardUnified(ids, members.Select(m => new[] { fed[m][k] }).ToArray(),
+                    Enumerable.Repeat(promptLength + k, members.Length).ToArray(), logits));
+                rows.Add((float[])logits[0].Clone());
+            }
+            foreach (string id in ids) model.OnSequenceReleased(id);
+            return rows.ToArray();
+        }
+        foreach (int width in new[] { 4, 2 })
+        {
+            float[][] beside = Decode(Enumerable.Range(0, width).ToArray());
+            float[][] copies = Decode(new int[width]);
+            for (int k = 0; k < beside.Length; k++)
+            {
+                double apart = Enumerable.Range(0, beside[k].Length).Max(i => Math.Abs(beside[k][i] - copies[k][i]));
+                Assert.True(beside[k].AsSpan().SequenceEqual(copies[k]),
+                    $"{backend}, {width} rows a step: the first request's logits at step {k} beside other requests are {apart:E2} from its " +
+                    "logits beside copies of itself");
+            }
+            output.WriteLine($"{backend}: {width} rows a step, {beside.Length} steps: the first request's logits beside other requests " +
+                "equal its logits beside copies of itself, bit for bit");
+        }
+    }
+
     private static async Task<List<int>> Collect(InferenceRequestHandle handle)
     {
         var tokens = new List<int>();
