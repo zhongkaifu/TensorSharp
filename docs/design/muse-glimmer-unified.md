@@ -1,8 +1,10 @@
 # Muse-Glimmer on the unified runtime and tensor executors
 
 Status: design, plus the legacy baseline measured on the Mac. Stage S0's Mac part (the llama.cpp goldens and the frozen
-legacy outputs), stage S1 (the runtime hooks G1-G3) and stage S2's Mac part (the text decoder on the runtime, behind its
-test seam; [§5.1](#51-s2-the-text-decoder-status)) are implemented; S0's and S2's CUDA parts wait for the GPU VM. Written
+legacy outputs), stage S1 (the runtime hooks G1-G3), stage S2's Mac part (the text decoder on the runtime, behind its
+test seam; [§5.1](#51-s2-the-text-decoder-status)) and stage S3's Mac part (serving: slots, rings, prefix cache,
+checkpoints, checkpoint files, concurrency, the probe on the runtime; [§5.2](#52-s3-serving-status)) are implemented;
+S0's, S2's and S3's CUDA parts wait for the GPU VM. Written
 2026-11-20 on `feature/muse-glimmer-unified`, cut from `origin/main` 2d759459. ggml is upstream
 d9fe7bff, unchanged (AGENTS.md), built with `TENSORSHARP_GGML_NO_UPDATE=1`. Every statement about
 TensorSharp comes from the code at 2d759459. The numbers in [§4.1](#41-legacy-baseline-measured)
@@ -217,8 +219,8 @@ must pass unchanged, and the E2E gates in §4.8 check the same behaviour through
 | Test or tool | Covers | Fate |
 |---|---|---|
 | `MuseGlimmerSyntheticModelBuilder` | a tiny Glimmer GGUF (SWA pattern, gate, norms, softcap) | kept; extended (S0) |
-| `MuseGlimmerKvGrowTests` (synthetic, any GPU lane) | grow mid-sequence == presized; restore and truncate below the ring | re-pointed at the runtime model (S3) |
-| `MuseGlimmerKvSnapshotTests` (real weights, `TS_TEST_MODEL_DIR`) | captured prefix == live; grow == presized | re-pointed (S3) |
+| `MuseGlimmerKvGrowTests` (synthetic, any GPU lane) | grow mid-sequence == presized; restore and truncate below the ring | legacy's, kept until S9. The runtime's counterparts are in `MuseGlimmerRuntimeServingTests` (S3): the primary and a request's slot grown mid-sequence == presized, bit for bit, on every executor; rewinds within the rings or refused |
+| `MuseGlimmerKvSnapshotTests` (real weights, `TS_TEST_MODEL_DIR`) | captured prefix == live; grow == presized | legacy's, kept until S9; since S3 it reads its backend as the other real-weight tests do (it defaulted to ggml_cuda and skipped elsewhere). The runtime's counterparts are `MuseGlimmerRuntimeKvTests` (S3): decode across the primary's and a slot's growth == presized, and a checkpoint of wrapped rings (cloned, and read back from a file in a new instance) == live |
 | `MuseGlimmerParityTests` (real weights + `.parity` goldens) | greedy and long context vs llama.cpp, tokenizer, SWA pattern, DFlash lossless, image geometry | **the goldens are committed (S0)**: `InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/`, made by `eng/validation/muse-glimmer-llamacpp-goldens.py` with llama.cpp d3c3e242c (D9). The tests teacher-force llama.cpp's continuations and skip only without the IQ2_XXS weights; the legacy model agrees at 768/768 positions on ggml_metal and MLX |
 | `MuseGlimmerMlxDecodeTests` | pipelined greedy contract, `RunDecodeGraphBatched` | delete with `.MlxDecode.cs` |
 | `GgmlMuseGlimmerVisionBlockTests` | the fused CUDA vision block vs a host reference | replaced by tower-program tests (S4) |
@@ -272,7 +274,7 @@ ggml change.
 | G6 | **ggml_vulkan tensor parallelism.** `GgmlGraphExecutor` declares `TensorParallel` only for CUDA, so `--tp` on Vulkan falls to the runtime's per-op TP. Legacy Glimmer runs fused per-rank graphs on Vulkan through the same native driver (`TSGgml_TensorParallelExecutePlans`). | `GgmlGraphExecutor` capability + Vulkan collective | every family on Vulkan | S6 (D4) |
 | G7 | **The vision tower as a program.** The pieces exist (`Norm` + bias, `GeluErf`, `FlashAttnExt`, `Permute`), but 2D NORM RoPE over the two half-heads does not. llama.cpp (`clip.cpp` `build_rope_2d`, called by `tools/mtmd/models/muse-glimmer.cpp`) rotates the first 48 dims at the column position, then the next 48 at the row position through `ggml_rope_set_offset`, which the pinned ggml has. The IR's `RopeExt` gets a dims-offset parameter (lowered to that call on GGML; the tensor executors honour it), or the tower rotates two half-head views and concatenates them. Window attention can run as `FlashAttnExt` per window over contiguous row ranges (the permutation makes them contiguous) or with one block-diagonal mask. Verify both on every executor. Also needed: a tower interface the injector takes, shared by Glimmer and Muse Spark. | `MuseGlimmerVisionTower` (new, on `NetworkGraph`), `ModelMultimodalInjector` | Muse Spark | S4 |
 | G8 | **MLX pipelined greedy decode.** Legacy's `--benchmark` decode on MLX keeps argmax and the next embedding on the device. The runtime's MLX decode reads logits back. Port it only if the runtime's MLX real generation trails legacy: `GreedyIdOutputs` on `MlxGraphExecutor` plus a device-side embedding of the chosen id. | `MlxGraphExecutor`, the runtime's decode loop | every family on MLX | S7 (D7) |
-| G9 | **The probe on the runtime.** `MuseGlimmerKvGrowProbe` reads legacy fields (`_kvCacheCapacity`, `_kvSwaRows`) for its report. Read the runtime's ring cells and slot capacity through internal accessors, and add a scenario for slot growth and checkpoint restore. | `eng/validation/MuseGlimmerKvGrowProbe` | - | S3 |
+| G9 | **The probe on the runtime.** `MuseGlimmerKvGrowProbe` reads legacy fields (`_kvCacheCapacity`, `_kvSwaRows`) for its report. Read the runtime's ring cells and slot capacity through internal accessors, and add a scenario for slot growth and checkpoint restore. **Done in S3** ([§5.2](#52-s3-serving-status)): the runtime's active-cache and slot capacities and ring cells through internal accessors; `checkpoint`, `slot-growth`, and `snapshot` as the runtime restores a prefix (a checkpoint file); every restore and rewind also mid-decode | `eng/validation/MuseGlimmerKvGrowProbe` | - | S3 |
 | G10 | **The CUDA FA-VEC hazard.** Legacy materializes the padded K/V window on CUDA where ggml-cuda would pick its VEC kernel, which misread a truncated-prefix view (all query heads of a KV head got the same wrong vector; Ada+ one-row decode under 8192 rows). **Closed in S2, no change.** (1) The premise was wrong: the runtime's builder lowers `GraphOp.KvWindow` through `view_kv_cache_window`, which applies `kv_window_needs_cuda_flash_attn_copy` itself; the runtime passes the query rows and the GQA ratio (`ip[6]`, `ip[7]`), so it has always carried legacy's guard. (2) At d9fe7bff the hazard is gone on Blackwell (RTX PRO 4500, sm_120): the real-weight probe with the guard off (`TS_KV_FATTN_COPY=0`, 52 window copies fewer by a gdb count) gave byte-identical fp16 logits over 500 decode steps at 4352-4864-row windows, and the synthetic legacy freeze (head 64, GQA 2) was byte-identical too. Ada (sm_89) was not run. The guard stays (TensorSharp-owned, about 0.8% of decode there, within noise); dropping it is an S7 measurement | `ggml_ops_transformer_common.h` (already) | every family on ggml_cuda | S2 (closed) |
 | G11 | **DFlash prompt catch-up width.** Legacy catches the drafter up in 1024-row trunk forwards (`TS_DFLASH_PREFILL_CHUNK`). The runtime follows the prompt in ring steps (512). Measure the DFlash prefill cost. | `StandardDecoderModel.BlockDraft.cs` | Qwen 3.8 | S5 |
 | G12 | **Rings under TP with one KV head per rank.** Legacy turned the ring off under `--tp` because ggml-cuda answered "17 plus 25" with fluent nonsense on a whole-ring read when a rank held one KV head (ne[2] == 1). The runtime's per-rank graphs ring by default. Gate it. If it fails, either find the kernel cause and avoid that shape in TensorSharp code, or use linear caches under TP for single-KV-head ranks (costs ~2.5 GB of KV at 64K). | `StandardDecoderModel.Placement/SlidingRings.cs` | any family with 1 KV head per rank | S6 |
@@ -575,7 +577,7 @@ Estimates are agent-days, including GPU runs.
 | **S0** Oracles | the legacy baseline (§4.1; the Mac part is in this commit, the CUDA part runs on the first VM); the probe's `--nll-text` mode (this commit) and runtime accessors (G9); llama.cpp goldens regenerated and committed as fixtures (D9); the synthetic builder extended; legacy logit digests frozen | `eng/validation/MuseGlimmerKvGrowProbe`, `InferenceWeb.Tests/MuseGlimmerSyntheticModelBuilder.cs`, `Fixtures/MuseGlimmer/` | `MuseGlimmerParityTests` run (they skip today); the legacy probe on ggml_cuda, real weights (never run before) | Mac; 1 GPU | 2 |
 | **S1** Runtime hooks | G1 logit transform (graph head, ranked head, per-op head, greedy-id heads untouched), G2 post-norm epsilon, G3 per-op stream input | `StandardDecoderModel.cs`, `.Graph.cs` | hook tests on synthetic models on managed, ggml_cpu, ggml_metal and MLX; the existing runtime families' digests unchanged (Qwen 3.5, Qwen 3.8, LFM3, Hunyuan, Mistral 3) | Mac | 2 |
 | **S2** Text decoder (Mac part done, [§5.1](#51-s2-the-text-decoder-status)) | `MuseGlimmerRuntimeModel` (+ `.Graph.cs`), one device, every executor, behind a test seam (the descriptor still builds legacy); G10 checked | family folder, `ggml_ops_graph_builder.cpp` only if G10 holds | §4.2 synthetic parity on every executor; real weights greedy + perplexity on ggml_metal and MLX (Mac), ggml_cuda, ggml_vulkan and direct CUDA (VM, UD-Q4_K_XL and IQ2_XXS) | Mac; 1 GPU (Ada or Blackwell) | 4 |
-| **S3** Serving | the unified step: slots, rings, prefix cache, checkpoints, checkpoint files, concurrency; the probe on the runtime | family folder; runtime fixes as found | §4.6 (every mark, every scenario, ggml_metal + MLX + ggml_cuda); §4.7; c4 concurrency 4/4 identical to sequential | Mac; 1 GPU | 4 |
+| **S3** Serving (Mac part done, [§5.2](#52-s3-serving-status)) | the unified step: slots, rings, prefix cache, checkpoints, checkpoint files, concurrency; the probe on the runtime | family folder; runtime fixes as found | §4.6 (every mark, every scenario, ggml_metal + MLX + ggml_cuda); §4.7; c4 concurrency 4/4 identical to sequential | Mac; 1 GPU | 4 |
 | **S4** Vision | `MuseGlimmerVisionTower` on `NetworkGraph` (G7), a tower interface used by Glimmer and Muse Spark, the injector re-typed, `QueueMedia`, reuse across image spans | `MuseGlimmerVisionTower.cs`, `.Multimodal.cs`, `ModelMultimodalInjector.cs`, `MuseSparkModel.Vision.cs` | §4.5 on ggml_metal, MLX, ggml_cuda; Muse Spark synthetic vision tests | Mac; 1 GPU | 5 |
 | **S5** Speculation | DFlash through the shared block drafter (graph programs; fused/per-op below), n-gram, defaults by measurement (`--spec-draft`, gate), G11 | family folder (declarations only), `StandardDecoderModel.BlockDraft.cs` if G11 needs it | §4.4 on ggml_metal and ggml_cuda; MLX lossless | Mac; 1 GPU | 3 |
 | **S6** Multi-GPU | `--tp 2` on per-rank graphs (ggml_cuda; Vulkan per D4), G12, `--layer-split 2` and hybrid (new), DFlash under TP per D5 | family folder, `GgmlGraphExecutor.cs` (D4), `StandardDecoderModel.Placement.cs` (G12) | TP greedy vs one GPU (legacy tracked 468/500 characters before a paraphrase); TP decode and prefill vs legacy TP (docs: 63.2 tok/s, pp512 1569 on 2x PRO 4000, IQ2_XXS); grow and snapshot under TP (never run for legacy); layer split == one GPU | 2 GPUs in one box | 4 |
@@ -627,6 +629,117 @@ CUDA, UD-Q4_K_XL and IQ2_XXS) waits for the VM.
 On ggml_cpu the runtime's graphs sit about 3e-4 from legacy, and per op 4e-5. The cause is shared and not Glimmer's: there
 (`FreshRowViews`, no `PaddedCacheAttention`) a prompt chunk attends its own fresh K/V rows in F32, where legacy and
 llama.cpp attend them through the F16 cache. Fed row by row, the same prompt is 2.6e-5 from legacy.
+
+### 5.2 S3, serving: status
+
+**The Mac part is done** (2026-11-20, M5 Pro, ggml d9fe7bff unchanged). The family needed no change: the runtime serves it as
+it serves every family, with per-request slots on the unified step, 2560-cell rings on the 39 sliding-window layers,
+class P prefix pages with truncation bounded by the rings, end states copied or donated, and persistable checkpoints
+(format 6: the rings whole). The CUDA part (ggml_cuda with UD-Q4_K_XL and IQ2_XXS, including `TS_KV_INITIAL_TOKENS=2048`,
+plus the direct-CUDA and ggml_vulkan synthetic lanes) waits for the VM.
+
+* **The probe on the runtime (G9).** `MuseGlimmerKvGrowProbe` reads the runtime's active-cache and slot capacities and ring
+  cells through internal accessors. New scenarios:
+  * `checkpoint`: a checkpoint cloned into a new request's slot;
+  * `slot-growth`: one request's slot, reserved for its prompt and first token, stepped through the unified batch entry and
+    grown by the decode;
+  * `snapshot`: on the runtime, a checkpoint file written, everything released, read back and cloned.
+
+  `truncate`, `checkpoint` and `snapshot` also act mid-decode (`--split` past the prompt). A rewind the rings refuse
+  re-prefills, as the server's turn does. `--logits-ref`/`--logits-ref2` record per-step cosines against two reference runs.
+* **Serving before the switch.** `eng/validation/MuseGlimmerRuntimeHost` runs the real `TensorSharp.Server.Host` (or
+  `TensorSharp.Cli`) with the runtime family: an internal seam on the descriptor's factory
+  (`MuseGlimmerArchitecture.DescriptorBuildsTheRuntimeFamily`), set only by that tool. No option, switch or environment
+  variable reaches it. S8 deletes it.
+* **Tests.**
+  * `MuseGlimmerRuntimeServingTests` (synthetic; managed, the pinned GGML backend, MLX, and direct CUDA on the VM; 16-cell
+    rings, so every script laps them) cover:
+    * slot batches against each request alone, in every local placement;
+    * four concurrent requests against sequential ones;
+    * checkpoints of wrapped rings (clones, device copies, pooled slots, checkpoint files);
+    * follow-up turns: full reuse, and a cold run's answers;
+    * edited follow-ups, which rewind within the rings' slack or fall back;
+    * the primary and a slot grown mid-sequence, bit for bit against presized ones;
+    * rewinds that keep the window or are refused.
+  * `MuseGlimmerRuntimeKvTests` re-points the legacy real-weight KV tests at the runtime, through model seams.
+
+**§4.6, the probe gate** (UD-IQ2_XXS). Every runtime scenario ran at the default sizing and was teacher-forced against two
+references: legacy presized and the runtime presized (`MAX_CONTEXT=8192`). Two configurations:
+* **A** is a fixed text: a 1,600-token prefix, then 3,000 teacher-forced steps, so positions 1600-4599 put decode steps
+  on both sides of every mark (2048, 2560, 4096 and 4352).
+* **B** is the 4.1K chat prompt (`p_4k.txt`), then 500 steps teacher-forced by legacy's greedy tokens.
+
+| | ggml_metal | MLX |
+|---|---|---|
+| runtime scenarios vs the runtime presized: decode (the primary grows at 2049 and 4097), slot growth (1792 -> 3584 -> 7168 mid-decode), checkpoint at 2600 (wrapped rings, then the clone's slot grows at 2817), checkpoint file at 4200 and 4400, rewind of 16 at 4400, prompt split 800 / 2000, rewind inside the prompt to 4000 (accepted) and to 3000 (refused, re-prefilled), checkpoint / file inside the prompt at 3000 | **passed**: 16/16 arms bit-identical (top-8 logits) at every step | **passed**: 16/16 arms argmax-identical at every step. The 10 arms that keep the prompt's step shapes are bit-identical. The 6 whose prompt cut falls off a 512-row step (splits at 800 and 2000, the checkpoint and file at 3000, the rewinds inside the prompt) carry MLX's step-shape rounding: cosine >= 0.999999, except A's split at 800 (0.999628 at one step, position 4456, where the top-two gap is 12.4 nat). Cuts on the steps (1024, 2048, 3072) are bit-identical |
+| the same arms vs legacy presized | **passed**: worst cosine 0.999952 (A, past 4352) and 0.999995 (B). One teacher-forced argmax difference in A's 3,000 steps (position 2801), a near-tie: a top-two gap of 0.0015 nat in both families. It is in the presized pair too, so it is ring-geometry rounding (2560- vs 4352-cell rings), not growth | **passed**: worst cosine 0.999951 (A) and 0.999954 (B); the split at 800 is 0.999763. One argmax difference in A (position 2311), a near-tie: legacy's top-two gap is 0.0016 nat, the runtime's 0.0115. It is in the presized pair too |
+| legacy default vs legacy presized (control) | 3000/3000, cosine 1.000000 | 3000/3000, cosine 1.000000 |
+
+**§4.7, multi-turn prefix reuse** through the real server (`--no-multi-agent --no-skills`, greedy request sampling;
+`eng/validation/multiturn-reuse.py`). Each follow-up turn reused exactly what the previous turn held (the previous prompt and
+reply), on every turn:
+* OpenAI, thinking off, 5 turns: 797, 977, 1349, 1494 tokens;
+* Web UI, thinking off, 5 turns;
+* Web UI, thinking on, 4 turns: 996, 1427, 2034 tokens.
+
+That is the same as legacy on the same conversations, turn for turn (legacy reuses its live primary cache below its
+4352-token cap). Follow-up TTFT on ggml_metal is 173-674 ms, against legacy's 205-693. Peak wired is 14.5 GB, against
+legacy's 20.3.
+
+**Re-prefill.** Each thinking-off conversation's last turn, sent to a fresh `--no-prefix-cache` server, answered
+identically (2/2). The thinking-on conversation is not comparable that way: a fresh server renders the client's history
+(1,009 tokens; the template drops past reasoning), where the session continued its raw transcript of 2,058 tokens. The
+synthetic follow-up tests cover that path's exactness against cold runs. MLX gives the same: reuse equal to what the previous turn held on all 13 follow-ups (follow-up TTFT 92-618 ms), and both thinking-off replays identical.
+
+**Concurrency** (`parallel-multiturn-webui.py --greedy --plain`, 4 conversations x 3 turns, each arm on a fresh server).
+On ggml_metal the c4 run's answers are the sequential control's, **12/12 turns**, with no preemption and no capacity wait.
+Its reuse equals the sequential run's on every turn. Wall time is 27.2 s against 53.6 s sequential. Legacy, which
+serializes requests, took 55.8 s against its own sequential 53.8 s. It also gave one answer different from its control
+("FFALCON-318"), and its follow-ups reused less under concurrency (224 against 237). MLX: 12/12, 28.0 s against 52.8 s, no preemption.
+
+**Checkpoint files.** A 4.1K-token system prompt (past the rings' wrap) and one turn:
+* the first server saved a 157 MB checkpoint of the 4,115-token shared prefix;
+* a second process read it back: 4,115 tokens reused, TTFT 12.7 s -> 1.79 s;
+* that reply is identical to the first run's and to a cold run's. MLX gives the same: TTFT 11.2 s -> 1.47 s, three identical replies.
+
+**The same-chunking rule** (the CUDA S0 finding: legacy's cache operations are exact on ggml_cuda, and its near-tie flips
+come from the prefill chunks' shapes).
+* A cut on a step boundary must be bit-identical to the unsplit run, and it is.
+* A cut off the boundary gets a near-tie analysis instead.
+* On ggml_metal every runtime arm is bit-identical, aligned or not. Legacy's 2048-row chunks are bit-identical there both
+  off the boundary (split 3000) and on it (2048), so ggml-metal's kernels are row-shape invariant.
+* On MLX only the cut matters: aligned cuts are bit-identical, and off-boundary cuts keep every argmax.
+
+**Also on the Mac.**
+* **The CLI** (`--multi-turn-jsonl`, 3 turns, through the runtime host) reused 0/89, **86/273** and **270/454** tokens,
+  against legacy's 80/273 and 256/454. It reaches the token before the previous reply's header, as §4.7 expected. The
+  recall answer is legacy's.
+  * Turns 2-3 TTFT is 682 and 683 ms, against legacy's 673 and 671. That is within §4.3's legacy x 1.02 + 5 ms, but not
+    below legacy: the §4.7 wording.
+  * The turns prefill fewer tokens (187 and 184 against 193 and 198) but no faster. S7 owns prompt-step costs.
+* **The real-weight KV tests.**
+  * `MuseGlimmerRuntimeKvTests` passed on ggml_metal and MLX: decode across the primary's and a slot's growth equals
+    presized over 360 steps; a checkpoint of wrapped rings, cloned and read back from a file, has max |delta| 0.
+  * Legacy's `MuseGlimmerKvSnapshotTests`, which used to skip here, passed 4/4 on ggml_metal.
+* **No regression elsewhere.** The S1/S2 AR regression filter plus the new tests, on both Mac lanes:
+  * cpu: 1646 tests, 1314 passed, 332 skipped;
+  * metal: 1658 tests, 1345 passed, 313 skipped;
+  * 0 failed, every pre-existing outcome unchanged, and the 33 additions are the new tests.
+  * `RuntimeFamilyDigestTests` is byte-identical to S2's on both lanes.
+  * The only shared-code change is two internal test accessors.
+
+* **A shared finding, not fixed here.** On a GGML backend, `ModelBase.Dispose` runs process-wide cleanups:
+  `GgmlBasicOps.ClearOffloadableState`, `ReleaseReuseComputeBuffers` and `ClearHostBufferCache`. So disposing one model frees
+  the host-buffer wrappers and reuse buffers that a second live model's cached graphs bind. That model's next forward then
+  faults in ggml-metal (`ggml_metal_op_norm` -> `ggml_metal_buffer_get_id`, a tensor with no buffer).
+  * It reproduces with any two models on one backend: load A, load B, dispose B, forward A.
+  * The serving tests keep one model alive at a time.
+  * A process that serves one model at a time (the server, the CLI) never meets it. A host that unloads one GGML model
+    while another stays loaded does.
+  * The fix needs per-model ownership of the host-buffer registrations: clearing only the disposed model's wrappers, and
+    freeing the shared reuse buffers with the last model. Leaving the wrappers would reattach stale device copies to
+    recycled addresses (the 2026-09-29 bug class). That is a lifetime change for every family, so it is left for its own
+    change, with the repro.
 
 ---
 
