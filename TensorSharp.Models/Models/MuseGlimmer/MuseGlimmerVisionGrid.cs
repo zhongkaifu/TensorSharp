@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using System.Threading.Tasks;
 
@@ -12,10 +13,98 @@ namespace TensorSharp.Models
 {
     /// <summary>
     /// Host-side geometry of the vision tower of the <c>muse-glimmer</c> projector type (Muse-Glimmer and Muse Spark): the
-    /// learned position grid resampled to an image's patch grid.
+    /// window order of the patches, the gather back to raster order and into 2 x 2 blocks, the patch rows, and the learned
+    /// position grid resampled to an image's patch grid.
     /// </summary>
     internal static class MuseGlimmerVisionGrid
     {
+        /// <summary>
+        /// The window order of a <paramref name="gridW"/> x <paramref name="gridH"/> patch grid (llama.cpp's
+        /// <c>muse_glimmer_sp_perm</c>, transformers' <c>get_vision_window_index</c> at merge size 1): windows of
+        /// <paramref name="side"/> x <paramref name="side"/> patches, row-major, the patches of each row-major, edge windows
+        /// clipped. Row i holds raster patch result[i]; window w covers rows [windows[w], windows[w + 1]).
+        /// </summary>
+        internal static int[] WindowOrder(int gridW, int gridH, int side, out int[] windows)
+        {
+            int n = gridW * gridH;
+            int nwinH = (gridH + side - 1) / side, nwinW = (gridW + side - 1) / side;
+            var order = new int[n];
+            var offsets = new List<int> { 0 };
+            int idx = 0;
+            for (int wy = 0; wy < nwinH; wy++)
+            {
+                for (int wx = 0; wx < nwinW; wx++)
+                {
+                    int count = 0;
+                    for (int hh = 0; hh < side; hh++)
+                    {
+                        for (int ww = 0; ww < side; ww++)
+                        {
+                            int gy = wy * side + hh, gx = wx * side + ww;
+                            if (gy >= gridH || gx >= gridW) continue;
+                            order[idx++] = gy * gridW + gx;
+                            count++;
+                        }
+                    }
+                    if (count > 0) offsets.Add(idx);
+                }
+            }
+            windows = offsets.ToArray();
+            return order;
+        }
+
+        /// <summary>
+        /// For each slot of the pixel shuffle (raster over the merged blocks, then the block's <paramref name="merge"/> x
+        /// <paramref name="merge"/> patches row-major: llama.cpp's <c>muse_glimmer_ds_perm</c>), the window-order row that holds
+        /// its patch: the un-permute and the shuffle's gather in one.
+        /// </summary>
+        internal static int[] MergeGather(int gridW, int gridH, int merge, int[] order)
+        {
+            var inverse = new int[order.Length];
+            for (int i = 0; i < order.Length; i++) inverse[order[i]] = i;
+            var gather = new int[order.Length];
+            int m = 0;
+            for (int oy = 0; oy < gridH / merge; oy++)
+                for (int ox = 0; ox < gridW / merge; ox++)
+                    for (int ry = 0; ry < merge; ry++)
+                        for (int rx = 0; rx < merge; rx++)
+                            gather[m++] = inverse[(oy * merge + ry) * gridW + (ox * merge + rx)];
+            return gather;
+        }
+
+        /// <summary>
+        /// The patch rows of channel-first [3, <paramref name="height"/>, <paramref name="width"/>] pixels, one row per entry of
+        /// <paramref name="order"/> (raster patch indices), each 3 * patch * patch values in (channel, ky, kx) order with kx
+        /// fastest: <c>v.patch_embd.weight</c>'s layout per output channel (the stride-patch conv2d as one product).
+        /// </summary>
+        internal static unsafe float[] Patchify(float[] pixels, int width, int height, int patch, int[] order)
+        {
+            int gridW = width / patch;
+            int stride = 3 * patch * patch;
+            var rows = new float[(long)order.Length * stride];
+            fixed (float* pixSrc = pixels)
+            fixed (float* dstSrc = rows)
+            fixed (int* orderSrc = order)
+            {
+                long pixL = (long)pixSrc, dstL = (long)dstSrc, orderL = (long)orderSrc;
+                Parallel.For(0, order.Length, t =>
+                {
+                    float* pix = (float*)pixL;
+                    float* outRow = (float*)dstL + (long)t * stride;
+                    int raster = ((int*)orderL)[t];
+                    int py = raster / gridW, px = raster - py * gridW;
+                    for (int c = 0; c < 3; c++)
+                    {
+                        long channel = (long)c * height * width;
+                        for (int ky = 0; ky < patch; ky++)
+                            Buffer.MemoryCopy(pix + channel + (long)(py * patch + ky) * width + px * patch,
+                                outRow + (long)c * patch * patch + (long)ky * patch, patch * sizeof(float), patch * sizeof(float));
+                    }
+                });
+            }
+            return rows;
+        }
+
         /// <summary>
         /// The learned [side * side, hidden] position table bilinearly resampled to a <paramref name="gridW"/> x
         /// <paramref name="gridH"/> patch grid: one row of <paramref name="destination"/> per entry of

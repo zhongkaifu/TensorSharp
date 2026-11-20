@@ -11,10 +11,12 @@ namespace TensorSharp.Models
 {
     public partial class MuseSparkModel : IVisionCapableModel, IMultimodalPromptExpander
     {
-        private MuseGlimmerVisionEncoder _visionEncoder;
+        private MuseGlimmerVisionTower _visionEncoder;
         private readonly List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
 
-        public MuseGlimmerVisionEncoder VisionEncoder => _visionEncoder;
+        /// <summary>The vision tower of the mmproj (projector type muse-glimmer, Muse-Glimmer's tower at Spark's width) as graph
+        /// programs on rank 0's executor, or null.</summary>
+        public MuseGlimmerVisionTower VisionEncoder => _visionEncoder;
         bool IVisionCapableModel.IsVisionEncoderLoaded => _visionEncoder != null;
         internal bool HasPendingVisionEmbeddings => _pendingVisionEmbeddingsList.Count != 0;
 
@@ -29,8 +31,7 @@ namespace TensorSharp.Models
             bool priorPin = pinRank && GgmlBasicOps.PinRank(0);
             try
             {
-                var encoder = new MuseGlimmerVisionEncoder(mmProjPath, _allocator);
-                encoder.SetHostModel(this);
+                var encoder = new MuseGlimmerVisionTower(mmProjPath, _allocator, _backend);
                 _visionEncoder?.Dispose();
                 _visionEncoder = encoder;
             }

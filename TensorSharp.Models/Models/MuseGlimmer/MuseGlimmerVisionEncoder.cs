@@ -49,7 +49,7 @@ namespace TensorSharp.Models
     /// so only one copy of each is resident. This tower is ~1.9B parameters, so
     /// the all-F32 working set is ~7.4 GB; see the note on LoadWeights.
     /// </summary>
-    public sealed class MuseGlimmerVisionEncoder : IDisposable
+    public sealed class MuseGlimmerVisionEncoder : IMuseGlimmerVisionTower
     {
         /// <summary>
         /// Transposed [3*14*14, hidden] view of v.patch_embd.weight used by the
@@ -409,6 +409,10 @@ namespace TensorSharp.Models
 
             return projected;
         }
+
+        /// <summary>The shared tower contract: this tower yields its host model's GPU lock between blocks itself
+        /// (<see cref="SetHostModel"/>), so <paramref name="betweenParts"/> is not called.</summary>
+        Tensor IMuseGlimmerVisionTower.Encode(float[] pixels, int width, int height, Action betweenParts) => Encode(pixels, width, height);
 
         /// <summary>
         /// Self-check helper: run <see cref="Encode"/> and return the result as a

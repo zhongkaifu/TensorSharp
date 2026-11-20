@@ -11,16 +11,21 @@
 // exactly the work being optimized.
 //
 // Env knobs:
-//   TS_VBENCH_TYPE    gemma4 | mistral3 | qwen35 | muse-glimmer (default gemma4)
+//   TS_VBENCH_TYPE    gemma4 | mistral3 | qwen35 | muse-glimmer (the legacy per-op tower) | muse-glimmer-graph (the
+//                     tower as graph programs on the allocator's executor, which Muse-Glimmer and Muse Spark load)
+//                     (default gemma4)
 //   TS_VBENCH_MMPROJ  path to the mmproj .gguf
 //   TS_VBENCH_IMAGE   path to a test image (default imgs/banner_1.png)
 //   TS_VBENCH_ITERS   timed iterations (default 5)
 //   TS_VBENCH_WARMUP  warmup iterations (default 1)
 using System.Diagnostics;
 using TensorSharp;
+using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 using TensorSharp.Models;
+using TensorSharp.Runtime;
 
 static string Env(string k, string fallback)
 {
@@ -42,7 +47,7 @@ string mmproj = Env("TS_VBENCH_MMPROJ", type switch
 {
     "mistral3" => @"C:\Works\models\Ministral-3-8B-Instruct-2512-BF16-mmproj.gguf",
     "qwen35" => @"C:\Works\models\Qwen3.6-35B-A3B-mmproj-F16.gguf",
-    "muse-glimmer" or "muse_glimmer" => @"C:\Works\models\muse-glimmer\mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+    "muse-glimmer" or "muse_glimmer" or "muse-glimmer-graph" => @"C:\Works\models\muse-glimmer\mmproj-Muse-Glimmer-30B-Q8_0.gguf",
     _ => @"C:\Works\models\mmproj-Gemma4-F16.gguf",
 });
 
@@ -55,16 +60,32 @@ if (!File.Exists(image)) { Console.WriteLine($"[vbench] missing image: {image}")
 //   ggml_metal           GGML Metal allocator     — the ggml_metal backend
 //   ggml_cuda            GGML CUDA allocator     — the ggml_cuda backend
 //   cuda                 direct CudaAllocator    — TensorSharp's own CUDA backend
+//   mlx                  MlxAllocator            — the mlx backend
+//   managed              CpuAllocator            — the managed cpu backend
 // "cuda" is what `--backend cuda` gives the server; the GGML choices give
 // _useNativeAttention = true and go through the fused GGML graph. Comparing the
 // checksums across these backends proves the optimized encoders are equivalent.
 string backendName = Env("TS_VBENCH_BACKEND", "cpu").ToLowerInvariant();
 IAllocator allocator;
 GgmlContext context = null;
+BackendType backendType;
 if (backendName == "cuda")
 {
     Console.WriteLine("[vbench] backend = direct CUDA (CudaAllocator)");
     allocator = new CudaAllocator(0);
+    backendType = BackendType.Cuda;
+}
+else if (backendName == "mlx")
+{
+    Console.WriteLine("[vbench] backend = MLX (MlxAllocator)");
+    allocator = new MlxAllocator();
+    backendType = BackendType.Mlx;
+}
+else if (backendName == "managed")
+{
+    Console.WriteLine("[vbench] backend = managed (CpuAllocator)");
+    allocator = new CpuAllocator(BlasEnum.DotNet);
+    backendType = BackendType.Cpu;
 }
 else
 {
@@ -79,6 +100,12 @@ else
     Console.WriteLine($"[vbench] ggml backend = {ggmlBackend}");
     context = new GgmlContext(new[] { 0 }, ggmlBackend);
     allocator = new GgmlAllocator(context, 0);
+    backendType = ggmlBackend switch
+    {
+        GgmlBackendType.Metal => BackendType.GgmlMetal,
+        GgmlBackendType.Cuda => BackendType.GgmlCuda,
+        _ => BackendType.GgmlCpu,
+    };
 }
 
 // Each model's encoder exposes a uniform Encode(pixels, dimA, dimB) -> Tensor.
@@ -99,6 +126,18 @@ switch (type)
         int rawPatches = (w / enc.PatchSize) * (h / enc.PatchSize);
         int mergedTokens = rawPatches / (enc.MergeSize * enc.MergeSize);
         geom = $"{w}x{h}, patch={enc.PatchSize}, merge={enc.MergeSize}, rawPatches={rawPatches}, mergedTokens={mergedTokens}";
+        encodeOnce = () => enc.Encode(pixels, w, h);
+        break;
+    }
+    case "muse-glimmer-graph":
+    {
+        using var gguf = new GgufFile(mmproj);
+        var enc = new MuseGlimmerVisionTower(gguf, allocator, backendType);
+        encoder = enc;
+        var (pixels, w, h) = enc.ImageProcessor.ProcessImage(image);
+        int rawPatches = (w / enc.PatchSize) * (h / enc.PatchSize);
+        geom = $"{w}x{h}, patch={enc.PatchSize}, merge={enc.MergeSize}, rawPatches={rawPatches}, " +
+            $"mergedTokens={rawPatches / (enc.MergeSize * enc.MergeSize)}, executor={enc.Graph.Executor.GetType().Name}";
         encodeOnce = () => enc.Encode(pixels, w, h);
         break;
     }
