@@ -83,6 +83,7 @@ namespace TensorSharp.Models
                     throw new InvalidOperationException($"Tensor parallelism needs a group of {tp} devices.");
                 _mesh = new DeviceMesh(1, tp, d => _tpGroup.GetAllocator(d), _tpGroup, null);
                 _rankGraphs = RankGraphsServe(tp);
+                _rankSumsCrossHost = _rankGraphs && ExecutorFor(_mesh.Allocator(0, 0)) is IRankedGraphExecutor ranked && ranked.RanksSumOnHost(tp);
                 if (_rankGraphs)
                 {
                     // A streaming executor sums each partial as the last rank hands it in; a compiling one (GGML) runs
@@ -116,6 +117,13 @@ namespace TensorSharp.Models
 
         /// <summary>Whether this model's tensor-parallel steps run as per-rank graphs (see <see cref="_rankGraphs"/>).</summary>
         protected bool RankGraphs => _rankGraphs;
+
+        /// <summary>Per-rank graphs whose all-reduces go through host memory (<see cref="IRankedGraphExecutor.RanksSumOnHost"/>):
+        /// every step pays a host round trip a reduction, two a layer.</summary>
+        private bool _rankSumsCrossHost;
+
+        /// <summary>Whether this placement's per-rank sums cross the host (see <see cref="_rankSumsCrossHost"/>).</summary>
+        internal bool RankSumsCrossHost => _rankSumsCrossHost;
 
         /// <summary>Whether the family's lowering traces one rank's shard (its local heads, sharded weights and per-rank
         /// state); default: families without recurrent layers, whose blocks the runtime emits.</summary>

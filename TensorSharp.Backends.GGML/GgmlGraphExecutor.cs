@@ -159,12 +159,20 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>Per-rank graphs run where the native driver runs the ranks' plans together (tsg::tp_fused_available):
-        /// ggml-cuda sums each partial on the devices (NCCL or its peer pipeline); ggml-vulkan has no device collective, so each
-        /// segment boundary sums through host staging (tsg::tp_reduce_segment), the transport legacy Muse-Glimmer's Vulkan
-        /// --tp ran on. That is two host crossings a layer, where the per-op tensor-parallel path the runtime ran on Vulkan
-        /// before crossed for every op.</summary>
+        /// ggml-cuda sums each partial on the devices (NCCL or its peer pipeline); ggml-vulkan's collective sums it through
+        /// host memory (ggml-vulkan-comm's imported host buffers, or the driver's own host staging, tsg::tp_reduce_segment,
+        /// without it), the transport legacy Muse-Glimmer's Vulkan --tp ran on. That is two host crossings a layer, where the
+        /// per-op tensor-parallel path the runtime ran on Vulkan before crossed for every op (see <see cref="RanksSumOnHost"/>).</summary>
         public bool RunsRanks(int ranks)
             => Backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
+
+        /// <summary>ggml-vulkan's collective (ggml-vulkan-comm) moves every partial through host memory: each device writes its
+        /// share to an imported host buffer and its peers read it from there, a host thread or SYNC_FD semaphores ordering the
+        /// two. Without a collective that passed its probe (tsg::tp_device_allreduce_usable) the native driver stages the sums
+        /// through host RAM itself (tsg::tp_reduce_segment). Only ggml-cuda's NCCL or peer pipeline keeps them on the
+        /// devices.</summary>
+        public bool RanksSumOnHost(int ranks)
+            => RunsRanks(ranks) && (Backend == GgmlBackendType.Vulkan || !GgmlNative.TensorParallelHasDeviceAllReduce());
 
         /// <summary>A graph is built for the active rank's device: compile with rank <paramref name="rank"/> active.</summary>
         public IGraphPlan CompileForRank(GraphProgram program, int rank)

@@ -223,7 +223,9 @@ public sealed class MuseGlimmerRuntimeTests(ITestOutputHelper output) : IDisposa
     /// Tensor parallelism over two GPUs as per-rank graphs (ggml_cuda; ggml_vulkan since design D4) and whole-layer stages on two
     /// GPUs give the one-GPU logits of the decode and ring-wrap cases on the same backend. Each rank holds one of the fixture's
     /// two KV heads, as a rank of the 30B does under --tp 2, so the ring-wrap case reads wrapped rings whole with one KV head a
-    /// rank (G12: legacy turned its rings off under --tp after ggml-cuda misread that shape).
+    /// rank (G12: legacy turned its rings off under --tp after ggml-cuda misread that shape). Where the ranks' sums cross the
+    /// host (ggml-vulkan) the placement takes 2048-row prompt steps (StandardDecoderModel.RingStepRowsForPlacement), and the
+    /// one-GPU reference runs at the same width.
     /// </summary>
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
     [InlineData(2, 1)]
@@ -251,21 +253,45 @@ public sealed class MuseGlimmerRuntimeTests(ITestOutputHelper output) : IDisposa
         {
             var spec = MuseGlimmerGoldens.Cases.Single(c => c.Name == caseName);
             string path = MuseGlimmerGoldens.WriteFixture(spec.Fixture, _dir);
-            List<float[]> Run(int t, int s)
+            int placedStep = 0;
+            List<float[]> Run(int t, int s, int? stepRows = null)
             {
                 using var _ = KvCacheDtypeConfig.ForCurrentFlowInTests(MuseGlimmerGoldens.CaseKvDtype);
-                using ModelBase model = MuseGlimmerArchitecture.CreateRuntimeModel(path, backend, t, null, s);
-                var decoder = (StandardDecoderModel)model;
-                Assert.Equal(t, decoder.Mesh.TensorParallel);
-                Assert.Equal(s, decoder.Mesh.Stages);
-                List<float[]> outputs = spec.Script(model);
-                // Every step ran as graphs: per-rank graphs under tensor parallelism (its per-op path runs no program).
-                Assert.True(decoder.GraphRuns > 0 && decoder.GraphReplays > 0,
-                    $"{caseName} on {backend}, tp {t} x stages {s}: the steps did not run and replay as graphs ({decoder.GraphRefusalForTests})");
-                return outputs;
+                StandardDecoderModel.RingGeometryForTests.Value = stepRows is int rows ? (rows, StandardDecoderModel.RingAlignment) : null;
+                try
+                {
+                    using ModelBase model = MuseGlimmerArchitecture.CreateRuntimeModel(path, backend, t, null, s);
+                    var decoder = (StandardDecoderModel)model;
+                    Assert.Equal(t, decoder.Mesh.TensorParallel);
+                    Assert.Equal(s, decoder.Mesh.Stages);
+                    if (stepRows == null && t > 1)
+                    {
+                        // The placement picks the prompt step: 2048 rows where the ranks' sums cross the host (ggml-vulkan's
+                        // collective goes through host memory), the runtime's 512 where they stay on the devices.
+                        if (backend == BackendType.GgmlVulkan) Assert.True(decoder.RankSumsCrossHost, $"{caseName}: ggml-vulkan's ranks sum on the host");
+                        Assert.Equal(decoder.RankSumsCrossHost ? StandardDecoderModel.HostStagedRingStepRows : StandardDecoderModel.RingStepRows,
+                            decoder.RingStepRowsInUse);
+                    }
+                    else if (stepRows == null)
+                    {
+                        Assert.False(decoder.RankSumsCrossHost);
+                        Assert.Equal(StandardDecoderModel.RingStepRows, decoder.RingStepRowsInUse);
+                    }
+                    placedStep = decoder.RingStepRowsInUse;
+                    List<float[]> outputs = spec.Script(model);
+                    // Every step ran as graphs: per-rank graphs under tensor parallelism (its per-op path runs no program).
+                    Assert.True(decoder.GraphRuns > 0 && decoder.GraphReplays > 0,
+                        $"{caseName} on {backend}, tp {t} x stages {s}: the steps did not run and replay as graphs ({decoder.GraphRefusalForTests})");
+                    return outputs;
+                }
+                finally
+                {
+                    StandardDecoderModel.RingGeometryForTests.Value = null;
+                }
             }
-            List<float[]> one = Run(1, 1);
             List<float[]> placed = Run(tp, stages);
+            // One GPU at the placed model's step width, so the comparison isolates the placement's arithmetic.
+            List<float[]> one = Run(1, 1, placedStep == StandardDecoderModel.RingStepRows ? null : placedStep);
             double worst = 0, worstMax = 0;
             for (int i = 0; i < one.Count; i++)
             {
