@@ -245,8 +245,9 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     // Measured on the legacy model (MuseGlimmerModel, ggml_metal, M5 Pro, 2026-11-20, TensorSharp db59fbfc + these tests,
     // ggml d9fe7bff) against the goldens (llama.cpp d3c3e242c, Metal): argmax = llama.cpp's token at 640/640 short and
     // 128/128 long teacher-forced positions (every greedy continuation identical for all 128 tokens), the first position's
-    // top-10 log-probabilities within 0.0496 nats (0.0125-0.0496 per prompt). The bounds leave room for the other backends
-    // and for the runtime family, whose kernels and reduction orders differ from both.
+    // top-10 log-probabilities within 0.0496 nats (0.0125-0.0496 per prompt); on MLX the same agreement, within 0.0560
+    // (0.0228-0.0560). The bounds leave room for the other backends and for the runtime family, whose kernels and
+    // reduction orders differ from both.
 
     /// <summary>
     /// The bound on a disagreement between our argmax and llama.cpp's greedy token at a teacher-forced position: each engine
@@ -259,7 +260,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     private const double MinAgreement = 0.97;
 
     /// <summary>The bound on |our log-probability - llama.cpp's| over llama.cpp's top ten at the first generated position (about
-    /// three times the legacy model's worst on ggml_metal).</summary>
+    /// three times the legacy model's worst on ggml_metal and MLX).</summary>
     private const double FirstPositionLogprobBound = 0.15;
 
     private static ModelBase Load(string draft = null)

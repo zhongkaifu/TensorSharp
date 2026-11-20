@@ -1,6 +1,7 @@
 # Muse-Glimmer on the unified runtime and tensor executors
 
-Status: design, plus the legacy baseline measured on the Mac. No stage is implemented. Written
+Status: design, plus the legacy baseline measured on the Mac. Stage S0's Mac part (the llama.cpp goldens and the frozen
+legacy outputs) and stage S1 (the runtime hooks G1-G3) are implemented; S0's CUDA part waits for a GPU. Written
 2026-11-20 on `feature/muse-glimmer-unified`, cut from `origin/main` 2d759459. ggml is upstream
 d9fe7bff, unchanged (AGENTS.md), built with `TENSORSHARP_GGML_NO_UPDATE=1`. Every statement about
 TensorSharp comes from the code at 2d759459. The numbers in [§4.1](#41-legacy-baseline-measured)
@@ -217,7 +218,7 @@ must pass unchanged, and the E2E gates in §4.8 check the same behaviour through
 | `MuseGlimmerSyntheticModelBuilder` | a tiny Glimmer GGUF (SWA pattern, gate, norms, softcap) | kept; extended (S0) |
 | `MuseGlimmerKvGrowTests` (synthetic, any GPU lane) | grow mid-sequence == presized; restore and truncate below the ring | re-pointed at the runtime model (S3) |
 | `MuseGlimmerKvSnapshotTests` (real weights, `TS_TEST_MODEL_DIR`) | captured prefix == live; grow == presized | re-pointed (S3) |
-| `MuseGlimmerParityTests` (real weights + `.parity` goldens) | greedy and long context vs llama.cpp, tokenizer, SWA pattern, DFlash lossless, image geometry | **they skip today: the goldens are not in the repo** (`.parity/` holds only READMEs). Regenerate with `~/work/llama.cpp` (1a24df163, has `muse-glimmer.cpp` and `dflash.cpp`) and commit them under `InferenceWeb.Tests/Fixtures/MuseGlimmer/` (D9) |
+| `MuseGlimmerParityTests` (real weights + `.parity` goldens) | greedy and long context vs llama.cpp, tokenizer, SWA pattern, DFlash lossless, image geometry | **the goldens are committed (S0)**: `InferenceWeb.Tests/Fixtures/MuseGlimmer/LlamaCpp/`, made by `eng/validation/muse-glimmer-llamacpp-goldens.py` with llama.cpp d3c3e242c (D9). The tests teacher-force llama.cpp's continuations and skip only without the IQ2_XXS weights; the legacy model agrees at 768/768 positions on ggml_metal and MLX |
 | `MuseGlimmerMlxDecodeTests` | pipelined greedy contract, `RunDecodeGraphBatched` | delete with `.MlxDecode.cs` |
 | `GgmlMuseGlimmerVisionBlockTests` | the fused CUDA vision block vs a host reference | replaced by tower-program tests (S4) |
 | `MuseGlimmerRegressionTests`, `MuseGlimmerOutputParserTests`, `MuseGlimmerDirectAnswerTests`, `MuseGlimmerKvReuseRenderTests`, `MuseThinkingTransitionTests`, `MuseAtemSchemaTests` | geometry, tokenizer, placeholders, parser, protocol | kept unchanged |
@@ -262,9 +263,9 @@ ggml change.
 
 | # | Gap | Where it lands | Also needed by | Stage |
 |---|---|---|---|---|
-| G1 | **Logit transform** (scale, then tanh softcap): the runtime head has none. Graph `EmitHead` (all-row, last-row, multi-sequence rows), the ranked vocabulary-split head, the per-op head, the greedy-id head (argmax is invariant: no transform there), and the verify rows. Logprobs, sampling and the perplexity probe read these logits. | `StandardDecoderModel(.Graph).cs`: `protected virtual int EmitLogitTransform(GraphStep, int logits)` + a per-op twin | Gemma 4 (`final_logit_softcapping`) | S1 |
-| G2 | **Post-norm epsilon** per block site: the graph `EmitBlockOutput` and the per-op path use `Config.Eps`. Glimmer's post norms take 1e-8. | `protected virtual float PostNormEps(int layer, BlockSite site)` used by both paths | - | S1 |
-| G3 | **Per-op stream input**: the graph has `EmitStreamInput`; the per-op path (multi-node stages, declined executors) has no twin for the weightless input RMSNorm. | per-op `TransformEmbeddedRows` hook (or `RequiresGraphs`, D6) | Gemma 4 (`sqrt(n_embd)` scale) | S1 |
+| G1 | **Logit transform** (scale, then tanh softcap): the runtime head has none. Graph `EmitHead` (all-row, last-row, multi-sequence rows), the ranked vocabulary-split head, the per-op head, the greedy-id head (argmax is invariant: no transform there), and the verify rows. Logprobs, sampling and the perplexity probe read these logits. | `StandardDecoderModel(.Graph).cs`: the family declares `LogitScale` and `FinalLogitSoftcap`; the runtime emits them on every logits path (`EmitLogitTransform`) and per op (`ApplyLogitTransform`), so the two paths cannot disagree (done in S1) | Gemma 4 (`final_logit_softcapping`) | S1 |
+| G2 | **Post-norm epsilon** per block site: the graph `EmitBlockOutput` and the per-op path use `Config.Eps`. Glimmer's post norms take 1e-8. | `protected virtual float PostNormEps(int layer, BlockSite site)` used by the graph, per-op and per-op tensor-parallel layers (done in S1) | - | S1 |
+| G3 | **Per-op stream input**: the graph has `EmitStreamInput`; the per-op path (multi-node stages, declined executors) has no twin for the weightless input RMSNorm. | per-op `ApplyStreamInput` hook, in place on the embedded rows after media injection, before the first layer (`RunLayers`, a multi-node stage's first layer) (done in S1, D6) | Gemma 4 (`sqrt(n_embd)` scale) | S1 |
 | G4 | **Ring geometry per family / backend.** The runtime's ring is W + 512 = 2560 cells and caps prompt steps at 512 rows a sequence. Legacy prefills 2048-row chunks over a 4352-row ring. A 30B dense model's prompt GEMMs may run slower at 512 rows, so measure it. The evidence so far says no: llama.cpp prefills in 512-row ubatches by default and measured pp4096 381.4 against legacy's 382.6 on this Mac (§4.1). ggml_cpu: legacy keeps uniform caches because ggml-cpu's FA scores every masked column; the runtime rings there. | `RingStepRows` as a family/backend choice set by measurement; a CPU policy (linear caches where whole-ring reads cost more) | every SWA family (LFM3, Gemma 4) | S7 (D1) |
 | G5 | **In-graph token embedding.** The runtime embeds on the host and uploads F32 rows (54 MB per 2048-row chunk). Legacy gathers the quantized table in-graph on Metal and CPU. Measure first; implement as `GetRows` over the quantized table leaf where the executor binds it zero-copy. | `StandardDecoderModel.Graph.cs`, GGML builder | every family | S7 |
 | G6 | **ggml_vulkan tensor parallelism.** `GgmlGraphExecutor` declares `TensorParallel` only for CUDA, so `--tp` on Vulkan falls to the runtime's per-op TP. Legacy Glimmer runs fused per-rank graphs on Vulkan through the same native driver (`TSGgml_TensorParallelExecutePlans`). | `GgmlGraphExecutor` capability + Vulkan collective | every family on Vulkan | S6 (D4) |
@@ -457,7 +458,8 @@ arm runs.
   per-chunk comparison (`eng/validation/paired-ppl-chunks.py` style) on a 16K-token text: the
   difference must not be significant (|t| < 2).
 * **Against llama.cpp** (independent): regenerate `.parity` goldens with `~/work/llama.cpp`
-  (1a24df163) and run `MuseGlimmerParityTests` on the runtime. Expect the documented near-tie
+  (committed in S0: llama.cpp d3c3e242c; the legacy model's greedy continuations are llama.cpp's on ggml_metal and MLX)
+  and run `MuseGlimmerParityTests` on the runtime. Expect the documented near-tie
   flips on IQ2_XXS (docs §4), not more.
 
 ### 4.3 Performance gates
@@ -597,7 +599,7 @@ work can start right after S3. The total is about 34 agent-days.
 | D6 | The per-op hooks (G3), or `RequiresGraphs => true` | **The hooks** (about half a day). Every SharedRuntime mechanism then holds, multi-node stages included, and Gemma 4 reuses them |
 | D7 | MLX pipelined greedy decode (`.MlxDecode.cs`, CLI `--benchmark` only) | **Delete it with legacy** if the runtime's MLX real-generation decode is at least legacy's. CLI `--benchmark` on MLX then measures the path serving uses. Port device argmax into `MlxGraphExecutor` (G8) only if the gate fails |
 | D8 | Retired names: `TS_MUSE_GLIMMER_PREFILL_CHUNK`, `_SWA_RING`, `_SWA_ROWS`, `_LAYER_TRACE` (+ `_POS`, `_N`, `_DIR`), `_VENC_TRACE`, `_MLX_STAGE_PROFILE`, `TS_MLX_KV_MATERIALIZE_INTERVAL` | **Retire all of them through the removed-names registry** (a hard error naming the replacement). The two traces are observers, a kept class, but nothing would implement them. Point them at the probe and `TS_GGML_NODE_PROFILE` rather than port a Glimmer-only trace |
-| D9 | Commit llama.cpp goldens as test fixtures | **Yes.** They are small JSON files (`MuseGlimmerParityTests` skips without them today). Regenerate them with `~/work/llama.cpp` 1a24df163 and record its revision |
+| D9 | Commit llama.cpp goldens as test fixtures | **Yes.** They are small JSON files (`MuseGlimmerParityTests` skips without them today). Done in S0 with llama.cpp d3c3e242c (`~/work/llama.cpp-lfm3`, a clean Release Metal build): the 1a24df163 checkout's build directory mixes four builds and its llama-server aborts at startup; d3c3e242c's text graph is 1a24df163's after a refactor |
 | D10 | Validation weights | **UD-Q4_K_XL** (the config's file) on the VM, plus **UD-IQ2_XXS** on the VM and the Mac for a cross-device anchor. Q8_0 only if a stage needs a near-exact reference |
 | D11 | Capabilities legacy lacks: continuous batching, layer split, hybrid, multi-node, n-gram, reuse across image spans, direct-CUDA graphs | **Turn them on at the switch.** Each has a gate in §4, and a SharedRuntime contract cannot declare less |
 | D12 | Hardware (§7) | **One Ada or Blackwell GPU (32 GB+) for S0-S8, and a 2-GPU box for S6** |
