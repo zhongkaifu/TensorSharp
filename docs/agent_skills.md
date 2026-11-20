@@ -447,6 +447,22 @@ When the round budget runs out the model is told so *in the conversation*
 check") and one final generation runs. Returning a tool-call-only turn to the
 user would show them nothing at all.
 
+A call repeated within one turn that cannot return anything new is not answered
+again. A `skills_read` of a file already read in the turn (the same skill, path and
+offset) gets "has not changed since you read it earlier in this turn: that result is
+still in the conversation above", as Claude Code answers a repeated Read; so does a
+second `skills_list` while the reachable skills are the same (an install in the turn
+makes the next listing a new one). A coordination call (`spawn_agent`, `send_input`, `close_agent`, `list_agents`) that
+failed, repeated with the same arguments, is not run: the model is told it failed
+the same way before, with the error. `wait_agent` and the code tools are not
+covered, because a repeat of them may legitimately differ. If the model asks again
+after being told, the loop stops answering tools for the turn and the final
+generation answers, as at the round cap. LFM3-Omni-2B, offered the server's skills
+on ordinary questions, re-read the same `SKILL.md` or retried the same refused
+`spawn_agent` round after round and restated the same sentence each time until the
+cap: 43 of its 54 tool-using turns on the `eng/lfm3/loop` chats re-read a file, and
+36 reached the cap.
+
 Each executed call is reported through `SkillAgentLoopOptions.OnInvocation`,
 which is what the server's structured logs and `skill_step` SSE completion
 metadata are built from. Code tools additionally emit transient
