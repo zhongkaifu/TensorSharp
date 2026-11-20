@@ -1655,6 +1655,20 @@ namespace TensorSharp.Cuda
             return result;
         }
 
+        /// <summary>ggml_gelu_erf as one kernel. The generic decomposition's abs and exp have no CUDA kernels: each ran on the
+        /// element-by-element host fallback, a device-to-host and back round trip: a Muse-Glimmer vision tower's 52 GELUs over
+        /// [patches, 8960] kept a 448 x 224 image's encode at 16.6 s, 0.15 s of it on the device (RTX PRO 4500 Blackwell, nsys).</summary>
+        protected override Tensor GeluErf(Tensor x)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if (kernels == null || x.Storage is not CudaStorage || x.ElementType != DType.Float32)
+                return base.GeluErf(x);
+            using Tensor dense = x.IsContiguous() ? x.CopyRef() : Ops.NewContiguous(x);
+            var result = new Tensor(Allocator, DType.Float32, x.Sizes);
+            Launch(new[] { dense }, result, (k, stream) => k.LaunchGeluErf(Ptr(dense), Ptr(result), dense.ElementCount(), stream));
+            return result;
+        }
+
         /// <summary>ggml's softplus as one kernel (the generic decomposition's abs/exp/log have no CUDA kernels).</summary>
         protected override Tensor Softplus(Tensor x)
         {

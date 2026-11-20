@@ -20,9 +20,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 36;
+        public const int CurrentVersion = 37;
 
-        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gatedDeltaNetScan4, _gatedDeltaNetScan4Kda, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32, _dflashConv;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _gatedDeltaNetScan4, _gatedDeltaNetScan4Kda, _gdnCommit, _softplus, _sqrt, _topk, _topkWide, _argmaxPart, _argmaxMerge, _topkFewPart, _topkFewMerge, _getRows, _getRowsF16, _setRows, _lightningIndexer, _topkMask, _maskCells, _sumRows, _smallMatvec, _countRoutes, _binaryBcast, _hcNorm, _hcPartials, _hcPostPartials, _hcApply, _scaleSilu, _hcGateMix, _hcScatter, _f16ToF32, _f32ToF16, _routeSplit, _waitAdd, _stageCopy, _ssmConv, _deltaNetPrep, _deltaNetPrepTiled, _gatedRmsNorm, _addRmsNorm, _addRmsNormReg, _sigmoidGate, _repackQ6kTiled, _ropeStrided, _sharedGate, _qsaScores, _qsaSelect, _qsaAttention, _qsaStorePool, _attnPrep, _ringAttn64, _ringAttn128, _ringAttnCombine, _setRowsQ8, _q8ToF32, _dflashConv, _geluErf, _q8WeightToF32;
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
@@ -82,6 +82,8 @@ namespace TensorSharp.Cuda
             _setRowsQ8 = module.GetFunction("ts_graph_set_rows_q8_0");
             _q8ToF32 = module.GetFunction("ts_graph_q8_0_to_f32");
             _dflashConv = module.GetFunction("ts_graph_dflash_conv_f32");
+            _geluErf = module.GetFunction("ts_graph_gelu_erf_f32");
+            _q8WeightToF32 = module.GetFunction("ts_graph_q8_0_weight_to_f32");
             // The tiled head's products stream with cp.async into the int8 tensor cores: only an image with their sm_80 bodies.
             if (ArchGuardedKernelsUsable)
             {
@@ -768,6 +770,21 @@ namespace TensorSharp.Cuda
         {
             void** args = stackalloc void*[] { &x, &y, &n };
             CudaDriverApi.cuLaunchKernel(_sqrt, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_gelu_erf over <paramref name="n"/> contiguous floats.</summary>
+        public void LaunchGeluErf(IntPtr x, IntPtr y, long n, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &y, &n };
+            CudaDriverApi.cuLaunchKernel(_geluErf, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The <paramref name="blocks"/> blocks of a q8_0 weight (34 bytes each) as F32 values (32 each), code * d in F32
+        /// as ggml's dequantize_row_q8_0 computes them.</summary>
+        public void LaunchQ8WeightToF32(IntPtr src, IntPtr dst, long blocks, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &src, &dst, &blocks };
+            CudaDriverApi.cuLaunchKernel(_q8WeightToF32, (uint)((blocks + 7) / 8), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>ggml_ssm_conv: x [n_s, channels, length] (time innermost), w [channels, width] (contiguous):
