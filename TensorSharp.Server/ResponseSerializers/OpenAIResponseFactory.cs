@@ -193,6 +193,19 @@ internal static class OpenAIResponseFactory
         };
     }
 
+    /// <summary>A spoken reply's message (OpenAI's audio output): no <c>content</c>, its text being
+    /// <c>audio.transcript</c>; the reasoning and tool calls as a text reply's. <paramref name="audio"/> is null when the
+    /// reply has no content to speak (only tool calls).</summary>
+    public static object SpokenAssistantMessage(string? thinking, IReadOnlyList<ToolCall>? toolCalls, object? audio) => new
+    {
+        role = "assistant",
+        content = (string?)null,
+        reasoning_content = thinking,
+        thinking,
+        tool_calls = BuildToolCalls(toolCalls),
+        audio,
+    };
+
     public static object PlainAssistantMessage(string content) => new
     {
         role = "assistant",

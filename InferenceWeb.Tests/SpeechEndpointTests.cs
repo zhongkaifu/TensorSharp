@@ -269,9 +269,7 @@ public sealed class SpeechEndpointTests : IDisposable
     [InlineData(",\"audio\":{\"voice\":\"female\"}", "modalities is not")]
     [InlineData(",\"modalities\":[\"text\"],\"audio\":{\"voice\":\"female\"}", "does not ask for")]
     [InlineData(",\"modalities\":[\"audio\"],\"audio\":{\"seed\":-3}", "audio.seed")]
-    [InlineData(",\"modalities\":[\"audio\"],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"p\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]", "tools")]
     [InlineData(",\"modalities\":[\"audio\"],\"response_format\":{\"type\":\"json_object\"}", "response_format")]
-    [InlineData(",\"modalities\":[\"audio\"],\"think\":true", "thinking")]
     public async Task ChatAudio_RefusesWhatItCannotServe_With400(string extra, string expected)
     {
         DefaultHttpContext context = await Chat(new SpeakingService(), "{" + Ask + extra + "}");
@@ -288,6 +286,21 @@ public sealed class SpeechEndpointTests : IDisposable
         DefaultHttpContext context = await Chat(service, "{" + Ask + ",\"modalities\":[\"text\",\"audio\"],\"audio\":{\"voice\":\"female\",\"format\":\"wav\"}}");
         Assert.Equal(400, context.Response.StatusCode);
         Assert.Contains(speakerWithoutDecoder ? "mmproj" : "no speech output", Body(context), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // A spoken completion runs what the text completion runs: tools and reasoning pass the rules.
+    [InlineData(",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"p\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]")]
+    [InlineData(",\"think\":true")]
+    [InlineData(",\"stream\":true,\"think\":true")]
+    public async Task ChatAudio_WithToolsOrReasoning_ReachesTheHostedModelGuard(string extra)
+    {
+        DefaultHttpContext context = await Chat(new SpeakingService(), "{\"model\":\"not-hosted.gguf\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]," +
+            "\"modalities\":[\"text\",\"audio\"],\"audio\":{\"voice\":\"female\",\"format\":\"pcm16\"}" + extra + "}");
+        if (extra.Contains("stream", StringComparison.Ordinal))
+            Assert.Contains("not-hosted.gguf", Body(context), StringComparison.Ordinal);   // the stream's error chunk
+        else
+            Assert.Equal(404, context.Response.StatusCode);
     }
 
     [Fact]
