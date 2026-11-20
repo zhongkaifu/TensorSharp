@@ -310,6 +310,7 @@ namespace TensorSharp.Models.SharedDiffusion
             public PresentedImage[] Pictures = Array.Empty<PresentedImage>();
             public bool EncodesReferences;
             public List<PhaseDemand> Demands;
+            public long TargetRows, ReferenceRows;
 
             public long Demand(DiffusionPhase phase) => Demands.FirstOrDefault(d => d.Phase == phase).WorkingBytes;
 
@@ -385,41 +386,14 @@ namespace TensorSharp.Models.SharedDiffusion
                 job.Demands.Add(new(DiffusionPhase.EncodeReferences, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.EncodeReferences)));
             job.Demands.Add(new(DiffusionPhase.Denoise, DiffusionComponent.Denoiser, Denoiser.WorkingBytes(workload, DiffusionPhase.Denoise)));
             job.Demands.Add(new(DiffusionPhase.Decode, DiffusionComponent.Vae, Vae.WorkingBytes(workload, DiffusionPhase.Decode)));
-            if (job.Inputs.Length > 0) RefuseOverTheRowBudget(job, workload);
+            long Rows(LatentShape s) => (long)(s.Height / geometry.Patch) * (s.Width / geometry.Patch);
+            job.TargetRows = Rows(job.Target);
+            job.ReferenceRows = workload.References.Sum(Rows);
             _log($"{name}: {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height}" +
                  (job.Canvas.Output != job.Canvas.Sampling ? $" (returned at {job.Canvas.Output.Width}x{job.Canvas.Output.Height})" : "") +
                  $", {recipe.Describe(steps)}, seed {r.Seed}, {job.Inputs.Length} reference(s)" +
                  (mask != null ? ", masked" : "") + (adapters.IsEmpty ? "" : $", adapters {string.Join(", ", adapters.Adapters.Select(a => a.Name))}"));
             return job;
-        }
-
-        /// <summary>
-        /// An edit whose conditioning or denoising phase alone needs more device memory than the device has (its component's
-        /// weights beside the phase's working memory, against the planner's budget) is refused before anything runs, naming
-        /// its rows: references add rows to both phases, and fewer or smaller ones are the remedy (decision D11). Text to
-        /// image is never refused here; a device with no budget (the CPU backends) refuses nothing.
-        /// </summary>
-        private void RefuseOverTheRowBudget(Prepared job, DiffusionWorkload workload)
-        {
-            long held = _resident.Sum(c => Created(c)?.WeightBytes ?? 0) + _workspaces.Values.Sum();
-            if (_planner.Budget(held) is not long budget) return;
-            DiffusionGeometry g = _family.Geometry;
-            long Rows(LatentShape s) => (long)(s.Height / g.Patch) * (s.Width / g.Patch);
-            long targetRows = Rows(job.Target), referenceRows = workload.References.Sum(Rows);
-            foreach ((DiffusionPhase phase, IResidentComponent component, string what) in new (DiffusionPhase, IResidentComponent, string)[]
-                     {
-                         (DiffusionPhase.Condition, Conditioner, "the text and vision encoding"),
-                         (DiffusionPhase.Denoise, Denoiser, "a denoising step"),
-                     })
-            {
-                long need = component.WeightBytes + job.Demand(phase);
-                if (need <= budget) continue;
-                throw new ArgumentException(
-                    $"{_family.DisplayName}: this edit is too large for the device. Its {job.Inputs.Length} reference image(s) add " +
-                    $"{referenceRows:N0} rows to the {targetRows:N0} rows of the {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height} " +
-                    $"picture (and their vision tokens to the prompt), and {what} would need about {need / 1e9:F1} GB of the " +
-                    $"{budget / 1e9:F1} GB the device has. Use fewer or smaller reference images, or a smaller size.");
-            }
         }
 
         // ---- residency
@@ -436,10 +410,23 @@ namespace TensorSharp.Models.SharedDiffusion
             return _planner.Plan(job.Demands, weights, _resident.ToArray(), new Dictionary<DiffusionComponent, long>(_workspaces), geometryClass);
         }
 
-        /// <summary>The one-line reason a request the device cannot hold is refused (see <see cref="ResidencyPlan.Refused"/>).</summary>
+        /// <summary>
+        /// The one-line reason a request the device cannot hold is refused (see <see cref="ResidencyPlan.Refused"/>: one test,
+        /// against the device's free memory, for every request). An edit whose text-and-vision encoding or denoising step is
+        /// what does not fit names its rows: its references add rows to both phases, and fewer or smaller ones are the remedy
+        /// (decision D11).
+        /// </summary>
         private string Refusal(Prepared job, ResidencyPlan plan)
         {
             static string Gb(long bytes) => (bytes / 1e9).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " GB";
+            if (job.Inputs.Length > 0 && plan.Limiting.Phase is DiffusionPhase.Condition or DiffusionPhase.Denoise)
+            {
+                string what = plan.Limiting.Phase == DiffusionPhase.Condition ? "the text and vision encoding" : "a denoising step";
+                return $"{_family.DisplayName}: this edit is too large for the device. Its {job.Inputs.Length} reference image(s) add " +
+                       $"{job.ReferenceRows:N0} rows to the {job.TargetRows:N0} rows of the {job.Canvas.Sampling.Width}x{job.Canvas.Sampling.Height} " +
+                       $"picture (and their vision tokens to the prompt), and {what} would need about {Gb(plan.MinimumPeak)} of the " +
+                       $"{Gb(plan.Capacity ?? 0)} of device memory free for it. Use fewer or smaller reference images, or a smaller size.";
+            }
             string phase = plan.Limiting.Phase switch
             {
                 DiffusionPhase.Condition => "text encoding",

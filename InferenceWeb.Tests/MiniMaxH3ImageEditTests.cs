@@ -314,24 +314,39 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
     }
 
     /// <summary>The row budget: an edit whose denoising step (its weights beside the step's working memory for the
-    /// references' rows) is over the device's budget is refused with its rows named; the same text to image is not.</summary>
+    /// references' rows) does not fit the device's free memory is refused before it runs, with its rows named, by the same
+    /// test (and the same exception) that refuses any request the device cannot hold; the same text to image is not.</summary>
     [Fact]
     public void EditsOverTheRowBudgetAreRefusedAndTextToImageIsNot()
     {
         var family = new StubbedFamily(new MiniMaxH3ImageFamily(Grid)) { DenoiserWeights = 8L << 30, BytesPerRow = 512 * 1024 };
         using var pipeline = new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlCuda },
-            new ResidencyPlanner(() => 12L << 30, _ => { }), _ => { });
+            new ResidencyPlanner(() => 10L << 30, _ => { }, freeBytes: () => 11L << 30), _ => { });
         DiffusionReference[] refs = Enumerable.Range(0, 4).Select(i => new DiffusionReference(Picture(64, 64, i))).ToArray();
-        string message = Assert.Throws<ArgumentException>(() => pipeline.Run(new DiffusionRequest
+        string message = Assert.Throws<RequestRefusedException>(() => pipeline.Run(new DiffusionRequest
         {
             Prompt = "x", References = refs, Width = 2048, Height = 2048,
         })).Message;
         output.WriteLine(message);
         Assert.Contains("too large for the device", message);
         Assert.Contains("4,096 rows", message);      // 4 references at 1024x1024: 1,024 rows each
+        Assert.Contains("a denoising step would need about", message);
         Assert.Contains("fewer or smaller reference images", message);
         Assert.Equal(0, family.Steps);
         pipeline.Run(new DiffusionRequest { Prompt = "x", Width = 2048, Height = 2048 });
+        Assert.Equal(6, family.Steps);
+    }
+
+    /// <summary>The row budget and the device check are one test: an edit over the plan's budget (its headroom) but within
+    /// the free memory runs, as a text to image does (bf16 at 4096x4096 ran on the A40 with its plan over the budget).</summary>
+    [Fact]
+    public void AnEditOverTheBudgetButWithinTheFreeMemoryRuns()
+    {
+        var family = new StubbedFamily(new MiniMaxH3ImageFamily(Grid)) { DenoiserWeights = 8L << 30, BytesPerRow = 512 * 1024 };
+        using var pipeline = new DiffusionPipeline(family, new DiffusionLoad { Backend = BackendType.GgmlCuda },
+            new ResidencyPlanner(() => 12L << 30, _ => { }, freeBytes: () => 16L << 30), _ => { });
+        DiffusionReference[] refs = Enumerable.Range(0, 4).Select(i => new DiffusionReference(Picture(64, 64, i))).ToArray();
+        pipeline.Run(new DiffusionRequest { Prompt = "x", References = refs, Width = 2048, Height = 2048 });
         Assert.Equal(6, family.Steps);
     }
 
