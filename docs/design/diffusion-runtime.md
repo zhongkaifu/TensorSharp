@@ -505,8 +505,13 @@ noted where it differs.
    tokenized separately and cut at 4,096 tokens each, as diffusers does, so the H3-Image
    conditioner builds the token ids itself and reuses the encoder and its vision tower. Sixteen
    1024-px pictures make about 17,000 text rows, whose materialized attention scores would be
-   70 GB: the native trunk gained an opt-in causal flash attention, used for picture sequences
-   only, so text to image and H3 video keep their graph.) The conditioning is the layer-50 hidden state of every
+   70 GB: the native trunk gained an opt-in query-block attention, used for picture sequences
+   only, so text to image and H3 video keep their graph. Past 1 GiB of scores it materializes
+   them a block of query rows at a time, each block against only the keys it can see: the same
+   F32 scores and softmax, in `[keys, rows, heads]` pieces. A first cut used
+   `ggml_flash_attn_ext`, but ggml-cuda's tensor-core kernel sums V in half precision
+   (`fattn-mma-f16.cuh`'s half2 VKQ tiles), which moved the layer-50 state off the F32 scores
+   by rel. L2 0.09 at 1,076 rows and 0.21 at 4,182 on the A40.) The conditioning is the layer-50 hidden state of every
    row. **Token tags:** label and prompt rows are text (1); every row of a vision block,
    including its start and end markers, is image (0). That matches `MiniMaxH3ImageLayout`'s
    `textTokenModalities` comment.
@@ -904,6 +909,16 @@ becomes available.
   (Q4_K_M versus bf16) is compared by cosine, recorded but not gated. End-to-end pixels across
   engines are not gated: the doc measured 9-12 dB between engines for text-to-image. Review
   composition and rendered text side by side instead.
+  (S5, measured on an A40 with `eng/validation/MiniMaxH3ImageEdit`: resizes, token ids, tags and
+  every position exact; reference rows 69-70% bit-exact, cosine 0.9999996; the target noise 61%
+  bit-exact, max error 2e-6, PyTorch's AVX2 `log`/`sincos` against .NET's. VAE moments: rel. L2
+  1.5-2e-6 from strict float32 diffusers on ggml_cpu, 2.5-5e-4 on ggml_cuda, whose F32 GEMMs
+  run as TF32; diffusers' own CUDA default is 4.3e-4 from its strict float32, and the F16
+  rounding 2.1e-4. ggml-metal's `kernel_mul_mm_f32_f32` stages F32 tiles in half, so ggml_metal
+  is in the same class: max error 7.4e-4 on the synthetic encoder, against 4.5e-7 on ggml_cpu. Step 1 given TensorSharp's inputs: cosine 0.99998 against the official
+  transformer in float32 (TF32 off), 0.99972 against it in bf16 as released, a run that is
+  itself 0.99975 from its float32. The gate reads the float32 run. Comfy-Org's pruned curve-table
+  AdaLN, which every TensorSharp checkpoint carries, moves the float32 step by cosine 2e-6.)
 * **Masked edits.** Weight-0 pixels are byte-identical to the source (gated). The inside of the
   mask is compared with ComfyUI's SetLatentNoiseMask workflow given the same latent mask and
   latent image, as a visual review.
