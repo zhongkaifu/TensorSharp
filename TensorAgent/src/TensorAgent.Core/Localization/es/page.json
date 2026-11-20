@@ -58,7 +58,7 @@
   "page.speech.save": "Guardar audio",
   "page.speech.saveWithLength": "Guardar audio ({seconds} s)",
   "page.speech.saveFailed": "No se pudo guardar el audio: {error}",
-  "page.speech.direct": "Esta respuesta es hablada, así que se genera sin razonamiento, herramientas ni habilidades.",
+  "page.speech.failed": "La voz de la respuesta se detuvo, así que solo se habló una parte: {error}",
   "page.speech.notSaved": "No se pudo guardar el audio de la respuesta, así que no se puede volver a reproducir.",
   "page.image.generatedAlt": "imagen generada",
   "page.image.compareOriginal": "Comparar con el original",

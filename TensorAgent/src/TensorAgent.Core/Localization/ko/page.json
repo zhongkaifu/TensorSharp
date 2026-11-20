@@ -58,7 +58,7 @@
   "page.speech.save": "오디오 저장",
   "page.speech.saveWithLength": "오디오 저장({seconds}초)",
   "page.speech.saveFailed": "오디오를 저장하지 못했습니다: {error}",
-  "page.speech.direct": "이 답변은 음성으로 제공되므로 추론, 도구, 스킬 없이 생성됩니다.",
+  "page.speech.failed": "답변 읽기가 중단되어 일부만 읽었습니다: {error}",
   "page.speech.notSaved": "답변 오디오를 저장하지 못해 다시 재생할 수 없습니다.",
   "page.image.generatedAlt": "생성된 이미지",
   "page.image.compareOriginal": "원본과 비교",

@@ -58,7 +58,7 @@
   "page.speech.save": "保存音频",
   "page.speech.saveWithLength": "保存音频（{seconds} 秒）",
   "page.speech.saveFailed": "无法保存音频：{error}",
-  "page.speech.direct": "此回复以语音进行，因此不会使用推理、工具或技能。",
+  "page.speech.failed": "回复的朗读中断了，只朗读了一部分：{error}",
   "page.speech.notSaved": "无法保存回复的音频，因此不能再次播放。",
   "page.image.generatedAlt": "生成的图像",
   "page.image.compareOriginal": "对比原图",

@@ -615,7 +615,7 @@ namespace TensorSharp.Server
         /// over them would be parsing parsed text.
         /// </para>
         /// </summary>
-        internal IAsyncEnumerable<ChatStreamUpdate>
+        internal virtual IAsyncEnumerable<ChatStreamUpdate>
             ChatStreamWithSkillsAsync(
                 ChatSession session,
                 List<ChatMessage> history,

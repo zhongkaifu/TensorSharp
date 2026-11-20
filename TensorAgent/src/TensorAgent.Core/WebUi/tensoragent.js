@@ -2502,7 +2502,7 @@
       if (typeof f.notice === 'string' && !view.noticesSaid[f.code || f.notice]) {
         // Said once in the turn (a replay of it too), in the page's language when it knows the case.
         view.noticesSaid[f.code || f.notice] = true;
-        var said = f.code === 'speech_direct' ? t('page.speech.direct')
+        var said = f.code === 'speech_failed' ? t('page.speech.failed', { error: f.detail || '' })
           : f.code === 'speech_not_saved' ? t('page.speech.notSaved') : f.notice;
         view.turn.appendChild(el('div', 'turn-note', said));
       }

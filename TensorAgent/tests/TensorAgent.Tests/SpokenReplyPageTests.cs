@@ -46,9 +46,13 @@ public sealed partial class WebUiPageTests
 
     // Two chunks of PCM16 LE: [0, 16384, -16384, 32767] and [-32768, 8192].
     private const string SpokenFrames = """
-        { notice: 'This reply is spoken, so it runs without tools.', code: 'speech_direct', without: ['tools'] },
-        { token: 'Hello, ' }, { audio: 'AAAAQADA/38=', sampleRate: 24000 },
+        { thinking: 'She asked for a greeting.' },
+        { token: 'Hello, ' }, { tool_progress: 'writing', tool: 'shell', text: 'echo hi', seconds: 0 },
+        { tool_progress: 'running', tool: 'shell', text: null, seconds: 0, detail: 'echo hi' },
+        { audio: 'AAAAQADA/38=', sampleRate: 24000 },
+        { tool_progress: 'finished', tool: 'shell', text: null, seconds: 0.1 },
         { token: 'Anna!' }, { audio: 'AIAAIA==', sampleRate: 24000 },
+        { notice: 'The reply\'s speech stopped, so only part of it was spoken: engine busy', code: 'speech_failed', detail: 'engine busy' },
         { done: true, sessionId: 's1', tokenCount: 9, elapsed: 1.5, tokPerSec: 6, promptTokens: 40, kvReusedTokens: 0,
           kvReusePercent: 0, audioId: 'audio_abc', audioUrl: '/uploads/speech-20261119-101500-0123456789ab.wav', audioSeconds: 0.24 }
         """;
@@ -108,8 +112,9 @@ public sealed partial class WebUiPageTests
         Assert.Equal("/uploads/speech-20261119-101500-0123456789ab.wav", result.GetProperty("player").GetString());
         Assert.Equal("Save audio (0.2 s)", result.GetProperty("saveLabel").GetString());
         Assert.Equal("speech-20261119-101500-0123456789ab.wav", result.GetProperty("saveName").GetString());
-        // Once in each spoken turn, in the interface language (the route answers both turns with the same frames).
-        Assert.Equal(Enumerable.Repeat("This reply is spoken, so it runs without reasoning, tools or skills.", 2),
+        // A spoken turn's tool round and reasoning render as a text turn's; its audio plays across the round. A notice is
+        // said once in each turn, in the interface language (the route answers both turns with the same frames).
+        Assert.Equal(Enumerable.Repeat("The reply's speech stopped, so only part of it was spoken: engine busy", 2),
             result.GetProperty("notes").EnumerateArray().Select(n => n.GetString()));
 
         JsonElement answer = result.GetProperty("answer");

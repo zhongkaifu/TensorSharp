@@ -1360,7 +1360,7 @@ button.primary:hover { background: var(--accent-hover); }
         <span>Reasoning</span>
       </label>
       <span class="speech-controls">
-        <label class="reasoning-toggle" id="speech-toggle-label" style="display:none" title="Speak the model's replies aloud as they are generated (reasoning and tools are off for a spoken reply)">
+        <label class="reasoning-toggle" id="speech-toggle-label" style="display:none" title="Speak the model's replies aloud as they are generated (the answer text; reasoning, tool calls and code are not read)">
           <input type="checkbox" id="speech-toggle" onchange="onSpeechToggle()">
           <span class="toggle-track"></span>
           <span>Speak replies</span>
@@ -4286,7 +4286,7 @@ function appendSpokenReply(bubble, message) {
   return box;
 }
 
-/** A sentence the server said about this turn (e.g. what a spoken reply runs without). */
+/** A sentence the server said about this turn (e.g. that its speech stopped, or its audio could not be saved). */
 function appendTurnNotice(bubble, text) {
   if (!bubble || !text) return;
   const note = document.createElement('div');
