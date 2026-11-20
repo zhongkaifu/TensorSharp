@@ -153,6 +153,22 @@ namespace TensorSharp.Models
 
         protected override float FinalLogitSoftcap => _softcap;
 
+        /// <summary>
+        /// The DFlash drafter's default window on ggml_metal: 7 drafts (an 8-row verify). Measured on an M5 Pro (UD-IQ2_XXS, the
+        /// 1.63 GB dflash-kquant drafter, greedy, five prompts x 512 tokens): a verify costs 76-84 ms at any width from 4 to 9
+        /// rows (past one row the IQ2/IQ3 products take the matrix kernel) and 152-160 ms at 16, against 46 ms for a plain step,
+        /// and a block 29 ms whatever its width, so the drafts a verify carries are nearly free up to 8 rows and dear past them.
+        /// With the cost governor: 7 drafts 34.1 tok/s in all, 5 drafts 31.6, 7 at the block default's gate 32.8, against 21.7
+        /// plain (legacy at its own default 30.7); ungoverned, before the prompt-follow fix, 3 / 5 / 7 / 15 drafts 24.8 / 27.3 /
+        /// 27.9 / 17.3. Elsewhere the speculator's default (8) until measured there (docs/design/muse-glimmer-unified.md §5.4).
+        /// </summary>
+        public override int SpecPreferredDraftWindow => HasDFlash && _backend == BackendType.GgmlMetal ? 7 : base.SpecPreferredDraftWindow;
+
+        /// <summary>No confidence gate for the drafter on ggml_metal, where a verify row is nearly free (see
+        /// <see cref="SpecPreferredDraftWindow"/>): 7 drafts without it 34.1 tok/s, with the block default's 0.35 32.8, lower on
+        /// every prompt. The cost governor parks the drafter where its drafts lose (prose: 21.6 tok/s against 21.9 plain).</summary>
+        public override float SpecPreferredBlockGate => HasDFlash && _backend == BackendType.GgmlMetal ? 0f : base.SpecPreferredBlockGate;
+
         protected override string FingerprintExtras =>
             string.Create(CultureInfo.InvariantCulture,
                 $"|muse-glimmer|swa={_window}:{LayerBits(_isSwa)}|rope={_rope.Dims}@{_rope.FreqBase:R}/norm|post={PostNormEpsilon:R}");
