@@ -91,7 +91,8 @@ public class WebUiTurnStatsTests
             Assert.Contains("turnEvalNs += update.EvalNs;", handler.Groups["body"].Value, StringComparison.Ordinal);
         }
 
-        Assert.Matches(@"turnRepetitionExplained,\s*turnEvalTokens,\s*turnEvalNs(?:,\s*knowledge)?\)\)", source);
+        // The totals reach the final frames (a spoken turn's call also passes its audio and materializes the frames).
+        Assert.Matches(@"turnRepetitionExplained,\s*turnEvalTokens,\s*turnEvalNs(?:,\s*knowledge)?(?:,\s*spoken:\s*\w+)?\)(?:\)|\.ToList\(\))", source);
         Assert.Contains("WebUiTurnStats.Summarize(evalTokens, evalNs, tokenCount, sw.Elapsed.TotalSeconds)", source, StringComparison.Ordinal);
     }
 
