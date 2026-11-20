@@ -466,14 +466,21 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
             int[] ids = Enumerable.Range(0, 23).Select(i => (i * 7 + 3) % vocab).ToArray();
             float[] whole = te.Encode(ids, null);
             double maxAbs = whole.Max(v => Math.Abs((double)v));
+            // ggml-cuda's products of the whole [seq, seq, heads] scores run on cuBLAS as TF32 (10-bit mantissas) while a
+            // one-row block's take ggml's F32 vector kernel: 1.4e-3 of 4.0 measured on an A40. A block that saw a key it
+            // should not, or lost one, moves the output by its whole scale.
+            double tolerance = backend == BackendType.GgmlCuda ? 2e-3 : 1e-5;
+            var errors = new List<(int Chunk, double Error)>();
             foreach (int chunk in new[] { 1, 5, ids.Length - 1 })
             {
                 float[] blocks = te.Encode(ids, null, queryChunk: chunk);
                 double maxErr = 0;
                 for (int i = 0; i < whole.Length; i++) maxErr = Math.Max(maxErr, Math.Abs((double)whole[i] - blocks[i]));
                 output.WriteLine($"{backend} query blocks of {chunk}: max |error| {maxErr:E2} of max |value| {maxAbs:F3}");
-                Assert.True(maxErr <= 1e-5 * Math.Max(1, maxAbs), $"{backend} blocks of {chunk}: max |error| {maxErr:E3}");
+                errors.Add((chunk, maxErr));
             }
+            foreach (var (chunk, maxErr) in errors)
+                Assert.True(maxErr <= tolerance * Math.Max(1, maxAbs), $"{backend} blocks of {chunk}: max |error| {maxErr:E3}");
         }
         finally
         {
