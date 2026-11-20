@@ -2681,7 +2681,8 @@ he、it、ja、ko、nl、pl、pt、sv、tr 与 zh。语音回复的语言取请�
 希腊文；拉丁字母则用默认的英语）。Web 聊天的回复，以及除普通英文 chat completions 之外的所有回复，都按普通文本回复生成，
 每句话一完成就由 TTS 提示说出，同时其余文本仍在生成（markdown、表情符号与代码不会朗读）。拉丁字母书写的非英语语言（`fr`、`de`、`es` 等）
 或语音提问时请指定 `language`。未指定语言的 TTS 说文本所用的语言，并把中文文本中的数字读出来（`2024年10月1日` 读作
-二零二四年十月一日）。
+二零二四年十月一日），英文文本中的数字及其间的运算符号也读成英文单词（`42,925` 读作 forty-two thousand nine hundred
+twenty-five，`37 × 43 = 1591` 读作 thirty-seven times forty-three equals one thousand five hundred ninety-one）。
 
 **语音轮次就是文本轮次。** 在 `/api/chat` 与 `/v1/chat/completions` 上，语音请求运行的内容与不带语音的同一请求完全相同：
 推理（`think`）、指定的技能以及主机可供发现的技能目录、客户端的工具、主机的代码工具（`--code-exec`：`shell`、`read_file`、

@@ -157,14 +157,19 @@ namespace TensorSharp.Models.Lfm3
         /// <summary>
         /// What the TTS prompt is given to say for <paramref name="text"/> in <paramref name="language"/> (null: the language
         /// the text's script names): Chinese text with its numerals read out (<see cref="TensorSharp.Models.Audio.ChineseNumberReading"/>),
-        /// which LFM3-Omni says as noise when it sees the digits; any other text as it is.
+        /// English (and Latin-script text with no language, which the TTS speaks as English) with its numerals and the
+        /// arithmetic signs between them as words (<see cref="TensorSharp.Models.Audio.EnglishNumberReading"/>): LFM3-Omni's
+        /// TTS says the digits of either as noise. Any other text as it is.
         /// </summary>
         public static string SpokenForm(string text, string language)
         {
             if (string.IsNullOrEmpty(text)) return text ?? string.Empty;
             string code = string.IsNullOrWhiteSpace(language) ? LanguageOfText(text) : language.Trim().ToLowerInvariant();
-            return code == "zh" || (code != null && code.StartsWith("zh-", StringComparison.Ordinal))
-                ? TensorSharp.Models.Audio.ChineseNumberReading.Read(text) : text;
+            if (code == "zh" || (code != null && code.StartsWith("zh-", StringComparison.Ordinal)))
+                return TensorSharp.Models.Audio.ChineseNumberReading.Read(text);
+            if (code == null || code == "en" || code.StartsWith("en-", StringComparison.Ordinal))
+                return TensorSharp.Models.Audio.EnglishNumberReading.Read(text);
+            return text;
         }
 
         /// <summary>

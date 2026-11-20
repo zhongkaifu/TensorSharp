@@ -331,7 +331,10 @@ completions 与 Responses 的 `audio.language`，CLI 的 `--language`），否�
 说出，与仍在生成的文本在引擎上同批运行（`TensorSharp.Models.Audio.SpeechReplyPath.Synthesized`）。文本即语音的转写；
 markdown 标记、表情符号与围栏代码不会朗读；第一段在满 8 个字符后的逗号处结束，使语音尽早开始。未指定语言的 TTS
 （`/v1/audio/speech`、`--tts`）说文本所用的语言（拉丁字母为模板默认的美式英语），中文文本在交给 TTS 提示前先把数字读出来
-（`2024年10月1日` 读作 `二零二四年十月一日`，`199元` 读作 `一百九十九元`），否则模型会把数字说成噪声。
+（`2024年10月1日` 读作 `二零二四年十月一日`，`199元` 读作 `一百九十九元`），否则模型会把数字说成噪声；英文文本（以及未指定语言的
+拉丁字母文本）在交给 TTS 前把数字及其间的符号写成英文单词（`366` 读作 `three hundred sixty-six`，`3 + 8 = 11` 读作
+`three plus eight equals eleven`，以及 `29th`、`3.14`、`50%`、`18 °C`），否则其 TTS 同样读不清（“366 days” 被听成
+“state-sex days”）。
 
 **语音轮次就是文本轮次。** 在 `/api/chat`（Web UI 与 TensorAgent 的 **Speak replies**）上，每个语音轮次（任何语言）都是该
 请求的文本轮次——推理、指定的技能与技能目录、客户端的工具、主机的代码工具、知识库、子代理以及工具循环的每一轮，帧也相同——

@@ -56,9 +56,11 @@ public sealed class Lfm3TtsLanguageTests
     {
         Assert.Equal("二零二四年十月一日是国庆节，我们放假七天。", Lfm3SpeechPrompt.SpokenForm("2024年10月1日是国庆节，我们放假七天。", null));
         Assert.Equal("原价一百九十九元", Lfm3SpeechPrompt.SpokenForm("原价199元", "zh"));
-        // Not Chinese: as it is (English digits are the English TTS's to read).
-        Assert.Equal("A leap year has 366 days.", Lfm3SpeechPrompt.SpokenForm("A leap year has 366 days.", null));
+        // English digits are read out too (the TTS says "366 days" as noise), with no language (Latin letters) or en;
+        // Chinese text asked for in English, and another Latin-script language, as they are.
+        Assert.Equal("A leap year has three hundred sixty-six days.", Lfm3SpeechPrompt.SpokenForm("A leap year has 366 days.", null));
         Assert.Equal("原价199元", Lfm3SpeechPrompt.SpokenForm("原价199元", "en"));
+        Assert.Equal("Il a 42 ans.", Lfm3SpeechPrompt.SpokenForm("Il a 42 ans.", "fr"));
     }
 
     [Theory]
@@ -93,4 +95,22 @@ public sealed class Lfm3TtsLanguageTests
     [InlineData("C++语言", "C++语言")]
     public void ChineseNumeralsAreReadAsMandarinSaysThem(string text, string read)
         => Assert.Equal(read, ChineseNumberReading.Read(text));
+
+    [Theory]
+    [InlineData("A leap year has 366 days.", "A leap year has three hundred sixty-six days.")]
+    [InlineData("The sum is 42,925.", "The sum is forty-two thousand nine hundred twenty-five.")]
+    [InlineData("37 × 43 = 1591", "thirty-seven times forty-three equals one thousand five hundred ninety-one")]
+    [InlineData("3 + 8 = 11", "three plus eight equals eleven")]
+    [InlineData("Pi is 3.14.", "Pi is three point one four.")]
+    [InlineData("February 29th, the 1st and the 22nd", "February twenty-ninth, the first and the twenty-second")]
+    [InlineData("It is 18 °C, 50% humidity.", "It is eighteen degrees Celsius, fifty percent humidity.")]
+    [InlineData("It fell to -5.", "It fell to minus five.")]
+    [InlineData("1,000,000 users", "one million users")]
+    [InlineData("Count 1, 2, 3.", "Count one, two, three.")]
+    // Numbers inside words, and text without digits, as they are.
+    [InlineData("Use mp3 or x86 in 3D.", "Use mp3 or x86 in 3D.")]
+    [InlineData("No digits here.", "No digits here.")]
+    [InlineData("Call 1234567890123.", "Call one two three four five six seven eight nine zero one two three.")]
+    public void EnglishNumeralsAreReadAsWords(string text, string spoken)
+        => Assert.Equal(spoken, EnglishNumberReading.Read(text));
 }

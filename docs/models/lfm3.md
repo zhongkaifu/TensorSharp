@@ -509,7 +509,9 @@ comma once it has 8 characters so the speech starts early. TTS without a languag
 (`/v1/audio/speech`, `--tts`) speaks the language its text is written in (American English,
 the template's default, for Latin letters), and Chinese text reaches the TTS prompt with its
 numerals read out (`2024年10月1日` as `二零二四年十月一日`, `199元` as `一百九十九元`), which
-the model otherwise says as noise.
+the model otherwise says as noise; English text (and Latin letters with no language) reaches it with its numerals and
+the signs between them as words (`366` as `three hundred sixty-six`, `3 + 8 = 11` as `three plus eight equals eleven`,
+`29th`, `3.14`, `50%`, `18 °C`), which its TTS otherwise garbles too ("366 days" heard as "state-sex days").
 
 **Spoken turns are text turns.** On `/api/chat` (the web UI's and TensorAgent's **Speak replies**)
 every spoken turn, in every language, is the request's text turn - reasoning, named skills and the

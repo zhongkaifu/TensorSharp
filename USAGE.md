@@ -3064,7 +3064,9 @@ every other reply but a plain English chat completion, is generated as an ordina
 spoken by the TTS prompt as soon as it is complete, while the rest is still being generated (markdown, emoji and code
 are not read aloud). Name `language` for a Latin-script language other than English (`fr`, `de`, `es`, ...) or for a
 spoken question. TTS without a language speaks the language its text is written in, and reads the numerals of Chinese
-text out (`2024年10月1日` as 二零二四年十月一日).
+text out (`2024年10月1日` as 二零二四年十月一日) and those of English text, with the signs between them, as words
+(`42,925` as forty-two thousand nine hundred twenty-five, `37 × 43 = 1591` as thirty-seven times forty-three equals one
+thousand five hundred ninety-one).
 
 **A spoken turn is a text turn.** On `/api/chat` and `/v1/chat/completions` a spoken request runs what the same
 request without speech runs: reasoning (`think`), named skills and the catalog the host discovers from, the client's
