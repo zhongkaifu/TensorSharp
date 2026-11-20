@@ -116,6 +116,10 @@ approximation), learned 32x32 position embedding.
   was trained so (the reference feeds `grid_sample` a `meshgrid(..., indexing="xy")`);
   HF transformers (#50847) and llama.cpp (#32433, since d3c3e242c) read it this way.
   Square grids are unaffected; the untransposed order is wrong on every other grid.
+  A tap that falls off the table weighs nothing (the reference's `grid_sample`
+  zero padding, which transformers, vLLM and SGLang reproduce). That matters only
+  where a side has more than 32 patches (above 448 px): llama.cpp's clamped
+  `ggml_interpolate` gives those edge patches the full edge row instead.
 * **Sparse window attention.** Patches are permuted into 32x32 windows (the
   window side is `sqrt(position_embd_rows)`), edge windows clipped. Layers where
   `(il + 1) % 4 == 0` or `il == n_layer - 1` attend globally; the rest attend

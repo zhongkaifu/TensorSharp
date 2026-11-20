@@ -32,9 +32,12 @@ namespace TensorSharp.Models
         /// (MuseGlimmerVisionPositionGridTests).
         /// </para>
         /// <para>
-        /// The arithmetic is ggml_compute_forward_upscale_f32's GGML_SCALE_MODE_BILINEAR branch (no antialias, no
-        /// align-corners flag), which uses half-pixel centres: sf = out / in, src = (dst + 0.5) / sf - 0.5, floor, clamp BOTH
-        /// neighbours to [0, in - 1] and only THEN take the fraction against the clamped low index (clamped again to [0, 1]).
+        /// The arithmetic is the reference's (transformers' <c>_interpolation_axis_taps_weights</c>, bilinear,
+        /// align_corners=False, padding "zeros" as <c>grid_sample</c>'s default; vLLM's and SGLang's ports do the same):
+        /// half-pixel centres, src = (i + 0.5) * side / size - 0.5, taps floor(src) and floor(src) + 1 weighted 1 - |src -
+        /// tap|, and a tap off the table weighs nothing. That last rule matters only where a side of the grid has more patches
+        /// than the table (more than 32, above 448 px): the edge rows there take less of the table than the clamped bilinear
+        /// of ggml_interpolate gives them (llama.cpp d3c3e242c clamps, so it differs from the reference on those grids).
         /// </para>
         /// </summary>
         internal static unsafe void ResamplePositionTable(float* table, int side, int hiddenSize, int gridW, int gridH,
@@ -42,9 +45,6 @@ namespace TensorSharp.Models
         {
             ArgumentNullException.ThrowIfNull(rasterOrder);
             int numTokens = rasterOrder.Length;
-            // The table's column axis runs over the grid's height, its row axis over the width.
-            float sfx = (float)gridH / side;
-            float sfy = (float)gridW / side;
             int vLen = Vector<float>.Count;
 
             fixed (int* orderSrc = rasterOrder)
@@ -57,55 +57,55 @@ namespace TensorSharp.Models
                 {
                     float* src = (float*)tableL;
                     float* dstRow = (float*)dstL + (long)i * hiddenSize;
-                    int* order = (int*)orderL;
+                    int raster = ((int*)orderL)[i];
 
-                    // (gx, gy): where the patch reads the table, column then row.
-                    int raster = order[i];
-                    int gy = raster / gridH;
-                    int gx = raster - gy * gridH;
+                    // The table's row axis runs over the grid's width, its column axis over the height.
+                    int row = raster / gridH;
+                    int col = raster - row * gridH;
+                    Taps(row, gridW, side, out int r0, out float wr0, out float wr1);
+                    Taps(col, gridH, side, out int c0, out float wc0, out float wc1);
+                    int r1 = Math.Min(r0 + 1, side - 1), c1 = Math.Min(c0 + 1, side - 1);
+                    r0 = Math.Max(r0, 0);
+                    c0 = Math.Max(c0, 0);
 
-                    float xf = ((float)gx + 0.5f) / sfx - 0.5f;
-                    int x0 = (int)MathF.Floor(xf);
-                    int x1 = x0 + 1;
-                    x0 = Math.Max(0, Math.Min(x0, side - 1));
-                    x1 = Math.Max(0, Math.Min(x1, side - 1));
-                    float dx = Math.Clamp(xf - x0, 0f, 1f);
-
-                    float yf = ((float)gy + 0.5f) / sfy - 0.5f;
-                    int y0 = (int)MathF.Floor(yf);
-                    int y1 = y0 + 1;
-                    y0 = Math.Max(0, Math.Min(y0, side - 1));
-                    y1 = Math.Max(0, Math.Min(y1, side - 1));
-                    float dy = Math.Clamp(yf - y0, 0f, 1f);
-
-                    float w00 = (1f - dx) * (1f - dy);
-                    float w10 = dx * (1f - dy);
-                    float w01 = (1f - dx) * dy;
-                    float w11 = dx * dy;
-
-                    float* p00 = src + (long)(y0 * side + x0) * hiddenSize;
-                    float* p10 = src + (long)(y0 * side + x1) * hiddenSize;
-                    float* p01 = src + (long)(y1 * side + x0) * hiddenSize;
-                    float* p11 = src + (long)(y1 * side + x1) * hiddenSize;
+                    // The reference's tap order: (r0, c0), (r0, c1), (r1, c0), (r1, c1).
+                    float w00 = wr0 * wc0, w01 = wr0 * wc1, w10 = wr1 * wc0, w11 = wr1 * wc1;
+                    float* p00 = src + (long)(r0 * side + c0) * hiddenSize;
+                    float* p01 = src + (long)(r0 * side + c1) * hiddenSize;
+                    float* p10 = src + (long)(r1 * side + c0) * hiddenSize;
+                    float* p11 = src + (long)(r1 * side + c1) * hiddenSize;
 
                     var v00 = new Vector<float>(w00);
-                    var v10 = new Vector<float>(w10);
                     var v01 = new Vector<float>(w01);
+                    var v10 = new Vector<float>(w10);
                     var v11 = new Vector<float>(w11);
 
                     int d = 0;
                     for (; d <= hiddenSize - vLen; d += vLen)
                     {
                         var a = TensorComputePrimitives.LoadVector(p00 + d);
-                        var b = TensorComputePrimitives.LoadVector(p10 + d);
-                        var c = TensorComputePrimitives.LoadVector(p01 + d);
+                        var b = TensorComputePrimitives.LoadVector(p01 + d);
+                        var c = TensorComputePrimitives.LoadVector(p10 + d);
                         var e = TensorComputePrimitives.LoadVector(p11 + d);
-                        TensorComputePrimitives.StoreVector(dstRow + d, a * v00 + b * v10 + c * v01 + e * v11);
+                        TensorComputePrimitives.StoreVector(dstRow + d, a * v00 + b * v01 + c * v10 + e * v11);
                     }
                     for (; d < hiddenSize; d++)
-                        dstRow[d] = w00 * p00[d] + w10 * p10[d] + w01 * p01[d] + w11 * p11[d];
+                        dstRow[d] = p00[d] * w00 + p01[d] * w01 + p10[d] * w10 + p11[d] * w11;
                 });
             }
+        }
+
+        /// <summary>One axis of the reference's bilinear taps: grid index <paramref name="index"/> of <paramref name="size"/>
+        /// over a table side of <paramref name="side"/>; the first tap and the two taps' weights (0 for a tap off the table).</summary>
+        private static void Taps(int index, int size, int side, out int first, out float w0, out float w1)
+        {
+            float src = (index + 0.5f) * side / size - 0.5f;
+            float floor = MathF.Floor(src);
+            first = (int)floor;
+            w0 = MathF.Max(1f - MathF.Abs(src - floor), 0f);
+            w1 = MathF.Max(1f - MathF.Abs(src - floor - 1f), 0f);
+            if (first < 0 || first > side - 1) w0 = 0f;
+            if (first + 1 < 0 || first + 1 > side - 1) w1 = 0f;
         }
     }
 }

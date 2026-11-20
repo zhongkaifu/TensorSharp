@@ -91,7 +91,10 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   `t / gridH` 行（该轴拉伸到 `gridW`）、第 `t % gridH` 列。模型就是这样训练的
   （参考实现把 `meshgrid(..., indexing="xy")` 传给 `grid_sample`）；HF transformers
   （#50847）和 llama.cpp（#32433，自 d3c3e242c 起）都这样读取。正方形网格不受影响；
-  不转置的读法在其他所有网格上都是错的。
+  不转置的读法在其他所有网格上都是错的。落在表外的采样点权重为零（参考实现
+  `grid_sample` 的零填充，transformers、vLLM 和 SGLang 都照此实现）。这只在某一边
+  超过 32 个 patch（大于 448 像素）时才有影响：llama.cpp 的 `ggml_interpolate`
+  会截断到边界，给这些边缘 patch 完整的边缘行。
 * **稀疏窗口注意力。** patch 被重排进 32x32 的窗口（窗口边长为
   `sqrt(position_embd_rows)`），边缘窗口裁剪。满足 `(il + 1) % 4 == 0` 或
   `il == n_layer - 1` 的层做全局注意力，其余层只在窗口内注意。由于该重排让掩码

@@ -21,7 +21,8 @@ namespace InferenceWeb.Tests;
 /// main 7394e56's MuseGlimmerVisionPatchEmbedder calls it (huggingface/transformers#50847: grid_thw[:, [0, 2, 1]], bilinear,
 /// align_corners=False, zero padding). The table is resampled to the transposed grid (its rows over the grid's width) and read
 /// in raster order, as llama.cpp reads it since d3c3e242c (ggml-org/llama.cpp#32433); the order before that fix (the table's
-/// rows over the grid's rows) agrees on square grids only.
+/// rows over the grid's rows) agrees on square grids only. Taps off the table weigh nothing, as in the reference: llama.cpp's
+/// clamped bilinear differs at the edges of an axis longer than the table.
 /// </summary>
 public sealed class MuseGlimmerVisionPositionGridTests(ITestOutputHelper output)
 {
@@ -99,22 +100,79 @@ public sealed class MuseGlimmerVisionPositionGridTests(ITestOutputHelper output)
         return m;
     }
 
-    /// <summary>Where no tap leaves the table (both sides of the grid at most the table's), the edges do not matter: the
-    /// resample is the reference's.</summary>
+    /// <summary>On every grid, the edges of an axis longer than the table included (their taps off the table weigh nothing,
+    /// as the reference's zero padding has it), the resample is the reference's.</summary>
     [Fact]
-    public void TheTowersResampleIsTheReferencesWhereEveryTapIsInTheTable()
+    public void TheTowersResampleIsTheReferencesOnEveryGrid()
     {
         var (hidden, cases) = Load();
-        int compared = 0;
         foreach (Case c in cases)
         {
-            if (c.GridW > c.Side || c.GridH > c.Side) continue;
             double d = MaxDifference(Resample(Table(c.Side, hidden), c.Side, hidden, c.GridW, c.GridH), c.Values);
             output.WriteLine($"side {c.Side} grid {c.GridW}x{c.GridH}: max |d| {d:E2}");
             Assert.True(d <= Bound, $"side {c.Side} grid {c.GridW}x{c.GridH}: {d:E3} from the reference");
-            compared++;
         }
-        Assert.True(compared >= 3, "the fixture has square and non-square grids inside the table");
+        Assert.Contains(cases, c => c.GridW > c.Side);
+        Assert.Contains(cases, c => c.GridW != c.GridH && c.GridW <= c.Side && c.GridH <= c.Side);
+    }
+
+    /// <summary>llama.cpp d3c3e242c reads the table in the trained order with ggml_interpolate's border-clamped bilinear
+    /// (ggml-cpu ops.cpp): the reference's values wherever every tap is in the table, and different only at the edge patches
+    /// of an axis with more patches than the table, where the reference weighs the tap off the table as zero.</summary>
+    [Fact]
+    public void LlamaCppsClampedResampleDiffersOnlyAtTheEdgesOfAnAxisLongerThanTheTable()
+    {
+        var (hidden, cases) = Load();
+        foreach (Case c in cases)
+        {
+            float[] clamped = ResampleTransposedClamped(Table(c.Side, hidden), c.Side, hidden, c.GridW, c.GridH);
+            double inside = 0, edges = 0;
+            for (int t = 0; t < c.GridW * c.GridH; t++)
+            {
+                // The transposed walk: row t / gridH over gridW, column t % gridH over gridH.
+                int row = t / c.GridH, col = t % c.GridH;
+                bool edge = OffTable(row, c.GridW, c.Side) || OffTable(col, c.GridH, c.Side);
+                for (int k = 0; k < hidden; k++)
+                {
+                    double d = Math.Abs((double)clamped[t * hidden + k] - c.Values[t * hidden + k]);
+                    if (edge) edges = Math.Max(edges, d);
+                    else inside = Math.Max(inside, d);
+                }
+            }
+            output.WriteLine($"side {c.Side} grid {c.GridW}x{c.GridH}: clamped vs reference inside {inside:E2}, at the edges {edges:E2}");
+            Assert.True(inside <= Bound, $"grid {c.GridW}x{c.GridH}: the clamped resample differs off the edges ({inside:E3})");
+            if (c.GridW > c.Side || c.GridH > c.Side) Assert.True(edges > 0.01, $"grid {c.GridW}x{c.GridH}: the edges agree ({edges:E3})");
+        }
+    }
+
+    /// <summary>Whether index <paramref name="i"/> of an axis of <paramref name="size"/> has a weighted bilinear tap off a table
+    /// of <paramref name="side"/> (half-pixel centres): the patches where zero padding and clamping differ.</summary>
+    private static bool OffTable(int i, int size, int side)
+    {
+        double src = (i + 0.5) * side / size - 0.5, floor = Math.Floor(src), frac = src - floor;
+        return (floor < 0 && frac < 1) || (floor + 1 > side - 1 && frac > 0);
+    }
+
+    /// <summary>ggml_interpolate's GGML_SCALE_MODE_BILINEAR over the table in the trained (transposed) order, as llama.cpp's
+    /// graph runs it.</summary>
+    private static float[] ResampleTransposedClamped(float[] table, int side, int hidden, int gridW, int gridH)
+    {
+        var dst = new float[gridW * gridH * hidden];
+        float sfx = (float)gridH / side, sfy = (float)gridW / side;
+        for (int t = 0; t < gridW * gridH; t++)
+        {
+            int gy = t / gridH, gx = t % gridH;
+            float xf = (gx + 0.5f) / sfx - 0.5f, yf = (gy + 0.5f) / sfy - 0.5f;
+            int x0 = (int)MathF.Floor(xf), y0 = (int)MathF.Floor(yf);
+            int x1 = Math.Clamp(x0 + 1, 0, side - 1), y1 = Math.Clamp(y0 + 1, 0, side - 1);
+            x0 = Math.Clamp(x0, 0, side - 1);
+            y0 = Math.Clamp(y0, 0, side - 1);
+            float dx = Math.Clamp(xf - x0, 0f, 1f), dy = Math.Clamp(yf - y0, 0f, 1f);
+            for (int c = 0; c < hidden; c++)
+                dst[t * hidden + c] = (1 - dx) * (1 - dy) * table[(y0 * side + x0) * hidden + c] + dx * (1 - dy) * table[(y0 * side + x1) * hidden + c]
+                    + (1 - dx) * dy * table[(y1 * side + x0) * hidden + c] + dx * dy * table[(y1 * side + x1) * hidden + c];
+        }
+        return dst;
     }
 
     /// <summary>The test sees the defect it guards: the order before the fix is the reference's on a square grid and far from
