@@ -24,7 +24,10 @@
 //
 // Opt-in, same convention as MuseGlimmerParityTests:
 //   TS_TEST_MODEL_DIR        directory holding Muse-Glimmer-*.gguf
-//   TS_MUSE_GLIMMER_BACKEND  backend name (default: ggml_cuda)
+//   TS_MUSE_GLIMMER_BACKEND  backend name (default: the GGML backend the process pins, TS_TEST_GGML_BACKEND; an unknown name
+//                            fails the tests rather than silently picking one)
+// These cover the legacy model. The unified-runtime family's equivalents (it keeps no block snapshots: a prefix restores from
+// a checkpoint, a clone or a checkpoint file) are MuseGlimmerRuntimeKvTests.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -37,8 +40,8 @@ namespace InferenceWeb.Tests;
 
 /// <summary>
 /// [ModelFact] for the Muse-Glimmer weights that also skips when the backend these
-/// tests construct (TS_MUSE_GLIMMER_BACKEND, default ggml_cuda) is not the GGML
-/// backend this process pinned: the second backend could only fail to initialize.
+/// tests construct (TS_MUSE_GLIMMER_BACKEND, default the pinned GGML backend) is not the
+/// GGML backend this process pinned: the second backend could only fail to initialize.
 /// </summary>
 [Xunit.Sdk.TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
 [AttributeUsage(AttributeTargets.Method)]
@@ -47,14 +50,19 @@ public sealed class MuseGlimmerKvFactAttribute : FactAttribute, Xunit.Sdk.ITrait
     public string RequiresValue => "Models";
 
     public MuseGlimmerKvFactAttribute()
-        => Skip = TestGates.ModelSkip("TS_TEST_MODEL_DIR", "muse-glimmer")
-            ?? TestGates.GgmlPinSkip(MuseGlimmerKvSnapshotTests.ResolveBackend());
+        => Skip = TestGates.ModelSkip("TS_TEST_MODEL_DIR", "muse-glimmer") ?? PinSkip();
+
+    // An unknown backend name does not skip: the test runs and fails on it (MuseGlimmerParity.Skip's rule).
+    private static string PinSkip()
+    {
+        try { return TestGates.GgmlPinSkip(MuseGlimmerKvSnapshotTests.ResolveBackend()); }
+        catch (ArgumentException) { return null; }
+    }
 }
 
 public class MuseGlimmerKvSnapshotTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
-    private const string EnvBackend = "TS_MUSE_GLIMMER_BACKEND";
 
     /// <summary>Matches SchedulerConfig.BlockSize, the size CaptureNewlyFullBlocks uses.</summary>
     private const int BlockSize = 256;
@@ -350,15 +358,10 @@ public class MuseGlimmerKvSnapshotTests
         return best;
     }
 
-    internal static BackendType ResolveBackend()
-    {
-        string name = Environment.GetEnvironmentVariable(EnvBackend);
-        if (string.IsNullOrWhiteSpace(name))
-            return BackendType.GgmlCuda;
-        return Enum.TryParse<BackendType>(name, ignoreCase: true, out var parsed)
-            ? parsed
-            : BackendType.GgmlCuda;
-    }
+    /// <summary>The backend the tests run on, as every Muse-Glimmer real-weight test reads it (<see cref="MuseGlimmerParity.Backend"/>):
+    /// TS_MUSE_GLIMMER_BACKEND, else the pinned GGML backend. It used to default to ggml_cuda and to fall back to it on a name it
+    /// could not parse, so on the Metal and CPU lanes every test here skipped as "another GGML backend".</summary>
+    internal static BackendType ResolveBackend() => MuseGlimmerParity.Backend();
 
     private string TryFindModel()
     {

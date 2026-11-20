@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <!-- The runtime settings of the hosts it runs (TensorSharp.Server.Host: the web SDK's server GC and no quick JIT;
+         TensorSharp.Cli: the same), so an A/B against them measures the model, not the process. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <TieredCompilationQuickJit>false</TieredCompilationQuickJit>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../TensorSharp.Server.Host/TensorSharp.Server.Host.csproj" />
+    <ProjectReference Include="../../../TensorSharp.Cli/TensorSharp.Cli.csproj" />
+  </ItemGroup>
+</Project>

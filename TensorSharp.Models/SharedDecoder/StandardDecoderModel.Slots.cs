@@ -267,6 +267,12 @@ namespace TensorSharp.Models
         /// <summary>Tests: the cells a request's slot holds (null where it has none).</summary>
         internal int? SlotCapacityForTests(string requestId) => TryGetSlot(requestId, out Slot slot) ? slot.Capacity : null;
 
+        /// <summary>Tests, probes: the positions a request's slot holds (null where it has none).</summary>
+        internal int? SlotLengthForTests(string requestId) => TryGetSlot(requestId, out Slot slot) ? slot.Length : null;
+
+        /// <summary>Tests, probes: the cells of the active cache (the bound request's slot, else the primary).</summary>
+        internal int ActiveCacheCapacityForTests => _cacheCapacity;
+
         /// <summary>Tests: the bytes a cell of a slot's caches takes (every entry's K and V).</summary>
         internal long CacheBytesPerCellForTests => CacheBytesPerCell();
 

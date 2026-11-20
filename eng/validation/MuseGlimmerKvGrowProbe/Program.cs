@@ -9,6 +9,7 @@ using System.Text.Json;
 using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling;
 
 string Option(string name, string? fallback)
 {
@@ -26,13 +27,22 @@ string? promptFile = Option("--prompt-file", null);
 string? systemFile = Option("--system-file", null);
 string? teacherFile = Option("--teacher", null);
 string? logitsOut = Option("--logits-out", null);
+// --logits-ref: another run's --logits-out (the same prompt and teacher): every step's cosine against that run's row is
+// recorded in the report (Steps[].Cos), so a long run needs no logits file of its own.
+string? logitsRef = Option("--logits-ref", null);
+// --logits-ref2: a second reference (Steps[].Cos2), e.g. the other family's presized arm.
+string? logitsRef2 = Option("--logits-ref2", null);
 // --nll-text: teacher-force a fixed raw text (no chat template) and report its perplexity. The first
 // --nll-prefix tokens are prefilled in one forward; every later token is scored from the logits of the
 // one-row forward before it (the decode path), so a run crosses the same cache grows a generation does.
 string? nllText = Option("--nll-text", null);
 int nllPrefix = int.Parse(Option("--nll-prefix", "64"));
 int steps = int.Parse(Option("--steps", nllText != null ? "0" : "64"));
+// --split: the position a scenario acts at. Inside the prompt it splits the prompt's forward there; at or past the prompt's end
+// (truncate, checkpoint, snapshot on the runtime) the scenario acts in the decode, when the cache holds that many positions.
 int split = int.Parse(Option("--split", "0"));
+// The rows a decode-time truncation forwards past --split before it rewinds there (a live-cache rewind's size).
+int rewind = int.Parse(Option("--rewind", "16"));
 int topK = int.Parse(Option("--topk", "8"));
 int tp = int.Parse(Option("--tp", "1"));
 // --family: "legacy" builds what the descriptor builds (MuseGlimmerModel until the switch, docs/design/muse-glimmer-unified.md
@@ -44,6 +54,9 @@ int benchPrefill = int.Parse(Option("--bench-prefill", "512"));
 int benchDecode = int.Parse(Option("--bench-decode", "128"));
 int benchRuns = int.Parse(Option("--bench-runs", "2"));
 
+string[] scenarios = { "decode", "split", "snapshot", "truncate", "checkpoint", "slot-growth", "bench" };
+if (!scenarios.Contains(scenario))
+    throw new ArgumentException($"Unknown scenario '{scenario}': use one of {string.Join(", ", scenarios)}.");
 if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
     throw new ArgumentException("Pass --model <Muse-Glimmer gguf> (or set TS_TEST_MUSE_GLIMMER_MODEL).");
 if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out BackendType backend))
@@ -61,7 +74,11 @@ var model = family switch
 double loadMs = load.Elapsed.TotalMilliseconds;
 if (model.Config.Architecture != "muse-glimmer")
     throw new InvalidOperationException($"Expected a muse-glimmer model, got {model.Config.Architecture}.");
+var runtime = model as StandardDecoderModel;
+var slots = model as IBatchedPagedModel;
 Console.WriteLine($"[probe] family={family} ({model.GetType().Name}), loaded in {loadMs:F0} ms");
+if (runtime == null && scenario is "checkpoint" or "slot-growth")
+    throw new ArgumentException($"--scenario {scenario} runs on the runtime family (per-request slots and checkpoints): pass --family runtime.");
 
 if (scenario == "bench")
 {
@@ -77,8 +94,8 @@ int[] prompt;
 int[]? teacher = null;
 if (nllText != null)
 {
-    Require(teacherFile == null && promptFile == null && systemFile == null && scenario == "decode",
-        "--nll-text scores its own text: it takes no --teacher, --prompt-file or --system-file, and runs the decode scenario.");
+    Require(teacherFile == null && promptFile == null && systemFile == null,
+        "--nll-text scores its own text: it takes no --teacher, --prompt-file or --system-file.");
     int[] all = model.Tokenizer.Encode(File.ReadAllText(nllText), addSpecial: true).ToArray();
     Require(nllPrefix >= 1 && nllPrefix < all.Length, $"--nll-prefix must be inside the text's {all.Length} tokens.");
     prompt = all[..nllPrefix];
@@ -108,8 +125,34 @@ if (teacherFile != null)
     steps = Math.Min(steps, teacher.Length);
 }
 
+bool inPrompt = split > 0 && split < prompt.Length;
+bool inDecode = runtime != null && split >= prompt.Length && scenario is "snapshot" or "checkpoint" or "truncate";
+switch (scenario)
+{
+    case "split":
+        Require(inPrompt, "--split must be inside the prompt.");
+        break;
+    case "snapshot" when runtime == null:
+        Require(split >= 256 && split < prompt.Length, "--split must cover at least one 256-token block and stay inside the prompt.");
+        break;
+    case "truncate" when runtime == null:
+        Require(inPrompt, "--split must be inside the prompt.");
+        break;
+    case "snapshot" or "checkpoint" or "truncate":
+        Require(inPrompt || (inDecode && teacher != null && split < prompt.Length + steps - 1),
+            "--split must be inside the prompt, or (teacher-forced) a position the decode reaches.");
+        break;
+}
+
+// The runtime's scenarios start on the primary cache (it honours MAX_CONTEXT and TS_KV_INITIAL_TOKENS, as legacy's one cache
+// does); a restored checkpoint continues in the slot of a new request (`request`); slot-growth steps one request's slot through
+// the unified batch entry, as the engine serves it.
+int requestSerial = 0;
+string? request = null;
+bool unified = scenario == "slot-growth";
+
 Console.WriteLine($"[probe] scenario={scenario} family={family} backend={backend} tp={tp} prompt={prompt.Length} tokens steps={steps} split={split} " +
-    $"capacity={Field<int>(model, "_kvCacheCapacity")} swaRows={Field<int>(model, "_kvSwaRows")}");
+    $"capacity={Capacity()} ringCells={RingCells()} kv={model.KvCacheDtype}");
 
 // ---- prefill -----------------------------------------------------------------
 var events = new List<string>();
@@ -123,16 +166,14 @@ switch (scenario)
         break;
     case "split":
         // Two forwards: the second one starts below the initial capacity and ends past it.
-        Require(split > 0 && split < prompt.Length, "--split must be inside the prompt.");
         model.Forward(prompt[..split]);
-        events.Add($"after first forward: seq={model.CacheSeqLen} capacity={Field<int>(model, "_kvCacheCapacity")}");
+        events.Add($"after first forward: seq={model.CacheSeqLen} capacity={Capacity()}");
         logits = model.Forward(prompt[split..]);
         break;
-    case "snapshot":
+    case "snapshot" when runtime == null:
     {
         // What a pooled radix-cache hit does: extract whole 256-token blocks, start a
         // fresh cache, inject them, and forward only the remainder.
-        Require(split >= 256 && split < prompt.Length, "--split must cover at least one block and stay inside the prompt.");
         int blocks = split / 256;
         int reused = blocks * 256;
         model.Forward(prompt);
@@ -155,40 +196,86 @@ switch (scenario)
         logits = model.Forward(prompt[reused..]);
         break;
     }
-    case "truncate":
-    {
+    case "truncate" when inPrompt:
         // What a live-cache rewind does: keep the head, drop the tail, re-forward it.
-        Require(split > 0 && split < prompt.Length, "--split must be inside the prompt.");
         model.Forward(prompt);
-        Require(model.TryTruncateKVCache(split), $"TryTruncateKVCache({split}) refused.");
-        events.Add($"truncated to {model.CacheSeqLen}");
+        Rewind(split, prompt[..split]);
         logits = model.Forward(prompt[split..]);
+        break;
+    case "snapshot" or "checkpoint" when inPrompt:
+        model.Forward(prompt[..split]);
+        Restore(scenario, prompt[..split]);
+        logits = model.Forward(prompt[split..]);
+        break;
+    case "snapshot" or "checkpoint" or "truncate":
+        logits = model.Forward(prompt);   // the scenario acts in the decode
+        break;
+    case "slot-growth":
+    {
+        // A request whose slot holds only its prompt and first token (a reservation its generation outgrows): the unified step
+        // grows the slot as the decode passes its capacity, keeping its rows (TryForwardSlots -> EnsureSlotCapacity).
+        request = "probe-0";
+        ((IUnifiedBatchModel)model).EnsureSequenceSlot(request, prompt.Length + 1);
+        events.Add($"slot reserved for {prompt.Length + 1} tokens: capacity {Capacity()}");
+        logits = Unified(prompt, 0);
         break;
     }
     default:
-        throw new ArgumentException($"Unknown scenario '{scenario}'.");
+        throw new InvalidOperationException(scenario);
 }
 double prefillMs = prefill.Elapsed.TotalMilliseconds;
 
 // ---- decode ------------------------------------------------------------------
 var records = new List<StepRecord>(steps);
 FileStream? logitsStream = logitsOut != null ? File.Create(logitsOut) : null;
+FileStream? refStream = logitsRef != null ? File.OpenRead(logitsRef) : null;
+FileStream? refStream2 = logitsRef2 != null ? File.OpenRead(logitsRef2) : null;
 int vocab = model.Config.VocabSize;
+var refRow = new byte[vocab * 2];
 double nllSum = 0;
+int lastCapacity = Capacity();
 var decode = Stopwatch.StartNew();
 for (int i = 0; i < steps; i++)
 {
-    int position = model.CacheSeqLen;      // the position the next token will occupy
+    int position = Length();      // the position the next token will occupy
     var top = TopK(logits, Math.Min(vocab, logits.Length), topK);
     int chosen = teacher != null ? teacher[i] : top[0].Id;
     if (nllText != null) nllSum -= LogSoftmaxAt(logits, Math.Min(vocab, logits.Length), chosen);
-    records.Add(new StepRecord(i, position, top[0].Id, chosen, top, Field<int>(model, "_kvCacheCapacity")));
+    double? cos = refStream != null ? CosineAgainstReference(logits, refStream, logitsRef!) : null;
+    double? cos2 = refStream2 != null ? CosineAgainstReference(logits, refStream2, logitsRef2!) : null;
+    int capacity = Capacity();
+    if (capacity != lastCapacity)
+    {
+        events.Add($"step {i} (position {position}): capacity {lastCapacity} -> {capacity}");
+        lastCapacity = capacity;
+    }
+    records.Add(new StepRecord(i, position, top[0].Id, chosen, top, capacity, cos, cos2));
     if (logitsStream != null) WriteHalf(logitsStream, logits, vocab);
-    if (i + 1 < steps)
+    if (i + 1 >= steps) break;
+    if (inDecode && position + 1 == split)
+    {
+        // The token at `position` goes in first, so the scenario acts with the cache holding `split` positions.
         logits = model.Forward(new[] { chosen });
+        int[] history = prompt.Concat(teacher![..(i + 1)]).ToArray();
+        if (scenario == "truncate")
+        {
+            // A live-cache rewind: rows past `split` forwarded, then dropped; the decode forwards them again one at a time.
+            int ahead = Math.Min(rewind, teacher.Length - (i + 1));
+            model.Forward(teacher[(i + 1)..(i + 1 + ahead)]);
+            Rewind(split, history);
+        }
+        else
+        {
+            Restore(scenario, history);
+        }
+        continue;
+    }
+    logits = unified ? Unified(new[] { chosen }, position) : model.Forward(new[] { chosen });
 }
 double decodeMs = decode.Elapsed.TotalMilliseconds;
 logitsStream?.Dispose();
+refStream?.Dispose();
+refStream2?.Dispose();
 
 string text = model.Tokenizer.Decode(records.Select(r => r.Chosen).ToList());
 object? nll = nllText == null ? null : new
@@ -200,6 +287,8 @@ object? nll = nllText == null ? null : new
     Perplexity = steps > 0 ? Math.Exp(nllSum / steps) : double.NaN,
     Top1Agreement = steps > 0 ? records.Count(r => r.Argmax == r.Chosen) / (double)steps : double.NaN,
 };
+double[] cosines = records.Where(r => r.Cos.HasValue).Select(r => r.Cos!.Value).ToArray();
+double[] cosines2 = records.Where(r => r.Cos2.HasValue).Select(r => r.Cos2!.Value).ToArray();
 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
 File.WriteAllText(output, JsonSerializer.Serialize(new
 {
@@ -217,8 +306,8 @@ File.WriteAllText(output, JsonSerializer.Serialize(new
         KV_CACHE_DTYPE = Environment.GetEnvironmentVariable("KV_CACHE_DTYPE"),
     },
     KvCacheDtype = model.KvCacheDtype.ToString(),
-    SwaRows = Field<int>(model, "_kvSwaRows"),
-    FinalCapacity = Field<int>(model, "_kvCacheCapacity"),
+    SwaRows = RingCells(),
+    FinalCapacity = Capacity(),
     ModelLoadMilliseconds = loadMs,
     PrefillMilliseconds = prefillMs,
     DecodeMilliseconds = decodeMs,
@@ -226,15 +315,24 @@ File.WriteAllText(output, JsonSerializer.Serialize(new
     Split = split,
     Events = events,
     Nll = nll,
+    LogitsReference = logitsRef != null ? Path.GetFullPath(logitsRef) : null,
+    MinCosine = cosines.Length > 0 ? cosines.Min() : (double?)null,
+    LogitsReference2 = logitsRef2 != null ? Path.GetFullPath(logitsRef2) : null,
+    MinCosine2 = cosines2.Length > 0 ? cosines2.Min() : (double?)null,
     PromptTokens = prompt,
     GeneratedText = text,
     Steps = records,
 }, new JsonSerializerOptions { WriteIndented = false }));
 Console.WriteLine($"[probe] prefill {prefillMs:F0} ms, decode {steps} steps in {decodeMs:F0} ms; wrote {output}");
+foreach (string e in events) Console.WriteLine($"[probe] event: {e}");
+if (cosines.Length > 0)
+    Console.WriteLine($"[probe] cosine against {Path.GetFileName(logitsRef)}: min {cosines.Min():F6} mean {cosines.Average():F6} over {cosines.Length} steps");
+if (cosines2.Length > 0)
+    Console.WriteLine($"[probe] cosine against {Path.GetFileName(logitsRef2)}: min {cosines2.Min():F6} mean {cosines2.Average():F6} over {cosines2.Length} steps");
 if (nllText != null && steps > 0)
     Console.WriteLine($"[probe] nll: {steps} tokens after a {nllPrefix}-token prefix, mean NLL {nllSum / steps:F5}, " +
         $"perplexity {Math.Exp(nllSum / steps):F4}, top-1 agreement {records.Count(r => r.Argmax == r.Chosen) / (double)steps:P2}");
-Console.WriteLine($"[probe] text: {Truncate(text.Replace('\n', ' '), 400)}");
+Console.WriteLine($"[probe] text: {Clip(text.Replace('\n', ' '), 400)}");
 model.Dispose();
 if (backend is BackendType.GgmlMetal or BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlCpu)
     TensorSharp.GGML.GgmlBasicOps.Shutdown();
@@ -281,6 +379,131 @@ void RunBench()
         KvCacheDtype = model.KvCacheDtype.ToString(), ModelLoadMilliseconds = loadMs, PrefillTokens = benchPrefill, DecodeTokens = benchDecode,
         BestPrefillTokensPerSecond = bestPp, BestDecodeTokensPerSecond = bestTg, Runs = runs, FirstRunDecodeTokens = firstTokens,
     }));
+}
+
+// The cells of the cache the scenario writes: on the runtime the active cache (the primary, or a restored request's slot) or the
+// stepped request's slot; legacy's full-attention capacity.
+int Capacity()
+{
+    if (runtime == null) return Field<int>(model, "_kvCacheCapacity");
+    return unified ? runtime.SlotCapacityForTests(request!) ?? 0 : runtime.ActiveCacheCapacityForTests;
+}
+
+// The sliding-window layers' cells: the runtime's rings (the largest), legacy's ring rows.
+int RingCells()
+{
+    if (runtime == null) return Field<int>(model, "_kvSwaRows");
+    int cells = 0;
+    for (int l = 0; l < model.Config.NumLayers; l++) cells = Math.Max(cells, runtime.RingCellsForTests(l));
+    return cells;
+}
+
+int Length() => unified ? runtime!.SlotLengthForTests(request!) ?? 0 : model.CacheSeqLen;
+
+// One unified step of the stepped request: its rows from `start`, the last row's logits. The engine asks for the step's rows
+// each step (BatchExecutor's unified prepare): the slot keeps the reservation and grows when a step needs more than it holds.
+float[] Unified(int[] tokens, int start)
+{
+    var batch = (IUnifiedBatchModel)model;
+    batch.EnsureSequenceSlot(request!, prompt.Length + 1, start + tokens.Length);
+    var outLogits = new float[1][];
+    Require(batch.TryForwardUnified(new[] { request! }, new[] { tokens }, new[] { start }, outLogits),
+        $"the unified step declined {tokens.Length} rows at {start}");
+    return outLogits[0];
+}
+
+// A live-cache rewind of the active cache to `target` positions (it holds `history` and the rows past it). Rings that overwrote
+// what the next row reads refuse it (the runtime's RingsKeepTruncation): the request then re-prefills its history, as the
+// server's turn does.
+void Rewind(int target, int[] history)
+{
+    int cached = model.CacheSeqLen;
+    if (model.TryTruncateKVCache(target))
+    {
+        events.Add($"truncated {cached} -> {model.CacheSeqLen}");
+        return;
+    }
+    events.Add($"truncation {cached} -> {target} refused (the rings overwrote rows the next row reads); re-prefilled {history.Length} tokens");
+    model.ResetKVCache();
+    model.Forward(history);
+}
+
+// What a request served from a cached prefix gets on the runtime: the active cache (`history`'s rows) checkpointed, the source
+// moving on with other rows (the checkpoint must be a copy), then the checkpoint cloned into a new request's slot ("checkpoint");
+// or the checkpoint written to a checkpoint file, the source and the checkpoint released, other rows forwarded over the released
+// cache, and the file read back into a checkpoint that a new request's slot is cloned from ("snapshot": a restarted server's
+// persisted prefix).
+void Restore(string kind, int[] history)
+{
+    string key = $"probe-ck-{requestSerial}";
+    var sw = Stopwatch.StartNew();
+    Require(slots!.TryCheckpointActiveCache(key), $"checkpoint of {model.CacheSeqLen} positions refused");
+    double checkpointMs = sw.Elapsed.TotalMilliseconds;
+    int[] junk = Enumerable.Range(0, 37).Select(k => history[(k * 7919) % history.Length]).ToArray();
+    model.Forward(junk);
+    string next = $"probe-{++requestSerial}";
+    if (kind == "snapshot")
+    {
+        using var file = new MemoryStream();
+        sw.Restart();
+        Require(slots.TryExportRetainedCache(key, file), "checkpoint export refused");
+        double exportMs = sw.Elapsed.TotalMilliseconds;
+        slots.DiscardRetainedCache(key);
+        ReleaseSource();
+        model.ResetKVCache();
+        model.Forward(history.Reverse().ToArray());
+        model.ResetKVCache();
+        file.Position = 0;
+        sw.Restart();
+        Require(slots.TryImportRetainedCache(key, file), "checkpoint import refused");
+        events.Add($"checkpoint file of {history.Length} positions: {file.Length} bytes; checkpoint {checkpointMs:F0} ms, " +
+            $"export {exportMs:F0} ms, import {sw.Elapsed.TotalMilliseconds:F0} ms");
+        Require(slots.TryCloneRetainedCache(key, next), "clone of the imported checkpoint refused");
+        slots.DiscardRetainedCache(key);
+    }
+    else
+    {
+        if (request != null) slots.RestorePrimaryCache();
+        Require(slots.TryCloneRetainedCache(key, next), "clone of the checkpoint refused");
+        slots.DiscardRetainedCache(key);
+        ReleaseSource();
+        events.Add($"checkpoint of {history.Length} positions in {checkpointMs:F0} ms; the source moved on {junk.Length} rows");
+    }
+    Require(!slots.BindSequenceCache(next), "the clone is the request's slot, not a fresh one");
+    request = next;
+    Require(model.CacheSeqLen == history.Length, $"the clone holds {model.CacheSeqLen} positions, the checkpoint {history.Length}");
+}
+
+// The request the restore replaces gives its cache up: the primary is reset, a slot released (it waits in the pool).
+void ReleaseSource()
+{
+    if (request == null)
+    {
+        model.ResetKVCache();
+        return;
+    }
+    slots!.RestorePrimaryCache();
+    slots.OnSequenceReleased(request);
+}
+
+double CosineAgainstReference(float[] values, FileStream reference, string name)
+{
+    int read = 0;
+    while (read < refRow.Length)
+    {
+        int n = reference.Read(refRow, read, refRow.Length - read);
+        if (n == 0) throw new InvalidOperationException($"{name} ends before step {records.Count}.");
+        read += n;
+    }
+    double dot = 0, na = 0, nb = 0;
+    for (int v = 0; v < vocab; v++)
+    {
+        double a = values[v], b = (double)BitConverter.ToHalf(refRow, v * 2);
+        dot += a * b;
+        na += a * a;
+        nb += b * b;
+    }
+    return dot / Math.Max(Math.Sqrt(na) * Math.Sqrt(nb), 1e-30);
 }
 
 static T Field<T>(object target, string name)
@@ -331,7 +554,7 @@ static void WriteHalf(Stream stream, float[] values, int n)
     stream.Write(bytes);
 }
 
-static string Truncate(string s, int n) => s.Length <= n ? s : s[..n] + "...";
+static string Clip(string s, int n) => s.Length <= n ? s : s[..n] + "...";
 
 record TopEntry(int Id, float Logit);
-record StepRecord(int Step, int Position, int Argmax, int Chosen, List<TopEntry> Top, int Capacity);
+record StepRecord(int Step, int Position, int Argmax, int Chosen, List<TopEntry> Top, int Capacity, double? Cos, double? Cos2);
