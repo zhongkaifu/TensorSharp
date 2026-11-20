@@ -566,11 +566,14 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
     /// the plain reference past a divergence is plain greedy resumed from the same prefix the same way (the drafted model's
     /// own plain forwards), not the first run's tail. Every divergence is printed with its margin. (llama.cpp's own DFlash:
     /// <see cref="GoldensAreWellFormed"/>.)
-    /// <para>A divergence over the line still passes when the target's own logits at that position, over the verify window the
-    /// decoder actually verified, prefer DFlash's token. The window is the decoder's own (<see cref="VerifyWindowLog"/>):
-    /// the same tokens in the same number of rows, resumed at the window's first token. That proves the acceptance exact
-    /// against the target's verify products, where the backend's verify rows round apart from its one-row decode (ggml_cuda's
-    /// do). A lane whose verify rows are its one-row decode's bits never reaches that branch.</para>
+    /// <para>A divergence over the line still passes when DFlash's token is the argmax of the verify row that drew it in this
+    /// run (<see cref="VerifyWindowLog"/>): the greedy-lossless property itself, no token emitted that the target's verify
+    /// products did not choose. That is where the backend's verify rows round apart from its one-row decode (ggml_cuda's do).
+    /// A lane whose verify rows are its one-row decode's bits never reaches that branch.</para>
+    /// <para>A corrupt verify forward would pass that check, so the stream is also held to plain one-row decode. Over every
+    /// prompt, with both resumed from plain's prefix past each divergence, DFlash must take plain greedy's token at
+    /// <see cref="VerifyWindowLog.MinAgreement"/> of the positions or more. Each divergence is one position where it does
+    /// not.</para>
     /// </summary>
     [MuseGlimmerModelFact(NeedsDraft = true)]
     public void DFlashDraftingIsLossless()
@@ -586,10 +589,10 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
         Assert.NotNull(spec);
         Assert.True(spec.HasDraftHead, "the DFlash drafter did not arm (HasDraftHead is false)");
         var decoder = new SpeculativeDecoder(spec, spec.DraftBlockSize);
-        var windows = new VerifyWindowLog(decoder);
+        var windows = new VerifyWindowLog(decoder, drafted.Config.VocabSize);
         // GenerateGreedy starts the statistics over on every call: sum them per call.
         long totalDrafted = 0, accepted = 0, verifies = 0, plains = 0;
-        int identical = 0, divergences = 0;
+        int identical = 0, divergences = 0, proven = 0, positions = 0;
         double worstMargin = 0;
         var failures = new List<string>();
         for (int r = 0; r < records.Count; r++)
@@ -598,6 +601,7 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
             int[] want = (int[])plain[r].Tokens.Clone();
             var tops = ((int Id, double Logprob)[][])plain[r].Top.Clone();
             int n = want.Length, start = 0;
+            positions += n;
             var notes = new List<string>();
             while (start < n)
             {
@@ -627,21 +631,16 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
                 worstMargin = Math.Max(worstMargin, margin);
                 if (margin >= DFlashNearTieNats)
                 {
-                    // Over the line: the target's own logits over the window that verified the token.
-                    VerifyWindowLog.Window? window = theirs >= 0 ? windows.Drawing(prompt.Length + j) : null;
-                    if (window is { } w)
+                    // Over the line: DFlash's token must be the argmax of the verify row that drew it in this run.
+                    VerifyWindowLog.Row? row = theirs >= 0 ? windows.Drawing(prompt.Length + j) : null;
+                    if (row is { } drew)
                     {
-                        int anchor = w.Start - prompt.Length;
-                        Assert.Equal(got[anchor], w.Tokens[0]);
-                        double[] lp = VerifyWindowLog.Recompute(drafted, prompt.Concat(got.Take(anchor)).ToArray(), w, prompt.Length + j);
-                        int best = Array.IndexOf(lp, lp.Max());
-                        what += $"; over its verify window ({w.Tokens.Length} rows from @{start + anchor}, row {prompt.Length + j - w.Start - 1}) " +
-                            $"the target takes {best}: dflash's {lp[theirs]:F4}, plain's {lp[want[k]]:F4}";
-                        if (best != theirs)
-                            failures.Add(what);
+                        what += "; " + VerifyWindowLog.Describe(drew, theirs, want[k]);
+                        if (drew.Top[0].Id == theirs) proven++;
+                        else failures.Add(what);
                     }
                     else
-                        failures.Add(what + " (no verify window drew it)");
+                        failures.Add(what + " (no verify row drew it)");
                 }
                 notes.Add(what);
                 start = k + 1;
@@ -658,7 +657,13 @@ public sealed class MuseGlimmerParityTests(ITestOutputHelper output)
         output.WriteLine($"{identical}/{records.Count} identical to plain greedy; {divergences} divergence(s), the widest at a plain top-2 " +
             $"margin of {worstMargin:F4} nat (bound {DFlashNearTieNats}); DFlash acceptance {(totalDrafted > 0 ? (double)accepted / totalDrafted : 0):P1} " +
             $"({accepted}/{totalDrafted} drafted tokens over {verifies} verify steps, {plains} plain steps)");
-        Assert.True(failures.Count == 0, "DFlash left plain greedy where plain's choice was not a near-tie:\n" + string.Join("\n", failures));
+        double agreement = 1.0 - (double)divergences / positions;
+        output.WriteLine($"teacher-forced agreement with plain one-row decode: {positions - divergences}/{positions} = {agreement:P2} " +
+            $"(bound {VerifyWindowLog.MinAgreement:P0}); {proven} divergence(s) over the near-tie line proven by the verify row that drew them");
+        Assert.True(failures.Count == 0, "DFlash left plain greedy where plain's choice was not a near-tie, and not at its verify row's argmax:\n" +
+            string.Join("\n", failures));
+        Assert.True(agreement >= VerifyWindowLog.MinAgreement,
+            $"DFlash agrees with plain one-row decode at {agreement:P2} of the positions, under {VerifyWindowLog.MinAgreement:P0}");
         Assert.True(totalDrafted > 0, "DFlash never drafted a token: the drafter is not running.");
     }
 

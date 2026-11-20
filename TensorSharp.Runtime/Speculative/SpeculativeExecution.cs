@@ -716,6 +716,8 @@ namespace TensorSharp.Runtime.Speculative
                 NextLogits = nextLogits,
                 UsedSpeculation = true,
                 VerifiedWindow = batch,
+                VerifiedLogits = greedyVerify ? null : VerifyLogits,
+                VerifiedDraws = greedyVerify ? VerifyDrawn : null,
             };
         }
 

@@ -177,7 +177,7 @@ namespace TensorSharp.Runtime.Scheduling
         internal PrefixCache.PrefixCacheCoordinator? RadixCache => _executor.RadixCache;
 
         /// <summary>Tests: the executor's batched verifies (<see cref="BatchExecutor.SpecVerifyObserverForTests"/>).</summary>
-        internal Action<string[], int[], int, int[], int[]>? SpecVerifyObserverForTests
+        internal Action<BatchedVerifyRecord>? SpecVerifyObserverForTests
         {
             get => _executor.SpecVerifyObserverForTests;
             set => _executor.SpecVerifyObserverForTests = value;

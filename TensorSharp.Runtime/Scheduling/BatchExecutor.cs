@@ -3646,10 +3646,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// sequence's window in one trunk forward).</summary>
         internal long BatchedSpeculativeSteps => _batchedSpecSteps;
 
-        /// <summary>Tests: each batched verify as the trunk ran it. The arguments are the requests, the positions of their
-        /// windows' first tokens, the window's rows, the windows' tokens (request i's from i * window, padded with its last
-        /// draft), and the rows each kept (its window's first token and its accepted drafts).</summary>
-        internal Action<string[], int[], int, int[], int[]>? SpecVerifyObserverForTests { get; set; }
+        /// <summary>Tests: each batched verify as the trunk ran it (<see cref="BatchedVerifyRecord"/>).</summary>
+        internal Action<BatchedVerifyRecord>? SpecVerifyObserverForTests { get; set; }
 
         /// <summary>
         /// One speculative step for SEVERAL decoding sequences on their per-request
@@ -3993,8 +3991,8 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             batched.CommitBatchedSpecVerify(requestIds, positions, kept);
-            SpecVerifyObserverForTests?.Invoke((string[])requestIds.Clone(), (int[])positions.Clone(), window, (int[])tokens.Clone(),
-                (int[])kept.Clone());
+            SpecVerifyObserverForTests?.Invoke(new BatchedVerifyRecord((string[])requestIds.Clone(), (int[])positions.Clone(), window,
+                (int[])tokens.Clone(), (int[])kept.Clone(), sampledVerify ? null : (int[])drawn.Clone(), sampledVerify ? rowLogits : null, vocab));
             long committed = Timestamp();
             // The anchors' and rows' draws, the acceptance and the trunk's commit of the kept rows.
             long commitTicks = committed - verified;
@@ -5578,4 +5576,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// logits, not just the last position.</summary>
         public float[]? CaptureLogitsAll { get; init; }
     }
+
+    /// <summary>One batched verify as the trunk ran it (<see cref="BatchExecutor.SpecVerifyObserverForTests"/>): the requests,
+    /// the positions of their windows' first tokens, the window's rows, the windows' tokens (request i's from i * window, padded
+    /// with its last draft), the rows each kept (its window's first token and its accepted drafts), and the rows' draws: the
+    /// device's argmax of each row on a greedy verify, or every row's logits ([requests x window x vocab], valid only during
+    /// the callback) on a sampled one.</summary>
+    internal sealed record BatchedVerifyRecord(string[] Ids, int[] Positions, int Window, int[] Tokens, int[] Kept, int[]? Drawn,
+        float[]? Logits, int Vocab);
 }

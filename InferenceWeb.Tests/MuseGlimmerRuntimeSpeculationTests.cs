@@ -97,8 +97,10 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
     /// <item>Or it first leaves plain greedy where plain's top two are a near-tie, by taking plain's runner-up there.</item>
     /// <item>Then it agrees again under teacher forcing. Resumed from the prompt and plain's tokens through that position, it
     /// is plain's continuation, or it leaves it again only at another such near-tie.</item>
-    /// <item>A parting that is not a near-tie still passes when the target's own logits over the verify window that drew the
-    /// token prefer the stream's (<see cref="VerifyWindowLog"/>), as in the real-weight gate.</item>
+    /// <item>A parting that is not a near-tie still passes when the stream's token is the argmax of the verify row that drew it
+    /// in this run (<see cref="VerifyWindowLog"/>), as in the real-weight gate.</item>
+    /// <item>Over the 48 tokens, the stream takes plain greedy's token at <see cref="VerifyWindowLog.MinAgreement"/> of the
+    /// positions or more: a parting is one position where it does not.</item>
     /// </list>
     /// </summary>
     [Theory]
@@ -150,7 +152,7 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
             // Gate 0 and no cost governor: every step drafts the whole block, whatever the (random) drafter's confidence.
             var speculator = new BlockDraftSpeculator(spec, spec.DraftBlockSize, spec.DraftBlockSize) { MinDraftProb = 0 };
             var decoder = new SpeculativeDecoder(spec, speculator) { AdaptiveSpeculation = false, PrefillChunkSize = prompt.Length };
-            var windows = new VerifyWindowLog(decoder);
+            var windows = new VerifyWindowLog(decoder, model.Config.VocabSize);
             List<int> stream = decoder.GenerateGreedy(prompt, maxNew - from);
             Assert.Equal(maxNew - from, stream.Count);
             verifySteps += decoder.VerifySteps;
@@ -165,19 +167,13 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
             string parting = $"token {from + d}: {stream[d]} for plain's {at.Token} (relative margin {at.Margin:E2})";
             if (!(tolerance > 0 && at.Margin <= tolerance && stream[d] == at.RunnerUp))
             {
-                // Not a near-tie: the target's own logits over the window that verified the token must prefer it.
+                // Not a near-tie: the token must be the argmax of the verify row that drew it in this run.
                 string what = $"{label}: token {from + d} is {stream[d]}, plain greedy {at.Token} (runner-up {at.RunnerUp}, relative " +
                     $"margin {at.Margin:E2}{(from > 0 ? $"; resumed at {from}" : "")}), not a near-tie";
-                VerifyWindowLog.Window? window = windows.Drawing(prompt.Length + d);
-                Assert.True(window != null, $"{what}, and no verify window drew it");
-                VerifyWindowLog.Window w = window.Value;
-                int anchor = w.Start - prompt.Length;
-                Assert.Equal(stream[anchor], w.Tokens[0]);
-                double[] lp = VerifyWindowLog.Recompute(model, prompt.Concat(stream.Take(anchor)).ToArray(), w, prompt.Length + d);
-                int best = Array.IndexOf(lp, lp.Max());
-                string over = $"over its {w.Tokens.Length}-row verify window from token {from + anchor} the target takes {best}: " +
-                    $"the stream's {lp[stream[d]]:F4}, plain's {lp[at.Token]:F4}";
-                Assert.True(best == stream[d], $"{what}, and {over}");
+                VerifyWindowLog.Row? row = windows.Drawing(prompt.Length + d);
+                Assert.True(row != null, $"{what}, and no verify row drew it");
+                string over = VerifyWindowLog.Describe(row.Value, stream[d], at.Token);
+                Assert.True(row.Value.Top[0].Id == stream[d], $"{what}, and {over}");
                 parting += "; " + over;
             }
             partings.Add(parting);
@@ -185,6 +181,9 @@ public sealed class MuseGlimmerRuntimeSpeculationTests(ITestOutputHelper output)
         }
         Assert.True(verifySteps > 0, $"{label}: no verify ran");
         Assert.True(drafted > 0, $"{label}: the drafter drafted nothing");
+        double agreement = 1.0 - (double)partings.Count / maxNew;
+        Assert.True(agreement >= VerifyWindowLog.MinAgreement,
+            $"{label}: {partings.Count} parting(s) in {maxNew} tokens, an agreement of {agreement:P1} with plain greedy, under {VerifyWindowLog.MinAgreement:P0}");
         output.WriteLine($"{backend}: {(partings.Count == 0 ? "plain greedy's stream" : $"{partings.Count} parting(s), " +
             $"each agreeing again under teacher forcing: {string.Join("; ", partings)}")}; {blocks} blocks and {injects} injects " +
             $"as programs; declined: {declined ?? "no"}");
