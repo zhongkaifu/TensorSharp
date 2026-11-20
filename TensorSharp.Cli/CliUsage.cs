@@ -576,6 +576,17 @@ namespace TensorSharp.Cli
                     "overrides).",
                     "--kv-cache-dtype q8_0"),
             }),
+            ("Prompt attention (--backend cuda)", new[]
+            {
+                new OptionHelp(TensorSharp.Graph.PromptAttentionConfig.Flag + " <p>",
+                    "Arithmetic of a prompt chunk's attention on --backend cuda: int8 (the default where it runs: " +
+                    "8-bit Q K^T and E4M3 P V for 256-wide heads over an F16 cache, in an sm_120a / sm_121a build; f16 " +
+                    "elsewhere), f16 (the 16-bit-run prompt kernels, bit for bit the earlier default) or f32acc (F32 " +
+                    "accumulation). int8 moves a few long code windows (issue #376's quality gates); f16 keeps the " +
+                    "earlier numbers. Decode, verify and draft rows keep the 16-bit kernels. Sets TS_PROMPT_ATTENTION " +
+                    "(an already-set value is used when the flag is absent).",
+                    TensorSharp.Graph.PromptAttentionConfig.Flag + " f16"),
+            }),
             ("Scheduling", new[]
             {
                 new OptionHelp("--no-prefix-cache",

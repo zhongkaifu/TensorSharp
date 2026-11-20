@@ -22,7 +22,8 @@ namespace InferenceWeb.Tests;
 /// image (skipped elsewhere), over a synthetic Qwen 3.5 dense trunk with an F16 cache: a marked prompt chunk takes it (the
 /// logits near the 16-bit run's), verify windows, decode rows and plain forwards never do (a verify row still the decode row
 /// at its position, bit for bit), speculation over 8-bit prompts emits plain greedy decoding's stream, a band without device
-/// room keeps the 16-bit kernel's bits (and takes the pool's idle blocks before it is refused), and the path is off by default.
+/// room keeps the 16-bit kernel's bits (and takes the pool's idle blocks before it is refused), and the path is the default
+/// where it runs (issue #383), --prompt-attention f16 giving back the 16-bit-run kernels' bits.
 /// </summary>
 public sealed class CudaPromptAttention8ExecutorTests : IDisposable
 {
@@ -200,17 +201,94 @@ public sealed class CudaPromptAttention8ExecutorTests : IDisposable
         }
     }
 
-    /// <summary>Off by default: a marked prompt chunk keeps the 16-bit kernel unless the seam asks.</summary>
+    /// <summary>On by default where it runs (issue #383): with nothing chosen a marked prompt chunk takes the 8-bit kernel on
+    /// every attention layer, and --prompt-attention f16 gives back the 16-bit-run kernels' bits (those of the earlier
+    /// default). Over a q8_0 cache the default runs the 16-bit kernel (the 8-bit kernels read an F16 cache).</summary>
     [CudaFact(PromptAttention8 = true)]
-    public void OffByDefault()
+    public void OnByDefaultWhereItRuns_AndF16GivesBackTheEarlierBits()
+    {
+        float[] eight, sixteen, sixteenAgain;
+        using (KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16))
+        {
+            var (model, executor) = Create(attn8: null);
+            using (model)
+            {
+                long layers = AttentionLayers(model);
+                eight = (float[])model.ForwardPrompt(Tokens(PromptLength)).Clone();
+                Assert.Equal(layers, executor.PromptAttention8Launches);
+                Assert.True(((TensorSharp.Graph.TensorGraphExecutor)executor).PromptChunkAttentions > 0, "the prompt was not marked");
+                executor.PromptAttentionForTests = TensorSharp.Graph.PromptAttentionPath.F16;
+                model.ResetKVCache();
+                sixteen = (float[])model.ForwardPrompt(Tokens(PromptLength)).Clone();
+                Assert.Equal(layers, executor.PromptAttention8Launches);
+            }
+            // The 16-bit-run kernels' bits, as a model whose executor never took the 8-bit path gives them.
+            var (fresh, freshExecutor) = Create(attn8: false);
+            using (fresh)
+                sixteenAgain = (float[])fresh.ForwardPrompt(Tokens(PromptLength)).Clone();
+            Assert.Equal(0, freshExecutor.PromptAttention8Launches);
+        }
+        Assert.True(sixteen.AsSpan().SequenceEqual(sixteenAgain), "--prompt-attention f16 did not give the 16-bit-run kernels' bits");
+        Assert.False(eight.AsSpan().SequenceEqual(sixteen), "the default run gave the 16-bit kernels' bits: it did not attend in 8 bits");
+        using (KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.Q8_0))
+        {
+            var (model, executor) = Create(attn8: null);
+            using (model)
+            {
+                model.ForwardPrompt(Tokens(PromptLength));
+                Assert.Equal(0, executor.PromptAttention8Launches);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Issue #383: each path <c>--prompt-attention</c> chooses (CudaGraphExecutor.PromptAttentionForTests here) runs a prompt
+    /// chunk's attention on its kernel, on any CUDA image. f16 gives the 16-bit-run kernels' bits run after run; f32acc takes
+    /// the kernels with F32 accumulation on every attention layer, its own bits run after run, near f16's logits and not
+    /// their bits; int8, where the image carries the 8-bit kernels, takes them on every attention layer.
+    /// </summary>
+    [CudaFact]
+    public void EachPromptAttentionPathRunsItsKernelOnThePromptChunks()
     {
         using IDisposable dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
         var (model, executor) = Create(attn8: null);
         using (model)
         {
-            model.ForwardPrompt(Tokens(PromptLength));
+            long layers = AttentionLayers(model);
+            float[] Run(TensorSharp.Graph.PromptAttentionPath path)
+            {
+                executor.PromptAttentionForTests = path;
+                model.ResetKVCache();
+                return (float[])model.ForwardPrompt(Tokens(PromptLength)).Clone();
+            }
+            float[] f16 = Run(TensorSharp.Graph.PromptAttentionPath.F16);
+            Assert.Equal(0, executor.PromptAttentionF32AccLaunches);
             Assert.Equal(0, executor.PromptAttention8Launches);
-            Assert.True(((TensorSharp.Graph.TensorGraphExecutor)executor).PromptChunkAttentions > 0, "the prompt was not marked");
+            float[] f32acc = Run(TensorSharp.Graph.PromptAttentionPath.F32Acc);
+            Assert.Equal(layers, executor.PromptAttentionF32AccLaunches);
+            float[] f32accAgain = Run(TensorSharp.Graph.PromptAttentionPath.F32Acc);
+            float[] f16Again = Run(TensorSharp.Graph.PromptAttentionPath.F16);
+            Assert.Equal(2 * layers, executor.PromptAttentionF32AccLaunches);
+            Assert.True(f16.AsSpan().SequenceEqual(f16Again), "two f16 runs differ");
+            Assert.True(f32acc.AsSpan().SequenceEqual(f32accAgain), "two f32acc runs differ");
+            Assert.False(f32acc.AsSpan().SequenceEqual(f16), "f32acc gave f16's bits: the setting changed nothing");
+            double rel = RelativeL2(f32acc, f16);
+            var flash = ((CudaAllocator)executor.Allocator).FlashPrefillKernels;
+            _output.WriteLine($"{PromptLength}-token prompt, {layers} attention layers: f32acc last-row logits rel L2 {rel:E3} against f16 " +
+                $"(F32 accumulation at {flash.F32AccumulationRate:F2} of the F16 rate here)");
+            Assert.True(rel <= 1e-2, $"f32acc last-row logits rel L2 {rel:E3} against f16");
+
+            if (!flash.Runs8BitPrompt(256))
+            {
+                _output.WriteLine("int8 not run: this CUDA image carries no 8-bit prompt kernels (an sm_120a / sm_121a build does)");
+                return;
+            }
+            float[] int8 = Run(TensorSharp.Graph.PromptAttentionPath.Int8);
+            Assert.Equal(layers, executor.PromptAttention8Launches);
+            double rel8 = RelativeL2(int8, f16);
+            _output.WriteLine($"int8 last-row logits rel L2 {rel8:E3} against f16");
+            Assert.True(rel8 <= 0.05, $"int8 last-row logits rel L2 {rel8:E3} against f16");
+            Assert.Equal(2 * layers, executor.PromptAttentionF32AccLaunches);
         }
     }
 

@@ -271,16 +271,16 @@ namespace TensorSharp.Cuda
             _halfBytes = 0;
             _halfLayer[0] = _halfLayer[1] = -1;
             _arenaGeneration++;
-            CudaDriverApi.cuMemGetInfo(out UIntPtr free, out _).ThrowOnError();
-            long shortfall = 2 * want - ((long)free.ToUInt64() - StagingFreeFloorBytes);
+            long free = cuda.FreeDeviceBytes();   // dedicated memory (DeviceMemoryView), not WDDM shared memory
+            long shortfall = 2 * want - (free - StagingFreeFloorBytes);
             if (shortfall > 0)
             {
                 // Only what the halves lack goes back, the least recently used cached blocks first.
                 cuda.TrimLargeCache(shortfall);
                 cuda.Context.MakeCurrent();
-                CudaDriverApi.cuMemGetInfo(out free, out _).ThrowOnError();
+                free = cuda.FreeDeviceBytes();
             }
-            if ((long)free.ToUInt64() - StagingFreeFloorBytes < 2 * want
+            if (free - StagingFreeFloorBytes < 2 * want
                 || CudaDriverApi.cuMemAlloc(out IntPtr arena, new UIntPtr((ulong)(2 * want))) != 0)
                 return false;
             _prefetchArena = arena;

@@ -329,9 +329,13 @@ namespace TensorSharp.Models
                     break;
                 }
             // A new ring, while the pool may grow: beside the contexts finished requests keep, only where the model gives kept
-            // rings back when short and the device has room (RoomForDFlashRing).
+            // rings back when short and the device has room (RoomForDFlashRing), and while fewer contexts are kept than the
+            // model keeps finished sequences a request could continue (KeptContextsWorthARing): a ring kept for a
+            // conversation whose cached prefix is gone is never continued. On Qwen3.8-27B DFlash2 the long-turn reproducer of
+            // issue #383 had grown the pool to nine 81 MiB rings, most of them for the server's warm-up chats and for
+            // conversations the prefix cache had evicted, beside two retained conversations.
             if (chosen == null && (_dflashRingPool?.Count ?? 0) < MaxDFlashRequestRings
-                && (!AnyKeptDFlashRing() || RoomForDFlashRing(DFlashRingBytes)))
+                && (!AnyKeptDFlashRing() || (KeptDFlashRingCount() < KeptContextsWorthARing && RoomForDFlashRing(DFlashRingBytes))))
             {
                 chosen = AllocateDFlashRing();
                 (_dflashRingPool ??= new List<DFlashRing>()).Add(chosen);
@@ -372,6 +376,20 @@ namespace TensorSharp.Models
             OnDFlashRingOwnerChanged(ring.K);
         }
 
+        /// <summary>Finished sequences the model keeps that a later request could continue (the prefix cache's retained
+        /// conversations and checkpoints): kept drafter contexts past this many are not worth a new ring. Unbounded where the
+        /// model does not say.</summary>
+        private protected virtual int KeptContextsWorthARing => int.MaxValue;
+
+        private int KeptDFlashRingCount()
+        {
+            int kept = 0;
+            foreach (DFlashRing ring in AllDFlashRings())
+                if (ring.Owner == null && ring.KeptFor != null)
+                    kept++;
+            return kept;
+        }
+
         private bool AnyKeptDFlashRing()
         {
             foreach (DFlashRing ring in AllDFlashRings())
@@ -406,6 +424,16 @@ namespace TensorSharp.Models
         private long DFlashRingBytes => _dflash == null ? 0
             : 2L * _dflash.NumLayers * _dflash.NumKVHeads * _dflashRingRows * _dflash.HeadDim * sizeof(float) + (long)_dflash.FeatureSize * sizeof(float);
 
+        /// <summary>The drafter rings on the device (the model's own and the pooled ones) and their bytes (diagnostics).</summary>
+        private protected (int Rings, long Bytes) DFlashRingHoldings
+        {
+            get
+            {
+                int rings = (_dflashModelRing != null || _hasDFlash ? 1 : 0) + (_dflashRingPool?.Count ?? 0);
+                return (rings, rings * DFlashRingBytes);
+            }
+        }
+
         /// <summary>The device bytes <see cref="ReleaseIdleDFlashRings"/> gives back at most: the pooled rings no request holds
         /// (the model's own and the bound one stay).</summary>
         private protected long IdleDFlashRingBytes
@@ -438,6 +466,7 @@ namespace TensorSharp.Models
                     idle.Add(ring);
             idle.Sort((a, b) => a.LastUsed.CompareTo(b.LastUsed));
             long freed = 0;
+            using IDisposable toDriver = ReturningToDriver();
             foreach (DFlashRing ring in idle)
             {
                 if (freed >= bytes)

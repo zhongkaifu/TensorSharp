@@ -678,6 +678,17 @@ namespace TensorSharp.Cli
                     case "--width": imageWidth = int.Parse(args[++i]); break;
                     case "--height": imageHeight = int.Parse(args[++i]); break;
                     case "--diffusion-blocks": diffusionBlocks = int.Parse(args[++i]); break;
+                    case TensorSharp.Graph.PromptAttentionConfig.Flag:
+                        {
+                            // Read by the CUDA executor when the model loads, as the server's ApplyPromptAttentionCliFlag.
+                            string promptAttentionStr = args[++i];
+                            if (!TensorSharp.Graph.PromptAttentionConfig.TryParse(promptAttentionStr, out var promptAttention))
+                                throw new ArgumentException(TensorSharp.Graph.PromptAttentionConfig.InvalidValueMessage(
+                                    TensorSharp.Graph.PromptAttentionConfig.Flag, promptAttentionStr));
+                            Environment.SetEnvironmentVariable(TensorSharp.Graph.PromptAttentionConfig.EnvironmentVariable,
+                                TensorSharp.Graph.PromptAttentionConfig.Name(promptAttention));
+                            break;
+                        }
                     case "--kv-cache-dtype":
                         {
                             string kvDtypeStr = args[++i];
@@ -743,6 +754,16 @@ namespace TensorSharp.Cli
             if (listGpus)
             {
                 ListVulkanGpus();
+                return;
+            }
+
+            // An unknown TS_PROMPT_ATTENTION (--prompt-attention above sets a known one) is refused before a model loads,
+            // as the server refuses it, rather than when the CUDA executor reads it.
+            try { TensorSharp.Graph.PromptAttentionConfig.FromEnvironment(); }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine("Configuration error: " + ex.Message);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
                 return;
             }
 

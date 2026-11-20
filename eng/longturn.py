@@ -26,7 +26,7 @@ Without --temperature / --top-k / --top-p / --seed the requests carry no samplin
 apply, as in the issue's script (acceptance then varies from run to run); the issue's replay pinned 0.3 / 20 / 0.8.
 
 Writes <out>/run.json (arguments, model, corpus revision and sha256) and <out>/client.jsonl (one record a request: size,
-round, step, UTC send and receive times, HTTP status, response id, prompt and completion tokens, error), and prints one
+round, step, UTC send and receive times, HTTP status, response id, prompt and completion tokens, reply text, error), and prints one
 line a request. --out defaults to artifacts/longturn/<UTC time>/ in this checkout (ignored by git). A request that fails
 ends its size (B and C need A); the next size runs unless --stop-on-error.
 Standard library only.
@@ -109,9 +109,11 @@ def build_corpus(files: list[tuple[str, str]]) -> str:
     return "".join(f"// FILE {rel}\n" + text for rel, text in files)
 
 
-def conversation(corpus: str, size: int, round_index: int, fresh_rounds: bool) -> tuple[list, list]:
-    """The A and B message lists of one size (C sends B's)."""
-    suffix, doc = corpus[-SUFFIX_CHARS:], corpus[:-SUFFIX_CHARS]
+def conversation(corpus: str, size: int, round_index: int, fresh_rounds: bool,
+                 suffix_chars: int = SUFFIX_CHARS) -> tuple[list, list]:
+    """The A and B message lists of one size (C sends B's). B's file is the corpus's last suffix_chars characters; the
+    document is always the corpus less its last SUFFIX_CHARS, so A's prompt does not depend on B's file."""
+    suffix, doc = corpus[-suffix_chars:], corpus[:-SUFFIX_CHARS]
     cut = doc[: int(size * CHARS_PER_TOKEN)]
     system = SYSTEM if not (fresh_rounds and round_index > 0) else f"{SYSTEM} (Round {round_index + 1}.)"
     a = [{"role": "system", "content": system},
@@ -160,6 +162,8 @@ def chat(base: str, body: dict, timeout: float) -> dict:
         rec["cached_tokens"] = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
         choices = r.get("choices") or [{}]
         rec["finish_reason"] = choices[0].get("finish_reason")
+        # The reply's text, so runs of two trees compare token for token where nothing should change (greedy runs).
+        rec["content"] = (choices[0].get("message") or {}).get("content")
     except urllib.error.HTTPError as e:
         rec["status"] = e.code
         try:
@@ -192,6 +196,7 @@ def run(args) -> int:
     meta = {
         "started": iso(utc_now()), "url": base, "model": model, "sizes": args.sizes, "rounds": args.rounds,
         "fresh_rounds": args.fresh_rounds, "max_tokens_c": args.max_tokens, "sampling": sampling_fields(args) or None,
+        "suffix_chars": args.suffix_chars,
         "corpus_checkout": checkout, "corpus_rev": args.corpus_rev, "corpus_files": len(files),
         "corpus_chars": len(corpus), "corpus_sha256": hashlib.sha256(corpus.encode("utf-8")).hexdigest(),
     }
@@ -203,7 +208,7 @@ def run(args) -> int:
     with open(os.path.join(out, "client.jsonl"), "a", encoding="utf-8") as log:
         for size in args.sizes:
             for rnd in range(args.rounds):
-                a, b = conversation(corpus, size, rnd, args.fresh_rounds)
+                a, b = conversation(corpus, size, rnd, args.fresh_rounds, args.suffix_chars)
                 broken = False
                 for step, msgs, max_tokens in (("A", a, 1), ("B", b, 1), ("C", b, args.max_tokens)):
                     body = {"model": model, "messages": msgs, "max_tokens": max_tokens, **sampling_fields(args)}
@@ -232,6 +237,9 @@ def parse_args(argv):
     ap.add_argument("--fresh-rounds", action="store_true",
                     help="rounds after the first change the system turn, so their A is a fresh prefill instead of a reuse")
     ap.add_argument("--max-tokens", type=int, default=192, help="C's max_tokens (A and B take 1; default: 192)")
+    ap.add_argument("--suffix-chars", type=int, default=SUFFIX_CHARS,
+                    help="characters of B's file, the corpus's last ones (default: %(default)s; 3800 gives issue #383's "
+                         "961-token B turn, under the prefix cache's 1,024-token prompt-tail minimum)")
     ap.add_argument("--temperature", type=float, help="sampling temperature (default: not sent, the server's default)")
     ap.add_argument("--top-k", type=int, help="top-k (default: not sent)")
     ap.add_argument("--top-p", type=float, help="top-p (default: not sent)")
@@ -244,8 +252,8 @@ def parse_args(argv):
     ap.add_argument("--out", help="output directory (default: artifacts/longturn/<UTC time>/ in this checkout)")
     ap.add_argument("--stop-on-error", action="store_true", help="stop at the first failed request instead of the next size")
     args = ap.parse_args(argv)
-    if args.rounds < 1 or any(s <= 0 for s in args.sizes) or args.max_tokens < 1:
-        ap.error("--rounds, --sizes and --max-tokens must be positive")
+    if args.rounds < 1 or any(s <= 0 for s in args.sizes) or args.max_tokens < 1 or not 0 < args.suffix_chars <= SUFFIX_CHARS:
+        ap.error(f"--rounds, --sizes and --max-tokens must be positive, --suffix-chars 1-{SUFFIX_CHARS}")
     return args
 
 

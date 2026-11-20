@@ -56,17 +56,30 @@ namespace TensorSharp.Cuda
                 throw;
             }
 
+            // What room checks read (DeviceMemoryView): cuMemGetInfo bounded by NVML's dedicated figures and a deployment
+            // budget. On Windows cuMemGetInfo's total counts shared system memory (an RTX Spark N1X: 50,803 MiB against 38,912
+            // dedicated) and its free only this process's allocations (issue #383).
+            Context = context;
+            context.MakeCurrent();
+            IDedicatedMemoryProbe nvml = NvmlDedicatedMemoryProbe.Create(deviceId);
+            long budget = DeviceMemoryView.BudgetFromEnvironment();
+            memoryView = new DeviceMemoryView(ReadDriverMemory, nvml, budget, driverMaySpill: OperatingSystem.IsWindows());
+            if (nvml == null && budget == 0 && OperatingSystem.IsWindows())
+                ReportOnce.NoDedicatedReading.Report(() =>
+                    $"WARNING: [cuda] GPU {deviceId}: NVML (nvml.dll) did not report this device, so room checks read cuMemGetInfo alone, "
+                    + "whose total on Windows counts shared system memory and whose free counts only this process: allocations can "
+                    + "spill into shared memory before any room check fails. Set TENSORSHARP_CUDA_DEVICE_BUDGET_MB a little under the "
+                    + "device's dedicated memory. Reported once.");
+
             // Default: a quarter of the device's memory, at least 1 GB. A graph executor's prompt step allocates each
             // op's activations as it runs (a 3.6K-token step of Qwen3.8-27B holds 0.5 GB gate|up products); past the
             // budget every one went back to the driver through a synchronizing cuMemFree (2,863 a prompt, 0.55 s of a
             // 2.3 s prefill on an RTX PRO 4500). An allocation that finds the device full gives back the cached blocks it
             // needs, the least recently used size first (DeviceMemoryReclaimLadder).
-            context.MakeCurrent();
-            long deviceBytes = CudaDriverApi.cuMemGetInfo(out UIntPtr _, out UIntPtr totalBytes) == 0 ? (long)totalBytes.ToUInt64() : 0;
+            long deviceBytes = memoryView.TryRead(out long _, out long viewTotal) ? viewTotal : 0;
             long largeCachedBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_LARGE_MB", Math.Max(1024L, deviceBytes / 4 / (1024L * 1024L)))
                 * 1024L * 1024L;
 
-            Context = context;
             freeReserveBytes = minFreeReserveBytes;
             _stream = stream;
             Blas = blas;
@@ -95,7 +108,8 @@ namespace TensorSharp.Cuda
                 ReportOnce.FullDrain,
                 deviceId,
                 VramLogEnabled ? line => Console.WriteLine($"{line}; {GetStats()}") : null,
-                minFreeReserveBytes);
+                minFreeReserveBytes,
+                bytes => MemoryView.ShortfallBytes(bytes, freeReserveBytes));
         }
 
         // What an allocation does when the device is full (see DeviceMemoryReclaimLadder).
@@ -327,7 +341,11 @@ namespace TensorSharp.Cuda
             lock (_claims)
                 if (_claims.Count > 0 && _claims.Remove(ptr, out owner))
                     owner.Add((ptr, allocationBytes));
-            if (owner != null) return;
+            if (owner != null)
+            {
+                NoteRecordingBytes(allocationBytes);
+                return;
+            }
             lock (_deferSync)
                 if (_deferDepth > 0)
                 {
@@ -352,7 +370,36 @@ namespace TensorSharp.Cuda
                     pool.Return(ptr, allocationBytes);
                 return;
             }
+            if (t_returnToDriver > 0 && CudaGraphCapture.MayFreeCachedBlocksUnasked(this))
+            {
+                pool.ReturnToDriver(ptr, allocationBytes);
+                return;
+            }
             pool.Return(ptr, allocationBytes);
+        }
+
+        // Scopes on this thread whose large returned blocks go back to the driver (ReturningToDriver).
+        [ThreadStatic] private static int t_returnToDriver;
+
+        /// <summary>
+        /// Until the scope is disposed, large blocks this thread returns go back to the driver instead of the pool's cache: a
+        /// holder that frees memory no allocation of its sizes will reuse (a slot's caches and states when the slot is
+        /// disposed, a drafter ring given up). Cached, they stayed on the device until a trim: a 47K-token Qwen3.8-27B
+        /// conversation's 32 K/V tensors of 112 MiB, released when the next conversation came, waited in the cache beside
+        /// that conversation's new slot, and on WDDM pushed it into shared system memory (issue #383). Not while a graph is
+        /// captured on this allocator or a capture that just ended takes its blocks (they are pooled as before), and never a
+        /// block a recorded graph claimed or a concurrent region holds back (<see cref="ReturnDeviceMemory"/>).
+        /// </summary>
+        public ReturnToDriverScope ReturningToDriver()
+        {
+            t_returnToDriver++;
+            return new ReturnToDriverScope();
+        }
+
+        /// <summary>The scope <see cref="ReturningToDriver"/> opens.</summary>
+        public readonly struct ReturnToDriverScope : IDisposable
+        {
+            public void Dispose() => t_returnToDriver--;
         }
 
         /// <summary>Remove a specific free block from the pool so a cached CUDA
@@ -387,8 +434,20 @@ namespace TensorSharp.Cuda
             int rc = CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)allocationBytes));
             if (rc == OutOfMemoryStatus) return IntPtr.Zero;
             rc.ThrowOnError();
+            lock (backingSizes)
+            {
+                backingSizes[ptr] = allocationBytes;
+                backingBytes += allocationBytes;
+            }
+            if (MemoryView.AllocationsMaySpill) MemoryView.NoteAllocated(allocationBytes);
             return ptr;
         }
+
+        // The size of each block the pool's backing allocation made, and their sum: a free is counted against the last NVML
+        // reading where allocations may pass dedicated memory (DeviceMemoryView.AllocationsMaySpill), and the sum less the
+        // cached blocks is what the device holds live through the pool (diagnostics).
+        private readonly Dictionary<IntPtr, long> backingSizes = new();
+        private long backingBytes;
 
         /// <summary>The ladder's last resort, the old out-of-memory path: storages whose last reference is an
         /// unreachable-but-unfinalized tensor (view chains) only release on collection; collect them, then drain every
@@ -407,51 +466,68 @@ namespace TensorSharp.Cuda
         {
             Context.MakeCurrent();
             CudaDriverApi.cuMemFree(ptr);
+            long bytes;
+            lock (backingSizes)
+            {
+                backingSizes.Remove(ptr, out bytes);
+                backingBytes -= bytes;
+            }
+            if (bytes > 0 && MemoryView.AllocationsMaySpill) MemoryView.NoteAllocated(-bytes);
         }
 
-        /// <summary>Free dedicated device memory in bytes, for the pool's
-        /// VRAM-pressure valve. Sampled at most every ~10 ms, so the MakeCurrent +
-        /// cuMemGetInfo cost stays off the hot return path.</summary>
+        /// <summary>Free dedicated device memory in bytes (<see cref="MemoryView"/>), for the pool's VRAM-pressure valve.
+        /// Sampled at most every ~100 ms, so the MakeCurrent + cuMemGetInfo cost stays off the hot return path.</summary>
         private long QueryFreeDeviceBytes()
+            => MemoryView.TryRead(out long free, out long _) ? free : long.MaxValue; // on query failure, don't throttle caching
+
+        /// <summary>cuMemGetInfo on this allocator's context; null where it fails.</summary>
+        private (long Free, long Total)? ReadDriverMemory()
         {
             Context.MakeCurrent();
-            if (CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr _) != 0)
-                return long.MaxValue; // on query failure, don't throttle caching
-            return (long)free.ToUInt64();
+            return CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr total) == 0
+                ? ((long)free.ToUInt64(), (long)total.ToUInt64())
+                : null;
         }
+
+        private readonly DeviceMemoryView memoryView;
+
+        /// <summary>What this allocator and the models' room checks take the device's free and total memory to be:
+        /// cuMemGetInfo, bounded by NVML's dedicated figures and TENSORSHARP_CUDA_DEVICE_BUDGET_MB (issue #383).</summary>
+        public DeviceMemoryView MemoryView => MemoryViewForTests ?? memoryView;
+
+        /// <summary>Tests stand in for the device's memory reading (a fake NVML or budget over the real device).</summary>
+        internal DeviceMemoryView MemoryViewForTests { get; set; }
+
+        /// <summary>What the budget guard did (DeviceMemoryReclaimLadder): allocations kept within dedicated memory by trims and
+        /// by reclaimers, and those placed past it.</summary>
+        internal (long Trims, long Reclaims, long Passes) BudgetGuardOutcomes => (ladder.BudgetTrims, ladder.BudgetReclaims, ladder.BudgetPasses);
 
         public float GetAllocatedMemoryRatio()
         {
-            Context.MakeCurrent();
-            CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr total).ThrowOnError();
-            ulong totalBytes = total.ToUInt64();
+            (long freeBytes, long totalBytes) = GetMemoryInfo();
             if (totalBytes == 0)
                 return 0.0f;
-
-            ulong freeBytes = free.ToUInt64();
             return (float)(1.0 - (double)freeBytes / totalBytes);
         }
 
-        /// <summary>Free / total device memory in bytes (driver view, i.e. dedicated
-        /// VRAM only — WDDM shared-memory spillover shows up as this staying pinned
-        /// near zero while performance collapses).</summary>
+        /// <summary>Free / total device memory in bytes for room checks (<see cref="MemoryView"/>): dedicated memory where
+        /// NVML knows the device, so WDDM's shared-memory share of cuMemGetInfo's total and other processes' use are not
+        /// counted as room.</summary>
         public (long freeBytes, long totalBytes) GetMemoryInfo()
         {
+            if (MemoryView.TryRead(out long free, out long total)) return (free, total);
             Context.MakeCurrent();
-            CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr total).ThrowOnError();
-            return ((long)free.ToUInt64(), (long)total.ToUInt64());
+            CudaDriverApi.cuMemGetInfo(out UIntPtr _, out UIntPtr _).ThrowOnError();
+            return (0, 0);
         }
 
         /// <summary>Whether a rent of <paramref name="requestedBytes"/> would reuse a block the pool caches (no driver
         /// allocation, so no out-of-memory reclaim).</summary>
         internal bool HasCachedBlock(long requestedBytes) => pool.HasCachedBlock(requestedBytes);
 
-        /// <summary>The driver's free device memory in bytes (the pool's cached blocks not counted); 0 when the query fails.</summary>
-        internal long FreeDeviceBytes()
-        {
-            Context.MakeCurrent();
-            return CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr _) == 0 ? (long)free.ToUInt64() : 0;
-        }
+        /// <summary>The device's free memory in bytes (<see cref="MemoryView"/>; the pool's cached blocks not counted); 0 when
+        /// the query fails.</summary>
+        internal long FreeDeviceBytes() => MemoryView.TryRead(out long free, out long _) ? free : 0;
 
         /// <summary>Free device memory, with the large blocks the pool caches counted as free (an allocation that needs the
         /// room gives them back, <see cref="ReclaimableBytes"/>), and the total. The shards' small cached blocks are not
@@ -516,6 +592,31 @@ namespace TensorSharp.Cuda
         internal static readonly bool VramLogEnabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_LOG_VRAM"), "1", StringComparison.Ordinal);
 
+        /// <summary>Whether TS_CUDA_LOG_VRAM=1 diagnostics are on (models add their own lines beside the allocator's).</summary>
+        public bool LogsVram => VramLogEnabled;
+
+        private long recordingBytes;
+
+        /// <summary>The pool blocks recorded CUDA graphs own (their kernels' working memory, kept while they can replay).</summary>
+        public long RecordingBytes => Interlocked.Read(ref recordingBytes);
+
+        internal void NoteRecordingBytes(long bytes) => Interlocked.Add(ref recordingBytes, bytes);
+
+        /// <summary>The cached large blocks by size (diagnostics).</summary>
+        public string DescribeLargeCache() => pool.DescribeLargeCache();
+
+        /// <summary>Device bytes the pool's backing allocations hold less the blocks it caches: what is live through the pool
+        /// (weights, caches, states, activations, recordings' blocks), for diagnostics.</summary>
+        public long LiveBytes
+        {
+            get
+            {
+                long backing;
+                lock (backingSizes) backing = backingBytes;
+                return backing - pool.GetStats().CachedBytes;
+            }
+        }
+
         /// <summary>Diagnostic (TS_CUDA_LOG_VRAM=1): prints free/used dedicated VRAM
         /// plus the pool's currently-cached idle bytes at <paramref name="label"/>.</summary>
         public void LogVram(string label)
@@ -528,7 +629,8 @@ namespace TensorSharp.Cuda
                 $"[vram] {label}: free={free / (1024 * 1024)} MB used={(total - free) / (1024 * 1024)} MB " +
                 $"pool_cached={stats.CachedBytes / (1024 * 1024)} MB (large={stats.LargeCachedBytes / (1024 * 1024)} MB) " +
                 $"cuMemAlloc={stats.CuMemAllocCount} cuMemFree={stats.CuMemFreeCount} largeTrimFrees={stats.LargeTrimFrees} " +
-                $"oomTrims={stats.OomTrims} oomReclaims={stats.OomReclaims} fullDrains={stats.FullDrains}");
+                $"oomTrims={stats.OomTrims} oomReclaims={stats.OomReclaims} fullDrains={stats.FullDrains} " +
+                $"budgetTrims={ladder.BudgetTrims} budgetReclaims={ladder.BudgetReclaims} budgetPasses={ladder.BudgetPasses}");
         }
 
         /// <summary>
@@ -605,8 +707,10 @@ namespace TensorSharp.Cuda
                     integrated = CudaDriverApi.cuDeviceGet(out int device, DeviceId) == 0
                         && CudaDriverApi.cuDeviceGetAttribute(out int value, 18 /* CU_DEVICE_ATTRIBUTE_INTEGRATED */, device) == 0
                         ? value : 0;
-                Console.WriteLine($"[vram] {label}: GPU {DeviceId} cuMemGetInfo free={free >> 20} MiB of {total >> 20} MiB, "
-                    + $"large cached={pool.LargeCachedBytes >> 20} MiB, integrated={integrated}, host MemAvailable={HostMemAvailable()}");
+                Console.WriteLine($"[vram] {label}: GPU {DeviceId} room free={free >> 20} MiB of {total >> 20} MiB ({MemoryView.Describe()}), "
+                    + $"large cached={pool.LargeCachedBytes >> 20} MiB, small cached={(pool.GetStats().CachedBytes - pool.LargeCachedBytes) >> 20} MiB, "
+                    + $"budget guard trims/reclaims/passes={ladder.BudgetTrims}/{ladder.BudgetReclaims}/{ladder.BudgetPasses}, "
+                    + $"integrated={integrated}, host MemAvailable={HostMemAvailable()}");
             }
             catch (Exception)
             {

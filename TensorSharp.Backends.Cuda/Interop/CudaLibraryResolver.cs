@@ -29,6 +29,14 @@ namespace TensorSharp.Cuda.Interop
                     return cudaHandle;
             }
 
+            if (libraryName == NvmlApi.LibName)
+            {
+                // NVML ships with the driver (System32 on Windows, beside libcuda on Linux): loaded only where present.
+                foreach (string candidate in NvmlApi.LibraryCandidates(RuntimeInformation.IsOSPlatform(OSPlatform.Windows)))
+                    if (NativeLibrary.TryLoad(candidate, out IntPtr nvmlHandle))
+                        return nvmlHandle;
+            }
+
             if (libraryName == "cublas")
             {
                 foreach (string candidate in GetCublasCandidates())

@@ -379,8 +379,10 @@ namespace TensorSharp.Cuda
             if (FlashCaches(kc, vc, d, out bool q8Rows) && (trimmed ? mask.Trimmed : mask.Pattern) == MaskPattern.Causal
                 && ((CudaAllocator)Allocator).FlashPrefillKernels is { } flash && (q8Rows ? flash.RunsAttentionQ8(d) : flash.RunsAttention(d)))
             {
-                // A marked prompt chunk's rows may attend in 8 bits (TryPromptAttention8); else, and for every other row, the
-                // 16-bit kernels below.
+                // A marked prompt chunk's rows attend in 8 bits where they can (TryPromptAttention8: the default, or
+                // --prompt-attention int8); else, and for every other row, the 16-bit kernels below.
+                if (promptChunk && nq > WidestVerifyWindow && q8Rows && PromptAttention8Enabled)
+                    WarnAttn8DeclinedOnce("the K/V cache is q8_0 (the 8-bit kernels read an F16 cache)");
                 if (promptChunk && nq > WidestVerifyWindow && !q8Rows
                     && TryPromptAttention8(qc, kc, vc, cap, nq, len, floor, heads, kvHeads, d, scale, flash, out Tensor attended8))
                     return attended8;
@@ -389,6 +391,22 @@ namespace TensorSharp.Cuda
                 // recorded decode row does: the splits then follow the bucket window its length falls in (the launch holds its
                 // whole window's).
                 IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr((CudaAllocator)Allocator, kc.Storage);
+                // Rows past a verify window's are a prompt chunk's (never recorded): with --prompt-attention f32acc the prompt
+                // kernels with F32 accumulation (CudaFlashPrefillKernels.LaunchPromptAttention, flash prefill v13), else the
+                // 16-bit-run ones below.
+                if (nq > WidestVerifyWindow && dyn == IntPtr.Zero && PromptAttention == PromptAttentionPath.F32Acc)
+                {
+                    var plan = flash.PromptPlan(nq * (heads / kvHeads), kvHeads, Math.Max(1, len - nq + 1 - floor));
+                    long partialFloats = CudaFlashPrefillKernels.PromptPartialFloats(nq * (heads / kvHeads), kvHeads, d, plan);
+                    using Tensor tailPartial = partialFloats > 0 ? new Tensor(Allocator, DType.Float32, partialFloats) : null;
+                    Tensor[] promptWritten = tailPartial == null ? new[] { attended } : new[] { attended, tailPartial };
+                    Launch(new[] { qc, kc, vc }, promptWritten, (_, stream) => flash.LaunchPromptAttention(Ptr(qc), CachePtr(kc), CachePtr(vc), cap,
+                        nq, len, floor, heads, kvHeads, d, scale, plan, tailPartial == null ? IntPtr.Zero : Ptr(tailPartial), Ptr(attended), stream,
+                        q8: q8Rows));
+                    PromptAttentionF32AccLaunches++;
+                    NotePromptAttentionOnce(PromptAttentionPath.F32Acc, flash);
+                    return attended;
+                }
                 int windowKeys = (int)k.Sizes[^2];
                 int splits = flash.Splits(nq * (heads / kvHeads), kvHeads, dyn != IntPtr.Zero ? windowKeys : len);
                 using Tensor partial = splits > 1
@@ -2865,8 +2883,8 @@ namespace TensorSharp.Cuda
                 _stagingArena = IntPtr.Zero;
                 _stagingBytes = 0;
             }
-            CudaDriverApi.cuMemGetInfo(out UIntPtr free, out _).ThrowOnError();
-            long shortfall = Math.Min(need, StagingArenaCapBytes) - ((long)free.ToUInt64() - StagingFreeFloorBytes);
+            long free = cuda.FreeDeviceBytes();   // dedicated memory (DeviceMemoryView), not WDDM shared memory
+            long shortfall = Math.Min(need, StagingArenaCapBytes) - (free - StagingFreeFloorBytes);
             if (shortfall > 0)
             {
                 // The memory pool keeps the blocks earlier steps returned: release what the arena lacks, the least
@@ -2874,9 +2892,9 @@ namespace TensorSharp.Cuda
                 // experts one at a time). The blocks the steps rent again stay cached.
                 cuda.TrimLargeCache(shortfall);
                 cuda.Context.MakeCurrent();
-                CudaDriverApi.cuMemGetInfo(out free, out _).ThrowOnError();
+                free = cuda.FreeDeviceBytes();
             }
-            long room = Math.Min(StagingArenaCapBytes, (long)free.ToUInt64() - StagingFreeFloorBytes);
+            long room = Math.Min(StagingArenaCapBytes, free - StagingFreeFloorBytes);
             if (ShortChunkArenaSlotsForTests > 0) room = Math.Min(room, ShortChunkArenaSlotsForTests * perExpert);
             long bytes = Math.Min(need, room) / perExpert * perExpert;
             if (bytes < perExpert) return false;

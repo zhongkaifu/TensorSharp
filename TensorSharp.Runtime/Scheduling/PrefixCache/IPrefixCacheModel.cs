@@ -89,6 +89,11 @@ public interface IPrefixCacheModel
     bool TryCaptureCheckpoint(string requestId, string payloadKey, bool mayShareRows, out PayloadFootprint footprint)
         => TryCaptureCopy(requestId, payloadKey, out footprint);
 
+    /// <summary><see cref="TryCaptureCheckpoint"/> with <c>mayShareRows</c> keeps only a request's recurrent states and shares
+    /// its cache rows (the CUDA executor's slot-bound policies): an automatic checkpoint at a prompt's end costs a fixed set
+    /// of states, not a copy of the prompt's rows. False by default: a checkpoint copies the request's cache.</summary>
+    bool CheckpointsShareRows => false;
+
     /// <summary>Side-effect free. The cached payloads a request that adopts <paramref name="payloadKey"/> in place of their
     /// holder would use up (<see cref="TryCaptureCheckpoint"/>'s shared rows: the holder's end state and the longer
     /// checkpoints over them), so the coordinator can say which of them are the request's to consume

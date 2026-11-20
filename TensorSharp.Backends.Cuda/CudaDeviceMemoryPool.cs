@@ -245,6 +245,23 @@ namespace TensorSharp.Cuda
                 shard.FreedCount++;
         }
 
+        /// <summary>A returned large block (2 MiB and up) goes back to the driver instead of the cache: its holder knows no
+        /// allocation of its size is coming (a disposed slot's caches, whose capacity class the next slot rarely has); small
+        /// blocks are cached as <see cref="Return"/> caches them.</summary>
+        public void ReturnToDriver(IntPtr ptr, long allocationBytes)
+        {
+            if (ptr == IntPtr.Zero) return;
+            if (!enabled || allocationBytes < LargeBlockThreshold)
+            {
+                Return(ptr, allocationBytes);
+                return;
+            }
+            backingFree(ptr);
+            Shard shard = CurrentShard();
+            lock (shard.Sync)
+                shard.FreedCount++;
+        }
+
         /// <summary>
         /// Like <see cref="Return"/> but never falls back to the backing free:
         /// returns false when the block cannot be pooled (over the block-size or
@@ -497,6 +514,21 @@ namespace TensorSharp.Cuda
         public long LargeCachedBytes
         {
             get { lock (largeSync) return largeCachedBytes; }
+        }
+
+        /// <summary>The cached large blocks by size, the most bytes first (diagnostics): "112 MiB x32, 80 MiB x4, ...".</summary>
+        public string DescribeLargeCache(int sizes = 8)
+        {
+            var parts = new List<(long Size, int Count)>();
+            lock (largeSync)
+                foreach (var (size, stack) in largePool)
+                    if (stack.Count > 0) parts.Add((size, stack.Count));
+            parts.Sort((a, b) => (b.Size * b.Count).CompareTo(a.Size * a.Count));
+            var text = new System.Text.StringBuilder();
+            for (int i = 0; i < parts.Count && i < sizes; i++)
+                text.Append(i == 0 ? "" : ", ").Append(parts[i].Size >> 20).Append(" MiB x").Append(parts[i].Count);
+            if (parts.Count > sizes) text.Append($", +{parts.Count - sizes} sizes");
+            return text.ToString();
         }
 
         /// <summary>
