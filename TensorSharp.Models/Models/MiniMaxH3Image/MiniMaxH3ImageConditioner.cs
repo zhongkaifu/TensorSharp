@@ -75,7 +75,30 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 rows += tokens + 2 + 6;
                 largest = Math.Max(largest, tokens);
             }
-            return WorkingBytesFor(_encoder.Config, workload.Prompt, rows) + VisionWorkingBytesFor(largest);
+            long seq = Math.Max(16, (workload.Prompt?.Length ?? 0) / 3 + 16) + rows;
+            return WorkingBytesFor(_encoder.Config, workload.Prompt, rows) + VisionWorkingBytesFor(largest) +
+                   ScoreBytesFor(seq, _encoder.Config.Heads);
+        }
+
+        /// <summary>The F32 scores one query block of an edit's attention keeps (at most this, whole sequences below it): the
+        /// trunk materializes them a block at a time (<see cref="QueryChunkFor"/>).</summary>
+        internal const long ScoreBudgetBytes = 1L << 30;
+
+        /// <summary>The query rows of one block of an edit's materialized attention: 0 (the whole [seq, seq, heads] scores)
+        /// when those fit <see cref="ScoreBudgetBytes"/>, else as many rows as a [seq, rows, heads] block fits, at least 32.</summary>
+        internal static int QueryChunkFor(long seq, int heads)
+        {
+            long rowBytes = seq * heads * 4L;
+            if (seq * rowBytes <= ScoreBudgetBytes) return 0;
+            return (int)Math.Clamp(ScoreBudgetBytes / rowBytes, 32, seq);
+        }
+
+        /// <summary>The scores and their softmax for one query block of a <paramref name="seq"/>-row edit (both F32, alive
+        /// together).</summary>
+        internal static long ScoreBytesFor(long seq, int heads)
+        {
+            int chunk = QueryChunkFor(seq, heads);
+            return 2L * seq * (chunk > 0 ? chunk : seq) * heads * 4L;
         }
 
         /// <summary>The vision tower's merged tokens for a vision copy of <paramref name="width"/> x <paramref name="height"/>.</summary>
@@ -147,9 +170,10 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 for (int i = 0; i < outputs.Length; i++)
                     images.Add(new MiniMaxH3PromptImage { TokenIndex = starts[i], Vision = outputs[i] });
                 cancellationToken.ThrowIfCancellationRequested();
-                // The vision rows make the sequence thousands of tokens long, where the trunk's materialized scores
-                // ([seq, seq, heads] F32) would not fit; its causal flash attention does not keep them.
-                float[] hidden = _encoder.Encode(ids, images, flashAttention: FlashAttentionForPictures);
+                // The vision rows make the sequence thousands of tokens long, where the trunk's whole scores
+                // ([seq, seq, heads] F32) would not fit: it materializes them a block of query rows at a time.
+                int queryChunk = QueryChunkForPictures ?? QueryChunkFor(ids.Count, _encoder.Config.Heads);
+                float[] hidden = _encoder.Encode(ids, images, flashAttention: FlashAttentionForPictures, queryChunk: queryChunk);
                 LastTokens = ids.Count;
                 LastPresentation = (ids.ToArray(), tags.ToArray());
                 return new ConditioningSet(hidden, ids.Count, _encoder.Config.Hidden, tags.ToArray())
@@ -200,9 +224,13 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return ids[0];
         }
 
-        /// <summary>Whether an edit's sequence runs the trunk's flash attention (a measurement seam: off materializes the
-        /// scores, which only short sequences afford).</summary>
-        internal bool FlashAttentionForPictures { get; set; } = true;
+        /// <summary>Whether an edit's sequence runs the trunk's flash attention instead (a measurement seam; ggml-cuda's
+        /// flash kernel sums V in half precision, rel. L2 0.09-0.21 from the F32 scores at 1-4K rows).</summary>
+        internal bool FlashAttentionForPictures { get; set; }
+
+        /// <summary>The query block an edit's attention uses instead of <see cref="QueryChunkFor"/> (a measurement seam; 0 is
+        /// the whole scores).</summary>
+        internal int? QueryChunkForPictures { get; set; }
 
         /// <summary>The token ids and tags of the last edit's presentation (a parity seam).</summary>
         internal (int[] Ids, int[] Tags) LastPresentation { get; private set; }

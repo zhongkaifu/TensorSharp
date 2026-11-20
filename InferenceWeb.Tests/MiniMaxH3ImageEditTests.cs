@@ -400,11 +400,97 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
                 maxErr = Math.Max(maxErr, Math.Abs(want[i] - got[i]));
             }
             output.WriteLine($"{backend} {w}x{h} ({codec.LastEncodeTiles} tiles): moments [48, {lh}, {lw}], max |error| {maxErr:E2} of max |value| {maxAbs:F3}");
-            Assert.True(maxErr <= 2e-4 * Math.Max(1, maxAbs), $"{backend} {w}x{h}: max |error| {maxErr:E3} against the NumPy oracle");
+            // The GPU backends' F32 products carry 10-bit mantissas: ggml-cuda runs them as TF32 (cuBLAS TF32 tensor-op
+            // math, as diffusers' own CUDA convolutions do by default) and ggml-metal's kernel_mul_mm_f32_f32 stages its
+            // tiles in half. 6.5e-4 (A40) and 7.4e-4 (M5 Pro) measured; ggml_cpu stays under 1e-6.
+            double tolerance = backend == BackendType.GgmlCpu ? 2e-4 : 2e-3;
+            Assert.True(maxErr <= tolerance * Math.Max(1, maxAbs), $"{backend} {w}x{h}: max |error| {maxErr:E3} against the NumPy oracle");
         }
         // Four 256-pixel tiles share one program, the 64x48 tile another; the encoder's weights now count.
         Assert.Equal(2, codec.EncoderCompiles);
         Assert.True(codec.WeightBytes > decoderBytes);
+    }
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void TextEncoderQueryBlocksMatchItsWholeScoresOnGgmlCpu() => TextEncoderQueryBlocksMatchItsWholeScores(BackendType.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TextEncoderQueryBlocksMatchItsWholeScoresOnGgmlMetal() => TextEncoderQueryBlocksMatchItsWholeScores(BackendType.GgmlMetal);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TextEncoderQueryBlocksMatchItsWholeScoresOnGgmlCuda() => TextEncoderQueryBlocksMatchItsWholeScores(BackendType.GgmlCuda);
+
+    /// <summary>The trunk's attention a block of query rows at a time (each block against the keys it sees, as an edit's long
+    /// sequence runs it) against the whole [seq, seq, heads] scores, on a tiny two-layer GQA encoder: blocks of one row (each
+    /// sees only its own prefix), of five (the last one short) and of all but one row.</summary>
+    private void TextEncoderQueryBlocksMatchItsWholeScores(BackendType backend)
+    {
+        GgmlBasicOps.EnsureBackendAvailable(backend switch
+        {
+            BackendType.GgmlMetal => GgmlBackendType.Metal,
+            BackendType.GgmlCuda => GgmlBackendType.Cuda,
+            _ => GgmlBackendType.Cpu,
+        });
+        string dir = Path.Combine(Path.GetTempPath(), "ts-h3te-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            const int hidden = 64, heads = 4, kvHeads = 2, headDim = 16, ffn = 96, vocab = 40;
+            var rng = new Random(77);
+            var tensors = new List<MiniMaxH3ImageFixture.T>();
+            void Add(string name, float scale, float offset, params long[] shape) =>
+                tensors.Add(new MiniMaxH3ImageFixture.T(name, shape, MiniMaxH3ImageFixture.F32,
+                    Enumerable.Range(0, checked((int)shape.Aggregate(1L, (a, b) => a * b)))
+                        .Select(_ => offset + scale * (float)(rng.NextDouble() * 2 - 1)).ToArray()));
+            Add("model.embed_tokens.weight", 1f, 0f, hidden, vocab);
+            for (int l = 0; l < 2; l++)
+            {
+                string p = $"model.layers.{l}.";
+                Add(p + "input_layernorm.weight", 0.2f, 1f, hidden);
+                Add(p + "post_attention_layernorm.weight", 0.2f, 1f, hidden);
+                Add(p + "self_attn.q_norm.weight", 0.2f, 1f, headDim);
+                Add(p + "self_attn.k_norm.weight", 0.2f, 1f, headDim);
+                Add(p + "self_attn.q_proj.weight", 0.3f, 0f, hidden, heads * headDim);
+                Add(p + "self_attn.k_proj.weight", 0.3f, 0f, hidden, kvHeads * headDim);
+                Add(p + "self_attn.v_proj.weight", 0.3f, 0f, hidden, kvHeads * headDim);
+                Add(p + "self_attn.o_proj.weight", 0.15f, 0f, heads * headDim, hidden);
+                Add(p + "mlp.gate_proj.weight", 0.15f, 0f, hidden, ffn);
+                Add(p + "mlp.up_proj.weight", 0.15f, 0f, hidden, ffn);
+                Add(p + "mlp.down_proj.weight", 0.1f, 0f, ffn, hidden);
+            }
+            string path = Path.Combine(dir, "te-tiny.gguf");
+            MiniMaxH3ImageFixture.Write(path, tensors);
+            File.WriteAllText(Path.Combine(dir, "vocab.json"), "{" + string.Join(",", Enumerable.Range(0, vocab).Select(i => $"\"t{i}\":{i}")) + "}");
+            File.WriteAllText(Path.Combine(dir, "merges.txt"), "#version: 0.2\n");
+            using var te = new MiniMaxH3TextEncoder(path, dir, backend, null);
+            int[] ids = Enumerable.Range(0, 23).Select(i => (i * 7 + 3) % vocab).ToArray();
+            float[] whole = te.Encode(ids, null);
+            double maxAbs = whole.Max(v => Math.Abs((double)v));
+            foreach (int chunk in new[] { 1, 5, ids.Length - 1 })
+            {
+                float[] blocks = te.Encode(ids, null, queryChunk: chunk);
+                double maxErr = 0;
+                for (int i = 0; i < whole.Length; i++) maxErr = Math.Max(maxErr, Math.Abs((double)whole[i] - blocks[i]));
+                output.WriteLine($"{backend} query blocks of {chunk}: max |error| {maxErr:E2} of max |value| {maxAbs:F3}");
+                Assert.True(maxErr <= 1e-5 * Math.Max(1, maxAbs), $"{backend} blocks of {chunk}: max |error| {maxErr:E3}");
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>The conditioner's query block for an edit's sequence: the whole scores while they fit the budget, then as many
+    /// rows as a [seq, rows, heads] block fits (H3's 64 heads).</summary>
+    [Fact]
+    public void EditAttentionBlocksFitTheScoreBudget()
+    {
+        Assert.Equal(0, MiniMaxH3ImageConditioner.QueryChunkFor(1076, 64));     // one picture: the whole scores (296 MB)
+        Assert.Equal(1001, MiniMaxH3ImageConditioner.QueryChunkFor(4189, 64));  // four: 1 GiB / (4189 * 64 * 4)
+        Assert.Equal(252, MiniMaxH3ImageConditioner.QueryChunkFor(16635, 64));  // sixteen
+        Assert.Equal(32, MiniMaxH3ImageConditioner.QueryChunkFor(200_000, 64)); // never below 32 rows
+        Assert.Equal(2L * 16635 * 252 * 64 * 4, MiniMaxH3ImageConditioner.ScoreBytesFor(16635, 64));
     }
 
     /// <summary>The stitched moments against hand-computed blends: the second tile's first overlapping row is the RAW tile

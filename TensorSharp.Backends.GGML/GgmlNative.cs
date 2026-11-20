@@ -780,8 +780,11 @@ public struct H3TextEncodeArgs
     public float Eps;
     public int NumDeepstack;
     /// <summary>1: the causal attention through ggml_flash_attn_ext (F16 K/V, an F16 causal mask) instead of the
-    /// materialized [seq, seq, heads] scores (MiniMax-H3-Image's edits, whose pictures make long sequences).</summary>
+    /// materialized [seq, seq, heads] scores. ggml-cuda's kernel sums V in half precision, so long sequences drift.</summary>
     public int FlashAttention;
+    /// <summary>&gt; 0: the materialized attention this many query rows at a time, each block against the keys it sees (the
+    /// same F32 scores in [keys, rows, heads] pieces; MiniMax-H3-Image's edits, whose pictures make long sequences).</summary>
+    public int QueryChunk;
 }
 
 /// <summary>One run of conditioning tokens and the projection it goes through:

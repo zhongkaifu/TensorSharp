@@ -517,16 +517,18 @@ namespace TensorSharp.Models.MiniMaxH3
         /// hidden state after the first three layers, and its span takes 3-D M-RoPE
         /// positions instead of the running token index.</para>
         ///
-        /// <para><paramref name="flashAttention"/> runs the causal attention as ggml's flash
-        /// attention (F16 keys and values, a power-of-two V pre-scale, an F16 causal mask)
-        /// instead of materializing the [seq, seq, heads] F32 scores: what a sequence of
-        /// several pictures' vision rows needs (MiniMax-H3-Image's edits; 16 pictures make
-        /// about 17K rows, whose scores alone would be 70 GB). Off, the trunk is the graph
-        /// it has always been.</para></summary>
+        /// <para><paramref name="queryChunk"/> &gt; 0 materializes the causal attention that
+        /// many query rows at a time, each block against only the keys it can see: the same
+        /// F32 scores as the whole [seq, seq, heads] tensor, in pieces a long sequence affords
+        /// (MiniMax-H3-Image's edits; 16 pictures make about 17K rows, whose whole scores
+        /// would be 70 GB). <paramref name="flashAttention"/> runs ggml's flash attention
+        /// instead (F16 keys and values; ggml-cuda sums V in half precision, which drifts over
+        /// thousands of keys). Neither, the trunk is the graph it has always been.</para></summary>
         public float[] Encode(IReadOnlyList<int> tokens,
                               IReadOnlyList<MiniMaxH3PromptImage> images,
                               int layerLimit = 0,
-                              bool flashAttention = false)
+                              bool flashAttention = false,
+                              int queryChunk = 0)
         {
             if (tokens is null || tokens.Count == 0)
                 throw new ArgumentException("at least one token is required", nameof(tokens));
@@ -627,6 +629,7 @@ namespace TensorSharp.Models.MiniMaxH3
                             Causal = 1,
                             Eps = Config.Eps,
                             FlashAttention = flashAttention ? 1 : 0,
+                            QueryChunk = flashAttention ? 0 : queryChunk,
                         };
                         if (!GgmlBasicOps.TryMiniMaxH3TextEncode(in args))
                             throw new InvalidOperationException(
