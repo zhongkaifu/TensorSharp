@@ -45,6 +45,8 @@ int split = int.Parse(Option("--split", "0"));
 int rewind = int.Parse(Option("--rewind", "16"));
 int topK = int.Parse(Option("--topk", "8"));
 int tp = int.Parse(Option("--tp", "1"));
+// --layer-split N: whole layers over N GPUs (the runtime family; legacy refuses it, as its serving contract says).
+int layerSplit = int.Parse(Option("--layer-split", "1"));
 // --family: "legacy" builds what the descriptor builds (MuseGlimmerModel until the switch, docs/design/muse-glimmer-unified.md
 // stage S8); "runtime" builds the unified-runtime family through its test seam (MuseGlimmerArchitecture.CreateRuntimeModel).
 string family = Option("--family", "legacy");
@@ -67,8 +69,8 @@ var load = Stopwatch.StartNew();
 // process exit if any buffer is still registered, as the server's ProcessExit hook knows.
 var model = family switch
 {
-    "legacy" => ModelBase.Create(modelPath, backend, tpDegree: tp),
-    "runtime" => MuseGlimmerArchitecture.CreateRuntimeModel(modelPath, backend, tpDegree: tp),
+    "legacy" => ModelBase.Create(modelPath, backend, tpDegree: tp, layerSplitDegree: layerSplit),
+    "runtime" => MuseGlimmerArchitecture.CreateRuntimeModel(modelPath, backend, tpDegree: tp, layerSplitDegree: layerSplit),
     _ => throw new ArgumentException($"--family {family}: use legacy or runtime."),
 };
 double loadMs = load.Elapsed.TotalMilliseconds;
