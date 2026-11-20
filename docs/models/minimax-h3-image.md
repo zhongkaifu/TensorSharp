@@ -25,7 +25,8 @@ family, its text encoder with the vision tower, denoiser and VAE encoder and dec
 phase by phase by one pipeline) on `ggml_cuda`, `ggml_metal` and `ggml_cpu`, end to end. It
 has been run with real weights on `ggml_cuda` (an H100 and an A40) and on `ggml_metal` (an
 M5 Pro); `ggml_cpu` runs the same programs (validated on small synthetic checkpoints; with
-real weights it takes tens of minutes a picture). Masked edits are not implemented yet.
+real weights it takes tens of minutes a picture). An edit can be limited to a selection of `<Picture 1>` with a mask
+([Masked edits](#masked-edits)), and the chat hosts edit across turns ([Multi-turn](#multi-turn)).
 
 | Component | File | Source |
 |---|---|---|
@@ -125,16 +126,103 @@ diffusers implements it (main d5df05ed), which conditions on every picture twice
   area (the server's 2048x2048 default), or on the CLI its VAE copy's size. An edit below
   2048x2048 samples on a larger canvas of the same aspect (diffusers'
   `min_generation_area`) and is resized back with Lanczos; a speed plug-in's own floor
-  replaces it (pDMD's is 1024 pixels: its edits sample at the asked size, as its diffusers
-  pipeline does). Text to image keeps its own size (no floor).
-- **Refusals.** `cfg` above 1, a negative prompt, a mask, more than 16 references, a side
-  under 32 pixels, and an edit whose references make its sequence longer than the
-  device's memory holds (the message names the rows; fewer or smaller references fit).
+  replaces it (pDMD's is 1024 pixels: its edits, masked ones included, sample at the asked
+  size, as its diffusers pipeline does). Text to image keeps its own size (no floor).
+- **Refusals.** `cfg` above 1, a negative prompt, more than 16 references, a side under
+  32 pixels, and, before anything runs, an edit whose references make its text encoding
+  or its denoising step need more than the device's free memory (the message names the
+  rows; fewer or smaller references fit). This is the one check every request gets, a
+  picture from words included: a step that fits the free memory runs even when the plan
+  says it uses some of the headroom.
 
 Each reference costs rows twice: about 1,024 text rows for its vision block and, in the
 DiT, (VAE copy / 32)² rows (1,024 for a 1024x1024 copy, 4,096 for 2048x2048). Sixteen
 1024x1024 references beside a 2048x2048 target are about 37,000 DiT rows, nine times a
 text-to-image step's; attention grows with the square.
+
+### Masked edits
+
+```bash
+TensorSharp.Cli --config config/minimax-h3-image.json \
+  --image shop.png --mask banner.png --keep-source-size --diffusion-seed 42 \
+  --prompt "In <Picture 1>, change the painted banner above the door so it reads \"SPRING EQUINOX CAFE\"." \
+  --output shop-edit.png
+```
+
+A mask limits the edit to a selection of `<Picture 1>`, the picture being edited; the
+other pictures stay references. MiniMax's pipeline has no masks (its README: "not yet
+supported: mask-based inpainting"), so this is TensorSharp's own method, the one its
+Qwen-Image path uses, and the flags and fields are the same:
+
+- **The mask** has `<Picture 1>`'s exact size. `--mask-mode grayscale` (the default):
+  white edits, black keeps, gray blends; `alpha`: transparent edits, opaque keeps.
+  `--mask-invert` swaps them, `--mask-feather N` softens the edge inward by N source
+  pixels (never past the selection), and `--mask-crop` with `--mask-crop-padding N`
+  (default 64) samples only the selection's box and that much context around it. The
+  server takes `maskPath` (an upload), `maskMode`, `maskInvert`, `maskFeather`, `maskCrop`
+  and `maskCropPadding`, or a `mask` file on the multipart `/api/image-edit`; the OpenAI
+  `/v1/images/edits` takes a `mask` part, read [OpenAI's way](../../TensorSharp.Server.Host/API_EXAMPLES.md#openai-image-routes-v1imagesgenerations-v1imagesedits).
+- **Size.** The result is always `<Picture 1>`'s own canvas, whatever it samples at. The
+  whole picture samples where the same edit without a mask would (the rules above); a
+  crop samples its box at that canvas's density; either way the 2048x2048 floor (a speed
+  plug-in's own instead, when one is loaded) applies to what is sampled, at its own aspect,
+  and the decode is resized back with Lanczos.
+- **The latent.** The mask goes to the latent grid by the largest weight in each 16x16
+  cell, so a thin stroke stays editable. `<Picture 1>` (or its crop) at the sampling canvas
+  is encoded to its posterior mean, normalized as the references are (its reference copy is
+  reused when it has that size; otherwise it costs one more VAE encode). After every step
+  the kept cells are set back to that latent noised to the next sigma with the request's own
+  noise, so the last step leaves them exactly on it: the edited area is denoised with its
+  surroundings in view, the picture's own pixels around it. `<Picture 1>` is still a
+  reference, so the model sees what it blends with.
+- **Composite.** The decode, resized to the selection, is blended into `<Picture 1>` by the
+  mask's weights: every pixel of weight 0 is the source's own bytes (alpha included), every
+  pixel of weight 1 the edit's. An empty mask returns `<Picture 1>` without running the
+  model; a full one is an unmasked edit on the source's canvas.
+- **With pDMD.** Masks and the pDMD plug-in compose: its two steps reset the kept cells
+  after each step like the six do, and the composite is the same, so the kept pixels are
+  still the source's own bytes; the selection samples at the plug-in's floor (the asked
+  size). MASKED_PDMD_CHECK
+
+The cost is the unmasked edit's, plus the extra VAE encode when `<Picture 1>`'s reference
+copy is not the sampling canvas (a 2048x2048 picture's is; a 1024x1024 one's is not). The
+selection is kept as drawn: an inverted rectangle around an object keeps the whole box,
+background included, which then meets the new surroundings at a hard edge; a selection
+drawn along the object, or a feather, blends it.
+
+M5 Pro 48 GB, `ggml_metal`, Q8_0, 2048x2048 pictures, one process, six steps (a step is the
+median of steps 2 to 6; the first edit in the process cold, the rest warm):
+
+| Masked edit | Selection | Text | Vision | VAE encode | Per step | Decode | Edit | Peak (allocated) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| sign rewritten ("SPRING EQUINOX CAFE") | the banner, 10.0% | 3.81 s | 1.24 s | 16.94 s (121) | 33.6 s | 2.86 s | 232.2 s | 30.6 GB |
+| mug replaced by a glass teapot | a box around the mug, 29.4% | 6.44 s | 1.15 s | 16.95 s (121) | 33.6 s | 2.71 s | 229.9 s | 30.6 GB |
+| inverted: everything but the mug box | 70.6% | 6.27 s | 1.16 s | 16.93 s (121) | 33.6 s | 2.69 s | 229.6 s | 30.6 GB |
+
+The same picture unmasked costs the same (S5's text edit: 33.8 s a step, 231.0 s, 30.7 GB):
+the reference copy is the sampling canvas, so nothing more is encoded. Every unselected pixel
+was the source's own bytes (2,960,883 to 3,774,333 of them a picture, none differing).
+
+### Multi-turn
+
+TensorAgent's chat (its `/api/chat` turns) reads each message against the pictures before
+it, as it does for Qwen-Image-2.1; the server's Web UI sends each message to the image
+routes as it is (the photos attached are the edit's, Edit again restores a turn's photos,
+selection and words). In TensorAgent:
+
+- A follow-up with no picture attached changes the newest picture in the chat. Qwen-Image
+  asks its own language model which picture a follow-up means; MiniMax-H3-Image's encoder
+  has no output head to answer that, so the turn changes the newest one and the page says
+  it guessed (its other reading, a new picture, is one tap).
+- Photos attached to a message are what it edits (the first is `<Picture 1>`, the rest
+  references, a selection the first's). A message the user said changes an earlier
+  picture of the chat (the reading chosen on the page) edits that picture with the
+  attached photos as its references: `[picture, ...attached]`, its selection the picture's.
+- Every edit keeps its source's size, and a turn asks for the model's own 2048x2048 area
+  (TensorAgent's other image model, Qwen-Image-2.1, keeps its 1024x1024 budget).
+- Pages know an image model by `/api/models`' `image` block (`family`, `supportsEdit`,
+  `supportsMask`, `minimumArea`), so the edit area (Edit again, Select area, several
+  attachments) works for MiniMax-H3-Image as it does for Qwen-Image.
 
 ## How it runs
 
@@ -403,6 +491,13 @@ references, 252 at sixteen.
 | composition (2 at 2048x2048) | 2,125 + 8,192 + 4,096 | 10.60 s | 2.15 s | 33.90 s (242) | 62.57 s | 3.78 s | 427.4 s | 34.5 GB |
 | MiniMax's example (1 at 1024x1024) | 1,459 + 1,024 + 4,096 | 7.77 s | 1.25 s | 3.52 s (25) | 21.47 s | 3.81 s | 146.3 s | 28.4 GB |
 
+The refusals above are stage S5's, which checked an edit against the plan's budget (free memory less a headroom).
+Since then an edit is checked as every request is, against the device's free memory, and an edit's step estimate counts
+two more F32 rows of the hidden width a packed row (calibrated to the A40 peaks above: bf16 with four references measured
+1.08x the earlier estimate, Q4_K_M with sixteen 1.1 GB over its plan). By that check bf16 with sixteen references still
+needs about 53.7 GB of the A40's 48.0 GB and Q8_0 with sixteen about 51.4 GB of the M5 Pro's 40.2 GB, so both are refused;
+bf16's composition of two 2048x2048 references needs about 45.5 GB, is no longer refused, and has not been run since.
+
 ### H100
 
 The H100 numbers below were measured on the earlier native path; the runtime runs the
@@ -472,7 +567,10 @@ and 9.5 s with bf16 at 4 MP, against 55.1 s for ComfyUI's first job.
   columns from their own pointer.
 - LoRA merging (the updates always run unmerged), DoRA, LoCon, LoHa and LoKr adapters,
   and a per-module alpha or rank pattern in a PEFT config.
-- Masked edits (inpainting) and the multi-turn planner for this model.
+- The chat planner's question for this model (which picture a follow-up changes): its
+  text encoder has no output head, so a follow-up changes the newest picture.
+- Mask-aware modulation of the kept rows (modulating them as clean, as ComfyUI's H3 video
+  does): designed as an off-by-default experiment, not built or measured.
 - The prompt expander (MiniMaxAI/MiniMax-H3-Image-PE). ComfyUI's text-to-image
   template leaves it off by default.
 - The `mlx`, `cuda` and `cpu` (pure C#) backends.

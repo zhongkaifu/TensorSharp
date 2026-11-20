@@ -387,6 +387,20 @@ namespace TensorSharp.Chat
                 };
             }
 
+            // What the loaded model does with pictures, when it is an image model (Qwen-Image-2.1, MiniMax-H3-Image): that
+            // a message makes a picture rather than an answer, whether it edits, whether an edit takes a selection (a
+            // mask), and the smallest area it makes pictures at (0 for none). Null for every other model, like video, so a
+            // page tests one field rather than an architecture name.
+            object image = _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel imageModel
+                ? new
+                {
+                    family = imageModel.ImageModelFamily,
+                    supportsEdit = imageModel.SupportsImageEdit,
+                    supportsMask = imageModel.SupportsImageEdit && imageModel.SupportsEditMask,
+                    minimumArea = imageModel.MinimumGenerationArea,
+                }
+                : null;
+
             // What the loaded model does with sound, when it is an audio model (Whisper, Kokoro,
             // ACE-Step): the /v1/audio route it serves and what a request can name. Null for
             // every other model, like video.
@@ -446,6 +460,7 @@ namespace TensorSharp.Chat
                 modelContextTokens = _svc.ModelContextTokens,
                 defaultMaxTokens = _options.DefaultMaxTokens,
                 video,
+                image,
                 audio,
                 // Null when this build serves no skills at all, so the UI can hide the
                 // whole control by testing one field rather than discovering it after a
@@ -1345,6 +1360,11 @@ namespace TensorSharp.Chat
         /// </summary>
         public bool LoadedModelMakesImages => _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel;
 
+        /// <summary>The loaded image model's declared floor (<see cref="TensorSharp.Models.QwenImage.IImageGenerationModel.MinimumGenerationArea"/>),
+        /// or 0: no image model, or one without a floor.</summary>
+        public long LoadedImageModelMinimumArea =>
+            _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel image ? image.MinimumGenerationArea : 0;
+
         /// <summary>The host's authoritative persistent Studio service, shared by chat tools and manual editing.</summary>
         public TensorSharp.Studio.StudioService Studio { get; set; }
 
@@ -1621,6 +1641,7 @@ namespace TensorSharp.Chat
                 {
                     if (generate) throw new WebUiRequestRejectedException(400, new { error = "A mask requires an input image." });
                     p.Mask = DecodeRequestImage(mask, "mask");
+                    p.MaskMode = OpenAIMaskMode(p.Mask);
                 }
                 return await RunImageEditAsync(model, prompt, p, generate ? new List<byte[]>() : images.ToList(), logger, generate,
                     null, image, cancellationToken);
@@ -1914,6 +1935,19 @@ namespace TensorSharp.Chat
             if (info.Length == 0 || info.Length > _uploads.MaxFileBytes)
                 throw new WebUiRequestRejectedException(400, new { error = "Mask is empty or exceeds the upload size limit." });
             p.Mask = DecodeRequestImage(await File.ReadAllBytesAsync(full, ct), "mask");
+        }
+
+        /// <summary>
+        /// How <c>/v1/images/edits</c> reads its <c>mask</c>: OpenAI's convention, where the fully transparent pixels are the
+        /// ones edited (alpha mode), for a mask with any pixel that is not opaque; a mask with no alpha, or an opaque one,
+        /// is read as the image routes' default, white edits and black keeps (grayscale).
+        /// </summary>
+        internal static TensorSharp.Models.QwenImage.QwenImageMaskMode OpenAIMaskMode(TensorSharp.Models.QwenImage.RgbImage mask)
+        {
+            ArgumentNullException.ThrowIfNull(mask);
+            return mask.Alpha != null && Array.Exists(mask.Alpha, a => a < 1f)
+                ? TensorSharp.Models.QwenImage.QwenImageMaskMode.Alpha
+                : TensorSharp.Models.QwenImage.QwenImageMaskMode.Grayscale;
         }
 
         private static TensorSharp.Models.QwenImage.RgbImage DecodeRequestImage(byte[] bytes, string field)

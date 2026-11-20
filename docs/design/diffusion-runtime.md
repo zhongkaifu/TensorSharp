@@ -659,6 +659,15 @@ Optional, behind a recipe field rather than a user switch: mask-aware modulation
 modulated at `t = 1 - m*sigma`, as ComfyUI's H3 video does). It is off by default for parity;
 it is an experiment for stage S6 to measure.
 
+(S6, as built: the canvas is the unmasked edit's for the whole picture, the crop sampled at
+that canvas's density, then the 4 MP floor and the 20 MP ceiling applied to what is sampled at
+its own aspect; the output is the source canvas. The source latent is the posterior mean
+through the references' own F16 rounding and latent normalization
+(`IReferencePolicy.SourceLatent`; the S2 pipeline had used the raw mean, which is not the
+space MiniMax-H3-Image's DiT works in), encoded once more at the sampling canvas when the
+reference copy differs. The decode is resized to the selection with the family's Pillow
+Lanczos before the composite. The mask-aware modulation was not built or measured.)
+
 ### 4.6 Multi-turn
 
 This uses the same convention as Qwen-Image's turns (`ImageTurns.Planning.cs`): the planner
@@ -672,6 +681,12 @@ belongs to `<Picture 1>`. `keepSourceSize` is set on every edit, as now. The pro
 verbatim (decision D10). TensorAgent's "intent scorer" (`QwenImageIntentScorer`) needs an LM
 head that H3's 50-layer encoder does not have, so H3-Image turns take the existing
 `ImageIntentUnavailableException` route (shape-only planning).
+
+(S6, as built: "refers to an earlier picture" is the reading the user chose, `imageIntent`
+"edit" naming a picture of the chat that is not one of the attached photos; without it the
+attached photos are the edit's as before, and the model is not asked. The turn area is
+`max(1024^2, IImageGenerationModel.MinimumGenerationArea)`. Both pages know an image model by
+`/api/models`' new `image` block rather than Qwen's architecture name.)
 
 ### 4.7 Limits and cost
 
@@ -844,7 +859,10 @@ is added: multi-turn is a chat surface.
   to `negativePrompt`.
 * Web UI: no change. It already attaches several images (`imagePaths`), sends masks
   (`mask-editor.js`) and offers "Edit again"; `/api/chat` image turns go through ImageTurns
-  where that host is used.
+  where that host is used. (S6 found otherwise: both pages recognised an image model by
+  Qwen-Image's architecture name, so MiniMax-H3-Image's messages went to the text chat.
+  `/api/models` now reports an `image` block (`family`, `supportsEdit`, `supportsMask`,
+  `minimumArea`), and both pages test it; an older server without it still matches Qwen.)
 
 ### 6.3 TensorAgent
 

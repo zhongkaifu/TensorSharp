@@ -134,7 +134,8 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 quantized |= w.Quantized;
                 bf16Route |= w.Format == GgmlQ4K;
             }
-            return WorkingBytesFor(_w.Config, RowsOf(workload), fused: Backend == BackendType.GgmlCuda, quantized, bf16Route);
+            return WorkingBytesFor(_w.Config, RowsOf(workload), fused: Backend == BackendType.GgmlCuda, quantized, bf16Route,
+                edit: workload.References is { Count: > 0 });
         }
 
         /// <summary>GGML_TYPE_Q4_K: the block type the CUDA step's wide products take to cuBLAS BF16 (ggml_ops_dit_offload.cpp,
@@ -172,16 +173,23 @@ namespace TensorSharp.Models.MiniMaxH3Image
         /// <item>The unfused step (ggml_metal, ggml_cpu, the managed executor): the SwiGLU's own output, the q/k norms, RoPE
         /// and padded attention copies and the modulated rows as separate F32 tensors. 745 KB a row: Q8_0 on ggml_metal
         /// measured 2.95 GB at 2048x2048 (710 KB a row) and Q4_K_M 0.23 GB at 512x512 (770 KB a row, with the fixed part).</item>
+        /// <item>An edit (<paramref name="edit"/>: references in the sequence, modulated at t = 0 beside the target's sigma)
+        /// adds two F32 rows of the hidden width a row (43 KB at the release width), calibrated to stage S5's A40 peaks: bf16
+        /// with 4 references (12,412 rows, the DiT alone resident) measured 4,160 MiB, 1.08x the text-to-image formula's
+        /// 3,861 MiB; Q4_K_M with 16 references (37,129 rows) peaked 1.1 GB over its plan in the decode. The estimate is
+        /// 1.05x the first; the second's plan rises by 1.6 GB. Text to image is unchanged.</item>
         /// </list>
         /// </summary>
-        internal static long WorkingBytesFor(MiniMaxH3Config c, long rows, bool fused, bool quantized, bool bf16Route = true)
+        internal static long WorkingBytesFor(MiniMaxH3Config c, long rows, bool fused, bool quantized, bool bf16Route = true,
+            bool edit = false)
         {
             ArgumentNullException.ThrowIfNull(c);
             long ffn = c.FfnHiddenSize, inner = c.AttentionInnerDim, hidden = c.HiddenSize;
+            long segments = edit ? rows * 2L * 4 * hidden : 0;
             if (fused)
-                return (quantized ? 512L : 128L) * 1024 * 1024
+                return (quantized ? 512L : 128L) * 1024 * 1024 + segments
                     + rows * (4L * (2 * ffn + 3 * inner + 4 * hidden) + 4L * inner + (quantized && bf16Route ? 4L * ffn : 0));
-            return 64L * 1024 * 1024 + rows * 4L * (4 * ffn + 12 * inner + 8 * hidden);
+            return 64L * 1024 * 1024 + segments + rows * 4L * (4 * ffn + 12 * inner + 8 * hidden);
         }
 
         /// <summary>Make the weights resident now (MiniMax-H3's uploader on the GGML backends: direct reads from the file

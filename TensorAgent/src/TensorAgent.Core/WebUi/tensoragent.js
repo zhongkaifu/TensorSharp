@@ -27,7 +27,7 @@
   var modelBtn = $('model'), hold = $('hold'), abc = $('abc');
 
   var state = {
-    model: null, arch: null, backend: null, video: null, contextTokens: 0,
+    model: null, arch: null, backend: null, video: null, image: null, contextTokens: 0,
     modelContextTokens: 0, visionReady: false,
     acceptsVisionProjector: true,
     visionChecking: false,
@@ -774,6 +774,8 @@
     var previousVideo = state.video;
     state.model = (d && d.loaded) || null;
     state.arch = (d && d.architecture) || null;
+    // What an image model takes (the host's image block; null for any other model or an older host).
+    state.image = d && d.image ? Object.assign({}, d.image) : null;
     state.backend = (d && d.loadedBackend) || null;
     // loadedMmProj is retained as a compatibility fallback for an older host.
     // visionReady is authoritative: it is true only after the loaded model has
@@ -828,9 +830,11 @@
         : state.native && !state.dictation ? state.composerHint : t('page.composer.messageOrTalk');
   }
 
-  // Qwen-Image: the host turns a message into a picture rather than an answer
-  // (ImageTurns), on the same /api/chat route and turn machinery as a reply.
-  function makesImages() { return state.arch === 'qwen_image' || state.arch === 'qwen-image'; }
+  // An image model (Qwen-Image-2.1, MiniMax-H3-Image): the host turns a message into a picture
+  // rather than an answer (ImageTurns), on the same /api/chat route and turn machinery as a
+  // reply. Known by the capability the host reports; an older host reports none, and only
+  // Qwen-Image's architecture then.
+  function makesImages() { return !!state.image || state.arch === 'qwen_image' || state.arch === 'qwen-image'; }
 
   // MiniMax-H3: the host films the message instead (VideoTurns), the same way. Known by
   // the capability the host reports, not by an architecture name: the two checkpoints
@@ -2603,12 +2607,19 @@
   }
 
   /**
-   * The other readings of the request a picture answered. None when the request attached
-   * its own photos -- those were the target -- or when there was nothing else it could mean.
+   * The other readings of the request a picture answered. A request that attached photos
+   * edited them; its other reading changes the picture before it, with the photos as that
+   * picture's references ([picture, ...attached], ImageTurns), unless it carried a selection
+   * (of its first photo) or was already read that way. None when there was nothing else it
+   * could mean.
    */
   function overridesFor(plan, request) {
-    if (!request || (request.stillImagePaths && request.stillImagePaths.length) || request.maskPath) return [];
+    if (!request || request.maskPath) return [];
     var earlier = pictureBefore(state.history.lastIndexOf(request));
+    var photos = request.stillImagePaths || [];
+    if (photos.length)
+      return plan === 'edit' && earlier && photos.indexOf(earlier) < 0 && request.imageIntent !== 'edit'
+        ? [{ intent: 'edit', source: earlier }] : [];
     var changeEarlier = earlier ? [{ intent: 'edit', source: earlier }] : [];
     if (plan === 'edit') return [{ intent: 'new' }];
     if (plan === 'again') return changeEarlier.concat([{ intent: 'new' }]);

@@ -438,24 +438,27 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         Assert.Equal(cellOfValue, weights);
     }
 
-    /// <summary>Editing is stage S5's: the family refuses references; its components need their files (a load without
-    /// them names the missing role).</summary>
+    /// <summary>Edits (stage S5) and masked edits (stage S6) are the family's; a mask needs a picture to edit; its components
+    /// need their files (a load without them names the missing role).</summary>
     [Fact]
-    public void TheFamilyRefusesMasksAndComponentsWithoutTheirFiles()
+    public void TheFamilyTakesMasksAndRefusesComponentsWithoutTheirFiles()
     {
         var family = new MiniMaxH3ImageFamily(MiniMaxH3ImageSampling.ReleaseSigmas);
         var image = new TensorSharp.Models.QwenImage.RgbImage(32, 32, new float[32 * 32 * 3]);
-        // Edits are taken (MiniMaxH3ImageEditTests); masked edits are not yet.
+        // Edits are taken (MiniMaxH3ImageEditTests), masked ones on the source's own canvas.
         Assert.Equal(new DiffusionCanvas((2048, 2048), (1024, 1024)), family.ResolveCanvas(new DiffusionRequest
         {
             Prompt = "x",
             References = new[] { new DiffusionReference(image) },
         }, null));
-        Assert.Contains("mask", Assert.Throws<ArgumentException>(() => family.ResolveCanvas(new DiffusionRequest
+        EditMask mask = EditMask.Create(new EditMaskOptions { Mask = image }, image);
+        Assert.Equal(new DiffusionCanvas((2048, 2048), (32, 32)), family.ResolveCanvas(new DiffusionRequest
         {
             Prompt = "x",
             References = new[] { new DiffusionReference(image) },
-        }, EditMask.Create(new EditMaskOptions { Mask = image }, image))).Message);
+        }, mask));
+        Assert.Contains("requires a first reference image", Assert.Throws<ArgumentException>(() =>
+            family.ResolveCanvas(new DiffusionRequest { Prompt = "x" }, mask)).Message);
         Assert.Equal(DiffusionCanvas.Of(2048, 2048), family.ResolveCanvas(new DiffusionRequest { Prompt = "x" }, null));
         Assert.Equal(DiffusionCanvas.Of(1024, 512), family.ResolveCanvas(new DiffusionRequest { Prompt = "x", Width = 1024, Height = 512 }, null));
         var load = new DiffusionLoad { Backend = TestGates.PinnedGgmlBackend };

@@ -459,11 +459,11 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--diffusion-seed <N>` | 扩散路径的噪声种子：DiffusionGemma 的确定性采样器与 Qwen-Image-2.1（默认：0），以及视频生成（Wan、MiniMax-H3）——视频不传时每次运行都会取一个新的随机种子。决定一段视频长什么样的是这个种子，`--seed` 是文本采样种子，对它没有影响。Qwen-Image-2.1 的图像由种子和尺寸决定；编辑的噪声还取决于 `--image` 传入的图片，因此用画出某张图的种子去编辑它，不会从它自己的噪声重新开始（[种子与编辑](docs/models/qwenimage21_zh-cn.md#种子与编辑)）。 |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
 | `--image <path>` | 图像编辑用的输入图像（也是多模态聊天的图像输入）；重复该参数可传入多张参考图。每个 `--image` 都是一张参考图，按命令行顺序排列，提示词按模型自己的方式指代它们：Qwen-Image-2.1 在提示词之前将其标记为 `<image1>`、`<image2>`……；MiniMax-H3-Image（最多 16 张）称之为 `<Picture 1>`、`<Picture 2>`……。不带 `--image` 时，两个模型都改为根据提示词生成图像。 |
-| `--mask <path>` | Qwen-Image-2.1 掩码，尺寸须与第一张输入图完全一致。需要 `--image`；其他图片仍作为参考。保留源图尺寸及未选中的已解码 RGBA 像素。见[掩码图像编辑](#掩码图像编辑)。 |
+| `--mask <path>` | Qwen-Image-2.1 或 MiniMax-H3-Image 编辑的掩码，尺寸须与第一张输入图（MiniMax-H3-Image 的 `<Picture 1>`）完全一致。需要 `--image`；其他图片仍作为参考。保留源图尺寸及未选中的已解码 RGBA 像素。见[掩码图像编辑](#掩码图像编辑)。 |
 | `--mask-mode <mode>` / `--mask-invert` | `grayscale`（默认）：白色编辑、黑色保护、灰色混合。`alpha`：透明编辑、不透明保护。`--mask-invert` 反转选区。 |
 | `--mask-feather <pixels>` | 按源图像素向内柔化边缘；范围 0–1024，默认 0。 |
 | `--mask-crop` / `--mask-crop-padding <pixels>` | 处理选区及周围上下文，再合成回原始画布。padding 按源图像素计，范围 0–16384，默认 64。未给 `--mask` 时掩码设置会被拒绝。 |
-| `--keep-source-size` | Qwen-Image-2.1 编辑：返回第一张 `--image` 的精确宽高，使对编辑结果的再次编辑保持尺寸不变。采样面积约为该图自身面积，至少 1 百万像素、至多自动面积，宽高比近似保持（二者都按 32 像素网格取整），结果再缩放回源图尺寸。需要 `--image`；不能与 `--width`/`--height` 同时使用。带掩码的编辑无需此参数即保持源图尺寸。服务端对应的每请求字段为 `keepSourceSize`。见[保持源图尺寸](#保持源图尺寸)。 |
+| `--keep-source-size` | Qwen-Image-2.1 或 MiniMax-H3-Image 编辑：返回第一张 `--image` 的精确宽高，使对编辑结果的再次编辑保持尺寸不变。采样面积约为该图自身面积（Qwen-Image-2.1：至少 1 百万像素、至多自动面积；MiniMax-H3-Image：至少 2048×2048、至多 2000 万像素），宽高比近似保持（二者都按 32 像素网格取整），结果再缩放回源图尺寸。需要 `--image`；不能与 `--width`/`--height` 同时使用。带掩码的编辑无需此参数即保持源图尺寸。服务端对应的每请求字段为 `keepSourceSize`。见[保持源图尺寸](#保持源图尺寸)。 |
 | `--prompt <text>` | Qwen-Image-2.1 的生成提示词或编辑指令（省略时回退到 `--input` 文件内容）。 |
 | `--output <path>` | Qwen-Image-2.1 输出 PNG 路径（默认：生成为 `generated.png`，编辑为 `edited.png`）。 |
 | `--cfg <F>` | Qwen-Image-2.1 true-CFG 引导尺度（`<= 1` 关闭负向分支）。省略时自动选择：Qwen-Image-2.1 为 1.0（每步只做一次 Transformer 预测），或 `--lora` 插件采样配方中的 CFG；大于 1 的值会增加负向分支。步数与种子复用 `--diffusion-steps` / `--diffusion-seed`。在 MiniMax-H3 上唯一可接受的取值是 `1.0`（也是它的默认值）：该检查点是 CFG 蒸馏的，更高的值会被直接拒绝，而不是照跑然后出劣化结果。`TensorSharp.Server.Host` 根本没有 `--cfg` 参数——但请求体里仍然可以带 `cfg`。 |
@@ -950,7 +950,7 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 
 ## 掩码图像编辑
 
-Qwen-Image-2.1 可以编辑选区，同时保留源图尺寸及所有未选中的已解码 RGBA 像素。
+Qwen-Image-2.1 与 MiniMax-H3-Image 可以编辑选区，同时保留源图尺寸及所有未选中的已解码 RGBA 像素。
 第一张图片是编辑目标，其他图片仍作为参考。例如：
 
 ```bash
@@ -963,7 +963,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 `maskMode`、`maskInvert`、`maskFeather`、`maskCrop`、`maskCropPadding`。
 非流式 `/api/image-edit` 还支持 multipart 上传 `mask` 文件及同名设置。
 JSON 引用的文件请先通过 `/api/upload` 上传。
-掩码需要 Qwen-Image-2.1、输入图以及与源图一致的尺寸。
+掩码需要支持掩码的图像模型（Qwen-Image-2.1 或 MiniMax-H3-Image）、输入图以及与源图一致的尺寸；MiniMax-H3-Image 的采样画布（2048×2048 下限）与多参考图编辑见[其模型文档](docs/models/minimax-h3-image_zh-cn.md#遮罩编辑)。
 选区语义、采样几何、API 示例与验证范围见[掩码指南](docs/models/qwenimage21_zh-cn.md#用遮罩精确编辑局部区域)。
 
 ### 保持源图尺寸
@@ -2708,7 +2708,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
 
 `TensorSharp.Server.Host` 暴露三种 API 风格——兼容 Ollama、兼容 OpenAI，以及 Web UI 自己的 SSE 路由——另有供 DiffusionGemma 使用的 Jev 类型化决策端点 `POST /v1/systemone`。完整文档及 curl/Python 示例见 [API_EXAMPLES_zh-cn.md](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md)。
 
-在 TensorSharp.Server.Host 中，图像与视频模型使用专门的媒体路由。Qwen-Image-2.1 响应 `POST /api/image-generate`（文生图）与 `POST /api/image-edit`（提示词、参考图及可选掩码），两者都有一个用 SSE 报告去噪进度的 `/stream` 变体；没有 `/v1/images/*` 路由。视频模型使用[音视频生成（MiniMax-H3）](#音视频生成minimax-h3) 中介绍的路由。TensorAgent 自身的宿主则通过 `/api/chat` 回合管理器处理媒体请求，与文本回合共用输入框和已保存对话。
+在 TensorSharp.Server.Host 中，图像与视频模型使用专门的媒体路由。Qwen-Image-2.1 与 MiniMax-H3-Image 响应 `POST /api/image-generate`（文生图）与 `POST /api/image-edit`（提示词、参考图及可选掩码），两者都有一个用 SSE 报告去噪进度的 `/stream` 变体，并响应 OpenAI 形式的 `POST /v1/images/generations` 与 `POST /v1/images/edits`。视频模型使用[音视频生成（MiniMax-H3）](#音视频生成minimax-h3) 中介绍的路由。TensorAgent 自身的宿主则通过 `/api/chat` 回合管理器处理媒体请求，与文本回合共用输入框和已保存对话。
 
 **兼容 Ollama 的 API：**
 

@@ -48,11 +48,20 @@ public static partial class ImageTurns
     /// <summary>
     /// The output area a turn asks for: 1024 x 1024 for a picture made from words. An edit
     /// returns its source picture's own size and samples at this area at most, at the
-    /// picture's shape (see <see cref="ImagePlan.Payload"/>). The model's native area is 2048
-    /// x 2048, which has four times the image tokens and costs several times as long per
-    /// step; the page offers no size setting, so this is the budget every turn gets.
+    /// picture's shape (see <see cref="ImagePlan.Payload"/>). Qwen-Image-2.1's native area is
+    /// 2048 x 2048, which has four times the image tokens and costs several times as long per
+    /// step; the page offers no size setting, so this is the budget every turn gets, unless the
+    /// model declares a floor of its own (<see cref="TurnArea"/>).
     /// </summary>
     public const long DefaultTargetArea = 1024L * 1024;
+
+    /// <summary>
+    /// The area a turn asks the loaded model for: <see cref="DefaultTargetArea"/>, or the model's
+    /// declared floor where it is larger (IImageGenerationModel.MinimumGenerationArea:
+    /// MiniMax-H3-Image's 2048 x 2048, below which an edit samples there anyway and a picture from
+    /// words is made at a size the model was not trained for).
+    /// </summary>
+    public static long TurnArea(long minimumGenerationArea) => Math.Max(DefaultTargetArea, minimumGenerationArea);
 
     /// <summary>
     /// Where a chat turn's frames come from: the image service when the loaded model
@@ -145,6 +154,7 @@ public static partial class ImageTurns
         // turn is a stopped turn, and the app's GPU gate tells a damaged engine from a refusal
         // only by what reaches it (AgentAppHost.GatedChatFrames).
         ImagePlan plan = await PlanAsync(conversation, planner, cancellationToken).ConfigureAwait(false);
+        plan = plan with { Area = TurnArea(chat.LoadedImageModelMinimumArea) };
         if (plan.Choices is { } choices)
         {
             // The question is the answer's text, so the transcript and a text model reading
