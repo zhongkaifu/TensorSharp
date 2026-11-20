@@ -172,6 +172,9 @@ namespace TensorSharp.Models
             room = long.MaxValue;
             if (!DeviceRoomManaged || bytes <= 0) return true;
             _slotMutationDepth++;
+            // What the stages below free is for this allocation: it goes back to the driver, not the allocator's cache, where a
+            // disposed slot's capacity-class blocks would wait for a trim (ModelBase.ReturningToDriver).
+            using IDisposable toDriver = ReturningToDriver();
             try
             {
                 long free = RoomFree(use), before = free;

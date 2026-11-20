@@ -336,7 +336,6 @@ namespace TensorSharp.Models
         {
             if (dependent?.K == null) return;
             _slotMutationDepth++;
-            using IDisposable toDriver = ReturningToDriver();
             try
             {
                 Unregister(dependent);

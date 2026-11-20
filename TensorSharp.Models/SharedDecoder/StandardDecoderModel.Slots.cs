@@ -712,7 +712,6 @@ namespace TensorSharp.Models
             }
             _idleSpareRefused = false;
             _slotMutationDepth++;
-            using IDisposable toDriver = ReturningToDriver();
             try
             {
                 ForgetGraphsOf(slot);
