@@ -41,7 +41,8 @@ code, so the runtime family can be held to them after the legacy code is deleted
 * `LegacyGoldens/<lane>.json` (`MuseGlimmerGoldens.cs`, `MuseGlimmerFrozenLegacyTests`):
   the logits of every forward of seven scripted cases (a long prefill, prompt steps,
   the ring wrapping, the full layers' cache growing, a rewind; an untied and a tied
-  head) on two synthetic fixtures, per lane (cpu, ggml_cpu, ggml_metal, mlx on the M5 Pro).
+  head) on two synthetic fixtures, per lane (cpu, ggml_cpu, ggml_metal, mlx on the M5 Pro; cpu,
+  ggml_cpu, ggml_cuda, ggml_vulkan and direct cuda on an RTX PRO 4500 Blackwell box, linux-x64).
 * `LegacyReal/<lane>.json` (`MuseGlimmerLegacyRealTests.cs`): on the real IQ2_XXS weights
   (ggml_metal and mlx on the M5 Pro), the greedy continuations of the goldens' prompts with
   each position's top four log-probabilities, and the teacher-forced perplexity of
