@@ -104,6 +104,25 @@ public sealed class OpenAIImageRoutesTests : IDisposable
         return ImageIO.EncodePng(new RgbImage(w, h, px));
     }
 
+    /// <summary>/api/models reports the loaded image model's capabilities in its <c>image</c> block (the pages know an image
+    /// model by it): a model that declares no mask support or floor reports false and 0.</summary>
+    [Fact]
+    public void TheModelsRouteReportsTheImageModelsCapabilities()
+    {
+        var (adapter, _, service) = Build();
+        using (service)
+        {
+            IResult result = adapter.GetModels();
+            JsonElement models = JsonSerializer.SerializeToElement(result.GetType().GetProperty("Value")!.GetValue(result));
+            JsonElement image = models.GetProperty("image");
+            Assert.Equal("fake-image", image.GetProperty("family").GetString());
+            Assert.True(image.GetProperty("supportsEdit").GetBoolean());
+            Assert.False(image.GetProperty("supportsMask").GetBoolean());
+            Assert.Equal(0, image.GetProperty("minimumArea").GetInt64());
+            Assert.Equal(JsonValueKind.Null, models.GetProperty("video").ValueKind);
+        }
+    }
+
     /// <summary>/v1/images/edits reads its mask as OpenAI does, transparent pixels edited, when the mask has any that are not
     /// opaque; a mask without alpha, or an opaque one, is the image routes' grayscale (white edits).</summary>
     [Fact]

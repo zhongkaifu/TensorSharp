@@ -387,6 +387,20 @@ namespace TensorSharp.Chat
                 };
             }
 
+            // What the loaded model does with pictures, when it is an image model (Qwen-Image-2.1, MiniMax-H3-Image): that
+            // a message makes a picture rather than an answer, whether it edits, whether an edit takes a selection (a
+            // mask), and the smallest area it makes pictures at (0 for none). Null for every other model, like video, so a
+            // page tests one field rather than an architecture name.
+            object image = _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel imageModel
+                ? new
+                {
+                    family = imageModel.ImageModelFamily,
+                    supportsEdit = imageModel.SupportsImageEdit,
+                    supportsMask = imageModel.SupportsImageEdit && imageModel.SupportsEditMask,
+                    minimumArea = imageModel.MinimumGenerationArea,
+                }
+                : null;
+
             // What the loaded model does with sound, when it is an audio model (Whisper, Kokoro,
             // ACE-Step): the /v1/audio route it serves and what a request can name. Null for
             // every other model, like video.
@@ -446,6 +460,7 @@ namespace TensorSharp.Chat
                 modelContextTokens = _svc.ModelContextTokens,
                 defaultMaxTokens = _options.DefaultMaxTokens,
                 video,
+                image,
                 audio,
                 // Null when this build serves no skills at all, so the UI can hide the
                 // whole control by testing one field rather than discovering it after a
@@ -1344,6 +1359,11 @@ namespace TensorSharp.Chat
         /// turn goes to.
         /// </summary>
         public bool LoadedModelMakesImages => _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel;
+
+        /// <summary>The loaded image model's declared floor (<see cref="TensorSharp.Models.QwenImage.IImageGenerationModel.MinimumGenerationArea"/>),
+        /// or 0: no image model, or one without a floor.</summary>
+        public long LoadedImageModelMinimumArea =>
+            _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel image ? image.MinimumGenerationArea : 0;
 
         /// <summary>The host's authoritative persistent Studio service, shared by chat tools and manual editing.</summary>
         public TensorSharp.Studio.StudioService Studio { get; set; }

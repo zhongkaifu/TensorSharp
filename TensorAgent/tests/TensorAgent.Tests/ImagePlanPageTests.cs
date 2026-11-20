@@ -184,6 +184,62 @@ public sealed partial class WebUiPageTests
     }
 
     /// <summary>
+    /// A message that attached a photo edited that photo; its other reading changes the picture
+    /// before it with the photo as a reference ([picture, ...attached]): the tap sends the same
+    /// words and photo again, naming the earlier picture to change (imageIntent "edit",
+    /// imageSource), in place of the turn.
+    /// </summary>
+    [WebJavaScriptFact]
+    public void AnAttachedPhotosOtherReadingChangesThePreviousPictureWithItAsAReference()
+    {
+        JsonElement result = Run(ImageModel + ChatWithAPicture + """
+            var chatCalls = 0;
+            R['/api/chat'] = function () {
+              chatCalls++;
+              return chatCalls === 1 ? { __sse: [
+                { image_plan: 'edit', image_sources: ['/uploads/hat.png'], image_prompt: 'put this hat on the dog', image_plan_reason: 'attached' },
+                { imageUrl: '/uploads/hat-edit.png', width: 1024, height: 1024, imagePlan: 'edit', imagePlanReason: 'attached',
+                  imageSources: ['hat.png'], imagePrompt: 'put this hat on the dog', imageSeed: 0, imageMask: null },
+                { done: true, sessionId: 's9' }
+              ] } : { __sse: [
+                { image_plan: 'edit', image_sources: ['/uploads/dog.png', '/uploads/hat.png'], image_prompt: 'put this hat on the dog', image_plan_reason: 'asked' },
+                { imageUrl: '/uploads/dog-hat.png', width: 1024, height: 1024, imagePlan: 'edit', imagePlanReason: 'asked',
+                  imageSources: ['dog.png', 'hat.png'], imagePrompt: 'put this hat on the dog', imageSeed: 0, imageMask: null },
+                { done: true, sessionId: 's9' }
+              ] };
+            };
+            """, """
+            window.TensorAgent.addAttachment({ ok: true, file: 'hat.png', mediaType: 'image' });
+            __page.byId['text'].value = 'put this hat on the dog';
+            __page.byId['send'].dispatch('click');
+            return settle(30).then(function () {
+              var redo = __page.byId['chat'].querySelector('.image-redo');
+              var label = redo && redo.textContent;
+              redo.querySelector('button').dispatch('click');
+              return settle(30).then(function () { return {
+                label: label, sent: __page.requests('/api/chat').map(function (r) { return r.body; }),
+                history: window.TensorAgent.history().map(function (m) { return m.imageUrl || m.content; }),
+                offeredAfter: __page.byId['chat'].querySelectorAll('.image-redo').length,
+                errors: __page.errorNotices()
+              }; });
+            });
+            """);
+
+        Assert.False(result.TryGetProperty("error", out JsonElement failure), failure.ToString());
+        Assert.Contains("Change the previous picture instead", result.GetProperty("label").GetString());
+        JsonElement redo = result.GetProperty("sent")[1];
+        JsonElement asked = redo.GetProperty("messages").EnumerateArray().Last();
+        Assert.Equal("put this hat on the dog", asked.GetProperty("content").GetString());
+        Assert.Equal("edit", asked.GetProperty("imageIntent").GetString());
+        Assert.Equal("dog.png", asked.GetProperty("imageSource").GetString());
+        Assert.Equal(new[] { "hat.png" }, Strings(asked, "stillImagePaths"));
+        Assert.Equal(new[] { "a dog", "/uploads/dog.png", "put this hat on the dog", "/uploads/dog-hat.png" }, Strings(result, "history"));
+        // Read that way already: no other reading is offered for it.
+        Assert.Equal(0, result.GetProperty("offeredAfter").GetInt32());
+        Assert.Empty(Strings(result, "errors"));
+    }
+
+    /// <summary>
     /// A wrong reading is cheapest to correct before the picture is finished: the other
     /// reading is offered as soon as the plan arrives, and taking it replaces the turn that
     /// is still drawing.

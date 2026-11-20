@@ -1322,6 +1322,166 @@ public sealed class ImageTurnsTests : IDisposable
     /// user's turn, or it is that bug again.
     /// </para>
     /// </summary>
+    // =====================================================================================
+    // MiniMax-H3-Image: the model's own floor, no scorer, and [picture, ...attached]
+    // =====================================================================================
+
+    /// <summary>
+    /// An image model that records what each turn asked of it and paints a picture of the asked
+    /// size: MiniMax-H3-Image's capabilities (edits, masks, a 2048 x 2048 floor) when
+    /// <paramref name="floor"/> is its floor, no weights.
+    /// </summary>
+    internal sealed class PictureModel : TensorSharp.Models.ModelBase, IImageGenerationModel
+    {
+        private readonly long _floor;
+
+        public PictureModel(string path, long floor) : base(path, TensorSharp.Runtime.BackendType.Cpu)
+        {
+            _floor = floor;
+            Config = new TensorSharp.Runtime.ModelConfig { Architecture = "minimax-h3-image" };
+        }
+
+        public List<(string Prompt, QwenImageParams P, RgbImage[] Inputs)> Calls { get; } = new();
+        public string ImageModelFamily => "minimax-h3-image";
+        public bool SupportsImageEdit => true;
+        public bool SupportsEditMask => true;
+        public long MinimumGenerationArea => _floor;
+
+        public RgbImage GenerateImage(string prompt, QwenImageParams p = null) => Make(prompt, p, Array.Empty<RgbImage>());
+        public RgbImage EditImage(string prompt, IReadOnlyList<RgbImage> inputs, QwenImageParams p) => Make(prompt, p, inputs.ToArray());
+
+        private RgbImage Make(string prompt, QwenImageParams p, RgbImage[] inputs)
+        {
+            lock (Calls) Calls.Add((prompt, p, inputs));
+            p.OnStep?.Invoke(1, 1, null);
+            int w = inputs.Length > 0 ? inputs[0].Width : 64, h = inputs.Length > 0 ? inputs[0].Height : 64;
+            return new RgbImage(w, h, new float[w * h * 3]);
+        }
+
+        protected override float[] ForwardCore(int[] tokens) => Array.Empty<float>();
+        protected override void ResetKVCacheCore() { }
+    }
+
+    /// <summary>A chat service with <see cref="PictureModel"/> loaded (its floor <paramref name="floor"/>).</summary>
+    internal static (WebUiChatService Chat, PictureModel Model) ChatWithPictureModel(string root, string uploads, long floor)
+    {
+        string gguf = Path.Combine(root, "models", "picture.gguf");
+        Directory.CreateDirectory(Path.GetDirectoryName(gguf)!);
+        using (var writer = new BinaryWriter(File.Create(gguf)))
+        {
+            writer.Write(0x46554747u); writer.Write(3u); writer.Write(0UL); writer.Write(0UL); writer.Write(new byte[8]);
+        }
+        PictureModel? model = null;
+        var service = new ModelService(NullLogger<ModelService>.Instance, (path, _, _, _) => model = new PictureModel(path, floor));
+        service.LoadModel(gguf, null, "cpu");
+        var options = new ServerHostingOptions(
+            startupModelPath: gguf, startupMmProjPath: null, defaultBackend: "cpu",
+            supportedBackends: new[] { new BackendOption("cpu", "CPU") }, defaultMaxTokens: 100, maxTokensPinned: false,
+            defaultVideoFrames: 0, defaultVideoFps: 0, defaultVideoWidth: 0, defaultVideoHeight: 0, defaultVideoSteps: 0,
+            defaultVideoMode: null, uploadDirectory: uploads, logDirectory: Path.Combine(root, "logs"), fileLoggingEnabled: false,
+            samplingDefaults: null);
+        var chat = new WebUiChatService(service, new SessionManager(), options, new UploadStoragePolicy(uploads),
+            new SkillRegistry(new SkillRegistryOptions()), codeRunner: null, workspaces: null, codeArtifacts: null,
+            NullLoggerFactory.Instance);
+        return (chat, model!);
+    }
+
+    /// <summary>A real PNG in the uploads folder (the image service decodes what it edits).</summary>
+    private void KeepPicture(string name, int width = 96, int height = 64) =>
+        File.WriteAllBytes(Path.Combine(_uploads, name), ImageIO.EncodePng(new RgbImage(width, height, new float[width * height * 3])));
+
+    /// <summary>
+    /// The area a turn asks for is the loaded model's own floor where it has one (MiniMax-H3-Image's
+    /// 2048 x 2048), and the 1024 x 1024 budget otherwise (Qwen-Image-2.1, unchanged): a picture
+    /// from words and an edit alike.
+    /// </summary>
+    [Theory]
+    [InlineData(0L, 1024L * 1024)]
+    [InlineData(2048L * 2048, 2048L * 2048)]
+    public async Task ATurnAsksForTheLoadedModelsOwnFloor(long floor, long area)
+    {
+        Assert.Equal(area, ImageTurns.TurnArea(floor));
+        var (chat, model) = ChatWithPictureModel(_root, _uploads, floor);
+        KeepPicture("photo.png");
+        await CollectAsync(ImageTurns.StreamAsync(chat, Body("""
+            { "sessionId": "s1", "messages": [ { "role": "user", "content": "a lighthouse at dusk" } ] }
+            """), new Scorer().For(_uploads), CancellationToken.None));
+        await CollectAsync(ImageTurns.StreamAsync(chat, Body("""
+            { "sessionId": "s1", "messages": [ { "role": "user", "content": "make it night", "stillImagePaths": ["photo.png"] } ] }
+            """), new Scorer().For(_uploads), CancellationToken.None));
+
+        Assert.Equal(2, model.Calls.Count);
+        Assert.All(model.Calls, call => Assert.Equal(area, call.P.TargetArea));
+        Assert.True(model.Calls[1].P.KeepSourceSize);
+    }
+
+    /// <summary>
+    /// MiniMax-H3-Image's encoder has no output head to answer the planner's question, so a
+    /// follow-up takes the shape-only route (no answer): the newest picture is changed, and the
+    /// page is told the turn guessed. The edit keeps that picture's size.
+    /// </summary>
+    [Fact]
+    public async Task AFollowUpWithAnImageModelThatCannotBeAskedChangesTheNewestPicture()
+    {
+        var (chat, model) = ChatWithPictureModel(_root, _uploads, 2048L * 2048);
+        KeepPicture("made.png", 128, 96);
+        List<JsonElement> frames = await CollectAsync(ImageTurns.StreamAsync(chat, Body("""
+            { "sessionId": "s1", "messages": [
+                { "role": "user", "content": "a cafe with a painted sign" },
+                { "role": "assistant", "content": "", "imageUrl": "/uploads/made.png" },
+                { "role": "user", "content": "make the sign read OPEN" }
+            ] }
+            """), ImageTurns.Planner.For(chat, _uploads), CancellationToken.None));
+
+        Assert.Equal(("edit", "unavailable"), (frames[0].GetProperty("image_plan").GetString(), frames[0].GetProperty("image_plan_reason").GetString()));
+        var call = Assert.Single(model.Calls);
+        Assert.Equal("make the sign read OPEN", call.Prompt);
+        Assert.Equal((128, 96), (Assert.Single(call.Inputs).Width, call.Inputs[0].Height));
+        Assert.True(call.P.KeepSourceSize);
+        Assert.Contains(frames, f => f.TryGetProperty("imageUrl", out _));
+    }
+
+    /// <summary>
+    /// Photos attached to a message the user said changes a picture of the chat (the reading
+    /// they chose: imageIntent "edit" naming it) are references of that picture's edit:
+    /// [picture, ...attached], so the prompt's &lt;Picture 1&gt; is the picture changed and
+    /// &lt;Picture 2&gt;... the photos, and the selection is the picture's. Without that reading,
+    /// or when it names one of the message's own photos, the photos are the edit's as before.
+    /// </summary>
+    [Fact]
+    public async Task PhotosAttachedToAChosenPictureAreItsReferences()
+    {
+        Keep("made.png", "mug.png", "lamp.png");
+        var scorer = new Scorer { Answer = _ => throw new InvalidOperationException("the model must not be asked") };
+        const string earlier = """
+            { "role": "user", "content": "a library table" },
+            { "role": "assistant", "content": "", "imageUrl": "/uploads/made.png" },
+            """;
+        ImageTurns.ImagePlan chosen = await PlanAsync("{ \"messages\": [" + earlier + """
+            { "role": "user", "content": "put the mug from <Picture 2> and the lamp from <Picture 3> on the table",
+              "stillImagePaths": ["mug.png", "lamp.png"], "imageIntent": "edit", "imageSource": "made.png",
+              "maskPath": "selection.png", "maskFeather": 8 }
+            ] }
+            """, scorer);
+        Assert.Equal(("edit", "asked"), (chosen.Kind, chosen.Reason));
+        JsonElement payload = PayloadOf(chosen);
+        Assert.Equal(new[] { "made.png", "mug.png", "lamp.png" }, Strings(payload, "imagePaths"));
+        Assert.Equal("selection.png", payload.GetProperty("maskPath").GetString());
+        Assert.Equal(8, payload.GetProperty("maskFeather").GetInt32());
+        Assert.True(payload.GetProperty("keepSourceSize").GetBoolean());
+
+        // The reading names one of the photos, or nothing in the chat: the photos are the edit's.
+        foreach (string source in new[] { "mug.png", "gone.png" })
+        {
+            ImageTurns.ImagePlan plain = await PlanAsync("{ \"messages\": [" + earlier + """
+                { "role": "user", "content": "brighter", "stillImagePaths": ["mug.png"], "imageIntent": "edit", "imageSource": "
+                """.TrimEnd() + source + "\" } ] }", scorer);
+            Assert.Equal(("edit", "attached"), (plain.Kind, plain.Reason));
+            Assert.Equal(new[] { "mug.png" }, Strings(PayloadOf(plain), "imagePaths"));
+        }
+        Assert.Empty(scorer.Asked);
+    }
+
     [Fact]
     public void EveryChatTurnAsksImageTurnsWhichServiceAnswersIt()
     {
