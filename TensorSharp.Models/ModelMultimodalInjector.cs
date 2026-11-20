@@ -18,7 +18,7 @@ using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
-    internal sealed class ModelMultimodalInjector : IMultimodalInjector, IDisposable
+    internal sealed partial class ModelMultimodalInjector : IMultimodalInjector, IDisposable
     {
         private readonly ModelBase _model;
         private readonly Dictionary<string, CachedEmbedding> _visionCache = new(StringComparer.OrdinalIgnoreCase);
@@ -214,7 +214,11 @@ namespace TensorSharp.Models
             // GGUF, which threw on the magic bytes and failed the whole projector load
             // for a family that merely also KNOWS how to read audio (Gemma 4).
             if (!IsSafetensorsProjector(mmProjPath))
+            {
                 (_model as IAudioEncoderLoader)?.LoadAudioEncoder(mmProjPath);
+                // A speaking LLM's speech decoder lives in its mmproj too (LFM3-Omni's a.gen.*).
+                (_model as TensorSharp.Models.Audio.ISpeechOutputLoader)?.LoadSpeechOutput(mmProjPath);
+            }
         }
 
         /// <summary>Whether a projector path is a HuggingFace safetensors shard rather

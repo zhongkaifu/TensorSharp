@@ -445,7 +445,12 @@ namespace TensorSharp.Models
                 {
                     long bytes = (slot.K?[e] is { } k && r < k.Length && k[r] != null ? k[r].Storage.ByteLength : 0)
                         + (slot.V?[e] is { } v && r < v.Length && v[r] != null ? v[r].Storage.ByteLength : 0);
-                    if (bytes > 0) Add(CacheStage(e), r, bytes, 0);
+                    if (bytes <= 0) continue;
+                    // A sliding-window ring costs its whole ring a slot, whatever the slot's length.
+                    if (RingOf(e) is > 0 and var ring)
+                        Add(CacheStage(e), r, 0, bytes / Math.Max(1, CacheCells(e, slot.Capacity)) * ring);
+                    else
+                        Add(CacheStage(e), r, bytes, 0);
                 }
             if (slot.Recurrent != null)
                 for (int l = 0; l < slot.Recurrent.Length; l++)
@@ -813,8 +818,11 @@ namespace TensorSharp.Models
                 ForgetGraphsOfGrowing(slot);
                 CopyRows(slot.K, k, slot.Length);
                 CopyRows(slot.V, v, slot.Length);
-                foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
-                foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                using (ReturningToDriver())
+                {
+                    foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                    foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                }
                 Tensor[][] oldK = slot.K;
                 slot.K = k;
                 slot.V = v;
@@ -877,22 +885,25 @@ namespace TensorSharp.Models
 
                 Tensor Replace(Tensor[] old, int r, int e, bool value)
                 {
-                    long bytes = old[r].Storage.ByteLength / Math.Max(1, slot.Capacity) * capacity;
+                    // A sliding-window layer's ring holds at most its cells on both sides (CacheCells), and one past its first
+                    // lap moves whole: its cells keep their positions (CopyRows, Grow).
+                    long bytes = old[r].Storage.ByteLength / Math.Max(1, old[r].Sizes[1]) * CacheCells(e, capacity);
+                    int moved = (int)Math.Min(rows, old[r].Sizes[1]);
                     if (cuda != null)
                         driverFree += cuda.TrimForAllocation(bytes, cuda.AllocationBlockBytes(bytes), Math.Max(0, driverFree));
                     if (RollingGrowthFailAfterForTests is int failAfter && made >= failAfter)
                         throw new InvalidOperationException($"{Config.Architecture}: injected allocation failure during a slot's growth (test)");
-                    Tensor grown = NewCacheTensor(e, r, capacity, value, zeroFrom: rows);
+                    Tensor grown = NewCacheTensor(e, r, capacity, value, zeroFrom: moved);
                     made++;
                     if (cuda != null) driverFree -= cuda.AllocationBlockBytes(bytes);
-                    if (rows > 0)
+                    if (moved > 0)
                     {
-                        using Tensor src = old[r].Narrow(1, 0, rows);
-                        using Tensor dst = grown.Narrow(1, 0, rows);
+                        using Tensor src = old[r].Narrow(1, 0, moved);
+                        using Tensor dst = grown.Narrow(1, 0, moved);
                         Ops.Copy(dst, src);
                     }
                     InvalidateTensorDeviceCache(old[r]);
-                    old[r].Dispose();
+                    using (ReturningToDriver()) old[r].Dispose();   // no slot of the old capacity is coming
                     old[r] = null;
                     return grown;
                 }
@@ -934,8 +945,10 @@ namespace TensorSharp.Models
                 for (int r = 0; r < from[l].Length; r++)
                 {
                     if (from[l][r] == null) continue;   // a rank that does not run this entry (a draft layer off rank 0)
-                    using Tensor src = from[l][r].Narrow(1, 0, rows);
-                    using Tensor dst = to[l][r].Narrow(1, 0, rows);
+                    // A ring past its first lap moves whole (same cells on both sides).
+                    int n = (int)Math.Min(rows, from[l][r].Sizes[1]);
+                    using Tensor src = from[l][r].Narrow(1, 0, n);
+                    using Tensor dst = to[l][r].Narrow(1, 0, n);
                     Ops.Copy(dst, src);
                 }
             }
@@ -994,6 +1007,7 @@ namespace TensorSharp.Models
             _slots.Remove(requestId);
             _fittedReservations?.Remove(requestId);
             RecycleSlot(slot);
+            LogDeviceHoldings($"{requestId} released");
         }
 
         public bool RetainSequenceCache(string requestId) => RetainSequenceCacheAs(requestId, requestId);
@@ -1127,16 +1141,18 @@ namespace TensorSharp.Models
         /// every request it carried: four Qwen3.8-27B DFlash2 prompts on a 24 GB GPU, where Qwen35Model serves them.
         /// </remarks>
         private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
-            float[][] features = null)
+            float[][] features = null, SlotRowIO rowIO = null)
         {
             NoteEngineThread();
             ForgetDeferredGraphs();
             if (SlotInvariantChecksForTests) CheckSlotShareInvariants();
-            try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
+            if (_maxSequenceStepRows != int.MaxValue && chunks.Any(c => c != null && c.Length > _maxSequenceStepRows))
+                return TryForwardSlotsInRingSteps(requestIds, chunks, starts, outLogits, features, rowIO);
+            try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features, rowIO); }
             catch (InvalidOperationException ex) when (IsGraphAllocationFailure(ex))
             {
                 FreeGraphMemory();
-                try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features); }
+                try { return TryForwardSlotsOnce(requestIds, chunks, starts, outLogits, features, rowIO); }
                 catch (InvalidOperationException again) when (IsGraphAllocationFailure(again) && requestIds.Count > 1)
                 {
                     FreeGraphMemory();
@@ -1161,11 +1177,87 @@ namespace TensorSharp.Models
                     logits[i] = outLogits[from + i];
                     if (partFeatures != null) partFeatures[i] = features[from + i];
                 }
-                bool ran = TryForwardSlots(ids, parts, partStarts, logits, partFeatures);
+                bool ran = TryForwardSlots(ids, parts, partStarts, logits, partFeatures, rowIO?.Slice(from, count));
                 Array.Copy(logits, 0, outLogits, from, count);
                 if (partFeatures != null) Array.Copy(partFeatures, 0, features, from, count);
                 return ran;
             }
+        }
+
+        /// <summary>
+        /// A batched step whose chunks hold more rows of a sequence than its sliding-window rings hold beside their window, as
+        /// rounds of at most <see cref="MaxSequenceStepRows"/> rows a sequence (StandardDecoderModel.SlidingRings.cs): round k
+        /// carries piece k of every chunk that has one, and each sequence's logits come from the round of its last piece.
+        /// Declines (nothing run) where the first round does.
+        /// </summary>
+        private bool TryForwardSlotsInRingSteps(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
+            float[][] features, SlotRowIO rowIO = null)
+        {
+            if (features != null && Array.Exists(features, f => f != null))
+                throw new NotSupportedException($"{Config.Architecture}: drafter features of a chunk longer than {_maxSequenceStepRows} rows, " +
+                    "which its sliding-window ring caches take in steps.");
+            int step = _maxSequenceStepRows, n = requestIds.Count, rounds = 0;
+            for (int s = 0; s < n; s++) rounds = Math.Max(rounds, ((chunks[s]?.Length ?? 0) + step - 1) / step);
+            // Plain prompts' rounds overlap on the device (IGraphExecutor.OverlapSteps): a round that ends no request's chunk runs
+            // no head and hands the host nothing, so its run returns with its work queued while the next round is embedded,
+            // traced and built. The slots hold their whole chunks first, so no round grows them.
+            IDisposable overlap = null;
+            if (OverlapPromptSteps && rounds > 1 && GraphExecutor != null && _mesh.Stages == 1 && !_rankGraphs && _graphTpRanks == null
+                && (_followPromptRequests == null || !requestIds.Any(_followPromptRequests.ContainsKey)) && _slots != null
+                && requestIds.All(id => _slots.ContainsKey(id)))
+            {
+                for (int s = 0; s < n; s++)
+                    if (chunks[s] != null) EnsureSlotCapacity(_slots[requestIds[s]], checked(starts[s] + chunks[s].Length));
+                overlap = GraphExecutor.OverlapSteps();
+            }
+            try
+            {
+                for (int round = 0; round < rounds; round++)
+                {
+                    var ids = new List<string>();
+                    var parts = new List<int[]>();
+                    var partStarts = new List<int>();
+                    var owners = new List<int>();
+                    // A request's row input and hidden output belong to its last row, so they go with its last piece.
+                    var inputRows = new List<float[]>();
+                    var hidden = new List<float[]>();
+                    for (int s = 0; s < n; s++)
+                    {
+                        int at = round * step, length = chunks[s]?.Length ?? 0;
+                        if (at >= length) continue;
+                        bool last = at + step >= length;
+                        ids.Add(requestIds[s]);
+                        parts.Add(chunks[s].AsSpan(at, Math.Min(step, length - at)).ToArray());
+                        partStarts.Add(starts[s] + at);
+                        owners.Add(s);
+                        inputRows.Add(last ? rowIO?.InputRows?[s] : null);
+                        hidden.Add(last ? rowIO?.Hidden?[s] : null);
+                    }
+                    bool anyLast = false;
+                    foreach (int o in owners) anyLast |= (round + 1) * step >= chunks[o].Length;
+                    var roundRowIO = rowIO == null
+                        ? overlap != null && !anyLast ? new SlotRowIO { Logits = false } : null
+                        : new SlotRowIO
+                        {
+                            InputRows = rowIO.InputRows == null ? null : inputRows.ToArray(),
+                            Logits = rowIO.Logits && (overlap == null || anyLast),
+                            Hidden = rowIO.Hidden == null ? null : hidden.ToArray(),
+                        };
+                    var logits = new float[ids.Count][];
+                    if (!TryForwardSlots(ids, parts, partStarts.ToArray(), logits, null, roundRowIO))
+                    {
+                        if (round == 0) return false;
+                        throw new InvalidOperationException($"{Config.Architecture}: round {round} of a batched step in ring steps declined after the first ran.");
+                    }
+                    for (int i = 0; i < owners.Count; i++)
+                        if ((round + 1) * step >= chunks[owners[i]].Length) outLogits[owners[i]] = logits[i];
+                }
+            }
+            finally
+            {
+                overlap?.Dispose();
+            }
+            return true;
         }
 
         /// <summary>Frees the device memory a step can do without: the cached graphs, the kept arenas and the idle slots'
@@ -1184,8 +1276,50 @@ namespace TensorSharp.Models
         /// <summary>Forwards over several requests that fail as a graph's compute allocation would, before running (tests).</summary>
         internal int InjectedForwardAllocationFailures { get; set; }
 
+        /// <summary>
+        /// A step's per-request row input and output (<see cref="IUnifiedBatchModel.TryForwardUnifiedRows"/>): the rows that
+        /// replace some requests' last embedded rows, whether the step runs the LM head, and the buffers of the requests' last
+        /// final-normed rows.
+        /// </summary>
+        private sealed class SlotRowIO
+        {
+            /// <summary>Per request, the embedding row of its last row, or null (its token's).</summary>
+            public float[][] InputRows;
+            /// <summary>The step runs the head (some request wants logits); without it, every request's logits stay null.</summary>
+            public bool Logits = true;
+            /// <summary>Per request, a buffer for its last final-normed row, or null.</summary>
+            public float[][] Hidden;
+
+            public SlotRowIO Slice(int from, int count) => new()
+            {
+                InputRows = InputRows?[from..(from + count)],
+                Logits = Logits,
+                Hidden = Hidden?[from..(from + count)],
+            };
+        }
+
+        /// <summary>Write the requests' input rows over their last embedded rows (<paramref name="lastRows"/>).</summary>
+        private unsafe void InjectRows(Tensor embedded, SlotRowIO rowIO, int[] lastRows)
+        {
+            if (rowIO?.InputRows == null) return;
+            int dim = Config.HiddenSize;
+            bool wrote = false;
+            float* destination = GetFloatPtr(embedded);
+            for (int s = 0; s < lastRows.Length; s++)
+            {
+                float[] row = rowIO.InputRows[s];
+                if (row == null) continue;
+                if (row.Length != dim)
+                    throw new ArgumentException($"{Config.Architecture}: an input row has {row.Length} values, the embedding {dim}.");
+                fixed (float* source = row)
+                    Buffer.MemoryCopy(source, destination + (long)lastRows[s] * dim, (long)dim * sizeof(float), (long)dim * sizeof(float));
+                wrote = true;
+            }
+            if (wrote) HostWritten(embedded);
+        }
+
         private bool TryForwardSlotsOnce(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
-            float[][] features)
+            float[][] features, SlotRowIO rowIO = null)
         {
             if (!SupportsPerSequenceFusedForward || _slots == null || HasPendingMedia || _pendingPositionTable != null) return false;
             int n = requestIds.Count;
@@ -1242,7 +1376,8 @@ namespace TensorSharp.Models
             try
             {
                 embedded = EmbedStep(flatTokens);
-                bool capture = features != null && Array.Exists(features, f => f != null);
+                InjectRows(embedded, rowIO, lastRows);
+                bool capture = rowIO == null && features != null && Array.Exists(features, f => f != null);
                 // A lone speculating request's prompt chunk hands the draft layer its rows, and every speculating request's
                 // chunk its DFlash ring's (FollowPlainPrompt); a request that does not speculate, its ring's where one is free
                 // (FollowUnspeculatedPrompt).
@@ -1253,7 +1388,7 @@ namespace TensorSharp.Models
                 DFlashFollowPlan dflash = promptEnds == null ? null : PlanDFlashFollow(requestIds.ToArray(), starts, counts, promptEnds, aside);
                 if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
                     : RunFollowingDFlash(ref dflash, plan => TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(),
-                          wantLogits: true, out float[][] graphLogits, follow: follow, draftRows: draftRows, dflash: plan, prompt: true)
+                          wantLogits: rowIO?.Logits ?? true, out float[][] graphLogits, rowIO?.Hidden, follow: follow, draftRows: draftRows, dflash: plan, prompt: true)
                           && CopyLogits(graphLogits, outLogits)))
                 {
                     BatchedForwardCount++;
@@ -1265,7 +1400,8 @@ namespace TensorSharp.Models
                 }
                 static bool CopyLogits(float[][] from, float[][] to)
                 {
-                    Array.Copy(from, to, to.Length);
+                    if (from != null) Array.Copy(from, to, to.Length);
+                    else Array.Clear(to);   // a step no request wanted logits from ran no head
                     return true;
                 }
             }
@@ -1292,8 +1428,9 @@ namespace TensorSharp.Models
                 BatchedForwardCount++;
                 EnterStage(0);
                 Tensor hidden = EmbedStep(flatTokens);
+                InjectRows(hidden, rowIO, lastRows);
                 hidden = RunLayers(hidden, TokenPositions.Explicit(positions), batch);
-                all = ProjectRows(hidden, lastRows);
+                all = ProjectRows(hidden, lastRows, rowIO?.Logits ?? true, rowIO?.Hidden);
                 hidden.Dispose();
                 if (loraAudit) VerifyLoraForwardAudit(producedLogits: true);
             }
@@ -1308,6 +1445,11 @@ namespace TensorSharp.Models
             for (int s = 0; s < n; s++)
             {
                 slots[s].Length = starts[s] + counts[s];
+                if (all == null)
+                {
+                    outLogits[s] = null;   // no request wanted logits: no head ran
+                    continue;
+                }
                 slots[s].Logits ??= new float[vocab];
                 Array.Copy(all, (long)s * vocab, slots[s].Logits, 0, vocab);
                 outLogits[s] = slots[s].Logits;
@@ -1348,9 +1490,12 @@ namespace TensorSharp.Models
         private Tensor SequenceAttention(RankScope scope, int layer, Slot slot, Tensor q, Tensor k, Tensor v, int start, int count)
         {
             Tensor cacheK = slot.K[layer][scope.Rank], cacheV = slot.V[layer][scope.Rank];
+            int band = SlidingWindow(layer);
+            if (RingWrapped(layer, start, count))
+                return RingAttention(scope, cacheK, cacheV, RingOf(layer), q, k, v, start, count, band);
             return count == 1
-                ? DecodeAttention(scope, cacheK, cacheV, slot.Capacity, q, k, v, start)
-                : PrefillAttention(scope, cacheK, cacheV, q, k, v, start, count);
+                ? DecodeAttention(scope, cacheK, cacheV, (int)cacheK.Sizes[1], q, k, v, start, band)
+                : PrefillAttention(scope, cacheK, cacheV, q, k, v, start, count, band);
         }
     }
 }

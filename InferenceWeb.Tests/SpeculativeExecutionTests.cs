@@ -230,6 +230,36 @@ public partial class SpeculativeExecutionTests
         Assert.Empty(model.ProtocolViolations);
     }
 
+    /// <summary>An ignore_eos request (fixed-length benchmarks) speculating alone: the EOS inside an accepted window is a
+    /// token like any other - the verify keeps the drafts after it, and the request runs to its length limit with the plain
+    /// stream. The solo step used to end the accept run at the EOS (rejecting every draft after it) while the engine went
+    /// on past it.</summary>
+    [Fact]
+    public void EngineSpec_IgnoreEos_AcceptsPastAnEosAndRunsToTheLimit()
+    {
+        const int promptLen = 5;
+        const int maxNew = 32;
+        var model = new FakeSpeculativeModel();
+        int eosToken = model.ExpectedNext(promptLen + 4);
+        model.EosTokenId = eosToken;
+        var sampling = new SamplingConfig
+        {
+            Temperature = 0f, TopK = 0, TopP = 1f, RepetitionPenalty = 1f, PresencePenalty = 0f, FrequencyPenalty = 0f,
+            IgnoreEos = true, StopRepetition = false,
+        };
+
+        var seq = RunEngineRequest(model, promptLen, maxNew, specEnabled: true, sampling: sampling);
+
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, seq.Status);
+        Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
+        Assert.Contains(eosToken, seq.OutputTokens);
+        // The fake's drafts are all right: none is rejected, the EOS's neighbours included.
+        Assert.NotNull(seq.SpecStats);
+        Assert.True(seq.SpecStats.TokensDrafted > 0, "nothing was drafted");
+        Assert.Equal(seq.SpecStats.TokensDrafted, seq.SpecStats.TokensAccepted);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
     [Fact]
     public void EngineSpec_PrefixCaching_EosPastBlockBoundary_FinishesWithoutThrow()
     {

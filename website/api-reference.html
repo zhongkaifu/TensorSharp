@@ -52,6 +52,7 @@
       <tr><td><code>--gpu-device &lt;N&gt;</code></td><td>Vulkan device index for <code>ggml_vulkan</code> on multi-GPU hosts (default 0; env <code>TS_GGML_VULKAN_DEVICE</code>).</td></tr>
       <tr><td><code>--list-gpus</code></td><td>List visible Vulkan devices (index + adapter name) and exit.</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code>, <code>f16</code>, <code>q8_0</code>, <code>q4_0</code> (default: auto per backend/model; <code>q4_0</code> ~1/7 of f32, for very long 128K–256K contexts; the quantized tiers need the native GGML flash-attention path).</td></tr>
+      <tr><td><code>--prompt-attention &lt;path&gt;</code></td><td>Prompt-chunk attention on <code>--backend cuda</code>: <code>int8</code> (the default where it runs: 8-bit, in an <code>sm_120a</code> / <code>sm_121a</code> build with an F16 cache; <code>f16</code> elsewhere), <code>f16</code> (the earlier default's kernels, bit for bit) or <code>f32acc</code> (F32 accumulation). <code>int8</code> moves a few long code windows of the long-context quality gates; <code>f16</code> keeps the earlier numbers. Decode, verify and draft rows keep the 16-bit kernels (env <code>TS_PROMPT_ATTENTION</code>).</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code> / <code>--chat</code></td><td>Start the interactive REPL.</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>Seed the system prompt.</td></tr>
       <tr><td><code>--think</code></td><td>Enable thinking / reasoning mode.</td></tr>
@@ -307,6 +308,7 @@
       <tr><td><code>seed</code></td><td><code>seed</code></td><td>-1</td><td>Random seed (-1 = random).</td></tr>
       <tr><td><code>stop</code></td><td><code>stop</code></td><td>null</td><td>Stop sequences.</td></tr>
       <tr><td>—</td><td><code>response_format</code></td><td>null</td><td><code>text</code>, <code>json_object</code>, or <code>json_schema</code>.</td></tr>
+      <tr><td>—</td><td><code>ignore_eos</code></td><td>false</td><td>Keep generating through end-of-sequence tokens until <code>max_tokens</code> (fixed-length benchmarks; vLLM / SGLang / llama.cpp spelling).</td></tr>
     </tbody>
   </table>
   </div>

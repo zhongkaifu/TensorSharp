@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TensorSharpSkipGgmlNative>true</TensorSharpSkipGgmlNative>
+    <TensorSharpSkipMlxNative>true</TensorSharpSkipMlxNative>
+    <!-- The deployment target copies an existing library only; it never
+         configures or compiles GGML. Callers can select an isolated build. -->
+    <GgmlNativeBuildDir Condition="'$(GgmlNativeBuildDir)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../../../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDir>
+    <GgmlNativeBuildDir Condition="'$(GgmlNativeBuildDir)' == ''">$(MSBuildProjectDirectory)/../../../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
+    <BatchDigestRequireGgmlNative Condition="'$(BatchDigestRequireGgmlNative)' == ''">false</BatchDigestRequireGgmlNative>
+  </PropertyGroup>
+  <ItemGroup>
+    
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+  </ItemGroup>
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <_BatchDigestGgmlSource></_BatchDigestGgmlSource>
+      <!-- Match the hosts' Release output when both layouts are present, but
+           select exactly one source instead of overwriting the destination twice. -->
+      <_BatchDigestGgmlSource Condition="'$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')">$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)</_BatchDigestGgmlSource>
+      <_BatchDigestGgmlSource Condition="'$(_BatchDigestGgmlSource)' == '' And '$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')">$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)</_BatchDigestGgmlSource>
+      <_BatchDigestNativeOutput>$(TargetDir)</_BatchDigestNativeOutput>
+      <_BatchDigestNativeOutput Condition="'$(_BatchDigestNativeOutput)' == ''">$(OutDir)</_BatchDigestNativeOutput>
+      <_BatchDigestNativeOutput Condition="'$(_BatchDigestNativeOutput)' == ''">$(OutputPath)</_BatchDigestNativeOutput>
+    </PropertyGroup>
+    <Error Condition="'$(_BatchDigestGgmlSource)' == '' And '$(BatchDigestRequireGgmlNative)' == 'true'"
+           Text="BatchDigest GGML deployment unavailable: no prebuilt $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir) or its Release directory. Build GGML separately or set -p:GgmlNativeBuildDir to the matching prebuilt directory. No native build was attempted." />
+    <Warning Condition="'$(_BatchDigestGgmlSource)' == '' And '$(BatchDigestRequireGgmlNative)' != 'true'"
+             Text="BatchDigest GGML deployment unavailable: no prebuilt $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir) or its Release directory. Managed build completion does not establish GGML runtime availability; any existing output library is unchanged. No native build was attempted." />
+    <Error Condition="'$(_BatchDigestGgmlSource)' != '' And '$(_BatchDigestNativeOutput)' == ''"
+           Text="BatchDigest cannot deploy its prebuilt GGML library without a resolved output directory." />
+    <MakeDir Directories="$(_BatchDigestNativeOutput)" Condition="'$(_BatchDigestGgmlSource)' != ''" />
+    <Copy SourceFiles="$(_BatchDigestGgmlSource)" DestinationFolder="$(_BatchDigestNativeOutput)"
+          SkipUnchangedFiles="true" Condition="'$(_BatchDigestGgmlSource)' != ''" />
+    <Message Importance="high" Condition="'$(_BatchDigestGgmlSource)' != ''"
+             Text="BatchDigest prebuilt GGML runtime: $(_BatchDigestGgmlSource) -> $(_BatchDigestNativeOutput). Copying a library does not qualify its runtime backend." />
+  </Target>
+</Project>

@@ -82,7 +82,7 @@ public class NoAnswerPlaceholderTests
         string turn = Between(
             Source(),
             "IOutputParser uiParser = null;",
-            "foreach (object frame in FinalFrames(");
+            "List<object> finalFrames = FinalFrames(");
 
         Assert.DoesNotContain("WebUiSseEvents.Token(", turn, StringComparison.Ordinal);
         Assert.DoesNotContain("WebUiSseEvents.Replace(", turn, StringComparison.Ordinal);

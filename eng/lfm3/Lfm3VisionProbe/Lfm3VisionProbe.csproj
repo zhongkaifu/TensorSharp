@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- TensorSharp's side of the LFM3 vision comparison with llama.cpp (see Program.cs). Builds like the test project:
+       the GGML bridge comes from TensorSharp.GGML.Native/build (built by any TensorSharp build: libGgmlOps.dylib on macOS,
+       libGgmlOps.so on Linux), MLX from TensorSharp.Backends.MLX/Native/dist. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <ProbeGgmlBuildDir>$(MSBuildProjectDirectory)/../../../TensorSharp.GGML.Native/build</ProbeGgmlBuildDir>
+    <ProbeMlxDist>$(MSBuildProjectDirectory)/../../../TensorSharp.Backends.MLX/Native/dist</ProbeMlxDist>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+    <Compile Include="../../../InferenceWeb.Tests/Lfm3VisionSynthetic.cs" Link="Lfm3VisionSynthetic.cs" />
+  </ItemGroup>
+  <Target Name="CopyProbeNativeLibraries" AfterTargets="Build">
+    <ItemGroup>
+      <ProbeNative Include="$(ProbeGgmlBuildDir)/libGgmlOps.dylib" Condition="Exists('$(ProbeGgmlBuildDir)/libGgmlOps.dylib')" />
+      <ProbeNative Include="$(ProbeGgmlBuildDir)/libGgmlOps.so" Condition="Exists('$(ProbeGgmlBuildDir)/libGgmlOps.so')" />
+      <ProbeNative Include="$(ProbeMlxDist)/libmlxc.dylib;$(ProbeMlxDist)/libmlx.dylib;$(ProbeMlxDist)/libjaccl.dylib" Condition="Exists('$(ProbeMlxDist)/libmlxc.dylib')" />
+      <ProbeNative Include="$(ProbeMlxDist)/lib/mlx.metallib" Condition="Exists('$(ProbeMlxDist)/lib/mlx.metallib')" />
+      <ProbeNative Include="$(ProbeMlxDist)/mlx.metallib" Condition="Exists('$(ProbeMlxDist)/mlx.metallib')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ProbeNative)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

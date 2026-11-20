@@ -51,6 +51,12 @@ namespace TensorSharp.Models
         /// (<see cref="Telemetry.GpuMemoryTelemetry"/>), which pick their device query by its
         /// type. Null on a model built without its constructor (a test fake).</summary>
         internal IAllocator DirectAllocatorForTelemetry => _allocator;
+
+        /// <summary>A scope in which the large blocks this thread frees on a direct-CUDA device go back to the driver, not the
+        /// allocator's cache (<see cref="TensorSharp.Cuda.CudaAllocator.ReturningToDriver"/>): a disposed slot's caches and
+        /// states, a drafter ring given up. Null (no scope) elsewhere.</summary>
+        private protected IDisposable ReturningToDriver()
+            => _allocator is TensorSharp.Cuda.CudaAllocator cuda ? cuda.ReturningToDriver() : null;
         protected readonly BackendType _backend;
 
         protected readonly Dictionary<string, Tensor> _weights = new();
@@ -1057,7 +1063,11 @@ namespace TensorSharp.Models
                 Ops.Fill(tensor, 0f);
         }
 
-        protected void ResetCacheTensor(Tensor tensor)
+        /// <param name="keepDeviceCopy">The caller's cache rows past its length are masked out of every read (the shared
+        /// decoder runtime's K/V), so GgmlCuda keeps its device copy too, as GgmlVulkan and GgmlMetal always do: dropping it
+        /// freed and re-allocated every cache's device memory and uploaded the host bytes again on the next step (LFM3-1.7B at
+        /// 8K: 35 buffers and ~100 MB, 13 ms of the next 512-token prompt on an A40).</param>
+        protected void ResetCacheTensor(Tensor tensor, bool keepDeviceCopy = false)
         {
             if (tensor == null)
                 return;
@@ -1071,7 +1081,8 @@ namespace TensorSharp.Models
             // makes those rows semantically empty until overwritten. Besides
             // avoiding a full KV re-upload, stable Metal bindings let a warmed
             // persistent decode graph survive from startup into the first request.
-            if (_backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal)
+            if (_backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal
+                && !(keepDeviceCopy && _backend == BackendType.GgmlCuda))
                 InvalidateTensorDeviceCache(tensor);
         }
 
@@ -1458,7 +1469,9 @@ namespace TensorSharp.Models
             if (backend == BackendType.Cpu && !ManagedQuantizedOps.SupportsCpuQuantizedStorage(info.Type))
                 return false;
 
-            if (backend == BackendType.Mlx && !MlxQuantizedOps.SupportsQuantizedType(info.Type))
+            // NVFP4 matrices load as F16 there (LoadNvfp4AsF16), which MLX stores as it is.
+            if (backend == BackendType.Mlx && !MlxQuantizedOps.SupportsQuantizedType(info.Type)
+                && !(info.Type == GgmlTensorType.NVFP4 && info.Shape.Length == 2))
                 return false;
 
             if (info.Shape.Length == 2)
@@ -1627,6 +1640,11 @@ namespace TensorSharp.Models
             return contiguous.GetElementsAsFloat((int)contiguous.ElementCount());
         }
 
+        /// <summary>A prompt's token embeddings are looked up on the host on a discrete GPU's GGML backend too (Metal and the CPU
+        /// always do): the step's graph uploads them with its other inputs, where the device lookup was a graph of its own with
+        /// a download and a wait before every prompt step. Default: on the device.</summary>
+        protected virtual bool EmbedsPromptRowsOnHost => false;
+
         protected unsafe Tensor Embedding(int[] tokens)
         {
             int dim = Config.HiddenSize;
@@ -1640,11 +1658,16 @@ namespace TensorSharp.Models
                     // A direct host dequant is faster for single-token decode, and it is
                     // also the compatibility path for CUDA quant types whose get_rows
                     // kernel is not implemented upstream, and for a table too large to
-                    // be device-resident (DevicePreloadTooLarge).
-                    if ((tokens.Length == 1 || !canUseGgmlLookup || qw.DevicePreloadTooLarge) && qw.HasHostData)
+                    // be device-resident (DevicePreloadTooLarge). Where the device reads the
+                    // host's rows themselves (Metal's shared memory, the CPU), a prompt's rows
+                    // too: the device lookup was a graph of its own and a wait before the
+                    // step's graph (LFM3-1.7B pp128 on Metal +1.4%).
+                    bool hostRows = tokens.Length == 1 || _backend is BackendType.GgmlMetal or BackendType.GgmlCpu || EmbedsPromptRowsOnHost;
+                    if ((hostRows || !canUseGgmlLookup || qw.DevicePreloadTooLarge) && qw.HasHostData)
                     {
                         var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
-                        PopulateQuantizedRows(result, qw, tokens);
+                        PopulateQuantizedRows(result, qw, tokens, freshResult: EmbedsPromptRowsOnHost && tokens.Length > 1
+                            && _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan);
                         return result;
                     }
 
@@ -2401,6 +2424,10 @@ namespace TensorSharp.Models
                 return false;
             if (!_weights.TryGetValue(normWeightName, out var normW) || normW == null)
                 return false;
+            // The fused graph multiplies by the blocks alone: a per-tensor scale (NVFP4 scale2) runs the unfused chain,
+            // whose projections apply it.
+            if (gateUpQW.Scale != 1.0f || downQW.Scale != 1.0f)
+                return false;
 
             int intermSize = Config.IntermediateSize;
             int halfDim = intermSize > 0 ? intermSize : (int)(gateUpQW.Ne1 / 2);
@@ -2449,6 +2476,8 @@ namespace TensorSharp.Models
                 return null;
             if (!_weights.TryGetValue(normWeightName, out var normW) || normW == null)
                 return null;
+            if (gateUpQW.Scale != 1.0f || downQW.Scale != 1.0f)
+                return null;   // see TryFusedDenseSwiGLUFFNInto
 
             int intermSize = Config.IntermediateSize;
             int halfDim = intermSize > 0 ? intermSize : (int)(gateUpQW.Ne1 / 2);
@@ -3274,6 +3303,38 @@ namespace TensorSharp.Models
             // about to be freed (see BeginRetirement).
             if (_retiring)
                 throw new ModelUnloadedException();
+        }
+
+        /// <summary>
+        /// Run host-only <paramref name="work"/> - decoding a file, resizing pictures, computing audio features - with
+        /// <see cref="GpuComputeLock"/> released, when the calling thread holds it (a media preparation does), so engine
+        /// steps and other preparations run meanwhile instead of waiting for work that never touches the device. The
+        /// work must not touch the model, its backend or the multimodal injector's state. The lock is taken again
+        /// before this returns (registered with <see cref="GpuLockWaiters"/> so the engine worker lets the thread in at
+        /// its next step boundary); a model being unloaded meanwhile throws <see cref="ModelUnloadedException"/> there,
+        /// as <see cref="YieldGpuComputeLock"/> does. Without the lock held (the CLI), or inside an adapter step, the
+        /// work runs as it is.
+        /// </summary>
+        public T RunOutsideGpuComputeLock<T>(Func<T> work)
+        {
+            ArgumentNullException.ThrowIfNull(work);
+            if (_stepLora != null || !Monitor.IsEntered(GpuComputeLock))
+                return work();
+            Monitor.Exit(GpuComputeLock);
+            T result;
+            try
+            {
+                result = work();
+            }
+            finally
+            {
+                GpuLockWaiters.Enter(GpuComputeLock);
+                try { Monitor.Enter(GpuComputeLock); }
+                finally { GpuLockWaiters.Exit(GpuComputeLock); }
+            }
+            if (_retiring)
+                throw new ModelUnloadedException();
+            return result;
         }
 
         // No lock object: some callers build a model without running its constructor

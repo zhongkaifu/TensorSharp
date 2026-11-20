@@ -45,6 +45,18 @@ namespace TensorSharp.Runtime
         // idle timeout closes them. Clients that can take text back are not held.
         internal const int NemotronHStrayReasoningWindow = 2048;
 
+        // The same for LFM3 (ChatTemplate.IsLfm3ThinkingOffTemplate). With thinking off,
+        // LFM3-1.7B Q4_K_M (greedy, Metal) reasoned and closed the block itself in 52 of 200
+        // GSM8K replies and 5 of 33 instruction-following prompts, llama.cpp's replies alike
+        // (eng/lfm3/e2e): the answer the client read was "reasoning</think>answer". The 57
+        // closes came at 83-3562 characters, median 1983, 95th percentile 3425; 2048 would
+        // have caught 32 of them, 4096 catches all. Unlike Nemotron-H, an LFM3 stream that
+        // cannot take text back is not held for it (the protocol's parser streams such text as
+        // content at once, IOutputParser.StreamWithoutHolding), and a whole API reply cut short
+        // reads as that stream did: the window decides the reply for retracting streams and for
+        // whole replies the model finished only.
+        internal const int Lfm3StrayReasoningWindow = 4096;
+
         private static readonly object Gate = new();
         private static readonly Dictionary<string, ChatProtocol> ByArchitecture =
             new(StringComparer.OrdinalIgnoreCase);
@@ -215,6 +227,76 @@ namespace TensorSharp.Runtime
                 // and DeepSeek V4.1. The frames render as the Qwen3-VL video layout
                 // (see QwenVideoFrames) and the injector merges them in temporal pairs.
                 CapsVideoFrames = true,
+            });
+
+            // ---- Liquid LFM3 / LFM3-Omni -----------------------------------
+            // One architecture name ("lfm3") for both checkpoints; the GGUF template
+            // tells them apart (1.7B reasons by default, Omni does not, and only the
+            // Omni template renders audio parts). The GGUF template renders as shipped
+            // and matches llama.cpp's renders byte for byte (Lfm3ChatProtocolTests);
+            // RenderLfm3 is the fallback for a GGUF without one.
+            Register(new ChatProtocol
+            {
+                Id = "lfm3",
+                Architectures = new[] { "lfm3" },
+                Render = r => ChatTemplate.RenderLfm3(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
+                // `<|vision_start|><|image|><|vision_end|>` per image, one
+                // `<|vision_start|><|video|><|vision_end|>` per video and (Omni)
+                // `<|vision_start|><|audio|><|vision_end|>` per clip, before the text:
+                // the template's own spans. The multimodal expander replaces the inner
+                // token with the encoder rows (docs/models/lfm3.md, "Media placeholders").
+                AppendMediaPlaceholders = ChatTemplate.AppendLfm3MediaPlaceholders,
+                // `video_url` / `input_video` are accepted; the model samples the saved clip
+                // itself (2 fps, with its soundtrack), so the host samples no frames from it.
+                CapsVideoFrames = true,
+                ReadsVideoFiles = true,
+                // Reasoning ends at `</think>`, or at a `<tool_call>` written while still
+                // reasoning; calls are the Qwen3-Coder XML body. llama.cpp routes this
+                // template to its Qwen3-Coder parser with the same end tags.
+                CreateOutputParser = () => new Qwen35OutputParser(Lfm3StrayReasoningWindow, holdsAppendOnlyStreams: false),
+                // With thinking off (prompt ends `<think></think>`) the 1.7B often reasons
+                // anyway and closes the block itself: the reply opens undecided and a close
+                // within the window makes it reasoning, for a whole reply (non-streaming
+                // responses) and a stream that can take text back (the Web UI, TensorAgent).
+                // An append-only stream (the OpenAI, Ollama and Responses streams, the CLI) is
+                // not held for it: it streams the reply as content as it is generated, as
+                // llama.cpp, vLLM and SGLang return such a reply whole as the answer,
+                // `</think>` and all (their parsers do not look for reasoning with thinking
+                // off). Holding it cost a short answer its whole stream: nothing arrived
+                // before the end of the reply or 4,096 characters. A whole reply cut short
+                // (max_tokens) reads as its stream did (ChatStreamCollector.ParseWhole): the
+                // answer after the close is incomplete, and the reasoning before it often
+                // holds the result (GSM8K on the CPU lanes: 5 and 7 of 200 replies had their
+                // answer only there, all cut in the answer that followed). A reply the model
+                // finished keeps the reasoning apart, which kept 4-6 of 33 instruction prompts
+                // a client reads as content from showing it.
+                ThinkingOffReplyMayReason = ChatTemplate.IsLfm3ThinkingOffTemplate,
+                // The generation prompt ends `<think>` (on) or `<think></think>` (off), no
+                // newline; past turns re-render as `<think></think>` + answer with their
+                // reasoning dropped, so the cache's raw turn needs the suffix back and the
+                // template's empty block removed.
+                AssistantGenerationSuffix = thinking => thinking
+                    ? ChatTemplate.Lfm3ThinkOpen : ChatTemplate.Lfm3ThinkOpen + ChatTemplate.Lfm3ThinkClose,
+                EmitsEmptyThinkBlockForPastTurns = _ => true,
+                // role=tool renders from the tool message alone (render_tool_response),
+                // never from the calling turn's structured tool_calls.
+                ToolCallRawSplicing = ToolCallRawSplicing.Always,
+                // The template re-renders `<think>reasoning</think>` only for assistant
+                // turns after the last user message (or with preserve_thinking, which the
+                // host never sets), the gate this flag requires.
+                RendersAssistantReasoning = true,
+                ThinkingGrammarActivationTrigger = ChatTemplate.Lfm3ThinkClose,
+                // `</think>` is one token (124902): a budget closes the block and the
+                // answer follows. No hand-over sentence: none is published for LFM3.
+                ThinkingBudgetEndToken = ChatTemplate.Lfm3ThinkClose,
+                // `<think>` (124901) is one token too, and with thinking off the 1.7B
+                // sometimes writes it itself right after the prompt's `<think></think>` and
+                // reasons on (4 of 33 instruction prompts): the client asked for no
+                // reasoning and, past max_tokens, got an empty answer. Declaring the opener
+                // caps such a block (UnrequestedThinkingBudgetFor, at a line break past a
+                // quarter of max_tokens, at most 64 tokens); a requested block opens in the
+                // prompt and keeps its ordinary budget.
+                ThinkingBudgetOpenToken = ChatTemplate.Lfm3ThinkOpen,
             });
 
             // ---- GPT-OSS / Harmony -----------------------------------------

@@ -59,6 +59,8 @@
   "catalog.extended.nemotronOmni.notes": "可选投影器支持图像输入。音频需另行转换 Parakeet 配套模型，此处不提供。暂不支持推测解码。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
   "catalog.extended.mistral.notes": "Pixtral 视觉投影器可选下载。此实现支持聊天和图像，不支持思考模式或工具调用。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
   "catalog.extended.hunyuan.notes": "采用 hunyuan-dense 架构的腾讯翻译模型。仅支持文本和单设备运行，不支持思考模式或工具调用。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
+  "catalog.lfm3.notes": "Liquid 的短卷积与注意力混合模型，支持思考模式和工具调用，仅支持文本。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
+  "catalog.lfm3Omni.notes": "Liquid 的全模态模型：输入图像、视频和音频，输出文本，没有思考模式。必需的投影器还包含语音生成器：打开“朗读回复”即可边生成边收听回复，并可反复回放和保存音频。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
   "catalog.extended.deepseek4.notes": "必须下载全部三个分片。匹配的 0731 DSpark 草稿模型可选下载，在 CUDA 上使用贪心采样运行。需要工作站级内存。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
   "catalog.extended.deepseek41.notes": "修复版包含十个分片及内置 Engram。正式运行使用 CUDA，CPU 路径用于可移植性验证。视觉与 DSpark 需使用 TensorSharp 工具转换；已发布的 clip/dflash 配套文件不兼容。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
   "catalog.extended.glm.notes": "仅支持文本，必须下载全部分片。内置 NextN，无需另行下载草稿。GLM 5.3 的 NextN 需单设备或分层运行；应用默认使用 n-gram 推测解码。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",

@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TensorSharpSkipGgmlNative>true</TensorSharpSkipGgmlNative>
+    <TensorSharpSkipMlxNative>true</TensorSharpSkipMlxNative>
+    <!-- The deployment target copies an existing library only; it never
+         configures or compiles GGML. Callers can select an isolated build. -->
+    <GgmlNativeBuildDir Condition="'$(GgmlNativeBuildDir)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../../../../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDir>
+    <GgmlNativeBuildDir Condition="'$(GgmlNativeBuildDir)' == ''">$(MSBuildProjectDirectory)/../../../../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
+    <Lfm3AudioProbeRequireGgmlNative Condition="'$(Lfm3AudioProbeRequireGgmlNative)' == ''">false</Lfm3AudioProbeRequireGgmlNative>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+    <!-- The clips the tests check, generated bit-identically here for the llama.cpp reference. -->
+    <Compile Include="../../../../InferenceWeb.Tests/Lfm3AudioSignals.cs" Link="Lfm3AudioSignals.cs" />
+  </ItemGroup>
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <_Lfm3AudioProbeGgmlSource></_Lfm3AudioProbeGgmlSource>
+      <!-- Match the hosts' Release output when both layouts are present, but
+           select exactly one source instead of overwriting the destination twice. -->
+      <_Lfm3AudioProbeGgmlSource Condition="'$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')">$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)</_Lfm3AudioProbeGgmlSource>
+      <_Lfm3AudioProbeGgmlSource Condition="'$(_Lfm3AudioProbeGgmlSource)' == '' And '$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')">$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)</_Lfm3AudioProbeGgmlSource>
+      <_Lfm3AudioProbeNativeOutput>$(TargetDir)</_Lfm3AudioProbeNativeOutput>
+      <_Lfm3AudioProbeNativeOutput Condition="'$(_Lfm3AudioProbeNativeOutput)' == ''">$(OutDir)</_Lfm3AudioProbeNativeOutput>
+      <_Lfm3AudioProbeNativeOutput Condition="'$(_Lfm3AudioProbeNativeOutput)' == ''">$(OutputPath)</_Lfm3AudioProbeNativeOutput>
+    </PropertyGroup>
+    <Error Condition="'$(_Lfm3AudioProbeGgmlSource)' == '' And '$(Lfm3AudioProbeRequireGgmlNative)' == 'true'"
+           Text="Lfm3AudioProbe GGML deployment unavailable: no prebuilt $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir) or its Release directory. Build GGML separately or set -p:GgmlNativeBuildDir to the matching prebuilt directory. No native build was attempted." />
+    <Warning Condition="'$(_Lfm3AudioProbeGgmlSource)' == '' And '$(Lfm3AudioProbeRequireGgmlNative)' != 'true'"
+             Text="Lfm3AudioProbe GGML deployment unavailable: no prebuilt $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir) or its Release directory. Managed build completion does not establish GGML runtime availability; any existing output library is unchanged. No native build was attempted." />
+    <Error Condition="'$(_Lfm3AudioProbeGgmlSource)' != '' And '$(_Lfm3AudioProbeNativeOutput)' == ''"
+           Text="Lfm3AudioProbe cannot deploy its prebuilt GGML library without a resolved output directory." />
+    <MakeDir Directories="$(_Lfm3AudioProbeNativeOutput)" Condition="'$(_Lfm3AudioProbeGgmlSource)' != ''" />
+    <Copy SourceFiles="$(_Lfm3AudioProbeGgmlSource)" DestinationFolder="$(_Lfm3AudioProbeNativeOutput)"
+          SkipUnchangedFiles="true" Condition="'$(_Lfm3AudioProbeGgmlSource)' != ''" />
+    <Message Importance="high" Condition="'$(_Lfm3AudioProbeGgmlSource)' != ''"
+             Text="Lfm3AudioProbe prebuilt GGML runtime: $(_Lfm3AudioProbeGgmlSource) -> $(_Lfm3AudioProbeNativeOutput). Copying a library does not qualify its runtime backend." />
+  </Target>
+</Project>

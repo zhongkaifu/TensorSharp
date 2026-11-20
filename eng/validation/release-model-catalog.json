@@ -8,6 +8,8 @@
     {"id":"gptoss20b","repo":"ggml-org/gpt-oss-20b-GGUF","patterns":["gpt-oss-20b-MXFP4.gguf"],"modalities":["text"]},
     {"id":"nemotron-h8b","repo":"bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF","patterns":["*Q4_K_M.gguf"],"modalities":["text"]},
     {"id":"hunyuan-dense","repo":"tencent/Hy-MT2-1.8B-GGUF","patterns":["Hy-MT2-1.8B-Q8_0.gguf"],"modalities":["text"]},
+    {"id":"lfm3-1.7b","repo":"LiquidAI/LFM3-1.7B-GGUF","patterns":["LFM3-1.7B-Q4_K_M.gguf"],"modalities":["text"]},
+    {"id":"lfm3-omni-2b","repo":"LiquidAI/LFM3-Omni-2B-GGUF","patterns":["LFM3-Omni-2B-Q4_K_M.gguf","mmproj-LFM3-Omni-2B-Q8_0.gguf"],"modalities":["text","image","video","audio"]},
     {"id":"qwen36-moe-mtp","repo":"unsloth/Qwen3.6-35B-A3B-MTP-GGUF","patterns":["Qwen3.6-35B-A3B-UD-Q4_K_M.gguf","mmproj-F16.gguf"],"modalities":["text","image"]},
     {"id":"mistral3","repo":"bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF","patterns":["*Q4_K_M.gguf","mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf"],"modalities":["text","image"]},
     {"id":"muse-glimmer","repo":"unsloth/Muse-Glimmer-30B-GGUF","patterns":["Muse-Glimmer-30B-UD-Q4_K_XL.gguf","mmproj-Muse-Glimmer-30B-Q8_0.gguf","dflash-kquant.gguf"],"modalities":["text","image"]},

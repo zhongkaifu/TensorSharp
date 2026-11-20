@@ -436,11 +436,14 @@ namespace TensorSharp.Server
         {
             int imageCount = message.ImagePaths?.Count ?? 0;
             int audioCount = message.AudioPaths?.Count ?? 0;
-            images = message.IsVideo && images > 0 ? imageCount : Math.Clamp(images, 0, imageCount);
+            // A video goes whole: its frames with the clip a family reads itself (VideoFilePaths), which may
+            // be all a message has of it (ChatProtocol.ReadsVideoFiles).
+            bool video = message.IsVideo && images > 0 && (imageCount > 0 || message.VideoFilePaths is { Count: > 0 });
+            images = video ? imageCount : Math.Clamp(images, 0, imageCount);
             audio = Math.Clamp(audio, 0, audioCount);
 
             var notes = new List<string>();
-            if (images > 0 && message.IsVideo)
+            if (video)
             {
                 // The frames are the server's extraction, not something the user named.
                 notes.Add("[an earlier video is no longer shown]");
@@ -454,7 +457,7 @@ namespace TensorSharp.Server
                 notes.Add(Note("audio", message.AudioPaths[i], "included"));
 
             ChatMessage copy = CloneShallow(message);
-            if (images > 0)
+            if (images > 0 || video)
             {
                 copy.ImagePaths = images < imageCount ? message.ImagePaths.Skip(images).ToList() : null;
                 copy.ImageTimestamps = images < imageCount && message.ImageTimestamps != null
@@ -462,6 +465,9 @@ namespace TensorSharp.Server
                     : null;
                 if (copy.ImagePaths == null)
                     copy.IsVideo = false;
+                // A video goes as a whole: the clip a family reads itself (LFM3) with its frames.
+                if (message.IsVideo)
+                    copy.VideoFilePaths = null;
             }
             if (audio > 0)
                 copy.AudioPaths = audio < audioCount ? message.AudioPaths.Skip(audio).ToList() : null;
@@ -507,7 +513,8 @@ namespace TensorSharp.Server
         {
             if (msg == null) return false;
             return (msg.ImagePaths != null && msg.ImagePaths.Count > 0) ||
-                   (msg.AudioPaths != null && msg.AudioPaths.Count > 0);
+                   (msg.AudioPaths != null && msg.AudioPaths.Count > 0) ||
+                   (msg.VideoFilePaths != null && msg.VideoFilePaths.Count > 0);
         }
 
         public static bool HasMultimodalContent(List<ChatMessage> history)
@@ -545,8 +552,13 @@ namespace TensorSharp.Server
             // maxVideoFrames <= 0 means "no cap" (pure time-based extraction); leave history untouched.
             // Whether a family expands a video into per-frame images (and so needs the
             // cap) is declared with the rest of its chat protocol, not matched on here.
-            bool capsFrames = ChatProtocolRegistry.For(arch)?.CapsVideoFrames ?? false;
+            ChatProtocol protocol = ChatProtocolRegistry.For(arch);
+            bool capsFrames = protocol?.CapsVideoFrames ?? false;
             if (!capsFrames || maxVideoFrames <= 0 || !msg.IsVideo || msg.ImagePaths == null || msg.ImagePaths.Count <= maxVideoFrames)
+                return msg;
+            // A family that reads the clip itself samples it its own way: the host's frames are not what it sees, and
+            // thinning them would only drop stills that share the list.
+            if (protocol.ReadsVideoFiles && msg.VideoFilePaths is { Count: > 0 })
                 return msg;
 
             var sampledIndices = MediaHelper.SelectEvenlySpacedIndices(msg.ImagePaths.Count, maxVideoFrames);
@@ -571,13 +583,17 @@ namespace TensorSharp.Server
                 TextFilePaths = msg.TextFilePaths != null ? new List<string>(msg.TextFilePaths) : null,
                 TextFileNames = msg.TextFileNames != null ? new List<string>(msg.TextFileNames) : null,
                 HasFileBackedTextAttachments = msg.HasFileBackedTextAttachments,
+                AttachmentPaths = msg.AttachmentPaths,
+                AttachmentNames = msg.AttachmentNames,
                 IsVideo = msg.IsVideo,
+                VideoFilePaths = msg.VideoFilePaths,
                 ToolCalls = msg.ToolCalls,
                 ToolCallId = msg.ToolCallId,
                 Thinking = msg.Thinking,
                 RawOutputTokens = msg.RawOutputTokens,
                 RawPromptTrailingWhitespace = msg.RawPromptTrailingWhitespace,
                 RawGenerationSuffix = msg.RawGenerationSuffix,
+                SpeechFrames = msg.SpeechFrames,
                 CacheControl = msg.CacheControl,
                 ContentCacheBreakpoints = msg.ContentCacheBreakpoints != null
                     ? new List<int>(msg.ContentCacheBreakpoints)
@@ -600,12 +616,14 @@ namespace TensorSharp.Server
                 AttachmentPaths = src.AttachmentPaths,
                 AttachmentNames = src.AttachmentNames,
                 IsVideo = src.IsVideo,
+                VideoFilePaths = src.VideoFilePaths,
                 ToolCalls = src.ToolCalls,
                 ToolCallId = src.ToolCallId,
                 Thinking = src.Thinking,
                 RawOutputTokens = src.RawOutputTokens,
                 RawPromptTrailingWhitespace = src.RawPromptTrailingWhitespace,
                 RawGenerationSuffix = src.RawGenerationSuffix,
+                SpeechFrames = src.SpeechFrames,
                 CacheControl = src.CacheControl != null
                     ? new CacheControlMarker { Type = src.CacheControl.Type }
                     : null,

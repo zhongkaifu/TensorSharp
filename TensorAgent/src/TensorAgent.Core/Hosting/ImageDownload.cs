@@ -16,14 +16,27 @@ namespace TensorAgent.Core.Hosting;
 /// <summary>Resolves an image download from the page to its existing upload file.</summary>
 internal static class ImageDownload
 {
-    private const string UploadPrefix = "/uploads/";
-
     /// <summary>
     /// Accept only image files under the app's upload directory, including generated
     /// and edited results. A page request cannot select a remote URL or a file outside
     /// that directory, even through an encoded separator or a symbolic link.
     /// </summary>
     internal static bool TryResolve(string uploadDirectory, string? urlOrPath, string pageUrl, out string? fullPath)
+        => UploadDownload.TryResolve(uploadDirectory, urlOrPath, pageUrl, "image", out fullPath);
+}
+
+/// <summary>Resolves a download of a generated file (a picture, a spoken reply) from the page to its upload file.</summary>
+internal static class UploadDownload
+{
+    private const string UploadPrefix = "/uploads/";
+
+    /// <summary>
+    /// Accept only files of <paramref name="mediaType"/> (<see cref="UploadContentPolicy.Classify"/>:
+    /// <c>image</c>, <c>audio</c>) under the app's upload directory. A page request cannot select a
+    /// remote URL, another kind of file, or a file outside that directory, even through an encoded
+    /// separator or a symbolic link.
+    /// </summary>
+    internal static bool TryResolve(string uploadDirectory, string? urlOrPath, string pageUrl, string mediaType, out string? fullPath)
     {
         fullPath = null;
         if (string.IsNullOrEmpty(urlOrPath))
@@ -53,7 +66,7 @@ internal static class ImageDownload
         // Windows alternate streams even when this code runs on an Apple device.
         if (string.IsNullOrWhiteSpace(name) || name is "." or ".."
             || name.IndexOfAny(['/', '\\', ':', '\0']) >= 0
-            || UploadContentPolicy.Classify(Path.GetExtension(name)) != "image")
+            || UploadContentPolicy.Classify(Path.GetExtension(name)) != mediaType)
             return false;
 
         try

@@ -131,6 +131,37 @@ namespace TensorSharp.Server.Skills
         internal bool ClientRetractsAnswerText { get; set; }
 
         /// <summary>
+        /// True when the client of this turn streams each piece as it arrives and cannot take it
+        /// back (an OpenAI, Ollama or Responses stream). The loop's parsers are then told so
+        /// (<see cref="IOutputParser.StreamWithoutHolding"/>): a family that streams a reply it
+        /// cannot classify yet as it is generated does so for this client too.
+        /// </summary>
+        internal bool ClientStreamsAppendOnly { get; set; }
+
+        /// <summary>
+        /// True when the client of this turn reads the reply only once it is whole (a
+        /// non-streaming OpenAI, Ollama or Responses request). A round cut short (max_tokens,
+        /// a thinking budget, the repetition guard) then reaches it as the round's API stream
+        /// would have (<see cref="IOutputParser.StreamWithoutHolding"/>), as the adapter's own
+        /// parse of a whole reply does (<c>ChatStreamCollector.Resolve</c>): for LFM3 the text
+        /// before a stray <c>&lt;/think&gt;</c> stays in the content when the answer after it
+        /// was cut. Such a round's pieces are held until the round ends, which a client that
+        /// waits for the whole reply cannot tell.
+        /// </summary>
+        internal bool ClientReadsWholeReply { get; set; }
+
+        private int _reasoningTokens;
+
+        /// <summary>The reasoning tokens every generation of this turn has reported so far
+        /// (<see cref="ChatStreamUpdate.ReasoningTokens"/>), for the turn's usage.</summary>
+        internal int ReasoningTokens => System.Threading.Volatile.Read(ref _reasoningTokens);
+
+        internal void AddReasoningTokens(int count)
+        {
+            if (count > 0) System.Threading.Interlocked.Add(ref _reasoningTokens, count);
+        }
+
+        /// <summary>
         /// The single artifact that passed the routed completion contract. Until this is
         /// set, adapters must not expose files captured by guarded invocations: a partial
         /// ZIP is useful evidence for repair, but it is not a user deliverable.

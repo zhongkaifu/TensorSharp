@@ -248,35 +248,51 @@ def build_cases(args):
         for k in r["sizes"]:
             for rep in range(r["repeats"]):
                 cases.append(retrieval_case(seed, k, rep, r["max_new"], prose, args.think))
+    def task_picks(group, n_rows, count):
+        # --task-first takes the dataset's first rows (the usual "GSM8K first 250" / "HumanEval 164"), else a seeded sample.
+        count = min(count, n_rows)
+        return list(range(count)) if args.task_first else sorted(random.Random(seed).sample(range(n_rows), count))
+
+    def task_case(case_id, group, user, max_new, grade, prefix):
+        # prefix 0: the benchmark's own prompt, one user turn (no reference document, no system turn).
+        case = {"type": "case", "id": case_id, "kind": "chat", "group": group, "think": args.think, "max_new_tokens": max_new,
+                "grade": grade}
+        if prefix > 0:
+            case.update({"fit_tokens": prefix * 1024, "document": {"corpus": "prose", "start_paragraph": 211},
+                         "messages": reference_messages(seed, user)})
+        else:
+            case["messages"] = [{"role": "user", "content": user}]
+        return case
+
+    for group, value in (args.task_counts or {}).items():
+        preset[group]["count"] = value
+    if args.task_prefix is not None:
+        for group in ("gsm8k", "humaneval"):
+            preset[group]["prefix"] = args.task_prefix
     if "gsm8k" in kinds:
         g = preset["gsm8k"]
         rows = [json.loads(line) for line in fetch(GSM8K, downloads).decode("utf-8").splitlines() if line.strip()]
-        picks = sorted(random.Random(seed).sample(range(len(rows)), g["count"]))
+        picks = task_picks("gsm8k", len(rows), g["count"])
         header["datasets"]["gsm8k"] = {k: GSM8K[k] for k in ("name", "license", "urls", "revision", "sha256")}
         header["datasets"]["gsm8k"]["indices_zero_based"] = picks
         for i in picks:
             answer = rows[i]["answer"].split("####")[-1].strip().replace(",", "")
             user = (rows[i]["question"] + "\n\nSolve the problem step by step, briefly. End with a final line of the form "
                     "'Answer: <number>'.")
-            cases.append({"type": "case", "id": f"gsm8k/test-{i}", "kind": "chat", "group": "gsm8k",
-                          "fit_tokens": g["prefix"] * 1024, "document": {"corpus": "prose", "start_paragraph": 211},
-                          "messages": reference_messages(seed, user), "think": args.think, "max_new_tokens": g["max_new"],
-                          "grade": {"type": "gsm8k", "answer": answer}})
+            cases.append(task_case(f"gsm8k/test-{i}", "gsm8k", user, g["max_new"], {"type": "gsm8k", "answer": answer}, g["prefix"]))
     if "humaneval" in kinds:
         h = preset["humaneval"]
         rows = [json.loads(line) for line in gzip.decompress(fetch(HUMANEVAL, downloads)).decode("utf-8").splitlines() if line.strip()]
-        picks = sorted(random.Random(seed).sample(range(len(rows)), h["count"]))
+        picks = task_picks("humaneval", len(rows), h["count"])
         header["datasets"]["humaneval"] = {k: HUMANEVAL[k] for k in ("name", "license", "urls", "revision", "sha256")}
         header["datasets"]["humaneval"]["task_ids"] = [rows[i]["task_id"] for i in picks]
         for i in picks:
             row = rows[i]
             user = ("Complete the following Python function. Reply with the complete function, including its signature and any "
                     "imports it needs, in one ```python code block.\n\n```python\n" + row["prompt"] + "```")
-            cases.append({"type": "case", "id": f"humaneval/{row['task_id'].replace('/', '-')}", "kind": "chat", "group": "humaneval",
-                          "fit_tokens": h["prefix"] * 1024, "document": {"corpus": "prose", "start_paragraph": 211},
-                          "messages": reference_messages(seed, user), "think": args.think, "max_new_tokens": h["max_new"],
-                          "grade": {"type": "humaneval", "task_id": row["task_id"], "prompt": row["prompt"], "test": row["test"],
-                                    "entry_point": row["entry_point"]}})
+            cases.append(task_case(f"humaneval/{row['task_id'].replace('/', '-')}", "humaneval", user, h["max_new"],
+                                   {"type": "humaneval", "task_id": row["task_id"], "prompt": row["prompt"], "test": row["test"],
+                                    "entry_point": row["entry_point"]}, h["prefix"]))
     path = out / "cases.jsonl"
     with path.open("w", encoding="utf-8") as f:
         f.write(json.dumps(header) + "\n")
@@ -803,11 +819,15 @@ class Report:
         self.out(f"Reference {ref_ok}/{len(grades)}, candidate {cand_ok}/{len(grades)}; lost {b}, gained {c_} (net {c_ - b:+d}); "
                  f"McNemar exact p = {p:.3f}; identical outputs {same}/{len(grades)}.")
         lost = [g[0] for g in grades if g[1] and not g[2]]
+        gained = [g[0] for g in grades if g[2] and not g[1]]
         if lost:
             self.out(f"Lost: {', '.join(lost)}.")
+        if gained:
+            self.out(f"Gained: {', '.join(gained)}.")
         self.not_paired(unpaired)
         self.out()
-        self.summary[group] = {"ref": ref_ok, "cand": cand_ok, "n": len(grades), "lost": b, "gained": c_, "p": p, "identical": same}
+        self.summary[group] = {"ref": ref_ok, "cand": cand_ok, "n": len(grades), "lost": b, "gained": c_, "p": p, "identical": same,
+                               "lost_ids": lost, "gained_ids": gained}
         if self.gates["tasks"]:
             loss, pmin = self.gates["tasks"]
             self.verdict(group, (b - c_ <= loss and (p > pmin or c_ >= b)) if grades else None, f"net {c_ - b:+d}, p {p:.3f}", unpaired)
@@ -1002,6 +1022,17 @@ def estimate(args):
 
 # --------------------------------------------------------------------------- main
 
+def parse_task_counts(text):
+    counts = {}
+    for part in text.split(","):
+        name, _, value = part.partition("=")
+        name = name.strip()
+        if name not in ("gsm8k", "humaneval") or not value.strip().isdigit() or int(value) < 1:
+            raise argparse.ArgumentTypeError(f"{part!r}: expected gsm8k=N or humaneval=N with N >= 1")
+        counts[name] = int(value)
+    return counts
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["humaneval-worker"]:
@@ -1017,6 +1048,12 @@ def main(argv=None):
     c.add_argument("--repo", default=str(ROOT), help="git checkout holding the code corpus revision")
     c.add_argument("--code-revision", default=CODE_REVISION)
     c.add_argument("--downloads", default=str(ROOT / "artifacts" / "quality" / "downloads"))
+    c.add_argument("--task-counts", type=parse_task_counts,
+                   help="override the preset's task counts, e.g. gsm8k=250,humaneval=164 (a count past the dataset takes all of it)")
+    c.add_argument("--task-first", action="store_true", help="take each task dataset's first rows instead of a seeded sample")
+    c.add_argument("--task-prefix", type=int,
+                   help="thousands of prose tokens before each task's question (default: the preset's 16); 0 sends the benchmark's "
+                        "own prompt as one user turn")
     r = sub.add_parser("report", help="pair two arms, grade and check gates")
     r.add_argument("--ref", required=True, help="RUN.jsonl:ARM of the reference")
     r.add_argument("--cand", required=True, help="RUN.jsonl:ARM of the candidate")

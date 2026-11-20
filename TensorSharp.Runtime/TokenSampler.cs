@@ -72,8 +72,18 @@ namespace TensorSharp.Runtime
         /// forced-token override before consuming a device-side argmax, so
         /// ordinary greedy decoding need not materialize host logits.</summary>
         internal bool IsPlainGreedyArgmax =>
+            IsGreedyArgmaxOverSuppressed && SuppressedTokens is not { Count: > 0 };
+
+        /// <summary><see cref="IsPlainGreedyArgmax"/> but for <see cref="SuppressedTokens"/>: a first-max argmax over the
+        /// raw logits with the suppressed tokens' set to -inf (a device pick that suppresses the same tokens may serve).</summary>
+        internal bool IsGreedyArgmaxOverSuppressed =>
             _config.Temperature <= 0f && _config.Grammar == null && !HasPenalties()
             && _config.ThinkingBudget?.SuppressUnopenedEnd != true;
+
+        /// <summary>Tokens never drawn: their logits are set to -inf before every other stage (a model's
+        /// <c>IReplyTokenPolicy</c>: media placeholders, speech switches). Null or empty for none. A sampler with some is not
+        /// a plain argmax, so a device-side greedy pick (which cannot see them) is not used for it.</summary>
+        public IReadOnlyList<int>? SuppressedTokens { get; init; }
 
         public int Sample(float[] logits, IList<int>? generatedTokenIds = null)
         {
@@ -113,6 +123,11 @@ namespace TensorSharp.Runtime
                     throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
                 return thinkingEnd;
             }
+
+            var suppressed = SuppressedTokens;
+            if (suppressed != null)
+                foreach (int id in suppressed)
+                    if ((uint)id < (uint)vocabSize) logits[id] = float.NegativeInfinity;
 
             // A close with no open channel is masked (see ThinkingTokenBudget).
             // TryGetForcedThinkingToken has just brought the channel state up to date.

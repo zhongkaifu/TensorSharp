@@ -16,7 +16,7 @@ namespace TensorSharp.MLX
     /// MLX's executor plugin: programs run node by node on MLX arrays (lazily, as MLX evaluates), with
     /// MLX's quantized products and fused attention.
     /// </summary>
-    public sealed class MlxGraphExecutor : TensorGraphExecutor
+    public sealed partial class MlxGraphExecutor : TensorGraphExecutor
     {
         [ModuleInitializer]
         internal static void Register()
@@ -437,15 +437,33 @@ namespace TensorSharp.MLX
         protected override Tensor QuantizedMatMul(IGraphWeight weight, Tensor x)
         {
             var result = new Tensor(Allocator, DType.Float32, x.Sizes[0], weight.Ne1);
-            // MLX's quantized kernels, else (Q2_K, Q3_K, BF16) the raw weight dequantized to exact F32.
-            if (MlxQuantizedOps.TryAddmmQuantizedToFloat32(result, x, weight.CacheKey, weight.Data, weight.Format,
+            // Unquantized F32/F16/BF16 weights on the device as their own bytes (a matrix-vector kernel for decode rows, MLX's
+            // GEMM above); MLX's quantized kernels; else (Q2_K, Q3_K) the raw weight dequantized to exact F32.
+            if (MlxQuantizedOps.TryAddmmFloatWeight(result, x, weight.CacheKey, weight.Data, weight.Format, weight.Ne0, weight.Ne1, weight.Bytes)
+                || MlxQuantizedOps.TryAddmmQuantizedToFloat32(result, x, weight.CacheKey, weight.Data, weight.Format,
                     weight.Ne0, weight.Ne1, weight.Bytes)
                 || (MlxQuantizedOps.CanPreloadDirectFloatType(weight.Format)
                     && MlxQuantizedOps.TryAddmmDirectFloat32(result, x, weight.CacheKey, weight.Data, weight.Format,
                         weight.Ne0, weight.Ne1, weight.Bytes)))
                 return result;
             result.Dispose();
+            ReportHostProduct(weight);
             return HostProduct(weight, x);
+        }
+
+        private readonly System.Collections.Generic.HashSet<int> _hostProductFormats = new();
+
+        /// <summary>A product MLX has no kernel for runs on the host CPU (TensorGraphExecutor.HostProduct): said once per
+        /// weight format, with what it costs.</summary>
+        private void ReportHostProduct(IGraphWeight weight)
+        {
+            lock (_hostProductFormats)
+                if (!_hostProductFormats.Add(weight.Format)) return;
+            string format = Enum.IsDefined(typeof(TensorSharp.Runtime.GgmlTensorType), (uint)weight.Format)
+                ? ((TensorSharp.Runtime.GgmlTensorType)weight.Format).ToString() : $"GGML type {weight.Format}";
+            Console.Error.WriteLine($"[mlx] {format} weights have no MLX product: their products run on the host CPU instead " +
+                $"(first: [{weight.Ne1} x {weight.Ne0}]), copying activations off the device and back for each one; " +
+                "expect them to dominate the step's time.");
         }
 
         /// <summary>MLX's fused attention (GQA native) over the K/V views as they are: q is cast to the

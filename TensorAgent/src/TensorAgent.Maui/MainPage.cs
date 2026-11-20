@@ -291,10 +291,16 @@ public sealed class MainPage : ContentPage
     }
 
     /// <summary>Save the full-resolution image already shown in the conversation.</summary>
-    private async Task SaveImageAsync(string url)
+    private Task SaveImageAsync(string url) => SaveUploadAsync(url, "image");
+
+    /// <summary>Save a spoken reply's WAV (the player under the reply plays the same file).</summary>
+    private Task SaveAudioAsync(string url) => SaveUploadAsync(url, "audio");
+
+    /// <summary>Export a copy of a generated upload of <paramref name="mediaType"/> through the native save UI.</summary>
+    private async Task SaveUploadAsync(string url, string mediaType)
     {
         string? failure;
-        if (!Core.Hosting.ImageDownload.TryResolve(_host.App.Paths.UploadsDirectory, url, _host.EntryUrl, out string? full))
+        if (!Core.Hosting.UploadDownload.TryResolve(_host.App.Paths.UploadsDirectory, url, _host.EntryUrl, mediaType, out string? full))
             failure = Loc.T("app.openFile.missing");
         else
             failure = await Services.FilePresenter.SaveAsync(full!);
@@ -2586,6 +2592,22 @@ public sealed class MainPage : ContentPage
                     catch (Exception ex)
                     {
                         Console.WriteLine("TensorAgent: save-image failed: " + ex.Message);
+                        await DisplayAlert(Loc.T("app.openFile.alert.title"), ex.Message, Loc.T("common.ok"));
+                    }
+                });
+                return;
+
+            // A spoken reply's WAV, likewise under /uploads: a WebView has no download
+            // manager, so the save goes through the same native picker as a picture's.
+            case "save-audio":
+                string audioUrl = message.TryGetProperty("url", out System.Text.Json.JsonElement audio)
+                    ? audio.GetString() ?? string.Empty : string.Empty;
+                MainThread.BeginInvokeOnMainThread(async () =>
+                {
+                    try { await SaveAudioAsync(audioUrl); }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("TensorAgent: save-audio failed: " + ex.Message);
                         await DisplayAlert(Loc.T("app.openFile.alert.title"), ex.Message, Loc.T("common.ok"));
                     }
                 });

@@ -2634,14 +2634,20 @@ public sealed class AgentAppHost : IDisposable
     };
 
     /// <summary>The catalog entry's card values as the defaults a request falls back to.</summary>
-    private static SamplingDefaults SamplingDefaultsFor(CatalogModel model) =>
-        new(new TensorSharp.Runtime.SamplingConfig
+    internal static SamplingDefaults SamplingDefaultsFor(CatalogModel model)
+    {
+        var values = new TensorSharp.Runtime.SamplingConfig
         {
             Temperature = model.Sampling.Temperature,
             TopK = model.Sampling.TopK,
             TopP = model.Sampling.TopP,
             MinP = model.Sampling.MinP,
-        });
+        };
+        // Only a card that states one moves it off the engine default.
+        if (model.Sampling.RepetitionPenalty is float penalty)
+            values.RepetitionPenalty = penalty;
+        return new SamplingDefaults(values);
+    }
 
     private static ServerHostingOptions BuildOptions(
         AgentPaths paths, AppSettings settings, IReadOnlyList<BackendOption>? backends) => new(

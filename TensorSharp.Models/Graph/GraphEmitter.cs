@@ -273,18 +273,24 @@ namespace TensorSharp.Models.Graph
         /// -1 attends every key. <paramref name="kvMax"/> &gt; 0 bounds the finite entries of every mask row, which lets a
         /// backend attend only those (ggml_flash_attn_ext_set_n_kv_max). <paramref name="promptChunk"/>: the rows are one
         /// sequence's prompt chunk (<see cref="GraphAttentionRows.PromptChunk"/>).</summary>
-        public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0, bool promptChunk = false)
+        /// <param name="band">A sliding-window layer's window (ip[3]; ip[2] is then the rows' kind, see
+        /// <see cref="GraphAttentionRows"/>) where the executor reads such masks on the device
+        /// (<see cref="GraphCapabilities.BandMasksOnDevice"/>), 0 elsewhere.</param>
+        public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0, bool promptChunk = false, int band = 0)
         {
             Span<int> srcs = stackalloc[] { q, k, v, mask };
-            // ip[2] only on a prompt chunk's op (GraphAttentionRows): every other op keeps the ip, bytes and signature it had.
-            ReadOnlySpan<long> ip = promptChunk ? stackalloc long[] { 10 /* F32 accumulation */, Math.Max(kvMax, 0), GraphAttentionRows.PromptChunk }
+            // ip[2] only on a prompt chunk's op or a device band's (GraphAttentionRows), ip[3] only on a device band's: every
+            // other op keeps the ip, bytes and signature it had.
+            long rows = promptChunk ? GraphAttentionRows.PromptChunk : GraphAttentionRows.Unsaid;
+            ReadOnlySpan<long> ip = band > 0 ? stackalloc long[] { 10 /* F32 accumulation */, Math.Max(kvMax, 0), rows, band }
+                : promptChunk ? stackalloc long[] { 10, Math.Max(kvMax, 0), rows }
                 : kvMax > 0 ? stackalloc long[] { 10, kvMax } : stackalloc long[] { 10 };
-            ObserveAttention(ip);
+            ObserveAttention(ip, band);
             return Op(GraphOp.FlashAttnExt, mask >= 0 ? srcs : srcs[..3], ip, stackalloc[] { scale, 0f, 0f });
         }
 
-        /// <summary>Called with every attention op's ip before it is emitted (a test seam of a derived emitter).</summary>
-        protected virtual void ObserveAttention(ReadOnlySpan<long> ip) { }
+        /// <summary>Called with every attention op's ip (and its device band, 0 for none) before it is emitted.</summary>
+        protected virtual void ObserveAttention(ReadOnlySpan<long> ip, int band) { }
 
         // ---- programs and runs
 
@@ -306,7 +312,7 @@ namespace TensorSharp.Models.Graph
         public GraphRunInputs RunInputs() => new(_inputs.ToArray(), _inputData.ToArray(), _inputBytes.ToArray());
 
         /// <summary>Run <paramref name="plan"/> (compiled from this trace or one of the same signature) on this trace's inputs.</summary>
-        public bool Run(IGraphPlan plan) => plan.Run(CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData),
+        public virtual bool Run(IGraphPlan plan) => plan.Run(CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData),
             CollectionsMarshal.AsSpan(_inputBytes), CollectionsMarshal.AsSpan(_inputHandles));
 
         public void Dispose()

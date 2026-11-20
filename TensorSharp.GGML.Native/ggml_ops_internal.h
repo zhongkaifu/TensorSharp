@@ -46,6 +46,7 @@
 #include "ggml_ops_flash_attn_guard.h"
 #include "ggml_ops_bonsai.h"
 #include "ggml_ops_host_read_gate.h"
+#include "ggml_ops_cpu_graph.h"
 
 #if defined(_WIN32)
 #define TSG_EXPORT extern "C" __declspec(dllexport)
@@ -488,11 +489,26 @@ namespace tsg
     // TSGgml_RecreateBackend exists for, and it is the only thing that clears this.
     inline ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph* graph)
     {
+        // ggml-cpu: a compute outside the graph runtime runs on the thread pool for its products' width.
+        if (g_backend_type == BACKEND_TYPE_CPU) cpu_pools_select_for(backend, graph);
         const std::uint64_t before = g_ggml_error_count.load(std::memory_order_acquire);
         const ggml_status status = ggml_backend_graph_compute(backend, graph);
         if (g_ggml_error_count.load(std::memory_order_acquire) != before)
             g_backend_compute_failed.store(true, std::memory_order_release);
         return status;
+    }
+
+    // w · x for a per-op product of a weight whose host bytes are `key` (TSGgml_AddmmQuantF32 and the fused per-op ops
+    // over quantized weights), as the graph builder's weight_product computes it in a graph: x rotated first when the
+    // weight carries a Bonsai2 PRISM transform; on ggml-cpu, TensorSharp's product for a weight ggml-cpu has no fast
+    // kernel for (cpu_weight_product: BF16 weights on ARM64 over unrounded F32 activations, NVFP4 from two rows with
+    // ggml's bits); else ggml's MUL_MAT. So a per-op path and a graph run one product per weight on every backend (the
+    // per-op DFlash drafter's head and the graph drafter's, GraphBlockDraftTests).
+    inline ggml_tensor* weight_mul_mat(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, const void* key)
+    {
+        if (g_backend_type == BACKEND_TYPE_CPU && !(bonsai_any_transform() && bonsai_weight_has_transform(key)))
+            if (ggml_tensor* r = cpu_weight_product(ctx, w, x)) return r;
+        return bonsai_mul_mat(ctx, w, x, key);
     }
 
     // Same, for the paths that submit asynchronously and drain separately.

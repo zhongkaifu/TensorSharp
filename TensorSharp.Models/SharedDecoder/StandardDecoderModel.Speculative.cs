@@ -44,6 +44,8 @@ namespace TensorSharp.Models
         /// family whose graphs keep it in device buffers overrides this.</summary>
         protected virtual void CommitRecurrentPrefix(int kept, int rows)
         {
+            // The runtime's own short-conv states keep a graph verify window in device buffers: their copy programs first.
+            CommitShortConvWindows(kept, rows);
             foreach (RecurrentState state in ActiveRecurrentStates())
                 state.CommitVerify(kept);
         }
@@ -201,6 +203,11 @@ namespace TensorSharp.Models
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             ArgumentNullException.ThrowIfNull(tokens);
+            if (tokens.Length > _maxSequenceStepRows)
+            {
+                SpecForwardInRingSteps(tokens, hAllOut, logitsOut, allLogitsRows);
+                return;
+            }
             if (IsMultiNodePipeline)
             {
                 SpecForwardDistributed(tokens, hAllOut, logitsOut, allLogitsRows);
@@ -283,6 +290,42 @@ namespace TensorSharp.Models
             long logitFloats = allLogitsRows ? (long)rows * vocab : vocab;
             Array.Copy(result.Logits, 0, logitsOut, 0, Math.Min(logitFloats, logitsOut.LongLength));
             WriteSpecFeatures(hAllOut, rows, result.Captures, result.Final);
+        }
+
+        /// <summary>A forward of more rows than the sliding-window rings hold beside their window (a prompt through a speculating
+        /// context), in steps of <see cref="MaxSequenceStepRows"/> rows: every row's logits land at its row (allLogitsRows), else
+        /// the last step's. Drafter features of such a forward are refused (no step captures them all).</summary>
+        private void SpecForwardInRingSteps(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+        {
+            if (hAllOut != null)
+                throw new NotSupportedException($"{Config.Architecture}: drafter features of a {tokens.Length}-row forward, which its " +
+                    $"sliding-window ring caches take in steps of {_maxSequenceStepRows} rows.");
+            int vocab = Config.VocabSize, step = _maxSequenceStepRows;
+            var media = _pendingMedia.ToArray();
+            _pendingMedia.Clear();
+            try
+            {
+                for (int at = 0; at < tokens.Length; at += step)
+                {
+                    int n = Math.Min(step, tokens.Length - at);
+                    foreach (var (rows, offset) in media)
+                    {
+                        int from = Math.Max(offset, at), to = Math.Min(offset + (int)rows.Sizes[0], at + n);
+                        if (from < to) _pendingMedia.Add((rows.Narrow(0, from - offset, to - from), from - at));
+                    }
+                    bool last = at + n == tokens.Length;
+                    var piece = new float[(allLogitsRows ? n : 1) * (long)vocab];
+                    SpecForward(tokens.AsSpan(at, n).ToArray(), null, piece, allLogitsRows);
+                    if (allLogitsRows)
+                        Array.Copy(piece, 0, logitsOut, (long)at * vocab, Math.Max(0, Math.Min(piece.LongLength, logitsOut.LongLength - (long)at * vocab)));
+                    else if (last)
+                        Array.Copy(piece, 0, logitsOut, 0, Math.Min(piece.LongLength, logitsOut.LongLength));
+                }
+            }
+            finally
+            {
+                foreach (var (rows, _) in media) rows.Dispose();
+            }
         }
 
         /// <summary>The verify off the graphs: the per-op layers with the drafter's rows captured, every

@@ -44,6 +44,20 @@ namespace TensorSharp.GGML
             {
                 // Metal and CUDA read row-contiguous strided views (the fused Qwen graphs rely on it).
                 StridedViews = metal || backend == GgmlBackendType.Cuda,
+                // A prompt chunk's packed products as one product and views (ggml-metal's and ggml-cuda's element-wise kernels,
+                // norms, rotary and set_rows read row-contiguous strided rows): LFM3-1.7B Q4_K_M pp128 4,083 -> 4,320 tok/s,
+                // pp512 +2.3% (M5 Pro); on an A40 pp512 +4.7%, pp4096 +4.1% (26 fewer products a 512-row step). ggml-vulkan
+                // measured no gain (pp512 +0.8%, pp4096 -0.3%, decode -0.4..-0.9%), so it keeps the separate products.
+                // ggml-cpu likewise (its norms, rotary, binary ops, set_rows, concat and flash attention read rows at any
+                // strides), and it takes a prompt chunk's fresh K/V rows as their permuted views (FreshRowViews: written by
+                // index, attended where they lie): no copies of every chunk's q, k and v, nor of its fresh K/V rows, and one
+                // short-convolution in-projection product instead of three. The same bits (logits digests of LFM3-1.7B
+                // Q4_K_M and Q8_0, Ministral-3 3B, Hunyuan-MT2 1.8B, Qwen3.5 0.8B). LFM3-1.7B Q4_K_M on an M5 Pro (18 threads,
+                // interleaved): pp128 807 -> 953 tok/s, pp512 876 -> 953, pp2048 844 -> 877 in one session, within the
+                // run-to-run spread in another (pp128 / pp512 910 -> 909 / 917 -> 933, 4 rounds); the other families' prompts
+                // within their run-to-run spread (Qwen3.5 pp512 2,170 -> 2,313).
+                PackedProductBlocks = metal || backend is GgmlBackendType.Cuda or GgmlBackendType.Cpu,
+                FreshRowViews = backend == GgmlBackendType.Cpu,
                 // ggml-metal finishes reading a head's recurrent state before writing it.
                 InPlaceStateAlias = metal,
                 // Metal's concurrency reorder (+8% decode on Qwen 3.5 A3B).
@@ -54,6 +68,7 @@ namespace TensorSharp.GGML
                 // ggml-cuda groups a KV head's queries only over K whose length is a multiple of 256: over exact-length
                 // rows Qwen3.6-35B-A3B's 3.6K prompt spent 133.6 ms in flash attention, Qwen35Model's padded window 31.5
                 // (A40, nsys).
+                // (ggml-vulkan: a family opts in, StandardDecoderModel.PadsPromptWindowsOnVulkan.)
                 PaddedCacheAttention = metal || backend == GgmlBackendType.Cuda,
                 TensorParallel = backend == GgmlBackendType.Cuda,
                 BindsHostPointers = true,
@@ -61,12 +76,42 @@ namespace TensorSharp.GGML
                 QuantizedKvCache = true,
                 // Routed experts in host memory run at a pause in the graph (ggml_ops_graph_builder.cpp).
                 HostExperts = true,
+                // Greedy heads end in each row's id on the discrete GPUs (ggml_ops_graph_builder.cpp's GreedyHead: the
+                // device's top candidates, the host's tie rule): a 64-sequence LFM3-1.7B step had read back 32 MB of logits
+                // and scanned 8.2 M floats on the engine thread (B0 census, A40). Metal and the CPU read their logits in
+                // place, where the host's scan stays.
+                GreedyIdOutputs = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
+                // Suppressed tokens (a reply-token policy) as a mask the greedy head adds (GreedyHead).
+                GreedyIdSuppression = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
             };
         }
 
         public GgmlBackendType Backend { get; }
 
         public GraphCapabilities Capabilities { get; }
+
+        /// <summary>A prompt's one-shot steps return with their work queued, the host building the next meanwhile (see
+        /// <see cref="IGraphExecutor.OverlapSteps"/>; TSGgml_GraphOverlapSteps): a 512-row LFM3-1.7B step at 4K on an A40 had
+        /// left the device idle for ~5 ms of host work (the next step's embedding, trace and graph build, its inputs' upload)
+        /// after its ~25 ms run; overlapped, pp4096 16,817 -> 18,216 tok/s and pp16384 15,460 -> 17,137 on ggml-cuda, pp4096
+        /// 9,344 -> 10,092 on ggml-vulkan (interleaved, decode unchanged). On the discrete GPUs only, whose queued work writes no
+        /// host buffer it does not download into (Metal's buffers are the host's: its own lazy sync has its own rules).</summary>
+        public IDisposable OverlapSteps()
+            => Backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan ? new OverlapScope() : null;
+
+        private sealed class OverlapScope : IDisposable
+        {
+            private bool _open = true;
+
+            public OverlapScope() => GgmlNative.TSGgml_GraphOverlapSteps(1);
+
+            public void Dispose()
+            {
+                if (!_open) return;
+                _open = false;
+                GgmlNative.TSGgml_GraphOverlapSteps(0);
+            }
+        }
 
         public IGraphPlan Compile(GraphProgram program)
         {
@@ -197,7 +242,7 @@ namespace TensorSharp.GGML
 
         public void Invalidate(IntPtr data) => GgmlBasicOps.InvalidateHostBuffer(data);
 
-        private sealed class Plan : IGraphPlan
+        private sealed class Plan : IGraphPlan, IGraphPlanCensus
         {
             private readonly GgmlGraph _graph;
             private readonly GCHandle[] _pins;
@@ -229,6 +274,22 @@ namespace TensorSharp.GGML
             }
 
             public bool IsLeafResident(int node) => _graph.IsResident(node);
+
+            private GraphPlanCensus? _census;
+
+            /// <summary>The built ggml graph's census (TSGgml_GraphCensus), read once after its first run: a replayable graph
+            /// is fixed from then on.</summary>
+            public GraphPlanCensus? Census
+            {
+                get
+                {
+                    if (_census != null) return _census;
+                    long[] v = _graph.Census();
+                    if (v == null) return null;
+                    _census = new GraphPlanCensus(v[0], v[1], v[2], v[3], v[4], v[5]);
+                    return _census;
+                }
+            }
 
             public void Dispose()
             {

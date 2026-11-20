@@ -157,6 +157,15 @@ body { display: flex; flex-direction: column; }
 .bubble table { border-collapse: collapse; width: 100%; font-size: 13px; display: block; overflow-x: auto; }
 .bubble th, .bubble td { border: 1px solid var(--border); padding: 5px 7px; text-align: left; }
 
+/* A spoken reply: its player, Save link and, while it plays, Stop, under the text. */
+.bubble .spoken-reply { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.bubble .spoken-reply audio { flex: 1 1 100%; margin: 0; }
+.bubble .speech-download { display: inline-flex; align-items: center; min-height: 42px; }
+.turn-note { max-width: 100%; margin-top: 4px; padding: 0 2px; font-size: 12px; line-height: 1.5; color: var(--muted); font-style: italic; }
+#speechbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+#speechbar .switch { min-height: 44px; font-size: 13px; }
+#speech-voice { min-height: 36px; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font-size: 13px; }
+
 .turn-stats {
   max-width: 100%; margin-top: 4px; padding: 0 2px;
   font-size: 12px; line-height: 1.5; color: var(--muted);
@@ -744,6 +753,11 @@ button.mini.quiet { background: transparent; color: var(--muted); }
 
 <div id="composer">
   <button id="composer-loras" type="button" style="display:none" aria-controls="lora-sheet" aria-haspopup="dialog"><span data-i18n="markup.model.loras">LoRA plug-ins</span><span id="composer-loras-hint"></span><span aria-hidden="true">›</span></button>
+  <!-- Shown only while the loaded model can speak its replies (LFM3-Omni with its projector). -->
+  <div id="speechbar" style="display:none">
+    <label class="switch"><input type="checkbox" id="speech-toggle" role="switch" aria-checked="false"><span class="track"></span><span data-i18n="markup.composer.speakReplies">Speak replies</span></label>
+    <select id="speech-voice" style="display:none" data-i18n-aria-label="markup.composer.voice" aria-label="Voice"></select>
+  </div>
   <div id="skillchips"></div>
   <div id="knowledgechips"></div>
   <div id="chips"></div>

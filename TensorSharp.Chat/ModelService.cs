@@ -615,7 +615,7 @@ namespace TensorSharp.Server
         /// over them would be parsing parsed text.
         /// </para>
         /// </summary>
-        internal IAsyncEnumerable<ChatStreamUpdate>
+        internal virtual IAsyncEnumerable<ChatStreamUpdate>
             ChatStreamWithSkillsAsync(
                 ChatSession session,
                 List<ChatMessage> history,
@@ -725,6 +725,64 @@ namespace TensorSharp.Server
                 _intrinsicSession, history, maxTokens, cancellationToken,
                 samplingConfig, tools, enableThinking, skills, logger, lora: lora);
         }
+
+        /// <summary>
+        /// A spoken reply (the loaded model speaks: <see cref="TensorSharp.Models.Audio.ISpeechOutputModel"/>) to a stateless
+        /// protocol's history: the engine request is driven slot by slot (text tokens and speech frames), batched with every
+        /// other request, and its updates carry the speech (<see cref="ChatStreamUpdate.Audio"/>) in order with the
+        /// transcript text.
+        /// </summary>
+        internal virtual IAsyncEnumerable<ChatStreamUpdate>
+            ChatStreamWithSpeechAsync(
+                List<ChatMessage> history,
+                int maxTokens,
+                CancellationToken cancellationToken,
+                SamplingConfig? samplingConfig,
+                bool enableThinking,
+                TensorSharp.Models.Audio.SpeechReplyOptions speech,
+                TextLoraAdapter? lora = null)
+            => ChatStreamWithSpeechAsync(_intrinsicSession, history, maxTokens, cancellationToken, samplingConfig,
+                enableThinking, speech, lora);
+
+        /// <summary>
+        /// A spoken reply on <paramref name="session"/> (a web chat session: its cache scope and its transcript), as the
+        /// stateless overload gives the protocols without sessions. No tools: a spoken reply is one generation, never a
+        /// tool loop. Its language is <see cref="TensorSharp.Models.Audio.SpeechReplyOptions.Language"/>, else the one the user's
+        /// last message is written in; a language the model's speech modes do not speak is spoken from the text reply by its
+        /// TTS prompt, sentence by sentence (<see cref="TensorSharp.Models.Audio.SpeechReplyPath.Synthesized"/>).
+        /// </summary>
+        internal virtual IAsyncEnumerable<ChatStreamUpdate>
+            ChatStreamWithSpeechAsync(
+                ChatSession session,
+                List<ChatMessage> history,
+                int maxTokens,
+                CancellationToken cancellationToken,
+                SamplingConfig? samplingConfig,
+                bool enableThinking,
+                TensorSharp.Models.Audio.SpeechReplyOptions speech,
+                TextLoraAdapter? lora = null)
+        {
+            ArgumentNullException.ThrowIfNull(session);
+            ArgumentNullException.ThrowIfNull(speech);
+            return _generation.SpokenReplyStreamAsync(
+                session, history, maxTokens, cancellationToken, samplingConfig, enableThinking, speech, lora);
+        }
+
+        /// <summary>
+        /// Speech synthesis by the loaded model's TTS prompt on the engine (a speaking LLM: LFM3-Omni), batched with every
+        /// other request: updates carry the PCM as each frame is decoded, then a terminal update with the counts.
+        /// </summary>
+        internal virtual IAsyncEnumerable<ChatStreamUpdate>
+            SpeechSynthesisStreamAsync(string text, TensorSharp.Models.Audio.SpeechSynthesisOptions options, CancellationToken cancellationToken)
+            => _generation.SpeechSynthesisStreamAsync(text, options, cancellationToken);
+
+        /// <summary>The loaded model when it is a language model that can speak (its speech decoder may still be missing:
+        /// <see cref="TensorSharp.Models.Audio.ISpeechOutputModel.HasSpeechOutput"/>), else null.</summary>
+        public virtual TensorSharp.Models.Audio.ISpeechOutputModel SpeechOutputModel
+            => _lifecycle.Model as TensorSharp.Models.Audio.ISpeechOutputModel;
+
+        /// <summary>The loaded model speaks through the engine now (an LLM with its speech decoder loaded).</summary>
+        public bool HasSpeechOutput => SpeechOutputModel is { HasSpeechOutput: true };
 
         /// <summary>True when the loaded model is a DiffusionGemma block-diffusion model, which is
         /// generated via an iterative denoising sampler instead of the autoregressive engine.</summary>

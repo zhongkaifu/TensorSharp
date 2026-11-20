@@ -312,6 +312,63 @@ public class WebUiChatServiceTests : IDisposable
         Assert.False(service.BindSessionConversation("no-such-session", "conv-1"));
     }
 
+    /// <summary>
+    /// The scope alone did not let a reopened chat continue: its session's transcript store
+    /// was empty, so the history the page sent back rendered every earlier reply through the
+    /// template, which on Qwen 3.5 drops a past reply's empty thinking block. The prompt left
+    /// the conversation's cached state at the first reply and everything after it was
+    /// prefilled again. A session bound to a conversation continues the records of a live
+    /// session of that conversation; another conversation's records never reach it, and a
+    /// reset or dispose of one session leaves the other's records in place.
+    /// </summary>
+    [Fact]
+    public void AReopenedConversationSession_ContinuesTheEarlierSessionsTranscripts()
+    {
+        using var model = new ModelService(NullLogger<ModelService>.Instance);
+        var sessions = new SessionManager();
+        var service = new WebUiChatService(
+            model, sessions, Options(), new UploadStoragePolicy(_baseDir),
+            new SkillRegistry(new SkillRegistryOptions()),
+            codeRunner: null, workspaces: null, codeArtifacts: null,
+            NullLoggerFactory.Instance, WebUiChatService.DefaultArtifactUriPrefix);
+
+        ChatSession first = sessions.CreateSession();
+        Assert.True(service.BindSessionConversation(first.Id, "conv-1"));
+        var question = new ChatMessage { Role = "user", Content = "What is a radix tree?" };
+        var raw = new List<int> { 11, 12, 13 };
+        lock (first.HistoryLock)
+            first.Transcripts.Record(new List<ChatMessage> { question },
+                new ChatMessage { Role = "assistant", Content = "A prefix tree.", RawOutputTokens = raw },
+                new EmittedAssistantTurn("A prefix tree.", null, null, "A prefix tree.", Cancelled: false),
+                first.ResolveCacheScope(null));
+        List<ChatMessage> sentBack = new()
+        {
+            question,
+            new ChatMessage { Role = "assistant", Content = "A prefix tree." },
+            new ChatMessage { Role = "user", Content = "And a trie?" },
+        };
+
+        ChatSession reopened = sessions.CreateSession();
+        ChatSession other = sessions.CreateSession();
+        Assert.True(service.BindSessionConversation(reopened.Id, "conv-1"));
+        Assert.True(service.BindSessionConversation(other.Id, "conv-2"));
+
+        TranscriptAugmentation continued = reopened.Transcripts.Augment(sentBack);
+        Assert.Equal(1, continued.SplicedTurns);
+        Assert.Same(raw, continued.History[1].RawOutputTokens);
+        Assert.Equal(0, other.Transcripts.Augment(sentBack).SplicedTurns);
+
+        // The first session goes (the app's page never deletes one, a host may): the reopened one keeps the records.
+        first.Dispose();
+        Assert.Equal(1, reopened.Transcripts.Augment(sentBack).SplicedTurns);
+        // A new chat in the reopened session forgets them for that session only.
+        ChatSession third = sessions.CreateSession();
+        Assert.True(service.BindSessionConversation(third.Id, "conv-1"));
+        lock (reopened.HistoryLock) reopened.ResetConversation();
+        Assert.Equal(0, reopened.Transcripts.Augment(sentBack).SplicedTurns);
+        Assert.Equal(1, third.Transcripts.Augment(sentBack).SplicedTurns);
+    }
+
     [Fact]
     public async Task RoutedArtifactSetupFailureAlsoCarriesTheBrowserRollbackCode()
     {

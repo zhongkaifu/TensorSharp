@@ -533,6 +533,44 @@ namespace TensorSharp.MLX
                 result, input, weight, ggmlType, ne0, ne1, inputStorage, rows, preserveFloat32));
         }
 
+        /// <summary>Whether <see cref="TryAddmmFloatWeight"/> takes this GGML type (F32, F16, BF16).</summary>
+        public static bool IsFloatWeightType(int ggmlType) => MlxNative.IsFloatWeightType(ggmlType);
+
+        /// <summary>
+        /// x [rows, ne0] (F32) times an unquantized F32/F16/BF16 weight [ne1, ne0] kept on the device as its GGUF bytes:
+        /// decode-sized row counts run a matrix-vector kernel that reads each weight element once and sums in F32, larger
+        /// ones MLX's GEMM (MlxNative.FloatWeightMatmul). False when the operands are not MLX F32 rows or the type is not one
+        /// of the three.
+        /// </summary>
+        public static bool TryAddmmFloatWeight(
+            Tensor result, Tensor input, IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
+        {
+            if (!MlxNative.IsFloatWeightType(ggmlType))
+                return false;
+            if (!TryValidateMatmul(result, input, ne0, ne1, out MlxStorage resultStorage, out MlxStorage inputStorage, out int rows))
+                return false;
+            if (rows == 0) return true;
+            DeviceWeight weight = EnsureWeight(resultStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray inputView = default;
+                MlxNative.MlxArray output = default;
+                try
+                {
+                    inputView = inputStorage.CreateArrayView(input);
+                    output = MlxNative.FloatWeightMatmul(inputView, weight.Weight, ggmlType, rows, (int)ne0, (int)ne1);
+                    SetDeviceResult(result, output);
+                    output = default;
+                    return true;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(inputView);
+                    MlxNative.FreeArray(output);
+                }
+            });
+        }
+
         /// <summary>
         /// Whether the direct models' exact F32 projections (DirectLinear) keep a GGUF weight of
         /// this type on the device in compressed form: every <see cref="CanPreloadQuantizedType"/>
@@ -1636,6 +1674,7 @@ namespace TensorSharp.MLX
                     (int)GgmlTensorType.IQ1_M => CreateRawKWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes,
                         MlxNative.LowBitBlockBytes(ggmlType), "IQ1_M", mode: "iq1_m"),
                     (int)GgmlTensorType.BF16 => CreateRawBf16Weight(deviceId, hostData, ne0, ne1, rawBytes),
+                    (int)GgmlTensorType.F16 or (int)GgmlTensorType.F32 => CreateRawFloatWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes),
                     _ => throw new NotSupportedException($"MLX quantized preload does not support GGML tensor type {(GgmlTensorType)ggmlType}."),
                 };
                 entry.Key = key;
@@ -2231,6 +2270,34 @@ namespace TensorSharp.MLX
         }
 
         /// <summary>A BF16 matrix wrapped in place over its mapped bytes, for the direct F32 path.</summary>
+        /// <summary>An F16 or F32 weight kept as its GGUF bytes (no copy), for <see cref="TryAddmmFloatWeight"/>.</summary>
+        private static DeviceWeight CreateRawFloatWeight(int deviceId, int ggmlType, IntPtr hostData, long ne0, long ne1, long rawBytes)
+        {
+            string label = ((GgmlTensorType)ggmlType).ToString();
+            int elementBytes = ggmlType == (int)GgmlTensorType.F32 ? sizeof(float) : sizeof(ushort);
+            if (ne0 <= 0 || ne1 <= 0 || ne0 > int.MaxValue || ne1 > int.MaxValue)
+                throw new NotSupportedException($"{label} MLX weight requires positive dimensions, got [{ne0}, {ne1}].");
+            long expectedBytes = checked(ne0 * ne1 * elementBytes);
+            if (rawBytes < expectedBytes)
+                throw new ArgumentException($"{label} raw buffer is too small: expected at least {expectedBytes} bytes, got {rawBytes}.", nameof(rawBytes));
+            if (expectedBytes > int.MaxValue)
+                throw new NotSupportedException($"{label} raw MLX array exceeds the current Int32 shape limit: {expectedBytes} bytes.");
+            MlxNative.MlxArray rawWeight = default;
+            try
+            {
+                rawWeight = MlxNative.NewArrayFromHostNoCopy(hostData, new[] { (int)expectedBytes }, DType.UInt8);
+                var entry = new DeviceWeight
+                {
+                    Weight = rawWeight, Scales = default, Biases = default, DeviceId = deviceId,
+                    GgmlType = ggmlType, Ne0 = ne0, Ne1 = ne1, RawBytes = rawBytes,
+                    GroupSize = 1, Bits = elementBytes * 8, Mode = label.ToLowerInvariant(),
+                };
+                rawWeight = default;
+                return entry;
+            }
+            finally { MlxNative.FreeArray(rawWeight); }
+        }
+
         private static DeviceWeight CreateRawBf16Weight(int deviceId, IntPtr hostData, long ne0, long ne1, long rawBytes)
         {
             if (ne0 <= 0 || ne1 <= 0 || ne0 > int.MaxValue || ne1 > int.MaxValue)

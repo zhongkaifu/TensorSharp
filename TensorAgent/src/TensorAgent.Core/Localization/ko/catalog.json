@@ -59,6 +59,8 @@
   "catalog.extended.nemotronOmni.notes": "선택적 프로젝터로 이미지를 사용할 수 있습니다. 오디오에는 별도로 변환한 Parakeet 구성 요소가 필요하며 포함되어 있지 않습니다. 추측 디코딩은 지원되지 않습니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
   "catalog.extended.mistral.notes": "Pixtral 시각 프로젝터는 선택 사항입니다. 이 구현은 채팅과 이미지를 지원하며 사고 모드나 도구 호출은 지원하지 않습니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
   "catalog.extended.hunyuan.notes": "hunyuan-dense를 사용하는 Tencent 번역 모델입니다. 단일 장치에서 텍스트만 처리하며 사고 모드나 도구 호출은 지원하지 않습니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
+  "catalog.lfm3.notes": "짧은 합성곱 층과 어텐션 층을 결합한 Liquid의 하이브리드 모델입니다. 사고 모드와 도구 호출을 지원하며 텍스트만 처리합니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
+  "catalog.lfm3Omni.notes": "Liquid의 옴니 모델입니다. 이미지, 동영상, 오디오를 입력받아 텍스트를 출력하며 사고 모드는 없습니다. 필수 프로젝터에 음성 생성기도 들어 있습니다. '답변 읽어 주기'를 켜면 답변이 생성되는 동안 듣고, 다시 재생하고, 오디오를 저장할 수 있습니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
   "catalog.extended.deepseek4.notes": "분할 파일 3개가 모두 필요합니다. 선택적 0731 DSpark 초안은 CUDA에서 탐욕 샘플링으로 실행됩니다. 워크스테이션급 메모리가 필요합니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
   "catalog.extended.deepseek41.notes": "Engram이 내장된 수정 버전으로 분할 파일 10개가 필요합니다. 실제 서비스에는 CUDA를, 이식성 확인에는 CPU를 사용합니다. 시각 기능과 DSpark에는 TensorSharp 변환이 필요하며 공개 clip/dflash 파일은 호환되지 않습니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",
   "catalog.extended.glm.notes": "텍스트 전용이며 모든 분할 파일이 필요합니다. NextN이 내장되어 별도 초안 다운로드가 필요 없습니다. GLM 5.3 NextN에는 단일 장치나 레이어 분할이 필요하며 앱 기본값은 n-gram 추측입니다. 카탈로그 메타데이터는 확인되었으나 TensorAgent 추론은 아직 검증되지 않았습니다.",

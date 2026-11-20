@@ -294,6 +294,8 @@ namespace TensorSharp.Models
                             qRows, Config.NumKVHeads * _keyDim, Config.NumKVHeads * _valueDim);
                     else
                         columns.AddRange(new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" });
+                    if (!_recurrentLayer[l])
+                        columns.AddRange(HeadParallelLayerWeights(l));   // per-head rows, in the query's head blocks
                     if (_gateUpFused[l])
                         ShardFusedGateUpColumnParallel(p + "ffn_gate_up.weight");
                     else

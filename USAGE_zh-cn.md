@@ -32,8 +32,8 @@ EmbeddingGemma 2 加载投影器后，两个嵌入端点也接受有序媒体 co
 | GGML Metal | `--backend ggml_metal` | Apple Silicon（macOS 上服务端的默认后端；CLI 在所有平台上默认 `ggml_cpu`） | 通过 Apple Metal 进行 GPU 加速。量化权重通过 host 指针缓冲区从 GGUF 文件零拷贝映射到 Metal command buffer，常驻内存接近模型在磁盘上的大小。 |
 | GGML CUDA | `--backend ggml_cuda` | 通过 ggml 使用 NVIDIA 推理 | 通过 GGML CUDA 在 Windows 或 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
 | GGML Vulkan | `--backend ggml_vulkan` | 通过 ggml 的厂商无关 GPU 推理 | 通过 GGML Vulkan 在 Windows 或 Linux 上加速——支持带 Vulkan 1.3 驱动的 AMD、Intel 与 NVIDIA GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。机器有 Vulkan 运行时（已安装 loader）时原生构建会自动启用；未安装 Vulkan SDK 或发行版开发包时，构建会通过 `eng/fetch-vulkan-toolchain.ps1` / `eng/fetch-vulkan-toolchain.sh` 自动下载便携工具链（headers、glslc、SPIRV-Headers，Windows 上还有 loader 导入库）。用 `--no-vulkan`（或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`）退出。 |
-| GGML CPU | `--backend ggml_cpu` | 原生 CPU 内核 | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
-| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 可移植的 CPU 推理：模型计算不加载任何原生库（桌面平台上的图像文件读写仍经由 Magick.NET，服务端启动时也会探测 GGML / CUDA 后端）。托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，默认宽度是可用核心数的一半（`TS_CPU_THREADS` 及下文其余 `TS_CPU_*` 开关）；在 direct 视频网络（Wan、MiniMax-H3）上，量化权重直接以 GGUF 存储类型参与乘法，而不再在加载时展开成 F32。DeepSeek V4.1 Flash 与下文的 DeepSeek V4 Flash 一样，在这里也走自己的整模型执行器——100% 纯 C# 的 `DeepSeek4CpuExecutor`，它是正确性与可移植性路径，而非服务路径，其计算宽度来自 `TS_DSV4_THREADS`（这个后端上默认取全部处理器）而不是 `TS_CPU_THREADS`。 |
+| GGML CPU | `--backend ggml_cpu` | 原生 CPU 内核 | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射；ARM64 例外：只被矩阵乘法读取的量化权重会被复制一次到 ggml-cpu 的重排布局（常驻内存约等于这些权重的大小，提示速度约翻倍）。`TS_GGML_CPU_REPACK=0` 让它们保持零拷贝（见[环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md#矩阵外的-ggml-cpu-后端开关)）。 |
+| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 可移植的 CPU 推理：模型计算不加载任何原生库（桌面平台上的图像文件读写仍经由 Magick.NET，服务端启动时也会探测 GGML / CUDA 后端）。托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，默认宽度是可用核心数的一半，Apple 芯片上取全部核心（`TS_CPU_THREADS` 及下文其余 `TS_CPU_*` 开关）；在 direct 视频网络（Wan、MiniMax-H3）上，量化权重直接以 GGUF 存储类型参与乘法，而不再在加载时展开成 F32。DeepSeek V4.1 Flash 与下文的 DeepSeek V4 Flash 一样，在这里也走自己的整模型执行器——100% 纯 C# 的 `DeepSeek4CpuExecutor`，它是正确性与可移植性路径，而非服务路径，其计算宽度来自 `TS_DSV4_THREADS`（这个后端上默认取全部处理器）而不是 `TS_CPU_THREADS`。 |
 
 **嵌入编码器使用独立执行器。** `cpu` 路径持有紧凑的量化数组与模型专属线程池，通过 `--embedding-threads` 配置（默认四个线程）；原生嵌入后端可能复制或重排权重。该路径的存储与线程策略见[嵌入执行](docs/embeddings_zh-cn.md#c-api-与实现)。
 
@@ -164,6 +164,15 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --video clip
 
 # 音频推理（Gemma 4）
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --audio speech.wav --backend ggml_metal
+
+# 语音输出（LFM3-Omni 加载其 mmproj；见下文“语音输出（LFM3-Omni）”）。
+# --tts 用 GGUF 的 "tts" 模板朗读 --prompt（与 llama-tts 相同）并写入 --output；
+# --speech-out 让对话回复也说出来（--speech-mode interleaved|audio、--voice female|male、
+# --language、--seed、--speech-temperature）。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf \
+    --backend ggml_metal --tts --prompt "你好，很高兴认识你。" --voice male --language zh --output hello.wav
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model LFM3-Omni-2B-Q4_K_M.gguf --mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf \
+    --backend ggml_metal --input question.txt --speech-out reply.wav --speech-mode interleaved --voice female
 
 # PDF 文档输入：文字型 PDF 会提取文本层并内联进提示词；扫描型 PDF 会转成页面
 # 图像，需要视觉模型（--mmproj 或内置视觉编码器）。--input 提供针对文档的指令。
@@ -352,7 +361,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 
 | 参数 | 说明 |
 |---|---|
-| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（默认：自动——由后端 / 模型决定；环境变量 `KV_CACHE_DTYPE`）。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）在 GGML 后端走其 flash 路径；在 `--backend cuda` 上，共享解码运行时上的每个模型族（Qwen 3.5/3.6/3.8、Mistral 3、Hunyuan Dense）的 `q8_0` 由 CUDA 执行器自己的 flash 内核运行（decode、验证窗口与 prompt 分块读取的字节约为 `f16` 的一半；这些内核不接的路径会警告一次并走通用注意力），而 `q4_0` 会让模型在那里不走整图前向（Qwen3.8 Flash Next 只能以整图运行，因此用 `q4_0`，或在带 QSA 层时用 `q8_0`，它的第一步就会失败：请为它保持 `f16`）；DeepSeek V4 / V4.1 会在加载时拒绝它们（其执行器的 cache 固定为 F16，由自己的内核读取），显式的 `f32` 会按 `f16` 报告。 |
+| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（默认：自动——由后端 / 模型决定；环境变量 `KV_CACHE_DTYPE`）。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）在 GGML 后端走其 flash 路径；在 `--backend cuda` 上，共享解码运行时上的每个模型族（Qwen 3.5/3.6/3.8、Mistral 3、Hunyuan Dense）的 `q8_0` 由 CUDA 执行器自己的 flash 内核运行（decode、验证窗口与 prompt 分块读取的字节约为 `f16` 的一半；这些内核不接的路径会警告一次并走通用注意力；LFM3 的滑动窗口层的 band 与环形缓存路径在那里只接 F16 缓存，因此它的 `q8_0` 不走整图前向），而 `q4_0` 会让模型在那里不走整图前向（Qwen3.8 Flash Next 只能以整图运行，因此用 `q4_0`，或在带 QSA 层时用 `q8_0`，它的第一步就会失败：请为它保持 `f16`）；DeepSeek V4 / V4.1 会在加载时拒绝它们（其执行器的 cache 固定为 F16，由自己的内核读取），显式的 `f32` 会按 `f16` 报告。 |
+| `--prompt-attention <path>` | `--backend cuda`（CUDA 执行器）上 prompt 分块注意力的算术。默认：能运行处为 `int8`，其他情况为 `f16`。`int8` 的 Q K^T 用 INT8 张量核心、P V 用 E4M3 张量核心，适用于 256 宽的注意力头、F16 缓存与至少 1,024 个键的窗口，需 `sm_120a` / `sm_121a` 构建；其他情况（其他 GPU、`q8_0` 缓存、其他头宽）默认静默改用 `f16`，只有显式的 `--prompt-attention int8` 会警告一次。`f16` 运行 16 位分段累加的 prompt 内核，与 issue #383 之前的默认逐位一致：需要保持之前的数值时选它。`f32acc` 让张量核心的每个乘积都以 F32 累加（在工作站与数据中心 GPU 上比 `f16` 快，在 GeForce 卡上更慢，首次使用时会报告）。`int8` 与 `f32acc` 未通过 issue #376 在少数长代码窗口上的长上下文质量门槛（散文与检索不受影响）；`int8` 由维护者决定设为默认。decode 行、验证窗口与草稿始终使用 16 位内核。环境变量：`TS_PROMPT_ATTENTION`（命令行参数优先）。 |
 | `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。与 `--layer-split P` 一起使用时，在声明支持的架构上选择混合放置（P 个整层阶段，每个阶段 N 张 GPU，仅限单进程）；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
 | `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。支持的架构可配合 `--tp-node-id`、`--tp-peers` 跨节点运行；与大于 1 的 `--tp T` 一起使用时选择混合放置（仅限单进程）。详见[多节点推理](docs/multi-node-inference.md)。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
 | `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |
@@ -366,7 +376,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--skills-dir <path>` | 扫描 Agent Skills 的目录（可以是装着若干 `SKILL.md` 的文件夹，也可以是单个技能目录）。可重复；按给出的顺序扫描，最深三层。不传时，先使用从工作目录向上直到 Git 仓库根目录之间所有已存在的 `.agents/skills` 目录（离得近的优先；不在仓库内时只检查工作目录），再加上二进制文件旁的 `skills` 目录（不存在则创建）。显式给出的目录会取代这些默认值，个人/全局技能目录永远不会被自动加载。传入的路径不存在会在启动时报错并点名该参数。环境变量：`TS_SKILLS_DIR`（以路径分隔符分隔的列表）。 |
 | `--skill <name>` | 为本次运行选中一个技能，名称取自其 `SKILL.md`（也就是它的目录名）。可重复。对支持工具调用的模型族，选中只会展示技能元数据并把内置技能工具的可达范围限定到该技能，**不会**把 `SKILL.md` 正文直接写入提示词。只有模型族或请求无法使用工具声明时（包括结构化输出请求），才会在预算允许时内联正文作为回退。 |
 | `--list-skills` | 打印技能注册表——名称、描述、来源、随包文件、大小，以及任何加载告警或错误——然后退出。 |
-| `--no-skills` | 彻底关闭 Agent Skills：不扫描、不注入提示词块、不提供工具。环境变量：`TS_NO_SKILLS`（非 `0` 即视为开启）。 |
+| `--no-skills` | 彻底关闭 Agent Skills：不扫描、不注入提示词块、不提供工具。环境变量：`TS_NO_SKILLS`（非 `0` 即视为开启）。与 `--skills-dir`、`--skill`、`--skills-allow-exec` 或 `--skills-allow-network` 同时给出会被拒绝；与 `--config` 文件中的条目冲突时以命令行一方为准（见 `config/README.md`）。 |
 | `--skills-no-discovery` | 不向模型展示未被选中的技能。不加时，所有已注册技能的名称与描述都会列出，好让模型自己发现你没想到要点名的那个；加上后，本次运行只看得到 `--skill` 选中的技能。 |
 | `--skills-allow-exec` | 允许模型通过 `skills_run` 运行选中技能自带的脚本。**默认关闭；开启后应把每个脚本都当作不受信任代码。**TensorSharp 仅调用已知解释器（`.py`、`.js`/`.mjs`、`.sh`、`.bash`），不经过 shell，并会清理环境、限制运行时间与输出、以只读方式挂载技能目录；工作目录是当前 Web/CLI 会话或 OpenAI/Ollama 请求的工作区（未开启代码执行时则是单次调用 scratch 目录）。默认的 `--skills-sandbox required` 会增加操作系统隔离，无法隔离时拒绝执行；除非另传 `--skills-allow-network`，否则网络仍被禁止。环境变量：`TS_SKILLS_ALLOW_EXEC`（非 `0` 即视为开启）。 |
 | `--skills-max-rounds <n>` | 模型在必须作答前可以取用技能内容——或运行、查看并修正代码——的次数，范围 1-64（默认：`8`；开启 `--code-exec` 时为 `24`，因为写程序、运行它并按回溯修正它比读文件需要更多轮次；此处显式设定的值一律按原样使用）。每一轮都是一次完整生成，因此这一项限制的是那种反复把文件名叫错的模型所能造成的开销。预算用尽时会在对话里告知模型，让它用已读到的内容作答，并说明已经完成了哪些部分。环境变量：`TS_SKILLS_MAX_ROUNDS`。 |
@@ -699,7 +709,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
 | `--skills-dir <path>` | 扫描 Agent Skills 的目录。可重复；按给出的顺序扫描，最深三层；重名时先给出的目录优先。不传时，先使用从工作目录向上直到 Git 仓库根目录之间所有已存在的 `.agents/skills` 目录（离得近的优先；不在仓库内时只检查工作目录），再加上二进制文件旁的 `skills` 目录（不存在则创建）。二进制文件旁的这个 `skills` 目录也是 `POST /api/skills` 上传的技能落地之处；服务端始终最先扫描它，传入 `--skills-dir` 后也照样扫描，因此其中的技能在与任何其他目录重名时优先。显式给出的目录只取代 `.agents/skills` 这些默认值，个人/全局技能目录永远不会被自动加载。传入的路径不存在会在启动时报错。环境变量：`TS_SKILLS_DIR`（以路径分隔符分隔的列表）。 |
 | `--skill <name>` | 让某个技能对所有未自行指定技能的请求生效。可重复。请求体里的 `skills` 数组会覆盖它。 |
 | `--list-skills` | 打印技能注册表——名称、描述、文件、告警与加载错误——然后退出。 |
-| `--no-skills` | 关闭 Agent Skills：不向模型提供任何技能，`/v1/skills` 与 `/api/skills` 路由根本不会被映射；携带 `skills` 的 OpenAI、Responses 或 Ollama 聊天请求会被以 HTTP 400（`Agent skills are disabled on this server (--no-skills).`）拒绝，而不是被静默忽略。环境变量：`TS_NO_SKILLS`（非 `0` 即视为开启）。 |
+| `--no-skills` | 关闭 Agent Skills：不向模型提供任何技能，`/v1/skills` 与 `/api/skills` 路由根本不会被映射；携带 `skills` 的 OpenAI、Responses 或 Ollama 聊天请求会被以 HTTP 400（`Agent skills are disabled on this server (--no-skills).`）拒绝，而不是被静默忽略。环境变量：`TS_NO_SKILLS`（非 `0` 即视为开启）。与 `--skills-dir`、`--skill`、`--skills-allow-exec` 或 `--skills-allow-network` 同时给出时启动会被拒绝；与 `--config` 文件中的条目冲突时以命令行一方为准，因此 `--skills-dir` 可以为关闭了技能的预设重新开启技能（见 `config/README.md`）。 |
 | `--skills-no-discovery` | 不向模型展示未被选中的技能，于是每个请求只看得到它自己点名的技能。按请求粒度可用 `"skills_discovery": false` 达到同样效果。 |
 | `--skills-allow-exec` | 允许 `skills_run`。**默认关闭。在共享服务器上，这就是一个远程代码执行入口**——技能是别人上传的内容，而决定要不要运行其中某个脚本的，是一个正在读同一个人写的 Markdown 的模型。脚本只经已知解释器直接运行，不经过 shell；工作目录是当前 Web 会话或私有 OpenAI/Ollama 请求工作区（未开启代码执行时为单次调用 scratch 目录），技能目录只读。默认的 required 沙箱在无法提供安全操作系统隔离时拒绝执行。环境变量：`TS_SKILLS_ALLOW_EXEC`（非 `0` 即视为开启）。 |
 | `--skills-max-rounds <n>` | 模型在必须作答前可以取用技能内容——或运行、查看并修正代码——的次数，范围 1-64（默认：`8`；开启 `--code-exec` 时为 `24`；此处显式设定的值按原样使用）。每一轮都是一次完整生成。环境变量：`TS_SKILLS_MAX_ROUNDS`。 |
@@ -779,6 +789,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--stop <string>` | 停止序列（可重复指定）。在默认的 `--sampling-precedence config` 下，请求体里的 `stop`/`stop_sequences` 会与这里的列表**合并**；在 `request` 下则完全替换。 |
 | `--sampling-precedence <config\|request>` | 当请求同时携带了你在上面配置过的采样参数时，以谁为准。`config`（默认）保留你的配置值 —— VS Code Copilot Chat 等客户端会把 `temperature`/`top_p` 硬编码进每一次请求，否则就会静默覆盖你的配置；你**没有**配置过的参数仍然取请求中的值。`request` 恢复“客户端优先”。环境变量：`TENSORSHARP_SAMPLING_PRECEDENCE`。 |
 | `--kv-cache-dtype <type>` | 托管模型的 KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（量化缓存以微小数值漂移换取内存节省；各档位的取舍见上文 CLI 参数表）。默认：自动 —— 由后端 / 模型决定。环境变量：`KV_CACHE_DTYPE`。 |
+| `--prompt-attention <path>` | `--backend cuda` 上 prompt 分块注意力的算术：`int8`（能运行处的默认；其他情况为 `f16`）、`f16`（之前默认的内核，逐位一致）或 `f32acc`（各自运行什么、在哪里可用，见上文 CLI 参数表）。`int8` 会改变 issue #376 质量门槛中少数长代码窗口的结果；`--prompt-attention f16` 保持之前的数值。decode、验证与草稿行保持 16 位内核。未知取值在启动时被拒绝。环境变量：`TS_PROMPT_ATTENTION`（命令行参数优先）。 |
 | `--continuous-batching` / `--no-continuous-batching` | 启用（默认）或关闭迭代级分页批处理。启用时服务会在批内动态加入 / 抢占序列，并在实现了 `IBatchedPagedModel` 的模型上将多个序列打包到一次前向中执行。`--no-continuous-batching` 会让所有模型回退到按序列 KV 交换。原先的第二种拼写 `--paged-batching` / `--no-paged-batching` 已移除，两个宿主都会在启动时拒绝（作为配置键也一样）。 |
 | `--no-webui` | 不提供内置 Web UI；`GET /` 改为返回纯文本存活探测。所有 HTTP API 端点（含 `/uploads`）照常可用。环境变量：`TS_NO_WEBUI` |
 | `--upload-max-mb <N>` | 客户端写入的单文件上限：multipart `/api/upload` 文件，以及从聊天或 Jev 请求中解码出的 base64 附件（默认：`500`）。`POST /api/upload` 的请求体上限跟随该值且不低于 500 MB，因此调大上限就能让更大的文件进来：先上传到那里，再按路径引用。其他路由保持 500 MB 的请求体上限；base64 编码后文件在线路上约增大三分之一，所以 JSON 请求中的附件无论上限多大，最多约 375 MB。环境变量：`TS_UPLOAD_MAX_MB`。 |
@@ -797,7 +808,8 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 
 请求 JSON 中的字段（如 `temperature`、`top_p`、`top_k`、`min_p`、
 `repeat_penalty`、`repeat_last_n`、`presence_penalty`、`frequency_penalty`、`seed`、
-`stop`/`stop_sequences`）会填充所有你**没有**在上面配置过的参数。对于你
+`stop`/`stop_sequences`）会填充所有你**没有**在上面配置过的参数。OpenAI 端点还接受 `ignore_eos`
+（定长基准测试：遇到结束 token 也继续生成直到 `max_tokens`；见 [API 参考](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#4-采样选项)）。对于你
 **已经**配置过的参数，默认的 `--sampling-precedence config` 保留你的取值
 并忽略请求中的值 —— 很多聊天客户端会把 `temperature`/`top_p` 硬编码进每一
 次调用，终端用户无从修改，因此只有服务端未配置的参数才应由请求决定。若需
@@ -837,7 +849,8 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 |---|---|
 | `BACKEND` | 未传 `--backend` 时使用的默认计算后端（`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan`；默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `MAX_TOKENS` | 未传 `--max-tokens` 时的最大生成长度：请求未携带上限时用它填充，请求要求更多时按它截断（默认：`20000`，该默认值只填充、不截断） |
-| `MAX_CONTEXT` | 要分配的上下文窗口，覆盖 GGUF 自报的长度。设了它就是**硬上限**：缓存加一整个 `n_ubatch` 的计算图装得下就照办，装不下就带着具体数字拒绝加载。不设时，自报长度只是**上界**——权重加载完之后运行时会去问各设备实际还剩多少显存，按能装下的大小定上下文，并把选中的值打印出来。GLM-5.2 自报 1,048,576 token（约 93 GiB 的 KV）；在 3x RTX PRO 6000 上按层切分选到 342,272，`--tp 3` 选到 91,136，`--n-cpu-moe 30` 选到 646,400。在 `--backend cuda` 上，共享解码运行时（其上的每个模型族：Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next、Mistral 3、Hunyuan Dense）加载时不分配窗口：每个请求都在按它自己大小创建的 slot 里运行，所以 `MAX_CONTEXT` 是单个请求能达到的最长上下文；除非设置了 `TS_KV_INITIAL_TOKENS`，主缓存从 1,024 个单元起步 |
+| `MAX_CONTEXT` | 要分配的上下文窗口，覆盖 GGUF 自报的长度。设了它就是**硬上限**：缓存加一整个 `n_ubatch` 的计算图装得下就照办，装不下就带着具体数字拒绝加载。不设时，自报长度只是**上界**——权重加载完之后运行时会去问各设备实际还剩多少显存，按能装下的大小定上下文，并把选中的值打印出来。GLM-5.2 自报 1,048,576 token（约 93 GiB 的 KV）；在 3x RTX PRO 6000 上按层切分选到 342,272，`--tp 3` 选到 91,136，`--n-cpu-moe 30` 选到 646,400。在 `--backend cuda` 上，共享解码运行时（其上的每个模型族：Qwen 3.5/3.6/3.8、Qwen 3.8 Flash Next、Mistral 3、Hunyuan Dense）加载时不分配窗口：每个请求都在按它自己大小创建的 slot 里运行，所以 `MAX_CONTEXT` 是单个请求能达到的最长上下文；主缓存从 1,024 个单元起步（`TS_KV_INITIAL_TOKENS` 只能让它更小，不能更大） |
+| `TENSORSHARP_CUDA_DEVICE_BUDGET_MB` | `--backend cuda`：容量检查与分配器可使用的显存（MB）。未设置时读取独占显存：NVML（存在时才加载）约束 cuMemGetInfo——在 Windows（WDDM）上后者的总量包含共享系统内存，空闲量只计本进程；在 Windows 上，会超出独占显存的分配会先交还缓存块和已结束的会话，而不是溢出到共享内存。在 Linux 上，除非设置了该值，这一保护不启用。缺少 NVML 或 GPU 与其他进程共用时，可设为略低于独占显存。详见[环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md)。 |
 | `VIDEO_SAMPLE_FPS` | 输入视频作为多模态提示词时每秒抽取的帧数；基于时间的抽帧（默认：`1`）。它与视频生成的输出参数 `--fps` 无关 |
 | `VIDEO_MAX_FRAMES` | 输入视频作为多模态提示词时抽取帧数的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制）。它与视频生成的输出参数 `--video-frames` 无关 |
 | `PORT` / `HOST` | 未传 `--port` / `--host` 时的监听端口与绑定网卡（默认：`5000`、`0.0.0.0`） |
@@ -2111,7 +2124,8 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
-| 工作线程池宽度（托管 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image 内核） | 8 核及以下取全部核心；8 核以上取一半，且不低于 8 | `TS_CPU_THREADS=N` | — |
+| 工作线程池宽度（托管 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image 内核） | 8 核及以下取全部核心；8 核以上取一半，且不低于 8；Apple 芯片（无 SMT）取全部核心 | `TS_CPU_THREADS=N` | — |
+| 解码规模步上的工作线程池宽度（权重乘积最多读 4 行激活的步：一条序列的一个 token，或一步里几条序列的 token） | 有性能核与能效核的 Mac（`hw.perflevel0` / `hw.perflevel1`）上取全部核心减二，且不少于性能核数（M5 Pro 上为 16）；其他平台取线程池宽度；只设置 `TS_CPU_THREADS` 时两个宽度都取它 | `TS_CPU_DECODE_THREADS=N` —— 超出这个宽度的工作线程挂起，直到较宽的步到来，这样进程里的其他线程（服务器的请求线程与流式输出线程）能找到空闲核心，而不必在任务进行中抢走某个池内线程的核心；输出不变。大于线程池宽度的值按线程池宽度处理；`TS_CPU_POOL=0`（没有线程池）时不起作用 | — |
 | 是否启用工作线程池 | 启用 | `TS_CPU_POOL=0` 让所有分派并行任务的托管内核——量化 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的 VAE、文本编码器与视觉塔（VAE 的宽度上限为 `TS_CPU_GEMM_THREADS`）——回退到 ThreadPool 的 `Parallel.For`，用于负担不起自旋线程的主机，也便于在同一个二进制里做 A/B；结果不变。Direct 视频网络的行循环仍在线程池上 | — |
 | 工作线程挂起前的自旋次数 | `4096` | `TS_CPU_SPIN=N` —— 在这个宽度下挂起才是最贵的部分，所以默认自旋次数足够多，使稳态下根本不会挂起 | — |
 | 单次托管矩阵乘的任务切分 | 每个工作项 `131072` 字节权重，每个线程最多 `4` 个工作项 | `TS_CPU_TASK_BYTES`、`TS_CPU_TASKS_PER_WORKER` —— 按**工作量**而不是线程数来切 | — |
@@ -2219,7 +2233,7 @@ CLI 没有子智能体。参见 [Web 应用](#web-应用)一节中的子智能�
 | Jev 端点限制（`POST /v1/systemone`） | 8 MiB 请求体、64 token 画布、同时接纳 32 个请求 | `TS_JEV_MAX_BODY_MB`、`TS_JEV_MAX_CANVAS`、`TS_JEV_MAX_PENDING` |
 | 文本 LoRA 适配器目录（启动时加载 + `POST /v1/loras`，最多 32 个适配器） | 未设置：没有适配器，`POST /v1/loras` 返回 403 | `TS_LORAS_DIR`（`--loras-dir` 优先） |
 | 文本及原生数字 PDF 上传 | 保留全部提取内容；最终渲染的提示词必须能放入已加载模型的上下文 | — |
-| 视频帧抽取 | 1 fps（基于时间，不限制）。OpenAI 的 `video_url` part（DeepSeek V4.1、Qwen 3.8 Flash Next）可自带 `fps` / `max_frames`，`VIDEO_MAX_FRAMES` 未设置时上限 16 帧；Qwen 3.8 把采样到的帧两两合并并使用 Qwen-VL 时间轴坐标（见[模型卡](docs/models/qwen38-flash-next_zh-cn.md#视频输入)） | `VIDEO_SAMPLE_FPS`、`VIDEO_MAX_FRAMES` |
+| 视频帧抽取 | 1 fps（基于时间，不限制）。OpenAI 的 `video_url` part（DeepSeek V4.1、Qwen 3.8 Flash Next）可自带 `fps` / `max_frames`，`VIDEO_MAX_FRAMES` 未设置时上限 16 帧；Qwen 3.8 把采样到的帧两两合并并使用 Qwen-VL 时间轴坐标（见[模型卡](docs/models/qwen38-flash-next_zh-cn.md#视频输入)）。LFM3-Omni 自行读取视频文件（`--video`、`video_url`、Web UI 的 `videoFilePaths`）：不论这些设置如何，都以 2 fps 抽帧并带音轨（见[模型卡](docs/models/lfm3_zh-cn.md#媒体输入)） | `VIDEO_SAMPLE_FPS`、`VIDEO_MAX_FRAMES` |
 | DiffusionGemma Web UI 去噪 | 48 步，最大 batch 2 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH` |
 
 #### 日志（服务端 + CLI）
@@ -2705,6 +2719,59 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
   针对真实的 Application Insights 资源做同样的检查：它用 Azure CLI 读取连接串，从不把连接串写到任何地方，并持续
   查询该资源直到数据到达（[运行方法](eng/telemetry/README.md)，英文）。两者都把证据写入被 git 忽略的
   `docs/validation/`。
+
+## 语音输出（LFM3-Omni）
+
+LFM3-Omni 在加载其 mmproj（`--mmproj mmproj-LFM3-Omni-2B-*.gguf`，其中的 `a.gen.*` 即 depthformer 与
+LiquidCodec 解码器）后即可说话。语音回复与文本运行在同一个连续批处理引擎上：每个 80 ms 的语音帧是一次解码步骤，
+输入是上一帧的嵌入行，输出是 LM 的最终隐藏行（该步没有请求需要 logits 时不运行 LM head），因此语音请求与文本请求
+在同一批中执行。
+
+| 入口 | 作用 |
+|---|---|
+| CLI `--tts` | 用 GGUF 的 `tts` 模板朗读 `--prompt`，写入 `--output`（WAV，24 kHz 单声道 16 位）。会说话的对话模型只有加 `--tts` 才做语音合成。 |
+| CLI `--speech-out FILE` | 单次提示的对话回复也说出来；`--speech-mode interleaved`（默认：6 个文本 token，然后 12 帧，……；文本即语音的转写）或 `audio`。 |
+| CLI `--speech-temperature T` | 语音编码的温度（默认取 mmproj 的 0.4）；文本仍用 `--temperature`。 |
+| CLI `--voice female\|male`、`--language CODE`、`--seed N` | 写入系统提示的音色与语言（语言默认为文本所用的语言，见下文）；语音采样器的种子。 |
+| `POST /v1/audio/speech` | `input`、`voice`（`female`/`male`；其他值，包括 OpenAI 默认的 `alloy`，返回 400 并列出可用音色）、`language`（默认为 `input` 所用的语言）、`response_format` `wav`/`pcm`/`pcm16`、`stream: true`（分块；WAV 流以未知长度头开头）或 `stream_format: "audio"`/`"sse"`、`seed`、`temperature`、`max_frames`。`speed` 不为 1 时返回 400。 |
+| `POST /v1/chat/completions`、`POST /v1/responses` | `"modalities": ["text","audio"]`（交错：文本即转写；对话模式）或 `["audio"]`（纯语音，以 `<|audio_start|>` 开始：LFM3-Omni 会朗读用户的消息而不是回答，与 llama.cpp 相同），配合 `"audio": {"voice": "female", "format": "wav"\|"pcm16"}`（TensorSharp 还读取其中的 `language`、`seed`、`temperature`）。非流式：`message.audio = {id, expires_at, data, transcript}`；流式（仅 pcm16）：`delta.audio` 先发 `id`，再按顺序发 `transcript` 与 `data` 片段，最后是 `expires_at`。一小时内把回复以 `{"role":"assistant","audio":{"id":...}}` 发回，会按其转写渲染。在 chat completions 上，语音请求可以带 `tools`、推理（`think`）、技能和知识库：它就是该请求的文本补全，并把其内容说出来（见下文“语音轮次就是文本轮次”）；带 `tool_calls` 的回复照常返回工具调用，有内容时再附上内容的 `message.audio`。音频与 `response_format` 同用会返回 400。Responses 的音频请求仍拒绝 `tools`、推理、技能与知识库（400）。 |
+| `GET /v1/models` | 会说话的模型列出 `"capabilities": ["chat","audio_output"]` 及其音色。 |
+| `POST /api/chat`（Web UI、TensorAgent） | `"speech": true` 或 `{"voice": ..., "language": ...}`：该请求不带语音时的轮次照常运行（推理、技能、工具、代码执行、知识库、子代理以及每一轮，帧也相同），其回答边写边说，语音在夹于其他帧之间的 `audio` 帧中（base64 PCM16，采样率为 `sampleRate`），`done` 帧带有 `audioId`、`audioUrl`（整个轮次的 WAV，位于 `/uploads/`）和 `audioSeconds`。`GET /api/models` 报告 `speechOutput: {available, voices, reason}`；页面只在其可用时显示 **Speak replies** 开关，边生成边播放，并保留播放器与下载链接。见 [API_EXAMPLES_zh-cn.md → 语音回复](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#语音回复speechlfm3-omni)。 |
+
+**语言。** LFM3-Omni 的交错模式与纯语音模式只会说英语；它的 TTS 能说 ar、da、de、el、en（en-us、en-gb）、es、fi、fr、
+he、it、ja、ko、nl、pl、pt、sv、tr 与 zh。语音回复的语言取请求中的 `language`（`speech.language`、`audio.language`、
+`--language`），否则取用户最近一条消息所用的语言（按文字判断：汉字为 zh，假名为 ja，谚文为 ko，以及阿拉伯文、希伯来文、
+希腊文；拉丁字母则用默认的英语）。Web 聊天的回复，以及除普通英文 chat completions 之外的所有回复，都按普通文本回复生成，
+每句话一完成就由 TTS 提示说出，同时其余文本仍在生成（markdown、表情符号与代码不会朗读）。拉丁字母书写的非英语语言（`fr`、`de`、`es` 等）
+或语音提问时请指定 `language`。未指定语言的 TTS 说文本所用的语言，并把中文文本中的数字读出来（`2024年10月1日` 读作
+二零二四年十月一日），英文文本中的数字及其间的运算符号也读成英文单词（`42,925` 读作 forty-two thousand nine hundred
+twenty-five，`37 × 43 = 1591` 读作 thirty-seven times forty-three equals one thousand five hundred ninety-one）。
+
+**语音轮次就是文本轮次。** 在 `/api/chat` 与 `/v1/chat/completions` 上，语音请求运行的内容与不带语音的同一请求完全相同：
+推理（`think`）、指定的技能以及主机可供发现的技能目录、客户端的工具、主机的代码工具（`--code-exec`：`shell`、`read_file`、
+`write_file`、`apply_patch`）、知识库、子代理，以及工具循环的每一轮，帧也相同。模型的 TTS 提示在同一引擎上与生成并行，
+逐句说出每一轮边写边出的回答文本：工具调用之前的文字在调用开始时就说出（因此工具运行时语音仍在继续），推理、工具调用与
+工具结果从不朗读。不朗读的内容：代码块、表格行、表情符号与 markdown 标记、主机写在回答中的说明（`_(...)_`）、40 个字符
+及以上的行内代码；URL 读作其主机名（`docs.python.org`），三段及以上的路径读作最后一段（`/Users/me/out/result.csv` 读作
+`result.csv`）。该轮次保留一个涵盖其全部语音的 WAV 与 `audioId`，下一轮像文本轮次一样复用其前缀（包括工具轮）。语音失败时
+文本轮次照常完成，并以一个 `notice` 帧（`code` 为 `speech_failed`）说明。在 `/api/chat` 上，每个语音轮次（任何语言）都由
+文本说出，因此其提示就是文本轮次的提示（系统提示中没有语音说明），在对话中途打开或关闭 **Speak replies** 仍能复用已缓存的
+前缀。在 `/v1/chat/completions` 上，若文本补全是普通的英文回复（无推理、无客户端或主机的工具、无技能、无知识库），仍是一次
+交错生成文本与语音的驱动生成（首段音频只需几十毫秒）；主机的技能目录、`--code-exec` 与子代理（默认开启）会让每个补全都带
+工具，此时同样由文本说出。
+
+LFM3-Omni 的文本回复永不采样媒体占位符，纯文本回复也不会开启语音（禁止 `<|audio_start|>`、`<|mixed_start|>`），
+与模型卡中 `generate` 的做法一致。按其 id 送回的语音助手回合（`/v1/chat/completions` 上的 `audio.id`，`/api/chat` 上的
+`audioId`，保留一小时）按生成时解码的样子拼回；语音回复的结束状态会被保留，其每段连续帧以编码为键，因此下一个语音回合
+能跨越它复用缓存的提示。未知的 id 按其转写渲染。见 [docs/models/lfm3_zh-cn.md](docs/models/lfm3_zh-cn.md#语音输出)。
+
+```bash
+curl http://localhost:5000/v1/audio/speech -H "content-type: application/json" \
+  -d '{"model":"LFM3-Omni-2B-Q4_K_M","input":"你好。","voice":"female","language":"zh","seed":1234}' -o hello.wav
+curl http://localhost:5000/v1/chat/completions -H "content-type: application/json" \
+  -d '{"model":"LFM3-Omni-2B-Q4_K_M","messages":[{"role":"user","content":"法国的首都是哪里？"}],
+       "modalities":["text","audio"],"audio":{"voice":"female","format":"wav"}}'
+```
 
 ## HTTP API
 

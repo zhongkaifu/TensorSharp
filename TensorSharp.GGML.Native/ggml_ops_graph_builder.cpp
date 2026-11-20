@@ -25,6 +25,7 @@
 
 #include "ggml_ops_internal.h"
 #include "ggml_ops_bonsai.h"
+#include "ggml_ops_cpu_graph.h"
 #include "ggml_ops_graph_optimize.h"
 #include "ggml_ops_transformer_common.h"
 #include "ggml_ops_precision_policy.h"
@@ -34,6 +35,7 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -97,7 +99,7 @@ namespace
         OP_CPY = 33,            // copy a into b; the result views b
         OP_SET_ROWS = 34,       // srcs: dst, src, row ids; the result views dst
         OP_ROPE_EXT = 35,       // srcs: x, positions, [freq factors]; ip: n_dims, mode, n_ctx_orig; fp: base, freq_scale, ext, attn, beta_fast, beta_slow
-        OP_FLASH_ATTN_EXT = 36, // srcs: q, k, v, [mask], [sinks]; fp: scale, max_bias, softcap; ip: [acc precision, n_kv max, rows kind (GraphAttentionRows: a hint for TensorSharp executors, ignored here)]
+        OP_FLASH_ATTN_EXT = 36, // srcs: q, k, v, [mask], [sinks]; fp: scale, max_bias, softcap; ip: [acc precision, n_kv max, rows kind, sliding-window band (GraphAttentionRows: hints for TensorSharp executors, ignored here)]
         OP_SOFT_MAX_EXT = 37,   // srcs: x, [mask]; fp: scale, max_bias
         OP_ARGSORT = 38,        // ip: order (0 asc, 1 desc)
         OP_TOP_K = 39,          // ip: k
@@ -122,6 +124,8 @@ namespace
         OP_ALLREDUCE = 57,      // srcs: a tensor-parallel partial; summed in place across the ranks (TSGgml_GraphRunRanked)
         OP_CONV_2D = 58,        // srcs: kernel [KW, KH, IC, OC] (F32/F16), x [W, H, IC, N]; ip: s0, s1, p0, p1, d0, d1 (ggml_conv_2d)
         OP_PAD_REFLECT_1D = 59, // srcs: x (F32, contiguous); ip: p0, p1
+        OP_DEPTHWISE_CONV_2D = 70, // srcs: x [C, W, H, N] (channels innermost), kernel [KW, KH, 1, C]; ip: s0, s1, p0, p1, d0, d1
+        OP_GELU_ERF = 71,       // 0.5 x (1 + erf(x / sqrt 2))
     };
 
     struct Leaf
@@ -132,6 +136,7 @@ namespace
         int role;
         bool uploaded;   // bound to compute memory: uploaded every run (and downloaded after, for STATE)
         bool host_only = false;                        // read from host memory at a host-expert pause, never bound
+        bool repacked = false;                         // ggml-cpu: bound to its CPU_REPACK copy (ggml_ops_cpu_graph.h)
         bool has_split = false;                        // tensor parallelism: how the leaf spreads over the ranks
         ggml_backend_meta_split_state split{};
     };
@@ -142,6 +147,33 @@ namespace
         void* data;
         std::size_t bytes;
     };
+
+    // A greedy head (OP_TOP_K with ip[1] = 1: GraphCapabilities.GreedyIdOutputs): each row's largest logit, a tie to the
+    // lowest id, written to the head's output as the id's F32 value - the host's argmax exactly (TokenSampler's ordered '>'
+    // scan from the row's first value). ggml's top-k and argmax break ties in no defined order (ggml-cuda's argmax takes
+    // any lane of a warp's maxima), so the device gives each row's kGreedyCandidates largest logits with their ids and the
+    // row's sum, and the host takes the largest candidate of the lowest id. That is the argmax unless every candidate ties
+    // the largest (another logit of that value may lie outside them) or the row holds a NaN or an infinity (its sum is not
+    // finite; the host scan's NaN rule picks by position): such a row reads its logits and is scanned as the host scans.
+    constexpr int kGreedyCandidates = 8;
+
+    struct GreedyHead
+    {
+        ggml_tensor* logits = nullptr;   // [vocab, rows] F32: kept to the end of the run for a row's full read
+        ggml_tensor* mask = nullptr;     // [vocab] F32, -0 kept / -inf suppressed, added before the pick (null: none)
+        ggml_tensor* ids = nullptr;      // [k, rows] I32: ggml_top_k (in no particular order)
+        ggml_tensor* values = nullptr;   // [1, k, rows] F32: the logits at those ids
+        ggml_tensor* sums = nullptr;     // [1, rows] F32: each row's raw sum (finite iff every logit is)
+        ggml_tensor* result = nullptr;   // the node the program reads (its output takes the ids below instead)
+        std::int64_t vocab = 0, rows = 0;
+        int k = 0;
+        float* out = nullptr;            // the output's host floats: one id a row
+        std::vector<std::int32_t> host_ids;
+        std::vector<float> host_values, host_sums, row, host_mask;
+    };
+
+    // Rows whose greedy id was read from their full logits (a tie of every candidate, or a NaN or infinity), for tests.
+    std::atomic<std::int64_t> g_greedy_full_rows{0};
 
     // ---- tensor parallelism: a graph on ggml's meta device over several ranks (upstream's
     // tensor-split mechanism). Weights and states live in meta buffers, spread by the split state
@@ -404,6 +436,13 @@ namespace
         std::vector<ggml_tensor*> nodes;
         std::vector<Leaf> leaves;
         std::vector<Output> outputs;
+        std::vector<GreedyHead> greedy;
+        // Discrete GPUs: the inputs every run uploads, in one device buffer of the graph's own (pack_run_inputs), and the
+        // pinned host block a run fills and sends in one copy; by tensor, each input's offset in both.
+        std::unordered_map<const ggml_tensor*, std::size_t> packed;
+        ggml_tensor* packed_span = nullptr;   // I8 over the whole device buffer
+        std::uint8_t* packed_stage = nullptr;
+        std::vector<std::uint8_t> packed_stage_pageable;   // where the device has no pinned host buffers
         std::vector<ggml_tensor*> effects;
         std::vector<BufferHandle> ephemeral;
         struct Alias { ggml_tensor* node; ggml_tensor* base; std::size_t offset; ggml_tensor* fallback; };
@@ -450,6 +489,10 @@ namespace
         int hc_last_role = -1;
         // Bonsai2 PRISM: the rotated activation each (input, transform) products share (see weight_product).
         tsg::BonsaiMemo bonsai;
+        // ggml-cpu: the repacked weight copies this graph's leaves are bound to (kept alive while it lives), and the most
+        // activation rows any weight product reads (which thread pool runs the graph).
+        std::vector<tsg::CpuRepackedRef> repacked;
+        std::int64_t product_rows = 0;
 
         ~TsgGraph()
         {
@@ -512,6 +555,13 @@ namespace
             if (Leaf* leaf = leaf_of(g, base); leaf != nullptr && leaf->role == LEAF_WEIGHT && leaf->data != nullptr
                 && tsg::bonsai_weight_has_transform(leaf->data))
                 return tsg::bonsai_mul_mat_memo(g->ctx, w, x, leaf->data, g->bonsai);
+        }
+        // ggml-cpu: weights it has no fast kernel for here (BF16 on ARM64; BF16 and NVFP4 prompt products on Apple).
+        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU)
+        {
+            const ggml_tensor* base = w->view_src != nullptr ? w->view_src : w;
+            if (Leaf* leaf = leaf_of(g, base); leaf != nullptr && leaf->role == LEAF_WEIGHT)
+                if (ggml_tensor* r = tsg::cpu_weight_product(g->ctx, w, x)) return r;
         }
         return ggml_mul_mat(g->ctx, w, x);
     }
@@ -681,6 +731,149 @@ namespace
 #endif
     }
 
+    // A depthwise 2-D convolution of rows of channels x [C, W, H, N] (the IR's token layout) with ggml's depthwise kernel
+    // [KW, KH, 1, C]: ggml_conv_2d_dw_direct on x viewed channels-innermost (CWHN: a permute, no copy) with the kernel laid
+    // out channels-innermost too (a copy of KW * KH * C values, which ggml-cpu's and ggml-cuda's CWHN kernels index that
+    // way), whose result comes back CWHN and, permuted to [C, OW, OH, N], is contiguous. A shape ggml's CWHN kernels do not
+    // take (one channel, or one column: not "contiguous channels") runs the same convolution WHCN, through two copies.
+    ggml_tensor* depthwise_conv_2d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* k, int s0, int s1, int p0, int p1, int d0, int d1)
+    {
+        const std::int64_t C = x->ne[0], KW = k->ne[0], KH = k->ne[1];
+        if (ggml_nelements(k) != KW * KH * C)
+            throw std::runtime_error("graph builder: a depthwise conv kernel holds KW x KH values a channel");
+        if (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16)
+            throw std::runtime_error("graph builder: a depthwise conv kernel is F32 or F16");
+        if (x->type != GGML_TYPE_F32) throw std::runtime_error("graph builder: a depthwise conv reads F32 rows");
+        if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+        if (!ggml_is_contiguous(k)) k = ggml_cont(ctx, k);
+        ggml_tensor* xw = ggml_permute(ctx, x, 2, 0, 1, 3);                     // [W, H, C, N], channels innermost
+        ggml_tensor* k4 = ggml_reshape_4d(ctx, k, KW, KH, 1, C);
+        if (ggml_is_contiguous_channels(xw))
+        {
+            ggml_tensor* kc = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, k4, KW * KH, C)));   // [C, KW * KH]
+            const std::size_t es = ggml_element_size(kc);
+            // [KW, KH, 1, C] over that memory: ne2's stride (one element) is what makes it "CWHN" to ggml-cpu's check.
+            ggml_tensor* kv = ggml_view_4d(ctx, kc, C, KW, KH, 1, C * es, C * KW * es, es, 0);
+            ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, ggml_permute(ctx, kv, 3, 0, 1, 2), xw, s0, s1, p0, p1, d0, d1);
+            return ggml_permute(ctx, r, 1, 2, 0, 3);                            // [C, OW, OH, N], contiguous
+        }
+        ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, k4, ggml_cont(ctx, xw), s0, s1, p0, p1, d0, d1);
+        return ggml_cont(ctx, ggml_permute(ctx, r, 1, 2, 0, 3));
+    }
+
+    // A greedy head over x [vocab, rows] F32 (see GreedyHead): the candidates' ids and logits and each row's sum, kept for
+    // the run's end; the program's node is a view of the ids (its output receives the resolved ids instead of its bytes).
+    ggml_tensor* greedy_head(TsgGraph* g, ggml_tensor* x, ggml_tensor* mask)
+    {
+        if (g->tp != nullptr) throw std::runtime_error("graph builder: a greedy head runs on one device's graph");
+        if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] < 1)
+            throw std::runtime_error("graph builder: a greedy head reads contiguous F32 rows [vocab, rows]");
+        if (x->ne[0] > (std::int64_t{1} << 24))
+            throw std::runtime_error("graph builder: a greedy head's ids are F32 values, exact below 2^24");
+        GreedyHead h;
+        h.vocab = x->ne[0];
+        h.rows = x->ne[1];
+        h.k = static_cast<int>(std::min<std::int64_t>(kGreedyCandidates, h.vocab));
+        h.logits = x;
+        // Suppressed tokens: the mask's -inf added (its -0 adds nothing, signed zeros included). The row's sum is the raw
+        // logits' (the masked row always holds the mask's -inf), so a NaN or an infinity anywhere, a suppressed one
+        // included, reads the row in full, where the mask is applied as the host applies it (assigned).
+        ggml_tensor* picked = x;
+        if (mask != nullptr)
+        {
+            if (mask->type != GGML_TYPE_F32 || ggml_nelements(mask) != h.vocab || !ggml_is_contiguous(mask))
+                throw std::runtime_error("graph builder: a greedy head's mask is F32 [vocab]");
+            h.mask = mask;
+            picked = ggml_add(g->ctx, x, ggml_reshape_2d(g->ctx, mask, h.vocab, 1));
+        }
+        h.ids = ggml_top_k(g->ctx, picked, h.k);
+        h.values = ggml_get_rows(g->ctx, ggml_reshape_3d(g->ctx, picked, 1, h.vocab, h.rows), h.ids);
+        h.sums = ggml_sum_rows(g->ctx, x);
+        h.result = ggml_view_2d(g->ctx, h.ids, 1, h.rows, h.ids->nb[1], 0);
+        g->greedy.push_back(std::move(h));
+        return g->greedy.back().result;
+    }
+
+    // The greedy head (if any) whose result `t` is or copies (the program's Cont of it).
+    GreedyHead* greedy_head_of(TsgGraph* g, const ggml_tensor* t)
+    {
+        for (GreedyHead& h : g->greedy)
+            if (t == h.result || (t->op == GGML_OP_CONT && t->src[0] == h.result)) return &h;
+        return nullptr;
+    }
+
+    // The host's argmax of one row (TokenSampler.ArgmaxScalar): the first value no later value exceeds, so a leading NaN
+    // is never replaced and later NaNs are never taken.
+    std::int64_t host_row_argmax(const float* v, std::int64_t n)
+    {
+        std::int64_t best = 0;
+        float best_value = v[0];
+        for (std::int64_t i = 1; i < n; i++)
+            if (v[i] > best_value)
+            {
+                best_value = v[i];
+                best = i;
+            }
+        return best;
+    }
+
+    // After a run (the device synchronized, the candidates downloaded): each greedy head's rows to their ids.
+    void resolve_greedy_heads(TsgGraph* g, bool download)
+    {
+        for (GreedyHead& h : g->greedy)
+        {
+            if (h.out == nullptr) continue;
+            h.host_mask.clear();   // this run's mask (an input), read only for a row read in full
+            const std::size_t k = static_cast<std::size_t>(h.k), rows = static_cast<std::size_t>(h.rows);
+            if (download)
+            {
+                ggml_backend_tensor_get(h.ids, h.host_ids.data(), 0, h.host_ids.size() * sizeof(std::int32_t));
+                ggml_backend_tensor_get(h.values, h.host_values.data(), 0, h.host_values.size() * sizeof(float));
+                ggml_backend_tensor_get(h.sums, h.host_sums.data(), 0, h.host_sums.size() * sizeof(float));
+            }
+            for (std::size_t r = 0; r < rows; r++)
+            {
+                const std::int32_t* ids = h.host_ids.data() + r * k;
+                const float* values = h.host_values.data() + r * k;
+                std::int64_t id = -1;
+                if (std::isfinite(h.host_sums[r]))
+                {
+                    float best = values[0];
+                    for (std::size_t c = 1; c < k; c++) best = std::max(best, values[c]);
+                    std::size_t ties = 0;
+                    for (std::size_t c = 0; c < k; c++)
+                        if (values[c] == best)
+                        {
+                            ties++;
+                            if (id < 0 || ids[c] < id) id = ids[c];
+                        }
+                    // Every candidate ties the largest: a logit of that value may lie outside them (unless they are the row).
+                    if (ties == k && static_cast<std::int64_t>(k) < h.vocab) id = -1;
+                }
+                if (id < 0 || id >= h.vocab)
+                {
+                    h.row.resize(static_cast<std::size_t>(h.vocab));
+                    ggml_backend_tensor_get(h.logits, h.row.data(), r * static_cast<std::size_t>(h.vocab) * sizeof(float),
+                                            static_cast<std::size_t>(h.vocab) * sizeof(float));
+                    if (h.mask != nullptr)
+                    {
+                        // TokenSampler's suppression: the suppressed logits set to -inf.
+                        if (h.host_mask.empty())
+                        {
+                            h.host_mask.resize(static_cast<std::size_t>(h.vocab));
+                            ggml_backend_tensor_get(h.mask, h.host_mask.data(), 0, h.host_mask.size() * sizeof(float));
+                        }
+                        for (std::size_t i = 0; i < h.row.size(); i++)
+                            if (h.host_mask[i] == -INFINITY) h.row[i] = -INFINITY;
+                    }
+                    id = host_row_argmax(h.row.data(), h.vocab);
+                    g_greedy_full_rows.fetch_add(1, std::memory_order_relaxed);
+                }
+                h.out[r] = static_cast<float>(id);
+            }
+        }
+    }
+
     ggml_tensor* build_op(TsgGraph* g, int op, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
     {
         ggml_context* ctx = g->ctx;
@@ -694,7 +887,14 @@ namespace
         case OP_GET_ROWS: need(2); return ggml_get_rows(ctx, src(0), src(1));
         case OP_ADD: need(2); return ggml_add(ctx, src(0), src(1));
         case OP_SUB: need(2); return ggml_sub(ctx, src(0), src(1));
-        case OP_MUL: need(2); return ggml_mul(ctx, src(0), src(1));
+        case OP_MUL:
+            need(2);
+            // A square (both operands one node) as SQR on Vulkan: ggml-vulkan fuses a UNARY followed by a MUL of its result
+            // (ggml_vk_can_fuse_unary_mul at d9fe7bf) and takes the MUL's other operand from memory; when that operand is the
+            // unary's own result, which the fused kernel never writes, it multiplies by whatever that memory held (silu(x)^2
+            // came out 0.3 off: NetworkGraphTests unary_squared). SQR computes the same products and fuses with nothing.
+            if (g_backend_type == BACKEND_TYPE_VULKAN && s[0] == s[1]) return ggml_sqr(ctx, src(0));
+            return ggml_mul(ctx, src(0), src(1));
         case OP_DIV: need(2); return ggml_div(ctx, src(0), src(1));
         case OP_SCALE:
             need(1);
@@ -820,7 +1020,11 @@ namespace
         case OP_ARGSORT: need(1); return ggml_argsort(ctx, src(0), ipar(0, 0) == 0 ? GGML_SORT_ORDER_ASC : GGML_SORT_ORDER_DESC);
         // Descending, as the IR defines it (ggml_top_k's are in no particular order): a route's position is its rank
         // to the host seams' route-tail skip, and argsort + view is the chain ggml-metal's top-k MoE fusion matches.
-        case OP_TOP_K: need(1); return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
+        // ip[1] = 1: a greedy head (GreedyHead), its ids read back as F32 values.
+        case OP_TOP_K:
+            need(1);
+            if (ipar(1, 0) == 1) return greedy_head(g, src(0), ns > 1 ? src(1) : nullptr);
+            return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
         case OP_SUM_ROWS: need(1); return ggml_sum_rows(ctx, src(0));
         case OP_LIGHTNING_INDEXER:
         {
@@ -883,6 +1087,12 @@ namespace
         case OP_ARGMAX: need(1); return ggml_argmax(ctx, src(0));
         case OP_SWIGLU: need(1); return ggml_swiglu(ctx, src(0));
         case OP_GEGLU: need(1); return ggml_geglu(ctx, src(0));
+        case OP_GELU_ERF: need(1); return ggml_gelu_erf(ctx, src(0));
+        case OP_DEPTHWISE_CONV_2D:
+            need(2);
+            return depthwise_conv_2d(ctx, src(0), src(1), static_cast<int>(ipar(0, 1)), static_cast<int>(ipar(1, 1)),
+                                     static_cast<int>(ipar(2, 0)), static_cast<int>(ipar(3, 0)), static_cast<int>(ipar(4, 1)),
+                                     static_cast<int>(ipar(5, 1)));
         case OP_KV_WINDOW:
         {
             need(1);
@@ -1471,7 +1681,7 @@ namespace
         }
         if (w->type != GGML_TYPE_F32) U = ggml_cpy(ctx, U, ggml_new_tensor_2d(ctx, w->type, R, N));
         ggml_tensor* shrunk = ggml_mul_mat(ctx, D, x);   // [R, T]
-        ggml_mul_mat_set_prec(shrunk, GGML_PREC_F32);
+        ggml_prec_set_acc(shrunk, GGML_PREC_F32);
         ggml_tensor* y = ggml_mul_mat(ctx, ggml_concat(ctx, w, U, 0), ggml_concat(ctx, x, shrunk, 0));
         results = { y };
         return true;
@@ -1716,7 +1926,101 @@ namespace
                     throw std::runtime_error("graph builder: binding a device operation's operand failed");
     }
 
+    // ggml-cpu (ggml_ops_cpu_graph.h): weights only products read go into its repacked layout, and the graph's widest
+    // weight product picks the thread pool that runs it.
+    void bind_cpu_weights(TsgGraph* g)
+    {
+        std::vector<tsg::CpuWeightLeaf> weights;
+        std::vector<Leaf*> of;
+        for (Leaf& leaf : g->leaves)
+        {
+            if (leaf.role != LEAF_WEIGHT || leaf.data == nullptr || leaf.host_only) continue;
+            weights.push_back({ leaf.tensor, leaf.data, resolve_upload_source(leaf.data) });
+            of.push_back(&leaf);
+        }
+        std::vector<char> bound;
+        g->repacked = tsg::cpu_repack_bind(g->graph, weights, bound);
+        for (std::size_t i = 0; i < of.size(); i++)
+            of[i]->repacked = bound[i] != 0;
+
+        // A weight product: ggml's MUL_MAT / MUL_MAT_ID of a weight (or a row block of one), or TensorSharp's product of
+        // one (tsg::cpu_weight_product: a custom op over the weight, or over its F32 conversion, and the activations).
+        std::unordered_map<const ggml_tensor*, int> is_weight;
+        for (const tsg::CpuWeightLeaf& w : weights) is_weight[w.tensor] = 1;
+        auto weight_operand = [&](const ggml_tensor* t) {
+            if (t != nullptr && t->op == GGML_OP_CUSTOM) t = t->src[0];
+            if (t != nullptr && t->view_src != nullptr) t = t->view_src;
+            return t != nullptr && is_weight.find(t) != is_weight.end();
+        };
+        g->product_rows = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(g->graph); i++)
+        {
+            const ggml_tensor* node = ggml_graph_node(g->graph, i);
+            if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_CUSTOM) continue;
+            const ggml_tensor* x = node->src[1];
+            if (x == nullptr || !weight_operand(node->src[0])) continue;
+            const std::int64_t rows = node->op == GGML_OP_MUL_MAT_ID ? x->ne[2] * x->ne[3] : x->ne[1] * x->ne[2] * x->ne[3];
+            g->product_rows = std::max(g->product_rows, rows);
+        }
+    }
+
     // Bind the leaves, then let the graph's own allocator place every other tensor.
+    // A graph that replays on a discrete GPU (CUDA, Vulkan) keeps the inputs every run uploads (INPUT leaves in compute
+    // memory that the graph reads) in one device buffer of its own, outside the allocator, and each run copies their host
+    // bytes into one pinned block and sends it in one copy (upload_run_inputs): each input had been its own synchronous
+    // copy, 515 of them, each waited on with the device idle, in a 64-sequence LFM3-1.7B decode step (B0 census, A40). The
+    // device bytes are the same. One-shot graphs (prompt chunks: a few inputs) keep the allocator's memory.
+    void pack_run_inputs(TsgGraph* g)
+    {
+        if (g->tp != nullptr || !g->replayable || (g_backend_type != BACKEND_TYPE_CUDA && g_backend_type != BACKEND_TYPE_VULKAN))
+            return;
+        std::unordered_map<const ggml_tensor*, bool> read;
+        for (int i = 0; i < g->graph->n_leafs; i++) read[g->graph->leafs[i]] = true;
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(graph_backend(g));
+        const std::size_t align = std::max<std::size_t>(ggml_backend_buft_get_alignment(buft), 16);
+        std::vector<std::pair<ggml_tensor*, std::size_t>> placed;
+        std::size_t total = 0;
+        for (const Leaf& leaf : g->leaves)
+        {
+            ggml_tensor* t = leaf.tensor;
+            if (leaf.role != LEAF_INPUT || !leaf.uploaded || leaf.host_only || t->buffer != nullptr || t->data != nullptr
+                || t->view_src != nullptr || read.count(t) == 0)
+                continue;
+            total = (total + align - 1) / align * align;
+            placed.emplace_back(t, total);
+            total += ggml_backend_buft_get_alloc_size(buft, t);
+        }
+        if (placed.size() < 2) return;
+        total = (total + align - 1) / align * align;
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
+        if (buf == nullptr) return;   // the allocator's memory, as before
+        g->ephemeral.emplace_back(buf);
+        char* base = static_cast<char*>(ggml_backend_buffer_get_base(buf));
+        g->packed_span = ggml_new_tensor_1d(g->ctx, GGML_TYPE_I8, static_cast<std::int64_t>(total));
+        if (g->packed_span == nullptr || ggml_backend_tensor_alloc(buf, g->packed_span, base) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("graph builder: binding the packed inputs failed");
+        for (const auto& [t, offset] : placed)
+        {
+            if (ggml_backend_tensor_alloc(buf, t, base + offset) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("graph builder: binding a packed input failed");
+            g->packed[t] = offset;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(graph_backend(g));
+        ggml_backend_buffer_type_t host = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        ggml_backend_buffer_t stage = host != nullptr ? ggml_backend_buft_alloc_buffer(host, total) : nullptr;
+        if (stage != nullptr)
+        {
+            g->ephemeral.emplace_back(stage);
+            g->packed_stage = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(stage));
+            std::memset(g->packed_stage, 0, total);
+        }
+        else
+        {
+            g->packed_stage_pageable.assign(total, 0);
+            g->packed_stage = g->packed_stage_pageable.data();
+        }
+    }
+
     bool build(TsgGraph* g)
     {
         g->graph = ggml_new_graph_custom(g->ctx, graph_slots(g->max_nodes), false);
@@ -1749,6 +2053,12 @@ namespace
             if (hm.pred_next != nullptr) ggml_build_forward_expand(g->graph, hm.pred_next);   // read at this pause
         }
         for (const Output& o : g->outputs) ggml_build_forward_expand(g->graph, o.tensor);
+        // A greedy head's candidates and sums (its output reads them, not the node the program reads).
+        for (const GreedyHead& h : g->greedy)
+        {
+            ggml_build_forward_expand(g->graph, h.values);
+            ggml_build_forward_expand(g->graph, h.sums);
+        }
         // Every tensor-parallel partial is computed and reduced on every rank, read or not: a rank that does not run the
         // head never reads its last block's sum, yet the other ranks' reduce needs its partial (and the ranks must cut
         // their graphs at the same boundaries).
@@ -1804,9 +2114,15 @@ namespace
                 }
         }
         bool fresh_weights = false;   // a weight got a new device copy
+        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU) bind_cpu_weights(g);
         for (Leaf& leaf : g->leaves)
         {
             leaf.uploaded = !leaf.host_only;
+            if (leaf.repacked)
+            {
+                leaf.uploaded = false;
+                continue;
+            }
             if (leaf.role == LEAF_INPUT || leaf.data == nullptr || leaf.host_only) continue;
             if (g->tp != nullptr)
             {
@@ -1828,7 +2144,11 @@ namespace
                 if (try_bind_cached_tensor(g_backend, dev, leaf.tensor, leaf.data, leaf.bytes, needs_upload, usage))
                 {
                     if (needs_upload)
+                    {
+                        // An overlapped step still running may read the device copy this rewrites (TSGgml_GraphOverlapSteps).
+                        host_read_barrier();
                         ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
+                    }
                     fresh_weights |= needs_upload && leaf.bytes >= 4096;
                     leaf.uploaded = false;
                     continue;
@@ -1843,6 +2163,10 @@ namespace
             }
             // Compute memory: the allocator must neither reuse nor clobber it before it is read.
             ggml_set_input(leaf.tensor);
+            // A state is written back to its host bytes after the run (TSGgml_GraphRun): its memory must stay its own to the
+            // end, or a program that only reads it (a projection kept from an earlier program) writes back whatever reused
+            // that memory after the last read (ggml-alloc frees inputs, never outputs).
+            if (leaf.role == LEAF_STATE) ggml_set_output(leaf.tensor);
         }
         for (const Output& o : g->outputs) ggml_set_output(o.tensor);
 #if defined(TSG_GGML_USE_CUDA)
@@ -1856,6 +2180,15 @@ namespace
 #else
         (void) fresh_weights;
 #endif
+        // Kept to the run's end: the candidates the host reads, and the logits a tied or non-finite row is read from.
+        for (GreedyHead& h : g->greedy)
+        {
+            for (ggml_tensor* t : { h.logits, h.ids, h.values, h.sums }) ggml_set_output(t);
+            if (h.mask != nullptr) ggml_set_output(h.mask);
+            h.host_ids.assign(static_cast<std::size_t>(h.k * h.rows), 0);
+            h.host_values.assign(static_cast<std::size_t>(h.k * h.rows), 0.0f);
+            h.host_sums.assign(static_cast<std::size_t>(h.rows), 0.0f);
+        }
 
         // Place aliased op results inside their (persistent) base buffers, so the op writes the
         // state in place. A base living in compute memory cannot host it: run the fallback copy.
@@ -1874,6 +2207,7 @@ namespace
         (void) fallbacks;
         if (!g->host_moe.empty() && !tsg::host_moe_build_segment_ends(g->graph, g->host_moe, g->seg_end, "graph builder"))
             return false;
+        pack_run_inputs(g);
 
         // A one-shot graph borrows the backend's persistent, reused compute allocator (the
         // memory the fused graphs share, grown on demand); a graph that will be replayed keeps
@@ -2078,6 +2412,15 @@ TSG_EXPORT int TSGgml_GraphOutput(void* handle, int node, void* data, std::int64
     {
         if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
         ggml_tensor* t = node_at(g, node);
+        if (GreedyHead* h = greedy_head_of(g, t))
+        {
+            // A greedy head's output: one id a row as its F32 value, written after the run (resolve_greedy_heads).
+            if (data == nullptr || bytes < h->rows * static_cast<std::int64_t>(sizeof(float)) || h->out != nullptr)
+                throw std::runtime_error("graph builder: a greedy head has one output of a float a row");
+            h->out = static_cast<float*>(data);
+            g->outputs.push_back({ t, nullptr, 0 });
+            return 1;
+        }
         if (data != nullptr && static_cast<std::size_t>(bytes) < ggml_nbytes(t))
             throw std::runtime_error("graph builder: output buffer is smaller than its node");
         g->outputs.push_back({ t, data, data != nullptr ? ggml_nbytes(t) : 0 });
@@ -2206,17 +2549,28 @@ namespace
     // Leaves living in compute memory are uploaded every run, weights included: the allocator may reuse an input's
     // memory after its last use within the graph. A leaf nothing in the graph reads (the trace may emit more than the
     // outputs and effects need) has no memory. Then the step's inputs.
+    // A packed input's bytes go to the graph's pinned block (pack_run_inputs), sent after the others in one copy.
     void upload_run_inputs(TsgGraph* g, const int* inputs, void* const* input_data, const std::int64_t* input_bytes, int ninputs)
     {
+        auto stage = [g](const ggml_tensor* t) -> std::uint8_t*
+        {
+            if (g->packed.empty()) return nullptr;
+            auto it = g->packed.find(t);
+            return it == g->packed.end() ? nullptr : g->packed_stage + it->second;
+        };
         for (const Leaf& leaf : g->leaves)
             if (leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
-                ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
+            {
+                if (std::uint8_t* at = stage(leaf.tensor)) std::memcpy(at, resolve_upload_source(leaf.data), leaf.bytes);
+                else ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
+            }
         for (int i = 0; i < ninputs; i++)
         {
             ggml_tensor* t = node_at(g, inputs[i]);
             const std::size_t n = std::min(static_cast<std::size_t>(input_bytes[i]), ggml_nbytes(t));
-            if (input_data[i] != nullptr && n > 0 && t->buffer != nullptr)
-                ggml_backend_tensor_set(t, input_data[i], 0, n);
+            if (input_data[i] == nullptr || n == 0 || t->buffer == nullptr) continue;
+            if (std::uint8_t* at = stage(t)) std::memcpy(at, input_data[i], n);
+            else ggml_backend_tensor_set(t, input_data[i], 0, n);
         }
         // The segment tables served regions read on the host: this run's values (a weight's were read at build).
         for (const auto& h : g->host_segments)
@@ -2237,6 +2591,38 @@ namespace
             if (!given && !h->filled)
                 throw std::runtime_error("graph builder: a served region's segment table input was not given");
         }
+        if (g->packed_span == nullptr) return;
+        // On CUDA the copy is queued on the stream the graph runs on, ahead of it; the block is written again only at a
+        // later run, after this one's end synchronized the device (a graph that replays always does).
+        if (g_backend_type == BACKEND_TYPE_CUDA && g->packed_stage_pageable.empty())
+            ggml_backend_tensor_set_async(graph_backend(g), g->packed_span, g->packed_stage, 0, ggml_nbytes(g->packed_span));
+        else
+            ggml_backend_tensor_set(g->packed_span, g->packed_stage, 0, ggml_nbytes(g->packed_span));
+    }
+}
+
+namespace
+{
+    // Open TSGgml_GraphOverlapSteps scopes: while any is open, a one-shot graph whose run hands the host nothing (no output
+    // to download, no state leaf to write back, no host-expert pause) returns once its work is queued, marked as pending GPU
+    // work like Metal's lazy sync (g_pending_gpu_work): every host read, buffer release and upload drains it first
+    // (host_read_barrier), the next graph's run among them. The host then traces and builds the next prompt step while the
+    // device runs this one, as llama.cpp's scheduler overlaps a prompt's ubatches.
+    std::atomic<int> g_overlap_steps{0};
+}
+
+// Open (open != 0) or close an overlapped-steps scope; closing the last one drains the pending work.
+TSG_EXPORT void TSGgml_GraphOverlapSteps(int open)
+{
+    if (open != 0)
+    {
+        g_overlap_steps.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    if (g_overlap_steps.fetch_sub(1, std::memory_order_acq_rel) <= 1)
+    {
+        g_overlap_steps.store(0, std::memory_order_release);
+        host_read_barrier();
     }
 }
 
@@ -2260,6 +2646,9 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         // Device work queued by earlier calls may still read or write these host buffers.
         host_read_barrier();
         upload_run_inputs(g, inputs, input_data, input_bytes, ninputs);
+        if (g->tp == nullptr && g_backend_type == BACKEND_TYPE_CPU) tsg::cpu_pools_select(g_backend, g->product_rows);
+        // Its computes (segments, profiled nodes) keep that pool (tsg::compute_graph would pick one per segment).
+        tsg::CpuGraphRuntimeScope runtime;
 
         // Enqueue the graph and the downloads back to back, then synchronize once (as llama.cpp's
         // scheduler does): a synchronous compute followed by a download is a second command-buffer
@@ -2305,13 +2694,37 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             set_last_error("graph builder: backend graph execution failed.");
             return 0;
         }
+        bool host_results = false;
         for (const Output& o : g->outputs)
             if (o.data != nullptr)
+            {
                 ggml_backend_tensor_get_async(graph_backend(g), o.tensor, o.data, 0, o.bytes);
+                host_results = true;
+            }
+        for (GreedyHead& h : g->greedy)
+            if (h.out != nullptr)
+            {
+                ggml_backend_tensor_get_async(graph_backend(g), h.ids, h.host_ids.data(), 0, h.host_ids.size() * sizeof(std::int32_t));
+                ggml_backend_tensor_get_async(graph_backend(g), h.values, h.host_values.data(), 0, h.host_values.size() * sizeof(float));
+                ggml_backend_tensor_get_async(graph_backend(g), h.sums, h.host_sums.data(), 0, h.host_sums.size() * sizeof(float));
+                host_results = true;
+            }
         for (const Leaf& leaf : g->leaves)
             if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
+            {
                 ggml_backend_tensor_get_async(graph_backend(g), leaf.tensor, leaf.data, 0, leaf.bytes);
+                host_results = true;
+            }
+        if (!host_results && !g->replayable && g->tp == nullptr && g->host_moe.empty() && !graph_node_profile_enabled()
+            && g_overlap_steps.load(std::memory_order_acquire) > 0)
+        {
+            // Nothing for the host to read: the run returns with its work queued (TSGgml_GraphOverlapSteps).
+            mark_pending_gpu_work();
+            clear_last_error();
+            return 1;
+        }
         sync_backend(graph_backend(g));
+        resolve_greedy_heads(g, false);
         clear_last_error();
         return 1;
     }
@@ -2374,6 +2787,13 @@ TSG_EXPORT int TSGgml_GraphRunRanked(void* const* handles, int nranks, const int
             plan_ptrs[static_cast<std::size_t>(r)] = &plan;
         }
         if (!tsg::tp_execute_plans(plan_ptrs.data(), nranks)) return 0;
+        for (int r = 0; r < nranks; r++)
+        {
+            auto* g = static_cast<TsgGraph*>(handles[r]);
+            if (g->greedy.empty()) continue;
+            ScopedRank scope(g->rank);
+            resolve_greedy_heads(g, true);
+        }
         clear_last_error();
         return 1;
     }
@@ -2480,6 +2900,51 @@ TSG_EXPORT int TSGgml_GraphLeafIsResident(void* handle, int node)
     for (const Leaf& leaf : g->leaves)
         if (leaf.tensor == t) return leaf.uploaded ? 0 : 1;
     return 0;
+}
+
+// How many greedy-head rows (OP_TOP_K ip[1] = 1) took their id from their full logits since the process started: rows
+// whose candidates all tie, or that hold a NaN or an infinity (GreedyHead). For tests.
+TSG_EXPORT std::int64_t TSGgml_GreedyFullRows()
+{
+    return g_greedy_full_rows.load(std::memory_order_relaxed);
+}
+
+// What one run of a built graph evaluates and moves, for censuses of steps (eng/lfm3/Lfm3Probe batch): out[0] its ggml
+// nodes, out[1] those that run a kernel (not a no-op, view, reshape, permute or transpose, nor an empty tensor), out[2] and
+// out[3] the leaves in compute memory every run uploads besides its inputs (upload_run_inputs) and their bytes, out[4] and
+// out[5] the state leaves every run downloads after it and their bytes. Reads the graph only. Returns the values written:
+// 6, or 0 before the graph is built (on its first run).
+TSG_EXPORT int TSGgml_GraphCensus(void* handle, std::int64_t* out, int n)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    if (g == nullptr || out == nullptr || n < 6 || !g->built || g->graph == nullptr) return 0;
+    const int nodes = ggml_graph_n_nodes(g->graph);
+    std::int64_t kernels = 0;
+    for (int i = 0; i < nodes; i++)
+    {
+        const ggml_tensor* t = ggml_graph_node(g->graph, i);
+        if (t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE
+            || t->op == GGML_OP_TRANSPOSE || ggml_is_empty(t))
+            continue;
+        kernels++;
+    }
+    std::int64_t uploads = 0, upload_bytes = 0, downloads = 0, download_bytes = 0;
+    for (const Leaf& leaf : g->leaves)
+    {
+        if (!leaf.uploaded || leaf.data == nullptr || leaf.tensor->buffer == nullptr) continue;
+        uploads++;
+        upload_bytes += static_cast<std::int64_t>(leaf.bytes);
+        if (leaf.role != LEAF_STATE) continue;
+        downloads++;
+        download_bytes += static_cast<std::int64_t>(leaf.bytes);
+    }
+    out[0] = nodes;
+    out[1] = kernels;
+    out[2] = uploads;
+    out[3] = upload_bytes;
+    out[4] = downloads;
+    out[5] = download_bytes;
+    return 6;
 }
 
 // Make `node`'s result live in `base`'s buffer at `offset` bytes (an in-place state update).

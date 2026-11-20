@@ -983,6 +983,7 @@ public static partial class WebUiRoutes
         string? imageUrl = null, videoUrl = null, audioUrl = null;
         ImageTurnRecord? image = null;
         StoredTurnStats? stats = null;
+        SpokenReplyRecord? spoken = null;
 
         await foreach (object frame in frames.ConfigureAwait(false))
         {
@@ -995,7 +996,10 @@ public static partial class WebUiRoutes
             JsonElement root = document.RootElement;
             CollectKnowledgeSources(root, knowledgeSources);
             if (root.TryGetProperty("done", out JsonElement done) && done.ValueKind == JsonValueKind.True)
+            {
                 stats = StoredTurnStats.FromDoneFrame(root);
+                spoken = SpokenReplyRecord.FromDoneFrame(root);
+            }
             if (root.TryGetProperty("token", out JsonElement token) && token.GetString() is { } piece)
                 content.Append(piece);
             else if (root.TryGetProperty("replace", out JsonElement replace) && replace.GetString() is { } whole)
@@ -1026,7 +1030,8 @@ public static partial class WebUiRoutes
         }
 
         if (sessionId is not null)
-            recorder.Complete(sessionId, content.ToString(), thinking.ToString(), artifacts, imageUrl, videoUrl, audioUrl, stats, image, knowledgeSources);
+            recorder.Complete(sessionId, content.ToString(), thinking.ToString(), artifacts, imageUrl, videoUrl, audioUrl, stats, image,
+                knowledgeSources, spoken);
     }
 
     internal static void CollectKnowledgeSources(JsonElement frame, List<JsonElement> destination)

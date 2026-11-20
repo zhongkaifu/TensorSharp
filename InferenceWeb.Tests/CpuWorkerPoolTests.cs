@@ -181,6 +181,53 @@ namespace InferenceWeb.Tests
         }
 
         [Fact]
+        public void AWorkerBlockThatFailsLastFailsItsOwnJob()
+        {
+            // A worker's block that throws and is the last block to finish. The pool used to count the block done in a
+            // finally that runs before the catch recording its exception, so the submitter could see every block done,
+            // find no error and return normally - the block's output never written, nothing thrown - and the late
+            // exception then surfaced in the NEXT job. The window is narrow: the old pool lost or misrouted 1-4 of every
+            // 100,000 such jobs on an M5 Pro, so this runs 200,000 (about 1.5 s).
+            const int pools = 4, jobsPerPool = 50_000;
+            int lost = 0, foreign = 0, propagated = 0;
+            int submitter = Environment.CurrentManagedThreadId;
+            for (int p = 0; p < pools; p++)
+            {
+                using var pool = new CpuWorkerPool(2);
+                for (int job = 0; job < jobsPerPool; job++)
+                {
+                    int workerStarted = 0;
+                    var failure = new InvalidOperationException($"pool {p} job {job}");
+                    try
+                    {
+                        pool.For(2, _ =>
+                        {
+                            if (Environment.CurrentManagedThreadId != submitter)
+                            {
+                                Volatile.Write(ref workerStarted, 1);
+                                throw failure;
+                            }
+                            // The submitter's block waits for the worker's to start, so the worker's finishes last. (The
+                            // bound only keeps a starved worker from hanging the test: the job then runs both blocks on
+                            // this thread and counts as neither lost nor propagated.)
+                            var spin = new SpinWait();
+                            var waited = System.Diagnostics.Stopwatch.StartNew();
+                            while (Volatile.Read(ref workerStarted) == 0 && waited.Elapsed < TimeSpan.FromSeconds(10)) spin.SpinOnce(-1);
+                        });
+                        if (Volatile.Read(ref workerStarted) == 1) lost++;
+                    }
+                    catch (AggregateException error)
+                    {
+                        if (error.InnerExceptions.Contains(failure)) propagated++;
+                        else foreign++;
+                    }
+                }
+            }
+            Assert.True(lost == 0 && foreign == 0,
+                $"{lost} jobs returned normally although a worker's block threw, {foreign} threw another job's exception ({propagated} correct)");
+        }
+
+        [Fact]
         public void ConcurrentSubmittersAllComplete()
         {
             // The pool runs one job at a time; a second submitter has to fall back
@@ -205,6 +252,78 @@ namespace InferenceWeb.Tests
             Assert.Equal(8, CpuWorkerPool.DefaultThreadCountFor(16));
             Assert.Equal(61, CpuWorkerPool.DefaultThreadCountFor(122));
             Assert.True(CpuWorkerPool.DefaultThreadCountFor(384) < 384);
+            // Apple silicon has no SMT: one worker per core.
+            Assert.Equal(18, CpuWorkerPool.DefaultThreadCountFor(18, oneThreadPerCore: true));
+            Assert.Equal(6, CpuWorkerPool.DefaultThreadCountFor(6, oneThreadPerCore: true));
+        }
+
+        [Fact]
+        public void ANarrowedPoolRunsJobsOnItsActiveThreadsOnlyAndWidensAgain()
+        {
+            using var pool = new CpuWorkerPool(4);
+            Assert.Equal(4, pool.ActiveThreads);
+            pool.SetActiveThreads(2);
+            Assert.Equal(2, pool.ActiveThreads);
+            Assert.Equal(4, pool.ThreadCount);   // task splits keep the pool's size
+            for (int job = 0; job < 200; job++)
+            {
+                var threads = new ConcurrentDictionary<int, bool>();
+                int ran = 0;
+                pool.For(64, _ =>
+                {
+                    threads.TryAdd(Environment.CurrentManagedThreadId, true);
+                    Interlocked.Increment(ref ran);
+                    Thread.SpinWait(200);
+                });
+                Assert.Equal(64, ran);
+                Assert.InRange(threads.Count, 1, 2);
+            }
+
+            // Widened: every thread takes blocks again (each block waits until four distinct threads have arrived).
+            pool.SetActiveThreads(4);
+            Assert.Equal(4, pool.ActiveThreads);
+            using var barrier = new Barrier(4);
+            var participants = new ConcurrentDictionary<int, bool>();
+            pool.For(4, _ =>
+            {
+                participants.TryAdd(Environment.CurrentManagedThreadId, true);
+                Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(10)));
+            });
+            Assert.Equal(4, participants.Count);
+        }
+
+        [Fact]
+        public void APoolNarrowedToOneThreadRunsJobsInlineAndDisposesItsParkedWorkers()
+        {
+            var pool = new CpuWorkerPool(3);
+            pool.SetActiveThreads(0);   // clamped to the submitter alone
+            Assert.Equal(1, pool.ActiveThreads);
+            int submitter = Environment.CurrentManagedThreadId, other = 0;
+            pool.For(32, _ => { if (Environment.CurrentManagedThreadId != submitter) Interlocked.Increment(ref other); });
+            Assert.Equal(0, other);
+            pool.SetActiveThreads(99);   // clamped to the pool
+            Assert.Equal(3, pool.ActiveThreads);
+            pool.SetActiveThreads(1);
+            pool.For(8, _ => { });
+            pool.Dispose();              // the parked workers wake and exit
+        }
+
+        [Fact]
+        public void DecodeWidthLeavesTwoCoresOnHybridMacsAndFollowsItsKnobs()
+        {
+            // M5 Pro: 6 performance + 12 efficiency cores, a pool on all 18.
+            Assert.Equal(16, CpuWorkerPool.DecodeThreadCountFor(18, forced: 0, poolForced: false, perfCores: 6, effCores: 12));
+            // never below the performance cores, never above the pool
+            Assert.Equal(4, CpuWorkerPool.DecodeThreadCountFor(5, 0, false, 4, 1));
+            Assert.Equal(3, CpuWorkerPool.DecodeThreadCountFor(3, 0, false, 4, 4));
+            // TS_CPU_DECODE_THREADS wins (clamped to the pool); TS_CPU_THREADS alone sets both widths
+            Assert.Equal(12, CpuWorkerPool.DecodeThreadCountFor(18, 12, false, 6, 12));
+            Assert.Equal(18, CpuWorkerPool.DecodeThreadCountFor(18, 40, false, 6, 12));
+            Assert.Equal(14, CpuWorkerPool.DecodeThreadCountFor(14, 0, true, 6, 12));
+            Assert.Equal(10, CpuWorkerPool.DecodeThreadCountFor(14, 10, true, 6, 12));
+            // no hybrid topology (Linux, Windows, iOS, an Intel Mac): the pool's width
+            Assert.Equal(16, CpuWorkerPool.DecodeThreadCountFor(16, 0, false, 0, 0));
+            Assert.Equal(8, CpuWorkerPool.DecodeThreadCountFor(8, 0, false, 8, 0));
         }
 
         [Fact]

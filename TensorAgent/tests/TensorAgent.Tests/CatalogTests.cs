@@ -16,6 +16,8 @@ public sealed class CatalogTests
             "gemma-4-e4b-iq4xs",
             "bonsai-2-27b-ptq1-0",
             "qwen3.5-9b-iq4xs",
+            "lfm3-1.7b-q4km",
+            "lfm3-omni-2b-q4km",
             "qwen3.8-27b-iq3xxs",
             "muse-glimmer-30b-q4kxl",
             "qwen3.8-flash-next-gsq-q2-0",
@@ -759,6 +761,9 @@ public sealed class CatalogTests
         "ltx-2.5-distilled-q4kxl",
         "qwen-image-2.1-turbo-q5ks",
         "qwen-image-2.1-turbo-q8-0",
+        // Added 2026-11-16.
+        "lfm3-1.7b-q4km",
+        "lfm3-omni-2b-q4km",
         "minimax-h3-image-q4km",
         "minimax-h3-image-q8-0",
     };

@@ -21,7 +21,7 @@
     with SIGABRT inside load_aot_module, before any managed code runs. Measured on
     device.
 
-    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 431 symbols.
+    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 388 symbols.
     Test-only exports (inside #if defined(TSG_GGML_TEST_HOOKS) or TSG_GGML_TEST_DIAGNOSTICS
     blocks) are left out: only the native test build compiles them, and a name listed here
     becomes a -u link root, so one the device archive lacks fails the Release link.
@@ -50,6 +50,8 @@
     <ReferenceNativeSymbol Include="TSGgml_Conv2dF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_CopyDeviceCopyRanges" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_CopyF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_CpuPoolThreads" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_CpuRepacksWeights" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_CrossEntropyLossBackwardF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_CrossEntropyLossF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashDraftBlock" SymbolType="Function" />
@@ -208,6 +210,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GptOssResetDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphAlias" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphCensus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphCreate" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphCreateTp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphEffect" SymbolType="Function" />
@@ -219,11 +222,13 @@
     <ReferenceNativeSymbol Include="TSGgml_GraphLeafSplit" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOutput" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphOverlapSteps" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphPreloadWeights" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphRun" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphRunRanked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphShape" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphWideTokenProducts" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GreedyFullRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostAvailableMemoryBytes" SymbolType="Function" />

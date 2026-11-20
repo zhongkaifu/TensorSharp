@@ -95,8 +95,15 @@ public sealed class StoredMessage
     /// <summary>Generated clip URL for a video turn.</summary>
     [JsonPropertyName("videoUrl")] public string? VideoUrl { get; set; }
     /// <summary>The clip's soundtrack, kept only when it is a separate file the page plays
-    /// beside the clip (when the sound is inside the MP4 there is nothing to keep).</summary>
+    /// beside the clip (when the sound is inside the MP4 there is nothing to keep); or, on a
+    /// spoken reply (<see cref="AudioId"/> set, no clip), the WAV of the whole reply.</summary>
     [JsonPropertyName("audioUrl")] public string? AudioUrl { get; set; }
+    /// <summary>A spoken reply's id (the turn's <c>done.audioId</c>). Sent back with the
+    /// history, it splices the turn as the model generated it, so the next turn reuses its
+    /// prompt prefix; the host keeps that for an hour, and an older id renders as the text.</summary>
+    [JsonPropertyName("audioId")] public string? AudioId { get; set; }
+    /// <summary>How long the spoken reply at <see cref="AudioUrl"/> is, in seconds.</summary>
+    [JsonPropertyName("audioSeconds")] public double? AudioSeconds { get; set; }
 
     /// <summary>Every upload file name (bare names under the uploads root) this message references.</summary>
     [JsonIgnore]
@@ -132,6 +139,38 @@ public sealed class StoredMessage
             if (!string.IsNullOrEmpty(ImageSource)) yield return Path.GetFileName(ImageSource);
             if (!string.IsNullOrEmpty(VideoUrl)) yield return Path.GetFileName(VideoUrl);
             if (!string.IsNullOrEmpty(AudioUrl)) yield return Path.GetFileName(AudioUrl);
+        }
+    }
+}
+
+/// <summary>
+/// A spoken reply, from its terminal Web UI frame (<c>done</c> with <c>audioId</c>, and
+/// <c>audioUrl</c> / <c>audioSeconds</c> when the reply had speech): what the transcript keeps
+/// so a reopened chat can replay and save it, and the next turn can splice it.
+/// </summary>
+public sealed record SpokenReplyRecord(string AudioId, string? AudioUrl, double? AudioSeconds)
+{
+    internal static SpokenReplyRecord? FromDoneFrame(JsonElement frame)
+    {
+        if (!frame.TryGetProperty("done", out JsonElement done) || done.ValueKind != JsonValueKind.True
+            || !frame.TryGetProperty("audioId", out JsonElement id) || id.ValueKind != JsonValueKind.String
+            || id.GetString() is not { Length: > 0 } audioId)
+            return null;
+        string? url = frame.TryGetProperty("audioUrl", out JsonElement u) && u.ValueKind == JsonValueKind.String
+            && u.GetString() is { Length: > 0 } value ? value : null;
+        double? seconds = url != null && frame.TryGetProperty("audioSeconds", out JsonElement s)
+            && s.ValueKind == JsonValueKind.Number && s.TryGetDouble(out double length) && double.IsFinite(length) && length >= 0
+            ? length : null;
+        return new SpokenReplyRecord(audioId, url, seconds);
+    }
+
+    internal void ApplyTo(StoredMessage message)
+    {
+        message.AudioId = AudioId;
+        if (AudioUrl is not null && string.IsNullOrEmpty(message.VideoUrl))
+        {
+            message.AudioUrl = AudioUrl;
+            message.AudioSeconds = AudioSeconds;
         }
     }
 }

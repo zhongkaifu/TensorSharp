@@ -230,6 +230,9 @@ public static partial class ModelCatalog
             License = ApacheLicense,
             Notes = "catalog.model.qwen35Size9b.notes",
         },
+        // The phone-tier LFM3 entries (ModelCatalog.Lfm3.cs).
+        Lfm3Text(),
+        Lfm3Omni(),
         new CatalogModel
         {
             Id = "qwen3.8-27b-iq3xxs",

@@ -53,8 +53,24 @@ namespace TensorSharp.Models.Media.Desktop
             return new VideoInfo(
                 capture.Get(VideoCaptureProperties.Fps),
                 (int)capture.Get(VideoCaptureProperties.FrameCount),
-                (int)capture.Get(VideoCaptureProperties.FrameWidth),
+                DisplayWidth(capture, (int)capture.Get(VideoCaptureProperties.FrameWidth)),
                 (int)capture.Get(VideoCaptureProperties.FrameHeight));
+        }
+
+        /// <summary>
+        /// The width a clip is shown at: OpenCV's FFmpeg backend (Linux, Windows) decodes frames at their encoded size and
+        /// leaves the pixel aspect ratio to the player, so an anamorphic clip (720 x 358 at 427:360) probed 720 wide where
+        /// macOS's AVFoundation backend, which decodes to the displayed size, gives 854 - and LFM3-Omni sized its frames
+        /// from it, 549 tokens fewer on Linux for llama.cpp's test-3.mp4 than llama.cpp's mtmd, which applies the ratio as
+        /// ffprobe reports it (nearbyint(width * sar) for a plausible 0.1 .. 10). A reader resizing the decoded frames to a
+        /// size planned from this width stretches them in that one resize, as mtmd's ffmpeg scale does.
+        /// </summary>
+        private static int DisplayWidth(VideoCapture capture, int width)
+        {
+            if (!string.Equals(capture.GetBackendName(), "FFMPEG", StringComparison.OrdinalIgnoreCase)) return width;
+            double num = capture.Get(VideoCaptureProperties.SARNum), den = capture.Get(VideoCaptureProperties.SARDen);
+            double sar = den > 0 ? num / den : 1.0;
+            return sar is >= 0.1 and <= 10.0 ? (int)Math.Round(width * sar, MidpointRounding.ToEven) : width;
         }
 
         /// <summary>

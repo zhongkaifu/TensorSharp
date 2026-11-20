@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
 using TensorSharp;
 using TensorSharp.Cuda;
@@ -100,6 +101,63 @@ public sealed class Dsv4RouterKernelTests
             line += $" {rows}r {Convert.ToHexString(SHA256.HashData(bytes))[..12]}";
         }
         _output.WriteLine(line);
+    }
+
+    /// <summary>The BF16 block GEMV over several outputs a block (every form of Dsv4Kernels.GemvBf16OutputVariants: outputs a
+    /// block, a warp sum a row or one reduce-scatter of the rows) gives the block-per-output kernel's bits at every row count,
+    /// on decode-step shapes (LFM3-1.7B's projections, an output count that is no multiple of 8); each form's graph-captured
+    /// time a call is printed, not asserted.</summary>
+    [CudaTheory]
+    [InlineData(2048, 8192)]
+    [InlineData(8192, 2048)]
+    [InlineData(2048, 2050)]
+    public void BlockGemvOverSeveralOutputsGivesTheBlockKernelsBits(int inDim, int outDim)
+    {
+        using var allocator = new CudaAllocator(0);
+        allocator.Context.MakeCurrent();
+        using var dk = Dsv4Kernels.Create();
+        var rnd = new Random(inDim * 7 + outDim);
+        const int maxRows = Dsv4Kernels.GemvMaxRows;
+        var x = new float[maxRows * inDim];
+        for (int i = 0; i < x.Length; i++)
+            x[i] = (float)((rnd.NextDouble() * 2 - 1) * (i % 97 == 3 ? 8 : 1));
+        ushort[] w = RandomBf16(rnd, inDim * outDim);
+        using Tensor xT = Up(allocator, x);
+        using Tensor wT = Up(allocator, Bytes(w));
+        using Tensor y = new Tensor(allocator, DType.Float32, maxRows, outDim);
+        IntPtr stream = allocator.Stream.Handle;
+        (string, string) Form(string name) => name == null ? (null, null) : name.StartsWith("8_", StringComparison.Ordinal) ? (name, null) : (null, name);
+        float[] Run(string name, int rows)
+        {
+            dk.GemvBf16VariantForTests = Form(name);
+            dk.GemvBf16(Ptr(xT), Ptr(wT), Ptr(y), inDim, outDim, rows, stream);
+            allocator.Stream.Synchronize();
+            return Down(y, rows * outDim);
+        }
+        for (int rows = 1; rows <= maxRows; rows++)
+        {
+            float[] block = Run(null, rows);
+            foreach (string name in Dsv4Kernels.GemvBf16OutputVariants)
+            {
+                if ((rows <= 8) != name.StartsWith("8_", StringComparison.Ordinal) && rows > 4) continue;
+                float[] got = Run(name, rows);
+                for (int i = 0; i < got.Length; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(got[i]) == BitConverter.SingleToInt32Bits(block[i]),
+                        $"{rows} rows, form {name}, output {i}: {got[i]:R}, the block-per-output kernel {block[i]:R}");
+            }
+        }
+        foreach (int rows in new[] { 8, 16 })
+        {
+            string line = $"bf16 block gemv {inDim} -> {outDim}, {rows} rows, us a call:";
+            foreach (string name in new string[] { null }.Concat(Dsv4Kernels.GemvBf16OutputVariants))
+            {
+                if (name != null && (rows <= 8) != name.StartsWith("8_", StringComparison.Ordinal)) continue;
+                dk.GemvBf16VariantForTests = Form(name);
+                line += $" {name ?? "block"} {GraphMicros(stream, _ => dk.GemvBf16(Ptr(xT), Ptr(wT), Ptr(y), inDim, outDim, rows, stream), 20, 20):F1}";
+            }
+            _output.WriteLine(line);
+        }
+        dk.GemvBf16VariantForTests = null;
     }
 
     // Router logits for nt rows: random, with rows whose top scores tie exactly (the lower expert first) and rows with

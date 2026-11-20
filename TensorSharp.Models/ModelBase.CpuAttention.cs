@@ -784,6 +784,20 @@ namespace TensorSharp.Models
         internal static unsafe void AttentionDecodeGroupedF16(float* qPtr, ushort* kPtr, ushort* vPtr, float* rPtr,
             int numHeads, int numKVHeads, int headDim, int maxSeqLen, int totalSeqLen, float scale)
         {
+            // Long contexts: the same result with the keys and head-dim slices spread over every worker
+            // (ModelBase.CpuAttentionSplit.cs); one block per KV head leaves most cores idle there.
+            if (totalSeqLen >= SplitDecodeKeys && SplitDecodeAttentionSupported && CpuParallel.DegreeOfParallelism > numKVHeads)
+            {
+                AttentionDecodeGroupedF16Split(qPtr, kPtr, vPtr, rPtr, numHeads, numKVHeads, headDim, maxSeqLen, totalSeqLen, scale);
+                return;
+            }
+            AttentionDecodeGroupedF16OnePass(qPtr, kPtr, vPtr, rPtr, numHeads, numKVHeads, headDim, maxSeqLen, totalSeqLen, scale);
+        }
+
+        /// <summary>The one-pass kernel: one block per KV head over every key (the reference the split kernel matches).</summary>
+        internal static unsafe void AttentionDecodeGroupedF16OnePass(float* qPtr, ushort* kPtr, ushort* vPtr, float* rPtr,
+            int numHeads, int numKVHeads, int headDim, int maxSeqLen, int totalSeqLen, float scale)
+        {
             int groupSize = numHeads / numKVHeads;
             // Read on the entering thread and captured by the blocks (see CpuScratch).
             int stackLimit = CpuScratch.StackFloatLimit;

@@ -56,6 +56,7 @@ namespace TensorSharp.Models
             Console.Write("Loading model weights...");
             var (countF32, countQuant, totalQuantBytes, totalF32Bytes, mappedQuantBytes) = LoadTensorsFrom(_gguf);
             Console.WriteLine($" done ({countF32} F32 tensors, {countQuant} quantized tensors)");
+            ReportNvfp4Widening();
             AttachSidecarWeightScales();
             if (countQuant > 0)
             {
@@ -164,6 +165,15 @@ namespace TensorSharp.Models
                         countQuant += numExperts;
                         totalQuantBytes += byteCount;
                     }
+                    else if (info.Type == GgmlTensorType.NVFP4 && WidensNvfp4ToF16(_backend))
+                    {
+                        QuantizedWeight widened = LoadNvfp4AsF16(file, info, byteCount, ne0, ne1);
+                        _quantWeights[info.Name] = widened;
+                        countQuant++;
+                        totalQuantBytes += widened.RawBytes;
+                        _nvfp4Widened++;
+                        _nvfp4WidenedBytes += byteCount;
+                    }
                     else
                     {
                         if (tryMmap && file.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
@@ -219,6 +229,69 @@ namespace TensorSharp.Models
                 }
             }
             return (countF32, countQuant, totalQuantBytes, totalF32Bytes, mappedQuantBytes);
+        }
+
+        // ---------------------------------------------------------------- NVFP4 on backends without its matmul
+
+        /// <summary>
+        /// Backends with no NVFP4 matmul: ggml-metal refuses NVFP4 MUL_MAT and GET_ROWS (ggml-metal-device.m), and MLX has no
+        /// NVFP4 kernel (it had dequantized the weights to F32 and dropped their <c>.scale</c> sidecars). Their NVFP4 matrices
+        /// load as F16, exactly: a value is an E2M1 code (at most 12, two significant bits) times a UE4M3 sub-block scale times
+        /// 1/2 (four significant bits, 2^-10 .. 240), at most six significant bits within F16's range. The per-tensor
+        /// <c>.scale</c> stays the output multiplier it is for NVFP4 (<see cref="QuantizedWeight.Scale"/>), as llama.cpp applies it.
+        /// </summary>
+        internal static bool WidensNvfp4ToF16(BackendType backend) => backend is BackendType.GgmlMetal or BackendType.Mlx;
+
+        private int _nvfp4Widened;
+        private long _nvfp4WidenedBytes;
+
+        /// <summary>An NVFP4 [ne0, ne1] matrix as an F16 <see cref="QuantizedWeight"/> holding the same values.</summary>
+        private static QuantizedWeight LoadNvfp4AsF16(GgufFile file, GgufTensorInfo info, long byteCount, long ne0, long ne1)
+        {
+            long count = ne0 * ne1;
+            IntPtr raw = QuantizedWeight.AllocateBuffer(byteCount);
+            try
+            {
+                file.ReadTensorDataToNative(info, raw, byteCount);
+                return new QuantizedWeight(WidenNvfp4ToF16(raw, count), count * sizeof(ushort), (int)GgmlTensorType.F16, ne0, ne1);
+            }
+            finally
+            {
+                QuantizedWeight.FreeBuffer(raw);
+            }
+        }
+
+        /// <summary><paramref name="count"/> NVFP4 values at <paramref name="nvfp4"/> as a new buffer of F16 (see
+        /// <see cref="WidensNvfp4ToF16"/>): ggml's dequantization, then each value's F16, which equals it.</summary>
+        internal static unsafe IntPtr WidenNvfp4ToF16(IntPtr nvfp4, long count)
+        {
+            const int rowValues = 1 << 16;   // whole NVFP4 blocks (64 values) per pass
+            IntPtr f16 = QuantizedWeight.AllocateBuffer(count * sizeof(ushort));
+            long rowBytes = NativeDequant.RowSize((int)GgmlTensorType.NVFP4, rowValues);
+            float[] values = ArrayPool<float>.Shared.Rent(rowValues);
+            try
+            {
+                for (long done = 0; done < count; done += rowValues)
+                {
+                    int n = (int)Math.Min(rowValues, count - done);
+                    NativeDequant.DequantizeToFloat32((int)GgmlTensorType.NVFP4, nvfp4 + (nint)(done / rowValues * rowBytes), values, 0, n);
+                    System.Numerics.Tensors.TensorPrimitives.ConvertToHalf(values.AsSpan(0, n), new Span<System.Half>((System.Half*)f16 + done, n));
+                }
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(values);
+            }
+            return f16;
+        }
+
+        /// <summary>Name the NVFP4 widening's cost once a load did it (a fast path that declines says what runs instead).</summary>
+        private void ReportNvfp4Widening()
+        {
+            if (_nvfp4Widened == 0) return;
+            Console.Error.WriteLine($"  NVFP4: {_backend} has no NVFP4 matmul, so {_nvfp4Widened} NVFP4 weights run as F16 " +
+                $"({_nvfp4WidenedBytes / 1048576} MB of NVFP4 held as {_nvfp4WidenedBytes * 32 / 9 / 1048576} MB of F16). The values are " +
+                "exact; the weights take 3.6x the memory and bandwidth of NVFP4 kernels.");
         }
 
         protected void PrepareCudaQuantizedWeightsForInference()
@@ -1098,7 +1171,10 @@ namespace TensorSharp.Models
             return bytes;
         }
 
-        protected unsafe void PopulateQuantizedRows(Tensor result, QuantizedWeight weight, int[] rowIndices)
+        /// <param name="freshResult">The result was just allocated on a discrete GPU's GGML backend: its host bytes are written
+        /// through the storage pointer without waiting for queued device work (an overlapped prompt step's,
+        /// <see cref="IGraphExecutor.OverlapSteps"/>), which never writes a host buffer it did not download into.</param>
+        protected unsafe void PopulateQuantizedRows(Tensor result, QuantizedWeight weight, int[] rowIndices, bool freshResult = false)
         {
             if (result == null)
                 throw new ArgumentNullException(nameof(result));
@@ -1117,17 +1193,19 @@ namespace TensorSharp.Models
             }
 
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
-            byte* basePtr = (byte*)weight.Data.ToPointer();
-            float* dst = GetFloatPtr(result);
-            for (int i = 0; i < rowIndices.Length; i++)
+            IntPtr basePtr = weight.Data;
+            IntPtr dst = freshResult ? TensorComputePrimitives.GetStoragePointer(result) : (IntPtr)GetFloatPtr(result);
+            // A prompt's rows in parallel (each row is its own dequant: the same values either way).
+            if (rowIndices.Length >= 64)
+                System.Threading.Tasks.Parallel.For(0, rowIndices.Length, Row);
+            else
+                for (int i = 0; i < rowIndices.Length; i++) Row(i);
+
+            void Row(int i)
             {
-                byte* rowPtr = basePtr + (long)rowIndices[i] * rowBytes;
-                NativeDequant.DequantizeToFloat32Native(
-                    weight.GgmlType,
-                    (IntPtr)rowPtr,
-                    (IntPtr)(dst + (long)i * dim),
-                    dim);
-                weight.InverseBonsaiEmbeddingRow(new Span<float>(dst + (long)i * dim, dim));
+                float* row = (float*)dst + (long)i * dim;
+                NativeDequant.DequantizeToFloat32Native(weight.GgmlType, basePtr + (nint)((long)rowIndices[i] * rowBytes), (IntPtr)row, dim);
+                weight.InverseBonsaiEmbeddingRow(new Span<float>(row, dim));
             }
 
             InvalidateTensorDeviceCache(result);
@@ -1213,12 +1291,22 @@ namespace TensorSharp.Models
         private bool KeepMixedGateUpSplitOnMlx =>
             _backend == BackendType.Mlx && SupportsSplitGateUpFfn && SplitsMixedGateUpOnMlx;
 
+        /// <summary>
+        /// Whether a gate/up pair of these GGML types stays two weights (two products and a SwiGLU of two operands, which a
+        /// family that <see cref="SupportsSplitGateUpFfn"/> runs on every path) instead of one fused ffn_gate_up. On ggml-cuda
+        /// the two products and their SwiGLU are one kernel of ggml's own (MMQ or MMVQ with the GLU in its write-back), where a
+        /// fused weight's product is followed by a separate SwiGLU pass over twice the rows; the products' K splits differ
+        /// with the row count, so a family opts in per type where it measures faster. Default: fused.
+        /// </summary>
+        protected virtual bool KeepsGateUpApart(int gateType, int upType) => false;
+
         protected unsafe void FuseGateUpWeights(int numLayers = 0)
         {
             if (numLayers <= 0)
                 numLayers = Config.NumLayers;
             int fused = 0;
             int requantized = 0;
+            int keptApart = 0;
             // "layer:gateType+upType" - the type pair is the only place the
             // mismatch is ever surfaced, and it is what a future GGUF tripping a
             // DIFFERENT combination has to be diagnosed from.
@@ -1238,6 +1326,11 @@ namespace TensorSharp.Models
                     _quantWeights.TryGetValue(upName, out var uw) &&
                     gw.Ne0 == uw.Ne0)
                 {
+                    if (SupportsSplitGateUpFfn && KeepsGateUpApart(gw.GgmlType, uw.GgmlType))
+                    {
+                        keptApart++;
+                        continue;
+                    }
                     // Mixed-quant "UD"/dynamic GGUFs (e.g. Qwen3.8 UD quants, where
                     // ffn_gate is IQ4_XS but ffn_up is Q5_K) store gate and up in
                     // different types, which a single fused tensor can't represent.
@@ -1334,6 +1427,8 @@ namespace TensorSharp.Models
                 Console.WriteLine(requantized > 0
                     ? $"  Fused projections: {fused} Gate+Up ({requantized} mixed-quant layers requantized to a common type)"
                     : $"  Fused projections: {fused} Gate+Up");
+            if (keptApart > 0)
+                Console.WriteLine($"  Gate and up kept apart: {keptApart} layers (the backend runs the two products and the SwiGLU as one kernel)");
             if (requantLayers.Count > 0)
             {
                 // A dequantize+requantize of already-lossy weights is a real

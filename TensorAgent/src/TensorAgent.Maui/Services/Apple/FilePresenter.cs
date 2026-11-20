@@ -37,7 +37,7 @@ namespace TensorAgent.Maui.Services;
 /// </summary>
 internal static class FilePresenter
 {
-    /// <summary>Export a copy of an image to Files on iOS or a chosen folder on Mac.</summary>
+    /// <summary>Export a copy of a generated file (a picture, a spoken reply) to Files on iOS or a chosen folder on Mac.</summary>
     public static async Task<string?> SaveAsync(string fullPath)
     {
         if (string.IsNullOrEmpty(fullPath) || !File.Exists(fullPath))

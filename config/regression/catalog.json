@@ -592,6 +592,44 @@
       ]
     },
     {
+      "id": "lfm3",
+      "aliases": [
+        "lfm3"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text",
+        "image",
+        "video",
+        "audio"
+      ],
+      "layout": "dense",
+      "notes": "Liquid LFM3 (1.7B) and LFM3-Omni (2B) share general.architecture lfm3: 13 short-conv + 11 GQA attention layers (5 sliding-window). The text decoder runs on the shared runtime (sliding-window attention, head-wise gates, sandwich norms, short convolutions) and matches llama.cpp; the chat protocol (GGUF template, reasoning, Qwen3-Coder XML tools, Omni media placeholders) matches llama.cpp's renders. Image/video/audio in and speech out need the Omni projector. ggml_cuda, direct CUDA and ggml_vulkan were checked against llama.cpp on an NVIDIA A40; the NVFP4 config's FP4 tensor-core route (Blackwell) ran on an RTX PRO 4500 (sm_120).",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Lfm3/Lfm3Architecture.cs",
+        "TensorSharp.Models/Models/Lfm3/Lfm3RuntimeModel.cs",
+        "TensorSharp.Runtime/ChatProtocolRegistry.cs",
+        "TensorSharp.Runtime/ChatTemplate.Lfm3.cs",
+        "InferenceWeb.Tests/Lfm3RuntimeTests.cs",
+        "InferenceWeb.Tests/Lfm3ChatProtocolTests.cs",
+        "docs/models/lfm3.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "lfm3-1.7b",
+        "lfm3-1.7b-nvfp4",
+        "lfm3-omni-2b"
+      ]
+    },
+    {
       "id": "muse-glimmer",
       "aliases": [
         "muse-glimmer",
@@ -1929,6 +1967,156 @@
       },
       "notes": [
         "Autoregressive prefill/decode, tool and forced-history paths do not apply to diffusion generation."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lfm3-1.7b",
+      "config": "config/lfm3-1.7b.json",
+      "kind": "text",
+      "family": "lfm3",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "client_http_live",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/lfm3-1.7b.json",
+        "docs/models/lfm3.md",
+        "InferenceWeb.Tests/Lfm3ChatProtocolTests.cs",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Lfm3.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "LFM3-1.7B-Q4_K_M.gguf": 1099627808
+      },
+      "notes": [
+        "Reasoning model: llama.cpp and HF default to thinking on, TensorSharp requests to off; the cli_thinking scenario passes --think. Pin think in any A/B against llama.cpp.",
+        "Card sampling (temperature 0.1, top_k 50, repetition penalty 1.1 over the whole output); forced-logit and parity scenarios use their own greedy settings."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lfm3-1.7b-nvfp4",
+      "config": "config/lfm3-1.7b-nvfp4.json",
+      "kind": "text",
+      "family": "lfm3",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "ggml_cuda",
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "client_http_live",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/lfm3-1.7b-nvfp4.json",
+        "docs/models/lfm3.md"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "LFM3-1.7B-NVFP4.gguf": 1280019776
+      },
+      "notes": [
+        "NVFP4 FFN weights (72 tensors, per-tensor .scale after the matmul; .input_scale unused); embeddings, attention and conv projections stay Q8_0. FP4 tensor-core GEMMs need sm_100/sm_120.",
+        "Unvalidated: no Blackwell run has been made; a non-Blackwell CUDA device must report what replaces the FP4 GEMM."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lfm3-omni-2b",
+      "config": "config/lfm3-omni-2b.json",
+      "kind": "text",
+      "family": "lfm3",
+      "modalities": [
+        "text",
+        "image",
+        "video",
+        "audio"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "client_http_live",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_audio",
+        "cli_video"
+      ],
+      "source_evidence": [
+        "config/lfm3-omni-2b.json",
+        "docs/models/lfm3.md",
+        "InferenceWeb.Tests/Lfm3ChatProtocolTests.cs",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Lfm3.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "LFM3-Omni-2B-Q4_K_M.gguf": 1099630080,
+        "mmproj-LFM3-Omni-2B-Q8_0.gguf": 506842528
+      },
+      "notes": [
+        "Not a reasoning model (template default enable_thinking=false), so no cli_thinking scenario.",
+        "One mmproj holds the vision tower (lfm3vl), the audio encoder (lfm3a) and the speech generator (lfm3a_gen); media scenarios need the LFM3 encoders, and an absent encoder event is untested, not a pass. Speech output (TTS, chat modalities audio) is not among this entry's scenarios.",
+        "The Q8_0 projector is 506842528 bytes on disk; plan for its dequantized copies, not the download size."
       ],
       "status": "configured"
     },

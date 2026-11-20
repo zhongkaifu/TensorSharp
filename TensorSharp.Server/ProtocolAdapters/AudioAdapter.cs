@@ -13,6 +13,10 @@
 //   POST /v1/audio/translations     the same, translated to English                  -> Whisper
 //   POST /v1/audio/speech           JSON: input, voice, speed, response_format (wav | pcm)
 //                                                                                    -> Kokoro
+//                                   LFM3-Omni (a language model that speaks) on the engine:
+//                                   input, voice (female | male), language, response_format
+//                                   (wav | pcm | pcm16), stream / stream_format (audio | sse),
+//                                   seed, temperature, max_frames; speed only 1
 //   POST /v1/audio/music            JSON: prompt (style tags), lyrics, duration, bpm, key,
 //                                   time_signature, language, seed, steps -> WAV    -> ACE-Step
 //
@@ -22,6 +26,7 @@ using System;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
@@ -99,27 +104,241 @@ public sealed class AudioAdapter
 
     public async Task<IResult> SpeechAsync(HttpRequest req)
     {
-        if (_svc.Model is not ISpeechSynthesisModel)
-            return Error(400, "The loaded model is not a speech synthesis model (load a Kokoro GGUF).");
-        using var doc = await JsonDocument.ParseAsync(req.Body).ConfigureAwait(false);
-        var root = doc.RootElement;
+        JsonDocument doc;
+        try { doc = await JsonDocument.ParseAsync(req.Body).ConfigureAwait(false); }
+        catch (JsonException ex) { return Error(400, $"The body is not JSON: {ex.Message}"); }
+        using (doc)
+        {
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return Error(400, "The body must be a JSON object.");
+            // A language model that speaks (LFM3-Omni) runs on the engine, batched with the chat requests.
+            if (_svc.SpeechOutputModel is { } speaker)
+                return await LlmSpeechAsync(req, root, speaker).ConfigureAwait(false);
+            if (_svc.Model is not ISpeechSynthesisModel)
+                return Error(400, "The loaded model is not a speech synthesis model (load a Kokoro GGUF, or LFM3-Omni with its mmproj).");
+            string input = Str(root, "input");
+            if (string.IsNullOrWhiteSpace(input))
+                return Error(400, "input is required.");
+            string format = Str(root, "response_format") ?? "wav";
+            if (format is not ("wav" or "pcm"))
+                return Error(400, "response_format must be wav or pcm (16-bit little-endian mono at the model's rate).");
+            if (FirstPresent(root, "seed", "temperature", "max_frames") is { } sampled)
+                return Error(400, $"{sampled} applies to a model that samples its speech (LFM3-Omni); the loaded model's speech is not sampled.", "invalid_request_error");
+            var options = new SpeechSynthesisOptions
+            {
+                Voice = Str(root, "voice"),
+                Language = Str(root, "language"),
+                Speed = root.TryGetProperty("speed", out var sp) && sp.ValueKind == JsonValueKind.Number ? (float)sp.GetDouble() : 1f,
+            };
+            if (options.Speed is < 0.25f or > 4f)
+                return Error(400, "speed must be between 0.25 and 4.");
+            var result = await RunAsync<ISpeechSynthesisModel, DecodedAudio>(m => m.Synthesize(input, options)).ConfigureAwait(false);
+            if (result.Error != null) return result.Error;
+            return AudioResult(result.Value, format);
+        }
+    }
+
+    private static string FirstPresent(JsonElement root, params string[] names)
+    {
+        foreach (string name in names)
+            if (root.TryGetProperty(name, out var v) && v.ValueKind != JsonValueKind.Null) return name;
+        return null;
+    }
+
+    /// <summary>
+    /// <c>POST /v1/audio/speech</c> on a language model that speaks (LFM3-Omni): its TTS prompt runs on the engine as a
+    /// driven request. Fields: <c>input</c>; <c>voice</c> (one of the model's, case-insensitive; anything else, OpenAI's
+    /// default <c>alloy</c> included, is a 400 listing them); <c>language</c>; <c>response_format</c> <c>wav</c> (default),
+    /// <c>pcm</c> or <c>pcm16</c> (both 16-bit little-endian mono); <c>speed</c> only 1 (no rate control); <c>seed</c>,
+    /// <c>temperature</c> (the speech temperature), <c>max_frames</c> (80 ms each, default 512); <c>stream</c>
+    /// <c>true</c> (or OpenAI's <c>stream_format</c> <c>"audio"</c>) sends the audio chunked as each frame is decoded, a WAV
+    /// stream with an unknown-length header (sizes 0xFFFFFFFF, as llama.cpp and ffmpeg write); <c>stream_format</c>
+    /// <c>"sse"</c> sends OpenAI's <c>speech.audio.delta</c> / <c>speech.audio.done</c> events (base64 PCM16).
+    /// </summary>
+    private async Task<IResult> LlmSpeechAsync(HttpRequest req, JsonElement root, ISpeechOutputModel speaker)
+    {
+        if (!speaker.HasSpeechOutput)
+            return Error(400, speaker.SpeechOutputUnavailableReason ?? "The loaded model has no speech output.");
         string input = Str(root, "input");
         if (string.IsNullOrWhiteSpace(input))
             return Error(400, "input is required.");
+        if (root.TryGetProperty("voice", out var voiceProp) && voiceProp.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
+            return Error(400, $"voice must be a string naming one of the model's voices ({string.Join(", ", speaker.SpeechVoices)}).");
+        string voice = Str(root, "voice");
+        if (voice != null && !speaker.IsSpeechVoice(voice))
+            return Error(400, $"voice '{voice}' is not one of the loaded model's voices: {string.Join(", ", speaker.SpeechVoices)} " +
+                             "(case does not matter). OpenAI clients send 'alloy' by default: name one of these instead.");
         string format = Str(root, "response_format") ?? "wav";
+        if (format == "pcm16") format = "pcm";
         if (format is not ("wav" or "pcm"))
-            return Error(400, "response_format must be wav or pcm (16-bit little-endian mono at the model's rate).");
-        var options = new SpeechSynthesisOptions
+            return Error(400, $"response_format '{format}' is not served: wav, pcm or pcm16 (16-bit little-endian mono at {speaker.SpeechSampleRate} Hz).");
+        if (root.TryGetProperty("speed", out var sp) && sp.ValueKind != JsonValueKind.Null
+            && (sp.ValueKind != JsonValueKind.Number || sp.GetDouble() != 1.0))
+            return Error(400, "speed must be 1: the loaded model has no speaking-rate control.");
+        string streamFormat = Str(root, "stream_format");
+        if (streamFormat is not (null or "audio" or "sse"))
+            return Error(400, "stream_format must be \"audio\" or \"sse\".");
+        bool stream = streamFormat != null || (root.TryGetProperty("stream", out var st) && st.ValueKind == JsonValueKind.True);
+        if (root.TryGetProperty("stream", out var stv) && stv.ValueKind is not (JsonValueKind.True or JsonValueKind.False or JsonValueKind.Null))
+            return Error(400, "stream must be a boolean.");
+        bool sse = streamFormat == "sse";
+        if (sse && format != "pcm")
+            return Error(400, "stream_format \"sse\" carries PCM16 (response_format pcm); a WAV stream is stream_format \"audio\".");
+        var options = new SpeechSynthesisOptions { Voice = voice, Language = Str(root, "language") };
+        if (root.TryGetProperty("seed", out var seedProp) && seedProp.ValueKind != JsonValueKind.Null)
         {
-            Voice = Str(root, "voice"),
-            Language = Str(root, "language"),
-            Speed = root.TryGetProperty("speed", out var sp) && sp.ValueKind == JsonValueKind.Number ? (float)sp.GetDouble() : 1f,
-        };
-        if (options.Speed is < 0.25f or > 4f)
-            return Error(400, "speed must be between 0.25 and 4.");
-        var result = await RunAsync<ISpeechSynthesisModel, DecodedAudio>(m => m.Synthesize(input, options)).ConfigureAwait(false);
-        if (result.Error != null) return result.Error;
-        return AudioResult(result.Value, format);
+            if (seedProp.ValueKind != JsonValueKind.Number || !seedProp.TryGetInt64(out long seed) || seed < 0 || seed > uint.MaxValue)
+                return Error(400, "seed must be an integer from 0 to 4294967295.");
+            options.Seed = (uint)seed;
+        }
+        if (root.TryGetProperty("temperature", out var tProp) && tProp.ValueKind != JsonValueKind.Null)
+        {
+            if (tProp.ValueKind != JsonValueKind.Number || tProp.GetDouble() < 0 || !double.IsFinite(tProp.GetDouble()))
+                return Error(400, "temperature (the speech temperature) must be a number of 0 (argmax) or more.");
+            options.Temperature = (float)tProp.GetDouble();
+        }
+        if (root.TryGetProperty("max_frames", out var mfProp) && mfProp.ValueKind != JsonValueKind.Null)
+        {
+            if (mfProp.ValueKind != JsonValueKind.Number || !mfProp.TryGetInt32(out int frames) || frames < 1)
+                return Error(400, "max_frames must be a positive integer (80 ms of speech each).");
+            options.MaxFrames = frames;
+        }
+
+        // The first update settles the request: a refusal (an unloaded model, an engine that cannot run it) is still a
+        // status code, not a broken stream.
+        var updates = _svc.SpeechSynthesisStreamAsync(input, options, req.HttpContext.RequestAborted).GetAsyncEnumerator(req.HttpContext.RequestAborted);
+        bool any;
+        try
+        {
+            any = await updates.MoveNextAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+            await updates.DisposeAsync().ConfigureAwait(false);
+            _logger.LogWarning(ex, "Speech request rejected");
+            return Error(400, ex.Message);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException && !req.HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            await updates.DisposeAsync().ConfigureAwait(false);
+            _logger.LogError(ex, "Speech request failed");
+            return Error(ex is ModelUnloadedException ? 503 : 500, ex.Message, "server_error");
+        }
+        int rate = speaker.SpeechSampleRate;
+        if (!stream)
+        {
+            var pcm = new System.Collections.Generic.List<float>();
+            try
+            {
+                while (any)
+                {
+                    if (updates.Current.Audio is { } chunk) pcm.AddRange(chunk);
+                    any = await updates.MoveNextAsync().ConfigureAwait(false);
+                }
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogError(ex, "Speech request failed");
+                return Error(500, ex.Message, "server_error");
+            }
+            finally
+            {
+                await updates.DisposeAsync().ConfigureAwait(false);
+            }
+            float[] samples = pcm.ToArray();
+            return format == "wav"
+                ? Results.File(TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Wav(samples, rate), "audio/wav", "speech.wav")
+                : Results.File(TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Pcm16(samples), "audio/pcm");
+        }
+        return new SpeechStreamResult(updates, any, format, sse, rate, _logger);
+    }
+
+    /// <summary>A speech reply streamed as its frames are decoded: chunked audio (a WAV stream's header first) or OpenAI's
+    /// SSE events.</summary>
+    private sealed class SpeechStreamResult : IResult
+    {
+        private readonly System.Collections.Generic.IAsyncEnumerator<ChatStreamUpdate> _updates;
+        private readonly bool _first, _sse;
+        private readonly string _format;
+        private readonly int _rate;
+        private readonly ILogger _logger;
+
+        public SpeechStreamResult(System.Collections.Generic.IAsyncEnumerator<ChatStreamUpdate> updates, bool first, string format, bool sse,
+            int rate, ILogger logger)
+        {
+            _updates = updates;
+            _first = first;
+            _format = format;
+            _sse = sse;
+            _rate = rate;
+            _logger = logger;
+        }
+
+        public async Task ExecuteAsync(HttpContext context)
+        {
+            var response = context.Response;
+            var ct = context.RequestAborted;
+            response.StatusCode = 200;
+            response.ContentType = _sse ? "text/event-stream" : _format == "wav" ? "audio/wav" : "audio/pcm";
+            response.Headers.CacheControl = "no-cache";
+            if (_sse) response.Headers["X-Accel-Buffering"] = "no";
+            int promptTokens = 0, frames = 0;
+            try
+            {
+                if (!_sse && _format == "wav")
+                    await response.Body.WriteAsync(TensorSharp.Models.Lfm3.Lfm3SpeechAudio.StreamingWavHeader(_rate), ct).ConfigureAwait(false);
+                await response.Body.FlushAsync(ct).ConfigureAwait(false);
+                bool any = _first;
+                while (any)
+                {
+                    ChatStreamUpdate update = _updates.Current;
+                    if (update.Audio is { Length: > 0 } chunk)
+                    {
+                        byte[] pcm = TensorSharp.Models.Lfm3.Lfm3SpeechAudio.Pcm16(chunk);
+                        if (_sse)
+                            await WriteEventAsync(response, new { type = "speech.audio.delta", audio = Convert.ToBase64String(pcm) }, ct).ConfigureAwait(false);
+                        else
+                            await response.Body.WriteAsync(pcm, ct).ConfigureAwait(false);
+                        await response.Body.FlushAsync(ct).ConfigureAwait(false);
+                    }
+                    if (update.Done)
+                    {
+                        promptTokens = update.PromptTokens;
+                        frames = update.EvalTokens;
+                    }
+                    any = await _updates.MoveNextAsync().ConfigureAwait(false);
+                }
+                if (_sse)
+                    await WriteEventAsync(response, new
+                    {
+                        type = "speech.audio.done",
+                        usage = new { input_tokens = promptTokens, output_tokens = frames, total_tokens = promptTokens + frames },
+                    }, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // The client went away: the pipeline's iterator stops the engine request when it is disposed.
+            }
+            catch (Exception ex)
+            {
+                // The status is sent: the stream just ends (an SSE client is told why).
+                _logger.LogError(ex, "Speech stream failed");
+                if (_sse && !ct.IsCancellationRequested)
+                    await WriteEventAsync(response, new { type = "error", error = new { message = ex.Message, type = "server_error" } }, CancellationToken.None)
+                        .ConfigureAwait(false);
+            }
+            finally
+            {
+                await _updates.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        private static async Task WriteEventAsync(HttpResponse response, object payload, CancellationToken ct)
+        {
+            byte[] line = System.Text.Encoding.UTF8.GetBytes("data: " + JsonSerializer.Serialize(payload) + "\n\n");
+            await response.Body.WriteAsync(line, ct).ConfigureAwait(false);
+            await response.Body.FlushAsync(ct).ConfigureAwait(false);
+        }
     }
 
     public async Task<IResult> MusicAsync(HttpRequest req)

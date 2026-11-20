@@ -543,7 +543,7 @@ The response shape (when the model decides to call the tool):
 }
 ```
 
-Continue the conversation by appending the assistant tool call and a `role: "tool"` message containing the function result, then call `/api/chat/ollama` again.
+Continue the conversation by appending the assistant tool call and a `role: "tool"` message containing the function result, then call `/api/chat/ollama` again. Send the assistant message back as it came, with its `tool_calls` (and `thinking`, when there was any): the server renders the call into the prompt, and the request continues the conversation's cached prefix.
 
 Only the parameters listed in `required` are declared as required to the model. A tool that sends no `required` list declares none of its parameters as required (JSON-schema renderers write `"required": []`), so every one of its parameters stays optional.
 
@@ -826,6 +826,38 @@ are 1 fps and 16 frames. Frames keep their source order and each carries its sou
 seconds, so this is frame sampling rather than a temporal encoder. Remote HTTP URLs are not
 fetched — send a data URI. Audio parts are refused with HTTP 400 rather than dropped.
 
+### Chat Completions with Images, Video and Audio (LFM3-Omni)
+
+LFM3-Omni-2B with its projector (`--mmproj mmproj-LFM3-Omni-2B-Q8_0.gguf`) takes images,
+audio and video in one message. A `video_url` clip is saved and read by the model itself:
+2 frames a second (at most 384) and its soundtrack, the way llama.cpp and Hugging Face
+read it, so `fps` / `max_frames` do not apply and no frames are sampled on the host.
+Without the projector (or with LFM3-1.7B) every media part is refused with HTTP 400.
+
+```bash
+VID_B64=$(base64 < clip.mp4 | tr -d '\n')
+WAV_B64=$(base64 < question.wav | tr -d '\n')
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"LFM3-Omni-2B-Q4_K_M.gguf\",
+    \"messages\": [
+      {\"role\": \"system\", \"content\": \"Answer questions about the video using what you see and hear.\"},
+      {\"role\": \"user\", \"content\": [
+        {\"type\": \"video_url\", \"video_url\": {\"url\": \"data:video/mp4;base64,$VID_B64\"}},
+        {\"type\": \"input_audio\", \"input_audio\": {\"data\": \"$WAV_B64\", \"format\": \"wav\"}},
+        {\"type\": \"text\", \"text\": \"Answer the spoken question about the clip.\"}
+      ]}
+    ],
+    \"temperature\": 0,
+    \"max_tokens\": 200
+  }"
+```
+
+The model sees a message's media before its text, still images before videos, then audio
+clips. For speech recognition use the system prompt `Perform ASR in English.` and send the
+audio alone. See [the model card](../docs/models/lfm3.md#media-input).
+
 ### Chat Completions with Tool Calling
 
 ```bash
@@ -1050,6 +1082,14 @@ starts with `--redis-url` or `TS_RESPONSES_STORE_REDIS_URL`. Every request is
 self-contained: `previous_response_id` is refused with HTTP 400, so send the
 earlier turns in `input`. `text.format` cannot be combined with `reasoning` or
 `tools` (HTTP 400).
+
+Message items take media content parts as well: `{"type": "input_image", "image_url":
+"data:image/...;base64,..."}`, `{"type": "input_audio", "input_audio": {"data": "<base64>",
+"format": "wav"}}` and, for the families that take Chat Completions `video_url` (DeepSeek
+V4.1, Qwen 3.8 Flash Next, LFM3-Omni), `{"type": "input_video", "input_video": {"url":
+"data:video/mp4;base64,...", "fps": 1, "max_frames": 16}}` — the embeddings API's
+`input_video` part, with `video_url`'s optional sampling fields. Other families refuse
+`input_video` with HTTP 400.
 
 ### Sub-agents (`multi_agent`)
 
@@ -1296,7 +1336,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, and the `skills` block described under [Skills](#skills-apiskills). When the hosted model generates video it also returns a `video` object — `family` (`"ltx-2.5"`, `"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsKeyframeConditioning`, `defaultPreviewFrames`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. Likewise an `image` object when it makes pictures — `family` (`"qwen_image"`, `"minimax-h3-image"`), `supportsEdit`, `supportsMask`, and `minimumArea` (the smallest output area it makes pictures at as trained, 0 for none; 4,194,304 for MiniMax-H3-Image) — and `null` otherwise; the Web UI and TensorAgent's page know an image model by it. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, the `skills` block described under [Skills](#skills-apiskills), and `speechOutput` (`available`, `voices`, `reason`: whether `/api/chat` can give a spoken reply, see [Spoken replies](#spoken-replies-speech-lfm3-omni)). When the hosted model generates video it also returns a `video` object — `family` (`"ltx-2.5"`, `"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsKeyframeConditioning`, `defaultPreviewFrames`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. Likewise an `image` object when it makes pictures — `family` (`"qwen_image"`, `"minimax-h3-image"`), `supportsEdit`, `supportsMask`, and `minimumArea` (the smallest output area it makes pictures at as trained, 0 for none; 4,194,304 for MiniMax-H3-Image) — and `null` otherwise; the Web UI and TensorAgent's page know an image model by it. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
 
 ---
 
@@ -1385,6 +1425,8 @@ Event shapes:
 | `tool_progress`, `tool`, `text`, `seconds`, `detail`, `agents` | while an in-process skill/code/agent call is being written or run | transient live activity: phase is `writing`, `running`, or `finished`; the bundled Web UI keeps only a bounded current tail and clears it on `finished`. While `wait_agent` is `running`, `agents` is a snapshot of every sub-agent in the request (`agent_id`, `parent_id`, `task`, `agent_type`, `status`, `tool`, `tool_status`, `detail`, `result`, `error`); otherwise it is `null` |
 | `skill_step`, `agent_id`, `skill`, `detail`, `ok`, `round`, `files` | after each in-process skill, code or agent tool call finishes | completion metadata for the tool, target and result; `agent_id` names the agent that made the call (`/root` for the main conversation); produced artifacts appear as optional `{name, bytes, url}` entries in `files` |
 | `artifact_verified`, `files` | once, when a routed deliverable workflow (such as a PowerPoint request) proves its output | the one deliverable that passed the host's structural checks, as a single `{name, bytes, url}` entry; `skill_step.files` stays empty on those requests so provisional files are never offered |
+| `audio`, `sampleRate` | a spoken reply (`speech`, below), between the turn's other frames as the speech is made (during a tool's run too) | base64 PCM16 little-endian mono, one 80 ms speech frame (or the codec's tail at the end) at `sampleRate` Hz |
+| `notice`, `code`, `detail` | before `done`, when a spoken turn's speech stopped or its audio could not be written | `code` `speech_failed`: the speech stopped (`detail` is the reason; the text turn is whole, and what was spoken is kept); `speech_not_saved`: no WAV, so no `audioUrl`. `notice` is the English sentence |
 | `done`, `tokenCount`, `elapsed`, `tokPerSec`, `aborted`, `truncated`, `error`, `sessionId`, `promptTokens`, `kvReusedTokens`, `kvReusePercent` | last frame | terminal summary: `tokenCount` counts every token the turn generated (reasoning, tool calls and answer, across all rounds), `elapsed` is the turn's wall-clock seconds including tool runs, and `tokPerSec` is the decode speed; `truncated` is true when the max-tokens budget ended the answer (not the user; `aborted` covers that) |
 
 Sample terminal frame:
@@ -1435,6 +1477,82 @@ fields - they all measure the same thing (prompt tokens served from cached KV
 state: the session's prior turn, or a system/tool prefix shared across
 conversations).
 
+### Spoken replies (`speech`, LFM3-Omni)
+
+A model that speaks (LFM3-Omni with its mmproj, which carries the speech
+decoder) can say its reply aloud while it writes it. `/api/models` reports
+whether the loaded model can:
+
+```json
+"speechOutput": { "available": true, "voices": ["female", "male"], "reason": null }
+```
+
+`voices` lists the default first; `reason` says why not when `available` is
+false (a model without speech output, or LFM3-Omni loaded without its mmproj).
+Ask for a spoken reply with `speech`: `true` (the default voice), or
+`{"voice": "...", "language": "..."}` (both optional; `language` is the speech's
+language code, such as `en`, `zh` or `fr`; without it, the language the user's
+last message is written in by its script, Latin letters meaning English).
+A spoken turn is the request's text turn: whatever the same request runs
+without `speech` (reasoning with `think`, `skills` and the catalog, the host's
+code tools, `tools`, knowledge, sub-agents, every round of the tool loop) it
+runs, with the same frames, and the model's TTS speaks the answer text of each
+round, sentence by sentence, as it is written (the text before a tool call when
+the call begins). Reasoning, tool calls and tool results are never spoken, nor
+are fenced code, table rows, emoji, markdown markers, a host note in the answer
+(`_(...)_`) or an inline code span of 40 characters or more; a URL is said as
+its host, a path of three or more parts as its last name. Every spoken turn,
+in every language, is spoken from its text this way, so its prompt is the text
+turn's (no speech line in the system prompt) and a conversation that switches
+speech on and off keeps reusing its cached prefix.
+
+```bash
+curl -N -X POST http://localhost:5000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sessionId": "a3b1c2...",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "speech": {"voice": "female"}
+  }'
+```
+
+The answer arrives in the ordinary `token` frames (and `thinking`,
+`tool_progress`, `skill_step` frames as in a text turn) and the speech in
+`audio` frames between them; the `done` frame adds `audioId`, `audioUrl` (the
+whole turn's speech as a 24 kHz mono 16-bit WAV under `/uploads/`, named by when
+it was spoken) and `audioSeconds`:
+
+```
+data: {"token":"The capital "}
+data: {"audio":"AAAAQADA/38...","sampleRate":24000}
+data: {"token":"of France is Paris."}
+data: {"audio":"...","sampleRate":24000}
+data: {"done":true,"tokenCount":41,"elapsed":2.9,"tokPerSec":19.3,"aborted":false,"truncated":false,"error":null,"sessionId":"a3b...","promptTokens":44,"kvReusedTokens":0,"kvReusePercent":0.0,"audioId":"audio_5f0c...","audioUrl":"/uploads/speech-20261119-101500-5f0c1a2b3c4d4e5f8a9b0c1d2e3f4a5b.wav","audioSeconds":3.36}
+```
+
+If the speech fails, the text turn still completes and one `notice` frame
+before `done` says so (`code` `speech_failed`, `detail` the reason). A model
+that cannot speak refuses `speech` with HTTP 400 and its reason
+(`{"code": "speech_unavailable", "error": "..."}`); so does a voice the model
+does not have, and a `speech` that is not `true` or an object of `voice` /
+`language`. A stopped reply (Stop, or a new prompt that replaces it, during a
+tool round too) stops its speech, writes no WAV and has no `audioId`.
+
+Keep the reply in the history with its `audioId` (and `audioUrl`, which the
+bundled pages use to show a player and a download): sent back on the assistant
+message, `{"role": "assistant", "content": "<transcript>", "audioId": "audio_5f0c..."}`
+renders the turn as its text, which the session matches to the tokens it
+generated, tool rounds included, as for a text turn, so the next turn (spoken or
+not) reuses the cached prompt through it. A spoken turn is kept for an hour in
+memory, for the model load that made it; an unknown id renders as its text too,
+and the server log says so once.
+
+The bundled Web UI shows a **Speak replies** switch (and a voice picker) only
+when `speechOutput.available`; it plays the `audio` frames as they arrive, and
+leaves an `<audio>` player and a **Download audio** link in the bubble when the
+reply is done. TensorAgent's chat does the same, with **Save audio** going
+through the app's save picker.
+
 ### File Uploads (`/api/upload`) — images, video, audio, text, PDF
 
 ```bash
@@ -1446,9 +1564,10 @@ Every response carries `ok, file, url, mediaType, fileName`; the media type is
 classified by file extension (image / video / audio / pdf / text). `file` is
 the server-assigned filename inside the upload directory. The client then
 references that `file` name in the next `/api/chat` request —
-images via `imagePaths`, extracted video frames via `isVideo: true` +
-`imagePaths`, audio via `audioPaths`, and text content by inlining the returned
-`textContent` into the message.
+images via `imagePaths`, a video via `isVideo: true` + its extracted frames in
+`imagePaths` + the video itself in `videoFilePaths` (a family that reads the clip,
+LFM3-Omni, samples it and hears its soundtrack; the others use the frames), audio via
+`audioPaths`, and text content by inlining the returned `textContent` into the message.
 
 **PDF documents** get a two-stage treatment:
 
@@ -2164,6 +2283,7 @@ the request.
 | `frequency_penalty` | float       | 0       | Frequency penalty                  |
 | `seed`              | int         | -1      | Random seed                        |
 | `stop`              | string/array| null    | Stop sequences                     |
+| `ignore_eos`        | bool        | false   | Non-standard (vLLM / SGLang / llama.cpp spelling): keep generating through end-of-sequence tokens until `max_tokens`, for fixed-length benchmarks. The repetition guard is off for the request too, so only the token limit and the request's own `stop` strings end it; the EOS tokens count in `usage.completion_tokens` and their marker text is left out of the reply. Must be a boolean (HTTP 400 otherwise) |
 | `response_format`   | object      | null    | `text`, `json_object`, or `json_schema` |
 | `think`             | bool        | false   | Non-standard extension: enables thinking/reasoning parsing (returned/streamed as `reasoning_content`) |
 | `chat_template_kwargs` | object  | null    | llama.cpp / vLLM / SGLang convention. Only `enable_thinking` (bool) is read, as the same switch as `think`; a request whose `think` and `enable_thinking` disagree is HTTP 400. Other keys are ignored, and the server logs that once per key |
@@ -2171,12 +2291,20 @@ the request.
 | `tool_choice`       | string/object | `auto` | Chat Completions: `auto`, `none` (offers no tools, including the built-in skill, code and sub-agent tools), `required`, or `{"type": "function", "function": {"name": ...}}`; the last two must name client-declared `tools` (HTTP 400 otherwise). Only DeepSeek V4.1 enforces them with a tool-call grammar; other families accept them but can still answer without calling the tool |
 | `parallel_tool_calls` | bool      | null    | Chat Completions: must be a boolean (HTTP 400 otherwise). Only DeepSeek V4.1 honors `false` (its tool grammar then allows a single call); other families accept and ignore it |
 
-`top_k`, `min_p`, `repeat_penalty` / `repetition_penalty` and `repeat_last_n` are
+`top_k`, `min_p`, `repeat_penalty` / `repetition_penalty`, `repeat_last_n` and `ignore_eos` are
 not part of the OpenAI specification; they are read from the top level the way
 llama.cpp and vLLM expose them, so an OpenAI-shaped client can pass them through
 `extra_body`. `/v1/responses` reads the same sampling fields, with
 `max_output_tokens` in place of `max_tokens`. The `--sampling-precedence` rule
 above applies to every surface.
+
+The repetition, presence and frequency penalties look back over the last
+`repeat_last_n` **generated** tokens only. Engines differ here: llama-server also
+counts the last `repeat_last_n` prompt tokens (it feeds the prompt into its sampler
+first), vLLM and Hugging Face `generate` penalize every prompt and output token with
+no window, and SGLang every output token. For output parity with another engine,
+compare with `repeat_penalty` 1.0 (and greedy decoding), as the shipped regression
+configs do.
 
 ---
 

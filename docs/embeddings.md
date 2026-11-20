@@ -751,7 +751,8 @@ pool is separate; set `TS_GGML_CPU_THREADS=8` at process start for an explicit
 eight-worker media comparison. Validation records this thread policy separately
 from arithmetic selectors. On Linux its automatic pool count floors the CFS
 quota, which gives seven workers on the 7.65-core test VM; on Apple it defaults
-to physical cores. No inference call changes the process environment or a
+to the physical cores (all but one on a CPU with performance and efficiency
+cores, as `docs/env_var_feature_matrix.md` describes). No inference call changes the process environment or a
 shared library's thread settings.
 
 Fresh continuation evidence is in ignored

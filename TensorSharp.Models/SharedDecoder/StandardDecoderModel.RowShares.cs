@@ -64,8 +64,10 @@ namespace TensorSharp.Models
 
         /// <summary>A family whose steps write a slot's rows below its length with other bytes opts out: its checkpoints copy.
         /// (Qwen3.8's QSA rewrites the last whole block's pooled key below the length with the same bytes, a function of rows
-        /// that do not change.)</summary>
-        protected virtual bool CheckpointRowsAppendOnly => true;
+        /// that do not change.) A model with sliding-window ring caches (StandardDecoderModel.SlidingRings.cs) never shares: a
+        /// ring's cell p mod R holds position p, so the slot's next rows, written at or past every checkpoint's length, still
+        /// overwrite the cells of the positions a checkpoint's window reads.</summary>
+        protected virtual bool CheckpointRowsAppendOnly => !HasRingCaches;
 
         private bool _lastMaterializeWantedRoom;
 
@@ -94,6 +96,11 @@ namespace TensorSharp.Models
         private bool InAnyShare(Slot slot) => slot != null && (slot.SharesRows || HasDependents(slot));
 
         // ---------------------------------------------------------------- capture
+
+        /// <summary>Requests run in slots of their own and an automatic checkpoint shares its request's rows: the conditions
+        /// <see cref="IPrefixCacheModel.TryCaptureCheckpoint"/> shares them on.</summary>
+        bool IPrefixCacheModel.CheckpointsShareRows => _slots != null && SlotBoundPolicies && CheckpointRowsAppendOnly
+            && !SharedRowsDisabledForTests && SupportsPrefixCheckpoints;
 
         bool IPrefixCacheModel.TryCaptureCheckpoint(string requestId, string payloadKey, bool mayShareRows, out PayloadFootprint footprint)
         {

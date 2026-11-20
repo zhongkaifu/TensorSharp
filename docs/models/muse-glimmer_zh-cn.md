@@ -260,7 +260,8 @@ decode 为 19.5 tok/s，走重放路径为 21.3（+9%）。
 
 llama.cpp 以 `--device none -ngl 0` 运行（在 Metal 构建上，只给 `-ngl 0` 仍会把
 batch≥32 的矩阵乘按算子卸载到 GPU）。llama.cpp 默认只用 P 核（本机为 `-t 6`）；
-TensorSharp 的 ggml CPU 后端现在默认使用**全部物理核**（这里是 18 个），因为这个负载
+测量时 TensorSharp 的 ggml CPU 后端默认使用**全部物理核**（这里是 18 个；现在在混合架构的 Apple CPU 上，
+提示步给宿主留出一个核，解码步留出两个：见[环境变量矩阵](../env_var_feature_matrix_zh-cn.md)），因为这个负载
 会随 E 核扩展 —— llama.cpp 自己在给 `-t 18` 时 tg 从 3.69 升到 7.87，而它的提示吞吐
 随 E 核*下降*，我们的则上升。
 
@@ -610,4 +611,4 @@ DFlash 投机解码只走单卡路径：`--tp N` > 1 下配置的草稿模型会
 | `TS_MUSE_GLIMMER_SWA_ROWS` | 覆盖 SWA 环的行数（诊断用） |
 | `TS_DFLASH_PREFILL_CHUNK` | DFlash prefill 追赶草稿模型时每次**主干**前向的 token 数（默认 1024） |
 | `TS_KV_FATTN_COPY` | `0` = 从不物化填充后的 KV 窗口（会复现 ggml-cuda flash-attention **vec** 故障）；`force` = 总是物化 |
-| `TS_GGML_CPU_THREADS` | 共享 ggml CPU 后端的线程数（默认：全部物理核） |
+| `TS_GGML_CPU_THREADS` | 共享 ggml CPU 后端提示线程池的线程数，单独设置时也是解码线程池的线程数（默认：全部物理核；在有性能核与能效核的 Apple CPU 上为全部物理核减一，解码步为减二，即 `TS_GGML_CPU_DECODE_THREADS`：见[环境变量矩阵](../env_var_feature_matrix_zh-cn.md)） |

@@ -175,6 +175,12 @@ namespace TensorSharp.Runtime
                 // trained on and it quoted it back as "INV-4472".
                 "glm4" or "chatglm-bpe" =>
                     @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+                // LiquidAI LFM2 / LFM3 (tokenizer.ggml.pre "lfm2"): llama.cpp's LLAMA_VOCAB_PRE_TYPE_LLAMA3 regex
+                // (llama-vocab.cpp, the "adapted" form with case-sensitive contraction alternatives) and
+                // ignore_merges, which Encode applies to every vocabulary (a piece in the vocabulary is one token).
+                // The default below splits every digit; LLAMA3 keeps runs of up to three, so "2026" is "202" + "6".
+                "lfm2" =>
+                    @"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
                 "tekken" =>
                     @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|" +
                     @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|" +

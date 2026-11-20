@@ -193,6 +193,19 @@ internal static class OpenAIResponseFactory
         };
     }
 
+    /// <summary>A spoken reply's message (OpenAI's audio output): no <c>content</c>, its text being
+    /// <c>audio.transcript</c>; the reasoning and tool calls as a text reply's. <paramref name="audio"/> is null when the
+    /// reply has no content to speak (only tool calls).</summary>
+    public static object SpokenAssistantMessage(string? thinking, IReadOnlyList<ToolCall>? toolCalls, object? audio) => new
+    {
+        role = "assistant",
+        content = (string?)null,
+        reasoning_content = thinking,
+        thinking,
+        tool_calls = BuildToolCalls(toolCalls),
+        audio,
+    };
+
     public static object PlainAssistantMessage(string content) => new
     {
         role = "assistant",
@@ -214,7 +227,7 @@ internal static class OpenAIResponseFactory
         {
             id = $"call_{Guid.NewGuid():N}"[..24],
             type = "function",
-            function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) },
+            function = new { name = tc.Name, arguments = ToolCallArgumentsJson.Serialize(tc.Arguments) },
         }).ToArray();
     }
 
@@ -231,7 +244,7 @@ internal static class OpenAIResponseFactory
             index = tc.Index,
             id = $"call_{Guid.NewGuid():N}"[..24],
             type = "function",
-            function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) },
+            function = new { name = tc.Name, arguments = ToolCallArgumentsJson.Serialize(tc.Arguments) },
         }).ToArray();
     }
 

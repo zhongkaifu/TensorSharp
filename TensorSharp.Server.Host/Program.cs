@@ -211,7 +211,8 @@ if (SkillHostOptions.Parse(args).ListOnly)
 LogLevel resolvedLogLevel = LoggingSetup.ResolveMinimumLevel();
 string? configuredBackendInput = ServerOptionsBuilder.ReadConfiguredBackendInput(args);
 bool redisFlagsApplied, continuousBatchingFlagApplied, specFlagsApplied, qwenImageFlagsApplied,
-    kvCacheDtypeFlagApplied, moeCpuOffloadFlagsApplied, gpuDeviceFlagApplied, tensorParallelFlagsApplied;
+    kvCacheDtypeFlagApplied, moeCpuOffloadFlagsApplied, gpuDeviceFlagApplied, tensorParallelFlagsApplied,
+    promptAttentionFlagApplied;
 try
 {
     ServerOptionsBuilder.ApplyPrefixCacheCliFlag(args);
@@ -250,6 +251,9 @@ try
     // which Vulkan device the ggml_vulkan backend initializes on. Must run before
     // the startup model is loaded (the device is fixed at first backend init).
     gpuDeviceFlagApplied = ServerOptionsBuilder.ApplyGpuDeviceCliFlag(args);
+    // Translate --prompt-attention into TS_PROMPT_ATTENTION, which the CUDA executor reads when the model loads
+    // (and refuse an unknown inherited value now, before a model loads).
+    promptAttentionFlagApplied = ServerOptionsBuilder.ApplyPromptAttentionCliFlag(args);
     // Translate --tp / --layer-split and distributed options into the model placement env vars
     // the model loader reads (ModelBase.Create for the local degree,
     // DistributedTpConfig for the multi-node pair). Must run before the startup
@@ -545,6 +549,17 @@ if (gpuDeviceFlagApplied)
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
         "Vulkan GPU device configured via CLI: --gpu-device {DeviceIndex} (applies when the ggml_vulkan backend initializes)",
         Environment.GetEnvironmentVariable(GgmlBasicOps.VulkanDeviceEnvVar));
+}
+
+if (TensorSharp.Graph.PromptAttentionConfig.FromEnvironment() is { } configuredAttention)
+{
+    // An option's name and one of its three fixed values, never request content.
+    string attentionSource = promptAttentionFlagApplied
+        ? "CLI (" + TensorSharp.Graph.PromptAttentionConfig.Flag + ")" : TensorSharp.Graph.PromptAttentionConfig.EnvironmentVariable;
+    string attentionPath = TensorSharp.Graph.PromptAttentionConfig.Name(configuredAttention);
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Prompt attention configured via {Source}: {AttentionPath} (applies to prompt chunks on --backend cuda; the default is " +
+        "int8 where it runs, f16 elsewhere)", attentionSource, attentionPath);
 }
 
 if (tensorParallelFlagsApplied)

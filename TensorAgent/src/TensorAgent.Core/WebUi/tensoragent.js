@@ -69,6 +69,11 @@
     // row of chrome a phone composer has. Re-read whenever the chat comes back to the
     // front, so changing it in Settings applies to the very next message.
     think: false,
+    // Spoken replies (a model that speaks: LFM3-Omni with its projector). /api/models'
+    // speechOutput when it is available, else null; the switch is shown only then.
+    speechOutput: null,
+    speakReplies: false,
+    speechVoice: null,
   };
 
   // ---- tiny helpers --------------------------------------------------------
@@ -419,6 +424,145 @@
     return audio;
   }
 
+  // ---- spoken replies ------------------------------------------------------
+  //
+  // A model that speaks streams its reply as text and as 80 ms PCM16 chunks, in the
+  // order it makes them. The chunks play as they arrive through one AudioContext,
+  // created and resumed inside the tap that sends (a WebView starts audio only from a
+  // user gesture); the finished reply is a WAV under /uploads that the turn keeps as a
+  // player and a Save link, in a reopened chat too.
+
+  /** The names the page shows for the voices the host lists (any other shows as sent). */
+  var VOICE_NAMES = { female: 'page.speech.voiceFemale', male: 'page.speech.voiceMale' };
+
+  function speaksReplies() { return !!state.speechOutput && state.speakReplies; }
+
+  /** The request's `speech`: true, or the voice picked when the model has several. */
+  function speechField() {
+    var voices = (state.speechOutput && state.speechOutput.voices) || [];
+    return state.speechVoice && voices.length > 1 && voices.indexOf(state.speechVoice) >= 0
+      ? { voice: state.speechVoice } : true;
+  }
+
+  function paintSpeech() {
+    var bar = $('speechbar'), toggle = $('speech-toggle'), picker = $('speech-voice');
+    if (!bar || !toggle || !picker) return;
+    bar.style.display = state.speechOutput ? '' : 'none';
+    toggle.checked = speaksReplies();
+    toggle.setAttribute('aria-checked', speaksReplies() ? 'true' : 'false');
+    var voices = (state.speechOutput && state.speechOutput.voices) || [];
+    if (voices.indexOf(state.speechVoice) < 0) state.speechVoice = voices.length ? voices[0] : null;
+    picker.innerHTML = '';
+    voices.forEach(function (name) {
+      var option = el('option', null, VOICE_NAMES[name] ? t(VOICE_NAMES[name]) : name);
+      option.value = name;
+      picker.appendChild(option);
+    });
+    picker.value = state.speechVoice || '';
+    picker.style.display = speaksReplies() && voices.length > 1 ? '' : 'none';
+  }
+
+  var speechContext = null;
+  /** Create or resume the AudioContext inside a tap, so a reply's chunks may play. */
+  function primeSpeech() {
+    if (!speaksReplies()) return null;
+    var Context = window.AudioContext || window.webkitAudioContext;
+    if (!Context) return null;
+    try {
+      if (!speechContext || speechContext.state === 'closed') speechContext = new Context();
+      // 'suspended', or WebKit's 'interrupted' after the app was in the background.
+      if (speechContext.state !== 'running' && speechContext.resume) speechContext.resume();
+    } catch (e) {
+      note('speech-context-failed', (e && e.message) || e);
+      speechContext = null;
+    }
+    return speechContext;
+  }
+
+  /** Base64 PCM16 little-endian mono to float samples. */
+  function pcm16Floats(base64) {
+    var bytes = atob(base64), count = bytes.length >> 1;
+    var samples = new Float32Array(count);
+    for (var i = 0; i < count; i++) {
+      var v = bytes.charCodeAt(2 * i) | (bytes.charCodeAt(2 * i + 1) << 8);
+      if (v >= 0x8000) v -= 0x10000;
+      samples[i] = v / 32768;
+    }
+    return samples;
+  }
+
+  var liveSpeech = null;
+  function stopLiveSpeech() {
+    if (liveSpeech) liveSpeech.stop();
+    liveSpeech = null;
+  }
+
+  /** Plays one reply's chunks back to back as they arrive; stop() silences it. */
+  function speechPlayer(context, onPlaying) {
+    var sources = [], nextAt = 0, stopped = false;
+    return {
+      push: function (base64, rate) {
+        if (stopped || !base64 || !(rate > 0)) return;
+        var samples = pcm16Floats(base64);
+        if (!samples.length) return;
+        var buffer = context.createBuffer(1, samples.length, rate);
+        buffer.getChannelData(0).set(samples);
+        var source = context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(context.destination);
+        nextAt = Math.max(nextAt, context.currentTime + 0.05);
+        source.start(nextAt);
+        nextAt += buffer.duration;
+        sources.push(source);
+        source.onended = function () {
+          var at = sources.indexOf(source);
+          if (at >= 0) sources.splice(at, 1);
+          if (!sources.length) onPlaying(false);
+        };
+        onPlaying(true);
+      },
+      stop: function () {
+        stopped = true;
+        sources.forEach(function (source) { try { source.stop(); } catch (e) {} });
+        sources = [];
+        onPlaying(false);
+      },
+    };
+  }
+
+  /** The box under a reply's text that holds its player, its Save link and its Stop; put
+   * back after a repaint of the bubble's text, which replaces its children. */
+  function speechBoxOf(view) {
+    if (!view.speechBox) view.speechBox = el('div', 'spoken-reply');
+    if (view.speechBox.parentNode !== view.bubble) view.bubble.appendChild(view.speechBox);
+    return view.speechBox;
+  }
+
+  /** A finished spoken reply: the whole of it to play again, and to save. */
+  function spokenReplyNode(view, url, seconds) {
+    var box = speechBoxOf(view);
+    box.querySelectorAll('audio').forEach(function (n) { n.remove(); });
+    box.querySelectorAll('.speech-download').forEach(function (n) { n.remove(); });
+    box.appendChild(soundNode(url));
+    var save = el('a', 'filechip speech-download', typeof seconds === 'number' && isFinite(seconds)
+      ? t('page.speech.saveWithLength', { seconds: seconds.toFixed(1) }) : t('page.speech.save'));
+    save.href = url;
+    save.download = uploadName(url);
+    save.setAttribute('download', save.download);
+    // A browser downloads the same-origin link; the app's WebView has no download
+    // manager, so the app exports the file through its own save picker.
+    save.addEventListener('click', function (ev) {
+      if (!state.native || ev.defaultPrevented || ev.button) return;
+      ev.preventDefault();
+      post('/api/agent/events', { type: 'save-audio', url: url, name: save.download })
+        .catch(function (error) {
+          notice(t('page.speech.saveFailed', { error: (error && error.message) || error }), 'error');
+        });
+    });
+    box.appendChild(save);
+    return box;
+  }
+
   function addTurn(role, content, attachments, extra) {
     clearEmpty();
     var turn = el('div', 'turn ' + (role === 'user' ? 'me' : 'bot'));
@@ -443,6 +587,9 @@
     if (extra && extra.videoUrl) {
       b.appendChild(clipNode(extra.videoUrl));
       if (extra.audioUrl) b.appendChild(soundNode(extra.audioUrl));
+    } else if (extra && extra.audioUrl) {
+      // A spoken reply: the whole of it, to play again or save.
+      spokenReplyNode({ bubble: b }, extra.audioUrl, entry && entry.audioSeconds);
     }
     turn.appendChild(b);
     chat.appendChild(turn);
@@ -799,6 +946,9 @@
     // What a video model can be given besides its description. The host reports it
     // for a video model and null for every other one.
     state.video = d && d.video ? Object.assign({}, d.video) : null;
+    state.speechOutput = d && d.speechOutput && d.speechOutput.available === true ? d.speechOutput : null;
+    if (!state.speechOutput) state.speakReplies = false;
+    paintSpeech();
     if (previousModel !== state.model) modelChanged();
     // A foreground capability refresh must not discard an unsent clip's
     // length or image semantics. A different checkpoint starts a fresh choice,
@@ -1384,6 +1534,8 @@
     if (state.generating && !text.value.trim() && !state.attachments.length) {
       note('send-is-stop', state.turn); stop(); return;
     }
+    // Inside the tap: the only moment a WebView lets a spoken reply start playing.
+    primeSpeech();
     if (pendingUploadCount) {
       notice(t('page.send.waitForUploads'));
       return;
@@ -1555,6 +1707,7 @@
       knowledgeCollections: state.knowledgeCollections.slice(),
     };
     if (state.session) body.sessionId = state.session;
+    if (speaksReplies()) body.speech = speechField();
     if (!skillsOn()) body.skills_discovery = false;
     else if (state.skills.length) body.skills = state.skills;
     else if (state.skillSelectionExplicit) {
@@ -1658,6 +1811,7 @@
    */
   function stop() {
     var turn = state.turn;
+    stopLiveSpeech();
     retireResponse();
     state.interrupted = true;
     if (turn) {
@@ -2226,6 +2380,8 @@
     // next request rewrites the saved transcript from -- an entry that has forgotten
     // the PDF erases the PDF from a chat that had one.
     var made = [], madeSeen = {}, madeImage = null, madeVideo = null, madeAudio = null;
+    // A spoken reply's id, WAV and length (its done frame), and the chunks this read has seen.
+    var madeSpeech = null, chunksSeen = 0;
     // What the picture was made from, and the readings an image turn offered instead of
     // making one: the host plans the next picture turn from both.
     var madeFrom = null, madeChoices = null;
@@ -2266,6 +2422,7 @@
       if (answerDirty) {
         view.bubble.innerHTML = render(answer); view.answerSoFar = answer; answerDirty = false;
         if (view.knowledgeSourceCandidates) showKnowledgeSources(view, view.knowledgeSourceCandidates, answer);
+        if (view.speechBox) speechBoxOf(view);
       }
       var entry = { role: 'assistant', content: answer };
       if (thinking) entry.thinking = thinking;
@@ -2275,6 +2432,7 @@
       if (madeChoices) entry.imageChoices = madeChoices;
       if (madeVideo) entry.videoUrl = madeVideo;
       if (madeAudio) entry.audioUrl = madeAudio;
+      if (madeSpeech) spokenEntry(entry);
       view.partialEntry = answer || thinking || made.length || madeImage || madeVideo ? entry : null;
       if (stickBottom) toBottom();
     }
@@ -2318,9 +2476,50 @@
         renderMessages(f.steeringMessages);
         chat.appendChild(view.turn);
       }
+      if (typeof f.audio === 'string') {
+        // Played once per turn: a page attaching to a running turn again is handed every
+        // frame from the first, into the same bubble, and must not say the reply twice.
+        chunksSeen++;
+        if (chunksSeen > (view.speechHeard || 0)) {
+          view.speechHeard = chunksSeen;
+          if (!view.liveSpeech && speaksReplies() && speechContext && (!ctrl || ctrl === state.abort)) {
+            var button = null;
+            // One reply speaks at a time: a newer one silences the one before it.
+            stopLiveSpeech();
+            view.liveSpeech = liveSpeech = speechPlayer(speechContext, function (playing) {
+              if (!button) {
+                button = el('button', 'mini quiet speech-stop', t('page.speech.stop'));
+                button.type = 'button';
+                button.addEventListener('click', function () { if (view.liveSpeech) view.liveSpeech.stop(); });
+                speechBoxOf(view).appendChild(button);
+              }
+              button.style.display = playing ? '' : 'none';
+            });
+          }
+          if (view.liveSpeech) {
+            try { view.liveSpeech.push(f.audio, Number(f.sampleRate)); }
+            catch (e) { note('speech-play-failed', (e && e.message) || e); view.liveSpeech.stop(); }
+          }
+        }
+      }
+      view.noticesSaid = view.noticesSaid || {};
+      if (typeof f.notice === 'string' && !view.noticesSaid[f.code || f.notice]) {
+        // Said once in the turn (a replay of it too), in the page's language when it knows the case.
+        view.noticesSaid[f.code || f.notice] = true;
+        var said = f.code === 'speech_failed' ? t('page.speech.failed', { error: f.detail || '' })
+          : f.code === 'speech_not_saved' ? t('page.speech.notSaved') : f.notice;
+        view.turn.appendChild(el('div', 'turn-note', said));
+      }
       if (f.done === true) {
         terminal = true;
         stats = statsOf(f);
+        if (typeof f.audioId === 'string' && f.audioId) {
+          madeSpeech = { audioId: f.audioId };
+          if (typeof f.audioUrl === 'string' && f.audioUrl) {
+            madeSpeech.audioUrl = f.audioUrl;
+            if (typeof f.audioSeconds === 'number') madeSpeech.audioSeconds = f.audioSeconds;
+          }
+        }
         // Image/video generators use zero token counters as protocol placeholders.
         // A text turn that also produces media still has its real model counters.
         if (stats && stats.tokenCount === 0 && (madeImage || madeVideo)) stats = null;
@@ -2467,6 +2666,13 @@
         if (madeAudio) soundOf(view).src = madeAudio;
       }
     }
+    function spokenEntry(entry) {
+      entry.audioId = madeSpeech.audioId;
+      if (madeSpeech.audioUrl && !madeVideo) {
+        entry.audioUrl = madeSpeech.audioUrl;
+        if (typeof madeSpeech.audioSeconds === 'number') entry.audioSeconds = madeSpeech.audioSeconds;
+      }
+    }
     // The one picture a turn shows, made on first use and made again if a repaint of
     // the bubble's text removed it.
     function pictureOf(v) {
@@ -2527,6 +2733,12 @@
       if (madeChoices) entry.imageChoices = madeChoices;
       if (madeVideo) entry.videoUrl = madeVideo;
       if (madeAudio) entry.audioUrl = madeAudio;
+      if (madeSpeech) {
+        // Sent back with the history: audioId splices the spoken turn as it was generated
+        // (the next turn reuses its prefix), audioUrl keeps its player and Save link.
+        spokenEntry(entry);
+        if (madeSpeech.audioUrl) spokenReplyNode(view, madeSpeech.audioUrl, madeSpeech.audioSeconds);
+      }
       // Nothing produced is nothing to remember: the host's own record skips an empty
       // turn too, and an empty assistant entry in the history would be sent back to
       // the model as a message it never wrote.
@@ -3512,6 +3724,15 @@
   }
   $('open-loras').addEventListener('click', function () { openLoraSheet($('open-loras')); });
   $('composer-loras').addEventListener('click', function () { openLoraSheet($('composer-loras')); });
+  $('speech-toggle').addEventListener('change', function () {
+    state.speakReplies = !!$('speech-toggle').checked && !!state.speechOutput;
+    primeSpeech();
+    if (!state.speakReplies) stopLiveSpeech();
+    paintSpeech();
+  });
+  $('speech-voice').addEventListener('change', function () {
+    state.speechVoice = $('speech-voice').value || null;
+  });
   $('lora-search').addEventListener('input', function () { if (state.loras) paintLoras(state.loras); });
   $('lora-close').addEventListener('click', closeSheets);
   document.addEventListener('keydown', function (e) {

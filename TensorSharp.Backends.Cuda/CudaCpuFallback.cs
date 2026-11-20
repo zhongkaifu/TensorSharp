@@ -12,12 +12,18 @@ namespace TensorSharp.Cuda
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> WarnedOps =
             new(StringComparer.Ordinal);
 
+        [ThreadStatic] private static long _threadCalls;
+
+        /// <summary>Host fallbacks this thread has run (a test reads it around the ops it runs).</summary>
+        internal static long ThreadCalls => _threadCalls;
+
         internal static void WarnFallback(string opName)
         {
             // A host computation inside a CUDA graph capture runs once, at recording: every replay would reuse what it
             // computed then (a recorded decode step replayed the recording's rotary positions).
             if (CudaGraphCapture.AnyCapturing)
                 throw new CudaGraphCaptureAbortedException($"CUDA op '{opName}' has no device kernel for these arguments; a recorded step cannot run it on the host.");
+            _threadCalls++;
             if (!WarnedOps.TryAdd(opName, true))
                 return;
 

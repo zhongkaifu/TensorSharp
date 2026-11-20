@@ -38,6 +38,8 @@ internal sealed partial class PrefixCacheCoordinator
         int count = (int)(((long)length + _pool.BlockSize - 1) / _pool.BlockSize);
         if (sequence.BlockTable.NumBlocks < count) return false;
         KeyRope key = GetKey(sequence);
+        // A driven request is keyed only as far as its driver named its rows (KeyDrivenOutput).
+        if (length > key.Length) return false;
         RadixNode node = _tree.Insert(key, length, GetScope(sequence), sequence.SharedPrefixTokens,
             NodeFlags.None, GetSpans(sequence));
         if (node.EndState is not null) return false;

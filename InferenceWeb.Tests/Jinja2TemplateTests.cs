@@ -154,4 +154,26 @@ public class Jinja2TemplateTests
     [InlineData("{{ 'user\\'s reply; do not use for pre-tool updates or partial responses.' }}", "user's reply; do not use for pre-tool updates or partial responses.")]
     public void SparkExpressionFeaturesPreserveTextAndSchema(string template, string expected)
         => Assert.Equal(expected, Render(template, new Dictionary<string, object>()));
+
+    /// <summary>
+    /// <c>tojson</c> quotes strings as HF's chat-template filter (<c>json.dumps(...,
+    /// ensure_ascii=False)</c>) and llama.cpp do: only quotes, backslashes and control
+    /// characters are escaped, so a tool described with quotes, <c>&lt;</c>, <c>&amp;</c> or
+    /// non-English text reaches the model as the publisher's engines print it.
+    /// </summary>
+    [Fact]
+    public void ToJson_QuotesStringsLikePythonJsonDumpsWithoutAsciiEscapes()
+    {
+        var ctx = new Dictionary<string, object>
+        {
+            ["tool"] = new Dictionary<string, object>
+            {
+                ["name"] = "search",
+                ["description"] = "Search \"docs\" — <b>A & B</b> 'x'+y\n\ttab\\ 搜索 🌍\u0001",
+            },
+        };
+        Assert.Equal(
+            "{\"name\": \"search\", \"description\": \"Search \\\"docs\\\" — <b>A & B</b> 'x'+y\\n\\ttab\\\\ 搜索 🌍\\u0001\"}",
+            Render("{{ tool | tojson }}", ctx));
+    }
 }

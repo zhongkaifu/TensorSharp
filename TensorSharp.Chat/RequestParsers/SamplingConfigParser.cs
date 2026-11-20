@@ -130,6 +130,14 @@ namespace TensorSharp.Server.RequestParsers
             if (TryGetSingle(body, "frequency_penalty", out float fp)) cfg.FrequencyPenalty = fp;
             if (TryGetInt32(body, "repeat_last_n", out int rln)) cfg.PenaltyLastN = rln;
             if (TryGetInt32(body, "seed", out int sd)) cfg.Seed = sd;
+            if (body.ValueKind == JsonValueKind.Object
+                && body.TryGetProperty(IgnoreEosField, out var ignoreEos) && ignoreEos.ValueKind == JsonValueKind.True)
+            {
+                cfg.IgnoreEos = true;
+                // Only the token limit (or the caller's stop strings) ends such a request:
+                // the repetition guard would cut a fixed-length run short as surely as EOS.
+                cfg.StopRepetition = false;
+            }
             if (body.TryGetProperty("stop", out var stopEl))
             {
                 if (stopEl.ValueKind == JsonValueKind.Array)
@@ -145,6 +153,29 @@ namespace TensorSharp.Server.RequestParsers
                 }
             }
             return ApplyPinned(cfg, defaults);
+        }
+
+        /// <summary>The OpenAI-compatible request field (vLLM, SGLang and llama.cpp spell it
+        /// the same) that keeps generating past end-of-sequence tokens; see
+        /// <see cref="SamplingConfig.IgnoreEos"/>.</summary>
+        public const string IgnoreEosField = "ignore_eos";
+
+        /// <summary>
+        /// Check <c>ignore_eos</c> before the request is admitted: a boolean or null, or the
+        /// caller answers HTTP 400 with <paramref name="error"/>. A benchmark that spelled it
+        /// <c>"true"</c> would otherwise run with ordinary EOS stops and report lengths it
+        /// never asked for.
+        /// </summary>
+        public static bool TryValidateIgnoreEos(JsonElement body, out string error)
+        {
+            error = null;
+            if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty(IgnoreEosField, out var value)
+                && value.ValueKind is not (JsonValueKind.True or JsonValueKind.False or JsonValueKind.Null))
+            {
+                error = $"{IgnoreEosField} must be a boolean.";
+                return false;
+            }
+            return true;
         }
 
         /// <summary>

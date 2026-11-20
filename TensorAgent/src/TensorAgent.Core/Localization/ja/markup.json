@@ -11,6 +11,8 @@
   "markup.composer.placeholder": "メッセージ… 長押しで話す",
   "markup.composer.holdToTalk": "長押しで話す",
   "markup.composer.send": "送信",
+  "markup.composer.speakReplies": "返答を読み上げ",
+  "markup.composer.voice": "声",
   "markup.attach.title": "このメッセージに追加",
   "markup.attach.photo": "写真",
   "markup.attach.camera": "カメラ",
