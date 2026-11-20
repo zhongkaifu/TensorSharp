@@ -61,10 +61,10 @@ internal static class ParityDump
     }
 
     /// <summary>The text encoder's attentions on one edit's presentation, each against the whole materialized [seq, seq,
-    /// heads] scores (affordable for a short sequence): the query blocks edits use (<paramref name="chunk"/> rows, or the
-    /// conditioner's own choice when 0) and ggml's flash attention, row by row; the whole scores run twice and the second
-    /// run is the one timed.</summary>
-    public static JsonObject AttentionCheck(BackendType backend, string te, JsonNode job, string baseDir, int chunk)
+    /// heads] scores (affordable for a short sequence): the query blocks edits use (each of <paramref name="chunks"/>, or the
+    /// conditioner's own choice when empty) and ggml's flash attention, row by row, and every run against the first query
+    /// block size's; the whole scores run twice and the second run is the one timed.</summary>
+    public static JsonObject AttentionCheck(BackendType backend, string te, JsonNode job, string baseDir, IReadOnlyList<int> chunks)
     {
         var family = new MiniMaxH3ImageFamily(TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageSampling.ReleaseSigmas);
         var load = new DiffusionLoad { Backend = backend, Files = new Dictionary<string, string> { [DiffusionLoad.TextEncoder] = te } };
@@ -82,15 +82,21 @@ internal static class ParityDump
         }
         Run(false, 0);
         var whole = Run(false, 0);
-        var chunked = Run(false, chunk > 0 ? chunk : null);
+        int rows = whole.Hidden.Length / 5120;
+        int[] sizes = chunks.Count > 0 ? chunks.ToArray() : new[] { MiniMaxH3ImageConditioner.QueryChunkFor(rows, 64) };
+        var runs = sizes.Select(c => (Chunk: c, Run: Run(false, c))).ToArray();
         var flash = Run(true, null);
-        var o = new JsonObject
+        var o = new JsonObject { ["rows"] = rows, ["whole_seconds"] = whole.Seconds };
+        var first = runs[0].Run.Hidden;
+        foreach (var (c, r) in runs)
         {
-            ["rows"] = whole.Hidden.Length / 5120, ["whole_seconds"] = whole.Seconds,
-            ["chunk"] = chunk > 0 ? chunk : MiniMaxH3ImageConditioner.QueryChunkFor(whole.Hidden.Length / 5120, 64),
-            ["chunked"] = Compare(chunked.Hidden, whole.Hidden, chunked.Seconds),
-            ["flash"] = Compare(flash.Hidden, whole.Hidden, flash.Seconds),
-        };
+            JsonObject entry = Compare(r.Hidden, whole.Hidden, r.Seconds);
+            if (!ReferenceEquals(r.Hidden, first)) entry["against_first_chunk"] = Compare(r.Hidden, first, r.Seconds);
+            o[$"chunk_{c}"] = entry;
+        }
+        JsonObject f = Compare(flash.Hidden, whole.Hidden, flash.Seconds);
+        f["against_first_chunk"] = Compare(flash.Hidden, first, flash.Seconds);
+        o["flash"] = f;
         Console.WriteLine($"[h3img-ab] te attention check: {o.ToJsonString()}");
         return o;
     }
