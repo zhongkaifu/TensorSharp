@@ -7,7 +7,7 @@
 //
 // MiniMax-H3-Image as a family of the shared diffusion runtime (docs/design/diffusion-runtime.md section 3.2): its
 // geometry, its recipe (ComfyUI's "simple" schedule over the checkpoint's PDD grid, the grid interval's head), the CPU
-// torch noise, the packed layout of MiniMaxH3ImageLayout and the 2x2-patch token rows MiniMaxH3ImageModel denoises on.
+// torch noise, the packed layout of MiniMaxH3ImageLayout and the 2x2-patch token rows the legacy MiniMaxH3ImageModel denoised on.
 // Its components are the MiniMax-H3 text encoder with its vision tower (MiniMaxH3ImageConditioner), the DiT
 // (MiniMaxH3ImageDenoiser) and the image VAE (MiniMaxH3ImageVaeCodec), all on the runtime. An edit's references follow
 // MiniMaxH3ImageReferences; its canvas follows diffusers' MiniMax-H3-Image (ResolveCanvas).
@@ -56,7 +56,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public const long MaxEditArea = 4096L * 5120;
 
         /// <summary>The family of the denoiser in <paramref name="path"/>: its grid from the safetensors metadata, or the
-        /// release grid for a file without it (MiniMaxH3ImageModel's rule).</summary>
+        /// release grid for a file without it (the legacy model's rule).</summary>
         public static MiniMaxH3ImageFamily ForDenoiser(string path)
         {
             using var file = new MiniMaxH3WeightFile(path ?? throw new ArgumentNullException(nameof(path)));
@@ -271,7 +271,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         }
 
         /// <summary>[C, 1, H, W] to the denoiser's token rows: channels last, then 2x2 patches of 96 values, channel-major
-        /// within a token (MiniMaxH3ImageModel.Generate's exact steps).</summary>
+        /// within a token (the legacy MiniMaxH3ImageModel.Generate's exact steps).</summary>
         public float[] ToRows(LatentTensor latent)
         {
             ArgumentNullException.ThrowIfNull(latent);

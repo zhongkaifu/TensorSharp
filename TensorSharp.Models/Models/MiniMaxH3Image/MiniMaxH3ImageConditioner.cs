@@ -7,7 +7,7 @@
 //
 // MiniMax-H3-Image's conditioner on the diffusion runtime: the MiniMax-H3 text encoder (Qwen3-VL-32B truncated to 50
 // layers, no final norm; the native trunk MiniMax-H3 video uses too) behind IConditioner. The raw prompt is tokenized with
-// no chat template and the layer-50 hidden state of every token is the conditioning, exactly as MiniMaxH3ImageModel
+// no chat template and the layer-50 hidden state of every token is the conditioning, exactly as the legacy MiniMaxH3ImageModel (deleted in stage S10)
 // encodes it. An edit's pictures are presented as diffusers' MiniMaxH3ImageEditTextEncoderStep presents them: for each,
 // the label "Picture i: " (no angle brackets), <|vision_start|>, one <|image_pad|> a merged patch, <|vision_end|>; then
 // the prompt verbatim; each label and the prompt tokenized on their own and cut at 4,096 tokens. The vision tower's merged

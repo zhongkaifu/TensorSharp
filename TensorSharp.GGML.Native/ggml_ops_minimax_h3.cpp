@@ -171,16 +171,10 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecod
     return h3_vit_decode(d, 1);
 }
 
-// The same decoder over `batch` independent sequences of d->tokens tokens each, held
-// one after another in d->latent and d->out: the projections run once over all of them
-// and the attention once per sequence, so many tiles share one graph and one submit.
-// The rope tables are one sequence's and are shared. MiniMax-H3-Image decodes a row of
-// its 256-pixel tiles at a time this way. batch 1 is TSGgml_MiniMaxH3VideoVaeDecode.
-TSG_EXPORT int TSGgml_MiniMaxH3VitDecodeBatch(const TSGgmlMiniMaxH3VideoVaeDecodeDesc* d, int batch)
-{
-    return h3_vit_decode(d, batch);
-}
-
+// h3_vit_decode takes `batch` independent sequences of d->tokens tokens each, held one after
+// another in d->latent and d->out (the projections once over all of them, the attention once
+// per sequence). The video decoder calls it with one; MiniMax-H3-Image's batched tile rows are
+// the diffusion runtime's program (MiniMaxH3ImageVaeCodec), whose export this was.
 static int h3_vit_decode(const TSGgmlMiniMaxH3VideoVaeDecodeDesc* d, int batch)
 {
     try
@@ -1031,15 +1025,15 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
                            ". The managed TensorSharp build and the native library differ; rebuild GgmlOps.");
             return 0;
         }
-        // audio_count 0 is an image checkpoint (MiniMax-H3-Image): no audio stream,
-        // no audio patch projection or head, and the target is one latent frame.
+        // The audio-video DiT: an audio stream is required. MiniMax-H3-Image's DiT (none) runs on the
+        // diffusion runtime's graphs (MiniMaxH3ImageDenoiser), not here.
         if (d == nullptr ||
-            d->video_tokens == nullptr || (d->audio_count > 0 && d->audio_tokens == nullptr) ||
+            d->video_tokens == nullptr || d->audio_tokens == nullptr || d->audio_count <= 0 ||
             d->time_embed == nullptr || d->cosf == nullptr || d->sinf == nullptr ||
-            d->video_out == nullptr || (d->audio_count > 0 && d->audio_out == nullptr) ||
+            d->video_out == nullptr || d->audio_out == nullptr ||
             d->blocks == nullptr || d->segments == nullptr || d->num_blocks <= 0 ||
             d->num_segments <= 0 || d->n_tok <= 0)
-        { set_last_error("MiniMaxH3DitForward: bad descriptor."); return 0; }
+        { set_last_error("MiniMaxH3DitForward: bad descriptor (an audio-video DiT step needs its audio tokens)."); return 0; }
         if (!ensure_backend()) return 0;
 
         const int nl = d->num_blocks, nref = d->num_refiner_blocks;
@@ -1088,7 +1082,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             if (d->audio_start < 0 || d->audio_start + d->audio_count > ntok ||
                 d->video_start < 0 || d->video_start + d->video_count > ntok)
             { set_last_error("MiniMaxH3DitForward: audio/video span outside the sequence."); return 0; }
-            if ((d->audio_count > 0 && (d->audio_col + 1 >= 2 * nts || d->audio_col < 0)) ||
+            if (d->audio_col + 1 >= 2 * nts || d->audio_col < 0 ||
                 d->video_col + 1 >= 2 * nts || d->video_col < 0)
             {
                 set_last_error("MiniMaxH3DitForward: final-layer column base out of range (audio " +
@@ -1208,9 +1202,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         const int condCount = d->condition_count;
         ggml_tensor* vin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d->video_patch_dim,
                                               condCount + d->video_count);
-        const bool hasAudio = d->audio_count > 0;
-        ggml_tensor* ain = hasAudio
-            ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d->audio_channels, d->audio_count) : nullptr;
+        ggml_tensor* ain = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d->audio_channels, d->audio_count);
         ggml_tensor* acin = nullptr;
         if (d->condition_audio != nullptr && d->condition_audio_count > 0)
         {
@@ -1221,7 +1213,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         ggml_tensor* temb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ted, nts);
         ggml_tensor* cosf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rot, ntok);
         ggml_tensor* sinf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rot, ntok);
-        ggml_set_input(vin); if (ain != nullptr) ggml_set_input(ain);
+        ggml_set_input(vin); ggml_set_input(ain);
         ggml_set_input(temb); ggml_set_input(cosf); ggml_set_input(sinf);
         ggml_tensor* sinS = h3_rope_signed_sin(ctx, sinf);
         ggml_tensor* tin = nullptr;
@@ -1231,8 +1223,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             ggml_set_input(tin);
         }
         ggml_tensor* voutT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d->video_patch_dim, d->video_count);
-        ggml_tensor* aoutT = hasAudio
-            ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d->audio_channels, d->audio_count) : nullptr;
+        ggml_tensor* aoutT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d->audio_channels, d->audio_count);
 
         // Shared bidirectional attention. Packed diffusion blocks apply RoPE;
         // the text token refiner has no positional rotation.
@@ -1555,11 +1546,11 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         // ---- patchify video and audio, then pack ----
         ggml_tensor *vpw, *vpb, *apw = nullptr, *apb = nullptr;
         declLin(d->video_patch_proj, vpw, vpb);
-        if (hasAudio || acin != nullptr) declLin(d->audio_patch_proj, apw, apb);
+        declLin(d->audio_patch_proj, apw, apb);
         // Conditioning frames share the target's patch projection, exactly as the
         // reference concatenates them before projecting once.
         ggml_tensor* allVideo = lin(vpw, vin, vpb);
-        ggml_tensor* audioTok = ain != nullptr ? lin(apw, ain, apb) : nullptr;
+        ggml_tensor* audioTok = lin(apw, ain, apb);
 
         ggml_tensor* condAudioTok = acin != nullptr ? lin(apw, acin, apb) : nullptr;
 
@@ -1606,7 +1597,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         ggml_tensor* x = ctxTok;
         auto append = [&](ggml_tensor* v) { x = x == nullptr ? v : ggml_concat(ctx, x, v, 1); };
         if (condTok != nullptr) append(condTok);
-        if (audioTok != nullptr) append(audioTok);
+        append(audioTok);
         append(videoTok);
 
         // Apply one modulation parameter per segment, broadcasting its single row.
@@ -1735,23 +1726,22 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
 
         ggml_tensor *fvw, *fvb, *faw2 = nullptr, *fab2 = nullptr;
         declLin(d->final_video_out, fvw, fvb);
-        if (hasAudio) declLin(d->final_audio_out, faw2, fab2);
+        declLin(d->final_audio_out, faw2, fab2);
 
         ggml_tensor* videoOut = lin(fvw, finalSlice(d->video_start, d->video_count, d->video_col), fvb);
-        ggml_tensor* audioOut = hasAudio
-            ? lin(faw2, finalSlice(d->audio_start, d->audio_count, d->audio_col), fab2) : nullptr;
+        ggml_tensor* audioOut = lin(faw2, finalSlice(d->audio_start, d->audio_count, d->audio_col), fab2);
 
         // The model emits velocities: video negated, audio scaled by
         // d(sigma_audio)/d(sigma_video) so one Euler step advances both streams.
         videoOut = ggml_scale(ctx, videoOut, d->video_scale);
         // A changing SCALE op_params value otherwise resets CUDA graph warmup
         // on every step. Apply that exact SCALE kernel in a tiny graph below.
-        if (!stable_cuda_graph && audioOut != nullptr) audioOut = ggml_scale(ctx, audioOut, d->audio_scale);
+        if (!stable_cuda_graph) audioOut = ggml_scale(ctx, audioOut, d->audio_scale);
 
         ggml_tensor* vcopy = ggml_cpy(ctx, videoOut, voutT);
-        ggml_tensor* acopy = audioOut != nullptr ? ggml_cpy(ctx, audioOut, aoutT) : nullptr;
+        ggml_tensor* acopy = ggml_cpy(ctx, audioOut, aoutT);
         ggml_set_output(vcopy);
-        if (acopy != nullptr) ggml_set_output(acopy);
+        ggml_set_output(acopy);
 
         // 104 rather than 96 per layer: h3_attend's V pre-scale and output
         // re-scale are two more nodes per attention, and the budget is an
@@ -1781,7 +1771,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         if (graph == nullptr)
         { set_last_error("MiniMaxH3DitForward: graph alloc failed."); return 0; }
         ggml_build_forward_expand(graph, vcopy);
-        if (acopy != nullptr) ggml_build_forward_expand(graph, acopy);
+        ggml_build_forward_expand(graph, acopy);
 
         for (int i = 0; i < ggml_graph_n_nodes(graph); i++)
         {
@@ -1798,7 +1788,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3DitForward: buffer alloc failed."); return 0; }
         }
-        ggml_cgraph* audio_scale_graph = stable_cuda_graph && aoutT != nullptr
+        ggml_cgraph* audio_scale_graph = stable_cuda_graph
             ? h3_output_scale_graph(ctx, aoutT, d->audio_scale) : nullptr;
 
         host_read_barrier();
@@ -1816,7 +1806,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             }
 #endif
         ggml_backend_tensor_set(vin, d->video_tokens, 0, ggml_nbytes(vin));
-        if (ain != nullptr) ggml_backend_tensor_set(ain, d->audio_tokens, 0, ggml_nbytes(ain));
+        ggml_backend_tensor_set(ain, d->audio_tokens, 0, ggml_nbytes(ain));
         if (acin != nullptr)
             ggml_backend_tensor_set(acin, d->condition_audio, 0, ggml_nbytes(acin));
         ggml_backend_tensor_set(temb, d->time_embed, 0, ggml_nbytes(temb));
@@ -1831,7 +1821,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         { set_last_error("MiniMaxH3DitForward: audio scale graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(voutT, d->video_out, 0, ggml_nbytes(voutT));
-        if (aoutT != nullptr) ggml_backend_tensor_get(aoutT, d->audio_out, 0, ggml_nbytes(aoutT));
+        ggml_backend_tensor_get(aoutT, d->audio_out, 0, ggml_nbytes(aoutT));
         clear_last_error();
         return 1;
     }

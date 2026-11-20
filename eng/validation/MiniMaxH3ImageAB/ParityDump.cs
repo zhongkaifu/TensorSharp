@@ -66,7 +66,7 @@ internal static class ParityDump
     /// block size's; the whole scores run twice and the second run is the one timed.</summary>
     public static JsonObject AttentionCheck(BackendType backend, string te, JsonNode job, string baseDir, IReadOnlyList<int> chunks)
     {
-        var family = new MiniMaxH3ImageFamily(TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageSampling.ReleaseSigmas);
+        var family = new MiniMaxH3ImageFamily(TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageSampling.ReleaseSigmas);
         var load = new DiffusionLoad { Backend = backend, Files = new Dictionary<string, string> { [DiffusionLoad.TextEncoder] = te } };
         using var conditioner = (MiniMaxH3ImageConditioner)family.CreateConditioner(load);
         string[] paths = ((JsonArray)job["images"]!).Select(x => Path.Combine(baseDir, (string)x!)).ToArray();
@@ -133,7 +133,7 @@ internal static class ParityDump
     public static JsonObject VaeDump(BackendType backend, string vae, JsonNode job, string baseDir, string dir)
     {
         Directory.CreateDirectory(dir);
-        var family = new MiniMaxH3ImageFamily(TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageSampling.ReleaseSigmas);
+        var family = new MiniMaxH3ImageFamily(TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageSampling.ReleaseSigmas);
         using var codec = new MiniMaxH3ImageVaeCodec(vae, backend);
         var info = new JsonObject();
         string[] paths = ((JsonArray)job["images"]!).Select(x => Path.Combine(baseDir, (string)x!)).ToArray();

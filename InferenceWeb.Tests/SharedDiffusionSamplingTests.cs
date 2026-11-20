@@ -10,6 +10,7 @@
 // numpy float32 replay of the algorithm reproduces bit for bit; the legacy MiniMaxH3ImageSampling and
 // MiniMaxH3Scheduler are the live oracles until they are deleted (docs/design/diffusion-runtime.md stage S10).
 using TensorSharp.Models.MiniMaxH3;
+using TensorSharp.Models.MiniMaxH3Image;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.SharedDiffusion;
 
@@ -140,7 +141,7 @@ public sealed class SharedDiffusionSamplingTests
         for (int i = 0; i < 6; i++)
         {
             float sigma = sigmas[i], next = sigmas[i + 1];
-            // MiniMaxH3ImageModel.Generate's update.
+            // the legacy MiniMaxH3ImageModel.Generate's update (deleted in stage S10).
             float dt = next - sigma;
             for (long k = 0; k < legacy.Length; k++) legacy[k] += v[k] * dt;
             sampler.Step(shared, v, sigma, next);

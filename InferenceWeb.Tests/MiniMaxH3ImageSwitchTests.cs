@@ -57,24 +57,32 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
         Assert.Contains("minimax_h3_image", d.Aliases);
     }
 
+    /// <summary>Stage S10 deleted the legacy model, its decoder and its denoiser seam: the runtime's model is the only one.</summary>
     [Fact]
-    public void TheLegacyModelIsReachableOnlyThroughTheTestSeam()
+    public void TheLegacyModelIsGone()
     {
-        Assert.False(typeof(MiniMaxH3ImageModel).IsPublic);
+        System.Reflection.Assembly models = typeof(ModelBase).Assembly;
+        foreach (string gone in new[]
+        {
+            "TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageModel",
+            "TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageVae",
+            "TensorSharp.Models.MiniMaxH3Image.MiniMaxH3ImageLegacyDenoiser",
+        })
+            Assert.Null(models.GetType(gone));
+        Assert.Null(typeof(MiniMaxH3DiT).GetMethod("ForwardImage", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public));
+        Assert.Null(typeof(MiniMaxH3Config).GetMethod("IsMiniMaxH3Image"));
         Assert.True(typeof(MiniMaxH3ImageDiffusionModel).IsPublic);
         Assert.True(typeof(IImageGenerationModel).IsAssignableFrom(typeof(MiniMaxH3ImageDiffusionModel)));
-        // No public member of the models assembly hands out the legacy type.
-        var exposed = typeof(ModelBase).Assembly.GetExportedTypes()
-            .SelectMany(t => t.GetMembers())
-            .Where(m => m switch
-            {
-                System.Reflection.MethodInfo mi => mi.ReturnType == typeof(MiniMaxH3ImageModel),
-                System.Reflection.PropertyInfo pi => pi.PropertyType == typeof(MiniMaxH3ImageModel),
-                _ => false,
-            })
-            .Select(m => m.DeclaringType + "." + m.Name)
-            .ToArray();
-        Assert.Empty(exposed);
+    }
+
+    /// <summary>The audio-video DiT refuses an image denoiser by name instead of reading its head bank as one head.</summary>
+    [Fact]
+    public void TheVideoDitRefusesAnImageDenoiser()
+    {
+        using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.BF16);
+        var ex = Assert.Throws<NotSupportedException>(() => new MiniMaxH3DiT(dit.DitPath, TestGates.PinnedGgmlBackend, null));
+        Assert.Contains("MiniMax-H3-Image", ex.Message);
+        Assert.Contains("diffusion runtime", ex.Message);
     }
 
     /// <summary>The safetensors release goes through the registry's safetensors hook (no special case in ModelBase.Create)

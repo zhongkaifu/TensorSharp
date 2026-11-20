@@ -77,14 +77,6 @@ namespace TensorSharp.Models.MiniMaxH3Image
             }
         }
 
-        /// <summary>A denoiser over <paramref name="legacy"/>'s file mapping (a test seam: the two bind the same host bytes,
-        /// so they share every weight's device copy and a comparison holds the weights once).</summary>
-        internal static MiniMaxH3ImageDenoiser SharingLegacyWeights(MiniMaxH3DiT legacy, BackendType backend)
-        {
-            ArgumentNullException.ThrowIfNull(legacy);
-            return new MiniMaxH3ImageDenoiser(legacy.WeightFile, ownsFile: false, backend, null, null);
-        }
-
         private static (IGraphExecutor, IAllocator) Resolve(BackendType backend) => backend switch
         {
             BackendType.GgmlCuda => (GgmlGraphExecutor.For(GgmlBackendType.Cuda), null),
@@ -293,7 +285,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         }
 
         /// <summary>
-        /// One step, as <see cref="MiniMaxH3DiT"/>'s ForwardImage takes it: [text | references | target] through the trunk,
+        /// One step, as the legacy MiniMaxH3DiT.ForwardImage took it (deleted in stage S10): [text | references | target] through the trunk,
         /// the target's velocity out of the PDD head for grid intervals [<paramref name="headStart"/>,
         /// <paramref name="headStop"/>), negated so that <c>x += v * (next - sigma)</c> is the Euler step. The result is the
         /// plan's output buffer, valid until the next step.
@@ -370,7 +362,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         // ---- the step's host values
 
         /// <summary>The layout's modulation spans as the regions' segments: a row timestep * 3 + modality maps to column
-        /// base timestep * 18 + modality * 6 of the block projection viewed as [hidden, 18 * timesteps] (ForwardImage's).</summary>
+        /// base timestep * 18 + modality * 6 of the block projection viewed as [hidden, 18 * timesteps] (the legacy ForwardImage's).</summary>
         private static GraphSegment[] Segments(MiniMaxH3PackedLayout layout)
         {
             var segments = new GraphSegment[layout.ModulationSpans.Count];

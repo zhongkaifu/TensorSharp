@@ -47,7 +47,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         public const int HeadDim = 64;
 
         /// <summary>Tiles one decoder program takes at most: a row of a 16 MP canvas is 21 to 33 tiles, about 15 MB of
-        /// activations each (MiniMaxH3ImageVae's default, TS_H3_IMAGE_VAE_BATCH).</summary>
+        /// activations each (the legacy decoder's default, which TS_H3_IMAGE_VAE_BATCH overrode before stage S10 retired it).</summary>
         public const int MaxBatch = 64;
 
         /// <summary>Plans kept per codec: a canvas decodes with one tile shape and at most two batch sizes.</summary>
@@ -223,7 +223,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             return new Linear(w, _model.HasTensor(bias) ? Vec(bias) : null);
         }
 
-        /// <summary>A small tensor as a pinned F32 leaf (MiniMaxH3ImageVae.PinF32's values), null when the file has none:
+        /// <summary>A small tensor as a pinned F32 leaf (the legacy decoder's PinF32 values), null when the file has none:
         /// a vector, or with <paramref name="rows"/> a [rows, count / rows] matrix.</summary>
         private MiniMaxH3ImageWeight Vec(string name, long rows = 0)
         {
@@ -482,7 +482,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             }
         }
 
-        // ---- tiles (ComfyUI's MiniMaxH3ImageVAE, as MiniMaxH3ImageVae does them)
+        // ---- tiles (ComfyUI's MiniMaxH3ImageVAE, as the legacy decoder did them)
 
         /// <summary>ComfyUI's split_tiles: the fewest 256-pixel tiles that cover <paramref name="length"/> pixels with
         /// overlaps of at least 64, the spare overlap spread in 16-pixel units from the first gap on. (start, length) per tile

@@ -1,17 +1,14 @@
-// MiniMax-H3-Image end to end, several images in one process, through either engine: the A/B harness of stage S4
-// (docs/design/diffusion-runtime.md section 7.2/7.3), the production path against the legacy oracle.
+// MiniMax-H3-Image end to end, several images in one process, on the diffusion runtime: the A/B harness of stage S4
+// (docs/design/diffusion-runtime.md section 7.2/7.3). Its legacy engine (the MiniMaxH3ImageModel seam) was deleted with the
+// legacy code in stage S10; an A/B is now two builds of this tool.
 //
-//   dotnet MiniMaxH3ImageAB.dll --engine runtime|legacy --backend ggml_cuda|ggml_metal|ggml_cpu \
+//   dotnet MiniMaxH3ImageAB.dll [--engine runtime] --backend ggml_cuda|ggml_metal|ggml_cpu \
 //       --model <denoiser.gguf|.safetensors> --te <qwen3vl...gguf> --vae <minimax_h3_image_vae_fp16.safetensors> \
 //       --prompts <prompts.json> --jobs id[,id...] [--size N] --out <dir> [--label name]
-//       [--legacy-release-te] [--legacy-vae-batch N]
 //       [--lora <plug-in .json | weights> [--lora-scale S] [--lora-config C] ...] [--dump-cond <dir>]
+//       [--diffusion-products bf16|int8|int8-all]
 //
-// runtime: the production load (ModelBase.Create, the registry's MiniMax-H3-Image family on the diffusion runtime).
-// legacy:  the test seam MiniMaxH3ImageModel (one native graph a step, the native batched VAE decode); --legacy-release-te
-//          disposes its text encoder after each encode (the bf16 verification's local patch, needed where the 40 GB bf16
-//          DiT does not fit beside it), --legacy-vae-batch caps its tiles a decode call (TS_H3_IMAGE_VAE_BATCH; its graph
-//          overflows past 4 on ggml_metal and ggml_cpu).
+// The production load (ModelBase.Create, the registry's MiniMax-H3-Image family on the diffusion runtime).
 // The jobs run in order in this one process (the first is the cold first job, the rest warm); prompts.json is a list of
 // {id, prompt, seed, width, height[, images: [paths], keepSourceSize, mask: path, maskMode: grayscale|alpha, maskInvert,
 // maskFeather, maskCrop, maskCropPadding]}; a job with images is an edit (EditImage; the paths are relative to
@@ -43,8 +40,9 @@ string? Value(string name) => args.SkipWhile(a => a != name).Skip(1).FirstOrDefa
 bool Flag(string name) => args.Contains(name);
 string Required(string name) => Value(name) ?? throw new ArgumentException($"{name} is required");
 
-string engine = Required("--engine");
-if (engine is not ("runtime" or "legacy")) throw new ArgumentException("--engine is runtime or legacy");
+string engine = Value("--engine") ?? "runtime";
+if (engine != "runtime")
+    throw new ArgumentException("--engine is runtime: the legacy engine (MiniMaxH3ImageModel) was deleted in stage S10; compare two builds instead");
 BackendType backend = Required("--backend") switch
 {
     "ggml_metal" => BackendType.GgmlMetal,
@@ -60,11 +58,9 @@ string[] jobs = Required("--jobs").Split(',', StringSplitOptions.RemoveEmptyEntr
 int size = int.Parse(Value("--size") ?? "0", CultureInfo.InvariantCulture);
 string outDir = Path.GetFullPath(Required("--out"));
 string label = Value("--label") ?? engine;
-bool releaseTe = Flag("--legacy-release-te");
-int vaeBatch = int.Parse(Value("--legacy-vae-batch") ?? "0", CultureInfo.InvariantCulture);
-if (engine == "runtime" && (releaseTe || vaeBatch > 0)) throw new ArgumentException("--legacy-* options are the legacy engine's");
+if (Flag("--legacy-release-te") || Value("--legacy-vae-batch") != null)
+    throw new ArgumentException("--legacy-* options were the legacy engine's, deleted in stage S10");
 List<LoraSpec> loraSpecs = LoraCliFlags.Parse(args);
-if (engine == "legacy" && loraSpecs.Count > 0) throw new ArgumentException("--lora is the runtime engine's (the legacy model takes none)");
 string? dumpCond = Value("--dump-cond");
 Directory.CreateDirectory(outDir);
 string resultPath = Path.Combine(outDir, label + ".json");
@@ -124,8 +120,6 @@ var result = new JsonObject
     ["model"] = model,
     ["te"] = te,
     ["vae"] = vae,
-    ["legacy_release_te"] = releaseTe,
-    ["legacy_vae_batch"] = vaeBatch,
     ["env_int8"] = Environment.GetEnvironmentVariable("TS_H3_INT8_MATMUL") ?? "",
     ["loras"] = LoraCliFlags.Describe(loraSpecs),
     ["load_start"] = Load(),
@@ -140,7 +134,7 @@ void Save()
     File.WriteAllText(resultPath, result.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
 }
 
-// ---- --vae-latent: the decoders alone, on one latent, both engines in this process (A B B A ... by round)
+// ---- --vae-latent: the decoder alone, on one latent, --rounds times in this process
 if (Value("--vae-latent") is { } latentPath)
 {
     int lh = int.Parse(Required("--latent-h"), CultureInfo.InvariantCulture), lw = int.Parse(Required("--latent-w"), CultureInfo.InvariantCulture);
@@ -149,40 +143,34 @@ if (Value("--vae-latent") is { } latentPath)
     var latent = new float[latentBytes.Length / sizeof(float)];
     Buffer.BlockCopy(latentBytes, 0, latent, 0, latentBytes.Length);
     if (latent.LongLength != (long)lh * lw * 24) throw new ArgumentException($"{latentPath} holds {latent.Length} floats, not [{lh}][{lw}][24]");
-    var legacyVae = new MiniMaxH3ImageVae(vae) { BatchOverride = vaeBatch };
     var codec = new MiniMaxH3ImageVaeCodec(vae, backend);
     var decodes = new JsonArray();
-    var shas = new Dictionary<string, string>();
+    string? first = null;
     for (int r = 0; r < rounds; r++)
-        foreach (string arm in r % 2 == 0 ? new[] { "legacy", "runtime" } : new[] { "runtime", "legacy" })
+    {
+        double t0 = clock.Elapsed.TotalSeconds;
+        RgbImage decoded = codec.Decode(latent, lh, lw);
+        double t1 = clock.Elapsed.TotalSeconds;
+        byte[] png = ImageIO.EncodePng(decoded);
+        string sha = Convert.ToHexStringLower(SHA256.HashData(png));
+        if (first == null)
         {
-            double t0 = clock.Elapsed.TotalSeconds;
-            RgbImage decoded = arm == "legacy" ? legacyVae.Decode(latent, lh, lw) : codec.Decode(latent, lh, lw);
-            double t1 = clock.Elapsed.TotalSeconds;
-            byte[] png = ImageIO.EncodePng(decoded);
-            string sha = Convert.ToHexStringLower(SHA256.HashData(png));
-            if (!shas.ContainsKey(arm))
-            {
-                shas[arm] = sha;
-                File.WriteAllBytes(Path.Combine(outDir, $"{label}-vae-{arm}.png"), png);
-            }
-            decodes.Add(new JsonObject
-            {
-                ["round"] = r + 1, ["arm"] = arm, ["seconds"] = t1 - t0,
-                ["native_seconds"] = arm == "legacy" ? legacyVae.LastNativeSeconds : codec.LastNativeSeconds,
-                ["tiles"] = arm == "legacy" ? legacyVae.LastTileCount : codec.LastTileCount,
-                ["png_sha256"] = sha, ["peak_device_bytes"] = PeakBetween(t0, t1),
-            });
-            Console.WriteLine($"[h3img-ab] vae round {r + 1} {arm}: {t1 - t0:F3}s ({(arm == "legacy" ? legacyVae.LastTileCount : codec.LastTileCount)} tiles) sha {sha}");
+            first = sha;
+            File.WriteAllBytes(Path.Combine(outDir, $"{label}-vae.png"), png);
         }
+        decodes.Add(new JsonObject
+        {
+            ["round"] = r + 1, ["seconds"] = t1 - t0, ["native_seconds"] = codec.LastNativeSeconds, ["tiles"] = codec.LastTileCount,
+            ["png_sha256"] = sha, ["peak_device_bytes"] = PeakBetween(t0, t1),
+        });
+        Console.WriteLine($"[h3img-ab] vae round {r + 1}: {t1 - t0:F3}s ({codec.LastTileCount} tiles) sha {sha}");
+    }
     result["vae_decodes"] = decodes;
-    result["vae_bit_exact"] = shas.Count == 2 && shas["legacy"] == shas["runtime"];
     result["vae_compiles"] = codec.Compiles;
     stop.Cancel();
     sampler.Join();
     Save();
     codec.Dispose();
-    legacyVae.Dispose();
     // The backends go before the process's static destructors (as the CLI's exit does), or ggml-metal aborts in them.
     GgmlBasicOps.Shutdown();
     return 0;
@@ -367,10 +355,8 @@ if (Flag("--te-attention-check"))
 double loadStart = clock.Elapsed.TotalSeconds;
 IImageGenerationModel image;
 ModelBase loaded;
-MiniMaxH3ImageModel? legacy = null;
-MiniMaxH3ImageDiffusionModel? runtime = null;
+MiniMaxH3ImageDiffusionModel runtime;
 var phases = new List<(DiffusionPhase Phase, double T)>();
-if (engine == "runtime")
 {
     loaded = ModelBase.Create(model, backend);
     runtime = loaded as MiniMaxH3ImageDiffusionModel
@@ -385,12 +371,6 @@ if (engine == "runtime")
         result["lora_factor_bytes"] = runtime.Loras?.FactorBytes ?? 0;
         result["lora_summary"] = runtime.Loras?.Summary;
     }
-}
-else
-{
-    legacy = new MiniMaxH3ImageModel(model, backend) { ReleaseTextEncoderAfterEncode = releaseTe, VaeBatchOverride = vaeBatch };
-    loaded = legacy;
-    image = legacy;
 }
 result["load_seconds"] = clock.Elapsed.TotalSeconds - loadStart;
 result["model_type"] = loaded.GetType().FullName;
@@ -457,7 +437,6 @@ for (int n = 0; n < jobs.Length; n++)
         IReadOnlyList<double> steps;
         int tiles;
         double native;
-        if (runtime != null)
         {
             var t = runtime.LastResult!.Timings;
             (text, denoise, decode, total, steps) = (t.Text, t.Denoise, t.Decode, t.Total, t.Steps);
@@ -488,27 +467,6 @@ for (int n = 0; n < jobs.Length; n++)
             for (int i = 0; i < marks.Count; i++)
                 peaks[marks[i].Item1.ToString()] = PeakBetween(marks[i].Item2, i + 1 < marks.Count ? marks[i + 1].Item2 : end);
             job["phase_peak_device_bytes"] = peaks;
-        }
-        else
-        {
-            var lt = legacy!.LastTimings;
-            (text, denoise, decode) = (lt.Text, lt.Denoise, lt.Decode);
-            total = end - start;
-            steps = stepTimes.ToArray();
-            // The legacy loop times its steps inside the denoise; the callbacks' first interval holds the text phase.
-            var adjusted = stepTimes.ToArray();
-            if (adjusted.Length > 0) adjusted[0] = Math.Max(0, adjusted[0] - text - legacy.LastTextEncoderReleaseSeconds);
-            steps = adjusted;
-            tiles = legacy.LastVaeTileCount;
-            native = legacy.LastVaeNativeSeconds;
-            job["text_encoder_release_seconds"] = legacy.LastTextEncoderReleaseSeconds;
-            double denoiseStart = start + text + legacy.LastTextEncoderReleaseSeconds, decodeStart = denoiseStart + denoise;
-            job["phase_peak_device_bytes"] = new JsonObject
-            {
-                ["Condition"] = PeakBetween(start, denoiseStart),
-                ["Denoise"] = PeakBetween(denoiseStart, decodeStart),
-                ["Decode"] = PeakBetween(decodeStart, end),
-            };
         }
         job["text_seconds"] = text;
         job["denoise_seconds"] = denoise;

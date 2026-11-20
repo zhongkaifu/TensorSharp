@@ -16,7 +16,9 @@
 using System;
 using System.Collections.Generic;
 
-namespace TensorSharp.Models.MiniMaxH3
+using TensorSharp.Models.MiniMaxH3;
+
+namespace TensorSharp.Models.MiniMaxH3Image
 {
     internal static class MiniMaxH3ImageLayout
     {

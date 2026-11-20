@@ -118,6 +118,9 @@ namespace TensorSharp.Runtime
             ("TS_WAN_VAE", "every video model reads TS_VIDEO_VAE (--video-vae)."),
             ("TS_WAN_TE", "every video model reads TS_VIDEO_TEXT_ENCODER (--video-text-encoder)."),
             ("TS_WAN_DIT2", "every video model reads TS_VIDEO_DIT2 (--video-dit2)."),
+            ("TS_H3_IMAGE_VAE_BATCH",
+                "MiniMax-H3-Image's VAE decoder sizes its own programs (a row of tiles, at most 64); the native decoder whose "
+                + "tiles a call it capped was removed with the legacy model."),
             ("DIFFUSION_CPU_LEGACY", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_MOE", DiffusionCpuLegacyRemoved),
             ("DIFFUSION_CPU_LEGACY_PROJ", DiffusionCpuLegacyRemoved),
