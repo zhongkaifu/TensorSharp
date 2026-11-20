@@ -141,14 +141,21 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     /// graphs above are opt-in): the same logits as one device, decode replays, and speculation.</summary>
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
     [MemberData(nameof(Families))]
-    public void RankGraphsOnGgmlMatchOneDevice(string family)
+    public void RankGraphsOnGgmlMatchOneDevice(string family) => AssertRankGraphsMatchOneDevice(family, BackendType.GgmlCuda);
+
+    /// <summary>The same over two ggml_vulkan GPUs, whose partials sum through host staging (no device collective).</summary>
+    [GgmlTheory(BackendType.GgmlVulkan, Devices = 2)]
+    [MemberData(nameof(Families))]
+    public void RankGraphsOnGgmlVulkanMatchOneDevice(string family) => AssertRankGraphsMatchOneDevice(family, BackendType.GgmlVulkan);
+
+    private void AssertRankGraphsMatchOneDevice(string family, BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(family, keyLength: 64);
         List<float[]> single;
-        using (var one = Create(family, path, 1, 1, BackendType.GgmlCuda))
+        using (var one = Create(family, path, 1, 1, backend))
             single = Script(one);
-        using ModelBase tp = CreateGgmlTensorParallel(family, path);
+        using ModelBase tp = CreateGgmlTensorParallel(family, path, backend);
         var sdm = Assert.IsAssignableFrom<StandardDecoderModel>(tp);
         Assert.Equal(2, sdm.Mesh.TensorParallel);
         List<float[]> actual = Script(tp);
@@ -168,10 +175,10 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     }
 
     /// <summary>A GGML tensor-parallel group of two (the model builds it: no group is passed).</summary>
-    private static ModelBase CreateGgmlTensorParallel(string family, string path) => family switch
+    private static ModelBase CreateGgmlTensorParallel(string family, string path, BackendType backend = BackendType.GgmlCuda) => family switch
     {
-        "mistral3" => new Mistral3Model(path, BackendType.GgmlCuda, 2, null, 1),
-        "hunyuan-dense" => new HunyuanDenseModel(path, BackendType.GgmlCuda, 2, null, 1),
+        "mistral3" => new Mistral3Model(path, backend, 2, null, 1),
+        "hunyuan-dense" => new HunyuanDenseModel(path, backend, 2, null, 1),
         _ => throw new ArgumentOutOfRangeException(nameof(family)),
     };
 

@@ -158,9 +158,13 @@ namespace TensorSharp.GGML
             }
         }
 
-        /// <summary>Per-rank graphs need ranks with a device collective: without one every segment boundary is a host
-        /// round trip (tsg::tp_fused_available).</summary>
-        public bool RunsRanks(int ranks) => Backend == GgmlBackendType.Cuda && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
+        /// <summary>Per-rank graphs run where the native driver runs the ranks' plans together (tsg::tp_fused_available):
+        /// ggml-cuda sums each partial on the devices (NCCL or its peer pipeline); ggml-vulkan has no device collective, so each
+        /// segment boundary sums through host staging (tsg::tp_reduce_segment), the transport legacy Muse-Glimmer's Vulkan
+        /// --tp ran on. That is two host crossings a layer, where the per-op tensor-parallel path the runtime ran on Vulkan
+        /// before crossed for every op.</summary>
+        public bool RunsRanks(int ranks)
+            => Backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan && ranks > 1 && GgmlBasicOps.TensorParallelFusedAvailable(ranks);
 
         /// <summary>A graph is built for the active rank's device: compile with rank <paramref name="rank"/> active.</summary>
         public IGraphPlan CompileForRank(GraphProgram program, int rank)
