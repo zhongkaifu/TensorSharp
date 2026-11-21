@@ -56,7 +56,7 @@ dotnet run --project TensorSharp.Cli -c Release -- \
 ## 共享解码运行时（2026-11 起）
 
 Muse-Glimmer 运行在[共享解码运行时](../design/unified-execution.md)上（`MuseGlimmerRuntimeModel`），与 Qwen 3.5、LFM3
-相同；旧的 `MuseGlimmerModel` 及其原生图不再服务任何请求。迁移过程与证据见
+相同；迁移完成后，旧模型及其原生图已被删除（2026-11-20）。迁移过程与证据见
 [docs/design/muse-glimmer-unified.md](../design/muse-glimmer-unified.md)。它带来：
 
 * **所有放置与执行器：** GGML CUDA / Vulkan / Metal / CPU、MLX 与直接 CUDA（`--backend cuda`，旧实现在此逐算子运行，现为整步图）
@@ -80,7 +80,7 @@ Muse-Glimmer 运行在[共享解码运行时](../design/unified-execution.md)上
 在 ggml_cuda（RTX PRO 4500）上，两种 UD 量化的运行时 prefill 比旧实现快 3.6-28%、解码快 2.8-7.0%；ggml_vulkan 上解码快
 18-22%；直接 CUDA（旧实现逐算子）prefill 快 3.4-13 倍、解码快 2.1-3.7 倍。质量门槛（与 llama.cpp 的对齐、每个后端上
 困惑度与旧实现相差 0.06% 以内、跨环回绕的 teacher-forced 探针）见设计文档。下面第 2-6 节保留历史：其中的性能数字和
-工程说明描述的是当时测量的旧模型。
+工程说明描述的是当时测量的旧模型，其中提到的文件、类和开关已随旧模型一并删除。
 
 ## 1. 文本架构
 
@@ -645,8 +645,9 @@ DFlash 投机解码只走单卡路径：`--tp N` > 1 下配置的草稿模型会
 
 旧模型的开关（`TS_MUSE_GLIMMER_PREFILL_CHUNK`、`TS_MUSE_GLIMMER_SWA_RING`、`TS_MUSE_GLIMMER_SWA_ROWS`、
 `TS_MUSE_GLIMMER_LAYER_TRACE` 及其 `_POS` / `_N` / `_DIR`、`TS_MUSE_GLIMMER_VENC_TRACE`、`TS_MUSE_GLIMMER_MLX_STAGE_PROFILE`
-以及 `TS_MLX_KV_MATERIALIZE_INTERVAL`）在切换到共享解码运行时后不再起作用：运行时自行决定环和提示步的大小（见上文），
-下一个版本会把这些名称正式退役，并在报错中给出替代方式。
+以及 `TS_MLX_KV_MATERIALIZE_INTERVAL`）已随旧模型一并移除：共享解码运行时自行决定环和提示步的大小（见下文）；设置其中
+任何一个，CLI 和服务器都会在启动时报错，并说明应改用什么（跟踪类开关改用探针 `eng/validation/MuseGlimmerKvGrowProbe`
+和 `TS_GGML_NODE_PROFILE`）。
 
 | 变量 | 作用 |
 |---|---|

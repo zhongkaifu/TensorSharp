@@ -219,7 +219,7 @@ MiniMax-H3 对**一条**无 mask 的打包序列做双向注意力——文本�
 [TensorSharp] warning: CUDA0 has no flash-attention kernel for paged attention (K head 16, V head 16, KV rows 64, query rows 8, heads 4/2, K/V f32/f32, mask yes); running this attention as explicit F32 mul_mat + soft_max instead (same math, slower, more memory). Reported once per call site.
 ```
 
-`TSGgml_FlashAttnFallbackCount`（`GgmlBasicOps.FlashAttnFallbackCount()`）统计走显式路径的建图次数。覆盖的调用点：分页注意力（两个变体）与分页 KV 池；共享解码运行时的 GGML 计算图（`ggml_ops_graph_builder.cpp`：Qwen 3.5 / 3.6 / 3.8 家族、Qwen 3.8 Flash Next 及运行时上的其他模型族）；Gemma 4 dense 与 MoE 的 decode 和批处理 decode；GPT-OSS 的 decode、prefill、批处理 decode 与层 prefill；Muse-Glimmer 及其 DFlash drafter；GLM 5.x 的 decode 与 forward（询问该层所在设备的后端）；以及 CPU/Metal 上的视觉注意力。原本就询问后端的调用点保留各自的处理：Gemma 4 verify 与 GPT-OSS slot arena 向托管调用方返回错误（现在检查每个 tile 与每一层，而不只是第一个），视觉、diffusion、Wan、Qwen-Image、MiniMax-H3 与 embedding 图照旧回退。DeepSeek V4/V4.1 的注意力不变：其滑动窗口环与压缩行缓存在构造上就补齐到 256 行，V4.1 运行 TensorSharp 自己的 F32 注意力。
+`TSGgml_FlashAttnFallbackCount`（`GgmlBasicOps.FlashAttnFallbackCount()`）统计走显式路径的建图次数。覆盖的调用点：分页注意力（两个变体）与分页 KV 池；共享解码运行时的 GGML 计算图（`ggml_ops_graph_builder.cpp`：Qwen 3.5 / 3.6 / 3.8 家族、Qwen 3.8 Flash Next 及运行时上的其他模型族）；Gemma 4 dense 与 MoE 的 decode 和批处理 decode；GPT-OSS 的 decode、prefill、批处理 decode 与层 prefill；DFlash drafter；GLM 5.x 的 decode 与 forward（询问该层所在设备的后端）；以及 CPU/Metal 上的视觉注意力。原本就询问后端的调用点保留各自的处理：Gemma 4 verify 与 GPT-OSS slot arena 向托管调用方返回错误（现在检查每个 tile 与每一层，而不只是第一个），视觉、diffusion、Wan、Qwen-Image、MiniMax-H3 与 embedding 图照旧回退。DeepSeek V4/V4.1 的注意力不变：其滑动窗口环与压缩行缓存在构造上就补齐到 256 行，V4.1 运行 TensorSharp 自己的 F32 注意力。
 
 `GgmlOpsFlashAttnGuardTest`（ctest `flash-attn-unsupported-shape-fallback`）在 CPU 后端上把显式路径与双精度参考实现对比（mask、GQA、带步长的 F16 窗口、sinks、softcap、ALiBi、query 分块），并在第一个 GPU 设备上检查 head 16 以及过短或未对齐的 512 维窗口会以相同结果回退、受支持的形状仍走 kernel。在 CUDA 上，若 ggml 升级后 ggml-cuda 对这些形状的 kernel 可用性发生变化，该测试也会失败。`GgmlOpsFlashAttnGuardTest --unguarded` 在 GPU 上计算裸的 head-16 节点，复现该 abort。`FlashAttnUnsupportedShapeTests`（`Requires=Cuda`）以 head 大小 16 调用 `TSGgml_PagedAttentionForward`，并与托管参考实现对比。
 
@@ -353,7 +353,7 @@ TensorSharp/
 │   │   ├── DeepSeek4Model.Dspark.cs        # DSpark 块级草稿器（draft / 置信度 / Markov 头）
 │   │   └── DeepSeek4Model.PerSeqCache.cs   # 让该模型可被服务端托管的原生 per-sequence slot
 │   ├── Models/GlmDsa/           # GLM 5.x：原生执行器驱动、MLA + DSA indexer 逐算子参考实现、序列 slot、NextN/MTP 草稿头
-│   ├── Models/MuseGlimmer/      # Muse-Glimmer：共享解码运行时上的 MuseGlimmerRuntimeModel 与其图视觉塔；旧模型在删除前保留
+│   ├── Models/MuseGlimmer/      # Muse-Glimmer：共享解码运行时上的 MuseGlimmerRuntimeModel 与其图视觉塔（Muse Spark 也使用）
 │   ├── Models/MuseSpark/        # Muse Spark：原生整模型执行器（按层切分与 `--tp`）的托管驱动（MuseSparkModel.Native.cs）、带注意力/专家张量并行与整层放置的逐算子参考前向（`TS_MUSE_SPARK_NATIVE=0`、Vulkan 上的 `--tp`）、视觉、前缀缓存
 │   ├── Models/MiniMaxH3/        # MiniMax-H3 视频 + 联合 32 kHz 立体声音频：打包序列 DiT、Qwen3-VL 文本编码器与视觉塔、视频与音频 VAE、flow-match 调度器、pipeline
 │   ├── Models/WanVideo/         # Wan 2.1/2.2，仅视频：DiT、UMT5-XXL 文本编码器、因果 3D VAE、UniPC 调度器，以及不依赖 ggml 的 WanDirect* `cuda`/`cpu` 路径
@@ -383,9 +383,7 @@ TensorSharp/
 │   ├── ggml_ops_deepseek4.cpp             # DeepSeek V4 原生整模型执行器（层切分、压缩 KV 缓存、计算图缓存）
 │   ├── ggml_ops_deepseek41_tp.cpp / _vision.cpp # DeepSeek V4.1 路由 MoE 张量并行（按 rank 切分专家权重条带）及其视觉伴随编码器
 │   ├── ggml_ops_glm_dsa.cpp               # GLM 5.x 原生整模型执行器（MLA + DSA indexer、张量并行、序列 slot、NextN/MTP verify + 草稿图）
-│   ├── ggml_ops_muse_glimmer.cpp          # Muse-Glimmer 整模型前向：decode 用持久图（供 ggml-cuda 捕获 CUDA 图）、prefill 用瞬时图，另含张量并行图
-│   ├── ggml_ops_muse_glimmer_vision.cpp   # Muse-Glimmer ViT 块的设备端实现（最大尺寸图像有 16,224 个 patch，逐算子派发会让每步都经宿主同步）
-│   ├── ggml_ops_dflash.cpp                # Muse-Glimmer DFlash 块级草稿器，每个投机步融合为一张图（草稿块 + 借用主干的 LM head）
+│   ├── ggml_ops_dflash.cpp                # DFlash 块级草稿器，每个投机步融合为一张图（草稿块 + 借用主干的 LM head）
 │   ├── ggml_ops_muse_spark_exec.cpp       # Muse Spark 原生整模型执行器：分片 GGUF 加载、最多 16 张 GPU 的整层与按专家栈放置、NUMA 本地主机专家、按 slot 的 F16 KV 与滑动窗口环、每个微批一张图、按层切分的流水线 prefill、批处理 decode/prefill、slot 检查点、基于 ggml meta 后端的张量并行
 │   ├── ggml_ops_muse_spark_tp.cpp         # Muse Spark 原生张量并行切分方案：注意力按 KV 组、路由专家沿 n_ff、输出头按词表行（ctest `muse-spark-tp-split-plan`）
 │   ├── ggml_ops_cuda_vmm_peer_guard.cpp   # Linux `--wrap=cuMemSetAccess` 保护层：CUDA 的 8 个 peer 上限拒绝授权时，让 ggml-cuda 的 VMM 临时内存池只归其所属 GPU（ctest `cuda-vmm-peer-guard`）

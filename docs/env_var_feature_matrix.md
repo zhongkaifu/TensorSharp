@@ -341,16 +341,14 @@ speculation algorithm and speculator weights — is documented in
 
 ## Out-of-Matrix Muse-Glimmer & DFlash Knobs
 
-The DFlash block drafter's knobs below are read by the shared drafter. The three `TS_MUSE_GLIMMER_*` rows were the
-legacy model's: since Muse-Glimmer moved to the shared decoder runtime they have no effect (the runtime sizes its rings and
-prompt steps itself), and the next release retires them with an error naming the replacement. None are registered in
-`EnvVarMatrix.All`; see the [Muse-Glimmer card](models/muse-glimmer.md#7-environment-variables).
+The DFlash block drafter's knobs below are read by the shared drafter; none are registered in `EnvVarMatrix.All`. The
+legacy Muse-Glimmer model's switches (`TS_MUSE_GLIMMER_PREFILL_CHUNK`, `_SWA_RING`, `_SWA_ROWS`, the layer and vision
+traces, `TS_MUSE_GLIMMER_MLX_STAGE_PROFILE`, `TS_MLX_KV_MATERIALIZE_INTERVAL`) were removed with it in 2026-11: setting one
+stops the server or CLI at startup with a message naming the replacement (`RemovedEnvironmentVariables` in
+`TensorSharp.Runtime/RemovedCliFlags.cs`); see the [Muse-Glimmer card](models/muse-glimmer.md#7-environment-variables).
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_MUSE_GLIMMER_PREFILL_CHUNK` | the legacy Muse-Glimmer model (no effect since the switch) | Tokens per prefill forward; `0` disables chunking | `2048` | not registered | no |
-| `TS_MUSE_GLIMMER_SWA_RING` | the legacy Muse-Glimmer model (no effect since the switch) | Ring the 39 sliding-window layers at `pad(n_swa + chunk + 1, 256)` rows instead of sizing every layer for the full context | ON | not registered | no |
-| `TS_MUSE_GLIMMER_SWA_ROWS` | the legacy Muse-Glimmer model (no effect since the switch) | Override the SWA ring size in rows (diagnostics) | auto | not registered | no |
 | `TS_DFLASH_PREFILL_CHUNK` | any DFlash drafter | Tokens per speculative prefill forward (drives the TRUNK, not only the drafter) | `1024`, capped by the drafter ring and the trunk's own window | not registered | no |
 | `TS_DFLASH_SELECTOR` | DFlash2 drafter | `0` drafts by per-position argmax instead of the candidate lattice (attribution only - the weights were trained with it) | ON | not registered | no |
 | `TS_DFLASH_CONV` | DFlash2 drafter | `0` drops the grouped dynamic convolution (attribution only, as above) | ON | not registered | no |

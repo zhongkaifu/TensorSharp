@@ -76,7 +76,7 @@ token that could close it early.
 ## The shared decoder runtime (since 2026-11)
 
 Muse-Glimmer runs on the [shared decoder runtime](../design/unified-execution.md) (`MuseGlimmerRuntimeModel`), like
-Qwen 3.5 and LFM3; the legacy `MuseGlimmerModel` and its native graphs serve no request any more. The migration and its
+Qwen 3.5 and LFM3; the legacy model and its native graphs were deleted once it had moved (2026-11-20). The migration and its
 evidence are in [docs/design/muse-glimmer-unified.md](../design/muse-glimmer-unified.md). What it brings:
 
 * **Every placement and executor:** one device on GGML CUDA / Vulkan / Metal / CPU, MLX and direct CUDA (`--backend cuda`,
@@ -101,7 +101,7 @@ On ggml_cuda (RTX PRO 4500) the runtime prefilled 3.6-28% and decoded 2.8-7.0% f
 18-22% faster on ggml_vulkan; direct CUDA, which legacy ran per op, prefills 3.4-13x and decodes 2.1-3.7x faster. The
 quality gates (llama.cpp parity, perplexity within 0.06% of legacy on every backend, teacher-forced probes across the
 rings' wrap) are in the design document. Sections 2-6 below keep their history: their performance figures and engineering
-notes describe the legacy model they were measured on.
+notes describe the legacy model they were measured on, and the files, classes and switches they name were deleted with it.
 
 ## 1. Text architecture
 
@@ -791,8 +791,9 @@ layer's per-rank caches), so multi-turn reuse there works as it does on one GPU.
 
 The legacy model's switches (`TS_MUSE_GLIMMER_PREFILL_CHUNK`, `TS_MUSE_GLIMMER_SWA_RING`, `TS_MUSE_GLIMMER_SWA_ROWS`,
 `TS_MUSE_GLIMMER_LAYER_TRACE` with `_POS` / `_N` / `_DIR`, `TS_MUSE_GLIMMER_VENC_TRACE`, `TS_MUSE_GLIMMER_MLX_STAGE_PROFILE`
-and `TS_MLX_KV_MATERIALIZE_INTERVAL`) have no effect since the switch to the shared decoder runtime: the runtime sizes its
-rings and prompt steps itself (below), and the next release retires the names with an error that names the replacement.
+and `TS_MLX_KV_MATERIALIZE_INTERVAL`) were removed with it: the shared decoder runtime sizes its rings and prompt steps
+itself (below), and setting one of them stops the CLI and the server at startup with a message that names what to use
+instead (the probe `eng/validation/MuseGlimmerKvGrowProbe` and `TS_GGML_NODE_PROFILE` for the traces).
 
 | Variable | Effect |
 |---|---|

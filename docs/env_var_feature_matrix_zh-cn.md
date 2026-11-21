@@ -302,15 +302,14 @@ Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1
 
 ## 矩阵外的 Muse-Glimmer 与 DFlash 开关
 
-Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有一个 A/B 开关，另外还有
-长上下文的尺寸开关。这些都没有注册进 `EnvVarMatrix.All`。完整清单（含逐层追踪开关）见
+下面是共享 DFlash 块级草稿模型读取的开关，都没有注册进 `EnvVarMatrix.All`。旧 Muse-Glimmer 模型的开关
+（`TS_MUSE_GLIMMER_PREFILL_CHUNK`、`_SWA_RING`、`_SWA_ROWS`、逐层与视觉追踪开关、`TS_MUSE_GLIMMER_MLX_STAGE_PROFILE`、
+`TS_MLX_KV_MATERIALIZE_INTERVAL`）已于 2026-11 随旧模型一并移除：设置其中任何一个，服务器或 CLI 都会在启动时报错并给出
+替代方式（见 `TensorSharp.Runtime/RemovedCliFlags.cs` 中的 `RemovedEnvironmentVariables`）；另见
 [Muse-Glimmer 卡片](models/muse-glimmer_zh-cn.md#7-环境变量)。
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描取值 | 默认是否扫描 |
 |---|---|---|---|---|---|
-| `TS_MUSE_GLIMMER_PREFILL_CHUNK` | 旧 Muse-Glimmer 模型（切换后不再起作用） | 每次 prefill 前向的 token 数；`0` 关闭分块 | `2048` | 未注册 | 否 |
-| `TS_MUSE_GLIMMER_SWA_RING` | 旧 Muse-Glimmer 模型（切换后不再起作用） | 把 39 个滑动窗口层按 `pad(n_swa + chunk + 1, 256)` 行做环，而不是所有层都按完整上下文分配 | 开 | 未注册 | 否 |
-| `TS_MUSE_GLIMMER_SWA_ROWS` | 旧 Muse-Glimmer 模型（切换后不再起作用） | 覆盖 SWA 环的行数（诊断用） | 自动 | 未注册 | 否 |
 | `TS_DFLASH_PREFILL_CHUNK` | 任意 DFlash 草稿器 | 每次投机 prefill 前向的 token 数（驱动的是**主干**，不只是草稿器） | `1024`，并受草稿器环形缓冲与主干自身窗口的限制 | 未注册 | 否 |
 | `TS_DFLASH_SELECTOR` | DFlash2 草稿器 | `0` 改为按逐位置 argmax 起草，而不走候选格（仅用于归因分析——权重本来就是带着它训练的） | 开 | 未注册 | 否 |
 | `TS_DFLASH_CONV` | DFlash2 草稿器 | `0` 去掉分组动态卷积（同上，仅用于归因分析） | 开 | 未注册 | 否 |

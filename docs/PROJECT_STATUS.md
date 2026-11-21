@@ -147,6 +147,11 @@ CUDA results are committed. See the [Bonsai2 card](models/bonsai2.md).
 
 The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse Spark, loading split GGUFs from any shard, native skill discovery and the latest MiniMax-H3 work are newer than `v2026.10.11`, as described above. Knowledge collections and active-turn steering are included in that tag; the entries below retain compatibility and measured-performance history from earlier work.
 
+- **Muse-Glimmer runs on the shared decoder runtime, and its legacy model is removed.** Every backend and placement
+  serves it (`--tp 2`, `--layer-split N` and their hybrid included), with continuous batching, the prefix cache with
+  checkpoint files, DFlash and n-gram speculation (n-gram needs no drafter) and the graph vision tower. The legacy
+  `TS_MUSE_GLIMMER_*` ring, chunk and trace switches and `TS_MLX_KV_MATERIALIZE_INTERVAL` now stop the server or CLI at
+  startup with a message naming the replacement. See the [model card](models/muse-glimmer.md#the-shared-decoder-runtime-since-2026-11).
 - **The Qwen direct-CUDA engines and NInfer support are removed.** Qwen 3.5 / 3.6 / 3.8 (`qwen35`,
   `qwen35moe`) and Qwen 3.8 Flash Next (`qwen4exp`) now run on the shared decoder runtime on every
   backend; on `--backend cuda` its graphs run on the CUDA graph executor. Dense NVFP4 checkpoints on
@@ -366,8 +371,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, Muse
     `TS_MLX_BASELINE_*` and the rest listed in the startup error. MLX Q4_K / Q5_K
     weights always repack to MLX affine, which was already the default. The Gemma 4
     and Muse-Glimmer spellings of the MLX eval and materialize intervals are gone:
-    every model reads `TS_MLX_EVAL_EVERY_N_LAYERS`, `TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL`
-    and `TS_MLX_KV_MATERIALIZE_INTERVAL`;
+    every model reads `TS_MLX_EVAL_EVERY_N_LAYERS` and `TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL`
+    (`TS_MLX_KV_MATERIALIZE_INTERVAL` went with the legacy Muse-Glimmer model in 2026-11);
   - the switches that turned a retained whole-model graph or its pieces off
     (`TS_QWEN35_FD_PERSIST`, `TS_GEMMA4_FD_PERSIST`, `TS_GPTOSS_FD_PERSIST`,
     `TS_MUSE_GLIMMER_PERSIST`, `TS_DFLASH_PERSIST`, the `*_BATCHED_ARENA` switches,

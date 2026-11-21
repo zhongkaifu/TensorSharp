@@ -115,6 +115,10 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 
 以下变化跨越多个发布标签。上文的 LTX 2.5、EmbeddingGemma 2、Muse Spark、从任意分片加载分片 GGUF、原生技能发现和最新 MiniMax-H3 改动晚于 `v2026.10.11`；知识集合与生成中引导已包含于该标签。下面保留早期工作的兼容性说明和性能实测记录。
 
+- **Muse-Glimmer 运行在共享解码运行时上，旧模型已移除。** 所有后端与放置方式都可服务它（包括 `--tp 2`、`--layer-split N`
+  及二者的混合），并支持连续批处理、带检查点文件的前缀缓存、DFlash 与 n-gram 推测解码（n-gram 无需草稿模型）以及图形化
+  视觉塔。旧的 `TS_MUSE_GLIMMER_*` 环、分块与追踪开关以及 `TS_MLX_KV_MATERIALIZE_INTERVAL` 现在会让服务器或 CLI 在启动时
+  报错，并说明替代方式。详见[模型卡片](models/muse-glimmer_zh-cn.md#共享解码运行时2026-11-起)。
 - **Qwen 直连 CUDA 引擎与 NInfer 支持已移除。** Qwen 3.5 / 3.6 / 3.8（`qwen35`、`qwen35moe`）与 Qwen 3.8 Flash Next（`qwen4exp`）
   现在在所有后端上都运行在共享解码运行时上；`--backend cuda` 上它的图运行在 CUDA 图执行器上。`--backend cuda` 上的稠密 NVFP4
   检查点不再有专属的直连引擎；Flash Next 在 `--backend cuda` 上现在与 `ggml_cuda` 一样接受 `--tp N` 与 `--n-cpu-moe` / `--cpu-moe`
@@ -255,8 +259,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
     `TS_MLX_KQUANT_AFFINE`、`TS_MLX_Q5K_*`、`TS_MLX_Q6K_*` 与 `TS_MLX_IQ*` 内核开关（`*_MATVEC_MAX_ROWS` 阈值保留）、
     `TS_MLX_PIPELINED_DECODE`、`TS_MLX_DEVICE_*`、`TS_MLX_BASELINE_*`，以及启动报错中列出的其余开关。MLX 上的
     Q4_K / Q5_K 权重总是重新打包为 MLX affine（此前的默认行为）。Gemma 4 与 Muse-Glimmer 专用的 MLX eval /
-    materialize 间隔拼写已移除：所有模型都读取 `TS_MLX_EVAL_EVERY_N_LAYERS`、`TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL`
-    与 `TS_MLX_KV_MATERIALIZE_INTERVAL`；
+    materialize 间隔拼写已移除：所有模型都读取 `TS_MLX_EVAL_EVERY_N_LAYERS` 与 `TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL`
+    （`TS_MLX_KV_MATERIALIZE_INTERVAL` 已于 2026-11 随旧 Muse-Glimmer 模型一并移除）；
   - 关闭保留（重放）整模型计算图或其部件的开关（`TS_QWEN35_FD_PERSIST`、`TS_GEMMA4_FD_PERSIST`、
     `TS_GPTOSS_FD_PERSIST`、`TS_MUSE_GLIMMER_PERSIST`、`TS_DFLASH_PERSIST`、各 `*_BATCHED_ARENA` 开关、
     `TS_QWEN35_METAL_*` 等），GPT OSS 的 decode 与张量并行开关（`TS_GPTOSS_MODEL_DECODE`、
