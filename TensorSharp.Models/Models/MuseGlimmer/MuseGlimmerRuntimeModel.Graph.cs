@@ -23,21 +23,31 @@ namespace TensorSharp.Models
         protected override RotarySpec GraphRotary => _rope;
 
         /// <summary>Decode steps (the replayable graphs) run under ggml-metal's concurrency reorder, as legacy's persistent
-        /// decode graph did (graph_optimize on its persist builds only) and as LFM3 measured faster.</summary>
+        /// decode graph did (graph_optimize on its persist builds only). Measured on an M5 Pro (stage S7, ABBA, one binary):
+        /// without it UD-IQ2_XXS decodes 1.4-1.5% slower at depth 512 and 4K, UD-Q4_K_XL 0.2-0.3%; prompts are unchanged.</summary>
         protected override bool GraphConcurrencyReorder => true;
 
-        /// <summary>A prompt step's last layer runs its feed-forward on the rows the head reads only, as llama.cpp's graph does
-        /// (LFM3's measurement; S7 measures it here).</summary>
+        /// <summary>A prompt step's last layer runs its feed-forward on the rows the head reads only, as llama.cpp's graph does.
+        /// Without it pp512 is 1.4-1.5% slower on ggml_metal (both UD quants) and MLX (stage S7, M5 Pro); decode is unchanged.</summary>
         protected override bool PrunesLastLayerRows => true;
 
-        /// <summary>LFM3's rule: ggml-cuda keeps same-type Q8_0 and Q4_K gate/up apart (one MMQ/MMVQ with the GLU in its
-        /// write-back), ggml-cpu keeps the types it repacks apart; everything else (the IQ2_S pairs of the UD files on Metal and
-        /// MLX) stays fused as legacy runs it. S7 measures it on Muse-Glimmer's quants.</summary>
+        /// <summary>
+        /// LFM3's rule, with one addition measured on Muse-Glimmer (stage S7, M5 Pro, ABBA):
+        /// <list type="bullet">
+        /// <item>ggml-cuda keeps same-type Q8_0 and Q4_K gate/up apart (one MMQ/MMVQ with the GLU in its write-back);</item>
+        /// <item>ggml-cpu keeps the types it repacks apart, and the UD files' IQ2_S pairs too: ggml-cpu reads both products from
+        /// the GGUF's mapped pages, where the fused weight was an anonymous copy of both. UD-IQ2_XXS on ggml_cpu: peak resident
+        /// 17.8 -> 13.4 GB, the system's reclaimable memory 4.0 GB higher, pp512 and decode within 0.4% (the same products row
+        /// for row);</item>
+        /// <item>everything else stays fused, as legacy runs it: apart measured 0.997-1.000 on ggml_metal (IQ2_S and Q4_K pairs,
+        /// no memory saved: Metal wires either) and 0.975-0.991 on MLX.</item>
+        /// </list>
+        /// </summary>
         protected override bool KeepsGateUpApart(int gateType, int upType)
             => _gateUpApart is bool apart
                 ? apart && gateType == upType
                 : (_backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */)
-                  || (_backend == BackendType.GgmlCpu && gateType == upType && CpuRepacks(gateType));
+                  || (_backend == BackendType.GgmlCpu && gateType == upType && (CpuRepacks(gateType) || gateType == 22 /* IQ2_S */));
 
         /// <summary>Benchmarks (eng/validation/MuseGlimmerKvGrowProbe <c>--gate-up</c>): every same-type gate/up pair kept apart
         /// (true) or fused (false) in place of <see cref="KeepsGateUpApart"/>'s rule, so both arms of that measurement run in one
