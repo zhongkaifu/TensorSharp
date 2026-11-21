@@ -83,11 +83,17 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
     /// </summary>
     private const double FirstPositionLogprobBoundPastTheTable = 0.25;
 
-    /// <summary>The graph tower's rows against the F32 tower's (<see cref="MuseGlimmerLegacyVision.F32Tower"/>) on the lanes
-    /// whose products keep the activations in floating point or quantize them per block on the CPU (ggml_metal, MLX,
-    /// ggml_cpu). The design's bound (§4.5) was set against the legacy tower on the same executor; since stage S9 deleted that
-    /// tower the F32 tower is the reference (the S9 figures: docs/design/muse-glimmer-unified.md §5.8).</summary>
-    private const double MinCosine = 0.9999;
+    /// <summary>The graph tower's rows against the F32 tower's (<see cref="MuseGlimmerLegacyVision.F32Tower"/>) on ggml_metal
+    /// and MLX, picture by picture. Until stage S9 the rows were held to the legacy tower on the same executor at cosine 0.9999
+    /// (design §4.5), which shares the executor's rounding; the F32 tower does not: the two lanes multiply the Q8_0 weights
+    /// against half-precision activations. Measured on the M5 Pro with the S9 build: ggml_metal 0.99979-0.99999 (the 1036 x 1036
+    /// picture the lowest), MLX 0.99977-0.99999 (word-ocean.jpg). A wrong layout, position table or window is O(1).</summary>
+    private const double MinCosine = 0.9995;
+
+    /// <summary>As <see cref="MinCosine"/> on ggml_cpu, whose Q8_0 products quantize the activations (q8_K), as ggml_cuda's
+    /// q8_1 do (1 - cosine to the F32 tower up to 4.7e-3 there, legacy's tower alike): measured on the M5 Pro 0.99576-0.99900
+    /// (the 1036 x 1036 picture the lowest, worst row 0.78).</summary>
+    private const double MinCosineQuantizedActivations = 0.99;
 
     internal sealed record Record(string Name, string Prompt, string Image, int PromptN, int[] Generated, MuseGlimmerParity.Step[] Steps);
 
@@ -424,7 +430,12 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         // The F32 reference: the cheaper F32 tower (direct CUDA's where the process can open it), on direct CUDA the managed
         // one (another executor's arithmetic than the tower under test).
         var (reference, owner, referenceName) = MuseGlimmerLegacyVision.F32Tower(gguf, preferDirectCuda: backend != BackendType.Cuda);
-        double minCosine = backend == BackendType.Cuda ? MinCosineF32 : MinCosine;
+        double minCosine = backend switch
+        {
+            BackendType.Cuda => MinCosineF32,
+            BackendType.GgmlCpu => MinCosineQuantizedActivations,
+            _ => MinCosine,
+        };
         using (owner)
         using (reference)
         {
