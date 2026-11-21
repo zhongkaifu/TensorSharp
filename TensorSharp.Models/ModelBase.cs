@@ -29,7 +29,7 @@ using TensorSharp.MLX;
 namespace TensorSharp.Models
 {
 
-    public abstract partial class ModelBase : IModelArchitecture, IAdapterAwareModel
+    public abstract partial class ModelBase : IModelArchitecture, IAdapterAwareModel, IGgmlHostMemoryOwner
     {
         public ModelConfig Config { get; protected set; }
         public ITokenizer Tokenizer { get; protected set; }
@@ -466,6 +466,7 @@ namespace TensorSharp.Models
                     throw new ArgumentException($"Unsupported backend: {backend}");
             }
             Console.WriteLine($"Backend: {backend}");
+            if (IsGgmlBackend) EnterLiveGgmlModels();
 
             // Tell the kernels about the whole cluster, not just this process.
             // Expert parallelism is sharded by the GLOBAL degree, so a kernel
@@ -3603,6 +3604,69 @@ namespace TensorSharp.Models
         /// their pool blocks can already be handed out again and the model's allocator is still open.</summary>
         internal virtual void AfterDenseWeightsFreedForTests() { }
 
+        // GGML models of this process not yet disposed: the last one out may clear the process-wide caches.
+        private static int s_liveGgmlModels;
+        private int _countedLiveGgml;
+
+        /// <summary>GGML models constructed and not yet disposed in this process.</summary>
+        internal static int LiveGgmlModels => Volatile.Read(ref s_liveGgmlModels);
+
+        private void EnterLiveGgmlModels()
+        {
+            if (Interlocked.Exchange(ref _countedLiveGgml, 1) == 0) Interlocked.Increment(ref s_liveGgmlModels);
+        }
+
+        /// <summary>This model leaves the live GGML models: true when another one is still live.</summary>
+        private bool LeaveLiveGgmlModels()
+            => Interlocked.Exchange(ref _countedLiveGgml, 0) == 1 ? Interlocked.Decrement(ref s_liveGgmlModels) > 0 : LiveGgmlModels > 0;
+
+        /// <summary>
+        /// The host memory this model owns, which its GGML device copies and the backend's other records are keyed inside:
+        /// its GGUF mappings, its memory pool's blocks (dense weights, KV caches, states, scratch), the cache keys of its
+        /// weights (an opaque key after a preload, a private copy, a requantized stack, a tensor-parallel shard), plus what a
+        /// family adds (<see cref="AddOwnedHostMemory"/>). Released by <see cref="Dispose"/> while another model is live, and
+        /// by <see cref="ReleaseGgmlDeviceMemory"/>.
+        /// </summary>
+        void IGgmlHostMemoryOwner.CollectHostMemory(List<(IntPtr Base, long Length)> ranges, List<IntPtr> keys)
+        {
+            GgmlOwnerRelease.AddMappings(ranges, _gguf);
+            if (_ownsGgmlContext && _ggmlContext != null)
+                ranges.AddRange(_ggmlContext.PoolRanges());
+            foreach (Tensor t in _weights.Values)
+                if (t != null) keys.Add(GetStoragePtr(t));
+            foreach (QuantizedWeight qw in _quantWeights.Values)
+                if (qw != null) { keys.Add(qw.Data); keys.Add(qw.CacheKey); }
+            foreach (StackedExpertWeights stacked in _stackedExpertWeights.Values)
+                if (stacked != null) { keys.Add(stacked.Data); keys.Add(stacked.OwnedBuffer); }
+            foreach (QuantizedWeight[] shards in _tpQuantWeights.Values)
+                foreach (QuantizedWeight qw in shards)
+                    if (qw != null) { keys.Add(qw.Data); keys.Add(qw.CacheKey); }
+            foreach (Tensor[] shards in _tpWeights.Values)
+                foreach (Tensor t in shards)
+                    if (t != null) keys.Add(GetStoragePtr(t));
+            AddOwnedHostMemory(ranges, keys);
+        }
+
+        /// <summary>A family's own host memory that its GGML device copies may be keyed by, beyond the GGUF mapping, the pool
+        /// and the weight dictionaries: buffers it allocated itself (fused or requantized copies, a second GGUF file), as
+        /// ranges, or as cache keys where it does not keep their lengths.</summary>
+        protected virtual void AddOwnedHostMemory(List<(IntPtr Base, long Length)> ranges, List<IntPtr> keys) { }
+
+        /// <summary>
+        /// Drop this model's GGML device memory without freeing anything: the device copies of its weights, its KV caches
+        /// and states (their device-resident contents are lost: call it between requests), and the shared graph caches,
+        /// which rebuild on their next call. Its next step uploads its weights again. Another live model keeps its own
+        /// (<see cref="GgmlBasicOps.ClearHostBufferCache"/> would free them). A pipeline hands back a finished stage's VRAM
+        /// with it.
+        /// </summary>
+        public void ReleaseGgmlDeviceMemory()
+        {
+            if (!IsGgmlBackend)
+                return;
+            OnBeforeReleaseGgmlDeviceResidency();
+            GgmlOwnerRelease.Release(this);
+        }
+
         public virtual void Dispose()
         {
             // Release any distributed worker nodes before tearing down the TP
@@ -3618,8 +3682,20 @@ namespace TensorSharp.Models
             // LoRA factor tensors come from this model's allocator, so they go before it does.
             ReleaseAllAdapters();
 
-            if (IsGgmlBackend)
+            bool othersLive = IsGgmlBackend && LeaveLiveGgmlModels();
+            if (othersLive)
             {
+                // Another model of this process is live (a second chat model, a drafter, an image pipeline's other
+                // component): release only what this one owns. The wipe below would free that model's device copies
+                // under the plans bound to them, and its device-resident state (KV caches) with them: its next step read
+                // freed device memory (a SIGSEGV in TSGgml_GraphRun on ggml_cuda) or lost its context. The shared graph
+                // scratch goes as with the last model (see below): the others grow it again on their next prompt.
+                GgmlOwnerRelease.Release(this);
+                GgmlBasicOps.ReleaseReuseComputeBuffers();
+            }
+            else if (IsGgmlBackend)
+            {
+                // The last GGML model of the process: everything goes, as when the process started.
                 // Clear offloadable registrations FIRST so they don't outlive
                 // the host pointers (which become invalid once the GgufFile
                 // mmap below is disposed). ClearHostBufferCache then frees the

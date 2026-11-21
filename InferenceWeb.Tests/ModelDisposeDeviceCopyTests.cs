@@ -16,10 +16,11 @@ namespace InferenceWeb.Tests;
 
 /// <summary>
 /// A GGML device copy is keyed by the address and size of its host bytes alone, and a disposed model's weight blocks can be
-/// handed out again the moment they are freed. <see cref="ModelBase.Dispose"/> therefore clears the device-copy cache before
-/// it frees its dense weights: bytes of the same size placed where a freed weight was (here the very block, from the model's
-/// own pool, while its dispose is still running) bind a fresh copy of themselves, never the weight's. Only backends that
-/// keep separate device copies (CUDA, Vulkan) can bind a stale one; elsewhere the weights are wrapped in place.
+/// handed out again the moment they are freed. <see cref="ModelBase.Dispose"/> therefore drops its device copies before it
+/// frees its dense weights: bytes of the same size placed where a freed weight was (here the very block, from the model's
+/// own pool, while its dispose is still running) bind a fresh copy of themselves, never the weight's. And it drops only its
+/// own while another model is live. Only backends that keep separate device copies (CUDA, Vulkan) can bind a stale one;
+/// elsewhere the weights are wrapped in place.
 /// </summary>
 public sealed class ModelDisposeDeviceCopyTests
 {
@@ -30,6 +31,43 @@ public sealed class ModelDisposeDeviceCopyTests
 
     [GgmlFact(BackendType.GgmlVulkan)]
     public void VulkanBytesAtAFreedWeightsAddressNeverBindItsDeviceCopy() => Verify(BackendType.GgmlVulkan, GgmlBackendType.Vulkan);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void CudaADisposedModelTakesOnlyItsOwnDeviceCopies() => OnlyItsOwn(BackendType.GgmlCuda, GgmlBackendType.Cuda);
+
+    [GgmlFact(BackendType.GgmlVulkan)]
+    public void VulkanADisposedModelTakesOnlyItsOwnDeviceCopies() => OnlyItsOwn(BackendType.GgmlVulkan, GgmlBackendType.Vulkan);
+
+    /// <summary>Two live models, each with a weight bound through the graph executor: disposing one drops its device copy and
+    /// leaves the other's (the whole-process wipe it replaced dropped both, under the live model's plans), whose product is
+    /// then still its own, bit for bit.</summary>
+    private static void OnlyItsOwn(BackendType backend, GgmlBackendType ggml)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"dispose-own-copies-{Guid.NewGuid():N}.gguf");
+        SyntheticGguf.Write(path, [new SyntheticGguf.Str { Key = "general.architecture", V = "probe" }], []);
+        try
+        {
+            var rng = new Random(13);
+            float[] wa = Enumerable.Range(0, In * Out).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray();
+            float[] wb = Enumerable.Range(0, In * Out).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray();
+            float[] x = Enumerable.Range(0, In * Rows).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray();
+            using var kept = new WeightModel(path, backend, wa);
+            var gone = new WeightModel(path, backend, wb);
+            float[] before = Product(ggml, kept.WeightBytes, x);
+            Product(ggml, gone.WeightBytes, x);
+            IntPtr goneKey = gone.WeightBytes;
+            Assert.Equal(In * Out * 4L, GgmlBasicOps.CachedBufferBytes(kept.WeightBytes));
+            Assert.Equal(In * Out * 4L, GgmlBasicOps.CachedBufferBytes(goneKey));
+            gone.Dispose();
+            Assert.Equal(0, GgmlBasicOps.CachedBufferBytes(goneKey));
+            Assert.Equal(In * Out * 4L, GgmlBasicOps.CachedBufferBytes(kept.WeightBytes));
+            Assert.Equal(before, Product(ggml, kept.WeightBytes, x));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
 
     private static void Verify(BackendType backend, GgmlBackendType ggml)
     {

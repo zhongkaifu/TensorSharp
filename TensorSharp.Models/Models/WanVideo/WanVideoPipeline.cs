@@ -98,7 +98,10 @@ namespace TensorSharp.Models.WanVideo
                 // gallocr). Vulkan in particular cannot fit the UMT5 + DiT + VAE
                 // graph all resident on a 16 GB card.
                 GgmlBasicOps.ReleaseReuseComputeBuffers();
-                GgmlBasicOps.ClearHostBufferCache();
+                // This model's and its stages' device memory, not the process's: another model of the process keeps its
+                // own (this had been the whole-process wipe).
+                GgmlOwnerRelease.Release(_model, _te as IGgmlHostMemoryOwner, _dit as IGgmlHostMemoryOwner,
+                    _ditLow as IGgmlHostMemoryOwner, _vae as IGgmlHostMemoryOwner);
             }
             else if (_model.Backend is BackendType.Cuda && _dctx != null)
             {

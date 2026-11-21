@@ -1656,6 +1656,10 @@ namespace TensorSharp.GGML
 
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
+        /// <summary>The whole-process wipe of the GGML device copies (and every cache keyed by host address): every model's
+        /// copies go, under the plans bound to them, with their device-resident state. Only the last GGML model of the
+        /// process (<c>ModelBase.Dispose</c>), backend shutdown, or a process that holds no other model may call it; an owner
+        /// that leaves others live releases its own memory (<see cref="ReleaseHostRanges"/>).</summary>
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
         /// <summary>The width of the thread pool ggml_cpu's next compute runs on (0 on any other backend).</summary>
         public static int CpuPoolThreads() => GgmlNative.CpuPoolThreads();
@@ -1682,6 +1686,22 @@ namespace TensorSharp.GGML
             => GgmlNative.SetNativeEnvironmentVariable(name, value, overwrite);
         public static void ReleaseReuseComputeBuffers() => GgmlNative.ReleaseReuseComputeBuffers();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
+
+        /// <summary>
+        /// One owner (a model, a pipeline component) releases its host memory: drop every GGML device copy, zero-copy wrap
+        /// and backend record kept for host bytes inside <paramref name="ranges"/> (its GGUF mappings, its pool's blocks, its
+        /// own buffers) or keyed by one of <paramref name="keys"/> (its preloaded weights' cache keys), on every rank, and
+        /// nothing else. Unlike <see cref="ClearHostBufferCache"/>, another live model keeps its device copies, the plans
+        /// bound to them and its device-resident state (KV caches). Returns how many device copies were dropped.
+        /// </summary>
+        /// <summary>Drop the graph caches every family keeps by shape or by host address (persistent decode and draft graphs,
+        /// attention sessions, per-rank graphs, vendor workspaces): a model releasing its memory, so none replays over a
+        /// device copy that went with it. Each live model rebuilds its own on its next call.</summary>
+        public static void ResetSharedGraphCaches() => GgmlNative.ResetSharedGraphCaches();
+
+        public static int ReleaseHostRanges(System.Collections.Generic.IReadOnlyList<(IntPtr Base, long Length)> ranges,
+            System.Collections.Generic.IReadOnlyList<IntPtr> keys)
+            => GgmlNative.ReleaseHostRanges(ranges, keys);
 
         /// <summary>
         /// Drop any cached GGML device binding held against <paramref name="tensor"/>'s host

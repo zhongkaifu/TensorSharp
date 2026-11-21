@@ -1302,6 +1302,8 @@ namespace tsg
                         std::vector<std::pair<std::size_t, std::size_t>>& pieces);
     std::size_t host_pinned_bytes();
     void host_pin_release_all();
+    // Unregisters the registrations this module made whose start lies inside `ranges` (an owner's mappings going away).
+    void host_pin_release_ranges(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& ranges);
 #else
     inline bool host_pin_range(const void*, std::size_t) { return false; }
     inline void host_pin_split(const void*, std::size_t bytes,
@@ -1311,6 +1313,7 @@ namespace tsg
     }
     inline std::size_t host_pinned_bytes() { return 0; }
     inline void host_pin_release_all() {}
+    inline void host_pin_release_ranges(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>&) {}
 #endif
 
     // Worker-thread count for the host MoE matmul (--cpu-moe-threads). Zero
@@ -1946,6 +1949,39 @@ namespace tsg
     };
     // Retire Qwen-Image-2.1 graphs before an immutable weight is changed/freed.
     void qwen_image21_invalidate_weight(const void* data);
+
+    // The host memory one owner releases (TSGgml_ReleaseHostRanges): a model's GGUF mappings, its memory pool's blocks,
+    // buffers it allocated. Spans [begin, end), sorted and merged, so contains() is a binary search.
+    struct HostRanges
+    {
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> spans;
+
+        void add(const void* base, std::uint64_t length)
+        {
+            if (base == nullptr || length == 0) return;
+            const auto b = reinterpret_cast<std::uintptr_t>(base);
+            spans.emplace_back(b, b + static_cast<std::uintptr_t>(length));
+        }
+        void seal()
+        {
+            std::sort(spans.begin(), spans.end());
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t>> merged;
+            for (const auto& s : spans)
+                if (!merged.empty() && s.first <= merged.back().second) merged.back().second = std::max(merged.back().second, s.second);
+                else merged.push_back(s);
+            spans.swap(merged);
+        }
+        bool contains(const void* p) const
+        {
+            if (p == nullptr || spans.empty()) return false;
+            const auto a = reinterpret_cast<std::uintptr_t>(p);
+            auto it = std::upper_bound(spans.begin(), spans.end(), std::make_pair(a, UINTPTR_MAX));
+            return it != spans.begin() && a < std::prev(it)->second;
+        }
+    };
+    // Per-module halves of TSGgml_ReleaseHostRanges: drop what each keeps keyed inside the ranges.
+    void qwen_image21_invalidate_ranges(const HostRanges& ranges);
+    void moe_hot_tier_drop_ranges(const HostRanges& ranges);
 
     // allow_unified_weight: when true the prefers_device_local_cache gate is
     // bypassed and only raw capability (host_ptr_buffer_capable) is required.

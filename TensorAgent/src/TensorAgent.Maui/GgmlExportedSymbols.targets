@@ -46,6 +46,7 @@
     <ReferenceNativeSymbol Include="TSGgml_CanInitializeBackend" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ClampF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ClearHostBufferCache" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResetSharedGraphCaches" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ClearOffloadableState" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Conv2dF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_CopyDeviceCopyRanges" SymbolType="Function" />
@@ -242,6 +243,7 @@
     <ReferenceNativeSymbol Include="TSGgml_IndexSelectF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexSelectGradF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_InvalidateHostBuffer" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ReleaseHostRanges" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IsActiveDeviceIntegrated" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IsBackendAvailable" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IsMetalAvailable" SymbolType="Function" />

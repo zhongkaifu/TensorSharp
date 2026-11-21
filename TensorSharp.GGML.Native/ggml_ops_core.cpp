@@ -2394,6 +2394,22 @@ namespace tsg
         g_cache_key_copies.clear();
     }
 
+    // The opaque cache keys of one owner's preloaded weights: those in `keys`, and those whose host bytes lie inside
+    // `ranges`. Appends them to `out` (their device copies are keyed by them) and forgets them.
+    void forget_cache_keys_of(const HostRanges& ranges, const std::unordered_set<const void*>& keys, std::vector<void*>& out)
+    {
+        std::lock_guard<std::mutex> lock(g_cache_key_mutex);
+        for (auto it = g_cache_key_host_data.begin(); it != g_cache_key_host_data.end();)
+        {
+            const bool owned = keys.count(it->first) != 0 || ranges.contains(it->first)
+                || (g_cache_key_copies.count(it->first) == 0 && ranges.contains(it->second));
+            if (!owned) { ++it; continue; }
+            out.push_back(const_cast<void*>(it->first));
+            g_cache_key_copies.erase(it->first);
+            it = g_cache_key_host_data.erase(it);
+        }
+    }
+
     // Number of uploads that had to be redirected — i.e. preloaded weights whose
     // device copy was not found. Each one is a silent re-upload of a whole
     // weight, so a non-zero count is a performance signal as well as the thing
@@ -3410,11 +3426,13 @@ extern "C" void TSGgml_WanResetForwardCache();
 extern "C" void TSGgml_NemotronMamba2PrefillClear();
 extern "C" void TSGgml_NemotronMamba2DecodeClear(std::uint64_t model_key);
 
-TSG_EXPORT void TSGgml_ClearHostBufferCache()
+// The graph caches every family keeps by shape or by host address (persistent decode and draft graphs, prefill and
+// paged-attention sessions, per-rank graphs, vendor library workspaces, the Q4_K GEMM's derived weights): dropped when a
+// model releases its memory, so none replays over a device copy that went with it or that a later model's bytes now
+// occupy. None holds state a live model needs: each rebuilds on its next call (the Mamba2 decode graphs, which carry a
+// live model's recurrent state, are each model's own to clear).
+TSG_EXPORT void TSGgml_ResetSharedGraphCaches()
 {
-    // Everything below frees buffers a deferred command buffer may still be reading
-    // (see TSGgml_ReleaseReuseComputeBuffers). Two atomic loads and no write when
-    // nothing is pending.
     host_read_barrier();
     TSGgml_QwenImage21ResetForwardCache();
     // Stored Qwen-Image-2.1 prefix K/V are device memory too; a request that
@@ -3458,6 +3476,17 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
 #if defined(TSG_GGML_USE_CUDA)
     tsg_cuda_q4k_gemm_release();
 #endif
+}
+
+TSG_EXPORT void TSGgml_ClearHostBufferCache()
+{
+    // Everything below frees buffers a deferred command buffer may still be reading
+    // (see TSGgml_ReleaseReuseComputeBuffers). Two atomic loads and no write when
+    // nothing is pending. The whole-process wipe: every model's device copies go, so only the last model of the process
+    // (ModelBase.Dispose), a component that holds the only model, or backend shutdown may call it; a model that leaves
+    // others live releases its own memory instead (TSGgml_ReleaseHostRanges).
+    host_read_barrier();
+    TSGgml_ResetSharedGraphCaches();
     forget_cache_keys();
     // ggml-cpu's repacked weight copies (graphs still bound to one keep it until they are freed).
     tsg::cpu_repack_clear();
@@ -3995,6 +4024,7 @@ TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes
 namespace tsg_graphtp
 {
     void on_drop(void* ptr);
+    void on_drop_ranges(const tsg::HostRanges& ranges);
     bool sync_to_host(void* ptr, std::size_t size);
 }
 
@@ -4047,6 +4077,82 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_GptOssResetDecodeCache();
     TSGgml_GptOssResetBatchedDecodeCache();
+}
+
+
+// One owner releases its host memory - a model's GGUF mappings, its memory pool's blocks, buffers it allocated
+// ([bases[i], bases[i] + lengths[i])) - and the opaque cache keys of its preloaded weights (`keys`): drop everything kept
+// for those bytes on every rank, and nothing else. TSGgml_InvalidateHostBuffer for each device copy keyed inside the
+// ranges (or by one of the keys), as for one key; then each module's entries for host bytes inside the ranges (ggml-cpu
+// repacks, tensor-parallel meta residents, MoE hot tiers, host-expert files, Qwen-Image-2.1 graphs, page locks,
+// offloadable registrations, cache-key resolutions). Another live model keeps its device copies, the plans bound to them
+// and its device-resident state: TSGgml_ClearHostBufferCache frees all of them, which only the last owner may do. Returns
+// how many device copies were dropped.
+TSG_EXPORT int TSGgml_ReleaseHostRanges(const void* const* bases, const std::uint64_t* lengths, int nranges,
+                                        void* const* keys, int nkeys)
+{
+    try
+    {
+        host_read_barrier();
+        tsg::HostRanges ranges;
+        for (int i = 0; i < nranges; ++i) ranges.add(bases[i], lengths[i]);
+        ranges.seal();
+        std::unordered_set<const void*> explicit_keys;
+        for (int i = 0; i < nkeys; ++i) if (keys[i] != nullptr) explicit_keys.insert(keys[i]);
+
+        // The keys of every device copy (and zero-copy wrap) this owner's bytes have, on every rank.
+        std::vector<void*> drop;
+        for (const void* k : explicit_keys) drop.push_back(const_cast<void*>(k));
+        tsg::forget_cache_keys_of(ranges, explicit_keys, drop);
+        for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
+        {
+            tsg::ScopedRank rank(r);
+            {
+                std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+                for (const auto& [ptr, cached] : g_preloaded_buffer_cache)
+                    if (ranges.contains(ptr)) drop.push_back(ptr);
+            }
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            for (const auto& [ptr, cached] : g_host_buffer_cache)
+                if (ranges.contains(ptr)) drop.push_back(ptr);
+            // Offloadable registrations of these bytes (their copies go below; an unregistered key never had one).
+            for (auto it = g_offloadable_keys.begin(); it != g_offloadable_keys.end();)
+            {
+                if (!ranges.contains(*it)) { ++it; continue; }
+                tsg::offloadable_lru_remove_locked(*it);
+                it = g_offloadable_keys.erase(it);
+            }
+        }
+        std::sort(drop.begin(), drop.end());
+        drop.erase(std::unique(drop.begin(), drop.end()), drop.end());
+        int dropped = 0;
+        for (void* key : drop)
+        {
+            bool had = false;
+            for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire) && !had; ++r)
+            {
+                tsg::ScopedRank rank(r);
+                std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+                had = g_host_buffer_cache.count(key) != 0;
+            }
+            TSGgml_InvalidateHostBuffer(key);
+            dropped += had ? 1 : 0;
+        }
+
+        tsg::cpu_repack_forget_ranges(ranges.spans);
+        tsg_graphtp::on_drop_ranges(ranges);
+        tsg::moe_hot_tier_drop_ranges(ranges);
+        for (const auto& span : ranges.spans) tsg::host_expert_io_on_drop(reinterpret_cast<const void*>(span.first));
+        tsg::qwen_image21_invalidate_ranges(ranges);
+        tsg::host_pin_release_ranges(ranges.spans);
+        clear_last_error();
+        return dropped;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return -1;
+    }
 }
 
 TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)

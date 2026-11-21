@@ -114,15 +114,21 @@ namespace TensorSharp.Models
     {
         internal const long PageAlignment = 16384;
 
-        private readonly List<IntPtr> _buffers = new();
+        private readonly List<(IntPtr Base, long Length)> _buffers = new();
 
         internal unsafe IntPtr Allocate(long bytes)
         {
             void* p = NativeMemory.AlignedAlloc((nuint)Math.Max(bytes, 1), (nuint)PageAlignment);
             if (p == null) throw new OutOfMemoryException($"Unable to allocate {bytes} bytes for LoRA factors.");
             var ptr = (IntPtr)p;
-            lock (_buffers) _buffers.Add(ptr);
+            lock (_buffers) _buffers.Add((ptr, Math.Max(bytes, 1)));
             return ptr;
+        }
+
+        /// <summary>Adds every factor buffer, as a range: the memory a set's GGML device copies are keyed inside.</summary>
+        internal void AddRanges(List<(IntPtr Base, long Length)> ranges)
+        {
+            lock (_buffers) ranges.AddRange(_buffers);
         }
 
         internal unsafe IntPtr Copy(ReadOnlySpan<float> values)
@@ -134,7 +140,7 @@ namespace TensorSharp.Models
 
         public void Dispose()
         {
-            foreach (var p in _buffers) unsafe { NativeMemory.AlignedFree(p.ToPointer()); }
+            foreach (var (p, _) in _buffers) unsafe { NativeMemory.AlignedFree(p.ToPointer()); }
             _buffers.Clear();
         }
     }

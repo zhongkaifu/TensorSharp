@@ -2991,6 +2991,14 @@ namespace tsg_graphtp
             it = it->first.second == ptr ? g_residents.erase(it) : std::next(it);
     }
 
+    // Every meta resident of host bytes inside `ranges` (an owner releasing its memory: TSGgml_ReleaseHostRanges).
+    void on_drop_ranges(const tsg::HostRanges& ranges)
+    {
+        std::lock_guard<std::mutex> lk(g_resident_mu);
+        for (auto it = g_residents.begin(); it != g_residents.end();)
+            it = ranges.contains(it->first.second) ? g_residents.erase(it) : std::next(it);
+    }
+
     // Gather a meta-resident state back into its host bytes; false when `ptr` has none.
     bool sync_to_host(void* ptr, std::size_t size)
     {

@@ -25,7 +25,7 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.WanVideo
 {
-    internal sealed class WanTextEncoder : IWanTextEncoder
+    internal sealed class WanTextEncoder : IWanTextEncoder, IGgmlHostMemoryOwner
     {
         public const int TextLen = 512;
 
@@ -258,6 +258,13 @@ namespace TensorSharp.Models.WanVideo
                 _f32Copies[name] = result;
                 return result;
             }
+        }
+
+        /// <summary>This encoder's GGUF mapping and the F32 copies it made.</summary>
+        void IGgmlHostMemoryOwner.CollectHostMemory(List<(IntPtr Base, long Length)> ranges, List<IntPtr> keys)
+        {
+            GgmlOwnerRelease.AddMappings(ranges, _gguf);
+            keys.AddRange(_f32Owned);
         }
 
         public void Dispose()

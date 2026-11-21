@@ -852,6 +852,10 @@ namespace TensorSharp.Models.QwenImage
             return host;
         }
 
+        /// <summary>The fused weights this encoder allocated, whose device copies go with its own.</summary>
+        protected override void AddOwnedHostMemory(System.Collections.Generic.List<(IntPtr Base, long Length)> ranges,
+            System.Collections.Generic.List<IntPtr> keys) => keys.AddRange(_fusedAllocs);
+
         public override void Dispose()
         {
             base.Dispose();

@@ -7,7 +7,7 @@ using TensorSharp.GGML;
 namespace TensorSharp.Models.QwenImage
 {
     /// <summary>Single-frame Qwen-Image-2.1 RGBA VAE: 64 normalized channels at 1/16 resolution.</summary>
-    internal sealed class QwenImage21Vae : IDisposable
+    internal sealed class QwenImage21Vae : IDisposable, IGgmlHostMemoryOwner
     {
         private VaeWeights _weights;
         public QwenImage21Vae(QwenImageModel model)
@@ -44,6 +44,10 @@ namespace TensorSharp.Models.QwenImage
         public VaeLatent Encode(RgbImage image) => VaeReferenceMath.Encode21(_weights, image);
         public RgbImage Decode(VaeLatent latent) => VaeReferenceMath.Decode21(_weights, latent);
         public void Dispose() { _weights?.FusedGraph?.Dispose(); _weights = null; }
+
+        /// <summary>The fused graph's weight copies (the decoder's GGUF mapping is the model's).</summary>
+        void IGgmlHostMemoryOwner.CollectHostMemory(System.Collections.Generic.List<(IntPtr Base, long Length)> ranges,
+            System.Collections.Generic.List<IntPtr> keys) => (_weights?.FusedGraph as IGgmlHostMemoryOwner)?.CollectHostMemory(ranges, keys);
     }
 
     internal static partial class VaeReferenceMath

@@ -1092,6 +1092,21 @@ namespace TensorSharp.Runtime
             viewPtr += _mappedView.PointerOffset;
             _mappedBase = viewPtr;
             _mappedPointerAcquired = true;
+            lock (_mappingsMade) _mappingsMade.Add(((IntPtr)viewPtr, _stream.Length));
+        }
+
+        // Every view this file mapped, kept after it is unmapped: device copies keyed by its addresses may outlive it.
+        private readonly List<(IntPtr Base, long Length)> _mappingsMade = new();
+
+        /// <summary>The address ranges this file and its shards have mapped (still mapped or not), without mapping
+        /// anything: the host memory whose GGML device copies its owner releases with its own.</summary>
+        public IReadOnlyList<(IntPtr Base, long Length)> MappingsMade()
+        {
+            var made = new List<(IntPtr, long)>();
+            lock (_mappingsMade) made.AddRange(_mappingsMade);
+            foreach (var shard in _shards)
+                lock (shard._mappingsMade) made.AddRange(shard._mappingsMade);
+            return made;
         }
     }
 }

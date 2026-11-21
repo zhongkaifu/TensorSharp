@@ -288,6 +288,29 @@ namespace tsg
         return g_pinned_bytes;
     }
 
+    void host_pin_release_ranges(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& ranges)
+    {
+        std::lock_guard<std::mutex> lock(g_pin_mutex);
+        auto inside = [&](std::uintptr_t a)
+        {
+            auto s = std::upper_bound(ranges.begin(), ranges.end(), std::make_pair(a, UINTPTR_MAX));
+            return s != ranges.begin() && a < std::prev(s)->second;
+        };
+        for (auto it = g_owned.begin(); it != g_owned.end();)
+        {
+            if (!inside(it->first)) { ++it; continue; }
+            cudaHostUnregister(reinterpret_cast<void*>(it->first));
+            cudaGetLastError();
+            it = g_owned.erase(it);
+        }
+        for (auto it = g_pinned.begin(); it != g_pinned.end();)
+        {
+            if (!inside(it->first)) { ++it; continue; }
+            g_pinned_bytes -= std::min<std::size_t>(g_pinned_bytes, static_cast<std::size_t>(it->second - it->first));
+            it = g_pinned.erase(it);
+        }
+    }
+
     void host_pin_release_all()
     {
         std::lock_guard<std::mutex> lock(g_pin_mutex);

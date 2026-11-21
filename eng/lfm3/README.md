@@ -63,6 +63,14 @@ in the ignored `artifacts/lfm3/`.
   build it in both trees and compare the `STEP` and `CELL` lines of the two outputs (the cells' counters cut off, and
   only the `logits` cells where one build has device ids and the other has not) per model and backend.
 
+- `MultiModelUnload KEPT OTHER BACKEND [--prompt P] [--steps T] [--other-steps U]` (`dotnet build
+  eng/lfm3/MultiModelUnload -c Release`) checks that a model kept loaded carries on exactly while another model of the
+  same process is loaded, run and unloaded mid-generation. It runs KEPT alone: a prompt of P tokens, then T greedy decode
+  steps. Then it runs KEPT again, and halfway through loads OTHER, runs its prompt and U steps, and disposes it, before
+  KEPT finishes on the same cache. It prints every step's FNV-1a logits digest for both runs, and SAME or DIFFERS; the
+  exit code is 0 only when they are equal bit for bit. Any family `ModelBase.Create` loads, on any backend. KEPT and
+  OTHER may be the same file.
+
 - `gpu-matrix.sh OUT MODELS_DIR CASES_DIR CORPUS [MODEL ...]` runs the text comparison on a Linux GPU machine (CUDA and
   Vulkan): builds `llamacpp-forced` against llama.cpp's `build-cuda/` and `build-vk/` trees (`LLAMA`), records llama.cpp's
   references on each, teacher-forces TensorSharp's `ggml_cuda` and direct `cuda` lanes through the CUDA references and

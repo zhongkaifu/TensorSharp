@@ -333,6 +333,18 @@ namespace tsg
         g_repacked.clear();
     }
 
+    void cpu_repack_forget_ranges(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& spans)
+    {
+        std::lock_guard<std::mutex> lock(g_repack_mu);
+        for (auto it = g_repacked.begin(); it != g_repacked.end();)
+        {
+            const auto a = reinterpret_cast<std::uintptr_t>(it->first);
+            auto s = std::upper_bound(spans.begin(), spans.end(), std::make_pair(a, UINTPTR_MAX));
+            const bool inside = s != spans.begin() && a < std::prev(s)->second;
+            it = inside ? g_repacked.erase(it) : std::next(it);
+        }
+    }
+
     // ---- thread pools
 
     namespace
