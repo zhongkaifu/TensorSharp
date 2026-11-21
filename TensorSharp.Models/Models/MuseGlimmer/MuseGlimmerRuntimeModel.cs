@@ -153,6 +153,20 @@ namespace TensorSharp.Models
         protected override float FinalLogitSoftcap => _softcap;
 
         /// <summary>
+        /// The rows a prompt step writes into a sliding-window ring on MLX (rings of align256(window + rows) cells: 3072 for the
+        /// 30B's 2048-token window): the runtime's 512 elsewhere. MLX's graph executor does not overlap a step's host work with
+        /// the previous step's GPU work, so each step costs host time a wider step amortizes. Measured on an M5 Pro (48 GB),
+        /// UD-IQ2_XXS, the probe's bench, ABBA in one binary at 41e0d628 (docs/design/muse-glimmer-unified.md §5.8), 1024 against
+        /// 512 rows: prefill 5.0% faster at 4K and 5.4% at 16K, within noise at 512 (two rounds, 0.956 and 1.032: one step either
+        /// way); decode 0.997-1.001; peak wired 17.1 / 19.0 GB at 4K / 16K against 16.7 / 18.0, under legacy's 18.1 / 19.9.
+        /// 2048 rows against 1024: prefill +2.7% (4K) and +1.4% (16K), but decode 0.9% slower and 18.9-20.9 GB wired, past
+        /// legacy's peak. ggml_metal keeps 512 (2048 rows measured 0.99-1.00 there).
+        /// </summary>
+        internal const int MlxRingStepRows = 1024;
+
+        protected override int RingStepRowsForPlacement => _backend == BackendType.Mlx ? MlxRingStepRows : base.RingStepRowsForPlacement;
+
+        /// <summary>
         /// The default draft window, by the trunk's verify economics. Measured on an M5 Pro (UD-IQ2_XXS, the 1.63 GB dflash-kquant
         /// drafter, greedy, five prompts x 512 tokens; docs/design/muse-glimmer-unified.md §5.4):
         /// <list type="bullet">

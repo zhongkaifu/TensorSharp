@@ -986,6 +986,9 @@ step stays 512 rows on every Mac backend, and no shared runtime, executor or nat
   is per-step host time: `MlxGraphExecutor` has no `OverlapSteps`, so a step's host work does not overlap the previous
   step's GPU work (about 60-70 ms a 512-row step). The fix, if wanted, is that overlap (every MLX family), or 1024 rows on
   MLX through S6's `RingStepRowsForPlacement`.
+  **Changed after S9** by the standing rule (take the faster kernel, measured on the device) where memory stays within
+  legacy's: Muse-Glimmer on MLX takes 1024-row steps (`MuseGlimmerRuntimeModel.RingStepRowsForPlacement`), measured at
+  41e0d628 in §5.8.
 * **G4, the CPU ring policy: rings.** Legacy's reason for uniform caches (its 4352-row rings read whole once wrapped) does not carry over to 2560-cell rings. At 4K, both arms in 512-row steps, linear caches prefill 1.001x and decode 0.985x the rings, at 2.9 GB more resident memory, so no CPU policy is added. ggml_cpu at 16K was not run: an arm prefills for 32-45 min, past the Mac lock's budget, and 4K already reads the wrapped rings whole.
 * **G5: not implemented.** The host lookup and upload of a step's rows cost 0.06-0.17% of a prefill on ggml_metal, 0.02-0.48%
   on MLX and under 0.01% on ggml_cpu, and 0.02-0.06% of a decoded token; Metal's prompt steps overlap it.
@@ -1088,6 +1091,29 @@ direct CUDA, the S8 sessions) waits for the CUDA box: `glimmer/cuda-vm/s9w/s9-cu
 | Server (OpenAI, Web UI, DFlash and n-gram servers, c4) | **passed**, S8's figures: OpenAI 7/9 (the same two pre-existing ones), reuse 4,515 / 4,922 (thinking 4,486 / 4,917), the Web UI loop check, c4 12/12 identical to sequential, 27.2 s against 53.8 s |
 | No legacy symbol | **passed**: the class, export and helper names occur in no code, project, build or script file; only in the frozen fixtures' provenance, the history sections of the model card and this document |
 | ggml_cuda, ggml_vulkan, direct CUDA | **not run** (the VM) |
+
+**MLX prompt step width, after S9 (a DEFAULT CHANGE).** The standing rule (take the faster kernel, measured on the device)
+over D1's "widen only where the runtime trails legacy", where memory stays within legacy's. The probe's bench on 41e0d628,
+UD-IQ2_XXS, ABBA in one binary, each arm its own process under the Mac lock and memguard (prefill and decode tok/s, each
+arm; peak wired GB; legacy's peaks from S7 on the same machine):
+
+| Arms (A / B) | Depth | prefill A / B | B / A | decode A / B | B / A | peak wired A / B (legacy) |
+|---|---:|---|---:|---|---:|---|
+| 512 / 1024 rows | 512 | 438.6, 416.7 / 415.3, 402.1 | 0.956 | 21.16, 21.18 / 21.18, 21.20 | 1.001 | 15.8 / 15.7 (16.0) |
+| 512 / 1024, second round | 512 | 438.3, 406.8 / 439.0, 433.1 | 1.032 | 21.21, 21.22 / 21.23, 21.17 | 0.999 | 15.7 / 15.8 |
+| 512 / 1024 | 4K | 409.1, 408.9 / 429.5, 429.6 | **1.050** | 20.44, 20.48 / 20.41, 20.45 | 0.999 | 16.7 / 17.1 (18.1) |
+| 512 / 1024 | 16K | 389.4, 399.9 / 414.9, 417.3 | **1.054** | 19.89, 19.85 / 19.78, 19.84 | 0.997 | 18.0 / 19.0 (19.9) |
+| 1024 / 2048 | 512 | 410.9, 433.5 / 425.7, 431.0 | 1.015 | 21.16, 21.22 / 21.20, 21.24 | 1.001 | 15.8 / 15.7 |
+| 1024 / 2048 | 4K | 422.0, 423.5 / 434.0, 434.1 | 1.027 | 20.45, 20.46 / 20.26, 20.27 | 0.991 | 17.0 / 19.6 (18.1) |
+| 1024 / 2048 | 16K | 417.5, 419.0 / 423.2, 423.7 | 1.012 | 19.81, 19.83 / 19.64, 19.68 | 0.992 | 19.0 / 21.1 (19.9) |
+
+At 512 tokens the prompt is one step either way, so the two rounds bound the noise (0.956-1.032, A's own runs 5% apart).
+1024 rows: prefill +5.0% at 4K and +5.4% at 16K, decode within 0.3%, wired under legacy's: **taken**
+(`MuseGlimmerRuntimeModel.MlxRingStepRows`, 3072-cell rings). 2048 rows: a further +1.2-2.7% prefill, but decode 0.8-0.9%
+slower and wired past legacy's at 4K and 16K: not taken. With 1024 rows the MLX gates hold: llama.cpp 639/640 and 128/128,
+legacy's continuations 5/6 (the sixth a near-tie, as before), perplexity +0.0001%, images 215/216, DFlash lossless up to one
+near-tie (together), a checkpoint past the 3,072-cell rings' lap continuing exactly (the test's prefix moved from 3,000 to
+3,500 positions to pass either ring), and the synthetic family classes on the metal pin (440 passed). ggml_metal keeps 512.
 
 
 ---
