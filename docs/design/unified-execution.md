@@ -981,7 +981,8 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
 * **Several sequences' regions (direct CUDA):** a batched step's per-sequence ops of one layer stay per-sequence ops
   (each sequence on its own state and caches) and form a region the CUDA executor runs in one launch, every
   sequence's values its own launch's: `DeltaNetScans` (a verify window's delta-net scans, the multi-sequence form of
-  the window scan kernel), `SequenceAttentions` (the sequences' cache writes and attention ops, run at the region's end
+  the window scan kernel), `DeltaNetPreps` (the sequences' delta-rule preps, each writing its conv input into its conv
+  history, the region's copies) and `GatedRmsNorms` (their gated norms into the rows' concatenation), `SequenceAttentions` (the sequences' cache writes and attention ops, run at the region's end
   between `BeginTogether` and `EndTogether`: the verify windows' flash launches are held back and made in one
   multi-sequence window launch and one combine) and `RingAttentionLanes` (a batched block draft's lanes' ring
   attentions). A test pins each against its op-by-op form and each sequence run alone, bit for bit

@@ -334,6 +334,10 @@ namespace TensorSharp.Models
         /// (<see cref="GraphFusion.DeltaNetScans"/>).</summary>
         internal bool DeltaNetScanRegionsDisabledForTests { get; set; }
 
+        /// <summary>Tests: a batched verify's sequences' delta-rule preps and gated norms run each in its own region, not as one
+        /// region a layer (<see cref="GraphFusion.DeltaNetPreps"/>, <see cref="GraphFusion.GatedRmsNorms"/>).</summary>
+        internal bool SequencePrepRegionsDisabledForTests { get; set; }
+
         protected override int EmitRecurrentMixer(GraphStep step, int layer, int normed)
         {
             const long f = sizeof(float);
@@ -379,45 +383,141 @@ namespace TensorSharp.Models
             int ssmNorm = step.TensorWeight(step.Replicated(_deviceSsmNorm[layer]));
             long nb1 = packed * f;
 
+            // y * rsqrt(mean(y^2) + eps) * w * gate(z), one region a backend may run as one kernel (GraphFusion.GatedRmsNorm).
+            int GatedNorm(int y, int zh)
+            {
+                bool sigmoid = MixerSigmoidGate;
+                step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, stackalloc long[] { sigmoid ? 1 : 0 }, stackalloc[] { eps });
+                int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(sigmoid ? GraphOp.Sigmoid : GraphOp.Silu, zh));
+                step.EndFused(stackalloc[] { gated });
+                return gated;
+            }
+
             // Several sequences' verify windows (a batched verify): each sequence's scan waits until every sequence's inputs are
             // made, and the scans form one region (GraphFusion.DeltaNetScans) an executor may run in one dispatch, each
             // sequence's values its op's.
             bool scans = step.Sequences > 1 && step.RecurrentSnapshots && !DeltaNetScanRegionsDisabledForTests;
+            // Every sequence a verify window read where the in-projection put it: the sequences' preps (each with its conv
+            // history's copy) form one region, and so do their gated norms with the rows' concatenation
+            // (GraphFusion.DeltaNetPreps, GraphFusion.GatedRmsNorms).
+            bool together = scans && windowViews && !SequencePrepRegionsDisabledForTests;
+            for (int s = 0; together && s < step.Sequences; s++) together = step.Counts[s] > 1;
             var parts = new int[step.Sequences];
             var waiting = new List<(int Sequence, int[] Srcs, long Rows, Func<int, int> Then)>();
-            for (int s = 0; s < step.Sequences; s++)
+
+            // A sequence's in-projection blocks: qkv, z (and z as [dv, vHeads, count] where it is read in place), beta, alpha.
+            (int Qkv, int Z, int Z4, int Beta, int Alpha) Operands(int s)
             {
                 int count = step.Counts[s];
                 long row0 = step.First[s] * nb1;
-                var state = (DeviceGdnState)step.SequenceState(s, layer);
-
-                int qkv, z, betaRaw, alphaRaw, z4 = -1;
                 if (split)
                 {
                     long col = step.First[s];
-                    qkv = step.Sequences == 1 ? qkvAll : step.View2(qkvAll, channels, count, channels * f, col * channels * f);
-                    z = step.Sequences == 1 ? zAll : step.View2(zAll, v, count, v * f, col * v * f);
-                    betaRaw = step.Sequences == 1 ? betaAll : step.View2(betaAll, vHeads, count, vHeads * f, col * vHeads * f);
-                    alphaRaw = step.Sequences == 1 ? alphaAll : step.View2(alphaAll, vHeads, count, vHeads * f, col * vHeads * f);
+                    return (step.Sequences == 1 ? qkvAll : step.View2(qkvAll, channels, count, channels * f, col * channels * f),
+                        step.Sequences == 1 ? zAll : step.View2(zAll, v, count, v * f, col * v * f), -1,
+                        step.Sequences == 1 ? betaAll : step.View2(betaAll, vHeads, count, vHeads * f, col * vHeads * f),
+                        step.Sequences == 1 ? alphaAll : step.View2(alphaAll, vHeads, count, vHeads * f, col * vHeads * f));
                 }
-                else if (windowViews && count > 1)
+                if (windowViews && count > 1)
                 {
                     // The window's rows a packed row apart, read where they are by the regions that take them.
-                    qkv = step.View2(proj, channels, count, nb1, row0);
-                    z = step.View2(proj, v, count, nb1, row0 + channels * f);
-                    z4 = step.View4(proj, dv, vHeads, count, 1, dv * f, nb1, nb1 * count, row0 + channels * f);
-                    betaRaw = step.View2(proj, vHeads, count, nb1, row0 + (channels + v) * f);
-                    alphaRaw = step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f);
+                    return (step.View2(proj, channels, count, nb1, row0), step.View2(proj, v, count, nb1, row0 + channels * f),
+                        step.View4(proj, dv, vHeads, count, 1, dv * f, nb1, nb1 * count, row0 + channels * f),
+                        step.View2(proj, vHeads, count, nb1, row0 + (channels + v) * f),
+                        step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f));
+                }
+                return (step.Cont(step.View2(proj, channels, count, nb1, row0)), step.Cont(step.View2(proj, v, count, nb1, row0 + channels * f)), -1,
+                    step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v) * f)),
+                    step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f)));
+            }
+
+            // The delta rule's inputs, one region a backend may run as one kernel (GraphFusion.DeltaNetPrep):
+            // the gates, the causal conv over [previous window | this chunk] and the L2-normed Q and K.
+            (int ConvIn, int Q, int K, int V, int G, int Beta) Prep(int count, int window, int qkv, int alphaRaw, int betaRaw)
+            {
+                step.BeginFused(GraphFusion.DeltaNetPrep, stackalloc[] { window, qkv, convW, alphaRaw, betaRaw, dt, a },
+                    stackalloc long[] { dk, kHeads, dv, vHeads }, stackalloc[] { eps });
+                int beta = step.Reshape(step.Op(GraphOp.Sigmoid, betaRaw), 1, vHeads, count, 1);
+                int g = step.Op(GraphOp.Mul, step.Op(GraphOp.Softplus, step.Op(GraphOp.Add, alphaRaw, dt)), a);
+                g = step.Reshape(g, 1, vHeads, count, 1);
+                // ggml_concat writes a contiguous result, so it reads the transposed view directly.
+                int convIn = step.Op(GraphOp.Concat, stackalloc[] { window, step.Transpose(qkv) }, stackalloc long[] { 0 });
+                int conv = step.Op(GraphOp.Silu, step.Op(GraphOp.SsmConv, convIn, convW));   // [channels, count]
+                // Q, K, V as [head, heads, tokens, 1] views of the conv output; where the backend reads
+                // strided rows they feed the norms and the recurrence directly, else contiguous copies.
+                long token = channels * f, all = channels * count * f;
+                int q4 = step.View4(conv, dk, kHeads, count, 1, dk * f, token, all, 0);
+                int k4 = step.View4(conv, dk, kHeads, count, 1, dk * f, token, all, qk * f);
+                int v4 = step.View4(conv, dv, vHeads, count, 1, dv * f, token, all, 2 * qk * f);
+                if (!step.StridedInputs)
+                {
+                    q4 = step.Cont(q4);
+                    k4 = step.Cont(k4);
+                    v4 = step.Cont(v4);
+                }
+                q4 = step.L2Norm(q4, dk, eps);
+                k4 = step.L2Norm(k4, dk, eps);
+                step.EndFused(stackalloc[] { convIn, q4, k4, v4, g, beta });
+                return (convIn, q4, k4, v4, g, beta);
+            }
+
+            // A verify window's conv history: its conv input [previous window | its rows] at the window's own pitch, one
+            // contiguous copy whatever its rows (at the capacity's pitch a window narrower than it wrote [channels] rows of a few
+            // floats each: 27 us a layer for 2- and 3-row windows of Qwen3.8 Flash Next, 1 ms a window).
+            int HistoryView(DeviceGdnState state, int count)
+            {
+                int hist = step.State(state.ConvHistory, GraphFormat.F32, convRows + state.SnapshotCapacity, channels);
+                long histPitch = convRows + count;
+                return step.View2(hist, convRows + count, channels, histPitch * f, 0);
+            }
+
+            // Together: every sequence's prep (each writing its conv input into its history) in one region, before anything else.
+            var prepared = together ? new (int Qkv, int Z, int Z4, int Window, (int ConvIn, int Q, int K, int V, int G, int Beta) Prep)[step.Sequences] : null;
+            if (together)
+            {
+                var operands = new (int Qkv, int Z, int Z4, int Beta, int Alpha)[step.Sequences];
+                var windows = new int[step.Sequences];
+                var histories = new int[step.Sequences];
+                var srcs = new List<int>(5 * step.Sequences + 3);
+                for (int s = 0; s < step.Sequences; s++)
+                {
+                    var state = (DeviceGdnState)step.SequenceState(s, layer);
+                    operands[s] = Operands(s);
+                    windows[s] = step.State(state.Conv, GraphFormat.F32, convRows, channels);
+                    if (state.EnsureSpecBuffers(step.Counts[s])) NoteGraphBindingsChanged();
+                    histories[s] = HistoryView(state, step.Counts[s]);
+                    srcs.AddRange(new[] { windows[s], operands[s].Qkv, operands[s].Alpha, operands[s].Beta, histories[s] });
+                }
+                srcs.AddRange(new[] { convW, dt, a });
+                step.BeginFused(GraphFusion.DeltaNetPreps, srcs.ToArray(), stackalloc long[] { dk, kHeads, dv, vHeads, step.Sequences },
+                    stackalloc[] { eps });
+                var results = new List<int>(5 * step.Sequences);
+                for (int s = 0; s < step.Sequences; s++)
+                {
+                    var made = Prep(step.Counts[s], windows[s], operands[s].Qkv, operands[s].Alpha, operands[s].Beta);
+                    step.Effect(step.Op(GraphOp.Cpy, made.ConvIn, histories[s]));
+                    prepared[s] = (operands[s].Qkv, operands[s].Z, operands[s].Z4, windows[s], made);
+                    results.AddRange(new[] { made.Q, made.K, made.V, made.G, made.Beta });
+                }
+                step.EndFused(results.ToArray());
+            }
+
+            var norms = together ? new (int Y, int Z)[step.Sequences] : null;
+            for (int s = 0; s < step.Sequences; s++)
+            {
+                int count = step.Counts[s], sequence = s;   // (Rest runs after the loop for a scanned sequence)
+                var state = (DeviceGdnState)step.SequenceState(s, layer);
+
+                int qkv, z, betaRaw = -1, alphaRaw = -1, z4, window;
+                if (together)
+                {
+                    (qkv, z, z4, window, _) = prepared[s];
                 }
                 else
                 {
-                    qkv = step.Cont(step.View2(proj, channels, count, nb1, row0));
-                    z = step.Cont(step.View2(proj, v, count, nb1, row0 + channels * f));
-                    betaRaw = step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v) * f));
-                    alphaRaw = step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f));
+                    (qkv, z, z4, betaRaw, alphaRaw) = Operands(s);
+                    window = step.State(state.Conv, GraphFormat.F32, convRows, channels);
                 }
-
-                int window = step.State(state.Conv, GraphFormat.F32, convRows, channels);
                 // A verify window leaves the live window alone: the commit sets it from the conv history.
                 bool keep = step.RecurrentSnapshots && count > 1;
 
@@ -444,31 +544,7 @@ namespace TensorSharp.Models
                     step.BeginFused(GraphFusion.DeltaNetPrompt, stackalloc[] { qkv, z, alphaRaw, betaRaw, convW, dt, a, ssmNorm, window, s4 },
                         stackalloc long[] { dk, kHeads, dv, vHeads, MixerSigmoidGate ? 1 : 0, _convKernel }, stackalloc[] { eps });
 
-                // The delta rule's inputs, one region a backend may run as one kernel (GraphFusion.DeltaNetPrep):
-                // the gates, the causal conv over [previous window | this chunk] and the L2-normed Q and K.
-                step.BeginFused(GraphFusion.DeltaNetPrep, stackalloc[] { window, qkv, convW, alphaRaw, betaRaw, dt, a },
-                    stackalloc long[] { dk, kHeads, dv, vHeads }, stackalloc[] { eps });
-                int beta = step.Reshape(step.Op(GraphOp.Sigmoid, betaRaw), 1, vHeads, count, 1);
-                int g = step.Op(GraphOp.Mul, step.Op(GraphOp.Softplus, step.Op(GraphOp.Add, alphaRaw, dt)), a);
-                g = step.Reshape(g, 1, vHeads, count, 1);
-                // ggml_concat writes a contiguous result, so it reads the transposed view directly.
-                int convIn = step.Op(GraphOp.Concat, stackalloc[] { window, step.Transpose(qkv) }, stackalloc long[] { 0 });
-                int conv = step.Op(GraphOp.Silu, step.Op(GraphOp.SsmConv, convIn, convW));   // [channels, count]
-                // Q, K, V as [head, heads, tokens, 1] views of the conv output; where the backend reads
-                // strided rows they feed the norms and the recurrence directly, else contiguous copies.
-                long token = channels * f, all = channels * count * f;
-                int q4 = step.View4(conv, dk, kHeads, count, 1, dk * f, token, all, 0);
-                int k4 = step.View4(conv, dk, kHeads, count, 1, dk * f, token, all, qk * f);
-                int v4 = step.View4(conv, dv, vHeads, count, 1, dv * f, token, all, 2 * qk * f);
-                if (!step.StridedInputs)
-                {
-                    q4 = step.Cont(q4);
-                    k4 = step.Cont(k4);
-                    v4 = step.Cont(v4);
-                }
-                q4 = step.L2Norm(q4, dk, eps);
-                k4 = step.L2Norm(k4, dk, eps);
-                step.EndFused(stackalloc[] { convIn, q4, k4, v4, g, beta });
+                var (convIn, q4, k4, v4, g, beta) = together ? prepared[s].Prep : Prep(count, window, qkv, alphaRaw, betaRaw);
 
                 // convIn is a fresh contiguous [convRows + count, channels]: its last rows are the new window.
                 if (!keep)
@@ -502,7 +578,8 @@ namespace TensorSharp.Models
                         stackalloc long[] { 0, state.BackingRows, 1 })
                     : step.Op(GraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 }, stackalloc long[] { keep ? count : 1 }));
 
-                // The sequence's recurrence's result on: its window's history, its gated output.
+                // The sequence's recurrence's result on: its window's history, its gated output (together, the norm's operands:
+                // the norms are emitted as one region after every sequence's).
                 int Rest(int gdn)
                 {
                     int scores = step.View2(gdn, v, count, v * f, 0);
@@ -514,13 +591,8 @@ namespace TensorSharp.Models
                             int fallback = step.Op(GraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(verify, total, 1, total * f, 0));
                             step.Alias(gdn, verify, 0, fallback);
                         }
-                        // At the window's own pitch, one contiguous copy whatever its rows (at the capacity's pitch a window
-                        // narrower than it wrote [channels] rows of a few floats each: 27 us a layer for 2- and 3-row windows
-                        // of Qwen3.8 Flash Next, 1 ms a window).
-                        int hist = step.State(state.ConvHistory, GraphFormat.F32, convRows + cap, channels);
-                        long histPitch = convRows + count;
-                        step.Effect(step.Op(GraphOp.Cpy, convIn,
-                            step.View2(hist, convRows + count, channels, histPitch * f, 0)));
+                        // (Together, the prep region wrote it.)
+                        if (!together) step.Effect(step.Op(GraphOp.Cpy, convIn, HistoryView(state, count)));
                     }
                     else
                     {
@@ -536,10 +608,12 @@ namespace TensorSharp.Models
                     }
 
                     int y = step.Reshape(step.Cont(scores), dv, vHeads, count), zh = z4 >= 0 ? z4 : step.Reshape(z, dv, vHeads, count);
-                    bool sigmoid = MixerSigmoidGate;
-                    step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, stackalloc long[] { sigmoid ? 1 : 0 }, stackalloc[] { eps });
-                    int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(sigmoid ? GraphOp.Sigmoid : GraphOp.Silu, zh));
-                    step.EndFused(stackalloc[] { gated });
+                    if (together)
+                    {
+                        norms[sequence] = (y, zh);
+                        return -1;
+                    }
+                    int gated = GatedNorm(y, zh);
                     if (mixer) step.EndFused(stackalloc[] { gated });
                     return step.Reshape(gated, v, count);
                 }
@@ -562,6 +636,23 @@ namespace TensorSharp.Models
                 if (region) step.EndFused(scanned);
                 for (int w = 0; w < waiting.Count; w++)
                     parts[waiting[w].Sequence] = waiting[w].Then(scanned[w]);
+            }
+            if (together)
+            {
+                // Every sequence's gated norm, and the rows' concatenation, one region (GraphFusion.GatedRmsNorms).
+                var srcs = new List<int>(2 * step.Sequences + 1);
+                foreach (var (y, zh) in norms) srcs.AddRange(new[] { y, zh });
+                srcs.Add(ssmNorm);
+                step.BeginFused(GraphFusion.GatedRmsNorms, srcs.ToArray(), stackalloc long[] { MixerSigmoidGate ? 1 : 0, step.Sequences },
+                    stackalloc[] { eps });
+                int joined = -1;
+                for (int s = 0; s < step.Sequences; s++)
+                {
+                    int part = step.Reshape(GatedNorm(norms[s].Y, norms[s].Z), v, step.Counts[s]);
+                    joined = joined < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { joined, part }, stackalloc long[] { 1 });
+                }
+                step.EndFused(stackalloc[] { joined });
+                return step.MatMul(LayerName(layer, "ssm_out.weight"), joined);
             }
             int output = -1;
             foreach (int part in parts)

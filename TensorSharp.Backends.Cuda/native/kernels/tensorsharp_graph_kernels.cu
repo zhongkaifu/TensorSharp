@@ -3714,3 +3714,145 @@ struct ts_graph_ring_lanes
 
 TS_GRAPH_RING_ATTN_LANES(64)
 TS_GRAPH_RING_ATTN_LANES(128)
+
+// GraphFusion.DeltaNetPreps: ts_graph_deltanet_prep_f32 over several sequences' verify windows in one launch, each sequence's
+// values that kernel's to the bit (its expressions, copied). Sequence z reads its own conv window, qkv, alpha and beta rows
+// (pointers in the table; qkv rows qkv_pitch floats apart, alpha and beta ab_pitch apart) and writes its conv input
+// [channels, conv_rows + rows] (its conv history) where its table entry says; its q, k, v, g and beta rows go to rows
+// z * rows .. of the shared outputs (the sequences' rows one after another). Launch: grid (2 * k_heads + v_heads, rows,
+// sequences), block d (d % 32 == 0, <= 1024).
+#define TS_GRAPH_PREP_SEQS 16
+struct ts_graph_prep_seqs
+{
+    const float* window[TS_GRAPH_PREP_SEQS];
+    const float* qkv[TS_GRAPH_PREP_SEQS];
+    const float* alpha[TS_GRAPH_PREP_SEQS];
+    const float* beta[TS_GRAPH_PREP_SEQS];
+    float* conv_in[TS_GRAPH_PREP_SEQS];
+};
+
+extern "C" __global__ void ts_graph_deltanet_prep_seqs_f32(const ts_graph_prep_seqs seqs,
+    const float* __restrict__ conv_w, const float* __restrict__ dt, const float* __restrict__ a,
+    float* __restrict__ q_all, float* __restrict__ k_all, float* __restrict__ v_all, float* __restrict__ g_all,
+    float* __restrict__ beta_all, int channels, int conv_rows, int width, int d, int k_heads, int v_heads, int rows, float eps,
+    long long qkv_pitch, long long ab_pitch)
+{
+    __shared__ float partial[32];
+    const int z = blockIdx.z;
+    const float* __restrict__ window = seqs.window[z];
+    const float* __restrict__ qkv = seqs.qkv[z];
+    const float* __restrict__ alpha = seqs.alpha[z];
+    const float* __restrict__ beta = seqs.beta[z];
+    float* __restrict__ conv_in = seqs.conv_in[z];
+    float* __restrict__ q_out = q_all + (size_t)z * rows * k_heads * d;
+    float* __restrict__ k_out = k_all + (size_t)z * rows * k_heads * d;
+    float* __restrict__ v_out = v_all + (size_t)z * rows * v_heads * d;
+    float* __restrict__ g_out = g_all + (size_t)z * rows * v_heads;
+    float* __restrict__ beta_out = beta_all + (size_t)z * rows * v_heads;
+    const int i = threadIdx.x;
+    const int head = blockIdx.x;
+    const int t = blockIdx.y;
+    const int span = conv_rows + rows;
+    const size_t c = (size_t)head * d + i;
+    float x = 0.0f;
+    for (int j = 0; j < width; j++)
+    {
+        const int p = t + j;
+        const float in = p < conv_rows ? window[c * conv_rows + p] : qkv[(size_t)(p - conv_rows) * qkv_pitch + c];
+        x += in * conv_w[c * width + j];
+    }
+    conv_in[c * span + conv_rows + t] = qkv[(size_t)t * qkv_pitch + c];
+    if (t == 0)
+        for (int p = 0; p < conv_rows; p++) conv_in[c * span + p] = window[c * conv_rows + p];
+    const float y = x / (1.0f + expf(-x));
+    if (head < 2 * k_heads)
+    {
+        const float sq = ts_graph_warp_sum(y * y);
+        if ((i & 31) == 0) partial[i >> 5] = sq;
+        __syncthreads();
+        float total = 0.0f;
+        for (int s = 0; s < d / 32; s++) total += partial[s];
+        const float yn = y * rsqrtf(total + eps);
+        if (head < k_heads) q_out[((size_t)t * k_heads + head) * d + i] = yn;
+        else k_out[((size_t)t * k_heads + head - k_heads) * d + i] = yn;
+    }
+    else
+    {
+        const int vh = head - 2 * k_heads;
+        v_out[((size_t)t * v_heads + vh) * d + i] = y;
+        if (i == 0)
+        {
+            const size_t gi = (size_t)t * v_heads + vh, ai = (size_t)t * ab_pitch + vh;
+            const float s = alpha[ai] + dt[vh];
+            g_out[gi] = (s > 20.0f ? s : logf(1.0f + expf(s))) * a[vh];
+            beta_out[gi] = 1.0f / (1.0f + expf(-beta[ai]));
+        }
+    }
+}
+
+// GraphFusion.GatedRmsNorms: ts_graph_gated_rms_norm_f32 over several sequences' rows in one launch, each row that kernel's to
+// the bit (its expressions, copied), without the q8_1 copy. Sequence z's rows_per_seq rows of y and its z (a token's heads * d
+// values z_pitch floats apart) at its table's pointers; its outputs at rows z * rows_per_seq .. of out (the sequences'
+// outputs one after another: their concatenation). Launch: grid (rows_per_seq, sequences), block d (d % 32 == 0, <= 1024).
+struct ts_graph_gated_norm_seqs
+{
+    const float* y[TS_GRAPH_PREP_SEQS];
+    const float* z[TS_GRAPH_PREP_SEQS];
+};
+
+extern "C" __global__ void ts_graph_gated_rms_norm_seqs_f32(const ts_graph_gated_norm_seqs seqs, const float* __restrict__ w,
+    float* __restrict__ out_all, int d, float eps, int heads, long long z_pitch, int sigmoid_gate, int rows_per_seq)
+{
+    __shared__ float partial[32];
+    const float* __restrict__ y = seqs.y[blockIdx.y];
+    const float* __restrict__ z = seqs.z[blockIdx.y];
+    float* __restrict__ out = out_all + (size_t)blockIdx.y * rows_per_seq * d;
+    const int i = threadIdx.x;
+    const size_t r = blockIdx.x;
+    const float v = y[r * d + i];
+    const float sq = ts_graph_warp_sum(v * v);
+    if ((i & 31) == 0) partial[i >> 5] = sq;
+    __syncthreads();
+    float total = 0.0f;
+    for (int s = 0; s < d / 32; s++) total += partial[s];
+    const float zz = z[(r / heads) * z_pitch + (r % heads) * d + i];
+    const float gate = sigmoid_gate ? 1.0f / (1.0f + expf(-zz)) : zz / (1.0f + expf(-zz));
+    const float o = v * rsqrtf(total / d + eps) * w[i] * gate;
+    out[r * d + i] = o;
+}
+
+// Several sequences' verify-window K and V rows into their F16 caches in one launch (GraphFusion.SequenceAttentions' writes):
+// entry z (a sequence's K or V) takes rows [heads, count, d] read where they lie (row t of head h at src + h * head_stride +
+// t * row_stride, values unit-stride: the projection's view, which ts_copy_head_first_to_cache_f16 needed packed first) into
+// cache [heads, cells, d] at row (dyn ? dyn[1] : first) + t, taken modulo cells with circular; each value converted as that
+// kernel converts it (__float2half_rn), so every cache row is its bits. Launch: grid (ceil(heads * count * d / 256),
+// entries), block 256.
+#define TS_GRAPH_CACHE_ROWS_SEQS 32
+struct ts_graph_cache_rows_seqs
+{
+    const float* src[TS_GRAPH_CACHE_ROWS_SEQS];
+    __half* cache[TS_GRAPH_CACHE_ROWS_SEQS];
+    const int* dyn[TS_GRAPH_CACHE_ROWS_SEQS];
+    long long head_stride[TS_GRAPH_CACHE_ROWS_SEQS];
+    long long row_stride[TS_GRAPH_CACHE_ROWS_SEQS];
+    int first[TS_GRAPH_CACHE_ROWS_SEQS];
+    int cells[TS_GRAPH_CACHE_ROWS_SEQS];
+};
+
+extern "C" __global__ void ts_graph_cache_rows_seqs_f16(const ts_graph_cache_rows_seqs seqs, int heads, int count, int head_dim, int circular)
+{
+    const int z = blockIdx.y;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= heads * count * head_dim)
+        return;
+    const int* dyn = seqs.dyn[z];
+    const int start = dyn ? dyn[1] : seqs.first[z];
+    const int d = idx % head_dim;
+    const int tmp = idx / head_dim;
+    const int t = tmp % count;
+    const int head = tmp / count;
+    const int cells = seqs.cells[z];
+    const int pos = circular ? ((start + t) % cells) : (start + t);
+    const float v = seqs.src[z][(size_t)head * seqs.head_stride[z] + (size_t)t * seqs.row_stride[z] + d];
+    seqs.cache[z][((size_t)head * cells + pos) * head_dim + d] = __float2half_rn(v);
+}

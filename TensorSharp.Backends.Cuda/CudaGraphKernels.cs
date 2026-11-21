@@ -29,6 +29,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] _gemmQ6k = new IntPtr[4];
         private readonly IntPtr _setRowsHeads;
         private readonly IntPtr _gdnScanSeqs, _gdnScanSeqsKda;
+        private readonly IntPtr _deltaNetPrepSeqs, _gatedRmsNormSeqs, _cacheRowsSeqs;
         private readonly IntPtr _ringAttnLanes64, _ringAttnLanes128;
         private readonly int _multiprocessors;
 
@@ -48,6 +49,17 @@ namespace TensorSharp.Cuda
             {
                 _gdnScanSeqs = _gdnScanSeqsKda = IntPtr.Zero;
             }
+            try
+            {
+                _deltaNetPrepSeqs = module.GetFunction("ts_graph_deltanet_prep_seqs_f32");
+                _gatedRmsNormSeqs = module.GetFunction("ts_graph_gated_rms_norm_seqs_f32");
+                _cacheRowsSeqs = module.GetFunction("ts_graph_cache_rows_seqs_f16");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                _deltaNetPrepSeqs = _gatedRmsNormSeqs = _cacheRowsSeqs = IntPtr.Zero;
+            }
+
             _gdnCommit = module.GetFunction("ts_graph_gdn_commit_f32");
             _softplus = module.GetFunction("ts_graph_softplus_f32");
             _sqrt = module.GetFunction("ts_graph_sqrt_f32");
@@ -434,6 +446,7 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuLaunchKernel(_gatedDeltaNet, (uint)(sequences * heads), (uint)((s + 3) / 4), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
+
 
         /// <summary><see cref="LaunchGatedDeltaNet"/> with four state rows a warp (a prompt chunk reads each token's q and k
         /// once for four rows); the same results. With <paramref name="saved"/> ([heads, s, s], one sequence) the state before
@@ -1018,6 +1031,104 @@ namespace TensorSharp.Cuda
             int gate = sigmoidGate ? 1 : 0;
             void** args = stackalloc void*[] { &y, &z, &w, &output, &d, &eps, &heads, &zPitch, &gate, &outputQ81 };
             CudaDriverApi.cuLaunchKernel(_gatedRmsNorm, (uint)rows, 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Sequences <see cref="LaunchDeltaNetPrepSequences"/> and <see cref="LaunchGatedRmsNormSequences"/> take in one
+        /// launch (TS_GRAPH_PREP_SEQS).</summary>
+        public const int PrepSequences = 16;
+
+        /// <summary>Whether this image runs <see cref="LaunchDeltaNetPrepSequences"/> and <see cref="LaunchGatedRmsNormSequences"/>.</summary>
+        public bool TakesPrepSequences => _deltaNetPrepSeqs != IntPtr.Zero && _gatedRmsNormSeqs != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_deltanet_prep_seqs_f32, byte for byte (struct ts_graph_prep_seqs): each sequence's
+        /// conv window, qkv, alpha and beta rows, and where its conv input goes.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct PrepSequencesArgs
+        {
+            public fixed long Window[PrepSequences];
+            public fixed long Qkv[PrepSequences];
+            public fixed long Alpha[PrepSequences];
+            public fixed long Beta[PrepSequences];
+            public fixed long ConvIn[PrepSequences];
+        }
+
+        /// <summary><see cref="LaunchDeltaNetPrep(IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr,
+        /// IntPtr, IntPtr, IntPtr, int, int, int, int, int, int, int, float, long, long, IntPtr)"/>'s per-row kernel over
+        /// <paramref name="sequences"/> sequences of <paramref name="rows"/> rows each in one launch (their pointers in
+        /// <paramref name="args"/>; their q, k, v, g and beta rows one sequence after another in the shared outputs): each
+        /// sequence's values are its own launch's.</summary>
+        public void LaunchDeltaNetPrepSequences(PrepSequencesArgs args, int sequences, IntPtr convW, IntPtr dt, IntPtr a,
+            IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr betaOut, int channels, int convRows, int width, int d, int kHeads, int vHeads,
+            int rows, float eps, long qkvPitch, long alphaBetaPitch, IntPtr stream)
+        {
+            if (sequences < 1 || sequences > PrepSequences || d % 32 != 0 || d > 1024)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of head width {d}");
+            PrepSequencesArgs* p = &args;
+            void** argv = stackalloc void*[]
+            {
+                p, &convW, &dt, &a, &q, &k, &v, &g, &betaOut, &channels, &convRows, &width, &d, &kHeads, &vHeads, &rows, &eps,
+                &qkvPitch, &alphaBetaPitch,
+            };
+            CudaDriverApi.cuLaunchKernel(_deltaNetPrepSeqs, (uint)(2 * kHeads + vHeads), (uint)rows, (uint)sequences, (uint)d, 1, 1, 0,
+                stream, (IntPtr)argv, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Entries <see cref="LaunchCacheRowsSequences"/> takes in one launch (TS_GRAPH_CACHE_ROWS_SEQS).</summary>
+        public const int CacheRowsSequences = 32;
+
+        /// <summary>Whether this image runs <see cref="LaunchCacheRowsSequences"/>.</summary>
+        public bool TakesCacheRowsSequences => _cacheRowsSeqs != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_cache_rows_seqs_f16, byte for byte (struct ts_graph_cache_rows_seqs): each entry's
+        /// rows, cache, dynamic block (or 0), head and row strides (floats), first row and cells.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct CacheRowsSequencesArgs
+        {
+            public fixed long Src[CacheRowsSequences];
+            public fixed long Cache[CacheRowsSequences];
+            public fixed long Dyn[CacheRowsSequences];
+            public fixed long HeadStride[CacheRowsSequences];
+            public fixed long RowStride[CacheRowsSequences];
+            public fixed int First[CacheRowsSequences];
+            public fixed int Cells[CacheRowsSequences];
+        }
+
+        /// <summary>ts_copy_head_first_to_cache_f16 for <paramref name="entries"/> entries in one launch (several sequences' K and V
+        /// rows into their F16 caches, each read where it lies): every cache row is that kernel's bits.</summary>
+        public void LaunchCacheRowsSequences(CacheRowsSequencesArgs args, int entries, int heads, int count, int headDim, bool circular,
+            IntPtr stream)
+        {
+            if (entries < 1 || entries > CacheRowsSequences)
+                throw new ArgumentOutOfRangeException(nameof(entries), $"{entries} cache writes");
+            int wrap = circular ? 1 : 0;
+            CacheRowsSequencesArgs* p = &args;
+            void** argv = stackalloc void*[] { p, &heads, &count, &headDim, &wrap };
+            long total = (long)heads * count * headDim;
+            CudaDriverApi.cuLaunchKernel(_cacheRowsSeqs, (uint)((total + 255) / 256), (uint)entries, 1, 256, 1, 1, 0, stream, (IntPtr)argv,
+                IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The argument of ts_graph_gated_rms_norm_seqs_f32 (struct ts_graph_gated_norm_seqs): each sequence's y and z.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct GatedNormSequencesArgs
+        {
+            public fixed long Y[PrepSequences];
+            public fixed long Z[PrepSequences];
+        }
+
+        /// <summary><see cref="LaunchGatedRmsNorm"/> (without the q8_1 copy) over <paramref name="sequences"/> sequences of
+        /// <paramref name="rowsPerSequence"/> rows each in one launch, their outputs one after another in
+        /// <paramref name="output"/>: each row's values are its own launch's.</summary>
+        public void LaunchGatedRmsNormSequences(GatedNormSequencesArgs args, int sequences, IntPtr w, IntPtr output, int rowsPerSequence,
+            int d, float eps, int heads, long zPitch, bool sigmoidGate, IntPtr stream)
+        {
+            if (sequences < 1 || sequences > PrepSequences || d % 32 != 0 || d > 1024)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of width {d}");
+            int gate = sigmoidGate ? 1 : 0;
+            GatedNormSequencesArgs* p = &args;
+            void** argv = stackalloc void*[] { p, &w, &output, &d, &eps, &heads, &zPitch, &gate, &rowsPerSequence };
+            CudaDriverApi.cuLaunchKernel(_gatedRmsNormSeqs, (uint)rowsPerSequence, (uint)sequences, 1, (uint)d, 1, 1, 0, stream,
+                (IntPtr)argv, IntPtr.Zero).ThrowOnError();
         }
     }
 }

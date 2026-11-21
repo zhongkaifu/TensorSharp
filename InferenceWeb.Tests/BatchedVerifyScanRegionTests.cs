@@ -15,8 +15,9 @@ namespace InferenceWeb.Tests;
 
 /// <summary>
 /// A batched verify's sequences' gated delta-net scans in one launch a layer (GraphFusion.DeltaNetScans, the direct CUDA
-/// executor's multi-sequence scan) and their attention windows in one launch a layer (GraphFusion.SequenceAttentions, the
-/// multi-sequence window kernels): the same math as each sequence's own launches, so every row's logits, and every row after
+/// executor's multi-sequence scan), their delta-rule preps with their conv histories' copies and their gated norms with the
+/// rows' concatenation (GraphFusion.DeltaNetPreps, GraphFusion.GatedRmsNorms) and their F16 cache writes and attention windows
+/// in one launch a layer each (GraphFusion.SequenceAttentions, the multi-sequence write and window kernels): the same math as each sequence's own launches, so every row's logits, and every row after
 /// the commits (which re-step each sequence's kept rows on its state), are the bits of the step that launches them a sequence
 /// at a time, and those of each sequence run alone.
 /// </summary>
@@ -122,24 +123,33 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
         string path = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "q35.gguf"));
         int[] all = Enumerable.Range(0, Prompts.Length).ToArray();
         List<float[]>[] together, apart;
-        long regions, windows;
+        long regions, windows, preps, norms, writes;
         using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
         {
             together = Run(model, all);
             var executor = (CudaGraphExecutor)model.GraphExecutorForTests;
-            (regions, windows) = (executor.DeltaNetScanRegions, executor.SequenceWindowLaunches);
+            (regions, windows, preps, norms, writes) = (executor.DeltaNetScanRegions, executor.SequenceWindowLaunches, executor.PrepSequenceLaunches,
+                executor.GatedNormSequenceLaunches, executor.SequenceWriteLaunches);
         }
         using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
         {
             ((Qwen35RuntimeModel)model).DeltaNetScanRegionsDisabledForTests = true;
+            ((Qwen35RuntimeModel)model).SequencePrepRegionsDisabledForTests = true;
             model.SequenceAttentionRegionsDisabledForTests = true;
             apart = Run(model, all);
             var executor = (CudaGraphExecutor)model.GraphExecutorForTests;
             Assert.Equal(0, executor.DeltaNetScanRegions);
             Assert.Equal(0, executor.SequenceWindowLaunches);
+            Assert.Equal(0, executor.PrepSequenceLaunches);
+            Assert.Equal(0, executor.GatedNormSequenceLaunches);
+            Assert.Equal(0, executor.SequenceWriteLaunches);
         }
         Assert.True(regions > 0, "no verify step scanned its sequences in one launch");
         Assert.True(windows > 0, "no verify step attended its sequences' windows in one launch");
+        Assert.True(preps > 0, "no verify step prepared its sequences' delta-rule inputs in one launch");
+        Assert.True(norms > 0, "no verify step normed its sequences' outputs in one launch");
+        // An F16 cache's rows are written for every sequence in one launch; a q8_0 cache's each as before.
+        if (kv == KvCacheDtype.F16) Assert.True(writes > 0, "no verify step wrote its sequences' cache rows in one launch");
         var alone = new List<float[]>[Prompts.Length];
         for (int r = 0; r < Prompts.Length; r++)
             using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
@@ -147,10 +157,10 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
         for (int r = 0; r < Prompts.Length; r++)
         {
             int vsOps = Apart(together[r], apart[r]), vsAlone = Apart(together[r], alone[r]);
-            _output.WriteLine($"request {r}: {together[r].Count} rows; {vsOps} apart from the scans and windows launched a sequence each, {vsAlone} from it alone");
+            _output.WriteLine($"request {r}: {together[r].Count} rows; {vsOps} apart from the preps, scans, norms and windows launched a sequence each, {vsAlone} from it alone");
             Assert.Equal(0, vsOps);
             Assert.Equal(0, vsAlone);
         }
-        _output.WriteLine($"{regions} scan regions, {windows} window regions");
+        _output.WriteLine($"{regions} scan regions, {preps} prep regions, {norms} norm regions, {writes} write launches, {windows} window regions");
     }
 }

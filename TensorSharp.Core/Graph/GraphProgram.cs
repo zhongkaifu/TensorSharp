@@ -347,6 +347,19 @@ namespace TensorSharp.Graph
         /// the region's ops at its end and launch the sequences' attention kernels together (each sequence's values its ops');
         /// any other computes the ops in place.</summary>
         SequenceAttentions = 27,
+        /// <summary>Several sequences' delta-rule inputs of one gated delta-net layer (a batched verify's windows, each sequence
+        /// with its own conv window and history): each sequence's <see cref="DeltaNetPrep"/> region and the copy of its conv
+        /// input into its conv history. Inputs: per sequence its conv window, qkv, alpha and beta (its prep region's) and its conv
+        /// history's view [convRows + rows, channels], in sequence order; then the conv kernel, dt and a. Ip: dk, k heads, dv,
+        /// v heads, the sequences. Fp: eps. Results: per sequence its prep's q, k, v, g and beta, in sequence order. An executor
+        /// may run every sequence's prep in one dispatch, writing each conv input into its history; each value is its op's.</summary>
+        DeltaNetPreps = 28,
+        /// <summary>Several sequences' gated norms of one gated delta-net layer (a batched verify's windows) and the concatenation
+        /// of their results along the rows: each sequence's <see cref="GatedRmsNorm"/> region, then the concatenation. Inputs:
+        /// per sequence its norm's y and z, in sequence order; then the norm weight. Ip: the sigmoid flag, the sequences. Fp:
+        /// eps. Result: the concatenation [heads * d, every sequence's rows]. An executor may run every sequence's norm in one
+        /// dispatch into the concatenation; each value is its op's.</summary>
+        GatedRmsNorms = 29,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

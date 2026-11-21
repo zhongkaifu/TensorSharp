@@ -247,7 +247,112 @@ namespace TensorSharp.Cuda
         /// every replay: it is taken modulo the cache's cells, which a ring needs (a sliding-window layer's 768 cells, its
         /// decode rows recorded past the first lap) and a linear cache never reaches.</summary>
         protected override bool TryWriteRows(Tensor dst, Tensor src, int first, int count)
-            => WriteRows(dst, src, first, count, circular: CudaDecodeDynParams.IsActive((CudaAllocator)Allocator));
+        {
+            bool circular = CudaDecodeDynParams.IsActive((CudaAllocator)Allocator);
+            // Inside several sequences' attention region its sequences' writes are held and made in one launch before its
+            // first attention reads a cache (FlushHeldWrites).
+            if (_togetherWrites != null && TryHoldWrite(dst, src, first, count, circular)) return true;
+            FlushHeldWrites();
+            return WriteRows(dst, src, first, count, circular);
+        }
+
+        private sealed record HeldWrite(Tensor Src, Tensor Cache, int First, int Count, int Heads, int D, bool Circular, IntPtr Dyn);
+
+        private List<HeldWrite> _togetherWrites;
+
+        /// <summary>Cache writes of several sequences' attention regions made in one launch (tests check it engaged).</summary>
+        internal long SequenceWriteLaunches { get; private set; }
+
+        /// <summary>Tests: a region of several sequences' attentions writes each sequence's K and V rows on its own.</summary>
+        internal bool SequenceWritesDisabledForTests { get; set; }
+
+        /// <summary>F32 rows [heads, count, d] (unit-stride values, any head and row strides) into an F16 head-first cache, held for
+        /// <see cref="FlushHeldWrites"/>; false (the write runs now) for anything else.</summary>
+        private bool TryHoldWrite(Tensor dst, Tensor src, int first, int count, bool circular)
+        {
+            var cuda = (CudaAllocator)Allocator;
+            if (SequenceWritesDisabledForTests || Kernels is not { TakesCacheRowsSequences: true } || dst.ElementType != DType.Float16
+                || dst.DimensionCount is < 2 or > 3 || !dst.IsContiguous() || dst.Storage is not CudaStorage cacheStorage
+                || src.Storage is not CudaStorage srcStorage || src.ElementType != DType.Float32 || src.DimensionCount < 3 || src.Strides[^1] != 1
+                || count < 1)
+                return false;
+            for (int i = 0; i < src.DimensionCount - 3; i++)
+                if (src.Sizes[i] != 1) return false;
+            Tensor cache = HeadFirst(dst);
+            int heads = (int)src.Sizes[^3], d = (int)src.Sizes[^1], cells = (int)cache.Sizes[1];
+            if (src.Sizes[^2] != count || cache.Sizes[0] != heads || cache.Sizes[2] != d || (!circular && first + count > cells) || first < 0)
+            {
+                cache.Dispose();
+                return false;
+            }
+            // Rows a host path wrote and has not uploaded go first (never inside a recording: the plain write refuses it there).
+            if (cacheStorage.IsHostDirty)
+            {
+                if (CudaGraphCapture.IsCapturing(cuda))
+                {
+                    cache.Dispose();
+                    return false;
+                }
+                cacheStorage.EnsureDeviceCurrent();
+            }
+            srcStorage.EnsureDeviceCurrent();
+            IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(cuda, cacheStorage);
+            _togetherWrites.Add(new HeldWrite(src.CopyRef(), cache, first, count, heads, d, circular, dyn));
+            return true;
+        }
+
+        /// <summary>The held cache writes, every entry of a shape in one launch (ts_graph_cache_rows_seqs_f16); each cache row is the
+        /// bits its own write makes. Four Qwen3.8-27B sequences' 8-row windows had taken four launches each an attention layer (the
+        /// K and V rows packed, then each written), 0.32 of a verify step's 28 ms on an RTX PRO 4500.</summary>
+        private void FlushHeldWrites()
+        {
+            List<HeldWrite> held = _togetherWrites;
+            if (held == null || held.Count == 0) return;
+            _togetherWrites = new List<HeldWrite>();
+            var cuda = (CudaAllocator)Allocator;
+            try
+            {
+                cuda.Context.MakeCurrent();
+                var groups = new List<List<HeldWrite>>();
+                foreach (HeldWrite w in held)
+                {
+                    List<HeldWrite> group = groups.Find(g => g[0].Heads == w.Heads && g[0].Count == w.Count && g[0].D == w.D
+                        && g[0].Circular == w.Circular && g.Count < CudaGraphKernels.CacheRowsSequences);
+                    if (group == null) groups.Add(group = new List<HeldWrite>());
+                    group.Add(w);
+                }
+                foreach (List<HeldWrite> group in groups)
+                {
+                    var args = new CudaGraphKernels.CacheRowsSequencesArgs();
+                    unsafe
+                    {
+                        for (int z = 0; z < group.Count; z++)
+                        {
+                            HeldWrite w = group[z];
+                            args.Src[z] = (long)((CudaStorage)w.Src.Storage).DevicePtrAtElement(w.Src.StorageOffset);
+                            args.Cache[z] = (long)((CudaStorage)w.Cache.Storage).DevicePtrAtElement(w.Cache.StorageOffset);
+                            args.Dyn[z] = (long)w.Dyn;
+                            args.HeadStride[z] = w.Src.Strides[^3];
+                            args.RowStride[z] = w.Src.Strides[^2];
+                            args.First[z] = w.First;
+                            args.Cells[z] = (int)w.Cache.Sizes[1];
+                        }
+                    }
+                    HeldWrite first = group[0];
+                    Kernels.LaunchCacheRowsSequences(args, group.Count, first.Heads, first.Count, first.D, first.Circular, cuda.Stream.Handle);
+                }
+                foreach (HeldWrite w in held) ((CudaStorage)w.Cache.Storage).MarkDeviceModified();
+                SequenceWriteLaunches++;
+            }
+            finally
+            {
+                foreach (HeldWrite w in held)
+                {
+                    w.Src.Dispose();
+                    w.Cache.Dispose();
+                }
+            }
+        }
 
         /// <summary>A ring's rows past its last cell (a sliding-window layer's ring cache: an F16 one had no copy that converts
         /// a strided run) in the same kernel, its cells taken modulo the ring.</summary>
@@ -297,6 +402,8 @@ namespace TensorSharp.Cuda
         protected override Tensor FlashAttention(Tensor q, Tensor k, Tensor v, AttentionMask mask, float scale,
             CacheWindow kWindow, CacheWindow vWindow, bool promptChunk)
         {
+            // Writes held for several sequences' attention region are made before any attention reads a cache.
+            FlushHeldWrites();
             // Rows over K and V that are tensors, not cache windows (a block drafter's ring), with a mask tensor: its values, whatever
             // pattern an eager run reads in them (a recorded run cannot read them; the eager run had then taken the generic path,
             // 54 ms a layer of Qwen3.8-27B's drafter on an A40, the first two blocks of every request). A draft step's run on the
@@ -810,7 +917,11 @@ namespace TensorSharp.Cuda
         /// <summary>Regions whose sequences' verify windows ran in one launch (tests check it engaged).</summary>
         internal long SequenceWindowLaunches { get; private set; }
 
-        protected override void BeginTogether() => _together = new List<HeldWindow>();
+        protected override void BeginTogether()
+        {
+            _together = new List<HeldWindow>();
+            _togetherWrites = new List<HeldWrite>();
+        }
 
         /// <summary>
         /// The held verify windows, every sequence's in one window launch and one combine where they share a shape (heads, KV
@@ -820,6 +931,15 @@ namespace TensorSharp.Cuda
         /// </summary>
         protected override void EndTogether()
         {
+            // The sequences' cache writes first: the held windows read them.
+            try
+            {
+                FlushHeldWrites();
+            }
+            finally
+            {
+                _togetherWrites = null;
+            }
             List<HeldWindow> held = _together;
             _together = null;
             if (held == null || held.Count == 0) return;
@@ -1869,6 +1989,7 @@ namespace TensorSharp.Cuda
             GraphFusion.QsaAttention => Kernels is { TakesQsaAttention: true },
             GraphFusion.QsaKeys or GraphFusion.DeltaNetCommit or GraphFusion.AttentionPrep or GraphFusion.DFlashConv => Kernels != null,
             GraphFusion.DeltaNetScans => Kernels is { TakesGdnScanSequences: true },
+            GraphFusion.DeltaNetPreps or GraphFusion.GatedRmsNorms => Kernels is { TakesPrepSequences: true } && !PrepSequencesDisabledForTests,
             GraphFusion.RingAttentionLanes => Kernels is { TakesRingAttentionLanes: true } && !RingAttentionDisabledForTests,
             _ => false,
         };
@@ -1890,6 +2011,8 @@ namespace TensorSharp.Cuda
             if (kind == GraphFusion.AttentionPrep) return TryAttentionPrep(inputs, ip, fp, results);
             if (kind == GraphFusion.DFlashConv) return TryDFlashConv(inputs, ip, results);
             if (kind == GraphFusion.DeltaNetScans) return TryDeltaNetScans(inputs, ip, results);
+            if (kind == GraphFusion.DeltaNetPreps) return TryDeltaNetPreps(inputs, ip, fp, results);
+            if (kind == GraphFusion.GatedRmsNorms) return TryGatedRmsNorms(inputs, ip, fp, results);
             if (kind == GraphFusion.RingAttentionLanes) return TryRingAttentionLanes(inputs, ip, fp, results);
             CudaGraphKernels kernels = Kernels;
             if (kernels == null || Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage || t.ElementType != DType.Float32))
@@ -2175,7 +2298,7 @@ namespace TensorSharp.Cuda
         /// inputs.</summary>
         protected override bool RegionReadsStridedInputs(GraphFusion kind)
             => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SigmoidGate or GraphFusion.AttentionPrep
-                or GraphFusion.RingAttentionLanes;
+                or GraphFusion.RingAttentionLanes or GraphFusion.DeltaNetPreps or GraphFusion.GatedRmsNorms;
 
         /// <summary>
         /// DFlash2's grouped dynamic convolution (<see cref="GraphFusion.DFlashConv"/>) in one launch (ts_graph_dflash_conv_f32)
@@ -2355,6 +2478,142 @@ namespace TensorSharp.Cuda
             int inputRows)
             => DeviceGatedDeltaNet(q, k, v, g, beta, state, 0, true, inputs, inputRows)
                ?? base.GatedDeltaNetWindow(q, k, v, g, beta, state, inputs, inputRows);
+
+        /// <summary>Tests: a batched verify's sequences' preps and gated norms run each sequence's own region.</summary>
+        internal bool PrepSequencesDisabledForTests { get; set; }
+
+        /// <summary>Layers whose sequences' delta-rule preps ran in one launch, and whose gated norms did (tests check them).</summary>
+        internal long PrepSequenceLaunches { get; private set; }
+
+        internal long GatedNormSequenceLaunches { get; private set; }
+
+        /// <summary>
+        /// Several sequences' delta-rule preps of one layer (<see cref="GraphFusion.DeltaNetPreps"/>) in one launch, each
+        /// sequence's conv input written into its conv history (the region's copies): each value is that of the sequence's
+        /// own prep (the per-row kernel's, ts_graph_deltanet_prep_f32). Four Qwen3.8-27B sequences' 8-row windows had taken a
+        /// prep and a history copy each a layer, 0.9 of a verify step's 28 ms on an RTX PRO 4500. False (the ops run) unless
+        /// every sequence's window has the same shape and pitches, on F32 operands of this device where the prep reads them.
+        /// </summary>
+        private bool TryDeltaNetPreps(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            int n = ip != null && ip.Length >= 5 ? (int)ip[4] : 0;
+            if (kernels is not { TakesPrepSequences: true } || n < 1 || n > CudaGraphKernels.PrepSequences || inputs.Length != 5 * n + 3
+                || results.Length != 5 * n)
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            if (Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage st || st.DeviceId != cuda.DeviceId || t.ElementType != DType.Float32))
+                return false;
+            int dk = (int)ip[0], kHeads = (int)ip[1], dv = (int)ip[2], vHeads = (int)ip[3];
+            float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
+            Tensor convW = inputs[5 * n], dtT = inputs[5 * n + 1], aT = inputs[5 * n + 2];
+            int channels = (int)inputs[0].Sizes[0], convRows = (int)inputs[0].Sizes[^1], width = (int)convW.Sizes[^1];
+            int rows = (int)(inputs[1].ElementCount() / Math.Max(1, channels));
+            long qkvPitch = 0, abPitch = 0;
+            if (dk != dv || dk % 32 != 0 || dk > 1024 || channels != (2 * kHeads + vHeads) * dk || rows < 1
+                || CudaGraphKernels.TakesTiledDeltaNetPrep(convRows, width, dk, rows)
+                || convW.ElementCount() != (long)channels * width || !convW.IsContiguous() || !dtT.IsContiguous() || !aT.IsContiguous())
+                return false;
+            for (int j = 0; j < n; j++)
+            {
+                Tensor window = inputs[5 * j], qkv = inputs[5 * j + 1], alpha = inputs[5 * j + 2], beta = inputs[5 * j + 3], hist = inputs[5 * j + 4];
+                if (!window.IsContiguous() || window.ElementCount() != (long)channels * convRows || window.Sizes[^1] != convRows
+                    || qkv.ElementCount() != (long)channels * rows || alpha.ElementCount() != (long)rows * vHeads
+                    || beta.ElementCount() != (long)rows * vHeads || !hist.IsContiguous() || hist.ElementCount() != (long)channels * (convRows + rows)
+                    || !TryRows(qkv, channels, out long jq) || !TryRows(alpha, vHeads, out long ja) || !TryRows(beta, vHeads, out long jb)
+                    || ja != jb || (j > 0 && (jq != qkvPitch || ja != abPitch)))
+                    return false;
+                (qkvPitch, abPitch) = (jq, ja);
+            }
+            IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
+            foreach (Tensor t in inputs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            long total = (long)n * rows;
+            using var qAll = new Tensor(Allocator, DType.Float32, total, kHeads, dk);
+            using var kAll = new Tensor(Allocator, DType.Float32, total, kHeads, dk);
+            using var vAll = new Tensor(Allocator, DType.Float32, total, vHeads, dv);
+            using var gAll = new Tensor(Allocator, DType.Float32, total, vHeads, 1);
+            using var betaAll = new Tensor(Allocator, DType.Float32, total, vHeads, 1);
+            Tensor[] outs = { qAll, kAll, vAll, gAll, betaAll };
+            foreach (Tensor t in outs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            var args = new CudaGraphKernels.PrepSequencesArgs();
+            unsafe
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    args.Window[j] = (long)P(inputs[5 * j]);
+                    args.Qkv[j] = (long)P(inputs[5 * j + 1]);
+                    args.Alpha[j] = (long)P(inputs[5 * j + 2]);
+                    args.Beta[j] = (long)P(inputs[5 * j + 3]);
+                    args.ConvIn[j] = (long)P(inputs[5 * j + 4]);
+                }
+            }
+            cuda.Context.MakeCurrent();
+            kernels.LaunchDeltaNetPrepSequences(args, n, P(convW), P(dtT), P(aT), P(qAll), P(kAll), P(vAll), P(gAll), P(betaAll), channels,
+                convRows, width, dk, kHeads, vHeads, rows, eps, qkvPitch, abPitch, cuda.Stream.Handle);
+            foreach (Tensor t in outs) ((CudaStorage)t.Storage).MarkDeviceModified();
+            for (int j = 0; j < n; j++)
+            {
+                ((CudaStorage)inputs[5 * j + 4].Storage).MarkDeviceModified();
+                for (int o = 0; o < 5; o++) results[5 * j + o] = outs[o].Narrow(0, (long)j * rows, rows);
+            }
+            PrepSequenceLaunches++;
+            return true;
+        }
+
+        /// <summary>
+        /// Several sequences' gated norms of one layer and their rows' concatenation (<see cref="GraphFusion.GatedRmsNorms"/>) in
+        /// one launch into the concatenation: each row's values are those of its sequence's own norm (ts_graph_gated_rms_norm_f32).
+        /// False (the ops run) unless every sequence's rows have the same shape and z pitch.
+        /// </summary>
+        private bool TryGatedRmsNorms(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            int n = ip != null && ip.Length >= 2 ? (int)ip[1] : 0;
+            if (kernels is not { TakesPrepSequences: true } || n < 1 || n > CudaGraphKernels.PrepSequences || inputs.Length != 2 * n + 1
+                || results.Length != 1)
+                return false;
+            var cuda = (CudaAllocator)Allocator;
+            if (Array.Exists(inputs, t => t == null || t.Storage is not CudaStorage st || st.DeviceId != cuda.DeviceId || t.ElementType != DType.Float32))
+                return false;
+            bool sigmoidGate = ip[0] != 0;
+            float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
+            Tensor w = inputs[2 * n];
+            int d = (int)w.ElementCount();
+            Tensor y0 = inputs[0];
+            int heads = y0.DimensionCount >= 2 ? (int)y0.Sizes[^2] : 1;
+            if (d % 32 != 0 || d > 1024 || !w.IsContiguous() || y0.ElementCount() % d != 0)
+                return false;
+            int rows = (int)(y0.ElementCount() / d);
+            long zPitch = 0;
+            for (int j = 0; j < n; j++)
+            {
+                Tensor y = inputs[2 * j], z = inputs[2 * j + 1];
+                if (!y.IsContiguous() || y.ElementCount() != (long)rows * d || y.Sizes[^1] != d || (y.DimensionCount >= 2 ? (int)y.Sizes[^2] : 1) != heads
+                    || z.ElementCount() != y.ElementCount() || !TryRows(z, (long)heads * d, out long jz) || (j > 0 && jz != zPitch))
+                    return false;
+                zPitch = jz;
+            }
+            if (rows % heads != 0) return false;
+            IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
+            foreach (Tensor t in inputs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+            long tokens = rows / heads;
+            results[0] = new Tensor(Allocator, DType.Float32, n * tokens, (long)heads * d);
+            ((CudaStorage)results[0].Storage).EnsureDeviceCurrent();
+            var args = new CudaGraphKernels.GatedNormSequencesArgs();
+            unsafe
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    args.Y[j] = (long)P(inputs[2 * j]);
+                    args.Z[j] = (long)P(inputs[2 * j + 1]);
+                }
+            }
+            cuda.Context.MakeCurrent();
+            kernels.LaunchGatedRmsNormSequences(args, n, P(w), P(results[0]), rows, d, eps, heads, zPitch, sigmoidGate, cuda.Stream.Handle);
+            ((CudaStorage)results[0].Storage).MarkDeviceModified();
+            GatedNormSequenceLaunches++;
+            return true;
+        }
 
         /// <summary>
         /// Several sequences' verify-window scans of one layer (<see cref="GraphFusion.DeltaNetScans"/>) in one launch: each
