@@ -265,7 +265,8 @@ namespace TensorSharp.Graph
         /// rounded on its own, each tap's two products added, and the taps added in order (tap 0's term, then the result plus
         /// each later tap's: zero on the rows before that tap reaches). Inputs: x [hidden, rows], taps [stride, rows] (the
         /// conv projection of the sublayer's input) and the base kernel [hidden, width, 2]. Ip: width, group, groups, side,
-        /// stride. Result: [hidden, rows].</summary>
+        /// stride, then (optional) a block's rows: the rows are blocks of that many one after another (several requests'
+        /// blocks), each convolved on its own (r counts from its block's first row). Result: [hidden, rows].</summary>
         DFlashConv = 17,
         /// <summary>A diffusion transformer's adaLN modulation of a packed sequence: each row RMS-normed and times the norm
         /// weight, then n + n * scale + shift, where scale and shift are columns of the modulation matrix picked by the row's

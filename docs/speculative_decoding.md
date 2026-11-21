@@ -1543,7 +1543,13 @@ head ships for it) speculates on the same holder path since the session fix abov
 On the shared decoder runtime (the Qwen 3.5 family, Qwen 3.8 Flash Next and the other families it
 serves) concurrent requests do speculate: the unified step drafts each speculating request over its own
 drafter state and verifies every window in one forward (see
-[the unified step](design/unified-execution.md#the-unified-step)). The rest of this section describes
+[the unified step](design/unified-execution.md#the-unified-step)). The drafters run once a step for every
+request too: per-token MTP heads chain together, and a DFlash or DFlash2 drafter drafts every request's
+block in one graph program (each request on its own ring and mask, the weights and the head read once
+for all of them), and writes every request's catch-up in one program when the step ends. Each request's
+`draft` and `catchUp` are then its share. On ggml_metal, DFlash2 keeps its fused selector tail request by
+request, which measured faster there (the drafter's products are compute-bound on an M5 Pro past 8 rows).
+The rest of this section describes
 the per-sequence and holder paths of the other families; its Qwen arena and holder notes predate the
 runtime.
 

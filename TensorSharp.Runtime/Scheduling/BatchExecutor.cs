@@ -3804,12 +3804,16 @@ namespace TensorSharp.Runtime.Scheduling
                 var carries = new List<float[]>(n);
                 var caps = new List<int>(n);
                 for (int i = 0; i < n; i++)
+                {
+                    // Preparing may take the carry the drafter holds (the first draft after a followed prompt).
+                    batched.BindDraftState(requestIds[i]);
                     if (ctxs[i].Exec.TryPrepareBatchDraft(positions[i], kMaxes[i], out float[]? carry, out int cap))
                     {
                         lanes.Add(i);
                         carries.Add(carry);
                         caps.Add(cap);
                     }
+                }
                 if (lanes.Count >= 2)
                 {
                     int m = lanes.Count;
@@ -4016,6 +4020,13 @@ namespace TensorSharp.Runtime.Scheduling
                     ForwardElapsedTicks = ticksPerSequence,
                 });
             }
+            // The step's end: a model that held the catch-ups back writes every sequence's now (one program over the
+            // drafters' rings), each sequence charged its share as its own catch-up.
+            long tFlush = Timestamp();
+            scope.Dispose();
+            long flushShare = (Timestamp() - tFlush) / n;
+            for (int i = 0; i < n; i++)
+                ctxs[i].Exec.AddBatchCatchUp(flushShare, drafts[i].Count > 0);
             if (ending != null)
                 foreach (var (seq, ctx, anchor) in ending)
                     EmitEndingAnchor(seq, ctx, anchor, results);

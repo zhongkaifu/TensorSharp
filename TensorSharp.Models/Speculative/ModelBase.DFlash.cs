@@ -674,6 +674,18 @@ namespace TensorSharp.Models
             RecordDSpineDumpRows(hRows, rowOffset, n, startPos);
             if (DFlashDraftingDeclined)
                 return;   // this request's ring is incomplete; it decodes without drafts
+            // A batched step's commit waits on the ring (ModelBase.DFlash.Lanes.cs), and anything else writes after its queue.
+            if (TryDeferDFlashInject(hRows, rowOffset, n, startPos))
+                return;
+            FlushBoundDFlashRows();
+            WriteDFlashRows(hRows, rowOffset, n, startPos);
+        }
+
+        /// <summary><see cref="DFlashEncodeAndInject"/>'s write: the graph program, the fused graph or the per-op pair.</summary>
+        private void WriteDFlashRows(float[] hRows, int rowOffset, int n, int startPos)
+        {
+            if (DFlashDraftingDeclined)
+                return;
             if (TryGraphDFlashInject(hRows, rowOffset, n, startPos))
                 return;
             _dflashFusedInjectFailed = false;
@@ -908,6 +920,7 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe int DFlashDraftBlockCore(int anchorToken, int position, int b, int[] draftOut, float[] confOut)
         {
+            FlushBoundDFlashRows();
             int graph = TryGraphDFlashDraftBlock(anchorToken, position, b, draftOut, confOut);
             if (graph >= 0)
                 return graph;

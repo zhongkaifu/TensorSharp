@@ -62,6 +62,10 @@ namespace TensorSharp.Models
             /// anything else wrote the ring.</summary>
             public Tensor Carry;
             public int CarryEnd = -1;
+            /// <summary>Feature rows a batched step queued for the ring (ModelBase.DFlash.Lanes.cs): <see cref="PendingCount"/>
+            /// rows from position <see cref="PendingStart"/>, bookkept as written, written before anything reads the ring.</summary>
+            public float[] PendingRows;
+            public int PendingStart, PendingCount;
         }
 
         /// <summary>Rings beyond the model's own (81 MB each on Qwen3.8-27B's DFlash2).
@@ -147,11 +151,16 @@ namespace TensorSharp.Models
         private protected (Tensor[] K, Tensor[] V, int Filled, Tensor Carry) DFlashRingOf(string requestId, bool mayTake = true)
         {
             if (requestId == null || !_hasDFlash || _dflashRingK == null)
+            {
+                FlushBoundDFlashRows();
                 return (_dflashRingK, _dflashRingV, _dflashRingFilled, EnsureDFlashRingCarry());
+            }
             EnsureDFlashRingObjects();
             DFlashRing previous = _dflashActiveRing;
             if (!TryBindDFlashRing(requestId, mayTake))
                 return (null, null, 0, null);
+            // The trunk's step writes rows after the ones the ring holds queued.
+            FlushBoundDFlashRows();
             (Tensor[] K, Tensor[] V, int Filled, Tensor Carry) ring = (_dflashRingK, _dflashRingV, _dflashRingFilled, EnsureDFlashRingCarry());
             SelectDFlashRing(previous);
             return ring;
@@ -220,6 +229,7 @@ namespace TensorSharp.Models
                     BindDFlashRing(null);
                 ring.Owner = null;
                 ring.DraftingDeclined = false;
+                ring.PendingCount = 0;
             }
         }
 
@@ -237,6 +247,8 @@ namespace TensorSharp.Models
                 ReleaseDFlashRing(requestId);
                 return 0;
             }
+            // The context kept is the rows written: the queued ones too.
+            FlushPendingDFlashRows(ring);
             var (filled, validFrom) = DFlashRunOf(ring);
             if (ring.DraftingDeclined || filled <= validFrom)
             {
@@ -363,6 +375,7 @@ namespace TensorSharp.Models
             ring.Owner = requestId;
             ring.KeptFor = null;
             ring.DraftingDeclined = false;
+            ring.PendingCount = 0;   // rows another sequence queued
             if (ReferenceEquals(ring, _dflashActiveRing))
             {
                 _dflashRingFilled = _dflashRingValidFrom = _dflashRingHigh = 0;

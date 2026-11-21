@@ -1658,6 +1658,7 @@ namespace TensorSharp.Models
             public int[] Captures;   // -1: the captured layer is another stage's
             public (int Output, int Layer)[] Routes;   // resident MoE layers' top-K ids while device routes are recorded
             public int[] Draft;   // a block draft's results: its ids' outputs, then its confidences' (see EmitDFlashBlock)
+            public int[] Trace;   // tests: a block's head logits, then each slot's candidates and scores (DFlashTraceForTests)
         }
 
         /// <summary>Trace one step: every layer, then what the request asks for.</summary>

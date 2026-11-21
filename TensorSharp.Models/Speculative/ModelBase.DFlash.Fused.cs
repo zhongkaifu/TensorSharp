@@ -114,6 +114,7 @@ namespace TensorSharp.Models
         /// </summary>
         private void EnsureDFlashRingHostSynchronized()
         {
+            FlushBoundDFlashRows();
             if (!_dflashRingHostStale || _dflashRingK == null)
                 return;
             for (int l = 0; l < _dflash.NumLayers; l++)
@@ -678,7 +679,9 @@ namespace TensorSharp.Models
             if (cfg.HasSelector)
             {
                 MapDraftVocab(_dflashSelCand, gamma * k);
-                return DFlashWalkLattice(gamma, k, _dflashSelScores, _dflashSelCand, draftOut, confOut);
+                int walked = DFlashWalkLattice(gamma, k, _dflashSelScores, _dflashSelCand, draftOut, confOut);
+                if (DFlashTraceForTests) TraceFusedLattice(gamma, k, _dflashSelScores, _dflashSelCand, draftOut);
+                return walked;
             }
             MapDraftVocab(_dflashDraftIds, b);
 
@@ -695,6 +698,44 @@ namespace TensorSharp.Models
 
         private float[] _dflashSelScores;
         private int[] _dflashSelCand;
+
+        /// <summary>Tests: what a lone block's head decided at each of its slots (<see cref="DFlashTraceForTests"/>).</summary>
+        internal sealed class DFlashSlotTrace
+        {
+            /// <summary>The head's logits of the slot's row (the graph drafter's; null from the fused drafter, which keeps them
+            /// on the device).</summary>
+            public float[] Logits;
+            /// <summary>The selector's candidates of the slot and their scores, in candidate order (null for plain DFlash).</summary>
+            public int[] Candidates;
+            public float[] Scores;
+        }
+
+        /// <summary>Tests: a lone block records what its head decided at each slot (<see cref="LastDFlashTraceForTests"/>): the
+        /// graph drafter as extra outputs of its program, the fused drafter from the lattice it returns.</summary>
+        internal bool DFlashTraceForTests { get; set; }
+
+        /// <summary>Tests: the last lone block's slots (<see cref="DFlashTraceForTests"/>), or null.</summary>
+        internal DFlashSlotTrace[] LastDFlashTraceForTests { get; private protected set; }
+
+        /// <summary>The fused selector's lattice as each slot's scored row: slot 0's row against the anchor, slot e's the row
+        /// slot e - 1's choice selects (<see cref="DFlashWalkLattice"/>).</summary>
+        private void TraceFusedLattice(int gamma, int k, float[] scores, int[] cand, int[] draftOut)
+        {
+            var slots = new DFlashSlotTrace[gamma];
+            int chosen = 0;
+            for (int e = 0; e < gamma; e++)
+            {
+                long at = e == 0 ? 0 : (long)k + ((long)(e - 1) * k + chosen) * k;
+                var row = new float[k];
+                Array.Copy(scores, at, row, 0, k);
+                var ids = new int[k];
+                Array.Copy(cand, (long)e * k, ids, 0, k);
+                slots[e] = new DFlashSlotTrace { Candidates = ids, Scores = row };
+                chosen = Array.IndexOf(ids, draftOut[e]);
+                if (chosen < 0) chosen = 0;
+            }
+            LastDFlashTraceForTests = slots;
+        }
 
         /// <summary>
         /// The greedy walk through the transition lattice the kernel produced.

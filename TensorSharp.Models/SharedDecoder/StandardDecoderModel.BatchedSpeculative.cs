@@ -70,14 +70,33 @@ namespace TensorSharp.Models
 
         public IDisposable BeginBatchedSpeculation() => new BatchedSpeculationScope(this);
 
+        /// <summary>One batched step. Where the drafter's programs run over several rings, the commits' catch-ups wait on their
+        /// rings until the step ends and are written then in one program (ModelBase.DFlash.Lanes.cs).</summary>
         private sealed class BatchedSpeculationScope : IDisposable
         {
             private StandardDecoderModel _model;
-            public BatchedSpeculationScope(StandardDecoderModel model) => _model = model;
+            private readonly bool _defers;
+
+            public BatchedSpeculationScope(StandardDecoderModel model)
+            {
+                _model = model;
+                _defers = model.HasDFlash && model.BatchedBlockDraftRefusal() == null;
+                if (_defers) model.BeginDFlashInjectDeferral();
+            }
+
             public void Dispose()
             {
-                _model?.RestorePrimaryCache();
+                StandardDecoderModel model = _model;
+                if (model == null) return;
                 _model = null;
+                try
+                {
+                    if (_defers) model.EndDFlashInjectDeferral();
+                }
+                finally
+                {
+                    model.RestorePrimaryCache();
+                }
             }
         }
 

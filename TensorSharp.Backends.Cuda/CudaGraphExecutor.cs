@@ -1993,7 +1993,8 @@ namespace TensorSharp.Cuda
         /// <summary>
         /// DFlash2's grouped dynamic convolution (<see cref="GraphFusion.DFlashConv"/>) in one launch (ts_graph_dflash_conv_f32)
         /// with its ops' roundings: about ten elementwise, copy and concatenation kernels a convolution otherwise, twenty
-        /// convolutions a Qwen3.8-27B DFlash2 block. Declined (the ops run) unless the operands are contiguous F32 on the device
+        /// convolutions a Qwen3.8-27B DFlash2 block. Several requests' blocks one after another (the region's block rows) take a
+        /// launch a block, each over its own rows. Declined (the ops run) unless the operands are contiguous F32 on the device
         /// and their extents agree with the region's.
         /// </summary>
         private bool TryDFlashConv(Tensor[] inputs, long[] ip, Tensor[] results)
@@ -2006,13 +2007,18 @@ namespace TensorSharp.Cuda
             int width = (int)ip[0], group = (int)ip[1], groups = (int)ip[2], side = (int)ip[3];
             long stride = ip[4];
             long hidden = (long)group * groups, rows = x.ElementCount() / Math.Max(1, hidden);
+            long block = ip.Length > 5 ? ip[5] : rows;
             if (width < 1 || group < 1 || groups < 1 || side is not (0 or 1) || hidden > int.MaxValue || rows < 1 || rows > int.MaxValue
                 || x.ElementCount() != rows * hidden || taps.ElementCount() != rows * stride || stride < 2L * width * groups
-                || kernel.ElementCount() != 2L * width * hidden)
+                || kernel.ElementCount() != 2L * width * hidden || block < 1 || rows % block != 0)
                 return false;
             var result = new Tensor(Allocator, DType.Float32, rows, hidden);
-            Launch(inputs, result, (k, stream) => k.LaunchDFlashConv(Ptr(x), Ptr(taps), Ptr(kernel), Ptr(result), (int)rows, (int)hidden, width,
-                group, groups, side, stride, stream));
+            Launch(inputs, result, (k, stream) =>
+            {
+                for (long r0 = 0; r0 < rows; r0 += block)
+                    k.LaunchDFlashConv(Ptr(x) + (nint)(r0 * hidden * sizeof(float)), Ptr(taps) + (nint)(r0 * stride * sizeof(float)), Ptr(kernel),
+                        Ptr(result) + (nint)(r0 * hidden * sizeof(float)), (int)block, (int)hidden, width, group, groups, side, stride, stream);
+            });
             results[0] = result;
             DFlashConvRegions++;
             return true;
