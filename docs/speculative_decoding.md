@@ -1060,6 +1060,22 @@ parks once they average a loss, so a wrong win costs a handful of steps, not
 sixty-four. The hold is still re-measured every 64 steps (three plain
 steps, since the speculative samples are productive) to refresh the baseline.
 
+Those plain steps are not free where drafting wins by a wide margin: each gives up
+the tokens a speculative step would have made in its time, about three where
+speculation is three times cheaper a token. On a lone request of Qwen3.8-27B NVFP4
++ DFlash2 (direct CUDA, RTX PRO 4500, `--spec-draft 7 --spec-pmin 0`) the re-checks
+took about eight plain steps a 512-token request and cost 4-6% of its speed
+(governor plain=20.6 spec=6.0 ms/tok). So a WIDE win - speculation at two thirds
+of plain decoding's cost a token or less, on the round and on the long-run evidence
+alike - is re-checked less and less often: its hold grows fourfold each time it is
+confirmed (256, 1024, then 4096 steps), and its re-check measures one plain step
+behind the one it drops. Any other verdict - a narrow win, a loss, a hold that
+stops winning - starts the hold over at 64 with the full baseline, and a long hold
+is no blinder than a short one: it parks as soon as its speculative steps average
+a loss. The 27B's lone requests then run at main's speed again (C=1 wave tok/s
+0.992x a build that does not govern a lone request's unified step, against 0.944x
+with 64-step holds), and a losing pairing parks as before.
+
 What "average a loss" means changed after Qwen3.8 Flash Next (M5 Pro, DFlash2):
 judging on the last eight steps - and a re-probe on three - parked speculation
 for up to 371 steps of a request whose speculative steps cost 13-27 ms a token

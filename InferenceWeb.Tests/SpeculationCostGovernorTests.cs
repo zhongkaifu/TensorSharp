@@ -1,4 +1,6 @@
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using TensorSharp.Runtime.Speculative;
 using Xunit;
 
@@ -100,6 +102,80 @@ public class SpeculationCostGovernorTests
         }
         Assert.Equal(0, g.Losses);
         Assert.Equal(0, g.ParkedSteps);
+    }
+
+    /// <summary>
+    /// Steps run as the executor runs them (a step the governor declines is plain), each speculative one costing
+    /// <paramref name="specMs"/> for <paramref name="specTokens"/> tokens and each plain one 15 ms: the lengths of the runs
+    /// of speculative and of plain steps, in order.
+    /// </summary>
+    private static (List<int> Spec, List<int> Plain) Runs(SpeculationCostGovernor g, int steps, int specTokens, double specMs)
+    {
+        var spec = new List<int>(); var plain = new List<int>();
+        bool? last = null;
+        for (int i = 0; i < steps; i++)
+        {
+            bool speculate = g.AllowsSpeculation();
+            if (speculate) g.Record(speculated: true, tokensEmitted: specTokens, elapsedTicks: Ticks(specMs));
+            else g.Record(speculated: false, tokensEmitted: 1, elapsedTicks: Ticks(15));
+            var runs = speculate ? spec : plain;
+            if (last != speculate) runs.Add(0);
+            runs[^1]++;
+            last = speculate;
+        }
+        return (spec, plain);
+    }
+
+    [Fact]
+    public void AWideWinHoldsLongerEachTimeItIsConfirmedAndReChecksItWithOnePlainStep()
+    {
+        // 5 ms a token against 15 plain: wide. The first round's verdict holds 4 x 64 steps, each confirmation 4x longer up
+        // to 4096; a re-check is the nine-step probe (its first sample dropped) and two plain steps (the first dropped).
+        var g = WinningRound();
+        var (spec, plain) = Runs(g, 6000, specTokens: 4, specMs: 20);
+        Assert.Equal(new[] { 256 + 9, 1024 + 9, 4096 + 9 }, spec.Take(3).ToArray());
+        Assert.Equal(new[] { 2, 2 }, plain.Take(2).ToArray());
+        Assert.Equal(0, g.Losses);
+    }
+
+    [Fact]
+    public void ANarrowWinKeepsTheShortHoldAndTheFullBaseline()
+    {
+        // 12.5 ms a token against 15 plain: a win inside the margin, not a wide one. Every round holds 64 steps and measures
+        // three plain steps behind the one it drops, as before.
+        var g = new SpeculationCostGovernor { Enabled = true };
+        g.Reset();
+        var (spec, plain) = Runs(g, 400, specTokens: 4, specMs: 50);
+        Assert.Equal(9, spec[0]);
+        Assert.All(spec.Skip(1).Take(3), n => Assert.Equal(64 + 9, n));
+        Assert.All(plain.Take(4), n => Assert.Equal(4, n));
+    }
+
+    [Fact]
+    public void AWideWinThatStopsWinningParksAndStartsTheHoldOver()
+    {
+        // Confirmed twice (a 4096-step hold under way), the text turns to prose: 2 tokens a 63 ms step, 31.5 ms a token. The
+        // hold parks on the long-run evidence as a 64-step hold's window does (the evidence decays per sample, not per hold,
+        // so the same ~33 steps outweigh a long run of 5 ms tokens), and the hold starts over: the re-probe's win, with the
+        // loss still in the evidence, is not a wide one.
+        var g = WinningRound();
+        Runs(g, 256 + 9 + 2 + 1024 + 9 + 2 + 100, specTokens: 4, specMs: 20);
+        int losing = 0;
+        while (!g.IsParked && losing < 64)
+        {
+            Assert.True(g.AllowsSpeculation());
+            g.Record(speculated: true, tokensEmitted: 2, elapsedTicks: Ticks(63));
+            losing++;
+        }
+        Assert.True(g.IsParked, "the hold should have parked on the loss");
+        Assert.InRange(losing, 8, 40);
+        Assert.Equal(1, g.Losses);
+        // The 32-step park (its plain steps are the baseline), a three-step re-probe that wins (its first sample dropped),
+        // a 64-step hold, the next round's nine-step probe and its full baseline (one dropped, three measured); that round's
+        // win is wide again and holds 4 x 64.
+        var (spec, plain) = Runs(g, 32 + 4 + 64 + 9 + 4 + 256, specTokens: 4, specMs: 20);
+        Assert.Equal(new[] { 32, 4 }, plain.ToArray());
+        Assert.Equal(new[] { 4 + 64 + 9, 256 }, spec.ToArray());
     }
 
     [Fact]
