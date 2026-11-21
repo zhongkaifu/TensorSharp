@@ -79,7 +79,15 @@ async function scenario() {
   await cdp('Page.addScriptToEvaluateOnNewDocument', { source: `
     window.__speech = { started: 0, rates: [] };
     const start = AudioBufferSourceNode.prototype.start;
-    AudioBufferSourceNode.prototype.start = function (...a) { window.__speech.started++;
+    AudioBufferSourceNode.prototype.start = function (...a) {
+      if (!window.__speech.started) {
+        // The first chunk: how much of the answer was on screen, and whether it was still being written.
+        const texts = document.querySelectorAll('.message.assistant .bubble-text');
+        window.__speech.firstAt = Date.now();
+        window.__speech.textAtFirst = texts.length ? texts[texts.length - 1].textContent.length : -1;
+        window.__speech.generatingAtFirst = typeof isGenerating === 'boolean' ? isGenerating : null;
+      }
+      window.__speech.started++;
       if (this.buffer) window.__speech.rates.push(this.buffer.sampleRate); return start.apply(this, a); };` });
   await cdp('Page.navigate', { url: base + '/' });
   await until(`document.getElementById('speech-toggle-label') && getComputedStyle(document.getElementById('speech-toggle-label')).display !== 'none'`,
@@ -88,9 +96,12 @@ async function scenario() {
   await evaluate(`(() => { const t = document.getElementById('speech-toggle'); t.checked = true; t.dispatchEvent(new Event('change')); return true; })()`);
   await shot('01-switch-on');
 
+  const sentAt = Date.now();
   await send(args.first || 'What is the capital of France? Answer in one short sentence.');
   await until(`window.__speech.started > 0`, 'the first audio chunk to be scheduled', 120000);
-  const live = await evaluate(`({ started: window.__speech.started, stop: !!document.querySelector('.spoken-reply-live') })`);
+  const live = await evaluate(`({ started: window.__speech.started, stop: !!document.querySelector('.spoken-reply-live'),
+    firstAt: window.__speech.firstAt, textAtFirst: window.__speech.textAtFirst, generatingAtFirst: window.__speech.generatingAtFirst })`);
+  live.firstChunkMs = live.firstAt - sentAt; delete live.firstAt;
   step('audio chunks play as they arrive', live);
   await until(`!!document.querySelector('.message.assistant .spoken-reply audio[src]') && !isGenerating`, 'the finished spoken reply', 180000);
   const finished = await evaluate(`(async () => {
@@ -104,13 +115,22 @@ async function scenario() {
       chunks: window.__speech.started, rates: Array.from(new Set(window.__speech.rates)),
       history: chatHistory.map(m => ({ role: m.role, audioId: m.audioId || null, audioUrl: m.audioUrl || null })),
       answer: document.querySelector('.message.assistant .bubble-text').textContent.slice(0, 400),
+      answerLength: document.querySelector('.message.assistant .bubble-text').textContent.length,
       notes: Array.from(document.querySelectorAll('.message.assistant .turn-notice, .message.assistant .turn-note')).map(n => n.textContent),
       stats: document.querySelector('.message.assistant .stats').textContent };
   })()`);
   if (!(finished.duration > 0) || finished.header !== 'RIFF/WAVE' || !finished.download)
     throw new Error('The finished reply does not play or download: ' + JSON.stringify(finished));
+  // Whether the speech started before the text was all written (a one-sentence answer is spoken once it is complete).
+  finished.textAtFirstChunk = live.textAtFirst;
+  finished.speechBeforeTextEnded = live.textAtFirst >= 0 && live.textAtFirst < finished.answerLength;
   step('player and download of the finished reply', finished);
   await shot('02-finished-reply');
+  // Once the reply has been heard, the page gives the audio back: the context rests.
+  await until(`!activeLiveSpeech || !activeLiveSpeech.speaking`, 'the reply to finish playing', 120000);
+  await new Promise(r => setTimeout(r, 500));
+  step('the audio is given back after the reply', await evaluate(`({ context: speechAudioContext && speechAudioContext.state,
+    audioSession: navigator.audioSession ? navigator.audioSession.type : 'n/a' })`));
 
   // The second spoken turn sends the first back by its audioId.
   let sent = null;
