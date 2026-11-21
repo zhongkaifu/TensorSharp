@@ -3804,12 +3804,16 @@ namespace TensorSharp.Runtime.Scheduling
                 var carries = new List<float[]>(n);
                 var caps = new List<int>(n);
                 for (int i = 0; i < n; i++)
+                {
+                    // Preparing may take the carry the drafter holds (the first draft after a followed prompt).
+                    batched.BindDraftState(requestIds[i]);
                     if (ctxs[i].Exec.TryPrepareBatchDraft(positions[i], kMaxes[i], out float[]? carry, out int cap))
                     {
                         lanes.Add(i);
                         carries.Add(carry);
                         caps.Add(cap);
                     }
+                }
                 if (lanes.Count >= 2)
                 {
                     int m = lanes.Count;
@@ -3870,9 +3874,12 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             int feat = spec.SpecFeatureSize;
+            // A verify that keeps every sequence's drafter in step itself takes no features, and the contexts' commits none.
+            bool keepsDrafter = batched.BatchedSpecVerifyKeepsDrafter;
             long featNeeded = (long)n * window * feat;
-            if (_batchedSpecFeatures == null || _batchedSpecFeatures.LongLength < featNeeded)
+            if (!keepsDrafter && (_batchedSpecFeatures == null || _batchedSpecFeatures.LongLength < featNeeded))
                 _batchedSpecFeatures = new float[featNeeded];
+            float[]? rowFeatures = keepsDrafter ? null : _batchedSpecFeatures;
             var drawn = new int[n * window];
             long drafted = Timestamp();
             int vocab = _model.Config.VocabSize;
@@ -3880,11 +3887,11 @@ namespace TensorSharp.Runtime.Scheduling
             float[]? rowLogits = null;
             if (sampledVerify)
             {
-                if (!batched.TryBatchedSpecVerifyLogits(requestIds, positions, window, tokens, _batchedSpecFeatures,
+                if (!batched.TryBatchedSpecVerifyLogits(requestIds, positions, window, tokens, rowFeatures!,
                         ref _batchedSpecLogits, (long)n * window * vocab, out rowLogits))
                     return false;
             }
-            else if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, _batchedSpecFeatures))
+            else if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, rowFeatures!))
                 return false;
             long verified = Timestamp();
             // The verify forward alone: each sequence's draft is counted where it ran (ProposeForBatch, AcceptBatchDraft,
@@ -3996,7 +4003,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int m = kept[i] - 1;
                 batched.BindDraftState(seq.RequestId);
                 ctx.Exec.CommitBatch(anchors[i], positions[i], drafts[i], m,
-                    _batchedSpecFeatures, (long)i * window * feat, verifyTicks / n, commitTicks / n);
+                    rowFeatures, (long)i * window * feat, verifyTicks / n, commitTicks / n);
                 int next = nexts[i];
                 seq.LastLogits = null;
                 seq.AdvanceComputedTokens(kept[i]);
@@ -4016,6 +4023,13 @@ namespace TensorSharp.Runtime.Scheduling
                     ForwardElapsedTicks = ticksPerSequence,
                 });
             }
+            // The step's end: a model that held the catch-ups back writes every sequence's now (one program over the
+            // drafters' rings), each sequence charged its share as its own catch-up.
+            long tFlush = Timestamp();
+            scope.Dispose();
+            long flushShare = (Timestamp() - tFlush) / n;
+            for (int i = 0; i < n; i++)
+                ctxs[i].Exec.AddBatchCatchUp(flushShare, drafts[i].Count > 0);
             if (ending != null)
                 foreach (var (seq, ctx, anchor) in ending)
                     EmitEndingAnchor(seq, ctx, anchor, results);

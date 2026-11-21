@@ -430,6 +430,9 @@ namespace TensorSharp.Runtime
             ("TS_MUSE_GLIMMER_GELU_TANH",
                 "the Muse-Glimmer vision tower always uses the reference erf GELU; the tanh approximation was removed."),
             ("TS_DFLASH_FUSED", DefaultPathSwitchRemoved),
+            ("TS_DFLASH_BATCHED_INJECT",
+                "a batched speculative step writes every request's DFlash ring catch-up in one graph program wherever the "
+                + "drafter runs as graph programs; the ggml_cuda switch read only by a deferred inject nothing started was removed."),
             ("TS_NEMOTRON_LINEAR_RESIDUAL_FUSED_PREFILL", ExperimentRemoved),
             ("TS_NEMOTRON_MOE_PREFILL_FUSED", ExperimentRemoved),
             ("TS_CUDA_Q8_MMA", ExperimentRemoved),

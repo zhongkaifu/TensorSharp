@@ -1658,6 +1658,7 @@ namespace TensorSharp.Models
             public int[] Captures;   // -1: the captured layer is another stage's
             public (int Output, int Layer)[] Routes;   // resident MoE layers' top-K ids while device routes are recorded
             public int[] Draft;   // a block draft's results: its ids' outputs, then its confidences' (see EmitDFlashBlock)
+            public int[] Trace;   // tests: a block's head logits, then each slot's candidates and scores (DFlashTraceForTests)
         }
 
         /// <summary>Trace one step: every layer, then what the request asks for.</summary>
@@ -2393,12 +2394,26 @@ namespace TensorSharp.Models
         /// 3.8's QSA selection), what the region reads from outside it emitted before it opens; default none.</summary>
         protected virtual bool BeginWindowAttention(GraphStep step, int layer, int x, int s, in WindowAttentionOperands attention) => false;
 
+        /// <summary>Whether the family opens regions of its own over a window's attention (<see cref="BeginWindowAttention"/>): its
+        /// sequences' attentions then stay out of a region of several sequences' (GraphFusion.SequenceAttentions).</summary>
+        protected virtual bool WindowAttentionHasRegion => false;
+
+        /// <summary>Tests: several sequences' verify windows run as their ops one sequence at a time, not as one region
+        /// (<see cref="GraphFusion.SequenceAttentions"/>).</summary>
+        internal bool SequenceAttentionRegionsDisabledForTests { get; set; }
+
         /// <summary>A one-sequence step's attention prep operands in a layer: its rows' q [d, heads, rows] and k [d, kvHeads, rows]
         /// as projected (views of the products, before the copies and <see cref="EmitQueryKey"/>'s ops), v [dv, kvHeads, rows], the
         /// K and V caches [d, capacity, kvHeads], the rows the step writes them at (I64 [rows]: their KV indices), the local heads
         /// and KV heads, and the key and value head widths.</summary>
         protected readonly record struct AttentionPrepOperands(int Queries, int Keys, int Values, int KCache, int VCache, int Rows, int Heads,
-            int KvHeads, int HeadDim, int ValueDim);
+            int KvHeads, int HeadDim, int ValueDim)
+        {
+            /// <summary>Several sequences' rows (a batched verify's windows, as many rows each): the second sequence's K cache, V
+            /// cache and write rows on, three a sequence (the first sequence's are <see cref="KCache"/>, <see cref="VCache"/> and
+            /// <see cref="Rows"/>); null for one sequence.</summary>
+            public int[] Further { get; init; }
+        }
 
         /// <summary>Whether a one-sequence step whose rows are written into the caches by index takes <paramref name="layer"/>'s
         /// query/key prep and cache writes as a region (<see cref="BeginAttentionPrep"/>); default none.</summary>
@@ -2457,11 +2472,38 @@ namespace TensorSharp.Models
                     step.State(only.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads),
                     step.WriteRows(step.Starts[0], step.Counts[0], 0), heads, kvHeads, d, dv));
             }
+            // Several sequences' verify windows written by index (a batched verify, as many rows each, none past a ring's first lap
+            // or a prompt chunk): every sequence's prep and cache writes one region, the writes first, each sequence's into its own
+            // caches at its own rows (the region's results the rotated queries of every row).
+            bool preps = !prep && step.Sequences > 1 && !LegacyBatchedJoinForTests && !WindowAttentionHasRegion
+                && !SequenceAttentionRegionsDisabledForTests && TakesAttentionPrep(step, layer);
+            for (int s = 0; preps && s < step.Sequences; s++)
+                preps = Indexed(step.Counts[s]) && step.Counts[s] == step.Counts[0] && !RingWrapped(layer, step.Starts[s], step.Counts[s])
+                    && !(step.PromptChunks && step.Counts[s] > SmallChunkRows);
+            int[] prepRows = null;
+            if (preps)
+            {
+                prepRows = new int[step.Sequences];
+                var further = new List<int>(3 * (step.Sequences - 1));
+                int firstK = -1, firstV = -1;
+                for (int s = 0; s < step.Sequences; s++)
+                {
+                    Slot slot = step.Slots[s];
+                    int cells = CacheCells(layer, slot.Capacity);
+                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cells, kvHeads);
+                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads);
+                    prepRows[s] = step.WriteRows(step.Starts[s], step.Counts[s], s);
+                    if (s == 0) (firstK, firstV) = (ck, cv);
+                    else further.AddRange(new[] { ck, cv, prepRows[s] });
+                }
+                BeginAttentionPrep(step, layer, new AttentionPrepOperands(q, k, v, firstK, firstV, prepRows[0], heads, kvHeads, d, dv)
+                    { Further = further.ToArray() });
+            }
             // Where the executor's ops read a packed product's row blocks where they lie (GraphCapabilities.PackedProductBlocks),
             // a fused QKV product's queries and keys go to the family's prep as its views (the norms and rotary write fresh
             // rows) and one sequence's values to the cache writes (set_rows reads any strides): no copies of every prompt
             // chunk's q, k and v. Elsewhere, and for what the prep leaves a view, contiguous copies.
-            bool blocks = GraphExecutor.Capabilities.PackedProductBlocks && !prep;
+            bool blocks = GraphExecutor.Capabilities.PackedProductBlocks && !prep && !preps;
             // A prompt chunk's fresh rows as their permuted views (GraphCapabilities.FreshRowViews): written by index, attended
             // where they lie.
             bool freshViews = caps.FreshRowViews && _graphTpRanks == null;
@@ -2474,6 +2516,25 @@ namespace TensorSharp.Models
             EmitQueryKey(step, layer, ref q, ref k);
             q = step.Cont(q);
             k = step.Cont(k);
+            if (preps)
+            {
+                // Every sequence's rows into its caches, then the rotated queries close the region.
+                for (int s = 0; s < step.Sequences; s++)
+                {
+                    Slot slot = step.Slots[s];
+                    int count = step.Counts[s], cells = CacheCells(layer, slot.Capacity);
+                    long firstRow = step.First[s];
+                    int ks = step.View3(k, d, kvHeads, count, d * f, d * kvHeads * f, firstRow * d * kvHeads * f);
+                    int vs = step.View3(v, dv, kvHeads, count, dv * f, dv * kvHeads * f, firstRow * dv * kvHeads * f);
+                    int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : step.Permute(ks, 0, 2, 1, 3);
+                    int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : step.Permute(vs, 0, 2, 1, 3);
+                    int ck = step.State(slot.K[layer][step.RankIndex], kvType, KvCacheSplit(), d, cells, kvHeads);
+                    int cv = step.State(slot.V[layer][step.RankIndex], kvType, KvCacheSplit(), dv, cells, kvHeads);
+                    step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, prepRows[s]));
+                    step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, prepRows[s]));
+                }
+                step.EndFused(stackalloc[] { q });
+            }
 
             float scale = 1.0f / MathF.Sqrt(d);
             long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
@@ -2482,6 +2543,14 @@ namespace TensorSharp.Models
             int attn = -1;
             // Several sequences' outputs, joined after the loop (JoinSequenceRows).
             var parts = n > 1 && !LegacyBatchedJoinForTests ? new List<int>(n) : null;
+            // Several sequences' verify windows (each written by index into its own caches, none a prompt chunk or past a ring's
+            // first lap): one region an executor may run at its end, launching every sequence's attention together
+            // (GraphFusion.SequenceAttentions); a family's own window regions keep theirs.
+            bool together = parts != null && !prep && !WindowAttentionHasRegion && !SequenceAttentionRegionsDisabledForTests;
+            for (int s = 0; together && s < n; s++)
+                together = Indexed(step.Counts[s]) && !RingWrapped(layer, step.Starts[s], step.Counts[s])
+                    && !(step.PromptChunks && step.Counts[s] > SmallChunkRows);
+            if (together) step.BeginFused(GraphFusion.SequenceAttentions, stackalloc[] { q, k, v });
             for (int s = 0; s < n; s++)
             {
                 int count = step.Counts[s], start = step.Starts[s];
@@ -2573,9 +2642,13 @@ namespace TensorSharp.Models
                     // Decode and short chunks (a verify window): rows are written by index and
                     // attention reads the padded cache window under a causal mask, so every row is
                     // computed as a decode row is and a window bucket replays the same graph.
-                    int rowsAt = step.WriteRows(start, count, s);
-                    step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, rowsAt));
-                    step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, rowsAt));
+                    // (Several sequences' prep region wrote every sequence's rows.)
+                    int rowsAt = preps ? prepRows[s] : step.WriteRows(start, count, s);
+                    if (!preps)
+                    {
+                        step.Effect(step.Op(GraphOp.SetRows, ck, kFresh, rowsAt));
+                        step.Effect(step.Op(GraphOp.SetRows, cv, vFresh, rowsAt));
+                    }
                     if (prep)
                     {
                         step.EndFused(stackalloc[] { q });
@@ -2638,6 +2711,7 @@ namespace TensorSharp.Models
                 if (parts != null) parts.Add(part);
                 else attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
             }
+            if (together) step.EndFused(parts.ToArray());
             if (parts != null) attn = JoinSequenceRows(step, parts);
 
             if (gate >= 0)

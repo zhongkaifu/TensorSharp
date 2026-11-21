@@ -62,6 +62,15 @@ namespace TensorSharp.Models
             /// anything else wrote the ring.</summary>
             public Tensor Carry;
             public int CarryEnd = -1;
+            /// <summary>The ring holds every row before this position, the carry's own (position - 1) among them: a batched
+            /// verify wrote its rows into the ring (StandardDecoderModel.VerifyFollow.cs), so the runtime keeps no feature
+            /// row for it. A draft at this position injects no carry, and a catch-up starting at its carry's position writes
+            /// from the row after it (<see cref="DFlashEncodeAndInject"/>). -1 once anything else wrote the ring.</summary>
+            public int HeldTo = -1;
+            /// <summary>Feature rows a batched step queued for the ring (ModelBase.DFlash.Lanes.cs): <see cref="PendingCount"/>
+            /// rows from position <see cref="PendingStart"/>, bookkept as written, written before anything reads the ring.</summary>
+            public float[] PendingRows;
+            public int PendingStart, PendingCount;
         }
 
         /// <summary>Rings beyond the model's own (81 MB each on Qwen3.8-27B's DFlash2).
@@ -118,6 +127,7 @@ namespace TensorSharp.Models
             _dflashActiveRing.HostStale = _dflashRingHostStale;
             _dflashActiveRing.Carry = _dflashRingCarry;
             _dflashActiveRing.CarryEnd = _dflashRingCarryEnd;
+            _dflashActiveRing.HeldTo = _dflashRingHeldTo;
             _dflashRingK = target.K;
             _dflashRingV = target.V;
             _dflashRingFilled = target.Filled;
@@ -126,6 +136,7 @@ namespace TensorSharp.Models
             _dflashRingHostStale = target.HostStale;
             _dflashRingCarry = target.Carry;
             _dflashRingCarryEnd = target.CarryEnd;
+            _dflashRingHeldTo = target.HeldTo;
             if (_dflashArrays != null)
             {
                 for (int l = 0; l < _dflashArrays.RingK.Length; l++)
@@ -147,11 +158,16 @@ namespace TensorSharp.Models
         private protected (Tensor[] K, Tensor[] V, int Filled, Tensor Carry) DFlashRingOf(string requestId, bool mayTake = true)
         {
             if (requestId == null || !_hasDFlash || _dflashRingK == null)
+            {
+                FlushBoundDFlashRows();
                 return (_dflashRingK, _dflashRingV, _dflashRingFilled, EnsureDFlashRingCarry());
+            }
             EnsureDFlashRingObjects();
             DFlashRing previous = _dflashActiveRing;
             if (!TryBindDFlashRing(requestId, mayTake))
                 return (null, null, 0, null);
+            // The trunk's step writes rows after the ones the ring holds queued.
+            FlushBoundDFlashRows();
             (Tensor[] K, Tensor[] V, int Filled, Tensor Carry) ring = (_dflashRingK, _dflashRingV, _dflashRingFilled, EnsureDFlashRingCarry());
             SelectDFlashRing(previous);
             return ring;
@@ -181,11 +197,17 @@ namespace TensorSharp.Models
         // The bound ring's carry and the position past the row it holds (-1: none); see DFlashRing.Carry.
         private Tensor _dflashRingCarry;
         private int _dflashRingCarryEnd = -1;
+        // The position before which the bound ring holds every row, its carry's included (-1: none); see DFlashRing.HeldTo.
+        private int _dflashRingHeldTo = -1;
+
+        /// <summary>Whether the bound ring holds the carry of a draft at <paramref name="position"/> itself (DFlashRing.HeldTo).</summary>
+        private protected bool DFlashRingHoldsCarry(int position)
+            => _hasDFlash && position > 0 && _dflashRingHeldTo == position && _dflashRingFilled == position && !DFlashDraftingDeclined;
 
         /// <summary>A graph on the device wrote rows <paramref name="startPos"/> .. + <paramref name="n"/> of
         /// <paramref name="requestId"/>'s ring (null: the bound ring): its frontier and valid run, as the injects record
         /// theirs (<see cref="NoteDFlashRingWrite"/>), and its host copy behind; the bound ring is left as it was.</summary>
-        private protected void NoteDFlashRingWriteOf(string requestId, int startPos, int n, bool carried = false)
+        private protected void NoteDFlashRingWriteOf(string requestId, int startPos, int n, bool carried = false, bool holdsCarry = false)
         {
             DFlashRing previous = null;
             if (requestId != null && _hasDFlash && _dflashRingK != null)
@@ -198,6 +220,9 @@ namespace TensorSharp.Models
             // The write also left its last row's features in the ring's carry (a followed prompt's step).
             if (carried)
                 _dflashRingCarryEnd = startPos + n;
+            // The rows end with the next draft's carry row (a batched verify's kept rows: DFlashRing.HeldTo).
+            if (holdsCarry)
+                _dflashRingHeldTo = startPos + n;
             _dflashRingHostStale = true;
             if (previous != null)
                 SelectDFlashRing(previous);
@@ -220,6 +245,7 @@ namespace TensorSharp.Models
                     BindDFlashRing(null);
                 ring.Owner = null;
                 ring.DraftingDeclined = false;
+                ring.PendingCount = 0;
             }
         }
 
@@ -237,6 +263,8 @@ namespace TensorSharp.Models
                 ReleaseDFlashRing(requestId);
                 return 0;
             }
+            // The context kept is the rows written: the queued ones too.
+            FlushPendingDFlashRows(ring);
             var (filled, validFrom) = DFlashRunOf(ring);
             if (ring.DraftingDeclined || filled <= validFrom)
             {
@@ -284,6 +312,7 @@ namespace TensorSharp.Models
                 _dflashRingFilled = tokens;
                 _dflashRingValidFrom = Math.Min(_dflashRingValidFrom, tokens);
                 _dflashRingCarryEnd = -1;
+                _dflashRingHeldTo = -1;
             }
             SelectDFlashRing(previous);
             OnDFlashRingOwnerChanged(ring.K);
@@ -363,15 +392,18 @@ namespace TensorSharp.Models
             ring.Owner = requestId;
             ring.KeptFor = null;
             ring.DraftingDeclined = false;
+            ring.PendingCount = 0;   // rows another sequence queued
             if (ReferenceEquals(ring, _dflashActiveRing))
             {
                 _dflashRingFilled = _dflashRingValidFrom = _dflashRingHigh = 0;
                 _dflashRingCarryEnd = -1;
+                _dflashRingHeldTo = -1;
             }
             else
             {
                 ring.Filled = ring.ValidFrom = ring.High = 0;
                 ring.CarryEnd = -1;
+                ring.HeldTo = -1;
             }
             OnDFlashRingOwnerChanged(ring.K);
         }
@@ -580,6 +612,7 @@ namespace TensorSharp.Models
                     ring.Carry?.Dispose();
             _dflashRingCarry = null;
             _dflashRingCarryEnd = -1;
+            _dflashRingHeldTo = -1;
             if (_dflashModelRing != null)
             {
                 // The model's own ring is disposed through the fields by DisposeDFlash.

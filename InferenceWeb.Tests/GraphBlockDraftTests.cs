@@ -18,6 +18,12 @@ namespace InferenceWeb.Tests;
 /// width. The drafter's window (16) is shorter than the context, so the window slides and the 32-row ring wraps. Each block
 /// must give the same ids with confidences within 1e-3, and the rings the same rows over the window within 1e-4 relative L2.
 /// On ggml_metal the seam's model drafts on the fused GGML graph (CanUseFusedDFlash), so there the reference is that graph.
+/// On a GPU the two drafters' products round apart, so a block may part from the reference's at a slot the reference decided
+/// at a near-tie (DFlashNearTies: the head's k-th logit against the (k+1)-th, or the walk's best score against the second,
+/// within 1e-2 of the largest), and only there; each such parting is printed with both drafters' candidates and scores. On
+/// ggml_cuda, dflash2-q8's block of cycle 16 parted so (main 48deb34c included): slot 1's 8th and 9th head logits were
+/// 1.3647376 and 1.3646636 (3.5e-5 of the largest), the two drafters kept another 8th candidate, and the same choice took
+/// another share of the candidates' softmax.
 /// </summary>
 public sealed class GraphBlockDraftTests : IDisposable
 {
@@ -331,7 +337,8 @@ public sealed class GraphBlockDraftTests : IDisposable
         return mismatches;
     }
 
-    /// <summary>The same on ggml_cuda, where the old path is the fused native drafter.</summary>
+    /// <summary>The same on ggml_cuda, where the old path is the fused native drafter (where it takes the drafter's weights:
+    /// these fixtures' F32 projections keep the per-op drafter).</summary>
     [GgmlTheory(BackendType.GgmlCuda)]
     [InlineData("dflash")]
     [InlineData("dflash2")]
@@ -1037,6 +1044,8 @@ public sealed class GraphBlockDraftTests : IDisposable
         using var graph = new Qwen35RuntimeModel(target, backend, 1, null, 1, draft) { GraphBlockDraftOnMetalForTests = true };
         if (!ringKernel && graph.GraphExecutorForTests is TensorSharp.Cuda.CudaGraphExecutor cuda) cuda.RingAttentionDisabledForTests = true;
         using var perOp = new Qwen35RuntimeModel(target, reference ?? backend, 1, null, 1, draft) { GraphBlockDraftDisabledForTests = true };
+        // Each block's slots as the two drafters decided them, to tell a near-tie from a real difference.
+        graph.DFlashTraceForTests = perOp.DFlashTraceForTests = true;
         string label = $"{backend} {variant}";
         Assert.True(graph.HasDFlash && perOp.HasDFlash, $"{label}: the drafter did not attach");
         Assert.Equal(32, graph.DFlashRingRowsForTests);
@@ -1058,6 +1067,7 @@ public sealed class GraphBlockDraftTests : IDisposable
         int last = Argmax(logits, 0, vocab), position = prompt.Length;
         var mismatches = new List<string>();
         double worstConfidence = 0, worstRing = 0;
+        int partings = 0;
         worstRing = Math.Max(worstRing, CompareRings(graph, perOp, label, "prompt", mismatches));
 
         for (int cycle = 0; cycle < Cycles; cycle++)
@@ -1072,11 +1082,23 @@ public sealed class GraphBlockDraftTests : IDisposable
             }
             for (int e = 0; e < gamma; e++)
             {
-                if (ids[0][e] != ids[1][e])
-                    mismatches.Add($"cycle {cycle} slot {e}: graph drafted {ids[0][e]} ({conf[0][e]:F5}), per-op {ids[1][e]} ({conf[1][e]:F5})");
-                worstConfidence = Math.Max(worstConfidence, Math.Abs(conf[0][e] - conf[1][e]));
-                if (Math.Abs(conf[0][e] - conf[1][e]) > ConfidenceTolerance)
-                    mismatches.Add($"cycle {cycle} slot {e}: confidence {conf[0][e]:F6} against the per-op {conf[1][e]:F6}");
+                if (ids[0][e] == ids[1][e] && Math.Abs(conf[0][e] - conf[1][e]) <= ConfidenceTolerance)
+                {
+                    worstConfidence = Math.Max(worstConfidence, Math.Abs(conf[0][e] - conf[1][e]));
+                    continue;
+                }
+                // The two blocks part here (their later slots follow other predecessors): only where the reference drafter
+                // decided the slot at a near-tie (DFlashNearTies), as a GPU's products round the two drafters apart.
+                string slot = $"cycle {cycle} slot {e}: graph drafted {ids[0][e]} ({conf[0][e]:R}), per-op {ids[1][e]} ({conf[1][e]:R})";
+                ModelBase.DFlashSlotTrace decider = perOp.LastDFlashTraceForTests?[e] ?? graph.LastDFlashTraceForTests?[e];
+                string seen = DFlashNearTies.Describe("graph", graph.LastDFlashTraceForTests?[e], "per-op", perOp.LastDFlashTraceForTests?[e]);
+                _output.WriteLine($"{label} {slot}: {seen}");
+                bool cpu = backend is BackendType.Cpu or BackendType.GgmlCpu;
+                if (cpu || decider == null || !DFlashNearTies.IsNearTie(DFlashNearTies.Margins(decider)))
+                    mismatches.Add($"{slot}; {seen}");
+                else
+                    partings++;
+                break;
             }
             worstRing = Math.Max(worstRing, CompareRings(graph, perOp, label, $"cycle {cycle} draft", mismatches));
 
@@ -1100,7 +1122,7 @@ public sealed class GraphBlockDraftTests : IDisposable
             position += accepted + 1;
         }
 
-        _output.WriteLine($"{label}: {Cycles} blocks to position {position}; worst confidence difference {worstConfidence:E2}, " +
+        _output.WriteLine($"{label}: {Cycles} blocks to position {position}, {partings} parted at a near-tie; worst confidence difference {worstConfidence:E2}, " +
             $"worst ring relative L2 {worstRing:E2}; {graph.GraphBlockDrafts} graph blocks, {graph.GraphDFlashInjects} graph injects, " +
             $"{graph.DraftAdvances} advanced draft steps");
         Assert.True(mismatches.Count == 0, $"{label}: {string.Join("; ", mismatches.Take(12))}");

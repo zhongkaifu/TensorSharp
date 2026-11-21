@@ -70,14 +70,33 @@ namespace TensorSharp.Models
 
         public IDisposable BeginBatchedSpeculation() => new BatchedSpeculationScope(this);
 
+        /// <summary>One batched step. Where the drafter's programs run over several rings, the commits' catch-ups wait on their
+        /// rings until the step ends and are written then in one program (ModelBase.DFlash.Lanes.cs).</summary>
         private sealed class BatchedSpeculationScope : IDisposable
         {
             private StandardDecoderModel _model;
-            public BatchedSpeculationScope(StandardDecoderModel model) => _model = model;
+            private readonly bool _defers;
+
+            public BatchedSpeculationScope(StandardDecoderModel model)
+            {
+                _model = model;
+                _defers = model.HasDFlash && model.BatchedBlockDraftRefusal() == null;
+                if (_defers) model.BeginDFlashInjectDeferral();
+            }
+
             public void Dispose()
             {
-                _model?.RestorePrimaryCache();
+                StandardDecoderModel model = _model;
+                if (model == null) return;
                 _model = null;
+                try
+                {
+                    if (_defers) model.EndDFlashInjectDeferral();
+                }
+                finally
+                {
+                    model.RestorePrimaryCache();
+                }
             }
         }
 
@@ -193,6 +212,12 @@ namespace TensorSharp.Models
             int rows = n * window;
             var flat = new int[rows];
             Array.Copy(tokens, flat, rows);
+            // A verify that keeps the rings in step itself (the caller takes no features): its windows' rows go into the
+            // rings in its own program, else its features come back to the model for the commit (StandardDecoderModel.VerifyFollow.cs).
+            _keptVerify = null;
+            bool keepsRings = dflash && featuresOut == null && BatchedSpecVerifyKeepsDrafter;
+            DFlashFollowPlan ringFollow = keepsRings ? PlanDFlashVerifyFollow(requestIds, window) : null;
+            float[] keptFeatures = keepsRings ? KeptVerifyFeatures(rows) : null;
             // A lone request's one-row step that captures its carry (no drafts yet) hands the draft layer its row when the
             // layer followed the rows before it (its prompt).
             DraftFollow follow = n == 1 && window == 1 && !dflash && featuresOut != null ? PlanDraftFollow(slots[0], positions[0], null) : DraftFollow.None;
@@ -202,24 +227,41 @@ namespace TensorSharp.Models
                 LastRowLogits = false,
                 AllRowLogits = true,
                 GreedyIds = idsOut != null && GraphGreedyIds,
-                CaptureLayers = dflash && featuresOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
+                CaptureLayers = dflash && (featuresOut != null || keptFeatures != null) ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
                 CaptureFinal = !dflash && featuresOut != null,
                 RecurrentSnapshots = _anyRecurrent && window > 1,
                 FollowDraft = follow,
                 DraftRows = follow != DraftFollow.None ? PrepareDraftFollow(slots[0], flat, media: false) : null,
             };
+            // The follow's program returns no features (the rings take them); where it does not run, the step captures them.
+            GraphRequest following = ringFollow == null ? null : new GraphRequest
+            {
+                LastRowLogits = request.LastRowLogits, AllRowLogits = request.AllRowLogits, GreedyIds = request.GreedyIds,
+                CaptureLayers = Array.Empty<int>(), CaptureFinal = request.CaptureFinal, RecurrentSnapshots = request.RecurrentSnapshots,
+                FollowDraft = request.FollowDraft, DraftRows = request.DraftRows,
+            };
             Tensor hidden = EmbedStep(flat);
-            GraphResult result;
+            GraphResult result = null;
             _forwardSw.Start();
             try
             {
-                if (!TryRunGraphStep(hidden, slots, first, counts, (int[])positions.Clone(), request, out result))
+                if (!RunFollowingDFlash(ref ringFollow, plan => TryRunGraphStep(hidden, slots, first, counts, (int[])positions.Clone(),
+                        plan == null ? request : following.WithDFlashFollow(plan), out result)))
                     return false;
             }
             finally
             {
                 hidden.Dispose();
                 _forwardSw.Stop();
+            }
+            if (keepsRings)
+            {
+                _keptVerify = new KeptVerify { Requests = new List<string>(requestIds).ToArray(), Positions = (int[])positions.Clone(), Window = window, Followed = ringFollow != null };
+                if (ringFollow == null)
+                {
+                    WriteSpecFeatures(keptFeatures, rows, result.Captures, result.Final);
+                    _keptVerify.Features = keptFeatures;
+                }
             }
             for (int s = 0; s < n; s++)
             {
@@ -309,6 +351,8 @@ namespace TensorSharp.Models
             RestorePrimaryCache();
             try
             {
+                // The rings first: their kept rows (the verify wrote them, or the features it returned are written now).
+                CommitKeptVerify(requestIds, positions, kept);
                 for (int i = 0; i < requestIds.Count; i++)
                 {
                     if (!_slots.TryGetValue(requestIds[i], out Slot slot))

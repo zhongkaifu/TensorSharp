@@ -26,6 +26,12 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] _gemmQ6kTiled = new IntPtr[4];
         private readonly int[] _smemQ6kTiled = new int[4];
         private readonly IntPtr[] _gemmQ4k = new IntPtr[4];
+        private readonly IntPtr[] _gemmQ6k = new IntPtr[4];
+        private readonly IntPtr _setRowsHeads;
+        private readonly IntPtr _gdnScanSeqs, _gdnScanSeqsKda;
+        private readonly IntPtr _deltaNetPrepSeqs, _gatedRmsNormSeqs, _cacheRowsSeqs, _deltaNetPrepSeqs2, _attnPrepSeqs;
+        private readonly IntPtr _gdn8, _gdn8Scan, _gdn8ScanKda, _gdn8ScanSeqs, _gdn8ScanSeqsKda, _gdn8Commit;
+        private readonly IntPtr _ringAttnLanes64, _ringAttnLanes128;
         private readonly int _multiprocessors;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
@@ -35,6 +41,47 @@ namespace TensorSharp.Cuda
             _gatedDeltaNetRows4 = module.GetFunction("ts_graph_gated_delta_net_rows4_f32");
             _gatedDeltaNetScan4 = module.GetFunction("ts_graph_gated_delta_net_scan4_f32");
             _gatedDeltaNetScan4Kda = module.GetFunction("ts_graph_gated_delta_net_scan4_kda_f32");
+            try
+            {
+                _gdnScanSeqs = module.GetFunction("ts_graph_gated_delta_net_scan4_seqs_f32");
+                _gdnScanSeqsKda = module.GetFunction("ts_graph_gated_delta_net_scan4_seqs_kda_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                _gdnScanSeqs = _gdnScanSeqsKda = IntPtr.Zero;
+            }
+            try
+            {
+                _deltaNetPrepSeqs = module.GetFunction("ts_graph_deltanet_prep_seqs_f32");
+                _gatedRmsNormSeqs = module.GetFunction("ts_graph_gated_rms_norm_seqs_f32");
+                _cacheRowsSeqs = module.GetFunction("ts_graph_cache_rows_seqs_f16");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                _deltaNetPrepSeqs = _gatedRmsNormSeqs = _cacheRowsSeqs = IntPtr.Zero;
+            }
+            try
+            {
+                _deltaNetPrepSeqs2 = module.GetFunction("ts_graph_deltanet_prep_seqs2_f32");
+                _attnPrepSeqs = module.GetFunction("ts_graph_attn_prep_seqs_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                _deltaNetPrepSeqs2 = _attnPrepSeqs = IntPtr.Zero;
+            }
+            try
+            {
+                _gdn8 = module.GetFunction("ts_graph_gdn8_f32");
+                _gdn8Scan = module.GetFunction("ts_graph_gdn8_scan_f32");
+                _gdn8ScanKda = module.GetFunction("ts_graph_gdn8_scan_kda_f32");
+                _gdn8ScanSeqs = module.GetFunction("ts_graph_gdn8_scan_seqs_f32");
+                _gdn8ScanSeqsKda = module.GetFunction("ts_graph_gdn8_scan_seqs_kda_f32");
+                _gdn8Commit = module.GetFunction("ts_graph_gdn8_commit_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                _gdn8 = _gdn8Scan = _gdn8ScanKda = _gdn8ScanSeqs = _gdn8ScanSeqsKda = _gdn8Commit = IntPtr.Zero;
+            }
             _gdnCommit = module.GetFunction("ts_graph_gdn_commit_f32");
             _softplus = module.GetFunction("ts_graph_softplus_f32");
             _sqrt = module.GetFunction("ts_graph_sqrt_f32");
@@ -47,6 +94,8 @@ namespace TensorSharp.Cuda
             _getRows = module.GetFunction("ts_graph_get_rows_f32");
             _getRowsF16 = module.GetFunction("ts_graph_get_rows_f16");
             _setRows = module.GetFunction("ts_graph_set_rows_f32");
+            try { _setRowsHeads = module.GetFunction("ts_graph_set_rows_heads_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { _setRowsHeads = IntPtr.Zero; }
             _lightningIndexer = module.GetFunction("ts_graph_lightning_indexer_f32");
             _topkMask = module.GetFunction("ts_graph_topk_mask_f32");
             _maskCells = module.GetFunction("ts_graph_mask_cells");
@@ -112,6 +161,17 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuCtxGetDevice(out int device).ThrowOnError();
                 CudaDriverApi.cuDeviceGetAttribute(out _multiprocessors, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, device).ThrowOnError();
                 TakesQ4kMma = true;
+                // A drafter's Q6_K products on the int8 tensor cores (an image built before them has no such entries).
+                try
+                {
+                    for (int i = 0; i < 4; i++)
+                        _gemmQ6k[i] = module.GetFunction($"ts_graph_gemm_q6k_{1 << i}");
+                    TakesQ6kMma = true;
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500)
+                {
+                    TakesQ6kMma = false;
+                }
                 // A QSA region's kernels: its prompt attention runs on the tensor cores, and its decode rows on the flash
                 // kernels (sm_80 as well).
                 _qsaScores = module.GetFunction("ts_graph_qsa_scores_f32");
@@ -123,6 +183,15 @@ namespace TensorSharp.Cuda
                 _ringAttn128 = module.GetFunction("ts_graph_ring_attn_f16_d128");
                 _ringAttnCombine = module.GetFunction("ts_graph_ring_attn_combine_f32");
                 TakesRingAttention = true;
+                try
+                {
+                    _ringAttnLanes64 = module.GetFunction("ts_graph_ring_attn_lanes_f16_d64");
+                    _ringAttnLanes128 = module.GetFunction("ts_graph_ring_attn_lanes_f16_d128");
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500)
+                {
+                    _ringAttnLanes64 = _ringAttnLanes128 = IntPtr.Zero;
+                }
             }
         }
 
@@ -173,6 +242,46 @@ namespace TensorSharp.Cuda
                 &freqScale, &extFactor, &attnFactor, &betaFast, &betaSlow };
             CudaDriverApi.cuLaunchKernel(_attnPrep, (uint)((units + AttentionPrepWarps - 1) / AttentionPrepWarps), 1, 1, AttentionPrepWarps * 32, 1, 1,
                 (uint)(AttentionPrepWarps * d * sizeof(float)), stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Sequences <see cref="LaunchAttentionPrepSequences"/> takes in one launch (TS_GRAPH_ATTN_PREP_SEQS).</summary>
+        public const int AttentionPrepSequences = 16;
+
+        /// <summary>Whether this image runs <see cref="LaunchAttentionPrepSequences"/>.</summary>
+        public bool TakesAttentionPrepSequences => _attnPrepSeqs != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_attn_prep_seqs_f32, byte for byte (struct ts_graph_attn_prep_seqs): each sequence's K
+        /// and V caches (head-first; a q8_0 cache's block bytes), its rows' KV indices and its caches' cells.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct AttentionPrepSequencesArgs
+        {
+            public fixed long KCache[AttentionPrepSequences];
+            public fixed long VCache[AttentionPrepSequences];
+            public fixed long Cells[AttentionPrepSequences];
+            public fixed int Cap[AttentionPrepSequences];
+        }
+
+        /// <summary><see cref="LaunchAttentionPrep"/> over several sequences' rows (<paramref name="rowsPerSequence"/> each, every
+        /// sequence's keys and values into its own caches at its own cells, per <paramref name="args"/>), the queries as rows of
+        /// heads: every value and cache row is that kernel's.</summary>
+        public void LaunchAttentionPrepSequences(AttentionPrepSequencesArgs args, int rowsPerSequence, IntPtr q, long qRow, long qHead, IntPtr k,
+            long kRow, long kHead, IntPtr v, long vRow, long vHead, IntPtr qNorm, IntPtr kNorm, IntPtr output, long outRow, long outHead,
+            int cacheFormat, IntPtr positions, int rows, int heads, int kvHeads, int d, int dv, float eps, int ropeDim, int mode, int ctx,
+            float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow, IntPtr stream)
+        {
+            if (cacheFormat is not (CacheF32 or CacheF16 or CacheQ8_0) || (cacheFormat == CacheQ8_0 && (d % 32 != 0 || dv % 32 != 0)))
+                throw new ArgumentOutOfRangeException(nameof(cacheFormat), $"attention prep into cache format {cacheFormat} of {d} / {dv} values a row");
+            long units = (long)rows * (heads + 2L * kvHeads);
+            if (units < 1 || rowsPerSequence < 1 || rows % rowsPerSequence != 0 || rows / rowsPerSequence > AttentionPrepSequences
+                || (units + AttentionPrepWarps - 1) / AttentionPrepWarps > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(rows), $"attention prep of {rows} rows ({rowsPerSequence} a sequence)");
+            int half = cacheFormat;
+            AttentionPrepSequencesArgs* p = &args;
+            void** argv = stackalloc void*[] { p, &rowsPerSequence, &q, &qRow, &qHead, &k, &kRow, &kHead, &v, &vRow, &vHead, &qNorm, &kNorm, &output,
+                &outRow, &outHead, &half, &positions, &rows, &heads, &kvHeads, &d, &dv, &eps, &ropeDim, &mode, &ctx, &freqBase, &freqScale,
+                &extFactor, &attnFactor, &betaFast, &betaSlow };
+            CudaDriverApi.cuLaunchKernel(_attnPrepSeqs, (uint)((units + AttentionPrepWarps - 1) / AttentionPrepWarps), 1, 1, AttentionPrepWarps * 32, 1, 1,
+                (uint)(AttentionPrepWarps * d * sizeof(float)), stream, (IntPtr)argv, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Whether this image runs a QSA region's kernels (<see cref="LaunchQsaScores"/>, <see cref="LaunchQsaSelect"/>
@@ -252,6 +361,43 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuLaunchKernel(_ringAttnCombine, (uint)(rows * heads), 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)combine, IntPtr.Zero).ThrowOnError();
         }
 
+        /// <summary>Lanes <see cref="LaunchRingAttentionLanes"/> takes in one launch (TS_GRAPH_RING_LANES).</summary>
+        public const int RingAttentionLanesMax = 16;
+
+        /// <summary>Whether this image runs <see cref="LaunchRingAttentionLanes"/>.</summary>
+        public bool TakesRingAttentionLanes => _ringAttnLanes128 != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_ring_attn_lanes_f16_d*, byte for byte (struct ts_graph_ring_lanes): each lane's queries,
+        /// ring K and V, and mask.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct RingAttentionLanesArgs
+        {
+            public fixed long Q[RingAttentionLanesMax];
+            public fixed long K[RingAttentionLanesMax];
+            public fixed long V[RingAttentionLanesMax];
+            public fixed long Mask[RingAttentionLanesMax];
+        }
+
+        /// <summary><see cref="LaunchRingAttention"/> for <paramref name="lanes"/> lanes of the same shape in one launch (and one
+        /// combine): lane j's queries, ring and mask in <paramref name="args"/>, its partials and rows after lane j - 1's in
+        /// <paramref name="partial"/> (<see cref="RingAttentionPartialFloats"/> floats a lane) and <paramref name="output"/>
+        /// ([lanes * rows][heads][d]). Each lane's values are its own launch's.</summary>
+        public void LaunchRingAttentionLanes(RingAttentionLanesArgs args, int lanes, long qRow, long qHead, int keys, bool maskHalf, long maskRow,
+            int rows, int heads, int kvHeads, int d, float scale, IntPtr partial, IntPtr output, IntPtr stream)
+        {
+            if (!TakesRingAttentionLanes || !RingAttentionTakes(d) || lanes < 1 || lanes > RingAttentionLanesMax || kvHeads < 1
+                || heads % kvHeads != 0 || rows < 1 || keys < 1)
+                throw new ArgumentOutOfRangeException(nameof(lanes), $"{lanes} lanes' ring attention over {keys} keys of {rows} rows, {heads} / {kvHeads} heads of {d}");
+            int chunk = RingAttentionChunk, splits = (keys + chunk - 1) / chunk, half = maskHalf ? 1 : 0;
+            int tiles = (rows * (heads / kvHeads) + 63) / 64;
+            RingAttentionLanesArgs* p = &args;
+            void** a = stackalloc void*[] { p, &qRow, &qHead, &keys, &half, &maskRow, &rows, &heads, &kvHeads, &scale, &chunk, &splits, &tiles, &partial };
+            CudaDriverApi.cuLaunchKernel(d == 64 ? _ringAttnLanes64 : _ringAttnLanes128, (uint)splits, (uint)kvHeads, (uint)(lanes * tiles), 128, 1, 1, 0,
+                stream, (IntPtr)a, IntPtr.Zero).ThrowOnError();
+            void** combine = stackalloc void*[] { &partial, &splits, &d, &output };
+            CudaDriverApi.cuLaunchKernel(_ringAttnCombine, (uint)(lanes * rows * heads), 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)combine, IntPtr.Zero).ThrowOnError();
+        }
+
         /// <summary>Weight rows of a tile of the tiled Q6_K head layout, and rows of activations one product takes at most.</summary>
         public const int Q6kTileRows = 64, Q6kTiledMaxRows = 64;
 
@@ -264,15 +410,24 @@ namespace TensorSharp.Cuda
         /// <summary>Activation rows <see cref="LaunchGemmQ4k"/> takes in one launch.</summary>
         public const int Q4kMmaMaxRows = 64;
 
+        /// <summary>Whether this image runs <see cref="LaunchGemmQ6k"/> (its sm_80 bodies are in it).</summary>
+        public bool TakesQ6kMma { get; }
+
+        /// <summary>Blocks a multiprocessor a drafter product's K splits aim for (<see cref="LaunchGemmQ4k"/>, <see cref="LaunchGemmQ6k"/>):
+        /// a Qwen3.8-27B DFlash2 drafter's gate and up (272 row tiles each) had run unsplit at 3.3 blocks a multiprocessor of an RTX
+        /// PRO 4500, 175 us each, where the direct engine's fused gate|up (544 tiles) took 283.</summary>
+        internal const int DrafterProductWaves = 4;
+
         /// <summary>y [n][outDim] = xq [n] W^T for a Q4_K weight (rows <paramref name="rowBytes"/> apart, k a multiple of 256)
         /// on the int8 tensor cores, the direct engines' drafter product: <paramref name="xq"/> int8 [n][k] and
-        /// <paramref name="xd"/> [n][k / 32] (the split q8_1 rows). K splits until the row tiles fill the device twice over (at
-        /// least four superblocks a split), their shares added atomically: the last bits vary from run to run.</summary>
+        /// <paramref name="xd"/> [n][k / 32] (the split q8_1 rows). K splits until the row tiles fill the device
+        /// <see cref="DrafterProductWaves"/> times over (at least four superblocks a split), their shares added atomically: the
+        /// last bits vary from run to run.</summary>
         public void LaunchGemmQ4k(IntPtr w, long rowBytes, int outDim, int k, IntPtr xq, IntPtr xd, int n, IntPtr y, IntPtr stream)
         {
             uint tiles = (uint)((outDim + 63) / 64);
             int superblocks = k / 256, splits = 1;
-            while (tiles * splits < 2 * _multiprocessors && splits * 4 <= superblocks)
+            while (tiles * splits < DrafterProductWaves * _multiprocessors && splits * 4 <= superblocks)
                 splits *= 2;
             if (splits > 1)
                 CudaDriverApi.cuMemsetD32Async(y, 0, new UIntPtr((ulong)n * (ulong)outDim), stream).ThrowOnError();
@@ -287,6 +442,30 @@ namespace TensorSharp.Cuda
                 a5 = xd + (nint)((long)r0 * (k / 32) * 4);
                 a7 = y + (nint)((long)r0 * outDim * 4);
                 CudaDriverApi.cuLaunchKernel(_gemmQ4k[i], tiles, (uint)splits, 1, 128, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+            }
+        }
+
+        /// <summary><see cref="LaunchGemmQ4k"/> for a Q6_K weight (rows <paramref name="rowBytes"/> apart, k a multiple of 256): the
+        /// direct engines' drafter product for its Q6_K matrices, with the same K splits and the same rows a launch.</summary>
+        public void LaunchGemmQ6k(IntPtr w, long rowBytes, int outDim, int k, IntPtr xq, IntPtr xd, int n, IntPtr y, IntPtr stream)
+        {
+            uint tiles = (uint)((outDim + 63) / 64);
+            int superblocks = k / 256, splits = 1;
+            while (tiles * splits < DrafterProductWaves * _multiprocessors && splits * 4 <= superblocks)
+                splits *= 2;
+            if (splits > 1)
+                CudaDriverApi.cuMemsetD32Async(y, 0, new UIntPtr((ulong)n * (ulong)outDim), stream).ThrowOnError();
+            IntPtr a4 = IntPtr.Zero, a5 = IntPtr.Zero, a7 = IntPtr.Zero;
+            int rows = 0;
+            void** args = stackalloc void*[] { &w, &rowBytes, &outDim, &k, &a4, &a5, &rows, &a7 };
+            for (int r0 = 0; r0 < n; r0 += Q4kMmaMaxRows)
+            {
+                rows = Math.Min(Q4kMmaMaxRows, n - r0);
+                int i = rows <= 8 ? 0 : rows <= 16 ? 1 : rows <= 32 ? 2 : 3;
+                a4 = xq + (nint)((long)r0 * k);
+                a5 = xd + (nint)((long)r0 * (k / 32) * 4);
+                a7 = y + (nint)((long)r0 * outDim * 4);
+                CudaDriverApi.cuLaunchKernel(_gemmQ6k[i], tiles, (uint)splits, 1, 128, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
             }
         }
 
@@ -332,9 +511,25 @@ namespace TensorSharp.Cuda
             int kda = perKeyDecay ? 1 : 0;
             void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda,
                 &saved, &inputs, &inputRows };
+            if (TakesGdn8For(s))
+            {
+                CudaDriverApi.cuLaunchKernel(_gdn8, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
+                    (IntPtr)args, IntPtr.Zero).ThrowOnError();
+                return;
+            }
             CudaDriverApi.cuLaunchKernel(_gatedDeltaNet, (uint)(sequences * heads), (uint)((s + 3) / 4), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
+
+        /// <summary>Whether every gated delta rule this image runs (<see cref="LaunchGatedDeltaNet"/>, <see cref="LaunchGatedDeltaNetRows4"/>,
+        /// <see cref="LaunchGatedDeltaNetScanSequences"/>, <see cref="LaunchGdnCommit"/>) takes the eight-lane row sums
+        /// (ts_graph_gdn8_*, the direct engine's layout); otherwise the 32-lane ones. One arithmetic for all of them, so a verify
+        /// window's rows and a commit's re-step are the decode rows' bits.</summary>
+        public bool TakesGdn8 => _gdn8 != IntPtr.Zero;
+
+        /// <summary>Whether a head width of <paramref name="s"/> takes the eight-lane sums (64 or 128: S / 8 keys a lane stay in
+        /// registers); every other width keeps the 32-lane ones, in every kernel alike.</summary>
+        public bool TakesGdn8For(int s) => TakesGdn8 && (s == 64 || s == 128);
 
         /// <summary><see cref="LaunchGatedDeltaNet"/> with four state rows a warp (a prompt chunk reads each token's q and k
         /// once for four rows); the same results. With <paramref name="saved"/> ([heads, s, s], one sequence) the state before
@@ -348,17 +543,19 @@ namespace TensorSharp.Cuda
             IntPtr inputs = default, int inputRows = 0)
         {
             int kda = perKeyDecay ? 1 : 0;
+            bool eight = TakesGdn8For(s);
             if (slots == 0 && saved == IntPtr.Zero)
             {
                 void** sargs = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences,
                     &inputs, &inputRows };
-                CudaDriverApi.cuLaunchKernel(perKeyDecay ? _gatedDeltaNetScan4Kda : _gatedDeltaNetScan4, (uint)(sequences * heads),
+                IntPtr scan = eight ? (perKeyDecay ? _gdn8ScanKda : _gdn8Scan) : perKeyDecay ? _gatedDeltaNetScan4Kda : _gatedDeltaNetScan4;
+                CudaDriverApi.cuLaunchKernel(scan, (uint)(sequences * heads),
                     (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream, (IntPtr)sargs, IntPtr.Zero).ThrowOnError();
                 return;
             }
             void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda,
                 &saved, &inputs, &inputRows };
-            CudaDriverApi.cuLaunchKernel(_gatedDeltaNetRows4, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
+            CudaDriverApi.cuLaunchKernel(eight ? _gdn8 : _gatedDeltaNetRows4, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
@@ -395,8 +592,44 @@ namespace TensorSharp.Cuda
             // The driver copies the argument's bytes when the launch is made (or recorded).
             GdnCommitArgs* p = &args;
             void** a = stackalloc void*[] { p };
-            CudaDriverApi.cuLaunchKernel(_gdnCommit, (uint)args.Heads, (uint)((args.S + 15) / 16), (uint)args.Layers, 128, 1, 1, 0, stream,
-                (IntPtr)a, IntPtr.Zero).ThrowOnError();
+            CudaDriverApi.cuLaunchKernel(TakesGdn8For(args.S) ? _gdn8Commit : _gdnCommit, (uint)args.Heads, (uint)((args.S + 15) / 16), (uint)args.Layers, 128,
+                1, 1, 0, stream, (IntPtr)a, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Sequences <see cref="LaunchGatedDeltaNetScanSequences"/> takes in one launch (TS_GRAPH_GDN_SEQS).</summary>
+        public const int GdnScanSequences = 16;
+
+        /// <summary>Whether this image runs <see cref="LaunchGatedDeltaNetScanSequences"/>.</summary>
+        public bool TakesGdnScanSequences => _gdnScanSeqs != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_gated_delta_net_scan4_seqs_f32, byte for byte (struct ts_graph_gdn_seqs): each
+        /// sequence's q, k, v, gates, betas, state, output and saved inputs.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct GdnScanSequencesArgs
+        {
+            public fixed long Q[GdnScanSequences];
+            public fixed long K[GdnScanSequences];
+            public fixed long V[GdnScanSequences];
+            public fixed long G[GdnScanSequences];
+            public fixed long Beta[GdnScanSequences];
+            public fixed long State[GdnScanSequences];
+            public fixed long Out[GdnScanSequences];
+            public fixed long Save[GdnScanSequences];
+        }
+
+        /// <summary><see cref="LaunchGatedDeltaNetRows4"/>'s verify-window scan (no slot, no saved state, the rows' inputs saved)
+        /// of <paramref name="sequences"/> sequences in one launch, each over its own buffers of <paramref name="tokens"/>
+        /// tokens (its pointers in <paramref name="args"/>): each sequence's values are its own launch's.</summary>
+        public void LaunchGatedDeltaNetScanSequences(GdnScanSequencesArgs args, int sequences, int s, int heads, int keyHeads, int tokens,
+            bool perKeyDecay, int inputRows, IntPtr stream)
+        {
+            if (sequences < 1 || sequences > GdnScanSequences || s % 32 != 0 || s > 256)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of S {s}");
+            GdnScanSequencesArgs* p = &args;
+            void** a = stackalloc void*[] { p, &s, &heads, &keyHeads, &tokens, &inputRows };
+            IntPtr scan = TakesGdn8For(s) ? (perKeyDecay ? _gdn8ScanSeqsKda : _gdn8ScanSeqs) : perKeyDecay ? _gdnScanSeqsKda : _gdnScanSeqs;
+            CudaDriverApi.cuLaunchKernel(scan, (uint)heads, (uint)((s + 15) / 16), (uint)sequences, 128, 1, 1, 0,
+                stream, (IntPtr)a, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Floats of a recurrence's saved inputs for <paramref name="rows"/> tokens: q and k [rows, keyHeads, s], v
@@ -519,6 +752,19 @@ namespace TensorSharp.Cuda
             int h = half ? 1 : 0;
             void** args = stackalloc void*[] { &src, &ids, &dst, &rowLen, &dstPitch, &dstRows, &h };
             CudaDriverApi.cuLaunchKernel(_setRows, (uint)count, 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Whether this image runs <see cref="LaunchSetRowsHeads"/>.</summary>
+        public bool TakesSetRowsHeads => _setRowsHeads != IntPtr.Zero;
+
+        /// <summary><see cref="LaunchSetRows"/> into each of <paramref name="heads"/> heads' blocks (<paramref name="dstHead"/> elements
+        /// apart; src heads <paramref name="srcHead"/> floats apart) in one launch: the same rows into each head's block.</summary>
+        public void LaunchSetRowsHeads(IntPtr src, long srcHead, IntPtr ids, IntPtr dst, long dstHead, int heads, int count, int rowLen,
+            long dstPitch, int dstRows, bool half, IntPtr stream)
+        {
+            int h = half ? 1 : 0;
+            void** args = stackalloc void*[] { &src, &srcHead, &ids, &dst, &dstHead, &rowLen, &dstPitch, &dstRows, &h };
+            CudaDriverApi.cuLaunchKernel(_setRowsHeads, (uint)count, (uint)heads, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Most q floats (heads * d) a row of <see cref="LaunchLightningIndexer"/> holds; d &lt;= 256.</summary>
@@ -871,6 +1117,146 @@ namespace TensorSharp.Cuda
             int gate = sigmoidGate ? 1 : 0;
             void** args = stackalloc void*[] { &y, &z, &w, &output, &d, &eps, &heads, &zPitch, &gate, &outputQ81 };
             CudaDriverApi.cuLaunchKernel(_gatedRmsNorm, (uint)rows, 1, 1, (uint)d, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Sequences <see cref="LaunchDeltaNetPrepSequences"/> and <see cref="LaunchGatedRmsNormSequences"/> take in one
+        /// launch (TS_GRAPH_PREP_SEQS).</summary>
+        public const int PrepSequences = 16;
+
+        /// <summary>Whether this image runs <see cref="LaunchDeltaNetPrepSequences"/> and <see cref="LaunchGatedRmsNormSequences"/>.</summary>
+        public bool TakesPrepSequences => _deltaNetPrepSeqs != IntPtr.Zero && _gatedRmsNormSeqs != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_deltanet_prep_seqs_f32, byte for byte (struct ts_graph_prep_seqs): each sequence's
+        /// conv window, qkv, alpha and beta rows, and where its conv input goes.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct PrepSequencesArgs
+        {
+            public fixed long Window[PrepSequences];
+            public fixed long Qkv[PrepSequences];
+            public fixed long Alpha[PrepSequences];
+            public fixed long Beta[PrepSequences];
+            public fixed long ConvIn[PrepSequences];
+        }
+
+        /// <summary><see cref="LaunchDeltaNetPrep(IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, IntPtr,
+        /// IntPtr, IntPtr, IntPtr, int, int, int, int, int, int, int, float, long, long, IntPtr)"/>'s per-row kernel over
+        /// <paramref name="sequences"/> sequences of <paramref name="rows"/> rows each in one launch (their pointers in
+        /// <paramref name="args"/>; their q, k, v, g and beta rows one sequence after another in the shared outputs): each
+        /// sequence's values are its own launch's.</summary>
+        public void LaunchDeltaNetPrepSequences(PrepSequencesArgs args, int sequences, IntPtr convW, IntPtr dt, IntPtr a,
+            IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr betaOut, int channels, int convRows, int width, int d, int kHeads, int vHeads,
+            int rows, float eps, long qkvPitch, long alphaBetaPitch, IntPtr stream)
+        {
+            if (sequences < 1 || sequences > PrepSequences || d % 32 != 0 || d > 1024)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of head width {d}");
+            PrepSequencesArgs* p = &args;
+            void** argv = stackalloc void*[]
+            {
+                p, &convW, &dt, &a, &q, &k, &v, &g, &betaOut, &channels, &convRows, &width, &d, &kHeads, &vHeads, &rows, &eps,
+                &qkvPitch, &alphaBetaPitch,
+            };
+            CudaDriverApi.cuLaunchKernel(_deltaNetPrepSeqs, (uint)(2 * kHeads + vHeads), (uint)rows, (uint)sequences, (uint)d, 1, 1, 0,
+                stream, (IntPtr)argv, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Entries <see cref="LaunchCacheRowsSequences"/> takes in one launch (TS_GRAPH_CACHE_ROWS_SEQS).</summary>
+        public const int CacheRowsSequences = 32;
+
+        /// <summary>Whether this image runs <see cref="LaunchCacheRowsSequences"/>.</summary>
+        public bool TakesCacheRowsSequences => _cacheRowsSeqs != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_cache_rows_seqs_f16, byte for byte (struct ts_graph_cache_rows_seqs): each entry's
+        /// rows, cache, dynamic block (or 0), head and row strides (floats), first row and cells.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct CacheRowsSequencesArgs
+        {
+            public fixed long Src[CacheRowsSequences];
+            public fixed long Cache[CacheRowsSequences];
+            public fixed long Dyn[CacheRowsSequences];
+            public fixed long HeadStride[CacheRowsSequences];
+            public fixed long RowStride[CacheRowsSequences];
+            public fixed int First[CacheRowsSequences];
+            public fixed int Cells[CacheRowsSequences];
+        }
+
+        /// <summary>ts_copy_head_first_to_cache_f16 for <paramref name="entries"/> entries in one launch (several sequences' K and V
+        /// rows into their F16 caches, each read where it lies): every cache row is that kernel's bits.</summary>
+        public void LaunchCacheRowsSequences(CacheRowsSequencesArgs args, int entries, int heads, int count, int headDim, bool circular,
+            IntPtr stream)
+        {
+            if (entries < 1 || entries > CacheRowsSequences)
+                throw new ArgumentOutOfRangeException(nameof(entries), $"{entries} cache writes");
+            int wrap = circular ? 1 : 0;
+            CacheRowsSequencesArgs* p = &args;
+            void** argv = stackalloc void*[] { p, &heads, &count, &headDim, &wrap };
+            long total = (long)heads * count * headDim;
+            CudaDriverApi.cuLaunchKernel(_cacheRowsSeqs, (uint)((total + 255) / 256), (uint)entries, 1, 256, 1, 1, 0, stream, (IntPtr)argv,
+                IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Rows and conv taps <see cref="LaunchDeltaNetPrepSequences2"/> takes (TS_GRAPH_PREP2_ROWS, TS_GRAPH_PREP2_WIDTH).</summary>
+        public const int PrepSequences2Rows = 16, PrepSequences2Width = 8;
+
+        /// <summary>Whether this image runs <see cref="LaunchDeltaNetPrepSequences2"/>.</summary>
+        public bool TakesPrepSequences2 => _deltaNetPrepSeqs2 != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_deltanet_prep_seqs2_f32, byte for byte (struct ts_graph_prep2_seqs): each sequence's
+        /// conv window, qkv, alpha and beta rows, its conv history, and where its q, k, v, g and beta go.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct PrepSequences2Args
+        {
+            public fixed long Window[PrepSequences];
+            public fixed long Qkv[PrepSequences];
+            public fixed long Alpha[PrepSequences];
+            public fixed long Beta[PrepSequences];
+            public fixed long ConvIn[PrepSequences];
+            public fixed long Q[PrepSequences];
+            public fixed long K[PrepSequences];
+            public fixed long V[PrepSequences];
+            public fixed long G[PrepSequences];
+            public fixed long BetaOut[PrepSequences];
+        }
+
+        /// <summary><see cref="LaunchDeltaNetPrepSequences"/>' values (ts_graph_deltanet_prep_f32's), a block a head and sequence
+        /// over all its rows: the conv history written in one coalesced pass, the outputs at each sequence's own pointers.</summary>
+        public void LaunchDeltaNetPrepSequences2(PrepSequences2Args args, int sequences, IntPtr convW, IntPtr dt, IntPtr a,
+            int channels, int convRows, int width, int d, int kHeads, int vHeads, int rows, float eps, long qkvPitch, long alphaBetaPitch,
+            IntPtr stream)
+        {
+            if (sequences < 1 || sequences > PrepSequences || d % 32 != 0 || d > 256 || rows < 1 || rows > PrepSequences2Rows
+                || width > PrepSequences2Width || convRows != width - 1)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of {rows} rows, head width {d}, {width} taps");
+            PrepSequences2Args* p = &args;
+            void** argv = stackalloc void*[]
+            {
+                p, &convW, &dt, &a, &channels, &convRows, &width, &d, &kHeads, &vHeads, &rows, &eps, &qkvPitch, &alphaBetaPitch,
+            };
+            uint smem = (uint)((long)d * (convRows + rows) * sizeof(float));
+            CudaDriverApi.cuLaunchKernel(_deltaNetPrepSeqs2, (uint)(2 * kHeads + vHeads), (uint)sequences, 1, (uint)d, 1, 1, smem,
+                stream, (IntPtr)argv, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>The argument of ts_graph_gated_rms_norm_seqs_f32 (struct ts_graph_gated_norm_seqs): each sequence's y and z.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct GatedNormSequencesArgs
+        {
+            public fixed long Y[PrepSequences];
+            public fixed long Z[PrepSequences];
+        }
+
+        /// <summary><see cref="LaunchGatedRmsNorm"/> (without the q8_1 copy) over <paramref name="sequences"/> sequences of
+        /// <paramref name="rowsPerSequence"/> rows each in one launch, their outputs one after another in
+        /// <paramref name="output"/>: each row's values are its own launch's.</summary>
+        public void LaunchGatedRmsNormSequences(GatedNormSequencesArgs args, int sequences, IntPtr w, IntPtr output, int rowsPerSequence,
+            int d, float eps, int heads, long zPitch, bool sigmoidGate, IntPtr stream)
+        {
+            if (sequences < 1 || sequences > PrepSequences || d % 32 != 0 || d > 1024)
+                throw new ArgumentOutOfRangeException(nameof(sequences), $"{sequences} sequences of width {d}");
+            int gate = sigmoidGate ? 1 : 0;
+            GatedNormSequencesArgs* p = &args;
+            void** argv = stackalloc void*[] { p, &w, &output, &d, &eps, &heads, &zPitch, &gate, &rowsPerSequence };
+            CudaDriverApi.cuLaunchKernel(_gatedRmsNormSeqs, (uint)rowsPerSequence, (uint)sequences, 1, (uint)d, 1, 1, 0, stream,
+                (IntPtr)argv, IntPtr.Zero).ThrowOnError();
         }
     }
 }

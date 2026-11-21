@@ -4,9 +4,8 @@
 // The DFlash draft with its block written into the ring at the block's own slots (the default) against the draft that
 // concatenates the ring with the block in every layer (TS_DFLASH_RING_BLOCK=0): the same drafts, confidences and
 // selector lattices over a wrapping ring, step after step (replayed graphs included), and the ring rows a later window
-// can read left exactly as the injects wrote them. On CUDA the batched draft (two lanes, each on its own ring) is checked
-// against the single-lane drafts too. On Metal the fused convolution (TS_DFLASH_METAL_FUSE: row-offset views) is
-// checked bit for bit against the per-tap chains.
+// can read left exactly as the injects wrote them. On Metal the fused convolution (TS_DFLASH_METAL_FUSE: row-offset
+// views) is checked bit for bit against the per-tap chains.
 //
 // The selector keeps every token (top-k = the vocabulary) and its lattice is compared keyed by token ids: the drafts
 // differ by float rounding, which can reorder near-tied candidates (on CUDA's attention, ~6e-5) and so permute the
@@ -66,11 +65,6 @@ int TSGgml_DFlashInjectScaled(
     const float* scales, int scale_count
 int TSGgml_DFlashDraftBlockScaled(
     const int* block_ids, int block_len, const int* positions,
-    int num_layers, int hidden_size, int head_dim, int num_heads, int num_kv_heads, int ring_rows,
-    float eps, float rope_base, float rope_freq_scale, float kq_scale,
-    const int* ring_slot_pos, int sliding_window, TS_DF_DRAFT_TAIL);
-int TSGgml_DFlashDraftBlockBatched(
-    int n_lanes, const int* block_ids, int block_len, const int* positions,
     int num_layers, int hidden_size, int head_dim, int num_heads, int num_kv_heads, int ring_rows,
     float eps, float rope_base, float rope_freq_scale, float kq_scale,
     const int* ring_slot_pos, int sliding_window, TS_DF_DRAFT_TAIL);
@@ -271,65 +265,12 @@ float max_rel(const std::vector<float>& a, const std::vector<float>& b) {
     return r;
 }
 
-// CUDA: two lanes drafted at once (each on its own ring, at its own frontier) against their single-lane drafts.
 // The relative difference the two key orders may show. ggml-cuda runs F32 matmuls (every projection of this test's
 // F32 weights, and the attention's F32 fallback at these shapes) on TF32 tensor cores (CUBLAS_TF32_TENSOR_OP_MATH,
 // a 10-bit mantissa), where two key orders differ by ~4e-3 after two layers and the selector; CPU and Metal stay
 // within ~4e-5.
 float tolerance(int backend) { return backend == 3 ? 2e-2f : 1e-3f; }
 
-bool batched(Weights& w, bool selector, int backend) {
-    setenv("TS_DFLASH_RING_BLOCK", "1", 1);
-    Lane a(11), b(29);
-    bool ok = true;
-    for (int p = 0; ok && p < PROMPT; p += B) ok = inject(w, a, p, std::min(B, PROMPT - p));
-    for (int p = 0; ok && p < PROMPT + 9; p += B) ok = inject(w, b, p, std::min(B, PROMPT + 9 - p));
-    float worst = 0;
-    bool same = true;
-    for (int step = 0; ok && step < 6; ++step) {
-        std::vector<int> ta = block_tokens(a, step), tb = block_tokens(b, step), ids_a, ids_b;
-        std::vector<float> va, vb;
-        ok = check(draft_one(w, a, ta, selector, ids_a, va), "draft lane a") && check(draft_one(w, b, tb, selector, ids_b, vb), "draft lane b");
-        std::vector<int> tokens = ta, positions(2 * B), maps = a.slot_map(), mb = b.slot_map();
-        tokens.insert(tokens.end(), tb.begin(), tb.end());
-        maps.insert(maps.end(), mb.begin(), mb.end());
-        for (int i = 0; i < B; ++i) { positions[i] = a.filled + i; positions[B + i] = b.filled + i; }
-        std::vector<void*> rk, rv;
-        for (Lane* l : {&a, &b}) { rk.insert(rk.end(), l->ringk.begin(), l->ringk.end()); rv.insert(rv.end(), l->ringv.begin(), l->ringv.end()); }
-        std::vector<int> id(2 * B), cand(2 * TOPK * (B - 1));
-        std::vector<float> conf(2 * B), scores(2 * (TOPK + TOPK * TOPK * (B - 2)));
-        ok = ok && check(TSGgml_DFlashDraftBlockBatched(2, tokens.data(), B, positions.data(), N, H, HD, NH, NKV, RING,
-            1e-6f, 10000.f, 1.f, 1.f / std::sqrt(float(HD)), maps.data(), SW, w.norms.data(),
-            ARGS(w.q), ARGS(w.k), ARGS(w.v), w.hnorms.data(), w.hnorms.data(), ARGS(w.o), w.norms.data(),
-            ARGS(w.gate), ARGS(w.up), ARGS(w.down), rk.data(), rv.data(), GGML_TYPE_F32, w.norm.data(),
-            ONE(w.emb), ONE(w.head), VOCAB, id.data(), conf.data(),
-            selector ? TAPS : 0, GROUP, H / GROUP, w.bases.data(), ARGS(w.ac), w.bases.data(), ARGS(w.fconv),
-            selector ? RANK : 0, TOPK, .8f, 3.f, ONE(w.sh), ONE(w.sp), ONE(w.ss), scores.data(), cand.data(), nullptr, 0),
-            "batched draft");
-        if (!ok) break;
-        std::vector<int> ids = selector ? cand : id, single = ids_a;
-        single.insert(single.end(), ids_b.begin(), ids_b.end());
-        std::vector<float> vals = selector ? scores : conf, sv = va;
-        if (selector) {
-            // each lane's block of the batched outputs, keyed by token ids as the single drafts are
-            const std::size_t nc = std::size_t(TOPK) * (B - 1), ns = TOPK + std::size_t(TOPK) * TOPK * (B - 2);
-            std::vector<int> c0(ids.begin(), ids.begin() + nc), c1(ids.begin() + nc, ids.end());
-            std::vector<float> s0(vals.begin(), vals.begin() + ns), s1(vals.begin() + ns, vals.end());
-            canonical(c0, s0);
-            canonical(c1, s1);
-            ids = c0; ids.insert(ids.end(), c1.begin(), c1.end());
-            vals = s0; vals.insert(vals.end(), s1.begin(), s1.end());
-        }
-        sv.insert(sv.end(), vb.begin(), vb.end());
-        same = same && ids == single;
-        worst = std::max(worst, max_rel(vals, sv));
-        ok = inject(w, a, a.filled, accepted(step)) && inject(w, b, b.filled, accepted(step + 1));
-    }
-    TSGgml_DFlashResetCaches();
-    TSGgml_ClearHostBufferCache();
-    std::printf("DFlash%d batched (2 lanes) vs single: max relative difference %.3g, same picks %d\n", selector ? 2 : 1, worst, int(same));
-    return ok && same && worst < tolerance(backend);
-}
 }
 
 int main(int argc, char** argv) {
@@ -352,7 +293,6 @@ int main(int argc, char** argv) {
         std::printf("DFlash%d: ring slots vs concatenation over %d steps: max relative difference %.3g, same picks %d, "
                     "live ring rows identical %d\n", selector ? 2 : 1, STEPS, worst, int(same_picks), int(same_rows));
         if (!(worst < tolerance(backend)) || !same_picks || !same_rows) return 1;
-        if (backend == 3 && !batched(w, selector, backend)) return 1;
         if (backend == 1) {
             std::vector<Step> chains;
             if (!run(w, true, selector, 3, chains, false)) return 1;

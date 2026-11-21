@@ -44,7 +44,7 @@
 // probabilities. Off by default (CudaGraphExecutor.PromptAttention8Enabled).
 // ---------------------------------------------------------------------------
 
-#define TS_FLASH_PREFILL_VERSION 13
+#define TS_FLASH_PREFILL_VERSION 14
 
 /// Writes the module version to out[0] and the architecture this image was compiled for
 /// (__CUDA_ARCH__ of the code the driver selected: the SASS of a fatbin, or the PTX target
@@ -1693,4 +1693,86 @@ extern "C" __global__ void __launch_bounds__(128) ts_flash_prefill_mma_rate(int 
 #else
     __trap();
 #endif
+}
+
+// Several sequences' verify windows in one launch (GraphFusion.SequenceAttentions: a batched verify's sequences, each over its
+// own cache): sequence z (grid z) is ts_flash_decode_window_{f16,q8}_d<hd> over its own operands (by value), with its own
+// splits, so every value of a sequence is its own launch's. The grid's x is the widest sequence's (tiles * its splits); a
+// sequence's blocks past its own leave first. Four Qwen3.8-27B sequences' 8-row windows had taken a launch each, two thirds of
+// the device idle in each (RTX PRO 4500). Launch: grid (tiles * the most splits, nKv, sequences), block 256, the dynamic shared
+// memory of the one-sequence kernel.
+#define TS_FP_WINDOW_SEQS 16
+
+struct ts_fp_window_seqs
+{
+    const float* q[TS_FP_WINDOW_SEQS];
+    const void* kc[TS_FP_WINDOW_SEQS];
+    const void* vc[TS_FP_WINDOW_SEQS];
+    float* partial[TS_FP_WINDOW_SEQS];
+    float* out[TS_FP_WINDOW_SEQS];
+    const int* dyn[TS_FP_WINDOW_SEQS];
+    int cap[TS_FP_WINDOW_SEQS];
+    int len[TS_FP_WINDOW_SEQS];
+    int floor[TS_FP_WINDOW_SEQS];
+    int splits[TS_FP_WINDOW_SEQS];
+    int windowKeys[TS_FP_WINDOW_SEQS];
+};
+
+#define TS_FP_ATTN_WINDOW_SEQS(NAME, HD, T, Q8) \
+    extern "C" __global__ void __launch_bounds__(256) NAME(const ts_fp_window_seqs a, int rows, int nHead, int nKv, float scale, \
+        int tiles, int bucket, int sms) \
+    { \
+        const int z = blockIdx.z; \
+        if ((int)blockIdx.x >= tiles * a.splits[z]) \
+            return; \
+        ts_fp_attn<HD, true, false, Q8>(a.q[z], (const T*)a.kc[z], (const T*)a.vc[z], a.cap[z], rows, a.len[z], a.floor[z], nHead, nKv, \
+            scale, a.splits[z], a.partial[z], a.out[z], a.dyn[z], nullptr, nullptr, nullptr, \
+            ts_fp_live_splits(a.splits[z], a.dyn[z], 0, a.windowKeys[z], bucket, nHead / nKv, nKv, sms), a.windowKeys[z], bucket, sms); \
+    }
+
+TS_FP_ATTN_WINDOW_SEQS(ts_flash_decode_window_seqs_f16_d128, 128, half, false)
+TS_FP_ATTN_WINDOW_SEQS(ts_flash_decode_window_seqs_f16_d256, 256, half, false)
+TS_FP_ATTN_WINDOW_SEQS(ts_flash_decode_window_seqs_q8_d128, 128, uint8_t, true)
+TS_FP_ATTN_WINDOW_SEQS(ts_flash_decode_window_seqs_q8_d256, 256, uint8_t, true)
+
+// ts_flash_window_combine_f32 for the sequences of ts_flash_decode_window_seqs_* (grid y the sequence, its own operands by
+// value): each output the one-sequence combine's, the same splits in the same order. Launch: grid (rows * nHead, sequences),
+// block HD.
+struct ts_fp_window_combine_seqs
+{
+    const float* partial[TS_FP_WINDOW_SEQS];
+    float* out[TS_FP_WINDOW_SEQS];
+    const int* dyn[TS_FP_WINDOW_SEQS];
+    int splits[TS_FP_WINDOW_SEQS];
+    int len[TS_FP_WINDOW_SEQS];
+    int windowKeys[TS_FP_WINDOW_SEQS];
+};
+
+extern "C" __global__ void ts_flash_window_combine_seqs_f32(const ts_fp_window_combine_seqs a, int hd, int rows, int nHead, int bucket,
+    int ruleRows, int nKv, int sms)
+{
+    const int z = blockIdx.y;
+    const int splits = a.splits[z];
+    if (splits <= 1)
+        return;
+    const long long base = blockIdx.x;
+    const int t = (int)(base / nHead);
+    const int* dyn = a.dyn[z];
+    const int live = ts_fp_rule_splits(splits, (dyn != nullptr ? dyn[0] : a.len[z]) - (rows - 1 - t), a.windowKeys[z], bucket, ruleRows, nKv, sms);
+    if (live <= 1)
+        return;
+    const float* p = a.partial[z] + base * splits * (hd + 2);
+    float mx = -INFINITY;
+    for (int s = 0; s < live; ++s)
+        mx = fmaxf(mx, p[s * (hd + 2) + hd]);
+    float num = 0.0f, den = 0.0f;
+    const int x = threadIdx.x;
+    for (int s = 0; s < live; ++s)
+    {
+        const float* ps = p + s * (hd + 2);
+        const float w = mx == -INFINITY ? 0.0f : expf(ps[hd] - mx);
+        num = fmaf(ps[x], w, num);
+        den = fmaf(ps[hd + 1], w, den);
+    }
+    a.out[z][base * hd + x] = den > 0.0f ? num / den : 0.0f;
 }

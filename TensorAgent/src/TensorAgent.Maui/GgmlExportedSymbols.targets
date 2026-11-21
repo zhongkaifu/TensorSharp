@@ -55,10 +55,8 @@
     <ReferenceNativeSymbol Include="TSGgml_CrossEntropyLossBackwardF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_CrossEntropyLossF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashDraftBlock" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_DFlashDraftBlockBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashDraftBlockScaled" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashInject" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_DFlashInjectBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashInjectScaled" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashResetCaches" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DSpineDraftBlock" SymbolType="Function" />

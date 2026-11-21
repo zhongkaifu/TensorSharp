@@ -235,11 +235,16 @@ public sealed class CudaNvfp4MatmulTests
     }
 
     /// <summary>
-    /// Prompt rows of a fused gate|up NVFP4 projection with SwiGLU in the TMA GEMM's epilogue equal the [rows, 2 ff] product
-    /// and a SwiGLU over it, to the bit: 128-row token tiles (a partial one at 65 rows), 256-row ones from 768 rows, and a
-    /// feed-forward width a 128-row weight tile would split across gate and up (ff = 1536 + 64).
+    /// Rows of a fused gate|up NVFP4 projection with SwiGLU in the GEMM's epilogue equal the [rows, 2 ff] product and a SwiGLU
+    /// over it, to the bit: prompt rows on the TMA GEMM (128-row token tiles, a partial one at 65 rows, 256-row ones from 768
+    /// rows, a feed-forward width a 128-row weight tile would split across gate and up: ff = 1536 + 64), and a batched verify's
+    /// 17-64 rows on the cp.async GEMM's paired tiles (32- and 64-column tiles, K split as the product splits it).
     /// </summary>
     [CudaTheory]
+    [InlineData(17408, 5120, 32)]
+    [InlineData(17408, 5120, 40)]
+    [InlineData(512, 1024, 17)]
+    [InlineData(1600, 2048, 64)]
     [InlineData(512, 1024, 65)]
     [InlineData(1600, 2048, 300)]
     [InlineData(17408, 5120, 800)]
@@ -285,8 +290,68 @@ public sealed class CudaNvfp4MatmulTests
         }
     }
 
-    /// <summary>A gate|up width the epilogue's 64-column tiles do not divide, or too few rows for the TMA GEMM: the route
-    /// declines (the caller runs the product and the SwiGLU).</summary>
+    /// <summary>
+    /// The down projection's NVFP4 input is the same from either path: the plain quantizer over the epilogue's activation gives
+    /// the codes, scales and row scales the SwiGLU quantizer gives over the [rows, 2 ff] product, byte for byte (a batched
+    /// verify's rows and prompt rows).
+    /// </summary>
+    [CudaTheory]
+    [InlineData(17408, 5120, 32)]
+    [InlineData(1600, 2048, 64)]
+    [InlineData(512, 1024, 65)]
+    public void EpilogueAndSwiGluQuantizerGiveTheSameDownInput(int ff, int inDim, int rows)
+    {
+        using var allocator = new CudaAllocator();
+        if (allocator.Fp4Kernels is not { } fp4)
+        {
+            _output.WriteLine("no FP4 tensor-core products here: the epilogue route does not apply");
+            return;
+        }
+        byte[] weights = Nvfp4Rows(2 * ff, inDim, seed: 29);
+        var x = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                x[r, c] = 1.25f * MathF.Sin(0.0113f * (c + 3) * (r + 1)) + 0.3f * MathF.Cos(0.031f * c + r);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var input = Tensor.FromArray(allocator, x);
+            using var act = new Tensor(allocator, DType.Float32, rows, ff);
+            Assert.True(CudaQuantizedOps.TryAddmmGateUpSwiGluNvfp4(act, input, host, host, Nvfp4, inDim, 2 * ff, weights.Length));
+            using var gateUp = new Tensor(allocator, DType.Float32, rows, 2 * ff);
+            Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(gateUp, input, host, host, Nvfp4, inDim, 2 * ff, weights.Length));
+            var (codeBytes, scaleBytes, rowScaleBytes) = CudaFp4Kernels.ActivationBytes(rows, ff);
+            byte[] Planes(Action<IntPtr, IntPtr, IntPtr> quantize)
+            {
+                using var codes = new Tensor(allocator, DType.UInt8, codeBytes);
+                using var scales = new Tensor(allocator, DType.UInt8, scaleBytes);
+                using var rowScale = new Tensor(allocator, DType.Float32, rows);
+                allocator.Context.MakeCurrent();
+                quantize(Ptr(codes), Ptr(scales), Ptr(rowScale));
+                allocator.Stream.Synchronize();
+                float[] rs = rowScale.GetElementsAsFloat(rows);
+                return Bytes(codes, codeBytes).Concat(Bytes(scales, scaleBytes))
+                    .Concat(rs.SelectMany(BitConverter.GetBytes)).ToArray();
+            }
+            ((CudaStorage)act.Storage).EnsureDeviceCurrent();
+            ((CudaStorage)gateUp.Storage).EnsureDeviceCurrent();
+            byte[] fromEpilogue = Planes((c, sc, rs) => fp4.Quantize(Ptr(act), c, sc, rs, ff, rows, allocator.Stream.Handle));
+            byte[] fromSwiGlu = Planes((c, sc, rs) => fp4.QuantizeSwiGlu(Ptr(gateUp), c, sc, rs, ff, rows, allocator.Stream.Handle));
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+            Assert.Equal(fromSwiGlu.Length, fromEpilogue.Length);
+            for (int i = 0; i < fromSwiGlu.Length; i++)
+                if (fromSwiGlu[i] != fromEpilogue[i])
+                    Assert.Fail($"ff {ff}, {rows} rows: byte {i} of the down input planes: {fromEpilogue[i]} from the epilogue, {fromSwiGlu[i]} from the SwiGLU quantizer");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    /// <summary>A gate|up width the epilogue's 64-row tiles do not divide, or rows the q8 matvec takes: the route declines (the
+    /// caller runs the product and the SwiGLU).</summary>
     [CudaFact]
     public void GateUpSwiGluEpilogueDeclinesWhatItDoesNotTile()
     {
@@ -294,7 +359,7 @@ public sealed class CudaNvfp4MatmulTests
         if (allocator.Fp4Kernels == null)
             return;
         const int inDim = 512;
-        foreach ((int ff, int rows) in new[] { (96, 100), (512, 64) })
+        foreach ((int ff, int rows) in new[] { (96, 100), (96, 32), (512, 16) })
         {
             byte[] weights = Nvfp4Rows(2 * ff, inDim, seed: 3);
             IntPtr host = Marshal.AllocHGlobal(weights.Length);
