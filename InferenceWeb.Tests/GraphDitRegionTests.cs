@@ -243,12 +243,21 @@ public sealed class GraphDitRegionTests(ITestOutputHelper output)
     {
         // The reference ops alone (no WideTokenProducts: nothing served) on ggml_cuda.
         GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
-        using var env = new Env(GgmlGraphExecutor.For(GgmlBackendType.Cuda), null);
+        using var env = new Env(GgmlGraphExecutor.For(GgmlBackendType.Cuda), null, productTolerance: GgmlCudaF32ProductTolerance);
         Case c = Cases().Single(k => k.Name == name);
         float[] got = Run(env, c, wide: false, out int served, out double[] want);
         Assert.Equal(0, served);
-        Check(name, got, want, c.Tolerance);
+        Check(name, got, want, c.Products ? Math.Max(c.Tolerance, env.ProductTolerance) : c.Tolerance);
     }
+
+    /// <summary>ggml-cuda's F32 products on GPUs with TF32 tensor cores (compute capability 8.0 and newer) take TF32 operands:
+    /// it creates every cuBLAS handle in CUBLAS_TF32_TENSOR_OP_MATH (ggml-cuda/common.cuh) and its mmf kernel multiplies F32
+    /// tiles with tf32 mma.sync (ggml-cuda/mma.cuh). A 10-bit mantissa rounds each operand by up to 2^-11 = 4.9e-4 of itself,
+    /// so the oracle's F32-class bound cannot hold there: on an RTX PRO 4500 (sm_120) the LoRA and biased SwiGLU products sit
+    /// 2.9-4.0e-4 from it, and 0.8-1.4e-7 with NVIDIA_TF32_OVERRIDE=0 (cuBLAS's math kept in F32; these shapes take cuBLAS).
+    /// 2e-3 is the bound the VAE encoder's oracle holds ggml-cuda's F32 products to (MiniMaxH3ImageEditTests), four TF32
+    /// units.</summary>
+    private const double GgmlCudaF32ProductTolerance = 2e-3;
 
     private void VerifyGgml(GgmlBackendType backend, string name)
     {
