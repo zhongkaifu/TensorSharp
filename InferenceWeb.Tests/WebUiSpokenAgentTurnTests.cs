@@ -111,6 +111,10 @@ public sealed class WebUiSpokenAgentTurnTests : IDisposable
         public List<(List<ChatMessage> History, SpeechReplyOptions Speech)> DirectCalls { get; } = new();
         public List<TtsCall> TtsCalls { get; } = new();
         public TaskCompletionSource FirstAudioTaken { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>Set once a <see cref="StopInTool"/> turn's tool round is waiting for the turn's cancellation: until then its
+        /// speech (unless <see cref="HoldTts"/>) holds its first audio, so that audio reaches the consumer while the pull of
+        /// the tool round is in flight.</summary>
+        public TaskCompletionSource ToolRoundWaiting { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool TtsSawCancellation;
         public bool ToolSawCancellation;
 
@@ -136,6 +140,7 @@ public sealed class WebUiSpokenAgentTurnTests : IDisposable
             yield return ChatStreamUpdate.ToolProgress("running", "shell", detail: "python3 -c 'print(6 * 7)'");
             if (StopInTool)
             {
+                ToolRoundWaiting.TrySetResult();
                 try { await Task.Delay(Timeout.Infinite, cancellationToken); }
                 catch (OperationCanceledException) { ToolSawCancellation = true; throw; }
             }
@@ -160,6 +165,10 @@ public sealed class WebUiSpokenAgentTurnTests : IDisposable
                 TtsCalls.Add(new TtsCall(text, options.Language, options.Voice));
             }
             if (TtsFails != null) throw TtsFails;
+            // A turn that stops in its tool round speaks the text before the call once the round waits (the web chat yields
+            // audio it already holds between two pulls too, when no pull is in flight: a consumer leaving there would stop
+            // the turn before its tool round, which these tests do not mean). Held speech yields no audio to race with.
+            if (StopInTool && !HoldTts) await ToolRoundWaiting.Task.WaitAsync(Patience, cancellationToken);
             for (int f = 0; f < 2; f++)
             {
                 if (HoldTts)
