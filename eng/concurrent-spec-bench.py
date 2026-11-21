@@ -26,6 +26,7 @@ TensorSharp.Server.Host ... --no-multi-agent --no-skills.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -120,7 +121,9 @@ def wave(args, model, w, n):
         r = post(args.url + "/api/chat/ollama", b, args.timeout)
         results[i] = {"start": t0, "end": time.perf_counter(), "eval_count": r.get("eval_count"),
                       "eval_ns": r.get("eval_duration"), "prompt_count": r.get("prompt_eval_count"),
-                      "prompt_ns": r.get("prompt_eval_duration"), "chars": len((r.get("message") or {}).get("content") or "")}
+                      "prompt_ns": r.get("prompt_eval_duration"), "chars": len((r.get("message") or {}).get("content") or ""),
+                      # The completion's digest: greedy speculation is lossless, so every build and concurrency gives the same.
+                      "sha": hashlib.sha256(((r.get("message") or {}).get("content") or "").encode("utf-8")).hexdigest()[:16]}
 
     log0 = log_size(args.server_log) if args.server_log else 0
     load0 = os.getloadavg()
@@ -139,7 +142,7 @@ def wave(args, model, w, n):
     rec = {"kind": "wave", "label": args.label, "concurrency": n, "wave": w, "max_tokens": args.max_tokens,
            "decode_tok_s_sum": sum(rates), "decode_tok_s_per_request": rates,
            "wave_tok_s": tokens / (last - first), "wave_wall_s": last - first, "tokens": tokens,
-           "eval_counts": [r["eval_count"] for r in results],
+           "eval_counts": [r["eval_count"] for r in results], "digests": [r["sha"] for r in results],
            "ttft_ms": [r["prompt_ns"] / 1e6 if r["prompt_ns"] else None for r in results],
            "loadavg_before": load0, "loadavg_after": load1, "spec": stats}
     if stats:

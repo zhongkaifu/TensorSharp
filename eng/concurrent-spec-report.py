@@ -95,6 +95,16 @@ def main():
         print(f"| {label} | {c} | {len(waves)} | {wave:.1f} | {med(w['decode_tok_s_sum'] for w in waves):.1f} | "
               f"{phase('draft_pv'):.1f} | {phase('verify_pv'):.1f} | {phase('commit_pv'):.1f} | {phase('catchup_pv'):.1f} | "
               f"{med(acc) if acc else float('nan'):.2f} | {min(loads):.1f}-{max(loads):.1f} |")
+    # Greedy speculation is lossless: every build gives each prompt the same completion (where the bench recorded digests).
+    by_prompt = defaultdict(lambda: defaultdict(set))
+    for (label, c), waves in rows.items():
+        for w in waves:
+            for i, d in enumerate(w.get("digests") or []):
+                by_prompt[c][(w["wave"], i)].add(d)
+    for c in sorted(by_prompt):
+        prompts = by_prompt[c]
+        same = sum(1 for ds in prompts.values() if len(ds) == 1)
+        print(f"\nC={c}: {same} of {len(prompts)} prompts completed identically by every build")
     if args.base:
         print()
         print(f"| build | C | wave tok/s vs {args.base} |")
