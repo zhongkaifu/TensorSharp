@@ -35,6 +35,7 @@ public sealed class GraphDitRegionTests(ITestOutputHelper output)
     private sealed class Env : IDisposable
     {
         private readonly List<GCHandle> _pins = new();
+        private readonly List<IntPtr> _weights = new();
         private readonly List<Tensor> _tensors = new();
 
         public Env(IGraphExecutor executor, IAllocator allocator, double productTolerance = 0)
@@ -54,10 +55,12 @@ public sealed class GraphDitRegionTests(ITestOutputHelper output)
 
         private static long[] Sizes(long[] ne) => ne.Reverse().ToArray();
 
+        /// <summary>Pins a GGML weight's host bytes, which key its device copy.</summary>
         private IntPtr Pin(Array values)
         {
             GCHandle h = GCHandle.Alloc(values, GCHandleType.Pinned);
             _pins.Add(h);
+            _weights.Add(h.AddrOfPinnedObject());
             return h.AddrOfPinnedObject();
         }
 
@@ -109,9 +112,13 @@ public sealed class GraphDitRegionTests(ITestOutputHelper output)
             return g.Leaf(GraphLeafRole.Weight, GraphFormat.F16, ne, GraphIdentity.Of(t.Storage), values.Length * 2L, handle: t);
         }
 
+        /// <summary>A GGML weight's device copy is keyed by the address of its host bytes and outlives the plan, so it is
+        /// dropped before the pin is freed (<see cref="IGraphExecutor.Invalidate"/>): a later weight of the same size the GC
+        /// places at that address would otherwise bind this one's copy.</summary>
         public void Dispose()
         {
             foreach (Tensor t in _tensors) t.Dispose();
+            foreach (IntPtr data in _weights) Executor.Invalidate(data);
             foreach (GCHandle h in _pins) h.Free();
         }
     }

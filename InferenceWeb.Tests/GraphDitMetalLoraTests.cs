@@ -32,6 +32,7 @@ public sealed class GraphDitMetalLoraTests(ITestOutputHelper output)
     private sealed class Program : IDisposable
     {
         private readonly List<GCHandle> _pins = new();
+        private readonly List<IntPtr> _weights = new();
         public readonly GraphProgramBuilder G;
         public readonly List<int> Nodes = new();
         public readonly List<IntPtr> Data = new();
@@ -59,7 +60,12 @@ public sealed class GraphDitMetalLoraTests(ITestOutputHelper output)
             return node;
         }
 
-        public int Weight(int format, Array raw, long bytes, params long[] ne) => G.Leaf(GraphLeafRole.Weight, format, ne, Pin(raw), bytes);
+        public int Weight(int format, Array raw, long bytes, params long[] ne)
+        {
+            IntPtr data = Pin(raw);
+            _weights.Add(data);
+            return G.Leaf(GraphLeafRole.Weight, format, ne, data, bytes);
+        }
 
         public float[] Run(int outputNode, long count, out int lowered)
         {
@@ -74,8 +80,12 @@ public sealed class GraphDitMetalLoraTests(ITestOutputHelper output)
             return first;
         }
 
+        /// <summary>A weight's device binding is keyed by the address of its host bytes and outlives the plan, so it is dropped
+        /// before the pin is freed (<see cref="IGraphExecutor.Invalidate"/>): a later weight of the same size the GC places
+        /// at that address would otherwise bind this one's.</summary>
         public void Dispose()
         {
+            foreach (IntPtr data in _weights) GgmlGraphExecutor.For(GgmlBackendType.Metal).Invalidate(data);
             foreach (GCHandle h in _pins) h.Free();
         }
     }
