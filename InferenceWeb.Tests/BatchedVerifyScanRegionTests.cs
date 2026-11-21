@@ -15,9 +15,10 @@ namespace InferenceWeb.Tests;
 
 /// <summary>
 /// A batched verify's sequences' gated delta-net scans in one launch a layer (GraphFusion.DeltaNetScans, the direct CUDA
-/// executor's multi-sequence scan): the same math as each sequence's own launch, so every row's logits, and every row after
-/// the commits (which re-step each sequence's kept rows on its state), are the bits of the step that launches a scan a
-/// sequence, and those of each sequence run alone.
+/// executor's multi-sequence scan) and their attention windows in one launch a layer (GraphFusion.SequenceAttentions, the
+/// multi-sequence window kernels): the same math as each sequence's own launches, so every row's logits, and every row after
+/// the commits (which re-step each sequence's kept rows on its state), are the bits of the step that launches them a sequence
+/// at a time, and those of each sequence run alone.
 /// </summary>
 public sealed class BatchedVerifyScanRegionTests : IDisposable
 {
@@ -111,26 +112,34 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
         return apart;
     }
 
-    [CudaFact]
-    public void SequencesScannedInOneLaunchAreEachSequencesOwnBits()
+    /// <summary>Over an F16 cache and a q8_0 one, which the flash window kernels read (an F32 cache takes the generic attention).</summary>
+    [CudaTheory]
+    [InlineData(KvCacheDtype.F16)]
+    [InlineData(KvCacheDtype.Q8_0)]
+    public void SequencesScannedAndAttendedInOneLaunchAreEachSequencesOwnBits(KvCacheDtype kv)
     {
-        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F32);
+        using var dtype = KvCacheDtypeConfig.ForCurrentFlowInTests(kv);
         string path = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "q35.gguf"));
         int[] all = Enumerable.Range(0, Prompts.Length).ToArray();
         List<float[]>[] together, apart;
-        long regions;
+        long regions, windows;
         using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
         {
             together = Run(model, all);
-            regions = ((CudaGraphExecutor)model.GraphExecutorForTests).DeltaNetScanRegions;
+            var executor = (CudaGraphExecutor)model.GraphExecutorForTests;
+            (regions, windows) = (executor.DeltaNetScanRegions, executor.SequenceWindowLaunches);
         }
         using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
         {
             ((Qwen35RuntimeModel)model).DeltaNetScanRegionsDisabledForTests = true;
+            model.SequenceAttentionRegionsDisabledForTests = true;
             apart = Run(model, all);
-            Assert.Equal(0, ((CudaGraphExecutor)model.GraphExecutorForTests).DeltaNetScanRegions);
+            var executor = (CudaGraphExecutor)model.GraphExecutorForTests;
+            Assert.Equal(0, executor.DeltaNetScanRegions);
+            Assert.Equal(0, executor.SequenceWindowLaunches);
         }
         Assert.True(regions > 0, "no verify step scanned its sequences in one launch");
+        Assert.True(windows > 0, "no verify step attended its sequences' windows in one launch");
         var alone = new List<float[]>[Prompts.Length];
         for (int r = 0; r < Prompts.Length; r++)
             using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
@@ -138,10 +147,10 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
         for (int r = 0; r < Prompts.Length; r++)
         {
             int vsOps = Apart(together[r], apart[r]), vsAlone = Apart(together[r], alone[r]);
-            _output.WriteLine($"request {r}: {together[r].Count} rows; {vsOps} apart from the scans launched a sequence each, {vsAlone} from it alone");
+            _output.WriteLine($"request {r}: {together[r].Count} rows; {vsOps} apart from the scans and windows launched a sequence each, {vsAlone} from it alone");
             Assert.Equal(0, vsOps);
             Assert.Equal(0, vsAlone);
         }
-        _output.WriteLine($"{regions} scan regions");
+        _output.WriteLine($"{regions} scan regions, {windows} window regions");
     }
 }

@@ -2394,6 +2394,14 @@ namespace TensorSharp.Models
         /// 3.8's QSA selection), what the region reads from outside it emitted before it opens; default none.</summary>
         protected virtual bool BeginWindowAttention(GraphStep step, int layer, int x, int s, in WindowAttentionOperands attention) => false;
 
+        /// <summary>Whether the family opens regions of its own over a window's attention (<see cref="BeginWindowAttention"/>): its
+        /// sequences' attentions then stay out of a region of several sequences' (GraphFusion.SequenceAttentions).</summary>
+        protected virtual bool WindowAttentionHasRegion => false;
+
+        /// <summary>Tests: several sequences' verify windows run as their ops one sequence at a time, not as one region
+        /// (<see cref="GraphFusion.SequenceAttentions"/>).</summary>
+        internal bool SequenceAttentionRegionsDisabledForTests { get; set; }
+
         /// <summary>A one-sequence step's attention prep operands in a layer: its rows' q [d, heads, rows] and k [d, kvHeads, rows]
         /// as projected (views of the products, before the copies and <see cref="EmitQueryKey"/>'s ops), v [dv, kvHeads, rows], the
         /// K and V caches [d, capacity, kvHeads], the rows the step writes them at (I64 [rows]: their KV indices), the local heads
@@ -2483,6 +2491,14 @@ namespace TensorSharp.Models
             int attn = -1;
             // Several sequences' outputs, joined after the loop (JoinSequenceRows).
             var parts = n > 1 && !LegacyBatchedJoinForTests ? new List<int>(n) : null;
+            // Several sequences' verify windows (each written by index into its own caches, none a prompt chunk or past a ring's
+            // first lap): one region an executor may run at its end, launching every sequence's attention together
+            // (GraphFusion.SequenceAttentions); a family's own window regions keep theirs.
+            bool together = parts != null && !prep && !WindowAttentionHasRegion && !SequenceAttentionRegionsDisabledForTests;
+            for (int s = 0; together && s < n; s++)
+                together = Indexed(step.Counts[s]) && !RingWrapped(layer, step.Starts[s], step.Counts[s])
+                    && !(step.PromptChunks && step.Counts[s] > SmallChunkRows);
+            if (together) step.BeginFused(GraphFusion.SequenceAttentions, stackalloc[] { q, k, v });
             for (int s = 0; s < n; s++)
             {
                 int count = step.Counts[s], start = step.Starts[s];
@@ -2639,6 +2655,7 @@ namespace TensorSharp.Models
                 if (parts != null) parts.Add(part);
                 else attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
             }
+            if (together) step.EndFused(parts.ToArray());
             if (parts != null) attn = JoinSequenceRows(step, parts);
 
             if (gate >= 0)

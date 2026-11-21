@@ -773,6 +773,15 @@ namespace TensorSharp.Cuda
                 ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(nq, heads, d, splits)) : null;
             Tensor[] written = partial == null ? new[] { output } : new[] { output, partial };
             Tensor[] read = selection ? new[] { qc, kc, vc, cells, count, rows } : new[] { qc, kc, vc };
+            // Inside a region of several sequences' attentions (GraphFusion.SequenceAttentions) the launch waits for the
+            // region's end, which makes every sequence's in one (TrySequenceWindows); its operands stay alive until then.
+            if (_together != null && !selection && flash.TakesWindowSequences)
+            {
+                _together.Add(new HeldWindow(qc.CopyRef(), kc.CopyRef(), vc.CopyRef(), partial?.CopyRef(), output.CopyRef(), cap, nq, keys, floor,
+                    heads, kvHeads, d, scale, splits, dyn, nkv, q8));
+                attended = output;
+                return true;
+            }
             Launch(read, written, (_, stream) => flash.LaunchDecodeRows(Ptr(qc), CachePtr(kc), CachePtr(vc), cap, nq,
                 selection ? nkv : keys, selection ? 0 : floor, heads, kvHeads, d, scale, splits,
                 partial == null ? IntPtr.Zero : Ptr(partial), Ptr(output), stream, dyn,
@@ -780,6 +789,85 @@ namespace TensorSharp.Cuda
                 windowKeys: nkv, bucket: selection ? 0 : DecodeWindowBucket, q8: q8));
             attended = output;
             return true;
+        }
+
+        /// <summary>A verify window's attention held back inside a region of several sequences' attentions: its operands (each a
+        /// reference of its own) and <see cref="CudaFlashPrefillKernels.LaunchDecodeRows"/>'s arguments.</summary>
+        private sealed record HeldWindow(Tensor Q, Tensor K, Tensor V, Tensor Partial, Tensor Output, int Cap, int Rows, int Len, int Floor,
+            int Heads, int KvHeads, int D, float Scale, int Splits, IntPtr Dyn, int WindowKeys, bool Q8);
+
+        private List<HeldWindow> _together;
+
+        /// <summary>Several sequences' attentions of a layer (<see cref="GraphFusion.SequenceAttentions"/>) run their ops at the
+        /// region's end, their verify windows' launches held back until it closes (<see cref="EndTogether"/>).</summary>
+        protected override bool RunsTogether(GraphFusion kind)
+            => kind == GraphFusion.SequenceAttentions && !SequenceWindowsDisabledForTests
+               && ((CudaAllocator)Allocator).FlashPrefillKernels is { TakesWindowSequences: true };
+
+        /// <summary>Tests: a region of several sequences' attentions launches each sequence's window on its own.</summary>
+        internal bool SequenceWindowsDisabledForTests { get; set; }
+
+        /// <summary>Regions whose sequences' verify windows ran in one launch (tests check it engaged).</summary>
+        internal long SequenceWindowLaunches { get; private set; }
+
+        protected override void BeginTogether() => _together = new List<HeldWindow>();
+
+        /// <summary>
+        /// The held verify windows, every sequence's in one window launch and one combine where they share a shape (heads, KV
+        /// heads, width, cache format, rows, scale), each sequence with its own caches, length, splits and partials, so each
+        /// value is its own launch's. Four Qwen3.8-27B sequences' 8-row windows had taken two launches each a layer (the window
+        /// and its combine), 1.1 of a verify step's 28 ms on an RTX PRO 4500 against the direct engine's 0.4.
+        /// </summary>
+        protected override void EndTogether()
+        {
+            List<HeldWindow> held = _together;
+            _together = null;
+            if (held == null || held.Count == 0) return;
+            var cuda = (CudaAllocator)Allocator;
+            CudaFlashPrefillKernels flash = cuda.FlashPrefillKernels;
+            try
+            {
+                foreach (HeldWindow w in held)
+                {
+                    foreach (Tensor t in new[] { w.Q, w.K, w.V, w.Partial, w.Output })
+                        if (t != null) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
+                }
+                cuda.Context.MakeCurrent();
+                var groups = new List<List<HeldWindow>>();
+                foreach (HeldWindow w in held)
+                {
+                    List<HeldWindow> group = groups.Find(g => g[0].Heads == w.Heads && g[0].KvHeads == w.KvHeads && g[0].D == w.D && g[0].Q8 == w.Q8
+                        && g[0].Rows == w.Rows && BitConverter.SingleToInt32Bits(g[0].Scale) == BitConverter.SingleToInt32Bits(w.Scale)
+                        && g.Count < CudaFlashPrefillKernels.WindowSequencesMax);
+                    if (group == null) groups.Add(group = new List<HeldWindow>());
+                    group.Add(w);
+                }
+                foreach (List<HeldWindow> group in groups)
+                {
+                    var sequences = new CudaFlashPrefillKernels.WindowSequence[group.Count];
+                    for (int z = 0; z < group.Count; z++)
+                    {
+                        HeldWindow w = group[z];
+                        sequences[z] = new CudaFlashPrefillKernels.WindowSequence(Ptr(w.Q), CachePtr(w.K), CachePtr(w.V), w.Cap, w.Len, w.Floor,
+                            w.Splits, w.Partial == null ? IntPtr.Zero : Ptr(w.Partial), Ptr(w.Output), w.Dyn, w.WindowKeys);
+                    }
+                    HeldWindow first = group[0];
+                    flash.LaunchDecodeWindowSequences(sequences, first.Rows, first.Heads, first.KvHeads, first.D, first.Scale, DecodeWindowBucket,
+                        first.Q8, cuda.Stream.Handle);
+                }
+                foreach (HeldWindow w in held)
+                {
+                    ((CudaStorage)w.Output.Storage).MarkDeviceModified();
+                    if (w.Partial != null) ((CudaStorage)w.Partial.Storage).MarkDeviceModified();
+                }
+                SequenceWindowLaunches++;
+            }
+            finally
+            {
+                foreach (HeldWindow w in held)
+                    foreach (Tensor t in new[] { w.Q, w.K, w.V, w.Partial, w.Output })
+                        t?.Dispose();
+            }
         }
 
         /// <summary>A mask as contiguous F32 [rows, keys] on this device, or null.</summary>

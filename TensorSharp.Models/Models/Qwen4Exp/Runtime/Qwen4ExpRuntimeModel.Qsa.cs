@@ -245,6 +245,9 @@ namespace TensorSharp.Models
         /// region's cells are not masked below one), as does a media step (a position table), which the region has not been
         /// checked on.
         /// </summary>
+        /// <summary>QSA layers open their own region over a window's attention (<see cref="BeginWindowAttention"/>).</summary>
+        protected override bool WindowAttentionHasRegion => true;
+
         protected override bool BeginWindowAttention(GraphStep step, int layer, int x, int s, in WindowAttentionOperands attention)
         {
             int ratio = QsaRatio(layer);

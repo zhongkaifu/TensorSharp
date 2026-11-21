@@ -341,6 +341,12 @@ namespace TensorSharp.Graph
         /// the rows. Inputs: per lane its op's q, K, V and mask, in lane order. Ip: the lanes. Fp: the scale. Result: the lanes'
         /// attentions [d, heads, lanes * rows]. An executor may run every lane's in one dispatch; each lane's values are its op's.</summary>
         RingAttentionLanes = 26,
+        /// <summary>Several sequences' attentions of one layer (a batched verify's windows, each over its own caches): the
+        /// sequences' cache writes and attention ops, which read the region's inputs and each sequence's own caches alone.
+        /// Inputs: the step's q, k and v. Results: each sequence's attention [heads * dv, its rows], in order. An executor may run
+        /// the region's ops at its end and launch the sequences' attention kernels together (each sequence's values its ops');
+        /// any other computes the ops in place.</summary>
+        SequenceAttentions = 27,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

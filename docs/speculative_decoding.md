@@ -1546,9 +1546,15 @@ drafter state and verifies every window in one forward (see
 [the unified step](design/unified-execution.md#the-unified-step)). The drafters run once a step for every
 request too: per-token MTP heads chain together, and a DFlash or DFlash2 drafter drafts every request's
 block in one graph program (each request on its own ring and mask, the weights and the head read once
-for all of them), and writes every request's catch-up in one program when the step ends. Each request's
-`draft` and `catchUp` are then its share. On ggml_metal, DFlash2 keeps its fused selector tail request by
-request, which measured faster there (the drafter's products are compute-bound on an M5 Pro past 8 rows).
+for all of them). The verify keeps the rings itself: its own program writes every window row of every
+request into that request's ring at its position, and the commit bookkeeps each request's kept rows, the
+next draft's carried row among them, so no feature row goes to the host and back and no catch-up program
+runs (a verify that cannot write the rings returns the features to the model, and the commit writes the
+kept rows from them). Each request's `draft` is then its share, and `catchUp` is 0. On ggml_metal, DFlash2
+keeps its fused selector tail request by request, which measured faster there (the drafter's products are
+compute-bound on an M5 Pro past 8 rows), and the requests' catch-ups are written in one program when the
+step ends. On direct CUDA several requests' verify windows also share launches: each layer's delta-net scans
+and attention windows of every request run in one kernel launch each, every request's values its own launch's.
 The rest of this section describes
 the per-sequence and holder paths of the other families; its Qwen arena and holder notes predate the
 runtime.

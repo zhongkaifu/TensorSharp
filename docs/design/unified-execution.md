@@ -978,6 +978,15 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
   mask a graph shares, as the H3 graph does; elsewhere those are the region's ops. `TSGgml_GraphFusedBegin`
   returns 2 for it and `GgmlGraphExecutor.LoweredRegions` counts it apart from served regions. Inside a served
   `TableRopeQkNorm` it is part of that region (cuDNN).
+* **Several sequences' regions (direct CUDA):** a batched step's per-sequence ops of one layer stay per-sequence ops
+  (each sequence on its own state and caches) and form a region the CUDA executor runs in one launch, every
+  sequence's values its own launch's: `DeltaNetScans` (a verify window's delta-net scans, the multi-sequence form of
+  the window scan kernel), `SequenceAttentions` (the sequences' cache writes and attention ops, run at the region's end
+  between `BeginTogether` and `EndTogether`: the verify windows' flash launches are held back and made in one
+  multi-sequence window launch and one combine) and `RingAttentionLanes` (a batched block draft's lanes' ring
+  attentions). A test pins each against its op-by-op form and each sequence run alone, bit for bit
+  (`BatchedVerifyScanRegionTests`). Four Qwen3.8-27B NVFP4 sequences' 8-row verify windows on an RTX PRO 4500: the
+  scans 2.99 -> 2.49 ms a step, the attentions 1.15 -> 0.37.
 * **Weight preload:** `IGraphExecutor.Preload(weights)` makes a component's weights resident before its first
   program binds them. On GGML it is `TSGgml_GraphPreloadWeights`: MiniMax-H3's uploader (`ggml_h3_upload.h`:
   direct reads from a registered file mapping, else prefaulted parallel copies) into the device copies a weight
