@@ -1061,14 +1061,17 @@ direct CUDA, the S8 sessions) waits for the CUDA box: `glimmer/cuda-vm/s9w/s9-cu
 * **Tests on frozen figures (24cb451d).** The tower tests against the frozen managed rows, within the parity bound on the
   managed executor and within legacy's own spread between executors (6e-3) elsewhere (measured: managed 6.1e-7, ggml_cpu
   1.3e-4, ggml_metal 1.6e-3, MLX 4.2e-3); Muse Spark's tower and the drafter features against the same file. The real
-  mmproj's tower rows against the F32 tower on every lane, as the quantized lanes already were (the legacy tower on the same
-  executor shared its rounding; the F32 tower does not): cosine 0.9995 on ggml_metal and MLX (measured 0.99977-0.99999), 0.99
-  on ggml_cpu (its q8_K activations, as ggml_cuda's q8_1: measured 0.99576-0.99900), 0.99999 on direct CUDA. Deleted: the
-  tests of legacy against itself, the writers, the legacy-only KV, MLX-decode and truncation tests.
-* **Deleted.** `MuseGlimmerModel` and its partials, the oracle seam, the probe's `--family` (refused with a message);
+  mmproj's tower rows against the F32 tower, by the rule ggml_cuda and ggml_vulkan already had, on every lane but direct CUDA:
+  1 - cosine summed over the nine pictures at most 1.25x legacy's frozen sum, each picture's ratio logged. The figures for
+  ggml_metal, MLX and ggml_cpu were frozen from d492bfe9 (the last tree with the legacy tower; the M5 Pro, ggml d9fe7bff,
+  2026-11-20; `Fixtures/MuseGlimmer/LlamaCpp/legacy_vision.<lane>.json`), where the graph tower's sum was 0.71x, 0.81x and 0.92x
+  legacy's. Direct CUDA keeps cosine 0.99999 per picture. (An absolute bound per lane, c57920ce, stood for one commit.) Deleted:
+  the tests of legacy against itself, the writers, the legacy-only KV, MLX-decode and truncation tests.
+* **Deleted.** `MuseGlimmerModel` and its partials, the oracle seam, the probe's `--family` (refused: exit 2, one stderr line);
   `MuseGlimmerVisionEncoder` and the native vision block; `ggml_ops_muse_glimmer.cpp`, its exports and `ggml_ops_core.cpp`'s
   hooks; the CUDA ring-mask kernel only that graph called (`ggml_ops_mask.cu`; no committed PTX is involved, so nothing is
-  regenerated); the MLX helpers only legacy used. 10,649 lines out, 616 in.
+  regenerated); the MLX helpers only legacy used; `KvBlockTransfer`'s ring addressing, which only legacy passed (no other
+  caller: Gemma 4, GPT-OSS, Muse Spark and the shared runtime address every layer linearly).
 * **Names retired** (`RemovedCliFlags.cs`, one entry a name): the D8 list, each failing startup with its replacement.
 * **Docs.** The model card, the env-var feature matrix, PROJECT_STATUS, the development guides and the capability reference
   (EN and zh); the website pages and both search indexes name no legacy code or switch.
@@ -1079,7 +1082,7 @@ direct CUDA, the S8 sessions) waits for the CUDA box: `glimmer/cuda-vm/s9w/s9-cu
 | Real weights, ggml_metal (IQ2_XXS) | **passed** 11/11: llama.cpp 640/640 and 128/128 teacher-forced, first position within 0.050; legacy's frozen continuations 6/6 identical; perplexity 4.168974 against legacy's frozen 4.168933 (+0.0010%), top-1 62.96% both; three growth paths 360 steps identical to presized; a checkpoint across the rings' wrap continues as the live cache; DFlash identical to plain on all six prompts, alone and together |
 | Real weights, MLX | **passed** 11/11: 639/640 (one near-tie) and 128/128; 5/6 continuations legacy's, the sixth leaving at a near-tie; perplexity +0.0001% |
 | Image prompts | **passed**: ggml_metal 215/216 (first position within 0.18), MLX 215/216 (0.35) |
-| Tower rows against the F32 tower (real mmproj, nine pictures) | **passed** at the bounds set from this run (c57920ce): ggml_metal 0.99979-0.99999 and MLX 0.99977-0.99999 (bound 0.9995; the 0.9999 set against legacy on the same executor no longer applies), ggml_cpu 0.99576-0.99900 (bound 0.99: q8_K activations) |
+| Tower rows against the F32 tower (real mmproj, nine pictures) | **passed** by the frozen-sum rule: the graph tower's 1 - cosine summed over the pictures 0.71x legacy's frozen sum on ggml_metal (7.01e-4 against 9.90e-4), 0.81x on MLX (6.06e-4 against 7.44e-4), 0.92x on ggml_cpu (2.14e-2 against 2.34e-2); bound 1.25x. The S9 graph tower gives the same sums as at the freeze |
 | Checkpoint files and checkpoints (the probe, ggml_metal, the 4.1K prompt teacher-forced by legacy's frozen tokens, 500 steps) | **passed**: a checkpoint file written at 3000 and at 4400 positions (160.8 MB) and restored into a new request's slot, a checkpoint cloned at both, and a decode-time rewind: every step's logits at cosine 1.000000 to the presized run, argmax legacy's token 500/500 |
 | CLI, ggml_metal and MLX | **passed**: TTFT 405 / 372 ms, 21.7 / 21.4 tok/s; images 4/4; multi-turn reuse 86/273 and 270/454; DFlash and n-gram (99%) engaged. `TS_MUSE_GLIMMER_SWA_RING=0` stops the CLI before loading ("... was removed: ... Unset it.", exit 1); the probe refuses `--family` |
 | Server (OpenAI, Web UI, DFlash and n-gram servers, c4) | **passed**, S8's figures: OpenAI 7/9 (the same two pre-existing ones), reuse 4,515 / 4,922 (thinking 4,486 / 4,917), the Web UI loop check, c4 12/12 identical to sequential, 27.2 s against 53.8 s |
