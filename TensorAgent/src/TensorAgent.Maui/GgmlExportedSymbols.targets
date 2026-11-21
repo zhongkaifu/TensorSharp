@@ -223,9 +223,11 @@
     <ReferenceNativeSymbol Include="TSGgml_GraphOp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOutput" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOverlapSteps" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphPreloadWeights" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphRun" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphRunRanked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphShape" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphWideTokenProducts" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GreedyFullRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
@@ -253,7 +255,6 @@
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VideoVaeEncode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VideoVaeEncode3D" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VisionEncode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VitDecodeBatch" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3ClearVisionRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3CtxSize" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3DsparkBlockSize" SymbolType="Function" />

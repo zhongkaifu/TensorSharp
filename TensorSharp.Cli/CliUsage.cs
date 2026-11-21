@@ -274,10 +274,10 @@ namespace TensorSharp.Cli
             ("Multimodal input (vision / audio / video models)", new[]
             {
                 new OptionHelp("--image <file>",
-                    "Image input for a vision model (PNG/JPEG/...). Repeatable: for Qwen-Image-2.1 editing every " +
-                    "--image is a reference picture, handed to the text encoder in command-line order and tagged " +
-                    "<image1>, <image2>, ... ahead of the prompt, so the prompt can name a picture by its tag. " +
-                    "Default: none.",
+                    "Image input for a vision model (PNG/JPEG/...). Repeatable: for image editing every --image is a " +
+                    "reference picture, in command-line order, and the prompt names the pictures the way the model " +
+                    "does: Qwen-Image-2.1 tags them <image1>, <image2>, ... ahead of the prompt; MiniMax-H3-Image (up " +
+                    "to 16) calls them <Picture 1>, <Picture 2>, ... Default: none.",
                     "--image photo.jpg"),
                 new OptionHelp("--audio <file>",
                     "Audio input for an audio-capable model (e.g. Gemma 4). Default: none.",
@@ -587,6 +587,17 @@ namespace TensorSharp.Cli
                     "(an already-set value is used when the flag is absent).",
                     TensorSharp.Graph.PromptAttentionConfig.Flag + " f16"),
             }),
+            ("Diffusion products (--backend ggml_cuda)", new[]
+            {
+                new OptionHelp(TensorSharp.Graph.DiffusionProductsConfig.Flag + " <p>",
+                    "Arithmetic of a diffusion model's wide weight products on --backend ggml_cuda (MiniMax-H3-Image, " +
+                    "MiniMax-H3 video, Qwen-Image 2.1): bf16 (the default: the products as stored, BF16 and Q4_K on cuBLAS " +
+                    "BF16), int8 (the DiT's projections on int8 tensor cores, each weight row and token rounded to 8 bits: " +
+                    "faster, and it changes the picture) or int8-all (int8 plus the VAE decoders' F16 projections). Other " +
+                    "backends run the products as stored. Config key diffusion-products; sets TS_DIFFUSION_PRODUCTS (an " +
+                    "already-set value is used when the flag is absent). Replaces TS_H3_INT8_MATMUL.",
+                    TensorSharp.Graph.DiffusionProductsConfig.Flag + " int8"),
+            }),
             ("Scheduling", new[]
             {
                 new OptionHelp("--no-prefix-cache",
@@ -662,8 +673,8 @@ namespace TensorSharp.Cli
             ("Image generation and editing (DiffusionGemma / Qwen-Image models)", new[]
             {
                 new OptionHelp("--prompt <text>",
-                    "Image description for Qwen-Image-2.1; --image selects editing (alternative to --input). " +
-                    "Repeat --image for multiple references. Default: empty.",
+                    "Image description for Qwen-Image-2.1 or MiniMax-H3-Image; --image selects editing (alternative to " +
+                    "--input). Repeat --image for multiple references. Default: empty.",
                     "--prompt \"Make the sky look like sunset\""),
                 new OptionHelp("--cfg <f>",
                     "Classifier-free guidance scale. Default: 1.0 for Qwen-Image-2.1 (one prediction per step; " +
@@ -707,7 +718,9 @@ namespace TensorSharp.Cli
                     "another model.",
                     "--qwen-image-variant turbo"),
                 new OptionHelp("--mask <file>",
-                    "Qwen-Image-2.1 local edit mask, matching the first --image dimensions. Unselected pixels and output size are preserved. Default: none.",
+                    "Local edit mask for Qwen-Image-2.1 or MiniMax-H3-Image, matching the first --image's dimensions (MiniMax-H3-Image's " +
+                    "<Picture 1>; later images stay references). Unselected pixels keep their exact bytes and the output keeps the " +
+                    "first image's size. Default: none.",
                     "--image photo.png --mask selection.png"),
                 new OptionHelp("--mask-mode <mode>",
                     "Mask convention: grayscale (default, white edits and black preserves) or alpha (transparent edits and opaque preserves).",
@@ -725,9 +738,10 @@ namespace TensorSharp.Cli
                     "Context around the selected crop, in source pixels (0-16384). Default: 64.",
                     "--mask-crop-padding 96"),
                 new OptionHelp("--keep-source-size",
-                    "Qwen-Image-2.1 edit: return the first --image's exact width and height, so an edit of an edit keeps " +
-                    "its size. Sampling uses about the image's own area, at least 1 megapixel and at most the automatic " +
-                    "area, at about its aspect ratio, and the result is resized to the source. Cannot be combined with --width/--height. Masked " +
+                    "Qwen-Image-2.1 or MiniMax-H3-Image edit: return the first --image's exact width and height, so an edit of an edit keeps " +
+                    "its size. Sampling uses about the image's own area at about its aspect ratio (Qwen-Image-2.1: at least " +
+                    "1 megapixel and at most the automatic area; MiniMax-H3-Image: at least 2048x2048 and at most 20 " +
+                    "megapixels), and the result is resized to the source. Cannot be combined with --width/--height. Masked " +
                     "edits keep the source size without it. Default: off (the automatic size).",
                     "--image photo.png --keep-source-size"),
                 new OptionHelp("--lora <path>",
@@ -738,7 +752,12 @@ namespace TensorSharp.Cli
                     "LightX2V Turbo step-distillation plug-ins config/lora/minimax-h3-fl2v-turbo-8step.json (8 steps) and " +
                     "config/lora/minimax-h3-fl2v-turbo-4step.json (4 steps), which lock --diffusion-steps, --flow-shift, " +
                     "--sampler and --cfg to their recipe (unset or equal is accepted; anything else is refused) and are refused " +
-                    "on the Ref2VA checkpoint. Applied unmerged on top of the quantized transformer, so small distillation " +
+                    "on the Ref2VA checkpoint. MiniMax-H3-Image takes minimax-h3-image-lora configs and bare LoRA .safetensors " +
+                    "(diffusers PEFT, ComfyUI or kohya names), repeatable as style adapters each at its own --lora-scale, plus at " +
+                    "most one speed adapter: the pDMD plug-ins config/lora/minimax-h3-image-pdmd-2step.json (2 steps) and " +
+                    "config/lora/minimax-h3-image-pdmd-2step-comfy.json (2 steps), which lock --diffusion-steps and --cfg the same " +
+                    "way; the style plug-in config/lora/minimax-h3-image-seedreamstyle.json fixes nothing. Applied unmerged on top " +
+                    "of the quantized transformer, so small distillation " +
                     "deltas are kept exactly. A plug-in the model does not take is refused at startup, before the plug-in " +
                     "downloads; when a --config still has to download the model, the model's family is checked right after " +
                     "that download (a contradicting sampling flag is refused before it). Default: none.",

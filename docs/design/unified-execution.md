@@ -227,6 +227,7 @@ classDiagram
         <<enumeration>>
         SharedRuntime
         Bespoke
+        SharedDiffusionRuntime
     }
     class IBatchedPagedModel {
         <<interface>>
@@ -427,7 +428,11 @@ driven by it, so a declared gap is also the operator-facing refusal message.
    easy way out) and when a listed gap has been closed but not removed (so the list always
    matches reality).
 3. **New families use the shared runtime:** any architecture id not in the legacy (bespoke) list
-   must declare `Implementation = SharedRuntime`; the test fails otherwise.
+   must declare `Implementation = SharedRuntime`, or, for a diffusion family,
+   `Implementation = SharedDiffusionRuntime` (`ServingContract.SharedDiffusionRuntime(...)`: the generic
+   diffusion runtime of [diffusion-runtime.md](diffusion-runtime.md), where continuous batching does not
+   apply and tensor parallelism is the runtime's per-rank emission of a shardable denoiser); the test fails
+   otherwise.
 4. **Proof per claim:** `SharedRuntimeConformanceTests` runs every shared-runtime family through
    prefill, decode, truncate-and-refill and reset under TP 2, layer split 2 and 4, and hybrid
    2×2 and 2×3 on simulated devices (`SimulatedDeviceGroup`), comparing logits with one device
@@ -948,6 +953,36 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
   prompt, M5 Pro: 7.3-7.5 s before, 5.79-5.85 s after, `Qwen4ExpModel` 5.69-5.83 s (same text as before);
   Qwen3.5-0.8B perplexity 19.8009 for both paths, Qwen3.6-35B-A3B Q4_K_M 1,825 tokens 1.03 s against
   1.05 s.
+* **Diffusion-transformer regions on GGML (CUDA):** `AdaLnModulate`, `GatedResidual`, `TableRopeQkNorm` (the
+  form that goes on through its attention), `LoraLinear` and a BF16/F16 `SwigluFfn` are served *inside* the
+  graph in a program marked `WideTokenProducts`: the region becomes the DiT offload's `GGML_OP_CUSTOM` node
+  (`ggml_ops_dit_offload.h`, the nodes MiniMax-H3's native DiT builds), in the graph allocator's memory, and
+  `TSGgml_GraphRun` runs the graph through `tsg::dit_offload_compute` (cuDNN attention, the fused nodes, the
+  cuBLAS BF16 / int8 wide products). A served modulation or residual reads its segment table on the host, refilled
+  every run. Programs without the attribute and the other backends run the regions' ops (`GraphDitRegions`, the
+  H3 graph's unfused sequence). Past `tsg_h3_fused_max_segments()` modulation segments no modulation or residual
+  is served, and then (as the native DiT builds the block unfused) no BF16 `SwigluFfn` in that graph either. See
+  [diffusion-runtime.md](diffusion-runtime.md).
+* **ViT decoder regions (CUDA):** `VitAttention` (a ViT's self-attention over equal-length sequences packed along
+  the rows, from the normed input: the interleaved qkv product and its bias, per sequence the gainless q/k norms,
+  the table RoPE and the attention) and `ScaledResidual` (`base + (W act(x) + b) * scale`, a projection or a
+  SwiGLU FFN) are MiniMax-H3-Image's VAE decoder. ggml_cuda serves them in any program as `h3_vit_decode`'s fused
+  nodes: the F16 products on cuBLAS, one cuDNN attention over a row of tiles with the bias in its prep, the scaled
+  residuals (these only where cuDNN takes the attention: the native decoder fuses a block whole or not at all).
+  Elsewhere their ops are the decoder's unfused graph, and its native graph is sized from the program, so any
+  number of tiles decodes on ggml_metal and ggml_cpu.
+* **DiT attention on every GGML backend:** `DitAttention` (the unmasked attention of a packed sequence, nested in
+  `TableRopeQkNorm`'s attend form and used alone by a token refiner) is *lowered*, not served: the builder
+  builds MiniMax-H3's own attention nodes from the region's inputs (`ggml_h3_attention.h`'s `h3_attend`, shared
+  with the native H3 graphs), so ggml-metal's tensor-API path pads the keys to 64 and chunks the queries behind one
+  mask a graph shares, as the H3 graph does; elsewhere those are the region's ops. `TSGgml_GraphFusedBegin`
+  returns 2 for it and `GgmlGraphExecutor.LoweredRegions` counts it apart from served regions. Inside a served
+  `TableRopeQkNorm` it is part of that region (cuDNN).
+* **Weight preload:** `IGraphExecutor.Preload(weights)` makes a component's weights resident before its first
+  program binds them. On GGML it is `TSGgml_GraphPreloadWeights`: MiniMax-H3's uploader (`ggml_h3_upload.h`:
+  direct reads from a registered file mapping, else prefaulted parallel copies) into the device copies a weight
+  leaf of the same host bytes binds. MiniMax-H3-Image's denoiser and VAE decoder call it once before their first
+  program.
 * **Copies run when forced:** a `Cpy` runs when an effect, an alias or a reader asks for it, as ggml
   schedules it. A streamed step used to run each copy as it was emitted, so an alias's fallback copy ran
   ahead of the alias the executor could have honoured.

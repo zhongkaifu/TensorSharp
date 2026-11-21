@@ -331,17 +331,24 @@
         "ggml_metal"
       ],
       "modalities": [
-        "image_generation"
+        "image_generation",
+        "image_editing"
       ],
       "layout": "dense",
-      "notes": "Single device, ggml backends only. The MiniMax-H3 DiT without its audio stream; six distilled steps, guidance fixed at 1. Shares the Qwen3-VL-32B text encoder file with minimax-h3-fl2va.",
+      "notes": "Single device, ggml backends only. On the shared diffusion runtime: text to image and editing with up to 16 pictures. The MiniMax-H3 DiT without its audio stream; six distilled steps, guidance fixed at 1. bf16 (Comfy-Org) and Unsloth Q8_0, Q5_K_M and Q4_K_M GGUFs. Shares the Qwen3-VL-32B text encoder file with minimax-h3-fl2va.",
       "source_evidence": [
-        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3ImageArchitecture.cs",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
         "docs/models/minimax-h3-image.md"
       ],
       "configuration_status": "configured",
       "presets": [
-        "minimax-h3-image"
+        "lora-minimax-h3-image-pdmd-2step",
+        "lora-minimax-h3-image-pdmd-2step-comfy",
+        "lora-minimax-h3-image-seedreamstyle",
+        "minimax-h3-image",
+        "minimax-h3-image-q4km",
+        "minimax-h3-image-q5km",
+        "minimax-h3-image-q8"
       ]
     },
     {
@@ -2174,6 +2181,87 @@
       "status": "configured"
     },
     {
+      "id": "lora-minimax-h3-image-pdmd-2step",
+      "config": "config/lora/minimax-h3-image-pdmd-2step.json",
+      "kind": "plugin",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/minimax-h3-image-pdmd-2step.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/minimax-h3-image.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-minimax-h3-image-pdmd-2step-comfy",
+      "config": "config/lora/minimax-h3-image-pdmd-2step-comfy.json",
+      "kind": "plugin",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/minimax-h3-image-pdmd-2step-comfy.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/minimax-h3-image.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-minimax-h3-image-seedreamstyle",
+      "config": "config/lora/minimax-h3-image-seedreamstyle.json",
+      "kind": "plugin",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/minimax-h3-image-seedreamstyle.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/minimax-h3-image.json"
+      ],
+      "status": "configured"
+    },
+    {
       "id": "lora-qwen-image-2.1-anime-consistency",
       "config": "config/lora/qwen-image-2.1-anime-consistency.json",
       "kind": "plugin",
@@ -2673,7 +2761,8 @@
       "kind": "image_generation",
       "family": "minimax-h3-image",
       "modalities": [
-        "image_generation"
+        "image_generation",
+        "image_editing"
       ],
       "backends": [
         "ggml_cpu",
@@ -2681,16 +2770,121 @@
         "ggml_metal"
       ],
       "scenarios": [
-        "image_generation"
+        "image_generation",
+        "image_editing"
       ],
       "source_evidence": [
         "config/minimax-h3-image.json",
-        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3ImageArchitecture.cs",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
         "docs/models/minimax-h3-image.md"
       ],
       "layout": "dense",
       "file_sizes": {
         "minimax_h3_image_pruned_bf16.safetensors": 40234657162,
+        "qwen3vl_32b_minimax_h3-Q4_K_M.gguf": 18218065024,
+        "vocab.json": 2776833,
+        "merges.txt": 1671839,
+        "tokenizer_config.json": 11003,
+        "minimax_h3_image_vae_fp16.safetensors": 1168505312
+      },
+      "status": "configured"
+    },
+    {
+      "id": "minimax-h3-image-q4km",
+      "config": "config/minimax-h3-image-q4km.json",
+      "kind": "image_generation",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "image_generation",
+        "image_editing"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "image_generation",
+        "image_editing"
+      ],
+      "source_evidence": [
+        "config/minimax-h3-image-q4km.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "minimax_h3_image_pruned-Q4_K_M.gguf": 12721119968,
+        "qwen3vl_32b_minimax_h3-Q4_K_M.gguf": 18218065024,
+        "vocab.json": 2776833,
+        "merges.txt": 1671839,
+        "tokenizer_config.json": 11003,
+        "minimax_h3_image_vae_fp16.safetensors": 1168505312
+      },
+      "status": "configured"
+    },
+    {
+      "id": "minimax-h3-image-q5km",
+      "config": "config/minimax-h3-image-q5km.json",
+      "kind": "image_generation",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "image_generation",
+        "image_editing"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "image_generation",
+        "image_editing"
+      ],
+      "source_evidence": [
+        "config/minimax-h3-image-q5km.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "minimax_h3_image_pruned-Q5_K_M.gguf": 14599107296,
+        "qwen3vl_32b_minimax_h3-Q4_K_M.gguf": 18218065024,
+        "vocab.json": 2776833,
+        "merges.txt": 1671839,
+        "tokenizer_config.json": 11003,
+        "minimax_h3_image_vae_fp16.safetensors": 1168505312
+      },
+      "status": "configured"
+    },
+    {
+      "id": "minimax-h3-image-q8",
+      "config": "config/minimax-h3-image-q8.json",
+      "kind": "image_generation",
+      "family": "minimax-h3-image",
+      "modalities": [
+        "image_generation",
+        "image_editing"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "image_generation",
+        "image_editing"
+      ],
+      "source_evidence": [
+        "config/minimax-h3-image-q8.json",
+        "TensorSharp.Models/Models/MiniMaxH3Image/MiniMaxH3ImageArchitecture.cs",
+        "docs/models/minimax-h3-image.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "minimax_h3_image_pruned-Q8_0.gguf": 22026760928,
         "qwen3vl_32b_minimax_h3-Q4_K_M.gguf": 18218065024,
         "vocab.json": 2776833,
         "merges.txt": 1671839,

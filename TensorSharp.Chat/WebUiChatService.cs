@@ -404,6 +404,20 @@ namespace TensorSharp.Chat
                 };
             }
 
+            // What the loaded model does with pictures, when it is an image model (Qwen-Image-2.1, MiniMax-H3-Image): that
+            // a message makes a picture rather than an answer, whether it edits, whether an edit takes a selection (a
+            // mask), and the smallest area it makes pictures at (0 for none). Null for every other model, like video, so a
+            // page tests one field rather than an architecture name.
+            object image = _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel imageModel
+                ? new
+                {
+                    family = imageModel.ImageModelFamily,
+                    supportsEdit = imageModel.SupportsImageEdit,
+                    supportsMask = imageModel.SupportsImageEdit && imageModel.SupportsEditMask,
+                    minimumArea = imageModel.MinimumGenerationArea,
+                }
+                : null;
+
             // What the loaded model does with sound, when it is an audio model (Whisper, Kokoro,
             // ACE-Step): the /v1/audio route it serves and what a request can name. Null for
             // every other model, like video.
@@ -464,6 +478,7 @@ namespace TensorSharp.Chat
                 modelContextTokens = _svc.ModelContextTokens,
                 defaultMaxTokens = _options.DefaultMaxTokens,
                 video,
+                image,
                 audio,
                 // Whether a chat reply can be spoken (/api/chat's `speech`): the pages offer the
                 // option only when `available`, and `reason` says why not (a model that does not
@@ -1350,6 +1365,19 @@ namespace TensorSharp.Chat
         // The model is not thread-safe; edit requests are serialised process-wide.
         private static readonly object _imageEditLock = new();
 
+        // Picture requests run one at a time, first in first out, on the image queue's compute thread, holding
+        // _imageEditLock while they run (a Qwen-Image intent question takes it too). A request cancelled while it waits
+        // leaves the queue without running; a running one stops at its next step. docs/design/diffusion-runtime.md 3.5.
+        private static readonly TensorSharp.Runtime.Scheduling.Diffusion.DiffusionJobQueue _imageQueue =
+            new(new TensorSharp.Runtime.Scheduling.Diffusion.DiffusionJobQueueOptions { Name = "image", ComputeLock = _imageEditLock });
+
+        /// <summary>A finished picture request: its upload URL, the PNG's path, its size and how long it took.</summary>
+        public sealed record ImageRequestResult(string Url, string OutputPath, int Width, int Height, double ElapsedSeconds)
+        {
+            /// <summary>The JSON image routes' answer.</summary>
+            internal object ToJson() => new { ok = true, url = Url, width = Width, height = Height, elapsedSeconds = ElapsedSeconds };
+        }
+
         /// <summary>
         /// The two refusals every image-edit route starts with, in order: 400 when the
         /// loaded model is not Qwen-Image-2.1, 507 when the upload directory has no
@@ -1369,6 +1397,11 @@ namespace TensorSharp.Chat
         /// turn goes to.
         /// </summary>
         public bool LoadedModelMakesImages => _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel;
+
+        /// <summary>The loaded image model's declared floor (<see cref="TensorSharp.Models.QwenImage.IImageGenerationModel.MinimumGenerationArea"/>),
+        /// or 0: no image model, or one without a floor.</summary>
+        public long LoadedImageModelMinimumArea =>
+            _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel image ? image.MinimumGenerationArea : 0;
 
         /// <summary>The host's authoritative persistent Studio service, shared by chat tools and manual editing.</summary>
         public TensorSharp.Studio.StudioService Studio { get; set; }
@@ -1620,11 +1653,40 @@ namespace TensorSharp.Chat
             return prompt;
         }
 
-        private Task<object> ImageRequestAsync(
+        private async Task<object> ImageRequestAsync(
             JsonElement body, bool generate, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken) =>
-            TraceImageRequestAsync(generate, image => ImageRequestCoreAsync(body, generate, loras, image, cancellationToken));
+            (await TraceImageRequestAsync(generate, image => ImageRequestCoreAsync(body, generate, loras, image, cancellationToken))).ToJson();
 
-        private async Task<object> ImageRequestCoreAsync(
+        /// <summary>
+        /// A picture for the OpenAI image routes (<c>/v1/images/generations</c>, <c>/v1/images/edits</c>): the image
+        /// routes' JSON <paramref name="parameters"/> (ParseImageParameters' fields and <c>prompt</c>), with
+        /// <paramref name="images"/> (in <c>&lt;Picture n&gt;</c> order) and <paramref name="mask"/> for an edit, through the
+        /// same validation, queue and worker as <c>/api/image-generate</c> and <c>/api/image-edit</c>.
+        /// </summary>
+        public Task<ImageRequestResult> OpenAIImageAsync(
+            JsonElement parameters, IReadOnlyList<byte[]> images, byte[] mask, CancellationToken cancellationToken)
+        {
+            bool generate = images is not { Count: > 0 };
+            return TraceImageRequestAsync(generate, async image =>
+            {
+                var logger = _loggerFactory.CreateLogger("TensorSharp.Server.ImageEdit");
+                var model = generate ? RequireImageGenerationModel() : RequireImageEditModel();
+                EnsureImageEditHeadroom(logger, "Image request rejected: {Reason}");
+                var p = ParseImageParameters(parameters);
+                string prompt = ParseImagePrompt(parameters, generate);
+                ValidateMaskPresence(parameters, mask != null);
+                if (mask != null)
+                {
+                    if (generate) throw new WebUiRequestRejectedException(400, new { error = "A mask requires an input image." });
+                    p.Mask = DecodeRequestImage(mask, "mask");
+                    p.MaskMode = OpenAIMaskMode(p.Mask);
+                }
+                return await RunImageEditAsync(model, prompt, p, generate ? new List<byte[]>() : images.ToList(), logger, generate,
+                    null, image, cancellationToken);
+            });
+        }
+
+        private async Task<ImageRequestResult> ImageRequestCoreAsync(
             JsonElement body, bool generate, IReadOnlyList<LoraSpec> loras,
             TensorSharp.Models.QwenImage.ImageGenerationTelemetry image, CancellationToken cancellationToken)
         {
@@ -1644,11 +1706,11 @@ namespace TensorSharp.Chat
         }
 
         /// <summary>The multipart edit route uses the same validation and worker as JSON.</summary>
-        public Task<object> ImageEditAsync(
+        public async Task<object> ImageEditAsync(
             JsonElement parameters, IReadOnlyList<byte[]> images, byte[] mask, CancellationToken cancellationToken) =>
-            TraceImageRequestAsync(generate: false, image => ImageEditCoreAsync(parameters, images, mask, image, cancellationToken));
+            (await TraceImageRequestAsync(generate: false, image => ImageEditCoreAsync(parameters, images, mask, image, cancellationToken))).ToJson();
 
-        private async Task<object> ImageEditCoreAsync(
+        private async Task<ImageRequestResult> ImageEditCoreAsync(
             JsonElement parameters, IReadOnlyList<byte[]> images, byte[] mask,
             TensorSharp.Models.QwenImage.ImageGenerationTelemetry image, CancellationToken cancellationToken)
         {
@@ -1666,13 +1728,13 @@ namespace TensorSharp.Chat
         }
 
         /// <summary>Compatibility overload for callers supplying decoded multipart fields.</summary>
-        public Task<object> ImageEditAsync(
+        public async Task<object> ImageEditAsync(
             string prompt, int steps, float cfg, long seed, long targetArea, IReadOnlyList<byte[]> images, CancellationToken cancellationToken,
             int width = 0, int height = 0, string negativePrompt = null) =>
-            TraceImageRequestAsync(generate: false, image => ImageEditCoreAsync(
-                prompt, steps, cfg, seed, targetArea, images, cancellationToken, width, height, negativePrompt, image));
+            (await TraceImageRequestAsync(generate: false, image => ImageEditCoreAsync(
+                prompt, steps, cfg, seed, targetArea, images, cancellationToken, width, height, negativePrompt, image))).ToJson();
 
-        private async Task<object> ImageEditCoreAsync(
+        private async Task<ImageRequestResult> ImageEditCoreAsync(
             string prompt, int steps, float cfg, long seed, long targetArea, IReadOnlyList<byte[]> images, CancellationToken cancellationToken,
             int width, int height, string negativePrompt, TensorSharp.Models.QwenImage.ImageGenerationTelemetry image)
         {
@@ -1767,7 +1829,7 @@ namespace TensorSharp.Chat
         private sealed class LoraApplyException(string message, Exception inner) : InvalidOperationException(message, inner);
 
         /// <summary><see cref="ApplyLoras"/> for a picture: a model that takes no plug-ins
-        /// (MiniMax-H3-Image) refuses a non-empty set rather than making the picture without it.</summary>
+        /// refuses a non-empty set rather than making the picture without it.</summary>
         private static void ApplyImageLoras(
             TensorSharp.Models.QwenImage.IImageGenerationModel model, IReadOnlyList<LoraSpec> loras, ILogger logger)
         {
@@ -1779,7 +1841,7 @@ namespace TensorSharp.Chat
                 throw new LoraApplyException($"{model.ImageModelFamily} takes no LoRA plug-ins.", null);
         }
 
-        private async Task<object> RunImageEditAsync(
+        private async Task<ImageRequestResult> RunImageEditAsync(
             TensorSharp.Models.QwenImage.IImageGenerationModel model,
             string prompt, TensorSharp.Models.QwenImage.QwenImageParams p, List<byte[]> imageBytesList, ILogger logger,
             bool generate, IReadOnlyList<LoraSpec> loras,
@@ -1797,25 +1859,22 @@ namespace TensorSharp.Chat
             Interlocked.Increment(ref _mediaJobs);
             try
             {
-                (w, h) = await Task.Run(() =>
+                (w, h) = await _imageQueue.Submit(job =>
                 {
-                    lock (_imageEditLock)
+                    var inputs = imageBytesList.ConvertAll(bytes => DecodeRequestImage(bytes, "image"));
+                    ValidateImageMaskGeometry(p, inputs);
+                    ApplyImageLoras(model, loras, logger);
+                    p.OnStep = (_, total, _) =>
                     {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        var inputs = imageBytesList.ConvertAll(bytes => DecodeRequestImage(bytes, "image"));
-                        ValidateImageMaskGeometry(p, inputs);
-                        ApplyImageLoras(model, loras, logger);
-                        p.OnStep = (_, total, _) =>
-                        {
-                            cancellationToken.ThrowIfCancellationRequested();
-                            telemetry.RecordStep(total);
-                        };
-                        var output = generate ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
-                        TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
-                        telemetry.SetResult(output.Width, output.Height);
-                        return (output.Width, output.Height);
-                    }
-                }, cancellationToken);
+                        // Between steps: the request's cancellation, and a turn for compute work waiting on the model.
+                        job.Checkpoint();
+                        telemetry.RecordStep(total);
+                    };
+                    var output = generate ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
+                    TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
+                    telemetry.SetResult(output.Width, output.Height);
+                    return (output.Width, output.Height);
+                }, null, cancellationToken).Completion;
             }
             catch (ArgumentException ex) when (ex is not ArgumentNullException)
             {
@@ -1830,6 +1889,13 @@ namespace TensorSharp.Chat
                 logger.LogError(LogEventIds.ChatFailed, ex, "Image request failed");
                 throw new WebUiRequestRejectedException(500, new { error = ex.Message });
             }
+            catch (RequestRefusedException ex)
+            {
+                // Refused before any phase ran: the device cannot hold the request (a smaller size or quantization can be
+                // served). 507, the server's own capacity, with the reason; the model stays loaded and serves the next one.
+                logger.LogWarning(LogEventIds.UploadReceived, "Image request refused: {Reason}", ex.Message);
+                throw new WebUiRequestRejectedException(507, new { error = ex.Message });
+            }
             finally
             {
                 // The awaited worker has left the model (a cancelled request that never
@@ -1841,7 +1907,7 @@ namespace TensorSharp.Chat
             string url = BuildUploadUrl(outName);
             logger.LogInformation(LogEventIds.UploadReceived,
                 "Image request done: {W}x{H} -> {Url} ({Sec:F1}s)", w, h, LogContent.Of(url), sw.Elapsed.TotalSeconds);
-            return new { ok = true, url, width = w, height = h, elapsedSeconds = sw.Elapsed.TotalSeconds };
+            return new ImageRequestResult(url, outPath, w, h, sw.Elapsed.TotalSeconds);
         }
 
         /// <summary>
@@ -1907,6 +1973,19 @@ namespace TensorSharp.Chat
             if (info.Length == 0 || info.Length > _uploads.MaxFileBytes)
                 throw new WebUiRequestRejectedException(400, new { error = "Mask is empty or exceeds the upload size limit." });
             p.Mask = DecodeRequestImage(await File.ReadAllBytesAsync(full, ct), "mask");
+        }
+
+        /// <summary>
+        /// How <c>/v1/images/edits</c> reads its <c>mask</c>: OpenAI's convention, where the fully transparent pixels are the
+        /// ones edited (alpha mode), for a mask with any pixel that is not opaque; a mask with no alpha, or an opaque one,
+        /// is read as the image routes' default, white edits and black keeps (grayscale).
+        /// </summary>
+        internal static TensorSharp.Models.QwenImage.QwenImageMaskMode OpenAIMaskMode(TensorSharp.Models.QwenImage.RgbImage mask)
+        {
+            ArgumentNullException.ThrowIfNull(mask);
+            return mask.Alpha != null && Array.Exists(mask.Alpha, a => a < 1f)
+                ? TensorSharp.Models.QwenImage.QwenImageMaskMode.Alpha
+                : TensorSharp.Models.QwenImage.QwenImageMaskMode.Grayscale;
         }
 
         private static TensorSharp.Models.QwenImage.RgbImage DecodeRequestImage(byte[] bytes, string field)
@@ -2053,22 +2132,22 @@ namespace TensorSharp.Chat
             int previewCount = p.Steps > 0 ? Math.Clamp(p.Steps - 1, 0, 8) : 8;
 
             Interlocked.Increment(ref _mediaJobs);
-            var editTask = Task.Run(() =>
+            var editTask = Task.Run(async () =>
             {
                 var sw = Stopwatch.StartNew();
                 try
                 {
-                    // The model is not thread-safe; serialize edit requests (shared with ImageEditAsync).
-                    lock (_imageEditLock)
+                    // The model is not thread-safe: the request waits its turn in the image queue (shared with ImageEditAsync).
+                    await _imageQueue.Submit(job =>
                     {
                         var inputs = imageBytesList.ConvertAll(bytes => DecodeRequestImage(bytes, "image"));
-                        ct.ThrowIfCancellationRequested();
+                        job.Cancellation.ThrowIfCancellationRequested();
                         ValidateImageMaskGeometry(p, inputs);
                         ApplyImageLoras(editModel, loras, logger);
                         p.PreviewCount = previewCount;
                         p.OnStep = (step, total, preview) =>
                             {
-                                if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
+                                job.Checkpoint();
                                 imageTelemetry.RecordStep(total);
                                 // Preview encoding is best-effort: a failure here must degrade to a
                                 // plain progress tick (like the pipeline's own preview-decode guard),
@@ -2094,7 +2173,8 @@ namespace TensorSharp.Chat
                             Final = true, Url = BuildUploadUrl(outName),
                             Width = output.Width, Height = output.Height, Seconds = sw.Elapsed.TotalSeconds,
                         });
-                    }
+                        return true;
+                    }, null, ct).Completion;
                 }
                 catch (OperationCanceledException)
                 {
@@ -2846,8 +2926,8 @@ namespace TensorSharp.Chat
         /// in its validation is recorded, as well as a failure or a cancellation. Async, so the span
         /// is current only inside the request and never in the caller's flow.
         /// </summary>
-        private async Task<object> TraceImageRequestAsync(
-            bool generate, Func<TensorSharp.Models.QwenImage.ImageGenerationTelemetry, Task<object>> run)
+        private async Task<T> TraceImageRequestAsync<T>(
+            bool generate, Func<TensorSharp.Models.QwenImage.ImageGenerationTelemetry, Task<T>> run)
         {
             using var image = StartImageRequest(generate);
             try

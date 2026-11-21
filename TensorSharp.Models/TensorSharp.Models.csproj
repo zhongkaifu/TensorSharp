@@ -34,6 +34,7 @@
     <InternalsVisibleTo Include="LongContextQualityProbe" />
     <InternalsVisibleTo Include="MuseGlimmerKvGrowProbe" />
     <InternalsVisibleTo Include="MuseGlimmerRuntimeHost" />
+    <InternalsVisibleTo Include="MiniMaxH3ImageAB" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />

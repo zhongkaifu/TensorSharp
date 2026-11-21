@@ -27,6 +27,8 @@ public sealed class CatalogTests
             "qwen-image-2.1-turbo-q5ks",
             "qwen-image-2.1-turbo-q8-0",
             "minimax-h3-fl2va-q4k",
+            "minimax-h3-image-q4km",
+            "minimax-h3-image-q8-0",
             "ltx-2.5-distilled-q4kxl",
             "gemma-4-26b-a4b-qat-q4kxl",
             "gemma-4-31b-q4-0",
@@ -238,6 +240,8 @@ public sealed class CatalogTests
         "qwen-image-2.1-turbo-q5ks",
         "qwen-image-2.1-turbo-q8-0",
         "minimax-h3-fl2va-q4k",
+        "minimax-h3-image-q4km",
+        "minimax-h3-image-q8-0",
     };
 
     [Fact]
@@ -266,6 +270,8 @@ public sealed class CatalogTests
     [InlineData("qwen-image-2.1-turbo-q5ks", 24)]
     [InlineData("qwen-image-2.1-turbo-q8-0", 32)]
     [InlineData("minimax-h3-fl2va-q4k", 32)]
+    [InlineData("minimax-h3-image-q4km", 32)]
+    [InlineData("minimax-h3-image-q8-0", 48)]
     [InlineData("qwen3.8-flash-next-gsq-q2-0", 48)]
     [InlineData("qwen3.8-flash-next-q2kxl", 48)]
     [InlineData("qwen3.8-flash-next-iq1m", 32)]
@@ -356,6 +362,16 @@ public sealed class CatalogTests
         // A photo (keyframe or reference) is what takes the footprint to its highest: the
         // video VAE's encoder converts its kernels to F32 in managed memory.
         ["minimax-h3-fl2va-q4k"] = (18.22, 2.24, "chat-e2e.py's MiniMax-H3 video scenarios in the Mac app, 22 frames, 20 steps"),
+        // MiniMax-H3-Image: the files are the largest phase's device residency, its weights and its working memory
+        // as the pipeline plans them (LargestGpuPhaseOnAMac): for Q4_K_M the text encoder (18.22 GB + 0.64 GB; the
+        // pipeline releases it before the denoise wherever the GPU's working set cannot hold both), for Q8_0 the
+        // denoise at 2048x2048 (22.03 GB + 3.09 GB measured on Metal by stage S4). Footprints: Q4_K_M measured
+        // 2026-11-19 through AgentAppHost (eng/validation/TensorAgentHost, CoreCLR, /usr/bin/time -l) over three turns
+        // of /api/chat, a 2048x2048 picture, a pDMD picture and a masked pDMD edit (the edit's reference copies are the
+        // peak), every component resident on the 48 GB Mac (39.2 GB wired at the peak); Q8_0 the CLI's peak footprint
+        // over a 2048x2048 picture on the same Mac (the bf16 verification's run m3).
+        ["minimax-h3-image-q4km"] = (18.86, 4.38, "a 2048x2048 picture, a pDMD picture and a masked pDMD edit through AgentAppHost's /api/chat, phys_footprint_peak"),
+        ["minimax-h3-image-q8-0"] = (25.12, 1.43, "a 2048x2048 picture in the CLI, peak footprint"),
         // Measured 2026-10-01 in the Debug Mac app: the files are what stays resident (the dense
         // half and the 15 layers' experts the engine keeps on the GPU); the rest is read from the
         // SSD (CatalogModel.WeightsPagedFromDiskBytes). The footprint is phys_footprint_peak over
@@ -382,6 +398,27 @@ public sealed class CatalogTests
 
     /// <summary>What macOS and the rest of a desktop keep for themselves.</summary>
     private const double MacOsGB = 5.0;
+
+    /// <summary>
+    /// A diffusion entry's largest phase on the GPU (weights and working memory, in GB), where the pipeline plans its
+    /// phases against Metal's recommended working set rather than the memory beside macOS. The working set is what
+    /// decides its tier when it is the tighter bound: Q8_0's 25.1 GB denoise fits beside a 32 GB Mac's macOS by the
+    /// count above but not into its 22.9 GB working set.
+    /// </summary>
+    private static readonly Dictionary<string, double> LargestGpuPhaseOnAMac = new()
+    {
+        ["minimax-h3-image-q4km"] = 18.86,
+        ["minimax-h3-image-q8-0"] = 25.12,
+    };
+
+    /// <summary>Metal's recommended working set by tier, GB: two thirds of the memory up to 32 GB (22,906.5 MB as
+    /// ggml-metal reports it on 32 GB Apple Silicon; not measured here), and the 48 GB M5 Pro's measured 40,200.9 MB.</summary>
+    private static double MetalWorkingSetGB(int tier) => tier switch
+    {
+        <= 32 => tier * 1.073741824 * 2 / 3,
+        48 => 40.2009,
+        _ => tier * 1.073741824 * 0.75,
+    };
 
     [Fact]
     public void EachDesktopEntryFitsItsTierBesideMacOS()
@@ -411,6 +448,14 @@ public sealed class CatalogTests
                 $"{id} needs about {need:F1} GB ({how}) but is offered from {model.MinDeviceMemoryGB} GB");
             // And not offered higher than it needs: the next tier down must really be too small.
             int below = tiers.Where(t => t < model.MinDeviceMemoryGB).DefaultIfEmpty(0).Max();
+            if (LargestGpuPhaseOnAMac.TryGetValue(id, out double phase))
+            {
+                Assert.True(phase <= MetalWorkingSetGB(model.MinDeviceMemoryGB),
+                    $"{id}'s largest phase, {phase:F1} GB, is past the {model.MinDeviceMemoryGB} GB tier's GPU working set");
+                Assert.True(need > below || phase > MetalWorkingSetGB(below),
+                    $"{id} needs about {need:F1} GB ({how}) and {phase:F1} GB of GPU working set, which the {below} GB tier already holds");
+                continue;
+            }
             Assert.True(need > below,
                 $"{id} needs about {need:F1} GB ({how}), which the {below} GB tier already holds");
         }
@@ -719,6 +764,8 @@ public sealed class CatalogTests
         // Added 2026-11-16.
         "lfm3-1.7b-q4km",
         "lfm3-omni-2b-q4km",
+        "minimax-h3-image-q4km",
+        "minimax-h3-image-q8-0",
     };
 
     /// <summary>

@@ -155,7 +155,7 @@ public class ServerUsageAccuracyTests
     {
         string usage = RawUsage();
 
-        Assert.Equal(LoraCliFlags.Flags, SectionFlags(usage, "LoRA plug-ins (Qwen-Image-2.1, MiniMax-H3 FL2VA)"));
+        Assert.Equal(LoraCliFlags.Flags, SectionFlags(usage, "LoRA plug-ins (Qwen-Image-2.1, MiniMax-H3 FL2VA, MiniMax-H3-Image)"));
         var companions = SectionFlags(usage, "Qwen-Image-2.1 companion models");
         Assert.Contains("--qwen-image-variant", companions);
         foreach (string flag in LoraCliFlags.Flags)
@@ -170,6 +170,7 @@ public class ServerUsageAccuracyTests
         Assert.Contains("Qwen-Image-2.1 or MiniMax-H3 (FL2VA)", lora, StringComparison.Ordinal);
         foreach (var (path, plugin) in CliUsageTests.ShippedH3Plugins())
             Assert.Contains($"{path} ({plugin.Recipe.Steps} steps)", lora, StringComparison.Ordinal);
+        CliUsageTests.AssertNamesEveryShippedH3ImagePlugin(lora);
         foreach (string locked in new[] { "--video-steps", "\"steps\"", "\"flowShift\"", "\"sampler\"", "\"cfg\"" })
             Assert.Contains(locked, lora, StringComparison.Ordinal);
         // The CLI's spellings are not server flags.

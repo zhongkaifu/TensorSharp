@@ -1,0 +1,26 @@
+{
+  // Seedreamstyle 6K (Nebsh/Seedreamstyle-H3-6K): a photographic style LoRA for MiniMax-H3-Image (cinematic human scenes:
+  // portraits, conversations, practical lighting), kohya names, rank 16, alpha 16 (.alpha tensors: scale 1), the 50 DiT
+  // blocks' qkv, out, fc1 and fc2. Trained around 1 MP for 6,000 steps.
+  //
+  //   TensorSharp.Cli --config config/minimax-h3-image.json \
+  //       --lora config/lora/minimax-h3-image-seedreamstyle.json --prompt "seedreamstyle. A portrait of ..." --output out.png
+  //
+  // Trigger: start the prompt with "seedreamstyle.". The card's strength is 1.0; --lora-scale overrides it. Sampling: the
+  // checkpoint's own (a style adapter fixes nothing); it combines with other style adapters and with one speed adapter.
+  // Licence: MiniMax-H3-Image Community License Agreement.
+  "type": "minimax-h3-image-lora",
+  "name": "Seedreamstyle 6K",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/minimax-h3-image/loras"
+  },
+  "weights": {
+    "path": "${root}/Seedreamstyle_H3_Resume_6K.safetensors",
+    "urls": [
+      "https://huggingface.co/Nebsh/Seedreamstyle-H3-6K/resolve/5e1b48cd929da47a98e7a9ea426f20340ef92a0a/Seedreamstyle_H3_Resume_6K.safetensors"
+    ],
+    "sha256": "3e1d306c8a392d9cb53540c8f6b853042e008a1f604992a3800ecc99075e2fe8"
+  },
+  "key_format": "kohya",
+  "scale": 1.0
+}

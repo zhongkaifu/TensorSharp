@@ -8,7 +8,7 @@
 // unsloth/MiniMax-H3-Image-GGUF, made with ComfyUI-GGUF's converter, declares
 // general.architecture = hyvid. The registry dispatches a labelled file on its label
 // before it looks at tensors, so the file died at load with "Unsupported architecture:
-// hyvid" although its tensors are exactly what MiniMaxH3ImageModel reads. These tests
+// hyvid" although its tensors are exactly what the MiniMax-H3-Image family reads. These tests
 // pin the fix: a hyvid-labelled H3-Image denoiser resolves to minimax-h3-image, while
 // hyvid-labelled files with other tensors stay refused.
 using System;
@@ -16,6 +16,7 @@ using System.IO;
 using TensorSharp.Models;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Models.MiniMaxH3;
+using TensorSharp.Models.MiniMaxH3Image;
 using TensorSharp.Runtime;
 using Xunit;
 
@@ -63,14 +64,14 @@ public class MiniMaxH3ImageGgufLabelTests : IDisposable
     public void HyvidLabelledImageDenoiser_ResolvesToMiniMaxH3Image()
     {
         string path = Write("minimax_h3_image_pruned-Q8_0.gguf", "hyvid", ImageDenoiser);
-        Assert.Equal(MiniMaxH3ImageModel.ArchitectureId, Resolve(path).Id);
+        Assert.Equal(MiniMaxH3ImageFamily.ArchitectureId, Resolve(path).Id);
     }
 
     [Fact]
     public void UnlabelledImageDenoiser_StillResolvesByItsTensors()
     {
         string path = Write("unlabelled.gguf", null, ImageDenoiser);
-        Assert.Equal(MiniMaxH3ImageModel.ArchitectureId, Resolve(path).Id);
+        Assert.Equal(MiniMaxH3ImageFamily.ArchitectureId, Resolve(path).Id);
     }
 
     [Fact]

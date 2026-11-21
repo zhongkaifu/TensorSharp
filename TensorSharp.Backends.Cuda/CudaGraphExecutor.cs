@@ -2256,6 +2256,8 @@ namespace TensorSharp.Cuda
         private bool TrySwigluFfn(Tensor[] inputs, IGraphWeight[] weights, long[] ip, Tensor[] results)
         {
             if (ip != null && ip.Length > 0 && ip[0] == 1) return false;
+            // The biased form (ip[1] = 1) runs as its ops: the kernels have no bias terms.
+            if (ip != null && ip.Length > 1 && ip[1] != 0) return false;
             if (weights.Length < 3 || weights[1] is not { } gateUp || weights[2] is not { } down) return false;
             Tensor x = inputs[0];
             long ff = gateUp.Ne1 / 2;

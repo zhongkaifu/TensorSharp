@@ -37,10 +37,6 @@ namespace TensorSharp.Models.MiniMaxH3
         private H3Lin _finalAdaLn, _finalVideoOut, _finalAudioOut;
         private IntPtr _refinerFinalNorm, _finalNorm;
         private readonly float[] _curveTable;   // [grid][timeEmbedDim]
-        // A PDD checkpoint's stacked output heads (MiniMax-H3-Image), as F32 [steps*patch][hidden]
-        // and [steps*patch], and the combined head per grid interval, pinned and bound like a weight.
-        private readonly float[] _pddWeight, _pddBias;
-        private readonly Dictionary<(int, int), H3Lin> _pddHeads = new();
         // Packed positions are constant across denoising steps. Keep an exact
         // snapshot because callers may reuse and mutate their layout buffers.
         // The derived tables remain private so public BuildRope callers still
@@ -73,13 +69,20 @@ namespace TensorSharp.Models.MiniMaxH3
 
         public MiniMaxH3DiT(string ggufPath) : this(ggufPath, BackendType.GgmlCuda, null) { }
 
-        /// <param name="ggufPath">The denoiser: a GGUF, or for MiniMax-H3-Image also the
-        /// safetensors release in its original tensor names (F32/F16/BF16 data only).</param>
+        /// <param name="ggufPath">The audio-video denoiser's GGUF. MiniMax-H3-Image's DiT (no audio stream, a PDD head bank)
+        /// is refused: it runs on the diffusion runtime (MiniMaxH3ImageDenoiser).</param>
         public MiniMaxH3DiT(string ggufPath, BackendType backend, IAllocator allocator)
         {
             _useNativeGraphArena = backend == BackendType.GgmlCuda;
             _weights = new MiniMaxH3WeightFile(ggufPath);
             Config = MiniMaxH3Config.Detect(_weights.Tensors);
+            if (!Config.HasAudio || Config.PddSteps > 1)
+            {
+                _weights.Dispose();
+                throw new NotSupportedException(
+                    $"'{System.IO.Path.GetFileName(ggufPath)}' is a MiniMax-H3-Image denoiser (no audio stream), which runs on the " +
+                    "diffusion runtime (the minimax-h3-image architecture), not as the MiniMax-H3 audio-video DiT.");
+            }
             string p = Config.Prefix;
 
             _videoPatch = Lin(p + "video_patch_proj.weight", p + "video_patch_proj.bias");
@@ -88,14 +91,7 @@ namespace TensorSharp.Models.MiniMaxH3
             _conditionProj = Lin(p + "condition_proj.weight", p + "condition_proj.bias");
             _finalAdaLn = Lin(p + "final_layer.adaln_proj.linear.weight",
                               p + "final_layer.adaln_proj.linear.bias");
-            if (Config.PddSteps > 1)
-            {
-                // The head bank is combined per step on the host (PddHead); keep it as F32.
-                _pddWeight = ReadVectorF32(p + "final_layer.video_out.weight");
-                _pddBias = ReadVectorF32(p + "final_layer.video_out.bias");
-            }
-            else
-                _finalVideoOut = Lin(p + "final_layer.video_out.weight", p + "final_layer.video_out.bias");
+            _finalVideoOut = Lin(p + "final_layer.video_out.weight", p + "final_layer.video_out.bias");
             if (Config.HasAudio)
                 _finalAudioOut = Lin(p + "final_layer.audio_out.weight", p + "final_layer.audio_out.bias");
             _finalNorm = PinF32(p + "final_layer.norm.weight");
@@ -149,9 +145,9 @@ namespace TensorSharp.Models.MiniMaxH3
             // shared direct primitives instead.
             if (allocator != null && !IsGgmlBackendType(backend))
             {
-                if (_weights.Gguf == null || !Config.HasAudio)
+                if (_weights.Gguf == null)
                     throw new NotSupportedException(
-                        $"MiniMax-H3{(Config.HasAudio ? "" : "-Image")} from '{System.IO.Path.GetFileName(ggufPath)}' " +
+                        $"MiniMax-H3 from '{System.IO.Path.GetFileName(ggufPath)}' " +
                         $"runs on the ggml backends (ggml_cuda, ggml_metal, ggml_cpu), not on {backend}.");
                 _direct = new MiniMaxH3DirectDiT(_weights.Gguf, Config, allocator);
             }
@@ -582,155 +578,6 @@ namespace TensorSharp.Models.MiniMaxH3
                     foreach (var h in pins) if (h.IsAllocated) h.Free();
                 }
                 return (videoOut, audioOut);
-            }
-            finally
-            {
-                if (nativeLockTaken) System.Threading.Monitor.Exit(_nativeGraphLock);
-            }
-        }
-
-        /// <summary>The output head of a PDD checkpoint for the step over grid intervals
-        /// [<paramref name="start"/>, <paramref name="stop"/>) (<see cref="MiniMaxH3ImageSampling.CombineHead"/>),
-        /// built once and kept pinned so the device cache keys on a stable pointer.</summary>
-        private H3Lin PddHead(float[] grid, int start, int stop)
-        {
-            if (_pddWeight == null)
-                throw new InvalidOperationException("this MiniMax-H3 checkpoint has a single output head.");
-            if (_pddHeads.TryGetValue((start, stop), out var head)) return head;
-            int rows = Config.VideoPatchDim, cols = Config.HiddenSize;
-            var (w, b) = MiniMaxH3ImageSampling.CombineHead(_pddWeight, _pddBias, rows, cols, grid, start, stop);
-            var wPin = GCHandle.Alloc(w, GCHandleType.Pinned);
-            var bPin = GCHandle.Alloc(b, GCHandleType.Pinned);
-            _pins.Add(wPin); _pins.Add(bPin);
-            head = new H3Lin
-            {
-                W = wPin.AddrOfPinnedObject(),
-                B = bPin.AddrOfPinnedObject(),
-                Ne0 = cols,
-                Ne1 = rows,
-                Bytes = 0,
-                Type = (int)GgmlTensorType.F32,
-            };
-            _bound.Add(head.W); _bound.Add(head.B);
-            _pddHeads[(start, stop)] = head;
-            return head;
-        }
-
-        /// <summary>
-        /// One MiniMax-H3-Image step: [text | reference images | target image] through the
-        /// trunk, the target's velocity out of the PDD head for grid intervals
-        /// [<paramref name="headStart"/>, <paramref name="headStop"/>). Tokens are patchified
-        /// (<see cref="PatchifyVideo"/>); the returned velocity is negated like the video
-        /// stream's, so <c>x += v * (sigmaNext - sigma)</c> is the Euler step.
-        /// </summary>
-        internal float[] ForwardImage(
-            float[] imageTokens, int imageCount,
-            float[] textHidden, int textCount,
-            MiniMaxH3PackedLayout layout,
-            float[] grid, int headStart, int headStop,
-            float[] referenceTokens = null, int referenceCount = 0)
-        {
-            bool nativeLockTaken = false;
-            try
-            {
-                System.Threading.Monitor.Enter(_nativeGraphLock, ref nativeLockTaken);
-                ObjectDisposedException.ThrowIf(_disposed, this);
-                if (layout is null) throw new ArgumentNullException(nameof(layout));
-                if (Config.HasAudio)
-                    throw new InvalidOperationException("ForwardImage runs MiniMax-H3-Image; this denoiser has an audio stream.");
-
-                var segments = new H3DitSegment[layout.ModulationSpans.Count];
-                for (int i = 0; i < segments.Length; i++)
-                {
-                    var span = layout.ModulationSpans[i];
-                    int ts = span.Row / MiniMaxH3Modality.Count, modality = span.Row % MiniMaxH3Modality.Count;
-                    segments[i] = new H3DitSegment
-                    {
-                        Start = span.Start,
-                        End = span.End,
-                        Col = ts * (MiniMaxH3Modality.VectorsPerRow * MiniMaxH3Modality.Count)
-                              + modality * MiniMaxH3Modality.VectorsPerRow,
-                    };
-                }
-
-                // References share the target's patch projection: one buffer, references first.
-                float[] videoInput = imageTokens;
-                if (referenceCount > 0)
-                {
-                    if (referenceTokens is null) throw new ArgumentNullException(nameof(referenceTokens));
-                    videoInput = new float[referenceTokens.Length + imageTokens.Length];
-                    Array.Copy(referenceTokens, videoInput, referenceTokens.Length);
-                    Array.Copy(imageTokens, 0, videoInput, referenceTokens.Length, imageTokens.Length);
-                }
-
-                H3Lin head = PddHead(grid, headStart, headStop);
-                float[] timeEmbed = TimeEmbedding(layout.Timesteps);
-                var (cos, sin) = GetRopeForForward(layout.Positions);
-                var videoOut = new float[(long)imageCount * Config.VideoPatchDim];
-                var pins = new List<GCHandle>();
-                IntPtr Pin(Array a)
-                {
-                    var h = GCHandle.Alloc(a, GCHandleType.Pinned);
-                    pins.Add(h);
-                    return h.AddrOfPinnedObject();
-                }
-                try
-                {
-                    if (_useNativeGraphArena && _nativeGraphArena == IntPtr.Zero)
-                        _nativeGraphArena = Marshal.AllocHGlobal(NativeGraphArenaBytes);
-                    var args = new H3DitForwardArgs
-                    {
-                        StructBytes = Marshal.SizeOf<H3DitForwardArgs>(),
-                        NumBlocks = _blocks.Length,
-                        NumRefinerBlocks = textCount > 0 ? _refiner.Length : 0,
-                        NumSegments = segments.Length,
-                        VideoTokens = Pin(videoInput),
-                        TextHidden = textCount > 0 ? Pin(textHidden) : IntPtr.Zero,
-                        TimeEmbed = Pin(timeEmbed),
-                        Cos = Pin(cos),
-                        Sin = Pin(sin),
-                        VideoOut = Pin(videoOut),
-                        VideoPatchProj = _videoPatch,
-                        ConditionProj = _conditionProj,
-                        Refiner = _refinerPin.AddrOfPinnedObject(),
-                        RefinerFinalNorm = _refinerFinalNorm,
-                        Blocks = _blocksPin.AddrOfPinnedObject(),
-                        Segments = Pin(segments),
-                        FinalNorm = _finalNorm,
-                        FinalAdaLn = _finalAdaLn,
-                        FinalVideoOut = head,
-                        NTok = layout.TokenCount,
-                        TextCount = textCount,
-                        ConditionCount = referenceCount,
-                        AudioStart = layout.VideoSpan.Start,
-                        AudioCount = 0,
-                        VideoStart = layout.VideoSpan.Start,
-                        VideoCount = imageCount,
-                        VideoCol = layout.VideoSpan.Row * 2,
-                        Hidden = Config.HiddenSize,
-                        Heads = Config.NumAttentionHeads,
-                        HeadDim = Config.AttentionHeadDim,
-                        Inner = Config.AttentionInnerDim,
-                        Ffn = Config.FfnHiddenSize,
-                        RotDim = Config.RopeRotaryDim,
-                        TimeEmbedDim = Config.TimeEmbedDim,
-                        NTimesteps = layout.Timesteps.Length,
-                        VideoPatchDim = Config.VideoPatchDim,
-                        TextDim = Config.TextDim,
-                        Eps = Config.NormEps,
-                        VideoScale = -1f,
-                        GraphArena = _nativeGraphArena,
-                        GraphArenaBytes = _nativeGraphArena != IntPtr.Zero ? NativeGraphArenaBytes : 0UL,
-                    };
-                    if (!GgmlBasicOps.TryMiniMaxH3DitForward(in args))
-                        throw new InvalidOperationException(
-                            "MiniMax-H3-Image DiT forward failed: " + GgmlBasicOps.LastNativeError());
-                }
-                finally
-                {
-                    foreach (var h in pins) if (h.IsAllocated) h.Free();
-                }
-                return videoOut;
             }
             finally
             {

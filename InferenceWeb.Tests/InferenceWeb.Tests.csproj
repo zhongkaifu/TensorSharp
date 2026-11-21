@@ -48,6 +48,12 @@
     <EmbeddedResource Include="Fixtures/NemotronAudio/frontend_reference.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxH3/noise-reference.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxH3/turbo-comfy-reference-rows.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3Image/torch-randn-stream.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3Image/pillow-resize.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3Image/diffusers-edit-golden.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3Image/vae-encoder-oracle.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3Image/LegacyGoldens/*.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3Image/PinnedQ4K/denoiser-seed2051.bin.gz" LogicalName="InferenceWeb.Tests.Fixtures.MiniMaxH3Image.PinnedQ4K.denoiser-seed2051.bin.gz" />
     <EmbeddedResource Include="Fixtures/MiniMaxM3/chat_reference.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxM3/tokenizer_reference.json" />
     <EmbeddedResource Include="Fixtures/Lfm3/*" />

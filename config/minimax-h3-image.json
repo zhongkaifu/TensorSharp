@@ -1,6 +1,9 @@
 {
-  // MiniMax-H3-Image — text to image at up to ~16 MP, the MiniMax-H3 DiT (33B) without
-  // its audio stream, six distilled steps, no CFG.
+  // MiniMax-H3-Image — text to image at up to ~16 MP and editing with up to 16 pictures, the
+  // MiniMax-H3 DiT (33B) without its audio stream, six distilled steps, no CFG. This config is the
+  // bf16 DiT as released; for smaller GPUs and Macs the same files with a quantized denoiser are
+  // minimax-h3-image-q8.json (46-48 GB), -q5km.json (20-24 GB) and -q4km.json (20 GB to 4480x4480,
+  // 32 GB Macs).
   //
   //   TensorSharp.Server.Host --config config/minimax-h3-image.json
   //
@@ -15,6 +18,14 @@
   // The text encoder is the same file config/minimax-h3-fl2va.json downloads, so the two
   // configs share it.
   //
+  // Backends (measured with real weights): ggml_cuda (H100, A40, RTX A4500) and ggml_metal (an
+  // M5 Pro, Q8_0 and Q4_K_M; bf16's 40.2 GB is the whole working set of a 48 GB Mac, use the Q8_0
+  // config there). ggml_cpu runs the same programs (validated on synthetic checkpoints only; with
+  // real weights a picture takes tens of minutes). bf16 peaks at 39.9 GiB at 2048x2048 and
+  // 42.6 GiB at 4096x4096 (an A40 46 GB holds both): the pipeline releases the text encoder before
+  // the denoise when the device cannot hold both, and refuses before any phase runs a picture
+  // the device cannot hold at all (CLI exit 2, server HTTP 507).
+  //
   // Steps, size and guidance are left to the model: six steps on the checkpoint's own
   // sigma grid (anything else is allowed but is not what it was distilled for), guidance
   // fixed at 1 (a cfg above 1 or a negative prompt is refused), and 2048 x 2048 when a
@@ -24,9 +35,20 @@
   // ComfyUI does (CPU torch.randn), so a seed reproduces ComfyUI's template picture up to
   // kernel precision.
   //
+  // Editing: --image a.png --image b.png ... (up to 16; the prompt names them <Picture 1>,
+  // <Picture 2>, ... in that order), or "imagePaths" on /api/image-edit and image[] on
+  // /v1/images/edits. An edit samples at least 4 MP (diffusers' min_generation_area) and is
+  // resized to the asked size; --keep-source-size keeps the first picture's. A mask (--mask,
+  // --mask-mode, --mask-invert, --mask-feather, --mask-crop) limits the edit to its white part.
+  //
+  // LoRA plug-ins: --lora config/lora/minimax-h3-image-*.json (the pDMD 2-step speed adapters
+  // and style adapters), applied unmerged, on either host; see config/README.md.
+  //
   // Licence: the MiniMax-H3-Image Community License Agreement, which excludes the United
-  // States, the European Union, the United Kingdom and the Republic of Korea; see
-  // docs/models/minimax-h3-image.md before using it.
+  // States, the European Union, the United Kingdom and the Republic of Korea, and asks for
+  // MiniMax's written authorization past USD 1 million of annual revenue or for a hosted
+  // service; see docs/models/minimax-h3-image.md before using it. The TensorAgent app shows
+  // these terms and asks for their acceptance before it downloads the model.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "hf": "https://huggingface.co",

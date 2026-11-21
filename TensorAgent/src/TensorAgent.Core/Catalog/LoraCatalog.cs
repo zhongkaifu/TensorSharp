@@ -51,10 +51,20 @@ public sealed record CatalogLora
     /// Other entries it applies to beside <see cref="BaseModelId"/>. Turbo style/edit adapters
     /// are checked with real pictures on at least one quantization. The same-architecture Q8
     /// entry shares compatibility; that does not imply separate image validation on Q8 (see
-    /// docs/models/qwenimage21.md for measured scope). Never a speed plug-in: Turbo already
-    /// supplies its own schedule, and the engine refuses a second one.
+    /// docs/models/qwenimage21.md for measured scope). Never a speed plug-in on a Qwen-Image
+    /// Turbo entry: Turbo already supplies its own schedule, and the engine refuses a second one.
+    /// Another quantization of the same checkpoint takes every plug-in of its base entry
+    /// (MiniMax-H3-Image's Q8_0 takes pDMD).
     /// </summary>
     public IReadOnlyList<string> AlsoFor { get; init; } = Array.Empty<string>();
+    /// <summary>
+    /// The terms its download needs accepted: those of the entries it applies to, when the plug-in is a Model
+    /// Derivative under their license (MiniMax-H3-Image's pDMD, under the MiniMax-H3-Image Community License). An
+    /// acceptance of the same revision recorded for one of those entries covers it (the user accepted that text when
+    /// the base model downloaded); none on record, its download is refused until the base entry's terms are accepted.
+    /// Null for plug-ins under their own open license.
+    /// </summary>
+    public CatalogLicenseTerms? LicenseTerms { get; init; }
     public required LoraKind Kind { get; init; }
     /// <summary>The adapter weights (always first) and any file the engine reads beside them.</summary>
     public required IReadOnlyList<LoraFile> Files { get; init; }
@@ -71,6 +81,13 @@ public sealed record CatalogLora
     /// Null when nothing beyond the weights is needed.
     /// </summary>
     public string? RecipeConfig { get; init; }
+    /// <summary>
+    /// A speed plug-in's own generation floor in pixels (diffusers' <c>min_generation_area</c>, the
+    /// <c>sampling</c> of its <see cref="RecipeConfig"/>), where it replaces the model's: MiniMax-H3-Image
+    /// samples at least 2048 x 2048, and pDMD, distilled around 1 MP, at the size asked. A picture made
+    /// with it asks for <see cref="Hosting.ImageTurns.TurnArea"/> of this floor. Null keeps the model's.
+    /// </summary>
+    public long? MinGenerationArea { get; init; }
     /// <summary>The engine's own config for a plug-in whose third-party config file ships with
     /// it (Fun-Acc's <c>pdd_config.json</c>): the file name in <see cref="Files"/> to pass.</summary>
     public string? ConfigFile { get; init; }
@@ -130,6 +147,10 @@ public static class LoraCatalog
     /// plug-ins target. The unified entry also includes Ref2VA, where the engine refuses them
     /// based on the active denoiser's file name.</summary>
     public const string MiniMaxH3Keyframes = "minimax-h3-fl2va-q4k";
+
+    /// <summary>The MiniMax-H3-Image entry its plug-ins are based on, and the other quantization that takes them.</summary>
+    public const string MiniMaxH3Image = "minimax-h3-image-q4km";
+    public const string MiniMaxH3ImageQ8 = "minimax-h3-image-q8-0";
 
     /// <summary>The commit of <c>lightx2v/Minimax-h3-Turbo</c> the MiniMax-H3 plug-ins are pinned to.</summary>
     private const string MiniMaxH3TurboCommit = "a29e57d195f80ead07c89f89e55ecf2911e893c5";
@@ -445,6 +466,32 @@ public static class LoraCatalog
             },
             Purpose = "catalog.lora.minimaxH3Turbo4Step.purpose",
             License = "Apache-2.0",
+        },
+        // MiniMax-H3-Image pDMD 2-step (linoyts @c07d96e5, read from the tree API on 2026-11-19): step
+        // distillation for pictures and edits, applied unmerged. The config fixes 2 steps on [1, 12/13, 0], the
+        // heads by step, CFG 1 and the asked size as the floor; a picture that asks for anything else is refused,
+        // never overridden. The only MiniMax-H3-Image plug-in the app offers (decision D7): config/lora/ also has
+        // akhaliq's ComfyUI conversion and a style adapter, for the CLI and server only
+        // (LoraCatalogTests.ConfigsTheAppDoesNotOffer says why).
+        new CatalogLora
+        {
+            Id = "minimax-h3-image-pdmd-2step",
+            DisplayName = "pDMD 2-Step",
+            BaseModelId = MiniMaxH3Image,
+            AlsoFor = new[] { MiniMaxH3ImageQ8 },
+            LicenseTerms = ModelCatalog.MiniMaxH3ImageTerms,
+            Kind = LoraKind.Speed,
+            Steps = 2,
+            RecipeConfig = "minimax-h3-image-pdmd-2step.json",
+            MinGenerationArea = 1024,
+            Files = new[]
+            {
+                new LoraFile("pytorch_lora_weights.safetensors",
+                    Hf("linoyts/MiniMax-H3-Image-pDMD-2steps", "c07d96e5635311ed007d44654c2f98cc8d6e0a1e", "pytorch_lora_weights.safetensors"),
+                    1_383_680_256, "c0a88d9c1de401e50894424a6b9a73e46b4f0d977e181e48642fdcfe98ede435"),
+            },
+            Purpose = "catalog.lora.minimaxH3ImagePdmd2Step.purpose",
+            License = "catalog.license.minimaxH3Image",
         },
     };
 

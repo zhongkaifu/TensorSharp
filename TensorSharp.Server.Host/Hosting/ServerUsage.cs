@@ -282,6 +282,17 @@ namespace TensorSharp.Server.Host.Hosting
                     "(an already-set value is used when the flag is absent).",
                     TensorSharp.Graph.PromptAttentionConfig.Flag + " f16"),
             }),
+            ("Diffusion products (--backend ggml_cuda)", new[]
+            {
+                new OptionHelp(TensorSharp.Graph.DiffusionProductsConfig.Flag + " <p>",
+                    "Arithmetic of a diffusion model's wide weight products on --backend ggml_cuda (MiniMax-H3-Image, " +
+                    "MiniMax-H3 video, Qwen-Image 2.1): bf16 (the default: the products as stored, BF16 and Q4_K on cuBLAS " +
+                    "BF16), int8 (the DiT's projections on int8 tensor cores, each weight row and token rounded to 8 bits: " +
+                    "faster, and it changes the picture) or int8-all (int8 plus the VAE decoders' F16 projections). Other " +
+                    "backends run the products as stored. Config key diffusion-products; sets TS_DIFFUSION_PRODUCTS (an " +
+                    "already-set value is used when the flag is absent). Replaces TS_H3_INT8_MATMUL.",
+                    TensorSharp.Graph.DiffusionProductsConfig.Flag + " int8"),
+            }),
             ("Responses API store", new[]
             {
                 new OptionHelp("--redis-url <url>",
@@ -368,7 +379,7 @@ namespace TensorSharp.Server.Host.Hosting
                     "loads without it, with a warning.",
                     "--qwen-image-variant turbo"),
             }),
-            ("LoRA plug-ins (Qwen-Image-2.1, MiniMax-H3 FL2VA)", new[]
+            ("LoRA plug-ins (Qwen-Image-2.1, MiniMax-H3 FL2VA, MiniMax-H3-Image)", new[]
             {
                 new OptionHelp("--lora <path>",
                     "LoRA plug-in for the hosted Qwen-Image-2.1 or MiniMax-H3 (FL2VA) model: a TensorSharp plug-in config " +
@@ -378,7 +389,13 @@ namespace TensorSharp.Server.Host.Hosting
                     "config only: the LightX2V Turbo step-distillation plug-ins config/lora/minimax-h3-fl2v-turbo-8step.json " +
                     "(8 steps) and config/lora/minimax-h3-fl2v-turbo-4step.json (4 steps), which lock --video-steps and a " +
                     "request's \"steps\", \"flowShift\", \"sampler\" and \"cfg\" to their recipe (unset or equal is accepted; " +
-                    "anything else is refused) and are refused on the Ref2VA checkpoint. Applied unmerged on top of the " +
+                    "anything else is refused) and are refused on the Ref2VA checkpoint. MiniMax-H3-Image takes " +
+                    "minimax-h3-image-lora configs and bare LoRA .safetensors (diffusers PEFT, ComfyUI or kohya names), " +
+                    "repeatable as style adapters each at its own --lora-scale, plus at most one speed adapter: the pDMD plug-ins " +
+                    "config/lora/minimax-h3-image-pdmd-2step.json (2 steps) and config/lora/minimax-h3-image-pdmd-2step-comfy.json " +
+                    "(2 steps), which lock a request's \"steps\" and \"cfg\" the same way; the style plug-in " +
+                    "config/lora/minimax-h3-image-seedreamstyle.json fixes nothing. A request's \"loras\" list swaps them per " +
+                    "picture. Applied unmerged on top of the " +
                     "quantized transformer, so small distillation deltas are kept exactly. A plug-in the startup model does " +
                     "not take is refused at startup, before the plug-in downloads; when a --config still has to download the " +
                     "model, the model's family is checked right after that download (a contradicting --video-steps is refused " +

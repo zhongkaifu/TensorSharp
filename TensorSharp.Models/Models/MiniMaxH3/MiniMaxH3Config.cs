@@ -112,11 +112,6 @@ namespace TensorSharp.Models.MiniMaxH3
         public static bool IsMiniMaxH3(IReadOnlyDictionary<string, GgufTensorInfo> tensors)
             => TryFindPrefix(tensors, out _);
 
-        /// <summary>True when the tensor table is a MiniMax-H3-Image denoiser: the H3 DiT
-        /// with no audio stream.</summary>
-        public static bool IsMiniMaxH3Image(IReadOnlyDictionary<string, GgufTensorInfo> tensors)
-            => TryFindPrefix(tensors, out _, requireAudio: false) && !TryFindPrefix(tensors, out _);
-
         /// <summary>Locate the prefix the H3 weights sit under, if any. The audio-video
         /// denoisers are the ones with both patch projections; <paramref name="requireAudio"/>
         /// false also accepts an image denoiser (video patch and text projections only).</summary>

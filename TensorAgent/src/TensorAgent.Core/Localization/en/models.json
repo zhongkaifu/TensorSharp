@@ -90,5 +90,13 @@
   "models.alert.delete.message": "Remove {model} from this device? It can be downloaded again.",
   "models.alert.delete.messageLocal": "Remove {model} from this device? You will need to choose the original local GGUF again to restore it.",
   "models.alert.delete.confirm": "Delete",
-  "models.action.unavailable": "Unavailable"
+  "models.action.unavailable": "Unavailable",
+  "models.license.title": "License terms",
+  "models.license.intro": "{model} is licensed under the {license}. Read the terms below: the download starts only if you accept them.",
+  "models.license.changed": "The terms have changed since you last accepted them.",
+  "models.license.summary": "Summary",
+  "models.license.fullText": "Full license text (English, as published)",
+  "models.license.open": "Open the license on Hugging Face",
+  "models.license.accept": "Accept and download",
+  "models.license.decline": "Decline"
 }

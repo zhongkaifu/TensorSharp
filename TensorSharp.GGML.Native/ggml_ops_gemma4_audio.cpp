@@ -40,6 +40,9 @@ struct audio_graph {
     std::vector<binding> bindings;
     struct immutable_upload { ggml_tensor * tensor; void * data; size_t bytes; };
     std::vector<immutable_upload> immutable_uploads;
+    // Cached device copies bound and not yet written: dropped unless execute() wrote them (a graph abandoned before
+    // its upload must not leave them published).
+    tsg::PendingDeviceCopies pending;
 
     int graph_capacity;
     bool require_float32_precision;
@@ -89,7 +92,7 @@ struct audio_graph {
         bool upload = false;
         if (try_bind_cached_tensor(g_backend, ggml_backend_get_device(g_backend), tensor, desc.data,
             static_cast<size_t>(desc.raw_bytes), upload, GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
-            if (upload) immutable_uploads.push_back({tensor, desc.data, static_cast<size_t>(desc.raw_bytes)});
+            if (upload) { immutable_uploads.push_back({tensor, desc.data, static_cast<size_t>(desc.raw_bytes)}); pending.add(desc.data); }
             return tensor;
         }
         return bind(desc);
@@ -98,9 +101,12 @@ struct audio_graph {
     ggml_tensor * bind_quantized(void * data, ggml_type type, int input, int output, size_t bytes) {
         auto * tensor = ggml_new_tensor_2d(context.value, type, input, output);
         bool upload = false;
-        if (!try_bind_cached_tensor(g_backend, ggml_backend_get_device(g_backend), tensor, data,
-            bytes, upload, GGML_BACKEND_BUFFER_USAGE_WEIGHTS) || upload)
+        const bool cached = try_bind_cached_tensor(g_backend, ggml_backend_get_device(g_backend), tensor, data,
+            bytes, upload, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (!cached || upload)
             immutable_uploads.push_back({tensor, data, bytes});
+        if (cached && upload)
+            pending.add(data);
         return tensor;
     }
 
@@ -123,6 +129,7 @@ struct audio_graph {
             ggml_backend_tensor_set(item.first, item.second.data(), 0, item.second.size() * sizeof(float));
         for (const auto& item : immutable_uploads)
             ggml_backend_tensor_set(item.tensor, item.data, 0, item.bytes);
+        pending.commit();
         ggml_status status = GGML_STATUS_SUCCESS;
         bool handled = false;
 #if defined(TSG_GGML_USE_METAL)

@@ -52,6 +52,16 @@ namespace TensorSharp.Models.Architecture
         public Func<GgufFile, bool> DetectFromTensors { get; init; }
 
         /// <summary>
+        /// Recognises a model file of this family shipped as safetensors rather than GGUF (MiniMax-H3-Image's
+        /// Comfy-Org denoiser), from its header alone: tensor names, shapes and dtypes, and the
+        /// <c>__metadata__</c> map. The loader offers a <c>.safetensors</c> model file to every registered detector
+        /// (<see cref="ModelArchitectureRegistry.ResolveSafetensors"/>) before any GGUF probe, so neither the
+        /// loader nor the hosts' file checks carry a family's special case. Must return true only for a file this
+        /// family's model implements. Null for the normal case.
+        /// </summary>
+        public Func<SafetensorsFile, bool> DetectSafetensors { get; init; }
+
+        /// <summary>
         /// Recognises a GGUF of this family that a converter labelled with a GENERIC
         /// architecture instead of the family's own id - llama.cpp's older
         /// <c>convert_hf_to_gguf.py</c> wrote Mistral Small 3.1 as

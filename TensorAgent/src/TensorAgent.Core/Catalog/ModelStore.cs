@@ -79,6 +79,29 @@ public sealed class ModelStore
     /// </summary>
     internal Action<string, string> CreateHardLink { get; init; } = HardLinks.Create;
 
+    /// <summary>
+    /// The license acceptances a download of an entry with <see cref="CatalogModel.LicenseTerms"/> is checked
+    /// against (<see cref="DownloadAsync"/>). Null keeps none: such an entry then never downloads, which is the
+    /// safe way for a store nobody gave the user's answers to be wrong. Entries without terms are unaffected.
+    /// </summary>
+    public LicenseAcceptanceStore? Licenses { get; init; }
+
+    /// <summary>Whether <paramref name="model"/> declares terms that have not been accepted (at their current
+    /// revision): its download is refused until they are.</summary>
+    public bool NeedsLicenseAcceptance(CatalogModel model)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        return model.LicenseTerms is not null && !(Licenses?.IsAccepted(model) ?? false);
+    }
+
+    /// <summary>Refuse, before anything is fetched or linked, a download whose license terms are not accepted.</summary>
+    /// <exception cref="LicenseAcceptanceRequiredException">They are not.</exception>
+    public void EnsureLicenseAccepted(CatalogModel model)
+    {
+        if (NeedsLicenseAcceptance(model))
+            throw new LicenseAcceptanceRequiredException(model);
+    }
+
     /// <param name="root">Directory holding one sub-folder per catalog entry.</param>
     /// <param name="downloader">Fetches the files; a default one when null.</param>
     /// <param name="catalog">
@@ -241,6 +264,9 @@ public sealed class ModelStore
             throw new InvalidOperationException(
                 Loc.T("host.models.noDownloadUrl", ("model", model.DisplayName), ("file", model.Weights.FileName)));
         }
+        // Every download of an entry passes here -- the Models page's, the HTTP route's, a resume -- so this is
+        // where its license terms are enforced, before a byte is fetched or a shared copy linked.
+        EnsureLicenseAccepted(model);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {

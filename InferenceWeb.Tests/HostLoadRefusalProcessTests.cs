@@ -385,7 +385,7 @@ public class HostLoadRefusalProcessTests : IDisposable
     }
 
     [Theory]
-    [InlineData("qwen35", "--lora applies to Qwen-Image-2.1 and MiniMax-H3 (FL2VA) models only")]
+    [InlineData("qwen35", "--lora applies to Qwen-Image-2.1, MiniMax-H3 (FL2VA) and MiniMax-H3-Image models only")]
     [InlineData("qwen_image", "--lora turbo-8step.json is a minimax-h3-lora plug-in;")]
     public void Cli_H3TurboPlugin_OnAnotherFamily_IsRefusedBeforeAnyDownload(string architecture, string reason)
     {

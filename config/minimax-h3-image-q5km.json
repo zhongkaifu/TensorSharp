@@ -1,0 +1,77 @@
+{
+  // MiniMax-H3-Image with Unsloth's Q5_K_M denoiser (14.6 GB): the choice for a 20-24 GB GPU. Of the
+  // quantizations that fit 20 GB it is the closest to the bf16 DiT. Text to image and editing with up
+  // to 16 pictures; six distilled steps, no CFG.
+  //
+  //   TensorSharp.Cli --config config/minimax-h3-image-q5km.json \
+  //     --prompt "a red paper lantern in a snowy courtyard at dusk" --output lantern.png
+  //   TensorSharp.Server.Host --config config/minimax-h3-image-q5km.json
+  //
+  // Downloads into ${modelRoot} on the first run (~34 GB) and reuses the files after:
+  //   1. the denoiser     (model)               Q5_K_M GGUF of Comfy-Org's pruned DiT    14.6 GB
+  //   2. Qwen3-VL-32B     (video-text-encoder)  MiniMax-H3's text encoder, 50 layers   16.97 GiB
+  //   3. the image VAE    (video-vae)           2-D ViT decoder, 16x                    1.17 GB
+  // Files 2 and 3 are config/minimax-h3-image.json's and the encoder config/minimax-h3-fl2va.json's
+  // (same paths), so the configs share them.
+  //
+  // Measured on an RTX A4500 20 GB, ggml_cuda (docs/models/minimax-h3-image.md#quantizations):
+  //   2048x2048: 3.88 s a step, 32.0 s a picture in a fresh process, 27.6 s warm on the server,
+  //     16.6 GiB peak (the text encoder is released before the denoise).
+  //   The largest square that runs there is 3840x3840 (19.0 GiB); 4096x4096 is refused before any
+  //   phase runs. For native 4096x4096 on 20 GB use minimax-h3-image-q4km.json (to 4480x4480).
+  //   Against the bf16 DiT: 21.8 dB mean PSNR over four prompts, level with Q6_K (which stops at
+  //     3328x3328 on 20 GB) and 4.5 dB closer than Q4_K_M; clean English and Chinese lettering.
+  //
+  // Requests, editing, LoRA plug-ins and masks are as for config/minimax-h3-image.json (see its
+  // comment and the model guide): steps, guidance and seeds are the model's, <Picture n> names the
+  // n-th --image, a LoRA plug-in is added with --lora config/lora/minimax-h3-image-*.json.
+  //
+  // Licence: the MiniMax-H3-Image Community License Agreement, which excludes the United States,
+  // the European Union, the United Kingdom and the Republic of Korea, and asks for MiniMax's written
+  // authorization past USD 1 million of annual revenue or for a hosted service; see
+  // docs/models/minimax-h3-image.md before using it.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "hf": "https://huggingface.co",
+    "unsloth": "${hf}/unsloth/MiniMax-H3-Image-GGUF/resolve/0d25c7349e007529691bbc0f4426b579fce7de01",
+    "comfy": "${hf}/Comfy-Org/MiniMax-H3-Image/resolve/0bb149f51e3156ed4b90dd45d5620346bfe1df8f",
+    "gguf": "${hf}/unsloth/MiniMax-H3-GGUF/resolve/d629413c2e5b51b38c453668b75ca3b06ca92703"
+  },
+
+  "backend": "ggml_cuda",
+
+  "model": {
+    "path": "${modelRoot}/minimax-h3-image/minimax_h3_image_pruned-Q5_K_M.gguf",
+    "urls": [ "${unsloth}/minimax_h3_image_pruned-Q5_K_M.gguf" ],
+    "sha256": "356b59a267c10bcb11c3379ade194ab4589749fb4ff3b341dc69382bded2ba89"
+  },
+
+  "video-text-encoder": {
+    "path": "${modelRoot}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+    "urls": [ "${gguf}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf" ],
+    "sha256": "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc",
+    "files": [
+      {
+        "path": "${modelRoot}/vocab.json",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/vocab.json" ],
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      },
+      {
+        "path": "${modelRoot}/merges.txt",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/merges.txt" ],
+        "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+      },
+      {
+        "path": "${modelRoot}/tokenizer_config.json",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/tokenizer_config.json" ],
+        "sha256": "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68"
+      }
+    ]
+  },
+
+  "video-vae": {
+    "path": "${modelRoot}/minimax-h3-image/minimax_h3_image_vae_fp16.safetensors",
+    "urls": [ "${comfy}/vae/minimax_h3_image_vae_fp16.safetensors" ],
+    "sha256": "d80e9c2e5cfc9844869961ff5a58c9a9e52182df6bfb30b26018dd7f348721af"
+  }
+}

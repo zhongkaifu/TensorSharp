@@ -212,7 +212,7 @@ LogLevel resolvedLogLevel = LoggingSetup.ResolveMinimumLevel();
 string? configuredBackendInput = ServerOptionsBuilder.ReadConfiguredBackendInput(args);
 bool redisFlagsApplied, continuousBatchingFlagApplied, specFlagsApplied, qwenImageFlagsApplied,
     kvCacheDtypeFlagApplied, moeCpuOffloadFlagsApplied, gpuDeviceFlagApplied, tensorParallelFlagsApplied,
-    promptAttentionFlagApplied;
+    promptAttentionFlagApplied, diffusionProductsFlagApplied;
 try
 {
     ServerOptionsBuilder.ApplyPrefixCacheCliFlag(args);
@@ -254,6 +254,8 @@ try
     // Translate --prompt-attention into TS_PROMPT_ATTENTION, which the CUDA executor reads when the model loads
     // (and refuse an unknown inherited value now, before a model loads).
     promptAttentionFlagApplied = ServerOptionsBuilder.ApplyPromptAttentionCliFlag(args);
+    // Translate --diffusion-products into TS_DIFFUSION_PRODUCTS, which the native CUDA products read.
+    diffusionProductsFlagApplied = ServerOptionsBuilder.ApplyDiffusionProductsCliFlag(args);
     // Translate --tp / --layer-split and distributed options into the model placement env vars
     // the model loader reads (ModelBase.Create for the local degree,
     // DistributedTpConfig for the multi-node pair). Must run before the startup
@@ -560,6 +562,18 @@ if (TensorSharp.Graph.PromptAttentionConfig.FromEnvironment() is { } configuredA
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
         "Prompt attention configured via {Source}: {AttentionPath} (applies to prompt chunks on --backend cuda; the default is " +
         "int8 where it runs, f16 elsewhere)", attentionSource, attentionPath);
+}
+
+if (TensorSharp.Graph.DiffusionProductsConfig.FromEnvironment() is { } configuredProducts)
+{
+    // An option's name and one of its three fixed values, never request content.
+    string productsSource = diffusionProductsFlagApplied
+        ? "CLI (" + TensorSharp.Graph.DiffusionProductsConfig.Flag + ")" : TensorSharp.Graph.DiffusionProductsConfig.EnvironmentVariable;
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Diffusion products configured via {Source}: {Products} (applies to a diffusion model's wide products on --backend ggml_cuda)",
+        productsSource, TensorSharp.Graph.DiffusionProductsConfig.Name(configuredProducts));
+    if (TensorSharp.Graph.DiffusionProductsConfig.IgnoredOn(configuredProducts, hostingOptions.DefaultBackend) is { } ignored)
+        startupLogger.LogWarning(LogEventIds.HostConfiguration, "{Warning}", ignored);
 }
 
 if (tensorParallelFlagsApplied)

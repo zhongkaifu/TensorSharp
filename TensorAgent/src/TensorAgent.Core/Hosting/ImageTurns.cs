@@ -48,11 +48,20 @@ public static partial class ImageTurns
     /// <summary>
     /// The output area a turn asks for: 1024 x 1024 for a picture made from words. An edit
     /// returns its source picture's own size and samples at this area at most, at the
-    /// picture's shape (see <see cref="ImagePlan.Payload"/>). The model's native area is 2048
-    /// x 2048, which has four times the image tokens and costs several times as long per
-    /// step; the page offers no size setting, so this is the budget every turn gets.
+    /// picture's shape (see <see cref="ImagePlan.Payload"/>). Qwen-Image-2.1's native area is
+    /// 2048 x 2048, which has four times the image tokens and costs several times as long per
+    /// step; the page offers no size setting, so this is the budget every turn gets, unless the
+    /// model declares a floor of its own (<see cref="TurnArea"/>).
     /// </summary>
     public const long DefaultTargetArea = 1024L * 1024;
+
+    /// <summary>
+    /// The area a turn asks the loaded model for: <see cref="DefaultTargetArea"/>, or the model's
+    /// declared floor where it is larger (IImageGenerationModel.MinimumGenerationArea:
+    /// MiniMax-H3-Image's 2048 x 2048, below which an edit samples there anyway and a picture from
+    /// words is made at a size the model was not trained for).
+    /// </summary>
+    public static long TurnArea(long minimumGenerationArea) => Math.Max(DefaultTargetArea, minimumGenerationArea);
 
     /// <summary>
     /// Where a chat turn's frames come from: the image service when the loaded model
@@ -94,9 +103,13 @@ public static partial class ImageTurns
     /// Or why it cannot be made as the user asked, which ends the turn with that message rather
     /// than with a picture or clip made without the plug-ins they turned on.
     /// </summary>
-    public sealed record Preparation(string? Error, IReadOnlyList<LoraSpec> Specs, IReadOnlyList<string> Loras)
+    /// <param name="MinimumArea">The applied speed plug-in's generation floor where it replaces the model's
+    /// (<see cref="Catalog.CatalogLora.MinGenerationArea"/>: pDMD samples at the size asked), or null.</param>
+    public sealed record Preparation(string? Error, IReadOnlyList<LoraSpec> Specs, IReadOnlyList<string> Loras,
+        long? MinimumArea = null)
     {
-        public static Preparation Ready(IReadOnlyList<LoraSpec> specs, IReadOnlyList<string> loras) => new(null, specs, loras);
+        public static Preparation Ready(IReadOnlyList<LoraSpec> specs, IReadOnlyList<string> loras, long? minimumArea = null) =>
+            new(null, specs, loras, minimumArea);
         public static Preparation Refused(string error) => new(error, Array.Empty<LoraSpec>(), Array.Empty<string>());
     }
 
@@ -145,6 +158,7 @@ public static partial class ImageTurns
         // turn is a stopped turn, and the app's GPU gate tells a damaged engine from a refusal
         // only by what reaches it (AgentAppHost.GatedChatFrames).
         ImagePlan plan = await PlanAsync(conversation, planner, cancellationToken).ConfigureAwait(false);
+        plan = plan with { Area = TurnArea(chat.LoadedImageModelMinimumArea) };
         if (plan.Choices is { } choices)
         {
             // The question is the answer's text, so the transcript and a text model reading
@@ -163,6 +177,10 @@ public static partial class ImageTurns
             yield return new { done = true, error = refusal, sessionId };
             yield break;
         }
+        // A speed plug-in with a floor of its own replaces the model's (MiniMax-H3-Image's 2048 x 2048 becomes the
+        // 1 MP pDMD was distilled at): the turn asks for what that schedule makes.
+        if (prepared?.MinimumArea is { } pluginFloor)
+            plan = plan with { Area = TurnArea(pluginFloor) };
 
         // Before the first step, so the page can say what it is doing while it does it. A turn
         // the GPU gate runs again plans again and sends this again; the page keeps the last.

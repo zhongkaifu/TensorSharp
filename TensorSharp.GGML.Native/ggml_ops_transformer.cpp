@@ -155,6 +155,7 @@ namespace
 
         struct HostBinding { ggml_tensor* tensor; const void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
 
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
@@ -172,8 +173,7 @@ namespace
                     ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
                     if (st == GGML_STATUS_SUCCESS)
                     {
-                        if (needs_upload)
-                            upload_list.push_back({t, data, bytes});
+                        if (needs_upload) { upload_list.push_back({t, data, bytes}); pending.add(data); }
                         return;
                     }
 
@@ -215,6 +215,7 @@ namespace
         // Upload non-host-ptr tensors.
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
 
         ggml_backend_tensor_set(q_in, q_data, 0, static_cast<std::size_t>(q_dim) * sizeof(float));
         ggml_backend_tensor_set(k_in, k_data, 0, static_cast<std::size_t>(kv_dim) * sizeof(float));

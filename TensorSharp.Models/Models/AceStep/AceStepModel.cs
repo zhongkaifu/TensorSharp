@@ -30,7 +30,7 @@ using System.Text;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Models.Audio;
 using TensorSharp.Models.Direct;
-using TensorSharp.Models.MiniMaxH3;
+using TensorSharp.Models.SharedDiffusion;
 using TensorSharp.Models.Video;
 using TensorSharp.Runtime;
 

@@ -135,6 +135,49 @@ namespace TensorSharp.Models.Architecture
                 "The model declares no architecture and no registered tensor-layout detector recognized it.");
         }
 
+        /// <summary>Whether <paramref name="path"/> names a safetensors model file (by its extension), which the loader
+        /// offers to the families' <see cref="ModelArchitectureDescriptor.DetectSafetensors"/> instead of opening it as
+        /// a GGUF.</summary>
+        public static bool IsSafetensorsPath(string path) =>
+            path != null && path.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// The family that claims the safetensors model file <paramref name="path"/>, offered to every registered
+        /// <see cref="ModelArchitectureDescriptor.DetectSafetensors"/> in registration order (the first claim wins), or
+        /// null when the path is not a safetensors file, cannot be read as one, or no family claims it. Reads the
+        /// header only; nothing is mapped.
+        /// </summary>
+        public static ModelArchitectureDescriptor ResolveSafetensors(string path)
+        {
+            if (!IsSafetensorsPath(path) || !System.IO.File.Exists(path))
+                return null;
+            var detectors = All.Where(d => d.DetectSafetensors != null).ToArray();
+            if (detectors.Length == 0)
+                return null;
+            SafetensorsFile file;
+            try
+            {
+                file = new SafetensorsFile(path);
+            }
+            catch (Exception e) when (e is System.IO.IOException or System.IO.InvalidDataException or NotSupportedException
+                or UnauthorizedAccessException or System.Text.Json.JsonException or KeyNotFoundException
+                or InvalidOperationException or FormatException or OverflowException)
+            {
+                // Not a readable safetensors header: no family claims it, and the caller reports the file as it would
+                // any unrecognised model.
+                return null;
+            }
+            using (file)
+            {
+                foreach (var candidate in detectors)
+                {
+                    if (candidate.DetectSafetensors(file))
+                        return candidate;
+                }
+                return null;
+            }
+        }
+
         /// <summary>
         /// Locate the mmproj companion for a loaded model when the operator did not
         /// name one, using the architecture's own <see

@@ -43,6 +43,20 @@ public static partial class WebUiRoutes
             string id = request.RouteValues["id"];
             if (Find(id) is not { } lora)
                 return Task.FromResult(NotFound(id));
+            // A plug-in under its base model's license (CatalogLora.LicenseTerms) downloads once that license is accepted:
+            // it answers with the base entry's terms instead of starting, as that entry's own download does.
+            if (host.Loras.NeedsLicenseAcceptance(lora))
+            {
+                CatalogModel? baseModel = LicenseAcceptanceStore.BaseEntries(lora, host.Catalog).FirstOrDefault();
+                return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new
+                {
+                    error = new LoraLicenseAcceptanceRequiredException(lora, baseModel).Message,
+                    licenseRequired = true,
+                    id = lora.Id,
+                    model = baseModel?.Id,
+                    license = baseModel is null ? null : DescribeTerms(baseModel, host.Models),
+                }, 409));
+            }
             host.StartLoraDownload(lora);
             return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Sse(
                 WatchFrames(host.Downloads, AgentAppHost.LoraDownloadKey(lora), ct), request.Cancellation));

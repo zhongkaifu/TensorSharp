@@ -75,5 +75,9 @@
   "host.engine.unknown": "inconnu",
   "host.video.keyframesUnavailable": "Ce modèle vidéo ne prend pas en charge les images clés à des positions arbitraires.",
   "host.video.ingredientsUnavailable": "Les références d’identité Ingredients nécessitent un checkpoint IC-LoRA ; utilisez des images clés avec LTX 2.5 Distilled.",
-  "host.video.invalidFrames": "Le nombre d’images LTX doit être positif et suivre la règle 8n+1."
+  "host.video.invalidFrames": "Le nombre d’images LTX doit être positif et suivre la règle 8n+1.",
+  "host.license.required": "{model} ne se télécharge qu’après acceptation de ses conditions de licence ({license}).",
+  "host.license.loraRequired": "{lora} est un dérivé de {model} sous la même licence ({license}) : il se télécharge après acceptation de cette licence pour {model} (page Modèles).",
+  "host.license.changed": "Les conditions de licence de {model} ont changé. Relisez-les et acceptez la version actuelle.",
+  "host.license.notRequired": "{model} n’a pas de conditions de licence à accepter."
 }

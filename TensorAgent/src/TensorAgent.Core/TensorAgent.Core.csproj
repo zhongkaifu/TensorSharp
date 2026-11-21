@@ -29,6 +29,10 @@
          LoraStore.SpecFor); embedding the repository's files keeps the app on the same
          schedules the CLI and server use, and LoraCatalogTests keeps the catalog equal to them. -->
     <EmbeddedResource Include="..\..\..\config\lora\*.json" LogicalName="lora/%(Filename)%(Extension)" />
+    <!-- Licenses a catalog entry must have accepted before it downloads (CatalogLicenseTerms), verbatim:
+         the app shows the full text before anything is fetched, and the revision is its SHA-256. -->
+    <EmbeddedResource Include="Catalog\Licenses\*.txt"
+                      LogicalName="TensorAgent.Core.Catalog.Licenses.%(Filename)%(Extension)" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="TensorAgent.Tests" />

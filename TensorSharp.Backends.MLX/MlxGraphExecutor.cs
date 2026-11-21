@@ -136,6 +136,8 @@ namespace TensorSharp.MLX
             if (x == null || x.Storage is not MlxStorage || x.ElementType != DType.Float32 || x.ElementCount() % x.Sizes[^1] != 0)
                 return false;
             bool split = ip != null && ip.Length > 0 && ip[0] == 1;
+            // The biased form (ip[1] = 1) runs as its ops: the kernel has no bias terms.
+            if (ip != null && ip.Length > 1 && ip[1] != 0) return false;
             IGraphWeight gate = weights[1], up = split ? weights[2] : null, down = weights[split ? 3 : 2];
             if (gate == null || down == null || (split && up == null)) return false;
             long rows = x.ElementCount() / x.Sizes[^1];

@@ -466,6 +466,7 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
 
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
@@ -480,7 +481,7 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
                 {
                     if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
                     {
-                        if (needs_upload) upload_list.push_back({t, data, bytes});
+                        if (needs_upload) { upload_list.push_back({t, data, bytes}); pending.add(data); }
                         return;
                     }
                     invalidate_cached_buffer(data);
@@ -549,6 +550,7 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
 
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
 
         ggml_backend_tensor_set(hidden_t, d->hidden, 0, static_cast<std::size_t>(H) * C * sizeof(float));
         std::vector<std::int32_t> pos_data(C);
@@ -883,6 +885,7 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
         auto bind_or_mark = [&](ggml_tensor* tt, void* data, std::size_t bytes, bool cacheable,
                                 enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
@@ -893,7 +896,7 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, tt, data, bytes, buf, addr, needs_upload, usage))
                 {
                     if (ggml_backend_tensor_alloc(buf, tt, addr) == GGML_STATUS_SUCCESS)
-                    { if (needs_upload) upload_list.push_back({tt, data, bytes}); return; }
+                    { if (needs_upload) { upload_list.push_back({tt, data, bytes}); pending.add(data); } return; }
                     invalidate_cached_buffer(data);
                 }
             }
@@ -959,6 +962,7 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
 
         host_read_barrier();
         for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, (std::size_t)H * C * sizeof(float));
         std::vector<std::int32_t> pos_data(C);
         for (int i = 0; i < C; i++) pos_data[i] = P + i;
@@ -1055,6 +1059,7 @@ TSG_EXPORT int TSGgml_DiffusionLmHead(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         std::vector<BufferHandle> ephemeral_bufs;
         auto bind_or_mark = [&](ggml_tensor* tt, void* data, std::size_t bytes, bool cacheable) {
             if (tt == nullptr || data == nullptr) return;
@@ -1064,7 +1069,7 @@ TSG_EXPORT int TSGgml_DiffusionLmHead(
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, tt, data, bytes, buf, addr, needs_upload, GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
                 {
                     if (ggml_backend_tensor_alloc(buf, tt, addr) == GGML_STATUS_SUCCESS)
-                    { if (needs_upload) upload_list.push_back({tt, data, bytes}); return; }
+                    { if (needs_upload) { upload_list.push_back({tt, data, bytes}); pending.add(data); } return; }
                     invalidate_cached_buffer(data);
                 }
             }
@@ -1083,6 +1088,7 @@ TSG_EXPORT int TSGgml_DiffusionLmHead(
 
         host_read_barrier();
         for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, (std::size_t)H * C * sizeof(float));
 
         ggml_status status = tsg::compute_graph(g_backend, graph);
@@ -1177,6 +1183,7 @@ TSG_EXPORT int TSGgml_DiffusionLmHeadSample(
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
+        tsg::PendingDeviceCopies pending;  // cached device copies bound below and not yet written: dropped unless committed after the upload
         auto bind_or_mark = [&](ggml_tensor* tt, void* data, std::size_t bytes, bool cacheable) {
             if (tt == nullptr || data == nullptr) return;
             if (cacheable && bytes >= 4096)
@@ -1185,7 +1192,7 @@ TSG_EXPORT int TSGgml_DiffusionLmHeadSample(
                 if (try_get_cacheable_tensor_buffer(g_backend, dev, tt, data, bytes, buf, addr, needs_upload, GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
                 {
                     if (ggml_backend_tensor_alloc(buf, tt, addr) == GGML_STATUS_SUCCESS)
-                    { if (needs_upload) upload_list.push_back({tt, data, bytes}); return; }
+                    { if (needs_upload) { upload_list.push_back({tt, data, bytes}); pending.add(data); } return; }
                     invalidate_cached_buffer(data);
                 }
             }
@@ -1204,6 +1211,7 @@ TSG_EXPORT int TSGgml_DiffusionLmHeadSample(
 
         host_read_barrier();
         for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        pending.commit();
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, (std::size_t)H * C * sizeof(float));
 
         ggml_status status = tsg::compute_graph(g_backend, graph);

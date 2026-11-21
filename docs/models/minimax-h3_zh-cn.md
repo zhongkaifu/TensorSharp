@@ -172,11 +172,11 @@ fc2 直接读取 fc1 的 `[gate | value]` 输出，在收窄为 BF16 时完成 S
 可选的 FP8 投影（`TS_H3_FP8_MATMUL`，`1` 为 DiT，`vae` 为视频 VAE，`all` 为两者）经 cuBLASLt 计算 E4M3 操作数，
 每个操作数一个 2 的幂缩放，会改变输出：DiT 投影乘积比自身舍入误差高 27-37 dB（平均 31 dB）。`TS_H3_FP8_MATMUL=1`
 时单步 16.4 s，整次请求 188.8 s / 181.0 s；`vae` 与 `all` 尚未做端到端测量。
-可选的 INT8 投影（`TS_H3_INT8_MATMUL=1`）面向没有 FP8 内核的 GPU（sm_80：A100、RTX 30）：合并后权重的每一行与
+可选的 INT8 投影（`--diffusion-products int8`）面向没有 FP8 内核的 GPU（sm_80：A100、RTX 30）：合并后权重的每一行与
 每个 token 的激活各按自身峰值舍入为 int8，经 cuBLASLt 以 int32 精确累加，再用一遍把结果缩放回 F32，同样会改变输出。
 在 A100 80 GB 上（1344x768、124 帧、Turbo 8 步、39,844 个 token），fc1 的乘法由 50.3 ms 降到 31.8 ms，去噪单步由
 21.7 s 降到 20.2 s，热态整次请求由 203 s 降到 191-193 s；解码结果与 BF16 路径相差 30.6 dB PSNR，多次运行完全一致。
-`TS_H3_INT8_MATMUL=vae`（或 `all`，连同 DiT）对视频 VAE 解码器的 F16 投影做同样处理，并把每个权重的 int8 行保留在
+`--diffusion-products int8-all`（DiT 与 VAE）对视频 VAE 解码器的 F16 投影做同样处理，并把每个权重的 int8 行保留在
 设备上供各分块复用。在 A100 80 GB 上，1344x768、124 帧片段的 196 个分块由 15.5 s 降到 13.7 s，与 F16 解码相差
 41-45 dB PSNR（下述改动之后为 11.6 s）。单个分块的 int8 乘法单独计时为 24 ms（F16 为 40 ms）。
 
@@ -186,17 +186,17 @@ int8 乘法周围的几遍处理也已去掉大半，且不改变任何数值（
 （`TS_H3_INT8_ONE_PASS=0` 关闭）；设备剩余内存不少于 8 GB 时，DiT 的 int8 权重行在各步之间保留
 （H3 的 DiT 为 19 GB，A100 上峰值由 30 GB 升至 49 GB，`TS_H3_INT8_KEEP_WEIGHTS=0` 关闭）。
 同一 A100 与片段上（含 FlashAttention），去噪单步由 19.1-19.2 s 降到 18.1 s，热态整次请求由 177.9-178.5 s 降到
-169.8-170.0 s（`TS_H3_INT8_MATMUL=1`）与 165.7-166.6 s（`all`，VAE 解码 12.4 s）；同一会话中 ComfyUI 模板为
+169.8-170.0 s（`int8`，当时以 `TS_H3_INT8_MATMUL=1` 测得）与 165.7-166.6 s（`int8-all`，VAE 解码 12.4 s）；同一会话中 ComfyUI 模板为
 157.5 与 162.5 s。
 
 DiT 注意力可改用 [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) 的前向内核（PyTorch 所用的内核）：
 以 `-DTENSORSHARP_FLASH_ATTENTION=ON` 配置原生构建时，会下载固定版本的 flash-attention 与 CUTLASS 源码，只编译本模型
 用到的一个内核（头维 128、F16、无掩码），并在融合注意力节点中替代 cuDNN 的 SDPA；需要 cuDNN 头文件与 sm_80 及以上的
-GPU，`TS_H3_FLASH_ATTENTION=0` 可切回 cuDNN。在同一 A100 与片段上（39,875 个 token，`TS_H3_INT8_MATMUL=1`），每个块的
+GPU，`TS_H3_FLASH_ATTENTION=0` 可切回 cuDNN。在同一 A100 与片段上（39,875 个 token，`--diffusion-products int8`），每个块的
 注意力由 278-281 ms 降到 251 ms，去噪单步由 20.5-20.7 s 降到 19.1-19.2 s，热态整次请求由 188 s 降到 177.9-178.5 s。
 内核输出与双精度参考相差 73 dB（F16 舍入量级）；两种实现的舍入不同，经 8 步去噪放大后，片段与 cuDNN 结果相差
 31.6 与 24.8 dB PSNR。该选项默认关闭（配置时需要联网下载源码），目前只在 Linux 的 CUDA 13 上构建过。
-该内核是面向 Ampere 的代码，而 cuDNN 在 Hopper 上有专门的实现：在 H100 NVL（sm_90 构建、同一片段、`TS_H3_INT8_MATMUL=all`）上，
+该内核是面向 Ampere 的代码，而 cuDNN 在 Hopper 上有专门的实现：在 H100 NVL（sm_90 构建、同一片段、`--diffusion-products int8-all`）上，
 每个块的注意力 cuDNN 为 114 ms、FlashAttention-2 为 165 ms，热态整次请求分别为 76.7-77.1 s 与 97.4 s。因此含该内核的构建
 只在 sm_8x 上默认使用它，更新的 GPU 默认仍走 cuDNN；`TS_H3_FLASH_ATTENTION=1` 可在这些 GPU 上强制使用该内核。
 

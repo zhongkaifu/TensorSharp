@@ -1416,6 +1416,8 @@ let activeImageEditTarget = null;
 let isGenerating = false;
 let currentLoadedModel = null;
 let currentArchitecture = null;
+// What the loaded image model takes (/api/models' image block; null for any other model or an older server).
+let currentImageCaps = null;
 // What the loaded model does with attached pictures, straight from /api/models.
 // Null for a non-video model. The same three images are three REFERENCES on
 // MiniMax-H3 Ref2VA and a refused request on FL2VA, so this decides the shape of a
@@ -1511,6 +1513,7 @@ function updateStatusBadge(data) {
   currentLoadedModel = data.loaded || null;
   currentArchitecture = data.architecture || null;
   currentVideoCaps = data.video || null;
+  currentImageCaps = data.image || null;
   if (currentLoadedModel !== videoComposerModelId) {
     videoComposerModelId = currentLoadedModel;
     videoComposerMode = 'auto';
@@ -1911,7 +1914,7 @@ function renderAttachments() {
         title: `Scanned PDF: ${label}`, removeTitle: 'Remove this PDF', page: true };
     }
     const chip = () => buildAttachmentChip(icon, label, idx, name);
-    const selectableImage = att.mediaType === 'image' && isQwenImageModel();
+    const selectableImage = att.mediaType === 'image' && imageTakesMasks();
     const keyframeImage = att.mediaType === 'image' && currentVideoCaps?.supportsKeyframeConditioning;
     const attachmentHost = selectableImage || keyframeImage ? document.createElement('div') : attachmentsDiv;
     if (selectableImage || keyframeImage) {
@@ -2054,8 +2057,15 @@ function removeAttachment(idx) {
   renderAttachments();
 }
 
-function isQwenImageModel() {
-  return currentArchitecture === 'qwen_image' || currentArchitecture === 'qwen-image';
+// An image model (Qwen-Image-2.1, MiniMax-H3-Image): a message makes a picture through the image routes. Known by the
+// capability the server reports; an older server reports none, and only Qwen-Image's architecture then.
+function isImageModel() {
+  return !!currentImageCaps || currentArchitecture === 'qwen_image' || currentArchitecture === 'qwen-image';
+}
+
+// Whether its edits take a selection of the first picture (a mask).
+function imageTakesMasks() {
+  return currentImageCaps ? !!currentImageCaps.supportsMask : isImageModel();
 }
 
 async function selectImageArea(att) {
@@ -3100,7 +3110,7 @@ async function sendMessage() {
     if (conditions) msg.imageConditions = conditions;
   }
   const editSource = attachmentsCopy.find(att => att.mediaType === 'image');
-  if (editSource && editSource === activeImageEditTarget && editSource.maskPath && isQwenImageModel()) {
+  if (editSource && editSource === activeImageEditTarget && editSource.maskPath && imageTakesMasks()) {
     msg.maskPath = editSource.maskPath;
     msg.maskMode = 'grayscale';
     msg.maskFeather = editSource.maskFeather || 0;
@@ -3705,9 +3715,9 @@ async function requestAssistantResponse() {
     }
     ensureCurrentGeneration(generation);
 
-    // Qwen image models use the diffusion endpoints; an attachment selects editing.
+    // Image models use the diffusion endpoints; an attachment selects editing.
     const _lastUser = chatHistory[chatHistory.length - 1];
-    if ((currentArchitecture === 'qwen_image' || currentArchitecture === 'qwen-image') && _lastUser) {
+    if (isImageModel() && _lastUser) {
       await runImageEdit(_lastUser, bubbleText, statsDiv, generation);
       return;
     }

@@ -122,8 +122,10 @@ namespace TensorSharp.GGML
                 : new GgmlGraph(maxNodes, program.Replayable, program.Reorder && Capabilities.ConcurrencyReorder);
             var outputs = new List<float[]>();
             var pins = new List<GCHandle>();
+            int served = 0, lowered = 0;
             try
             {
+                if (program.WideTokenProducts) g.MarkWideTokenProducts();
                 foreach (GraphNode n in program.Entries)
                 {
                     switch (n.Kind)
@@ -136,8 +138,12 @@ namespace TensorSharp.GGML
                         case GraphNodeKind.Effect: g.Effect(n.Node); break;
                         case GraphNodeKind.Alias: g.Alias(n.Node, n.Srcs[0], n.Bytes, n.Srcs[1]); break;
                         // A region the backend has a kernel for (Metal's prompt-width delta-net layers) runs as one
-                        // device operation between graph segments; any other builds its ops.
-                        case GraphNodeKind.Fused: g.FusedBegin(n.Node, n.Srcs, n.Ip, n.Fp); break;
+                        // device operation between graph segments, a diffusion-transformer region of a wide program on
+                        // CUDA as the DiT offload's nodes inside the graph; any other builds its ops.
+                        case GraphNodeKind.Fused:
+                            if (g.FusedBegin(n.Node, n.Srcs, n.Ip, n.Fp, out bool low)) served++;
+                            if (low) lowered++;
+                            break;
                         case GraphNodeKind.FusedEnd: g.FusedEnd(n.Srcs); break;
                         case GraphNodeKind.Output:
                             var values = new float[n.Bytes];
@@ -148,7 +154,7 @@ namespace TensorSharp.GGML
                             break;
                     }
                 }
-                return new Plan(g, outputs.ToArray(), pins.ToArray());
+                return new Plan(g, outputs.ToArray(), pins.ToArray(), served, lowered);
             }
             catch
             {
@@ -199,6 +205,51 @@ namespace TensorSharp.GGML
             return ok;
         }
 
+        /// <summary>How many of <paramref name="plan"/>'s fused regions a device kernel computes instead of their ops (served
+        /// when compiled; a region nested in a served one is part of it).</summary>
+        public static int ServedRegions(IGraphPlan plan)
+            => plan is Plan p ? p.ServedRegions : throw new ArgumentException("not a ggml graph plan", nameof(plan));
+
+        /// <summary>How many of <paramref name="plan"/>'s fused regions the backend built as graph nodes of its own instead of
+        /// their ops (GraphFusion.DitAttention: MiniMax-H3's attention nodes; a region nested in a served one is part of it).</summary>
+        public static int LoweredRegions(IGraphPlan plan)
+            => plan is Plan p ? p.LoweredRegions : throw new ArgumentException("not a ggml graph plan", nameof(plan));
+
+        /// <summary>Makes <paramref name="weights"/> resident on the device through MiniMax-H3's weight uploader (direct reads
+        /// from a registered file mapping, else prefaulted parallel copies: ggml_h3_upload.h), into the device copies a weight
+        /// leaf of the same host bytes binds, so the first program that reads them uploads nothing. A weight's host bytes are
+        /// its <see cref="IGraphWeight.Data"/>, which must also be its cache key. Returns how many were copied now (0 where the
+        /// device reads host memory in place or they were resident already).</summary>
+        public int Preload(IReadOnlyList<IGraphWeight> weights, string tag)
+        {
+            ArgumentNullException.ThrowIfNull(weights);
+            var items = new GgmlPreloadWeight[weights.Count];
+            for (int i = 0; i < items.Length; i++)
+            {
+                IGraphWeight w = weights[i] ?? throw new ArgumentException($"weight {i} is null", nameof(weights));
+                if (w.Data == IntPtr.Zero || (w.CacheKey != IntPtr.Zero && w.CacheKey != w.Data))
+                    throw new ArgumentException($"weight {i} is not keyed by its host bytes", nameof(weights));
+                items[i].Data = w.Data;
+                items[i].Bytes = w.Bytes;
+                items[i].Type = w.Format;
+                unsafe
+                {
+                    items[i].Ne[0] = w.Ne0;
+                    items[i].Ne[1] = w.Ne1;
+                    items[i].Ne[2] = w.Ne2;
+                    items[i].Nd = w.Ne2 > 1 ? 3 : 2;
+                }
+            }
+            unsafe
+            {
+                int uploaded = 0;
+                fixed (GgmlPreloadWeight* p = items)
+                    if (GgmlNative.TSGgml_GraphPreloadWeights(p, items.Length, tag, &uploaded) == 0)
+                        throw new InvalidOperationException("ggml weight preload failed: " + GgmlBasicOps.LastNativeError());
+                return uploaded;
+            }
+        }
+
         public void SyncToHost(IntPtr data, long bytes) => GgmlBasicOps.SyncHostBuffer(data, bytes);
 
         public void Invalidate(IntPtr data) => GgmlBasicOps.InvalidateHostBuffer(data);
@@ -208,12 +259,18 @@ namespace TensorSharp.GGML
             private readonly GgmlGraph _graph;
             private readonly GCHandle[] _pins;
 
-            public Plan(GgmlGraph graph, float[][] outputs, GCHandle[] pins)
+            public Plan(GgmlGraph graph, float[][] outputs, GCHandle[] pins, int servedRegions, int loweredRegions)
             {
                 _graph = graph;
                 Outputs = outputs;
                 _pins = pins;
+                ServedRegions = servedRegions;
+                LoweredRegions = loweredRegions;
             }
+
+            public int ServedRegions { get; }
+
+            public int LoweredRegions { get; }
 
             public float[][] Outputs { get; }
 

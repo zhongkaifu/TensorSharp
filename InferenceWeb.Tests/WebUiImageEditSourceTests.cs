@@ -32,4 +32,22 @@ public sealed class WebUiImageEditSourceTests
         Assert.DoesNotContain("width:", run, StringComparison.Ordinal);
         Assert.DoesNotContain("targetArea", run, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// Any image model the server reports (/api/models' <c>image</c> block: MiniMax-H3-Image as well as Qwen-Image-2.1)
+    /// sends a message through the image routes, and offers and sends a selection when it takes masks; an older server
+    /// with no block still has Qwen-Image's architecture name.
+    /// </summary>
+    [Fact]
+    public void ImageModelsAreKnownByTheReportedCapabilityNotAnArchitectureName()
+    {
+        string html = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "wwwroot", "index.html"));
+        Assert.Contains("currentImageCaps = data.image || null;", html, StringComparison.Ordinal);
+        Assert.Contains("return !!currentImageCaps || currentArchitecture === 'qwen_image' || currentArchitecture === 'qwen-image';", html, StringComparison.Ordinal);
+        Assert.Contains("return currentImageCaps ? !!currentImageCaps.supportsMask : isImageModel();", html, StringComparison.Ordinal);
+        Assert.Contains("if (isImageModel() && _lastUser) {", html, StringComparison.Ordinal);
+        Assert.Contains("const selectableImage = att.mediaType === 'image' && imageTakesMasks();", html, StringComparison.Ordinal);
+        Assert.Contains("editSource.maskPath && imageTakesMasks()) {", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("isQwenImageModel", html, StringComparison.Ordinal);
+    }
 }
