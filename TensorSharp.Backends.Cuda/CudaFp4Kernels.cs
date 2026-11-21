@@ -60,7 +60,8 @@ namespace TensorSharp.Cuda
         private CudaFp4Kernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
             if (!IsCurrent) return;
-            int* host = stackalloc int[16];
+            // The largest probe is the matvec's rows-per-warp table, one entry for 0 .. GemvMaxRows.
+            int* host = stackalloc int[GemvMaxRows + 1];
             RunProbe(module.GetFunction("ts_fp4_mma_caps"), host, 1);
             HasTensorCores = host[0] == 1;
             if (!HasTensorCores) return;

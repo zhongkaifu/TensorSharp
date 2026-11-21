@@ -282,7 +282,9 @@ namespace TensorSharp.Models.Architecture
         /// <summary>
         /// The contract of a family built on the shared decoder runtime: the runtime
         /// implements every mechanism on every backend the family loads on (TP and layer
-        /// split wherever the backend provides the devices). Not overridable downwards.
+        /// split wherever the backend provides the devices). Not overridable downwards, except
+        /// that a family which does not run a mechanism yet declares it a gap on every backend
+        /// (<see cref="MechanismSupport.None"/>), which the conformance ratchet lists.
         /// </summary>
         public static ServingContract SharedRuntime(bool hasRoutedExperts, IReadOnlyList<BackendType> backends = null)
         {
@@ -401,13 +403,18 @@ namespace TensorSharp.Models.Architecture
                 ServingContract expected = SharedRuntime(HasRoutedExperts, Backends);
                 foreach (ServingMechanism mechanism in Enum.GetValues<ServingMechanism>())
                 {
+                    // A family that does not run a mechanism yet declares it a gap on every backend (MechanismSupport.None,
+                    // whose reason is the operator's refusal; the conformance ratchet lists each gap). What it claims is the
+                    // runtime's.
+                    if (this[mechanism] is { Kind: SupportKind.Supported, Backends.Count: 0 } gap && !string.IsNullOrWhiteSpace(gap.GapReason))
+                        continue;
                     if (this[mechanism].Kind != expected[mechanism].Kind ||
                         !this[mechanism].Backends.OrderBy(b => b).SequenceEqual(expected[mechanism].Backends.OrderBy(b => b)) ||
                         !this[mechanism].BatchedBackends.OrderBy(b => b).SequenceEqual(expected[mechanism].BatchedBackends.OrderBy(b => b)))
                         throw new InvalidOperationException(
                             $"Architecture '{id}' is built on the shared runtime, which provides {mechanism} on " +
-                            $"{expected[mechanism]}; a shared-runtime family cannot declare less ({this[mechanism]}). " +
-                            "Use ServingContract.SharedRuntime(...).");
+                            $"{expected[mechanism]}; a shared-runtime family declares it so, or as a gap on every backend " +
+                            $"(MechanismSupport.None), not {this[mechanism]}. Use ServingContract.SharedRuntime(...).");
                 }
             }
         }

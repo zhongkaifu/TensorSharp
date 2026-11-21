@@ -497,7 +497,7 @@ namespace TensorSharp.Models
             int fusedQkv = 0;
             for (int l = 0; l < TotalLayers; l++)
             {
-                if (OwnsLayer(l) && TryFuseQkvWeights(l))
+                if (OwnsLayer(l) && PhysicalLayer(l) == l && FusesQkv(l) && TryFuseQkvWeights(l))
                     fusedQkv++;
             }
             if (fusedQkv > 0)
@@ -508,10 +508,15 @@ namespace TensorSharp.Models
             _gateUpFused = new bool[TotalLayers];
             for (int l = 0; l < TotalLayers; l++)
             {
-                _qkvFused[l] = HasWeight($"blk.{l}.attn_qkv.weight");
-                _gateUpFused[l] = HasWeight($"blk.{l}.ffn_gate_up.weight");
+                _qkvFused[l] = HasWeight(LayerName(l, "attn_qkv.weight"));
+                _gateUpFused[l] = HasWeight(LayerName(l, "ffn_gate_up.weight"));
             }
         }
+
+        /// <summary>Whether <paramref name="layer"/>'s Q, K and V projections may fuse into one product at load: they read the
+        /// same input. Inkling 2's full-attention layers (and every layer in a later loop pass) read three different inputs.
+        /// Default: yes.</summary>
+        protected virtual bool FusesQkv(int layer) => true;
 
         protected bool HasWeight(string name) =>
             _quantWeights.ContainsKey(name) || _weights.ContainsKey(name) ||
