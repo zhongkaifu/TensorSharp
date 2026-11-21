@@ -87,7 +87,7 @@ Zhongkai Fu 的 [《From Tensors to Tokens》书籍指南](../BOOK_zh-cn.md)，�
 
 DeepSeek V4 把一个**块级**草稿器接入了同一套核心：它的 DSpark 支持模块作为独立 GGUF 通过 `--draft-model` 加载（CLI 与服务端都支持），每步提议一整块 token 而不是逐个。由于草稿器的权重必须计入层切分，它在加载阶段就传给 `ModelBase.Create()`，而不是事后附加。详见 [DeepSeek V4 卡片](deepseek4_zh-cn.md#dspark-投机解码)。DeepSeek V4.1 只接受 `deepseek41-dspark` 草稿器，且仅限 `ggml_cuda` 或 `ggml_cpu`；这条路径属于实验性功能，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。Muse-Glimmer（DFlash / DFlash2）与 Qwen 3.8-27B（DFlash2）同样通过 `--draft-model` 加载块级草稿器。MiniMax-M3.1 也以同样方式加载其 DSpark 草稿器（带 Markov 头的 `dflash` GGUF）；原生执行器在按层切分时把它与目标模型一起加载，`--tp` 下拒绝（见 [MiniMax-M3.1 卡片](minimax-m3_zh-cn.md#dspark-投机解码)）。
 
-不需要任何草稿权重的 n-gram（prompt-lookup）投机器用 `--spec-type ngram` 选择，适用于 Qwen 3.5 家族、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、Muse Spark（它唯一的投机器）与 MiniMax-M3.1（仅按层切分）；DeepSeek V4 / V4.1 与 Muse-Glimmer 只有在加载了各自草稿器时才能使用。GPT OSS、Mistral 3 与 Hunyuan Dense 无法使用它，Nemotron-H 则拒绝一切投机器；见[投机解码](../speculative_decoding.md)。
+不需要任何草稿权重的 n-gram（prompt-lookup）投机器用 `--spec-type ngram` 选择，适用于 Qwen 3.5 家族、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、Muse Spark（它唯一的投机器）与 MiniMax-M3.1（仅按层切分）；DeepSeek V4 / V4.1 只有在加载了各自草稿器时才能使用，Muse-Glimmer 无需草稿器。GPT OSS、Mistral 3 与 Hunyuan Dense 无法使用它，Nemotron-H 则拒绝一切投机器；见[投机解码](../speculative_decoding.md)。
 
 ## 架构对比
 
@@ -104,7 +104,7 @@ DeepSeek V4 把一个**块级**草稿器接入了同一套核心：它的 DSpark
 | Per-Layer Embedding (PLE) | 否 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | KV 共享 | 是（所有 query 共用一个 512 维 K=V 头） | 是（尾部若干层） | 去噪多步间复用 prompt-KV | 否 | 否 | 否 | 否 | 否 |
 | Attention sinks | 是 | 否 | 否 | 否 | 是 | 否 | 否 | 否 |
-| 环形 KV cache | 是（原始 SWA-128 环） | 是（SWA 层） | 无自回归 KV | 否 | 否 | 否 | 否 | 是（GPU 后端上的 SWA 环；`TS_MUSE_GLIMMER_SWA_RING=0` 关闭） |
+| 环形 KV cache | 是（原始 SWA-128 环） | 是（SWA 层） | 无自回归 KV | 否 | 否 | 否 | 否 | 是（共享运行时在 39 个滑动窗口层上保留 2560 单元的环，所有后端） |
 | SSM / 递归层 | 否（用 4 路 hyper-connection 取代普通残差） | 否 | 否 | 是（GatedDeltaNet） | 否 | 是（Mamba2） | 否 | 否 |
 | 共享专家 | 是 | 否 | 否 | 是（qwen35moe / qwen3next） | 否 | 是（可选） | 否 | 否（稠密 FFN） |
 | Latent bottleneck FFN | 否（改为 LoRA 分解的 Q / 输出投影） | 否 | 否 | 否 | 否 | 是（可选） | 否 | 否 |

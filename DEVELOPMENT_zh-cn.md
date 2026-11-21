@@ -353,7 +353,7 @@ TensorSharp/
 │   │   ├── DeepSeek4Model.Dspark.cs        # DSpark 块级草稿器（draft / 置信度 / Markov 头）
 │   │   └── DeepSeek4Model.PerSeqCache.cs   # 让该模型可被服务端托管的原生 per-sequence slot
 │   ├── Models/GlmDsa/           # GLM 5.x：原生执行器驱动、MLA + DSA indexer 逐算子参考实现、序列 slot、NextN/MTP 草稿头
-│   ├── Models/MuseGlimmer/      # Muse-Glimmer：融合整模型前向、视觉编码器、张量并行变体、DFlash 块级草稿器
+│   ├── Models/MuseGlimmer/      # Muse-Glimmer：共享解码运行时上的 MuseGlimmerRuntimeModel 与其图视觉塔；旧模型在删除前保留
 │   ├── Models/MuseSpark/        # Muse Spark：原生整模型执行器（按层切分与 `--tp`）的托管驱动（MuseSparkModel.Native.cs）、带注意力/专家张量并行与整层放置的逐算子参考前向（`TS_MUSE_SPARK_NATIVE=0`、Vulkan 上的 `--tp`）、视觉、前缀缓存
 │   ├── Models/MiniMaxH3/        # MiniMax-H3 视频 + 联合 32 kHz 立体声音频：打包序列 DiT、Qwen3-VL 文本编码器与视觉塔、视频与音频 VAE、flow-match 调度器、pipeline
 │   ├── Models/WanVideo/         # Wan 2.1/2.2，仅视频：DiT、UMT5-XXL 文本编码器、因果 3D VAE、UniPC 调度器，以及不依赖 ggml 的 WanDirect* `cuda`/`cpu` 路径

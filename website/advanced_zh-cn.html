@@ -22,7 +22,7 @@
   <p>服务器的 <code>InferenceEngine</code> 是一个 vLLM 式连续批处理引擎，默认开启。它不再一次只运行一个请求，而是以单个 decode 步的粒度将多个请求交错运行。</p>
   <ul>
     <li><strong>分页 KV 池</strong> —— KV 缓存被划分为取自共享池的定长块，因此内存按块分配，而非按最坏情况的序列长度分配。</li>
-    <li><strong>Radix 前缀缓存</strong> —— 在服务器、CLI 生成与 TensorAgent 中默认开启：一棵基于 token 前缀的 radix 树索引为每个新请求找到已缓存的最长前缀（系统提示、工具声明、之前的轮次），在并发与顺序请求间复用而非重新计算，同时遵守会话作用域、媒体身份与各模型可恢复的边界。它覆盖 Qwen 3.5/3.6/3.8、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、DeepSeek V4/V4.1 与原生执行器上的 Muse Spark（模型自有的 holder 与结束状态），以及 GPT OSS、Mistral 3、Hunyuan Dense、Muse-Glimmer 与 Nemotron-H（共享的分页块）；DiffusionGemma 以及图像、视频模型不使用它。<code>--no-prefix-cache</code>（<code>TS_SCHED_PREFIX_CACHE=0</code>）会关闭复用。</li>
+    <li><strong>Radix 前缀缓存</strong> —— 在服务器、CLI 生成与 TensorAgent 中默认开启：一棵基于 token 前缀的 radix 树索引为每个新请求找到已缓存的最长前缀（系统提示、工具声明、之前的轮次），在并发与顺序请求间复用而非重新计算，同时遵守会话作用域、媒体身份与各模型可恢复的边界。它覆盖 Qwen 3.5/3.6/3.8、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、DeepSeek V4/V4.1 与原生执行器上的 Muse Spark（模型自有的 holder 与结束状态），以及 Muse-Glimmer（共享运行时上的 holder 与结束状态），以及 GPT OSS、Mistral 3、Hunyuan Dense 与 Nemotron-H（共享的分页块）；DiffusionGemma 以及图像、视频模型不使用它。<code>--no-prefix-cache</code>（<code>TS_SCHED_PREFIX_CACHE=0</code>）会关闭复用。</li>
     <li><strong>迭代级调度器</strong> —— 在批中接纳与抢占序列，并在实现 <code>IBatchedPagedModel</code> 的模型上把它们打包进一次前向。</li>
   </ul>
   <p>尚未实现批量路径的模型仍运行在引擎隔离的逐序列 KV 交换回退之上。用 <a href="server_zh-cn.html#tunables"><code>TS_SCHED_*</code></a> 变量调参，或用 <code>--no-continuous-batching</code> 完全禁用。</p>
@@ -71,7 +71,7 @@ dotnet run --project TensorSharp.Server.Host -c Release --no-build -- --model ge
     </tbody>
   </table>
   </div>
-  <p>调参：<code>--spec-type auto|draft-head|block|ngram</code> 选择算法 —— <code>auto</code>（默认）使用检查点自带的草稿器，<code>ngram</code> 是在序列自身 token 上做后缀匹配、无需权重的推测器，不需要草稿文件。但 n-gram 仍需要模型是推测目标，因此并非处处可用：它可运行在 Qwen 3.5/3.6/3.8 家族、Gemma 4（GGML 后端或 <code>cuda</code>）、GLM 5.x（GLM-5.3-Flash 仅在其回滚可用时）、Qwen 3.8 Flash Next（GGML）与 Muse Spark（它唯一的推测方式；其原生 <code>--tp N</code> 下不推测，只做普通 decode）上，而不能运行在 GPT OSS、Mistral 3 或 Hunyuan Dense 上；DeepSeek V4/V4.1 与 Muse-Glimmer 只有挂上各自的块级草稿器才会推测，Nemotron-H 则拒绝一切推测器。<code>--spec-draft</code>（默认 8）限定每步草拟的 token 数；<code>--spec-pmin</code> 是保留某 token 所需的最低草稿置信度，其默认值取决于草稿器类型（逐 token 草稿头为 <code>0.15</code>，块级草稿器为 <code>0.35</code> —— 后者的门限是<em>累积</em>前缀概率，因此同一个数字要严格得多）。在 GGML 后端上对 Qwen 3.5 显式传入的 <code>--spec-draft</code> 请保持 7 或更小：验证批达到九行时会偏离普通贪心解码，这是正确性缺陷而不是速度问题。默认值不受影响，因为该模型自己要求 3 token 的窗口。</p>
+  <p>调参：<code>--spec-type auto|draft-head|block|ngram</code> 选择算法 —— <code>auto</code>（默认）使用检查点自带的草稿器，<code>ngram</code> 是在序列自身 token 上做后缀匹配、无需权重的推测器，不需要草稿文件。但 n-gram 仍需要模型是推测目标，因此并非处处可用：它可运行在 Qwen 3.5/3.6/3.8 家族、Gemma 4（GGML 后端或 <code>cuda</code>）、GLM 5.x（GLM-5.3-Flash 仅在其回滚可用时）、Qwen 3.8 Flash Next（GGML）与 Muse Spark（它唯一的推测方式；其原生 <code>--tp N</code> 下不推测，只做普通 decode）上，而不能运行在 GPT OSS、Mistral 3 或 Hunyuan Dense 上；DeepSeek V4/V4.1 只有挂上各自的块级草稿器才会推测，Nemotron-H 则拒绝一切推测器。<code>--spec-draft</code>（默认 8）限定每步草拟的 token 数；<code>--spec-pmin</code> 是保留某 token 所需的最低草稿置信度，其默认值取决于草稿器类型（逐 token 草稿头为 <code>0.15</code>，块级草稿器为 <code>0.35</code> —— 后者的门限是<em>累积</em>前缀概率，因此同一个数字要严格得多）。在 GGML 后端上对 Qwen 3.5 显式传入的 <code>--spec-draft</code> 请保持 7 或更小：验证批达到九行时会偏离普通贪心解码，这是正确性缺陷而不是速度问题。默认值不受影响，因为该模型自己要求 3 token 的窗口。</p>
 
 
   <h2 id="dspark">DSpark 块级投机解码（DeepSeek V4）</h2>

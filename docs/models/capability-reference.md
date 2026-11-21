@@ -163,7 +163,7 @@ its native executor loads it with the target on a layer split and refuses it und
 
 A weight-free n-gram (prompt-lookup) speculator, selected with `--spec-type ngram`,
 needs no drafter and runs on the Qwen 3.5 family, Gemma 4, GLM 5.x, Qwen 3.8
-Flash Next, Muse Spark (its only speculator) and MiniMax-M3.1 (layer split only), and on DeepSeek V4 / V4.1 and Muse-Glimmer only while their drafter is
+Flash Next, Muse-Glimmer, Muse Spark (its only speculator) and MiniMax-M3.1 (layer split only), and on DeepSeek V4 / V4.1 only while their drafter is
 loaded. It does not run on GPT OSS, Mistral 3 or Hunyuan Dense,
 and Nemotron-H refuses every speculator; see
 [speculative decoding](../speculative_decoding.md).
@@ -183,7 +183,7 @@ and Nemotron-H refuses every speculator; see
 | Per-Layer Embedding (PLE) | No | Yes | No | No | No | No | No | No |
 | KV sharing | Yes (one shared 512-dim K=V head for all queries) | Yes (tail layers) | Prompt-KV cache across denoising steps | No | No | No | No | No |
 | Attention sinks | Yes | No | No | No | Yes | No | No | No |
-| Circular KV cache | Yes (raw SWA-128 ring) | Yes (SWA layers) | No autoregressive KV | No | No | No | No | Yes (SWA ring on the GPU backends; `TS_MUSE_GLIMMER_SWA_RING=0` disables) |
+| Circular KV cache | Yes (raw SWA-128 ring) | Yes (SWA layers) | No autoregressive KV | No | No | No | No | Yes (the shared runtime's 2560-cell rings on the 39 sliding-window layers, every backend) |
 | SSM / recurrent layers | No (4-stream hyper-connections replace the plain residual) | No | No | Yes (GatedDeltaNet) | No | Yes (Mamba2) | No | No |
 | Shared experts | Yes | No | No | Yes (qwen35moe / qwen3next) | No | Yes (optional) | No | No (dense FFN) |
 | Latent bottleneck FFN | No (LoRA-factored Q / output projections instead) | No | No | No | No | Yes (optional) | No | No |

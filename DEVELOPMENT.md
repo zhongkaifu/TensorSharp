@@ -478,7 +478,7 @@ TensorSharp/
 │   │   ├── DeepSeek4Model.Dspark.cs        # DSpark block drafter (draft / confidence / Markov heads)
 │   │   └── DeepSeek4Model.PerSeqCache.cs   # Native per-sequence slots that make the model servable
 │   ├── Models/GlmDsa/           # GLM 5.x: native-executor driver, MLA + DSA indexer per-op reference, sequence slots, NextN/MTP draft head
-│   ├── Models/MuseGlimmer/      # Muse-Glimmer: fused whole-model forward, vision encoder, tensor-parallel variants, DFlash block drafter
+│   ├── Models/MuseGlimmer/      # Muse-Glimmer on the shared decoder runtime (MuseGlimmerRuntimeModel), its graph vision tower; the legacy model until its deletion
 │   ├── Models/MuseSpark/        # Muse Spark: managed driver for the native whole-model executor in layer split and `--tp` (MuseSparkModel.Native.cs), the per-op reference forward with attention/expert tensor parallelism and layer placement (`TS_MUSE_SPARK_NATIVE=0`, `--tp` on Vulkan), vision, prefix cache
 │   ├── Models/MiniMaxH3/        # MiniMax-H3 video + joint 32 kHz stereo audio: packed-sequence DiT, Qwen3-VL text encoder + vision tower, video and audio VAEs, flow-match scheduler, pipeline
 │   ├── Models/WanVideo/         # Wan 2.1/2.2, video only: DiT, UMT5-XXL text encoder, causal 3D VAE, UniPC scheduler, plus the ggml-independent WanDirect* `cuda`/`cpu` path

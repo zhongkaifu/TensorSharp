@@ -7,17 +7,17 @@
 | 属性 | 值 |
 |---|---|
 | GGUF 架构标识 | `muse-glimmer`（也接受 `muse_glimmer`） |
-| 源码类 | [`MuseGlimmerModel`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerModel.cs)（传统单序列） |
-| 投机草稿模型 | [`MuseGlimmerModel.DFlash.cs`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerModel.DFlash.cs) + [`DFlashConfig`](../../TensorSharp.Models/Speculative/DFlashConfig.cs) |
-| 视觉编码器 | [`MuseGlimmerVisionEncoder`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerVisionEncoder.cs) |
+| 源码类 | [`MuseGlimmerRuntimeModel`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerRuntimeModel.cs)，运行在[共享解码运行时](../design/unified-execution.md)上（2026-11 起；[迁移设计](../design/muse-glimmer-unified.md)） |
+| 投机草稿模型 | 运行时共享的块草稿器（[`StandardDecoderModel.BlockDraft.cs`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.BlockDraft.cs)）+ [`DFlashConfig`](../../TensorSharp.Models/Speculative/DFlashConfig.cs)；n-gram 无需草稿模型 |
+| 视觉编码器 | [`MuseGlimmerVisionTower`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerVisionTower.cs)（在每个执行器上以图程序运行，与 Muse Spark 共用） |
 | 图像预处理 | [`MuseGlimmerImageProcessor`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerImageProcessor.cs) |
 | 示例模型 | Muse-Glimmer-30B |
 | 模态 | 文本、图像 |
 | 思维链 | 支持（聊天模板会输出 `assistant to=self` 推理通道） |
 | 工具调用 | 支持（聊天模板中的 ATEM XML 标记）；可使用 skills、代码工具以及服务端的[子智能体委派](../multi_agent.md) |
-| 批处理 / 分页前向 | 不支持（传统单序列） |
-| 融合整模型内核 | GGML CUDA / Vulkan / Metal / CPU（四者都有持久化 decode 图） |
-| 张量并行 | 支持 —— GGML CUDA / Vulkan，最高 `--tp 2`（30B 只有 2 个 KV 头） |
+| 批处理前向、连续批处理 | 支持（运行时的统一步：每请求槽位、前缀缓存、检查点与检查点文件） |
+| 整步图 | GGML CUDA / Vulkan / Metal / CPU、MLX、直接 CUDA（`--backend cuda`）；托管 CPU 逐算子 |
+| 张量并行 | 支持 —— 最高 `--tp 2`（30B 只有 2 个 KV 头），GGML CUDA / Vulkan 上每 rank 一张图；`--layer-split N` 以及 TP x 分层混合放置由运行时提供 |
 
 ## 快速开始
 
@@ -38,14 +38,49 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
   --draft-model models/dflash-kquant.gguf \
   --spec-draft 15 --input prompt.txt --backend ggml_cuda
+
+# 无草稿模型的 n-gram 投机解码（回答引用提示时最有效）
+dotnet run --project TensorSharp.Cli -c Release -- \
+  --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
+  --spec --spec-type ngram --input prompt.txt --backend ggml_metal
 ```
 
-`--draft-model` 也可以用环境变量 `TS_SPEC_DRAFT_MODEL` 指定。这个模型上的投机解码
-离不开该草稿模型：没有它时，`--spec`（包括无权重的 n-gram 草稿器）只提供普通解码。
+`--draft-model` 也可以用环境变量 `TS_SPEC_DRAFT_MODEL` 指定。没有草稿模型时，
+`--spec --spec-type ngram` 按上下文后缀匹配起草（回答引用提示时效果最好）。
+`--tp` 下会拒绝草稿模型（CLI 给出警告并普通解码；服务端以退出码 2 退出）。
 
 ### 结构化输出
 
 生成 prompt 停在 `<|start|>assistant`，因此正常回复以模型自己写的路由头开始（推理为 ` to=self<|message|>`，答案为 ` to=user<|message|>` 或 `<|message|>`）。使用 `response_format` 时 JSON 语法从第一个 token 起生效，模型会直接写出对象而没有任何头部。`MuseGlimmerOutputParser` 把不可能是头部开头的回复（JSON 的 `{`、`[`、`"` 或数字）视为答案内容，并在流结束时返回未加框架的文本而不是丢弃。此前解析器一直等待被语法排除的 `<|message|>`：流式响应返回 `content: null`，`json_schema` 在生成正确对象后返回 HTTP 422（2026-09-16 验证活动，B6）。非流式路径现在也对解析后的 content 而不是原始输出做校验。`response_format` 也可以与 `"think": true` 同时使用。模型先在 ` to=self<|message|>` 消息中推理，再以 `<|start|>assistant to=user<|message|>` 开始答案，因此协议把 `to=user<|message|>` 声明为 `ThinkingGrammarActivationTrigger`，语法在那里启用。此前该组合返回 HTTP 400（首次复测中每个 `--thinking` json 用例都是如此）。用 `validate_inference.py --thinking` 实测（json / json_schema / json_unicode，c1 与 c4，重复三次，Q4_K_XL，单张 RTX PRO 6000）：38/45，模型写出的 41 个答案头全部是 `to=user<|message|>`。7 个失败都停在 `max_tokens` 256：推理会先复述 prompt 再作答，而 Muse-Glimmer 没有声明可以提前关闭推理的思考预算结束 token。
+
+## 共享解码运行时（2026-11 起）
+
+Muse-Glimmer 运行在[共享解码运行时](../design/unified-execution.md)上（`MuseGlimmerRuntimeModel`），与 Qwen 3.5、LFM3
+相同；旧的 `MuseGlimmerModel` 及其原生图不再服务任何请求。迁移过程与证据见
+[docs/design/muse-glimmer-unified.md](../design/muse-glimmer-unified.md)。它带来：
+
+* **所有放置与执行器：** GGML CUDA / Vulkan / Metal / CPU、MLX 与直接 CUDA（`--backend cuda`，旧实现在此逐算子运行，现为整步图）
+  上的单设备，`--tp 2`、`--layer-split N` 与混合放置。
+* **服务：** 连续批处理（并发请求在同一步中执行，而非轮流）、Radix 前缀缓存的精确 token 复用（包括跨图像片段）、
+  提示末尾检查点以及可跨重启保留的检查点文件。
+* **投机解码**走共享层：DFlash 搭配 `dflash-kquant.gguf` 草稿模型（也可与批处理同时使用；ggml_metal 上 7 个草稿、
+  不设置置信门限，MLX 上起草整个块），以及无需草稿模型的 n-gram。
+* **内存：** 39 个滑动窗口层保留 2560 个单元的环（窗口 2048 加一个 512 行的提示步），旧实现为 4352 行；
+  每个序列的提示步最多 512 行。
+
+在 M5 Pro（48 GB）上的测量（除注明外为 UD-IQ2_XXS，运行时与旧模型在同一个二进制中 ABBA 对比；括号内为旧模型）：
+
+| 后端 | prefill 512 / 4K / 16K（tok/s） | 解码（深度 512 / 4K / 16K） | 真实生成（CLI，93 token 提示 x 512） | 峰值内存 |
+|---|---|---|---|---|
+| ggml_metal | 401 / 392 / 369（399 / 385 / 355） | 21.5 / 21.2 / 19.9（21.4 / 21.2 / 19.8） | TTFT 415 ms（423），21.8 tok/s（21.8） | wired 13.8-15.0 GB（15.9-17.0） |
+| ggml_metal，UD-Q4_K_XL | 401 / 387 / 367（391 / 375 / 357） | 18.0 / 17.5 / 16.9（17.9 / 17.5 / 16.8） | 383 ms（418），18.0 tok/s（17.9） | 19.2-19.6 GB（20.1-21.3） |
+| MLX | 439 / 416 / 414（425 / 396 / 372） | 21.2 / 20.4 / 19.9（20.5 / 19.5 / 17.8） | 375 ms（456），21.4 tok/s（20.7） | 15.9-18.3 GB（16.0-19.9） |
+| ggml_cpu | 8.7 / 8.6 / -（8.6 / 8.5 / -） | 6.8 / 6.5 / -（6.9 / 6.2-6.7 / -） | 10.8 s（11.0 s），6.9 tok/s（6.8） | 常驻 13.4 GB（21.8） |
+
+在 ggml_cuda（RTX PRO 4500）上，两种 UD 量化的运行时 prefill 比旧实现快 3.6-28%、解码快 2.8-7.0%；ggml_vulkan 上解码快
+18-22%；直接 CUDA（旧实现逐算子）prefill 快 3.4-13 倍、解码快 2.1-3.7 倍。质量门槛（与 llama.cpp 的对齐、每个后端上
+困惑度与旧实现相差 0.06% 以内、跨环回绕的 teacher-forced 探针）见设计文档。下面第 2-6 节保留历史：其中的性能数字和
+工程说明描述的是当时测量的旧模型。
 
 ## 1. 文本架构
 
@@ -608,16 +643,15 @@ DFlash 投机解码只走单卡路径：`--tp N` > 1 下配置的草稿模型会
 
 ## 7. 环境变量
 
+旧模型的开关（`TS_MUSE_GLIMMER_PREFILL_CHUNK`、`TS_MUSE_GLIMMER_SWA_RING`、`TS_MUSE_GLIMMER_SWA_ROWS`、
+`TS_MUSE_GLIMMER_LAYER_TRACE` 及其 `_POS` / `_N` / `_DIR`、`TS_MUSE_GLIMMER_VENC_TRACE`、`TS_MUSE_GLIMMER_MLX_STAGE_PROFILE`
+以及 `TS_MLX_KV_MATERIALIZE_INTERVAL`）在切换到共享解码运行时后不再起作用：运行时自行决定环和提示步的大小（见上文），
+下一个版本会把这些名称正式退役，并在报错中给出替代方式。
+
 | 变量 | 作用 |
 |---|---|
-| `TS_MUSE_GLIMMER_VENC_TRACE` | `1` = 打印视觉残差流的逐阶段校验和 |
-| `TS_MUSE_GLIMMER_LAYER_TRACE` | `1` = 打印进入每一层的残差校验和（融合与逐算子路径输出相同格式，因此做 diff 就能把分叉定位到某一层） |
-| `TS_MUSE_GLIMMER_LAYER_TRACE_POS` / `_N` / `_DIR` | 第一个追踪的位置 / 追踪多少次前向 / 原始 F32 转储目录 |
-| `TS_MLX_EVAL_EVERY_N_LAYERS` | MLX 逐算子惰性图的 flush 间隔（Muse-Glimmer 默认 4，`0` 关闭） |
-| `TS_PREFILL_CHUNK` | `ForwardRefill` 的提示分块大小（默认 2048） |
-| `TS_MUSE_GLIMMER_PREFILL_CHUNK` | 每次 prefill 前向的 token 数（默认 2048，`0` 关闭分块） |
-| `TS_MUSE_GLIMMER_SWA_RING` | `0` = 所有层都按完整上下文分配，而不是给 SWA 层用环（GPU 后端；GgmlCpu 始终是统一尺寸） |
-| `TS_MUSE_GLIMMER_SWA_ROWS` | 覆盖 SWA 环的行数（诊断用） |
-| `TS_DFLASH_PREFILL_CHUNK` | DFlash prefill 追赶草稿模型时每次**主干**前向的 token 数（默认 1024） |
+| `TS_PREFILL_CHUNK` | `ForwardRefill` 的提示分块大小（默认 2048）；滑动窗口环上的一个分块仍按每序列最多 512 行的提示步运行 |
+| `TS_MLX_EVAL_EVERY_N_LAYERS` | MLX 层边界 `async_eval` 的间隔（运行时默认值） |
+| `TS_DFLASH_*` | 共享 DFlash 草稿器的参数（见[投机解码](../speculative_decoding.md)） |
 | `TS_KV_FATTN_COPY` | `0` = 从不物化填充后的 KV 窗口（会复现 ggml-cuda flash-attention **vec** 故障）；`force` = 总是物化 |
 | `TS_GGML_CPU_THREADS` | 共享 ggml CPU 后端提示线程池的线程数，单独设置时也是解码线程池的线程数（默认：全部物理核；在有性能核与能效核的 Apple CPU 上为全部物理核减一，解码步为减二，即 `TS_GGML_CPU_DECODE_THREADS`：见[环境变量矩阵](../env_var_feature_matrix_zh-cn.md)） |

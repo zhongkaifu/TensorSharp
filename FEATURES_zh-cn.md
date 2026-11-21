@@ -113,7 +113,7 @@ Muse-Glimmer 与 Qwen 3.8 都有块级草稿模型 **DFlash**：一个独立的 
 | `block` | 每次前向出一整块，配一个置信度头（DeepSeek V4 DSpark；Muse-Glimmer 与 Qwen 3.8 上的 DFlash / DFlash2） | 是，且与目标模型一一对应 |
 | `ngram` | 在序列自己的 token 上做后缀匹配——这几个 token 之前出现在哪里、后面跟的是什么？ | **否** |
 
-`ngram` 是无需权重的那一个：它不需要训练好的权重，因此完全不带草稿器的 checkpoint 也能用；在答案会引用输入的场景下最强——摘要、编辑、翻译、就文档作答、重复性的结构化输出、含重复标识符的代码、智能体的工具循环。在不带草稿头的 Qwen3.5-9B 上实测（Q8_0、ggml_metal、M5 Pro）：一条"复现这份配置"的提示词跑出 **45.2 tok/s，对比普通 decode 的 31.4（1.44×）**，输出逐字节一致。在自由散文上它找不到可用后缀，每一步都退化成普通 decode，而运行期的成本调控器会让这件事保持廉价。它仍然需要能验证草稿的架构：Qwen 3.5/3.6/3.8、Gemma 4、GLM 5.x 与 Qwen 3.8 Flash Next 都可以用；DeepSeek V4 与 Muse-Glimmer 只有在加载了各自的草稿器时才会投机；GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机路径，始终走普通 decode；Nemotron-H 则拒绝所有投机器，`ngram` 也不例外（见上文）。
+`ngram` 是无需权重的那一个：它不需要训练好的权重，因此完全不带草稿器的 checkpoint 也能用；在答案会引用输入的场景下最强——摘要、编辑、翻译、就文档作答、重复性的结构化输出、含重复标识符的代码、智能体的工具循环。在不带草稿头的 Qwen3.5-9B 上实测（Q8_0、ggml_metal、M5 Pro）：一条"复现这份配置"的提示词跑出 **45.2 tok/s，对比普通 decode 的 31.4（1.44×）**，输出逐字节一致。在自由散文上它找不到可用后缀，每一步都退化成普通 decode，而运行期的成本调控器会让这件事保持廉价。它仍然需要能验证草稿的架构：Qwen 3.5/3.6/3.8、Gemma 4、GLM 5.x、Muse-Glimmer 与 Qwen 3.8 Flash Next 都可以用；DeepSeek V4 只有在加载了自己的草稿器时才会投机；GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机路径，始终走普通 decode；Nemotron-H 则拒绝所有投机器，`ngram` 也不例外（见上文）。
 
 投机解码**默认关闭**。在服务端或 `TensorSharp.Cli` 上，`--spec`（环境变量 `TS_SPEC=1`）是内嵌在主干检查点里的草稿器（Qwen 3.6、Qwen 3.8 27B、GLM 5.2 与 GLM-5.3 的 NextN 块）的显式开关——因为加载它们要把额外的权重调入显存；以独立 GGUF 发布的草稿器只需 `--draft-model` 即可启用，显式的 `--no-spec` 则是否决。每个参数对应一个 `TS_SPEC_*` 环境变量，glm-dsa 的原生加载器也会读取（在加载模型时从 C++ 侧读取 `TS_SPEC_DRAFT`）。例如：
 

@@ -297,7 +297,7 @@ same class (there is an `ISpeculativeModel` alias for the pair) and report the
 matching `DraftHeadKind`.
 
 One caveat worth stating: some models' `SpecForward` is not drafter-independent
-— Muse-Glimmer and DeepSeek V4 / V4.1 share the fused verify kernel with their drafter
+— DeepSeek V4 / V4.1 share the fused verify kernel with their drafter
 and refuse to run without it. Those report `SpeculationProfitable` as false when
 no drafter is loaded, so weight-free speculation is declined rather than
 crashed. Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash, Qwen 3.8 Flash Next and Gemma 4 have
