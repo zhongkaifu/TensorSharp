@@ -111,6 +111,16 @@ IQ2_XXS model and the Q8_0 mmproj:
 | `legacy_vision.cuda.linux-x64.NVIDIA.RTX.PRO.4500.Blackwell.json` | direct CUDA (Metal set) | 215/216 (99.54%) | 0.125 / 0.090 / 0.260 / 0.458 / 0.673 | (not frozen: the lane multiplies F32) |
 | `cuda/legacy_vision.ggml_cuda.linux-x64.NVIDIA.RTX.PRO.4500.Blackwell.json` | ggml_cuda | 207/212 (97.64%) | 0.320 / 0.273 / 0.575 / 0.956 / 1.066 | 8.3e-4 to 4.7e-3 |
 | `vulkan/legacy_vision.ggml_vulkan.linux-x64.NVIDIA.RTX.PRO.4500.Blackwell.json` | ggml_vulkan | 210/217 (96.77%) | 0.183 / 0.130 / 0.384 / 0.743 / 1.358 | 6.2e-5 to 1.7e-3 |
+| `legacy_vision.ggml_metal.osx-arm64.Apple.M5.Pro.json` | ggml_metal | 214/216 (99.07%) | 0.090 / 0.043 / 0.242 / 0.477 / 0.577 | 8.5e-6 to 3.4e-4 (summed 9.90e-4) |
+| `legacy_vision.mlx.osx-arm64.Apple.M5.Pro.json` | MLX | 215/216 (99.54%) | 0.106 / 0.059 / 0.267 / 0.514 / 0.684 | 6.2e-6 to 2.8e-4 (summed 7.44e-4) |
+| `legacy_vision.ggml_cpu.osx-arm64.Apple.M5.Pro.json` | ggml_cpu (Metal set) | 210/216 (97.22%) | 0.392 / 0.330 / 0.654 / 1.085 / 1.458 | 8.4e-4 to 5.6e-3 (summed 2.34e-2) |
+
+The three Mac files were written after the switch, just before S9 deleted the legacy tower: from d492bfe9 (the last commit
+with the legacy model and tower; 757e0517 plus the S9 freeze of the synthetic figures), with the writer extended to every
+lane but direct CUDA, on the M5 Pro (48 GB, macOS 27.2), ggml d9fe7bff unchanged, 2026-11-20; each file's `provenance` says
+so. Each picture also records the graph tower's own distance at that commit and its distance to legacy's rows
+(`graphOneMinusCos`, `legacyToGraphOneMinusCos`: at most 3.6e-5 on ggml_metal and 4.4e-5 on MLX, which share their rounding; up to 5.0e-3 on ggml_cpu, whose q8_K activations
+the two towers round independently, as on ggml_vulkan).
 
 * A position's top-k |dlogprob| is the largest |our log-probability - llama.cpp's| over llama.cpp's listed top tokens
   (ten at the first generated position, four after it): the parity tests' first-position metric, at every position.
@@ -130,7 +140,9 @@ How `MuseGlimmerVisionParityTests` uses them:
   (0.458 to 0.548) when it is given the graph tower's rows, 1.3e-5 from its own. One position (wide-describe @32) flips
   with such changes too (`ImageRuleOf`). The graph tower's rows are held, picture by picture, to cosine 0.99999 against
   the managed executor's F32 tower.
-* ggml_metal, MLX and the CPU lanes keep the near-tie rule (97%, every parting a near-tie).
+* ggml_metal, MLX and the CPU lanes keep the near-tie rule for the prompts (97%, every parting a near-tie). Their tower rows
+  take the GPU lanes' rule: 1 - cosine to the F32 tower summed over the nine pictures at most 1.25x legacy's frozen sum, each
+  picture's ratio logged (the managed lane has no tower-rows test).
 
 A lane with no file fails and names the file it needs. The writer (`MuseGlimmerLegacyVisionWriterTests`) went with the
 legacy code in stage S9, so the frozen files cannot be regenerated; they are the record.

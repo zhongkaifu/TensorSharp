@@ -28,8 +28,9 @@ namespace InferenceWeb.Tests;
 /// <list type="bullet">
 /// <item>its teacher-forced argmax agreement with the lane's set (<see cref="MuseGlimmerParity.GoldenSet"/>), and the
 /// distribution of every position's <see cref="MuseGlimmerParity.Position.TopDelta"/> (mean, p50, p90, p99, max);</item>
-/// <item>on the lanes whose products quantize the activations (ggml_cuda, ggml_vulkan), each picture's 1 - cosine between the
-/// legacy tower's rows and the F32 tower's (<see cref="F32Tower"/>).</item>
+/// <item>on every lane but direct CUDA, each picture's 1 - cosine between the legacy tower's rows and the F32 tower's
+/// (<see cref="F32Tower"/>): ggml_cuda and ggml_vulkan frozen in S4 on the RTX PRO 4500 Blackwell box, ggml_metal, MLX and
+/// ggml_cpu just before S9 on the M5 Pro.</item>
 /// </list>
 /// They were written on 2026-11-20 by a writer test that went with the legacy code (Fixtures/MuseGlimmer/README.md).
 /// </summary>
@@ -93,9 +94,6 @@ internal static class MuseGlimmerLegacyVision
         managed.Graph.FloatProducts = true;
         return (managed, null, "the graph tower with F32 products on the managed executor");
     }
-
-    /// <summary>Whether a lane's products quantize the activations, so its towers are measured against the F32 tower.</summary>
-    internal static bool QuantizedProducts(BackendType backend) => backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
 
     /// <summary>1 - cosine of two row sets.</summary>
     internal static double OneMinusCos(float[] a, float[] b)

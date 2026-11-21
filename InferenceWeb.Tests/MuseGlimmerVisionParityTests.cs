@@ -51,7 +51,7 @@ public sealed class MuseGlimmerVisionFactAttribute : FactAttribute, ITraitAttrib
 /// backend's llama.cpp set (<see cref="MuseGlimmerParity.GoldenSet"/>: LlamaCpp/ for Metal, LlamaCpp/cuda/, LlamaCpp/vulkan/),
 /// and its first generated position is checked against llama.cpp only on the float-activation lanes
 /// (<see cref="MuseGlimmerParityTests.FirstPositionRuleOf"/>: ggml_metal, MLX, direct CUDA); elsewhere it is logged.
-/// Where a lane's rule is relative to legacy (<see cref="ImageRuleOf"/>, the rows on the quantized-product lanes), it reads
+/// Where a lane's rule is relative to legacy (<see cref="ImageRuleOf"/>, and the tower rows on every lane but direct CUDA), it reads
 /// legacy's figures frozen on the lane next to its set (<see cref="MuseGlimmerLegacyVision"/>).
 /// </summary>
 public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
@@ -82,18 +82,6 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
     /// 0.161 (0.087 / 0.088); every other prompt 0.06 or less. The near-tie bound.
     /// </summary>
     private const double FirstPositionLogprobBoundPastTheTable = 0.25;
-
-    /// <summary>The graph tower's rows against the F32 tower's (<see cref="MuseGlimmerLegacyVision.F32Tower"/>) on ggml_metal
-    /// and MLX, picture by picture. Until stage S9 the rows were held to the legacy tower on the same executor at cosine 0.9999
-    /// (design §4.5), which shares the executor's rounding; the F32 tower does not: the two lanes multiply the Q8_0 weights
-    /// against half-precision activations. Measured on the M5 Pro with the S9 build: ggml_metal 0.99979-0.99999 (the 1036 x 1036
-    /// picture the lowest), MLX 0.99977-0.99999 (word-ocean.jpg). A wrong layout, position table or window is O(1).</summary>
-    private const double MinCosine = 0.9995;
-
-    /// <summary>As <see cref="MinCosine"/> on ggml_cpu, whose Q8_0 products quantize the activations (q8_K), as ggml_cuda's
-    /// q8_1 do (1 - cosine to the F32 tower up to 4.7e-3 there, legacy's tower alike): measured on the M5 Pro 0.99576-0.99900
-    /// (the 1036 x 1036 picture the lowest, worst row 0.78).</summary>
-    private const double MinCosineQuantizedActivations = 0.99;
 
     internal sealed record Record(string Name, string Prompt, string Image, int PromptN, int[] Generated, MuseGlimmerParity.Step[] Steps);
 
@@ -401,9 +389,14 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
     /// lanes of one run share it.</summary>
     private static readonly Dictionary<string, float[]> s_f32Rows = new(StringComparer.Ordinal);
 
-    /// <summary>On the quantized-product lanes (ggml_cuda, ggml_vulkan), the graph tower's 1 - cosine to the F32 tower's rows
+    /// <summary>On every lane but direct CUDA, the graph tower's 1 - cosine to the F32 tower's rows
     /// (<see cref="MuseGlimmerLegacyVision.F32Tower"/>), summed over the pictures, may be at most this many times the legacy
-    /// tower's sum, frozen on the lane; each picture's ratio is logged. Both towers' products quantize the activations there:
+    /// tower's sum, frozen on the lane (<see cref="MuseGlimmerLegacyVision"/>); each picture's ratio is logged. Until stage S9 the
+    /// float lanes (ggml_metal, MLX) and ggml_cpu were held to the legacy tower on the same executor at cosine 0.9999; their
+    /// figures were frozen from the last tree with that tower (d492bfe9, the M5 Pro, 2026-11-20), where the graph tower's sum was
+    /// 0.71x legacy's on ggml_metal, 0.81x on MLX and 0.92x on ggml_cpu (the two towers 1 - cosine 4.4e-5 apart or less on the
+    /// float lanes; up to 5.0e-3 on ggml_cpu, whose q8_K activations they round independently, as on ggml_vulkan); so their
+    /// rule is the GPU lanes'. ggml_cuda and ggml_vulkan's products quantize the activations:
     /// measured on an RTX PRO 4500 Blackwell, each sits at 1 - cosine 6e-5 to 1.7e-3 from the F32 tower on ggml_vulkan and 8e-4
     /// to 4.7e-3 on ggml_cuda, and from each other at up to 3.9e-4 on ggml_vulkan, where legacy's per-op tower and the graph
     /// tower round independently. There the graph tower's distance is 0.74-1.67x legacy's picture by picture (the ratio of two
@@ -421,27 +414,22 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
         string mmproj = FindMmproj();
         using var gguf = new GgufFile(mmproj);
         using var tower = new MuseGlimmerVisionTower(gguf, lane.Allocator, backend);
-        bool quantized = MuseGlimmerLegacyVision.QuantizedProducts(backend);
+        // Direct CUDA multiplies F32 values (its own rule below); every other lane is held to legacy's frozen distance.
+        bool frozenRule = backend != BackendType.Cuda;
         string laneKey = MuseGlimmerGoldens.LaneKey(backend), set = MuseGlimmerParity.GoldenSet(backend);
-        MuseGlimmerLegacyVision.Lane frozen = quantized ? MuseGlimmerLegacyVision.Find(laneKey, set) : null;
-        Assert.True(!quantized || frozen is { RowsOneMinusCos.Count: > 0 },
-            $"no legacy tower figures frozen for {laneKey} (MuseGlimmerLegacyVisionWriterTests writes Fixtures/MuseGlimmer/LlamaCpp/{set}/" +
-            $"{MuseGlimmerLegacyVision.FileName(laneKey)})");
+        MuseGlimmerLegacyVision.Lane frozen = frozenRule ? MuseGlimmerLegacyVision.Find(laneKey, set) : null;
+        Assert.True(!frozenRule || frozen is { RowsOneMinusCos.Count: > 0 },
+            $"no legacy tower figures frozen for {laneKey} (Fixtures/MuseGlimmer/LlamaCpp/{(set == "metal" ? "" : set + "/")}" +
+            $"{MuseGlimmerLegacyVision.FileName(laneKey)}; the writer went with the legacy tower in stage S9)");
         // The F32 reference: the cheaper F32 tower (direct CUDA's where the process can open it), on direct CUDA the managed
         // one (another executor's arithmetic than the tower under test).
         var (reference, owner, referenceName) = MuseGlimmerLegacyVision.F32Tower(gguf, preferDirectCuda: backend != BackendType.Cuda);
-        double minCosine = backend switch
-        {
-            BackendType.Cuda => MinCosineF32,
-            BackendType.GgmlCpu => MinCosineQuantizedActivations,
-            _ => MinCosine,
-        };
         using (owner)
         using (reference)
         {
-            output.WriteLine($"{backend}: graph tower on {tower.Graph.Executor.GetType().Name}" + (quantized
+            output.WriteLine($"{backend}: graph tower on {tower.Graph.Executor.GetType().Name}" + (frozenRule
                 ? $"; held to {F32DistanceRatio}x the legacy tower's frozen distance to {referenceName}, summed over the pictures"
-                : $"; held to {referenceName} at cosine {minCosine}"));
+                : $"; held to {referenceName} at cosine {MinCosineF32}"));
             var failures = new List<string>();
             double graphSum = 0, legacySum = 0;
             int summed = 0;
@@ -459,9 +447,9 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
                 double graph = 1 - fCos;
                 output.WriteLine($"  {name} ({w}x{h}, {tokens} rows): vs the F32 tower cosine {fCos:F7} (worst row {fWorst:F6}), relL2 " +
                     $"{dist.RelL2:E2}, max {dist.RelMax:E2}; graph tower {towerMs:F0} ms (one run, informational)");
-                if (!quantized)
+                if (!frozenRule)
                 {
-                    if (fCos < minCosine) failures.Add($"{name}: cosine {fCos:F7} to the F32 tower < {minCosine}");
+                    if (fCos < MinCosineF32) failures.Add($"{name}: cosine {fCos:F7} to the F32 tower < {MinCosineF32}");
                     continue;
                 }
                 Assert.True(frozen.RowsOneMinusCos.TryGetValue(name, out double legacyFrozen), $"{name}: no frozen legacy figure");
@@ -470,7 +458,7 @@ public sealed class MuseGlimmerVisionParityTests(ITestOutputHelper output)
                 legacySum += legacyFrozen;
                 summed++;
             }
-            if (quantized)
+            if (frozenRule)
             {
                 Assert.Equal(frozen.RowsOneMinusCos.Count, summed);
                 output.WriteLine($"  summed over the {summed} pictures: graph {graphSum:E3}, legacy frozen {legacySum:E3} " +

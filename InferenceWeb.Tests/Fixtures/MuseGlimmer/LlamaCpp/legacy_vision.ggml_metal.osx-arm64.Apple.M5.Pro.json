@@ -1,0 +1,105 @@
+{
+  "lane": "ggml_metal|osx-arm64|Apple M5 Pro",
+  "set": "metal",
+  "about": "The legacy Muse-Glimmer model and vision tower on this lane: its teacher-forced argmax agreement with the lane's llama.cpp image goldens (and the distribution of every position's largest |our log-probability - llama.cpp's| over llama.cpp's listed top tokens), and on the quantized-product lanes each picture's 1 - cosine between the legacy tower's rows and the F32 tower's. InferenceWeb.Tests/MuseGlimmerVisionParityTests.cs holds the runtime family to them.",
+  "producer": "MuseGlimmerModel and MuseGlimmerVisionEncoder (legacy)",
+  "provenance": "TensorSharp d492bfe9 (feature/muse-glimmer-unified: the last commit with the legacy model and tower, 757e0517 plus the S9 freeze; writer extended to every lane but direct CUDA), ggml d9fe7bff, Release, Apple M5 Pro (48 GB), macOS 27.2, 2026-11-20",
+  "frozenUtc": "2026-11-21T04:44:48.7165350Z",
+  "model": {
+    "file": "Muse-Glimmer-30B-UD-IQ2_XXS.gguf",
+    "sha256": "3e9bd0e609df9d0121ba18c6556de496e7be880184cf22c5dbafbc0600875ad9"
+  },
+  "mmproj": {
+    "file": "mmproj-Muse-Glimmer-30B-Q8_0.gguf"
+  },
+  "llamaCpp": "d3c3e242c16b8cbf51400fad410cd69b22d64f35",
+  "imagePrompts": {
+    "agree": 214,
+    "positions": 216,
+    "agreement": 0.9907407407407407,
+    "topDelta": {
+      "mean": 0.09000772388556809,
+      "p50": 0.04311503749434742,
+      "p90": 0.24174155796077557,
+      "p99": 0.4766064544121007,
+      "max": 0.5771454442595054
+    }
+  },
+  "rowsVsF32": {
+    "reference": "the graph tower with F32 products on the managed executor",
+    "images": [
+      {
+        "name": "number-7319.png",
+        "width": 448,
+        "height": 224,
+        "oneMinusCos": 1.148668478889725E-05,
+        "graphOneMinusCos": 4.856589139512479E-06,
+        "legacyToGraphOneMinusCos": 6.735077984099114E-06
+      },
+      {
+        "name": "shapes-red-circle.jpg",
+        "width": 448,
+        "height": 448,
+        "oneMinusCos": 3.0462083084215053E-05,
+        "graphOneMinusCos": 2.8830104602417528E-05,
+        "legacyToGraphOneMinusCos": 9.625604548202382E-06
+      },
+      {
+        "name": "word-ocean.jpg",
+        "width": 560,
+        "height": 196,
+        "oneMinusCos": 0.00017308608994781594,
+        "graphOneMinusCos": 0.00020723792571231137,
+        "legacyToGraphOneMinusCos": 9.680848003901232E-06
+      },
+      {
+        "name": "count-green-squares.png",
+        "width": 448,
+        "height": 448,
+        "oneMinusCos": 1.6647687055004745E-05,
+        "graphOneMinusCos": 8.597903703777554E-06,
+        "legacyToGraphOneMinusCos": 7.414169504338375E-06
+      },
+      {
+        "name": "wide-left-right.png",
+        "width": 448,
+        "height": 168,
+        "oneMinusCos": 1.5909856864948502E-05,
+        "graphOneMinusCos": 2.1321728591594535E-05,
+        "legacyToGraphOneMinusCos": 1.2118631600555041E-05
+      },
+      {
+        "name": "tall-top-bottom.png",
+        "width": 168,
+        "height": 448,
+        "oneMinusCos": 8.47818396021438E-06,
+        "graphOneMinusCos": 8.210745708336908E-06,
+        "legacyToGraphOneMinusCos": 9.561295110649404E-06
+      },
+      {
+        "name": "synthetic 336x336",
+        "width": 336,
+        "height": 336,
+        "oneMinusCos": 0.00017613791056403372,
+        "graphOneMinusCos": 9.32181478174865E-05,
+        "legacyToGraphOneMinusCos": 3.6298355367447854E-05
+      },
+      {
+        "name": "synthetic 1036x1036",
+        "width": 1036,
+        "height": 1036,
+        "oneMinusCos": 0.0003353990131863549,
+        "graphOneMinusCos": 0.00021001897134342862,
+        "legacyToGraphOneMinusCos": 3.271294874374053E-05
+      },
+      {
+        "name": "synthetic 588x868",
+        "width": 588,
+        "height": 868,
+        "oneMinusCos": 0.00022225485603610817,
+        "graphOneMinusCos": 0.00011903961683679132,
+        "legacyToGraphOneMinusCos": 2.7181538399312366E-05
+      }
+    ]
+  }
+}
