@@ -58,7 +58,7 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
 
     /// <summary>A geometry's steps share one plan; another text length records and compiles a new one in its place, and a
     /// released workspace compiles again with the same results, as do released device copies.</summary>
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void AGeometryCompilesOnceAndAReleasedWorkspaceRecompilesToTheSameBytes()
     {
         BackendType backend = TestGates.PinnedGgmlBackend;
@@ -83,7 +83,7 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         for (int i = 0; i < first.Count; i++) Assert.Equal(first[i], resident[i]);
     }
 
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void TheDenoiserRefusesForeignAdaptersAndAForeignLayout()
     {
         using var fx = new MiniMaxH3ImageFixture(F32);
@@ -112,7 +112,7 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         Assert.Equal(0, runtime.Compiles);
     }
 
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void TheDenoiserRefusesAnAudioVideoCheckpoint()
     {
         using var fixtures = new MiniMaxH3LoraFixtures();
@@ -121,7 +121,7 @@ public sealed class MiniMaxH3ImageDenoiserTests(ITestOutputHelper output)
         Assert.Throws<NotSupportedException>(() => MiniMaxH3ImageFamily.ForDenoiser(video));
     }
 
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void WeightAndWorkingBytesAreTheLeavesAndAPositiveEstimate()
     {
         using var fx = new MiniMaxH3ImageFixture(Q4_K);

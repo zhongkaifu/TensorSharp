@@ -60,7 +60,8 @@ namespace TensorSharp.Cuda
         private CudaFp4Kernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
             if (!IsCurrent) return;
-            int* host = stackalloc int[16];
+            // The largest probe is the matvec's rows-per-warp table, one entry for 0 .. GemvMaxRows.
+            int* host = stackalloc int[GemvMaxRows + 1];
             RunProbe(module.GetFunction("ts_fp4_mma_caps"), host, 1);
             HasTensorCores = host[0] == 1;
             if (!HasTensorCores) return;
@@ -125,6 +126,9 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr((ulong)count * 4)).ThrowOnError();
             try
             {
+                // A probe writes only the entries it defines (ts_fp4_gemv_rows_per_warp leaves entry 0), and the copy back reads
+                // them all: start from zeros, in the launch's stream, so that copy reads no uninitialized device memory.
+                CudaDriverApi.cuMemsetD8Async(probe, 0, new UIntPtr((ulong)count * 4), IntPtr.Zero).ThrowOnError();
                 IntPtr p = probe;
                 void** args = stackalloc void*[] { &p };
                 CudaDriverApi.cuLaunchKernel(fn, 1, 1, 1, 1, 1, 1, 0, IntPtr.Zero, (IntPtr)args, IntPtr.Zero).ThrowOnError();

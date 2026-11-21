@@ -84,7 +84,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
             BackendType.GgmlCpu => (GgmlGraphExecutor.For(GgmlBackendType.Cpu), null),
             BackendType.Cpu => ManagedExecutor(),
             _ => throw new NotSupportedException(
-                $"MiniMax-H3-Image's denoiser runs on ggml_cuda, ggml_metal, ggml_cpu or the managed cpu backend, not {backend}."),
+                $"MiniMax-H3-Image's denoiser runs on ggml_cuda, ggml_metal, ggml_cpu or cpu, not {Architecture.BackendNames.OptionName(backend)}."),
         };
 
         private static (IGraphExecutor, IAllocator) ManagedExecutor()

@@ -393,8 +393,11 @@ public sealed class Lfm3SpeechOutputTests
         using Lfm3SpeechOutput speech = SyntheticOutput(lane, variant, 17, out float[] feedbackTable);
         Lfm3SpeechConfig c = speech.Config;
         var reference = new HostReference(lane.Weights, c);
-        // CPU block products quantize their activations to 8 bits; GGML metal / MLX products and attention round to F16.
-        double tol = variant == "q8_0" ? 6e-2 : laneKind == Lane.Mlx || HalfOperandLane(laneKind) ? 1.5e-2 : variant == "f16" && laneKind == Lane.GgmlCpu ? 1e-2 : 2e-3;
+        // CPU block products quantize their activations to 8 bits; GGML metal / MLX products and attention round to F16, and
+        // so do direct CUDA's F16-weight products (CudaQuantizedOps.RunF16Gemm narrows the activations to F16 for cuBLAS's F16
+        // GEMM at every row count; the streamed bound below already counts direct CUDA among the F16-operand lanes).
+        bool halfOperands = laneKind == Lane.Mlx || HalfOperandLane(laneKind) || (laneKind == Lane.Cuda && variant == "f16");
+        double tol = variant == "q8_0" ? 6e-2 : halfOperands ? 1.5e-2 : variant == "f16" && laneKind == Lane.GgmlCpu ? 1e-2 : 2e-3;
         var rng = new Random(23);
 
         // ---- depthformer: a frame's three passes (the projection kept between them), codes revealed 4 at a time ----
@@ -449,17 +452,33 @@ public sealed class Lfm3SpeechOutputTests
         }
         Assert.Equal(Frames * c.SamplesPerFrame, streamed.Length);
         // The log-magnitudes' errors grow through exp(); 8-bit activations (CPU block products) over five layers most.
-        AssertClose(expectedPcm, streamed, variant == "q8_0" ? 0.25 : tol * 2, $"{laneKind}/{variant} codec pcm");
-        using (Lfm3CodecStream whole = speech.CreateCodecStream())
+        double codecTolerance = variant == "q8_0" ? 0.25 : tol * 2;
+        AssertClose(expectedPcm, streamed, codecTolerance, $"{laneKind}/{variant} codec pcm");
+        float[] whole;
+        using (Lfm3CodecStream stream = speech.CreateCodecStream())
         {
-            var pcm = new List<float>(whole.Decode(all));
-            whole.Flush(pcm);
-            // A frame at a time and five at once run other GPU kernels (row counts): within F16-operand rounding on ggml-metal,
-            // MLX, ggml-vulkan and direct CUDA [direct CUDA f16 5.4e-4, A40]; ggml-cuda's Q8_0 products requantize each layer's
-            // activations (q8_1), so the two kernels' last bits flip 8-bit codes the codec's exp() amplifies [6.2e-2].
-            double streamedTolerance = variant == "q8_0" && laneKind == Lane.GgmlCuda ? 0.1
+            var pcm = new List<float>(stream.Decode(all));
+            stream.Flush(pcm);
+            whole = pcm.ToArray();
+        }
+        // Five frames at once are held to the host forward as one frame at a time is.
+        AssertClose(expectedPcm, whole, codecTolerance, $"{laneKind}/{variant} codec pcm, frames at once");
+        // A frame at a time and five at once carry the decoder's state differently and must agree. Direct CUDA's Q8_0
+        // products give a row the same bits whatever the row count, so there the two are equal bit for bit (a state-carry
+        // bug cannot hide inside a rounding bound), and its F16 and F32 GEMMs keep them within 1e-2 [RTX PRO 4500, 24
+        // seeds: f16 1.1e-3, f32 2.8e-6; A40 f16 5.4e-4]. ggml-cuda and ggml-vulkan pick their product kernels by row
+        // count (a frame is 6 rows, five are 30: ggml-cuda's mmvq/mmvf against mmq/mmf/cuBLAS), so the two run other sums
+        // and operand roundings, which the codec's exp() amplifies [RTX PRO 4500, 24 seeds: ggml-cuda q8_0 up to 0.198
+        // (median 7.8e-2), f16 1.10e-2, f32 1.41e-2; ggml-vulkan up to 9.6e-3; A40 ggml-cuda q8_0 6.2e-2]. Each of the two
+        // is within codecTolerance of the host forward, so by the triangle inequality they are within twice that of each
+        // other; that is their bound there. Elsewhere: F16-operand rounding on ggml-metal and MLX, none on the CPU lanes.
+        if (laneKind == Lane.Cuda && variant == "q8_0")
+            Assert.Equal(streamed, whole);
+        else
+        {
+            double streamedTolerance = laneKind is Lane.GgmlCuda or Lane.GgmlVulkan ? 2 * codecTolerance
                 : laneKind == Lane.Mlx || laneKind == Lane.Cuda || HalfOperandLane(laneKind) ? 1e-2 : 1e-4;
-            AssertClose(streamed, pcm.ToArray(), streamedTolerance, $"{laneKind}/{variant} codec whole vs streamed");
+            AssertClose(streamed, whole, streamedTolerance, $"{laneKind}/{variant} codec whole vs streamed");
         }
         _output.WriteLine($"{laneKind}/{variant}: depthformer max error / scale {worst:G3}; codec pcm {MaxRelative(expectedPcm, streamed):G3}");
 

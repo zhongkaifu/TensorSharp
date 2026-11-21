@@ -36,12 +36,7 @@ public sealed class MiniMaxH3ImageFrozenLegacyTests(ITestOutputHelper output)
     /// 5.2e-5, 5.5e-4, 1.6e-3, 2.5e-3. The bound is about twice their sum or more.</summary>
     private static double Bound(int format) => format is Q8_0 or Q4_K ? 1e-2 : 3e-3;
 
-    private static void Pin(BackendType backend) => GgmlBasicOps.EnsureBackendAvailable(backend switch
-    {
-        BackendType.GgmlMetal => GgmlBackendType.Metal,
-        BackendType.GgmlCuda => GgmlBackendType.Cuda,
-        _ => GgmlBackendType.Cpu,
-    });
+    private static void Pin(BackendType backend) => GgmlBasicOps.EnsureBackendAvailable(TestGates.GgmlBackendTypeOf(backend));
 
     public static IEnumerable<object[]> DenoiserCases() => new (string, int)[]
     {
@@ -141,7 +136,7 @@ public sealed class MiniMaxH3ImageFrozenLegacyTests(ITestOutputHelper output)
     /// <summary>The step's host tables (the AdaLN curve table at the layout's timesteps and the 3-axis partial-RoPE tables of
     /// its float positions) are the legacy DiT's: byte for byte on the runtime identifier they were frozen on, within float
     /// rounding (1e-6 of the largest value) elsewhere.</summary>
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void TheStepsHostTablesAreTheFrozenLegacyTables()
     {
         using var fx = new MiniMaxH3ImageFixture(BF16);

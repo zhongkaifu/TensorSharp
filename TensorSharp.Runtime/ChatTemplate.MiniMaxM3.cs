@@ -4,6 +4,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 
@@ -392,22 +393,30 @@ namespace TensorSharp.Runtime
             return sb.ToString();
         }
 
-        /// <summary>Python <c>json.dumps(value, ensure_ascii=False)</c> of a parsed JSON value.</summary>
-        internal static void AppendPythonJson(StringBuilder sb, JsonElement element)
+        /// <summary>
+        /// Python <c>json.dumps(value, ensure_ascii=False)</c> of a parsed JSON value; with
+        /// <paramref name="compact"/> the <c>separators=(",", ":")</c> spelling, and with
+        /// <paramref name="sortKeys"/> <c>sort_keys=True</c> (every object's keys in code-point order).
+        /// </summary>
+        internal static void AppendPythonJson(StringBuilder sb, JsonElement element, bool compact = false, bool sortKeys = false)
         {
+            string itemSeparator = compact ? "," : ", ", keySeparator = compact ? ":" : ": ";
             switch (element.ValueKind)
             {
                 case JsonValueKind.Object:
                 {
                     sb.Append('{');
                     bool first = true;
-                    foreach (JsonProperty property in element.EnumerateObject())
+                    IEnumerable<JsonProperty> properties = element.EnumerateObject();
+                    if (sortKeys)
+                        properties = properties.OrderBy(p => p.Name, StringComparer.Ordinal);
+                    foreach (JsonProperty property in properties)
                     {
-                        if (!first) sb.Append(", ");
+                        if (!first) sb.Append(itemSeparator);
                         first = false;
                         AppendPythonJsonString(sb, property.Name);
-                        sb.Append(": ");
-                        AppendPythonJson(sb, property.Value);
+                        sb.Append(keySeparator);
+                        AppendPythonJson(sb, property.Value, compact, sortKeys);
                     }
                     sb.Append('}');
                     return;
@@ -418,9 +427,9 @@ namespace TensorSharp.Runtime
                     bool first = true;
                     foreach (JsonElement item in element.EnumerateArray())
                     {
-                        if (!first) sb.Append(", ");
+                        if (!first) sb.Append(itemSeparator);
                         first = false;
-                        AppendPythonJson(sb, item);
+                        AppendPythonJson(sb, item, compact, sortKeys);
                     }
                     sb.Append(']');
                     return;
@@ -443,7 +452,7 @@ namespace TensorSharp.Runtime
             }
         }
 
-        private static void AppendPythonJsonString(StringBuilder sb, string text)
+        internal static void AppendPythonJsonString(StringBuilder sb, string text)
         {
             sb.Append('"');
             foreach (char c in text)

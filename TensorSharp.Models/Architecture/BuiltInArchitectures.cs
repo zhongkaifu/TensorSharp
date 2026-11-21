@@ -44,6 +44,7 @@ namespace TensorSharp.Models.Architecture
             Mistral3Architecture.Descriptor,
             HunyuanDenseArchitecture.Descriptor,
             Lfm3Architecture.Descriptor,
+            Inkling2Architecture.Descriptor,
             MuseGlimmerArchitecture.Descriptor,
             MuseSparkArchitecture.Descriptor,
             DeepSeek4Architecture.Descriptor,

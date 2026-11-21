@@ -1588,12 +1588,15 @@ namespace TensorSharp.Models
                 }
                 return graph;
             }
-            catch (InvalidOperationException) when (step != null && step.Rejected)
+            catch (InvalidOperationException rejected) when (step != null && step.Rejected)
             {
                 // The lowering met a case it does not express; nothing was built or run.
                 if (owned) graph?.Dispose();
                 owned = false;
                 ClearGraphCache();
+                // A family the per-op layers do not implement has nothing to fall back to.
+                if (RequiresGraphs)
+                    throw new NotSupportedException($"{Config.Architecture} runs only as graphs, and this step's graph was rejected: {rejected.Message}", rejected);
                 return null;
             }
             catch
@@ -1717,7 +1720,7 @@ namespace TensorSharp.Models
                 // The last layer's feed-forward over the rows the head reads only (PrunesLastLayerRows).
                 if (prune && layer == Config.NumLayers - 1) h = EmitLastRows(step, h, width);
                 int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
-                int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
+                int ffn = EmitFeedForward(step, layer, ffnIn);
                 h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
                 step.Boundary(h);
             }
@@ -1813,7 +1816,7 @@ namespace TensorSharp.Models
                 ? "output.weight" : "token_embd.weight";
             if (request.AllRowLogits)
             {
-                int logits = step.MatMul(headName, final);
+                int logits = EmitLogits(step, step.MatMul(headName, final), rows);
                 outputs.Logits = request.GreedyIds
                     ? step.Output(step.Op(GraphOp.Cont, GreedyHead(step, logits, request)), rows)
                     : step.Output(EmitLogitTransform(step, logits), (long)Config.VocabSize * rows);
@@ -1834,12 +1837,16 @@ namespace TensorSharp.Models
                         (long)hiddenSize * n);
                 // A step that wants only the rows (every sequence's next slot is made from its hidden row) runs no head.
                 if (!request.LastRowLogits) return;
-                int logits = step.MatMul(headName, selected);
+                int logits = EmitLogits(step, step.MatMul(headName, selected), n);
                 outputs.Logits = request.GreedyIds
                     ? step.Output(step.Op(GraphOp.Cont, GreedyHead(step, logits, request)), n)
                     : step.Output(EmitLogitTransform(step, logits), (long)Config.VocabSize * n);
             }
         }
+
+        /// <summary>What a family applies to the head's logits [vocab, rows] before they are read or sampled: a final logit
+        /// softcap (Inkling 2: 30 tanh(logits / 30)); <paramref name="rows"/> is the logits' columns. Default: nothing.</summary>
+        protected virtual int EmitLogits(GraphStep step, int logits, int rows) => logits;
 
         /// <summary>The head's logit transform over <paramref name="logits"/> (<see cref="LogitScale"/>, then
         /// <see cref="FinalLogitSoftcap"/>): a scale, then a scale by 1/cap, tanh and a scale by cap, the nodes llama.cpp's graphs
@@ -1914,7 +1921,7 @@ namespace TensorSharp.Models
                 {
                     h[r] = EmitBlockOutput(steps[r], layer, h[r], BlockSite.Mixer, context[r], block[r]);
                     int ffnIn = EmitBlockInput(steps[r], layer, h[r], BlockSite.Ffn, out context[r]);
-                    block[r] = _moeLayer[layer] ? EmitMoe(steps[r], layer, ffnIn) : EmitDenseFfn(steps[r], layer, ffnIn);
+                    block[r] = EmitFeedForward(steps[r], layer, ffnIn);
                 }
                 for (int r = 0; r < ranks; r++) block[r] = steps[r].Op(GraphOp.AllReduce, block[r]);
                 for (int r = 0; r < ranks; r++)
@@ -2377,13 +2384,18 @@ namespace TensorSharp.Models
 
         private readonly Dictionary<(int Layer, string Suffix), string> _layerNames = new();
 
-        /// <summary><c>blk.{layer}.{suffix}</c>, built once (traces run every token).</summary>
+        /// <summary><c>blk.{physical layer}.{suffix}</c>, built once (traces run every token).</summary>
         protected string LayerName(int layer, string suffix)
         {
             if (!_layerNames.TryGetValue((layer, suffix), out string name))
-                _layerNames[(layer, suffix)] = name = $"blk.{layer}.{suffix}";
+                _layerNames[(layer, suffix)] = name = $"blk.{PhysicalLayer(layer)}.{suffix}";
             return name;
         }
+
+        /// <summary>The checkpoint layer whose weights <paramref name="layer"/> of the stack reads. A looped family (Inkling 2
+        /// Mini) runs some stored layers more than once: each run is a layer of the stack, with its own KV cache and state, and
+        /// reads the stored layer's weights. Default: the layer itself.</summary>
+        protected virtual int PhysicalLayer(int layer) => layer;
 
         // ---------------------------------------------------------------- branches
 
@@ -2397,6 +2409,32 @@ namespace TensorSharp.Models
         /// <summary>The mask sequence <paramref name="s"/> attends under in <paramref name="layer"/>: <paramref name="mask"/>
         /// ([<paramref name="keys"/>, its rows], F16, causal) unless the family narrows it (Qwen 3.8's QSA selection).</summary>
         protected virtual int EmitAttentionMask(GraphStep step, int layer, int x, int s, int mask, int keys) => mask;
+
+        /// <summary>Which positions an attention's keys hold, for a family whose scores depend on the query-key distance:
+        /// key j holds position <see cref="FirstPosition"/> + j where <see cref="Ring"/> is 0; otherwise the keys are a ring's
+        /// cells, cell c holding the latest position p &lt;= <see cref="RowStart"/> + <see cref="Rows"/> - 1 with p mod Ring = c
+        /// (cells the mask closes hold nothing the rows see). The rows are positions RowStart .. RowStart + Rows - 1.</summary>
+        protected readonly record struct AttentionKeys(int FirstPosition, int Ring, int RowStart, int Rows);
+
+        /// <summary>One sequence's attention, where a family computes it itself instead of the backend's flash attention: its
+        /// rows' queries <paramref name="q"/> [d, rows, heads], the keys <paramref name="k"/> [d, keys, kvHeads] and values
+        /// <paramref name="v"/> [dv, keys, kvHeads] the runtime would attend (a cache window, or cached and fresh rows), the
+        /// mask <paramref name="mask"/> [keys, rows] (F16, after <see cref="EmitAttentionMask(GraphStep, int, int, int, int, int)"/>)
+        /// and the keys' positions <paramref name="layout"/>; returns [dv, heads, rows], or -1 for the flash attention
+        /// (default). Inkling 2 adds a per-head relative-position bias and a per-query sink to the scores, in F32: ggml's flash
+        /// attention takes an F16 mask only, and has no kernel for a mask per head.</summary>
+        protected virtual int EmitAttentionCore(GraphStep step, int layer, int x, int s, int q, int k, int v, int mask, int keys,
+            in AttentionKeys layout, float scale) => -1;
+
+        /// <summary>A family that projects and prepares its own attention operands from the layer's input <paramref name="x"/>
+        /// returns true with q [d, heads, rows], k [d, kvHeads, rows] and v [dv, kvHeads, rows] (Inkling 2: separate Q, K and
+        /// V inputs, short convolutions on K and V, clipped rows, normed values); <see cref="EmitQueryKey"/> still runs on them.
+        /// Default: the runtime's projections.</summary>
+        protected virtual bool EmitAttentionProjections(GraphStep step, int layer, int x, out int q, out int k, out int v)
+        {
+            q = k = v = -1;
+            return false;
+        }
 
         /// <summary>A bound on the cells any row of sequence <paramref name="s"/> attends in <paramref name="layer"/> under
         /// its mask (a selection's width), so the backend may attend only those; 0 for none.</summary>
@@ -2455,7 +2493,11 @@ namespace TensorSharp.Models
             long qStride = GatedAttentionOutput ? 2L * d : d;
 
             int q, k, v, gate = -1;
-            if (_qkvFused[layer])
+            if (EmitAttentionProjections(step, layer, x, out q, out k, out v))
+            {
+                // The family's own q [d, heads, rows], k [d, kvHeads, rows] and v [dv, kvHeads, rows], prepared.
+            }
+            else if (_qkvFused[layer])
             {
                 int qkv = step.MatMul(LayerName(layer, "attn_qkv.weight"), x);
                 long width = qWidth + kDim + vDim;
@@ -2494,8 +2536,11 @@ namespace TensorSharp.Models
             }
             // Several sequences' verify windows written by index (a batched verify, as many rows each, none past a ring's first lap
             // or a prompt chunk): every sequence's prep and cache writes one region, the writes first, each sequence's into its own
-            // caches at its own rows (the region's results the rotated queries of every row).
-            bool preps = !prep && step.Sequences > 1 && !LegacyBatchedJoinForTests && !WindowAttentionHasRegion
+            // caches at its own rows (the region's results the rotated queries of every row). Only for an executor that runs that
+            // region as one kernel (GraphCapabilities.SequencePrepRegions): elsewhere its ops would replace the step's own (its
+            // queries' and keys' contiguous copies, the writes before the rotations), so a sequence's rows in a batched step would
+            // no longer be the bits of the same rows in the step's other layouts (BatchedJoinBitwiseTests, ggml-cuda).
+            bool preps = !prep && step.Sequences > 1 && caps.SequencePrepRegions && !LegacyBatchedJoinForTests && !WindowAttentionHasRegion
                 && !SequenceAttentionRegionsDisabledForTests && TakesAttentionPrep(step, layer);
             for (int s = 0; preps && s < step.Sequences; s++)
                 preps = Indexed(step.Counts[s]) && step.Counts[s] == step.Counts[0] && !RingWrapped(layer, step.Starts[s], step.Counts[s])
@@ -2612,8 +2657,11 @@ namespace TensorSharp.Models
                     int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, ring, kvType, count, gqa });
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, ring, kvType, count, gqa });
                     int mask = step.RingBandMask(ring, start, count, s, band);
-                    fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, mask, ring), scale,
-                        AttentionKvMax(step, layer, s), promptChunk, DeviceBand(step, band, d, kvType));
+                    int m = EmitAttentionMask(step, layer, x, s, mask, ring);
+                    fa = EmitAttentionCore(step, layer, x, s, qPerm, kWin, vWin, m, ring, new AttentionKeys(-1, ring, start, count), scale);
+                    if (fa < 0)
+                        fa = step.FlashAttention(qPerm, kWin, vWin, m, scale,
+                            AttentionKvMax(step, layer, s), promptChunk, DeviceBand(step, band, d, kvType));
                 }
                 else if (wrapped)
                 {
@@ -2637,8 +2685,9 @@ namespace TensorSharp.Models
                         vAttn = step.Op(GraphOp.Concat, stackalloc[] { ReadRuns(cv, dv, vRow, p1, m1, p2, m2), vFresh }, stackalloc long[] { 1 });
                     }
                     int mask = step.BandCausalMask(first, start, count, s, band);
-                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, mask, start + count - first), scale,
-                        promptChunk: promptChunk);
+                    int m = EmitAttentionMask(step, layer, x, s, mask, start + count - first);
+                    fa = EmitAttentionCore(step, layer, x, s, qPerm, kAttn, vAttn, m, start + count - first, new AttentionKeys(first, 0, start, count), scale);
+                    if (fa < 0) fa = step.FlashAttention(qPerm, kAttn, vAttn, m, scale, promptChunk: promptChunk);
 
                     void WriteRun(int fresh, int cache, int width, long rowBytes, int cell, int from, int n)
                         => step.Effect(step.Op(GraphOp.Cpy,
@@ -2688,8 +2737,11 @@ namespace TensorSharp.Models
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, first, keys, kvType, count, gqa });
                     bool region = BeginWindowAttention(step, layer, x, s, new WindowAttentionOperands(qs, ck, cv, rowsAt, window, heads, kvHeads, d, scale));
                     int mask = band > 0 ? step.BandMask(keys, first, start, count, s, band) : step.ChunkMask(window, start, count, s);
-                    fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, mask, keys), scale,
-                        AttentionKvMax(step, layer, s), promptChunk, capacity ? DeviceBand(step, band, d, kvType) : 0);
+                    int m = EmitAttentionMask(step, layer, x, s, mask, keys);
+                    fa = EmitAttentionCore(step, layer, x, s, qPerm, kWin, vWin, m, keys, new AttentionKeys(first, 0, start, count), scale);
+                    if (fa < 0)
+                        fa = step.FlashAttention(qPerm, kWin, vWin, m, scale,
+                            AttentionKvMax(step, layer, s), promptChunk, capacity ? DeviceBand(step, band, d, kvType) : 0);
                     if (region) step.EndFused(stackalloc[] { fa });
                 }
                 else
@@ -2724,8 +2776,9 @@ namespace TensorSharp.Models
                         vAttn = step.Op(GraphOp.Concat, stackalloc[] { vPrev, vFresh }, stackalloc long[] { 1 });
                     }
                     int mask = band > 0 ? step.BandCausalMask(first, start, count, s, band) : step.CausalMask(start, count, s);
-                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, mask, start + count - first), scale,
-                        promptChunk: promptChunk);
+                    int m = EmitAttentionMask(step, layer, x, s, mask, start + count - first);
+                    fa = EmitAttentionCore(step, layer, x, s, qPerm, kAttn, vAttn, m, start + count - first, new AttentionKeys(first, 0, start, count), scale);
+                    if (fa < 0) fa = step.FlashAttention(qPerm, kAttn, vAttn, m, scale, promptChunk: promptChunk);
                 }
                 int part = step.Reshape(fa, heads * dv, count);
                 if (parts != null) parts.Add(part);
@@ -2766,6 +2819,12 @@ namespace TensorSharp.Models
         /// of a bucket reads the same cells (a decode step advances through them) and a window moves a bucket at a time.</summary>
         private static int SlidingWindowFirstCell(int start, int window, int stepRows)
             => start <= window ? 0 : (start - window) / stepRows * stepRows;
+
+        /// <summary>A layer's feed-forward over its block input <paramref name="x"/> [hidden, rows]: the routed experts on a MoE
+        /// layer, the SwiGLU FFN elsewhere. A family with its own expert recipe (Inkling 2's sigmoid routing and SITU) emits it
+        /// here.</summary>
+        protected virtual int EmitFeedForward(GraphStep step, int layer, int x)
+            => _moeLayer[layer] ? EmitMoe(step, layer, x) : EmitDenseFfn(step, layer, x);
 
         private int EmitDenseFfn(GraphStep step, int layer, int x)
         {

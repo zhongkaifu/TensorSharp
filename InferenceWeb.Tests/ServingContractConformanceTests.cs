@@ -104,6 +104,17 @@ public sealed class ServingContractConformanceTests
         "gptoss: TensorParallel+batching@cuda",
         "gptoss: TensorParallel+batching@ggml_cuda",
         "gptoss: TensorParallel+batching@ggml_vulkan",
+        // Inkling 2 (milestone 1) runs on one device with its experts resident: its loop, depth-mixed stream and own expert
+        // path have no placement or host-expert route yet (docs/design/inkling2-on-shared-runtime.md).
+        "inkling2: ExpertOffload@ggml_cuda",
+        "inkling2: ExpertOffload@ggml_metal",
+        "inkling2: ExpertOffload@ggml_vulkan",
+        "inkling2: HybridParallel@ggml_cuda",
+        "inkling2: HybridParallel@ggml_vulkan",
+        "inkling2: LayerSplit@ggml_cuda",
+        "inkling2: LayerSplit@ggml_vulkan",
+        "inkling2: TensorParallel@ggml_cuda",
+        "inkling2: TensorParallel@ggml_vulkan",
         "ltx-2.5: HybridParallel@cuda",
         "ltx-2.5: HybridParallel@ggml_cuda",
         "ltx-2.5: LayerSplit@cuda",
@@ -234,6 +245,9 @@ public sealed class ServingContractConformanceTests
         }
     }
 
+    /// <summary>The family implements <paramref name="support"/> on at least one backend.</summary>
+    private static bool Claims(MechanismSupport support) => support.Kind == SupportKind.Supported && support.Backends.Count > 0;
+
     [Fact]
     public void EverySharedRuntimeFamilyHasAConformanceFixture()
     {
@@ -246,6 +260,13 @@ public sealed class ServingContractConformanceTests
                 {
                     // Host experts are a claim of families with routed experts only: a dense family has none to place.
                     if (test == SharedRuntimeConformanceTests.HostExpertsMechanism && !arch.Serving.HasRoutedExperts) continue;
+                    // A mechanism the family declares as a gap on every backend (each gap in KnownGaps) is not claimed.
+                    if (test == SharedRuntimeConformanceTests.HostExpertsMechanism && !Claims(arch.Serving.ExpertOffload)) continue;
+                    if (test == nameof(SharedRuntimeConformanceTests.PlacementMatchesOneDevice) && !Claims(arch.Serving.TensorParallel)
+                        && !Claims(arch.Serving.LayerSplit) && !Claims(arch.Serving.HybridParallel)) continue;
+                    // A graph-only family has no per-op path to compare.
+                    if (test == nameof(SharedRuntimeConformanceTests.WholeForwardGraphMatchesThePerOpPath)
+                        && SharedRuntimeConformanceTests.GraphOnlyFamilies.Contains(arch.Id)) continue;
                     Assert.True(suite.GetMethod(test)?.GetCustomAttributes(typeof(FactAttribute), inherit: true).Length > 0,
                         $"'{arch.Id}' is proven by {suite.Name}, which must declare the test {test}.");
                 }

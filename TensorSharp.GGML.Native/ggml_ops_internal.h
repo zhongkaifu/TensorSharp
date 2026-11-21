@@ -1959,6 +1959,21 @@ namespace tsg
 
     bool try_peek_cached_device_copy(const void* data, std::size_t bytes,
                                      ggml_backend_buffer_t& out_buffer, void*& out_addr);
+
+    // THE KEY, AND THE CALLER'S DUTY. A cached device copy (and its initialised
+    // flag and bound address) is keyed by the address of the host bytes and their
+    // size, nothing else: no content check, no owner, no generation. It outlives
+    // the call or graph that made it, until TSGgml_InvalidateHostBuffer(data)
+    // (managed: IGraphExecutor.Invalidate, GgmlBasicOps.InvalidateHostBuffer) or a
+    // whole-cache clear drops it. So whoever frees, re-pins or rewrites host bytes
+    // that were bound here invalidates them first. Otherwise the next bytes of
+    // the same size at that address bind the old copy and compute with the old
+    // values, and nothing reports it. Such bytes can be a managed array pinned
+    // again at a reused address, a recycled GgmlMemoryPool block, or a reused
+    // native allocation. A model's own weights are freed by its dispose, which
+    // clears the whole cache (ModelBase.Dispose). The owners that free weights or
+    // LoRA factors while a model lives invalidate them first: NetworkWeights.Release,
+    // the MiniMax-H3 and MiniMax-H3-Image LoRA sets and the H3-Image denoiser.
     bool try_get_cacheable_tensor_buffer(
         ggml_backend_t backend, ggml_backend_dev_t dev,
         ggml_tensor* tensor, void* data, std::size_t bytes,

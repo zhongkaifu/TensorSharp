@@ -755,24 +755,51 @@ namespace TensorSharp.Cuda
             if (Interlocked.Exchange(ref disposed, 1) != 0)
                 return;
 
-            Context.MakeCurrent();
-            Stream.Synchronize();
-            lock (ownedResources)
+            // The whole teardown under the lifetime lock: a storage finalized meanwhile returns its block before it or finds
+            // the context released after it (ReturnFinalizedStorageMemory). The teardown's own releases on this thread
+            // (owned resources) re-enter the lock and still reach the pool before it is drained.
+            lock (lifetimeSync)
             {
-                foreach (IDisposable resource in ownedResources) resource.Dispose();
-                ownedResources.Clear();
+                Context.MakeCurrent();
+                Stream.Synchronize();
+                lock (ownedResources)
+                {
+                    foreach (IDisposable resource in ownedResources) resource.Dispose();
+                    ownedResources.Clear();
+                }
+                CudaQuantizedOps.ReleaseScratch(this);
+                CudaQuantizedOps.ReleaseArena(this);
+                pool.DrainAndFree();
+                CudaLtx25PromptOps.ReleaseForAllocator(this);
+                Kernels?.Dispose();
+                fp4Kernels?.Dispose();
+                ssmPrefillKernels?.Dispose();
+                flashPrefillKernels?.Dispose();
+                Blas.Dispose();
+                Stream.Dispose();
+                Context.Dispose();
             }
-            CudaQuantizedOps.ReleaseScratch(this);
-            CudaQuantizedOps.ReleaseArena(this);
-            pool.DrainAndFree();
-            CudaLtx25PromptOps.ReleaseForAllocator(this);
-            Kernels?.Dispose();
-            fp4Kernels?.Dispose();
-            ssmPrefillKernels?.Dispose();
-            flashPrefillKernels?.Dispose();
-            Blas.Dispose();
-            Stream.Dispose();
-            Context.Dispose();
+        }
+
+        /// <summary>Held by <see cref="Dispose"/> for its whole teardown and by <see cref="ReturnFinalizedStorageMemory"/>.</summary>
+        private readonly object lifetimeSync = new();
+
+        /// <summary>
+        /// A device block of a storage the GC finalized (CudaStorage's finalizer thread). The context check, the context
+        /// switch and the return - whose pool may read the device's free memory (QueryFreeDeviceBytes, on this context) - run
+        /// under the lifetime lock, so a concurrent <see cref="Dispose"/> cannot release the context between them: a
+        /// finalizer must never throw (an exception there ends the process). After the teardown the block is dropped:
+        /// releasing the context freed it.
+        /// </summary>
+        internal void ReturnFinalizedStorageMemory(IntPtr ptr, long allocationBytes)
+        {
+            lock (lifetimeSync)
+            {
+                if (Context.IsDisposed)
+                    return;
+                Context.MakeCurrent();
+                ReturnDeviceMemory(ptr, allocationBytes);
+            }
         }
 
         private void ThrowIfDisposed()

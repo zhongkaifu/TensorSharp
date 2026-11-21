@@ -90,7 +90,7 @@ namespace TensorSharp.Graph
 
         private static readonly HashSet<GraphOp> s_ops = new()
         {
-            GraphOp.GetRows, GraphOp.Add, GraphOp.Sub, GraphOp.Mul, GraphOp.Div, GraphOp.Scale, GraphOp.RmsNorm,
+            GraphOp.GetRows, GraphOp.Add, GraphOp.Sub, GraphOp.Mul, GraphOp.Div, GraphOp.Scale, GraphOp.ScaleBias, GraphOp.RmsNorm,
             GraphOp.L2Norm, GraphOp.MulMat, GraphOp.MulMatId, GraphOp.Silu, GraphOp.Sigmoid, GraphOp.Softplus,
             GraphOp.Exp, GraphOp.Neg, GraphOp.Tanh, GraphOp.Relu, GraphOp.SwigluSplit, GraphOp.Swiglu, GraphOp.Reshape,
             GraphOp.View, GraphOp.Permute, GraphOp.Transpose, GraphOp.Cont, GraphOp.Cast, GraphOp.Cpy, GraphOp.SetRows,
@@ -1705,6 +1705,12 @@ namespace TensorSharp.Graph
                 case GraphOp.Sqrt: return V(Sqrt(In(T(0), run)));
                 case GraphOp.Clamp: return V(Ops.Clamp(null, In(T(0), run), Fp(0, float.MinValue), Fp(1, float.MaxValue)));
                 case GraphOp.Scale: return V(Ops.Mul(null, In(T(0), run), Fp(0, 1f)));
+                case GraphOp.ScaleBias:
+                {
+                    // ggml_scale_bias: x * s + b.
+                    using Tensor scaled = Ops.Mul(null, In(T(0), run), Fp(0, 1f));
+                    return V(Ops.Add(null, scaled, Fp(1, 0f)));
+                }
                 case GraphOp.Silu: return V(Ops.SiLU(null, In(T(0), run)));
                 case GraphOp.Sigmoid: return V(Ops.Sigmoid(null, In(T(0), run)));
                 case GraphOp.Exp: return V(Ops.Exp(null, In(T(0), run)));

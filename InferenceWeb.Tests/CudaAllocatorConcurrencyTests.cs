@@ -36,6 +36,56 @@ public class CudaAllocatorConcurrencyTests
     public CudaAllocatorConcurrencyTests(ITestOutputHelper output) => _output = output;
 
     // ---------------------------------------------------------------------
+    // Storages the GC finalizes after, or while, their allocator is disposed: the release runs on the finalizer
+    // thread, where an exception ends the process. Before CudaAllocator.ReturnFinalizedStorageMemory a dispose on
+    // another thread could release the context between the finalizer's IsDisposed check and its pool's free-memory
+    // read (QueryFreeDeviceBytes -> MakeCurrent -> ObjectDisposedException), which aborted a CUDA test host.
+    // Reaching the end is the assertion.
+    // ---------------------------------------------------------------------
+    [CudaFact]
+    public void StoragesFinalizedAfterOrWhileTheirAllocatorIsDisposedNeverThrow()
+    {
+        // The allocator disposed with live storages, then the storages finalized.
+        var allocator = new CudaAllocator();
+        Orphan(allocator, 64);
+        allocator.Dispose();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // The finalizer thread releasing orphaned storages while this thread disposes their allocator.
+        for (int round = 0; round < 16; round++)
+        {
+            var concurrent = new CudaAllocator();
+            Orphan(concurrent, 256);
+            using var start = new Barrier(2);
+            var collector = new Thread(() =>
+            {
+                start.SignalAndWait();
+                for (int i = 0; i < 4; i++)
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                }
+            });
+            collector.Start();
+            start.SignalAndWait();
+            concurrent.Dispose();
+            collector.Join();
+        }
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+    }
+
+    /// <summary>Storages of <paramref name="allocator"/> nothing releases: only the GC frees them.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void Orphan(CudaAllocator allocator, int count)
+    {
+        for (int i = 0; i < count; i++)
+            _ = new CudaStorage(allocator, DType.Float32, 1024 + i);
+    }
+
+    // ---------------------------------------------------------------------
     // Real-device correctness: concurrent allocate/dispose must be race-free,
     // must reuse pooled blocks (high hit ratio), and must keep cachedBytes /
     // metric accounting consistent (no negative or leaked accounting).

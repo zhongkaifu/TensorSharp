@@ -14,6 +14,12 @@ namespace TensorSharp.Cuda
         private bool hostDirty;
         private bool deviceDirty;
 
+        /// <summary>Set by the finalizer before RefCounted's calls <see cref="Destroy"/>: that release runs on the GC's finalizer
+        /// thread, concurrently with whatever thread disposes the allocator.</summary>
+        private volatile bool finalizing;
+
+        ~CudaStorage() => finalizing = true;
+
         public CudaStorage(CudaAllocator allocator, DType elementType, long elementCount)
             : base(allocator, elementType, elementCount)
         {
@@ -42,24 +48,23 @@ namespace TensorSharp.Cuda
                 if (deviceBuffer != IntPtr.Zero)
                 {
                     // A storage that outlives its context reaches here from the GC
-                    // finalizer thread at process exit, after the primary context was
-                    // released. Releasing the context already freed every allocation
-                    // made against it, so making it current (or returning the buffer
-                    // to a pool whose device memory is gone) would throw
-                    // ObjectDisposedException out of a finalizer and abort the
-                    // process. Just drop the pointer.
-                    if (AllocatorImpl.Context.IsDisposed)
-                    {
-                        deviceBuffer = IntPtr.Zero;
-                        deviceAllocationBytes = 0;
-                    }
-                    else
+                    // finalizer thread, after (or while) the allocator is disposed and the
+                    // primary context released. Releasing the context already freed every
+                    // allocation made against it, so making it current (or returning the
+                    // buffer to a pool whose device memory is gone) would throw
+                    // ObjectDisposedException out of a finalizer and abort the process:
+                    // drop the pointer then. From the finalizer thread the check and the
+                    // return run under the allocator's lifetime lock, which its Dispose holds
+                    // for the whole teardown, so the context cannot be released between them.
+                    if (finalizing)
+                        AllocatorImpl.ReturnFinalizedStorageMemory(deviceBuffer, deviceAllocationBytes);
+                    else if (!AllocatorImpl.Context.IsDisposed)
                     {
                         AllocatorImpl.Context.MakeCurrent();
                         AllocatorImpl.ReturnDeviceMemory(deviceBuffer, deviceAllocationBytes);
-                        deviceBuffer = IntPtr.Zero;
-                        deviceAllocationBytes = 0;
                     }
+                    deviceBuffer = IntPtr.Zero;
+                    deviceAllocationBytes = 0;
                 }
 
                 if (hostBuffer != IntPtr.Zero)
