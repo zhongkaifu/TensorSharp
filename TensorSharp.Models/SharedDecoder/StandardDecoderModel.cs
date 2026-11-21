@@ -522,6 +522,16 @@ namespace TensorSharp.Models
         /// and ggml-vulkan too: the device lookup was a graph of its own whose download waited for the step before it.</summary>
         protected override bool EmbedsPromptRowsOnHost => OverlapsPromptSteps && _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan;
 
+        /// <summary>
+        /// The direct-CUDA startup warmup prefills 64 tokens, past the CUDA graph executor's decode-size products (up to 32 rows:
+        /// the row-invariant decode kernels of the K-quants, Q8_0, IQ4_XS and the IQ2 / IQ3 formats). The shared 32 had run
+        /// those alone, so the prompt route (the F16 tensor-core GEMM over dequantized weights) was first used by the first
+        /// request: Muse-Glimmer-30B UD-IQ2_XXS's first 53-token prompt step took 360.9 ms against 262.9 after a 64-token
+        /// warmup, and the later prompts' 242-247 ms either way (RTX PRO 4500 Blackwell). TS_PREFILL_WARMUP_LEN still
+        /// overrides it.
+        /// </summary>
+        protected override int NativeCudaPrefillWarmupLength => Math.Max(base.NativeCudaPrefillWarmupLength, 64);
+
         private Tensor EmbedStep(int[] tokens)
         {
             StepTokens = tokens;
