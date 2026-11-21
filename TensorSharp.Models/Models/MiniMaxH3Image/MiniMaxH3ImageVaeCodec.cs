@@ -104,7 +104,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
                 BackendType.GgmlMetal => GgmlGraphExecutor.For(GgmlBackendType.Metal),
                 BackendType.GgmlCpu => GgmlGraphExecutor.For(GgmlBackendType.Cpu),
                 _ => throw new NotSupportedException(
-                    $"MiniMax-H3-Image's VAE runs on ggml_cuda, ggml_metal or ggml_cpu, not {backend}."),
+                    $"MiniMax-H3-Image's VAE runs on ggml_cuda, ggml_metal or ggml_cpu, not {Architecture.BackendNames.OptionName(backend)}."),
             })
         {
         }
