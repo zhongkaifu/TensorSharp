@@ -39,15 +39,21 @@ namespace TensorSharp.Models
         /// the GGUF's mapped pages, where the fused weight was an anonymous copy of both. UD-IQ2_XXS on ggml_cpu: peak resident
         /// 17.8 -> 13.4 GB, the system's reclaimable memory 4.0 GB higher, pp512 and decode within 0.4% (the same products row
         /// for row);</item>
+        /// <item>ggml-vulkan keeps the UD files' IQ2_S pairs apart: two IQ2_S products prefill 2.1-3.2% faster than the fused
+        /// one at 512 and 4K rows, decode within noise (0.990-1.013), the same VRAM and the same greedy tokens (UD-IQ2_XXS,
+        /// RTX PRO 4500 Blackwell, stage S7's CUDA part, two ABBA rounds of the probe's bench in one binary). Its Q4_K pairs
+        /// stay fused (apart: prefill 1.010-1.014, decode 0.976-0.996);</item>
         /// <item>everything else stays fused, as legacy runs it: apart measured 0.997-1.000 on ggml_metal (IQ2_S and Q4_K pairs,
-        /// no memory saved: Metal wires either) and 0.975-0.991 on MLX.</item>
+        /// no memory saved: Metal wires either), 0.975-0.991 on MLX, and on ggml_cuda and direct CUDA IQ2_S apart trades
+        /// prefill for decode (0.986-1.017 against 0.975-1.011).</item>
         /// </list>
         /// </summary>
         protected override bool KeepsGateUpApart(int gateType, int upType)
             => _gateUpApart is bool apart
                 ? apart && gateType == upType
                 : (_backend == BackendType.GgmlCuda && gateType == upType && gateType is 8 /* Q8_0 */ or 12 /* Q4_K */)
-                  || (_backend == BackendType.GgmlCpu && gateType == upType && (CpuRepacks(gateType) || gateType == 22 /* IQ2_S */));
+                  || (_backend == BackendType.GgmlCpu && gateType == upType && (CpuRepacks(gateType) || gateType == 22 /* IQ2_S */))
+                  || (_backend == BackendType.GgmlVulkan && gateType == upType && gateType == 22 /* IQ2_S */);
 
         /// <summary>Benchmarks (eng/validation/MuseGlimmerKvGrowProbe <c>--gate-up</c>): every same-type gate/up pair kept apart
         /// (true) or fused (false) in place of <see cref="KeepsGateUpApart"/>'s rule, so both arms of that measurement run in one
