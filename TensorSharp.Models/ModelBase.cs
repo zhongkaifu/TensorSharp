@@ -3599,6 +3599,10 @@ namespace TensorSharp.Models
             _hostExpertIoBases = null;
         }
 
+        /// <summary>Test seam: <see cref="Dispose"/> calls it right after it frees the model's dense weight tensors, while
+        /// their pool blocks can already be handed out again and the model's allocator is still open.</summary>
+        internal virtual void AfterDenseWeightsFreedForTests() { }
+
         public virtual void Dispose()
         {
             // Release any distributed worker nodes before tearing down the TP
@@ -3613,10 +3617,6 @@ namespace TensorSharp.Models
 
             // LoRA factor tensors come from this model's allocator, so they go before it does.
             ReleaseAllAdapters();
-
-            foreach (var w in _weights.Values)
-                w.Dispose();
-            _weights.Clear();
 
             if (IsGgmlBackend)
             {
@@ -3643,6 +3643,14 @@ namespace TensorSharp.Models
                 GgmlBasicOps.ReleaseReuseComputeBuffers();
                 GgmlBasicOps.ClearHostBufferCache();
             }
+
+            // After the cache is cleared: a device copy is keyed by the address and size of its host bytes alone, and a
+            // weight's pool block may be handed out again as soon as it is freed (to another model in this process, for
+            // one), whose bytes would then bind this weight's copy.
+            foreach (var w in _weights.Values)
+                w.Dispose();
+            _weights.Clear();
+            AfterDenseWeightsFreedForTests();
 
             if (_backend == BackendType.Cuda && _allocator is CudaAllocator cudaAllocator)
             {
