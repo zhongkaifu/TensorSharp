@@ -29,7 +29,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] _gemmQ6k = new IntPtr[4];
         private readonly IntPtr _setRowsHeads;
         private readonly IntPtr _gdnScanSeqs, _gdnScanSeqsKda;
-        private readonly IntPtr _deltaNetPrepSeqs, _gatedRmsNormSeqs, _cacheRowsSeqs, _deltaNetPrepSeqs2;
+        private readonly IntPtr _deltaNetPrepSeqs, _gatedRmsNormSeqs, _cacheRowsSeqs, _deltaNetPrepSeqs2, _attnPrepSeqs;
         private readonly IntPtr _gdn8, _gdn8Scan, _gdn8ScanKda, _gdn8ScanSeqs, _gdn8ScanSeqsKda, _gdn8Commit;
         private readonly IntPtr _ringAttnLanes64, _ringAttnLanes128;
         private readonly int _multiprocessors;
@@ -63,10 +63,11 @@ namespace TensorSharp.Cuda
             try
             {
                 _deltaNetPrepSeqs2 = module.GetFunction("ts_graph_deltanet_prep_seqs2_f32");
+                _attnPrepSeqs = module.GetFunction("ts_graph_attn_prep_seqs_f32");
             }
             catch (CudaException ex) when (ex.ErrorCode == 500)
             {
-                _deltaNetPrepSeqs2 = IntPtr.Zero;
+                _deltaNetPrepSeqs2 = _attnPrepSeqs = IntPtr.Zero;
             }
             try
             {
@@ -241,6 +242,46 @@ namespace TensorSharp.Cuda
                 &freqScale, &extFactor, &attnFactor, &betaFast, &betaSlow };
             CudaDriverApi.cuLaunchKernel(_attnPrep, (uint)((units + AttentionPrepWarps - 1) / AttentionPrepWarps), 1, 1, AttentionPrepWarps * 32, 1, 1,
                 (uint)(AttentionPrepWarps * d * sizeof(float)), stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>Sequences <see cref="LaunchAttentionPrepSequences"/> takes in one launch (TS_GRAPH_ATTN_PREP_SEQS).</summary>
+        public const int AttentionPrepSequences = 16;
+
+        /// <summary>Whether this image runs <see cref="LaunchAttentionPrepSequences"/>.</summary>
+        public bool TakesAttentionPrepSequences => _attnPrepSeqs != IntPtr.Zero;
+
+        /// <summary>The argument of ts_graph_attn_prep_seqs_f32, byte for byte (struct ts_graph_attn_prep_seqs): each sequence's K
+        /// and V caches (head-first; a q8_0 cache's block bytes), its rows' KV indices and its caches' cells.</summary>
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct AttentionPrepSequencesArgs
+        {
+            public fixed long KCache[AttentionPrepSequences];
+            public fixed long VCache[AttentionPrepSequences];
+            public fixed long Cells[AttentionPrepSequences];
+            public fixed int Cap[AttentionPrepSequences];
+        }
+
+        /// <summary><see cref="LaunchAttentionPrep"/> over several sequences' rows (<paramref name="rowsPerSequence"/> each, every
+        /// sequence's keys and values into its own caches at its own cells, per <paramref name="args"/>), the queries as rows of
+        /// heads: every value and cache row is that kernel's.</summary>
+        public void LaunchAttentionPrepSequences(AttentionPrepSequencesArgs args, int rowsPerSequence, IntPtr q, long qRow, long qHead, IntPtr k,
+            long kRow, long kHead, IntPtr v, long vRow, long vHead, IntPtr qNorm, IntPtr kNorm, IntPtr output, long outRow, long outHead,
+            int cacheFormat, IntPtr positions, int rows, int heads, int kvHeads, int d, int dv, float eps, int ropeDim, int mode, int ctx,
+            float freqBase, float freqScale, float extFactor, float attnFactor, float betaFast, float betaSlow, IntPtr stream)
+        {
+            if (cacheFormat is not (CacheF32 or CacheF16 or CacheQ8_0) || (cacheFormat == CacheQ8_0 && (d % 32 != 0 || dv % 32 != 0)))
+                throw new ArgumentOutOfRangeException(nameof(cacheFormat), $"attention prep into cache format {cacheFormat} of {d} / {dv} values a row");
+            long units = (long)rows * (heads + 2L * kvHeads);
+            if (units < 1 || rowsPerSequence < 1 || rows % rowsPerSequence != 0 || rows / rowsPerSequence > AttentionPrepSequences
+                || (units + AttentionPrepWarps - 1) / AttentionPrepWarps > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(rows), $"attention prep of {rows} rows ({rowsPerSequence} a sequence)");
+            int half = cacheFormat;
+            AttentionPrepSequencesArgs* p = &args;
+            void** argv = stackalloc void*[] { p, &rowsPerSequence, &q, &qRow, &qHead, &k, &kRow, &kHead, &v, &vRow, &vHead, &qNorm, &kNorm, &output,
+                &outRow, &outHead, &half, &positions, &rows, &heads, &kvHeads, &d, &dv, &eps, &ropeDim, &mode, &ctx, &freqBase, &freqScale,
+                &extFactor, &attnFactor, &betaFast, &betaSlow };
+            CudaDriverApi.cuLaunchKernel(_attnPrepSeqs, (uint)((units + AttentionPrepWarps - 1) / AttentionPrepWarps), 1, 1, AttentionPrepWarps * 32, 1, 1,
+                (uint)(AttentionPrepWarps * d * sizeof(float)), stream, (IntPtr)argv, IntPtr.Zero).ThrowOnError();
         }
 
         /// <summary>Whether this image runs a QSA region's kernels (<see cref="LaunchQsaScores"/>, <see cref="LaunchQsaSelect"/>

@@ -4197,3 +4197,150 @@ extern "C" __global__ void ts_graph_deltanet_prep_seqs2_f32(const ts_graph_prep2
     for (int e = i; e < d * span; e += blockDim.x)
         hist[e] = prep2_stage[e];
 }
+
+// GraphFusion.AttentionPrep over several sequences' rows (a batched verify's windows, rowsPerSeq rows each, every sequence with
+// its own caches and KV indices): ts_graph_attn_prep_f32's body (copied), row t of sequence t / rowsPerSeq writing its keys and
+// values into that sequence's caches at its own cells, so every value and cache row is that kernel's (and the ops') to the bit.
+// The queries go out as rows of heads. Launch: as ts_graph_attn_prep_f32 over every sequence's rows.
+#define TS_GRAPH_ATTN_PREP_SEQS 16
+struct ts_graph_attn_prep_seqs
+{
+    void* k_cache[TS_GRAPH_ATTN_PREP_SEQS];
+    void* v_cache[TS_GRAPH_ATTN_PREP_SEQS];
+    const int* cells[TS_GRAPH_ATTN_PREP_SEQS];
+    int cap[TS_GRAPH_ATTN_PREP_SEQS];
+};
+
+extern "C" __global__ void __launch_bounds__(TS_GRAPH_ATTN_PREP_WARPS * 32) ts_graph_attn_prep_seqs_f32(const ts_graph_attn_prep_seqs seqs,
+    int rowsPerSeq, const float* __restrict__ q, long long qRow, long long qHead, const float* __restrict__ k, long long kRow, long long kHead,
+    const float* __restrict__ v, long long vRow, long long vHead, const float* __restrict__ qNorm, const float* __restrict__ kNorm,
+    float* __restrict__ out, long long outRow, long long outHead, int cacheFormat,
+    const int* __restrict__ pos, int rows, int heads, int kvHeads, int d, int dv, float eps,
+    int rope_dim, int mode, int n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast,
+    float beta_slow)
+{
+    extern __shared__ float rowbuf[];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int units = heads + 2 * kvHeads;
+    const long long unit = (long long)blockIdx.x * TS_GRAPH_ATTN_PREP_WARPS + warp;
+    // Every exit below is a whole warp's: the kernel has no block-wide barrier.
+    if (unit >= (long long)rows * units)
+        return;
+    const int t = (int)(unit / units), h = (int)(unit % units);
+    // Row t is row t % rowsPerSeq of sequence t / rowsPerSeq: its caches, their cells and its KV index there.
+    const int z = t / rowsPerSeq;
+    void* __restrict__ kCache = seqs.k_cache[z];
+    void* __restrict__ vCache = seqs.v_cache[z];
+    const int cap = seqs.cap[z];
+    const bool isQ = h < heads, isV = h >= heads + kvHeads;
+    const int kvh = isV ? h - heads - kvHeads : h - heads;
+    const int cell = isQ ? 0 : seqs.cells[z][t - z * rowsPerSeq];
+    if (!isQ && (cell < 0 || cell >= cap))
+        return;
+    if (isV)
+    {
+        const float* src = v + t * vRow + (long long)kvh * vHead;
+        const size_t at = ((size_t)kvh * cap + cell) * dv;
+        if (cacheFormat == TS_GRAPH_CACHE_Q8_0)
+        {
+            ts_q8_0_store_row_warp(src, (uint8_t*)vCache + ((size_t)kvh * cap + cell) * (size_t)(dv / 32 * 34), dv);
+            return;
+        }
+        for (int i = lane; i < dv; i += 32)
+        {
+            const float val = src[i];
+            if (cacheFormat == TS_GRAPH_CACHE_F16) ((__half*)vCache)[at + i] = __float2half_rn(val);
+            else ((float*)vCache)[at + i] = val;
+        }
+        return;
+    }
+    const float* x = isQ ? q + t * qRow + (long long)h * qHead : k + t * kRow + (long long)kvh * kHead;
+    const float* w = isQ ? qNorm : kNorm;
+    float* qDst = isQ ? out + t * outRow + (long long)h * outHead : nullptr;
+    const size_t at = isQ ? 0 : ((size_t)kvh * cap + cell) * d;
+    float* buf = rowbuf + (size_t)warp * d;
+
+    // ts_rmsnorm_f32's thread sums (blockDim 256): thread 32m + lane squares columns 32m + lane + 256k, k ascending.
+    float part[8];
+#pragma unroll
+    for (int m = 0; m < 8; ++m)
+        part[m] = 0.0f;
+    for (int base = 0; base < d; base += 256)
+    {
+#pragma unroll
+        for (int m = 0; m < 8; ++m)
+        {
+            const int i = base + 32 * m + lane;
+            if (i < d)
+            {
+                float val = x[i];
+                buf[i] = val;
+                part[m] += val * val;
+            }
+        }
+    }
+    // block_reduce_sum: each warp's shuffle-down tree (its sum on lane 0), then the first warp's over lanes 0..7.
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int m = 0; m < 8; ++m)
+    {
+        float s = part[m];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            s += __shfl_down_sync(0xFFFFFFFF, s, offset);
+        s = __shfl_sync(0xFFFFFFFF, s, 0);
+        if (lane == m)
+            sum_sq = s;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    const float inv_rms = rsqrtf(__shfl_sync(0xFFFFFFFF, sum_sq, 0) / (float)d + eps);
+    for (int i = lane; i < d; i += 32)
+    {
+        float val = buf[i] * inv_rms;
+        val *= w[i];
+        buf[i] = val;
+    }
+    __syncwarp();
+
+    const int position = pos[t];
+    const int active_dim = rope_dim < d ? rope_dim : d;
+    const int pair_count = active_dim / 2;
+    const bool neox = (mode & 2) != 0;   // GGML_ROPE_TYPE_NEOX
+    for (int i = lane; i < pair_count; i += 32)
+    {
+        float theta_extrap = (float)position * powf(freq_base, -2.0f * (float)i / (float)active_dim);
+        float c;
+        float s;
+        if (ext_factor != 0.0f)
+        {
+            float corr_low;
+            float corr_high;
+            ts_graph_yarn_corr_dims(active_dim, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr_low, &corr_high);
+            float mscale = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+            ts_graph_yarn_rope(theta_extrap, freq_scale, corr_low, corr_high, i, ext_factor, mscale, &c, &s);
+        }
+        else
+        {
+            float angle = theta_extrap * freq_scale;
+            c = cosf(angle);
+            s = sinf(angle);
+        }
+        const int left_index = neox ? i : i * 2;
+        const int right_index = neox ? i + pair_count : i * 2 + 1;
+        float left = buf[left_index];
+        float right = buf[right_index];
+        float out_left = left * c - right * s;
+        float out_right = right * c + left * s;
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, left_index, out_left, buf);
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, right_index, out_right, buf);
+    }
+    for (int col = pair_count * 2 + lane; col < d; col += 32)
+        ts_graph_attn_prep_store(isQ, qDst, kCache, cacheFormat, at, col, buf[col], buf);
+    if (!isQ && cacheFormat == TS_GRAPH_CACHE_Q8_0)
+    {
+        // The rotated key, every lane's columns written back to the row: quantized whole.
+        __syncwarp();
+        ts_q8_0_store_row_warp(buf, (uint8_t*)kCache + ((size_t)kvh * cap + cell) * (size_t)(d / 32 * 34), d);
+    }
+}
+

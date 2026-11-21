@@ -123,14 +123,14 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
         string path = new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "q35.gguf"));
         int[] all = Enumerable.Range(0, Prompts.Length).ToArray();
         List<float[]>[] together, apart;
-        long regions, windows, preps, norms, writes, planes, blockRows;
+        long regions, windows, preps, norms, writes, planes, blockRows, attentionPreps;
         using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
         {
             together = Run(model, all);
             var executor = (CudaGraphExecutor)model.GraphExecutorForTests;
             (regions, windows, preps, norms, writes) = (executor.DeltaNetScanRegions, executor.SequenceWindowLaunches, executor.PrepSequenceLaunches,
                 executor.GatedNormSequenceLaunches, executor.SequenceWriteLaunches);
-            (planes, blockRows) = (executor.PrepIntoSavedInputs, executor.PrepSequence2Launches);
+            (planes, blockRows, attentionPreps) = (executor.PrepIntoSavedInputs, executor.PrepSequence2Launches, executor.AttentionPrepSequenceRegions);
         }
         using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
         {
@@ -144,6 +144,7 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
             Assert.Equal(0, executor.PrepSequenceLaunches);
             Assert.Equal(0, executor.GatedNormSequenceLaunches);
             Assert.Equal(0, executor.SequenceWriteLaunches);
+            Assert.Equal(0, executor.AttentionPrepSequenceRegions);
         }
         Assert.True(regions > 0, "no verify step scanned its sequences in one launch");
         Assert.True(windows > 0, "no verify step attended its sequences' windows in one launch");
@@ -153,19 +154,35 @@ public sealed class BatchedVerifyScanRegionTests : IDisposable
         // over every row.
         Assert.True(planes > 0, "no verify step's preps wrote the windows' saved inputs");
         Assert.True(blockRows > 0, "no verify step's preps ran a block a head over its rows");
-        // An F16 cache's rows are written for every sequence in one launch; a q8_0 cache's each as before.
-        if (kv == KvCacheDtype.F16) Assert.True(writes > 0, "no verify step wrote its sequences' cache rows in one launch");
+        // Every sequence's query/key prep and cache writes ran in one launch a layer (the family's attention prep region over
+        // the sequences' rows), so no cache write was left for the attention region to hold.
+        Assert.True(attentionPreps > 0, "no verify step prepared its sequences' queries and keys in one launch");
+        // Without the family's attention prep the attention region holds the sequences' F16 cache writes and makes them in one
+        // launch: the same bits again.
+        List<float[]>[] heldWrites;
+        long held;
+        using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
+        {
+            ((Qwen35RuntimeModel)model).AttentionPrepRegionDisabledForTests = true;
+            heldWrites = Run(model, all);
+            var executor = (CudaGraphExecutor)model.GraphExecutorForTests;
+            held = executor.SequenceWriteLaunches;
+            Assert.Equal(0, executor.AttentionPrepSequenceRegions);
+        }
+        if (kv == KvCacheDtype.F16) Assert.True(held > 0, "no verify step wrote its sequences' cache rows in one launch");
         var alone = new List<float[]>[Prompts.Length];
         for (int r = 0; r < Prompts.Length; r++)
             using (var model = (StandardDecoderModel)ModelBase.Create(path, BackendType.Cuda))
                 alone[r] = Run(model, new[] { r })[0];
         for (int r = 0; r < Prompts.Length; r++)
         {
-            int vsOps = Apart(together[r], apart[r]), vsAlone = Apart(together[r], alone[r]);
-            _output.WriteLine($"request {r}: {together[r].Count} rows; {vsOps} apart from the preps, scans, norms and windows launched a sequence each, {vsAlone} from it alone");
+            int vsOps = Apart(together[r], apart[r]), vsAlone = Apart(together[r], alone[r]), vsHeld = Apart(together[r], heldWrites[r]);
+            _output.WriteLine($"request {r}: {together[r].Count} rows; {vsOps} apart from the preps, scans, norms and windows launched a sequence each, " +
+                $"{vsAlone} from it alone, {vsHeld} from the held cache writes");
             Assert.Equal(0, vsOps);
             Assert.Equal(0, vsAlone);
+            Assert.Equal(0, vsHeld);
         }
-        _output.WriteLine($"{regions} scan regions, {preps} prep regions ({planes} into the saved inputs), {norms} norm regions, {writes} write launches, {windows} window regions");
+        _output.WriteLine($"{regions} scan regions, {preps} prep regions ({planes} into the saved inputs), {norms} norm regions, {attentionPreps} attention prep regions, {held} held write launches, {windows} window regions");
     }
 }

@@ -73,16 +73,19 @@ namespace TensorSharp.Models
         protected override void BeginAttentionPrep(GraphStep step, int layer, in AttentionPrepOperands prep)
         {
             RotarySpec rope = _rotary;
-            step.BeginFused(GraphFusion.AttentionPrep,
-                stackalloc[]
-                {
-                    prep.Queries, prep.Keys, prep.Values, step.Weight(LayerName(layer, "attn_q_norm.weight")),
-                    step.Weight(LayerName(layer, "attn_k_norm.weight")), prep.KCache, prep.VCache, step.Positions, prep.Rows,
-                },
+            int[] further = prep.Further ?? Array.Empty<int>();
+            var srcs = new int[9 + further.Length];
+            new[]
+            {
+                prep.Queries, prep.Keys, prep.Values, step.Weight(LayerName(layer, "attn_q_norm.weight")),
+                step.Weight(LayerName(layer, "attn_k_norm.weight")), prep.KCache, prep.VCache, step.Positions, prep.Rows,
+            }.CopyTo(srcs, 0);
+            further.CopyTo(srcs, 9);
+            step.BeginFused(GraphFusion.AttentionPrep, srcs,
                 stackalloc long[]
                 {
                     prep.Heads, prep.KvHeads, prep.HeadDim, prep.ValueDim, rope.Dims, rope.NeoX ? 2 : 0, rope.OriginalContext,
-                    AttentionReadsQueriesAlone(step, layer) ? 1 : 0,
+                    further.Length == 0 && AttentionReadsQueriesAlone(step, layer) ? 1 : 0,
                 },
                 stackalloc[] { Config.Eps, rope.FreqBase, rope.FreqScale, rope.ExtFactor, rope.AttnFactor, rope.BetaFast, rope.BetaSlow });
         }

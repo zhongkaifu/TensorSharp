@@ -1669,6 +1669,7 @@ namespace TensorSharp.Cuda
             if (kernels == null || inputs.Length < 9 || ip == null || ip.Length < 7 || fp == null || fp.Length < 7 || results.Length < 1
                 || Array.Exists(ip, x => x < int.MinValue || x > int.MaxValue))
                 return false;
+            if (inputs.Length > 9) return TryAttentionPreps(inputs, ip, fp, results);
             Tensor q = inputs[0], k = inputs[1], v = inputs[2], qNorm = inputs[3], kNorm = inputs[4], positions = inputs[7], rows = inputs[8];
             int heads = (int)ip[0], kvHeads = (int)ip[1], d = (int)ip[2], dv = (int)ip[3];
             if (!DeviceInts(positions) || !DeviceInts(rows) || !AllF32OnDevice(q, k, v, qNorm, kNorm) || !qNorm.IsContiguous() || !kNorm.IsContiguous())
@@ -1721,6 +1722,99 @@ namespace TensorSharp.Cuda
             AttentionPrepRegions++;
             return true;
         }
+
+        /// <summary>
+        /// <see cref="GraphFusion.AttentionPrep"/> over several sequences' rows (a batched verify's windows: inputs 5, 6 and 8 the
+        /// first sequence's caches and KV indices, then each further sequence's three) in one launch (ts_graph_attn_prep_seqs_f32):
+        /// the norms, rotaries and cache writes of every sequence's rows, each sequence's into its own caches, every value
+        /// ts_graph_attn_prep_f32's. Four Qwen3.8-27B requests' 32-row verify had run them as seven launches a layer (the norms,
+        /// rotaries, the values' copy and the sequences' writes: 0.21 of the step's ms on an RTX PRO 4500), where 038fb303's engine
+        /// ran one. False (the ops run) unless every sequence's rows are as many and its caches the first one's kind and shape.
+        /// </summary>
+        private bool TryAttentionPreps(Tensor[] inputs, long[] ip, float[] fp, Tensor[] results)
+        {
+            CudaGraphKernels kernels = Kernels;
+            if ((inputs.Length - 9) % 3 != 0 || kernels is not { TakesAttentionPrepSequences: true }) return false;
+            int n = (inputs.Length - 9) / 3 + 1;
+            if (n > CudaGraphKernels.AttentionPrepSequences) return false;
+            Tensor q = inputs[0], k = inputs[1], v = inputs[2], qNorm = inputs[3], kNorm = inputs[4], positions = inputs[7];
+            int heads = (int)ip[0], kvHeads = (int)ip[1], d = (int)ip[2], dv = (int)ip[3];
+            Tensor KCache(int s) => s == 0 ? inputs[5] : inputs[9 + 3 * (s - 1)];
+            Tensor VCache(int s) => s == 0 ? inputs[6] : inputs[10 + 3 * (s - 1)];
+            Tensor Cells(int s) => s == 0 ? inputs[8] : inputs[11 + 3 * (s - 1)];
+            if (!DeviceInts(positions) || !AllF32OnDevice(q, k, v, qNorm, kNorm) || !qNorm.IsContiguous() || !kNorm.IsContiguous())
+                return false;
+            long count = Cells(0).ElementCount(), total = count * n;
+            if (count < 1 || total > int.MaxValue || positions.ElementCount() < total || heads < 1 || kvHeads < 1 || d < 1 || dv < 1
+                || (long)d * CudaGraphKernels.AttentionPrepWarps * sizeof(float) > 48 * 1024 || qNorm.ElementCount() != d || kNorm.ElementCount() != d
+                || total * (heads + 2L * kvHeads) > (long)int.MaxValue * CudaGraphKernels.AttentionPrepWarps
+                || !TryHeadRows(q, total, heads, d, out long qRow, out long qHead) || !TryHeadRows(k, total, kvHeads, d, out long kRow, out long kHead)
+                || !TryHeadRows(v, total, kvHeads, dv, out long vRow, out long vHead))
+                return false;
+            var kcs = new Tensor[n];
+            var vcs = new Tensor[n];
+            try
+            {
+                DType type = DType.Float32;
+                for (int s = 0; s < n; s++)
+                {
+                    Tensor rows = Cells(s);
+                    if (!DeviceInts(rows) || rows.ElementCount() != count) return false;
+                    kcs[s] = HeadFirst(KCache(s));
+                    vcs[s] = HeadFirst(VCache(s));
+                    Tensor kc = kcs[s], vc = vcs[s];
+                    if (s == 0) type = kc.ElementType;
+                    if (kc.Storage is not CudaStorage || vc.Storage is not CudaStorage || kc.ElementType != type || vc.ElementType != type
+                        || type is not (DType.Float16 or DType.Float32 or DType.Q8_0) || !kc.IsContiguous() || !vc.IsContiguous()
+                        || kc.DimensionCount != 3 || vc.DimensionCount != 3 || kc.Sizes[0] != kvHeads || vc.Sizes[0] != kvHeads
+                        || kc.Sizes[2] != d || vc.Sizes[2] != dv || kc.Sizes[1] != vc.Sizes[1] || kc.Sizes[1] > int.MaxValue
+                        || (type == DType.Q8_0 && (d % 32 != 0 || dv % 32 != 0 || kc.StorageOffset % 32 != 0 || vc.StorageOffset % 32 != 0)))
+                        return false;
+                }
+                int cacheFormat = type switch
+                {
+                    DType.Float16 => CudaGraphKernels.CacheF16,
+                    DType.Q8_0 => CudaGraphKernels.CacheQ8_0,
+                    _ => CudaGraphKernels.CacheF32,
+                };
+                // The rotary's result as the ops shape it ([d, heads, rows], trailing ones dropped): rows of heads.
+                var output = new Tensor(Allocator, DType.Float32, Sizes(stackalloc long[] { d, heads, total }));
+                long outRow = (long)heads * d, outHead = d;
+                var touched = new List<Tensor> { q, k, v, qNorm, kNorm, positions };
+                for (int s = 0; s < n; s++) touched.Add(Cells(s));
+                var written = new List<Tensor> { output };
+                written.AddRange(kcs);
+                written.AddRange(vcs);
+                Launch(touched.ToArray(), written.ToArray(), (kn, stream) =>
+                {
+                    var args = new CudaGraphKernels.AttentionPrepSequencesArgs();
+                    unsafe
+                    {
+                        for (int s = 0; s < n; s++)
+                        {
+                            args.KCache[s] = (long)CachePtr(kcs[s]);
+                            args.VCache[s] = (long)CachePtr(vcs[s]);
+                            args.Cells[s] = (long)Ptr(Cells(s));
+                            args.Cap[s] = (int)kcs[s].Sizes[1];
+                        }
+                    }
+                    kn.LaunchAttentionPrepSequences(args, (int)count, Ptr(q), qRow, qHead, Ptr(k), kRow, kHead, Ptr(v), vRow, vHead, Ptr(qNorm),
+                        Ptr(kNorm), Ptr(output), outRow, outHead, cacheFormat, Ptr(positions), (int)total, heads, kvHeads, d, dv, fp[0], (int)ip[4],
+                        (int)ip[5], (int)ip[6], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], stream);
+                });
+                results[0] = output;
+                AttentionPrepSequenceRegions++;
+                return true;
+            }
+            finally
+            {
+                foreach (Tensor t in kcs) t?.Dispose();
+                foreach (Tensor t in vcs) t?.Dispose();
+            }
+        }
+
+        /// <summary>Several sequences' query/key preps run as <see cref="TryAttentionPreps"/> (tests check the region engaged).</summary>
+        internal long AttentionPrepSequenceRegions { get; private set; }
 
         /// <summary>Preps whose queries went out head-first (tests check the layout engaged).</summary>
         internal long HeadMajorQueryPreps { get; private set; }
