@@ -2619,12 +2619,42 @@ namespace TensorSharp.Graph
             return x.GetElementsAsFloat((int)x.ElementCount());
         }
 
-        /// <summary>ggml_top_k on the host (executors with a kernel override it; their result need not carry host ints).</summary>
+        /// <summary>ggml_top_k on the host (executors with a kernel override it; their result need not carry host ints): each
+        /// row's k largest values' indices, largest first, a tie to the lower index. A few picks keep a sorted run of k and
+        /// let a value in only past the run's last, which gives a full sort's order: sorting every row of a block drafter's
+        /// logits (a DFlash2 block's 16 candidates of Qwen3.8's 248,320 ids, 7 rows a block) took ~165 ms a block on MLX.</summary>
         protected virtual Value TopK(Tensor x, int k, RunState run)
         {
             long cols = x.Sizes[^1], rows = x.ElementCount() / cols;
             float[] v = x.GetElementsAsFloat((int)x.ElementCount());
             var picked = new int[rows * k];
+            if (k <= TopKSelectMaxPicks)
+            {
+                var best = new float[k];
+                for (long r = 0; r < rows; r++)
+                {
+                    long b = r * cols;
+                    Span<int> ids = picked.AsSpan((int)(r * k), k);
+                    int count = 0;
+                    for (int c = 0; c < cols; c++)
+                    {
+                        float value = v[b + c];
+                        // CompareTo orders NaN below every number, as the sort did; an equal value ranks after the earlier index.
+                        if (count == k && value.CompareTo(best[k - 1]) <= 0) continue;
+                        int at = count < k ? count : k - 1;
+                        while (at > 0 && value.CompareTo(best[at - 1]) > 0)
+                        {
+                            best[at] = best[at - 1];
+                            ids[at] = ids[at - 1];
+                            at--;
+                        }
+                        best[at] = value;
+                        ids[at] = c;
+                        if (count < k) count++;
+                    }
+                }
+                return new Value { Tensor = IntTensor(picked, Sizes(stackalloc long[] { k, rows }), run), Ints = picked };
+            }
             var order = new int[cols];
             for (long r = 0; r < rows; r++)
             {
@@ -2635,6 +2665,9 @@ namespace TensorSharp.Graph
             }
             return new Value { Tensor = IntTensor(picked, Sizes(stackalloc long[] { k, rows }), run), Ints = picked };
         }
+
+        /// <summary>Picks <see cref="TopK"/> selects in one pass over a row; more sort the row.</summary>
+        private const int TopKSelectMaxPicks = 64;
 
         /// <summary>ggml's rotary over x [d, heads, tokens] at positions [tokens] (multi-axis: [4 * tokens],
         /// axis-major); ip = dims, mode, n_ctx_orig[, sections]; fp = base, freq_scale, ext_factor,
