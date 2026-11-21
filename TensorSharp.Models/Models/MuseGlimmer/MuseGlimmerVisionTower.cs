@@ -18,7 +18,7 @@ namespace TensorSharp.Models
     /// The vision tower of the <c>muse-glimmer</c> projector type, which Muse-Glimmer and Muse Spark both load: preprocessed
     /// pixels in, one row of the language model's embedding width per merged 2 x 2 patch block out. The multimodal injector
     /// takes it (<see cref="ModelMultimodalInjector.ProcessMuseGlimmerHistory"/>); <see cref="MuseGlimmerVisionTower"/> is the
-    /// graph program every executor runs, <see cref="MuseGlimmerVisionEncoder"/> the legacy per-op tower kept as its oracle.
+    /// graph program every executor runs (the legacy per-op tower, its oracle until stage S9, was deleted then).
     /// </summary>
     public interface IMuseGlimmerVisionTower : IDisposable
     {

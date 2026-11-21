@@ -115,75 +115,6 @@ internal readonly struct GgmlContiguousTensor
     }
 }
 
-// Field order and packing must match MuseGlimmerVisionBlockDesc in
-// ggml_ops_muse_glimmer_vision.cpp. Keep all pointer-sized fields first, then
-// int64 shapes, int32 scalars, and floats so the native sizeof guard catches an
-// accidental ABI drift.
-[StructLayout(LayoutKind.Sequential)]
-internal struct GgmlMuseGlimmerVisionBlockArgs
-{
-    public GgmlTensorView2D Hidden;
-
-    public IntPtr Ln1W;
-    public IntPtr Ln1B;
-    public IntPtr QW;
-    public IntPtr QB;
-    public IntPtr KW;
-    public IntPtr KB;
-    public IntPtr VW;
-    public IntPtr VB;
-    public IntPtr OutW;
-    public IntPtr OutB;
-
-    public IntPtr Ln2W;
-    public IntPtr Ln2B;
-    public IntPtr UpW;
-    public IntPtr UpB;
-    public IntPtr DownW;
-    public IntPtr DownB;
-
-    public IntPtr PosW;
-    public IntPtr PosH;
-    public IntPtr WindowOffsets;
-
-    public long QNe0;
-    public long QNe1;
-    public long QBytes;
-    public long KNe0;
-    public long KNe1;
-    public long KBytes;
-    public long VNe0;
-    public long VNe1;
-    public long VBytes;
-    public long OutNe0;
-    public long OutNe1;
-    public long OutBytes;
-    public long UpNe0;
-    public long UpNe1;
-    public long UpBytes;
-    public long DownNe0;
-    public long DownNe1;
-    public long DownBytes;
-
-    public int StructBytes;
-    public int HiddenSize;
-    public int IntermediateSize;
-    public int NumTokens;
-    public int NumHeads;
-    public int HeadDim;
-    public int WindowCount;
-    public int IsGlobal;
-    public int QType;
-    public int KType;
-    public int VType;
-    public int OutType;
-    public int UpType;
-    public int DownType;
-
-    public float Eps;
-    public float RopeTheta;
-}
-
 [StructLayout(LayoutKind.Sequential)]
 internal readonly struct GgmlQuantizedWeight
 {
@@ -1654,11 +1585,6 @@ internal enum GgmlIndexReductionOp
             IntPtr upB, int upBDim,
             IntPtr downW, int downNe0, int downNe1, long downBytes,
             IntPtr downB, int downBDim);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_MuseGlimmerVisionBlockQuantF32(
-            in GgmlMuseGlimmerVisionBlockArgs args);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -4637,14 +4563,6 @@ internal enum GgmlIndexReductionOp
                 upW, upNe0, upNe1, upBytes, upB, upBDim,
                 downW, downNe0, downNe1, downBytes, downB, downBDim), "fused_vision_mlp");
         }
-
-        /// <summary>
-        /// Runs one exact Muse-Glimmer vision block as a bounded, on-device graph.
-        /// False means the backend/geometry is unsupported or workspace allocation
-        /// failed; the caller retains its portable block implementation as fallback.
-        /// </summary>
-        internal static bool MuseGlimmerVisionBlock(in GgmlMuseGlimmerVisionBlockArgs args)
-            => TSGgml_MuseGlimmerVisionBlockQuantF32(in args) != 0;
 
         public static void FusedVisionAttention(
             GgmlTensorView2D hidden,

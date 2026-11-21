@@ -307,7 +307,6 @@
     <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerModelForward" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerReleaseTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerResetDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerVisionBlockQuantF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkAttentionF16KV2D" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkClearVisionRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseSparkCtxSize" SymbolType="Function" />

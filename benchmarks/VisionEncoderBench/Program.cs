@@ -11,8 +11,8 @@
 // exactly the work being optimized.
 //
 // Env knobs:
-//   TS_VBENCH_TYPE    gemma4 | mistral3 | qwen35 | muse-glimmer (the legacy per-op tower) | muse-glimmer-graph (the
-//                     tower as graph programs on the allocator's executor, which Muse-Glimmer and Muse Spark load)
+//   TS_VBENCH_TYPE    gemma4 | mistral3 | qwen35 | muse-glimmer (the tower as graph programs on the allocator's executor,
+//                     which Muse-Glimmer and Muse Spark load; the legacy per-op tower was deleted in stage S9)
 //                     (default gemma4)
 //   TS_VBENCH_MMPROJ  path to the mmproj .gguf
 //   TS_VBENCH_IMAGE   path to a test image (default imgs/banner_1.png)
@@ -47,7 +47,7 @@ string mmproj = Env("TS_VBENCH_MMPROJ", type switch
 {
     "mistral3" => @"C:\Works\models\Ministral-3-8B-Instruct-2512-BF16-mmproj.gguf",
     "qwen35" => @"C:\Works\models\Qwen3.6-35B-A3B-mmproj-F16.gguf",
-    "muse-glimmer" or "muse_glimmer" or "muse-glimmer-graph" => @"C:\Works\models\muse-glimmer\mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+    "muse-glimmer" or "muse_glimmer" => @"C:\Works\models\muse-glimmer\mmproj-Muse-Glimmer-30B-Q8_0.gguf",
     _ => @"C:\Works\models\mmproj-Gemma4-F16.gguf",
 });
 
@@ -122,17 +122,6 @@ switch (type)
 {
     case "muse-glimmer":
     case "muse_glimmer":
-    {
-        var enc = new MuseGlimmerVisionEncoder(mmproj, allocator);
-        encoder = enc;
-        var (pixels, w, h) = enc.ImageProcessor.ProcessImage(image);
-        int rawPatches = (w / enc.PatchSize) * (h / enc.PatchSize);
-        int mergedTokens = rawPatches / (enc.MergeSize * enc.MergeSize);
-        geom = $"{w}x{h}, patch={enc.PatchSize}, merge={enc.MergeSize}, rawPatches={rawPatches}, mergedTokens={mergedTokens}";
-        encodeOnce = () => enc.Encode(pixels, w, h);
-        break;
-    }
-    case "muse-glimmer-graph":
     {
         using var gguf = new GgufFile(mmproj);
         var enc = new MuseGlimmerVisionTower(gguf, allocator, backendType);
