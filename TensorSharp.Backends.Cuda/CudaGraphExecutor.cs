@@ -2881,9 +2881,12 @@ namespace TensorSharp.Cuda
             var cuda = (CudaAllocator)Allocator;
             long rows = x.ElementCount() / gateUp.Ne0;
             using Tensor x2 = x.View(rows, gateUp.Ne0);
-            // Prompt rows of an NVFP4 gate|up on the FP4 tensor cores: the activation straight from the GEMM's epilogue (and
-            // x's planes straight from the add and norm that make x, where they were deferred).
-            if (rows >= CudaFp4Kernels.TmaMinRows && cuda.Fp4Kernels != null)
+            // Rows of an NVFP4 gate|up on the FP4 tensor cores (prompt rows on the TMA GEMM, a batched verify's on the cp.async
+            // GEMM's paired tiles): the activation straight from the GEMM's epilogue, half the bytes a [rows, 2 ff] product
+            // writes and its SwiGLU reads back (and x's planes straight from the add and norm that make x, where they were
+            // deferred). Four Qwen3.8-27B requests' 32-row verify: 64 SwiGLU passes over 2 ff, 0.59 ms of the step, where
+            // 038fb303's engine quantized the down projection's input from its gate|up GEMM's SwiGLU epilogue.
+            if (rows > cuda.Nvfp4MatvecRows && cuda.Fp4Kernels != null)
             {
                 Tensor swiglu = DeferredNormProduct(gateUp, x2, swiGluFfn: true);
                 if (swiglu == null)
