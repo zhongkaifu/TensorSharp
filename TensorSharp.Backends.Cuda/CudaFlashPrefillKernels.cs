@@ -20,13 +20,13 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_FLASH_PREFILL_VERSION in tensorsharp_flash_prefill.cu: bump both together whenever a
         /// kernel is added or changes its signature (CudaPrefillModuleTests pins that they agree).</summary>
-        public const int CurrentVersion = 13;
+        public const int CurrentVersion = 14;
 
         /// <summary>Query rows (query heads x positions of one KV head) one block takes, and keys per tile.</summary>
         public const int BlockRows = 128, TileKeys = 32;
 
         private const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
-        private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _window128, _window256, _combine, _windowCombine;
+        private readonly IntPtr _attn128, _attn256, _rows128, _rows256, _window128, _window256, _combine, _windowCombine, _listedCombine;
         private readonly IntPtr _prompt128, _prompt256;
         // The prompt kernels with F32 accumulation (ts_flash_prompt2_*) and their tail combine.
         private readonly IntPtr _prompt2_128, _prompt2_256, _prompt2Q8128, _prompt2Q8256, _prompt2Combine;
@@ -83,6 +83,7 @@ namespace TensorSharp.Cuda
             _window256 = module.GetFunction("ts_flash_decode_window_f16_d256");
             _combine = module.GetFunction("ts_flash_prefill_combine_f32");
             _windowCombine = module.GetFunction("ts_flash_window_combine_f32");
+            _listedCombine = module.GetFunction("ts_flash_listed_combine_f32");
             _prompt128 = module.GetFunction("ts_flash_prompt_f16_d128");
             _prompt256 = module.GetFunction("ts_flash_prompt_f16_d256");
             (_smem128, _smem256) = (SharedBytes(128), SharedBytes(256));
@@ -465,7 +466,9 @@ namespace TensorSharp.Cuda
         /// <paramref name="dyn"/>[0] on the device when given), into out [rows][heads][d] F32. Each row's arithmetic is a
         /// one-row <see cref="LaunchAttention"/>'s; the partials hold <see cref="PartialFloats"/>(rows, ...). With
         /// <paramref name="cells"/> (a sparse attention's selection) row z's keys are cells[z * cellStride ..], cellCount[z] of
-        /// them, its mask row cellMask[z * cellStride ..] (or none), every row on <paramref name="splits"/>. Without a selection
+        /// them, its mask row cellMask[z * cellStride ..] (or none); with <paramref name="bucket"/> &gt; 0 row z runs the splits
+        /// <see cref="Splits"/> gives <see cref="BucketKeys"/> of <paramref name="windowKeys"/> and its count (the decode row's over
+        /// the same cells), never more than <paramref name="splits"/>, and bucket 0 runs every row on them. Without a selection
         /// the rows share the launch's row tiles (ts_flash_decode_window_f16_d*: every key tile read once for the window's rows,
         /// each row still its one-row launch's bits); with one, a row of the grid each. Without a selection and with
         /// <paramref name="bucket"/> &gt; 0, row z runs the splits <see cref="Splits"/> gives <see cref="BucketKeys"/> of
@@ -502,6 +505,16 @@ namespace TensorSharp.Cuda
                     IntPtr.Zero).ThrowOnError();
             }
             if (splits <= 1) return;
+            if (cells != IntPtr.Zero && bucket > 0)
+            {
+                // Each selection's row combines the splits its own listed count gave it.
+                IntPtr l0 = partial, l3 = output, l4 = cellCount;
+                int l1 = splits, l2 = headDim, l5 = heads, l6 = windowKeys, l7 = bucket, l8 = heads / kvHeads, l9 = kvHeads, l10 = MultiprocessorCount;
+                void** largs = stackalloc void*[] { &l0, &l1, &l2, &l3, &l4, &l5, &l6, &l7, &l8, &l9, &l10 };
+                CudaDriverApi.cuLaunchKernel(_listedCombine, (uint)(rows * heads), 1, 1, (uint)headDim, 1, 1, 0, stream, (IntPtr)largs,
+                    IntPtr.Zero).ThrowOnError();
+                return;
+            }
             if (cells != IntPtr.Zero)
             {
                 LaunchCombine(partial, splits, headDim, output, rows * heads, dyn, 0, windowKeys, bucket, heads / kvHeads, kvHeads, stream);

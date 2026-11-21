@@ -669,11 +669,13 @@ namespace TensorSharp.Cuda
             using Tensor permuted = q.Permute(1, 0, 2);
             using Tensor qc = Ops.NewContiguous(permuted);
             IntPtr dyn = selection ? IntPtr.Zero : CudaDecodeDynParams.GetActiveDevicePtr(cuda, kc.Storage);
-            // A selection's rows split their selection's width; the others are launched with the splits of the bucket window the
-            // window's length falls in (a recorded launch holds those of its whole window, the length read on the device), the
-            // most any of its rows runs: each row runs its own length's bucket window's (the bucket rule on the device), as the
-            // decode row at its position does.
-            int splits = flash.Splits(heads / kvHeads, kvHeads, selection ? (mask.KvMax > 0 ? Math.Min(mask.KvMax, nkv) : nkv)
+            // Each row runs its own length's bucket window's splits (the bucket rule on the device), as the decode row at its
+            // position does: a selection's row its listed count's, the launch holding those of the selection's bound
+            // (SelectionKeys); the others' length is the window's less the rows after them, the launch holding the splits of
+            // the bucket window the window's length falls in (a recorded launch those of its whole window, the length read on
+            // the device), the most any of its rows runs.
+            int selectionKeys = selection ? SelectionKeys(mask.KvMax, nkv) : 0;
+            int splits = flash.Splits(heads / kvHeads, kvHeads, selection ? selectionKeys
                 : dyn != IntPtr.Zero ? nkv : CudaFlashPrefillKernels.BucketKeys(nkv, keys, DecodeWindowBucket));
             using Tensor cells = selection ? new Tensor(Allocator, DType.Int32, nq, nkv) : null;
             using Tensor count = selection ? new Tensor(Allocator, DType.Int32, nq) : null;
@@ -688,10 +690,24 @@ namespace TensorSharp.Cuda
                 selection ? nkv : keys, selection ? 0 : floor, heads, kvHeads, d, scale, splits,
                 partial == null ? IntPtr.Zero : Ptr(partial), Ptr(output), stream, dyn,
                 selection ? Ptr(cells) : IntPtr.Zero, selection ? Ptr(count) : IntPtr.Zero, selection ? Ptr(rows) : IntPtr.Zero, nkv,
-                windowKeys: nkv, bucket: selection ? 0 : DecodeWindowBucket, q8: q8));
+                windowKeys: selection ? selectionKeys : nkv, bucket: DecodeWindowBucket, q8: q8));
             attended = output;
             return true;
         }
+
+        /// <summary>
+        /// The keys a selection's launch holds splits for (<see cref="CudaFlashPrefillKernels.Splits"/>): the selection's bound
+        /// <paramref name="kvMax"/> (the most cells a row keeps: a sliding window's band, a sparse attention's budget) where it has
+        /// one, else the whole <paramref name="windowKeys"/>-key window, rounded up to the decode bucket. Each row runs the splits
+        /// the bucket rule gives its own listed count, read on the device, as a row over a window runs its own length's.
+        /// <para>The splits had come from the bound clipped to the window, and every row ran all of them. The kernel shares a row's
+        /// cells among its splits, so a row summed its cells in another grouping in a smaller cache. Muse-Glimmer-30B's
+        /// 2,048-key band ran 2 splits over a 256-cell capacity window where a 1,024-cell window ran 8, and the first decode step
+        /// after a 200-token prompt parted by up to 0.12 in a logit (MuseGlimmerRuntimeKvTests). A verify window of 9-16 rows,
+        /// whose band is classified on the host and runs the bucket rule, parted from the decode rows from position 64 on.</para>
+        /// </summary>
+        private int SelectionKeys(int kvMax, int windowKeys)
+            => CudaFlashPrefillKernels.BucketKeys(int.MaxValue, kvMax > 0 ? kvMax : windowKeys, DecodeWindowBucket);
 
         /// <summary>A mask as contiguous F32 [rows, keys] on this device, or null.</summary>
         private static Tensor Contiguous2(Tensor m, int rows, int keys)
@@ -731,13 +747,16 @@ namespace TensorSharp.Cuda
             using var cells = new Tensor(Allocator, DType.Int32, nkv);
             using var count = new Tensor(Allocator, DType.Int32, 1);
             Launch(new[] { row }, new[] { cells, count }, (kn, stream) => kn.LaunchMaskCells(Ptr(row), Ptr(cells), Ptr(count), 1, nkv, stream));
-            int splits = flash.Splits(heads / kvHeads, kvHeads, mask.KvMax > 0 ? Math.Min(mask.KvMax, nkv) : nkv);
+            // The splits the bucket rule gives the listed count (read on the device, so a recorded step replays each position's),
+            // as a row over a window splits its own length; the launch holds those of the selection's bound (SelectionKeys).
+            int selectionKeys = SelectionKeys(mask.KvMax, nkv);
+            int splits = flash.Splits(heads / kvHeads, kvHeads, selectionKeys);
             var result = new Tensor(Allocator, DType.Float32, 1, heads, d);
             using Tensor partial = splits > 1 ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(1, heads, d, splits)) : null;
             Tensor[] written = partial == null ? new[] { result } : new[] { result, partial };
             Launch(new[] { qc, kc, vc, cells, count, row }, written, (_, stream) => flash.LaunchAttention(Ptr(qc), Ptr(kc), Ptr(vc), cap, 1, nkv, 0,
-                heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(result), stream, IntPtr.Zero,
-                Ptr(cells), Ptr(count), Ptr(row)));
+                heads, kvHeads, d, scale, splits, partial == null ? IntPtr.Zero : Ptr(partial), Ptr(result), stream, Ptr(count),
+                Ptr(cells), Ptr(count), Ptr(row), windowKeys: selectionKeys, bucket: DecodeWindowBucket));
             attended = result;
             return true;
         }
@@ -1287,8 +1306,10 @@ namespace TensorSharp.Cuda
             }
             else
             {
-                // The splits the ops' flash path takes over the mask's window, bounded by the selection's width.
-                int splits = flash.Splits(group, kvHeads, kvMax > 0 ? Math.Min(kvMax, window) : window);
+                // The splits the ops' flash path takes: the bucket rule over each row's listed count, the launch holding those
+                // of the selection's bound.
+                int selectionKeys = SelectionKeys(kvMax, window);
+                int splits = flash.Splits(group, kvHeads, selectionKeys);
                 using Tensor partial = splits > 1
                     ? new Tensor(Allocator, DType.Float32, CudaFlashPrefillKernels.PartialFloats(count, heads, d, splits)) : null;
                 Tensor[] written = partial == null ? new[] { output } : new[] { output, partial };
@@ -1297,10 +1318,11 @@ namespace TensorSharp.Cuda
                 {
                     if (count == 1)
                         flash.LaunchAttention(Ptr(q), Ptr(kc), Ptr(vc), cap, 1, window, 0, heads, kvHeads, d, scale, splits, partialPtr,
-                            Ptr(output), stream, IntPtr.Zero, Ptr(cells), Ptr(cellCount));
+                            Ptr(output), stream, Ptr(cellCount), Ptr(cells), Ptr(cellCount), windowKeys: selectionKeys, bucket: DecodeWindowBucket);
                     else
                         flash.LaunchDecodeRows(Ptr(q), Ptr(kc), Ptr(vc), cap, count, window, 0, heads, kvHeads, d, scale, splits, partialPtr,
-                            Ptr(output), stream, IntPtr.Zero, Ptr(cells), Ptr(cellCount), IntPtr.Zero, stride);
+                            Ptr(output), stream, IntPtr.Zero, Ptr(cells), Ptr(cellCount), IntPtr.Zero, stride, windowKeys: selectionKeys,
+                            bucket: DecodeWindowBucket);
                 });
             }
             results[0] = output;
