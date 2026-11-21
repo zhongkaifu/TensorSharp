@@ -3037,7 +3037,7 @@ async function sendMessage() {
   }
 
   // Inside the click: the only moment a browser lets a spoken reply start playing.
-  primeSpeechPlayback();
+  primeSpeechPlayback(true);
   const userContent = text || describeAttachments();
   const msg = { role: 'user', content: userContent };
 
@@ -3684,7 +3684,12 @@ async function requestAssistantResponse() {
   if (spokenTurn && speechAudioContext) {
     // One reply speaks at a time: a newer one silences what is left of the one before it.
     if (activeLiveSpeech) activeLiveSpeech.stop();
-    liveSpeech = activeLiveSpeech = createLiveSpeech(speechAudioContext, playing => { liveSpeechButton().hidden = !playing; });
+    const player = createLiveSpeech(speechAudioContext, playing => { liveSpeechButton().hidden = !playing; }, () => {
+      // Heard to the end (or stopped): the user's other audio may come back, unless a newer reply is speaking.
+      if (activeLiveSpeech && activeLiveSpeech !== player && activeLiveSpeech.speaking) return;
+      releaseSpeechPlayback();
+    });
+    liveSpeech = activeLiveSpeech = player;
   }
 
   let fullText = '';
@@ -3853,7 +3858,7 @@ async function requestAssistantResponse() {
             appendTurnNotice(speechBubble, data.notice);
           }
           if (data.audio) {
-            if (liveSpeech) liveSpeech.push(data.audio, data.sampleRate);
+            if (liveSpeech) { setSpeechSession('playback'); wakeSpeechPlayback(); liveSpeech.push(data.audio, data.sampleRate); }
           }
           if (data.token) {
             fullText += data.token;
@@ -3959,6 +3964,8 @@ async function requestAssistantResponse() {
       isGenerating = false;
       setSendButtonState(queuedResponseRequested);
     }
+    // No more chunks: the reply gives the audio back once what it scheduled has played (now, if it made none).
+    if (liveSpeech) liveSpeech.end(); else releaseSpeechPlayback();
     const indicator = assistDiv.querySelector('.typing-indicator');
     if (indicator) indicator.remove();
     finishGeneration();
@@ -4189,15 +4196,55 @@ function speechRequestField() {
 let speechAudioContext = null;
 let activeLiveSpeech = null;
 
-/** Create or resume the AudioContext inside a user gesture, so live chunks may play. */
-function primeSpeechPlayback() {
+/**
+ * Ask the browser to play this page's sound as playback ('playback') or as it chooses ('auto'). WebKit plays Web
+ * Audio under the ambient audio-session category, which an iPhone's Silent mode mutes, while an <audio> element plays
+ * as media: on a phone set to silent the live chunks were inaudible and only the finished reply's player was heard.
+ * The Audio Session API (navigator.audioSession, WebKit) asks for playback; other browsers lack it and this does
+ * nothing. Playback does not mix (it pauses the user's music), so it is asked for from the Send click and with each
+ * chunk of a spoken reply, and given back once that reply's audio has played (releaseSpeechPlayback).
+ */
+function setSpeechSession(type) {
+  const session = navigator.audioSession;
+  if (!session) return;
+  try { if (session.type !== type) session.type = type; } catch (e) { console.warn('Audio session type not set:', e); }
+}
+
+/**
+ * Resume the AudioContext when it is not running ('suspended', or WebKit's 'interrupted' by a call, Siri or the tab
+ * going to the background while a reply is spoken): a chunk scheduled on a context that is not running is never heard.
+ * Outside a gesture a browser that wants one keeps it suspended until the next tap.
+ */
+function wakeSpeechPlayback() {
+  const context = speechAudioContext;
+  if (!context || context.state === 'running' || context.state === 'closed') return;
+  try { Promise.resolve(context.resume()).catch(() => {}); } catch {}
+}
+
+/**
+ * The spoken replies are over for now: give the category back and let the context rest, so the browser can end its
+ * audio session and the user's other audio comes back. Not while a reply is still sounding or being generated.
+ */
+function releaseSpeechPlayback() {
+  if (activeLiveSpeech && activeLiveSpeech.speaking) return;
+  if (isGenerating && speechRequested()) return;
+  setSpeechSession('auto');
+  const context = speechAudioContext;
+  if (context && context.state === 'running' && context.suspend) {
+    try { Promise.resolve(context.suspend()).catch(() => {}); } catch {}
+  }
+}
+
+/** Create or resume the AudioContext inside a user gesture, so live chunks may play; the Send click (forReply) also
+ * asks for playback. The toggle primes it without: an idle context must not pause the user's music. */
+function primeSpeechPlayback(forReply) {
   if (!speechRequested()) return null;
   const Context = window.AudioContext || window.webkitAudioContext;
   if (!Context) return null;
+  if (forReply) setSpeechSession('playback');
   try {
     if (!speechAudioContext || speechAudioContext.state === 'closed') speechAudioContext = new Context();
-    // 'suspended', or WebKit's 'interrupted' after the tab was in the background.
-    if (speechAudioContext.state !== 'running') speechAudioContext.resume();
+    wakeSpeechPlayback();
   } catch (e) {
     console.warn('Spoken replies cannot play live in this browser:', e);
     speechAudioContext = null;
@@ -4207,6 +4254,7 @@ function primeSpeechPlayback() {
 
 function onSpeechToggle() {
   primeSpeechPlayback();
+  if (!speechRequested()) setSpeechSession('auto');
   updateSpeechControl();
 }
 
@@ -4229,12 +4277,24 @@ function pcm16ToFloats(base64) {
  * up with generation), so the reply is heard as one stream. stop() silences what is
  * scheduled and drops what comes after.
  */
-function createLiveSpeech(context, onState) {
+function createLiveSpeech(context, onState, onDrained) {
   const sources = new Set();
   let nextAt = 0;
   let stopped = false;
+  let ended = false;
+  let drained = false;
+  // Once, when the reply has ended (end() or stop()) and nothing it scheduled is still sounding.
+  const drain = () => {
+    if (drained || !ended || sources.size) return;
+    drained = true;
+    if (onDrained) onDrained();
+  };
   return {
     get stopped() { return stopped; },
+    /** Whether some of the reply is still scheduled to sound. */
+    get speaking() { return !stopped && sources.size > 0; },
+    /** The reply's request is over: no more chunks will come. */
+    end() { ended = true; drain(); },
     push(base64, sampleRate) {
       if (stopped || !context || !base64 || !(sampleRate > 0)) return;
       const samples = pcm16ToFloats(base64);
@@ -4250,7 +4310,7 @@ function createLiveSpeech(context, onState) {
       sources.add(source);
       source.onended = () => {
         sources.delete(source);
-        if (sources.size === 0) onState(false);
+        if (sources.size === 0) { onState(false); drain(); }
       };
       onState(true);
     },
@@ -4259,6 +4319,8 @@ function createLiveSpeech(context, onState) {
       sources.forEach(source => { try { source.stop(); } catch {} });
       sources.clear();
       onState(false);
+      ended = true;
+      drain();
     }
   };
 }

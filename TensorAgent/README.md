@@ -247,7 +247,9 @@ image/video turns do not show the placeholder zero-token counters.
 **Spoken replies.** With a model that speaks loaded (LFM3-Omni and its projector, which carries
 the speech decoder), the composer shows a **Speak replies** switch and, when the model has more
 than one, a voice picker. A reply sent with it on is spoken while it is written: the page plays the
-speech chunks as they arrive (the audio starts from the tap that sends, as WebKit requires) and
+speech chunks as they arrive (the audio starts from the tap that sends, as WebKit requires; a reply
+plays as playback, so the iPhone's Silent mode does not mute it and other audio pauses until the reply
+has played, and it resumes after a call, Siri or a trip to the background interrupts it) and
 **Stop speaking** silences it; the finished reply keeps a player and **Save audio**, which goes
 through the app's save picker like a picture's **Download**. The WAV is saved with the conversation
 and plays again when it is reopened, and the next turn carries the reply back by its id, so the

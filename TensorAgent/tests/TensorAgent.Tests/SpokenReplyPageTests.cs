@@ -131,6 +131,157 @@ public sealed partial class WebUiPageTests
         Assert.Empty(result.GetProperty("errors").EnumerateArray());
     }
 
+    /// <summary>
+    /// The live chunks play as playback, not as ambient sound: WebKit plays a page's Web Audio under the ambient
+    /// audio-session category, which an iPhone's Silent mode mutes, while the finished reply's &lt;audio&gt; player plays as
+    /// media -- the reported "the speech can only be heard from the player after the whole answer". The page asks for
+    /// playback through the Audio Session API from the send and with each chunk. Playback does not mix (it pauses the
+    /// user's music), so the switch alone asks for nothing, and once the reply's audio has played the page gives the
+    /// choice back and lets its AudioContext rest, so the other audio comes back after every reply.
+    /// </summary>
+    [WebJavaScriptFact]
+    public void ASpokenReplyPlaysAsPlaybackAndGivesTheAudioBackOnceItHasPlayed()
+    {
+        JsonElement result = Run(SpeakingModel + "R['/api/chat'] = { __sse: [" + SpokenFrames + "] };", FakeAudio + """
+            var types = [], sources = [], suspends = 0;
+            navigator.audioSession = {};
+            var current = 'auto';
+            Object.defineProperty(navigator.audioSession, 'type', {
+              get: function () { return current; },
+              set: function (v) { current = v; types.push(v); }
+            });
+            var create = window.AudioContext.prototype.createBufferSource;
+            window.AudioContext.prototype.createBufferSource = function () { var s = create.call(this); sources.push(s); return s; };
+            window.AudioContext.prototype.suspend = function () { suspends++; this.state = 'suspended'; return Promise.resolve(); };
+            window.AudioContext.prototype.resume = function () { this.state = 'running'; return Promise.resolve(); };
+            return settle(20).then(function () {
+              __page.byId['speech-toggle'].checked = true;
+              __page.byId['speech-toggle'].dispatch('change');
+              var afterSwitch = navigator.audioSession.type;
+              __page.byId['text'].value = 'Say hello to Anna.';
+              __page.byId['send'].dispatch('click');
+              var afterSend = navigator.audioSession.type;
+              return settle(30).then(function () {
+                // The text is done and the reply's audio is still playing.
+                var turnOver = navigator.audioSession.type, suspendsWhilePlaying = suspends;
+                sources[0].onended();
+                var oneLeft = navigator.audioSession.type;
+                sources[1].onended();
+                return { afterSwitch: afterSwitch, afterSend: afterSend, turnOver: turnOver, oneLeft: oneLeft,
+                  drained: navigator.audioSession.type, types: types, suspendsWhilePlaying: suspendsWhilePlaying,
+                  suspends: suspends, scheduled: scheduled.length, errors: __page.errorNotices() };
+              });
+            });
+            """);
+
+        Assert.False(result.TryGetProperty("error", out JsonElement failure), failure.ToString());
+        Assert.Equal("auto", result.GetProperty("afterSwitch").GetString());
+        Assert.Equal("playback", result.GetProperty("afterSend").GetString());
+        Assert.Equal("playback", result.GetProperty("turnOver").GetString());
+        Assert.Equal("playback", result.GetProperty("oneLeft").GetString());
+        Assert.Equal("auto", result.GetProperty("drained").GetString());
+        // Set when it changes, not on every chunk.
+        Assert.Equal(new[] { "playback", "auto" }, result.GetProperty("types").EnumerateArray().Select(t => t.GetString()));
+        Assert.Equal(0, result.GetProperty("suspendsWhilePlaying").GetInt32());
+        Assert.Equal(1, result.GetProperty("suspends").GetInt32());
+        Assert.Equal(2, result.GetProperty("scheduled").GetInt32());
+        Assert.Empty(result.GetProperty("errors").EnumerateArray());
+    }
+
+    /// <summary>A spoken turn that made no speech (it failed, or the reply was empty) gives the audio back when it
+    /// ends; so does Stop speaking, at once.</summary>
+    [WebJavaScriptFact]
+    public void ATurnWithoutSpeechAndStopSpeakingGiveTheAudioBack()
+    {
+        JsonElement result = Run(SpeakingModel + """
+            var calls = 0;
+            R['/api/chat'] = function () {
+              calls++;
+              return calls === 1
+                ? { __sse: [{ token: 'Hi.' }, { done: true, sessionId: 's1', tokenCount: 1 }] }
+                : { __sse: [{ token: 'Hello, ' }, { audio: 'AAAAQADA/38=', sampleRate: 24000 }, { token: 'Anna!' },
+                    { done: true, sessionId: 's1', tokenCount: 2, audioId: 'audio_x' }] };
+            };
+            """, FakeAudio + """
+            navigator.audioSession = { type: 'auto' };
+            return settle(20).then(function () {
+              __page.byId['speech-toggle'].checked = true;
+              __page.byId['speech-toggle'].dispatch('change');
+              __page.byId['text'].value = 'hi';
+              __page.byId['send'].dispatch('click');
+              return settle(30).then(function () {
+                var noSpeech = navigator.audioSession.type;
+                __page.byId['text'].value = 'Say hello to Anna.';
+                __page.byId['send'].dispatch('click');
+                return settle(30).then(function () {
+                  var playing = navigator.audioSession.type;
+                  var stop = __page.byId['chat'].querySelector('.speech-stop');
+                  if (stop) stop.dispatch('click');
+                  return { noSpeech: noSpeech, playing: playing, stopped: navigator.audioSession.type, hadStop: !!stop };
+                });
+              });
+            });
+            """);
+
+        Assert.False(result.TryGetProperty("error", out JsonElement failure), failure.ToString());
+        Assert.Equal("auto", result.GetProperty("noSpeech").GetString());
+        Assert.Equal("playback", result.GetProperty("playing").GetString());
+        Assert.True(result.GetProperty("hadStop").GetBoolean());
+        Assert.Equal("auto", result.GetProperty("stopped").GetString());
+    }
+
+    /// <summary>
+    /// A reply outlives the tap that sent it. WebKit interrupts the AudioContext for a call, Siri, dictation or the app
+    /// going to the background; a chunk scheduled on a context that is not running is never heard, so a chunk that
+    /// arrives then resumes it (the app's WebView lets audio start without a gesture), and so does the page coming back
+    /// while the reply is still being spoken.
+    /// </summary>
+    [WebJavaScriptFact]
+    public void AChunkThatArrivesWhileTheAudioIsInterruptedResumesIt()
+    {
+        JsonElement result = Run(SpeakingModel + "R['/api/chat'] = { __sse: [" + SpokenFrames + "] };", FakeAudio + """
+            var resumes = [];
+            window.AudioContext.prototype.resume = function () {
+              resumes.push(this.state);
+              if (this.state !== 'interrupted') this.state = 'running';
+              return Promise.resolve();
+            };
+            return settle(20).then(function () {
+              __page.byId['speech-toggle'].checked = true;
+              __page.byId['speech-toggle'].dispatch('change');
+              var primed = resumes.length;
+              // A call comes in as the first chunk is scheduled: the context is interrupted for the rest of the reply.
+              var create = window.AudioContext.prototype.createBufferSource;
+              window.AudioContext.prototype.createBufferSource = function () {
+                var source = create.call(this), context = this, start = source.start;
+                source.start = function (at) { start.call(source, at); context.state = 'interrupted'; };
+                return source;
+              };
+              __page.byId['text'].value = 'Say hello to Anna.';
+              __page.byId['send'].dispatch('click');
+              return settle(30).then(function () {
+                var duringReply = resumes.slice(primed);
+                // The app comes back to the front with the reply still scheduled.
+                document.visibilityState = 'hidden'; document.dispatch('visibilitychange');
+                document.visibilityState = 'visible'; document.dispatch('visibilitychange');
+                return settle(10).then(function () { return {
+                  primed: primed, duringReply: duringReply, afterReturn: resumes.length - primed - duringReply.length,
+                  scheduled: scheduled.length, errors: __page.errorNotices()
+                }; });
+              });
+            });
+            """);
+
+        Assert.False(result.TryGetProperty("error", out JsonElement failure), failure.ToString());
+        // The fake context starts running, so the switch has nothing to resume.
+        Assert.Equal(0, result.GetProperty("primed").GetInt32());
+        // The chunk that arrived while it was interrupted asked for it back, and was still scheduled.
+        Assert.Equal(new[] { "interrupted" }, result.GetProperty("duringReply").EnumerateArray().Select(s => s.GetString()));
+        Assert.Equal(2, result.GetProperty("scheduled").GetInt32());
+        Assert.Equal(1, result.GetProperty("afterReturn").GetInt32());
+        Assert.Empty(result.GetProperty("errors").EnumerateArray());
+    }
+
     [WebJavaScriptFact]
     public void AModelThatDoesNotSpeakShowsNoSwitchAndAsksForNoSpeech()
     {

@@ -331,7 +331,9 @@ TTS（GGUF 的 `tokenizer.chat_template.tts`，在语音结束帧停止）。对
 用法：CLI `--tts` / `--speech-out`（配合 `--speech-mode`、`--speech-temperature`、`--voice`、`--language`、`--seed`）、
 `POST /v1/audio/speech`、带 `modalities` `["text","audio"]` 或 `["audio"]` 的 `/v1/chat/completions` /
 `/v1/responses`，以及网页聊天（带 `speech` 的 `/api/chat`：内置 Web UI 与 TensorAgent 的 **Speak replies** 开关，
-边生成边播放，并保留播放器与下载链接）——见 [USAGE_zh-cn.md → 语音输出](../../USAGE_zh-cn.md#语音输出lfm3-omni)。音色为 `female` 与 `male`
+边生成边播放，并保留播放器与下载链接；朗读回复期间两个页面都向 WebKit 请求 `navigator.audioSession.type = "playback"`，因此处于
+静音模式的 iPhone 也会播放实时语音（否则 WebKit 把它当作环境音播放，静音模式会将其静音），回复的音频播完后交还选择（`"auto"`），
+让用户的音乐或播客可以继续，并在来电、Siri 或应用进入后台打断音频后恢复播放）——见 [USAGE_zh-cn.md → 语音输出](../../USAGE_zh-cn.md#语音输出lfm3-omni)。音色为 `female` 与 `male`
 （写在系统提示中，没有说话人嵌入）；未知音色（包括 OpenAI 默认的 `alloy`）返回 400 并列出可用音色。语音对话回复的系统提示
 加上 llama.cpp 的 realtime 句子（“Speak in English using a female voice.”），交错回复再加上模型卡的
 “Respond with interleaved text and audio.”。

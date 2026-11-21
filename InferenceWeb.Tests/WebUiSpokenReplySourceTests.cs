@@ -66,12 +66,15 @@ public class WebUiSpokenReplySourceTests
         string html = ReadWebUi();
         // Primed in the click's synchronous part, before any await, and from the toggle.
         string send = Between(html, "async function sendMessage()", "const userContent = text || describeAttachments();");
-        Assert.Contains("primeSpeechPlayback();", send, StringComparison.Ordinal);
+        Assert.Contains("primeSpeechPlayback(true);", send, StringComparison.Ordinal);
         Assert.DoesNotContain("await", send, StringComparison.Ordinal);
         Assert.Contains("function onSpeechToggle() {\n  primeSpeechPlayback();", html, StringComparison.Ordinal);
-        string prime = Between(html, "function primeSpeechPlayback()", "function onSpeechToggle()");
+        string prime = Between(html, "function primeSpeechPlayback(forReply)", "function onSpeechToggle()");
         Assert.Contains("window.AudioContext || window.webkitAudioContext", prime, StringComparison.Ordinal);
-        Assert.Contains("if (speechAudioContext.state !== 'running') speechAudioContext.resume();", prime, StringComparison.Ordinal);
+        Assert.Contains("wakeSpeechPlayback();", prime, StringComparison.Ordinal);
+        string wake = Between(html, "function wakeSpeechPlayback()", "function releaseSpeechPlayback()");
+        Assert.Contains("context.state === 'running'", wake, StringComparison.Ordinal);
+        Assert.Contains("context.resume()", wake, StringComparison.Ordinal);
 
         // Each chunk is a buffer scheduled right after the previous one.
         string player = Between(html, "function createLiveSpeech(", "function spokenReplyFileName(");
@@ -81,12 +84,49 @@ public class WebUiSpokenReplySourceTests
         Assert.Contains("stop()", player, StringComparison.Ordinal);
 
         string request = Between(html, "async function requestAssistantResponse()", "function revertFrom(");
-        Assert.Contains("if (liveSpeech) liveSpeech.push(data.audio, data.sampleRate);", request, StringComparison.Ordinal);
+        // A chunk that arrives while the context is suspended or interrupted (a call, the tab in the background) resumes it.
+        Assert.Contains("if (liveSpeech) { setSpeechSession('playback'); wakeSpeechPlayback(); liveSpeech.push(data.audio, data.sampleRate); }",
+            request, StringComparison.Ordinal);
         // A stop of the reply (or a steer, or a new chat) silences it.
         Assert.Contains("if (liveSpeech) liveSpeech.stop();", request, StringComparison.Ordinal);
         Assert.Contains("'\\u25A0 Stop speaking'", request, StringComparison.Ordinal);
         // A spoken turn's notice is shown in the bubble.
         Assert.Contains("appendTurnNotice(speechBubble, data.notice);", request, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// WebKit plays Web Audio as ambient sound, which an iPhone's Silent mode mutes, while an &lt;audio&gt; element plays as
+    /// media: the live chunks were inaudible on a phone set to silent and only the finished reply's player was heard. The
+    /// page asks for playback (the Audio Session API) from the Send click, before the context resumes, and with every
+    /// chunk; playback does not mix, so once the reply's audio has played (or the request ends with none) it gives the
+    /// choice back and lets the context rest, and the user's other audio comes back. The toggle alone asks for nothing.
+    /// </summary>
+    [Fact]
+    public void SpokenRepliesAskForPlaybackWhileTheyPlayAndGiveItBackAfterwards()
+    {
+        string html = ReadWebUi();
+        string session = Between(html, "function setSpeechSession(type)", "function wakeSpeechPlayback()");
+        Assert.Contains("const session = navigator.audioSession;", session, StringComparison.Ordinal);
+        Assert.Contains("if (!session) return;", session, StringComparison.Ordinal);
+        Assert.Contains("session.type = type;", session, StringComparison.Ordinal);
+        string prime = Between(html, "function primeSpeechPlayback(forReply)", "function onSpeechToggle()");
+        int playback = prime.IndexOf("if (forReply) setSpeechSession('playback');", StringComparison.Ordinal);
+        Assert.True(playback >= 0 && playback < prime.IndexOf("new Context()", StringComparison.Ordinal),
+            "playback is asked for before the AudioContext is created");
+        string toggle = Between(html, "function onSpeechToggle()", "function pcm16ToFloats(");
+        Assert.Contains("primeSpeechPlayback();", toggle, StringComparison.Ordinal);
+        Assert.Contains("if (!speechRequested()) setSpeechSession('auto');", toggle, StringComparison.Ordinal);
+
+        string release = Between(html, "function releaseSpeechPlayback()", "function primeSpeechPlayback(forReply)");
+        Assert.Contains("if (activeLiveSpeech && activeLiveSpeech.speaking) return;", release, StringComparison.Ordinal);
+        Assert.Contains("setSpeechSession('auto');", release, StringComparison.Ordinal);
+        Assert.Contains("context.suspend()", release, StringComparison.Ordinal);
+        string player = Between(html, "function createLiveSpeech(", "function spokenReplyFileName(");
+        Assert.Contains("if (sources.size === 0) { onState(false); drain(); }", player, StringComparison.Ordinal);
+        Assert.Contains("end() { ended = true; drain(); }", player, StringComparison.Ordinal);
+        string request = Between(html, "async function requestAssistantResponse()", "function revertFrom(");
+        Assert.Contains("releaseSpeechPlayback();", request, StringComparison.Ordinal);
+        Assert.Contains("if (liveSpeech) liveSpeech.end(); else releaseSpeechPlayback();", request, StringComparison.Ordinal);
     }
 
     [Fact]

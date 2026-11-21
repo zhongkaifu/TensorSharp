@@ -462,21 +462,92 @@
     picker.style.display = speaksReplies() && voices.length > 1 ? '' : 'none';
   }
 
+  /**
+   * Ask WebKit to play this page's sound as playback ('playback') or as it chooses
+   * ('auto'). Left to itself, WebKit plays Web Audio under the ambient audio-session
+   * category, which the iPhone's Silent mode (the Ring/Silent switch, or the Action
+   * button) mutes, while an <audio> element plays as media and is heard: so on a phone
+   * set to silent a reply's live chunks played into nothing and only the finished
+   * reply's player could be heard. The Audio Session API (navigator.audioSession,
+   * WebKit) is how a page asks for playback; where it is absent this does nothing.
+   *
+   * Playback does not mix: it pauses the user's music or podcast. So it is asked for
+   * only for a spoken reply -- from the tap that sends it and again with each of its
+   * chunks -- and given back ('auto') once that reply's audio has finished playing,
+   * which lets the other audio come back after every reply.
+   */
+  function speechSession(type) {
+    var session = navigator.audioSession;
+    if (!session) return;
+    try { if (session.type !== type) session.type = type; }
+    catch (e) { note('speech-session-failed', (e && e.message) || e); }
+  }
+
   var speechContext = null;
-  /** Create or resume the AudioContext inside a tap, so a reply's chunks may play. */
-  function primeSpeech() {
+  /**
+   * Create or resume the AudioContext inside a tap, so a reply's chunks may play;
+   * `forReply` (the send) also asks for playback, before the context resumes under it.
+   * The switch primes the context without it: an idle context must not pause the
+   * user's music.
+   */
+  function primeSpeech(forReply) {
     if (!speaksReplies()) return null;
     var Context = window.AudioContext || window.webkitAudioContext;
     if (!Context) return null;
+    if (forReply) speechSession('playback');
     try {
-      if (!speechContext || speechContext.state === 'closed') speechContext = new Context();
-      // 'suspended', or WebKit's 'interrupted' after the app was in the background.
-      if (speechContext.state !== 'running' && speechContext.resume) speechContext.resume();
+      if (!speechContext || speechContext.state === 'closed') {
+        var context = speechContext = new Context();
+        context.onstatechange = function () {
+          note('speech-context', context.state);
+          if (context === speechContext) speechLogState('statechange');
+        };
+      }
+      wakeSpeech();
     } catch (e) {
       note('speech-context-failed', (e && e.message) || e);
       speechContext = null;
     }
     return speechContext;
+  }
+
+  /**
+   * Resume the AudioContext when it is not running: 'suspended', or WebKit's
+   * 'interrupted' -- a call, Siri, dictation, or the app in the background, any of which
+   * can happen while a reply is being spoken. The send primes it, but a reply outlives
+   * the tap that sent it, and a chunk scheduled on a context that is not running is never
+   * heard. The app's WebView lets audio start without a gesture, so a resume here works
+   * there; a browser that still wants a tap leaves it suspended until the next one.
+   */
+  function wakeSpeech() {
+    var context = speechContext;
+    if (!context || context.state === 'running' || context.state === 'closed' || !context.resume) return;
+    try {
+      var resumed = context.resume();
+      if (resumed && resumed.catch) resumed.catch(function (e) { note('speech-resume-failed', (e && e.message) || e); });
+    } catch (e) {
+      note('speech-resume-failed', (e && e.message) || e);
+    }
+  }
+
+  /**
+   * The spoken replies are over for now: give the category back and let the context
+   * rest, so WebKit can end its audio session and the user's music or podcast resumes.
+   * Not while a reply is still sounding, nor while a spoken turn is still being answered
+   * (its chunks would only take both back). The next send, or chunk, wakes it.
+   */
+  function releaseSpeech(why) {
+    if (liveSpeech && liveSpeech.speaking()) return;
+    if (state.generating && speaksReplies()) return;
+    speechSession('auto');
+    var context = speechContext;
+    if (context && context.state === 'running' && context.suspend) {
+      try {
+        var suspended = context.suspend();
+        if (suspended && suspended.catch) suspended.catch(function () {});
+      } catch (e) { /* a context that will not rest is only a context left running */ }
+    }
+    speechLogState(why || 'released');
   }
 
   /** Base64 PCM16 little-endian mono to float samples. */
@@ -491,15 +562,44 @@
     return samples;
   }
 
+  // What the newest spoken turn did, for the app's device check: when its text and each
+  // chunk of its speech reached this page, when the player scheduled the chunk, and the
+  // states the AudioContext went through. Milliseconds since the send.
+  var speechLog = null;
+  function speechLogStart() {
+    speechLog = {
+      t0: Date.now(), firstText: -1, lastText: -1, texts: 0, done: -1,
+      chunkAt: [], startAt: [], noPlayer: 0, states: [],
+    };
+    speechLogState('send');
+  }
+  function speechLogAt() { return speechLog ? Date.now() - speechLog.t0 : -1; }
+  function speechLogState(when) {
+    if (!speechLog) return;
+    var s = speechContext ? speechContext.state : 'none';
+    var session = navigator.audioSession ? navigator.audioSession.type + '/' + navigator.audioSession.state : 'n/a';
+    var last = speechLog.states[speechLog.states.length - 1];
+    if (!last || last[2] !== s || last[3] !== session) speechLog.states.push([speechLogAt(), when, s, session]);
+  }
+
   var liveSpeech = null;
   function stopLiveSpeech() {
     if (liveSpeech) liveSpeech.stop();
     liveSpeech = null;
   }
 
-  /** Plays one reply's chunks back to back as they arrive; stop() silences it. */
-  function speechPlayer(context, onPlaying) {
-    var sources = [], nextAt = 0, stopped = false;
+  /**
+   * Plays one reply's chunks back to back as they arrive; stop() silences it. onDrained
+   * is called once, when the reply has ended (end(), its turn is over; or stop()) and
+   * nothing it scheduled is still sounding.
+   */
+  function speechPlayer(context, onPlaying, onDrained) {
+    var sources = [], nextAt = 0, stopped = false, ended = false, drained = false;
+    function drain() {
+      if (drained || !ended || sources.length) return;
+      drained = true;
+      if (onDrained) onDrained();
+    }
     return {
       push: function (base64, rate) {
         if (stopped || !base64 || !(rate > 0)) return;
@@ -512,20 +612,28 @@
         source.connect(context.destination);
         nextAt = Math.max(nextAt, context.currentTime + 0.05);
         source.start(nextAt);
+        var startsIn = nextAt - context.currentTime;
         nextAt += buffer.duration;
         sources.push(source);
         source.onended = function () {
           var at = sources.indexOf(source);
           if (at >= 0) sources.splice(at, 1);
-          if (!sources.length) onPlaying(false);
+          if (!sources.length) { onPlaying(false); drain(); }
         };
         onPlaying(true);
+        return startsIn;
       },
+      /** Whether some of the reply is still scheduled to sound. */
+      speaking: function () { return !stopped && sources.length > 0; },
+      /** The reply's turn is over: no more chunks will come. */
+      end: function () { ended = true; drain(); },
       stop: function () {
         stopped = true;
         sources.forEach(function (source) { try { source.stop(); } catch (e) {} });
         sources = [];
         onPlaying(false);
+        ended = true;
+        drain();
       },
     };
   }
@@ -1511,6 +1619,9 @@
   // ---- sending -------------------------------------------------------------
   function setGenerating(on) {
     state.generating = !!on;
+    // A turn that ended with nothing left to say (no speech, a refusal, a stop) gives the
+    // audio back now; one whose reply is still sounding does when the reply has drained.
+    if (!on) releaseSpeech('turn-ended');
     busy.className = on ? 'on' : '';
     paintSend();
     send.disabled = state.visionChecking || shareDiscarding || (!on && !state.model);
@@ -1535,7 +1646,8 @@
       note('send-is-stop', state.turn); stop(); return;
     }
     // Inside the tap: the only moment a WebView lets a spoken reply start playing.
-    primeSpeech();
+    primeSpeech(true);
+    if (speaksReplies()) speechLogStart();
     if (pendingUploadCount) {
       notice(t('page.send.waitForUploads'));
       return;
@@ -2486,7 +2598,7 @@
             var button = null;
             // One reply speaks at a time: a newer one silences the one before it.
             stopLiveSpeech();
-            view.liveSpeech = liveSpeech = speechPlayer(speechContext, function (playing) {
+            var player = speechPlayer(speechContext, function (playing) {
               if (!button) {
                 button = el('button', 'mini quiet speech-stop', t('page.speech.stop'));
                 button.type = 'button';
@@ -2494,14 +2606,38 @@
                 speechBoxOf(view).appendChild(button);
               }
               button.style.display = playing ? '' : 'none';
+            }, function () {
+              // The reply has been heard to the end (or stopped): the user's other audio
+              // may come back -- unless a newer reply is already speaking.
+              if (liveSpeech && liveSpeech !== player && liveSpeech.speaking()) return;
+              releaseSpeech('drained');
             });
+            view.liveSpeech = liveSpeech = player;
           }
+          var startsIn = null;
           if (view.liveSpeech) {
-            try { view.liveSpeech.push(f.audio, Number(f.sampleRate)); }
+            // Again with every chunk: a reply that outlives its tap (a page that attached
+            // to it again) or a reply before it that finished meanwhile and gave it back.
+            speechSession('playback');
+            wakeSpeech();
+            try { startsIn = view.liveSpeech.push(f.audio, Number(f.sampleRate)); }
             catch (e) { note('speech-play-failed', (e && e.message) || e); view.liveSpeech.stop(); }
+          }
+          if (speechLog) {
+            var heardAt = speechLogAt();
+            speechLog.chunkAt.push(heardAt);
+            if (typeof startsIn === 'number') speechLog.startAt.push(Math.round(heardAt + startsIn * 1000));
+            else speechLog.noPlayer++;
+            speechLogState('chunk');
           }
         }
       }
+      if (f.token && speechLog) {
+        speechLog.texts++;
+        speechLog.lastText = speechLogAt();
+        if (speechLog.firstText < 0) speechLog.firstText = speechLog.lastText;
+      }
+      if (f.done === true && speechLog) { speechLog.done = speechLogAt(); speechLogState('done'); }
       view.noticesSaid = view.noticesSaid || {};
       if (typeof f.notice === 'string' && !view.noticesSaid[f.code || f.notice]) {
         // Said once in the turn (a replay of it too), in the page's language when it knows the case.
@@ -2749,6 +2885,8 @@
       }
       if (answer) addCopy(view.turn, function () { return answer; });
       setGenerating(false);
+      // No more chunks: the reply gives the audio back once what it scheduled has played.
+      if (view.liveSpeech) view.liveSpeech.end();
       state.abort = null;
       state.turn = null;
       state.liveView = null;
@@ -3728,7 +3866,7 @@
   $('speech-toggle').addEventListener('change', function () {
     state.speakReplies = !!$('speech-toggle').checked && !!state.speechOutput;
     primeSpeech();
-    if (!state.speakReplies) stopLiveSpeech();
+    if (!state.speakReplies) { stopLiveSpeech(); speechSession('auto'); }
     paintSpeech();
   });
   $('speech-voice').addEventListener('change', function () {
@@ -5383,6 +5521,17 @@
 
     /** How many files are chipped under the composer. For tests and the app's own checks. */
     attachmentCount: function () { return state.attachments.length; },
+    /** Switch Speak replies, as the switch does; false when the model does not speak. For the app's own checks. */
+    setSpeakReplies: function (on) {
+      var toggle = $('speech-toggle');
+      if (toggle) { toggle.checked = !!on; toggle.dispatchEvent(new Event('change')); }
+      return speaksReplies();
+    },
+    /** The newest spoken turn's timeline (see speechLog), as one JSON string, or 'null'. */
+    speechTimeline: function () {
+      if (speechLog) speechLogState('asked');
+      return JSON.stringify(speechLog);
+    },
 
     addAttachment: function (a) {
       if (!a || !a.ok) { notice((a && a.error) || t('page.upload.failed'), 'error'); return; }
@@ -5608,6 +5757,9 @@
   document.addEventListener('visibilitychange', function () {
     note('visibility', document.visibilityState);
     if (document.visibilityState !== 'visible') return;
+    // A reply still being spoken comes back with the app: WebKit interrupts the
+    // AudioContext while the app is away, and nothing else would resume it.
+    if (liveSpeech && liveSpeech.speaking()) wakeSpeech();
     // A moment later rather than inside the handler: WebKit on iOS 18 and later can
     // fail a fetch issued synchronously here with "Load failed" against a server that
     // is perfectly well, and the app's own check of its listener is under way at the

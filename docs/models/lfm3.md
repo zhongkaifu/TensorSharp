@@ -509,7 +509,11 @@ Where to use it: CLI `--tts` / `--speech-out` (with `--speech-mode`, `--speech-t
 `--voice`, `--language`, `--seed`), `POST /v1/audio/speech`, `/v1/chat/completions` /
 `/v1/responses` with `modalities` `["text","audio"]` or `["audio"]`, and the web chat
 (`/api/chat` with `speech`: the bundled Web UI's and TensorAgent's **Speak replies** switch, which
-play the reply as it is generated and keep a player and a download) — see
+play the reply as it is generated and keep a player and a download; while a reply is spoken both pages ask WebKit
+for `navigator.audioSession.type = "playback"`, so an iPhone in Silent mode plays the live speech, which WebKit
+otherwise plays as ambient sound that Silent mode mutes, give the choice back (`"auto"`) once the reply's audio has
+played so the user's music or podcast can resume, and resume the audio after a call, Siri or the app going to the
+background interrupts it) — see
 [USAGE.md → Speech output](../../USAGE.md#speech-output-lfm3-omni). Voices are `female`
 and `male` (named in the system prompt; there is no speaker embedding); an unknown voice,
 OpenAI's default `alloy` included, is a 400 that lists them. A spoken chat reply's system
