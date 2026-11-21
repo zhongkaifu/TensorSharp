@@ -80,6 +80,17 @@ namespace TensorSharp.Models
         private readonly object _sync = new();
         private bool _disposed;
 
+        /// <summary>
+        /// The tower's claim on its device (<see cref="GpuMemoryBudget.Reserve"/>) on the discrete GPUs whose caches are sized
+        /// from free memory (ggml_cuda, ggml_vulkan: the device the GGML budget reads; direct CUDA: the allocator's): its
+        /// weights until the first image uploads them, and the compute of the largest image it accepts
+        /// (<see cref="ReservedComputeBytes"/>) while it is loaded. A KV cache that grows before any image has come then leaves
+        /// the first image its room, as llama.cpp's mtmd does by allocating both when it loads. Null elsewhere: Metal and MLX
+        /// share host memory and keep their own caps.
+        /// </summary>
+        private readonly DeviceReservation _reservation;
+        private bool _weightsUploaded;
+
         /// <summary>Load the vision tower of the mmproj at <paramref name="mmprojPath"/> onto <paramref name="allocator"/> (the
         /// model's; <paramref name="backend"/> is its backend, which decides the weights' formats).</summary>
         public MuseGlimmerVisionTower(string mmprojPath, IAllocator allocator, BackendType backend)
@@ -122,6 +133,8 @@ namespace TensorSharp.Models
                 Graph = new NetworkGraph(Weights, executor, "muse-glimmer vision tower") { MaxCachedPlans = MaxParts };
                 Graph.FloatProducts = Graph.Executor is not ManagedGraphExecutor;
                 _materializesAttention = Graph.Executor is TensorGraphExecutor && Graph.Executor is not MlxGraphExecutor;
+                ReservedComputeBytes = ComputeBytes((long)MaxTokens * MergeSize * MergeSize);
+                _reservation = ReserveDevice(allocator, backend, Weights.QuantizedBytes + Weights.DenseBytes + ReservedComputeBytes);
                 // GGML's rotary kernels read a strided half-head view where it lies; the tensor executors' do not (MLX's
                 // fast rope takes contiguous rows and turns a strided view element by element on the host: 8 s for a
                 // 448 x 448 image where 0.3 s were the device's), so there the views are packed first.
@@ -129,6 +142,7 @@ namespace TensorSharp.Models
             }
             catch
             {
+                _reservation?.Dispose();
                 Graph?.Dispose();
                 Weights?.Dispose();
                 throw;
@@ -325,6 +339,12 @@ namespace TensorSharp.Models
                 rows = (float[])rows.Clone();
             }
             tokens = geo.Tokens;
+            if (_reservation != null && !_weightsUploaded)
+            {
+                // The weights are on the device now, and the device's readings count them.
+                _weightsUploaded = true;
+                _reservation.Bytes = ReservedComputeBytes;
+            }
             LastParts = parts;
             LastEncodeMs = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
             Console.WriteLine($"  Vision encode: {LastEncodeMs:F0} ms total ({parts} program{(parts == 1 ? "" : "s")} on {Graph.Executor.GetType().Name}), " +
@@ -539,6 +559,47 @@ namespace TensorSharp.Models
             return pieces[0];
         }
 
+        /// <summary>The device memory the compute of the largest image takes beyond the weights (an image of
+        /// <see cref="MaxTokens"/> merged tokens), which <see cref="_reservation"/> keeps claimed.</summary>
+        internal long ReservedComputeBytes { get; }
+
+        /// <summary>The bytes the tower claims on its device now (0 where it claims none).</summary>
+        internal long ReservedBytes => _reservation?.Bytes ?? 0;
+
+        /// <summary>
+        /// The device memory an image of <paramref name="patches"/> patches takes to encode beyond the weights: per patch, a
+        /// layer's activations at its widest (the MLP's <see cref="FeedForwardLength"/> beside the
+        /// <see cref="EmbeddingLength"/> rows) times what the executor keeps live, and on the executors whose attention holds
+        /// its scores the score budget of one piece. Measured on an RTX PRO 4500 Blackwell with a 1792 x 1792 image (16384
+        /// patches) as the first image of a process, beyond the 1951 MiB of weights: ggml_cuda 1496 MiB and ggml_vulkan 1216
+        /// MiB (flash attention, one arena; nvidia-smi's peak, or ggml's reading where higher), direct CUDA 3463 MiB
+        /// (materialized scores in 256 MiB pieces, the pool's blocks). These factors give 1640 and 3864 MiB.
+        /// </summary>
+        internal long ComputeBytes(long patches)
+        {
+            long perPatch = ((long)FeedForwardLength + EmbeddingLength) * sizeof(float);
+            return _materializesAttention
+                ? patches * perPatch * 11 / 2 + AttentionScoreBudget
+                : patches * perPatch * 5 / 2;
+        }
+
+        private DeviceReservation ReserveDevice(IAllocator allocator, BackendType backend, long bytes)
+        {
+            DeviceReservation reservation = backend switch
+            {
+                BackendType.GgmlCuda or BackendType.GgmlVulkan => GpuMemoryBudget.Reserve(backend, GpuMemoryBudget.GgmlDevice,
+                    "muse-glimmer vision tower", bytes),
+                BackendType.Cuda when allocator is TensorSharp.Cuda.CudaAllocator cuda => GpuMemoryBudget.Reserve(backend, cuda.DeviceId,
+                    "muse-glimmer vision tower", bytes),
+                _ => null,
+            };
+            if (reservation != null)
+                Console.WriteLine($"muse-glimmer vision tower: {bytes / 1048576.0:F0} MiB reserved on {backend} device {reservation.Device} " +
+                    $"({(Weights.QuantizedBytes + Weights.DenseBytes) / 1048576.0:F0} MiB of weights until the first image, " +
+                    $"{ReservedComputeBytes / 1048576.0:F0} MiB for a {MaxTokens}-token image's compute)");
+            return reservation;
+        }
+
         private int QueryChunk(int n)
         {
             if (AttentionChunkRows > 0) return AttentionChunkRows;
@@ -552,6 +613,7 @@ namespace TensorSharp.Models
         {
             if (_disposed) return;
             _disposed = true;
+            _reservation?.Dispose();
             Graph?.Dispose();
             Weights?.Dispose();
             lock (_geometries)
