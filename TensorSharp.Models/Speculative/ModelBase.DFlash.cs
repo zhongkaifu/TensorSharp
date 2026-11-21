@@ -589,9 +589,6 @@ namespace TensorSharp.Models
         /// <see cref="Dispose"/>; only the rings are ours.</summary>
         private protected void DisposeDFlash()
         {
-            _dflashDeferInjects = false;
-            _dflashPendingInjects.Clear();
-            _dflashPendingRowCount = 0;
             DisposeDSpine();
             DisposeDFlashRingPool();
             if (_dflashSubHead != IntPtr.Zero)
@@ -911,7 +908,6 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe int DFlashDraftBlockCore(int anchorToken, int position, int b, int[] draftOut, float[] confOut)
         {
-            FlushDeferredDFlashInjects();
             int graph = TryGraphDFlashDraftBlock(anchorToken, position, b, draftOut, confOut);
             if (graph >= 0)
                 return graph;
