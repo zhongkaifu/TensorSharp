@@ -45,13 +45,14 @@ int split = int.Parse(Option("--split", "0"));
 int rewind = int.Parse(Option("--rewind", "16"));
 int topK = int.Parse(Option("--topk", "8"));
 int tp = int.Parse(Option("--tp", "1"));
-// --layer-split N: whole layers over N GPUs (the runtime family; legacy refuses it, as its serving contract says).
+// --layer-split N: whole layers over N GPUs.
 int layerSplit = int.Parse(Option("--layer-split", "1"));
-// --family: "legacy" builds the legacy MuseGlimmerModel through its oracle seam (MuseGlimmerArchitecture.CreateLegacyModel,
-// until stage S9 of docs/design/muse-glimmer-unified.md deletes it); "runtime" builds the unified-runtime family, which the
-// descriptor builds since stage S8.
-string family = Option("--family", "legacy");
-// --scenario bench: the CLI's --benchmark (greedy, end to end) on either family in this binary: a prompt of
+// The probe builds the shared-runtime family, which the descriptor builds since stage S8 of docs/design/muse-glimmer-unified.md.
+// --family chose between it and the legacy model until stage S9 deleted the legacy model, and is refused since.
+if (args.Contains("--family"))
+    throw new ArgumentException("--family was removed with the legacy Muse-Glimmer model (stage S9): the probe builds the shared-runtime family; drop --family.");
+const string family = "runtime";
+// --scenario bench: the CLI's --benchmark (greedy, end to end) in this binary: a prompt of
 // --bench-prefill tokens cycling 17 ids, then --bench-decode greedy one-row forwards, --bench-runs times.
 int benchPrefill = int.Parse(Option("--bench-prefill", "512"));
 int benchDecode = int.Parse(Option("--bench-decode", "128"));
@@ -78,10 +79,6 @@ if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
 if (!Enum.TryParse(backendName.Replace("_", string.Empty), ignoreCase: true, out BackendType backend))
     throw new ArgumentException($"Unknown backend '{backendName}'.");
 
-if (family == "legacy" && layerSplit > 1)
-    throw new ArgumentException("--layer-split runs on the runtime family: legacy has no whole-layer placement.");
-if (family != "runtime" && (ringStepRows != null || gateUp != null || noPrune))
-    throw new ArgumentException("--ring-step-rows, --gate-up and --no-prune set the runtime family's choices: pass --family runtime.");
 if (ringStepRows != null)
     StandardDecoderModel.RingGeometryForTests.Value =
         (ringStepRows == "linear" ? 1 << 24 : int.Parse(ringStepRows), StandardDecoderModel.RingAlignment);
@@ -96,21 +93,14 @@ if (gateUp != null)
 var load = Stopwatch.StartNew();
 // Released explicitly (and the backend shut down) at the end: ggml-metal asserts at
 // process exit if any buffer is still registered, as the server's ProcessExit hook knows.
-var model = family switch
-{
-    "legacy" => MuseGlimmerArchitecture.CreateLegacyModel(modelPath, backend, tpDegree: tp),
-    "runtime" => MuseGlimmerArchitecture.CreateRuntimeModel(modelPath, backend, tpDegree: tp, layerSplitDegree: layerSplit),
-    _ => throw new ArgumentException($"--family {family}: use legacy or runtime."),
-};
+var model = MuseGlimmerArchitecture.CreateRuntimeModel(modelPath, backend, tpDegree: tp, layerSplitDegree: layerSplit);
 double loadMs = load.Elapsed.TotalMilliseconds;
 if (model.Config.Architecture != "muse-glimmer")
     throw new InvalidOperationException($"Expected a muse-glimmer model, got {model.Config.Architecture}.");
-var runtime = model as StandardDecoderModel;
+var runtime = (StandardDecoderModel)model;
 var slots = model as IBatchedPagedModel;
-if (noPrune) runtime!.LastLayerPruningDisabledForTests = true;
+if (noPrune) runtime.LastLayerPruningDisabledForTests = true;
 Console.WriteLine($"[probe] family={family} ({model.GetType().Name}), loaded in {loadMs:F0} ms");
-if (runtime == null && scenario is "checkpoint" or "slot-growth")
-    throw new ArgumentException($"--scenario {scenario} runs on the runtime family (per-request slots and checkpoints): pass --family runtime.");
 
 if (scenario == "bench")
 {
@@ -158,16 +148,10 @@ if (teacherFile != null)
 }
 
 bool inPrompt = split > 0 && split < prompt.Length;
-bool inDecode = runtime != null && split >= prompt.Length && scenario is "snapshot" or "checkpoint" or "truncate";
+bool inDecode = split >= prompt.Length && scenario is "snapshot" or "checkpoint" or "truncate";
 switch (scenario)
 {
     case "split":
-        Require(inPrompt, "--split must be inside the prompt.");
-        break;
-    case "snapshot" when runtime == null:
-        Require(split >= 256 && split < prompt.Length, "--split must cover at least one 256-token block and stay inside the prompt.");
-        break;
-    case "truncate" when runtime == null:
         Require(inPrompt, "--split must be inside the prompt.");
         break;
     case "snapshot" or "checkpoint" or "truncate":
@@ -176,8 +160,7 @@ switch (scenario)
         break;
 }
 
-// The runtime's scenarios start on the primary cache (it honours MAX_CONTEXT and TS_KV_INITIAL_TOKENS, as legacy's one cache
-// does); a restored checkpoint continues in the slot of a new request (`request`); slot-growth steps one request's slot through
+// The scenarios start on the primary cache (it honours MAX_CONTEXT and TS_KV_INITIAL_TOKENS); a restored checkpoint continues in the slot of a new request (`request`); slot-growth steps one request's slot through
 // the unified batch entry, as the engine serves it.
 int requestSerial = 0;
 string? request = null;
@@ -202,32 +185,6 @@ switch (scenario)
         events.Add($"after first forward: seq={model.CacheSeqLen} capacity={Capacity()}");
         logits = model.Forward(prompt[split..]);
         break;
-    case "snapshot" when runtime == null:
-    {
-        // What a pooled radix-cache hit does: extract whole 256-token blocks, start a
-        // fresh cache, inject them, and forward only the remainder.
-        int blocks = split / 256;
-        int reused = blocks * 256;
-        model.Forward(prompt);
-        long blockBytes = model.ComputeKVBlockByteSize(256);
-        var saved = new List<byte[]>();
-        for (int b = 0; b < blocks; b++)
-        {
-            var buf = new byte[blockBytes];
-            Require(model.TryExtractKVBlock(b * 256, 256, buf), $"TryExtractKVBlock refused block {b}.");
-            saved.Add(buf);
-        }
-        // Scramble the same rows first: a reset keeps the device copies on the GPU
-        // backends, so a restore that wrote nothing would otherwise read them back.
-        model.ResetKVCache();
-        model.Forward(prompt.Reverse().ToArray());
-        model.ResetKVCache();
-        for (int b = 0; b < blocks; b++)
-            Require(model.TryInjectKVBlock(b * 256, 256, saved[b]), $"TryInjectKVBlock refused block {b}.");
-        events.Add($"injected {reused} tokens in {blocks} blocks of {blockBytes} bytes; seq={model.CacheSeqLen}");
-        logits = model.Forward(prompt[reused..]);
-        break;
-    }
     case "truncate" when inPrompt:
         // What a live-cache rewind does: keep the head, drop the tail, re-forward it.
         model.Forward(prompt);
@@ -334,7 +291,6 @@ File.WriteAllText(output, JsonSerializer.Serialize(new
     {
         MAX_CONTEXT = Environment.GetEnvironmentVariable("MAX_CONTEXT"),
         TS_KV_INITIAL_TOKENS = Environment.GetEnvironmentVariable("TS_KV_INITIAL_TOKENS"),
-        TS_MUSE_GLIMMER_SWA_RING = Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_SWA_RING"),
         KV_CACHE_DTYPE = Environment.GetEnvironmentVariable("KV_CACHE_DTYPE"),
     },
     KvCacheDtype = model.KvCacheDtype.ToString(),
@@ -382,8 +338,8 @@ void RunBench()
     for (int run = 0; run < benchRuns; run++)
     {
         model.ResetKVCache();
-        // The host's token embedding (the runtime's lookup and upload of each step's rows; legacy gathers in its graph on Metal
-        // and the CPU, so it counts little or nothing there): ModelBase's own embedding clock, read around each phase.
+        // The host's token embedding (the lookup and upload of each step's rows): ModelBase's own embedding clock, read around
+        // each phase.
         SetField(model, "_embTicks", 0L);
         var sw = Stopwatch.StartNew();
         float[] logits = benchRefill ? model.ForwardRefill(ids) : model.Forward(ids);
@@ -421,7 +377,7 @@ void RunBench()
         KvCacheDtype = model.KvCacheDtype.ToString(), ModelLoadMilliseconds = loadMs, PrefillTokens = benchPrefill, DecodeTokens = benchDecode,
         Settings = new
         {
-            RingCells = RingCells(), MaxSequenceStepRows = runtime?.MaxSequenceStepRows, RingStepRows = ringStepRows, GateUp = gateUp,
+            RingCells = RingCells(), MaxSequenceStepRows = runtime.MaxSequenceStepRows, RingStepRows = ringStepRows, GateUp = gateUp,
             GateUpFusedLayers = (Field<bool[]>(model, "_gateUpFused") ?? Array.Empty<bool>()).Count(f => f),
             PrunesLastLayer = runtime != null ? !noPrune : (bool?)null, BenchRefill = benchRefill,
             TS_METAL_GRAPH_OPTIMIZE = Environment.GetEnvironmentVariable("TS_METAL_GRAPH_OPTIMIZE"),
@@ -431,24 +387,22 @@ void RunBench()
     }));
 }
 
-// The cells of the cache the scenario writes: on the runtime the active cache (the primary, or a restored request's slot) or the
-// stepped request's slot; legacy's full-attention capacity.
+// The cells of the cache the scenario writes: the active cache (the primary, or a restored request's slot) or the stepped
+// request's slot.
 int Capacity()
 {
-    if (runtime == null) return Field<int>(model, "_kvCacheCapacity");
     return unified ? runtime.SlotCapacityForTests(request!) ?? 0 : runtime.ActiveCacheCapacityForTests;
 }
 
-// The sliding-window layers' cells: the runtime's rings (the largest), legacy's ring rows.
+// The sliding-window layers' cells: the rings (the largest).
 int RingCells()
 {
-    if (runtime == null) return Field<int>(model, "_kvSwaRows");
     int cells = 0;
     for (int l = 0; l < model.Config.NumLayers; l++) cells = Math.Max(cells, runtime.RingCellsForTests(l));
     return cells;
 }
 
-int Length() => unified ? runtime!.SlotLengthForTests(request!) ?? 0 : model.CacheSeqLen;
+int Length() => unified ? runtime.SlotLengthForTests(request!) ?? 0 : model.CacheSeqLen;
 
 // One unified step of the stepped request: its rows from `start`, the last row's logits. The engine asks for the step's rows
 // each step (BatchExecutor's unified prepare): the slot keeps the reservation and grows when a step needs more than it holds.

@@ -601,14 +601,10 @@ namespace TensorSharp.Models
         /// the encoder's merged-patch count for that image; the filler rows are overwritten
         /// by the projected vision embeddings before the layer loop. This mirrors llama.cpp's
         /// mtmd chunking for PROJECTOR_TYPE_MUSE_GLIMMER (img_beg "&lt;|image_start|&gt;",
-        /// img_end "&lt;|image_end|&gt;").
+        /// img_end "&lt;|image_end|&gt;"). Muse Spark publishes the same vision tower and
+        /// image-token contract, so image caching and placeholder expansion are shared by
+        /// both models (<see cref="IMuseGlimmerVisionTower"/>).
         /// </summary>
-        internal List<int> ProcessMuseGlimmerHistory(MuseGlimmerModel model, List<ChatMessage> history, List<int> inputTokens)
-            => ProcessMuseGlimmerHistory(model.VisionEncoder, history, inputTokens);
-
-        // Muse Spark publishes the same Muse-Glimmer vision tower and image-token
-        // contract. Keep image caching/placeholder expansion shared by both models
-        // (and by the legacy and the graph tower, IMuseGlimmerVisionTower).
         internal List<int> ProcessMuseGlimmerHistory(IMuseGlimmerVisionTower encoder, List<ChatMessage> history, List<int> inputTokens)
         {
             if (encoder == null)

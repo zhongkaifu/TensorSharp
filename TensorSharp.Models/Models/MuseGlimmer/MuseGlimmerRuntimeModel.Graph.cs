@@ -9,7 +9,7 @@ using TensorSharp.Graph;
 namespace TensorSharp.Models
 {
     /// <summary>
-    /// Muse-Glimmer in whole-forward graphs, node for node as legacy's fused graph (TSGgml_MuseGlimmerModelForward) emits each
+    /// Muse-Glimmer in whole-forward graphs, node for node as the legacy model's fused native graph (deleted in stage S9) emitted each
     /// layer: the weightless input RMSNorm, per-head Q/K RMSNorm then the NORM rotary on the sliding-window layers, the
     /// elementwise output gate from the attention input, and the runtime's sliding-window attention, sandwich norms (at
     /// <see cref="MuseGlimmerRuntimeModel.PostNormEpsilon"/>), SwiGLU feed-forward and logit transform. Every per-position

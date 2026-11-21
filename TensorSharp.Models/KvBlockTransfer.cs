@@ -33,10 +33,10 @@ namespace TensorSharp.Models
     ///  - LINEAR (the default): row index == absolute token position, so the tensor
     ///    must have at least <c>startToken + tokenCount</c> rows.
     ///  - RING: row index == <c>position % rows</c>, and only the most recent
-    ///    <c>rows</c> positions are physically present. Muse-Glimmer sizes its
-    ///    sliding-window layers this way (see <c>MuseGlimmerModel._kvSwaRows</c>) so
-    ///    a 64K context does not pay for 64K rows on the 39 layers that never look
-    ///    back further than the window. Callers opt in per model by passing
+    ///    <c>rows</c> positions are physically present. The legacy Muse-Glimmer model
+    ///    (deleted in stage S9 of docs/design/muse-glimmer-unified.md) sized its
+    ///    sliding-window layers this way so a 64K context did not pay for 64K rows on
+    ///    the 39 layers that never look back further than the window. Callers opt in per model by passing
     ///    <c>ringRows</c>; a tensor is treated as a ring exactly when its row count
     ///    equals that value.
     ///

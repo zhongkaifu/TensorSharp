@@ -14,8 +14,8 @@ namespace TensorSharp.Models
     /// <summary>
     /// Muse-Glimmer (GGUF <c>muse-glimmer</c> / <c>muse_glimmer</c>) on the shared decoder runtime, which provides every
     /// placement, continuous batching, the prefix cache, checkpoints and speculation. The recipe (llama.cpp
-    /// <c>src/models/muse-glimmer.cpp</c>; the legacy <see cref="MuseGlimmerModel"/> and its fused graph
-    /// <c>ggml_ops_muse_glimmer.cpp</c>):
+    /// <c>src/models/muse-glimmer.cpp</c>, which the legacy model and its fused native graph, deleted in stage S9 of
+    /// docs/design/muse-glimmer-unified.md, followed too):
     /// <list type="bullet">
     /// <item>a dense stack of GQA attention layers, sliding-window or full by <c>attention.sliding_window_pattern</c>: a scalar
     /// period P (layer l slides when l % P &lt; P - 1, llama.cpp's <c>set_swa_pattern</c>) or a per-layer bool array. The 30B's
@@ -30,9 +30,7 @@ namespace TensorSharp.Models
     /// <item>a dense SwiGLU feed-forward; the head (<c>output</c>, or <c>token_embd</c> tied) scaled by <c>logit_scale</c>, then a
     /// tanh softcap at <c>final_logit_softcapping</c> (<see cref="LogitScale"/>, <see cref="FinalLogitSoftcap"/>).</item>
     /// </list>
-    /// The descriptor builds it (<see cref="MuseGlimmerArchitecture.Descriptor"/>, since stage S8 of docs/design/muse-glimmer-unified.md);
-    /// the legacy <see cref="MuseGlimmerModel"/> stays reachable through the oracle seam
-    /// <see cref="MuseGlimmerArchitecture.CreateLegacyModel"/> until stage S9 deletes it.
+    /// The descriptor builds it (<see cref="MuseGlimmerArchitecture.Descriptor"/>, since stage S8 of docs/design/muse-glimmer-unified.md).
     /// </summary>
     internal sealed partial class MuseGlimmerRuntimeModel : StandardDecoderModel
     {
@@ -208,7 +206,7 @@ namespace TensorSharp.Models
             => new[] { LayerName(layer, "attn_gate.weight") };
 
         /// <summary>
-        /// What a tensor-parallel degree must also meet, as legacy checked it (MuseGlimmerModel.TensorParallel.cs): the
+        /// What a tensor-parallel degree must also meet, as the legacy model checked it: the
         /// row-parallel projections' rows split into whole quantization blocks a rank. The KV heads (2 on the 30B, so --tp is at
         /// most 2) are the runtime's own check, whose refusal already names them ("2 KV heads must each divide by N").
         /// </summary>

@@ -136,9 +136,8 @@ namespace TensorSharp.Models
         private const int GgmlTypeF32 = 0;
 
         /// <summary>
-        /// Same backend set as the trunk kernel (see
-        /// <c>MuseGlimmerModel.Fused.CanUseFusedForward</c>): CUDA, Vulkan and
-        /// Metal. CPU keeps the per-op drafter, which is correct.
+        /// The backend set the legacy Muse-Glimmer trunk kernel had (deleted in
+        /// stage S9): CUDA, Vulkan and Metal. CPU keeps the per-op drafter, which is correct.
         ///
         /// Metal was excluded with the trunk kernel and is included for the same
         /// reason - ggml-metal implements every op these graphs use, including
