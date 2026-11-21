@@ -351,15 +351,21 @@ namespace TensorSharp.Cuda
         /// <summary>Whether this image runs <see cref="LaunchGemmQ6k"/> (its sm_80 bodies are in it).</summary>
         public bool TakesQ6kMma { get; }
 
+        /// <summary>Blocks a multiprocessor a drafter product's K splits aim for (<see cref="LaunchGemmQ4k"/>, <see cref="LaunchGemmQ6k"/>):
+        /// a Qwen3.8-27B DFlash2 drafter's gate and up (272 row tiles each) had run unsplit at 3.3 blocks a multiprocessor of an RTX
+        /// PRO 4500, 175 us each, where the direct engine's fused gate|up (544 tiles) took 283.</summary>
+        internal const int DrafterProductWaves = 4;
+
         /// <summary>y [n][outDim] = xq [n] W^T for a Q4_K weight (rows <paramref name="rowBytes"/> apart, k a multiple of 256)
         /// on the int8 tensor cores, the direct engines' drafter product: <paramref name="xq"/> int8 [n][k] and
-        /// <paramref name="xd"/> [n][k / 32] (the split q8_1 rows). K splits until the row tiles fill the device twice over (at
-        /// least four superblocks a split), their shares added atomically: the last bits vary from run to run.</summary>
+        /// <paramref name="xd"/> [n][k / 32] (the split q8_1 rows). K splits until the row tiles fill the device
+        /// <see cref="DrafterProductWaves"/> times over (at least four superblocks a split), their shares added atomically: the
+        /// last bits vary from run to run.</summary>
         public void LaunchGemmQ4k(IntPtr w, long rowBytes, int outDim, int k, IntPtr xq, IntPtr xd, int n, IntPtr y, IntPtr stream)
         {
             uint tiles = (uint)((outDim + 63) / 64);
             int superblocks = k / 256, splits = 1;
-            while (tiles * splits < 2 * _multiprocessors && splits * 4 <= superblocks)
+            while (tiles * splits < DrafterProductWaves * _multiprocessors && splits * 4 <= superblocks)
                 splits *= 2;
             if (splits > 1)
                 CudaDriverApi.cuMemsetD32Async(y, 0, new UIntPtr((ulong)n * (ulong)outDim), stream).ThrowOnError();
@@ -383,7 +389,7 @@ namespace TensorSharp.Cuda
         {
             uint tiles = (uint)((outDim + 63) / 64);
             int superblocks = k / 256, splits = 1;
-            while (tiles * splits < 2 * _multiprocessors && splits * 4 <= superblocks)
+            while (tiles * splits < DrafterProductWaves * _multiprocessors && splits * 4 <= superblocks)
                 splits *= 2;
             if (splits > 1)
                 CudaDriverApi.cuMemsetD32Async(y, 0, new UIntPtr((ulong)n * (ulong)outDim), stream).ThrowOnError();
