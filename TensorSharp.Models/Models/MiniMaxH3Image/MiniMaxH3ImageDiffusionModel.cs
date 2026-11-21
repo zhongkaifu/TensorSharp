@@ -50,7 +50,7 @@ namespace TensorSharp.Models.MiniMaxH3Image
         {
             if (backend is not (BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu))
                 throw new ModelLoadRefusedException(
-                    $"MiniMax-H3-Image runs on --backend ggml_cuda, ggml_metal or ggml_cpu, not {backend}.");
+                    $"MiniMax-H3-Image runs on --backend ggml_cuda, ggml_metal or ggml_cpu, not {Architecture.BackendNames.OptionName(backend)}.");
             float[] grid;
             using (var probe = new MiniMaxH3WeightFile(ditPath))
             {

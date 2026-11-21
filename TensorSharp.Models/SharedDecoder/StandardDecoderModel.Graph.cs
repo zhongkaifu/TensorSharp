@@ -2516,8 +2516,11 @@ namespace TensorSharp.Models
             }
             // Several sequences' verify windows written by index (a batched verify, as many rows each, none past a ring's first lap
             // or a prompt chunk): every sequence's prep and cache writes one region, the writes first, each sequence's into its own
-            // caches at its own rows (the region's results the rotated queries of every row).
-            bool preps = !prep && step.Sequences > 1 && !LegacyBatchedJoinForTests && !WindowAttentionHasRegion
+            // caches at its own rows (the region's results the rotated queries of every row). Only for an executor that runs that
+            // region as one kernel (GraphCapabilities.SequencePrepRegions): elsewhere its ops would replace the step's own (its
+            // queries' and keys' contiguous copies, the writes before the rotations), so a sequence's rows in a batched step would
+            // no longer be the bits of the same rows in the step's other layouts (BatchedJoinBitwiseTests, ggml-cuda).
+            bool preps = !prep && step.Sequences > 1 && caps.SequencePrepRegions && !LegacyBatchedJoinForTests && !WindowAttentionHasRegion
                 && !SequenceAttentionRegionsDisabledForTests && TakesAttentionPrep(step, layer);
             for (int s = 0; preps && s < step.Sequences; s++)
                 preps = Indexed(step.Counts[s]) && step.Counts[s] == step.Counts[0] && !RingWrapped(layer, step.Starts[s], step.Counts[s])

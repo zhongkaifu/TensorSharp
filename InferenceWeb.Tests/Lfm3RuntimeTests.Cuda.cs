@@ -374,7 +374,14 @@ public sealed partial class Lfm3RuntimeTests
     // ---------------------------------------------------------------- NVFP4
 
     /// <summary>LiquidAI's NVFP4 layout on direct CUDA: the NVFP4 blocks stay as they are (no widening) and their .scale sidecars
-    /// apply; below sm_120 (no FP4 tensor cores) the products run on the NVFP4 matvec and the dequantizing GEMM.</summary>
+    /// apply; below sm_120 (no FP4 tensor cores) the products run on the NVFP4 matvec and the dequantizing GEMM. With FP4 tensor
+    /// cores the prompt rows' products are W4A4: the q8-activation seam (CudaAllocator.AllNvfp4RowsOnMatvecForTests) keeps every
+    /// row on the q8 matvec here, so the layout and scales are held to the q8 bound. The W4A4 route is held exactly in
+    /// CudaNvfp4MatmulTests: its activation quantizer codes rows as ggml-cuda's does, bit for bit, and its GEMM equals the
+    /// product of the dequantized operands within accumulation order. (Its cost against q8 activations, RTX PRO 4500,
+    /// wikitext-2 32 x 1024: perplexity +4.7% on LFM3-1.7B NVFP4, +1.8% on Qwen3.8-27B NVFP4; the seam's matvec route
+    /// runs those prompts 4-13x slower, so it is a measurement seam, not a product route.)</summary>
     [CudaFact]
-    public void Nvfp4FeedForwardsOnDirectCudaMatchTheManagedReference() => AssertNvfp4(BackendType.Cuda);
+    public void Nvfp4FeedForwardsOnDirectCudaMatchTheManagedReference()
+        => AssertNvfp4(BackendType.Cuda, configure: m => ((TensorSharp.Cuda.CudaAllocator)m.DirectAllocatorForTelemetry).AllNvfp4RowsOnMatvecForTests = true);
 }

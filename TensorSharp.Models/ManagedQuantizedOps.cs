@@ -355,6 +355,42 @@ namespace TensorSharp.Models
             ParallelOptions options,
             QGemmIsa isa)
         {
+            if (ggmlType == 40 && rowCount > Nvfp4PromptRowsFrom && Nvfp4PromptRowsForTests is { } rewrite)
+            {
+                int k = checked((int)ne0);
+                var rows = new float[(long)rowCount * k];
+                for (int r = 0; r < rowCount; r++)
+                    new ReadOnlySpan<float>(input + (long)r * inputRowStride, k).CopyTo(rows.AsSpan(r * k, k));
+                rewrite(rows, rowCount, k);
+                fixed (float* rewritten = rows)
+                    AddmmQuantizedRows(ggmlType, weights, ne0, ne1, rewritten, k, rowCount, output, outputRowStride, options, isa);
+                return;
+            }
+            AddmmQuantizedRows(ggmlType, weights, ne0, ne1, input, inputRowStride, rowCount, output, outputRowStride, options, isa);
+        }
+
+        /// <summary>Rows past which <see cref="Nvfp4PromptRowsForTests"/> applies: the NVFP4 products the FP4 tensor-core backends
+        /// run on W4A4 GEMMs (direct CUDA's <c>CudaFp4Kernels.GemvMaxRows</c> rows and fewer stay on its q8 matvec).</summary>
+        internal const int Nvfp4PromptRowsFrom = 16;
+
+        /// <summary>Test seam, never set by the product: rewrites the activation rows [rows, k] of every NVFP4 product of more
+        /// than <see cref="Nvfp4PromptRowsFrom"/> rows before the product. Lfm3RuntimeTests puts ggml-cuda's NVFP4 activation
+        /// quantizer here to give the managed executor the W4A4 prompt products of the FP4 tensor-core backends.</summary>
+        internal static Action<float[], int, int> Nvfp4PromptRowsForTests;
+
+        private static unsafe void AddmmQuantizedRows(
+            int ggmlType,
+            IntPtr weights,
+            long ne0,
+            long ne1,
+            float* input,
+            int inputRowStride,
+            int rowCount,
+            float* output,
+            int outputRowStride,
+            ParallelOptions options,
+            QGemmIsa isa)
+        {
             if (TryAddmmQuantizedToFloat32(
                     ggmlType, weights, ne0, ne1, input, inputRowStride, rowCount, output, outputRowStride, options, isa))
             {

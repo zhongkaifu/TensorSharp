@@ -146,12 +146,7 @@ public sealed class MiniMaxH3ImageLoraDenoiserTests(ITestOutputHelper output) : 
         Assert.Same(set, unmerged.BoundLora);
     }
 
-    private static GgmlBackendType GgmlBackend(BackendType b) => b switch
-    {
-        BackendType.GgmlMetal => GgmlBackendType.Metal,
-        BackendType.GgmlCuda => GgmlBackendType.Cuda,
-        _ => GgmlBackendType.Cpu,
-    };
+    private static GgmlBackendType GgmlBackend(BackendType b) => TestGates.GgmlBackendTypeOf(b);
 
     // Bounds: the largest relative error measured on each lane (max |err| / max |v|), with headroom. The managed executor
     // and ggml_cpu keep the factors in F32; ggml_metal and ggml_cuda in F16, and ggml_cuda's products round their
@@ -281,7 +276,7 @@ public sealed class MiniMaxH3ImageLoraDenoiserTests(ITestOutputHelper output) : 
     public void SwitchingAdaptersLeavesNothingBehindOnGgmlCuda() => VerifySwitching(BackendType.GgmlCuda);
 
     /// <summary>A geometry's steps with adapters share one plan; a set loaded for another backend or checkpoint is refused.</summary>
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void AdaptedStepsCompileOnceAndAForeignSetIsRefused()
     {
         BackendType backend = TestGates.PinnedGgmlBackend;

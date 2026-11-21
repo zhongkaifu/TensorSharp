@@ -623,12 +623,7 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
 
     private void VaeEncoderMatchesTheOracle(BackendType backend)
     {
-        GgmlBasicOps.EnsureBackendAvailable(backend switch
-        {
-            BackendType.GgmlMetal => GgmlBackendType.Metal,
-            BackendType.GgmlCuda => GgmlBackendType.Cuda,
-            _ => GgmlBackendType.Cpu,
-        });
+        GgmlBasicOps.EnsureBackendAvailable(TestGates.GgmlBackendTypeOf(backend));
         using JsonDocument doc = Fixture("vae-encoder-oracle.json");
         using var fx = new MiniMaxH3ImageVaeFixture(blocks: 1, encoder: true);
         using var codec = new MiniMaxH3ImageVaeCodec(fx.VaePath, backend);
@@ -674,12 +669,7 @@ public sealed class MiniMaxH3ImageEditTests(ITestOutputHelper output)
     /// sees only its own prefix), of five (the last one short) and of all but one row.</summary>
     private void TextEncoderQueryBlocksMatchItsWholeScores(BackendType backend)
     {
-        GgmlBasicOps.EnsureBackendAvailable(backend switch
-        {
-            BackendType.GgmlMetal => GgmlBackendType.Metal,
-            BackendType.GgmlCuda => GgmlBackendType.Cuda,
-            _ => GgmlBackendType.Cpu,
-        });
+        GgmlBasicOps.EnsureBackendAvailable(TestGates.GgmlBackendTypeOf(backend));
         string dir = Path.Combine(Path.GetTempPath(), "ts-h3te-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try

@@ -36,6 +36,11 @@ namespace TensorSharp.Graph
         /// them, a packed row apart: the window takes the projection as one product, as decode rows do, instead of a product
         /// per row block.</summary>
         public bool WindowRegionsReadPackedRows { get; init; }
+        /// <summary>Several sequences' query/key prep and cache writes run as one attention prep region
+        /// (GraphFusion.AttentionPrep with each further sequence's caches and write rows) in one kernel; a family emits that
+        /// region only for such an executor, and elsewhere each sequence's rows take the ops a step of several sequences
+        /// always emitted.</summary>
+        public bool SequencePrepRegions { get; init; }
         /// <summary>Its recorded steps bind a slot's buffers: a request that runs in a new slot relocates or records them again
         /// (tens of milliseconds a step shape), so a finished request is retained as a copy and its slot serves the next.</summary>
         public bool SlotBoundRecordings { get; init; }
@@ -129,6 +134,11 @@ namespace TensorSharp.Graph
         void SyncToHost(IntPtr data, long bytes);
 
         /// <summary>The host bytes at <paramref name="data"/> changed (or are being freed): drop device copies.</summary>
+        /// <remarks>An executor that <see cref="GraphCapabilities.BindsHostPointers"/> keys the device copy of a weight or
+        /// state leaf by the address and size of its host bytes alone, and keeps it after the plan is gone. A caller that
+        /// frees, re-pins or rewrites such bytes calls this first. Otherwise the next bytes of the same size at that
+        /// address bind the old copy and compute with the old values, with no error. Those bytes can be an array pinned
+        /// again where the GC reused the address, or a recycled pool block.</remarks>
         void Invalidate(IntPtr data);
 
         /// <summary>A weight the model reads only through its products (an untied LM head, never gathered by rows), by its

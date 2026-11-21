@@ -88,7 +88,7 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
     /// <summary>The safetensors release goes through the registry's safetensors hook (no special case in ModelBase.Create)
     /// and builds the runtime's model, with the checkpoint's grid and the companions beside it; nothing reaches a device
     /// before the first image.</summary>
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void TheSafetensorsReleaseLoadsAsTheRuntimesModel()
     {
         using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.BF16, safetensors: true);
@@ -121,7 +121,7 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
     }
 
     /// <summary>A GGUF denoiser (unlabelled, as the published quantized files' tensors are read) builds the same model.</summary>
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void AGgufDenoiserLoadsAsTheRuntimesModel()
     {
         using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.Q8_0);
@@ -130,6 +130,24 @@ public sealed class MiniMaxH3ImageSwitchTests : IDisposable
         Assert.Null(ModelArchitectureRegistry.ResolveSafetensors(dit.DitPath));
         using ModelBase model = ModelBase.Create(dit.DitPath, TestGates.PinnedGgmlBackend);
         Assert.IsType<MiniMaxH3ImageDiffusionModel>(model);
+    }
+
+    /// <summary>ggml_vulkan is not in the serving contract: the model, its denoiser and its VAE refuse it at load, naming the
+    /// backend by its option spelling. (The tests that run the family on the pinned GGML backend skip in this lane.)</summary>
+    [GgmlFact(BackendType.GgmlVulkan)]
+    public void GgmlVulkanIsRefusedAtLoad()
+    {
+        Assert.DoesNotContain(BackendType.GgmlVulkan,
+            ModelArchitectureRegistry.All.Single(a => a.Id == MiniMaxH3ImageFamily.ArchitectureId).Serving.Backends);
+        using var dit = new MiniMaxH3ImageFixture(MiniMaxH3ImageFixture.BF16, safetensors: true);
+        using var vae = new MiniMaxH3ImageVaeFixture(2);
+        Companions(dit.Dir, vae);
+        var model = Assert.Throws<ModelLoadRefusedException>(() => ModelBase.Create(dit.DitPath, BackendType.GgmlVulkan));
+        Assert.Contains("runs on --backend ggml_cuda, ggml_metal or ggml_cpu, not ggml_vulkan", model.Message);
+        var denoiser = Assert.Throws<NotSupportedException>(() => new MiniMaxH3ImageDenoiser(dit.DitPath, BackendType.GgmlVulkan));
+        Assert.EndsWith("not ggml_vulkan.", denoiser.Message);
+        var codec = Assert.Throws<NotSupportedException>(() => new MiniMaxH3ImageVaeCodec(vae.VaePath, BackendType.GgmlVulkan));
+        Assert.EndsWith("not ggml_vulkan.", codec.Message);
     }
 
     /// <summary>Multi-GPU requests are refused by the contract's gaps, as for any family, before anything loads.</summary>

@@ -62,7 +62,7 @@ public sealed class MiniMaxH3ImageLoraHostTests : IDisposable
     private MiniMaxH3ImageDiffusionModel Model() =>
         Assert.IsType<MiniMaxH3ImageDiffusionModel>(ModelBase.Create(_dit.DitPath, TestGates.PinnedGgmlBackend));
 
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void TheModelTakesItsOwnConfigsAndBareWeightsOnly()
     {
         using var model = Model();
@@ -80,7 +80,7 @@ public sealed class MiniMaxH3ImageLoraHostTests : IDisposable
         Assert.Throws<FileNotFoundException>(() => model.AcceptsLora(new LoraSpec(Path.Combine(_fx.Dir, "missing.json"))));
     }
 
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void SetLorasSwapsTheSetAndARefusedSetLeavesThePreviousOne()
     {
         using var model = Model();
@@ -125,7 +125,7 @@ public sealed class MiniMaxH3ImageLoraHostTests : IDisposable
         }
     }
 
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void ARequestMayOnlyRepeatTheSpeedContract()
     {
         using var model = Model();

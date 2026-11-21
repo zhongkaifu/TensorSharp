@@ -37,12 +37,7 @@ public sealed class MiniMaxH3ImageVaeCodecTests(ITestOutputHelper output)
         return v;
     }
 
-    private static void Pin(BackendType backend) => GgmlBasicOps.EnsureBackendAvailable(backend switch
-    {
-        BackendType.GgmlMetal => GgmlBackendType.Metal,
-        BackendType.GgmlCuda => GgmlBackendType.Cuda,
-        _ => GgmlBackendType.Cpu,
-    });
+    private static void Pin(BackendType backend) => GgmlBasicOps.EnsureBackendAvailable(TestGates.GgmlBackendTypeOf(backend));
 
     private void AssertSamePixels(RgbImage want, RgbImage got, string what)
     {
@@ -156,7 +151,7 @@ public sealed class MiniMaxH3ImageVaeCodecTests(ITestOutputHelper output)
     /// <summary>A row longer than the batch limit takes two programs (the limit and the rest), both cached, and decodes as
     /// the legacy decoder did with the same limit. (Off ggml_cuda a row's pixels do not depend on its split; on ggml_cuda
     /// cuDNN's batched attention plans by batch, so they do, for both decoders alike.)</summary>
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void ARowSplitAcrossProgramsDecodesAsTheLegacyDecoderSplitTheSameWay()
     {
         BackendType backend = TestGates.PinnedGgmlBackend;
@@ -174,7 +169,7 @@ public sealed class MiniMaxH3ImageVaeCodecTests(ITestOutputHelper output)
 
     /// <summary>Released workspaces and device copies are made again by the next decode, to the same pixels; the latent's
     /// [C, 1, H, W] form decodes as its channel-last one.</summary>
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void ReleasesAndTheLatentTensorFormDecodeTheSamePixels()
     {
         BackendType backend = TestGates.PinnedGgmlBackend;
@@ -198,7 +193,7 @@ public sealed class MiniMaxH3ImageVaeCodecTests(ITestOutputHelper output)
         Assert.Equal((160, 160), (preview.Width, preview.Height));
     }
 
-    [Fact]
+    [PinnedGgmlServesFact(MiniMaxH3ImageFamily.ArchitectureId)]
     public void TheCodecDeclaresItsWeightsAndARowsWorkingMemoryAndRefusesToEncodeWithoutAnEncoder()
     {
         using var fx = new MiniMaxH3ImageVaeFixture(2);
