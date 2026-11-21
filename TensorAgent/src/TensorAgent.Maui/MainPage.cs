@@ -1486,10 +1486,20 @@ public sealed class MainPage : ContentPage
                 catch (JsonException) { }
                 Say($"speechcheck turn {turn} summary " + SummarizeSpeechTimeline(timeline));
                 Say($"speechcheck turn {turn} timeline " + timeline);
-                // Let the reply finish playing before the next turn silences it.
-                await Task.Delay(TimeSpan.FromSeconds(20));
+                // Let the reply finish playing (the page gives the audio back once it has drained) before the next turn
+                // silences it, and say what the session is then.
+                string states = "null";
+                for (int i = 0; i < 240; i++)
+                {
+                    await Task.Delay(500);
+                    states = UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
+                        "window.TensorAgent.speechTimeline ? JSON.stringify(JSON.parse(window.TensorAgent.speechTimeline()).states.slice(-3)) : 'null'"));
+                    if (states.Contains("drained", StringComparison.Ordinal))
+                        break;
+                }
+                await Task.Delay(TimeSpan.FromSeconds(3));
                 Say($"speechcheck turn {turn} after playback " + UnwrapEvaluated(await _webView.EvaluateJavaScriptAsync(
-                    "window.TensorAgent.speechTimeline ? JSON.stringify(JSON.parse(window.TensorAgent.speechTimeline()).states.slice(-2)) : 'null'"))
+                    "window.TensorAgent.speechTimeline ? JSON.stringify(JSON.parse(window.TensorAgent.speechTimeline()).states.slice(-3)) : 'null'"))
                     + " " + DescribeAudioSession());
             }
         }
